@@ -1460,13 +1460,14 @@ impl RuntimeActor {
         dispatch: ActionDispatch,
         trusted_verification: Option<bool>,
     ) {
+        let facts = self.services.tools().execution_facts(output);
         if let Some(batch) = self
             .state
             .turn
             .as_mut()
             .and_then(|turn| turn.action_batch.as_mut())
         {
-            batch.record(output, disposition, dispatch, trusted_verification);
+            batch.record(output, disposition, dispatch, trusted_verification, &facts);
         }
     }
 

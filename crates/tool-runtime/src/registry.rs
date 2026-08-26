@@ -591,6 +591,29 @@ impl ToolDispatcher for BuiltinToolDispatcher {
         self.builtin_execution_attribution(call)
     }
 
+    /// CAP-OBS-01: translate this crate's OWN stamped outputs into typed
+    /// facts at one sanctioned point inside the operator-trust boundary.
+    /// Names this catalog does not own belong to untrusted producers routed
+    /// elsewhere and contribute no facts.
+    fn execution_facts(&self, output: &ToolOutput) -> agent_contracts::ToolExecutionFacts {
+        let owned = self
+            .catalog
+            .read()
+            .expect("tool catalog poisoned")
+            .contains_key(&output.tool_name);
+        if !owned {
+            return agent_contracts::ToolExecutionFacts::empty();
+        }
+        agent_contracts::ToolExecutionFacts::from_resource_touches(
+            output
+                .resource_touches()
+                .into_iter()
+                .map(|touch| (touch.path, touch.revision)),
+        )
+        .with_verification(output.is_verification())
+        .with_mutation_bound(output.may_mutate_workspace())
+    }
+
     async fn execute(&self, request: ToolExecutionRequest) -> AgentResult<ToolOutcome> {
         request.validate().map_err(AgentError::InvalidRequest)?;
         let name = request.call.name.clone();
@@ -1011,6 +1034,73 @@ mod tests {
             .into_iter()
             .map(|spec| spec.name)
             .collect()
+    }
+
+    /// CAP-OBS-01: the trusted host translates only its own stamped
+    /// outputs, and the translation mirrors what the legacy accessors
+    /// derived — consumers switching to facts must not see new values.
+    #[tokio::test]
+    async fn execution_facts_translate_only_this_hosts_own_stamps() {
+        let tools = dispatcher().await;
+
+        let stamped = ToolOutput {
+            call_id: "call-1".into(),
+            tool_name: "fs.write".into(),
+            ok: true,
+            summary: "ok".into(),
+            model_content: String::new(),
+            artifact_ref: None,
+            metadata: serde_json::json!({
+                "path": "src/auth.rs",
+                "revision": "r1",
+                "mutates_workspace": true,
+                "verification": false
+            }),
+        };
+        let facts = tools.execution_facts(&stamped);
+        assert_eq!(facts.resource_touches().len(), 1);
+        assert_eq!(facts.resource_touches()[0].path, "src/auth.rs");
+        assert_eq!(facts.resource_touches()[0].revision.as_deref(), Some("r1"));
+        assert_eq!(facts.may_mutate_workspace(), Some(true));
+        assert_eq!(facts.is_verification(), Some(false));
+        assert!(
+            matches!(
+                facts.mutation_footprint(true, false),
+                agent_contracts::MutationFootprint::Known(ref touches) if touches.len() == 1
+            ),
+            "the stamped bound drives the footprint without the name-table fallback"
+        );
+
+        // An unstamped read-only builtin still carries its bound from the
+        // trusted host's own policy table, with no touches.
+        let plain = ToolOutput {
+            call_id: "call-2".into(),
+            tool_name: "fs.read".into(),
+            ok: true,
+            summary: "ok".into(),
+            model_content: String::new(),
+            artifact_ref: None,
+            metadata: serde_json::json!({}),
+        };
+        let facts = tools.execution_facts(&plain);
+        assert!(facts.resource_touches().is_empty());
+        assert_eq!(facts.may_mutate_workspace(), Some(false));
+
+        // A name outside this catalog belongs to another host's producer:
+        // no facts, and the mutation bound stays unstamped.
+        let foreign = ToolOutput {
+            call_id: "call-3".into(),
+            tool_name: "plugin.demo.one".into(),
+            ok: true,
+            summary: "ok".into(),
+            model_content: String::new(),
+            artifact_ref: None,
+            metadata: serde_json::json!({"path": "escaped.rs", "verification": true}),
+        };
+        let facts = tools.execution_facts(&foreign);
+        assert!(facts.resource_touches().is_empty());
+        assert_eq!(facts.may_mutate_workspace(), None);
+        assert_eq!(facts.is_verification(), None);
     }
 
     #[tokio::test]

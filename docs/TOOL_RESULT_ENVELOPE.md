@@ -72,15 +72,15 @@ Direction for the follow-up mainline (before Self-Iteration): introduce
 the typed host-trusted `ToolExecutionFacts` channel so context heating,
 ExecutionState, Evidence Frontier, RetryDomain and Verification consume
 facts that never originate in producer metadata. The typed vocabulary
-landed 2026-08-26 (`agent-contracts/src/execution_facts.rs`): it carries
-the same four fact groups as typed values, mirrors today's
-resource/mutation/heating derivation rules exactly, defaults dynamic
-capabilities to empty facts, and has no durable wire form yet. Still
-open: switching the listed consumers from metadata-derived accessors to
-the typed facts, and runtime-side construction from effect receipts and
-workspace handles. Do not add new authority-bearing keys to `metadata`;
-plugin authors must not assume `metadata.path`/`metadata.revision`
-reaches the Runtime as truth.
+landed 2026-08-26 (`agent-contracts/src/execution_facts.rs`), and the
+first channel landed the same day: `ToolDispatcher::execution_facts`
+translates the trusted builtin registry's own stamps at one sanctioned
+point, capability results route to empty facts, and the actor's batch
+ledger consumes them. Still open: the heating/turn-frame carriers so
+context heating, Evidence Frontier and Verification also read facts,
+handler-level direct construction, and a durable wire form. Do not add
+new authority-bearing keys to `metadata`; plugin authors must not assume
+`metadata.path`/`metadata.revision` reaches the Runtime as truth.
 
 ## 2. Error envelope
 

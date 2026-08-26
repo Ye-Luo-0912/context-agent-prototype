@@ -1008,6 +1008,78 @@ async fn capability_output_metadata_cannot_forge_runtime_facts() {
     assert_eq!(output.metadata.get("rows"), Some(&json!(3)));
 }
 
+/// A base whose facts are recognizable, so the routing assertions can tell
+/// base-derived facts apart from empty ones.
+struct MarkedFactsBase;
+
+#[async_trait::async_trait]
+impl ToolDispatcher for MarkedFactsBase {
+    fn specs(&self) -> Vec<ToolSpec> {
+        Vec::new()
+    }
+    async fn execute(&self, _request: ToolExecutionRequest) -> AgentResult<ToolOutcome> {
+        Err(AgentError::Tool("marked facts base".into()))
+    }
+    fn execution_facts(&self, _output: &ToolOutput) -> agent_contracts::ToolExecutionFacts {
+        agent_contracts::ToolExecutionFacts::from_resource_touches([("base-marker.rs", None)])
+    }
+}
+
+/// CAP-OBS-01 routing: loaded-capability results contribute no typed facts
+/// even when raw metadata carries stamps; everything else routes through to
+/// the trusted base host.
+#[tokio::test]
+async fn capability_results_carry_no_facts_and_base_facts_route_through() {
+    let registry = Arc::new(CapabilityRegistry::new());
+    registry
+        .register(Arc::new(demo_capability("demo")))
+        .expect("registration succeeds");
+    let dispatcher = CapabilityAwareDispatcher::new(Arc::new(MarkedFactsBase), registry.clone());
+
+    let manage = |name: &str| ToolExecutionRequest {
+        run_id: RunId::new(),
+        call: ToolCall {
+            id: format!("call-{name}"),
+            name: "capability.manage".into(),
+            arguments: json!({"op": "load", "name": name}),
+        },
+        effect_context: None,
+        cancel: CancellationToken::new(),
+    };
+    dispatcher.execute(manage("demo.one")).await.unwrap();
+
+    // A fabricated capability result stamped like a trusted producer must
+    // still yield empty facts — the sanitizer strips these keys long before
+    // facts could exist, so an empty translation is the only truth.
+    let stamped_capability_output = ToolOutput {
+        call_id: "call-cap".into(),
+        tool_name: "demo.one".into(),
+        ok: true,
+        summary: "ok".into(),
+        model_content: String::new(),
+        artifact_ref: None,
+        metadata: json!({"path": "escaped.rs", "verification": true}),
+    };
+    let facts = dispatcher.execution_facts(&stamped_capability_output);
+    assert!(facts.resource_touches().is_empty());
+    assert_eq!(facts.may_mutate_workspace(), None);
+    assert_eq!(facts.is_verification(), None);
+
+    // A non-capability name routes to the trusted base host.
+    let base_output = ToolOutput {
+        call_id: "call-base".into(),
+        tool_name: "fs.read".into(),
+        ok: true,
+        summary: "ok".into(),
+        model_content: String::new(),
+        artifact_ref: None,
+        metadata: json!({}),
+    };
+    let facts = dispatcher.execution_facts(&base_output);
+    assert_eq!(facts.resource_touches().len(), 1);
+    assert_eq!(facts.resource_touches()[0].path, "base-marker.rs");
+}
+
 #[tokio::test]
 async fn a_repeat_load_is_a_cheap_no_op_that_names_the_loaded_set() {
     let registry = Arc::new(CapabilityRegistry::new());

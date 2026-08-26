@@ -246,6 +246,12 @@ impl RuntimeServices {
         self.artifact_workspace.as_deref()
     }
 
+    /// The tool dispatcher lane, for typed execution facts at settlement
+    /// time (CAP-OBS-01). Dispatch itself stays behind the Core port.
+    pub(crate) fn tools(&self) -> Arc<dyn ToolDispatcher> {
+        self.tools.clone()
+    }
+
     /// Narrow authority port shared by the actor and spawn seam. It exposes
     /// no concrete Core implementation or component-authority handles.
     pub(crate) fn core_port(&self) -> Arc<dyn CorePort> {

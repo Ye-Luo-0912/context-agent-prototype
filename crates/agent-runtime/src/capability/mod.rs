@@ -1486,6 +1486,17 @@ impl ToolDispatcher for CapabilityAwareDispatcher {
         }
     }
 
+    /// Capability-originated results are untrusted producer output: their
+    /// authority keys were stripped before Core read them, so they contribute
+    /// no typed facts. Everything else routes to the trusted base host.
+    fn execution_facts(&self, output: &ToolOutput) -> agent_contracts::ToolExecutionFacts {
+        if self.capabilities.owner_of(&output.tool_name).is_some() {
+            agent_contracts::ToolExecutionFacts::empty()
+        } else {
+            self.base.execution_facts(output)
+        }
+    }
+
     async fn execute(&self, request: ToolExecutionRequest) -> AgentResult<ToolOutcome> {
         request.validate().map_err(AgentError::InvalidRequest)?;
         let name = request.call.name.clone();

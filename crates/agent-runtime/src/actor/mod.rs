@@ -335,6 +335,7 @@ impl TurnActionBatch {
         disposition: ToolResultDisposition,
         mut dispatch: ActionDispatch,
         trusted_verification: Option<bool>,
+        facts: &agent_contracts::ToolExecutionFacts,
     ) {
         self.terminal = self.terminal.saturating_add(1);
         if matches!(dispatch, ActionDispatch::Spawned)
@@ -368,13 +369,19 @@ impl TurnActionBatch {
             self.failed = self.failed.saturating_add(1);
         }
 
-        let footprint = output.mutation_footprint();
+        // CAP-OBS-01: the ledger consumes typed facts from the dispatcher
+        // lane. For untrusted producers the facts are empty and the
+        // mutation bound falls back exactly like the legacy accessor; for
+        // the trusted builtin host the stamps arrive pre-translated.
+        let footprint = facts.mutation_footprint(output.ok, output.may_mutate_workspace());
         let known_mutation = output.ok
             && matches!(
                 &footprint,
                 agent_contracts::MutationFootprint::Known(touches) if !touches.is_empty()
             );
-        let verification = trusted_verification.unwrap_or_else(|| output.is_verification());
+        let verification = trusted_verification
+            .or(facts.is_verification())
+            .unwrap_or(false);
         let unknown = matches!(footprint, agent_contracts::MutationFootprint::Unknown);
         let completion = output.ok && output.tool_name == "task.complete";
         self.known_mutation_results = self

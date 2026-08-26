@@ -2494,6 +2494,21 @@ pub trait ToolDispatcher: Send + Sync {
         ToolExecutionAttribution::default()
     }
 
+    /// Typed host-trusted [`ToolExecutionFacts`] for one settled result
+    /// (CAP-OBS-01). The default is empty facts: dynamic capabilities are
+    /// untrusted producers and their authority keys are stripped before
+    /// Core reads them, so they have no facts to contribute. Operator-
+    /// trusted hosts override this to translate their OWN stamped outputs
+    /// at one sanctioned point inside the trust boundary — consumers
+    /// downstream read facts and never re-parse producer metadata.
+    ///
+    /// This is a transitional derivation seam: when every trusted handler
+    /// constructs facts directly from its execution knowledge, the
+    /// translation inside hosts disappears without a consumer-side change.
+    fn execution_facts(&self, _output: &ToolOutput) -> crate::execution_facts::ToolExecutionFacts {
+        crate::execution_facts::ToolExecutionFacts::empty()
+    }
+
     async fn execute(&self, request: ToolExecutionRequest) -> AgentResult<ToolOutcome>;
 }
 

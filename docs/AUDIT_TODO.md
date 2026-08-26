@@ -571,11 +571,16 @@ substrate landed 2026-08-26: `ToolExecutionFacts` in
 bound / verification stamp / runtime diagnosis as typed values with
 constructors that mirror the legacy accessors exactly and default to
 empty facts; no consumer reads them yet and there is no durable wire
-form. Still open before
-Self-Iteration: switch context heating, ExecutionState, Evidence
-Frontier, RetryDomain and Verification to consume the typed facts
-instead of producer metadata at all (capability default = empty facts;
-effect receipts and workspace handles generate Runtime-owned facts).
+form. First lane landed 2026-08-26: `ToolDispatcher::execution_facts`
+(default empty) lets the operator-trusted builtin registry translate its
+own stamped outputs at one sanctioned point inside the trust boundary,
+capability-routed results contribute empty facts by routing, and the
+actor's body-free batch ledger now consumes those facts instead of
+re-deriving from producer metadata. Still open before
+Self-Iteration: switch context heating (the ingest carrier), the prompt
+working-set signal (the turn-frame carrier) and Verification to consume
+the typed facts as well, move fact construction into individual trusted
+handlers, and define the durable wire form.
 
 ### PROTO-EVID-02 — cache correctness + observability (fixed 2026-08-23)
 
