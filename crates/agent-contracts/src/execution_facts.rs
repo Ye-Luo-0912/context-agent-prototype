@@ -12,11 +12,13 @@
 //! from JSON keys.
 //!
 //! Scope honesty: this is the vocabulary plus faithful mirrors of today's
-//! derivation rules. No consumer reads it yet, and there is no durable
-//! wire form — facts live in memory between the dispatching host and the
-//! runtime until a carrier (event or envelope field) is specified. Effect
-//! receipts and workspace handles will construct these facts runtime-side;
-//! dynamic capabilities default to [`ToolExecutionFacts::empty`].
+//! derivation rules. Trusted handlers stamp native facts at construction
+//! time under [`crate::EXECUTION_FACTS_METADATA_KEY`]; the dispatching host
+//! prefers them over legacy-key derivation, and untrusted producer output
+//! loses that key fail-closed. The event-level durable DTO remains
+//! unspecified. Effect receipts and workspace handles will construct these
+//! facts runtime-side; dynamic capabilities default to
+//! [`ToolExecutionFacts::empty`].
 
 use crate::context::{MutationFootprint, ResourceTouch};
 use crate::tool::RuntimeDiagnosis;
@@ -32,8 +34,10 @@ use serde::{Deserialize, Serialize};
 /// verification stamp (`verification` / `intent=verify`, never inferred),
 /// and the runtime-owned failure diagnosis (`_runtime.failure_class`).
 ///
-/// Serialized only inside the checkpointed turn frame; there is still no
-/// event- or wire-level facts DTO.
+/// Serialized inside the checkpointed turn frame and, while in transit from
+/// a trusted handler to its dispatching host, under the reserved
+/// `metadata` key [`crate::EXECUTION_FACTS_METADATA_KEY`] (stripped from
+/// untrusted producer output). There is still no event- or wire-level facts DTO.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct ToolExecutionFacts {
     resources: Vec<ResourceTouch>,
@@ -314,5 +318,42 @@ mod tests {
             ToolExecutionFacts::from_resource_touches([("src/lib.rs", None)])
                 .with_failure(diagnosis(ToolFailureClass::Io));
         assert!(!failed_class_blocks_heat.heats_working_set(true));
+    }
+
+    #[test]
+    fn native_facts_round_trip_through_the_reserved_metadata_key() {
+        let facts =
+            ToolExecutionFacts::from_resource_touches([("src/auth.rs", Some("r1".to_owned()))])
+                .with_mutation_bound(true);
+        let mut output = output_with(json!({"path": "src/auth.rs", "revision": "r1"}));
+        output.set_native_execution_facts(facts.clone());
+        assert!(
+            output
+                .metadata
+                .get(crate::tool::EXECUTION_FACTS_METADATA_KEY)
+                .is_some()
+        );
+        let read_back = output.native_execution_facts().expect("facts round-trip");
+        assert_eq!(
+            serde_json::to_value(&read_back).unwrap(),
+            serde_json::to_value(&facts).unwrap()
+        );
+    }
+
+    #[test]
+    fn sanitizer_strips_handler_native_facts_from_untrusted_output() {
+        let mut output = output_with(json!({"path": "forged.rs"}));
+        output.set_native_execution_facts(
+            ToolExecutionFacts::from_resource_touches([("forged.rs", None)])
+                .with_mutation_bound(false),
+        );
+        crate::sanitize_untrusted_producer_output(&mut output);
+        assert!(output.native_execution_facts().is_none());
+    }
+
+    #[test]
+    fn outputs_without_the_key_keep_the_legacy_derivation_path() {
+        let output = output_with(json!({"path": "src/auth.rs", "verification": true}));
+        assert!(output.native_execution_facts().is_none());
     }
 }

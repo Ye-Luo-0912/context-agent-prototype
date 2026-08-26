@@ -651,6 +651,27 @@ Verification needs no behavioral change: the
 production observation path already draws verifier authority from the
 trusted pre-dispatch attribution channel; only its representation differs.
 
+Handler-level direct construction landed 2026-08-26 as a dual-write slice
+with no model-visible change. The authoritative builtin handlers —
+`fs.read`, `fs.list`, `fs.write`, `edit.replace` (success, no-op and
+refusal outcomes), `edit.patch` (applied, no-op, refusal), and
+`verify.run` (which owns the verification claim over its wrapped process
+result) — now stamp native `ToolExecutionFacts` at construction time
+under the reserved `metadata._execution_facts` key;
+`sanitize_untrusted_producer_output` strips that key together with the
+other reserved keys, so a dynamic capability cannot mint facts by
+carrying it. `BuiltinToolDispatcher::execution_facts` prefers native
+stamps for owned tools and keeps the legacy key derivation as the
+fallback for handlers that have not migrated; per-handler tests assert
+native equals derivation on every outcome shape, so consumers switching
+between channels see identical values. The legacy stamps stay because
+removing them changes model-visible output shapes. Still open for this
+entry: migrating any remaining producer whose bound currently comes from
+the temporary builtin-name table, retiring the legacy stamps once
+model-visible drift is acceptable (derivation then returns empty by
+construction and every fallback becomes dead-code removal), and the
+event-level durable wire DTO.
+
 ### PROTO-EVID-02 — cache correctness + observability (fixed 2026-08-23)
 
 Two findings: edit echo was cached as if it were the exact body (it is

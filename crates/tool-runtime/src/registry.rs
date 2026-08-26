@@ -605,14 +605,14 @@ impl ToolDispatcher for BuiltinToolDispatcher {
         if !owned {
             return agent_contracts::ToolExecutionFacts::empty();
         }
-        agent_contracts::ToolExecutionFacts::from_resource_touches(
-            output
-                .resource_touches()
-                .into_iter()
-                .map(|touch| (touch.path, touch.revision)),
-        )
-        .with_verification(output.is_verification())
-        .with_mutation_bound(output.may_mutate_workspace())
+        // Handler-native facts win: the trusted producer stamped its own
+        // execution truth at construction time. The legacy key derivation
+        // stays only as the fallback for handlers that have not moved to
+        // native stamping; per-handler tests lock both channels to agree.
+        if let Some(native) = output.native_execution_facts() {
+            return native;
+        }
+        Self::translate_stamped_execution_facts(output)
     }
 
     fn verification_equivalent(&self, left: (&str, &str), right: (&str, &str)) -> bool {
@@ -676,6 +676,22 @@ impl ToolDispatcher for BuiltinToolDispatcher {
 /// attribution channel. Generic shell/process remain opaque even when their
 /// command happens to run tests; only a host recipe may become Verify.
 impl BuiltinToolDispatcher {
+    /// Legacy derivation from this crate's stamped producer-authority keys.
+    /// Fallback for outputs whose handler has not moved to native stamping;
+    /// per-handler tests lock the native channel to agree with this.
+    pub(crate) fn translate_stamped_execution_facts(
+        output: &ToolOutput,
+    ) -> agent_contracts::ToolExecutionFacts {
+        agent_contracts::ToolExecutionFacts::from_resource_touches(
+            output
+                .resource_touches()
+                .into_iter()
+                .map(|touch| (touch.path, touch.revision)),
+        )
+        .with_verification(output.is_verification())
+        .with_mutation_bound(output.may_mutate_workspace())
+    }
+
     fn builtin_execution_attribution(
         &self,
         call: &agent_contracts::ToolCall,
@@ -1131,6 +1147,55 @@ mod tests {
             artifact_ref: None,
             metadata: serde_json::json!({"path": "escaped.rs", "verification": true}),
         };
+        let facts = tools.execution_facts(&foreign);
+        assert!(facts.resource_touches().is_empty());
+        assert_eq!(facts.may_mutate_workspace(), None);
+        assert_eq!(facts.is_verification(), None);
+    }
+
+    /// Handler-native stamps win over legacy-key derivation for owned
+    /// tools; an unowned name cannot mint facts even from a native key —
+    /// presence implies a trusted producer lane, not just a stamped key.
+    #[tokio::test]
+    async fn execution_facts_prefer_native_stamps_inside_the_trust_boundary() {
+        let tools = dispatcher().await;
+
+        let mut owned = ToolOutput {
+            call_id: "call-4".into(),
+            tool_name: "fs.read".into(),
+            ok: true,
+            summary: "ok".into(),
+            model_content: String::new(),
+            artifact_ref: None,
+            metadata: serde_json::json!({"path": "derived.rs", "revision": "r1"}),
+        };
+        owned.set_native_execution_facts(
+            agent_contracts::ToolExecutionFacts::from_resource_touches([(
+                "native.rs",
+                Some("r9".to_owned()),
+            )])
+            .with_mutation_bound(false),
+        );
+        let facts = tools.execution_facts(&owned);
+        assert_eq!(facts.resource_touches().len(), 1);
+        assert_eq!(facts.resource_touches()[0].path, "native.rs");
+        assert_eq!(facts.resource_touches()[0].revision.as_deref(), Some("r9"));
+        assert_eq!(facts.may_mutate_workspace(), Some(false));
+
+        let mut foreign = ToolOutput {
+            call_id: "call-5".into(),
+            tool_name: "plugin.demo.one".into(),
+            ok: true,
+            summary: "ok".into(),
+            model_content: String::new(),
+            artifact_ref: None,
+            metadata: serde_json::json!({}),
+        };
+        foreign.set_native_execution_facts(
+            agent_contracts::ToolExecutionFacts::empty()
+                .with_verification(true)
+                .with_mutation_bound(false),
+        );
         let facts = tools.execution_facts(&foreign);
         assert!(facts.resource_touches().is_empty());
         assert_eq!(facts.may_mutate_workspace(), None);

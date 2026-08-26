@@ -6,8 +6,9 @@
 //! workspace change journal (`.focus-agent/changes.jsonl`).
 
 use agent_contracts::{
-    AgentError, AgentResult, CancellationToken, Effect, RunId, ToolFailureClass, ToolOutcome,
-    ToolOutput, ToolRisk, ToolSemanticRole, ToolSpec, tool_failure_output,
+    AgentError, AgentResult, CancellationToken, Effect, RunId, ToolExecutionFacts,
+    ToolFailureClass, ToolOutcome, ToolOutput, ToolRisk, ToolSemanticRole, ToolSpec,
+    tool_failure_output,
 };
 use agent_workspace::{MAX_MUTATION_BYTES, Workspace};
 use async_trait::async_trait;
@@ -262,7 +263,7 @@ impl Tool for EditReplaceTool {
         };
 
         if updated == original {
-            return Ok(ToolOutcome::Value(ToolOutput {
+            let mut output = ToolOutput {
                 call_id: call_id.into(),
                 tool_name: "edit.replace".into(),
                 ok: true,
@@ -277,7 +278,16 @@ impl Tool for EditReplaceTool {
                     "line_ending": line_ending.as_str(),
                     "line_endings_normalized": line_endings_normalized,
                 }),
-            }));
+            };
+            output.set_native_execution_facts(
+                ToolExecutionFacts::from_resource_touches([(
+                    relative.as_str(),
+                    Some(current_revision.clone()),
+                )])
+                .with_verification(false)
+                .with_mutation_bound(true),
+            );
+            return Ok(ToolOutcome::Value(output));
         }
 
         // The new content is staged and journaled as prepared; the atomic
@@ -296,44 +306,50 @@ impl Tool for EditReplaceTool {
 
         let new_revision = content_digest(updated.as_bytes());
         let updated_line_ending = LineEnding::detect(&updated);
-        Ok(ToolOutcome::PreparedEffect {
-            output: ToolOutput {
-                call_id: call_id.into(),
-                tool_name: "edit.replace".into(),
-                ok: true,
-                summary: format!("replaced {} occurrence(s) in {}", replacements, relative),
-                // The success line carries the new revision (so a chained
-                // edit can pass `base_revision` without a re-read) plus a
-                // bounded echo of the changed region: the model can anchor
-                // its next edit on what the file actually looks like now,
-                // instead of spending a confirm `fs.read` round.
-                model_content: format!(
-                    "edit applied: {} ({} occurrence(s) of old text; bytes {} -> {}; revision {})\n{}",
-                    relative,
-                    count,
-                    original.len(),
-                    updated.len(),
-                    new_revision,
-                    super::edit_echo(&original, &updated, super::EDIT_ECHO_MAX_CHARS).trim_end()
-                ),
-                artifact_ref: None,
-                metadata: json!({
-                    "path": relative,
-                    "changed": true,
-                    "occurrences": count,
-                    "bytes_before": original.len(),
-                    "bytes_after": updated.len(),
-                    "revision": new_revision,
-                    // `line_ending` describes the returned revision. Keep
-                    // the input style separately so chained edits never
-                    // receive stale metadata after adding/removing EOLs.
-                    "line_ending_before": line_ending.as_str(),
-                    "line_ending": updated_line_ending.as_str(),
-                    "line_endings_normalized": line_endings_normalized,
-                }),
-            },
-            effect,
-        })
+        let mut output = ToolOutput {
+            call_id: call_id.into(),
+            tool_name: "edit.replace".into(),
+            ok: true,
+            summary: format!("replaced {} occurrence(s) in {}", replacements, relative),
+            // The success line carries the new revision (so a chained
+            // edit can pass `base_revision` without a re-read) plus a
+            // bounded echo of the changed region: the model can anchor
+            // its next edit on what the file actually looks like now,
+            // instead of spending a confirm `fs.read` round.
+            model_content: format!(
+                "edit applied: {} ({} occurrence(s) of old text; bytes {} -> {}; revision {})\n{}",
+                relative,
+                count,
+                original.len(),
+                updated.len(),
+                new_revision,
+                super::edit_echo(&original, &updated, super::EDIT_ECHO_MAX_CHARS).trim_end()
+            ),
+            artifact_ref: None,
+            metadata: json!({
+                "path": relative,
+                "changed": true,
+                "occurrences": count,
+                "bytes_before": original.len(),
+                "bytes_after": updated.len(),
+                "revision": new_revision,
+                // `line_ending` describes the returned revision. Keep
+                // the input style separately so chained edits never
+                // receive stale metadata after adding/removing EOLs.
+                "line_ending_before": line_ending.as_str(),
+                "line_ending": updated_line_ending.as_str(),
+                "line_endings_normalized": line_endings_normalized,
+            }),
+        };
+        output.set_native_execution_facts(
+            ToolExecutionFacts::from_resource_touches([(
+                relative.as_str(),
+                Some(new_revision.clone()),
+            )])
+            .with_verification(false)
+            .with_mutation_bound(true),
+        );
+        Ok(ToolOutcome::PreparedEffect { output, effect })
     }
 }
 
@@ -355,7 +371,7 @@ fn edit_refusal(
     } else {
         candidates.join("\n---\n")
     };
-    tool_failure_output(
+    let mut output = tool_failure_output(
         call_id,
         "edit.replace",
         class,
@@ -368,13 +384,81 @@ fn edit_refusal(
             "candidates": candidates,
             "recovery_hint": format!("current revision {revision}; matching stays exact"),
         }),
-    )
+    );
+    output.set_native_execution_facts(
+        ToolExecutionFacts::from_resource_touches([(path, Some(revision.clone()))])
+            .with_verification(false)
+            .with_mutation_bound(true),
+    );
+    output
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use agent_contracts::{CancellationToken, ToolExecutionRequest};
+
+    /// Applied, no-op and refused replace outcomes must stamp native facts
+    /// identical to the legacy key derivation.
+    #[tokio::test]
+    async fn native_facts_match_the_legacy_derivation_on_every_replace_outcome() {
+        let dir = tempfile::tempdir().unwrap();
+        let workspace = Workspace::open(dir.path()).await.unwrap();
+        std::fs::write(dir.path().join("app.txt"), "alpha beta\n").unwrap();
+        let tool = EditReplaceTool::new(workspace.clone());
+        let run_id = RunId::new();
+
+        let outcome = tool
+            .execute(
+                run_id,
+                "e",
+                json!({"path": "app.txt", "old": "alpha", "new": "gamma"}),
+                None,
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+        let ToolOutcome::PreparedEffect { output, effect } = outcome else {
+            panic!("edit.replace must prepare a committed effect");
+        };
+        assert!(output.ok);
+        crate::tools::assert_native_facts_match_derivation(&output);
+        assert!(matches!(
+            effect.commit().await,
+            agent_contracts::EffectReceipt::Applied { .. }
+        ));
+
+        let outcome = tool
+            .execute(
+                run_id,
+                "n",
+                json!({"path": "app.txt", "old": "gamma", "new": "gamma"}),
+                None,
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+        let ToolOutcome::Value(output) = outcome else {
+            panic!("no-op replacement must return a value outcome");
+        };
+        crate::tools::assert_native_facts_match_derivation(&output);
+
+        let outcome = tool
+            .execute(
+                run_id,
+                "x",
+                json!({"path": "app.txt", "old": "absent", "new": "z"}),
+                None,
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+        let ToolOutcome::Value(output) = outcome else {
+            panic!("refused replacement must return a value outcome");
+        };
+        assert!(!output.ok);
+        crate::tools::assert_native_facts_match_derivation(&output);
+    }
     use serde_json::json;
     use tokio::fs as tfs;
 

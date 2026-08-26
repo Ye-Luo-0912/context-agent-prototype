@@ -832,6 +832,36 @@ impl ToolOutput {
         touches
     }
 
+    /// Handler-native typed execution facts, stamped at construction time
+    /// under [`EXECUTION_FACTS_METADATA_KEY`]. Presence short-circuits the
+    /// legacy derivation from producer-authority metadata keys; untrusted
+    /// producer output loses the key in
+    /// [`sanitize_untrusted_producer_output`] before any consumer runs.
+    pub fn native_execution_facts(&self) -> Option<crate::execution_facts::ToolExecutionFacts> {
+        let value = self.metadata.get(EXECUTION_FACTS_METADATA_KEY)?;
+        serde_json::from_value(value.clone()).ok()
+    }
+
+    /// Stamp handler-native typed execution facts on this output. Values
+    /// must be the handler's own execution truth; this is a trusted-lane
+    /// API and mirrors nothing — derivation consumers prefer it verbatim.
+    pub fn set_native_execution_facts(
+        &mut self,
+        facts: crate::execution_facts::ToolExecutionFacts,
+    ) {
+        let Ok(value) = serde_json::to_value(&facts) else {
+            return;
+        };
+        match self.metadata.as_object_mut() {
+            Some(object) => {
+                object.insert(EXECUTION_FACTS_METADATA_KEY.into(), value);
+            }
+            None => {
+                self.metadata = serde_json::json!({ EXECUTION_FACTS_METADATA_KEY: value });
+            }
+        }
+    }
+
     /// Trusted failure class. Core writes it under `metadata._runtime`;
     /// top-level `failure_class` is accepted only as a producer hint or
     /// legacy trace.
@@ -912,9 +942,16 @@ pub const TOOL_RECOVERY_HINT_KEY: &str = "recovery_hint";
 pub const TOOL_RECOVERY_HINT_MAX_CHARS: usize = 256;
 /// Core-owned diagnosis object. Producers cannot write this key; the output
 /// authority strips it and writes the trusted copy (`TOOL-ERROR-01`).
+/// Reserved metadata key carrying handler-native typed
+/// [`crate::ToolExecutionFacts`]. Only operator-trusted handlers stamp it at
+/// construction time; [`sanitize_untrusted_producer_output`] strips it from
+/// untrusted producer output, so presence implies a trusted producer lane.
+pub const EXECUTION_FACTS_METADATA_KEY: &str = "_execution_facts";
+
 pub const RUNTIME_METADATA_KEY: &str = "_runtime";
 const RESERVED_RUNTIME_METADATA_KEYS: &[&str] = &[
     RUNTIME_METADATA_KEY,
+    EXECUTION_FACTS_METADATA_KEY,
     TOOL_FAILURE_CLASS_KEY,
     TOOL_RECOVERY_HINT_KEY,
     "retryable",
@@ -1283,7 +1320,8 @@ pub const PRODUCER_AUTHORITY_METADATA_KEYS: &[&str] = &[
 
 /// 动态 Capability 输出的统一净化（fail-closed）：先剥
 /// reserved 键（否则 [`take_runtime_diagnosis`] 会先读走 producer 自选
-/// 的 failure_class），再剥权威键。untrusted producer 只留下
+/// 的 failure_class，handler 原生事实键也在此列），再剥权威键。
+/// untrusted producer 只留下
 /// summary / model_content / artifact_ref 与无权威语义的自由键。
 pub fn sanitize_untrusted_producer_output(output: &mut ToolOutput) {
     strip_metadata_keys(&mut output.metadata, RESERVED_RUNTIME_METADATA_KEYS);

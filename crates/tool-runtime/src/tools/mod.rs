@@ -48,6 +48,23 @@ use std::path::Path;
 use tokio::fs as tokio_fs;
 use tokio::io::AsyncReadExt;
 
+/// Lock the handler-native facts channel to the legacy key derivation for
+/// one stamped output: the two channels must agree until legacy stamps are
+/// retired. Test-only.
+#[cfg(test)]
+pub(super) fn assert_native_facts_match_derivation(output: &agent_contracts::ToolOutput) {
+    let native = output
+        .native_execution_facts()
+        .expect("handler must stamp native facts");
+    let derived = crate::BuiltinToolDispatcher::translate_stamped_execution_facts(output);
+    assert_eq!(
+        serde_json::to_value(&native).unwrap(),
+        serde_json::to_value(&derived).unwrap(),
+        "native facts diverge from derivation for {}",
+        output.tool_name
+    );
+}
+
 /// Directories the workspace scanners skip by default, so build artifacts
 /// and runtime state never pollute the working set.
 pub(crate) const IGNORED_DIRS: &[&str] = &[

@@ -1,8 +1,8 @@
 use std::path::Path;
 
 use agent_contracts::{
-    AgentError, AgentResult, CancellationToken, Effect, RunId, ToolOutcome, ToolOutput, ToolRisk,
-    ToolSemanticRole, ToolSpec,
+    AgentError, AgentResult, CancellationToken, Effect, RunId, ToolExecutionFacts, ToolOutcome,
+    ToolOutput, ToolRisk, ToolSemanticRole, ToolSpec,
 };
 use agent_workspace::{MAX_MUTATION_BYTES, Workspace};
 use async_trait::async_trait;
@@ -182,7 +182,8 @@ impl Tool for FsListTool {
         } else {
             listed_relative
         };
-        Ok(ToolOutcome::Value(ToolOutput {
+        let list_revision = content_digest(full.as_bytes());
+        let mut output = ToolOutput {
             call_id: call_id.into(),
             tool_name: "fs.list".into(),
             ok: true,
@@ -197,14 +198,20 @@ impl Tool for FsListTool {
                 // digest 对完整 listing 计算：visible 只是分页窗口，
                 // 窗口外的条目变化同样改变目录身份。
                 "path": listed,
-                "revision": content_digest(full.as_bytes()),
+                "revision": list_revision,
                 "entry_count": entries.len(),
                 "returned": visible.len(),
                 "has_more": has_more,
                 "next_start_line": has_more.then_some(visible.len() + 1),
                 "cursor": cursor,
             }),
-        }))
+        };
+        output.set_native_execution_facts(
+            ToolExecutionFacts::from_resource_touches([(&listed, Some(list_revision.clone()))])
+                .with_verification(false)
+                .with_mutation_bound(false),
+        );
+        Ok(ToolOutcome::Value(output))
     }
 }
 
@@ -240,7 +247,7 @@ impl FsListTool {
         let has_more = next_offset < lines.len();
         let next_cursor = has_more.then(|| format!("{reference}#{next_offset}"));
 
-        Ok(ToolOutcome::Value(ToolOutput {
+        let mut output = ToolOutput {
             call_id: call_id.into(),
             tool_name: "fs.list".into(),
             ok: true,
@@ -262,7 +269,16 @@ impl FsListTool {
                 "has_more": has_more,
                 "cursor": next_cursor,
             }),
-        }))
+        };
+        // Snapshot pages describe no fresh directory identity; the stamp
+        // keeps the explicit read-only bound so the native channel and the
+        // legacy derivation agree on every `fs.list` outcome.
+        output.set_native_execution_facts(
+            ToolExecutionFacts::empty()
+                .with_verification(false)
+                .with_mutation_bound(false),
+        );
+        Ok(ToolOutcome::Value(output))
     }
 }
 
@@ -449,7 +465,7 @@ impl Tool for FsReadTool {
             model_content.push_str(&selected);
         }
 
-        Ok(ToolOutcome::Value(ToolOutput {
+        let mut output = ToolOutput {
             call_id: call_id.into(),
             tool_name: "fs.read".into(),
             ok: true,
@@ -466,7 +482,13 @@ impl Tool for FsReadTool {
                 // `base_revision` precondition is checked against this.
                 "revision": revision,
             }),
-        }))
+        };
+        output.set_native_execution_facts(
+            ToolExecutionFacts::from_resource_touches([(&relative, Some(revision.clone()))])
+                .with_verification(false)
+                .with_mutation_bound(false),
+        );
+        Ok(ToolOutcome::Value(output))
     }
 }
 
@@ -517,7 +539,7 @@ impl FsWriteTool {
         };
         let effect: Box<dyn Effect> = Box::new(prepared);
         let relative = display_relative(&self.workspace, &path);
-        let output = ToolOutput {
+        let mut output = ToolOutput {
             call_id: call_id.into(),
             tool_name: "fs.write".into(),
             ok: true,
@@ -531,6 +553,14 @@ impl FsWriteTool {
                 "line_ending": LineEnding::detect(&args.content).as_str(),
             }),
         };
+        output.set_native_execution_facts(
+            ToolExecutionFacts::from_resource_touches([(
+                relative.as_str(),
+                Some(content_digest(args.content.as_bytes())),
+            )])
+            .with_verification(false)
+            .with_mutation_bound(true),
+        );
         Ok(ToolOutcome::PreparedEffect { output, effect })
     }
 }
@@ -594,6 +624,68 @@ mod tests {
         assert_eq!(mixed_eol_tokens("a\r\nb\n", 0, 400), "CL");
         assert_eq!(mixed_eol_tokens("\n\r\nx", 0, 400), "LCN");
         assert_eq!(mixed_eol_tokens("a\rb", 0, 400), "N");
+    }
+
+    /// Every fs outcome that stamps native facts must agree with what the
+    /// legacy key derivation would produce — the two channels are locked
+    /// together until the legacy stamps are retired.
+    #[tokio::test]
+    async fn native_facts_match_the_legacy_derivation_on_every_fs_outcome() {
+        let dir = tempfile::tempdir().unwrap();
+        let workspace = Workspace::open(dir.path()).await.unwrap();
+        let run_id = RunId::new();
+
+        let write = FsWriteTool::new(workspace.clone());
+        let outcome = write
+            .execute(
+                run_id,
+                "w",
+                json!({"path": "notes.txt", "content": "first"}),
+                None,
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+        let ToolOutcome::PreparedEffect { output, effect } = outcome else {
+            panic!("fs.write must prepare a committed effect");
+        };
+        crate::tools::assert_native_facts_match_derivation(&output);
+        assert!(matches!(
+            effect.commit().await,
+            agent_contracts::EffectReceipt::Applied { .. }
+        ));
+
+        let read = FsReadTool::new(workspace.clone());
+        let outcome = read
+            .execute(
+                run_id,
+                "r",
+                json!({"path": "notes.txt"}),
+                None,
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+        let ToolOutcome::Value(output) = outcome else {
+            panic!("fs.read must return a value outcome");
+        };
+        crate::tools::assert_native_facts_match_derivation(&output);
+
+        let list = FsListTool::new(workspace.clone());
+        let outcome = list
+            .execute(
+                run_id,
+                "l",
+                json!({"path": "."}),
+                None,
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+        let ToolOutcome::Value(output) = outcome else {
+            panic!("fs.list must return a value outcome");
+        };
+        crate::tools::assert_native_facts_match_derivation(&output);
     }
 
     #[tokio::test]

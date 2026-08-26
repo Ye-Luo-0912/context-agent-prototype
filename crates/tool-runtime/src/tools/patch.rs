@@ -11,8 +11,9 @@
 //! journaled; the runtime commits it behind the generation fence.
 
 use agent_contracts::{
-    AgentError, AgentResult, CancellationToken, Effect, RunId, ToolFailureClass, ToolOutcome,
-    ToolOutput, ToolRisk, ToolSemanticRole, ToolSpec, tool_failure_output,
+    AgentError, AgentResult, CancellationToken, Effect, RunId, ToolExecutionFacts,
+    ToolFailureClass, ToolOutcome, ToolOutput, ToolRisk, ToolSemanticRole, ToolSpec,
+    tool_failure_output,
 };
 use agent_workspace::{MAX_MUTATION_BYTES, MutationTransaction, Workspace};
 use async_trait::async_trait;
@@ -477,6 +478,7 @@ impl Tool for EditPatchTool {
         //
         let mut effects: Vec<Box<dyn Effect>> = Vec::new();
         let mut file_reports: Vec<Value> = Vec::new();
+        let mut file_touches: Vec<(String, Option<String>)> = Vec::new();
         let mut echo_blocks: Vec<String> = Vec::new();
         let mut revisions_in_files_order: Vec<String> = Vec::with_capacity(resolved.len());
         let mut changed_any = false;
@@ -485,6 +487,7 @@ impl Tool for EditPatchTool {
             let changed = patch.updated != patch.original;
             let revision = content_digest(patch.updated.as_bytes());
             revisions_in_files_order.push(revision.clone());
+            file_touches.push((patch.relative.clone(), Some(revision.clone())));
             file_reports.push(json!({
                 "path": patch.relative,
                 "changed": changed,
@@ -516,7 +519,7 @@ impl Tool for EditPatchTool {
         }
 
         if !changed_any {
-            return Ok(ToolOutcome::Value(ToolOutput {
+            let mut output = ToolOutput {
                 call_id: call_id.into(),
                 tool_name: "edit.patch".into(),
                 ok: true,
@@ -524,7 +527,13 @@ impl Tool for EditPatchTool {
                 model_content: "no change: all hunks matched already-applied content".into(),
                 artifact_ref: None,
                 metadata: json!({"changed": false, "files": file_reports}),
-            }));
+            };
+            output.set_native_execution_facts(
+                ToolExecutionFacts::from_resource_touches(file_touches)
+                    .with_verification(false)
+                    .with_mutation_bound(true),
+            );
+            return Ok(ToolOutcome::Value(output));
         }
 
         for patch in resolved
@@ -581,29 +590,35 @@ impl Tool for EditPatchTool {
             .map(|(index, revision)| format!("{index}:{revision}"))
             .collect::<Vec<_>>()
             .join(",");
+        let mut output = ToolOutput {
+            call_id: call_id.into(),
+            tool_name: "edit.patch".into(),
+            ok: true,
+            summary: format!(
+                "applied {} hunk(s) across {} file(s)",
+                total_hunks_applied,
+                effects.len()
+            ),
+            model_content: format!(
+                "patch applied: {} file(s), {} hunk(s)\nrevisions_in_files_order={}\n{}",
+                effects.len(),
+                total_hunks_applied,
+                revision_manifest,
+                echo
+            ),
+            artifact_ref: None,
+            metadata: json!({"changed": true, "files": file_reports}),
+        };
+        output.set_native_execution_facts(
+            ToolExecutionFacts::from_resource_touches(file_touches)
+                .with_verification(false)
+                .with_mutation_bound(true),
+        );
+        // The composite effect commits changed files in order. A
+        // failure cleans the unattempted preparations; already-applied
+        // files remain applied and are reported as requiring recovery.
         Ok(ToolOutcome::PreparedEffect {
-            output: ToolOutput {
-                call_id: call_id.into(),
-                tool_name: "edit.patch".into(),
-                ok: true,
-                summary: format!(
-                    "applied {} hunk(s) across {} file(s)",
-                    total_hunks_applied,
-                    effects.len()
-                ),
-                model_content: format!(
-                    "patch applied: {} file(s), {} hunk(s)\nrevisions_in_files_order={}\n{}",
-                    effects.len(),
-                    total_hunks_applied,
-                    revision_manifest,
-                    echo
-                ),
-                artifact_ref: None,
-                metadata: json!({"changed": true, "files": file_reports}),
-            },
-            // The composite effect commits changed files in order. A
-            // failure cleans the unattempted preparations; already-applied
-            // files remain applied and are reported as requiring recovery.
+            output,
             effect: Box::new(effects),
         })
     }
@@ -627,7 +642,7 @@ fn patch_refusal(
     } else {
         candidates.join("\n---\n")
     };
-    tool_failure_output(
+    let mut output = tool_failure_output(
         call_id,
         "edit.patch",
         class,
@@ -640,7 +655,13 @@ fn patch_refusal(
             "candidates": candidates,
             "recovery_hint": format!("current revision {revision}; matching stays exact"),
         }),
-    )
+    );
+    output.set_native_execution_facts(
+        ToolExecutionFacts::from_resource_touches([(path, Some(revision.clone()))])
+            .with_verification(false)
+            .with_mutation_bound(true),
+    );
+    output
 }
 
 #[cfg(test)]
@@ -648,6 +669,77 @@ mod tests {
     use super::*;
     use agent_contracts::{CancellationToken, EffectReceipt, ToolExecutionRequest};
     use serde_json::json;
+
+    /// Applied, no-op and refused patch outcomes must stamp native facts
+    /// identical to the legacy key derivation; the applied case covers a
+    /// multi-file batch so touches keep the full `files[]` identity.
+    #[tokio::test]
+    async fn native_facts_match_the_legacy_derivation_on_every_patch_outcome() {
+        let dir = tempfile::tempdir().unwrap();
+        let workspace = Workspace::open(dir.path()).await.unwrap();
+        std::fs::write(dir.path().join("a.txt"), "one\n").unwrap();
+        std::fs::write(dir.path().join("b.txt"), "two\n").unwrap();
+        let tool = EditPatchTool::new(workspace.clone());
+        let run_id = RunId::new();
+
+        let outcome = tool
+            .execute(
+                run_id,
+                "p",
+                json!({"files": [
+                    {"path": "a.txt", "hunks": [{"old": "one", "new": "uno"}]},
+                    {"path": "b.txt", "hunks": [{"old": "two", "new": "due"}]}
+                ]}),
+                None,
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+        let ToolOutcome::PreparedEffect { output, effect } = outcome else {
+            panic!("edit.patch must prepare a composite effect");
+        };
+        assert!(output.ok);
+        crate::tools::assert_native_facts_match_derivation(&output);
+        assert!(matches!(
+            effect.commit().await,
+            agent_contracts::EffectReceipt::Applied { .. }
+        ));
+
+        let outcome = tool
+            .execute(
+                run_id,
+                "n",
+                json!({"files": [
+                    {"path": "a.txt", "hunks": [{"old": "uno", "new": "uno"}]}
+                ]}),
+                None,
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+        let ToolOutcome::Value(output) = outcome else {
+            panic!("no-op patch must return a value outcome");
+        };
+        crate::tools::assert_native_facts_match_derivation(&output);
+
+        let outcome = tool
+            .execute(
+                run_id,
+                "x",
+                json!({"files": [
+                    {"path": "a.txt", "base_revision": "0".repeat(64), "hunks": [{"old": "uno", "new": "single"}]}
+                ]}),
+                None,
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+        let ToolOutcome::Value(output) = outcome else {
+            panic!("refused patch must return a value outcome");
+        };
+        assert!(!output.ok);
+        crate::tools::assert_native_facts_match_derivation(&output);
+    }
     use std::sync::{
         Arc,
         atomic::{AtomicUsize, Ordering},

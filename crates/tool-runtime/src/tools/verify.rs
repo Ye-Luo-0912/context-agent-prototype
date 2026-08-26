@@ -4,8 +4,8 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use agent_contracts::{
-    AgentError, AgentResult, CancellationToken, HostToolPolicy, RunId, ToolOutcome, ToolRisk,
-    ToolSemanticRole, ToolSpec,
+    AgentError, AgentResult, CancellationToken, HostToolPolicy, RunId, ToolExecutionFacts,
+    ToolOutcome, ToolRisk, ToolSemanticRole, ToolSpec,
 };
 use agent_workspace::Workspace;
 use async_trait::async_trait;
@@ -135,6 +135,14 @@ impl Tool for VerificationRunTool {
                     metadata.insert("mutates_workspace".into(), json!(!recipe.source_read_only));
                     metadata.insert("verification".into(), json!(true));
                 }
+                // The wrapped process result carries no verification claim of
+                // its own; this lane owns the stamp and states it natively so
+                // the typed channel and the legacy keys cannot disagree.
+                output.set_native_execution_facts(
+                    ToolExecutionFacts::empty()
+                        .with_verification(true)
+                        .with_mutation_bound(!recipe.source_read_only),
+                );
                 ToolOutcome::Value(output)
             }
             other => other,
@@ -178,6 +186,39 @@ mod tests {
         );
     }
 
+    /// A successful recipe run stamps the verification claim natively; the
+    /// typed channel and the legacy keys must agree.
+    #[tokio::test]
+    async fn native_facts_match_the_legacy_derivation_on_recipe_success() {
+        let dir = tempfile::tempdir().unwrap();
+        let workspace = Workspace::open(dir.path()).await.unwrap();
+        let recipes = Arc::new(VerificationRecipes::new(vec![echo_recipe()]).unwrap());
+        let tool = VerificationRunTool::new(workspace, recipes).unwrap();
+        let run_id = RunId::new();
+        let arguments = json!({"recipe_id": "echo.trusted"});
+        let context = crate::tools::test_process_effect_context(
+            run_id,
+            "call-verify",
+            VERIFY_RUN_TOOL_NAME,
+            &arguments,
+        );
+        let outcome = tool
+            .execute(
+                run_id,
+                "call-verify",
+                arguments,
+                Some(context),
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+        let ToolOutcome::Value(output) = outcome else {
+            panic!("verify.run is a non-transactional process tool")
+        };
+        assert!(output.ok, "{}", output.model_content);
+        crate::tools::assert_native_facts_match_derivation(&output);
+    }
+
     #[tokio::test]
     async fn model_selects_id_but_cannot_replace_recipe_argv() {
         let dir = tempfile::tempdir().unwrap();
@@ -195,7 +236,7 @@ mod tests {
             VERIFY_RUN_TOOL_NAME,
             &arguments,
         );
-        let output = tool
+        let outcome = tool
             .execute(
                 run_id,
                 "call-verify",
@@ -205,7 +246,7 @@ mod tests {
             )
             .await
             .unwrap();
-        let ToolOutcome::Value(output) = output else {
+        let ToolOutcome::Value(output) = outcome else {
             panic!("verify.run is a non-transactional process tool")
         };
         assert!(output.ok, "{}", output.model_content);

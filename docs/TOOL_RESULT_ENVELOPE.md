@@ -88,9 +88,22 @@ legacy fallback for frames without captured touches — identical values
 today for every producer class. Verification's representation landed the
 same way: the no-attribution frontier entry reads its claim from
 dispatcher-lane facts first, and the attributed production entry keeps
-pre-dispatch attribution as the sole reusable-verifier authority. Still
-open: handler-level direct construction (which retires the legacy
-derivation by construction), and an event-level durable wire DTO. Do not
+pre-dispatch attribution as the sole reusable-verifier authority.
+Handler-level direct construction landed 2026-08-26 as dual-write: the
+authoritative builtin handlers (`fs.read`/`fs.list`/`fs.write`,
+`edit.replace`, `edit.patch`, `verify.run`) stamp native facts at
+construction time under the reserved `metadata._execution_facts` key
+(serde-typed, stripped from untrusted producer output by
+`sanitize_untrusted_producer_output` together with the other reserved
+keys), and `BuiltinToolDispatcher::execution_facts` prefers them with the
+legacy key derivation as fallback for handlers that have not migrated;
+per-handler tests lock both channels to identical values. The legacy
+stamps stay on the wire because removing them changes model-visible tool
+output shapes (pinned/convergence behavior could shift). Still open:
+retiring the legacy stamps once model-visible drift is acceptable (the
+derivation then returns empty by construction and every ingest/prompt
+fallback becomes dead-code removal), and an event-level durable wire DTO.
+Do not
 add
 new authority-bearing keys to `metadata`; plugin authors must not assume
 `metadata.path`/`metadata.revision` reaches the Runtime as truth.
