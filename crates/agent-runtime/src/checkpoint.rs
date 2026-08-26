@@ -72,6 +72,19 @@ pub struct StoredCheckpoint {
 
 const CHECKPOINT_ENVELOPE_FORMAT: &str = "runtime-checkpoint-envelope-v1";
 
+/// Refuse absurd header lines before parsing; a legitimate envelope of the
+/// three fixed keys never approaches this.
+pub(crate) const MAX_CHECKPOINT_HEADER_BYTES: usize = 4 * 1024;
+/// Hard payload ceiling. A full-plane checkpoint is bounded state, not an
+/// archive; larger inputs mean a runaway plane and must fail closed.
+pub const MAX_CHECKPOINT_PAYLOAD_BYTES: usize = 16 * 1024 * 1024;
+/// Header + payload + newline combined ceiling for one stored artifact.
+pub const MAX_CHECKPOINT_ARTIFACT_BYTES: usize =
+    MAX_CHECKPOINT_PAYLOAD_BYTES + 2 * MAX_CHECKPOINT_HEADER_BYTES;
+/// Artifacts a store retains by default after each durable write; older
+/// ones are pruned best-effort while the newest always survives.
+pub const DEFAULT_MAX_RETAINED_CHECKPOINTS: usize = 32;
+
 /// Actor-owned atomic checkpoint artifact store under the workspace state
 /// directory. A write lands as a unique temp file renamed onto its final
 /// name inside the same directory, so a reader never observes a partial
@@ -95,6 +108,30 @@ impl CheckpointStore {
     /// acknowledgement. Unique names keep every successful write
     /// addressable; retention/cleanup stays a host concern.
     pub async fn write_atomic(&self, payload: &[u8]) -> AgentResult<StoredCheckpoint> {
+        self.write_atomic_bounded(payload, DEFAULT_MAX_RETAINED_CHECKPOINTS)
+            .await
+    }
+
+    /// The bounded form of [`Self::write_atomic`]: refuses payloads or
+    /// projected artifacts beyond the explicit caps, and after a durable
+    /// rename prunes the store down to `keep` newest artifacts (the just-
+    /// written one is the newest and is never pruned).
+    pub async fn write_atomic_bounded(
+        &self,
+        payload: &[u8],
+        keep: usize,
+    ) -> AgentResult<StoredCheckpoint> {
+        if payload.len() > MAX_CHECKPOINT_PAYLOAD_BYTES {
+            return Err(AgentError::InvalidRequest(format!(
+                "checkpoint payload is {} bytes; the limit is {MAX_CHECKPOINT_PAYLOAD_BYTES}",
+                payload.len()
+            )));
+        }
+        if keep == 0 {
+            return Err(AgentError::InvalidRequest(
+                "checkpoint retention must keep at least one artifact".into(),
+            ));
+        }
         tokio::fs::create_dir_all(&self.dir)
             .await
             .map_err(|error| {
@@ -115,6 +152,12 @@ impl CheckpointStore {
         stored.extend_from_slice(header.to_string().as_bytes());
         stored.push(b'\n');
         stored.extend_from_slice(payload);
+        if stored.len() > MAX_CHECKPOINT_ARTIFACT_BYTES {
+            return Err(AgentError::InvalidRequest(format!(
+                "checkpoint artifact is {} bytes; the limit is {MAX_CHECKPOINT_ARTIFACT_BYTES}",
+                stored.len()
+            )));
+        }
         let temp = self.dir.join(format!(".{artifact}.tmp"));
         let final_path = self.dir.join(&artifact);
         write_and_sync(&temp, &stored).await.map_err(|error| {
@@ -126,11 +169,36 @@ impl CheckpointStore {
                 AgentError::InvalidRequest(format!("checkpoint rename failed: {error}"))
             })?;
         sync_directory_best_effort(&self.dir).await;
+        self.prune_retained(keep).await;
         Ok(StoredCheckpoint {
             artifact,
             bytes: stored.len() as u64,
             checksum,
         })
+    }
+
+    /// Delete the oldest artifacts beyond `keep`, never touching the newest
+    /// (which is the only one continuation may resume from). Best-effort:
+    /// a failed unlink surfaces as nothing more than extra retained bytes,
+    /// so it must not fail the durable acknowledgement that triggered it.
+    async fn prune_retained(&self, keep: usize) {
+        let mut entries: Vec<(std::time::SystemTime, std::path::PathBuf)> = Vec::new();
+        let Ok(mut reader) = tokio::fs::read_dir(&self.dir).await else {
+            return;
+        };
+        while let Ok(Some(entry)) = reader.next_entry().await {
+            let Ok(metadata) = entry.metadata().await else {
+                continue;
+            };
+            if !metadata.is_file() || !entry.file_name().to_string_lossy().ends_with(".json") {
+                continue;
+            }
+            entries.push((metadata.modified().unwrap_or(std::time::UNIX_EPOCH), entry.path()));
+        }
+        entries.sort_by_key(|(modified, _)| std::cmp::Reverse(*modified));
+        for (_, path) in entries.into_iter().skip(keep) {
+            let _ = tokio::fs::remove_file(path).await;
+        }
     }
 
     /// Load and verify one acknowledged artifact by name. Refuses unknown
@@ -160,6 +228,11 @@ impl CheckpointStore {
             .ok_or_else(|| {
                 AgentError::InvalidRequest(format!("checkpoint artifact {artifact} has no header"))
             })?;
+        if split > MAX_CHECKPOINT_HEADER_BYTES {
+            return Err(AgentError::InvalidRequest(format!(
+                "checkpoint artifact {artifact} header exceeds its byte bound"
+            )));
+        }
         let header: serde_json::Value =
             serde_json::from_slice(&stored[..split]).map_err(|error| {
                 AgentError::InvalidRequest(format!(
@@ -182,6 +255,12 @@ impl CheckpointStore {
                 "checkpoint artifact {artifact} header has no payload length"
             ))
         })? as usize;
+        if payload_bytes > MAX_CHECKPOINT_PAYLOAD_BYTES || stored.len() > MAX_CHECKPOINT_ARTIFACT_BYTES
+        {
+            return Err(AgentError::InvalidRequest(format!(
+                "checkpoint artifact {artifact} exceeds its byte bounds"
+            )));
+        }
         let payload = &stored[split + 1..];
         if payload.len() != payload_bytes {
             return Err(AgentError::InvalidRequest(format!(
@@ -333,7 +412,7 @@ impl RuntimeCheckpoint {
     /// mutation. A checkpoint is untrusted input: `tasks.active`, the
     /// actor's `current_task_id`, and the record carrying `Active` must name
     /// exactly the same task.
-    pub(crate) fn validate(&self) -> AgentResult<()> {
+    pub fn validate(&self) -> AgentResult<()> {
         if self.version != RUNTIME_CHECKPOINT_VERSION {
             return Err(AgentError::InvalidRequest(format!(
                 "checkpoint version {} is not supported (expected {}); automatic migration is not available",
@@ -547,6 +626,79 @@ impl From<TaskRecordSnapshot> for TaskRecord {
             resume: snapshot.resume,
             turn_intent: snapshot.turn_intent,
         }
+    }
+}
+
+/// Store-contract unit coverage: byte caps fail closed on both write and
+/// load, and bounded retention keeps exactly the newest artifacts.
+#[cfg(test)]
+mod store_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn oversized_payload_refuses_before_any_file_is_created() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = CheckpointStore::new(dir.path());
+        let oversized = vec![b'x'; MAX_CHECKPOINT_PAYLOAD_BYTES + 1];
+        let error = store.write_atomic(&oversized).await.unwrap_err();
+        assert!(error.to_string().contains("limit"));
+        assert!(
+            std::fs::read_dir(dir.path()).unwrap().next().is_none(),
+            "no artifact or temp file may exist after a refused write"
+        );
+    }
+
+    #[tokio::test]
+    async fn load_refuses_a_header_that_declares_an_over_cap_payload() {
+        let dir = tempfile::tempdir().unwrap();
+        let header = format!(
+            "{{\"format\":\"{CHECKPOINT_ENVELOPE_FORMAT}\",\"checksum\":\"{}\",\"payload_bytes\":{}}}\n",
+            "0".repeat(64),
+            MAX_CHECKPOINT_PAYLOAD_BYTES + 1,
+        );
+        std::fs::write(
+            dir.path().join("checkpoint-liar.json"),
+            [header.as_bytes(), b"big".as_slice()].concat(),
+        )
+        .unwrap();
+        let store = CheckpointStore::new(dir.path());
+        let error = store
+            .load_verified("checkpoint-liar.json")
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("byte bounds"));
+    }
+
+    #[tokio::test]
+    async fn retention_prunes_the_oldest_and_keeps_the_newest() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = CheckpointStore::new(dir.path());
+        for index in 0..4 {
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            store
+                .write_atomic_bounded(format!("body-{index}").as_bytes(), 2)
+                .await
+                .unwrap();
+        }
+        let names: Vec<String> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(names.len(), 2, "bounded retention keeps two: {names:?}");
+        let mut saw_newest = false;
+        for name in &names {
+            let payload = store.load_verified(name).await.unwrap();
+            let body = String::from_utf8(payload).unwrap();
+            if body.contains("body-3") {
+                saw_newest = true;
+            } else {
+                assert!(
+                    body.contains("body-2"),
+                    "only the two newest snapshots survive: {body}"
+                );
+            }
+        }
+        assert!(saw_newest, "the newest snapshot must always survive");
     }
 }
 

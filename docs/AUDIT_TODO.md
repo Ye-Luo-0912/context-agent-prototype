@@ -602,6 +602,15 @@ narrower residuals are CAP-OBS-01 and CONV-03 there.
 
 ### LONGTASK-03 — acknowledged checkpoints are not uniformly cold-restorable (reopened 2026-08-27)
 
+Landed toward this fix 2026-08-27: automatic safe points, instance
+checkpoints and terminal completion share one assembler with the bounded
+capability-generation handshake; snapshots validate before persisting;
+terminal completion is two-phase (durable prospective-terminal acknowledgement
+before any in-memory commit or `TaskCompleted`, failed writes leave the task
+pending/retryable); store input/output bounds and bounded retention landed.
+The reopened item stays until acknowledged artifacts restore into fresh
+Runtime/Context instances across the full deterministic matrix (WP5).
+
 Observed: completion clears `TaskManager.active`, then captures the final
 checkpoint while the actor still carries `current_task_id`; restore validation
 rejects that mismatched authority state. The write path can acknowledge the

@@ -52,28 +52,68 @@ impl RuntimeActor {
     }
 
     /// Assemble the runtime checkpoint from every plane this process can
-    /// see: actor state, engine snapshot, authority marker and the live
-    /// host capability surface. The registry handle is a read-only
-    /// snapshot source injected at spawn; the actor stays the sole
-    /// lifecycle orchestrator and the host performs a mechanical merge.
+    /// see, under the ONE capture contract the external instance path also
+    /// uses: the capability-surface generation is read before the actor,
+    /// context and authority planes and re-checked after; a mismatch means
+    /// a surface mutation raced the capture, so the whole assembly retries
+    /// against one stable generation instead of shipping a torn view.
+    /// A terminal override freezes the prospective post-completion task
+    /// plane (active cleared, the completing task Completed) while every
+    /// live value stays untouched.
+    async fn assemble_checkpoint(
+        &self,
+        terminal_tasks_override: Option<crate::checkpoint::TaskManagerSnapshot>,
+    ) -> AgentResult<RuntimeCheckpoint> {
+        let registry = self.services.capability_registry();
+        let mut last_error: Option<AgentError> = None;
+        for _ in 0..3 {
+            let generation_before = registry.map(|registry| registry.generation());
+            let context = match self.core.checkpoint().await {
+                Ok(context) => context,
+                Err(error) => return Err(error),
+            };
+            let authority = self.core.authority_checkpoint_marker()?;
+            let capabilities = match registry {
+                Some(registry) => registry.snapshot(),
+                None => Vec::new(),
+            };
+            if generation_before == registry.map(|registry| registry.generation()) {
+                let (tasks_snapshot, current_task_id) = match &terminal_tasks_override {
+                    Some(tasks) => (tasks.clone(), None),
+                    None => (
+                        crate::checkpoint::TaskManagerSnapshot::from_manager(&self.state.tasks),
+                        self.state.task_id,
+                    ),
+                };
+                return Ok(RuntimeCheckpoint {
+                    version: crate::checkpoint::RUNTIME_CHECKPOINT_VERSION,
+                    run_metadata: crate::checkpoint::RunMetadata {
+                        run_id: self.core.run_id(),
+                        created_at_ms: now_ms(),
+                    },
+                    tasks: tasks_snapshot,
+                    current_task_id,
+                    focus_revision: self.state.focus_revision,
+                    last_surface_revision: self.state.last_surface_revision,
+                    context,
+                    capabilities,
+                    authority,
+                    snapshot_sequence: self.state.snapshot_sequence,
+                });
+            }
+            // A capability surface mutation landed between the two planes;
+            // retry the whole capture against one stable generation.
+            last_error = Some(AgentError::Internal(
+                "capability surface kept changing during checkpoint capture".into(),
+            ));
+        }
+        Err(last_error.unwrap_or_else(|| {
+            AgentError::Internal("capability surface kept changing during checkpoint capture".into())
+        }))
+    }
+
     pub(super) async fn capture_checkpoint(&self) -> AgentResult<RuntimeCheckpoint> {
-        let context = self.core.checkpoint().await?;
-        let authority = self.core.authority_checkpoint_marker()?;
-        Ok(RuntimeCheckpoint {
-            version: crate::checkpoint::RUNTIME_CHECKPOINT_VERSION,
-            run_metadata: crate::checkpoint::RunMetadata {
-                run_id: self.core.run_id(),
-                created_at_ms: now_ms(),
-            },
-            tasks: crate::checkpoint::TaskManagerSnapshot::from_manager(&self.state.tasks),
-            current_task_id: self.state.task_id,
-            focus_revision: self.state.focus_revision,
-            last_surface_revision: self.state.last_surface_revision,
-            context,
-            capabilities: self.services.capability_snapshot(),
-            authority,
-            snapshot_sequence: self.state.snapshot_sequence,
-        })
+        self.assemble_checkpoint(None).await
     }
 
     fn checkpoint_store(&self) -> Option<CheckpointStore> {
@@ -229,7 +269,19 @@ impl RuntimeActor {
     ) {
         let capture = self.capture_checkpoint().await;
         let snapshot = match capture {
-            Ok(snapshot) => snapshot,
+            Ok(snapshot) => {
+                // The checkpoint is untrusted input the moment it exists:
+                // validate before persisting so an internally inconsistent
+                // plane can never become a durable acknowledgement.
+                if let Err(error) = snapshot.validate() {
+                    self.emit_checkpoint_write_failed(format!(
+                        "assembled checkpoint failed validation: {error}"
+                    ))
+                    .await;
+                    return;
+                }
+                snapshot
+            }
             Err(error) => {
                 self.emit_checkpoint_write_failed(error.to_string()).await;
                 return;
@@ -340,30 +392,105 @@ impl RuntimeActor {
         Ok(())
     }
 
-    /// Final barrier for a durable completion: wait out any in-flight
-    /// write, freeze one more snapshot under a freshly allocated sequence,
-    /// then wait for its acknowledgement. Returns an error when the last
-    /// write failed so the caller can surface uncertainty instead of
-    /// claiming resumability.
-    pub(super) async fn durable_final_checkpoint(&mut self) -> AgentResult<()> {
+    /// Two-phase terminal completion (phase P). The prospective
+    /// post-completion task plane is frozen under a fresh sequence,
+    /// validated, written and durably acknowledged while every live value
+    /// stays untouched. Only the caller — after this returns Ok — commits
+    /// the in-memory terminal transition and emits `TaskCompleted`. A
+    /// failed write leaves the task active/completion-pending and returns
+    /// an error so it may retry from the same authorized completion intent.
+    pub(super) async fn freeze_and_acknowledge_terminal(
+        &mut self,
+        record: crate::task::CompletionRecord,
+    ) -> Result<bool, AgentError> {
+        // `Ok(true)` = the exact terminal shape is durably acknowledged;
+        // `Ok(false)` = this composition has no checkpoint store at all, so
+        // there is nothing to make resumable and the caller completes
+        // in-memory behind one explicit warning. Only `Err` fences.
+        let Some(store) = self.checkpoint_store() else {
+            let _ = self
+                .core
+                .emit_event(RuntimeEvent::CheckpointWriteFailed {
+                    reason: Self::checkpoint_store_missing_error().to_string(),
+                })
+                .await;
+            return Ok(false);
+        };
         self.await_pending_checkpoint().await?;
+        let Some(terminal_tasks) =
+            crate::task::TaskManager::prospective_terminal_snapshot(&self.state.tasks, record)
+        else {
+            return Err(AgentError::InvalidRequest(
+                "no active task to freeze into a terminal checkpoint".into(),
+            ));
+        };
+        // Allocate the terminal snapshot's identity before freezing planes.
         self.state.snapshot_sequence = self
             .state
             .snapshot_sequence
             .checked_add(1)
             .expect("snapshot sequence cannot overflow within any realistic run");
         let sequence = self.state.snapshot_sequence;
-        let captured_debt = std::mem::take(&mut self.state.checkpoint_debt);
+        self.state.required_sequence =
+            Some(self.state.required_sequence.unwrap_or(0).max(sequence));
+        // Completion resolves every obligation by definition: whatever
+        // debt survived to this point is retired with the terminal freeze,
+        // not deferred.
+        std::mem::take(&mut self.state.checkpoint_debt);
         let anchor = self.current_anchor_revision();
-        self.schedule_checkpoint_write(sequence, anchor, captured_debt)
-            .await;
-        self.await_pending_checkpoint().await?;
-        if self.state.checkpoint_write_failed {
-            self.state.checkpoint_write_failed = false;
-            return Err(AgentError::InvalidRequest(
-                "the final checkpoint write did not land durably".into(),
-            ));
+
+        let snapshot = match self.assemble_checkpoint(Some(terminal_tasks)).await {
+            Ok(snapshot) => snapshot,
+            Err(error) => {
+                self.emit_checkpoint_write_failed(error.to_string()).await;
+                return Err(AgentError::RecoveryRequired(
+                    "the terminal checkpoint could not be assembled; the task stays \
+                     completion-pending"
+                        .into(),
+                ));
+            }
+        };
+        if let Err(error) = snapshot.validate() {
+            return Err(AgentError::InvalidRequest(format!(
+                "the terminal checkpoint is internally inconsistent; nothing was committed: {error}"
+            )));
         }
-        Ok(())
+        let bytes = serde_json::to_vec(&snapshot).map_err(|error| {
+            AgentError::Internal(format!("terminal checkpoint serialization failed: {error}"))
+        })?;
+        let in_flight_handle = tokio::spawn(async move {
+            store.write_atomic(&bytes).await.map(|stored| (sequence, stored))
+        });
+        let acked = match in_flight_handle.await {
+            Ok(result) => result,
+            Err(join_error) => Err(AgentError::InvalidRequest(format!(
+                "checkpoint write task failed: {join_error}"
+            ))),
+        };
+        match acked {
+            Ok((acked_sequence, stored)) => {
+                self.state.checkpoint_write_failed = false;
+                self.state.durable_sequence =
+                    Some(self.state.durable_sequence.unwrap_or(0).max(acked_sequence));
+                let _ = self
+                    .core
+                    .emit_event(RuntimeEvent::CheckpointDurable {
+                        bytes: stored.bytes,
+                        artifact: stored.artifact,
+                        revision: anchor,
+                        checksum: stored.checksum,
+                        sequence: acked_sequence,
+                    })
+                    .await;
+                Ok(true)
+            }
+            Err(error) => {
+                self.emit_checkpoint_write_failed(error.to_string()).await;
+                Err(AgentError::RecoveryRequired(format!(
+                    "the terminal checkpoint never landed durably ({error}); the task stays \
+                     completion-pending and the completion intent stays retryable"
+                )))
+            }
+        }
     }
 }

@@ -413,7 +413,13 @@ and sandbox contracts live elsewhere. Experiment facts live in
   frozen debt set; continuation requires no outstanding debt, no in-flight or
   failed write, and a landed sequence; the allocator watermark rides the
   checkpoint lineage without regressing on restore. Runtime suites and the
-  scripted normal/resume gate are green with the fence active.
+  scripted normal/resume gate are green with the fence active. Work package
+  two landed on top: safe-point, instance and terminal capture share one
+  generation-handshaked assembler that validates before persisting; terminal
+  completion is two-phase (durable prospective-terminal ack before any
+  in-memory commit or TaskCompleted; failed writes leave the task
+  pending/retryable); and the store enforces header/payload/artifact byte
+  caps plus bounded newest-window retention.
 
   Earlier raw artifacts remain retained as diagnostic evidence, but their
   pass/fail ratios and medians must not be used for promotion.

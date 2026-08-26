@@ -732,6 +732,23 @@ retry from the same authorized completion intent. Regression coverage must load
 the acknowledged final artifact and restore it into a fresh Runtime + Context;
 event order alone is insufficient.
 
+Status: landed deterministically 2026-08-27. Safe-point capture, external
+instance checkpoints and terminal completion now share ONE assembler with
+the bounded capability-generation handshake; every persisted snapshot passes
+`RuntimeCheckpoint::validate` before any byte is written. Terminal completion
+is two-phase: the prospective post-completion task plane (active cleared, the
+completing task Completed with its record) is frozen under a fresh sequence,
+validated and durably acknowledged while live state stays untouched — only
+then are the in-memory transition and `TaskCompleted` published. A failed
+terminal write leaves the task active/completion-pending and retryable;
+store-less compositions complete in-memory behind an explicit warning and
+never claim resumability. The store enforces explicit header/payload/artifact
+byte caps on both write and load and prunes to a bounded newest-window after
+every durable write. Covered by the turn/safepoint suite (terminal artifact
+loads checksum-verified with no active authority and its own sequence, ack
+precedes TaskCompleted, blocked-store keeps completion pending) plus new
+checkpoint store-contract tests.
+
 ### Work package 3 — one verification basis
 
 Introduce an explicit verification-basis revision or digest distinct from the

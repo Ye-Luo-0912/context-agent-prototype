@@ -907,3 +907,122 @@ async fn snapshot_sequences_increase_across_tasks_and_repeats() {
     );
     instance.shutdown().await.unwrap();
 }
+
+
+
+/// The acknowledged TERMINAL snapshot must be a real durable fact: it loads
+/// checksum-verified, passes full validation, carries no active authority,
+/// owns the finished task's completion record, and its acknowledgement is
+/// published before `TaskCompleted`.
+#[tokio::test]
+async fn final_terminal_artifact_loads_verified_and_names_no_active_task() {
+    let dir = tempfile::tempdir().unwrap();
+    let instance = completion_instance(dir.path()).await;
+    let handle = instance.handle();
+    handle
+        .set_focus("implement bounded retry".into())
+        .await
+        .unwrap();
+    let task_id = handle.list_tasks().await.unwrap()[0].id;
+    let events = handle.subscribe();
+
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    let collector = tokio::spawn({
+        let mut events = events;
+        async move {
+            let mut last_artifact = None;
+            let mut ordered = true;
+            loop {
+                match tokio::time::timeout_at(deadline, events.recv()).await {
+                    Ok(Ok(envelope)) => match envelope.event {
+                        RuntimeEvent::CheckpointDurable { artifact, .. } => {
+                            last_artifact = Some(artifact);
+                        }
+                        RuntimeEvent::TaskCompleted { .. } => {
+                            if last_artifact.is_none() {
+                                ordered = false;
+                            }
+                            return (last_artifact, ordered);
+                        }
+                        _ => {}
+                    },
+                    Ok(Err(_)) => break,
+                    Err(_) => break,
+                }
+            }
+            (last_artifact, ordered)
+        }
+    });
+
+    handle
+        .complete_current_task("the retry policy is done".into())
+        .await
+        .expect("/done must succeed once the terminal ack lands");
+    let (artifact, ordered) = collector.await.unwrap();
+    assert!(ordered, "the durable ack must precede TaskCompleted");
+    assert!(
+        artifact.is_some(),
+        "the terminal write must be acknowledged"
+    );
+
+    let store =
+        agent_runtime::CheckpointStore::new(dir.path().join(".focus-agent").join("checkpoints"));
+    let payload = store.load_verified(artifact.as_deref().unwrap()).await.unwrap();
+    let checkpoint: agent_runtime::RuntimeCheckpoint = serde_json::from_slice(&payload).unwrap();
+    checkpoint.validate().expect("the terminal snapshot validates");
+    assert!(
+        checkpoint.current_task_id.is_none() && checkpoint.tasks.active.is_none(),
+        "terminal authority must be cleared consistently"
+    );
+    assert!(
+        checkpoint.snapshot_sequence >= 1,
+        "the terminal snapshot allocates its own sequence"
+    );
+    assert!(
+        checkpoint
+            .tasks
+            .completed
+            .iter()
+            .any(|record| record.task_id == task_id),
+        "the finished task owns exactly its committed completion record"
+    );
+    instance.shutdown().await.unwrap();
+}
+
+/// With the store path blocked, phase P fails closed: `/done` surfaces the
+/// typed error and the task stays active/completion-pending.
+#[tokio::test]
+async fn blocked_terminal_write_leaves_the_task_completion_pending() {
+    let dir = tempfile::tempdir().unwrap();
+    let checkpoints_dir = dir.path().join(".focus-agent");
+    std::fs::create_dir_all(&checkpoints_dir).unwrap();
+    std::fs::write(checkpoints_dir.join("checkpoints"), b"not a directory").unwrap();
+
+    let instance = completion_instance(dir.path()).await;
+    let handle = instance.handle();
+    handle
+        .set_focus("implement bounded retry".into())
+        .await
+        .unwrap();
+    let task_id = handle.list_tasks().await.unwrap()[0].id;
+
+    let refusal = handle
+        .complete_current_task("the retry policy is done".into())
+        .await
+        .expect_err("a blocked terminal write must fail closed");
+    let refusal_text = refusal.to_string();
+    assert!(
+        refusal_text.contains("never landed durably")
+            || refusal_text.contains("stays completion-pending"),
+        "the fence names the missing durability: {refusal_text}"
+    );
+
+    let tasks = handle.list_tasks().await.unwrap();
+    let pending = tasks.iter().find(|task| task.id == task_id).unwrap();
+    assert!(
+        matches!(pending.status, agent_runtime::TaskStatus::Active),
+        "the task must stay completion-pending: {:?}",
+        pending.status
+    );
+    instance.shutdown().await.unwrap();
+}

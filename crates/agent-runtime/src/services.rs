@@ -54,13 +54,9 @@ pub struct RuntimeServices {
 }
 
 impl RuntimeServices {
-    /// The live host capability surface for checkpoint captures, when a
-    /// registry was injected at spawn.
-    pub(crate) fn capability_snapshot(&self) -> Vec<crate::checkpoint::CapabilitySnapshot> {
-        self.capability_registry
-            .as_ref()
-            .map(|registry| registry.snapshot())
-            .unwrap_or_default()
+    /// Live registry handle for the capture-side generation handshake.
+    pub(crate) fn capability_registry(&self) -> Option<&Arc<crate::capability::CapabilityRegistry>> {
+        self.capability_registry.as_ref()
     }
 
     /// Spawn-time injection probe and setter (crate-private).

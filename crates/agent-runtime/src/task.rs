@@ -660,6 +660,49 @@ impl TaskManager {
     }
 
     /// Every committed completion outcome, in completion order.
+/// Build the prospective TERMINAL snapshot for two-phase completion: the
+/// active task flips to `Completed` with its freshly prepared record inside
+/// the snapshot only, `active` clears, and the live manager is untouched.
+/// The durable acknowledgement of this exact shape is what authorizes the
+/// real in-memory transition.
+pub(crate) fn prospective_terminal_snapshot(
+    tasks: &TaskManager,
+    record: CompletionRecord,
+) -> Option<crate::checkpoint::TaskManagerSnapshot> {
+    let active = tasks.active?;
+    let mut task_rows: Vec<crate::checkpoint::TaskRecordSnapshot> = Vec::with_capacity(tasks.tasks.len() + 1);
+    let mut flipped = false;
+    for task in &tasks.tasks {
+        let status = if task.id == active {
+            flipped = true;
+            TaskStatus::Completed
+        } else {
+            task.status
+        };
+        task_rows.push(crate::checkpoint::TaskRecordSnapshot {
+            id: task.id,
+            goal: task.goal.clone(),
+            status,
+            created_at_ms: task.created_at_ms,
+            last_active_ms: task.last_active_ms,
+            tool_requirements: task.tool_requirements.clone(),
+            anchor: task.anchor.clone(),
+            resume: task.resume.clone(),
+            turn_intent: task.turn_intent.clone(),
+        });
+    }
+    if !flipped {
+        return None;
+    }
+    let mut completed = tasks.completed_records().to_vec();
+    completed.push(record);
+    Some(crate::checkpoint::TaskManagerSnapshot {
+        tasks: task_rows,
+        active: None,
+        completed,
+    })
+}
+
     pub fn completed_records(&self) -> &[CompletionRecord] {
         &self.completed
     }

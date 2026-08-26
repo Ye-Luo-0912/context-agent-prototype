@@ -941,6 +941,27 @@ impl RuntimeActor {
         let task_id = record.task_id;
         let anchor_revision = record.anchor_revision;
         let event_summary = record.summary.clone();
+
+        // PHASE P — freeze and durably acknowledge the prospective terminal
+        // snapshot while every live value stays untouched. Nothing about the
+        // active task may move before this acknowledgement: a failed write
+        // leaves the task active/completion-pending, surfacing the error so
+        // the same authorized completion intent can retry. A composition
+        // with no store at all cannot claim resumability either way, so it
+        // completes in-memory behind one explicit failure event.
+        let durable = self.freeze_and_acknowledge_terminal(record).await?;
+        if !durable {
+            let _ = self
+                .core
+                .emit_warning(
+                    "task completed in a composition with no checkpoint store; it is not \
+                     resumable by design"
+                        .to_string(),
+                )
+                .await;
+        }
+
+        // PHASE Q — the durable ack authorizes the real transition.
         self.bump_generation()?;
         let report = self
             .services
@@ -948,17 +969,6 @@ impl RuntimeActor {
             .await
             .map_err(|error| self.context_transition_failed(error))?;
         self.state.tasks.commit(txn);
-        // Final durable checkpoint after TurnCompleted and before the
-        // completed scope is reported closed. A failed final write never
-        // un-completes the task, but it is surfaced instead of claimed.
-        if let Err(error) = self.durable_final_checkpoint().await {
-            let _ = self
-                .core
-                .emit_warning(format!(
-                    "task {task_id} completed without a durable final checkpoint: {error}"
-                ))
-                .await;
-        }
         self.state.task_id = None;
         self.state.last_assistant_artifact = None;
         self.state.focus_revision = next_focus_revision;

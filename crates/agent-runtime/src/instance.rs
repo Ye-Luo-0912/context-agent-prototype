@@ -76,31 +76,12 @@ impl RuntimeInstance {
     /// truth remains in its WAL; the checkpoint references and verifies it
     /// rather than copying or rewinding it.
     ///
-    /// Capture is a freeze handshake: the capability surface generation is
-    /// read before the actor snapshot and re-checked after the capability
-    /// snapshot. A concurrent surface mutation between the two planes would
-    /// otherwise produce a mixed snapshot (actor state from one moment,
-    /// capability flags from another); the mismatch is detected and the
-    /// capture retried, bounded, instead of silently shipping a torn view.
-    /// It need not take the full-restore mutex: actor serialization means a
-    /// checkpoint either completes before restore preparation or is refused
-    /// by the pending restore fence, while the generation retry catches a
-    /// capability mutation between the two snapshot planes.
+    /// The one checkpoint capture contract lives in the actor's safe-point
+    /// assembler: capability-plane generation handshake around every plane
+    /// read, with bounded retries against a stable generation. The external
+    /// instance path and automatic safe points therefore cannot drift.
     pub async fn checkpoint(&self) -> AgentResult<RuntimeCheckpoint> {
-        let registry = self.host.capability_registry();
-        for _ in 0..3 {
-            let generation_before = registry.generation();
-            let mut checkpoint = self.handle.checkpoint().await?;
-            checkpoint.capabilities = registry.snapshot();
-            if registry.generation() == generation_before {
-                return Ok(checkpoint);
-            }
-            // A capability surface mutation landed between the two planes;
-            // retry the whole capture against one stable generation.
-        }
-        Err(AgentError::Internal(
-            "capability surface kept changing during checkpoint capture".into(),
-        ))
+        self.handle.checkpoint().await
     }
 
     /// Restore the whole runtime from a checkpoint through a two-phase
