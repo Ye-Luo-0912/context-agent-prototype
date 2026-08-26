@@ -18,51 +18,13 @@ happy-path tests pass.
 
 ## Open P0 — trusted execution
 
-### CORE-01 — M12/M13 residual (not closed)
-
-First cuts landed: trusted `HostToolPolicy`, structured `EffectIntent`
-(`ExecArgv` / `ShellExec`), `HostLifecycle` restart circuit,
-`SandboxProfile` vs post-spawn `SandboxCapabilities`. External process
-capabilities stay Disabled by default. Generic `shell.exec` /
-`process.run` / `process.session` stay non-transactional (Core identity
-before spawn, kill-then-reap, no rollback of child mutations).
-
-Remaining OS isolation is outside the V1 availability floor, not a new
-`MOD-18` slice:
-
-- Linux UDP / raw / pathname-Unix
-- Linux absolute OS-level reads
-- Windows OS-level network
-- I/O bandwidth quotas
-- seccomp / AppContainer
-
-`UntrustedGenerated` fails closed on native. That refusal is the required V1
-truth when the complete floor cannot be attested; making the profile runnable
-through WASI is a V2 candidate. Matrix:
-[`PLATFORM_SECURITY.md`](PLATFORM_SECURITY.md).
-
-M12 now needs a bounded closure audit rather than another speculative
-transport: prove that every brokerable production effect crosses the common
-reserve/dispatch/ack path, that crash windows reconcile as
-NotApplied/Applied/Ambiguous, and that authority/revocation fencing remains
-intact. Generic shell/process are explicit non-transactional exceptions.
-Requester-side application is the V1 contract; broker-owned remote execution
-is not required without a remotable consumer. Evidence schema and output path:
-[`PLATFORM_SECURITY.md`](PLATFORM_SECURITY.md) “M12 closure evidence artifact”.
-
-The audit generator landed 2026-08-27 (`agent-eval --platform-closure-m12`,
-wrapped as `platform_closure::tests::m12_closure_gates_hold_deterministically`):
-each run drives every production write family through trusted admission plus
-the journaled barrier, reopens the reservation journal for each crash window,
-observes per-binding epoch fencing on an admitted plugin binding, executes
-generic process exceptions against an empty journal, and derives one row per
-trusted table entry mechanically. Its first run wrote 28 resolved rows /
-zero unresolved and gate PASS under `crates/agent-eval/evidence/platform-
-closure/m12/`, including two independent out-of-process coordinator sessions
-sharing one durable ledger (`Applied` closed cycle, `Ambiguous` crashed
-dispatch). Formal M12 close remains conditional on regenerating that report
-on a clean source tree after the pending changes commit; nothing structural
-is left open in this item.
+The platform gates closed 2026-08-27 on clean-tree closure-audit evidence
+(CORE-01/CORE-12 moved to the archive below). Residual OS isolation stays
+outside the V1 availability floor — Linux UDP / raw / pathname-Unix, absolute
+OS-level reads, Windows OS-level network, I/O bandwidth quotas,
+seccomp / AppContainer — and `UntrustedGenerated` keeps failing closed on
+native; making that profile runnable through WASI remains a V2 candidate.
+Matrix: [`PLATFORM_SECURITY.md`](PLATFORM_SECURITY.md).
 
 ### CORE-10 — protocol remaining (not a transport swap)
 
@@ -72,37 +34,8 @@ is left open in this item.
 - PLAT-07 adapter envelope migration
 - PLAT-08 Named Pipe/UDS (later)
 
-Named pipes/UDS are not a fix for CORE-01. V1 still trusts Runtime in
-the same address space.
-
-### CORE-12 — M13 attestation depth (attestation landed 2026-08-25)
-
-Landed: `SandboxAttestation { capabilities, backend, backend_version,
-evidence }` — the boolean floor keeps its wire shape while every enforced
-flag names its mechanism (probed landlock ABI level, rlimit and job-object
-values, integrity root counts) with bounded proof text,
-consistency-checked against the flags by
-`SandboxEvidence::consistent_with` / `SandboxAttestation::validate()`.
-M13 now needs a bounded closure audit: structured attestation must validate
-against enforced evidence, activation must enforce `required ⊆ actual`, and
-native `UntrustedGenerated` must reliably refuse whenever the complete floor
-cannot be attested. Universal native availability is not the V1 gate; WASI
-execution remains V2. A renamed `process_count_quota` keeps its serde alias
-for wire compatibility. Evidence schema and output path:
-[`PLATFORM_SECURITY.md`](PLATFORM_SECURITY.md) “M13 closure evidence artifact”.
-
-The audit generator landed 2026-08-27 (`agent-eval --platform-closure-m13`,
-wrapped as a deterministic cargo test of the same name): each run spawns the
-real protocol fixture and drives
-the trusted adapter's post-spawn activation check for every supported profile,
-replays both required refusal cases (Restricted without its write-confinement
-mechanism; UntrustedGenerated against the strongest native configuration),
-records per-flag mechanism proofs straight from `ProcessHost::sandbox_attestation`,
-and adds contract-level attestation negatives plus explicit not-run rows for
-landlock-backed platforms. Its first run wrote 8 resolved rows / zero
-unresolved and gate PASS under `crates/agent-eval/evidence/platform-
-closure/m13/`. Formal close waits on a clean-tree regeneration of that report
-after the pending changes commit.
+Named pipes/UDS are not a fix for the platform gates. V1 still trusts Runtime
+in the same address space.
 
 ## Open P1 — Tool Surface reliability
 
@@ -1169,6 +1102,7 @@ Full text: git history of this file.
 | MOD-AUTH-01 | `edit.patch files[]` multi-file authority widening → `EffectIntent::WorkspaceWriteSet` + all-paths `grant_matches` (2026-08-21; see PLATFORM_SECURITY.md) |
 | MOD-AUTH-02 | Prepared effects report canonical `ActualWorkspaceWrite` (real path + real staged bytes); Core commit rejects `ActualExceedsApproved` outside the approved set (2026-08-21) |
 | LONGTASK-01/02 | Catalog-cold progress CAS, actor safe-point resume install, coalesced checkpointing and same-task continuation landed deterministically (2026-08-24/25); reopened residuals remain LONGTASK-03/04 and EXEC-REV-01 |
+| CORE-11 | HostToolPolicy registry| CORE-12 | M13 sandbox gate: structured attestation with per-flag mechanism proofs, `required ⊆ actual` activation, native fail-closed UntrustedGenerated. Closed 2026-08-27 on the clean-tree closure-audit report (`evidence/platform-closure/m13/`) |
 | Sandbox floor | `UntrustedGenerated.required` now includes `fs_read_confined` + `cpu_quota` (still fail-closed on native until provable); `process_spawn_controlled` → `process_count_quota` with a wire-compat serde alias (2026-08-21) |
 | Foreground ack | `ContextConsumptionAck.foreground_item_ids` + engine counter: foreground bodies the model saw are observable (weak signal; no residency / admission change) (2026-08-21) |
 | TOOL-02 | `search.grep` `path` accepts a file target (file-or-directory), removing a class of `path_not_found` tool failures (2026-08-21) |

@@ -1,8 +1,8 @@
 {
   "schema_version": "platform-closure.m13.v1",
-  "generated_at_unix_secs": 1787771571,
+  "generated_at_unix_secs": 1787772910,
   "platform": "windows-x86_64 (windows)",
-  "source_tree_digest": "e791fde16de47045adf60133a042af5ad9b82ecb188c6b0a5b0f4c7089e90df2",
+  "source_tree_digest": "ec8909116375d8aed74ccc7554aee20633942558e75006b25bff7a6a5998f9a5",
   "gate": "extension-sandbox-closure",
   "commands": [
     "agent-eval --platform-closure-m13",

@@ -491,7 +491,9 @@ and sandbox contracts live elsewhere. Experiment facts live in
   `tool_surface=production`. It must not be used to silently change the
   frozen Context Mechanism pin.
 
-**Do not claim M12, M13, or PLAT-06 closed.**
+**M12 and M13 closed 2026-08-27 at their named clean-tree gates**
+(`platform-closure/m12/` and `/m13/` evidence reports). **Do not claim
+PLAT-06 closed**: slice 1–2 are landed and multiplexing stays out of v0.
 
 - The typed host-trusted execution-facts channel reached its last behavioral
   consumers on 2026-08-26: context heating and observation identity now read
@@ -536,9 +538,10 @@ and sandbox contracts live elsewhere. Experiment facts live in
 
 ## P0 / P1
 
-**P0 — trusted execution.** Finish M12/M13 gates in
-[`PLATFORM_SECURITY.md`](PLATFORM_SECURITY.md): one brokerable
-`EffectRequest` path. Landed by 2026-08-26: the full admission flow —
+**P0 — trusted execution (closed).** M12/M13 gates in
+[`PLATFORM_SECURITY.md`](PLATFORM_SECURITY.md) closed 2026-08-27 on their
+clean-tree closure-audit evidence; the gate history below is retained as
+context. Landed by 2026-08-26: the full admission flow —
 an installed package manifest supplies candidate tool names only, the
 operator review artifact supplies the actual bindings,
 `admit_reviewed` installs them atomically, and versioned snapshots bind
@@ -579,8 +582,9 @@ The M13 counterpart landed the same day: `agent-eval --platform-closure-m13`
 (real child spawns, per-profile `required ⊆ actual` activation, both refusal
 cases, mechanism-proof attestations) wrote its first PASS report — 8 rows,
 zero unresolved — under `crates/agent-eval/evidence/platform-closure/m13/`.
-Formal M12/M13 closes wait only on regenerating both reports from a clean
-tree after commit; nothing structural remains open in either item.
+Both gates then closed 2026-08-27 on clean-tree regeneration of the two
+reports (commit-bound source digests in each manifest); nothing structural
+remains open in either item.
 M13 is likewise a closure audit: structured attestation must validate enforced
 evidence, activation must enforce `required ⊆ actual`, and unsupported native
 `UntrustedGenerated` must fail closed. Universal native availability belongs
@@ -736,10 +740,10 @@ stay deferred and evidence-gated.
 
 ## Next milestone
 
-Engineering mainline is the bounded **M12 closure audit, then M13 closure
-audit**, then a V1 candidate and formal M15. V2 Self-Iteration stays blocked.
-M12 does not wait for broker-owned remote execution; M13 accepts truthful
-native fail-closed activation and does not wait for the WASI/V2 runtime.
+Engineering mainline after the 2026-08-27 platform-gate closures is the
+**V1 candidate and formal M15**: define the separately frozen M15 acceptance
+design, then run it. V2 Self-Iteration stays blocked until M15 closes.
+The agent may grow capabilities, never evaluation or permission Core authority.
 
 In parallel, complete deterministic `LT-RUN-05`, then run at most the specified
 decision-grade CompletionOpportunity pair before same-model A/C. Do not spend

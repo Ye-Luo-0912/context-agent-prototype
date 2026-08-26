@@ -64,8 +64,9 @@ Do not duplicate those lists here. Do not treat
 8. **Keep v0 non-vector.** No embeddings, vector DB, graph retrieval, or RAG
    until the dynamic working-set baseline is measured. Context operational
    core is a freeze candidate: do not retune GC thresholds or reactivation
-   scoring; do not add a learned router. After Execution Coherence V1,
-   main engineering is M12/M13. Do not claim those milestones closed.
+   scoring; do not add a learned router. The platform gates M12/M13 closed
+   on their clean-tree closure-audit evidence (2026-08-27); main engineering
+   is the V1 candidate and formal M15. Do not claim M15 or V2 closed.
 
 ## Architecture and dependencies
 

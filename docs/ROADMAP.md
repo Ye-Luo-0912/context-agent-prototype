@@ -22,24 +22,27 @@ copy them back.
 | --- | --- | --- |
 | M10 Runtime Consistency | ✅ | Runtime and context never split-brain on task/restore/turn commit. |
 | M11 Context Recall | ✅ narrow retrieval | Search/inspect/fetch without polluting prompt history. Broader catalog work is not a reason to reopen recall. |
-| M12 Effect Runtime | 🟡 closure audit | Close only when one bounded evidence table proves every brokerable production effect crosses the common reserve/dispatch/ack path, crash windows reconcile as NotApplied/Applied/Ambiguous, authority/revocation fencing is preserved, and generic shell/process are explicit non-transactional exceptions. Requester-side application is the V1 contract; broker-owned remote execution is not required without a remotable consumer. Details: [`PLATFORM_SECURITY.md`](PLATFORM_SECURITY.md). **Not closed.** |
-| M13 Extension Sandbox | 🟡 closure audit | Close when structured attestation validates against enforced evidence, activation enforces `required ⊆ actual`, and native `UntrustedGenerated` reliably refuses when the complete floor cannot be attested. V1 acceptance is truthful fail-closed activation, not universal native availability. Running untrusted generated code through WASI remains V2. Details: [`PLATFORM_SECURITY.md`](PLATFORM_SECURITY.md). **Not closed.** |
+| M12 Effect Runtime | ✅ closed 2026-08-27 | The bounded evidence table proves every brokerable production effect crosses the common reserve/dispatch/ack path, crash windows reconcile as NotApplied/Applied/Ambiguous, authority/revocation fencing holds, and generic shell/process are explicit non-transactional exceptions (`crates/agent-eval/evidence/platform-closure/m12/`, clean-tree PASS; regenerate via `agent-eval --platform-closure-m12`). Requester-side application is the V1 contract; broker-owned remote execution is not required without a remotable consumer. Details: [`PLATFORM_SECURITY.md`](PLATFORM_SECURITY.md). |
+| M13 Extension Sandbox | ✅ closed 2026-08-27 | Clean-tree closure audit: real-child activation per supported profile with post-spawn mechanism attestation, both required refusals (missing write confinement; native untrusted floor), and contract negatives — zero unresolved rows (`crates/agent-eval/evidence/platform-closure/m13/`, regenerate via `agent-eval --platform-closure-m13`). V1 acceptance is truthful fail-closed activation, not universal native availability. Running untrusted generated code through WASI remains V2. Details: [`PLATFORM_SECURITY.md`](PLATFORM_SECURITY.md). |
 | M14 Resource Policy | ✅ | Schema/context quotas, standing grants, output broker, authority leases. Further typed policy is not a reopen of this gate. |
 | M15 Real Evaluation | 🧪 | Reproducible per-cell artifacts. **Context** live `context-mech.v2` 12-cell A/C evidence is in `crates/agent-eval/evidence/context-mech/`. `add_test` is Tool Surface, not Context. Frozen `context-bench.v1` SPEC stays frozen. 300×3 parked. **Not closed.** |
 | V2 Self-Iteration | 🔒 blocked | Until M12/M13/M15 close. The agent may grow capabilities, never evaluation or permission Core authority. |
 
-Open gate order: M12 closure audit → M13 closure audit → V1 candidate → formal
-M15 → V2 Self-Iteration. M14 is already closed and is not reopened or inserted
+Open gate order: M12 ✅ → M13 ✅ → V1 candidate → formal
+M15 → V2 Self-Iteration. Both platform gates closed on their named clean-tree
+evidence (2026-08-27); M14 is already closed and is not reopened or inserted
 back into the active sequence. Context live evidence runs in parallel and does
 not retune GC. Tool Surface edit reliability may improve in parallel, but it
-does not reorder or close either gate.
+does not reorder or close any gate.
 
 ## Ordered route
 
-1. Close M12 by the bounded production-path/crash/reconcile/fencing evidence
-   table; do not make raw shell transactional or wait for remote execution.
-2. Close M13 by honest structured attestation and fail-closed activation;
-   universal native `UntrustedGenerated` availability waits for WASI/V2.
+1. ~~Close M12 by the bounded production-path/crash/reconcile/fencing evidence
+   table~~ — done 2026-08-27 without making raw shell transactional or waiting
+   for remote execution.
+2. ~~Close M13 by honest structured attestation and fail-closed activation~~ —
+   done 2026-08-27; universal native `UntrustedGenerated` availability still
+   waits for WASI/V2 by design.
 3. Keep M14 closed; do not reopen it as a sandbox dump.
 4. V1 candidate: `context-mech.v2` 12-cell Context evidence exists; do not
    retune GC from it. Separately, `edit.patch` v4 removed confirmation reads in

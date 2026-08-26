@@ -1691,8 +1691,10 @@ Do not move Agent Kernel, tools, approvals, TUI, or provider code into ContextCo
 ## 9b. Process capability boundary: sandbox + cancellation (V1-M9)
 
 M12/M13 first cuts, HostToolPolicy, HostLifecycle, and the per-OS
-attestation matrix live in [`PLATFORM_SECURITY.md`](PLATFORM_SECURITY.md).
-Do not claim those milestones closed from this section.
+attestation matrix live in [`PLATFORM_SECURITY.md`](PLATFORM_SECURITY.md);
+both closed 2026-08-27 on clean-tree closure-audit evidence (see
+[`STATUS.md`](STATUS.md) and [`ROADMAP.md`](ROADMAP.md)). Do not reopen them
+from this section without new authority evidence.
 
 A process capability is not sandboxed by *telling* the child what it may
 do — the manifest's `permissions` array is informational, not
