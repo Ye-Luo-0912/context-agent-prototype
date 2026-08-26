@@ -407,6 +407,14 @@ and sandbox contracts live elsewhere. Experiment facts live in
       accounting are not yet classified strongly enough for a decision-grade
       result.
 
+  Landed since that review (2026-08-27), the first LT-RUN-05 work package:
+  actor-owned monotonic snapshot sequences replace the anchor-aliased
+  durability watermarks; acknowledgements retire exactly their artifact's
+  frozen debt set; continuation requires no outstanding debt, no in-flight or
+  failed write, and a landed sequence; the allocator watermark rides the
+  checkpoint lineage without regressing on restore. Runtime suites and the
+  scripted normal/resume gate are green with the fence active.
+
   Earlier raw artifacts remain retained as diagnostic evidence, but their
   pass/fail ratios and medians must not be used for promotion.
 - The `CompletionOpportunity` off/on gate did run twice on 2026-08-25

@@ -260,6 +260,13 @@ pub struct RuntimeCheckpoint {
     /// mutation and never installs its epoch or journal state.
     #[serde(default)]
     pub authority: Option<AuthorityCheckpointMarker>,
+    /// Actor-owned monotonic snapshot-sequence allocator watermark at
+    /// capture time. Ordering identity for durability, independent of
+    /// task-anchor revisions. Serde-defaulted so version-4 payloads written
+    /// before the field existed still load; restore takes the max against
+    /// the live allocator so a continued lineage never moves backwards.
+    #[serde(default)]
+    pub snapshot_sequence: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -586,6 +593,7 @@ mod tests {
             context: serde_json::json!({}),
             capabilities: Vec::new(),
             authority: None,
+            snapshot_sequence: 7,
         }
     }
 

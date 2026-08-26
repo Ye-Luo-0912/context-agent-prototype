@@ -696,6 +696,17 @@ Runtime durability order. Neither may impersonate the other. This keeps the
 hot path adaptive: state changes accrue cheap typed debt, while actual writes
 remain coalesced at safe points rather than following a fixed round count.
 
+Status: landed deterministically 2026-08-27. The actor allocates `S =
+prev + 1` per frozen snapshot independent of anchor revisions; each write
+carries its exact captured-debt set and only that set is retired on ack;
+`Resume(S) -> Durable(S)` order and per-artifact retirement are covered in
+`tests/turn/safepoint.rs` (same-anchor retry under a fresh sequence,
+cross-task cycles keeping allocation strictly monotonic, failed-write fence
+until a retried capture lands). The acknowledged artifact persists the
+allocator watermark and restore adopts it monotonically. Out-of-order or
+foreign acknowledgements are structurally impossible behind the single-flight
+writer, so no separate stale-ack code path exists to test.
+
 ### Work package 2 — one valid full-plane checkpoint path
 
 Automatic safe points, explicit instance checkpoints and final completion use

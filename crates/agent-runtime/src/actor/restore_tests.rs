@@ -249,6 +249,7 @@ fn checkpoint(run_id: RunId) -> RuntimeCheckpoint {
         context: serde_json::Value::Null,
         capabilities: Vec::new(),
         authority: None,
+        snapshot_sequence: 0,
     }
 }
 

@@ -377,6 +377,7 @@ async fn concurrent_full_restores_are_serialized_across_all_state_planes() {
         context: serde_json::Value::Null,
         capabilities: Vec::new(),
         authority: None,
+        snapshot_sequence: 3,
     };
     let mut checkpoint_b = checkpoint_a.clone();
     checkpoint_b.focus_revision = 41;

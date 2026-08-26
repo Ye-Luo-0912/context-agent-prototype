@@ -464,24 +464,34 @@ pub enum RuntimeEvent {
         anchor_revision: u64,
         #[serde(default)]
         debt: Vec<String>,
+        /// Actor-owned monotonic snapshot sequence allocated for the frozen
+        /// snapshot. Ordering authority for durability — independent of
+        /// task-anchor revisions, so same-anchor snapshots and cross-task
+        /// switches never alias.
+        #[serde(default)]
+        sequence: u64,
     },
     /// The scheduled background checkpoint write landed durably. Only after
     /// this event may the run be described as safely resumable up to the
-    /// write's revision. `revision` is the task-anchor revision the
-    /// artifact was captured at; `checksum` pins the artifact contents.
+    /// write's sequence. `sequence` is the actor-owned snapshot identity the
+    /// artifact was captured under; `revision` remains the legacy anchor
+    /// revision for observability only and carries no ordering meaning.
+    /// `checksum` pins the artifact contents.
     CheckpointDurable {
         #[serde(default)]
         bytes: u64,
         /// Bounded file name of the atomic checkpoint artifact.
         #[serde(default)]
         artifact: String,
-        /// Anchor revision this artifact acknowledges. Zero only for
-        /// legacy rows written before revisions existed.
+        /// Legacy anchor revision at capture; superseded by `sequence`.
         #[serde(default)]
         revision: u64,
         /// Bounded sha256 hex of the stored envelope, when recorded.
         #[serde(default)]
         checksum: String,
+        /// Snapshot sequence this acknowledgement covers.
+        #[serde(default)]
+        sequence: u64,
     },
     /// The background checkpoint write failed. Accrued debt stays visible
     /// and retryable at the next safe point; nothing may claim safe

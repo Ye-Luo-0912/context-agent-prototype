@@ -39,6 +39,7 @@ impl RuntimeActor {
             authority: _,
             run_metadata,
             version,
+            snapshot_sequence: restored_snapshot_sequence,
         } = checkpoint;
 
         let mut restored_requirement_high_water = self.state.task_requirement_high_water.clone();
@@ -82,10 +83,16 @@ impl RuntimeActor {
         let restore_id = self.bump_generation()?;
         // Durability watermarks are process-local: the loaded checkpoint
         // is itself this segment's durability proof, so pre-restore
-        // bookkeeping must not fence continuation after a restore.
-        self.state.resume_state_revision = None;
-        self.state.required_durable_revision = None;
-        self.state.durable_revision = None;
+        // bookkeeping must not fence continuation after a restore. The
+        // snapshot-sequence allocator is the one exception — it is lineage
+        // identity, so a continued run adopts at least the restored value
+        // and can never move backwards across a task switch or cold load.
+        self.state.snapshot_sequence = self
+            .state
+            .snapshot_sequence
+            .max(restored_snapshot_sequence);
+        self.state.required_sequence = None;
+        self.state.durable_sequence = None;
         self.core
             .restore(context, current_task_id)
             .await

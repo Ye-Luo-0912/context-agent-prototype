@@ -627,6 +627,14 @@ or referenced recovery artifact.
 
 ### LONGTASK-04 — resume durability watermark is not a snapshot fence (reopened 2026-08-27)
 
+Landed toward this fix 2026-08-27: actor-owned monotonic snapshot sequences
+replace the anchor-aliased watermarks (`agent-runtime/src/actor/safepoint.rs`),
+acknowledgements retire exactly their artifact's debt set, continuation
+requires no outstanding debt / no in-flight write / no failed write plus a
+landed sequence, and the allocator watermark rides the checkpoint lineage
+without moving backwards on restore. The reopened item stays until the full
+LT-RUN-05 exit matrix runs.
+
 Observed: `resume_state_revision`, required revision and durable revision all
 alias the task-anchor revision. Workspace mutation and verification can change
 the checkpoint without advancing it; task changes can lower it; zero also

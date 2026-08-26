@@ -642,8 +642,9 @@ async fn durable_ack_carries_revision_artifact_and_verifiable_payload() {
                 artifact,
                 revision,
                 checksum,
+                sequence,
             } => {
-                durable = Some((bytes, artifact, revision, checksum));
+                durable = Some((bytes, artifact, revision, checksum, sequence));
             }
             RuntimeEvent::TurnCompleted => break,
             _ => {}
@@ -654,8 +655,10 @@ async fn durable_ack_carries_revision_artifact_and_verifiable_payload() {
         vec![1],
         "the anchor patch drives the debt"
     );
-    let (_bytes, artifact, revision, checksum) = durable.expect("the write must be acknowledged");
-    assert_eq!(revision, 1, "the ack names the revision it captured");
+    let (_bytes, artifact, revision, checksum, sequence) =
+        durable.expect("the write must be acknowledged");
+    assert_eq!(revision, 1, "the legacy field names the anchor revision");
+    assert_eq!(sequence, 1, "the ack names the snapshot sequence it covers");
     assert!(!artifact.is_empty());
     assert_eq!(checksum.len(), 64, "the ack pins a sha256 digest");
 
@@ -668,6 +671,10 @@ async fn durable_ack_carries_revision_artifact_and_verifiable_payload() {
     assert_eq!(
         checkpoint.version,
         agent_runtime::RUNTIME_CHECKPOINT_VERSION
+    );
+    assert_eq!(
+        checkpoint.snapshot_sequence, 1,
+        "the persisted allocator watermark matches the acknowledged snapshot"
     );
     let payload_text = String::from_utf8_lossy(&payload);
     assert!(
@@ -760,9 +767,15 @@ async fn failed_checkpoint_write_fences_continuation_until_a_retry_lands() {
             .expect("retry turn finishes inside the deadline")
             .expect("event stream stays open");
         match envelope.event {
-            RuntimeEvent::CheckpointDurable { revision, .. } => {
+            RuntimeEvent::CheckpointDurable { revision, sequence, .. } => {
                 durable_seen = true;
-                assert_eq!(revision, 1, "the retry acknowledges the required revision");
+                // The retry captured the SAME anchor revision under a fresh
+                // snapshot: same anchor, distinct (higher) sequence.
+                assert_eq!(
+                    (revision, sequence),
+                    (1, 2),
+                    "the retry acknowledges a new snapshot of the unchanged anchor"
+                );
             }
             RuntimeEvent::TurnCompleted => break,
             _ => {}
@@ -774,5 +787,123 @@ async fn failed_checkpoint_write_fences_continuation_until_a_retry_lands() {
         .continue_active_task()
         .await
         .expect("a landed watermark releases the continuation fence");
+    instance.shutdown().await.unwrap();
+}
+
+
+/// Snapshot identity stays honest across task switches and repeat debt
+/// cycles: every frozen snapshot allocates a strictly increasing sequence,
+/// including two snapshots taken under identical anchor revisions from
+/// different tasks, so durability order can never alias or move backwards.
+#[tokio::test]
+async fn snapshot_sequences_increase_across_tasks_and_repeats() {
+    let dir = tempfile::tempdir().unwrap();
+    let instance = instance_with(
+        dir.path(),
+        "task.manage",
+        json!({"base_anchor_revision": 0, "next_action": "advance"}),
+    )
+    .await;
+    let handle = instance.handle();
+    let mut events = handle.subscribe();
+
+    // Two independent tasks, both patched to anchor revision 1.
+    handle.set_focus("first bounded retry".into()).await.unwrap();
+    let first = handle.list_tasks().await.unwrap()[0].id;
+    handle.set_focus("second bounded retry".into()).await.unwrap();
+    let tasks_now = handle.list_tasks().await.unwrap();
+    let second = tasks_now.iter().find(|t| t.id != first).expect("a second task").id;
+
+    let mut pairs = Vec::new();
+    for task in [first, second] {
+        let revision = handle
+            .patch_task_anchor(
+                task,
+                0,
+                agent_runtime::AnchorPatch {
+                    next_action: Some("advance".into()),
+                    ..agent_runtime::AnchorPatch::default()
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(revision, 1);
+        pairs.push((task, revision));
+    }
+    // Only the ACTIVE task's batch settles into a resume commit: one turn,
+    // one snapshot. Collect its sequence.
+    handle.user_message("one round".into()).await.unwrap();
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+    let mut seen_sequences: Vec<(u64, u64)> = Vec::new(); // (anchor, sequence)
+    loop {
+        let envelope = tokio::time::timeout_at(deadline, events.recv())
+            .await
+            .expect("turn finishes inside the deadline")
+            .expect("event stream stays open");
+        match envelope.event {
+            RuntimeEvent::TaskResumeCommitted { anchor_revision, sequence, .. } => {
+                seen_sequences.push((anchor_revision, sequence));
+            }
+            RuntimeEvent::CheckpointDurable { revision, sequence, .. } => {
+                let _ = (revision, sequence);
+            }
+            RuntimeEvent::TurnCompleted => break,
+            _ => {}
+        }
+    }
+    assert_eq!(seen_sequences.len(), 1, "one settled batch freezes one snapshot");
+    assert_eq!(
+        seen_sequences[0],
+        (1, 1),
+        "the first snapshot sits at anchor 1 / sequence 1"
+    );
+
+    // The inactive task's debt cycle (its own anchor patched to 2) settles
+    // only once it becomes... the handler surfaces global debt, so the next
+    // turn freezes ANOTHER snapshot for the active task under a higher
+    // sequence even though nothing about IT moved. This is precisely the
+    // decoupling under test: durable order follows snapshot allocation,
+    // never an anchor revision.
+    handle.set_focus("third segment".into()).await.unwrap();
+    let third = handle.list_tasks().await.unwrap()[0].id;
+    let _ = (second, third);
+    handle.patch_task_anchor(
+        second,
+        1,
+        agent_runtime::AnchorPatch {
+            next_action: Some("advance again".into()),
+            ..agent_runtime::AnchorPatch::default()
+        },
+    ).await.unwrap();
+
+    handle.user_message("another round".into()).await.unwrap();
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+    loop {
+        let envelope = tokio::time::timeout_at(deadline, events.recv())
+            .await
+            .expect("turn finishes inside the deadline")
+            .expect("event stream stays open");
+        match envelope.event {
+            RuntimeEvent::TaskResumeCommitted { anchor_revision, sequence, .. } => {
+                seen_sequences.push((anchor_revision, sequence));
+            }
+            RuntimeEvent::CheckpointDurable { sequence, .. } => {
+                let _ = sequence;
+            }
+            RuntimeEvent::TurnCompleted => break,
+            _ => {}
+        }
+    }
+
+    let seqs: Vec<u64> = seen_sequences.iter().map(|(_, s)| *s).collect();
+    assert!(
+        seqs.windows(2).all(|pair| pair[0] < pair[1]),
+        "snapshots allocate strictly increasing sequences: {seen_sequences:?}"
+    );
+    assert_eq!(
+        seen_sequences[0],
+        (1, 1),
+        "first observed identity stays (anchor 1, sequence 1)"
+    );
     instance.shutdown().await.unwrap();
 }
