@@ -94,6 +94,21 @@ pub enum VerificationPassEventKind {
     Reused,
 }
 
+/// How a reused PASS relates to the request it satisfied. `Exact` is the
+/// landed same-recipe identity; `DomainEquivalent` marks a sibling recipe
+/// from one host-declared coverage class. The domain id is a bounded
+/// host-chosen label, never command text.
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum VerificationPassEquivalence {
+    #[default]
+    Exact,
+    DomainEquivalent {
+        #[serde(default, skip_serializing_if = "String::is_empty")]
+        domain_id: String,
+    },
+}
+
 /// Lifecycle of one derived completion-opportunity observation. The
 /// opportunity is advisory: it never commits a task by itself.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
@@ -348,6 +363,10 @@ pub enum RuntimeEvent {
     ExecutionVerificationPass {
         #[serde(default)]
         kind: VerificationPassEventKind,
+        /// How the reuse relates to the skipped dispatch. Old events
+        /// deserialize as `Exact`.
+        #[serde(default)]
+        equivalence: VerificationPassEquivalence,
         tool_name: String,
         argument_digest: String,
         /// SHA-256 digest of the host recipe/profile/policy/environment

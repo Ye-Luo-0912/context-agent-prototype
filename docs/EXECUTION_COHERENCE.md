@@ -473,7 +473,7 @@ The remaining decision layer stays host-attributed and purpose-scoped:
    and context search/inspect/fetch remain transient and body-free, but their
    request/result receipts still count as execution actions.
 
-#### Host-declared equivalence classes (designed 2026-08-26; staged implementation)
+#### Host-declared equivalence classes (slice 1 landed 2026-08-26; dormant until hosts declare domains)
 
 Open decision items 1–2 get this concrete shape. Equivalence between two
 verifiers is always declared by the host that registers the recipes; nothing
@@ -513,6 +513,23 @@ extend the lease source enum with `ObligationProvenance { obligation_id }`
 retained exactly while the ledger row lives; the association is written only
 by the trusted code path that records the obligation, never by producer
 metadata.
+
+Slice 1 landed 2026-08-26 end to end with no default behavior change:
+`VerificationRecipeProvenance` (recipe id/revision, coverage domain,
+declaration revision, class execution-identity digest) rides pre-dispatch
+attribution only for exact verifiers; recorded PASS facts carry it;
+`current_domain_verification_pass` joins facts to sibling requests on
+domain + declaration revision + shared class digest plus every
+exact-current world check; the actor asks the dispatcher trait
+(`verification_equivalent`, default fail-closed) whether both revisions are
+declared members of one class in the current composition; the reuse event
+gains a bounded discriminator (`Exact` vs `DomainEquivalent { domain_id }`)
+and eval splits `verification_pass_reused_equivalent`. The class identity
+hashes platform, architecture, resolved executable, inherited environment
+and the requesting recipe's *current* input digests, so any external input
+drift since the recorded PASS dispatches for real. No shipped recipe
+declares a domain yet, so every request still dispatches; behavior changes
+only when a host registers classes through the single recipe-table wiring.
 
 Lease lifetime is never a fixed number of calls, rounds or seconds. A lease is
 live exactly while its typed source set is non-empty; source identity changes

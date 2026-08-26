@@ -157,6 +157,9 @@ pub struct RunMetrics {
     /// separate from model-requested verification results and tool starts.
     pub verification_pass_recorded: u64,
     pub verification_pass_reused: u64,
+    /// Subset of `verification_pass_reused` satisfied by a sibling recipe
+    /// from one host-declared coverage class instead of the exact recipe.
+    pub verification_pass_reused_equivalent: u64,
     /// 同血统第 2 次及以后的失败调用数——真正可避免的浪费
     /// （第一次失败是诚实拒绝，不是优化目标）。
     pub avoidable_failure_calls: u64,
@@ -812,12 +815,20 @@ pub fn aggregate_metrics(events: &[RuntimeEventEnvelope]) -> RunMetrics {
                     metrics.negative_fact_resolved += 1;
                 }
             },
-            RuntimeEvent::ExecutionVerificationPass { kind, .. } => match kind {
+            RuntimeEvent::ExecutionVerificationPass {
+                kind, equivalence, ..
+            } => match kind {
                 agent_contracts::VerificationPassEventKind::Recorded => {
                     metrics.verification_pass_recorded += 1;
                 }
                 agent_contracts::VerificationPassEventKind::Reused => {
                     metrics.verification_pass_reused += 1;
+                    if let agent_contracts::VerificationPassEquivalence::DomainEquivalent {
+                        ..
+                    } = equivalence
+                    {
+                        metrics.verification_pass_reused_equivalent += 1;
+                    }
                 }
             },
             RuntimeEvent::ContextMaintained { report, .. } => {
@@ -2266,6 +2277,7 @@ mod tests {
                 index as u64 + 1,
                 RuntimeEvent::ExecutionVerificationPass {
                     kind,
+                    equivalence: agent_contracts::VerificationPassEquivalence::Exact,
                     tool_name: "test.verify".into(),
                     argument_digest: "arg".into(),
                     verification_identity: "recipe:v1|env:test".into(),

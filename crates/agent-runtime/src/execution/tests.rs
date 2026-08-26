@@ -1524,6 +1524,80 @@ fn dispatcher_lane_facts_verify_without_metadata_stamps() {
 }
 
 #[test]
+fn domain_equivalent_pass_requires_matching_class_identity_and_declaration() {
+    fn attribution_for(
+        recipe_id: &str,
+        class: &str,
+        declaration_revision: u64,
+    ) -> RuntimeExecutionAttribution {
+        RuntimeExecutionAttribution {
+            host: agent_contracts::ToolExecutionAttribution::bounded(
+                ToolExecutionPurpose::Verify,
+                Vec::<String>::new(),
+                VerificationReuse::ExactCurrentWorld,
+            )
+            .with_verification_identity_material(format!("recipe:{recipe_id}|env:e").as_str())
+            .with_verification_recipe(agent_contracts::VerificationRecipeProvenance {
+                recipe_id: recipe_id.into(),
+                recipe_revision: "rev-1".into(),
+                coverage_domain: Some("workspace-tests".into()),
+                domain_declaration_revision: Some(declaration_revision),
+                class_identity_digest: class.into(),
+            }),
+            rooted_targets: Vec::new(),
+        }
+    }
+
+    let mut state = ExecutionState::default();
+    let verify = output("test.verify", true, "tests passed");
+    state.observe_tool_attributed(
+        &verify,
+        7,
+        1,
+        "arg-a",
+        &attribution_for("verify.a", "class-1", 3),
+    );
+
+    // A sibling recipe from the same declared class and shared execution
+    // identity satisfies the due verification without a dispatch.
+    let sibling =
+        state.current_domain_verification_pass(7, &attribution_for("verify.b", "class-1", 3));
+    assert!(sibling.is_some());
+    assert_eq!(
+        sibling.unwrap().recipe_provenance.unwrap().recipe_id,
+        "verify.a"
+    );
+
+    // Declaration revision bump invalidates older facts.
+    assert!(
+        state
+            .current_domain_verification_pass(7, &attribution_for("verify.b", "class-1", 4))
+            .is_none()
+    );
+    // Class execution-identity drift invalidates.
+    assert!(
+        state
+            .current_domain_verification_pass(7, &attribution_for("verify.b", "class-2", 3))
+            .is_none()
+    );
+    // A request whose host resolved no coverage domain fails closed.
+    let no_domain = RuntimeExecutionAttribution {
+        host: agent_contracts::ToolExecutionAttribution::bounded(
+            ToolExecutionPurpose::Verify,
+            Vec::<String>::new(),
+            VerificationReuse::ExactCurrentWorld,
+        )
+        .with_verification_identity_material("recipe:b|env:e"),
+        rooted_targets: Vec::new(),
+    };
+    assert!(
+        state
+            .current_domain_verification_pass(7, &no_domain)
+            .is_none()
+    );
+}
+
+#[test]
 fn exact_verification_pass_reuse_requires_the_complete_current_identity() {
     let mut state = ExecutionState::default();
     state.on_user_turn("verify current state");

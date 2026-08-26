@@ -745,8 +745,12 @@ Open implementation must remain execution-only and staged:
   is designed 2026-08-26 in
   [`EXECUTION_COHERENCE.md`](EXECUTION_COHERENCE.md) (coverage domains with
   declaration revisions, class membership evaluated against current
-  composition, fail-closed dispatch on every miss); implementation is staged
-  behind that contract. Identical
+  composition, fail-closed dispatch on every miss). Slice 1 landed 2026-08-26
+  dormant — no shipped recipe declares a domain, so every request still
+  dispatches: attribution carries bounded provenance, PASS facts store it,
+  the state predicate and actor table check implement the widened reuse,
+  and the reuse event plus eval metrics gained an exact/equivalent
+  discriminator. Identical
   in-flight joining inside one batch is landed and proven: duplicate
   typed-verification calls settle as one spawn plus one truthful no-dispatch
   reuse (`ExecutionVerificationPass` Recorded/Reused, batch accounting

@@ -1497,6 +1497,12 @@ impl ToolDispatcher for CapabilityAwareDispatcher {
         }
     }
 
+    /// Capability-owned tools never carry a recipe table; the decision
+    /// delegates to the wrapped builtin dispatcher, which fails closed.
+    fn verification_equivalent(&self, left: (&str, &str), right: (&str, &str)) -> bool {
+        self.base.verification_equivalent(left, right)
+    }
+
     async fn execute(&self, request: ToolExecutionRequest) -> AgentResult<ToolOutcome> {
         request.validate().map_err(AgentError::InvalidRequest)?;
         let name = request.call.name.clone();

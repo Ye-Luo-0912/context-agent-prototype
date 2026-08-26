@@ -787,6 +787,7 @@ fn metrics_json(metrics: &RunMetrics) -> serde_json::Value {
                 "negative_fact_resolved": metrics.negative_fact_resolved,
                 "verification_pass_recorded": metrics.verification_pass_recorded,
                 "verification_pass_reused": metrics.verification_pass_reused,
+                "verification_pass_reused_equivalent": metrics.verification_pass_reused_equivalent,
                 "edit_attempts": metrics.edit_attempts,
                 "edit_started_calls": metrics.edit_started_calls,
                 "edit_successes": metrics.edit_successes,

@@ -530,8 +530,10 @@ and sandbox contracts live elsewhere. Experiment facts live in
   production path keeps pre-dispatch attribution as the sole reusable-verifier
   authority. Values are identical for every producer class until trusted
   handlers stop stamping metadata keys, so no behavior change is claimed.
-  Host-declared verification equivalence classes are designed (see
-  [`EXECUTION_COHERENCE.md`](EXECUTION_COHERENCE.md)) but not implemented.
+  Host-declared verification equivalence classes landed their first slice
+  on 2026-08-26 and stay dormant until a host declares coverage domains
+  through the recipe table (see
+  [`EXECUTION_COHERENCE.md`](EXECUTION_COHERENCE.md)).
   Code comments no longer carry audit tracking ids; the docs own that
   vocabulary.
 

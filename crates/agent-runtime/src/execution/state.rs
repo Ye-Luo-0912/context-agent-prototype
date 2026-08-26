@@ -348,6 +348,11 @@ pub struct VerificationFact {
     /// Artifact locator of the verification output, when the tool retained one.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub evidence_ref: Option<String>,
+    /// Host-resolved provenance of the exact recipe that produced this PASS,
+    /// when the dispatcher captured one. Legacy and non-exact facts keep
+    /// `None` and never join domain-equivalent reuse.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub recipe_provenance: Option<agent_contracts::VerificationRecipeProvenance>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -403,6 +408,10 @@ impl RuntimeExecutionAttribution {
 
     pub fn exact_verification_identity(&self) -> Option<&str> {
         self.host.exact_verification_identity()
+    }
+
+    pub fn verification_recipe(&self) -> Option<&agent_contracts::VerificationRecipeProvenance> {
+        self.host.verification_recipe()
     }
 }
 
@@ -704,6 +713,50 @@ impl ExecutionState {
                     && fact.source_tool_name == tool_name
                     && fact.argument_digest == argument_digest
                     && fact.verification_identity == verification_identity
+            })
+            .cloned()
+    }
+
+    /// Domain-equivalent PASS lookup: the request and the recorded fact may
+    /// come from different recipes, but only when the trusted pre-dispatch
+    /// attribution proves both sides sit in one host-declared coverage class
+    /// under the same declaration revision, share one class execution
+    /// identity, and every exact-current world check still holds. Recipe
+    /// class membership itself is judged against the current composition by
+    /// the caller, which owns the table; any uncertainty returns `None`.
+    pub fn current_domain_verification_pass(
+        &self,
+        anchor_revision: u64,
+        attribution: &RuntimeExecutionAttribution,
+    ) -> Option<VerificationFact> {
+        // The skipped dispatch must itself be exact-capable; a downgrade to
+        // TaskScoped never rides a sibling's PASS.
+        attribution.exact_verification_identity()?;
+        let requested = attribution.verification_recipe()?;
+        let domain = requested.coverage_domain.as_deref()?;
+        if requested.domain_declaration_revision.is_none()
+            || requested.class_identity_digest.is_empty()
+        {
+            return None;
+        }
+        if self.anchor_revision != anchor_revision || self.validity() != VerificationState::Current
+        {
+            return None;
+        }
+        self.verifications
+            .iter()
+            .rev()
+            .find(|fact| {
+                fact.ok
+                    && fact.anchor_revision == anchor_revision
+                    && fact.directive_revision == self.directive_revision
+                    && fact.workspace_revision == self.workspace_revision
+                    && fact.recipe_provenance.as_ref().is_some_and(|recorded| {
+                        recorded.class_identity_digest == requested.class_identity_digest
+                            && recorded.coverage_domain.as_deref() == Some(domain)
+                            && recorded.domain_declaration_revision
+                                == requested.domain_declaration_revision
+                    })
             })
             .cloned()
     }
@@ -1719,6 +1772,8 @@ impl ExecutionState {
             verification_identity: verification_identity.clone(),
             directive_revision: self.directive_revision,
             evidence_ref: output.artifact_ref.as_ref().map(|value| bound_item(value)),
+            recipe_provenance: attribution
+                .and_then(|attribution| attribution.host.verification_recipe.clone()),
         });
         (output.ok && !verification_identity.is_empty()).then_some(VerificationPassTransition {
             kind: VerificationPassEventKind::Recorded,

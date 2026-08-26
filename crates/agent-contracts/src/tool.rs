@@ -414,6 +414,32 @@ pub struct ToolExecutionAttribution {
     /// exact PASS reuse.
     #[serde(default)]
     pub verification_identity: String,
+    /// Bounded provenance of the requested recipe, resolved from the single
+    /// host recipe table before dispatch. Present only for exact verifiers;
+    /// nothing here is model-authorable. `None` is fail-closed and keeps
+    /// domain-equivalent PASS reuse disabled.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub verification_recipe: Option<VerificationRecipeProvenance>,
+}
+
+/// Host-declared identity of one exact verifier recipe plus its coverage
+/// domain, if the host registered one. Ids and revisions only.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct VerificationRecipeProvenance {
+    pub recipe_id: String,
+    pub recipe_revision: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub coverage_domain: Option<String>,
+    /// Revision of the domain declaration in the table that produced this
+    /// attribution; a meaning bump invalidates older facts.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub domain_declaration_revision: Option<u64>,
+    /// SHA-256 over the execution profile shared by every member of the
+    /// class (platform, architecture, resolved executable, inherited
+    /// environment), excluding recipe-specific material. Empty fails
+    /// closed: domain-equivalent reuse requires it on both sides.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub class_identity_digest: String,
 }
 
 impl ToolExecutionAttribution {
@@ -442,7 +468,24 @@ impl ToolExecutionAttribution {
                 VerificationReuse::None
             },
             verification_identity: String::new(),
+            verification_recipe: None,
         }
+    }
+
+    /// Attach host-resolved recipe provenance. It sticks only for exact
+    /// verifiers whose identity digest was also captured.
+    pub fn with_verification_recipe(mut self, provenance: VerificationRecipeProvenance) -> Self {
+        if self.purpose == ToolExecutionPurpose::Verify
+            && self.verification_reuse == VerificationReuse::ExactCurrentWorld
+            && self.exact_verification_identity().is_some()
+        {
+            self.verification_recipe = Some(provenance);
+        }
+        self
+    }
+
+    pub fn verification_recipe(&self) -> Option<&VerificationRecipeProvenance> {
+        self.verification_recipe.as_ref()
     }
 
     /// Attach the complete host-side equivalence identity for an exact
@@ -2509,6 +2552,15 @@ pub trait ToolDispatcher: Send + Sync {
         crate::execution_facts::ToolExecutionFacts::empty()
     }
 
+    /// Whether the host's current recipe table declares these two exact
+    /// verifier recipes — identified by (recipe id, recipe revision) — as
+    /// one equivalence class for coverage-domain PASS reuse. The default is
+    /// fail-closed: a dispatcher without a recipe table never declares
+    /// equivalence and every verification dispatches.
+    fn verification_equivalent(&self, _left: (&str, &str), _right: (&str, &str)) -> bool {
+        false
+    }
+
     async fn execute(&self, request: ToolExecutionRequest) -> AgentResult<ToolOutcome>;
 }
 
@@ -3021,6 +3073,44 @@ mod tests {
         let exact = exact_without_identity.with_verification_identity_material("host-policy:v3");
         let expected = crate::ContentDigest::sha256_bytes(b"host-policy:v3").to_string();
         assert_eq!(exact.exact_verification_identity(), Some(expected.as_str()));
+
+        let provenance = VerificationRecipeProvenance {
+            recipe_id: "rust.workspace".into(),
+            recipe_revision: "cargo-workspace-v1".into(),
+            coverage_domain: Some("workspace-tests".into()),
+            domain_declaration_revision: Some(2),
+            class_identity_digest: "class-digest".into(),
+        };
+        // Without a captured identity the provenance is dropped fail-closed.
+        assert!(
+            ToolExecutionAttribution::bounded(
+                ToolExecutionPurpose::Verify,
+                Vec::<String>::new(),
+                VerificationReuse::ExactCurrentWorld,
+            )
+            .with_verification_recipe(provenance.clone())
+            .verification_recipe()
+            .is_none()
+        );
+        let carried = exact.with_verification_recipe(provenance);
+        let resolved = carried.verification_recipe().unwrap();
+        assert_eq!(resolved.recipe_id, "rust.workspace");
+        assert_eq!(resolved.domain_declaration_revision, Some(2));
+
+        // Task-scoped verifiers never carry recipe provenance.
+        let task_scoped = ToolExecutionAttribution::bounded(
+            ToolExecutionPurpose::Verify,
+            Vec::<String>::new(),
+            VerificationReuse::TaskScoped,
+        )
+        .with_verification_recipe(VerificationRecipeProvenance {
+            recipe_id: "r".into(),
+            recipe_revision: "rev".into(),
+            coverage_domain: None,
+            domain_declaration_revision: None,
+            class_identity_digest: String::new(),
+        });
+        assert!(task_scoped.verification_recipe().is_none());
     }
 
     #[test]

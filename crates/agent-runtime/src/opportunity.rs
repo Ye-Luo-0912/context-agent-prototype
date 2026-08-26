@@ -201,6 +201,7 @@ mod tests {
             verification_identity: "cargo-test-identity".into(),
             directive_revision: 2,
             evidence_ref: Some("artifact://v1/run/owner/digest".into()),
+            recipe_provenance: None,
         });
     }
 
@@ -282,6 +283,7 @@ mod tests {
             verification_identity: String::new(),
             directive_revision: 0,
             evidence_ref: None,
+            recipe_provenance: None,
         });
         let decision = derive_completion_opportunity(id, &anchor, &execution, false, false, false);
         assert!(decision.ready.is_none());

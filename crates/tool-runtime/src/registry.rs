@@ -23,6 +23,7 @@ use agent_contracts::{
 use agent_workspace::Workspace;
 use serde::Deserialize;
 use serde_json::json;
+use sha2::{Digest, Sha256};
 
 use crate::tools::{
     ArtifactReadTool, CodeDiagnosticsTool, CodeSymbolsTool, ContextManageTool, EditPatchTool,
@@ -614,6 +615,10 @@ impl ToolDispatcher for BuiltinToolDispatcher {
         .with_mutation_bound(output.may_mutate_workspace())
     }
 
+    fn verification_equivalent(&self, left: (&str, &str), right: (&str, &str)) -> bool {
+        self.verification_recipes.same_declared_class(left, right)
+    }
+
     async fn execute(&self, request: ToolExecutionRequest) -> AgentResult<ToolOutcome> {
         request.validate().map_err(AgentError::InvalidRequest)?;
         let name = request.call.name.clone();
@@ -722,7 +727,36 @@ impl BuiltinToolDispatcher {
                     VerificationReuse::TaskScoped,
                 );
             };
-            return attribution.with_verification_identity_material(&identity_material);
+            let class_identity_digest = recipe
+                .coverage_domain
+                .as_ref()
+                .and_then(|_| {
+                    self.verification_recipes.class_shared_identity(
+                        recipe,
+                        &self.workspace.runtime_facts(),
+                        self.workspace.root(),
+                        &executable_identity,
+                    )
+                })
+                .map(|material| format!("sha256-{:x}", Sha256::digest(material.trim().as_bytes())))
+                .unwrap_or_default();
+            let domain_declaration_revision = recipe.coverage_domain.as_ref().and_then(|domain| {
+                self.verification_recipes
+                    .domains()
+                    .iter()
+                    .find(|declared| declared.domain_id == *domain)
+                    .map(|declared| declared.declaration_revision)
+            });
+            let provenance = agent_contracts::VerificationRecipeProvenance {
+                recipe_id: recipe.id.clone(),
+                recipe_revision: recipe.revision.clone(),
+                coverage_domain: recipe.coverage_domain.clone(),
+                domain_declaration_revision,
+                class_identity_digest,
+            };
+            return attribution
+                .with_verification_identity_material(&identity_material)
+                .with_verification_recipe(provenance);
         }
         let purpose = match call.name.as_str() {
             "fs.read" => ToolExecutionPurpose::Observe,

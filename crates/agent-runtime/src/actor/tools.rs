@@ -350,21 +350,49 @@ impl RuntimeActor {
                 .task_id
                 .and_then(|task_id| self.state.tasks.get(task_id))
                 .map(|task| task.anchor.revision);
-            let verification_pass = current_anchor_revision.and_then(|anchor_revision| {
+            let verified_pass = current_anchor_revision.and_then(|anchor_revision| {
+                let tools = self.services.tools();
                 self.state.turn.as_ref().and_then(|turn| {
-                    turn.execution.current_exact_verification_pass(
+                    if let Some(pass) = turn.execution.current_exact_verification_pass(
                         &call.name,
                         &verification_argument_digest,
                         anchor_revision,
                         &attribution,
-                    )
+                    ) {
+                        return Some((pass, agent_contracts::VerificationPassEquivalence::Exact));
+                    }
+                    // Domain-equivalent fallback: a sibling recipe from one
+                    // host-declared coverage class. The state predicate
+                    // proves the shared execution/input identity and every
+                    // exact-current world check; this side additionally asks
+                    // the current composition whether the two recipe
+                    // revisions are declared members of one class.
+                    let requested = attribution.verification_recipe()?;
+                    let domain_id = requested.coverage_domain.clone()?;
+                    let pass = turn
+                        .execution
+                        .current_domain_verification_pass(anchor_revision, &attribution)?;
+                    let recorded = pass.recipe_provenance.as_ref()?;
+                    if !tools.verification_equivalent(
+                        (&recorded.recipe_id, &recorded.recipe_revision),
+                        (&requested.recipe_id, &requested.recipe_revision),
+                    ) {
+                        return None;
+                    }
+                    Some((
+                        pass,
+                        agent_contracts::VerificationPassEquivalence::DomainEquivalent {
+                            domain_id,
+                        },
+                    ))
                 })
             });
-            if let Some(pass) = verification_pass {
+            if let Some((pass, equivalence)) = verified_pass {
                 let event = RuntimeEvent::ExecutionVerificationPass {
                     kind: agent_contracts::VerificationPassEventKind::Reused,
-                    tool_name: pass.source_tool_name.clone(),
-                    argument_digest: pass.argument_digest.clone(),
+                    equivalence,
+                    tool_name: call.name.clone(),
+                    argument_digest: verification_argument_digest.clone(),
                     verification_identity: pass.verification_identity.clone(),
                     anchor_revision: pass.anchor_revision,
                     directive_revision: pass.directive_revision,
@@ -1558,6 +1586,7 @@ impl RuntimeActor {
                 .core
                 .emit_event(RuntimeEvent::ExecutionVerificationPass {
                     kind: event.kind,
+                    equivalence: agent_contracts::VerificationPassEquivalence::Exact,
                     tool_name: event.tool_name,
                     argument_digest: event.argument_digest,
                     verification_identity: event.verification_identity,
