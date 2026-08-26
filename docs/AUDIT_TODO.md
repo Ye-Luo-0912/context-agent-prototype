@@ -120,6 +120,17 @@ tests (mid-stream replay with attempt stamping, non-retryable immediate
 surface without leaking buffered output, exhaustion) plus a real-socket
 stall test proving the idle bound fires long before the client deadline.
 
+End-to-end validation landed the same day: re-running the OpenCode-relay
+gate window after the fix, the cell that previously died on a relay
+stream decode error replayed and completed (`strict=11/12 → 12/12`,
+`usage_incomplete_cells=1 → 0`, lower-bound tokens gone; two cells carry
+multi-minute walls as the visible cost of in-place replay). With
+transport noise removed, applied-patch correctness is proven across two
+providers and seven windows with zero wrong bytes ever committed, and
+every remaining gate violation on either serving is model decision
+behavior — chiefly the post-edit confirmation read. See
+`tool-surface-edit-v3-clean-tree-2026-08-26-ox-r2/REPORT.md`.
+
 ### TOOL-CONTRACT-01 — optional-union and cursor semantics (deterministic fix landed 2026-08-24; live gate open)
 
 The PinAI/Luna long-flow trace attributed 25/29 Dynamic failed outputs to
