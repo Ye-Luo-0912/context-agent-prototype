@@ -473,6 +473,47 @@ The remaining decision layer stays host-attributed and purpose-scoped:
    and context search/inspect/fetch remain transient and body-free, but their
    request/result receipts still count as execution actions.
 
+#### Host-declared equivalence classes (designed 2026-08-26; staged implementation)
+
+Open decision items 1–2 get this concrete shape. Equivalence between two
+verifiers is always declared by the host that registers the recipes; nothing
+infers it from command strings, argv or output text.
+
+- The existing single recipe table (wired once into
+  `BuiltinToolDispatcher` and `HostToolPolicyRegistry`) grows three bounded
+  fields per entry plus one side table owned by the same composition wiring:
+  `coverage_domain: Option<BoundedDomainId>` on every recipe, and
+  `VerificationCoverageDomain { domain_id, declaration_revision }` with
+  `members: Vec<(recipe_id, recipe_revision)>` declared per domain. The
+  model-visible schema stays `verify.run { recipe_id }`; none of this is
+  model-authorable.
+- A recorded PASS fact keeps its exact tuple exactly as today. The reuse
+  predicate widens from "same recipe" to: resolve the requested recipe in the
+  current composition; require its domain to equal the recorded fact's
+  domain, require the fact's stored `declaration_revision` to equal the
+  current one (a meaning bump invalidates all older facts), require both
+  recipe revisions to sit in one declared class, and then apply every
+  existing ExactCurrentWorld check unchanged. Any miss dispatches for real.
+- Class membership is evaluated against the *current* composition, never
+  checkpointed tables; checkpoints keep carrying only per-fact revisions, so
+  restore needs no new residency rules.
+- The appended `ExecutionVerificationPass::Reused` event gains a bounded
+  discriminator (`exact` vs `{domain_id, declaration_revision}`); eval splits
+  `verification_pass_reused` accordingly. Event-append failure keeps fencing
+  exactly as today.
+- Fail-closed surface: unknown recipe/domain, missing class membership,
+  revision mismatch or unresolvable composition → dispatch. Required
+  deterministic tests before default behavior: same-domain cross-recipe
+  reuse; cross-domain never reuses; declaration-revision bump invalidates;
+  unknown ids dispatch; restore under a recomposed table; append-failure
+  fence.
+
+Obligation-scoped provenance sources (open item 3) follow the same pattern:
+extend the lease source enum with `ObligationProvenance { obligation_id }`
+retained exactly while the ledger row lives; the association is written only
+by the trusted code path that records the obligation, never by producer
+metadata.
+
 Lease lifetime is never a fixed number of calls, rounds or seconds. A lease is
 live exactly while its typed source set is non-empty; source identity changes
 open a new epoch. Numeric limits exist only at allocation/wire boundaries

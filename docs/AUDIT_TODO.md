@@ -741,7 +741,12 @@ Open implementation must remain execution-only and staged:
 
 - extend the landed exact-current completed-PASS identity with broader
   bounded coverage/obligation provenance and explicit host-declared
-  equivalence classes; do not infer equivalence from commands. Identical
+  equivalence classes; do not infer equivalence from commands. The API shape
+  is designed 2026-08-26 in
+  [`EXECUTION_COHERENCE.md`](EXECUTION_COHERENCE.md) (coverage domains with
+  declaration revisions, class membership evaluated against current
+  composition, fail-closed dispatch on every miss); implementation is staged
+  behind that contract. Identical
   in-flight joining inside one batch is landed and proven: duplicate
   typed-verification calls settle as one spawn plus one truthful no-dispatch
   reuse (`ExecutionVerificationPass` Recorded/Reused, batch accounting
