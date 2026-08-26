@@ -426,6 +426,25 @@ injection behind the `test-faults` storage seam (intent append, staged
 bytes, committed record) with fail-closed recovery fixtures. M12 and M13
 mainline does not move.
 
+The first clean-tree frozen run (2026-08-26, PinAI/Luna) did not close the
+gate and produced two findings instead. First, a real contract drift: the
+unique-anchor schema made an explicit `op` required on every hunk after the
+v3 gate was authored, so the model correctly followed its tool spec and the
+gate rejected all 12 cells as non-canonical while strict raw-byte truth
+passed 12/12. The gate now accepts exactly the runtime enum values
+(`replace`/`insert_before`/`insert_after`) alongside the legacy omitted-op
+spelling, with a regression test; the drifted run's bundle is archived out
+of tree. Second, the post-fix rerun scored strict 11/12, gate 9/12,
+non-conflict-first 7/9 over wall 1277 s (prior r4: 463 s): one cell lost
+its provider session before any tool call (`usage_incomplete`, zero patch
+attempts), one crlf cell spent its first attempt on revisions not from the
+latest reads and recovered on the second, and one stale-recovery cell added
+a post-edit confirmation read that this fixture's flow gate forbids. No
+runtime regression is claimed — the residual failures are provider latency
+plus model behavior variance. TOOL-EDIT-02 stays open for one stable
+provider window meeting 12/12 strict, 12/12 gate and 9/9 non-conflict
+first patch.
+
 ## Open P1 — runtime scheduling correctness
 
 Design + invariants: [`EXECUTION_COHERENCE.md`](EXECUTION_COHERENCE.md)
