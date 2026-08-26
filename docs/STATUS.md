@@ -522,6 +522,19 @@ and sandbox contracts live elsewhere. Experiment facts live in
 
 **Do not claim M12, M13, or PLAT-06 closed.**
 
+- The typed host-trusted execution-facts channel reached its last behavioral
+  consumers on 2026-08-26: context heating and observation identity now read
+  `ContextIngress::ToolObservation.facts` (facts-first with per-value legacy
+  fallback), the no-attribution verification entry reads its claim from
+  dispatcher-lane facts under the same fallback rule, and the attributed
+  production path keeps pre-dispatch attribution as the sole reusable-verifier
+  authority. Values are identical for every producer class until trusted
+  handlers stop stamping metadata keys, so no behavior change is claimed.
+  Host-declared verification equivalence classes are designed (see
+  [`EXECUTION_COHERENCE.md`](EXECUTION_COHERENCE.md)) but not implemented.
+  Code comments no longer carry audit tracking ids; the docs own that
+  vocabulary.
+
 ## Frozen
 
 - GC knobs: `active_threshold` / `archive_threshold` / `gc_max_generation`
