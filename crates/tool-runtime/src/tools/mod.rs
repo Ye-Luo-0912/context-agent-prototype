@@ -36,8 +36,8 @@ pub(crate) use view::{
 };
 
 use agent_contracts::{
-    AgentError, AgentResult, CancellationToken, OperationEffectContext, RunId, ToolOutcome,
-    ToolSpec, is_non_transactional_process_tool, process_spawn_is_covered,
+    AgentError, AgentResult, CancellationToken, OperationEffectContext, RunId, ToolExecutionFacts,
+    ToolOutcome, ToolSpec, is_non_transactional_process_tool, process_spawn_is_covered,
 };
 use agent_process::kill_process_tree;
 use agent_workspace::Workspace;
@@ -47,6 +47,17 @@ use std::borrow::Cow;
 use std::path::Path;
 use tokio::fs as tokio_fs;
 use tokio::io::AsyncReadExt;
+
+/// The explicit workspace-mutation bound builtin producers assert about
+/// their own results. It mirrors the temporary builtin-name table exactly,
+/// so the native facts channel and the legacy derivation agree until the
+/// table retires; `process.session` deliberately stays on the fallback
+/// because its table value is under review.
+pub(crate) fn builtin_bound(may_mutate_workspace: bool) -> ToolExecutionFacts {
+    ToolExecutionFacts::empty()
+        .with_verification(false)
+        .with_mutation_bound(may_mutate_workspace)
+}
 
 /// Lock the handler-native facts channel to the legacy key derivation for
 /// one stamped output: the two channels must agree until legacy stamps are

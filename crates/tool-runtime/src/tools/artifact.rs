@@ -129,31 +129,34 @@ impl Tool for ArtifactReadTool {
         let has_more = end < lines.len();
         let next_start_line = if has_more { end + 1 } else { end };
 
-        Ok(ToolOutcome::Value(ToolOutput {
-            call_id: call_id.into(),
-            tool_name: "artifact.read".into(),
-            ok: true,
-            summary: format!(
-                "read lines {}-{} of {} ({} lines total)",
-                start + 1,
-                end,
-                display_relative(&self.workspace, &display_path),
-                lines.len()
-            ),
-            model_content: if selected.is_empty() {
-                "no lines in range".to_string()
-            } else {
-                selected
-            },
-            artifact_ref: Some(args.reference),
-            metadata: json!({
-                "total_lines": lines.len(),
-                "bytes": bytes.len(),
-                "returned": end - start,
-                "has_more": has_more,
-                "next_start_line": next_start_line,
-            }),
-        }))
+        Ok(ToolOutcome::Value(
+            ToolOutput {
+                call_id: call_id.into(),
+                tool_name: "artifact.read".into(),
+                ok: true,
+                summary: format!(
+                    "read lines {}-{} of {} ({} lines total)",
+                    start + 1,
+                    end,
+                    display_relative(&self.workspace, &display_path),
+                    lines.len()
+                ),
+                model_content: if selected.is_empty() {
+                    "no lines in range".to_string()
+                } else {
+                    selected
+                },
+                artifact_ref: Some(args.reference),
+                metadata: json!({
+                    "total_lines": lines.len(),
+                    "bytes": bytes.len(),
+                    "returned": end - start,
+                    "has_more": has_more,
+                    "next_start_line": next_start_line,
+                }),
+            }
+            .with_native_execution_facts(super::builtin_bound(false)),
+        ))
     }
 }
 

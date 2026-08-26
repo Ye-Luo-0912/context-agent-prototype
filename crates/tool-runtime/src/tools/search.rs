@@ -79,24 +79,27 @@ fn cancelled_outcome(
         "cursor": serde_json::Value::Null,
     });
     attach_failure_class(&mut metadata, ToolFailureClass::Cancellation);
-    ToolOutcome::Value(ToolOutput {
-        call_id: call_id.into(),
-        tool_name: "search.grep".into(),
-        ok: false,
-        summary: format!(
-            "cancelled after {} hits for /{}/ across {} files",
-            hits.len(),
-            pattern,
-            scanned_files
-        ),
-        model_content: if model_hits.is_empty() {
-            "cancelled".into()
-        } else {
-            model_hits.join("\n")
-        },
-        artifact_ref: None,
-        metadata,
-    })
+    ToolOutcome::Value(
+        ToolOutput {
+            call_id: call_id.into(),
+            tool_name: "search.grep".into(),
+            ok: false,
+            summary: format!(
+                "cancelled after {} hits for /{}/ across {} files",
+                hits.len(),
+                pattern,
+                scanned_files
+            ),
+            model_content: if model_hits.is_empty() {
+                "cancelled".into()
+            } else {
+                model_hits.join("\n")
+            },
+            artifact_ref: None,
+            metadata,
+        }
+        .with_native_execution_facts(super::builtin_bound(false)),
+    )
 }
 
 #[async_trait]
@@ -270,24 +273,27 @@ impl Tool for SearchGrepTool {
             attach_failure_class(&mut metadata, ToolFailureClass::NoSearchMatch);
         }
 
-        Ok(ToolOutcome::Value(ToolOutput {
-            call_id: call_id.into(),
-            tool_name: "search.grep".into(),
-            ok: true,
-            summary: format!(
-                "{} hits for /{}/ across {} files",
-                hits.len(),
-                args.pattern,
-                scanned_files
-            ),
-            model_content: if model_hits.is_empty() {
-                "no matches".to_string()
-            } else {
-                format!("{}{}", model_hits.join("\n"), truncated_note)
-            },
-            artifact_ref,
-            metadata,
-        }))
+        Ok(ToolOutcome::Value(
+            ToolOutput {
+                call_id: call_id.into(),
+                tool_name: "search.grep".into(),
+                ok: true,
+                summary: format!(
+                    "{} hits for /{}/ across {} files",
+                    hits.len(),
+                    args.pattern,
+                    scanned_files
+                ),
+                model_content: if model_hits.is_empty() {
+                    "no matches".to_string()
+                } else {
+                    format!("{}{}", model_hits.join("\n"), truncated_note)
+                },
+                artifact_ref,
+                metadata,
+            }
+            .with_native_execution_facts(super::builtin_bound(false)),
+        ))
     }
 }
 
@@ -323,29 +329,32 @@ impl SearchGrepTool {
         let has_more = next_offset < lines.len();
         let next_cursor = has_more.then(|| format!("{reference}#{next_offset}"));
 
-        Ok(ToolOutcome::Value(ToolOutput {
-            call_id: call_id.into(),
-            tool_name: "search.grep".into(),
-            ok: true,
-            summary: format!(
-                "hit page {}-{} of {} (snapshot)",
-                offset + 1,
-                next_offset,
-                lines.len()
-            ),
-            model_content: if page.is_empty() {
-                "no more hits".to_string()
-            } else {
-                page.join("\n")
-            },
-            artifact_ref: Some(reference.to_string()),
-            metadata: json!({
-                "hits": lines.len(),
-                "returned": page.len(),
-                "has_more": has_more,
-                "cursor": next_cursor,
-            }),
-        }))
+        Ok(ToolOutcome::Value(
+            ToolOutput {
+                call_id: call_id.into(),
+                tool_name: "search.grep".into(),
+                ok: true,
+                summary: format!(
+                    "hit page {}-{} of {} (snapshot)",
+                    offset + 1,
+                    next_offset,
+                    lines.len()
+                ),
+                model_content: if page.is_empty() {
+                    "no more hits".to_string()
+                } else {
+                    page.join("\n")
+                },
+                artifact_ref: Some(reference.to_string()),
+                metadata: json!({
+                    "hits": lines.len(),
+                    "returned": page.len(),
+                    "has_more": has_more,
+                    "cursor": next_cursor,
+                }),
+            }
+            .with_native_execution_facts(super::builtin_bound(false)),
+        ))
     }
 }
 

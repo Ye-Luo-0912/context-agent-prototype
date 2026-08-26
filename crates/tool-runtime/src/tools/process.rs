@@ -724,7 +724,8 @@ impl ProcessRunTool {
             model_content,
             artifact_ref,
             metadata,
-        }))
+        }
+        .with_native_execution_facts(super::builtin_bound(true))))
     }
 }
 

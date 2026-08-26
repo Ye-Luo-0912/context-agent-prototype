@@ -149,7 +149,8 @@ impl Tool for TaskManageTool {
                     "base_anchor_revision": proposal.base_anchor_revision,
                     "requested_fields": touched,
                 }),
-            },
+            }
+            .with_native_execution_facts(super::builtin_bound(false)),
             directive: RuntimeDirective::UpdateTaskProgress(proposal),
         })
     }

@@ -676,6 +676,15 @@ impl ToolDispatcher for BuiltinToolDispatcher {
 /// attribution channel. Generic shell/process remain opaque even when their
 /// command happens to run tests; only a host recipe may become Verify.
 impl BuiltinToolDispatcher {
+    /// Explicit bound for the catalog's own control-surface results;
+    /// mirrors `tools::builtin_bound` so every capability.manage outcome
+    /// carries native facts instead of the name-table fallback.
+    fn manage_bound(may_mutate_workspace: bool) -> agent_contracts::ToolExecutionFacts {
+        agent_contracts::ToolExecutionFacts::empty()
+            .with_verification(false)
+            .with_mutation_bound(may_mutate_workspace)
+    }
+
     /// Legacy derivation from this crate's stamped producer-authority keys.
     /// Fallback for outputs whose handler has not moved to native stamping;
     /// per-handler tests lock the native channel to agree with this.
@@ -903,7 +912,8 @@ impl BuiltinToolDispatcher {
                 "has_more": has_more,
                 "descriptors": page.iter().map(|entry| ResourceDescriptor::from_tool(entry, None)).collect::<Vec<_>>(),
             }),
-        })
+        }
+        .with_native_execution_facts(Self::manage_bound(false)))
     }
 
     async fn run_load(
@@ -920,7 +930,8 @@ impl BuiltinToolDispatcher {
             model_content: format!("tool loaded: {name} — its schema is now offered to the model"),
             artifact_ref: None,
             metadata: json!({"op": "load", "tool": name}),
-        })
+        }
+        .with_native_execution_facts(Self::manage_bound(false)))
     }
 
     async fn run_unload(
@@ -937,7 +948,8 @@ impl BuiltinToolDispatcher {
             model_content: format!("tool unloaded: {name}"),
             artifact_ref: None,
             metadata: json!({"op": "unload", "tool": name}),
-        })
+        }
+        .with_native_execution_facts(Self::manage_bound(false)))
     }
 
     async fn run_inspect(
@@ -956,7 +968,8 @@ impl BuiltinToolDispatcher {
                 model_content: format!("unknown tool: {name}"),
                 artifact_ref: None,
                 metadata,
-            });
+            }
+            .with_native_execution_facts(Self::manage_bound(false)));
         };
         let state = self
             .catalog()
@@ -975,7 +988,8 @@ impl BuiltinToolDispatcher {
             ),
             artifact_ref: None,
             metadata: json!({"op": "inspect", "name": spec.name, "owner": "builtin", "state": state}),
-        })
+        }
+        .with_native_execution_facts(Self::manage_bound(false)))
     }
 
     /// Dispatch `capability.manage` ops: search / inspect / load / unload.
@@ -1200,6 +1214,52 @@ mod tests {
         assert!(facts.resource_touches().is_empty());
         assert_eq!(facts.may_mutate_workspace(), None);
         assert_eq!(facts.is_verification(), None);
+    }
+
+    /// Producer-bound coverage: representative outputs from migrated
+    /// builtin families (control surface, git, search) carry native facts
+    /// equal to the legacy derivation.
+    #[tokio::test]
+    async fn execution_facts_native_stamps_match_derivation_across_builtin_families() {
+        let tools = dispatcher().await;
+        let mut checked = 0usize;
+
+        for outcome in [
+            tools
+                .execute(request(
+                    "capability.manage",
+                    serde_json::json!({"op": "inspect", "name": "fs.read"}),
+                ))
+                .await
+                .unwrap(),
+            tools
+                .execute(request("git.status", serde_json::json!({})))
+                .await
+                .unwrap(),
+            tools
+                .execute(request(
+                    "search.grep",
+                    serde_json::json!({"pattern": "no_such_marker_xyz", "path": "."}),
+                ))
+                .await
+                .unwrap(),
+        ] {
+            let ToolOutcome::Value(output) = outcome else {
+                panic!("these read-only calls must return value outcomes");
+            };
+            let native = output
+                .native_execution_facts()
+                .expect("migrated builtin must stamp native facts");
+            let derived = BuiltinToolDispatcher::translate_stamped_execution_facts(&output);
+            assert_eq!(
+                serde_json::to_value(&native).unwrap(),
+                serde_json::to_value(&derived).unwrap(),
+                "native facts diverge for {}",
+                output.tool_name
+            );
+            checked += 1;
+        }
+        assert_eq!(checked, 3);
     }
 
     #[tokio::test]

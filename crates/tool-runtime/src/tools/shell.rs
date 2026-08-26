@@ -469,7 +469,8 @@ impl Tool for ShellExecTool {
             model_content: format!("{model_content}\n\n{artifact_note}"),
             artifact_ref: Some(artifact_ref),
             metadata,
-        }))
+        }
+        .with_native_execution_facts(super::builtin_bound(true))))
     }
 }
 

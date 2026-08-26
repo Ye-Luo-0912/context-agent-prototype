@@ -97,7 +97,16 @@ construction time under the reserved `metadata._execution_facts` key
 `sanitize_untrusted_producer_output` together with the other reserved
 keys), and `BuiltinToolDispatcher::execution_facts` prefers them with the
 legacy key derivation as fallback for handlers that have not migrated;
-per-handler tests lock both channels to identical values. The legacy
+per-handler tests lock both channels to identical values. Producer-bound
+coverage completed the same day: every remaining builtin family
+(`shell.exec`, `process.run`, `git.status`/`git.diff`,
+`search.grep`, `code.*`, `artifact.read`, `context.manage`,
+`task.complete`/`task.manage`, and the `capability.manage` control
+surface) stamps an explicit workspace-mutation bound mirroring the
+temporary builtin-name table, so retiring that table reduces to retiring
+the legacy stamps plus one pending decision — `process.session` stays on
+the fallback because its table value looks wrong for an arbitrary-process
+tool and widening it needs its own eval pass. The legacy
 stamps stay on the wire because removing them changes model-visible tool
 output shapes (pinned/convergence behavior could shift). Still open:
 retiring the legacy stamps once model-visible drift is acceptable (the

@@ -247,7 +247,8 @@ impl Tool for ContextManageTool {
                         model_content: description,
                         artifact_ref: None,
                         metadata: json!({"context_action": action}),
-                    },
+                    }
+                    .with_native_execution_facts(super::builtin_bound(false)),
                     directive: agent_contracts::RuntimeDirective::Context(action),
                 })
             }
@@ -265,7 +266,8 @@ impl Tool for ContextManageTool {
                         model_content: description,
                         artifact_ref: None,
                         metadata: json!({"context_action": action}),
-                    },
+                    }
+                    .with_native_execution_facts(super::builtin_bound(false)),
                     directive: agent_contracts::RuntimeDirective::Context(action),
                 })
             }
@@ -287,7 +289,8 @@ impl Tool for ContextManageTool {
                         model_content: "resolving...".into(),
                         artifact_ref: None,
                         metadata: json!({"engine_query": true}),
-                    },
+                    }
+                    .with_native_execution_facts(super::builtin_bound(false)),
                     query: EngineQuery::SearchExternal {
                         query,
                         kind,
@@ -309,7 +312,8 @@ impl Tool for ContextManageTool {
                         model_content: "resolving...".into(),
                         artifact_ref: None,
                         metadata: json!({"engine_query": true}),
-                    },
+                    }
+                    .with_native_execution_facts(super::builtin_bound(false)),
                     query: EngineQuery::InspectExternal { item_id },
                 })
             }
@@ -324,7 +328,8 @@ impl Tool for ContextManageTool {
                         model_content: "resolving...".into(),
                         artifact_ref: None,
                         metadata: json!({"engine_query": true}),
-                    },
+                    }
+                    .with_native_execution_facts(super::builtin_bound(false)),
                     query: EngineQuery::FetchExternal { item_id },
                 })
             }
@@ -342,7 +347,8 @@ impl Tool for ContextManageTool {
                         model_content: description,
                         artifact_ref: None,
                         metadata: json!({"context_action": action}),
-                    },
+                    }
+                    .with_native_execution_facts(super::builtin_bound(false)),
                     directive: agent_contracts::RuntimeDirective::Context(action),
                 })
             }
@@ -365,7 +371,8 @@ impl Tool for ContextManageTool {
                         model_content: description,
                         artifact_ref: None,
                         metadata: json!({"context_action": action}),
-                    },
+                    }
+                    .with_native_execution_facts(super::builtin_bound(false)),
                     directive: agent_contracts::RuntimeDirective::Context(action),
                 })
             }

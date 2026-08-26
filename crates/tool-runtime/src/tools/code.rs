@@ -479,36 +479,39 @@ impl Tool for CodeSymbolsTool {
             })
             .unwrap_or_default();
 
-        Ok(ToolOutcome::Value(ToolOutput {
-            call_id: call_id.into(),
-            tool_name: "code.symbols".into(),
-            ok: true,
-            summary: format!("{} symbols across {} files", symbols.len(), scanned_files),
-            model_content: if model_rows.is_empty() {
-                "no symbols found".to_string()
-            } else {
-                format!(
-                    "{}{}",
-                    model_rows
-                        .iter()
-                        .map(|(path, line, column, kind, name)| {
-                            format!("{path}:{line}:{column}  {kind} {name}")
-                        })
-                        .collect::<Vec<_>>()
-                        .join("\n"),
-                    truncated_note
-                )
-            },
-            artifact_ref,
-            metadata: json!({
-                "symbols": symbols.len(),
-                "files_scanned": scanned_files,
-                "returned": model_rows.len(),
-                "has_more": has_more,
-                "next_start_line": has_more.then_some(model_rows.len() + 1),
-                "cursor": cursor,
-            }),
-        }))
+        Ok(ToolOutcome::Value(
+            ToolOutput {
+                call_id: call_id.into(),
+                tool_name: "code.symbols".into(),
+                ok: true,
+                summary: format!("{} symbols across {} files", symbols.len(), scanned_files),
+                model_content: if model_rows.is_empty() {
+                    "no symbols found".to_string()
+                } else {
+                    format!(
+                        "{}{}",
+                        model_rows
+                            .iter()
+                            .map(|(path, line, column, kind, name)| {
+                                format!("{path}:{line}:{column}  {kind} {name}")
+                            })
+                            .collect::<Vec<_>>()
+                            .join("\n"),
+                        truncated_note
+                    )
+                },
+                artifact_ref,
+                metadata: json!({
+                    "symbols": symbols.len(),
+                    "files_scanned": scanned_files,
+                    "returned": model_rows.len(),
+                    "has_more": has_more,
+                    "next_start_line": has_more.then_some(model_rows.len() + 1),
+                    "cursor": cursor,
+                }),
+            }
+            .with_native_execution_facts(super::builtin_bound(false)),
+        ))
     }
 }
 
@@ -542,29 +545,32 @@ impl CodeSymbolsTool {
         let has_more = next_offset < lines.len();
         let next_cursor = has_more.then(|| format!("{reference}#{next_offset}"));
 
-        Ok(ToolOutcome::Value(ToolOutput {
-            call_id: call_id.into(),
-            tool_name: "code.symbols".into(),
-            ok: true,
-            summary: format!(
-                "symbol rows {}-{} of {} (snapshot)",
-                offset + 1,
-                next_offset,
-                lines.len()
-            ),
-            model_content: if page.is_empty() {
-                "no more symbols".to_string()
-            } else {
-                page.join("\n")
-            },
-            artifact_ref: Some(reference.to_string()),
-            metadata: json!({
-                "symbols": lines.len(),
-                "returned": page.len(),
-                "has_more": has_more,
-                "cursor": next_cursor,
-            }),
-        }))
+        Ok(ToolOutcome::Value(
+            ToolOutput {
+                call_id: call_id.into(),
+                tool_name: "code.symbols".into(),
+                ok: true,
+                summary: format!(
+                    "symbol rows {}-{} of {} (snapshot)",
+                    offset + 1,
+                    next_offset,
+                    lines.len()
+                ),
+                model_content: if page.is_empty() {
+                    "no more symbols".to_string()
+                } else {
+                    page.join("\n")
+                },
+                artifact_ref: Some(reference.to_string()),
+                metadata: json!({
+                    "symbols": lines.len(),
+                    "returned": page.len(),
+                    "has_more": has_more,
+                    "cursor": next_cursor,
+                }),
+            }
+            .with_native_execution_facts(super::builtin_bound(false)),
+        ))
     }
 }
 
@@ -712,28 +718,31 @@ impl Tool for CodeDiagnosticsTool {
             ));
         }
 
-        Ok(ToolOutcome::Value(ToolOutput {
-            call_id: call_id.into(),
-            tool_name: "code.diagnostics".into(),
-            ok: true,
-            summary: format!(
-                "expanded {expanded} of {} positions ({unresolved} unresolved)",
-                positions.len()
-            ),
-            model_content: if out_lines.is_empty() {
-                "no file:line:col positions found in the input".to_string()
-            } else {
-                out_lines.join("\n")
-            },
-            artifact_ref: None,
-            metadata: json!({
-                "positions": positions.len(),
-                "expanded": expanded,
-                "unresolved": unresolved,
-                "skipped": skipped,
-                "input_truncated": input_truncated,
-            }),
-        }))
+        Ok(ToolOutcome::Value(
+            ToolOutput {
+                call_id: call_id.into(),
+                tool_name: "code.diagnostics".into(),
+                ok: true,
+                summary: format!(
+                    "expanded {expanded} of {} positions ({unresolved} unresolved)",
+                    positions.len()
+                ),
+                model_content: if out_lines.is_empty() {
+                    "no file:line:col positions found in the input".to_string()
+                } else {
+                    out_lines.join("\n")
+                },
+                artifact_ref: None,
+                metadata: json!({
+                    "positions": positions.len(),
+                    "expanded": expanded,
+                    "unresolved": unresolved,
+                    "skipped": skipped,
+                    "input_truncated": input_truncated,
+                }),
+            }
+            .with_native_execution_facts(super::builtin_bound(false)),
+        ))
     }
 }
 

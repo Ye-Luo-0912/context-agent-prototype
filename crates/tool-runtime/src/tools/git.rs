@@ -138,7 +138,8 @@ async fn run_git(
             model_content: "(empty output; is this a git repository?)".into(),
             artifact_ref: None,
             metadata: json!({"exit_code": status.code()}),
-        });
+        }
+        .with_native_execution_facts(super::builtin_bound(false)));
     }
 
     let truncated = combined.chars().count() > MODEL_OUTPUT_CHARS;
@@ -180,7 +181,8 @@ async fn run_git(
         },
         artifact_ref,
         metadata: json!({"exit_code": status.code(), "bytes": combined.len()}),
-    })
+    }
+    .with_native_execution_facts(super::builtin_bound(false)))
 }
 
 fn strip_runtime_paths(text: &str) -> String {

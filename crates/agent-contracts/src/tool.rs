@@ -862,6 +862,16 @@ impl ToolOutput {
         }
     }
 
+    /// Builder form of [`Self::set_native_execution_facts`] for literal
+    /// construction sites.
+    pub fn with_native_execution_facts(
+        mut self,
+        facts: crate::execution_facts::ToolExecutionFacts,
+    ) -> Self {
+        self.set_native_execution_facts(facts);
+        self
+    }
+
     /// Trusted failure class. Core writes it under `metadata._runtime`;
     /// top-level `failure_class` is accepted only as a producer hint or
     /// legacy trace.

@@ -665,12 +665,29 @@ stamps for owned tools and keeps the legacy key derivation as the
 fallback for handlers that have not migrated; per-handler tests assert
 native equals derivation on every outcome shape, so consumers switching
 between channels see identical values. The legacy stamps stay because
-removing them changes model-visible output shapes. Still open for this
-entry: migrating any remaining producer whose bound currently comes from
-the temporary builtin-name table, retiring the legacy stamps once
-model-visible drift is acceptable (derivation then returns empty by
-construction and every fallback becomes dead-code removal), and the
-event-level durable wire DTO.
+removing them changes model-visible output shapes.
+
+Producer-bound coverage completed 2026-08-26 the same day: every
+remaining builtin family now stamps an explicit workspace-mutation bound
+on its own outputs (`shell.exec`, `process.run`, `git.status`, `git.diff`,
+`search.grep` including cancellation and no-match outcomes,
+`code.symbols`/`code.diagnostics`, `artifact.read`,
+`context.manage` across all ops, `task.complete`, `task.manage`, and the
+`capability.manage` control surface), mirroring the temporary
+builtin-name table exactly so the two channels cannot disagree. Shared
+refusal helpers (`hidden_path`, missing-path) stay on the derivation:
+they serve many tool names and their outputs carry no authority keys.
+`process.session` deliberately stays on the name-table fallback too: its
+table value (`false`) looks wrong for a tool that executes arbitrary
+processes, and stamping that value natively would entrench it — widening
+the session bound is a conservative behavior change that needs its own
+eval pass before landing. With coverage this complete, retiring the name
+table reduces to retiring the legacy stamps plus migrating session once
+its bound decision lands. Still open for this entry: the session-bound
+decision, retiring the legacy stamps once model-visible drift is
+acceptable (derivation then returns empty by construction and every
+fallback becomes dead-code removal), and the event-level durable wire
+DTO.
 
 ### PROTO-EVID-02 — cache correctness + observability (fixed 2026-08-23)
 

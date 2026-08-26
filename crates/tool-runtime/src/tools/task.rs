@@ -116,7 +116,8 @@ impl Tool for TaskCompleteTool {
                         "artifacts": proposal.artifacts.len(),
                     },
                 }),
-            },
+            }
+            .with_native_execution_facts(super::builtin_bound(false)),
             directive: RuntimeDirective::CompleteTask(proposal),
         })
     }
