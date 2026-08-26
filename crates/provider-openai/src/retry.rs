@@ -25,6 +25,12 @@ pub struct RetryingTransport<T: ModelTransport> {
     inner: T,
     max_attempts: u32,
     base_delay: Duration,
+    /// Whole-response buffering mode: chunks are collected internally and
+    /// only forwarded to the real sink after a successful attempt, so a
+    /// retryable mid-stream failure can replay from scratch. Harnesses
+    /// measure outcomes rather than render live deltas; interactive hosts
+    /// keep the live mode where already-emitted output blocks a replay.
+    buffering: bool,
 }
 
 impl<T: ModelTransport> RetryingTransport<T> {
@@ -33,6 +39,19 @@ impl<T: ModelTransport> RetryingTransport<T> {
             inner,
             max_attempts: max_attempts.max(1),
             base_delay,
+            buffering: false,
+        }
+    }
+
+    /// Buffering variant for outcome-measuring harnesses: any retryable
+    /// transport failure is retried from scratch even after chunks were
+    /// produced, because nothing reached the real sink until success.
+    pub fn new_buffering(inner: T, max_attempts: u32, base_delay: Duration) -> Self {
+        Self {
+            inner,
+            max_attempts: max_attempts.max(1),
+            base_delay,
+            buffering: true,
         }
     }
 }
@@ -69,6 +88,23 @@ impl<T: ModelTransport> ModelTransport for RetryingTransport<T> {
     }
 
     async fn complete_stream(
+        &self,
+        request: ModelRequest,
+        sink: &dyn ModelEventSink,
+    ) -> AgentResult<ModelOutput> {
+        if self.buffering {
+            self.complete_stream_buffered(request, sink).await
+        } else {
+            self.complete_stream_live(request, sink).await
+        }
+    }
+}
+
+impl<T: ModelTransport> RetryingTransport<T> {
+    /// Live mode: forward chunks as they arrive; a retryable failure after
+    /// anything was emitted cannot be replayed into the same sink, so it is
+    /// surfaced instead of retried.
+    async fn complete_stream_live(
         &self,
         request: ModelRequest,
         sink: &dyn ModelEventSink,
@@ -111,6 +147,75 @@ impl<T: ModelTransport> ModelTransport for RetryingTransport<T> {
                 }
             }
         }
+    }
+
+    /// Buffering mode: collect each attempt's chunks internally; only a
+    /// successful attempt is forwarded to the real sink, so every retryable
+    /// transport failure can replay from scratch without duplication.
+    async fn complete_stream_buffered(
+        &self,
+        request: ModelRequest,
+        sink: &dyn ModelEventSink,
+    ) -> AgentResult<ModelOutput> {
+        let mut attempt = 0u32;
+        loop {
+            let collected = BufferedSink::default();
+            match self
+                .inner
+                .complete_stream(request.clone(), &collected)
+                .await
+            {
+                Ok(mut output) => {
+                    for chunk in collected.take() {
+                        sink.on_chunk(chunk).await?;
+                    }
+                    stamp_attempt_usage(&mut output, attempt + 1);
+                    return Ok(output);
+                }
+                Err(error) => {
+                    let retryable = matches!(
+                        &error,
+                        AgentError::Transport {
+                            retryable: true,
+                            ..
+                        }
+                    );
+                    if attempt + 1 >= self.max_attempts || !retryable {
+                        return Err(error);
+                    }
+                    attempt += 1;
+                    let delay = self.base_delay * 2u32.pow(attempt.saturating_sub(1));
+                    tokio::select! {
+                        _ = request.cancel.cancelled() => return Err(AgentError::Cancelled),
+                        _ = tokio::time::sleep(delay) => {}
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Collects one attempt's chunks for the buffering mode. Chunks are bounded
+/// upstream by the provider's byte cap, so this stays memory-bounded.
+#[derive(Default)]
+struct BufferedSink {
+    chunks: std::sync::Mutex<Vec<ModelChunk>>,
+}
+
+impl BufferedSink {
+    fn take(&self) -> Vec<ModelChunk> {
+        std::mem::take(&mut *self.chunks.lock().expect("buffered sink poisoned"))
+    }
+}
+
+#[async_trait]
+impl ModelEventSink for BufferedSink {
+    async fn on_chunk(&self, chunk: ModelChunk) -> AgentResult<()> {
+        self.chunks
+            .lock()
+            .expect("buffered sink poisoned")
+            .push(chunk);
+        Ok(())
     }
 }
 
@@ -275,10 +380,11 @@ mod tests {
         assert_eq!(calls.load(Ordering::SeqCst), 1);
     }
 
-    /// Fails with a retryable error *after* emitting one delta on the first
+    /// Fails with a transport error *after* emitting one delta on the first
     /// call; succeeds on the second.
     struct EmitsThenFails {
         calls: Arc<AtomicU32>,
+        retryable: bool,
     }
 
     #[async_trait]
@@ -301,7 +407,7 @@ mod tests {
                 })
                 .await?;
                 return Err(AgentError::Transport {
-                    retryable: true,
+                    retryable: self.retryable,
                     message: "stream broke".into(),
                 });
             }
@@ -314,11 +420,42 @@ mod tests {
         }
     }
 
+    /// Always emits one delta, then fails with a retryable transport error.
+    struct AlwaysFailingStream {
+        calls: Arc<AtomicU32>,
+    }
+
+    #[async_trait]
+    impl ModelTransport for AlwaysFailingStream {
+        fn capabilities(&self) -> ModelCapabilities {
+            ModelCapabilities::default()
+        }
+        async fn complete(&self, _request: ModelRequest) -> AgentResult<ModelOutput> {
+            unreachable!("streaming model should be driven through complete_stream")
+        }
+        async fn complete_stream(
+            &self,
+            _request: ModelRequest,
+            sink: &dyn ModelEventSink,
+        ) -> AgentResult<ModelOutput> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            sink.on_chunk(ModelChunk::TextDelta {
+                delta: "partial".into(),
+            })
+            .await?;
+            Err(AgentError::Transport {
+                retryable: true,
+                message: "connection reset".into(),
+            })
+        }
+    }
+
     #[tokio::test]
     async fn stream_that_failed_after_emitting_is_not_retried() {
         let calls = Arc::new(AtomicU32::new(0));
         let inner = EmitsThenFails {
             calls: calls.clone(),
+            retryable: true,
         };
         let transport = RetryingTransport::new(inner, 5, Duration::from_millis(1));
         let sink = RecordingSink::default();
@@ -416,6 +553,94 @@ mod tests {
             ],
             "the listener must see exactly one stream's output"
         );
+    }
+
+    /// Buffering mode exists for outcome-measuring harnesses: a mid-stream
+    /// retryable failure replays from scratch and only the successful
+    /// attempt reaches the real sink.
+    #[tokio::test]
+    async fn buffering_mode_replays_after_midstream_failure() {
+        let calls = Arc::new(AtomicU32::new(0));
+        let inner = EmitsThenFails {
+            calls: calls.clone(),
+            retryable: true,
+        };
+        let transport = RetryingTransport::new_buffering(inner, 5, Duration::from_millis(1));
+        let sink = RecordingSink::default();
+
+        let output = transport.complete_stream(request(), &sink).await.unwrap();
+        assert_eq!(output.content, "full");
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            2,
+            "one replay after the break"
+        );
+        assert_eq!(output.usage.attempts, 2);
+        assert_eq!(output.usage.retries, 1);
+        let chunks = sink.chunks.lock().unwrap();
+        assert_eq!(
+            &chunks[..],
+            &[ModelChunk::Done],
+            "the listener must see only the successful attempt"
+        );
+    }
+
+    #[tokio::test]
+    async fn buffering_mode_surfaces_non_retryable_immediately() {
+        let calls = Arc::new(AtomicU32::new(0));
+        let inner = EmitsThenFails {
+            calls: calls.clone(),
+            retryable: false,
+        };
+        let transport = RetryingTransport::new_buffering(inner, 5, Duration::from_millis(1));
+        let sink = RecordingSink::default();
+
+        let error = transport
+            .complete_stream(request(), &sink)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(
+                &error,
+                AgentError::Transport {
+                    retryable: false,
+                    ..
+                }
+            ),
+            "the non-retryable failure must surface, got: {error}"
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert!(
+            sink.chunks.lock().unwrap().is_empty(),
+            "buffered output must not leak to the listener on failure"
+        );
+    }
+
+    #[tokio::test]
+    async fn buffering_mode_gives_up_after_max_attempts() {
+        let calls = Arc::new(AtomicU32::new(0));
+        let inner = AlwaysFailingStream {
+            calls: calls.clone(),
+        };
+        let transport = RetryingTransport::new_buffering(inner, 3, Duration::from_millis(1));
+        let sink = RecordingSink::default();
+
+        let error = transport
+            .complete_stream(request(), &sink)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(
+                &error,
+                AgentError::Transport {
+                    retryable: true,
+                    ..
+                }
+            ),
+            "the last retryable failure must surface, got: {error}"
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 3);
+        assert!(sink.chunks.lock().unwrap().is_empty());
     }
 
     #[tokio::test]

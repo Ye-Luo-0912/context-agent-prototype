@@ -312,12 +312,26 @@ impl OpenAiProvider {
         let max_stream_bytes = self.config.max_stream_bytes;
         let mut total_bytes = 0usize;
         let mut accumulator = StreamAccumulator::default();
+        // A stream that stops delivering bytes without closing is a stalled
+        // connection, not a slow model: bound the silent gap so the turn
+        // fails retryable instead of hanging until the peer gives up.
+        let mut idle_deadline = tokio::time::Instant::now() + self.config.timeout;
         loop {
             tokio::select! {
                 _ = request.cancel.cancelled() => {
                     return Err(ProtocolError::from(AgentError::Cancelled));
                 }
+                _ = tokio::time::sleep_until(idle_deadline) => {
+                    return Err(ProtocolError::transport(
+                        true,
+                        format!(
+                            "provider stream stalled: no bytes for {:?}",
+                            self.config.timeout
+                        ),
+                    ));
+                }
                 line = lines.next() => {
+                    idle_deadline = tokio::time::Instant::now() + self.config.timeout;
                     match line {
                         Some(Ok(line)) => {
                             // Every decoded line counts toward the stream
@@ -415,10 +429,23 @@ impl OpenAiProvider {
         let max_stream_bytes = self.config.max_stream_bytes;
         let mut total_bytes = 0usize;
         let mut accumulator = ResponsesAccumulator::default();
+        // Same stalled-connection bound as the chat path: fail retryable
+        // instead of hanging on a silent peer.
+        let mut idle_deadline = tokio::time::Instant::now() + self.config.timeout;
         loop {
             tokio::select! {
                 _ = request.cancel.cancelled() => return Err(ProtocolError::from(AgentError::Cancelled)),
+                _ = tokio::time::sleep_until(idle_deadline) => {
+                    return Err(ProtocolError::transport(
+                        true,
+                        format!(
+                            "provider stream stalled: no bytes for {:?}",
+                            self.config.timeout
+                        ),
+                    ));
+                }
                 line = lines.next() => {
+                    idle_deadline = tokio::time::Instant::now() + self.config.timeout;
                     match line {
                         Some(Ok(line)) => {
                             total_bytes = total_bytes.saturating_add(line.len() + 1);
@@ -868,6 +895,59 @@ mod tests {
         assert_eq!(output.tool_calls.len(), 1);
         assert_eq!(output.tool_calls[0].id, "c1");
         assert_eq!(output.tool_calls[0].name, "fs.list");
+    }
+
+    #[tokio::test]
+    async fn stalled_stream_fails_retryable_after_the_idle_bound() {
+        // The mock server sends valid response headers and then goes silent
+        // with an open body. The provider must fail retryable on the idle
+        // bound instead of hanging until the peer or the client deadline
+        // gives up — that hang is what turned relay hiccups into
+        // multi-minute dead cells.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut buf = vec![0u8; 16 * 1024];
+            let n = socket.read(&mut buf).await.unwrap();
+            assert!(n > 0);
+            let headers =
+                "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\n";
+            socket.write_all(headers.as_bytes()).await.unwrap();
+            // No body, no close: the stream stalls by construction.
+            tokio::time::sleep(Duration::from_secs(30)).await;
+        });
+
+        let mut config = dummy_config(format!("http://{addr}/v1"));
+        config.timeout = Duration::from_millis(150);
+        let provider = OpenAiProvider::with_client(
+            config,
+            // Keep the injected client's total timeout far above the idle
+            // bound so this test exercises the idle path, not the client
+            // deadline.
+            Client::builder()
+                .no_proxy()
+                .timeout(Duration::from_secs(10))
+                .build()
+                .unwrap(),
+        );
+
+        let started = std::time::Instant::now();
+        let error = provider.complete(fs_list_request()).await.unwrap_err();
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "the idle bound must fire long before the client deadline"
+        );
+        assert!(
+            matches!(
+                &error,
+                AgentError::Transport {
+                    retryable: true,
+                    ..
+                }
+            ) && error.to_string().contains("stalled"),
+            "a silent stream must surface as a retryable stall: {error}"
+        );
     }
 
     #[tokio::test]

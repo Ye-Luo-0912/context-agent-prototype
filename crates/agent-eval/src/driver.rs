@@ -121,7 +121,10 @@ fn build_model_with_timeout(timeout: Duration) -> anyhow::Result<Arc<dyn ModelTr
         max_stream_bytes: provider_openai::DEFAULT_MAX_STREAM_BYTES,
         context_window: Some(context_window),
     });
-    Ok(Arc::new(RetryingTransport::new(
+    // Harness runs measure outcomes, not live deltas: buffer each attempt
+    // so a retryable mid-stream transport failure replays from scratch
+    // instead of killing the cell after partial output.
+    Ok(Arc::new(RetryingTransport::new_buffering(
         provider,
         3,
         Duration::from_millis(500),

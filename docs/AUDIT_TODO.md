@@ -98,6 +98,28 @@ reads cannot attest yet (the CORE-01 residual); a renamed
 
 ## Open P1 — Tool Surface reliability
 
+### PROV-LINK-01 — retryable transport failures killed runs instead of retrying (fixed 2026-08-26)
+
+Live evidence kept dying on errors the provider layer itself marked
+`retryable=true`: relay streams ended in `stream error: error decoding
+response body` mid-round, and cells hung for minutes before surfacing it.
+Two root causes, both fixed in `provider-openai`. First, the streaming
+retry wrapper refused to replay once anything had reached the sink — the
+right rule for a live UI listener, but an outcome-measuring harness has no
+live listener to corrupt, so its runs had no recovery path at all. The
+wrapper now has a buffering mode (`RetryingTransport::new_buffering`):
+each attempt's chunks are collected internally and only a successful
+attempt is forwarded, so every retryable transport failure replays from
+scratch without duplication; the eval driver uses it. Interactive hosts
+keep the live mode and its no-replay rule. Second, streamed bodies had no
+idle bound: a silent peer held the turn open until the total client
+deadline (or the peer) gave up. Both protocol paths now fail retryable
+with a named stall error after `config.timeout` without bytes, resetting
+on every delivered line. Deterministic coverage: three buffering-mode
+tests (mid-stream replay with attempt stamping, non-retryable immediate
+surface without leaking buffered output, exhaustion) plus a real-socket
+stall test proving the idle bound fires long before the client deadline.
+
 ### TOOL-CONTRACT-01 — optional-union and cursor semantics (deterministic fix landed 2026-08-24; live gate open)
 
 The PinAI/Luna long-flow trace attributed 25/29 Dynamic failed outputs to
