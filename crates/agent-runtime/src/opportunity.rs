@@ -326,6 +326,7 @@ mod tests {
                 epoch: 0,
                 opened_at_evidence_revision: 0,
                 tried_targets: Vec::new(),
+                source_tool_name: String::new(),
             });
         let decision = derive_completion_opportunity(id, &anchor, &execution, false, false, false);
         assert!(decision.ready.is_none());

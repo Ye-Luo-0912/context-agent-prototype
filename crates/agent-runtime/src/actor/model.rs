@@ -933,6 +933,16 @@ impl RuntimeActor {
         if include_turn_leases && let Some(turn) = self.state.turn.as_ref() {
             roots.extend(turn.pending_loaded_tools.iter().cloned());
             roots.extend(turn.result_delivery_tools.iter().cloned());
+            // Unresolved obligations keep their exact source tool surfaced:
+            // the ledger recorded a trusted association when the row opened,
+            // and this derived view releases it exactly when the row dies.
+            let obligation_source_tools: Vec<String> = turn
+                .execution
+                .obligation_source_tools()
+                .into_iter()
+                .filter(|tool_name| catalog.iter().any(|spec| spec.name == *tool_name))
+                .collect();
+            roots.extend(obligation_source_tools.iter().cloned());
         }
         roots.extend(decision_calls.iter().map(|call| call.name.clone()));
         roots.sort();

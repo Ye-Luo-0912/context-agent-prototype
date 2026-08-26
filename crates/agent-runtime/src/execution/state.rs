@@ -204,6 +204,11 @@ pub struct ExecutionObligation {
     pub tried_targets: Vec<String>,
     #[serde(default)]
     pub opened_at_evidence_revision: u64,
+    /// The exact tool whose failed execution opened this obligation, stamped
+    /// by the trusted recording path from pre-dispatch truth. Empty on rows
+    /// that predate the field; drives obligation-scoped lease provenance.
+    #[serde(default)]
+    pub source_tool_name: String,
 }
 
 impl ExecutionObligation {
@@ -669,6 +674,22 @@ impl ExecutionState {
                     .map(|(candidate, _)| candidate == path)
                     .unwrap_or(row.precondition == path)
         })
+    }
+
+    /// Source tools of live obligation rows, sorted and deduplicated. This
+    /// is a derived view — membership exists exactly while its row does, so
+    /// resolution, invalidation and the bounded drop path release the lease
+    /// with no separate bookkeeping.
+    pub fn obligation_source_tools(&self) -> Vec<String> {
+        let mut tools: Vec<String> = self
+            .obligations
+            .iter()
+            .filter(|row| !row.source_tool_name.is_empty())
+            .map(|row| row.source_tool_name.clone())
+            .collect();
+        tools.sort();
+        tools.dedup();
+        tools
     }
 
     /// Exact verifier schemas remembered for the current task anchor. The
@@ -1379,6 +1400,7 @@ impl ExecutionState {
             total_attempts: 1,
             tried_targets: vec![target],
             opened_at_evidence_revision: self.convergence.evidence_revision,
+            source_tool_name: bound_evidence_text(&output.tool_name),
         });
         let row = self.obligations.last().expect("just pushed");
         events.push(agent_contracts::ExecutionObligationEvent {

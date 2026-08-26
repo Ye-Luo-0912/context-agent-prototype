@@ -1181,6 +1181,21 @@ fn resolved_command(argv0: &str, scope: &str, fingerprint: &str) -> ToolOutput {
 }
 
 #[test]
+fn obligation_source_tools_track_live_rows_only() {
+    let mut resume = ExecutionState::default();
+    resume.observe_tool(&missing_program("prog_a", "fp-1"), 1, 1);
+    assert_eq!(resume.obligations.len(), 1);
+    assert_eq!(resume.obligations[0].source_tool_name, "process.run");
+    assert_eq!(resume.obligation_source_tools(), vec!["process.run"]);
+
+    // A fingerprint-matched success resolves the row and releases its
+    // provenance by construction — no separate lease bookkeeping exists.
+    resume.observe_tool(&resolved_command("prog_a", "scope-a", "fp-1"), 1, 2);
+    assert!(resume.obligations.is_empty());
+    assert!(resume.obligation_source_tools().is_empty());
+}
+
+#[test]
 fn executable_obligation_opens_and_survives_unrelated_progress() {
     let mut resume = ExecutionState::default();
     resume.observe_tool(&missing_program("prog_a", "fp-1"), 1, 1);

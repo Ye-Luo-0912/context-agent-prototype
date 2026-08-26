@@ -519,8 +519,15 @@ turn-scoped and never checkpointed). The slice adds a third set populated
 when `ExecutionState::record_obligation` accepts a row naming its source
 tool, released by the same paths that resolve or invalidate the obligation,
 and folded into the `ToolLeasesReconciled` runtime-root partition.
-Obligations live in the turn-scoped `ExecutionState`, so the new set never
+Obligations live in the turn-scoped `ExecutionState`, so the set never
 outlives the turn and needs no checkpoint rule beyond the existing ones.
+Landed 2026-08-26 as a derived view rather than a stored set:
+`ExecutionObligation.source_tool_name` is stamped once by
+`record_obligation` from pre-dispatch truth (backfilled never),
+`ExecutionState::obligation_source_tools()` derives membership from live
+rows — release on resolve/invalidate/bounded-drop is therefore true by
+construction — and `tool_lease_roots` folds it into runtime roots filtered
+against the catalog.
 
 Slice 1 landed 2026-08-26 end to end with no default behavior change:
 `VerificationRecipeProvenance` (recipe id/revision, coverage domain,
