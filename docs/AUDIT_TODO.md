@@ -581,9 +581,18 @@ on every tool-result step (`Option<Box<_>>`, serde-defaulted so old
 checkpoints restore as `None`), and the prompt's fs.read body-identity
 hints read them with a legacy-metadata fallback exactly for `None` frames.
 Still open before
-Self-Iteration: switch context heating (the ingest carrier) and
-Verification to consume the typed facts as well, move fact construction
-into individual trusted handlers, and define the durable wire form.
+Self-Iteration: switch context heating and Verification's representation
+to the typed facts, move fact construction into individual trusted
+handlers, and define the durable wire form. Sequencing note: heating is
+the one consumer whose carrier crosses a process boundary
+(`ContextIngress` feeds the context-service wire contract and ~77
+construction sites), so its migration should land together with
+handler-level direct construction — once trusted handlers stop stamping
+metadata keys entirely, the legacy derivation returns empty by
+construction and the ingest switch becomes removal of dead code instead
+of a dual-path migration. Verification needs no behavioral change: the
+production observation path already draws verifier authority from the
+trusted pre-dispatch attribution channel; only its representation differs.
 
 ### PROTO-EVID-02 — cache correctness + observability (fixed 2026-08-23)
 
