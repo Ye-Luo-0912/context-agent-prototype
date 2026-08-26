@@ -456,6 +456,20 @@ The mutation path is proven; what fluctuates between provider windows is
 first-attempt decision quality of the served model, which is exactly the
 product reliability this open gate measures.
 
+A fourth run the same day (`tool-surface-edit-v3-clean-tree-2026-08-26-r3/`),
+launched immediately after a green single-cell availability smoke in a
+healthy window, reproduces the pattern once more: strict 12/12, gate 9/12,
+non-conflict-first 8/9, wall 570 s with no session loss. The three gate
+failures are two post-edit confirmation reads forbidden by the
+stale-recovery flow contract (the same fixture passed cleanly with zero
+confirm reads on its third repeat) and one non-exact first-hunk attempt
+recovered on the second. Across all four clean-tree runs every applied
+patch has been byte-perfect; strict raw-byte truth has never failed except
+the one cell whose provider session died before any tool call. The gate bar
+(12/12 strict, 12/12 gate, 9/9 non-conflict-first) remains unmet by this
+provider serving and TOOL-EDIT-02 stays open for a window where the served
+model's first-attempt discipline holds across all twelve cells.
+
 ## Open P1 — runtime scheduling correctness
 
 Design + invariants: [`EXECUTION_COHERENCE.md`](EXECUTION_COHERENCE.md)
