@@ -689,6 +689,21 @@ completed cell, with all five behavioral failures being the same
 forbidden post-edit confirmation read — now the binding violation for
 both servings. Applied-patch correctness is proven as an engine property;
 first-attempt flow discipline is the open model property.
+The binding violation has since been root-caused and fixed: the no-confirm
+rule existed only in grader config — the v3 surface compaction had dropped
+it from the `edit.patch` description under that tool's 96-char cap while
+`edit.replace` kept its twin sentence. Stating the contract on the success
+echo itself (committed 2026-08-26) removed post-edit confirmation reads
+entirely: three windows on the v4 surface (`tool-surface-edit-v4-clean-tree-
+2026-08-26-ox-r1..r3/`, two archived with REPORT.md, one console-only full-bar
+pass) ran 0 confirm reads in all 36 cells and cut wall time from 871 s to
+509–594 s. The archived windows each miss the bar by one cell:
+`batch_two_file`'s exact-hunk check, where the model merges each file's two
+anchor lines into one multiline hunk on ~1 of 3 repeats — byte-perfect,
+revision-correct, granularity differs from the golden decomposition. That
+residual needs a contract decision (teach canonical granularity in
+model-visible text, or accept byte-equivalent decompositions in
+`exact_hunks`); TOOL-EDIT-02 stays open with its bar unchanged.
 Deterministic external-race, crash, journal-fault and — since 2026-08-26 —
 disk-full coverage are landed: the feature-gated `test-faults` storage seam
 injects storage-full refusals at the authority intent, the staged temp bytes

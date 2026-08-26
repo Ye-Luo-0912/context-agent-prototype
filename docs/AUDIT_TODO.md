@@ -546,8 +546,25 @@ dropped it under that tool's 96-char description cap, while `edit.replace`
 still carries its twin sentence today. Fix: state the contract on the
 success echo itself ("patch applied and committed; this echo is final,
 no re-read needed"), which costs ~15 tokens on successful patches only
-and leaves the 96-char schema cap intact. A fresh clean-tree window
-validates whether visibility closes the violation.
+and leaves the 96-char schema cap intact.
+
+Validation on the same relay serving, clean tree at the fix commit
+(`tool-surface-edit-v4-clean-tree-2026-08-26-ox-r2/` and `-ox-r3/`, both
+with REPORT.md): strict 12/12 in both, and post-edit confirmation reads
+are gone — 0 of 24 cells across the two archived windows, versus every
+prior window on either provider producing them. Wall time dropped from
+871 s to 509/594 s with rounds 46 → 42, the visible saving from the
+eliminated confirmation round-trips. A first same-day window ran before
+these two with flags mis-ordered (`--evidence-dir` after
+`--tool-edit-run`) so no artifacts persisted; its console verdict was
+strict 12/12, gate 12/12, non-conflict-first 9/9 — observed but not
+archival evidence. The remaining bar-blocker is now solely the
+`batch_two_file` exact-hunk cell (~1 of 3 repeats per window): the model
+merges each file's two anchor lines into one multiline hunk; bytes are
+always correct and `confirm=0`. Closing it requires a contract decision —
+teach the canonical granularity in model-visible text, or re-scope
+`exact_hunks` to accept byte-equivalent decompositions — not an engine
+fix. TOOL-EDIT-02 stays open; its bar is unchanged.
 
 ## Open P1 — runtime scheduling correctness
 

@@ -1,0 +1,24 @@
+{
+  "analysis_schema": "agent-eval.tool-edit.v2",
+  "arm_order": [
+    "production"
+  ],
+  "cells": [
+    {
+      "dir": "production",
+      "engine": "production"
+    }
+  ],
+  "context_engine": "dynamic",
+  "fixture_id": "batch_two_file",
+  "gate_implementation_sha256": "35eb2435a6c80982e642e8e8e85241b49705ff26b60ea90857330827de62fee5",
+  "gate_schema": "agent-eval.tool-surface-edit.v3",
+  "live": true,
+  "pack_digest": "e5c871282743a079c1e7b85be11859b05cd86e49a7cb8aa44587ae2a6b586611",
+  "repeat": 1,
+  "repeats": 3,
+  "schema": "agent-eval.pair.v1",
+  "spec_sha256": "19d7a492afb7e4b45ae5b3d01bfcaacad4df8b060e6b00510eca3efdab525c0a",
+  "surface": "production-default",
+  "task_sha256": "d44b0ec6efe28143f88e2a6b57798fc9758f4e102d11c7858a6cfe24ad4418a0"
+}
