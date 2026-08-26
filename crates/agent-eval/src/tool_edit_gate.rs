@@ -950,9 +950,21 @@ fn validate_patch_file(
 
 fn validate_hunk(hunk: &Value) -> Option<(&str, &str)> {
     let object = hunk.as_object()?;
+    // The current model-visible edit.patch schema makes an explicit `op`
+    // (replace/insert_before/insert_after) REQUIRED on every hunk; the
+    // omitted-op form stays accepted as the legacy parser-only spelling.
+    // Both spellings are judged on the same (old, new) fingerprint.
     if object
         .keys()
-        .any(|key| !matches!(key.as_str(), "old" | "new" | "occurrence"))
+        .any(|key| !matches!(key.as_str(), "old" | "new" | "occurrence" | "op"))
+    {
+        return None;
+    }
+    if let Some(op) = object.get("op").map(Value::as_str)
+        && !matches!(
+            op,
+            Some("replace") | Some("insert_before") | Some("insert_after")
+        )
     {
         return None;
     }
@@ -1870,5 +1882,15 @@ mod tests {
             }]
         });
         assert!(!validate_patch_shape(&dummy_hunk, true).valid);
+    }
+
+    #[test]
+    fn hunk_validation_accepts_schema_required_op_and_legacy_omission() {
+        let with_op = serde_json::json!({"op": "replace", "old": "a=v1", "new": "a=v2"});
+        assert!(validate_hunk(&with_op).is_some());
+        let legacy = serde_json::json!({"old": "a=v1", "new": "a=v2"});
+        assert!(validate_hunk(&legacy).is_some());
+        let bad_op = serde_json::json!({"op": "delete", "old": "a=v1", "new": "a=v2"});
+        assert!(validate_hunk(&bad_op).is_none());
     }
 }
