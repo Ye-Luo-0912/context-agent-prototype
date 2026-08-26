@@ -576,11 +576,14 @@ form. First lane landed 2026-08-26: `ToolDispatcher::execution_facts`
 own stamped outputs at one sanctioned point inside the trust boundary,
 capability-routed results contribute empty facts by routing, and the
 actor's body-free batch ledger now consumes those facts instead of
-re-deriving from producer metadata. Still open before
-Self-Iteration: switch context heating (the ingest carrier), the prompt
-working-set signal (the turn-frame carrier) and Verification to consume
-the typed facts as well, move fact construction into individual trusted
-handlers, and define the durable wire form.
+re-deriving from producer metadata. The turn frame carries the same facts
+on every tool-result step (`Option<Box<_>>`, serde-defaulted so old
+checkpoints restore as `None`), and the prompt's fs.read body-identity
+hints read them with a legacy-metadata fallback exactly for `None` frames.
+Still open before
+Self-Iteration: switch context heating (the ingest carrier) and
+Verification to consume the typed facts as well, move fact construction
+into individual trusted handlers, and define the durable wire form.
 
 ### PROTO-EVID-02 — cache correctness + observability (fixed 2026-08-23)
 

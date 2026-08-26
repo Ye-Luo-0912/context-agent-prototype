@@ -115,6 +115,13 @@ pub enum TurnFrameStep {
         /// fetched evidence under a new item id.
         #[serde(default)]
         disposition: ToolResultDisposition,
+        /// Typed host-trusted execution facts (CAP-OBS-01), captured from
+        /// the dispatcher lane when the result landed. `None` marks frames
+        /// that predate the channel — consumers fall back to the legacy
+        /// metadata derivation for exactly those. Boxed to keep the enum
+        /// variants within a word of each other.
+        #[serde(default)]
+        facts: Option<Box<crate::execution_facts::ToolExecutionFacts>>,
     },
 }
 
@@ -145,8 +152,18 @@ impl TurnFrame {
         }
     }
 
-    pub fn push_tool_result(&mut self, output: ToolOutput, scope_id: Option<ScopeId>) {
-        self.push_tool_result_with(output, scope_id, ToolResultDisposition::PersistObservation);
+    pub fn push_tool_result(
+        &mut self,
+        output: ToolOutput,
+        scope_id: Option<ScopeId>,
+        facts: crate::execution_facts::ToolExecutionFacts,
+    ) {
+        self.push_tool_result_with(
+            output,
+            scope_id,
+            ToolResultDisposition::PersistObservation,
+            facts,
+        );
     }
 
     /// Push a tool result with an explicit persist disposition: context
@@ -156,11 +173,13 @@ impl TurnFrame {
         output: ToolOutput,
         scope_id: Option<ScopeId>,
         disposition: ToolResultDisposition,
+        facts: crate::execution_facts::ToolExecutionFacts,
     ) {
         self.steps.push(TurnFrameStep::ToolResult {
             output,
             scope_id,
             disposition,
+            facts: Some(Box::new(facts)),
         });
     }
 
@@ -704,6 +723,7 @@ mod tests {
                 metadata: json!({}),
             },
             None,
+            crate::ToolExecutionFacts::empty(),
         );
 
         let messages = turn.messages();
@@ -736,6 +756,7 @@ mod tests {
                 metadata: json!({}),
             },
             None,
+            crate::ToolExecutionFacts::empty(),
         );
         let input = ModelInput {
             system_policy: vec![ModelMessage::system("policy")],
@@ -780,6 +801,7 @@ mod tests {
                     metadata: json!({}),
                 },
                 None,
+                crate::ToolExecutionFacts::empty(),
             );
         }
         turn
@@ -846,6 +868,7 @@ mod tests {
                 },
                 None,
                 disposition,
+                crate::ToolExecutionFacts::empty(),
             );
         }
 

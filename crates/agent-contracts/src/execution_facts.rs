@@ -20,6 +20,7 @@
 
 use crate::context::{MutationFootprint, ResourceTouch};
 use crate::tool::RuntimeDiagnosis;
+use serde::{Deserialize, Serialize};
 
 /// Trusted execution facts for one tool result. Every field is what a
 /// trusted producer asserts about its own execution — never parsed back
@@ -30,7 +31,10 @@ use crate::tool::RuntimeDiagnosis;
 /// (`mutates_workspace`, `None` keeps the builtin-name fallback), the
 /// verification stamp (`verification` / `intent=verify`, never inferred),
 /// and the runtime-owned failure diagnosis (`_runtime.failure_class`).
-#[derive(Debug, Clone, Default)]
+///
+/// Serialized only inside the checkpointed turn frame; there is still no
+/// event- or wire-level facts DTO.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct ToolExecutionFacts {
     resources: Vec<ResourceTouch>,
     may_mutate_workspace: Option<bool>,

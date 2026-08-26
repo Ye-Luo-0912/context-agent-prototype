@@ -231,7 +231,9 @@ impl RuntimeActor {
                     None,
                 );
                 if let Some(turn) = self.state.turn.as_mut() {
-                    turn.turn_frame.push_tool_result(output.clone(), None);
+                    let facts = self.services.tools().execution_facts(&output);
+                    turn.turn_frame
+                        .push_tool_result(output.clone(), None, facts);
                 }
                 let frontier = self.observe_persistable_tool(
                     &output,
@@ -264,10 +266,12 @@ impl RuntimeActor {
                     None,
                 );
                 if let Some(turn) = self.state.turn.as_mut() {
+                    let facts = self.services.tools().execution_facts(&output);
                     turn.turn_frame.push_tool_result_with(
                         output,
                         None,
                         ToolResultDisposition::TransientNoPersist,
+                        facts,
                     );
                     if let Some(next) = turn.pending_tools.pop_front() {
                         call = next;
@@ -1224,10 +1228,12 @@ impl RuntimeActor {
                         .await;
                 }
                 if let Some(turn) = self.state.turn.as_mut() {
+                    let facts = self.services.tools().execution_facts(&output);
                     turn.turn_frame.push_tool_result_with(
                         output.clone(),
                         op_scope_id,
                         completion.disposition,
+                        facts,
                     );
                     // Exactly-once close scheduling: this result's frame is
                     // consumed by the next model request, so its context
@@ -1626,7 +1632,9 @@ impl RuntimeActor {
             Some(true),
         );
         if let Some(turn) = self.state.turn.as_mut() {
-            turn.turn_frame.push_tool_result(output.clone(), None);
+            let facts = self.services.tools().execution_facts(&output);
+            turn.turn_frame
+                .push_tool_result(output.clone(), None, facts);
         }
         let frontier = self
             .state
@@ -1664,7 +1672,9 @@ impl RuntimeActor {
             attribution.map(RuntimeExecutionAttribution::reusable_verification),
         );
         if let Some(turn) = self.state.turn.as_mut() {
-            turn.turn_frame.push_tool_result(output.clone(), None);
+            let facts = self.services.tools().execution_facts(&output);
+            turn.turn_frame
+                .push_tool_result(output.clone(), None, facts);
         }
         let frontier = self.observe_persistable_tool(
             &output,

@@ -1060,6 +1060,7 @@ impl RuntimeActor {
                     output,
                     scope_id,
                     disposition,
+                    facts: _,
                 } = step
                 else {
                     continue;

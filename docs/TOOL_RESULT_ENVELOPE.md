@@ -75,10 +75,13 @@ facts that never originate in producer metadata. The typed vocabulary
 landed 2026-08-26 (`agent-contracts/src/execution_facts.rs`), and the
 first channel landed the same day: `ToolDispatcher::execution_facts`
 translates the trusted builtin registry's own stamps at one sanctioned
-point, capability results route to empty facts, and the actor's batch
-ledger consumes them. Still open: the heating/turn-frame carriers so
-context heating, Evidence Frontier and Verification also read facts,
-handler-level direct construction, and a durable wire form. Do not add
+point, capability results route to empty facts, the actor's batch ledger
+consumes them, and the checkpointed turn frame carries the same facts on
+every tool-result step (`Option<Box<_>>`; old checkpoints restore as
+`None`, where the prompt's fs.read body-identity hints fall back to the
+legacy metadata derivation). Still open: the heating ingest carrier,
+Verification, handler-level direct construction, and an event-level wire
+DTO. Do not add
 new authority-bearing keys to `metadata`; plugin authors must not assume
 `metadata.path`/`metadata.revision` reaches the Runtime as truth.
 

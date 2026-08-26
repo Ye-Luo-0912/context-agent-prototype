@@ -1147,7 +1147,7 @@ pub fn tool_failure_output(
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RuntimeDiagnosis {
     pub class: ToolFailureClass,
     pub hint: String,

@@ -7,8 +7,8 @@ use super::state::{
 use super::*;
 use agent_contracts::{
     MAX_TASK_ANCHOR_ITEM_CHARS, NegativeFactEventKind, ResourceFreshness, ResourceVersionOracle,
-    ToolExecutionAttribution, ToolExecutionPurpose, ToolOutput, ToolResultDisposition, TurnFrame,
-    VerificationReuse,
+    ToolExecutionAttribution, ToolExecutionFacts, ToolExecutionPurpose, ToolOutput,
+    ToolResultDisposition, TurnFrame, VerificationReuse,
 };
 use serde_json::json;
 
@@ -451,7 +451,7 @@ fn open_turn_projection_shows_path_revision_without_persisting() {
         ]
     });
     let mut turn = TurnFrame::new("continue");
-    turn.push_tool_result(patch, None);
+    turn.push_tool_result(patch, None, ToolExecutionFacts::empty());
     let before = resume.clone();
     let view = resume.project_from_turn(&turn, 1, 2);
     assert_eq!(resume, before, "projection must not persist");
@@ -475,7 +475,12 @@ fn open_turn_projection_skips_transient_results() {
     let mut fetch = output("context.fetch", true, "body");
     fetch.metadata = json!({"path": "src/secret.rs", "revision": "ss"});
     let mut turn = TurnFrame::new("continue");
-    turn.push_tool_result_with(fetch, None, ToolResultDisposition::TransientNoPersist);
+    turn.push_tool_result_with(
+        fetch,
+        None,
+        ToolResultDisposition::TransientNoPersist,
+        ToolExecutionFacts::empty(),
+    );
     let view = resume.project_from_turn(&turn, 1, 2);
     assert!(view.is_empty());
     assert!(resume.checked_files.is_empty());
@@ -488,7 +493,7 @@ fn open_turn_unknown_mutation_keeps_projected_checked_files() {
     let mut ls = output("shell.exec", true, "listed");
     ls.metadata = json!({"command": "ls", "mutates_workspace": true});
     let mut turn = TurnFrame::new("continue");
-    turn.push_tool_result(ls, None);
+    turn.push_tool_result(ls, None, ToolExecutionFacts::empty());
     let view = resume.project_from_turn(&turn, 1, 2);
     assert!(
         view.checked_files.is_empty(),

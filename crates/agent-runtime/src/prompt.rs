@@ -377,16 +377,31 @@ fn visible_body_identities_from_parts(
     identities
 }
 
+/// First trusted resource touch of a settled result. Facts captured on the
+/// dispatcher lane are authoritative; frames without channel-captured
+/// touches (pre-channel frames, or results with none) fall back to the
+/// legacy metadata derivation, which yields the same values for every
+/// producer class today.
+fn primary_result_touch(
+    output: &agent_contracts::ToolOutput,
+    facts: &Option<Box<agent_contracts::ToolExecutionFacts>>,
+) -> Option<agent_contracts::ResourceTouch> {
+    facts
+        .as_deref()
+        .and_then(|facts| facts.resource_touches().first().cloned())
+        .or_else(|| output.resource_touches().into_iter().next())
+}
+
 fn file_read_body_identities(frame: &TurnFrame) -> Vec<String> {
     let mut identities = Vec::new();
     for step in &frame.steps {
-        let TurnFrameStep::ToolResult { output, .. } = step else {
+        let TurnFrameStep::ToolResult { output, facts, .. } = step else {
             continue;
         };
         if output.tool_name != "fs.read" || !output.ok || output.model_content.is_empty() {
             continue;
         }
-        let Some(touch) = output.resource_touches().into_iter().next() else {
+        let Some(touch) = primary_result_touch(output, facts) else {
             continue;
         };
         let Some(identity) = touch
@@ -412,7 +427,7 @@ fn demanded_file_read_body_rows(
 ) -> Vec<(String, String)> {
     let mut rows = Vec::new();
     for step in &frame.steps {
-        let TurnFrameStep::ToolResult { output, .. } = step else {
+        let TurnFrameStep::ToolResult { output, facts, .. } = step else {
             continue;
         };
         if output.tool_name != "fs.read"
@@ -422,7 +437,7 @@ fn demanded_file_read_body_rows(
         {
             continue;
         }
-        let Some(touch) = output.resource_touches().into_iter().next() else {
+        let Some(touch) = primary_result_touch(output, facts) else {
             continue;
         };
         let Some(identity) = touch
@@ -1133,6 +1148,7 @@ mod tests {
                 }),
             },
             None,
+            agent_contracts::ToolExecutionFacts::empty(),
         );
         let assembled =
             assembler.assemble(None, None, Some(&progress), &history, &turn, Vec::new());
@@ -1503,6 +1519,7 @@ mod tests {
                     metadata: serde_json::json!({}),
                 },
                 None,
+                agent_contracts::ToolExecutionFacts::empty(),
             );
         }
         let assembled = assembler.assemble(
@@ -1571,14 +1588,22 @@ mod tests {
             name: "fs.read".into(),
             arguments: serde_json::json!({ "path": "src/auth.rs" }),
         }]);
-        turn.push_tool_result(read_output(0, "src/auth.rs"), None);
+        turn.push_tool_result(
+            read_output(0, "src/auth.rs"),
+            None,
+            agent_contracts::ToolExecutionFacts::empty(),
+        );
         for index in 1..9 {
             turn.push_tool_calls(vec![agent_contracts::ToolCall {
                 id: format!("call-{index}"),
                 name: "fs.read".into(),
                 arguments: serde_json::json!({ "path": "src/other.rs" }),
             }]);
-            turn.push_tool_result(read_output(index, "src/other.rs"), None);
+            turn.push_tool_result(
+                read_output(index, "src/other.rs"),
+                None,
+                agent_contracts::ToolExecutionFacts::empty(),
+            );
         }
         let progress = TaskProgressView {
             checked_files: vec!["src/auth.rs@abc123".into()],
@@ -1703,7 +1728,11 @@ mod tests {
             name: "fs.read".into(),
             arguments: serde_json::json!({ "path": "src/auth.rs" }),
         }]);
-        short_turn.push_tool_result(read_output(0, "src/auth.rs"), None);
+        short_turn.push_tool_result(
+            read_output(0, "src/auth.rs"),
+            None,
+            agent_contracts::ToolExecutionFacts::empty(),
+        );
         let still_there = assembler.assemble_with_catalog(
             None,
             None,
@@ -1911,6 +1940,7 @@ mod tests {
                 metadata: serde_json::Value::Null,
             },
             None,
+            agent_contracts::ToolExecutionFacts::empty(),
         );
         let messages = turn.messages();
         let tool = messages
