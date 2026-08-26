@@ -684,7 +684,7 @@ so optimization targets long turns, not task-round means. Deferred
 honestly: a `warning_surfaced` kind needs the render path to report
 surfacing; do not fake it from attempt counts.
 
-### CONV-04 — execution attribution + capability leases (partial; attribution/negative-fact slices landed 2026-08-24)
+### CONV-04 — execution attribution + capability leases (partial; attribution/negative-fact/equivalence-class/obligation-provenance slices landed through 2026-08-26)
 
 The retained long-flow event streams prove that the current convergence
 scalar is the wrong decision signal for optional exploration. C/A produced
