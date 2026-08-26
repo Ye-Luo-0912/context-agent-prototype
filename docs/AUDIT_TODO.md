@@ -470,6 +470,18 @@ the one cell whose provider session died before any tool call. The gate bar
 provider serving and TOOL-EDIT-02 stays open for a window where the served
 model's first-attempt discipline holds across all twelve cells.
 
+A fifth run the same day (`tool-surface-edit-v3-clean-tree-2026-08-26-r4/`),
+in the fastest window yet (wall 218 s, no session loss), reproduced the
+verdict shape exactly: strict 12/12, gate 9/12, non-conflict-first 8/9,
+with the three gate failures again being two forbidden post-edit
+confirmation reads on the stale-recovery fixture and one non-exact
+first-hunk set recovered on the second attempt. Five independent windows
+have now produced byte-perfect applied patches in every cell that reached
+a tool call, with gate failures drawn from the same two model-behavior
+shapes. The diagnostic has saturated: further same-day retries against
+this serving add no information, and the item now waits for a materially
+different provider or model serving rather than another attempt.
+
 ## Open P1 — runtime scheduling correctness
 
 Design + invariants: [`EXECUTION_COHERENCE.md`](EXECUTION_COHERENCE.md)
