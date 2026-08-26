@@ -445,6 +445,17 @@ plus model behavior variance. TOOL-EDIT-02 stays open for one stable
 provider window meeting 12/12 strict, 12/12 gate and 9/9 non-conflict
 first patch.
 
+A third run the same day in a normal-latency window (`tool-surface-edit-
+v3-clean-tree-2026-08-26-r2/`) confirms the separation and narrows the
+diagnosis: strict 12/12 again, gate 8/12, non-conflict-first 7/9, wall back
+to 280 s with no session loss. Every applied patch across all 36 clean-tree
+cells has been byte-perfect; the four gate failures were two post-edit
+confirmation reads this fixture's flow contract forbids, one stale-revision
+first attempt (recovered), and one non-exact first-hunk attempt (recovered).
+The mutation path is proven; what fluctuates between provider windows is
+first-attempt decision quality of the served model, which is exactly the
+product reliability this open gate measures.
+
 ## Open P1 — runtime scheduling correctness
 
 Design + invariants: [`EXECUTION_COHERENCE.md`](EXECUTION_COHERENCE.md)
