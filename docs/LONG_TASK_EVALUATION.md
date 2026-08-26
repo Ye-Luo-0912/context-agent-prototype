@@ -150,8 +150,9 @@ candidate snapshot.
   stated in the status paragraph below.
 - A complete externally captured checkpoint contains the task, Context,
   capability and authority-marker planes. The current safe-point background
-  artifact is actor-owned and deliberately omits the host capability plane;
-  closing that ownership seam is part of `LT-RUN-04` below. Neither form may
+  artifact was actor-owned and omitted the host capability plane; `LT-RUN-04`
+  added capture plumbing, while the stable-generation ownership proof is
+  reopened under `LT-RUN-05`. Neither form may
   serialize raw transcript history or an in-flight prepared effect.
 - Restore reuses the existing validation/fence. A new
   `continue_active_task` runtime command starts a fresh `ActiveTurn` from the
@@ -162,7 +163,7 @@ The implementation must add explicit events for progress update, safe-point
 resume commit, durable checkpoint acknowledgement/failure and continuation
 start. Eval must be able to prove their order from JSONL.
 
-Status: landed deterministically 2026-08-25. Accrued debt reasons are task
+Historical landing status (2026-08-25): accrued debt reasons are task
 anchor change, durable workspace mutation and verification change; they
 coalesce into one resume install plus one atomic write under the workspace
 state directory (`CheckpointStore`). `TaskResumeCommitted` precedes
@@ -174,7 +175,9 @@ through write-plus-rename, not yet a checksummed/fsync cold-restart artifact.
 `continue_active_task` restarts the stored directive with a
 `task_continuation` input kind — no new dialogue identity, no re-ingest,
 and a `TaskContinuationStarted` event. Deterministic coverage: ordering,
-read-only no-debt, store atomicity, and continuation identity.
+read-only no-debt, store atomicity, and continuation identity. The 2026-08-27
+audit supersedes the implied durability claim: failed/debt/in-flight gating and
+snapshot identity are reopened under `LT-RUN-05`.
 
 ### LT-RUN-03 — completion and recovery gate
 
@@ -189,16 +192,18 @@ The final durable checkpoint is taken after `TurnCompleted` and before the
 task scope is reported safely closed. This slice extends existing completion
 tests; it does not make `task.complete` permanently visible.
 
-Status: landed deterministically 2026-08-25. The acceptance gate re-runs at
+Historical landing status (2026-08-25): the acceptance gate re-runs at
 every completion edge: no recovery fence, no unsettled cancelled operation,
 zero open failure obligations, required verification current, and no open
 loops silently erased. A gated proposal on the one-shot path returns the
 decision to the model with one warning per turn instead of committing;
 the deferred and `/done` paths fail their transaction with the typed
 reason. Success orders `TurnCompleted` -> final `CheckpointDurable` ->
-`TaskCompleted`, so JSONL proves closure was durably checkpointed before
-it was reported. A failed final write surfaces as a warning that never
-un-completes the task and never claims resumability. Deterministic
+`TaskCompleted`, so JSONL proves event order, not restore validity. The current
+implementation has already cleared task authority when a failed final write is
+reported; its warning cannot make that task active again. The 2026-08-27 audit
+rejects that as the target contract. `LT-RUN-05` replaces it with the two-phase
+completion protocol below. Deterministic
 coverage: refusal with later resolution, ordering proof, and store
 failure semantics.
 
@@ -222,8 +227,9 @@ or network. The target harness-owned oracle must validate boundary values,
 overflow saturation, permanent-error behavior, public API compatibility,
 README semantics and the allowed workspace diff. The current post-run
 `cargo test` executes tests inside the agent-editable workspace and is only a
-self-check; adding an external oracle is part of `LT-RUN-04`. Multiple correct
-implementations must be accepted; a golden text patch is not the oracle.
+self-check. `LT-RUN-04` added an external-oracle path, but its setup and outcome
+classification are reopened under `LT-RUN-05`. Multiple correct implementations
+must be accepted; a golden text patch is not the oracle.
 
 Two modes share the exact seed and directive:
 
@@ -242,7 +248,8 @@ its one comparison variable.
 1. **Deterministic runtime gate:** scripted decisions cover progress CAS,
    safe-point ordering, checkpoint failure/retry, stop/restore/continue,
    no duplicated effect commit and completion refusal with stale verify.
-   Status: green for `retry_policy_dev` as of 2026-08-25. The scripted
+   Historical mechanism status: green for `retry_policy_dev` as of 2026-08-25.
+   The scripted
    normal/resume gate (`agent-eval --long-task-gate`, also run as a cargo
    test) drives two real runtime instances over the production tool
    surface — progress CAS at the operation commit, safe-point ordering,
@@ -252,8 +259,9 @@ its one comparison variable.
    Directive tools are leased from their catalog-cold state through
    `capability.manage`, exactly as a live run must. Checkpoint
    failure/retry and completion-refusal-with-stale-verify remain covered
-   by the LT-RUN runtime slices. The first layer-2 C cells have since run;
-   layers 3+ remain open.
+   by the LT-RUN runtime slices. The 2026-08-27 audit adds same-anchor snapshot,
+   exact ack correlation, final cold-restore and cross-consumer verification
+   regressions before this layer can serve as an exit gate.
 2. **C live development pilot:** `normal` and `resume`, two repeats each,
    using one pinned model/provider. These four cells validate the harness;
    they are not acceptance.
@@ -265,7 +273,7 @@ its one comparison variable.
    canonical behavioral-pass claim. Two additional attempts are retained as a
    separate provider-transport failure window. No acceptance claim and
    nothing retuned.
-3. **Completion-candidate isolation:** after `LT-RUN-04` deterministic gates,
+3. **Completion-candidate isolation:** after `LT-RUN-05` deterministic gates,
    freeze the final Runtime/evaluator substrate and run retained-C
    CompletionOpportunity off/on normal/resume pairs, at least two repeats per
    mode. The candidate is default-off and is the only variable. Roadmap item 8
@@ -286,7 +294,7 @@ state-based: verified acceptance, resolved required blockers and explicit
 completion. Round/call/token/time values are safety ceilings, never target
 step counts or automatic declarations of success.
 
-## Next phase task: `LT-RUN-04` — trustworthy closure and cold continuation
+## Implemented candidate phase: `LT-RUN-04` — trustworthy closure and cold continuation
 
 `LT-RUN-01..03` established the bounded task/resume substrate. The first live
 pilot changes the next implementation order; it does not justify a Task DAG or
@@ -361,7 +369,7 @@ continuation:      n/a | restored | failed(reason)
 provider/runtime:  healthy | failed(class)
 ```
 
-The final cell verdict remains the conjunction required by the existing gate;
+The target final cell verdict is the conjunction of all mandatory dimensions;
 separating dimensions does not turn partial work into PASS. It prevents a
 closure failure from erasing whether the implementation was behaviorally
 correct. Provider, verifier, safe edit, filesystem settlement and lifecycle
@@ -370,9 +378,10 @@ failures remain different classes.
 Run read-only diff and behavioral acceptance whenever the final workspace is
 inspectable, including after missing closure or a provider failure that occurs
 after edits. `not_run(reason)` is reserved for an unavailable workspace or an
-oracle that cannot start, not for failure in another dimension. Report the
-workspace's own `cargo test` separately as an agent-authored self-check. Add a
-harness-owned, network-free external test crate (or equivalent isolated
+oracle that cannot start, not for failure in another dimension. Run and report
+the workspace's own `cargo test` separately as an agent-authored self-check
+before oracle injection, or target it so the injected oracle cannot execute.
+Add a harness-owned, network-free external test crate (or equivalent isolated
 oracle) for retry bounds, transient/permanent behavior, delay saturation and
 overflow, and public API compatibility; keep README semantics and allowed diff
 as harness-owned checks. Do not use implementation markers or a golden patch
@@ -382,14 +391,14 @@ For resume cells, phase two must construct a fresh Context implementation and
 load the persisted checkpoint artifact. Reusing the phase-one engine object is
 not a cold-resume result.
 
-Status: landed 2026-08-25. The evaluator records the six outcome dimensions
-independently and read-only acceptance always runs while the workspace is
-inspectable; a harness-owned frozen-public-API oracle is injected after the
-run and executed in isolation from the agent-editable workspace, and the
-agent's own cargo run stays a separate non-gating self-check. Resume twins
-build a fresh Context engine per phase and cross the boundary holding only
-the acknowledged artifact locator, which is checksum-verified on load.
-No live cell has yet passed the full conjunction.
+Status after the 2026-08-27 audit: partially landed and reopened. The report
+shape contains separate fields and resume twins construct a fresh Context
+engine with a checksum-verified loader. However, oracle injection can fail
+before execution because its target directory is not created; four retained
+`behavior=fail` cells are setup failures (`os error 3`), not behavioral
+failures. Overall PASS does not yet require successful resume, healthy
+provider/runtime and absence of runtime error. Per-phase counters are lost on
+some failed driver returns. No retained live aggregate is decision-grade.
 
 ### Slice B — separate CAS revision from verification basis
 
@@ -432,16 +441,13 @@ Acceptance for this slice:
 - ActiveTurn, task resume, exact reuse and completion agree on currentness;
 - completion records remain bound to the authoritative task basis.
 
-Status: landed deterministically 2026-08-25, as authority-gated staleness on
-the existing single record revision rather than a second counter: the whole
-anchor CAS still advances one monotonic revision and the resume fence always
-follows it, but only boundary-class movement (goal/constraints) marks a
-Current verifier stale with cause `SpecChanged`; progress-only CAS keeps the
-verifier Current while stale-base writes stay refused. The behavioral
-acceptance bullets above are covered by deterministic TaskManager tests in
-both the patch and whole-anchor paths. A dedicated verification-basis counter
-stays open and is not needed by any current caller; if criterion-level gates
-arrive they must first define criterion origin/authority as stated above.
+Status after the 2026-08-27 audit: partially landed and reopened. Whole-record
+stale CAS still refuses and goal/constraint movement marks verification stale.
+A progress-only CAS leaves `validity()` and completion Current, but exact reuse
+and `CompletionOpportunity` reject the same fact because they compare its old
+anchor revision with the new record revision. The single revision therefore
+does not provide the independent basis promised above. Criterion
+origin/authority and one shared currentness predicate remain required.
 
 ### Slice C — conservative `CompletionOpportunity` candidate
 
@@ -506,7 +512,7 @@ offers per opportunity key. If the gate fails, the candidate remains off and
 cannot be smuggled into an A/C comparison; only a promoted, frozen setting may
 be held constant across later Context engines.
 
-Status: landed behind a default-off host switch
+Status: the mechanism landed behind a default-off host switch
 (`RuntimeServices::with_project_completion_opportunity`) on 2026-08-25, not
 promoted. Eligibility is a pure derivation mirroring the acceptance gate plus
 the two positive-evidence conditions (task-relevant durable mutation with
@@ -531,21 +537,25 @@ verifiers are TaskScoped by design, so no live PASS ever carried an exact
 identity. Attempt 2 registered a host opt-in source-read-only
 ExactCurrentWorld recipe on both arms and proved the mechanism end to end in
 live conditions — receipt-backed offers fired once per mode, and resume/on r2
-executed offer -> leased call -> committed closure -> all dimensions pass —
-but paired outcomes fell (2/4 versus 1/4), medians rose, arming stayed rare
-(2 of 6 on-cells), and one journal-lock flake censored an off cell.
-Decision-grade reruns require a higher arming rate and that lock fix first;
+executed offer -> leased call -> committed closure; the then-current report
+marked its dimensions pass —
+but the retained ratios and medians are not promotion evidence because the
+evaluator and resume correlation are reopened below. Eligibility also accepts
+any historical `MutationResult` without the shared verification basis, and the
+offered key is written after safe-point capture without accruing checkpoint
+debt, so crash recovery can re-offer it. The candidate remains default-off.
+Do not run another live attempt until `LT-RUN-05` closes these prerequisites;
 upgrading discovered general runners remains a separate gated decision.
 
 ### Slice D — one complete durable checkpoint boundary
 
-The current actor safe-point artifact contains the actor-owned checkpoint
-plane and an empty host-capability list. A full `RuntimeCheckpoint` is produced
-only when `RuntimeInstance::checkpoint()` mechanically merges the host registry
-under its generation handshake. The pilot disabled capability-aware mode, so
-this omission is not an explanation for its missing closure; it is a production
-recovery-contract gap. `LT-RUN-04` must make the safe segment boundary use the
-same complete ownership model. Centralize external and automatic
+The historical pre-`LT-RUN-04` baseline stored an actor-owned checkpoint with
+an empty host-capability list, while only `RuntimeInstance::checkpoint()` used
+a generation handshake. `LT-RUN-04` then wired automatic capture to the host
+capability snapshot. The current defect is narrower: that automatic path does
+not prove a stable generation before/after capture and can therefore be torn.
+`LT-RUN-05` carries the reopened generation and validation proof. Centralize
+external and automatic
 safe-point persistence through one narrow full-plane coordinator; it only
 captures, merges, writes and acknowledges, while `RuntimeActor` remains the
 sole lifecycle orchestrator:
@@ -568,8 +578,8 @@ The host performs a mechanical snapshot/merge; it does not become a second
 orchestrator. Platform-specific directory durability limitations remain
 explicit, especially on Windows.
 
-Replace reason-vector inference as durability truth with monotonic watermarks
-equivalent to:
+The attempted `LT-RUN-04` design replaced reason-vector inference with
+watermarks named:
 
 ```text
 resume_state_revision
@@ -577,8 +587,8 @@ required_durable_revision
 durable_revision
 ```
 
-Debt reasons remain useful observability. Continuation across a segment is
-allowed only when `durable_revision >= required_durable_revision`. A write,
+Debt reasons remain useful observability. Its intended continuation rule was
+`durable_revision >= required_durable_revision`. A write,
 checksum, rename, host-plane capture or acknowledgement failure must not emit a
 safe-pause claim or start `TaskContinuationStarted`; it remains retryable and
 visible. A segment boundary forces the latest bounded resume knowledge into the
@@ -592,16 +602,16 @@ exact artifact, and only then calls `continue_active_task`. An in-memory
 `RuntimeCheckpoint` may not cross the boundary. Instrument instance identity in
 the deterministic harness so this fact is provable rather than inferred.
 
-Status: landed deterministically 2026-08-25. Safe-point persistence runs
-through one full-plane coordinator that captures the host capability plane at
-spawn-injected registry handles, and `CheckpointStore` writes a header +
-payload envelope with sha256 and an OS sync barrier before the atomic rename,
-with a verified load path refusing truncation or corruption. Continuation is
-gated by monotonic watermarks (`resume_state_revision`,
-`required_durable_revision`, `durable_revision`) and fails closed with a typed
-fence until a retried write lands; turn-end settlement flushes accrued debt so
-a failed write retries even without a tool batch. `CheckpointDurable` carries
-the acknowledged revision and checksum.
+Status after the 2026-08-27 audit: envelope checksum, sync/rename persistence,
+corruption refusal, typed events and a fresh-engine load path are landed, but
+the boundary contract is reopened. Automatic safe-point capture does not use
+the external checkpoint path's stable capability-generation handshake. The
+three watermarks alias task-anchor revision, which does not advance for every
+workspace/verification snapshot and can decrease across tasks; continuation
+does not also require no debt, no failed write and no in-flight write. The
+completion path can acknowledge a checkpoint whose active-task authority and
+`current_task_id` disagree, which restore validation rejects. Read size,
+serialization and retained-artifact growth are not yet bounded.
 
 ### Slice E — evidence gate for proof and planning research
 
@@ -634,42 +644,216 @@ failure after closure, provider and tool failures are separated. Its first
 evaluation must be same-model TaskGraph-off/on, must not become completion
 authority and must not create new Context roots.
 
-### Verification and exit gate
+## Next phase task: `LT-RUN-05` — durable resume truth and decision-grade evaluation
+
+The 2026-08-27 post-landing audit changes the order again. `LT-RUN-04`
+delivered useful primitives, but deterministic mechanism tests did not prove
+that the acknowledged artifact is the latest internally valid snapshot or that
+the live evaluator reports that fact correctly. Do not optimize completion
+arming or expand the task pack until the truth chain is repaired.
+
+The phase objective is:
+
+> Make one exact, bounded snapshot identity flow from settled Runtime state to
+> durable acknowledgement, cold restore, continuation and the final report;
+> make every verification and outcome consumer agree on the same basis.
+
+### Work package 1 — coalesced monotonic snapshot fence
+
+Use an actor-owned snapshot sequence independent of `TaskAnchor` revision.
+Persist and restore it as part of the existing durable Runtime/authority
+lineage: an unrelated run may start a new sequence, but a continued lineage
+cannot reset or move backwards across a task switch or cold restore. This is a
+sequencing identity, not another editable ResumePoint and not a fixed-round
+checkpoint policy:
+
+```text
+durable state change
+  -> mark checkpoint debt (coalesce while work continues)
+fully settled safe point + debt + no write in flight
+  -> allocate S = previous snapshot sequence + 1
+  -> freeze the bounded resume state represented by S
+  -> required_sequence = S
+  -> capture, validate and persist S
+ack(lineage, S, artifact, checksum, bytes, capability_generation)
+  -> accept only for the matching frozen snapshot
+  -> durable_sequence = max(durable_sequence, S)
+newer debt during write(S)
+  -> retain debt and schedule a later S+1; never clear it with ack(S)
+```
+
+Continuation is allowed only when all are true:
+
+```text
+checkpoint_debt is empty
+AND checkpoint_write_failed is false
+AND no checkpoint write is in flight
+AND durable_sequence >= required_sequence
+```
+
+Task-anchor CAS remains task-record concurrency control. Snapshot sequence is
+Runtime durability order. Neither may impersonate the other. This keeps the
+hot path adaptive: state changes accrue cheap typed debt, while actual writes
+remain coalesced at safe points rather than following a fixed round count.
+
+### Work package 2 — one valid full-plane checkpoint path
+
+Automatic safe points, explicit instance checkpoints and final completion use
+one narrow capture contract:
+
+1. freeze a self-consistent actor/task state for sequence `S`;
+2. capture Context and authority-marker planes;
+3. capture the capability plane with bounded generation-before/after retry;
+4. merge and call `RuntimeCheckpoint::validate` before persistence;
+5. enforce explicit header, payload and total artifact byte limits;
+6. write the checksummed envelope, sync, rename and acknowledge the exact
+   tuple; and
+7. retain artifacts under a bounded policy while preserving referenced/audit
+   checkpoints.
+
+Terminal completion is explicitly two-phase. First prepare a prospective
+terminal snapshot in which `TaskManager.active` and Runtime task identity are
+both cleared while the live task remains completion-pending and retryable.
+Validate and durably acknowledge that snapshot. Only then commit the matching
+in-memory terminal transition and emit `TaskCompleted`. A failed write leaves
+the live task active/completion-pending; it never reports completion and may
+retry from the same authorized completion intent. Regression coverage must load
+the acknowledged final artifact and restore it into a fresh Runtime + Context;
+event order alone is insufficient.
+
+### Work package 3 — one verification basis
+
+Introduce an explicit verification-basis revision or digest distinct from the
+whole-record CAS revision. Authoritative goal, constraint and accepted
+criterion changes move the basis; progress/open-loop/next-action maintenance
+may advance CAS without moving it. First define criterion origin and authority:
+user/host criteria may be authoritative, while model-derived criteria remain
+proposals.
+
+Bind verification facts and all consumers to the same basis tuple. One shared
+predicate must drive ActiveTurn projection, task resume, completion acceptance,
+exact/domain reuse and `CompletionOpportunity`. Positive mutation evidence and
+the offered-opportunity key must carry that basis; persisting a new offered key
+accrues checkpoint debt so once-per-basis survives recovery.
+
+### Work package 4 — evaluator truth reconstruction
+
+The evaluator must derive summaries from immutable per-cell facts, never from
+the control-flow path by which a cell exited:
+
+- create harness-owned oracle directories before injection; distinguish setup,
+  spawn and assertion results, and reserve `behavior=fail` for an oracle that
+  actually ran;
+- run the workspace self-check before oracle injection, or through a target
+  proven to exclude the injected oracle, and remove the oracle before any later
+  self-check; retain separate argv/results so the self-check cannot execute the
+  harness oracle accidentally;
+- classify provider and Runtime failures from typed sources at the point of
+  failure; never infer health from a transport-error substring;
+- preserve phase counters and error classes on success, cancel, timeout and
+  failure; record `restored`, `continued` and `completed` independently;
+- correlate interruption only with the latest exact
+  `(lineage, task, sequence, artifact, checksum, capability_generation)`
+  acknowledgement;
+- make overall PASS the conjunction of every mandatory behavior/diff/closure/
+  continuation/health dimension plus `runtime_error == none`;
+- bind exact verification to a complete bounded workspace input snapshot,
+  including all relevant source and test files;
+- count opportunity call-through only from one non-empty identical key across
+  Offered -> Called -> Completed, with the disabled arm emitting comparable
+  explicit zeros; and
+- rebuild report ratios, rounds, tool calls, prompt/schema tokens and tails
+  mechanically from per-cell records. Missing measurements remain explicit,
+  not zero; for two observations report both values (and any midpoint used)
+  instead of labeling the upper value as the median.
+
+Sequence-contiguity checks are per Runtime run/segment; a subscriber that starts
+after the run or a merge across run ids must not manufacture a product failure.
+
+### Work package 5 — execution order and live decision
+
+Implementation and proof order is fixed by dependency, not by round budget:
+
+1. snapshot sequence/fence and final-state consistency;
+2. shared capture/validation/generation/bounds path;
+3. verification basis and basis-bound opportunity persistence;
+4. evaluator fixtures and report recomputation;
+5. deterministic end-to-end cold-resume matrix; then
+6. one decision-grade paired live gate.
+
+The live gate remains the frozen retained-C CompletionOpportunity off/on
+normal/resume design with at least two paired repeats per mode and immutable
+evidence. Interleave arms where the harness supports it. The candidate remains
+default-off unless mandatory outcomes do not regress, closure improves, median
+rounds and tool calls fall, and no new tail appears. A failed gate ends the
+candidate; it does not authorize prompt pressure, provider-specific policy or
+a same-model A/C run.
+
+### Non-goals
+
+- no transcript expansion or second task/turn authority;
+- no Context selection, GC, retrieval or prompt-packing retune;
+- no fixed checkpoint interval, fixed subtask count or score-driven stopping;
+- no model-visible TaskGraph, CPL authority, learned router or semantic planner;
+- no provider/model special case and no standing “stop earlier” instruction;
+- no new live run before the deterministic truth chain is green.
+
+### `LT-RUN-05` verification and exit gate
 
 Minimum deterministic coverage:
 
 - behavior PASS + missing closure records behavior PASS, closure FAIL and
   overall FAIL; closure PASS + behavior FAIL also remains overall FAIL;
-- a provider failure after edits still runs the oracle when the workspace is
-  inspectable; only a real workspace/oracle-start failure records `not_run`;
-- the harness-owned external oracle is independent of agent-editable tests;
-- initial and incomplete tasks never receive a derived completion lease;
-- Current trusted terminal evidence offers `task.complete` for one bounded
-  decision; one key offers once, ignoring it never auto-completes, and
-  invalidation retracts it;
-- progress-only anchor updates do not stale verification while authority
-  changes do; ActiveTurn, resume, exact reuse and completion agree;
-- a loaded capability and all other Runtime planes round-trip through one
-  persisted artifact;
-- corruption, truncation or checksum mismatch refuses before state mutation;
-- phase two uses a distinct Context engine and no phase-one in-memory
-  checkpoint or engine reference;
-- checkpoint failure/checksum mismatch blocks continuation, retry success
-  releases it;
-- no duplicate committed effect appears after restore;
-- event revisions prove `TaskResumeCommitted(N)` ->
-  `CheckpointDurable(N, artifact, digest)` ->
-  `TaskContinuationStarted(N)`;
-- a successful final-checkpoint path retains `TurnCompleted` ->
-  `CheckpointDurable` -> `TaskCompleted`; final-write failure remains a
-  separate visible outcome and never claims resumability.
+- provider/runtime error, failed restore or failed continuation makes overall
+  FAIL even when behavior, diff and closure happen to pass;
+- oracle setup/start failures produce typed `not_run`, while an executed
+  assertion failure produces behavior FAIL; the external oracle is independent
+  of agent-editable tests, the workspace self-check cannot execute the injected
+  oracle, and neither argv/result can overwrite the other;
+- typed provider/Runtime failures remain non-healthy regardless of error text;
+- success, timeout, cancellation and error exits all preserve their actual
+  per-phase rounds, tool calls, tokens and outcome fields;
+- two different snapshots under one task-anchor revision receive different
+  sequences, and a task switch cannot move snapshot order backwards;
+- an old acknowledgement arriving after a new mutation cannot clear newer debt
+  or release continuation; an in-flight write that accrues debt is followed by
+  another capture;
+- write failure at sequence zero and at a repeated task-anchor revision blocks
+  continuation until the exact required sequence succeeds;
+- a loaded capability and all other Runtime planes round-trip under a stable
+  capability generation through one validated, bounded persisted artifact;
+- corruption, truncation, checksum mismatch, oversized input and stale
+  capability generation refuse before restored state mutation;
+- phase two uses a distinct Runtime and Context engine and receives only the
+  exact acknowledged lineage/task tuple, never a phase-one checkpoint
+  object/reference;
+- event identities within one durable lineage prove
+  `TaskResumeCommitted(S)` ->
+  `CheckpointDurable(S, artifact, digest, capability_generation)` ->
+  `TaskContinuationStarted(S)` with no mismatched/older ack accepted;
+- the final completion artifact is validated, loaded and restored successfully
+  in a fresh Runtime before the test accepts `TurnCompleted` ->
+  `CheckpointDurable` -> `TaskCompleted`; final-write failure leaves the live
+  task completion-pending/retryable and emits no `TaskCompleted`;
+- a stress fixture creates `configured_retention_limit + 2` checkpoints and
+  crosses the configured byte threshold; count/bytes remain bounded without
+  deleting the latest required, pinned or referenced recovery artifact;
+- progress-only record movement preserves verification across every consumer,
+  while authoritative basis movement invalidates it across every consumer;
+- initial/incomplete tasks never receive a derived completion lease; current
+  positive evidence offers one bounded decision; Offered -> Called -> Completed
+  carries one non-empty identical key, which survives cold restore and cannot
+  re-offer without a new valid basis; and
+- no duplicate committed effect appears after restore.
 
-Then execute the CompletionOpportunity off/on promotion gate above. All outcome
-dimensions must be present; its four candidate-on cells must pass behavioral,
-diff, lifecycle and normal/resume-equivalence gates, and the paired efficiency
-and tail criteria must pass before the candidate can become the frozen default.
-Only that promoted setting may enter same-model A/C. Afterward the pack may add
-diagnosis and migration tasks or collect Completion/TaskGraph shadow evidence.
+Then execute the CompletionOpportunity off/on promotion gate. All mandatory
+dimensions must be present in every uncensored cell; a harness failure is
+explicitly NOT_RUN and cannot improve either arm. The four candidate-on cells
+must pass behavioral, diff, lifecycle, health and normal/resume-equivalence
+gates, and paired efficiency/tail criteria must pass before the candidate can
+become the frozen default. Only that promoted setting may enter same-model A/C.
+Afterward the pack may add diagnosis and migration tasks or collect
+Completion/TaskGraph shadow evidence.
 
 ## Metrics and gate
 
@@ -682,8 +866,10 @@ Primary, counted over every assigned cell:
 - required verification is Current at successful completion;
 - no `Unknown` or recovery fence is hidden;
 - normal and resumed twins reach equivalent accepted behavior;
-- acknowledged full-plane artifact/digest/revision and distinct restored
-  Context engine identity.
+- acknowledged full-plane lineage/task/sequence/artifact/digest/capability-
+  generation tuple and distinct restored Runtime/Context identities;
+- explicit setup, provider, runtime, restore and continuation error classes,
+  with no missing value silently interpreted as zero or healthy.
 
 Efficiency is secondary and reported per solved task:
 
@@ -699,9 +885,9 @@ Efficiency is secondary and reported per solved task:
   verifier reruns after progress-only changes;
 - recovery overhead after restore: repeated calls, reread motive and time to
   first new outcome;
-- required/durable resume revisions, checkpoint bytes, capture/sync/restore
-  latency, coalesced debt, checksum/fence/write failures and restored
-  capability count.
+- required/durable snapshot sequences, checkpoint bytes, capture/sync/restore
+  latency, coalesced debt, write-in-flight state, checksum/fence/write failures,
+  generation retries and restored capability count.
 
 Safe edit refusals, verifier failures, provider failures and filesystem
 settlement failures remain separate classes. None is silently removed from
@@ -713,25 +899,30 @@ first; only then may lower rounds/calls support an efficiency claim.
 Exit only when:
 
 1. every deterministic gate above is green;
-2. all four new C normal/resume cells run the independent oracle and pass
-   behavioral, closure and applicable continuation dimensions with the
-   CompletionOpportunity candidate on;
-3. both resume cells load a checksum-valid full-plane artifact into a distinct
-   Context engine, with no in-memory phase-one checkpoint crossing the seam;
-4. no committed effect is duplicated and no recovery/unknown state is hidden;
-5. every `TaskCompleted` follows explicit authorized closure intent — model
-   `task.complete` or a trusted `/done`/host path; successful final-checkpoint
-   ordering is proven, while failure remains visible and makes no resumability
-   claim;
-6. the default-off candidate passes the deterministic replay and at least two
-   C off/on paired repeats per normal/resume mode, including behavior, outcome,
-   median round/call and tail gates;
-7. one unchanged completion key cannot produce repeated hints or leases;
-8. progress-only changes preserve verification while semantic-basis changes
-   invalidate it consistently across ActiveTurn, resume, reuse and completion;
-9. evidence rebuilds from immutable manifest/events/oracle/workspace facts;
-10. no implementation replays transcript history, changes Context/GC policy or
-   special-cases the provider/model in product Runtime policy.
+2. every acknowledged checkpoint in the deterministic matrix validates and
+   restores into fresh Runtime/Context instances, including the final
+   completion artifact; retention count/bytes remain bounded under stress
+   without deleting the latest required, pinned or referenced artifact;
+3. exact snapshot identity and the no-debt/no-failure/no-in-flight fence hold
+   under same-anchor snapshots, out-of-order acknowledgements, task switches,
+   new debt during write and failed-write retry;
+4. progress-only changes preserve verification while semantic-basis changes
+   invalidate it consistently across ActiveTurn, resume, exact/domain reuse,
+   completion and `CompletionOpportunity`;
+5. one unchanged completion key cannot produce repeated hints or leases across
+   a cold restore, and old mutation evidence cannot arm a new basis;
+6. evaluator fixtures prove typed oracle setup/start/assertion outcomes, full
+   PASS conjunction, complete failed-path accounting and exact resume-tuple
+   correlation;
+7. evidence and the summary report rebuild mechanically from immutable
+   manifest/events/oracle/workspace facts with no arithmetic discrepancy;
+8. the default-off candidate passes the deterministic replay and at least two
+   C off/on paired repeats per normal/resume mode, including behavior, health,
+   closure, median round/call and tail gates;
+9. no committed effect is duplicated and no recovery/unknown state is hidden;
+10. no implementation replays transcript history, changes Context/GC/prompt
+    policy, fixes progress to a predetermined size or special-cases the
+    provider/model in product Runtime policy.
 
 Only then may same-model A/C cells make a new Context-efficiency claim. This
 remains development evidence; formal M15 still requires its separately frozen

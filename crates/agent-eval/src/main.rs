@@ -28,6 +28,8 @@ mod longflow;
 mod metrics;
 mod mock_model;
 mod pilot;
+mod platform_closure;
+mod platform_closure_m13;
 mod retrieval;
 mod suite;
 mod task;
@@ -113,6 +115,24 @@ fn usage() -> ! {
          checkpoint), then stop/restore/continue the same directive.\n\
          Acceptance: TaskCompleted + hidden cargo tests pass + allowed diff.\n\
          Writes evidence under crates/agent-eval/evidence/retry-pilot/.\n\
+         \n\
+         usage: agent-eval --platform-closure-m12 [--evidence-dir <dir>]\n\
+         \n\
+         Deterministic M12 closure audit over the real authority path:\n\
+         trusted admission, prepared workspace mutations, the journaled\n\
+         reserved/dispatch/ack barrier, crash-window reopen reconciliation,\n\
+         binding-epoch fencing and generic-process exception scope. Writes\n\
+         manifest.json / rows.jsonl / REPORT.md under\n\
+         crates/agent-eval/evidence/platform-closure/m12/.\n\
+         \n\
+         usage: agent-eval --platform-closure-m13 [--evidence-dir <dir>]\n\
+         \n\
+         Deterministic extension-sandbox closure audit: real child spawns,\n\
+         post-spawn attestation validation, the trusted `required ⊆ actual`\n\
+         activation gate per sandbox profile (including both refusal cases),\n\
+         and explicit not-run rows for landlock-backed platforms this runner\n\
+         cannot execute. Writes manifest.json / rows.jsonl / REPORT.md under\n\
+         crates/agent-eval/evidence/platform-closure/m13/.\n\
          \n\
          usage: agent-eval --long-task-gate\n\
          \n\
@@ -548,6 +568,36 @@ async fn main() -> anyhow::Result<()> {
                 }
                 if !reports.iter().all(|report| report.passed) {
                     anyhow::bail!("convergence bench failed");
+                }
+                return Ok(());
+            }
+            "--platform-closure-m12" => {
+                let out_dir = evidence_dir.clone().unwrap_or_else(|| {
+                    std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                        .join("evidence")
+                        .join("platform-closure")
+                        .join("m12")
+                });
+                let (report, passed) = platform_closure::run_m12_closure(&out_dir).await?;
+                print!("{report}");
+                println!("m12 closure audit: {}", if passed { "PASS" } else { "FAIL" });
+                if !passed {
+                    anyhow::bail!("platform closure m12 gate failed");
+                }
+                return Ok(());
+            }
+            "--platform-closure-m13" => {
+                let out_dir = evidence_dir.clone().unwrap_or_else(|| {
+                    std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                        .join("evidence")
+                        .join("platform-closure")
+                        .join("m13")
+                });
+                let (report, passed) = platform_closure_m13::run_m13_closure(&out_dir).await?;
+                print!("{report}");
+                println!("m13 closure audit: {}", if passed { "PASS" } else { "FAIL" });
+                if !passed {
+                    anyhow::bail!("platform closure m13 gate failed");
                 }
                 return Ok(());
             }

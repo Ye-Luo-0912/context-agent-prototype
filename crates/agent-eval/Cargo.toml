@@ -6,8 +6,10 @@ license.workspace = true
 description = "Headless live evaluation: run a real coding task through the A/B/C context engines with a real model and compare cost vs. task success"
 
 [dependencies]
+agent-capability-process.workspace = true
 agent-contracts.workspace = true
 agent-compose.workspace = true
+agent-process.workspace = true
 agent-core.workspace = true
 agent-runtime.workspace = true
 agent-storage.workspace = true

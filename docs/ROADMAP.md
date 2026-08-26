@@ -22,45 +22,40 @@ copy them back.
 | --- | --- | --- |
 | M10 Runtime Consistency | ✅ | Runtime and context never split-brain on task/restore/turn commit. |
 | M11 Context Recall | ✅ narrow retrieval | Search/inspect/fetch without polluting prompt history. Broader catalog work is not a reason to reopen recall. |
-| M12 Effect Runtime | 🟡 first cut | One `EffectRequest`/commit path for brokerable effects. Structured `EffectIntent` + `HostToolPolicy` landed; reserved/dispatch/ack barrier with journaled durability and the out-of-process ledger transport (`broker_host` + `ProcessEffectBroker`, execution stays at the requester) landed 2026-08-26. Generic shell/process stay non-transactional. Broker-owned execution / HTTP-gRPC shells wait for remotable effects. Details: [`PLATFORM_SECURITY.md`](PLATFORM_SECURITY.md). **Not closed.** |
-| M13 Extension Sandbox | 🟡 first cut | `SandboxProfile` vs post-spawn attestation (`required ⊆ actual`). `UntrustedGenerated` fail-closed on native. Residual OS isolation is not `MOD-18`. Details: [`PLATFORM_SECURITY.md`](PLATFORM_SECURITY.md). **Not closed.** |
+| M12 Effect Runtime | 🟡 closure audit | Close only when one bounded evidence table proves every brokerable production effect crosses the common reserve/dispatch/ack path, crash windows reconcile as NotApplied/Applied/Ambiguous, authority/revocation fencing is preserved, and generic shell/process are explicit non-transactional exceptions. Requester-side application is the V1 contract; broker-owned remote execution is not required without a remotable consumer. Details: [`PLATFORM_SECURITY.md`](PLATFORM_SECURITY.md). **Not closed.** |
+| M13 Extension Sandbox | 🟡 closure audit | Close when structured attestation validates against enforced evidence, activation enforces `required ⊆ actual`, and native `UntrustedGenerated` reliably refuses when the complete floor cannot be attested. V1 acceptance is truthful fail-closed activation, not universal native availability. Running untrusted generated code through WASI remains V2. Details: [`PLATFORM_SECURITY.md`](PLATFORM_SECURITY.md). **Not closed.** |
 | M14 Resource Policy | ✅ | Schema/context quotas, standing grants, output broker, authority leases. Further typed policy is not a reopen of this gate. |
 | M15 Real Evaluation | 🧪 | Reproducible per-cell artifacts. **Context** live `context-mech.v2` 12-cell A/C evidence is in `crates/agent-eval/evidence/context-mech/`. `add_test` is Tool Surface, not Context. Frozen `context-bench.v1` SPEC stays frozen. 300×3 parked. **Not closed.** |
 | V2 Self-Iteration | 🔒 blocked | Until M12/M13/M15 close. The agent may grow capabilities, never evaluation or permission Core authority. |
 
-Dependency: M10 → M11 → M12 → M13 → M14 → M15 → V2.
-Engineering mainline is M12, then M13. Context live evidence runs in
-parallel and does not retune GC. Tool Surface edit reliability may improve
-in parallel, but it does not reorder or close either gate.
+Open gate order: M12 closure audit → M13 closure audit → V1 candidate → formal
+M15 → V2 Self-Iteration. M14 is already closed and is not reopened or inserted
+back into the active sequence. Context live evidence runs in parallel and does
+not retune GC. Tool Surface edit reliability may improve in parallel, but it
+does not reorder or close either gate.
 
 ## Ordered route
 
-1. Close M12 (brokerable effects; do not make raw shell transactional).
-2. Close M13 (attestation of actual enforced capabilities; WASI is V2).
+1. Close M12 by the bounded production-path/crash/reconcile/fencing evidence
+   table; do not make raw shell transactional or wait for remote execution.
+2. Close M13 by honest structured attestation and fail-closed activation;
+   universal native `UntrustedGenerated` availability waits for WASI/V2.
 3. Keep M14 closed; do not reopen it as a sandbox dump.
 4. V1 candidate: `context-mech.v2` 12-cell Context evidence exists; do not
-   retune GC from it. Separately, canonical `edit.patch` has a current-source
-   r4 dirty-tree diagnostic pass on the versioned v2 pack/v3 gate: non-conflict
-   first patch 9/9, proactive stale route 3/3, raw truth and flow gate 12/12,
-   with no observed patch failure, fallback, confirm read, recovery or unknown
-   settlement. This supports the current path but is not formal acceptance or
-   a general failure-rate estimate. Next run the unchanged frozen pack on a
-   clean source tree. Core-managed prepare crash seams after authority intent,
-   stage sync, and review record now have bounded fail-closed unit coverage,
-   and abrupt OS-level kills during prepare, right after commit, and
-   mid-batch are exercised through a real child process whose staged-byte
-   frames survive the death; cross-process external races (a refused second
-   official writer and a retry-window lock handoff) and mid-journal
-   corruption or checksum-valid sequence gaps have deterministic fail-closed
-   fixtures. Portable disk-full injection landed 2026-08-26 behind a
-   feature-gated storage seam (`test-faults`): injected refusals at the
-   authority-intent append, the staged temp bytes, and the committed-record
-   append have deterministic child-process fixtures pinning the honest
-   classifications — nothing staged, rolled-back cleanup of the truncated
-   stage, and applied-but-not-durably-acknowledged recovery by hash
-   evidence (`Applied { complete: false }`). Do not turn expected stale refusal into a first-attempt
-   defect: grade the bounded read→stale→reread→retry state machine. Unit fixes
-   or this diagnostic alone do not close M12, M13, or M15.
+   retune GC from it. Separately, `edit.patch` v4 removed confirmation reads in
+   both archived clean-tree windows and reached strict raw-byte truth 12/12;
+   each scored flow gate 11/12 and non-conflict-first 8/9. The sole repeated
+   archived miss is a byte-perfect, revision-correct `batch_two_file` patch
+   whose hunk partition differs from hidden `exact_hunks`. The product contract
+   is byte/revision/settlement truth; hunk partition is not model-visible
+   authority and no current consumer requires a golden decomposition. Version
+   the gate to accept byte-equivalent decompositions while retaining strict
+   paths, bytes, revisions, settlement and no-fallback/no-confirm checks. Then
+   run one archival 4x3 confirmation window. Do not wait for another provider
+   or repeat the unchanged ambiguous gate. Deterministic crash, external-race,
+   journal-corruption and portable
+   disk-full coverage remains required. This finite diagnostic is not a general
+   failure-rate estimate and does not close M12, M13 or M15.
 5. Formal M15 only from versioned per-cell artifacts. Do not use one
    A/B/C for every layer.
 6. Execution Convergence V1 candidate gate (revised 2026-08-23 second
@@ -123,7 +118,10 @@ in parallel, but it does not reorder or close either gate.
    new tail. Context selection/GC/retrieval stays frozen.
 8. Before adding another model-visible execution-progress hint or generic
    "stop earlier" standing instruction, first freeze a deterministic
-   already-satisfied-task replay plus at least two paired live repeats.
+   already-satisfied-task replay plus at least two paired live repeats. A live
+   repeat is eligible only after its evaluator proves exact resume-artifact
+   correlation, typed NOT_RUN/setup failures, full mandatory PASS conjunction
+   and complete failed-path accounting.
    Acceptance requires lower median rounds and tool calls, unchanged hidden
    success, and no new long-tail constraint turn. The rejected
    `TaskProgress.task_changes` and current-workspace-authority experiments show
@@ -217,63 +215,53 @@ in parallel, but it does not reorder or close either gate.
    positional/fuzzy edit authority from one ambiguous-anchor sample. Consider
    bounded revision-bound exact guard context only if further unchanged live
    evidence makes ambiguous-anchor rereads a material residual tail.
-10. Add the bounded long-task Runtime continuation slice before treating
-    longflow as an autonomous-agent evaluation. Reuse `TaskAnchor` plus the
-    existing `TaskRecord.resume: ExecutionState`; do not add a second
-    ResumePoint or persist raw transcript history. The implementation order is
-    (a) catalog-cold/task-required `task.manage` progress CAS for autonomous
-    plan/open-loop/next-action fields, (b) actor-owned safe-point resume commit
-    plus coalesced atomic Runtime checkpoint and
-    `continue_active_task`, then (c) completion/recovery gate coverage.
-    Safe points require a completely settled tool batch and no in-flight
-    operation; checkpoint debt is driven by durable state changes, not a fixed
-    round count. Deterministic crash/cancel/stale-verification tests must pass
-    before any live claim. Slices (a) and (b) landed deterministically
-    (2026-08-24 / 2026-08-25): catalog-cold `task.manage` anchor CAS with
-    authoritative model-visible outcomes; coalesced checkpoint debt, atomic
-    state-directory writes with durable/failure events in provable order,
-    completion barriers that wait for in-flight writes, and
-    `continue_active_task` continuation without minting a new directive
-    identity. Slice (c) landed deterministically 2026-08-25: the acceptance
-    gate re-runs at every completion edge (recovery fence, cancelled-op
-    cleanup, open obligations, verification currency, un-erased open loops),
-    gated one-shot proposals return to the model instead of committing, and
-    success orders `TurnCompleted` -> final durable checkpoint ack ->
-    `TaskCompleted`. The deterministic long-task Runtime slices are green;
-    the `retry_policy_dev` deterministic layer-1 gate also landed
-    2026-08-25 (scripted normal/resume stop/restore/continue over the real
-    production tool surface, including the catalog-cold lease path through
-    `capability.manage`).
+10. Repair and re-prove bounded long-task continuation before treating it as
+    an autonomous-agent evaluation. `LT-RUN-01..03` and useful `LT-RUN-04`
+    primitives remain; the 2026-08-27 audit reopens snapshot, verification and
+    evaluator correctness. Reuse `TaskAnchor` plus
+    `TaskRecord.resume: ExecutionState`; do not add a second ResumePoint or
+    persist raw transcript history.
 
-    The first four C live cells ran 2026-08-25. They exercised the operator
-    stop/restore/continue path, but all ended without `TaskCompleted`; their
-    event streams contain no direct `task.manage` or `task.complete` calls,
-    and none of the four canonical cells even loaded either tool through
-    `capability.manage`. Because the evaluator
-    currently returns on lifecycle-closure failure before the post-run
-    diff/cargo checks, the canonical cells do not yet prove behavioral
-    success or cold process recovery. An earlier retained attempt did call
-    `task.complete` and pass the cargo check, then failed only on the fixed
-    Windows diff-path defect. Treat the immediate gap as closure affordance
-    plus proof separation, not as evidence for a Task DAG.
+    **Runtime correctness gate**
 
-    Next execute `LT-RUN-04` in
-    [`LONG_TASK_EVALUATION.md`](LONG_TASK_EVALUATION.md): preserve behavioral,
-    diff, closure, continuation and provider outcomes independently and add a
-    harness-owned oracle outside the agent-editable workspace; preserve the
-    whole-anchor CAS while giving verification basis its own revision meaning;
-    derive a body-free key and offer one positive-evidence-gated
-    `CompletionOpportunity` per unchanged basis behind a default-off candidate
-    switch; and make the actor safe-point artifact a complete, checksummed,
-    revision-acknowledged checkpoint that a fresh Context engine can load.
-    Failed durability must block continuation. On the final common substrate,
-    apply item 8 before promotion: freeze the already-satisfied replay and run
-    retained-C CompletionOpportunity off/on normal/resume pairs with at least
-    two repeats per mode. Behavior/outcome cannot regress, closure must improve,
-    median rounds/calls must fall and no p95/max-turn tail may appear. Only the
-    promoted frozen setting enters same-model A/C, followed by diagnosis and
-    migration tasks. Criterion origin/authority precedes Completion Proof
-    Ledger shadow work; a model-visible TaskGraph remains evidence-gated. These
-    are development cells, not M15 acceptance, and they do not reorder M12 then
-    M13.
+    - actor-owned, lineage-persisted monotonic snapshot sequence independent of
+      task-anchor CAS;
+    - two-phase completion whose prospective terminal checkpoint is internally
+      valid, bounded, durable and fresh-restorable before in-memory commit;
+    - no-debt/no-failed/no-in-flight continuation fence;
+    - exact lineage/task/sequence/artifact/checksum/capability-generation
+      acknowledgement;
+    - stable capability-generation capture on automatic and explicit paths;
+    - one shared verification-basis predicate across completion, resume, reuse
+      and `CompletionOpportunity`.
+
+    **Evaluator validity gate**
+
+    - harness-owned oracle setup is explicit and setup/start failures are
+      typed NOT_RUN rather than behavior failure;
+    - provider, Runtime, behavior, diff, closure, restore and continuation are
+      independent truth dimensions;
+    - PASS requires every mandatory dimension and no runtime error;
+    - failed/cancelled/timed-out cells retain their real round/call/token totals;
+    - cancellation follows only the latest exactly acknowledged snapshot; and
+    - exact verification binds the complete bounded workspace input set.
+
+    **Deterministic exit**
+
+    Exercise same-anchor multi-snapshot ordering, out-of-order acknowledgement,
+    new debt during an old write, failed-write retry, final-artifact restore,
+    stale capability generation, progress-only verification movement and
+    report reconstruction. Raw prior evidence is retained but diagnostic.
+
+    **Live exit**
+
+    Only after deterministic exit, run the frozen retained-C
+    `CompletionOpportunity` off/on normal/resume pairs with at least two repeats
+    per mode. The candidate remains default-off unless hidden behavior is
+    non-regressing, closure improves, median rounds/calls fall and no tail
+    appears.
+    Only a promoted frozen setting may enter same-model A/C. No Context/GC
+    retune, fixed round-cap trick, provider-specific policy or standing “stop
+    earlier” instruction is allowed. Detailed contract:
+    [`LONG_TASK_EVALUATION.md`](LONG_TASK_EVALUATION.md).
 11. V2 Self-Iteration last.

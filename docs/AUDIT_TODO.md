@@ -1,7 +1,10 @@
 # Audit follow-up
 
-Confirmed **open** defects only. Closed write-ups stay in git history of
-this file; do not copy them back and do not reopen them as new work.
+Confirmed defect queue. Only headings explicitly marked **open** or
+**reopened** are actionable. This file still carries some clearly labelled
+fixed/closed chronology that predates the compact archive; treat it as
+non-actionable context and move it to the archive/git history when that section
+is next touched. Do not reopen closed work under a new id without new evidence.
 
 - Invariants: `AGENTS.md`
 - Now/freeze/P0: [`STATUS.md`](STATUS.md)
@@ -24,7 +27,8 @@ capabilities stay Disabled by default. Generic `shell.exec` /
 `process.run` / `process.session` stay non-transactional (Core identity
 before spawn, kill-then-reap, no rollback of child mutations).
 
-Remaining OS isolation is the residual, not a new `MOD-18` slice:
+Remaining OS isolation is outside the V1 availability floor, not a new
+`MOD-18` slice:
 
 - Linux UDP / raw / pathname-Unix
 - Linux absolute OS-level reads
@@ -32,11 +36,33 @@ Remaining OS isolation is the residual, not a new `MOD-18` slice:
 - I/O bandwidth quotas
 - seccomp / AppContainer
 
-`UntrustedGenerated` fails closed on native. WASI is V2. Matrix:
+`UntrustedGenerated` fails closed on native. That refusal is the required V1
+truth when the complete floor cannot be attested; making the profile runnable
+through WASI is a V2 candidate. Matrix:
 [`PLATFORM_SECURITY.md`](PLATFORM_SECURITY.md).
 
-Do not make raw shell transactional. Do not close M12/M13 from the
-first cut.
+M12 now needs a bounded closure audit rather than another speculative
+transport: prove that every brokerable production effect crosses the common
+reserve/dispatch/ack path, that crash windows reconcile as
+NotApplied/Applied/Ambiguous, and that authority/revocation fencing remains
+intact. Generic shell/process are explicit non-transactional exceptions.
+Requester-side application is the V1 contract; broker-owned remote execution
+is not required without a remotable consumer. Evidence schema and output path:
+[`PLATFORM_SECURITY.md`](PLATFORM_SECURITY.md) “M12 closure evidence artifact”.
+
+The audit generator landed 2026-08-27 (`agent-eval --platform-closure-m12`,
+wrapped as `platform_closure::tests::m12_closure_gates_hold_deterministically`):
+each run drives every production write family through trusted admission plus
+the journaled barrier, reopens the reservation journal for each crash window,
+observes per-binding epoch fencing on an admitted plugin binding, executes
+generic process exceptions against an empty journal, and derives one row per
+trusted table entry mechanically. Its first run wrote 28 resolved rows /
+zero unresolved and gate PASS under `crates/agent-eval/evidence/platform-
+closure/m12/`, including two independent out-of-process coordinator sessions
+sharing one durable ledger (`Applied` closed cycle, `Ambiguous` crashed
+dispatch). Formal M12 close remains conditional on regenerating that report
+on a clean source tree after the pending changes commit; nothing structural
+is left open in this item.
 
 ### CORE-10 — protocol remaining (not a transport swap)
 
@@ -49,40 +75,6 @@ first cut.
 Named pipes/UDS are not a fix for CORE-01. V1 still trusts Runtime in
 the same address space.
 
-### CORE-11 — HostToolPolicy registry & plugin admission (closed 2026-08-26)
-
-Landed: `agent-contracts/src/host_policy.rs` is vocabulary only —
-`HostToolPolicy`/`HostEffectBinding` carry owned names (serde-ready) plus
-the `HostToolPolicies` lookup trait whose provided `effect_intent` is the
-one derivation every consumer shares. The builtin table moved next to
-its handlers in `tool-runtime` (`BuiltinToolPolicies`). Trusted
-composition owns `agent-compose::HostToolPolicyRegistry`: builtins at
-construction, operator-reviewed plugin bindings via `admit()`, which
-refuses to shadow a builtin or duplicate an admission. One registry
-instance is wired into the kernel lease path
-(`CoreAuthorityConfig.host_policies`), the approval gate
-(`TaskApprovalGate::with_host_policies`) and the capability dispatcher;
-with no injection everything falls back to the declared-risk empty bound.
-
-Still open (M12): the plugin manifest → operator review → `admit()` flow
-itself landed 2026-08-25 — an installed package manifest provides candidate
-tool names only, while the operator review artifact supplies the actual
-`HostToolPolicy` bindings; `admit_reviewed` installs them atomically (any
-builtin shadow, duplicate admission, or out-of-manifest tool name refuses
-the whole batch) and `revoke_admitted` withdraws a binding; both advance the
-versioned snapshot and never re-interpret old-snapshot consumers. A revoked
-tool stops receiving new authority immediately (unbound intent fails closed
-at the approval gate). Fencing landed 2026-08-26: a lease stamps its
-binding's epoch at mint; commit consults Core's own operation record for
-the tool name and refuses with a typed rejection when the binding was
-revoked or replaced since — a missing record fences too, while builtin and
-never-admitted tools carry no epoch and are never fenced. CORE-11 is
-closed. The out-of-process coordinator transport also landed 2026-08-26
-(`broker_host` durable ledger + `ProcessEffectBroker`, execution stays at
-the requester; see `PLATFORM_SECURITY.md`). No further M12 slices are
-queued in this file; the gate stays open as a milestone-review decision,
-not a defect here.
-
 ### CORE-12 — M13 attestation depth (attestation landed 2026-08-25)
 
 Landed: `SandboxAttestation { capabilities, backend, backend_version,
@@ -91,10 +83,26 @@ flag names its mechanism (probed landlock ABI level, rlimit and job-object
 values, integrity root counts) with bounded proof text,
 consistency-checked against the flags by
 `SandboxEvidence::consistent_with` / `SandboxAttestation::validate()`.
-Remaining before M13 closes: UntrustedGenerated is still fail-closed on
-native because UDP / raw / pathname-Unix denials and absolute OS-level
-reads cannot attest yet (the CORE-01 residual); a renamed
-`process_count_quota` keeps its serde alias for wire compatibility.
+M13 now needs a bounded closure audit: structured attestation must validate
+against enforced evidence, activation must enforce `required ⊆ actual`, and
+native `UntrustedGenerated` must reliably refuse whenever the complete floor
+cannot be attested. Universal native availability is not the V1 gate; WASI
+execution remains V2. A renamed `process_count_quota` keeps its serde alias
+for wire compatibility. Evidence schema and output path:
+[`PLATFORM_SECURITY.md`](PLATFORM_SECURITY.md) “M13 closure evidence artifact”.
+
+The audit generator landed 2026-08-27 (`agent-eval --platform-closure-m13`,
+wrapped as a deterministic cargo test of the same name): each run spawns the
+real protocol fixture and drives
+the trusted adapter's post-spawn activation check for every supported profile,
+replays both required refusal cases (Restricted without its write-confinement
+mechanism; UntrustedGenerated against the strongest native configuration),
+records per-flag mechanism proofs straight from `ProcessHost::sandbox_attestation`,
+and adds contract-level attestation negatives plus explicit not-run rows for
+landlock-backed platforms. Its first run wrote 8 resolved rows / zero
+unresolved and gate PASS under `crates/agent-eval/evidence/platform-
+closure/m13/`. Formal close waits on a clean-tree regeneration of that report
+after the pending changes commit.
 
 ## Open P1 — Tool Surface reliability
 
@@ -209,13 +217,19 @@ dirty-tree pair; keep the item open for an independent repeat.
 The first one-directive `retry_policy_dev` pilot exposed the opposite edge:
 all four canonical cells ended without `TaskCompleted` and made no direct
 `task.complete` call. Do not undo the continuity fix by making that tool
-permanent. `LT-RUN-04` instead tests a body-free, once-per-verification-basis
-`CompletionOpportunity` after positive terminal evidence, while retaining the
-existing completion gate and explicit model call. It remains default-off until
-an already-satisfied deterministic replay and at least two C off/on paired
-normal/resume repeats pass the Roadmap item-8 success, median round/call and
-tail gates. Closure discoverability and multi-turn non-premature closure must
-both pass before this item closes.
+permanent. The body-free `CompletionOpportunity` candidate has landed
+default-off and its deterministic already-satisfied replay is green. Two live
+off/on attempts did not promote it; one proves the mechanism can execute an
+offer -> lease -> explicit `task.complete` -> closure chain, but sparse arming,
+worse paired efficiency and the reopened evaluator defects make the attempts
+non-decision-grade.
+
+Before another live attempt, bind positive mutation evidence to the same
+verification basis and make persisting the offered key accrue checkpoint debt;
+today an old mutation can combine with a newer verifier and a crash can re-offer
+a key written after the last safe-point capture. Then close the reopened
+checkpoint, verification and evaluator items below. Closure discoverability
+and multi-turn non-premature closure must both pass before this item closes.
 
 ### TOOL-PROC-01 — explicit ProgramResolver for process.run (fixed 2026-08-23)
 
@@ -432,7 +446,8 @@ Confirmed residuals:
   and mid-batch (staged-byte frames verified intact), cross-process journal-
   lock races (refused second official writer, retry-window handoff), and
   mid-journal corruption plus checksum-valid sequence gaps. Portable
-  disk-full injection remains open behind a storage seam. A successful edit currently performs the snapshot
+  disk-full injection has since landed behind the `test-faults` storage seam.
+  A successful edit currently performs the snapshot
   plus repeated bounded full-file integrity hashes; treat that as a candidate
   measurement, not an established performance hotspot.
 
@@ -446,9 +461,10 @@ physical I/O different. Fuse a pass only after measurement and only if stale,
 staged-integrity, post-replace and final-ack truth remain independently
 provable.
 
-The direct formal-acceptance blocker is a run of the same frozen pack on a
-clean source tree; r4 deliberately used `--allow-dirty`, so all manifests say
-`git_dirty=true` and `acceptance_eligible=false`. Acceptance measures
+At the r4 stage, the next formal-acceptance blocker was a run of the same
+frozen pack on a clean source tree; r4 deliberately used `--allow-dirty`, so
+all manifests say `git_dirty=true` and `acceptance_eligible=false`.
+Acceptance measures
 non-conflict first-patch success, correct proactive/reactive stale recovery,
 edit-to-passing verification, failure class, fallback-to-shell/`fs.write`,
 confirm reads, rounds, tokens, p50/p95 latency, bytes read/staged, commit
@@ -474,9 +490,9 @@ attempts), one crlf cell spent its first attempt on revisions not from the
 latest reads and recovered on the second, and one stale-recovery cell added
 a post-edit confirmation read that this fixture's flow gate forbids. No
 runtime regression is claimed — the residual failures are provider latency
-plus model behavior variance. TOOL-EDIT-02 stays open for one stable
-provider window meeting 12/12 strict, 12/12 gate and 9/9 non-conflict
-first patch.
+plus model behavior variance. At that point TOOL-EDIT-02 still awaited one
+stable provider window meeting 12/12 strict, 12/12 gate and 9/9 non-conflict
+first patch; the v4 conclusion below supersedes that route.
 
 A third run the same day in a normal-latency window (`tool-surface-edit-
 v3-clean-tree-2026-08-26-r2/`) confirms the separation and narrows the
@@ -485,9 +501,9 @@ to 280 s with no session loss. Every applied patch across all 36 clean-tree
 cells has been byte-perfect; the four gate failures were two post-edit
 confirmation reads this fixture's flow contract forbids, one stale-revision
 first attempt (recovered), and one non-exact first-hunk attempt (recovered).
-The mutation path is proven; what fluctuates between provider windows is
-first-attempt decision quality of the served model, which is exactly the
-product reliability this open gate measures.
+No raw-byte mismatch was observed in these frozen cells; what fluctuates
+between provider windows is first-attempt decision quality. This is evidence
+for the bounded pack, not proof of an editor-engine property in general.
 
 A fourth run the same day (`tool-surface-edit-v3-clean-tree-2026-08-26-r3/`),
 launched immediately after a green single-cell availability smoke in a
@@ -500,8 +516,8 @@ recovered on the second. Across all four clean-tree runs every applied
 patch has been byte-perfect; strict raw-byte truth has never failed except
 the one cell whose provider session died before any tool call. The gate bar
 (12/12 strict, 12/12 gate, 9/9 non-conflict-first) remains unmet by this
-provider serving and TOOL-EDIT-02 stays open for a window where the served
-model's first-attempt discipline holds across all twelve cells.
+provider serving; at that point the item still awaited a window where the
+served model's first-attempt discipline held across all twelve cells.
 
 A fifth run the same day (`tool-surface-edit-v3-clean-tree-2026-08-26-r4/`),
 in the fastest window yet (wall 218 s, no session loss), reproduced the
@@ -512,8 +528,8 @@ first-hunk set recovered on the second attempt. Five independent windows
 have now produced byte-perfect applied patches in every cell that reached
 a tool call, with gate failures drawn from the same two model-behavior
 shapes. The diagnostic has saturated: further same-day retries against
-this serving add no information, and the item now waits for a materially
-different provider or model serving rather than another attempt.
+this serving added no information, so the next historical step was a materially
+different provider/model serving rather than another same-window attempt.
 
 That materially different serving ran the same day: one clean-tree gate on
 the local OpenCode relay (`ox-alpha-free`, availability precondition green,
@@ -524,13 +540,11 @@ cell applied byte-perfect patches, and the model showed perfect hunk
 discipline — no non-exact first attempt and no wrong-revision selection in
 any window. Its behavioral failures are narrower than Luna's but heavier:
 all five are the same forbidden post-edit confirmation read (5 of 11
-completed cells). Cross-model summary after six runs: applied-patch
-correctness is an engine property proven twice over; first-attempt flow
-discipline is a model property whose binding violation for both servings
-is the post-edit confirmation read. Neither serving meets the bar.
-Remaining closure paths are a serving that follows the flow contract, or
-an explicit product decision to re-scope the no-confirm rule — the latter
-would be a contract change to this gate, not a defect fix.
+completed cells). Cross-model summary after six runs: every completed
+frozen-pack cell was byte-correct, while first-attempt flow discipline varied
+and both servings repeated the post-edit confirmation read. This separates
+the observed failure classes without generalizing the finite pack into an
+engine-wide proof.
 
 Root cause of the binding violation (event-level audit of
 `mixed_eol/r1` in the ox-r2 window): after a successful patch whose echo
@@ -561,10 +575,14 @@ strict 12/12, gate 12/12, non-conflict-first 9/9 — observed but not
 archival evidence. The remaining bar-blocker is now solely the
 `batch_two_file` exact-hunk cell (~1 of 3 repeats per window): the model
 merges each file's two anchor lines into one multiline hunk; bytes are
-always correct and `confirm=0`. Closing it requires a contract decision —
-teach the canonical granularity in model-visible text, or re-scope
-`exact_hunks` to accept byte-equivalent decompositions — not an engine
-fix. TOOL-EDIT-02 stays open; its bar is unchanged.
+always correct and `confirm=0`. The chosen product contract is committed
+byte/revision/settlement truth: hunk partition is not model-visible authority
+and no current consumer requires the golden decomposition. Version
+`exact_hunks` to accept byte-equivalent decompositions while retaining paths,
+strict bytes, revisions, settlement and no-fallback/no-confirm checks, then run
+one archival 4x3 confirmation window. A future canonical-granularity rule
+requires a documented consumer before reversing this decision. TOOL-EDIT-02
+stays open until that confirmation.
 
 ## Open P1 — runtime scheduling correctness
 
@@ -621,17 +639,25 @@ be sized against real demand. Residency loosening stays rejected on
 current evidence; the tiny current-turn LRU gets built only if this
 motive shows up in live runs.
 
-### EXEC-REV-01 — anchor CAS and verification basis are coupled inconsistently (core defect fixed 2026-08-25)
+### EXEC-REV-01 — verification basis diverges across consumers (reopened 2026-08-27)
 
-The confirmed defect — an out-of-turn plan-only patch marking otherwise
-Current verification stale, with path-dependent completion-freshness and
-reuse — is fixed by LT-RUN-04 Slice B: authority gating on the single record
-revision gives verification basis independent meaning, so a progress-only
-anchor CAS advances the record and its resume fence without staling a
-Current verifier, while goal/constraint movement stales it
-(`progress_only_cas_keeps_current_verification_and_boundary_change_stales_it`).
-If live evidence ever shows currentness drifting between resume, completion
-and exact reuse, reopen from this entry.
+Observed: a progress-only CAS advances the task/execution anchor revision
+without marking the existing verification stale. `ExecutionState::validity()`
+and completion therefore accept it as Current, while exact reuse and
+`CompletionOpportunity` require the fact's old anchor revision to equal the
+new record revision and reject the same PASS (`agent-runtime/src/task.rs`,
+`execution/state.rs`, `opportunity.rs`).
+
+Risk: completion, resume/reuse and advisory closure do not share one definition
+of current verification. The existing test proves only the enum remains
+Current; it does not prove agreement among those consumers.
+
+Required fix and exit evidence: introduce an independent verification-basis
+revision or digest while retaining the whole record revision only for CAS.
+Define criterion origin/authority, bind facts to the shared basis tuple, and
+use one currentness predicate in ActiveTurn, task resume, completion, exact
+reuse and opportunity derivation. Cover progress-only movement, authoritative
+boundary movement and checkpoint round-trip in one cross-consumer regression.
 
 ### CONV-01 / CONV-02 / PROTO-EVID-01 — closed 2026-08-23
 
@@ -641,27 +667,88 @@ All three landed in Execution Convergence V1 (see
 the second-round section below and to the closed archive. The remaining,
 narrower residuals are CAP-OBS-01 and CONV-03 there.
 
-### LONGTASK-03 / LONGTASK-04 / EVAL-05 — closed 2026-08-25 by LT-RUN-04
+### LONGTASK-03 — acknowledged checkpoints are not uniformly cold-restorable (reopened 2026-08-27)
 
-LONGTASK-03: safe-point checkpoints capture every visible plane including
-the host capability registry under the generation handshake and persist as
-sha256 + fsync'd atomic-rename envelopes with a corruption-refusing
-`load_verified` (`agent-runtime/src/checkpoint.rs`). LONGTASK-04:
-continuation is gated by monotonic `resume_state_revision` /
-`required_durable_revision` / `durable_revision` watermarks that fail closed
-until the required write lands, with `CheckpointWriteFailed` events
-(`agent-runtime/src/actor/safepoint.rs`). EVAL-05: resume twins build a
-fresh Context engine per phase and cross the boundary only with the
-checksum-verified artifact locator. Design and contract:
-[`LONG_TASK_EVALUATION.md`](LONG_TASK_EVALUATION.md).
+Observed: completion clears `TaskManager.active`, then captures the final
+checkpoint while the actor still carries `current_task_id`; restore validation
+rejects that mismatched authority state. The write path can acknowledge the
+artifact without first calling checkpoint validation. Automatic safe-point
+capture also does not reuse the bounded capability-generation handshake used
+by external instance checkpoints (`agent-runtime/src/actor/turn.rs`,
+`actor/safepoint.rs`, `checkpoint.rs`, `instance.rs`).
 
-### EVAL-06 — live cargo acceptance runs agent-editable tests (closed 2026-08-25)
+Risk: `CheckpointDurable` can name an artifact that no fresh Runtime can
+restore, or a torn cross-plane snapshot. Whole-file load, serialization and
+retention are also not bounded for a genuinely long run.
 
-LT-RUN-04 Slice A landed the equivalent isolated oracle: read-only
-acceptance always runs on an inspectable workspace through a harness-owned
-frozen-API oracle executing outside the agent-editable workspace after the
-diff scan; the in-workspace cargo self-check remains a separately named
-outcome dimension.
+Required fix and exit evidence: route all checkpoint writes through one
+capture -> stable-generation merge -> validate -> persist path. Use two-phase
+completion: prepare a prospective terminal snapshot with both task authorities
+cleared while the live task remains pending/retryable; acknowledge it before
+committing in-memory completion and emitting `TaskCompleted`. Reject oversized
+header/payload/artifact input and define bounded local retention. Load and
+restore every acknowledged test artifact into a fresh Runtime and Context,
+including the final artifact; stress `configured_retention_limit + 2`
+checkpoints and the byte ceiling without deleting the latest required, pinned
+or referenced recovery artifact.
+
+### LONGTASK-04 — resume durability watermark is not a snapshot fence (reopened 2026-08-27)
+
+Observed: `resume_state_revision`, required revision and durable revision all
+alias the task-anchor revision. Workspace mutation and verification can change
+the checkpoint without advancing it; task changes can lower it; zero also
+means both "none" and a real first revision. The continuation gate compares
+only numbers and does not require no debt, no failed write and no in-flight
+write. A newer debt may also appear while an older write is awaited
+(`agent-runtime/src/actor/safepoint.rs`).
+
+Risk: an older durable acknowledgement can satisfy a newer state, including
+after the newest write failed.
+
+Required fix and exit evidence: add an actor-owned, monotonically increasing
+snapshot sequence independent of task anchors and persist it across the
+existing durable Runtime lineage. Bind each acknowledgement to lineage +
+sequence + artifact + checksum, and allow continuation only when there is no
+debt, failed write or in-flight write and `durable_sequence >=
+required_sequence`. Cover same-anchor distinct snapshots, out-of-order ack,
+new debt during an old write, revision zero, task switch and failed-write
+retry.
+
+### EVAL-05 — resume twin does not prove the latest settled cold artifact (reopened 2026-08-27)
+
+Observed: the harness now builds a fresh engine and uses the verified loader,
+but treats any `CheckpointDurable` arriving after a mutation as the mutation's
+checkpoint. A pre-mutation capture may acknowledge after a later write; the
+cross-phase state retains only the artifact name, not the acknowledged
+sequence/checksum/capability generation (`agent-eval/src/long_live.rs`).
+
+Risk: phase two may restore an older Runtime snapshot while the workspace is
+already ahead, so the current cold-resume and continuation dimensions are not
+decision-grade.
+
+Required fix and exit evidence: correlate the latest `TaskResumeCommitted`
+with its exact lineage, sequence, artifact, checksum and capability generation. Cancel
+only after that tuple is fully settled; carry only that tuple across phases;
+reject an older or mismatched acknowledgement before restore.
+
+### EVAL-06 — isolated oracle setup failures are misclassified as behavior failures (reopened 2026-08-27)
+
+Observed: oracle injection writes under `tests/` without first creating the
+directory. Four retained `behavior=fail` records are actually setup failures
+(`os error 3`), not executed behavioral assertions. The injected oracle also
+overwrites the recorded cargo argv, blurring it with the workspace self-check
+(`agent-eval/src/long_live.rs`).
+
+Risk: setup and harness failures are charged to model behavior and can support
+an invalid promotion conclusion.
+
+Required fix and exit evidence: pre-create harness-owned paths, keep oracle
+and workspace-self-check commands separate, and run the self-check before
+injection (or through a target proven to exclude the oracle). Remove the oracle
+before any later self-check. Type setup/start failures as `not_run(reason)`.
+Only an oracle that actually executes may produce behavior PASS/FAIL; add pass,
+assertion-fail, missing-directory, accidental-self-check-inclusion and
+spawn-fail fixtures.
 
 ## Second-round review 2026-08-23 — trust & obligation
 
@@ -1038,17 +1125,32 @@ Frozen `context-bench.v1` SPEC / pack digest stay frozen. Wave-1 live
 retune GC from that live or from an `add_test` cell. Do not treat
 `Likely optimization target` as a modification order.
 
-### EVAL-03 — pilot conflates closure with behavioral acceptance (evaluator split landed 2026-08-25; promotion still open)
+### EVAL-03 — outcome split is partial; live attempts are non-decision-grade
 
-The evaluator now records behavioral oracle, allowed diff, task closure,
-continuation and provider/runtime health independently; read-only acceptance
-always runs on an inspectable workspace even when closure or a late provider
-failure is missing, and provider-dead attempts stay outside the canonical
-behavior aggregate (LT-RUN-04 Slice A). The default-off CompletionOpportunity
-off/on gate ran twice with that evaluator on 2026-08-25 and failed to promote
-both times (see [`STATUS.md`](STATUS.md)); the candidate stays off, so no
-promoted frozen setting exists yet for same-model A/C. The pilot remains
-development evidence, not M15 acceptance. Design and exit gate:
+Observed: dimensions are serialized separately, but overall PASS currently
+requires only task completion + behavioral PASS + clean diff. It does not
+require absence of runtime error, successful restore/continuation, or healthy
+provider/runtime. Per-phase counters are committed only on a fully successful
+driver return, restored and continued are conflated, and summary arithmetic is
+not consistently rebuilt from per-cell facts. The exact verification recipe
+also omits part of the mutable input set. EVAL-05 and EVAL-06 further contaminate
+the retained attempts.
+
+Risk: the two 2026-08-25 CompletionOpportunity attempts are useful diagnostics,
+and one contains a real mechanism chain, but their pass ratios, medians and
+arming rate cannot decide promotion. The candidate remains default-off.
+
+Required fix and exit evidence: make every dimension typed PASS/FAIL/NOT_RUN;
+require all mandatory dimensions, healthy provider/runtime and no runtime error
+for overall PASS; classify provider/Runtime failures from typed sources rather
+than error-string substrings; finalize phase counters even on failure; separate
+restored, continued and completed; snapshot the complete bounded workspace
+input set; require one non-empty identical opportunity key across
+Offered -> Called -> Completed; and derive reports mechanically from per-cell
+facts, including tool calls, prompt/schema tokens and tails. For `n=2`, report
+both observations and any
+midpoint used rather than naming the upper value as the median. Only then rerun
+the frozen paired gate. Design and exit gate:
 [`LONG_TASK_EVALUATION.md`](LONG_TASK_EVALUATION.md).
 
 ## Closed archive (index only)
@@ -1061,11 +1163,12 @@ Full text: git history of this file.
 | CTX-01..CTX-10 | Episode, residency, fetch/search persist, store, Storage GC, GC ops, materializer, mid-turn signals, clocks, TaskAnchor |
 | CTX-06..CTX-09 | GC/storage ops, materializer budget, working-set signals, lifecycle clocks |
 | CORE-02..CORE-09 | Turn durability, checkpoint, output broker, System-role leak, cancel/process cleanup, TOCTOU opens, standing grants, schema budget |
+| CORE-11 | HostToolPolicy registry, manifest → operator review → atomic admission/revocation, versioned snapshots and per-binding epoch fencing landed through 2026-08-26; M12 closure audit remains under CORE-01 |
 | TOOL-01 | `search.grep` cancellation |
 | TOOL-ENV-01, TOOL-EDIT-01, TOOL-VIEW-01, TOOL-ERROR-01 | Tool-quality preflight 2026-08-17 |
 | MOD-AUTH-01 | `edit.patch files[]` multi-file authority widening → `EffectIntent::WorkspaceWriteSet` + all-paths `grant_matches` (2026-08-21; see PLATFORM_SECURITY.md) |
 | MOD-AUTH-02 | Prepared effects report canonical `ActualWorkspaceWrite` (real path + real staged bytes); Core commit rejects `ActualExceedsApproved` outside the approved set (2026-08-21) |
-| LONGTASK-01/02 | Catalog-cold progress CAS, actor safe-point resume install, coalesced checkpointing and same-task continuation landed deterministically (2026-08-24/25); residuals are LONGTASK-03/04 and EXEC-REV-01 |
+| LONGTASK-01/02 | Catalog-cold progress CAS, actor safe-point resume install, coalesced checkpointing and same-task continuation landed deterministically (2026-08-24/25); reopened residuals remain LONGTASK-03/04 and EXEC-REV-01 |
 | Sandbox floor | `UntrustedGenerated.required` now includes `fs_read_confined` + `cpu_quota` (still fail-closed on native until provable); `process_spawn_controlled` → `process_count_quota` with a wire-compat serde alias (2026-08-21) |
 | Foreground ack | `ContextConsumptionAck.foreground_item_ids` + engine counter: foreground bodies the model saw are observable (weak signal; no residency / admission change) (2026-08-21) |
 | TOOL-02 | `search.grep` `path` accepts a file target (file-or-directory), removing a class of `path_not_found` tool failures (2026-08-21) |

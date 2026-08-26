@@ -104,9 +104,11 @@ dependencies = [
 name = "agent-eval"
 version = "0.1.0"
 dependencies = [
+ "agent-capability-process",
  "agent-compose",
  "agent-contracts",
  "agent-core",
+ "agent-process",
  "agent-runtime",
  "agent-storage",
  "agent-workspace",

@@ -1,4 +1,4 @@
-# Platform security (M12 / M13 first cuts)
+# Platform security (M12 / M13 closure audits)
 
 Neither M12 nor M13 is closed. This file is the authority/sandbox contract.
 Layering and crate graph live in [`ARCHITECTURE.md`](ARCHITECTURE.md).
@@ -147,8 +147,8 @@ Standing grants: a process grant is exactly one of `exec_argv_prefix` or
 `shell_command_digest`. Spawn fails closed unless the approved bound
 covers the actual spawn.
 
-M12 remaining: one `EffectRequest`/commit path for brokerable side
-effects. The reserved/dispatch/ack barrier is now structured in Core:
+M12 implemented substrate: one `EffectRequest`/commit path for brokerable side
+effects. The reserved/dispatch/ack barrier is structured in Core:
 every approved effect crosses an `EffectBroker` seam — `reserve` before
 anything applies (failure fences dispatch and settles the prepared effect
 NotApplied as a `BrokerUnavailable` rejection), `dispatch` applies the
@@ -174,8 +174,35 @@ effect bodies are not remotable in v0, so the crash-window semantics are
 identical to the in-process reference: between a dispatched record and its
 ack record the classification can only be Ambiguous. Broker-owned execution
 and HTTP/gRPC coordinator shells stay future work until a consumer needs
-remotable effects. Do not close M12 because structured intents, the local
-barrier, or this transport landed.
+remotable effects. M12 closes only from one bounded audit showing every
+brokerable production effect crosses this path, crash windows reconcile as
+NotApplied/Applied/Ambiguous, authority/revocation fencing holds, and generic
+shell/process are documented non-transactional exceptions. Requester-side
+application is the V1 contract; remote execution is not an acceptance
+condition without a remotable consumer.
+
+### M12 closure evidence artifact
+
+The closure audit writes immutable evidence under
+`crates/agent-eval/evidence/platform-closure/m12/`:
+
+```text
+manifest.json  source-tree digest, platform, commands, schema version
+rows.jsonl     one bounded row per production-caller/effect-family pair or
+               explicitly named non-transactional exception
+REPORT.md      mechanically derived coverage and unresolved rows
+```
+
+Each `rows.jsonl` row contains: effect/tool family, production caller,
+`EffectIntent`, brokerable-or-exception classification, observed
+reserve/dispatch/ack path, crash seam and reconcile result, policy snapshot and
+binding-epoch fence result, test command, and artifact/event reference. The gate
+requires every production caller/effect-family pair to have exactly one current
+classification,
+all brokerable rows to cover NotApplied/Applied/Ambiguous as applicable, every
+exception to match the documented generic shell/process scope, and zero
+unresolved rows. The report is the milestone decision artifact; implementation
+existence alone is not.
 
 ## HostLifecycle (restart)
 
@@ -261,12 +288,32 @@ impossible and not a per-sandbox process namespace. A boolean must not
 claim a stronger OS guarantee than it delivers; a true
 spawn-denied/brokered floor is a separate future item.
 
-Booleans are the v1 attestation floor. M13 acceptance should upgrade
-them to `SandboxAttestation { capabilities, backend, backend_version,
-evidence }` so each enforced capability is explainable
-(`fs_write_confined` → landlock ABI, `memory_quota` → rlimit_as bytes,
-`tcp_connect_denied` → landlock ABI v4+). Same principle as context
+Booleans remain the v1 activation floor; the structured
+`SandboxAttestation { capabilities, backend, backend_version, evidence }`
+upgrade is landed so each true capability is explainable. M13 closes when
+validation binds those booleans to enforced evidence, activation consistently
+enforces `required ⊆ actual`, and unsupported native `UntrustedGenerated`
+activation fails closed. It does not wait for universal native availability;
+running that profile through WASI remains V2. Same principle as context
 lifecycle: state why you believe the state is true.
+
+### M13 closure evidence artifact
+
+The closure audit writes immutable evidence under
+`crates/agent-eval/evidence/platform-closure/m13/` with the same
+`manifest.json` / `rows.jsonl` / mechanically derived `REPORT.md` layout. One
+bounded row covers each supported `(platform, sandbox profile)` activation
+case and each required refusal case. A row contains: platform/backend/version,
+profile, required capability set, attested actual set, bounded enforcement
+evidence refs, attestation-validation result, `required ⊆ actual` result,
+activation/refusal result and typed reason, test command, and artifact/event
+reference.
+
+The gate requires every claimed true capability to have consistent enforced
+evidence, every supported profile to activate only when the subset relation
+holds, native `UntrustedGenerated` to refuse when the full floor is absent, and
+zero unexplained activation/refusal rows. It does not require WASI or a false
+claim that unsupported native capabilities exist.
 
 ## Residual (out of v0; not MOD-18)
 

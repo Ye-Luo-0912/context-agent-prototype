@@ -329,8 +329,9 @@ and sandbox contracts live elsewhere. Experiment facts live in
   precedes `CheckpointDurable`, which lands before `TurnCompleted`; a
   failed write re-arms the debt as `CheckpointWriteFailed`. Completion waits
   for in-flight writes. Continuation also waits for settlement but currently
-  does not reject a failed-write outcome; that residual is `LONGTASK-04`
-  (since resolved by the LT-RUN-04 Slice D watermarks).
+  does not reject a failed-write outcome; the later watermark implementation
+  landed, but the 2026-08-27 review reopened `LONGTASK-04` because those
+  watermarks alias task-anchor revision rather than snapshot identity.
   `continue_active_task` starts a fresh turn from the stored current
   directive and resume state with a `task_continuation` input kind — no
   new user instruction, no re-ingest, `TaskContinuationStarted` is
@@ -346,10 +347,14 @@ and sandbox contracts live elsewhere. Experiment facts live in
   required verification current, and no open loops silently erased. A
   gated one-shot proposal returns its decision to the model with one
   warning per turn instead of committing; deferred and `/done`
-  completions fail with the typed reason. Successful closure orders
+  completions fail with the typed reason. The intended successful order is
   `TurnCompleted` -> final durable checkpoint acknowledgement ->
-  `TaskCompleted`, provable from JSONL; a failed final write surfaces as
-  a warning that never un-completes the task nor claims resumability.
+  `TaskCompleted`, and JSONL proves that order. The 2026-08-27 review found
+  that the acknowledged final snapshot can contain inconsistent task authority
+  and fail restore validation, so order alone is not completion-durability
+  proof. The current failed-write warning occurs after task authority was
+  cleared and cannot make it active again; `LT-RUN-05` replaces that behavior
+  with two-phase completion that stays pending/retryable until durable ack.
   Deterministic coverage: open-loop refusal with later resolution and
   full ordering proof. All three deterministic LT-RUN slices are green; the
   first live `retry_policy_dev` normal/resume cells later ran as summarized
@@ -378,77 +383,41 @@ and sandbox contracts live elsewhere. Experiment facts live in
   completion afterwards saw a stale epoch and raised a false recovery
   fence that refused later mutations; accepted values now terminalize
   before directive application. The first live C cells (evaluation layer 2)
-  are summarized next; layers 3+ remain open behind the provider-stability
-  caution.
-- The `retry_policy_dev` live pilot executed its first C-engine cells
-  (2026-08-25, evidence under
-  [`evidence/retry-pilot/REPORT.md`](../crates/agent-eval/evidence/retry-pilot/REPORT.md)):
-  the harness exercised semantic interruption on the first durably settled
-  mutation, operator-style turn cancel, externally captured checkpoint
-  restore through the durable authority lineage and
-  `continue_active_task`. This is narrower than cold recovery: phase two
-  reuses the same `ContextEngine` object and does not load the actor's
-  safe-point artifact from disk. All four canonical cells end with a report
-  but no `TaskCompleted`; their event streams contain zero direct
-  `task.manage` and zero direct `task.complete` calls, and none of the four
-  canonical cells even loaded either tool through `capability.manage` —
-  their catalog-control calls fetched shell/process/edit tools instead.
-  The evaluator returns on that lifecycle error
-  before the post-run cargo check, so the canonical cells do not support the
-  earlier “passing coverage” characterization. One retained earlier attempt
-  did call `task.complete`, passed the post-run cargo check and failed only on
-  the since-fixed Windows diff-path bug. Two additional attempts are retained
-  separately as PinAI transport failures. No acceptance claim and nothing was
-  retuned. The bounded next task is `LT-RUN-04`: split outcome truth, add a
-  harness-owned oracle outside the editable workspace, decouple verification
-  basis from progress CAS, offer a positive-evidence-gated one-decision closure
-  affordance as a default-off candidate, and make safe-point durability
-  independently cold-loadable; see
-  [`LONG_TASK_EVALUATION.md`](LONG_TASK_EVALUATION.md).
-- All four deterministic `LT-RUN-04` slices landed (2026-08-25). Slice A:
-  outcome dimensions are recorded independently, read-only acceptance always
-  runs on an inspectable workspace, a harness-owned frozen-API oracle executes
-  outside the agent-editable workspace after the diff scan, and resume twins
-  build a fresh Context engine per phase while crossing the boundary with only
-  the checksum-verified artifact locator. Slice B: a progress-only anchor CAS
-  advances the record revision and its resume fence without staling a Current
-  verifier; only goal/constraint movement marks dependent verification stale,
-  implemented as authority gating on the single record revision rather than a
-  second counter. Slice C: the advisory `CompletionOpportunity` candidate
-  landed behind a default-off host switch — pure eligibility mirrors the
-  acceptance gate plus positive durable-work and exact-tuple trusted-pass
-  evidence, the body-free key is offered once per basis and persisted bounded
-  in `ExecutionState`, the lease prefers `task.complete` for exactly one
-  decision with one bounded prompt statement, typed events distinguish
-  not_ready/offered/called/ignored/refused/completed, and all eight mandatory
-  negatives plus switch-default silence are deterministic-green. Slice D:
-  safe-point checkpoints capture every visible plane including the host
-  capability registry under the generation handshake, write as sha256 +
-  fsync'd atomic-rename envelopes with a corruption-refusing load path, and
-  continuation is gated by monotonic watermarks that fail closed until a
-  retried write lands. None of this is a live claim: no cell has passed the
-  full conjunction, and the CompletionOpportunity promotion gate (Roadmap
-  item 8 off/on paired repeats) has not run — the candidate stays off until
-  it does.
-- The item-8 off/on paired live gate for the `CompletionOpportunity`
-  candidate ran twice (2026-08-25, 8 cells each over `retry_policy_dev`,
-  C engine, evidence under
-  [`evidence/opportunity-gate/REPORT.md`](../crates/agent-eval/evidence/opportunity-gate/REPORT.md))
-  and **failed to promote both times; the candidate stays off**. Attempt 1:
-  zero offers armed — discovered verifiers are TaskScoped by design, so no
-  exact-identity receipt ever existed and the fail-closed precondition never
-  held. Attempt 2 registered a host opt-in source-read-only
-  ExactCurrentWorld recipe on both arms: receipt-backed offers fired once
-  per mode, and one cell executed the full intended chain live (offer ->
-  leased `task.complete` call -> committed closure -> behavior/diff/closure/
-  continuation all pass). Promotion still fails: paired outcomes fell 2/4 to
-  1/4, medians rose, arming stayed rare, and a journal-lock flake censored
-  an off cell (exclusive-lock conflict on the workspace effect journal
-  during checkpoint artifact load — recorded as a real defect candidate).
-  Separately, the deterministic already-satisfied replay froze green: with a
-  registered exact recipe, one offer fires per basis and the leased decision
-  closes through `task.complete` alone, while the disabled twin stays fully
-  silent (`--long-task-gate` now runs this pair).
+  are summarized next; layers 3+ remain open behind the `LT-RUN-05`
+  correctness gate.
+- The 2026-08-27 post-landing review supersedes the earlier `LT-RUN-04`
+  completion wording. The four implementation slices and their deterministic
+  suites are present, but Slice B, Slice D and the live evaluator are reopened
+  for correctness:
+
+    - the final completion checkpoint may be acknowledged after active-task
+      authority has been cleared but before the Runtime task identity is
+      cleared, producing a durable artifact that restore validation rejects;
+    - safe-point required/durable watermarks alias task-anchor revision although
+      workspace and verification state may change without advancing it, so an
+      older checkpoint may satisfy a newer basis;
+    - automatic capture does not use the external path's stable capability-
+      generation handshake, and checkpoint read/retention is not yet bounded;
+    - the live harness accepts any later `CheckpointDurable` instead of matching
+      the latest committed snapshot by sequence, checksum, artifact and
+      capability generation;
+    - progress-only anchor CAS is interpreted differently by completion
+      acceptance, exact verification reuse and `CompletionOpportunity`; and
+    - oracle setup/start failures, runtime/provider failures and failed-resume
+      accounting are not yet classified strongly enough for a decision-grade
+      result.
+
+  Earlier raw artifacts remain retained as diagnostic evidence, but their
+  pass/fail ratios and medians must not be used for promotion.
+- The `CompletionOpportunity` off/on gate did run twice on 2026-08-25
+  ([`evidence/opportunity-gate/REPORT.md`](../crates/agent-eval/evidence/opportunity-gate/REPORT.md));
+  this replaces the stale statement that it had not run. Attempt 2 proves one
+  live offer -> lease -> explicit `task.complete` -> committed closure chain,
+  and the deterministic already-satisfied replay remains green. It does not
+  prove product benefit or safe promotion: the candidate remains default-off.
+  Do not run a third unchanged live window until the checkpoint,
+  verification-basis and evaluator defects have deterministic regression
+  coverage under `LT-RUN-05`.
 - **Execution Convergence V1 mechanism landed** (2026-08-23, all 22
   items checked — the checklist is now the historical record
   [`EXECUTION_CONVERGENCE_V1.md`](EXECUTION_CONVERGENCE_V1.md)):
@@ -505,7 +474,9 @@ and sandbox contracts live elsewhere. Experiment facts live in
   moved out of contracts into `tool-runtime`; `agent-compose` owns the
   `HostToolPolicyRegistry` (builtins + fail-closed plugin `admit()`),
   wired into the kernel lease path, approval gate and dispatcher. The
-  manifest → operator-review flow is still open (M12).
+  manifest → operator-review → atomic `admit_reviewed`/revocation flow and
+  per-binding epoch fence landed by 2026-08-26. M12 remains open only for the
+  bounded production-path closure audit below.
 - Production always-load: `fs.list`, `fs.read`, `fs.write`, `search.grep`,
   `artifact.read`, `edit.patch`, `git.status`, `git.diff`,
   `capability.manage`. Their compact core schemas cost roughly 1k tokens total,
@@ -546,8 +517,9 @@ and sandbox contracts live elsewhere. Experiment facts live in
   (`process.session` deliberately stays on the fallback pending its bound
   decision); per-handler tests lock native equals derivation. No
   model-visible output shape changed; a live fixture confirmed end-to-end
-  behavior. Code comments no longer carry audit tracking ids; the docs own that
-  vocabulary.
+  behavior. The repository still contains legacy tracking ids in code comments;
+  removing them is a bounded hygiene follow-up required by `AGENTS.md`, not an
+  execution-semantics change. New comments keep tracking vocabulary in docs.
 
 ## Frozen
 
@@ -582,21 +554,37 @@ by design, and two concerns stay separate: the policy snapshot identity
 prevents *reinterpretation* of approved operations, while the explicit
 binding revocation epoch is the only mechanism that may fence live
 leases — one revision field must not carry both meanings.
-Remaining for M12 closure: nothing structural is left on the
-reserve/dispatch/ack path. The out-of-process coordinator transport
-landed 2026-08-26 as a process-separated durable ledger: `broker_host`
-opens the same `ReservationJournal` and serves bounded line-delimited
-requests over stdin/stdout, `ProcessEffectBroker` journals each phase
-across the pipe and applies effect bodies locally at the requester
-(they are not remotable in v0), so crash-window semantics match the
-in-process `JournaledEffectBroker` reference exactly — between a
-dispatched record and its ack record recovery can only be Ambiguous.
-Broker-owned cross-process execution and HTTP/gRPC coordinator shells
-stay future work until a consumer actually needs remotable effects;
-do not build them speculatively.
+M12 is now a closure audit, not an unbounded implementation queue. Nothing
+structural is left on the reserve/dispatch/ack path. The out-of-process
+coordinator transport landed 2026-08-26 as a process-separated durable ledger:
+`broker_host` opens the same `ReservationJournal`, while
+`ProcessEffectBroker` journals each phase across the pipe and applies effect
+bodies locally at the requester. Close M12 only when one bounded evidence table
+shows every brokerable production effect crosses that path, crash windows
+reconcile honestly, and authority/revocation fencing holds; generic
+shell/process remain named non-transactional exceptions. Broker-owned remote
+execution and HTTP/gRPC shells are not V1 requirements without a remotable
+consumer.
 Do not build a second registry. Attestation is actual enforced
 capabilities; generic process tools stay non-transactional.
-UntrustedGenerated stays fail-closed on native. Multi-file
+The bounded closure-audit evidence generator landed 2026-08-27: the
+deterministic `agent-eval --platform-closure-m12` run (also a cargo test)
+wrote its first PASS report — 28 resolved rows, zero unresolved — under
+`crates/agent-eval/evidence/platform-closure/m12/`, covering every brokerable
+family on the journaled reserve/dispatch/ack path, NotApplied/Applied/Ambiguous
+crash reconciliation through journal reopen, per-binding epoch fencing,
+generic-process exceptions executing against an empty journal, and two
+independent out-of-process coordinator sessions sharing one durable ledger.
+The M13 counterpart landed the same day: `agent-eval --platform-closure-m13`
+(real child spawns, per-profile `required ⊆ actual` activation, both refusal
+cases, mechanism-proof attestations) wrote its first PASS report — 8 rows,
+zero unresolved — under `crates/agent-eval/evidence/platform-closure/m13/`.
+Formal M12/M13 closes wait only on regenerating both reports from a clean
+tree after commit; nothing structural remains open in either item.
+M13 is likewise a closure audit: structured attestation must validate enforced
+evidence, activation must enforce `required ⊆ actual`, and unsupported native
+`UntrustedGenerated` must fail closed. Universal native availability belongs
+to the WASI/V2 candidate, not the V1 gate. Multi-file
 `EffectIntent` and commit-time Actual ⊆ Approved (`MOD-AUTH-01`/`02`)
 landed 2026-08-21 — do not reopen them without new authority evidence.
 Tool Surface utility scoring stays out of scope until
@@ -669,41 +657,23 @@ preserved all r3 call-quality results while observing lower wall p50/p95. See
 the r4 evidence `REPORT.md`. This proves the combined contract on that frozen
 surface, not a general task-failure rate or a causal performance gain.
 
-`TOOL-EDIT-02` remains open. Five clean-tree frozen-gate runs completed
-2026-08-26 after the hunk `op`-field drift fix (evidence
-`tool-surface-edit-v3-clean-tree-2026-08-26*/`, four with REPORT.md).
-Strict raw-byte truth passed every applied patch in all five windows —
-12/12 in four runs, 11/12 in the first only because one provider session
-died before any tool call — so the mutation path is proven byte-perfect.
-The gate never exceeded 9/12 and non-conflict-first never exceeded 8/9:
-every failure was served-model decision behavior (post-edit confirmation
-reads the stale-recovery contract forbids, a stale-revision first attempt,
-or one non-exact first-hunk set, each recovered). The diagnostic has
-saturated across five windows; the bar stays 12/12 strict, 12/12 gate,
-9/9 non-conflict-first on one clean tree, and the item waits for a
-materially different provider or model serving. A sixth cross-model run
-the same day on the local OpenCode relay (`ox-alpha-free`, availability
-precondition green) scored strict 11/12 (one relay transport death),
-gate 6/12, non-conflict-first 8/9: perfect hunk discipline in every
-completed cell, with all five behavioral failures being the same
-forbidden post-edit confirmation read — now the binding violation for
-both servings. Applied-patch correctness is proven as an engine property;
-first-attempt flow discipline is the open model property.
-The binding violation has since been root-caused and fixed: the no-confirm
-rule existed only in grader config — the v3 surface compaction had dropped
-it from the `edit.patch` description under that tool's 96-char cap while
-`edit.replace` kept its twin sentence. Stating the contract on the success
-echo itself (committed 2026-08-26) removed post-edit confirmation reads
-entirely: three windows on the v4 surface (`tool-surface-edit-v4-clean-tree-
-2026-08-26-ox-r1..r3/`, two archived with REPORT.md, one console-only full-bar
-pass) ran 0 confirm reads in all 36 cells and cut wall time from 871 s to
-509–594 s. The archived windows each miss the bar by one cell:
-`batch_two_file`'s exact-hunk check, where the model merges each file's two
-anchor lines into one multiline hunk on ~1 of 3 repeats — byte-perfect,
-revision-correct, granularity differs from the golden decomposition. That
-residual needs a contract decision (teach canonical granularity in
-model-visible text, or accept byte-equivalent decompositions in
-`exact_hunks`); TOOL-EDIT-02 stays open with its bar unchanged.
+`TOOL-EDIT-02` is no longer waiting for another unchanged provider/model
+window. On the v4 surface, both archived clean-tree windows reached strict
+12/12 with zero confirmation reads; each scored gate 11/12 and
+non-conflict-first 8/9. A third console-only window reached the full bar but is
+not archival evidence. The only repeated archived miss is a byte-perfect,
+revision-correct two-file patch whose hunk partition differs from the hidden
+`exact_hunks` decomposition. These finite results support the frozen surface;
+they do not prove a general editor-engine failure rate.
+
+The product route is byte/revision/settlement truth: hunk partition is not
+model-visible authority and no downstream consumer currently requires a golden
+decomposition. Version `exact_hunks` to accept byte-equivalent decompositions
+while preserving submitted paths, strict final bytes, revision discipline,
+atomic settlement and no-fallback/no-confirm-read checks. Reverse that choice
+only if a real consumer first documents a canonical-granularity requirement.
+Then run one archival 4x3 confirmation window; do not spend more live windows
+on the unchanged ambiguous contract.
 Deterministic external-race, crash, journal-fault and — since 2026-08-26 —
 disk-full coverage are landed: the feature-gated `test-faults` storage seam
 injects storage-full refusals at the authority intent, the staged temp bytes
@@ -729,55 +699,52 @@ deleted. A multi-file effect remains sequential with honest partial recovery.
 This V1-candidate gate runs in parallel with — and does not replace or close —
 the M12 → M13 mainline.
 
-**P1 — trustworthy long-task closure and cold continuation before broader
-agent evaluation.** The r8-r10 stable-core/edit sequence remains frozen: C's
-median gap was +1 model round / +4 tool calls while retaining the large Context
-advantage. Keep Context, GC and the production tool surface fixed.
+**P1 — long-task recovery integrity before further live promotion.** The
+r8-r10 stable-core/edit sequence remains frozen: C's median gap was +1 model
+round / +4 tool calls while retaining the large Context advantage. The current
+audit does not weaken that Context finding; it invalidates later recovery and
+evaluation claims. Keep Context selection, GC, prompt packing and the stable
+tool surface fixed.
 
-`LT-RUN-01..03` and the deterministic `retry_policy_dev` gate are green. The
-first four live C cells also ran, but all lack lifecycle closure and the current
-evaluator skips post-run acceptance after that failure. Their resume twins prove
-operator stop plus restore of an externally captured full checkpoint, not an
-independent disk cold start: the Context engine is reused, the actor safe-point
-artifact omits the host capability plane, and the artifact store has no load
-path, checksum or fsync durability claim. The runtime has since landed all of
-those properties (LT-RUN-04 Slice D), but the retained cells predate it, so
-they still do not demonstrate cold start.
+The next phase is `LT-RUN-05` in
+[`LONG_TASK_EVALUATION.md`](LONG_TASK_EVALUATION.md), a repair and re-proof of
+the existing `LT-RUN-04` substrate rather than a new planning algorithm:
 
-The next bounded phase is `LT-RUN-04` in
-[`LONG_TASK_EVALUATION.md`](LONG_TASK_EVALUATION.md): (1) preserve behavioral,
-diff, closure, continuation and provider truth independently through a
-harness-owned external oracle; (2) retain whole-anchor CAS while giving
-verification basis an independent revision meaning; (3) derive a
-once-per-basis `CompletionOpportunity` only from current positive terminal
-evidence, default-off until its item-8 candidate gate passes;
-and (4) produce and cold-load one complete, checksummed,
-revision-acknowledged safe-point artifact, with failed durability blocking
-continuation. On that final substrate, run retained-C CompletionOpportunity
-off/on normal/resume pairs with at least two repeats per mode; require
-behavior/outcome non-regression, improved closure, lower median rounds/calls
-and no new tail before promotion. Only the promoted frozen setting enters
-same-model A/C. After that add diagnosis and multi-file migration tasks.
-Criterion origin/authority must land before Completion Proof Ledger shadow
-evidence; a model-visible TaskGraph remains evidence-gated. The pilot remains
-development evidence, not M15 acceptance, and it does not reorder M12 then
-M13.
+1. introduce an actor-owned monotonic snapshot sequence independent of
+   `TaskAnchor`; continuation requires no debt, no failed or in-flight write,
+   and `durable_sequence >= required_sequence`;
+2. make completion two-phase: validate and durably acknowledge a prospective
+   internally valid terminal snapshot before committing in-memory completion;
+   share the stable capability-generation capture path;
+3. bind cancellation, restore and continuation to the exact durable-lineage/
+   task/sequence/artifact/checksum/capability-generation tuple;
+4. define one verification basis and currentness predicate shared by
+   completion, exact reuse and `CompletionOpportunity`;
+5. classify oracle setup, provider, Runtime, behavior, diff, closure, restore
+   and continuation independently; require every mandatory dimension and no
+   runtime error for PASS, and preserve failed-path round/call accounting; and
+6. prove same-anchor multi-snapshot order, out-of-order ack, failed-write retry,
+   final-artifact restore, stale capability generation and progress-only
+   verification movement with deterministic tests.
 
-All four `LT-RUN-04` slices are landed deterministically as of 2026-08-25
-(see Now); the live half of this phase remains open: canonical closure cells
-under the split-dimension evaluator, and the item-8 off/on paired
-CompletionOpportunity promotion gate on the final substrate before any
-same-model A/C comparison.
+Only after all six are green may the retained-C off/on normal/resume gate run
+again under the already-frozen paired-repeat rule. The candidate stays off
+unless behavior does not regress, closure improves, median rounds/calls improve
+and no new tail appears. Same-model A/C, diagnosis and multi-file migration tasks
+remain after that decision. Criterion/CPL and model-visible TaskGraph research
+stay deferred and evidence-gated.
 
 ## Next milestone
 
-Engineering mainline is **M12, then M13**, then a V1 candidate, then
-formal M15. V2 Self-Iteration stays blocked.
+Engineering mainline is the bounded **M12 closure audit, then M13 closure
+audit**, then a V1 candidate and formal M15. V2 Self-Iteration stays blocked.
+M12 does not wait for broker-owned remote execution; M13 accepts truthful
+native fail-closed activation and does not wait for the WASI/V2 runtime.
 
-In parallel, complete `LT-RUN-04`, then pass the retained-C default-off
-CompletionOpportunity paired gate before same-model A/C. Do not spend another
-live pair on the old 15-directive longflow unless a regression specifically
-reopens its retained r8-r10 decision.
+In parallel, complete deterministic `LT-RUN-05`, then run at most the specified
+decision-grade CompletionOpportunity pair before same-model A/C. Do not spend
+another live pair on the old 15-directive longflow unless a regression
+specifically reopens its retained r8-r10 decision.
 
 Context evaluation: `context-mech.v2` 12-cell evidence exists; do not
 expand to 27 or 300×3. Live `recall_after_fix` is refused.
