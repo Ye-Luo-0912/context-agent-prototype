@@ -509,10 +509,18 @@ infers it from command strings, argv or output text.
   fence.
 
 Obligation-scoped provenance sources (open item 3) follow the same pattern:
-extend the lease source enum with `ObligationProvenance { obligation_id }`
+extend the lease source sets with an obligation-provenance membership,
 retained exactly while the ledger row lives; the association is written only
 by the trusted code path that records the obligation, never by producer
-metadata.
+metadata. Implementation map from the current code (for the next slice):
+there is no source enum — sources are typed `Vec<String>` sets on
+`ActiveTurn` (`pending_loaded_tools`, `result_delivery_tools`, both
+turn-scoped and never checkpointed). The slice adds a third set populated
+when `ExecutionState::record_obligation` accepts a row naming its source
+tool, released by the same paths that resolve or invalidate the obligation,
+and folded into the `ToolLeasesReconciled` runtime-root partition.
+Obligations live in the turn-scoped `ExecutionState`, so the new set never
+outlives the turn and needs no checkpoint rule beyond the existing ones.
 
 Slice 1 landed 2026-08-26 end to end with no default behavior change:
 `VerificationRecipeProvenance` (recipe id/revision, coverage domain,
