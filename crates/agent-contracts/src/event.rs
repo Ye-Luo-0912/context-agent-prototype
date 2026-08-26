@@ -310,7 +310,7 @@ pub enum RuntimeEvent {
         #[serde(default)]
         restored_body_tokens: u64,
     },
-    /// CONV-OBS-01：义务账本生命周期事件（typed、有界，不含任何工具
+    /// 义务账本生命周期事件（typed、有界，不含任何工具
     /// 正文）。kind ∈ opened / attempted / precondition_changed /
     /// resolved / dropped；scope_digest 是稳定的血统身份
     /// （ExecutableResolution = 解析上下文 digest），epoch 是前置指纹

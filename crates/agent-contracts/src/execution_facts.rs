@@ -274,7 +274,7 @@ mod tests {
         );
 
         // Failed run whose class proves nothing executed: no staleness
-        // (MOD-OBS-01) even though the observation itself stays trusted.
+        // even though the observation itself stays trusted.
         let refused = ToolExecutionFacts::from_resource_touches([("src/auth.rs", None)])
             .with_mutation_bound(true)
             .with_failure(diagnosis(ToolFailureClass::StaleRevision));

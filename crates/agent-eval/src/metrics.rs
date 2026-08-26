@@ -74,7 +74,7 @@ pub struct RunMetrics {
     pub frontier_no_advance_peak: u64,
     /// 因 world revision 推进而失效的前沿证据条数。
     pub evidence_invalidations: u64,
-    /// CONV-OBS-02：任务结果前沿的影子账本。现有 Evidence
+    /// 任务结果前沿的影子账本。现有 Evidence
     /// Frontier 回答“是否获得了新的 current 证据”；这一组指标
     /// 只回答“任务结果是否前进”，不参与实时决策。
     /// 前进事件是成功的 Known 变更结果、显式 typed verification
@@ -140,7 +140,7 @@ pub struct RunMetrics {
     pub restored_body_tokens: u64,
     /// Unknown footprint 挂起（休眠保留）的条目数。
     pub protocol_cache_suspended: u64,
-    /// CONV-OBS-01：义务账本生命周期计数（事件流求和）。
+    /// 义务账本生命周期计数（事件流求和）。
     pub obligation_opened: u64,
     pub obligation_attempted: u64,
     pub obligation_precondition_changes: u64,
@@ -368,11 +368,11 @@ pub fn aggregate_metrics(events: &[RuntimeEventEnvelope]) -> RunMetrics {
     let mut recovered_path: HashMap<ContextItemId, RecoverPath> = HashMap::new();
     let mut unique_reactivated: HashSet<ContextItemId> = HashSet::new();
     let mut seen_context_compacted = false;
-    // CONV-OBS-01 血统累计 + §25 每 turn 长尾归因。
+    // 血统累计 + §25 每 turn 长尾归因。
     let mut obligation_lineage_totals: HashMap<String, u32> = HashMap::new();
     let mut turn_round_buckets: Vec<u64> = Vec::new();
     let mut current_turn_rounds: u64 = 0;
-    // CONV-OBS-02 只是 eval 影子时钟：它不修改 Runtime 的
+    // 只是 eval 影子时钟：它不修改 Runtime 的
     // Evidence Frontier，也不抑制任何工具。
     let mut results_without_outcome_advance: u64 = 0;
     // TOOL-SURFACE-OBS-01 逐轮连接 surface provenance 与后续调用。
@@ -679,7 +679,7 @@ pub fn aggregate_metrics(events: &[RuntimeEventEnvelope]) -> RunMetrics {
                 invalidated,
                 ..
             } => {
-                // 收敛指标（评审第 30 条）：可证明推进数、冗余证据调用、
+                // 收敛指标：可证明推进数、冗余证据调用、
                 // 无推进连击峰值与证据失效数，全部来自事件流。
                 if delta.advances_frontier() {
                     metrics.frontier_advances += 1;
@@ -766,7 +766,7 @@ pub fn aggregate_metrics(events: &[RuntimeEventEnvelope]) -> RunMetrics {
                 attempts_in_epoch,
                 total_attempts,
             } => {
-                // CONV-OBS-01：义务账本生命周期指标。avoidable = 同血统
+                // 义务账本生命周期指标。avoidable = 同血统
                 // 第 2 次及以后的失败（第一次是诚实失败，其后才是浪费）。
                 match kind {
                     agent_contracts::ObligationEventKind::Opened => {
@@ -1068,7 +1068,7 @@ pub fn aggregate_metrics(events: &[RuntimeEventEnvelope]) -> RunMetrics {
     metrics.recovery_workspace_reread = metrics.repeated_fs_reads;
     metrics.recovery_failed = forgotten.difference(&recovered).count() as u64;
     metrics.unique_reactivated = unique_reactivated.len() as u64;
-    // CONV-OBS-01：血统累计的跨事件上界。
+    // 血统累计的跨事件上界。
     metrics.max_total_attempts_per_lineage = obligation_lineage_totals
         .values()
         .copied()

@@ -1,4 +1,4 @@
-//! Convergence Bench（评审第 29 条）：四个确定性 scripted-model 场景，
+//! Convergence Bench：四个确定性 scripted-model 场景，
 //! 在真实 runtime + 真实工具表面上验证 Execution Convergence 语义。
 //! 不依赖 live provider，可在 CI 里反复运行：
 //!
@@ -425,7 +425,7 @@ pub async fn run_convergence_bench() -> anyhow::Result<Vec<ConvergenceBenchRepor
 mod tests {
     use super::*;
 
-    /// Convergence Bench 自身作为测试运行（评审第 29 条的验收门）。
+    /// Convergence Bench 自身作为测试运行。
     #[tokio::test]
     async fn all_four_scenarios_pass() {
         let reports = run_convergence_bench().await.expect("bench runs");

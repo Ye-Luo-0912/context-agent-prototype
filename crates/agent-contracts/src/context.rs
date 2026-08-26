@@ -1137,7 +1137,7 @@ pub struct TaskProgressView {
     /// 由 typed 失效事实开出的义务；无关推进不清除它们。
     #[serde(default)]
     pub unresolved_blockers: Vec<String>,
-    /// Deterministic stall signal (MOD-PROG-01): the same operation
+    /// Deterministic stall signal: the same operation
     /// signature has produced no world progress for consecutive rounds.
     /// Advisory prompt line, never an execution block.
     #[serde(default, skip_serializing_if = "Option::is_none")]

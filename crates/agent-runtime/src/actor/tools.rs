@@ -385,7 +385,7 @@ impl RuntimeActor {
                     return;
                 }
             }
-            // MOD-PROG-01: an identical retry of a deterministic edit
+            // an identical retry of a deterministic edit
             // refusal against unchanged file identities cannot produce a
             // different result — refuse it before admission so no operation
             // is spawned for a provably no-progress round.
@@ -1265,7 +1265,7 @@ impl RuntimeActor {
                     &facts,
                     settled_attribution.as_ref(),
                 );
-                // MOD-PROG-01: remember deterministic edit refusals so an
+                // remember deterministic edit refusals so an
                 // identical retry can be refused without dispatch.
                 if let Some(digest) = completion.argument_digest
                     && let Some(turn) = self.state.turn.as_mut()
@@ -1528,7 +1528,7 @@ impl RuntimeActor {
 
     /// 把一轮前沿分类作为 `ExecutionFrontier` 事件上报。事件是有界
     /// 计数，不含任何工具正文；收敛指标从这里聚合。同批的义务账目
-    /// 事件（CONV-OBS-01）逐条出账，报告可从事件流独立验证
+    /// 事件（ ）逐条出账，报告可从事件流独立验证
     /// max_attempts_per_epoch / max_total_attempts_per_lineage。
     async fn report_frontier(
         &mut self,
@@ -1724,7 +1724,7 @@ impl RuntimeActor {
     }
 }
 
-/// MOD-PROG-01: the deterministic duplicate-refusal result. Nothing was
+/// the deterministic duplicate-refusal result. Nothing was
 /// executed, so this is `NotApplied` by construction; the message names
 /// the original failure so the model can change strategy instead of
 /// resubmitting the same arguments.

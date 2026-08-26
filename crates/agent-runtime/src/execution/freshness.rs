@@ -54,7 +54,7 @@ impl ExecutionState {
         self.observe_tool_with_digest(output, anchor_revision, turn, "")
     }
 
-    /// 评审第 17 条：证据的 argument_digest 用 Runtime 在
+    /// 证据的 argument_digest 用 Runtime 在
     /// OperationCompletion 计算的真值，消除同 argv 不同 cwd/env、
     /// 同 path 不同 limit/cursor 的身份碰撞。
     pub fn observe_tool_with_digest(
@@ -133,7 +133,7 @@ impl ExecutionState {
     ) -> super::state::FrontierObservation {
         self.anchor_revision = anchor_revision;
         self.last_turn = turn;
-        // MOD-PROG-01 progress probe: capture the before-state so one
+        // progress probe: capture the before-state so one
         // deterministic classification can answer "did this round move
         // the world or our knowledge of it?"
         let before_failures = self.failed_commands.len();
@@ -202,7 +202,7 @@ impl ExecutionState {
                 }
             }
         } else {
-            // MOD-OBS-01: a refused mutation still observed the world —
+            // a refused mutation still observed the world —
             // the tool read the target to refuse it, so its trusted
             // path+revision stamp is real world truth even though the
             // write did not apply. Consuming it here clears
@@ -253,7 +253,7 @@ impl ExecutionState {
         // 等到下一轮。失效条数随事件上报。
         let invalidated = self.invalidate_stale_evidence();
         // 义务账本：先解析（本输出可能已解除旧义务或推进 epoch），再
-        // 登记新失败；账目事件随 FrontierObservation 出账（CONV-OBS-01）。
+        // 登记新失败；账目事件随 FrontierObservation 出账（ ）。
         let mut obligation_events = Vec::new();
         self.resolve_obligations(output, &mut obligation_events);
         self.record_obligation(
@@ -279,7 +279,7 @@ impl ExecutionState {
                 != before_last_evidence;
         let failure_resolved = self.failed_commands.len() < before_failures;
         let obs_evidence = if output.ok && !is_verification && !output.may_mutate_workspace() {
-            // 评审第 17 条：证据身份用 Runtime 的真 ArgumentDigest，
+            // 证据身份用 Runtime 的真 ArgumentDigest，
             // 不在 ToolOutput 上反推；缺省时退化为参数摘要。
             self.record_observation_evidence(output, turn, argument_digest)
         } else {

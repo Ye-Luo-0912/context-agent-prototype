@@ -60,7 +60,7 @@ impl CapabilityRunState {
     }
 }
 
-/// 统一表面驻留预算：与 builtin 侧共用同一组水位（评审第 20 条）。
+/// 统一表面驻留预算：与 builtin 侧共用同一组水位。
 /// 合并（本侧 + builtin 侧）已加载字节数超高位才冷却，回到低位即停。
 pub(crate) const SURFACE_SOFT_HIGH_BYTES: usize = 18_000;
 pub(crate) const SURFACE_LOW_WATERMARK_BYTES: usize = 9_000;
@@ -788,7 +788,7 @@ impl CapabilityRegistry {
         report
     }
 
-    /// 统一表面驻留预算下的安全点（评审第 20 条）：Loaded→Warm 冷却
+    /// 统一表面驻留预算下的安全点：Loaded→Warm 冷却
     /// 只由合并压力驱动（本侧 + builtin 侧字节数共用同一组水位，超
     /// 高位才按最久未用冷却到低水位），替代 capability 侧原纯 TTL；
     /// Warm→Unloaded 的闲置卸载保持不变。外部表面先于核心表面承担
@@ -806,7 +806,7 @@ impl CapabilityRegistry {
             // 压力路径：与 builtin 相同的资格规则（非 root、已达闲置
             // 阈值），按最久未用把 Loaded 冷却到 Warm，到低水位为止。
             // 低水位以下不再有纯 TTL 冷却——Loaded 驻留完全由统一
-            // 预算驱动（评审第 20 条：替代 capability 侧纯 TTL）。
+            // 预算驱动（替代 capability 侧纯 TTL）。
             if over_pressure {
                 let mut aging: Vec<(String, u64, usize)> = Vec::new();
                 for entry in inner.values() {
@@ -1418,7 +1418,7 @@ impl ToolDispatcher for CapabilityAwareDispatcher {
     }
 
     fn gc(&self, roots: &[String]) {
-        // 统一表面驻留预算（评审第 20 条）：先取 builtin 侧已加载字节
+        // 统一表面驻留预算：先取 builtin 侧已加载字节
         // 数作为外部压力输入，能力侧与 builtin 共用同一组水位；外部
         // 表面优先承担冷却，builtin 核心随后按自身水位评估。
         let base_bytes = self.base.loaded_surface_bytes();

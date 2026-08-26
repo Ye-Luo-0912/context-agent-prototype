@@ -348,7 +348,7 @@ mod tests {
         assert!(tokens > 0);
     }
 
-    /// checkpoint 向后兼容契约（评审第 27 条）：旧形状的执行状态与
+    /// checkpoint 向后兼容契约：旧形状的执行状态与
     /// 进度视图必须带缺省值反序列化，新字段不破坏旧 checkpoint。
     #[test]
     fn old_execution_state_json_deserializes_with_default_frontier() {

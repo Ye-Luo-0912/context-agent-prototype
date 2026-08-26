@@ -820,7 +820,7 @@ impl ToolOutput {
     ///
     /// A deterministic refusal executed nothing: the mutation is
     /// `NotApplied`, so no fact went stale and the workspace revision
-    /// must not advance (MOD-OBS-01: mutation outcome and observation
+    /// must not advance (mutation outcome and observation
     /// are separate truths — the refusal's `path`+`revision` stamp is
     /// still a trusted observation).
     pub fn mutation_footprint(&self) -> crate::MutationFootprint {
@@ -900,7 +900,7 @@ pub enum ToolFailureClass {
     InvalidRequest,
     /// The runtime refused to dispatch: this call is byte-identical to a
     /// deterministic refusal against unchanged file identities, so
-    /// executing it again cannot produce a new result (MOD-PROG-01).
+    /// executing it again cannot produce a new result.
     DuplicateNoProgress,
     Io,
 }
@@ -991,7 +991,7 @@ impl ToolFailureClass {
     /// Whether this failure class proves the tool never touched the
     /// world: the operation was refused before any side effect. Such a
     /// refusal is `NotApplied` — no fact went stale — while its stamped
-    /// `path`+`revision` stays a trusted observation (MOD-OBS-01).
+    /// `path`+`revision` stays a trusted observation.
     /// Process/verification/timeout/cancellation/io classes may have
     /// partial side effects and stay conservative.
     pub const fn nothing_executed(self) -> bool {
@@ -1069,7 +1069,7 @@ impl ToolFailureDomain {
     }
 }
 
-/// CONV-OBS-01：义务账目事件的类型。warning_surfaced 暂缺——警告行
+/// 义务账目事件的类型。warning_surfaced 暂缺——警告行
 /// 目前只渲染进 TASK PROGRESS，不经过观察管线，无法在此出账。
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -3195,7 +3195,7 @@ mod tests {
 
     #[test]
     fn deterministic_refusal_has_no_mutation_footprint() {
-        // MOD-OBS-01: a refusal executed nothing, so no known fact went
+        // a refusal executed nothing, so no known fact went
         // stale — while its trusted path+revision stamp remains a usable
         // observation.
         let refused = tool_failure_output(

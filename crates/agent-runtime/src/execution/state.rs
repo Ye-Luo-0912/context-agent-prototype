@@ -17,7 +17,7 @@ pub(super) const MAX_RESUME_FAILURES: usize = 8;
 pub(super) const MAX_REVALIDATE_PER_ROUND: usize = 8;
 pub(super) const MAX_COVERAGE_PATHS: usize = 8;
 /// Consecutive identical no-progress rounds before the runtime tells the
-/// model its repeated behavior is not moving the world (MOD-PROG-01).
+/// model its repeated behavior is not moving the world.
 pub(super) const STALL_THRESHOLD: u32 = 3;
 /// 连续同类失败命中的不同目标数达到该值即上报聚类提示：换拼写的
 /// 连击在任一单独签名上永远到不了 [`STALL_THRESHOLD`]。
@@ -46,7 +46,7 @@ pub struct FrontierObservation {
     pub actions_since_frontier_advance: u32,
     pub evidence_revision: u64,
     pub invalidated: u64,
-    /// CONV-OBS-01：本次观察产生的义务账目事件（有界）。
+    /// 本次观察产生的义务账目事件（有界）。
     pub obligation_events: Vec<agent_contracts::ExecutionObligationEvent>,
     /// Bounded lifecycle transitions for speculative negative facts.
     pub negative_fact_events: Vec<NegativeFactTransition>,
@@ -230,7 +230,7 @@ pub struct ConvergenceState {
 
 /// How one [`ResourceFact`] was last observed. Observability only: it
 /// never gates freshness, authority, or selection — it explains why the
-/// fact is believed (MOD-OBS-01: effect, observation, and attention are
+/// fact is believed (effect, observation, and attention are
 /// separate truths).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -1073,7 +1073,7 @@ impl ExecutionState {
         invalidated
     }
 
-    /// "这条证据现在还能证明为真吗"——唯一裁决点（评审第 8 条）。
+    /// "这条证据现在还能证明为真吗"——唯一裁决点。
     /// WorkspaceRevision 绑定当前世界版本；Resource 要求事实表存在
     /// 同 path@digest 的 Fresh 行；Turn 要求仍是当轮。
     pub(super) fn evidence_is_current(&self, row: &ExecutionEvidence) -> bool {

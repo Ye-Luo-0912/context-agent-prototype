@@ -48,7 +48,7 @@ fn failed_file_observation_is_not_checked() {
 }
 
 /// A refused mutation observed the file it refused to write: the trusted
-/// path+revision stamp is a real observation (MOD-OBS-01).
+/// path+revision stamp is a real observation.
 fn refused_edit(path: &str, revision: &str, class: &str) -> ToolOutput {
     let mut refusal = output("edit.replace", false, "edit refused");
     refusal.metadata = json!({
@@ -85,7 +85,7 @@ fn refused_mutation_stamps_the_observed_fact_without_bumping_the_world() {
 
 #[test]
 fn refusal_observation_resolves_needs_revalidation_without_a_reread() {
-    // MOD-OBS-01 headline: after an unknown mutation, a stale_revision
+    // headline: after an unknown mutation, a stale_revision
     // refusal already carries the current revision — NeedsRevalidation
     // resolves without the model burning an fs.read.
     let mut resume = ExecutionState::default();
@@ -151,7 +151,7 @@ fn failed_process_execution_still_bumps_the_world_revision() {
 
 #[test]
 fn repeated_identical_refusals_surface_the_stall_warning() {
-    // MOD-PROG-01: the fact is already known at the stamped revision, so
+    // the fact is already known at the stamped revision, so
     // each identical refusal is provably no-progress; three in a row
     // surface EXECUTION STALL.
     let mut resume = ExecutionState::default();
@@ -905,7 +905,7 @@ fn foreground_resources_are_exact_mentions_of_known_paths() {
     );
 }
 
-// ---- Evidence Frontier / ConvergenceState（评审第 8–12 条）----
+// ---- Evidence Frontier / ConvergenceState----
 
 fn pathless_command(name: &str, ok: bool, command: &str, summary: &str) -> ToolOutput {
     ToolOutput {
@@ -1283,7 +1283,7 @@ fn edit_target_obligation_resolves_only_at_new_digest() {
 
 #[test]
 fn stale_resource_evidence_is_hidden_but_keeps_bounded_fingerprint() {
-    // 评审第 8 条的原始 bug 场景：edit 之后 Resource 行不得残留 AAA。
+    // 的原始 bug 场景：edit 之后 Resource 行不得残留 AAA。
     let mut resume = ExecutionState::default();
     resume.observe_tool(&read_output("src/foo.rs", "AAA"), 1, 1);
     assert_eq!(resume.view().operational_evidence.len(), 1);

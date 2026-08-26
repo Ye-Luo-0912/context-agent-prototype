@@ -195,7 +195,7 @@ impl Tool for FsListTool {
             artifact_ref,
             metadata: json!({
                 // digest 对完整 listing 计算：visible 只是分页窗口，
-                // 窗口外的条目变化同样改变目录身份（评审第 10 条）。
+                // 窗口外的条目变化同样改变目录身份。
                 "path": listed,
                 "revision": content_digest(full.as_bytes()),
                 "entry_count": entries.len(),

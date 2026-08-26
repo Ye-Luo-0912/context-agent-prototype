@@ -224,7 +224,7 @@ struct ActiveTurn {
     /// results; installed back onto the task only after TurnCompleted.
     /// Cancel / fail / stale drops this value.
     execution: ExecutionState,
-    /// MOD-PROG-01: deterministically-refused edit attempts this turn.
+    /// deterministically-refused edit attempts this turn.
     /// An identical retry (same argument digest) against unchanged file
     /// identities is refused without dispatch. Turn-scoped on purpose:
     /// a new user directive may legitimately ask for the same edit.
@@ -415,7 +415,7 @@ struct AssistantArtifactEvidence {
     reference: String,
 }
 
-/// MOD-PROG-01: one deterministically-refused edit attempt. The
+/// one deterministically-refused edit attempt. The
 /// `OperationAttemptKey` is tool + argument digest; the trusted target
 /// observations (`path@digest`) captured at refusal time prove the retry
 /// would hit identical file identities.
@@ -497,7 +497,7 @@ impl ActiveTurn {
         ) {
             return;
         }
-        // MOD-OBS-01: the refusal's trusted path+revision stamps are the
+        // the refusal's trusted path+revision stamps are the
         // file identities a retry must still match to be a duplicate.
         let targets: Vec<String> = output
             .resource_touches()
