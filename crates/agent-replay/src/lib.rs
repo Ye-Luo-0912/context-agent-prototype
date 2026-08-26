@@ -283,6 +283,7 @@ pub(crate) async fn run_engine_observing(
                 total_tool_rounds += 1;
                 engine
                     .ingest(ContextIngress::ToolObservation {
+                        facts: None,
                         output: output.clone(),
                         scope_id: None,
                     })

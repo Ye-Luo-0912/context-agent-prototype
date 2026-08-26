@@ -342,6 +342,7 @@ async fn service_equivalence_with_in_process_engine() {
                 .unwrap();
             engine
                 .ingest(ContextIngress::ToolObservation {
+                    facts: None,
                     output: ToolOutput {
                         call_id: "c".into(),
                         tool_name: "shell.exec".into(),
@@ -396,6 +397,7 @@ async fn gc_parity_between_in_process_and_service_boundary() {
                 .unwrap();
             engine
                 .ingest(ContextIngress::ToolObservation {
+                    facts: None,
                     output: ToolOutput {
                         call_id: format!("{turn}"),
                         tool_name: "shell.exec".into(),
@@ -681,6 +683,7 @@ async fn contract_snapshot(engine: &dyn ContextEngine) -> serde_json::Value {
         };
         engine
             .ingest(ContextIngress::ToolObservation {
+                facts: None,
                 output: ToolOutput {
                     call_id: format!("overflow-{item}"),
                     tool_name: "shell.exec".into(),
@@ -1021,6 +1024,7 @@ async fn storage_gc_parity_between_in_process_and_service_boundary() {
                 .unwrap();
             engine
                 .ingest(ContextIngress::ToolObservation {
+                    facts: None,
                     output: ToolOutput {
                         call_id: format!("{turn}"),
                         tool_name: "shell.exec".into(),
@@ -1068,6 +1072,7 @@ async fn externalize_some(engine: &dyn ContextEngine, store_dir: &Path) -> usize
     for item in 0..overflow {
         engine
             .ingest(ContextIngress::ToolObservation {
+                facts: None,
                 output: ToolOutput {
                     call_id: format!("reconcile-{item}"),
                     tool_name: "shell.exec".into(),

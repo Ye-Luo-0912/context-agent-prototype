@@ -115,7 +115,7 @@ pub enum TurnFrameStep {
         /// fetched evidence under a new item id.
         #[serde(default)]
         disposition: ToolResultDisposition,
-        /// Typed host-trusted execution facts (CAP-OBS-01), captured from
+        /// Typed host-trusted execution facts, captured from
         /// the dispatcher lane when the result landed. `None` marks frames
         /// that predate the channel — consumers fall back to the legacy
         /// metadata derivation for exactly those. Boxed to keep the enum

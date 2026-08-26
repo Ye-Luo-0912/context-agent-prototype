@@ -1060,7 +1060,7 @@ impl RuntimeActor {
                     output,
                     scope_id,
                     disposition,
-                    facts: _,
+                    facts,
                 } = step
                 else {
                     continue;
@@ -1077,6 +1077,7 @@ impl RuntimeActor {
                     .context_ingest(ContextIngress::ToolObservation {
                         output: output.clone(),
                         scope_id: *scope_id,
+                        facts: facts.clone(),
                     })
                     .await
                 {

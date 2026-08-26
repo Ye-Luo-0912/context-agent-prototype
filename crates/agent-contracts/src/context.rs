@@ -804,6 +804,13 @@ pub enum ContextIngress {
         /// (replay, standalone use).
         #[serde(default)]
         scope_id: Option<ScopeId>,
+        /// Typed host-trusted execution facts captured on the dispatch lane
+        /// when the result landed. `None` marks producers that predate the
+        /// channel — engines fall back to deriving from legacy metadata for
+        /// exactly those. Boxed to keep the variant small; serialized only
+        /// inside checkpointed frames and service wire traffic.
+        #[serde(default)]
+        facts: Option<Box<crate::execution_facts::ToolExecutionFacts>>,
     },
     /// A lightweight, bounded mid-turn working-set signal from the runtime.
     /// Heating consumes `resources` (trusted path@revision touches) only.

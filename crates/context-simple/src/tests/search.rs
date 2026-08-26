@@ -223,6 +223,7 @@ async fn live_fs_read_stamps_path_and_is_a_catalog_search_hit() {
     open_focus(&engine, "fix src/auth/login.rs").await;
     engine
         .ingest(ContextIngress::ToolObservation {
+            facts: None,
             output: ToolOutput {
                 call_id: "1".into(),
                 tool_name: "fs.read".into(),
@@ -284,6 +285,7 @@ async fn search_and_inspect_file_body_are_identity_descriptors() {
     let engine = SimpleContextEngine::new(SimpleContextConfig::default());
     engine
         .ingest(ContextIngress::ToolObservation {
+            facts: None,
             output: ToolOutput {
                 call_id: "1".into(),
                 tool_name: "fs.read".into(),

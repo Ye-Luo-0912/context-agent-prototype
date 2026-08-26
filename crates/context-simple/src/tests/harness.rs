@@ -103,6 +103,7 @@ pub(crate) async fn consumed_observation_outside_focus(
         .unwrap();
     engine
         .ingest(ContextIngress::ToolObservation {
+            facts: None,
             output: observation_output("1", true, "tests passed in AuthService.rs"),
             scope_id: None,
         })
@@ -145,6 +146,7 @@ pub(crate) async fn observations_in_focus(
     for i in 0..n {
         engine
             .ingest(ContextIngress::ToolObservation {
+                facts: None,
                 output: observation_output(
                     &format!("step-{i}"),
                     true,
@@ -171,6 +173,7 @@ pub(crate) async fn observations_in_focus(
 pub(crate) async fn tool_observation(engine: &SimpleContextEngine, call_id: &str, content: &str) {
     engine
         .ingest(ContextIngress::ToolObservation {
+            facts: None,
             output: ToolOutput {
                 call_id: call_id.into(),
                 tool_name: "shell.exec".into(),
@@ -190,6 +193,7 @@ pub(crate) async fn tool_observation(engine: &SimpleContextEngine, call_id: &str
 pub(crate) async fn failed_observation(engine: &SimpleContextEngine, call_id: &str, content: &str) {
     engine
         .ingest(ContextIngress::ToolObservation {
+            facts: None,
             output: ToolOutput {
                 call_id: call_id.into(),
                 tool_name: "shell.exec".into(),

@@ -31,6 +31,7 @@ async fn warm_body_is_projected_without_residency_change() {
         .unwrap();
     engine
         .ingest(ContextIngress::ToolObservation {
+            facts: None,
             output: fs_read("1", "src/scratch.md"),
             scope_id: None,
         })
@@ -93,6 +94,7 @@ async fn unmentioned_known_path_is_not_foreground() {
     open_focus(&engine, "append notes").await;
     engine
         .ingest(ContextIngress::ToolObservation {
+            facts: None,
             output: fs_read("1", "src/util.py"),
             scope_id: None,
         })
@@ -125,6 +127,7 @@ async fn foreground_caps_at_two_resources() {
     for (id, path) in [("1", "src/a.md"), ("2", "src/b.md"), ("3", "src/c.md")] {
         engine
             .ingest(ContextIngress::ToolObservation {
+                facts: None,
                 output: fs_read(id, path),
                 scope_id: None,
             })
@@ -216,6 +219,7 @@ async fn stored_body_is_projected_without_admit() {
     open_focus(&engine, "append notes").await;
     engine
         .ingest(ContextIngress::ToolObservation {
+            facts: None,
             output: fs_read("1", "src/scratch.md"),
             scope_id: None,
         })
@@ -278,6 +282,7 @@ async fn foreground_deducts_actual_tokens_from_the_historical_budget() {
     open_focus(&engine, "append notes").await;
     engine
         .ingest(ContextIngress::ToolObservation {
+            facts: None,
             output: fs_read("1", "src/scratch.md"),
             scope_id: None,
         })

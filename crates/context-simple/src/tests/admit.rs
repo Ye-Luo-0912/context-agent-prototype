@@ -45,6 +45,7 @@ async fn admit_externalized_item_preserves_identity_and_produces_one_transition(
     for (i, content) in contents.iter().enumerate() {
         engine
             .ingest(ContextIngress::ToolObservation {
+                facts: None,
                 output: super::harness::observation_touching(
                     &format!("step-{i}"),
                     true,
@@ -248,6 +249,7 @@ async fn admit_refused_for_terminal_semantic_item() {
     // externalize (a single evicted item would stay warm instead).
     engine
         .ingest(ContextIngress::ToolObservation {
+            facts: None,
             output: observation_touching(
                 "1",
                 true,
@@ -260,6 +262,7 @@ async fn admit_refused_for_terminal_semantic_item() {
         .unwrap();
     engine
         .ingest(ContextIngress::ToolObservation {
+            facts: None,
             output: observation_touching(
                 "2",
                 true,
@@ -515,6 +518,7 @@ async fn admit_of_a_disappeared_store_blob_is_a_silent_no_op() {
     let content = format!("step 0: fix AuthService.rs {}", "x".repeat(160));
     engine
         .ingest(ContextIngress::ToolObservation {
+            facts: None,
             output: observation_touching("step-0", true, &content, Some("AuthService.rs")),
             scope_id: None,
         })
@@ -523,6 +527,7 @@ async fn admit_of_a_disappeared_store_blob_is_a_silent_no_op() {
     let content = format!("step 1: fix AuthService.rs {}", "y".repeat(160));
     engine
         .ingest(ContextIngress::ToolObservation {
+            facts: None,
             output: observation_touching("step-1", true, &content, Some("AuthService.rs")),
             scope_id: None,
         })
@@ -2502,6 +2507,7 @@ async fn lifecycle_ledger_records_maintenance_and_gc_rows() {
         .unwrap();
     engine
         .ingest(ContextIngress::ToolObservation {
+            facts: None,
             output: ToolOutput {
                 call_id: "1".into(),
                 tool_name: "shell.exec".into(),
@@ -2569,6 +2575,7 @@ async fn lifecycle_ledger_survives_checkpoint() {
         .unwrap();
     engine
         .ingest(ContextIngress::ToolObservation {
+            facts: None,
             output: ToolOutput {
                 call_id: "1".into(),
                 tool_name: "shell.exec".into(),
@@ -2649,6 +2656,7 @@ async fn materialize_preview_is_a_read_that_advances_no_clock() {
     // A state change still advances it.
     engine
         .ingest(ContextIngress::ToolObservation {
+            facts: None,
             output: ToolOutput {
                 call_id: "1".into(),
                 tool_name: "shell.exec".into(),
@@ -2750,6 +2758,7 @@ async fn ephemeral_ttl_counts_user_turns_not_events() {
         .unwrap();
     engine
         .ingest(ContextIngress::ToolObservation {
+            facts: None,
             output: ToolOutput {
                 call_id: "1".into(),
                 tool_name: "shell.exec".into(),

@@ -75,13 +75,20 @@ facts that never originate in producer metadata. The typed vocabulary
 landed 2026-08-26 (`agent-contracts/src/execution_facts.rs`), and the
 first channel landed the same day: `ToolDispatcher::execution_facts`
 translates the trusted builtin registry's own stamps at one sanctioned
-point, capability results route to empty facts, the actor's batch ledger
-consumes them, and the checkpointed turn frame carries the same facts on
-every tool-result step (`Option<Box<_>>`; old checkpoints restore as
+point, capability results route to empty facts, and the actor's batch
+ledger consumes them. The checkpointed turn frame carries the same facts
+on every tool-result step (`Option<Box<_>>`; old checkpoints restore as
 `None`, where the prompt's fs.read body-identity hints fall back to the
-legacy metadata derivation). Still open: the heating ingest carrier,
-Verification, handler-level direct construction, and an event-level wire
-DTO. Do not add
+legacy metadata derivation). The heating ingest carrier landed the same
+day, again as consumer-side adoption: `ContextIngress::ToolObservation`
+carries `facts` (same serde-defaulted shape) forwarded from turn-frame
+step facts at the actor's single observation-ingest site, and the context
+engine reads heating/observation identity facts-first with a per-value
+legacy fallback for frames without captured touches — identical values
+today for every producer class. Still open: Verification representation
+unification, handler-level direct construction (which retires the legacy
+derivation by construction), and an event-level durable wire DTO. Do not
+add
 new authority-bearing keys to `metadata`; plugin authors must not assume
 `metadata.path`/`metadata.revision` reaches the Runtime as truth.
 

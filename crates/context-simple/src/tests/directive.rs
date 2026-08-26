@@ -340,6 +340,7 @@ async fn lease_token_quota_bounds_the_weight_of_protected_items() {
         .unwrap();
     engine
         .ingest(ContextIngress::ToolObservation {
+            facts: None,
             output: observation_output("big-1", true, &big),
             scope_id: None,
         })
@@ -347,6 +348,7 @@ async fn lease_token_quota_bounds_the_weight_of_protected_items() {
         .unwrap();
     engine
         .ingest(ContextIngress::ToolObservation {
+            facts: None,
             output: observation_output("big-2", true, &big),
             scope_id: None,
         })

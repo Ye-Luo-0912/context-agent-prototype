@@ -21,6 +21,7 @@ async fn gc_evicts_consumed_ephemeral_observations_with_a_reason() {
     // the turn (consumed, not tombstoned — it stays recallable).
     engine
         .ingest(ContextIngress::ToolObservation {
+            facts: None,
             output: ToolOutput {
                 call_id: "1".into(),
                 tool_name: "shell.exec".into(),
@@ -82,6 +83,7 @@ async fn file_read_turn(engine: &SimpleContextEngine, path: &str, body: &str) {
         .join("\n");
     engine
         .ingest(ContextIngress::ToolObservation {
+            facts: None,
             output: ToolOutput {
                 call_id: "1".into(),
                 tool_name: "fs.read".into(),
@@ -267,6 +269,7 @@ async fn gc_reactivates_warm_items_whose_entities_become_hot_again() {
         .unwrap();
     engine
         .ingest(ContextIngress::ToolObservation {
+            facts: None,
             output: ToolOutput {
                 call_id: "1".into(),
                 tool_name: "fs.read".into(),
@@ -324,6 +327,7 @@ async fn pathless_tool_stdout_does_not_auto_reactivate() {
         .unwrap();
     engine
         .ingest(ContextIngress::ToolObservation {
+            facts: None,
             output: ToolOutput {
                 call_id: "1".into(),
                 tool_name: "shell.exec".into(),
@@ -371,6 +375,7 @@ async fn stamped_shell_path_does_not_auto_reactivate() {
         .unwrap();
     engine
         .ingest(ContextIngress::ToolObservation {
+            facts: None,
             output: ToolOutput {
                 call_id: "1".into(),
                 tool_name: "shell.exec".into(),
@@ -418,6 +423,7 @@ async fn checked_file_body_does_not_auto_reactivate() {
         .unwrap();
     engine
         .ingest(ContextIngress::ToolObservation {
+            facts: None,
             output: ToolOutput {
                 call_id: "1".into(),
                 tool_name: "fs.read".into(),
@@ -540,6 +546,7 @@ async fn skipped_warm_file_body_is_a_prompt_descriptor() {
         .unwrap();
     engine
         .ingest(ContextIngress::ToolObservation {
+            facts: None,
             output: ToolOutput {
                 call_id: "1".into(),
                 tool_name: "fs.read".into(),
@@ -645,6 +652,7 @@ async fn gc_buffer_overflow_externalizes_instead_of_purging() {
             .unwrap();
         engine
             .ingest(ContextIngress::ToolObservation {
+                facts: None,
                 output: ToolOutput {
                     call_id: i.to_string(),
                     tool_name: "shell.exec".into(),
@@ -691,6 +699,7 @@ async fn gc_generation_increments_for_survivors_and_evicts_at_the_cap() {
     // not hot, so nothing marks it and the generational counter climbs.
     engine
         .ingest(ContextIngress::ToolObservation {
+            facts: None,
             output: ToolOutput {
                 call_id: "1".into(),
                 tool_name: "shell.exec".into(),
@@ -749,6 +758,7 @@ async fn gc_protects_dependencies_of_roots_forward_along_the_edges() {
         .unwrap();
     engine
         .ingest(ContextIngress::ToolObservation {
+            facts: None,
             output: ToolOutput {
                 call_id: "1".into(),
                 tool_name: "shell.exec".into(),
@@ -832,6 +842,7 @@ async fn gc_does_not_treat_shares_entities_as_a_residency_root() {
         .unwrap();
     engine
         .ingest(ContextIngress::ToolObservation {
+            facts: None,
             output: ToolOutput {
                 call_id: "1".into(),
                 tool_name: "shell.exec".into(),
@@ -1096,6 +1107,7 @@ async fn hot_reactivation_requires_exact_entity_identity() {
         .unwrap();
     engine
         .ingest(ContextIngress::ToolObservation {
+            facts: None,
             output: ToolOutput {
                 call_id: "1".into(),
                 tool_name: "fs.read".into(),
@@ -1175,6 +1187,7 @@ async fn descriptor_only_tool_observation_skips_body_reactivation() {
         .unwrap();
     engine
         .ingest(ContextIngress::ToolObservation {
+            facts: None,
             output: ToolOutput {
                 call_id: "1".into(),
                 tool_name: "fs.read".into(),

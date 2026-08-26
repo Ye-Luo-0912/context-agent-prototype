@@ -32,6 +32,7 @@ async fn gc_externalizes_overflow_and_recalls_via_the_store() {
     for (i, path) in files.iter().enumerate() {
         engine
             .ingest(ContextIngress::ToolObservation {
+                facts: None,
                 output: fs_read_touching(
                     &format!("step-{i}"),
                     path,
@@ -111,6 +112,7 @@ async fn fetch_external_recovers_the_exact_original_content() {
     for (i, content) in contents.iter().enumerate() {
         engine
             .ingest(ContextIngress::ToolObservation {
+                facts: None,
                 output: observation_touching(
                     &format!("step-{i}"),
                     true,
@@ -199,6 +201,7 @@ async fn context_store_never_writes_outside_the_state_directory() {
     for i in 0..3 {
         engine
             .ingest(ContextIngress::ToolObservation {
+                facts: None,
                 output: observation_touching(
                     &format!("step-{i}"),
                     true,

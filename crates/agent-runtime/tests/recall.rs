@@ -59,6 +59,7 @@ async fn seed_externalized(engine: &SimpleContextEngine) -> (ContextItemId, Stri
     for (i, content) in contents.iter().enumerate() {
         engine
             .ingest(ContextIngress::ToolObservation {
+                facts: None,
                 output: observation_output(&format!("step-{i}"), true, content),
                 scope_id: None,
             })

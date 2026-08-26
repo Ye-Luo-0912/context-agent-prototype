@@ -1,6 +1,7 @@
 use agent_contracts::{
     AttentionState, ContextEngine, ContextHints, ContextIngress, ContextItem, ContextItemId,
-    ContextKind, ContextQuery, ContextRetention, ContextScope, SemanticState, ToolOutput,
+    ContextKind, ContextQuery, ContextRetention, ContextScope, SemanticState, ToolExecutionFacts,
+    ToolOutput,
 };
 
 use crate::engine::{SimpleContextConfig, SimpleContextEngine};
@@ -28,6 +29,7 @@ async fn hot_entities_follow_user_then_tool_then_reset() {
     // in model_content must not.
     engine
         .ingest(ContextIngress::ToolObservation {
+            facts: None,
             output: ToolOutput {
                 call_id: "1".into(),
                 tool_name: "fs.read".into(),
@@ -100,6 +102,7 @@ async fn failed_tool_observation_does_not_heat_candidate_entities() {
         .unwrap();
     engine
         .ingest(ContextIngress::ToolObservation {
+            facts: None,
             output: ToolOutput {
                 call_id: "1".into(),
                 tool_name: "edit.replace".into(),
@@ -137,6 +140,120 @@ async fn failed_tool_observation_does_not_heat_candidate_entities() {
 }
 
 #[tokio::test]
+async fn typed_facts_authorize_heating_and_identity_without_metadata_stamps() {
+    let engine = SimpleContextEngine::new(SimpleContextConfig::default());
+    engine
+        .ingest(ContextIngress::UserMessage {
+            content: "fix AuthService.rs".into(),
+        })
+        .await
+        .unwrap();
+
+    // Typed facts captured on the dispatcher lane carry their own
+    // authority: heating and observation identity come from facts even
+    // when the output carries no metadata stamps at all.
+    engine
+        .ingest(ContextIngress::ToolObservation {
+            output: ToolOutput {
+                call_id: "1".into(),
+                tool_name: "fs.read".into(),
+                ok: true,
+                summary: "read".into(),
+                model_content: "plain stdout".into(),
+                artifact_ref: None,
+                metadata: serde_json::Value::Null,
+            },
+            facts: Some(Box::new(ToolExecutionFacts::from_resource_touches([(
+                "src/TypedFacts.rs",
+                Some("rev-1".to_string()),
+            )]))),
+            scope_id: None,
+        })
+        .await
+        .unwrap();
+    {
+        let state = engine.state.lock().await;
+        assert!(
+            state
+                .tool_hot
+                .iter()
+                .any(|entry| entry.entity == "src/TypedFacts.rs"),
+            "typed facts must heat the working set without metadata stamps"
+        );
+        assert_eq!(
+            state
+                .items
+                .iter()
+                .find(|item| item.kind == ContextKind::ToolObservation)
+                .and_then(|item| item.file_path.clone()),
+            Some("src/TypedFacts.rs".to_string()),
+            "observation identity must come from typed facts"
+        );
+    }
+
+    // Producers without channel-captured touches keep the legacy
+    // derivation: identical stamps produce identical identity and heat.
+    engine
+        .ingest(ContextIngress::ToolObservation {
+            output: ToolOutput {
+                call_id: "2".into(),
+                tool_name: "fs.read".into(),
+                ok: true,
+                summary: "read".into(),
+                model_content: "plain stdout".into(),
+                artifact_ref: None,
+                metadata: serde_json::json!({
+                    "path": "src/LegacyStamps.rs",
+                    "revision": "rev-2"
+                }),
+            },
+            facts: None,
+            scope_id: None,
+        })
+        .await
+        .unwrap();
+    {
+        let state = engine.state.lock().await;
+        assert!(
+            state
+                .tool_hot
+                .iter()
+                .any(|entry| entry.entity == "src/LegacyStamps.rs"),
+            "stamped metadata must still heat for pre-channel producers"
+        );
+    }
+
+    // Typed facts without captured touches fall back per value to the
+    // legacy derivation, mirroring the prompt-side dual read.
+    engine
+        .ingest(ContextIngress::ToolObservation {
+            output: ToolOutput {
+                call_id: "3".into(),
+                tool_name: "fs.read".into(),
+                ok: true,
+                summary: "read".into(),
+                model_content: "plain stdout".into(),
+                artifact_ref: None,
+                metadata: serde_json::json!({"path": "src/Fallback.rs"}),
+            },
+            facts: Some(Box::new(ToolExecutionFacts::empty())),
+            scope_id: None,
+        })
+        .await
+        .unwrap();
+    {
+        let state = engine.state.lock().await;
+        assert!(
+            state
+                .tool_hot
+                .iter()
+                .any(|entry| entry.entity == "src/Fallback.rs"),
+            "empty typed facts must fall back to stamped metadata"
+        );
+    }
+}
+
+#[tokio::test]
 async fn ingest_links_items_sharing_entities() {
     let engine = SimpleContextEngine::new(SimpleContextConfig::default());
     engine
@@ -147,6 +264,7 @@ async fn ingest_links_items_sharing_entities() {
         .unwrap();
     engine
         .ingest(ContextIngress::ToolObservation {
+            facts: None,
             output: ToolOutput {
                 call_id: "1".into(),
                 tool_name: "shell.exec".into(),
@@ -537,6 +655,7 @@ async fn pinned_dependency_cannot_break_the_expansion_budget() {
         .unwrap();
     engine
         .ingest(ContextIngress::ToolObservation {
+            facts: None,
             output: ToolOutput {
                 call_id: "1".into(),
                 tool_name: "shell.exec".into(),
@@ -784,6 +903,7 @@ async fn shell_stdout_does_not_heat_entities() {
         .unwrap();
     engine
         .ingest(ContextIngress::ToolObservation {
+            facts: None,
             output: ToolOutput {
                 call_id: "1".into(),
                 tool_name: "shell.exec".into(),
@@ -827,6 +947,7 @@ async fn stamped_shell_path_does_not_supersede_prior_shell_observation() {
     for (id, body) in [("1", "first shell log"), ("2", "second shell log")] {
         engine
             .ingest(ContextIngress::ToolObservation {
+                facts: None,
                 output: ToolOutput {
                     call_id: id.into(),
                     tool_name: "shell.exec".into(),
@@ -870,6 +991,7 @@ async fn patch_files_array_stamps_all_paths_into_identity() {
         .unwrap();
     engine
         .ingest(ContextIngress::ToolObservation {
+            facts: None,
             output: ToolOutput {
                 call_id: "patch-1".into(),
                 tool_name: "edit.patch".into(),
@@ -945,6 +1067,7 @@ async fn fs_read_reread_classes_and_selected_attribution() {
         .unwrap();
     engine
         .ingest(ContextIngress::ToolObservation {
+            facts: None,
             output: fs_read("1", "src/a.rs"),
             scope_id: None,
         })
@@ -957,6 +1080,7 @@ async fn fs_read_reread_classes_and_selected_attribution() {
     }
     engine
         .ingest(ContextIngress::ToolObservation {
+            facts: None,
             output: fs_read("2", "src/a.rs"),
             scope_id: None,
         })
@@ -986,6 +1110,7 @@ async fn fs_read_reread_classes_and_selected_attribution() {
     );
     engine
         .ingest(ContextIngress::ToolObservation {
+            facts: None,
             output: fs_read("3", "src/a.rs"),
             scope_id: None,
         })
@@ -1014,6 +1139,7 @@ async fn fs_read_of_a_descriptorized_body_is_selected_descriptor() {
     first_read.metadata["revision"] = serde_json::json!("rev");
     engine
         .ingest(ContextIngress::ToolObservation {
+            facts: None,
             output: first_read,
             scope_id: None,
         })
@@ -1033,6 +1159,7 @@ async fn fs_read_of_a_descriptorized_body_is_selected_descriptor() {
         .unwrap();
     engine
         .ingest(ContextIngress::ToolObservation {
+            facts: None,
             output: fs_read("2", "src/a.rs"),
             scope_id: None,
         })
@@ -1060,6 +1187,7 @@ async fn fs_read_reread_warm_and_stored() {
         .unwrap();
     engine
         .ingest(ContextIngress::ToolObservation {
+            facts: None,
             output: fs_read("1", "src/warm.rs"),
             scope_id: None,
         })
@@ -1080,6 +1208,7 @@ async fn fs_read_reread_warm_and_stored() {
     }
     engine
         .ingest(ContextIngress::ToolObservation {
+            facts: None,
             output: fs_read("2", "src/warm.rs"),
             scope_id: None,
         })
@@ -1092,6 +1221,7 @@ async fn fs_read_reread_warm_and_stored() {
 
     engine
         .ingest(ContextIngress::ToolObservation {
+            facts: None,
             output: fs_read("3", "src/stored.rs"),
             scope_id: None,
         })
@@ -1126,6 +1256,7 @@ async fn fs_read_reread_warm_and_stored() {
     }
     engine
         .ingest(ContextIngress::ToolObservation {
+            facts: None,
             output: fs_read("4", "src/stored.rs"),
             scope_id: None,
         })
@@ -1151,6 +1282,7 @@ async fn recent_file_bodies_cap_and_one_round_lease() {
         .unwrap();
     engine
         .ingest(ContextIngress::ToolObservation {
+            facts: None,
             output: fs_read("1", "src/old.rs"),
             scope_id: None,
         })
@@ -1158,6 +1290,7 @@ async fn recent_file_bodies_cap_and_one_round_lease() {
         .unwrap();
     engine
         .ingest(ContextIngress::ToolObservation {
+            facts: None,
             output: fs_read("2", "src/new.rs"),
             scope_id: None,
         })

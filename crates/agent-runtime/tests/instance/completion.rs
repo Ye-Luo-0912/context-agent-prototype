@@ -43,6 +43,7 @@ async fn context_manage_admit_routes_end_to_end() {
     for (index, ch) in ["x", "y"].iter().enumerate() {
         context
             .ingest(ContextIngress::ToolObservation {
+                facts: None,
                 output: ToolOutput {
                     call_id: format!("step-{index}"),
                     tool_name: "shell.exec".into(),

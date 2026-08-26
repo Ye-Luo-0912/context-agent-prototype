@@ -48,6 +48,7 @@ async fn successful_observation_is_ephemeral_but_failure_persists_until_verified
     // Round 1: failure — persists (Working) so a later fix can be verified.
     engine
         .ingest(ContextIngress::ToolObservation {
+            facts: None,
             output: ToolOutput {
                 call_id: "1".into(),
                 tool_name: "shell.exec".into(),
@@ -78,6 +79,7 @@ async fn successful_observation_is_ephemeral_but_failure_persists_until_verified
     // Round 2: success on the same entity verifies the fix.
     engine
         .ingest(ContextIngress::ToolObservation {
+            facts: None,
             output: ToolOutput {
                 call_id: "2".into(),
                 tool_name: "shell.exec".into(),
@@ -172,6 +174,7 @@ async fn maintenance_records_transitions_with_reasons() {
         .unwrap();
     engine
         .ingest(ContextIngress::ToolObservation {
+            facts: None,
             output: ToolOutput {
                 call_id: "1".into(),
                 tool_name: "shell.exec".into(),
@@ -671,6 +674,7 @@ async fn recurring_failure_supersedes_prior_error() {
     for round in 1..=3 {
         engine
             .ingest(ContextIngress::ToolObservation {
+                facts: None,
                 output: ToolOutput {
                     call_id: format!("r{round}"),
                     tool_name: "shell.exec".into(),

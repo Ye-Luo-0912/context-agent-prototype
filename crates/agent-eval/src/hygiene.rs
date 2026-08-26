@@ -144,6 +144,7 @@ async fn run_reactivation_scenario(
         .await?;
     engine
         .ingest(ContextIngress::ToolObservation {
+            facts: None,
             output: ToolOutput {
                 call_id: "hygiene-obs-1".into(),
                 tool_name: "fs.read".into(),
@@ -278,6 +279,7 @@ async fn ingest_fs_read(
 ) -> anyhow::Result<()> {
     engine
         .ingest(ContextIngress::ToolObservation {
+            facts: None,
             output: ToolOutput {
                 call_id: call_id.into(),
                 tool_name: "fs.read".into(),

@@ -91,6 +91,7 @@ pub async fn run_retrieval_baseline() -> anyhow::Result<RetrievalReport> {
     for (index, needle) in needles.iter().enumerate() {
         engine
             .ingest(ContextIngress::ToolObservation {
+                facts: None,
                 output: ToolOutput {
                     call_id: format!("obs-{index}"),
                     tool_name: "shell.exec".into(),
@@ -247,6 +248,7 @@ pub async fn run_retrieval_complex_baseline() -> anyhow::Result<String> {
     for (index, path) in identity_paths.iter().enumerate() {
         engine
             .ingest(ContextIngress::ToolObservation {
+                facts: None,
                 output: ToolOutput {
                     call_id: format!("cobs-{index}"),
                     tool_name: "shell.exec".into(),

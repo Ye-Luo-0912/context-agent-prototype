@@ -859,10 +859,27 @@ impl ContextEngine for SimpleContextEngine {
                     );
                     dependency::push_linked(&mut state, &self.config, item);
                 }
-                ContextIngress::ToolObservation { output, scope_id } => {
+                ContextIngress::ToolObservation {
+                    output,
+                    scope_id,
+                    facts,
+                } => {
                     state.tool_round += 1;
-                    let heats = output.heats_working_set();
-                    let touches = output.resource_touches();
+                    // Typed facts captured on the dispatcher lane are
+                    // authoritative; producers without channel-captured
+                    // touches fall back to the legacy metadata derivation,
+                    // which yields identical values for every producer class
+                    // today.
+                    let facts = facts
+                        .as_deref()
+                        .filter(|f| !f.resource_touches().is_empty());
+                    let (heats, touches) = match facts {
+                        Some(facts) => (
+                            facts.heats_working_set(output.ok),
+                            facts.resource_touches().to_vec(),
+                        ),
+                        None => (output.heats_working_set(), output.resource_touches()),
+                    };
                     let file_path = touches.first().map(|touch| touch.path.clone());
                     let file_revision = touches.first().and_then(|touch| touch.revision.clone());
                     if output.tool_name == "fs.read"

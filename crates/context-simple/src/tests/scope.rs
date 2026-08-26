@@ -150,6 +150,7 @@ async fn tool_scope_lifecycle_is_runtime_driven() {
     // happens after the frame's execution.
     engine
         .ingest(ContextIngress::ToolObservation {
+            facts: None,
             output: ToolOutput {
                 call_id: "1".into(),
                 tool_name: "shell.exec".into(),
@@ -420,6 +421,7 @@ async fn checkpoint_preserves_scope_tree() {
         .unwrap();
     engine
         .ingest(ContextIngress::ToolObservation {
+            facts: None,
             output: ToolOutput {
                 call_id: "1".into(),
                 tool_name: "shell.exec".into(),
@@ -626,6 +628,7 @@ async fn task_close_promotes_archived_durable_outcomes_and_resyncs_scope_id() {
     // A working observation in the same task: ephemeral, must not promote.
     engine
         .ingest(ContextIngress::ToolObservation {
+            facts: None,
             output: ToolOutput {
                 call_id: "1".into(),
                 tool_name: "shell.exec".into(),
@@ -744,6 +747,7 @@ async fn closed_tool_scopes_are_not_candidates_but_hot_entities_still_reach_them
     let tool_scope = engine.open_scope(ScopeKind::Tool, None).await.unwrap();
     engine
         .ingest(ContextIngress::ToolObservation {
+            facts: None,
             output: ToolOutput {
                 call_id: "1".into(),
                 tool_name: "shell.exec".into(),

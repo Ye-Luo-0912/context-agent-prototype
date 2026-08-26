@@ -66,6 +66,7 @@ mod tests {
         for round in 0..rounds {
             engine
                 .ingest(ContextIngress::ToolObservation {
+                    facts: None,
                     output: tool_output(true, &format!("tool round {round} output")),
                     scope_id: None,
                 })

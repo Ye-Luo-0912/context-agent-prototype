@@ -87,6 +87,7 @@ mod tests {
             .unwrap();
         engine
             .ingest(ContextIngress::ToolObservation {
+                facts: None,
                 output: ToolOutput {
                     call_id: "1".into(),
                     tool_name: "shell.exec".into(),

@@ -580,17 +580,25 @@ re-deriving from producer metadata. The turn frame carries the same facts
 on every tool-result step (`Option<Box<_>>`, serde-defaulted so old
 checkpoints restore as `None`), and the prompt's fs.read body-identity
 hints read them with a legacy-metadata fallback exactly for `None` frames.
+Heating landed 2026-08-26 as consumer-side adoption only — trusted
+handlers still stamp metadata keys, so no model-visible output shape
+changed: `ContextIngress::ToolObservation` carries `facts`
+(`Option<Box<ToolExecutionFacts>>`, serde-defaulted so old service frames
+restore as `None`); the actor forwards the turn-frame step facts at its
+single observation-ingest site with zero extra dispatcher calls, and the
+context engine reads heating/observation identity facts-first with a
+per-value legacy-metadata fallback for frames without captured touches.
 Still open before
-Self-Iteration: switch context heating and Verification's representation
-to the typed facts, move fact construction into individual trusted
-handlers, and define the durable wire form. Sequencing note: heating is
-the one consumer whose carrier crosses a process boundary
-(`ContextIngress` feeds the context-service wire contract and ~77
-construction sites), so its migration should land together with
-handler-level direct construction — once trusted handlers stop stamping
+Self-Iteration: switch Verification's representation to the typed facts,
+move fact construction into individual trusted handlers, and define the
+event-level durable wire form. Sequencing note: once trusted handlers
+stop stamping
 metadata keys entirely, the legacy derivation returns empty by
-construction and the ingest switch becomes removal of dead code instead
-of a dual-path migration. Verification needs no behavioral change: the
+construction and every ingest/prompt fallback becomes removal of dead
+code instead of a dual-path migration; removing the stamps changes
+model-visible tool output shapes (pinned/convergence behavior could
+shift), so consumer-side adoption deliberately keeps them for now.
+Verification needs no behavioral change: the
 production observation path already draws verifier authority from the
 trusted pre-dispatch attribution channel; only its representation differs.
 
