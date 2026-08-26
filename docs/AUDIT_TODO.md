@@ -482,6 +482,23 @@ shapes. The diagnostic has saturated: further same-day retries against
 this serving add no information, and the item now waits for a materially
 different provider or model serving rather than another attempt.
 
+That materially different serving ran the same day: one clean-tree gate on
+the local OpenCode relay (`ox-alpha-free`, availability precondition green,
+`tool-surface-edit-v3-clean-tree-2026-08-26-ox-r1/`) scored strict 11/12,
+gate 6/12, non-conflict-first 8/9. The strict miss and one cell's transport
+death were a relay stream decode failure after two rounds; every completed
+cell applied byte-perfect patches, and the model showed perfect hunk
+discipline — no non-exact first attempt and no wrong-revision selection in
+any window. Its behavioral failures are narrower than Luna's but heavier:
+all five are the same forbidden post-edit confirmation read (5 of 11
+completed cells). Cross-model summary after six runs: applied-patch
+correctness is an engine property proven twice over; first-attempt flow
+discipline is a model property whose binding violation for both servings
+is the post-edit confirmation read. Neither serving meets the bar.
+Remaining closure paths are a serving that follows the flow contract, or
+an explicit product decision to re-scope the no-confirm rule — the latter
+would be a contract change to this gate, not a defect fix.
+
 ## Open P1 — runtime scheduling correctness
 
 Design + invariants: [`EXECUTION_COHERENCE.md`](EXECUTION_COHERENCE.md)

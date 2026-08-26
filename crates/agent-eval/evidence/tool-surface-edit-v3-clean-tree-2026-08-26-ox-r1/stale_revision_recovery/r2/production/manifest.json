@@ -1,0 +1,16 @@
+{
+  "schema": "agent-eval.cell.v1",
+  "fixture_id": "stale_revision_recovery",
+  "engine": "production",
+  "repeat": 2,
+  "repeats": 3,
+  "live": true,
+  "tool_surface": "production",
+  "fixture_sha256": "a1aa1cb7d173955a87890c2554d757c8356ed78dd68c4966f50179c56eb12d9d",
+  "git_head": "07de14ce871ac2b402841cc5d0b8336c353106f7",
+  "git_dirty": false,
+  "git_dirty_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+  "source_tree_digest": "8c4ca7aa83d733d10d6d9db8e1c4e87249e854895a28f2b9d181007f94d0f9d0",
+  "openai_model": "ox-alpha-free",
+  "openai_base_url": "http://127.0.0.1:8787/v1"
+}

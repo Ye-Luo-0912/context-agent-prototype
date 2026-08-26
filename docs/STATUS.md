@@ -681,7 +681,14 @@ reads the stale-recovery contract forbids, a stale-revision first attempt,
 or one non-exact first-hunk set, each recovered). The diagnostic has
 saturated across five windows; the bar stays 12/12 strict, 12/12 gate,
 9/9 non-conflict-first on one clean tree, and the item waits for a
-materially different provider or model serving.
+materially different provider or model serving. A sixth cross-model run
+the same day on the local OpenCode relay (`ox-alpha-free`, availability
+precondition green) scored strict 11/12 (one relay transport death),
+gate 6/12, non-conflict-first 8/9: perfect hunk discipline in every
+completed cell, with all five behavioral failures being the same
+forbidden post-edit confirmation read — now the binding violation for
+both servings. Applied-patch correctness is proven as an engine property;
+first-attempt flow discipline is the open model property.
 Deterministic external-race, crash, journal-fault and — since 2026-08-26 —
 disk-full coverage are landed: the feature-gated `test-faults` storage seam
 injects storage-full refusals at the authority intent, the staged temp bytes

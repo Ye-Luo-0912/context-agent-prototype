@@ -1,0 +1,16 @@
+{
+  "schema": "agent-eval.cell.v1",
+  "fixture_id": "mixed_eol",
+  "engine": "production",
+  "repeat": 3,
+  "repeats": 3,
+  "live": true,
+  "tool_surface": "production",
+  "fixture_sha256": "e6c6c3864330fb36a6bd151ace532aae7da81fe70b948fe6183d7cc5260875c1",
+  "git_head": "07de14ce871ac2b402841cc5d0b8336c353106f7",
+  "git_dirty": false,
+  "git_dirty_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+  "source_tree_digest": "8c4ca7aa83d733d10d6d9db8e1c4e87249e854895a28f2b9d181007f94d0f9d0",
+  "openai_model": "ox-alpha-free",
+  "openai_base_url": "http://127.0.0.1:8787/v1"
+}
