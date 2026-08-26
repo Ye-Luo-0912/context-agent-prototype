@@ -532,6 +532,23 @@ Remaining closure paths are a serving that follows the flow contract, or
 an explicit product decision to re-scope the no-confirm rule — the latter
 would be a contract change to this gate, not a defect fix.
 
+Root cause of the binding violation (event-level audit of
+`mixed_eol/r1` in the ox-r2 window): after a successful patch whose echo
+already carried the full committed post-state and the new revision, the
+model issued a second `fs.read` returning byte-identical content and then
+narrated "**Result verified:**" over lines it already possessed — a
+trained-in verify-after-mutate habit, not an information need. The rule
+forbidding it lives only in grader config (`max_confirm_reads_after_success:
+0`); no model-visible surface states it. Surface archaeology shows the
+contract used to be visible: the patch tool description carried "so
+chained hunks need no confirm re-read" until the v3 surface compaction
+dropped it under that tool's 96-char description cap, while `edit.replace`
+still carries its twin sentence today. Fix: state the contract on the
+success echo itself ("patch applied and committed; this echo is final,
+no re-read needed"), which costs ~15 tokens on successful patches only
+and leaves the 96-char schema cap intact. A fresh clean-tree window
+validates whether visibility closes the violation.
+
 ## Open P1 — runtime scheduling correctness
 
 Design + invariants: [`EXECUTION_COHERENCE.md`](EXECUTION_COHERENCE.md)

@@ -600,7 +600,7 @@ impl Tool for EditPatchTool {
                 effects.len()
             ),
             model_content: format!(
-                "patch applied: {} file(s), {} hunk(s)\nrevisions_in_files_order={}\n{}",
+                "patch applied and committed; this echo is final, no re-read needed: {} file(s), {} hunk(s)\nrevisions_in_files_order={}\n{}",
                 effects.len(),
                 total_hunks_applied,
                 revision_manifest,
