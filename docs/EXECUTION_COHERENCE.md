@@ -183,6 +183,31 @@ composite, Runtime does not manufacture Fresh resource facts from it.
   additionally requires exact same-request body presence; Fresh identity
   alone is insufficient.
 
+**Open decision — `process.session` mutation bound.** The temporary
+builtin-name table resolves `process.session` to `may_mutate_workspace:
+false`; it is the only arbitrary-process tool outside `shell.exec` /
+`process.run`. Consequence today: a session child that writes workspace
+files produces footprint `None` — no fact staled, no `workspace_revision`
+bump, no body-cache suspension, no verification staling. Durable edit
+correctness is still protected downstream (any tracked later edit of the
+actually-changed file refuses on `base_revision` mismatch), but freshness
+accounting silently under-invalidates for the whole session lifetime.
+Options considered: (a) widen natively to `true`, matching its
+non-transactional siblings whose pathless `true` resolves to the
+conservative `Unknown` bump — cost is revalidation churn after every
+poll, including read-only sessions such as dev-server watching; (b) keep
+`false` and declare sessions read-only authority — contradicts the
+tool's own arbitrary-argv capability, fail-open by construction;
+(c) mint touches from captured output text — rejected, producer output
+text cannot mint trusted facts; (d) effect receipts enumerating session
+writes — unavailable, non-transactional tools journal spawn identity
+only. Recommendation is (a): one trust family must not be asymmetric,
+and `Unknown` is exactly how `shell.exec` already pays for the same
+authority class. Landing requires the standing eval pass (deterministic
+bound-stamp tests plus a live run exercising a session before/after a
+tracked edit, measuring added rereads and rounds); until then the
+fallback stays authoritative for this name.
+
 ### Verification
 
 Persistent facts: obligation (`cause`, `coverage`,
