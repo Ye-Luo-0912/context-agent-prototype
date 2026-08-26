@@ -1,4 +1,4 @@
-//! The composition seam (MOD-04A): the concrete implementations one run
+//! The composition seam: the concrete implementations one run
 //! needs, resolved from the module host's typed registry or built directly
 //! in tests. A composition root constructs one `RuntimeServices` and hands
 //! it to the runtime; the runtime uses it for *all* scheduling — context
@@ -247,7 +247,7 @@ impl RuntimeServices {
     }
 
     /// The tool dispatcher lane, for typed execution facts at settlement
-    /// time (CAP-OBS-01). Dispatch itself stays behind the Core port.
+    /// time. Dispatch itself stays behind the Core port.
     pub(crate) fn tools(&self) -> Arc<dyn ToolDispatcher> {
         self.tools.clone()
     }

@@ -1,4 +1,4 @@
-//! EVAL-01.2 / EVAL-01.3 / EVAL-01.3b / EVAL-01.3c：正式门禁的预注册分析。
+//! EVAL-01.2 / EVAL-01.3 / EVAL-01.3b / 正式门禁的预注册分析。
 //!
 //! EVAL-01.2 冻结估计量、聚类、单侧区间、ITT 规则，以及历史 30×3 功效表。
 //! EVAL-01.3 在收集接受细胞之前，用同一模型重冻 n/repeats：300 题 × 3 次重复。
@@ -26,7 +26,7 @@ pub const MARGIN: f64 = -0.05;
 /// 历史提案（EVAL-01.2 功效表）。功效不足，不得用来收接受细胞。
 pub const HISTORICAL_TASKS: usize = 30;
 pub const HISTORICAL_REPEATS: u32 = 3;
-/// EVAL-01.3：保守模型下 P(pass|Δ=0)≥0.80 的最小整齐三分层 r=3 设计。
+/// 保守模型下 P(pass|Δ=0)≥0.80 的最小整齐三分层 r=3 设计。
 /// 290×3 只有 4003/5000（刀口），300×3 才锁成门禁 n。
 pub const MIN_TASKS: usize = 300;
 pub const GATE_REPEATS: u32 = 3;
@@ -956,7 +956,7 @@ fn simulate_gate(rng: &mut SplitMix64, n_tasks: usize, repeats: u32, delta: f64)
         .unwrap_or(false)
 }
 
-/// 三分层：易 0.90 / 中 0.70 / 难 0.40。n=30 时仍是 10/10/10，与 EVAL-01.2 表一致。
+/// 三分层：易 0.90 / 中 0.70 / 难 0.40。n=30 时仍是 10/10/10，与表一致。
 fn strata_p(task: usize, n_tasks: usize) -> f64 {
     let third = n_tasks / 3;
     if task < third {

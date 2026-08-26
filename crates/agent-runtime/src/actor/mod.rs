@@ -229,10 +229,10 @@ struct ActiveTurn {
     /// identities is refused without dispatch. Turn-scoped on purpose:
     /// a new user directive may legitimately ask for the same edit.
     edit_attempts: Vec<EditAttemptFact>,
-    /// CONV-02：本轮的程序解析失败记录（可证等价重试域）。同轮内
+    /// 本轮的程序解析失败记录（可证等价重试域）。同轮内
     /// 同参数重试在版本未推进时被无派发拒绝。
     launch_failures: Vec<LaunchResolutionFact>,
-    /// PROTO-EVID-01：本轮协议正文缓存。只在组装下一轮请求时按严格
+    /// 本轮协议正文缓存。只在组装下一轮请求时按严格
     /// 条件回注；不进 Context、不被 admit、不落盘。
     protocol_bodies: crate::execution::body_cache::ProtocolBodyCache,
     /// Captured once per BeforeModel after revalidate. Prompt, ContextHints,
@@ -369,7 +369,7 @@ impl TurnActionBatch {
             self.failed = self.failed.saturating_add(1);
         }
 
-        // CAP-OBS-01: the ledger consumes typed facts from the dispatcher
+        // the ledger consumes typed facts from the dispatcher
         // lane. For untrusted producers the facts are empty and the
         // mutation bound falls back exactly like the legacy accessor; for
         // the trusted builtin host the stamps arrive pre-translated.
@@ -427,7 +427,7 @@ struct EditAttemptFact {
     failure_class: agent_contracts::ToolFailureClass,
 }
 
-/// CONV-02：一次程序解析失败的可证等价记录。参数摘要覆盖 argv0/cwd/env
+/// 一次程序解析失败的可证等价记录。参数摘要覆盖 argv0/cwd/env
 /// 覆盖项；世界版本未推进 ⇒ 解析输入未变 ⇒ 同参数重试可证等价，可
 /// 硬拒绝。残余假设：运行外环境（如 PATH）变化不在观察模型内，由
 /// 收敛债务软性兜底；不做按名字的 K-strikes 硬封禁——listing 有界、
@@ -589,7 +589,7 @@ impl ActiveTurn {
         self.launch_failures.drain(0..excess);
     }
 
-    /// PROTO-EVID-02a：把成功观察到的正文记入当轮缓存。唯一正文来源
+    /// 把成功观察到的正文记入当轮缓存。唯一正文来源
     /// 是 fs.read——edit 的 model_content 是 patch echo 不是完整文件，
     /// 不得冒充 exact body。失效规则：任何 Known mutation 使被触 path
     /// 失效；Unknown mutation 全部作废。
@@ -600,7 +600,7 @@ impl ActiveTurn {
         let touches = output.resource_touches();
         match output.mutation_footprint() {
             agent_contracts::MutationFootprint::Unknown => {
-                // PROTO-EVID-03：Unknown 只挂起不删除——字节保留、资格
+                // Unknown 只挂起不删除——字节保留、资格
                 // 冻结；BeforeModel 重验证同身份后可再次回注。
                 self.protocol_bodies.suspend_all();
             }
@@ -775,7 +775,7 @@ mod edit_attempt_tests {
         assert!(turn.edit_attempts.is_empty());
     }
 
-    // ---- CONV-02：程序解析重试域（可证等价才硬拒绝）----
+    // ---- 程序解析重试域（可证等价才硬拒绝）----
 
     fn launch_failure(argv0: &str, class: ToolFailureClass) -> ToolOutput {
         ToolOutput {
@@ -1033,7 +1033,7 @@ struct ActorState {
     /// CompletionRecord so the complete raw output is reachable even when
     /// the model's self-declared artifact list omits it.
     last_assistant_artifact: Option<AssistantArtifactEvidence>,
-    /// CTX-DISC-03: per-user-turn discovery search caps. Reset in `start_turn`.
+    /// Per-user-turn discovery search caps. Reset in `start_turn`.
     discovery_budget: DiscoveryTurnBudget,
     /// 周转中最多一条待处理对话（CTX-EVENT-02）。进程内有效，不进 checkpoint。
     pending_user_input: Option<QueuedUserDialogue>,

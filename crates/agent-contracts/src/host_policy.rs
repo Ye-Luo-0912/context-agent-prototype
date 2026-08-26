@@ -101,7 +101,7 @@ pub trait HostToolPolicies: Send + Sync {
     }
 }
 
-/// 版本化策略快照（M12 P0）：一次解析拿到的不可变表项集合 + 单调
+/// 版本化策略快照：一次解析拿到的不可变表项集合 + 单调
 /// revision + 内容摘要。消费方持有 [`std::sync::Arc`] 并绑定 revision；
 /// 注册表安装新准入后 revision 前进，旧租约/旧准入凭据可据此检测失配。
 /// digest 是 FNV-1a 完整性标记（排序后的 JCS 规范字节），不是安全哈希。

@@ -1,8 +1,8 @@
-//! A/B/C/D evaluation fixtures (TOOLS-04 remainder, M15 input).
+//! A/B/C/D evaluation fixtures.
 //!
 //! The four tool-surface arms the evaluation plan compares, plus the coding
 //! workload fixtures each arm must solve. The fixtures are the *data*
-//! half of M15: deterministic seed workspaces, model-visible task
+//! half of  deterministic seed workspaces, model-visible task
 //! descriptions (plus optional extra live turns), and hidden verification
 //! hidden verification (pure file-content assertions, so they run identically
 //! on every platform without an interpreter and without executing student
@@ -638,7 +638,7 @@ pub fn fixture_role(id: &str) -> &'static str {
     }
 }
 
-/// Human-readable listing of the M15 evaluation inputs: the four arms and
+/// Human-readable listing of the evaluation inputs: the four arms and
 /// the coding fixtures, used by `agent-eval --fixtures`.
 pub fn render_fixtures() -> String {
     let mut out = String::new();

@@ -159,7 +159,7 @@ pub struct ExecutionState {
     /// 最近一次观察的模型轮号，Turn 有效性的判定基准。
     #[serde(default)]
     pub last_turn: u64,
-    /// CONV-03 义务账本：只能由 typed 失效事实产生；无关推进不清除，
+    /// 义务账本：只能由 typed 失效事实产生；无关推进不清除，
     /// 仅前置变化或同类成功解除。
     #[serde(default)]
     pub obligations: Vec<ExecutionObligation>,
@@ -179,7 +179,7 @@ pub struct ExecutionState {
     pub last_offered_opportunity: Option<String>,
 }
 
-/// 一条已证明存在的执行 blocker（CONV-03 lineage 模型）。
+/// 一条已证明存在的执行 blocker（lineage 模型）。
 /// `scope_key` 是稳定 lineage 身份（ExecutableResolution = 解析上下文
 /// digest：cwd + effective PATH + 规则版本；EditTarget/ResourcePath =
 /// 路径；ProjectMarker = 目标身份），跨 epoch 不变。`precondition` 是
@@ -1040,7 +1040,7 @@ impl ExecutionState {
     /// observation can repair currentness without laundering itself into
     /// new evidence. Prompt projection still hides every non-current row.
     pub(super) fn invalidate_stale_evidence(&mut self) -> u64 {
-        // EXEC-EVID-01a：失效与投影共用同一个 currentness 谓词；
+        // 失效与投影共用同一个 currentness 谓词；
         // 先物化事实表快照，避免借用冲突。
         let revision = self.workspace_revision;
         let last_turn = self.last_turn;
@@ -1226,7 +1226,7 @@ impl ExecutionState {
         });
     }
 
-    /// CONV-03 lineage：由 typed 失效事实登记/累计义务。同 scope 的
+    /// lineage：由 typed 失效事实登记/累计义务。同 scope 的
     /// 行是同一个 blocker 的同一血统——同指纹累计 epoch 内尝试，异
     /// 指纹推进 epoch（PreconditionChanged ≠ Resolved）；不同 scope
     /// 是不同 blocker，互不取代。只有失败输出才开义务。
@@ -1352,7 +1352,7 @@ impl ExecutionState {
         }
     }
 
-    /// CONV-03：义务只被 blocker 特定的证明解除——ExecutableResolution
+    /// 义务只被 blocker 特定的证明解除——ExecutableResolution
     /// 要求同 scope 且同前置指纹的成功（"同类成功"太宽：rustc 编译成功
     /// 不能证明 tests.exe 的解析 blocker 已解决）；世界推进只把 epoch
     /// 推进一格（PreconditionChanged ≠ Resolved）。EditTarget 以新
@@ -1783,7 +1783,7 @@ pub(crate) fn validate_execution_state(state: &ExecutionState) -> Result<(), Str
     {
         return Err("resume list exceeds its cap".into());
     }
-    // EXEC-EVID-01b：restore 契约不得假定 checkpoint 由当前 Runtime
+    // restore 契约不得假定 checkpoint 由当前 Runtime
     // 生成且未损坏——新增字段同样受界。
     if state.evidence.len() > MAX_EVIDENCE_ROWS
         || state.convergence.recent_deltas.len() > MAX_RECENT_DELTAS

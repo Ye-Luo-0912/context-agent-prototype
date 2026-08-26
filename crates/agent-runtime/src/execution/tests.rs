@@ -1152,7 +1152,7 @@ fn repeated_identical_verification_pass_is_redundant_not_progress() {
     );
 }
 
-// ---- CONV-03 Obligation Ledger + EXEC-EVID-01（第二轮评审）----
+// ---- Obligation ledger + execution evidence（第二轮评审）----
 
 fn missing_program(argv0: &str, fingerprint: &str) -> ToolOutput {
     let mut out = pathless_command("process.run", false, argv0, "program not found");
@@ -1168,7 +1168,7 @@ fn missing_program(argv0: &str, fingerprint: &str) -> ToolOutput {
     out
 }
 
-/// 成功的命令运行同样携带解析身份（CONV-03 matched-success 的依据）。
+/// 成功的命令运行同样携带解析身份（matched-success 的依据）。
 fn resolved_command(argv0: &str, scope: &str, fingerprint: &str) -> ToolOutput {
     let mut out = pathless_command("process.run", true, argv0, "ran");
     out.metadata = json!({

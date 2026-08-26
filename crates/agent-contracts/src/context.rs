@@ -365,7 +365,7 @@ pub enum SemanticState {
     Tombstoned,
 }
 
-/// 分级检索访问信号（`CTX-GC-11`）。
+/// 分级检索访问信号。
 ///
 /// search 是最弱的在线相关性证据；inspect/fetch 是更强的故意读取；
 /// `admit` 是显式驻留动作；consumption ack 是最强的在线信号。弱信号
@@ -1133,7 +1133,7 @@ pub struct TaskProgressView {
     /// key + 结果 + world 版本，不含任何工具正文。
     #[serde(default)]
     pub operational_evidence: Vec<String>,
-    /// CONV-03：未解析执行 blocker 的有界警告行（≤2）。每行对应一个
+    /// 未解析执行 blocker 的有界警告行（≤2）。每行对应一个
     /// 由 typed 失效事实开出的义务；无关推进不清除它们。
     #[serde(default)]
     pub unresolved_blockers: Vec<String>,
@@ -1556,7 +1556,7 @@ pub struct ContextDiagnostics {
     pub gc_externalized_total: u64,
     #[serde(default)]
     pub gc_storage_deleted_total: u64,
-    /// Cumulative graded retrieval stamps this run (`CTX-GC-11` / M15).
+    /// Cumulative graded retrieval stamps this run.
     /// Search-hit is the weakest; consumption ack the strongest. These
     /// count applied stamps, not descriptor rows returned.
     #[serde(default)]
@@ -1789,7 +1789,7 @@ pub struct ContextGcReport {
     #[serde(default)]
     pub externalized: usize,
     /// Item ids externalized this pass. Bounded by `externalized`; used by
-    /// M15 found-after-forgotten accounting. Empty on pre-field reports.
+    /// Found-after-forgotten accounting. Empty on pre-field reports.
     #[serde(default)]
     pub externalized_ids: Vec<ContextItemId>,
     /// Warm -> Cold aging in the other direction: externalized entries that
@@ -1815,7 +1815,7 @@ pub struct ContextGcReport {
     #[serde(default)]
     pub store_blob_delete_errors: usize,
     /// Bytes written to the external context store this pass (full
-    /// externalization bodies). Store I/O accounting for the M15 baseline.
+    /// externalization bodies). Store I/O accounting for the baseline report.
     #[serde(default)]
     pub store_write_bytes: u64,
     /// Bytes read back from the external context store this pass (recall

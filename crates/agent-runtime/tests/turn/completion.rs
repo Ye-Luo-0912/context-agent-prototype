@@ -926,7 +926,7 @@ async fn focus_switch_clears_previous_tasks_raw_assistant_evidence() {
 
 // ---------------------------------------------------------------------------
 // One-shot and terminal-safety proofs for *accepted* completions,
-// independent of any long-flow baseline (CONV-04): the retained runs had
+// independent of any long-flow baseline: the retained runs had
 // zero completion calls, so these properties need their own deterministic
 // evidence through the real actor.
 // ---------------------------------------------------------------------------

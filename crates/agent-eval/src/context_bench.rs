@@ -1,4 +1,4 @@
-//! EVAL-02 Context Benchmark: the current M15 decision instrument.
+//! Context Benchmark: the current decision instrument (see docs/ROADMAP.md).
 //!
 //! Asks where the dynamic context runtime helps or hurts a coding agent.
 //! Independent of `agent-eval.analysis.v2` (300×3 ITT stays frozen and parked).

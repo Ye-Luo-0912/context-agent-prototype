@@ -1,5 +1,4 @@
-//! Trusted authority primitives inside the stateless kernel (MOD-04 first
-//! slice).
+//! Trusted authority primitives inside the stateless kernel.
 //!
 //! The four authority seams — events, approval, effects, output — each get
 //! one named home behind the existing `CoreAuthority` facade. This slice only
@@ -217,7 +216,7 @@ pub struct EffectAuthority;
 impl EffectAuthority {
     /// Roll a staged effect back because its operation turned stale or the
     /// turn aborted. The reason is surfaced through the effect's own
-    /// bookkeeping. Commit moved to the M12 broker barrier: dispatch runs
+    /// bookkeeping. Commit moved to the broker barrier: dispatch runs
     /// through `EffectBroker::dispatch`, never around it.
     pub async fn rollback(&self, effect: Box<dyn Effect>, reason: &str) -> AgentResult<()> {
         effect.rollback(reason).await

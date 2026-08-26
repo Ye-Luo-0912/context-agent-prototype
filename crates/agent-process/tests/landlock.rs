@@ -1,4 +1,4 @@
-//! End-to-end tests for the Linux landlock confinement (M13: OS-level
+//! End-to-end tests for the Linux landlock confinement (OS-level
 //! write filtering, TCP deny on ABI v4+, device-ioctl deny on ABI v5,
 //! signal scope on ABI v6).
 //!

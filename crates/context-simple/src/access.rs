@@ -1,4 +1,4 @@
-//! Graded retrieval access signals (`CTX-GC-11`).
+//! Graded retrieval access signals.
 //!
 //! Authority metadata stays on the body. This module is the single writer
 //! for retrieval stamps so search / inspect / fetch / ack cannot each
@@ -15,7 +15,7 @@ use crate::store::externally_retrievable;
 /// 每次 `context.search` 最多给 Cold 老化锚点一次机会的命中数。
 pub(crate) const SEARCH_REINFORCE_MAX_PER_CALL: usize = 8;
 /// 同一条目在更强信号出现前，search 最多刷新几次 `last_access_gc_epoch`。
-/// 1 = 保留 CTX-GC-10 的一次延迟，同时禁止 search 循环把条目钉死。
+/// 1 = 保留 的一次延迟，同时禁止 search 循环把条目钉死。
 pub(crate) const SEARCH_REINFORCE_SATURATION: u32 = 1;
 /// 同一检索指纹每个用户回合最多强化一次。limit 不参与指纹。
 pub(crate) const SEARCH_IDENTICAL_QUERY_BUDGET: u32 = 1;

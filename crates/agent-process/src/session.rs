@@ -5,8 +5,8 @@
 //! 出站在写之前被拒绝时连接仍同步，与 [`encode_frame`] 一致。
 //!
 //! [`DuplexTransport`] is the byte-duplex seam; [`StdioDuplexTransport`] is
-//! the inherited anonymous-pipe backend (PLAT-05). Named Pipe/UDS remain
-//! PLAT-08 and must implement the same trait, not a second codec.
+//! the inherited anonymous-pipe backend. Named Pipe/UDS remain
+//! future work and must implement the same trait, not a second codec.
 //!
 //! 与 `AuthenticatedOperationControlAdapter::handle_frame` 的组合是：
 //! 读一帧 → 把正文交给适配器 → 把返回的 JSON 正文 `send_bytes` 写回。
@@ -23,7 +23,7 @@ use crate::frame::{FrameError, FrameErrorKind, encode_frame, encode_frame_bytes,
 
 /// Bounded framed byte duplex used by [`crate::ProcessHost`].
 ///
-/// This is the PLAT-05 transport seam: protocol ping-pong talks to this
+/// This is the transport seam: protocol ping-pong talks to this
 /// trait, not to `ChildStdout`. [`FramedProtocolSession`] is the
 /// implementation; [`StdioDuplexTransport`] is the first backend.
 /// Local transport identity is never a Core grant.
@@ -47,7 +47,7 @@ pub struct FramedProtocolSession<R, W> {
 }
 
 /// Inherited anonymous-pipe backend of [`DuplexTransport`].
-/// Named Pipe/UDS remain PLAT-08.
+/// Named Pipe/UDS remain future work.
 pub type StdioDuplexTransport =
     FramedProtocolSession<BufReader<tokio::process::ChildStdout>, tokio::process::ChildStdin>;
 

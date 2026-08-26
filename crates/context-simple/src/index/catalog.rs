@@ -271,7 +271,7 @@ impl ContextCatalog {
     }
 
     /// Attention buckets are part of the lifecycle index. Graded access
-    /// (`CTX-GC-11`) writes signal strength onto the body, not into these
+    /// writes signal strength onto the body, not into these
     /// buckets; keep the method so the index is not a write-only field.
     #[allow(dead_code)]
     pub(crate) fn ids_for_attention(&self, attention: AttentionState) -> &[ContextItemId] {

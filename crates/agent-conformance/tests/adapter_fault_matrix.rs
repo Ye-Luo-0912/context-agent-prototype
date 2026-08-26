@@ -1,6 +1,6 @@
-//! PLAT-04 共享适配器故障矩阵。
+//! 共享适配器故障矩阵。
 //!
-//! 列是当前线协议，不是 Platform 信封（信封迁移在 PLAT-07）：
+//! 列是当前线协议，不是 Platform 信封：
 //! - process：`DuplexTransport`（双工直连 + `ProcessHost` 管道）+ 解析期 `JsonDecodeBudget`
 //! - context：`serve_session` + 进程内 `AppendOnlyEngine`
 //! - MCP：内存双工 `McpClient`

@@ -226,7 +226,7 @@ impl ExecutionState {
         let (speculative_negative, negative_transitions) =
             self.observe_negative_fact(output, argument_digest, turn, attribution);
         negative_fact_events.extend(negative_transitions);
-        // EXEC-EVID-01a：本轮可信事实已落表后再统一裁决证据现势性——
+        // 本轮可信事实已落表后再统一裁决证据现势性——
         // edit 的新 digest 必须当场杀死绑定旧 digest 的证据行，而不是
         // 等到下一轮。失效条数随事件上报。
         let invalidated = self.invalidate_stale_evidence();
@@ -242,7 +242,7 @@ impl ExecutionState {
         );
         self.cap();
         self.refresh_validity();
-        // Deterministic frontier classification (CONV-01): a verification
+        // Deterministic frontier classification: a verification
         // result is always typed evidence; otherwise footprint decides —
         // Known is provable world change, Unknown is only invalidation,
         // and read-only rounds split into evidence gain vs redundant

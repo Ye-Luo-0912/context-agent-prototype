@@ -64,7 +64,7 @@ pub fn try_build_core_port(
 /// `turn_id` and `operation_id` are carried for audit/recovery continuity.
 /// Core independently validates the current authority epoch, exact admitted
 /// operation identity and its issued lease. Effect-specific crash
-/// reconciliation remains PLAT-03 work.
+/// reconciliation remains platform-level work.
 pub struct EffectCommitRequest {
     pub run_id: RunId,
     pub turn_id: TurnId,
@@ -181,7 +181,7 @@ pub enum EffectCommitRejection {
     /// to a path the leased intent never approved. Authority widening at
     /// commit time — rollback, never commit.
     ActualExceedsApproved,
-    /// M12 barrier: the broker could not reserve the approved effect
+    /// Broker barrier: the broker could not reserve the approved effect
     /// before dispatch. Nothing was applied; the prepared effect is
     /// settled as NotApplied and the decision returns as a rejection.
     BrokerUnavailable,
@@ -192,7 +192,7 @@ pub enum EffectCommitRejection {
     BindingRevoked,
 }
 
-/// M12 reserved/dispatch/ack barrier — phase 1 input: the approved
+/// Reserved/dispatch/ack barrier — phase 1 input: the approved
 /// authority shape of one effect, registered with the broker BEFORE any
 /// mutation applies. Carries identities and the leased intent only;
 /// never argument bodies or effect internals.
@@ -789,7 +789,7 @@ impl CorePort for CoreAuthority {
                 }
                 return EffectCommitDisposition::Rejected(rejection);
             }
-            // M12 reserved/dispatch/ack barrier: reserve BEFORE anything
+            // Reserved/dispatch/ack barrier: reserve BEFORE anything
             // applies. A reservation failure fences dispatch — the effect
             // settles NotApplied and the commit returns rejected.
             let reservation = EffectReservation {

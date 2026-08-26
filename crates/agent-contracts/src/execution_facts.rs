@@ -1,4 +1,4 @@
-//! Typed host/runtime-trusted execution facts (`CAP-OBS-01` substrate).
+//! Typed host/runtime-trusted execution facts substrate.
 //!
 //! Producer-stamped `metadata` keys became de-facto authority: the runtime
 //! reads `path` / `revision` / `files[]` as resource facts, `verification`

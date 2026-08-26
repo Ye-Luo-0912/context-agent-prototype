@@ -122,7 +122,7 @@ impl PromptAssembler {
         .0
     }
 
-    /// 同 [`Self::assemble_with_catalog`]，同时返回 PROTO-EVID-02b 的
+    /// 同 [`Self::assemble_with_catalog`]，同时返回 的
     /// 本次组装账目（候选/回注行数与回注 token）。
     #[allow(clippy::too_many_arguments)]
     pub fn assemble_with_catalog_stats(
@@ -264,7 +264,7 @@ impl PromptAssembler {
     }
 }
 
-/// PROTO-EVID-02b：一次模型输入组装的正文缓存账目（增量，不是累计）。
+/// 一次模型输入组装的正文缓存账目（增量，不是累计）。
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct ProtocolBodyAssemblyStats {
     /// Exact fresh fs.read bodies actually removed by this checkpoint and
@@ -277,7 +277,7 @@ pub struct ProtocolBodyAssemblyStats {
     pub restored_body_tokens: u64,
 }
 
-/// PROTO-EVID-01 回注挑选：某行的正文只有同时满足
+/// 回注挑选：某行的正文只有同时满足
 /// (a) 完整帧里有它的非空读取结果、(b) 保留尾已不含该结果（checkpoint
 /// 截掉）、(c) TASK PROGRESS 的 Fresh 事实仍是同一 path@digest，才会
 /// 被回注。行本身来自有界当轮缓存。
@@ -702,7 +702,7 @@ fn format_task_progress(
         out.push_str(opportunity);
         out.push('\n');
     }
-    // 逐义务 blocker（CONV-03，≤2 行有界）：无关推进清不掉它们，
+    // 逐义务 blocker（≤2 行有界）：无关推进清不掉它们，
     // 与全局 advisory 的语义不同，必须分开可见。
     append_list(&mut out, "Unresolved blockers", blockers);
     append_list(&mut out, "Checked", checked);

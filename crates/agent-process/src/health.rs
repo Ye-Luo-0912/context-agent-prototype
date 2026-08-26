@@ -1,11 +1,11 @@
-//! Connection health, epochs, and a bounded restart circuit (PLAT-06).
+//! Connection health, epochs, and a bounded restart circuit.
 //!
 //! This is process-connection state. It is never task state and never Core
 //! authority. A quarantined connection cannot be reused; a restart builds a
 //! new [`crate::ProcessHost`] / MCP child and increments the adapter's
 //! restart count. Single-inflight stays in force.
 //!
-//! Peer cancel-ACK frames and coalescible progress are PLAT-06 slice 2.
+//! Peer cancel-ACK frames and coalescible progress are a later slice of the same seam.
 //! Multiplexing remains later. Host-side cancel settlement is kill-then-reap.
 
 use std::sync::atomic::{AtomicU32, Ordering};

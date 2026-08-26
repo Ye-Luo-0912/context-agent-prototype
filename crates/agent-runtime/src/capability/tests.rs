@@ -892,7 +892,7 @@ async fn effectful_capability_invoke_persists_remote_ack() {
     ));
 }
 
-/// CAP-OBS-01：伪造权威 metadata 的能力。输出声称读过/验证过
+/// 伪造权威 metadata 的能力。输出声称读过/验证过
 /// src/auth.rs 且不改动工作区——若这些键被信任，ResourceFact、
 /// Verification 与 mutation 上界就由 producer 任意决定。
 struct ForgingCapability {
@@ -1025,7 +1025,7 @@ impl ToolDispatcher for MarkedFactsBase {
     }
 }
 
-/// CAP-OBS-01 routing: loaded-capability results contribute no typed facts
+/// Facts-channel routing: loaded-capability results contribute no typed facts
 /// even when raw metadata carries stamps; everything else routes through to
 /// the trusted base host.
 #[tokio::test]

@@ -305,7 +305,7 @@ mod tests {
         );
     }
 
-    /// M12 P0：resolve_policy 返回版本化不可变快照；同一 revision 下
+    ///resolve_policy 返回版本化不可变快照；同一 revision 下
     /// 重复解析是同一 Arc，admission 换版后 revision 前进、digest 变化。
     #[test]
     fn resolve_policy_returns_versioned_snapshots() {

@@ -1,4 +1,4 @@
-//! Current-turn protocol body cache (PROTO-EVID-01).
+//! Current-turn protocol body cache.
 //!
 //! 目标群体：fs.read 正文已被 turn checkpoint 截掉、身份头还在、模型
 //! 只好原样重读的那批调用（实测 motive=protocol_checkpoint_body_missing）。
@@ -25,8 +25,8 @@ struct ProtocolBodyEntry {
     dormant: bool,
 }
 
-/// record 的结果：入账 / 超限拒收 / 空值忽略。超限计入 PROTO-EVID-02b
-/// 的 oversize 账目。
+/// record 的结果：入账 / 超限拒收 / 空值忽略。超限计入
+/// oversize 账目。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum BodyRecordOutcome {
     Stored,
@@ -34,7 +34,7 @@ pub(crate) enum BodyRecordOutcome {
     Empty,
 }
 
-/// 自上一条账目以来的增量计数（PROTO-EVID-02b）。actor 在每次模型输入
+/// 自上一条账目以来的增量计数。actor 在每次模型输入
 /// 组装后 drain 一次，以 `ProtocolBodyCacheStats` 事件出账，报告可以
 /// 从事件流独立验证命中率，而不是靠推断。
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -88,7 +88,7 @@ impl ProtocolBodyCache {
     }
 
     /// Unknown mutation：无法知道改了什么，全部条目休眠而非物理删除
-    /// （PROTO-EVID-03，Unknown ≠ False 的延伸）。之后 BeforeModel 的
+    /// （Unknown ≠ False 的延伸）。之后 BeforeModel 的
     /// 本地重验证若证明 path@digest 未变，条目恢复可回注；确实变了
     /// 则永远过不了身份门，由 LRU 自然淘汰。返回挂起条数。
     pub(crate) fn suspend_all(&mut self) -> usize {

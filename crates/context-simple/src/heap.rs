@@ -92,7 +92,7 @@ impl Ord for CatalogEntry {
 
 /// Keep only the `limit` summaries with the smallest `created_tick` while
 /// streaming, so memory stays O(limit) even when the external store is
-/// large (M14 resource policy: a model-driven catalog call must not cost
+/// large (resource policy: a model-driven catalog call must not cost
 /// proportional to logical history size). Equal ticks resolve by stream
 /// order (heap slots, then buffer order, then externalization order),
 /// matching a stable sort followed by truncate. `limit == 0` yields

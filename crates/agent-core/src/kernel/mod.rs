@@ -55,7 +55,7 @@ pub struct CoreAuthorityConfig {
     /// 同一来源交给审批门。缺省时一切意图按声明风险的空界限推导，
     /// 永远匹配不到授权。
     pub host_policies: Option<Arc<dyn agent_contracts::HostToolPolicies>>,
-    /// M12 reserved/dispatch/ack barrier for brokerable effects. `None`
+    /// Reserved/dispatch/ack barrier for brokerable effects. `None`
     /// installs the local broker, which preserves today's inline commit
     /// behavior exactly while structuring the three phases for a future
     /// HTTP/gRPC coordinator.
@@ -97,7 +97,7 @@ impl Default for CoreAuthorityConfig {
 /// effects, output) and the event plumbing. The execution *state machine*
 /// (turn frame, generation, what to commit) lives in the runtime actor —
 /// this type owns no turn state and no locks for it. The authorities are
-/// the MOD-04 seam: every event, approval verdict, effect commit/rollback
+/// the durability seam: every event, approval verdict, effect commit/rollback
 /// and bounded producer output passes through one named home, so a future
 /// Trusted Core can replace the seam without rewriting the facade or the
 /// actor.
@@ -105,7 +105,7 @@ pub(crate) struct CoreAuthority {
     run_id: RunId,
     /// Process-lifetime authority epoch. Runtime asks Core to advance this
     /// fence, but cannot choose or restore an older value. The recoverable
-    /// operation journal that persists it across process restarts is PLAT-03a3.
+    /// operation journal that persists it across process restarts is its own follow-up slice.
     authority_epoch: AtomicU64,
     /// Linearizes epoch changes with operation dispatch/commit admission.
     /// The guard is never held across an async tool/effect body.
@@ -459,7 +459,7 @@ impl CoreAuthority {
     }
 
     /// The broker seam: reserved/dispatch/ack barrier for brokerable
-    /// effects (M12). The local default preserves inline behavior.
+    /// effects. The local default preserves inline behavior.
     pub(crate) fn broker(&self) -> &Arc<dyn crate::port::EffectBroker> {
         &self.broker
     }

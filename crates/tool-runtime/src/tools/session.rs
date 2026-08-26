@@ -1,6 +1,6 @@
 //! `process.session` — long-running process sessions (start/poll/stop).
 //!
-//! The TOOLS-06 session protocol: `start` launches an argv process and
+//! The session protocol: `start` launches an argv process and
 //! returns a session id; `poll` reports its status and drains its output
 //! (bounded tail + artifact, exactly like the one-shot tools); `stop`
 //! kills the whole process tree and reaps the session. The child lives in

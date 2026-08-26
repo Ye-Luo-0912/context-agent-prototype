@@ -1,4 +1,4 @@
-//! 每个 intended cell 一份有界证据包（EVAL-01）：事件 JSONL、机器可读
+//! 每个 intended cell 一份有界证据包：事件 JSONL、机器可读
 //! 摘要、workspace 哈希、可重放的 hidden 断言（文件体 + 谓词结果）。
 //! 报告表从这些包重建，不靠已经删掉的临时目录。不含 API key。
 
@@ -983,7 +983,7 @@ pub(crate) fn source_tree_digest() -> Option<String> {
     Some(hex_encode(hasher.finalize()))
 }
 
-/// EVAL identity gate (EVAL-03): a dirty workspace must not silently
+/// EVAL identity gate: a dirty workspace must not silently
 /// produce formal evidence, because the dirty diff is not part of the
 /// `git_head` identity and the bundle becomes unreproducible. Refuse
 /// unless the operator explicitly passes `--allow-dirty` (the digest is

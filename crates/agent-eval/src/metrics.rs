@@ -1,7 +1,7 @@
-//! All-module cost accounting for M15: aggregate every measurable dimension
+//! All-module cost accounting for  aggregate every measurable dimension
 //! of a run from its event stream without calling a model.
 //!
-//! The M15 evaluation plan requires per-solved-task accounting of model
+//! The evaluation plan requires per-solved-task accounting of model
 //! tokens, tool-schema tokens, lifecycle/GC cost and tool behavior. Some of
 //! that is only measurable in the live harness (wall time, provider
 //! latency, process launches); everything that is *in the event stream* is
@@ -128,7 +128,7 @@ pub struct RunMetrics {
     pub action_no_outcome_results: u64,
     pub action_missing_terminal: u64,
     pub action_unexpected_terminal: u64,
-    /// PROTO-EVID-02b：当轮正文恢复账目（事件增量求和）。hit/eligible
+    /// 当轮正文恢复账目（事件增量求和）。hit/eligible
     /// 给出真实 checkpoint demand 的恢复率；invalidated/oversize 解释
     /// 缓存为何丢。
     pub protocol_cache_eligible: u64,
@@ -138,7 +138,7 @@ pub struct RunMetrics {
     pub protocol_cache_oversize: u64,
     /// 实际回注进模型输入的正文近似 token 总量。
     pub restored_body_tokens: u64,
-    /// PROTO-EVID-03：Unknown footprint 挂起（休眠保留）的条目数。
+    /// Unknown footprint 挂起（休眠保留）的条目数。
     pub protocol_cache_suspended: u64,
     /// CONV-OBS-01：义务账本生命周期计数（事件流求和）。
     pub obligation_opened: u64,
@@ -282,7 +282,7 @@ pub struct RunMetrics {
     pub materialize_ms_p50: u64,
     pub materialize_ms_p95: u64,
 
-    // Retrieval（M15 / CTX-DISC）：从事件流计 search/inspect/fetch，
+    // Retrieval：从事件流计 search/inspect/fetch，
     // 并用 GC 外置/驱逐 id 与后续命中做 found-after-forgotten 连接。
     /// `context.manage` / `capability.manage` search calls.
     pub search_calls: u64,
@@ -748,7 +748,7 @@ pub fn aggregate_metrics(events: &[RuntimeEventEnvelope]) -> RunMetrics {
                 oversize,
                 restored_body_tokens,
             } => {
-                // PROTO-EVID-02b：缓存命中率可从事件流独立验证——每条
+                // 缓存命中率可从事件流独立验证——每条
                 // 事件是一次组装的增量，全部求和即整轮总量。
                 metrics.protocol_cache_eligible += *eligible;
                 metrics.protocol_cache_hit += *hit;

@@ -72,7 +72,7 @@ fn unrecorded_off_surface_call_is_rejected_without_live_catalog_claims() {
     assert!(!message.contains("loaded"));
 }
 
-// --- CORE-04: trusted output broker + execution-enforced query limits ---
+// --- trusted output broker + execution-enforced query limits ---
 
 #[derive(Default)]
 struct RecordingBroker {

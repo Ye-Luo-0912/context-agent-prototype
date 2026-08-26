@@ -1,6 +1,6 @@
 //! Child supervision: pid, job object, tree kill, and reap.
 //!
-//! This is the PLAT-05 process-control seam. It does not speak JSON-lines.
+//! This is the process-control seam. It does not speak JSON-lines.
 //! Protocol ping-pong stays on [`crate::ProcessHost`]; framed bytes stay on
 //! [`crate::DuplexTransport`] / [`crate::FramedProtocolSession`]. Adapters
 //! must not grow a second kill policy: MCP stdio owns a [`ProcessSupervisor`],

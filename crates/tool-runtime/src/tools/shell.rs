@@ -6,7 +6,7 @@
 //! captured as an artifact; overflow is still drained but is not stored. The
 //! command is killed on timeout or on request cancellation.
 //! `process.run` is the structured argv alternative; the raw shell string
-//! stays as the controlled escape hatch (TOOLS-06).
+//! stays as the controlled escape hatch.
 
 use std::process::Stdio;
 use std::sync::OnceLock;
@@ -345,7 +345,7 @@ impl Tool for ShellExecTool {
                 _ = cancel.cancelled() => {
                     // Kill the whole process tree, not just the shell: a
                     // descendant that outlives the cancel is an avoidable
-                    // stale mutation (the M12 boundary).
+                    // stale mutation (the broker boundary).
                     kill_process_tree(child.id().unwrap_or(0));
                     let _ = child.kill().await;
                     outcome = "cancelled";
@@ -607,7 +607,7 @@ mod tests {
         // the command starts a long-lived foreground process that also
         // spawned a background descendant rewriting a heartbeat file every
         // ~50 ms. After the cancel, the counter must freeze — the whole
-        // process tree is dead, not just the direct shell (the M12
+        // process tree is dead, not just the direct shell (the broker
         // boundary: a cancelled operation produces no avoidable stale
         // mutation).
         let dir = tempfile::tempdir().unwrap();

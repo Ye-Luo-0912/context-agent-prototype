@@ -99,7 +99,7 @@ const MAX_ERROR_BODY_CHARS: usize = 512;
 
 /// Total bytes accepted from one streaming response before the transport
 /// fails: a broken or malicious provider must not make the runtime buffer
-/// an unbounded model stream (the M14 resource boundary).
+/// an unbounded model stream (the resource boundary).
 pub const DEFAULT_MAX_STREAM_BYTES: usize = 16 * 1024 * 1024;
 
 /// Conservative declared send window when the compatible API does not

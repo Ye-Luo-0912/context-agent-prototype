@@ -1,10 +1,10 @@
 //! Deterministic fixture evaluation: run one coding fixture through the
 //! real runtime with the real builtin tool surface, a scripted model, and
-//! the fixture's hidden verification — proving the M15 harness end to end
+//! the fixture's hidden verification — proving the harness end to end
 //! (tool execution, prepared-effect commit, verification, cost accounting)
 //! without a provider.
 //!
-//! This is the harness skeleton of M15: the live A/B/C/D run against a real
+//! This is the harness skeleton of  the live A/B/C/D run against a real
 //! model replaces only the `ScriptedModel`; the workspace, tool surface,
 //! verification and accounting stay.
 
@@ -785,7 +785,7 @@ pub async fn run_fixture(
     .await
 }
 
-/// The M15 live path: the same harness with a real model transport. The
+/// The live path: the same harness with a real model transport. The
 /// model under test sees `live_turns` and the real tool surface;
 /// the workspace, verification and accounting are identical to the
 /// deterministic run. Requires a provider that accepts tool calls.
@@ -812,7 +812,7 @@ pub async fn run_fixture_with_model(
     .await
 }
 
-/// The M15 comparison path: the same harness on a caller-supplied context
+/// The comparison path: the same harness on a caller-supplied context
 /// engine (append-only / rolling / dynamic), driven through one or more
 /// user turns. Cross-engine token differences only appear across turns —
 /// inside one turn the TurnFrame carries the tool protocol, so every engine
@@ -2166,7 +2166,7 @@ mod tests {
         assert_eq!(manager_token_cost(&dynamic).await.unwrap(), 0);
     }
 
-    /// The M15 acceptance, as a deterministic CI proxy: on the same real
+    /// The acceptance, as a deterministic CI proxy: on the same real
     /// tool surface and the same scripted model, the dynamic engine must
     /// finish the multi-turn fixture with the same success while feeding
     /// the model measurably fewer input tokens than append-only.
@@ -2232,7 +2232,7 @@ mod tests {
             // append-only on the same workload. The gap is a
             // real-but-bounded fraction of the total: tool schemas and the
             // system prompt are a large per-round fixed cost (the same
-            // phenomenon the live M15 measurement reported), so the
+            // phenomenon the live measurement reported), so the
             // assertion is directional plus a noise floor, not a large
             // ratio. C-hygiene identity cards / TaskProgress also cost a
             // few tokens per round, so the tiny-fixture floor is 200.

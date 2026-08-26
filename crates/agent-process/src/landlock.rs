@@ -1,4 +1,4 @@
-//! Linux landlock confinement for child processes (M13: OS-level write
+//! Linux landlock confinement for child processes (OS-level write
 //! fence, plus TCP deny when the kernel speaks ABI v4).
 //!
 //! Landlock (kernel 5.13+) lets an unprivileged process restrict *its own*
@@ -405,7 +405,7 @@ pub fn apply_in_child(rules: &ChildRules) -> io::Result<()> {
     // CAP_SYS_ADMIN), so set it first. This also hardens the exec that
     // follows: a setuid/setgid binary can no longer escalate. `apply_
     // unix_rlimits` sets the same bit on Linux even when landlock is
-    // skipped (`MOD-16`). `syscall(SYS_prctl)` stays async-signal-safe
+    // skipped. `syscall(SYS_prctl)` stays async-signal-safe
     // inside pre_exec; libc 0.2 does not export `prctl`/`PR_*` on gnu.
     const PR_SET_NO_NEW_PRIVS: libc::c_long = 38;
     if unsafe { libc::syscall(libc::SYS_prctl, PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) } < 0 {

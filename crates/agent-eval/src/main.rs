@@ -247,7 +247,7 @@ async fn main() -> anyhow::Result<()> {
     let mut include_swebench = false;
     let mut file_only = false;
     let mut pilot_id: Option<String> = None;
-    // EVAL-03 identity gate: live evidence runs refuse a dirty tree unless
+    // Evidence identity gate: live evidence runs refuse a dirty tree unless
     // the operator explicitly accepts a source_tree_digest diagnostic.
     let mut allow_dirty = false;
 

@@ -407,7 +407,7 @@ pub(crate) fn commit_full_gc(
     let externalized_ids: Vec<ContextItemId> =
         io.externalized.iter().map(|(item, _, _)| item.id).collect();
     // Store I/O accounting: the bodies written this pass, read back this
-    // pass, and how many items were recalled (M15 baseline, aggregated by
+    // pass, and how many items were recalled (baseline report, aggregated by
     // the eval harness from the event stream).
     let store_write_bytes = io
         .externalized

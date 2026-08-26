@@ -1,6 +1,6 @@
-//! Unix rlimit ceilings (M13 / MOD-09 `RLIMIT_AS`, MOD-10 `RLIMIT_FSIZE`,
-//! MOD-13 `RLIMIT_NOFILE` plus inherited-fd close, MOD-15 `RLIMIT_CORE=0`,
-//! MOD-16 Linux `RLIMIT_NICE`/`RLIMIT_RTPRIO`=0 plus `no_new_privs`).
+//! Unix rlimit ceilings (`RLIMIT_AS`, `RLIMIT_FSIZE`,
+//! `RLIMIT_NOFILE` plus inherited-fd close, `RLIMIT_CORE=0`,
+//! Linux `RLIMIT_NICE`/`RLIMIT_RTPRIO`=0 plus `no_new_privs`).
 //!
 //! The alloc probe tries to map 2 GiB under a 512 MiB address-space cap.
 //! The fsize probe tries to write 1 MiB under a 64 KiB file-size cap.

@@ -1486,7 +1486,7 @@ impl ContextEngine for SimpleContextEngine {
         // `limit` smallest created_tick summaries while streaming, so the
         // call's memory stays O(limit) no matter how large the external
         // store grows — a model-driven catalog call must not cost
-        // proportional to logical history size (M14 resource policy). The
+        // proportional to logical history size (resource policy). The
         // stream order (heap slot, buffer order, externalization order)
         // makes equal ticks deterministic, exactly like the previous
         // stable sort + truncate.

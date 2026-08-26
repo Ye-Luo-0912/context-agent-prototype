@@ -133,10 +133,10 @@ impl ProcessCapabilityAdapter {
                 max_file_bytes: 256 * 1024 * 1024,
                 // Open-file ceiling (`RLIMIT_NOFILE`). Bounds fd
                 // exhaustion; inherited fds other than stdio are closed
-                // in the same pre_exec (`MOD-13`). That hook also zeros
-                // RLIMIT_CORE so a crash cannot dump secrets (`MOD-15`).
+                // in the same pre_exec. That hook also zeros
+                // RLIMIT_CORE so a crash cannot dump secrets.
                 // On Linux it also clamps NICE/RTPRIO and sets
-                // no_new_privs (`MOD-16`).
+                // no_new_privs.
                 #[cfg(unix)]
                 max_open_files: 1024,
                 // OS-level write confinement (Linux landlock / Windows Low IL):

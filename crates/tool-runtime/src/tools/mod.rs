@@ -149,7 +149,7 @@ pub(crate) fn model_json_string(value: &str) -> String {
 /// SHA-256 of the file's bytes as a lowercase hex string. `fs.read`
 /// reports it (`revision`), and `edit.patch` requires it as
 /// `base_revision`, so an edit is refused unless the file is exactly the
-/// revision the model based its change on (TOOLS-05 file-revision
+/// revision the model based its change on the file-revision
 /// semantics).
 pub(crate) fn content_digest(bytes: &[u8]) -> String {
     use sha2::{Digest, Sha256};

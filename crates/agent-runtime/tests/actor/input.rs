@@ -10,7 +10,7 @@ use agent_runtime::{RuntimeServices, spawn_runtime};
 
 use crate::harness::*;
 
-/// CORE-04 end to end: the composition-root output broker runs inside the
+/// Output-broker end to end: the composition-root output broker runs inside the
 /// kernel, spills an oversized tool result to the run's artifact directory
 /// and the model-facing preview stays bounded — the truncated middle is no
 /// longer lost for a producer that did not spill.

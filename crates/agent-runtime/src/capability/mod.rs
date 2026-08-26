@@ -1673,7 +1673,7 @@ impl CapabilityAwareDispatcher {
         // through with producer-authority metadata stripped.
         match outcome? {
             CapabilityOutcome::Value(mut output) => {
-                // CAP-OBS-01：动态 capability 的 metadata 不是 Runtime 事实。
+                // 动态 capability 的 metadata 不是 Runtime 事实。
                 sanitize_untrusted_producer_output(&mut output);
                 Ok(ToolOutcome::Value(output))
             }

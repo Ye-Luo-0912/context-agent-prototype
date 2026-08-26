@@ -1,4 +1,4 @@
-//! Bounded, versioned federated discovery (`CTX-DISC-01..03`, `TOOLS-10`).
+//! Bounded, versioned federated discovery.
 //!
 //! Search is read-only: a hit is a descriptor, never admission, loading,
 //! invocation, or a TaskAnchor mutation. Context and Tool are the only
@@ -271,7 +271,7 @@ impl DiscoveryBudgetExhausted {
     }
 }
 
-/// Actor-owned per-user-turn search admission (`CTX-DISC-03`). Reset on
+/// Actor-owned per-user-turn search admission. Reset on
 /// `start_turn`. Inspect/load/admit/fetch are not searches.
 #[derive(Debug, Default, Clone)]
 pub struct DiscoveryTurnBudget {
@@ -371,7 +371,7 @@ pub fn federate(
     page
 }
 
-/// Provider-owned tool catalog search (`TOOLS-10`).
+/// Provider-owned tool catalog search.
 ///
 /// Ranking is token-OR plus a phrase bonus: a multi-word needle such as
 /// `"patch edit file"` must still hit `edit.patch`. Requiring every token

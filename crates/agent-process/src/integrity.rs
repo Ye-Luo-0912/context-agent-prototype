@@ -1,4 +1,4 @@
-//! Windows integrity-level write confinement (M13 / MOD-08).
+//! Windows integrity-level write confinement.
 //!
 //! AppContainer stays out of v0. A Medium IL parent labels configured write
 //! roots Low and re-spawns through this process with [`WRAP_SENTINEL`]: a
@@ -11,8 +11,8 @@
 //! The wrap is this same executable, not a second binary: every product
 //! and test that links `agent-process` can confine. The wrap creates a
 //! Job-Object with `KILL_ON_JOB_CLOSE`, a 512 MiB per-process commit
-//! ceiling (`MOD-14`), `DIE_ON_UNHANDLED_EXCEPTION`, and
-//! `PRIORITY_CLASS=NORMAL` (`MOD-17`) so TerminateProcess of the wrap
+//! ceiling, `DIE_ON_UNHANDLED_EXCEPTION`, and
+//! `PRIORITY_CLASS=NORMAL` so TerminateProcess of the wrap
 //! still kills the real child, a runaway Low-IL allocator cannot exhaust
 //! the machine, and the child cannot raise HIGH/REALTIME. BREAKAWAY_OK
 //! stays unset. ProcessHost's job covers the wrap process; this job
@@ -50,7 +50,7 @@ use windows_sys::Win32::System::Threading::{
 /// First argument that turns this executable into the Low-IL wrap.
 pub const WRAP_SENTINEL: &str = "__FOCUS_AGENT_INTEGRITY_WRAP_V1__";
 
-/// Per-process commit ceiling on the wrap's Job-Object (`MOD-14`).
+/// Per-process commit ceiling on the wrap's Job-Object.
 /// Matches the capability adapter's Windows `job_max_memory_bytes`.
 /// `RLIMIT_AS` on Unix is coarser (virtual maps); this is commit charge.
 pub const WRAP_JOB_MAX_MEMORY_BYTES: u64 = 512 * 1024 * 1024;

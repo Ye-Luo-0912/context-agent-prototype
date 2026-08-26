@@ -312,7 +312,7 @@ pub const MAX_TURN_CHECKPOINT_RECEIPTS: usize = 6;
 pub const MAX_TURN_CHECKPOINT_RECEIPT_CHARS: usize = 96;
 const MAX_TURN_CHECKPOINT_TOOL_NAME_CHARS: usize = 48;
 
-/// PROTO-EVID-01：单轮最多回注的协议正文行数。与运行时当轮缓存的
+/// 单轮最多回注的协议正文行数。与运行时当轮缓存的
 /// 容量一致；回注内容只进 user-role 焦点层，不进 Context / 不持久。
 pub const MAX_PROTOCOL_BODY_ROWS: usize = 4;
 

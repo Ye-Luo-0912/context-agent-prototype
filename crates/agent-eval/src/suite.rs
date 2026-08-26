@@ -1,8 +1,8 @@
-//! EVAL-01.4：接受套件包。300 题是审查过的交付物，不是 `FIXTURES` 烟雾。
+//! 接受套件包。300 题是审查过的交付物，不是 `FIXTURES` 烟雾。
 //!
 //! 冻结条件由本模块计算：`manifest.frozen` 不能单独打开门禁。9 道文件题
 //! 加上 500 道 SWE-bench Verified 使 n≥300。异质性、出处、可执行 hidden
-//! 已审查；pack 已冻结。EVAL-01.3c 将 `SUITE_FROZEN`、exact 300 acceptance
+//! 已审查；pack 已冻结。`SUITE_FROZEN`、exact 300 acceptance
 //! ids 与 SPEC 一并冻结。门禁是这 300 题，不是 509 包里任意子集。
 //! 300×3 接受细胞仍须先做剩余校准。不得发明一行 stand-in。
 //!

@@ -1,10 +1,10 @@
-//! Shared tool/capability conformance harness (TOOLS-04).
+//! Shared tool/capability conformance harness.
 //!
 //! Every tool, capability and process adapter must pass the same set of
 //! contract checks before it is trusted on the model surface. The checks in
 //! this crate encode the normative envelope from
-//! `docs/TOOL_RESULT_ENVELOPE.md` (TOOLS-03) and the per-tool matrix from
-//! `docs/TOOL_INVENTORY.json` (TOOLS-01):
+//! `docs/TOOL_RESULT_ENVELOPE.md` and the per-tool matrix from
+//! `docs/TOOL_INVENTORY.json`:
 //!
 //! - `check_schema_contract`: a `ToolSpec` is a well-formed, bounded
 //!   model-visible schema (name/description present, `type: object`,

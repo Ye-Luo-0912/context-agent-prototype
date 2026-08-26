@@ -287,7 +287,7 @@ pub enum RuntimeEvent {
         #[serde(default)]
         invalidated: u64,
     },
-    /// PROTO-EVID-02b：当轮正文缓存账目，每次模型输入组装出一条增量。
+    /// 当轮正文缓存账目，每次模型输入组装出一条增量。
     /// eligible/hit/miss 为本次组装真实 checkpoint demand / 回注 /
     /// 未回注行数（仍在 retained tail 的缓存行不计 demand）；
     /// invalidated 为物理丢弃条数（Known mutation / LRU 挤出），

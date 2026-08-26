@@ -566,7 +566,7 @@ impl RuntimeActor {
         }
 
         let estimated_input_tokens = assembled_total(&input);
-        // PROTO-EVID-02b：正文恢复账目出账（增量）。eligible 是最终
+        // 正文恢复账目出账（增量）。eligible 是最终
         // 组装的真实 checkpoint demand；失效/超限计数是自上一条账目
         // 以来的累计，drain 后归零。
         // 只记账不设障：事件失败不影响本轮准备。
@@ -826,7 +826,7 @@ impl RuntimeActor {
         turn_frame: &TurnFrame,
         tools: Vec<ToolSpec>,
     ) -> (ModelInput, crate::prompt::ProtocolBodyAssemblyStats) {
-        // PROTO-EVID-01/03：当轮正文缓存的可回注行交给组装器。休眠
+        // 当轮正文缓存的可回注行交给组装器。休眠
         // 条目只有在事实表里同 path@digest 重新 Fresh（BeforeModel 重
         // 验证通过）时才恢复资格；是否回注由组装器再核对 checkpoint
         // 截断 + Fresh 事实一致。

@@ -3,8 +3,8 @@
 //! request/response, per-request deadlines, cancellation, and a
 //! poisoned-connection policy so a wedged or malicious child can never be
 //! reused or grow the parent's memory without bound. Connection health,
-//! epochs and a bounded restart circuit (`PLAT-06` slice 1) live here, as
-//! do peer cancel-ACK frames and coalescible progress (`PLAT-06` slice 2);
+//! epochs and a bounded restart circuit (live here, as
+//! do peer cancel-ACK frames and coalescible progress;
 //! they are never task state or Core authority.
 //!
 //! Thin protocol layers build on top of this host — the context-service

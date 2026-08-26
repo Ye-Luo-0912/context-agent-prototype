@@ -1,6 +1,6 @@
 //! Plugin package activation authority: the core-side owner of an installed
-//! package's activation state, mirroring `CapabilityStateAuthority` (MOD-05
-//! split). Admission decides whether a package may be installed at all
+//! package's activation state, mirroring `CapabilityStateAuthority`
+//! Admission decides whether a package may be installed at all
 //! (`PluginPackageAdmission`); this authority owns *whether it runs* after
 //! installation, and installation never implies activation (ECO-04): a
 //! package enters `Installed` and stays inert until an explicit operator

@@ -1,6 +1,6 @@
 //! `edit.patch` — multi-hunk, revision-checked text patching.
 //!
-//! The file-revision companion to `edit.replace` (TOOLS-05): the canonical
+//! The file-revision companion to `edit.replace`: the canonical
 //! model-visible shape applies exact-match hunks through one `files[]` batch,
 //! including a path and `fs.read` revision for every entry. The parser keeps
 //! the older top-level single-file shortcut for wire compatibility, but does

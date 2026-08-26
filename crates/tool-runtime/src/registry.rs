@@ -591,7 +591,7 @@ impl ToolDispatcher for BuiltinToolDispatcher {
         self.builtin_execution_attribution(call)
     }
 
-    /// CAP-OBS-01: translate this crate's OWN stamped outputs into typed
+    /// translate this crate's OWN stamped outputs into typed
     /// facts at one sanctioned point inside the operator-trust boundary.
     /// Names this catalog does not own belong to untrusted producers routed
     /// elsewhere and contribute no facts.
@@ -1036,7 +1036,7 @@ mod tests {
             .collect()
     }
 
-    /// CAP-OBS-01: the trusted host translates only its own stamped
+    /// the trusted host translates only its own stamped
     /// outputs, and the translation mirrors what the legacy accessors
     /// derived — consumers switching to facts must not see new values.
     #[tokio::test]

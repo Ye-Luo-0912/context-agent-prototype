@@ -740,7 +740,7 @@ impl Tool for CodeDiagnosticsTool {
 /// Read the source context block for one position: the line itself plus
 /// `context` lines around it, prefixed with a `== file:line:col ==` header.
 /// File contents are cached per path and read through the confined
-/// directory-handle descent (CORE-07); escaping or oversized files yield a
+/// directory-handle descent; escaping or oversized files yield a
 /// `String` reason instead of an error.
 async fn read_block(
     workspace: &Workspace,

@@ -3,11 +3,9 @@
 //! 不依赖 live provider，可在 CI 里反复运行：
 //!
 //! - `retry_domain`：process.run program-not-found 后的同参数重试被
-//!   无派发拒绝（CONV-02 可证等价重试域）；
-//! - `operational_evidence`：同版本重复观察入前沿并计 RedundantEvidence
-//!   （CONV-01）；
-//! - `protocol_body`：正文被 turn checkpoint 截掉后由当轮缓存回注
-//!   （PROTO-EVID-01）；
+//!   无派发拒绝（可证等价重试域）；
+//! - `operational_evidence`：同版本重复观察入前沿并计 RedundantEvidence；
+//! - `protocol_body`：正文被 turn checkpoint 截掉后由当轮缓存回注；
 //! - `verification_reuse`：生产 `verify.run` 的同一 exact PASS 第二次
 //!   请求不再启动进程，但仍结算完整工具结果。
 
@@ -59,7 +57,7 @@ impl ConvergenceBenchReport {
     }
 }
 
-/// 包装 ScriptedModel：记录是否出现过回注标记（PROTO-EVID-01 断言面）。
+/// 包装 ScriptedModel：记录是否出现过回注标记（断言面）。
 struct BodyProbeModel {
     inner: ScriptedModel,
     restored_seen: AtomicBool,
@@ -220,7 +218,7 @@ fn failure_classes(events: &[RuntimeEventEnvelope], tool: &str) -> HashMap<Strin
     classes
 }
 
-/// 场景一（CONV-02）：program-not-found 后同参数重试必须被无派发拒绝；
+/// 场景一：program-not-found 后同参数重试必须被无派发拒绝；
 /// 换参数的调用正常派发。
 pub async fn scenario_retry_domain() -> anyhow::Result<ConvergenceBenchReport> {
     let dir = seed_workspace(&[("src/main.rs", "fn main() {}\n")]).await?;
@@ -251,7 +249,7 @@ pub async fn scenario_retry_domain() -> anyhow::Result<ConvergenceBenchReport> {
     ))
 }
 
-/// 场景二（CONV-01）：同版本重复观察记 RedundantEvidence；首次观察是
+/// 场景二：同版本重复观察记 RedundantEvidence；首次观察是
 /// 可证明推进。
 pub async fn scenario_operational_evidence() -> anyhow::Result<ConvergenceBenchReport> {
     let dir = seed_workspace(&[("src/main.rs", "fn main() {}\n")]).await?;
@@ -310,7 +308,7 @@ pub async fn scenario_operational_evidence() -> anyhow::Result<ConvergenceBenchR
     ))
 }
 
-/// 场景三（PROTO-EVID-01）：首个 fs.read 正文被 checkpoint 截掉后，
+/// 场景三：首个 fs.read 正文被 checkpoint 截掉后，
 /// 同一身份由当轮缓存回注到下一轮请求。
 pub async fn scenario_protocol_body() -> anyhow::Result<ConvergenceBenchReport> {
     let body = "fn secret_body() {}\n";

@@ -224,7 +224,7 @@ pub struct GrantAuditEntry {
 /// established through `grant` (composition root / UI), only shrink
 /// (revocation, run consumption, expiry) and never grant beyond their
 /// declared target. The final effect of a granted workspace write is still
-/// bounded by the confined workspace (CORE-07) and the runtime's generation
+/// bounded by the confined workspace and the runtime's generation
 /// fence — the grant is an approval decision, not a sandbox bypass.
 pub struct TaskApprovalGate {
     inner: Arc<dyn ApprovalGate>,

@@ -534,8 +534,8 @@ impl McpClient<tokio::process::ChildStdout, tokio::process::ChildStdin> {
         // file-size or open-file ceiling when write roots are configured.
         // RLIMIT_AS is 2 GiB VAS, RLIMIT_FSIZE is 256 MiB and
         // RLIMIT_NOFILE is 1024 (same defaults as process capabilities).
-        // apply_unix_rlimits also zeros RLIMIT_CORE (`MOD-15`) and on
-        // Linux clamps NICE/RTPRIO and sets no_new_privs (`MOD-16`).
+        // apply_unix_rlimits also zeros RLIMIT_CORE and on
+        // Linux clamps NICE/RTPRIO and sets no_new_privs.
         // CPU/nproc stay unset here: RLIMIT_NPROC is per-user on Linux
         // and a small cap can starve MCP handshake threads on a busy CI
         // host. Inherited fds other than stdio are closed after landlock.

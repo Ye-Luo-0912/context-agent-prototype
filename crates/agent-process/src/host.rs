@@ -103,7 +103,7 @@ pub struct ProcessSandbox {
     /// opened fails the spawn.
     #[cfg(target_os = "linux")]
     pub landlock_write_roots: Vec<std::path::PathBuf>,
-    /// Per-process memory ceiling (`MOD-09`). `0` = unlimited.
+    /// Per-process memory ceiling. `0` = unlimited.
     /// Windows: Job-Object `JOB_OBJECT_LIMIT_PROCESS_MEMORY` (committed).
     /// Unix: `RLIMIT_AS` (virtual address space, including mappings; this
     /// is coarser than the Windows commit charge). Combined with landlock
@@ -112,27 +112,27 @@ pub struct ProcessSandbox {
     pub job_max_memory_bytes: u64,
     #[cfg(unix)]
     pub max_memory_bytes: u64,
-    /// Unix `RLIMIT_FSIZE` (`MOD-10`): the largest file the child may
+    /// Unix `RLIMIT_FSIZE`: the largest file the child may
     /// create or extend. `0` = unlimited. A write past this limit fails
     /// with `EFBIG` (and `SIGXFSZ` unless ignored). This is a per-file
     /// size cap, not I/O bandwidth and not a Windows Job-Object feature.
     #[cfg(unix)]
     pub max_file_bytes: u64,
-    /// Unix `RLIMIT_NOFILE` (`MOD-13`): how many file descriptors the
+    /// Unix `RLIMIT_NOFILE`: how many file descriptors the
     /// child may have open. `0` = unlimited. Combined with
     /// [`close_inherited_fds`] in the same `pre_exec` so a parent fd
     /// without `O_CLOEXEC` cannot leak across exec. The close scan is
     /// capped (see that function); this is not I/O bandwidth.
     #[cfg(unix)]
     pub max_open_files: u64,
-    // Unix `RLIMIT_CORE` (`MOD-15`) is not a field: other rlimit fields
+    // Unix `RLIMIT_CORE` is not a field: other rlimit fields
     // use `0` = unlimited, so a `max_core_bytes: 0` would be ambiguous.
     // Whenever `apply_unix_rlimits` runs (capability / MCP `pre_exec`),
     // core dumps are forced to zero so a crash cannot leak sandbox
     // secrets into a dump file. Probe via `getrlimit`, not by crashing.
     // Linux also clamps `RLIMIT_NICE` / `RLIMIT_RTPRIO` to zero and sets
-    // `no_new_privs` (`MOD-16`); those are not fields either.
-    /// Windows integrity write confinement (Low IL, `MOD-08`): the child
+    // `no_new_privs`; those are not fields either.
+    /// Windows integrity write confinement (Low IL): the child
     /// may create/modify/destroy filesystem state only under these roots.
     /// The parent labels each root Low and re-spawns through this process
     /// as a wrap that drops to Low IL before CreateProcess of the real
@@ -186,10 +186,10 @@ pub struct ProcessHostConfig {
 /// Only `setrlimit` / `prctl` (via `syscall`) are used (async-signal-safe).
 /// For CPU / NPROC / AS / FSIZE / NOFILE, `0` leaves that resource
 /// unchanged (unlimited). `RLIMIT_CORE` is always set to zero when this
-/// function runs (`MOD-15`) so a crash cannot dump sandbox secrets; that
+/// function runs so a crash cannot dump sandbox secrets; that
 /// is not expressed as a sixth `0` = unlimited argument. On Linux the
 /// same hook also clamps `RLIMIT_NICE` / `RLIMIT_RTPRIO` to zero and
-/// sets `PR_SET_NO_NEW_PRIVS` (`MOD-16`) so a parent with a raised
+/// sets `PR_SET_NO_NEW_PRIVS` so a parent with a raised
 /// priority ceiling cannot leak into the child and a setuid exec cannot
 /// escalate even when landlock is skipped. Linux GNU types the resource
 /// id as `u32`; macOS uses `c_int` — calling `setrlimit` with the
@@ -439,14 +439,14 @@ impl ProcessHost {
 
         // Sandbox (Unix): hard CPU / process / address-space / file-size /
         // open-file ceilings via rlimits, applied right after fork. The
-        // same hook always zeros RLIMIT_CORE (`MOD-15`) so a crash cannot
+        // same hook always zeros RLIMIT_CORE so a crash cannot
         // dump secrets, and on Linux clamps NICE/RTPRIO and sets
-        // no_new_privs (`MOD-16`) even when landlock is skipped. On Linux
+        // no_new_privs even when landlock is skipped. On Linux
         // the same pre_exec also applies landlock so a second closure
         // cannot replace this one on toolchains that keep only the last
         // hook. Inherited fds other than stdio are closed after landlock
         // so a parent descriptor without O_CLOEXEC cannot leak across
-        // exec (`MOD-13`).
+        // exec.
         #[cfg(target_os = "linux")]
         let landlock_rules = if config.sandbox.landlock_write_roots.is_empty() {
             None
@@ -1259,7 +1259,7 @@ pub fn kill_process_tree(pid: u32) {
 /// The Windows Job-Object machinery behind the process sandbox:
 /// kernel-enforced quotas (active-process ceiling, per-process memory
 /// ceiling), `KILL_ON_JOB_CLOSE`, `DIE_ON_UNHANDLED_EXCEPTION`, and
-/// `PRIORITY_CLASS=NORMAL` (`MOD-17`) so the child cannot raise
+/// `PRIORITY_CLASS=NORMAL` so the child cannot raise
 /// HIGH/REALTIME. Breakaway stays default-deny. Closing the handle — the
 /// host's drop — terminates every assigned process even if no explicit
 /// kill ran.
@@ -1340,7 +1340,7 @@ mod job_object {
             }
             let mut info: JOBOBJECT_EXTENDED_LIMIT_INFORMATION = std::mem::zeroed();
             // PRIORITY_CLASS pins NORMAL so the child cannot raise to
-            // HIGH/REALTIME (`MOD-17`). BREAKAWAY_OK / SILENT_BREAKAWAY_OK
+            // HIGH/REALTIME. BREAKAWAY_OK / SILENT_BREAKAWAY_OK
             // stay unset (default-deny). Not a rate limit and not UI.
             let mut flags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE
                 | JOB_OBJECT_LIMIT_DIE_ON_UNHANDLED_EXCEPTION

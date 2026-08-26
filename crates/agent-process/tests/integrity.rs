@@ -1,4 +1,4 @@
-//! End-to-end tests for the Windows Low-IL write confinement (M13 / MOD-08).
+//! End-to-end tests for the Windows Low-IL write confinement.
 //!
 //! `sandbox_probe` is spawned through this test binary's integrity wrap:
 //! the wrap drops to Low IL, so writes inside a Low-labeled root must

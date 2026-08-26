@@ -1238,7 +1238,7 @@ pub const PRODUCER_AUTHORITY_METADATA_KEYS: &[&str] = &[
     "mutates_workspace",
 ];
 
-/// 动态 Capability 输出的统一净化（CAP-OBS-01，fail-closed）：先剥
+/// 动态 Capability 输出的统一净化（fail-closed）：先剥
 /// reserved 键（否则 [`take_runtime_diagnosis`] 会先读走 producer 自选
 /// 的 failure_class），再剥权威键。untrusted producer 只留下
 /// summary / model_content / artifact_ref 与无权威语义的自由键。
@@ -1380,7 +1380,7 @@ impl OperationEffectContext {
 }
 
 /// Builtin tools that mutate the world inside a child before the operation
-/// completes. They are an explicit M12 non-transactional exception:
+/// completes. They are an explicit non-transactional exception:
 /// Core identity is required before spawn, spawn/exit is journaled,
 /// cancellation kills the tree, and mutations already performed are never
 /// rolled back. They must return [`ToolOutcome::Value`], never a prepared
@@ -2495,7 +2495,7 @@ pub trait ToolDispatcher: Send + Sync {
     }
 
     /// Typed host-trusted [`ToolExecutionFacts`] for one settled result
-    /// (CAP-OBS-01). The default is empty facts: dynamic capabilities are
+    ///. The default is empty facts: dynamic capabilities are
     /// untrusted producers and their authority keys are stripped before
     /// Core reads them, so they have no facts to contribute. Operator-
     /// trusted hosts override this to translate their OWN stamped outputs

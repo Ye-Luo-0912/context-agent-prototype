@@ -1,6 +1,6 @@
 //! `process.run` — structured argv process execution.
 //!
-//! The TOOLS-06 alternative to the raw `shell.exec` string: the command is
+//! The structured alternative to the raw `shell.exec` string: the command is
 //! an explicit argv vector, so there is no shell to parse (and no shell
 //! injection to guard). cwd is a workspace-relative directory, env is an
 //! explicit override map layered on the inherited environment, and the
@@ -54,7 +54,7 @@ const MAX_ATTEMPTED_CANDIDATES: usize = 8;
 struct ProgramResolution {
     /// 传给 `Command::new` 的绝对路径。
     executable: std::path::PathBuf,
-    /// 稳定 lineage scope（CONV-03）：digest(cwd 身份 + effective PATH
+    /// 稳定 lineage scope：digest(cwd 身份 + effective PATH
     /// + 规则版本)。目录内容变化不改变它。
     scope_key: String,
     /// 当前 epoch 前置指纹：完整有界目录状态 + PATH + 规范化 env 覆盖。
@@ -460,7 +460,7 @@ impl ProcessRunTool {
             Err(failure) => {
                 // 模型反复猜测不存在的程序名是实测最高频的失败循环：
                 // 一次错误必须足以纠正。preview 只列前 20 个名字，
-                // 身份指纹则覆盖完整有界目录状态（PROTO-EVID-03 同理）。
+                // 身份指纹则覆盖完整有界目录状态（同理）。
                 let entries = bounded_cwd_listing(&cwd);
                 let (scope_key, fingerprint) = resolution_identity(&cwd, &args.env);
                 return Ok(ToolOutcome::Value(agent_contracts::tool_failure_output(
@@ -691,7 +691,7 @@ impl ProcessRunTool {
             "outcome": outcome,
             "cwd": if cwd_text.is_empty() { "." } else { &cwd_text },
             "argv": argv_text,
-            // CONV-03 matched-success：成功也携带解析身份，义务账本只
+            // matched-success：成功也携带解析身份，义务账本只
             // 在 scope 与指纹都匹配时才认定 blocker 被真正解决。
             "resolution_scope_key": resolution.scope_key,
             "resolution_fingerprint": resolution.fingerprint,

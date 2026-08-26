@@ -199,7 +199,7 @@ impl RuntimeActor {
         // record or returned an unknown state. Keep the model informed by
         // completing the current turn, but never dispatch another tool while
         // recovery is required; that would build new effects on an
-        // unprovable world state before PLAT-03 can arbitrate them.
+        // unprovable world state before arbitration can resume.
         if self.state.recovery_required {
             let mut refused = vec![call];
             if let Some(turn) = self.state.turn.as_mut() {
@@ -423,7 +423,7 @@ impl RuntimeActor {
                 self.spawn_next_model_or_end(op_tx).await;
                 return;
             }
-            // CONV-02：可证等价的启动失败重试（同参数 + 世界版本未推进）
+            // 可证等价的启动失败重试（同参数 + 世界版本未推进）
             // 同样无派发拒绝；超时/退出码等非确定失败永不走这里。
             let duplicate_launch = self
                 .state
@@ -1268,10 +1268,10 @@ impl RuntimeActor {
                     && let Some(turn) = self.state.turn.as_mut()
                 {
                     turn.record_edit_attempt(&output, &digest);
-                    // CONV-02：程序解析失败同样入账（可证等价域才收）。
+                    // 程序解析失败同样入账（可证等价域才收）。
                     turn.record_launch_failure(&output, &digest);
                 }
-                // PROTO-EVID-01：正文入当轮缓存（含失效规则）。
+                // 正文入当轮缓存（含失效规则）。
                 if let Some(turn) = self.state.turn.as_mut() {
                     turn.record_protocol_body(&output);
                 }
