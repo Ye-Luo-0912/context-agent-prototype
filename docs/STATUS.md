@@ -534,7 +534,19 @@ and sandbox contracts live elsewhere. Experiment facts live in
   on 2026-08-26 and stay dormant until a host declares coverage domains
   through the recipe table (see
   [`EXECUTION_COHERENCE.md`](EXECUTION_COHERENCE.md)).
-  Code comments no longer carry audit tracking ids; the docs own that
+  Obligation-scoped provenance sources also landed 2026-08-26:
+  `ExecutionObligation.source_tool_name` is stamped once by
+  `record_obligation` from pre-dispatch truth, lease membership derives
+  from live ledger rows, and `tool_lease_roots` folds it into runtime
+  roots filtered against the catalog. Trusted handlers now stamp native
+  typed execution facts at construction time under the reserved
+  `_execution_facts` metadata key (sanitizer-stripped from untrusted
+  producers), and every builtin family stamps an explicit
+  workspace-mutation bound mirroring the temporary name table
+  (`process.session` deliberately stays on the fallback pending its bound
+  decision); per-handler tests lock native equals derivation. No
+  model-visible output shape changed; a live fixture confirmed end-to-end
+  behavior. Code comments no longer carry audit tracking ids; the docs own that
   vocabulary.
 
 ## Frozen
@@ -657,7 +669,18 @@ preserved all r3 call-quality results while observing lower wall p50/p95. See
 the r4 evidence `REPORT.md`. This proves the combined contract on that frozen
 surface, not a general task-failure rate or a causal performance gain.
 
-`TOOL-EDIT-02` remains open for the same frozen run on a clean source tree.
+`TOOL-EDIT-02` remains open. Four clean-tree frozen-gate runs completed
+2026-08-26 after the hunk `op`-field drift fix (evidence
+`tool-surface-edit-v3-clean-tree-2026-08-26*/`, three with REPORT.md).
+Strict raw-byte truth passed every applied patch in all four windows —
+12/12 in three runs, 11/12 in the first only because one provider session
+died before any tool call — so the mutation path is proven byte-perfect.
+The gate never exceeded 9/12 and non-conflict-first never exceeded 8/9:
+every failure was served-model decision behavior (post-edit confirmation
+reads the stale-recovery contract forbids, a stale-revision first attempt,
+or one non-exact first-hunk set, each recovered). The bar stays 12/12
+strict, 12/12 gate, 9/9 non-conflict-first on one clean tree; no window
+met it today.
 Deterministic external-race, crash, journal-fault and — since 2026-08-26 —
 disk-full coverage are landed: the feature-gated `test-faults` storage seam
 injects storage-full refusals at the authority intent, the staged temp bytes
