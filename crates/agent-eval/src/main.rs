@@ -580,7 +580,10 @@ async fn main() -> anyhow::Result<()> {
                 });
                 let (report, passed) = platform_closure::run_m12_closure(&out_dir).await?;
                 print!("{report}");
-                println!("m12 closure audit: {}", if passed { "PASS" } else { "FAIL" });
+                println!(
+                    "m12 closure audit: {}",
+                    if passed { "PASS" } else { "FAIL" }
+                );
                 if !passed {
                     anyhow::bail!("platform closure m12 gate failed");
                 }
@@ -595,7 +598,10 @@ async fn main() -> anyhow::Result<()> {
                 });
                 let (report, passed) = platform_closure_m13::run_m13_closure(&out_dir).await?;
                 print!("{report}");
-                println!("m13 closure audit: {}", if passed { "PASS" } else { "FAIL" });
+                println!(
+                    "m13 closure audit: {}",
+                    if passed { "PASS" } else { "FAIL" }
+                );
                 if !passed {
                     anyhow::bail!("platform closure m13 gate failed");
                 }

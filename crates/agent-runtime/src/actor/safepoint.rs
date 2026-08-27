@@ -108,7 +108,9 @@ impl RuntimeActor {
             ));
         }
         Err(last_error.unwrap_or_else(|| {
-            AgentError::Internal("capability surface kept changing during checkpoint capture".into())
+            AgentError::Internal(
+                "capability surface kept changing during checkpoint capture".into(),
+            )
         }))
     }
 
@@ -215,9 +217,11 @@ impl RuntimeActor {
 
         // Allocate this snapshot's identity before freezing any plane so
         // the written payload embeds its own sequence.
-        self.state.snapshot_sequence = self.state.snapshot_sequence.checked_add(1).expect(
-            "snapshot sequence cannot overflow within any realistic run",
-        );
+        self.state.snapshot_sequence = self
+            .state
+            .snapshot_sequence
+            .checked_add(1)
+            .expect("snapshot sequence cannot overflow within any realistic run");
         let sequence = self.state.snapshot_sequence;
         if let Some(turn) = self.state.turn.as_ref() {
             self.state
@@ -309,7 +313,10 @@ impl RuntimeActor {
         };
         self.state.checkpoint_write = Some(InFlightCheckpoint {
             handle: tokio::spawn(async move {
-                store.write_atomic(&bytes).await.map(|stored| (sequence, stored))
+                store
+                    .write_atomic(&bytes)
+                    .await
+                    .map(|stored| (sequence, stored))
             }),
             anchor_revision,
             captured_debt,
@@ -459,7 +466,10 @@ impl RuntimeActor {
             AgentError::Internal(format!("terminal checkpoint serialization failed: {error}"))
         })?;
         let in_flight_handle = tokio::spawn(async move {
-            store.write_atomic(&bytes).await.map(|stored| (sequence, stored))
+            store
+                .write_atomic(&bytes)
+                .await
+                .map(|stored| (sequence, stored))
         });
         let acked = match in_flight_handle.await {
             Ok(result) => result,

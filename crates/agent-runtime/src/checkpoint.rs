@@ -193,7 +193,10 @@ impl CheckpointStore {
             if !metadata.is_file() || !entry.file_name().to_string_lossy().ends_with(".json") {
                 continue;
             }
-            entries.push((metadata.modified().unwrap_or(std::time::UNIX_EPOCH), entry.path()));
+            entries.push((
+                metadata.modified().unwrap_or(std::time::UNIX_EPOCH),
+                entry.path(),
+            ));
         }
         entries.sort_by_key(|(modified, _)| std::cmp::Reverse(*modified));
         for (_, path) in entries.into_iter().skip(keep) {
@@ -255,7 +258,8 @@ impl CheckpointStore {
                 "checkpoint artifact {artifact} header has no payload length"
             ))
         })? as usize;
-        if payload_bytes > MAX_CHECKPOINT_PAYLOAD_BYTES || stored.len() > MAX_CHECKPOINT_ARTIFACT_BYTES
+        if payload_bytes > MAX_CHECKPOINT_PAYLOAD_BYTES
+            || stored.len() > MAX_CHECKPOINT_ARTIFACT_BYTES
         {
             return Err(AgentError::InvalidRequest(format!(
                 "checkpoint artifact {artifact} exceeds its byte bounds"

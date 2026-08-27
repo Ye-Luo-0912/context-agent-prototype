@@ -24,7 +24,7 @@ use agent_contracts::{
     ToolRisk, ToolSpec,
 };
 use agent_process::{ProcessHost, ProcessHostConfig};
-use anyhow::{anyhow, Context as _, bail};
+use anyhow::{Context as _, anyhow, bail};
 use serde::Serialize;
 use serde_json::json;
 
@@ -137,9 +137,7 @@ fn evidence_refs(evidence: &SandboxEvidence) -> Vec<String> {
     ];
     items
         .iter()
-        .filter_map(|(name, proof)| {
-            proof.as_ref().map(|text| format!("{name}: {text}"))
-        })
+        .filter_map(|(name, proof)| proof.as_ref().map(|text| format!("{name}: {text}")))
         .collect()
 }
 
@@ -179,7 +177,11 @@ fn demo_manifest(profile: SandboxProfile, program: &str) -> CapabilityManifest {
 /// restricted native integration: OS-level write confinement roots plus a
 /// Job-Object / rlimit resource ceiling. `with_write_roots` models the
 /// misconfigured operator variant whose confinement mechanism is missing.
-fn fixture_config(program: &Path, sandbox_root: &Path, with_write_roots: bool) -> ProcessHostConfig {
+fn fixture_config(
+    program: &Path,
+    sandbox_root: &Path,
+    with_write_roots: bool,
+) -> ProcessHostConfig {
     std::fs::create_dir_all(sandbox_root).expect("sandbox cwd");
     let sandbox = default_sandbox(sandbox_root, with_write_roots);
     ProcessHostConfig {
@@ -234,9 +236,13 @@ fn default_sandbox(root: &Path, with_write_roots: bool) -> agent_process::Proces
 fn local_platform_backend() -> (&'static str, bool) {
     // (row label, whether this runner can exercise native spawns of it)
     #[cfg(windows)]
-    { (WINDOWS_BACKEND, true) }
+    {
+        (WINDOWS_BACKEND, true)
+    }
     #[cfg(unix)]
-    { ("unix-native", true) }
+    {
+        ("unix-native", true)
+    }
 }
 
 /// Locate the `mock_host` protocol fixture; build it once when absent so a
@@ -252,7 +258,10 @@ fn locate_mock_host() -> Option<PathBuf> {
         .to_path_buf();
     let exe_suffix = std::env::consts::EXE_SUFFIX;
     for profile in ["debug", "release"] {
-        let candidate = repo_root.join("target").join(profile).join(format!("mock_host{exe_suffix}"));
+        let candidate = repo_root
+            .join("target")
+            .join(profile)
+            .join(format!("mock_host{exe_suffix}"));
         if candidate.exists() {
             return Some(candidate);
         }
@@ -269,11 +278,12 @@ fn ensure_mock_host() -> anyhow::Result<PathBuf> {
         .and_then(Path::parent)
         .ok_or_else(|| anyhow!("cannot locate repository root"))?
         .to_path_buf();
-    let status = std::process::Command::new(std::env::var("CARGO").unwrap_or_else(|_| "cargo".into()))
-        .current_dir(&repo_root)
-        .args(["build", "-p", "agent-process", "--bin", "mock_host"])
-        .status()
-        .context("spawn cargo build for the sandbox fixture")?;
+    let status =
+        std::process::Command::new(std::env::var("CARGO").unwrap_or_else(|_| "cargo".into()))
+            .current_dir(&repo_root)
+            .args(["build", "-p", "agent-process", "--bin", "mock_host"])
+            .status()
+            .context("spawn cargo build for the sandbox fixture")?;
     if !status.success() {
         bail!("building the mock_host sandbox fixture failed");
     }
@@ -297,17 +307,17 @@ async fn drive_activation(
     // Detail pass: same config against the bare host for the attestation.
     let (attestation, validation): (Option<SandboxAttestation>, String) =
         match ProcessHost::connect(config.clone()).await {
-        Ok(host) => {
-            let attestation = host.sandbox_attestation();
-            host.shutdown().await;
-            let result = match attestation.validate() {
-                Ok(()) => "Ok".to_string(),
-                Err(reason) => format!("Err({reason})"),
-            };
-            (Some(attestation), result)
-        }
-        Err(error) => (None, format!("connect failed: {error}")),
-    };
+            Ok(host) => {
+                let attestation = host.sandbox_attestation();
+                host.shutdown().await;
+                let result = match attestation.validate() {
+                    Ok(()) => "Ok".to_string(),
+                    Err(reason) => format!("Err({reason})"),
+                };
+                (Some(attestation), result)
+            }
+            Err(error) => (None, format!("connect failed: {error}")),
+        };
 
     let manifest = demo_manifest(profile, &program.to_string_lossy());
     let capability = ProcessCapabilityAdapter::with_config(manifest, config.clone());
@@ -332,7 +342,9 @@ async fn drive_activation(
                 row.activation_result = "refused";
                 let reason = format!("{error:#}");
                 if subset {
-                    row.fail(format!("activation check passed yet start refused: {reason}"));
+                    row.fail(format!(
+                        "activation check passed yet start refused: {reason}"
+                    ));
                     return;
                 }
                 row.typed_reason = Some(reason);
@@ -357,7 +369,10 @@ fn contract_rows(rows: &mut Vec<M13Row>) {
     // A claimed-true quota without its mechanism proof is refused by the
     // type itself.
     let mut inconsistent = SandboxAttestation {
-        capabilities: SandboxCapabilities { memory_quota: true, ..Default::default() },
+        capabilities: SandboxCapabilities {
+            memory_quota: true,
+            ..Default::default()
+        },
         backend: "fixture".into(),
         backend_version: "1".into(),
         evidence: SandboxEvidence::default(),
@@ -451,9 +466,18 @@ fn render_report(
 ) -> (String, M13Manifest) {
     let total = rows.len();
     let unresolved = rows.iter().filter(|row| !row.resolved).count();
-    let activated = rows.iter().filter(|row| row.activation_result == "activated").count();
-    let refused = rows.iter().filter(|row| row.activation_result == "refused").count();
-    let not_run = rows.iter().filter(|row| row.activation_result.starts_with("not_run")).count();
+    let activated = rows
+        .iter()
+        .filter(|row| row.activation_result == "activated")
+        .count();
+    let refused = rows
+        .iter()
+        .filter(|row| row.activation_result == "refused")
+        .count();
+    let not_run = rows
+        .iter()
+        .filter(|row| row.activation_result.starts_with("not_run"))
+        .count();
 
     let mut markdown = String::new();
     markdown.push_str("# Closure evidence — structured attestation and fail-closed activation\n\n");
@@ -474,7 +498,11 @@ fn render_report(
             row.platform_backend,
             row.sandbox_profile,
             row.required_subset_of_actual,
-            if row.attestation_validation.is_empty() { "-" } else { row.attestation_validation.as_str() },
+            if row.attestation_validation.is_empty() {
+                "-"
+            } else {
+                row.attestation_validation.as_str()
+            },
             row.activation_result,
             row.typed_reason.as_deref().unwrap_or("-"),
         ));
@@ -493,7 +521,10 @@ fn render_report(
         "- native untrusted floor refuses when its complete floor cannot be attested: {}\n",
         untrusted_refuses_natively
     ));
-    markdown.push_str(&format!("\n**Verdict: {}**\n", if gate_pass { "PASS" } else { "FAIL" }));
+    markdown.push_str(&format!(
+        "\n**Verdict: {}**\n",
+        if gate_pass { "PASS" } else { "FAIL" }
+    ));
 
     if unresolved > 0 {
         markdown.push_str("\n## Unresolved rows\n\n");
@@ -543,16 +574,38 @@ pub async fn run_m13_closure(out_dir: &Path) -> anyhow::Result<(String, bool)> {
 
     // Case 1: Trusted starts under whatever the platform could enforce
     // (its required floor is empty).
-    let mut row = M13Row::base("activation/trusted/minimal-floor", SandboxProfile::Trusted, backend_label);
+    let mut row = M13Row::base(
+        "activation/trusted/minimal-floor",
+        SandboxProfile::Trusted,
+        backend_label,
+    );
     row.artifact_ref = "rows.jsonl#activation/trusted/minimal-floor".into();
-    drive_activation(&mut row, fixtures.path(), &program, SandboxProfile::Trusted, false).await;
+    drive_activation(
+        &mut row,
+        fixtures.path(),
+        &program,
+        SandboxProfile::Trusted,
+        false,
+    )
+    .await;
     rows.push(row);
 
     // Case 2: Restricted activates when write confinement plus both
     // resource quotas are genuinely enforced.
-    let mut row = M13Row::base("activation/restricted/full-floor", SandboxProfile::Restricted, backend_label);
+    let mut row = M13Row::base(
+        "activation/restricted/full-floor",
+        SandboxProfile::Restricted,
+        backend_label,
+    );
     row.artifact_ref = "rows.jsonl#activation/restricted/full-floor".into();
-    drive_activation(&mut row, fixtures.path(), &program, SandboxProfile::Restricted, true).await;
+    drive_activation(
+        &mut row,
+        fixtures.path(),
+        &program,
+        SandboxProfile::Restricted,
+        true,
+    )
+    .await;
     rows.push(row);
 
     // Case 3: Restricted refuses when the write-confinement mechanism is
@@ -564,7 +617,14 @@ pub async fn run_m13_closure(out_dir: &Path) -> anyhow::Result<(String, bool)> {
         backend_label,
     );
     row.artifact_ref = "rows.jsonl#activation/restricted/missing-write-confinement".into();
-    drive_activation(&mut row, fixtures.path(), &program, SandboxProfile::Restricted, false).await;
+    drive_activation(
+        &mut row,
+        fixtures.path(),
+        &program,
+        SandboxProfile::Restricted,
+        false,
+    )
+    .await;
     rows.push(row);
 
     // Case 4: the untrusted floor can never be fully attested by a native
@@ -575,7 +635,14 @@ pub async fn run_m13_closure(out_dir: &Path) -> anyhow::Result<(String, bool)> {
         backend_label,
     );
     row.artifact_ref = "rows.jsonl#activation/untrusted-generated/native-refusal".into();
-    drive_activation(&mut row, fixtures.path(), &program, SandboxProfile::UntrustedGenerated, true).await;
+    drive_activation(
+        &mut row,
+        fixtures.path(),
+        &program,
+        SandboxProfile::UntrustedGenerated,
+        true,
+    )
+    .await;
     rows.push(row);
 
     contract_rows(&mut rows);
@@ -594,8 +661,10 @@ pub async fn run_m13_closure(out_dir: &Path) -> anyhow::Result<(String, bool)> {
         })
         .collect();
 
-    let activated_rows: Vec<&M13Row> =
-        rows.iter().filter(|row| row.activation_result == "activated").collect();
+    let activated_rows: Vec<&M13Row> = rows
+        .iter()
+        .filter(|row| row.activation_result == "activated")
+        .collect();
     let activated_ok = activated_rows.iter().all(|row| {
         row.attestation_validation == "Ok"
             && !row.enforcement_evidence_refs.is_empty()
@@ -604,8 +673,7 @@ pub async fn run_m13_closure(out_dir: &Path) -> anyhow::Result<(String, bool)> {
     let activated_without_evidence_zero = activated_ok;
 
     let untrusted_row = rows.iter().find(|row| {
-        row.sandbox_profile.contains("UntrustedGenerated")
-            && row.row_id.starts_with("activation/")
+        row.sandbox_profile.contains("UntrustedGenerated") && row.row_id.starts_with("activation/")
     });
     let untrusted_refuses_natively = untrusted_row
         .map(|row| row.activation_result == "refused" && row.resolved)
@@ -618,7 +686,6 @@ pub async fn run_m13_closure(out_dir: &Path) -> anyhow::Result<(String, bool)> {
             || row.activation_result != "refused"
             || !row.typed_reason.as_deref().unwrap_or_default().is_empty()
     });
-
 
     let gate_pass = unresolved.is_empty()
         && activated_without_evidence_zero

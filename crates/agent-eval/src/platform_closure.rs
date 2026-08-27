@@ -19,20 +19,20 @@
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+use agent_compose::HostToolPolicyRegistry;
 use agent_contracts::{
     ArgumentDigest, CancellationToken, ContextDiagnostics, ContextEngine, ContextIngress,
     ContextItemSummary, ContextMaintenanceReport, ContextMaintenanceTrigger, ContextQuery,
     ContextStateTransition, EffectId, EffectReceipt, EffectReconciliation, HostEffectBinding,
     HostToolPolicy, MaterializedContext, OperationEffectContext, OperationId, RunId, ScopeId,
-    ScopeKind, ToolCall, ToolDispatcher, ToolExecutionRequest, ToolOperationIdentity,
-    ToolOutcome, ToolOutput, ToolRisk, ToolSpec, ToolSurfaceSnapshot, TurnId,
+    ScopeKind, ToolCall, ToolDispatcher, ToolExecutionRequest, ToolOperationIdentity, ToolOutcome,
+    ToolOutput, ToolRisk, ToolSpec, ToolSurfaceSnapshot, TurnId,
 };
-use agent_compose::HostToolPolicyRegistry;
 use agent_core::{
     CoreAuthorityConfig, CorePort, CoreToolExecution, EffectAck, EffectBroker,
     EffectCommitDisposition, EffectCommitRejection, EffectCommitRequest, EffectReservation,
     JournaledEffectBroker, LocalEffectBroker, PolicyApprovalGate, ProcessEffectBroker,
-    ReservedEffect, ReservationJournal, build_core_port,
+    ReservationJournal, ReservedEffect, build_core_port,
 };
 use agent_workspace::Workspace;
 use anyhow::{Context as _, anyhow};
@@ -48,12 +48,8 @@ pub const M12_SCHEMA_VERSION: &str = "platform-closure.m12.v1";
 /// The authoritative exception scope from `agent-contracts`
 /// (`is_non_transactional_process_tool`): only these names may execute
 /// outside the transactional path.
-const DOCUMENTED_EXCEPTIONS: [&str; 4] = [
-    "process.run",
-    "process.session",
-    "shell.exec",
-    "verify.run",
-];
+const DOCUMENTED_EXCEPTIONS: [&str; 4] =
+    ["process.run", "process.session", "shell.exec", "verify.run"];
 
 // ---------------------------------------------------------------------------
 // Evidence rows
@@ -172,7 +168,10 @@ impl ContextEngine for NoopContext {
     async fn diagnostics(&self) -> agent_contracts::AgentResult<ContextDiagnostics> {
         Ok(Default::default())
     }
-    async fn inspect(&self, _limit: usize) -> agent_contracts::AgentResult<Vec<ContextItemSummary>> {
+    async fn inspect(
+        &self,
+        _limit: usize,
+    ) -> agent_contracts::AgentResult<Vec<ContextItemSummary>> {
         Ok(Vec::new())
     }
     async fn checkpoint(&self) -> agent_contracts::AgentResult<serde_json::Value> {
@@ -182,7 +181,6 @@ impl ContextEngine for NoopContext {
         Ok(())
     }
 }
-
 
 /// Minimal trusted policy source for the fencing drive: it serves the
 /// builtin table plus one operator-reviewed plugin binding. Entries are
@@ -205,11 +203,14 @@ impl FenceRegistry {
         let mut entries = BUILTIN_TOOL_POLICIES.clone();
         entries.push(policy);
         let mut epochs = std::collections::HashMap::new();
-        epochs.insert(
-            tool_name,
-            Arc::new(std::sync::atomic::AtomicU64::new(1)),
-        );
-        (Self { entries, epochs: std::sync::Mutex::new(epochs) }, 1)
+        epochs.insert(tool_name, Arc::new(std::sync::atomic::AtomicU64::new(1)));
+        (
+            Self {
+                entries,
+                epochs: std::sync::Mutex::new(epochs),
+            },
+            1,
+        )
     }
 
     /// Move one binding's epoch forward, as an operator replacement or
@@ -226,7 +227,9 @@ impl FenceRegistry {
 #[async_trait::async_trait]
 impl agent_contracts::HostToolPolicies for FenceRegistry {
     fn policy_for(&self, tool_name: &str) -> Option<&HostToolPolicy> {
-        self.entries.iter().find(|policy| policy.tool_name == tool_name)
+        self.entries
+            .iter()
+            .find(|policy| policy.tool_name == tool_name)
     }
 
     fn binding_epoch(&self, tool_name: &str) -> Option<u64> {
@@ -308,7 +311,10 @@ impl ToolDispatcher for ChainedDispatcher {
         specs
     }
 
-    async fn execute(&self, request: ToolExecutionRequest) -> agent_contracts::AgentResult<ToolOutcome> {
+    async fn execute(
+        &self,
+        request: ToolExecutionRequest,
+    ) -> agent_contracts::AgentResult<ToolOutcome> {
         let handled_by_builtin = self
             .builtin
             .specs()
@@ -359,7 +365,10 @@ impl ToolDispatcher for PluginWriteFixture {
         vec![Self::spec()]
     }
 
-    async fn execute(&self, request: ToolExecutionRequest) -> agent_contracts::AgentResult<ToolOutcome> {
+    async fn execute(
+        &self,
+        request: ToolExecutionRequest,
+    ) -> agent_contracts::AgentResult<ToolOutcome> {
         use agent_contracts::{AgentError, ToolExecutionFacts};
         let path = request
             .call
@@ -421,7 +430,10 @@ fn fresh_identity(call: &ToolCall) -> ToolOperationIdentity {
 }
 
 /// Fill in the Core-owned pieces of one fresh operation identity.
-fn bound_identity(core: &dyn CorePort, mut identity: ToolOperationIdentity) -> ToolOperationIdentity {
+fn bound_identity(
+    core: &dyn CorePort,
+    mut identity: ToolOperationIdentity,
+) -> ToolOperationIdentity {
     identity.run_id = core.run_id();
     identity.generation = core.current_authority_epoch();
     identity
@@ -441,10 +453,15 @@ async fn admit_and_execute(
         return Err(anyhow!("fresh closure operation must receive a permit"));
     };
     let permit = core.publish_tool_operation(permit, &call).await?;
-    Ok(core.execute_published_tool(permit, call, CancellationToken::new(), surface).await)
+    Ok(core
+        .execute_published_tool(permit, call, CancellationToken::new(), surface)
+        .await)
 }
 
-fn effect_context_of(identity: &ToolOperationIdentity, effect_id: EffectId) -> OperationEffectContext {
+fn effect_context_of(
+    identity: &ToolOperationIdentity,
+    effect_id: EffectId,
+) -> OperationEffectContext {
     OperationEffectContext {
         identity: identity.clone(),
         effect_id,
@@ -515,7 +532,11 @@ fn journal_last_seq(journal_path: &Path) -> anyhow::Result<u64> {
 async fn prepared_mutation_fixture_named(
     workspace: Workspace,
     relative: &str,
-) -> anyhow::Result<(ToolOperationIdentity, EffectId, Box<dyn agent_contracts::Effect>)> {
+) -> anyhow::Result<(
+    ToolOperationIdentity,
+    EffectId,
+    Box<dyn agent_contracts::Effect>,
+)> {
     let effect_id = EffectId::new();
     let identity = ToolOperationIdentity {
         run_id: RunId::new(),
@@ -528,7 +549,9 @@ async fn prepared_mutation_fixture_named(
         tool_name: "fs.write".into(),
         argument_digest: ArgumentDigest::sha256_bytes(relative.as_bytes()),
     };
-    let transaction = workspace.begin_mutation("fs.write", "write", relative).await?;
+    let transaction = workspace
+        .begin_mutation("fs.write", "write", relative)
+        .await?;
     let prepared = transaction
         .prepare_with_effect_context(b"window-body", effect_context_of(&identity, effect_id))
         .await?;
@@ -537,7 +560,11 @@ async fn prepared_mutation_fixture_named(
 
 async fn prepared_mutation_fixture(
     workspace: Workspace,
-) -> anyhow::Result<(ToolOperationIdentity, EffectId, Box<dyn agent_contracts::Effect>)> {
+) -> anyhow::Result<(
+    ToolOperationIdentity,
+    EffectId,
+    Box<dyn agent_contracts::Effect>,
+)> {
     prepared_mutation_fixture_named(workspace, "notes/window.md").await
 }
 
@@ -556,11 +583,17 @@ async fn drive_applied_family(
     verify_contains: &[(&str, &str)],
 ) {
     let row_id = format!("observed/{tool_name}/applied");
-    let mut row = ClosureRow::base(row_id.clone(), format!("tool-runtime::{tool_name} handler"), family_of(tool_name));
+    let mut row = ClosureRow::base(
+        row_id.clone(),
+        format!("tool-runtime::{tool_name} handler"),
+        family_of(tool_name),
+    );
     row.intent_binding = "trusted WorkspaceWrite binding (BUILTIN_TOOL_POLICIES)".into();
     row.artifact_ref = format!("rows.jsonl#{row_id}");
 
-    let journal_path = fixtures.path().join(format!("journal-{tool_name}-applied.jsonl"));
+    let journal_path = fixtures
+        .path()
+        .join(format!("journal-{tool_name}-applied.jsonl"));
     let outcome = async {
         let registry = Arc::new(HostToolPolicyRegistry::with_builtins());
         let core = scenario_core(workspace, registry, &journal_path, None).await?;
@@ -653,9 +686,17 @@ async fn drive_applied_family(
 /// Refusal before any reservation: an expired authority epoch refuses the
 /// commit and rolls staged bytes back; the journal honestly answers "this
 /// effect was never managed".
-async fn drive_pre_reserve_refusal(rows: &mut Vec<ClosureRow>, fixtures: &TempDir, workspace: Workspace) {
+async fn drive_pre_reserve_refusal(
+    rows: &mut Vec<ClosureRow>,
+    fixtures: &TempDir,
+    workspace: Workspace,
+) {
     let row_id = "observed/fs.write/pre_reserve_refusal";
-    let mut row = ClosureRow::base(row_id, "tool-runtime::fs.write handler", family_of("fs.write"));
+    let mut row = ClosureRow::base(
+        row_id,
+        "tool-runtime::fs.write handler",
+        family_of("fs.write"),
+    );
     row.artifact_ref = format!("rows.jsonl#{row_id}");
 
     let outcome = async {
@@ -706,12 +747,19 @@ async fn drive_pre_reserve_refusal(rows: &mut Vec<ClosureRow>, fixtures: &TempDi
 
 /// Broker-unavailable fence: a reserve failure fences dispatch, the staged
 /// effect settles NotApplied and nothing reaches any ledger.
-async fn drive_broker_unavailable(rows: &mut Vec<ClosureRow>, fixtures: &TempDir, workspace: Workspace) {
+async fn drive_broker_unavailable(
+    rows: &mut Vec<ClosureRow>,
+    fixtures: &TempDir,
+    workspace: Workspace,
+) {
     struct FailingBroker;
 
     #[async_trait::async_trait]
     impl EffectBroker for FailingBroker {
-        async fn reserve(&self, _reservation: EffectReservation) -> agent_contracts::AgentResult<String> {
+        async fn reserve(
+            &self,
+            _reservation: EffectReservation,
+        ) -> agent_contracts::AgentResult<String> {
             Err(agent_contracts::AgentError::Storage(
                 "closure fixture: simulated broker reservation failure".into(),
             ))
@@ -725,7 +773,11 @@ async fn drive_broker_unavailable(rows: &mut Vec<ClosureRow>, fixtures: &TempDir
     }
 
     let row_id = "observed/fs.write/broker_unavailable_fence";
-    let mut row = ClosureRow::base(row_id, "tool-runtime::fs.write handler", family_of("fs.write"));
+    let mut row = ClosureRow::base(
+        row_id,
+        "tool-runtime::fs.write handler",
+        family_of("fs.write"),
+    );
     row.artifact_ref = format!("rows.jsonl#{row_id}");
 
     let outcome = async {
@@ -794,9 +846,17 @@ async fn drive_broker_unavailable(rows: &mut Vec<ClosureRow>, fixtures: &TempDir
 /// Admitted-plugin binding fencing: replacing or revoking the binding
 /// between lease mint and commit fences that operation per binding; a fresh
 /// lease under the moved epoch commits normally.
-async fn drive_plugin_binding_fence(rows: &mut Vec<ClosureRow>, fixtures: &TempDir, workspace: Workspace) {
+async fn drive_plugin_binding_fence(
+    rows: &mut Vec<ClosureRow>,
+    fixtures: &TempDir,
+    workspace: Workspace,
+) {
     let row_id = "observed/plugin.notes.write/binding_revocation_fence";
-    let mut row = ClosureRow::base(row_id, "capability plugin tool with operator-admitted binding", family_of(PLUGIN_TOOL_NAME));
+    let mut row = ClosureRow::base(
+        row_id,
+        "capability plugin tool with operator-admitted binding",
+        family_of(PLUGIN_TOOL_NAME),
+    );
     row.test_command =
         "agent-eval --platform-closure-m12; cargo test -p agent-compose host_policies".into();
     row.artifact_ref = format!("rows.jsonl#{row_id}");
@@ -904,9 +964,17 @@ async fn drive_plugin_binding_fence(rows: &mut Vec<ClosureRow>, fixtures: &TempD
 // Drives: crash windows on real effect bodies
 // ---------------------------------------------------------------------------
 
-async fn drive_window_reserve_only(rows: &mut Vec<ClosureRow>, fixtures: &TempDir, workspace: Workspace) {
+async fn drive_window_reserve_only(
+    rows: &mut Vec<ClosureRow>,
+    fixtures: &TempDir,
+    workspace: Workspace,
+) {
     let row_id = "crash-window/reserve-only";
-    let mut row = ClosureRow::base(row_id, "JournaledEffectBroker reservation face", family_of("fs.write"));
+    let mut row = ClosureRow::base(
+        row_id,
+        "JournaledEffectBroker reservation face",
+        family_of("fs.write"),
+    );
     row.artifact_ref = format!("rows.jsonl#{row_id}");
     let outcome = async {
         let journal_path = fixtures.path().join("window-reserve-only.jsonl");
@@ -930,8 +998,13 @@ async fn drive_window_reserve_only(rows: &mut Vec<ClosureRow>, fixtures: &TempDi
         drop(effect);
         drop(broker);
         let class = reopened_class(&journal_path, &effect_context_of(&identity, effect_id))?;
-        anyhow::ensure!(class == "NotApplied", "reserve-only window classified {class}");
-        Ok::<String, anyhow::Error>("reopened journal reconciles NotApplied (never dispatched)".into())
+        anyhow::ensure!(
+            class == "NotApplied",
+            "reserve-only window classified {class}"
+        );
+        Ok::<String, anyhow::Error>(
+            "reopened journal reconciles NotApplied (never dispatched)".into(),
+        )
     }
     .await;
     finish_seam_row(
@@ -943,9 +1016,17 @@ async fn drive_window_reserve_only(rows: &mut Vec<ClosureRow>, fixtures: &TempDi
     rows.push(row);
 }
 
-async fn drive_window_dispatch_no_ack(rows: &mut Vec<ClosureRow>, fixtures: &TempDir, workspace: Workspace) {
+async fn drive_window_dispatch_no_ack(
+    rows: &mut Vec<ClosureRow>,
+    fixtures: &TempDir,
+    workspace: Workspace,
+) {
     let row_id = "crash-window/dispatch-without-ack";
-    let mut row = ClosureRow::base(row_id, "JournaledEffectBroker reservation face", family_of("fs.write"));
+    let mut row = ClosureRow::base(
+        row_id,
+        "JournaledEffectBroker reservation face",
+        family_of("fs.write"),
+    );
     row.artifact_ref = format!("rows.jsonl#{row_id}");
     let outcome = async {
         let journal_path = fixtures.path().join("window-dispatch-noack.jsonl");
@@ -999,9 +1080,17 @@ async fn drive_window_dispatch_no_ack(rows: &mut Vec<ClosureRow>, fixtures: &Tem
     rows.push(row);
 }
 
-async fn drive_window_identity_drift(rows: &mut Vec<ClosureRow>, fixtures: &TempDir, workspace: Workspace) {
+async fn drive_window_identity_drift(
+    rows: &mut Vec<ClosureRow>,
+    fixtures: &TempDir,
+    workspace: Workspace,
+) {
     let row_id = "crash-window/identity-drift";
-    let mut row = ClosureRow::base(row_id, "JournaledEffectBroker reservation face", family_of("fs.write"));
+    let mut row = ClosureRow::base(
+        row_id,
+        "JournaledEffectBroker reservation face",
+        family_of("fs.write"),
+    );
     row.artifact_ref = format!("rows.jsonl#{row_id}");
     let outcome = async {
         let journal_path = fixtures.path().join("window-drift.jsonl");
@@ -1025,7 +1114,12 @@ async fn drive_window_identity_drift(rows: &mut Vec<ClosureRow>, fixtures: &Temp
         Ok::<String, anyhow::Error>("drifted identity reconciles Ambiguous, never guessed".into())
     }
     .await;
-    finish_seam_row(&mut row, outcome, "reserved record probed with mismatched identity", "Ambiguous");
+    finish_seam_row(
+        &mut row,
+        outcome,
+        "reserved record probed with mismatched identity",
+        "Ambiguous",
+    );
     rows.push(row);
 }
 
@@ -1189,7 +1283,8 @@ async fn drive_coordinator_inner(
         anyhow::ensure!(matches!(receipt, EffectReceipt::Applied { .. }));
     }
     drop(_staging2);
-    let ambiguous_class = reopened_class(&journal_path, &effect_context_of(&identity2, effect_id2))?;
+    let ambiguous_class =
+        reopened_class(&journal_path, &effect_context_of(&identity2, effect_id2))?;
 
     anyhow::ensure!(
         applied_class == "Applied",
@@ -1260,7 +1355,9 @@ async fn mechanical_rows(rows: &mut Vec<ClosureRow>, workspace: &Workspace) {
     // Every surfaced spec must be explainable by the table, the
     // recipe-conditional verifier, or read-only fallback risk.
     for spec in &specs {
-        let tabulated = BUILTIN_TOOL_POLICIES.iter().any(|policy| policy.tool_name == spec.name);
+        let tabulated = BUILTIN_TOOL_POLICIES
+            .iter()
+            .any(|policy| policy.tool_name == spec.name);
         let is_verifier = spec.name == tool_runtime::VERIFY_RUN_TOOL_NAME;
         if !tabulated && !is_verifier && spec.risk != ToolRisk::ReadOnly {
             let mut row = ClosureRow::base(
@@ -1281,7 +1378,11 @@ async fn mechanical_rows(rows: &mut Vec<ClosureRow>, workspace: &Workspace) {
 
 /// Execute the two generic process exceptions for real and prove they leave
 /// the transactional path untouched.
-async fn exception_execution_rows(rows: &mut Vec<ClosureRow>, fixtures: &TempDir, workspace: Workspace) {
+async fn exception_execution_rows(
+    rows: &mut Vec<ClosureRow>,
+    fixtures: &TempDir,
+    workspace: Workspace,
+) {
     let journal_path = fixtures.path().join("journal-exceptions.jsonl");
     let outcome = async {
         let registry = Arc::new(HostToolPolicyRegistry::with_builtins());
@@ -1351,7 +1452,8 @@ async fn exception_execution_rows(rows: &mut Vec<ClosureRow>, fixtures: &TempDir
 
     if let Err(error) = outcome {
         for row in rows.iter_mut().filter(|row| {
-            row.classification == "non_transactional_exception" && row.row_id.starts_with("observed/")
+            row.classification == "non_transactional_exception"
+                && row.row_id.starts_with("observed/")
         }) {
             row.fail(format!("{error:#}"));
         }
@@ -1410,26 +1512,72 @@ pub async fn run_m12_closure(out_dir: &Path) -> anyhow::Result<(String, bool)> {
         };
     }
 
-    step!(drive_applied_family(&mut rows, &fixtures, workspace.clone(), "fs.write",
+    step!(drive_applied_family(
+        &mut rows,
+        &fixtures,
+        workspace.clone(),
+        "fs.write",
         json!({"path": "src/main.rs", "content": "written by closure\n"}),
-        &[("src/main.rs", "written by closure")]));
-    step!(drive_applied_family(&mut rows, &fixtures, workspace.clone(), "edit.replace",
+        &[("src/main.rs", "written by closure")]
+    ));
+    step!(drive_applied_family(
+        &mut rows,
+        &fixtures,
+        workspace.clone(),
+        "edit.replace",
         json!({"path": "docs/readme.md", "old": "draft body", "new": "revised body"}),
-        &[("docs/readme.md", "revised body")]));
-    step!(drive_applied_family(&mut rows, &fixtures, workspace.clone(), "edit.patch",
+        &[("docs/readme.md", "revised body")]
+    ));
+    step!(drive_applied_family(
+        &mut rows,
+        &fixtures,
+        workspace.clone(),
+        "edit.patch",
         json!({"files": [
             {"path": "src/lib.rs", "hunks": [{"old": "placeholder lib", "new": "patched lib"}]},
             {"path": "src/util.rs", "hunks": [{"old": "placeholder util", "new": "patched util"}]}
         ]}),
-        &[("src/lib.rs", "patched lib"), ("src/util.rs", "patched util")]));
+        &[
+            ("src/lib.rs", "patched lib"),
+            ("src/util.rs", "patched util")
+        ]
+    ));
 
-    step!(drive_pre_reserve_refusal(&mut rows, &fixtures, workspace.clone()));
-    step!(drive_broker_unavailable(&mut rows, &fixtures, workspace.clone()));
-    step!(drive_plugin_binding_fence(&mut rows, &fixtures, workspace.clone()));
-    step!(drive_window_reserve_only(&mut rows, &fixtures, workspace.clone()));
-    step!(drive_window_dispatch_no_ack(&mut rows, &fixtures, workspace.clone()));
-    step!(drive_window_identity_drift(&mut rows, &fixtures, workspace.clone()));
-    step!(drive_process_coordinator(&mut rows, &fixtures, workspace.clone()));
+    step!(drive_pre_reserve_refusal(
+        &mut rows,
+        &fixtures,
+        workspace.clone()
+    ));
+    step!(drive_broker_unavailable(
+        &mut rows,
+        &fixtures,
+        workspace.clone()
+    ));
+    step!(drive_plugin_binding_fence(
+        &mut rows,
+        &fixtures,
+        workspace.clone()
+    ));
+    step!(drive_window_reserve_only(
+        &mut rows,
+        &fixtures,
+        workspace.clone()
+    ));
+    step!(drive_window_dispatch_no_ack(
+        &mut rows,
+        &fixtures,
+        workspace.clone()
+    ));
+    step!(drive_window_identity_drift(
+        &mut rows,
+        &fixtures,
+        workspace.clone()
+    ));
+    step!(drive_process_coordinator(
+        &mut rows,
+        &fixtures,
+        workspace.clone()
+    ));
 
     // A representative read-only call: completes without effects and never
     // touches a journal.
@@ -1450,14 +1598,19 @@ pub async fn run_m12_closure(out_dir: &Path) -> anyhow::Result<(String, bool)> {
         .collect();
 
     let seen_exceptions = observed_exception_names(&rows);
-    let documented: Vec<String> = DOCUMENTED_EXCEPTIONS.iter().map(|s| s.to_string()).collect();
+    let documented: Vec<String> = DOCUMENTED_EXCEPTIONS
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
     let scope_match = seen_exceptions.iter().all(|name| documented.contains(name));
     let crash_classes_covered = {
         let classes: Vec<&str> = rows
             .iter()
             .flat_map(|row| row.crash_seams.iter().map(|seam| seam.reconcile.as_str()))
             .collect();
-        classes.contains(&"NotApplied") && classes.contains(&"Applied") && classes.contains(&"Ambiguous")
+        classes.contains(&"NotApplied")
+            && classes.contains(&"Applied")
+            && classes.contains(&"Ambiguous")
     };
     let all_rows_resolved = unresolved.is_empty();
     let gate_pass = all_rows_resolved && scope_match && crash_classes_covered;
@@ -1497,7 +1650,11 @@ fn observed_exception_names(rows: &[ClosureRow]) -> Vec<String> {
 /// reach the transactional path.
 async fn readonly_spot_check(rows: &mut Vec<ClosureRow>, fixtures: &TempDir, workspace: Workspace) {
     let row_id = "observed/fs.read/no-effect-spot-check";
-    let mut row = ClosureRow::base(row_id, "tool-runtime::fs.read handler", "read_only_observation");
+    let mut row = ClosureRow::base(
+        row_id,
+        "tool-runtime::fs.read handler",
+        "read_only_observation",
+    );
     row.classification = "no_effect";
     row.artifact_ref = format!("rows.jsonl#{row_id}");
     let outcome = async {
@@ -1528,7 +1685,10 @@ async fn readonly_spot_check(rows: &mut Vec<ClosureRow>, fixtures: &TempDir, wor
         };
         let identity = bound_identity(port.as_ref(), fresh_identity(&call));
         let execution = admit_and_execute(port.as_ref(), identity.clone(), call, &surface).await?;
-        anyhow::ensure!(execution.effect_id.is_none(), "read-only calls carry no effect identity");
+        anyhow::ensure!(
+            execution.effect_id.is_none(),
+            "read-only calls carry no effect identity"
+        );
         anyhow::ensure!(
             matches!(&execution.outcome, ToolOutcome::Value(output) if output.ok),
             "fs.read must complete as a plain value"
@@ -1556,12 +1716,18 @@ fn render_report(
     crash_classes_covered: bool,
 ) -> (String, Manifest) {
     let total = rows.len();
-    let brokerable = rows.iter().filter(|row| row.classification == "brokerable").count();
+    let brokerable = rows
+        .iter()
+        .filter(|row| row.classification == "brokerable")
+        .count();
     let exceptions = rows
         .iter()
         .filter(|row| row.classification == "non_transactional_exception")
         .count();
-    let readonly = rows.iter().filter(|row| row.classification == "no_effect").count();
+    let readonly = rows
+        .iter()
+        .filter(|row| row.classification == "no_effect")
+        .count();
     let unresolved_count = rows.iter().filter(|row| !row.resolved).count();
 
     let mut markdown = String::new();
@@ -1589,7 +1755,11 @@ fn render_report(
             row.row_id,
             row.effect_family,
             row.classification,
-            if seams.is_empty() { "-" } else { seams.as_str() },
+            if seams.is_empty() {
+                "-"
+            } else {
+                seams.as_str()
+            },
             row.fencing.as_deref().unwrap_or("-"),
             if row.resolved { "yes" } else { "NO" },
         ));
@@ -1608,8 +1778,14 @@ fn render_report(
     markdown.push_str(&format!(
         "- exceptions stay inside the documented generic shell/process scope: {scope_match}\n"
     ));
-    markdown.push_str(&format!("- zero unresolved rows: {}\n", unresolved_count == 0));
-    markdown.push_str(&format!("\n**Verdict: {}**\n", if gate_pass { "PASS" } else { "FAIL" }));
+    markdown.push_str(&format!(
+        "- zero unresolved rows: {}\n",
+        unresolved_count == 0
+    ));
+    markdown.push_str(&format!(
+        "\n**Verdict: {}**\n",
+        if gate_pass { "PASS" } else { "FAIL" }
+    ));
 
     if unresolved_count > 0 {
         markdown.push_str("\n## Unresolved rows\n\n");
@@ -1668,7 +1844,10 @@ pub(crate) fn persist_report_and_manifest(
 ) -> anyhow::Result<()> {
     std::fs::create_dir_all(out_dir)?;
     std::fs::write(out_dir.join("REPORT.md"), report)?;
-    std::fs::write(out_dir.join("manifest.json"), serde_json::to_vec_pretty(&manifest)?)?;
+    std::fs::write(
+        out_dir.join("manifest.json"),
+        serde_json::to_vec_pretty(&manifest)?,
+    )?;
     Ok(())
 }
 
@@ -1691,10 +1870,10 @@ mod tests {
                     };
                     if row["resolved"] == serde_json::json!(false) {
                         eprintln!(
-                        "UNRESOLVED {} -> {}",
-                        row["row_id"],
-                        row["unresolved_reason"].as_str().unwrap_or(""),
-                    );
+                            "UNRESOLVED {} -> {}",
+                            row["row_id"],
+                            row["unresolved_reason"].as_str().unwrap_or(""),
+                        );
                     }
                 }
                 panic!("audit failed: {error:#}");

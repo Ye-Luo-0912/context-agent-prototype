@@ -55,7 +55,9 @@ pub struct RuntimeServices {
 
 impl RuntimeServices {
     /// Live registry handle for the capture-side generation handshake.
-    pub(crate) fn capability_registry(&self) -> Option<&Arc<crate::capability::CapabilityRegistry>> {
+    pub(crate) fn capability_registry(
+        &self,
+    ) -> Option<&Arc<crate::capability::CapabilityRegistry>> {
         self.capability_registry.as_ref()
     }
 

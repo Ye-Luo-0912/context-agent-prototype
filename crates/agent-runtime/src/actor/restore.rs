@@ -87,10 +87,7 @@ impl RuntimeActor {
         // snapshot-sequence allocator is the one exception — it is lineage
         // identity, so a continued run adopts at least the restored value
         // and can never move backwards across a task switch or cold load.
-        self.state.snapshot_sequence = self
-            .state
-            .snapshot_sequence
-            .max(restored_snapshot_sequence);
+        self.state.snapshot_sequence = self.state.snapshot_sequence.max(restored_snapshot_sequence);
         self.state.required_sequence = None;
         self.state.durable_sequence = None;
         self.core

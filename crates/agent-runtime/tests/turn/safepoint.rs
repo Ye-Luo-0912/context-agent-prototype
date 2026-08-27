@@ -767,7 +767,9 @@ async fn failed_checkpoint_write_fences_continuation_until_a_retry_lands() {
             .expect("retry turn finishes inside the deadline")
             .expect("event stream stays open");
         match envelope.event {
-            RuntimeEvent::CheckpointDurable { revision, sequence, .. } => {
+            RuntimeEvent::CheckpointDurable {
+                revision, sequence, ..
+            } => {
                 durable_seen = true;
                 // The retry captured the SAME anchor revision under a fresh
                 // snapshot: same anchor, distinct (higher) sequence.
@@ -790,7 +792,6 @@ async fn failed_checkpoint_write_fences_continuation_until_a_retry_lands() {
     instance.shutdown().await.unwrap();
 }
 
-
 /// Snapshot identity stays honest across task switches and repeat debt
 /// cycles: every frozen snapshot allocates a strictly increasing sequence,
 /// including two snapshots taken under identical anchor revisions from
@@ -808,11 +809,21 @@ async fn snapshot_sequences_increase_across_tasks_and_repeats() {
     let mut events = handle.subscribe();
 
     // Two independent tasks, both patched to anchor revision 1.
-    handle.set_focus("first bounded retry".into()).await.unwrap();
+    handle
+        .set_focus("first bounded retry".into())
+        .await
+        .unwrap();
     let first = handle.list_tasks().await.unwrap()[0].id;
-    handle.set_focus("second bounded retry".into()).await.unwrap();
+    handle
+        .set_focus("second bounded retry".into())
+        .await
+        .unwrap();
     let tasks_now = handle.list_tasks().await.unwrap();
-    let second = tasks_now.iter().find(|t| t.id != first).expect("a second task").id;
+    let second = tasks_now
+        .iter()
+        .find(|t| t.id != first)
+        .expect("a second task")
+        .id;
 
     let mut pairs = Vec::new();
     for task in [first, second] {
@@ -841,17 +852,27 @@ async fn snapshot_sequences_increase_across_tasks_and_repeats() {
             .expect("turn finishes inside the deadline")
             .expect("event stream stays open");
         match envelope.event {
-            RuntimeEvent::TaskResumeCommitted { anchor_revision, sequence, .. } => {
+            RuntimeEvent::TaskResumeCommitted {
+                anchor_revision,
+                sequence,
+                ..
+            } => {
                 seen_sequences.push((anchor_revision, sequence));
             }
-            RuntimeEvent::CheckpointDurable { revision, sequence, .. } => {
+            RuntimeEvent::CheckpointDurable {
+                revision, sequence, ..
+            } => {
                 let _ = (revision, sequence);
             }
             RuntimeEvent::TurnCompleted => break,
             _ => {}
         }
     }
-    assert_eq!(seen_sequences.len(), 1, "one settled batch freezes one snapshot");
+    assert_eq!(
+        seen_sequences.len(),
+        1,
+        "one settled batch freezes one snapshot"
+    );
     assert_eq!(
         seen_sequences[0],
         (1, 1),
@@ -867,14 +888,17 @@ async fn snapshot_sequences_increase_across_tasks_and_repeats() {
     handle.set_focus("third segment".into()).await.unwrap();
     let third = handle.list_tasks().await.unwrap()[0].id;
     let _ = (second, third);
-    handle.patch_task_anchor(
-        second,
-        1,
-        agent_runtime::AnchorPatch {
-            next_action: Some("advance again".into()),
-            ..agent_runtime::AnchorPatch::default()
-        },
-    ).await.unwrap();
+    handle
+        .patch_task_anchor(
+            second,
+            1,
+            agent_runtime::AnchorPatch {
+                next_action: Some("advance again".into()),
+                ..agent_runtime::AnchorPatch::default()
+            },
+        )
+        .await
+        .unwrap();
 
     handle.user_message("another round".into()).await.unwrap();
     let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
@@ -884,7 +908,11 @@ async fn snapshot_sequences_increase_across_tasks_and_repeats() {
             .expect("turn finishes inside the deadline")
             .expect("event stream stays open");
         match envelope.event {
-            RuntimeEvent::TaskResumeCommitted { anchor_revision, sequence, .. } => {
+            RuntimeEvent::TaskResumeCommitted {
+                anchor_revision,
+                sequence,
+                ..
+            } => {
                 seen_sequences.push((anchor_revision, sequence));
             }
             RuntimeEvent::CheckpointDurable { sequence, .. } => {
@@ -907,8 +935,6 @@ async fn snapshot_sequences_increase_across_tasks_and_repeats() {
     );
     instance.shutdown().await.unwrap();
 }
-
-
 
 /// The acknowledged TERMINAL snapshot must be a real durable fact: it loads
 /// checksum-verified, passes full validation, carries no active authority,
@@ -967,9 +993,14 @@ async fn final_terminal_artifact_loads_verified_and_names_no_active_task() {
 
     let store =
         agent_runtime::CheckpointStore::new(dir.path().join(".focus-agent").join("checkpoints"));
-    let payload = store.load_verified(artifact.as_deref().unwrap()).await.unwrap();
+    let payload = store
+        .load_verified(artifact.as_deref().unwrap())
+        .await
+        .unwrap();
     let checkpoint: agent_runtime::RuntimeCheckpoint = serde_json::from_slice(&payload).unwrap();
-    checkpoint.validate().expect("the terminal snapshot validates");
+    checkpoint
+        .validate()
+        .expect("the terminal snapshot validates");
     assert!(
         checkpoint.current_task_id.is_none() && checkpoint.tasks.active.is_none(),
         "terminal authority must be cleared consistently"
