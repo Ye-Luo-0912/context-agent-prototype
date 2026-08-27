@@ -515,8 +515,10 @@ versioned to accept byte-equivalent decompositions while retaining paths,
 strict bytes, revisions, settlement and no-fallback/no-confirm checks; the gate
 is `agent-eval.tool-surface-edit.v4`. A future canonical-granularity rule
 requires a documented consumer before reversing this decision. One archival 4x3
-confirmation window on the versioned gate is required. TOOL-EDIT-02 stays open
-until that confirmation.
+confirmation window on the versioned gate is now landed:
+`tool-surface-edit-v4-clean-tree-2026-08-26-r4` scored `strict 12/12 gate
+12/12 non_conflict_first 9/9` with zero confirmation reads. TOOL-EDIT-02 now
+meets its product contract on the frozen surface.
 
 ## Open P1 — runtime scheduling correctness
 
