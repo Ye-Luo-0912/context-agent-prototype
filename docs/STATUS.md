@@ -438,7 +438,14 @@ and sandbox contracts live elsewhere. Experiment facts live in
   acknowledged artifact tuple through the verified cold-load path, the
   terminal artifact restores into a third fresh instance with the completed
   task plane visible, capability generation rides capture and every
-  acknowledgement, and retention gained an aggregate byte budget.
+  acknowledgement, and retention gained an aggregate byte budget. The
+  frozen CompletionOpportunity off/on paired live gate then ran
+  decision-grade on 2026-08-28 (8 cells): it FAILED promotion — the off
+  baseline closed a normal cell by itself while no on-cell improved closure
+  (one offer armed, its lease was not called) — so per the frozen rule the
+  candidate ENDS default-off. `retry_policy_dev` behavior and diff
+  dimensions passed in all eight cells; the truth chain held under live
+  load throughout.
 - **Execution Convergence V1 mechanism landed** (2026-08-23, all 22
   items checked — the checklist is now the historical record
   [`EXECUTION_CONVERGENCE_V1.md`](EXECUTION_CONVERGENCE_V1.md)):

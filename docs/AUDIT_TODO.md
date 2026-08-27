@@ -111,7 +111,7 @@ uses it. A follow-up 4/4 pair reduced failures to 2/1 but left C at 77 rounds /
 84 calls versus A's 49/36, so this deterministic defect is fixed while the
 live round/call acceptance remains open.
 
-### TOOL-CONTINUITY-01 — turn completion must not erase multi-turn task affinity (candidate; live success gate open 2026-08-24)
+### TOOL-CONTINUITY-01 — turn completion must not erase multi-turn task affinity (fixed; the CompletionOpportunity candidate ENDED by its 2026-08-28 decision-grade gate)
 
 The one-shot completion trace isolated a lifecycle feedback loop rather than a
 Context-size problem. Dynamic C called and committed `task.complete` on 9/15
@@ -157,12 +157,19 @@ offer -> lease -> explicit `task.complete` -> closure chain, but sparse arming,
 worse paired efficiency and the reopened evaluator defects make the attempts
 non-decision-grade.
 
-Before another live attempt, bind positive mutation evidence to the same
-verification basis and make persisting the offered key accrue checkpoint debt;
-today an old mutation can combine with a newer verifier and a crash can re-offer
-a key written after the last safe-point capture. Then close the reopened
-checkpoint, verification and evaluator items below. Closure discoverability
-and multi-turn non-premature closure must both pass before this item closes.
+The 2026-08-28 decision-grade rerun (post LT-RUN-05 WP1–WP5) armed once in
+four on-cells and the leased decision did not call; the paired off baseline
+closed a normal cell by itself. Outcomes regressed and closure did not
+improve, so the frozen promotion rule ENDED the candidate — default-off is
+final unless a new, separately documented design reopens it. The offer-debt
+and verification-basis prerequisites both landed before the run, so the
+failure is substantive (the affordance did not pay for itself), not
+mechanical. See `evidence/opportunity-gate/REPORT.md` (2026-08-28 section).
+
+Historical prerequisite text: an old mutation could combine with a newer
+verifier and a crash could re-offer a key written after the last safe-point
+capture; both are fixed (independent verification basis; `OpportunityOffered`
+checkpoint debt with a serialization round-trip survival proof).
 
 ### TOOL-PROC-01 — explicit ProgramResolver for process.run (fixed 2026-08-23)
 

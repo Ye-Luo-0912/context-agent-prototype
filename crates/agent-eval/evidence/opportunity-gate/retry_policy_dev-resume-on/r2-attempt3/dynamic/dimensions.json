@@ -1,0 +1,17 @@
+{
+  "allowed_diff": "pass",
+  "behavioral_oracle": "pass",
+  "completion_opportunity": "on",
+  "continuation": "restored",
+  "final_passed": false,
+  "mode": "resume",
+  "opportunity_called": false,
+  "opportunity_offers": [
+    "opp/1419b90d-0a4a-44f4-876f-582cbd05a876/a0/d2/w14/0a9d2aaf34251da8"
+  ],
+  "provider_runtime": "healthy",
+  "runtime_error": "continuation ended without TaskCompleted",
+  "schema": "retry-pilot-cell-v2",
+  "task_closure": "failed",
+  "workspace_self_check": "pass"
+}

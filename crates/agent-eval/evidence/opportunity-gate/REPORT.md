@@ -153,3 +153,77 @@ What remains before a decision-grade rerun:
    noise-dominated.
 Whether general discovered runners should ever be upgraded is a separate,
 gated decision; this report does not propose retuning them.
+
+---
+
+# Decision-grade rerun (2026-08-28) — gate FAILED; the candidate ends
+
+## Scope
+
+The frozen item-8 gate rerun on the repaired truth chain (LT-RUN-05 WP1–WP5
+landed: snapshot-sequence fence, unified validated capture, two-phase
+terminal completion, independent verification basis, evaluator truth
+reconstruction, tuple-only cold-resume matrix). Eight cells, C engine,
+same provider family as the availability probe that passed minutes earlier
+(`gpt-5.6-luna` @ PinAI, single-cell `add_test` probe: 3 rounds, 2 calls,
+0 failed outputs, first-try committed edit). The switch was the only
+variable. Bundles: `retry_policy_dev-{mode}-{arm}/rN-attempt3/` (attempt
+series r1–r3; earlier numbers belong to the superseded 2026-08-25 windows).
+
+## Cells
+
+| cell | opp | verdict | behavior | diff | closure | continuation | rounds | resumes | durables | offers | called |
+| --- | --- | --- | --- | --- | --- | --- | --- | ---: | ---: | ---: | --- |
+| normal r1 | off | FAIL | pass | pass | failed | n/a | 0+0 | 0 | 0 | 0 | no |
+| normal r2 | off | PASS | pass | pass | completed | n/a | 45+0 | 9 | 10 | 0 | no |
+| resume r1 | off | FAIL | pass | pass | failed | restored | 9+24 | 10 | 10 | 0 | no |
+| resume r2 | off | FAIL | pass | pass | failed | failed | 6+0 | 1 | 1 | 0 | no |
+| normal r1 | on | FAIL | pass | pass | failed | n/a | 31+0 | 8 | 8 | 0 | no |
+| normal r2 | on | FAIL | pass | pass | failed | n/a | 22+0 | 8 | 8 | 0 | no |
+| resume r1 | on | FAIL | pass | pass | failed | restored | 6+32 | 8 | 8 | 0 | no |
+| resume r2 | on | FAIL | pass | pass | failed | restored | 8+20 | 8 | 8 | 1 | no |
+
+`runtime_error` per failed cell is typed in its `dimensions.json` (two
+provider-stream stalls in the off arm, one in the on arm; the rest are
+honest "ended without TaskCompleted" lifecycle outcomes).
+
+## Paired summary (facts)
+
+| mode | arm | passed | completed | median rounds | offers | called |
+| --- | --- | ---: | ---: | ---: | ---: | ---: |
+| normal | off | 1/2 | 1 | 45 | 0 | 0 |
+| normal | on | 0/2 | 0 | 31 | 0 | 0 |
+| resume | off | 0/2 | 0 | 33 | 0 | 0 |
+| resume | on | 0/2 | 0 | 38 | 1 | 0 |
+
+## Promotion criteria, applied mechanically
+
+1. mandatory outcomes must not regress — **FAILED**: normal completed 1→0,
+   passed 1→0.
+2. closure must improve — **FAILED**: normal closure regressed; resume
+   unchanged at zero.
+3. median rounds and tool calls must fall — mixed (normal 45→31 fell,
+   resume 33→38 rose); moot given (1).
+4. no new tail — stalls appear in BOTH arms (provider-stream stalls hitting
+   phase-one start and phase-two mid-flight); not an arm effect, but the
+   censoring reinforces how thin the n=2 margins are.
+
+**Verdict: the gate FAILED promotion.** Per the frozen rule the failed gate
+ends the candidate: `CompletionOpportunity` stays default-off permanently
+unless a future, separately documented product reason reopens it with a new
+design — this report does not authorize prompt pressure, provider-specific
+policy, or a same-model A/C run on top of it.
+
+## What the run did establish
+
+- The truth chain holds under live load: every durable acknowledgement was
+  tuple-correlated, both resume cells restored and continued on cold
+  artifacts, and no cell duplicated an effect or hid a recovery state.
+- Arming remains rare even with the exact recipe: 1 offer across 4 on-cells
+  (`opp/…/a0/d2/w14/…` — basis 0, so no authoritative movement ever
+  happened), and the single leased decision did not call. The structural
+  arming cost recorded by the 2026-08-25 report stands.
+- The strongest normal baseline cell closed itself through catalog discovery
+  and explicit `task.complete` with the candidate OFF — model autonomy
+  already covers the closure path that the candidate tried to earn, which is
+  the substantive reason the affordance failed to pay for itself.
