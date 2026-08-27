@@ -331,6 +331,7 @@ pub struct GateReport {
 }
 
 impl GateReport {
+    #[allow(dead_code)]
     pub fn passed(&self) -> bool {
         self.resume_committed > 0
             && self.checkpoint_durable >= 2
@@ -768,6 +769,7 @@ async fn drive_two_phases(root: &Path) -> anyhow::Result<GateReport> {
 
 /// What one arm of the replay observed, body-free.
 #[derive(Debug, Default)]
+#[allow(dead_code)]
 struct OpportunityArmObservation {
     turn_completed: bool,
     task_completed: bool,
@@ -784,6 +786,7 @@ struct OpportunityArmObservation {
 
 /// Summary of the off/on pair.
 #[derive(Debug, Default)]
+#[allow(dead_code)]
 pub struct OpportunityReplayReport {
     pub on_offered_once: bool,
     /// Diagnostic: when the offer's checkpoint debt survives to a later
@@ -801,6 +804,7 @@ pub struct OpportunityReplayReport {
 }
 
 impl OpportunityReplayReport {
+    #[allow(dead_code)]
     pub fn passed(&self) -> bool {
         self.on_offered_once
             && self.on_surfaced_after_offer
@@ -819,6 +823,11 @@ impl OpportunityReplayReport {
 /// leased surface decision closes the task without any explicit load — and
 /// with it disabled the identical script must produce zero opportunity
 /// observations and never surface `task.complete` from derived readiness.
+///
+/// RETIRED 2026-08-28: the candidate ended by its decision-grade gate and
+/// `task.complete` joined the always-loaded surface, so the arms no longer
+/// differ by presence.
+#[allow(dead_code)]
 pub async fn run_opportunity_replay() -> anyhow::Result<OpportunityReplayReport> {
     let mut report = OpportunityReplayReport::default();
 
@@ -871,6 +880,7 @@ pub async fn run_opportunity_replay() -> anyhow::Result<OpportunityReplayReport>
     Ok(report)
 }
 
+#[allow(dead_code)]
 async fn drive_opportunity_arm(
     root: &Path,
     opportunity_switch: bool,
@@ -1093,27 +1103,9 @@ mod tests {
         );
     }
 
-    /// The item-8 freeze input: the already-satisfied replay must offer
-    /// exactly once per basis and close through the lease alone when the
-    /// candidate is enabled, and stay fully silent when it is not.
-    #[tokio::test]
-    async fn opportunity_replay_passes_off_and_on() {
-        let report = run_opportunity_replay()
-            .await
-            .expect("opportunity replay completes");
-        assert!(
-            report.passed(),
-            "on_offered_once={} on_offer_debt_owed={} on_surfaced_after_offer={} on_called_after_offer={} \
-             on_completed={} on_completed_key_matches_offer={} \
-             off_opportunity_events_zero={} off_never_surfaced={}",
-            report.on_offered_once,
-            report.on_offer_debt_owed,
-            report.on_surfaced_after_offer,
-            report.on_called_after_offer,
-            report.on_completed,
-            report.on_completed_key_matches_offer,
-            report.off_opportunity_events_zero,
-            report.off_never_surfaced,
-        );
-    }
+    // The item-8 off/on replay retired 2026-08-28 with the
+    // CompletionOpportunity candidate (its decision-grade gate failed
+    // promotion) and with `task.complete` joining the always-loaded
+    // production surface: the arms no longer differ by surface presence,
+    // so the replay has nothing left to isolate.
 }

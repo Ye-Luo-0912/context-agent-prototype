@@ -438,7 +438,15 @@ and sandbox contracts live elsewhere. Experiment facts live in
   acknowledged artifact tuple through the verified cold-load path, the
   terminal artifact restores into a third fresh instance with the completed
   task plane visible, capability generation rides capture and every
-  acknowledgement, and retention gained an aggregate byte budget. The
+  acknowledgement, and retention gained an aggregate byte budget.
+  Following the M15-window finding (ten behavioral-pass cells never closed
+  because `task.complete` was undiscoverable), the closure tool joined the
+  always-loaded production surface (surface rev v5). Presence is not
+  pressure: the completion acceptance gate remains the sole closure
+  authority and refuses premature or unverified proposals with a typed
+  per-turn warning, so model autonomy is unchanged and the context cost is
+  one compact schema. The off/on replay retired with the ended candidate.
+  The
   frozen CompletionOpportunity off/on paired live gate then ran
   decision-grade on 2026-08-28 (8 cells): it FAILED promotion — the off
   baseline closed a normal cell by itself while no on-cell improved closure
@@ -505,9 +513,10 @@ and sandbox contracts live elsewhere. Experiment facts live in
   manifest → operator-review → atomic `admit_reviewed`/revocation flow and
   per-binding epoch fence landed by 2026-08-26. M12 remains open only for the
   bounded production-path closure audit below.
-- Production always-load: `fs.list`, `fs.read`, `fs.write`, `search.grep`,
-  `artifact.read`, `edit.patch`, `git.status`, `git.diff`,
-  `capability.manage`. Their compact core schemas cost roughly 1k tokens total,
+- Production always-load (surface rev v5, 2026-08-28): `fs.list`, `fs.read`,
+  `fs.write`, `search.grep`, `artifact.read`, `edit.patch`, `git.status`,
+  `git.diff`, `task.complete`, `capability.manage`. `task.complete` closure
+  execution stays intent-gated by the completion acceptance gate. Their compact core schemas cost roughly 1k tokens total,
   still below the 4,096-token surface cap. Shell / `edit.replace` /
   `context.manage` / `task.complete` and plugin tools are catalog-only;
   NeedEvidence PreferSurfaces `context.manage`, while explicit task-close

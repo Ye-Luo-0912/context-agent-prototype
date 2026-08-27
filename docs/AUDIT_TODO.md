@@ -171,6 +171,15 @@ verifier and a crash could re-offer a key written after the last safe-point
 capture; both are fixed (independent verification basis; `OpportunityOffered`
 checkpoint debt with a serialization round-trip survival proof).
 
+Surface decision (2026-08-28, rev v5): the earlier guard "do not make
+`task.complete` permanent" is superseded by measured evidence. The M15
+window showed ten behavioral-pass cells never closed solely because the
+catalog-cold schema was never discovered; the guard's original disease
+(pre-mature closure erasing task affinity) is now structurally guarded by
+the LT-RUN-03 completion acceptance gate, which refuses premature or
+unverified proposals with a typed per-turn warning. `task.complete` joined
+the always-loaded production surface; `task.manage` stays catalog-cold.
+
 ### TOOL-PROC-01 — explicit ProgramResolver for process.run (fixed 2026-08-23)
 
 Reproduction on Windows confirmed a tool-side semantic defect, not model

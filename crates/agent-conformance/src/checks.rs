@@ -16,9 +16,10 @@ use crate::report::{ConformanceReport, ConformanceViolation};
 pub const MAX_CONFORMANCE_SCHEMA_BYTES: usize = 16 * 1024;
 
 /// The core read/discovery tools every surface must always offer.
-/// `task.complete` and `task.manage` stay out by design: durable closure
-/// and autonomous progress are catalog-cold and leased by explicit
-/// intent, a task requirement, or host discovery.
+/// `task.complete` ships on the production surface (closure discovery;
+/// execution stays gated by the completion acceptance gate). `task.manage`
+/// stays catalog-cold: autonomous progress is leased by explicit intent,
+/// a task requirement, or host discovery.
 pub const CONFORMANCE_CORE_TOOLS: &[&str] = &["fs.list", "fs.read", "artifact.read", "search.grep"];
 
 /// Check one `ToolSpec`: well-formed identity, a `type: object` input

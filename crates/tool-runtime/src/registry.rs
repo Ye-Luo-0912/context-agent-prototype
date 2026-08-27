@@ -83,6 +83,14 @@ impl Default for ToolLifecycleConfig {
                 "fs.write".into(),
                 "git.status".into(),
                 "git.diff".into(),
+                // Structured task closure. M15-window evidence (2026-08-28):
+                // 10 behavioral-pass cells never closed because the model
+                // never discovered this schema through the catalog. Presence
+                // is not pressure — the completion acceptance gate remains
+                // the sole closure authority and refuses premature or
+                // unverified proposals with a typed per-turn warning, so
+                // autonomy is unchanged and the cost is one compact schema.
+                "task.complete".into(),
                 // Catalog control plane: search/inspect/load/unload. The
                 // merged retrieval tool (`context.manage`) is catalog-only
                 // until EXTERNAL CONTEXT / NeedEvidence (item 24).
@@ -1273,8 +1281,8 @@ mod tests {
         );
         assert!(names.contains(&"capability.manage".to_string()));
         assert!(
-            !names.contains(&"task.complete".to_string()),
-            "task lifecycle closure is intent-gated, not an ordinary turn tool: {names:?}"
+            names.contains(&"task.complete".to_string()),
+            "closure discovery is on the surface; the completion acceptance gate              remains the sole closure authority: {names:?}"
         );
         assert!(
             !names.contains(&"context.gc_hint".to_string()),
@@ -1727,7 +1735,9 @@ mod tests {
     async fn load_and_unload_change_the_model_surface() {
         let dispatcher = dispatcher().await;
         assert!(!surface(&dispatcher).contains(&"edit.replace".to_string()));
-        assert!(!surface(&dispatcher).contains(&"task.complete".to_string()));
+        // task.complete ships on the production surface (closure discovery);
+        // an explicit load stays idempotent and unload still cools it.
+        assert!(surface(&dispatcher).contains(&"task.complete".to_string()));
 
         dispatcher.load("edit.replace").unwrap();
         assert!(surface(&dispatcher).contains(&"edit.replace".to_string()));
@@ -1737,8 +1747,14 @@ mod tests {
 
         dispatcher.unload("edit.replace").unwrap();
         assert!(!surface(&dispatcher).contains(&"edit.replace".to_string()));
-        dispatcher.unload("task.complete").unwrap();
-        assert!(!surface(&dispatcher).contains(&"task.complete".to_string()));
+        // task.complete is always-loaded now: unload refuses, exactly like
+        // the other core tools.
+        let unload = dispatcher.unload("task.complete");
+        assert!(
+            unload.is_err(),
+            "an always-loaded closure surface cannot be unloaded"
+        );
+        assert!(surface(&dispatcher).contains(&"task.complete".to_string()));
 
         // Core tools cannot be unloaded.
         let core = dispatcher.unload("fs.read");
@@ -1758,7 +1774,10 @@ mod tests {
         assert!(!dispatcher.may_omit_from_round("unknown.tool"));
         assert!(!dispatcher.may_omit_from_round("git.status"));
         assert!(dispatcher.may_omit_from_round("edit.replace"));
-        assert!(dispatcher.may_omit_from_round("task.complete"));
+        assert!(
+            !dispatcher.may_omit_from_round("task.complete"),
+            "closure discovery is always-surface and fail-closed omission"
+        );
     }
 
     #[tokio::test]

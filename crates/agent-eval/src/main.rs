@@ -631,15 +631,9 @@ async fn main() -> anyhow::Result<()> {
                 if !report.passed() {
                     anyhow::bail!("long-task gate failed");
                 }
-                let opportunity = long_task::run_opportunity_replay().await?;
-                println!(
-                    "completion_opportunity off/on replay: {} (offer_debt_observed={})",
-                    if opportunity.passed() { "PASS" } else { "FAIL" },
-                    opportunity.on_offer_debt_owed
-                );
-                if !opportunity.passed() {
-                    anyhow::bail!("completion-opportunity replay failed");
-                }
+                // The off/on replay retired with the ended candidate
+                // (2026-08-28); task.complete now ships on the production
+                // surface, so the arms no longer differ by presence.
                 return Ok(());
             }
             "--opportunity-gate" => {

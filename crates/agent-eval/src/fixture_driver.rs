@@ -1736,9 +1736,10 @@ mod tests {
                 "fs.write".to_string(),
                 "git.status".to_string(),
                 "git.diff".to_string(),
+                "task.complete".to_string(),
                 agent_contracts::CAPABILITY_MANAGE.to_string(),
             ],
-            "live coding compare matches production; compact file-write/Git review primitives are core; context.manage and task.complete are intent-gated/catalog-only"
+            "live coding compare matches production (surface rev v5: closure discovery is core); context.manage stays intent-gated/catalog-only"
         );
         assert!(
             !production
@@ -1747,12 +1748,15 @@ mod tests {
                 .any(|name| name == agent_contracts::CONTEXT_MANAGE),
             "production must not always-load context.manage"
         );
+        // task.complete ships always-loaded (surface rev v5): presence is
+        // discovery, not authority — the completion acceptance gate refuses
+        // premature or unverified closure with a typed per-turn warning.
         assert!(
-            !production
+            production
                 .always_loaded
                 .iter()
                 .any(|name| name == "task.complete"),
-            "ordinary turn completion must not close task-scoped progress"
+            "closure discovery must be on the production surface"
         );
         assert!(
             production

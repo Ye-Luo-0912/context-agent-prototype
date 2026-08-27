@@ -21,7 +21,7 @@ V1 is the composition at the current HEAD, backed by these banked planes:
 | --- | --- | --- |
 | Platform gates | M12/M13 closure-audit reports, clean-tree PASS (`evidence/platform-closure/{m12,m13}/`) | closed 2026-08-27 |
 | Context | `context-mech.v2` 12-cell A/C live (`evidence/context-mech/`); frozen SPEC; GC/context policy untouched since | banked; **no rerun** |
-| Tool Surface | edit-gate `v4` archival 4×3 window (strict 12/12, gate 12/12, zero confirm reads) + deterministic crash/race/journal/disk-full suite | banked |
+| Tool Surface | edit-gate `v4` archival 4×3 window (strict 12/12, gate 12/12, zero confirm reads) + deterministic crash/race/journal/disk-full suite | banked; surface rev **v5** amendment 2026-08-28: `task.complete` added to the always-load set (closure discovery; acceptance gate unchanged) after the 08-28 window measured ten behavioral-pass cells blocked on discovery |
 | Execution coherence | Convergence Bench 4/4 deterministic on the acceptance HEAD (re-certified 2026-08-28); obligation-ledger and hidden-green live A/C longflow evidence (`longflow-post-obligation-2026-08-23/`) | banked + re-certified |
 | Long-task truth chain | LT-RUN-05 WP1–WP5 deterministic matrix (snapshot fence, unified capture, two-phase completion, verification basis, tuple-only cold resume) | landed |
 | Advisory switches | CompletionOpportunity ENDED default-off by its 2026-08-28 decision-grade gate; no candidate switches may be on | final |
@@ -86,7 +86,8 @@ unresolved items on the acceptance path.
 
 ## 5. Freeze rules during the window
 
-Pinned for the whole window: tool surface `v4`; LT-RUN substrate at the
+Pinned for the whole window: tool surface `v5` (v4 + always-loaded
+`task.complete`, amended 2026-08-28 after the first window's closure finding); LT-RUN substrate at the
 acceptance HEAD; opportunity OFF; the C context composition; the host policy
 snapshot; model/provider serving; pack contents; oracle sources; repeat
 count. No source change lands between the first and last cell — a mid-window
