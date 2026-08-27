@@ -14,6 +14,7 @@ changing architecture.
 | [`docs/ROADMAP.md`](docs/ROADMAP.md) | Milestone gates and ordered route |
 | [`docs/LONG_TASK_EVALUATION.md`](docs/LONG_TASK_EVALUATION.md) | Long-task Runtime gaps and one-directive development diagnostic |
 | [`docs/AUDIT_TODO.md`](docs/AUDIT_TODO.md) | Confirmed defect queue |
+| [`docs/M15_ACCEPTANCE.md`](docs/M15_ACCEPTANCE.md) | Frozen M15 acceptance design (V1) |
 | `crates/agent-eval/evidence/*/REPORT.md` | Experiment facts |
 
 Do not duplicate those lists here. Do not treat

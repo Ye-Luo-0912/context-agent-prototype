@@ -1108,7 +1108,7 @@ Frozen `context-bench.v1` SPEC / pack digest stay frozen. Wave-1 live
 retune GC from that live or from an `add_test` cell. Do not treat
 `Likely optimization target` as a modification order.
 
-### EVAL-03 — outcome split is partial; live attempts are non-decision-grade
+### EVAL-03 — outcome split is partial; live attempts are non-decision-grade (fixed 2026-08-28)
 
 Observed: dimensions are serialized separately, but overall PASS currently
 requires only task completion + behavioral PASS + clean diff. It does not
@@ -1135,6 +1135,14 @@ both observations and any
 midpoint used rather than naming the upper value as the median. Only then rerun
 the frozen paired gate. Design and exit gate:
 [`LONG_TASK_EVALUATION.md`](LONG_TASK_EVALUATION.md).
+
+Fixed 2026-08-28: the LT-RUN-05 WP4 evaluator truth reconstruction landed
+(typed per-dimension records incl. healthy-provider and no-runtime-error
+requirements, phase counters preserved on failure, restored/continued
+separated, mechanically derived summaries, for-n=2 medians reported as both
+observations), and the frozen paired gate then RERAN decision-grade — its
+promotion verdict (FAIL; candidate ended) is recorded in
+`evidence/opportunity-gate/REPORT.md` (2026-08-28 section).
 
 ## Closed archive (index only)
 

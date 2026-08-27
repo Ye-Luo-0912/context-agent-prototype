@@ -772,8 +772,13 @@ stay deferred and evidence-gated.
 ## Next milestone
 
 Engineering mainline after the 2026-08-27 platform-gate closures is the
-**V1 candidate and formal M15**: define the separately frozen M15 acceptance
-design, then run it. V2 Self-Iteration stays blocked until M15 closes.
+**V1 candidate and formal M15**: the frozen acceptance design is
+[`M15_ACCEPTANCE.md`](M15_ACCEPTANCE.md) — V1 is the banked planes plus one
+live development pack (3 tasks × normal/resume × 2 repeats); the Convergence
+Bench was re-certified 4/4 on the acceptance HEAD (2026-08-28). The run is
+gated on the design's four signed-off decision points (serving pin, budget,
+fixture authoring, closure reporting). V2 Self-Iteration stays blocked until
+M15 closes.
 The agent may grow capabilities, never evaluation or permission Core authority.
 
 In parallel, complete deterministic `LT-RUN-05`, then run at most the specified
