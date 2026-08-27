@@ -860,7 +860,7 @@ fn validate_patch_shape(arguments: &Value, require_revision: bool) -> PatchShape
     let Some(object) = arguments.as_object() else {
         return PatchShape::default();
     };
-    // V3 measures the one model-visible wire shape. The runtime still accepts
+    // V4 measures the one model-visible wire shape. The runtime still accepts
     // the older top-level shortcut for compatibility, but a benchmark call is
     // canonical only when every target and revision is explicit in `files[]`.
     if object.keys().any(|key| key != "files") {
