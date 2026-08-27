@@ -25,6 +25,7 @@ mod hygiene;
 mod long_live;
 mod long_task;
 mod longflow;
+mod m15_pack;
 mod metrics;
 mod mock_model;
 mod pilot;

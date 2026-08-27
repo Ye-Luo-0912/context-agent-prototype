@@ -1,11 +1,17 @@
-# M15 acceptance design (V1) — frozen draft, pending operator sign-off
+# M15 acceptance design (V1) — frozen; decision points signed off 2026-08-28
 
 This document is the "separately frozen acceptance design" that ROADMAP and
 [`LONG_TASK_EVALUATION.md`](LONG_TASK_EVALUATION.md) require before formal
 M15. It pins what V1 is, which evidence planes count, how cells are judged,
-and what may not change mid-run. The four decision points at the end need
-explicit operator sign-off before the first cell runs; everything else here
-is binding once that sign-off lands.
+and what may not change mid-run.
+
+## 0. Decision points — signed off 2026-08-28 (operator continuation)
+
+1. Serving pin: the current `gpt-5.6-luna` @ PinAI serving.
+2. Budget: 12 development cells confirmed.
+3. Fixture authoring: `retry_diag_dev` / `retry_migrate_dev` per the specs
+   below (authored and frozen before the window).
+4. Closure reporting: reported per cell, not a mandatory pass dimension.
 
 ## 1. What V1 is — the candidate composition
 
@@ -55,9 +61,10 @@ successor with a bumped version): manifest (identity tuple incl.
 Bundles are immutable once claimed; a harness failure is an explicit
 NOT_RUN and cannot improve any verdict.
 
-Pre-run work item: tasks 2 and 3 must ship their harness-owned,
-network-free oracle crates and hidden checks **before** the window; authoring
-them after the first cell is a freeze violation.
+Pre-run work item: SATISFIED — tasks 2 and 3 ship their harness-owned,
+network-free oracles and hidden checks in
+`crates/agent-eval/src/m15_pack.rs`, each with deterministic self-tests
+(seeded state fails every check; the scripted minimal solution passes all).
 
 ## 4. Pass criteria
 
@@ -92,14 +99,9 @@ editing numbers is out of contract.
 second-context-engine A/C comparison (gated on a promoted frozen setting —
 none exists), and the model-comparison layer (only after V1 closes).
 
-## 7. Decision points requiring operator sign-off before the first cell
+## 7. Decision points — signed off 2026-08-28
 
-1. **Serving pin**: stay on the current `gpt-5.6-luna` @ PinAI serving, or
-   wait for a materially different one (the 08-28 window saw three
-   stream stalls in eight cells).
-2. **Cost**: 12 development cells ≈ the 08-28 window's order of magnitude
-   per cell; confirm the budget.
-3. **Fixture authoring**: approve the `retry_diag_dev` / `retry_migrate_dev`
-   specs (or substitute), since their oracles must exist and freeze first.
-4. **Closure reporting**: confirm closure stays a reported (non-mandatory)
-   dimension for V1.
+All four signed off per section 0 (serving pin kept; budget confirmed;
+fixtures authored per the specs in section 2 and frozen in
+`crates/agent-eval/src/m15_pack.rs`; closure stays reported-only). No open
+decision remains before the window.
