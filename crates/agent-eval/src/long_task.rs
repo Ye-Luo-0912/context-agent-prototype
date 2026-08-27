@@ -483,6 +483,9 @@ async fn drive_two_phases(root: &Path) -> anyhow::Result<GateReport> {
     let instance_a = spawn_instance(root, &journal_path, phase_one_model, false).await?;
     let handle_a = instance_a.handle();
     let mut events_a = handle_a.subscribe();
+    // A second independent subscription keeps the durable tuple observable
+    // even after the label drains consumed their own view of the stream.
+    let mut events_capture = handle_a.subscribe();
     handle_a
         .set_focus(DIRECTIVE.to_string())
         .await
@@ -509,15 +512,66 @@ async fn drive_two_phases(root: &Path) -> anyhow::Result<GateReport> {
     )
     .await?;
 
-    // Stop the runtime and capture its planes.
-    let checkpoint: RuntimeCheckpoint = instance_a
-        .checkpoint()
-        .await
-        .map_err(|e| anyhow!("phase-a checkpoint: {e}; labels_a={labels_a:?}"))?;
+    // ---- Cold boundary: the ONLY thing crossing into phase two is the
+    // exact acknowledged tuple (artifact, checksum, sequence, capability
+    // generation) captured from the durable event. The in-memory
+    // checkpoint object is dropped with the phase-one runtime.
+    let mut durable_tuple: Option<(String, String, u64, u64)> = None;
+    while let Ok(envelope) = events_capture.try_recv() {
+        if let RuntimeEvent::CheckpointDurable {
+            ref artifact,
+            ref checksum,
+            sequence,
+            capability_generation,
+            ..
+        } = envelope.event
+        {
+            durable_tuple =
+                Some((artifact.clone(), checksum.clone(), sequence, capability_generation));
+        }
+    }
+    let (artifact, ack_checksum, acked_sequence, acked_generation) = durable_tuple
+        .ok_or_else(|| anyhow!("phase-a never acknowledged a durable checkpoint"))?;
     instance_a
         .shutdown()
         .await
         .map_err(|e| anyhow!("phase-a shutdown: {e}"))?;
+
+    // Phase two loads THAT artifact cold: envelope checksum verified by the
+    // store, then the ack digest and snapshot sequence cross-checked against
+    // the tuple before anything restores. Any mismatch bails here — phase B
+    // must never silently resume from a stale or foreign snapshot.
+    let store = agent_runtime::CheckpointStore::new(
+        root.join(".focus-agent").join("checkpoints"),
+    );
+    let payload = store
+        .load_verified(&artifact)
+        .await
+        .map_err(|e| anyhow!("cold load of {artifact}: {e}"))?;
+    {
+        use sha2::Digest as _;
+        let digest = sha2::Sha256::digest(&payload);
+        let digest_hex: String = digest.iter().map(|byte| format!("{byte:02x}")).collect();
+        anyhow::ensure!(
+            digest_hex == ack_checksum,
+            "cold artifact digest {digest_hex} does not match the acknowledged checksum {ack_checksum}"
+        );
+    }
+    let checkpoint: RuntimeCheckpoint = serde_json::from_slice(&payload)
+        .map_err(|e| anyhow!("cold payload deserialization: {e}"))?;
+    anyhow::ensure!(
+        checkpoint.snapshot_sequence == acked_sequence,
+        "cold artifact sequence {} does not match the acknowledged sequence {acked_sequence}",
+        checkpoint.snapshot_sequence
+    );
+    anyhow::ensure!(
+        checkpoint.capability_generation == acked_generation,
+        "cold artifact capability generation {} does not match the acknowledged {acked_generation}",
+        checkpoint.capability_generation
+    );
+    checkpoint
+        .validate()
+        .map_err(|e| anyhow!("cold artifact failed validation: {e}"))?;
 
     // ---- Restore into a fresh runtime and continue the SAME directive.
     let phase_two_model = Arc::new(ScriptGateModel::new(vec![
@@ -570,6 +624,9 @@ async fn drive_two_phases(root: &Path) -> anyhow::Result<GateReport> {
         .map_err(|e| anyhow!("restore: {e}"))?;
     let handle_b = instance_b.handle();
     let mut events_b = handle_b.subscribe();
+    // Third subscription: keeps the FINAL (terminal) artifact tuple for the
+    // post-completion cold restore below.
+    let mut events_b_capture = handle_b.subscribe();
     handle_b
         .continue_active_task()
         .await
@@ -584,6 +641,74 @@ async fn drive_two_phases(root: &Path) -> anyhow::Result<GateReport> {
     )
     .await?;
     let shutdown = instance_b.shutdown().await;
+    shutdown?;
+
+    // ---- Terminal cold restore: the completion ack's exact tuple is the
+    // only handle phase C receives. It must load, digest-match, validate,
+    // and restore into a fresh instance whose task plane shows the task
+    // Completed — the durable truth chain closing where it started.
+    let mut final_tuple: Option<(String, String, u64, u64)> = None;
+    while let Ok(envelope) = events_b_capture.try_recv() {
+        if let RuntimeEvent::CheckpointDurable {
+            ref artifact,
+            ref checksum,
+            sequence,
+            capability_generation,
+            ..
+        } = envelope.event
+        {
+            final_tuple = Some((artifact.clone(), checksum.clone(), sequence, capability_generation));
+        }
+    }
+    let (final_artifact, final_checksum, final_sequence, final_generation) = final_tuple
+        .ok_or_else(|| anyhow!("phase-b never acknowledged the terminal checkpoint"))?;
+    let terminal_payload = store
+        .load_verified(&final_artifact)
+        .await
+        .map_err(|e| anyhow!("cold load of terminal {final_artifact}: {e}"))?;
+    {
+        use sha2::Digest as _;
+        let digest = sha2::Sha256::digest(&terminal_payload);
+        let digest_hex: String = digest.iter().map(|byte| format!("{byte:02x}")).collect();
+        anyhow::ensure!(
+            digest_hex == final_checksum,
+            "terminal artifact digest does not match its acknowledgement"
+        );
+    }
+    let terminal_checkpoint: RuntimeCheckpoint =
+        serde_json::from_slice(&terminal_payload)
+            .map_err(|e| anyhow!("terminal payload deserialization: {e}"))?;
+    anyhow::ensure!(
+        terminal_checkpoint.snapshot_sequence == final_sequence
+            && terminal_checkpoint.capability_generation == final_generation,
+        "terminal artifact identity tuple drifted from its acknowledgement"
+    );
+    terminal_checkpoint
+        .validate()
+        .map_err(|e| anyhow!("terminal artifact failed validation: {e}"))?;
+    let instance_c = spawn_instance(
+        root,
+        &journal_path,
+        Arc::new(ScriptGateModel::new(Vec::new())),
+        false,
+    )
+    .await
+    .map_err(|e| anyhow!("phase-c spawn: {e}"))?;
+    instance_c
+        .restore(terminal_checkpoint)
+        .await
+        .map_err(|e| anyhow!("terminal cold restore: {e}"))?;
+    let completed_restored = instance_c
+        .handle()
+        .list_tasks()
+        .await?
+        .iter()
+        .any(|task| matches!(task.status, agent_runtime::TaskStatus::Completed));
+    anyhow::ensure!(
+        completed_restored,
+        "the fresh instance must see the completed task plane"
+    );
+    let shutdown = instance_c.shutdown().await;
     shutdown?;
 
     // ---- Assertions over both event streams and the final workspace.

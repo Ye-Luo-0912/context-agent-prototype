@@ -433,8 +433,12 @@ and sandbox contracts live elsewhere. Experiment facts live in
   The 2026-08-27 prerequisites for another live window have since landed:
   EXEC-REV-01's independent verification basis, EVAL-05's durable-tuple
   resume correlation and EVAL-06's typed oracle setup classification are
-  all fixed with deterministic coverage; what remains before that gate is
-  the LT-RUN-05 cold-resume matrix (work package five).
+  all fixed with deterministic coverage, and on 2026-08-28 the cold-resume
+  matrix itself landed: the scripted gate's resume phase consumes only the
+  acknowledged artifact tuple through the verified cold-load path, the
+  terminal artifact restores into a third fresh instance with the completed
+  task plane visible, capability generation rides capture and every
+  acknowledgement, and retention gained an aggregate byte budget.
 - **Execution Convergence V1 mechanism landed** (2026-08-23, all 22
   items checked — the checklist is now the historical record
   [`EXECUTION_CONVERGENCE_V1.md`](EXECUTION_CONVERGENCE_V1.md)):

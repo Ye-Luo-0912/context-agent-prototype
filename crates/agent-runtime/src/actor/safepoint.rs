@@ -22,6 +22,8 @@ pub(super) struct InFlightCheckpoint {
     /// The active task's anchor revision at freeze time, surfaced on the
     /// acknowledgement for observability only.
     anchor_revision: u64,
+    /// Capability generation the captured plane verified stable against.
+    capability_generation: u64,
     captured_debt: Vec<CheckpointDebtReason>,
 }
 
@@ -78,6 +80,9 @@ impl RuntimeActor {
                 None => Vec::new(),
             };
             if generation_before == registry.map(|registry| registry.generation()) {
+                let capability_generation = registry
+                    .map(|registry| registry.generation())
+                    .unwrap_or_default();
                 let (tasks_snapshot, current_task_id) = match &terminal_tasks_override {
                     Some(tasks) => (tasks.clone(), None),
                     None => (
@@ -99,6 +104,7 @@ impl RuntimeActor {
                     capabilities,
                     authority,
                     snapshot_sequence: self.state.snapshot_sequence,
+                    capability_generation,
                 });
             }
             // A capability surface mutation landed between the two planes;
@@ -154,6 +160,7 @@ impl RuntimeActor {
                     Some(self.state.durable_sequence.unwrap_or(0).max(sequence));
                 // Typed retirement: subtract only this artifact's frozen set.
                 let anchor_revision = in_flight.anchor_revision;
+                let capability_generation = in_flight.capability_generation;
                 self.state
                     .checkpoint_debt
                     .retain(|reason| !in_flight.captured_debt.contains(reason));
@@ -165,6 +172,7 @@ impl RuntimeActor {
                         revision: anchor_revision,
                         checksum: stored.checksum,
                         sequence,
+                        capability_generation,
                     })
                     .await;
                 Ok(())
@@ -291,6 +299,7 @@ impl RuntimeActor {
                 return;
             }
         };
+        let capability_generation = snapshot.capability_generation;
         let bytes = match serde_json::to_vec(&snapshot) {
             Ok(bytes) => bytes,
             Err(error) => {
@@ -319,6 +328,7 @@ impl RuntimeActor {
                     .map(|stored| (sequence, stored))
             }),
             anchor_revision,
+            capability_generation,
             captured_debt,
         });
     }
@@ -343,6 +353,7 @@ impl RuntimeActor {
                 self.state.durable_sequence =
                     Some(self.state.durable_sequence.unwrap_or(0).max(sequence));
                 let anchor_revision = in_flight.anchor_revision;
+                let capability_generation = in_flight.capability_generation;
                 self.state
                     .checkpoint_debt
                     .retain(|reason| !in_flight.captured_debt.contains(reason));
@@ -354,6 +365,7 @@ impl RuntimeActor {
                         revision: anchor_revision,
                         checksum: stored.checksum,
                         sequence,
+                        capability_generation,
                     })
                     .await;
                 Ok(())
@@ -490,6 +502,7 @@ impl RuntimeActor {
                         revision: anchor,
                         checksum: stored.checksum,
                         sequence: acked_sequence,
+                        capability_generation: snapshot.capability_generation,
                     })
                     .await;
                 Ok(true)

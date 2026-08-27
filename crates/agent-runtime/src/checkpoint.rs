@@ -89,6 +89,10 @@ pub const MAX_CHECKPOINT_ARTIFACT_BYTES: usize =
 /// Artifacts a store retains by default after each durable write; older
 /// ones are pruned best-effort while the newest always survives.
 pub const DEFAULT_MAX_RETAINED_CHECKPOINTS: usize = 32;
+/// Aggregate stored-bytes budget retention enforces on top of the count
+/// window: once the surviving artifacts exceed it, the oldest are pruned
+/// until they fit (the newest always survives).
+pub const DEFAULT_MAX_RETAINED_CHECKPOINT_BYTES: u64 = 64 * 1024 * 1024;
 
 /// Actor-owned atomic checkpoint artifact store under the workspace state
 /// directory. A write lands as a unique temp file renamed onto its final
@@ -174,7 +178,8 @@ impl CheckpointStore {
                 AgentError::InvalidRequest(format!("checkpoint rename failed: {error}"))
             })?;
         sync_directory_best_effort(&self.dir).await;
-        self.prune_retained(keep).await;
+        self.prune_retained(keep, DEFAULT_MAX_RETAINED_CHECKPOINT_BYTES)
+            .await;
         Ok(StoredCheckpoint {
             artifact,
             bytes: stored.len() as u64,
@@ -186,7 +191,7 @@ impl CheckpointStore {
     /// (which is the only one continuation may resume from). Best-effort:
     /// a failed unlink surfaces as nothing more than extra retained bytes,
     /// so it must not fail the durable acknowledgement that triggered it.
-    async fn prune_retained(&self, keep: usize) {
+    async fn prune_retained(&self, keep: usize, max_total_bytes: u64) {
         let mut entries: Vec<(std::time::SystemTime, std::path::PathBuf)> = Vec::new();
         let Ok(mut reader) = tokio::fs::read_dir(&self.dir).await else {
             return;
@@ -198,14 +203,24 @@ impl CheckpointStore {
             if !metadata.is_file() || !entry.file_name().to_string_lossy().ends_with(".json") {
                 continue;
             }
-            entries.push((
-                metadata.modified().unwrap_or(std::time::UNIX_EPOCH),
-                entry.path(),
-            ));
+            entries.push((metadata.modified().unwrap_or(std::time::UNIX_EPOCH), entry.path()));
         }
         entries.sort_by_key(|(modified, _)| std::cmp::Reverse(*modified));
-        for (_, path) in entries.into_iter().skip(keep) {
-            let _ = tokio::fs::remove_file(path).await;
+        // Newest-first. The newest artifact always survives (continuation
+        // may only resume from the latest durable snapshot); the rest fit
+        // inside the count window and the aggregate byte budget.
+        let mut kept_bytes = 0u64;
+        for (index, (_, path)) in entries.iter().enumerate() {
+            let size = tokio::fs::metadata(path)
+                .await
+                .map(|metadata| metadata.len())
+                .unwrap_or(0);
+            if index > 0 && (index >= keep || kept_bytes.saturating_add(size) > max_total_bytes)
+            {
+                let _ = tokio::fs::remove_file(path).await;
+                continue;
+            }
+            kept_bytes += size;
         }
     }
 
@@ -355,6 +370,10 @@ pub struct RuntimeCheckpoint {
     /// the live allocator so a continued lineage never moves backwards.
     #[serde(default)]
     pub snapshot_sequence: u64,
+    /// Capability-surface generation the capabilities plane was captured
+    /// under (handshake-verified stable). Zero without a registry.
+    #[serde(default)]
+    pub capability_generation: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -679,6 +698,31 @@ mod store_tests {
     }
 
     #[tokio::test]
+    async fn aggregate_byte_budget_prunes_oldest_first() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = CheckpointStore::new(dir.path());
+        let heavy = vec![b'a'; 200 * 1024];
+        let mut names = Vec::new();
+        for _ in 0..4 {
+            let stored = store.write_atomic_bounded(&heavy, 32).await.unwrap();
+            names.push(stored.artifact);
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+        store.prune_retained(32, 500 * 1024).await;
+        // ~800 KiB total against a 500 KiB budget: the two oldest die, the
+        // newest two survive and fit.
+        assert!(!dir.path().join(&names[0]).exists());
+        assert!(!dir.path().join(&names[1]).exists());
+        assert!(dir.path().join(&names[2]).exists());
+        assert!(dir.path().join(&names[3]).exists());
+        let total: u64 = [&names[2], &names[3]]
+            .iter()
+            .map(|name| std::fs::metadata(dir.path().join(name)).unwrap().len())
+            .sum();
+        assert!(total <= 500 * 1024, "survivors exceed the budget: {total}");
+    }
+
+    #[tokio::test]
     async fn retention_prunes_the_oldest_and_keeps_the_newest() {
         let dir = tempfile::tempdir().unwrap();
         let store = CheckpointStore::new(dir.path());
@@ -755,6 +799,7 @@ mod tests {
             capabilities: Vec::new(),
             authority: None,
             snapshot_sequence: 7,
+            capability_generation: 0,
         }
     }
 

@@ -250,6 +250,7 @@ fn checkpoint(run_id: RunId) -> RuntimeCheckpoint {
         capabilities: Vec::new(),
         authority: None,
         snapshot_sequence: 0,
+        capability_generation: 0,
     }
 }
 

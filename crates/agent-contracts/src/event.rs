@@ -492,6 +492,11 @@ pub enum RuntimeEvent {
         /// Snapshot sequence this acknowledgement covers.
         #[serde(default)]
         sequence: u64,
+        /// Capability-surface generation the captured plane was verified
+        /// stable against. Zero when the composition runs without a
+        /// capability registry.
+        #[serde(default)]
+        capability_generation: u64,
     },
     /// The background checkpoint write failed. Accrued debt stays visible
     /// and retryable at the next safe point; nothing may claim safe

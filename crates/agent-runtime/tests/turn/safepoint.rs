@@ -643,6 +643,7 @@ async fn durable_ack_carries_revision_artifact_and_verifiable_payload() {
                 revision,
                 checksum,
                 sequence,
+                ..
             } => {
                 durable = Some((bytes, artifact, revision, checksum, sequence));
             }

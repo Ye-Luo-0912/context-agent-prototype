@@ -809,6 +809,21 @@ Implementation and proof order is fixed by dependency, not by round budget:
 5. deterministic end-to-end cold-resume matrix; then
 6. one decision-grade paired live gate.
 
+Status: the deterministic cold-resume matrix landed 2026-08-28 inside the
+scripted gate itself. Phase B no longer receives a phase-one checkpoint
+object: the harness keeps only the acknowledged tuple
+(artifact, checksum, sequence, capability generation), cold-loads the
+artifact through the verified store path, cross-checks digest, sequence and
+generation against the tuple, validates the payload, and only then restores
+the fresh instance and continues the directive. After completion the gate
+repeats the same cold chain for the TERMINAL artifact into a third fresh
+instance and proves the completed task plane is visible there. Capability
+generation is handshake-verified at capture, embedded in the persisted
+payload and published on every `CheckpointDurable`. Retention enforces a
+newest-window count and an aggregate byte budget without ever dropping the
+latest artifact; the offered-key state rides the serialized resume state and
+cannot re-arm on the same basis after restore.
+
 The live gate remains the frozen retained-C CompletionOpportunity off/on
 normal/resume design with at least two paired repeats per mode and immutable
 evidence. Interleave arms where the harness supports it. The candidate remains

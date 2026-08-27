@@ -391,4 +391,22 @@ mod tests {
         // never masquerades as a spec change.
         assert_eq!(execution.verification.cause, VerificationCause::None);
     }
+
+    /// The offered key rides the serialized resume state: a cold restore
+    /// inherits it, so the same basis cannot re-arm the same hint after
+    /// recovery. Only a moved verification basis mints a fresh key.
+    #[test]
+    fn offer_key_survives_serialization_round_trip() {
+        let mut execution = ExecutionState::default();
+        execution.verification.spec_revision = 2;
+        execution.record_opportunity_offer("opp/t7/a2/d1/w5/deadbeef".to_string());
+        let encoded = serde_json::to_string(&execution).unwrap();
+        let restored: ExecutionState = serde_json::from_str(&encoded).unwrap();
+        assert_eq!(
+            restored.last_offered_opportunity.as_deref(),
+            Some("opp/t7/a2/d1/w5/deadbeef"),
+            "once-per-basis offer state must survive cold restore"
+        );
+        assert_eq!(restored.verification.spec_revision, 2);
+    }
 }

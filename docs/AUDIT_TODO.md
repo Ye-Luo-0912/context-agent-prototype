@@ -632,8 +632,10 @@ capability-generation handshake; snapshots validate before persisting;
 terminal completion is two-phase (durable prospective-terminal acknowledgement
 before any in-memory commit or `TaskCompleted`, failed writes leave the task
 pending/retryable); store input/output bounds and bounded retention landed.
-The reopened item stays until acknowledged artifacts restore into fresh
-Runtime/Context instances across the full deterministic matrix (WP5).
+Fixed 2026-08-28: acknowledged artifacts — including the final terminal
+snapshot — cold-load, validate and restore into fresh Runtime instances in
+the deterministic gate (third-instance phase), with the capability plane
+handshake-verified and its generation published on every acknowledgement.
 
 Observed: completion clears `TaskManager.active`, then captures the final
 checkpoint while the actor still carries `current_task_id`; restore validation
@@ -665,8 +667,10 @@ replace the anchor-aliased watermarks (`agent-runtime/src/actor/safepoint.rs`),
 acknowledgements retire exactly their artifact's debt set, continuation
 requires no outstanding debt / no in-flight write / no failed write plus a
 landed sequence, and the allocator watermark rides the checkpoint lineage
-without moving backwards on restore. The reopened item stays until the full
-LT-RUN-05 exit matrix runs.
+without moving backwards on restore. Fixed 2026-08-28: the deterministic
+gate's resume phase consumes only the acknowledged artifact tuple
+(artifact, checksum, sequence, capability generation) through the verified
+cold-load path, with third-instance terminal restore closing the matrix.
 
 Observed: `resume_state_revision`, required revision and durable revision all
 alias the task-anchor revision. Workspace mutation and verification can change
