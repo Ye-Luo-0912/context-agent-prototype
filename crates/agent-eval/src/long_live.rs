@@ -360,6 +360,10 @@ struct PhaseState {
     durable_after_mutation: bool,
     /// Artifact name of the latest acknowledged durable checkpoint.
     last_durable_artifact: Option<String>,
+    /// Full acknowledged tuple for the mutation debt.
+    last_durable_sequence: Option<u64>,
+    last_durable_checksum: Option<String>,
+    last_resume_sequence: Option<u64>,
     resume_committed: u64,
     checkpoint_durable: u64,
     turn_completed: bool,
@@ -423,17 +427,30 @@ fn step_event(
             collector.push(envelope);
             StepOutcome::Continue
         }
-        RuntimeEvent::CheckpointDurable { ref artifact, .. } => {
+        RuntimeEvent::CheckpointDurable {
+            ref artifact,
+            ref checksum,
+            sequence,
+            ..
+        } => {
             state.checkpoint_durable = state.checkpoint_durable.saturating_add(1);
-            state.durable_after_mutation |= state.mutation_tool.is_some();
             if !artifact.is_empty() {
                 state.last_durable_artifact = Some(artifact.clone());
+                state.last_durable_sequence = Some(sequence);
+                state.last_durable_checksum = Some(checksum.clone());
+            }
+            if state.mutation_tool.is_some()
+                && state.last_resume_sequence.is_some()
+                && Some(sequence) == state.last_resume_sequence
+            {
+                state.durable_after_mutation = true;
             }
             collector.push(envelope);
             StepOutcome::Continue
         }
-        RuntimeEvent::TaskResumeCommitted { .. } => {
+        RuntimeEvent::TaskResumeCommitted { sequence, .. } => {
             state.resume_committed = state.resume_committed.saturating_add(1);
+            state.last_resume_sequence = Some(sequence);
             collector.push(envelope);
             StepOutcome::Continue
         }
@@ -775,6 +792,8 @@ pub async fn run_cell(
     // instance is per-phase; the resume twin must not inherit any
     // phase-one in-memory state through a shared object.
     let mut checkpoint_artifact: Option<String> = None;
+    let mut checkpoint_sequence: Option<u64> = None;
+    let mut checkpoint_checksum: Option<String> = None;
     match compose_cell(root, model.clone(), c_engine(model.clone()), opportunity).await {
         Err(e) => error = Some(format!("phase-one compose failed: {e:#}")),
         Ok(composed) => {
@@ -815,14 +834,22 @@ pub async fn run_cell(
                         error = Some("normal run ended without TaskCompleted".into());
                     }
                     if mode == PilotMode::Resume {
-                        // Retain only the artifact locator across the
+                        // Retain the exact acknowledged tuple across the
                         // boundary: phase two loads and verifies the exact
                         // acknowledged safe-point artifact from disk.
-                        match state.last_durable_artifact.clone() {
-                            Some(artifact) => checkpoint_artifact = Some(artifact),
-                            None => {
+                        match (
+                            state.last_durable_artifact.clone(),
+                            state.last_durable_sequence,
+                            state.last_durable_checksum.clone(),
+                        ) {
+                            (Some(artifact), Some(seq), Some(sum)) => {
+                                checkpoint_artifact = Some(artifact);
+                                checkpoint_sequence = Some(seq);
+                                checkpoint_checksum = Some(sum);
+                            }
+                            _ => {
                                 error = Some(
-                                    "trigger fired without an acknowledged checkpoint artifact"
+                                    "trigger fired without an acknowledged checkpoint tuple"
                                         .into(),
                                 );
                             }
@@ -854,7 +881,23 @@ pub async fn run_cell(
         match loaded {
             Err(e) => error = Some(format!("checkpoint artifact load failed: {e:#}")),
             Ok(checkpoint) => {
-                match compose_cell(root, model.clone(), c_engine(model.clone()), opportunity).await
+                if let Some(expected) = checkpoint_sequence
+                    && checkpoint.snapshot_sequence != expected
+                {
+                    error = Some(format!(
+                        "checkpoint sequence mismatch: expected {expected}, got {}",
+                        checkpoint.snapshot_sequence
+                    ));
+                } else if let Some(expected) = checkpoint_checksum.as_ref()
+                    && !expected.is_empty()
+                {
+                    // load_verified already verified envelope checksum; keep the tuple for correlation.
+                    let _ = expected;
+                }
+                if error.is_some() {
+                    // sequence mismatch is a harness failure, not a restore attempt.
+                } else {
+                    match compose_cell(root, model.clone(), c_engine(model.clone()), opportunity).await
                 {
                     Err(e) => error = Some(format!("phase-two compose failed: {e:#}")),
                     Ok(composed) => {
@@ -902,6 +945,7 @@ pub async fn run_cell(
                         }
                     }
                 }
+                }
             }
         }
     }
@@ -938,33 +982,61 @@ pub async fn run_cell(
     let diff_clean = diff_violations.is_empty();
     let marker_violations = long_task::hidden_check_violations(root);
 
-    // Harness-owned behavioral oracle: inject after the diff scan, then
-    // run as an isolated integration target.
-    let oracle_record = match std::fs::write(
-        root.join("tests").join(format!("{ORACLE_TEST_NAME}.rs")),
-        ORACLE_TEST_SOURCE,
-    ) {
+    // Agent-authored self-check over the whole workspace, reported but
+    // never gating: run before oracle injection so the injected oracle
+    // cannot be executed as part of the self-check.
+    let self_check_record = run_cargo_test(root, &["--quiet"]).await;
+    // Harness-owned behavioral oracle: ensure parent directory exists
+    // before injection, then run as an isolated integration target.
+    let oracle_path = root.join("tests").join(format!("{ORACLE_TEST_NAME}.rs"));
+    let oracle_record = match std::fs::create_dir_all(oracle_path.parent().unwrap()) {
         Err(e) => HiddenCommandResult {
-            argv: cargo_argv(),
+            argv: vec![
+                "cargo".into(),
+                "test".into(),
+                "--test".into(),
+                ORACLE_TEST_NAME.into(),
+            ],
             expect_exit: 0,
             exit: None,
             timed_out: false,
             stdout: String::new(),
-            stderr: format!("oracle injection failed: {e}"),
+            stderr: format!("oracle setup failed: {e}"),
             stdout_truncated: false,
             stderr_truncated: false,
             passed: false,
         },
-        Ok(()) => {
-            let mut record = run_cargo_test(root, &["--test", ORACLE_TEST_NAME]).await;
-            record.argv = cargo_argv();
-            record
-        }
+        Ok(()) => match std::fs::write(&oracle_path, ORACLE_TEST_SOURCE) {
+            Err(e) => HiddenCommandResult {
+                argv: vec![
+                    "cargo".into(),
+                    "test".into(),
+                    "--test".into(),
+                    ORACLE_TEST_NAME.into(),
+                ],
+                expect_exit: 0,
+                exit: None,
+                timed_out: false,
+                stdout: String::new(),
+                stderr: format!("oracle injection failed: {e}"),
+                stdout_truncated: false,
+                stderr_truncated: false,
+                passed: false,
+            },
+            Ok(()) => run_cargo_test(root, &["--test", ORACLE_TEST_NAME]).await,
+        },
     };
-    // Agent-authored self-check over the whole workspace, reported but
-    // never gating: the evaluated agent owns these tests.
-    let self_check_record = run_cargo_test(root, &["--quiet"]).await;
-    let behavior = if oracle_record.passed { "pass" } else { "fail" }.to_string();
+    let _ = std::fs::remove_file(&oracle_path);
+    let behavior = if oracle_record.passed {
+        "pass"
+    } else if oracle_record.stderr.contains("oracle setup failed")
+        || oracle_record.stderr.contains("oracle injection failed")
+    {
+        "not_run"
+    } else {
+        "fail"
+    }
+    .to_string();
     let self_check = if self_check_record.passed {
         "pass"
     } else if error.is_some() && !workspace_has_tests(root) {
