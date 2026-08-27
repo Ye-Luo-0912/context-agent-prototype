@@ -177,7 +177,7 @@ pub enum EffectCommitRejection {
     MissingLease,
     InvalidLease,
     InvalidOperation,
-    /// MOD-AUTH-02: the effect itself reported an actual workspace write
+    /// the effect itself reported an actual workspace write
     /// to a path the leased intent never approved. Authority widening at
     /// commit time — rollback, never commit.
     ActualExceedsApproved,
@@ -713,7 +713,7 @@ impl CorePort for CoreAuthority {
             }
             EffectCommitDisposition::Rejected(rejection)
         } else {
-            // MOD-AUTH-02 — Actual ⊆ Approved at commit: when the leased
+            // Actual ⊆ Approved at commit: when the leased
             // intent is a workspace write and the prepared effect reports
             // its canonical actual writes, every actual path must be one
             // the intent approved. An effect that cannot report its
@@ -2734,7 +2734,7 @@ mod tests {
 
     #[tokio::test]
     async fn commit_refuses_an_actual_write_outside_the_approved_intent() {
-        // MOD-AUTH-02: the approved intent names `src/lib.rs`; the staged
+        // the approved intent names `src/lib.rs`; the staged
         // effect reports a write to `secret/other.rs`. Authority widened
         // between approval and commit — rollback, never commit.
         let (result, state) =

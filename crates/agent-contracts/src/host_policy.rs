@@ -269,7 +269,7 @@ fn workspace_write_intent(
         // `src/` must not be widened by a second file outside it. The
         // trusted knowledge-plane touch set (`metadata.files[].path`)
         // already carries every target — the authority intent must carry
-        // them too (MOD-AUTH-01). Each entry carries its own per-file
+        // them too (). Each entry carries its own per-file
         // byte estimate (the hunk delta); the cap is
         // [`crate::MAX_WORKSPACE_WRITE_SET`].
         let mut writes: Vec<crate::WorkspaceWriteBound> = Vec::new();
@@ -426,7 +426,7 @@ mod tests {
 
     #[test]
     fn edit_patch_multi_file_intent_is_the_whole_target_set() {
-        // MOD-AUTH-01 regression: the intent used to carry only the first
+        // regression: the intent used to carry only the first
         // `files[].path`, so one granted path widened authority over the
         // rest of the set. Every distinct target must be in the intent,
         // each with its own per-file byte estimate (duplicate paths merge

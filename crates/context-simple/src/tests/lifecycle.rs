@@ -436,7 +436,7 @@ async fn consumption_ack_rejects_cross_residency_duplicate_ownership() {
 
 #[tokio::test]
 async fn foreground_consumption_is_recorded_without_reinforcing_access() {
-    // MOD-FG-01: the prompt rendered a foreground body, so the ack carries
+    // the prompt rendered a foreground body, so the ack carries
     // its id. The engine records the consumption observably (diagnostics)
     // but must not reinforce access, Admit, or change residency —
     // foreground rehydration is transient by contract.

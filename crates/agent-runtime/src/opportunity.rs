@@ -1,4 +1,4 @@
-//! Derived, advisory completion-opportunity facts (LT-RUN-04 Slice C).
+//! Derived, advisory completion-opportunity facts.
 //!
 //! The opportunity is a safe-point observation, never completion authority:
 //! eligibility means the existing acceptance gate would accept, no proposal

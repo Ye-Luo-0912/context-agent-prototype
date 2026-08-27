@@ -100,7 +100,7 @@ pub enum EffectIntent {
     /// conservative byte estimate of the content being written.
     WorkspaceWrite { path: String, content_bytes: u64 },
     /// A multi-resource workspace write: every target of one operation,
-    /// each with its own approval-time byte estimate (MOD-AUTH-01). A
+    /// each with its own approval-time byte estimate (). A
     /// single-path intent never covers this variant — one approved file
     /// must not widen into the other files of the same call
     /// (`edit.patch` `files[]`). Capped at [`MAX_WORKSPACE_WRITE_SET`].
@@ -1549,7 +1549,7 @@ impl ToolExecutionRequest {
 
 /// One canonical actual workspace write a prepared effect will perform:
 /// the real relative path and the real byte count of the content being
-/// written (MOD-AUTH-02). Unlike [`WorkspaceWriteBound::max_bytes`] this
+/// written (). Unlike [`WorkspaceWriteBound::max_bytes`] this
 /// is not an estimate — it is measured from what was actually staged.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ActualWorkspaceWrite {
@@ -1571,7 +1571,7 @@ pub trait Effect: Send + Sync {
     /// Human-readable description for events and logs.
     fn describe(&self) -> String;
     /// Canonical actual workspace writes this effect will perform
-    /// (MOD-AUTH-02: Actual ⊆ Approved at commit). `None` (the default)
+    /// (Actual ⊆ Approved at commit). `None` (the default)
     /// means this effect cannot conservatively describe its targets, so
     /// the commit-time containment check is skipped for it; trusted
     /// builtin write effects report `Some`. Bytes are the *real* staged
@@ -2810,7 +2810,7 @@ mod tests {
         assert!(approved.covers(&EffectIntent::WorkspaceWriteSet {
             writes: vec![bound("src/a.rs", 60)],
         }));
-        // A different second file is never covered (MOD-AUTH-01).
+        // A different second file is never covered ().
         assert!(!approved.covers(&EffectIntent::WorkspaceWriteSet {
             writes: vec![bound("src/a.rs", 1), bound("secret/b.rs", 1)],
         }));

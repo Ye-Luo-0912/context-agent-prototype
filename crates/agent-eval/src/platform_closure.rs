@@ -1731,7 +1731,7 @@ fn render_report(
     let unresolved_count = rows.iter().filter(|row| !row.resolved).count();
 
     let mut markdown = String::new();
-    markdown.push_str("# M12 closure evidence — brokered production effect path\n\n");
+    markdown.push_str("#  closure evidence — brokered production effect path\n\n");
     markdown.push_str(&format!(
         "Schema `{M12_SCHEMA_VERSION}`. Generated mechanically by `agent-eval --platform-closure-m12`; \
          every observed row was executed inside this run.\n\n"
@@ -1813,7 +1813,7 @@ fn render_report(
             std::env::consts::FAMILY
         ),
         source_tree_digest: crate::bundle::source_tree_digest(),
-        gate: "M12".into(),
+        gate: "".into(),
         commands: vec![
             "agent-eval --platform-closure-m12",
             "cargo test -p agent-core --test broker_host_coordinator",

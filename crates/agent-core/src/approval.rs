@@ -393,7 +393,7 @@ impl TaskApprovalGate {
                 // Every write target must be inside the grant's prefix:
                 // the first file matching a grant must never widen
                 // authority to the remaining files of the same call
-                // (MOD-AUTH-01). An empty set fails closed, and each
+                // (). An empty set fails closed, and each
                 // entry's byte estimate plus the total must respect a
                 // content cap.
                 if writes.is_empty()
@@ -1301,7 +1301,7 @@ mod tests {
 
     #[tokio::test]
     async fn multi_file_patch_grant_covers_every_target_not_just_the_first() {
-        // MOD-AUTH-01 regression: `edit.patch files[]` used to derive a
+        // regression: `edit.patch files[]` used to derive a
         // single-path intent from the first file, so a `src/` standing
         // grant authorized writes to every other file in the set. The
         // intent now carries the whole target set and the grant must

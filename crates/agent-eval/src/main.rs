@@ -118,7 +118,7 @@ fn usage() -> ! {
          \n\
          usage: agent-eval --platform-closure-m12 [--evidence-dir <dir>]\n\
          \n\
-         Deterministic M12 closure audit over the real authority path:\n\
+         Deterministic  closure audit over the real authority path:\n\
          trusted admission, prepared workspace mutations, the journaled\n\
          reserved/dispatch/ack barrier, crash-window reopen reconciliation,\n\
          binding-epoch fencing and generic-process exception scope. Writes\n\

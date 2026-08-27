@@ -1641,7 +1641,7 @@ pub struct PreparedMutation {
     effect_context: Option<OperationEffectContext>,
     finished: bool,
     /// Canonical actual write target + real staged byte count, reported to
-    /// Core for the commit-time Actual ⊆ Approved check (MOD-AUTH-02).
+    /// Core for the commit-time Actual ⊆ Approved check ().
     relative_target: String,
     staged_bytes: u64,
     /// Expected SHA-256 of the exact staged bytes. Commit re-derives this
@@ -2024,7 +2024,7 @@ impl Effect for PreparedMutation {
     fn actual_workspace_writes(&self) -> Option<Vec<agent_contracts::ActualWorkspaceWrite>> {
         // The real staged target and the real byte count — not an
         // approval-time estimate. Core compares these against the leased
-        // intent's approved path set before committing (MOD-AUTH-02).
+        // intent's approved path set before committing ().
         Some(vec![agent_contracts::ActualWorkspaceWrite {
             path: self.relative_target.clone(),
             bytes: self.staged_bytes,
