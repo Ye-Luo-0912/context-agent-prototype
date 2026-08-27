@@ -34,10 +34,11 @@ use serde::{Deserialize, Serialize};
 /// verification stamp (`verification` / `intent=verify`, never inferred),
 /// and the runtime-owned failure diagnosis (`_runtime.failure_class`).
 ///
-/// Serialized inside the checkpointed turn frame and, while in transit from
-/// a trusted handler to its dispatching host, under the reserved
-/// `metadata` key [`crate::EXECUTION_FACTS_METADATA_KEY`] (stripped from
-/// untrusted producer output). There is still no event- or wire-level facts DTO.
+/// Serialized inside the checkpointed turn frame and as the durable
+/// `ToolFinished` event's output native facts, while in transit from a
+/// trusted handler to its dispatching host under the reserved `metadata`
+/// key [`crate::EXECUTION_FACTS_METADATA_KEY`] (stripped from untrusted
+/// producer output). A separate top-level wire field remains deferred.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct ToolExecutionFacts {
     resources: Vec<ResourceTouch>,
