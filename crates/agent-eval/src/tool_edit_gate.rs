@@ -2011,4 +2011,132 @@ mod tests {
         let bad_op = serde_json::json!({"op": "delete", "old": "a=v1", "new": "a=v2"});
         assert!(validate_hunk(&bad_op).is_none());
     }
+
+    #[test]
+    fn byte_equivalent_merged_hunks_satisfy_the_versioned_gate() {
+        let pack = crate::tool_edit_pack::load_pack().unwrap();
+        let task = pack.task("batch_two_file").unwrap();
+        let args = json!({
+            "files": [
+                {
+                    "path": "src/library.cfg",
+                    "base_revision": task.file.seed_files[0].sha256,
+                    "hunks": [{"op": "replace", "old": "api=v1\nmode=stable", "new": "api=v2\nmode=stable"}]
+                },
+                {
+                    "path": "src/client.cfg",
+                    "base_revision": task.file.seed_files[1].sha256,
+                    "hunks": [{"op": "replace", "old": "uses=v1\nflag=keep", "new": "uses=v2\nflag=keep"}]
+                }
+            ]
+        });
+        let shape = validate_patch_shape(&args, true);
+        assert!(shape.valid);
+        assert_ne!(shape.hunk_fingerprints, expected_hunk_fingerprints(task));
+        assert!(is_byte_equivalent(task, &shape));
+        // A strict-pass cell with merged hunks now passes the gate.
+        let run = RunId::new();
+        let rev_a = task.file.seed_files[0].sha256.clone();
+        let rev_b = task.file.seed_files[1].sha256.clone();
+        let events = vec![
+            run_started(run),
+            model_started(run, 2, 10),
+            event(
+                run,
+                3,
+                20,
+                RuntimeEvent::ToolStarted {
+                    call: ToolCall {
+                        id: "r1".into(),
+                        name: "fs.read".into(),
+                        arguments: json!({"path": "src/library.cfg"}),
+                    },
+                },
+            ),
+            event(
+                run,
+                4,
+                30,
+                RuntimeEvent::ToolFinished {
+                    output: ToolOutput {
+                        call_id: "r1".into(),
+                        tool_name: "fs.read".into(),
+                        ok: true,
+                        summary: "read".into(),
+                        model_content: String::new(),
+                        artifact_ref: None,
+                        metadata: json!({"path": "src/library.cfg", "revision": rev_a, "bytes": 16}),
+                    },
+                },
+            ),
+            event(
+                run,
+                5,
+                40,
+                RuntimeEvent::ToolStarted {
+                    call: ToolCall {
+                        id: "r2".into(),
+                        name: "fs.read".into(),
+                        arguments: json!({"path": "src/client.cfg"}),
+                    },
+                },
+            ),
+            event(
+                run,
+                6,
+                50,
+                RuntimeEvent::ToolFinished {
+                    output: ToolOutput {
+                        call_id: "r2".into(),
+                        tool_name: "fs.read".into(),
+                        ok: true,
+                        summary: "read".into(),
+                        model_content: String::new(),
+                        artifact_ref: None,
+                        metadata: json!({"path": "src/client.cfg", "revision": rev_b, "bytes": 16}),
+                    },
+                },
+            ),
+            model_started(run, 7, 60),
+            event(
+                run,
+                8,
+                70,
+                RuntimeEvent::ToolStarted {
+                    call: ToolCall {
+                        id: "patch".into(),
+                        name: "edit.patch".into(),
+                        arguments: args,
+                    },
+                },
+            ),
+            event(
+                run,
+                9,
+                80,
+                RuntimeEvent::ToolFinished {
+                    output: ToolOutput {
+                        call_id: "patch".into(),
+                        tool_name: "edit.patch".into(),
+                        ok: true,
+                        summary: "patched".into(),
+                        model_content: String::new(),
+                        artifact_ref: None,
+                        metadata: json!({
+                            "changed": true,
+                            "files": [
+                                {"path": "src/library.cfg", "changed": true, "hunks": 1, "bytes_before": 16, "bytes_after": 16},
+                                {"path": "src/client.cfg", "changed": true, "hunks": 1, "bytes_before": 16, "bytes_after": 16}
+                            ]
+                        }),
+                    },
+                },
+            ),
+            model_started(run, 10, 90),
+            run_completed(run, 11, 100),
+        ];
+        let report = analyze_cell(task, &events, &[], true, true);
+        assert!(report.passed, "{:?}", report.violations);
+        assert!(report.first_patch_exact_hunks);
+    }
 }
