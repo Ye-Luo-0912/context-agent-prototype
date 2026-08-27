@@ -334,6 +334,7 @@ impl AppState {
                 task_id,
                 anchor_revision,
                 debt,
+                ..
             } => {
                 self.push_system(format!(
                     "task {task_id} resume installed at r{anchor_revision}: {}",

@@ -17,7 +17,7 @@ use crate::tool_edit_pack::{
     self, ConflictContract, FixtureMutationRecord, ToolEditOp, ToolEditTask,
 };
 
-pub const SCHEMA: &str = "agent-eval.tool-surface-edit.v3";
+pub const SCHEMA: &str = "agent-eval.tool-surface-edit.v4";
 
 /// Fingerprint the exact analyzer implementation used to produce a gate.
 /// This complements the semantic schema version and prevents a report from
@@ -110,7 +110,17 @@ struct PatchShape {
     paths: Vec<String>,
     revisions: Vec<(String, String)>,
     hunk_fingerprints: Vec<HunkFingerprint>,
+    ordered_hunks: Vec<OrderedHunk>,
     hunks: usize,
+}
+
+#[derive(Debug, Clone, Eq, PartialEq, Ord, PartialOrd)]
+struct OrderedHunk {
+    path: String,
+    old: String,
+    new: String,
+    op: String,
+    occurrence: Option<usize>,
 }
 
 #[derive(Debug)]
@@ -118,6 +128,7 @@ struct PatchShapeAccumulator {
     paths: Vec<String>,
     revision_pairs: Vec<(String, String)>,
     hunk_fingerprints: Vec<HunkFingerprint>,
+    ordered_hunks: Vec<OrderedHunk>,
     hunks: usize,
     hunk_text_bytes: usize,
     all_revisions_valid: bool,
@@ -129,6 +140,7 @@ impl Default for PatchShapeAccumulator {
             paths: Vec::new(),
             revision_pairs: Vec::new(),
             hunk_fingerprints: Vec::new(),
+            ordered_hunks: Vec::new(),
             hunks: 0,
             hunk_text_bytes: 0,
             all_revisions_valid: true,
@@ -310,7 +322,10 @@ pub fn analyze_cell(
                     if !shape.revisions_from_latest_reads {
                         patch_revision_provenance_failures += 1;
                     }
-                    shape.exact_hunks = shape.hunk_fingerprints == expected_hunks;
+                    let exact_match = shape.hunk_fingerprints == expected_hunks;
+                    let byte_equivalent =
+                        !exact_match && strict_passed && is_byte_equivalent(task, &shape);
+                    shape.exact_hunks = exact_match || byte_equivalent;
                     if !shape.exact_hunks {
                         patch_hunk_contract_failures += 1;
                     }
@@ -877,6 +892,7 @@ fn validate_patch_shape(arguments: &Value, require_revision: bool) -> PatchShape
         paths: accumulated.paths,
         revisions: accumulated.revision_pairs,
         hunk_fingerprints: accumulated.hunk_fingerprints,
+        ordered_hunks: accumulated.ordered_hunks,
         hunks: accumulated.hunks,
     }
 }
@@ -944,6 +960,22 @@ fn validate_patch_file(
         accumulated
             .hunk_fingerprints
             .push(hunk_fingerprint(&path, old, new));
+        let op = hunk
+            .get("op")
+            .and_then(Value::as_str)
+            .unwrap_or("replace")
+            .to_string();
+        let occurrence = hunk
+            .get("occurrence")
+            .and_then(Value::as_u64)
+            .map(|value| value as usize);
+        accumulated.ordered_hunks.push(OrderedHunk {
+            path: path.clone(),
+            old: old.to_string(),
+            new: new.to_string(),
+            op,
+            occurrence,
+        });
         true
     })
 }
@@ -1036,6 +1068,92 @@ fn logical_hunk_sha256(value: &str, strip_terminal_newline: bool) -> String {
         }
     }
     format!("{:x}", digest.finalize())
+}
+
+fn is_byte_equivalent(task: &ToolEditTask, shape: &PatchShape) -> bool {
+    if !shape.valid || shape.ordered_hunks.is_empty() {
+        return false;
+    }
+    use std::collections::HashMap;
+    let mut seed_by_path: HashMap<String, &str> = HashMap::new();
+    let mut golden_by_path: HashMap<String, &str> = HashMap::new();
+    for file in &task.file.seed_files {
+        seed_by_path.insert(normalize_path(&file.path), file.content.as_str());
+    }
+    for file in &task.file.golden_files {
+        golden_by_path.insert(normalize_path(&file.path), file.content.as_str());
+    }
+    let mut grouped: HashMap<String, Vec<&OrderedHunk>> = HashMap::new();
+    for hunk in &shape.ordered_hunks {
+        grouped
+            .entry(normalize_path(&hunk.path))
+            .or_default()
+            .push(hunk);
+    }
+    for (path, hunks) in grouped {
+        let Some(seed) = seed_by_path.get(&path) else {
+            return false;
+        };
+        let Some(golden) = golden_by_path.get(&path) else {
+            return false;
+        };
+        let mut cur = seed.to_string();
+        for hunk in hunks {
+            let old = hunk.old.as_str();
+            let new = hunk.new.as_str();
+            if old.is_empty() || old == new {
+                return false;
+            }
+            let count = cur.matches(old).count();
+            if let Some(n) = hunk.occurrence {
+                if n == 0 || count < n {
+                    return false;
+                }
+            } else if count != 1 {
+                return false;
+            }
+            let (start, end) = if let Some(n) = hunk.occurrence {
+                let mut found = None;
+                for (idx, (off, _)) in cur.match_indices(old).enumerate() {
+                    if idx + 1 == n {
+                        found = Some((off, off + old.len()));
+                        break;
+                    }
+                }
+                let Some((s, e)) = found else {
+                    return false;
+                };
+                (s, e)
+            } else {
+                let Some(s) = cur.find(old) else {
+                    return false;
+                };
+                (s, s + old.len())
+            };
+            cur = match hunk.op.as_str() {
+                "replace" => format!("{}{}{}", &cur[..start], new, &cur[end..]),
+                "insert_before" => format!("{}{}{}", &cur[..start], new, &cur[start..]),
+                "insert_after" => format!("{}{}{}", &cur[..end], new, &cur[end..]),
+                _ => return false,
+            };
+        }
+        if cur != *golden {
+            return false;
+        }
+    }
+    let shape_paths: BTreeSet<String> = shape
+        .paths
+        .iter()
+        .map(|path| normalize_path(path))
+        .collect();
+    let target_paths: BTreeSet<String> = task
+        .file
+        .trace
+        .target_files
+        .iter()
+        .map(|path| normalize_path(path))
+        .collect();
+    shape_paths == target_paths
 }
 
 fn assess_fixture_mutation(
