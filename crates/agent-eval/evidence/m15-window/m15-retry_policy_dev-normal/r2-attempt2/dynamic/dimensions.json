@@ -1,0 +1,15 @@
+{
+  "allowed_diff": "pass",
+  "behavioral_oracle": "fail",
+  "completion_opportunity": "off",
+  "continuation": "n/a",
+  "final_passed": false,
+  "mode": "normal",
+  "opportunity_called": false,
+  "opportunity_offers": [],
+  "provider_runtime": "healthy",
+  "runtime_error": "phase one failed: cell stalled waiting for runtime events",
+  "schema": "retry-pilot-cell-v2",
+  "task_closure": "failed",
+  "workspace_self_check": "not_run"
+}

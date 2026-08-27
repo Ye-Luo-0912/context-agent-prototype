@@ -63,3 +63,55 @@ evidence; per the design, no plane borrows another's cells.
 - Behavior/diff infrastructure, the oracle suite, and the cold-resume chain
   are demonstrated decision-grade: they held across 12 live cells with zero
   harness-attributed failures.
+
+---
+
+# Surface rev v5 rerun — 2026-08-28 — window FAILED again (3/12), closure improved 1→4
+
+Scope: identical frozen design rerun after surface rev v5 (`task.complete`
+added to the always-loaded set; acceptance gate unchanged). Bundles:
+`m15-<task>-<mode>/rN-attempt2/`.
+
+## Per-cell facts (mechanically derived)
+
+| cell | behavior | diff | closure | continuation | PASS |
+| --- | --- | --- | --- | --- | --- |
+| diag normal r1 | fail | pass | completed | n/a | no |
+| diag normal r2 | fail | pass | failed | n/a | no |
+| diag resume r1 | pass | pass | failed | restored | no |
+| diag resume r2 | fail | pass | failed | restored | no |
+| migrate normal r1 | pass | pass | completed | n/a | **yes** |
+| migrate normal r2 | pass | pass | failed | n/a | no |
+| migrate resume r1 | pass | pass | failed | restored | no |
+| migrate resume r2 | pass | pass | failed | restored | no |
+| retry normal r1 | pass | pass | completed | n/a | **yes** |
+| retry normal r2 | fail | pass | failed | n/a | no |
+| retry resume r1 | pass | pass | completed | restored | **yes** |
+| retry resume r2 | pass | pass | failed | failed | no |
+
+## Gate application
+
+Plane PASS requires every cell PASS: **3/12 — the window FAILED again and
+M15 stays open.**
+
+## v4 → v5 deltas (same design, same serving, same day)
+
+- Task closures: 1/12 → 4/12 (every fixture closed at least once; the
+  always-loaded closure schema removed the discovery blocker it targeted).
+- Overall passes: 1/12 → 3/12, including the first resume cell ever to pass
+  end to end (restore + continuation + closure).
+- Behavior regressions are model variance, not surface effects: diag
+  behavior fell to 1/4 pass (the diagnosis contract is the hardest for this
+  serving) and one retry normal cell produced a broken implementation.
+- Infrastructure stayed flawless: 12/12 healthy, zero stalls, all resume
+  cells restored.
+
+## Standing blocker for M15 closure
+
+The all-cells bar fails on two independent model-capability findings:
+lifecycle closure consistency (8/12 behavioral-pass cells still ended
+without `TaskCompleted`) and diagnosis-task difficulty (1/4). Neither is a
+runtime or harness defect; both are honest measurements of the pinned
+serving against the frozen packs. Closing M15 requires either a serving
+that clears the frozen bar or a separately documented acceptance-design
+revision — this report does not authorize either.
