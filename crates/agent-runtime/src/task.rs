@@ -83,6 +83,11 @@ pub struct TaskAnchor {
     /// empty anchor (goal only, stamped from the task goal at creation);
     /// every CAS replacement bumps it.
     pub revision: u64,
+    /// Independent verification basis revision. Only boundary changes
+    /// (goal/constraints) bump it; autonomous progress patches keep it
+    /// stable so a Current verifier stays current through plan updates.
+    #[serde(default)]
+    pub verification_revision: u64,
     /// The user-given origin the task was created with. This is task
     /// identity / historical origin, not a perpetual current instruction:
     /// temporal wording (`yet`, `for now`, `first`) does not outrank the
@@ -803,6 +808,16 @@ impl TaskManager {
             })?
         };
         anchor.revision = revision;
+        if authority_changed {
+            anchor.verification_revision =
+                anchor.verification_revision.checked_add(1).ok_or_else(|| {
+                    AgentError::InvalidRequest(format!(
+                        "task {task_id} verification revision is exhausted"
+                    ))
+                })?;
+        } else {
+            anchor.verification_revision = task.anchor.verification_revision;
+        }
         Ok((
             TaskTxn {
                 plan: TaskPlan::ReplaceAnchor {
@@ -863,6 +878,18 @@ impl TaskManager {
             })?
         };
         replacement.revision = revision;
+        if authority_changed {
+            replacement.verification_revision = replacement
+                .verification_revision
+                .checked_add(1)
+                .ok_or_else(|| {
+                    AgentError::InvalidRequest(format!(
+                        "task {task_id} verification revision is exhausted"
+                    ))
+                })?;
+        } else {
+            replacement.verification_revision = task.anchor.verification_revision;
+        }
         Ok((
             TaskTxn {
                 plan: TaskPlan::ReplaceAnchor {
@@ -950,6 +977,7 @@ impl TaskManager {
                         task.resume.mark_spec_changed();
                     }
                     task.resume.anchor_revision = replacement.revision;
+                    task.resume.verification.spec_revision = replacement.verification_revision;
                     task.anchor = replacement;
                 }
             }
@@ -1406,6 +1434,7 @@ mod tests {
                 "evidence_refs",
             )],
             revision: 0,
+            verification_revision: 0,
         };
         let next = AnchorPatch {
             plan_progress: Some(vec!["next".into()]),
@@ -1828,6 +1857,7 @@ mod tests {
     fn evolved_anchor() -> TaskAnchor {
         TaskAnchor {
             revision: 0, // the CAS flow re-stamps this
+            verification_revision: 0,
             original_goal: "task A".into(),
             current_interpretation: "refactor the auth module".into(),
             constraints: vec!["no dependency changes".into()],

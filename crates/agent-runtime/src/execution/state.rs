@@ -692,14 +692,14 @@ impl ExecutionState {
         tools
     }
 
-    /// Exact verifier schemas remembered for the current task anchor. The
-    /// caller decides whether verification is due; current verification does
-    /// not keep schemas resident merely because a source exists.
-    pub fn verification_source_tools(&self, anchor_revision: u64) -> Vec<String> {
+    /// Exact verifier schemas remembered for the current verification basis.
+    /// The caller decides whether verification is due; current verification
+    /// does not keep schemas resident merely because a source exists.
+    pub fn verification_source_tools(&self, verification_revision: u64) -> Vec<String> {
         let mut tools: Vec<String> = self
             .verification_sources
             .iter()
-            .filter(|source| source.anchor_revision == anchor_revision)
+            .filter(|source| source.anchor_revision == verification_revision)
             .map(|source| source.tool_name.clone())
             .collect();
         tools.sort();
@@ -715,11 +715,12 @@ impl ExecutionState {
         &self,
         tool_name: &str,
         argument_digest: &str,
-        anchor_revision: u64,
+        verification_revision: u64,
         attribution: &RuntimeExecutionAttribution,
     ) -> Option<VerificationFact> {
         let verification_identity = attribution.exact_verification_identity()?;
-        if self.anchor_revision != anchor_revision || self.validity() != VerificationState::Current
+        if self.verification.spec_revision != verification_revision
+            || self.validity() != VerificationState::Current
         {
             return None;
         }
@@ -728,7 +729,7 @@ impl ExecutionState {
             .rev()
             .find(|fact| {
                 fact.ok
-                    && fact.anchor_revision == anchor_revision
+                    && fact.anchor_revision == verification_revision
                     && fact.directive_revision == self.directive_revision
                     && fact.workspace_revision == self.workspace_revision
                     && fact.source_tool_name == tool_name
@@ -747,7 +748,7 @@ impl ExecutionState {
     /// the caller, which owns the table; any uncertainty returns `None`.
     pub fn current_domain_verification_pass(
         &self,
-        anchor_revision: u64,
+        verification_revision: u64,
         attribution: &RuntimeExecutionAttribution,
     ) -> Option<VerificationFact> {
         // The skipped dispatch must itself be exact-capable; a downgrade to
@@ -760,7 +761,8 @@ impl ExecutionState {
         {
             return None;
         }
-        if self.anchor_revision != anchor_revision || self.validity() != VerificationState::Current
+        if self.verification.spec_revision != verification_revision
+            || self.validity() != VerificationState::Current
         {
             return None;
         }
@@ -769,7 +771,7 @@ impl ExecutionState {
             .rev()
             .find(|fact| {
                 fact.ok
-                    && fact.anchor_revision == anchor_revision
+                    && fact.anchor_revision == verification_revision
                     && fact.directive_revision == self.directive_revision
                     && fact.workspace_revision == self.workspace_revision
                     && fact.recipe_provenance.as_ref().is_some_and(|recorded| {
@@ -1296,7 +1298,7 @@ impl ExecutionState {
         self.verification_sources.push(VerificationSourceLease {
             tool_name,
             argument_digest,
-            anchor_revision: self.anchor_revision,
+            anchor_revision: self.verification.spec_revision,
         });
     }
 
@@ -1783,11 +1785,14 @@ impl ExecutionState {
         } else {
             bound_item(argument_digest)
         };
+        // Store the verification basis, not the whole anchor revision, so
+        // progress-only CAS does not invalidate a Current verifier.
+        let basis = self.verification.spec_revision;
         self.verifications.push(VerificationFact {
             summary: bound_item(&output.summary),
             ok: output.ok,
             turn,
-            anchor_revision: self.anchor_revision,
+            anchor_revision: basis,
             workspace_revision: self.workspace_revision,
             source_tool_name: source_tool_name.clone(),
             argument_digest: argument_digest.clone(),
@@ -1802,7 +1807,7 @@ impl ExecutionState {
             tool_name: source_tool_name,
             argument_digest,
             verification_identity,
-            anchor_revision: self.anchor_revision,
+            anchor_revision: basis,
             directive_revision: self.directive_revision,
             workspace_revision: self.workspace_revision,
         })
@@ -1833,7 +1838,7 @@ impl ExecutionState {
 
     pub(super) fn current_verifications(&self) -> impl Iterator<Item = &VerificationFact> {
         self.verifications.iter().filter(|row| {
-            row.anchor_revision == self.anchor_revision
+            row.anchor_revision == self.verification.spec_revision
                 && row.workspace_revision == self.workspace_revision
         })
     }

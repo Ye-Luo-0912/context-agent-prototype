@@ -380,12 +380,25 @@ fn typed_verification_does_not_keep_an_old_pass_after_mutation() {
 #[test]
 fn anchor_revision_change_does_not_promote_old_pass() {
     let mut resume = ExecutionState::default();
+    resume.verification.spec_revision = 1;
     let mut test = output("shell.exec", true, "exit 0");
     test.metadata = json!({"command": "cargo test", "verification": true});
     resume.observe_tool(&test, 1, 1);
+    // Progress-only anchor bump keeps the Current verifier visible
+    // because the verification basis is spec_revision, not the whole
+    // anchor revision.
     resume.observe_tool(&output("fs.read", true, "read auth"), 2, 2);
-    assert!(resume.view().verifications.is_empty());
+    assert!(
+        !resume.view().verifications.is_empty(),
+        "progress-only anchor change must not hide Current verification"
+    );
     assert_eq!(resume.anchor_revision, 2);
+    assert_eq!(resume.verification.spec_revision, 1);
+    // Authority change (spec bump) hides the old PASS.
+    resume.mark_spec_changed();
+    resume.verification.spec_revision = 2;
+    resume.anchor_revision = 2;
+    assert!(resume.view().verifications.is_empty());
 }
 
 #[test]
@@ -1493,6 +1506,7 @@ fn workspace_mutation_invalidates_speculative_negative_facts() {
 #[test]
 fn only_trusted_verify_attribution_mints_reusable_verification() {
     let mut state = ExecutionState::default();
+    state.verification.spec_revision = 7;
     let mut verify = output("test.verify", true, "tests passed");
     verify.metadata = json!({"verification": true});
     let untrusted = RuntimeExecutionAttribution::default();
@@ -1564,6 +1578,7 @@ fn domain_equivalent_pass_requires_matching_class_identity_and_declaration() {
     }
 
     let mut state = ExecutionState::default();
+    state.verification.spec_revision = 7;
     let verify = output("test.verify", true, "tests passed");
     state.observe_tool_attributed(
         &verify,
@@ -1615,6 +1630,7 @@ fn domain_equivalent_pass_requires_matching_class_identity_and_declaration() {
 #[test]
 fn exact_verification_pass_reuse_requires_the_complete_current_identity() {
     let mut state = ExecutionState::default();
+    state.verification.spec_revision = 7;
     state.on_user_turn("verify current state");
     let verify = output("test.verify", true, "tests passed");
     let exact = RuntimeExecutionAttribution {

@@ -349,7 +349,7 @@ impl RuntimeActor {
                 .state
                 .task_id
                 .and_then(|task_id| self.state.tasks.get(task_id))
-                .map(|task| task.anchor.revision);
+                .map(|task| task.anchor.verification_revision);
             let verified_pass = current_anchor_revision.and_then(|anchor_revision| {
                 let tools = self.services.tools();
                 self.state.turn.as_ref().and_then(|turn| {

@@ -209,6 +209,7 @@ mod tests {
     ) -> TaskAnchor {
         TaskAnchor {
             revision: 7,
+            verification_revision: 0,
             original_goal: "goal".into(),
             next_action: String::new(),
             current_interpretation: "goal".into(),

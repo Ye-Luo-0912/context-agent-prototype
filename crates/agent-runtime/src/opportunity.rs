@@ -92,7 +92,7 @@ pub(crate) fn derive_completion_opportunity(
     OpportunityDecision {
         ready: Some(OpportunityKey {
             key: build_key(task_id, execution, fact),
-            anchor_revision: execution.anchor_revision,
+            anchor_revision: execution.verification.spec_revision,
         }),
         reason: "eligible".to_string(),
     }
@@ -106,11 +106,12 @@ fn current_trusted_pass(execution: &ExecutionState) -> Option<&crate::execution:
     if execution.validity() != VerificationState::Current {
         return None;
     }
+    let basis = execution.verification.spec_revision;
     execution.verifications.iter().rev().find(|fact| {
         fact.ok
             && !fact.source_tool_name.is_empty()
             && !fact.verification_identity.is_empty()
-            && fact.anchor_revision == execution.anchor_revision
+            && fact.anchor_revision == basis
             && fact.directive_revision == execution.directive_revision
             && fact.workspace_revision == execution.workspace_revision
     })
@@ -143,7 +144,7 @@ fn build_key(
         .collect();
     format!(
         "opp/{task_id}/a{}/d{}/w{}/{}",
-        execution.anchor_revision,
+        execution.verification.spec_revision,
         execution.directive_revision,
         execution.workspace_revision,
         short
@@ -187,6 +188,7 @@ mod tests {
             provenance: ResourceProvenance::MutationResult,
         });
         execution.anchor_revision = 1;
+        execution.verification.spec_revision = 1;
         execution.directive_revision = 2;
         execution.workspace_revision = 3;
         execution.verification.state = VerificationState::Current;

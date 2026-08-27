@@ -189,7 +189,10 @@ impl ExecutionState {
                 {
                     verification_pass_events.push(event);
                 }
-                self.verification.spec_revision = self.anchor_revision;
+                // Keep the verification basis (spec_revision) as tracked by
+                // TaskAnchor.verification_revision; a progress-only anchor
+                // CAS must not move it. Authority changes already bump the
+                // basis via TaskManager commit.
                 self.verification.cause = VerificationCause::None;
                 self.verification.source_changed = false;
                 self.verification.unknown_pending = false;
@@ -238,7 +241,6 @@ impl ExecutionState {
         if is_verification && !output.ok {
             let _ = self.push_verification(output, argument_digest, attribution, turn);
             self.verification.cause = VerificationCause::FailureRepair;
-            self.verification.spec_revision = self.anchor_revision;
             self.verification.failed_open = true;
         }
         if matches!(footprint, MutationFootprint::Unknown) && had_prior_verification_evidence {
