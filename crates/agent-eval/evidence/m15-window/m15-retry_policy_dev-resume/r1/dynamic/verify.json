@@ -1,0 +1,143 @@
+{
+  "schema": "retry-pilot-cell-v2",
+  "kind": "retry_pilot_oracle",
+  "fixture_id": "retry_policy_dev-resume",
+  "expected_edit": "",
+  "passed": false,
+  "replay_complete": true,
+  "assertions": [
+    {
+      "path": "src/config.rs",
+      "pred": "max_delay_ms field exists exactly once",
+      "needles": [],
+      "passed": true,
+      "file_exists": true
+    },
+    {
+      "path": "src/error.rs",
+      "pred": "transient classification implemented",
+      "needles": [],
+      "passed": false,
+      "file_exists": true
+    },
+    {
+      "path": "src/lib.rs",
+      "pred": "retry loop bounds on max_attempts",
+      "needles": [],
+      "passed": false,
+      "file_exists": true
+    },
+    {
+      "path": "src/lib.rs",
+      "pred": "delay growth saturates at max_delay_ms",
+      "needles": [],
+      "passed": false,
+      "file_exists": true
+    },
+    {
+      "path": "src/lib.rs",
+      "pred": "public run_job signature preserved",
+      "needles": [],
+      "passed": true,
+      "file_exists": true
+    },
+    {
+      "path": "README.md",
+      "pred": "README documents the saturation boundary",
+      "needles": [],
+      "passed": true,
+      "file_exists": true
+    }
+  ],
+  "files": [
+    {
+      "path": "Cargo.toml",
+      "exists": true,
+      "sha256": "c1b470a7b7d62d1114f5f56721cf579ae68b7d1db8ad9c403534f7635a62f098",
+      "bytes": 80,
+      "truncated": false,
+      "body": "[package]\nname = \"jobrunner\"\nversion = \"0.1.0\"\nedition = \"2021\"\n\n[dependencies]\n"
+    },
+    {
+      "path": "src/error.rs",
+      "exists": true,
+      "sha256": "2b108014213e984b82f845a77ed649fcc58a42c711caf4391ccdc059580edc5d",
+      "bytes": 751,
+      "truncated": false,
+      "body": "//! Error taxonomy for the job runner.\n#[derive(Debug, Clone, PartialEq, Eq)]\npub enum RetryError {\n    /// Transient faults may be retried (network blips, temporary locks).\n    Transient(String),\n    /// Permanent faults must return immediately (bad input, missing job).\n    Permanent(String),\n}\n\nimpl RetryError {\n    /// Returns whether this error is eligible for another attempt.\n    pub fn is_transient(&self) -> bool {\n        matches!(self, Self::Transient(_))\n    }\n}\n#[cfg(test)]\nmod tests {\n    use super::RetryError;\n\n    #[test]\n    fn only_transient_errors_are_retryable() {\n        assert!(RetryError::Transient(\"temporary\".into()).is_transient());\n        assert!(!RetryError::Permanent(\"invalid input\".into()).is_transient());\n    }\n}\n"
+    },
+    {
+      "path": "src/config.rs",
+      "exists": true,
+      "sha256": "a65d2e4374658008b5a013a210aeabbf0a110fa53907646a664be3f9b84b43cd",
+      "bytes": 1483,
+      "truncated": false,
+      "body": "//! Retry configuration.\n#[derive(Debug, Clone, PartialEq, Eq)]\npub struct RetryConfig {\n    /// Total attempts allowed, including the first call. Must be >= 1.\n    pub max_attempts: u32,\n    /// Base delay before the first retry, in milliseconds.\n    pub base_delay_ms: u64,\n    /// Maximum delay between retries, in milliseconds.\n    pub max_delay_ms: u64,\n}\n\nimpl RetryConfig {\n    /// Returns the delay for a retry after `retry_index` previous retries.\n    pub(crate) fn delay_for_retry(&self, retry_index: u32) -> u64 {\n        let multiplier = 1u64.checked_shl(retry_index).unwrap_or(u64::MAX);\n        let delay = self.base_delay_ms.saturating_mul(multiplier);\n        delay.min(self.max_delay_ms)\n    }\n}\n#[cfg(test)]\nmod tests {\n    use super::RetryConfig;\n\n    fn config(base_delay_ms: u64, max_delay_ms: u64) -> RetryConfig {\n        RetryConfig {\n            max_attempts: 5,\n            base_delay_ms,\n            max_delay_ms,\n        }\n    }\n\n    #[test]\n    fn delay_grows_exponentially_from_base() {\n        let retry_config = config(10, 1_000);\n\n        assert_eq!(retry_config.delay_for_retry(0), 10);\n        assert_eq!(retry_config.delay_for_retry(1), 20);\n        assert_eq!(retry_config.delay_for_retry(2), 40);\n    }\n\n    #[test]\n    fn delay_is_capped_without_overflowing() {\n        let retry_config = config(u64::MAX, 500);\n\n        assert_eq!(retry_config.delay_for_retry(0), 500);\n        assert_eq!(retry_config.delay_for_retry(u32::MAX), 500);\n    }\n}\n"
+    },
+    {
+      "path": "src/sleeper.rs",
+      "exists": true,
+      "sha256": "29961c03c8941ddb6824d82833311ed7afe7a258423cfa9d68d9659e12534458",
+      "bytes": 350,
+      "truncated": false,
+      "body": "//! Injected sleeper so tests never really wait.\npub trait Sleeper {\n    fn sleep_ms(&mut self, ms: u64);\n}\n\n/// Records every requested delay instead of waiting.\n#[derive(Debug, Default)]\npub struct FakeSleeper {\n    pub sleeps: Vec<u64>,\n}\n\nimpl Sleeper for FakeSleeper {\n    fn sleep_ms(&mut self, ms: u64) {\n        self.sleeps.push(ms);\n    }\n}\n"
+    },
+    {
+      "path": "src/lib.rs",
+      "exists": true,
+      "sha256": "0bac121ef26ca86b41b76368fff029501e785ec9a4d65496f0aead128a6f3bec",
+      "bytes": 2659,
+      "truncated": false,
+      "body": "mod config;\nmod error;\nmod sleeper;\n\npub use config::RetryConfig;\npub use error::RetryError;\npub use sleeper::{FakeSleeper, Sleeper};\n\n/// Runs `job` until it succeeds or the retry budget is exhausted.\n/// The public signature is frozen; do not change it.\npub fn run_job(\n    config: &RetryConfig,\n    sleeper: &mut dyn Sleeper,\n    mut job: impl FnMut() -> Result<(), RetryError>,\n) -> Result<(), RetryError> {\n    let max_attempts = config.max_attempts.max(1);\n    let mut attempts = 0;\n    let mut retry_index = 0;\n\n    loop {\n        attempts += 1;\n        match job() {\n            Ok(()) => return Ok(()),\n            Err(error) if !error.is_transient() || attempts >= max_attempts => {\n                return Err(error);\n            }\n            Err(_) => {\n                sleeper.sleep_ms(config.delay_for_retry(retry_index));\n                retry_index += 1;\n            }\n        }\n    }\n}\n#[cfg(test)]\nmod tests {\n    use super::{run_job, FakeSleeper, RetryConfig, RetryError};\n\n    fn config(max_attempts: u32) -> RetryConfig {\n        RetryConfig {\n            max_attempts,\n            base_delay_ms: 10,\n            max_delay_ms: 25,\n        }\n    }\n\n    #[test]\n    fn retries_transient_errors_until_success() {\n        let mut sleeper = FakeSleeper::default();\n        let mut calls = 0;\n\n        let result = run_job(&config(4), &mut sleeper, || {\n            calls += 1;\n            if calls < 3 {\n                Err(RetryError::Transient(\"temporary\".into()))\n            } else {\n                Ok(())\n            }\n        });\n\n        assert_eq!(result, Ok(()));\n        assert_eq!(calls, 3);\n        assert_eq!(sleeper.sleeps, vec![10, 20]);\n    }\n\n    #[test]\n    fn permanent_errors_return_without_retry() {\n        let mut sleeper = FakeSleeper::default();\n        let mut calls = 0;\n\n        let result = run_job(&config(4), &mut sleeper, || {\n            calls += 1;\n            Err(RetryError::Permanent(\"bad input\".into()))\n        });\n\n        assert_eq!(result, Err(RetryError::Permanent(\"bad input\".into())));\n        assert_eq!(calls, 1);\n        assert!(sleeper.sleeps.is_empty());\n    }\n\n    #[test]\n    fn max_attempts_includes_first_call_and_delay_cap_is_used() {\n        let mut sleeper = FakeSleeper::default();\n        let mut calls = 0;\n\n        let result = run_job(&config(4), &mut sleeper, || {\n            calls += 1;\n            Err(RetryError::Transient(\"still unavailable\".into()))\n        });\n\n        assert_eq!(\n            result,\n            Err(RetryError::Transient(\"still unavailable\".into()))\n        );\n        assert_eq!(calls, 4);\n        assert_eq!(sleeper.sleeps, vec![10, 20, 25]);\n    }\n}\n"
+    },
+    {
+      "path": "README.md",
+      "exists": true,
+      "sha256": "3ddbe21802082f2a0e7389494848efdff2777eefe7113a9f46610a12c9b53f61",
+      "bytes": 691,
+      "truncated": false,
+      "body": "# jobrunner\n\nSmall job runner with a pluggable retry policy.\n\n## Retry policy\n\n`run_job` accepts a `RetryConfig` and an injected `Sleeper`. `max_attempts` is\nthe total number of job calls, including the first call. A `Transient` error is\nretried until the budget is exhausted; `Permanent` errors are returned\nimmediately.\n\nRetries use bounded exponential backoff. The requested delays are\n`base_delay_ms`, then twice that value, and so on, capped at\n`max_delay_ms`. The sleeper is called only between attempts, so no delay is\nrequested after the final attempt or after success.\n\n```rust\nlet config = RetryConfig {\n    max_attempts: 4,\n    base_delay_ms: 100,\n    max_delay_ms: 1_000,\n};\n```\n"
+    },
+    {
+      "path": "tests/retry_policy.rs",
+      "exists": true,
+      "sha256": "c904609dac0201370555a5d0add7f6cf5aa7243fc98755e355d5393999702e29",
+      "bytes": 1345,
+      "truncated": false,
+      "body": "use jobrunner::{run_job, RetryConfig, RetryError, Sleeper};\n\n#[derive(Default)]\nstruct RecordingSleeper {\n    delays: Vec<u64>,\n}\n\nimpl Sleeper for RecordingSleeper {\n    fn sleep_ms(&mut self, ms: u64) {\n        self.delays.push(ms);\n    }\n}\n\n#[test]\nfn public_api_retries_transient_errors_with_bounded_backoff() {\n    let config = RetryConfig {\n        max_attempts: 4,\n        base_delay_ms: 5,\n        max_delay_ms: 9,\n    };\n    let mut sleeper = RecordingSleeper::default();\n    let mut calls = 0;\n\n    let result = run_job(&config, &mut sleeper, || {\n        calls += 1;\n        if calls < 4 {\n            Err(RetryError::Transient(\"unavailable\".into()))\n        } else {\n            Ok(())\n        }\n    });\n\n    assert_eq!(result, Ok(()));\n    assert_eq!(calls, 4);\n    assert_eq!(sleeper.delays, vec![5, 9, 9]);\n}\n\n#[test]\nfn public_api_does_not_retry_permanent_errors() {\n    let config = RetryConfig {\n        max_attempts: 3,\n        base_delay_ms: 5,\n        max_delay_ms: 9,\n    };\n    let mut sleeper = RecordingSleeper::default();\n    let mut calls = 0;\n\n    let result = run_job(&config, &mut sleeper, || {\n        calls += 1;\n        Err(RetryError::Permanent(\"invalid\".into()))\n    });\n\n    assert_eq!(result, Err(RetryError::Permanent(\"invalid\".into())));\n    assert_eq!(calls, 1);\n    assert!(sleeper.delays.is_empty());\n}\n"
+    }
+  ],
+  "commands": [
+    {
+      "argv": [
+        "cargo",
+        "test",
+        "--test",
+        "retry_policy_oracle"
+      ],
+      "expect_exit": 0,
+      "exit": 0,
+      "timed_out": false,
+      "stdout": "\nrunning 7 tests\ntest huge_base_delays_saturate_instead_of_overflowing ... ok\ntest delays_grow_monotonic_and_saturate_at_max_delay_ms ... ok\ntest first_try_success_never_waits ... ok\ntest max_attempts_includes_the_first_call ... ok\ntest permanent_errors_return_without_waiting ... ok\ntest public_api_accepts_a_dyn_sleeper ... ok\ntest transient_errors_are_retried_until_success ... ok\n\ntest result: ok. 7 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s\n\n",
+      "stderr": "   Compiling jobrunner v0.1.0 (C:\\Users\\Ye_Luo\\AppData\\Local\\Temp\\.tmp1XMWwb)\n    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.66s\n     Running tests\\retry_policy_oracle.rs (target\\debug\\deps\\retry_policy_oracle-4b51c628efe75332.exe)\n",
+      "stdout_truncated": false,
+      "stderr_truncated": false,
+      "passed": true
+    },
+    {
+      "argv": [
+        "cargo",
+        "test",
+        "--quiet"
+      ],
+      "expect_exit": 0,
+      "exit": 0,
+      "timed_out": false,
+      "stdout": "\nrunning 6 tests\n......\ntest result: ok. 6 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s\n\n\nrunning 2 tests\n..\ntest result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s\n\n\nrunning 0 tests\n\ntest result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s\n\n",
+      "stderr": "\n(self-check over agent-authored tests; informational)",
+      "stdout_truncated": false,
+      "stderr_truncated": false,
+      "passed": true
+    }
+  ]
+}

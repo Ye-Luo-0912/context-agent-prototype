@@ -1,0 +1,135 @@
+{
+  "schema": "retry-pilot-cell-v2",
+  "kind": "retry_pilot_oracle",
+  "fixture_id": "retry_policy_dev-normal",
+  "expected_edit": "",
+  "passed": false,
+  "replay_complete": true,
+  "assertions": [
+    {
+      "path": "src/config.rs",
+      "pred": "max_delay_ms field exists exactly once",
+      "needles": [],
+      "passed": true,
+      "file_exists": true
+    },
+    {
+      "path": "src/error.rs",
+      "pred": "transient classification implemented",
+      "needles": [],
+      "passed": false,
+      "file_exists": true
+    },
+    {
+      "path": "src/lib.rs",
+      "pred": "retry loop bounds on max_attempts",
+      "needles": [],
+      "passed": false,
+      "file_exists": true
+    },
+    {
+      "path": "src/lib.rs",
+      "pred": "delay growth saturates at max_delay_ms",
+      "needles": [],
+      "passed": true,
+      "file_exists": true
+    },
+    {
+      "path": "src/lib.rs",
+      "pred": "public run_job signature preserved",
+      "needles": [],
+      "passed": true,
+      "file_exists": true
+    },
+    {
+      "path": "README.md",
+      "pred": "README documents the saturation boundary",
+      "needles": [],
+      "passed": true,
+      "file_exists": true
+    }
+  ],
+  "files": [
+    {
+      "path": "Cargo.toml",
+      "exists": true,
+      "sha256": "c1b470a7b7d62d1114f5f56721cf579ae68b7d1db8ad9c403534f7635a62f098",
+      "bytes": 80,
+      "truncated": false,
+      "body": "[package]\nname = \"jobrunner\"\nversion = \"0.1.0\"\nedition = \"2021\"\n\n[dependencies]\n"
+    },
+    {
+      "path": "src/error.rs",
+      "exists": true,
+      "sha256": "e7ea3a4a8aab4d56f04de1d9e2def5777ee59e526677e3a26dbbe7b63a77ad38",
+      "bytes": 408,
+      "truncated": false,
+      "body": "//! Error taxonomy for the job runner.\n#[derive(Debug, Clone, PartialEq, Eq)]\npub enum RetryError {\n    /// Transient faults may be retried (network blips, temporary locks).\n    Transient(String),\n    /// Permanent faults must return immediately (bad input, missing job).\n    Permanent(String),\n}\n\nimpl RetryError {\n    pub fn is_transient(&self) -> bool {\n        matches!(self, Self::Transient(_))\n    }\n}\n"
+    },
+    {
+      "path": "src/config.rs",
+      "exists": true,
+      "sha256": "e516e7c51e4dc6f060e73b2d992d9857115556f0606cd3733717a473d9142e43",
+      "bytes": 673,
+      "truncated": false,
+      "body": "//! Retry configuration.\n#[derive(Debug, Clone, PartialEq, Eq)]\npub struct RetryConfig {\n    /// Total attempts allowed, including the first call. Values below one\n    /// are treated as one attempt by `run_job`.\n    pub max_attempts: u32,\n    /// Base delay before the first retry, in milliseconds.\n    pub base_delay_ms: u64,\n    /// Maximum delay between retries, in milliseconds.\n    pub max_delay_ms: u64,\n}\n\nimpl RetryConfig {\n    /// Creates a retry configuration.\n    pub const fn new(max_attempts: u32, base_delay_ms: u64, max_delay_ms: u64) -> Self {\n        Self {\n            max_attempts,\n            base_delay_ms,\n            max_delay_ms,\n        }\n    }\n}\n"
+    },
+    {
+      "path": "src/sleeper.rs",
+      "exists": true,
+      "sha256": "29961c03c8941ddb6824d82833311ed7afe7a258423cfa9d68d9659e12534458",
+      "bytes": 350,
+      "truncated": false,
+      "body": "//! Injected sleeper so tests never really wait.\npub trait Sleeper {\n    fn sleep_ms(&mut self, ms: u64);\n}\n\n/// Records every requested delay instead of waiting.\n#[derive(Debug, Default)]\npub struct FakeSleeper {\n    pub sleeps: Vec<u64>,\n}\n\nimpl Sleeper for FakeSleeper {\n    fn sleep_ms(&mut self, ms: u64) {\n        self.sleeps.push(ms);\n    }\n}\n"
+    },
+    {
+      "path": "src/lib.rs",
+      "exists": true,
+      "sha256": "4090e085fec8f87c66fb12582dca9106b077f89537db45f3e2fb47b81efb9030",
+      "bytes": 2941,
+      "truncated": false,
+      "body": "mod config;\nmod error;\nmod sleeper;\n\npub use config::RetryConfig;\npub use error::RetryError;\npub use sleeper::{FakeSleeper, Sleeper};\n\n/// Runs `job` until it succeeds or the retry budget is exhausted.\n/// The public signature is frozen; do not change it.\npub fn run_job(\n    config: &RetryConfig,\n    sleeper: &mut dyn Sleeper,\n    mut job: impl FnMut() -> Result<(), RetryError>,\n) -> Result<(), RetryError> {\n    let max_attempts = config.max_attempts.max(1);\n    let mut attempt = 0;\n    let mut delay_ms = config.base_delay_ms.min(config.max_delay_ms);\n\n    loop {\n        attempt += 1;\n        match job() {\n            Ok(()) => return Ok(()),\n            Err(error) if !error.is_transient() || attempt >= max_attempts => return Err(error),\n            Err(_) => {\n                sleeper.sleep_ms(delay_ms);\n                delay_ms = delay_ms.saturating_mul(2).min(config.max_delay_ms);\n            }\n        }\n    }\n}\n\n#[cfg(test)]\nmod tests {\n    use super::*;\n\n    fn config(max_attempts: u32, base_delay_ms: u64, max_delay_ms: u64) -> RetryConfig {\n        RetryConfig::new(max_attempts, base_delay_ms, max_delay_ms)\n    }\n\n    #[test]\n    fn retries_transient_errors_with_bounded_exponential_delays() {\n        let mut sleeper = FakeSleeper::default();\n        let mut calls = 0;\n\n        let result = run_job(&config(4, 10, 25), &mut sleeper, || {\n            calls += 1;\n            if calls < 4 {\n                Err(RetryError::Transient(\"temporary\".into()))\n            } else {\n                Ok(())\n            }\n        });\n\n        assert_eq!(result, Ok(()));\n        assert_eq!(calls, 4);\n        assert_eq!(sleeper.sleeps, vec![10, 20, 25]);\n    }\n\n    #[test]\n    fn permanent_errors_return_without_retrying() {\n        let mut sleeper = FakeSleeper::default();\n        let mut calls = 0;\n\n        let result = run_job(&config(3, 10, 100), &mut sleeper, || {\n            calls += 1;\n            Err(RetryError::Permanent(\"invalid\".into()))\n        });\n\n        assert_eq!(result, Err(RetryError::Permanent(\"invalid\".into())));\n        assert_eq!(calls, 1);\n        assert!(sleeper.sleeps.is_empty());\n    }\n\n    #[test]\n    fn max_attempts_includes_the_first_call() {\n        let mut sleeper = FakeSleeper::default();\n        let mut calls = 0;\n\n        let result = run_job(&config(2, 1, 100), &mut sleeper, || {\n            calls += 1;\n            Err(RetryError::Transient(\"temporary\".into()))\n        });\n\n        assert_eq!(result, Err(RetryError::Transient(\"temporary\".into())));\n        assert_eq!(calls, 2);\n        assert_eq!(sleeper.sleeps, vec![1]);\n    }\n\n    #[test]\n    fn delay_multiplication_saturates_before_applying_the_cap() {\n        let mut sleeper = FakeSleeper::default();\n\n        let _ = run_job(&config(3, u64::MAX, u64::MAX), &mut sleeper, || {\n            Err(RetryError::Transient(\"temporary\".into()))\n        });\n\n        assert_eq!(sleeper.sleeps, vec![u64::MAX, u64::MAX]);\n    }\n}\n"
+    },
+    {
+      "path": "README.md",
+      "exists": true,
+      "sha256": "37d118dccaa5bfca62a23e522b1cb3158560d40963c54ddd77b5c43182bd3f50",
+      "bytes": 823,
+      "truncated": false,
+      "body": "# jobrunner\n\nSmall job runner with a pluggable retry policy.\n\n## Retry policy\n\n`run_job` accepts a `RetryConfig`, a `Sleeper`, and a job closure. The\nconfiguration uses `max_attempts` as the total number of calls, including the\nfirst call. `Transient` errors are retried with delays of `base_delay_ms`, then\ndouble after each retry, capped at `max_delay_ms`. `Permanent` errors return\nimmediately, and the final transient error is returned when the attempt budget\nis exhausted.\n\nFor example:\n\n```rust\nuse jobrunner::{run_job, RetryConfig, RetryError, Sleeper};\n\nlet config = RetryConfig::new(3, 100, 1_000);\n# struct NoopSleeper;\n# impl Sleeper for NoopSleeper { fn sleep_ms(&mut self, _: u64) {} }\nlet mut sleeper = NoopSleeper;\nrun_job(&config, &mut sleeper, || Ok::<(), RetryError>(()))?;\n# Ok::<(), RetryError>(())\n```\n"
+    }
+  ],
+  "commands": [
+    {
+      "argv": [
+        "cargo",
+        "test",
+        "--test",
+        "retry_policy_oracle"
+      ],
+      "expect_exit": 0,
+      "exit": 0,
+      "timed_out": false,
+      "stdout": "\nrunning 7 tests\ntest permanent_errors_return_without_waiting ... ok\ntest delays_grow_monotonic_and_saturate_at_max_delay_ms ... ok\ntest huge_base_delays_saturate_instead_of_overflowing ... ok\ntest first_try_success_never_waits ... ok\ntest public_api_accepts_a_dyn_sleeper ... ok\ntest transient_errors_are_retried_until_success ... ok\ntest max_attempts_includes_the_first_call ... ok\n\ntest result: ok. 7 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s\n\n",
+      "stderr": "   Compiling jobrunner v0.1.0 (C:\\Users\\Ye_Luo\\AppData\\Local\\Temp\\.tmp7hpa1H)\n    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.68s\n     Running tests\\retry_policy_oracle.rs (target\\debug\\deps\\retry_policy_oracle-4b51c628efe75332.exe)\n",
+      "stdout_truncated": false,
+      "stderr_truncated": false,
+      "passed": true
+    },
+    {
+      "argv": [
+        "cargo",
+        "test",
+        "--quiet"
+      ],
+      "expect_exit": 0,
+      "exit": 0,
+      "timed_out": false,
+      "stdout": "\nrunning 4 tests\n....\ntest result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s\n\n\nrunning 0 tests\n\ntest result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s\n\n",
+      "stderr": "\n(self-check over agent-authored tests; informational)",
+      "stdout_truncated": false,
+      "stderr_truncated": false,
+      "passed": true
+    }
+  ]
+}

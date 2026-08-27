@@ -1,0 +1,16 @@
+{
+  "schema": "agent-eval.cell.v1",
+  "fixture_id": "retry_policy_dev",
+  "engine": "dynamic",
+  "repeat": 2,
+  "repeats": 2,
+  "live": true,
+  "tool_surface": "production",
+  "fixture_sha256": "5055c1c58b0b24ac6e12f696a342bc214ea0c239dc91b5b5866e2378719762ca",
+  "git_head": "6bc9e40dda17bd3c4ef2afa85a5fa597932a2244",
+  "git_dirty": false,
+  "git_dirty_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+  "source_tree_digest": "80dbbc1bb4fc40743aab21d9718ed6a0fa44979954a7e6d6d2b33e21f6e38562",
+  "openai_model": "gpt-5.6-luna",
+  "openai_base_url": "https://api.pinaic.com/v1"
+}
