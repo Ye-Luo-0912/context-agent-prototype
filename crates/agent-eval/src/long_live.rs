@@ -60,10 +60,20 @@ pub(crate) struct PackSpec {
     /// ExactCurrentWorld recipe inputs; empty = no exact recipe for this
     /// pack (verify.run stays absent from its surface).
     pub exact_recipe_inputs: Box<dyn Fn() -> Vec<String>>,
+    /// Per-pack allowed-diff predicate over workspace-relative paths.
+    pub allowed_diff: Box<dyn Fn(&str) -> bool>,
 }
 
 fn retry_hidden_violations(root: &Path) -> Vec<String> {
     long_task::hidden_check_violations(root)
+}
+
+/// The standard edit allowance: workspace sources plus the manifest.
+fn standard_allowed_diff(relative: &str) -> bool {
+    relative.starts_with("src/")
+        || relative.starts_with("tests/")
+        || relative == "README.md"
+        || relative == "Cargo.toml"
 }
 
 pub(crate) fn retry_pack() -> PackSpec {
@@ -83,6 +93,7 @@ pub(crate) fn retry_pack() -> PackSpec {
                 "src/lib.rs".into(),
             ]
         }),
+        allowed_diff: Box::new(standard_allowed_diff),
     }
 }
 
@@ -121,6 +132,10 @@ pub(crate) fn m15_diag_pack() -> PackSpec {
             (fixture.oracle_name, fixture.oracle_source)
         }),
         exact_recipe_inputs: Box::new(Vec::new),
+        // The directive mandates a root-level DIAGNOSIS.md report.
+        allowed_diff: Box::new(|relative| {
+            standard_allowed_diff(relative) || relative == "DIAGNOSIS.md"
+        }),
     }
 }
 
@@ -145,6 +160,7 @@ pub(crate) fn m15_migrate_pack() -> PackSpec {
             (fixture.oracle_name, fixture.oracle_source)
         }),
         exact_recipe_inputs: Box::new(Vec::new),
+        allowed_diff: Box::new(standard_allowed_diff),
     }
 }
 
@@ -1098,9 +1114,11 @@ pub async fn run_pack_cell(
     .to_string();
 
     let diff_seed_files = (pack.seed_files)();
-    let diff_violations =
-        match diff_violations(root, &diff_seed_files.to_vec())
-        {
+    let diff_violations = match diff_violations(
+        root,
+        &diff_seed_files.to_vec(),
+        pack.allowed_diff.as_ref(),
+    ) {
         Ok(violations) => violations,
         Err(e) => vec![format!("diff scan failed: {e:#}")],
     };
@@ -1454,16 +1472,16 @@ fn parse_test_totals(text: &str) -> (u32, u32) {
 
 /// Compare the finished workspace against the frozen seed. Changed seed
 /// files are the assignment; deletions and out-of-bounds paths are not.
-fn diff_violations(root: &Path, diff_seed_files: &[&str]) -> anyhow::Result<Vec<String>> {
+fn diff_violations(
+    root: &Path,
+    diff_seed_files: &[&str],
+    allowed_diff: &dyn Fn(&str) -> bool,
+) -> anyhow::Result<Vec<String>> {
     let mut present: BTreeMap<String, String> = BTreeMap::new();
     collect_files(root, PathBuf::new(), &mut present)?;
     let mut violations = Vec::new();
     for relative in present.keys() {
-        let allowed = relative.starts_with("src/")
-            || relative.starts_with("tests/")
-            || relative == "README.md"
-            || relative == "Cargo.toml";
-        if !allowed {
+        if !allowed_diff(relative) {
             violations.push(format!("path outside the allowed diff: {relative}"));
         }
     }
