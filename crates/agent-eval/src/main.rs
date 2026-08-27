@@ -652,6 +652,16 @@ async fn main() -> anyhow::Result<()> {
                 run_opportunity_gate(mode_filter, repeats, evidence_dir, allow_dirty).await?;
                 return Ok(());
             }
+            "--m15-window" => {
+                let fixture_filter = args.next().filter(|value| !value.starts_with('-'));
+                let repeats = if repeats_set {
+                    repeats
+                } else {
+                    long_live::DEFAULT_REPEATS
+                };
+                run_m15_window(fixture_filter, repeats, evidence_dir, allow_dirty).await?;
+                return Ok(());
+            }
             "--long-task-live" => {
                 let mode_filter = args.next().filter(|value| !value.starts_with('-'));
                 let repeats = if repeats_set {
@@ -1116,6 +1126,89 @@ async fn run_long_task_live(
 /// normal/resume repeats in both arms. Evidence lands per cell with its
 /// recorded setting; the runner prints paired facts and leaves promotion
 /// judgment to the REPORT.
+/// M15 formal acceptance window (`M15_ACCEPTANCE.md` §2): the three
+/// development-pack fixtures x {normal, resume} x N repeats, the advisory
+/// switch OFF everywhere, immutable per-cell bundles under
+/// `evidence/m15-window/`. The pass criteria are mechanical per cell
+/// (behavior, diff, health, no runtime error; resume adds
+/// restored+continued); closure is reported, never gating.
+async fn run_m15_window(
+    fixture_filter: Option<String>,
+    repeats: u32,
+    evidence_dir: Option<std::path::PathBuf>,
+    allow_dirty: bool,
+) -> anyhow::Result<()> {
+    bundle::require_clean_tree(allow_dirty)?;
+    anyhow::ensure!((1..=4).contains(&repeats), "repeats must be 1..=4");
+    let model = driver::build_live_coding_model()?;
+    let evidence_root = evidence_dir
+        .unwrap_or_else(|| std::path::PathBuf::from("crates/agent-eval/evidence/m15-window"));
+    std::fs::create_dir_all(&evidence_root)?;
+    eprintln!("evidence dir: {}", evidence_root.display());
+
+    let mut packs = vec![
+        long_live::m15_diag_pack(),
+        long_live::m15_migrate_pack(),
+        long_live::retry_pack(),
+    ];
+    if let Some(id) = &fixture_filter {
+        packs.retain(|pack| pack.id == id);
+        anyhow::ensure!(!packs.is_empty(), "unknown m15 fixture filter {id}");
+    }
+    let mut outcomes = Vec::new();
+    for pack in &packs {
+        for repeat in 1..=repeats {
+            for mode in [long_live::PilotMode::Normal, long_live::PilotMode::Resume] {
+                eprintln!(
+                    "== m15 {} {} repeat {repeat}/{repeats} ==",
+                    pack.id,
+                    mode.id(),
+                );
+                let dir = tempfile::tempdir()?;
+                let pair = bundle::PairSink::claim(
+                    evidence_root.clone(),
+                    format!("m15-{}-{}", pack.id, mode.id()),
+                    repeat,
+                    repeats,
+                    true,
+                );
+                let outcome =
+                    long_live::run_pack_cell(pack, mode, &pair, model.clone(), dir.path(), false)
+                        .await?;
+                println!("{}", outcome.render_line());
+                match bundle::render_evidence(&pair.repeat_path()) {
+                    Ok(rendered) => println!("{rendered}"),
+                    Err(e) => eprintln!("warning: evidence render failed: {e}"),
+                }
+                outcomes.push((pack.id, outcome));
+            }
+        }
+    }
+
+    println!("
+== m15 window summary (facts only) ==");
+    for (pack_id, _) in outcomes.iter().map(|(id, _)| (*id, ())).collect::<Vec<_>>() {
+        let cells: Vec<&long_live::CellOutcome> = outcomes
+            .iter()
+            .filter(|(id, _)| *id == pack_id)
+            .map(|(_, outcome)| outcome)
+            .collect();
+        if cells.is_empty() {
+            continue;
+        }
+        println!(
+            "{:<18} cells={} passed={} completed={} stalls={}",
+            pack_id,
+            cells.len(),
+            cells.iter().filter(|cell| cell.passed).count(),
+            cells.iter().filter(|cell| cell.closure == "completed").count(),
+            cells.iter().filter(|cell| cell.error.as_deref().is_some_and(|e| e.contains("stalled"))).count(),
+        );
+    }
+    println!("judgment belongs to the evidence REPORT, not this runner");
+    Ok(())
+}
+
 async fn run_opportunity_gate(
     mode_filter: Option<String>,
     repeats: u32,

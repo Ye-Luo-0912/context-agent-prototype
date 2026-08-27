@@ -29,7 +29,8 @@ use anyhow::bail;
 use sha2::{Digest as _, Sha256};
 
 use crate::bundle::PairSink;
-use crate::long_task::{self, DIRECTIVE, FINAL_FILES, FIXTURE_FILES};
+use crate::long_task::{self, DIRECTIVE, FIXTURE_FILES};
+use crate::m15_pack;
 use crate::workload::{HiddenAssertionResult, HiddenCommandResult, HiddenFileBody, HiddenReport};
 
 pub const PILOT_SCHEMA: &str = "retry-pilot-cell-v2";
@@ -41,6 +42,112 @@ pub const DEFAULT_REPEATS: u32 = 2;
 /// isolated integration target. It pins only the frozen public API and the
 /// directive's stated semantics — never a concrete growth formula or patch
 /// shape, so multiple correct implementations pass.
+/// Frozen per-pack identity + evaluation hooks for one development task.
+/// `run_cell` is pack-generic; every retry-specific seam routes through
+/// these function pointers so a new pack cannot drift the harness.
+pub type SeedFn = Box<dyn Fn(&Path) -> anyhow::Result<()>>;
+pub type HiddenViolationsFn = Box<dyn Fn(&Path) -> Vec<String>>;
+pub type HiddenResultsFn = Box<dyn Fn(&Path) -> Vec<(&'static str, &'static str, bool)>>;
+
+pub(crate) struct PackSpec {
+    pub id: &'static str,
+    pub seed: SeedFn,
+    pub directive: Box<dyn Fn() -> &'static str>,
+    pub seed_files: Box<dyn Fn() -> Vec<&'static str>>,
+    pub hidden_violations: HiddenViolationsFn,
+    pub hidden_results: HiddenResultsFn,
+    pub oracle: Box<dyn Fn() -> (&'static str, &'static str)>,
+    /// ExactCurrentWorld recipe inputs; empty = no exact recipe for this
+    /// pack (verify.run stays absent from its surface).
+    pub exact_recipe_inputs: Box<dyn Fn() -> Vec<String>>,
+}
+
+fn retry_hidden_violations(root: &Path) -> Vec<String> {
+    long_task::hidden_check_violations(root)
+}
+
+pub(crate) fn retry_pack() -> PackSpec {
+    PackSpec {
+        id: "retry_policy_dev",
+        seed: Box::new(long_task::seed_workspace),
+        directive: Box::new(|| DIRECTIVE),
+        seed_files: Box::new(|| FIXTURE_FILES.iter().map(|(relative, _)| *relative).collect()),
+        hidden_violations: Box::new(retry_hidden_violations),
+        hidden_results: Box::new(long_task::hidden_check_results),
+        oracle: Box::new(|| (ORACLE_TEST_NAME, ORACLE_TEST_SOURCE)),
+        exact_recipe_inputs: Box::new(|| {
+            vec![
+                "Cargo.toml".into(),
+                "src/config.rs".into(),
+                "src/error.rs".into(),
+                "src/lib.rs".into(),
+            ]
+        }),
+    }
+}
+
+fn m15_pack_violations(id: &'static str) -> impl Fn(&Path) -> Vec<String> {
+    move |root: &Path| {
+        m15_pack::hidden_check_results(root, id)
+            .into_iter()
+            .filter(|(_, _, passed)| !passed)
+            .map(|(path, name, _)| format!("{path}: {name}"))
+            .collect()
+    }
+}
+
+fn m15_pack_results(id: &'static str) -> impl Fn(&Path) -> Vec<(&'static str, &'static str, bool)> {
+    move |root: &Path| m15_pack::hidden_check_results(root, id)
+}
+
+pub(crate) fn m15_diag_pack() -> PackSpec {
+    let id = m15_pack::RETRY_DIAG;
+    PackSpec {
+        id,
+        seed: Box::new(move |root| m15_pack::seed(root, id)),
+        directive: Box::new(move || m15_pack::fixture(id).unwrap().directive),
+        seed_files: Box::new(move || {
+            m15_pack::fixture(id)
+                .unwrap()
+                .files
+                .iter()
+                .map(|(relative, _)| *relative)
+                .collect()
+        }),
+        hidden_violations: Box::new(m15_pack_violations(id)),
+        hidden_results: Box::new(m15_pack_results(id)),
+        oracle: Box::new(move || {
+            let fixture = m15_pack::fixture(id).unwrap();
+            (fixture.oracle_name, fixture.oracle_source)
+        }),
+        exact_recipe_inputs: Box::new(Vec::new),
+    }
+}
+
+pub(crate) fn m15_migrate_pack() -> PackSpec {
+    let id = m15_pack::RETRY_MIGRATE;
+    PackSpec {
+        id,
+        seed: Box::new(move |root| m15_pack::seed(root, id)),
+        directive: Box::new(move || m15_pack::fixture(id).unwrap().directive),
+        seed_files: Box::new(move || {
+            m15_pack::fixture(id)
+                .unwrap()
+                .files
+                .iter()
+                .map(|(relative, _)| *relative)
+                .collect()
+        }),
+        hidden_violations: Box::new(m15_pack_violations(id)),
+        hidden_results: Box::new(m15_pack_results(id)),
+        oracle: Box::new(move || {
+            let fixture = m15_pack::fixture(id).unwrap();
+            (fixture.oracle_name, fixture.oracle_source)
+        }),
+        exact_recipe_inputs: Box::new(Vec::new),
+    }
+}
+
 const ORACLE_TEST_NAME: &str = "retry_policy_oracle";
 const ORACLE_TEST_SOURCE: &str = r#"//! Harness-owned behavioral oracle; copied in by the evaluation harness
 //! after the run. Not authored by the evaluated agent.
@@ -647,9 +754,10 @@ async fn compose_cell(
     model: Arc<dyn ModelTransport>,
     engine: Arc<dyn ContextEngine>,
     opportunity: bool,
+    pack: &PackSpec,
 ) -> anyhow::Result<agent_compose::ComposedRuntime> {
     let workspace = agent_workspace::Workspace::open(root).await?;
-    let verification_recipes = pilot_verification_recipes();
+    let verification_recipes = pilot_verification_recipes((pack.exact_recipe_inputs)());
     let tools: Arc<dyn ToolDispatcher> = Arc::new(
         tool_runtime::BuiltinToolDispatcher::with_config_and_verification_recipes(
             workspace.clone(),
@@ -702,7 +810,9 @@ fn c_engine(model: Arc<dyn ModelTransport>) -> Arc<dyn ContextEngine> {
 /// opportunity candidate's fail-closed precondition is unreachable (see
 /// opportunity-gate REPORT, attempt 1). The set is identical across off/on
 /// arms; the switch remains the only paired variable.
-fn pilot_verification_recipes() -> tool_runtime::VerificationRecipes {
+fn pilot_verification_recipes(
+    exact_inputs: Vec<String>,
+) -> tool_runtime::VerificationRecipes {
     let mut recipes = Vec::new();
     // Mirror of discovery for a Cargo workspace fixture.
     if let Ok(recipe) = tool_runtime::VerificationRecipe::new(
@@ -717,24 +827,21 @@ fn pilot_verification_recipes() -> tool_runtime::VerificationRecipes {
     // inside target/, so the source-read-only assertion holds. Declared
     // inputs are exactly the seed-guaranteed files; content changes create a
     // new exact world.
-    let exact = tool_runtime::VerificationRecipe::new(
-        "jobrunner.exact",
-        "Exact-world jobrunner test suite (source-read-only)",
-        "jobrunner-exact-v1",
-        vec!["cargo".into(), "test".into(), "--workspace".into()],
-    )
-    .and_then(|recipe| {
-        recipe
-            .with_exact_current_world_reuse()
-            .with_exact_inputs(vec![
-                "Cargo.toml".into(),
-                "src/config.rs".into(),
-                "src/error.rs".into(),
-                "src/lib.rs".into(),
-            ])
-    })
-    .expect("pilot exact recipe is valid");
-    recipes.push(exact);
+    if !exact_inputs.is_empty() {
+        let exact = tool_runtime::VerificationRecipe::new(
+            "jobrunner.exact",
+            "Exact-world jobrunner test suite (source-read-only)",
+            "jobrunner-exact-v1",
+            vec!["cargo".into(), "test".into(), "--workspace".into()],
+        )
+        .and_then(|recipe| {
+            recipe
+                .with_exact_current_world_reuse()
+                .with_exact_inputs(exact_inputs)
+        })
+        .expect("pilot exact recipe is valid");
+        recipes.push(exact);
+    }
     tool_runtime::VerificationRecipes::new(recipes).expect("pilot recipe set is valid")
 }
 
@@ -765,11 +872,25 @@ pub async fn run_cell(
     root: &Path,
     opportunity: bool,
 ) -> anyhow::Result<CellOutcome> {
+    run_pack_cell(&retry_pack(), mode, pair, model, root, opportunity).await
+}
+
+/// Pack-generic live cell. Every retry-specific seam (seed, directive,
+/// hidden checks, oracle, exact recipe, diff baseline) routes through the
+/// [`PackSpec`], so a new pack cannot silently drift the harness.
+pub async fn run_pack_cell(
+    pack: &PackSpec,
+    mode: PilotMode,
+    pair: &PairSink,
+    model: Arc<dyn ModelTransport>,
+    root: &Path,
+    opportunity: bool,
+) -> anyhow::Result<CellOutcome> {
     let started = Instant::now();
     let failed =
         |reason: String| CellOutcome::failed(mode, started.elapsed().as_millis() as u64, reason);
 
-    if let Err(e) = long_task::seed_workspace(root) {
+    if let Err(e) = (pack.seed)(root) {
         return Ok(failed(format!("seeding failed: {e:#}")));
     }
     if let Err(e) = crate::suite::ensure_workspace_git(root) {
@@ -794,19 +915,20 @@ pub async fn run_cell(
     let mut checkpoint_artifact: Option<String> = None;
     let mut checkpoint_sequence: Option<u64> = None;
     let mut checkpoint_checksum: Option<String> = None;
-    match compose_cell(root, model.clone(), c_engine(model.clone()), opportunity).await {
+    match compose_cell(root, model.clone(), c_engine(model.clone()), opportunity, pack).await {
         Err(e) => error = Some(format!("phase-one compose failed: {e:#}")),
         Ok(composed) => {
             let handle = composed.handle().clone();
             let mut events = composed.subscribe();
             let mut state = PhaseState::default();
             let drive: Result<(), String> = async {
+                let directive = (pack.directive)();
                 handle
-                    .set_focus(DIRECTIVE.to_string())
+                    .set_focus(directive.to_string())
                     .await
                     .map_err(|e| format!("set_focus failed: {e}"))?;
                 handle
-                    .user_message(DIRECTIVE.to_string())
+                    .user_message(directive.to_string())
                     .await
                     .map_err(|e| format!("user_message failed: {e}"))?;
                 match mode {
@@ -897,7 +1019,7 @@ pub async fn run_cell(
                 if error.is_some() {
                     // sequence mismatch is a harness failure, not a restore attempt.
                 } else {
-                    match compose_cell(root, model.clone(), c_engine(model.clone()), opportunity).await
+                    match compose_cell(root, model.clone(), c_engine(model.clone()), opportunity, pack).await
                 {
                     Err(e) => error = Some(format!("phase-two compose failed: {e:#}")),
                     Ok(composed) => {
@@ -975,12 +1097,15 @@ pub async fn run_cell(
     }
     .to_string();
 
-    let diff_violations = match diff_violations(root) {
+    let diff_seed_files = (pack.seed_files)();
+    let diff_violations =
+        match diff_violations(root, &diff_seed_files.to_vec())
+        {
         Ok(violations) => violations,
         Err(e) => vec![format!("diff scan failed: {e:#}")],
     };
     let diff_clean = diff_violations.is_empty();
-    let marker_violations = long_task::hidden_check_violations(root);
+    let marker_violations = (pack.hidden_violations)(root);
 
     // Agent-authored self-check over the whole workspace, reported but
     // never gating: run before oracle injection so the injected oracle
@@ -988,14 +1113,15 @@ pub async fn run_cell(
     let self_check_record = run_cargo_test(root, &["--quiet"]).await;
     // Harness-owned behavioral oracle: ensure parent directory exists
     // before injection, then run as an isolated integration target.
-    let oracle_path = root.join("tests").join(format!("{ORACLE_TEST_NAME}.rs"));
+    let (oracle_name, oracle_source) = (pack.oracle)();
+    let oracle_path = root.join("tests").join(format!("{oracle_name}.rs"));
     let oracle_record = match std::fs::create_dir_all(oracle_path.parent().unwrap()) {
         Err(e) => HiddenCommandResult {
             argv: vec![
                 "cargo".into(),
                 "test".into(),
                 "--test".into(),
-                ORACLE_TEST_NAME.into(),
+                oracle_name.into(),
             ],
             expect_exit: 0,
             exit: None,
@@ -1006,13 +1132,13 @@ pub async fn run_cell(
             stderr_truncated: false,
             passed: false,
         },
-        Ok(()) => match std::fs::write(&oracle_path, ORACLE_TEST_SOURCE) {
+        Ok(()) => match std::fs::write(&oracle_path, oracle_source) {
             Err(e) => HiddenCommandResult {
                 argv: vec![
                     "cargo".into(),
                     "test".into(),
                     "--test".into(),
-                    ORACLE_TEST_NAME.into(),
+                    oracle_name.into(),
                 ],
                 expect_exit: 0,
                 exit: None,
@@ -1023,7 +1149,7 @@ pub async fn run_cell(
                 stderr_truncated: false,
                 passed: false,
             },
-            Ok(()) => run_cargo_test(root, &["--test", ORACLE_TEST_NAME]).await,
+            Ok(()) => run_cargo_test(root, &["--test", oracle_name]).await,
         },
     };
     let _ = std::fs::remove_file(&oracle_path);
@@ -1076,6 +1202,7 @@ pub async fn run_cell(
         pair,
         root,
         &collector,
+        pack,
         &outcome,
         Some(&oracle_record),
         Some(&self_check_record),
@@ -1109,11 +1236,12 @@ fn write_evidence(
     pair: &PairSink,
     root: &Path,
     collector: &Collector,
+    pack: &PackSpec,
     outcome: &CellOutcome,
     oracle: Option<&HiddenCommandResult>,
     self_check: Option<&HiddenCommandResult>,
 ) {
-    let report = build_hidden_report(outcome, root, oracle, self_check);
+    let report = build_hidden_report(outcome, root, pack, oracle, self_check);
     let metrics = crate::metrics::aggregate_metrics(&collector.events);
     let cell_dir = pair.cell_dir("dynamic");
     if let Err(e) = crate::bundle::write_cell_parts(
@@ -1164,10 +1292,11 @@ fn write_evidence(
 fn build_hidden_report(
     outcome: &CellOutcome,
     root: &Path,
+    pack: &PackSpec,
     oracle: Option<&HiddenCommandResult>,
     self_check: Option<&HiddenCommandResult>,
 ) -> HiddenReport {
-    let checks = long_task::hidden_check_results(root);
+    let checks = (pack.hidden_results)(root);
     let assertions: Vec<HiddenAssertionResult> = checks
         .iter()
         .map(|(path, name, passed)| HiddenAssertionResult {
@@ -1180,9 +1309,9 @@ fn build_hidden_report(
             file_exists: root.join(path).exists(),
         })
         .collect();
-    let mut paths: Vec<String> = FINAL_FILES
-        .iter()
-        .map(|(path, _)| (*path).to_string())
+    let mut paths: Vec<String> = (pack.seed_files)()
+        .into_iter()
+        .map(|path| path.to_string())
         .collect();
     let tests = list_tests_dir(root);
     paths.extend(tests);
@@ -1325,7 +1454,7 @@ fn parse_test_totals(text: &str) -> (u32, u32) {
 
 /// Compare the finished workspace against the frozen seed. Changed seed
 /// files are the assignment; deletions and out-of-bounds paths are not.
-fn diff_violations(root: &Path) -> anyhow::Result<Vec<String>> {
+fn diff_violations(root: &Path, diff_seed_files: &[&str]) -> anyhow::Result<Vec<String>> {
     let mut present: BTreeMap<String, String> = BTreeMap::new();
     collect_files(root, PathBuf::new(), &mut present)?;
     let mut violations = Vec::new();
@@ -1338,7 +1467,7 @@ fn diff_violations(root: &Path) -> anyhow::Result<Vec<String>> {
             violations.push(format!("path outside the allowed diff: {relative}"));
         }
     }
-    for (relative, _) in FIXTURE_FILES {
+    for relative in diff_seed_files {
         if !present.contains_key(*relative) {
             violations.push(format!("seed file deleted: {relative}"));
         }
@@ -1485,7 +1614,12 @@ mod tests {
         let dispatcher = tool_runtime::BuiltinToolDispatcher::with_config_and_verification_recipes(
             workspace,
             tool_runtime::ToolLifecycleConfig::default(),
-            pilot_verification_recipes(),
+            pilot_verification_recipes(vec![
+                "Cargo.toml".into(),
+                "src/config.rs".into(),
+                "src/error.rs".into(),
+                "src/lib.rs".into(),
+            ]),
         );
         use agent_contracts::{ToolCall, ToolDispatcher as _, ToolExecutionPurpose};
         let call = ToolCall {
