@@ -1,0 +1,45 @@
+{
+  "schema": "agent-eval.verify.v1",
+  "kind": "file_content+command",
+  "fixture_id": "crlf_multi_hunk",
+  "expected_edit": "one revision-checked edit.patch with two hunks, preserving CRLF",
+  "passed": false,
+  "replay_complete": true,
+  "assertions": [
+    {
+      "path": "src/settings.cfg",
+      "pred": "sha256",
+      "needles": [
+        "e8c281ca09a7e8907ff7ec5403959086a23bb85411ae31d768d0678a85537524"
+      ],
+      "count": 0,
+      "passed": false,
+      "file_exists": true
+    }
+  ],
+  "files": [
+    {
+      "path": "src/settings.cfg",
+      "exists": true,
+      "sha256": "5e5e640e7f60322d8f8737237840e9cb126fd8b79bff24594465f356bb1cd9fa",
+      "bytes": 40,
+      "truncated": false,
+      "body": "mode=legacy\r\ntimeout=30\r\nsentinel=keep\r\n"
+    }
+  ],
+  "commands": [
+    {
+      "argv": [
+        "tool-edit.no-unexpected-files"
+      ],
+      "expect_exit": 0,
+      "exit": 0,
+      "timed_out": false,
+      "stdout": "",
+      "stderr": "",
+      "stdout_truncated": false,
+      "stderr_truncated": false,
+      "passed": true
+    }
+  ]
+}

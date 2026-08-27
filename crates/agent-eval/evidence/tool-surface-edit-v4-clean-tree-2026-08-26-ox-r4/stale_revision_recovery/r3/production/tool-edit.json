@@ -1,0 +1,115 @@
+{
+  "context_engine": "dynamic",
+  "fixture_id": "stale_revision_recovery",
+  "fixture_mutations": [],
+  "gate": {
+    "analysis_truncated": false,
+    "changed_bytes_after": 0,
+    "changed_bytes_before": 0,
+    "commit_not_applied": 0,
+    "commit_recovery_required": 0,
+    "commit_unknown": 0,
+    "confirm_reads_after_success": 0,
+    "conflict_route": null,
+    "duplicate_call_ids": 0,
+    "edit_latency_ms_p50": 0,
+    "edit_latency_ms_p95": 0,
+    "edit_to_green_ms": null,
+    "first_patch_changed_success": false,
+    "first_patch_exact_hunks": false,
+    "first_patch_has_required_revisions": false,
+    "first_patch_raw_success": false,
+    "first_patch_revisions_from_latest_reads": false,
+    "first_patch_shape_valid": false,
+    "fixture_id": "stale_revision_recovery",
+    "fixture_mutation_evidence_valid": false,
+    "forbidden_calls": 0,
+    "forbidden_tool_counts": {},
+    "fs_read_bytes": 0,
+    "model_rounds": 1,
+    "non_stale_failures": 0,
+    "orphan_tool_finishes": 0,
+    "passed": false,
+    "patch_attempts": 0,
+    "patch_changed_successes": 0,
+    "patch_failures": 0,
+    "patch_finished": 0,
+    "patch_hunk_contract_failures": 0,
+    "patch_noops": 0,
+    "patch_raw_successes": 0,
+    "patch_revision_provenance_failures": 0,
+    "patch_started": 0,
+    "patch_target_mismatches": 0,
+    "read_identity_failures": 0,
+    "schema": "agent-eval.tool-surface-edit.v4",
+    "seq_contiguous": true,
+    "session_ok": false,
+    "stale_refusals": 0,
+    "strict_passed": false,
+    "target_files_covered": [],
+    "target_read_successes": 0,
+    "trace_complete": true,
+    "unfinished_patch_calls": 0,
+    "valid_call_first_attempt_success": false,
+    "violations": [
+      "runtime session did not finish cleanly",
+      "raw-byte hidden verification failed",
+      "model rounds 1 outside 4..10",
+      "changed patch successes 0 != required 1",
+      "first edit.patch call was missing or non-canonical",
+      "first edit.patch call did not carry every required base_revision",
+      "first edit.patch revisions did not come from the latest successful fs.read of each path",
+      "first edit.patch call did not use the fixture's exact local hunks",
+      "fixture mutation evidence did not match the frozen op and completed-turn boundary",
+      "changed patch target coverage did not match the fixture",
+      "stale fixture followed neither the proactive-read nor stale-refusal/read/retry state machine"
+    ]
+  },
+  "gate_implementation_sha256": "9a9ed6da24c27054b823bea90b0646df6a05ba2e4b74430bc52ae97bc42fca62",
+  "gate_schema": "agent-eval.tool-surface-edit.v4",
+  "schema": "agent-eval.tool-edit.v2",
+  "strict": {
+    "files": [
+      {
+        "actual_sha256": "0de0bf052bb6c4fd8751f82697ac3dda7724fc52df6c49743ded6158c9157ec0",
+        "bytes": 19,
+        "expected_sha256": "47c2e2fe08863b41eca344c4d6f65d476d97f23f3695ba8be2655abe8520393f",
+        "passed": false,
+        "path": "src/retry.cfg"
+      }
+    ],
+    "fixture_id": "stale_revision_recovery",
+    "passed": false,
+    "schema": "agent-eval.tool-edit.v2",
+    "unexpected_files": [],
+    "unexpected_files_truncated": false
+  },
+  "surface": "production-default",
+  "trace_contract": {
+    "conflict": "stale_or_revalidated",
+    "exact_hunks": [
+      {
+        "new": "limit=5",
+        "old": "limit=3",
+        "path": "src/retry.cfg"
+      }
+    ],
+    "expected_files_per_success": 1,
+    "first_patch_must_succeed": false,
+    "forbidden_tools": [
+      "shell.exec",
+      "process.run",
+      "process.session",
+      "fs.write",
+      "edit.replace"
+    ],
+    "max_confirm_reads_after_success": 0,
+    "max_patch_calls": 2,
+    "min_hunks_per_success": 1,
+    "require_base_revision": true,
+    "required_successful_patch_calls": 1,
+    "target_files": [
+      "src/retry.cfg"
+    ]
+  }
+}

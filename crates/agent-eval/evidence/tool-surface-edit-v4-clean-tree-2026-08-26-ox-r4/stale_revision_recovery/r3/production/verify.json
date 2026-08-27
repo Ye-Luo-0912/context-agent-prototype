@@ -1,0 +1,45 @@
+{
+  "schema": "agent-eval.verify.v1",
+  "kind": "file_content+command",
+  "fixture_id": "stale_revision_recovery",
+  "expected_edit": "preserve concurrent content and eventually apply a revision-checked limit change",
+  "passed": false,
+  "replay_complete": true,
+  "assertions": [
+    {
+      "path": "src/retry.cfg",
+      "pred": "sha256",
+      "needles": [
+        "47c2e2fe08863b41eca344c4d6f65d476d97f23f3695ba8be2655abe8520393f"
+      ],
+      "count": 0,
+      "passed": false,
+      "file_exists": true
+    }
+  ],
+  "files": [
+    {
+      "path": "src/retry.cfg",
+      "exists": true,
+      "sha256": "0de0bf052bb6c4fd8751f82697ac3dda7724fc52df6c49743ded6158c9157ec0",
+      "bytes": 19,
+      "truncated": false,
+      "body": "limit=3\nowner=user\n"
+    }
+  ],
+  "commands": [
+    {
+      "argv": [
+        "tool-edit.no-unexpected-files"
+      ],
+      "expect_exit": 0,
+      "exit": 0,
+      "timed_out": false,
+      "stdout": "",
+      "stderr": "",
+      "stdout_truncated": false,
+      "stderr_truncated": false,
+      "passed": true
+    }
+  ]
+}

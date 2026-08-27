@@ -1,0 +1,100 @@
+{
+  "allow_dirty": false,
+  "edit_patch_model_spec": {
+    "description": "Exact revision-checked replace/insert hunks across files[]; max 16 files; max 64 hunks total.",
+    "input_schema": {
+      "additionalProperties": false,
+      "properties": {
+        "files": {
+          "items": {
+            "additionalProperties": false,
+            "properties": {
+              "base_revision": {
+                "pattern": "^[0-9a-f]{64}$",
+                "type": "string"
+              },
+              "hunks": {
+                "items": {
+                  "additionalProperties": false,
+                  "properties": {
+                    "new": {
+                      "type": "string"
+                    },
+                    "old": {
+                      "minLength": 1,
+                      "type": "string"
+                    },
+                    "op": {
+                      "enum": [
+                        "replace",
+                        "insert_before",
+                        "insert_after"
+                      ],
+                      "type": "string"
+                    }
+                  },
+                  "required": [
+                    "op",
+                    "old",
+                    "new"
+                  ],
+                  "type": "object"
+                },
+                "maxItems": 64,
+                "minItems": 1,
+                "type": "array"
+              },
+              "path": {
+                "maxLength": 512,
+                "minLength": 1,
+                "type": "string"
+              }
+            },
+            "required": [
+              "path",
+              "base_revision",
+              "hunks"
+            ],
+            "type": "object"
+          },
+          "maxItems": 16,
+          "minItems": 1,
+          "type": "array"
+        }
+      },
+      "required": [
+        "files"
+      ],
+      "type": "object"
+    },
+    "name": "edit.patch",
+    "risk": "WorkspaceWrite",
+    "roles": [
+      "mutate"
+    ]
+  },
+  "edit_patch_model_spec_sha256": "7df70cebb117edcd99de42a1485a05528599ff03ca0e168bc5ece3a7dbab2024",
+  "expected_cells": [
+    "mixed_eol/r1/production"
+  ],
+  "gate_implementation_sha256": "9a9ed6da24c27054b823bea90b0646df6a05ba2e4b74430bc52ae97bc42fca62",
+  "gate_schema": "agent-eval.tool-surface-edit.v4",
+  "model_identity": {
+    "base_url": "https://api.pinaic.com/v1",
+    "model": "gpt-5.6-luna"
+  },
+  "pack_digest": "e5c871282743a079c1e7b85be11859b05cd86e49a7cb8aa44587ae2a6b586611",
+  "pack_schema": "agent-eval.tool-edit.v2",
+  "repeats": 1,
+  "schema": "agent-eval.tool-edit-run-plan.v2",
+  "scope": "single_task",
+  "source_tree_digest": "d3a7834c7d40277043705762090f1816528e3ad10176a17baa4d277c753d013c",
+  "spec_sha256": "19d7a492afb7e4b45ae5b3d01bfcaacad4df8b060e6b00510eca3efdab525c0a",
+  "status": "planned",
+  "task_ids": [
+    "mixed_eol"
+  ],
+  "task_sha256s": {
+    "mixed_eol": "e6c6c3864330fb36a6bd151ace532aae7da81fe70b948fe6183d7cc5260875c1"
+  }
+}

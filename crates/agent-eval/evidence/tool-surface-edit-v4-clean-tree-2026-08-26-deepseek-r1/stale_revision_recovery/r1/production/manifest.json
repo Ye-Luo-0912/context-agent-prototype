@@ -1,0 +1,16 @@
+{
+  "schema": "agent-eval.cell.v1",
+  "fixture_id": "stale_revision_recovery",
+  "engine": "production",
+  "repeat": 1,
+  "repeats": 3,
+  "live": true,
+  "tool_surface": "production",
+  "fixture_sha256": "a1aa1cb7d173955a87890c2554d757c8356ed78dd68c4966f50179c56eb12d9d",
+  "git_head": "040e65f652a3ab7c435b07bcb023e924570b5a6b",
+  "git_dirty": false,
+  "git_dirty_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+  "source_tree_digest": "d3a7834c7d40277043705762090f1816528e3ad10176a17baa4d277c753d013c",
+  "openai_model": "deepseek-v4-flash",
+  "openai_base_url": "http://127.0.0.1:8787/v1"
+}

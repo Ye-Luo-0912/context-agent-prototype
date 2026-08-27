@@ -1,0 +1,85 @@
+{
+  "schema": "agent-eval.verify.v1",
+  "kind": "file_content+command",
+  "fixture_id": "late_constraint_long",
+  "expected_edit": "add v2 Hello and Heartbeat while keeping unversioned ping",
+  "passed": true,
+  "replay_complete": true,
+  "assertions": [
+    {
+      "path": "src/protocol.rs",
+      "pred": "contains",
+      "needles": [
+        "Hello"
+      ],
+      "count": 5,
+      "passed": true,
+      "file_exists": true
+    },
+    {
+      "path": "src/protocol.rs",
+      "pred": "contains",
+      "needles": [
+        "Heartbeat"
+      ],
+      "count": 5,
+      "passed": true,
+      "file_exists": true
+    },
+    {
+      "path": "src/protocol.rs",
+      "pred": "contains",
+      "needles": [
+        "ping"
+      ],
+      "count": 5,
+      "passed": true,
+      "file_exists": true
+    },
+    {
+      "path": "RELEASE.md",
+      "pred": "contains",
+      "needles": [
+        "v2"
+      ],
+      "count": 2,
+      "passed": true,
+      "file_exists": true
+    }
+  ],
+  "files": [
+    {
+      "path": "RELEASE.md",
+      "exists": true,
+      "sha256": "fc9c44b6ffa268ab613792043d28da0a46c02c6d25774f738e7bdff0c7f04291",
+      "bytes": 317,
+      "truncated": false,
+      "body": "The planned v2 work will extend messages with a request ID for correlating requests and responses, a timestamp for recording message creation time, and an optional payload for carrying additional message data while preserving the existing Ping behavior.\n\nShipped: v2 `Hello` messages with an explicit `v:2` envelope.\n"
+    },
+    {
+      "path": "src/protocol.rs",
+      "exists": true,
+      "sha256": "c8e54f23883995643bb82c79f58f48f566fdbb6bf5a4958ed6d252eab4d1f557",
+      "bytes": 1765,
+      "truncated": false,
+      "body": "pub enum Msg {\r\n    Ping,\r\n    Hello(String),\r\n    Heartbeat(u32),\r\n}\r\n\r\npub fn decode(bytes: &str) -> Result<Msg, String> {\r\n    if bytes.contains(\"ping\") {\r\n        return Ok(Msg::Ping);\r\n    }\r\n    if let Some(value) = bytes\r\n        .strip_prefix(r#\"{\"v\":2,\"hello\":\"\"#)\r\n        .and_then(|value| value.strip_suffix(r#\"\"}\"#))\r\n    {\r\n        return Ok(Msg::Hello(value.into()));\r\n    }\r\n    if let Some(value) = bytes\r\n        .strip_prefix(r#\"{\"v\":2,\"heartbeat\":\"#)\r\n        .and_then(|value| value.strip_suffix('}'))\r\n    {\r\n        if let Ok(sequence) = value.parse() {\r\n            return Ok(Msg::Heartbeat(sequence));\r\n        }\r\n    }\r\n    Err(\"unknown\".into())\r\n}\r\n\r\npub fn encode(msg: &Msg) -> String {\r\n    match msg {\r\n        Msg::Ping => \"ping\".into(),\r\n        Msg::Hello(value) => format!(r#\"{{\"v\":2,\"hello\":\"{}\"}}\"#, value),\r\n        Msg::Heartbeat(sequence) => format!(r#\"{{\"v\":2,\"heartbeat\":{}}}\"#, sequence),\r\n    }\r\n}\r\npub fn ping_roundtrip() -> Result<Msg, String> {\r\n    decode(&encode(&Msg::Ping))\r\n}\r\n\r\n#[cfg(test)]\r\nmod tests {\r\n    use super::{decode, encode, Msg};\r\n\r\n    #[test]\r\n    fn decodes_ping_frame() {\r\n        assert!(matches!(decode(\"ping\"), Ok(Msg::Ping)));\r\n    }\r\n    #[test]\r\n    fn hello_roundtrip_uses_v2_envelope() {\r\n        let encoded = encode(&Msg::Hello(\"world\".into()));\r\n        assert_eq!(encoded, r#\"{\"v\":2,\"hello\":\"world\"}\"#);\r\n        assert!(matches!(decode(&encoded), Ok(Msg::Hello(value)) if value == \"world\"));\r\n    }\r\n    #[test]\r\n    fn heartbeat_roundtrip_preserves_sequence() {\r\n        let encoded = encode(&Msg::Heartbeat(42));\r\n        assert_eq!(encoded, r#\"{\"v\":2,\"heartbeat\":42}\"#);\r\n        assert!(matches!(decode(&encoded), Ok(Msg::Heartbeat(sequence)) if sequence == 42));\r\n    }\r\n\r\n}\r\n\r\n"
+    }
+  ],
+  "commands": [
+    {
+      "argv": [
+        "python",
+        "D:\\Users\\Ye_Luo\\APP\\context-agent-prototype\\crates\\agent-eval\\longflow\\checks\\wire_v1.py",
+        "C:\\Users\\Ye_Luo\\AppData\\Local\\Temp\\.tmpMpEUn4\\append"
+      ],
+      "expect_exit": 0,
+      "exit": 0,
+      "timed_out": false,
+      "stdout": "",
+      "stderr": "",
+      "stdout_truncated": false,
+      "stderr_truncated": false,
+      "passed": true
+    }
+  ]
+}
