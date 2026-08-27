@@ -47,6 +47,10 @@ pub enum CheckpointDebtReason {
     TaskAnchorChanged,
     DurableWorkspaceMutation,
     VerificationChanged,
+    /// A derived completion-opportunity key was persisted into the bounded
+    /// resume state. Once-per-basis offer discipline must survive recovery,
+    /// so the write owes a durable snapshot like any other resume change.
+    OpportunityOffered,
 }
 
 impl CheckpointDebtReason {
@@ -55,6 +59,7 @@ impl CheckpointDebtReason {
             Self::TaskAnchorChanged => "task_anchor_changed",
             Self::DurableWorkspaceMutation => "durable_workspace_mutation",
             Self::VerificationChanged => "verification_changed",
+            Self::OpportunityOffered => "opportunity_offered",
         }
     }
 }

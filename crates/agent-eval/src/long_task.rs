@@ -404,7 +404,16 @@ async fn drain_until(
     while tokio::time::Instant::now() < deadline {
         while let Ok(envelope) = events.try_recv() {
             match envelope.event {
-                RuntimeEvent::TaskResumeCommitted { .. } => labels.push("resume".into()),
+                RuntimeEvent::TaskResumeCommitted {
+                    ref debt,
+                    ..
+                } => {
+                    if debt.iter().any(|reason| reason == "opportunity_offered") {
+                        labels.push("resume:opportunity_offered".into());
+                    } else {
+                        labels.push("resume".into());
+                    }
+                }
                 RuntimeEvent::CheckpointDurable { .. } => labels.push("durable".into()),
                 RuntimeEvent::CheckpointWriteFailed { reason } => {
                     labels.push(format!("write_failed:{reason}"))
@@ -652,6 +661,12 @@ struct OpportunityArmObservation {
 #[derive(Debug, Default)]
 pub struct OpportunityReplayReport {
     pub on_offered_once: bool,
+    /// Diagnostic: when the offer's checkpoint debt survives to a later
+    /// resume commit it shows here; when the leased decision completes the
+    /// task in the same window the terminal freeze retires it instead, so
+    /// absence is not a defect. The crash-window proof of once-per-basis
+    /// offer survival belongs to the cold-resume matrix.
+    pub on_offer_debt_owed: bool,
     pub on_surfaced_after_offer: bool,
     pub on_called_after_offer: bool,
     pub on_completed: bool,
@@ -796,6 +811,14 @@ async fn drive_opportunity_arm(
                             obs.markers.push("completed_key");
                         }
                         _ => {}
+                    }
+                }
+                RuntimeEvent::TaskResumeCommitted {
+                    ref debt,
+                    ..
+                } => {
+                    if debt.iter().any(|reason| reason == "opportunity_offered") {
+                        obs.markers.push("resume_opportunity_debt");
                     }
                 }
                 RuntimeEvent::TaskCompleted { .. } => {
@@ -955,10 +978,11 @@ mod tests {
             .expect("opportunity replay completes");
         assert!(
             report.passed(),
-            "on_offered_once={} on_surfaced_after_offer={} on_called_after_offer={} \
+            "on_offered_once={} on_offer_debt_owed={} on_surfaced_after_offer={} on_called_after_offer={} \
              on_completed={} on_completed_key_matches_offer={} \
              off_opportunity_events_zero={} off_never_surfaced={}",
             report.on_offered_once,
+            report.on_offer_debt_owed,
             report.on_surfaced_after_offer,
             report.on_called_after_offer,
             report.on_completed,

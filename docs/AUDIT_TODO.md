@@ -189,7 +189,15 @@ directory state (all entries sorted, 4096-entry/128 KiB caps, truncation
 flag hashed) plus canonically sorted env pairs. Beyond-preview changes
 move the epoch; HashMap iteration order cannot.
 
-### TOOL-EDIT-02 — canonical edit first-attempt success (open)
+### TOOL-EDIT-02 — canonical edit first-attempt success (confirmation met 2026-08-27; residual reliability work only)
+
+The `v4` contract (byte-equivalent hunk decompositions accepted; byte/
+revision/settlement truth preserved) reached its archival 4x3 confirmation
+window: strict 12/12, gate 12/12, zero post-edit confirmation reads, with the
+regression test locking the gate. No current consumer requires a golden
+decomposition; reversing that choice needs a documented consumer first. What
+remains is bounded reliability breadth (staged-byte accounting, external
+races), not an open acceptance gate.
 
 Do not reopen `TOOL-EDIT-01`: revision-aware exact refusals and bounded
 candidates remain landed. The open gate is product reliability of the one
@@ -575,9 +583,22 @@ be sized against real demand. Residency loosening stays rejected on
 current evidence; the tiny current-turn LRU gets built only if this
 motive shows up in live runs.
 
-### EXEC-REV-01 — verification basis diverges across consumers (reopened 2026-08-27)
+### EXEC-REV-01 — verification basis diverges across consumers (fixed 2026-08-27)
 
-Observed: a progress-only CAS advances the task/execution anchor revision
+Landed: `TaskAnchor.verification_revision` is an independent basis (serde
+default) bumped only by authoritative boundary changes — original goal and
+constraints — while progress/open-loop/next-action maintenance advances only
+the whole-record CAS revision; `TaskManager` syncs
+`ExecutionState.verification.spec_revision` to the basis, and facts, exact
+verifier sources, freshness/validity and the opportunity key
+(`opp/{task}/a{basis}/d{directive}/w{workspace}/...`) all read the basis.
+Deterministic regressions prove progress-only movement keeps Current while
+authority movement stales across consumers. Residual, tracked with the
+cold-resume matrix: the persisted offer key must also accrue checkpoint debt
+(it does since 2026-08-28) with a crash-window proof that once-per-basis
+discipline survives recovery.
+
+Original observation: a progress-only CAS advances the task/execution anchor revision
 without marking the existing verification stale. `ExecutionState::validity()`
 and completion therefore accept it as Current, while exact reuse and
 `CompletionOpportunity` require the fact's old anchor revision to equal the
@@ -667,9 +688,15 @@ required_sequence`. Cover same-anchor distinct snapshots, out-of-order ack,
 new debt during an old write, revision zero, task switch and failed-write
 retry.
 
-### EVAL-05 — resume twin does not prove the latest settled cold artifact (reopened 2026-08-27)
+### EVAL-05 — resume twin does not prove the latest settled cold artifact (fixed 2026-08-27)
 
-Observed: the harness now builds a fresh engine and uses the verified loader,
+Landed: the harness correlates the checkpoint artifact with its snapshot
+sequence and checksum across the resume boundary — a sequence mismatch fails
+harness-side before restore — and tracks the full durable tuple
+(artifact, sequence, checksum), requiring the durable-after-mutation ack to
+match the last resume-committed sequence.
+
+Original observation: the harness now builds a fresh engine and uses the verified loader,
 but treats any `CheckpointDurable` arriving after a mutation as the mutation's
 checkpoint. A pre-mutation capture may acknowledge after a later write; the
 cross-phase state retains only the artifact name, not the acknowledged
@@ -684,9 +711,14 @@ with its exact lineage, sequence, artifact, checksum and capability generation. 
 only after that tuple is fully settled; carry only that tuple across phases;
 reject an older or mismatched acknowledgement before restore.
 
-### EVAL-06 — isolated oracle setup failures are misclassified as behavior failures (reopened 2026-08-27)
+### EVAL-06 — isolated oracle setup failures are misclassified as behavior failures (fixed 2026-08-27)
 
-Observed: oracle injection writes under `tests/` without first creating the
+Landed: the harness pre-creates the tests directory, classifies setup and
+injection failures as typed `not_run` instead of behavior fail, runs the
+workspace self-check before oracle injection with a distinct cargo target so
+the oracle cannot pollute it, and removes the injected oracle after the run.
+
+Original observation: oracle injection writes under `tests/` without first creating the
 directory. Four retained `behavior=fail` records are actually setup failures
 (`os error 3`), not executed behavioral assertions. The injected oracle also
 overwrites the recorded cargo argv, blurring it with the workspace self-check
@@ -1108,7 +1140,7 @@ Full text: git history of this file.
 | TOOL-ENV-01, TOOL-EDIT-01, TOOL-VIEW-01, TOOL-ERROR-01 | Tool-quality preflight 2026-08-17 |
 | MOD-AUTH-01 | `edit.patch files[]` multi-file authority widening → `EffectIntent::WorkspaceWriteSet` + all-paths `grant_matches` (2026-08-21; see PLATFORM_SECURITY.md) |
 | MOD-AUTH-02 | Prepared effects report canonical `ActualWorkspaceWrite` (real path + real staged bytes); Core commit rejects `ActualExceedsApproved` outside the approved set (2026-08-21) |
-| LONGTASK-01/02 | Catalog-cold progress CAS, actor safe-point resume install, coalesced checkpointing and same-task continuation landed deterministically (2026-08-24/25); reopened residuals remain LONGTASK-03/04 and EXEC-REV-01 |
+| LONGTASK-01/02 | Catalog-cold progress CAS, actor safe-point resume install, coalesced checkpointing and same-task continuation landed deterministically (2026-08-24/25); remaining residuals are the LT-RUN-05 cold-resume matrix items under LONGTASK-03/04 (EXEC-REV-01 closed 2026-08-27) |
 | CORE-11 | HostToolPolicy registry| CORE-12 | M13 sandbox gate: structured attestation with per-flag mechanism proofs, `required ⊆ actual` activation, native fail-closed UntrustedGenerated. Closed 2026-08-27 on the clean-tree closure-audit report (`evidence/platform-closure/m13/`) |
 | Sandbox floor | `UntrustedGenerated.required` now includes `fs_read_confined` + `cpu_quota` (still fail-closed on native until provable); `process_spawn_controlled` → `process_count_quota` with a wire-compat serde alias (2026-08-21) |
 | Foreground ack | `ContextConsumptionAck.foreground_item_ids` + engine counter: foreground bodies the model saw are observable (weak signal; no residency / admission change) (2026-08-21) |

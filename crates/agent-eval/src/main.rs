@@ -632,8 +632,9 @@ async fn main() -> anyhow::Result<()> {
                 }
                 let opportunity = long_task::run_opportunity_replay().await?;
                 println!(
-                    "completion_opportunity off/on replay: {}",
-                    if opportunity.passed() { "PASS" } else { "FAIL" }
+                    "completion_opportunity off/on replay: {} (offer_debt_observed={})",
+                    if opportunity.passed() { "PASS" } else { "FAIL" },
+                    opportunity.on_offer_debt_owed
                 );
                 if !opportunity.passed() {
                     anyhow::bail!("completion-opportunity replay failed");

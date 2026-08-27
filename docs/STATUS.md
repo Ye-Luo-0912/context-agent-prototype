@@ -427,11 +427,14 @@ and sandbox contracts live elsewhere. Experiment facts live in
   ([`evidence/opportunity-gate/REPORT.md`](../crates/agent-eval/evidence/opportunity-gate/REPORT.md));
   this replaces the stale statement that it had not run. Attempt 2 proves one
   live offer -> lease -> explicit `task.complete` -> committed closure chain,
-  and the deterministic already-satisfied replay remains green. It does not
+  and the deterministic already-satisfied replay remains green (now also
+  observing the offer's checkpoint-debt diagnostic). It does not
   prove product benefit or safe promotion: the candidate remains default-off.
-  Do not run a third unchanged live window until the checkpoint,
-  verification-basis and evaluator defects have deterministic regression
-  coverage under `LT-RUN-05`.
+  The 2026-08-27 prerequisites for another live window have since landed:
+  EXEC-REV-01's independent verification basis, EVAL-05's durable-tuple
+  resume correlation and EVAL-06's typed oracle setup classification are
+  all fixed with deterministic coverage; what remains before that gate is
+  the LT-RUN-05 cold-resume matrix (work package five).
 - **Execution Convergence V1 mechanism landed** (2026-08-23, all 22
   items checked — the checklist is now the historical record
   [`EXECUTION_CONVERGENCE_V1.md`](EXECUTION_CONVERGENCE_V1.md)):

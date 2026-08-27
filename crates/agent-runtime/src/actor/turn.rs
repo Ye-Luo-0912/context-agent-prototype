@@ -749,9 +749,16 @@ impl RuntimeActor {
                     return;
                 }
                 let key_text = key.key.clone();
-                let turn = self.state.turn.as_mut().expect("turn checked above");
-                turn.execution.record_opportunity_offer(key_text.clone());
-                turn.opportunity_lease = Some(key_text.clone());
+                if let Some(turn) = self.state.turn.as_mut() {
+                    turn.execution.record_opportunity_offer(key_text.clone());
+                    turn.opportunity_lease = Some(key_text.clone());
+                }
+                // The persisted key is durable resume state: once-per-basis
+                // offer discipline has to survive recovery, so persisting
+                // it owes a checkpoint like any other resume change.
+                self.accrue_checkpoint_debt(
+                    crate::checkpoint::CheckpointDebtReason::OpportunityOffered,
+                );
                 let _ = self
                     .core
                     .emit_event(RuntimeEvent::CompletionOpportunity {
