@@ -813,20 +813,7 @@ on its own outputs (`shell.exec`, `process.run`, `git.status`, `git.diff`,
 builtin-name table exactly so the two channels cannot disagree. Shared
 refusal helpers (`hidden_path`, missing-path) stay on the derivation:
 they serve many tool names and their outputs carry no authority keys.
-`process.session` deliberately stays on the fallback too: its
-table value (`false`) looks wrong for a tool that executes arbitrary
-processes, and stamping that value natively would entrench it — widening
-the session bound is a conservative behavior change that needs its own
-eval pass before landing; the full options analysis and recommendation
-live in [`EXECUTION_COHERENCE.md`](EXECUTION_COHERENCE.md) ("Open
-decision — `process.session` mutation bound"). With coverage this
-complete, retiring the name
-table reduces to retiring the legacy stamps plus migrating session once
-its bound decision lands. Still open for this entry: the session-bound
-decision, retiring the legacy stamps once model-visible drift is
-acceptable (derivation then returns empty by construction and every
-fallback becomes dead-code removal), and the event-level durable wire
-DTO.
+`process.session` now stamps `may_mutate=true` natively on every action (`start`/`poll`/`stop`) via the `_execution_facts` channel, and the legacy name-table fallback also resolves it to true — both channels agree on the conservative `Unknown` footprint shared with `shell.exec`/`process.run` (see [`EXECUTION_COHERENCE.md`](EXECUTION_COHERENCE.md) resolved `process.session` bound). With coverage this complete, retiring the name table reduces to retiring the legacy stamps once model-visible drift is acceptable (derivation then returns empty by construction and every fallback becomes dead-code removal), plus the event-level durable wire DTO. The session-bound decision is now closed.
 
 ### PROTO-EVID-02 — cache correctness + observability (fixed 2026-08-23)
 

@@ -309,25 +309,28 @@ impl ProcessSessionTool {
             },
         );
 
-        Ok(ToolOutcome::Value(ToolOutput {
-            call_id: call_id.into(),
-            tool_name: "process.session".into(),
-            ok: true,
-            summary: format!("session {session_id} started (pid {pid})"),
-            model_content: format!(
-                "session started: {session_id} (pid {pid})\nDrain output with process.session poll.",
-            ),
-            artifact_ref: Some(artifact_ref),
-            metadata: json!({
-                "action": "start",
-                "session_id": session_id,
-                "pid": pid,
-                "output_bytes": 0,
-                "artifact_bytes": 0,
-                "artifact_limit_bytes": MAX_ARTIFACT_BYTES,
-                "artifact_truncated": false,
-            }),
-        }))
+        Ok(ToolOutcome::Value(
+            ToolOutput {
+                call_id: call_id.into(),
+                tool_name: "process.session".into(),
+                ok: true,
+                summary: format!("session {session_id} started (pid {pid})"),
+                model_content: format!(
+                    "session started: {session_id} (pid {pid})\nDrain output with process.session poll.",
+                ),
+                artifact_ref: Some(artifact_ref),
+                metadata: json!({
+                    "action": "start",
+                    "session_id": session_id,
+                    "pid": pid,
+                    "output_bytes": 0,
+                    "artifact_bytes": 0,
+                    "artifact_limit_bytes": MAX_ARTIFACT_BYTES,
+                    "artifact_truncated": false,
+                }),
+            }
+            .with_native_execution_facts(super::builtin_bound(true)),
+        ))
     }
 
     async fn poll(&self, call_id: &str, args: SessionArgs) -> AgentResult<ToolOutcome> {
@@ -379,34 +382,37 @@ impl ProcessSessionTool {
             ""
         };
 
-        Ok(ToolOutcome::Value(ToolOutput {
-            call_id: call_id.into(),
-            tool_name: "process.session".into(),
-            ok: true,
-            summary: format!(
-                "session {session_id} {status} ({new_lines} new line(s), {total_lines} total{truncation_summary})",
-            ),
-            model_content: if new_lines == 0 && tail.is_empty() {
-                format!("session {session_id} {status}; no output yet{truncation_note}")
-            } else {
-                format!(
-                    "[session {session_id} {status}; {new_lines} new line(s); {total_lines} total]\n{tail}{truncation_note}",
-                )
-            },
-            artifact_ref: Some(session.artifact_ref.clone()),
-            metadata: json!({
-                "action": "poll",
-                "session_id": session_id,
-                "status": status,
-                "exit_code": exit_code,
-                "new_lines": new_lines,
-                "total_lines": total_lines,
-                "output_bytes": output_bytes,
-                "artifact_bytes": artifact_bytes,
-                "artifact_limit_bytes": MAX_ARTIFACT_BYTES,
-                "artifact_truncated": artifact_truncated,
-            }),
-        }))
+        Ok(ToolOutcome::Value(
+            ToolOutput {
+                call_id: call_id.into(),
+                tool_name: "process.session".into(),
+                ok: true,
+                summary: format!(
+                    "session {session_id} {status} ({new_lines} new line(s), {total_lines} total{truncation_summary})",
+                ),
+                model_content: if new_lines == 0 && tail.is_empty() {
+                    format!("session {session_id} {status}; no output yet{truncation_note}")
+                } else {
+                    format!(
+                        "[session {session_id} {status}; {new_lines} new line(s); {total_lines} total]\n{tail}{truncation_note}",
+                    )
+                },
+                artifact_ref: Some(session.artifact_ref.clone()),
+                metadata: json!({
+                    "action": "poll",
+                    "session_id": session_id,
+                    "status": status,
+                    "exit_code": exit_code,
+                    "new_lines": new_lines,
+                    "total_lines": total_lines,
+                    "output_bytes": output_bytes,
+                    "artifact_bytes": artifact_bytes,
+                    "artifact_limit_bytes": MAX_ARTIFACT_BYTES,
+                    "artifact_truncated": artifact_truncated,
+                }),
+            }
+            .with_native_execution_facts(super::builtin_bound(true)),
+        ))
     }
 
     async fn stop(&self, call_id: &str, args: SessionArgs) -> AgentResult<ToolOutcome> {
@@ -444,32 +450,35 @@ impl ProcessSessionTool {
             ""
         };
 
-        Ok(ToolOutcome::Value(ToolOutput {
-            call_id: call_id.into(),
-            tool_name: "process.session".into(),
-            ok: true,
-            summary: format!(
-                "session {session_id} stopped ({total_lines} total lines{truncation_summary})",
-            ),
-            model_content: if artifact_truncated {
-                format!(
-                    "session {session_id} stopped; artifact capture was truncated at {MAX_ARTIFACT_BYTES} bytes"
-                )
-            } else {
-                format!("session {session_id} stopped")
-            },
-            artifact_ref: Some(artifact_ref),
-            metadata: json!({
-                "action": "stop",
-                "session_id": session_id,
-                "status": "stopped",
-                "total_lines": total_lines,
-                "output_bytes": output_bytes,
-                "artifact_bytes": artifact_bytes,
-                "artifact_limit_bytes": MAX_ARTIFACT_BYTES,
-                "artifact_truncated": artifact_truncated,
-            }),
-        }))
+        Ok(ToolOutcome::Value(
+            ToolOutput {
+                call_id: call_id.into(),
+                tool_name: "process.session".into(),
+                ok: true,
+                summary: format!(
+                    "session {session_id} stopped ({total_lines} total lines{truncation_summary})",
+                ),
+                model_content: if artifact_truncated {
+                    format!(
+                        "session {session_id} stopped; artifact capture was truncated at {MAX_ARTIFACT_BYTES} bytes"
+                    )
+                } else {
+                    format!("session {session_id} stopped")
+                },
+                artifact_ref: Some(artifact_ref),
+                metadata: json!({
+                    "action": "stop",
+                    "session_id": session_id,
+                    "status": "stopped",
+                    "total_lines": total_lines,
+                    "output_bytes": output_bytes,
+                    "artifact_bytes": artifact_bytes,
+                    "artifact_limit_bytes": MAX_ARTIFACT_BYTES,
+                    "artifact_truncated": artifact_truncated,
+                }),
+            }
+            .with_native_execution_facts(super::builtin_bound(true)),
+        ))
     }
 }
 

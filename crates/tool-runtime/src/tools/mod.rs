@@ -49,10 +49,11 @@ use tokio::fs as tokio_fs;
 use tokio::io::AsyncReadExt;
 
 /// The explicit workspace-mutation bound builtin producers assert about
-/// their own results. It mirrors the temporary builtin-name table exactly,
-/// so the native facts channel and the legacy derivation agree until the
-/// table retires; `process.session` deliberately stays on the fallback
-/// because its table value is under review.
+/// their own results. It mirrors the builtin-name table; every builtin
+/// now stamps its bound natively, including `process.session` as
+/// `may_mutate=true` (Unknown footprint, matching `shell.exec` and
+/// `process.run`) so session children that write workspace files are not
+/// silently treated as read-only.
 pub(crate) fn builtin_bound(may_mutate_workspace: bool) -> ToolExecutionFacts {
     ToolExecutionFacts::empty()
         .with_verification(false)

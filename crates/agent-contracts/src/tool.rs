@@ -771,7 +771,12 @@ impl ToolOutput {
         }
         matches!(
             self.tool_name.as_str(),
-            "fs.write" | "edit.replace" | "edit.patch" | "shell.exec" | "process.run"
+            "fs.write"
+                | "edit.replace"
+                | "edit.patch"
+                | "shell.exec"
+                | "process.run"
+                | "process.session"
         ) || (self.tool_name.starts_with("git.")
             && !matches!(
                 self.tool_name.as_str(),
