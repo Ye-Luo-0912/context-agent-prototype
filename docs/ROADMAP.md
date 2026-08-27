@@ -45,17 +45,13 @@ does not reorder or close any gate.
    waits for WASI/V2 by design.
 3. Keep M14 closed; do not reopen it as a sandbox dump.
 4. V1 candidate: `context-mech.v2` 12-cell Context evidence exists; do not
-   retune GC from it. Separately, `edit.patch` v4 removed confirmation reads in
-   both archived clean-tree windows and reached strict raw-byte truth 12/12;
-   each scored flow gate 11/12 and non-conflict-first 8/9. The sole repeated
-   archived miss is a byte-perfect, revision-correct `batch_two_file` patch
-   whose hunk partition differs from hidden `exact_hunks`. The product contract
-   is byte/revision/settlement truth; hunk partition is not model-visible
-   authority and no current consumer requires a golden decomposition. Version
-   the gate to accept byte-equivalent decompositions while retaining strict
-   paths, bytes, revisions, settlement and no-fallback/no-confirm checks. Then
-   run one archival 4x3 confirmation window. Do not wait for another provider
-   or repeat the unchanged ambiguous gate. Deterministic crash, external-race,
+   retune GC from it. Separately, `edit.patch` v4 removed confirmation reads
+   and, after the gate accepted byte-equivalent decompositions as `v4`, one
+   archival 4x3 window reached `strict 12/12 gate 12/12` with zero confirmation
+   reads. The product contract is byte/revision/settlement truth; hunk
+   partition is not model-visible authority and no current consumer requires a
+   golden decomposition. Do not wait for another provider or repeat the
+   unchanged ambiguous gate. Deterministic crash, external-race,
    journal-corruption and portable
    disk-full coverage remains required. This finite diagnostic is not a general
    failure-rate estimate and does not close M12, M13 or M15.
