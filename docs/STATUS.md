@@ -686,12 +686,13 @@ they do not prove a general editor-engine failure rate.
 
 The product route is byte/revision/settlement truth: hunk partition is not
 model-visible authority and no downstream consumer currently requires a golden
-decomposition. Version `exact_hunks` to accept byte-equivalent decompositions
-while preserving submitted paths, strict final bytes, revision discipline,
-atomic settlement and no-fallback/no-confirm-read checks. Reverse that choice
-only if a real consumer first documents a canonical-granularity requirement.
-Then run one archival 4x3 confirmation window; do not spend more live windows
-on the unchanged ambiguous contract.
+decomposition. `exact_hunks` is now versioned to accept byte-equivalent
+decompositions while preserving submitted paths, strict final bytes, revision
+discipline, atomic settlement and no-fallback/no-confirm-read checks; the gate
+is `agent-eval.tool-surface-edit.v4`. Reverse that choice only if a real
+consumer first documents a canonical-granularity requirement. One archival 4x3
+confirmation window on the versioned gate is required; do not spend more live
+windows on the unchanged ambiguous contract.
 Deterministic external-race, crash, journal-fault and — since 2026-08-26 —
 disk-full coverage are landed: the feature-gated `test-faults` storage seam
 injects storage-full refusals at the authority intent, the staged temp bytes

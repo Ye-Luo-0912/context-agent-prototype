@@ -510,12 +510,13 @@ archival evidence. The remaining bar-blocker is now solely the
 merges each file's two anchor lines into one multiline hunk; bytes are
 always correct and `confirm=0`. The chosen product contract is committed
 byte/revision/settlement truth: hunk partition is not model-visible authority
-and no current consumer requires the golden decomposition. Version
-`exact_hunks` to accept byte-equivalent decompositions while retaining paths,
-strict bytes, revisions, settlement and no-fallback/no-confirm checks, then run
-one archival 4x3 confirmation window. A future canonical-granularity rule
-requires a documented consumer before reversing this decision. TOOL-EDIT-02
-stays open until that confirmation.
+and no current consumer requires the golden decomposition. `exact_hunks` is now
+versioned to accept byte-equivalent decompositions while retaining paths,
+strict bytes, revisions, settlement and no-fallback/no-confirm checks; the gate
+is `agent-eval.tool-surface-edit.v4`. A future canonical-granularity rule
+requires a documented consumer before reversing this decision. One archival 4x3
+confirmation window on the versioned gate is required. TOOL-EDIT-02 stays open
+until that confirmation.
 
 ## Open P1 — runtime scheduling correctness
 
