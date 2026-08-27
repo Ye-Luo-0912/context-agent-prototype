@@ -166,6 +166,7 @@ mod tests {
 "#;
 
 /// The scripted minimal solution used by the deterministic self-test.
+#[cfg(test)]
 const DIAG_BACKOFF_FIXED: &str = r#"//! Bounded exponential backoff.
 use crate::config::RetryConfig;
 
@@ -195,6 +196,7 @@ mod tests {
 }
 "#;
 
+#[cfg(test)]
 const DIAG_DIAGNOSIS_SOLVED: &str = r#"# Diagnosis
 
 `next_delay` in `src/backoff.rs` treats the 1-based `attempt` as the shift
@@ -372,6 +374,7 @@ pub fn total_delay(policy: &RetryPolicy, attempts: u32, backoff: Backoff) -> u64
 
 /// The scripted minimal solution: policy.rs defines, lib.rs re-exports,
 /// call sites import through `crate::policy::`.
+#[cfg(test)]
 const MIGRATE_POLICY_SOLVED: &str = r#"//! Retry policy extracted from the crate root.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RetryPolicy {
@@ -399,6 +402,7 @@ impl RetryPolicy {
 }
 "#;
 
+#[cfg(test)]
 const MIGRATE_LIB_SOLVED: &str = r#"//! Job runner; retry policy lives in `policy` and is re-exported unchanged.
 pub mod job;
 pub mod metrics;
@@ -412,6 +416,7 @@ pub fn max_attempts(policy: &RetryPolicy) -> u32 {
 }
 "#;
 
+#[cfg(test)]
 const MIGRATE_JOB_SOLVED: &str = r#"//! Job execution against the extracted policy module.
 use crate::policy::RetryPolicy;
 
@@ -426,6 +431,7 @@ impl Job {
 }
 "#;
 
+#[cfg(test)]
 const MIGRATE_METRICS_SOLVED: &str = r#"//! Retry metrics against the extracted policy module.
 use crate::policy::Backoff;
 
@@ -445,6 +451,7 @@ impl RetryMetrics {
 }
 "#;
 
+#[cfg(test)]
 const MIGRATE_USAGE_SOLVED: &str = r#"//! Cross-module usage against the extracted policy module.
 use crate::policy::{Backoff, RetryPolicy};
 
@@ -617,7 +624,8 @@ mod tests {
     #[tokio::test]
     #[ignore]
     async fn variants_cargo_check() {
-        let combos: [(&str, &[(&str, &str)], &str, bool); 4] = [
+        type Overrides = &'static [(&'static str, &'static str)];
+        let combos: [(&str, Overrides, &str, bool); 4] = [
             (RETRY_DIAG, &[], "diag-seed", false),
             (
                 RETRY_DIAG,
