@@ -510,17 +510,23 @@ and sandbox contracts live elsewhere. Experiment facts live in
   demands an overflow-safe marker, and fixture self-check runs each M15 pack
   oracle offline against seed and scripted solution; diag digest regenerated
   to `2fff5157…eeb`, migrate digest unchanged. The evaluator-validity part of
-  the pre-window checklist is done; the remaining item is the one-cell
-  product preflight after Completion Convergence V1 readiness. A 2-cell
-  `--diag-smoke` on the pinned serving failed both cells on the overflow edge
-  with now-valid evidence: the model fixed the off-by-one and named
-  `next_delay`, then used `checked_shl` + fallback, which does not catch bits
-  shifting out of the value (the old check table would have passed that fix —
-  the calibration closes that hole). Keep the fixture as the M15 diag pack.
-  Consequently the earlier product preflight still pins the serving tuple,
-  but it does not validate this newer catalog/source revision; rerun one
-  bounded source-bound preflight after the surface choice and before formal
-  M15.
+  the pre-window checklist is done, and the one-cell product preflight after
+  Completion Convergence V1 readiness is cleared: `retry_diag_dev` normal
+  PASSed 2026-08-29 on the same pinned serving at clean HEAD `09cce69`
+  (with the same frozen diag digest) in 14 rounds / 22 tool calls /
+  1 failed output / 139,886 ms — zero provider retries, contiguous events,
+  6 durable checkpoints, hidden oracle green, and settlement exposed (`seen`,
+  pre 9/15 → post 5/7) with ordinary-final closure, no `task.complete`, no
+  auto-close. The only unmatched diagnosis marker is the `backoff.rs`
+  overflow-safe needle: the written `exponent >= u64::BITS` + `checked_mul`
+  + saturation shape beats the oracle but not the reference
+  `u128`/`leading_zeros` needle text, a needle-shape miss, not a functional
+  failure. The calibrated diag fixture is solvable on the pinned serving; the
+  earlier 2-cell `--diag-smoke` failure was the model not solving the
+  overflow edge, which the calibration's needle and oracle now reject
+  consistently. M15 remains open until one complete clean-tree 12-cell v3
+  window passes; a resume-arm one-cell preflight was not part of this
+  bounded run.
 - **Completion Convergence V1 deterministic foundation landed** (2026-08-29,
   CONV-CLOSE-01 slices 1–5): evaluator cleanliness now aligns model-visible
   workspace with the allowed-diff policy (`.gate/`, `target/` and

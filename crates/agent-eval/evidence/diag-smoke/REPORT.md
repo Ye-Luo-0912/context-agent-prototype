@@ -65,3 +65,39 @@ is an honest reported fact (closure is report-only). No fixture, oracle or
 serving change follows from this smoke. Remaining readiness work is unchanged:
 Completion Convergence V1 readiness, then the exact-source one-cell preflight,
 then the formal 12-cell window.
+
+## 2026-08-29 one-cell product preflight (normal arm PASS)
+
+Added after the two-cell failure above, once Completion Convergence V1
+readiness landed: the pre-window checklist's remaining item was a bounded
+one-cell product preflight on the same pinned serving, proving the calibrated
+fixture is solvable before the formal window spends its 12-cell budget.
+
+- Clean HEAD: `09cce69` (the `--conv-tail` commit), same frozen fixture
+  digest `2fff5157…eeb`; no fixture, oracle or serving change.
+- Command: `agent-eval --diag-smoke normal` (one repeat, recovery switch
+  off). Evidence is under `retry_diag_dev-normal/r1-attempt2/dynamic/`.
+- Verdict: PASS — `retry_diag_dev` normal in 14 rounds / 22 tool calls /
+  1 failed output / 139,886 ms; zero provider retries, contiguous event
+  stream, 6 durable checkpoints, hidden oracle green (`cargo test --test
+  m15_diag_oracle` 3/3, exit 0) and replay complete.
+- Settlement exposed: first `SettledCandidate` frontier event at seq 153
+  (carrying a pending `verification_changed` debt); pre 9 rounds / 15 calls,
+  post 5 rounds / 7 calls. The model closed with an ordinary final message —
+  `closure=active`, no `task.complete`, no auto-close.
+- The single failed tool output is one `edit.patch` stale-revision retry
+  (6 edit attempts, 5 committed changes, 1 failure on the first patch of the
+  final rewrite).
+- Diagnosis markers: 5/6 assertions pass; the only miss is the `backoff.rs`
+  "shift corrected and overflow-safe" needle, because the written solution
+  guards `exponent >= u64::BITS` and uses `checked_mul` + `min(max_delay_ms)`
+  instead of the reference `u128`/`leading_zeros` shape. The oracle and the
+  seeded unit tests are green, so this is a needle-shape miss, not a
+  functional failure.
+
+Interpretation: this is one positive cell on the frozen calibrated fixture.
+It clears the one-cell preflight item (the pinned serving tuple can start,
+edit, verify and settle the diag fixture) and shows the earlier two-cell
+failure was the model not solving the overflow edge, not a harness artifact.
+It is not a formal M15 cell, makes no efficiency claim, and does not close
+M15; a resume-arm one-cell preflight was not part of this bounded run.

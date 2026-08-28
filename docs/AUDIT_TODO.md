@@ -343,6 +343,21 @@ honest reported fact, not a harness artifact. The
 surviving blocker is a missing completion decision boundary; see
 CONV-CLOSE-01 below.
 
+The one-cell product preflight cleared 2026-08-29 (after Completion
+Convergence V1 readiness): `retry_diag_dev` normal PASSed on the same pinned
+serving at clean HEAD `09cce69` ([`evidence/diag-smoke/REPORT.md`](../crates/agent-eval/evidence/diag-smoke/REPORT.md))
+in 14 rounds / 22 calls / 1 failed output / 139,886 ms with the hidden oracle
+green, 6 durable checkpoints and settlement exposed (`seen`, pre 9/15 →
+post 5/7) under ordinary-final closure — no `task.complete`, no auto-close.
+The one unmatched diagnosis marker is the `backoff.rs` overflow-safe needle:
+the written `exponent >= u64::BITS` + `checked_mul` + saturation shape passes
+the oracle but not the reference `u128`/`leading_zeros` needle text, so it is
+a needle-shape miss, not a functional failure. The calibrated fixture is
+solvable on the pinned serving; the earlier smoke failures were the model not
+solving the overflow edge. M15 stays open until one complete clean-tree
+12-cell v3 window passes; a resume-arm one-cell preflight was not part of
+this bounded run.
+
 ### CONV-CLOSE-01 — Completion Convergence V1 (deterministic foundation + exposure-qualified live gate ran 2026-08-29; efficiency open)
 
 The 55-round / 129-call `retry_policy_dev` resume cell is the current bounded
