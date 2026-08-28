@@ -14,9 +14,15 @@ Three decisions remain frozen:
 
 1. Budget: 3 tasks × 2 modes × 2 repeats = 12 development cells.
 2. Fixtures: `retry_policy_dev`, `retry_diag_dev` and `retry_migrate_dev` as
-   implemented in `crates/agent-eval/src/m15_pack.rs`.
+   semantically defined in `crates/agent-eval/src/m15_pack.rs`.
 3. Closure: the `task.complete` lifecycle is a reported product fact, not a
    mandatory M15 V1 pass dimension.
+
+The fixture freeze preserves requested behavior and oracle meaning, not a
+known-invalid golden implementation. A golden/self-check repair that only
+makes the seed satisfy its already-stated oracle is allowed before source pin;
+it must regenerate the pack digest. Any task-contract or oracle-meaning change
+requires an explicit acceptance refreeze.
 
 The serving pin was reopened. The earlier Luna and relay attempts cannot select
 a serving because their v2 evidence misprojected closure, reused the wrong
@@ -37,18 +43,29 @@ predates the catalog-cold `fs.mkdir` addition and its admission decision.
 The `TOOL-DIR-SURFACE-01` deterministic gate landed (2026-08-28): a typed
 missing-parent refusal surfaces exactly `fs.mkdir` with `RecoverySurface`
 provenance for one decision, approval unchanged, unrelated missing reads
-unaffected. The full 24-cell isolated live paired gate ran the same day and
-did NOT promote the recovery source (off 12/12 vs on 11/12 mandatory
-success; higher median rounds/calls; new max tail 55 vs 31), so the
-catalog-cold baseline is retained and `with_recovery_surface` stays off.
-Evidence: [`recovery-surface-gate/REPORT.md`](../crates/agent-eval/evidence/recovery-surface-gate/REPORT.md).
-The gate also exposed a calibration blocker: `retry_diag_dev` fails 0/8 in
-both arms because the serving misses the saturation edge (`base <<
-(attempt-1).min(63)` wraps to 0 for attempts ≥ 64) while every needle
-predicate passes. Resolve that fixture calibration, then rerun the same
-one-cell bounded preflight on that source before the
-formal window. This is product/source readiness confirmation, not permission
-to switch the serving tuple or alter this acceptance contract.
+unaffected. Its 24-cell live run did not promote the recovery source, but a
+post-run event audit found zero candidate exposure in either arm. The off/on
+round and call differences therefore cannot be attributed to the switch. Keep
+the catalog-cold baseline and `with_recovery_surface` off conservatively; the
+live decision is `NOT_EXERCISED`, and any future paired report must fail closed
+as inconclusive when exposure is zero. Evidence:
+[`recovery-surface-gate/REPORT.md`](../crates/agent-eval/evidence/recovery-surface-gate/REPORT.md).
+
+The diagnosis failure is also evaluator calibration, not established serving
+failure: the checked-in `retry_diag_dev` minimal/golden solution fails its own
+saturation oracle (the `u64` shift wraps to zero on large attempts), while
+fixture self-check does not execute that oracle. Calibrated 2026-08-29 under
+the §0 fixture-authoring provision: the golden solution now saturates via
+`u128` widening, the directive and golden `DIAGNOSIS` name the
+saturate-not-wrap edge, the hidden check requires an overflow-safe marker,
+fixture self-check executes each pack's oracle against the untouched seed and
+the scripted solution, and the pack digests are recorded as frozen constants
+(diag regenerated to `2fff51573097fe4c833215420dd0da74f11a645ef5c859bdd9bba87e5b427eeb`;
+migrate unchanged). Then complete the bounded Completion Convergence V1
+readiness slice and rerun the same one-cell product preflight on that source
+before the formal window. These repairs preserve the frozen task meaning and
+report-only closure semantics; they do not permit a serving switch or a
+mid-window change.
 
 No formal M15 development window currently exists. M15 remains open.
 
@@ -58,7 +75,7 @@ No formal M15 development window currently exists. M15 remains open.
 | --- | --- | --- |
 | Platform gates | M12/M13 clean-tree closure audits in `evidence/platform-closure/{m12,m13}/` | banked |
 | Context | frozen `context-mech.v2` 12-cell A/C evidence in `evidence/context-mech/`; no policy retune or rerun | banked |
-| Tool Surface | edit-gate v4 archival window plus deterministic crash/race/journal/disk-full coverage; production model surface remains v5; catalog-cold `fs.mkdir` baseline retained by the paired gate (2026-08-28), recovery source behind a default-off switch | banked mechanisms; the `TOOL-DIR-SURFACE-01` 24-cell paired live gate decided against promotion and is not folded into M15; the v5 `task.complete` availability change is not promoted by the invalid M15 attempts |
+| Tool Surface | edit-gate v4 archival window plus deterministic crash/race/journal/disk-full coverage; production model surface remains v5; catalog-cold `fs.mkdir` baseline retained conservatively, recovery source behind a default-off switch | banked mechanisms; the `TOOL-DIR-SURFACE-01` deterministic mechanism is green but its 24-cell live run had zero treatment exposure and is not folded into M15; the v5 `task.complete` availability change is not promoted by the invalid M15 attempts |
 | Execution coherence | Convergence Bench 4/4 plus `longflow-post-obligation-2026-08-23/` | banked |
 | Long-task truth chain | deterministic snapshot fence, unified capture, two-phase completion, verification basis and tuple-only cold resume | banked |
 | Advisory switches | `CompletionOpportunity` ended default-off; no candidate switch may be enabled | frozen off |
@@ -167,16 +184,22 @@ surface, reject a serving or close M15.
 Before spending a 12-cell window:
 
 1. keep the relevant deterministic evaluator/provider/runtime tests green;
-2. resolve the `retry_diag_dev` calibration blocker the paired gate exposed
-   (0/8 in both arms: the serving misses the saturation edge) and rerun the
-   bounded one-cell
-   source/product preflight without changing the serving tuple;
-3. use the preflight-pinned serving tuple in §0 without fallback or automatic
+2. evaluator validity is calibrated (done 2026-08-29): the diagnosis golden
+   solution passes and fixture self-check executes each pack's oracle offline
+   against seed and scripted solution; remaining sub-items are mechanical
+   paired-count reconstruction with recorded treatment exposure, and
+   aligning fixture artifact visibility with allowed-diff policy;
+3. land and deterministically prove the bounded Completion Convergence V1
+   readiness slice described in `LONG_TASK_EVALUATION.md`, without automatic
+   closure, Context/GC changes or fixed-round stopping;
+4. rerun the bounded one-cell source/product preflight without changing the
+   serving tuple;
+5. use the preflight-pinned serving tuple in §0 without fallback or automatic
    protocol negotiation;
-4. record the exact serving and clean source identity;
-5. set an explicit `OPENAI_API_PROTOCOL` and run one uninterrupted 12-cell v3
+6. record the exact serving and clean source identity;
+7. set an explicit `OPENAI_API_PROTOCOL` and run one uninterrupted 12-cell v3
    window with `agent-eval --m15-window`;
-6. accept only the mechanically regenerated report.
+8. accept only the mechanically regenerated report.
 
 300×3 scale, `recall_after_fix`, a 27-cell context expansion, a second context
 engine comparison and model comparison remain parked until this gate closes.

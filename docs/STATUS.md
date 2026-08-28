@@ -94,10 +94,11 @@ and sandbox contracts live elsewhere. Experiment facts live in
   task affinity and causing the next directive to rediscover tools/files.
   See
   [`longflow-pinai-luna-terminal-completion-2026-08-24/REPORT.md`](../crates/agent-eval/evidence/longflow-pinai-luna-terminal-completion-2026-08-24/REPORT.md).
-- A task-continuity candidate now separates implicit turn completion from
-  durable multi-turn task closure. `task.complete` is catalog-cold during
-  ordinary work and is leased by explicit closure intent or a task-owned
-  requirement; `capability.manage` discovery remains available. Deterministic
+- A historical task-continuity candidate separated implicit turn completion
+  from durable multi-turn task closure. At that experiment's surface revision,
+  `task.complete` was catalog-cold during ordinary work and leased by explicit
+  closure intent or a task-owned requirement; production v5 now always loads
+  it as recorded below. `capability.manage` discovery remained available. Deterministic
   tests prove ordinary vs explicit surface selection, clean one-shot commit,
   and failed-sibling recovery. A live `add_test` smoke passed in 3 rounds / 2
   calls / 0 failures. Two initial long-flow A/C diagnostics then removed every
@@ -493,16 +494,24 @@ and sandbox contracts live elsewhere. Experiment facts live in
   (PreferSurface demand only; a read-only gate still refuses the
   recovery-marked write without dispatch), and no surface change for
   unrelated missing reads. The candidate ships behind a host switch
-  (default off). The full 24-cell isolated live paired gate ran the same
-  day (`crates/agent-eval/evidence/recovery-surface-gate/REPORT.md`):
-  the recovery surface did NOT promote (off 12/12 vs on 11/12 mandatory
-  success, higher median rounds/calls in 5 of 6 pack/mode cells, new max
-  tail 55 vs 31 rounds), so the catalog-cold baseline is retained and the
-  switch stays off; the always-ready compact schema is the only unexercised
-  fallback. The gate also surfaced a calibration blocker: `retry_diag_dev`
-  fails 0/8 in both arms (the serving misses the saturation edge while all
-  needle predicates pass), which must be resolved before the formal M15
-  window.
+  (default off). The full 24-cell isolated live paired run completed the same
+  day (`crates/agent-eval/evidence/recovery-surface-gate/REPORT.md`), but a
+  post-run audit found zero `RecoverySurface`/`next_directory` exposure in all
+  24 event streams; all eight policy cells catalog-loaded and successfully
+  called `fs.mkdir`. Its off/on differences therefore cannot be attributed to
+  the candidate. Status is `NOT_EXERCISED / no promotion`: retain the
+  catalog-cold baseline and keep the switch off conservatively, but do not
+  advance the always-ready fallback or claim the candidate caused the 55-round
+  tail. The diagnosis failure is also evaluator calibration: the checked-in
+  golden solution fails its own saturation oracle and fixture self-check never
+  runs that oracle. Calibrated 2026-08-29 (fixture authoring, frozen
+  task/oracle meaning): the diag golden saturates via `u128` widening, the
+  directive and `DIAGNOSIS` name the saturate-not-wrap edge, the hidden check
+  demands an overflow-safe marker, and fixture self-check runs each M15 pack
+  oracle offline against seed and scripted solution; diag digest regenerated
+  to `2fff5157…eeb`, migrate digest unchanged. The evaluator-validity part of
+  the pre-window checklist is done; the remaining item is the one-cell
+  product preflight after Completion Convergence V1 readiness.
   Consequently the earlier product preflight still pins the serving tuple,
   but it does not validate this newer catalog/source revision; rerun one
   bounded source-bound preflight after the surface choice and before formal
@@ -835,27 +844,37 @@ planning algorithm:
 The deterministic snapshot/cold-restore chain and evaluator reconstruction are
 green. The retained-C CompletionOpportunity off/on gate then ran eight cells
 and failed promotion, so that candidate has ended default-off; do not spend
-another pair on it. Same-model A/C, diagnosis and multi-file migration tasks
+another pair on it. The newer 55-round / 129-call tail establishes a different
+pre-M15 readiness task: Completion Convergence V1. `task.complete` was always
+visible and its 18 calls in the 24-cell run all returned successful tool
+results; the tail made no completion call. Start with evaluator/fixture
+validity and event-derived post-settlement metrics, then derive a dynamic
+settled-state decision boundary from existing execution/verification facts.
+Do not auto-close, resurrect CompletionOpportunity, add fixed stopping counts,
+or change Context/GC. Same-model A/C and broader diagnosis/multi-file twins
 remain after formal M15. Criterion/CPL and model-visible TaskGraph research
 stay deferred and evidence-gated.
 
 ## Next milestone
 
-Engineering mainline after the 2026-08-27 platform-gate closures is the
-**V1 candidate and formal M15**. The corrected acceptance contract is
+Engineering mainline after the 2026-08-27 platform-gate closures remains the
+**V1 candidate and formal M15**, with two bounded readiness repairs before the
+next live window. The corrected acceptance contract is
 [`M15_ACCEPTANCE.md`](M15_ACCEPTANCE.md): V1 is the banked planes plus one
 live development pack (3 tasks × normal/resume × 2 repeats). Budget, fixtures
 and report-only closure semantics are frozen; the serving tuple is fixed by
 the bounded representative PinAI/Luna Responses preflight. Because `fs.mkdir`
 changed the product catalog after that diagnostic, the `TOOL-DIR-SURFACE-01`
 deterministic admission gate landed (2026-08-28) and its full 24-cell paired
-live gate ran the same day: the recovery surface did NOT promote, the
-catalog-cold baseline is retained, and the `with_recovery_surface` switch
-stays off. The `retry_diag_dev` calibration blocker (0/8 in both arms,
-saturation edge missed) must be resolved, then one bounded
-preflight must rerun on the exact candidate
-source/surface. The next accepted run must then be one uninterrupted clean-tree
-`retry-pilot-cell-v3` window with a
+live run completed the same day, but had zero treatment exposure. First repair
+evaluator validity: golden-oracle consistency, executable oracle self-check,
+mechanical exposure/count reconstruction, and fixture artifact visibility.
+Then implement and deterministically prove Completion Convergence V1 as a
+dynamic decision boundary after current verification; it preserves ordinary
+final versus durable `task.complete`, valid unfinished work and the lightweight
+C Context path. After those repairs, one bounded preflight must rerun on the
+exact candidate source/surface. The next accepted run must then be one
+uninterrupted clean-tree `retry-pilot-cell-v3` window with a
 mechanically regenerated report. V2 Self-Iteration stays blocked until M15
 closes.
 The agent may grow capabilities, never evaluation or permission Core authority.

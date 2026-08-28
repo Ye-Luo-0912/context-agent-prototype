@@ -853,13 +853,20 @@ authority-v3 object identity and conservative rollback/reopen recovery.
 the `TOOL-DIR-SURFACE-01` deterministic gate (2026-08-28) proved the
 failure-triggered recovery source works — a typed missing-parent refusal
 surfaces exactly `fs.mkdir` with `RecoverySurface` provenance for one
-decision — but its full 24-cell isolated live paired gate rejected
-promotion the same day (unequal mandatory success, higher median
-rounds/calls, new max tail), so the baseline stays and the
-`with_recovery_surface` switch remains off. The gate also exposed a
-`retry_diag_dev` calibration blocker (0/8 both arms; saturation edge
-missed). The old preflight pins the serving tuple but predates
-this product catalog revision.
+decision. Its 24-cell live run did not promote the candidate, but the
+post-run audit found zero `RecoverySurface`/`next_directory` exposure in all
+24 traces; all eight policy cells catalog-loaded and successfully used
+`fs.mkdir`. The run is therefore `NOT_EXERCISED`, not causal evidence that the
+candidate increased rounds/calls. Keep the baseline and switch off
+conservatively. The same audit found that `retry_diag_dev`'s checked-in golden
+solution fails its own overflow oracle and that fixture self-check never runs
+that oracle. That evaluator-validity gap is closed (calibrated 2026-08-29):
+the golden solution saturates via `u128` widening, the hidden check demands an
+overflow-safe marker, the directive names the saturate-not-wrap edge, and
+fixture self-check now runs both pack oracles offline against the seed
+(reject) and scripted solution (accept); the diag pack digest is regenerated
+(`2fff5157…eeb`). The old
+preflight pins the serving tuple but predates this product catalog revision.
 
 ### Work package 5 — execution order and live decision
 
@@ -893,6 +900,81 @@ close normally and no on cell improved closure. The candidate therefore ended
 default-off. This is a terminal decision for that mechanism, not a reason to
 rerun it, add prompt pressure, special-case the provider or proceed to a
 same-model A/C claim.
+
+## Pre-M15 readiness task: Completion Convergence V1
+
+Do not start by rewriting `task.complete`. In the recovery-surface run its
+schema was always present, all 18 calls returned successful tool results, and
+17 reached durable `TaskCompleted`; the 55-round / 129-call tail made no
+completion call. One successful proposal did not reach `TaskCompleted` within
+its trace, so proposal settlement across cancel/resume belongs in the new
+deterministic coverage, but it does not explain the long pre-proposal decision
+tail.
+
+The next task is an execution-flow boundary that recognizes when current work
+is settled while preserving autonomy and long-task continuation:
+
+```text
+Working
+  -> VerificationDue       when an applicable accepted mutation makes proof stale
+  -> VerifiedCurrent       when the trusted verification basis covers that mutation
+  -> SettledCandidate      when no unresolved constraint, obligation, failure or
+                            in-flight operation remains
+  -> ordinary final | task.complete | concrete remaining blocker/action
+```
+
+Transitions are evidence-driven, not round-driven. Any new accepted mutation,
+new user constraint, stale/failed verification or unresolved obligation moves
+the state back to `Working`. `SettledCandidate` is a decision boundary, not an
+automatic stop: ordinary turn completion remains distinct from whole durable
+task closure, and valid remaining work must remain executable.
+
+### Delivery slices
+
+1. **Evaluator validity.** Make the diagnosis golden solution pass the hidden
+   oracle and run that oracle during fixture self-check. Reconstruct paired
+   reports mechanically, report treatment exposure, and classify zero exposure
+   as inconclusive. Align model-visible workspace cleanliness with allowed-diff
+   policy so `target/` and `Cargo.lock` cannot manufacture cleanup loops.
+
+   Calibrated 2026-08-29: the diag reference solution now uses overflow-safe
+   `u128` saturation so large attempts saturate at `max_delay_ms` instead of
+   wrapping to zero; the directive and golden `DIAGNOSIS` name that
+   saturation edge, and the hidden check requires an explicit `u128`/
+   `leading_zeros` marker. Fixture self-check now runs each M15 pack oracle
+   against the untouched seed (reject) and the scripted solution (accept)
+   offline, and records both pack digests as frozen constants. This is
+   fixture authoring under the frozen task/oracle meaning, not a serving
+   decision. The remaining slice 1 work (mechanical reconstruction and
+   model-visible cleanliness alignment) is tracked in CONV-CLOSE-01.
+2. **Observation only.** Emit bounded facts for last authoritative mutation,
+   current verification basis, first settled candidate, terminal mechanism,
+   post-settlement rounds/calls, outcome-free actions, and repeated
+   read/diff/verify or cleanup actions. Large output remains artifact-backed;
+   no transcript expansion is allowed.
+3. **Dynamic state.** Derive the four states above from existing Execution
+   Frontier, obligations, verification basis and bounded
+   `TaskRecord.resume: ExecutionState`. Do not create a second orchestrator or
+   authoritative global history. Its bounded progress projection may contain
+   only current goal, unresolved constraints, checked file identities/revisions
+   (not bodies), latest verification basis/result, deduplicated known failed
+   commands and one next action. Collections are capped and superseded by
+   stable identity rather than appended as transcript history.
+4. **Decision boundary.** Present only current facts needed to choose final,
+   durable closure, or concrete continuation. Do not reuse/re-arm the failed
+   `CompletionOpportunity`, add a standing “stop earlier” instruction, or
+   auto-call `task.complete`.
+5. **Proof.** First cover ordinary final, durable closure, genuine remaining
+   work, post-verification mutation, stale verification, proposal settlement
+   across cancel/resume and cold resume with deterministic models. Only then
+   run a small exposure-qualified live gate with at least two paired repeats.
+
+Promotion requires mandatory behavior/diff/resume parity, no lost unfinished
+work, lower rounds and calls after the first valid settled candidate, and no new
+max tail. Total rounds/calls remain reported, but the causal metric starts at
+the last meaningful mutation/current verification boundary. Context selection,
+GC, retrieval and prompt packing stay frozen; the prior C Context advantage is
+neither spent nor re-evaluated by this slice.
 
 ## Post-M15 next phase task: `LT-EVAL-06` — representative development twins
 

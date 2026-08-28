@@ -284,24 +284,105 @@ schema/prompt-token delta. Failed outputs remain counted. After the surface
 choice, rerun one bounded source-bound product preflight before formal M15;
 the earlier preflight did not contain this catalog entry.
 
-The full 24-cell paired gate ran on 2026-08-28 (clean tree at
-`1a239479`, serving `gpt-5.6-luna` @ PinAI `/v1`, 128k, zero NOT_RUN) and
-**the recovery surface did NOT promote**: mandatory success was unequal
-(off 12/12 vs on 11/12 — the on-arm resume policy cell exhausted the tool
-round budget after 48 phase-two rounds), median rounds/calls were higher on
-in 5 of 6 pack/mode cells (`retry_policy_dev` normal +55%, resume +83%),
-and the on arm grew a new max tail (55 vs 31 rounds). The baseline stays:
-`fs.mkdir` remains catalog-cold and the `with_recovery_surface` switch stays
-off. Evidence: `crates/agent-eval/evidence/recovery-surface-gate/REPORT.md`.
-The fallback (always-ready compact schema) is now the only unexercised
-candidate and would need its own paired comparison before promotion.
+The full 24-cell paired run completed on 2026-08-28 (clean tree at
+`1a239479`, serving `gpt-5.6-luna` @ PinAI `/v1`, 128k, zero NOT_RUN), but a
+post-run event audit changes what it can decide. Across all 24 event streams
+there are zero `RecoverySurface` rows and zero `next_directory` recovery
+facts. All eight `retry_policy_dev` cells instead catalog-loaded and called
+`fs.mkdir` once successfully. The treatment was therefore never exercised:
+the observed off/on differences are stochastic execution/order differences,
+not attributable recovery-surface cost. The report also mixes final verdict
+totals (off 8/12, on 7/12 because diagnosis is 0/8) with a 12/12 versus 11/12
+success statement, and its table supports higher rounds in 3/6 pairs and
+higher calls in 4/6, not 5/6 for both.
 
-The gate also exposed a calibration finding independent of the surface:
-`retry_diag_dev` fails 0/8 in both arms because the serving misses the
-saturation edge (`base << (attempt-1).min(63)` wraps to 0 for attempts ≥ 64
-while the oracle expects `max_delay_ms`); all file-level needle predicates
-pass while the compiled oracle fails. This must be resolved before the
-formal M15 window (four diag cells would fail as-is).
+Decision: **NOT_EXERCISED / no promotion**. Keep the conservative
+catalog-cold baseline and the `with_recovery_surface` switch off, but do not
+claim the candidate caused the 55-round tail and do not advance the
+always-ready fallback. Before another live comparison, report generation must
+mechanically reconstruct event-derived counts and require non-zero candidate
+exposure; an exposure-free run is inconclusive rather than a rejection.
+Evidence remains immutable at
+`crates/agent-eval/evidence/recovery-surface-gate/REPORT.md`; this audit
+supersedes only its causal interpretation.
+
+The run also exposed an evaluator-fixture defect independent of the surface.
+`retry_diag_dev` fails 0/8 because the checked-in minimal/golden solution uses
+`base << (attempt-1).min(63)`, which can wrap to zero, and the deterministic
+self-check does not execute `m15_diag_oracle`. This is not evidence that the
+serving missed a valid golden solution. Repair the golden implementation with
+overflow-safe saturation, execute `cargo test --test m15_diag_oracle` in the
+fixture self-check, then regenerate the pack digest before formal M15.
+
+Calibrated 2026-08-29 (fixture authoring, allowed before source pin; it does
+not change task or oracle meaning): the diag reference solution now widens to
+`u128` before the shift so large attempts saturate at `max_delay_ms` instead
+of wrapping to zero, the directive and `DIAGNOSIS` text name the large-attempt
+saturation requirement, and the hidden check requires a `u128`/`leading_zeros`
+overflow-safe marker rather than accepting the overflow-prone shift alone.
+Fixture self-check now runs each pack's oracle against the untouched seed
+(reject) and the scripted solution (accept) offline, and records both pack
+digests as frozen constants. The calibrated diag digest is
+`2fff51573097fe4c833215420dd0da74f11a645ef5c859bdd9bba87e5b427eeb`
+(was `844793249406be591372f7ee8b17bd68b3933e9d2745988168de64834584aaf3`);
+the migrate digest is unchanged at
+`26d69fa1d4ccd00452b3ceb88f2a6ec7fbb977989df6d6f4e2f1e345660679cb`. The
+surviving blocker is a missing completion decision boundary; see
+CONV-CLOSE-01 below.
+
+### CONV-CLOSE-01 — Completion Convergence V1 (open 2026-08-29)
+
+The 55-round / 129-call `retry_policy_dev` resume cell is the current bounded
+readiness blocker, but `task.complete` itself is not established as its root
+cause. The schema was present on every round. Across the 24-cell run it was
+called 18 times and every tool result was successful; 17 calls reached a
+`TaskCompleted` event, while one successful proposal did not reach a
+`TaskCompleted` event within its trace. The long-tail cell made no
+`task.complete` call and still performed formatting, linting and artifact
+cleanup in its last rounds. Five other no-call cells ended their turn normally.
+
+The stronger hypothesis is a missing completion decision boundary after the
+last authoritative mutation and current verification, amplified by fragmented
+verification and workspace noise (`target/` and `Cargo.lock` are model-visible
+through `git.status` but evaluator-ignored). Implement the next task in this
+order:
+
+1. Make fixture cleanliness and allowed-diff visibility agree; generated build
+   artifacts must not create model-visible cleanup work that the evaluator
+   silently discards.
+2. Add event-derived convergence metrics before policy: last authoritative
+   mutation, current verification basis, first settled candidate, terminal
+   mechanism, rounds/calls after settlement, outcome-free actions, and repeated
+   read/diff/verify or artifact-cleanup actions.
+3. Reuse the bounded `TaskRecord.resume: ExecutionState` and verification
+   basis to derive dynamic states `Working -> VerificationDue ->
+   VerifiedCurrent -> SettledCandidate`. No fixed round count establishes a
+   state. A new mutation, obligation, failed/stale verification or unresolved
+   constraint returns the task to `Working`.
+4. At `SettledCandidate`, preserve model choice among an ordinary final answer,
+   `task.complete` for whole durable-task closure, or one concrete remaining
+   blocker/action. Runtime must not auto-close the task, suppress legitimate
+   exploration or turn a subtask boundary into whole-task completion.
+5. Prove deterministic scenarios first: ordinary final, durable closure,
+   genuine remaining work, mutation after verification, stale verification,
+   proposal settlement across cancel/resume, and cold resume. Run a small live
+   gate with at least two paired repeats only after those scenarios and exposure
+   accounting are green.
+
+The bounded progress payload may retain only the current goal, unresolved
+constraints, checked file identities/revisions (not file bodies), latest
+verification basis/result, deduplicated known failed commands and one next
+action. Every collection is capped and superseded by stable identity. It is a
+resume/control summary, never an append-only transcript. Also remove the stale
+runtime comment that still describes `task.complete` as catalog-cold; the v5
+registry is the source of truth and always loads it.
+
+This slice does not revive the failed `CompletionOpportunity`, add standing
+prompt pressure, expand the transcript, retune Context/GC, introduce a
+TaskGraph/learned planner, or specialize behavior for a fixture/provider. Its
+promotion gate requires mandatory-success and resume-integrity parity, lower
+post-settlement tail rounds/calls, no new max tail, and no loss of valid
+unfinished-work continuation.
 
 ### Fingerprint v2 — preview ≠ identity (fixed 2026-08-23)
 

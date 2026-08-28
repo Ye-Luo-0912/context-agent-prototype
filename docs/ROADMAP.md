@@ -25,11 +25,12 @@ copy them back.
 | M12 Effect Runtime | ✅ closed 2026-08-27 | The bounded evidence table proves every brokerable production effect crosses the common reserve/dispatch/ack path, crash windows reconcile as NotApplied/Applied/Ambiguous, authority/revocation fencing holds, and generic shell/process are explicit non-transactional exceptions (`crates/agent-eval/evidence/platform-closure/m12/`, clean-tree PASS; regenerate via `agent-eval --platform-closure-m12`). Requester-side application is the V1 contract; broker-owned remote execution is not required without a remotable consumer. Details: [`PLATFORM_SECURITY.md`](PLATFORM_SECURITY.md). |
 | M13 Extension Sandbox | ✅ closed 2026-08-27 | Clean-tree closure audit: real-child activation per supported profile with post-spawn mechanism attestation, both required refusals (missing write confinement; native untrusted floor), and contract negatives — zero unresolved rows (`crates/agent-eval/evidence/platform-closure/m13/`, regenerate via `agent-eval --platform-closure-m13`). V1 acceptance is truthful fail-closed activation, not universal native availability. Running untrusted generated code through WASI remains V2. Details: [`PLATFORM_SECURITY.md`](PLATFORM_SECURITY.md). |
 | M14 Resource Policy | ✅ | Schema/context quotas, standing grants, output broker, authority leases. Further typed policy is not a reopen of this gate. |
-| M15 Real Evaluation | 🧪 serving tuple pinned; diag-pack calibration and one source-bound preflight pending; formal v3 window after that | Reproducible per-cell artifacts. The frozen semantics are in [`M15_ACCEPTANCE.md`](M15_ACCEPTANCE.md): V1 = the banked planes plus one live development pack (3 tasks × normal/resume × 2). `add_test` is Tool Surface, not Context; frozen `context-bench.v1` stays frozen; 300×3 is parked. The three 2026-08-28 v2 attempts are forensic-only because closure was misprojected, pack identities were reused, failures were untyped and the report was hand-maintained. The repaired v3 path persists typed facts and exact pack identity, classifies transport as NOT_RUN versus output-limit as FAIL, and generates a report from an exact 12-cell window manifest. A bounded dirty-tree preflight pins PinAI `/v1` + `gpt-5.6-luna` + Responses + 128,000, but predates the `fs.mkdir` catalog revision. **Not closed** — the `TOOL-DIR-SURFACE-01` deterministic gate landed and its full 24-cell paired live gate ran (2026-08-28): the recovery surface did NOT promote, the catalog-cold baseline is retained. The gate exposed a calibration blocker — `retry_diag_dev` fails 0/8 (saturation edge missed). Resolve that, rerun one exact-source preflight, then pass and commit one clean-tree v3 window. |
+| M15 Real Evaluation | 🧪 serving tuple pinned; evaluator validity calibrated; Completion Convergence V1 readiness pending; exact-source preflight and formal v3 window follow | Reproducible per-cell artifacts. The frozen semantics are in [`M15_ACCEPTANCE.md`](M15_ACCEPTANCE.md): V1 = the banked planes plus one live development pack (3 tasks × normal/resume × 2). `add_test` is Tool Surface, not Context; frozen `context-bench.v1` stays frozen; 300×3 is parked. The three 2026-08-28 v2 attempts are forensic-only because closure was misprojected, pack identities were reused, failures were untyped and the report was hand-maintained. The repaired v3 path persists typed facts and exact pack identity, classifies transport as NOT_RUN versus output-limit as FAIL, and generates a report from an exact 12-cell window manifest. A bounded dirty-tree preflight pins PinAI `/v1` + `gpt-5.6-luna` + Responses + 128,000, but predates the `fs.mkdir` catalog revision. Evaluator validity was calibrated 2026-08-29 (fixture authoring): the diag golden saturates via `u128` widening and fixture self-check runs both pack oracles offline, with pack digests recorded. **Not closed** — the recovery-surface live run had zero treatment exposure and is inconclusive, so the catalog-cold baseline remains; the 55-round tail still requires the bounded completion-convergence readiness slice; and the source-bound preflight must be rerun on the calibrated source. Do those in order, rerun one exact-source preflight, then pass and commit one clean-tree v3 window. |
 | V2 Self-Iteration | 🔒 blocked | Until M12/M13/M15 close. The agent may grow capabilities, never evaluation or permission Core authority. |
 
-Open gate order: M12 ✅ → M13 ✅ → V1 candidate → formal
-M15 → V2 Self-Iteration. Both platform gates closed on their named clean-tree
+Open gate order: M12 ✅ → M13 ✅ → V1 candidate → evaluator validity →
+Completion Convergence V1 readiness → exact-source preflight → formal M15 →
+V2 Self-Iteration. Both platform gates closed on their named clean-tree
 evidence (2026-08-27); M14 is already closed and is not reopened or inserted
 back into the active sequence. Context live evidence runs in parallel and does
 not retune GC. Tool Surface edit reliability may improve in parallel, but it
@@ -61,19 +62,31 @@ does not reorder or close any gate.
    deterministic admission gate landed (2026-08-28): a typed missing-parent
    refusal surfaces exactly `fs.mkdir` with `RecoverySurface` provenance for
    one decision, approval unchanged, unrelated missing reads unaffected.
-   The full 24-cell paired live gate ran the same day and did NOT promote
-   the recovery source (unequal mandatory success 12/12 vs 11/12, higher
-   median rounds/calls, new max tail 55 vs 31) — the catalog-cold baseline
-   is retained and the `with_recovery_surface` switch stays off. Before the
-   formal window, resolve the `retry_diag_dev` calibration blocker the gate
-   exposed (0/8 both arms; saturation edge missed), rerun one source-bound
-   preflight; do not fold that product-surface decision into M15
-   or infer it from the one `retry_policy_dev` sample.
-5. Formal M15 only from versioned per-cell artifacts. Do not use one
+   Its full 24-cell live run had zero `RecoverySurface`/`next_directory`
+   exposure; all eight policy cells instead catalog-loaded and called
+   `fs.mkdir`. The off/on tail is therefore not attributable to the switch.
+   Keep the baseline and switch off as `NOT_EXERCISED`, repair mechanical
+   exposure/report accounting, and fix the diagnosis golden fixture plus
+   oracle self-check. The diagnosis fixture is calibrated (2026-08-29):
+   overflow-safe golden, directive names the saturation edge, hidden check
+   demands an overflow-safe marker, and self-check runs both pack oracles
+   offline; the mechanical exposure/report-accounting repair remains with
+   Completion Convergence V1. Do not advance the always-ready fallback from
+   this run.
+5. Completion Convergence V1 is a bounded pre-M15 readiness task. Instrument
+   the tail after the last authoritative mutation/current verification, align
+   workspace artifact visibility with the evaluator, then derive dynamic
+   `Working -> VerificationDue -> VerifiedCurrent -> SettledCandidate` state
+   from existing execution facts. Preserve the model's choice of ordinary
+   final, whole-task `task.complete`, or concrete continuation. No auto-close,
+   fixed-round stop, revived `CompletionOpportunity`, Context/GC change,
+   transcript expansion, TaskGraph or learned planner. Deterministic scenarios
+   precede any small exposure-qualified paired live gate.
+6. Formal M15 only from versioned per-cell artifacts. Do not use one
    A/B/C for every layer. The frozen design lives in
    [`M15_ACCEPTANCE.md`](M15_ACCEPTANCE.md); its decision points (serving
    pin, cost, fixture authoring, closure reporting) gate the first cell.
-6. Execution Convergence V1 candidate gate (revised 2026-08-23 second
+7. Execution Convergence V1 candidate gate (revised 2026-08-23 second
    review; lineage metrics added after the obligation-run evidence):
    before any V1 candidate claim, all of the following hold —
    (a) the Convergence Bench is green: four deterministic
@@ -94,7 +107,7 @@ does not reorder or close any gate.
    Evidence identity uses the Runtime `ArgumentDigest`; cache hit-rate
    claims must be backed by `ProtocolBodyCacheStats` events. This gate
    does not close M12/M13/M15 and does not reorder them.
-7. The first three execution-flow behavior slices landed 2026-08-24: exact
+8. The first three execution-flow behavior slices landed 2026-08-24: exact
    result-delivery sources renew on reuse and release unrooted schemas to Warm
    after consumption/new-directive boundaries; explicit task and typed need
    roots survive. Model-explicit loads now remain pending until exact use,
@@ -131,7 +144,7 @@ does not reorder or close any gate.
    require at least two paired live repeats; hidden success and outcome count
    cannot fall, median rounds/calls must fall, and p95/max turn cannot gain a
    new tail. Context selection/GC/retrieval stays frozen.
-8. Before adding another model-visible execution-progress hint or generic
+9. Before adding another model-visible execution-progress hint or generic
    "stop earlier" standing instruction, first freeze a deterministic
    already-satisfied-task replay plus at least two paired live repeats. A live
    repeat is eligible only after its evaluator proves exact resume-artifact
@@ -143,7 +156,7 @@ does not reorder or close any gate.
    that a locally useful hint can create global prompt/control coupling. Keep
    Context selection, GC, and retrieval frozen while evaluating execution-only
    candidates.
-9. Tool-contract changes must distinguish invocation prevention from failure
+10. Tool-contract changes must distinguish invocation prevention from failure
    masking. Do not expose optional opaque capability fields on every
    first-page file/search tool: shape validation made the model fabricate
    plausible-looking identities, while empty normalization merely hid the
@@ -230,7 +243,7 @@ does not reorder or close any gate.
    positional/fuzzy edit authority from one ambiguous-anchor sample. Consider
    bounded revision-bound exact guard context only if further unchanged live
    evidence makes ambiguous-anchor rereads a material residual tail.
-10. Repair and re-prove bounded long-task continuation before treating it as
+11. Repair and re-prove bounded long-task continuation before treating it as
     an autonomous-agent evaluation. `LT-RUN-01..03` and useful `LT-RUN-04`
     primitives remain; the 2026-08-27 audit reopens snapshot, verification and
     evaluator correctness. Reuse `TaskAnchor` plus
@@ -268,15 +281,12 @@ does not reorder or close any gate.
     stale capability generation, progress-only verification movement and
     report reconstruction. Raw prior evidence is retained but diagnostic.
 
-    **Live exit**
+    **Live exit (completed 2026-08-28)**
 
-    Only after deterministic exit, run the frozen retained-C
-    `CompletionOpportunity` off/on normal/resume pairs with at least two repeats
-    per mode. The candidate remains default-off unless hidden behavior is
-    non-regressing, closure improves, median rounds/calls fall and no tail
-    appears.
-    Only a promoted frozen setting may enter same-model A/C. No Context/GC
-    retune, fixed round-cap trick, provider-specific policy or standing “stop
-    earlier” instruction is allowed. Detailed contract:
+    The frozen retained-C `CompletionOpportunity` off/on normal/resume gate ran
+    after deterministic exit and failed promotion. That mechanism has ended
+    default-off and must not be rerun or repackaged as Completion Convergence
+    V1. No Context/GC retune, fixed round-cap trick, provider-specific policy or
+    standing “stop earlier” instruction is allowed. Detailed contract:
     [`LONG_TASK_EVALUATION.md`](LONG_TASK_EVALUATION.md).
-11. V2 Self-Iteration last.
+12. V2 Self-Iteration last.

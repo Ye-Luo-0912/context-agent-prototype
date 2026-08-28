@@ -4,7 +4,8 @@
 //! network-free: seed files, the one user directive, the hidden check
 //! table, and the injected behavioral oracle are frozen constants with
 //! deterministic self-tests — the seeded workspace fails the contract
-//! checks, the scripted minimal solution passes all of them.
+//! checks, the scripted minimal solution passes all of them, and the
+//! oracle rejects the seed while accepting that same solution.
 //!
 //! Seeds intentionally differ in role from `retry_policy_dev`: the diag
 //! seed's own tests encode the WRONG behavior (all green while violating
@@ -107,7 +108,8 @@ pub fn hidden_check_results(root: &Path, id: &str) -> Vec<(&'static str, &'stati
 // ---------------------------------------------------------------------------
 
 const DIAG_DIRECTIVE: &str = "The job runner's documented retry contract says the first retry \
-     waits exactly `base_delay_ms` and growth saturates at `max_delay_ms`. Every check in the \
+     waits exactly `base_delay_ms`, growth doubles and saturates at `max_delay_ms`, and large \
+     attempt numbers saturate at the cap rather than wrapping to zero. Every check in the \
      repo is green, yet staging observed the FIRST retry waiting twice the configured base. \
      Investigate `src/backoff.rs`, write `DIAGNOSIS.md` at the workspace root naming the \
      responsible function and the precise mechanism, then apply the minimal fix and correct any \
@@ -203,11 +205,11 @@ use crate::config::RetryConfig;
 
 /// Delay before retry number `attempt` (1-based). The documented contract:
 /// the first retry waits exactly `base_delay_ms`; growth doubles and
-/// saturates at `max_delay_ms`.
+/// saturates at `max_delay_ms`, never wrapping on large attempts.
 pub fn next_delay(attempt: u32, config: &RetryConfig) -> u64 {
     let shift = attempt.saturating_sub(1).min(63);
-    let raw = config.base_delay_ms << shift;
-    raw.min(config.max_delay_ms)
+    let raw = (config.base_delay_ms as u128) << shift;
+    raw.min(config.max_delay_ms as u128) as u64
 }
 
 #[cfg(test)]
@@ -233,8 +235,10 @@ const DIAG_DIAGNOSIS_SOLVED: &str = r#"# Diagnosis
 `next_delay` in `src/backoff.rs` treats the 1-based `attempt` as the shift
 exponent directly (`attempt.min(63)`), so the first retry shifts by one and
 waits `2 x base_delay_ms`. The seed unit test encoded the wrong table, which
-kept every check green. Fix: shift by `attempt.saturating_sub(1)` and cap
-with `min(max_delay_ms)`; the test now asserts the documented contract.
+kept every check green. Fix: shift by `attempt.saturating_sub(1)`, widen to
+`u128` before the shift so large attempts saturate at `max_delay_ms` instead
+of wrapping to zero, then cap with `min(max_delay_ms)`; the test now asserts
+the documented contract.
 "#;
 
 /// Harness-owned oracle: the documented contract, injected only after the
@@ -295,8 +299,12 @@ const DIAG_CHECKS: &[PackCheck] = &[
     },
     PackCheck {
         path: "src/backoff.rs",
-        name: "shift corrected to a 1-based attempt",
-        accept: |body| body.contains("saturating_sub(1)") && !body.contains("attempt.min(63)"),
+        name: "shift corrected and overflow-safe",
+        accept: |body| {
+            body.contains("saturating_sub(1)")
+                && (body.contains("u128") || body.contains("leading_zeros"))
+                && !body.contains("attempt.min(63)")
+        },
     },
     PackCheck {
         path: "src/backoff.rs",
@@ -605,6 +613,7 @@ const RETRY_MIGRATE_DEV: M15Fixture = M15Fixture {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::Duration;
 
     fn seed_and(id: &str, solve: impl FnOnce(&Path)) -> (tempfile::TempDir, Vec<bool>) {
         let dir = tempfile::tempdir().unwrap();
@@ -656,6 +665,91 @@ mod tests {
             solved.iter().all(|passed| *passed),
             "the split must pass every check: {solved:?}"
         );
+    }
+
+    const CARGO_TEST_TIMEOUT: Duration = Duration::from_secs(600);
+
+    /// Run the harness-owned oracle the same way the live harness does
+    /// (post-run injection as an isolated integration target) and report
+    /// whether it compiled and every test passed.
+    async fn oracle_passes(root: &Path, oracle_name: &str) -> bool {
+        use std::process::Stdio;
+
+        let mut command = tokio::process::Command::new("cargo");
+        command
+            .arg("test")
+            .arg("--test")
+            .arg(oracle_name)
+            .current_dir(root)
+            .env("CARGO_TERM_COLOR", "never")
+            .stdin(Stdio::null());
+        match tokio::time::timeout(CARGO_TEST_TIMEOUT, command.output()).await {
+            Ok(Ok(output)) => output.status.success(),
+            _ => false,
+        }
+    }
+
+    /// Materialize the workspace with the oracle injected and report the
+    /// oracle verdict; `overrides` may replace seeded files with the
+    /// scripted solution.
+    async fn oracle_passes_on(id: &str, overrides: &[(&str, &str)]) -> bool {
+        let dir = tempfile::tempdir().unwrap();
+        seed(dir.path(), id).unwrap();
+        for (relative, body) in overrides {
+            std::fs::write(dir.path().join(relative), body).unwrap();
+        }
+        let fixture = fixture(id).unwrap();
+        let tests = dir.path().join("tests");
+        std::fs::create_dir_all(&tests).unwrap();
+        std::fs::write(
+            tests.join(format!("{}.rs", fixture.oracle_name)),
+            fixture.oracle_source,
+        )
+        .unwrap();
+        oracle_passes(dir.path(), fixture.oracle_name).await
+    }
+
+    /// Recorded pack identities; changing a frozen fixture constant
+    /// requires updating these values deliberately, so the regenerated
+    /// digest is visible before the formal window.
+    #[test]
+    fn recorded_pack_digests_are_frozen() {
+        assert_eq!(
+            spec_sha256(RETRY_DIAG),
+            "2fff51573097fe4c833215420dd0da74f11a645ef5c859bdd9bba87e5b427eeb"
+        );
+        assert_eq!(
+            spec_sha256(RETRY_MIGRATE),
+            "26d69fa1d4ccd00452b3ceb88f2a6ec7fbb977989df6d6f4e2f1e345660679cb"
+        );
+    }
+
+    /// The harness-owned oracle must reject each pack's untouched seed and
+    /// accept its scripted minimal solution, so the live post-run verdict
+    /// can never contradict the deterministic fixture.
+    #[tokio::test]
+    async fn oracles_accept_reference_solutions_and_reject_seeds() {
+        let diag_solved: &[(&str, &str)] = &[
+            ("src/backoff.rs", DIAG_BACKOFF_FIXED),
+            ("DIAGNOSIS.md", DIAG_DIAGNOSIS_SOLVED),
+        ];
+        let migrate_solved: &[(&str, &str)] = &[
+            ("src/policy.rs", MIGRATE_POLICY_SOLVED),
+            ("src/lib.rs", MIGRATE_LIB_SOLVED),
+            ("src/job.rs", MIGRATE_JOB_SOLVED),
+            ("src/metrics.rs", MIGRATE_METRICS_SOLVED),
+            ("src/usage.rs", MIGRATE_USAGE_SOLVED),
+        ];
+        for (id, solved) in [(RETRY_DIAG, diag_solved), (RETRY_MIGRATE, migrate_solved)] {
+            assert!(
+                !oracle_passes_on(id, &[]).await,
+                "oracle must reject the untouched {id} seed"
+            );
+            assert!(
+                oracle_passes_on(id, solved).await,
+                "oracle must accept the scripted {id} solution"
+            );
+        }
     }
 
     /// Materialize a variant and `cargo check` it. #[ignore]d so the unit
