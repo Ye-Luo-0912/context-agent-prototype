@@ -1,112 +1,173 @@
-# M15 acceptance design (V1) — frozen; decision points signed off 2026-08-28
+# M15 acceptance design (V1) — frozen semantics; formal evidence reset 2026-08-28
 
-This document is the "separately frozen acceptance design" that ROADMAP and
-[`LONG_TASK_EVALUATION.md`](LONG_TASK_EVALUATION.md) require before formal
-M15. It pins what V1 is, which evidence planes count, how cells are judged,
-and what may not change mid-run.
+This document is the separately frozen acceptance contract required by
+[`ROADMAP.md`](ROADMAP.md) and
+[`LONG_TASK_EVALUATION.md`](LONG_TASK_EVALUATION.md). It pins the V1
+candidate, the evidence planes, the development cells and their verdict
+semantics. The three legacy 2026-08-28 attempts are retained for diagnosis,
+but none is formal M15 evidence; see
+[`evidence/m15-window/REPORT.md`](../crates/agent-eval/evidence/m15-window/REPORT.md).
 
-## 0. Decision points — signed off 2026-08-28 (operator continuation)
+## 0. Current decision state
 
-1. Serving pin: AMENDED 2026-08-28 — after two windows measured diagnosis-task
-   difficulty and closure consistency as serving-capability limits on
-   `gpt-5.6-luna` @ PinAI (1/12 and 3/12 of 12 cells), the operator approved
-   switching to `deepseek-v4-pro` @ the local OpenCode relay for the rerun
-   (availability probe: add_test passed=true, first-try committed edit, 22 s).
-2. Budget: 12 development cells confirmed.
-3. Fixture authoring: `retry_diag_dev` / `retry_migrate_dev` per the specs
-   below (authored and frozen before the window).
-4. Closure reporting: reported per cell, not a mandatory pass dimension.
+Three decisions remain frozen:
 
-## 1. What V1 is — the candidate composition
+1. Budget: 3 tasks × 2 modes × 2 repeats = 12 development cells.
+2. Fixtures: `retry_policy_dev`, `retry_diag_dev` and `retry_migrate_dev` as
+   implemented in `crates/agent-eval/src/m15_pack.rs`.
+3. Closure: the `task.complete` lifecycle is a reported product fact, not a
+   mandatory M15 V1 pass dimension.
 
-V1 is the composition at the current HEAD, backed by these banked planes:
+The serving pin was reopened. The earlier Luna and relay attempts cannot select
+a serving because their v2 evidence misprojected closure, reused the wrong
+pack identity, relied on untyped error text and was summarized by hand. A new
+serving may be pinned only after a bounded representative preflight proves the
+same endpoint/model/protocol/context-window tuple can start, edit and finish
+one fixture. The formal window then uses that one tuple without switching.
 
-| plane | evidence (banked, frozen) | status |
+That preflight passed on 2026-08-28 and pins PinAI `/v1`,
+`gpt-5.6-luna`, Responses, 128,000 tokens. The source-bound dirty-tree
+`retry_policy_dev` normal cell passed behavior, diff and closure-required
+completion in 26 rounds / 59 calls with zero provider retries. It is not one
+of the formal cells and makes no comparative performance claim; its role is
+only to prevent spending the clean 12-cell budget on an unproven serving.
+
+The serving tuple remains pinned, but this source-bound product preflight
+predates the catalog-cold `fs.mkdir` addition and its admission decision.
+The `TOOL-DIR-SURFACE-01` deterministic gate landed (2026-08-28): a typed
+missing-parent refusal surfaces exactly `fs.mkdir` with `RecoverySurface`
+provenance for one decision, approval unchanged, unrelated missing reads
+unaffected. After its isolated live paired gate freezes the exact product
+surface, rerun the same one-cell bounded preflight on that source before the
+formal window. This is product/source readiness confirmation, not permission
+to switch the serving tuple or alter this acceptance contract.
+
+No formal M15 development window currently exists. M15 remains open.
+
+## 1. V1 candidate composition
+
+| plane | evidence | status |
 | --- | --- | --- |
-| Platform gates | M12/M13 closure-audit reports, clean-tree PASS (`evidence/platform-closure/{m12,m13}/`) | closed 2026-08-27 |
-| Context | `context-mech.v2` 12-cell A/C live (`evidence/context-mech/`); frozen SPEC; GC/context policy untouched since | banked; **no rerun** |
-| Tool Surface | edit-gate `v4` archival 4×3 window (strict 12/12, gate 12/12, zero confirm reads) + deterministic crash/race/journal/disk-full suite | banked; surface rev **v5** amendment 2026-08-28: `task.complete` added to the always-load set (closure discovery; acceptance gate unchanged) after the 08-28 window measured ten behavioral-pass cells blocked on discovery |
-| Execution coherence | Convergence Bench 4/4 deterministic on the acceptance HEAD (re-certified 2026-08-28); obligation-ledger and hidden-green live A/C longflow evidence (`longflow-post-obligation-2026-08-23/`) | banked + re-certified |
-| Long-task truth chain | LT-RUN-05 WP1–WP5 deterministic matrix (snapshot fence, unified capture, two-phase completion, verification basis, tuple-only cold resume) | landed |
-| Advisory switches | CompletionOpportunity ENDED default-off by its 2026-08-28 decision-grade gate; no candidate switches may be on | final |
+| Platform gates | M12/M13 clean-tree closure audits in `evidence/platform-closure/{m12,m13}/` | banked |
+| Context | frozen `context-mech.v2` 12-cell A/C evidence in `evidence/context-mech/`; no policy retune or rerun | banked |
+| Tool Surface | edit-gate v4 archival window plus deterministic crash/race/journal/disk-full coverage; production model surface remains v5 while catalog-cold `fs.mkdir` awaits its isolated live admission gate | banked mechanisms; the `TOOL-DIR-SURFACE-01` deterministic gate landed (2026-08-28) and its live paired gate is not folded into M15; the v5 `task.complete` availability change is not promoted by the invalid M15 attempts |
+| Execution coherence | Convergence Bench 4/4 plus `longflow-post-obligation-2026-08-23/` | banked |
+| Long-task truth chain | deterministic snapshot fence, unified capture, two-phase completion, verification basis and tuple-only cold resume | banked |
+| Advisory switches | `CompletionOpportunity` ended default-off; no candidate switch may be enabled | frozen off |
 
-V1 claims nothing about general task-failure rates: every plane's evidence is
-a finite diagnostic over its frozen pack.
+V1 makes no claim about general task-failure rates. Every plane is a bounded
+diagnostic over its named, frozen evidence.
 
-## 2. Planes and the live formal run (layered per EVAL-02)
+## 2. Formal development window
 
-The live M15 run covers exactly one plane — the **development plane**. The
-other planes cite their banked evidence; none is rerun, and no plane borrows
-another's cells.
+The live plane is exactly:
 
-Development pack (three tasks, per the layer-6 expansion rule):
+- tasks: `retry_policy_dev`, `retry_diag_dev`, `retry_migrate_dev`;
+- modes: `normal`, `resume`;
+- repeats: two for each task/mode pair;
+- engine: the retained C composition;
+- source: one clean, unchanged HEAD for all 12 cells;
+- serving: one pinned provider/model/protocol/context-window tuple;
+- switches: advisory candidates off.
 
-1. `retry_policy_dev` — already frozen (fixture, directive, hidden oracle).
-2. `retry_diag_dev` — one diagnosis task (to be authored): a small
-   network-free crate with a seeded, reproducible defect; the hidden oracle
-   asserts the diagnosis report names the defect mechanism and the minimal
-   fix holds the suite.
-3. `retry_migrate_dev` — one multi-file migration task (to be authored):
-   rename/split across a bounded file set with a harness-owned API-compat
-   oracle.
+Resume interrupts after the first durably settled mutation and its durable
+checkpoint. Continuation must restore and continue from the exact acknowledged
+`(lineage, task, sequence, artifact, checksum, capability_generation)` tuple.
+A source, pack, host-policy, surface or serving change voids the window.
 
-Modes: `normal` and `resume` (semantic interruption trigger: first durably
-settled mutation + its durable checkpoint). Repeats: **2 per (task, mode)**
-— 12 development cells total. All cells run on the same pinned serving
-within one window; a mid-window provider loss voids the window (evidence
-stays; the window reruns whole).
+## 3. Evidence contract
 
-## 3. Per-cell artifacts (EVAL-01 rebuildability)
+Formal cells use schema `retry-pilot-cell-v3`. Each immutable cell directory
+contains the manifest, full event stream, `dimensions.json`, hidden oracle
+records and workspace snapshot hash. The dimensions are persisted facts, not
+a projection from the exit branch:
 
-Every cell writes the versioned bundle (schema `retry-pilot-cell-v2` or its
-successor with a bumped version): manifest (identity tuple incl.
-`source_tree_digest`, model, pack digest), full event stream, per-dimension
-`dimensions.json`, hidden-verification records, workspace snapshot hash.
-Bundles are immutable once claimed; a harness failure is an explicit
-NOT_RUN and cannot improve any verdict.
+- acceptance profile, verdict and observed oracle result;
+- behavior and allowed-diff result;
+- provider health plus typed error class;
+- restored, exact-tuple-matched and continued as independent booleans;
+- turn completion and task closure as independent booleans;
+- phase counters and runtime error text, including failure exits;
+- exact pack id/digest and the shared source/serving/surface identity.
 
-Pre-run work item: SATISFIED — tasks 2 and 3 ship their harness-owned,
-network-free oracles and hidden checks in
-`crates/agent-eval/src/m15_pack.rs`, each with deterministic self-tests
-(seeded state fails every check; the scripted minimal solution passes all).
+`provider_transport`, `model_output_limit`, `model`, `input_budget`,
+`round_budget`, `runtime`, `harness_setup` and `harness_watchdog` are distinct
+classes. Provider transport and harness failures are `NOT_RUN`; an incomplete
+response caused by `max_output_tokens` is a model-output-limit cell `FAIL`, not
+a provider outage.
 
-## 4. Pass criteria
+The harness writes `_windows/<timestamp>/manifest.json` containing the exact
+12 claimed cell directories, then re-reads those directories and generates
+`REPORT.md`. Report generation refuses mixed identity, missing/duplicate
+cells, wrong pack digests, verdict drift, untyped provider health, absent
+terminal events, event loss/gaps, summary/dimension drift, escaped cell paths
+or a dirty tree. Per-cell and total/max round, tool, wall-time and token facts
+come from the persisted event-derived summaries. `agent-eval --m15-report
+<window-dir>` rebuilds the same report from persisted facts.
 
-Cell PASS = behavioral oracle PASS ∧ allowed-diff PASS ∧ provider/runtime
-healthy ∧ no runtime error ∧ (resume mode only: restored ∧ continued on the
-exact acknowledged tuple).
+## 4. Verdicts
 
-**Closure (`task.complete` lifecycle) is reported per cell as a product fact
-— completed | active | failed(reason) — but is not a mandatory pass
-dimension for V1.** Grounding: the 2026-08-28 decision-grade window showed
-model-autonomous closure is variance (the off baseline self-closed one cell;
-the affordance candidate that tried to earn closure ended by its own gate).
-Making it mandatory now would bind M15 to a product behavior the project
-just declined to buy. The operator may raise it later for a V2 design.
+For the M15 V1 profile:
 
-Plane PASS = every cell PASS. M15 closure = all planes PASS + bundles
-committed + REPORT mechanically derived from per-cell facts + zero
-unresolved items on the acceptance path.
+```text
+PASS = behavior PASS
+    ∧ allowed diff PASS
+    ∧ no typed failure
+    ∧ (normal ∨ (restored ∧ exact tuple matched ∧ continued))
+```
 
-## 5. Freeze rules during the window
+`task.complete` is reported as `completed | active | failed(reason)` but is
+not part of this conjunction. Other evaluation profiles may require closure;
+the profile is persisted so the two contracts cannot be conflated.
 
-Pinned for the whole window: tool surface `v5` (v4 + always-loaded
-`task.complete`, amended 2026-08-28 after the first window's closure finding); LT-RUN substrate at the
-acceptance HEAD; opportunity OFF; the C context composition; the host policy
-snapshot; model/provider serving; pack contents; oracle sources; repeat
-count. No source change lands between the first and last cell — a mid-window
-fix voids the window. Reports are derived mechanically from bundles; hand
-editing numbers is out of contract.
+A cell with provider-transport or harness failure is `NOT_RUN`. Any `NOT_RUN`
+censors the whole window. Otherwise the development plane passes only when all
+12 cells pass. M15 closes only when every banked plane remains valid, the
+development plane passes, the bundles and generated report are committed, and
+no acceptance-path defect remains unresolved.
 
-## 6. Explicitly parked
+## 5. Freeze rules
 
-300×3 scale, `recall_after_fix`, 27-cell context expansion, a
-second-context-engine A/C comparison (gated on a promoted frozen setting —
-none exists), and the model-comparison layer (only after V1 closes).
+Pinned from the first through last cell: source identity, C context
+composition, production tool surface, host policy, provider/model serving,
+protocol family, context window, pack contents/digests, oracle sources,
+acceptance profile and repeat count. No mid-window repair or serving failover
+is allowed. Protocol `auto`, fixture filters, non-two repeat counts and
+`--allow-dirty` are rejected by the formal command. A censored window remains
+auditable but must be rerun whole.
 
-## 7. Decision points — signed off 2026-08-28; point 1 amended same day
+The context mechanism, GC, retrieval and prompt packing remain frozen. M15 is
+an execution/evaluation gate and cannot authorize a context retune.
 
-All four signed off per section 0 (serving pin kept; budget confirmed;
-fixtures authored per the specs in section 2 and frozen in
-`crates/agent-eval/src/m15_pack.rs`; closure stays reported-only). No open
-decision remains before the window.
+## 6. Legacy attempts
+
+The three v2 attempts remain immutable raw evidence, but are forensic-only:
+
+- all three packs were stamped with the `retry_policy_dev` identity/digest;
+- the evaluator made missing `task.complete` a Runtime failure despite the
+  frozen report-only closure contract;
+- provider health was inferred from message substrings;
+- six relay `max_output_tokens` outcomes were called transport failures;
+- the aggregate report was hand-maintained and contains inconsistent counts.
+
+Their individual observations may guide fixture and serving preflight, but
+their ratios, cross-window deltas and causal interpretations cannot promote a
+surface, reject a serving or close M15.
+
+## 7. Next execution gate
+
+Before spending a 12-cell window:
+
+1. keep the relevant deterministic evaluator/provider/runtime tests green;
+2. finish the `TOOL-DIR-SURFACE-01` isolated live paired gate outside M15
+   and rerun the bounded one-cell
+   source/product preflight without changing the serving tuple;
+3. use the preflight-pinned serving tuple in §0 without fallback or automatic
+   protocol negotiation;
+4. record the exact serving and clean source identity;
+5. set an explicit `OPENAI_API_PROTOCOL` and run one uninterrupted 12-cell v3
+   window with `agent-eval --m15-window`;
+6. accept only the mechanically regenerated report.
+
+300×3 scale, `recall_after_fix`, a 27-cell context expansion, a second context
+engine comparison and model comparison remain parked until this gate closes.

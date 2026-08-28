@@ -493,9 +493,12 @@ while a localhost OpenCode relay remains a separate provider route. Responses
 input is rebuilt from the Runtime-owned model frame (`message`,
 `function_call`, `function_call_output`) with `store=false`; no provider
 conversation becomes Context authority. Chat `finish_reason=network_error`
-and Responses terminal error events remain retryable transport failures rather
-than structurally empty successful turns. All vendor wire parsing stays in the
-provider crate. Function names on either wire are mapped to
+and retryable Responses failure events remain transport failures rather than
+structurally empty successful turns. Responses `response.incomplete` is
+semantic: `max_output_tokens` becomes the non-retryable `ModelOutputLimit`
+outcome and other incomplete reasons become model outcomes, not provider
+outages. All vendor wire parsing stays in the provider crate. Function names
+on either wire are mapped to
 `^[a-zA-Z0-9_-]+$` (`.` and `:` become `_`); inbound calls are mapped back to
 Core ids. Two Core ids that collapse to the same wire name fail closed before
 the HTTP call. Kernel tool ids are unchanged.
@@ -703,7 +706,7 @@ directory to exist; only the final file may be newly created:
 
 ```text
 resolve + canonical ordered leases → pinned bounded snapshot
-→ synced authority v2 Prepared (Core-managed) → exclusive short sibling temp
+→ synced authority v3 Prepared (Core-managed) → exclusive short sibling temp
 → stage sync → review Prepared
 → target-revision and staged-identity/length/SHA checks
 → handle-relative atomic replace → installed-byte checks + authority ack
@@ -716,7 +719,7 @@ directory handle — `renameat` on Unix,
 `RootDirectory` on Windows — so neither the staged file nor the final
 replace can be redirected by a path swap.
 
-For Core-managed writes the synced authority v2 `Prepared` intent lands
+For Core-managed writes the synced authority v3 `Prepared` intent lands
 *before the staged entry is created*, so every temp that can survive a crash
 already has its deterministic name, target, byte lengths, SHA-256 revisions,
 and operation identity recorded. Failure to record intent therefore creates
@@ -731,6 +734,31 @@ handle with shared read only and renames that handle itself, denying competing
 shared write/delete access. A pre-replace refusal removes the temp and records
 rollback; cleanup or rollback-journal uncertainty is `Unknown`, not a false
 `NotApplied`. `fs.write`, `edit.replace`, and `edit.patch` use this path.
+
+Directory topology uses a separate single-component transaction, never an
+implicit side effect of a file write:
+
+```text
+confine exact path + acquire target lease + pin existing parent
+→ authority-v3 Prepared(kind=directory, bytes=0)
+→ Core generation/intent fence
+→ handle-relative create of the absent final component
+→ sync where supported + capture stable filesystem identity
+→ authority Committed(identity) + review terminal + final identity check
+```
+
+`fs.mkdir` requires the immediate parent to exist. This makes one prepared
+effect equal one visible topology transition; callers express a deeper path as
+separate approved effects instead of receiving a hidden partially-created
+chain. An existing directory is an idempotent value and carries a no-mutation
+execution fact. Rollback deletes only the exact pinned directory while it is
+still empty and unchanged. If another actor substitutes or populates it, if
+cleanup cannot be confirmed, or if a crash occurs after create and before the
+committed identity, the result is `Unknown`/`Ambiguous`. Unix identity is
+device+inode and directory entries receive a parent sync; Windows identity is
+volume serial+file index, competing write/delete sharing is denied while the
+effect settles, and the existing documented directory-entry power-loss window
+remains because Windows exposes no supported directory flush equivalent.
 
 On Unix the staged file receives the original mode bits before replace. On
 Windows the replacement's readonly permission is restored after replace;
@@ -758,11 +786,13 @@ MutationPrepared { tx_id, target, before_hash, after_hash }
 
 `.focus-agent/authority/workspace-effects.jsonl` is the distinct authority
 journal: exclusive/pinned, framed and SHA-256-checksummed, `sync_all`'d, and
-bounded. New v2 `Prepared` records store the deterministic staged name,
-operation evidence, before/after byte lengths, and SHA-256 revisions needed
-for startup reconciliation. Real v1 frames remain read-compatible with their
-legacy FNV-1a-64 before/after hashes, but both versions now use 4 MiB-per-file
-and aggregate reconciliation read bounds.
+bounded. V3 keeps the v2 file record fields (deterministic staged name,
+operation evidence, byte lengths and SHA-256 revisions) and adds an entry kind
+plus committed stable identity for directories. Real v1 FNV-1a-64 and v2 file
+frames remain checksum/read compatible; every file version uses 4 MiB-per-file
+and aggregate reconciliation read bounds. Directory recovery performs no file
+content read and succeeds as Applied only when the current object identity
+matches the committed identity.
 
 Reconciliation opens target and stage through confined handles. It deletes a
 stage only after proving regular-file type, complete expected bytes, and that
@@ -1938,25 +1968,24 @@ attaches those handles to `CompletionRecord` at the safe point. The older
 model-supplied artifact list remains parser-only compatibility; asking the
 model to echo opaque runtime capabilities created avoidable invalid proposals
 without adding authority or evidence. Ending a model turn is implicit and does
-not close the durable task. `task.complete` is therefore catalog-cold during
-ordinary work: Runtime leases it for explicit task-closure intent or an
-explicit task requirement, while the model can still deliberately discover
-and load it through `capability.manage`. Once accepted, it terminates directly
+not close the durable task. Surface rev v5 keeps the compact `task.complete`
+schema visible, but visibility grants neither closure intent nor authority.
+Once accepted by the Runtime-owned completion gate, it terminates directly
 after the whole sibling batch settles successfully and current verification
 still passes. A failed sibling or invalidated completion gate returns the
 results to the model instead of hiding them behind task closure.
 
 The default always-loaded model surface is `fs.list`, `fs.read`, `fs.write`,
-`search.grep`, `artifact.read`, `edit.patch`, `git.status`, `git.diff`, and
-`capability.manage`. `edit.patch` is the single canonical revision-aware
+`search.grep`, `artifact.read`, `edit.patch`, `git.status`, `git.diff`,
+`task.complete`, and `capability.manage`. `edit.patch` is the single canonical
+revision-aware
 mutation primitive for existing text; compact universal file creation and
 read-only Git review remain visible because measured catalog-control rounds
 cost more than their small schemas. Surface visibility grants no effect
 authority. `edit.replace`, shell, process and plugin tools stay catalog-only.
 `context.manage` is catalog-only until a typed evidence need
-(Warm/Cold/Stored catalog, TaskAnchor `evidence_refs`, or open loops), while
-`task.complete` is catalog-only until explicit closure intent or a task-owned
-requirement; the model can also load either through `capability.manage`. Catalog search
+(Warm/Cold/Stored catalog, TaskAnchor `evidence_refs`, or open loops); the
+model can also load it through `capability.manage`. Catalog search
 accepts `role=mutate|verify|read_resource|search|inspect_diff|escape_hatch`
 so the model does not have to guess keywords. The merge is evidence-backed,
 not assumed: `merged_control_surface_costs_

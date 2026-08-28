@@ -211,6 +211,10 @@ pub struct ComposeConfig {
     /// LONG-TASK Slice C 候选开关（默认关）：派生 advisory 完成机会并
     /// 允许一次决策的 `task.complete` 租赁。晋级门通过前保持关。
     pub project_completion_opportunity: bool,
+    /// 目录工具准入候选开关（默认关）：类型化缺失父目录失败不改变
+    /// 模型表面，`fs.mkdir` 保持 catalog-cold 基线；开启时受信恢复源
+    /// 为一次决策精确浮现宿主工具。隔离配对实时门是唯一晋级路径。
+    pub recovery_surface: bool,
     /// 受信的宿主授权注册表。缺省只装内置表；插件工具没有条目就没有
     /// 授权，保持 fail-closed。同一来源接入内核配置与能力分发器。
     pub host_policies: Option<Arc<HostToolPolicyRegistry>>,
@@ -272,6 +276,7 @@ pub async fn compose(config: ComposeConfig) -> anyhow::Result<ComposedRuntime> {
         max_tool_rounds,
         project_task_progress,
         project_completion_opportunity,
+        recovery_surface,
         host_policies,
         effect_reservation_journal,
     } = config;
@@ -350,6 +355,7 @@ pub async fn compose(config: ComposeConfig) -> anyhow::Result<ComposedRuntime> {
     )?;
     services = services.with_project_task_progress(project_task_progress);
     services = services.with_project_completion_opportunity(project_completion_opportunity);
+    services = services.with_recovery_surface(recovery_surface);
     let instance = RuntimeInstance::spawn(host, services);
     Ok(ComposedRuntime {
         workspace,

@@ -23,9 +23,10 @@ use std::time::{Duration, Instant};
 use agent_contracts::{
     AgentResult, ApprovalDecision, ApprovalGate, CancellationToken,
     CompletionOpportunityDisposition, ContextEngine, ModelTransport, RuntimeEvent,
-    RuntimeEventEnvelope, ToolCall, ToolDispatcher, ToolSpec,
+    RuntimeEventEnvelope, RuntimeFailureClass, TaskId, ToolCall, ToolDispatcher, ToolSpec,
 };
 use anyhow::bail;
+use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
 
 use crate::bundle::PairSink;
@@ -33,9 +34,25 @@ use crate::long_task::{self, DIRECTIVE, FIXTURE_FILES};
 use crate::m15_pack;
 use crate::workload::{HiddenAssertionResult, HiddenCommandResult, HiddenFileBody, HiddenReport};
 
-pub const PILOT_SCHEMA: &str = "retry-pilot-cell-v2";
+pub const PILOT_SCHEMA: &str = "retry-pilot-cell-v3";
 /// LONG_TASK_EVALUATION layer 2: normal and resume, two repeats each.
 pub const DEFAULT_REPEATS: u32 = 2;
+pub const M15_PACK_IDS: [&str; 3] = [
+    m15_pack::RETRY_DIAG,
+    m15_pack::RETRY_MIGRATE,
+    "retry_policy_dev",
+];
+
+/// Candidate switches for one live cell. Each paired gate runs identical
+/// cells with exactly one of these as the only variable; the evidence
+/// records every setting.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct CellSwitches {
+    /// Item-8 advisory completion-opportunity candidate (default off).
+    pub opportunity: bool,
+    /// Directory-tool admission recovery-surface candidate (default off).
+    pub recovery_surface: bool,
+}
 
 /// Harness-owned behavioral oracle. Injected into the finished workspace
 /// after the run (so the evaluated agent never sees it) and executed as an
@@ -51,6 +68,7 @@ pub type HiddenResultsFn = Box<dyn Fn(&Path) -> Vec<(&'static str, &'static str,
 
 pub(crate) struct PackSpec {
     pub id: &'static str,
+    pub identity_sha256: Box<dyn Fn() -> String>,
     pub seed: SeedFn,
     pub directive: Box<dyn Fn() -> &'static str>,
     pub seed_files: Box<dyn Fn() -> Vec<&'static str>>,
@@ -62,6 +80,166 @@ pub(crate) struct PackSpec {
     pub exact_recipe_inputs: Box<dyn Fn() -> Vec<String>>,
     /// Per-pack allowed-diff predicate over workspace-relative paths.
     pub allowed_diff: Box<dyn Fn(&str) -> bool>,
+}
+
+/// The same raw cell facts can serve gates with different lifecycle policy.
+/// Selection happens before the run and is persisted with the dimensions so
+/// no report can silently change its acceptance rule afterward.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AcceptanceProfile {
+    ClosureRequired,
+    M15V1,
+}
+
+impl AcceptanceProfile {
+    pub fn id(self) -> &'static str {
+        match self {
+            Self::ClosureRequired => "closure_required",
+            Self::M15V1 => "m15_v1",
+        }
+    }
+
+    fn requires_closure(self) -> bool {
+        matches!(self, Self::ClosureRequired)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CellFailureClass {
+    HarnessSetup,
+    HarnessWatchdog,
+    ProviderTransport,
+    ModelOutputLimit,
+    Model,
+    InputBudget,
+    RoundBudget,
+    Runtime,
+}
+
+impl CellFailureClass {
+    fn id(self) -> &'static str {
+        match self {
+            Self::HarnessSetup => "harness_setup",
+            Self::HarnessWatchdog => "harness_watchdog",
+            Self::ProviderTransport => "provider_transport",
+            Self::ModelOutputLimit => "model_output_limit",
+            Self::Model => "model",
+            Self::InputBudget => "input_budget",
+            Self::RoundBudget => "round_budget",
+            Self::Runtime => "runtime",
+        }
+    }
+
+    fn not_run(self) -> bool {
+        matches!(
+            self,
+            Self::HarnessSetup | Self::HarnessWatchdog | Self::ProviderTransport
+        )
+    }
+}
+
+impl From<RuntimeFailureClass> for CellFailureClass {
+    fn from(value: RuntimeFailureClass) -> Self {
+        match value {
+            RuntimeFailureClass::ProviderTransport => Self::ProviderTransport,
+            RuntimeFailureClass::ModelOutputLimit => Self::ModelOutputLimit,
+            RuntimeFailureClass::Model => Self::Model,
+            RuntimeFailureClass::InputBudget => Self::InputBudget,
+            RuntimeFailureClass::RoundBudget => Self::RoundBudget,
+            RuntimeFailureClass::Runtime => Self::Runtime,
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+struct CellFailure {
+    class: CellFailureClass,
+    retryable: bool,
+    message: String,
+}
+
+impl CellFailure {
+    fn new(class: CellFailureClass, message: impl Into<String>) -> Self {
+        Self {
+            class,
+            retryable: false,
+            message: message.into(),
+        }
+    }
+
+    fn from_runtime(
+        class: RuntimeFailureClass,
+        retryable: bool,
+        message: impl Into<String>,
+    ) -> Self {
+        Self {
+            class: class.into(),
+            retryable,
+            message: message.into(),
+        }
+    }
+
+    fn runtime(message: impl Into<String>) -> Self {
+        Self::new(CellFailureClass::Runtime, message)
+    }
+
+    fn harness_setup(message: impl Into<String>) -> Self {
+        Self::new(CellFailureClass::HarnessSetup, message)
+    }
+
+    fn context(mut self, prefix: &str) -> Self {
+        self.message = format!("{prefix}: {}", self.message);
+        self
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CellVerdict {
+    Pass,
+    Fail,
+    NotRun,
+}
+
+impl CellVerdict {
+    pub fn id(self) -> &'static str {
+        match self {
+            Self::Pass => "pass",
+            Self::Fail => "fail",
+            Self::NotRun => "not_run",
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn evaluate_verdict(
+    profile: AcceptanceProfile,
+    mode: PilotMode,
+    failure_class: Option<CellFailureClass>,
+    behavior: &str,
+    diff_clean: bool,
+    exact_resume_tuple_matched: bool,
+    restored: bool,
+    continued: bool,
+    task_completed: bool,
+) -> CellVerdict {
+    if failure_class.is_some_and(CellFailureClass::not_run) {
+        return CellVerdict::NotRun;
+    }
+    let resume_ready =
+        mode == PilotMode::Normal || (exact_resume_tuple_matched && restored && continued);
+    let passed = failure_class.is_none()
+        && behavior == "pass"
+        && diff_clean
+        && resume_ready
+        && (!profile.requires_closure() || task_completed);
+    if passed {
+        CellVerdict::Pass
+    } else {
+        CellVerdict::Fail
+    }
 }
 
 fn retry_hidden_violations(root: &Path) -> Vec<String> {
@@ -79,9 +257,15 @@ fn standard_allowed_diff(relative: &str) -> bool {
 pub(crate) fn retry_pack() -> PackSpec {
     PackSpec {
         id: "retry_policy_dev",
+        identity_sha256: Box::new(spec_sha256),
         seed: Box::new(long_task::seed_workspace),
         directive: Box::new(|| DIRECTIVE),
-        seed_files: Box::new(|| FIXTURE_FILES.iter().map(|(relative, _)| *relative).collect()),
+        seed_files: Box::new(|| {
+            FIXTURE_FILES
+                .iter()
+                .map(|(relative, _)| *relative)
+                .collect()
+        }),
         hidden_violations: Box::new(retry_hidden_violations),
         hidden_results: Box::new(long_task::hidden_check_results),
         oracle: Box::new(|| (ORACLE_TEST_NAME, ORACLE_TEST_SOURCE)),
@@ -115,6 +299,7 @@ pub(crate) fn m15_diag_pack() -> PackSpec {
     let id = m15_pack::RETRY_DIAG;
     PackSpec {
         id,
+        identity_sha256: Box::new(move || m15_pack::spec_sha256(id)),
         seed: Box::new(move |root| m15_pack::seed(root, id)),
         directive: Box::new(move || m15_pack::fixture(id).unwrap().directive),
         seed_files: Box::new(move || {
@@ -143,6 +328,7 @@ pub(crate) fn m15_migrate_pack() -> PackSpec {
     let id = m15_pack::RETRY_MIGRATE;
     PackSpec {
         id,
+        identity_sha256: Box::new(move || m15_pack::spec_sha256(id)),
         seed: Box::new(move |root| m15_pack::seed(root, id)),
         directive: Box::new(move || m15_pack::fixture(id).unwrap().directive),
         seed_files: Box::new(move || {
@@ -293,7 +479,10 @@ fn public_api_accepts_a_dyn_sleeper() {
 }
 "#;
 
-const LIVE_IDLE: Duration = Duration::from_secs(300);
+// The provider owns its 300-second per-attempt idle timeout and emits a
+// retry-progress event before the next bounded attempt. This outer watchdog
+// deliberately leaves a grace window so it cannot win the same deadline race.
+const LIVE_IDLE: Duration = Duration::from_secs(330);
 /// Live cells share one round cap across engines; never raise it for C.
 const LIVE_MAX_MODEL_ROUNDS: u32 = 48;
 /// After TurnCompleted, drain until this quiet period passes so the final
@@ -309,7 +498,8 @@ const COMMAND_CAPTURE_CAP: usize = 16 * 1024;
 const SKIP_DIRS: [&str; 4] = [".git", ".focus-agent", ".gate", "target"];
 const SKIP_FILES: [&str; 2] = ["Cargo.lock", ".gitignore"];
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum PilotMode {
     Normal,
     Resume,
@@ -353,20 +543,33 @@ impl ApprovalGate for AllowAllGate {
 /// not erase whether the workspace was behaviorally correct, and the final
 /// verdict stays conjunctive.
 pub struct CellOutcome {
+    pub pack_id: &'static str,
     pub mode: PilotMode,
+    pub acceptance_profile: AcceptanceProfile,
+    pub verdict: CellVerdict,
     pub passed: bool,
-    /// Runtime/lifecycle failure reason, if any. Never suppresses the
+    /// Runtime/harness failure reason, if any. Never suppresses the
     /// read-only acceptance dimensions below.
     pub error: Option<String>,
+    pub error_class: Option<CellFailureClass>,
+    pub error_retryable: bool,
     pub wall_ms: u64,
     /// pass | fail | not_run(reason)
     pub behavior: String,
+    /// Oracle observation retained even when a provider/harness failure makes
+    /// the acceptance behavior NOT_RUN.
+    pub observed_behavior: String,
     /// pass | fail
     pub diff: String,
     /// completed | active | failed
     pub closure: String,
     /// n/a | restored | failed
     pub continuation: String,
+    pub exact_resume_tuple_matched: bool,
+    pub restored: bool,
+    pub continued: bool,
+    pub turn_completed: bool,
+    pub task_completed: bool,
     /// healthy | transport_failed
     pub provider_health: String,
     /// Agent-authored `cargo test` self-check: pass | fail | not_run
@@ -382,6 +585,9 @@ pub struct CellOutcome {
     /// Whether the advisory completion-opportunity candidate was enabled
     /// for this cell (the item-8 gate's only variable).
     pub opportunity: bool,
+    /// Whether the directory-tool recovery surface candidate was enabled
+    /// for this cell (the isolation paired gate's only variable).
+    pub recovery_surface: bool,
     /// Offered opportunity keys, in arrival order across both phases.
     pub opportunity_offers: Vec<String>,
     /// The model called `task.complete` after an offer was live.
@@ -389,13 +595,26 @@ pub struct CellOutcome {
 }
 
 impl CellOutcome {
-    fn failed(mode: PilotMode, wall_ms: u64, reason: String) -> Self {
+    fn failed(
+        pack_id: &'static str,
+        mode: PilotMode,
+        acceptance_profile: AcceptanceProfile,
+        switches: CellSwitches,
+        wall_ms: u64,
+        failure: CellFailure,
+    ) -> Self {
         Self {
+            pack_id,
             mode,
+            acceptance_profile,
+            verdict: CellVerdict::NotRun,
             passed: false,
-            error: Some(reason),
+            error: Some(failure.message),
+            error_class: Some(failure.class),
+            error_retryable: failure.retryable,
             wall_ms,
             behavior: "not_run".into(),
+            observed_behavior: "not_run".into(),
             diff: "fail".into(),
             closure: "failed".into(),
             continuation: if mode == PilotMode::Resume {
@@ -403,6 +622,11 @@ impl CellOutcome {
             } else {
                 "n/a".into()
             },
+            exact_resume_tuple_matched: false,
+            restored: false,
+            continued: false,
+            turn_completed: false,
+            task_completed: false,
             provider_health: "healthy".into(),
             self_check: "not_run".into(),
             resume_committed: 0,
@@ -412,15 +636,16 @@ impl CellOutcome {
             resume_trigger: None,
             diff_violations: Vec::new(),
             marker_violations: Vec::new(),
-            opportunity: false,
+            opportunity: switches.opportunity,
             opportunity_offers: Vec::new(),
             opportunity_called: false,
+            recovery_surface: switches.recovery_surface,
         }
     }
 
     /// One-line human summary for the runner output.
     pub fn render_line(&self) -> String {
-        let status = if self.passed { "PASS" } else { "FAIL" };
+        let status = self.verdict.id().to_ascii_uppercase();
         let trigger = self
             .resume_trigger
             .map(|tool| format!(" trigger={tool}"))
@@ -434,10 +659,17 @@ impl CellOutcome {
         } else {
             " opp=off".to_string()
         };
+        let recovery = if self.recovery_surface {
+            " recovery=on"
+        } else {
+            " recovery=off"
+        };
         format!(
-            "retry_policy_dev {:<6} {} behavior={} diff={} closure={} continuation={} provider={} rounds={}+{} resumes={} durables={}{}{}{}",
+            "{} {:<6} {} profile={} behavior={} diff={} closure={} continuation={} provider={} rounds={}+{} resumes={} durables={}{}{}{}{}",
+            self.pack_id,
             self.mode.id(),
             status,
+            self.acceptance_profile.id(),
             self.behavior,
             self.diff,
             self.closure,
@@ -449,9 +681,15 @@ impl CellOutcome {
             self.checkpoint_durable,
             trigger,
             opp,
+            recovery,
             self.error
                 .as_ref()
-                .map(|reason| format!(" error={reason}"))
+                .map(|reason| format!(
+                    " error_class={} error={reason}",
+                    self.error_class
+                        .map(CellFailureClass::id)
+                        .unwrap_or("unknown")
+                ))
                 .unwrap_or_default(),
         )
     }
@@ -486,7 +724,9 @@ struct PhaseState {
     /// Full acknowledged tuple for the mutation debt.
     last_durable_sequence: Option<u64>,
     last_durable_checksum: Option<String>,
+    last_durable_capability_generation: Option<u64>,
     last_resume_sequence: Option<u64>,
+    last_resume_task_id: Option<TaskId>,
     resume_committed: u64,
     checkpoint_durable: u64,
     turn_completed: bool,
@@ -503,7 +743,7 @@ enum StepOutcome {
     TurnCompleted,
     /// The turn stopped because this loop requested the cancel.
     ExpectedCancel,
-    Fail(String),
+    Fail(CellFailure),
 }
 
 impl PhaseState {
@@ -554,6 +794,7 @@ fn step_event(
             ref artifact,
             ref checksum,
             sequence,
+            capability_generation,
             ..
         } => {
             state.checkpoint_durable = state.checkpoint_durable.saturating_add(1);
@@ -561,6 +802,7 @@ fn step_event(
                 state.last_durable_artifact = Some(artifact.clone());
                 state.last_durable_sequence = Some(sequence);
                 state.last_durable_checksum = Some(checksum.clone());
+                state.last_durable_capability_generation = Some(capability_generation);
             }
             if state.mutation_tool.is_some()
                 && state.last_resume_sequence.is_some()
@@ -571,9 +813,12 @@ fn step_event(
             collector.push(envelope);
             StepOutcome::Continue
         }
-        RuntimeEvent::TaskResumeCommitted { sequence, .. } => {
+        RuntimeEvent::TaskResumeCommitted {
+            task_id, sequence, ..
+        } => {
             state.resume_committed = state.resume_committed.saturating_add(1);
             state.last_resume_sequence = Some(sequence);
+            state.last_resume_task_id = Some(task_id);
             collector.push(envelope);
             StepOutcome::Continue
         }
@@ -607,17 +852,27 @@ fn step_event(
             if state.cancel_requested {
                 StepOutcome::ExpectedCancel
             } else if state.cancelled_for_cap {
-                StepOutcome::Fail(format!(
-                    "live model-round cap ({LIVE_MAX_MODEL_ROUNDS}) exceeded"
+                StepOutcome::Fail(CellFailure::new(
+                    CellFailureClass::RoundBudget,
+                    format!("live model-round cap ({LIVE_MAX_MODEL_ROUNDS}) exceeded"),
                 ))
             } else {
-                StepOutcome::Fail("turn cancelled".into())
+                StepOutcome::Fail(CellFailure::runtime("turn cancelled"))
             }
         }
         RuntimeEvent::TurnCommitFailed { ref message, .. } => {
             let reason = format!("turn commit failed: {message}");
             collector.push(envelope);
-            StepOutcome::Fail(reason)
+            StepOutcome::Fail(CellFailure::runtime(reason))
+        }
+        RuntimeEvent::Failure {
+            class,
+            retryable,
+            ref message,
+        } => {
+            let failure = CellFailure::from_runtime(class, retryable, message.clone());
+            collector.push(envelope);
+            StepOutcome::Fail(failure)
         }
         RuntimeEvent::Error { ref message } => {
             let reason = format!("runtime error: {message}");
@@ -627,12 +882,12 @@ fn step_event(
             if state.cancel_requested {
                 StepOutcome::Continue
             } else {
-                StepOutcome::Fail(reason)
+                StepOutcome::Fail(CellFailure::runtime(reason))
             }
         }
         RuntimeEvent::RecoveryRequired => {
             collector.push(envelope);
-            StepOutcome::Fail("recovery fence raised during the run".into())
+            StepOutcome::Fail(CellFailure::runtime("recovery fence raised during the run"))
         }
         _ => {
             collector.push(envelope);
@@ -646,15 +901,20 @@ fn step_event(
 async fn next_envelope(
     receiver: &mut EventStream,
     collector: &mut Collector,
-) -> Result<RuntimeEventEnvelope, String> {
+) -> Result<RuntimeEventEnvelope, CellFailure> {
     loop {
         match tokio::time::timeout(LIVE_IDLE, receiver.recv()).await {
-            Err(_) => return Err("cell stalled waiting for runtime events".into()),
+            Err(_) => {
+                return Err(CellFailure::new(
+                    CellFailureClass::HarnessWatchdog,
+                    "cell stalled waiting for runtime events",
+                ));
+            }
             Ok(Err(tokio::sync::broadcast::error::RecvError::Lagged(skipped))) => {
                 collector.lagged = collector.lagged.saturating_add(skipped);
             }
             Ok(Err(tokio::sync::broadcast::error::RecvError::Closed)) => {
-                return Err("event stream closed".into());
+                return Err(CellFailure::runtime("event stream closed"));
             }
             Ok(Ok(envelope)) => return Ok(envelope),
         }
@@ -672,7 +932,7 @@ async fn wait_resume_trigger(
     collector: &mut Collector,
     state: &mut PhaseState,
     handle: &agent_runtime::RuntimeHandle,
-) -> Result<(), String> {
+) -> Result<(), CellFailure> {
     loop {
         let envelope = next_envelope(receiver, collector).await?;
         match step_event(envelope, collector, state) {
@@ -684,7 +944,9 @@ async fn wait_resume_trigger(
                 return Ok(());
             }
             StepOutcome::TaskCompleted => {
-                return Err("task completed before the resume interruption could fire".into());
+                return Err(CellFailure::harness_setup(
+                    "task completed before the resume interruption could fire",
+                ));
             }
             StepOutcome::TurnCompleted => {
                 if state.durable_after_mutation {
@@ -692,7 +954,9 @@ async fn wait_resume_trigger(
                     // and equally resumable.
                     return Ok(());
                 }
-                return Err("turn finished before any durably settled workspace mutation".into());
+                return Err(CellFailure::harness_setup(
+                    "turn finished before any durably settled workspace mutation",
+                ));
             }
             StepOutcome::Fail(reason) => return Err(reason),
         }
@@ -735,7 +999,7 @@ async fn run_to_completion(
     collector: &mut Collector,
     state: &mut PhaseState,
     handle: &agent_runtime::RuntimeHandle,
-) -> Result<(), String> {
+) -> Result<(), CellFailure> {
     loop {
         let envelope = next_envelope(receiver, collector).await?;
         match step_event(envelope, collector, state) {
@@ -743,7 +1007,9 @@ async fn run_to_completion(
             StepOutcome::TaskCompleted => return Ok(()),
             StepOutcome::TurnCompleted => break,
             StepOutcome::ExpectedCancel => {
-                return Err("unexpected operator-style cancel during a live run".into());
+                return Err(CellFailure::runtime(
+                    "unexpected operator-style cancel during a live run",
+                ));
             }
             StepOutcome::Fail(reason) => return Err(reason),
         }
@@ -756,7 +1022,9 @@ async fn run_to_completion(
             Ok(Ok(envelope)) => match step_event(envelope, collector, state) {
                 StepOutcome::TaskCompleted => return Ok(()),
                 StepOutcome::ExpectedCancel => {
-                    return Err("unexpected operator-style cancel during a live run".into());
+                    return Err(CellFailure::runtime(
+                        "unexpected operator-style cancel during a live run",
+                    ));
                 }
                 StepOutcome::Fail(reason) => return Err(reason),
                 _ => {}
@@ -769,7 +1037,7 @@ async fn compose_cell(
     root: &Path,
     model: Arc<dyn ModelTransport>,
     engine: Arc<dyn ContextEngine>,
-    opportunity: bool,
+    switches: CellSwitches,
     pack: &PackSpec,
 ) -> anyhow::Result<agent_compose::ComposedRuntime> {
     let workspace = agent_workspace::Workspace::open(root).await?;
@@ -796,7 +1064,8 @@ async fn compose_cell(
         output_broker: None,
         max_tool_rounds: Some(LIVE_MAX_MODEL_ROUNDS as usize),
         project_task_progress: true,
-        project_completion_opportunity: opportunity,
+        project_completion_opportunity: switches.opportunity,
+        recovery_surface: switches.recovery_surface,
         host_policies: Some(Arc::new(
             agent_compose::HostToolPolicyRegistry::with_builtins_and_verification(
                 &verification_recipes,
@@ -826,9 +1095,7 @@ fn c_engine(model: Arc<dyn ModelTransport>) -> Arc<dyn ContextEngine> {
 /// opportunity candidate's fail-closed precondition is unreachable (see
 /// opportunity-gate REPORT, attempt 1). The set is identical across off/on
 /// arms; the switch remains the only paired variable.
-fn pilot_verification_recipes(
-    exact_inputs: Vec<String>,
-) -> tool_runtime::VerificationRecipes {
+fn pilot_verification_recipes(exact_inputs: Vec<String>) -> tool_runtime::VerificationRecipes {
     let mut recipes = Vec::new();
     // Mirror of discovery for a Cargo workspace fixture.
     if let Ok(recipe) = tool_runtime::VerificationRecipe::new(
@@ -867,7 +1134,7 @@ fn pilot_verification_recipes(
 async fn load_checkpoint_artifact(
     root: &Path,
     artifact: &str,
-) -> anyhow::Result<agent_runtime::RuntimeCheckpoint> {
+) -> anyhow::Result<(agent_runtime::RuntimeCheckpoint, String)> {
     let workspace = agent_workspace::Workspace::open(root).await?;
     let store =
         agent_runtime::checkpoint::CheckpointStore::new(workspace.state_dir().join("checkpoints"));
@@ -875,7 +1142,11 @@ async fn load_checkpoint_artifact(
         .load_verified(artifact)
         .await
         .map_err(anyhow::Error::msg)?;
-    Ok(serde_json::from_slice(&payload)?)
+    let checksum = Sha256::digest(&payload)
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect();
+    Ok((serde_json::from_slice(&payload)?, checksum))
 }
 
 /// Run one live cell end to end and score it against the finished
@@ -886,9 +1157,18 @@ pub async fn run_cell(
     pair: &PairSink,
     model: Arc<dyn ModelTransport>,
     root: &Path,
-    opportunity: bool,
+    switches: CellSwitches,
 ) -> anyhow::Result<CellOutcome> {
-    run_pack_cell(&retry_pack(), mode, pair, model, root, opportunity).await
+    run_pack_cell(
+        &retry_pack(),
+        mode,
+        pair,
+        model,
+        root,
+        switches,
+        AcceptanceProfile::ClosureRequired,
+    )
+    .await
 }
 
 /// Pack-generic live cell. Every retry-specific seam (seed, directive,
@@ -900,28 +1180,51 @@ pub async fn run_pack_cell(
     pair: &PairSink,
     model: Arc<dyn ModelTransport>,
     root: &Path,
-    opportunity: bool,
+    switches: CellSwitches,
+    acceptance_profile: AcceptanceProfile,
 ) -> anyhow::Result<CellOutcome> {
     let started = Instant::now();
-    let failed =
-        |reason: String| CellOutcome::failed(mode, started.elapsed().as_millis() as u64, reason);
+    let collector = Collector::default();
+    let CellSwitches {
+        opportunity,
+        recovery_surface,
+    } = switches;
+    let failed = |failure: CellFailure| {
+        CellOutcome::failed(
+            pack.id,
+            mode,
+            acceptance_profile,
+            switches,
+            started.elapsed().as_millis() as u64,
+            failure,
+        )
+    };
 
     if let Err(e) = (pack.seed)(root) {
-        return Ok(failed(format!("seeding failed: {e:#}")));
+        let outcome = failed(CellFailure::harness_setup(format!("seeding failed: {e:#}")));
+        write_evidence(pair, root, &collector, pack, &outcome, None, None)?;
+        return Ok(outcome);
     }
     if let Err(e) = crate::suite::ensure_workspace_git(root) {
-        return Ok(failed(format!("workspace git init failed: {e:#}")));
+        let outcome = failed(CellFailure::harness_setup(format!(
+            "workspace git init failed: {e:#}"
+        )));
+        write_evidence(pair, root, &collector, pack, &outcome, None, None)?;
+        return Ok(outcome);
     }
 
-    let mut collector = Collector::default();
-    let mut error: Option<String> = None;
+    let mut collector = collector;
+    let mut failure: Option<CellFailure> = None;
     let mut trigger_tool: Option<&'static str> = None;
     let mut resume_committed = 0u64;
     let mut checkpoint_durable = 0u64;
     let mut rounds_one = 0u32;
     let mut rounds_two = 0u32;
     let mut task_completed = false;
+    let mut turn_completed = false;
+    let mut exact_resume_tuple_matched = false;
     let mut phase_two_restored = false;
+    let mut phase_two_continued = false;
     let mut opportunity_offers = Vec::new();
     let mut opportunity_called = false;
 
@@ -931,22 +1234,36 @@ pub async fn run_pack_cell(
     let mut checkpoint_artifact: Option<String> = None;
     let mut checkpoint_sequence: Option<u64> = None;
     let mut checkpoint_checksum: Option<String> = None;
-    match compose_cell(root, model.clone(), c_engine(model.clone()), opportunity, pack).await {
-        Err(e) => error = Some(format!("phase-one compose failed: {e:#}")),
+    let mut checkpoint_capability_generation: Option<u64> = None;
+    let mut checkpoint_task_id: Option<TaskId> = None;
+    match compose_cell(
+        root,
+        model.clone(),
+        c_engine(model.clone()),
+        switches,
+        pack,
+    )
+    .await
+    {
+        Err(e) => {
+            failure = Some(CellFailure::harness_setup(format!(
+                "phase-one compose failed: {e:#}"
+            )))
+        }
         Ok(composed) => {
             let handle = composed.handle().clone();
             let mut events = composed.subscribe();
             let mut state = PhaseState::default();
-            let drive: Result<(), String> = async {
+            let drive: Result<(), CellFailure> = async {
                 let directive = (pack.directive)();
                 handle
                     .set_focus(directive.to_string())
                     .await
-                    .map_err(|e| format!("set_focus failed: {e}"))?;
+                    .map_err(|e| CellFailure::runtime(format!("set_focus failed: {e}")))?;
                 handle
                     .user_message(directive.to_string())
                     .await
-                    .map_err(|e| format!("user_message failed: {e}"))?;
+                    .map_err(|e| CellFailure::runtime(format!("user_message failed: {e}")))?;
                 match mode {
                     PilotMode::Normal => {
                         run_to_completion(&mut events, &mut collector, &mut state, &handle).await?
@@ -959,18 +1276,16 @@ pub async fn run_pack_cell(
                 Ok(())
             }
             .await;
+            rounds_one = state.model_rounds;
+            resume_committed += state.resume_committed;
+            checkpoint_durable += state.checkpoint_durable;
+            task_completed |= state.task_completed;
+            turn_completed |= state.turn_completed;
+            opportunity_offers.extend(state.opportunity_offers.iter().cloned());
+            opportunity_called |= state.opportunity_called;
+            trigger_tool = state.mutation_tool;
             match drive {
                 Ok(()) => {
-                    rounds_one = state.model_rounds;
-                    resume_committed += state.resume_committed;
-                    checkpoint_durable += state.checkpoint_durable;
-                    task_completed |= state.task_completed;
-                    opportunity_offers.extend(state.opportunity_offers.iter().cloned());
-                    opportunity_called |= state.opportunity_called;
-                    trigger_tool = state.mutation_tool;
-                    if mode == PilotMode::Normal && !task_completed {
-                        error = Some("normal run ended without TaskCompleted".into());
-                    }
                     if mode == PilotMode::Resume {
                         // Retain the exact acknowledged tuple across the
                         // boundary: phase two loads and verifies the exact
@@ -979,27 +1294,38 @@ pub async fn run_pack_cell(
                             state.last_durable_artifact.clone(),
                             state.last_durable_sequence,
                             state.last_durable_checksum.clone(),
+                            state.last_durable_capability_generation,
+                            state.last_resume_task_id,
                         ) {
-                            (Some(artifact), Some(seq), Some(sum)) => {
+                            (
+                                Some(artifact),
+                                Some(seq),
+                                Some(sum),
+                                Some(generation),
+                                Some(task_id),
+                            ) => {
                                 checkpoint_artifact = Some(artifact);
                                 checkpoint_sequence = Some(seq);
                                 checkpoint_checksum = Some(sum);
+                                checkpoint_capability_generation = Some(generation);
+                                checkpoint_task_id = Some(task_id);
                             }
                             _ => {
-                                error = Some(
-                                    "trigger fired without an acknowledged checkpoint tuple"
-                                        .into(),
-                                );
+                                failure = Some(CellFailure::runtime(
+                                    "trigger fired without an acknowledged checkpoint tuple",
+                                ));
                             }
                         }
                     }
                 }
-                Err(reason) => error = Some(format!("phase one failed: {reason}")),
+                Err(reason) => failure = Some(reason.context("phase one failed")),
             }
             if let Err(e) = composed.shutdown().await
-                && error.is_none()
+                && failure.is_none()
             {
-                error = Some(format!("phase-one shutdown failed: {e}"));
+                failure = Some(CellFailure::runtime(format!(
+                    "phase-one shutdown failed: {e}"
+                )));
             }
             while let Ok(envelope) = events.try_recv() {
                 collector.push(envelope);
@@ -1009,7 +1335,7 @@ pub async fn run_pack_cell(
 
     // ---- Phase two (resume only): cold-load the acknowledged artifact
     // into a fresh runtime and continue the SAME directive.
-    if mode == PilotMode::Resume && error.is_none() {
+    if mode == PilotMode::Resume && failure.is_none() {
         let loaded = match &checkpoint_artifact {
             None => Err(anyhow::anyhow!(
                 "resume mode reached phase two without a checkpoint"
@@ -1017,72 +1343,103 @@ pub async fn run_pack_cell(
             Some(artifact) => load_checkpoint_artifact(root, artifact).await,
         };
         match loaded {
-            Err(e) => error = Some(format!("checkpoint artifact load failed: {e:#}")),
-            Ok(checkpoint) => {
-                if let Some(expected) = checkpoint_sequence
-                    && checkpoint.snapshot_sequence != expected
-                {
-                    error = Some(format!(
-                        "checkpoint sequence mismatch: expected {expected}, got {}",
-                        checkpoint.snapshot_sequence
+            Err(e) => {
+                failure = Some(CellFailure::runtime(format!(
+                    "checkpoint artifact load failed: {e:#}"
+                )))
+            }
+            Ok((checkpoint, loaded_checksum)) => {
+                if checkpoint_sequence != Some(checkpoint.snapshot_sequence) {
+                    failure = Some(CellFailure::runtime(format!(
+                        "checkpoint sequence mismatch: expected {:?}, got {}",
+                        checkpoint_sequence, checkpoint.snapshot_sequence
+                    )));
+                } else if checkpoint_checksum.as_deref() != Some(loaded_checksum.as_str()) {
+                    failure = Some(CellFailure::runtime(
+                        "checkpoint acknowledgement checksum does not match the loaded payload",
                     ));
-                } else if let Some(expected) = checkpoint_checksum.as_ref()
-                    && !expected.is_empty()
+                } else if checkpoint_capability_generation != Some(checkpoint.capability_generation)
                 {
-                    // load_verified already verified envelope checksum; keep the tuple for correlation.
-                    let _ = expected;
+                    failure = Some(CellFailure::runtime(format!(
+                        "checkpoint capability generation mismatch: expected {:?}, got {}",
+                        checkpoint_capability_generation, checkpoint.capability_generation
+                    )));
+                } else if checkpoint_task_id != checkpoint.current_task_id {
+                    failure = Some(CellFailure::runtime(format!(
+                        "checkpoint task mismatch: expected {:?}, got {:?}",
+                        checkpoint_task_id, checkpoint.current_task_id
+                    )));
+                } else if checkpoint.authority.is_none() {
+                    failure = Some(CellFailure::runtime(
+                        "checkpoint has no durable Core authority lineage",
+                    ));
                 }
-                if error.is_some() {
-                    // sequence mismatch is a harness failure, not a restore attempt.
+                if failure.is_some() {
+                    // Acknowledgement mismatch is a Runtime truth-chain failure,
+                    // not a restore attempt.
                 } else {
-                    match compose_cell(root, model.clone(), c_engine(model.clone()), opportunity, pack).await
-                {
-                    Err(e) => error = Some(format!("phase-two compose failed: {e:#}")),
-                    Ok(composed) => {
-                        let handle = composed.handle().clone();
-                        let mut events = composed.subscribe();
-                        let mut state = PhaseState::default();
-                        let drive: Result<(), String> = async {
-                            composed
-                                .instance
-                                .restore(checkpoint)
-                                .await
-                                .map_err(|e| format!("restore failed: {e}"))?;
-                            handle
-                                .continue_active_task()
-                                .await
-                                .map_err(|e| format!("continue_active_task failed: {e}"))?;
-                            run_to_completion(&mut events, &mut collector, &mut state, &handle)
-                                .await
+                    match compose_cell(
+                        root,
+                        model.clone(),
+                        c_engine(model.clone()),
+                        switches,
+                        pack,
+                    )
+                    .await
+                    {
+                        Err(e) => {
+                            failure = Some(CellFailure::harness_setup(format!(
+                                "phase-two compose failed: {e:#}"
+                            )))
                         }
-                        .await;
-                        match drive {
-                            Ok(()) => {
+                        Ok(composed) => {
+                            let handle = composed.handle().clone();
+                            let mut events = composed.subscribe();
+                            let mut state = PhaseState::default();
+                            let drive: Result<(), CellFailure> = async {
+                                composed.instance.restore(checkpoint).await.map_err(|e| {
+                                    CellFailure::runtime(format!("restore failed: {e}"))
+                                })?;
                                 phase_two_restored = true;
-                                rounds_two = state.model_rounds;
-                                resume_committed += state.resume_committed;
-                                checkpoint_durable += state.checkpoint_durable;
-                                task_completed |= state.task_completed;
-                                opportunity_offers.extend(state.opportunity_offers.iter().cloned());
-                                opportunity_called |= state.opportunity_called;
-                                if !task_completed {
-                                    error = Some("continuation ended without TaskCompleted".into());
+                                // Restore verifies the checkpoint's authority marker
+                                // against the live Core lineage; all other acknowledged
+                                // tuple fields were matched above.
+                                exact_resume_tuple_matched = true;
+                                handle.continue_active_task().await.map_err(|e| {
+                                    CellFailure::runtime(format!(
+                                        "continue_active_task failed: {e}"
+                                    ))
+                                })?;
+                                phase_two_continued = true;
+                                run_to_completion(&mut events, &mut collector, &mut state, &handle)
+                                    .await
+                            }
+                            .await;
+                            rounds_two = state.model_rounds;
+                            resume_committed += state.resume_committed;
+                            checkpoint_durable += state.checkpoint_durable;
+                            task_completed |= state.task_completed;
+                            turn_completed |= state.turn_completed;
+                            opportunity_offers.extend(state.opportunity_offers.iter().cloned());
+                            opportunity_called |= state.opportunity_called;
+                            match drive {
+                                Ok(()) => {}
+                                Err(reason) => {
+                                    failure = Some(reason.context("phase two failed"));
                                 }
                             }
-                            Err(reason) => {
-                                error = Some(format!("phase two failed: {reason}"));
+                            if let Err(e) = composed.shutdown().await
+                                && failure.is_none()
+                            {
+                                failure = Some(CellFailure::runtime(format!(
+                                    "phase-two shutdown failed: {e}"
+                                )));
+                            }
+                            while let Ok(envelope) = events.try_recv() {
+                                collector.push(envelope);
                             }
                         }
-                        if let Err(e) = composed.shutdown().await
-                            && error.is_none()
-                        {
-                            error = Some(format!("phase-two shutdown failed: {e}"));
-                        }
-                        while let Ok(envelope) = events.try_recv() {
-                            collector.push(envelope);
-                        }
                     }
-                }
                 }
             }
         }
@@ -1096,32 +1453,30 @@ pub async fn run_pack_cell(
     // the implementation was behaviorally correct. The diff scan runs
     // before the oracle injection so build artifacts and the harness's
     // own oracle file can never enter the allowed-diff verdict.
-    let provider_failed = error
-        .as_deref()
-        .is_some_and(|reason| reason.contains("transport error"));
-    let closure = if task_completed {
-        "completed"
-    } else if error.is_some() {
-        "failed"
-    } else {
-        "active"
-    };
+    let provider_failed = failure
+        .as_ref()
+        .is_some_and(|failure| failure.class == CellFailureClass::ProviderTransport);
     let continuation = match mode {
         PilotMode::Normal => "n/a",
-        PilotMode::Resume if phase_two_restored => "restored",
+        PilotMode::Resume if phase_two_restored && phase_two_continued => "restored_and_continued",
+        PilotMode::Resume if phase_two_restored => "restored_not_continued",
         _ => "failed",
     }
     .to_string();
 
     let diff_seed_files = (pack.seed_files)();
-    let diff_violations = match diff_violations(
-        root,
-        &diff_seed_files.to_vec(),
-        pack.allowed_diff.as_ref(),
-    ) {
-        Ok(violations) => violations,
-        Err(e) => vec![format!("diff scan failed: {e:#}")],
-    };
+    let diff_violations =
+        match diff_violations(root, &diff_seed_files.to_vec(), pack.allowed_diff.as_ref()) {
+            Ok(violations) => violations,
+            Err(e) => {
+                if failure.is_none() {
+                    failure = Some(CellFailure::harness_setup(format!(
+                        "allowed-diff scan failed: {e:#}"
+                    )));
+                }
+                vec![format!("diff scan failed: {e:#}")]
+            }
+        };
     let diff_clean = diff_violations.is_empty();
     let marker_violations = (pack.hidden_violations)(root);
 
@@ -1171,34 +1526,91 @@ pub async fn run_pack_cell(
         },
     };
     let _ = std::fs::remove_file(&oracle_path);
-    let behavior = if oracle_record.passed {
-        "pass"
-    } else if oracle_record.stderr.contains("oracle setup failed")
+    let oracle_failure = if oracle_record.stderr.contains("oracle setup failed")
         || oracle_record.stderr.contains("oracle injection failed")
+        || oracle_record.stderr.contains("failed to spawn cargo test")
+        || oracle_record.stderr.contains("executed zero tests")
     {
+        Some(CellFailure::harness_setup(
+            "behavioral oracle could not be prepared or started",
+        ))
+    } else if oracle_record.timed_out {
+        Some(CellFailure::new(
+            CellFailureClass::HarnessWatchdog,
+            "behavioral oracle exceeded its bounded timeout",
+        ))
+    } else {
+        None
+    };
+    let observed_behavior = if oracle_record.passed {
+        "pass"
+    } else if oracle_failure.is_some() {
         "not_run"
     } else {
         "fail"
     }
     .to_string();
+    if failure.is_none() {
+        failure = oracle_failure;
+    }
+    let behavior = if failure
+        .as_ref()
+        .is_some_and(|failure| failure.class.not_run())
+    {
+        "not_run".to_string()
+    } else {
+        observed_behavior.clone()
+    };
     let self_check = if self_check_record.passed {
         "pass"
-    } else if error.is_some() && !workspace_has_tests(root) {
+    } else if failure.is_some() && !workspace_has_tests(root) {
         "not_run"
     } else {
         "fail"
     };
 
-    let passed = task_completed && behavior == "pass" && diff_clean;
-    let outcome = CellOutcome {
+    let error_class = failure.as_ref().map(|failure| failure.class);
+    let error_retryable = failure.as_ref().is_some_and(|failure| failure.retryable);
+    let verdict = evaluate_verdict(
+        acceptance_profile,
         mode,
+        error_class,
+        &behavior,
+        diff_clean,
+        exact_resume_tuple_matched,
+        phase_two_restored,
+        phase_two_continued,
+        task_completed,
+    );
+    let passed = verdict == CellVerdict::Pass;
+    let error = failure.as_ref().map(|failure| failure.message.clone());
+    let closure = if task_completed {
+        "completed"
+    } else if failure.is_some() {
+        "failed"
+    } else {
+        "active"
+    };
+    let outcome = CellOutcome {
+        pack_id: pack.id,
+        mode,
+        acceptance_profile,
+        verdict,
         passed,
         error,
+        error_class,
+        error_retryable,
         wall_ms,
         behavior,
+        observed_behavior,
         diff: if diff_clean { "pass" } else { "fail" }.into(),
         closure: closure.into(),
         continuation,
+        exact_resume_tuple_matched,
+        restored: phase_two_restored,
+        continued: phase_two_continued,
+        turn_completed,
+        task_completed,
         provider_health: if provider_failed {
             "transport_failed".into()
         } else {
@@ -1213,6 +1625,7 @@ pub async fn run_pack_cell(
         diff_violations,
         marker_violations,
         opportunity,
+        recovery_surface,
         opportunity_offers,
         opportunity_called,
     };
@@ -1224,7 +1637,7 @@ pub async fn run_pack_cell(
         &outcome,
         Some(&oracle_record),
         Some(&self_check_record),
-    );
+    )?;
     Ok(outcome)
 }
 
@@ -1258,14 +1671,14 @@ fn write_evidence(
     outcome: &CellOutcome,
     oracle: Option<&HiddenCommandResult>,
     self_check: Option<&HiddenCommandResult>,
-) {
+) -> anyhow::Result<()> {
     let report = build_hidden_report(outcome, root, pack, oracle, self_check);
     let metrics = crate::metrics::aggregate_metrics(&collector.events);
     let cell_dir = pair.cell_dir("dynamic");
-    if let Err(e) = crate::bundle::write_cell_parts(
+    crate::bundle::write_cell_parts(
         &cell_dir,
-        "retry_policy_dev",
-        &spec_sha256(),
+        pack.id,
+        &(pack.identity_sha256)(),
         "dynamic",
         pair,
         &collector.events,
@@ -1278,33 +1691,46 @@ fn write_evidence(
         0,
         Some("production"),
         &report,
-    ) {
-        eprintln!("warning: retry-pilot evidence write failed: {e}");
-    }
+    )?;
     let dimensions = serde_json::json!({
         "schema": PILOT_SCHEMA,
+        "pack_id": pack.id,
         "mode": outcome.mode.id(),
+        "acceptance_profile": outcome.acceptance_profile.id(),
+        "verdict": outcome.verdict.id(),
         "behavioral_oracle": outcome.behavior,
+        "observed_behavioral_oracle": outcome.observed_behavior,
         "allowed_diff": outcome.diff,
         "task_closure": outcome.closure,
         "continuation": outcome.continuation,
+        "exact_resume_tuple_matched": outcome.exact_resume_tuple_matched,
+        "restored": outcome.restored,
+        "continued": outcome.continued,
+        "turn_completed": outcome.turn_completed,
+        "task_completed": outcome.task_completed,
+        "wall_ms": outcome.wall_ms,
+        "model_rounds_phase_one": outcome.model_rounds_phase_one,
+        "model_rounds_phase_two": outcome.model_rounds_phase_two,
+        "resume_committed": outcome.resume_committed,
+        "checkpoint_durable": outcome.checkpoint_durable,
         "provider_runtime": outcome.provider_health,
         "workspace_self_check": outcome.self_check,
         "final_passed": outcome.passed,
         "runtime_error": outcome.error,
+        "runtime_error_class": outcome.error_class,
+        "runtime_error_retryable": outcome.error_retryable,
         // Item-8 candidate bookkeeping: the switch setting and the
         // per-cell opportunity account (offers per key, call-through).
         "completion_opportunity": if outcome.opportunity { "on" } else { "off" },
         "opportunity_offers": outcome.opportunity_offers,
         "opportunity_called": outcome.opportunity_called,
+        // Directory-tool admission gate bookkeeping: the candidate switch
+        // is the only variable between the two paired arms.
+        "recovery_surface": if outcome.recovery_surface { "on" } else { "off" },
     });
     let dimensions_path = pair.cell_dir("dynamic").join("dimensions.json");
-    if let Err(e) = std::fs::write(
-        &dimensions_path,
-        serde_json::to_vec_pretty(&dimensions).unwrap_or_default(),
-    ) {
-        eprintln!("warning: retry-pilot dimensions write failed: {e}");
-    }
+    std::fs::write(&dimensions_path, serde_json::to_vec_pretty(&dimensions)?)?;
+    Ok(())
 }
 
 fn build_hidden_report(
@@ -1364,7 +1790,7 @@ fn build_hidden_report(
     HiddenReport {
         schema: PILOT_SCHEMA.to_string(),
         kind: "retry_pilot_oracle".into(),
-        fixture_id: format!("retry_policy_dev-{}", outcome.mode.id()),
+        fixture_id: format!("{}-{}", pack.id, outcome.mode.id()),
         expected_edit: String::new(),
         passed: outcome.passed,
         replay_complete: true,
@@ -1706,6 +2132,84 @@ mod tests {
     fn spec_digest_is_stable_across_calls() {
         assert_eq!(spec_sha256(), spec_sha256());
         assert_eq!(spec_sha256().len(), 64);
+    }
+
+    #[test]
+    fn m15_verdict_does_not_require_lifecycle_closure() {
+        assert_eq!(
+            evaluate_verdict(
+                AcceptanceProfile::M15V1,
+                PilotMode::Normal,
+                None,
+                "pass",
+                true,
+                false,
+                false,
+                false,
+                false,
+            ),
+            CellVerdict::Pass
+        );
+        assert_eq!(
+            evaluate_verdict(
+                AcceptanceProfile::ClosureRequired,
+                PilotMode::Normal,
+                None,
+                "pass",
+                true,
+                false,
+                false,
+                false,
+                false,
+            ),
+            CellVerdict::Fail
+        );
+    }
+
+    #[test]
+    fn m15_resume_requires_the_exact_restored_continuation_chain() {
+        let verdict = |exact, restored, continued| {
+            evaluate_verdict(
+                AcceptanceProfile::M15V1,
+                PilotMode::Resume,
+                None,
+                "pass",
+                true,
+                exact,
+                restored,
+                continued,
+                false,
+            )
+        };
+        assert_eq!(verdict(true, true, true), CellVerdict::Pass);
+        assert_eq!(verdict(false, true, true), CellVerdict::Fail);
+        assert_eq!(verdict(true, false, true), CellVerdict::Fail);
+        assert_eq!(verdict(true, true, false), CellVerdict::Fail);
+    }
+
+    #[test]
+    fn provider_outage_is_not_run_but_output_limit_is_a_cell_failure() {
+        let verdict = |class| {
+            evaluate_verdict(
+                AcceptanceProfile::M15V1,
+                PilotMode::Normal,
+                Some(class),
+                "not_run",
+                true,
+                false,
+                false,
+                false,
+                false,
+            )
+        };
+        assert_eq!(
+            verdict(CellFailureClass::ProviderTransport),
+            CellVerdict::NotRun
+        );
+        assert_eq!(
+            verdict(CellFailureClass::ModelOutputLimit),
+            CellVerdict::Fail
+        );
     }
 
     /// The harness-owned oracle must accept the reference solution and

@@ -19,7 +19,7 @@ pub(crate) use artifact::ArtifactReadTool;
 pub(crate) use code::{CodeDiagnosticsTool, CodeSymbolsTool};
 pub(crate) use context::ContextManageTool;
 pub(crate) use edit::EditReplaceTool;
-pub(crate) use fs::{FsListTool, FsReadTool, FsWriteTool};
+pub(crate) use fs::{FsListTool, FsMkdirTool, FsReadTool, FsWriteTool};
 pub(crate) use git::{GitDiffTool, GitStatusTool};
 pub(crate) use patch::EditPatchTool;
 pub(crate) use process::{ProcessRunTool, verification_executable_identity};
@@ -31,8 +31,8 @@ pub(crate) use task::TaskCompleteTool;
 pub(crate) use task_manage::TaskManageTool;
 pub(crate) use verify::VerificationRunTool;
 pub(crate) use view::{
-    hidden_path_output, is_hidden_name, is_not_found_error, missing_path_output,
-    ordinary_view_blocked,
+    hidden_path_output, is_hidden_name, is_not_found_error, missing_parent_output,
+    missing_path_output, ordinary_view_blocked,
 };
 
 use agent_contracts::{

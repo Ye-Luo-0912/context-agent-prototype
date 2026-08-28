@@ -39,6 +39,20 @@ pub enum TurnCancelAck {
     },
 }
 
+/// Bounded failure taxonomy retained across the model-operation boundary.
+/// Human-readable messages remain diagnostic detail; policy and evaluation
+/// consume this class instead of parsing provider-specific strings.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RuntimeFailureClass {
+    ProviderTransport,
+    ModelOutputLimit,
+    Model,
+    InputBudget,
+    RoundBudget,
+    Runtime,
+}
+
 /// What a long-running operation produced. The actor compares the identity
 /// (run/turn/operation/generation) with the current state and drops results
 /// that belong to a superseded turn instead of letting them race in.
@@ -59,6 +73,9 @@ pub enum OperationOutcome {
     /// checkpoint, a focus change).
     Completed,
     Failed {
+        class: RuntimeFailureClass,
+        #[serde(default)]
+        retryable: bool,
         message: String,
     },
     Cancelled,

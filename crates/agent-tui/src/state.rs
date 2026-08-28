@@ -653,6 +653,33 @@ impl AppState {
                 self.busy = false;
                 self.status = "recovery_required".into();
             }
+            RuntimeEvent::Failure {
+                class,
+                retryable,
+                message,
+            } => {
+                // A typed execution failure. A retryable failure leaves the
+                // turn busy (the runtime may retry); a terminal one stops
+                // the spinner. The class drives policy; the message is a
+                // bounded diagnostic only.
+                self.busy = retryable;
+                self.status = format!("failed ({class:?})");
+                self.push_system(format!(
+                    "execution failed ({class:?}{}): {message}",
+                    if retryable { ", retryable" } else { "" }
+                ));
+            }
+            RuntimeEvent::ModelRetrying {
+                attempt, delay_ms, ..
+            } => {
+                // Live-only progress signal: the transport is inside its
+                // bounded retry policy. Keep the spinner honest without
+                // clearing any in-flight operation state.
+                self.status = "model (retrying)".into();
+                self.push_system(format!(
+                    "model attempt {attempt} failed, retrying in {delay_ms} ms"
+                ));
+            }
             RuntimeEvent::RuntimeRestored {
                 checkpoint_version,
                 restored_run_id,
@@ -944,6 +971,58 @@ mod tests {
             app.messages
                 .iter()
                 .all(|message| !message.content.contains("LATE"))
+        );
+    }
+
+    #[test]
+    fn typed_failure_and_retry_progress_render_without_claiming_idle() {
+        let mut app = AppState::new(RunId::new());
+        let turn = TurnId::new();
+        let operation = OperationId::new();
+
+        // A retryable model failure keeps the spinner honest while the
+        // transport is inside its bounded retry policy.
+        app.apply_runtime_event(envelope(RuntimeEvent::ModelStarted {
+            turn_id: turn,
+            operation_id: operation,
+            generation: 6,
+            surface_revision: 1,
+            model_round: 1,
+            turn_checkpoint: Default::default(),
+            prompt_layers: Default::default(),
+        }));
+        app.apply_runtime_event(envelope(RuntimeEvent::ModelRetrying {
+            turn_id: turn,
+            operation_id: operation,
+            generation: 6,
+            attempt: 2,
+            delay_ms: 250,
+        }));
+        assert!(app.busy);
+        assert_eq!(app.status, "model (retrying)");
+        assert!(
+            app.messages
+                .last()
+                .expect("retry notice")
+                .content
+                .contains("retrying in 250 ms")
+        );
+
+        // A terminal typed failure stops the spinner and names the class in
+        // the system line; the policy class is never reconstructed from text.
+        app.apply_runtime_event(envelope(RuntimeEvent::Failure {
+            class: agent_contracts::RuntimeFailureClass::ProviderTransport,
+            retryable: false,
+            message: "window closed".into(),
+        }));
+        assert!(!app.busy);
+        assert_eq!(app.status, "failed (ProviderTransport)");
+        assert!(
+            app.messages
+                .last()
+                .expect("failure notice")
+                .content
+                .contains("execution failed (ProviderTransport): window closed")
         );
     }
 

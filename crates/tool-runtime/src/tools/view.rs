@@ -122,6 +122,69 @@ pub(crate) async fn missing_path_output(
     )
 }
 
+/// A file/directory mutation whose immediate parent is absent needs a
+/// different recovery than an observation miss. Name the first creatable
+/// component after the nearest existing parent, so the next `fs.mkdir` call
+/// can succeed even when several path components are absent.
+pub(crate) async fn missing_parent_output(
+    workspace: &Workspace,
+    call_id: &str,
+    tool_name: &str,
+    path: &str,
+) -> ToolOutput {
+    let missing_parent = parent_relative(path);
+    let (nearest_parent, entries) = parent_topology_hint(workspace, path).await;
+    let next_directory = first_missing_directory(&missing_parent, &nearest_parent);
+    let quoted = serde_json::to_string(&next_directory).unwrap_or_else(|_| "\"\"".into());
+    let recovery = format!(
+        "Call fs.mkdir {{\"path\":{quoted}}}; create one component at a time, then retry {tool_name}."
+    );
+    let listing = if entries.is_empty() {
+        "(none)".to_string()
+    } else {
+        entries.join(", ")
+    };
+    tool_failure_output(
+        call_id,
+        tool_name,
+        ToolFailureClass::PathNotFound,
+        format!("{tool_name} refused: parent_path_not_found"),
+        format!(
+            "parent directory `{missing_parent}` is missing for `{path}`.\nnearest existing parent: `{nearest_parent}`; entries: [{listing}]\n{recovery}"
+        ),
+        json!({
+            "path": path,
+            "missing_parent": missing_parent,
+            "nearest_existing_parent": nearest_parent,
+            "parent_entries": entries,
+            "next_directory": next_directory,
+            "recovery_hint": recovery,
+        }),
+    )
+}
+
+fn first_missing_directory(missing_parent: &str, nearest_parent: &str) -> String {
+    let normalized = missing_parent.replace('\\', "/");
+    let parts: Vec<_> = normalized
+        .split('/')
+        .filter(|part| !part.is_empty() && *part != ".")
+        .collect();
+    let existing_parts = if nearest_parent == "." || nearest_parent.is_empty() {
+        0
+    } else {
+        nearest_parent
+            .replace('\\', "/")
+            .split('/')
+            .filter(|part| !part.is_empty() && *part != ".")
+            .count()
+    };
+    parts
+        .into_iter()
+        .take(existing_parts.saturating_add(1))
+        .collect::<Vec<_>>()
+        .join("/")
+}
+
 async fn parent_topology_hint(workspace: &Workspace, path: &str) -> (String, Vec<String>) {
     let mut current = parent_relative(path);
     loop {
@@ -195,5 +258,12 @@ mod tests {
         assert!(!is_not_found_error(&AgentError::Io(
             "open C:\\tmp\\x: NTSTATUS 0xc0000022".into()
         )));
+    }
+
+    #[test]
+    fn first_missing_directory_advances_exactly_one_component() {
+        assert_eq!(first_missing_directory("a/b", "."), "a");
+        assert_eq!(first_missing_directory("a/b", "a"), "a/b");
+        assert_eq!(first_missing_directory("a\\b\\c", "a/b"), "a/b/c");
     }
 }

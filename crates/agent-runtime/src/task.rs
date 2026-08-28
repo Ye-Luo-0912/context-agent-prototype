@@ -84,8 +84,9 @@ pub struct TaskAnchor {
     /// every CAS replacement bumps it.
     pub revision: u64,
     /// Independent verification basis revision. Only boundary changes
-    /// (goal/constraints) bump it; autonomous progress patches keep it
-    /// stable so a Current verifier stays current through plan updates.
+    /// (goal / constraints / acceptance criteria) bump it; autonomous
+    /// progress patches keep it stable so a Current verifier stays
+    /// current through plan updates.
     #[serde(default)]
     pub verification_revision: u64,
     /// The user-given origin the task was created with. This is task
@@ -971,9 +972,10 @@ impl TaskManager {
             } => {
                 if let Some(task) = self.tasks.iter_mut().find(|task| task.id == target) {
                     if task.anchor.revision != replacement.revision && authority_changed {
-                        // Only a boundary change (goal/constraints) makes a
-                        // Current verifier stale. Progress-only CAS keeps
-                        // the verification basis untouched.
+                        // Only a boundary change (goal, constraints or
+                        // acceptance criteria) makes a Current verifier
+                        // stale. Progress-only CAS keeps the verification
+                        // basis untouched.
                         task.resume.mark_spec_changed();
                     }
                     task.resume.anchor_revision = replacement.revision;
@@ -1116,9 +1118,13 @@ pub(crate) fn normalize_anchor(anchor: &mut TaskAnchor) -> AgentResult<()> {
 /// Authority fields of the anchor: moving any of them is a boundary-class
 /// change that invalidates dependent verification. Everything else
 /// (interpretation, plan, open loops, next action, refs) advances only the
-/// record CAS.
+/// record CAS. Acceptance criteria move the basis too: they are the
+/// authoritative verdict the completion outcome is measured against, so a
+/// changed criterion requires fresh proof. Model-derived criteria remain
+/// proposals — `task.manage` cannot submit this field — so no criterion
+/// approval gate is implied here; only dependent verification is staled.
 fn is_authority_field(field: &str) -> bool {
-    matches!(field, "original_goal" | "constraints")
+    matches!(field, "original_goal" | "constraints" | "acceptance_criteria")
 }
 
 /// The capped list of anchor field names whose content differs from `old`,
@@ -1676,13 +1682,16 @@ mod tests {
         let mut evolved = evolved_anchor();
         evolved.original_goal = "task A".into();
         evolved.constraints.clear();
+        evolved.acceptance_criteria.clear();
         let (txn, revision, changed) = tasks
             .prepare_replace_anchor(id, 0, evolved)
             .expect("initial CAS is valid");
         assert!(
-            !changed
-                .iter()
-                .any(|field| field == "original_goal" || field == "constraints"),
+            !changed.iter().any(|field| {
+                field == "original_goal"
+                    || field == "constraints"
+                    || field == "acceptance_criteria"
+            }),
             "fixture must not touch authority fields, got {changed:?}"
         );
         tasks.commit(txn);
@@ -1706,6 +1715,222 @@ mod tests {
             VerificationState::Stale,
             "an authority-moving replace must stale the verifier"
         );
+    }
+
+    #[test]
+    fn verification_basis_consumers_agree_through_progress_boundary_and_restore() {
+        use crate::checkpoint::{TaskManagerSnapshot, TaskRecordSnapshot};
+        use crate::execution::{
+            ExecutionState, ResourceFact, ResourceProvenance, RuntimeExecutionAttribution,
+            VerificationState,
+        };
+        use crate::opportunity::derive_completion_opportunity;
+        use agent_contracts::{
+            ResourceFreshness, ToolExecutionAttribution, ToolExecutionPurpose,
+            VerificationReuse,
+        };
+        use serde_json::json;
+
+        let mut tasks = TaskManager::new();
+        let id = create(&mut tasks, "goal");
+
+        // One committed world: a durable mutation stamp plus a trusted
+        // exact-verification PASS. The whole-record CAS revision and the
+        // verification basis start at 0 and stay bound together.
+        let mut resume = ExecutionState {
+            directive_revision: 1,
+            workspace_revision: 1,
+            ..ExecutionState::default()
+        };
+        resume.checked_files.push(ResourceFact {
+            path: "src/lib.rs".into(),
+            digest: "deadbeef".into(),
+            freshness: ResourceFreshness::Fresh,
+            turn: 1,
+            provenance: ResourceProvenance::MutationResult,
+        });
+        let exact = RuntimeExecutionAttribution {
+            host: ToolExecutionAttribution::bounded(
+                ToolExecutionPurpose::Verify,
+                Vec::<String>::new(),
+                VerificationReuse::ExactCurrentWorld,
+            )
+            .with_verification_identity_material("test-runner:v2|env:win"),
+            rooted_targets: Vec::new(),
+        };
+        let verify = agent_contracts::ToolOutput {
+            call_id: "v".into(),
+            tool_name: "test.verify".into(),
+            ok: true,
+            summary: "ok".into(),
+            model_content: "tests passed".into(),
+            artifact_ref: None,
+            metadata: json!({"verification": true}),
+        };
+        resume.observe_tool_attributed(&verify, 0, 1, "arg-verify", &exact);
+        tasks.install_resume(id, resume);
+        assert_eq!(
+            tasks.get(id).unwrap().resume.validity(),
+            VerificationState::Current
+        );
+
+        // Progress-only CAS: the record revision advances, the verification
+        // basis does not, and every consumer agrees the PASS is still
+        // current — ActiveTurn validity, completion, exact reuse and the
+        // derived closure opportunity all accept the same fact.
+        let (txn, revision, _, kind) = tasks
+            .prepare_patch_anchor(
+                id,
+                0,
+                &AnchorPatch {
+                    next_action: Some("continue".into()),
+                    ..AnchorPatch::default()
+                },
+            )
+            .unwrap();
+        assert_eq!(kind, AnchorPatchKind::Autonomous);
+        tasks.commit(txn);
+        let task = tasks.get(id).unwrap();
+        assert_eq!(task.anchor.revision, revision);
+        assert_eq!(task.anchor.verification_revision, 0);
+        assert_eq!(task.resume.verification.spec_revision, 0);
+        assert_eq!(task.resume.validity(), VerificationState::Current);
+        assert!(
+            matches!(
+                completion_from_execution(&task.resume)
+                    .unwrap()
+                    .0,
+                CompletionVerificationStatus::Current
+            ),
+            "progress-only CAS must keep completion verification Current"
+        );
+        assert!(
+            task.resume
+                .current_exact_verification_pass(
+                    "test.verify",
+                    "arg-verify",
+                    0,
+                    &exact
+                )
+                .is_some(),
+            "progress-only CAS must keep exact reuse on the same basis"
+        );
+        let decision = derive_completion_opportunity(
+            id,
+            &task.anchor,
+            &task.resume,
+            false,
+            false,
+            false,
+        );
+        assert!(
+            decision.ready.is_some(),
+            "progress-only CAS must keep the derived opportunity eligible"
+        );
+
+        // A trusted acceptance-criteria change moves the basis without
+        // entering the approval gate (model-derived criteria stay
+        // proposals; only dependent verification is staled). Every consumer
+        // now agrees the old PASS is stale.
+        let (txn, revision, _, kind) = tasks
+            .prepare_patch_anchor(
+                id,
+                1,
+                &AnchorPatch {
+                    acceptance_criteria: Some(vec!["api unchanged".into()]),
+                    ..AnchorPatch::default()
+                },
+            )
+            .unwrap();
+        assert_eq!(
+            kind,
+            AnchorPatchKind::Autonomous,
+            "criteria changes stay out of the approval gate; the basis moves"
+        );
+        tasks.commit(txn);
+        let task = tasks.get(id).unwrap();
+        assert_eq!(task.anchor.revision, revision);
+        assert_eq!(task.anchor.verification_revision, 1);
+        assert_eq!(task.resume.verification.spec_revision, 1);
+        assert_eq!(task.resume.validity(), VerificationState::Stale);
+        assert!(
+            matches!(
+                completion_from_execution(&task.resume)
+                    .unwrap()
+                    .0,
+                CompletionVerificationStatus::Unverified
+            ),
+            "a moved basis must downgrade completion verification"
+        );
+        assert!(
+            task.resume
+                .current_exact_verification_pass(
+                    "test.verify",
+                    "arg-verify",
+                    1,
+                    &exact
+                )
+                .is_none(),
+            "a moved basis must refuse exact reuse of the old PASS"
+        );
+        let decision = derive_completion_opportunity(
+            id,
+            &task.anchor,
+            &task.resume,
+            false,
+            false,
+            false,
+        );
+        assert!(
+            decision.ready.is_none(),
+            "a moved basis must block the derived opportunity"
+        );
+
+        // Checkpoint round-trip: the anchor/revision binding survives
+        // serialization and restore, and the restored consumers agree with
+        // the live ones.
+        let task = tasks.get(id).unwrap();
+        let snapshot = TaskManagerSnapshot {
+            tasks: vec![TaskRecordSnapshot {
+                id,
+                goal: task.goal.clone(),
+                status: TaskStatus::Active,
+                created_at_ms: 0,
+                last_active_ms: 0,
+                tool_requirements: task.tool_requirements.clone(),
+                anchor: task.anchor.clone(),
+                resume: task.resume.clone(),
+                turn_intent: String::new(),
+            }],
+            active: Some(id),
+            completed: Vec::new(),
+        };
+        let encoded = serde_json::to_string(&snapshot).unwrap();
+        let mut restored = TaskManager::new();
+        restored.restore(serde_json::from_str(&encoded).unwrap());
+        let task = restored.get(id).unwrap();
+        assert_eq!(task.anchor.verification_revision, 1);
+        assert_eq!(task.resume.verification.spec_revision, 1);
+        assert_eq!(task.resume.validity(), VerificationState::Stale);
+        assert!(
+            task.resume
+                .current_exact_verification_pass(
+                    "test.verify",
+                    "arg-verify",
+                    1,
+                    &exact
+                )
+                .is_none()
+        );
+        let decision = derive_completion_opportunity(
+            id,
+            &task.anchor,
+            &task.resume,
+            false,
+            false,
+            false,
+        );
+        assert!(decision.ready.is_none());
     }
 
     #[test]

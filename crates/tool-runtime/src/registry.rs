@@ -27,7 +27,7 @@ use sha2::{Digest, Sha256};
 
 use crate::tools::{
     ArtifactReadTool, CodeDiagnosticsTool, CodeSymbolsTool, ContextManageTool, EditPatchTool,
-    EditReplaceTool, FsListTool, FsReadTool, FsWriteTool, GitDiffTool, GitStatusTool,
+    EditReplaceTool, FsListTool, FsMkdirTool, FsReadTool, FsWriteTool, GitDiffTool, GitStatusTool,
     ProcessRunTool, ProcessSession, ProcessSessionTool, SearchGrepTool, ShellExecTool,
     TaskCompleteTool, TaskManageTool, Tool, VerificationRunTool,
 };
@@ -168,6 +168,7 @@ impl BuiltinToolDispatcher {
             Arc::new(FsReadTool::new(workspace.clone())),
             Arc::new(ArtifactReadTool::new(workspace.clone())),
             Arc::new(FsWriteTool::new(workspace.clone())),
+            Arc::new(FsMkdirTool::new(workspace.clone())),
             Arc::new(SearchGrepTool::new(workspace.clone())),
             Arc::new(EditReplaceTool::new(workspace.clone())),
             Arc::new(EditPatchTool::new(workspace.clone())),
@@ -796,7 +797,7 @@ impl BuiltinToolDispatcher {
             "fs.list" | "search.grep" | "code.symbols" | "code.diagnostics" => {
                 ToolExecutionPurpose::Search
             }
-            "fs.write" | "edit.replace" | "edit.patch" => ToolExecutionPurpose::Mutate,
+            "fs.write" | "fs.mkdir" | "edit.replace" | "edit.patch" => ToolExecutionPurpose::Mutate,
             "shell.exec" | "process.run" | "process.session" => ToolExecutionPurpose::Opaque,
             CAPABILITY_MANAGE | "context.manage" | "task.complete" => ToolExecutionPurpose::Control,
             "git.status" | "git.diff" | "artifact.read" => ToolExecutionPurpose::Observe,
@@ -809,6 +810,7 @@ impl BuiltinToolDispatcher {
                 | "fs.list"
                 | "search.grep"
                 | "fs.write"
+                | "fs.mkdir"
                 | "edit.replace"
                 | "git.diff"
                 | "code.symbols"
@@ -1295,6 +1297,17 @@ mod tests {
         assert!(names.contains(&"git.status".to_string()));
         assert!(names.contains(&"git.diff".to_string()));
         assert!(names.contains(&"fs.write".to_string()));
+        assert!(
+            !names.contains(&"fs.mkdir".to_string()),
+            "directory topology stays catalog-cold until the measured surface gate"
+        );
+        assert!(
+            dispatcher
+                .catalog()
+                .iter()
+                .any(|entry| entry.name == "fs.mkdir"),
+            "fs.mkdir must remain discoverable even while absent from the default surface"
+        );
     }
 
     #[tokio::test]

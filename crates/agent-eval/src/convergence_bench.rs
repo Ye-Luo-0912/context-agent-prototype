@@ -141,6 +141,7 @@ async fn run_session(
         max_tool_rounds: Some(32),
         project_task_progress: true,
         project_completion_opportunity: false,
+        recovery_surface: false,
         host_policies: Some(Arc::new(
             agent_compose::HostToolPolicyRegistry::with_builtins_and_verification(
                 &verification_recipes,

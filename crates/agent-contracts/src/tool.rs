@@ -576,7 +576,7 @@ impl ToolSemanticRole {
             | CAPABILITY_MANAGE | CAPABILITY_SEARCH => Some(Self::Search),
             "git.diff" | "git.status" | "git.log" | "code.diagnostics" => Some(Self::InspectDiff),
             "verify.run" => Some(Self::Verify),
-            "fs.write" | "edit.replace" | "edit.patch" => Some(Self::Mutate),
+            "fs.write" | "fs.mkdir" | "edit.replace" | "edit.patch" => Some(Self::Mutate),
             "shell.exec" | "process.run" | "process.session" => Some(Self::EscapeHatch),
             _ => None,
         }
@@ -772,6 +772,7 @@ impl ToolOutput {
         matches!(
             self.tool_name.as_str(),
             "fs.write"
+                | "fs.mkdir"
                 | "edit.replace"
                 | "edit.patch"
                 | "shell.exec"
@@ -1549,8 +1550,9 @@ impl ToolExecutionRequest {
 
 /// One canonical actual workspace write a prepared effect will perform:
 /// the real relative path and the real byte count of the content being
-/// written (). Unlike [`WorkspaceWriteBound::max_bytes`] this
-/// is not an estimate — it is measured from what was actually staged.
+/// written. A topology-only effect reports zero bytes for its exact path.
+/// Unlike [`WorkspaceWriteBound::max_bytes`] this is not an estimate — it is
+/// measured from what was actually staged.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ActualWorkspaceWrite {
     pub path: String,
@@ -2190,9 +2192,10 @@ pub enum ToolSurfaceBlockReason {
 
 /// Which authority put one tool into the round surface. Rows with the same
 /// `demand` can now answer whether they entered because of Task intent, a
-/// fail-closed dispatcher/core policy, or an ordinary catalog load. `Unknown`
-/// marks rows predating per-row provenance (old journal events), so no
-/// legacy row ever pretends to know its source.
+/// fail-closed dispatcher/core policy, an ordinary catalog load, or a
+/// trusted runtime-derived recovery signal. `Unknown` marks rows predating
+/// per-row provenance (old journal events), so no legacy row ever pretends
+/// to know its source.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Default, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ToolSurfaceOrigin {
@@ -2205,6 +2208,11 @@ pub enum ToolSurfaceOrigin {
     DispatcherRequired,
     /// Loaded optional from the catalog (e.g. `capability.load`).
     CatalogLoadedOptional,
+    /// Trusted runtime-derived recovery: a typed tool result proved the
+    /// next decision needs this exact host-owned tool (for example a
+    /// `parent_path_not_found` refusal surfaces `fs.mkdir` for one
+    /// decision). The model cannot mint this origin.
+    RecoverySurface,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

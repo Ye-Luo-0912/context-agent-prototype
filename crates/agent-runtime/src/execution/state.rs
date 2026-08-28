@@ -489,7 +489,7 @@ impl ExecutionState {
         if self.verification.failed_open || self.last_evidence().is_some_and(|ev| !ev.ok) {
             return VerificationState::Failed;
         }
-        let Some(_last) = self.last_evidence() else {
+        let Some(last) = self.last_evidence() else {
             return if self.verification.cause != VerificationCause::None
                 || self.verification.required_for_completion
             {
@@ -501,7 +501,12 @@ impl ExecutionState {
         if self.verification.source_changed
             || self.unknown_blocks_current()
             || self.verification.cause == VerificationCause::SpecChanged
+            || last.anchor_revision != self.verification.spec_revision
         {
+            // The last row is bound to a different verification basis than
+            // the current one. Authority movement is normally surfaced
+            // through `SpecChanged`, but this binding check keeps every
+            // consumer honest if the basis moves without that side effect.
             return VerificationState::Stale;
         }
         VerificationState::Current
@@ -1433,11 +1438,14 @@ impl ExecutionState {
     /// 要求同 scope 且同前置指纹的成功（"同类成功"太宽：rustc 编译成功
     /// 不能证明 tests.exe 的解析 blocker 已解决）；世界推进只把 epoch
     /// 推进一格（PreconditionChanged ≠ Resolved）。EditTarget 以新
-    /// digest 落地、ResourcePath 被 Known mutation 触碰或出现 Fresh
-    /// 事实、ProjectMarker 被触碰——这些本身就是 blocker 消失的证明。
+    /// digest 落地，或被失败之后的可信当前验证 supersede；ResourcePath
+    /// 被 Known mutation 触碰或出现 Fresh 事实、ProjectMarker 被触碰——
+    /// 这些本身就是 blocker 消失的证明。验证只能来自调用方传入的可信
+    /// pre-dispatch attribution，不能由 ToolOutput metadata 自行声明。
     pub(super) fn resolve_obligations(
         &mut self,
         output: &ToolOutput,
+        trusted_verification_pass: bool,
         events: &mut Vec<agent_contracts::ExecutionObligationEvent>,
     ) {
         let launch_ok = output.ok && is_command_tool(&output.tool_name);
@@ -1517,7 +1525,9 @@ impl ExecutionState {
                         .rsplit_once('@')
                         .map(|(_, rev)| rev)
                         .unwrap_or_default();
-                    if fresh.get(path).is_some_and(|digest| *digest != old) {
+                    if trusted_verification_pass
+                        || fresh.get(path).is_some_and(|digest| *digest != old)
+                    {
                         Outcome::Resolve
                     } else {
                         Outcome::Keep

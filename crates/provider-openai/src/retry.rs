@@ -140,6 +140,11 @@ impl<T: ModelTransport> RetryingTransport<T> {
                     }
                     attempt += 1;
                     let delay = self.base_delay * 2u32.pow(attempt.saturating_sub(1));
+                    sink.on_chunk(ModelChunk::Retrying {
+                        attempt: attempt + 1,
+                        delay_ms: delay.as_millis().min(u64::MAX as u128) as u64,
+                    })
+                    .await?;
                     tokio::select! {
                         _ = request.cancel.cancelled() => return Err(AgentError::Cancelled),
                         _ = tokio::time::sleep(delay) => {}
@@ -185,6 +190,11 @@ impl<T: ModelTransport> RetryingTransport<T> {
                     }
                     attempt += 1;
                     let delay = self.base_delay * 2u32.pow(attempt.saturating_sub(1));
+                    sink.on_chunk(ModelChunk::Retrying {
+                        attempt: attempt + 1,
+                        delay_ms: delay.as_millis().min(u64::MAX as u128) as u64,
+                    })
+                    .await?;
                     tokio::select! {
                         _ = request.cancel.cancelled() => return Err(AgentError::Cancelled),
                         _ = tokio::time::sleep(delay) => {}
@@ -546,12 +556,16 @@ mod tests {
         assert_eq!(
             &chunks[..],
             &[
+                ModelChunk::Retrying {
+                    attempt: 2,
+                    delay_ms: 1,
+                },
                 ModelChunk::TextDelta {
                     delta: "hello".into()
                 },
                 ModelChunk::Done,
             ],
-            "the listener must see exactly one stream's output"
+            "the listener sees retry progress and exactly one stream's output"
         );
     }
 
@@ -580,8 +594,14 @@ mod tests {
         let chunks = sink.chunks.lock().unwrap();
         assert_eq!(
             &chunks[..],
-            &[ModelChunk::Done],
-            "the listener must see only the successful attempt"
+            &[
+                ModelChunk::Retrying {
+                    attempt: 2,
+                    delay_ms: 1,
+                },
+                ModelChunk::Done,
+            ],
+            "the listener sees retry progress and only the successful attempt"
         );
     }
 
@@ -640,7 +660,20 @@ mod tests {
             "the last retryable failure must surface, got: {error}"
         );
         assert_eq!(calls.load(Ordering::SeqCst), 3);
-        assert!(sink.chunks.lock().unwrap().is_empty());
+        assert_eq!(
+            &sink.chunks.lock().unwrap()[..],
+            &[
+                ModelChunk::Retrying {
+                    attempt: 2,
+                    delay_ms: 1,
+                },
+                ModelChunk::Retrying {
+                    attempt: 3,
+                    delay_ms: 2,
+                },
+            ],
+            "retry progress stays observable even when all attempts fail"
+        );
     }
 
     #[tokio::test]

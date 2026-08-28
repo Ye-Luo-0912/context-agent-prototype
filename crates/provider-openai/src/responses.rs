@@ -20,6 +20,14 @@ struct AccFunctionCall {
 pub struct ResponseStreamError {
     pub message: String,
     pub retryable: bool,
+    pub kind: ResponseStreamErrorKind,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ResponseStreamErrorKind {
+    Transport,
+    OutputLimit,
+    Model,
 }
 
 /// Accumulates the small subset of Responses events the coding runtime owns:
@@ -137,9 +145,22 @@ impl ResponsesAccumulator {
                             .and_then(Value::as_str)
                     })
                     .unwrap_or("Responses stream did not complete");
+                let incomplete =
+                    event.get("type").and_then(Value::as_str) == Some("response.incomplete");
+                let output_limit = response
+                    .pointer("/incomplete_details/reason")
+                    .and_then(Value::as_str)
+                    == Some("max_output_tokens");
                 self.terminal_error = Some(ResponseStreamError {
                     retryable: retryable_stream_error(response),
                     message: message.to_string(),
+                    kind: if output_limit {
+                        ResponseStreamErrorKind::OutputLimit
+                    } else if incomplete {
+                        ResponseStreamErrorKind::Model
+                    } else {
+                        ResponseStreamErrorKind::Transport
+                    },
                 });
             }
             "error" => {
@@ -151,6 +172,7 @@ impl ResponsesAccumulator {
                 self.terminal_error = Some(ResponseStreamError {
                     retryable: retryable_stream_error(error),
                     message: message.to_string(),
+                    kind: ResponseStreamErrorKind::Transport,
                 });
             }
             _ => {}
@@ -293,5 +315,34 @@ mod tests {
         let error = accumulator.take_terminal_error().unwrap();
         assert!(error.retryable);
         assert_eq!(error.message, "link dropped");
+        assert_eq!(error.kind, ResponseStreamErrorKind::Transport);
+    }
+
+    #[test]
+    fn max_output_tokens_is_a_model_limit_not_a_transport_outage() {
+        let mut accumulator = ResponsesAccumulator::default();
+        accumulator.apply(&json!({
+            "type": "response.incomplete",
+            "response": {
+                "incomplete_details": {"reason": "max_output_tokens"},
+                "usage": {"input_tokens": 120, "output_tokens": 4096}
+            }
+        }));
+        let error = accumulator.take_terminal_error().unwrap();
+        assert!(!error.retryable);
+        assert_eq!(error.message, "max_output_tokens");
+        assert_eq!(error.kind, ResponseStreamErrorKind::OutputLimit);
+    }
+
+    #[test]
+    fn other_incomplete_reasons_are_model_outcomes() {
+        let mut accumulator = ResponsesAccumulator::default();
+        accumulator.apply(&json!({
+            "type": "response.incomplete",
+            "response": {"incomplete_details": {"reason": "content_filter"}}
+        }));
+        let error = accumulator.take_terminal_error().unwrap();
+        assert!(!error.retryable);
+        assert_eq!(error.kind, ResponseStreamErrorKind::Model);
     }
 }

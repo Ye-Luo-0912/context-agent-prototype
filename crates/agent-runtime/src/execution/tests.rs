@@ -7,8 +7,8 @@ use super::state::{
 use super::*;
 use agent_contracts::{
     MAX_TASK_ANCHOR_ITEM_CHARS, NegativeFactEventKind, ResourceFreshness, ResourceVersionOracle,
-    ToolExecutionAttribution, ToolExecutionFacts, ToolExecutionPurpose, ToolOutput,
-    ToolResultDisposition, TurnFrame, VerificationReuse,
+    ToolExecutionAttribution, ToolExecutionFacts, ToolExecutionPurpose, ToolFailureDomain,
+    ToolOutput, ToolResultDisposition, TurnFrame, VerificationReuse,
 };
 use serde_json::json;
 
@@ -1304,9 +1304,56 @@ fn edit_target_obligation_resolves_only_at_new_digest() {
     resume.observe_tool(&read_output("src/auth.rs", "rOLD"), 1, 2);
     assert_eq!(resume.obligations.len(), 1);
 
-    // 文件移动到新身份：唯一解除方式。
+    // 文件移动到新身份可以解除。
     resume.observe_tool(&read_output("src/auth.rs", "rNEW"), 1, 3);
     assert!(resume.obligations.is_empty());
+}
+
+#[test]
+fn trusted_verification_supersedes_a_stale_edit_plan() {
+    let mut state = ExecutionState::default();
+    let mut refusal = output("edit.replace", false, "stale");
+    refusal.metadata = json!({
+        "path": "src/auth.rs",
+        "revision": "rCURRENT",
+        "failure_class": "stale_revision",
+    });
+    state.observe_tool(&refusal, 1, 1);
+    assert_eq!(state.obligations.len(), 1);
+
+    // Provider/plugin metadata cannot retire a blocker by declaring itself
+    // a verifier. The authority must come from trusted pre-dispatch facts.
+    let mut verify = output("verify.run", true, "tests passed");
+    verify.metadata = json!({"verification": true});
+    state.observe_tool(&verify, 1, 2);
+    assert_eq!(
+        state.obligations.len(),
+        1,
+        "legacy producer metadata may record evidence but cannot retire an obligation"
+    );
+    state.observe_tool_attributed(
+        &verify,
+        1,
+        3,
+        "untrusted-verify",
+        &RuntimeExecutionAttribution::default(),
+    );
+    assert_eq!(state.obligations.len(), 1);
+
+    let trusted = RuntimeExecutionAttribution {
+        host: ToolExecutionAttribution::bounded(
+            ToolExecutionPurpose::Verify,
+            Vec::<String>::new(),
+            VerificationReuse::TaskScoped,
+        ),
+        rooted_targets: Vec::new(),
+    };
+    let observation = state.observe_tool_attributed(&verify, 1, 4, "trusted-verify", &trusted);
+    assert!(state.obligations.is_empty());
+    assert!(observation.obligation_events.iter().any(|event| {
+        event.kind == agent_contracts::ObligationEventKind::Resolved
+            && event.domain == ToolFailureDomain::EditTarget
+    }));
 }
 
 #[test]

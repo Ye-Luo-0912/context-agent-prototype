@@ -20,7 +20,8 @@ use uuid::Uuid;
 use crate::{ConfinedDir, MAX_MUTATION_BYTES, Workspace, clean_relative};
 
 const LEGACY_JOURNAL_VERSION: u32 = 1;
-const JOURNAL_VERSION: u32 = 2;
+const FILE_DIGEST_JOURNAL_VERSION: u32 = 2;
+const JOURNAL_VERSION: u32 = 3;
 const MAX_FRAME_BYTES: usize = 16 * 1024;
 const MAX_FILE_BYTES: u64 = 256 * 1024 * 1024;
 const MAX_RECORDS: usize = 65_536;
@@ -57,13 +58,36 @@ enum JournalTransition {
         bytes_before: Option<u64>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         bytes_after: Option<u64>,
+        /// V3 distinguishes content-bearing file replacement from an
+        /// identity-bearing directory creation. Omitted means File so v1/v2
+        /// frames reserialize byte-for-byte for checksum verification.
+        #[serde(default, skip_serializing_if = "WorkspaceEntryKind::is_file")]
+        entry_kind: WorkspaceEntryKind,
     },
     Committed {
         tx_id: String,
+        /// Stable identity is mandatory for a V3 directory commit and
+        /// omitted for file commits and all legacy frames.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        entry_identity: Option<String>,
     },
     RolledBack {
         tx_id: String,
     },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum WorkspaceEntryKind {
+    #[default]
+    File,
+    Directory,
+}
+
+impl WorkspaceEntryKind {
+    fn is_file(&self) -> bool {
+        *self == Self::File
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -79,9 +103,9 @@ struct StoredFrame {
     checksum: String,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 enum TxTerminal {
-    Committed,
+    Committed { entry_identity: Option<String> },
     RolledBack,
 }
 
@@ -96,6 +120,7 @@ struct TxEvidence {
     after_hash: String,
     bytes_before: Option<u64>,
     bytes_after: Option<u64>,
+    entry_kind: WorkspaceEntryKind,
     terminal: Option<TxTerminal>,
 }
 
@@ -109,6 +134,7 @@ pub(crate) struct PreparedEvidence {
     pub after_hash: String,
     pub bytes_before: u64,
     pub bytes_after: u64,
+    pub entry_kind: WorkspaceEntryKind,
 }
 
 #[derive(Debug, Default, Clone)]
@@ -226,12 +252,25 @@ impl WorkspaceEffectJournal {
             after_hash: evidence.after_hash,
             bytes_before: Some(evidence.bytes_before),
             bytes_after: Some(evidence.bytes_after),
+            entry_kind: evidence.entry_kind,
         })
     }
 
     pub(crate) fn append_committed(&self, tx_id: &str) -> AgentResult<()> {
         self.append(JournalTransition::Committed {
             tx_id: tx_id.to_string(),
+            entry_identity: None,
+        })
+    }
+
+    pub(crate) fn append_directory_committed(
+        &self,
+        tx_id: &str,
+        entry_identity: String,
+    ) -> AgentResult<()> {
+        self.append(JournalTransition::Committed {
+            tx_id: tx_id.to_string(),
+            entry_identity: Some(entry_identity),
         })
     }
 
@@ -303,7 +342,10 @@ impl WorkspaceEffectJournal {
 }
 
 fn validate_transition(version: u32, transition: &JournalTransition) -> Result<(), String> {
-    if version != LEGACY_JOURNAL_VERSION && version != JOURNAL_VERSION {
+    if !matches!(
+        version,
+        LEGACY_JOURNAL_VERSION | FILE_DIGEST_JOURNAL_VERSION | JOURNAL_VERSION
+    ) {
         return Err("unsupported workspace effect journal version".into());
     }
     match transition {
@@ -312,19 +354,17 @@ fn validate_transition(version: u32, transition: &JournalTransition) -> Result<(
             context,
             relative_target,
             temp_name,
+            target_existed,
             before_hash,
             after_hash,
             bytes_before,
             bytes_after,
+            entry_kind,
             ..
         } => {
             context.validate()?;
-            if Uuid::parse_str(tx_id).is_err()
-                || temp_name.len() > 255
-                || !temp_name.ends_with(".tmp")
-                || Path::new(temp_name).components().count() != 1
-            {
-                return Err("invalid workspace effect transaction/temp identity".into());
+            if Uuid::parse_str(tx_id).is_err() {
+                return Err("invalid workspace effect transaction identity".into());
             }
             let clean =
                 clean_relative(Path::new(relative_target)).map_err(|error| error.to_string())?;
@@ -334,8 +374,29 @@ fn validate_transition(version: u32, transition: &JournalTransition) -> Result<(
             {
                 return Err("workspace effect path/hash exceeds its bound".into());
             }
-            match version {
-                LEGACY_JOURNAL_VERSION => {
+            if version < JOURNAL_VERSION && *entry_kind != WorkspaceEntryKind::File {
+                return Err("legacy workspace effect cannot contain a directory entry".into());
+            }
+            match entry_kind {
+                WorkspaceEntryKind::Directory => {
+                    if version != JOURNAL_VERSION
+                        || !temp_name.is_empty()
+                        || *target_existed
+                        || !before_hash.is_empty()
+                        || !after_hash.is_empty()
+                        || *bytes_before != Some(0)
+                        || *bytes_after != Some(0)
+                    {
+                        return Err("invalid workspace directory effect evidence".into());
+                    }
+                }
+                WorkspaceEntryKind::File if version == LEGACY_JOURNAL_VERSION => {
+                    if temp_name.len() > 255
+                        || !temp_name.ends_with(".tmp")
+                        || Path::new(temp_name).components().count() != 1
+                    {
+                        return Err("invalid workspace effect temp identity".into());
+                    }
                     if bytes_before.is_some()
                         || bytes_after.is_some()
                         || !valid_hex_digest(before_hash, 16)
@@ -344,10 +405,16 @@ fn validate_transition(version: u32, transition: &JournalTransition) -> Result<(
                         return Err("invalid legacy workspace effect hash/length".into());
                     }
                 }
-                JOURNAL_VERSION => {
+                WorkspaceEntryKind::File => {
+                    if temp_name.len() > 255
+                        || !temp_name.ends_with(".tmp")
+                        || Path::new(temp_name).components().count() != 1
+                    {
+                        return Err("invalid workspace effect temp identity".into());
+                    }
                     let (Some(bytes_before), Some(bytes_after)) = (*bytes_before, *bytes_after)
                     else {
-                        return Err("workspace effect v2 requires byte lengths".into());
+                        return Err("workspace file effect requires byte lengths".into());
                     };
                     if temp_name != &format!(".fa-{tx_id}.tmp")
                         || bytes_before > MAX_MUTATION_BYTES as u64
@@ -355,14 +422,27 @@ fn validate_transition(version: u32, transition: &JournalTransition) -> Result<(
                         || !valid_hex_digest(before_hash, 64)
                         || !valid_hex_digest(after_hash, 64)
                     {
-                        return Err("invalid workspace effect v2 digest/length".into());
+                        return Err("invalid workspace file effect digest/length".into());
                     }
                 }
-                _ => unreachable!("journal version checked above"),
             }
             Ok(())
         }
-        JournalTransition::Committed { tx_id } | JournalTransition::RolledBack { tx_id } => {
+        JournalTransition::Committed {
+            tx_id,
+            entry_identity,
+        } => {
+            if Uuid::parse_str(tx_id).is_err()
+                || entry_identity
+                    .as_deref()
+                    .is_some_and(|identity| !valid_entry_identity(identity))
+            {
+                Err("invalid workspace committed transaction".into())
+            } else {
+                Ok(())
+            }
+        }
+        JournalTransition::RolledBack { tx_id } => {
             if Uuid::parse_str(tx_id).is_ok() {
                 Ok(())
             } else {
@@ -370,6 +450,14 @@ fn validate_transition(version: u32, transition: &JournalTransition) -> Result<(
             }
         }
     }
+}
+
+fn valid_entry_identity(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 160
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || byte == b':' || byte == b'-')
 }
 
 fn validate_fold(state: &RecoveryState, transition: &JournalTransition) -> Result<(), String> {
@@ -402,7 +490,26 @@ fn validate_fold(state: &RecoveryState, transition: &JournalTransition) -> Resul
             }
             Ok(())
         }
-        JournalTransition::Committed { tx_id } | JournalTransition::RolledBack { tx_id } => {
+        JournalTransition::Committed {
+            tx_id,
+            entry_identity,
+        } => {
+            let evidence = state.transactions.get(tx_id).ok_or_else(|| {
+                format!("terminal workspace transaction {tx_id} has no prepared record")
+            })?;
+            if evidence.terminal.is_some() {
+                return Err(format!(
+                    "workspace transaction {tx_id} has duplicate/conflicting terminal state"
+                ));
+            }
+            if (evidence.entry_kind == WorkspaceEntryKind::Directory) != entry_identity.is_some() {
+                return Err(format!(
+                    "workspace transaction {tx_id} committed identity does not match its entry kind"
+                ));
+            }
+            Ok(())
+        }
+        JournalTransition::RolledBack { tx_id } => {
             let evidence = state.transactions.get(tx_id).ok_or_else(|| {
                 format!("terminal workspace transaction {tx_id} has no prepared record")
             })?;
@@ -439,6 +546,7 @@ fn apply_transition(
             after_hash,
             bytes_before,
             bytes_after,
+            entry_kind,
         } => {
             state.transactions.insert(
                 tx_id.clone(),
@@ -452,16 +560,22 @@ fn apply_transition(
                     after_hash: after_hash.clone(),
                     bytes_before: *bytes_before,
                     bytes_after: *bytes_after,
+                    entry_kind: *entry_kind,
                     terminal: None,
                 },
             );
         }
-        JournalTransition::Committed { tx_id } => {
+        JournalTransition::Committed {
+            tx_id,
+            entry_identity,
+        } => {
             state
                 .transactions
                 .get_mut(tx_id)
                 .ok_or_else(|| "missing prepared transaction".to_string())?
-                .terminal = Some(TxTerminal::Committed)
+                .terminal = Some(TxTerminal::Committed {
+                entry_identity: entry_identity.clone(),
+            })
         }
         JournalTransition::RolledBack { tx_id } => {
             state
@@ -559,8 +673,10 @@ fn recover_file(file: &mut File, path: &Path) -> AgentResult<RecoveryState> {
         if frame.checksum != checksum_hex(&payload) {
             return Err(corrupt(path, "checksum mismatch"));
         }
-        if frame.record.version != LEGACY_JOURNAL_VERSION && frame.record.version != JOURNAL_VERSION
-        {
+        if !matches!(
+            frame.record.version,
+            LEGACY_JOURNAL_VERSION | FILE_DIGEST_JOURNAL_VERSION | JOURNAL_VERSION
+        ) {
             return Err(corrupt(path, "unsupported version"));
         }
         if frame.record.seq != state.last_seq + 1 {
@@ -605,6 +721,7 @@ fn corrupt(path: &Path, detail: &str) -> AgentError {
 enum CurrentTarget {
     Missing,
     File { bytes: u64, hash: String },
+    Directory { identity: String },
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -735,6 +852,23 @@ fn inspect_target(
                 )));
             }
         }
+    }
+    if evidence.entry_kind == WorkspaceEntryKind::Directory {
+        return match parent.open_child_dir(name) {
+            Ok(child) => Ok(CurrentTarget::Directory {
+                identity: child.entry_identity().map_err(|error| {
+                    AgentError::RecoveryRequired(format!(
+                        "identify reconciliation directory: {error}"
+                    ))
+                })?,
+            }),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                Ok(CurrentTarget::Missing)
+            }
+            Err(error) => Err(AgentError::RecoveryRequired(format!(
+                "open reconciliation directory: {error}"
+            ))),
+        };
     }
     match parent.open_recovery_target(name) {
         Ok(mut file) => {
@@ -901,6 +1035,49 @@ pub(crate) fn reconcile_workspace_effect(
     let mut read_budget = RecoveryReadBudget::new();
     for (tx_id, evidence) in &entries {
         let state = inspect_target(workspace, evidence, &mut read_budget)?;
+        if evidence.entry_kind == WorkspaceEntryKind::Directory {
+            match (&evidence.terminal, &state) {
+                (
+                    Some(TxTerminal::Committed {
+                        entry_identity: Some(expected),
+                    }),
+                    CurrentTarget::Directory { identity },
+                ) if expected == identity => {
+                    applied += 1;
+                    durably_committed += 1;
+                }
+                // A rolled-back directory effect durably proves that this
+                // transaction did not leave a directory behind. The name
+                // may legitimately be populated later by another actor.
+                (Some(TxTerminal::RolledBack), _) => {}
+                (None, CurrentTarget::Missing) => {
+                    not_applied.push((tx_id.clone(), evidence.clone()));
+                }
+                (None, CurrentTarget::Directory { .. }) => {
+                    return Ok(ambiguous(
+                        tx_ids,
+                        format!(
+                            "prepared directory transaction {tx_id} exists without a committed identity"
+                        ),
+                    ));
+                }
+                (Some(TxTerminal::Committed { .. }), _) => {
+                    return Ok(ambiguous(
+                        tx_ids,
+                        format!(
+                            "committed directory transaction {tx_id} target identity does not match"
+                        ),
+                    ));
+                }
+                (_, CurrentTarget::File { .. }) => {
+                    return Ok(ambiguous(
+                        tx_ids,
+                        format!("directory transaction {tx_id} target is a file"),
+                    ));
+                }
+            }
+            continue;
+        }
         let is_after = matches!(
             &state,
             CurrentTarget::File { bytes, hash }
@@ -911,14 +1088,15 @@ pub(crate) fn reconcile_workspace_effect(
             CurrentTarget::File { bytes, hash } => {
                 evidence.target_existed && recorded_state_matches(evidence, *bytes, hash, false)
             }
+            CurrentTarget::Directory { .. } => false,
         };
-        match evidence.terminal {
-            Some(TxTerminal::Committed) if is_after => {
+        match &evidence.terminal {
+            Some(TxTerminal::Committed { .. }) if is_after => {
                 applied += 1;
                 durably_committed += 1;
             }
             Some(TxTerminal::RolledBack) if is_before => {}
-            Some(TxTerminal::Committed) => {
+            Some(TxTerminal::Committed { .. }) => {
                 return Ok(ambiguous(
                     tx_ids,
                     format!("committed transaction {tx_id} target does not match after hash"),
@@ -951,11 +1129,13 @@ pub(crate) fn reconcile_workspace_effect(
     // land. This is mandatory for NotApplied and prevents a partial
     // composite from leaking the still-staged remainder.
     for (tx_id, evidence) in not_applied {
-        let (parent, _) = pinned_parent(workspace, &evidence.relative_target)?;
-        if let Err(error) =
-            remove_verified_staged_file(&parent, &tx_id, &evidence, &mut read_budget)
-        {
-            return Ok(ambiguous(tx_ids, error));
+        if evidence.entry_kind == WorkspaceEntryKind::File {
+            let (parent, _) = pinned_parent(workspace, &evidence.relative_target)?;
+            if let Err(error) =
+                remove_verified_staged_file(&parent, &tx_id, &evidence, &mut read_budget)
+            {
+                return Ok(ambiguous(tx_ids, error));
+            }
         }
         if let Err(error) = workspace.effect_journal.append_rolled_back(&tx_id) {
             return Ok(ambiguous(
@@ -1628,6 +1808,7 @@ mod tests {
                     after_hash: crate::content_hash(b"after"),
                     bytes_before: None,
                     bytes_after: None,
+                    entry_kind: WorkspaceEntryKind::File,
                 },
             },
         );
@@ -1635,7 +1816,7 @@ mod tests {
         append_raw_record(
             &workspace,
             &JournalRecord {
-                version: JOURNAL_VERSION,
+                version: FILE_DIGEST_JOURNAL_VERSION,
                 seq: 2,
                 transition: JournalTransition::Prepared {
                     tx_id: current_tx.clone(),
@@ -1647,6 +1828,7 @@ mod tests {
                     after_hash: crate::ContentDigest::sha256_bytes(b"after").to_string(),
                     bytes_before: Some(MAX_MUTATION_BYTES as u64),
                     bytes_after: Some(5),
+                    entry_kind: WorkspaceEntryKind::File,
                 },
             },
         );
@@ -1810,7 +1992,10 @@ mod tests {
         let gap = JournalRecord {
             version: JOURNAL_VERSION,
             seq: 3,
-            transition: JournalTransition::Committed { tx_id },
+            transition: JournalTransition::Committed {
+                tx_id,
+                entry_identity: None,
+            },
         };
         let payload = serde_json::to_vec(&gap).unwrap();
         let frame = StoredFrame {

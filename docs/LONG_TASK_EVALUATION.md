@@ -348,9 +348,10 @@ The phase objective is:
 - Keep Context selection/GC, the retained tool surface and editor semantics
   fixed. A fresh engine in a resume twin validates restore; it is not a Context
   algorithm experiment.
-- `task.complete` stays catalog-cold during ordinary work. No automatic task
-  completion and no natural-language classifier that guesses whether a final
-  answer means whole-task closure.
+- Production surface rev v5 keeps the compact `task.complete` schema visible.
+  This grants no automatic task completion or closure authority, and no
+  natural-language classifier guesses whether a final answer means whole-task
+  closure; the Runtime-owned acceptance gate remains decisive.
 - Do not implement a model-visible structured TaskGraph, Completion Proof
   Ledger, semantic-cycle control, memo, rewind or child agents in this phase.
 - M12 then M13 remains the engineering mainline; this research slice neither
@@ -441,13 +442,28 @@ Acceptance for this slice:
 - ActiveTurn, task resume, exact reuse and completion agree on currentness;
 - completion records remain bound to the authoritative task basis.
 
-Status after the 2026-08-27 audit: partially landed and reopened. Whole-record
-stale CAS still refuses and goal/constraint movement marks verification stale.
-A progress-only CAS leaves `validity()` and completion Current, but exact reuse
-and `CompletionOpportunity` reject the same fact because they compare its old
-anchor revision with the new record revision. The single revision therefore
-does not provide the independent basis promised above. Criterion
-origin/authority and one shared currentness predicate remain required.
+Status after the 2026-08-28 review: the reopened items are landed. The
+verification basis is a counter independent of the whole-record CAS revision
+(`TaskAnchor.verification_revision`, synced to
+`ExecutionState.verification.spec_revision` at commit). Facts, verifier
+sources, `validity()` / completion, exact / domain reuse and the opportunity
+key all read that basis, so progress-only CAS keeps a Current verifier
+everywhere while authoritative movement stales it everywhere. Acquisition
+criteria are authoritative boundary fields (the verdict the outcome is
+measured against) and move the basis; model-derived criteria stay proposals
+because `task.manage` cannot submit the field, so no criterion-level approval
+gate is implied — only dependent verification is staled. `validity()` also
+refuses Current when the last evidence row binds an older basis, so a basis
+move can never silently read as current even without the `SpecChanged` side
+effect. The exit regression covers progress-only movement, an
+acceptance-criteria change and a checkpoint round-trip in one test asserting
+consumer agreement (ActiveTurn validity, completion, exact reuse and the
+derived opportunity). Still tracked with the cold-resume matrix: the
+persisted offered-opportunity key accrues checkpoint debt and a crash-window
+proof must show once-per-basis discipline survives recovery. Criterion
+origin/authority is defined only to the extent that accepted criteria are
+authoritative; ingestion of user directives into stable criterion identities
+and any acceptance-to-proof hard gate remain shadow-only research.
 
 ### Slice C — conservative `CompletionOpportunity` candidate
 
@@ -783,8 +799,10 @@ the control-flow path by which a cell exited:
 - correlate interruption only with the latest exact
   `(lineage, task, sequence, artifact, checksum, capability_generation)`
   acknowledgement;
-- make overall PASS the conjunction of every mandatory behavior/diff/closure/
-  continuation/health dimension plus `runtime_error == none`;
+- make overall PASS the conjunction selected by an explicit persisted
+  acceptance profile: behavior/diff/continuation/health plus
+  `runtime_error == none` are mandatory, while closure is mandatory only for
+  closure-requiring profiles and remains report-only for M15 V1;
 - bind exact verification to a complete bounded workspace input snapshot,
   including all relevant source and test files;
 - count opportunity call-through only from one non-empty identical key across
@@ -797,6 +815,47 @@ the control-flow path by which a cell exited:
 
 Sequence-contiguity checks are per Runtime run/segment; a subscriber that starts
 after the run or a merge across run ids must not manufacture a product failure.
+
+Status 2026-08-28: the M15-facing reconstruction slice landed as
+`retry-pilot-cell-v3`. Cells now persist the acceptance profile, observed
+oracle result, verdict, actual pack identity/digest, typed failure class and
+independent restore/exact-tuple/continuation/turn/task facts. Runtime exposes
+provider transport, model output-limit, model, input-budget, round-budget and
+Runtime classes; provider retry progress is event-visible and resets the
+bounded harness watchdog. Provider transport and harness failures are
+NOT_RUN, while `max_output_tokens` is a model-output-limit FAIL. A window
+manifest names the exact claimed cells and `REPORT.md` is regenerated from
+those persisted facts with identity, terminal-event, event-contiguity,
+summary/dimension and verdict consistency checks. Evidence writes fail the
+cell runner instead of degrading to warnings. The formal command rejects a
+dirty tree, pack subsets, repeat drift and automatic protocol negotiation.
+The three retained v2 M15 attempts predate these guarantees and are
+forensic-only; a fresh v3 window is still required.
+
+Serving preflight status 2026-08-28: a source-bound dirty-tree diagnostic
+`retry_policy_dev` normal cell passed the stricter closure-required profile on
+PinAI `/v1` + `gpt-5.6-luna` + Responses + 128,000 context. It completed in 26
+rounds / 59 calls / 3 failed outputs / 315,468 ms with zero provider retries.
+This pins the serving tuple for the next clean formal window; it does not enter
+the 12-cell result. The prior cell used 30 rounds / 53 calls / 7 failures and
+did not close. The samples are too few and tool calls moved in the opposite
+direction, so they prove readiness and expose failure chains, not a causal
+efficiency gain.
+
+The passing trace kept the Context hypothesis falsifiable: cumulative
+historical-context prompt tokens were 8,146 while TurnFrame tokens were
+119,912. Its missing-parent recovery alone required `fs.write` refusal,
+loading `shell.exec`, directory creation, and a write retry across three new
+model decisions. `TOOL-DIR-01` has since landed as the explicit transactional
+`fs.mkdir`: one final component under an existing pinned parent, with
+authority-v3 object identity and conservative rollback/reopen recovery.
+`fs.write` still never creates topology. The tool is currently catalog-cold;
+the `TOOL-DIR-SURFACE-01` deterministic gate (2026-08-28) chose the
+failure-triggered recovery source — a typed missing-parent refusal surfaces
+exactly `fs.mkdir` with `RecoverySurface` provenance for one decision — and
+the isolated live paired gate must confirm that choice before always-ready
+admission. The old preflight pins the serving tuple but predates
+this product catalog revision.
 
 ### Work package 5 — execution order and live decision
 
@@ -824,13 +883,45 @@ newest-window count and an aggregate byte budget without ever dropping the
 latest artifact; the offered-key state rides the serialized resume state and
 cannot re-arm on the same basis after restore.
 
-The live gate remains the frozen retained-C CompletionOpportunity off/on
-normal/resume design with at least two paired repeats per mode and immutable
-evidence. Interleave arms where the harness supports it. The candidate remains
-default-off unless mandatory outcomes do not regress, closure improves, median
-rounds and tool calls fall, and no new tail appears. A failed gate ends the
-candidate; it does not authorize prompt pressure, provider-specific policy or
-a same-model A/C run.
+The frozen retained-C CompletionOpportunity off/on normal/resume gate ran on
+2026-08-28 with eight immutable cells and failed promotion: the off arm could
+close normally and no on cell improved closure. The candidate therefore ended
+default-off. This is a terminal decision for that mechanism, not a reason to
+rerun it, add prompt pressure, special-case the provider or proceed to a
+same-model A/C claim.
+
+## Post-M15 next phase task: `LT-EVAL-06` — representative development twins
+
+Do not add another planner first. After formal M15, evaluate the frozen
+`LT-RUN-05` Runtime on longer but still oracle-checkable development work:
+
+1. a diagnosis-and-fix task whose defect location is not named by the prompt;
+2. a bounded multi-file API migration with compile/tests and an allowed-diff
+   oracle; and
+3. an evaluation-harness maintenance task that changes code, adds or repairs a
+   test, executes it, and produces a mechanically reviewable result.
+
+Each task has normal and cold-resume twins and at least two repeats under one
+frozen source, serving tuple, tool surface and acceptance profile. The resume
+arm receives only the acknowledged lineage/task/sequence/artifact/checksum/
+capability-generation tuple. Harness setup, behavior, diff, verification,
+closure, provider health, Runtime health, restore and continuation remain
+independent facts. Failed tool outputs stay in the denominator.
+
+Use the current bounded `TaskRecord.resume: ExecutionState` as the only
+progress substrate. Its content follows actual goal/constraint/evidence
+changes and coalesced safe points; do not prescribe fixed subtask counts,
+checkpoint intervals or transcript windows. Report lost constraints,
+duplicated reads/effects, time and decisions to first new post-resume outcome,
+rounds, calls, failure classes, schema/prompt tokens and historical Context
+tokens. Preserve the existing Context/GC/prompt policy.
+
+Only evidence recurring across independent task families may open a TaskGraph,
+CPL/cycle advisory or richer planning slice. A single slow cell, provider
+failure or evaluator defect cannot. If normal/resume twins retain mandatory
+success, exact-once effects and bounded recovery without material repeated
+work, the correct result is to keep the simpler substrate and expand task
+breadth rather than add control state.
 
 ### Non-goals
 
@@ -889,14 +980,12 @@ Minimum deterministic coverage:
   re-offer without a new valid basis; and
 - no duplicate committed effect appears after restore.
 
-Then execute the CompletionOpportunity off/on promotion gate. All mandatory
-dimensions must be present in every uncensored cell; a harness failure is
-explicitly NOT_RUN and cannot improve either arm. The four candidate-on cells
-must pass behavioral, diff, lifecycle, health and normal/resume-equivalence
-gates, and paired efficiency/tail criteria must pass before the candidate can
-become the frozen default. Only that promoted setting may enter same-model A/C.
-Afterward the pack may add diagnosis and migration tasks or collect
-Completion/TaskGraph shadow evidence.
+The CompletionOpportunity off/on promotion gate was then executed. All
+mandatory dimensions were present, but the candidate failed the frozen
+promotion rule and ended default-off. Therefore it does not enter same-model
+A/C and must not be rerun as an unbounded optimization search. Diagnosis and
+migration breadth moves to post-M15 `LT-EVAL-06`; TaskGraph/Completion shadow
+evidence remains non-authoritative.
 
 ## Metrics and gate
 
@@ -959,14 +1048,15 @@ Exit only when:
    correlation;
 7. evidence and the summary report rebuild mechanically from immutable
    manifest/events/oracle/workspace facts with no arithmetic discrepancy;
-8. the default-off candidate passes the deterministic replay and at least two
-   C off/on paired repeats per normal/resume mode, including behavior, health,
-   closure, median round/call and tail gates;
+8. the default-off candidate's deterministic replay and eight-cell live gate
+   are reconstructed mechanically; the failed promotion is retained as the
+   terminal decision and the candidate stays off;
 9. no committed effect is duplicated and no recovery/unknown state is hidden;
 10. no implementation replays transcript history, changes Context/GC/prompt
     policy, fixes progress to a predetermined size or special-cases the
     provider/model in product Runtime policy.
 
-Only then may same-model A/C cells make a new Context-efficiency claim. This
-remains development evidence; formal M15 still requires its separately frozen
-acceptance design.
+The rejected promotion does not authorize same-model A/C cells or a new
+Context-efficiency claim. `LT-RUN-05` closes as a durability/evaluator repair,
+not as an execution-efficiency promotion. Formal M15 still uses its separately
+frozen acceptance design; `LT-EVAL-06` is the post-M15 breadth step.

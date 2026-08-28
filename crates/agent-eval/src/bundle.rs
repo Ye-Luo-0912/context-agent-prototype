@@ -98,6 +98,10 @@ pub struct CellManifest {
     pub source_tree_digest: Option<String>,
     pub openai_model: Option<String>,
     pub openai_base_url: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub openai_protocol: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub openai_context_window: Option<String>,
 }
 
 /// 从事件流抽出的工具直方图，用来解释 live 回合膨胀（空 search、
@@ -252,8 +256,17 @@ pub(crate) fn write_cell_parts(
         git_dirty: git_dirty(),
         git_dirty_sha256: git_dirty_sha256(),
         source_tree_digest: source_tree_digest(),
-        openai_model: crate::envfile::get("OPENAI_MODEL"),
-        openai_base_url: crate::envfile::get("OPENAI_BASE_URL"),
+        openai_model: Some(
+            crate::envfile::get("OPENAI_MODEL").unwrap_or_else(|| "gpt-4o-mini".into()),
+        ),
+        openai_base_url: Some(
+            crate::envfile::get("OPENAI_BASE_URL")
+                .unwrap_or_else(|| "https://api.openai.com/v1".into()),
+        ),
+        openai_protocol: Some(
+            crate::envfile::get("OPENAI_API_PROTOCOL").unwrap_or_else(|| "auto".into()),
+        ),
+        openai_context_window: Some(crate::envfile::context_window()?.to_string()),
     };
     write_json(dir.join("manifest.json"), &manifest)?;
 
@@ -486,23 +499,35 @@ fn render_cell(dir: &Path) -> anyhow::Result<String> {
             report.assertions.iter().filter(|row| row.passed).count(),
             report.assertions.len()
         ));
-        match crate::workload::reverify_from_report(&report) {
-            Ok(replayed) if replayed != report.passed => {
-                out.push_str(&format!(
-                    "           hidden reverify mismatch stored={} replayed={replayed}\n",
-                    report.passed
-                ));
+        // Only the generic workload schema carries replayable predicate
+        // material. Pack-specific live schemas preserve diagnostic rows and
+        // executable-oracle results, but must not be sent through a foreign
+        // predicate interpreter merely because both use HiddenReport as the
+        // bounded envelope.
+        if report.schema == crate::workload::VERIFY_SCHEMA {
+            match crate::workload::reverify_from_report(&report) {
+                Ok(replayed) if replayed != report.passed => {
+                    out.push_str(&format!(
+                        "           hidden reverify mismatch stored={} replayed={replayed}\n",
+                        report.passed
+                    ));
+                }
+                Err(error) => {
+                    out.push_str(&format!("           hidden reverify error={error}\n"));
+                }
+                _ => {}
             }
-            Err(error) => {
-                out.push_str(&format!("           hidden reverify error={error}\n"));
-            }
-            _ => {}
         }
+        let failed_assertion_label = if report.schema == crate::workload::VERIFY_SCHEMA {
+            "hidden FAIL"
+        } else {
+            "diagnostic marker MISS"
+        };
         for row in &report.assertions {
             if !row.passed {
                 out.push_str(&format!(
-                    "           hidden FAIL {} {} {:?}\n",
-                    row.path, row.pred, row.needles
+                    "           {failed_assertion_label} {} {} {:?}\n",
+                    row.path, row.pred, row.needles,
                 ));
             }
         }
@@ -596,15 +621,27 @@ pub fn suite_task_sha256(task: &crate::suite::SuiteTask) -> String {
 
 /// 广播流里的 `ModelDelta` 不占新的 durable seq；检查时跳过它们。
 pub fn first_journaled_seq_gap(events: &[RuntimeEventEnvelope]) -> Option<(u64, u64)> {
-    let mut expected = 1u64;
+    let mut expected = None;
+    let mut current_run = None;
     for envelope in events {
-        if matches!(envelope.event, RuntimeEvent::ModelDelta { .. }) {
+        if matches!(
+            envelope.event,
+            RuntimeEvent::ModelDelta { .. } | RuntimeEvent::ModelRetrying { .. }
+        ) {
             continue;
         }
-        if envelope.seq != expected {
-            return Some((expected, envelope.seq));
+        if current_run != Some(envelope.run_id) {
+            current_run = Some(envelope.run_id);
+            // A subscriber may attach after RunStarted was broadcast, so the
+            // first journaled event establishes this observed segment's
+            // baseline. Continuity is strict from that point onward.
+            expected = Some(envelope.seq);
         }
-        expected = expected.saturating_add(1);
+        let expected_seq = expected.unwrap_or(envelope.seq);
+        if envelope.seq != expected_seq {
+            return Some((expected_seq, envelope.seq));
+        }
+        expected = Some(expected_seq.saturating_add(1));
     }
     None
 }
@@ -1011,12 +1048,12 @@ pub(crate) fn require_clean_tree(allow_dirty: bool) -> anyhow::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use agent_contracts::{RunId, ToolCall, ToolOutput};
+    use agent_contracts::{ToolCall, ToolOutput};
     use serde_json::json;
 
     fn envelope(seq: u64, event: RuntimeEvent) -> RuntimeEventEnvelope {
         RuntimeEventEnvelope {
-            run_id: RunId::new(),
+            run_id: "00000000-0000-0000-0000-000000000001".parse().unwrap(),
             seq,
             timestamp_ms: seq,
             event,
@@ -1040,7 +1077,7 @@ mod tests {
     }
 
     #[test]
-    fn journaled_seq_skips_model_delta_repeats() {
+    fn journaled_seq_skips_live_only_model_events() {
         let events = vec![
             envelope(1, RuntimeEvent::RunStarted),
             envelope(
@@ -1052,6 +1089,16 @@ mod tests {
                     delta: "x".into(),
                 },
             ),
+            envelope(
+                1,
+                RuntimeEvent::ModelRetrying {
+                    turn_id: Default::default(),
+                    operation_id: Default::default(),
+                    generation: 0,
+                    attempt: 2,
+                    delay_ms: 500,
+                },
+            ),
             envelope(2, RuntimeEvent::TurnCompleted),
         ];
         assert_eq!(first_journaled_seq_gap(&events), None);
@@ -1060,6 +1107,21 @@ mod tests {
             envelope(3, RuntimeEvent::TurnCompleted),
         ];
         assert_eq!(first_journaled_seq_gap(&gapped), Some((2, 3)));
+
+        let observed_suffix = vec![
+            envelope(2, RuntimeEvent::TurnCompleted),
+            envelope(3, RuntimeEvent::RunCompleted),
+        ];
+        assert_eq!(first_journaled_seq_gap(&observed_suffix), None);
+
+        let mut second_run = envelope(1, RuntimeEvent::RunStarted);
+        second_run.run_id = agent_contracts::RunId::new();
+        let segmented = vec![
+            envelope(1, RuntimeEvent::RunStarted),
+            envelope(2, RuntimeEvent::TurnCompleted),
+            second_run,
+        ];
+        assert_eq!(first_journaled_seq_gap(&segmented), None);
     }
 
     #[test]

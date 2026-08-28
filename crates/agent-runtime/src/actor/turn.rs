@@ -153,6 +153,7 @@ impl RuntimeActor {
             round_snapshot: None,
             pending_completion: None,
             opportunity_lease: None,
+            recovery_surface_request: None,
             applied_input: Some(applied),
             input_consumed: false,
             structurally_empty_retries: 0,
@@ -340,7 +341,14 @@ impl RuntimeActor {
                     message: message.clone(),
                 })
                 .await;
-            let _ = self.core.emit_event(RuntimeEvent::Error { message }).await;
+            let _ = self
+                .core
+                .emit_event(RuntimeEvent::Failure {
+                    class: RuntimeFailureClass::RoundBudget,
+                    retryable: false,
+                    message,
+                })
+                .await;
             // Deliberate refusal (round budget), not a fault: settle the
             // applied input and drop the turn without fencing.
             self.settle_aborted_turn().await;

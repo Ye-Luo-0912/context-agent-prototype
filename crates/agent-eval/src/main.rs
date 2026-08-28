@@ -26,6 +26,7 @@ mod long_live;
 mod long_task;
 mod longflow;
 mod m15_pack;
+mod m15_report;
 mod metrics;
 mod mock_model;
 mod pilot;
@@ -105,10 +106,19 @@ fn usage() -> ! {
          usage: agent-eval [--repeats N] --long-task-live [normal|resume]\n\
          \n\
          usage: agent-eval [--repeats N] --opportunity-gate [normal|resume]\n\
+         usage: agent-eval --recovery-surface-gate [normal|resume]\n\
+         usage: agent-eval --m15-window\n\
+         usage: agent-eval --m15-report <window-dir>\n\
          \n\
          Item-8 off/on paired live gate for the advisory completion\n\
          opportunity: identical cells with the candidate switch as the only\n\
          variable; evidence records the setting per cell.\n\
+         \n\
+         Directory-tool admission paired live gate: the three representative\n\
+         packs run normal/resume cells with the recovery-surface candidate\n\
+         switch as the only variable; evidence records the setting per cell.\n\
+         Promotion requires the frozen criteria (equal mandatory success,\n\
+         lower median aggregate rounds and calls, no new max/p95 tail).\n\
          \n\
          retry_policy_dev live pilot (layer 2): the C engine runs the frozen\n\
          one-directive fixture with a real model. Resume cells interrupt on\n\
@@ -646,6 +656,16 @@ async fn main() -> anyhow::Result<()> {
                 run_opportunity_gate(mode_filter, repeats, evidence_dir, allow_dirty).await?;
                 return Ok(());
             }
+            "--recovery-surface-gate" => {
+                let mode_filter = args.next().filter(|value| !value.starts_with('-'));
+                let repeats = if repeats_set {
+                    repeats
+                } else {
+                    long_live::DEFAULT_REPEATS
+                };
+                run_recovery_surface_gate(mode_filter, repeats, evidence_dir, allow_dirty).await?;
+                return Ok(());
+            }
             "--m15-window" => {
                 let fixture_filter = args.next().filter(|value| !value.starts_with('-'));
                 let repeats = if repeats_set {
@@ -654,6 +674,14 @@ async fn main() -> anyhow::Result<()> {
                     long_live::DEFAULT_REPEATS
                 };
                 run_m15_window(fixture_filter, repeats, evidence_dir, allow_dirty).await?;
+                return Ok(());
+            }
+            "--m15-report" => {
+                let window_dir = args.next().map(std::path::PathBuf::from).ok_or_else(|| {
+                    anyhow::anyhow!("--m15-report requires a persisted window directory")
+                })?;
+                let rendered = m15_report::render_window(&window_dir)?;
+                print!("{}", rendered.markdown);
                 return Ok(());
             }
             "--long-task-live" => {
@@ -1094,8 +1122,14 @@ async fn run_long_task_live(
                 repeats,
                 true,
             );
-            let outcome =
-                long_live::run_cell(*mode, &pair, model.clone(), dir.path(), false).await?;
+            let outcome = long_live::run_cell(
+                *mode,
+                &pair,
+                model.clone(),
+                dir.path(),
+                long_live::CellSwitches::default(),
+            )
+            .await?;
             println!("{}", outcome.render_line());
             for violation in &outcome.diff_violations {
                 println!("diff: {violation}");
@@ -1105,7 +1139,7 @@ async fn run_long_task_live(
             }
             // Best effort: a fresh evidence file can transiently fail to
             // open on Windows (defender/indexer); never lose the run over it.
-            match bundle::render_evidence(&pair.repeat_path()) {
+            match bundle::render_evidence(&pair.cell_dir("dynamic")) {
                 Ok(rendered) => println!("{rendered}"),
                 Err(e) => eprintln!("warning: evidence render failed: {e}"),
             }
@@ -1121,35 +1155,49 @@ async fn run_long_task_live(
 /// recorded setting; the runner prints paired facts and leaves promotion
 /// judgment to the REPORT.
 /// M15 formal acceptance window (`M15_ACCEPTANCE.md` §2): the three
-/// development-pack fixtures x {normal, resume} x N repeats, the advisory
+/// development-pack fixtures x {normal, resume} x two repeats, the advisory
 /// switch OFF everywhere, immutable per-cell bundles under
 /// `evidence/m15-window/`. The pass criteria are mechanical per cell
 /// (behavior, diff, health, no runtime error; resume adds
-/// restored+continued); closure is reported, never gating.
+/// exact acknowledged tuple + restored + continued); closure is reported,
+/// never gating. Diagnostic subsets use the long-task runner instead.
 async fn run_m15_window(
     fixture_filter: Option<String>,
     repeats: u32,
     evidence_dir: Option<std::path::PathBuf>,
     allow_dirty: bool,
 ) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        fixture_filter.is_none(),
+        "--m15-window is the frozen 12-cell gate and does not accept a fixture filter; use --long-task-live for a diagnostic cell"
+    );
+    anyhow::ensure!(
+        repeats == long_live::DEFAULT_REPEATS,
+        "--m15-window requires exactly {} repeats",
+        long_live::DEFAULT_REPEATS
+    );
+    anyhow::ensure!(
+        !allow_dirty,
+        "--m15-window is formal evidence and does not permit --allow-dirty"
+    );
+    let protocol = envfile::get("OPENAI_API_PROTOCOL").unwrap_or_else(|| "auto".into());
+    anyhow::ensure!(
+        !protocol.eq_ignore_ascii_case("auto"),
+        "--m15-window requires an explicit OPENAI_API_PROTOCOL pin; auto negotiation is not a reproducible serving identity"
+    );
     bundle::require_clean_tree(allow_dirty)?;
-    anyhow::ensure!((1..=4).contains(&repeats), "repeats must be 1..=4");
     let model = driver::build_live_coding_model()?;
     let evidence_root = evidence_dir
         .unwrap_or_else(|| std::path::PathBuf::from("crates/agent-eval/evidence/m15-window"));
     std::fs::create_dir_all(&evidence_root)?;
     eprintln!("evidence dir: {}", evidence_root.display());
 
-    let mut packs = vec![
+    let packs = vec![
         long_live::m15_diag_pack(),
         long_live::m15_migrate_pack(),
         long_live::retry_pack(),
     ];
-    if let Some(id) = &fixture_filter {
-        packs.retain(|pack| pack.id == id);
-        anyhow::ensure!(!packs.is_empty(), "unknown m15 fixture filter {id}");
-    }
-    let mut outcomes = Vec::new();
+    let mut cell_dirs = Vec::new();
     for pack in &packs {
         for repeat in 1..=repeats {
             for mode in [long_live::PilotMode::Normal, long_live::PilotMode::Resume] {
@@ -1166,40 +1214,41 @@ async fn run_m15_window(
                     repeats,
                     true,
                 );
-                let outcome =
-                    long_live::run_pack_cell(pack, mode, &pair, model.clone(), dir.path(), false)
-                        .await?;
+                let outcome = long_live::run_pack_cell(
+                    pack,
+                    mode,
+                    &pair,
+                    model.clone(),
+                    dir.path(),
+                    long_live::CellSwitches::default(),
+                    long_live::AcceptanceProfile::M15V1,
+                )
+                .await?;
                 println!("{}", outcome.render_line());
-                match bundle::render_evidence(&pair.repeat_path()) {
+                match bundle::render_evidence(&pair.cell_dir("dynamic")) {
                     Ok(rendered) => println!("{rendered}"),
                     Err(e) => eprintln!("warning: evidence render failed: {e}"),
                 }
-                outcomes.push((pack.id, outcome));
+                cell_dirs.push(pair.cell_dir("dynamic"));
             }
         }
     }
 
-    println!("
-== m15 window summary (facts only) ==");
-    for (pack_id, _) in outcomes.iter().map(|(id, _)| (*id, ())).collect::<Vec<_>>() {
-        let cells: Vec<&long_live::CellOutcome> = outcomes
-            .iter()
-            .filter(|(id, _)| *id == pack_id)
-            .map(|(_, outcome)| outcome)
-            .collect();
-        if cells.is_empty() {
-            continue;
+    let pack_ids: Vec<&str> = packs.iter().map(|pack| pack.id).collect();
+    let (window_dir, rendered) =
+        m15_report::persist_window(&evidence_root, &cell_dirs, &pack_ids, repeats)?;
+    print!("{}", rendered.markdown);
+    println!("window evidence: {}", window_dir.display());
+    println!(
+        "mechanical window verdict: {}",
+        if rendered.censored {
+            "CENSORED"
+        } else if rendered.passed {
+            "PASS"
+        } else {
+            "FAILED"
         }
-        println!(
-            "{:<18} cells={} passed={} completed={} stalls={}",
-            pack_id,
-            cells.len(),
-            cells.iter().filter(|cell| cell.passed).count(),
-            cells.iter().filter(|cell| cell.closure == "completed").count(),
-            cells.iter().filter(|cell| cell.error.as_deref().is_some_and(|e| e.contains("stalled"))).count(),
-        );
-    }
-    println!("judgment belongs to the evidence REPORT, not this runner");
+    );
     Ok(())
 }
 
@@ -1239,11 +1288,19 @@ async fn run_opportunity_gate(
                     repeats,
                     true,
                 );
-                let outcome =
-                    long_live::run_cell(*mode, &pair, model.clone(), dir.path(), opportunity)
-                        .await?;
+                let outcome = long_live::run_cell(
+                    *mode,
+                    &pair,
+                    model.clone(),
+                    dir.path(),
+                    long_live::CellSwitches {
+                        opportunity,
+                        recovery_surface: false,
+                    },
+                )
+                .await?;
                 println!("{}", outcome.render_line());
-                match bundle::render_evidence(&pair.repeat_path()) {
+                match bundle::render_evidence(&pair.cell_dir("dynamic")) {
                     Ok(rendered) => println!("{rendered}"),
                     Err(e) => eprintln!("warning: evidence render failed: {e}"),
                 }
@@ -1284,6 +1341,122 @@ async fn run_opportunity_gate(
                     .filter(|cell| cell.closure == "completed")
                     .count(),
             );
+        }
+    }
+    println!("promotion judgment belongs to the evidence REPORT, not this runner");
+    Ok(())
+}
+
+/// Directory-tool admission paired gate: the three
+/// representative packs (create-file retry, diagnosis, multi-file migration)
+/// run normal/resume cells with the recovery-surface candidate switch as
+/// the only variable. Every cell records its setting in dimensions.json.
+/// The runner prints facts only; promotion judgment belongs to the evidence
+/// REPORT and requires the frozen criteria (equal mandatory success, lower
+/// median aggregate rounds and calls, no new max/p95 tail, reported
+/// schema/prompt-token delta).
+async fn run_recovery_surface_gate(
+    mode_filter: Option<String>,
+    repeats: u32,
+    evidence_dir: Option<std::path::PathBuf>,
+    allow_dirty: bool,
+) -> anyhow::Result<()> {
+    bundle::require_clean_tree(allow_dirty)?;
+    let modes = long_live::PilotMode::parse(mode_filter.as_deref())?;
+    anyhow::ensure!((1..=4).contains(&repeats), "repeats must be 1..=4");
+    let model = driver::build_live_coding_model()?;
+    let evidence_root = evidence_dir.unwrap_or_else(|| {
+        std::path::PathBuf::from("crates/agent-eval/evidence/recovery-surface-gate")
+    });
+    std::fs::create_dir_all(&evidence_root)?;
+    eprintln!("evidence dir: {}", evidence_root.display());
+
+    let packs = vec![
+        long_live::m15_diag_pack(),
+        long_live::m15_migrate_pack(),
+        long_live::retry_pack(),
+    ];
+    let mut outcomes = Vec::new();
+    for pack in &packs {
+        for recovery_surface in [false, true] {
+            for repeat in 1..=repeats {
+                for mode in &modes {
+                    eprintln!(
+                        "== {} {} live (C, recovery={}) repeat {repeat}/{repeats} ==",
+                        pack.id,
+                        mode.id(),
+                        if recovery_surface { "on" } else { "off" },
+                    );
+                    let dir = tempfile::tempdir()?;
+                    let pair = bundle::PairSink::claim(
+                        evidence_root.clone(),
+                        format!(
+                            "{}-{}-{}",
+                            pack.id,
+                            mode.id(),
+                            if recovery_surface { "on" } else { "off" }
+                        ),
+                        repeat,
+                        repeats,
+                        true,
+                    );
+                    let outcome = long_live::run_pack_cell(
+                        pack,
+                        *mode,
+                        &pair,
+                        model.clone(),
+                        dir.path(),
+                        long_live::CellSwitches {
+                            opportunity: false,
+                            recovery_surface,
+                        },
+                        long_live::AcceptanceProfile::M15V1,
+                    )
+                    .await?;
+                    println!("{}", outcome.render_line());
+                    match bundle::render_evidence(&pair.cell_dir("dynamic")) {
+                        Ok(rendered) => println!("{rendered}"),
+                        Err(e) => eprintln!("warning: evidence render failed: {e}"),
+                    }
+                    outcomes.push(outcome);
+                }
+            }
+        }
+    }
+
+    println!("\n== paired summary (baseline off vs recovery on; facts only) ==");
+    for pack in &packs {
+        for mode in &modes {
+            for (label, switch) in [("off", false), ("on", true)] {
+                let cells: Vec<&long_live::CellOutcome> = outcomes
+                    .iter()
+                    .filter(|cell| {
+                        cell.pack_id == pack.id
+                            && cell.mode == *mode
+                            && cell.recovery_surface == switch
+                    })
+                    .collect();
+                if cells.is_empty() {
+                    continue;
+                }
+                let mut rounds: Vec<u64> = cells
+                    .iter()
+                    .map(|cell| (cell.model_rounds_phase_one + cell.model_rounds_phase_two) as u64)
+                    .collect();
+                let median_rounds = checked_percentile(&mut rounds, 50).unwrap_or(0);
+                let max_rounds = rounds.iter().copied().max().unwrap_or(0);
+                println!(
+                    "{:<13} {:<6} recovery={} cells={} passed={} median_total_rounds={} max_total_rounds={} completed={}",
+                    pack.id,
+                    mode.id(),
+                    label,
+                    cells.len(),
+                    cells.iter().filter(|cell| cell.passed).count(),
+                    median_rounds,
+                    max_rounds,
+                    cells.iter().filter(|cell| cell.closure == "completed").count(),
+                );
+            }
         }
     }
     println!("promotion judgment belongs to the evidence REPORT, not this runner");
@@ -1989,6 +2162,8 @@ mod tool_edit_main_tests {
             source_tree_digest: Some("source-sha".into()),
             openai_model: Some("model".into()),
             openai_base_url: None,
+            openai_protocol: None,
+            openai_context_window: None,
         }
     }
 

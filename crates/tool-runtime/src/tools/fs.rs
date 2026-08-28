@@ -4,7 +4,7 @@ use agent_contracts::{
     AgentError, AgentResult, CancellationToken, Effect, RunId, ToolExecutionFacts, ToolOutcome,
     ToolOutput, ToolRisk, ToolSemanticRole, ToolSpec,
 };
-use agent_workspace::{MAX_MUTATION_BYTES, Workspace};
+use agent_workspace::{DirectoryCreationPreparation, MAX_MUTATION_BYTES, Workspace};
 use async_trait::async_trait;
 use serde::Deserialize;
 use serde_json::{Value, json};
@@ -12,7 +12,7 @@ use tokio::fs;
 
 use super::{
     LineEnding, Tool, content_digest, hidden_path_output, is_hidden_name, is_not_found_error,
-    missing_path_output, model_json_string, ordinary_view_blocked,
+    missing_parent_output, missing_path_output, model_json_string, ordinary_view_blocked,
 };
 
 // A revision returned by `fs.read` must be usable by the canonical edit
@@ -521,10 +521,19 @@ impl FsWriteTool {
             )));
         }
         let path = self.workspace.resolve_mutation(&args.path).await?;
-        let transaction = self
+        let transaction = match self
             .workspace
             .begin_mutation("fs.write", "write", &args.path)
-            .await?;
+            .await
+        {
+            Ok(transaction) => transaction,
+            Err(error) if is_not_found_error(&error) => {
+                return Ok(ToolOutcome::Value(
+                    missing_parent_output(&self.workspace, call_id, "fs.write", &args.path).await,
+                ));
+            }
+            Err(error) => return Err(error),
+        };
         // Computation is staged, the side effect is not applied yet: the
         // runtime owns the commit after the generation fence. Production
         // dispatches attach Core's stable identity; direct legacy tests can
@@ -562,6 +571,134 @@ impl FsWriteTool {
             .with_mutation_bound(true),
         );
         Ok(ToolOutcome::PreparedEffect { output, effect })
+    }
+}
+
+/// Transactional creation of one directory component. It deliberately does
+/// not implement `mkdir -p`: every visible topology change has one Core
+/// intent, one pinned parent and one recovery identity.
+pub struct FsMkdirTool {
+    workspace: Workspace,
+}
+
+impl FsMkdirTool {
+    pub fn new(workspace: Workspace) -> Self {
+        Self { workspace }
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct MkdirArgs {
+    path: String,
+}
+
+#[async_trait]
+impl Tool for FsMkdirTool {
+    fn spec(&self) -> ToolSpec {
+        ToolSpec {
+            name: "fs.mkdir".into(),
+            description: "Create exactly one workspace directory. Its immediate parent must already exist; an existing directory succeeds without mutation.".into(),
+            input_schema: json!({
+                "type": "object",
+                "required": ["path"],
+                "additionalProperties": false,
+                "properties": {
+                    "path": {"type": "string", "description": "Workspace-relative directory path"}
+                }
+            }),
+            risk: ToolRisk::WorkspaceWrite,
+            output_budget: None,
+            roles: vec![ToolSemanticRole::Mutate],
+        }
+    }
+
+    async fn execute(
+        &self,
+        _run_id: RunId,
+        call_id: &str,
+        arguments: Value,
+        effect_context: Option<agent_contracts::OperationEffectContext>,
+        _cancel: CancellationToken,
+    ) -> AgentResult<ToolOutcome> {
+        let args: MkdirArgs = serde_json::from_value(arguments)
+            .map_err(|error| AgentError::InvalidRequest(format!("fs.mkdir args: {error}")))?;
+        if ordinary_view_blocked(&args.path) {
+            return Ok(ToolOutcome::Value(hidden_path_output(
+                call_id, "fs.mkdir", &args.path,
+            )));
+        }
+        let preparation = match self
+            .workspace
+            .prepare_directory_creation("fs.mkdir", &args.path, effect_context)
+            .await
+        {
+            Ok(preparation) => preparation,
+            Err(error) if is_not_found_error(&error) => {
+                return Ok(ToolOutcome::Value(
+                    missing_parent_output(&self.workspace, call_id, "fs.mkdir", &args.path).await,
+                ));
+            }
+            Err(error) => return Err(error),
+        };
+        let relative = preparation.relative_path().to_string();
+        match preparation {
+            DirectoryCreationPreparation::AlreadyExists { .. } => {
+                let mut output = ToolOutput {
+                    call_id: call_id.into(),
+                    tool_name: "fs.mkdir".into(),
+                    ok: true,
+                    summary: format!("directory already exists: {relative}"),
+                    model_content: format!("directory already exists: {relative}"),
+                    artifact_ref: None,
+                    metadata: json!({
+                        "path": relative,
+                        "created": false,
+                        "entry_kind": "directory",
+                        "mutates_workspace": false,
+                        "verification": false,
+                    }),
+                };
+                output.set_native_execution_facts(
+                    ToolExecutionFacts::from_resource_touches([(
+                        relative.as_str(),
+                        Option::<String>::None,
+                    )])
+                    .with_verification(false)
+                    .with_mutation_bound(false),
+                );
+                Ok(ToolOutcome::Value(output))
+            }
+            DirectoryCreationPreparation::Prepared(prepared) => {
+                let mut output = ToolOutput {
+                    call_id: call_id.into(),
+                    tool_name: "fs.mkdir".into(),
+                    ok: true,
+                    summary: format!("created directory {relative}"),
+                    model_content: format!("directory created: {relative}"),
+                    artifact_ref: None,
+                    metadata: json!({
+                        "path": relative,
+                        "created": true,
+                        "entry_kind": "directory",
+                        "mutates_workspace": true,
+                        "verification": false,
+                    }),
+                };
+                output.set_native_execution_facts(
+                    ToolExecutionFacts::from_resource_touches([(
+                        relative.as_str(),
+                        Option::<String>::None,
+                    )])
+                    .with_verification(false)
+                    .with_mutation_bound(true),
+                );
+                Ok(ToolOutcome::PreparedEffect {
+                    output,
+                    effect: prepared,
+                })
+            }
+        }
     }
 }
 
@@ -1166,6 +1303,108 @@ mod tests {
         assert!(output.model_content.contains("README.md"));
         assert!(!output.model_content.contains(".focus-agent"));
         assert!(!output.model_content.contains(".git"));
+    }
+
+    #[tokio::test]
+    async fn fs_mkdir_prepares_one_zero_byte_effect_and_is_idempotent() {
+        let dir = tempfile::tempdir().unwrap();
+        let workspace = Workspace::open(dir.path()).await.unwrap();
+        let tool = FsMkdirTool::new(workspace.clone());
+        let outcome = tool
+            .execute(
+                RunId::new(),
+                "mkdir-1",
+                json!({"path": "src"}),
+                None,
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+        let ToolOutcome::PreparedEffect { output, effect } = outcome else {
+            panic!("an absent directory must produce a prepared effect");
+        };
+        crate::tools::assert_native_facts_match_derivation(&output);
+        assert!(!workspace.root().join("src").exists());
+        assert_eq!(
+            effect.actual_workspace_writes().unwrap(),
+            vec![agent_contracts::ActualWorkspaceWrite {
+                path: "src".into(),
+                bytes: 0,
+            }]
+        );
+        assert!(matches!(
+            effect.commit().await,
+            agent_contracts::EffectReceipt::Applied {
+                durability: agent_contracts::EffectDurability::Durable,
+                ..
+            }
+        ));
+        assert!(workspace.root().join("src").is_dir());
+
+        let outcome = tool
+            .execute(
+                RunId::new(),
+                "mkdir-2",
+                json!({"path": "src"}),
+                None,
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+        let ToolOutcome::Value(output) = outcome else {
+            panic!("an existing directory must be an idempotent value");
+        };
+        crate::tools::assert_native_facts_match_derivation(&output);
+        assert_eq!(output.metadata["created"], false);
+        assert!(!output.may_mutate_workspace());
+    }
+
+    #[tokio::test]
+    async fn fs_mkdir_and_write_explain_missing_parent_recovery() {
+        let dir = tempfile::tempdir().unwrap();
+        let workspace = Workspace::open(dir.path()).await.unwrap();
+        let mkdir = FsMkdirTool::new(workspace.clone());
+        let ToolOutcome::Value(missing) = mkdir
+            .execute(
+                RunId::new(),
+                "mkdir",
+                json!({"path": "missing/child"}),
+                None,
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap()
+        else {
+            panic!("a missing parent must be a typed refusal");
+        };
+        assert_eq!(
+            missing.failure_class(),
+            Some(ToolFailureClass::PathNotFound)
+        );
+        assert_eq!(missing.metadata["next_directory"], "missing");
+        assert!(missing.model_content.contains("fs.mkdir"));
+        assert!(!workspace.root().join("missing").exists());
+
+        let write = FsWriteTool::new(workspace);
+        let ToolOutcome::Value(missing) = write
+            .execute(
+                RunId::new(),
+                "write",
+                json!({"path": "missing/file.txt", "content": "x"}),
+                None,
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap()
+        else {
+            panic!("a missing write parent must be a typed refusal");
+        };
+        assert_eq!(
+            missing.failure_class(),
+            Some(ToolFailureClass::PathNotFound)
+        );
+        assert_eq!(missing.metadata["next_directory"], "missing");
+        assert!(missing.model_content.contains("fs.mkdir"));
     }
 
     #[tokio::test]

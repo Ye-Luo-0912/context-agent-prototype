@@ -24,13 +24,14 @@ use agent_contracts::{
     MAX_MODEL_TOOL_CALLS_PER_ROUND, MaterializedContext, ModelCompletionValidity, ModelInput,
     ModelRequest, OperationId, OperationOutcome, OperationQueryResult, OperationResult,
     OperationState, OperationTerminal, ResourceFreshness, ResourceKey, ResourceVersionOracle,
-    RestoreRevision, RunId, RuntimeDirective, RuntimeEvent, RuntimeInputEnvelope, RuntimeInputId,
-    ScopeId, ScopeKind, StatePatchProposal, TaskAnchorView, TaskId, TaskProgressProposal,
-    TaskProgressView, ToolCall, ToolLeaseBoundary, ToolOperationIdentity, ToolOutcome, ToolOutput,
-    ToolResultDisposition, ToolSpec, ToolSurfaceBlock, ToolSurfaceBlockReason, ToolSurfaceDemand,
-    ToolSurfaceRequirement, ToolSurfaceSnapshot, TurnCancelAck, TurnCancellationReason, TurnFrame,
-    TurnFrameStep, TurnId, USER_INPUT_ARTIFACT_OWNER, USER_INPUT_PREVIEW_CHARS,
-    USER_INPUT_QUEUE_CAP, apply_runtime_diagnosis, bounded_preview, context_maintenance_events,
+    RestoreRevision, RunId, RuntimeDirective, RuntimeEvent, RuntimeFailureClass,
+    RuntimeInputEnvelope, RuntimeInputId, ScopeId, ScopeKind, StatePatchProposal, TaskAnchorView,
+    TaskId, TaskProgressProposal, TaskProgressView, ToolCall, ToolLeaseBoundary,
+    ToolOperationIdentity, ToolOutcome, ToolOutput, ToolResultDisposition, ToolSpec,
+    ToolSurfaceBlock, ToolSurfaceBlockReason, ToolSurfaceDemand, ToolSurfaceRequirement,
+    ToolSurfaceSnapshot, TurnCancelAck, TurnCancellationReason, TurnFrame, TurnFrameStep, TurnId,
+    USER_INPUT_ARTIFACT_OWNER, USER_INPUT_PREVIEW_CHARS, USER_INPUT_QUEUE_CAP,
+    apply_runtime_diagnosis, bounded_preview, context_maintenance_events,
     discovery_search_from_call, path_exactly_in_directive,
 };
 use agent_core::{
@@ -185,6 +186,138 @@ struct InFlightOp {
 /// tool delta yet. The first empty response plus this many retries.
 const MAX_STRUCTURALLY_EMPTY_RETRIES: u8 = 2;
 
+/// One trusted topology-recovery surface request derived from a typed tool
+/// refusal. Body-free and hard-bounded; only the runtime's typed recovery
+/// pipeline constructs it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct RecoverySurfaceRequest {
+    /// The exact host-owned tool to prefer for the next decision.
+    pub(crate) tool_name: String,
+    /// The typed recovery target (e.g. the first missing directory), used
+    /// for audit and deduplication only.
+    pub(crate) target: String,
+}
+
+/// Pure derivation of a trusted topology-recovery surface request from one
+/// terminal tool result. Only a typed `parent_path_not_found` whose
+/// `next_directory` names the first creatable component qualifies: the
+/// recovery contract requires topology mutation, so the next decision gets
+/// the host-owned `fs.mkdir`. Unrelated missing reads (no `next_directory`)
+/// and non-mutating producers never qualify.
+pub(super) fn derive_recovery_surface_request(
+    output: &agent_contracts::ToolOutput,
+) -> Option<RecoverySurfaceRequest> {
+    if output.ok {
+        return None;
+    }
+    let target = output
+        .metadata
+        .get("next_directory")
+        .and_then(serde_json::Value::as_str)
+        .filter(|value| !value.is_empty())?;
+    if !output.may_mutate_workspace() {
+        return None;
+    }
+    let mut target = target.to_string();
+    if target.chars().count() > 512 {
+        target = target.chars().take(512).collect();
+    }
+    Some(RecoverySurfaceRequest {
+        tool_name: "fs.mkdir".into(),
+        target,
+    })
+}
+
+#[cfg(test)]
+mod recovery_surface_tests {
+    use super::*;
+
+    fn failed_write_output(next_directory: Option<&str>) -> ToolOutput {
+        let mut metadata = serde_json::json!({});
+        if let Some(dir) = next_directory {
+            metadata["next_directory"] = serde_json::json!(dir);
+        }
+        ToolOutput {
+            call_id: "c1".into(),
+            tool_name: "fs.write".into(),
+            ok: false,
+            summary: "fs.write refused: parent_path_not_found".into(),
+            model_content: "parent directory does not exist".into(),
+            artifact_ref: None,
+            metadata,
+        }
+    }
+
+    #[test]
+    fn failed_mutating_output_with_next_directory_arms_request() {
+        let request = derive_recovery_surface_request(&failed_write_output(Some("a/b")));
+        let request = request.expect("typed recovery target must arm the request");
+        assert_eq!(request.tool_name, "fs.mkdir");
+        assert_eq!(request.target, "a/b");
+    }
+
+    #[test]
+    fn ok_output_never_arms_request() {
+        let ok = ToolOutput {
+            call_id: "c1".into(),
+            tool_name: "fs.write".into(),
+            ok: true,
+            summary: "written".into(),
+            model_content: "ok".into(),
+            artifact_ref: None,
+            metadata: serde_json::json!({"next_directory": "a/b"}),
+        };
+        assert!(derive_recovery_surface_request(&ok).is_none());
+    }
+
+    #[test]
+    fn missing_or_empty_next_directory_never_arms_request() {
+        assert!(derive_recovery_surface_request(&failed_write_output(None)).is_none());
+        assert!(derive_recovery_surface_request(&failed_write_output(Some(""))).is_none());
+    }
+
+    #[test]
+    fn observation_missing_read_without_next_directory_never_arms_request() {
+        // A `path_not_found` from a read carries no `next_directory`; the
+        // recovery contract there is observation-only, not topology mutation.
+        let read = ToolOutput {
+            call_id: "c1".into(),
+            tool_name: "fs.read".into(),
+            ok: false,
+            summary: "fs.read refused: path_not_found".into(),
+            model_content: "no such file".into(),
+            artifact_ref: None,
+            metadata: serde_json::json!({"failure_class": "PathNotFound"}),
+        };
+        assert!(derive_recovery_surface_request(&read).is_none());
+    }
+
+    #[test]
+    fn non_mutating_producer_never_arms_request() {
+        // A search tool with a typed `next_directory` metadata key must not
+        // qualify: only workspace-mutating producers may prove the recovery
+        // contract requires topology mutation.
+        let search = ToolOutput {
+            call_id: "c1".into(),
+            tool_name: "search.grep".into(),
+            ok: false,
+            summary: "search failed".into(),
+            model_content: "no match".into(),
+            artifact_ref: None,
+            metadata: serde_json::json!({"next_directory": "a/b"}),
+        };
+        assert!(derive_recovery_surface_request(&search).is_none());
+    }
+
+    #[test]
+    fn target_is_truncated_to_bounded_length() {
+        let long = "长".repeat(1000);
+        let request = derive_recovery_surface_request(&failed_write_output(Some(&long)))
+            .expect("a long but valid target must still arm the request");
+        assert_eq!(request.target.chars().count(), 512);
+    }
+}
+
 /// The runtime's view of the active turn: the execution stack (TurnFrame),
 /// how many model rounds ran, tool calls still waiting to run, and the
 /// One turn's mutable state: the model round counter, the tool calls the
@@ -249,6 +382,12 @@ struct ActiveTurn {
     /// Dies with the turn on cancel/fail (retraction); cleared after one
     /// decision regardless of outcome.
     opportunity_lease: Option<String>,
+    /// Trusted runtime-derived recovery source for the NEXT decision only:
+    /// a typed `parent_path_not_found` proved topology mutation is the
+    /// recovery, so the host-owned `fs.mkdir` schema is preferred exactly
+    /// once, then cleared. Model calls cannot create this state; unrelated
+    /// missing reads never touch it.
+    recovery_surface_request: Option<RecoverySurfaceRequest>,
     /// 本轮 Applied 对话。Consumed / Archived / InterruptCommitted 复用同一条。
     applied_input: Option<RuntimeInputEnvelope>,
     /// 已经为这条 applied input 发过 Consumed。
@@ -649,6 +788,7 @@ mod edit_attempt_tests {
             round_snapshot: None,
             pending_completion: None,
             opportunity_lease: None,
+            recovery_surface_request: None,
             applied_input: None,
             input_consumed: false,
             structurally_empty_retries: 0,

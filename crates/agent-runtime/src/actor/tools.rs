@@ -1306,6 +1306,20 @@ impl RuntimeActor {
                 if let Some(turn) = self.state.turn.as_mut() {
                     turn.record_protocol_body(&output);
                 }
+                // A typed `parent_path_not_found` with an exact next
+                // directory proves the recovery contract requires topology
+                // mutation. Surface the host-owned `fs.mkdir` for exactly
+                // the next decision; unrelated missing reads (no
+                // `next_directory`) and non-mutating producers never
+                // qualify. The host switch gates the whole candidate: off
+                // (the shipped baseline) means no derived request ever
+                // enters turn state, so the surface never changes.
+                if self.services.recovery_surface()
+                    && let Some(request) = derive_recovery_surface_request(&output)
+                    && let Some(turn) = self.state.turn.as_mut()
+                {
+                    turn.recovery_surface_request = Some(request);
+                }
                 let _ = self
                     .core
                     .emit_event(RuntimeEvent::ToolFinished { output })
@@ -1340,8 +1354,19 @@ impl RuntimeActor {
                 }
                 self.drain_queued_user_input(op_tx).await;
             }
-            OperationOutcome::Failed { message } => {
-                let _ = self.core.emit_event(RuntimeEvent::Error { message }).await;
+            OperationOutcome::Failed {
+                class,
+                retryable,
+                message,
+            } => {
+                let _ = self
+                    .core
+                    .emit_event(RuntimeEvent::Failure {
+                        class,
+                        retryable,
+                        message,
+                    })
+                    .await;
                 // Provider failure, not runtime corruption: settle the
                 // applied input and drop the turn without fencing.
                 self.settle_aborted_turn().await;

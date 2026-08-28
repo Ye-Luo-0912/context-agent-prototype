@@ -8,6 +8,7 @@ mod focus;
 mod harness;
 mod opportunity;
 mod policy;
+mod recovery_surface;
 mod safepoint;
 mod scopes;
 mod stream;

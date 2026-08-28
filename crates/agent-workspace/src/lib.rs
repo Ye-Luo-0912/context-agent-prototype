@@ -39,13 +39,11 @@ pub use storage_faults::StorageFaultPlan;
 /// One record in the workspace change journal (`.focus-agent/changes.jsonl`).
 ///
 /// Mutations are journaled as a three-phase transaction so a recovery tool
-/// can tell exactly what happened: `MutationPrepared` (staged, target not
-/// touched), then `MutationCommitted` (atomic rename landed) or
-/// `MutationRolledBack` (staged file removed, target untouched). The
-/// prepared record carries both content hashes, so a later recovery pass can
-/// verify the target still matches what was committed. Kept bounded: old
-/// content is captured only for small files so the journal stays reviewable
-/// without duplicating the whole repository.
+/// can tell exactly what happened. File records track staged/committed/
+/// rolled-back content replacement. Directory records track preparation and
+/// the stable identity of one committed final component. Kept bounded: old
+/// file content is captured only for small files so the journal stays
+/// reviewable without duplicating the whole repository.
 #[derive(Debug, Clone, Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum ChangeRecord {
@@ -67,6 +65,22 @@ pub enum ChangeRecord {
         timestamp_ms: u64,
     },
     MutationRolledBack {
+        tx_id: String,
+        timestamp_ms: u64,
+        reason: String,
+    },
+    DirectoryPrepared {
+        tx_id: String,
+        timestamp_ms: u64,
+        tool: String,
+        path: String,
+    },
+    DirectoryCommitted {
+        tx_id: String,
+        timestamp_ms: u64,
+        entry_identity: String,
+    },
+    DirectoryRolledBack {
         tx_id: String,
         timestamp_ms: u64,
         reason: String,
@@ -377,6 +391,23 @@ pub struct Workspace {
 pub struct MutationSnapshot {
     transaction: MutationTransaction,
     bytes: Vec<u8>,
+}
+
+/// Result of preparing one explicit directory creation. Existing
+/// directories are an idempotent value result; only an absent final
+/// component becomes a Core-committed effect.
+pub enum DirectoryCreationPreparation {
+    AlreadyExists { relative: String },
+    Prepared(Box<PreparedDirectoryCreation>),
+}
+
+impl DirectoryCreationPreparation {
+    pub fn relative_path(&self) -> &str {
+        match self {
+            Self::AlreadyExists { relative } => relative,
+            Self::Prepared(prepared) => &prepared.relative_target,
+        }
+    }
 }
 
 impl MutationSnapshot {
@@ -1090,6 +1121,109 @@ impl Workspace {
         })
     }
 
+    /// Prepare creation of exactly one workspace directory. The immediate
+    /// parent must already exist; recursive topology is expressed as an
+    /// explicit sequence of effects so each component has its own approval,
+    /// journal identity and recovery result.
+    pub async fn prepare_directory_creation(
+        &self,
+        tool: &str,
+        relative: impl AsRef<Path>,
+        effect_context: Option<OperationEffectContext>,
+    ) -> AgentResult<DirectoryCreationPreparation> {
+        if let Some(context) = &effect_context {
+            context.validate().map_err(AgentError::InvalidRequest)?;
+        }
+        let target = self.resolve_mutation(relative).await?;
+        if target == self.root {
+            return Err(AgentError::InvalidRequest(
+                "cannot create the workspace root".into(),
+            ));
+        }
+        let target_name = target
+            .file_name()
+            .ok_or_else(|| AgentError::InvalidRequest("directory path has no final name".into()))?
+            .to_os_string();
+        let relative_target = display_relative(&self.root, &target);
+        let lease_group = self
+            .acquire_mutation_keys(vec![mutation_lock_key(&relative_target)])
+            .await;
+        let parent_rel = target
+            .parent()
+            .and_then(|parent| parent.strip_prefix(&self.root).ok())
+            .unwrap_or_else(|| Path::new(""));
+        let parent = self.confined_existing_parent(parent_rel).await?;
+        match parent.open_child_dir(&target_name) {
+            Ok(_) => {
+                return Ok(DirectoryCreationPreparation::AlreadyExists {
+                    relative: relative_target,
+                });
+            }
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => {
+                if let Ok(entry) = parent.open_existing(&target_name)
+                    && entry.metadata().is_ok_and(|metadata| metadata.is_file())
+                {
+                    return Err(AgentError::InvalidRequest(format!(
+                        "directory target is an existing file: {relative_target}"
+                    )));
+                }
+                return Err(confined_io_error("inspect directory", &target, error));
+            }
+        }
+
+        let tx_id = Uuid::new_v4().to_string();
+        if let Some(context) = &effect_context {
+            self.effect_journal
+                .append_prepared(journal::PreparedEvidence {
+                    tx_id: tx_id.clone(),
+                    context: context.clone(),
+                    relative_target: relative_target.clone(),
+                    temp_name: String::new(),
+                    target_existed: false,
+                    before_hash: String::new(),
+                    after_hash: String::new(),
+                    bytes_before: 0,
+                    bytes_after: 0,
+                    entry_kind: journal::WorkspaceEntryKind::Directory,
+                })?;
+        }
+        if let Err(error) = self
+            .record_change(ChangeRecord::DirectoryPrepared {
+                tx_id: tx_id.clone(),
+                timestamp_ms: now_ms(),
+                tool: tool.to_string(),
+                path: relative_target.clone(),
+            })
+            .await
+        {
+            if effect_context.is_some()
+                && let Err(rollback_error) = self.effect_journal.append_rolled_back(&tx_id)
+            {
+                return Err(AgentError::RecoveryRequired(format!(
+                    "record directory prepare failed ({error}); close workspace authority intent: {rollback_error}"
+                )));
+            }
+            return Err(error);
+        }
+        Ok(DirectoryCreationPreparation::Prepared(Box::new(
+            PreparedDirectoryCreation {
+                workspace: self.clone(),
+                parent,
+                target_name,
+                relative_target,
+                tx_id,
+                effect_context,
+                finished: false,
+                _lease_group: lease_group,
+                #[cfg(test)]
+                crash_after_create: false,
+                #[cfg(test)]
+                fail_bind_after_create: false,
+            },
+        )))
+    }
+
     pub async fn write_artifact(
         &self,
         run_id: RunId,
@@ -1309,6 +1443,285 @@ fn cleanup_staged_file(
     }
 }
 
+/// One absent final directory component whose creation has been durably
+/// prepared but not yet applied. Unlike file replacement there is no staged
+/// user-visible topology: commit performs the single mkdir only after Core's
+/// generation/intent fence, while rollback merely closes the prepared
+/// journal record.
+pub struct PreparedDirectoryCreation {
+    workspace: Workspace,
+    parent: ConfinedDir,
+    target_name: std::ffi::OsString,
+    relative_target: String,
+    tx_id: String,
+    effect_context: Option<OperationEffectContext>,
+    finished: bool,
+    _lease_group: Arc<MutationLeaseGroup>,
+    #[cfg(test)]
+    crash_after_create: bool,
+    #[cfg(test)]
+    fail_bind_after_create: bool,
+}
+
+impl PreparedDirectoryCreation {
+    pub fn tx_id(&self) -> &str {
+        &self.tx_id
+    }
+
+    #[cfg(test)]
+    fn with_crash_after_create(mut self) -> Self {
+        self.crash_after_create = true;
+        self
+    }
+
+    #[cfg(test)]
+    fn with_bind_failure_after_create(mut self) -> Self {
+        self.fail_bind_after_create = true;
+        self
+    }
+
+    async fn record_rolled_back(&self, reason: String) -> AgentResult<()> {
+        if self.effect_context.is_some() {
+            self.workspace
+                .effect_journal
+                .append_rolled_back(&self.tx_id)?;
+        }
+        self.workspace
+            .record_change(ChangeRecord::DirectoryRolledBack {
+                tx_id: self.tx_id.clone(),
+                timestamp_ms: now_ms(),
+                reason,
+            })
+            .await
+    }
+
+    async fn settle_not_applied(&mut self, reason: String) -> EffectReceipt {
+        self.finished = true;
+        match self.record_rolled_back(reason.clone()).await {
+            Ok(()) => EffectReceipt::NotApplied { error: reason },
+            Err(error) => EffectReceipt::Unknown {
+                error: format!(
+                    "{reason}; directory rollback journal could not be confirmed: {error}"
+                ),
+            },
+        }
+    }
+
+    async fn remove_created(&mut self, child: ConfinedDir, reason: String) -> EffectReceipt {
+        if let Err(error) = self.parent.remove_open_dir(&child, &self.target_name) {
+            self.finished = true;
+            return EffectReceipt::Unknown {
+                error: format!(
+                    "{reason}; created directory cleanup could not be confirmed: {error}"
+                ),
+            };
+        }
+        // Windows deletion is pending until the owned handle closes.
+        drop(child);
+        if let Err(error) = self.parent.sync_all() {
+            self.finished = true;
+            return EffectReceipt::Unknown {
+                error: format!("{reason}; sync directory cleanup: {error}"),
+            };
+        }
+        self.settle_not_applied(reason).await
+    }
+
+    pub async fn commit(mut self) -> EffectReceipt {
+        match self.parent.open_child_dir(&self.target_name) {
+            Ok(_) => {
+                return self
+                    .settle_not_applied(format!(
+                        "stale_precondition: directory appeared after prepare: {}",
+                        self.relative_target
+                    ))
+                    .await;
+            }
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => {
+                return self
+                    .settle_not_applied(format!(
+                        "directory precondition could not be verified for {}: {error}",
+                        self.relative_target
+                    ))
+                    .await;
+            }
+        }
+        let child = match self.parent.create_workspace_child_dir(
+            &self.target_name,
+            #[cfg(test)]
+            self.fail_bind_after_create,
+        ) {
+            Ok(child) => child,
+            Err(error) if error.may_have_created() => {
+                self.finished = true;
+                return EffectReceipt::Unknown {
+                    error: format!(
+                        "create directory {} reached the filesystem but its identity could not be bound: {error}",
+                        self.relative_target
+                    ),
+                };
+            }
+            Err(error) => {
+                return self
+                    .settle_not_applied(format!(
+                        "create directory {}: {error}",
+                        self.relative_target
+                    ))
+                    .await;
+            }
+        };
+        let identity = match child.entry_identity() {
+            Ok(identity) => identity,
+            Err(error) => {
+                return self
+                    .remove_created(
+                        child,
+                        format!(
+                            "created directory identity unavailable for {}: {error}",
+                            self.relative_target
+                        ),
+                    )
+                    .await;
+            }
+        };
+        match self
+            .parent
+            .named_entry_matches_dir(&self.target_name, &child)
+        {
+            Ok(true) => {}
+            Ok(false) => {
+                return self
+                    .remove_created(
+                        child,
+                        format!(
+                            "created directory identity changed before commit: {}",
+                            self.relative_target
+                        ),
+                    )
+                    .await;
+            }
+            Err(error) => {
+                return self
+                    .remove_created(
+                        child,
+                        format!(
+                            "created directory identity could not be rebound for {}: {error}",
+                            self.relative_target
+                        ),
+                    )
+                    .await;
+            }
+        }
+        if let Err(error) = child.sync_all().and_then(|()| self.parent.sync_all()) {
+            return self
+                .remove_created(
+                    child,
+                    format!("sync created directory {}: {error}", self.relative_target),
+                )
+                .await;
+        }
+
+        #[cfg(test)]
+        if self.crash_after_create {
+            self.finished = true;
+            drop(child);
+            return EffectReceipt::Unknown {
+                error: "simulated crash after directory creation".into(),
+            };
+        }
+
+        if self.effect_context.is_some()
+            && let Err(error) = self
+                .workspace
+                .effect_journal
+                .append_directory_committed(&self.tx_id, identity.clone())
+        {
+            self.finished = true;
+            return EffectReceipt::Applied {
+                durability: EffectDurability::DurabilityFailed(error.to_string()),
+                evidence: Some(self.tx_id.clone()),
+            };
+        }
+        self.finished = true;
+        if let Err(error) = self
+            .workspace
+            .record_change(ChangeRecord::DirectoryCommitted {
+                tx_id: self.tx_id.clone(),
+                timestamp_ms: now_ms(),
+                entry_identity: identity.clone(),
+            })
+            .await
+        {
+            return EffectReceipt::Applied {
+                durability: EffectDurability::DurabilityFailed(error.to_string()),
+                evidence: Some(self.tx_id.clone()),
+            };
+        }
+        match self
+            .parent
+            .named_entry_matches_dir(&self.target_name, &child)
+        {
+            Ok(true)
+                if child
+                    .entry_identity()
+                    .is_ok_and(|current| current == identity) =>
+            {
+                EffectReceipt::Applied {
+                    durability: EffectDurability::Durable,
+                    evidence: Some(self.tx_id.clone()),
+                }
+            }
+            Ok(_) => EffectReceipt::Applied {
+                durability: EffectDurability::DurabilityFailed(
+                    "created directory identity changed before durable acknowledgement".into(),
+                ),
+                evidence: Some(self.tx_id.clone()),
+            },
+            Err(error) => EffectReceipt::Applied {
+                durability: EffectDurability::DurabilityFailed(format!(
+                    "final created directory identity verification failed: {error}"
+                )),
+                evidence: Some(self.tx_id.clone()),
+            },
+        }
+    }
+
+    pub async fn rollback(mut self, reason: &str) -> AgentResult<()> {
+        self.finished = true;
+        self.record_rolled_back(reason.to_string())
+            .await
+            .map_err(|error| {
+                AgentError::RecoveryRequired(format!(
+                    "directory creation {} rollback could not be confirmed: {error}",
+                    self.tx_id
+                ))
+            })
+    }
+}
+
+#[async_trait]
+impl Effect for PreparedDirectoryCreation {
+    fn describe(&self) -> String {
+        format!("workspace directory creation {}", self.tx_id)
+    }
+
+    fn actual_workspace_writes(&self) -> Option<Vec<agent_contracts::ActualWorkspaceWrite>> {
+        Some(vec![agent_contracts::ActualWorkspaceWrite {
+            path: self.relative_target.clone(),
+            bytes: 0,
+        }])
+    }
+
+    async fn commit(self: Box<Self>) -> EffectReceipt {
+        (*self).commit().await
+    }
+
+    async fn rollback(self: Box<Self>, reason: &str) -> AgentResult<()> {
+        (*self).rollback(reason).await
+    }
+}
+
 /// A single journaled, atomic file mutation, split into prepare and commit.
 ///
 /// For Core-managed effects, `prepare` first persists an authority intent
@@ -1435,6 +1848,7 @@ impl MutationTransaction {
                     after_hash: staged_revision.to_string(),
                     bytes_before: self.bytes_before,
                     bytes_after: content.len() as u64,
+                    entry_kind: journal::WorkspaceEntryKind::File,
                 })?;
         }
 
@@ -2109,7 +2523,25 @@ fn now_ms() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use agent_contracts::{ArgumentDigest, EffectId, OperationId, ToolOperationIdentity, TurnId};
     use std::path::Path;
+
+    fn directory_effect_context() -> OperationEffectContext {
+        OperationEffectContext {
+            identity: ToolOperationIdentity {
+                run_id: RunId::new(),
+                task_id: None,
+                turn_id: TurnId::new(),
+                scope_id: None,
+                operation_id: OperationId::new(),
+                generation: 1,
+                call_id: "mkdir-1".into(),
+                tool_name: "fs.mkdir".into(),
+                argument_digest: ArgumentDigest::sha256_bytes(b"mkdir args"),
+            },
+            effect_id: EffectId::new(),
+        }
+    }
 
     fn try_make_link(link: &Path, target: &Path) -> bool {
         #[cfg(windows)]
@@ -2142,6 +2574,188 @@ mod tests {
             }
         }
         count
+    }
+
+    #[tokio::test]
+    async fn directory_creation_is_one_component_and_recovers_by_identity() {
+        let dir = tempfile::tempdir().unwrap();
+        let workspace = Workspace::open(dir.path()).await.unwrap();
+        let context = directory_effect_context();
+        let preparation = workspace
+            .prepare_directory_creation("fs.mkdir", "src", Some(context.clone()))
+            .await
+            .unwrap();
+        assert!(!workspace.root().join("src").exists());
+        let DirectoryCreationPreparation::Prepared(prepared) = preparation else {
+            panic!("absent directory must produce a prepared effect");
+        };
+        assert!(matches!(
+            prepared.commit().await,
+            EffectReceipt::Applied {
+                durability: EffectDurability::Durable,
+                ..
+            }
+        ));
+        assert!(workspace.root().join("src").is_dir());
+        assert!(matches!(
+            workspace.reconcile_effect(&context).unwrap(),
+            WorkspaceEffectRecovery::Applied { complete: true, .. }
+        ));
+
+        drop(workspace);
+        let reopened = Workspace::open(dir.path()).await.unwrap();
+        assert!(matches!(
+            reopened.reconcile_effect(&context).unwrap(),
+            WorkspaceEffectRecovery::Applied { complete: true, .. }
+        ));
+    }
+
+    #[tokio::test]
+    async fn directory_creation_is_idempotent_and_missing_parents_are_explicit() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir(dir.path().join("existing")).unwrap();
+        let workspace = Workspace::open(dir.path()).await.unwrap();
+        let existing_context = directory_effect_context();
+        assert!(matches!(
+            workspace
+                .prepare_directory_creation("fs.mkdir", "existing", Some(existing_context.clone()))
+                .await
+                .unwrap(),
+            DirectoryCreationPreparation::AlreadyExists { .. }
+        ));
+        assert_eq!(
+            workspace.reconcile_effect(&existing_context).unwrap(),
+            WorkspaceEffectRecovery::NotManaged
+        );
+
+        let missing_context = directory_effect_context();
+        assert!(matches!(
+            workspace
+                .prepare_directory_creation(
+                    "fs.mkdir",
+                    "missing/child",
+                    Some(missing_context.clone())
+                )
+                .await,
+            Err(AgentError::InvalidRequest(message)) if message.contains("parent directory not found")
+        ));
+        assert!(!workspace.root().join("missing").exists());
+        assert_eq!(
+            workspace.reconcile_effect(&missing_context).unwrap(),
+            WorkspaceEffectRecovery::NotManaged
+        );
+    }
+
+    #[tokio::test]
+    async fn directory_rollback_and_precondition_race_leave_foreign_topology_intact() {
+        let dir = tempfile::tempdir().unwrap();
+        let workspace = Workspace::open(dir.path()).await.unwrap();
+        let rollback_context = directory_effect_context();
+        let DirectoryCreationPreparation::Prepared(prepared) = workspace
+            .prepare_directory_creation("fs.mkdir", "rolled-back", Some(rollback_context.clone()))
+            .await
+            .unwrap()
+        else {
+            panic!("absent directory must prepare");
+        };
+        prepared.rollback("stale operation").await.unwrap();
+        assert!(!workspace.root().join("rolled-back").exists());
+        assert!(matches!(
+            workspace.reconcile_effect(&rollback_context).unwrap(),
+            WorkspaceEffectRecovery::NotApplied { .. }
+        ));
+
+        let race_context = directory_effect_context();
+        let DirectoryCreationPreparation::Prepared(prepared) = workspace
+            .prepare_directory_creation("fs.mkdir", "raced", Some(race_context.clone()))
+            .await
+            .unwrap()
+        else {
+            panic!("absent directory must prepare");
+        };
+        std::fs::create_dir(workspace.root().join("raced")).unwrap();
+        assert!(matches!(
+            prepared.commit().await,
+            EffectReceipt::NotApplied { .. }
+        ));
+        assert!(workspace.root().join("raced").is_dir());
+        assert!(matches!(
+            workspace.reconcile_effect(&race_context).unwrap(),
+            WorkspaceEffectRecovery::NotApplied { .. }
+        ));
+    }
+
+    #[tokio::test]
+    async fn crash_after_directory_create_is_ambiguous_without_committed_identity() {
+        let dir = tempfile::tempdir().unwrap();
+        let workspace = Workspace::open(dir.path()).await.unwrap();
+        let context = directory_effect_context();
+        let DirectoryCreationPreparation::Prepared(prepared) = workspace
+            .prepare_directory_creation("fs.mkdir", "uncertain", Some(context.clone()))
+            .await
+            .unwrap()
+        else {
+            panic!("absent directory must prepare");
+        };
+        assert!(matches!(
+            prepared.with_crash_after_create().commit().await,
+            EffectReceipt::Unknown { .. }
+        ));
+        assert!(workspace.root().join("uncertain").is_dir());
+
+        drop(workspace);
+        let reopened = Workspace::open(dir.path()).await.unwrap();
+        assert!(matches!(
+            reopened.reconcile_effect(&context).unwrap(),
+            WorkspaceEffectRecovery::Ambiguous { .. }
+        ));
+    }
+
+    #[tokio::test]
+    async fn post_create_bind_failure_never_claims_not_applied() {
+        let dir = tempfile::tempdir().unwrap();
+        let workspace = Workspace::open(dir.path()).await.unwrap();
+        let context = directory_effect_context();
+        let DirectoryCreationPreparation::Prepared(prepared) = workspace
+            .prepare_directory_creation("fs.mkdir", "unbound", Some(context.clone()))
+            .await
+            .unwrap()
+        else {
+            panic!("absent directory must prepare");
+        };
+        assert!(matches!(
+            prepared.with_bind_failure_after_create().commit().await,
+            EffectReceipt::Unknown { .. }
+        ));
+        assert!(workspace.root().join("unbound").is_dir());
+
+        drop(workspace);
+        let reopened = Workspace::open(dir.path()).await.unwrap();
+        assert!(matches!(
+            reopened.reconcile_effect(&context).unwrap(),
+            WorkspaceEffectRecovery::Ambiguous { .. }
+        ));
+    }
+
+    #[tokio::test]
+    async fn directory_creation_refuses_files_and_runtime_state() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("occupied"), b"file").unwrap();
+        let workspace = Workspace::open(dir.path()).await.unwrap();
+        assert!(
+            workspace
+                .prepare_directory_creation("fs.mkdir", "occupied", None)
+                .await
+                .is_err()
+        );
+        assert!(
+            workspace
+                .prepare_directory_creation("fs.mkdir", ".focus-agent/owned", None)
+                .await
+                .is_err()
+        );
+        assert!(workspace.root().join("occupied").is_file());
+        assert!(!workspace.state_dir().join("owned").exists());
     }
 
     #[tokio::test]

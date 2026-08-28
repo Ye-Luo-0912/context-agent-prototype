@@ -230,6 +230,22 @@ impl RoundSurfacePlan {
         );
     }
 
+    /// Relabel requirements whose trust is a runtime-derived recovery
+    /// signal. The model cannot mint `RecoverySurface`; only the typed
+    /// recovery pipeline can mark an exact tool (for example `fs.mkdir`
+    /// after a trusted `parent_path_not_found`).
+    pub(crate) fn mark_recovery_tools(&mut self, tools: &HashSet<String>) {
+        let mut relabel = Vec::new();
+        for name in self.origins.keys() {
+            if tools.contains(name) {
+                relabel.push(name.clone());
+            }
+        }
+        for name in relabel {
+            self.origins.insert(name, ToolSurfaceOrigin::RecoverySurface);
+        }
+    }
+
     /// Final provider-window degradation: remove only a non-mandatory entry
     /// from this local plan. Catalog lifecycle and generation are unreachable.
     pub(crate) fn omit_largest_for_provider_budget(&mut self) -> Option<ToolSpec> {
@@ -817,5 +833,88 @@ mod tests {
         });
         let row: ToolSurfaceOmission = serde_json::from_value(json).unwrap();
         assert_eq!(row.origin, ToolSurfaceOrigin::Unknown);
+    }
+
+    #[test]
+    fn recovery_mark_relabels_only_the_exact_tool() {
+        let candidates = ToolSurfaceSnapshot {
+            specs: vec![
+                spec("fs.mkdir", 100),
+                spec("task.pick", 100),
+                spec("catalog.pick", 100),
+                spec("core.mandatory", 100),
+            ],
+            ..Default::default()
+        };
+        let requirements = vec![
+            requirement("fs.mkdir", ToolSurfaceDemand::PreferSurface),
+            requirement("task.pick", ToolSurfaceDemand::PreferSurface),
+        ];
+        let mut plan =
+            RoundSurfacePlan::build(candidates, &requirements, |name| name != "core.mandatory");
+        plan.mark_recovery_tools(&std::collections::HashSet::from(["fs.mkdir".to_string()]));
+
+        assert_eq!(
+            plan.origins.get("fs.mkdir"),
+            Some(&ToolSurfaceOrigin::RecoverySurface)
+        );
+        assert_eq!(
+            plan.origins.get("task.pick"),
+            Some(&ToolSurfaceOrigin::TaskRequirement)
+        );
+        assert_eq!(
+            plan.origins.get("catalog.pick"),
+            Some(&ToolSurfaceOrigin::CatalogLoadedOptional)
+        );
+        assert_eq!(
+            plan.origins.get("core.mandatory"),
+            Some(&ToolSurfaceOrigin::DispatcherRequired)
+        );
+
+        // The report row answers "why" truthfully: provenance is
+        // runtime-derived recovery, not a task pin or a catalog load.
+        let report = plan.ready_report(SurfaceReportContext {
+            turn_id: TurnId::new(),
+            model_round: 1,
+            surface_revision: 1,
+            estimated_input_tokens: 0,
+            input_budget_tokens: 0,
+        });
+        let mkdir_row = report
+            .selected
+            .iter()
+            .find(|row| row.tool_name == "fs.mkdir")
+            .expect("fs.mkdir stays selected after relabel");
+        assert_eq!(mkdir_row.origin, ToolSurfaceOrigin::RecoverySurface);
+        assert_eq!(mkdir_row.demand, ToolSurfaceDemand::PreferSurface);
+    }
+
+    #[test]
+    fn recovery_mark_never_touches_absent_or_unrelated_tools() {
+        let candidates = ToolSurfaceSnapshot {
+            specs: vec![spec("fs.read", 100), spec("fs.write", 100)],
+            ..Default::default()
+        };
+        let mut plan = RoundSurfacePlan::build(candidates, &[], |_| true);
+        plan.mark_recovery_tools(&std::collections::HashSet::from([
+            "fs.mkdir".to_string(),
+        ]));
+
+        // `fs.mkdir` is not in this plan at all; marking an absent tool must
+        // not fabricate an origin entry. `fs.write` here is a plain catalog
+        // load and must not be relabeled by a recovery claim either.
+        assert_eq!(
+            plan.origins.get("fs.mkdir"),
+            None,
+            "marking an absent tool must not fabricate an origin entry"
+        );
+        assert_eq!(
+            plan.origins.get("fs.write"),
+            Some(&ToolSurfaceOrigin::CatalogLoadedOptional)
+        );
+        assert_eq!(
+            plan.origins.get("fs.read"),
+            Some(&ToolSurfaceOrigin::CatalogLoadedOptional)
+        );
     }
 }

@@ -6,8 +6,8 @@ use std::time::Duration;
 
 use agent_contracts::{
     AgentError, AgentResult, ContextEngine, ContextKind, RuntimeEvent, RuntimeEventEnvelope,
-    ToolCatalogEntry, ToolDispatcher, ToolExecutionRequest, ToolLeaseBoundary, ToolLifecycle,
-    ToolOutcome, ToolRisk, ToolSpec, ToolSurfaceBlockReason, ToolSurfaceDemand,
+    RuntimeFailureClass, ToolCatalogEntry, ToolDispatcher, ToolExecutionRequest, ToolLeaseBoundary,
+    ToolLifecycle, ToolOutcome, ToolRisk, ToolSpec, ToolSurfaceBlockReason, ToolSurfaceDemand,
     ToolSurfaceOmissionReason, ToolSurfacePlanStatus, ToolSurfaceRequirement,
 };
 use agent_core::{CoreAuthorityConfig, PolicyApprovalGate};
@@ -1135,7 +1135,7 @@ async fn must_surface_overflow_is_unsatisfiable_before_model_start() {
 /// `TurnCommitFailed` may be journaled for it, but the applied user input
 /// must still settle out of Applied instead of dangling there forever.
 #[tokio::test]
-async fn unsatisfiable_round_settles_the_input_without_a_failure_marker() {
+async fn unsatisfiable_round_settles_input_and_reports_typed_budget_refusal() {
     use agent_contracts::{InputLifecycle, ToolSurfaceDemand, ToolSurfaceRequirement};
 
     let model = Arc::new(VariableWindowModel::new(1_600));
@@ -1183,12 +1183,16 @@ async fn unsatisfiable_round_settles_the_input_without_a_failure_marker() {
     tokio::time::sleep(Duration::from_millis(100)).await;
     let mut settled = false;
     let mut saw_commit_failed = false;
+    let mut saw_input_budget = false;
     while let Ok(envelope) = all_events.try_recv() {
         match envelope.event {
             RuntimeEvent::UserMessageAccepted { input } => {
                 settled |= input.lifecycle == InputLifecycle::InterruptCommitted;
             }
             RuntimeEvent::TurnCommitFailed { .. } => saw_commit_failed = true,
+            RuntimeEvent::Failure { class, .. } => {
+                saw_input_budget |= class == RuntimeFailureClass::InputBudget;
+            }
             _ => {}
         }
     }
@@ -1200,6 +1204,7 @@ async fn unsatisfiable_round_settles_the_input_without_a_failure_marker() {
         !saw_commit_failed,
         "a deliberate refusal must not journal a turn-commit failure"
     );
+    assert!(saw_input_budget, "the refusal must retain its typed cause");
     assert!(model.requests.lock().unwrap().is_empty());
     handle.stop().await.unwrap();
 }
@@ -1548,19 +1553,26 @@ async fn final_guard_refuses_an_unshrinkable_over_budget_request() {
     handle.start().await.unwrap();
     handle.user_message("hello".into()).await.unwrap();
 
-    let mut saw_error = false;
+    let mut saw_input_budget_failure = false;
     let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
     while tokio::time::Instant::now() < deadline {
         while let Ok(envelope) = events.try_recv() {
-            if matches!(envelope.event, RuntimeEvent::Error { .. }) {
-                saw_error = true;
+            if matches!(
+                envelope.event,
+                RuntimeEvent::Failure {
+                    class: RuntimeFailureClass::InputBudget,
+                    retryable: false,
+                    ..
+                }
+            ) {
+                saw_input_budget_failure = true;
             }
         }
         tokio::time::sleep(Duration::from_millis(10)).await;
     }
     assert!(
-        saw_error,
-        "an unshrinkable over-budget request must surface a hard error"
+        saw_input_budget_failure,
+        "an unshrinkable over-budget request must surface a typed hard failure"
     );
     assert_eq!(
         model.calls(),

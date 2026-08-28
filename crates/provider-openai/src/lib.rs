@@ -34,7 +34,7 @@ use serde_json::{Value, json};
 use tokio_util::codec::{FramedRead, LinesCodec};
 use tokio_util::io::StreamReader;
 
-use crate::responses::ResponsesAccumulator;
+use crate::responses::{ResponseStreamErrorKind, ResponsesAccumulator};
 use crate::sse::{StreamAccumulator, WireChunk, parse_sse_data};
 use crate::wire_names::ToolNameCodec;
 
@@ -476,7 +476,19 @@ impl OpenAiProvider {
         }
 
         if let Some(error) = accumulator.take_terminal_error() {
-            return Err(ProtocolError::transport(error.retryable, error.message));
+            return Err(match error.kind {
+                ResponseStreamErrorKind::OutputLimit => {
+                    ProtocolError::from(AgentError::ModelOutputLimit {
+                        reason: error.message,
+                    })
+                }
+                ResponseStreamErrorKind::Model => {
+                    ProtocolError::from(AgentError::Model(error.message))
+                }
+                ResponseStreamErrorKind::Transport => {
+                    ProtocolError::transport(error.retryable, error.message)
+                }
+            });
         }
         let (content, tool_calls, usage) = accumulator.finalize();
         let tool_calls = codec.remap_calls(tool_calls);

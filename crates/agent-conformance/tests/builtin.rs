@@ -95,6 +95,7 @@ fn representative_calls() -> Vec<(String, Value)> {
             "fs.write".into(),
             json!({"path": "conformance.tmp", "content": "hello"}),
         ),
+        ("fs.mkdir".into(), json!({"path": "generated"})),
         (
             "edit.replace".into(),
             json!({"path": "src/main.rs", "old": "fn main", "new": "fn entry"}),
@@ -125,6 +126,7 @@ fn confined_calls() -> Vec<(String, Value)> {
             "fs.write".into(),
             json!({"path": "/tmp/escape.txt", "content": "x"}),
         ),
+        ("fs.mkdir".into(), json!({"path": "/tmp/escape-dir"})),
         (
             "edit.replace".into(),
             json!({"path": "/etc/passwd", "old": "a", "new": "b"}),

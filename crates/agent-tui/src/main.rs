@@ -140,6 +140,7 @@ async fn main() -> anyhow::Result<()> {
         max_tool_rounds: None,
         project_task_progress: true,
         project_completion_opportunity: false,
+        recovery_surface: false,
         host_policies: Some(host_policies),
         effect_reservation_journal: Some(reservation_journal),
     })

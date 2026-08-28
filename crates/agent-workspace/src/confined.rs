@@ -54,9 +54,10 @@ use windows_sys::Wdk::{
 use windows_sys::Win32::{
     Foundation::{GENERIC_READ, GENERIC_WRITE, HANDLE, INVALID_HANDLE_VALUE, UNICODE_STRING},
     Storage::FileSystem::{
-        CreateFileW, FILE_ATTRIBUTE_TAG_INFO, FILE_FLAG_BACKUP_SEMANTICS,
-        FILE_FLAG_OPEN_REPARSE_POINT, FILE_RENAME_INFO, FILE_SHARE_DELETE, FILE_SHARE_READ,
-        FILE_SHARE_WRITE, FileAttributeTagInfo, GetFileInformationByHandleEx, SYNCHRONIZE,
+        BY_HANDLE_FILE_INFORMATION, CreateFileW, FILE_ATTRIBUTE_TAG_INFO,
+        FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT, FILE_RENAME_INFO,
+        FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE, FileAttributeTagInfo,
+        GetFileInformationByHandle, GetFileInformationByHandleEx, SYNCHRONIZE,
     },
     System::IO::IO_STATUS_BLOCK,
 };
@@ -70,6 +71,50 @@ pub struct ConfinedDir {
     #[cfg(windows)]
     handle: std::os::windows::io::OwnedHandle,
     display: PathBuf,
+}
+
+/// Whether a failed directory-create primitive is known not to have changed
+/// topology. Once the create syscall succeeds, inability to bind/identify the
+/// new object must remain uncertain; callers may not record `NotApplied`.
+#[derive(Debug)]
+pub(crate) struct DirectoryCreateError {
+    source: io::Error,
+    may_have_created: bool,
+}
+
+impl DirectoryCreateError {
+    fn not_created(source: io::Error) -> Self {
+        Self {
+            source,
+            may_have_created: false,
+        }
+    }
+
+    #[cfg(any(unix, test, not(any(unix, windows))))]
+    fn created_but_unbound(source: io::Error) -> Self {
+        Self {
+            source,
+            may_have_created: true,
+        }
+    }
+
+    pub(crate) fn may_have_created(&self) -> bool {
+        self.may_have_created
+    }
+}
+
+impl std::fmt::Display for DirectoryCreateError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        if self.may_have_created {
+            write!(
+                formatter,
+                "directory was created but could not be bound: {}",
+                self.source
+            )
+        } else {
+            self.source.fmt(formatter)
+        }
+    }
 }
 
 impl std::fmt::Debug for ConfinedDir {
@@ -215,6 +260,210 @@ impl ConfinedDir {
         #[cfg(not(any(unix, windows)))]
         {
             std::fs::create_dir(self.display.join(name))
+        }
+    }
+
+    /// Create one user-visible workspace directory and return a pinned
+    /// handle that prevents replacement while the owning effect settles.
+    /// This is deliberately a single component: recursive topology belongs
+    /// to an explicit sequence of effects, not an implicit mkdir-p side
+    /// effect hidden inside a file write.
+    pub(crate) fn create_workspace_child_dir(
+        &self,
+        name: &OsStr,
+        #[cfg(test)] fail_bind_after_create: bool,
+    ) -> Result<Self, DirectoryCreateError> {
+        #[cfg(not(unix))]
+        let child_display = self.display.join(name);
+        #[cfg(unix)]
+        {
+            let cname = to_cstring(name).map_err(DirectoryCreateError::not_created)?;
+            // SAFETY: the name is NUL-terminated and resolved relative to
+            // the pinned parent. 0o777 is narrowed by the process umask.
+            let rc = unsafe { libc::mkdirat(self.fd.as_raw_fd(), cname.as_ptr(), 0o777) };
+            if rc != 0 {
+                return Err(DirectoryCreateError::not_created(io::Error::last_os_error()));
+            }
+            #[cfg(test)]
+            if fail_bind_after_create {
+                return Err(DirectoryCreateError::created_but_unbound(io::Error::other(
+                    "injected identity-bind failure",
+                )));
+            }
+            let child = self
+                .open_child_dir(name)
+                .map_err(DirectoryCreateError::created_but_unbound)?;
+            if !self
+                .named_entry_matches_dir(name, &child)
+                .map_err(DirectoryCreateError::created_but_unbound)?
+            {
+                return Err(DirectoryCreateError::created_but_unbound(io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    "created directory name no longer identifies its open handle",
+                )));
+            }
+            Ok(child)
+        }
+        #[cfg(windows)]
+        {
+            // Deny write/delete sharing until commit/rollback settles. The
+            // FILE_CREATE + FILE_DIRECTORY_FILE result is a new ordinary
+            // directory, and no competing writer can turn it into a reparse
+            // point or populate it behind this handle before settlement.
+            let handle = nt_open_relative_with_share(
+                self.handle.as_raw_handle(),
+                name,
+                DIR_ACCESS | DELETE_ACCESS,
+                FILE_CREATE,
+                FILE_DIRECTORY_FILE | FILE_OPEN_REPARSE_POINT,
+                FILE_SHARE_READ,
+            )
+            .map_err(DirectoryCreateError::not_created)?;
+            // SAFETY: `handle` is fresh and uniquely owned.
+            let handle = unsafe { std::os::windows::io::OwnedHandle::from_raw_handle(handle) };
+            #[cfg(test)]
+            if fail_bind_after_create {
+                return Err(DirectoryCreateError::created_but_unbound(io::Error::other(
+                    "injected identity-bind failure",
+                )));
+            }
+            Ok(Self {
+                handle,
+                display: child_display,
+            })
+        }
+        #[cfg(not(any(unix, windows)))]
+        {
+            std::fs::create_dir(&child_display).map_err(DirectoryCreateError::not_created)?;
+            #[cfg(test)]
+            if fail_bind_after_create {
+                return Err(DirectoryCreateError::created_but_unbound(io::Error::other(
+                    "injected identity-bind failure",
+                )));
+            }
+            Self::open_root(&child_display).map_err(DirectoryCreateError::created_but_unbound)
+        }
+    }
+
+    /// Stable filesystem identity used by the directory-effect journal.
+    /// Unsupported platforms fail closed instead of substituting a path or
+    /// timestamp for object identity.
+    pub(crate) fn entry_identity(&self) -> io::Result<String> {
+        #[cfg(unix)]
+        {
+            let mut stat = std::mem::MaybeUninit::<libc::stat>::uninit();
+            // SAFETY: `stat` has the exact output layout and the directory
+            // descriptor remains live for the call.
+            if unsafe { libc::fstat(self.fd.as_raw_fd(), stat.as_mut_ptr()) } != 0 {
+                return Err(io::Error::last_os_error());
+            }
+            // SAFETY: successful fstat initialized the value.
+            let stat = unsafe { stat.assume_init() };
+            Ok(format!("unix:{}:{}", stat.st_dev, stat.st_ino))
+        }
+        #[cfg(windows)]
+        {
+            let mut info = std::mem::MaybeUninit::<BY_HANDLE_FILE_INFORMATION>::zeroed();
+            // SAFETY: `info` is a correctly sized output buffer and the
+            // directory handle remains live for the call.
+            let ok = unsafe {
+                GetFileInformationByHandle(self.handle.as_raw_handle(), info.as_mut_ptr())
+            };
+            if ok == 0 {
+                return Err(io::Error::last_os_error());
+            }
+            // SAFETY: successful API call initialized the structure.
+            let info = unsafe { info.assume_init() };
+            let index = (u64::from(info.nFileIndexHigh) << 32) | u64::from(info.nFileIndexLow);
+            Ok(format!("windows:{}:{index}", info.dwVolumeSerialNumber))
+        }
+        #[cfg(not(any(unix, windows)))]
+        {
+            Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "stable directory identity is unavailable on this platform",
+            ))
+        }
+    }
+
+    pub(crate) fn named_entry_matches_dir(&self, name: &OsStr, child: &Self) -> io::Result<bool> {
+        #[cfg(windows)]
+        let named = {
+            // The created handle deliberately denies competing write/delete
+            // sharing until settlement. Rebinding needs identity metadata
+            // only, so request read access rather than conflicting with our
+            // own pinned handle's sharing contract.
+            let display = self.display.join(name);
+            let handle = nt_open_relative(
+                self.handle.as_raw_handle(),
+                name,
+                GENERIC_READ | SYNCHRONIZE,
+                FILE_OPEN,
+                FILE_DIRECTORY_FILE | FILE_OPEN_REPARSE_POINT,
+            )?;
+            // SAFETY: `handle` is fresh and uniquely owned.
+            let handle = unsafe { std::os::windows::io::OwnedHandle::from_raw_handle(handle) };
+            check_not_reparse(handle.as_raw_handle(), &display)?;
+            Self { handle, display }
+        };
+        #[cfg(not(windows))]
+        let named = self.open_child_dir(name)?;
+        Ok(named.entry_identity()? == child.entry_identity()?)
+    }
+
+    /// Remove exactly the pinned empty child directory. A non-empty or
+    /// substituted entry is never recursively deleted.
+    pub(crate) fn remove_open_dir(&self, child: &Self, name: &OsStr) -> io::Result<()> {
+        #[cfg(unix)]
+        {
+            if !self.named_entry_matches_dir(name, child)? {
+                return Err(io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    "directory name no longer identifies its open handle",
+                ));
+            }
+            let cname = to_cstring(name)?;
+            // SAFETY: the NUL-terminated name is resolved relative to the
+            // pinned parent and AT_REMOVEDIR refuses files/non-empty dirs.
+            let rc =
+                unsafe { libc::unlinkat(self.fd.as_raw_fd(), cname.as_ptr(), libc::AT_REMOVEDIR) };
+            if rc == 0 {
+                Ok(())
+            } else {
+                Err(io::Error::last_os_error())
+            }
+        }
+        #[cfg(windows)]
+        {
+            if !self.named_entry_matches_dir(name, child)? {
+                return Err(io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    "directory name no longer identifies its open handle",
+                ));
+            }
+            let disposition = FILE_DISPOSITION_INFORMATION { DeleteFile: 1 };
+            let mut io_status: IO_STATUS_BLOCK = unsafe { std::mem::zeroed() };
+            // SAFETY: the child was opened with DELETE access and remains
+            // live; the fixed-size input buffer is valid for the call.
+            let status = unsafe {
+                NtSetInformationFile(
+                    child.handle.as_raw_handle(),
+                    &mut io_status,
+                    &disposition as *const FILE_DISPOSITION_INFORMATION as *const core::ffi::c_void,
+                    std::mem::size_of::<FILE_DISPOSITION_INFORMATION>() as u32,
+                    FileDispositionInformation,
+                )
+            };
+            if status >= 0 {
+                Ok(())
+            } else {
+                Err(ntstatus_to_io(status))
+            }
+        }
+        #[cfg(not(any(unix, windows)))]
+        {
+            let _ = child;
+            std::fs::remove_dir(self.display.join(name))
         }
     }
 

@@ -13,6 +13,8 @@
 
 use std::path::Path;
 
+use sha2::{Digest, Sha256};
+
 // ---------------------------------------------------------------------------
 // Fixture registry
 // ---------------------------------------------------------------------------
@@ -41,6 +43,35 @@ pub fn fixture(id: &str) -> Option<&'static M15Fixture> {
 }
 
 pub const FIXTURES: &[M15Fixture] = &[RETRY_DIAG_DEV, RETRY_MIGRATE_DEV];
+
+/// Canonical identity of every frozen input that can change a pack's task or
+/// verdict. Function pointers are represented by their stable check names;
+/// deterministic self-tests pin the corresponding predicate behavior.
+pub fn spec_sha256(id: &str) -> String {
+    let fixture = fixture(id).expect("registered fixture id");
+    let mut hasher = Sha256::new();
+    hasher.update(fixture.id.as_bytes());
+    hasher.update(b"\n");
+    hasher.update(fixture.directive.as_bytes());
+    hasher.update(b"\n");
+    for (path, body) in fixture.files {
+        hasher.update(path.as_bytes());
+        hasher.update(b"\n");
+        hasher.update(body.as_bytes());
+        hasher.update(b"\n");
+    }
+    for check in fixture.checks {
+        hasher.update(check.path.as_bytes());
+        hasher.update(b"\n");
+        hasher.update(check.name.as_bytes());
+        hasher.update(b"\n");
+    }
+    hasher.update(fixture.oracle_name.as_bytes());
+    hasher.update(b"\n");
+    hasher.update(fixture.oracle_source.as_bytes());
+    let digest = hasher.finalize();
+    digest.iter().map(|byte| format!("{byte:02x}")).collect()
+}
 
 /// Materialize the frozen seed into a fresh workspace root.
 pub fn seed(root: &Path, id: &str) -> anyhow::Result<()> {
@@ -244,7 +275,10 @@ const DIAG_FILES: &[(&str, &str)] = &[
     ("src/config.rs", DIAG_CONFIG),
     ("src/sleeper.rs", DIAG_SLEEPER),
     ("src/backoff.rs", DIAG_BACKOFF_SEED),
-    ("README.md", "# jobrunner (diag fixture)\n\nRetry contract: first retry = `base_delay_ms`; double and saturate at `max_delay_ms`.\n"),
+    (
+        "README.md",
+        "# jobrunner (diag fixture)\n\nRetry contract: first retry = `base_delay_ms`; double and saturate at `max_delay_ms`.\n",
+    ),
 ];
 
 const DIAG_CHECKS: &[PackCheck] = &[
@@ -252,7 +286,11 @@ const DIAG_CHECKS: &[PackCheck] = &[
         path: "DIAGNOSIS.md",
         name: "diagnosis names next_delay and the off-by-one mechanism",
         accept: |body| {
-            body.contains("next_delay") && body.contains("attempt") && (body.contains("shift") || body.contains("off-by-one") || body.contains("first retry"))
+            body.contains("next_delay")
+                && body.contains("attempt")
+                && (body.contains("shift")
+                    || body.contains("off-by-one")
+                    || body.contains("first retry"))
         },
     },
     PackCheck {
@@ -273,7 +311,9 @@ const DIAG_CHECKS: &[PackCheck] = &[
     PackCheck {
         path: "src/config.rs",
         name: "config untouched",
-        accept: |body| body.contains("pub base_delay_ms: u64") && body.contains("pub max_delay_ms: u64"),
+        accept: |body| {
+            body.contains("pub base_delay_ms: u64") && body.contains("pub max_delay_ms: u64")
+        },
     },
     PackCheck {
         path: "README.md",

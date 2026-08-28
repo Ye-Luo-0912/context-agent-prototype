@@ -4,9 +4,9 @@ use serde::{Deserialize, Serialize};
 use crate::{
     AgentResult, CompactionReason, ContextConsumptionAck, ContextDiagnostics, ContextGcReport,
     ContextMaintenanceReport, ContextMaintenanceTrigger, ContextSelection, ContextStateTransition,
-    OperationId, OperationSnapshot, RunId, RuntimeInputEnvelope, ScopeId, StorageGcReport, TaskId,
-    ToolCall, ToolLeaseReconcileReport, ToolOutput, ToolSurfacePlanReport, ToolSurfaceRequirement,
-    TurnId,
+    OperationId, OperationSnapshot, RunId, RuntimeFailureClass, RuntimeInputEnvelope, ScopeId,
+    StorageGcReport, TaskId, ToolCall, ToolLeaseReconcileReport, ToolOutput, ToolSurfacePlanReport,
+    ToolSurfaceRequirement, TurnId,
 };
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -14,10 +14,10 @@ pub struct RuntimeEventEnvelope {
     pub run_id: RunId,
     /// Cursor in the durable event journal for this run. Journaled events
     /// advance it exactly once and are therefore contiguous from 1.
-    /// `ModelDelta` is live-only: it repeats the cursor of the preceding
-    /// `ModelStarted` and never consumes a durable sequence number. Live
-    /// consumers must use the delta's turn/operation/generation identity as
-    /// its supersession fence, not treat this cursor as a delivery counter.
+    /// `ModelDelta` and `ModelRetrying` are live-only: they repeat the cursor
+    /// of the preceding durable event and never consume a durable sequence
+    /// number. Live consumers use their turn/operation/generation identity
+    /// as the supersession fence, not this cursor as a delivery counter.
     pub seq: u64,
     pub timestamp_ms: u64,
     pub event: RuntimeEvent,
@@ -396,6 +396,25 @@ pub enum RuntimeEvent {
     },
     Error {
         message: String,
+    },
+    /// A typed execution failure. Consumers use `class` for policy and keep
+    /// `message` only as bounded diagnostics; provider/runtime attribution
+    /// must never be reconstructed from message text.
+    Failure {
+        class: RuntimeFailureClass,
+        #[serde(default)]
+        retryable: bool,
+        message: String,
+    },
+    /// A retryable provider attempt ended before emitting a usable result.
+    /// This live-only progress signal keeps outer watchdogs honest while the
+    /// transport performs its bounded retry policy.
+    ModelRetrying {
+        turn_id: TurnId,
+        operation_id: OperationId,
+        generation: u64,
+        attempt: u32,
+        delay_ms: u64,
     },
     /// One task completed: the runtime committed a typed CompletionRecord
     /// for it. Carries the task/result identity (task id and the anchor

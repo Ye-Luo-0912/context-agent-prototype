@@ -272,7 +272,10 @@ pub fn analyze_cell(
             .is_some_and(|last| matches!(last.event, RuntimeEvent::RunCompleted));
 
     for envelope in events.iter().take(MAX_EVENTS) {
-        if !matches!(envelope.event, RuntimeEvent::ModelDelta { .. }) {
+        if !matches!(
+            envelope.event,
+            RuntimeEvent::ModelDelta { .. } | RuntimeEvent::ModelRetrying { .. }
+        ) {
             if let Some(previous) = previous_seq
                 && envelope.seq != previous + 1
             {

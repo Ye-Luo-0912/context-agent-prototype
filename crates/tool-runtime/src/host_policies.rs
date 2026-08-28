@@ -34,6 +34,13 @@ pub static BUILTIN_TOOL_POLICIES: LazyLock<Vec<HostToolPolicy>> = LazyLock::new(
             },
         },
         HostToolPolicy {
+            tool_name: "fs.mkdir".into(),
+            binding: HostEffectBinding::WorkspaceWrite {
+                path_arg: "path".into(),
+                content_args: vec![],
+            },
+        },
+        HostToolPolicy {
             tool_name: "edit.replace".into(),
             binding: HostEffectBinding::WorkspaceWrite {
                 path_arg: "path".into(),
@@ -128,6 +135,22 @@ mod tests {
             EffectIntent::WorkspaceWrite {
                 path: "src/a.rs".into(),
                 content_bytes: "fn main() {}".len() as u64,
+            }
+        );
+    }
+
+    #[test]
+    fn mkdir_intent_binds_the_path_with_zero_content_bytes() {
+        let call = ToolCall {
+            id: "c".into(),
+            name: "fs.mkdir".into(),
+            arguments: json!({"path": "src/generated"}),
+        };
+        assert_eq!(
+            source().effect_intent(&call, &spec("fs.mkdir", ToolRisk::WorkspaceWrite)),
+            EffectIntent::WorkspaceWrite {
+                path: "src/generated".into(),
+                content_bytes: 0,
             }
         );
     }

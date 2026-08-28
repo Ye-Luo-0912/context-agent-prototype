@@ -257,7 +257,9 @@ impl ExecutionState {
         // 义务账本：先解析（本输出可能已解除旧义务或推进 epoch），再
         // 登记新失败；账目事件随 FrontierObservation 出账（ ）。
         let mut obligation_events = Vec::new();
-        self.resolve_obligations(output, &mut obligation_events);
+        let trusted_verification_pass = output.ok
+            && attribution.is_some_and(RuntimeExecutionAttribution::reusable_verification);
+        self.resolve_obligations(output, trusted_verification_pass, &mut obligation_events);
         self.record_obligation(
             output,
             &identity,

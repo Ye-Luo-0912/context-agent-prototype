@@ -86,7 +86,15 @@ Context packing, GC, and retrieval live in
    gives the model room to retry once more; it never clears the debt.
    Only blocker-specific proof resolves an obligation — for
    ExecutableResolution, a successful launch carrying the same scope
-   key *and* fingerprint.
+   key *and* fingerprint. An EditTarget row is narrower: it records a failed
+   editing plan, not an authoritative user requirement. A newer digest still
+   resolves it directly; a later successful verifier may also supersede it,
+   but only when verification authority came from trusted pre-dispatch
+   attribution. Producer metadata, an ordinary command success and unrelated
+   read evidence cannot use this route. This prevents a stale optional edit
+   from forcing a needless mutation after the current workspace has already
+   passed its trusted verifier, while executable/resource blockers remain
+   hard completion debt.
 
 9. **CachedBytesPresent ≠ BodyCurrentlyTrusted.**
    Unknown-footprint mutations suspend cached protocol bodies (bytes
@@ -200,6 +208,26 @@ effect receipts journal only spawn identity). The cost is revalidation
 after every poll, including read-only dev-server sessions — the same
 price `shell.exec` already pays for the same authority class and is
 accepted as the single-trust-family rule.
+
+### Typed model and Runtime failure outcomes
+
+Failures crossing the model/Runtime boundary carry
+`RuntimeFailureClass` instead of requiring an observer to parse display text:
+`ProviderTransport`, `ModelOutputLimit`, `Model`, `InputBudget`,
+`RoundBudget`, or `Runtime`. `OperationOutcome::Failed` stores the class,
+retryability and bounded message, and Runtime emits the same typed
+`RuntimeEvent::Failure`. Provider backoff also emits
+`RuntimeEvent::ModelRetrying` with attempt and delay so a bounded harness can
+distinguish active retry progress from a stalled run without extending prompt
+history.
+
+Classification is semantic. A transport/connectivity failure may make an
+evaluation cell NOT_RUN; a terminal `response.incomplete` with reason
+`max_output_tokens` is `ModelOutputLimit` and remains an executed cell
+failure. Model/provider telemetry is execution evidence only: it does not
+enter Context authority, alter GC, or authorize provider-specific Runtime
+policy.
+
 ### Verification
 
 Persistent facts: obligation (`cause`, `coverage`,

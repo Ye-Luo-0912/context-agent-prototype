@@ -579,6 +579,12 @@ pub enum ModelChunk {
         #[serde(default)]
         arguments_delta: String,
     },
+    /// A bounded progress marker emitted between retryable provider
+    /// attempts. It carries no model content and is never prompt history.
+    Retrying {
+        attempt: u32,
+        delay_ms: u64,
+    },
     Done,
 }
 

@@ -67,6 +67,16 @@ impl ModelEventSink for LiveSink {
                 });
                 Ok(())
             }
+            ModelChunk::Retrying { attempt, delay_ms } => {
+                self.emit_live(RuntimeEvent::ModelRetrying {
+                    turn_id: self.turn_id,
+                    operation_id: self.operation_id,
+                    generation: self.generation,
+                    attempt,
+                    delay_ms,
+                });
+                Ok(())
+            }
             // Tool-call argument deltas are internal to the model round; the
             // runtime surfaces tool execution via ToolStarted/ToolFinished.
             ModelChunk::ToolCallDelta { .. } | ModelChunk::Done => Ok(()),

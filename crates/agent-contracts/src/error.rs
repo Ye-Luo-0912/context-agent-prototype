@@ -11,6 +11,13 @@ pub enum AgentError {
     #[error("model error: {0}")]
     Model(String),
 
+    /// The provider completed the request protocol correctly but stopped the
+    /// model because its configured output allowance was exhausted. This is
+    /// a model/resource outcome, not a transport outage and not retryable
+    /// with the same request budget.
+    #[error("model output limit reached: {reason}")]
+    ModelOutputLimit { reason: String },
+
     #[error("transport error (retryable={retryable}): {message}")]
     Transport { retryable: bool, message: String },
 

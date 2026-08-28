@@ -47,6 +47,12 @@ pub struct RuntimeServices {
     /// derives completion-opportunity facts, never leases `task.complete`
     /// from derived readiness and emits no opportunity events.
     project_completion_opportunity: bool,
+    /// Directory-tool admission candidate: when false (the default), a
+    /// typed missing-parent refusal never changes the model surface, so
+    /// `fs.mkdir` stays catalog-cold exactly as the baseline. When true,
+    /// the trusted recovery source surfaces the exact host-owned tool for
+    /// one decision. Promotion requires the isolation paired live gate.
+    recovery_surface: bool,
     /// Read-only handle onto the host capability registry, injected at
     /// spawn so the actor's safe-point checkpoints capture the full plane
     /// set. The actor snapshots it; it never mutates through this handle.
@@ -127,6 +133,7 @@ impl RuntimeServices {
             artifact_workspace: None,
             project_task_progress: true,
             project_completion_opportunity: false,
+            recovery_surface: false,
             capability_registry: None,
         }
     }
@@ -161,6 +168,7 @@ impl RuntimeServices {
             artifact_workspace: None,
             project_task_progress: true,
             project_completion_opportunity: false,
+            recovery_surface: false,
             capability_registry: None,
         })
     }
@@ -238,6 +246,19 @@ impl RuntimeServices {
 
     pub(crate) fn project_completion_opportunity(&self) -> bool {
         self.project_completion_opportunity
+    }
+
+    /// Opt the runtime into the trusted recovery surface for directory
+    /// topology. Default off: `fs.mkdir` stays catalog-cold exactly as the
+    /// baseline until the isolated paired live gate promotes it. The switch
+    /// is the only variable between the two gate arms.
+    pub fn with_recovery_surface(mut self, enabled: bool) -> Self {
+        self.recovery_surface = enabled;
+        self
+    }
+
+    pub(crate) fn recovery_surface(&self) -> bool {
+        self.recovery_surface
     }
 
     pub(crate) fn artifact_workspace(&self) -> Option<&Workspace> {

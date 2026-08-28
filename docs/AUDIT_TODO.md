@@ -119,12 +119,13 @@ turns versus A's 3/15. Each commit closed the task scope; the next user
 directive started with a new task id and empty task-scoped `TaskProgress`, then
 repeated capability discovery, list/read/search, and another completion.
 
-The candidate separates implicit final-answer/turn completion from durable
-task closure. `task.complete` is catalog-cold by default, leased for explicit
-task-closure intent or an explicit Task requirement, and still discoverable
-through `capability.manage`. An accepted clean completion terminates without a
-confirmation model round; failed siblings and invalid verification gates keep
-the recovery round. This changes no Context/GC threshold or retrieval score.
+The ended candidate separated implicit final-answer/turn completion from
+durable task closure by making `task.complete` catalog-cold and leasing it for
+explicit task-closure intent or a task requirement. Surface rev v5 later made
+the compact schema always visible as a separate product decision. In either
+surface, an accepted clean completion terminates without a confirmation model
+round; failed siblings and invalid verification gates keep the recovery round.
+This changes no Context/GC threshold or retrieval score.
 
 Deterministic tool/runtime tests are green. A short live edit passed in 3
 rounds / 2 calls / 0 failures. Two independent long-flow pairs reduced C to
@@ -171,14 +172,14 @@ verifier and a crash could re-offer a key written after the last safe-point
 capture; both are fixed (independent verification basis; `OpportunityOffered`
 checkpoint debt with a serialization round-trip survival proof).
 
-Surface decision (2026-08-28, rev v5): the earlier guard "do not make
-`task.complete` permanent" is superseded by measured evidence. The M15
-window showed ten behavioral-pass cells never closed solely because the
-catalog-cold schema was never discovered; the guard's original disease
-(pre-mature closure erasing task affinity) is now structurally guarded by
-the LT-RUN-03 completion acceptance gate, which refuses premature or
-unverified proposals with a typed per-turn warning. `task.complete` joined
-the always-loaded production surface; `task.manage` stays catalog-cold.
+Surface decision (2026-08-28, rev v5): `task.complete` joined the always-loaded
+production surface while `task.manage` stayed catalog-cold. The completion
+acceptance gate structurally refuses premature or unverified proposals with a
+typed per-turn warning. The invalid M15 v2 attempts observed many behaviorally
+correct workspaces without closure, but they do not prove that discovery was
+the sole cause or that v5 caused the later closure delta. Treat v5 as the
+current product surface, not as an M15-promoted result; any future surface
+comparison needs its own frozen paired gate.
 
 ### TOOL-PROC-01 — explicit ProgramResolver for process.run (fixed 2026-08-23)
 
@@ -194,6 +195,94 @@ traversal rejected); bare names search the cwd first, then effective
 PATH, PATHEXT-completed on Windows — and spawn always uses the resolved
 absolute path. preflight, RetryDomain fingerprints and spawn share one
 semantics; failures report the bounded candidate list they tried.
+
+### TOOL-DIR-01 — transactional directory creation (fixed deterministically 2026-08-28)
+
+The pinned-serving `retry_policy_dev` preflight exposed a general ACI gap.
+`fs.write` correctly refused `tests/retry_policy.rs` because `tests/` did not
+exist. The passing trace then required three further model decisions and the
+sequence `capability.manage(shell.exec) -> shell.exec(New-Item) -> fs.write`.
+An earlier trace also tried the PowerShell builtin through direct-argv
+`process.run` first. This is execution/surface cost, not Context selection;
+the passing cell accumulated 119,912 TurnFrame tokens versus 8,146 historical
+Context tokens.
+
+Do not make `fs.write` recursively create parents. Its current guarantee — a
+file mutation may create the final file only inside an existing directory —
+keeps directory topology inside an explicit approved and recoverable effect.
+Landed semantics are deliberately narrower and safer than the original
+multi-component sketch:
+
+1. `fs.mkdir { path }` creates exactly one absent final directory component;
+   its immediate parent must already exist. A multi-level path is an explicit
+   sequence of effects, so a single approval never hides a partially-created
+   `mkdir -p` chain;
+2. the host binds the exact path to the existing `WorkspaceWrite` intent with
+   zero content bytes. The workspace appends an authority-v3 `Prepared`
+   record before creation, then creates relative to a pinned parent handle and
+   commits the stable directory identity (Unix device/inode; Windows volume/
+   file index);
+3. rollback removes only the exact pinned, still-empty directory created by
+   the transaction. Substitution, unexpected population, cleanup uncertainty,
+   or a crash after create but before the committed identity is
+   `Unknown`/`Ambiguous`, never false `NotApplied`;
+4. an already-existing directory is an idempotent successful value with an
+   explicit no-mutation fact. File collisions, missing parents, escaped roots,
+   state-directory access and link/reparse traversal fail closed; and
+5. `fs.write` keeps its existing-parent boundary but its typed missing-parent
+   result now derives the first creatable component after the nearest existing
+   parent and names the exact `fs.mkdir` call, instead of forcing a doomed
+   deeper mkdir or a shell/process guess.
+
+The authority reader remains byte-compatible with v1/v2 file frames. New
+workspace, tool-runtime, host-policy and conformance tests cover durable
+reopen, rollback, precondition races, the post-create crash seam, idempotence,
+zero-byte containment and confinement. The tool is catalog-discoverable but
+not yet on the default surface; deterministic completion does not by itself
+prove a round/call improvement.
+
+### TOOL-DIR-SURFACE-01 — choose directory-tool admission from paired evidence
+
+Freeze the effect semantics above. Compare the current catalog-cold baseline
+against one general recovery source that surfaces the exact host-owned tool
+after a trusted `ResourcePath/path_not_found` result whose recovery contract
+requires topology mutation. Reuse the existing bounded surface-source/
+obligation machinery; do not parse free-form model text, create a permanent
+task pin, or special-case an evaluator fixture. An always-ready compact schema
+is a fallback candidate only if the recovery source still costs more decisions
+than its per-round schema cost.
+
+The deterministic gate is implemented and green (2026-08-28): after a failing
+mutating result whose typed metadata names the first creatable directory, the
+runtime derives a turn-scoped recovery request and surfaces exactly
+`fs.mkdir` with `RecoverySurface` provenance for one decision. It proves
+exact-tool provenance (report row origin, unit- and actor-verified), one-
+decision source lifetime (consumed by the decision that saw it, never re-arms),
+unload after consumption/directive end (the requirement dies with the turn;
+lease reconciliation still releases it at the directive boundary), approval
+unchanged (PreferSurface demand only; a read-only gate still refuses the
+recovery-marked workspace write without dispatch), and no surface change for
+unrelated missing reads (observation `path_not_found` carries no
+`next_directory` and never arms). Covered by
+`agent-runtime` unit tests (`recovery_surface_tests`,
+`surface::tests::recovery_mark_*`) and actor tests
+(`tests/turn/recovery_surface.rs`). The candidate ships behind a host switch
+(`with_recovery_surface`, default off): the shipped product keeps the
+catalog-cold baseline until the paired gate promotes it, so the two gate arms
+differ only by that switch.
+
+The live gate is `agent-eval --recovery-surface-gate [normal|resume]` (default
+two repeats): the three representative packs (create-file retry, diagnosis,
+multi-file migration) run normal/resume cells with the recovery-surface
+candidate switch as the only variable; every cell records its setting in
+dimensions.json. It is an isolated normal/resume paired comparison on
+representative create-file, diagnosis and multi-file tasks (at least two
+repeats per mode — full run is 3 packs × 2 modes × 2 repeats × 2 arms = 24
+cells). Promote only with equal mandatory success, lower median
+aggregate rounds and calls, no new max/p95 tail, and a reported
+schema/prompt-token delta. Failed outputs remain counted. After the surface
+choice, rerun one bounded source-bound product preflight before formal M15;
+the earlier preflight did not contain this catalog entry.
 
 ### Fingerprint v2 — preview ≠ identity (fixed 2026-08-23)
 
@@ -602,14 +691,22 @@ motive shows up in live runs.
 ### EXEC-REV-01 — verification basis diverges across consumers (fixed 2026-08-27)
 
 Landed: `TaskAnchor.verification_revision` is an independent basis (serde
-default) bumped only by authoritative boundary changes — original goal and
-constraints — while progress/open-loop/next-action maintenance advances only
-the whole-record CAS revision; `TaskManager` syncs
+default) bumped only by authoritative boundary changes — original goal,
+constraints and acceptance criteria — while progress/open-loop/next-action
+maintenance advances only the whole-record CAS revision; `TaskManager` syncs
 `ExecutionState.verification.spec_revision` to the basis, and facts, exact
 verifier sources, freshness/validity and the opportunity key
 (`opp/{task}/a{basis}/d{directive}/w{workspace}/...`) all read the basis.
-Deterministic regressions prove progress-only movement keeps Current while
-authority movement stales across consumers. Residual, tracked with the
+Per `LONG_TASK_EVALUATION.md` Slice B, accepted criteria move the basis too
+(they are the authoritative verdict) while model-derived criteria remain
+proposals — `task.manage` cannot submit the field, so no criterion-level
+approval gate is implied. `validity()` additionally refuses Current when the
+last evidence row is bound to a different basis than the live one, so no
+consumer can disagree if the basis ever moves without the `SpecChanged`
+side effect. One cross-consumer regression covers progress-only movement,
+an acceptance-criteria change and a checkpoint round-trip, asserting that
+ActiveTurn validity, completion, exact reuse and the derived completion
+opportunity agree in all three phases. Residual, tracked with the
 cold-resume matrix: the persisted offer key must also accrue checkpoint debt
 (it does since 2026-08-28) with a crash-window proof that once-per-basis
 discipline survives recovery.
@@ -1152,6 +1249,33 @@ separated, mechanically derived summaries, for-n=2 medians reported as both
 observations), and the frozen paired gate then RERAN decision-grade — its
 promotion verdict (FAIL; candidate ended) is recorded in
 `evidence/opportunity-gate/REPORT.md` (2026-08-28 section).
+
+### EVAL-07 — M15 v2 evidence projected the wrong contract (runtime fixed; evidence exit pending)
+
+The three 2026-08-28 M15 attempts cannot be formal evidence. Missing
+`task.complete` was turned into Runtime failure although M15 V1 made closure
+report-only; diagnosis and migration manifests reused the retry-policy pack
+id/digest; provider health came from message substrings; six
+`max_output_tokens` outcomes were labeled transport failures; and aggregate
+Markdown arithmetic drifted from cell facts. The raw bundles remain immutable
+for forensic use, but their ratios, deltas and causal explanations cannot
+select a serving, promote surface v5 or close M15.
+
+The repaired `retry-pilot-cell-v3` path persists an acceptance profile,
+PASS/FAIL/NOT_RUN verdict, actual pack identity/digest, typed failure class
+and independent restored/exact-tuple/continued/turn/task facts. Provider
+transport and harness failure produce NOT_RUN; model output limit produces
+FAIL. The harness writes an exact window manifest and mechanically regenerates
+the report while rejecting mixed identity, duplicate/missing cells, verdict
+drift, absent terminal evidence, event gaps/loss, counter drift and paths
+outside the evidence root. Evidence-write errors are fatal; the formal command
+rejects a dirty tree, partial pack, repeat drift and protocol `auto`. Runtime
+publishes typed failures and provider retry progress rather than making the
+evaluator infer either from text. Exit evidence is still open: pass the
+relevant deterministic suite,
+retain the serving tuple pinned by the passing bounded representative
+preflight, then commit one complete clean-tree 12-cell v3 window and its
+regenerated report.
 
 ## Closed archive (index only)
 

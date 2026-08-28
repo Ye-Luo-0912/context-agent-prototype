@@ -172,6 +172,22 @@ impl RuntimeActor {
         {
             requirements.push(crate::opportunity::opportunity_surface_requirement());
         }
+        // A trusted `parent_path_not_found` from the previous batch proved
+        // the recovery contract requires topology mutation. Prefer the exact
+        // host-owned `fs.mkdir` for ONE decision (explicit provenance, never
+        // a model self-load); unrelated missing reads never set this state.
+        if let Some(request) = self
+            .state
+            .turn
+            .as_ref()
+            .and_then(|turn| turn.recovery_surface_request.as_ref())
+        {
+            requirements.push(ToolSurfaceRequirement {
+                tool_name: request.tool_name.clone(),
+                demand: ToolSurfaceDemand::PreferSurface,
+                reason: "typed recovery: missing parent requires directory creation".into(),
+            });
+        }
         // Verification is source-affine once a trusted verifier has
         // produced a reusable result for this exact task anchor. Keep that
         // concrete schema available first; the semantic-role fallback below
@@ -276,6 +292,24 @@ impl RuntimeActor {
         let mut surface_plan = RoundSurfacePlan::build(candidates, &requirements, |name| {
             self.services.tool_may_omit_from_round(name)
         });
+        // The recovery-derived requirement enters as a task-style demand;
+        // relabel its provenance so report rows answer "why" truthfully.
+        if let Some(request) = self
+            .state
+            .turn
+            .as_ref()
+            .and_then(|turn| turn.recovery_surface_request.as_ref())
+        {
+            surface_plan.mark_recovery_tools(&std::collections::HashSet::from([request
+                .tool_name
+                .clone()]));
+        }
+        // One-decision source lifetime: the recovery request is consumed by
+        // this surface and cannot re-arm the next decision, whether or not
+        // the model calls the tool.
+        if let Some(turn) = self.state.turn.as_mut() {
+            turn.recovery_surface_request = None;
+        }
         surface_plan
             .source_revisions_mut()
             .task_requirement_revision = task_requirement_revision;
@@ -642,7 +676,9 @@ impl RuntimeActor {
             // drop the turn without fencing.
             let _ = self
                 .core
-                .emit_event(RuntimeEvent::Error {
+                .emit_event(RuntimeEvent::Failure {
+                    class: RuntimeFailureClass::InputBudget,
+                    retryable: false,
                     message: format!(
                         "model input exceeds the provider window even with the context frame emptied and optional tool schemas omitted for this round ({estimated_input_tokens} > {max_input_budget} input tokens); refusing to send"
                     ),
@@ -784,9 +820,14 @@ impl RuntimeActor {
                     usage: output.usage,
                 },
                 Err(AgentError::Cancelled) => OperationOutcome::Cancelled,
-                Err(error) => OperationOutcome::Failed {
-                    message: crate::output::bound_error_message(error.to_string()),
-                },
+                Err(error) => {
+                    let (class, retryable) = Self::classify_model_failure(&error);
+                    OperationOutcome::Failed {
+                        class,
+                        retryable,
+                        message: crate::output::bound_error_message(error.to_string()),
+                    }
+                }
             };
             let _ = op_tx
                 .send(OperationCompletion {
@@ -815,6 +856,17 @@ impl RuntimeActor {
                 })
                 .await;
         });
+    }
+
+    fn classify_model_failure(error: &AgentError) -> (RuntimeFailureClass, bool) {
+        match error {
+            AgentError::Transport { retryable, .. } => {
+                (RuntimeFailureClass::ProviderTransport, *retryable)
+            }
+            AgentError::ModelOutputLimit { .. } => (RuntimeFailureClass::ModelOutputLimit, false),
+            AgentError::Model(_) => (RuntimeFailureClass::Model, false),
+            _ => (RuntimeFailureClass::Runtime, false),
+        }
     }
 
     fn assemble_model_input(
@@ -1141,5 +1193,31 @@ impl RuntimeActor {
             Some(crate::task::task_anchor_view(&task.anchor)),
             progress,
         )
+    }
+}
+
+#[cfg(test)]
+mod failure_class_tests {
+    use super::*;
+
+    #[test]
+    fn model_failures_keep_semantic_class_and_retryability() {
+        assert_eq!(
+            RuntimeActor::classify_model_failure(&AgentError::Transport {
+                retryable: true,
+                message: "reset".into(),
+            }),
+            (RuntimeFailureClass::ProviderTransport, true)
+        );
+        assert_eq!(
+            RuntimeActor::classify_model_failure(&AgentError::ModelOutputLimit {
+                reason: "max_output_tokens".into(),
+            }),
+            (RuntimeFailureClass::ModelOutputLimit, false)
+        );
+        assert_eq!(
+            RuntimeActor::classify_model_failure(&AgentError::Model("filtered".into())),
+            (RuntimeFailureClass::Model, false)
+        );
     }
 }

@@ -439,25 +439,69 @@ and sandbox contracts live elsewhere. Experiment facts live in
   terminal artifact restores into a third fresh instance with the completed
   task plane visible, capability generation rides capture and every
   acknowledgement, and retention gained an aggregate byte budget.
-  Following the M15-window finding (ten behavioral-pass cells never closed
-  because `task.complete` was undiscoverable), the closure tool joined the
-  always-loaded production surface (surface rev v5). Presence is not
-  pressure: the completion acceptance gate remains the sole closure
-  authority and refuses premature or unverified proposals with a typed
-  per-turn warning, so model autonomy is unchanged and the context cost is
-  one compact schema. The off/on replay retired with the ended candidate.
-  The v5 window reran the same day: closures improved 1/12 to 4/12 and
-  passes 1/12 to 3/12 (the first resume cell ever to pass end to end), but
-  the all-cells bar still fails — remaining blockers are model variance on
-  the diagnosis task (behavior 1/4 pass) and inconsistent closure (8/12
-  behavioral-pass cells still unclosed), both honest serving measurements
-  rather than runtime defects. M15 stays open. A same-day third window on the amended serving
-  (`deepseek-v4-pro` @ local relay, decision point 1 amended) came back
-  CENSORED — 6/12 cells died on relay transport failures mid-window — so it
-  decides nothing; its 6/12 closures and 2/12 passes are observations only.
-  `evidence/m15-window/REPORT.md` carries all three windows and the stop
-  condition: the only stable serving (luna) sits below the bar, and the
-  stronger relay serving cannot yet hold a window.
+  `task.complete` joined the always-loaded production surface (surface rev
+  v5) as a product choice; the completion acceptance gate remains the sole
+  closure authority and refuses premature or unverified proposals. The
+  three same-day M15 attempts do **not** validate that surface choice or a
+  serving choice. Their v2 bundles projected missing closure as Runtime
+  failure despite M15's report-only closure contract, stamped every pack
+  with the retry-policy identity/digest, inferred provider health from error
+  text, and were summarized by hand with inconsistent arithmetic. The relay
+  attempt's six `max_output_tokens` results are model-output-limit failures,
+  not proven transport outages. All three attempts are now forensic-only in
+  `evidence/m15-window/REPORT.md`; their ratios and apparent deltas cannot be
+  used for promotion or causality.
+
+  The evaluator repair is implemented as `retry-pilot-cell-v3`: actual pack
+  identity/digest, acceptance-profile-aware verdicts, typed Runtime/provider/
+  model/harness failure classes, independently persisted restore/exact-tuple/
+  continuation/turn/task facts, and an exact window manifest whose report is
+  regenerated from the 12 immutable cell directories. The report also
+  cross-checks event continuity, summary/dimension counters, confined paths
+  and per-cell round/tool/wall/token facts; evidence-write failure is fatal.
+  Provider transport or harness failure yields NOT_RUN and censors a window;
+  `max_output_tokens` yields a model-output-limit cell FAIL. Formal execution
+  rejects dirty source, pack/repeat drift and protocol `auto`. M15 remains open
+  until a new clean, single-serving v3 window passes.
+
+  A bounded representative preflight now pins the serving tuple for that
+  window: PinAI `/v1`, `gpt-5.6-luna`, Responses protocol, 128,000-token
+  context window. The 2026-08-28 source-bound dirty-tree diagnostic cell
+  (`retry_policy_dev`, normal, closure-required) passed behavior, diff and
+  committed closure in 26 rounds / 59 tool calls / 3 failed outputs /
+  315,468 ms, with zero provider retries and a contiguous observed event
+  suffix. It is serving-selection evidence only, not a formal M15 cell or a
+  failure-rate estimate. An earlier preflight on the same serving failed
+  closure after 30 rounds / 53 calls / 7 failed outputs; comparing two
+  stochastic cells cannot establish a causal round/call improvement.
+
+  The passing cell also localizes cost away from Context selection:
+  cumulative historical-context prompt cost was 8,146 tokens versus 119,912
+  TurnFrame tokens (model input 324,783; output 10,531). One of the three
+  failed outputs was `fs.write` refusing a missing `tests/` parent; recovery
+  then consumed three model decisions to load `shell.exec`, create the
+  directory and retry the write. Preserve `fs.write`'s existing-parent
+  transaction boundary. `TOOL-DIR-01` has now landed deterministically as
+  `fs.mkdir`: one exact final component, existing immediate parent, pinned
+  handle, authority-v3 Prepared/committed object identity, exact-empty
+  rollback and conservative reopen recovery. `fs.write` now names this typed
+  recovery path. The tool stays catalog-cold; the `TOOL-DIR-SURFACE-01`
+  deterministic admission gate landed (2026-08-28): a failing mutating
+  result whose typed metadata names the first creatable directory surfaces
+  exactly `fs.mkdir` with `RecoverySurface` provenance for one decision —
+  exact-tool provenance, one-decision source lifetime, approval unchanged
+  (PreferSurface demand only; a read-only gate still refuses the
+  recovery-marked write without dispatch), and no surface change for
+  unrelated missing reads. The candidate ships behind a host switch
+  (default off), so the shipped product keeps the catalog-cold baseline;
+  `agent-eval --recovery-surface-gate` runs the isolated live paired gate
+  (normal/resume, create-file/diagnosis/multi-file, at least two repeats
+  per mode) that decides promotion to an always-ready schema.
+  Consequently the earlier product preflight still pins the serving tuple,
+  but it does not validate this newer catalog/source revision; rerun one
+  bounded source-bound preflight after the surface choice and before formal
+  M15.
+
   The
   frozen CompletionOpportunity off/on paired live gate then ran
   decision-grade on 2026-08-28 (8 cells): it FAILED promotion — the off
@@ -530,9 +574,8 @@ and sandbox contracts live elsewhere. Experiment facts live in
   `git.diff`, `task.complete`, `capability.manage`. `task.complete` closure
   execution stays intent-gated by the completion acceptance gate. Their compact core schemas cost roughly 1k tokens total,
   still below the 4,096-token surface cap. Shell / `edit.replace` /
-  `context.manage` / `task.complete` and plugin tools are catalog-only;
-  NeedEvidence PreferSurfaces `context.manage`, while explicit task-close
-  intent or a task requirement PreferSurfaces `task.complete`.
+  `context.manage` and plugin tools are catalog-only; NeedEvidence
+  PreferSurfaces `context.manage`.
 - Scripted `--compare-arm` still additionally pins `edit.replace` /
   `context.manage`. Do not change that pin.
 - Longflow parallel A/C is a separate product diagnostic and now uses the
@@ -762,9 +805,9 @@ audit does not weaken that Context finding; it invalidates later recovery and
 evaluation claims. Keep Context selection, GC, prompt packing and the stable
 tool surface fixed.
 
-The next phase is `LT-RUN-05` in
-[`LONG_TASK_EVALUATION.md`](LONG_TASK_EVALUATION.md), a repair and re-proof of
-the existing `LT-RUN-04` substrate rather than a new planning algorithm:
+`LT-RUN-05` in [`LONG_TASK_EVALUATION.md`](LONG_TASK_EVALUATION.md) repaired
+and re-proved the existing `LT-RUN-04` substrate rather than adding a new
+planning algorithm:
 
 1. introduce an actor-owned monotonic snapshot sequence independent of
    `TaskAnchor`; continuation requires no debt, no failed or in-flight write,
@@ -783,29 +826,37 @@ the existing `LT-RUN-04` substrate rather than a new planning algorithm:
    final-artifact restore, stale capability generation and progress-only
    verification movement with deterministic tests.
 
-Only after all six are green may the retained-C off/on normal/resume gate run
-again under the already-frozen paired-repeat rule. The candidate stays off
-unless behavior does not regress, closure improves, median rounds/calls improve
-and no new tail appears. Same-model A/C, diagnosis and multi-file migration tasks
-remain after that decision. Criterion/CPL and model-visible TaskGraph research
+The deterministic snapshot/cold-restore chain and evaluator reconstruction are
+green. The retained-C CompletionOpportunity off/on gate then ran eight cells
+and failed promotion, so that candidate has ended default-off; do not spend
+another pair on it. Same-model A/C, diagnosis and multi-file migration tasks
+remain after formal M15. Criterion/CPL and model-visible TaskGraph research
 stay deferred and evidence-gated.
 
 ## Next milestone
 
 Engineering mainline after the 2026-08-27 platform-gate closures is the
-**V1 candidate and formal M15**: the frozen acceptance design is
-[`M15_ACCEPTANCE.md`](M15_ACCEPTANCE.md) — V1 is the banked planes plus one
-live development pack (3 tasks × normal/resume × 2 repeats); the Convergence
-Bench was re-certified 4/4 on the acceptance HEAD (2026-08-28). The run is
-gated on the design's four signed-off decision points (serving pin, budget,
-fixture authoring, closure reporting). V2 Self-Iteration stays blocked until
-M15 closes.
+**V1 candidate and formal M15**. The corrected acceptance contract is
+[`M15_ACCEPTANCE.md`](M15_ACCEPTANCE.md): V1 is the banked planes plus one
+live development pack (3 tasks × normal/resume × 2 repeats). Budget, fixtures
+and report-only closure semantics are frozen; the serving tuple is fixed by
+the bounded representative PinAI/Luna Responses preflight. Because `fs.mkdir`
+changed the product catalog after that diagnostic, the `TOOL-DIR-SURFACE-01`
+deterministic admission gate landed (2026-08-28); its isolated live paired
+gate (`agent-eval --recovery-surface-gate`) must then finish and one bounded
+preflight must rerun on the exact candidate
+source/surface. The next accepted run must then be one uninterrupted clean-tree
+`retry-pilot-cell-v3` window with a
+mechanically regenerated report. V2 Self-Iteration stays blocked until M15
+closes.
 The agent may grow capabilities, never evaluation or permission Core authority.
 
-In parallel, complete deterministic `LT-RUN-05`, then run at most the specified
-decision-grade CompletionOpportunity pair before same-model A/C. Do not spend
-another live pair on the old 15-directive longflow unless a regression
-specifically reopens its retained r8-r10 decision.
+In parallel, keep `LT-RUN-05` frozen and build only deterministic fixtures for
+the post-M15 `LT-EVAL-06` diagnosis/multi-file task pack. Do not add TaskGraph,
+change Context/GC, or run another CompletionOpportunity/old 15-directive live
+pair. The first post-M15 live expansion compares normal/resume twins on the
+unchanged Runtime and asks whether repeated-work or lost-subgoal evidence is
+material before proposing another planning substrate.
 
 Context evaluation: `context-mech.v2` 12-cell evidence exists; do not
 expand to 27 or 300×3. Live `recall_after_fix` is refused.

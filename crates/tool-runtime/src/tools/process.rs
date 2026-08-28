@@ -463,24 +463,20 @@ impl ProcessRunTool {
                 // 身份指纹则覆盖完整有界目录状态（同理）。
                 let entries = bounded_cwd_listing(&cwd);
                 let (scope_key, fingerprint) = resolution_identity(&cwd, &args.env);
+                let recovery_hint = "process.run launches an executable argv directly; shell syntax and built-ins require shell.exec (or an explicit shell executable plus its command flag)";
                 return Ok(ToolOutcome::Value(agent_contracts::tool_failure_output(
                     call_id,
                     tool_name,
                     agent_contracts::ToolFailureClass::PathNotFound,
                     format!("{tool_name} refused: program_not_found ({})", args.argv[0]),
                     format!(
-                        "program `{}` was not found.\ncwd `{}` contains: {}\ntried: {}\ncompile or install it first, or run a binary that exists in the listing.",
+                        "program `{}` was not found.\ncwd `{}` contains: {}\n{recovery_hint}.",
                         args.argv[0],
                         cwd.display(),
                         if entries.is_empty() {
                             "(empty)".into()
                         } else {
                             entries.join(", ")
-                        },
-                        if failure.candidates_tried.is_empty() {
-                            "(nothing: argv[0] may not traverse outside cwd)".into()
-                        } else {
-                            failure.candidates_tried.join(", ")
                         }
                     ),
                     json!({
@@ -490,7 +486,7 @@ impl ProcessRunTool {
                         "attempted": failure.candidates_tried,
                         "resolution_scope_key": scope_key,
                         "resolution_fingerprint": fingerprint,
-                        "recovery_hint": "use a program that exists in the listing; compile sources before running their binaries",
+                        "recovery_hint": recovery_hint,
                     }),
                 )));
             }
@@ -871,6 +867,12 @@ mod tests {
         assert!(
             attempted.iter().any(|candidate| candidate.contains("nope")),
             "tried candidates are reported: {attempted:?}"
+        );
+        assert!(output.model_content.contains("executable argv directly"));
+        assert!(output.model_content.contains("shell.exec"));
+        assert!(
+            !output.model_content.contains("tried:"),
+            "full resolver candidates stay in metadata instead of consuming the model budget"
         );
         // 失败与成功使用同一套身份语义：scope 稳定，指纹随目录状态变化。
         assert!(output.metadata["resolution_scope_key"].is_string());
