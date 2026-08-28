@@ -592,6 +592,15 @@ pub struct CellOutcome {
     pub opportunity_offers: Vec<String>,
     /// The model called `task.complete` after an offer was live.
     pub opportunity_called: bool,
+    /// Event-derived settlement exposure: at least one
+    /// `ExecutionFrontier` carried `SettledCandidate`, and how many
+    /// rounds/calls happened before and after that first settled event.
+    /// Zero exposure makes a convergence gate inconclusive, never a pass.
+    pub settlement_seen: bool,
+    pub settlement_pre_rounds: u64,
+    pub settlement_pre_calls: u64,
+    pub settlement_post_rounds: u64,
+    pub settlement_post_calls: u64,
 }
 
 impl CellOutcome {
@@ -640,6 +649,11 @@ impl CellOutcome {
             opportunity_offers: Vec::new(),
             opportunity_called: false,
             recovery_surface: switches.recovery_surface,
+            settlement_seen: false,
+            settlement_pre_rounds: 0,
+            settlement_pre_calls: 0,
+            settlement_post_rounds: 0,
+            settlement_post_calls: 0,
         }
     }
 
@@ -664,8 +678,19 @@ impl CellOutcome {
         } else {
             " recovery=off"
         };
+        let settlement = if self.settlement_seen {
+            format!(
+                " settled=seen pre_rounds={} pre_calls={} post_rounds={} post_calls={}",
+                self.settlement_pre_rounds,
+                self.settlement_pre_calls,
+                self.settlement_post_rounds,
+                self.settlement_post_calls
+            )
+        } else {
+            " settled=none".to_string()
+        };
         format!(
-            "{} {:<6} {} profile={} behavior={} diff={} closure={} continuation={} provider={} rounds={}+{} resumes={} durables={}{}{}{}{}",
+            "{} {:<6} {} profile={} behavior={} diff={} closure={} continuation={} provider={} rounds={}+{} resumes={} durables={}{}{}{}{}{}",
             self.pack_id,
             self.mode.id(),
             status,
@@ -682,6 +707,7 @@ impl CellOutcome {
             trigger,
             opp,
             recovery,
+            settlement,
             self.error
                 .as_ref()
                 .map(|reason| format!(
@@ -1591,6 +1617,10 @@ pub async fn run_pack_cell(
     } else {
         "active"
     };
+    // Event-derived settlement exposure, computed once here and reused by
+    // the outcome line and the evidence summary; `write_evidence` performs
+    // its own aggregation for the full cell bundle.
+    let metrics = crate::metrics::aggregate_metrics(&collector.events);
     let outcome = CellOutcome {
         pack_id: pack.id,
         mode,
@@ -1628,6 +1658,11 @@ pub async fn run_pack_cell(
         recovery_surface,
         opportunity_offers,
         opportunity_called,
+        settlement_seen: metrics.settled_seen,
+        settlement_pre_rounds: metrics.pre_settlement_rounds,
+        settlement_pre_calls: metrics.pre_settlement_calls,
+        settlement_post_rounds: metrics.post_settlement_rounds,
+        settlement_post_calls: metrics.post_settlement_calls,
     };
     write_evidence(
         pair,

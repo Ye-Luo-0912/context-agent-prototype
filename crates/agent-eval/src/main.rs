@@ -109,8 +109,17 @@ fn usage() -> ! {
 \n\
          usage: agent-eval [--repeats N] --opportunity-gate [normal|resume]\n\
          usage: agent-eval --recovery-surface-gate [normal|resume]\n\
+         usage: agent-eval [--repeats N] --conv-gate [normal|resume]\n\
          usage: agent-eval --m15-window\n\
          usage: agent-eval --m15-report <window-dir>\n\
+\n\
+         Completion Convergence V1 paired live gate: the frozen\n\
+         retry_policy_dev pack runs normal/resume cells, each cell bubbling\n\
+         event-derived settlement exposure (first settled candidate,\n\
+         rounds/calls before and after it). A cell with zero exposure makes\n\
+         the gate inconclusive rather than a pass. Evidence lands under\n\
+         crates/agent-eval/evidence/conv-gate/; promotion judgment belongs\n\
+         to the evidence REPORT.\n\
 \n\
          Item-8 off/on paired live gate for the advisory completion\n\
          opportunity: identical cells with the candidate switch as the only\n\
@@ -671,6 +680,16 @@ async fn main() -> anyhow::Result<()> {
                     long_live::DEFAULT_REPEATS
                 };
                 run_recovery_surface_gate(mode_filter, repeats, evidence_dir, allow_dirty).await?;
+                return Ok(());
+            }
+            "--conv-gate" => {
+                let mode_filter = args.next().filter(|value| !value.starts_with('-'));
+                let repeats = if repeats_set {
+                    repeats
+                } else {
+                    2
+                };
+                run_conv_gate(mode_filter, repeats, evidence_dir, allow_dirty).await?;
                 return Ok(());
             }
             "--m15-window" => {
@@ -1470,6 +1489,108 @@ async fn run_recovery_surface_gate(
                     cells.iter().filter(|cell| cell.closure == "completed").count(),
                 );
             }
+        }
+    }
+    println!("promotion judgment belongs to the evidence REPORT, not this runner");
+    Ok(())
+}
+
+/// Completion Convergence V1 paired live gate: the frozen retry_policy_dev
+/// pack runs normal/resume cells with the completion candidate off. Each
+/// cell reports event-derived settlement exposure (first settled candidate,
+/// rounds/calls before and after). Cells with zero exposure make the gate
+/// inconclusive, never a pass; promotion judgment lives in the evidence
+/// REPORT with the frozen criteria.
+async fn run_conv_gate(
+    mode_filter: Option<String>,
+    repeats: u32,
+    evidence_dir: Option<std::path::PathBuf>,
+    allow_dirty: bool,
+) -> anyhow::Result<()> {
+    bundle::require_clean_tree(allow_dirty)?;
+    let modes = long_live::PilotMode::parse(mode_filter.as_deref())?;
+    anyhow::ensure!((1..=4).contains(&repeats), "repeats must be 1..=4");
+    anyhow::ensure!(
+        repeats >= 2,
+        "the convergence gate requires at least two paired repeats"
+    );
+    let model = driver::build_live_coding_model()?;
+    let evidence_root = evidence_dir.unwrap_or_else(|| {
+        std::path::PathBuf::from("crates/agent-eval/evidence/conv-gate")
+    });
+    std::fs::create_dir_all(&evidence_root)?;
+    eprintln!("evidence dir: {}", evidence_root.display());
+
+    let pack = long_live::retry_pack();
+    let mut outcomes = Vec::new();
+    for repeat in 1..=repeats {
+        for mode in &modes {
+            eprintln!("== {} {} live repeat {repeat}/{repeats} ==", pack.id, mode.id());
+            let dir = tempfile::tempdir()?;
+            let pair = bundle::PairSink::claim(
+                evidence_root.clone(),
+                format!("{}-{}", pack.id, mode.id(),),
+                repeat,
+                repeats,
+                true,
+            );
+            let outcome = long_live::run_pack_cell(
+                &pack,
+                *mode,
+                &pair,
+                model.clone(),
+                dir.path(),
+                long_live::CellSwitches {
+                    opportunity: false,
+                    recovery_surface: false,
+                },
+                long_live::AcceptanceProfile::M15V1,
+            )
+            .await?;
+            println!("{}", outcome.render_line());
+            match bundle::render_evidence(&pair.cell_dir("dynamic")) {
+                Ok(rendered) => println!("{rendered}"),
+                Err(e) => eprintln!("warning: evidence render failed: {e}"),
+            }
+            outcomes.push(outcome);
+        }
+    }
+
+    println!("\n== convergence paired summary (facts only) ==");
+    for mode in &modes {
+        let cells: Vec<&long_live::CellOutcome> = outcomes
+            .iter()
+            .filter(|cell| cell.mode == *mode)
+            .collect();
+        let exposed: Vec<&long_live::CellOutcome> =
+            cells.iter().copied().filter(|cell| cell.settlement_seen).collect();
+        let mut total_rounds: Vec<u64> = cells
+            .iter()
+            .map(|cell| (cell.model_rounds_phase_one + cell.model_rounds_phase_two) as u64)
+            .collect();
+        let mut post_rounds: Vec<u64> = exposed
+            .iter()
+            .map(|cell| cell.settlement_post_rounds)
+            .collect();
+        let mut post_calls: Vec<u64> =
+            exposed.iter().map(|cell| cell.settlement_post_calls).collect();
+        println!(
+            "{:<6} cells={} passed={} median_total_rounds={} max_total_rounds={} exposed={} median_post_rounds={} median_post_calls={} completed={}",
+            mode.id(),
+            cells.len(),
+            cells.iter().filter(|cell| cell.passed).count(),
+            checked_percentile(&mut total_rounds, 50).unwrap_or(0),
+            total_rounds.iter().copied().max().unwrap_or(0),
+            exposed.len(),
+            checked_percentile(&mut post_rounds, 50).unwrap_or(0),
+            checked_percentile(&mut post_calls, 50).unwrap_or(0),
+            cells.iter().filter(|cell| cell.closure == "completed").count(),
+        );
+        if exposed.len() != cells.len() {
+            println!(
+                "  exposure incomplete ({} cell(s) saw no settled candidate): gate is inconclusive, not a pass",
+                cells.len() - exposed.len()
+            );
         }
     }
     println!("promotion judgment belongs to the evidence REPORT, not this runner");
