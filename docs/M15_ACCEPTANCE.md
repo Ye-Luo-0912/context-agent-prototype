@@ -61,7 +61,12 @@ saturate-not-wrap edge, the hidden check requires an overflow-safe marker,
 fixture self-check executes each pack's oracle against the untouched seed and
 the scripted solution, and the pack digests are recorded as frozen constants
 (diag regenerated to `2fff51573097fe4c833215420dd0da74f11a645ef5c859bdd9bba87e5b427eeb`;
-migrate unchanged). Then complete the bounded Completion Convergence V1
+migrate unchanged). A 2-cell `--diag-smoke` then failed both cells on the
+overflow edge with needle/oracle-consistent evidence (the model used
+`checked_shl` + fallback, which does not catch bits shifting out of the value;
+the old check table would have passed that fix). Diag cells remain in the
+window; a failing diag cell is an honest reported fact, not a harness
+artifact. Then complete the bounded Completion Convergence V1
 readiness slice and rerun the same one-cell product preflight on that source
 before the formal window. These repairs preserve the frozen task meaning and
 report-only closure semantics; they do not permit a serving switch or a

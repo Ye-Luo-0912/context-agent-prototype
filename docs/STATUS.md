@@ -511,7 +511,12 @@ and sandbox contracts live elsewhere. Experiment facts live in
   oracle offline against seed and scripted solution; diag digest regenerated
   to `2fff5157…eeb`, migrate digest unchanged. The evaluator-validity part of
   the pre-window checklist is done; the remaining item is the one-cell
-  product preflight after Completion Convergence V1 readiness.
+  product preflight after Completion Convergence V1 readiness. A 2-cell
+  `--diag-smoke` on the pinned serving failed both cells on the overflow edge
+  with now-valid evidence: the model fixed the off-by-one and named
+  `next_delay`, then used `checked_shl` + fallback, which does not catch bits
+  shifting out of the value (the old check table would have passed that fix —
+  the calibration closes that hole). Keep the fixture as the M15 diag pack.
   Consequently the earlier product preflight still pins the serving tuple,
   but it does not validate this newer catalog/source revision; rerun one
   bounded source-bound preflight after the surface choice and before formal

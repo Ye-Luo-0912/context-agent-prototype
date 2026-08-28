@@ -326,7 +326,20 @@ digests as frozen constants. The calibrated diag digest is
 `2fff51573097fe4c833215420dd0da74f11a645ef5c859bdd9bba87e5b427eeb`
 (was `844793249406be591372f7ee8b17bd68b3933e9d2745988168de64834584aaf3`);
 the migrate digest is unchanged at
-`26d69fa1d4ccd00452b3ceb88f2a6ec7fbb977989df6d6f4e2f1e345660679cb`. The
+`26d69fa1d4ccd00452b3ceb88f2a6ec7fbb977989df6d6f4e2f1e345660679cb`.
+
+A 2-cell live smoke (`agent-eval --diag-smoke`,
+[`evidence/diag-smoke/REPORT.md`](../crates/agent-eval/evidence/diag-smoke/REPORT.md),
+PinAI `/v1` + `gpt-5.6-luna` + Responses + 128k) ran the same day: both cells
+failed on the calibration edge with now-valid evidence. The model correctly
+fixed the off-by-one and named `next_delay` in `DIAGNOSIS.md`, then wrote
+`checked_shl(shift).unwrap_or(max)` — which only guards shift-amount ≥ 64, not
+bits shifting out of the value (`100u64.checked_shl(62)` is `Some(0)`), so the
+oracle's `next_delay(63, cfg(100,1_000)) == 1_000` still gets 0. Under the old
+check table that fix would have passed every needle while failing the oracle,
+reproducing the audit's complaint; the calibrated needle and oracle reject it
+consistently. Keep the fixture as the M15 diag pack: a failing diag cell is an
+honest reported fact, not a harness artifact. The
 surviving blocker is a missing completion decision boundary; see
 CONV-CLOSE-01 below.
 
