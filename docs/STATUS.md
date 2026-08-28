@@ -446,6 +446,13 @@ and sandbox contracts live elsewhere. Experiment facts live in
   authority and refuses premature or unverified proposals with a typed
   per-turn warning, so model autonomy is unchanged and the context cost is
   one compact schema. The off/on replay retired with the ended candidate.
+  The v5 window reran the same day: closures improved 1/12 to 4/12 and
+  passes 1/12 to 3/12 (the first resume cell ever to pass end to end), but
+  the all-cells bar still fails — remaining blockers are model variance on
+  the diagnosis task (behavior 1/4 pass) and inconsistent closure (8/12
+  behavioral-pass cells still unclosed), both honest serving measurements
+  rather than runtime defects. M15 stays open; `evidence/m15-window/
+  REPORT.md` carries both windows.
   The
   frozen CompletionOpportunity off/on paired live gate then ran
   decision-grade on 2026-08-28 (8 cells): it FAILED promotion — the off
