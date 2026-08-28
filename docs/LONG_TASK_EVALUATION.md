@@ -979,10 +979,14 @@ published only on change with a bounded neutral projection that preserves
 the model's choice; and seven deterministic actor scenarios are green
 (ordinary final, durable closure, genuine remaining work, mutation after
 verification, stale verification, proposal settlement across
-suspend/resume, cold same-run restore). The remaining step is the
-exposure-qualified live gate with ≥2 paired repeats, which requires user
-scope confirmation. The stale comment describing `task.complete` as
-catalog-cold was removed.
+suspend/resume, cold same-run restore). The exposure-qualified live gate
+(`--conv-gate`, 2 paired repeats) ran on 2026-08-29 and verifies the
+mechanism under the pinned serving — 4/4 cells PASS, 4/4 settlement
+exposure, model-chosen durable `task.complete` — but the resume arm still
+spends a long post-settlement tail (median 29 rounds / 58 calls), so the
+efficiency criterion is not claimed; see
+[`evidence/conv-gate/REPORT.md`](../crates/agent-eval/evidence/conv-gate/REPORT.md).
+The stale comment describing `task.complete` as catalog-cold was removed.
 
 Promotion requires mandatory behavior/diff/resume parity, no lost unfinished
 work, lower rounds and calls after the first valid settled candidate, and no new

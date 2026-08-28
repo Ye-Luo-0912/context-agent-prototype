@@ -539,9 +539,13 @@ and sandbox contracts live elsewhere. Experiment facts live in
   verification, stale verification, proposal settlement across
   cancel/resume, and cold restore. The stale runtime comment describing
   `task.complete` as catalog-cold was removed (the v5 registry always loads
-  it). Open: the small exposure-qualified live gate with at least two paired
-  repeats (requires user scope confirmation). Do not claim convergence or
-  M15 closed.
+  it). The exposure-qualified live gate (`--conv-gate`,
+  [`evidence/conv-gate/REPORT.md`](../crates/agent-eval/evidence/conv-gate/REPORT.md))
+  ran 4/4 cells PASS with 4/4 settlement exposure and model-chosen durable
+  closure: the boundary mechanism is verified under the pinned serving. Do
+  not claim convergence or M15 closed: the resume arm still spends a long
+  post-settlement tail (median 29 rounds / 58 calls), so the efficiency
+  criterion is open.
 
   The
   frozen CompletionOpportunity off/on paired live gate then ran

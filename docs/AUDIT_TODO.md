@@ -343,7 +343,7 @@ honest reported fact, not a harness artifact. The
 surviving blocker is a missing completion decision boundary; see
 CONV-CLOSE-01 below.
 
-### CONV-CLOSE-01 — Completion Convergence V1 (deterministic foundation landed 2026-08-29; live gate open)
+### CONV-CLOSE-01 — Completion Convergence V1 (deterministic foundation + exposure-qualified live gate ran 2026-08-29; efficiency open)
 
 The 55-round / 129-call `retry_policy_dev` resume cell is the current bounded
 readiness blocker, but `task.complete` itself is not established as its root
@@ -415,9 +415,19 @@ Landed 2026-08-29 (slices 1–5; the live gate is the remaining step):
   (`settlement_seen` plus pre/post rounds and calls), cell outcome lines
   render them, and the new `--conv-gate` runner (retry_policy_dev,
   normal/resume, at least two paired repeats) marks any cell with zero
-  settlement exposure as inconclusive rather than a pass. The live gate
-  with at least two paired repeats is running on the pinned serving and
-  requires user scope confirmation before each further run.
+  settlement exposure as inconclusive rather than a pass.
+- The exposure-qualified live gate ran 2026-08-29 on the pinned serving
+  (`crates/agent-eval/evidence/conv-gate/REPORT.md`): 4/4 cells PASS with
+  4/4 settlement exposure and durable closure by the model's own
+  `task.complete`. The settlement boundary is therefore verified under a
+  real serving, including cancel/resume and cold restore. The efficiency
+  criterion is NOT met: the resume arm still spends a long post-settlement
+  tail (median 29 rounds / 58 calls; resume r1 = 29/58 after a round-11
+  settled candidate) on edit/process/verify retries — the family of the
+  original 55-round/129-call tail. Do not claim convergence or M15 closed.
+  An A/C paired comparison with the settlement-derived surface/projection
+  as the only variable is the required next step before any lower-tail
+  claim.
 
 The bounded progress payload may retain only the current goal, unresolved
 constraints, checked file identities/revisions (not file bodies), latest
