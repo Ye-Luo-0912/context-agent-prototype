@@ -409,9 +409,15 @@ Landed 2026-08-29 (slices 1–5; the live gate is the remaining step):
   remaining work, mutation after verification (reopen and re-settle), stale
   verification (no re-settlement without a fresh verify), proposal
   settlement across suspend/resume (durable closure commits with a Current
-  verification), and cold same-run restore (reopen and re-settle). The live
-  gate with at least two paired repeats is the next step and requires user
-  scope confirmation before running.
+  verification), and cold same-run restore (reopen and re-settle).
+- Remaining slice-1 exposure accounting landed 2026-08-29 with the gate
+  runner: the cell summary now carries event-derived settlement facts
+  (`settlement_seen` plus pre/post rounds and calls), cell outcome lines
+  render them, and the new `--conv-gate` runner (retry_policy_dev,
+  normal/resume, at least two paired repeats) marks any cell with zero
+  settlement exposure as inconclusive rather than a pass. The live gate
+  with at least two paired repeats is running on the pinned serving and
+  requires user scope confirmation before each further run.
 
 The bounded progress payload may retain only the current goal, unresolved
 constraints, checked file identities/revisions (not file bodies), latest
