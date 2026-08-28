@@ -37,8 +37,16 @@ predates the catalog-cold `fs.mkdir` addition and its admission decision.
 The `TOOL-DIR-SURFACE-01` deterministic gate landed (2026-08-28): a typed
 missing-parent refusal surfaces exactly `fs.mkdir` with `RecoverySurface`
 provenance for one decision, approval unchanged, unrelated missing reads
-unaffected. After its isolated live paired gate freezes the exact product
-surface, rerun the same one-cell bounded preflight on that source before the
+unaffected. The full 24-cell isolated live paired gate ran the same day and
+did NOT promote the recovery source (off 12/12 vs on 11/12 mandatory
+success; higher median rounds/calls; new max tail 55 vs 31), so the
+catalog-cold baseline is retained and `with_recovery_surface` stays off.
+Evidence: [`recovery-surface-gate/REPORT.md`](../crates/agent-eval/evidence/recovery-surface-gate/REPORT.md).
+The gate also exposed a calibration blocker: `retry_diag_dev` fails 0/8 in
+both arms because the serving misses the saturation edge (`base <<
+(attempt-1).min(63)` wraps to 0 for attempts ≥ 64) while every needle
+predicate passes. Resolve that fixture calibration, then rerun the same
+one-cell bounded preflight on that source before the
 formal window. This is product/source readiness confirmation, not permission
 to switch the serving tuple or alter this acceptance contract.
 
@@ -50,7 +58,7 @@ No formal M15 development window currently exists. M15 remains open.
 | --- | --- | --- |
 | Platform gates | M12/M13 clean-tree closure audits in `evidence/platform-closure/{m12,m13}/` | banked |
 | Context | frozen `context-mech.v2` 12-cell A/C evidence in `evidence/context-mech/`; no policy retune or rerun | banked |
-| Tool Surface | edit-gate v4 archival window plus deterministic crash/race/journal/disk-full coverage; production model surface remains v5 while catalog-cold `fs.mkdir` awaits its isolated live admission gate | banked mechanisms; the `TOOL-DIR-SURFACE-01` deterministic gate landed (2026-08-28) and its live paired gate is not folded into M15; the v5 `task.complete` availability change is not promoted by the invalid M15 attempts |
+| Tool Surface | edit-gate v4 archival window plus deterministic crash/race/journal/disk-full coverage; production model surface remains v5; catalog-cold `fs.mkdir` baseline retained by the paired gate (2026-08-28), recovery source behind a default-off switch | banked mechanisms; the `TOOL-DIR-SURFACE-01` 24-cell paired live gate decided against promotion and is not folded into M15; the v5 `task.complete` availability change is not promoted by the invalid M15 attempts |
 | Execution coherence | Convergence Bench 4/4 plus `longflow-post-obligation-2026-08-23/` | banked |
 | Long-task truth chain | deterministic snapshot fence, unified capture, two-phase completion, verification basis and tuple-only cold resume | banked |
 | Advisory switches | `CompletionOpportunity` ended default-off; no candidate switch may be enabled | frozen off |
@@ -159,8 +167,9 @@ surface, reject a serving or close M15.
 Before spending a 12-cell window:
 
 1. keep the relevant deterministic evaluator/provider/runtime tests green;
-2. finish the `TOOL-DIR-SURFACE-01` isolated live paired gate outside M15
-   and rerun the bounded one-cell
+2. resolve the `retry_diag_dev` calibration blocker the paired gate exposed
+   (0/8 in both arms: the serving misses the saturation edge) and rerun the
+   bounded one-cell
    source/product preflight without changing the serving tuple;
 3. use the preflight-pinned serving tuple in §0 without fallback or automatic
    protocol negotiation;

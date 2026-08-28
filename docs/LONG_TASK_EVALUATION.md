@@ -850,11 +850,15 @@ model decisions. `TOOL-DIR-01` has since landed as the explicit transactional
 `fs.mkdir`: one final component under an existing pinned parent, with
 authority-v3 object identity and conservative rollback/reopen recovery.
 `fs.write` still never creates topology. The tool is currently catalog-cold;
-the `TOOL-DIR-SURFACE-01` deterministic gate (2026-08-28) chose the
-failure-triggered recovery source — a typed missing-parent refusal surfaces
-exactly `fs.mkdir` with `RecoverySurface` provenance for one decision — and
-the isolated live paired gate must confirm that choice before always-ready
-admission. The old preflight pins the serving tuple but predates
+the `TOOL-DIR-SURFACE-01` deterministic gate (2026-08-28) proved the
+failure-triggered recovery source works — a typed missing-parent refusal
+surfaces exactly `fs.mkdir` with `RecoverySurface` provenance for one
+decision — but its full 24-cell isolated live paired gate rejected
+promotion the same day (unequal mandatory success, higher median
+rounds/calls, new max tail), so the baseline stays and the
+`with_recovery_surface` switch remains off. The gate also exposed a
+`retry_diag_dev` calibration blocker (0/8 both arms; saturation edge
+missed). The old preflight pins the serving tuple but predates
 this product catalog revision.
 
 ### Work package 5 — execution order and live decision

@@ -493,10 +493,16 @@ and sandbox contracts live elsewhere. Experiment facts live in
   (PreferSurface demand only; a read-only gate still refuses the
   recovery-marked write without dispatch), and no surface change for
   unrelated missing reads. The candidate ships behind a host switch
-  (default off), so the shipped product keeps the catalog-cold baseline;
-  `agent-eval --recovery-surface-gate` runs the isolated live paired gate
-  (normal/resume, create-file/diagnosis/multi-file, at least two repeats
-  per mode) that decides promotion to an always-ready schema.
+  (default off). The full 24-cell isolated live paired gate ran the same
+  day (`crates/agent-eval/evidence/recovery-surface-gate/REPORT.md`):
+  the recovery surface did NOT promote (off 12/12 vs on 11/12 mandatory
+  success, higher median rounds/calls in 5 of 6 pack/mode cells, new max
+  tail 55 vs 31 rounds), so the catalog-cold baseline is retained and the
+  switch stays off; the always-ready compact schema is the only unexercised
+  fallback. The gate also surfaced a calibration blocker: `retry_diag_dev`
+  fails 0/8 in both arms (the serving misses the saturation edge while all
+  needle predicates pass), which must be resolved before the formal M15
+  window.
   Consequently the earlier product preflight still pins the serving tuple,
   but it does not validate this newer catalog/source revision; rerun one
   bounded source-bound preflight after the surface choice and before formal
@@ -842,8 +848,11 @@ live development pack (3 tasks × normal/resume × 2 repeats). Budget, fixtures
 and report-only closure semantics are frozen; the serving tuple is fixed by
 the bounded representative PinAI/Luna Responses preflight. Because `fs.mkdir`
 changed the product catalog after that diagnostic, the `TOOL-DIR-SURFACE-01`
-deterministic admission gate landed (2026-08-28); its isolated live paired
-gate (`agent-eval --recovery-surface-gate`) must then finish and one bounded
+deterministic admission gate landed (2026-08-28) and its full 24-cell paired
+live gate ran the same day: the recovery surface did NOT promote, the
+catalog-cold baseline is retained, and the `with_recovery_surface` switch
+stays off. The `retry_diag_dev` calibration blocker (0/8 in both arms,
+saturation edge missed) must be resolved, then one bounded
 preflight must rerun on the exact candidate
 source/surface. The next accepted run must then be one uninterrupted clean-tree
 `retry-pilot-cell-v3` window with a

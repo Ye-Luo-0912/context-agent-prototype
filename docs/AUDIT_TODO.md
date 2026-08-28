@@ -284,6 +284,25 @@ schema/prompt-token delta. Failed outputs remain counted. After the surface
 choice, rerun one bounded source-bound product preflight before formal M15;
 the earlier preflight did not contain this catalog entry.
 
+The full 24-cell paired gate ran on 2026-08-28 (clean tree at
+`1a239479`, serving `gpt-5.6-luna` @ PinAI `/v1`, 128k, zero NOT_RUN) and
+**the recovery surface did NOT promote**: mandatory success was unequal
+(off 12/12 vs on 11/12 — the on-arm resume policy cell exhausted the tool
+round budget after 48 phase-two rounds), median rounds/calls were higher on
+in 5 of 6 pack/mode cells (`retry_policy_dev` normal +55%, resume +83%),
+and the on arm grew a new max tail (55 vs 31 rounds). The baseline stays:
+`fs.mkdir` remains catalog-cold and the `with_recovery_surface` switch stays
+off. Evidence: `crates/agent-eval/evidence/recovery-surface-gate/REPORT.md`.
+The fallback (always-ready compact schema) is now the only unexercised
+candidate and would need its own paired comparison before promotion.
+
+The gate also exposed a calibration finding independent of the surface:
+`retry_diag_dev` fails 0/8 in both arms because the serving misses the
+saturation edge (`base << (attempt-1).min(63)` wraps to 0 for attempts ≥ 64
+while the oracle expects `max_delay_ms`); all file-level needle predicates
+pass while the compiled oracle fails. This must be resolved before the
+formal M15 window (four diag cells would fail as-is).
+
 ### Fingerprint v2 — preview ≠ identity (fixed 2026-08-23)
 
 The old `resolution_fingerprint` hashed only the 20-name cwd preview and
