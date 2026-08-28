@@ -542,10 +542,14 @@ and sandbox contracts live elsewhere. Experiment facts live in
   it). The exposure-qualified live gate (`--conv-gate`,
   [`evidence/conv-gate/REPORT.md`](../crates/agent-eval/evidence/conv-gate/REPORT.md))
   ran 4/4 cells PASS with 4/4 settlement exposure and model-chosen durable
-  closure: the boundary mechanism is verified under the pinned serving. Do
-  not claim convergence or M15 closed: the resume arm still spends a long
-  post-settlement tail (median 29 rounds / 58 calls), so the efficiency
-  criterion is open.
+  closure: the boundary mechanism is verified under the pinned serving.
+  Read-only `--conv-tail` sliced the post-settlement tail per cell: normal
+  arm clean, resume median driven by one r1 cell whose post-settlement
+  work is real phase-two development (mutations, verifications, retries)
+  with the state machine correctly re-opening and re-settling — not a
+  boundary failure. Do not claim convergence or M15 closed; the efficiency
+  criterion stays open and any model-side projection treatment is a
+  policy/surface question outside the frozen state machine.
 
   The
   frozen CompletionOpportunity off/on paired live gate then ran

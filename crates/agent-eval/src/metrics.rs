@@ -1138,6 +1138,59 @@ pub fn aggregate_metrics(events: &[RuntimeEventEnvelope]) -> RunMetrics {
     metrics
 }
 
+/// Event-level slice of everything that happened after the first
+/// `SettledCandidate` frontier label. Built mechanically from the same
+/// stream as [`aggregate_metrics`]; the split point is the first
+/// `ExecutionFrontier` event whose settlement label is
+/// `SettledCandidate`, and every later frontier delta and tool result is
+/// counted as post-settlement, whether or not the label changed again.
+/// With no settled event the profile is empty and `settled_at_seq` is
+/// `None` (the same zero-exposure rule as the gate runner).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct PostSettlementProfile {
+    pub settled_at_seq: Option<u64>,
+    /// Frontier delta labels after the settled event, counted by their
+    /// wire names (`observed_world_change`, `no_progress`, ...).
+    pub deltas: BTreeMap<String, u64>,
+    /// Failed `ToolFinished` outputs after the settled event.
+    pub failed_outputs: u64,
+    pub failed_tools: BTreeMap<String, u64>,
+    /// All tool calls after the settled event by tool name.
+    pub tool_calls: BTreeMap<String, u64>,
+}
+
+pub fn post_settlement_profile(events: &[RuntimeEventEnvelope]) -> PostSettlementProfile {
+    let mut profile = PostSettlementProfile::default();
+    let mut after = false;
+    for envelope in events {
+        match &envelope.event {
+            RuntimeEvent::ExecutionFrontier { settlement, delta, .. } => {
+                if !after {
+                    if *settlement == Some(agent_contracts::SettlementLabel::SettledCandidate) {
+                        profile.settled_at_seq = Some(envelope.seq);
+                        after = true;
+                    }
+                    continue;
+                }
+                let name = serde_json::to_value(delta)
+                    .ok()
+                    .and_then(|value| value.as_str().map(str::to_owned))
+                    .unwrap_or_default();
+                *profile.deltas.entry(name).or_insert(0) += 1;
+            }
+            RuntimeEvent::ToolFinished { output } if after => {
+                *profile.tool_calls.entry(output.tool_name.clone()).or_insert(0) += 1;
+                if !output.ok {
+                    profile.failed_outputs += 1;
+                    *profile.failed_tools.entry(output.tool_name.clone()).or_insert(0) += 1;
+                }
+            }
+            _ => {}
+        }
+    }
+    profile
+}
+
 fn mark_recovered(
     forgotten: &HashSet<ContextItemId>,
     recovered: &mut HashSet<ContextItemId>,
@@ -2931,6 +2984,113 @@ mod tests {
         assert_eq!(metrics.pre_settlement_calls, 1);
         assert_eq!(metrics.post_settlement_rounds, 0);
         assert_eq!(metrics.post_settlement_calls, 0);
+    }
+
+    #[test]
+    fn post_settlement_profile_counts_every_later_delta_and_tool_result() {
+        let run = RunId::new();
+        let events = vec![
+            envelope(
+                run,
+                1,
+                RuntimeEvent::ToolFinished {
+                    output: ToolOutput {
+                        call_id: "c-pre".into(),
+                        tool_name: "fs.read".into(),
+                        ok: true,
+                        summary: String::new(),
+                        model_content: String::new(),
+                        artifact_ref: None,
+                        metadata: json!({}),
+                    },
+                },
+            ),
+            envelope(run, 2, settled_frontier()),
+            envelope(
+                run,
+                3,
+                RuntimeEvent::ToolFinished {
+                    output: ToolOutput {
+                        call_id: "c1".into(),
+                        tool_name: "fs.read".into(),
+                        ok: true,
+                        summary: String::new(),
+                        model_content: String::new(),
+                        artifact_ref: None,
+                        metadata: json!({}),
+                    },
+                },
+            ),
+            envelope(run, 4, RuntimeEvent::ExecutionFrontier {
+                delta: FrontierDelta::NoProgress,
+                actions_since_frontier_advance: 0,
+                evidence_revision: 1,
+                invalidated: 0,
+                settlement: None,
+            }),
+            envelope(
+                run,
+                5,
+                RuntimeEvent::ToolFinished {
+                    output: ToolOutput {
+                        call_id: "c2".into(),
+                        tool_name: "edit.patch".into(),
+                        ok: false,
+                        summary: "refused".into(),
+                        model_content: String::new(),
+                        artifact_ref: None,
+                        metadata: json!({}),
+                    },
+                },
+            ),
+            envelope(run, 6, RuntimeEvent::ExecutionFrontier {
+                delta: FrontierDelta::ObservedWorldChange,
+                actions_since_frontier_advance: 0,
+                evidence_revision: 2,
+                invalidated: 1,
+                settlement: None,
+            }),
+            envelope(
+                run,
+                7,
+                RuntimeEvent::ToolFinished {
+                    output: ToolOutput {
+                        call_id: "c3".into(),
+                        tool_name: "verify.run".into(),
+                        ok: true,
+                        summary: "passed".into(),
+                        model_content: String::new(),
+                        artifact_ref: None,
+                        metadata: json!({}),
+                    },
+                },
+            ),
+        ];
+        let profile = post_settlement_profile(&events);
+        assert_eq!(profile.settled_at_seq, Some(2));
+        assert_eq!(profile.failed_outputs, 1);
+        assert_eq!(
+            profile.deltas,
+            [("no_progress".to_string(), 1), ("observed_world_change".to_string(), 1)]
+                .into_iter()
+                .collect()
+        );
+        assert_eq!(
+            profile.tool_calls,
+            [
+                ("fs.read".to_string(), 1),
+                ("edit.patch".to_string(), 1),
+                ("verify.run".to_string(), 1),
+            ]
+            .into_iter()
+            .collect()
+        );
+        assert_eq!(profile.failed_tools, [("edit.patch".to_string(), 1)].into_iter().collect());
+
+        let none = post_settlement_profile(&[]);
+        assert_eq!(none.settled_at_seq, None);
+        assert!(none.deltas.is_empty());
+        assert_eq!(none.failed_outputs, 0);
     }
 
     #[test]

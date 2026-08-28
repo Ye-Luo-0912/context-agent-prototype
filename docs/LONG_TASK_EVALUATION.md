@@ -982,9 +982,12 @@ verification, stale verification, proposal settlement across
 suspend/resume, cold same-run restore). The exposure-qualified live gate
 (`--conv-gate`, 2 paired repeats) ran on 2026-08-29 and verifies the
 mechanism under the pinned serving — 4/4 cells PASS, 4/4 settlement
-exposure, model-chosen durable `task.complete` — but the resume arm still
-spends a long post-settlement tail (median 29 rounds / 58 calls), so the
-efficiency criterion is not claimed; see
+exposure, model-chosen durable `task.complete`. A read-only `--conv-tail`
+sliced the post-settlement tail per cell: the normal arm is clean, and the
+resume median is driven by one r1 cell whose post-settlement work is real
+phase-two development (mutations, verifications, retries) with the state
+machine correctly re-opening and re-settling, so the efficiency criterion
+is not claimed and the boundary is not retuned; see
 [`evidence/conv-gate/REPORT.md`](../crates/agent-eval/evidence/conv-gate/REPORT.md).
 The stale comment describing `task.complete` as catalog-cold was removed.
 

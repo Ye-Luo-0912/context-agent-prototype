@@ -85,6 +85,38 @@ curtail the repair loop. Do not retune the boundary from this run: the
 derived state machine is frozen; the open question is policy/surface
 pressure on the model side, not the settlement state.
 
+## Post-settlement composition (read-only `--conv-tail`)
+
+Event-level slice of every cell after its first `SettledCandidate` label
+(deltas after the boundary, failed tool outputs, repeated reads/verifies):
+
+| cell | settled at | no_prog | redundant | advanced | world_ch | invalid | reconf | failed | fs.read | verify | edit.patch(er) | process/shell |
+| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| normal r1 | seq 223 | 3 | 0 | 4 | 0 | 0 | 0 | 0 | 3 | 1 | 0 | 0/0 |
+| normal r2 | seq 336 | 4 | 1 | 11 | 0 | 1 | 4 | 0 | 7 | 2 | 0 | 0/1 |
+| resume r1 | seq 89 | 15 | 1 | 19 | 4 | 11 | 5 | 8 | 17 | 3 | 6(er:4) | 10/1 |
+| resume r2 | seq 276 | 1 | 0 | 2 | 1 | 0 | 1 | 0 | 0 | 1 | 1 | 0/0 |
+
+The normal arm is clean: zero failed outputs, ≤4 `no_progress` deltas after
+settlement. The resume median is driven by resume r1 alone: its settlement
+happens early (seq 89, i.e. the boundary derived for the phase-one world),
+and the phase-two continuation then performs real further development —
+`advanced=19` new evidence/verification rows, `world_ch=4` Known mutations
+plus `invalidated=11` Unknown invalidation events, 15 `no_progress` deltas
+and 8 failed outputs (4 failed `edit.patch`, failed `process.run`/`shell`),
+with 17 `fs.read` and 3 `verify.run` calls. Each of those mutations returns
+the derived state to `Working` and the fresh verification re-settles it; the
+state machine behaved exactly as designed. The long tail is therefore real
+remaining work plus retries in one resume arm, not a settlement-boundary
+failure — and both trees show a clean cell (resume r2: settled seq 276,
+3 post rounds, 0 failed).
+
+Do not retune the frozen state machine from this table. If a later slice
+wants lower resume tails, the lever is model-side treatment of the
+settlement projection (a policy/surface question outside this audit), and
+any change must keep the mandatory no-lost-work and no-auto-close
+invariants.
+
 ## Next step
 
 A paired A/C comparison at the same serving with the same pack and at

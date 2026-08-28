@@ -110,8 +110,16 @@ fn usage() -> ! {
          usage: agent-eval [--repeats N] --opportunity-gate [normal|resume]\n\
          usage: agent-eval --recovery-surface-gate [normal|resume]\n\
          usage: agent-eval [--repeats N] --conv-gate [normal|resume]\n\
+         usage: agent-eval --conv-tail [--evidence-dir <dir>]\n\
          usage: agent-eval --m15-window\n\
          usage: agent-eval --m15-report <window-dir>\n\
+\n\
+         Read-only post-settlement tail analysis over a conv-gate evidence\n\
+         tree: for every cell, the first setted-candidate frontier event\n\
+         splits the stream and every later frontier delta and tool result\n\
+         is printed (no_progress / redundant / failed outputs / repeated\n\
+         reads and verifies). Does not modify anything and never touches\n\
+         the runtime.\n\
 \n\
          Completion Convergence V1 paired live gate: the frozen\n\
          retry_policy_dev pack runs normal/resume cells, each cell bubbling\n\
@@ -690,6 +698,10 @@ async fn main() -> anyhow::Result<()> {
                     2
                 };
                 run_conv_gate(mode_filter, repeats, evidence_dir, allow_dirty).await?;
+                return Ok(());
+            }
+            "--conv-tail" => {
+                run_conv_tail(evidence_dir).await?;
                 return Ok(());
             }
             "--m15-window" => {
@@ -1595,6 +1607,115 @@ async fn run_conv_gate(
     }
     println!("promotion judgment belongs to the evidence REPORT, not this runner");
     Ok(())
+}
+
+/// Read-only event-level slice of every cell in a conv-gate evidence tree:
+/// what actually happened after the first settled candidate. Prints a
+/// bounded one-line profile per cell plus per-mode medians. Never writes.
+async fn run_conv_tail(evidence_dir: Option<std::path::PathBuf>) -> anyhow::Result<()> {
+    let evidence_root = evidence_dir.unwrap_or_else(|| {
+        std::path::PathBuf::from("crates/agent-eval/evidence/conv-gate")
+    });
+    anyhow::ensure!(
+        evidence_root.is_dir(),
+        "evidence dir {} not found",
+        evidence_root.display()
+    );
+    let mut rows = Vec::new();
+    for entry in std::fs::read_dir(&evidence_root)? {
+        let entry = entry?;
+        if !entry.file_type()?.is_dir() {
+            continue;
+        }
+        let pair_name = entry.file_name().to_string_lossy().into_owned();
+        for repeat in std::fs::read_dir(entry.path())? {
+            let repeat = repeat?;
+            if !repeat.file_type()?.is_dir() {
+                continue;
+            }
+            let events_path = repeat.path().join("dynamic").join("events.jsonl");
+            if !events_path.is_file() {
+                continue;
+            }
+            let events = load_events_jsonl(&events_path)?;
+            let profile = crate::metrics::post_settlement_profile(&events);
+            rows.push((
+                pair_name.clone(),
+                repeat.file_name().to_string_lossy().into_owned(),
+                events.len(),
+                profile,
+            ));
+        }
+    }
+    rows.sort_by(|left, right| left.0.cmp(&right.0).then(left.1.cmp(&right.1)));
+    println!("== post-settlement tail profile (read-only, from {} ) ==", evidence_root.display());
+    println!(
+        "pair                         rep events  settled   no_prog redundant advanced world_ch invalid reconf resolved failed tools(read/verify/edit/process/shell)"
+    );
+    let mut mode_medians: std::collections::BTreeMap<String, Vec<(u64, u64, u64)>> =
+        std::collections::BTreeMap::new();
+    for (pair, repeat, event_count, profile) in &rows {
+        let mode = pair.split('-').next_back().unwrap_or(pair).to_string();
+        let delta = |name: &str| profile.deltas.get(name).copied().unwrap_or(0);
+        let tool = |name: &str| profile.tool_calls.get(name).copied().unwrap_or(0);
+        let failed = |name: &str| profile.failed_tools.get(name).copied().unwrap_or(0);
+        let settled = profile
+            .settled_at_seq
+            .map(|seq| format!("seq:{seq}"))
+            .unwrap_or_else(|| "none".into());
+        let (read, verify) = (tool("fs.read"), tool("verify.run"));
+        let (edits, failed_edits) = (tool("edit.patch"), failed("edit.patch"));
+        let (process, shell) = (tool("process.run"), tool("shell.exec"));
+        println!(
+            "{:<28} {:<3} {:<7} {:<8} {:<7} {:<6} {:<6} {:<7} {:<7} {:<6} {:<8} {:<8} {} {} {}",
+            pair,
+            repeat,
+            event_count,
+            settled,
+            delta("no_progress"),
+            delta("redundant_evidence"),
+            delta("evidence_advanced"),
+            delta("observed_world_change"),
+            delta("world_invalidated_unknown"),
+            delta("evidence_reconfirmed"),
+            delta("obligation_resolved"),
+            profile.failed_outputs,
+            format_args!("{read}/{verify}"),
+            format_args!("{edits}(er:{failed_edits})"),
+            format_args!("{process}/{shell}"),
+        );
+        mode_medians
+            .entry(mode)
+            .or_default()
+            .push((delta("no_progress"), delta("redundant_evidence"), profile.failed_outputs));
+    }
+    println!();
+    for (mode, samples) in &mode_medians {
+        let mut no_progress: Vec<u64> = samples.iter().map(|row| row.0).collect();
+        let mut redundant: Vec<u64> = samples.iter().map(|row| row.1).collect();
+        let mut failed: Vec<u64> = samples.iter().map(|row| row.2).collect();
+        println!(
+            "{:<6} median post no_progress={} redundant={} failed_outputs={} (n={})",
+            mode,
+            checked_percentile(&mut no_progress, 50).unwrap_or(0),
+            checked_percentile(&mut redundant, 50).unwrap_or(0),
+            checked_percentile(&mut failed, 50).unwrap_or(0),
+            samples.len()
+        );
+    }
+    Ok(())
+}
+
+fn load_events_jsonl(path: &std::path::Path) -> anyhow::Result<Vec<agent_contracts::RuntimeEventEnvelope>> {
+    let text = std::fs::read_to_string(path)?;
+    let mut events = Vec::new();
+    for line in text.lines() {
+        if line.trim().is_empty() {
+            continue;
+        }
+        events.push(serde_json::from_str(line)?);
+    }
+    Ok(events)
 }
 
 /// Calibrated `retry_diag_dev` live smoke: the candidate switch stays off,

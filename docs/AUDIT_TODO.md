@@ -420,14 +420,21 @@ Landed 2026-08-29 (slices 1–5; the live gate is the remaining step):
   (`crates/agent-eval/evidence/conv-gate/REPORT.md`): 4/4 cells PASS with
   4/4 settlement exposure and durable closure by the model's own
   `task.complete`. The settlement boundary is therefore verified under a
-  real serving, including cancel/resume and cold restore. The efficiency
-  criterion is NOT met: the resume arm still spends a long post-settlement
-  tail (median 29 rounds / 58 calls; resume r1 = 29/58 after a round-11
-  settled candidate) on edit/process/verify retries — the family of the
-  original 55-round/129-call tail. Do not claim convergence or M15 closed.
-  An A/C paired comparison with the settlement-derived surface/projection
-  as the only variable is the required next step before any lower-tail
-  claim.
+  real serving, including cancel/resume and cold restore.
+- Read-only `--conv-tail` then sliced the post-settlement tail at the event
+  level: the normal arm is clean (0 failed outputs, ≤4 `no_progress`
+  deltas after the settled label); the resume median is driven by resume
+  r1 alone, whose "long tail" is real phase-two development after an early
+  seq-89 settled label (19 `advanced`, 4 Known mutations + 11 Unknown
+  invalidations, 15 `no_progress`, 8 failed outputs) — each mutation
+  returns the derived state to `Working` and the fresh verification
+  re-settles it, exactly the designed behavior, and resume r2 is clean.
+  The efficiency criterion therefore remains not claimed, but the tail is
+  characterized as real remaining work plus retries in one cell rather
+  than a settlement-boundary failure. Do not claim convergence or M15
+  closed. Any future model-side treatment of the settlement projection is
+  a policy/surface question outside this audit and must preserve the
+  no-lost-work and no-auto-close invariants.
 
 The bounded progress payload may retain only the current goal, unresolved
 constraints, checked file identities/revisions (not file bodies), latest
