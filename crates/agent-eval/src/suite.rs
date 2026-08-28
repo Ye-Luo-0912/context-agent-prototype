@@ -316,6 +316,11 @@ pub fn materialize_live_workspace(task: &SuiteTask, root: &Path) -> anyhow::Resu
     }
 }
 
+/// Workspace cleanliness contract shared with the tool-edit strict scan:
+/// the harness-owned `.gitignore` at this exact content is not a
+/// model-visible artifact, so no evaluator layer reports it as unexpected.
+pub(crate) const EVAL_GITIGNORE_CONTENT: &str = ".focus-agent/\n.gate/\ntarget/\nCargo.lock\n";
+
 /// File-only eval workspaces are not clones. Init a local git repo so
 /// `git.status` / `git.diff` are real probes, not "not a git repository".
 /// Do not hide those tools. SWE-bench clones already have `.git` and skip.
@@ -330,7 +335,11 @@ pub fn ensure_workspace_git(root: &Path) -> anyhow::Result<()> {
     git_ok(root, &["config", "core.autocrlf", "false"])?;
     let gitignore = root.join(".gitignore");
     if !gitignore.exists() {
-        fs::write(&gitignore, ".focus-agent/\n")?;
+        // Align model-visible cleanliness with the allowed-diff policy
+        // (SKIP_DIRS / SKIP_FILES): generated build artifacts must not
+        // appear in git.status, so the model never spends rounds "cleaning"
+        // files the evaluator silently discards.
+        fs::write(&gitignore, EVAL_GITIGNORE_CONTENT)?;
     }
     git_ok(root, &["add", "-A"])?;
     let status = Command::new("git")

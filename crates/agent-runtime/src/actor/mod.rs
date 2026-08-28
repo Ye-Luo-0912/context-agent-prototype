@@ -1162,6 +1162,9 @@ struct ActorState {
     /// a tool's result still offers the tool.
     active_tool: Option<String>,
     turn: Option<ActiveTurn>,
+    /// 上次随 ExecutionFrontier 上报的派生结算标签。进程内记忆，
+    /// 不进 checkpoint：标签是重算派生态，checkpoint 不携带决策。
+    last_reported_settlement: Option<agent_contracts::SettlementLabel>,
     /// A cancelled tool operation whose completion may still own a prepared
     /// effect. Ordinary mutation waits for this single cleanup result; Stop
     /// drains it with a hard deadline so dropping the actor never silently

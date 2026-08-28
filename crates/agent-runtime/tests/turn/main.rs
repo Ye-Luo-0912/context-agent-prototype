@@ -11,5 +11,6 @@ mod policy;
 mod recovery_surface;
 mod safepoint;
 mod scopes;
+mod settlement;
 mod stream;
 mod task_progress;

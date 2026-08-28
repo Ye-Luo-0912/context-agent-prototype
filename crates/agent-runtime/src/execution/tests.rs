@@ -7,8 +7,8 @@ use super::state::{
 use super::*;
 use agent_contracts::{
     MAX_TASK_ANCHOR_ITEM_CHARS, NegativeFactEventKind, ResourceFreshness, ResourceVersionOracle,
-    ToolExecutionAttribution, ToolExecutionFacts, ToolExecutionPurpose, ToolFailureDomain,
-    ToolOutput, ToolResultDisposition, TurnFrame, VerificationReuse,
+    SettlementLabel, ToolExecutionAttribution, ToolExecutionFacts, ToolExecutionPurpose,
+    ToolFailureDomain, ToolOutput, ToolResultDisposition, TurnFrame, VerificationReuse,
 };
 use serde_json::json;
 
@@ -1748,4 +1748,118 @@ fn exact_verification_pass_reuse_requires_the_complete_current_identity() {
             .is_none(),
         "an admitted workspace revision change must force real verification"
     );
+}
+
+fn verified_ok() -> ToolOutput {
+    let mut out = output("shell.exec", true, "exit 0");
+    // A verifier that names its covered resource has a Known footprint, so
+    // the pass admits the current world instead of re-arming Unknown
+    // pending. The touched revision must match the fact it admits.
+    out.metadata = json!({
+        "command": "cargo test",
+        "verification": true,
+        "path": "src/auth.rs",
+        "revision": "v2",
+    });
+    out
+}
+
+fn write_of(path: &str, revision: &str) -> ToolOutput {
+    let mut out = output("fs.write", true, "wrote");
+    out.metadata = json!({"path": path, "revision": revision});
+    out
+}
+
+#[test]
+fn settlement_is_working_without_covered_mutation() {
+    let mut resume = ExecutionState::default();
+    assert_eq!(resume.settlement(), SettlementLabel::Working);
+    assert!(resume.settlement_view().is_none());
+
+    // Read-only exploration admits no mutation; the task has not settled.
+    resume.observe_tool(&output("fs.read", true, "read auth"), 1, 1);
+    assert_eq!(resume.settlement(), SettlementLabel::Working);
+    assert!(resume.settlement_view().is_none());
+}
+
+#[test]
+fn mutation_then_current_verification_settles() {
+    let mut resume = ExecutionState::default();
+    // A covered mutation needs a tracked path first: a write to a known
+    // digest marks the source changed and makes verification due.
+    resume.observe_tool(&output("fs.read", true, "read auth"), 1, 1);
+    resume.observe_tool(&write_of("src/auth.rs", "v2"), 1, 2);
+    assert_eq!(resume.settlement(), SettlementLabel::VerificationDue);
+    assert!(resume.settlement_view().is_none());
+
+    resume.observe_tool(&verified_ok(), 1, 3);
+    assert_eq!(resume.validity(), VerificationState::Current);
+    assert_eq!(resume.settlement(), SettlementLabel::SettledCandidate);
+    let view = resume.settlement_view().expect("settled candidate projects");
+    assert!(view.contains("SETTLED CANDIDATE"));
+}
+
+#[test]
+fn mutation_after_verification_returns_to_due() {
+    let mut resume = ExecutionState::default();
+    resume.observe_tool(&write_of("src/auth.rs", "v2"), 1, 1);
+    resume.observe_tool(&verified_ok(), 1, 2);
+    assert_eq!(resume.settlement(), SettlementLabel::SettledCandidate);
+
+    resume.observe_tool(&write_of("src/auth.rs", "v3"), 1, 3);
+    assert_eq!(resume.validity(), VerificationState::Stale);
+    assert_eq!(resume.settlement(), SettlementLabel::VerificationDue);
+    assert!(resume.settlement_view().is_none());
+}
+
+#[test]
+fn failed_verification_is_due_not_settled() {
+    let mut resume = ExecutionState::default();
+    resume.observe_tool(&write_of("src/auth.rs", "v2"), 1, 1);
+    let mut fail = output("shell.exec", false, "tests failed");
+    fail.metadata = json!({"command": "cargo test", "verification": true});
+    resume.observe_tool(&fail, 1, 2);
+    assert_eq!(resume.settlement(), SettlementLabel::VerificationDue);
+    assert!(resume.settlement_view().is_none());
+}
+
+#[test]
+fn open_obligation_with_current_verification_is_verified_current() {
+    let mut resume = ExecutionState::default();
+    resume.observe_tool(&write_of("src/auth.rs", "v2"), 1, 1);
+    resume.observe_tool(&verified_ok(), 1, 2);
+    resume.observe_tool(&missing_program("prog_a", "fp-1"), 1, 3);
+    assert_eq!(resume.settlement(), SettlementLabel::VerifiedCurrent);
+    let view = resume.settlement_view().expect("verified current projects");
+    assert!(view.contains("VERIFIED CURRENT"));
+    assert!(view.contains("1 obligation"));
+
+    // A typed resolution drains the ledger; the resolving command is itself
+    // a world change, so settlement needs a fresh verification on top.
+    resume.observe_tool(&resolved_command("prog_a", "scope-a", "fp-1"), 1, 4);
+    resume.observe_tool(&verified_ok(), 1, 5);
+    assert_eq!(resume.settlement(), SettlementLabel::SettledCandidate);
+}
+
+#[test]
+fn open_obligation_without_current_verification_is_working() {
+    let mut resume = ExecutionState::default();
+    resume.observe_tool(&missing_program("prog_a", "fp-1"), 1, 1);
+    assert_eq!(resume.settlement(), SettlementLabel::Working);
+    assert!(resume.settlement_view().is_none());
+}
+
+#[test]
+fn settlement_survives_progress_only_anchor_change() {
+    let mut resume = ExecutionState::default();
+    resume.observe_tool(&write_of("src/auth.rs", "v2"), 1, 1);
+    resume.observe_tool(&verified_ok(), 1, 2);
+    // Progress-only anchor advancement keeps the verification basis: the
+    // current verifier stays current (basis == 0 on both sides).
+    resume.anchor_revision = 5;
+    assert_eq!(resume.settlement(), SettlementLabel::SettledCandidate);
+
+    // A boundary change to the verification basis reopens the obligation.
+    resume.verification.spec_revision = 2;
+    assert_eq!(resume.settlement(), SettlementLabel::VerificationDue);
 }

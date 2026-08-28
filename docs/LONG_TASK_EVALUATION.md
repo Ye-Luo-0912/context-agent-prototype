@@ -969,6 +969,21 @@ task closure, and valid remaining work must remain executable.
    across cancel/resume and cold resume with deterministic models. Only then
    run a small exposure-qualified live gate with at least two paired repeats.
 
+Slices 1–5 are landed 2026-08-29, tracked in CONV-CLOSE-01: fixture
+self-check cleanliness matches the allowed-diff policy; `RunMetrics`
+aggregates first-settled-candidate and pre/post rounds and calls from
+`ExecutionFrontier` events; `ExecutionState::settlement()` derives
+`Working | VerificationDue | VerifiedCurrent | SettledCandidate` from
+verification validity plus the typed obligation ledger (no round counts),
+published only on change with a bounded neutral projection that preserves
+the model's choice; and seven deterministic actor scenarios are green
+(ordinary final, durable closure, genuine remaining work, mutation after
+verification, stale verification, proposal settlement across
+suspend/resume, cold same-run restore). The remaining step is the
+exposure-qualified live gate with ≥2 paired repeats, which requires user
+scope confirmation. The stale comment describing `task.complete` as
+catalog-cold was removed.
+
 Promotion requires mandatory behavior/diff/resume parity, no lost unfinished
 work, lower rounds and calls after the first valid settled candidate, and no new
 max tail. Total rounds/calls remain reported, but the causal metric starts at

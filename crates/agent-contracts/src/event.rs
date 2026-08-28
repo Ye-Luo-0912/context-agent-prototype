@@ -301,6 +301,10 @@ pub enum RuntimeEvent {
         /// 本轮因 world revision 推进而失效的前沿证据条数。
         #[serde(default)]
         invalidated: u64,
+        /// 派生结算标签；仅在标签变化时填充，供结算后尾部
+        /// rounds/calls 从事件流重建。
+        #[serde(default)]
+        settlement: Option<crate::SettlementLabel>,
     },
     /// 当轮正文缓存账目，每次模型输入组装出一条增量。
     /// eligible/hit/miss 为本次组装真实 checkpoint demand / 回注 /

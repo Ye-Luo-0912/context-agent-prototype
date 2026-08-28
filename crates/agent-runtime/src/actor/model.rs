@@ -147,12 +147,10 @@ impl RuntimeActor {
             })
             .unwrap_or((None, Vec::new()));
         // Ending a model turn is implicit; closing the durable task is a
-        // separate lifecycle transition. Keep `task.complete` catalog-cold
-        // during ordinary work so a model cannot accidentally erase task
-        // affinity after every successful substep. Explicit user intent or
-        // a task-owned requirement loads it through the same bounded lease
-        // path as every other optional capability. The model can also find
-        // and load it deliberately through `capability.manage`.
+        // separate lifecycle transition. `task.complete` is always present
+        // in the v5 catalog: this requirement only prefers it on the
+        // surface when the current directive explicitly requests closure,
+        // so ordinary work does not accidentally erase task affinity.
         if completion_requested {
             requirements.push(ToolSurfaceRequirement {
                 tool_name: "task.complete".into(),

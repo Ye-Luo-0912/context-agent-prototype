@@ -617,7 +617,7 @@ fn collect_workspace_files_inner(
             let relative = normalize_relative(&relative.to_string_lossy());
             if file_type.is_file()
                 && relative == ".gitignore"
-                && fs::read(&path)? == b".focus-agent/\n"
+                && fs::read(&path)? == crate::suite::EVAL_GITIGNORE_CONTENT.as_bytes()
             {
                 continue;
             }

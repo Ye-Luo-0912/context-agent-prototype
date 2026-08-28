@@ -521,6 +521,27 @@ and sandbox contracts live elsewhere. Experiment facts live in
   but it does not validate this newer catalog/source revision; rerun one
   bounded source-bound preflight after the surface choice and before formal
   M15.
+- **Completion Convergence V1 deterministic foundation landed** (2026-08-29,
+  CONV-CLOSE-01 slices 1–5): evaluator cleanliness now aligns model-visible
+  workspace with the allowed-diff policy (`.gate/`, `target/` and
+  `Cargo.lock` are gitignored by fixture self-check, so build artifacts
+  cannot manufacture cleanup loops the evaluator silently discards);
+  event-derived convergence metrics aggregate settlement (first settled
+  candidate, rounds/calls before and after it); dynamic states `Working ->
+  VerificationDue -> VerifiedCurrent -> SettledCandidate` derive from the
+  bounded `TaskRecord.resume: ExecutionState` (verification validity plus
+  the closing obligation ledger, never fixed round counts), are published as
+  label-on-change `ExecutionFrontier` events, and project a bounded neutral
+  one-liner that preserves the model's choice among ordinary final,
+  `task.complete`, or concrete continuation — no auto-close, no standing
+  stop instruction. Seven deterministic actor scenarios are green: ordinary
+  final, durable closure, genuine remaining work, mutation after
+  verification, stale verification, proposal settlement across
+  cancel/resume, and cold restore. The stale runtime comment describing
+  `task.complete` as catalog-cold was removed (the v5 registry always loads
+  it). Open: the small exposure-qualified live gate with at least two paired
+  repeats (requires user scope confirmation). Do not claim convergence or
+  M15 closed.
 
   The
   frozen CompletionOpportunity off/on paired live gate then ran
@@ -859,6 +880,11 @@ Do not auto-close, resurrect CompletionOpportunity, add fixed stopping counts,
 or change Context/GC. Same-model A/C and broader diagnosis/multi-file twins
 remain after formal M15. Criterion/CPL and model-visible TaskGraph research
 stay deferred and evidence-gated.
+The deterministic foundation (evaluator cleanliness, event-derived
+post-settlement metrics, derived `Working -> VerificationDue ->
+VerifiedCurrent -> SettledCandidate` boundary with label-on-change frontier
+events, and seven deterministic actor scenarios) landed 2026-08-29; the open
+step is the exposure-qualified live gate with at least two paired repeats.
 
 ## Next milestone
 

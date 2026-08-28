@@ -1051,6 +1051,25 @@ pub enum FrontierDelta {
     NoProgress,
 }
 
+/// 派生任务结算标签：证据驱动的动态状态（决策边界，不是自动停止）。
+/// 从 Execution Frontier、义务账本与验证基础推导；任何新的 accepted
+/// mutation、新用户约束、失效/失败验证或未解义务把任务推回
+/// `Working`。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SettlementLabel {
+    /// 有未解义务或未修复失败，验证也未覆盖当前世界。
+    #[default]
+    Working,
+    /// 一次适用的 accepted mutation 使证明失效：验证欠。
+    VerificationDue,
+    /// 可信验证基础覆盖了该变更，但仍有无未解义务/失败。
+    VerifiedCurrent,
+    /// 无未解约束、义务、失败或 in-flight 操作：当前工作已结算。
+    /// 模型仍自主选择 ordinary final、`task.complete` 或具体续做。
+    SettledCandidate,
+}
+
 impl FrontierDelta {
     /// 是否为可证明的前沿推进。只有推进轮清停滞签名、失败聚类与
     /// 收敛债务；其余 delta 只累计债务。
@@ -1151,6 +1170,13 @@ pub struct TaskProgressView {
     /// lease is outstanding for this decision. Never an execution block.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub completion_opportunity: Option<String>,
+    /// Derived settlement decision boundary: one bounded, neutral statement
+    /// projected only when the current work is verified and settled (or
+    /// verified with obligations still open). Not an instruction to stop;
+    /// the model keeps the choice of ordinary final, durable `task.complete`
+    /// or concrete continuation.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub settlement: Option<String>,
 }
 
 /// Hard cap on the assembled TASK PROGRESS prompt block. List-length caps

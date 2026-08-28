@@ -650,6 +650,35 @@ impl ExecutionState {
         !self.failed_commands.is_empty()
     }
 
+    /// Derived settlement label: an evidence-driven decision boundary, not a
+    /// policy. `SettledCandidate` requires the trusted verification basis to
+    /// cover the current world (a mutation happened and a Current verification
+    /// admits it) and no typed obligation or failed verification to be open;
+    /// the model keeps the choice of ordinary final, durable closure, or
+    /// concrete continuation. Provenance: the label is recomputed on demand
+    /// from typed facts, never stored, so a checkpoint cannot carry a stale
+    /// decision.
+    pub fn settlement(&self) -> agent_contracts::SettlementLabel {
+        use agent_contracts::SettlementLabel;
+        let verification_due = self.has_unmet_obligation();
+        let blockers_open = self.open_obligation_count() > 0;
+        let covered = !verification_due && self.validity() == VerificationState::Current;
+        match (covered, blockers_open) {
+            (true, false) => SettlementLabel::SettledCandidate,
+            (true, true) => SettlementLabel::VerifiedCurrent,
+            (false, true) => SettlementLabel::Working,
+            (false, false) => {
+                if verification_due {
+                    SettlementLabel::VerificationDue
+                } else {
+                    // No mutation is covered by a Current verification; the
+                    // task has not settled.
+                    SettlementLabel::Working
+                }
+            }
+        }
+    }
+
     pub fn fact_for(&self, path: &str) -> Option<&ResourceFact> {
         self.checked_files.iter().find(|row| row.path == path)
     }
@@ -956,6 +985,29 @@ impl ExecutionState {
             stall_warning: self.stall_warning(),
             frontier_warning: self.frontier_warning(),
             completion_opportunity: None,
+            settlement: self.settlement_view(),
+        }
+    }
+
+    /// 结算决策边界的有界、中性投影：仅在验证覆盖且义务清空（或验证
+    /// 覆盖而义务未清）时给出一行事实，供模型选择 ordinary final、
+    /// 持久闭包或具体续做。不是"停止"指令，也不是轮数驱动的提示。
+    pub(super) fn settlement_view(&self) -> Option<String> {
+        use agent_contracts::SettlementLabel;
+        let open = self.open_obligation_count();
+        match self.settlement() {
+            SettlementLabel::SettledCandidate => Some(
+                "SETTLED CANDIDATE: the trusted verification basis covers the current \
+                 world and no obligation or failure is open. You may give an ordinary \
+                 final answer, call task.complete for durable task closure, or continue \
+                 with concrete remaining work."
+                    .to_string(),
+            ),
+            SettlementLabel::VerifiedCurrent => {
+                Some(format!("VERIFIED CURRENT: verification covers the current world; {open} obligation(s) still open."))
+            }
+            // 中间状态不投影；未收敛已由 stall/frontier advisory 覆盖。
+            SettlementLabel::Working | SettlementLabel::VerificationDue => None,
         }
     }
 

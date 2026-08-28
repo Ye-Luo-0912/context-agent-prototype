@@ -1621,6 +1621,19 @@ impl RuntimeActor {
                 })
                 .await;
         }
+        let settlement = {
+            let current = self
+                .state
+                .turn
+                .as_ref()
+                .map(|turn| turn.execution.settlement());
+            if current != self.state.last_reported_settlement {
+                self.state.last_reported_settlement = current;
+                current
+            } else {
+                None
+            }
+        };
         let _ = self
             .core
             .emit_event(RuntimeEvent::ExecutionFrontier {
@@ -1628,6 +1641,7 @@ impl RuntimeActor {
                 actions_since_frontier_advance: observation.actions_since_frontier_advance,
                 evidence_revision: observation.evidence_revision,
                 invalidated: observation.invalidated,
+                settlement,
             })
             .await;
     }

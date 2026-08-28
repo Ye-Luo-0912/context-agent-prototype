@@ -74,6 +74,15 @@ pub struct RunMetrics {
     pub frontier_no_advance_peak: u64,
     /// 因 world revision 推进而失效的前沿证据条数。
     pub evidence_invalidations: u64,
+    /// 结算后尾部归因：事件流首次出现 `SettledCandidate` 标签之后的
+    /// 轮数/调用数，与结算点之前的分开报告（causal baseline）。
+    /// 首次结算点本身取自 `ExecutionFrontier` 的 settlement 变化，
+    /// 由 Runtime 派生，不从提示文本猜测。
+    pub settled_seen: bool,
+    pub pre_settlement_rounds: u64,
+    pub pre_settlement_calls: u64,
+    pub post_settlement_rounds: u64,
+    pub post_settlement_calls: u64,
     /// 任务结果前沿的影子账本。现有 Evidence
     /// Frontier 回答“是否获得了新的 current 证据”；这一组指标
     /// 只回答“任务结果是否前进”，不参与实时决策。
@@ -383,6 +392,11 @@ pub fn aggregate_metrics(events: &[RuntimeEventEnvelope]) -> RunMetrics {
     // 因此用有界在途 id 集合避免重复计数。
     let mut catalog_optional_round: Option<CatalogOptionalRound> = None;
     let mut open_optional_calls: HashSet<String> = HashSet::new();
+    // 结算后尾部会计：首次 SettledCandidate 事件出现前的轮/调用与
+    // 之后的分开计数，promotion 因果指标从结算点起算。
+    let mut settled_seen = false;
+    let mut pre_settlement_rounds: u64 = 0;
+    let mut pre_settlement_calls: u64 = 0;
 
     for envelope in events {
         match &envelope.event {
@@ -398,6 +412,11 @@ pub fn aggregate_metrics(events: &[RuntimeEventEnvelope]) -> RunMetrics {
             }
             RuntimeEvent::ToolStarted { call } => {
                 metrics.tool_calls += 1;
+                if settled_seen {
+                    metrics.post_settlement_calls += 1;
+                } else {
+                    pre_settlement_calls += 1;
+                }
                 note_catalog_optional_request(
                     &mut metrics,
                     catalog_optional_round.as_mut(),
@@ -680,6 +699,7 @@ pub fn aggregate_metrics(events: &[RuntimeEventEnvelope]) -> RunMetrics {
                 delta,
                 actions_since_frontier_advance,
                 invalidated,
+                settlement,
                 ..
             } => {
                 // 收敛指标：可证明推进数、冗余证据调用、
@@ -697,6 +717,14 @@ pub fn aggregate_metrics(events: &[RuntimeEventEnvelope]) -> RunMetrics {
                     .frontier_no_advance_peak
                     .max(u64::from(*actions_since_frontier_advance));
                 metrics.evidence_invalidations += *invalidated;
+                if let Some(agent_contracts::SettlementLabel::SettledCandidate) = settlement {
+                    if !settled_seen {
+                        settled_seen = true;
+                        metrics.pre_settlement_rounds = pre_settlement_rounds;
+                        metrics.pre_settlement_calls = pre_settlement_calls;
+                    }
+                    metrics.settled_seen = true;
+                }
             }
             RuntimeEvent::ExecutionBatchSettled {
                 requested,
@@ -890,6 +918,11 @@ pub fn aggregate_metrics(events: &[RuntimeEventEnvelope]) -> RunMetrics {
             RuntimeEvent::ToolSurfacePlanned { report } => {
                 finish_catalog_optional_round(&mut metrics, &mut catalog_optional_round);
                 metrics.rounds += 1;
+                if settled_seen {
+                    metrics.post_settlement_rounds += 1;
+                } else {
+                    pre_settlement_rounds += 1;
+                }
                 current_turn_rounds = current_turn_rounds.saturating_add(1);
                 metrics.schema_tokens_total += report.selected_schema_tokens as u64;
                 if report.selected_total > report.selected.len() {
@@ -1097,6 +1130,11 @@ pub fn aggregate_metrics(events: &[RuntimeEventEnvelope]) -> RunMetrics {
         .or_else(|| buckets.last())
         .copied()
         .unwrap_or(0);
+    // 从未出现 SettledCandidate 时，全部轮/调用属结算点之前。
+    if !settled_seen {
+        metrics.pre_settlement_rounds = pre_settlement_rounds;
+        metrics.pre_settlement_calls = pre_settlement_calls;
+    }
     metrics
 }
 
@@ -1421,7 +1459,8 @@ pub fn render_metrics(metrics: &RunMetrics) -> String {
          obligations: opened={} attempted={} precond_changed={} resolved={} avoidable={} max_epoch_attempts={} max_lineage_total={}\n\
          negative_facts: recorded={} reused={} invalidated={} promoted={} resolved={}\n\
          verification_passes: recorded={} reused={}\n\
-         turn_tail: max_rounds={} p95_rounds={}\n",
+         turn_tail: max_rounds={} p95_rounds={}\n\
+         settlement: seen={} pre_rounds={} pre_calls={} post_rounds={} post_calls={}\n",
         metrics.model_input_tokens,
         metrics.model_output_tokens,
         metrics.model_attempts,
@@ -1597,6 +1636,11 @@ pub fn render_metrics(metrics: &RunMetrics) -> String {
         metrics.verification_pass_reused,
         metrics.max_turn_rounds,
         metrics.p95_turn_rounds,
+        metrics.settled_seen,
+        metrics.pre_settlement_rounds,
+        metrics.pre_settlement_calls,
+        metrics.post_settlement_rounds,
+        metrics.post_settlement_calls,
     )
 }
 
@@ -1607,7 +1651,7 @@ mod tests {
         AttentionState, CompactionReason, ContextDiagnostics, ContextGcReport, ContextItemId,
         ContextKind, ContextMaintenanceReport, ContextMaintenanceTrigger, ContextScope,
         ContextSelection, ContextStateTransition, InputLifecycle, OperationId, PromptLayerCosts,
-        RunId, RuntimeInputEnvelope, ScoreBreakdown, TaskId, ToolLeaseBoundary,
+        RunId, RuntimeInputEnvelope, SettlementLabel, ScoreBreakdown, TaskId, ToolLeaseBoundary,
         ToolLeaseReconcileReport, ToolOutput, ToolSurfaceDemand, ToolSurfacePlanReport,
         ToolSurfacePlanStatus, ToolSurfaceSelection, ToolSurfaceSourceRevisions, TurnId,
     };
@@ -2806,5 +2850,104 @@ mod tests {
         let metrics = aggregate_metrics(&events);
         assert_eq!(metrics.reread_motive_protocol_checkpoint_body_missing, 1);
         assert!(render_metrics(&metrics).contains("protocol_checkpoint_body_missing=1"));
+    }
+
+    fn planned_surface(turn_id: TurnId, model_round: usize) -> RuntimeEvent {
+        RuntimeEvent::ToolSurfacePlanned {
+            report: ToolSurfacePlanReport {
+                turn_id,
+                model_round,
+                surface_revision: 0,
+                source_revisions: ToolSurfaceSourceRevisions::default(),
+                status: ToolSurfacePlanStatus::Ready,
+                selected: Vec::new(),
+                selected_total: 0,
+                omitted: Vec::new(),
+                omitted_total: 0,
+                blocked: Vec::new(),
+                blocked_total: 0,
+                selected_schema_tokens: 0,
+                mandatory_schema_tokens: 0,
+                estimated_input_tokens: 0,
+                input_budget_tokens: 24_000,
+            },
+        }
+    }
+
+    fn started_call(id: &str) -> RuntimeEvent {
+        RuntimeEvent::ToolStarted {
+            call: agent_contracts::ToolCall {
+                id: id.into(),
+                name: "fs.read".into(),
+                arguments: serde_json::json!({}),
+            },
+        }
+    }
+
+    fn settled_frontier() -> RuntimeEvent {
+        RuntimeEvent::ExecutionFrontier {
+            delta: FrontierDelta::EvidenceAdvanced,
+            actions_since_frontier_advance: 0,
+            evidence_revision: 1,
+            invalidated: 0,
+            settlement: Some(SettlementLabel::SettledCandidate),
+        }
+    }
+
+    #[test]
+    fn post_settlement_tail_is_split_at_the_first_settled_event() {
+        let run = RunId::new();
+        let turn_id = TurnId::new();
+        let events = vec![
+            envelope(run, 1, planned_surface(turn_id, 0)),
+            envelope(run, 2, started_call("c1")),
+            envelope(run, 3, settled_frontier()),
+            envelope(run, 4, planned_surface(turn_id, 1)),
+            envelope(run, 5, started_call("c2")),
+        ];
+        let metrics = aggregate_metrics(&events);
+        assert!(metrics.settled_seen);
+        assert_eq!(metrics.rounds, 2);
+        assert_eq!(metrics.tool_calls, 2);
+        assert_eq!(metrics.pre_settlement_rounds, 1);
+        assert_eq!(metrics.pre_settlement_calls, 1);
+        assert_eq!(metrics.post_settlement_rounds, 1);
+        assert_eq!(metrics.post_settlement_calls, 1);
+        let rendered = render_metrics(&metrics);
+        assert!(rendered.contains("settlement: seen=true pre_rounds=1 pre_calls=1 post_rounds=1 post_calls=1"));
+    }
+
+    #[test]
+    fn never_settled_keeps_the_whole_run_in_pre() {
+        let run = RunId::new();
+        let turn_id = TurnId::new();
+        let events = vec![
+            envelope(run, 1, planned_surface(turn_id, 0)),
+            envelope(run, 2, started_call("c1")),
+        ];
+        let metrics = aggregate_metrics(&events);
+        assert!(!metrics.settled_seen);
+        assert_eq!(metrics.pre_settlement_rounds, 1);
+        assert_eq!(metrics.pre_settlement_calls, 1);
+        assert_eq!(metrics.post_settlement_rounds, 0);
+        assert_eq!(metrics.post_settlement_calls, 0);
+    }
+
+    #[test]
+    fn repeated_settled_events_do_not_move_the_split_point() {
+        let run = RunId::new();
+        let turn_id = TurnId::new();
+        let events = vec![
+            envelope(run, 1, planned_surface(turn_id, 0)),
+            envelope(run, 2, settled_frontier()),
+            envelope(run, 3, started_call("c1")),
+            envelope(run, 4, settled_frontier()),
+            envelope(run, 5, planned_surface(turn_id, 1)),
+        ];
+        let metrics = aggregate_metrics(&events);
+        assert_eq!(metrics.pre_settlement_rounds, 1);
+        assert_eq!(metrics.pre_settlement_calls, 0);
+        assert_eq!(metrics.post_settlement_rounds, 1);
+        assert_eq!(metrics.post_settlement_calls, 1);
     }
 }

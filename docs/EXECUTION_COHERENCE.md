@@ -674,6 +674,39 @@ the Runtime-computed `ArgumentDigest` (not producer strings), so
 same-argv/different-env and same-path/different-cursor calls no longer
 collide on evidence identity.
 
+### Derived settlement decision boundary (landed 2026-08-29)
+
+Completion convergence is a derived state, not a policy and not a round
+counter. `ExecutionState::settlement()` recomputes a four-state label from
+typed facts on demand — it is never stored, so a checkpoint cannot carry a
+stale decision:
+
+```text
+Working            any new accepted mutation (Known or Unknown footprint),
+                   new user constraint, stale/failed verification, or
+                   unresolved obligation returns here, whatever the label
+                   was before
+VerificationDue    an unmet verification obligation exists (validity is
+                   Pending/Stale/Failed) and no independent failed block is
+                   still open
+VerifiedCurrent    verification covers the current world but a typed
+                   failure obligation is still open
+SettledCandidate   verification is Current, verification_due is clear, and
+                   the obligation ledger is empty
+```
+
+The derived label is published as `ExecutionFrontier.settlement` only when
+it changes, and `TaskProgressView.settlement` projects a bounded neutral
+one-liner only in the two covered states. `SettledCandidate` is a decision
+boundary for the model — ordinary final answer, `task.complete` for whole
+durable closure, or a concrete continuation — never an automatic stop and
+never an auto-close. The verification basis is `spec_revision` (tracked by
+the task anchor's verification revision), so progress-only anchor changes
+do not re-open a settled task while boundary changes do. Deterministic
+actor scenarios cover ordinary final, durable closure, genuine remaining
+work, mutation after verification, stale verification, proposal settlement
+across suspend/resume, and cold same-run restore.
+
 ### Protocol working set (turn checkpointing)
 
 The current turn is itself a working set. The wire view of `TurnFrame`

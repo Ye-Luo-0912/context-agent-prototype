@@ -343,7 +343,7 @@ honest reported fact, not a harness artifact. The
 surviving blocker is a missing completion decision boundary; see
 CONV-CLOSE-01 below.
 
-### CONV-CLOSE-01 — Completion Convergence V1 (open 2026-08-29)
+### CONV-CLOSE-01 — Completion Convergence V1 (deterministic foundation landed 2026-08-29; live gate open)
 
 The 55-round / 129-call `retry_policy_dev` resume cell is the current bounded
 readiness blocker, but `task.complete` itself is not established as its root
@@ -381,6 +381,37 @@ order:
    proposal settlement across cancel/resume, and cold resume. Run a small live
    gate with at least two paired repeats only after those scenarios and exposure
    accounting are green.
+
+Landed 2026-08-29 (slices 1–5; the live gate is the remaining step):
+
+- Slice 1 cleanliness: `ensure_workspace_git` now writes `.gitignore`
+  containing `.focus-agent/`, `.gate/`, `target/` and `Cargo.lock`,
+  matching the evaluator's allowed-diff skip policy, so build artifacts are
+  no longer model-visible-but-evaluator-ignored cleanup work. Remaining
+  slice-1 sub-items (mechanical event-derived report reconstruction and
+  treatment-exposure accounting) stay open with the live gate.
+- Slice 2 metrics: `RunMetrics` aggregates the first settled-candidate
+  frontier event and reports `settlement: seen / pre_rounds / pre_calls /
+  post_rounds / post_calls`; event-derived and unit-tested.
+- Slices 3–4 dynamic state and decision boundary: `SettlementLabel`
+  (`Working | VerificationDue | VerifiedCurrent | SettledCandidate`) is
+  derived by `ExecutionState::settlement()` from verification validity plus
+  the typed obligation ledger — never from fixed round counts; any new
+  mutation, obligation, stale/failed verification or boundary change returns
+  the task to `Working`. The label is published on `ExecutionFrontier` only
+  on change, and `TaskProgressView.settlement` projects a bounded neutral
+  one-liner only in the covered states; no stop instruction, no auto-close,
+  no revival of `CompletionOpportunity`. The stale runtime comment describing
+  `task.complete` as catalog-cold was removed (the v5 registry always loads
+  it).
+- Slice 5 deterministic proof: seven actor-level scripted scenarios over the
+  real runtime are green — ordinary final, durable closure, genuine
+  remaining work, mutation after verification (reopen and re-settle), stale
+  verification (no re-settlement without a fresh verify), proposal
+  settlement across suspend/resume (durable closure commits with a Current
+  verification), and cold same-run restore (reopen and re-settle). The live
+  gate with at least two paired repeats is the next step and requires user
+  scope confirmation before running.
 
 The bounded progress payload may retain only the current goal, unresolved
 constraints, checked file identities/revisions (not file bodies), latest
