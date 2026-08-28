@@ -104,16 +104,23 @@ fn usage() -> ! {
          is the live paired smoke, not the 300×3 gate.\n\
          \n\
          usage: agent-eval [--repeats N] --long-task-live [normal|resume]\n\
-         \n\
+\n\
+         usage: agent-eval [--repeats N] --diag-smoke [normal|resume]\n\
+\n\
          usage: agent-eval [--repeats N] --opportunity-gate [normal|resume]\n\
          usage: agent-eval --recovery-surface-gate [normal|resume]\n\
          usage: agent-eval --m15-window\n\
          usage: agent-eval --m15-report <window-dir>\n\
-         \n\
+\n\
          Item-8 off/on paired live gate for the advisory completion\n\
          opportunity: identical cells with the candidate switch as the only\n\
          variable; evidence records the setting per cell.\n\
-         \n\
+\n\
+         Calibrated retry_diag_dev fixture smoke: the C engine runs the diag\n\
+         pack (candidate switch off) on a fresh workspace per cell to confirm\n\
+         the calibrated pack is solvable before a formal window. Writes\n\
+         evidence under crates/agent-eval/evidence/diag-smoke/.\n\
+\n\
          Directory-tool admission paired live gate: the three representative\n\
          packs run normal/resume cells with the recovery-surface candidate\n\
          switch as the only variable; evidence records the setting per cell.\n\
@@ -692,6 +699,12 @@ async fn main() -> anyhow::Result<()> {
                     long_live::DEFAULT_REPEATS
                 };
                 run_long_task_live(mode_filter, repeats, evidence_dir, allow_dirty).await?;
+                return Ok(());
+            }
+            "--diag-smoke" => {
+                let mode_filter = args.next().filter(|value| !value.starts_with('-'));
+                let repeats = if repeats_set { repeats } else { 1 };
+                run_diag_smoke(mode_filter, repeats, evidence_dir, allow_dirty).await?;
                 return Ok(());
             }
             "--all" => engines = vec!["append", "rolling", "dynamic"],
@@ -1460,6 +1473,90 @@ async fn run_recovery_surface_gate(
         }
     }
     println!("promotion judgment belongs to the evidence REPORT, not this runner");
+    Ok(())
+}
+
+/// Calibrated `retry_diag_dev` live smoke: the candidate switch stays off,
+/// only the diag pack runs, and each cell proves the fixture is solvable by
+/// the current serving before a formal window spends its 12-cell budget.
+async fn run_diag_smoke(
+    mode_filter: Option<String>,
+    repeats: u32,
+    evidence_dir: Option<std::path::PathBuf>,
+    allow_dirty: bool,
+) -> anyhow::Result<()> {
+    bundle::require_clean_tree(allow_dirty)?;
+    let modes = long_live::PilotMode::parse(mode_filter.as_deref())?;
+    anyhow::ensure!((1..=4).contains(&repeats), "repeats must be 1..=4");
+    let model = driver::build_live_coding_model()?;
+    let evidence_root = evidence_dir
+        .unwrap_or_else(|| std::path::PathBuf::from("crates/agent-eval/evidence/diag-smoke"));
+    std::fs::create_dir_all(&evidence_root)?;
+    eprintln!("evidence dir: {}", evidence_root.display());
+
+    let pack = long_live::m15_diag_pack();
+    let mut outcomes = Vec::new();
+    for repeat in 1..=repeats {
+        for mode in &modes {
+            eprintln!(
+                "== {} {} live (C, recovery off) repeat {repeat}/{repeats} ==",
+                pack.id,
+                mode.id(),
+            );
+            let dir = tempfile::tempdir()?;
+            let pair = bundle::PairSink::claim(
+                evidence_root.clone(),
+                format!("{}-{}", pack.id, mode.id()),
+                repeat,
+                repeats,
+                true,
+            );
+            let outcome = long_live::run_pack_cell(
+                &pack,
+                *mode,
+                &pair,
+                model.clone(),
+                dir.path(),
+                long_live::CellSwitches {
+                    opportunity: false,
+                    recovery_surface: false,
+                },
+                long_live::AcceptanceProfile::M15V1,
+            )
+            .await?;
+            println!("{}", outcome.render_line());
+            match bundle::render_evidence(&pair.cell_dir("dynamic")) {
+                Ok(rendered) => println!("{rendered}"),
+                Err(e) => eprintln!("warning: evidence render failed: {e}"),
+            }
+            outcomes.push(outcome);
+        }
+    }
+
+    println!("\n== diag smoke summary (facts only) ==");
+    for mode in &modes {
+        let cells: Vec<&long_live::CellOutcome> = outcomes
+            .iter()
+            .filter(|cell| cell.mode == *mode)
+            .collect();
+        let mut rounds: Vec<u64> = cells
+            .iter()
+            .map(|cell| (cell.model_rounds_phase_one + cell.model_rounds_phase_two) as u64)
+            .collect();
+        let median_rounds = checked_percentile(&mut rounds, 50).unwrap_or(0);
+        let max_rounds = rounds.iter().copied().max().unwrap_or(0);
+        println!(
+            "{:<13} {:<6} cells={} passed={} median_total_rounds={} max_total_rounds={} completed={}",
+            pack.id,
+            mode.id(),
+            cells.len(),
+            cells.iter().filter(|cell| cell.passed).count(),
+            median_rounds,
+            max_rounds,
+            cells.iter().filter(|cell| cell.closure == "completed").count(),
+        );
+    }
+    println!("solvability judgment belongs to the per-cell oracle/hidden evidence, not this runner");
     Ok(())
 }
 
