@@ -1,0 +1,149 @@
+{
+  "schema": "retry-pilot-cell-v2",
+  "kind": "retry_pilot_oracle",
+  "fixture_id": "retry_policy_dev-resume",
+  "expected_edit": "",
+  "passed": false,
+  "replay_complete": true,
+  "assertions": [
+    {
+      "path": "src/policy.rs",
+      "pred": "policy module defines both public items",
+      "needles": [],
+      "passed": false,
+      "file_exists": false
+    },
+    {
+      "path": "src/lib.rs",
+      "pred": "crate root no longer defines the struct",
+      "needles": [],
+      "passed": false,
+      "file_exists": true
+    },
+    {
+      "path": "src/lib.rs",
+      "pred": "crate root re-exports the same public names",
+      "needles": [],
+      "passed": false,
+      "file_exists": true
+    },
+    {
+      "path": "src/lib.rs",
+      "pred": "crate-root helper survives the split",
+      "needles": [],
+      "passed": true,
+      "file_exists": true
+    },
+    {
+      "path": "src/job.rs",
+      "pred": "job imports through the policy module",
+      "needles": [],
+      "passed": false,
+      "file_exists": true
+    },
+    {
+      "path": "src/metrics.rs",
+      "pred": "metrics imports through the policy module",
+      "needles": [],
+      "passed": false,
+      "file_exists": true
+    },
+    {
+      "path": "src/usage.rs",
+      "pred": "usage imports through the policy module",
+      "needles": [],
+      "passed": false,
+      "file_exists": true
+    },
+    {
+      "path": "README.md",
+      "pred": "public-API contract note untouched",
+      "needles": [],
+      "passed": true,
+      "file_exists": true
+    }
+  ],
+  "files": [
+    {
+      "path": "Cargo.toml",
+      "exists": true,
+      "sha256": "5af263b4aba30a50bb74d1ef5bdf16a1d0253217d82083d518bdd420778fc40e",
+      "bytes": 107,
+      "truncated": false,
+      "body": "[package]\nname = \"jobrunner\"\nversion = \"0.1.0\"\nedition = \"2021\"\n\n[lib]\npath = \"src/lib.rs\"\n\n[dependencies]\n"
+    },
+    {
+      "path": "src/lib.rs",
+      "exists": true,
+      "sha256": "bca85bcde82fa327c8e30b863f7069208962a328a0b09d5abaa0ab9290c381bb",
+      "bytes": 897,
+      "truncated": false,
+      "body": "//! Monolithic job runner: retry policy still lives in the crate root.\npub mod job;\npub mod metrics;\npub mod usage;\n\n/// Retry policy for one job: attempts and the delay table.\n#[derive(Debug, Clone, PartialEq, Eq)]\npub struct RetryPolicy {\n    pub max_attempts: u32,\n    pub base_delay_ms: u64,\n}\n\n/// How the delay grows between attempts.\n#[derive(Debug, Clone, Copy, PartialEq, Eq)]\npub enum Backoff {\n    Fixed,\n    Double,\n}\n\nimpl RetryPolicy {\n    pub fn new(max_attempts: u32, base_delay_ms: u64) -> Self {\n        Self { max_attempts, base_delay_ms }\n    }\n\n    pub fn delay_before(&self, attempt: u32, backoff: Backoff) -> u64 {\n        match backoff {\n            Backoff::Fixed => self.base_delay_ms,\n            Backoff::Double => self.base_delay_ms.saturating_mul(attempt.max(1) as u64),\n        }\n    }\n}\n\npub fn max_attempts(policy: &RetryPolicy) -> u32 {\n    policy.max_attempts\n}\n"
+    },
+    {
+      "path": "src/job.rs",
+      "exists": true,
+      "sha256": "4cc6a54e828c3c54921f75c6e5f703fec72552c64a1181328018d25d51d06f97",
+      "bytes": 250,
+      "truncated": false,
+      "body": "//! Job execution against the crate-root policy.\nuse crate::RetryPolicy;\n\npub struct Job {\n    pub name: String,\n}\n\nimpl Job {\n    pub fn should_retry(&self, policy: &RetryPolicy, attempt: u32) -> bool {\n        attempt < policy.max_attempts\n    }\n}\n"
+    },
+    {
+      "path": "src/metrics.rs",
+      "exists": true,
+      "sha256": "7a30fffc2f7ba4eb9e9e372d1ed293fd1823e9b2b894305ab4f7559e255cfe01",
+      "bytes": 374,
+      "truncated": false,
+      "body": "//! Retry metrics.\nuse crate::Backoff;\n\n#[derive(Debug, Default)]\npub struct RetryMetrics {\n    pub fixed_delays: u32,\n    pub doubled_delays: u32,\n}\n\nimpl RetryMetrics {\n    pub fn observe(&mut self, backoff: Backoff) {\n        match backoff {\n            Backoff::Fixed => self.fixed_delays += 1,\n            Backoff::Double => self.doubled_delays += 1,\n        }\n    }\n}\n"
+    },
+    {
+      "path": "src/usage.rs",
+      "exists": true,
+      "sha256": "09068edd78762dcffcf8e6607e791f8161ee90aed9e3bf160bcf93591adc0647",
+      "bytes": 263,
+      "truncated": false,
+      "body": "//! Cross-module usage that must keep compiling after the split.\nuse crate::{RetryPolicy, Backoff};\n\npub fn total_delay(policy: &RetryPolicy, attempts: u32, backoff: Backoff) -> u64 {\n    (1..attempts).map(|attempt| policy.delay_before(attempt, backoff)).sum()\n}\n"
+    },
+    {
+      "path": "README.md",
+      "exists": true,
+      "sha256": "e1f51654ffd860b7e90fdd08754de66ac6e87e5956557fadd7b47c83b32e1edd",
+      "bytes": 118,
+      "truncated": false,
+      "body": "# jobrunner (migrate fixture)\n\nPublic API: `RetryPolicy`, `Backoff`, `max_attempts` — import paths must not change.\n"
+    }
+  ],
+  "commands": [
+    {
+      "argv": [
+        "cargo",
+        "test",
+        "--test",
+        "m15_migrate_oracle"
+      ],
+      "expect_exit": 0,
+      "exit": 101,
+      "timed_out": false,
+      "stdout": "",
+      "stderr": "   Compiling jobrunner v0.1.0 (C:\\Users\\Ye_Luo\\AppData\\Local\\Temp\\.tmpJUG6Xn)\nerror[E0433]: cannot find `policy` in `jobrunner`\n  --> tests\\m15_migrate_oracle.rs:13:29\n   |\n13 |     let policy = jobrunner::policy::RetryPolicy::new(2, 25);\n   |                             ^^^^^^ could not find `policy` in `jobrunner`\n\nerror[E0433]: cannot find `policy` in `jobrunner`\n  --> tests\\m15_migrate_oracle.rs:14:27\n   |\n14 |     assert_eq!(jobrunner::policy::Backoff::Fixed as u32, 0);\n   |                           ^^^^^^ could not find `policy` in `jobrunner`\n\nFor more information about this error, try `rustc --explain E0433`.\nerror: could not compile `jobrunner` (test \"m15_migrate_oracle\") due to 2 previous errors\n",
+      "stdout_truncated": false,
+      "stderr_truncated": false,
+      "passed": false
+    },
+    {
+      "argv": [
+        "cargo",
+        "test",
+        "--quiet"
+      ],
+      "expect_exit": 0,
+      "exit": 0,
+      "timed_out": false,
+      "stdout": "\nrunning 0 tests\n\ntest result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s\n\n\nrunning 0 tests\n\ntest result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s\n\n",
+      "stderr": "\noracle: cargo test succeeded but executed zero tests\n(self-check over agent-authored tests; informational)",
+      "stdout_truncated": false,
+      "stderr_truncated": false,
+      "passed": false
+    }
+  ]
+}

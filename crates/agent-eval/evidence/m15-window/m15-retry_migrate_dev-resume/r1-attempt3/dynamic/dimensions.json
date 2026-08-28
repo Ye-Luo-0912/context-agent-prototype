@@ -1,0 +1,15 @@
+{
+  "allowed_diff": "pass",
+  "behavioral_oracle": "fail",
+  "completion_opportunity": "off",
+  "continuation": "failed",
+  "final_passed": false,
+  "mode": "resume",
+  "opportunity_called": false,
+  "opportunity_offers": [],
+  "provider_runtime": "transport_failed",
+  "runtime_error": "phase one failed: runtime error: transport error (retryable=false): max_output_tokens",
+  "schema": "retry-pilot-cell-v2",
+  "task_closure": "failed",
+  "workspace_self_check": "not_run"
+}

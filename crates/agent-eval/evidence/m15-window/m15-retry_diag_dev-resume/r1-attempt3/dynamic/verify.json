@@ -1,0 +1,135 @@
+{
+  "schema": "retry-pilot-cell-v2",
+  "kind": "retry_pilot_oracle",
+  "fixture_id": "retry_policy_dev-resume",
+  "expected_edit": "",
+  "passed": false,
+  "replay_complete": true,
+  "assertions": [
+    {
+      "path": "DIAGNOSIS.md",
+      "pred": "diagnosis names next_delay and the off-by-one mechanism",
+      "needles": [],
+      "passed": true,
+      "file_exists": true
+    },
+    {
+      "path": "src/backoff.rs",
+      "pred": "shift corrected to a 1-based attempt",
+      "needles": [],
+      "passed": true,
+      "file_exists": true
+    },
+    {
+      "path": "src/backoff.rs",
+      "pred": "public signature unchanged",
+      "needles": [],
+      "passed": true,
+      "file_exists": true
+    },
+    {
+      "path": "src/backoff.rs",
+      "pred": "seed's wrong table no longer asserted",
+      "needles": [],
+      "passed": true,
+      "file_exists": true
+    },
+    {
+      "path": "src/config.rs",
+      "pred": "config untouched",
+      "needles": [],
+      "passed": true,
+      "file_exists": true
+    },
+    {
+      "path": "README.md",
+      "pred": "documented contract untouched",
+      "needles": [],
+      "passed": true,
+      "file_exists": true
+    }
+  ],
+  "files": [
+    {
+      "path": "Cargo.toml",
+      "exists": true,
+      "sha256": "5af263b4aba30a50bb74d1ef5bdf16a1d0253217d82083d518bdd420778fc40e",
+      "bytes": 107,
+      "truncated": false,
+      "body": "[package]\nname = \"jobrunner\"\nversion = \"0.1.0\"\nedition = \"2021\"\n\n[lib]\npath = \"src/lib.rs\"\n\n[dependencies]\n"
+    },
+    {
+      "path": "src/lib.rs",
+      "exists": true,
+      "sha256": "ac86e0366d53f6ab7c9c7bc04a9f993ef9615fb39c3dada823cc0e2bbcd05138",
+      "bytes": 204,
+      "truncated": false,
+      "body": "//! Job runner with a documented bounded-backoff retry contract.\npub mod backoff;\npub mod config;\npub mod sleeper;\n\npub use backoff::next_delay;\npub use config::RetryConfig;\npub use sleeper::FakeSleeper;\n"
+    },
+    {
+      "path": "src/config.rs",
+      "exists": true,
+      "sha256": "807c9c83d44d097eec0c59ca22654f6587867295a5114ecee8ebf5bce31c06a5",
+      "bytes": 269,
+      "truncated": false,
+      "body": "//! Frozen retry configuration.\n#[derive(Debug, Clone, PartialEq, Eq)]\npub struct RetryConfig {\n    /// Delay before the first retry, in milliseconds.\n    pub base_delay_ms: u64,\n    /// Upper bound for any computed delay, in milliseconds.\n    pub max_delay_ms: u64,\n}\n"
+    },
+    {
+      "path": "src/sleeper.rs",
+      "exists": true,
+      "sha256": "56d2a5c97a2dc0659a5d25f74b91bfe2e82b7b84e1bf92454d961fa40347fc1a",
+      "bytes": 262,
+      "truncated": false,
+      "body": "//! Fake sleeper recording the requested delays instead of waiting.\n#[derive(Debug, Default)]\npub struct FakeSleeper {\n    pub delays_ms: Vec<u64>,\n}\n\nimpl FakeSleeper {\n    pub fn sleep(&mut self, delay_ms: u64) {\n        self.delays_ms.push(delay_ms);\n    }\n}\n"
+    },
+    {
+      "path": "src/backoff.rs",
+      "exists": true,
+      "sha256": "2a8ca2b8ec8a2544b5b620ff961471e997e89c57bacdf274a24b67a40fa20cc5",
+      "bytes": 956,
+      "truncated": false,
+      "body": "//! Bounded exponential backoff.\nuse crate::config::RetryConfig;\n\n/// Delay before retry number `attempt` (1-based). The documented contract:\n/// the first retry waits exactly `base_delay_ms`; growth doubles and\n/// saturates at `max_delay_ms`.\npub fn next_delay(attempt: u32, config: &RetryConfig) -> u64 {\n    let shift = attempt.saturating_sub(1).min(63);\n    let raw = config.base_delay_ms << shift;\n    if raw > config.max_delay_ms {\n        config.max_delay_ms\n    } else {\n        raw\n    }\n}\n\n#[cfg(test)]\nmod tests {\n    use super::*;\n\n    fn cfg() -> RetryConfig {\n        RetryConfig { base_delay_ms: 100, max_delay_ms: 1_000 }\n    }\n\n    #[test]\n    fn delays_match_the_documented_contract() {\n        assert_eq!(next_delay(1, &cfg()), 100);\n        assert_eq!(next_delay(2, &cfg()), 200);\n        assert_eq!(next_delay(3, &cfg()), 400);\n        assert_eq!(next_delay(4, &cfg()), 800);\n        assert_eq!(next_delay(5, &cfg()), 1_000);\n    }\n}\n"
+    },
+    {
+      "path": "README.md",
+      "exists": true,
+      "sha256": "0e8d81e30e088d6f18d0826f71422e907eac0d850c865f8eac00eb7a67a5610d",
+      "bytes": 114,
+      "truncated": false,
+      "body": "# jobrunner (diag fixture)\n\nRetry contract: first retry = `base_delay_ms`; double and saturate at `max_delay_ms`.\n"
+    }
+  ],
+  "commands": [
+    {
+      "argv": [
+        "cargo",
+        "test",
+        "--test",
+        "m15_diag_oracle"
+      ],
+      "expect_exit": 0,
+      "exit": 101,
+      "timed_out": false,
+      "stdout": "\nrunning 3 tests\ntest first_retry_waits_exactly_the_base_delay ... ok\ntest signature_stays_public_and_copyable ... ok\ntest growth_doubles_then_saturates ... FAILED\n\nfailures:\n\n---- growth_doubles_then_saturates stdout ----\n\nthread 'growth_doubles_then_saturates' (22848) panicked at tests\\m15_diag_oracle.rs:19:5:\nassertion `left == right` failed\n  left: 0\n right: 1000\nnote: run with `RUST_BACKTRACE=1` environment variable to display a backtrace\n\n\nfailures:\n    growth_doubles_then_saturates\n\ntest result: FAILED. 2 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s\n\n",
+      "stderr": "   Compiling jobrunner v0.1.0 (C:\\Users\\Ye_Luo\\AppData\\Local\\Temp\\.tmpKckAKd)\n    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.52s\n     Running tests\\m15_diag_oracle.rs (target\\debug\\deps\\m15_diag_oracle-23311e7f3d2a2cad.exe)\nerror: test failed, to rerun pass `--test m15_diag_oracle`\n",
+      "stdout_truncated": false,
+      "stderr_truncated": false,
+      "passed": false
+    },
+    {
+      "argv": [
+        "cargo",
+        "test",
+        "--quiet"
+      ],
+      "expect_exit": 0,
+      "exit": 0,
+      "timed_out": false,
+      "stdout": "\nrunning 1 test\n.\ntest result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s\n\n\nrunning 0 tests\n\ntest result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s\n\n",
+      "stderr": "\n(self-check over agent-authored tests; informational)",
+      "stdout_truncated": false,
+      "stderr_truncated": false,
+      "passed": true
+    }
+  ]
+}

@@ -115,3 +115,57 @@ runtime or harness defect; both are honest measurements of the pinned
 serving against the frozen packs. Closing M15 requires either a serving
 that clears the frozen bar or a separately documented acceptance-design
 revision — this report does not authorize either.
+
+---
+
+# Serving-switch rerun (deepseek-v4-pro @ local relay) — 2026-08-28 — CENSORED, not decision-grade
+
+Scope: same frozen design, serving amended per decision point 1 (the
+operator approved the switch after two luna windows measured
+serving-capability limits). Availability probe passed (add_test true,
+first-try edit, 22 s). Bundles: `m15-<task>-<mode>/rN-attempt3/`.
+
+## Per-cell facts (mechanically derived)
+
+| cell | behavior | closure | continuation | provider | PASS |
+| --- | --- | --- | --- | --- | --- |
+| diag normal r1 | fail | completed | n/a | healthy | no |
+| diag normal r2 | fail | failed | n/a | healthy | no |
+| diag resume r1 | fail | completed | restored | healthy | no |
+| diag resume r2 | fail | completed | restored | healthy | no |
+| migrate normal r1 | fail | failed | n/a | **transport_failed** | no |
+| migrate normal r2 | pass | completed | n/a | healthy | **yes** |
+| migrate resume r1 | fail | failed | failed | **transport_failed** | no |
+| migrate resume r2 | pass | completed | restored | healthy | **yes** |
+| retry normal r1 | fail | failed | n/a | **transport_failed** | no |
+| retry normal r2 | fail | failed | n/a | **transport_failed** | no |
+| retry resume r1 | fail | failed | failed | **transport_failed** | no |
+| retry resume r2 | fail | failed | failed | **transport_failed** | no |
+
+## Verdict: CENSORED — the window cannot decide anything
+
+6 of 12 cells died on provider transport failures (the relay serving
+degraded mid-window, the same session-loss pattern the edit-gate ox windows
+recorded). Per the frozen design, harness/provider failures are NOT_RUN and
+cannot improve or condemn either configuration. The 2/12 passes and 6/12
+closures are recorded as observations, not gate results.
+
+## Cross-window picture (three windows, one day)
+
+| window | serving | passes | closures | stalls/transport | decision-grade |
+| --- | --- | ---: | ---: | ---: | --- |
+| v4 | luna @ PinAI | 1/12 | 1/12 | 0 | yes — FAILED |
+| v5 (surface rev) | luna @ PinAI | 3/12 | 4/12 | 0 | yes — FAILED |
+| v6 | ds-v4-pro @ relay | 2/12 | 6/12 | 6 transport | **censored** |
+
+What survives across all three: the v5 surface fix is real (closures rose
+on every window); the diagnosis task is the hardest for every serving; and
+no tested serving yet clears the all-cells frozen bar. The relay serving is
+promising on closures but cannot currently hold a window.
+
+## Stop condition
+
+Live spend stops here without operator direction: the only stable serving
+(luna) has a measured ceiling below the bar, and the stronger relay serving
+cannot hold a window. M15 stays open with three archived windows, a
+mechanical report, and two precisely quantified blockers.

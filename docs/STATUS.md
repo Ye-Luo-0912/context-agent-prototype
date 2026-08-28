@@ -451,8 +451,13 @@ and sandbox contracts live elsewhere. Experiment facts live in
   the all-cells bar still fails — remaining blockers are model variance on
   the diagnosis task (behavior 1/4 pass) and inconsistent closure (8/12
   behavioral-pass cells still unclosed), both honest serving measurements
-  rather than runtime defects. M15 stays open; `evidence/m15-window/
-  REPORT.md` carries both windows.
+  rather than runtime defects. M15 stays open. A same-day third window on the amended serving
+  (`deepseek-v4-pro` @ local relay, decision point 1 amended) came back
+  CENSORED — 6/12 cells died on relay transport failures mid-window — so it
+  decides nothing; its 6/12 closures and 2/12 passes are observations only.
+  `evidence/m15-window/REPORT.md` carries all three windows and the stop
+  condition: the only stable serving (luna) sits below the bar, and the
+  stronger relay serving cannot yet hold a window.
   The
   frozen CompletionOpportunity off/on paired live gate then ran
   decision-grade on 2026-08-28 (8 cells): it FAILED promotion — the off
