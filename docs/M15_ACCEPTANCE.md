@@ -7,7 +7,11 @@ and what may not change mid-run.
 
 ## 0. Decision points — signed off 2026-08-28 (operator continuation)
 
-1. Serving pin: the current `gpt-5.6-luna` @ PinAI serving.
+1. Serving pin: AMENDED 2026-08-28 — after two windows measured diagnosis-task
+   difficulty and closure consistency as serving-capability limits on
+   `gpt-5.6-luna` @ PinAI (1/12 and 3/12 of 12 cells), the operator approved
+   switching to `deepseek-v4-pro` @ the local OpenCode relay for the rerun
+   (availability probe: add_test passed=true, first-try committed edit, 22 s).
 2. Budget: 12 development cells confirmed.
 3. Fixture authoring: `retry_diag_dev` / `retry_migrate_dev` per the specs
    below (authored and frozen before the window).
@@ -100,7 +104,7 @@ editing numbers is out of contract.
 second-context-engine A/C comparison (gated on a promoted frozen setting —
 none exists), and the model-comparison layer (only after V1 closes).
 
-## 7. Decision points — signed off 2026-08-28
+## 7. Decision points — signed off 2026-08-28; point 1 amended same day
 
 All four signed off per section 0 (serving pin kept; budget confirmed;
 fixtures authored per the specs in section 2 and frozen in
