@@ -86,6 +86,14 @@ pub(crate) struct PackSpec {
     pub exact_recipe_inputs: Box<dyn Fn() -> Vec<String>>,
     /// Per-pack allowed-diff predicate over workspace-relative paths.
     pub allowed_diff: Box<dyn Fn(&str) -> bool>,
+    /// Declarative acceptance text the harness patches onto the task after
+    /// its creation, so the task-aware completion gate can arm in live
+    /// cells. The runtime binds the current trusted verification pass as
+    /// the coverage claim for the declared criteria on every verified
+    /// pass. `None` (the default) patches nothing and the gate stays
+    /// fail-closed at `VerifiedCurrent`. The text is neutral and never
+    /// carries hidden evaluation details.
+    pub acceptance_declaration: Option<&'static str>,
 }
 
 /// The same raw cell facts can serve gates with different lifecycle policy.
@@ -284,6 +292,7 @@ pub(crate) fn retry_pack() -> PackSpec {
             ]
         }),
         allowed_diff: Box::new(standard_allowed_diff),
+        acceptance_declaration: Some("the retry policy behaves correctly"),
     }
 }
 
@@ -327,6 +336,7 @@ pub(crate) fn m15_diag_pack() -> PackSpec {
         allowed_diff: Box::new(|relative| {
             standard_allowed_diff(relative) || relative == "DIAGNOSIS.md"
         }),
+        acceptance_declaration: None,
     }
 }
 
@@ -353,6 +363,7 @@ pub(crate) fn m15_migrate_pack() -> PackSpec {
         }),
         exact_recipe_inputs: Box::new(Vec::new),
         allowed_diff: Box::new(standard_allowed_diff),
+        acceptance_declaration: None,
     }
 }
 
@@ -1299,6 +1310,21 @@ pub async fn run_pack_cell(
                     .set_focus(directive.to_string())
                     .await
                     .map_err(|e| CellFailure::runtime(format!("set_focus failed: {e}")))?;
+                // The task now exists and the actor is idle: patch the
+                // pack's declarative acceptance onto the anchor so the
+                // task-aware completion gate can arm in this live cell.
+                // The runtime binds the current trusted verification pass
+                // as the coverage claim; without a declaration nothing is
+                // patched and the gate stays fail-closed.
+                if let Some(declaration) = pack.acceptance_declaration {
+                    declare_acceptance(&handle, declaration)
+                        .await
+                        .map_err(|e| {
+                            CellFailure::runtime(format!(
+                                "acceptance declaration failed: {e:#}"
+                            ))
+                        })?;
+                }
                 handle
                     .user_message(directive.to_string())
                     .await
@@ -1695,6 +1721,33 @@ pub async fn run_pack_cell(
 /// budget, hard verdict) is a fact to report, not to rerun.
 pub fn provider_transport_retryable(outcome: &CellOutcome) -> bool {
     outcome.error_class == Some(CellFailureClass::ProviderTransport) && outcome.error_retryable
+}
+
+/// Patch the pack's declarative acceptance criterion onto the active task
+/// between `set_focus` and the first user message. The actor is idle at
+/// that point, so the task-anchor CAS is allowed; the runtime then binds
+/// the current trusted verification pass as the coverage claim.
+async fn declare_acceptance(
+    handle: &agent_runtime::RuntimeHandle,
+    declaration: &'static str,
+) -> anyhow::Result<()> {
+    let tasks = handle.list_tasks().await?;
+    let task = tasks
+        .iter()
+        .find(|task| task.status == agent_runtime::task::TaskStatus::Active)
+        .or_else(|| tasks.first())
+        .ok_or_else(|| anyhow::anyhow!("no task exists after set_focus"))?;
+    handle
+        .patch_task_anchor(
+            task.id,
+            task.anchor_revision,
+            agent_runtime::task::AnchorPatch {
+                acceptance_criteria: Some(vec![declaration.to_string()]),
+                ..agent_runtime::task::AnchorPatch::default()
+            },
+        )
+        .await?;
+    Ok(())
 }
 
 /// Run one live cell with cell-level provider retry. When the cell ends in

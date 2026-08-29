@@ -1452,7 +1452,20 @@ impl RuntimeActor {
         if task.status == crate::task::TaskStatus::Completed {
             return None;
         }
-        let anchor_revision = task.anchor.revision;
+        // Bind declared acceptance coverage from the pre-dispatch
+        // verifier before the observation, so the observed anchor revision
+        // already carries the claim and this very round can rise to
+        // SettledCandidate. Without a pre-dispatch attribution there is no
+        // exact identity to bind and the gate stays fail-closed.
+        if let Some(attribution) = attribution {
+            self.bind_acceptance_coverage(attribution);
+        }
+        let anchor_revision = self
+            .state
+            .tasks
+            .get(task_id)
+            .map(|task| task.anchor.revision)
+            .unwrap_or(0);
         let turn = self.state.turn.as_mut()?;
         let turn_number = turn.model_round as u64;
         let observation = match attribution {
@@ -1664,6 +1677,69 @@ impl RuntimeActor {
                 workspace_revision: transition.workspace_revision,
             })
             .await;
+    }
+
+    /// Bind the pre-dispatch verifier's exact identity as the acceptance
+    /// coverage claim for every declared criterion of the active task.
+    /// Voluntary and claim-only: with no declared criteria, no exact
+    /// identity or no active task this is a no-op, so the gate keeps its
+    /// fail-closed `VerifiedCurrent` default, and the patch never rewrites
+    /// user authority fields. It runs *before* the tool observation, so
+    /// the observed anchor revision already carries the claim and the
+    /// settlement label can rise to `SettledCandidate` in the same round;
+    /// an identity bound after the observation would bump the revision
+    /// out from under the observed snapshot. An unchanged identity is an
+    /// equivalent patch and bumps nothing. The change is audited by the
+    /// `ExecutionVerificationPass` event and the checkpoint diff, so no
+    /// separate anchor-change event is emitted here.
+    fn bind_acceptance_coverage(&mut self, attribution: &RuntimeExecutionAttribution) {
+        let Some(task_id) = self.state.task_id else {
+            return;
+        };
+        let Some(identity) = attribution.exact_verification_identity() else {
+            return;
+        };
+        let Some(anchor) = self.state.tasks.get(task_id).map(|task| task.anchor.clone()) else {
+            return;
+        };
+        if anchor.acceptance_criteria.is_empty() {
+            return;
+        }
+        let claims = anchor
+            .acceptance_criteria
+            .iter()
+            .enumerate()
+            .map(|(index, _)| crate::task::AcceptanceCoverage {
+                criterion_index: index as u32,
+                verification_identity: identity.to_string(),
+            })
+            .collect();
+        let patch = AnchorPatch {
+            acceptance_coverage: Some(claims),
+            ..AnchorPatch::default()
+        };
+        let Ok((txn, _, changed_fields, kind)) =
+            self.state
+                .tasks
+                .prepare_patch_anchor(task_id, anchor.revision, &patch)
+        else {
+            return;
+        };
+        if changed_fields.is_empty() {
+            // Equivalent pass identity: the claim is already current.
+            self.state.tasks.commit(txn);
+            return;
+        }
+        if kind == AnchorPatchKind::Boundary {
+            return; // coverage patches are autonomous by construction
+        }
+        if self.bump_generation().is_err() {
+            return;
+        }
+        self.state.tasks.commit(txn);
+        self.accrue_checkpoint_debt(
+            crate::checkpoint::CheckpointDebtReason::TaskAnchorChanged,
+        );
     }
 
     /// 无派发拒绝一次可证等价的重试：类型化 ToolFinished 入账、推进
