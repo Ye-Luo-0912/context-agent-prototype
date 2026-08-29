@@ -1017,7 +1017,17 @@ blocked until M15 closes.
 The agent may grow capabilities, never evaluation or permission Core authority.
 
 In parallel, keep `LT-RUN-05` frozen and build only deterministic fixtures for
-the post-M15 `LT-EVAL-06` diagnosis/multi-file task pack. Do not add TaskGraph,
+the post-M15 `LT-EVAL-06` diagnosis/multi-file task pack. The deterministic
+side of that pack is now complete: the missing third task type —
+evaluation-harness maintenance — landed as `harness_maint_dev` (2026-08-29,
+`m15_pack` registry, frozen `c586021e…a2d91`): seeding a `summarize_results`
+misclassification (NOT_RUN rows counted as failed), an injected
+harness-owned oracle that rejects the seed and accepts the scripted minimal
+fix, content checks (report names the mechanism; `failed` counts only
+`Failed` rows; regression test locks the classification), and self-tests
+pinning seed-reject/solved-accept plus digest. It is a deterministic
+LT-EVAL-06 fixture, not an M15 window pack: `M15_PACK_IDS` stays 3 and the
+12-cell window contract is unchanged. Do not add TaskGraph,
 change Context/GC, or run another CompletionOpportunity/old 15-directive live
 pair. The first post-M15 live expansion compares normal/resume twins on the
 unchanged Runtime and asks whether repeated-work or lost-subgoal evidence is

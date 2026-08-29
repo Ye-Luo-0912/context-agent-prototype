@@ -1,6 +1,8 @@
-//! M15 development-pack fixtures 2 and 3 (`M15_ACCEPTANCE.md` §2):
-//! `retry_diag_dev` (seeded-defect diagnosis) and `retry_migrate_dev`
-//! (multi-file migration). Everything here is harness-owned and
+//! Development-pack fixtures (`M15_ACCEPTANCE.md` §2 and the LT-EVAL-06
+//! deterministic task pack): `retry_diag_dev` (seeded-defect diagnosis),
+//! `retry_migrate_dev` (multi-file migration), and `harness_maint_dev`
+//! (evaluation-harness maintenance — a deterministic LT-EVAL-06 fixture,
+//! not an M15 window pack). Everything here is harness-owned and
 //! network-free: seed files, the one user directive, the hidden check
 //! table, and the injected behavioral oracle are frozen constants with
 //! deterministic self-tests — the seeded workspace fails the contract
@@ -22,6 +24,7 @@ use sha2::{Digest, Sha256};
 
 pub const RETRY_DIAG: &str = "retry_diag_dev";
 pub const RETRY_MIGRATE: &str = "retry_migrate_dev";
+pub const RETRY_MAINT: &str = "harness_maint_dev";
 
 pub struct M15Fixture {
     pub id: &'static str,
@@ -43,7 +46,7 @@ pub fn fixture(id: &str) -> Option<&'static M15Fixture> {
     FIXTURES.iter().find(|fixture| fixture.id == id)
 }
 
-pub const FIXTURES: &[M15Fixture] = &[RETRY_DIAG_DEV, RETRY_MIGRATE_DEV];
+pub const FIXTURES: &[M15Fixture] = &[RETRY_DIAG_DEV, RETRY_MIGRATE_DEV, RETRY_MAINT_DEV];
 
 /// Canonical identity of every frozen input that can change a pack's task or
 /// verdict. Function pointers are represented by their stable check names;
@@ -596,6 +599,378 @@ const RETRY_DIAG_DEV: M15Fixture = M15Fixture {
     oracle_source: DIAG_ORACLE_SOURCE,
 };
 
+// ---------------------------------------------------------------------------
+// harness_maint_dev — regression-summary maintenance (LT-EVAL-06 task 3)
+// ---------------------------------------------------------------------------
+//
+// The seeded defect is an evaluation-harness classification bug: a
+// `NotRun` (censored/unexecuted) row is counted as `failed`, while the
+// documented contract counts it separately and keeps
+// `total == passed + failed + not_run`. The seeded tests never exercise
+// the `NotRun` arm, so they are all green — exactly the diagnosis and
+// test-repair pressure the task measures.
+
+const MAINT_DIRECTIVE: &str = "The evaluation harness documents its regression summary \
+     contract: `summarize_results` classifies every row as `passed`, `failed` or `not_run`; \
+     `total` is the sum of the three classes; and a `not_run` row (a censored or unexecuted \
+     case) must NEVER be counted as a failure. Every check in the repo is green, yet staging \
+     observed a NOT_RUN row reported as a failure. Investigate `src/lib.rs`, write `REPORT.md` \
+     at the workspace root naming the responsible function and the precise mechanism, then \
+     apply the minimal fix and add a regression test that locks the `not_run` classification \
+     to the documented contract (a mixed batch including at least one `not_run` row must \
+     report that row as `not_run`, not `failed`, and satisfy \
+     `total == passed + failed + not_run`). Keep the public `summarize_results` signature \
+     unchanged; run the project checks and report the result.";
+
+const MAINT_CARGO: &str = r#"[package]
+name = "evalkit"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+path = "src/lib.rs"
+
+[dependencies]
+"#;
+
+// Borrowed from the M15 diag seed so the golden/diag pact stays alike.
+const MAINT_LIB_SEED: &str = r#"//! Evaluation-harness regression summary.
+//!
+//! Documented contract: `summarize_results` classifies every row into
+//! `passed`, `failed` or `not_run`; `total` is the sum of the three, and a
+//! `not_run` row (a censored or unexecuted case) must never be counted as
+//! a failure.
+
+/// Outcome of one evaluated case.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CaseStatus {
+    /// Check passed.
+    Passed,
+    /// Check ran and failed.
+    Failed,
+    /// Check was never executed (censored/transport/unexecuted).
+    NotRun,
+}
+
+/// One evaluated case with its classification and a bounded detail line.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TestResult {
+    pub id: String,
+    pub status: CaseStatus,
+    pub detail: String,
+}
+
+/// Mechanical summary of a batch.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Summary {
+    pub total: usize,
+    pub passed: usize,
+    pub failed: usize,
+    pub not_run: usize,
+}
+
+/// Summarize a batch. `total` must equal `passed + failed + not_run`.
+pub fn summarize_results(results: &[TestResult]) -> Summary {
+    let mut passed = 0;
+    let mut failed = 0;
+    // Seeded defect: there is no NotRun arm, so the counter never moves.
+    let not_run = 0;
+    for result in results {
+        match result.status {
+            CaseStatus::Passed => passed += 1,
+            // Seeded defect: a NOT_RUN row is a censored case, not a
+            // failed case, but this arm reports it as failed.
+            CaseStatus::Failed | CaseStatus::NotRun => failed += 1,
+        }
+    }
+    Summary {
+        total: results.len(),
+        passed,
+        failed,
+        not_run,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn row(id: &str, status: CaseStatus) -> TestResult {
+        TestResult {
+            id: id.to_string(),
+            status,
+            detail: String::new(),
+        }
+    }
+
+    // All green: the seeded tests never exercise the NotRun classification.
+    #[test]
+    fn summarizes_passed_and_failed_rows() {
+        let summary = summarize_results(&[
+            row("a", CaseStatus::Passed),
+            row("b", CaseStatus::Failed),
+            row("c", CaseStatus::Passed),
+        ]);
+        assert_eq!(summary.total, 3);
+        assert_eq!(summary.passed, 2);
+        assert_eq!(summary.failed, 1);
+        assert_eq!(summary.not_run, 0);
+    }
+}
+"#;
+
+// The scripted minimal solution used by the deterministic self-test.
+#[cfg(test)]
+const MAINT_LIB_FIXED: &str = r#"//! Evaluation-harness regression summary.
+//!
+//! Documented contract: `summarize_results` classifies every row into
+//! `passed`, `failed` or `not_run`; `total` is the sum of the three, and a
+//! `not_run` row (a censored or unexecuted case) must never be counted as
+//! a failure.
+
+/// Outcome of one evaluated case.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CaseStatus {
+    /// Check passed.
+    Passed,
+    /// Check ran and failed.
+    Failed,
+    /// Check was never executed (censored/transport/unexecuted).
+    NotRun,
+}
+
+/// One evaluated case with its classification and a bounded detail line.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TestResult {
+    pub id: String,
+    pub status: CaseStatus,
+    pub detail: String,
+}
+
+/// Mechanical summary of a batch.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Summary {
+    pub total: usize,
+    pub passed: usize,
+    pub failed: usize,
+    pub not_run: usize,
+}
+
+/// Summarize a batch. `total` must equal `passed + failed + not_run`.
+pub fn summarize_results(results: &[TestResult]) -> Summary {
+    let mut passed = 0;
+    let mut failed = 0;
+    let mut not_run = 0;
+    for result in results {
+        match result.status {
+            CaseStatus::Passed => passed += 1,
+            CaseStatus::Failed => failed += 1,
+            CaseStatus::NotRun => not_run += 1,
+        }
+    }
+    Summary {
+        total: results.len(),
+        passed,
+        failed,
+        not_run,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn row(id: &str, status: CaseStatus) -> TestResult {
+        TestResult {
+            id: id.to_string(),
+            status,
+            detail: String::new(),
+        }
+    }
+
+    #[test]
+    fn summarizes_passed_and_failed_rows() {
+        let summary = summarize_results(&[
+            row("a", CaseStatus::Passed),
+            row("b", CaseStatus::Failed),
+            row("c", CaseStatus::Passed),
+        ]);
+        assert_eq!(summary.total, 3);
+        assert_eq!(summary.passed, 2);
+        assert_eq!(summary.failed, 1);
+        assert_eq!(summary.not_run, 0);
+    }
+
+    // Regression: a NOT_RUN row is censored, never a failure.
+    #[test]
+    fn not_run_row_is_not_a_failure() {
+        let summary = summarize_results(&[
+            row("a", CaseStatus::Passed),
+            row("b", CaseStatus::NotRun),
+            row("c", CaseStatus::Failed),
+            row("d", CaseStatus::NotRun),
+        ]);
+        assert_eq!((summary.passed, summary.failed, summary.not_run), (1, 1, 2));
+        assert_eq!(
+            summary.total,
+            summary.passed + summary.failed + summary.not_run
+        );
+    }
+}
+"#;
+
+const MAINT_TESTS_SEED: &str = r#"//! Model-visible integration coverage for the regression summary.
+use evalkit::{summarize_results, CaseStatus, TestResult};
+
+fn row(id: &str, status: CaseStatus) -> TestResult {
+    TestResult {
+        id: id.to_string(),
+        status,
+        detail: String::new(),
+    }
+}
+
+#[test]
+fn batch_without_not_run_rows_adds_up() {
+    let summary = summarize_results(&[
+        row("a", CaseStatus::Passed),
+        row("b", CaseStatus::Failed),
+        row("c", CaseStatus::Passed),
+    ]);
+    assert_eq!((summary.passed, summary.failed, summary.not_run), (2, 1, 0));
+}
+"#;
+
+// The scripted minimal solution used by the deterministic self-test.
+#[cfg(test)]
+const MAINT_TESTS_FIXED: &str = r#"//! Model-visible integration coverage for the regression summary.
+use evalkit::{summarize_results, CaseStatus, TestResult};
+
+fn row(id: &str, status: CaseStatus) -> TestResult {
+    TestResult {
+        id: id.to_string(),
+        status,
+        detail: String::new(),
+    }
+}
+
+#[test]
+fn batch_without_not_run_rows_adds_up() {
+    let summary = summarize_results(&[
+        row("a", CaseStatus::Passed),
+        row("b", CaseStatus::Failed),
+        row("c", CaseStatus::Passed),
+    ]);
+    assert_eq!((summary.passed, summary.failed, summary.not_run), (2, 1, 0));
+}
+
+// Regression: NOT_RUN rows are censored cases, never failures.
+#[test]
+fn not_run_rows_are_not_failures() {
+    let summary = summarize_results(&[
+        row("a", CaseStatus::Passed),
+        row("b", CaseStatus::NotRun),
+        row("c", CaseStatus::Failed),
+        row("d", CaseStatus::NotRun),
+    ]);
+    assert_eq!((summary.passed, summary.failed, summary.not_run), (1, 1, 2));
+    assert_eq!(summary.total, summary.passed + summary.failed + summary.not_run);
+}
+"#;
+
+// The scripted minimal solution used by the deterministic self-test.
+#[cfg(test)]
+const MAINT_REPORT_SOLVED: &str = r#"# Diagnosed defect: NOT_RUN rows counted as failed
+
+`summarize_results` in `src/lib.rs` matched `CaseStatus::Failed | CaseStatus::NotRun` into the
+`failed` counter, so a censored/unexecuted (not_run) row was reported as a failure and the
+`not_run` counter stayed at zero. The minimal fix splits the arm: `CaseStatus::NotRun =>
+not_run += 1` keeps `failed` exact and preserves the invariant `total == passed + failed +
+not_run`. A regression test in `tests/report.rs` locks the classification with a mixed batch.
+"#;
+
+const MAINT_README: &str = "# evalkit (maintenance fixture)\n\nEvaluation-harness regression summary: `summarize_results` classifies rows as `passed`, `failed` or `not_run`; `total` is the sum of the three classes.\n";
+
+const MAINT_FILES_SEED: &[(&str, &str)] = &[
+    ("Cargo.toml", MAINT_CARGO),
+    ("src/lib.rs", MAINT_LIB_SEED),
+    ("tests/report.rs", MAINT_TESTS_SEED),
+    ("README.md", MAINT_README),
+];
+
+const MAINT_ORACLE_NAME: &str = "harness_maint_oracle";
+const MAINT_ORACLE_SOURCE: &str = r#"//! Harness-owned regression oracle; copied in by the evaluation harness
+//! after the run. Not authored by the evaluated agent.
+
+use evalkit::{summarize_results, CaseStatus, TestResult};
+
+fn row(id: &str, status: CaseStatus) -> TestResult {
+    TestResult {
+        id: id.to_string(),
+        status,
+        detail: String::new(),
+    }
+}
+
+#[test]
+fn not_run_is_separate_from_failed() {
+    let summary = summarize_results(&[
+        row("a", CaseStatus::Passed),
+        row("b", CaseStatus::Failed),
+        row("c", CaseStatus::NotRun),
+        row("d", CaseStatus::Passed),
+    ]);
+    assert_eq!(summary.total, 4);
+    assert_eq!(summary.passed, 2);
+    assert_eq!(summary.failed, 1, "a NOT_RUN row must not count as failed");
+    assert_eq!(summary.not_run, 1);
+    assert_eq!(
+        summary.total,
+        summary.passed + summary.failed + summary.not_run,
+        "total is the sum of the three classes"
+    );
+}
+"#;
+
+const MAINT_CHECKS: &[PackCheck] = &[
+    PackCheck {
+        path: "REPORT.md",
+        name: "report names summarize_results and the not_run misclassification",
+        accept: |body| {
+            body.contains("not_run")
+                && body.contains("summarize_results")
+                && (body.contains("counted as failed") || body.contains("as a failure"))
+        },
+    },
+    PackCheck {
+        path: "src/lib.rs",
+        name: "failed counts only Failed rows; NotRun has its own arm",
+        accept: |body| {
+            body.contains("CaseStatus::Failed => failed += 1")
+                && body.contains("CaseStatus::NotRun => not_run += 1")
+                && !body.contains("| CaseStatus::NotRun => failed += 1")
+        },
+    },
+    PackCheck {
+        path: "tests/report.rs",
+        name: "regression test locks the not_run classification",
+        accept: |body| {
+            body.contains("NotRun")
+                && body.contains("+ summary.failed +")
+                && body.contains("+ summary.not_run")
+        },
+    },
+];
+
+const RETRY_MAINT_DEV: M15Fixture = M15Fixture {
+    id: RETRY_MAINT,
+    directive: MAINT_DIRECTIVE,
+    files: MAINT_FILES_SEED,
+    checks: MAINT_CHECKS,
+    oracle_name: MAINT_ORACLE_NAME,
+    oracle_source: MAINT_ORACLE_SOURCE,
+};
+
 const RETRY_MIGRATE_DEV: M15Fixture = M15Fixture {
     id: RETRY_MIGRATE,
     directive: MIGRATE_DIRECTIVE,
@@ -667,6 +1042,24 @@ mod tests {
         );
     }
 
+    #[test]
+    fn maint_seed_fails_checks_and_minimal_fix_passes_all() {
+        let (_dir, seeded) = seed_and(RETRY_MAINT, |_| {});
+        assert!(
+            seeded.iter().any(|passed| !passed),
+            "the seeded misclassification must fail the contract checks: {seeded:?}"
+        );
+        let (_dir2, solved) = seed_and(RETRY_MAINT, |root| {
+            overwrite(root, "src/lib.rs", MAINT_LIB_FIXED);
+            overwrite(root, "tests/report.rs", MAINT_TESTS_FIXED);
+            overwrite(root, "REPORT.md", MAINT_REPORT_SOLVED);
+        });
+        assert!(
+            solved.iter().all(|passed| *passed),
+            "the minimal fix must pass every check: {solved:?}"
+        );
+    }
+
     const CARGO_TEST_TIMEOUT: Duration = Duration::from_secs(600);
 
     /// Run the harness-owned oracle the same way the live harness does
@@ -722,6 +1115,10 @@ mod tests {
             spec_sha256(RETRY_MIGRATE),
             "26d69fa1d4ccd00452b3ceb88f2a6ec7fbb977989df6d6f4e2f1e345660679cb"
         );
+        assert_eq!(
+            spec_sha256(RETRY_MAINT),
+            "c586021e9be53f8f0c4451f9894ff07bdea6a06481909f0f3fab7f700b9a2d91"
+        );
     }
 
     /// The harness-owned oracle must reject each pack's untouched seed and
@@ -740,7 +1137,16 @@ mod tests {
             ("src/metrics.rs", MIGRATE_METRICS_SOLVED),
             ("src/usage.rs", MIGRATE_USAGE_SOLVED),
         ];
-        for (id, solved) in [(RETRY_DIAG, diag_solved), (RETRY_MIGRATE, migrate_solved)] {
+        let maint_solved: &[(&str, &str)] = &[
+            ("src/lib.rs", MAINT_LIB_FIXED),
+            ("tests/report.rs", MAINT_TESTS_FIXED),
+            ("REPORT.md", MAINT_REPORT_SOLVED),
+        ];
+        for (id, solved) in [
+            (RETRY_DIAG, diag_solved),
+            (RETRY_MIGRATE, migrate_solved),
+            (RETRY_MAINT, maint_solved),
+        ] {
             assert!(
                 !oracle_passes_on(id, &[]).await,
                 "oracle must reject the untouched {id} seed"
@@ -759,7 +1165,7 @@ mod tests {
     #[ignore]
     async fn variants_cargo_check() {
         type Overrides = &'static [(&'static str, &'static str)];
-        let combos: [(&str, Overrides, &str, bool); 4] = [
+        let combos: [(&str, Overrides, &str, bool); 6] = [
             (RETRY_DIAG, &[], "diag-seed", false),
             (
                 RETRY_DIAG,
@@ -781,6 +1187,17 @@ mod tests {
                     ("src/usage.rs", MIGRATE_USAGE_SOLVED),
                 ],
                 "migrate-solved",
+                true,
+            ),
+            (RETRY_MAINT, &[], "maint-seed", false),
+            (
+                RETRY_MAINT,
+                &[
+                    ("src/lib.rs", MAINT_LIB_FIXED),
+                    ("tests/report.rs", MAINT_TESTS_FIXED),
+                    ("REPORT.md", MAINT_REPORT_SOLVED),
+                ],
+                "maint-solved",
                 true,
             ),
         ];
@@ -810,8 +1227,8 @@ mod tests {
     }
 
     #[test]
-    fn registry_resolves_both_and_oracles_are_frozen_constants() {
-        assert_eq!(FIXTURES.len(), 2);
+    fn registry_resolves_all_and_oracles_are_frozen_constants() {
+        assert_eq!(FIXTURES.len(), 3);
         for entry in FIXTURES {
             assert!(fixture(entry.id).is_some());
             assert!(!entry.directive.is_empty());

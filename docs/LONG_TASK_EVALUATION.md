@@ -1042,6 +1042,16 @@ capability-generation tuple. Harness setup, behavior, diff, verification,
 closure, provider health, Runtime health, restore and continuation remain
 independent facts. Failed tool outputs stay in the denominator.
 
+The deterministic side of task 3 landed 2026-08-29 as `harness_maint_dev`
+(frozen digest `c586021e…a2d91`, registered in `m15_pack`): a
+`summarize_results` seed whose `NotRun` rows are counted as failed with all
+green tests, an injected harness-owned oracle rejecting the seed and accepting
+the scripted minimal fix, content checks (report names the responsible
+function and mechanism; `failed` counts only `Failed` rows; the regression
+test locks `total == passed + failed + not_run`), and self-tests pinning
+seed-reject / solved-accept / oracle / digest. It is a deterministic
+LT-EVAL-06 fixture, not an M15 window pack — `M15_PACK_IDS` stays 3.
+
 Use the current bounded `TaskRecord.resume: ExecutionState` as the only
 progress substrate. Its content follows actual goal/constraint/evidence
 changes and coalesced safe points; do not prescribe fixed subtask counts,
