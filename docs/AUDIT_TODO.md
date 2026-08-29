@@ -1469,11 +1469,7 @@ window ran 2026-08-29 at clean HEAD `f625d39`
 (`evidence/m15-window/_windows/1787970773734/`, mechanical report, 0 NOT_RUN,
 cached input metered): 9/12 PASS; all three failures are diag cells (normal
 r1/r2, resume r1), while migrate and policy pass all 8 cells with exact-tuple
-continuation. Across both windows the diag overflow edge is the only
-recurring failure surface (3/4 then 1/4 diag PASS), a stochastic per-cell
-solve rate rather than a harness or serving defect. Exit evidence for M15 is
-still open: rerun one complete clean-tree v3 window and commit its
-regenerated report with 12/12 PASS.
+continuation. A third clean-tree v3 window ran 2026-08-29 (`evidence/m15-window/_windows/1787973547152/`, 10/12 PASS): the two failures are again diag cells; `retry_migrate_dev` + `retry_policy_dev` have passed 24/24 across the three windows. All six failing diag cells across all windows finalize `checked_shl` (guards shift-count ≥ 64 only, not bits shifted out), and all eight passing diag cells use `checked_mul`/`saturating_mul` — a deterministic solver semantic trap, not a harness or serving defect; M15 therefore remains open. The recurring failure surface is the same calibrated diag overflow edge (~57% per-cell solve rate).
 
 ## Closed archive (index only)
 

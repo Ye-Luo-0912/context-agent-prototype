@@ -557,7 +557,23 @@ and sandbox contracts live elsewhere. Experiment facts live in
   (first window 3/4 diag PASS, second 1/4), consistent with its calibrated
   difficulty and with a stochastic per-cell solve rate; the fixture,
   oracle and serving stay unchanged and M15 stays open until a window
-  passes 12/12.
+  passes 12/12. A third clean-tree v3 window ran the same day at clean
+  HEAD `d88448d` (same pinned tuple; cached input 200,704 / input
+  ~1,943,439): 10/12 PASS — the two failures are again diag cells (normal
+  r2, resume r1), and `retry_migrate_dev` + `retry_policy_dev` have now
+  passed 24/24 cells across all three windows with exact-tuple
+  continuation everywhere; 0 NOT_RUN. Diag-cause analysis over the three
+  windows plus the two preflight arms is fully attributed and
+  deterministic: every failing diag cell (6/6) finalizes the fix with
+  `checked_shl(exp).unwrap_or(u64::MAX)` — which only guards shift counts
+  ≥ 64, not bits shifted out (`100u64.checked_shl(62)` is `Some(0)`) —
+  while every passing cell (8/8) uses `checked_mul`/`saturating_mul` (or
+  `min(63)` + `checked_mul`); failing cells also self-test with `base = 1`
+  configurations that avoid the trap, so their own tests pass while the
+  oracle fails. The calibration makes the needle and oracle agree against
+  the trap; the recurrence is a solver semantic issue (~57% per-cell diag
+  solve rate), not a harness or serving defect. M15 remains open with the
+  diag overflow edge the sole recurring failure surface.
 - **Completion Convergence V1 deterministic foundation landed** (2026-08-29,
   CONV-CLOSE-01 slices 1–5): evaluator cleanliness now aligns model-visible
   workspace with the allowed-diff policy (`.gate/`, `target/` and
