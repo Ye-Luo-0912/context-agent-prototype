@@ -524,9 +524,13 @@ and sandbox contracts live elsewhere. Experiment facts live in
   failure. The calibrated diag fixture is solvable on the pinned serving; the
   earlier 2-cell `--diag-smoke` failure was the model not solving the
   overflow edge, which the calibration's needle and oracle now reject
-  consistently. M15 remains open until one complete clean-tree 12-cell v3
-  window passes; a resume-arm one-cell preflight was not part of this
-  bounded run.
+  consistently. The same one-cell preflight then passed the resume arm the
+  same day at clean HEAD `65f6cc8`: two resumed turns (5 + 4 rounds) /
+  19 tool calls / 0 failed outputs / 104,516 ms, hidden oracle green,
+  settlement exposed (pre 8/19 → post 1/0) with ordinary-final closure, and
+  the same single needle-shape marker miss. Both arms of the one-cell
+  product preflight are therefore cleared on the frozen fixture. M15 remains
+  open until one complete clean-tree 12-cell v3 window passes.
 - **Completion Convergence V1 deterministic foundation landed** (2026-08-29,
   CONV-CLOSE-01 slices 1–5): evaluator cleanliness now aligns model-visible
   workspace with the allowed-diff policy (`.gate/`, `target/` and

@@ -100,4 +100,43 @@ It clears the one-cell preflight item (the pinned serving tuple can start,
 edit, verify and settle the diag fixture) and shows the earlier two-cell
 failure was the model not solving the overflow edge, not a harness artifact.
 It is not a formal M15 cell, makes no efficiency claim, and does not close
-M15; a resume-arm one-cell preflight was not part of this bounded run.
+M15; the resume-arm one-cell preflight ran separately below.
+
+## 2026-08-29 one-cell product preflight (resume arm PASS)
+
+Second half of the same bounded one-cell preflight, run on the current clean
+HEAD (`65f6cc8`) with the same frozen diag digest `2fff5157…eeb` and the same
+pinned serving; no fixture, oracle or serving change.
+
+- Command: `agent-eval --diag-smoke resume` (one repeat, recovery switch
+  off). Evidence is under `retry_diag_dev-resume/r1-attempt2/dynamic/`; the
+  earlier failed `r1/` stays untouched.
+- Verdict: PASS — `retry_diag_dev` resume in two resumed turns (5 + 4
+  rounds, `resumes=2`) / 19 tool calls / 0 failed outputs / 104,516 ms; zero
+  provider retries, contiguous event stream, 2 durable checkpoints, hidden
+  oracle green (3/3, exit 0) and replay complete.
+  `continuation=restored_and_continued`.
+- Settlement exposed: the first `SettledCandidate` frontier event came after
+  the resume restored state; pre 8 rounds / 19 calls, post 1 round /
+  0 calls. The model closed with an ordinary final message — `closure=active`,
+  no `task.complete`, no auto-close.
+- Tools: `fs.read` 9, `fs.list` 2, `search.grep` 2, `git.status` 2,
+  `git.diff` 1, `edit.patch` 1 (first-attempt commit), `fs.write` 1,
+  `verify.run` 1; zero failures across all 19 calls. The 3 repeated reads
+  are `checked_fresh` rereads after resume (state-health revalidation), not
+  redundant stalls.
+- Diagnosis markers: 5/6 assertions pass; the only miss is the same
+  `backoff.rs` "shift corrected and overflow-safe" needle — the written
+  `exponent >= 64` branch plus `saturating_mul` and `min(max_delay_ms)`
+  passes the oracle and the seeded unit tests (including the added
+  `large_attempts_saturate_at_the_cap`) but not the reference
+  `u128`/`leading_zeros` needle text: a needle-shape miss, not a functional
+  failure.
+- Provider token accounting is `usage_incomplete` (lower bound) across the
+  two resumed segments; the verdict and the oracle do not depend on token
+  totals.
+
+Both arms of the one-cell product preflight now pass on the pinned serving
+with the frozen calibrated fixture; the pre-window preflight item is cleared.
+Still not a formal M15 cell and no efficiency claim; M15 stays open until one
+complete clean-tree 12-cell v3 window passes.

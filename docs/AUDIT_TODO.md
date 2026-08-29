@@ -354,9 +354,12 @@ the written `exponent >= u64::BITS` + `checked_mul` + saturation shape passes
 the oracle but not the reference `u128`/`leading_zeros` needle text, so it is
 a needle-shape miss, not a functional failure. The calibrated fixture is
 solvable on the pinned serving; the earlier smoke failures were the model not
-solving the overflow edge. M15 stays open until one complete clean-tree
-12-cell v3 window passes; a resume-arm one-cell preflight was not part of
-this bounded run.
+solving the overflow edge. The resume arm passed the same one-cell preflight
+same-day at clean HEAD `65f6cc8` (two resumed turns, 5 + 4 rounds / 19 calls /
+0 failed outputs / 104,516 ms, hidden oracle green, settlement exposed
+pre 8/19 → post 1/0, ordinary-final closure, the same single needle-shape
+miss). Both one-cell preflight arms are cleared. M15 stays open until one
+complete clean-tree 12-cell v3 window passes.
 
 ### CONV-CLOSE-01 — Completion Convergence V1 (deterministic foundation + exposure-qualified live gate ran 2026-08-29; efficiency open)
 
