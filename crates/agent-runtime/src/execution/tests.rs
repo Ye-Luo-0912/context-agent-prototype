@@ -1905,3 +1905,91 @@ fn execution_ready_matches_verified_current_label() {
     assert!(!resume.execution_ready());
     assert_eq!(resume.settlement(), SettlementLabel::Working);
 }
+
+/// Untrusted verifier: the same reuse class as `observed_exact_pass` but
+/// without exact identity material, so the pass can never bind the world.
+fn observed_untrusted_pass(resume: &mut ExecutionState, anchor_revision: u64, turn: u64) {
+    let attribution = RuntimeExecutionAttribution {
+        host: ToolExecutionAttribution::bounded(
+            ToolExecutionPurpose::Verify,
+            Vec::<String>::new(),
+            VerificationReuse::ExactCurrentWorld,
+        ),
+        rooted_targets: Vec::new(),
+    };
+    resume.observe_tool_attributed(&verified_ok(), anchor_revision, turn, "arg-settle", &attribution);
+}
+
+/// A failed shell command: records a failed command whose Unknown-side
+/// footprint bumps the world revision, so readiness must reopen.
+fn failed_shell(command: &str) -> ToolOutput {
+    let mut fail = output("shell.exec", false, "command failed");
+    fail.metadata = json!({"command": command});
+    fail
+}
+
+#[test]
+fn trusted_verification_pass_resolves_failed_attempt_history() {
+    let mut resume = ExecutionState::default();
+    resume.observe_tool(&write_of("src/auth.rs", "v2"), 1, 1);
+    resume.observe_tool(&failed_shell("cargo build"), 1, 2);
+    assert_eq!(resume.failed_commands.len(), 1);
+    assert!(!resume.execution_ready());
+
+    // A trusted verification PASS confirms the current world on the
+    // covered criteria: the historical failed attempts are resolved past
+    // the readiness gate instead of blocking forever.
+    observed_exact_pass(&mut resume, 1, 3);
+    assert!(resume.failed_commands.is_empty());
+    assert_eq!(resume.settlement(), SettlementLabel::VerifiedCurrent);
+    assert!(resume.execution_ready());
+}
+
+#[test]
+fn untrusted_verification_pass_keeps_failed_attempts_open() {
+    let mut resume = ExecutionState::default();
+    resume.observe_tool(&write_of("src/auth.rs", "v2"), 1, 1);
+    resume.observe_tool(&failed_shell("cargo build"), 1, 2);
+    assert_eq!(resume.failed_commands.len(), 1);
+
+    // A PASS without exact identity cannot bind the world tuple: the
+    // failure history stays open and readiness fails closed.
+    observed_untrusted_pass(&mut resume, 1, 3);
+    assert_eq!(resume.failed_commands.len(), 1);
+    assert_eq!(resume.settlement(), SettlementLabel::Working);
+    assert!(!resume.execution_ready());
+}
+
+#[test]
+fn failed_verification_does_not_resolve_failure_history() {
+    let mut resume = ExecutionState::default();
+    resume.observe_tool(&write_of("src/auth.rs", "v2"), 1, 1);
+    resume.observe_tool(&failed_shell("cargo build"), 1, 2);
+    let mut fail = output("shell.exec", false, "tests failed");
+    fail.metadata = json!({"command": "cargo test", "verification": true});
+    resume.observe_tool(&fail, 1, 3);
+    assert!(!resume.failed_commands.is_empty());
+    assert_eq!(resume.settlement(), SettlementLabel::VerificationDue);
+    assert!(!resume.execution_ready());
+}
+
+#[test]
+fn failure_after_trusted_verification_reblocks_readiness() {
+    let mut resume = ExecutionState::default();
+    resume.observe_tool(&write_of("src/auth.rs", "v2"), 1, 1);
+    observed_exact_pass(&mut resume, 1, 2);
+    assert!(resume.execution_ready());
+
+    // A new failure after the trusted verification reopens the
+    // fail-closed gate until the next trusted pass: the Unknown-side
+    // footprint bumps the world and reopens the verification duty.
+    resume.observe_tool(&failed_shell("cargo build"), 1, 3);
+    assert_eq!(resume.failed_commands.len(), 1);
+    assert_eq!(resume.settlement(), SettlementLabel::VerificationDue);
+    assert!(!resume.execution_ready());
+
+    observed_exact_pass(&mut resume, 1, 4);
+    assert!(resume.failed_commands.is_empty());
+    assert_eq!(resume.settlement(), SettlementLabel::VerifiedCurrent);
+    assert!(resume.execution_ready());
+}

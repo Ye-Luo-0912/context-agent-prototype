@@ -188,6 +188,14 @@ impl ExecutionState {
                     self.push_verification(output, argument_digest, attribution, turn)
                 {
                     verification_pass_events.push(event);
+                    // A trusted verification PASS binds the whole current
+                    // tuple (verification basis, directive, workspace):
+                    // the world is confirmed on the covered criteria, so
+                    // the historical failed attempts count as resolved
+                    // past the readiness gate. Failures observed after
+                    // this point re-record and block readiness again; the
+                    // settlement() pure function stays unchanged.
+                    self.failed_commands.clear();
                 }
                 // Keep the verification basis (spec_revision) as tracked by
                 // TaskAnchor.verification_revision; a progress-only anchor
