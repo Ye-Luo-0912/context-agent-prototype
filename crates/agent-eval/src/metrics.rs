@@ -77,15 +77,17 @@ pub struct RunMetrics {
     pub frontier_no_advance_peak: u64,
     /// 因 world revision 推进而失效的前沿证据条数。
     pub evidence_invalidations: u64,
-    /// 结算后尾部归因：事件流首次出现 `SettledCandidate` 标签之后的
-    /// 轮数/调用数，与结算点之前的分开报告（causal baseline）。
-    /// 首次结算点本身取自 `ExecutionFrontier` 的 settlement 变化，
-    /// 由 Runtime 派生，不从提示文本猜测。
+    /// 结算 episode 会计：进入 `SettledCandidate` 即开一笔 episode，
+    /// 首次重开过渡或 terminal 结束。episode 内的轮/调用/失败归该
+    /// episode；重开后的 phase-two 工作不再计入上一笔。零 episode =
+    /// 零暴露，收敛 gate 判定 inconclusive（与 `settled_seen` 一致）。
+    /// 标签本身取自 `ExecutionFrontier` 的 settlement 变化，由 Runtime
+    /// 派生，不从提示文本猜测。
     pub settled_seen: bool,
-    pub pre_settlement_rounds: u64,
-    pub pre_settlement_calls: u64,
-    pub post_settlement_rounds: u64,
-    pub post_settlement_calls: u64,
+    pub settlement_episodes: u64,
+    pub settlement_episode_rounds: u64,
+    pub settlement_episode_calls: u64,
+    pub settlement_episode_failures: u64,
     /// 任务结果前沿的影子账本。现有 Evidence
     /// Frontier 回答“是否获得了新的 current 证据”；这一组指标
     /// 只回答“任务结果是否前进”，不参与实时决策。
@@ -395,11 +397,10 @@ pub fn aggregate_metrics(events: &[RuntimeEventEnvelope]) -> RunMetrics {
     // 因此用有界在途 id 集合避免重复计数。
     let mut catalog_optional_round: Option<CatalogOptionalRound> = None;
     let mut open_optional_calls: HashSet<String> = HashSet::new();
-    // 结算后尾部会计：首次 SettledCandidate 事件出现前的轮/调用与
-    // 之后的分开计数，promotion 因果指标从结算点起算。
-    let mut settled_seen = false;
-    let mut pre_settlement_rounds: u64 = 0;
-    let mut pre_settlement_calls: u64 = 0;
+    // 结算 episode 会计：SettledCandidate 进入即开一笔（该标签事件
+    // 由 Runtime 在变化时发布），离开即关；episode 内轮/调用/失败归
+    // 该 episode，重开后的 phase-two 工作只进 whole-cell 总数。
+    let mut in_settlement_episode = false;
 
     for envelope in events {
         match &envelope.event {
@@ -415,10 +416,8 @@ pub fn aggregate_metrics(events: &[RuntimeEventEnvelope]) -> RunMetrics {
             }
             RuntimeEvent::ToolStarted { call } => {
                 metrics.tool_calls += 1;
-                if settled_seen {
-                    metrics.post_settlement_calls += 1;
-                } else {
-                    pre_settlement_calls += 1;
+                if in_settlement_episode {
+                    metrics.settlement_episode_calls += 1;
                 }
                 note_catalog_optional_request(
                     &mut metrics,
@@ -528,6 +527,9 @@ pub fn aggregate_metrics(events: &[RuntimeEventEnvelope]) -> RunMetrics {
                 }
                 if !output.ok {
                     metrics.failed_tool_outputs += 1;
+                    if in_settlement_episode {
+                        metrics.settlement_episode_failures += 1;
+                    }
                 }
                 if output.tool_name == "fs.read"
                     && let Some(motive) = output
@@ -720,13 +722,18 @@ pub fn aggregate_metrics(events: &[RuntimeEventEnvelope]) -> RunMetrics {
                     .frontier_no_advance_peak
                     .max(u64::from(*actions_since_frontier_advance));
                 metrics.evidence_invalidations += *invalidated;
-                if let Some(agent_contracts::SettlementLabel::SettledCandidate) = settlement {
-                    if !settled_seen {
-                        settled_seen = true;
-                        metrics.pre_settlement_rounds = pre_settlement_rounds;
-                        metrics.pre_settlement_calls = pre_settlement_calls;
+                match settlement {
+                    Some(agent_contracts::SettlementLabel::SettledCandidate) => {
+                        metrics.settled_seen = true;
+                        if !in_settlement_episode {
+                            in_settlement_episode = true;
+                            metrics.settlement_episodes += 1;
+                        }
                     }
-                    metrics.settled_seen = true;
+                    // 离开 candidate 的第一个过渡（重开）关闭当前
+                    // episode：后续 phase-two 工作只进 whole-cell。
+                    Some(_) => in_settlement_episode = false,
+                    None => {}
                 }
             }
             RuntimeEvent::ExecutionBatchSettled {
@@ -921,10 +928,8 @@ pub fn aggregate_metrics(events: &[RuntimeEventEnvelope]) -> RunMetrics {
             RuntimeEvent::ToolSurfacePlanned { report } => {
                 finish_catalog_optional_round(&mut metrics, &mut catalog_optional_round);
                 metrics.rounds += 1;
-                if settled_seen {
-                    metrics.post_settlement_rounds += 1;
-                } else {
-                    pre_settlement_rounds += 1;
+                if in_settlement_episode {
+                    metrics.settlement_episode_rounds += 1;
                 }
                 current_turn_rounds = current_turn_rounds.saturating_add(1);
                 metrics.schema_tokens_total += report.selected_schema_tokens as u64;
@@ -1077,6 +1082,8 @@ pub fn aggregate_metrics(events: &[RuntimeEventEnvelope]) -> RunMetrics {
                 metrics.outcome_frontier_advances =
                     metrics.outcome_frontier_advances.saturating_add(1);
                 results_without_outcome_advance = 0;
+                // Terminal outcome closes any open settlement episode.
+                in_settlement_episode = false;
             }
             RuntimeEvent::TurnCompleted => {
                 finish_catalog_optional_round(&mut metrics, &mut catalog_optional_round);
@@ -1135,61 +1142,80 @@ pub fn aggregate_metrics(events: &[RuntimeEventEnvelope]) -> RunMetrics {
         .or_else(|| buckets.last())
         .copied()
         .unwrap_or(0);
-    // 从未出现 SettledCandidate 时，全部轮/调用属结算点之前。
-    if !settled_seen {
-        metrics.pre_settlement_rounds = pre_settlement_rounds;
-        metrics.pre_settlement_calls = pre_settlement_calls;
-    }
     metrics
 }
 
-/// Event-level slice of everything that happened after the first
-/// `SettledCandidate` frontier label. Built mechanically from the same
-/// stream as [`aggregate_metrics`]; the split point is the first
-/// `ExecutionFrontier` event whose settlement label is
-/// `SettledCandidate`, and every later frontier delta and tool result is
-/// counted as post-settlement, whether or not the label changed again.
-/// With no settled event the profile is empty and `settled_at_seq` is
-/// `None` (the same zero-exposure rule as the gate runner).
+/// Episode-sliced settlement accounting over one event stream, the same
+/// stream as [`aggregate_metrics`]. An episode opens at the first (or a
+/// repeated) `SettledCandidate` frontier label and closes on the first
+/// reopening transition or a terminal `TaskCompleted`; only work inside an
+/// episode is charged to it, so phase-two work after a reopen is never
+/// billed to an earlier candidate episode. With no settled event the
+/// profile is empty and `first_settled_at_seq` is `None` (the same
+/// zero-exposure rule as the gate runner).
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub struct PostSettlementProfile {
-    pub settled_at_seq: Option<u64>,
-    /// Frontier delta labels after the settled event, counted by their
-    /// wire names (`observed_world_change`, `no_progress`, ...).
-    pub deltas: BTreeMap<String, u64>,
-    /// Failed `ToolFinished` outputs after the settled event.
-    pub failed_outputs: u64,
-    pub failed_tools: BTreeMap<String, u64>,
-    /// All tool calls after the settled event by tool name.
-    pub tool_calls: BTreeMap<String, u64>,
+pub struct SettlementEpisodeProfile {
+    /// Sequence of the first settled frontier event, when any.
+    pub first_settled_at_seq: Option<u64>,
+    /// Number of candidate episodes entered.
+    pub episodes: u64,
+    /// Model rounds (surfaces) counted inside episodes.
+    pub episode_rounds: u64,
+    /// Tool started calls inside episodes, by tool name.
+    pub episode_tool_calls: BTreeMap<String, u64>,
+    /// Frontier delta labels inside episodes, by wire names
+    /// (`observed_world_change`, `no_progress`, ...).
+    pub episode_deltas: BTreeMap<String, u64>,
+    /// Failed `ToolFinished` outputs inside episodes.
+    pub episode_failures: u64,
+    pub episode_failed_tools: BTreeMap<String, u64>,
 }
 
-pub fn post_settlement_profile(events: &[RuntimeEventEnvelope]) -> PostSettlementProfile {
-    let mut profile = PostSettlementProfile::default();
-    let mut after = false;
+pub fn settlement_episode_profile(events: &[RuntimeEventEnvelope]) -> SettlementEpisodeProfile {
+    let mut profile = SettlementEpisodeProfile::default();
+    let mut in_episode = false;
     for envelope in events {
         match &envelope.event {
             RuntimeEvent::ExecutionFrontier { settlement, delta, .. } => {
-                if !after {
-                    if *settlement == Some(agent_contracts::SettlementLabel::SettledCandidate) {
-                        profile.settled_at_seq = Some(envelope.seq);
-                        after = true;
+                match settlement {
+                    Some(agent_contracts::SettlementLabel::SettledCandidate) => {
+                        profile.first_settled_at_seq.get_or_insert(envelope.seq);
+                        if !in_episode {
+                            in_episode = true;
+                            profile.episodes += 1;
+                        }
                     }
-                    continue;
+                    // 重开过渡关闭当前 episode；它的 delta 属 phase-two。
+                    Some(_) => in_episode = false,
+                    None => {}
                 }
-                let name = serde_json::to_value(delta)
-                    .ok()
-                    .and_then(|value| value.as_str().map(str::to_owned))
-                    .unwrap_or_default();
-                *profile.deltas.entry(name).or_insert(0) += 1;
+                if in_episode {
+                    let name = serde_json::to_value(delta)
+                        .ok()
+                        .and_then(|value| value.as_str().map(str::to_owned))
+                        .unwrap_or_default();
+                    *profile.episode_deltas.entry(name).or_insert(0) += 1;
+                }
             }
-            RuntimeEvent::ToolFinished { output } if after => {
-                *profile.tool_calls.entry(output.tool_name.clone()).or_insert(0) += 1;
+            RuntimeEvent::ToolSurfacePlanned { .. } if in_episode => {
+                profile.episode_rounds += 1;
+            }
+            RuntimeEvent::ToolStarted { call } if in_episode => {
+                *profile
+                    .episode_tool_calls
+                    .entry(call.name.clone())
+                    .or_insert(0) += 1;
+            }
+            RuntimeEvent::ToolFinished { output } if in_episode => {
                 if !output.ok {
-                    profile.failed_outputs += 1;
-                    *profile.failed_tools.entry(output.tool_name.clone()).or_insert(0) += 1;
+                    profile.episode_failures += 1;
+                    *profile
+                        .episode_failed_tools
+                        .entry(output.tool_name.clone())
+                        .or_insert(0) += 1;
                 }
             }
+            RuntimeEvent::TaskCompleted { .. } => in_episode = false,
             _ => {}
         }
     }
@@ -1518,7 +1544,7 @@ pub fn render_metrics(metrics: &RunMetrics) -> String {
          negative_facts: recorded={} reused={} invalidated={} promoted={} resolved={}\n\
          verification_passes: recorded={} reused={}\n\
          turn_tail: max_rounds={} p95_rounds={}\n\
-         settlement: seen={} pre_rounds={} pre_calls={} post_rounds={} post_calls={}\n",
+         settlement: seen={} episodes={} episode_rounds={} episode_calls={} episode_failures={}\n",
         metrics.model_input_tokens,
         metrics.model_output_tokens,
         metrics.model_cached_input_tokens,
@@ -1696,10 +1722,10 @@ pub fn render_metrics(metrics: &RunMetrics) -> String {
         metrics.max_turn_rounds,
         metrics.p95_turn_rounds,
         metrics.settled_seen,
-        metrics.pre_settlement_rounds,
-        metrics.pre_settlement_calls,
-        metrics.post_settlement_rounds,
-        metrics.post_settlement_calls,
+        metrics.settlement_episodes,
+        metrics.settlement_episode_rounds,
+        metrics.settlement_episode_calls,
+        metrics.settlement_episode_failures,
     )
 }
 
@@ -2956,7 +2982,7 @@ mod tests {
     }
 
     #[test]
-    fn post_settlement_tail_is_split_at_the_first_settled_event() {
+    fn settlement_episodes_charge_only_work_inside_candidate_episodes() {
         let run = RunId::new();
         let turn_id = TurnId::new();
         let events = vec![
@@ -2970,16 +2996,16 @@ mod tests {
         assert!(metrics.settled_seen);
         assert_eq!(metrics.rounds, 2);
         assert_eq!(metrics.tool_calls, 2);
-        assert_eq!(metrics.pre_settlement_rounds, 1);
-        assert_eq!(metrics.pre_settlement_calls, 1);
-        assert_eq!(metrics.post_settlement_rounds, 1);
-        assert_eq!(metrics.post_settlement_calls, 1);
+        assert_eq!(metrics.settlement_episodes, 1);
+        assert_eq!(metrics.settlement_episode_rounds, 1);
+        assert_eq!(metrics.settlement_episode_calls, 1);
+        assert_eq!(metrics.settlement_episode_failures, 0);
         let rendered = render_metrics(&metrics);
-        assert!(rendered.contains("settlement: seen=true pre_rounds=1 pre_calls=1 post_rounds=1 post_calls=1"));
+        assert!(rendered.contains("settlement: seen=true episodes=1 episode_rounds=1 episode_calls=1 episode_failures=0"));
     }
 
     #[test]
-    fn never_settled_keeps_the_whole_run_in_pre() {
+    fn never_settled_reports_zero_episodes() {
         let run = RunId::new();
         let turn_id = TurnId::new();
         let events = vec![
@@ -2988,14 +3014,53 @@ mod tests {
         ];
         let metrics = aggregate_metrics(&events);
         assert!(!metrics.settled_seen);
-        assert_eq!(metrics.pre_settlement_rounds, 1);
-        assert_eq!(metrics.pre_settlement_calls, 1);
-        assert_eq!(metrics.post_settlement_rounds, 0);
-        assert_eq!(metrics.post_settlement_calls, 0);
+        assert_eq!(metrics.settlement_episodes, 0);
+        assert_eq!(metrics.settlement_episode_rounds, 0);
+        assert_eq!(metrics.settlement_episode_calls, 0);
+        assert_eq!(metrics.settlement_episode_failures, 0);
     }
 
     #[test]
-    fn post_settlement_profile_counts_every_later_delta_and_tool_result() {
+    fn phase_two_work_after_reopen_is_not_charged_to_the_episode() {
+        let run = RunId::new();
+        let turn_id = TurnId::new();
+        let reopened = || RuntimeEvent::ExecutionFrontier {
+            delta: FrontierDelta::ObservedWorldChange,
+            actions_since_frontier_advance: 0,
+            evidence_revision: 2,
+            invalidated: 1,
+            settlement: Some(SettlementLabel::Working),
+        };
+        let events = vec![
+            envelope(run, 1, settled_frontier()),
+            envelope(run, 2, planned_surface(turn_id, 0)),
+            envelope(run, 3, started_call("c1")),
+            envelope(run, 4, reopened()),
+            envelope(run, 5, planned_surface(turn_id, 1)),
+            envelope(run, 6, started_call("c2")),
+            envelope(run, 7, settled_frontier()),
+            envelope(run, 8, planned_surface(turn_id, 2)),
+        ];
+        let metrics = aggregate_metrics(&events);
+        assert!(metrics.settled_seen);
+        assert_eq!(metrics.rounds, 3, "whole-cell totals keep all rounds");
+        assert_eq!(metrics.tool_calls, 2, "whole-cell totals keep all calls");
+        assert_eq!(
+            metrics.settlement_episodes, 2,
+            "a reopen closes the first episode and a later entry opens a second"
+        );
+        assert_eq!(
+            metrics.settlement_episode_rounds, 2,
+            "phase-two round 2 is not billed to either episode"
+        );
+        assert_eq!(
+            metrics.settlement_episode_calls, 1,
+            "the phase-two call is not billed to the first episode"
+        );
+    }
+
+    #[test]
+    fn settlement_episode_profile_counts_deltas_and_results_inside_episodes() {
         let run = RunId::new();
         let events = vec![
             envelope(
@@ -3074,35 +3139,35 @@ mod tests {
                 },
             ),
         ];
-        let profile = post_settlement_profile(&events);
-        assert_eq!(profile.settled_at_seq, Some(2));
-        assert_eq!(profile.failed_outputs, 1);
+        let profile = settlement_episode_profile(&events);
+        assert_eq!(profile.first_settled_at_seq, Some(2));
+        assert_eq!(profile.episodes, 1);
+        assert_eq!(profile.episode_failures, 1);
+        assert_eq!(profile.episode_rounds, 0, "no surface events inside the episode");
         assert_eq!(
-            profile.deltas,
-            [("no_progress".to_string(), 1), ("observed_world_change".to_string(), 1)]
-                .into_iter()
-                .collect()
-        );
-        assert_eq!(
-            profile.tool_calls,
+            profile.episode_deltas,
             [
-                ("fs.read".to_string(), 1),
-                ("edit.patch".to_string(), 1),
-                ("verify.run".to_string(), 1),
+                ("evidence_advanced".to_string(), 1),
+                ("no_progress".to_string(), 1),
+                ("observed_world_change".to_string(), 1),
             ]
             .into_iter()
             .collect()
         );
-        assert_eq!(profile.failed_tools, [("edit.patch".to_string(), 1)].into_iter().collect());
+        assert_eq!(
+            profile.episode_failed_tools,
+            [("edit.patch".to_string(), 1)].into_iter().collect()
+        );
 
-        let none = post_settlement_profile(&[]);
-        assert_eq!(none.settled_at_seq, None);
-        assert!(none.deltas.is_empty());
-        assert_eq!(none.failed_outputs, 0);
+        let none = settlement_episode_profile(&[]);
+        assert_eq!(none.first_settled_at_seq, None);
+        assert_eq!(none.episodes, 0);
+        assert!(none.episode_deltas.is_empty());
+        assert_eq!(none.episode_failures, 0);
     }
 
     #[test]
-    fn repeated_settled_events_do_not_move_the_split_point() {
+    fn repeated_settled_events_do_not_open_a_new_episode() {
         let run = RunId::new();
         let turn_id = TurnId::new();
         let events = vec![
@@ -3113,9 +3178,8 @@ mod tests {
             envelope(run, 5, planned_surface(turn_id, 1)),
         ];
         let metrics = aggregate_metrics(&events);
-        assert_eq!(metrics.pre_settlement_rounds, 1);
-        assert_eq!(metrics.pre_settlement_calls, 0);
-        assert_eq!(metrics.post_settlement_rounds, 1);
-        assert_eq!(metrics.post_settlement_calls, 1);
+        assert_eq!(metrics.settlement_episodes, 1);
+        assert_eq!(metrics.settlement_episode_rounds, 1);
+        assert_eq!(metrics.settlement_episode_calls, 1);
     }
 }

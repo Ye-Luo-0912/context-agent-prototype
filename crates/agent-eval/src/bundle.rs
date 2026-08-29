@@ -899,10 +899,10 @@ fn metrics_json(metrics: &RunMetrics) -> serde_json::Value {
                 "selected_tokens_reactivated": metrics.selected_tokens_reactivated,
                 "selected_tokens_resident": metrics.selected_tokens_resident,
                 "settlement_seen": metrics.settled_seen,
-                "settlement_pre_rounds": metrics.pre_settlement_rounds,
-                "settlement_pre_calls": metrics.pre_settlement_calls,
-                "settlement_post_rounds": metrics.post_settlement_rounds,
-                "settlement_post_calls": metrics.post_settlement_calls,
+                "settlement_episodes": metrics.settlement_episodes,
+                "settlement_episode_rounds": metrics.settlement_episode_rounds,
+                "settlement_episode_calls": metrics.settlement_episode_calls,
+                "settlement_episode_failures": metrics.settlement_episode_failures,
             })
             .as_object()
             .cloned()
@@ -1134,24 +1134,25 @@ mod tests {
     fn metrics_json_carries_settlement_exposure() {
         let metrics = RunMetrics {
             settled_seen: true,
-            pre_settlement_rounds: 3,
-            pre_settlement_calls: 2,
-            post_settlement_rounds: 1,
-            post_settlement_calls: 1,
+            settlement_episodes: 1,
+            settlement_episode_rounds: 3,
+            settlement_episode_calls: 2,
+            settlement_episode_failures: 1,
             ..Default::default()
         };
         let value = metrics_json(&metrics);
         assert_eq!(value["settlement_seen"], true);
-        assert_eq!(value["settlement_pre_rounds"], 3);
-        assert_eq!(value["settlement_pre_calls"], 2);
-        assert_eq!(value["settlement_post_rounds"], 1);
-        assert_eq!(value["settlement_post_calls"], 1);
+        assert_eq!(value["settlement_episodes"], 1);
+        assert_eq!(value["settlement_episode_rounds"], 3);
+        assert_eq!(value["settlement_episode_calls"], 2);
+        assert_eq!(value["settlement_episode_failures"], 1);
 
         let none = metrics_json(&RunMetrics::default());
         assert_eq!(none["settlement_seen"], false);
-        assert_eq!(none["settlement_pre_rounds"], 0);
-        assert_eq!(none["settlement_post_rounds"], 0);
-        assert_eq!(none["settlement_post_calls"], 0);
+        assert_eq!(none["settlement_episodes"], 0);
+        assert_eq!(none["settlement_episode_rounds"], 0);
+        assert_eq!(none["settlement_episode_calls"], 0);
+        assert_eq!(none["settlement_episode_failures"], 0);
     }
 
     #[test]

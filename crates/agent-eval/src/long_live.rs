@@ -593,14 +593,16 @@ pub struct CellOutcome {
     /// The model called `task.complete` after an offer was live.
     pub opportunity_called: bool,
     /// Event-derived settlement exposure: at least one
-    /// `ExecutionFrontier` carried `SettledCandidate`, and how many
-    /// rounds/calls happened before and after that first settled event.
-    /// Zero exposure makes a convergence gate inconclusive, never a pass.
+    /// `ExecutionFrontier` carried `SettledCandidate` (exposure means a
+    /// convergence gate can at least be evaluated; zero exposure is
+    /// inconclusive). Candidate episodes and the rounds/calls/failures
+    /// charged to them replace the old first-candidate lifetime counters;
+    /// phase-two work after a reopen is never billed to an earlier episode.
     pub settlement_seen: bool,
-    pub settlement_pre_rounds: u64,
-    pub settlement_pre_calls: u64,
-    pub settlement_post_rounds: u64,
-    pub settlement_post_calls: u64,
+    pub settlement_episodes: u64,
+    pub settlement_episode_rounds: u64,
+    pub settlement_episode_calls: u64,
+    pub settlement_episode_failures: u64,
 }
 
 impl CellOutcome {
@@ -650,10 +652,10 @@ impl CellOutcome {
             opportunity_called: false,
             recovery_surface: switches.recovery_surface,
             settlement_seen: false,
-            settlement_pre_rounds: 0,
-            settlement_pre_calls: 0,
-            settlement_post_rounds: 0,
-            settlement_post_calls: 0,
+            settlement_episodes: 0,
+            settlement_episode_rounds: 0,
+            settlement_episode_calls: 0,
+            settlement_episode_failures: 0,
         }
     }
 
@@ -680,11 +682,11 @@ impl CellOutcome {
         };
         let settlement = if self.settlement_seen {
             format!(
-                " settled=seen pre_rounds={} pre_calls={} post_rounds={} post_calls={}",
-                self.settlement_pre_rounds,
-                self.settlement_pre_calls,
-                self.settlement_post_rounds,
-                self.settlement_post_calls
+                " settled=seen episodes={} episode_rounds={} episode_calls={} episode_failures={}",
+                self.settlement_episodes,
+                self.settlement_episode_rounds,
+                self.settlement_episode_calls,
+                self.settlement_episode_failures
             )
         } else {
             " settled=none".to_string()
@@ -1659,10 +1661,10 @@ pub async fn run_pack_cell(
         opportunity_offers,
         opportunity_called,
         settlement_seen: metrics.settled_seen,
-        settlement_pre_rounds: metrics.pre_settlement_rounds,
-        settlement_pre_calls: metrics.pre_settlement_calls,
-        settlement_post_rounds: metrics.post_settlement_rounds,
-        settlement_post_calls: metrics.post_settlement_calls,
+        settlement_episodes: metrics.settlement_episodes,
+        settlement_episode_rounds: metrics.settlement_episode_rounds,
+        settlement_episode_calls: metrics.settlement_episode_calls,
+        settlement_episode_failures: metrics.settlement_episode_failures,
     };
     write_evidence(
         pair,

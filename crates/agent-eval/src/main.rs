@@ -1580,22 +1580,22 @@ async fn run_conv_gate(
             .iter()
             .map(|cell| (cell.model_rounds_phase_one + cell.model_rounds_phase_two) as u64)
             .collect();
-        let mut post_rounds: Vec<u64> = exposed
+        let mut episode_rounds: Vec<u64> = exposed
             .iter()
-            .map(|cell| cell.settlement_post_rounds)
+            .map(|cell| cell.settlement_episode_rounds)
             .collect();
-        let mut post_calls: Vec<u64> =
-            exposed.iter().map(|cell| cell.settlement_post_calls).collect();
+        let mut episode_calls: Vec<u64> =
+            exposed.iter().map(|cell| cell.settlement_episode_calls).collect();
         println!(
-            "{:<6} cells={} passed={} median_total_rounds={} max_total_rounds={} exposed={} median_post_rounds={} median_post_calls={} completed={}",
+            "{:<6} cells={} passed={} median_total_rounds={} max_total_rounds={} exposed={} median_episode_rounds={} median_episode_calls={} completed={}",
             mode.id(),
             cells.len(),
             cells.iter().filter(|cell| cell.passed).count(),
             checked_percentile(&mut total_rounds, 50).unwrap_or(0),
             total_rounds.iter().copied().max().unwrap_or(0),
             exposed.len(),
-            checked_percentile(&mut post_rounds, 50).unwrap_or(0),
-            checked_percentile(&mut post_calls, 50).unwrap_or(0),
+            checked_percentile(&mut episode_rounds, 50).unwrap_or(0),
+            checked_percentile(&mut episode_calls, 50).unwrap_or(0),
             cells.iter().filter(|cell| cell.closure == "completed").count(),
         );
         if exposed.len() != cells.len() {
@@ -1638,7 +1638,7 @@ async fn run_conv_tail(evidence_dir: Option<std::path::PathBuf>) -> anyhow::Resu
                 continue;
             }
             let events = load_events_jsonl(&events_path)?;
-            let profile = crate::metrics::post_settlement_profile(&events);
+            let profile = crate::metrics::settlement_episode_profile(&events);
             rows.push((
                 pair_name.clone(),
                 repeat.file_name().to_string_lossy().into_owned(),
@@ -1648,9 +1648,9 @@ async fn run_conv_tail(evidence_dir: Option<std::path::PathBuf>) -> anyhow::Resu
         }
     }
     rows.sort_by(|left, right| left.0.cmp(&right.0).then(left.1.cmp(&right.1)));
-    println!("== post-settlement tail profile (read-only, from {} ) ==", evidence_root.display());
+    println!("== settlement episode profile (read-only, from {} ) ==", evidence_root.display());
     println!(
-        "pair                         rep events  settled   no_prog redundant advanced world_ch invalid reconf resolved failed tools(read/verify/edit/process/shell)"
+        "pair                         rep events  episodes first_seq no_prog redundant advanced world_ch invalid reconf resolved episode_failed tools(read/verify/edit/process/shell)"
     );
     let mut mode_medians: std::collections::BTreeMap<String, Vec<(u64, u64, u64)>> =
         std::collections::BTreeMap::new();
@@ -1661,21 +1661,22 @@ async fn run_conv_tail(evidence_dir: Option<std::path::PathBuf>) -> anyhow::Resu
             .filter(|suffix| *suffix == "normal" || *suffix == "resume")
             .unwrap_or(pair)
             .to_string();
-        let delta = |name: &str| profile.deltas.get(name).copied().unwrap_or(0);
-        let tool = |name: &str| profile.tool_calls.get(name).copied().unwrap_or(0);
-        let failed = |name: &str| profile.failed_tools.get(name).copied().unwrap_or(0);
+        let delta = |name: &str| profile.episode_deltas.get(name).copied().unwrap_or(0);
+        let tool = |name: &str| profile.episode_tool_calls.get(name).copied().unwrap_or(0);
+        let failed = |name: &str| profile.episode_failed_tools.get(name).copied().unwrap_or(0);
         let settled = profile
-            .settled_at_seq
+            .first_settled_at_seq
             .map(|seq| format!("seq:{seq}"))
             .unwrap_or_else(|| "none".into());
         let (read, verify) = (tool("fs.read"), tool("verify.run"));
         let (edits, failed_edits) = (tool("edit.patch"), failed("edit.patch"));
         let (process, shell) = (tool("process.run"), tool("shell.exec"));
         println!(
-            "{:<28} {:<3} {:<7} {:<8} {:<7} {:<6} {:<6} {:<7} {:<7} {:<6} {:<8} {:<8} {} {} {}",
+            "{:<28} {:<3} {:<7} {:<6} {:<9} {:<7} {:<6} {:<6} {:<7} {:<7} {:<6} {:<8} {:<14} {} {} {}",
             pair,
             repeat,
             event_count,
+            profile.episodes,
             settled,
             delta("no_progress"),
             delta("redundant_evidence"),
@@ -1684,7 +1685,7 @@ async fn run_conv_tail(evidence_dir: Option<std::path::PathBuf>) -> anyhow::Resu
             delta("world_invalidated_unknown"),
             delta("evidence_reconfirmed"),
             delta("obligation_resolved"),
-            profile.failed_outputs,
+            profile.episode_failures,
             format_args!("{read}/{verify}"),
             format_args!("{edits}(er:{failed_edits})"),
             format_args!("{process}/{shell}"),
@@ -1692,7 +1693,7 @@ async fn run_conv_tail(evidence_dir: Option<std::path::PathBuf>) -> anyhow::Resu
         mode_medians
             .entry(mode)
             .or_default()
-            .push((delta("no_progress"), delta("redundant_evidence"), profile.failed_outputs));
+            .push((delta("no_progress"), delta("redundant_evidence"), profile.episode_failures));
     }
     println!();
     for (mode, samples) in &mode_medians {
@@ -1700,7 +1701,7 @@ async fn run_conv_tail(evidence_dir: Option<std::path::PathBuf>) -> anyhow::Resu
         let mut redundant: Vec<u64> = samples.iter().map(|row| row.1).collect();
         let mut failed: Vec<u64> = samples.iter().map(|row| row.2).collect();
         println!(
-            "{:<6} median post no_progress={} redundant={} failed_outputs={} (n={})",
+            "{:<6} median episode no_progress={} redundant={} episode_failed={} (n={})",
             mode,
             checked_percentile(&mut no_progress, 50).unwrap_or(0),
             checked_percentile(&mut redundant, 50).unwrap_or(0),
