@@ -140,3 +140,35 @@ Both arms of the one-cell product preflight now pass on the pinned serving
 with the frozen calibrated fixture; the pre-window preflight item is cleared.
 Still not a formal M15 cell and no efficiency claim; M15 stays open until one
 complete clean-tree 12-cell v3 window passes.
+
+## 2026-08-29 provider prefix-cache accounting (live measurement)
+
+Added after the first formal window: the provider usage parser and every
+eval surface previously discarded `cached_tokens`, so window cost could not
+distinguish cached from fresh input. The evaluator now records
+`input_tokens_details.cached_tokens` (Responses) and
+`prompt_tokens_details.cached_tokens` (chat) through `ModelUsage` into the
+`ModelUsed` event, `RunMetrics.model_cached_input_tokens`, the cell
+summary, the `--conv-tail`/live cost line and the mechanical window report.
+
+A repeat `retry_diag_dev` normal cell on the same serving (evidence
+`retry_diag_dev-normal/r1-attempt3/`, clean HEAD `a2f961b`) measured the
+relay's actual prefix caching:
+
+| round | input | cached | | round | input | cached |
+| --- | ---: | ---: | --- | --- | ---: | ---: |
+| 1 | 6,269 | 5,632 | | 4 | 9,759 | 0 |
+| 2 | 7,702 | 6,656 | | 5 | 11,025 | 0 |
+| 3 | 9,217 | 5,632 | | 6 | 10,990 | 0 |
+
+The relay does return prefix-cached tokens (17,920 of 54,962 input ≈ 33% in
+this cell, all in the first three rounds), but the cache drops to zero from
+round 4 onward even though the prompt layers stay structurally stable
+(fixed system/anchor/focus/tools/catalog; only the turn frame and progress
+line grow) and the tool surface is identical each round. The break is at the
+relay, not in the client: the client keeps one stable appending prefix and
+there is no protocol-level way to force or pin the cached prefix beyond what
+the endpoint already reports. The cached input is now visible and billed
+correctly in every report; if the relay's cache policy (prefix window, TTL,
+round limit) is adjustable, it is the lever for the remaining
+uncached/round-4+ input.
