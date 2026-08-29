@@ -610,6 +610,12 @@ pub struct ModelRequest {
 pub struct ModelUsage {
     pub input_tokens: Option<u64>,
     pub output_tokens: Option<u64>,
+    /// Provider-reported prompt tokens served from a prefix cache
+    /// (`input_tokens_details.cached_tokens` for Responses,
+    /// `prompt_tokens_details.cached_tokens` for Chat Completions).
+    /// `None` when the provider did not report them.
+    #[serde(default)]
+    pub cached_input_tokens: Option<u64>,
     /// Transport attempts that produced this output. `0` on legacy events
     /// means unknown (treat as one successful attempt). Failed attempts
     /// usually report no usage, so recorded tokens are a lower bound when
@@ -1026,6 +1032,7 @@ mod tests {
         let billed = ModelUsage {
             input_tokens: Some(12),
             output_tokens: Some(0),
+            cached_input_tokens: Some(4),
             attempts: 1,
             retries: 0,
         };

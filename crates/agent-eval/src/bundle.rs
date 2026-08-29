@@ -716,6 +716,7 @@ fn metrics_json(metrics: &RunMetrics) -> serde_json::Value {
     let mut value = json!({
         "model_input_tokens": metrics.model_input_tokens,
         "model_output_tokens": metrics.model_output_tokens,
+        "model_cached_input_tokens": metrics.model_cached_input_tokens,
         "schema_tokens_total": metrics.schema_tokens_total,
         "rounds": metrics.rounds,
         "turns": metrics.turns,

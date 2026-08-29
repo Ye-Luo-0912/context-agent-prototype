@@ -978,7 +978,7 @@ mod tests {
             let sse = concat!(
                 "data: {\"type\":\"response.output_item.added\",\"output_index\":0,\"item\":{\"type\":\"function_call\",\"call_id\":\"call_1\",\"name\":\"fs_list\",\"arguments\":\"\"}}\n\n",
                 "data: {\"type\":\"response.function_call_arguments.delta\",\"output_index\":0,\"item_id\":\"fc_1\",\"delta\":\"{}\"}\n\n",
-                "data: {\"type\":\"response.completed\",\"response\":{\"usage\":{\"input_tokens\":10,\"output_tokens\":2}}}\n\n",
+                "data: {\"type\":\"response.completed\",\"response\":{\"usage\":{\"input_tokens\":10,\"output_tokens\":2,\"input_tokens_details\":{\"cached_tokens\":6}}}}\n\n",
                 "data: [DONE]\n\n",
             );
             let response = format!(
@@ -999,6 +999,7 @@ mod tests {
         assert_eq!(output.tool_calls[0].arguments, json!({}));
         assert_eq!(output.usage.input_tokens, Some(10));
         assert_eq!(output.usage.output_tokens, Some(2));
+        assert_eq!(output.usage.cached_input_tokens, Some(6));
         server.await.unwrap();
     }
 

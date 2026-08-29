@@ -70,6 +70,13 @@ pub struct WireFunctionDelta {
 pub struct WireUsage {
     pub prompt_tokens: Option<u64>,
     pub completion_tokens: Option<u64>,
+    #[serde(default)]
+    pub prompt_tokens_details: Option<WirePromptTokensDetails>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct WirePromptTokensDetails {
+    pub cached_tokens: Option<u64>,
 }
 
 #[derive(Debug, Default)]
@@ -108,6 +115,10 @@ impl StreamAccumulator {
             self.usage = Some(ModelUsage {
                 input_tokens: usage.prompt_tokens,
                 output_tokens: usage.completion_tokens,
+                cached_input_tokens: usage
+                    .prompt_tokens_details
+                    .as_ref()
+                    .and_then(|details| details.cached_tokens),
                 ..Default::default()
             });
         }
@@ -272,13 +283,14 @@ mod tests {
     fn captures_usage_from_stream() {
         let mut acc = StreamAccumulator::default();
         let chunk: WireChunk = serde_json::from_str(
-            r#"{"choices":[{"index":0,"delta":{},"finish_reason":"stop"}],"usage":{"prompt_tokens":120,"completion_tokens":45,"total_tokens":165}}"#,
+            r#"{"choices":[{"index":0,"delta":{},"finish_reason":"stop"}],"usage":{"prompt_tokens":120,"completion_tokens":45,"total_tokens":165,"prompt_tokens_details":{"cached_tokens":30}}}"#,
         )
         .unwrap();
         acc.apply(&chunk);
         let usage = acc.usage.expect("usage should be captured");
         assert_eq!(usage.input_tokens, Some(120));
         assert_eq!(usage.output_tokens, Some(45));
+        assert_eq!(usage.cached_input_tokens, Some(30));
     }
 
     #[test]

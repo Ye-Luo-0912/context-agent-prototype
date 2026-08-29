@@ -187,6 +187,9 @@ impl ResponsesAccumulator {
         self.usage = Some(ModelUsage {
             input_tokens: usage.get("input_tokens").and_then(Value::as_u64),
             output_tokens: usage.get("output_tokens").and_then(Value::as_u64),
+            cached_input_tokens: usage
+                .pointer("/input_tokens_details/cached_tokens")
+                .and_then(Value::as_u64),
             ..Default::default()
         });
     }

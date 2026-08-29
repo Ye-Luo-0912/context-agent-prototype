@@ -602,6 +602,10 @@ pub enum RuntimeEvent {
     ModelUsed {
         input_tokens: u64,
         output_tokens: u64,
+        /// Provider-reported prefix-cached input tokens for this round;
+        /// `0` when the provider did not report cache details.
+        #[serde(default)]
+        cached_input_tokens: u64,
         #[serde(default)]
         attempts: u32,
         #[serde(default)]

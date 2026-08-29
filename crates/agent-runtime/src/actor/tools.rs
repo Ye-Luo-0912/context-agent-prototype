@@ -948,6 +948,7 @@ impl RuntimeActor {
                     .emit_event(RuntimeEvent::ModelUsed {
                         input_tokens: usage.input_tokens.unwrap_or(0),
                         output_tokens: usage.output_tokens.unwrap_or(0),
+                        cached_input_tokens: usage.cached_input_tokens.unwrap_or(0),
                         attempts: usage.attempts.max(1),
                         retries: usage.retries,
                     })

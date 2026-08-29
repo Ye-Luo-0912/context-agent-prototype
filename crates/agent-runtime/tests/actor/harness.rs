@@ -645,6 +645,7 @@ impl ModelTransport for SilentModel {
             usage: ModelUsage {
                 input_tokens: Some(1),
                 output_tokens: Some(1),
+                cached_input_tokens: Some(0),
                 attempts: 1,
                 retries: 0,
             },

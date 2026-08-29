@@ -28,6 +28,9 @@ pub struct RunMetrics {
     pub model_input_tokens: u64,
     /// Provider-reported output tokens (`ModelUsed`).
     pub model_output_tokens: u64,
+    /// Provider-reported prefix-cached input tokens (`ModelUsed`); 0 when
+    /// the provider did not report cache details.
+    pub model_cached_input_tokens: u64,
     /// Transport attempts that produced a `ModelUsed` (successful round).
     pub model_attempts: u64,
     /// Retries inside those successful rounds (`attempts - 1` per event).
@@ -1008,11 +1011,13 @@ pub fn aggregate_metrics(events: &[RuntimeEventEnvelope]) -> RunMetrics {
             RuntimeEvent::ModelUsed {
                 input_tokens,
                 output_tokens,
+                cached_input_tokens,
                 attempts,
                 retries,
             } => {
                 metrics.model_input_tokens += input_tokens;
                 metrics.model_output_tokens += output_tokens;
+                metrics.model_cached_input_tokens += cached_input_tokens;
                 let attempts = (*attempts).max(1) as u64;
                 metrics.model_attempts = metrics.model_attempts.saturating_add(attempts);
                 metrics.model_retries = metrics.model_retries.saturating_add(*retries as u64);
@@ -1482,7 +1487,7 @@ fn selection_reason_class(reason: &str) -> &'static str {
 /// Human-readable metric block for one run.
 pub fn render_metrics(metrics: &RunMetrics) -> String {
     format!(
-        "cost: model_in={} model_out={} attempts={} retries={} tokens_lower_bound={} schema_tokens={} rounds={} turns={} lifecycle_transitions={}\n\
+        "cost: model_in={} model_out={} cached_in={} attempts={} retries={} tokens_lower_bound={} schema_tokens={} rounds={} turns={} lifecycle_transitions={}\n\
          gc: evictions={} reactivations={} externalizations={}\n\
          materialize: rounds={} selected_items={} selected_tokens={} active_tokens={}\n\
          materialize_latency: p50={}ms p95={}ms\n\
@@ -1516,6 +1521,7 @@ pub fn render_metrics(metrics: &RunMetrics) -> String {
          settlement: seen={} pre_rounds={} pre_calls={} post_rounds={} post_calls={}\n",
         metrics.model_input_tokens,
         metrics.model_output_tokens,
+        metrics.model_cached_input_tokens,
         metrics.model_attempts,
         metrics.model_retries,
         metrics.provider_tokens_lower_bound,
@@ -1916,6 +1922,7 @@ mod tests {
             RuntimeEvent::ModelUsed {
                 input_tokens: 9_000,
                 output_tokens: 120,
+                cached_input_tokens: 2_500,
                 attempts: 1,
                 retries: 0,
             },
@@ -2018,6 +2025,7 @@ mod tests {
         assert_eq!(metrics.schema_tokens_total, 512);
         assert_eq!(metrics.model_input_tokens, 9_000);
         assert_eq!(metrics.model_output_tokens, 120);
+        assert_eq!(metrics.model_cached_input_tokens, 2_500);
         assert_eq!(metrics.model_attempts, 1);
         assert!(!metrics.provider_tokens_lower_bound);
         assert_eq!(metrics.prompt_task_progress_tokens, 40);

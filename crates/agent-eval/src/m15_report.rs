@@ -467,6 +467,10 @@ fn render_cells(cells: &[Cell]) -> RenderedWindow {
         .iter()
         .map(|cell| metric(cell, "model_output_tokens"))
         .sum();
+    let total_cached_input_tokens: u64 = ordered
+        .iter()
+        .map(|cell| metric(cell, "model_cached_input_tokens"))
+        .sum();
     let total_schema_tokens: u64 = ordered
         .iter()
         .map(|cell| metric(cell, "schema_tokens_total"))
@@ -517,7 +521,7 @@ fn render_cells(cells: &[Cell]) -> RenderedWindow {
         ));
     }
     markdown.push_str(&format!(
-        "\nSummary: pass {passed}/{total}; NOT_RUN {not_run}/{total}; behavior pass {behavior_pass}/{total}; closures {closures}/{total}.\n\nEfficiency facts: rounds total/max {total_rounds}/{max_rounds}; tool calls total/max {total_tools}/{max_tools}; wall max {max_wall_ms} ms; provider input/output tokens {total_input_tokens}/{total_output_tokens}; schema tokens {total_schema_tokens}. Token totals remain lower bounds when a cell's summary marks provider usage incomplete.\n",
+        "\nSummary: pass {passed}/{total}; NOT_RUN {not_run}/{total}; behavior pass {behavior_pass}/{total}; closures {closures}/{total}.\n\nEfficiency facts: rounds total/max {total_rounds}/{max_rounds}; tool calls total/max {total_tools}/{max_tools}; wall max {max_wall_ms} ms; provider input/output tokens {total_input_tokens}/{total_output_tokens} (cached input {total_cached_input_tokens}); schema tokens {total_schema_tokens}. Token totals remain lower bounds when a cell's summary marks provider usage incomplete.\n",
         total = ordered.len()
     ));
     RenderedWindow {

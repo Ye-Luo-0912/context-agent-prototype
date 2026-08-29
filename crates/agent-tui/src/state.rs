@@ -705,6 +705,7 @@ impl AppState {
                 output_tokens,
                 attempts,
                 retries,
+                ..
             } => {
                 self.input_tokens += input_tokens;
                 self.output_tokens += output_tokens;
