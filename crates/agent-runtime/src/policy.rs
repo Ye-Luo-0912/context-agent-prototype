@@ -240,6 +240,7 @@ mod tests {
                 Vec::new()
             },
             evidence_refs: Vec::new(),
+            acceptance_coverage: Vec::new(),
         }
     }
 

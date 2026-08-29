@@ -67,6 +67,21 @@ pub struct TaskToolRequirementSet {
     pub entries: Vec<ToolSurfaceRequirement>,
 }
 
+/// One bounded acceptance-coverage claim: the acceptance criterion at
+/// `criterion_index` is declared covered by a specific verification
+/// identity. The identity must resolve to the execution's current trusted
+/// verification pass (which already binds task anchor, directive and
+/// workspace revisions), so a stale or fabricated identity never counts.
+/// Free-form "done" text cannot establish coverage.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub struct AcceptanceCoverage {
+    /// Index into `TaskAnchor.acceptance_criteria` (stable ordering).
+    pub criterion_index: u32,
+    /// `VerificationFact.verification_identity` the claim links to.
+    pub verification_identity: String,
+}
+
 /// The actor-owned, bounded, versioned anchor of one task.
 ///
 /// The anchor is task authority: it lives with the `TaskManager`, never as a
@@ -103,6 +118,11 @@ pub struct TaskAnchor {
     pub constraints: Vec<String>,
     /// Acceptance criteria the completion outcome is measured against.
     pub acceptance_criteria: Vec<String>,
+    /// Bounded acceptance-coverage claims linking each criterion to a
+    /// current verification identity. A claim counts only while its
+    /// identity resolves to the execution's trusted Current pass.
+    #[serde(default)]
+    pub acceptance_coverage: Vec<AcceptanceCoverage>,
     /// Ordered plan progress: what has been done and what is next.
     pub plan_progress: Vec<String>,
     /// Open loops the task is still working: unresolved questions,
@@ -137,6 +157,9 @@ pub struct AnchorPatch {
     pub current_interpretation: Option<String>,
     /// `TaskAnchor.acceptance_criteria` — autonomous.
     pub acceptance_criteria: Option<Vec<String>>,
+    /// `TaskAnchor.acceptance_coverage` — autonomous (must still resolve
+    /// to trusted verification facts; it never rewrites user authority).
+    pub acceptance_coverage: Option<Vec<AcceptanceCoverage>>,
     /// `TaskAnchor.plan_progress` — autonomous.
     pub plan_progress: Option<Vec<String>>,
     /// `TaskAnchor.open_loops` — autonomous.
@@ -177,6 +200,9 @@ impl AnchorPatch {
         }
         if let Some(value) = &self.acceptance_criteria {
             next.acceptance_criteria = value.clone();
+        }
+        if let Some(value) = &self.acceptance_coverage {
+            next.acceptance_coverage = value.clone();
         }
         if let Some(value) = &self.plan_progress {
             next.plan_progress = value.clone();
@@ -1096,6 +1122,25 @@ pub(crate) fn normalize_anchor(anchor: &mut TaskAnchor) -> AgentResult<()> {
     ] {
         check_bounded_list(field, list)?;
     }
+    // Acceptance-coverage claims are bounded like the anchor lists, each
+    // identity is bounded text, and a claim must address a declared
+    // criterion (an out-of-range or fabricated index covers nothing).
+    if anchor.acceptance_coverage.len() > MAX_TASK_ANCHOR_LIST_ITEMS {
+        return Err(AgentError::InvalidRequest(format!(
+            "anchor acceptance_coverage carries {} claims, above the {MAX_TASK_ANCHOR_LIST_ITEMS} cap",
+            anchor.acceptance_coverage.len()
+        )));
+    }
+    for claim in &anchor.acceptance_coverage {
+        check_bounded_text("anchor acceptance_coverage identity", &claim.verification_identity)?;
+        if claim.criterion_index as usize >= anchor.acceptance_criteria.len() {
+            return Err(AgentError::InvalidRequest(format!(
+                "anchor acceptance_coverage addresses criterion {}, beyond the {} declared criteria",
+                claim.criterion_index,
+                anchor.acceptance_criteria.len()
+            )));
+        }
+    }
     check_bounded_text("anchor next_action", &anchor.next_action)?;
     for (field, claims) in [
         ("working_refs", &anchor.working_refs),
@@ -1158,6 +1203,11 @@ pub(crate) fn anchor_changed_fields(old: &TaskAnchor, new: &TaskAnchor) -> Vec<S
         &mut changed,
     );
     consider(
+        "acceptance_coverage",
+        old.acceptance_coverage != new.acceptance_coverage,
+        &mut changed,
+    );
+    consider(
         "plan_progress",
         old.plan_progress != new.plan_progress,
         &mut changed,
@@ -1195,6 +1245,67 @@ pub(crate) fn changed_fields_kind(changed_fields: &[String]) -> AnchorPatchKind 
     } else {
         AnchorPatchKind::Autonomous
     }
+}
+
+/// The bounded, model-neutral settlement fact projected only when the
+/// task-aware join has risen to `SettledCandidate`. It states the derived
+/// readiness facts and preserves the model's own choice of ordinary final,
+/// durable `task.complete`, or concrete continuation; it never instructs
+/// the model to stop and never auto-closes the task.
+pub(crate) const SETTLED_CANDIDATE_PROMPT_LINE: &str = "TASK SETTLED: every acceptance criterion \
+     is covered by a current trusted verification, the task epoch matches, and no open loop or \
+     next action remains. You may give an ordinary final answer, call task.complete for durable \
+     closure, or continue with concrete remaining work.";
+
+/// The task-aware settlement gate. `SettledCandidate` requires the
+/// execution-local world to be ready ([`ExecutionState::execution_ready`])
+/// and the task anchor to agree with it: the anchor epoch the execution
+/// tracked must be the anchor's current revision (boundary moves and
+/// reopenings invalidate readiness immediately), no open loop or next
+/// action may remain, and every declared acceptance criterion must carry a
+/// coverage claim resolving to the execution's current trusted verification
+/// pass. `in_flight_clear` is the actor gate: a live tool call or a pending
+/// cancel cleanup means the world is not settled even when the execution
+/// facts look ready. With no declared acceptance coverage the gate fails
+/// closed, so the strongest label stays `VerifiedCurrent`.
+pub fn task_ready(
+    anchor: &TaskAnchor,
+    execution: &crate::execution::ExecutionState,
+    in_flight_clear: bool,
+) -> bool {
+    if !in_flight_clear || !execution.execution_ready() {
+        return false;
+    }
+    if execution.anchor_revision != anchor.revision {
+        return false;
+    }
+    if !anchor.open_loops.is_empty() || !anchor.next_action.trim().is_empty() {
+        return false;
+    }
+    acceptance_covered(anchor, execution)
+}
+
+/// Whether every bounded acceptance criterion has live explicit evidence:
+/// a claim addressing exactly that criterion index whose verification
+/// identity is the execution's current trusted pass. A missing, stale or
+/// fabricated identity never covers, and zero declared criteria fail
+/// closed (no evidence coverage is claimed).
+fn acceptance_covered(anchor: &TaskAnchor, execution: &crate::execution::ExecutionState) -> bool {
+    if anchor.acceptance_criteria.is_empty() {
+        return false;
+    }
+    let Some(trusted) = execution.trusted_verification_identity() else {
+        return false;
+    };
+    anchor
+        .acceptance_criteria
+        .iter()
+        .enumerate()
+        .all(|(index, _)| {
+            anchor.acceptance_coverage.iter().any(|claim| {
+                claim.criterion_index as usize == index && claim.verification_identity == trusted
+            })
+        })
 }
 
 fn check_bounded_text(field: &str, value: &str) -> AgentResult<()> {
@@ -1426,6 +1537,7 @@ mod tests {
             current_interpretation: "interpretation".into(),
             constraints: vec!["c1".into()],
             acceptance_criteria: vec!["crit".into()],
+            acceptance_coverage: Vec::new(),
             plan_progress: vec!["done".into()],
             open_loops: vec!["loop".into()],
             next_action: "next step".into(),
@@ -2087,6 +2199,7 @@ mod tests {
             current_interpretation: "refactor the auth module".into(),
             constraints: vec!["no dependency changes".into()],
             acceptance_criteria: vec!["tests pass".into(), "api unchanged".into()],
+            acceptance_coverage: Vec::new(),
             plan_progress: vec!["read the module".into()],
             open_loops: vec!["verify edge cases".into()],
             next_action: "patch the second caller".into(),
@@ -2404,6 +2517,173 @@ mod tests {
         assert!(
             completion_from_execution(&state).is_err(),
             "required + no evidence must refuse"
+        );
+    }
+
+    /// An execution whose fact ledger looks exactly like a current trusted
+    /// verification world: one durable mutation and one exact attributed
+    /// PASS whose basis tuple matches every revision. Returns the identity
+    /// the anchor must claim.
+    fn settled_execution() -> (crate::execution::ExecutionState, String) {
+        let mut execution = crate::execution::ExecutionState {
+            anchor_revision: 1,
+            directive_revision: 2,
+            workspace_revision: 3,
+            ..crate::execution::ExecutionState::default()
+        };
+        execution.verification.spec_revision = 1;
+        execution.checked_files.push(crate::execution::ResourceFact {
+            path: "src/lib.rs".into(),
+            digest: "deadbeef".into(),
+            freshness: agent_contracts::ResourceFreshness::Fresh,
+            turn: 1,
+            provenance: crate::execution::ResourceProvenance::MutationResult,
+        });
+        execution.verifications.push(crate::execution::VerificationFact {
+            summary: "tests pass".into(),
+            ok: true,
+            turn: 1,
+            anchor_revision: 1,
+            workspace_revision: 3,
+            source_tool_name: "test.verify".into(),
+            argument_digest: "arg-a".into(),
+            verification_identity: "identity-a".into(),
+            directive_revision: 2,
+            evidence_ref: None,
+            recipe_provenance: None,
+        });
+        (execution, "identity-a".to_string())
+    }
+
+    fn settled_anchor(revision: u64) -> TaskAnchor {
+        TaskAnchor {
+            original_goal: "close the loop".into(),
+            revision,
+            acceptance_criteria: vec!["tests pass".into()],
+            acceptance_coverage: vec![AcceptanceCoverage {
+                criterion_index: 0,
+                verification_identity: "identity-a".into(),
+            }],
+            ..TaskAnchor::default()
+        }
+    }
+
+    #[test]
+    fn task_ready_accepts_the_fully_settled_task() {
+        let (execution, _) = settled_execution();
+        let anchor = settled_anchor(1);
+        assert!(task_ready(&anchor, &execution, true));
+    }
+
+    #[test]
+    fn task_ready_fails_closed_without_declared_coverage() {
+        let (execution, _) = settled_execution();
+        let mut anchor = settled_anchor(1);
+        anchor.acceptance_criteria.clear();
+        anchor.acceptance_coverage.clear();
+        assert!(
+            !task_ready(&anchor, &execution, true),
+            "no declared acceptance coverage must fail closed"
+        );
+    }
+
+    #[test]
+    fn task_ready_requires_a_live_claim_for_every_criterion() {
+        let (execution, _) = settled_execution();
+        let mut anchor = settled_anchor(1);
+        anchor.acceptance_criteria.push("no regressions".into());
+        assert!(
+            !task_ready(&anchor, &execution, true),
+            "a second criterion without a claim must not be covered"
+        );
+        anchor.acceptance_coverage.push(AcceptanceCoverage {
+            criterion_index: 1,
+            verification_identity: "identity-a".into(),
+        });
+        assert!(task_ready(&anchor, &execution, true));
+    }
+
+    #[test]
+    fn task_ready_rejects_stale_or_fabricated_identity() {
+        let (execution, _) = settled_execution();
+        let mut anchor = settled_anchor(1);
+        anchor.acceptance_coverage[0].verification_identity = "other-identity".into();
+        assert!(
+            !task_ready(&anchor, &execution, true),
+            "a claim that does not resolve to the current trusted pass covers nothing"
+        );
+
+        // A new directive moves the world: the old PASS no longer binds.
+        let mut moved = execution.clone();
+        moved.directive_revision = 3;
+        assert!(
+            !task_ready(&anchor, &moved, true),
+            "a new directive must invalidate readiness immediately"
+        );
+    }
+
+    #[test]
+    fn task_ready_rejects_open_loops_and_next_action() {
+        let (execution, _) = settled_execution();
+        let mut anchor = settled_anchor(1);
+        anchor.open_loops.push("verify edge cases".into());
+        assert!(!task_ready(&anchor, &execution, true));
+        anchor.open_loops.clear();
+        anchor.next_action = "write the missing test".into();
+        assert!(!task_ready(&anchor, &execution, true));
+    }
+
+    #[test]
+    fn task_ready_rejects_epoch_mismatch() {
+        let (execution, _) = settled_execution();
+        let anchor = settled_anchor(2);
+        assert!(
+            !task_ready(&anchor, &execution, true),
+            "the anchor epoch the execution tracked must be the current revision"
+        );
+    }
+
+    #[test]
+    fn task_ready_rejects_open_obligation_and_failed_command() {
+        let (execution, _) = settled_execution();
+        let anchor = settled_anchor(1);
+        let mut with_obligation = execution.clone();
+        with_obligation.obligations.push(crate::execution::ExecutionObligation {
+            domain: agent_contracts::ToolFailureDomain::ExecutableResolution,
+            scope_key: "scope-a".into(),
+            precondition: "fp-1".into(),
+            attempts: 1,
+            epoch: 0,
+            total_attempts: 1,
+            tried_targets: Vec::new(),
+            opened_at_evidence_revision: 1,
+            source_tool_name: String::new(),
+        });
+        assert!(!task_ready(&anchor, &with_obligation, true));
+
+        let mut with_failure = execution.clone();
+        with_failure.failed_commands.push(crate::execution::FailedCommandFact {
+            tool_name: "test.run".into(),
+            target: "pkg".into(),
+            summary: "crash".into(),
+            turn: 1,
+        });
+        assert!(!task_ready(&anchor, &with_failure, true));
+    }
+
+    #[test]
+    fn task_ready_rejects_in_flight_and_non_current_verification() {
+        let (execution, _) = settled_execution();
+        let anchor = settled_anchor(1);
+        assert!(
+            !task_ready(&anchor, &execution, false),
+            "a live tool or pending cleanup must block readiness"
+        );
+        let mut stale = execution.clone();
+        stale.verification.spec_revision = 2;
+        assert!(
+            !task_ready(&anchor, &stale, true),
+            "a non-current verification basis must block readiness"
         );
     }
 }

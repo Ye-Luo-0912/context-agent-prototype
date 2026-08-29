@@ -1171,10 +1171,10 @@ pub struct TaskProgressView {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub completion_opportunity: Option<String>,
     /// Derived settlement decision boundary: one bounded, neutral statement
-    /// projected only when the current work is verified and settled (or
-    /// verified with obligations still open). Not an instruction to stop;
-    /// the model keeps the choice of ordinary final, durable `task.complete`
-    /// or concrete continuation.
+    /// projected by the actor only when the task-aware join has risen to
+    /// `SettledCandidate` and the projection switch is on. Not an
+    /// instruction to stop; the model keeps the choice of ordinary final,
+    /// durable `task.complete` or concrete continuation.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub settlement: Option<String>,
 }
@@ -1190,6 +1190,7 @@ impl TaskProgressView {
             && self.failed_commands.is_empty()
             && self.operational_evidence.is_empty()
             && self.unresolved_blockers.is_empty()
+            && self.settlement.is_none()
     }
 
     /// Whether `Checked` already names this workspace path (`path` or

@@ -634,6 +634,7 @@ fn render_task_progress(progress: &TaskProgressView) -> String {
         &progress.unresolved_blockers,
         progress.stall_warning.as_deref(),
         progress.frontier_warning.as_deref(),
+        progress.settlement.as_deref(),
         progress.completion_opportunity.as_deref(),
     );
     while rendered.chars().count() > agent_contracts::MAX_TASK_PROGRESS_PROMPT_CHARS {
@@ -658,6 +659,7 @@ fn render_task_progress(progress: &TaskProgressView) -> String {
             &progress.unresolved_blockers,
             progress.stall_warning.as_deref(),
             progress.frontier_warning.as_deref(),
+            progress.settlement.as_deref(),
             progress.completion_opportunity.as_deref(),
         );
     }
@@ -682,6 +684,7 @@ fn format_task_progress(
     blockers: &[String],
     stall_warning: Option<&str>,
     frontier_warning: Option<&str>,
+    settlement: Option<&str>,
     completion_opportunity: Option<&str>,
 ) -> String {
     let mut out =
@@ -695,6 +698,12 @@ fn format_task_progress(
     // 收敛 advisory 同样不参与裁剪：它是重复行为的最后提醒。
     if let Some(warning) = frontier_warning {
         out.push_str(warning);
+        out.push('\n');
+    }
+    // 任务感知结算事实（默认关）：不参与列表裁剪，投影时直接可见。
+    // 它保留 ordinary final / durable closure / 具体续做的自主选择。
+    if let Some(line) = settlement {
+        out.push_str(line);
         out.push('\n');
     }
     // 机会投影（Slice C，默认关）：只在租赁存活的那一次决策可见。

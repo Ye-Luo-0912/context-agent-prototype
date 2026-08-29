@@ -60,9 +60,9 @@ pub use needs::{
 };
 pub use snapshot::RoundExecutionSnapshot;
 pub use snapshot::VerificationProjection;
-/// Test-only: unit tests construct typed obligations directly.
+/// Test-only: unit tests construct typed obligations/facts directly.
 #[cfg(test)]
-pub use state::ExecutionObligation;
+pub use state::{ExecutionObligation, FailedCommandFact};
 pub use state::{
     ExecutionState, FrontierObservation, NegativeExecutionFact, NegativeFactTransition,
     ResourceFact, ResourceProvenance, RuntimeExecutionAttribution, VerificationCause,

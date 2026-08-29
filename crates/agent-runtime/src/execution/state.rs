@@ -650,32 +650,63 @@ impl ExecutionState {
         !self.failed_commands.is_empty()
     }
 
+    /// The verification identity of the latest positive, exactly-attributed
+    /// PASS whose basis tuple still matches the current world: task
+    /// verification basis, user directive and admitted workspace revision.
+    /// This is the evidence side of the execution-ready join. Empty
+    /// provenance fields are legacy/non-exact evidence and stay fail-closed.
+    pub fn trusted_verification_identity(&self) -> Option<&str> {
+        if self.validity() != VerificationState::Current {
+            return None;
+        }
+        let basis = self.verification.spec_revision;
+        self.verifications.iter().rev().find(|fact| {
+            fact.ok
+                && !fact.source_tool_name.is_empty()
+                && !fact.verification_identity.is_empty()
+                && fact.anchor_revision == basis
+                && fact.directive_revision == self.directive_revision
+                && fact.workspace_revision == self.workspace_revision
+        })
+        .map(|fact| fact.verification_identity.as_str())
+    }
+
+    /// Execution-local readiness layer of the settlement gate: a current
+    /// trusted verification pass binds the full tuple (anchor basis,
+    /// directive, workspace) and no obligation row or failed command is
+    /// open. The actor still joins in-flight/cancel-cleanup state and the
+    /// task-anchor gates on top of this; execution state alone never
+    /// claims the whole task is settled.
+    pub fn execution_ready(&self) -> bool {
+        self.trusted_verification_identity().is_some()
+            && self.open_obligation_count() == 0
+            && self.failed_commands.is_empty()
+    }
+
     /// Derived settlement label: an evidence-driven decision boundary, not a
-    /// policy. `SettledCandidate` requires the trusted verification basis to
-    /// cover the current world (a mutation happened and a Current verification
-    /// admits it) and no typed obligation or failed verification to be open;
-    /// the model keeps the choice of ordinary final, durable closure, or
-    /// concrete continuation. Provenance: the label is recomputed on demand
-    /// from typed facts, never stored, so a checkpoint cannot carry a stale
-    /// decision.
+    /// policy. Execution-local only: the strongest label this function can
+    /// produce is `VerifiedCurrent` (the world is verified and no execution
+    /// obligation is open). Whether that rises to `SettledCandidate` is the
+    /// actor-owned task-aware join over the anchor epoch, open loops, next
+    /// action and acceptance coverage; the pure execution view never names
+    /// the whole task settled on its own. Provenance: the label is
+    /// recomputed on demand from typed facts, never stored, so a checkpoint
+    /// cannot carry a stale computed label.
     pub fn settlement(&self) -> agent_contracts::SettlementLabel {
         use agent_contracts::SettlementLabel;
-        let verification_due = self.has_unmet_obligation();
-        let blockers_open = self.open_obligation_count() > 0;
-        let covered = !verification_due && self.validity() == VerificationState::Current;
-        match (covered, blockers_open) {
-            (true, false) => SettlementLabel::SettledCandidate,
-            (true, true) => SettlementLabel::VerifiedCurrent,
-            (false, true) => SettlementLabel::Working,
-            (false, false) => {
-                if verification_due {
-                    SettlementLabel::VerificationDue
-                } else {
-                    // No mutation is covered by a Current verification; the
-                    // task has not settled.
-                    SettlementLabel::Working
-                }
-            }
+        if self.trusted_verification_identity().is_none() {
+            return if self.has_unmet_obligation() {
+                SettlementLabel::VerificationDue
+            } else {
+                // No exact trusted receipt on this basis (legacy evidence,
+                // directive moved, or a bare ok row): fail closed.
+                SettlementLabel::Working
+            };
+        }
+        if self.open_obligation_count() > 0 || self.has_failures() {
+            SettlementLabel::Working
+        } else {
+            SettlementLabel::VerifiedCurrent
         }
     }
 
@@ -985,29 +1016,10 @@ impl ExecutionState {
             stall_warning: self.stall_warning(),
             frontier_warning: self.frontier_warning(),
             completion_opportunity: None,
-            settlement: self.settlement_view(),
-        }
-    }
-
-    /// 结算决策边界的有界、中性投影：仅在验证覆盖且义务清空（或验证
-    /// 覆盖而义务未清）时给出一行事实，供模型选择 ordinary final、
-    /// 持久闭包或具体续做。不是"停止"指令，也不是轮数驱动的提示。
-    pub(super) fn settlement_view(&self) -> Option<String> {
-        use agent_contracts::SettlementLabel;
-        let open = self.open_obligation_count();
-        match self.settlement() {
-            SettlementLabel::SettledCandidate => Some(
-                "SETTLED CANDIDATE: the trusted verification basis covers the current \
-                 world and no obligation or failure is open. You may give an ordinary \
-                 final answer, call task.complete for durable task closure, or continue \
-                 with concrete remaining work."
-                    .to_string(),
-            ),
-            SettlementLabel::VerifiedCurrent => {
-                Some(format!("VERIFIED CURRENT: verification covers the current world; {open} obligation(s) still open."))
-            }
-            // 中间状态不投影；未收敛已由 stall/frontier advisory 覆盖。
-            SettlementLabel::Working | SettlementLabel::VerificationDue => None,
+            // The task-aware settlement fact is filled by the actor only
+            // when the projection switch is on and the joined label rises
+            // to `SettledCandidate`; execution state never projects it.
+            settlement: None,
         }
     }
 

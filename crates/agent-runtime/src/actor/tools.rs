@@ -1627,7 +1627,7 @@ impl RuntimeActor {
                 .state
                 .turn
                 .as_ref()
-                .map(|turn| turn.execution.settlement());
+                .map(|turn| self.task_settlement_label(&turn.execution));
             if current != self.state.last_reported_settlement {
                 self.state.last_reported_settlement = current;
                 current

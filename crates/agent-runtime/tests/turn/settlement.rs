@@ -38,6 +38,17 @@ enum Step {
     Plain(&'static str),
 }
 
+/// Host-side identity material of the scripted verifier. The dispatcher
+/// hashes this into the exact verification identity stamped onto the PASS;
+/// the task-aware acceptance claims in these tests must carry the same
+/// digest or they resolve to nothing.
+const VERIFY_IDENTITY_MATERIAL: &str = "scripted verify recipe v1";
+
+fn verify_identity() -> String {
+    agent_contracts::ContentDigest::sha256_bytes(VERIFY_IDENTITY_MATERIAL.trim().as_bytes())
+        .to_string()
+}
+
 /// Plays a round script exactly; a request beyond the script panics, so a
 /// runtime that refuses to settle (or auto-stops) fails the test loudly.
 #[derive(Debug)]
@@ -143,8 +154,9 @@ impl ToolDispatcher for SettlementToolDispatcher {
             "test.verify" => ToolExecutionAttribution::bounded(
                 ToolExecutionPurpose::Verify,
                 Vec::new(),
-                VerificationReuse::TaskScoped,
-            ),
+                VerificationReuse::ExactCurrentWorld,
+            )
+            .with_verification_identity_material(VERIFY_IDENTITY_MATERIAL),
             _ => ToolExecutionAttribution::default(),
         }
     }
@@ -276,10 +288,50 @@ fn settlement_labels(events: &[RuntimeEventEnvelope]) -> Vec<SettlementLabel> {
         .collect()
 }
 
-async fn drive(instance: &RuntimeInstance, collector: RuntimeEventEnvelopeCollector) -> Vec<RuntimeEventEnvelope> {
+/// Start the instance, focus the scripted task, and apply one anchor patch
+/// to its fresh revision-0 anchor before the first user turn. Tests use
+/// this to declare acceptance criteria/coverage and any blocking open loop
+/// or next action; the task-aware gate fails closed at `VerifiedCurrent`
+/// without it.
+async fn started_task_with_patch(
+    instance: &RuntimeInstance,
+    patch: agent_runtime::AnchorPatch,
+) {
     let handle = instance.handle();
     handle.start().await.unwrap();
-    continue_turn(instance, collector).await
+    handle.set_focus("implement bounded retry".into()).await.unwrap();
+    let task_id = handle.list_tasks().await.unwrap()[0].id;
+    let revision = handle.patch_task_anchor(task_id, 0, patch).await.unwrap();
+    assert_eq!(revision, 1, "the declared task anchor must advance by one");
+}
+
+/// The acceptance authority every settled-candidate scenario needs: one
+/// criterion with a coverage claim resolving to the scripted verifier's
+/// exact identity.
+fn settled_patch() -> agent_runtime::AnchorPatch {
+    agent_runtime::AnchorPatch {
+        acceptance_criteria: Some(vec!["tests pass for the current world".into()]),
+        acceptance_coverage: Some(vec![agent_runtime::task::AcceptanceCoverage {
+            criterion_index: 0,
+            verification_identity: verify_identity(),
+        }]),
+        ..agent_runtime::AnchorPatch::default()
+    }
+}
+
+async fn user_turn(
+    instance: &RuntimeInstance,
+    collector: RuntimeEventEnvelopeCollector,
+) -> Vec<RuntimeEventEnvelope> {
+    let handle = instance.handle();
+    handle.set_focus("implement bounded retry".into()).await.unwrap();
+    handle.user_message("keep going".into()).await.unwrap();
+    collector.drain_until_turn_completed().await
+}
+
+async fn drive(instance: &RuntimeInstance, collector: RuntimeEventEnvelopeCollector) -> Vec<RuntimeEventEnvelope> {
+    started_task_with_patch(instance, settled_patch()).await;
+    user_turn(instance, collector).await
 }
 
 /// A further user turn on an already-started instance: re-focusing the same
@@ -289,10 +341,7 @@ async fn continue_turn(
     instance: &RuntimeInstance,
     collector: RuntimeEventEnvelopeCollector,
 ) -> Vec<RuntimeEventEnvelope> {
-    let handle = instance.handle();
-    handle.set_focus("implement bounded retry".into()).await.unwrap();
-    handle.user_message("keep going".into()).await.unwrap();
-    collector.drain_until_turn_completed().await
+    user_turn(instance, collector).await
 }
 
 #[tokio::test]
@@ -478,6 +527,201 @@ async fn mutation_after_settlement_without_fresh_verify_is_stale_not_settled() {
         task.resume.validity(),
         agent_runtime::VerificationState::Stale,
         "the trusted verification basis is stale until a fresh verification covers the new revision"
+    );
+    instance.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn unmet_acceptance_coverage_stays_verified_current_not_candidate() {
+    let dir = tempfile::tempdir().unwrap();
+    let (instance, collector) = settlement_instance(
+        dir.path(),
+        vec![Step::Write("r2"), Step::Verify("r2"), Step::Plain("coverage?")],
+    )
+    .await;
+    // Criteria without any coverage claim: the gate fails closed.
+    started_task_with_patch(
+        &instance,
+        agent_runtime::AnchorPatch {
+            acceptance_criteria: Some(vec!["tests pass for the current world".into()]),
+            ..agent_runtime::AnchorPatch::default()
+        },
+    )
+    .await;
+    let events = user_turn(&instance, collector).await;
+    let labels = settlement_labels(&events);
+    assert!(
+        labels.contains(&SettlementLabel::VerifiedCurrent),
+        "execution is ready but no criterion has explicit evidence: {labels:?}"
+    );
+    assert!(
+        !labels.contains(&SettlementLabel::SettledCandidate),
+        "a declared criterion without explicit coverage must never be a candidate: {labels:?}"
+    );
+    instance.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn open_loop_blocks_candidate_even_with_full_coverage() {
+    let dir = tempfile::tempdir().unwrap();
+    let (instance, collector) = settlement_instance(
+        dir.path(),
+        vec![Step::Write("r2"), Step::Verify("r2"), Step::Plain("loop open")],
+    )
+    .await;
+    started_task_with_patch(
+        &instance,
+        agent_runtime::AnchorPatch {
+            acceptance_criteria: Some(vec!["tests pass for the current world".into()]),
+            acceptance_coverage: Some(vec![agent_runtime::task::AcceptanceCoverage {
+                criterion_index: 0,
+                verification_identity: verify_identity(),
+            }]),
+            open_loops: Some(vec!["verify edge cases".into()]),
+            ..agent_runtime::AnchorPatch::default()
+        },
+    )
+    .await;
+    let events = user_turn(&instance, collector).await;
+    let labels = settlement_labels(&events);
+    assert!(
+        !labels.contains(&SettlementLabel::SettledCandidate),
+        "an anchored open loop must block the candidate: {labels:?}"
+    );
+    instance.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn next_action_blocks_candidate_even_with_full_coverage() {
+    let dir = tempfile::tempdir().unwrap();
+    let (instance, collector) = settlement_instance(
+        dir.path(),
+        vec![Step::Write("r2"), Step::Verify("r2"), Step::Plain("next action")],
+    )
+    .await;
+    started_task_with_patch(
+        &instance,
+        agent_runtime::AnchorPatch {
+            acceptance_criteria: Some(vec!["tests pass for the current world".into()]),
+            acceptance_coverage: Some(vec![agent_runtime::task::AcceptanceCoverage {
+                criterion_index: 0,
+                verification_identity: verify_identity(),
+            }]),
+            next_action: Some("write the missing test".into()),
+            ..agent_runtime::AnchorPatch::default()
+        },
+    )
+    .await;
+    let events = user_turn(&instance, collector).await;
+    let labels = settlement_labels(&events);
+    assert!(
+        !labels.contains(&SettlementLabel::SettledCandidate),
+        "a non-empty next action must block the candidate: {labels:?}"
+    );
+    instance.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn boundary_criterion_change_reopens_and_redeclared_coverage_resettles() {
+    let dir = tempfile::tempdir().unwrap();
+    let (instance, collector) = settlement_instance(
+        dir.path(),
+        vec![
+            Step::Write("r2"),
+            Step::Verify("r2"),
+            Step::Plain("settled"),
+            Step::Write("r3"),
+            Step::Verify("r3"),
+            Step::Plain("reopened"),
+            Step::Write("r4"),
+            Step::Verify("r4"),
+            Step::Plain("covered again"),
+        ],
+    )
+    .await;
+    let first_turn = drive(&instance, collector).await;
+    assert!(
+        settlement_labels(&first_turn).contains(&SettlementLabel::SettledCandidate),
+        "the declared task settles before the boundary change"
+    );
+
+    // Boundary change: a second criterion moves the verification basis and
+    // leaves one criterion without a coverage claim (identity still covers
+    // only the first).
+    let handle = instance.handle();
+    let task_id = handle.list_tasks().await.unwrap()[0].id;
+    let revision = handle
+        .patch_task_anchor(
+            task_id,
+            1,
+            agent_runtime::AnchorPatch {
+                acceptance_criteria: Some(vec![
+                    "tests pass for the current world".into(),
+                    "api unchanged".into(),
+                ]),
+                acceptance_coverage: Some(vec![agent_runtime::task::AcceptanceCoverage {
+                    criterion_index: 0,
+                    verification_identity: verify_identity(),
+                }]),
+                ..agent_runtime::AnchorPatch::default()
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(revision, 2);
+
+    let reopened = continue_turn(
+        &instance,
+        RuntimeEventEnvelopeCollector {
+            events: instance.handle().subscribe(),
+        },
+    )
+    .await;
+    let reopened_labels = settlement_labels(&reopened);
+    assert!(
+        !reopened_labels.contains(&SettlementLabel::SettledCandidate),
+        "the moved basis and new criterion must reopen the proposal: {reopened_labels:?}"
+    );
+    assert!(
+        reopened_labels.contains(&SettlementLabel::VerifiedCurrent),
+        "a fresh verification covers the new basis while the uncovered criterion keeps it below candidate: {reopened_labels:?}"
+    );
+
+    // Now claim the second criterion too; the next verified mutation must
+    // settle again.
+    let revision = handle
+        .patch_task_anchor(
+            task_id,
+            2,
+            agent_runtime::AnchorPatch {
+                acceptance_coverage: Some(vec![
+                    agent_runtime::task::AcceptanceCoverage {
+                        criterion_index: 0,
+                        verification_identity: verify_identity(),
+                    },
+                    agent_runtime::task::AcceptanceCoverage {
+                        criterion_index: 1,
+                        verification_identity: verify_identity(),
+                    },
+                ]),
+                ..agent_runtime::AnchorPatch::default()
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(revision, 3);
+
+    let resettled = continue_turn(
+        &instance,
+        RuntimeEventEnvelopeCollector {
+            events: instance.handle().subscribe(),
+        },
+    )
+    .await;
+    assert!(
+        settlement_labels(&resettled).contains(&SettlementLabel::SettledCandidate),
+        "full declared coverage with a fresh verification must settle: {:?}",
+        settlement_labels(&resettled)
     );
     instance.shutdown().await.unwrap();
 }

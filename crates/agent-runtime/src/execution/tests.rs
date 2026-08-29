@@ -1774,42 +1774,65 @@ fn write_of(path: &str, revision: &str) -> ToolOutput {
 fn settlement_is_working_without_covered_mutation() {
     let mut resume = ExecutionState::default();
     assert_eq!(resume.settlement(), SettlementLabel::Working);
-    assert!(resume.settlement_view().is_none());
+    assert!(!resume.execution_ready());
+    assert!(resume.view().settlement.is_none());
 
     // Read-only exploration admits no mutation; the task has not settled.
     resume.observe_tool(&output("fs.read", true, "read auth"), 1, 1);
     assert_eq!(resume.settlement(), SettlementLabel::Working);
-    assert!(resume.settlement_view().is_none());
+    assert!(!resume.execution_ready());
+    assert!(resume.view().settlement.is_none());
+}
+
+/// Exact host-attributed verifier for the settlement tests. Without an
+/// exact verification identity the execution-ready gate fails closed, so
+/// every positive must go through this attribution.
+fn observed_exact_pass(resume: &mut ExecutionState, anchor_revision: u64, turn: u64) {
+    let attribution = RuntimeExecutionAttribution {
+        host: ToolExecutionAttribution::bounded(
+            ToolExecutionPurpose::Verify,
+            Vec::<String>::new(),
+            VerificationReuse::ExactCurrentWorld,
+        )
+        .with_verification_identity_material("test-runner:v1|env:win"),
+        rooted_targets: Vec::new(),
+    };
+    resume.observe_tool_attributed(&verified_ok(), anchor_revision, turn, "arg-settle", &attribution);
 }
 
 #[test]
-fn mutation_then_current_verification_settles() {
+fn mutation_then_current_verification_is_verified_current() {
     let mut resume = ExecutionState::default();
     // A covered mutation needs a tracked path first: a write to a known
     // digest marks the source changed and makes verification due.
     resume.observe_tool(&output("fs.read", true, "read auth"), 1, 1);
     resume.observe_tool(&write_of("src/auth.rs", "v2"), 1, 2);
     assert_eq!(resume.settlement(), SettlementLabel::VerificationDue);
-    assert!(resume.settlement_view().is_none());
+    assert!(!resume.execution_ready());
 
-    resume.observe_tool(&verified_ok(), 1, 3);
+    observed_exact_pass(&mut resume, 1, 3);
     assert_eq!(resume.validity(), VerificationState::Current);
-    assert_eq!(resume.settlement(), SettlementLabel::SettledCandidate);
-    let view = resume.settlement_view().expect("settled candidate projects");
-    assert!(view.contains("SETTLED CANDIDATE"));
+    // Execution-local top is VerifiedCurrent: the world is verified, but
+    // whether the whole task rises to a candidate is the actor-owned join.
+    assert_eq!(resume.settlement(), SettlementLabel::VerifiedCurrent);
+    assert!(resume.execution_ready());
+    assert!(
+        resume.view().settlement.is_none(),
+        "execution state never projects the settlement fact"
+    );
 }
 
 #[test]
 fn mutation_after_verification_returns_to_due() {
     let mut resume = ExecutionState::default();
     resume.observe_tool(&write_of("src/auth.rs", "v2"), 1, 1);
-    resume.observe_tool(&verified_ok(), 1, 2);
-    assert_eq!(resume.settlement(), SettlementLabel::SettledCandidate);
+    observed_exact_pass(&mut resume, 1, 2);
+    assert_eq!(resume.settlement(), SettlementLabel::VerifiedCurrent);
 
     resume.observe_tool(&write_of("src/auth.rs", "v3"), 1, 3);
     assert_eq!(resume.validity(), VerificationState::Stale);
     assert_eq!(resume.settlement(), SettlementLabel::VerificationDue);
-    assert!(resume.settlement_view().is_none());
+    assert!(!resume.execution_ready());
 }
 
 #[test]
@@ -1820,25 +1843,24 @@ fn failed_verification_is_due_not_settled() {
     fail.metadata = json!({"command": "cargo test", "verification": true});
     resume.observe_tool(&fail, 1, 2);
     assert_eq!(resume.settlement(), SettlementLabel::VerificationDue);
-    assert!(resume.settlement_view().is_none());
+    assert!(!resume.execution_ready());
 }
 
 #[test]
-fn open_obligation_with_current_verification_is_verified_current() {
+fn open_obligation_with_current_verification_is_working() {
     let mut resume = ExecutionState::default();
     resume.observe_tool(&write_of("src/auth.rs", "v2"), 1, 1);
-    resume.observe_tool(&verified_ok(), 1, 2);
+    observed_exact_pass(&mut resume, 1, 2);
     resume.observe_tool(&missing_program("prog_a", "fp-1"), 1, 3);
-    assert_eq!(resume.settlement(), SettlementLabel::VerifiedCurrent);
-    let view = resume.settlement_view().expect("verified current projects");
-    assert!(view.contains("VERIFIED CURRENT"));
-    assert!(view.contains("1 obligation"));
+    assert_eq!(resume.settlement(), SettlementLabel::Working);
+    assert!(!resume.execution_ready());
 
     // A typed resolution drains the ledger; the resolving command is itself
     // a world change, so settlement needs a fresh verification on top.
     resume.observe_tool(&resolved_command("prog_a", "scope-a", "fp-1"), 1, 4);
-    resume.observe_tool(&verified_ok(), 1, 5);
-    assert_eq!(resume.settlement(), SettlementLabel::SettledCandidate);
+    observed_exact_pass(&mut resume, 1, 5);
+    assert_eq!(resume.settlement(), SettlementLabel::VerifiedCurrent);
+    assert!(resume.execution_ready());
 }
 
 #[test]
@@ -1846,20 +1868,40 @@ fn open_obligation_without_current_verification_is_working() {
     let mut resume = ExecutionState::default();
     resume.observe_tool(&missing_program("prog_a", "fp-1"), 1, 1);
     assert_eq!(resume.settlement(), SettlementLabel::Working);
-    assert!(resume.settlement_view().is_none());
+    assert!(!resume.execution_ready());
 }
 
 #[test]
-fn settlement_survives_progress_only_anchor_change() {
+fn verified_current_survives_progress_only_anchor_change() {
     let mut resume = ExecutionState::default();
     resume.observe_tool(&write_of("src/auth.rs", "v2"), 1, 1);
-    resume.observe_tool(&verified_ok(), 1, 2);
+    observed_exact_pass(&mut resume, 1, 2);
     // Progress-only anchor advancement keeps the verification basis: the
     // current verifier stays current (basis == 0 on both sides).
     resume.anchor_revision = 5;
-    assert_eq!(resume.settlement(), SettlementLabel::SettledCandidate);
+    assert_eq!(resume.settlement(), SettlementLabel::VerifiedCurrent);
+    assert!(resume.execution_ready());
 
     // A boundary change to the verification basis reopens the obligation.
     resume.verification.spec_revision = 2;
     assert_eq!(resume.settlement(), SettlementLabel::VerificationDue);
+    assert!(!resume.execution_ready());
+}
+
+#[test]
+fn execution_ready_matches_verified_current_label() {
+    let mut resume = ExecutionState::default();
+    assert_eq!(resume.execution_ready(), resume.settlement() == SettlementLabel::VerifiedCurrent);
+    resume.observe_tool(&write_of("src/auth.rs", "v2"), 1, 1);
+    assert_eq!(resume.execution_ready(), resume.settlement() == SettlementLabel::VerifiedCurrent);
+
+    observed_exact_pass(&mut resume, 1, 2);
+    assert!(resume.execution_ready());
+    assert_eq!(resume.settlement(), SettlementLabel::VerifiedCurrent);
+
+    // Every reopening input must flip readiness and the label together.
+    resume.observe_tool(&missing_program("prog_a", "fp-1"), 1, 3);
+    assert_eq!(resume.execution_ready(), resume.settlement() == SettlementLabel::VerifiedCurrent);
+    assert!(!resume.execution_ready());
+    assert_eq!(resume.settlement(), SettlementLabel::Working);
 }

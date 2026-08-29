@@ -1186,6 +1186,26 @@ impl RuntimeActor {
             progress.completion_opportunity =
                 Some(crate::opportunity::OPPORTUNITY_PROMPT_LINE.to_string());
         }
+        // 任务感知结算事实（默认关）：仅当 joined 标签上升为
+        // `SettledCandidate` 时投影一行中性事实。execution 视图本身
+        // 从不携带该行，所以重开/缺失时它自然消失；它不构成停止
+        // 指令，也不附加任何 tool-surface lease。
+        if let Some(progress) = progress.as_mut().filter(|_| self.services.project_task_progress())
+        {
+            let settled = match self.state.turn.as_ref() {
+                Some(turn) => {
+                    self.task_settlement_label(&turn.execution)
+                        == agent_contracts::SettlementLabel::SettledCandidate
+                }
+                None => {
+                    self.task_settlement_label(&task.resume)
+                        == agent_contracts::SettlementLabel::SettledCandidate
+                }
+            };
+            if settled {
+                progress.settlement = Some(crate::task::SETTLED_CANDIDATE_PROMPT_LINE.to_string());
+            }
+        }
         (
             Some(focus),
             Some(crate::task::task_anchor_view(&task.anchor)),

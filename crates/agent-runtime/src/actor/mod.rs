@@ -1261,6 +1261,40 @@ impl RuntimeActor {
         self.assembler.refresh_markers(workspace.project_markers());
     }
 
+    /// 任务感知结算 join:`SettledCandidate` 仅当 execution-local 就绪
+    /// (最大 `VerifiedCurrent`) 且 active task anchor 同意——epoch 匹配、
+    /// 无 open loop、无 next action、每条 acceptance criterion 都有解析
+    /// 到当前 trusted pass 的覆盖 claim——且无 in-flight 操作 / cancel
+    /// cleanup。否则保留 execution 局部标签。in-flight 指尚未终止的
+    /// 派发操作与待派发队列 (`active_tool` 是表面 pin,不在此列)。
+    fn task_settlement_label(
+        &self,
+        execution: &crate::execution::ExecutionState,
+    ) -> agent_contracts::SettlementLabel {
+        use agent_contracts::SettlementLabel;
+        let local = execution.settlement();
+        if local != SettlementLabel::VerifiedCurrent {
+            return local;
+        }
+        let in_flight_clear = self.state.pending_tool_cleanup.is_none()
+            && self.state.turn.as_ref().is_none_or(|turn| {
+                turn.op.is_none() && turn.pending_tools.is_empty()
+            });
+        let ready = self
+            .state
+            .task_id
+            .and_then(|task_id| self.state.tasks.get(task_id))
+            .is_some_and(|task| {
+                crate::task::task_ready(&task.anchor, execution, in_flight_clear)
+                    && task.status != crate::task::TaskStatus::Completed
+            });
+        if ready {
+            SettlementLabel::SettledCandidate
+        } else {
+            SettlementLabel::VerifiedCurrent
+        }
+    }
+
     /// Run the actor loop until `Stop` or all handles are dropped. Commands
     /// and operation completions are handled concurrently so cancellation
     /// can always be processed while an operation is running.
