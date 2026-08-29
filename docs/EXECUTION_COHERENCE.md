@@ -730,12 +730,17 @@ episodes start on entry to a task-aware candidate and end at the first
 reopening transition or terminal outcome. The true projection-off/on paired
 gate then ran on an approved 8-cell budget: 8/8 cells PASS with 0 NOT_RUN,
 but the verdict is FAIL — pair 0 (normal r1) settlement exposure is
-off=none / on=seen (a verified cell whose last trusted PASS has no trailing
-tool observation records no episode and is inconclusive by rule),
+off=none / on=seen (the off cell recorded no trusted verification pass:
+its model used only the TaskScoped `rust.workspace` recipe, which executes
+but carries no exact identity, so the join never armed and the cell is
+inconclusive by rule; every exposed cell used the host `jobrunner.exact`
+recipe, whose pass arms the candidate synchronously with its observation),
 marker-violation counts differ in 3/4 pairs (needle-shape misses the
 harness oracle tolerates), and episode-rounds/calls medians are 1→1, not
-strictly lower. The frozen rule keeps the projection default-off and
-returns the gate to observation; no promotion claim follows.
+strictly lower. Projection rendering was arm-separated and bounded: off 0
+tokens every round, on 430–512 tokens once a candidate existed. The frozen
+rule keeps the projection default-off and returns the gate to observation;
+no promotion claim follows.
 Facts: [`evidence/conv-gate/REPORT.md`](../crates/agent-eval/evidence/conv-gate/REPORT.md).
 
 ### Protocol working set (turn checkpointing)

@@ -1004,14 +1004,19 @@ The step-4 paired gate then ran on the approved 8-cell budget
 (`--allow-dirty`; `project_progress` is the only arm difference): 8/8 cells
 PASS behavior/diff/closure/continuation, 0 NOT_RUN — but the verdict is
 FAIL. Pair 0 (normal r1) has settlement exposure off=none / on=seen (the
-off cell's last trusted PASS had no trailing tool observation, so no
-episode was recorded; zero-exposure cells are inconclusive by rule),
-marker-violation counts differ in 3/4 pairs (needle-shape misses the
-harness oracle tolerates, present in both arms), and episode-rounds/calls
-medians are 1→1, not strictly lower. The frozen rule therefore keeps the
+off cell recorded no trusted verification pass: all four `verify.run` calls
+used the TaskScoped `rust.workspace` runner, which executes but carries no
+exact identity, so the join never armed and the zero-exposure cell is
+inconclusive by rule; exposed cells used the host-registered
+`jobrunner.exact` recipe, whose pass arms the candidate synchronously with
+its observation), marker-violation counts differ in 3/4 pairs (needle-shape
+misses the harness oracle tolerates, present in both arms), and
+episode-rounds/calls medians are 1→1, not strictly lower. Projection
+rendering was real and arm-separated: off 0 tokens every round, on 430–512
+tokens once a candidate existed. The frozen rule therefore keeps the
 projection default-off and returns the gate to observation: no rerun before
-a bounded diagnosis of the exposure-timing and marker-parity causes, and no
-promotion claim. Facts:
+a bounded diagnosis of the recipe-choice exposure and marker-parity causes,
+and no promotion claim. Facts:
 [`evidence/conv-gate/REPORT.md`](../crates/agent-eval/evidence/conv-gate/REPORT.md).
 
 Context selection, GC, retrieval and prompt packing stay frozen. The prior C

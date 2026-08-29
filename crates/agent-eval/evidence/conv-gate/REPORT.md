@@ -82,13 +82,22 @@ whole-cell round tail is 34→34.
 
 ## Root-cause analysis
 
-1. **Pair-0 exposure asymmetry (off none / on seen).** Episode emission is
-   event-driven on the tool observation after the last trusted PASS. Off
-   normal r1 (34 rounds, the longest cell) ended with a verify →
-   `task.complete` sequence and no trailing tool observation, so no
-   candidate episode was recorded even though the world was verified and
-   the cell passed. Zero-exposure cells are inconclusive by the frozen
-   rule, so pair 0 cannot pass parity regardless of the projection switch.
+1. **Pair-0 exposure asymmetry (off none / on seen).** Off normal r1
+   (34 rounds) recorded **no trusted verification pass at all**: all four of
+   its `verify.run` calls used the discovered general runner `rust.workspace`
+   (`cargo test --workspace`, TaskScoped by design), which executes but
+   cannot carry an exact verification identity, so no `execution_verification_pass`
+   event was emitted and the task-aware join never armed — the settlement
+   label stayed at `verification_due` for the whole cell even though the
+   cell passed every hidden check. Every exposed cell used the
+   host-registered `jobrunner.exact` recipe (source-read-only
+   ExactCurrentWorld) at least once. A trusted pass is synchronous with its
+   observation: the same frontier emission that records the pass then
+   publishes the candidate label (observed `execution_verification_pass` →
+   `settlement:"settled_candidate"` in immediate succession), so exposure is
+   not delayed to a later tool call. The pair-0 asymmetry is therefore model
+   **recipe-choice variance** (which of the two surfaced recipe ids the model
+   picked), and per the frozen rule the zero-exposure cell is inconclusive.
 2. **Marker-violation parity.** The fixture's six content-marker
    assertions are needle-text checks ("transient classification
    implemented", "retry loop bounds on max_attempts", "delay growth
@@ -103,10 +112,13 @@ whole-cell round tail is 34→34.
    measurable regression, but no measurable episode or tail reduction
    either.
 
-All 8 cells held the truth chain under live load: behavior/diff/closure/
-continuation parity is otherwise intact; the two fail families are the
-exposure timing property and the marker dimension, not a runtime,
-transport or mechanism failure.
+Projection rendering was confirmed real and strictly arm-separated: the off
+arm never rendered the TASK PROGRESS layer (`task_progress_tokens=0` every
+round), while every on-arm cell rendered bounded progress blocks of 430–512
+tokens in 14–33 of its rounds once a candidate existed. All 8 cells held the
+truth chain under live load: behavior/diff/closure/continuation parity is
+otherwise intact; the two fail families are recipe-choice exposure and the
+marker dimension, not a runtime, transport or mechanism failure.
 
 ## What landed under option A and made live candidate emission possible
 
@@ -139,9 +151,11 @@ transport or mechanism failure.
 
 Per the frozen CONV-CLOSE-02 rule, a failed gate leaves projection off and
 returns to observation. The diagnosed causes are bounded and fixture-level:
-(a) a verified cell whose last trusted PASS has no trailing tool observation
-records no episode and is inconclusive by rule; (b) the marker dimension
-fails parity on needle-shape misses that the behavioral oracle tolerates.
-Any change must first pass the deterministic reopening/restore suite and the
-frozen efficiency criteria; no rerun before that diagnosis, and no fourth
+(a) pair-0 exposure is a model recipe-choice effect — the cell that used only
+the TaskScoped `rust.workspace` recipe recorded no trusted pass and stayed
+inconclusive, while cells that used the host-registered `jobrunner.exact`
+recipe armed synchronously; (b) the marker dimension fails parity on
+needle-shape misses that the behavioral oracle tolerates. Any change must
+first pass the deterministic reopening/restore suite and the frozen
+efficiency criteria; no rerun before that diagnosis, and no fourth
 unchanged M15 window.

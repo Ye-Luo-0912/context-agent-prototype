@@ -96,7 +96,7 @@ does not reorder or close any gate.
    strict parity (pair-0 exposure asymmetry; marker needle-shape counts differ
    in 3/4 pairs; episode medians 1→1). The projection stays default-off and the
    gate is back at observation; no rerun before a bounded diagnosis of the
-   exposure-timing and marker-parity causes.
+   recipe-choice exposure and marker-parity causes.
 6. Formal M15 only from versioned per-cell artifacts. Three valid failed v3
    windows remain evidence and cannot be retried unchanged. Before a new source
    is evaluated, freeze the missing prospective cross-window decision rule in

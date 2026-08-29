@@ -625,13 +625,17 @@ and sandbox contracts live elsewhere. Experiment facts live in
   request-level plus whole-cell provider retry, and live acceptance
   declaration bound by the trusted verification pass at observation time.
   The gate ran 8/8 cells PASS with 0 NOT_RUN but FAILED promotion: pair-0
-  (normal r1) exposure asymmetry (off none / on seen; a verified cell whose
-  last PASS has no trailing observation records no episode and is
-  inconclusive by rule), marker-violation parity in 3/4 pairs (needle-shape
-  misses the behavioral oracle tolerates), and episode-rounds/calls medians
-  1→1 (not strictly lower). Per the frozen rule the projection stays
-  default-off and the gate returns to observation; do not claim
-  convergence or M15 closed. See
+  (normal r1) exposure asymmetry (off none / on seen; the off cell recorded
+  no trusted verification pass because its model used only the TaskScoped
+  `rust.workspace` runner — no exact identity, so the join never armed and
+  the cell is inconclusive by rule, while exposed cells used the host
+  `jobrunner.exact` recipe whose pass arms synchronously), marker-violation
+  parity in 3/4 pairs (needle-shape misses the behavioral oracle
+  tolerates), and episode-rounds/calls medians 1→1 (not strictly lower).
+  Projection rendering was real and arm-separated: off 0 tokens every
+  round, on 430–512 tokens once a candidate existed. Per the frozen rule
+  the projection stays default-off and the gate returns to observation; do
+  not claim convergence or M15 closed. See
   [`evidence/conv-gate/REPORT.md`](../crates/agent-eval/evidence/conv-gate/REPORT.md).
 
   The
@@ -998,11 +1002,11 @@ The next bounded implementation task is **Task-aware Completion Convergence**:
 Steps 1–4 landed 2026-08-29 (see the CONV-CLOSE-02 "Now" entry); the step-4
 paired gate then ran on the approved 8-cell budget and FAILED promotion on
 strict parity, leaving the projection default-off and the gate back at
-observation. The diagnosed causes are bounded and fixture-level (exposure
-timing when the last trusted PASS has no trailing tool observation; marker
-needle-shape parity the behavioral oracle tolerates). Any change must first
-pass the deterministic reopening/restore suite; no rerun before that
-diagnosis.
+observation. The diagnosed causes are bounded and fixture-level (pair-0
+exposure is model recipe-choice — the cell that used only the TaskScoped
+`rust.workspace` runner recorded no trusted pass; marker needle-shape
+parity the behavioral oracle tolerates). Any change must first pass the
+deterministic reopening/restore suite; no rerun before that diagnosis.
 
 Before any further M15 spend, freeze the missing cross-window retry rule in
 [`M15_ACCEPTANCE.md`](M15_ACCEPTANCE.md). After the source changes, run the

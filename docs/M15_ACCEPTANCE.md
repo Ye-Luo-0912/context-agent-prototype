@@ -216,9 +216,11 @@ Before spending another 12-cell window:
    two paired repeats, treatment exposure, mandatory-success parity, no lost
    unfinished work and the frozen episode-efficiency criteria — the first
    such gate ran 2026-08-29 (8 cells, `--allow-dirty`; 8/8 cells PASS but
-   verdict FAIL: pair-0 exposure asymmetry plus marker needle-shape parity
-   in 3/4 pairs and episode medians 1→1), so this item is not yet met and
-   the projection stays default-off;
+   verdict FAIL: pair-0 exposure asymmetry — the off cell recorded no
+   trusted pass because its model used only the TaskScoped `rust.workspace`
+   runner — plus marker needle-shape parity in 3/4 pairs and episode
+   medians 1→1), so this item is not yet met and the projection stays
+   default-off;
 5. freeze and record the candidate identity under the §5 cross-window rule;
 6. rerun the bounded one-cell exact-source/product preflight without changing
    the serving tuple;

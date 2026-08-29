@@ -571,11 +571,17 @@ Progress (2026-08-29):
   tree; `project_progress` is the only arm difference). 8/8 cells PASS
   behavior/diff/closure/continuation, provider healthy, 0 NOT_RUN, one
   request-level retry absorbed. Verdict FAIL: pair-0 (normal r1) settlement
-  exposure asymmetry (off none / on seen — the off cell's last trusted PASS
-  had no trailing tool observation, so no episode was recorded and the cell
-  is inconclusive by rule), marker-violation counts differ in 3/4 pairs
+  exposure asymmetry (off none / on seen — the off cell recorded no trusted
+  verification pass: all four `verify.run` calls used the TaskScoped
+  `rust.workspace` runner, which executes but carries no exact identity, so
+  the task-aware join never armed and the zero-exposure cell is
+  inconclusive by rule; every exposed cell used the host-registered
+  `jobrunner.exact` recipe, whose pass arms the candidate synchronously
+  with its observation), marker-violation counts differ in 3/4 pairs
   (needle-shape misses the behavioral oracle tolerates, in both arms), and
-  episode rounds/calls medians are 1→1 (not strictly lower). Facts:
+  episode rounds/calls medians are 1→1 (not strictly lower). Projection
+  rendering was real and arm-separated: off 0 tokens every round, on
+  430–512 tokens in 14–33 of the rounds once a candidate existed. Facts:
   [`evidence/conv-gate/REPORT.md`](../crates/agent-eval/evidence/conv-gate/REPORT.md).
   Per the frozen rule the projection stays default-off and the gate returns
   to observation; no prompt tuning or Context/GC retuning is triggered.
