@@ -115,7 +115,7 @@ fn usage() -> ! {
          usage: agent-eval --m15-report <window-dir>\n\
 \n\
          Read-only post-settlement tail analysis over a conv-gate evidence\n\
-         tree: for every cell, the first setted-candidate frontier event\n\
+         tree: for every cell, the first settled-candidate frontier event\n\
          splits the stream and every later frontier delta and tool result\n\
          is printed (no_progress / redundant / failed outputs / repeated\n\
          reads and verifies). Does not modify anything and never touches\n\
@@ -1655,7 +1655,12 @@ async fn run_conv_tail(evidence_dir: Option<std::path::PathBuf>) -> anyhow::Resu
     let mut mode_medians: std::collections::BTreeMap<String, Vec<(u64, u64, u64)>> =
         std::collections::BTreeMap::new();
     for (pair, repeat, event_count, profile) in &rows {
-        let mode = pair.split('-').next_back().unwrap_or(pair).to_string();
+        let mode = pair
+            .rsplit('-')
+            .next()
+            .filter(|suffix| *suffix == "normal" || *suffix == "resume")
+            .unwrap_or(pair)
+            .to_string();
         let delta = |name: &str| profile.deltas.get(name).copied().unwrap_or(0);
         let tool = |name: &str| profile.tool_calls.get(name).copied().unwrap_or(0);
         let failed = |name: &str| profile.failed_tools.get(name).copied().unwrap_or(0);
