@@ -52,6 +52,12 @@ pub struct CellSwitches {
     pub opportunity: bool,
     /// Directory-tool admission recovery-surface candidate (default off).
     pub recovery_surface: bool,
+    /// Model projection switch of the TASK PROGRESS frame (default off):
+    /// when on, the runtime renders the bounded progress view and, at a
+    /// task-aware settled candidate, the neutral settlement fact. The
+    /// convergence gate runs identical cells with this as the only
+    /// variable; the switch is never hardcoded at the composition root.
+    pub project_progress: bool,
 }
 
 /// Harness-owned behavioral oracle. Injected into the finished workspace
@@ -588,6 +594,9 @@ pub struct CellOutcome {
     /// Whether the directory-tool recovery surface candidate was enabled
     /// for this cell (the isolation paired gate's only variable).
     pub recovery_surface: bool,
+    /// Whether the TASK PROGRESS model projection was enabled for this
+    /// cell (the convergence paired gate's only variable).
+    pub project_progress: bool,
     /// Offered opportunity keys, in arrival order across both phases.
     pub opportunity_offers: Vec<String>,
     /// The model called `task.complete` after an offer was live.
@@ -651,6 +660,7 @@ impl CellOutcome {
             opportunity_offers: Vec::new(),
             opportunity_called: false,
             recovery_surface: switches.recovery_surface,
+            project_progress: switches.project_progress,
             settlement_seen: false,
             settlement_episodes: 0,
             settlement_episode_rounds: 0,
@@ -1091,7 +1101,7 @@ async fn compose_cell(
         artifact_store: Some(Arc::new(workspace.clone())),
         output_broker: None,
         max_tool_rounds: Some(LIVE_MAX_MODEL_ROUNDS as usize),
-        project_task_progress: true,
+        project_task_progress: switches.project_progress,
         project_completion_opportunity: switches.opportunity,
         recovery_surface: switches.recovery_surface,
         host_policies: Some(Arc::new(
@@ -1216,6 +1226,7 @@ pub async fn run_pack_cell(
     let CellSwitches {
         opportunity,
         recovery_surface,
+        project_progress,
     } = switches;
     let failed = |failure: CellFailure| {
         CellOutcome::failed(
@@ -1658,6 +1669,7 @@ pub async fn run_pack_cell(
         marker_violations,
         opportunity,
         recovery_surface,
+        project_progress,
         opportunity_offers,
         opportunity_called,
         settlement_seen: metrics.settled_seen,
@@ -2078,6 +2090,234 @@ pub fn spec_sha256() -> String {
     hex
 }
 
+/// Judgment of the convergence paired gate. Both arms run the same
+/// source, pack, serving, mode and repeat; only the model projection
+/// switch differs. Zero on-arm exposure is inconclusive, never a pass.
+/// Promotion requires behavior/diff/resume parity, no lost unfinished
+/// work, strictly lower candidate-episode rounds and calls, and no new
+/// maximum episode or whole-cell tail.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ConvGateJudgment {
+    /// pass | fail | inconclusive
+    pub state: &'static str,
+    pub reasons: Vec<String>,
+    /// Per-mode median/overall exposure and episode facts for the report.
+    pub off_cells: usize,
+    pub off_exposed: usize,
+    pub on_cells: usize,
+    pub on_exposed: usize,
+}
+
+impl ConvGateJudgment {
+    pub fn render(&self) -> String {
+        let mut out = format!("convergence gate: {} (off={} on={})", self.state, self.off_cells, self.on_cells);
+        for reason in &self.reasons {
+            out.push_str("\n  - ");
+            out.push_str(reason);
+        }
+        out
+    }
+}
+
+/// Evaluate the paired conv gate from outcome lists: one off and one on
+/// outcome per (mode, repeat), in the same order. Pure and deterministic
+/// so the gate decision can be tested without a live run. Per-pair
+/// settlement exposure must match (the label derives regardless of the
+/// switch), and episode efficiency compares only the cells that actually
+/// saw a settled candidate.
+pub fn evaluate_conv_gate(outcomes: &[CellOutcome]) -> ConvGateJudgment {
+    let off: Vec<&CellOutcome> = outcomes
+        .iter()
+        .filter(|cell| !cell.project_progress)
+        .collect();
+    let on: Vec<&CellOutcome> = outcomes
+        .iter()
+        .filter(|cell| cell.project_progress)
+        .collect();
+    let mut reasons = Vec::new();
+
+    if on.is_empty() || off.is_empty() {
+        reasons.push("one arm produced no outcomes; the pair is not comparable".into());
+        return ConvGateJudgment {
+            state: "inconclusive",
+            off_cells: off.len(),
+            off_exposed: off.iter().filter(|cell| cell.settlement_seen).count(),
+            on_cells: on.len(),
+            on_exposed: on.iter().filter(|cell| cell.settlement_seen).count(),
+            reasons,
+        };
+    }
+
+    // Zero on-arm exposure: with no candidate event the convergence path
+    // never armed, so no episode comparison is meaningful.
+    let on_exposed = on.iter().filter(|cell| cell.settlement_seen).count();
+    if on_exposed == 0 {
+        reasons.push(format!(
+            "zero on-arm exposure ({} cell(s)); gate is inconclusive, never a pass",
+            on.len()
+        ));
+        return ConvGateJudgment {
+            state: "inconclusive",
+            off_cells: off.len(),
+            off_exposed: off.iter().filter(|cell| cell.settlement_seen).count(),
+            on_cells: on.len(),
+            on_exposed,
+            reasons,
+        };
+    }
+
+    // Mandatory parity per pair (same mode + repeat order): behavior,
+    // diff, closure, resume continuation, self-check, passed verdict.
+    for (index, (off_cell, on_cell)) in off.iter().zip(&on).enumerate() {
+        if off_cell.mode != on_cell.mode {
+            reasons.push(format!("pair {index}: arm mode mismatch ({} vs {})", off_cell.mode.id(), on_cell.mode.id()));
+        }
+        if off_cell.behavior != on_cell.behavior {
+            reasons.push(format!(
+                "pair {index} ({}): behavior {}/{}",
+                off_cell.mode.id(),
+                off_cell.behavior,
+                on_cell.behavior
+            ));
+        }
+        if off_cell.diff != on_cell.diff {
+            reasons.push(format!(
+                "pair {index} ({}): diff {}/{}",
+                off_cell.mode.id(),
+                off_cell.diff,
+                on_cell.diff
+            ));
+        }
+        if off_cell.closure != on_cell.closure {
+            reasons.push(format!(
+                "pair {index} ({}): closure {}/{}",
+                off_cell.mode.id(),
+                off_cell.closure,
+                on_cell.closure
+            ));
+        }
+        if off_cell.continuation != on_cell.continuation {
+            reasons.push(format!(
+                "pair {index} ({}): continuation {}/{}",
+                off_cell.mode.id(),
+                off_cell.continuation,
+                on_cell.continuation
+            ));
+        }
+        if off_cell.self_check != on_cell.self_check {
+            reasons.push(format!(
+                "pair {index} ({}): self_check {}/{}",
+                off_cell.mode.id(),
+                off_cell.self_check,
+                on_cell.self_check
+            ));
+        }
+        if off_cell.passed != on_cell.passed {
+            reasons.push(format!(
+                "pair {index} ({}): verdict {}/{}",
+                off_cell.mode.id(),
+                off_cell.passed,
+                on_cell.passed
+            ));
+        }
+        if off_cell.settlement_seen != on_cell.settlement_seen {
+            reasons.push(format!(
+                "pair {index} ({}): settlement exposure {}/{}",
+                off_cell.mode.id(),
+                off_cell.settlement_seen,
+                on_cell.settlement_seen
+            ));
+        }
+        if !off_cell.diff_violations.is_empty() || !on_cell.diff_violations.is_empty() {
+            reasons.push(format!(
+                "pair {index} ({}): diff violations off={} on={}",
+                off_cell.mode.id(),
+                off_cell.diff_violations.len(),
+                on_cell.diff_violations.len()
+            ));
+        }
+        if !off_cell.marker_violations.is_empty() || !on_cell.marker_violations.is_empty() {
+            reasons.push(format!(
+                "pair {index} ({}): marker violations off={} on={}",
+                off_cell.mode.id(),
+                off_cell.marker_violations.len(),
+                on_cell.marker_violations.len()
+            ));
+        }
+    }
+    if !reasons.is_empty() {
+        return ConvGateJudgment {
+            state: "fail",
+            off_cells: off.len(),
+            off_exposed: off.iter().filter(|cell| cell.settlement_seen).count(),
+            on_cells: on.len(),
+            on_exposed,
+            reasons,
+        };
+    }
+
+    // Efficiency: lower candidate-episode rounds and calls, and no new
+    // maximum episode or whole-cell tail. Episode metrics count only the
+    // cells that saw a settled candidate; whole-cell tails count every
+    // cell of the arm.
+    let med = |values: &mut Vec<u64>| {
+        values.sort_unstable();
+        crate::checked_percentile(values, 50).unwrap_or(0)
+    };
+    fn exposed<'a>(cells: &'a [&'a CellOutcome]) -> Vec<&'a CellOutcome> {
+        cells
+            .iter()
+            .copied()
+            .filter(|cell| cell.settlement_seen)
+            .collect()
+    }
+    let mut off_episode_rounds: Vec<u64> = exposed(&off).iter().map(|cell| cell.settlement_episode_rounds).collect();
+    let mut on_episode_rounds: Vec<u64> = exposed(&on).iter().map(|cell| cell.settlement_episode_rounds).collect();
+    let mut off_episode_calls: Vec<u64> = exposed(&off).iter().map(|cell| cell.settlement_episode_calls).collect();
+    let mut on_episode_calls: Vec<u64> = exposed(&on).iter().map(|cell| cell.settlement_episode_calls).collect();
+    let off_whole_tail: Vec<u64> = off
+        .iter()
+        .map(|cell| u64::from(cell.model_rounds_phase_one + cell.model_rounds_phase_two))
+        .collect();
+    let on_whole_tail: Vec<u64> = on
+        .iter()
+        .map(|cell| u64::from(cell.model_rounds_phase_one + cell.model_rounds_phase_two))
+        .collect();
+    let off_med_rounds = med(&mut off_episode_rounds);
+    let on_med_rounds = med(&mut on_episode_rounds);
+    let off_med_calls = med(&mut off_episode_calls);
+    let on_med_calls = med(&mut on_episode_calls);
+    let off_max_rounds = off_episode_rounds.iter().copied().max().unwrap_or(0);
+    let on_max_rounds = on_episode_rounds.iter().copied().max().unwrap_or(0);
+    let off_max_whole = off_whole_tail.iter().copied().max().unwrap_or(0);
+    let on_max_whole = on_whole_tail.iter().copied().max().unwrap_or(0);
+
+    reasons.push(format!(
+        "episode rounds median {off_med_rounds} -> {on_med_rounds}; episode calls median {off_med_calls} -> {on_med_calls}"
+    ));
+    reasons.push(format!(
+        "max episode round tail {off_max_rounds} -> {on_max_rounds}; max whole-cell round tail {off_max_whole} -> {on_max_whole}"
+    ));
+
+    let lower_episodes = on_med_rounds < off_med_rounds && on_med_calls < off_med_calls;
+    let no_new_max = on_max_rounds <= off_max_rounds && on_max_whole <= off_max_whole;
+    if !lower_episodes {
+        reasons.push("candidate-episode rounds/calls are not strictly lower".into());
+    }
+    if !no_new_max {
+        reasons.push("the on arm introduced a new maximum episode or whole-cell tail".into());
+    }
+    let state = if lower_episodes && no_new_max { "pass" } else { "fail" };
+    ConvGateJudgment {
+        state,
+        off_cells: off.len(),
+        off_exposed: off.iter().filter(|cell| cell.settlement_seen).count(),
+        on_cells: on.len(),
+        on_exposed,
+        reasons,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2276,6 +2516,181 @@ mod tests {
             result.passed,
             "reference solution must pass the oracle\nstdout:\n{}\nstderr:\n{}",
             result.stdout, result.stderr
+        );
+    }
+
+    /// Build one gate cell: the failed-outcome constructor is a convenient
+    /// all-fields base; the test then sets the dimensions the gate reads.
+    fn gate_cell(
+        mode: PilotMode,
+        projection: bool,
+        behavior: &str,
+        exposed: bool,
+        episode_rounds: u64,
+        episode_calls: u64,
+        whole_rounds: u32,
+    ) -> CellOutcome {
+        let mut cell = CellOutcome::failed(
+            "retry_policy_dev",
+            mode,
+            AcceptanceProfile::M15V1,
+            CellSwitches {
+                opportunity: false,
+                recovery_surface: false,
+                project_progress: projection,
+            },
+            0,
+            CellFailure::runtime("gate test seed"),
+        );
+        cell.behavior = behavior.into();
+        cell.diff = if behavior == "pass" { "pass" } else { "fail" }.into();
+        cell.closure = if behavior == "pass" { "completed" } else { "failed" }.into();
+        cell.continuation = match mode {
+            PilotMode::Normal => "n/a".into(),
+            PilotMode::Resume if behavior == "pass" => "restored".into(),
+            PilotMode::Resume => "failed".into(),
+        };
+        cell.self_check = if behavior == "pass" { "pass" } else { "fail" }.into();
+        cell.passed = behavior == "pass";
+        cell.settlement_seen = exposed;
+        cell.settlement_episodes = u64::from(exposed);
+        cell.settlement_episode_rounds = episode_rounds;
+        cell.settlement_episode_calls = episode_calls;
+        cell.model_rounds_phase_one = whole_rounds;
+        cell.model_rounds_phase_two = 0;
+        cell
+    }
+
+    #[test]
+    fn conv_gate_with_a_missing_arm_is_inconclusive() {
+        let outcomes = vec![
+            gate_cell(PilotMode::Normal, false, "pass", true, 10, 12, 10),
+            gate_cell(PilotMode::Resume, false, "pass", true, 8, 9, 8),
+        ];
+        let judgment = evaluate_conv_gate(&outcomes);
+        assert_eq!(judgment.state, "inconclusive");
+        assert!(
+            judgment
+                .reasons
+                .iter()
+                .any(|reason| reason.contains("one arm produced no outcomes")),
+            "{:?}",
+            judgment.reasons
+        );
+    }
+
+    #[test]
+    fn conv_gate_zero_on_arm_exposure_is_inconclusive_not_a_pass() {
+        let outcomes = vec![
+            gate_cell(PilotMode::Normal, false, "pass", true, 10, 12, 10),
+            gate_cell(PilotMode::Resume, false, "pass", true, 8, 9, 8),
+            gate_cell(PilotMode::Normal, true, "pass", false, 0, 0, 10),
+            gate_cell(PilotMode::Resume, true, "pass", false, 0, 0, 8),
+        ];
+        let judgment = evaluate_conv_gate(&outcomes);
+        assert_eq!(judgment.state, "inconclusive");
+        assert_eq!(judgment.on_exposed, 0);
+        assert!(
+            judgment
+                .reasons
+                .iter()
+                .any(|reason| reason.contains("zero on-arm exposure")),
+            "{:?}",
+            judgment.reasons
+        );
+    }
+
+    #[test]
+    fn conv_gate_paired_cells_must_match_behavior_world_and_verdict() {
+        let outcomes = vec![
+            gate_cell(PilotMode::Normal, false, "pass", true, 10, 12, 10),
+            gate_cell(PilotMode::Resume, false, "pass", true, 8, 9, 8),
+            gate_cell(PilotMode::Normal, true, "pass", true, 6, 6, 6),
+            gate_cell(PilotMode::Resume, true, "fail", true, 8, 9, 8),
+        ];
+        let judgment = evaluate_conv_gate(&outcomes);
+        assert_eq!(judgment.state, "fail");
+        assert!(
+            judgment
+                .reasons
+                .iter()
+                .any(|reason| reason.contains("behavior pass/fail")),
+            "{:?}",
+            judgment.reasons
+        );
+    }
+
+    #[test]
+    fn conv_gate_per_pair_exposure_mismatch_fails() {
+        let outcomes = vec![
+            gate_cell(PilotMode::Normal, false, "pass", true, 10, 12, 10),
+            gate_cell(PilotMode::Resume, false, "pass", true, 8, 9, 8),
+            gate_cell(PilotMode::Normal, true, "pass", true, 6, 6, 6),
+            gate_cell(PilotMode::Resume, true, "pass", false, 0, 0, 8),
+        ];
+        let judgment = evaluate_conv_gate(&outcomes);
+        assert_eq!(judgment.state, "fail");
+        assert!(
+            judgment
+                .reasons
+                .iter()
+                .any(|reason| reason.contains("settlement exposure true/false")),
+            "{:?}",
+            judgment.reasons
+        );
+    }
+
+    #[test]
+    fn conv_gate_passes_with_strictly_lower_episodes_and_no_new_max() {
+        let outcomes = vec![
+            gate_cell(PilotMode::Normal, false, "pass", true, 12, 14, 12),
+            gate_cell(PilotMode::Resume, false, "pass", true, 14, 16, 14),
+            gate_cell(PilotMode::Normal, true, "pass", true, 8, 10, 8),
+            gate_cell(PilotMode::Resume, true, "pass", true, 10, 12, 10),
+        ];
+        let judgment = evaluate_conv_gate(&outcomes);
+        assert_eq!(judgment.state, "pass", "{:?}", judgment.reasons);
+    }
+
+    #[test]
+    fn conv_gate_rejects_episodes_that_are_not_strictly_lower() {
+        let outcomes = vec![
+            gate_cell(PilotMode::Normal, false, "pass", true, 10, 12, 10),
+            gate_cell(PilotMode::Resume, false, "pass", true, 14, 16, 14),
+            gate_cell(PilotMode::Normal, true, "pass", true, 14, 16, 14),
+            gate_cell(PilotMode::Resume, true, "pass", true, 10, 12, 10),
+        ];
+        let judgment = evaluate_conv_gate(&outcomes);
+        assert_eq!(judgment.state, "fail");
+        assert!(
+            judgment
+                .reasons
+                .iter()
+                .any(|reason| reason.contains("not strictly lower")),
+            "{:?}",
+            judgment.reasons
+        );
+    }
+
+    #[test]
+    fn conv_gate_new_maximum_episode_or_whole_cell_tail_fails() {
+        let outcomes = vec![
+            gate_cell(PilotMode::Normal, false, "pass", true, 10, 12, 10),
+            gate_cell(PilotMode::Resume, false, "pass", true, 10, 12, 10),
+            gate_cell(PilotMode::Normal, false, "pass", true, 10, 12, 10),
+            gate_cell(PilotMode::Normal, true, "pass", true, 8, 8, 8),
+            gate_cell(PilotMode::Resume, true, "pass", true, 8, 8, 8),
+            gate_cell(PilotMode::Normal, true, "pass", true, 14, 8, 14),
+        ];
+        let judgment = evaluate_conv_gate(&outcomes);
+        assert_eq!(judgment.state, "fail");
+        assert!(
+            judgment
+                .reasons
+                .iter()
+                .any(|reason| reason.contains("introduced a new maximum")),
+            "{:?}",
+            judgment.reasons
         );
     }
 }

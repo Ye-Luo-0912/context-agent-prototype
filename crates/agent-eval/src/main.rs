@@ -122,12 +122,16 @@ fn usage() -> ! {
          the runtime.\n\
 \n\
          Completion Convergence V1 paired live gate: the frozen\n\
-         retry_policy_dev pack runs normal/resume cells, each cell bubbling\n\
-         event-derived settlement exposure (first settled candidate,\n\
-         rounds/calls before and after it). A cell with zero exposure makes\n\
-         the gate inconclusive rather than a pass. Evidence lands under\n\
-         crates/agent-eval/evidence/conv-gate/; promotion judgment belongs\n\
-         to the evidence REPORT.\n\
+         retry_policy_dev pack runs every normal/resume cell twice, once\n\
+         with the TASK PROGRESS model projection off and once on; the\n\
+         projection switch is the only variable between the arms, and the\n\
+         arm is part of the evidence pair name. Each cell reports\n\
+         event-derived settlement exposure plus candidate-episode\n\
+         rounds/calls/failures. Zero on-arm exposure makes the gate\n\
+         inconclusive, never a pass; the deterministic pair-parity and\n\
+         efficiency verdict is printed by this runner. Evidence lands\n\
+         under crates/agent-eval/evidence/conv-gate/; promotion judgment\n\
+         belongs to the evidence REPORT.\n\
 \n\
          Item-8 off/on paired live gate for the advisory completion\n\
          opportunity: identical cells with the candidate switch as the only\n\
@@ -1340,6 +1344,7 @@ async fn run_opportunity_gate(
                     long_live::CellSwitches {
                         opportunity,
                         recovery_surface: false,
+                        project_progress: false,
                     },
                 )
                 .await?;
@@ -1453,6 +1458,7 @@ async fn run_recovery_surface_gate(
                         long_live::CellSwitches {
                             opportunity: false,
                             recovery_surface,
+                            project_progress: false,
                         },
                         long_live::AcceptanceProfile::M15V1,
                     )
@@ -1508,11 +1514,14 @@ async fn run_recovery_surface_gate(
 }
 
 /// Completion Convergence V1 paired live gate: the frozen retry_policy_dev
-/// pack runs normal/resume cells with the completion candidate off. Each
-/// cell reports event-derived settlement exposure (first settled candidate,
-/// rounds/calls before and after). Cells with zero exposure make the gate
-/// inconclusive, never a pass; promotion judgment lives in the evidence
-/// REPORT with the frozen criteria.
+/// pack runs every normal/resume cell twice, once with the TASK PROGRESS
+/// model projection off and once on; the projection switch is the only
+/// variable between the arms. Each cell reports event-derived settlement
+/// exposure and candidate-episode rounds/calls/failures. Zero on-arm
+/// exposure makes the gate inconclusive, never a pass; the deterministic
+/// verdict (pair parity plus episode efficiency) is printed here, and
+/// promotion judgment lives in the evidence REPORT with the frozen
+/// criteria.
 async fn run_conv_gate(
     mode_filter: Option<String>,
     repeats: u32,
@@ -1535,36 +1544,46 @@ async fn run_conv_gate(
 
     let pack = long_live::retry_pack();
     let mut outcomes = Vec::new();
-    for repeat in 1..=repeats {
-        for mode in &modes {
-            eprintln!("== {} {} live repeat {repeat}/{repeats} ==", pack.id, mode.id());
-            let dir = tempfile::tempdir()?;
-            let pair = bundle::PairSink::claim(
-                evidence_root.clone(),
-                format!("{}-{}", pack.id, mode.id(),),
-                repeat,
-                repeats,
-                true,
-            );
-            let outcome = long_live::run_pack_cell(
-                &pack,
-                *mode,
-                &pair,
-                model.clone(),
-                dir.path(),
-                long_live::CellSwitches {
-                    opportunity: false,
-                    recovery_surface: false,
-                },
-                long_live::AcceptanceProfile::M15V1,
-            )
-            .await?;
-            println!("{}", outcome.render_line());
-            match bundle::render_evidence(&pair.cell_dir("dynamic")) {
-                Ok(rendered) => println!("{rendered}"),
-                Err(e) => eprintln!("warning: evidence render failed: {e}"),
+    // Paired arms: identical source, pack, serving, mode and repeat; the
+    // model projection switch is the only difference. The arm is a loop
+    // variable, so the gate can never hardcode a single-arm construction.
+    for arm in ["off", "on"] {
+        for repeat in 1..=repeats {
+            for mode in &modes {
+                eprintln!(
+                    "== {} {} {arm} live repeat {repeat}/{repeats} ==",
+                    pack.id,
+                    mode.id()
+                );
+                let dir = tempfile::tempdir()?;
+                let pair = bundle::PairSink::claim(
+                    evidence_root.clone(),
+                    format!("{}-{}-{}", pack.id, mode.id(), arm),
+                    repeat,
+                    repeats,
+                    true,
+                );
+                let outcome = long_live::run_pack_cell(
+                    &pack,
+                    *mode,
+                    &pair,
+                    model.clone(),
+                    dir.path(),
+                    long_live::CellSwitches {
+                        opportunity: false,
+                        recovery_surface: false,
+                        project_progress: arm == "on",
+                    },
+                    long_live::AcceptanceProfile::M15V1,
+                )
+                .await?;
+                println!("{}", outcome.render_line());
+                match bundle::render_evidence(&pair.cell_dir("dynamic")) {
+                    Ok(rendered) => println!("{rendered}"),
+                    Err(e) => eprintln!("warning: evidence render failed: {e}"),
+                }
+                outcomes.push(outcome);
             }
-            outcomes.push(outcome);
         }
     }
 
@@ -1605,13 +1624,17 @@ async fn run_conv_gate(
             );
         }
     }
+    let verdict = long_live::evaluate_conv_gate(&outcomes);
+    println!("\n{}", verdict.render());
     println!("promotion judgment belongs to the evidence REPORT, not this runner");
     Ok(())
 }
 
 /// Read-only event-level slice of every cell in a conv-gate evidence tree:
 /// what actually happened after the first settled candidate. Prints a
-/// bounded one-line profile per cell plus per-mode medians. Never writes.
+/// bounded one-line profile per cell plus per-mode/arm medians. Accepts
+/// both legacy single-arm pair names (`{pack}-{mode}`) and paired-arm
+/// names (`{pack}-{mode}-{off,on}`). Never writes.
 async fn run_conv_tail(evidence_dir: Option<std::path::PathBuf>) -> anyhow::Result<()> {
     let evidence_root = evidence_dir.unwrap_or_else(|| {
         std::path::PathBuf::from("crates/agent-eval/evidence/conv-gate")
@@ -1655,12 +1678,22 @@ async fn run_conv_tail(evidence_dir: Option<std::path::PathBuf>) -> anyhow::Resu
     let mut mode_medians: std::collections::BTreeMap<String, Vec<(u64, u64, u64)>> =
         std::collections::BTreeMap::new();
     for (pair, repeat, event_count, profile) in &rows {
-        let mode = pair
-            .rsplit('-')
-            .next()
-            .filter(|suffix| *suffix == "normal" || *suffix == "resume")
-            .unwrap_or(pair)
-            .to_string();
+        // Pair names are `{pack}-{mode}` (legacy single-arm evidence) or
+        // `{pack}-{mode}-{off,on}` (paired arms); the arm, when present,
+        // is the last dash-separated suffix.
+        let mut segments = pair.rsplit('-');
+        let tail = segments.next().unwrap_or(pair);
+        let (mode, arm) = if tail == "off" || tail == "on" {
+            (
+                segments
+                    .next()
+                    .filter(|suffix| *suffix == "normal" || *suffix == "resume")
+                    .unwrap_or(pair),
+                tail,
+            )
+        } else {
+            (tail, "")
+        };
         let delta = |name: &str| profile.episode_deltas.get(name).copied().unwrap_or(0);
         let tool = |name: &str| profile.episode_tool_calls.get(name).copied().unwrap_or(0);
         let failed = |name: &str| profile.episode_failed_tools.get(name).copied().unwrap_or(0);
@@ -1690,19 +1723,24 @@ async fn run_conv_tail(evidence_dir: Option<std::path::PathBuf>) -> anyhow::Resu
             format_args!("{edits}(er:{failed_edits})"),
             format_args!("{process}/{shell}"),
         );
+        let group = if arm.is_empty() {
+            mode.to_string()
+        } else {
+            format!("{mode}/{arm}")
+        };
         mode_medians
-            .entry(mode)
+            .entry(group)
             .or_default()
             .push((delta("no_progress"), delta("redundant_evidence"), profile.episode_failures));
     }
     println!();
-    for (mode, samples) in &mode_medians {
+    for (group, samples) in &mode_medians {
         let mut no_progress: Vec<u64> = samples.iter().map(|row| row.0).collect();
         let mut redundant: Vec<u64> = samples.iter().map(|row| row.1).collect();
         let mut failed: Vec<u64> = samples.iter().map(|row| row.2).collect();
         println!(
-            "{:<6} median episode no_progress={} redundant={} episode_failed={} (n={})",
-            mode,
+            "{:<12} median episode no_progress={} redundant={} episode_failed={} (n={})",
+            group,
             checked_percentile(&mut no_progress, 50).unwrap_or(0),
             checked_percentile(&mut redundant, 50).unwrap_or(0),
             checked_percentile(&mut failed, 50).unwrap_or(0),
@@ -1724,9 +1762,10 @@ fn load_events_jsonl(path: &std::path::Path) -> anyhow::Result<Vec<agent_contrac
     Ok(events)
 }
 
-/// Calibrated `retry_diag_dev` live smoke: the candidate switch stays off,
-/// only the diag pack runs, and each cell proves the fixture is solvable by
-/// the current serving before a formal window spends its 12-cell budget.
+/// Calibrated `retry_diag_dev` live smoke: the candidate switches (including
+/// the TASK PROGRESS model projection) stay off, only the diag pack runs,
+/// and each cell proves the fixture is solvable by the current serving
+/// before a formal window spends its 12-cell budget.
 async fn run_diag_smoke(
     mode_filter: Option<String>,
     repeats: u32,
@@ -1768,6 +1807,7 @@ async fn run_diag_smoke(
                 long_live::CellSwitches {
                     opportunity: false,
                     recovery_surface: false,
+                    project_progress: false,
                 },
                 long_live::AcceptanceProfile::M15V1,
             )
