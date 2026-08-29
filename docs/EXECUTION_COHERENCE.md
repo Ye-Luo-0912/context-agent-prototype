@@ -674,38 +674,69 @@ the Runtime-computed `ArgumentDigest` (not producer strings), so
 same-argv/different-env and same-path/different-cursor calls no longer
 collide on evidence identity.
 
-### Derived settlement decision boundary (landed 2026-08-29)
+### Derived settlement observation (foundation landed 2026-08-29; task-aware boundary open)
 
-Completion convergence is a derived state, not a policy and not a round
-counter. `ExecutionState::settlement()` recomputes a four-state label from
-typed facts on demand — it is never stored, so a checkpoint cannot carry a
-stale decision:
+Completion convergence must be a derived state, not a policy or round counter.
+The landed `ExecutionState::settlement()` cheaply recomputes a four-state label
+from verification validity and the typed execution-obligation ledger. It is
+not stored, so a checkpoint cannot carry a stale computed label, and changes
+are published as `ExecutionFrontier.settlement` events.
+
+That implementation is an **execution-local observation**, not yet the stable
+whole-task decision boundary. Review found three contract gaps:
+
+- `TaskProgressView.settlement` is populated but not rendered by
+  `PromptAssembler::render_task_progress`, so it is not model-visible;
+- `ExecutionState` cannot see current `TaskAnchor` acceptance criteria,
+  open loops, next action, actor in-flight state or all current user/task epoch
+  conditions, so its `SettledCandidate` can precede legitimate later work; and
+- current metrics count every action after the first candidate even after a
+  reopening mutation, which is observation rather than causal tail accounting.
+
+Until the task-aware join lands, interpret the strongest current label as
+“current execution world verified with no typed execution obligation,” not as
+“whole task ready to finish,” and do not project it to the model. The accepted
+next contract is:
 
 ```text
-Working            any new accepted mutation (Known or Unknown footprint),
-                   new user constraint, stale/failed verification, or
-                   unresolved obligation returns here, whatever the label
-                   was before
-VerificationDue    an unmet verification obligation exists (validity is
-                   Pending/Stale/Failed) and no independent failed block is
-                   still open
-VerifiedCurrent    verification covers the current world but a typed
-                   failure obligation is still open
-SettledCandidate   verification is Current, verification_due is clear, and
-                   the obligation ledger is empty
+ExecutionReady     current trusted verification matches task-verification,
+                   directive and workspace revisions; no in-flight cleanup,
+                   unresolved obligation or failed command
+VerifiedCurrent    ExecutionReady, but task-level readiness is unproved
+SettledCandidate   ExecutionReady plus current task/user epoch, empty open
+                   loops and next action, and explicit current evidence for
+                   every bounded acceptance criterion
+Working            any new directive/boundary, mutation, failure, stale proof
+                   or reopened task-progress fact invalidates readiness
 ```
 
-The derived label is published as `ExecutionFrontier.settlement` only when
-it changes, and `TaskProgressView.settlement` projects a bounded neutral
-one-liner only in the two covered states. `SettledCandidate` is a decision
-boundary for the model — ordinary final answer, `task.complete` for whole
-durable closure, or a concrete continuation — never an automatic stop and
-never an auto-close. The verification basis is `spec_revision` (tracked by
-the task anchor's verification revision), so progress-only anchor changes
-do not re-open a settled task while boundary changes do. Deterministic
-actor scenarios cover ordinary final, durable closure, genuine remaining
-work, mutation after verification, stale verification, proposal settlement
-across suspend/resume, and cold same-run restore.
+The actor/runtime owns the join because it alone has task and in-flight
+authority. It reuses `TaskAnchor`, `ExecutionState`, the verification tuple and
+bounded evidence identities; it does not move turn state into Core or Context.
+Absent explicit acceptance coverage it fails closed at `VerifiedCurrent`.
+Only after deterministic reopening/restore tests pass may `PromptAssembler`
+render one neutral, bounded fact behind a default-off switch. That fact preserves
+the model's choice of ordinary final, durable `task.complete`, or concrete
+continuation and never auto-closes. Metrics use settlement episodes that end on
+reopening, and the live promotion gate compares true projection-off/on arms.
+Detailed task: [`LONG_TASK_EVALUATION.md`](LONG_TASK_EVALUATION.md).
+
+The task-aware join landed 2026-08-29 behind the default-off
+`project_progress` switch: acceptance criteria declared on the anchor are
+bound by the current trusted verification pass at observation time (one
+criterion-addressed claim per declared criterion, evidence-linked to that
+pass; absent criteria fail closed at `VerifiedCurrent`), and settlement
+episodes start on entry to a task-aware candidate and end at the first
+reopening transition or terminal outcome. The true projection-off/on paired
+gate then ran on an approved 8-cell budget: 8/8 cells PASS with 0 NOT_RUN,
+but the verdict is FAIL — pair 0 (normal r1) settlement exposure is
+off=none / on=seen (a verified cell whose last trusted PASS has no trailing
+tool observation records no episode and is inconclusive by rule),
+marker-violation counts differ in 3/4 pairs (needle-shape misses the
+harness oracle tolerates), and episode-rounds/calls medians are 1→1, not
+strictly lower. The frozen rule keeps the projection default-off and
+returns the gate to observation; no promotion claim follows.
+Facts: [`evidence/conv-gate/REPORT.md`](../crates/agent-eval/evidence/conv-gate/REPORT.md).
 
 ### Protocol working set (turn checkpointing)
 

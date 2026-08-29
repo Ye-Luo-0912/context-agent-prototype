@@ -25,12 +25,15 @@ copy them back.
 | M12 Effect Runtime | ✅ closed 2026-08-27 | The bounded evidence table proves every brokerable production effect crosses the common reserve/dispatch/ack path, crash windows reconcile as NotApplied/Applied/Ambiguous, authority/revocation fencing holds, and generic shell/process are explicit non-transactional exceptions (`crates/agent-eval/evidence/platform-closure/m12/`, clean-tree PASS; regenerate via `agent-eval --platform-closure-m12`). Requester-side application is the V1 contract; broker-owned remote execution is not required without a remotable consumer. Details: [`PLATFORM_SECURITY.md`](PLATFORM_SECURITY.md). |
 | M13 Extension Sandbox | ✅ closed 2026-08-27 | Clean-tree closure audit: real-child activation per supported profile with post-spawn mechanism attestation, both required refusals (missing write confinement; native untrusted floor), and contract negatives — zero unresolved rows (`crates/agent-eval/evidence/platform-closure/m13/`, regenerate via `agent-eval --platform-closure-m13`). V1 acceptance is truthful fail-closed activation, not universal native availability. Running untrusted generated code through WASI remains V2. Details: [`PLATFORM_SECURITY.md`](PLATFORM_SECURITY.md). |
 | M14 Resource Policy | ✅ | Schema/context quotas, standing grants, output broker, authority leases. Further typed policy is not a reopen of this gate. |
-| M15 Real Evaluation | 🧪 serving tuple pinned; evaluator validity calibrated; Completion Convergence V1 readiness pending; exact-source preflight and formal v3 window follow | Reproducible per-cell artifacts. The frozen semantics are in [`M15_ACCEPTANCE.md`](M15_ACCEPTANCE.md): V1 = the banked planes plus one live development pack (3 tasks × normal/resume × 2). `add_test` is Tool Surface, not Context; frozen `context-bench.v1` stays frozen; 300×3 is parked. The three 2026-08-28 v2 attempts are forensic-only because closure was misprojected, pack identities were reused, failures were untyped and the report was hand-maintained. The repaired v3 path persists typed facts and exact pack identity, classifies transport as NOT_RUN versus output-limit as FAIL, and generates a report from an exact 12-cell window manifest. A bounded dirty-tree preflight pins PinAI `/v1` + `gpt-5.6-luna` + Responses + 128,000, but predates the `fs.mkdir` catalog revision. Evaluator validity was calibrated 2026-08-29 (fixture authoring): the diag golden saturates via `u128` widening and fixture self-check runs both pack oracles offline, with pack digests recorded. A 2-cell diag smoke on the pinned serving failed both cells on that overflow edge — now with needle/oracle-consistent evidence (the old check table would have passed the same fix). **Not closed** — the recovery-surface live run had zero treatment exposure and is inconclusive, so the catalog-cold baseline remains; the 55-round tail still requires the bounded completion-convergence readiness slice; and the source-bound preflight must be rerun on the calibrated source. Do those in order, rerun one exact-source preflight, then pass and commit one clean-tree v3 window. |
+| M15 Real Evaluation | 🧪 three valid v3 windows failed; task-aware convergence landed steps 1–4 but its paired gate FAILED promotion; projection stays off | The typed v3 harness and calibrated fixtures are valid. Three clean pinned-serving windows ran 2026-08-29 and failed 11/12, 9/12 and 10/12; migrate + policy are 24/24, formal diag is 6/12, and the sole recurring failure is the calibrated saturation edge. Task-aware Completion Convergence landed all four delivery steps 2026-08-29 and ran the true projection off/on gate on an approved 8-cell budget: 8/8 cells PASS, 0 NOT_RUN, but the verdict is FAIL on strict parity (pair-0 exposure asymmetry, marker needle-shape parity in 3/4 pairs, episode medians 1→1). The projection stays default-off and the gate returns to observation. **Not closed.** Only a promoted projection may enter the next exact-source preflight, and the prospective cross-window rule is frozen in [`M15_ACCEPTANCE.md`](M15_ACCEPTANCE.md): no fourth unchanged window or sampling until a lucky 12/12. |
 | V2 Self-Iteration | 🔒 blocked | Until M12/M13/M15 close. The agent may grow capabilities, never evaluation or permission Core authority. |
 
-Open gate order: M12 ✅ → M13 ✅ → V1 candidate → evaluator validity →
-Completion Convergence V1 readiness → exact-source preflight → formal M15 →
-V2 Self-Iteration. Both platform gates closed on their named clean-tree
+Open gate order: M12 ✅ → M13 ✅ → V1 candidate → evaluator validity ✅ →
+Task-aware Completion Convergence → real projection off/on gate (ran
+2026-08-29; FAILED promotion, back at observation) → freeze the
+cross-window decision rule → exact-source preflight → one predeclared formal
+M15 window → V2 Self-Iteration. Both platform gates closed on their named
+clean-tree
 evidence (2026-08-27); M14 is already closed and is not reopened or inserted
 back into the active sequence. Context live evidence runs in parallel and does
 not retune GC. Tool Surface edit reliability may improve in parallel, but it
@@ -65,27 +68,43 @@ does not reorder or close any gate.
    Its full 24-cell live run had zero `RecoverySurface`/`next_directory`
    exposure; all eight policy cells instead catalog-loaded and called
    `fs.mkdir`. The off/on tail is therefore not attributable to the switch.
-   Keep the baseline and switch off as `NOT_EXERCISED`, repair mechanical
-   exposure/report accounting, and fix the diagnosis golden fixture plus
-   oracle self-check. The diagnosis fixture is calibrated (2026-08-29):
+   Keep the baseline and switch off as `NOT_EXERCISED`. Mechanical exposure
+   accounting, workspace-cleanliness alignment and diagnosis calibration
+   landed as observation/evaluator work (2026-08-29):
    overflow-safe golden, directive names the saturation edge, hidden check
    demands an overflow-safe marker, and self-check runs both pack oracles
-   offline; the mechanical exposure/report-accounting repair remains with
-   Completion Convergence V1. Do not advance the always-ready fallback from
-   this run.
-5. Completion Convergence V1 is a bounded pre-M15 readiness task. Instrument
-   the tail after the last authoritative mutation/current verification, align
-   workspace artifact visibility with the evaluator, then derive dynamic
-   `Working -> VerificationDue -> VerifiedCurrent -> SettledCandidate` state
-   from existing execution facts. Preserve the model's choice of ordinary
-   final, whole-task `task.complete`, or concrete continuation. No auto-close,
-   fixed-round stop, revived `CompletionOpportunity`, Context/GC change,
-   transcript expansion, TaskGraph or learned planner. Deterministic scenarios
-   precede any small exposure-qualified paired live gate.
-6. Formal M15 only from versioned per-cell artifacts. Do not use one
-   A/B/C for every layer. The frozen design lives in
-   [`M15_ACCEPTANCE.md`](M15_ACCEPTANCE.md); its decision points (serving
-   pin, cost, fixture authoring, closure reporting) gate the first cell.
+   offline. Do not advance the always-ready fallback from this run; the open
+   work is the separate task-aware convergence join below.
+5. Task-aware Completion Convergence is the bounded pre-M15 readiness task.
+   Keep the landed labels/events as observation, but reserve
+   `SettledCandidate` for current task authority plus current verification,
+   zero in-flight work/obligations/known failures/open loops/next action, and
+   explicit bounded acceptance coverage. Without task-level coverage, stop at
+   `VerifiedCurrent`. New directives, boundary changes, mutations, failures or
+   stale proof reopen work. Only after deterministic safety proof may
+   `PromptAssembler` render one neutral bounded fact behind a default-off
+   switch. Replace first-candidate lifetime tails with episodes that close on
+   reopening, then compare projection off/on with normal/resume and at least two
+   repeats in both arms. Preserve ordinary final, whole-task `task.complete`
+   and concrete continuation; no auto-close, fixed-round stop, revived
+   `CompletionOpportunity`, Context/GC change, transcript expansion, TaskGraph
+   or learned planner.
+   Landed 2026-08-29, gated the same day: all four steps shipped (task-aware
+   settle with fail-closed acceptance coverage, default-off projection with
+   request-level tests, settlement episodes, per-pair `evaluate_conv_gate`),
+   then the off/on gate ran 8/8 cells PASS / 0 NOT_RUN and FAILED promotion on
+   strict parity (pair-0 exposure asymmetry; marker needle-shape counts differ
+   in 3/4 pairs; episode medians 1→1). The projection stays default-off and the
+   gate is back at observation; no rerun before a bounded diagnosis of the
+   exposure-timing and marker-parity causes.
+6. Formal M15 only from versioned per-cell artifacts. Three valid failed v3
+   windows remain evidence and cannot be retried unchanged. Before a new source
+   is evaluated, freeze the missing prospective cross-window decision rule in
+   [`M15_ACCEPTANCE.md`](M15_ACCEPTANCE.md). After the task-aware change passes
+   deterministic and paired gates, run an exact-source preflight followed by
+   exactly one predeclared 12-cell window. A valid FAIL rejects that candidate
+   and returns to diagnosis rather than authorizing another sample. Do not use
+   one A/B/C for every layer.
 7. Execution Convergence V1 candidate gate (revised 2026-08-23 second
    review; lineage metrics added after the obligation-run evidence):
    before any V1 candidate claim, all of the following hold —

@@ -340,11 +340,11 @@ check table that fix would have passed every needle while failing the oracle,
 reproducing the audit's complaint; the calibrated needle and oracle reject it
 consistently. Keep the fixture as the M15 diag pack: a failing diag cell is an
 honest reported fact, not a harness artifact. The
-surviving blocker is a missing completion decision boundary; see
-CONV-CLOSE-01 below.
+surviving blocker is a missing task-aware completion decision boundary; see
+CONV-CLOSE-02 below.
 
-The one-cell product preflight cleared 2026-08-29 (after Completion
-Convergence V1 readiness): `retry_diag_dev` normal PASSed on the same pinned
+The one-cell product preflight cleared 2026-08-29 on the observation-foundation
+source: `retry_diag_dev` normal PASSed on the same pinned
 serving at clean HEAD `09cce69` ([`evidence/diag-smoke/REPORT.md`](../crates/agent-eval/evidence/diag-smoke/REPORT.md))
 in 14 rounds / 22 calls / 1 failed output / 139,886 ms with the hidden oracle
 green, 6 durable checkpoints and settlement exposed (`seen`, pre 9/15 →
@@ -358,10 +358,10 @@ solving the overflow edge. The resume arm passed the same one-cell preflight
 same-day at clean HEAD `65f6cc8` (two resumed turns, 5 + 4 rounds / 19 calls /
 0 failed outputs / 104,516 ms, hidden oracle green, settlement exposed
 pre 8/19 → post 1/0, ordinary-final closure, the same single needle-shape
-miss). Both one-cell preflight arms are cleared. M15 stays open until one
-complete clean-tree 12-cell v3 window passes.
+miss). Both one-cell preflight arms cleared, but the three subsequent formal
+windows all failed. M15 stays open and no fourth unchanged retry is allowed.
 
-### CONV-CLOSE-01 — Completion Convergence V1 (deterministic foundation + exposure-qualified live gate ran 2026-08-29; efficiency open)
+### CONV-CLOSE-01 — Completion Convergence observation foundation (landed 2026-08-29; causal interpretation superseded)
 
 The 55-round / 129-call `retry_policy_dev` resume cell is the current bounded
 readiness blocker, but `task.complete` itself is not established as its root
@@ -400,7 +400,7 @@ order:
    gate with at least two paired repeats only after those scenarios and exposure
    accounting are green.
 
-Landed 2026-08-29 (slices 1–5; the live gate is the remaining step):
+Landed 2026-08-29 as an observation foundation:
 
 - Slice 1 cleanliness: `ensure_workspace_git` now writes `.gitignore`
   containing `.focus-agent/`, `.gate/`, `target/` and `Cargo.lock`,
@@ -411,15 +411,14 @@ Landed 2026-08-29 (slices 1–5; the live gate is the remaining step):
 - Slice 2 metrics: `RunMetrics` aggregates the first settled-candidate
   frontier event and reports `settlement: seen / pre_rounds / pre_calls /
   post_rounds / post_calls`; event-derived and unit-tested.
-- Slices 3–4 dynamic state and decision boundary: `SettlementLabel`
+- Slices 3–4 execution-local state observation: `SettlementLabel`
   (`Working | VerificationDue | VerifiedCurrent | SettledCandidate`) is
   derived by `ExecutionState::settlement()` from verification validity plus
   the typed obligation ledger — never from fixed round counts; any new
-  mutation, obligation, stale/failed verification or boundary change returns
-  the task to `Working`. The label is published on `ExecutionFrontier` only
-  on change, and `TaskProgressView.settlement` projects a bounded neutral
-  one-liner only in the covered states; no stop instruction, no auto-close,
-  no revival of `CompletionOpportunity`. The stale runtime comment describing
+  mutation, obligation or stale/failed verification returns the execution
+  state to `Working`. The label is published on `ExecutionFrontier` only on
+  change, and `TaskProgressView.settlement` is populated. The stale runtime
+  comment describing
   `task.complete` as catalog-cold was removed (the v5 registry always loads
   it).
 - Slice 5 deterministic proof: seven actor-level scripted scenarios over the
@@ -431,14 +430,14 @@ Landed 2026-08-29 (slices 1–5; the live gate is the remaining step):
 - Remaining slice-1 exposure accounting landed 2026-08-29 with the gate
   runner: the cell summary now carries event-derived settlement facts
   (`settlement_seen` plus pre/post rounds and calls), cell outcome lines
-  render them, and the new `--conv-gate` runner (retry_policy_dev,
-  normal/resume, at least two paired repeats) marks any cell with zero
+  render them, and the new `--conv-gate` runner (`retry_policy_dev`,
+  normal/resume, at least two repeats) marks any cell with zero
   settlement exposure as inconclusive rather than a pass.
-- The exposure-qualified live gate ran 2026-08-29 on the pinned serving
+- The live observation run completed 2026-08-29 on the pinned serving
   (`crates/agent-eval/evidence/conv-gate/REPORT.md`): 4/4 cells PASS with
   4/4 settlement exposure and durable closure by the model's own
-  `task.complete`. The settlement boundary is therefore verified under a
-  real serving, including cancel/resume and cold restore.
+  `task.complete`. This proves event exposure and ordinary task success only;
+  it does not prove a model treatment effect.
 - Read-only `--conv-tail` then sliced the post-settlement tail at the event
   level: the normal arm is clean (0 failed outputs, ≤4 `no_progress`
   deltas after the settled label); the resume median is driven by resume
@@ -447,27 +446,145 @@ Landed 2026-08-29 (slices 1–5; the live gate is the remaining step):
   invalidations, 15 `no_progress`, 8 failed outputs) — each mutation
   returns the derived state to `Working` and the fresh verification
   re-settles it, exactly the designed behavior, and resume r2 is clean.
-  The efficiency criterion therefore remains not claimed, but the tail is
-  characterized as real remaining work plus retries in one cell rather
-  than a settlement-boundary failure. Do not claim convergence or M15
-  closed. Any future model-side treatment of the settlement projection is
-  a policy/surface question outside this audit and must preserve the
-  no-lost-work and no-auto-close invariants.
+  This characterization is diagnostic only because the counter never closes
+  the first candidate episode when later work reopens.
 
-The bounded progress payload may retain only the current goal, unresolved
-constraints, checked file identities/revisions (not file bodies), latest
+Post-review correction: the claimed decision boundary was not model-visible.
+`TaskProgressView.settlement` is not passed through
+`PromptAssembler::render_task_progress`, and `TaskProgressView::is_empty` also
+does not make that field sufficient to emit a progress block. The current
+eligibility function sees verification validity plus the execution obligation
+ledger, but not `TaskAnchor` acceptance criteria/open loops/next action, known
+failed commands, in-flight cleanup, or the current user/task epoch. Finally,
+`--conv-gate` has only normal/resume cells with both candidate switches off;
+there is no treatment/control arm. Normal versus resume is not an off/on pair.
+The report remains immutable, but its causal and efficiency interpretation is
+superseded. CONV-CLOSE-02 owns the correction.
+
+The bounded progress-payload contract remains: it may retain only the current
+goal, unresolved constraints, checked file identities/revisions (not file bodies), latest
 verification basis/result, deduplicated known failed commands and one next
 action. Every collection is capped and superseded by stable identity. It is a
-resume/control summary, never an append-only transcript. Also remove the stale
-runtime comment that still describes `task.complete` as catalog-cold; the v5
+resume/control summary, never an append-only transcript. The stale runtime
+comment that described `task.complete` as catalog-cold was removed; the v5
 registry is the source of truth and always loads it.
 
 This slice does not revive the failed `CompletionOpportunity`, add standing
 prompt pressure, expand the transcript, retune Context/GC, introduce a
 TaskGraph/learned planner, or specialize behavior for a fixture/provider. Its
-promotion gate requires mandatory-success and resume-integrity parity, lower
-post-settlement tail rounds/calls, no new max tail, and no loss of valid
-unfinished-work continuation.
+corrected promotion gate is owned by CONV-CLOSE-02 and uses task-aware episodes,
+not the first-candidate lifetime tail.
+
+### CONV-CLOSE-02 — Task-aware Completion Convergence (steps 1–4 landed 2026-08-29; step-4 paired gate FAILED promotion; projection default-off)
+
+Root cause: the first slice answered “is the current execution world verified?”
+but named the strongest answer `SettledCandidate`, which sounds like “is the
+task done?”. Those are different predicates. The next implementation must keep
+the cheap execution-local predicate, then add an actor-owned task eligibility
+join over bounded existing authority. It must not move task state into Core or
+Context and must not add transcript history.
+
+The target algorithm is a monotonic-within-epoch, invalidation-driven join:
+
+```text
+execution_ready = trusted verification is Current on
+                  (task verification revision, directive revision,
+                   workspace revision)
+                  AND no in-flight/cancel cleanup
+                  AND no open execution obligation
+                  AND no unresolved failed command
+
+task_ready      = execution_ready
+                  AND current user/task epoch matches
+                  AND TaskAnchor.open_loops is empty
+                  AND TaskAnchor.next_action is empty
+                  AND every bounded acceptance criterion has current,
+                      explicit evidence coverage
+
+label           = SettledCandidate only when task_ready
+                  else VerifiedCurrent when execution_ready
+                  else VerificationDue or Working
+```
+
+Acceptance coverage must be bounded, criterion-addressed and evidence-linked;
+free-form “done” text is not proof. Reuse the current anchor CAS, verification
+basis and evidence refs where they can express the fact; add only the smallest
+typed coverage primitive if they cannot. With no declared coverage,
+fail closed at `VerifiedCurrent`. A new directive/constraint, anchor-boundary
+revision, accepted mutation, failed command, stale/failed verification, opened
+loop or non-empty next action invalidates task readiness immediately. Progress
+updates may clear readiness only through the existing anchor CAS; they never
+rewrite user constraints.
+
+Delivery order and exit:
+
+1. Correct derivation and add deterministic negatives for unmet acceptance,
+   open loop, next action, failed command, new directive, boundary change,
+   in-flight cleanup, mutation-after-verify and cold restore. Preserve the
+   existing ordinary-final and durable-completion positives.
+2. Keep model projection absent/default-off until step 1 is green. Then wire one
+   neutral settlement fact through `PromptAssembler`; add request-level tests
+   proving it is present only for a task-aware candidate and that the whole
+   TASK PROGRESS block stays within 2,048 characters. No stop instruction,
+   auto-close or tool-surface lease.
+3. Replace first-candidate lifetime counters with settlement episodes. An
+   episode starts on entry to `SettledCandidate` and ends on the first reopening
+   transition or terminal outcome. Report episode rounds/calls/failures plus
+   whole-cell totals; do not charge legitimate phase-two work to an earlier
+   episode.
+4. Build a true off/on runner. Both arms use the same source, pack, serving,
+   mode and repeat; only the model projection switch differs. Run normal and
+   resume in both arms with at least two paired repeats. Zero on-arm exposure is
+   inconclusive. Promotion requires mandatory behavior/diff/resume parity, no
+   lost unfinished work, lower candidate-episode rounds and calls, and no new
+   maximum episode or whole-cell tail.
+5. Only a promoted, default-on projection may enter the next exact-source M15
+   preflight. A failed or inconclusive gate leaves projection off and returns
+   to observation; it does not trigger prompt tuning or Context/GC retuning.
+
+Progress (2026-08-29):
+
+- Steps 1–3 landed as a bounded batch: task-aware settle (`task_ready` =
+  `execution_ready` + current epoch + empty open loops / next action +
+  acceptance coverage, fail-closed at `VerifiedCurrent` with no declared
+  coverage); the neutral settlement fact wired through `PromptAssembler`
+  behind the default-off `project_progress` switch with request-level tests
+  (present only for a task-aware candidate; TASK PROGRESS stays within its
+  2,048-character bound); settlement-episode counters replacing the
+  first-candidate lifetime tail. Deterministic positives and negatives
+  cover unmet acceptance, open loop, next action, failed command, new
+  directive, boundary change, in-flight cleanup, mutation-after-verify and
+  cold restore.
+- Two live-cell prerequisites landed: trusted verification PASS clears
+  identity-exact `failed_commands` bound to the current basis/directive/
+  workspace tuple (a fresh failure re-records and re-blocks), and provider
+  retry spans a request-level window (~62 s) plus a whole-cell rerun wrapper
+  (up to 3 runs, 30 s/60 s backoff) so transport outages cannot silently
+  censor gate evidence.
+- Live acceptance data source landed: the harness patches the bounded
+  acceptance declaration onto the task; the runtime binds the current
+  trusted verification pass as the coverage claim for every declared
+  criterion at observation time, so cells reach a task-aware candidate
+  through the real boundary. `task.manage` remains the only other writer;
+  public commands keep the same contract.
+- Step 4 ran 2026-08-29 (approved 8-cell budget, `--allow-dirty` on a dirty
+  tree; `project_progress` is the only arm difference). 8/8 cells PASS
+  behavior/diff/closure/continuation, provider healthy, 0 NOT_RUN, one
+  request-level retry absorbed. Verdict FAIL: pair-0 (normal r1) settlement
+  exposure asymmetry (off none / on seen — the off cell's last trusted PASS
+  had no trailing tool observation, so no episode was recorded and the cell
+  is inconclusive by rule), marker-violation counts differ in 3/4 pairs
+  (needle-shape misses the behavioral oracle tolerates, in both arms), and
+  episode rounds/calls medians are 1→1 (not strictly lower). Facts:
+  [`evidence/conv-gate/REPORT.md`](../crates/agent-eval/evidence/conv-gate/REPORT.md).
+  Per the frozen rule the projection stays default-off and the gate returns
+  to observation; no prompt tuning or Context/GC retuning is triggered.
+
+Non-goals: changing `task.complete`, RecoverySurface, provider cache policy,
+fixture/oracle wording, Context selection/GC/retrieval/prompt packing, TaskGraph,
+learned planning, or provider-specific instructions. The retained C Context
+advantage remains banked; this task reduces execution amplification without
+spending it.
 
 ### Fingerprint v2 — preview ≠ identity (fixed 2026-08-23)
 
@@ -1469,7 +1586,27 @@ window ran 2026-08-29 at clean HEAD `f625d39`
 (`evidence/m15-window/_windows/1787970773734/`, mechanical report, 0 NOT_RUN,
 cached input metered): 9/12 PASS; all three failures are diag cells (normal
 r1/r2, resume r1), while migrate and policy pass all 8 cells with exact-tuple
-continuation. A third clean-tree v3 window ran 2026-08-29 (`evidence/m15-window/_windows/1787973547152/`, 10/12 PASS): the two failures are again diag cells; `retry_migrate_dev` + `retry_policy_dev` have passed 24/24 across the three windows. All six failing diag cells across all windows finalize `checked_shl` (guards shift-count ≥ 64 only, not bits shifted out), and all eight passing diag cells use `checked_mul`/`saturating_mul` — a deterministic solver semantic trap, not a harness or serving defect; M15 therefore remains open. The recurring failure surface is the same calibrated diag overflow edge (~57% per-cell solve rate).
+continuation. A third clean-tree v3 window ran 2026-08-29 at clean HEAD
+`779604559f682dddc54018e99e5fb35b0080e965`
+(`evidence/m15-window/_windows/1787973547152/`, 10/12 PASS, rounds/tools
+179/403, cached/input 200,704/1,942,278): the two failures are again diag
+cells; `retry_migrate_dev` + `retry_policy_dev` have passed 24/24 across the
+three windows. All six failing formal diag cells finalize `checked_shl`
+(guards shift-count ≥ 64 only, not bits shifted out), and all six passing
+formal diag cells use `checked_mul`/`saturating_mul`. Formal diag is therefore
+6/12 PASS; including all calibrated same-fixture `diag-smoke` evidence it is
+9/17 PASS. This is a deterministic semantic trap and a model/solver weakness
+on the pinned serving, not a harness or transport defect. M15 remains open.
+
+The original acceptance contract bounded repeats inside one window but did not
+define valid-FAIL retries across windows. Three valid failed windows now make
+that omission decision-relevant: repeated unchanged sampling until a lucky
+12/12 would invalidate the gate. Do not run a fourth unchanged window.
+`M15_ACCEPTANCE.md` now requires a prospective rule: after a source change,
+deterministic and paired convergence gates, and exact-source preflight, exactly
+one predeclared confirmation window is allowed for that candidate. A valid
+failure rejects it and returns to diagnosis. Historical windows remain facts
+and are not retroactively aggregated into a new rule.
 
 ## Closed archive (index only)
 

@@ -51,28 +51,27 @@ live decision is `NOT_EXERCISED`, and any future paired report must fail closed
 as inconclusive when exposure is zero. Evidence:
 [`recovery-surface-gate/REPORT.md`](../crates/agent-eval/evidence/recovery-surface-gate/REPORT.md).
 
-The diagnosis failure is also evaluator calibration, not established serving
-failure: the checked-in `retry_diag_dev` minimal/golden solution fails its own
-saturation oracle (the `u64` shift wraps to zero on large attempts), while
-fixture self-check does not execute that oracle. Calibrated 2026-08-29 under
-the §0 fixture-authoring provision: the golden solution now saturates via
-`u128` widening, the directive and golden `DIAGNOSIS` name the
-saturate-not-wrap edge, the hidden check requires an overflow-safe marker,
-fixture self-check executes each pack's oracle against the untouched seed and
-the scripted solution, and the pack digests are recorded as frozen constants
-(diag regenerated to `2fff51573097fe4c833215420dd0da74f11a645ef5c859bdd9bba87e5b427eeb`;
-migrate unchanged). A 2-cell `--diag-smoke` then failed both cells on the
-overflow edge with needle/oracle-consistent evidence (the model used
-`checked_shl` + fallback, which does not catch bits shifting out of the value;
-the old check table would have passed that fix). Diag cells remain in the
-window; a failing diag cell is an honest reported fact, not a harness
-artifact. Then complete the bounded Completion Convergence V1
-readiness slice and rerun the same one-cell product preflight on that source
-before the formal window. These repairs preserve the frozen task meaning and
-report-only closure semantics; they do not permit a serving switch or a
-mid-window change.
+The diagnosis fixture was calibrated 2026-08-29 under the §0 fixture-authoring
+provision: the golden solution saturates via `u128` widening, the directive and
+golden `DIAGNOSIS` name the saturate-not-wrap edge, the hidden check requires an
+overflow-safe marker, fixture self-check executes each pack oracle against the
+untouched seed and scripted solution, and the frozen digests are recorded
+(diag `2fff51573097fe4c833215420dd0da74f11a645ef5c859bdd9bba87e5b427eeb`;
+migrate unchanged). A failing diag cell is therefore an honest result, not a
+golden/oracle mismatch.
 
-No formal M15 development window currently exists. M15 remains open.
+Three formal, clean, identity-consistent v3 windows now exist and all failed:
+`1787966622822` passed 11/12, `1787970773734` passed 9/12, and
+`1787973547152` passed 10/12. All have 0 NOT_RUN. Migrate + policy are 24/24
+across the windows; formal diag is 6/12 and every failure uses the same invalid
+`checked_shl` saturation strategy. This is not a harness or transport defect;
+it is a model/solver weakness on the pinned serving. M15 remains open.
+
+The landed Completion Convergence slice does not yet justify another window:
+its label is not rendered to the model, eligibility is execution-local rather
+than task-aware, tail accounting survives reopened work, and its live runner
+has no projection-off treatment arm. Correct those issues and apply the
+prospective cross-window rule in §5 before spending another formal window.
 
 ## 1. V1 candidate composition
 
@@ -166,6 +165,24 @@ is allowed. Protocol `auto`, fixture filters, non-two repeat counts and
 `--allow-dirty` are rejected by the formal command. A censored window remains
 auditable but must be rerun whole.
 
+Valid-FAIL windows are different from censored windows. The original freeze
+bounded repeats inside a window but omitted a cross-window valid-FAIL retry
+budget. The three valid failed windows in §0 remain evidence and must not be
+retroactively pooled under a newly invented aggregate. Repeating an unchanged
+source/serving until a lucky 12/12 is prohibited.
+
+Prospective rule for the current route:
+
+1. no fourth unchanged v3 window;
+2. a materially changed candidate must first pass its deterministic gates, a
+   true settlement-projection off/on gate, and an exact-source preflight;
+3. that candidate receives exactly one predeclared 12-cell confirmation
+   window under §§2–4;
+4. a valid FAIL rejects that candidate and returns to diagnosis; only NOT_RUN
+   permits a whole-window rerun, because it produced no decision-grade sample;
+5. any future aggregate or sequential rule requires an explicit acceptance
+   refreeze before observing new cells and cannot reinterpret prior windows.
+
 The context mechanism, GC, retrieval and prompt packing remain frozen. M15 is
 an execution/evaluation gate and cannot authorize a context retune.
 
@@ -186,25 +203,31 @@ surface, reject a serving or close M15.
 
 ## 7. Next execution gate
 
-Before spending a 12-cell window:
+Before spending another 12-cell window:
 
 1. keep the relevant deterministic evaluator/provider/runtime tests green;
-2. evaluator validity is calibrated (done 2026-08-29): the diagnosis golden
-   solution passes and fixture self-check executes each pack's oracle offline
-   against seed and scripted solution; remaining sub-items are mechanical
-   paired-count reconstruction with recorded treatment exposure, and
-   aligning fixture artifact visibility with allowed-diff policy;
-3. land and deterministically prove the bounded Completion Convergence V1
-   readiness slice described in `LONG_TASK_EVALUATION.md`, without automatic
-   closure, Context/GC changes or fixed-round stopping;
-4. rerun the bounded one-cell source/product preflight without changing the
-   serving tuple;
-5. use the preflight-pinned serving tuple in §0 without fallback or automatic
-   protocol negotiation;
-6. record the exact serving and clean source identity;
-7. set an explicit `OPENAI_API_PROTOCOL` and run one uninterrupted 12-cell v3
-   window with `agent-eval --m15-window`;
-8. accept only the mechanically regenerated report.
+2. keep evaluator validity and fixture cleanliness green (done 2026-08-29);
+3. correct Task-aware Completion Convergence as specified in
+   `LONG_TASK_EVALUATION.md`: task/current-epoch eligibility, fail-closed
+   acceptance coverage, bounded default-off projection, episode metrics, and
+   deterministic reopening tests; no automatic closure, Context/GC change or
+   fixed-round stopping;
+4. pass a true same-source projection-off/on normal/resume gate with at least
+   two paired repeats, treatment exposure, mandatory-success parity, no lost
+   unfinished work and the frozen episode-efficiency criteria — the first
+   such gate ran 2026-08-29 (8 cells, `--allow-dirty`; 8/8 cells PASS but
+   verdict FAIL: pair-0 exposure asymmetry plus marker needle-shape parity
+   in 3/4 pairs and episode medians 1→1), so this item is not yet met and
+   the projection stays default-off;
+5. freeze and record the candidate identity under the §5 cross-window rule;
+6. rerun the bounded one-cell exact-source/product preflight without changing
+   the serving tuple;
+7. use the preflight-pinned tuple without fallback or automatic protocol
+   negotiation, record the exact clean source identity, and set an explicit
+   `OPENAI_API_PROTOCOL`;
+8. run exactly one uninterrupted, predeclared 12-cell v3 window with
+   `agent-eval --m15-window` and accept only its mechanically regenerated
+   report.
 
 300×3 scale, `recall_after_fix`, a 27-cell context expansion, a second context
 engine comparison and model comparison remain parked until this gate closes.

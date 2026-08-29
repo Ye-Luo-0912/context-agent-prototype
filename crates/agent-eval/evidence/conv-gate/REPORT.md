@@ -1,126 +1,147 @@
-# Completion Convergence V1 paired live gate — 2026-08-29
+# Task-aware Completion Convergence paired live gate — 2026-08-29
 
-**Decision: the settlement boundary mechanism and its exposure accounting
-are verified, but the convergence-efficiency criterion is NOT satisfied.
-Do not claim Completion Convergence closed, and do not claim M15 closed.**
+**Decision: the true projection-off/on paired gate ran decision-grade
+(8/8 cells PASS, 0 NOT_RUN, provider healthy every cell) and FAILED
+promotion under the frozen strict-parity rule. The model projection stays
+default-off and the gate returns to observation. Do not claim Task-aware
+Completion Convergence closed, and do not claim M15 closed.**
 
 ## Identity
 
-- command: `agent-eval --conv-gate` (normal + resume, 2 paired repeats)
-- cells: 4 (1 pack × 2 modes × 2 repeats); all `retry-pilot-cell-v3`
-- pack: `retry_policy_dev` (frozen spec digest; the 55-round/129-call
-  bounded-readiness blocker from the recovery-surface audit)
-- source: clean tree at `deed96c`; `git_dirty=false`
-- serving: `gpt-5.6-luna` @ `https://api.pinaic.com/v1`, `protocol=auto`
-  (Response negotiation), context window 128,000
-- candidate switch: completion opportunity off, recovery surface off; the
-  derived settlement boundary is runtime-owned and always on
-- provider health: 4/4 `healthy`; zero `NOT_RUN`, zero transport cells
+- command: `agent-eval --allow-dirty --conv-gate` (normal + resume, 2 paired
+  repeats, off/on arms); judgment from the pure `evaluate_conv_gate`
+- cells: 8 = 1 pack × 2 modes × 2 repeats × 2 arms; all `retry-pilot-cell-v3`
+- pack: `retry_policy_dev` (frozen fixture, sha256
+  `5055c1c5…762ca`; acceptance declaration "the retry policy behaves
+  correctly" patched on by the harness in every cell)
+- the single arm variable is `project_progress` (renders the bounded
+  settlement fact through `PromptAssembler` in the TASK PROGRESS frame);
+  `opportunity` and `recovery_surface` are off in both arms
+- source: dirty tree at `git_head 2cb1c15` (`git_dirty=true`); the manifest
+  records `source_tree_digest` instead of a clean identity. This is a
+  Step-4 directive gate on the approved budget, not a formal M15 window
+- serving: `gpt-5.6-luna` @ `https://api.pinaic.com/v1`, `protocol=responses`,
+  context window 128,000
+- provider health: 8/8 `healthy`; zero `NOT_RUN`; one request-level retry
+  absorbed (normal off r2, `model_retries=1`); zero whole-cell reruns
+  (no `r{n}-attempt{k}` dirs)
+
+The non-arm-suffixed `retry_policy_dev-normal/` and `retry_policy_dev-resume/`
+dirs are the earlier CONV-CLOSE-01 observation run (4 cells at clean
+`deed96c`); their report text is preserved in git history and their causal
+interpretation was superseded by review. Only the arm-suffixed `-off`/`-on`
+dirs below are the cells of this paired gate.
 
 ## Results
 
-| cell | verdict | behavior | diff | closure | continuation | total rounds | total calls | settled at | post rounds | post calls |
-| --- | --- | --- | --- | --- | --- | ---: | ---: | ---: | ---: | ---: |
-| `retry_policy_dev` normal r1 | PASS | pass | pass | completed | n/a | 13 | 35 | round 11 | 2 | 7 |
-| `retry_policy_dev` normal r2 | PASS | pass | pass | completed | n/a | 25 | 56 | round 19 | 6 | 21 |
-| `retry_policy_dev` resume r1 | PASS | pass | pass | completed | restored_and_continued | 40 | 89 | round 11 | 29 | 58 |
-| `retry_policy_dev` resume r2 | PASS | pass | pass | completed | restored_and_continued | 25 | 57 | round 22 | 3 | 5 |
+| cell | verdict | behavior | diff | closure | continuation | rounds | wall ms | settled | episodes | round/call/fail |
+| --- | --- | --- | --- | --- | --- | ---: | ---: | --- | ---: | --- |
+| normal off r1 | PASS | pass | pass | completed | n/a | 34 | 296,701 | none | 0 | — |
+| normal off r2 | PASS | pass | pass | completed | n/a | 25 | 522,425 | seen | 1 | 1/1/0 |
+| normal on r1 | PASS | pass | pass | completed | n/a | 18 | 187,643 | seen | 1 | 1/1/0 |
+| normal on r2 | PASS | pass | pass | completed | n/a | 25 | 233,715 | seen | 4 | 5/5/1 |
+| resume off r1 | PASS | pass | pass | completed | restored_and_continued | 9+18=27 | 277,881 | seen | 3 | 4/4/1 |
+| resume off r2 | PASS | pass | pass | completed | restored_and_continued | 5+22=27 | 243,032 | seen | 1 | 1/1/0 |
+| resume on r1 | PASS | pass | pass | completed | restored_and_continued | 7+27=34 | 352,068 | seen | 1 | 1/1/0 |
+| resume on r2 | PASS | pass | pass | completed | restored_and_continued | 8+7=15 | 151,884 | seen | 1 | 1/1/0 |
 
-Settlement exposure: 4/4 cells observed at least one
-`SettledCandidate` `ExecutionFrontier` event (`settlement_seen=true`
-recorded in each `summary.json`); no cell is inconclusive on exposure.
-All cells reached `task.complete` → durable `TaskCompleted`
-(`closure=completed`), and none auto-closed: the task stayed `Active`
-across the settled moment and only the model's explicit completion
-proposal committed the durable record.
+Exposure: 7/8 cells observed at least one `SettledCandidate` episode
+(`settlement_seen=true`); the single zero-exposure cell is off normal r1.
+Every cell closed through model-chosen `task.complete` → durable
+`TaskCompleted`; none auto-closed.
 
-## Mechanically reconstructed facts
+## Episode accounting (settlement episodes)
 
-Each cell's `summary.json` carries the event-derived settlement fields
-(`settlement_seen`, `settlement_pre_rounds`, `settlement_pre_calls`,
-`settlement_post_rounds`, `settlement_post_calls`), reconstructed from the
-`ExecutionFrontier` event stream; the first `SettledCandidate` label in the
-stream sets the pre/post split and later same-label events do not move it.
-The leading invariant of the audit (zero exposure ⇒ inconclusive, never a
-pass) is enforced by the runner: any cell without exposure would be
-reported as inconclusive.
+An episode starts on entry to a task-aware candidate and ends at the first
+reopening transition or terminal outcome; reopened phase-two work is charged
+to new episodes, never to an earlier one. Five exposed cells (off normal r2,
+on normal r1, off resume r2, on resume r1, on resume r2) each recorded one
+episode of 1 round / 1 call / 0 failures. Normal on r2 recorded 4 episodes
+totalling 5 rounds / 5 calls / 1 failure across them, and resume off r1
+recorded 3 episodes totalling 4 rounds / 4 calls / 1 failure — the episode
+split is exactly the reopened-work boundary, not a lifetime tail. Read-only `--conv-tail` over the new arm-suffixed dirs reports
+per-episode composition (no_progress / redundant / advanced / failures) with
+medians: normal off 0/0/0, normal on 3/0/1, resume off 2/1/1, resume on
+1/0/0. With n=2 per arm per mode these are observation, not a causal claim.
 
-## Frozen-criteria evaluation (per CONV-CLOSE-01)
+## Judgment (verbatim from the runner)
 
-1. **Mandatory behavior/diff/resume parity**: satisfied — 4/4 behavior
-   pass, 4/4 allowed-diff pass, 2/2 resume cells restored_and_continued.
-2. **No lost unfinished work**: no evidence of truncation; resume cells
-   continued the exact directive with the exact restore tuple
-   (`exact_resume_tuple_matched=true`, `restored=true`, `continued=true`).
-3. **Lower rounds/calls after the first settled candidate**: NOT satisfied
-   for the resume arm. Normal post-settlement median is 6 rounds / 21
-   calls; resume post-settlement median is 29 rounds / 58 calls (resume r1:
-   29 rounds / 58 calls after the round-11 settled candidate).
-4. **No new max tail**: not satisfiable to claim — this gate had no
-   A/C comparison arm; it measured tail behavior against the settled
-   boundary only.
-5. **Outcome-free actions and repeated cleanup remain counted**: yes —
-   failed outputs are in the denominator (resume r1 had 9 failed outputs:
-   `edit.patch` 5, `process.run` 3, `shell.exec` 1; rereads 22), and the
-   runner prints them per cell.
+```text
+convergence gate: fail (off=4 on=4)
+  - pair 0 (normal): settlement exposure false/true
+  - pair 0 (normal): marker violations off=2 on=3
+  - pair 1 (resume): marker violations off=2 on=3
+  - pair 2 (normal): marker violations off=3 on=3
+  - pair 3 (resume): marker violations off=3 on=2
+```
 
-## Interpretation
+`evaluate_conv_gate` returned early on parity violations, so the efficiency
+reasons were not appended; evaluated on the numbers they would also fail:
+episode-rounds/calls medians are 1→1 (not strictly lower) and the max
+whole-cell round tail is 34→34.
 
-The mechanism goal of the slice is met deterministically and now also
-under a real serving: a derived settled candidate appears exactly when the
-trusted verification basis covers the current world and the obligation
-ledger is empty; the model keeps the choice (every cell chose durable
-closure, none was forced or auto-closed); cancel/resume and cold restore
-re-derive the same boundary from the persisted resume.
+## Root-cause analysis
 
-The efficiency goal is not met: the resume arm still spends a long
-post-settlement tail (29/58 in resume r1) on edit/process/verify retries
-with repeated reads — the same family as the original 55-round/129-call
-tail. In resume r1 the model had already reached a settled candidate by the
-restore boundary and kept working on diagnostic-marker misses
-(`transient classification`, `retry loop bounds`, `delay growth`
-markers missed in `src/error.rs`/`src/lib.rs`), which are real remaining
-work rather than pure cleanup — the boundary was observed, but it did not
-curtail the repair loop. Do not retune the boundary from this run: the
-derived state machine is frozen; the open question is policy/surface
-pressure on the model side, not the settlement state.
+1. **Pair-0 exposure asymmetry (off none / on seen).** Episode emission is
+   event-driven on the tool observation after the last trusted PASS. Off
+   normal r1 (34 rounds, the longest cell) ended with a verify →
+   `task.complete` sequence and no trailing tool observation, so no
+   candidate episode was recorded even though the world was verified and
+   the cell passed. Zero-exposure cells are inconclusive by the frozen
+   rule, so pair 0 cannot pass parity regardless of the projection switch.
+2. **Marker-violation parity.** The fixture's six content-marker
+   assertions are needle-text checks ("transient classification
+   implemented", "retry loop bounds on max_attempts", "delay growth
+   saturates at max_delay_ms", …); 2–3 are missed per cell in BOTH arms
+   while the harness-owned behavioral oracle passes 7/7 in every cell
+   (hidden `passed=true`, `replay_complete=true`). This is the same
+   needle-shape phenomenon as the M15 diag overflow markers, unrelated to
+   the projection switch; the parity rule flags any non-empty marker
+   violations on either side, and 3/4 pairs also differ in count.
+3. **Efficiency.** Episode medians 1→1 rounds and 1→1 calls are not
+   strictly lower; the max whole-cell tail is equal (34→34). No
+   measurable regression, but no measurable episode or tail reduction
+   either.
 
-## Post-settlement composition (read-only `--conv-tail`)
+All 8 cells held the truth chain under live load: behavior/diff/closure/
+continuation parity is otherwise intact; the two fail families are the
+exposure timing property and the marker dimension, not a runtime,
+transport or mechanism failure.
 
-Event-level slice of every cell after its first `SettledCandidate` label
-(deltas after the boundary, failed tool outputs, repeated reads/verifies):
+## What landed under option A and made live candidate emission possible
 
-| cell | settled at | no_prog | redundant | advanced | world_ch | invalid | reconf | failed | fs.read | verify | edit.patch(er) | process/shell |
-| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
-| normal r1 | seq 223 | 3 | 0 | 4 | 0 | 0 | 0 | 0 | 3 | 1 | 0 | 0/0 |
-| normal r2 | seq 336 | 4 | 1 | 11 | 0 | 1 | 4 | 0 | 7 | 2 | 0 | 0/1 |
-| resume r1 | seq 89 | 15 | 1 | 19 | 4 | 11 | 5 | 8 | 17 | 3 | 6(er:4) | 10/1 |
-| resume r2 | seq 276 | 1 | 0 | 2 | 1 | 0 | 1 | 0 | 0 | 1 | 1 | 0/0 |
+- trusted verification PASS clears identity-exact `failed_commands` bound to
+  the current basis/directive/workspace tuple; a fresh failure re-records
+  and re-blocks, so cells reached `execution_ready`;
+- provider retry spans a request-level window (6 attempts, ~62 s) plus a
+  whole-cell rerun wrapper (up to 3 runs, 30 s/60 s backoff) for retryable
+  transport outcomes; exercised once at request level (normal off r2) and
+  never at cell level;
+- live acceptance data source: the harness patches the bounded acceptance
+  declaration onto the task, and the runtime binds the current trusted
+  verification pass as the coverage claim for every declared criterion at
+  observation time. 7/8 cells then reached a task-aware candidate through
+  the real boundary (task_ready = execution_ready + epoch + no open loops /
+  next action + acceptance coverage).
 
-The normal arm is clean: zero failed outputs, ≤4 `no_progress` deltas after
-settlement. The resume median is driven by resume r1 alone: its settlement
-happens early (seq 89, i.e. the boundary derived for the phase-one world),
-and the phase-two continuation then performs real further development —
-`advanced=19` new evidence/verification rows, `world_ch=4` Known mutations
-plus `invalidated=11` Unknown invalidation events, 15 `no_progress` deltas
-and 8 failed outputs (4 failed `edit.patch`, failed `process.run`/`shell`),
-with 17 `fs.read` and 3 `verify.run` calls. Each of those mutations returns
-the derived state to `Working` and the fresh verification re-settles it; the
-state machine behaved exactly as designed. The long tail is therefore real
-remaining work plus retries in one resume arm, not a settlement-boundary
-failure — and both trees show a clean cell (resume r2: settled seq 276,
-3 post rounds, 0 failed).
+## What this run does not claim
 
-Do not retune the frozen state machine from this table. If a later slice
-wants lower resume tails, the lever is model-side treatment of the
-settlement projection (a policy/surface question outside this audit), and
-any change must keep the mandatory no-lost-work and no-auto-close
-invariants.
+- not a promotion: the frozen rule ends this candidate attempt with the
+  projection default-off;
+- no causal projection effect is measurable from this gate (parity failed
+  before efficiency);
+- not a formal M15 window: `--allow-dirty` on a dirty tree; the formal
+  window requires a clean source identity;
+- no closure claim, no Context/GC/retrieval/prompt-packing change, no
+  auto-close and no fixed-round stop were involved.
 
 ## Next step
 
-A paired A/C comparison at the same serving with the same pack and at
-least two repeats, where the only variable is the settlement-derived
-surface/projection treatment, is required before claiming lower
-post-settlement tail. Until then, M15 stays open and Completion
-Convergence V1 remains at "mechanism verified, efficiency not claimed".
+Per the frozen CONV-CLOSE-02 rule, a failed gate leaves projection off and
+returns to observation. The diagnosed causes are bounded and fixture-level:
+(a) a verified cell whose last trusted PASS has no trailing tool observation
+records no episode and is inconclusive by rule; (b) the marker dimension
+fails parity on needle-shape misses that the behavioral oracle tolerates.
+Any change must first pass the deterministic reopening/restore suite and the
+frozen efficiency criteria; no rerun before that diagnosis, and no fourth
+unchanged M15 window.

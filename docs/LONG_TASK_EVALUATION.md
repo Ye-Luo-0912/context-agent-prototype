@@ -901,102 +901,123 @@ default-off. This is a terminal decision for that mechanism, not a reason to
 rerun it, add prompt pressure, special-case the provider or proceed to a
 same-model A/C claim.
 
-## Pre-M15 readiness task: Completion Convergence V1
+## Pre-M15 readiness task: Task-aware Completion Convergence
 
 Do not start by rewriting `task.complete`. In the recovery-surface run its
 schema was always present, all 18 calls returned successful tool results, and
 17 reached durable `TaskCompleted`; the 55-round / 129-call tail made no
-completion call. One successful proposal did not reach `TaskCompleted` within
-its trace, so proposal settlement across cancel/resume belongs in the new
-deterministic coverage, but it does not explain the long pre-proposal decision
-tail.
+completion call. The bottleneck is the decision before a completion mechanism,
+not the mechanism itself.
 
-The next task is an execution-flow boundary that recognizes when current work
-is settled while preserving autonomy and long-task continuation:
+### Audit of the landed first slice
+
+CONV-CLOSE-01 landed useful workspace-cleanliness alignment, bounded
+`SettlementLabel` events, first-candidate metrics and seven deterministic actor
+scenarios. Its live run also produced 4/4 passing cells with event exposure.
+Those facts remain valid, but review found four gaps:
+
+1. `TaskProgressView.settlement` is not rendered by `PromptAssembler`; the
+   model did not receive the claimed one-line decision fact.
+2. `ExecutionState::settlement()` joins only verification validity and the
+   execution-obligation ledger. It does not see current task/user authority,
+   acceptance coverage, `TaskAnchor.open_loops`/`next_action`, known failures
+   or actor in-flight state. Its `SettledCandidate` is execution-local, not a
+   whole-task readiness result.
+3. `post_settlement_profile` counts everything after the first candidate even
+   after a later mutation returns the state to `Working`; legitimate phase-two
+   development is therefore charged as convergence tail.
+4. `--conv-gate` runs normal/resume with both existing switches off. It has no
+   settlement-projection control arm, so its 4/4 result proves observation
+   exposure and task success, not causal round/call reduction.
+
+The evidence report remains immutable; only its causal interpretation is
+superseded. No further live spend is justified until the four gaps are fixed.
+
+### Target algorithm
+
+Use a two-level, evidence-driven join rather than a fixed round or token limit:
 
 ```text
-Working
-  -> VerificationDue       when an applicable accepted mutation makes proof stale
-  -> VerifiedCurrent       when the trusted verification basis covers that mutation
-  -> SettledCandidate      when no unresolved constraint, obligation, failure or
-                            in-flight operation remains
-  -> ordinary final | task.complete | concrete remaining blocker/action
+ExecutionReady
+  = current trusted verification covers
+      (task verification revision, directive revision, workspace revision)
+    AND no in-flight/cancel cleanup
+    AND no unresolved execution obligation or failed command
+
+TaskReady
+  = ExecutionReady
+    AND current user/task epoch still matches
+    AND open_loops is empty
+    AND next_action is empty
+    AND every bounded acceptance criterion has current explicit evidence
+
+Working | VerificationDue | VerifiedCurrent | SettledCandidate
+                                          ^ only when TaskReady
 ```
 
-Transitions are evidence-driven, not round-driven. Any new accepted mutation,
-new user constraint, stale/failed verification or unresolved obligation moves
-the state back to `Working`. `SettledCandidate` is a decision boundary, not an
-automatic stop: ordinary turn completion remains distinct from whole durable
-task closure, and valid remaining work must remain executable.
+With no task-level acceptance coverage, the strongest truthful state is
+`VerifiedCurrent`. Acceptance coverage is criterion-addressed and linked to a
+bounded evidence identity; free-form “done” text cannot establish it. Reuse the
+existing TaskAnchor CAS, verification tuple and evidence refs where possible;
+add only the smallest typed coverage primitive if the existing types cannot
+express the join. A new directive/constraint, anchor-boundary change, accepted
+mutation, failure, stale verification, opened loop or non-empty next action
+reopens the state immediately. No fixed threshold decides readiness.
 
-### Delivery slices
+### Ordered delivery and promotion gate
 
-1. **Evaluator validity.** Make the diagnosis golden solution pass the hidden
-   oracle and run that oracle during fixture self-check. Reconstruct paired
-   reports mechanically, report treatment exposure, and classify zero exposure
-   as inconclusive. Align model-visible workspace cleanliness with allowed-diff
-   policy so `target/` and `Cargo.lock` cannot manufacture cleanup loops.
+1. **Correct semantics first.** Keep settlement model projection absent and
+   default-off. Add deterministic negative coverage for incomplete acceptance,
+   open loop, next action, failed command, new directive, boundary change,
+   in-flight cleanup, mutation-after-verify and cold restore. Preserve ordinary
+   final, durable closure and genuine remaining-work positives.
+2. **Bounded projection second.** Wire one neutral fact through the
+   Runtime-owned `PromptAssembler` only after step 1 is green. Model-request
+   tests must prove presence only for `TaskReady`, absence for every reopening
+   case, and the existing 2,048-character TASK PROGRESS bound. The fact offers
+   ordinary final, durable `task.complete`, or concrete continuation; it is not
+   a stop instruction, auto-close or capability lease.
+3. **Episode accounting.** A settlement episode begins on entry to a
+   task-aware candidate and ends at the first reopening transition or terminal
+   outcome. Report its rounds/calls/failures and whole-cell totals. Never attach
+   later legitimate work to an earlier episode.
+4. **Real paired gate.** Add a default-off projection switch. For each repeat,
+   run the same pack/source/serving in projection-off and projection-on arms;
+   normal and resume appear in both arms, with at least two paired repeats.
+   Zero on-arm exposure is inconclusive. Promotion requires mandatory
+   behavior/diff/resume parity, no lost unfinished work, lower candidate-episode
+   rounds and calls, and no new maximum episode or whole-cell tail.
+5. **M15 handoff.** Only a promoted projection may enter exact-source preflight.
+   Then follow the prospective one-window rule in `M15_ACCEPTANCE.md`; do not
+   repeatedly sample an unchanged candidate.
 
-   Calibrated 2026-08-29: the diag reference solution now uses overflow-safe
-   `u128` saturation so large attempts saturate at `max_delay_ms` instead of
-   wrapping to zero; the directive and golden `DIAGNOSIS` name that
-   saturation edge, and the hidden check requires an explicit `u128`/
-   `leading_zeros` marker. Fixture self-check now runs each M15 pack oracle
-   against the untouched seed (reject) and the scripted solution (accept)
-   offline, and records both pack digests as frozen constants. This is
-   fixture authoring under the frozen task/oracle meaning, not a serving
-   decision. The remaining slice 1 work (mechanical reconstruction and
-   model-visible cleanliness alignment) is tracked in CONV-CLOSE-01.
-2. **Observation only.** Emit bounded facts for last authoritative mutation,
-   current verification basis, first settled candidate, terminal mechanism,
-   post-settlement rounds/calls, outcome-free actions, and repeated
-   read/diff/verify or cleanup actions. Large output remains artifact-backed;
-   no transcript expansion is allowed.
-3. **Dynamic state.** Derive the four states above from existing Execution
-   Frontier, obligations, verification basis and bounded
-   `TaskRecord.resume: ExecutionState`. Do not create a second orchestrator or
-   authoritative global history. Its bounded progress projection may contain
-   only current goal, unresolved constraints, checked file identities/revisions
-   (not bodies), latest verification basis/result, deduplicated known failed
-   commands and one next action. Collections are capped and superseded by
-   stable identity rather than appended as transcript history.
-4. **Decision boundary.** Present only current facts needed to choose final,
-   durable closure, or concrete continuation. Do not reuse/re-arm the failed
-   `CompletionOpportunity`, add a standing “stop earlier” instruction, or
-   auto-call `task.complete`.
-5. **Proof.** First cover ordinary final, durable closure, genuine remaining
-   work, post-verification mutation, stale verification, proposal settlement
-   across cancel/resume and cold resume with deterministic models. Only then
-   run a small exposure-qualified live gate with at least two paired repeats.
+Steps 1–4 landed 2026-08-29 as a bounded batch. Live candidate emission
+required three driver repairs first: trusted verification PASS clears
+identity-exact `failed_commands` on the current basis/directive/workspace
+tuple (fresh failures re-block), request-level (~62 s) plus whole-cell
+(3 runs, 30 s/60 s backoff) provider retry, and a live acceptance data
+source — the harness patches the bounded acceptance declaration and the
+runtime binds the current trusted verification pass as the coverage claim
+for every declared criterion at observation time.
 
-Slices 1–5 are landed 2026-08-29, tracked in CONV-CLOSE-01: fixture
-self-check cleanliness matches the allowed-diff policy; `RunMetrics`
-aggregates first-settled-candidate and pre/post rounds and calls from
-`ExecutionFrontier` events; `ExecutionState::settlement()` derives
-`Working | VerificationDue | VerifiedCurrent | SettledCandidate` from
-verification validity plus the typed obligation ledger (no round counts),
-published only on change with a bounded neutral projection that preserves
-the model's choice; and seven deterministic actor scenarios are green
-(ordinary final, durable closure, genuine remaining work, mutation after
-verification, stale verification, proposal settlement across
-suspend/resume, cold same-run restore). The exposure-qualified live gate
-(`--conv-gate`, 2 paired repeats) ran on 2026-08-29 and verifies the
-mechanism under the pinned serving — 4/4 cells PASS, 4/4 settlement
-exposure, model-chosen durable `task.complete`. A read-only `--conv-tail`
-sliced the post-settlement tail per cell: the normal arm is clean, and the
-resume median is driven by one r1 cell whose post-settlement work is real
-phase-two development (mutations, verifications, retries) with the state
-machine correctly re-opening and re-settling, so the efficiency criterion
-is not claimed and the boundary is not retuned; see
+The step-4 paired gate then ran on the approved 8-cell budget
+(`--allow-dirty`; `project_progress` is the only arm difference): 8/8 cells
+PASS behavior/diff/closure/continuation, 0 NOT_RUN — but the verdict is
+FAIL. Pair 0 (normal r1) has settlement exposure off=none / on=seen (the
+off cell's last trusted PASS had no trailing tool observation, so no
+episode was recorded; zero-exposure cells are inconclusive by rule),
+marker-violation counts differ in 3/4 pairs (needle-shape misses the
+harness oracle tolerates, present in both arms), and episode-rounds/calls
+medians are 1→1, not strictly lower. The frozen rule therefore keeps the
+projection default-off and returns the gate to observation: no rerun before
+a bounded diagnosis of the exposure-timing and marker-parity causes, and no
+promotion claim. Facts:
 [`evidence/conv-gate/REPORT.md`](../crates/agent-eval/evidence/conv-gate/REPORT.md).
-The stale comment describing `task.complete` as catalog-cold was removed.
 
-Promotion requires mandatory behavior/diff/resume parity, no lost unfinished
-work, lower rounds and calls after the first valid settled candidate, and no new
-max tail. Total rounds/calls remain reported, but the causal metric starts at
-the last meaningful mutation/current verification boundary. Context selection,
-GC, retrieval and prompt packing stay frozen; the prior C Context advantage is
-neither spent nor re-evaluated by this slice.
+Context selection, GC, retrieval and prompt packing stay frozen. The prior C
+Context advantage remains banked: this task targets execution amplification
+without expanding the transcript, adding a second ResumePoint, or weakening
+model autonomy.
 
 ## Post-M15 next phase task: `LT-EVAL-06` — representative development twins
 

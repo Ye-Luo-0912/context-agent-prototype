@@ -510,8 +510,8 @@ and sandbox contracts live elsewhere. Experiment facts live in
   demands an overflow-safe marker, and fixture self-check runs each M15 pack
   oracle offline against seed and scripted solution; diag digest regenerated
   to `2fff5157…eeb`, migrate digest unchanged. The evaluator-validity part of
-  the pre-window checklist is done, and the one-cell product preflight after
-  Completion Convergence V1 readiness is cleared: `retry_diag_dev` normal
+  the pre-window checklist is done, and the one-cell product preflight on the
+  observation-foundation source is cleared: `retry_diag_dev` normal
   PASSed 2026-08-29 on the same pinned serving at clean HEAD `09cce69`
   (with the same frozen diag digest) in 14 rounds / 22 tool calls /
   1 failed output / 139,886 ms — zero provider retries, contiguous events,
@@ -545,8 +545,8 @@ and sandbox contracts live elsewhere. Experiment facts live in
   cell's usage is incomplete). The diag overflow edge is the one recurring
   failure surface across preflight and the window, consistent with its
   calibrated difficulty. M15 remains open: the frozen §4 verdict passes the
-  development plane only when all 12 cells pass, so the window must be
-  rerun whole before closure can be considered. A second clean-tree v3
+  development plane only when all 12 cells pass, so this window is a valid
+  failed result. A second clean-tree v3
   window ran the same day at clean HEAD `f625d39` (protocol pinned
   `responses`; cached input now metered, `cached 152,576 / input 1,943,439`
   across the window): 9/12 PASS — all three failures are diag cells
@@ -556,53 +556,83 @@ and sandbox contracts live elsewhere. Experiment facts live in
   windows, the diag overflow edge is the only recurring failure surface
   (first window 3/4 diag PASS, second 1/4), consistent with its calibrated
   difficulty and with a stochastic per-cell solve rate; the fixture,
-  oracle and serving stay unchanged and M15 stays open until a window
-  passes 12/12. A third clean-tree v3 window ran the same day at clean
-  HEAD `d88448d` (same pinned tuple; cached input 200,704 / input
-  ~1,943,439): 10/12 PASS — the two failures are again diag cells (normal
-  r2, resume r1), and `retry_migrate_dev` + `retry_policy_dev` have now
+  oracle and serving stayed unchanged. A third clean-tree v3 window ran the
+  same day at clean
+  HEAD `779604559f682dddc54018e99e5fb35b0080e965` (same pinned tuple;
+  cached input 200,704 / input 1,942,278): 10/12 PASS — the two failures are
+  again diag cells (normal r2, resume r1), and `retry_migrate_dev` +
+  `retry_policy_dev` have now
   passed 24/24 cells across all three windows with exact-tuple
   continuation everywhere; 0 NOT_RUN. Diag-cause analysis over the three
-  windows plus the two preflight arms is fully attributed and
-  deterministic: every failing diag cell (6/6) finalizes the fix with
+  formal windows is fully attributed: every failing diag cell (6/6)
+  finalizes the fix with
   `checked_shl(exp).unwrap_or(u64::MAX)` — which only guards shift counts
   ≥ 64, not bits shifted out (`100u64.checked_shl(62)` is `Some(0)`) —
-  while every passing cell (8/8) uses `checked_mul`/`saturating_mul` (or
+  while every formal-window passing diag cell (6/6) uses
+  `checked_mul`/`saturating_mul` (or
   `min(63)` + `checked_mul`); failing cells also self-test with `base = 1`
   configurations that avoid the trap, so their own tests pass while the
   oracle fails. The calibration makes the needle and oracle agree against
-  the trap; the recurrence is a solver semantic issue (~57% per-cell diag
-  solve rate), not a harness or serving defect. M15 remains open with the
-  diag overflow edge the sole recurring failure surface.
-- **Completion Convergence V1 deterministic foundation landed** (2026-08-29,
-  CONV-CLOSE-01 slices 1–5): evaluator cleanliness now aligns model-visible
+  the trap. Formal diag is 6/12 PASS (50%); all same-fixture calibrated
+  `diag-smoke` plus formal evidence is 9/17 PASS (52.9%). The recurrence is
+  not a harness or transport defect: it is a model/solver limitation on the
+  pinned serving. M15 remains open with the diag overflow edge the sole
+  recurring failure surface. Three valid failed windows are already evidence;
+  a fourth unchanged retry is prohibited until the cross-window decision rule
+  in `M15_ACCEPTANCE.md` is frozen prospectively.
+- **Completion Convergence observation foundation landed; task-aware control
+  plane remains open** (2026-08-29, CONV-CLOSE-01 reviewed): evaluator
+  cleanliness now aligns model-visible
   workspace with the allowed-diff policy (`.gate/`, `target/` and
   `Cargo.lock` are gitignored by fixture self-check, so build artifacts
   cannot manufacture cleanup loops the evaluator silently discards);
-  event-derived convergence metrics aggregate settlement (first settled
-  candidate, rounds/calls before and after it); dynamic states `Working ->
-  VerificationDue -> VerifiedCurrent -> SettledCandidate` derive from the
-  bounded `TaskRecord.resume: ExecutionState` (verification validity plus
-  the closing obligation ledger, never fixed round counts), are published as
-  label-on-change `ExecutionFrontier` events, and project a bounded neutral
-  one-liner that preserves the model's choice among ordinary final,
-  `task.complete`, or concrete continuation — no auto-close, no standing
-  stop instruction. Seven deterministic actor scenarios are green: ordinary
+  event-derived metrics aggregate the first execution-local settlement label;
+  dynamic states `Working -> VerificationDue -> VerifiedCurrent ->
+  SettledCandidate` derive from the bounded `TaskRecord.resume: ExecutionState`
+  and publish label-on-change `ExecutionFrontier` events. Seven deterministic
+  actor scenarios are green: ordinary
   final, durable closure, genuine remaining work, mutation after
   verification, stale verification, proposal settlement across
   cancel/resume, and cold restore. The stale runtime comment describing
   `task.complete` as catalog-cold was removed (the v5 registry always loads
-  it). The exposure-qualified live gate (`--conv-gate`,
+  it). Post-review, this is observation evidence only.
+  `TaskProgressView.settlement` is populated but
+  `PromptAssembler::render_task_progress` does not render it, so the model
+  never saw the claimed settlement one-liner. Eligibility also consults only
+  verification validity and the execution-obligation ledger; it does not bind
+  current user/task authority, acceptance coverage,
+  `TaskAnchor.open_loops`/`next_action`, or `failed_commands`. Therefore the
+  current `SettledCandidate` means only “execution state currently verified,”
+  not “whole task ready to finish.” The live runner (`--conv-gate`,
   [`evidence/conv-gate/REPORT.md`](../crates/agent-eval/evidence/conv-gate/REPORT.md))
-  ran 4/4 cells PASS with 4/4 settlement exposure and model-chosen durable
-  closure: the boundary mechanism is verified under the pinned serving.
-  Read-only `--conv-tail` sliced the post-settlement tail per cell: normal
-  arm clean, resume median driven by one r1 cell whose post-settlement
-  work is real phase-two development (mutations, verifications, retries)
-  with the state machine correctly re-opening and re-settling — not a
-  boundary failure. Do not claim convergence or M15 closed; the efficiency
-  criterion stays open and any model-side projection treatment is a
-  policy/surface question outside the frozen state machine.
+  ran 4/4 normal/resume cells PASS with 4/4 event exposure, but it has no
+  projection-off control arm; normal versus resume is not an off/on pair.
+  Model-chosen `task.complete` therefore cannot be attributed to settlement.
+  `--conv-tail` also counts every event after the first candidate even after a
+  later mutation reopens work, so it is not a causal efficiency metric.
+  CONV-CLOSE-02 must correct task-aware eligibility, wire the projection only
+  behind a default-off switch, replace lifetime tails with settlement episodes,
+  and then run a real switch-off/on paired gate. Do not claim convergence or
+  M15 closed from the current report.
+- CONV-CLOSE-02 landed its four delivery steps the same day and ran the real
+  switch-off/on paired gate (approved 8-cell budget, `--allow-dirty`):
+  task-aware settle (fail-closed at `VerifiedCurrent` without declared
+  acceptance coverage), the neutral fact behind the default-off
+  `project_progress` switch with request-level tests, settlement-episode
+  counters, and `evaluate_conv_gate` per-pair parity. Live cells required
+  three bounded repairs first: trusted PASS clears identity-exact
+  `failed_commands` on the current basis/directive/workspace tuple,
+  request-level plus whole-cell provider retry, and live acceptance
+  declaration bound by the trusted verification pass at observation time.
+  The gate ran 8/8 cells PASS with 0 NOT_RUN but FAILED promotion: pair-0
+  (normal r1) exposure asymmetry (off none / on seen; a verified cell whose
+  last PASS has no trailing observation records no episode and is
+  inconclusive by rule), marker-violation parity in 3/4 pairs (needle-shape
+  misses the behavioral oracle tolerates), and episode-rounds/calls medians
+  1→1 (not strictly lower). Per the frozen rule the projection stays
+  default-off and the gate returns to observation; do not claim
+  convergence or M15 closed. See
+  [`evidence/conv-gate/REPORT.md`](../crates/agent-eval/evidence/conv-gate/REPORT.md).
 
   The
   frozen CompletionOpportunity off/on paired live gate then ran
@@ -931,44 +961,55 @@ planning algorithm:
 The deterministic snapshot/cold-restore chain and evaluator reconstruction are
 green. The retained-C CompletionOpportunity off/on gate then ran eight cells
 and failed promotion, so that candidate has ended default-off; do not spend
-another pair on it. The newer 55-round / 129-call tail establishes a different
-pre-M15 readiness task: Completion Convergence V1. `task.complete` was always
-visible and its 18 calls in the 24-cell run all returned successful tool
-results; the tail made no completion call. Start with evaluator/fixture
-validity and event-derived post-settlement metrics, then derive a dynamic
-settled-state decision boundary from existing execution/verification facts.
-Do not auto-close, resurrect CompletionOpportunity, add fixed stopping counts,
-or change Context/GC. Same-model A/C and broader diagnosis/multi-file twins
-remain after formal M15. Criterion/CPL and model-visible TaskGraph research
-stay deferred and evidence-gated.
-The deterministic foundation (evaluator cleanliness, event-derived
-post-settlement metrics, derived `Working -> VerificationDue ->
-VerifiedCurrent -> SettledCandidate` boundary with label-on-change frontier
-events, and seven deterministic actor scenarios) landed 2026-08-29; the open
-step is the exposure-qualified live gate with at least two paired repeats.
+another pair on it. The newer 55-round / 129-call tail established Completion
+Convergence as the pre-M15 readiness task. `task.complete` was always visible
+and its 18 calls in the 24-cell run all returned successful tool results; the
+tail made no completion call. The first implementation landed useful
+observation labels, events and tests, but review found that the label is not
+rendered to the model, its eligibility is execution-local rather than
+task-aware, its tail metric does not stop when work reopens, and its live runner
+has no off/on treatment arm. The open task is therefore CONV-CLOSE-02, not
+another unchanged live run. Do not auto-close, resurrect CompletionOpportunity,
+add fixed stopping counts, or change Context/GC. Same-model A/C and broader
+diagnosis/multi-file twins remain after formal M15. Criterion/CPL and
+model-visible TaskGraph research stay deferred and evidence-gated.
 
 ## Next milestone
 
 Engineering mainline after the 2026-08-27 platform-gate closures remains the
-**V1 candidate and formal M15**, with two bounded readiness repairs before the
-next live window. The corrected acceptance contract is
-[`M15_ACCEPTANCE.md`](M15_ACCEPTANCE.md): V1 is the banked planes plus one
-live development pack (3 tasks × normal/resume × 2 repeats). Budget, fixtures
-and report-only closure semantics are frozen; the serving tuple is fixed by
-the bounded representative PinAI/Luna Responses preflight. Because `fs.mkdir`
-changed the product catalog after that diagnostic, the `TOOL-DIR-SURFACE-01`
-deterministic admission gate landed (2026-08-28) and its full 24-cell paired
-live run completed the same day, but had zero treatment exposure. First repair
-evaluator validity: golden-oracle consistency, executable oracle self-check,
-mechanical exposure/count reconstruction, and fixture artifact visibility.
-Then implement and deterministically prove Completion Convergence V1 as a
-dynamic decision boundary after current verification; it preserves ordinary
-final versus durable `task.complete`, valid unfinished work and the lightweight
-C Context path. After those repairs, one bounded preflight must rerun on the
-exact candidate source/surface. The next accepted run must then be one
-uninterrupted clean-tree `retry-pilot-cell-v3` window with a
-mechanically regenerated report. V2 Self-Iteration stays blocked until M15
-closes.
+**V1 candidate and formal M15**, but no fourth unchanged formal window is
+allowed. Three clean, identity-consistent v3 windows have already failed
+(11/12, 9/12, 10/12); migrate and policy are 24/24 while formal diag is 6/12.
+The next bounded implementation task is **Task-aware Completion Convergence**:
+
+1. derive eligibility from the current user/task epoch, current trusted
+   verification, no in-flight work/obligations/known failures, no open loops or
+   next action, and explicit bounded acceptance coverage; absent task-level
+   coverage, the strongest label is `VerifiedCurrent`;
+2. invalidate eligibility on any new directive/constraint, accepted mutation,
+   failure, stale verification or task-progress reopening;
+3. only after that is deterministic, render one bounded neutral fact through
+   `PromptAssembler` behind a default-off projection switch; preserve ordinary
+   final, durable `task.complete`, and concrete continuation;
+4. measure candidate **episodes** that end when work reopens, then run a real
+   same-source projection-off/on paired gate (normal/resume in both arms) with
+   exposure, success, no-lost-work and tail criteria.
+
+Steps 1–4 landed 2026-08-29 (see the CONV-CLOSE-02 "Now" entry); the step-4
+paired gate then ran on the approved 8-cell budget and FAILED promotion on
+strict parity, leaving the projection default-off and the gate back at
+observation. The diagnosed causes are bounded and fixture-level (exposure
+timing when the last trusted PASS has no trailing tool observation; marker
+needle-shape parity the behavioral oracle tolerates). Any change must first
+pass the deterministic reopening/restore suite; no rerun before that
+diagnosis.
+
+Before any further M15 spend, freeze the missing cross-window retry rule in
+[`M15_ACCEPTANCE.md`](M15_ACCEPTANCE.md). After the source changes, run the
+exact-source preflight and exactly one predeclared 12-cell confirmation window.
+A valid failure rejects that candidate and returns to diagnosis; it does not
+authorize repeated sampling until a lucky 12/12. V2 Self-Iteration stays
+blocked until M15 closes.
 The agent may grow capabilities, never evaluation or permission Core authority.
 
 In parallel, keep `LT-RUN-05` frozen and build only deterministic fixtures for
