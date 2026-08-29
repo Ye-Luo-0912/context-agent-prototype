@@ -529,8 +529,24 @@ and sandbox contracts live elsewhere. Experiment facts live in
   19 tool calls / 0 failed outputs / 104,516 ms, hidden oracle green,
   settlement exposed (pre 8/19 → post 1/0) with ordinary-final closure, and
   the same single needle-shape marker miss. Both arms of the one-cell
-  product preflight are therefore cleared on the frozen fixture. M15 remains
-  open until one complete clean-tree 12-cell v3 window passes.
+  product preflight are therefore cleared on the frozen fixture. The first
+  formal clean-tree v3 window ran 2026-08-29 on that pinned serving at clean
+  HEAD `16ba7c4` (protocol pinned `responses`, 12 cells, 0 NOT_RUN): 11/12
+  PASS; the single failure is `retry_diag_dev` resume r2 (six+five resumed
+  rounds / 25 tools / 1 failed output, hidden oracle not satisfied on the
+  overflow edge — the same `backoff.rs` needle miss plus one failed
+  `edit.patch`). Every other cell passes behavior, diff and, where resumed,
+  exact-tuple restored-and-continued; closures are 8/12 `task.complete` and
+  4/12 ordinary-final, reported not gated. Efficiency facts (mechanical
+  report,
+  [`evidence/m15-window/_windows/1787966622822/REPORT.md`](../crates/agent-eval/evidence/m15-window/_windows/1787966622822/REPORT.md)):
+  rounds total/max 137/21, tools total/max 332/49, wall max 712,990 ms,
+  provider input/output tokens 1,408,538/59,419 (lower bounds where a resume
+  cell's usage is incomplete). The diag overflow edge is the one recurring
+  failure surface across preflight and the window, consistent with its
+  calibrated difficulty. M15 remains open: the frozen §4 verdict passes the
+  development plane only when all 12 cells pass, so the window must be
+  rerun whole before closure can be considered.
 - **Completion Convergence V1 deterministic foundation landed** (2026-08-29,
   CONV-CLOSE-01 slices 1–5): evaluator cleanliness now aligns model-visible
   workspace with the allowed-diff policy (`.gate/`, `target/` and

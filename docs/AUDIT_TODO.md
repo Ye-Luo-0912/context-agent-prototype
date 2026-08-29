@@ -1456,11 +1456,17 @@ drift, absent terminal evidence, event gaps/loss, counter drift and paths
 outside the evidence root. Evidence-write errors are fatal; the formal command
 rejects a dirty tree, partial pack, repeat drift and protocol `auto`. Runtime
 publishes typed failures and provider retry progress rather than making the
-evaluator infer either from text. Exit evidence is still open: pass the
-relevant deterministic suite,
-retain the serving tuple pinned by the passing bounded representative
-preflight, then commit one complete clean-tree 12-cell v3 window and its
-regenerated report.
+evaluator infer either from text. The deterministic suite is green
+(`cargo test --workspace`, 2026-08-29) and the serving tuple stayed pinned
+by the passing bounded one-cell preflights (both arms). The first formal
+clean-tree 12-cell v3 window ran and was committed 2026-08-29 (window
+`evidence/m15-window/_windows/1787966622822/`, mechanical report, 0 NOT_RUN):
+11/12 PASS; the only failure is `retry_diag_dev` resume r2, which ends
+without satisfying the hidden oracle on the overflow edge. M15 therefore
+remains open — the frozen verdict demands all 12 cells pass, and the diag
+overflow edge is the one recurring failure surface. Exit evidence for M15 is
+still open: rerun one complete clean-tree v3 window and commit its
+regenerated report with 12/12 PASS.
 
 ## Closed archive (index only)
 
