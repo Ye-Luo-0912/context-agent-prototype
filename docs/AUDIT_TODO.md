@@ -1464,7 +1464,14 @@ clean-tree 12-cell v3 window ran and was committed 2026-08-29 (window
 11/12 PASS; the only failure is `retry_diag_dev` resume r2, which ends
 without satisfying the hidden oracle on the overflow edge. M15 therefore
 remains open — the frozen verdict demands all 12 cells pass, and the diag
-overflow edge is the one recurring failure surface. Exit evidence for M15 is
+overflow edge is the one recurring failure surface. A second clean-tree v3
+window ran 2026-08-29 at clean HEAD `f625d39`
+(`evidence/m15-window/_windows/1787970773734/`, mechanical report, 0 NOT_RUN,
+cached input metered): 9/12 PASS; all three failures are diag cells (normal
+r1/r2, resume r1), while migrate and policy pass all 8 cells with exact-tuple
+continuation. Across both windows the diag overflow edge is the only
+recurring failure surface (3/4 then 1/4 diag PASS), a stochastic per-cell
+solve rate rather than a harness or serving defect. Exit evidence for M15 is
 still open: rerun one complete clean-tree v3 window and commit its
 regenerated report with 12/12 PASS.
 

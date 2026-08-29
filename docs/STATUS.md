@@ -546,7 +546,18 @@ and sandbox contracts live elsewhere. Experiment facts live in
   failure surface across preflight and the window, consistent with its
   calibrated difficulty. M15 remains open: the frozen §4 verdict passes the
   development plane only when all 12 cells pass, so the window must be
-  rerun whole before closure can be considered.
+  rerun whole before closure can be considered. A second clean-tree v3
+  window ran the same day at clean HEAD `f625d39` (protocol pinned
+  `responses`; cached input now metered, `cached 152,576 / input 1,943,439`
+  across the window): 9/12 PASS — all three failures are diag cells
+  (normal r1, normal r2, resume r1; resume r2 PASS), while
+  `retry_migrate_dev` and `retry_policy_dev` pass all 8 cells with
+  exact-tuple restored-and-continued everywhere and 0 NOT_RUN. Across both
+  windows, the diag overflow edge is the only recurring failure surface
+  (first window 3/4 diag PASS, second 1/4), consistent with its calibrated
+  difficulty and with a stochastic per-cell solve rate; the fixture,
+  oracle and serving stay unchanged and M15 stays open until a window
+  passes 12/12.
 - **Completion Convergence V1 deterministic foundation landed** (2026-08-29,
   CONV-CLOSE-01 slices 1–5): evaluator cleanliness now aligns model-visible
   workspace with the allowed-diff policy (`.gate/`, `target/` and
