@@ -1481,6 +1481,7 @@ mod tests {
             checked_files: (0..32).map(|i| format!("src/f{i}.rs@{long}")).collect(),
             verifications: (0..8).map(|i| format!("ok:{long}{i}")).collect(),
             failed_commands: (0..8).map(|i| format!("shell.exec {long}{i}")).collect(),
+            settlement: Some(crate::task::SETTLED_CANDIDATE_PROMPT_LINE.to_string()),
             ..Default::default()
         };
         let history = materialized_with(Vec::new(), ContextMapView::default());
@@ -1493,14 +1494,19 @@ mod tests {
             Vec::new(),
         );
         let focus = assembled.focus_frame.expect("progress must render");
+        let rendered = render_task_progress(&progress);
         assert!(
-            render_task_progress(&progress).chars().count() <= MAX_TASK_PROGRESS_PROMPT_CHARS,
+            rendered.chars().count() <= MAX_TASK_PROGRESS_PROMPT_CHARS,
             "TASK PROGRESS render must stay under the hard cap, got {}",
-            render_task_progress(&progress).chars().count()
+            rendered.chars().count()
         );
         assert!(
             focus.contains("TASK PROGRESS"),
             "assembled focus must still carry the capped progress block"
+        );
+        assert!(
+            rendered.contains("TASK SETTLED"),
+            "the settlement fact must survive row trimming and the final cap"
         );
     }
 

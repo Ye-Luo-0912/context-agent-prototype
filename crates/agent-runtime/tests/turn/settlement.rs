@@ -51,10 +51,13 @@ fn verify_identity() -> String {
 
 /// Plays a round script exactly; a request beyond the script panics, so a
 /// runtime that refuses to settle (or auto-stops) fails the test loudly.
+/// Every model request's full message text is appended to `requests` so
+/// request-level projection tests can assert on the assembled prompt.
 #[derive(Debug)]
 struct SettlementModel {
     script: Vec<Step>,
     rounds: AtomicUsize,
+    requests: Arc<std::sync::Mutex<Vec<String>>>,
 }
 
 #[async_trait::async_trait]
@@ -62,7 +65,14 @@ impl ModelTransport for SettlementModel {
     fn capabilities(&self) -> ModelCapabilities {
         ModelCapabilities::default()
     }
-    async fn complete(&self, _request: ModelRequest) -> AgentResult<ModelOutput> {
+    async fn complete(&self, request: ModelRequest) -> AgentResult<ModelOutput> {
+        let text = request
+            .messages
+            .iter()
+            .map(|message| message.content.as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
+        self.requests.lock().unwrap().push(text);
         let round = self.rounds.fetch_add(1, Ordering::SeqCst);
         let Some(step) = self.script.get(round) else {
             panic!("the runtime requested round {round} beyond the script");
@@ -217,10 +227,16 @@ impl ToolDispatcher for SettlementToolDispatcher {
     }
 }
 
-async fn settlement_instance(
+async fn settlement_instance_with(
     dir: &std::path::Path,
     script: Vec<Step>,
-) -> (RuntimeInstance, RuntimeEventEnvelopeCollector) {
+    project_progress: bool,
+) -> (
+    RuntimeInstance,
+    RuntimeEventEnvelopeCollector,
+    Arc<std::sync::Mutex<Vec<String>>>,
+) {
+    let capture = Arc::new(std::sync::Mutex::new(Vec::new()));
     let workspace = Arc::new(agent_workspace::Workspace::open(dir).await.unwrap());
     let services = RuntimeServices::new(
         CoreAuthorityConfig::default(),
@@ -228,16 +244,26 @@ async fn settlement_instance(
         Arc::new(SettlementModel {
             script,
             rounds: AtomicUsize::new(0),
+            requests: capture.clone(),
         }),
         Arc::new(SettlementToolDispatcher),
         Arc::new(PolicyApprovalGate::permissive()),
         None,
     )
-    .with_artifact_workspace(workspace);
+    .with_artifact_workspace(workspace)
+    .with_project_task_progress(project_progress);
     let instance = RuntimeInstance::spawn(ModuleHost::new(), services);
     let collector = RuntimeEventEnvelopeCollector {
         events: instance.handle().subscribe(),
     };
+    (instance, collector, capture)
+}
+
+async fn settlement_instance(
+    dir: &std::path::Path,
+    script: Vec<Step>,
+) -> (RuntimeInstance, RuntimeEventEnvelopeCollector) {
+    let (instance, collector, _) = settlement_instance_with(dir, script, false).await;
     (instance, collector)
 }
 
@@ -850,5 +876,142 @@ async fn cold_restore_preserves_settlement_and_reopen_resettles() {
         agent_runtime::VerificationState::Current,
         "the restored verification, mutation and re-verification leave a Current basis"
     );
+    instance.shutdown().await.unwrap();
+}
+
+/// The TASK PROGRESS block of one captured request: the text from its
+/// header up to the following focus section, so a request-level 2,048-char
+/// bound can measure exactly the block (plus its trailing newline) rather
+/// than the whole message.
+fn progress_block_bounds(request: &str) -> Option<(usize, usize)> {
+    let start = request.find("TASK PROGRESS anchor_rev=")?;
+    let end = request[start..]
+        .find("\nCURRENT DIRECTIVE")
+        .map(|offset| start + offset)
+        .unwrap_or(request.len());
+    Some((start, end))
+}
+
+#[tokio::test]
+async fn settlement_fact_is_absent_when_projection_is_off() {
+    let dir = tempfile::tempdir().unwrap();
+    let (instance, collector, requests) = settlement_instance_with(
+        dir.path(),
+        vec![Step::Write("r2"), Step::Verify("r2"), Step::Plain("done")],
+        false,
+    )
+    .await;
+    let events = drive(&instance, collector).await;
+    assert!(
+        settlement_labels(&events).contains(&SettlementLabel::SettledCandidate),
+        "the label itself is derived regardless of the projection switch"
+    );
+    {
+        let captured = requests.lock().unwrap();
+        assert!(
+            captured
+                .iter()
+                .all(|request| !request.contains("TASK SETTLED")),
+            "projection is default-off: no model request may carry the settlement fact"
+        );
+    }
+    instance.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn settlement_fact_reaches_the_request_only_for_the_task_aware_candidate() {
+    let dir = tempfile::tempdir().unwrap();
+    let (instance, collector, requests) = settlement_instance_with(
+        dir.path(),
+        vec![Step::Write("r2"), Step::Verify("r2"), Step::Plain("done")],
+        true,
+    )
+    .await;
+    let events = drive(&instance, collector).await;
+    assert!(settlement_labels(&events).contains(&SettlementLabel::SettledCandidate));
+    {
+        let captured = requests.lock().unwrap();
+        assert_eq!(captured.len(), 3, "three model rounds in one turn");
+        assert!(
+            !captured[0].contains("TASK SETTLED"),
+            "before any mutation the task is not a candidate"
+        );
+        assert!(
+            !captured[1].contains("TASK SETTLED"),
+            "after the write there is no trusted verification yet"
+        );
+        assert!(
+            captured[2].contains("TASK SETTLED"),
+            "the request consuming the verified result must carry the neutral fact"
+        );
+    }
+    instance.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn settlement_fact_disappears_on_reopen_and_returns_after_reverify() {
+    let dir = tempfile::tempdir().unwrap();
+    let (instance, collector, requests) = settlement_instance_with(
+        dir.path(),
+        vec![
+            Step::Write("r2"),
+            Step::Verify("r2"),
+            Step::Write("r3"),
+            Step::Verify("r3"),
+            Step::Plain("final"),
+        ],
+        true,
+    )
+    .await;
+    drive(&instance, collector).await;
+    {
+        let captured = requests.lock().unwrap();
+        assert_eq!(captured.len(), 5, "five model rounds across the reopen");
+        assert!(captured[2].contains("TASK SETTLED"), "first verify settles");
+        assert!(
+            !captured[3].contains("TASK SETTLED"),
+            "the r3 mutation reopens the candidate immediately"
+        );
+        assert!(
+            captured[4].contains("TASK SETTLED"),
+            "the fresh verification settles the candidate again"
+        );
+    }
+    instance.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn task_progress_block_stays_within_cap_when_settlement_projected() {
+    let dir = tempfile::tempdir().unwrap();
+    let (instance, collector, requests) = settlement_instance_with(
+        dir.path(),
+        vec![Step::Write("r2"), Step::Verify("r2"), Step::Plain("done")],
+        true,
+    )
+    .await;
+    let events = drive(&instance, collector).await;
+    assert!(settlement_labels(&events).contains(&SettlementLabel::SettledCandidate));
+    {
+        let captured = requests.lock().unwrap();
+        assert!(
+            !captured[0].contains("TASK PROGRESS anchor_rev="),
+            "before any mutation the progress view is empty and renders no block"
+        );
+        let mut measured = 0;
+        for request in captured.iter() {
+            if let Some((start, end)) = progress_block_bounds(request) {
+                measured += 1;
+                assert!(
+                    end - start <= agent_contracts::MAX_TASK_PROGRESS_PROMPT_CHARS,
+                    "TASK PROGRESS must stay under the hard cap even with the settlement line: {}",
+                    end - start
+                );
+            }
+        }
+        assert_eq!(
+            measured, 2,
+            "the write and the verified rounds both carry a bounded TASK PROGRESS block"
+        );
+    }
     instance.shutdown().await.unwrap();
 }
