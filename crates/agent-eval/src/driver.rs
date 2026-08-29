@@ -123,11 +123,15 @@ fn build_model_with_timeout(timeout: Duration) -> anyhow::Result<Arc<dyn ModelTr
     });
     // Harness runs measure outcomes, not live deltas: buffer each attempt
     // so a retryable mid-stream transport failure replays from scratch
-    // instead of killing the cell after partial output.
+    // instead of killing the cell after partial output. Provider-scale
+    // outages (503) can last minutes, so the request-level retry window is
+    // wide (6 attempts, ~2s base exponential: 2+4+8+16+32s) and the
+    // harness additionally retries the whole cell on a retryable provider
+    // outcome (see long_live::run_pack_cell_retrying).
     Ok(Arc::new(RetryingTransport::new_buffering(
         provider,
-        3,
-        Duration::from_millis(500),
+        6,
+        Duration::from_secs(2),
     )))
 }
 

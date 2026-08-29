@@ -1555,33 +1555,29 @@ async fn run_conv_gate(
                     pack.id,
                     mode.id()
                 );
-                let dir = tempfile::tempdir()?;
-                let pair = bundle::PairSink::claim(
+                // Cell-level provider retry: a retryable transport outcome
+                // reruns the whole cell into `r{n}-attempt{k}` (up to 3
+                // runs, 30s/60s backoff), so a provider outage that
+                // outlives the request-level retry window cannot silently
+                // turn gate evidence into NOT_RUN.
+                let outcome = long_live::run_pack_cell_retrying(
+                    &pack,
+                    *mode,
                     evidence_root.clone(),
                     format!("{}-{}-{}", pack.id, mode.id(), arm),
                     repeat,
                     repeats,
-                    true,
-                );
-                let outcome = long_live::run_pack_cell(
-                    &pack,
-                    *mode,
-                    &pair,
                     model.clone(),
-                    dir.path(),
                     long_live::CellSwitches {
                         opportunity: false,
                         recovery_surface: false,
                         project_progress: arm == "on",
                     },
                     long_live::AcceptanceProfile::M15V1,
+                    3,
+                    std::time::Duration::from_secs(30),
                 )
                 .await?;
-                println!("{}", outcome.render_line());
-                match bundle::render_evidence(&pair.cell_dir("dynamic")) {
-                    Ok(rendered) => println!("{rendered}"),
-                    Err(e) => eprintln!("warning: evidence render failed: {e}"),
-                }
                 outcomes.push(outcome);
             }
         }

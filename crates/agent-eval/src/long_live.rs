@@ -1690,6 +1690,73 @@ pub async fn run_pack_cell(
     Ok(outcome)
 }
 
+/// Whether a finished cell is worth a whole-cell retry: only a retryable
+/// provider-transport outcome. Everything else (harness failure, model
+/// budget, hard verdict) is a fact to report, not to rerun.
+pub fn provider_transport_retryable(outcome: &CellOutcome) -> bool {
+    outcome.error_class == Some(CellFailureClass::ProviderTransport) && outcome.error_retryable
+}
+
+/// Run one live cell with cell-level provider retry. When the cell ends in
+/// a retryable provider-transport outcome, the whole cell reruns into a
+/// fresh attempt directory (`r{n}-attempt{k}`), so a provider outage that
+/// outlives the request-level retry window does not silently produce
+/// NOT_RUN evidence for a paired gate. Every attempt is rendered; only the
+/// transport-outcome state retries, and the last outcome is returned after
+/// `max_attempts` runs.
+#[allow(clippy::too_many_arguments)] // flat passthrough of run_pack_cell args plus retry policy
+pub async fn run_pack_cell_retrying(
+    pack: &PackSpec,
+    mode: PilotMode,
+    evidence_root: std::path::PathBuf,
+    fixture_id: String,
+    repeat: u32,
+    repeats: u32,
+    model: Arc<dyn ModelTransport>,
+    switches: CellSwitches,
+    acceptance_profile: AcceptanceProfile,
+    max_attempts: u32,
+    base_delay: std::time::Duration,
+) -> anyhow::Result<CellOutcome> {
+    anyhow::ensure!(max_attempts >= 1, "cell retry needs at least one attempt");
+    for attempt in 1..=max_attempts {
+        let dir = tempfile::tempdir()?;
+        let pair = PairSink::claim(
+            evidence_root.clone(),
+            fixture_id.clone(),
+            repeat,
+            repeats,
+            true,
+        );
+        let outcome = run_pack_cell(
+            pack,
+            mode,
+            &pair,
+            model.clone(),
+            dir.path(),
+            switches,
+            acceptance_profile,
+        )
+        .await?;
+        println!("{}", outcome.render_line());
+        match crate::bundle::render_evidence(&pair.cell_dir("dynamic")) {
+            Ok(rendered) => println!("{rendered}"),
+            Err(error) => eprintln!("warning: evidence render failed: {error}"),
+        }
+        let retryable = provider_transport_retryable(&outcome);
+        if !retryable || attempt == max_attempts {
+            return Ok(outcome);
+        }
+        let delay = base_delay * 2u32.pow(attempt.saturating_sub(1));
+        eprintln!(
+            "cell ended in a retryable provider transport failure (attempt {attempt}/{max_attempts}); \
+             retrying in {delay:?} into a fresh attempt directory"
+        );
+        tokio::time::sleep(delay).await;
+    }
+    unreachable!("max_attempts >= 1 and the final attempt always returns")
+}
+
 /// Whether the agent left any test of its own behind (decides whether a
 /// failed workspace self-check is `fail` or `not_run`).
 fn workspace_has_tests(root: &Path) -> bool {
@@ -2692,5 +2759,47 @@ mod tests {
             "{:?}",
             judgment.reasons
         );
+    }
+
+    #[test]
+    fn provider_transport_retryable_matches_only_retryable_transport() {
+        let failed_cell = |class: RuntimeFailureClass, retryable: bool| {
+            CellOutcome::failed(
+                "retry_policy_dev",
+                PilotMode::Normal,
+                AcceptanceProfile::M15V1,
+                CellSwitches {
+                    opportunity: false,
+                    recovery_surface: false,
+                    project_progress: false,
+                },
+                0,
+                CellFailure::from_runtime(class, retryable, "outage"),
+            )
+        };
+        assert!(provider_transport_retryable(&failed_cell(
+            RuntimeFailureClass::ProviderTransport,
+            true
+        )));
+        assert!(!provider_transport_retryable(&failed_cell(
+            RuntimeFailureClass::ProviderTransport,
+            false
+        )));
+        assert!(!provider_transport_retryable(&failed_cell(
+            RuntimeFailureClass::Model,
+            true
+        )));
+        assert!(!provider_transport_retryable(&CellOutcome::failed(
+            "retry_policy_dev",
+            PilotMode::Normal,
+            AcceptanceProfile::M15V1,
+            CellSwitches {
+                opportunity: false,
+                recovery_surface: false,
+                project_progress: false,
+            },
+            0,
+            CellFailure::harness_setup("no provider"),
+        )));
     }
 }
