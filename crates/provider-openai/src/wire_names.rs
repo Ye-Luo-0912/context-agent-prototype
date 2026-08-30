@@ -6,6 +6,11 @@
 //!
 //! 两个不同的 Core id 若落到同一个线名（`fs.list` 与 `fs_list`），在发请求
 //! 之前 fail-closed，避免模型调用被派发到错误的工具。
+//!
+//! History tool calls may hold raw wire names recorded while the tool was not
+//! yet exposed (e.g. `fs_mkdir` for `fs.mkdir`). Those are not Core ids: once
+//! the spec is exposed its mapping is authoritative and the raw name is that
+//! tool's wire form, so such collisions never fail the request.
 
 use std::collections::HashMap;
 
@@ -26,8 +31,26 @@ pub(crate) struct ToolNameCodec {
 impl ToolNameCodec {
     pub(crate) fn from_request(request: &ModelRequest) -> AgentResult<Self> {
         let mut from_wire = HashMap::new();
-        for original in original_tool_names(request) {
-            insert_mapping(&mut from_wire, original)?;
+        // Tool specs are authoritative: two exposed tool ids that collide on
+        // one wire name fail closed before the request leaves, because the
+        // id the model means would be ambiguous.
+        for original in request.tools.iter().map(|tool| tool.name.as_str()) {
+            insert_spec_mapping(&mut from_wire, original)?;
+        }
+        // History may hold raw wire names recorded when the tool was not yet
+        // exposed (e.g. `fs_mkdir` for `fs.mkdir`). Such a name is the wire
+        // form of the exposed spec, so the spec mapping already present wins
+        // and the name is skipped instead of failing the request. A history
+        // name with no matching spec keeps its identity mapping so a later
+        // call to it can still be decoded.
+        for original in request
+            .messages
+            .iter()
+            .flat_map(|message| message.tool_calls.iter().map(|call| call.name.as_str()))
+        {
+            from_wire
+                .entry(to_wire_tool_name(original))
+                .or_insert_with(|| original.to_string());
         }
         Ok(Self { from_wire })
     }
@@ -69,16 +92,7 @@ impl ToolNameCodec {
     }
 }
 
-fn original_tool_names(request: &ModelRequest) -> impl Iterator<Item = &str> {
-    let specs = request.tools.iter().map(|tool| tool.name.as_str());
-    let calls = request
-        .messages
-        .iter()
-        .flat_map(|message| message.tool_calls.iter().map(|call| call.name.as_str()));
-    specs.chain(calls)
-}
-
-fn insert_mapping(from_wire: &mut HashMap<String, String>, original: &str) -> AgentResult<()> {
+fn insert_spec_mapping(from_wire: &mut HashMap<String, String>, original: &str) -> AgentResult<()> {
     let wire = to_wire_tool_name(original);
     if let Some(existing) = from_wire.get(&wire) {
         if existing != original {
@@ -159,6 +173,37 @@ mod tests {
         };
         let codec = ToolNameCodec::from_request(&request).expect("no collision");
         assert_eq!(codec.decode_wire_name("edit_replace"), "edit.replace");
+    }
+
+    #[test]
+    fn raw_history_wire_name_is_decoded_once_its_spec_is_exposed() {
+        // Regression: a model called `fs_mkdir` while `fs.mkdir` was not yet
+        // exposed; the raw wire name stayed in history. Once `fs.mkdir` is
+        // exposed the request carries both, and the spec mapping must win
+        // instead of failing the request.
+        let request = ModelRequest {
+            messages: vec![ModelMessage::assistant_tool_calls(vec![
+                agent_contracts::ToolCall {
+                    id: "call-raw".into(),
+                    name: "fs_mkdir".into(),
+                    arguments: json!({"path": "tests"}),
+                },
+            ])],
+            tools: vec![ToolSpec {
+                name: "fs.mkdir".into(),
+                description: "create one workspace directory".into(),
+                input_schema: json!({"type": "object"}),
+                risk: agent_contracts::ToolRisk::ReadOnly,
+                output_budget: None,
+                roles: Vec::new(),
+            }],
+            metadata: json!({}),
+            cancel: CancellationToken::new(),
+        };
+        let codec = ToolNameCodec::from_request(&request)
+            .expect("a raw history wire name must not fail the request");
+        assert_eq!(codec.decode_wire_name("fs_mkdir"), "fs.mkdir");
+        assert_eq!(codec.to_wire("fs.mkdir"), "fs_mkdir");
     }
 
     #[test]
