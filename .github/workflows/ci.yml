@@ -88,5 +88,22 @@ jobs:
       - name: Cache cargo artifacts
         uses: Swatinem/rust-cache@v2
 
+      # A scoped test job selects only its part's crates, so integration
+      # tests that spawn sibling binaries (mock_host / broker_host from
+      # agent-process, the agent-context-service wire boundary) must build
+      # them explicitly; the workspace job builds them by selecting every
+      # member. A warm cache restores the service binary with an older mtime
+      # than this checkout, tripping context-contextcore's freshness guard,
+      # so stamp it to now - the content is the same built artifact, only
+      # the restore loses the build-time ordering.
+      - name: Build cross-crate test fixtures (part 2)
+        if: matrix.part == 2
+        shell: pwsh
+        run: |
+          cargo build -p agent-process
+          cargo build -p agent-context-service
+          $bin = if ($env:RUNNER_OS -eq 'Windows') { 'target/debug/agent-context-service.exe' } else { 'target/debug/agent-context-service' }
+          if (Test-Path $bin) { (Get-Item $bin).LastWriteTime = Get-Date }
+
       - name: cargo test (${{ matrix.part }})
         run: cargo test -j 2 ${{ matrix.cargo_pkgs }} -- --test-threads 2

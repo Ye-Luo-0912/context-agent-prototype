@@ -1220,6 +1220,11 @@ mod persist_tests {
         {
             let mut command = tokio::process::Command::new("sleep");
             command.arg("20");
+            // Match the production spawn contract behind `kill_process_tree`:
+            // the child must be its own process-group leader on Unix
+            // (`process_group(0)`), or the group kill misses (ESRCH) and the
+            // unmanaged child survives the rejection.
+            command.process_group(0);
             command.stdout(Stdio::null());
             command.stderr(Stdio::null());
             command

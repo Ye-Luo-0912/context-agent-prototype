@@ -1232,10 +1232,12 @@ pub fn kill_process_tree(pid: u32) {
     }
     #[cfg(unix)]
     {
-        // Negative pid = the process group. The child was spawned with
-        // `process_group(0)`, so its pgid == its pid and SIGKILL to -pid
-        // reaches the whole tree. On ESRCH (no such group) the tree is
-        // already gone; callers fall back to the direct child.
+        // Negative pid = the process group. Production children are spawned
+        // as group leaders (`process_group(0)`), so their pgid == their pid
+        // and SIGKILL to -pid reaches the whole tree. ESRCH means the child
+        // was not spawned as a group leader; the direct child may still be
+        // alive, so every spawn that can reach this path must set
+        // `process_group(0)` to honor the kill contract.
         let _ = unsafe { libc::kill(-(pid as i32), libc::SIGKILL) };
     }
     #[cfg(windows)]
