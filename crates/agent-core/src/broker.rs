@@ -151,12 +151,30 @@ impl ReservationJournal {
             .map_err(|error| {
                 AgentError::Storage(format!("open broker journal {}: {error}", path.display()))
             })?;
-        file.try_lock().map_err(|error| {
-            AgentError::Storage(format!(
+        // The journal is single-owner: an exclusive lock is mandatory. A
+        // transient holder (an audit child that inherited the journal fd
+        // before exiting, or a parallel same-host audit) must not fail the
+        // open outright, so retry with backoff for a bounded window; a
+        // genuinely stuck holder still fails closed.
+        let mut lock_error = None;
+        for _ in 0..40 {
+            match file.try_lock() {
+                Ok(()) => {
+                    lock_error = None;
+                    break;
+                }
+                Err(error) => {
+                    lock_error = Some(error);
+                    std::thread::sleep(std::time::Duration::from_millis(50));
+                }
+            }
+        }
+        if let Some(error) = lock_error {
+            return Err(AgentError::Storage(format!(
                 "lock broker journal {} exclusively: {error}",
                 path.display()
-            ))
-        })?;
+            )));
+        }
         let recovery = recover_file(&mut file, path)?;
         Ok(Self {
             path: path.to_path_buf(),
