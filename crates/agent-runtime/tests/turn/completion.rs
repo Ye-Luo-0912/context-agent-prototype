@@ -1923,15 +1923,15 @@ async fn unloaded_surface_attempts_are_visible_but_never_completion_debt() {
     }
     let captured = requests.lock().unwrap().clone();
     assert!(
-        captured
-            .get(1)
-            .is_some_and(|text| text.contains("only schemas in that captured surface may be called")),
+        captured.get(1).is_some_and(
+            |text| text.contains("only schemas in that captured surface may be called")
+        ),
         "the first refusal must be visible to the next model decision"
     );
     assert!(
-        captured
-            .get(2)
-            .is_some_and(|text| text.contains("only schemas in that captured surface may be called")),
+        captured.get(2).is_some_and(
+            |text| text.contains("only schemas in that captured surface may be called")
+        ),
         "the wire-spelling refusal must also be visible to the next model decision"
     );
     let checkpoint = instance.checkpoint().await.unwrap();

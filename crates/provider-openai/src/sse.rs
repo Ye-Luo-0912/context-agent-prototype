@@ -9,14 +9,87 @@ use agent_contracts::{
 use serde::Deserialize;
 use serde_json::Value;
 
-/// Extract the payload of an SSE `data:` line. Returns `None` for comment
-/// lines, event lines, and blanks. The payload is trimmed (including a
-/// trailing `\r` for `\r\n` line endings).
-pub fn parse_sse_data(line: &str) -> Option<&str> {
-    let line = line.trim_end_matches('\r');
-    line.strip_prefix("data:")
-        .map(str::trim)
-        .filter(|payload| !payload.is_empty())
+/// One complete SSE event at a blank-line boundary. Multi-line `data:`
+/// payloads are joined with `\n` per the SSE specification; `event` is
+/// `None` when the stream declared no event name.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SseEvent {
+    pub event: Option<String>,
+    pub data: String,
+}
+
+/// Byte-bounded SSE event framer. Consumes raw stream lines and emits one
+/// event when the blank-line boundary arrives, joining standard multi-`data:`
+/// events exactly once. Comment, `id:` and unknown fields are ignored; the
+/// joined payload of a single event cannot grow past `max_event_bytes` while
+/// waiting for the boundary, so a hostile or broken provider cannot make the
+/// accumulator unbounded.
+#[derive(Debug)]
+pub struct SseEventFramer {
+    data_lines: Vec<String>,
+    data_bytes: usize,
+    event_type: Option<String>,
+    max_event_bytes: usize,
+}
+
+impl SseEventFramer {
+    /// A new framer. `max_event_bytes` bounds one joined event payload.
+    pub fn new(max_event_bytes: usize) -> Self {
+        Self {
+            data_lines: Vec::new(),
+            data_bytes: 0,
+            event_type: None,
+            max_event_bytes: max_event_bytes.max(1),
+        }
+    }
+
+    /// Feed one raw stream line. Returns the completed event when the line is
+    /// the blank boundary, otherwise `None`. An event whose joined payload
+    /// exceeds the cap is an error: the stream is already consumed past a
+    /// point a replay could not restore.
+    pub fn push_line(&mut self, line: &str) -> Result<Option<SseEvent>, String> {
+        let line = line.trim_end_matches('\r');
+        if line.is_empty() {
+            return Ok(self.flush_event());
+        }
+        if let Some(payload) = line.strip_prefix("data:") {
+            let payload = payload.trim();
+            if !payload.is_empty() {
+                self.data_bytes = self.data_bytes.saturating_add(payload.len());
+                if self.data_bytes > self.max_event_bytes {
+                    return Err(format!(
+                        "SSE event exceeded the {} byte cap before the blank-line boundary",
+                        self.max_event_bytes
+                    ));
+                }
+                self.data_lines.push(payload.to_string());
+            }
+        } else if let Some(event) = line.strip_prefix("event:") {
+            self.event_type = Some(event.trim().to_string());
+        }
+        // Comment/`id:`/`retry:` and unknown fields carry no event payload.
+        Ok(None)
+    }
+
+    /// Flush a residual event when the stream ends without a blank line
+    /// (most providers still terminate the final event with a blank line).
+    pub fn finish(&mut self) -> Option<SseEvent> {
+        self.flush_event()
+    }
+
+    fn flush_event(&mut self) -> Option<SseEvent> {
+        if self.data_lines.is_empty() {
+            self.event_type = None;
+            return None;
+        }
+        let data = self.data_lines.join("\n");
+        self.data_lines.clear();
+        self.data_bytes = 0;
+        Some(SseEvent {
+            event: self.event_type.take(),
+            data,
+        })
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -81,6 +154,13 @@ pub struct WirePromptTokensDetails {
     pub cached_tokens: Option<u64>,
 }
 
+fn protocol_event_error(message: impl Into<String>) -> AgentError {
+    AgentError::ModelProtocol {
+        kind: ModelProtocolErrorKind::MalformedEvent,
+        message: message.into(),
+    }
+}
+
 /// Parse one Chat Completions SSE payload.
 ///
 /// A syntactically valid object that does not carry any Chat Completions
@@ -129,12 +209,15 @@ pub struct StreamAccumulator {
     tool_calls: Vec<AccToolCall>,
     pub usage: Option<ModelUsage>,
     terminal_error: Option<String>,
+    sealed: bool,
 }
 
 impl StreamAccumulator {
     /// Apply one wire chunk, returning the normalized `ModelChunk` events that
     /// should be forwarded to the sink (text deltas and tool-call deltas).
-    pub fn apply(&mut self, chunk: &WireChunk) -> Vec<ModelChunk> {
+    /// Identity contradictions and deltas after the terminal chunk are typed
+    /// protocol errors; the accumulator never silently rewrites a bound call.
+    pub fn apply(&mut self, chunk: &WireChunk) -> AgentResult<Vec<ModelChunk>> {
         let mut events = Vec::new();
 
         if let Some(error) = &chunk.error {
@@ -165,6 +248,11 @@ impl StreamAccumulator {
             if let Some(content) = &choice.delta.content
                 && !content.is_empty()
             {
+                if self.sealed {
+                    return Err(protocol_event_error(
+                        "Chat Completions text delta arrived after the terminal chunk",
+                    ));
+                }
                 self.content.push_str(content);
                 events.push(ModelChunk::TextDelta {
                     delta: content.clone(),
@@ -172,6 +260,12 @@ impl StreamAccumulator {
             }
 
             for delta in &choice.delta.tool_calls {
+                if self.sealed {
+                    return Err(protocol_event_error(format!(
+                        "Chat Completions tool-call delta for index {} arrived after the terminal chunk",
+                        delta.index
+                    )));
+                }
                 if !self.tool_calls.iter().any(|slot| slot.index == delta.index) {
                     self.tool_calls.push(AccToolCall {
                         index: delta.index,
@@ -186,15 +280,29 @@ impl StreamAccumulator {
                     .find(|slot| slot.index == delta.index)
                     .expect("slot was just ensured");
 
-                if let Some(id) = &delta.id
-                    && slot.id.is_none()
-                {
-                    slot.id = Some(id.clone());
+                if let Some(id) = &delta.id {
+                    if slot.id.as_deref().is_some_and(|bound| bound != id) {
+                        return Err(protocol_event_error(format!(
+                            "Chat Completions tool call at index {} bound id `{id}` but is already `{}`",
+                            delta.index,
+                            slot.id.as_deref().unwrap_or_default()
+                        )));
+                    }
+                    if slot.id.is_none() {
+                        slot.id = Some(id.clone());
+                    }
                 }
-                if let Some(name) = delta.function.as_ref().and_then(|f| f.name.clone())
-                    && slot.name.is_none()
-                {
-                    slot.name = Some(name);
+                if let Some(name) = delta.function.as_ref().and_then(|f| f.name.clone()) {
+                    if slot.name.as_deref().is_some_and(|bound| bound != name.as_str()) {
+                        return Err(protocol_event_error(format!(
+                            "Chat Completions tool call at index {} bound name `{name}` but is already `{}`",
+                            delta.index,
+                            slot.name.as_deref().unwrap_or_default()
+                        )));
+                    }
+                    if slot.name.is_none() {
+                        slot.name = Some(name);
+                    }
                 }
                 if let Some(arguments) = delta.function.as_ref().and_then(|f| f.arguments.clone()) {
                     let first_args = slot.arguments.is_empty();
@@ -211,7 +319,18 @@ impl StreamAccumulator {
             }
         }
 
-        events
+        // Any terminal chunk seals the stream so a deltas-after-done stream
+        // fails closed instead of appending onto a finished tool call.
+        if !self.sealed
+            && chunk
+                .choices
+                .iter()
+                .any(|choice| choice.finish_reason.is_some())
+        {
+            self.sealed = true;
+        }
+
+        Ok(events)
     }
 
     pub fn take_terminal_error(&mut self) -> Option<String> {
@@ -250,14 +369,46 @@ mod tests {
     use agent_contracts::ModelChunk;
 
     #[test]
-    fn parses_sse_data_lines() {
-        assert_eq!(parse_sse_data("data: hello world"), Some("hello world"));
-        assert_eq!(parse_sse_data("data: [DONE]"), Some("[DONE]"));
-        assert_eq!(parse_sse_data("data: hello\r"), Some("hello"));
-        assert_eq!(parse_sse_data("data:"), None);
-        assert_eq!(parse_sse_data(": keep-alive comment"), None);
-        assert_eq!(parse_sse_data("event: message"), None);
-        assert_eq!(parse_sse_data(""), None);
+    fn framer_joins_multi_data_events_at_the_blank_line() {
+        let mut framer = SseEventFramer::new(4096);
+        assert_eq!(framer.push_line("data: {\"a\":1}"), Ok(None));
+        assert_eq!(framer.push_line("data: {\"b\":2}\r"), Ok(None));
+        let event = framer.push_line("").unwrap().expect("blank boundary");
+        assert_eq!(event.event, None);
+        assert_eq!(event.data, "{\"a\":1}\n{\"b\":2}");
+    }
+
+    #[test]
+    fn framer_keeps_declared_event_names_and_ignores_comments_and_ids() {
+        let mut framer = SseEventFramer::new(4096);
+        assert_eq!(framer.push_line(": keep-alive"), Ok(None));
+        assert_eq!(framer.push_line("event: response.custom"), Ok(None));
+        assert_eq!(framer.push_line("id: 7"), Ok(None));
+        assert_eq!(framer.push_line("data: payload"), Ok(None));
+        let event = framer.push_line("").unwrap().expect("blank boundary");
+        assert_eq!(event.event.as_deref(), Some("response.custom"));
+        assert_eq!(event.data, "payload");
+    }
+
+    #[test]
+    fn framer_emits_nothing_for_empty_events_and_flushes_at_eof() {
+        let mut framer = SseEventFramer::new(4096);
+        assert_eq!(framer.push_line("event: ping"), Ok(None));
+        assert_eq!(framer.push_line(""), Ok(None), "no data line, no event");
+        assert_eq!(framer.push_line("data: [DONE]"), Ok(None));
+        let done = framer.finish().expect("eof flushes the residual event");
+        assert_eq!(done.data, "[DONE]");
+        assert_eq!(framer.finish(), None, "a second flush has nothing left");
+    }
+
+    #[test]
+    fn framer_bounds_one_event_before_the_blank_line() {
+        let mut framer = SseEventFramer::new(16);
+        assert_eq!(framer.push_line("data: 0123456789abcde"), Ok(None));
+        let error = framer
+            .push_line("data: FF")
+            .expect_err("joining past the cap must fail closed");
+        assert!(error.contains("byte cap"), "{error}");
     }
 
     #[test]
@@ -268,7 +419,7 @@ mod tests {
             r#"{"choices":[{"index":0,"delta":{"content":"Hel"},"finish_reason":null}]}"#,
         )
         .unwrap();
-        let events = acc.apply(&chunk);
+        let events = acc.apply(&chunk).unwrap();
         assert_eq!(
             events,
             vec![ModelChunk::TextDelta {
@@ -280,14 +431,14 @@ mod tests {
             r#"{"choices":[{"index":0,"delta":{"content":"lo"},"finish_reason":null}]}"#,
         )
         .unwrap();
-        let events = acc.apply(&chunk);
+        let events = acc.apply(&chunk).unwrap();
         assert_eq!(events, vec![ModelChunk::TextDelta { delta: "lo".into() }]);
 
         let chunk: WireChunk = serde_json::from_str(
             r#"{"choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"call_1","type":"function","function":{"name":"fs.read","arguments":"{\"path\":"}}]},"finish_reason":null}]}"#,
         )
         .unwrap();
-        let events = acc.apply(&chunk);
+        let events = acc.apply(&chunk).unwrap();
         assert_eq!(
             events,
             vec![ModelChunk::ToolCallDelta {
@@ -301,7 +452,7 @@ mod tests {
             r#"{"choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"function":{"arguments":"\"AuthService.rs\"}"}}]},"finish_reason":null}]}"#,
         )
         .unwrap();
-        let events = acc.apply(&chunk);
+        let events = acc.apply(&chunk).unwrap();
         assert_eq!(
             events,
             vec![ModelChunk::ToolCallDelta {
@@ -329,7 +480,7 @@ mod tests {
             r#"{"choices":[{"index":0,"delta":{},"finish_reason":"stop"}],"usage":{"prompt_tokens":120,"completion_tokens":45,"total_tokens":165,"prompt_tokens_details":{"cached_tokens":30}}}"#,
         )
         .unwrap();
-        acc.apply(&chunk);
+        acc.apply(&chunk).unwrap();
         let usage = acc.usage.expect("usage should be captured");
         assert_eq!(usage.input_tokens, Some(120));
         assert_eq!(usage.output_tokens, Some(45));
@@ -343,7 +494,7 @@ mod tests {
             r#"{"choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"c","function":{"name":"fs.read","arguments":"not json"}}]}}]}"#,
         )
         .unwrap();
-        acc.apply(&chunk);
+        acc.apply(&chunk).unwrap();
         let error = acc.finalize().unwrap_err();
         assert!(matches!(
             error,
@@ -388,10 +539,64 @@ mod tests {
             r#"{"choices":[{"index":0,"delta":{},"finish_reason":"network_error"}]}"#,
         )
         .unwrap();
-        assert!(acc.apply(&chunk).is_empty());
+        assert!(acc.apply(&chunk).unwrap().is_empty());
         assert_eq!(
             acc.take_terminal_error().as_deref(),
             Some("provider reported finish_reason=network_error")
+        );
+    }
+
+    #[test]
+    fn deltas_after_the_terminal_chunk_are_rejected() {
+        let mut acc = StreamAccumulator::default();
+        let terminal: WireChunk = serde_json::from_str(
+            r#"{"choices":[{"index":0,"delta":{},"finish_reason":"tool_calls"}]}"#,
+        )
+        .unwrap();
+        acc.apply(&terminal).unwrap();
+        let late: WireChunk = serde_json::from_str(
+            r#"{"choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"c1","function":{"name":"fs.read","arguments":"{}"}}]}}]}"#,
+        )
+        .unwrap();
+        let error = acc.apply(&late).unwrap_err();
+        assert!(matches!(
+            error,
+            AgentError::ModelProtocol {
+                kind: ModelProtocolErrorKind::MalformedEvent,
+                ..
+            }
+        ));
+        assert!(
+            error.to_string().contains("after the terminal chunk"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn identity_contradictions_in_tool_call_deltas_are_rejected() {
+        let mut acc = StreamAccumulator::default();
+        let first: WireChunk = serde_json::from_str(
+            r#"{"choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"c1","function":{"name":"fs.read","arguments":""}}]}}]}"#,
+        )
+        .unwrap();
+        acc.apply(&first).unwrap();
+        let conflicting_id: WireChunk = serde_json::from_str(
+            r#"{"choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"c2","function":{"arguments":"{}"}}]}}]}"#,
+        )
+        .unwrap();
+        let error = acc.apply(&conflicting_id).unwrap_err();
+        assert!(error.to_string().contains("bound id `c2`"), "{error}");
+
+        let mut acc = StreamAccumulator::default();
+        acc.apply(&first).unwrap();
+        let conflicting_name: WireChunk = serde_json::from_str(
+            r#"{"choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"function":{"name":"fs_write","arguments":"{}"}}]}}]}"#,
+        )
+        .unwrap();
+        let error = acc.apply(&conflicting_name).unwrap_err();
+        assert!(
+            error.to_string().contains("bound name `fs_write`"),
+            "{error}"
         );
     }
 }

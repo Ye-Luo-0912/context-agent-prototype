@@ -13,9 +13,22 @@ use serde_json::Value;
 
 #[derive(Debug, Default)]
 struct AccFunctionCall {
+    /// User-facing call id from the item's `call_id` field.
     call_id: Option<String>,
+    /// Routing identity from `item.id` / arguments event `item_id`. This is a
+    /// different namespace from `call_id` and is only compared against itself.
+    item_id: Option<String>,
     name: Option<String>,
     arguments: String,
+    /// A terminal full-arguments snapshot beyond what the deltas assembled;
+    /// used as an authoritative repair source only when the assembled text
+    /// does not parse at finalize time.
+    terminal_arguments: Option<String>,
+    /// `output_item.done` received: the slot is sealed and no further
+    /// non-terminal event may touch it.
+    sealed: bool,
+    /// `function_call_arguments.done` received: deltas must not follow.
+    arguments_done: bool,
 }
 
 #[derive(Debug)]
@@ -65,28 +78,41 @@ impl ResponsesAccumulator {
                 if item_type == "function_call" {
                     let call_id = required_call_id(item, event_type)?;
                     let name = required_string(item, "name", event_type)?;
-                    let arguments = required_string(item, "arguments", event_type)?;
-                    let slot = self.calls.entry(index).or_default();
-                    if slot.call_id.is_none() {
-                        slot.call_id = Some(call_id.to_owned());
+                    let is_terminal = event_type == "response.output_item.done";
+                    let slot = self.slot_for(index);
+                    if !is_terminal && slot.sealed {
+                        return Err(malformed_event(format!(
+                            "{event_type} for output index {index} arrived after the item was done; provider re-opened a sealed call"
+                        )));
                     }
-                    if slot.name.is_none() {
-                        slot.name = Some(name.to_owned());
+                    bind_identities(slot, index, call_id, name, event_type)?;
+                    if let Some(item_id) = optional_string(item, "id", event_type)? {
+                        bind_item_id(slot, index, item_id, event_type)?;
                     }
-                    if slot.arguments.is_empty() && !arguments.is_empty() {
-                        slot.arguments.push_str(arguments);
-                        chunks.push(tool_delta(slot, arguments.to_string(), true, index));
+                    if is_terminal {
+                        slot.arguments_done = true;
+                        apply_terminal_arguments(
+                            slot,
+                            index,
+                            item,
+                            "arguments",
+                            event_type,
+                            &mut chunks,
+                        )?;
                     }
                 }
             }
             "response.function_call_arguments.delta" => {
                 let index = output_index(event)?;
-                let call_id = required_call_id(event, event_type)?;
+                let item_id = required_call_id(event, event_type)?;
                 let delta = required_string(event, "delta", event_type)?;
                 if !delta.is_empty() {
-                    let slot = self.calls.entry(index).or_default();
-                    if slot.call_id.is_none() {
-                        slot.call_id = Some(call_id.to_owned());
+                    let slot = self.slot_for(index);
+                    bind_item_id(slot, index, item_id, event_type)?;
+                    if slot.sealed || slot.arguments_done {
+                        return Err(malformed_event(format!(
+                            "{event_type} for output index {index} arrived after the arguments/item was done; provider ordered or repeated the call stream"
+                        )));
                     }
                     let first = slot.arguments.is_empty();
                     slot.arguments.push_str(delta);
@@ -95,21 +121,21 @@ impl ResponsesAccumulator {
             }
             "response.function_call_arguments.done" => {
                 let index = output_index(event)?;
-                let call_id = required_call_id(event, event_type)?;
-                let arguments = required_string(event, "arguments", event_type)?;
-                let slot = self.calls.entry(index).or_default();
-                if slot.call_id.is_none() {
-                    slot.call_id = Some(call_id.to_owned());
+                let item_id = required_call_id(event, event_type)?;
+                let slot = self.slot_for(index);
+                bind_item_id(slot, index, item_id, event_type)?;
+                if slot.sealed {
+                    // A duplicate terminal event is an idempotent snapshot;
+                    // only non-terminal mutations after the seal are errors.
+                    return Ok(chunks);
                 }
                 if let Some(name) = optional_string(event, "name", event_type)?
                     && slot.name.is_none()
                 {
                     slot.name = Some(name.to_owned());
                 }
-                if slot.arguments.is_empty() && !arguments.is_empty() {
-                    slot.arguments.push_str(arguments);
-                    chunks.push(tool_delta(slot, arguments.to_string(), true, index));
-                }
+                slot.arguments_done = true;
+                apply_terminal_arguments(slot, index, event, "arguments", event_type, &mut chunks)?;
             }
             "response.completed" => {
                 let response = required_object(event, "response", event_type)?;
@@ -165,6 +191,10 @@ impl ResponsesAccumulator {
         Ok(chunks)
     }
 
+    fn slot_for(&mut self, index: usize) -> &mut AccFunctionCall {
+        self.calls.entry(index).or_default()
+    }
+
     fn capture_usage(&mut self, response: &Value) -> AgentResult<()> {
         let Some(usage) = response.get("usage") else {
             return Ok(());
@@ -206,16 +236,19 @@ impl ResponsesAccumulator {
             .calls
             .into_iter()
             .map(|(index, slot)| {
-                let arguments = serde_json::from_str(&slot.arguments).map_err(|error| {
-                    AgentError::ModelProtocol {
+                let arguments = assemble_arguments(&slot.arguments, slot.terminal_arguments.as_deref())
+                    .map_err(|error| AgentError::ModelProtocol {
                         kind: ModelProtocolErrorKind::MalformedToolCall,
                         message: format!(
                             "Responses tool call at output index {index} has incomplete or invalid arguments: {error}"
                         ),
-                    }
-                })?;
+                    })?;
                 Ok(ToolCall {
-                    id: slot.call_id.unwrap_or_else(|| format!("call-{index}")),
+                    id: slot
+                        .call_id
+                        .clone()
+                        .or_else(|| slot.item_id.clone())
+                        .unwrap_or_else(|| format!("call-{index}")),
                     name: slot.name.unwrap_or_default(),
                     arguments,
                 })
@@ -229,6 +262,116 @@ fn malformed_event(message: impl Into<String>) -> AgentError {
     AgentError::ModelProtocol {
         kind: ModelProtocolErrorKind::MalformedEvent,
         message: message.into(),
+    }
+}
+
+/// Reject an identity contradiction: every event that names a call already
+/// bound to a different id for the same output index is a broken stream.
+fn bind_call_id(
+    slot: &mut AccFunctionCall,
+    index: usize,
+    call_id: &str,
+    event_type: &str,
+) -> AgentResult<()> {
+    if slot
+        .call_id
+        .as_deref()
+        .is_some_and(|bound| bound != call_id)
+    {
+        return Err(malformed_event(format!(
+            "{event_type} for output index {index} bound call id `{call_id}` but the slot is already `{}`",
+            slot.call_id.as_deref().unwrap_or_default()
+        )));
+    }
+    if slot.call_id.is_none() {
+        slot.call_id = Some(call_id.to_owned());
+    }
+    Ok(())
+}
+
+/// Bind the item/routing identity of a slot, rejecting a contradiction with
+/// any item id already bound to that output index.
+fn bind_item_id(
+    slot: &mut AccFunctionCall,
+    index: usize,
+    item_id: &str,
+    event_type: &str,
+) -> AgentResult<()> {
+    if slot
+        .item_id
+        .as_deref()
+        .is_some_and(|bound| bound != item_id)
+    {
+        return Err(malformed_event(format!(
+            "{event_type} for output index {index} bound item id `{item_id}` but the slot is already `{}`",
+            slot.item_id.as_deref().unwrap_or_default()
+        )));
+    }
+    if slot.item_id.is_none() {
+        slot.item_id = Some(item_id.to_owned());
+    }
+    Ok(())
+}
+
+/// Bind an id/name pair for an output index, rejecting a contradiction with
+/// anything already bound to that slot.
+fn bind_identities(
+    slot: &mut AccFunctionCall,
+    index: usize,
+    call_id: &str,
+    name: &str,
+    event_type: &str,
+) -> AgentResult<()> {
+    bind_call_id(slot, index, call_id, event_type)?;
+    if slot.call_id.is_none() {
+        slot.call_id = Some(call_id.to_owned());
+    }
+    if slot.name.as_deref().is_some_and(|bound| bound != name) {
+        return Err(malformed_event(format!(
+            "{event_type} for output index {index} bound name `{name}` but the slot is already `{}`",
+            slot.name.as_deref().unwrap_or_default()
+        )));
+    }
+    if slot.name.is_none() {
+        slot.name = Some(name.to_owned());
+    }
+    Ok(())
+}
+
+/// Order a terminal full-arguments snapshot into the slot. Assembled deltas
+/// stay authoritative while they parse; the snapshot is kept as a repair
+/// candidate and only seeds directly when nothing was assembled, so a
+/// provider that never streams deltas still yields the call.
+fn apply_terminal_arguments(
+    slot: &mut AccFunctionCall,
+    index: usize,
+    source: &Value,
+    field: &str,
+    event_type: &str,
+    chunks: &mut Vec<ModelChunk>,
+) -> AgentResult<()> {
+    let arguments = required_string(source, field, event_type)?;
+    if slot.arguments.is_empty() {
+        if !arguments.is_empty() {
+            slot.arguments.push_str(arguments);
+            chunks.push(tool_delta(slot, arguments.to_string(), true, index));
+        }
+    } else {
+        slot.terminal_arguments = Some(arguments.to_string());
+    }
+    Ok(())
+}
+
+/// The assembled deltas parse, or the authoritative terminal snapshot does,
+/// or the call is a typed failure. The terminal snapshot only rescues an
+/// assembly the provider itself cut short; it never overrides live deltas.
+fn assemble_arguments(assembled: &str, terminal: Option<&str>) -> Result<Value, serde_json::Error> {
+    if let Ok(value) = serde_json::from_str(assembled) {
+        return Ok(value);
+    }
+    match terminal {
+        Some(snapshot) if !snapshot.is_empty() => serde_json::from_str(snapshot),
+        _ => serde_json::from_str(assembled),
     }
 }
 
@@ -310,6 +453,7 @@ fn tool_delta(
         call_id: slot
             .call_id
             .clone()
+            .or_else(|| slot.item_id.clone())
             .unwrap_or_else(|| format!("call-{index}")),
         name: include_name.then(|| slot.name.clone()).flatten(),
         arguments_delta,
@@ -551,5 +695,160 @@ mod tests {
                 }
             ));
         }
+    }
+
+    #[test]
+    fn call_and_item_ids_are_distinct_namespaces_and_conflicts_are_rejected() {
+        // The item carries `call_id` (call_1) while the arguments events
+        // carry `item_id` (fc_1). Those namespaces never contradict each
+        // other; a real contradiction inside one namespace is rejected.
+        let mut accumulator = ResponsesAccumulator::default();
+        accumulator
+            .apply(&json!({
+                "type": "response.output_item.added",
+                "output_index": 0,
+                "item": {
+                    "id": "fc_1",
+                    "type": "function_call",
+                    "call_id": "call_1",
+                    "name": "fs_read",
+                    "arguments": ""
+                }
+            }))
+            .unwrap();
+        let error = accumulator
+            .apply(&json!({
+                "type": "response.output_item.added",
+                "output_index": 0,
+                "item": {
+                    "id": "fc_1",
+                    "type": "function_call",
+                    "call_id": "call_2",
+                    "name": "fs_read",
+                    "arguments": ""
+                }
+            }))
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            AgentError::ModelProtocol {
+                kind: ModelProtocolErrorKind::MalformedEvent,
+                ..
+            }
+        ));
+        assert!(error.to_string().contains("call id `call_2`"));
+    }
+
+    #[test]
+    fn deltas_after_the_item_is_done_are_rejected() {
+        let mut accumulator = ResponsesAccumulator::default();
+        accumulator
+            .apply(&json!({
+                "type": "response.output_item.added",
+                "output_index": 0,
+                "item": {"type": "function_call", "call_id": "call_1", "name": "fs_read", "arguments": ""}
+            }))
+            .unwrap();
+        accumulator
+            .apply(&json!({
+                "type": "response.output_item.done",
+                "output_index": 0,
+                "item": {"type": "function_call", "call_id": "call_1", "name": "fs_read", "arguments": "{\"a\":1}"}
+            }))
+            .unwrap();
+        let error = accumulator
+            .apply(&json!({
+                "type": "response.function_call_arguments.delta",
+                "output_index": 0,
+                "item_id": "fc_1",
+                "delta": "{}"
+            }))
+            .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("after the arguments/item was done"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn terminal_snapshot_rescues_an_incomplete_delta_assembly() {
+        // Deltas were cut mid-object; the terminal done event carries the
+        // authoritative full arguments and finalize must use it.
+        let mut accumulator = ResponsesAccumulator::default();
+        accumulator
+            .apply(&json!({
+                "type": "response.output_item.added",
+                "output_index": 0,
+                "item": {"type": "function_call", "call_id": "call_1", "name": "fs_read", "arguments": ""}
+            }))
+            .unwrap();
+        accumulator
+            .apply(&json!({
+                "type": "response.function_call_arguments.delta",
+                "output_index": 0,
+                "item_id": "fc_1",
+                "delta": "{\"pa"
+            }))
+            .unwrap();
+        accumulator
+            .apply(&json!({
+                "type": "response.function_call_arguments.done",
+                "output_index": 0,
+                "item_id": "fc_1",
+                "arguments": "{\"path\":\"README.md\"}"
+            }))
+            .unwrap();
+        accumulator
+            .apply(&json!({
+                "type": "response.completed",
+                "response": {"usage": {"input_tokens": 1, "output_tokens": 2}}
+            }))
+            .unwrap();
+        let (_, calls, _) = accumulator.finalize().unwrap();
+        assert_eq!(calls[0].arguments, json!({"path": "README.md"}));
+    }
+
+    #[test]
+    fn duplicate_terminal_events_are_idempotent_snapshots() {
+        let mut accumulator = ResponsesAccumulator::default();
+        for _ in 0..2 {
+            accumulator
+                .apply(&json!({
+                    "type": "response.function_call_arguments.done",
+                    "output_index": 0,
+                    "item_id": "fc_1",
+                    "name": "fs_read",
+                    "arguments": "{}"
+                }))
+                .unwrap();
+        }
+        let (_, calls, _) = accumulator.finalize().unwrap();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].id, "fc_1");
+        assert_eq!(calls[0].arguments, json!({}));
+    }
+
+    #[test]
+    fn added_full_arguments_are_not_authoritative_until_a_terminal_event() {
+        // `output_item.added` may hint at arguments but is not a terminal
+        // snapshot; without deltas or a done event the call fails typed.
+        let mut accumulator = ResponsesAccumulator::default();
+        accumulator
+            .apply(&json!({
+                "type": "response.output_item.added",
+                "output_index": 0,
+                "item": {"type": "function_call", "call_id": "call_1", "name": "fs_read", "arguments": "{\"a\":1}"}
+            }))
+            .unwrap();
+        let error = accumulator.finalize().unwrap_err();
+        assert!(matches!(
+            error,
+            AgentError::ModelProtocol {
+                kind: ModelProtocolErrorKind::MalformedToolCall,
+                ..
+            }
+        ));
     }
 }

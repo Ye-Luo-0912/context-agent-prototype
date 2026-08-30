@@ -35,7 +35,7 @@ use tokio_util::codec::{FramedRead, LinesCodec, LinesCodecError};
 use tokio_util::io::StreamReader;
 
 use crate::responses::{ResponseStreamErrorKind, ResponsesAccumulator};
-use crate::sse::{StreamAccumulator, parse_sse_data, parse_wire_chunk};
+use crate::sse::{SseEventFramer, StreamAccumulator, parse_wire_chunk};
 use crate::wire_names::ToolNameCodec;
 
 const PROTOCOL_UNKNOWN: u8 = 0;
@@ -370,6 +370,7 @@ impl OpenAiProvider {
         let max_stream_bytes = self.config.max_stream_bytes;
         let mut total_bytes = 0usize;
         let mut accumulator = StreamAccumulator::default();
+        let mut framer = SseEventFramer::new(max_stream_bytes);
         let mut saw_done = false;
         // A stream that stops delivering bytes without closing is a stalled
         // connection, not a slow model: bound the silent gap so the turn
@@ -406,20 +407,29 @@ impl OpenAiProvider {
                                     ),
                                 ));
                             }
-                            let Some(payload) = parse_sse_data(&line) else {
-                                continue;
-                            };
-                            if payload == "[DONE]" {
-                                saw_done = true;
-                                break;
-                            }
-                            match parse_wire_chunk(payload).map_err(ProtocolError::from)? {
-                                Some(chunk) => {
-                                    for event in accumulator.apply(&chunk) {
-                                        sink.on_chunk(codec.remap_chunk(event)).await.map_err(ProtocolError::from)?;
+                            match framer.push_line(&line) {
+                                Ok(Some(event)) => {
+                                    if event.data == "[DONE]" {
+                                        saw_done = true;
+                                        break;
+                                    }
+                                    match parse_wire_chunk(&event.data)
+                                        .map_err(ProtocolError::from)?
+                                    {
+                                        Some(chunk) => {
+                                            for event in accumulator.apply(&chunk)
+                                                .map_err(ProtocolError::from)?
+                                            {
+                                                sink.on_chunk(codec.remap_chunk(event)).await.map_err(ProtocolError::from)?;
+                                            }
+                                        }
+                                        None => tracing::debug!(%event.data, "ignoring unknown Chat Completions extension event"),
                                     }
                                 }
-                                None => tracing::debug!(%payload, "ignoring unknown Chat Completions extension event"),
+                                Ok(None) => {}
+                                Err(message) => {
+                                    return Err(ProtocolError::transport(false, message));
+                                }
                             }
                         }
                         Some(Err(LinesCodecError::MaxLineLengthExceeded)) => {
@@ -436,7 +446,26 @@ impl OpenAiProvider {
                                 format!("stream error: {error}"),
                             ));
                         }
-                        None => break,
+                        None => {
+                            // The stream closed without a trailing blank
+                            // line; flush a residual event per the SSE spec.
+                            if let Some(event) = framer.finish() {
+                                if event.data == "[DONE]" {
+                                    saw_done = true;
+                                } else if let Some(chunk) =
+                                    parse_wire_chunk(&event.data).map_err(ProtocolError::from)?
+                                {
+                                    for event in accumulator.apply(&chunk)
+                                        .map_err(ProtocolError::from)?
+                                    {
+                                        sink.on_chunk(codec.remap_chunk(event))
+                                            .await
+                                            .map_err(ProtocolError::from)?;
+                                    }
+                                }
+                            }
+                            break;
+                        }
                     }
                 }
             }
@@ -507,6 +536,7 @@ impl OpenAiProvider {
         let max_stream_bytes = self.config.max_stream_bytes;
         let mut total_bytes = 0usize;
         let mut accumulator = ResponsesAccumulator::default();
+        let mut framer = SseEventFramer::new(max_stream_bytes);
         // Same stalled-connection bound as the chat path: fail retryable
         // instead of hanging on a silent peer.
         let mut idle_deadline = tokio::time::Instant::now() + self.config.timeout;
@@ -533,14 +563,22 @@ impl OpenAiProvider {
                                     format!("stream exceeded the {max_stream_bytes} byte cap; provider response is not bounded"),
                                 ));
                             }
-                            let Some(payload) = parse_sse_data(&line) else { continue; };
-                            if payload == "[DONE]" { break; }
-                            let event = parse_responses_event(payload).map_err(ProtocolError::from)?;
-                            for chunk in accumulator.apply(&event).map_err(ProtocolError::from)? {
-                                sink.on_chunk(codec.remap_chunk(chunk)).await.map_err(ProtocolError::from)?;
-                            }
-                            if accumulator.is_completed() {
-                                break;
+                            match framer.push_line(&line) {
+                                Ok(Some(event)) => {
+                                    if event.data == "[DONE]" { break; }
+                                    let event = parse_responses_event(&event.data)
+                                        .map_err(ProtocolError::from)?;
+                                    for chunk in accumulator.apply(&event).map_err(ProtocolError::from)? {
+                                        sink.on_chunk(codec.remap_chunk(chunk)).await.map_err(ProtocolError::from)?;
+                                    }
+                                    if accumulator.is_completed() {
+                                        break;
+                                    }
+                                }
+                                Ok(None) => {}
+                                Err(message) => {
+                                    return Err(ProtocolError::transport(false, message));
+                                }
                             }
                         }
                         Some(Err(LinesCodecError::MaxLineLengthExceeded)) => {
@@ -552,7 +590,18 @@ impl OpenAiProvider {
                         Some(Err(error)) => {
                             return Err(ProtocolError::transport(true, format!("stream error: {error}")));
                         }
-                        None => break,
+                        None => {
+                            // Stream closed without a trailing blank line;
+                            // flush a residual event per the SSE spec.
+                            if let Some(event) = framer.finish() && event.data != "[DONE]" {
+                                let event = parse_responses_event(&event.data)
+                                    .map_err(ProtocolError::from)?;
+                                for chunk in accumulator.apply(&event).map_err(ProtocolError::from)? {
+                                    sink.on_chunk(codec.remap_chunk(chunk)).await.map_err(ProtocolError::from)?;
+                                }
+                            }
+                            break;
+                        }
                     }
                 }
             }
@@ -1154,6 +1203,90 @@ mod tests {
         assert_eq!(output.usage.output_tokens, Some(2));
         assert_eq!(output.usage.cached_input_tokens, Some(6));
         server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn chat_joins_multiline_data_events_before_the_blank_boundary() {
+        // A compliant provider may split one event's JSON across several
+        // `data:` lines; the payload joins with `\n` and only a blank line
+        // closes the event. Per-line JSON parsing would reject the
+        // unterminated first line and fail the turn.
+        let addr = serve_sse_once(concat!(
+            "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"Hello\"}\n",
+            "data: }]}\n\n",
+            "data: [DONE]\n\n",
+        ))
+        .await;
+        let provider = OpenAiProvider::with_client(
+            dummy_config(format!("http://{addr}/v1")),
+            Client::builder().no_proxy().build().unwrap(),
+        );
+        let sink = RecordingSink::default();
+        let output = provider
+            .complete_stream(fs_list_request(), &sink)
+            .await
+            .unwrap();
+        assert_eq!(output.content, "Hello");
+        assert_eq!(
+            &sink.chunks.lock().unwrap()[..],
+            &[
+                ModelChunk::TextDelta {
+                    delta: "Hello".into()
+                },
+                ModelChunk::Done,
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn responses_joins_multiline_data_events_before_the_blank_boundary() {
+        let addr = serve_sse_once(concat!(
+            "data: {\"type\":\"response.output_item.added\",\"output_index\":0,\"item\":{\n",
+            "data: \"type\":\"function_call\",\"call_id\":\"call_1\",\"name\":\"fs_list\",\"arguments\":\"\"}}\n\n",
+            "data: {\"type\":\"response.function_call_arguments.delta\",\"output_index\":0,\"item_id\":\"fc_1\",\"delta\":\"{}\"}\n\n",
+            "data: {\"type\":\"response.completed\",\"response\":{\"usage\":{\"input_tokens\":10,\"output_tokens\":2,\"input_tokens_details\":{\"cached_tokens\":6}}}}\n\n",
+            "data: [DONE]\n\n",
+        ))
+        .await;
+        let mut config = dummy_config(format!("http://{addr}/v1"));
+        config.protocol = OpenAiProtocol::Responses;
+        let provider =
+            OpenAiProvider::with_client(config, Client::builder().no_proxy().build().unwrap());
+        let sink = RecordingSink::default();
+        let output = provider
+            .complete_stream(fs_list_request(), &sink)
+            .await
+            .unwrap();
+        assert_eq!(output.tool_calls.len(), 1);
+        assert_eq!(output.tool_calls[0].id, "call_1");
+        assert_eq!(output.tool_calls[0].name, "fs.list");
+        assert_eq!(output.tool_calls[0].arguments, json!({}));
+    }
+
+    #[tokio::test]
+    async fn chat_flushes_trailing_done_when_the_stream_closes_without_a_blank_line() {
+        let addr = serve_sse_once(concat!(
+            "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"hi\"}}]}\n\n",
+            "data: [DONE]",
+        ))
+        .await;
+        let provider = OpenAiProvider::with_client(
+            dummy_config(format!("http://{addr}/v1")),
+            Client::builder().no_proxy().build().unwrap(),
+        );
+        let sink = RecordingSink::default();
+        let output = provider
+            .complete_stream(fs_list_request(), &sink)
+            .await
+            .unwrap();
+        assert_eq!(output.content, "hi");
+        assert_eq!(
+            &sink.chunks.lock().unwrap()[..],
+            &[
+                ModelChunk::TextDelta { delta: "hi".into() },
+                ModelChunk::Done,
+            ]
+        );
     }
 
     #[test]
