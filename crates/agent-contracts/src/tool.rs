@@ -2814,8 +2814,12 @@ mod tests {
 
     #[test]
     fn approved_workspace_write_covers_the_same_canonical_path_only() {
+        // The canonical form is separator-independent only where the
+        // platform treats `\` and `/` as the same separator (Windows);
+        // on POSIX `\` is an ordinary filename character. Use the native
+        // separator so the approved path is the same canonical file.
         let approved = EffectIntent::WorkspaceWrite {
-            path: r"src\util.py".into(),
+            path: format!("src{}util.py", std::path::MAIN_SEPARATOR),
             content_bytes: 32,
         };
         assert!(approved.covers(&EffectIntent::WorkspaceWrite {
@@ -2826,6 +2830,19 @@ mod tests {
             path: "src/util.py".into(),
             content_bytes: 8,
         }));
+        #[cfg(not(windows))]
+        {
+            // A literal backslash names a different file on POSIX: the
+            // slash form must not cover it (fail closed).
+            let posix_backslash = EffectIntent::WorkspaceWrite {
+                path: r"src\util.py".into(),
+                content_bytes: 32,
+            };
+            assert!(!posix_backslash.covers(&EffectIntent::WorkspaceWrite {
+                path: "src/util.py".into(),
+                content_bytes: 32,
+            }));
+        }
         assert!(!approved.covers(&EffectIntent::WorkspaceWrite {
             path: "src/utils.py".into(),
             content_bytes: 8,
@@ -2928,7 +2945,7 @@ mod tests {
         let set = EffectIntent::WorkspaceWriteSet {
             writes: vec![
                 WorkspaceWriteBound {
-                    path: r"src\a.rs".into(),
+                    path: format!("src{}a.rs", std::path::MAIN_SEPARATOR),
                     max_bytes: 10,
                 },
                 WorkspaceWriteBound {

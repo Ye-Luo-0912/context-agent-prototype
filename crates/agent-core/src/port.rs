@@ -2772,9 +2772,11 @@ mod tests {
     async fn commit_allows_an_actual_write_inside_the_approved_intent() {
         // The same path the intent approved, slash-form differences
         // canonicalized away: the check must not reject honest effects.
+        // The actual write uses the native separator so it is the same
+        // canonical file on both Windows (`\`) and POSIX (`/`).
         let (result, state) =
             actual_vs_approved_commit(Some(vec![agent_contracts::ActualWorkspaceWrite {
-                path: r"src\lib.rs".into(),
+                path: format!("src{}lib.rs", std::path::MAIN_SEPARATOR),
                 bytes: 1,
             }]))
             .await;
