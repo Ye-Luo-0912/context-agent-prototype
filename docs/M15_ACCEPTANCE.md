@@ -111,8 +111,17 @@ settlement and advisory candidates off) completed with behavior/diff pass,
 closure completed, provider healthy, 23 model rounds / 35 tool calls.
 Evidence: `crates/agent-eval/evidence/m15-preflight-relay/`, with the three
 earlier failed attempts retained (Chat SSE shape, 4,096-token output
-truncation, wire-name collision). The next 12-cell window is predeclared on
-this tuple (§2) and has not been run.
+truncation, wire-name collision). The predeclared 12-cell window on this
+tuple then ran 2026-08-30 on the clean source `a25a8a5` and is a **valid
+FAIL: 10/12 pass, 0 NOT_RUN** — the mechanical report at
+`crates/agent-eval/evidence/m15-window/_windows/1788105967425/`. Diag 4/4
+and migrate 4/4; policy 2/4, its two failures sharing one mechanism: the
+model emitted single responses beyond the pinned 16,384 max output tokens
+(normal r2 died on the explicit output-limit error; resume r2's response
+truncated a ~8 KB list-typed tool-call argument that the provider's strict
+parser rejected fail-closed). No harness, transport or oracle defect; per
+§5 the valid FAIL rejects the relay candidate and M15 remains open.
+Candidate selection is a user decision.
 
 The later Completion Convergence implementation and report do not justify
 another window. The original review found split completion authority,
@@ -171,7 +180,8 @@ The three historical valid-FAIL windows remain immutable
 `retry-pilot-cell-v4`; this schema advance adds stable pair/source identity,
 independent acceptance-domain revision/source identity and bounded
 model-request causal-audit fields. It does not reinterpret v3 verdicts.
-No v4 formal M15 evidence is currently banked. Each immutable cell directory
+The two formal v4 windows are banked as valid FAILs (9/12 on `d1936d4`,
+10/12 on `a25a8a5`); no v4 window has passed. Each immutable cell directory
 contains the manifest, full event stream, `dimensions.json`, hidden oracle
 records and workspace snapshot hash. The dimensions are persisted facts, not
 a projection from the exit branch:
@@ -319,7 +329,9 @@ checkpoint, not a milestone exit. Continue in this order:
    the window;
 9. run exactly one uninterrupted, predeclared 12-cell v4 window with
    `agent-eval --m15-window` and accept only its mechanically regenerated
-   report. It has not been run.
+   report. It ran 2026-08-30 on `a25a8a5` and is a valid FAIL (10/12,
+   output-cap truncation on the two `retry_policy_dev` cells); §5 rejects
+   the candidate and M15 remains open.
 
 300×3 scale, `recall_after_fix`, a 27-cell context expansion, a second context
 engine comparison and model comparison remain parked until this gate closes.

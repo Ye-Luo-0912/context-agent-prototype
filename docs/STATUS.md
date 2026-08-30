@@ -129,8 +129,7 @@ and sandbox contracts live elsewhere. Experiment facts live in
   35 tool calls, no retryable transport outcome. Evidence:
   `crates/agent-eval/evidence/m15-preflight-relay/` (the earlier failed
   attempts are retained: Chat SSE shape, 4,096-token output truncation, and
-  the wire-name collision above). The single predeclared 12-cell v4 window
-  on this tuple (M15_ACCEPTANCE §2) is next.
+  the wire-name collision above).
 - The 12-cell v4 window on the relay tuple is **predeclared 2026-08-30
   before the run**: 3 fixtures × normal/resume × 2 repeats, the product
   surface, the relay serving tuple above with an explicit protocol, one
@@ -140,11 +139,24 @@ and sandbox contracts live elsewhere. Experiment facts live in
   item 8; no source change happens during the run, the frozen-window rules
   of M15_ACCEPTANCE §5 apply, and the mechanically regenerated report is the
   only accepted verdict.
+- The 12-cell v4 window on the relay tuple ran 2026-08-30 on the predeclared
+  clean source `a25a8a5` (product surface, relay serving, explicit protocol)
+  and is a **valid FAIL: 10/12 pass, 0 NOT_RUN** — the mechanical report at
+  `crates/agent-eval/evidence/m15-window/_windows/1788105967425/`. Diag 4/4
+  and migrate 4/4; policy 2/4, its two failures sharing one mechanism: the
+  model emitted single responses beyond the pinned 16,384 max output tokens
+  (normal r2: explicit output-limit error at round 6; resume r2: a
+  truncated ~8 KB list-typed tool-call argument rejected fail-closed by the
+  provider's strict parser). Per M15_ACCEPTANCE §5 the valid FAIL rejects
+  the relay candidate and returns to diagnosis at
+  `crates/agent-eval/evidence/m15-diagnosis-relay/REPORT.md`; the window is
+  not rerun. M15 remains open; candidate selection is a user decision.
 - M15 remains open. Its shape remains 3 fixtures × normal/resume × 2 repeats =
-  12 cells. Historical v3 FAIL windows remain immutable; the first v4 window
-  (valid FAIL 9/12) is banked and no v4 window has passed. M12/M13 artifacts
-  remain banked, while `GOV-STATUS-01` still forbids a new closure claim or
-  Self-Iteration transition.
+  12 cells. Historical v3 FAIL windows remain immutable; the two v4 windows
+  (valid FAILs 9/12 on `d1936d4` and 10/12 on `a25a8a5`) are banked and no
+  v4 window has passed. M12/M13 artifacts remain banked, while
+  `GOV-STATUS-01` still forbids a new closure claim or Self-Iteration
+  transition.
 
 ### Historical evidence chronology (non-authoritative)
 
