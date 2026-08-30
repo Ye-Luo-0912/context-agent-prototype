@@ -60,15 +60,15 @@ pub use needs::{
 };
 pub use snapshot::RoundExecutionSnapshot;
 pub use snapshot::VerificationProjection;
+pub use state::{
+    CompletionRepairRecord, ExecutionState, FrontierObservation, NegativeExecutionFact,
+    NegativeFactTransition, ResourceFact, ResourceProvenance, RuntimeExecutionAttribution,
+    UnresolvedFailureOverflow, VerificationCause, VerificationCoverage, VerificationFact,
+    VerificationPassTransition, VerificationSourceLease, VerificationState,
+};
 /// Test-only: unit tests construct typed obligations/facts directly.
 #[cfg(test)]
 pub use state::{ExecutionObligation, FailedCommandFact};
-pub use state::{
-    ExecutionState, FrontierObservation, NegativeExecutionFact, NegativeFactTransition,
-    ResourceFact, ResourceProvenance, RuntimeExecutionAttribution, UnresolvedFailureOverflow,
-    VerificationCause, VerificationCoverage, VerificationFact, VerificationPassTransition,
-    VerificationSourceLease, VerificationState,
-};
 
 /// Checkpoint/wire name for [`ExecutionState`]. The `TaskRecord` field is
 /// still `resume` so existing checkpoints load. Prefer `ExecutionState` in

@@ -54,6 +54,9 @@ pub enum CheckpointDebtReason {
     /// A deferred terminal completion failed after its operation had been
     /// accepted; the bounded failure projection must survive continuation.
     CompletionCommitFailed,
+    /// A completion-gate refusal wrote a durable repair stage that must
+    /// survive the deferred safe-point and restart.
+    CompletionRepairChanged,
 }
 
 impl CheckpointDebtReason {
@@ -64,6 +67,7 @@ impl CheckpointDebtReason {
             Self::VerificationChanged => "verification_changed",
             Self::OpportunityOffered => "opportunity_offered",
             Self::CompletionCommitFailed => "completion_commit_failed",
+            Self::CompletionRepairChanged => "completion_repair_changed",
         }
     }
 }

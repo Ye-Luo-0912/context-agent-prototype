@@ -1,6 +1,6 @@
 use super::*;
 
-const COMPLETION_REPAIR_VIEW_CHARS: usize = 768;
+use crate::task::COMPLETION_REPAIR_VIEW_CHARS;
 
 fn is_required_context_body(materialized: &MaterializedContext, item: &MaterializedItem) -> bool {
     item.retention == ContextRetention::Pinned
@@ -1648,13 +1648,25 @@ impl RuntimeActor {
             None
         };
         if let Some(progress) = progress.as_mut().filter(|_| {
-            self.state
-                .turn
-                .as_ref()
-                .is_some_and(|turn| latest_completion_gate_was_refused(&turn.turn_frame))
+            self.state.turn.as_ref().is_some_and(|turn| {
+                latest_completion_gate_was_refused(&turn.turn_frame)
+                    || turn.execution.completion_repair.is_some()
+            })
         }) {
             let readiness = self.completion_readiness(CompletionIntent::ModelProposal, None);
-            let (_, rendered) = self.completion_repair_plan(&readiness);
+            let rendered = self
+                .state
+                .turn
+                .as_ref()
+                .and_then(|turn| turn.execution.completion_repair.as_ref())
+                .filter(|record| record.matches_basis(&readiness))
+                .map(|record| record.text.clone())
+                .unwrap_or_else(|| {
+                    // A durable stage whose basis drifted is stale; derive
+                    // the current stage from readiness for this decision.
+                    let (_, rendered) = self.completion_repair_plan(&readiness);
+                    rendered
+                });
             progress.completion_repair =
                 Some(bounded_preview(&rendered, COMPLETION_REPAIR_VIEW_CHARS));
         }

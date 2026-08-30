@@ -655,7 +655,29 @@ pub(crate) struct CompletionReadiness {
     pub commit_safe: bool,
     pub verified_ready: bool,
     blockers: Vec<CompletionBlocker>,
+    /// Bounded details of currently uncovered acceptance criteria, carried
+    /// from the derivation so repair stages name the exact criterion instead
+    /// of re-deriving it from anchor state.
+    uncovered_criteria: Vec<UncoveredCriterion>,
 }
+
+/// One uncovered acceptance criterion, bounded for model-visible repair
+/// stages. Never carries the full anchor body.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct UncoveredCriterion {
+    pub criterion_index: u32,
+    pub coverage_domain: String,
+    pub criterion_text: String,
+}
+
+/// Cap on criterion details carried in one readiness decision.
+pub(crate) const MAX_UNCOVERED_CRITERION_DETAILS: usize = 8;
+
+/// Cap on the model-visible completion-repair instruction text.
+pub(crate) const COMPLETION_REPAIR_VIEW_CHARS: usize = 768;
+
+/// Cap on consecutive refusals recorded against one repair basis.
+pub(crate) const MAX_COMPLETION_REPAIR_REFUSALS: u32 = 64;
 
 impl CompletionReadiness {
     pub fn allows_completion(&self) -> bool {
@@ -665,6 +687,10 @@ impl CompletionReadiness {
 
     pub fn settled_candidate(&self) -> bool {
         self.commit_safe && self.verified_ready
+    }
+
+    pub fn uncovered_criteria(&self) -> &[UncoveredCriterion] {
+        &self.uncovered_criteria
     }
 
     pub fn applicable_blockers(&self) -> Vec<CompletionBlocker> {
@@ -797,6 +823,7 @@ pub(crate) fn derive_completion_readiness(
     current_declarations: &[agent_contracts::VerificationCoverageDeclaration],
 ) -> CompletionReadiness {
     let mut blockers = Vec::with_capacity(MAX_COMPLETION_BLOCKERS);
+    let mut uncovered_criteria: Vec<UncoveredCriterion> = Vec::new();
     let mut push = |blocker| {
         if blockers.len() < MAX_COMPLETION_BLOCKERS && !blockers.contains(&blocker) {
             blockers.push(blocker);
@@ -834,6 +861,7 @@ pub(crate) fn derive_completion_readiness(
                     verification_basis,
                     blockers,
                     safety,
+                    Vec::new(),
                 );
             };
             if execution.anchor_revision != task.anchor.revision {
@@ -880,7 +908,7 @@ pub(crate) fn derive_completion_readiness(
                     .iter()
                     .enumerate()
                     .filter(|(index, criterion)| {
-                        !task.anchor.acceptance_coverage.iter().any(|receipt| {
+                        let uncovered = !task.anchor.acceptance_coverage.iter().any(|receipt| {
                             receipt.criterion_index as usize == *index
                                 && receipt.coverage_domain == criterion.coverage_domain
                                 && receipt.domain_declaration_revision
@@ -895,7 +923,18 @@ pub(crate) fn derive_completion_readiness(
                                     acceptance_receipt_fact(execution, task, basis, receipt)
                                         .is_some()
                                 })
-                        })
+                        });
+                        if uncovered && uncovered_criteria.len() < MAX_UNCOVERED_CRITERION_DETAILS {
+                            uncovered_criteria.push(UncoveredCriterion {
+                                criterion_index: (*index).min(u32::MAX as usize) as u32,
+                                coverage_domain: criterion.coverage_domain.clone(),
+                                criterion_text: agent_contracts::bounded_preview(
+                                    &criterion.description,
+                                    agent_contracts::MAX_TASK_ANCHOR_ITEM_CHARS,
+                                ),
+                            });
+                        }
+                        uncovered
                     })
                     .count();
                 if uncovered > 0 {
@@ -933,6 +972,7 @@ pub(crate) fn derive_completion_readiness(
         verification_basis,
         blockers,
         safety,
+        uncovered_criteria,
     )
 }
 
@@ -981,6 +1021,7 @@ fn finish_completion_readiness(
     verification_basis: Option<VerificationBasis>,
     mut blockers: Vec<CompletionBlocker>,
     safety: CompletionSafety,
+    uncovered_criteria: Vec<UncoveredCriterion>,
 ) -> CompletionReadiness {
     for blocker in [
         safety
@@ -1035,6 +1076,7 @@ fn finish_completion_readiness(
         commit_safe,
         verified_ready,
         blockers,
+        uncovered_criteria,
     }
 }
 

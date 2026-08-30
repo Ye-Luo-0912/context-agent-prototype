@@ -1938,3 +1938,161 @@ async fn unloaded_surface_attempts_are_visible_but_never_completion_debt() {
     assert_eq!(checkpoint.tasks.completed.len(), 1);
     instance.shutdown().await.unwrap();
 }
+
+#[tokio::test]
+async fn refusal_persists_a_durable_repair_record_with_criterion_details() {
+    let (output, requests, checkpoint) = run_model_visible_completion_refusal(true).await;
+    assert!(!output.ok);
+    assert_eq!(output.metadata["refused"], "completion_gate");
+
+    // The repair stage carries the exact uncovered criterion straight from
+    // the readiness decision, not a separately re-derived guess.
+    let step = &output.metadata["repair_plan"]["steps"][0];
+    assert_eq!(step["kind"], "operator_required");
+    let details = step["criterion_details"]
+        .as_array()
+        .expect("criterion details");
+    assert_eq!(details.len(), 1);
+    assert_eq!(details[0]["coverage_domain"], COMPLETION_ACCEPTANCE_DOMAIN);
+    assert!(
+        details[0]["criterion_text"]
+            .as_str()
+            .is_some_and(|text| text.contains("completion fixture"))
+    );
+
+    // The gate refusal left a durable basis-stamped record on the task that
+    // survives the turn and subsequent checkpoints, so a deferred safe-point
+    // refusal can resume the exact stage instead of re-deriving it.
+    let active = checkpoint
+        .tasks
+        .active
+        .expect("task stays active after refusal");
+    let record = checkpoint
+        .tasks
+        .tasks
+        .iter()
+        .find(|task| task.id == active)
+        .and_then(|task| task.resume.completion_repair.as_ref())
+        .expect("a refused completion must persist its repair stage");
+    assert_eq!(record.refusal_count, 1);
+    assert!(record.basis_anchor_revision.is_some());
+    assert_eq!(record.plan["schema"], "completion-repair.v1");
+    assert_eq!(record.plan["steps"][0]["kind"], "operator_required");
+    assert_eq!(
+        record.plan["steps"][0]["criterion_details"][0]["coverage_domain"],
+        COMPLETION_ACCEPTANCE_DOMAIN
+    );
+    assert!(
+        requests
+            .get(1)
+            .is_some_and(|request| request.contains("cannot prove a current exact recipe_id")),
+        "the durable stage must reach the next model decision"
+    );
+}
+
+/// Proposes completion twice in one turn: a refused gate gets a second
+/// explicit attempt against the same basis, so the durable record can prove
+/// consecutive-refusal accounting.
+#[derive(Debug)]
+struct DoubleRefusalModel {
+    rounds: AtomicUsize,
+}
+
+#[async_trait::async_trait]
+impl ModelTransport for DoubleRefusalModel {
+    fn capabilities(&self) -> ModelCapabilities {
+        ModelCapabilities::default()
+    }
+
+    async fn complete(&self, _request: ModelRequest) -> AgentResult<ModelOutput> {
+        let round = self.rounds.fetch_add(1, Ordering::SeqCst);
+        Ok(if round <= 1 {
+            ModelOutput {
+                content: String::new(),
+                tool_calls: vec![ToolCall {
+                    id: format!("completion-refusal-{round}"),
+                    name: "task.complete".into(),
+                    arguments: json!({"summary": "optimistic completion", "artifacts": []}),
+                }],
+                usage: Default::default(),
+            }
+        } else {
+            ModelOutput {
+                content: "continuing after the second refusal".into(),
+                tool_calls: Vec::new(),
+                usage: Default::default(),
+            }
+        })
+    }
+}
+
+#[tokio::test]
+async fn consecutive_refusals_against_the_same_basis_accrue_durably() {
+    let model = Arc::new(DoubleRefusalModel {
+        rounds: AtomicUsize::new(0),
+    });
+    let services = RuntimeServices::new(
+        CoreAuthorityConfig::default(),
+        Arc::new(TestContextEngine),
+        model,
+        Arc::new(WithCompletionVerificationTools {
+            inner: CompletionToolDispatcher { workspace: None },
+        }),
+        Arc::new(PolicyApprovalGate::read_only()),
+        None,
+    );
+    let instance = RuntimeInstance::spawn(ModuleHost::new(), services);
+    let handle = instance.handle();
+    let mut events = handle.subscribe();
+    handle.start().await.unwrap();
+    declare_completion_acceptance(handle, "finish only with evidence").await;
+    handle.user_message("try to finish".into()).await.unwrap();
+
+    let mut refusals = Vec::new();
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+    while tokio::time::Instant::now() < deadline && refusals.len() < 2 {
+        if let Ok(Ok(envelope)) =
+            tokio::time::timeout(Duration::from_millis(50), events.recv()).await
+        {
+            match envelope.event {
+                RuntimeEvent::ToolFinished { output } if output.tool_name == "task.complete" => {
+                    assert!(!output.ok, "the gate must refuse both proposals");
+                    refusals.push(output);
+                }
+                RuntimeEvent::TaskCompleted { .. } => {
+                    panic!("a refused completion proposal must not complete the task")
+                }
+                RuntimeEvent::TurnCompleted if !refusals.is_empty() => {
+                    // The second refusal ends the turn; bail out of the
+                    // receive loop via the deadline guard instead.
+                }
+                _ => {}
+            }
+        }
+        if refusals.len() == 2 {
+            // Wait for the post-refusal text round to finish the turn.
+            break;
+        }
+    }
+    assert_eq!(
+        refusals.len(),
+        2,
+        "both explicit completion proposals must be refused"
+    );
+
+    let checkpoint = instance.checkpoint().await.unwrap();
+    let active = checkpoint.tasks.active.expect("task stays active");
+    let record = checkpoint
+        .tasks
+        .tasks
+        .iter()
+        .find(|task| task.id == active)
+        .and_then(|task| task.resume.completion_repair.as_ref())
+        .expect("the second refusal must persist the repair record");
+    assert_eq!(
+        record.refusal_count, 2,
+        "consecutive refusals against the same basis must accrue"
+    );
+    assert_eq!(record.plan["schema"], "completion-repair.v1");
+    instance.shutdown().await.unwrap();
+}

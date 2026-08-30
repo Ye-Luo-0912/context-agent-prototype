@@ -229,6 +229,50 @@ pub struct ExecutionState {
     /// and progress-only anchor edits cannot re-arm the same hint.
     #[serde(default)]
     pub last_offered_opportunity: Option<String>,
+    /// Durable completion-gate repair state for a refused `task.complete`.
+    /// Survives checkpoints and deferred safe-point refusals so the next
+    /// decision can resume the exact stage against the same basis instead of
+    /// re-deriving from scratch; a basis divergence makes it stale and the
+    /// next refusal replaces it.
+    #[serde(default)]
+    pub completion_repair: Option<CompletionRepairRecord>,
+}
+
+/// The last refused `task.complete` repair stage, persisted with the basis
+/// it was derived against. `plan` is the bounded `completion-repair.v1`
+/// stage; `text` is the bounded rendered instruction for the model view.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub struct CompletionRepairRecord {
+    pub basis_anchor_revision: Option<u64>,
+    pub basis_verification_revision: Option<u64>,
+    pub basis_directive_revision: Option<u64>,
+    pub basis_workspace_revision: Option<u64>,
+    pub plan: serde_json::Value,
+    pub text: String,
+    pub refused_at_ms: u64,
+    /// Consecutive refusals against the same basis; resets when the basis
+    /// changes.
+    pub refusal_count: u32,
+}
+
+impl CompletionRepairRecord {
+    /// Whether this record was derived against exactly the basis the
+    /// readiness decision currently holds. A mismatched record is stale and
+    /// must be replaced by a freshly derived stage.
+    pub(crate) fn matches_basis(&self, readiness: &crate::task::CompletionReadiness) -> bool {
+        let task_basis = readiness
+            .task_state_basis
+            .map(|basis| basis.anchor_revision);
+        let verification_basis = readiness.verification_basis;
+        self.basis_anchor_revision == task_basis
+            && self.basis_verification_revision
+                == verification_basis.map(|basis| basis.verification_revision)
+            && self.basis_directive_revision
+                == verification_basis.map(|basis| basis.directive_revision)
+            && self.basis_workspace_revision
+                == verification_basis.map(|basis| basis.workspace_revision)
+    }
 }
 
 /// 一条已证明存在的执行 blocker（lineage 模型）。

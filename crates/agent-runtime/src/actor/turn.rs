@@ -1,5 +1,8 @@
 use super::*;
 
+use crate::execution::CompletionRepairRecord;
+use crate::task::{COMPLETION_REPAIR_VIEW_CHARS, MAX_COMPLETION_REPAIR_REFUSALS};
+
 impl RuntimeActor {
     /// Commit the turn start: user message into the long-term context, then
     /// spawn the first model operation.
@@ -490,6 +493,51 @@ impl RuntimeActor {
                 .as_ref()
                 .filter(|readiness| !readiness.allows_completion())
                 .map(|readiness| self.completion_repair_plan(readiness));
+            // A gate refusal is durable: it must survive a checkpointed
+            // safe point and a restart so the next decision resumes the same
+            // basis-stamped stage instead of re-deriving it from scratch.
+            if refusal_class == "completion_gate"
+                && let Some((plan, text)) = repair.as_ref()
+            {
+                let basis = readiness
+                    .as_ref()
+                    .and_then(|readiness| readiness.verification_basis);
+                let anchor_revision = readiness
+                    .as_ref()
+                    .and_then(|readiness| readiness.task_state_basis)
+                    .map(|basis| basis.anchor_revision);
+                if let Some(turn) = self.state.turn.as_mut() {
+                    let previous = turn.execution.completion_repair.take();
+                    let same_basis = previous.as_ref().is_some_and(|record| {
+                        record.basis_anchor_revision == anchor_revision
+                            && record.basis_verification_revision
+                                == basis.map(|basis| basis.verification_revision)
+                            && record.basis_directive_revision
+                                == basis.map(|basis| basis.directive_revision)
+                            && record.basis_workspace_revision
+                                == basis.map(|basis| basis.workspace_revision)
+                    });
+                    turn.execution.completion_repair = Some(CompletionRepairRecord {
+                        basis_anchor_revision: anchor_revision,
+                        basis_verification_revision: basis.map(|basis| basis.verification_revision),
+                        basis_directive_revision: basis.map(|basis| basis.directive_revision),
+                        basis_workspace_revision: basis.map(|basis| basis.workspace_revision),
+                        plan: plan.clone(),
+                        text: bounded_preview(text, COMPLETION_REPAIR_VIEW_CHARS),
+                        refused_at_ms: now_ms(),
+                        refusal_count: if same_basis {
+                            previous
+                                .map_or(1, |record| record.refusal_count.saturating_add(1))
+                                .min(MAX_COMPLETION_REPAIR_REFUSALS)
+                        } else {
+                            1
+                        },
+                    });
+                    self.accrue_checkpoint_debt(
+                        crate::checkpoint::CheckpointDebtReason::CompletionRepairChanged,
+                    );
+                }
+            }
             let reason = bounded_preview(
                 &error.to_string(),
                 agent_contracts::MAX_TASK_ANCHOR_ITEM_CHARS,
@@ -509,7 +557,7 @@ impl RuntimeActor {
                 "accepted": false,
                 "refused": refusal_class,
                 "blockers": blockers,
-                "repair_plan": repair.map(|(plan, _)| plan),
+                "repair_plan": repair.as_ref().map(|(plan, _)| plan),
             });
             let _ = self
                 .core
@@ -521,9 +569,15 @@ impl RuntimeActor {
         // Acceptance means only that Runtime admitted a terminal proposal;
         // the actual task/context commit occurs after the turn barrier.
         // Clear an older failure in the turn-local resume projection so a
-        // fresh attempt does not carry stale diagnostics if it commits.
+        // fresh attempt does not carry stale diagnostics if it commits, and
+        // drop the durable refusal repair stage it replaces.
         if let Some(turn) = self.state.turn.as_mut() {
             turn.execution.clear_completion_commit_failure();
+            if turn.execution.completion_repair.take().is_some() {
+                self.accrue_checkpoint_debt(
+                    crate::checkpoint::CheckpointDebtReason::CompletionRepairChanged,
+                );
+            }
         }
         output.ok = true;
         output.summary = "task completion accepted; terminal commit pending".into();
@@ -863,6 +917,17 @@ impl RuntimeActor {
                     .into(),
             )
         } else if proof_blocked {
+            let criterion_details: Vec<_> = readiness
+                .uncovered_criteria()
+                .iter()
+                .map(|criterion| {
+                    serde_json::json!({
+                        "criterion_index": criterion.criterion_index,
+                        "coverage_domain": criterion.coverage_domain,
+                        "criterion_text": criterion.criterion_text,
+                    })
+                })
+                .collect();
             if let Some((criterion_index, domain, recipe_id)) =
                 self.current_completion_proof_route(readiness)
             {
@@ -873,6 +938,7 @@ impl RuntimeActor {
                         "coverage_domain": domain,
                         "criterion_index": criterion_index,
                         "recipe_id": recipe_id,
+                        "criterion_details": criterion_details,
                         "must_be_after_workspace_calls": true,
                     }),
                     format!(
@@ -885,6 +951,7 @@ impl RuntimeActor {
                         "kind": "operator_required",
                         "reason": "no_current_exact_verification_route",
                         "blockers": blockers,
+                        "criterion_details": criterion_details,
                     }),
                     "operator_required: Runtime cannot prove a current exact recipe_id for the uncovered verification domain; do not invent coverage_domain as a verify.run argument."
                         .into(),
@@ -918,11 +985,15 @@ impl RuntimeActor {
         &self,
         readiness: &CompletionReadiness,
     ) -> Option<(Option<u32>, String, String)> {
+        // Resolver availability binds to the captured round surface, not
+        // catalog-name presence: a proof_refresh instruction is actionable
+        // only for a verify.run the model can actually call on that surface.
         if !self
-            .services
-            .tool_catalog()
-            .iter()
-            .any(|entry| entry.name == "verify.run")
+            .state
+            .turn
+            .as_ref()
+            .and_then(|turn| turn.tool_surface.as_ref())
+            .is_some_and(|surface| surface.specs.iter().any(|spec| spec.name == "verify.run"))
         {
             return None;
         }
