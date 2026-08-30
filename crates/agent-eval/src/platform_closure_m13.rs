@@ -226,11 +226,17 @@ fn default_sandbox(root: &Path, with_write_roots: bool) -> agent_process::Proces
     }
     #[cfg(unix)]
     {
+        // RLIMIT_NPROC is checked against the real user's *global* thread
+        // count, so a small process quota self-defeats on a busy shared
+        // host: the fixture child cannot boot its own runtime once the
+        // runner user exceeds the quota. Keep a bounded, enforceable
+        // ceiling (well below the default limit) that still leaves the
+        // child headroom to start.
         agent_process::ProcessSandbox {
             cwd: Some(root.to_path_buf()),
             max_memory_bytes: 2u64 * 1024 * 1024 * 1024,
             max_open_files: 1024,
-            process_limit: 64,
+            process_limit: 2048,
             cpu_time_limit_secs: 60,
             landlock_write_roots: if with_write_roots {
                 vec![root.join("private")]
