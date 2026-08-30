@@ -28,12 +28,9 @@ Evidence interpretation:
 
 - the audited `ea8deef` source was not green: `cargo fmt --all -- --check`
   failed and both CI jobs stopped at formatting. The merged audit landed as
-  recorded source `a3bd23f`; twelve `BASELINE-01` follow-up commits repair
-  every formatting/CI/live-settlement regression exposed since. Local four
-  commands are green on the final tree, Windows CI is repeatedly green, and
-  Ubuntu CI runs the complete suite with zero test-level failures — its
-  remaining exit is the ~48-minute hosted-runner loss-of-communication
-  termination described under BASELINE-01, not a test result;
+  recorded source `a3bd23f`, and the `BASELINE-01` chain below repaired every
+  formatting/CI/live-settlement regression exposed since and banked both CI
+  platforms on the recorded source (2026-08-30);
 - the 2026-08-29 convergence report remains a **mechanical FAIL**, but it is
   **causally INVALID/CONFOUNDED** for settlement effectiveness. Its arm switch
   removed the whole `TaskProgress` projection and also changed checked-file GC
@@ -58,16 +55,15 @@ misses, prospective terminal checkpoints, explicit commit barriers,
 committed-prefix replay, a one-shot startup gate, strict provider parsing,
 stable episode pairs and same-state settlement request auditing. The recorded
 tree passed the four local commands on 2026-08-30 after repairing the
-integration regressions. This closes no heading by itself: `BASELINE-01`
-remains open until the same source passes both CI platforms (the Ubuntu
-remaining exit is the runner termination below — the full suite already runs
-with zero test failures). The live causal runner still needs a common
+integration regressions. This closes no heading by itself: `BASELINE-01` is
+now closed on the recorded source (both CI platforms banked 2026-08-30; see
+the item below). The live causal runner still needs a common
 pre-exposure checkpoint/workspace fork only if the selected candidate enables
 settlement projection.
 
 ### P0 — restore a trustworthy baseline
 
-#### BASELINE-01 — make the exact source green (**open**)
+#### BASELINE-01 — make the exact source green (**closed 2026-08-30 on `1455795`**)
 
 Scope is formatting, warnings and real regressions exposed by those checks;
 do not hide an algorithm change in this item. Exit requires all of:
@@ -84,20 +80,33 @@ clean worktree at the recorded source
 
 The full workspace test must complete; an external timeout is not a pass.
 
-Local checkpoint: the merged audit tree passed all four commands locally on
-2026-08-30 and landed as `a3bd23f`; the twelve follow-up commits carry the
-BASELINE-01 CI repair (deterministic turn drain, m13 sandbox fixture and
-timeouts, per-binary test-thread cap, mock-host single-threaded runtime,
-process-quota headroom, broker-journal lock retry, attestation-string parity,
-longer job timeout). Windows CI is green on repeated full runs. Ubuntu CI
-passes fmt/clippy/build and the complete workspace suite with zero
-test-level failures, but both long Ubuntu runs lost the hosted runner at
-nearly identical wall times (~48m01s/48m02s) with the test step in progress —
-once at full concurrency and once with `-j 2 -- --test-threads 2`, so the
-termination tracks elapsed/accumulated runner state, not peak load. `Ubuntu
-CI PASS` therefore remains open until one job completes the full suite; the
-planned split reaps all test processes at step boundaries to reset the
-accumulation.
+Closure record (2026-08-30). The recorded source is `1455795`; its Rust tree
+is commit `8558886` (the last commit changed only `ci.yml`). All six exits
+are banked on that source:
+
+- the four local commands are green on the Rust tree: fmt check, all-target
+  all-feature Clippy with warnings denied, all-target build, and the complete
+  all-target workspace suite;
+- Ubuntu and Windows CI both PASS one complete run — check (fmt/clippy/build)
+  in under 3 minutes per OS, then the test jobs: Ubuntu as two halves in
+  separate fresh-VM jobs (3m09s + 4m49s) and Windows as the full workspace
+  (15m01s);
+- the worktree is clean at the recorded source.
+
+The two earlier unanswered Ubuntu exits were a hosted-runner
+loss-of-communication at ~48 minutes of job wall time (48m02s / 47m59s from
+job start, tested step in progress, zero test-level failures, under both full
+and capped concurrency) — a wall-clock termination, not a test result. The
+full suite cannot fit in one job on that runner, so CI runs the Ubuntu suite
+as two parts in separate jobs; the scoped `cargo test -p` jobs additionally
+needed three fixture repairs the all-members workspace layout had masked:
+`tool-runtime` persist tests now spawn their sleeper as a Unix
+process-group leader to honor the group-kill contract (a non-leader child is
+invisible to `kill(-pid)` and survives), part 2 explicitly builds
+`agent-process`'s `mock_host`/`broker_host` bins and the
+`agent-context-service` binary (whose mtime freshness guard is tripped by
+warm-cache restore in a fresh checkout), and both those jobs rebuild and
+stamp the service binary accordingly.
 
 ### P0 — one completion authority
 

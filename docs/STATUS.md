@@ -50,20 +50,19 @@ and sandbox contracts live elsewhere. Experiment facts live in
   pair. The historical
   convergence bundle remains mechanical FAIL and causally
   **INVALID/CONFOUNDED**; it is not reinterpreted.
-- The merged audit tree passed the four local commands on 2026-08-30
-  (fmt check, all-target/all-feature Clippy with warnings denied, all-target
-  build, and the complete workspace all-target suite) and landed as commit
-  `a3bd23f`. `BASELINE-01` moved from "not a recorded clean source" to CI
-  only: twelve follow-up commits repair the formatting/CI/settlement
-  regressions exposed since, and Windows CI is repeatedly green (latest full
-  run green, 13m53s). Ubuntu CI passes fmt/clippy/build and then executes the
-  entire workspace suite with zero test-level failures, but the hosted runner
-  has lost communication at nearly identical wall times twice
-  (~48m01s/48m02s) with the test step in progress — once at full test
-  concurrency and once with `-j 2 -- --test-threads 2` — so the remaining
-  Ubuntu exit is a runner-level elapsed/accumulation termination, not a test
-  failure; the fix in flight reaps test processes at step boundaries rather
-  than capping concurrency further.
+- `BASELINE-01` closed 2026-08-30 on recorded source `1455795` (Rust tree
+  `8558886`): the four local commands pass, and Ubuntu and Windows CI are
+  both green on one complete run. The last open Ubuntu exit was a
+  hosted-runner loss of communication at ~48 minutes of job wall time, twice
+  at nearly identical timestamps (48m02s / 47m59s from job start) with the
+  test step in progress and zero test-level failures — a wall-clock
+  termination, not a test result — so the CI test step was split into per-OS
+  parts in separate fresh-VM jobs: Ubuntu runs two halves sized from measured
+  per-crate test durations (3m09s + 4m49s) and Windows keeps the full
+  workspace (15m01s). The scoped test jobs exposed and fixed three fixtures
+  the all-members layout had masked (the Unix process-group kill contract in
+  the persist tests, missing sibling binaries in the part-2 / full jobs, and
+  the context-service binary mtime guard against warm-cache restore).
 - M15 remains open. Its shape remains 3 fixtures × normal/resume × 2 repeats =
   12 cells. Historical v3 FAIL windows remain immutable; no v4 formal evidence
   has been run. M12/M13 artifacts remain banked, while `GOV-STATUS-01` still

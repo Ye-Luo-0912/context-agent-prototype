@@ -1069,17 +1069,17 @@ closes it as an ordinary turn. Deterministic coverage uses that order.
 
 ### Current delivery order
 
-The merged audit landed as recorded source `a3bd23f`; the readiness/
-declaration, continuation, required-context, failure-lifecycle, real-order
-terminal, RunStart/replay and strict-provider matrices are locally green, and
-the four local commands pass on the final `BASELINE-01` tree (Windows CI is
-repeatedly green too). That is a development checkpoint, not a clean-source or
-M15 evidence claim: Ubuntu CI still needs one complete job run — the full
-suite already executes with zero test-level failures, but the hosted runner
-terminates at ~48 minutes of wall time. Continue in this order:
+`BASELINE-01` closed 2026-08-30: the merged audit (`a3bd23f`) plus the
+BASELINE-01 chain is recorded as the clean source `1455795` (Rust tree
+`8558886`); the readiness/declaration, continuation, required-context,
+failure-lifecycle, real-order terminal, RunStart/replay and strict-provider
+matrices stay locally green, the four local commands pass on that tree, and
+Ubuntu plus Windows CI are green on one complete run — Ubuntu runs the whole
+suite as two fresh-VM halves (3m09s + 4m49s) because the hosted runner
+terminates a single job near 48 minutes of wall time. Continue in this order:
 
-1. Freeze one recorded clean source, repeat the four commands there, and pass
-   Ubuntu plus Windows CI on that exact source.
+1. One recorded clean source with the four commands green and Ubuntu plus
+   Windows CI passed on that exact source (**done** — `BASELINE-01`).
 2. Measure and improve verifier routing to the first criterion-satisfying
    trusted PASS using host-declared coverage domains. Include a negative where
    a broad Cargo/test PASS is valid but does not cover a criterion-specific

@@ -239,13 +239,13 @@ surface, reject a serving or close M15.
 
 Before spending another 12-cell window:
 
-The merged audit (`a3bd23f`) passed fmt, Clippy, build and the complete
-workspace suite locally; the `BASELINE-01` chain keeps that green and Windows
-CI green. This is a development checkpoint, not a formal source or milestone
-exit — Ubuntu CI still needs one complete job run. Continue in this order:
+`BASELINE-01` closed 2026-08-30 on recorded source `1455795`: the four local
+commands pass and Ubuntu plus Windows CI are green on one complete run
+(Ubuntu runs the suite as two fresh-VM halves because the hosted runner
+terminates a single job near 48 minutes of wall time). This is a development
+checkpoint, not a milestone exit. Continue in this order:
 
-1. finish `BASELINE-01`: one complete Ubuntu CI run on the recorded source
-   (Windows CI is already green on repeated full runs);
+1. **done — recorded clean source and dual-platform CI** (`BASELINE-01`);
 2. retain the locally green completion/continuation/required-context,
    criterion-receipt/failure-domain, real actor-order terminal, one-shot
    RunStart/committed-prefix replay and strict provider matrices on that source;
