@@ -44,5 +44,10 @@ jobs:
       - name: cargo build --workspace
         run: cargo build --workspace
 
+      # Closure audits (agent-eval m12/m13) spawn real child processes and
+      # journals; at the default concurrency the shared runner exhausts its
+      # thread/process budget (tokio worker spawn EAGAIN, flock would-block
+      # on inherited fds). Cap concurrent test binaries so the audit keeps
+      # headroom on both platforms.
       - name: cargo test --workspace
-        run: cargo test --workspace
+        run: cargo test --workspace -j 2
