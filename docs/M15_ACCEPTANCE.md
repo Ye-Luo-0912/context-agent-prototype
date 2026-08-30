@@ -182,6 +182,21 @@ malformed arguments on `ab4534a`. The harness fix removed its target
 failure mode and left a model task-execution failure on that fixture;
 per §5 the valid FAIL rejects the candidate and M15 remains open.
 
+Post-window diagnosis (2026-08-31,
+`crates/agent-eval/evidence/m15-diagnosis-closure-gate/REPORT.md`)
+attributes both failures to completion-gate compliance rather than wire
+quality: the model delivered the functional task (final workspace
+satisfies the directive; `verify.run` green; its 15 tests pass) but its
+last trusted verification was made stale by three successful post-verify
+`shell.exec` runs, early fail-closed tool-name attempts left permanently
+unresolved failed-command rows in the execution ledger, and the model
+could not act on the refusal messages, exhausting 48 rounds
+(`closure=error`). The passing cells differ behaviorally: tools loaded
+before first use, a current `verify.run` as the final action. The
+fixture's hidden checks also bind implementation detail (needle text)
+and flag three equivalently correct implementations false. Per §5 the
+valid FAIL rejects the candidate; M15 remains open.
+
 The later Completion Convergence implementation and report do not justify
 another window. The original review found split completion authority,
 continuation advancing the directive epoch, pre-success all-criterion coverage

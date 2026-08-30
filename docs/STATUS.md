@@ -242,6 +242,23 @@ and sandbox contracts live elsewhere. Experiment facts live in
   and exposed a model task-execution failure on this fixture. Per
   M15_ACCEPTANCE §5 the valid FAIL rejects the candidate; the window is
   not rerun. M15 remains open.
+- Post-window diagnosis (2026-08-31,
+  `crates/agent-eval/evidence/m15-diagnosis-closure-gate/REPORT.md`):
+  both failures are completion-gate compliance, not transport/JSON
+  defects. The model completed the functional task (final workspace
+  satisfies the directive; `verify.run` green; its 15 tests pass) but
+  its last trusted verification went stale after three successful
+  post-verify `shell.exec` runs (`cargo test`, `cargo fmt --check`,
+  `cargo clippy`), early fail-closed tool-name calls (`shell.exec`
+  before `capability.manage` load, `fs_mkdir`/`shell_exec` wire
+  variants) left permanently unresolved failed-command rows in the
+  execution ledger, and it could not act on the refusal messages,
+  exhausting the 48-round budget. The oracle hidden checks bind
+  implementation detail (needle text) and flag three equivalently
+  correct implementations false. Passing cells differ behaviorally:
+  tools loaded before first use, a current `verify.run` as the final
+  action. Any harness-visible candidate fix requires deterministic
+  gates plus an exact-source preflight and a fresh predeclared window.
 - M15 remains open. Its shape remains 3 fixtures × normal/resume × 2 repeats =
   12 cells. Historical v3 FAIL windows remain immutable; the four v4 windows
   (valid FAILs 9/12 on `d1936d4`, 10/12 on `a25a8a5`, 9/12 on `ab4534a`,
