@@ -1,15 +1,18 @@
 use std::{
     sync::{
         Arc,
-        atomic::{AtomicUsize, Ordering},
+        atomic::{AtomicBool, AtomicUsize, Ordering},
     },
     time::Duration,
 };
 
 use agent_contracts::{
-    AgentResult, ModelCapabilities, ModelChunk, ModelEventSink, ModelOutput, ModelRequest,
-    ModelTransport, RunId, RuntimeEvent, RuntimeEventEnvelope, ToolCall, ToolDispatcher,
-    ToolExecutionRequest, ToolOutcome, ToolOutput, ToolRisk, ToolSpec,
+    AgentError, AgentResult, ContextDiagnostics, ContextEngine, ContextIngress, ContextItemSummary,
+    ContextMaintenanceReport, ContextMaintenanceTrigger, ContextQuery, ContextStateTransition,
+    EventJournal, MaterializedContext, ModelCapabilities, ModelChunk, ModelEventSink, ModelOutput,
+    ModelRequest, ModelTransport, RunId, RuntimeEvent, RuntimeEventEnvelope, ScopeId, ScopeKind,
+    ToolCall, ToolDispatcher, ToolExecutionAttribution, ToolExecutionPurpose, ToolExecutionRequest,
+    ToolOutcome, ToolOutput, ToolRisk, ToolSpec, VerificationReuse,
 };
 
 use agent_core::{CoreAuthorityConfig, PolicyApprovalGate};
@@ -17,6 +20,245 @@ use agent_runtime::{ModuleHost, RuntimeInstance, RuntimeServices};
 use serde_json::json;
 
 use crate::harness::*;
+
+const COMPLETION_VERIFY_IDENTITY_MATERIAL: &str = "completion-test verifier v1";
+const COMPLETION_ACCEPTANCE_DOMAIN: &str = "completion-fixture";
+
+/// Fails exactly the checkpoint captured while TaskCompleted is prepared.
+/// The subsequent rollback and failure-resume checkpoint remain available,
+/// which isolates the cross-plane transaction path from store failures.
+#[derive(Debug, Default)]
+struct FailTerminalCheckpointContext {
+    terminal_prepared: tokio::sync::Mutex<bool>,
+    fail_once: AtomicBool,
+}
+
+#[derive(Debug)]
+struct FailTaskCompletedJournal;
+
+#[async_trait::async_trait]
+impl EventJournal for FailTaskCompletedJournal {
+    async fn append(&self, envelope: &RuntimeEventEnvelope) -> AgentResult<()> {
+        if matches!(envelope.event, RuntimeEvent::TaskCompleted { .. }) {
+            return Err(AgentError::Storage(
+                "injected terminal audit append failure".into(),
+            ));
+        }
+        Ok(())
+    }
+}
+
+impl FailTerminalCheckpointContext {
+    fn new() -> Self {
+        Self {
+            terminal_prepared: tokio::sync::Mutex::new(false),
+            fail_once: AtomicBool::new(true),
+        }
+    }
+}
+
+#[async_trait::async_trait]
+impl ContextEngine for FailTerminalCheckpointContext {
+    async fn ingest(&self, ingress: ContextIngress) -> AgentResult<()> {
+        if matches!(ingress, ContextIngress::TaskCompleted { .. }) {
+            *self.terminal_prepared.lock().await = true;
+        }
+        Ok(())
+    }
+
+    async fn maintain(
+        &self,
+        _trigger: ContextMaintenanceTrigger,
+    ) -> AgentResult<ContextMaintenanceReport> {
+        Ok(ContextMaintenanceReport::default())
+    }
+
+    async fn materialize(&self, _query: ContextQuery) -> AgentResult<MaterializedContext> {
+        Ok(MaterializedContext::default())
+    }
+
+    async fn open_scope(&self, _kind: ScopeKind, _parent: Option<ScopeId>) -> AgentResult<ScopeId> {
+        Ok(ScopeId::new())
+    }
+
+    async fn close_scope(&self, _scope_id: ScopeId) -> AgentResult<Vec<ContextStateTransition>> {
+        Ok(Vec::new())
+    }
+
+    async fn diagnostics(&self) -> AgentResult<ContextDiagnostics> {
+        Ok(ContextDiagnostics::default())
+    }
+
+    async fn inspect(&self, _limit: usize) -> AgentResult<Vec<ContextItemSummary>> {
+        Ok(Vec::new())
+    }
+
+    async fn checkpoint(&self) -> AgentResult<serde_json::Value> {
+        let terminal_prepared = *self.terminal_prepared.lock().await;
+        if terminal_prepared && self.fail_once.swap(false, Ordering::SeqCst) {
+            return Err(AgentError::Storage(
+                "injected terminal checkpoint assembly failure".into(),
+            ));
+        }
+        Ok(json!({ "terminal_prepared": terminal_prepared }))
+    }
+
+    async fn restore(&self, data: serde_json::Value) -> AgentResult<()> {
+        *self.terminal_prepared.lock().await = data
+            .get("terminal_prepared")
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false);
+        Ok(())
+    }
+}
+
+/// Prepend one trusted verifier decision without changing the wrapped model's
+/// own round script. Successful model-side completion tests must establish the
+/// same evidence authority production now requires.
+#[derive(Debug)]
+struct WithCompletionVerificationModel<M> {
+    inner: Arc<M>,
+    verification_sent: std::sync::atomic::AtomicBool,
+}
+
+impl<M> WithCompletionVerificationModel<M> {
+    fn new(inner: Arc<M>) -> Self {
+        Self {
+            inner,
+            verification_sent: std::sync::atomic::AtomicBool::new(false),
+        }
+    }
+}
+
+#[async_trait::async_trait]
+impl<M> ModelTransport for WithCompletionVerificationModel<M>
+where
+    M: ModelTransport + std::fmt::Debug + 'static,
+{
+    fn capabilities(&self) -> ModelCapabilities {
+        self.inner.capabilities()
+    }
+
+    async fn complete(&self, request: ModelRequest) -> AgentResult<ModelOutput> {
+        if !self
+            .verification_sent
+            .swap(true, std::sync::atomic::Ordering::SeqCst)
+        {
+            return Ok(ModelOutput {
+                content: String::new(),
+                tool_calls: vec![ToolCall {
+                    id: "completion-verify".into(),
+                    name: "test.verify".into(),
+                    arguments: json!({"command": "test completion fixture"}),
+                }],
+                usage: Default::default(),
+            });
+        }
+        self.inner.complete(request).await
+    }
+}
+
+/// Add one exact-current-world verifier to any completion dispatcher while
+/// preserving the dispatcher's own completion/artifact behavior.
+#[derive(Debug)]
+struct WithCompletionVerificationTools<D> {
+    inner: D,
+}
+
+fn completion_acceptance_declaration() -> agent_contracts::VerificationCoverageDeclaration {
+    agent_contracts::VerificationCoverageDeclaration {
+        domain_id: COMPLETION_ACCEPTANCE_DOMAIN.into(),
+        declaration_revision: 1,
+        source_digest: agent_contracts::ContentDigest::sha256_bytes(
+            b"completion-acceptance-declaration/v1",
+        )
+        .to_string(),
+    }
+}
+
+#[async_trait::async_trait]
+impl<D> ToolDispatcher for WithCompletionVerificationTools<D>
+where
+    D: ToolDispatcher + std::fmt::Debug + Send + Sync,
+{
+    fn specs(&self) -> Vec<ToolSpec> {
+        let mut specs = self.inner.specs();
+        specs.push(ToolSpec {
+            name: "test.verify".into(),
+            description: "trusted completion fixture verifier".into(),
+            input_schema: json!({"type": "object"}),
+            risk: ToolRisk::ReadOnly,
+            output_budget: None,
+            roles: Vec::new(),
+        });
+        specs
+    }
+
+    fn execution_attribution(&self, call: &ToolCall) -> ToolExecutionAttribution {
+        if call.name == "test.verify" {
+            return ToolExecutionAttribution::bounded(
+                ToolExecutionPurpose::Verify,
+                Vec::<String>::new(),
+                VerificationReuse::ExactCurrentWorld,
+            )
+            .with_verification_identity_material(COMPLETION_VERIFY_IDENTITY_MATERIAL)
+            .with_verification_recipe(agent_contracts::VerificationRecipeProvenance {
+                recipe_id: "test.verify".into(),
+                recipe_revision: "v1".into(),
+                coverage_domain: Some(COMPLETION_ACCEPTANCE_DOMAIN.into()),
+                domain_declaration_revision: Some(1),
+                domain_source_digest: completion_acceptance_declaration().source_digest,
+                class_identity_digest: "completion-fixture-class".into(),
+            });
+        }
+        self.inner.execution_attribution(call)
+    }
+
+    fn verification_coverage_declarations(
+        &self,
+    ) -> Vec<agent_contracts::VerificationCoverageDeclaration> {
+        vec![completion_acceptance_declaration()]
+    }
+
+    async fn execute(&self, request: ToolExecutionRequest) -> AgentResult<ToolOutcome> {
+        if request.call.name == "test.verify" {
+            return Ok(ToolOutcome::Value(ToolOutput {
+                call_id: request.call.id,
+                tool_name: request.call.name,
+                ok: true,
+                summary: "completion fixture verified".into(),
+                model_content: "completion fixture verified".into(),
+                artifact_ref: None,
+                metadata: json!({"verification": true, "command": "test completion fixture"}),
+            }));
+        }
+        self.inner.execute(request).await
+    }
+}
+
+async fn declare_completion_acceptance(handle: &agent_runtime::RuntimeHandle, goal: &str) {
+    handle.set_focus(goal.into()).await.unwrap();
+    let task_id = handle.list_tasks().await.unwrap()[0].id;
+    handle
+        .patch_task_anchor(
+            task_id,
+            0,
+            agent_runtime::AnchorPatch {
+                completion_policy: Some(
+                    agent_runtime::task::TaskCompletionPolicy::EvidenceRequired,
+                ),
+                acceptance_criteria: Some(vec![
+                    agent_runtime::task::AcceptanceCriterion::declared(
+                        "trusted completion fixture passes",
+                        &completion_acceptance_declaration(),
+                    ),
+                ]),
+                ..agent_runtime::AnchorPatch::default()
+            },
+        )
+        .await
+        .unwrap();
+}
 
 // ---------------------------------------------------------------------------
 // Structured completion: `task.complete` attaches a typed proposal that the
@@ -55,6 +297,51 @@ impl ModelTransport for CompletionProposalModel {
                 usage: Default::default(),
             })
         }
+    }
+}
+
+/// Proposes completion once, then records the next request so refusal tests
+/// can prove the authoritative gate result reached the model rather than
+/// existing only as an audit warning.
+#[derive(Debug)]
+struct CompletionRefusalModel {
+    rounds: AtomicUsize,
+    requests: Arc<std::sync::Mutex<Vec<String>>>,
+}
+
+#[async_trait::async_trait]
+impl ModelTransport for CompletionRefusalModel {
+    fn capabilities(&self) -> ModelCapabilities {
+        ModelCapabilities::default()
+    }
+
+    async fn complete(&self, request: ModelRequest) -> AgentResult<ModelOutput> {
+        self.requests.lock().unwrap().push(
+            request
+                .messages
+                .iter()
+                .map(|message| message.content.as_str())
+                .collect::<Vec<_>>()
+                .join("\n"),
+        );
+        let round = self.rounds.fetch_add(1, Ordering::SeqCst);
+        Ok(if round == 0 {
+            ModelOutput {
+                content: String::new(),
+                tool_calls: vec![ToolCall {
+                    id: "completion-refusal".into(),
+                    name: "task.complete".into(),
+                    arguments: json!({"summary": "optimistic completion", "artifacts": []}),
+                }],
+                usage: Default::default(),
+            }
+        } else {
+            ModelOutput {
+                content: "continuing after the refusal".into(),
+                tool_calls: Vec::new(),
+                usage: Default::default(),
+            }
+        })
     }
 }
 
@@ -115,6 +402,112 @@ impl ToolDispatcher for CompletionToolDispatcher {
     }
 }
 
+async fn run_model_visible_completion_refusal(
+    declare_evidence_policy: bool,
+) -> (
+    ToolOutput,
+    Vec<String>,
+    agent_runtime::checkpoint::RuntimeCheckpoint,
+) {
+    let requests = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let model = Arc::new(CompletionRefusalModel {
+        rounds: AtomicUsize::new(0),
+        requests: requests.clone(),
+    });
+    let services = RuntimeServices::new(
+        CoreAuthorityConfig::default(),
+        Arc::new(TestContextEngine),
+        model,
+        Arc::new(WithCompletionVerificationTools {
+            inner: CompletionToolDispatcher { workspace: None },
+        }),
+        Arc::new(PolicyApprovalGate::read_only()),
+        None,
+    );
+    let instance = RuntimeInstance::spawn(ModuleHost::new(), services);
+    let handle = instance.handle();
+    let mut events = handle.subscribe();
+    handle.start().await.unwrap();
+    if declare_evidence_policy {
+        declare_completion_acceptance(handle, "finish only with evidence").await;
+    } else {
+        handle
+            .set_focus("operator-owned completion".into())
+            .await
+            .unwrap();
+    }
+    handle.user_message("try to finish".into()).await.unwrap();
+
+    let mut completion_output = None;
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+    while tokio::time::Instant::now() < deadline {
+        if let Ok(Ok(envelope)) =
+            tokio::time::timeout(Duration::from_millis(50), events.recv()).await
+        {
+            match envelope.event {
+                RuntimeEvent::ToolFinished { output } if output.tool_name == "task.complete" => {
+                    completion_output = Some(output);
+                }
+                RuntimeEvent::TaskCompleted { .. } => {
+                    panic!("a refused completion proposal must not complete the task")
+                }
+                RuntimeEvent::TurnCompleted if completion_output.is_some() => break,
+                _ => {}
+            }
+        }
+    }
+    let output = completion_output.expect("task.complete must publish its authoritative result");
+    let checkpoint = instance.checkpoint().await.unwrap();
+    instance.shutdown().await.unwrap();
+    let captured = requests.lock().unwrap().clone();
+    (output, captured, checkpoint)
+}
+
+#[tokio::test]
+async fn task_complete_without_evidence_policy_returns_a_model_visible_refusal() {
+    let (output, requests, checkpoint) = run_model_visible_completion_refusal(false).await;
+    assert!(!output.ok);
+    assert_eq!(output.metadata["refused"], "completion_gate");
+    assert!(
+        output.metadata["blockers"]
+            .to_string()
+            .contains("operator_closure_only")
+    );
+    assert!(
+        output.metadata["blockers"]
+            .to_string()
+            .contains("acceptance_undeclared")
+    );
+    assert!(output.model_content.contains("was not accepted by Runtime"));
+    assert!(
+        requests
+            .get(1)
+            .is_some_and(|request| request.contains("was not accepted by Runtime")),
+        "the next model decision must receive the refusal output"
+    );
+    assert!(checkpoint.tasks.completed.is_empty());
+}
+
+#[tokio::test]
+async fn task_complete_without_a_criterion_receipt_returns_a_model_visible_refusal() {
+    let (output, requests, checkpoint) = run_model_visible_completion_refusal(true).await;
+    assert!(!output.ok);
+    assert_eq!(output.metadata["refused"], "completion_gate");
+    assert!(
+        output.metadata["blockers"]
+            .to_string()
+            .contains("acceptance_uncovered")
+    );
+    assert!(output.model_content.contains("lack current coverage"));
+    assert!(
+        requests
+            .get(1)
+            .is_some_and(|request| request.contains("lack current coverage")),
+        "the uncovered criterion must be actionable in the next model decision"
+    );
+    assert!(checkpoint.tasks.completed.is_empty());
+}
+
 #[tokio::test]
 async fn task_complete_proposal_commits_the_typed_record_at_turn_end() {
     let dir = tempfile::tempdir().unwrap();
@@ -126,9 +519,11 @@ async fn task_complete_proposal_commits_the_typed_record_at_turn_end() {
     let services = RuntimeServices::new(
         CoreAuthorityConfig::default(),
         Arc::new(TestContextEngine),
-        model.clone(),
-        Arc::new(CompletionToolDispatcher {
-            workspace: Some((*workspace).clone()),
+        Arc::new(WithCompletionVerificationModel::new(model.clone())),
+        Arc::new(WithCompletionVerificationTools {
+            inner: CompletionToolDispatcher {
+                workspace: Some((*workspace).clone()),
+            },
         }),
         Arc::new(PolicyApprovalGate::read_only()),
         None,
@@ -138,12 +533,19 @@ async fn task_complete_proposal_commits_the_typed_record_at_turn_end() {
     let handle = instance.handle();
     let mut events = handle.subscribe();
     handle.start().await.unwrap();
+    declare_completion_acceptance(handle, "finish the work").await;
     handle.user_message("finish the work".into()).await.unwrap();
 
     let mut completed_event = None;
+    let mut pending_receipt = None;
     let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
     while tokio::time::Instant::now() < deadline {
         while let Ok(envelope) = events.try_recv() {
+            if let RuntimeEvent::ToolFinished { output } = &envelope.event
+                && output.tool_name == "task.complete"
+            {
+                pending_receipt = Some(output.clone());
+            }
             if let RuntimeEvent::TaskCompleted {
                 task_id,
                 anchor_revision,
@@ -165,6 +567,17 @@ async fn task_complete_proposal_commits_the_typed_record_at_turn_end() {
     let (task_id, anchor_revision, summary) =
         completed_event.expect("the completion proposal must commit");
     assert_eq!(summary, "the task is done");
+    let pending_receipt = pending_receipt.expect("accepted tool output is audited");
+    assert!(pending_receipt.ok);
+    assert_eq!(
+        pending_receipt.metadata["completion_state"],
+        "pending_terminal_commit"
+    );
+    assert!(
+        pending_receipt
+            .model_content
+            .contains("pending_terminal_commit")
+    );
 
     // The typed record is durable in the checkpoint, with the proposal's
     // artifact ref attached — the CTX-10 transaction end to end.
@@ -199,6 +612,144 @@ async fn task_complete_proposal_commits_the_typed_record_at_turn_end() {
         1,
         "accepted task.complete is already the terminal model decision"
     );
+    instance.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn deferred_completion_failure_rolls_back_context_and_persists_resume_fact() {
+    let dir = tempfile::tempdir().unwrap();
+    let workspace = Arc::new(agent_workspace::Workspace::open(dir.path()).await.unwrap());
+    let context = Arc::new(FailTerminalCheckpointContext::new());
+    let model = Arc::new(CompletionProposalModel {
+        summary: "the task is done",
+        rounds: AtomicUsize::new(0),
+    });
+    let services = RuntimeServices::new(
+        CoreAuthorityConfig::default(),
+        context.clone(),
+        Arc::new(WithCompletionVerificationModel::new(model)),
+        Arc::new(WithCompletionVerificationTools {
+            inner: CompletionToolDispatcher {
+                workspace: Some((*workspace).clone()),
+            },
+        }),
+        Arc::new(PolicyApprovalGate::read_only()),
+        None,
+    )
+    .with_artifact_workspace(workspace);
+    let instance = RuntimeInstance::spawn(ModuleHost::new(), services);
+    let handle = instance.handle();
+    let mut events = handle.subscribe();
+    handle.start().await.unwrap();
+    declare_completion_acceptance(handle, "finish the work").await;
+    handle.user_message("finish the work".into()).await.unwrap();
+
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    let mut failure = None;
+    let mut failure_checkpoint_landed = false;
+    while tokio::time::Instant::now() < deadline {
+        if let Ok(Ok(envelope)) =
+            tokio::time::timeout(Duration::from_millis(100), events.recv()).await
+        {
+            match envelope.event {
+                RuntimeEvent::CompletionCommitFailed {
+                    task_id,
+                    retryable,
+                    reason,
+                } => failure = Some((task_id, retryable, reason)),
+                RuntimeEvent::CheckpointDurable { .. } if failure.is_some() => {
+                    failure_checkpoint_landed = true;
+                    break;
+                }
+                _ => {}
+            }
+        }
+    }
+
+    let (task_id, retryable, reason) = failure.expect("typed failure must be audited");
+    assert!(retryable);
+    assert!(reason.contains("injected terminal checkpoint"));
+    assert!(
+        failure_checkpoint_landed,
+        "the failure resume must reach a durable checkpoint"
+    );
+    assert!(
+        !*context.terminal_prepared.lock().await,
+        "failed terminal assembly must restore the pre-completion context plane"
+    );
+    let checkpoint = instance.checkpoint().await.unwrap();
+    assert!(!checkpoint.terminal_commit);
+    assert_eq!(checkpoint.current_task_id, Some(task_id));
+    let task = checkpoint
+        .tasks
+        .tasks
+        .iter()
+        .find(|task| task.id == task_id)
+        .unwrap();
+    let projected = task
+        .resume
+        .completion_commit_failure
+        .as_ref()
+        .expect("the bounded failure is checkpointed on the active task");
+    assert_eq!(projected.attempts, 1);
+    assert!(projected.reason.contains("injected terminal checkpoint"));
+    instance.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn post_commit_audit_failure_never_projects_a_pending_completion_failure() {
+    let dir = tempfile::tempdir().unwrap();
+    let workspace = Arc::new(agent_workspace::Workspace::open(dir.path()).await.unwrap());
+    let services = RuntimeServices::new(
+        CoreAuthorityConfig::default(),
+        Arc::new(TestContextEngine),
+        Arc::new(WithCompletionVerificationModel::new(Arc::new(
+            CompletionProposalModel {
+                summary: "the task is done",
+                rounds: AtomicUsize::new(0),
+            },
+        ))),
+        Arc::new(WithCompletionVerificationTools {
+            inner: CompletionToolDispatcher {
+                workspace: Some((*workspace).clone()),
+            },
+        }),
+        Arc::new(PolicyApprovalGate::read_only()),
+        Some(Arc::new(FailTaskCompletedJournal)),
+    )
+    .with_artifact_workspace(workspace);
+    let instance = RuntimeInstance::spawn(ModuleHost::new(), services);
+    let handle = instance.handle();
+    let mut events = handle.subscribe();
+    handle.start().await.unwrap();
+    declare_completion_acceptance(handle, "finish the work").await;
+    handle.user_message("finish the work".into()).await.unwrap();
+
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    let mut saw_recovery = false;
+    let mut saw_pending_failure = false;
+    let mut saw_pending_failure_debt = false;
+    while tokio::time::Instant::now() < deadline && !saw_recovery {
+        if let Ok(Ok(envelope)) =
+            tokio::time::timeout(Duration::from_millis(100), events.recv()).await
+        {
+            saw_recovery |= matches!(&envelope.event, RuntimeEvent::RecoveryRequired);
+            saw_pending_failure |=
+                matches!(&envelope.event, RuntimeEvent::CompletionCommitFailed { .. });
+            if let RuntimeEvent::TaskResumeCommitted { debt, .. } = &envelope.event {
+                saw_pending_failure_debt |=
+                    debt.iter().any(|row| row == "completion_commit_failed");
+            }
+        }
+    }
+    assert!(saw_recovery, "the terminal audit gap must fence the run");
+    assert!(
+        !saw_pending_failure,
+        "a committed task cannot be projected as a retryable pending completion"
+    );
+    let tasks = handle.list_tasks().await.unwrap();
+    assert_eq!(tasks[0].status, agent_runtime::TaskStatus::Completed);
+    assert!(!saw_pending_failure_debt);
     instance.shutdown().await.unwrap();
 }
 
@@ -289,8 +840,10 @@ async fn task_complete_waits_for_model_when_a_sibling_action_failed() {
     let services = RuntimeServices::new(
         CoreAuthorityConfig::default(),
         Arc::new(TestContextEngine),
-        model.clone(),
-        Arc::new(CompletionWithFailureDispatcher),
+        Arc::new(WithCompletionVerificationModel::new(model.clone())),
+        Arc::new(WithCompletionVerificationTools {
+            inner: CompletionWithFailureDispatcher,
+        }),
         Arc::new(PolicyApprovalGate::read_only()),
         None,
     );
@@ -298,12 +851,14 @@ async fn task_complete_waits_for_model_when_a_sibling_action_failed() {
     let handle = instance.handle();
     let mut events = handle.subscribe();
     handle.start().await.unwrap();
+    declare_completion_acceptance(handle, "finish carefully").await;
     handle
         .user_message("finish carefully".into())
         .await
         .unwrap();
 
     let mut failed_batch_seen = false;
+    let mut settled_failures = Vec::new();
     let mut assistant_content = None;
     let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
     while tokio::time::Instant::now() < deadline {
@@ -312,6 +867,7 @@ async fn task_complete_waits_for_model_when_a_sibling_action_failed() {
         {
             match envelope.event {
                 RuntimeEvent::ExecutionBatchSettled { failed, .. } => {
+                    settled_failures.push(failed);
                     failed_batch_seen |= failed == 1;
                 }
                 RuntimeEvent::AssistantMessage { content } => assistant_content = Some(content),
@@ -321,7 +877,10 @@ async fn task_complete_waits_for_model_when_a_sibling_action_failed() {
         }
     }
 
-    assert!(failed_batch_seen, "the failed sibling must be audited");
+    assert!(
+        failed_batch_seen,
+        "the failed sibling must be audited; settled failure counts={settled_failures:?}"
+    );
     assert_eq!(
         assistant_content.as_deref(),
         Some("handled the failed sibling")
@@ -504,11 +1063,15 @@ async fn completion_record_attaches_the_raw_final_response_artifact() {
     let services = RuntimeServices::new(
         CoreAuthorityConfig::default(),
         Arc::new(TestContextEngine),
-        Arc::new(CompletingLongModel {
-            rounds: AtomicUsize::new(0),
-            content_len,
+        Arc::new(WithCompletionVerificationModel::new(Arc::new(
+            CompletingLongModel {
+                rounds: AtomicUsize::new(0),
+                content_len,
+            },
+        ))),
+        Arc::new(WithCompletionVerificationTools {
+            inner: CompletionToolDispatcher { workspace: None },
         }),
-        Arc::new(CompletionToolDispatcher { workspace: None }),
         Arc::new(PolicyApprovalGate::read_only()),
         None,
     )
@@ -516,6 +1079,7 @@ async fn completion_record_attaches_the_raw_final_response_artifact() {
     let instance = RuntimeInstance::spawn(ModuleHost::new(), services);
     let handle = instance.handle();
     handle.start().await.unwrap();
+    declare_completion_acceptance(handle, "finish the work").await;
     handle.user_message("finish the work".into()).await.unwrap();
 
     let mut task_id = None;
@@ -771,24 +1335,29 @@ async fn completion_artifacts_keep_raw_evidence_first_and_cap_the_merged_set() {
     let services = RuntimeServices::new(
         CoreAuthorityConfig::default(),
         Arc::new(TestContextEngine),
-        Arc::new(CompletionProposalModel {
-            summary: "ignored by dispatcher",
-            rounds: AtomicUsize::new(0),
-        }),
-        Arc::new(BulkCompletionToolDispatcher {
-            workspace: (*workspace).clone(),
-            unique_artifacts: agent_contracts::MAX_COMPLETION_ARTIFACTS,
-            duplicate_first: false,
+        Arc::new(WithCompletionVerificationModel::new(Arc::new(
+            CompletionProposalModel {
+                summary: "ignored by dispatcher",
+                rounds: AtomicUsize::new(0),
+            },
+        ))),
+        Arc::new(WithCompletionVerificationTools {
+            inner: BulkCompletionToolDispatcher {
+                workspace: (*workspace).clone(),
+                unique_artifacts: agent_contracts::MAX_COMPLETION_ARTIFACTS,
+                duplicate_first: false,
+            },
         }),
         Arc::new(PolicyApprovalGate::read_only()),
         None,
     )
     .with_artifact_workspace(workspace);
     let instance = RuntimeInstance::spawn(ModuleHost::new(), services);
-    let mut events = instance.handle().subscribe();
+    let handle = instance.handle();
+    let mut events = handle.subscribe();
     instance.start().await.unwrap();
-    instance
-        .handle()
+    declare_completion_acceptance(handle, "finish with many artifacts").await;
+    handle
         .user_message("finish with many artifacts".into())
         .await
         .unwrap();
@@ -810,24 +1379,29 @@ async fn completion_artifacts_are_normalized_and_stably_deduplicated() {
     let services = RuntimeServices::new(
         CoreAuthorityConfig::default(),
         Arc::new(TestContextEngine),
-        Arc::new(CompletionProposalModel {
-            summary: "ignored by dispatcher",
-            rounds: AtomicUsize::new(0),
-        }),
-        Arc::new(BulkCompletionToolDispatcher {
-            workspace: (*workspace).clone(),
-            unique_artifacts: 1,
-            duplicate_first: true,
+        Arc::new(WithCompletionVerificationModel::new(Arc::new(
+            CompletionProposalModel {
+                summary: "ignored by dispatcher",
+                rounds: AtomicUsize::new(0),
+            },
+        ))),
+        Arc::new(WithCompletionVerificationTools {
+            inner: BulkCompletionToolDispatcher {
+                workspace: (*workspace).clone(),
+                unique_artifacts: 1,
+                duplicate_first: true,
+            },
         }),
         Arc::new(PolicyApprovalGate::read_only()),
         None,
     )
     .with_artifact_workspace(workspace);
     let instance = RuntimeInstance::spawn(ModuleHost::new(), services);
-    let mut events = instance.handle().subscribe();
+    let handle = instance.handle();
+    let mut events = handle.subscribe();
     instance.start().await.unwrap();
-    instance
-        .handle()
+    declare_completion_acceptance(handle, "finish with duplicate artifacts").await;
+    handle
         .user_message("finish with duplicate artifacts".into())
         .await
         .unwrap();
@@ -987,9 +1561,11 @@ async fn completion_services(
     RuntimeServices::new(
         CoreAuthorityConfig::default(),
         Arc::new(TestContextEngine),
-        model,
-        Arc::new(CompletionToolDispatcher {
-            workspace: Some((*workspace).clone()),
+        Arc::new(WithCompletionVerificationModel::new(model)),
+        Arc::new(WithCompletionVerificationTools {
+            inner: CompletionToolDispatcher {
+                workspace: Some((*workspace).clone()),
+            },
         }),
         Arc::new(PolicyApprovalGate::read_only()),
         None,
@@ -1016,6 +1592,7 @@ async fn duplicate_completions_in_one_batch_commit_exactly_one_record() {
     let handle = instance.handle();
     let mut events = handle.subscribe();
     instance.start().await.unwrap();
+    declare_completion_acceptance(handle, "finish the work").await;
     handle.user_message("finish the work".into()).await.unwrap();
 
     // The TaskCompleted event lands after TurnCompleted at the safe point,
@@ -1096,6 +1673,7 @@ async fn an_accepted_completion_leaves_a_clean_turn_for_queued_input() {
     let handle = instance.handle();
     let mut events = handle.subscribe();
     instance.start().await.unwrap();
+    declare_completion_acceptance(handle, "finish the work").await;
     handle.user_message("finish the work".into()).await.unwrap();
     // Queued before the first turn finishes: it must drain into a fresh
     // turn after the one-shot completion, not ride along inside it.

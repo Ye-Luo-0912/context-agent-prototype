@@ -40,6 +40,9 @@ impl ContextEngine for TestContext {
             selected: Vec::new(),
             approx_tokens: 0,
             foreground: Vec::new(),
+            required_item_ids: Vec::new(),
+            required_misses: Default::default(),
+            optional_misses: Default::default(),
             diagnostics: ContextDiagnostics::default(),
         })
     }
@@ -251,12 +254,21 @@ fn checkpoint(run_id: RunId) -> RuntimeCheckpoint {
         authority: None,
         snapshot_sequence: 0,
         capability_generation: 0,
+        event_cover_seq: 0,
+        terminal_commit: false,
     }
 }
 
 async fn process_command(actor: &mut RuntimeActor, command: RuntimeCommand) {
     let (op_tx, _op_rx) = mpsc::channel(1);
     actor.process(command, &op_tx).await;
+}
+
+/// These unit tests exercise restore/operation internals without running the
+/// actor loop. Put their actor at the already-proven startup boundary; startup
+/// ordering itself is covered by the integration barrier tests.
+fn mark_actor_serving(actor: &mut RuntimeActor) {
+    actor.state.lifecycle = ActorLifecycle::Serving;
 }
 
 #[test]
@@ -352,6 +364,7 @@ async fn operation_query_remains_available_behind_the_recovery_fence() {
         .unwrap(),
     );
     let mut actor = RuntimeActor::new(services.core_port(), services);
+    mark_actor_serving(&mut actor);
     assert!(actor.state.recovery_required);
 
     let (query_tx, query_rx) = oneshot::channel();
@@ -397,6 +410,7 @@ async fn prepared_restore_stays_fenced_and_unpublished_until_finalize() {
     let mut events = core.event_sender().subscribe();
     let run_id = core.run_id();
     let mut actor = RuntimeActor::new(core, services);
+    mark_actor_serving(&mut actor);
 
     let (prepare_tx, prepare_rx) = oneshot::channel();
     process_command(
@@ -505,6 +519,7 @@ async fn actor_epoch_mismatch_poison_is_fail_closed() {
     ));
     let core = services.core_port();
     let mut actor = RuntimeActor::new(core.clone(), services);
+    mark_actor_serving(&mut actor);
     let actor_epoch = actor.state.generation;
     core.advance_authority_epoch(actor_epoch).unwrap();
 
@@ -713,6 +728,7 @@ async fn operation_cancel_losing_to_a_core_terminal_returns_truth_without_fencin
     ));
     let core = services.core_port();
     let mut actor = RuntimeActor::new(core.clone(), services);
+    mark_actor_serving(&mut actor);
     let (op_tx, mut op_rx) = mpsc::channel(1);
 
     let (focus_tx, focus_rx) = oneshot::channel();
@@ -816,6 +832,7 @@ async fn partial_atomic_cancel_wal_failure_fences_actor_and_stays_queryable() {
     );
     let core = services.core_port();
     let mut actor = RuntimeActor::new(core.clone(), services);
+    mark_actor_serving(&mut actor);
     let (op_tx, mut op_rx) = mpsc::channel(1);
 
     let (focus_tx, focus_rx) = oneshot::channel();

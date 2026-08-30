@@ -15,21 +15,23 @@ use agent_contracts::tokens::approx_tokens;
 use agent_contracts::{
     AgentError, AgentResult, AnchorPatchKind, ArgumentDigest, ArtifactLocator, AuthorityLease,
     AuthorityRecoveryStatus, CAPABILITY_MANAGE, CONTEXT_CONSUMPTION_ACK_ITEM_CAP, CONTEXT_MANAGE,
-    CancellationToken, CompletionOpportunityDisposition, CompletionProposal, ContextConsumptionAck,
-    ContextHints, ContextIngress, ContextMaintenanceReport, ContextMaintenanceTrigger,
-    ContextQuery, ContextRetention, DISCOVERY_IDENTICAL_QUERY_BUDGET,
-    DISCOVERY_MAX_QUERIES_PER_TURN, DiscoveryBudgetExhausted, DiscoveryTurnBudget, Effect,
-    EffectDurability, EffectId, EffectReceipt, FocusState, FsRereadClass, InputAuthority,
-    InputKind, InputLifecycle, InputSource, MAX_COMPLETION_ARTIFACTS,
-    MAX_MODEL_TOOL_CALLS_PER_ROUND, MaterializedContext, ModelCompletionValidity, ModelInput,
-    ModelRequest, OperationId, OperationOutcome, OperationQueryResult, OperationResult,
-    OperationState, OperationTerminal, ResourceFreshness, ResourceKey, ResourceVersionOracle,
-    RestoreRevision, RunId, RuntimeDirective, RuntimeEvent, RuntimeFailureClass,
-    RuntimeInputEnvelope, RuntimeInputId, ScopeId, ScopeKind, StatePatchProposal, TaskAnchorView,
-    TaskId, TaskProgressProposal, TaskProgressView, ToolCall, ToolLeaseBoundary,
-    ToolOperationIdentity, ToolOutcome, ToolOutput, ToolResultDisposition, ToolSpec,
-    ToolSurfaceBlock, ToolSurfaceBlockReason, ToolSurfaceDemand, ToolSurfaceRequirement,
-    ToolSurfaceSnapshot, TurnCancelAck, TurnCancellationReason, TurnFrame, TurnFrameStep, TurnId,
+    CancellationToken, CompletionOpportunityDisposition, CompletionProposal, ContentDigest,
+    ContextConsumptionAck, ContextHints, ContextIngress, ContextMaintenanceReport,
+    ContextMaintenanceTrigger, ContextMaterializationIdentity, ContextMaterializationMiss,
+    ContextMaterializationMissReason, ContextQuery, ContextRetention,
+    DISCOVERY_IDENTICAL_QUERY_BUDGET, DISCOVERY_MAX_QUERIES_PER_TURN, DiscoveryBudgetExhausted,
+    DiscoveryTurnBudget, Effect, EffectDurability, EffectId, EffectReceipt, FocusState,
+    FsRereadClass, InputAuthority, InputKind, InputLifecycle, InputSource,
+    MAX_COMPLETION_ARTIFACTS, MAX_MODEL_TOOL_CALLS_PER_ROUND, MaterializedContext,
+    MaterializedItem, ModelCompletionValidity, ModelInput, ModelRequest, OperationId,
+    OperationOutcome, OperationQueryResult, OperationResult, OperationState, OperationTerminal,
+    ResourceFreshness, ResourceKey, ResourceVersionOracle, RestoreRevision, RunId,
+    RuntimeCommitKind, RuntimeDirective, RuntimeEvent, RuntimeFailureClass, RuntimeInputEnvelope,
+    RuntimeInputId, ScopeId, ScopeKind, StatePatchProposal, TaskAnchorView, TaskId,
+    TaskProgressProposal, TaskProgressView, ToolCall, ToolLeaseBoundary, ToolOperationIdentity,
+    ToolOutcome, ToolOutput, ToolResultDisposition, ToolSpec, ToolSurfaceBlock,
+    ToolSurfaceBlockReason, ToolSurfaceDemand, ToolSurfaceRequirement, ToolSurfaceSnapshot,
+    TurnCancelAck, TurnCancellationReason, TurnFrame, TurnFrameStep, TurnId,
     USER_INPUT_ARTIFACT_OWNER, USER_INPUT_PREVIEW_CHARS, USER_INPUT_QUEUE_CAP,
     apply_runtime_diagnosis, bounded_preview, context_maintenance_events,
     discovery_search_from_call, path_exactly_in_directive,
@@ -54,8 +56,9 @@ use crate::services::RuntimeServices;
 use crate::sink::LiveSink;
 use crate::surface::{RoundSurfacePlan, SurfaceReportContext};
 use crate::task::{
-    AnchorPatch, TaskManager, changed_fields_kind, completion_from_execution,
-    normalize_tool_requirements, validate_completion_proposal,
+    AnchorPatch, CompletionIntent, CompletionReadiness, CompletionSafety, TaskManager,
+    changed_fields_kind, derive_completion_readiness, normalize_tool_requirements,
+    validate_completion_proposal,
 };
 
 mod commands;
@@ -1122,10 +1125,114 @@ struct PendingRestore {
     rebased_task_sample: Vec<TaskId>,
 }
 
+/// Latest final-packed mandatory-context result for the active task. The
+/// root digest ignores TaskAnchor's record revision: receipt/progress-only
+/// CAS updates do not change what material must be present, while any actual
+/// PromptRequired claim change produces a new digest and invalidates this
+/// observation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ContextRequirementObservation {
+    task_id: TaskId,
+    anchor_revision: u64,
+    root_digest: ContentDigest,
+    required_misses: u32,
+}
+
+fn context_requirement_root_digest(
+    mut roots: Vec<agent_contracts::AnchorRootClaim>,
+) -> ContentDigest {
+    roots.retain(|claim| claim.strength.requires_prompt());
+    // Record revisions move for receipt/progress-only CAS updates. They
+    // remain provenance on miss rows, but are not requirement identity.
+    for root in &mut roots {
+        root.anchor_revision = 0;
+    }
+    let bytes = serde_json::to_vec(&roots).expect("anchor root claims are infallibly serializable");
+    ContentDigest::sha256_bytes(&bytes)
+}
+
+fn observed_context_requirement_misses(
+    basis: ContextRequirementObservation,
+    observed: Option<ContextRequirementObservation>,
+    has_prompt_required_roots: bool,
+) -> u32 {
+    match observed {
+        Some(observed)
+            if observed.task_id == basis.task_id && observed.root_digest == basis.root_digest =>
+        {
+            if observed.anchor_revision > basis.anchor_revision {
+                // Actor-local revisions must not move backwards. Treat an
+                // impossible reverse basis as unknown rather than reusing a
+                // future observation.
+                1
+            } else {
+                observed.required_misses
+            }
+        }
+        // The PromptRequired set moved after the last model frame. Force
+        // another materialization before accepting a model proposal.
+        _ if has_prompt_required_roots => 1,
+        _ => 0,
+    }
+}
+
+#[cfg(test)]
+mod context_requirement_observation_tests {
+    use super::*;
+
+    fn claim(item_ref: &str, anchor_revision: u64) -> agent_contracts::AnchorRootClaim {
+        agent_contracts::AnchorRootClaim {
+            item_ref: item_ref.into(),
+            strength: agent_contracts::AnchorRootStrength::PromptRequired,
+            source_field_id: "evidence_refs".into(),
+            anchor_revision,
+            reason: agent_contracts::RootReason::CompletionEvidence,
+        }
+    }
+
+    #[test]
+    fn receipt_only_revision_keeps_miss_but_root_change_stales_it() {
+        let task_id = TaskId::new();
+        let observed = ContextRequirementObservation {
+            task_id,
+            anchor_revision: 7,
+            root_digest: context_requirement_root_digest(vec![claim("context://run/a", 7)]),
+            required_misses: 3,
+        };
+        let receipt_only_basis = ContextRequirementObservation {
+            task_id,
+            anchor_revision: 8,
+            root_digest: context_requirement_root_digest(vec![claim("context://run/a", 8)]),
+            required_misses: 0,
+        };
+        assert_eq!(
+            observed_context_requirement_misses(receipt_only_basis, Some(observed), true),
+            3,
+            "receipt/progress CAS must not clear an unresolved hard miss"
+        );
+
+        let changed_root_basis = ContextRequirementObservation {
+            root_digest: context_requirement_root_digest(vec![claim("context://run/b", 9)]),
+            anchor_revision: 9,
+            ..receipt_only_basis
+        };
+        assert_eq!(
+            observed_context_requirement_misses(changed_root_basis, Some(observed), true),
+            1,
+            "a changed required root needs a fresh materialization"
+        );
+    }
+}
+
 /// Mutable runtime state, owned exclusively by the actor loop. Callers never
 /// touch it: everything goes through `RuntimeCommand`.
 #[derive(Default)]
 struct ActorState {
+    /// Process-local startup gate. A durable startup marker must commit before
+    /// any command can create task/context/model state. Startup failure is
+    /// terminal for this actor: retrying in place could let a later marker
+    /// sweep a partially appended prefix into replay truth.
+    lifecycle: ActorLifecycle,
     /// Focus epoch. Bumped on every accepted turn, focus change and cancel;
     /// operations tagged with an older generation are stale.
     generation: u64,
@@ -1205,6 +1312,17 @@ struct ActorState {
     /// Turn id whose completion-gate refusal was already surfaced, so one
     /// unresolved proposal warns once instead of every round.
     completion_refusal_surfaced_for: Option<TurnId>,
+    /// Not checkpointed: a restored/continued model round must materialize
+    /// again before its completion proposal can rely on context readiness.
+    context_requirement_observation: Option<ContextRequirementObservation>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+enum ActorLifecycle {
+    #[default]
+    NotStarted,
+    Serving,
+    StartFailed,
 }
 
 /// 已入账但尚未开转的对话。`input` 是 Queued 信封，`content` 是 ingest 全文。
@@ -1261,12 +1379,105 @@ impl RuntimeActor {
         self.assembler.refresh_markers(workspace.project_markers());
     }
 
-    /// 任务感知结算 join:`SettledCandidate` 仅当 execution-local 就绪
-    /// (最大 `VerifiedCurrent`) 且 active task anchor 同意——epoch 匹配、
-    /// 无 open loop、无 next action、每条 acceptance criterion 都有解析
-    /// 到当前 trusted pass 的覆盖 claim——且无 in-flight 操作 / cancel
-    /// cleanup。否则保留 execution 局部标签。in-flight 指尚未终止的
-    /// 派发操作与待派发队列 (`active_tool` 是表面 pin,不在此列)。
+    fn active_context_requirement_basis(&self) -> Option<ContextRequirementObservation> {
+        let task_id = self.state.tasks.active()?;
+        let task = self.state.tasks.get(task_id)?;
+        Some(ContextRequirementObservation {
+            task_id,
+            anchor_revision: task.anchor.revision,
+            root_digest: context_requirement_root_digest(crate::task::anchor_root_claims(
+                &task.anchor,
+            )),
+            required_misses: 0,
+        })
+    }
+
+    fn record_context_requirement_observation(&mut self, required_misses: u32) {
+        self.state.context_requirement_observation =
+            self.active_context_requirement_basis().map(|mut basis| {
+                basis.required_misses = required_misses;
+                basis
+            });
+    }
+
+    fn required_context_misses_for_completion(&self) -> u32 {
+        let Some(basis) = self.active_context_requirement_basis() else {
+            return 0;
+        };
+        let has_prompt_required_roots = self.state.tasks.get(basis.task_id).is_some_and(|task| {
+            crate::task::anchor_root_claims(&task.anchor)
+                .iter()
+                .any(|claim| claim.strength.requires_prompt())
+        });
+        observed_context_requirement_misses(
+            basis,
+            self.state.context_requirement_observation,
+            has_prompt_required_roots,
+        )
+    }
+
+    /// The one actor adapter from mutable runtime state to the pure completion
+    /// decision. Callers may supply the exact execution projection whose
+    /// frontier they are labeling; commit paths use the live turn/resume.
+    fn completion_readiness(
+        &self,
+        intent: CompletionIntent,
+        execution: Option<&crate::execution::ExecutionState>,
+    ) -> CompletionReadiness {
+        self.completion_readiness_inner(intent, execution, false)
+    }
+
+    /// Proposal admission checks semantic authority now but deliberately
+    /// defers operation/pending-sibling safety to the settled batch edge.
+    /// The proposal changes no task/context plane, so treating sibling work
+    /// as an immediate commit would reject the very intent the batch join is
+    /// designed to settle conservatively.
+    fn completion_proposal_readiness(
+        &self,
+        execution: Option<&crate::execution::ExecutionState>,
+    ) -> CompletionReadiness {
+        self.completion_readiness_inner(CompletionIntent::ModelProposal, execution, true)
+    }
+
+    fn completion_readiness_inner(
+        &self,
+        intent: CompletionIntent,
+        execution: Option<&crate::execution::ExecutionState>,
+        defer_batch_safety: bool,
+    ) -> CompletionReadiness {
+        let active_task = self
+            .state
+            .tasks
+            .active()
+            .and_then(|task_id| self.state.tasks.get(task_id));
+        let execution = execution.or_else(|| {
+            self.state
+                .turn
+                .as_ref()
+                .map(|turn| &turn.execution)
+                .or_else(|| active_task.map(|task| &task.resume))
+        });
+        let turn = self.state.turn.as_ref();
+        derive_completion_readiness(
+            intent,
+            self.state.task_id,
+            active_task,
+            execution,
+            CompletionSafety {
+                recovery_required: self.state.recovery_required,
+                cancel_cleanup_pending: self.state.pending_tool_cleanup.is_some(),
+                operation_in_flight: !defer_batch_safety
+                    && turn.is_some_and(|turn| turn.op.is_some()),
+                pending_tool_work: !defer_batch_safety
+                    && turn.is_some_and(|turn| !turn.pending_tools.is_empty()),
+                required_context_misses: self.required_context_misses_for_completion(),
+            },
+            self.services.verification_coverage_declarations(),
+        )
+    }
+
+    /// Task-aware settlement is the model-proposal decision rendered as a
+    /// label; it is not a second predicate.
     fn task_settlement_label(
         &self,
         execution: &crate::execution::ExecutionState,
@@ -1276,19 +1487,10 @@ impl RuntimeActor {
         if local != SettlementLabel::VerifiedCurrent {
             return local;
         }
-        let in_flight_clear = self.state.pending_tool_cleanup.is_none()
-            && self.state.turn.as_ref().is_none_or(|turn| {
-                turn.op.is_none() && turn.pending_tools.is_empty()
-            });
-        let ready = self
-            .state
-            .task_id
-            .and_then(|task_id| self.state.tasks.get(task_id))
-            .is_some_and(|task| {
-                crate::task::task_ready(&task.anchor, execution, in_flight_clear)
-                    && task.status != crate::task::TaskStatus::Completed
-            });
-        if ready {
+        if self
+            .completion_readiness(CompletionIntent::ModelProposal, Some(execution))
+            .settled_candidate()
+        {
             SettlementLabel::SettledCandidate
         } else {
             SettlementLabel::VerifiedCurrent
@@ -1344,6 +1546,15 @@ impl RuntimeActor {
         op_rx: &mut mpsc::Receiver<OperationCompletion>,
         op_tx: &mpsc::Sender<OperationCompletion>,
     ) -> AgentResult<()> {
+        // A run that never crossed its startup marker has no lifecycle to
+        // complete. In particular, after a partial startup append/flush
+        // failure, calling Core::stop would append `RunCompleted` and retry a
+        // flush across the uncommitted startup prefix. Leave that prefix
+        // forensic and terminate this actor without further journal writes.
+        if self.state.lifecycle != ActorLifecycle::Serving {
+            self.state.pending_user_input = None;
+            return Ok(());
+        }
         let cancel = self
             .cancel_turn(TurnCancellationReason::Shutdown, None)
             .await;

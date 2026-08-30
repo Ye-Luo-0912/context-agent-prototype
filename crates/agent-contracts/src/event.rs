@@ -3,10 +3,10 @@ use serde::{Deserialize, Serialize};
 
 use crate::{
     AgentResult, CompactionReason, ContextConsumptionAck, ContextDiagnostics, ContextGcReport,
-    ContextMaintenanceReport, ContextMaintenanceTrigger, ContextSelection, ContextStateTransition,
-    OperationId, OperationSnapshot, RunId, RuntimeFailureClass, RuntimeInputEnvelope, ScopeId,
-    StorageGcReport, TaskId, ToolCall, ToolLeaseReconcileReport, ToolOutput, ToolSurfacePlanReport,
-    ToolSurfaceRequirement, TurnId,
+    ContextMaintenanceReport, ContextMaintenanceTrigger, ContextMaterializationMisses,
+    ContextSelection, ContextStateTransition, OperationId, OperationSnapshot, RunId,
+    RuntimeFailureClass, RuntimeInputEnvelope, ScopeId, StorageGcReport, TaskId, ToolCall,
+    ToolLeaseReconcileReport, ToolOutput, ToolSurfacePlanReport, ToolSurfaceRequirement, TurnId,
 };
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -38,12 +38,25 @@ pub struct RestoreRevision {
     pub effective: u64,
 }
 
+/// The runtime transaction whose audit prefix one explicit durable barrier
+/// commits. Recovery keys off this marker itself rather than inferring
+/// durability from unrelated lifecycle event names.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RuntimeCommitKind {
+    /// Durable marker that opts this run into explicit-barrier replay. It
+    /// commits no model turn, but prevents a partially appended first turn
+    /// from being mistaken for a legacy `TurnCompleted`-only trace.
+    RunStart,
+    Turn,
+    TaskCompletion,
+}
+
 /// Authority split of one task-anchor patch. Autonomous patches touch only
-/// runtime-evolvable fields (interpretation, plan, open loops, criteria,
-/// refs) and apply without confirmation; boundary patches touch user
-/// authority (goal, constraints/waiver) and must clear the approval gate
-/// first. The split is task-anchor policy, so it lives in the contract the
-/// runtime and its consumers both see.
+/// host/runtime-ingested fields (interpretation, plan, open loops, completion
+/// policy/criteria and refs) and apply without confirmation; boundary patches
+/// touch user authority (goal, constraints/waiver) and must clear the approval
+/// gate first. Model-routable `task.manage` cannot submit completion authority.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum AnchorPatchKind {
@@ -166,6 +179,20 @@ pub enum RuntimeEvent {
         /// overhead). Default preserves old wire/checkpoint rows.
         #[serde(default)]
         materialize_ms: u64,
+    },
+    /// Bounded final-frame degradation report. Required misses participate
+    /// in completion readiness; optional misses are observability only. The
+    /// event carries identities and reasons, never context bodies.
+    ContextDegraded {
+        turn_id: TurnId,
+        #[serde(default)]
+        model_round: usize,
+        #[serde(default)]
+        materialization_id: u64,
+        #[serde(default)]
+        required_misses: ContextMaterializationMisses,
+        #[serde(default)]
+        optional_misses: ContextMaterializationMisses,
     },
     /// A successful model operation consumed exactly this bounded subset of
     /// one materialization preview. Failed/cancelled/refused/stale operations
@@ -331,7 +358,7 @@ pub enum RuntimeEvent {
     },
     /// 义务账本生命周期事件（typed、有界，不含任何工具
     /// 正文）。kind ∈ opened / attempted / precondition_changed /
-    /// resolved / dropped；scope_digest 是稳定的血统身份
+    /// resolved / dropped / overflowed；scope_digest 是稳定的血统身份
     /// （ExecutableResolution = 解析上下文 digest），epoch 是前置指纹
     /// 的代数。收敛报告由此验证 max_attempts_per_epoch /
     /// max_total_attempts_per_lineage 等指标。
@@ -382,6 +409,23 @@ pub enum RuntimeEvent {
         directive_revision: u64,
         #[serde(default)]
         workspace_revision: u64,
+    },
+    /// Runtime minted criterion-addressed acceptance receipts from one
+    /// already-observed trusted PASS. This event is body-free and bounded;
+    /// its identities are sufficient to audit the matching decision and the
+    /// corresponding TaskAnchor checkpoint state.
+    AcceptanceReceiptsRecorded {
+        task_id: TaskId,
+        anchor_revision: u64,
+        verification_revision: u64,
+        criterion_indices: Vec<u32>,
+        coverage_domain: String,
+        domain_declaration_revision: u64,
+        #[serde(default)]
+        domain_source_digest: String,
+        directive_revision: u64,
+        workspace_revision: u64,
+        verification_identity: String,
     },
     /// A tool frame closed: the runtime published the lifecycle transitions
     /// the close produced (durable outcomes promoted out of the tool frame),
@@ -536,9 +580,18 @@ pub enum RuntimeEvent {
         #[serde(default)]
         anchor_revision: u64,
     },
+    /// Explicit commit marker appended in the same durable batch as the
+    /// lifecycle events it covers. `checkpoint_sequence` is present for a
+    /// terminal task commit whose task/context planes were first frozen in
+    /// one atomic runtime checkpoint.
+    RuntimeCommitBarrier {
+        kind: RuntimeCommitKind,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        checkpoint_sequence: Option<u64>,
+    },
     /// The turn fully committed its model result and every mandatory context
-    /// write behind the durable event barrier. This is the only successful
-    /// turn-commit marker used by crash recovery.
+    /// write. It is lifecycle audit inside the same durable batch as the
+    /// explicit `RuntimeCommitBarrier`; recovery keys off that marker.
     TurnCompleted,
     /// The runtime fenced an active turn without committing it. This event
     /// has its own durability barrier, but it is deliberately not a
@@ -561,6 +614,16 @@ pub enum RuntimeEvent {
     TurnCommitFailed {
         phase: String,
         message: String,
+    },
+    /// A model-authored completion proposal was accepted by the operation
+    /// gate, but its deferred terminal transaction did not commit. The task
+    /// remains active and the bounded failure is also checkpointed in its
+    /// resume projection so a later decision can correct or retry it.
+    CompletionCommitFailed {
+        task_id: TaskId,
+        #[serde(default)]
+        retryable: bool,
+        reason: String,
     },
     /// The runtime detected state it cannot reconcile by itself (a failed
     /// turn commit, a journal/effect disagreement). Operators and future

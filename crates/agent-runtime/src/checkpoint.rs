@@ -35,8 +35,8 @@ use agent_contracts::{
 use serde::{Deserialize, Serialize};
 
 use crate::task::{
-    CompletionRecord, TaskAnchor, TaskManager, TaskRecord, TaskStatus, TaskToolRequirementSet,
-    validate_anchor, validate_tool_requirement_set,
+    CompletionDisposition, CompletionRecord, MAX_COMPLETION_BLOCKERS, TaskAnchor, TaskManager,
+    TaskRecord, TaskStatus, TaskToolRequirementSet, validate_anchor, validate_tool_requirement_set,
 };
 
 /// Bounded reasons why a fully settled batch owes a durable resume
@@ -51,6 +51,9 @@ pub enum CheckpointDebtReason {
     /// resume state. Once-per-basis offer discipline must survive recovery,
     /// so the write owes a durable snapshot like any other resume change.
     OpportunityOffered,
+    /// A deferred terminal completion failed after its operation had been
+    /// accepted; the bounded failure projection must survive continuation.
+    CompletionCommitFailed,
 }
 
 impl CheckpointDebtReason {
@@ -60,6 +63,7 @@ impl CheckpointDebtReason {
             Self::DurableWorkspaceMutation => "durable_workspace_mutation",
             Self::VerificationChanged => "verification_changed",
             Self::OpportunityOffered => "opportunity_offered",
+            Self::CompletionCommitFailed => "completion_commit_failed",
         }
     }
 }
@@ -203,7 +207,10 @@ impl CheckpointStore {
             if !metadata.is_file() || !entry.file_name().to_string_lossy().ends_with(".json") {
                 continue;
             }
-            entries.push((metadata.modified().unwrap_or(std::time::UNIX_EPOCH), entry.path()));
+            entries.push((
+                metadata.modified().unwrap_or(std::time::UNIX_EPOCH),
+                entry.path(),
+            ));
         }
         entries.sort_by_key(|(modified, _)| std::cmp::Reverse(*modified));
         // Newest-first. The newest artifact always survives (continuation
@@ -215,8 +222,7 @@ impl CheckpointStore {
                 .await
                 .map(|metadata| metadata.len())
                 .unwrap_or(0);
-            if index > 0 && (index >= keep || kept_bytes.saturating_add(size) > max_total_bytes)
-            {
+            if index > 0 && (index >= keep || kept_bytes.saturating_add(size) > max_total_bytes) {
                 let _ = tokio::fs::remove_file(path).await;
                 continue;
             }
@@ -374,6 +380,16 @@ pub struct RuntimeCheckpoint {
     /// under (handshake-verified stable). Zero without a registry.
     #[serde(default)]
     pub capability_generation: u64,
+    /// Last event-journal sequence already reflected by the captured
+    /// runtime/context planes. Recovery replays strictly after this cursor;
+    /// old v4 payloads default to zero and retain legacy behavior.
+    #[serde(default)]
+    pub event_cover_seq: u64,
+    /// This checkpoint is itself the durable commit anchor for one terminal
+    /// task/context transaction. It may be newer than the last journal
+    /// barrier if the process dies in the checkpoint-to-audit window.
+    #[serde(default)]
+    pub terminal_commit: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -463,6 +479,17 @@ impl RuntimeCheckpoint {
             ));
         }
 
+        if self.terminal_commit
+            && (self.current_task_id.is_some()
+                || self.tasks.active.is_some()
+                || self.tasks.completed.is_empty())
+        {
+            return Err(AgentError::InvalidRequest(
+                "terminal checkpoint must have no active/current task and at least one completion record"
+                    .into(),
+            ));
+        }
+
         let mut task_ids = HashSet::new();
         let mut active_records = Vec::new();
         for task in &self.tasks.tasks {
@@ -481,7 +508,7 @@ impl RuntimeCheckpoint {
                     task.id
                 ))
             })?;
-            validate_anchor(&task.anchor).map_err(|error| {
+            validate_anchor(task.id, &task.anchor).map_err(|error| {
                 AgentError::InvalidRequest(format!(
                     "checkpoint task {} has an invalid anchor: {error}",
                     task.id
@@ -592,6 +619,30 @@ pub(crate) fn validate_completion_record(record: &CompletionRecord) -> AgentResu
             "completion record carries {} verification refs, above the {MAX_COMPLETION_ARTIFACTS} cap",
             record.verification_refs.len()
         )));
+    }
+    if record.unmet_reasons.len() > MAX_COMPLETION_BLOCKERS {
+        return Err(AgentError::InvalidRequest(format!(
+            "completion record carries {} unmet reasons, above the {MAX_COMPLETION_BLOCKERS} cap",
+            record.unmet_reasons.len()
+        )));
+    }
+    match record.disposition {
+        CompletionDisposition::Verified
+            if !record.unmet_reasons.is_empty()
+                || record.verification_status
+                    != crate::task::CompletionVerificationStatus::Current =>
+        {
+            return Err(AgentError::InvalidRequest(
+                "a verified completion record requires Current verification and no unmet reasons"
+                    .into(),
+            ));
+        }
+        CompletionDisposition::OperatorOverride if record.unmet_reasons.is_empty() => {
+            return Err(AgentError::InvalidRequest(
+                "an operator override must retain at least one unmet reason".into(),
+            ));
+        }
+        _ => {}
     }
     for reference in record
         .final_output_ref
@@ -800,6 +851,8 @@ mod tests {
             authority: None,
             snapshot_sequence: 7,
             capability_generation: 0,
+            event_cover_seq: 0,
+            terminal_commit: false,
         }
     }
 
@@ -855,6 +908,88 @@ mod tests {
         assert_eq!(
             decoded.tasks.tasks[0].anchor.next_action,
             "add the fake-sleeper unit test"
+        );
+    }
+
+    #[test]
+    fn legacy_v4_string_criteria_and_weak_claim_restore_fail_closed() {
+        let mut tasks = task_manager_with_requirements();
+        let task_id = tasks.active().unwrap();
+        let (txn, _, _, _) = tasks
+            .prepare_patch_anchor(
+                task_id,
+                0,
+                &crate::task::AnchorPatch {
+                    acceptance_criteria: Some(vec!["legacy tests pass".into()]),
+                    ..crate::task::AnchorPatch::default()
+                },
+            )
+            .unwrap();
+        tasks.commit(txn);
+        let mut value = serde_json::to_value(checkpoint(&tasks)).unwrap();
+        let anchor = value["tasks"]["tasks"][0]["anchor"]
+            .as_object_mut()
+            .unwrap();
+        anchor.remove("completion_policy");
+        anchor.insert(
+            "acceptance_criteria".into(),
+            serde_json::json!(["legacy tests pass"]),
+        );
+        anchor.insert(
+            "acceptance_coverage".into(),
+            serde_json::json!([{
+                "criterion_index": 0,
+                "verification_identity": agent_contracts::ContentDigest::sha256_bytes(b"legacy")
+                    .to_string()
+            }]),
+        );
+
+        let decoded: RuntimeCheckpoint = serde_json::from_value(value).unwrap();
+        decoded.validate().unwrap();
+        let restored = &decoded.tasks.tasks[0].anchor;
+        assert_eq!(
+            restored.completion_policy,
+            crate::task::TaskCompletionPolicy::OperatorClosureOnly
+        );
+        assert_eq!(
+            restored.acceptance_criteria[0].description,
+            "legacy tests pass"
+        );
+        assert!(restored.acceptance_criteria[0].coverage_domain.is_empty());
+        assert_eq!(
+            restored.acceptance_criteria[0].domain_declaration_revision,
+            0
+        );
+        assert!(
+            restored.acceptance_criteria[0]
+                .domain_source_digest
+                .is_empty()
+        );
+        assert_eq!(restored.acceptance_coverage.len(), 1);
+        assert!(restored.acceptance_coverage[0].task_id.is_none());
+        assert_eq!(restored.acceptance_coverage[0].verification_revision, 0);
+        assert!(
+            restored.acceptance_coverage[0]
+                .domain_source_digest
+                .is_empty()
+        );
+        let mut restored_tasks = TaskManager::new();
+        restored_tasks.restore(decoded.tasks.clone());
+        let task = restored_tasks.get(task_id).unwrap();
+        let readiness = crate::task::derive_completion_readiness(
+            crate::task::CompletionIntent::ModelProposal,
+            Some(task.id),
+            Some(task),
+            Some(&task.resume),
+            crate::task::CompletionSafety::default(),
+            &[],
+        );
+        assert!(!readiness.allows_completion());
+        assert!(
+            readiness
+                .applicable_blockers()
+                .contains(&crate::task::CompletionBlocker::OperatorClosureOnly),
+            "legacy weak coverage must remain inert after restore"
         );
     }
 

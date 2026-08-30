@@ -4,10 +4,12 @@ use std::collections::HashSet;
 use std::path::Path;
 
 use agent_contracts::{
-    AttentionState, CONTEXT_MAP_VIEW_CAP, ContextItem, ContextItemId, ContextMapView, ContextQuery,
-    ContextRetention, ContextSelection, MAX_FOREGROUND_RESOURCES, MAX_FOREGROUND_TOKENS,
-    MaterializedContext, MaterializedItem, ScopeId, ScopeKind, ScopeState, ScoreBreakdown,
-    checked_files_cover_path, normalize_resource_path,
+    AttentionState, CONTEXT_CONSUMPTION_ACK_ITEM_CAP, CONTEXT_MAP_VIEW_CAP, ContextItem,
+    ContextItemId, ContextMapView, ContextMaterializationIdentity, ContextMaterializationMiss,
+    ContextMaterializationMissReason, ContextMaterializationMisses, ContextQuery, ContextRetention,
+    ContextSelection, MAX_FOREGROUND_RESOURCES, MAX_FOREGROUND_TOKENS, MaterializedContext,
+    MaterializedItem, ScopeId, ScopeKind, ScopeState, ScoreBreakdown, checked_files_cover_path,
+    normalize_resource_path,
 };
 
 use crate::diagnostics;
@@ -543,6 +545,9 @@ pub(crate) fn materialize(
         approx_tokens: approx_tokens_total,
         diagnostics: diagnostics::compute(state),
         foreground: Vec::new(),
+        required_item_ids: Vec::new(),
+        required_misses: ContextMaterializationMisses::default(),
+        optional_misses: ContextMaterializationMisses::default(),
     }
 }
 
@@ -844,18 +849,35 @@ fn packed_item_tokens(item: &ContextItem, visible_body_identities: &[String]) ->
 /// One current-directive file body to project. Memory sources are cloned
 /// under the state lock; store ids are read after the lock is dropped.
 pub(crate) enum ForegroundPlanItem {
-    Ready(Box<ContextItem>),
-    Store(ContextItemId),
+    Ready {
+        item: Box<ContextItem>,
+        identity: ContextMaterializationIdentity,
+    },
+    Store {
+        item_id: ContextItemId,
+        checksum: Option<String>,
+        identity: ContextMaterializationIdentity,
+    },
+}
+
+pub(crate) struct ForegroundPlan {
+    pub(crate) items: Vec<ForegroundPlanItem>,
+    pub(crate) misses: ContextMaterializationMisses,
 }
 
 pub(crate) fn plan_foreground(
     state: &State,
     query: &ContextQuery,
     selected: &[MaterializedItem],
-) -> Vec<ForegroundPlanItem> {
+) -> ForegroundPlan {
     let mut plan = Vec::new();
+    let mut misses = ContextMaterializationMisses::default();
     for key in &query.hints.foreground_resources {
         if plan.len() >= MAX_FOREGROUND_RESOURCES {
+            misses.push(context_miss(
+                resource_identity(key),
+                ContextMaterializationMissReason::BudgetExcluded,
+            ));
             break;
         }
         let path = normalize_resource_path(&key.path);
@@ -866,43 +888,87 @@ pub(crate) fn plan_foreground(
             continue;
         }
         let revision = key.revision.as_deref();
+        let identity = resource_identity(key);
         if let Some(item) = best_live_file_body(state.items.iter(), &path, revision) {
-            plan.push(ForegroundPlanItem::Ready(Box::new(item.clone())));
+            plan.push(ForegroundPlanItem::Ready {
+                item: Box::new(item.clone()),
+                identity,
+            });
             continue;
         }
         if let Some(item) = best_live_file_body(state.eviction_buffer.iter(), &path, revision) {
-            plan.push(ForegroundPlanItem::Ready(Box::new(item.clone())));
+            plan.push(ForegroundPlanItem::Ready {
+                item: Box::new(item.clone()),
+                identity,
+            });
             continue;
         }
-        if let Some(id) = best_stored_file_body(state, &path, revision) {
-            plan.push(ForegroundPlanItem::Store(id));
+        if let Some(entry) = best_stored_file_body(state, &path, revision) {
+            plan.push(ForegroundPlanItem::Store {
+                item_id: entry.item_id,
+                checksum: entry.blob_checksum.clone(),
+                identity,
+            });
+        } else {
+            misses.push(context_miss(
+                identity,
+                ContextMaterializationMissReason::Missing,
+            ));
         }
     }
-    plan
+    ForegroundPlan {
+        items: plan,
+        misses,
+    }
 }
 
 pub(crate) async fn realize_foreground(
-    plan: Vec<ForegroundPlanItem>,
+    plan: ForegroundPlan,
     dir: &Path,
-) -> Vec<MaterializedItem> {
+) -> (Vec<MaterializedItem>, ContextMaterializationMisses) {
     let mut out = Vec::new();
     let mut used = 0usize;
-    for source in plan {
+    let mut misses = plan.misses;
+    for source in plan.items {
         if out.len() >= MAX_FOREGROUND_RESOURCES || used >= MAX_FOREGROUND_TOKENS {
+            let identity = match source {
+                ForegroundPlanItem::Ready { identity, .. }
+                | ForegroundPlanItem::Store { identity, .. } => identity,
+            };
+            misses.push(context_miss(
+                identity,
+                ContextMaterializationMissReason::BudgetExcluded,
+            ));
             break;
         }
-        let Some(item) = (match source {
-            ForegroundPlanItem::Ready(item) => Some(*item),
-            ForegroundPlanItem::Store(id) => store::read_item_async(dir, id).await,
-        }) else {
-            continue;
+        let (item, identity) = match source {
+            ForegroundPlanItem::Ready { item, identity } => (*item, identity),
+            ForegroundPlanItem::Store {
+                item_id,
+                checksum,
+                identity,
+            } => match store::read_item_checked_async(dir, item_id, checksum.as_deref()).await {
+                Ok(item) => (item, identity),
+                Err(failure) => {
+                    misses.push(context_miss(identity, store_miss_reason(failure)));
+                    continue;
+                }
+            },
         };
         if !item.semantic.is_live() || !is_file_body_observation(&item) {
+            misses.push(context_miss(
+                identity,
+                ContextMaterializationMissReason::PolicyExcluded,
+            ));
             continue;
         }
         let remaining = MAX_FOREGROUND_TOKENS.saturating_sub(used);
         let content = clip_to_token_budget(&item.content, remaining);
         if content.is_empty() {
+            misses.push(context_miss(
+                identity,
+                ContextMaterializationMissReason::BudgetExcluded,
+            ));
             continue;
         }
         used = used.saturating_add(approx_tokens(&content));
@@ -919,7 +985,36 @@ pub(crate) async fn realize_foreground(
             file_revision: item.file_revision.clone(),
         });
     }
-    out
+    (out, misses)
+}
+
+fn resource_identity(key: &agent_contracts::ResourceKey) -> ContextMaterializationIdentity {
+    let path = normalize_resource_path(&key.path);
+    let item_ref = match key
+        .revision
+        .as_deref()
+        .map(str::trim)
+        .filter(|revision| !revision.is_empty())
+    {
+        Some(revision) => format!("{path}@{revision}"),
+        None => path,
+    };
+    ContextMaterializationIdentity::new(item_ref, None, "foreground_resources", 0)
+}
+
+fn context_miss(
+    identity: ContextMaterializationIdentity,
+    reason: ContextMaterializationMissReason,
+) -> ContextMaterializationMiss {
+    ContextMaterializationMiss { identity, reason }
+}
+
+fn store_miss_reason(failure: store::StoreReadFailure) -> ContextMaterializationMissReason {
+    match failure {
+        store::StoreReadFailure::Missing => ContextMaterializationMissReason::Missing,
+        store::StoreReadFailure::Corrupt => ContextMaterializationMissReason::Corrupt,
+        store::StoreReadFailure::IoFailed => ContextMaterializationMissReason::IoFailed,
+    }
 }
 
 fn selected_includes_file_body(selected: &[MaterializedItem], path: &str) -> bool {
@@ -976,11 +1071,11 @@ fn best_live_file_body<'a>(
         .max_by_key(|item| (item.created_tick, item.last_access_tick))
 }
 
-fn best_stored_file_body(
-    state: &State,
+fn best_stored_file_body<'a>(
+    state: &'a State,
     path: &str,
     revision: Option<&str>,
-) -> Option<ContextItemId> {
+) -> Option<&'a agent_contracts::ExternalizedContext> {
     state
         .external
         .iter()
@@ -993,7 +1088,573 @@ fn best_stored_file_body(
         })
         .filter(|entry| revision_ok(entry.file_revision.as_deref(), revision))
         .max_by_key(|entry| (entry.created_tick, entry.last_access_tick))
-        .map(|entry| entry.item_id)
+}
+
+enum RequiredPlanSource {
+    Ready(Box<ContextItem>),
+    Store {
+        item_id: ContextItemId,
+        checksum: Option<String>,
+    },
+}
+
+struct RequiredPlanItem {
+    identity: ContextMaterializationIdentity,
+    source: RequiredPlanSource,
+}
+
+pub(crate) struct RequiredPlan {
+    items: Vec<RequiredPlanItem>,
+    misses: ContextMaterializationMisses,
+}
+
+#[cfg(test)]
+impl RequiredPlan {
+    pub(crate) fn body_count(&self) -> usize {
+        self.items.len()
+    }
+
+    pub(crate) fn store_read_count(&self) -> usize {
+        self.items
+            .iter()
+            .filter(|item| matches!(&item.source, RequiredPlanSource::Store { .. }))
+            .count()
+    }
+
+    pub(crate) fn miss_count(&self) -> u32 {
+        self.misses.total()
+    }
+}
+
+const MAX_REQUIRED_PLAN_OBSERVATIONS: usize =
+    CONTEXT_CONSUMPTION_ACK_ITEM_CAP + agent_contracts::CONTEXT_MATERIALIZATION_MISS_CAP;
+
+pub(crate) struct RequiredBody {
+    item: ContextItem,
+    identity: ContextMaterializationIdentity,
+}
+
+/// Plan every mandatory body under the state lock. This does not change
+/// residency or scoring: it only makes the already-defined Pinned and
+/// PromptRequired contract explicit when its body lives outside the heap.
+pub(crate) fn plan_required(state: &State, query: &ContextQuery) -> RequiredPlan {
+    let mut items = Vec::new();
+    let mut misses = ContextMaterializationMisses::default();
+    let mut seen = HashSet::new();
+
+    // Pinned retention keeps its existing priority ahead of anchor roots.
+    for item in state
+        .items
+        .iter()
+        .chain(state.eviction_buffer.iter())
+        .filter(|item| item.retention == ContextRetention::Pinned)
+    {
+        let identity = pinned_identity(item.id);
+        if !plan_memory_required(
+            state,
+            query,
+            item,
+            identity,
+            &mut seen,
+            &mut items,
+            &mut misses,
+        ) {
+            break;
+        }
+    }
+    for item_id in state.external.pinned_ids().iter().copied() {
+        let Some(entry) = state.external.get(item_id) else {
+            continue;
+        };
+        let identity = pinned_identity(entry.item_id);
+        if !plan_store_required(entry, identity, &mut seen, &mut items, &mut misses) {
+            break;
+        }
+    }
+
+    for claim in query
+        .hints
+        .anchor_roots
+        .iter()
+        .filter(|claim| claim.strength.requires_prompt())
+        .take(agent_contracts::MAX_ANCHOR_ROOT_CLAIMS)
+    {
+        let mut matched = false;
+        let mut bounded_out = false;
+
+        // Direct id/uri lookup is O(1) in resident and stored catalogs.
+        if let Ok(id) = ContextItemId::parse_ref(&claim.item_ref) {
+            if let Some(index) = state.items.indexes().get(id) {
+                matched = true;
+                let item = &state.items[index];
+                bounded_out = !plan_memory_required(
+                    state,
+                    query,
+                    item,
+                    claim_identity(claim, Some(id)),
+                    &mut seen,
+                    &mut items,
+                    &mut misses,
+                );
+            } else if let Some(item) = state.eviction_buffer.iter().find(|item| item.id == id) {
+                matched = true;
+                bounded_out = !plan_memory_required(
+                    state,
+                    query,
+                    item,
+                    claim_identity(claim, Some(id)),
+                    &mut seen,
+                    &mut items,
+                    &mut misses,
+                );
+            } else if let Some(entry) = state.external.get(id) {
+                matched = true;
+                bounded_out = !plan_store_required(
+                    entry,
+                    claim_identity(claim, Some(id)),
+                    &mut seen,
+                    &mut items,
+                    &mut misses,
+                );
+            }
+        }
+
+        // Exact entity buckets preserve the established anchor matching
+        // semantics without scanning a long resident/store catalog.
+        for id in state.items.indexes().ids_for_entity(&claim.item_ref) {
+            if bounded_out {
+                break;
+            }
+            let Some(index) = state.items.indexes().get(*id) else {
+                continue;
+            };
+            matched = true;
+            let item = &state.items[index];
+            let identity = claim_identity(claim, Some(item.id));
+            bounded_out = !plan_memory_required(
+                state,
+                query,
+                item,
+                identity,
+                &mut seen,
+                &mut items,
+                &mut misses,
+            );
+        }
+        for item in state
+            .eviction_buffer
+            .iter()
+            .filter(|item| crate::engine::anchor_claim_matches_item(claim, item))
+        {
+            if bounded_out {
+                break;
+            }
+            matched = true;
+            bounded_out = !plan_memory_required(
+                state,
+                query,
+                item,
+                claim_identity(claim, Some(item.id)),
+                &mut seen,
+                &mut items,
+                &mut misses,
+            );
+        }
+        for id in state.external.ids_for_entity(&claim.item_ref) {
+            if bounded_out {
+                break;
+            }
+            let Some(entry) = state.external.get(*id) else {
+                continue;
+            };
+            matched = true;
+            bounded_out = !plan_store_required(
+                entry,
+                claim_identity(claim, Some(entry.item_id)),
+                &mut seen,
+                &mut items,
+                &mut misses,
+            );
+        }
+        if bounded_out {
+            break;
+        }
+        if !matched {
+            misses.push(context_miss(
+                claim_identity(claim, None),
+                ContextMaterializationMissReason::Missing,
+            ));
+        }
+    }
+
+    RequiredPlan { items, misses }
+}
+
+fn plan_memory_required(
+    state: &State,
+    query: &ContextQuery,
+    item: &ContextItem,
+    identity: ContextMaterializationIdentity,
+    seen: &mut HashSet<ContextItemId>,
+    items: &mut Vec<RequiredPlanItem>,
+    misses: &mut ContextMaterializationMisses,
+) -> bool {
+    if seen.contains(&item.id) {
+        return true;
+    }
+    if seen.len() >= MAX_REQUIRED_PLAN_OBSERVATIONS {
+        push_required_plan_overflow(misses);
+        return false;
+    }
+    seen.insert(item.id);
+    if is_excluded(item) {
+        misses.push(context_miss(
+            identity,
+            ContextMaterializationMissReason::PolicyExcluded,
+        ));
+        return true;
+    }
+    // The current user message is already carried by the fixed TurnFrame;
+    // duplicating it as historical context is neither necessary nor a miss.
+    if item.kind == agent_contracts::ContextKind::UserMessage
+        && state.turn > 0
+        && item.created_turn == state.turn
+        && item.content == query.current_input
+    {
+        return true;
+    }
+    if items.len() >= CONTEXT_CONSUMPTION_ACK_ITEM_CAP {
+        misses.push(context_miss(
+            identity,
+            ContextMaterializationMissReason::BudgetExcluded,
+        ));
+        return true;
+    }
+    items.push(RequiredPlanItem {
+        identity,
+        source: RequiredPlanSource::Ready(Box::new(item.clone())),
+    });
+    true
+}
+
+fn plan_store_required(
+    entry: &agent_contracts::ExternalizedContext,
+    identity: ContextMaterializationIdentity,
+    seen: &mut HashSet<ContextItemId>,
+    items: &mut Vec<RequiredPlanItem>,
+    misses: &mut ContextMaterializationMisses,
+) -> bool {
+    if seen.contains(&entry.item_id) {
+        return true;
+    }
+    if seen.len() >= MAX_REQUIRED_PLAN_OBSERVATIONS {
+        push_required_plan_overflow(misses);
+        return false;
+    }
+    seen.insert(entry.item_id);
+    let legacy_excluded = entry.tags.iter().any(|tag| {
+        tag.is_lifecycle(agent_contracts::LifecycleLabel::Superseded)
+            || tag.is_lifecycle(agent_contracts::LifecycleLabel::VerifiedFixed)
+    });
+    if !entry.semantic.is_live() || legacy_excluded {
+        misses.push(context_miss(
+            identity,
+            ContextMaterializationMissReason::PolicyExcluded,
+        ));
+        return true;
+    }
+    if items.len() >= CONTEXT_CONSUMPTION_ACK_ITEM_CAP {
+        misses.push(context_miss(
+            identity,
+            ContextMaterializationMissReason::BudgetExcluded,
+        ));
+        return true;
+    }
+    items.push(RequiredPlanItem {
+        identity,
+        source: RequiredPlanSource::Store {
+            item_id: entry.item_id,
+            checksum: entry.blob_checksum.clone(),
+        },
+    });
+    true
+}
+
+fn push_required_plan_overflow(misses: &mut ContextMaterializationMisses) {
+    misses.push(context_miss(
+        ContextMaterializationIdentity::new(
+            "context://required-set-overflow",
+            None,
+            "materialization",
+            0,
+        ),
+        ContextMaterializationMissReason::BudgetExcluded,
+    ));
+}
+
+fn pinned_identity(item_id: ContextItemId) -> ContextMaterializationIdentity {
+    ContextMaterializationIdentity::new(
+        format!("context://run/{item_id}"),
+        Some(item_id),
+        "retention:pinned",
+        0,
+    )
+}
+
+fn claim_identity(
+    claim: &agent_contracts::AnchorRootClaim,
+    item_id: Option<ContextItemId>,
+) -> ContextMaterializationIdentity {
+    ContextMaterializationIdentity::new(
+        claim.item_ref.clone(),
+        item_id,
+        claim.source_field_id.clone(),
+        claim.anchor_revision,
+    )
+}
+
+/// Execute required store reads outside the state lock with the same bounded
+/// concurrency as GC. Result order is restored by plan ordinal so events and
+/// packing stay deterministic even when disk completion order differs.
+pub(crate) async fn realize_required(
+    plan: RequiredPlan,
+    dir: &Path,
+) -> (Vec<RequiredBody>, ContextMaterializationMisses) {
+    let mut slots: Vec<(
+        ContextMaterializationIdentity,
+        Option<Result<ContextItem, store::StoreReadFailure>>,
+    )> = Vec::with_capacity(plan.items.len());
+    let mut jobs = std::collections::VecDeque::new();
+    for (ordinal, item) in plan.items.into_iter().enumerate() {
+        match item.source {
+            RequiredPlanSource::Ready(body) => {
+                slots.push((item.identity, Some(Ok(*body))));
+            }
+            RequiredPlanSource::Store { item_id, checksum } => {
+                slots.push((item.identity, None));
+                jobs.push_back((ordinal, item_id, checksum));
+            }
+        }
+    }
+
+    let mut reads = tokio::task::JoinSet::new();
+    while !jobs.is_empty() || !reads.is_empty() {
+        while reads.len() < store::MAX_STORE_IO_CONCURRENCY {
+            let Some((ordinal, item_id, checksum)) = jobs.pop_front() else {
+                break;
+            };
+            let dir = dir.to_path_buf();
+            reads.spawn(async move {
+                let result =
+                    store::read_item_checked_async(&dir, item_id, checksum.as_deref()).await;
+                (ordinal, result)
+            });
+        }
+        if let Some(Ok((ordinal, result))) = reads.join_next().await
+            && let Some(slot) = slots.get_mut(ordinal)
+        {
+            slot.1 = Some(result);
+        }
+    }
+
+    let mut bodies = Vec::new();
+    let mut misses = plan.misses;
+    for (identity, result) in slots {
+        match result {
+            Some(Ok(item)) if item.semantic.is_live() && !is_excluded(&item) => {
+                bodies.push(RequiredBody { item, identity });
+            }
+            Some(Ok(_)) => misses.push(context_miss(
+                identity,
+                ContextMaterializationMissReason::PolicyExcluded,
+            )),
+            Some(Err(failure)) => misses.push(context_miss(identity, store_miss_reason(failure))),
+            None => misses.push(context_miss(
+                identity,
+                ContextMaterializationMissReason::IoFailed,
+            )),
+        }
+    }
+    (bodies, misses)
+}
+
+/// Overlay mandatory bodies onto the unchanged scored selection. Optional
+/// selections are displaced only when needed to uphold a pre-existing
+/// Pinned/PromptRequired contract; scoring thresholds and GC state do not
+/// move. Anything that still cannot fit becomes an explicit hard miss.
+pub(crate) fn apply_required(
+    materialized: &mut MaterializedContext,
+    query: &ContextQuery,
+    bodies: Vec<RequiredBody>,
+    mut misses: ContextMaterializationMisses,
+) {
+    for required in bodies {
+        let item_id = required.item.id;
+        if materialized.required_item_ids.len() >= CONTEXT_CONSUMPTION_ACK_ITEM_CAP {
+            misses.push(context_miss(
+                required.identity,
+                ContextMaterializationMissReason::BudgetExcluded,
+            ));
+            continue;
+        }
+
+        let already_visible = materialized
+            .items
+            .iter()
+            .chain(materialized.foreground.iter())
+            .any(|item| item.item_id == item_id);
+        if already_visible {
+            materialized.required_item_ids.push(item_id);
+            remove_external_descriptor(materialized, item_id);
+            continue;
+        }
+
+        let tokens = packed_item_tokens(&required.item, &query.hints.visible_body_identities);
+        let max_items = query.hints.max_selected_items.unwrap_or(usize::MAX);
+        let Some(evictions) =
+            plan_required_evictions(materialized, tokens, query.budget_tokens, max_items)
+        else {
+            misses.push(context_miss(
+                required.identity,
+                ContextMaterializationMissReason::BudgetExcluded,
+            ));
+            continue;
+        };
+        for item_id in evictions {
+            drop_optional_item(materialized, item_id);
+        }
+
+        let content =
+            if prices_as_file_body_descriptor(&required.item, &query.hints.visible_body_identities)
+            {
+                file_body_descriptor_content(&required.item)
+            } else {
+                required.item.content.clone()
+            };
+        materialized.items.push(MaterializedItem {
+            item_id,
+            kind: required.item.kind,
+            scope: required.item.scope,
+            attention: required.item.attention,
+            semantic: required.item.semantic,
+            retention: required.item.retention,
+            content,
+            source: required.item.source.clone(),
+            file_path: required.item.file_path.clone(),
+            file_revision: required.item.file_revision.clone(),
+        });
+        materialized.selected.push(ContextSelection {
+            item_id,
+            score: 0.0,
+            approx_tokens: tokens,
+            reason: "required context body included by Pinned/PromptRequired contract".into(),
+            breakdown: ScoreBreakdown::default(),
+            kind: Some(required.item.kind),
+            source: required.item.source.clone(),
+            reactivated: false,
+        });
+        materialized.required_item_ids.push(item_id);
+        remove_external_descriptor(materialized, item_id);
+    }
+
+    materialized.approx_tokens = selected_item_tokens(materialized)
+        + materialized
+            .external
+            .iter()
+            .map(external_ref_tokens)
+            .sum::<usize>();
+    materialized.required_misses = misses;
+}
+
+fn packed_selected_tokens(materialized: &MaterializedContext) -> usize {
+    materialized
+        .selected
+        .iter()
+        .map(|selection| selection.approx_tokens)
+        .sum()
+}
+
+fn selected_item_tokens(materialized: &MaterializedContext) -> usize {
+    materialized
+        .items
+        .iter()
+        .map(|item| approx_tokens(&item.content))
+        .sum()
+}
+
+/// Plan displacement without mutating the current frame. Required bodies are
+/// applied one at a time; if this body cannot fit even after every eligible
+/// optional item is removed, the existing visible set must remain intact.
+/// This makes each required-body overlay transactional while preserving the
+/// established largest-first displacement order.
+fn plan_required_evictions(
+    materialized: &MaterializedContext,
+    required_tokens: usize,
+    budget_tokens: usize,
+    max_items: usize,
+) -> Option<Vec<ContextItemId>> {
+    let mut packed_tokens = packed_selected_tokens(materialized);
+    let mut item_count = materialized.items.len();
+    if item_count < max_items && packed_tokens.saturating_add(required_tokens) <= budget_tokens {
+        return Some(Vec::new());
+    }
+
+    let mut optional: Vec<(ContextItemId, usize, usize)> = materialized
+        .items
+        .iter()
+        .enumerate()
+        .filter(|(_, item)| {
+            item.retention != ContextRetention::Pinned
+                && !materialized.required_item_ids.contains(&item.item_id)
+        })
+        .map(|(ordinal, item)| {
+            let tokens = materialized
+                .selected
+                .iter()
+                .find(|selection| selection.item_id == item.item_id)
+                .map(|selection| selection.approx_tokens)
+                .unwrap_or_else(|| approx_tokens(&item.content));
+            (item.item_id, tokens, ordinal)
+        })
+        .collect();
+    optional.sort_by(|left, right| right.1.cmp(&left.1).then_with(|| left.2.cmp(&right.2)));
+
+    let mut evictions = Vec::new();
+    for (item_id, tokens, _) in optional {
+        packed_tokens = packed_tokens.saturating_sub(tokens);
+        item_count = item_count.saturating_sub(1);
+        evictions.push(item_id);
+        if item_count < max_items && packed_tokens.saturating_add(required_tokens) <= budget_tokens
+        {
+            return Some(evictions);
+        }
+    }
+    None
+}
+
+fn drop_optional_item(materialized: &mut MaterializedContext, item_id: ContextItemId) {
+    materialized.items.retain(|item| item.item_id != item_id);
+    materialized
+        .selected
+        .retain(|selection| selection.item_id != item_id);
+}
+
+fn remove_external_descriptor(materialized: &mut MaterializedContext, item_id: ContextItemId) {
+    if materialized
+        .external
+        .iter()
+        .all(|entry| entry.item_id != item_id)
+    {
+        return;
+    }
+    materialized.external = ContextMapView::new(
+        materialized
+            .external
+            .iter()
+            .filter(|entry| entry.item_id != item_id)
+            .cloned()
+            .collect(),
+    );
 }
 
 fn clip_to_token_budget(text: &str, max_tokens: usize) -> String {

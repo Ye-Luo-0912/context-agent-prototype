@@ -67,6 +67,24 @@ fn context_uri(item_id: ContextItemId) -> String {
     format!("context://run/{item_id}")
 }
 
+/// Typed outcome of reading one formal context-store blob. Absence,
+/// corruption and an operational filesystem failure have different
+/// recovery semantics and must never collapse into the same `None`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum StoreReadFailure {
+    Missing,
+    Corrupt,
+    IoFailed,
+}
+
+pub(crate) const fn read_failure_name(failure: StoreReadFailure) -> &'static str {
+    match failure {
+        StoreReadFailure::Missing => "missing",
+        StoreReadFailure::Corrupt => "corrupt",
+        StoreReadFailure::IoFailed => "io_failed",
+    }
+}
+
 /// Write an item's full content to the store and return its reference.
 /// Test-only sync variant: the GC's IO phase uses the async
 /// [`externalize_async`] so the state lock is not held across disk writes.
@@ -127,19 +145,60 @@ pub(crate) fn make_context_ref(item: &ContextItem) -> ContextRef {
     }
 }
 
-/// Read an externalized item's full content back from the store. `None`
-/// when the entry was already deleted by Storage GC.
+/// Read an externalized item's full content back from the store.
 #[cfg(test)]
-pub(crate) fn read_item(dir: &Path, item_id: ContextItemId) -> Option<ContextItem> {
-    let bytes = std::fs::read(file_path(dir, item_id)).ok()?;
-    serde_json::from_slice(&bytes).ok()
+pub(crate) fn read_item(
+    dir: &Path,
+    item_id: ContextItemId,
+) -> Result<ContextItem, StoreReadFailure> {
+    let bytes = std::fs::read(file_path(dir, item_id)).map_err(classify_read_io)?;
+    decode_item(item_id, &bytes, None)
 }
 
 /// Async variant of [`read_item`] for the GC's IO phase (recall), which
 /// must not hold the state lock across disk reads.
-pub(crate) async fn read_item_async(dir: &Path, item_id: ContextItemId) -> Option<ContextItem> {
-    let bytes = tokio::fs::read(file_path(dir, item_id)).await.ok()?;
-    serde_json::from_slice(&bytes).ok()
+pub(crate) async fn read_item_async(
+    dir: &Path,
+    item_id: ContextItemId,
+) -> Result<ContextItem, StoreReadFailure> {
+    read_item_checked_async(dir, item_id, None).await
+}
+
+/// Read a catalog-owned blob and, when the entry has a captured checksum,
+/// prove that the body still matches it. Required materialization uses this
+/// path; a corrupted body must become an explicit completion-visible miss.
+pub(crate) async fn read_item_checked_async(
+    dir: &Path,
+    item_id: ContextItemId,
+    expected_checksum: Option<&str>,
+) -> Result<ContextItem, StoreReadFailure> {
+    let bytes = tokio::fs::read(file_path(dir, item_id))
+        .await
+        .map_err(classify_read_io)?;
+    decode_item(item_id, &bytes, expected_checksum)
+}
+
+fn classify_read_io(error: std::io::Error) -> StoreReadFailure {
+    if error.kind() == std::io::ErrorKind::NotFound {
+        StoreReadFailure::Missing
+    } else {
+        StoreReadFailure::IoFailed
+    }
+}
+
+fn decode_item(
+    expected_id: ContextItemId,
+    bytes: &[u8],
+    expected_checksum: Option<&str>,
+) -> Result<ContextItem, StoreReadFailure> {
+    if expected_checksum.is_some_and(|expected| checksum_hex(bytes) != expected) {
+        return Err(StoreReadFailure::Corrupt);
+    }
+    let item: ContextItem = serde_json::from_slice(bytes).map_err(|_| StoreReadFailure::Corrupt)?;
+    if item.id != expected_id {
+        return Err(StoreReadFailure::Corrupt);
+    }
+    Ok(item)
 }
 
 /// Deterministic catalog search — no vectors. Candidate generation prefers

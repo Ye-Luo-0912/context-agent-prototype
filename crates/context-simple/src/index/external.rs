@@ -24,7 +24,7 @@ use std::collections::{HashMap, HashSet};
 
 use serde::{Deserialize, Serialize};
 
-use agent_contracts::{ContextItemId, ContextResidency, ExternalizedContext};
+use agent_contracts::{ContextItemId, ContextResidency, ContextRetention, ExternalizedContext};
 
 #[derive(Debug, Default)]
 pub(crate) struct ExternalMap {
@@ -33,6 +33,9 @@ pub(crate) struct ExternalMap {
     id_index: HashMap<ContextItemId, usize>,
     /// entity -> ids, insertion order = externalization order.
     entity_index: HashMap<String, Vec<ContextItemId>>,
+    /// Pinned entries are rare but mandatory materialization must not scan a
+    /// store whose size grows with task history to find them.
+    pinned_ids: Vec<ContextItemId>,
     /// Expected `self.entries.len()`; a mismatch means the map changed
     /// without the index and a rebuild is required before use.
     map_len: usize,
@@ -61,6 +64,9 @@ impl ExternalMap {
                 .entry(entity.clone())
                 .or_default()
                 .push(entry.item_id);
+        }
+        if entry.retention == ContextRetention::Pinned {
+            self.pinned_ids.push(entry.item_id);
         }
         let (cold, external) = Self::residency_delta(&entry);
         self.cold_entries = self.cold_entries.saturating_add(cold);
@@ -182,6 +188,7 @@ impl ExternalMap {
         self.catalog_dirty.clear();
         self.id_index.clear();
         self.entity_index.clear();
+        self.pinned_ids.clear();
         self.map_len = 0;
         std::mem::take(&mut self.entries)
     }
@@ -203,8 +210,8 @@ impl ExternalMap {
     }
 
     /// O(1) mutable lookup for *non-indexed* fields only (access stamps,
-    /// residency aging). Mutating `item_id` or `entities` through this
-    /// handle would silently desync the indexes.
+    /// residency aging). Mutating `item_id`, `entities` or `retention`
+    /// through this handle would silently desync the indexes.
     pub(crate) fn get_mut(&mut self, id: ContextItemId) -> Option<&mut ExternalizedContext> {
         self.id_index
             .get(&id)
@@ -233,6 +240,10 @@ impl ExternalMap {
             .unwrap_or_default()
     }
 
+    pub(crate) fn pinned_ids(&self) -> &[ContextItemId] {
+        &self.pinned_ids
+    }
+
     /// Safety net for direct pushes that bypassed the map (tests): rebuild
     /// when the map length no longer matches the indexed length. Field
     /// edits to indexed dimensions (`entities`, `item_id`) are caught by
@@ -259,6 +270,7 @@ impl ExternalMap {
     fn rebuild_indexes(&mut self) {
         self.id_index.clear();
         self.entity_index.clear();
+        self.pinned_ids.clear();
         self.cold_entries = 0;
         self.external_entries = 0;
         for (slot, entry) in self.entries.iter().enumerate() {
@@ -268,6 +280,9 @@ impl ExternalMap {
                     .entry(entity.clone())
                     .or_default()
                     .push(entry.item_id);
+            }
+            if entry.retention == ContextRetention::Pinned {
+                self.pinned_ids.push(entry.item_id);
             }
             let (cold, external) = Self::residency_delta(entry);
             self.cold_entries = self.cold_entries.saturating_add(cold);

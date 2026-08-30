@@ -1,8 +1,8 @@
 //! Generic retry/backoff wrapper for any `ModelTransport`.
 //!
-//! Only errors marked retryable (`AgentError::Transport { retryable: true }`,
-//! i.e. network failures, timeouts, 5xx, 429, and gateway-wrapped upstream
-//! 400 `Upstream request failed`) are retried. Auth errors and genuine
+//! Only typed retryable transport errors (network failures, timeouts, 5xx,
+//! 429, and gateway-wrapped upstream 400 `Upstream request failed`) are
+//! retried. Auth errors, malformed provider protocol, and genuine
 //! provider-level rejections fail immediately. The backoff yields to the
 //! request's cancellation token, so a cancelled request aborts instead of
 //! sleeping out the wait.
@@ -12,19 +12,101 @@
 //! retry would duplicate the live output. The wrapper tracks emission and
 //! surfaces the error instead of retrying in that case.
 
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::Duration;
+use std::sync::{
+    Arc,
+    atomic::{AtomicBool, AtomicU64, Ordering},
+};
+use std::time::{Duration, SystemTime};
 
 use agent_contracts::{
     AgentError, AgentResult, CancellationToken, ModelCapabilities, ModelChunk, ModelEventSink,
-    ModelOutput, ModelRequest, ModelTransport,
+    ModelOutput, ModelProtocolErrorKind, ModelRequest, ModelTransport, RetryAfterMillis,
 };
 use async_trait::async_trait;
+
+const DEFAULT_MAX_RETRY_DELAY: Duration = Duration::from_secs(60);
+const MAX_BUFFERED_STREAM_CHUNKS: usize = 16_384;
+type JitterFn = dyn Fn(Duration, u32) -> Duration + Send + Sync;
+
+struct RetrySchedule {
+    base_delay: Duration,
+    max_delay: Duration,
+    jitter: Arc<JitterFn>,
+}
+
+impl RetrySchedule {
+    fn new(base_delay: Duration) -> Self {
+        Self {
+            base_delay,
+            max_delay: DEFAULT_MAX_RETRY_DELAY,
+            jitter: Arc::new(default_jitter),
+        }
+    }
+
+    fn delay(&self, retry_number: u32, error: &AgentError) -> Duration {
+        let exponent = retry_number.saturating_sub(1);
+        let multiplier = 1u32.checked_shl(exponent).unwrap_or(u32::MAX);
+        let exponential = self
+            .base_delay
+            .checked_mul(multiplier)
+            .unwrap_or(self.max_delay)
+            .min(self.max_delay);
+        let jittered = (self.jitter)(exponential, retry_number).min(self.max_delay);
+        let retry_after = match error {
+            AgentError::TransportRetryAfter { retry_after_ms, .. } => {
+                Duration::from_millis(u64::from(retry_after_ms.get())).min(self.max_delay)
+            }
+            _ => Duration::ZERO,
+        };
+        jittered.max(retry_after)
+    }
+}
+
+// Equal jitter avoids synchronized retries while preserving half of the
+// exponential delay. Tests inject a deterministic function through
+// `with_jitter`, so timing assertions never depend on this process-wide state.
+fn default_jitter(delay: Duration, retry_number: u32) -> Duration {
+    static STATE: AtomicU64 = AtomicU64::new(0x9e37_79b9_7f4a_7c15);
+    if delay.is_zero() {
+        return delay;
+    }
+    let clock_bits = SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos()
+        .min(u64::MAX as u128) as u64;
+    let mut sample = STATE.fetch_add(0x9e37_79b9_7f4a_7c15, Ordering::Relaxed)
+        ^ u64::from(retry_number)
+        ^ clock_bits;
+    sample ^= sample >> 30;
+    sample = sample.wrapping_mul(0xbf58_476d_1ce4_e5b9);
+    sample ^= sample >> 27;
+    sample = sample.wrapping_mul(0x94d0_49bb_1331_11eb);
+    sample ^= sample >> 31;
+
+    let floor = delay / 2;
+    let span_nanos = (delay - floor).as_nanos().min(u64::MAX as u128) as u64;
+    let extra_nanos = sample % span_nanos.saturating_add(1);
+    floor
+        .checked_add(Duration::from_nanos(extra_nanos))
+        .unwrap_or(delay)
+        .min(delay)
+}
+
+fn retryable(error: &AgentError) -> bool {
+    matches!(
+        error,
+        AgentError::Transport {
+            retryable: true,
+            ..
+        } | AgentError::TransportRetryAfter { .. }
+    )
+}
 
 pub struct RetryingTransport<T: ModelTransport> {
     inner: T,
     max_attempts: u32,
-    base_delay: Duration,
+    schedule: RetrySchedule,
     /// Whole-response buffering mode: chunks are collected internally and
     /// only forwarded to the real sink after a successful attempt, so a
     /// retryable mid-stream failure can replay from scratch. Harnesses
@@ -38,7 +120,7 @@ impl<T: ModelTransport> RetryingTransport<T> {
         Self {
             inner,
             max_attempts: max_attempts.max(1),
-            base_delay,
+            schedule: RetrySchedule::new(base_delay),
             buffering: false,
         }
     }
@@ -50,9 +132,28 @@ impl<T: ModelTransport> RetryingTransport<T> {
         Self {
             inner,
             max_attempts: max_attempts.max(1),
-            base_delay,
+            schedule: RetrySchedule::new(base_delay),
             buffering: true,
         }
+    }
+
+    /// Cap every computed or provider-requested delay. The hard protocol
+    /// bound still applies if a caller supplies a larger value.
+    pub fn with_max_delay(mut self, max_delay: Duration) -> Self {
+        let hard_max = Duration::from_millis(u64::from(RetryAfterMillis::MAX_MILLIS));
+        self.schedule.max_delay = max_delay.min(hard_max);
+        self
+    }
+
+    /// Inject a bounded jitter transform. The result is always clamped to
+    /// `max_delay`; deterministic closures make retry schedules exact in
+    /// tests and controlled experiments.
+    pub fn with_jitter<J>(mut self, jitter: J) -> Self
+    where
+        J: Fn(Duration, u32) -> Duration + Send + Sync + 'static,
+    {
+        self.schedule.jitter = Arc::new(jitter);
+        self
     }
 }
 
@@ -79,7 +180,7 @@ impl<T: ModelTransport> ModelTransport for RetryingTransport<T> {
 
     async fn complete(&self, request: ModelRequest) -> AgentResult<ModelOutput> {
         let (mut output, attempts) =
-            retry(self.max_attempts, self.base_delay, &request.cancel, || {
+            retry(self.max_attempts, &self.schedule, &request.cancel, || {
                 self.inner.complete(request.clone())
             })
             .await?;
@@ -118,19 +219,12 @@ impl<T: ModelTransport> RetryingTransport<T> {
             };
             match self.inner.complete_stream(request.clone(), &tracking).await {
                 Ok(mut output) => {
-                    stamp_attempt_usage(&mut output, attempt + 1);
+                    stamp_attempt_usage(&mut output, attempt.saturating_add(1));
                     return Ok(output);
                 }
                 Err(error) => {
-                    let retryable = matches!(
-                        &error,
-                        AgentError::Transport {
-                            retryable: true,
-                            ..
-                        }
-                    );
-                    if attempt + 1 >= self.max_attempts
-                        || !retryable
+                    if attempt.saturating_add(1) >= self.max_attempts
+                        || !retryable(&error)
                         || emitted.load(Ordering::Relaxed)
                     {
                         // A stream that already emitted deltas cannot be
@@ -138,10 +232,10 @@ impl<T: ModelTransport> RetryingTransport<T> {
                         // no rewind, and a retry would duplicate the output.
                         return Err(error);
                     }
-                    attempt += 1;
-                    let delay = self.base_delay * 2u32.pow(attempt.saturating_sub(1));
+                    attempt = attempt.saturating_add(1);
+                    let delay = self.schedule.delay(attempt, &error);
                     sink.on_chunk(ModelChunk::Retrying {
-                        attempt: attempt + 1,
+                        attempt: attempt.saturating_add(1),
                         delay_ms: delay.as_millis().min(u64::MAX as u128) as u64,
                     })
                     .await?;
@@ -171,27 +265,20 @@ impl<T: ModelTransport> RetryingTransport<T> {
                 .await
             {
                 Ok(mut output) => {
-                    for chunk in collected.take() {
+                    for chunk in collected.take()? {
                         sink.on_chunk(chunk).await?;
                     }
-                    stamp_attempt_usage(&mut output, attempt + 1);
+                    stamp_attempt_usage(&mut output, attempt.saturating_add(1));
                     return Ok(output);
                 }
                 Err(error) => {
-                    let retryable = matches!(
-                        &error,
-                        AgentError::Transport {
-                            retryable: true,
-                            ..
-                        }
-                    );
-                    if attempt + 1 >= self.max_attempts || !retryable {
+                    if attempt.saturating_add(1) >= self.max_attempts || !retryable(&error) {
                         return Err(error);
                     }
-                    attempt += 1;
-                    let delay = self.base_delay * 2u32.pow(attempt.saturating_sub(1));
+                    attempt = attempt.saturating_add(1);
+                    let delay = self.schedule.delay(attempt, &error);
                     sink.on_chunk(ModelChunk::Retrying {
-                        attempt: attempt + 1,
+                        attempt: attempt.saturating_add(1),
                         delay_ms: delay.as_millis().min(u64::MAX as u128) as u64,
                     })
                     .await?;
@@ -205,27 +292,91 @@ impl<T: ModelTransport> RetryingTransport<T> {
     }
 }
 
-/// Collects one attempt's chunks for the buffering mode. Chunks are bounded
-/// upstream by the provider's byte cap, so this stays memory-bounded.
-#[derive(Default)]
+/// Collects one attempt's chunks for the buffering mode. The wrapper is
+/// generic, so it enforces its own chunk and resident-byte limits instead of
+/// assuming that every inner transport has an equivalent stream boundary.
 struct BufferedSink {
-    chunks: std::sync::Mutex<Vec<ModelChunk>>,
+    state: std::sync::Mutex<BufferedState>,
+    max_chunks: usize,
+    max_bytes: usize,
+}
+
+#[derive(Default)]
+struct BufferedState {
+    chunks: Vec<ModelChunk>,
+    bytes: usize,
+    limit_error: Option<String>,
+}
+
+impl Default for BufferedSink {
+    fn default() -> Self {
+        Self::with_limits(MAX_BUFFERED_STREAM_CHUNKS, crate::DEFAULT_MAX_STREAM_BYTES)
+    }
 }
 
 impl BufferedSink {
-    fn take(&self) -> Vec<ModelChunk> {
-        std::mem::take(&mut *self.chunks.lock().expect("buffered sink poisoned"))
+    fn with_limits(max_chunks: usize, max_bytes: usize) -> Self {
+        Self {
+            state: std::sync::Mutex::new(BufferedState::default()),
+            max_chunks,
+            max_bytes,
+        }
+    }
+
+    fn take(&self) -> AgentResult<Vec<ModelChunk>> {
+        let mut state = self.state.lock().expect("buffered sink poisoned");
+        if let Some(message) = &state.limit_error {
+            return Err(buffer_limit_error(message.clone()));
+        }
+        Ok(std::mem::take(&mut state.chunks))
     }
 }
 
 #[async_trait]
 impl ModelEventSink for BufferedSink {
     async fn on_chunk(&self, chunk: ModelChunk) -> AgentResult<()> {
-        self.chunks
-            .lock()
-            .expect("buffered sink poisoned")
-            .push(chunk);
+        let chunk_bytes = buffered_chunk_bytes(&chunk);
+        let mut state = self.state.lock().expect("buffered sink poisoned");
+        if let Some(message) = &state.limit_error {
+            return Err(buffer_limit_error(message.clone()));
+        }
+        let next_chunks = state.chunks.len().saturating_add(1);
+        let next_bytes = state.bytes.saturating_add(chunk_bytes);
+        if next_chunks > self.max_chunks || next_bytes > self.max_bytes {
+            let message = format!(
+                "buffered model stream exceeded its limits (chunks {next_chunks}/{}, bytes {next_bytes}/{})",
+                self.max_chunks, self.max_bytes
+            );
+            state.limit_error = Some(message.clone());
+            return Err(buffer_limit_error(message));
+        }
+        state.bytes = next_bytes;
+        state.chunks.push(chunk);
         Ok(())
+    }
+}
+
+fn buffered_chunk_bytes(chunk: &ModelChunk) -> usize {
+    let inline = std::mem::size_of::<ModelChunk>();
+    let dynamic = match chunk {
+        ModelChunk::TextDelta { delta } => delta.capacity(),
+        ModelChunk::ToolCallDelta {
+            call_id,
+            name,
+            arguments_delta,
+        } => call_id
+            .capacity()
+            .saturating_add(name.as_ref().map_or(0, String::capacity))
+            .saturating_add(arguments_delta.capacity()),
+        ModelChunk::Retrying { .. } | ModelChunk::Done => 0,
+    };
+    inline.saturating_add(dynamic)
+}
+
+fn buffer_limit_error(message: String) -> AgentError {
+    AgentError::ModelProtocol {
+        kind: ModelProtocolErrorKind::MalformedEvent,
+        message,
     }
 }
 
@@ -236,7 +387,7 @@ fn stamp_attempt_usage(output: &mut ModelOutput, attempts: u32) {
 
 async fn retry<T, F, Fut>(
     max_attempts: u32,
-    base_delay: Duration,
+    schedule: &RetrySchedule,
     cancel: &CancellationToken,
     mut op: F,
 ) -> AgentResult<(T, u32)>
@@ -247,22 +398,13 @@ where
     let mut attempt = 0u32;
     loop {
         match op().await {
-            Ok(value) => return Ok((value, attempt + 1)),
+            Ok(value) => return Ok((value, attempt.saturating_add(1))),
             Err(error) => {
-                if attempt + 1 >= max_attempts
-                    || !matches!(
-                        &error,
-                        AgentError::Transport {
-                            retryable: true,
-                            ..
-                        }
-                    )
-                {
+                if attempt.saturating_add(1) >= max_attempts || !retryable(&error) {
                     return Err(error);
                 }
-                attempt += 1;
-                // Exponential backoff with jitter-free doubling: 1x, 2x, 4x, ...
-                let delay = base_delay * 2u32.pow(attempt.saturating_sub(1));
+                attempt = attempt.saturating_add(1);
+                let delay = schedule.delay(attempt, &error);
                 tokio::select! {
                     _ = cancel.cancelled() => return Err(AgentError::Cancelled),
                     _ = tokio::time::sleep(delay) => {}
@@ -275,7 +417,7 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use agent_contracts::{ModelOutput, ModelUsage};
+    use agent_contracts::{ModelOutput, ModelProtocolErrorKind, ModelUsage};
     use serde_json::json;
     use std::sync::{
         Arc,
@@ -544,7 +686,8 @@ mod tests {
         let inner = FlakyStream {
             calls: calls.clone(),
         };
-        let transport = RetryingTransport::new(inner, 5, Duration::from_millis(1));
+        let transport = RetryingTransport::new(inner, 5, Duration::from_millis(1))
+            .with_jitter(|delay, _| delay);
         let sink = RecordingSink::default();
 
         let output = transport.complete_stream(request(), &sink).await.unwrap();
@@ -579,7 +722,8 @@ mod tests {
             calls: calls.clone(),
             retryable: true,
         };
-        let transport = RetryingTransport::new_buffering(inner, 5, Duration::from_millis(1));
+        let transport = RetryingTransport::new_buffering(inner, 5, Duration::from_millis(1))
+            .with_jitter(|delay, _| delay);
         let sink = RecordingSink::default();
 
         let output = transport.complete_stream(request(), &sink).await.unwrap();
@@ -642,7 +786,8 @@ mod tests {
         let inner = AlwaysFailingStream {
             calls: calls.clone(),
         };
-        let transport = RetryingTransport::new_buffering(inner, 3, Duration::from_millis(1));
+        let transport = RetryingTransport::new_buffering(inner, 3, Duration::from_millis(1))
+            .with_jitter(|delay, _| delay);
         let sink = RecordingSink::default();
 
         let error = transport
@@ -704,6 +849,84 @@ mod tests {
             matches!(result, Err(AgentError::Cancelled)),
             "a cancelled request must not sleep out the backoff, got: {result:?}"
         );
+    }
+
+    #[test]
+    fn backoff_is_checked_capped_and_deterministically_jitterable() {
+        let mut schedule = RetrySchedule::new(Duration::from_secs(2));
+        schedule.max_delay = Duration::from_secs(7);
+        schedule.jitter = Arc::new(|delay, _| delay / 2);
+        let error = AgentError::Transport {
+            retryable: true,
+            message: "transient".into(),
+        };
+
+        assert_eq!(schedule.delay(2, &error), Duration::from_secs(2));
+        assert_eq!(
+            schedule.delay(u32::MAX, &error),
+            Duration::from_millis(3_500),
+            "a huge exponent saturates at the cap before jitter instead of overflowing"
+        );
+    }
+
+    #[test]
+    fn retry_after_is_a_bounded_floor_for_the_schedule() {
+        let mut schedule = RetrySchedule::new(Duration::from_millis(10));
+        schedule.max_delay = Duration::from_secs(5);
+        schedule.jitter = Arc::new(|delay, _| delay);
+        let error = AgentError::TransportRetryAfter {
+            retry_after_ms: RetryAfterMillis::new_saturating(50_000),
+            message: "rate limited".into(),
+        };
+
+        assert_eq!(schedule.delay(1, &error), Duration::from_secs(5));
+        assert!(retryable(&error));
+    }
+
+    #[test]
+    fn protocol_damage_is_never_retried() {
+        let error = AgentError::ModelProtocol {
+            kind: ModelProtocolErrorKind::MalformedEvent,
+            message: "damaged SSE JSON".into(),
+        };
+        assert!(!retryable(&error));
+    }
+
+    #[tokio::test]
+    async fn buffered_sink_enforces_a_sticky_chunk_limit() {
+        let sink = BufferedSink::with_limits(1, usize::MAX);
+        sink.on_chunk(ModelChunk::Done).await.unwrap();
+        let error = sink.on_chunk(ModelChunk::Done).await.unwrap_err();
+        assert!(matches!(
+            error,
+            AgentError::ModelProtocol {
+                kind: ModelProtocolErrorKind::MalformedEvent,
+                ..
+            }
+        ));
+        assert!(
+            sink.take().is_err(),
+            "a transport that ignores the sink refusal cannot publish the bounded prefix"
+        );
+    }
+
+    #[tokio::test]
+    async fn buffered_sink_enforces_a_resident_byte_limit() {
+        let sink = BufferedSink::with_limits(8, std::mem::size_of::<ModelChunk>() + 8);
+        let error = sink
+            .on_chunk(ModelChunk::TextDelta {
+                delta: "x".repeat(64),
+            })
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            AgentError::ModelProtocol {
+                kind: ModelProtocolErrorKind::MalformedEvent,
+                ..
+            }
+        ));
+        assert!(error.to_string().contains("bytes"));
     }
 
     #[tokio::test]

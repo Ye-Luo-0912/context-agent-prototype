@@ -60,11 +60,11 @@ impl RuntimeActor {
     /// a surface mutation raced the capture, so the whole assembly retries
     /// against one stable generation instead of shipping a torn view.
     /// A terminal override freezes the prospective post-completion task
-    /// plane (active cleared, the completing task Completed) while every
-    /// live value stays untouched.
+    /// plane together with the already-prepared post-completion context
+    /// plane and its next focus revision.
     async fn assemble_checkpoint(
         &self,
-        terminal_tasks_override: Option<crate::checkpoint::TaskManagerSnapshot>,
+        terminal_override: Option<(crate::checkpoint::TaskManagerSnapshot, u64)>,
     ) -> AgentResult<RuntimeCheckpoint> {
         let registry = self.services.capability_registry();
         let mut last_error: Option<AgentError> = None;
@@ -83,11 +83,12 @@ impl RuntimeActor {
                 let capability_generation = registry
                     .map(|registry| registry.generation())
                     .unwrap_or_default();
-                let (tasks_snapshot, current_task_id) = match &terminal_tasks_override {
-                    Some(tasks) => (tasks.clone(), None),
+                let (tasks_snapshot, current_task_id, focus_revision) = match &terminal_override {
+                    Some((tasks, focus_revision)) => (tasks.clone(), None, *focus_revision),
                     None => (
                         crate::checkpoint::TaskManagerSnapshot::from_manager(&self.state.tasks),
                         self.state.task_id,
+                        self.state.focus_revision,
                     ),
                 };
                 return Ok(RuntimeCheckpoint {
@@ -98,13 +99,15 @@ impl RuntimeActor {
                     },
                     tasks: tasks_snapshot,
                     current_task_id,
-                    focus_revision: self.state.focus_revision,
+                    focus_revision,
                     last_surface_revision: self.state.last_surface_revision,
                     context,
                     capabilities,
                     authority,
                     snapshot_sequence: self.state.snapshot_sequence,
                     capability_generation,
+                    event_cover_seq: self.core.event_sequence(),
+                    terminal_commit: terminal_override.is_some(),
                 });
             }
             // A capability surface mutation landed between the two planes;
@@ -421,9 +424,10 @@ impl RuntimeActor {
     pub(super) async fn freeze_and_acknowledge_terminal(
         &mut self,
         record: crate::task::CompletionRecord,
-    ) -> Result<bool, AgentError> {
-        // `Ok(true)` = the exact terminal shape is durably acknowledged;
-        // `Ok(false)` = this composition has no checkpoint store at all, so
+        terminal_focus_revision: u64,
+    ) -> Result<Option<u64>, AgentError> {
+        // `Ok(Some(sequence))` = the exact terminal shape is durably
+        // acknowledged; `Ok(None)` = this composition has no checkpoint store, so
         // there is nothing to make resumable and the caller completes
         // in-memory behind one explicit warning. Only `Err` fences.
         let Some(store) = self.checkpoint_store() else {
@@ -433,7 +437,7 @@ impl RuntimeActor {
                     reason: Self::checkpoint_store_missing_error().to_string(),
                 })
                 .await;
-            return Ok(false);
+            return Ok(None);
         };
         self.await_pending_checkpoint().await?;
         let Some(terminal_tasks) =
@@ -450,33 +454,44 @@ impl RuntimeActor {
             .checked_add(1)
             .expect("snapshot sequence cannot overflow within any realistic run");
         let sequence = self.state.snapshot_sequence;
+        let prior_required_sequence = self.state.required_sequence;
         self.state.required_sequence =
             Some(self.state.required_sequence.unwrap_or(0).max(sequence));
         // Completion resolves every obligation by definition: whatever
         // debt survived to this point is retired with the terminal freeze,
         // not deferred.
-        std::mem::take(&mut self.state.checkpoint_debt);
+        let prior_debt = std::mem::take(&mut self.state.checkpoint_debt);
         let anchor = self.current_anchor_revision();
 
-        let snapshot = match self.assemble_checkpoint(Some(terminal_tasks)).await {
+        let snapshot = match self
+            .assemble_checkpoint(Some((terminal_tasks, terminal_focus_revision)))
+            .await
+        {
             Ok(snapshot) => snapshot,
             Err(error) => {
+                self.state.checkpoint_debt = prior_debt;
+                self.state.required_sequence = prior_required_sequence;
                 self.emit_checkpoint_write_failed(error.to_string()).await;
-                return Err(AgentError::RecoveryRequired(
-                    "the terminal checkpoint could not be assembled; the task stays \
-                     completion-pending"
-                        .into(),
-                ));
+                return Err(error);
             }
         };
         if let Err(error) = snapshot.validate() {
+            self.state.checkpoint_debt = prior_debt;
+            self.state.required_sequence = prior_required_sequence;
             return Err(AgentError::InvalidRequest(format!(
                 "the terminal checkpoint is internally inconsistent; nothing was committed: {error}"
             )));
         }
-        let bytes = serde_json::to_vec(&snapshot).map_err(|error| {
-            AgentError::Internal(format!("terminal checkpoint serialization failed: {error}"))
-        })?;
+        let bytes = match serde_json::to_vec(&snapshot) {
+            Ok(bytes) => bytes,
+            Err(error) => {
+                self.state.checkpoint_debt = prior_debt;
+                self.state.required_sequence = prior_required_sequence;
+                return Err(AgentError::Internal(format!(
+                    "terminal checkpoint serialization failed: {error}"
+                )));
+            }
+        };
         let in_flight_handle = tokio::spawn(async move {
             store
                 .write_atomic(&bytes)
@@ -505,11 +520,13 @@ impl RuntimeActor {
                         capability_generation: snapshot.capability_generation,
                     })
                     .await;
-                Ok(true)
+                Ok(Some(acked_sequence))
             }
             Err(error) => {
+                self.state.checkpoint_debt = prior_debt;
+                self.state.required_sequence = prior_required_sequence;
                 self.emit_checkpoint_write_failed(error.to_string()).await;
-                Err(AgentError::RecoveryRequired(format!(
+                Err(AgentError::Storage(format!(
                     "the terminal checkpoint never landed durably ({error}); the task stays \
                      completion-pending and the completion intent stays retryable"
                 )))

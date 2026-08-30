@@ -3,7 +3,9 @@
 //! Kept free of I/O so the mapping from wire chunks to `ModelChunk` events is
 //! unit-testable without a network.
 
-use agent_contracts::{ModelChunk, ModelUsage, ToolCall};
+use agent_contracts::{
+    AgentError, AgentResult, ModelChunk, ModelProtocolErrorKind, ModelUsage, ToolCall,
+};
 use serde::Deserialize;
 use serde_json::Value;
 
@@ -77,6 +79,39 @@ pub struct WireUsage {
 #[derive(Debug, Deserialize)]
 pub struct WirePromptTokensDetails {
     pub cached_tokens: Option<u64>,
+}
+
+/// Parse one Chat Completions SSE payload.
+///
+/// A syntactically valid object that does not carry any Chat Completions
+/// fields is an extension event and may be ignored. Once an event claims a
+/// known field, however, it must satisfy that field's wire shape. This keeps
+/// forward compatibility without turning damaged response bytes into a
+/// partial success.
+pub fn parse_wire_chunk(payload: &str) -> AgentResult<Option<WireChunk>> {
+    let value: Value =
+        serde_json::from_str(payload).map_err(|error| AgentError::ModelProtocol {
+            kind: ModelProtocolErrorKind::MalformedEvent,
+            message: format!("malformed Chat Completions SSE JSON: {error}"),
+        })?;
+    let Some(object) = value.as_object() else {
+        return Err(AgentError::ModelProtocol {
+            kind: ModelProtocolErrorKind::MalformedEvent,
+            message: "Chat Completions SSE data must be a JSON object".into(),
+        });
+    };
+    if !["choices", "usage", "error"]
+        .iter()
+        .any(|field| object.contains_key(*field))
+    {
+        return Ok(None);
+    }
+    serde_json::from_value(value)
+        .map(Some)
+        .map_err(|error| AgentError::ModelProtocol {
+            kind: ModelProtocolErrorKind::MalformedEvent,
+            message: format!("invalid Chat Completions SSE event shape: {error}"),
+        })
 }
 
 #[derive(Debug, Default)]
@@ -183,21 +218,29 @@ impl StreamAccumulator {
         self.terminal_error.take()
     }
 
-    /// Finalize into (content, tool_calls). Malformed tool-call argument JSON
-    /// degrades to `null` rather than failing the whole turn.
-    pub fn finalize(self) -> (String, Vec<ToolCall>) {
+    /// Finalize into `(content, tool_calls)` and fail closed when a streamed
+    /// function-call argument never became complete JSON.
+    pub fn finalize(self) -> AgentResult<(String, Vec<ToolCall>)> {
         let mut tool_calls = Vec::new();
         for slot in self.tool_calls {
             let id = slot.id.unwrap_or_else(|| format!("call-{}", slot.index));
             let name = slot.name.unwrap_or_default();
-            let arguments: Value = serde_json::from_str(&slot.arguments).unwrap_or(Value::Null);
+            let arguments: Value = serde_json::from_str(&slot.arguments).map_err(|error| {
+                AgentError::ModelProtocol {
+                    kind: ModelProtocolErrorKind::MalformedToolCall,
+                    message: format!(
+                        "Chat Completions tool call at index {} has incomplete or invalid arguments: {error}",
+                        slot.index
+                    ),
+                }
+            })?;
             tool_calls.push(ToolCall {
                 id,
                 name,
                 arguments,
             });
         }
-        (self.content, tool_calls)
+        Ok((self.content, tool_calls))
     }
 }
 
@@ -268,7 +311,7 @@ mod tests {
             }]
         );
 
-        let (content, calls) = acc.finalize();
+        let (content, calls) = acc.finalize().unwrap();
         assert_eq!(content, "Hello");
         assert_eq!(calls.len(), 1);
         assert_eq!(calls[0].id, "call_1");
@@ -294,16 +337,48 @@ mod tests {
     }
 
     #[test]
-    fn malformed_tool_arguments_degrade_to_null() {
+    fn malformed_tool_arguments_fail_closed() {
         let mut acc = StreamAccumulator::default();
         let chunk: WireChunk = serde_json::from_str(
             r#"{"choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"c","function":{"name":"fs.read","arguments":"not json"}}]}}]}"#,
         )
         .unwrap();
         acc.apply(&chunk);
-        let (_, calls) = acc.finalize();
-        assert_eq!(calls[0].name, "fs.read");
-        assert_eq!(calls[0].arguments, serde_json::Value::Null);
+        let error = acc.finalize().unwrap_err();
+        assert!(matches!(
+            error,
+            AgentError::ModelProtocol {
+                kind: ModelProtocolErrorKind::MalformedToolCall,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn malformed_data_and_known_shapes_fail_but_extensions_are_ignored() {
+        let error = parse_wire_chunk(r#"{"choices": [}"#).unwrap_err();
+        assert!(matches!(
+            error,
+            AgentError::ModelProtocol {
+                kind: ModelProtocolErrorKind::MalformedEvent,
+                ..
+            }
+        ));
+
+        let error = parse_wire_chunk(r#"{"choices":"not-an-array"}"#).unwrap_err();
+        assert!(matches!(
+            error,
+            AgentError::ModelProtocol {
+                kind: ModelProtocolErrorKind::MalformedEvent,
+                ..
+            }
+        ));
+
+        assert!(
+            parse_wire_chunk(r#"{"type":"provider.keepalive","sequence":7}"#)
+                .unwrap()
+                .is_none()
+        );
     }
 
     #[test]

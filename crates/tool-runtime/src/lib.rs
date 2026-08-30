@@ -11,5 +11,6 @@ pub use host_policies::{BUILTIN_TOOL_POLICIES, BuiltinToolPolicies};
 pub use registry::{BuiltinToolDispatcher, ToolLifecycleConfig};
 pub use tools::{ShellDialect, ShellKind};
 pub use verification::{
-    MAX_VERIFICATION_RECIPES, VERIFY_RUN_TOOL_NAME, VerificationRecipe, VerificationRecipes,
+    MAX_VERIFICATION_RECIPES, VERIFY_RUN_TOOL_NAME, VerificationCoverageDomain, VerificationRecipe,
+    VerificationRecipes,
 };

@@ -1503,6 +1503,12 @@ impl ToolDispatcher for CapabilityAwareDispatcher {
         self.base.verification_equivalent(left, right)
     }
 
+    fn verification_coverage_declarations(
+        &self,
+    ) -> Vec<agent_contracts::VerificationCoverageDeclaration> {
+        self.base.verification_coverage_declarations()
+    }
+
     async fn execute(&self, request: ToolExecutionRequest) -> AgentResult<ToolOutcome> {
         request.validate().map_err(AgentError::InvalidRequest)?;
         let name = request.call.name.clone();

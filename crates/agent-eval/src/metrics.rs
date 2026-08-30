@@ -10,14 +10,54 @@
 
 use agent_contracts::{
     CAPABILITY_MANAGE, CONTEXT_MANAGE, ContextItemId, FS_READ_MOTIVE_KEY, FrontierDelta,
-    FsReadMotive, MutationFootprint, RuntimeEvent, RuntimeEventEnvelope, ToolSurfaceOrigin,
+    FsReadMotive, InputKind, MutationFootprint, RuntimeCommitKind, RuntimeEvent,
+    RuntimeEventEnvelope, ToolSurfaceOrigin,
 };
+use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap, HashSet};
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum RecoverPath {
     Search,
     Reactivate,
+}
+
+/// Why a settlement episode stopped accepting work. The enum keeps the
+/// evidence vocabulary bounded; free-form event text is never promoted into
+/// a terminal identity. `TraceEnded` means the captured event stream ended
+/// before Runtime emitted another semantic boundary.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SettlementEpisodeTerminal {
+    Reopened,
+    TaskCompleted,
+    TurnCompleted,
+    TurnCancelled,
+    TurnCommitFailed,
+    CompletionCommitFailed,
+    RecoveryRequired,
+    RunCompleted,
+    NewUserBoundary,
+    TaskContinuationBoundary,
+    TraceEnded,
+}
+
+impl SettlementEpisodeTerminal {
+    pub fn id(self) -> &'static str {
+        match self {
+            Self::Reopened => "reopened",
+            Self::TaskCompleted => "task_completed",
+            Self::TurnCompleted => "turn_completed",
+            Self::TurnCancelled => "turn_cancelled",
+            Self::TurnCommitFailed => "turn_commit_failed",
+            Self::CompletionCommitFailed => "completion_commit_failed",
+            Self::RecoveryRequired => "recovery_required",
+            Self::RunCompleted => "run_completed",
+            Self::NewUserBoundary => "new_user_boundary",
+            Self::TaskContinuationBoundary => "task_continuation_boundary",
+            Self::TraceEnded => "trace_ended",
+        }
+    }
 }
 
 /// Deterministic per-run measurements aggregated from the event stream.
@@ -88,6 +128,9 @@ pub struct RunMetrics {
     pub settlement_episode_rounds: u64,
     pub settlement_episode_calls: u64,
     pub settlement_episode_failures: u64,
+    /// One terminal mechanism per entered episode. Keys are a fixed enum and
+    /// therefore cannot grow with model- or provider-authored strings.
+    pub settlement_episode_terminals: BTreeMap<SettlementEpisodeTerminal, u64>,
     /// 任务结果前沿的影子账本。现有 Evidence
     /// Frontier 回答“是否获得了新的 current 证据”；这一组指标
     /// 只回答“任务结果是否前进”，不参与实时决策。
@@ -397,11 +440,6 @@ pub fn aggregate_metrics(events: &[RuntimeEventEnvelope]) -> RunMetrics {
     // 因此用有界在途 id 集合避免重复计数。
     let mut catalog_optional_round: Option<CatalogOptionalRound> = None;
     let mut open_optional_calls: HashSet<String> = HashSet::new();
-    // 结算 episode 会计：SettledCandidate 进入即开一笔（该标签事件
-    // 由 Runtime 在变化时发布），离开即关；episode 内轮/调用/失败归
-    // 该 episode，重开后的 phase-two 工作只进 whole-cell 总数。
-    let mut in_settlement_episode = false;
-
     for envelope in events {
         match &envelope.event {
             RuntimeEvent::UserMessageAccepted { input } if input.is_applied() => {
@@ -416,9 +454,6 @@ pub fn aggregate_metrics(events: &[RuntimeEventEnvelope]) -> RunMetrics {
             }
             RuntimeEvent::ToolStarted { call } => {
                 metrics.tool_calls += 1;
-                if in_settlement_episode {
-                    metrics.settlement_episode_calls += 1;
-                }
                 note_catalog_optional_request(
                     &mut metrics,
                     catalog_optional_round.as_mut(),
@@ -527,9 +562,6 @@ pub fn aggregate_metrics(events: &[RuntimeEventEnvelope]) -> RunMetrics {
                 }
                 if !output.ok {
                     metrics.failed_tool_outputs += 1;
-                    if in_settlement_episode {
-                        metrics.settlement_episode_failures += 1;
-                    }
                 }
                 if output.tool_name == "fs.read"
                     && let Some(motive) = output
@@ -704,7 +736,6 @@ pub fn aggregate_metrics(events: &[RuntimeEventEnvelope]) -> RunMetrics {
                 delta,
                 actions_since_frontier_advance,
                 invalidated,
-                settlement,
                 ..
             } => {
                 // 收敛指标：可证明推进数、冗余证据调用、
@@ -722,19 +753,6 @@ pub fn aggregate_metrics(events: &[RuntimeEventEnvelope]) -> RunMetrics {
                     .frontier_no_advance_peak
                     .max(u64::from(*actions_since_frontier_advance));
                 metrics.evidence_invalidations += *invalidated;
-                match settlement {
-                    Some(agent_contracts::SettlementLabel::SettledCandidate) => {
-                        metrics.settled_seen = true;
-                        if !in_settlement_episode {
-                            in_settlement_episode = true;
-                            metrics.settlement_episodes += 1;
-                        }
-                    }
-                    // 离开 candidate 的第一个过渡（重开）关闭当前
-                    // episode：后续 phase-two 工作只进 whole-cell。
-                    Some(_) => in_settlement_episode = false,
-                    None => {}
-                }
             }
             RuntimeEvent::ExecutionBatchSettled {
                 requested,
@@ -826,7 +844,8 @@ pub fn aggregate_metrics(events: &[RuntimeEventEnvelope]) -> RunMetrics {
                     agent_contracts::ObligationEventKind::Resolved => {
                         metrics.obligation_resolved += 1;
                     }
-                    agent_contracts::ObligationEventKind::Dropped => {}
+                    agent_contracts::ObligationEventKind::Dropped
+                    | agent_contracts::ObligationEventKind::Overflowed => {}
                 }
                 metrics.max_obligation_attempts_per_epoch = metrics
                     .max_obligation_attempts_per_epoch
@@ -869,6 +888,10 @@ pub fn aggregate_metrics(events: &[RuntimeEventEnvelope]) -> RunMetrics {
                     }
                 }
             },
+            RuntimeEvent::AcceptanceReceiptsRecorded { .. } => {
+                // Receipt counts are derivable from the bounded event rows;
+                // no existing convergence metric aliases them to PASS reuse.
+            }
             RuntimeEvent::ContextMaintained { report, .. } => {
                 metrics.lifecycle_transitions += report.transitions.len() as u64;
                 snapshot_access(&mut metrics, &report.diagnostics);
@@ -928,9 +951,6 @@ pub fn aggregate_metrics(events: &[RuntimeEventEnvelope]) -> RunMetrics {
             RuntimeEvent::ToolSurfacePlanned { report } => {
                 finish_catalog_optional_round(&mut metrics, &mut catalog_optional_round);
                 metrics.rounds += 1;
-                if in_settlement_episode {
-                    metrics.settlement_episode_rounds += 1;
-                }
                 current_turn_rounds = current_turn_rounds.saturating_add(1);
                 metrics.schema_tokens_total += report.selected_schema_tokens as u64;
                 if report.selected_total > report.selected.len() {
@@ -1082,8 +1102,6 @@ pub fn aggregate_metrics(events: &[RuntimeEventEnvelope]) -> RunMetrics {
                 metrics.outcome_frontier_advances =
                     metrics.outcome_frontier_advances.saturating_add(1);
                 results_without_outcome_advance = 0;
-                // Terminal outcome closes any open settlement episode.
-                in_settlement_episode = false;
             }
             RuntimeEvent::TurnCompleted => {
                 finish_catalog_optional_round(&mut metrics, &mut catalog_optional_round);
@@ -1092,6 +1110,16 @@ pub fn aggregate_metrics(events: &[RuntimeEventEnvelope]) -> RunMetrics {
         }
     }
     finish_catalog_optional_round(&mut metrics, &mut catalog_optional_round);
+    // Keep one episode state machine authoritative for both the compact run
+    // totals and the detailed tail report. A second pass is cheap in the eval
+    // path and prevents boundary handling from drifting between reports.
+    let episode_profile = settlement_episode_profile(events);
+    metrics.settled_seen = episode_profile.first_settled_at_seq.is_some();
+    metrics.settlement_episodes = episode_profile.episodes;
+    metrics.settlement_episode_rounds = episode_profile.episode_rounds;
+    metrics.settlement_episode_calls = episode_profile.episode_tool_calls.values().copied().sum();
+    metrics.settlement_episode_failures = episode_profile.episode_failures;
+    metrics.settlement_episode_terminals = episode_profile.episode_terminals;
     if !materialize_ms_samples.is_empty() {
         materialize_ms_samples.sort_unstable();
         metrics.materialize_ms_p50 = percentile(&materialize_ms_samples, 50);
@@ -1147,12 +1175,17 @@ pub fn aggregate_metrics(events: &[RuntimeEventEnvelope]) -> RunMetrics {
 
 /// Episode-sliced settlement accounting over one event stream, the same
 /// stream as [`aggregate_metrics`]. An episode opens at the first (or a
-/// repeated) `SettledCandidate` frontier label and closes on the first
-/// reopening transition or a terminal `TaskCompleted`; only work inside an
-/// episode is charged to it, so phase-two work after a reopen is never
-/// billed to an earlier candidate episode. With no settled event the
-/// profile is empty and `first_settled_at_seq` is `None` (the same
-/// zero-exposure rule as the gate runner).
+/// repeated) `SettledCandidate` frontier label and closes on the first typed
+/// runtime boundary: reopening, task completion, ordinary turn completion,
+/// a typed turn/runtime terminal, new user input, or task continuation.
+/// `TurnCompleted` is held pending because model-authored `task.complete`
+/// commits its turn first and then emits the task-completion transaction; a
+/// following `TaskCompleted` or task-completion barrier upgrades the same
+/// episode terminal. A next-round/input boundary or trace end instead
+/// settles that pending terminal as `TurnCompleted`. Only typed failure
+/// events receive typed failure labels; a raw provider/runtime failure with
+/// no terminal boundary remains `TraceEnded`. With no settled event the
+/// profile is empty and `first_settled_at_seq` is `None`.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct SettlementEpisodeProfile {
     /// Sequence of the first settled frontier event, when any.
@@ -1169,14 +1202,63 @@ pub struct SettlementEpisodeProfile {
     /// Failed `ToolFinished` outputs inside episodes.
     pub episode_failures: u64,
     pub episode_failed_tools: BTreeMap<String, u64>,
+    /// Exactly one bounded terminal mechanism for every entered episode.
+    pub episode_terminals: BTreeMap<SettlementEpisodeTerminal, u64>,
 }
 
 pub fn settlement_episode_profile(events: &[RuntimeEventEnvelope]) -> SettlementEpisodeProfile {
     let mut profile = SettlementEpisodeProfile::default();
     let mut in_episode = false;
+    let mut pending_turn_completion = false;
+
+    fn close(
+        profile: &mut SettlementEpisodeProfile,
+        in_episode: &mut bool,
+        terminal: SettlementEpisodeTerminal,
+    ) {
+        if std::mem::replace(in_episode, false) {
+            *profile.episode_terminals.entry(terminal).or_insert(0) += 1;
+        }
+    }
+
     for envelope in events {
+        // A committed turn may be immediately followed by the deferred
+        // task-completion transaction. Do not close it before that chain has
+        // a chance to publish its stronger terminal. A new execution/input
+        // boundary proves no such upgrade belongs to the preceding turn.
+        let next_applied_input = matches!(
+            &envelope.event,
+            RuntimeEvent::UserMessageAccepted { input } if input.is_applied()
+        );
+        let next_execution_boundary = matches!(
+            &envelope.event,
+            RuntimeEvent::TaskContinuationStarted { .. }
+                | RuntimeEvent::RunStarted
+                | RuntimeEvent::ToolSurfacePlanned { .. }
+                | RuntimeEvent::ModelStarted { .. }
+                | RuntimeEvent::ExecutionFrontier { .. }
+                | RuntimeEvent::TurnCompleted
+        );
+        if pending_turn_completion && (next_applied_input || next_execution_boundary) {
+            close(
+                &mut profile,
+                &mut in_episode,
+                SettlementEpisodeTerminal::TurnCompleted,
+            );
+            pending_turn_completion = false;
+        }
         match &envelope.event {
-            RuntimeEvent::ExecutionFrontier { settlement, delta, .. } => {
+            RuntimeEvent::UserMessageAccepted { input } if input.is_applied() => {
+                let terminal = if input.kind == InputKind::TaskContinuation {
+                    SettlementEpisodeTerminal::TaskContinuationBoundary
+                } else {
+                    SettlementEpisodeTerminal::NewUserBoundary
+                };
+                close(&mut profile, &mut in_episode, terminal);
+            }
+            RuntimeEvent::ExecutionFrontier {
+                settlement, delta, ..
+            } => {
                 match settlement {
                     Some(agent_contracts::SettlementLabel::SettledCandidate) => {
                         profile.first_settled_at_seq.get_or_insert(envelope.seq);
@@ -1186,7 +1268,11 @@ pub fn settlement_episode_profile(events: &[RuntimeEventEnvelope]) -> Settlement
                         }
                     }
                     // 重开过渡关闭当前 episode；它的 delta 属 phase-two。
-                    Some(_) => in_episode = false,
+                    Some(_) => close(
+                        &mut profile,
+                        &mut in_episode,
+                        SettlementEpisodeTerminal::Reopened,
+                    ),
                     None => {}
                 }
                 if in_episode {
@@ -1215,10 +1301,81 @@ pub fn settlement_episode_profile(events: &[RuntimeEventEnvelope]) -> Settlement
                         .or_insert(0) += 1;
                 }
             }
-            RuntimeEvent::TaskCompleted { .. } => in_episode = false,
+            RuntimeEvent::TaskCompleted { .. }
+            | RuntimeEvent::RuntimeCommitBarrier {
+                kind: RuntimeCommitKind::TaskCompletion,
+                ..
+            } => {
+                close(
+                    &mut profile,
+                    &mut in_episode,
+                    SettlementEpisodeTerminal::TaskCompleted,
+                );
+                pending_turn_completion = false;
+            }
+            // Older traces may carry the typed continuation event without
+            // the applied input envelope. The first of the two closes the
+            // episode; the second is a no-op.
+            RuntimeEvent::TaskContinuationStarted { .. } => close(
+                &mut profile,
+                &mut in_episode,
+                SettlementEpisodeTerminal::TaskContinuationBoundary,
+            ),
+            RuntimeEvent::TurnCompleted => {
+                pending_turn_completion = in_episode;
+            }
+            RuntimeEvent::TurnCancelled { .. } => {
+                close(
+                    &mut profile,
+                    &mut in_episode,
+                    SettlementEpisodeTerminal::TurnCancelled,
+                );
+                pending_turn_completion = false;
+            }
+            RuntimeEvent::TurnCommitFailed { .. } => {
+                close(
+                    &mut profile,
+                    &mut in_episode,
+                    SettlementEpisodeTerminal::TurnCommitFailed,
+                );
+                pending_turn_completion = false;
+            }
+            RuntimeEvent::CompletionCommitFailed { .. } => {
+                close(
+                    &mut profile,
+                    &mut in_episode,
+                    SettlementEpisodeTerminal::CompletionCommitFailed,
+                );
+                pending_turn_completion = false;
+            }
+            RuntimeEvent::RecoveryRequired => {
+                close(
+                    &mut profile,
+                    &mut in_episode,
+                    SettlementEpisodeTerminal::RecoveryRequired,
+                );
+                pending_turn_completion = false;
+            }
+            RuntimeEvent::RunCompleted => {
+                close(
+                    &mut profile,
+                    &mut in_episode,
+                    SettlementEpisodeTerminal::RunCompleted,
+                );
+                pending_turn_completion = false;
+            }
             _ => {}
         }
     }
+    close(
+        &mut profile,
+        &mut in_episode,
+        if pending_turn_completion {
+            SettlementEpisodeTerminal::TurnCompleted
+        } else {
+            SettlementEpisodeTerminal::TraceEnded
+        },
+    );
     profile
 }
 
@@ -1544,7 +1701,7 @@ pub fn render_metrics(metrics: &RunMetrics) -> String {
          negative_facts: recorded={} reused={} invalidated={} promoted={} resolved={}\n\
          verification_passes: recorded={} reused={}\n\
          turn_tail: max_rounds={} p95_rounds={}\n\
-         settlement: seen={} episodes={} episode_rounds={} episode_calls={} episode_failures={}\n",
+         settlement: seen={} episodes={} episode_rounds={} episode_calls={} episode_failures={} terminals={:?}\n",
         metrics.model_input_tokens,
         metrics.model_output_tokens,
         metrics.model_cached_input_tokens,
@@ -1726,6 +1883,7 @@ pub fn render_metrics(metrics: &RunMetrics) -> String {
         metrics.settlement_episode_rounds,
         metrics.settlement_episode_calls,
         metrics.settlement_episode_failures,
+        metrics.settlement_episode_terminals,
     )
 }
 
@@ -1736,7 +1894,7 @@ mod tests {
         AttentionState, CompactionReason, ContextDiagnostics, ContextGcReport, ContextItemId,
         ContextKind, ContextMaintenanceReport, ContextMaintenanceTrigger, ContextScope,
         ContextSelection, ContextStateTransition, InputLifecycle, OperationId, PromptLayerCosts,
-        RunId, RuntimeInputEnvelope, SettlementLabel, ScoreBreakdown, TaskId, ToolLeaseBoundary,
+        RunId, RuntimeInputEnvelope, ScoreBreakdown, SettlementLabel, TaskId, ToolLeaseBoundary,
         ToolLeaseReconcileReport, ToolOutput, ToolSurfaceDemand, ToolSurfacePlanReport,
         ToolSurfacePlanStatus, ToolSurfaceSelection, ToolSurfaceSourceRevisions, TurnId,
     };
@@ -3001,7 +3159,9 @@ mod tests {
         assert_eq!(metrics.settlement_episode_calls, 1);
         assert_eq!(metrics.settlement_episode_failures, 0);
         let rendered = render_metrics(&metrics);
-        assert!(rendered.contains("settlement: seen=true episodes=1 episode_rounds=1 episode_calls=1 episode_failures=0"));
+        assert!(rendered.contains(
+            "settlement: seen=true episodes=1 episode_rounds=1 episode_calls=1 episode_failures=0"
+        ));
     }
 
     #[test]
@@ -3094,13 +3254,17 @@ mod tests {
                     },
                 },
             ),
-            envelope(run, 4, RuntimeEvent::ExecutionFrontier {
-                delta: FrontierDelta::NoProgress,
-                actions_since_frontier_advance: 0,
-                evidence_revision: 1,
-                invalidated: 0,
-                settlement: None,
-            }),
+            envelope(
+                run,
+                4,
+                RuntimeEvent::ExecutionFrontier {
+                    delta: FrontierDelta::NoProgress,
+                    actions_since_frontier_advance: 0,
+                    evidence_revision: 1,
+                    invalidated: 0,
+                    settlement: None,
+                },
+            ),
             envelope(
                 run,
                 5,
@@ -3116,13 +3280,17 @@ mod tests {
                     },
                 },
             ),
-            envelope(run, 6, RuntimeEvent::ExecutionFrontier {
-                delta: FrontierDelta::ObservedWorldChange,
-                actions_since_frontier_advance: 0,
-                evidence_revision: 2,
-                invalidated: 1,
-                settlement: None,
-            }),
+            envelope(
+                run,
+                6,
+                RuntimeEvent::ExecutionFrontier {
+                    delta: FrontierDelta::ObservedWorldChange,
+                    actions_since_frontier_advance: 0,
+                    evidence_revision: 2,
+                    invalidated: 1,
+                    settlement: None,
+                },
+            ),
             envelope(
                 run,
                 7,
@@ -3143,7 +3311,10 @@ mod tests {
         assert_eq!(profile.first_settled_at_seq, Some(2));
         assert_eq!(profile.episodes, 1);
         assert_eq!(profile.episode_failures, 1);
-        assert_eq!(profile.episode_rounds, 0, "no surface events inside the episode");
+        assert_eq!(
+            profile.episode_rounds, 0,
+            "no surface events inside the episode"
+        );
         assert_eq!(
             profile.episode_deltas,
             [
@@ -3181,5 +3352,241 @@ mod tests {
         assert_eq!(metrics.settlement_episodes, 1);
         assert_eq!(metrics.settlement_episode_rounds, 1);
         assert_eq!(metrics.settlement_episode_calls, 1);
+    }
+
+    #[test]
+    fn settlement_episodes_close_on_every_typed_runtime_boundary() {
+        let run = RunId::new();
+        let task_id = TaskId::new();
+        let continuation = RuntimeInputEnvelope::task_continuation(task_id, "same directive");
+        let reopened = RuntimeEvent::ExecutionFrontier {
+            delta: FrontierDelta::ObservedWorldChange,
+            actions_since_frontier_advance: 0,
+            evidence_revision: 2,
+            invalidated: 1,
+            settlement: Some(SettlementLabel::Working),
+        };
+        let events = vec![
+            envelope(run, 1, settled_frontier()),
+            envelope(run, 2, reopened),
+            envelope(run, 3, settled_frontier()),
+            envelope(
+                run,
+                4,
+                RuntimeEvent::TaskCompleted {
+                    task_id,
+                    anchor_revision: 1,
+                    summary: "done".into(),
+                },
+            ),
+            envelope(run, 5, settled_frontier()),
+            envelope(run, 6, RuntimeEvent::TurnCompleted),
+            envelope(run, 7, settled_frontier()),
+            envelope(run, 8, RuntimeEvent::user_message_accepted("next")),
+            envelope(run, 9, settled_frontier()),
+            envelope(
+                run,
+                10,
+                RuntimeEvent::UserMessageAccepted {
+                    input: continuation,
+                },
+            ),
+        ];
+
+        let profile = settlement_episode_profile(&events);
+        assert_eq!(profile.episodes, 5);
+        for terminal in [
+            SettlementEpisodeTerminal::Reopened,
+            SettlementEpisodeTerminal::TaskCompleted,
+            SettlementEpisodeTerminal::TurnCompleted,
+            SettlementEpisodeTerminal::NewUserBoundary,
+            SettlementEpisodeTerminal::TaskContinuationBoundary,
+        ] {
+            assert_eq!(profile.episode_terminals.get(&terminal), Some(&1));
+        }
+        assert_eq!(profile.episode_terminals.len(), 5);
+
+        let metrics = aggregate_metrics(&events);
+        assert_eq!(
+            metrics.settlement_episode_terminals,
+            profile.episode_terminals
+        );
+    }
+
+    #[test]
+    fn turn_completion_waits_for_the_deferred_task_completion_chain() {
+        let run = RunId::new();
+        let task_id = TaskId::new();
+        let events = vec![
+            envelope(run, 1, settled_frontier()),
+            envelope(run, 2, RuntimeEvent::TurnCompleted),
+            envelope(
+                run,
+                3,
+                RuntimeEvent::RuntimeCommitBarrier {
+                    kind: RuntimeCommitKind::Turn,
+                    checkpoint_sequence: None,
+                },
+            ),
+            envelope(
+                run,
+                4,
+                RuntimeEvent::TaskCompleted {
+                    task_id,
+                    anchor_revision: 1,
+                    summary: "done".into(),
+                },
+            ),
+            envelope(
+                run,
+                5,
+                RuntimeEvent::RuntimeCommitBarrier {
+                    kind: RuntimeCommitKind::TaskCompletion,
+                    checkpoint_sequence: Some(7),
+                },
+            ),
+        ];
+        let profile = settlement_episode_profile(&events);
+        assert_eq!(profile.episodes, 1);
+        assert_eq!(
+            profile
+                .episode_terminals
+                .get(&SettlementEpisodeTerminal::TaskCompleted),
+            Some(&1)
+        );
+        assert!(
+            !profile
+                .episode_terminals
+                .contains_key(&SettlementEpisodeTerminal::TurnCompleted)
+        );
+
+        let barrier_only = settlement_episode_profile(&[
+            envelope(run, 1, settled_frontier()),
+            envelope(run, 2, RuntimeEvent::TurnCompleted),
+            envelope(
+                run,
+                3,
+                RuntimeEvent::RuntimeCommitBarrier {
+                    kind: RuntimeCommitKind::Turn,
+                    checkpoint_sequence: None,
+                },
+            ),
+            envelope(
+                run,
+                4,
+                RuntimeEvent::RuntimeCommitBarrier {
+                    kind: RuntimeCommitKind::TaskCompletion,
+                    checkpoint_sequence: Some(8),
+                },
+            ),
+        ]);
+        assert_eq!(
+            barrier_only
+                .episode_terminals
+                .get(&SettlementEpisodeTerminal::TaskCompleted),
+            Some(&1),
+            "the durable task-completion marker is sufficient typed evidence"
+        );
+    }
+
+    #[test]
+    fn pending_turn_completion_closes_at_next_round_or_trace_end() {
+        let run = RunId::new();
+        let turn_id = TurnId::new();
+        let next_round = vec![
+            envelope(run, 1, settled_frontier()),
+            envelope(run, 2, RuntimeEvent::TurnCompleted),
+            envelope(
+                run,
+                3,
+                RuntimeEvent::RuntimeCommitBarrier {
+                    kind: RuntimeCommitKind::Turn,
+                    checkpoint_sequence: None,
+                },
+            ),
+            envelope(run, 4, planned_surface(turn_id, 1)),
+        ];
+        let profile = settlement_episode_profile(&next_round);
+        assert_eq!(
+            profile
+                .episode_terminals
+                .get(&SettlementEpisodeTerminal::TurnCompleted),
+            Some(&1)
+        );
+        assert_eq!(profile.episode_rounds, 0);
+
+        let trace_end = settlement_episode_profile(&[
+            envelope(run, 1, settled_frontier()),
+            envelope(run, 2, RuntimeEvent::TurnCompleted),
+        ]);
+        assert_eq!(
+            trace_end
+                .episode_terminals
+                .get(&SettlementEpisodeTerminal::TurnCompleted),
+            Some(&1)
+        );
+        assert!(
+            !trace_end
+                .episode_terminals
+                .contains_key(&SettlementEpisodeTerminal::TraceEnded)
+        );
+    }
+
+    #[test]
+    fn episode_uses_typed_failure_only_when_the_trace_has_one() {
+        let run = RunId::new();
+        let untyped = settlement_episode_profile(&[
+            envelope(run, 1, settled_frontier()),
+            envelope(
+                run,
+                2,
+                RuntimeEvent::Failure {
+                    class: agent_contracts::RuntimeFailureClass::ProviderTransport,
+                    retryable: true,
+                    message: "provider unavailable".into(),
+                },
+            ),
+        ]);
+        assert_eq!(
+            untyped
+                .episode_terminals
+                .get(&SettlementEpisodeTerminal::TraceEnded),
+            Some(&1),
+            "a failure observation is not itself a terminal boundary"
+        );
+
+        let task_id = TaskId::new();
+        let typed = settlement_episode_profile(&[
+            envelope(run, 1, settled_frontier()),
+            envelope(run, 2, RuntimeEvent::TurnCompleted),
+            envelope(
+                run,
+                3,
+                RuntimeEvent::CompletionCommitFailed {
+                    task_id,
+                    retryable: true,
+                    reason: "checkpoint failed".into(),
+                },
+            ),
+        ]);
+        assert_eq!(
+            typed
+                .episode_terminals
+                .get(&SettlementEpisodeTerminal::CompletionCommitFailed),
+            Some(&1)
+        );
+    }
+
+    #[test]
+    fn open_episode_records_trace_end_instead_of_an_untyped_reason() {
+        let run = RunId::new();
+        let profile = settlement_episode_profile(&[envelope(run, 1, settled_frontier())]);
+        assert_eq!(profile.episodes, 1);
+        assert_eq!(
+            profile
+                .episode_terminals
+                .get(&SettlementEpisodeTerminal::TraceEnded),
+            Some(&1)
+        );
     }
 }

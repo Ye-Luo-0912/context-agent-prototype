@@ -428,7 +428,15 @@ fn close_members(
         let from = entry.attention;
         entry.scope = parent_scope;
         entry.scope_id = parent_id;
-        entry.retention = ContextRetention::Durable;
+        // Mirror resident promotion: closing a scope may upgrade transient
+        // retention, but must never downgrade a Pin. The external map keeps
+        // a pinned-id index for bounded required-body planning.
+        if matches!(
+            entry.retention,
+            ContextRetention::Ephemeral | ContextRetention::Working
+        ) {
+            entry.retention = ContextRetention::Durable;
+        }
         entry.tags.push(Label::lifecycle(LifecycleLabel::Promoted));
         if entry.attention != AttentionState::Active {
             entry.attention = AttentionState::Active;

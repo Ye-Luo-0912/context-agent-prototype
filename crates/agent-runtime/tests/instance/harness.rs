@@ -87,6 +87,9 @@ impl ContextEngine for TestContextEngine {
             selected: Vec::new(),
             approx_tokens: 0,
             foreground: Vec::new(),
+            required_item_ids: Vec::new(),
+            required_misses: Default::default(),
+            optional_misses: Default::default(),
             diagnostics: ContextDiagnostics::default(),
         })
     }
@@ -142,6 +145,9 @@ impl ContextEngine for FailingCompleteEngine {
             selected: Vec::new(),
             approx_tokens: 0,
             foreground: Vec::new(),
+            required_item_ids: Vec::new(),
+            required_misses: Default::default(),
+            optional_misses: Default::default(),
             diagnostics: ContextDiagnostics::default(),
         })
     }
@@ -432,6 +438,7 @@ impl EventJournal for FailRestoreEventJournal {
 #[derive(Debug)]
 pub(crate) struct BlockingFirstRestoreJournal {
     pub(crate) restore_flushes: std::sync::atomic::AtomicUsize,
+    restore_pending: std::sync::atomic::AtomicBool,
     pub(crate) first_entered: Mutex<Option<tokio::sync::oneshot::Sender<()>>>,
     pub(crate) release_first: tokio::sync::Mutex<Option<tokio::sync::oneshot::Receiver<()>>>,
 }
@@ -443,6 +450,7 @@ impl BlockingFirstRestoreJournal {
     ) -> Self {
         Self {
             restore_flushes: std::sync::atomic::AtomicUsize::new(0),
+            restore_pending: std::sync::atomic::AtomicBool::new(false),
             first_entered: Mutex::new(Some(first_entered)),
             release_first: tokio::sync::Mutex::new(Some(release_first)),
         }
@@ -451,14 +459,19 @@ impl BlockingFirstRestoreJournal {
 
 #[async_trait::async_trait]
 impl EventJournal for BlockingFirstRestoreJournal {
-    async fn append(&self, _envelope: &RuntimeEventEnvelope) -> AgentResult<()> {
+    async fn append(&self, envelope: &RuntimeEventEnvelope) -> AgentResult<()> {
+        if matches!(envelope.event, RuntimeEvent::RuntimeRestored { .. }) {
+            self.restore_pending.store(true, Ordering::Release);
+        }
         Ok(())
     }
 
     async fn flush(&self) -> AgentResult<()> {
-        // `start()` only appends; the first flush therefore belongs to the
-        // first RuntimeRestored durability barrier.
-        if self.restore_flushes.fetch_add(1, Ordering::SeqCst) == 0 {
+        // Startup has its own durable format marker. Block only a flush whose
+        // batch actually appended RuntimeRestored, never the startup flush.
+        if self.restore_pending.swap(false, Ordering::AcqRel)
+            && self.restore_flushes.fetch_add(1, Ordering::SeqCst) == 0
+        {
             if let Some(entered) = self.first_entered.lock().unwrap().take() {
                 let _ = entered.send(());
             }

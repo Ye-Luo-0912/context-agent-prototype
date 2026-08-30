@@ -214,6 +214,7 @@ mod tests {
             next_action: String::new(),
             current_interpretation: "goal".into(),
             constraints: Vec::new(),
+            completion_policy: crate::task::TaskCompletionPolicy::OperatorClosureOnly,
             acceptance_criteria: if acceptance {
                 vec!["tests pass".into()]
             } else {

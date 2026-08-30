@@ -10,6 +10,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, ensure};
 use serde::{Deserialize, Serialize};
+use sha2::{Digest as _, Sha256};
 
 use crate::bundle::{CELL_SCHEMA, CellManifest, CellSummary};
 use crate::long_live::{
@@ -18,6 +19,26 @@ use crate::long_live::{
 };
 
 const WINDOW_SCHEMA: &str = "m15-window.v1";
+const FORMAL_CANDIDATE_ID: &str = "task-progress-settlement-v1";
+const FORMAL_TOOL_SURFACE: &str = "production";
+const REQUIRED_DIMENSION_IDENTITY_FIELDS: [&str; 16] = [
+    "candidate_id",
+    "source_tree_digest",
+    "fixture_sha256",
+    "repeat",
+    "tool_surface",
+    "surface_config_digest",
+    "prompt_config_digest",
+    "acceptance_domain",
+    "acceptance_declaration_revision",
+    "acceptance_source_digest",
+    "provider_config_digest",
+    "settlement_projection_diagnostics",
+    "completion_opportunity",
+    "recovery_surface",
+    "project_task_progress",
+    "project_settlement",
+];
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct WindowCellRef {
@@ -37,6 +58,18 @@ struct WindowManifest {
 struct Dimensions {
     schema: String,
     pack_id: String,
+    candidate_id: String,
+    source_tree_digest: Option<String>,
+    fixture_sha256: String,
+    repeat: u32,
+    tool_surface: String,
+    surface_config_digest: String,
+    prompt_config_digest: String,
+    acceptance_domain: Option<String>,
+    acceptance_declaration_revision: Option<u64>,
+    acceptance_source_digest: Option<String>,
+    provider_config_digest: String,
+    settlement_projection_diagnostics: bool,
     mode: PilotMode,
     acceptance_profile: AcceptanceProfile,
     verdict: CellVerdict,
@@ -61,6 +94,10 @@ struct Dimensions {
     runtime_error_class: Option<CellFailureClass>,
     #[serde(default)]
     runtime_error_retryable: bool,
+    completion_opportunity: String,
+    recovery_surface: String,
+    project_task_progress: bool,
+    project_settlement: bool,
 }
 
 #[derive(Debug)]
@@ -72,6 +109,7 @@ struct Cell {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct SharedIdentity {
+    candidate_id: String,
     git_head: Option<String>,
     source_tree_digest: Option<String>,
     model: Option<String>,
@@ -79,6 +117,22 @@ struct SharedIdentity {
     protocol: Option<String>,
     context_window: Option<String>,
     tool_surface: Option<String>,
+    provider_config_digest: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PackIdentity {
+    fixture_sha256: String,
+    surface_config_digest: String,
+    prompt_config_digest: String,
+    acceptance_authority: AcceptanceAuthorityIdentity,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct AcceptanceAuthorityIdentity {
+    domain: Option<String>,
+    declaration_revision: Option<u64>,
+    source_digest: Option<String>,
 }
 
 pub struct RenderedWindow {
@@ -186,7 +240,7 @@ pub fn render_window(window_dir: &Path) -> anyhow::Result<RenderedWindow> {
         );
         cells.push(Cell {
             manifest: read_json(&cell_dir.join("manifest.json"))?,
-            dimensions: read_json(&cell_dir.join("dimensions.json"))?,
+            dimensions: read_dimensions(&cell_dir.join("dimensions.json"))?,
             summary: read_json(&cell_dir.join("summary.json"))?,
         });
     }
@@ -200,6 +254,13 @@ fn validate_cells(manifest: &WindowManifest, cells: &[Cell]) -> anyhow::Result<(
     let mut keys = BTreeSet::new();
     let mut shared: Option<SharedIdentity> = None;
     let mut pack_digests = BTreeMap::<&str, &str>::new();
+    let mut pack_identities = BTreeMap::<&str, PackIdentity>::new();
+    let mut acceptance_authorities = BTreeMap::<&str, AcceptanceAuthorityIdentity>::new();
+    let expected_identities = manifest
+        .expected_packs
+        .iter()
+        .map(|pack_id| expected_pack_identity(pack_id).map(|identity| (pack_id.as_str(), identity)))
+        .collect::<anyhow::Result<BTreeMap<_, _>>>()?;
 
     for cell in cells {
         let dimensions = &cell.dimensions;
@@ -217,6 +278,9 @@ fn validate_cells(manifest: &WindowManifest, cells: &[Cell]) -> anyhow::Result<(
             expected_packs.contains(dimensions.pack_id.as_str()),
             "unexpected pack"
         );
+        let expected_identity = expected_identities
+            .get(dimensions.pack_id.as_str())
+            .context("missing frozen pack identity")?;
         ensure!(
             identity.fixture_id == dimensions.pack_id,
             "manifest pack mismatch"
@@ -242,6 +306,93 @@ fn validate_cells(manifest: &WindowManifest, cells: &[Cell]) -> anyhow::Result<(
             identity.repeat >= 1 && identity.repeat <= manifest.expected_repeats,
             "repeat out of range"
         );
+        ensure!(
+            dimensions.candidate_id == FORMAL_CANDIDATE_ID,
+            "formal cell candidate identity drift"
+        );
+        ensure!(
+            dimensions.source_tree_digest == identity.source_tree_digest,
+            "dimensions/manifest source identity mismatch"
+        );
+        ensure!(
+            dimensions.fixture_sha256 == identity.fixture_sha256,
+            "dimensions/manifest fixture identity mismatch"
+        );
+        ensure!(
+            dimensions.repeat == identity.repeat,
+            "dimensions/manifest repeat identity mismatch"
+        );
+        ensure!(
+            identity.tool_surface.as_deref() == Some(dimensions.tool_surface.as_str()),
+            "dimensions/manifest tool-surface identity mismatch"
+        );
+        ensure!(
+            dimensions.tool_surface == FORMAL_TOOL_SURFACE,
+            "formal cell used the wrong tool surface"
+        );
+        ensure!(
+            dimensions.fixture_sha256 == expected_identity.fixture_sha256,
+            "frozen fixture identity drift"
+        );
+        ensure!(
+            dimensions.surface_config_digest == expected_identity.surface_config_digest,
+            "tool-surface configuration identity drift"
+        );
+        ensure!(
+            dimensions.prompt_config_digest == expected_identity.prompt_config_digest,
+            "prompt configuration identity drift"
+        );
+        ensure!(
+            dimensions.provider_config_digest == provider_config_digest(identity)?,
+            "provider configuration identity drift"
+        );
+        ensure!(
+            dimensions.project_task_progress,
+            "formal M15 requires TaskProgress projection"
+        );
+        ensure!(
+            !dimensions.project_settlement,
+            "formal M15 must keep settlement projection off"
+        );
+        ensure!(
+            !dimensions.settlement_projection_diagnostics,
+            "formal M15 must keep settlement diagnostics off"
+        );
+        ensure!(
+            dimensions.completion_opportunity == "off" && dimensions.recovery_surface == "off",
+            "formal M15 advisory switches must remain off"
+        );
+        validate_acceptance_authority(dimensions, &expected_identity.acceptance_authority)?;
+        let acceptance = AcceptanceAuthorityIdentity {
+            domain: dimensions.acceptance_domain.clone(),
+            declaration_revision: dimensions.acceptance_declaration_revision,
+            source_digest: dimensions.acceptance_source_digest.clone(),
+        };
+        match acceptance_authorities.get(dimensions.pack_id.as_str()) {
+            Some(expected) => ensure!(
+                *expected == acceptance,
+                "acceptance authority drift within pack {}",
+                dimensions.pack_id
+            ),
+            None => {
+                acceptance_authorities.insert(&dimensions.pack_id, acceptance.clone());
+            }
+        }
+        let observed_pack_identity = PackIdentity {
+            fixture_sha256: dimensions.fixture_sha256.clone(),
+            surface_config_digest: dimensions.surface_config_digest.clone(),
+            prompt_config_digest: dimensions.prompt_config_digest.clone(),
+            acceptance_authority: acceptance,
+        };
+        match pack_identities.get(dimensions.pack_id.as_str()) {
+            Some(expected) => ensure!(
+                *expected == observed_pack_identity,
+                "pack configuration identity drift"
+            ),
+            None => {
+                pack_identities.insert(&dimensions.pack_id, observed_pack_identity);
+            }
+        }
         ensure!(
             keys.insert((
                 dimensions.pack_id.as_str(),
@@ -357,6 +508,7 @@ fn validate_cells(manifest: &WindowManifest, cells: &[Cell]) -> anyhow::Result<(
             }
         }
         let current = SharedIdentity {
+            candidate_id: dimensions.candidate_id.clone(),
             git_head: identity.git_head.clone(),
             source_tree_digest: identity.source_tree_digest.clone(),
             model: identity.openai_model.clone(),
@@ -364,6 +516,7 @@ fn validate_cells(manifest: &WindowManifest, cells: &[Cell]) -> anyhow::Result<(
             protocol: identity.openai_protocol.clone(),
             context_window: identity.openai_context_window.clone(),
             tool_surface: identity.tool_surface.clone(),
+            provider_config_digest: dimensions.provider_config_digest.clone(),
         };
         ensure!(
             current.git_head.as_deref().is_some_and(non_empty)
@@ -376,10 +529,14 @@ fn validate_cells(manifest: &WindowManifest, cells: &[Cell]) -> anyhow::Result<(
             "formal cell is missing source or serving identity"
         );
         ensure!(
+            current.source_tree_digest.as_deref().is_some_and(is_sha256),
+            "source-tree digest is missing or malformed"
+        );
+        ensure!(
             !current
                 .protocol
                 .as_deref()
-                .is_some_and(|protocol| protocol.eq_ignore_ascii_case("auto")),
+                .is_some_and(|protocol| protocol.trim().eq_ignore_ascii_case("auto")),
             "formal window cannot use auto protocol negotiation"
         );
         ensure!(
@@ -396,6 +553,11 @@ fn validate_cells(manifest: &WindowManifest, cells: &[Cell]) -> anyhow::Result<(
         "pack coverage mismatch"
     );
     ensure!(
+        pack_identities.len() == expected_packs.len()
+            && acceptance_authorities.len() == expected_packs.len(),
+        "pack identity coverage mismatch"
+    );
+    ensure!(
         pack_digests
             .values()
             .copied()
@@ -407,12 +569,125 @@ fn validate_cells(manifest: &WindowManifest, cells: &[Cell]) -> anyhow::Result<(
     Ok(())
 }
 
+fn expected_pack_identity(pack_id: &str) -> anyhow::Result<PackIdentity> {
+    let pack = match pack_id {
+        crate::m15_pack::RETRY_DIAG => crate::long_live::m15_diag_pack(),
+        crate::m15_pack::RETRY_MIGRATE => crate::long_live::m15_migrate_pack(),
+        "retry_policy_dev" => crate::long_live::retry_pack(),
+        _ => anyhow::bail!("unknown frozen pack {pack_id}"),
+    };
+    let fixture_sha256 = (pack.identity_sha256)();
+    let exact_recipe_inputs = (pack.exact_recipe_inputs)();
+    let surface_config_digest = serialized_digest(&serde_json::json!({
+        "profile": FORMAL_TOOL_SURFACE,
+        "recovery_surface": false,
+        "exact_recipe_inputs": exact_recipe_inputs,
+    }))?;
+    let directive_sha256 = format!("{:x}", Sha256::digest((pack.directive)().as_bytes()));
+    let prompt_config_digest = serialized_digest(&serde_json::json!({
+        "candidate": FORMAL_CANDIDATE_ID,
+        "directive_sha256": directive_sha256,
+        "acceptance_declaration": pack.acceptance_declaration,
+        "acceptance_domain": pack.acceptance_domain,
+        "acceptance_profile": AcceptanceProfile::M15V1.id(),
+        "completion_opportunity": false,
+        "project_task_progress": true,
+        "settlement_projection_diagnostics": false,
+    }))?;
+    let (_, authority) = crate::long_live::pack_verification_projection(&pack);
+    let acceptance_authority = AcceptanceAuthorityIdentity {
+        domain: pack.acceptance_domain.map(str::to_owned),
+        declaration_revision: authority
+            .as_ref()
+            .map(|declaration| declaration.declaration_revision),
+        source_digest: authority.map(|declaration| declaration.source_digest),
+    };
+    Ok(PackIdentity {
+        fixture_sha256,
+        surface_config_digest,
+        prompt_config_digest,
+        acceptance_authority,
+    })
+}
+
+fn provider_config_digest(manifest: &CellManifest) -> anyhow::Result<String> {
+    let model = manifest
+        .openai_model
+        .as_deref()
+        .filter(|value| non_empty(value))
+        .context("cell manifest is missing model identity")?;
+    let base_url = manifest
+        .openai_base_url
+        .as_deref()
+        .filter(|value| non_empty(value))
+        .context("cell manifest is missing provider base-url identity")?;
+    let protocol = manifest
+        .openai_protocol
+        .as_deref()
+        .filter(|value| non_empty(value))
+        .context("cell manifest is missing provider protocol identity")?;
+    let context_window = manifest
+        .openai_context_window
+        .as_deref()
+        .filter(|value| non_empty(value))
+        .context("cell manifest is missing provider context-window identity")?;
+    serialized_digest(&serde_json::json!({
+        "model": model,
+        "base_url": base_url,
+        "protocol": protocol,
+        "context_window": context_window,
+    }))
+}
+
+fn validate_acceptance_authority(
+    dimensions: &Dimensions,
+    expected: &AcceptanceAuthorityIdentity,
+) -> anyhow::Result<()> {
+    let observed = AcceptanceAuthorityIdentity {
+        domain: dimensions.acceptance_domain.clone(),
+        declaration_revision: dimensions.acceptance_declaration_revision,
+        source_digest: dimensions.acceptance_source_digest.clone(),
+    };
+    ensure!(
+        observed == *expected,
+        "acceptance authority identity drift for {}",
+        dimensions.pack_id
+    );
+    match expected.domain.as_deref() {
+        Some(_) => {
+            ensure!(
+                expected
+                    .declaration_revision
+                    .is_some_and(|revision| revision > 0),
+                "frozen acceptance declaration revision is invalid for {}",
+                dimensions.pack_id
+            );
+            ensure!(
+                expected.source_digest.as_deref().is_some_and(is_sha256),
+                "frozen acceptance source digest is malformed for {}",
+                dimensions.pack_id
+            );
+        }
+        None => ensure!(
+            expected.declaration_revision.is_none() && expected.source_digest.is_none(),
+            "frozen pack {} has a partial acceptance authority",
+            dimensions.pack_id
+        ),
+    }
+    Ok(())
+}
+
+fn serialized_digest(value: &impl Serialize) -> anyhow::Result<String> {
+    let bytes = serde_json::to_vec(value).context("serialize formal identity")?;
+    Ok(format!("{:x}", Sha256::digest(bytes)))
+}
+
 fn non_empty(value: &str) -> bool {
     !value.trim().is_empty()
 }
 
 fn is_sha256(value: &str) -> bool {
-    value.len() == 64 && value.bytes().all(|byte| byte.is_ascii_hexdigit())
+    value.parse::<agent_contracts::ContentDigest>().is_ok()
 }
 
 fn metric_u64(summary: &CellSummary, name: &str) -> anyhow::Result<u64> {
@@ -531,6 +806,27 @@ fn render_cells(cells: &[Cell]) -> RenderedWindow {
     }
 }
 
+fn read_dimensions(path: &Path) -> anyhow::Result<Dimensions> {
+    let bytes = std::fs::read(path).with_context(|| format!("read {}", path.display()))?;
+    let value: serde_json::Value =
+        serde_json::from_slice(&bytes).with_context(|| format!("decode {}", path.display()))?;
+    let object = value
+        .as_object()
+        .with_context(|| format!("{} must contain a JSON object", path.display()))?;
+    let missing: Vec<_> = REQUIRED_DIMENSION_IDENTITY_FIELDS
+        .iter()
+        .copied()
+        .filter(|field| !object.contains_key(*field))
+        .collect();
+    ensure!(
+        missing.is_empty(),
+        "{} is missing required v4 identity fields: {}",
+        path.display(),
+        missing.join(", ")
+    );
+    serde_json::from_value(value).with_context(|| format!("decode {}", path.display()))
+}
+
 fn read_json<T: for<'de> Deserialize<'de>>(path: &Path) -> anyhow::Result<T> {
     let bytes = std::fs::read(path).with_context(|| format!("read {}", path.display()))?;
     serde_json::from_slice(&bytes).with_context(|| format!("decode {}", path.display()))
@@ -573,6 +869,7 @@ mod tests {
             exact,
             false,
         );
+        let expected_identity = expected_pack_identity(pack).unwrap();
         let manifest = CellManifest {
             schema: crate::bundle::CELL_SCHEMA.into(),
             fixture_id: pack.into(),
@@ -581,11 +878,11 @@ mod tests {
             repeats: 2,
             live: true,
             tool_surface: Some("production".into()),
-            fixture_sha256: format!("{:064x}", pack.len()),
+            fixture_sha256: expected_identity.fixture_sha256.clone(),
             git_head: Some("head".into()),
             git_dirty: Some(false),
             git_dirty_sha256: Some("clean".into()),
-            source_tree_digest: Some("source".into()),
+            source_tree_digest: Some("1".repeat(64)),
             openai_model: Some("model".into()),
             openai_base_url: Some("provider".into()),
             openai_protocol: Some("responses".into()),
@@ -594,6 +891,20 @@ mod tests {
         let dimensions = Dimensions {
             schema: PILOT_SCHEMA.into(),
             pack_id: pack.into(),
+            candidate_id: FORMAL_CANDIDATE_ID.into(),
+            source_tree_digest: manifest.source_tree_digest.clone(),
+            fixture_sha256: manifest.fixture_sha256.clone(),
+            repeat,
+            tool_surface: FORMAL_TOOL_SURFACE.into(),
+            surface_config_digest: expected_identity.surface_config_digest,
+            prompt_config_digest: expected_identity.prompt_config_digest,
+            acceptance_domain: expected_identity.acceptance_authority.domain,
+            acceptance_declaration_revision: expected_identity
+                .acceptance_authority
+                .declaration_revision,
+            acceptance_source_digest: expected_identity.acceptance_authority.source_digest,
+            provider_config_digest: provider_config_digest(&manifest).unwrap(),
+            settlement_projection_diagnostics: false,
             mode,
             acceptance_profile: AcceptanceProfile::M15V1,
             verdict,
@@ -632,6 +943,10 @@ mod tests {
             runtime_error: failure.map(|_| "provider failed".into()),
             runtime_error_class: failure,
             runtime_error_retryable: failure == Some(CellFailureClass::ProviderTransport),
+            completion_opportunity: "off".into(),
+            recovery_surface: "off".into(),
+            project_task_progress: true,
+            project_settlement: false,
         };
         let summary = CellSummary {
             schema: CELL_SCHEMA.into(),
@@ -761,5 +1076,148 @@ mod tests {
         .err()
         .expect("summary drift must be rejected");
         assert!(error.to_string().contains("not contiguous"));
+    }
+
+    #[test]
+    fn report_rejects_acceptance_authority_drift_within_a_pack() {
+        let temp = tempfile::tempdir().unwrap();
+        let cells = full_window(temp.path(), false);
+        let cell = cells
+            .iter()
+            .find(|path| path.to_string_lossy().contains("retry_policy_dev"))
+            .unwrap();
+        let dimensions_path = cell.join("dimensions.json");
+        let mut dimensions: serde_json::Value = read_json(&dimensions_path).unwrap();
+        dimensions["acceptance_source_digest"] = serde_json::json!("b".repeat(64));
+        std::fs::write(
+            &dimensions_path,
+            serde_json::to_vec_pretty(&dimensions).unwrap(),
+        )
+        .unwrap();
+
+        let error = persist_window(
+            temp.path(),
+            &cells,
+            &M15_PACK_IDS,
+            crate::long_live::DEFAULT_REPEATS,
+        )
+        .err()
+        .expect("acceptance authority drift must be rejected");
+        assert!(
+            error
+                .to_string()
+                .contains("acceptance authority identity drift")
+        );
+    }
+
+    #[test]
+    fn report_rejects_formal_switch_drift() {
+        let temp = tempfile::tempdir().unwrap();
+        let cells = full_window(temp.path(), false);
+        let dimensions_path = cells[0].join("dimensions.json");
+        let mut dimensions: serde_json::Value = read_json(&dimensions_path).unwrap();
+        dimensions["project_settlement"] = serde_json::json!(true);
+        std::fs::write(
+            &dimensions_path,
+            serde_json::to_vec_pretty(&dimensions).unwrap(),
+        )
+        .unwrap();
+
+        let error = persist_window(
+            temp.path(),
+            &cells,
+            &M15_PACK_IDS,
+            crate::long_live::DEFAULT_REPEATS,
+        )
+        .err()
+        .expect("switch drift must be rejected");
+        assert!(error.to_string().contains("settlement projection off"));
+    }
+
+    #[test]
+    fn report_rejects_prompt_identity_drift() {
+        let temp = tempfile::tempdir().unwrap();
+        let cells = full_window(temp.path(), false);
+        let dimensions_path = cells[0].join("dimensions.json");
+        let mut dimensions: serde_json::Value = read_json(&dimensions_path).unwrap();
+        dimensions["prompt_config_digest"] = serde_json::json!("f".repeat(64));
+        std::fs::write(
+            &dimensions_path,
+            serde_json::to_vec_pretty(&dimensions).unwrap(),
+        )
+        .unwrap();
+
+        let error = persist_window(
+            temp.path(),
+            &cells,
+            &M15_PACK_IDS,
+            crate::long_live::DEFAULT_REPEATS,
+        )
+        .err()
+        .expect("prompt identity drift must be rejected");
+        assert!(
+            error
+                .to_string()
+                .contains("prompt configuration identity drift")
+        );
+    }
+
+    #[test]
+    fn report_rejects_whitespace_padded_auto_protocol() {
+        let temp = tempfile::tempdir().unwrap();
+        let cells = full_window(temp.path(), false);
+        let manifest_path = cells[0].join("manifest.json");
+        let dimensions_path = cells[0].join("dimensions.json");
+        let mut manifest: CellManifest = read_json(&manifest_path).unwrap();
+        manifest.openai_protocol = Some(" auto ".into());
+        let mut dimensions: Dimensions = read_json(&dimensions_path).unwrap();
+        dimensions.provider_config_digest = provider_config_digest(&manifest).unwrap();
+        std::fs::write(
+            &manifest_path,
+            serde_json::to_vec_pretty(&manifest).unwrap(),
+        )
+        .unwrap();
+        std::fs::write(
+            &dimensions_path,
+            serde_json::to_vec_pretty(&dimensions).unwrap(),
+        )
+        .unwrap();
+
+        let error = persist_window(
+            temp.path(),
+            &cells,
+            &M15_PACK_IDS,
+            crate::long_live::DEFAULT_REPEATS,
+        )
+        .err()
+        .expect("auto protocol must be rejected after trimming");
+        assert!(error.to_string().contains("auto protocol negotiation"));
+    }
+
+    #[test]
+    fn report_rejects_a_missing_nullable_identity_field() {
+        let temp = tempfile::tempdir().unwrap();
+        let cells = full_window(temp.path(), false);
+        let dimensions_path = cells[0].join("dimensions.json");
+        let mut dimensions: serde_json::Value = read_json(&dimensions_path).unwrap();
+        dimensions
+            .as_object_mut()
+            .unwrap()
+            .remove("acceptance_domain");
+        std::fs::write(
+            &dimensions_path,
+            serde_json::to_vec_pretty(&dimensions).unwrap(),
+        )
+        .unwrap();
+
+        let error = persist_window(
+            temp.path(),
+            &cells,
+            &M15_PACK_IDS,
+            crate::long_live::DEFAULT_REPEATS,
+        )
+        .err()
+        .expect("missing v4 identity must be rejected");
+        assert!(error.to_string().contains("missing required v4 identity"));
     }
 }

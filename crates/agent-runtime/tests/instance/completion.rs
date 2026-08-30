@@ -194,6 +194,21 @@ async fn completion_commits_a_typed_record_and_publishes_task_identity() {
         "auth refactor shipped"
     );
     assert_eq!(
+        checkpoint.tasks.completed[0].disposition,
+        agent_runtime::task::CompletionDisposition::OperatorOverride,
+        "an explicit operator completion must remain distinguishable from verified readiness"
+    );
+    assert!(
+        checkpoint.tasks.completed[0]
+            .unmet_reasons
+            .iter()
+            .any(|reason| matches!(
+                reason,
+                agent_runtime::task::CompletionBlocker::OperatorClosureOnly
+            )),
+        "the durable override must retain the task's actual completion-policy blocker"
+    );
+    assert_eq!(
         checkpoint.tasks.tasks[0].status,
         agent_runtime::TaskStatus::Completed
     );

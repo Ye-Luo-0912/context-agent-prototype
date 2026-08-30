@@ -41,6 +41,8 @@ impl RuntimeActor {
             version,
             snapshot_sequence: restored_snapshot_sequence,
             capability_generation: _,
+            event_cover_seq: _,
+            terminal_commit: _,
         } = checkpoint;
 
         let mut restored_requirement_high_water = self.state.task_requirement_high_water.clone();

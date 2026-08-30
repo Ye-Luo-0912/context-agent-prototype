@@ -374,7 +374,7 @@ pub(crate) async fn run_store_io(config: &SimpleContextConfig, plan: &mut GcPlan
         });
     }
     while let Some(joined) = reads.join_next().await {
-        if let Ok((_item_id, Some(item))) = joined {
+        if let Ok((_item_id, Ok(item))) = joined {
             io.recalled.push(item);
         }
     }

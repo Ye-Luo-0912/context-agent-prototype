@@ -45,7 +45,8 @@ new ----> │ Active │  decay ------> │ Cooling │
 - `Turn`: normally valid through the current tool/model turn.
 - `Task`: belongs to the active task.
 - `Session`: can survive task transitions.
-- `Pinned`: explicitly forced into the working set.
+- `Pinned`: explicitly prioritized for the working set; if its body cannot fit
+  the hard frame bound, materialization records an explicit required miss.
 
 ### Retention
 
@@ -451,7 +452,8 @@ available across retries.
 ### Decision and constraint promotion
 
 - decisions: tagged + importance 0.72 (see above);
-- constraints (pins): unchanged — `Pinned` retention, always selected.
+- constraints (pins): unchanged — `Pinned` retention, selected first when it
+  fits and otherwise reported as a required budget miss.
 
 These rules are configurable and can be switched off for comparison:
 `SimpleContextConfig { supersession, error_verification }` (default on);
@@ -907,6 +909,35 @@ projected claim carries `anchor_revision`, `source_field_id`, and a
 `anchor_root_protections`. The completion boundary force-clears the
 projection, so a finished task's records stop being rooted.
 
+Mandatory materialization is an explicit result, not an assumption.
+`MaterializedContext` carries the ids of required bodies plus two separately
+bounded miss ledgers: `required_misses` and `optional_misses`. Store reads
+distinguish `Missing`, checksum/shape `Corrupt`, and `IoFailed`; Runtime final
+packing adds `BudgetExcluded` when provider rendering pressure displaces a
+body. Pinned and `PromptRequired` bodies enter the required ledger whether
+they originate Resident, Warm or Cold. Optional misses remain observational.
+Runtime validates the bounds, emits one bounded `ContextDegraded` event, and
+feeds only the required count into the shared completion decision. The final
+packer removes optional bodies first; if the hard provider window still
+forces a required removal, completion fails closed for that exact frame. Cold
+reread does not promote residency merely because the body was rendered.
+
+Required overlay is transactional per body. It first plans the smallest
+largest-first optional displacement that would satisfy both token and item
+bounds, without changing the materialized frame. Only a feasible plan commits
+those removals and inserts the required body. An oversized or otherwise
+impossible required body records `BudgetExcluded` and leaves every already
+visible optional/required item untouched; sequential required bodies each get
+the same atomic decision.
+
+Runtime retains the latest final-packed required-miss count under
+`(task_id, normalized PromptRequired-root digest)`. Receipt/progress-only anchor
+CAS movement preserves the observation; a real required-root change makes
+readiness unknown and fail-closed until another materialization. Restore
+likewise requires rematerialization before model completion when prompt-required
+roots exist. This is bounded actor state, not Context authority or transcript
+history.
+
 The same materialize request also carries a bounded `TaskAnchorView` on
 `ContextHints.task` for engine-internal root policy. The assembler renders Focus (`TASK ORIGIN` / `PERSISTENT TASK STATE` /
 `CURRENT DIRECTIVE`) and TaskProgress from the runtime `TaskManager`; production
@@ -956,7 +987,7 @@ counts come from `ContextGc` events. Context V1 still does not enable
 P3/P4 by default. Do not add further Context heuristics. Production
 `ToolLifecycleConfig::default()` always-loads `fs.list` / `fs.read` /
 `fs.write` / `search.grep` / `artifact.read` / `edit.patch` / `git.status` /
-`git.diff` / `capability.manage`; when
+`git.diff` / `task.complete` / `capability.manage`; when
 bounded host recipes exist, the compact
 `verify.run { recipe_id }` schema is also required and cannot be silently
 omitted. Shell / `edit.replace` / `context.manage` and plugin tools are
@@ -966,10 +997,11 @@ compare now reuses production
 `ToolLifecycleConfig::default()`. Runtime PreferSurfaces `context.manage`
 when Warm/Cold/Stored catalog entries or TaskAnchor `evidence_refs`
 exist (NeedEvidence / EXTERNAL CONTEXT); otherwise it stays catalog-only
-and loads through `capability.manage`. `task.complete` is likewise
-catalog-only during ordinary turns: Runtime leases it for explicit task-close
-intent or a task-owned requirement, and deliberate model discovery remains
-available. A normal final response closes only the turn, preserving the
+and loads through `capability.manage`. `task.complete` is compact and always
+visible in the current production surface, but visibility is not completion
+authority: the shared Runtime readiness decision may refuse it, and an
+accepted result remains `pending_terminal_commit` until the turn barrier and
+terminal checkpoint transaction succeed. A normal final response closes only the turn, preserving the
 multi-turn task scope and its bounded TaskProgress. The
 landed Verify slice is a host-recipe selector, not a
 `verify.run(command)` rename of `shell.exec`; general project runners stay
@@ -1406,7 +1438,7 @@ Consequences:
 Persisting the turn is not best-effort cleanup: `finalize_turn` walks
 `Running → ModelFinished → Committing → Committed`, and every mandatory
 write (observation ingest, `AfterTool`/`AfterModel` maintenance, the full
-GC, and their journal events) must succeed before `TurnCompleted` is
+GC, and their journal events) must succeed before the terminal event batch is
 emitted. On the first failure the commit aborts and the runtime journals
 `TurnCommitFailed { phase, message }` + `RecoveryRequired` — the model
 answered, but the context frame was not durably updated. This is what makes
@@ -1414,11 +1446,12 @@ the long-term record trustworthy: "the model said X" and "the context frame
 reflects X" can only diverge when an explicit recovery-required signal says
 so, never silently.
 
-`TurnCompleted` itself is published through the kernel's `emit_event_durable`
-path: append to the event journal, then flush it, then broadcast. Because
-the journal channel is FIFO, a successful flush is an OS-level durability
-barrier covering every event appended before it — the subscriber never sees
-a committed turn unless all mandatory state writes have left the process. A
-failed barrier broadcasts nothing and routes to `TurnCommitFailed`; ordinary
-events (not turn boundaries) are still append-only and flush on stop, so the
-hot path stays off the persistence path.
+`TurnCompleted` and `RuntimeCommitBarrier { kind: Turn }` are published through
+the kernel's bounded durable-batch path: append both in order, flush once, then
+broadcast either both or neither. Because the journal channel is FIFO, a
+successful flush is an OS-level durability barrier covering every event
+appended before it. Recovery trusts the explicit marker; `TurnCompleted`
+remains lifecycle audit and is used as a fallback only for legacy traces that
+contain no explicit marker anywhere. A failed batch broadcasts no member and
+routes to `TurnCommitFailed`; ordinary events remain append-only and flush at
+a boundary, keeping unrelated hot-path observations off synchronous storage.

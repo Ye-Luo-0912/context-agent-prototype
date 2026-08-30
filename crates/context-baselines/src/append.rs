@@ -120,6 +120,9 @@ impl ContextEngine for AppendOnlyEngine {
             selected,
             approx_tokens: approx_tokens_total,
             foreground: Vec::new(),
+            required_item_ids: Vec::new(),
+            required_misses: Default::default(),
+            optional_misses: Default::default(),
             diagnostics: active_diagnostics(&state.records, None, 0),
         })
     }

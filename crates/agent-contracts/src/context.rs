@@ -1148,6 +1148,10 @@ pub struct TaskProgressView {
     pub checked_files: Vec<String>,
     pub verifications: Vec<String>,
     pub failed_commands: Vec<String>,
+    /// Last deferred `task.complete` terminal-commit failure. This is a
+    /// bounded runtime fact, not a transcript retry instruction.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub completion_commit_failure: Option<String>,
     /// 类型化操作证据行（身份/digest/计数），最新在前、有界。只含
     /// key + 结果 + world 版本，不含任何工具正文。
     #[serde(default)]
@@ -1188,8 +1192,12 @@ impl TaskProgressView {
         self.checked_files.is_empty()
             && self.verifications.is_empty()
             && self.failed_commands.is_empty()
+            && self.completion_commit_failure.is_none()
             && self.operational_evidence.is_empty()
             && self.unresolved_blockers.is_empty()
+            && self.stall_warning.is_none()
+            && self.frontier_warning.is_none()
+            && self.completion_opportunity.is_none()
             && self.settlement.is_none()
     }
 
@@ -1465,6 +1473,221 @@ pub struct ContextSelection {
     pub reactivated: bool,
 }
 
+/// Hard cap on materialization misses returned by one context preview.
+/// The omitted counter preserves the fact that degradation exceeded the
+/// sample without allowing a large catalog or hostile adapter to grow the
+/// runtime event/prompt surface.
+pub const CONTEXT_MATERIALIZATION_MISS_CAP: usize = 64;
+/// Maximum visible chars in a materialization-miss identity. Longer stable
+/// refs retain a readable prefix plus a SHA-256 suffix, so the event stays
+/// small without making two long refs indistinguishable.
+pub const CONTEXT_MATERIALIZATION_IDENTITY_CHARS: usize = 256;
+/// Maximum visible chars in the bounded provenance field of a miss.
+pub const CONTEXT_MATERIALIZATION_SOURCE_CHARS: usize = 128;
+
+/// Stable, body-free identity of material that a context preview could not
+/// supply. `item_ref` is the anchor ref, canonical context uri, or normalized
+/// resource identity that requested the body; `item_id` is present when the
+/// catalog resolved that ref before the failure occurred.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ContextMaterializationIdentity {
+    pub item_ref: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub item_id: Option<ContextItemId>,
+    /// Anchor field that supplied the requirement, or a bounded runtime
+    /// source such as `retention:pinned` / `foreground_resources`.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub source_field_id: String,
+    /// Anchor revision that supplied the requirement. Zero means the source
+    /// is not an anchor claim.
+    #[serde(default)]
+    pub anchor_revision: u64,
+}
+
+impl ContextMaterializationIdentity {
+    pub fn new(
+        item_ref: impl Into<String>,
+        item_id: Option<ContextItemId>,
+        source_field_id: impl Into<String>,
+        anchor_revision: u64,
+    ) -> Self {
+        let item_ref = item_ref.into();
+        let item_ref = if item_ref.trim().is_empty() {
+            "context://unresolved-empty-ref".to_string()
+        } else {
+            bounded_stable_identity(&item_ref, CONTEXT_MATERIALIZATION_IDENTITY_CHARS)
+        };
+        Self {
+            item_ref,
+            item_id,
+            source_field_id: bounded_stable_identity(
+                &source_field_id.into(),
+                CONTEXT_MATERIALIZATION_SOURCE_CHARS,
+            ),
+            anchor_revision,
+        }
+    }
+
+    fn validate(&self) -> AgentResult<()> {
+        let item_ref_chars = self.item_ref.chars().count();
+        if self.item_ref.trim().is_empty()
+            || item_ref_chars > CONTEXT_MATERIALIZATION_IDENTITY_CHARS
+        {
+            return Err(AgentError::InvalidRequest(format!(
+                "context miss identity has {item_ref_chars} chars (allowed 1..={CONTEXT_MATERIALIZATION_IDENTITY_CHARS})"
+            )));
+        }
+        let source_chars = self.source_field_id.chars().count();
+        if source_chars > CONTEXT_MATERIALIZATION_SOURCE_CHARS {
+            return Err(AgentError::InvalidRequest(format!(
+                "context miss source has {source_chars} chars, above the {CONTEXT_MATERIALIZATION_SOURCE_CHARS} cap"
+            )));
+        }
+        Ok(())
+    }
+}
+
+fn bounded_stable_identity(value: &str, max_chars: usize) -> String {
+    if value.chars().count() <= max_chars {
+        return value.to_string();
+    }
+    let digest = crate::ContentDigest::sha256_bytes(value.as_bytes()).to_string();
+    let suffix = format!("#sha256:{digest}");
+    let prefix_chars = max_chars.saturating_sub(suffix.chars().count());
+    let mut bounded: String = value.chars().take(prefix_chars).collect();
+    bounded.push_str(&suffix);
+    bounded
+}
+
+/// Why a required or optional context body was unavailable to the final
+/// materialized frame. This is a correctness classification, not a scoring
+/// signal; changing it must never retune Context selection or GC.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ContextMaterializationMissReason {
+    /// No catalog/body owner matched the stable requirement identity, or a
+    /// known store blob was absent.
+    #[default]
+    Missing,
+    /// A blob existed but could not be decoded or did not match its catalog
+    /// identity/checksum.
+    Corrupt,
+    /// The filesystem failed for a reason other than absence.
+    IoFailed,
+    /// The body was available but could not fit the bounded model frame or
+    /// item-count cap (including Runtime's final rendered-input guard).
+    BudgetExcluded,
+    /// The target exists but its terminal/excluded lifecycle state forbids
+    /// projection. Required claims never resurrect terminal information.
+    PolicyExcluded,
+}
+
+/// One body-free materialization degradation row.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ContextMaterializationMiss {
+    pub identity: ContextMaterializationIdentity,
+    pub reason: ContextMaterializationMissReason,
+}
+
+/// A bounded list of materialization misses plus a saturating count of
+/// omitted observations.
+/// Producers add through [`ContextMaterializationMisses::push`]; wire input
+/// above the cap is rejected instead of silently allocating an unbounded
+/// event payload.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
+pub struct ContextMaterializationMisses {
+    entries: Vec<ContextMaterializationMiss>,
+    omitted: u32,
+}
+
+impl ContextMaterializationMisses {
+    pub fn push(&mut self, miss: ContextMaterializationMiss) {
+        if self.entries.contains(&miss) {
+            return;
+        }
+        if self.entries.len() < CONTEXT_MATERIALIZATION_MISS_CAP {
+            self.entries.push(miss);
+        } else {
+            self.omitted = self.omitted.saturating_add(1);
+        }
+    }
+
+    pub fn len(&self) -> usize {
+        self.entries.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.entries.is_empty() && self.omitted == 0
+    }
+
+    pub fn total(&self) -> u32 {
+        (self.entries.len() as u32).saturating_add(self.omitted)
+    }
+
+    pub fn omitted(&self) -> u32 {
+        self.omitted
+    }
+
+    pub fn iter(&self) -> std::slice::Iter<'_, ContextMaterializationMiss> {
+        self.entries.iter()
+    }
+
+    pub fn as_slice(&self) -> &[ContextMaterializationMiss] {
+        &self.entries
+    }
+
+    pub fn validate(&self) -> AgentResult<()> {
+        if self.entries.len() > CONTEXT_MATERIALIZATION_MISS_CAP {
+            return Err(AgentError::InvalidRequest(format!(
+                "context materialization carries {} misses, above the {CONTEXT_MATERIALIZATION_MISS_CAP} cap",
+                self.entries.len()
+            )));
+        }
+        for miss in &self.entries {
+            miss.identity.validate()?;
+        }
+        Ok(())
+    }
+}
+
+impl<'a> IntoIterator for &'a ContextMaterializationMisses {
+    type Item = &'a ContextMaterializationMiss;
+    type IntoIter = std::slice::Iter<'a, ContextMaterializationMiss>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        self.entries.iter()
+    }
+}
+
+impl<'de> Deserialize<'de> for ContextMaterializationMisses {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        struct Wire {
+            #[serde(default)]
+            entries: Vec<ContextMaterializationMiss>,
+            #[serde(default)]
+            omitted: u32,
+        }
+
+        let wire = Wire::deserialize(deserializer)?;
+        if wire.entries.len() > CONTEXT_MATERIALIZATION_MISS_CAP {
+            return Err(serde::de::Error::custom(format!(
+                "context materialization carries {} misses, above the {CONTEXT_MATERIALIZATION_MISS_CAP} cap",
+                wire.entries.len()
+            )));
+        }
+        let misses = Self {
+            entries: wire.entries,
+            omitted: wire.omitted,
+        };
+        misses.validate().map_err(serde::de::Error::custom)?;
+        Ok(misses)
+    }
+}
+
 /// A single observed lifecycle state transition produced by one maintenance pass.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ContextStateTransition {
@@ -1721,6 +1944,45 @@ pub struct MaterializedContext {
     /// ack must not stamp these ids.
     #[serde(default)]
     pub foreground: Vec<MaterializedItem>,
+    /// Exact full-body ids that the engine classified as mandatory in this
+    /// preview (Pinned retention or PromptRequired anchor roots). Runtime's
+    /// final rendered-input guard uses this bounded set so it can report a
+    /// hard miss if it must remove one after engine packing.
+    #[serde(default)]
+    pub required_item_ids: Vec<ContextItemId>,
+    /// Hard misses: the current task required these bodies in the model
+    /// frame. Runtime completion readiness must treat a non-empty value as a
+    /// semantic blocker for model-proposed completion.
+    #[serde(default)]
+    pub required_misses: ContextMaterializationMisses,
+    /// Best-effort/foreground misses. They are published for observability
+    /// but never block completion.
+    #[serde(default)]
+    pub optional_misses: ContextMaterializationMisses,
+}
+
+impl MaterializedContext {
+    /// Validate the bounded requirement/degradation surface at the Runtime
+    /// trust boundary. In-process and test engines do not pass through serde,
+    /// so Runtime must call this before cloning rows into durable events.
+    pub fn validate_requirement_status(&self) -> AgentResult<()> {
+        if self.required_item_ids.len() > CONTEXT_CONSUMPTION_ACK_ITEM_CAP {
+            return Err(AgentError::InvalidRequest(format!(
+                "context materialization carries {} required item ids, above the {} cap",
+                self.required_item_ids.len(),
+                CONTEXT_CONSUMPTION_ACK_ITEM_CAP
+            )));
+        }
+        let mut seen = HashSet::with_capacity(self.required_item_ids.len());
+        if self.required_item_ids.iter().any(|id| !seen.insert(*id)) {
+            return Err(AgentError::InvalidRequest(
+                "context materialization contains duplicate required item ids".into(),
+            ));
+        }
+        self.required_misses.validate()?;
+        self.optional_misses.validate()?;
+        Ok(())
+    }
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -2704,5 +2966,81 @@ mod tests {
             "src/auth.rs",
             None
         ));
+    }
+
+    #[test]
+    fn advisory_only_task_progress_is_not_empty() {
+        for view in [
+            TaskProgressView {
+                stall_warning: Some("stalled".into()),
+                ..TaskProgressView::default()
+            },
+            TaskProgressView {
+                frontier_warning: Some("frontier unchanged".into()),
+                ..TaskProgressView::default()
+            },
+            TaskProgressView {
+                completion_opportunity: Some("completion may be ready".into()),
+                ..TaskProgressView::default()
+            },
+        ] {
+            assert!(
+                !view.is_empty(),
+                "an advisory-only progress view must remain projectable"
+            );
+        }
+    }
+
+    #[test]
+    fn materialization_miss_surface_is_stable_and_wire_bounded() {
+        let long_ref = "x".repeat(CONTEXT_MATERIALIZATION_IDENTITY_CHARS + 100);
+        let identity = ContextMaterializationIdentity::new(long_ref, None, "test", 4);
+        assert_eq!(
+            identity.item_ref.chars().count(),
+            CONTEXT_MATERIALIZATION_IDENTITY_CHARS
+        );
+        assert!(identity.item_ref.contains("#sha256:"));
+        assert_eq!(
+            ContextMaterializationIdentity::new("   ", None, "test", 0).item_ref,
+            "context://unresolved-empty-ref"
+        );
+
+        let miss = ContextMaterializationMiss {
+            identity,
+            reason: ContextMaterializationMissReason::Missing,
+        };
+        let over_cap = ContextMaterializationMisses {
+            entries: vec![miss; CONTEXT_MATERIALIZATION_MISS_CAP + 1],
+            omitted: 0,
+        };
+        let bytes = serde_json::to_vec(&over_cap).unwrap();
+        let error = serde_json::from_slice::<ContextMaterializationMisses>(&bytes).unwrap_err();
+        assert!(error.to_string().contains("above the"));
+    }
+
+    #[test]
+    fn materialized_requirement_status_rejects_duplicate_and_over_cap_ids() {
+        let duplicate = ContextItemId::new();
+        let mut materialized = MaterializedContext {
+            required_item_ids: vec![duplicate, duplicate],
+            ..Default::default()
+        };
+        assert!(
+            materialized
+                .validate_requirement_status()
+                .unwrap_err()
+                .to_string()
+                .contains("duplicate")
+        );
+        materialized.required_item_ids = (0..=CONTEXT_CONSUMPTION_ACK_ITEM_CAP)
+            .map(|_| ContextItemId::new())
+            .collect();
+        assert!(
+            materialized
+                .validate_requirement_status()
+                .unwrap_err()
+                .to_string()
+                .contains("cap")
+        );
     }
 }

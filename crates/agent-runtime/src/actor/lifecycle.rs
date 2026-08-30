@@ -1,10 +1,54 @@
 use super::*;
 
 impl RuntimeActor {
+    /// Cross the one-shot startup durability boundary. A failed append or
+    /// flush may leave a forensic prefix in the journal, so this actor must
+    /// never retry startup or accept work that could later be mistaken for a
+    /// committed legacy turn.
+    pub(super) async fn start_serving(&mut self) -> AgentResult<()> {
+        match self.state.lifecycle {
+            ActorLifecycle::NotStarted => match self.core.start().await {
+                Ok(()) => {
+                    self.state.lifecycle = ActorLifecycle::Serving;
+                    Ok(())
+                }
+                Err(error) => {
+                    self.state.lifecycle = ActorLifecycle::StartFailed;
+                    self.state.recovery_required = true;
+                    Err(AgentError::RecoveryRequired(format!(
+                        "runtime startup failed before the serving marker committed: {error}"
+                    )))
+                }
+            },
+            ActorLifecycle::Serving => Err(AgentError::InvalidRequest(
+                "runtime is already started".into(),
+            )),
+            ActorLifecycle::StartFailed => Err(AgentError::RecoveryRequired(
+                "runtime startup previously failed; this actor cannot enter service".into(),
+            )),
+        }
+    }
+
+    /// Read-only recovery inspection remains available outside service, but
+    /// every command that can change runtime, context, task or journal state
+    /// crosses this gate first.
+    pub(super) fn ensure_serving(&self) -> AgentResult<()> {
+        match self.state.lifecycle {
+            ActorLifecycle::Serving => Ok(()),
+            ActorLifecycle::NotStarted => Err(AgentError::InvalidRequest(
+                "runtime must be started before accepting work".into(),
+            )),
+            ActorLifecycle::StartFailed => Err(AgentError::RecoveryRequired(
+                "runtime startup failed; this actor is recovery-fenced".into(),
+            )),
+        }
+    }
+
     /// A turn is accepted only when the runtime is idle. Serializing every
     /// mutation removes the structural race where focus/pin/task commands
     /// interleaved with an in-flight turn.
     pub(super) fn ensure_idle(&self) -> AgentResult<()> {
+        self.ensure_serving()?;
         if self.state.recovery_required {
             Err(AgentError::RecoveryRequired(
                 "runtime recovery is required before normal mutation may continue".into(),
@@ -460,7 +504,7 @@ impl RuntimeActor {
             return;
         };
         if let Err(error) = self
-            .begin_applied_turn(queued.content, queued.input, op_tx, false)
+            .begin_applied_turn(queued.content, queued.input, op_tx)
             .await
         {
             let _ = self

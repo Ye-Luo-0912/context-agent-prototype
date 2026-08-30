@@ -1,8 +1,9 @@
 //! Algorithm tests for ExecutionState (formerly ResumePoint).
 
 use super::state::{
-    MAX_NEGATIVE_FACTS, MAX_RESUME_FILES, MAX_REVALIDATE_PER_ROUND, MAX_VERIFICATION_SOURCES,
-    VerificationCause, VerificationCoverage, VerificationState,
+    MAX_NEGATIVE_FACTS, MAX_OBLIGATIONS, MAX_RESUME_FAILURES, MAX_RESUME_FILES,
+    MAX_REVALIDATE_PER_ROUND, MAX_VERIFICATION_SOURCES, VerificationCause, VerificationCoverage,
+    VerificationState,
 };
 use super::*;
 use agent_contracts::{
@@ -303,16 +304,16 @@ fn success_clears_only_the_matching_failed_command() {
     let mut resume = ExecutionState::default();
     let mut fail = output("shell.exec", false, "exit 1");
     fail.metadata = json!({"command": "cargo test"});
-    resume.observe_tool(&fail, 1, 2);
+    resume.observe_tool_with_digest(&fail, 1, 2, "cargo-test-digest");
     let mut other = output("shell.exec", true, "exit 0");
     other.metadata = json!({"command": "dir"});
-    resume.observe_tool(&other, 1, 3);
+    resume.observe_tool_with_digest(&other, 1, 3, "dir-digest");
     assert_eq!(resume.failed_commands.len(), 1);
     assert_eq!(resume.failed_commands[0].target, "cargo test");
     assert!(resume.view().verifications.is_empty());
     let mut ok = output("shell.exec", true, "exit 0");
     ok.metadata = json!({"command": "cargo test", "verification": true});
-    resume.observe_tool(&ok, 1, 4);
+    resume.observe_tool_with_digest(&ok, 1, 4, "cargo-test-digest");
     assert!(resume.failed_commands.is_empty());
     assert!(
         resume
@@ -321,6 +322,30 @@ fn success_clears_only_the_matching_failed_command() {
             .last()
             .unwrap()
             .starts_with("ok:")
+    );
+}
+
+#[test]
+fn runtime_argument_digest_not_command_text_controls_exact_failure_resolution() {
+    let mut resume = ExecutionState::default();
+    let mut failure = output("shell.exec", false, "exit 1");
+    failure.metadata = json!({"command": "cargo test"});
+    resume.observe_tool_with_digest(&failure, 1, 1, "argument-digest-a");
+    assert_eq!(resume.failed_commands.len(), 1);
+
+    let mut success = output("shell.exec", true, "exit 0");
+    success.metadata = json!({"command": "cargo test"});
+    resume.observe_tool_with_digest(&success, 1, 2, "argument-digest-b");
+    assert_eq!(
+        resume.failed_commands.len(),
+        1,
+        "identical display command with different runtime arguments is unrelated"
+    );
+
+    resume.observe_tool_with_digest(&success, 1, 3, "argument-digest-a");
+    assert!(
+        resume.failed_commands.is_empty(),
+        "the exact runtime argument identity resolves its own blocker"
     );
 }
 
@@ -542,6 +567,39 @@ fn dead_fields_are_ignored_on_old_checkpoints() {
     let resume: ExecutionState = serde_json::from_value(value).unwrap();
     assert_eq!(resume.anchor_revision, 3);
     assert!(resume.view().is_empty());
+}
+
+#[test]
+fn legacy_failed_command_restores_fail_closed_without_typed_identity() {
+    let value = json!({
+        "anchor_revision": 3,
+        "checked_files": [],
+        "verifications": [],
+        "failed_commands": [{
+            "tool_name": "shell.exec",
+            "target": "cargo test",
+            "summary": "exit 1",
+            "turn": 2
+        }]
+    });
+    let mut resume: ExecutionState = serde_json::from_value(value).unwrap();
+    assert_eq!(resume.failed_commands.len(), 1);
+    assert_eq!(
+        resume.failed_commands[0].domain,
+        ToolFailureDomain::NonDeterministic
+    );
+    assert!(resume.failed_commands[0].argument_digest.is_empty());
+    assert!(resume.failed_commands[0].scope_key.is_empty());
+    assert!(resume.failed_commands[0].precondition.is_empty());
+
+    let mut success = output("shell.exec", true, "exit 0");
+    success.metadata = json!({"command": "cargo test"});
+    resume.observe_tool_with_digest(&success, 3, 3, "new-runtime-digest");
+    assert_eq!(
+        resume.failed_commands.len(),
+        1,
+        "legacy display text must not become equivalence authority"
+    );
 }
 
 struct MapOracle(std::collections::HashMap<String, Option<String>>);
@@ -1168,13 +1226,17 @@ fn repeated_identical_verification_pass_is_redundant_not_progress() {
 // ---- Obligation ledger + execution evidence（第二轮评审）----
 
 fn missing_program(argv0: &str, fingerprint: &str) -> ToolOutput {
+    missing_program_in_scope(argv0, "scope-a", fingerprint)
+}
+
+fn missing_program_in_scope(argv0: &str, scope: &str, fingerprint: &str) -> ToolOutput {
     let mut out = pathless_command("process.run", false, argv0, "program not found");
     out.metadata = json!({
         // 与真实 process.run 一致：argv 是 join 过的字符串；resolver
         // 在 preflight 统一盖章 scope 与 epoch 指纹。
         "argv": argv0,
         "cwd": ".",
-        "resolution_scope_key": "scope-a",
+        "resolution_scope_key": scope,
         "resolution_fingerprint": fingerprint,
         "failure_class": "path_not_found",
     });
@@ -1256,32 +1318,249 @@ fn same_fingerprint_accumulates_and_new_fingerprint_advances_the_epoch() {
 }
 
 #[test]
-fn only_precondition_matched_success_resolves_the_executable_obligation() {
+fn only_candidate_family_matched_success_resolves_the_executable_obligation() {
     let mut resume = ExecutionState::default();
     resume.observe_tool(&missing_program("app.exe", "fp-1"), 1, 1);
     assert!(!resume.obligations.is_empty());
+    assert_eq!(resume.failed_commands.len(), 1);
+    assert_eq!(
+        resume.failed_commands[0].domain,
+        ToolFailureDomain::ExecutableResolution
+    );
+    assert_eq!(resume.failed_commands[0].scope_key, "scope-a");
+    assert_eq!(resume.failed_commands[0].precondition, "fp-1");
 
-    // 同 scope 但不同指纹的成功（例如 rustc 构建成功）：只推进 epoch，
-    // blocker 未被证明解决。
-    resume.observe_tool(&resolved_command("rustc", "scope-a", "fp-2"), 1, 2);
+    // Another program's successful launch is a different candidate family
+    // and cannot clear app.exe, even if the broader resolver world changed.
+    resume.observe_tool(&resolved_command("rustc", "scope-b", "fp-2"), 1, 2);
     assert_eq!(
         resume.obligations.len(),
         1,
-        "world change is not resolution"
+        "another program launch is not resolution"
     );
-    assert_eq!(resume.obligations[0].epoch, 2);
-    assert_eq!(resume.obligations[0].attempts, 0);
+    assert_eq!(resume.failed_commands.len(), 1);
 
     // 另一个 scope 的成功与本 blocker 无关。
     resume.observe_tool(&resolved_command("other.exe", "scope-b", "fp-2"), 1, 3);
     assert_eq!(resume.obligations.len(), 1);
+    assert_eq!(resume.failed_commands.len(), 1);
 
-    // 同 scope 同指纹的成功：blocker 特定的证明，义务解除。
-    resume.observe_tool(&resolved_command("app.exe", "scope-a", "fp-2"), 1, 4);
+    // Installing app.exe moves the fingerprint, but a successful launch in
+    // the exact app.exe candidate-family scope proves the blocker resolved.
+    let resolved = resume.observe_tool(&resolved_command("app.exe", "scope-a", "fp-2"), 1, 4);
     assert!(
         resume.obligations.is_empty(),
-        "a fingerprint-matched launch proves resolution works now"
+        "a candidate-family-matched launch proves resolution works now"
     );
+    assert!(resume.failed_commands.is_empty());
+    assert!(resolved.obligation_events.iter().any(|event| {
+        event.kind == agent_contracts::ObligationEventKind::Resolved
+            && event.domain == ToolFailureDomain::ExecutableResolution
+            && event.total_attempts == 1
+    }));
+}
+
+#[test]
+fn exact_candidate_family_success_resolves_after_install_epoch_change() {
+    let mut resume = ExecutionState::default();
+    resume.observe_tool_with_digest(
+        &missing_program("app.exe", "fp-1"),
+        1,
+        1,
+        "argument-digest-a",
+    );
+
+    // Installation changes the resolver precondition. The same candidate
+    // family's successful launch is stronger evidence than that change and
+    // resolves both blocker projections immediately.
+    resume.observe_tool_with_digest(
+        &resolved_command("app.exe", "scope-a", "fp-2"),
+        1,
+        2,
+        "argument-digest-a",
+    );
+    assert!(resume.obligations.is_empty());
+    assert!(resume.failed_commands.is_empty());
+}
+
+#[test]
+fn executable_resolution_requires_the_exact_program_candidate_family() {
+    let mut resume = ExecutionState::default();
+    resume.observe_tool(
+        &missing_program_in_scope("foo", "scope-foo", "fp-before"),
+        1,
+        1,
+    );
+
+    resume.observe_tool(&resolved_command("bar", "scope-bar", "fp-after"), 1, 2);
+    assert_eq!(resume.obligations.len(), 1, "bar cannot resolve foo");
+    assert_eq!(resume.failed_commands.len(), 1, "bar cannot clear foo");
+
+    resume.observe_tool(&resolved_command("foo", "scope-foo", "fp-after"), 1, 3);
+    assert!(
+        resume.obligations.is_empty(),
+        "the real foo launch resolves foo"
+    );
+    assert!(
+        resume.failed_commands.is_empty(),
+        "both projections resolve together"
+    );
+}
+
+#[test]
+fn unresolved_failure_overflow_survives_directives_and_stays_fail_closed() {
+    let mut resume = ExecutionState::default();
+    let mut overflow_event = None;
+    for index in 0..=MAX_OBLIGATIONS {
+        let path = format!("src/missing-{index}.rs");
+        let observation =
+            resume.observe_tool(&failed_read(&path, "path_not_found"), 1, index as u64);
+        overflow_event = observation
+            .obligation_events
+            .into_iter()
+            .find(|event| event.kind == agent_contracts::ObligationEventKind::Overflowed)
+            .or(overflow_event);
+    }
+
+    assert_eq!(resume.obligations.len(), MAX_OBLIGATIONS);
+    assert_eq!(resume.failed_commands.len(), MAX_RESUME_FAILURES);
+    assert_eq!(resume.failure_overflow.omitted_obligations, 1);
+    assert_eq!(resume.failure_overflow.omitted_failed_commands, 1);
+    assert_eq!(resume.open_obligation_count(), MAX_OBLIGATIONS + 1);
+    assert_eq!(
+        resume.unresolved_failed_command_count(),
+        MAX_RESUME_FAILURES + 1
+    );
+    assert!(
+        !resume.execution_ready(),
+        "overflow debt must block completion"
+    );
+    assert_eq!(
+        overflow_event.expect("overflow transition").scope_digest,
+        format!("src/missing-{MAX_OBLIGATIONS}.rs")
+    );
+    assert!(
+        resume
+            .view()
+            .unresolved_blockers
+            .iter()
+            .any(|warning| warning.contains("BLOCKER OVERFLOW"))
+    );
+
+    // Exact observations can still retire every identity retained in the
+    // bounded hot set. They cannot guess the omitted identity, so the
+    // sentinel remains fail-closed.
+    for index in 0..MAX_OBLIGATIONS {
+        resume.observe_tool(
+            &read_output(&format!("src/missing-{index}.rs"), "now-present"),
+            1,
+            20 + index as u64,
+        );
+    }
+    assert!(resume.obligations.is_empty());
+    assert!(resume.failed_commands.is_empty());
+    assert_eq!(resume.open_obligation_count(), 1);
+    assert!(resume.has_failures());
+
+    // Neither TaskContinuation nor an ordinary incremental user directive is
+    // a waiver. The old opaque debt stays bound to its opening epoch and
+    // continues to block; only operator override/new-task authority can
+    // leave it behind.
+    resume.on_user_turn("continue the same task with one more requirement");
+    assert_eq!(resume.directive_revision, 1);
+    assert_eq!(resume.failure_overflow.directive_revision, 0);
+    assert_eq!(resume.open_obligation_count(), 1);
+    assert!(resume.has_failures());
+    assert!(super::state::validate_execution_state(&resume).is_ok());
+
+    let fresh_task = ExecutionState::default();
+    assert_eq!(
+        fresh_task.failure_overflow,
+        UnresolvedFailureOverflow::default()
+    );
+    assert_eq!(fresh_task.open_obligation_count(), 0);
+}
+
+#[test]
+fn typed_resolution_preserves_an_unrelated_failure_domain() {
+    let mut resume = ExecutionState::default();
+    resume.observe_tool(&missing_program("app.exe", "fp-1"), 1, 1);
+    resume.observe_tool(&failed_read("src/missing.rs", "path_not_found"), 1, 2);
+    assert_eq!(resume.failed_commands.len(), 2);
+    assert_eq!(resume.obligations.len(), 2);
+
+    resume.observe_tool(&resolved_command("app.exe", "scope-a", "fp-1"), 1, 3);
+
+    assert_eq!(resume.failed_commands.len(), 1);
+    assert_eq!(
+        resume.failed_commands[0].domain,
+        ToolFailureDomain::ResourcePath
+    );
+    assert_eq!(resume.failed_commands[0].scope_key, "src/missing.rs");
+    assert_eq!(resume.obligations.len(), 1);
+    assert_eq!(
+        resume.obligations[0].domain,
+        ToolFailureDomain::ResourcePath
+    );
+    assert_eq!(resume.obligations[0].scope_key, "src/missing.rs");
+}
+
+#[test]
+fn a_new_failure_cannot_resolve_itself_from_a_cached_resource_fact() {
+    let mut resume = ExecutionState::default();
+    resume.observe_tool(&read_output("src/unstable.rs", "r1"), 1, 1);
+
+    // The old fact may be stale in reality. The current failed observation
+    // is an attempt in this lineage, not proof that its own blocker vanished.
+    resume.observe_tool(&failed_read("src/unstable.rs", "path_not_found"), 1, 2);
+    assert_eq!(resume.obligations.len(), 1);
+    assert_eq!(resume.failed_commands.len(), 1);
+
+    // Nor may a later unrelated success reinterpret that cached pre-failure
+    // fact as a new observation of the missing path.
+    resume.observe_tool(&read_output("src/other.rs", "other-r1"), 1, 3);
+    assert_eq!(resume.obligations.len(), 1);
+    assert_eq!(resume.failed_commands.len(), 1);
+
+    resume.observe_tool(&read_output("src/unstable.rs", "r2"), 1, 4);
+    assert!(resume.obligations.is_empty());
+    assert!(resume.failed_commands.is_empty());
+}
+
+#[test]
+fn project_marker_blocker_uses_the_typed_marker_not_command_text() {
+    let mut resume = ExecutionState::default();
+    let mut missing = output("shell.exec", false, "manifest missing");
+    missing.metadata = json!({
+        "command": "cargo test --workspace",
+        "missing_marker": "Cargo.toml",
+        "failure_class": "missing_project_marker",
+    });
+    resume.observe_tool(&missing, 1, 1);
+    assert_eq!(resume.obligations.len(), 1);
+    assert_eq!(
+        resume.obligations[0].domain,
+        ToolFailureDomain::ProjectMarker
+    );
+    assert_eq!(resume.obligations[0].scope_key, "Cargo.toml");
+    assert_eq!(resume.failed_commands[0].scope_key, "Cargo.toml");
+    assert_ne!(
+        resume.failed_commands[0].scope_key, resume.failed_commands[0].target,
+        "display command text is not blocker equivalence authority"
+    );
+
+    let mut created = output("fs.write", true, "created manifest");
+    created.metadata = json!({"path": "Cargo.toml", "revision": "manifest-v1"});
+    resume.observe_tool(&created, 1, 2);
+    assert!(resume.obligations.is_empty());
+    assert!(resume.failed_commands.is_empty());
+
+    // External creation is equally provable through a current exact read;
+    // no Runtime mutation is required to retire the missing-marker fact.
+    resume.observe_tool(&missing, 1, 3);
+    resume.observe_tool(&read_output("Cargo.toml", "manifest-v2"), 1, 4);
+    assert!(resume.obligations.is_empty());
+    assert!(resume.failed_commands.is_empty());
 }
 
 #[test]
@@ -1310,46 +1589,79 @@ fn edit_target_obligation_resolves_only_at_new_digest() {
 }
 
 #[test]
-fn trusted_verification_supersedes_a_stale_edit_plan() {
+fn changed_edit_refusal_advances_lineage_instead_of_erasing_history() {
+    let mut resume = ExecutionState::default();
+    resume.observe_tool(&refused_edit("src/auth.rs", "rOLD", "stale_revision"), 1, 1);
+    resume.observe_tool(
+        &refused_edit("src/auth.rs", "rCURRENT", "stale_revision"),
+        1,
+        2,
+    );
+
+    assert_eq!(resume.obligations.len(), 1);
+    assert_eq!(resume.obligations[0].epoch, 2);
+    assert_eq!(resume.obligations[0].attempts, 1);
+    assert_eq!(resume.obligations[0].total_attempts, 2);
+    assert_eq!(resume.obligations[0].precondition, "src/auth.rs@rCURRENT");
+    assert_eq!(resume.failed_commands.len(), 1);
+    assert_eq!(
+        resume.failed_commands[0].precondition,
+        "src/auth.rs@rCURRENT"
+    );
+}
+
+#[test]
+fn trusted_verification_resolves_only_its_rooted_edit_blocker() {
     let mut state = ExecutionState::default();
-    let mut refusal = output("edit.replace", false, "stale");
-    refusal.metadata = json!({
+    let mut auth_refusal = output("edit.replace", false, "stale auth");
+    auth_refusal.metadata = json!({
         "path": "src/auth.rs",
         "revision": "rCURRENT",
         "failure_class": "stale_revision",
     });
-    state.observe_tool(&refusal, 1, 1);
-    assert_eq!(state.obligations.len(), 1);
+    let mut billing_refusal = output("edit.replace", false, "stale billing");
+    billing_refusal.metadata = json!({
+        "path": "src/billing.rs",
+        "revision": "rCURRENT",
+        "failure_class": "stale_revision",
+    });
+    state.observe_tool(&auth_refusal, 1, 1);
+    state.observe_tool(&billing_refusal, 1, 2);
+    assert_eq!(state.obligations.len(), 2);
+    assert_eq!(state.failed_commands.len(), 2);
 
     // Provider/plugin metadata cannot retire a blocker by declaring itself
     // a verifier. The authority must come from trusted pre-dispatch facts.
     let mut verify = output("verify.run", true, "tests passed");
     verify.metadata = json!({"verification": true});
-    state.observe_tool(&verify, 1, 2);
+    state.observe_tool(&verify, 1, 3);
     assert_eq!(
         state.obligations.len(),
-        1,
+        2,
         "legacy producer metadata may record evidence but cannot retire an obligation"
     );
     state.observe_tool_attributed(
         &verify,
         1,
-        3,
+        4,
         "untrusted-verify",
         &RuntimeExecutionAttribution::default(),
     );
-    assert_eq!(state.obligations.len(), 1);
+    assert_eq!(state.obligations.len(), 2);
 
     let trusted = RuntimeExecutionAttribution {
         host: ToolExecutionAttribution::bounded(
             ToolExecutionPurpose::Verify,
-            Vec::<String>::new(),
+            ["src/auth.rs".into()],
             VerificationReuse::TaskScoped,
         ),
-        rooted_targets: Vec::new(),
+        rooted_targets: vec!["src/auth.rs".into()],
     };
-    let observation = state.observe_tool_attributed(&verify, 1, 4, "trusted-verify", &trusted);
-    assert!(state.obligations.is_empty());
+    let observation = state.observe_tool_attributed(&verify, 1, 5, "trusted-verify", &trusted);
+    assert_eq!(state.obligations.len(), 1);
+    assert_eq!(state.obligations[0].scope_key, "src/billing.rs");
+    assert_eq!(state.failed_commands.len(), 1);
+    assert_eq!(state.failed_commands[0].scope_key, "src/billing.rs");
     assert!(observation.obligation_events.iter().any(|event| {
         event.kind == agent_contracts::ObligationEventKind::Resolved
             && event.domain == ToolFailureDomain::EditTarget
@@ -1464,6 +1776,33 @@ fn restore_rejects_oversized_frontier_fields() {
             });
     }
     assert!(validate_execution_state(&source_overflow).is_err());
+
+    let mut valid_failure_overflow = ExecutionState {
+        directive_revision: 7,
+        failure_overflow: UnresolvedFailureOverflow {
+            directive_revision: 7,
+            omitted_obligations: 2,
+            omitted_failed_commands: 3,
+        },
+        ..ExecutionState::default()
+    };
+    assert!(validate_execution_state(&valid_failure_overflow).is_ok());
+    valid_failure_overflow.failure_overflow.directive_revision = 6;
+    assert!(
+        validate_execution_state(&valid_failure_overflow).is_ok(),
+        "overflow debt remains valid across later directives"
+    );
+    valid_failure_overflow.failure_overflow.directive_revision = 8;
+    assert!(
+        validate_execution_state(&valid_failure_overflow).is_err(),
+        "an overflow sentinel cannot claim a future directive epoch"
+    );
+    valid_failure_overflow.failure_overflow.directive_revision = 7;
+    valid_failure_overflow.failure_overflow.omitted_obligations = 4;
+    assert!(
+        validate_execution_state(&valid_failure_overflow).is_ok(),
+        "the independently capped projections may omit different counts"
+    );
 }
 
 fn attributed_path(
@@ -1618,6 +1957,10 @@ fn domain_equivalent_pass_requires_matching_class_identity_and_declaration() {
                 recipe_revision: "rev-1".into(),
                 coverage_domain: Some("workspace-tests".into()),
                 domain_declaration_revision: Some(declaration_revision),
+                domain_source_digest: agent_contracts::ContentDigest::sha256_bytes(
+                    b"workspace-tests/source",
+                )
+                .to_string(),
                 class_identity_digest: class.into(),
             }),
             rooted_targets: Vec::new(),
@@ -1649,6 +1992,21 @@ fn domain_equivalent_pass_requires_matching_class_identity_and_declaration() {
     assert!(
         state
             .current_domain_verification_pass(7, &attribution_for("verify.b", "class-1", 4))
+            .is_none()
+    );
+    // Recomposition under the same numeric revision is fenced by the stable
+    // source digest too.
+    let mut recomposed = attribution_for("verify.b", "class-1", 3);
+    recomposed
+        .host
+        .verification_recipe
+        .as_mut()
+        .unwrap()
+        .domain_source_digest =
+        agent_contracts::ContentDigest::sha256_bytes(b"recomposed/source").to_string();
+    assert!(
+        state
+            .current_domain_verification_pass(7, &recomposed)
             .is_none()
     );
     // Class execution-identity drift invalidates.
@@ -1797,7 +2155,13 @@ fn observed_exact_pass(resume: &mut ExecutionState, anchor_revision: u64, turn: 
         .with_verification_identity_material("test-runner:v1|env:win"),
         rooted_targets: Vec::new(),
     };
-    resume.observe_tool_attributed(&verified_ok(), anchor_revision, turn, "arg-settle", &attribution);
+    resume.observe_tool_attributed(
+        &verified_ok(),
+        anchor_revision,
+        turn,
+        "arg-settle",
+        &attribution,
+    );
 }
 
 #[test]
@@ -1891,9 +2255,15 @@ fn verified_current_survives_progress_only_anchor_change() {
 #[test]
 fn execution_ready_matches_verified_current_label() {
     let mut resume = ExecutionState::default();
-    assert_eq!(resume.execution_ready(), resume.settlement() == SettlementLabel::VerifiedCurrent);
+    assert_eq!(
+        resume.execution_ready(),
+        resume.settlement() == SettlementLabel::VerifiedCurrent
+    );
     resume.observe_tool(&write_of("src/auth.rs", "v2"), 1, 1);
-    assert_eq!(resume.execution_ready(), resume.settlement() == SettlementLabel::VerifiedCurrent);
+    assert_eq!(
+        resume.execution_ready(),
+        resume.settlement() == SettlementLabel::VerifiedCurrent
+    );
 
     observed_exact_pass(&mut resume, 1, 2);
     assert!(resume.execution_ready());
@@ -1901,7 +2271,10 @@ fn execution_ready_matches_verified_current_label() {
 
     // Every reopening input must flip readiness and the label together.
     resume.observe_tool(&missing_program("prog_a", "fp-1"), 1, 3);
-    assert_eq!(resume.execution_ready(), resume.settlement() == SettlementLabel::VerifiedCurrent);
+    assert_eq!(
+        resume.execution_ready(),
+        resume.settlement() == SettlementLabel::VerifiedCurrent
+    );
     assert!(!resume.execution_ready());
     assert_eq!(resume.settlement(), SettlementLabel::Working);
 }
@@ -1917,7 +2290,13 @@ fn observed_untrusted_pass(resume: &mut ExecutionState, anchor_revision: u64, tu
         ),
         rooted_targets: Vec::new(),
     };
-    resume.observe_tool_attributed(&verified_ok(), anchor_revision, turn, "arg-settle", &attribution);
+    resume.observe_tool_attributed(
+        &verified_ok(),
+        anchor_revision,
+        turn,
+        "arg-settle",
+        &attribution,
+    );
 }
 
 /// A failed shell command: records a failed command whose Unknown-side
@@ -1929,20 +2308,19 @@ fn failed_shell(command: &str) -> ToolOutput {
 }
 
 #[test]
-fn trusted_verification_pass_resolves_failed_attempt_history() {
+fn trusted_verification_pass_keeps_an_unrelated_failure_blocker() {
     let mut resume = ExecutionState::default();
     resume.observe_tool(&write_of("src/auth.rs", "v2"), 1, 1);
     resume.observe_tool(&failed_shell("cargo build"), 1, 2);
     assert_eq!(resume.failed_commands.len(), 1);
     assert!(!resume.execution_ready());
 
-    // A trusted verification PASS confirms the current world on the
-    // covered criteria: the historical failed attempts are resolved past
-    // the readiness gate instead of blocking forever.
+    // A trusted verification PASS is evidence for its declared verifier,
+    // not a universal eraser for an unrelated shell failure.
     observed_exact_pass(&mut resume, 1, 3);
-    assert!(resume.failed_commands.is_empty());
-    assert_eq!(resume.settlement(), SettlementLabel::VerifiedCurrent);
-    assert!(resume.execution_ready());
+    assert_eq!(resume.failed_commands.len(), 1);
+    assert_eq!(resume.settlement(), SettlementLabel::Working);
+    assert!(!resume.execution_ready());
 }
 
 #[test]
@@ -1980,16 +2358,27 @@ fn failure_after_trusted_verification_reblocks_readiness() {
     observed_exact_pass(&mut resume, 1, 2);
     assert!(resume.execution_ready());
 
-    // A new failure after the trusted verification reopens the
-    // fail-closed gate until the next trusted pass: the Unknown-side
-    // footprint bumps the world and reopens the verification duty.
-    resume.observe_tool(&failed_shell("cargo build"), 1, 3);
+    // A new failure after the trusted verification reopens the fail-closed
+    // gate. Another unrelated PASS must not erase it.
+    resume.observe_tool_with_digest(&failed_shell("cargo build"), 1, 3, "cargo-build-digest");
     assert_eq!(resume.failed_commands.len(), 1);
     assert_eq!(resume.settlement(), SettlementLabel::VerificationDue);
     assert!(!resume.execution_ready());
 
     observed_exact_pass(&mut resume, 1, 4);
+    assert_eq!(resume.failed_commands.len(), 1);
+    assert_eq!(resume.settlement(), SettlementLabel::Working);
+    assert!(!resume.execution_ready());
+
+    // The exact failed operation succeeds, which resolves its own blocker.
+    // That command may have mutated the workspace, so a fresh verifier is
+    // still required before readiness returns.
+    let mut build_ok = output("shell.exec", true, "build succeeded");
+    build_ok.metadata = json!({"command": "cargo build"});
+    resume.observe_tool_with_digest(&build_ok, 1, 5, "cargo-build-digest");
     assert!(resume.failed_commands.is_empty());
+    assert!(!resume.execution_ready());
+    observed_exact_pass(&mut resume, 1, 6);
     assert_eq!(resume.settlement(), SettlementLabel::VerifiedCurrent);
     assert!(resume.execution_ready());
 }

@@ -28,7 +28,7 @@ impl ExecutionState {
     ) -> super::state::FrontierObservation {
         self.anchor_revision = anchor_revision;
         self.last_turn = turn;
-        let identity = operation_identity(output);
+        let identity = operation_identity(output, "");
         let delta = FrontierDelta::RedundantEvidence;
         self.update_convergence(&identity, None, delta);
         self.refresh_validity();
@@ -136,7 +136,7 @@ impl ExecutionState {
         // progress probe: capture the before-state so one
         // deterministic classification can answer "did this round move
         // the world or our knowledge of it?"
-        let before_failures = self.failed_commands.len();
+        let before_failures = self.unresolved_failed_command_count();
         let before_verifications = self.verifications.len();
         let before_last_evidence = self
             .verifications
@@ -158,7 +158,7 @@ impl ExecutionState {
         if matches!(footprint, MutationFootprint::Unknown) {
             self.mark_facts_needs_revalidation();
         }
-        let identity = operation_identity(output);
+        let identity = operation_identity(output, argument_digest);
         // Unknown mutation 的 PASS-stale 标记以观察前的验证史为准
         // （本输出若自带验证结果，不得把自己标成待复核）。
         let had_prior_verification_evidence = self.last_evidence().is_some();
@@ -181,21 +181,20 @@ impl ExecutionState {
                     provenance,
                 ));
             }
-            self.failed_commands
-                .retain(|row| !same_operation(row, &identity));
+            // Exact operation identity is sufficient only for an untyped or
+            // NonDeterministic blocker. Deterministic domains are resolved
+            // below by the same domain/scope/precondition predicate as the
+            // obligation ledger; clearing them here would let the two views
+            // disagree when a resolver epoch changed.
+            self.failed_commands.retain(|row| {
+                row.domain != agent_contracts::ToolFailureDomain::NonDeterministic
+                    || !same_operation(row, &identity)
+            });
             if is_verification {
                 if let Some(event) =
                     self.push_verification(output, argument_digest, attribution, turn)
                 {
                     verification_pass_events.push(event);
-                    // A trusted verification PASS binds the whole current
-                    // tuple (verification basis, directive, workspace):
-                    // the world is confirmed on the covered criteria, so
-                    // the historical failed attempts count as resolved
-                    // past the readiness gate. Failures observed after
-                    // this point re-record and block readiness again; the
-                    // settlement() pure function stays unchanged.
-                    self.failed_commands.clear();
                 }
                 // Keep the verification basis (spec_revision) as tracked by
                 // TaskAnchor.verification_revision; a progress-only anchor
@@ -238,12 +237,13 @@ impl ExecutionState {
             }
             if let Some(touch) = output.resource_touches().first() {
                 self.push_failure(
+                    output,
                     &identity,
                     format!("failed observation {}", touch.path),
                     turn,
                 );
             } else if is_command_tool(&output.tool_name) {
-                self.push_failure(&identity, output.summary.clone(), turn);
+                self.push_failure(output, &identity, output.summary.clone(), turn);
             }
         }
         if is_verification && !output.ok {
@@ -265,16 +265,14 @@ impl ExecutionState {
         // 义务账本：先解析（本输出可能已解除旧义务或推进 epoch），再
         // 登记新失败；账目事件随 FrontierObservation 出账（ ）。
         let mut obligation_events = Vec::new();
-        let trusted_verification_pass = output.ok
-            && attribution.is_some_and(RuntimeExecutionAttribution::reusable_verification);
-        self.resolve_obligations(output, trusted_verification_pass, &mut obligation_events);
+        self.resolve_failure_blockers(output, attribution, &mut obligation_events);
         self.record_obligation(
             output,
             &identity,
             speculative_negative,
             &mut obligation_events,
         );
-        self.cap();
+        self.cap(&mut obligation_events);
         self.refresh_validity();
         // Deterministic frontier classification: a verification
         // result is always typed evidence; otherwise footprint decides —
@@ -289,7 +287,7 @@ impl ExecutionState {
                 .last()
                 .map(|row| (row.ok, row.summary.clone()))
                 != before_last_evidence;
-        let failure_resolved = self.failed_commands.len() < before_failures;
+        let failure_resolved = self.unresolved_failed_command_count() < before_failures;
         let obs_evidence = if output.ok && !is_verification && !output.may_mutate_workspace() {
             // 证据身份用 Runtime 的真 ArgumentDigest，
             // 不在 ToolOutput 上反推；缺省时退化为参数摘要。

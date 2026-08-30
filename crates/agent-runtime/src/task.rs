@@ -67,18 +67,145 @@ pub struct TaskToolRequirementSet {
     pub entries: Vec<ToolSurfaceRequirement>,
 }
 
-/// One bounded acceptance-coverage claim: the acceptance criterion at
-/// `criterion_index` is declared covered by a specific verification
-/// identity. The identity must resolve to the execution's current trusted
-/// verification pass (which already binds task anchor, directive and
-/// workspace revisions), so a stale or fabricated identity never counts.
-/// Free-form "done" text cannot establish coverage.
+/// Whether model-authored completion needs criterion-addressed evidence.
+///
+/// Tasks begin conservatively in `OperatorClosureOnly`: an ordinary final is
+/// still allowed, but only an explicit operator can durably close the task.
+/// A trusted host may move the anchor to `EvidenceRequired` while atomically
+/// supplying non-empty criteria. The model-routable `task.manage` surface has
+/// no field for either value.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TaskCompletionPolicy {
+    #[default]
+    OperatorClosureOnly,
+    EvidenceRequired,
+}
+
+/// One stable, bounded acceptance criterion and the host-declared proof
+/// domain declaration that may satisfy it. Its identity is
+/// `(TaskAnchor.verification_revision, index, domain declaration)`; changing
+/// content, order or declaration advances the verification revision and
+/// invalidates old receipts. Defaulted legacy declaration fields remain
+/// readable but can never authorize evidence-backed completion.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct AcceptanceCriterion {
+    pub description: String,
+    pub coverage_domain: String,
+    pub domain_declaration_revision: u64,
+    pub domain_source_digest: String,
+}
+
+impl<'de> serde::Deserialize<'de> for AcceptanceCriterion {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        #[derive(serde::Deserialize)]
+        #[serde(untagged)]
+        enum Wire {
+            Structured {
+                description: String,
+                coverage_domain: String,
+                #[serde(default)]
+                domain_declaration_revision: u64,
+                #[serde(default)]
+                domain_source_digest: String,
+            },
+            Legacy(String),
+        }
+
+        Ok(match Wire::deserialize(deserializer)? {
+            Wire::Structured {
+                description,
+                coverage_domain,
+                domain_declaration_revision,
+                domain_source_digest,
+            } => Self {
+                description,
+                coverage_domain,
+                domain_declaration_revision,
+                domain_source_digest,
+            },
+            // Legacy string criteria are preserved for operator visibility,
+            // but the empty domain can never mint or satisfy a receipt.
+            Wire::Legacy(description) => Self {
+                description,
+                coverage_domain: String::new(),
+                domain_declaration_revision: 0,
+                domain_source_digest: String::new(),
+            },
+        })
+    }
+}
+
+impl AcceptanceCriterion {
+    pub fn new(description: impl Into<String>, coverage_domain: impl Into<String>) -> Self {
+        Self {
+            description: description.into(),
+            coverage_domain: coverage_domain.into(),
+            domain_declaration_revision: 0,
+            domain_source_digest: String::new(),
+        }
+    }
+
+    /// Bind a criterion to the exact current host declaration projection.
+    /// Callers still pass the resulting anchor through Runtime validation;
+    /// an invalid hand-built projection therefore remains fail-closed.
+    pub fn declared(
+        description: impl Into<String>,
+        declaration: &agent_contracts::VerificationCoverageDeclaration,
+    ) -> Self {
+        Self {
+            description: description.into(),
+            coverage_domain: declaration.domain_id.clone(),
+            domain_declaration_revision: declaration.declaration_revision,
+            domain_source_digest: declaration.source_digest.clone(),
+        }
+    }
+}
+
+impl From<String> for AcceptanceCriterion {
+    fn from(description: String) -> Self {
+        Self {
+            description,
+            coverage_domain: String::new(),
+            domain_declaration_revision: 0,
+            domain_source_digest: String::new(),
+        }
+    }
+}
+
+impl From<&str> for AcceptanceCriterion {
+    fn from(description: &str) -> Self {
+        description.to_string().into()
+    }
+}
+
+/// One actor-minted, criterion-addressed acceptance receipt. Every identity
+/// required to prove currentness is retained directly; free-form completion
+/// text and pre-dispatch attribution can never establish coverage.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub struct AcceptanceCoverage {
-    /// Index into `TaskAnchor.acceptance_criteria` (stable ordering).
+    #[serde(default)]
+    pub task_id: Option<TaskId>,
+    #[serde(default)]
+    pub verification_revision: u64,
+    /// Index into `TaskAnchor.acceptance_criteria` (stable within the
+    /// verification revision).
     pub criterion_index: u32,
-    /// `VerificationFact.verification_identity` the claim links to.
+    #[serde(default)]
+    pub coverage_domain: String,
+    #[serde(default)]
+    pub domain_declaration_revision: u64,
+    #[serde(default)]
+    pub domain_source_digest: String,
+    #[serde(default)]
+    pub directive_revision: u64,
+    #[serde(default)]
+    pub workspace_revision: u64,
+    /// `VerificationFact.verification_identity` the receipt links to.
     pub verification_identity: String,
 }
 
@@ -98,10 +225,10 @@ pub struct TaskAnchor {
     /// empty anchor (goal only, stamped from the task goal at creation);
     /// every CAS replacement bumps it.
     pub revision: u64,
-    /// Independent verification basis revision. Only boundary changes
-    /// (goal / constraints / acceptance criteria) bump it; autonomous
-    /// progress patches keep it stable so a Current verifier stays
-    /// current through plan updates.
+    /// Independent verification basis revision. Goal, constraints and
+    /// completion authority (policy / criteria) bump it; progress-only
+    /// patches keep it stable so a Current verifier stays current through
+    /// plan updates. This proof boundary is independent of approval kind.
     #[serde(default)]
     pub verification_revision: u64,
     /// The user-given origin the task was created with. This is task
@@ -116,11 +243,16 @@ pub struct TaskAnchor {
     pub current_interpretation: String,
     /// Hard user-authority constraints the task must respect.
     pub constraints: Vec<String>,
-    /// Acceptance criteria the completion outcome is measured against.
-    pub acceptance_criteria: Vec<String>,
-    /// Bounded acceptance-coverage claims linking each criterion to a
-    /// current verification identity. A claim counts only while its
-    /// identity resolves to the execution's trusted Current pass.
+    /// Explicit task completion authority. The default is fail-closed for
+    /// model completion until a host supplies structured criteria.
+    #[serde(default)]
+    pub completion_policy: TaskCompletionPolicy,
+    /// Acceptance criteria the completion outcome is measured against, each
+    /// paired with the host-declared verifier domain that can prove it.
+    #[serde(default)]
+    pub acceptance_criteria: Vec<AcceptanceCriterion>,
+    /// Actor-minted acceptance receipts. Generic anchor replacement/patch
+    /// APIs preserve or invalidate these; they cannot add them.
     #[serde(default)]
     pub acceptance_coverage: Vec<AcceptanceCoverage>,
     /// Ordered plan progress: what has been done and what is next.
@@ -155,10 +287,13 @@ pub struct AnchorPatch {
     pub constraints: Option<Vec<String>>,
     /// `TaskAnchor.current_interpretation` — autonomous.
     pub current_interpretation: Option<String>,
-    /// `TaskAnchor.acceptance_criteria` — autonomous.
-    pub acceptance_criteria: Option<Vec<String>>,
-    /// `TaskAnchor.acceptance_coverage` — autonomous (must still resolve
-    /// to trusted verification facts; it never rewrites user authority).
+    /// `TaskAnchor.completion_policy` — host/operator authority.
+    pub completion_policy: Option<TaskCompletionPolicy>,
+    /// `TaskAnchor.acceptance_criteria` — host/operator authority.
+    pub acceptance_criteria: Option<Vec<AcceptanceCriterion>>,
+    /// Reserved for checkpoint/API compatibility. Generic callers cannot
+    /// mint or replace receipts; Runtime uses a dedicated post-observation
+    /// transaction.
     pub acceptance_coverage: Option<Vec<AcceptanceCoverage>>,
     /// `TaskAnchor.plan_progress` — autonomous.
     pub plan_progress: Option<Vec<String>>,
@@ -173,9 +308,9 @@ pub struct AnchorPatch {
 }
 
 impl AnchorPatch {
-    /// The patch's authority kind: boundary when any goal/constraint field
-    /// moves (user authority), autonomous otherwise (runtime-evolvable
-    /// interpretation/plan/open-loop/criteria/ref fields).
+    /// The patch's approval kind: only goal/constraint changes require the
+    /// user boundary gate. Completion authority is host-ingested and still
+    /// invalidates proof, but `task.manage` cannot submit it.
     pub fn kind(&self) -> AnchorPatchKind {
         if self.original_goal.is_some() || self.constraints.is_some() {
             AnchorPatchKind::Boundary
@@ -194,6 +329,9 @@ impl AnchorPatch {
         }
         if let Some(value) = &self.constraints {
             next.constraints = value.clone();
+        }
+        if let Some(value) = self.completion_policy {
+            next.completion_policy = value;
         }
         if let Some(value) = &self.current_interpretation {
             next.current_interpretation = value.clone();
@@ -314,7 +452,11 @@ pub fn task_anchor_view(anchor: &TaskAnchor) -> agent_contracts::TaskAnchorView 
         original_goal: anchor.original_goal.clone(),
         current_interpretation: anchor.current_interpretation.clone(),
         constraints: anchor.constraints.clone(),
-        acceptance_criteria: anchor.acceptance_criteria.clone(),
+        acceptance_criteria: anchor
+            .acceptance_criteria
+            .iter()
+            .map(|criterion| criterion.description.clone())
+            .collect(),
         plan_progress: anchor.plan_progress.clone(),
         open_loops: anchor.open_loops.clone(),
         next_action: anchor.next_action.clone(),
@@ -341,6 +483,214 @@ pub enum CompletionVerificationStatus {
     Current,
     Failed,
 }
+
+/// Trusted source asking Runtime to close a task.
+///
+/// A model proposal is a claim of successful completion and therefore needs
+/// current semantic evidence. An explicit operator command may acknowledge
+/// incomplete evidence, but it never bypasses task identity or commit safety.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CompletionIntent {
+    ModelProposal,
+    ExplicitOperator,
+}
+
+/// Task-authority identity used by completion decisions.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct TaskStateBasis {
+    pub task_id: TaskId,
+    pub anchor_revision: u64,
+}
+
+/// Evidence identity used by completion decisions.
+///
+/// This is deliberately separate from [`TaskStateBasis`]: progress-only
+/// anchor updates advance the task CAS revision without invalidating proof.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct VerificationBasis {
+    pub task_id: TaskId,
+    pub verification_revision: u64,
+    pub directive_revision: u64,
+    pub workspace_revision: u64,
+}
+
+/// Why a task is not a verified completion candidate. Variants carry only
+/// bounded scalar data so the same values can be retained on an explicit
+/// operator override without copying prompt or tool bodies.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CompletionBlocker {
+    NoActiveTask,
+    TaskIdentityMismatch,
+    TaskNotActive,
+    TaskStateStale,
+    VerificationBasisStale,
+    VerificationNotCurrent,
+    OperatorClosureOnly,
+    AcceptanceUndeclared,
+    AcceptanceDeclarationStale { remaining: u32 },
+    AcceptanceUncovered { remaining: u32 },
+    OpenLoops { remaining: u32 },
+    NextActionPending,
+    RequiredContextUnavailable { remaining: u32 },
+    ExecutionObligations { remaining: u32 },
+    FailedCommands { remaining: u32 },
+    RecoveryRequired,
+    CancelCleanupPending,
+    OperationInFlight,
+    PendingToolWork,
+}
+
+impl CompletionBlocker {
+    fn blocks_commit(self) -> bool {
+        matches!(
+            self,
+            Self::NoActiveTask
+                | Self::TaskIdentityMismatch
+                | Self::TaskNotActive
+                | Self::TaskStateStale
+                | Self::RecoveryRequired
+                | Self::CancelCleanupPending
+                | Self::OperationInFlight
+                | Self::PendingToolWork
+        )
+    }
+
+    pub(crate) fn summary(self) -> String {
+        match self {
+            Self::NoActiveTask => "no active task".into(),
+            Self::TaskIdentityMismatch => {
+                "actor and task manager disagree on the active task".into()
+            }
+            Self::TaskNotActive => "the selected task is not active".into(),
+            Self::TaskStateStale => "execution is bound to an older task-state revision".into(),
+            Self::VerificationBasisStale => {
+                "execution is bound to an older verification revision".into()
+            }
+            Self::VerificationNotCurrent => "trusted verification is not current".into(),
+            Self::OperatorClosureOnly => {
+                "task policy permits durable closure only by an explicit operator".into()
+            }
+            Self::AcceptanceUndeclared => "no acceptance criteria are declared".into(),
+            Self::AcceptanceDeclarationStale { remaining } => format!(
+                "{remaining} acceptance criterion/criteria are not bound to the current host declaration"
+            ),
+            Self::AcceptanceUncovered { remaining } => {
+                format!("{remaining} acceptance criterion/criteria lack current coverage")
+            }
+            Self::OpenLoops { remaining } => format!("{remaining} explicit open loop(s) remain"),
+            Self::NextActionPending => "a concrete next action remains".into(),
+            Self::RequiredContextUnavailable { remaining } => {
+                format!("{remaining} required context item(s) are unavailable")
+            }
+            Self::ExecutionObligations { remaining } => {
+                format!("{remaining} unresolved execution obligation(s) remain")
+            }
+            Self::FailedCommands { remaining } => {
+                format!("{remaining} unresolved failed command(s) remain")
+            }
+            Self::RecoveryRequired => "runtime recovery is required".into(),
+            Self::CancelCleanupPending => "a cancelled operation is still unsettled".into(),
+            Self::OperationInFlight => "an operation is still in flight".into(),
+            Self::PendingToolWork => "tool work is still pending".into(),
+        }
+    }
+}
+
+/// Runtime-owned safety inputs which cannot be derived from task/execution
+/// state alone.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub(crate) struct CompletionSafety {
+    pub recovery_required: bool,
+    pub cancel_cleanup_pending: bool,
+    pub operation_in_flight: bool,
+    pub pending_tool_work: bool,
+    pub required_context_misses: u32,
+}
+
+/// One pure, bounded completion decision shared by settlement, proposals and
+/// the durable commit safe point.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct CompletionReadiness {
+    pub intent: CompletionIntent,
+    pub task_state_basis: Option<TaskStateBasis>,
+    pub verification_basis: Option<VerificationBasis>,
+    pub task_state_current: bool,
+    pub commit_safe: bool,
+    pub verified_ready: bool,
+    blockers: Vec<CompletionBlocker>,
+}
+
+impl CompletionReadiness {
+    pub fn allows_completion(&self) -> bool {
+        self.commit_safe
+            && (self.verified_ready || self.intent == CompletionIntent::ExplicitOperator)
+    }
+
+    pub fn settled_candidate(&self) -> bool {
+        self.commit_safe && self.verified_ready
+    }
+
+    pub fn applicable_blockers(&self) -> Vec<CompletionBlocker> {
+        self.blockers
+            .iter()
+            .copied()
+            .filter(|blocker| {
+                self.intent == CompletionIntent::ModelProposal || blocker.blocks_commit()
+            })
+            .collect()
+    }
+
+    pub fn refusal(&self) -> AgentError {
+        let reasons = self
+            .applicable_blockers()
+            .into_iter()
+            .map(CompletionBlocker::summary)
+            .collect::<Vec<_>>()
+            .join("; ");
+        AgentError::InvalidRequest(if reasons.is_empty() {
+            "completion is not currently authorized".into()
+        } else {
+            format!("completion is not ready: {reasons}")
+        })
+    }
+
+    pub(crate) fn disposition(&self) -> Option<CompletionDisposition> {
+        if !self.allows_completion() {
+            return None;
+        }
+        Some(if self.verified_ready {
+            CompletionDisposition::Verified
+        } else {
+            CompletionDisposition::OperatorOverride
+        })
+    }
+
+    pub(crate) fn override_reasons(&self) -> Vec<CompletionBlocker> {
+        if self.disposition() != Some(CompletionDisposition::OperatorOverride) {
+            return Vec::new();
+        }
+        self.blockers
+            .iter()
+            .copied()
+            .filter(|blocker| !blocker.blocks_commit())
+            .collect()
+    }
+}
+
+/// How Runtime authorized a durable completion record.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CompletionDisposition {
+    /// Record written before the disposition field existed.
+    #[default]
+    LegacyUnclassified,
+    Verified,
+    OperatorOverride,
+}
+
+/// Hard bound on semantic blockers retained by an operator override.
+pub const MAX_COMPLETION_BLOCKERS: usize = 16;
 
 /// One immutable, typed task completion outcome.
 ///
@@ -375,36 +725,372 @@ pub struct CompletionRecord {
     /// Current or Failed. Capped like `artifacts`.
     #[serde(default)]
     pub verification_refs: Vec<String>,
+    /// Whether completion was backed by the full verified-readiness join or
+    /// explicitly acknowledged by the operator despite semantic blockers.
+    #[serde(default)]
+    pub disposition: CompletionDisposition,
+    /// Semantic blockers acknowledged by an operator override. Empty for a
+    /// verified completion and bounded independently of prompt/tool content.
+    #[serde(default)]
+    pub unmet_reasons: Vec<CompletionBlocker>,
 }
 
-/// Stamp completion verification from the live or durable execution state.
-/// Required + not-Current refuses. Optional stale/pending is Unverified;
-/// optional Failed is recorded as Failed; Current attaches evidence refs.
-pub(crate) fn completion_from_execution(
-    state: &crate::execution::ExecutionState,
-) -> AgentResult<(CompletionVerificationStatus, Vec<String>)> {
-    use crate::execution::VerificationState;
-    let validity = state.validity();
-    if state.verification.required_for_completion && validity != VerificationState::Current {
-        return Err(AgentError::InvalidRequest(
-            "verification is required for completion but is not current".into(),
-        ));
+/// Caller-supplied fields for preparing one immutable completion record.
+/// Runtime supplies task identity, anchor revision and completion time from
+/// the active authority state at preparation time.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct CompletionRecordDraft {
+    pub summary: String,
+    pub final_output_ref: Option<String>,
+    pub final_output_digest: Option<String>,
+    pub artifacts: Vec<String>,
+    pub verification_status: CompletionVerificationStatus,
+    pub verification_refs: Vec<String>,
+    pub disposition: CompletionDisposition,
+    pub unmet_reasons: Vec<CompletionBlocker>,
+}
+
+/// Derive the single completion decision for the current task and execution
+/// projection. The function owns no actor state and performs no mutation.
+pub(crate) fn derive_completion_readiness(
+    intent: CompletionIntent,
+    actor_task_id: Option<TaskId>,
+    active_task: Option<&TaskRecord>,
+    execution: Option<&crate::execution::ExecutionState>,
+    safety: CompletionSafety,
+    current_declarations: &[agent_contracts::VerificationCoverageDeclaration],
+) -> CompletionReadiness {
+    let mut blockers = Vec::with_capacity(MAX_COMPLETION_BLOCKERS);
+    let mut push = |blocker| {
+        if blockers.len() < MAX_COMPLETION_BLOCKERS && !blockers.contains(&blocker) {
+            blockers.push(blocker);
+        }
+    };
+
+    let task_state_basis = active_task.map(|task| TaskStateBasis {
+        task_id: task.id,
+        anchor_revision: task.anchor.revision,
+    });
+    let verification_basis =
+        active_task
+            .zip(execution)
+            .map(|(task, execution)| VerificationBasis {
+                task_id: task.id,
+                verification_revision: task.anchor.verification_revision,
+                directive_revision: execution.directive_revision,
+                workspace_revision: execution.workspace_revision,
+            });
+
+    match active_task {
+        None => push(CompletionBlocker::NoActiveTask),
+        Some(task) => {
+            if actor_task_id != Some(task.id) {
+                push(CompletionBlocker::TaskIdentityMismatch);
+            }
+            if task.status != TaskStatus::Active {
+                push(CompletionBlocker::TaskNotActive);
+            }
+            let Some(execution) = execution else {
+                push(CompletionBlocker::TaskStateStale);
+                return finish_completion_readiness(
+                    intent,
+                    task_state_basis,
+                    verification_basis,
+                    blockers,
+                    safety,
+                );
+            };
+            if execution.anchor_revision != task.anchor.revision {
+                push(CompletionBlocker::TaskStateStale);
+            }
+            if execution.verification.spec_revision != task.anchor.verification_revision {
+                push(CompletionBlocker::VerificationBasisStale);
+            }
+
+            let trusted = verification_basis
+                .as_ref()
+                .and_then(|basis| current_trusted_verification(execution, basis));
+            if trusted.is_none() {
+                push(CompletionBlocker::VerificationNotCurrent);
+            }
+
+            if task.anchor.acceptance_criteria.is_empty() {
+                push(CompletionBlocker::AcceptanceUndeclared);
+            }
+            if task.anchor.completion_policy == TaskCompletionPolicy::OperatorClosureOnly {
+                push(CompletionBlocker::OperatorClosureOnly);
+            } else if !task.anchor.acceptance_criteria.is_empty() {
+                let declarations_current = declarations_are_canonical(current_declarations);
+                let stale_declarations = task
+                    .anchor
+                    .acceptance_criteria
+                    .iter()
+                    .filter(|criterion| {
+                        !declarations_current
+                            || !criterion_matches_current_declaration(
+                                criterion,
+                                current_declarations,
+                            )
+                    })
+                    .count();
+                if stale_declarations > 0 {
+                    push(CompletionBlocker::AcceptanceDeclarationStale {
+                        remaining: stale_declarations.min(u32::MAX as usize) as u32,
+                    });
+                }
+                let uncovered = task
+                    .anchor
+                    .acceptance_criteria
+                    .iter()
+                    .enumerate()
+                    .filter(|(index, criterion)| {
+                        !task.anchor.acceptance_coverage.iter().any(|receipt| {
+                            receipt.criterion_index as usize == *index
+                                && receipt.coverage_domain == criterion.coverage_domain
+                                && receipt.domain_declaration_revision
+                                    == criterion.domain_declaration_revision
+                                && receipt.domain_source_digest == criterion.domain_source_digest
+                                && declarations_current
+                                && criterion_matches_current_declaration(
+                                    criterion,
+                                    current_declarations,
+                                )
+                                && verification_basis.as_ref().is_some_and(|basis| {
+                                    acceptance_receipt_fact(execution, task, basis, receipt)
+                                        .is_some()
+                                })
+                        })
+                    })
+                    .count();
+                if uncovered > 0 {
+                    push(CompletionBlocker::AcceptanceUncovered {
+                        remaining: uncovered.min(u32::MAX as usize) as u32,
+                    });
+                }
+            }
+            if !task.anchor.open_loops.is_empty() {
+                push(CompletionBlocker::OpenLoops {
+                    remaining: task.anchor.open_loops.len().min(u32::MAX as usize) as u32,
+                });
+            }
+            if !task.anchor.next_action.trim().is_empty() {
+                push(CompletionBlocker::NextActionPending);
+            }
+            let obligations = execution.open_obligation_count();
+            if obligations > 0 {
+                push(CompletionBlocker::ExecutionObligations {
+                    remaining: obligations.min(u32::MAX as usize) as u32,
+                });
+            }
+            let failed_commands = execution.unresolved_failed_command_count();
+            if failed_commands > 0 {
+                push(CompletionBlocker::FailedCommands {
+                    remaining: failed_commands.min(u32::MAX as usize) as u32,
+                });
+            }
+        }
     }
-    let status = match validity {
-        VerificationState::Current => CompletionVerificationStatus::Current,
-        VerificationState::Failed => CompletionVerificationStatus::Failed,
-        _ => CompletionVerificationStatus::Unverified,
-    };
-    let refs = match status {
-        CompletionVerificationStatus::Unverified => Vec::new(),
-        CompletionVerificationStatus::Current | CompletionVerificationStatus::Failed => state
-            .last_evidence()
-            .and_then(|ev| ev.evidence_ref.clone())
-            .into_iter()
-            .take(MAX_COMPLETION_ARTIFACTS)
-            .collect(),
-    };
-    Ok((status, refs))
+
+    finish_completion_readiness(
+        intent,
+        task_state_basis,
+        verification_basis,
+        blockers,
+        safety,
+    )
+}
+
+fn declarations_are_canonical(
+    declarations: &[agent_contracts::VerificationCoverageDeclaration],
+) -> bool {
+    declarations.len() <= agent_contracts::MAX_VERIFICATION_COVERAGE_DECLARATIONS
+        && declarations
+            .iter()
+            .all(agent_contracts::VerificationCoverageDeclaration::is_valid)
+        && declarations
+            .windows(2)
+            .all(|pair| pair[0].domain_id < pair[1].domain_id)
+}
+
+fn criterion_matches_current_declaration(
+    criterion: &AcceptanceCriterion,
+    declarations: &[agent_contracts::VerificationCoverageDeclaration],
+) -> bool {
+    if criterion.domain_declaration_revision == 0
+        || criterion
+            .domain_source_digest
+            .parse::<agent_contracts::ContentDigest>()
+            .is_err()
+    {
+        return false;
+    }
+    declarations
+        .binary_search_by(|declaration| {
+            declaration
+                .domain_id
+                .as_str()
+                .cmp(criterion.coverage_domain.as_str())
+        })
+        .ok()
+        .map(|index| &declarations[index])
+        .is_some_and(|declaration| {
+            declaration.declaration_revision == criterion.domain_declaration_revision
+                && declaration.source_digest == criterion.domain_source_digest
+        })
+}
+
+fn finish_completion_readiness(
+    intent: CompletionIntent,
+    task_state_basis: Option<TaskStateBasis>,
+    verification_basis: Option<VerificationBasis>,
+    mut blockers: Vec<CompletionBlocker>,
+    safety: CompletionSafety,
+) -> CompletionReadiness {
+    for blocker in [
+        safety
+            .recovery_required
+            .then_some(CompletionBlocker::RecoveryRequired),
+        safety
+            .cancel_cleanup_pending
+            .then_some(CompletionBlocker::CancelCleanupPending),
+        safety
+            .operation_in_flight
+            .then_some(CompletionBlocker::OperationInFlight),
+        safety
+            .pending_tool_work
+            .then_some(CompletionBlocker::PendingToolWork),
+    ]
+    .into_iter()
+    .flatten()
+    {
+        if blockers.len() < MAX_COMPLETION_BLOCKERS && !blockers.contains(&blocker) {
+            blockers.push(blocker);
+        }
+    }
+    if safety.required_context_misses > 0 && blockers.len() < MAX_COMPLETION_BLOCKERS {
+        blockers.push(CompletionBlocker::RequiredContextUnavailable {
+            remaining: safety.required_context_misses,
+        });
+    }
+    let task_state_current = task_state_basis.is_some()
+        && !blockers.iter().copied().any(|blocker| {
+            matches!(
+                blocker,
+                CompletionBlocker::NoActiveTask
+                    | CompletionBlocker::TaskIdentityMismatch
+                    | CompletionBlocker::TaskNotActive
+                    | CompletionBlocker::TaskStateStale
+            )
+        });
+    let commit_safe = task_state_current
+        && !blockers
+            .iter()
+            .copied()
+            .any(CompletionBlocker::blocks_commit);
+    let verified_ready = !blockers
+        .iter()
+        .copied()
+        .any(|blocker| !blocker.blocks_commit());
+    CompletionReadiness {
+        intent,
+        task_state_basis,
+        verification_basis,
+        task_state_current,
+        commit_safe,
+        verified_ready,
+        blockers,
+    }
+}
+
+fn current_trusted_verification<'a>(
+    state: &'a crate::execution::ExecutionState,
+    basis: &VerificationBasis,
+) -> Option<&'a crate::execution::VerificationFact> {
+    if state.verification.spec_revision != basis.verification_revision
+        || state.validity() != crate::execution::VerificationState::Current
+    {
+        return None;
+    }
+    let trusted_identity = state.trusted_verification_identity()?;
+    state.verifications.iter().rev().find(|fact| {
+        fact.ok
+            && !fact.source_tool_name.is_empty()
+            && fact.verification_identity == trusted_identity
+            && fact.anchor_revision == basis.verification_revision
+            && fact.directive_revision == basis.directive_revision
+            && fact.workspace_revision == basis.workspace_revision
+    })
+}
+
+/// Resolve one acceptance receipt to the exact current trusted PASS it
+/// names. Unlike the single latest verification used for completion-summary
+/// provenance, criterion receipts may legitimately point at different PASS
+/// facts from the same task/directive/world basis.
+pub(crate) fn acceptance_receipt_fact<'a>(
+    state: &'a crate::execution::ExecutionState,
+    task: &TaskRecord,
+    basis: &VerificationBasis,
+    receipt: &AcceptanceCoverage,
+) -> Option<&'a crate::execution::VerificationFact> {
+    if state.verification.spec_revision != basis.verification_revision
+        || state.validity() != crate::execution::VerificationState::Current
+        || receipt.task_id != Some(task.id)
+        || receipt.verification_revision != basis.verification_revision
+        || receipt.directive_revision != basis.directive_revision
+        || receipt.workspace_revision != basis.workspace_revision
+        || receipt.domain_declaration_revision == 0
+        || receipt
+            .domain_source_digest
+            .parse::<agent_contracts::ContentDigest>()
+            .is_err()
+    {
+        return None;
+    }
+    state.verifications.iter().rev().find(|fact| {
+        fact.ok
+            && !fact.source_tool_name.is_empty()
+            && fact.anchor_revision == basis.verification_revision
+            && fact.directive_revision == basis.directive_revision
+            && fact.workspace_revision == basis.workspace_revision
+            && fact.verification_identity == receipt.verification_identity
+            && fact.recipe_provenance.as_ref().is_some_and(|provenance| {
+                provenance.coverage_domain.as_deref() == Some(receipt.coverage_domain.as_str())
+                    && provenance.domain_declaration_revision
+                        == Some(receipt.domain_declaration_revision)
+                    && provenance.domain_source_digest == receipt.domain_source_digest
+            })
+    })
+}
+
+/// Stamp evidence on the completion record without making a second decision.
+/// Only an exact trusted PASS on the already-derived verification basis may be
+/// recorded as Current.
+pub(crate) fn completion_evidence(
+    state: &crate::execution::ExecutionState,
+    basis: Option<&VerificationBasis>,
+) -> (CompletionVerificationStatus, Vec<String>) {
+    let current = basis.and_then(|basis| current_trusted_verification(state, basis));
+    if let Some(fact) = current {
+        return (
+            CompletionVerificationStatus::Current,
+            fact.evidence_ref.clone().into_iter().collect(),
+        );
+    }
+    let failed = basis.and_then(|basis| {
+        state.verifications.iter().rev().find(|fact| {
+            !fact.ok
+                && fact.anchor_revision == basis.verification_revision
+                && fact.directive_revision == basis.directive_revision
+                && fact.workspace_revision == basis.workspace_revision
+        })
+    });
+    match failed {
+        Some(fact) => (
+            CompletionVerificationStatus::Failed,
+            fact.evidence_ref.clone().into_iter().collect(),
+        ),
+        None => (CompletionVerificationStatus::Unverified, Vec::new()),
+    }
 }
 
 /// Validate a structured completion proposal from `task.complete` before
@@ -655,12 +1341,7 @@ impl TaskManager {
     /// `artifact://` refs recorded on the outcome.
     pub fn prepare_complete(
         &self,
-        summary: String,
-        final_output_ref: Option<String>,
-        final_output_digest: Option<String>,
-        artifacts: Vec<String>,
-        verification_status: CompletionVerificationStatus,
-        verification_refs: Vec<String>,
+        draft: CompletionRecordDraft,
     ) -> Option<(TaskTxn, CompletionRecord)> {
         let active = self.active?;
         let anchor_revision = self
@@ -669,6 +1350,17 @@ impl TaskManager {
             .find(|task| task.id == active)
             .map(|task| task.anchor.revision)
             .unwrap_or_default();
+        let CompletionRecordDraft {
+            summary,
+            final_output_ref,
+            final_output_digest,
+            artifacts,
+            verification_status,
+            verification_refs,
+            disposition,
+            mut unmet_reasons,
+        } = draft;
+        unmet_reasons.truncate(MAX_COMPLETION_BLOCKERS);
         let record = CompletionRecord {
             task_id: active,
             anchor_revision,
@@ -679,6 +1371,8 @@ impl TaskManager {
             artifacts,
             verification_status,
             verification_refs,
+            disposition,
+            unmet_reasons,
         };
         Some((
             TaskTxn {
@@ -824,6 +1518,30 @@ impl TaskManager {
             )));
         }
 
+        // Both revisions are Runtime-owned. Stamp the current bases before
+        // receipt validation so arbitrary caller values cannot either reject
+        // an otherwise valid replacement or authorize a foreign basis.
+        anchor.revision = task.anchor.revision;
+        anchor.verification_revision = task.anchor.verification_revision;
+
+        let acceptance_boundary_changed = anchor.completion_policy != task.anchor.completion_policy
+            || anchor.acceptance_criteria != task.anchor.acceptance_criteria;
+        if acceptance_boundary_changed {
+            if !anchor.acceptance_coverage.is_empty()
+                && anchor.acceptance_coverage != task.anchor.acceptance_coverage
+            {
+                return Err(AgentError::InvalidRequest(
+                    "acceptance receipts are runtime-owned and cannot be supplied through an authority replacement"
+                        .into(),
+                ));
+            }
+            anchor.acceptance_coverage.clear();
+        } else if anchor.acceptance_coverage != task.anchor.acceptance_coverage {
+            return Err(AgentError::InvalidRequest(
+                "acceptance receipts are runtime-owned and cannot be replaced through the generic anchor API"
+                    .into(),
+            ));
+        }
         normalize_anchor(&mut anchor)?;
         let changed_fields = anchor_changed_fields(&task.anchor, &anchor);
         let authority_changed = changed_fields.iter().any(|field| is_authority_field(field));
@@ -836,8 +1554,11 @@ impl TaskManager {
         };
         anchor.revision = revision;
         if authority_changed {
-            anchor.verification_revision =
-                anchor.verification_revision.checked_add(1).ok_or_else(|| {
+            anchor.verification_revision = task
+                .anchor
+                .verification_revision
+                .checked_add(1)
+                .ok_or_else(|| {
                     AgentError::InvalidRequest(format!(
                         "task {task_id} verification revision is exhausted"
                     ))
@@ -861,10 +1582,10 @@ impl TaskManager {
     /// Plan a bounded, field-level CAS patch of one task's anchor.
     ///
     /// The patch is classified before it reaches the task table: patches
-    /// touching only runtime-evolvable fields (interpretation, plan, open
-    /// loops, criteria, refs) are `Autonomous` and apply directly; patches
-    /// touching goal/constraints are `Boundary` and must clear the approval
-    /// gate before this transaction is committed. Completed tasks are
+    /// touching only host/runtime-ingested fields (including completion
+    /// policy/criteria) are `Autonomous` and apply directly; patches touching
+    /// goal/constraints are `Boundary` and must clear the approval gate.
+    /// Completed tasks are
     /// immutable and the `base_revision` must still match, exactly like a
     /// whole-anchor replacement. Returns the transaction, the resulting
     /// revision, the capped changed-field list and the authority kind.
@@ -888,13 +1609,25 @@ impl TaskManager {
                 task.anchor.revision
             )));
         }
+        if patch.acceptance_coverage.is_some() {
+            return Err(AgentError::InvalidRequest(
+                "acceptance receipts are runtime-owned and cannot be patched through the generic anchor API"
+                    .into(),
+            ));
+        }
         let kind = patch.kind();
         let mut replacement = patch.apply_to(&task.anchor);
+        let acceptance_boundary_changed = replacement.completion_policy
+            != task.anchor.completion_policy
+            || replacement.acceptance_criteria != task.anchor.acceptance_criteria;
+        if acceptance_boundary_changed {
+            replacement.acceptance_coverage.clear();
+        }
         normalize_anchor(&mut replacement)?;
         let changed_fields = anchor_changed_fields(&task.anchor, &replacement);
         // A patch that moves only runtime-evolvable fields advances the
         // record CAS without touching the verification basis; a boundary
-        // patch (goal/constraints) invalidates dependent verification.
+        // patch (goal/constraints/completion authority) invalidates proof.
         let authority_changed = kind == AnchorPatchKind::Boundary
             || changed_fields.iter().any(|field| is_authority_field(field));
         let revision = if changed_fields.is_empty() {
@@ -928,6 +1661,70 @@ impl TaskManager {
             revision,
             changed_fields,
             kind,
+        ))
+    }
+
+    /// Plan Runtime's sole acceptance-receipt mutation. The caller must have
+    /// observed and matched a trusted PASS already; this transaction only
+    /// enforces bounded/canonical task authority and advances the record CAS.
+    /// It deliberately preserves `verification_revision`, so the receipt does
+    /// not stale the PASS that earned it.
+    pub(crate) fn prepare_record_acceptance_receipts(
+        &self,
+        task_id: TaskId,
+        base_revision: u64,
+        receipts: Vec<AcceptanceCoverage>,
+    ) -> AgentResult<(TaskTxn, u64, Vec<String>)> {
+        let task = self.get(task_id).ok_or_else(|| {
+            AgentError::InvalidRequest(format!("task {task_id} is not registered"))
+        })?;
+        if task.status == TaskStatus::Completed {
+            return Err(AgentError::InvalidRequest(format!(
+                "task {task_id} is completed and its acceptance receipts are immutable"
+            )));
+        }
+        if task.anchor.revision != base_revision {
+            return Err(AgentError::InvalidRequest(format!(
+                "task {task_id} anchor revision mismatch: expected {}, got {base_revision}",
+                task.anchor.revision
+            )));
+        }
+        if task.anchor.completion_policy != TaskCompletionPolicy::EvidenceRequired {
+            return Err(AgentError::InvalidRequest(
+                "operator-closure-only tasks cannot receive acceptance receipts".into(),
+            ));
+        }
+        if receipts
+            .iter()
+            .any(|receipt| receipt.task_id != Some(task_id))
+        {
+            return Err(AgentError::InvalidRequest(
+                "acceptance receipt task identity does not match the target task".into(),
+            ));
+        }
+        let mut replacement = task.anchor.clone();
+        replacement.acceptance_coverage = receipts;
+        normalize_anchor(&mut replacement)?;
+        let changed_fields = anchor_changed_fields(&task.anchor, &replacement);
+        let revision = if changed_fields.is_empty() {
+            base_revision
+        } else {
+            base_revision.checked_add(1).ok_or_else(|| {
+                AgentError::InvalidRequest(format!("task {task_id} anchor revision is exhausted"))
+            })?
+        };
+        replacement.revision = revision;
+        replacement.verification_revision = task.anchor.verification_revision;
+        Ok((
+            TaskTxn {
+                plan: TaskPlan::ReplaceAnchor {
+                    target: task_id,
+                    replacement,
+                    authority_changed: false,
+                },
+            },
+            revision,
+            changed_fields,
         ))
     }
 
@@ -1116,29 +1913,128 @@ pub(crate) fn normalize_anchor(anchor: &mut TaskAnchor) -> AgentResult<()> {
     )?;
     for (field, list) in [
         ("constraints", &anchor.constraints),
-        ("acceptance_criteria", &anchor.acceptance_criteria),
         ("plan_progress", &anchor.plan_progress),
         ("open_loops", &anchor.open_loops),
     ] {
         check_bounded_list(field, list)?;
     }
-    // Acceptance-coverage claims are bounded like the anchor lists, each
-    // identity is bounded text, and a claim must address a declared
-    // criterion (an out-of-range or fabricated index covers nothing).
+    if anchor.acceptance_criteria.len() > MAX_TASK_ANCHOR_LIST_ITEMS {
+        return Err(AgentError::InvalidRequest(format!(
+            "anchor acceptance_criteria carries {} entries, above the {MAX_TASK_ANCHOR_LIST_ITEMS} cap",
+            anchor.acceptance_criteria.len()
+        )));
+    }
+    for criterion in &anchor.acceptance_criteria {
+        check_bounded_text("anchor acceptance criterion", &criterion.description)?;
+        if anchor.completion_policy == TaskCompletionPolicy::EvidenceRequired
+            || !criterion.coverage_domain.is_empty()
+        {
+            check_coverage_domain(&criterion.coverage_domain)?;
+        }
+        if !criterion.domain_source_digest.is_empty()
+            && criterion
+                .domain_source_digest
+                .parse::<agent_contracts::ContentDigest>()
+                .is_err()
+        {
+            return Err(AgentError::InvalidRequest(
+                "anchor acceptance criterion has an invalid coverage-domain source digest".into(),
+            ));
+        }
+    }
+    match anchor.completion_policy {
+        TaskCompletionPolicy::EvidenceRequired if anchor.acceptance_criteria.is_empty() => {
+            return Err(AgentError::InvalidRequest(
+                "evidence-required tasks must declare at least one acceptance criterion".into(),
+            ));
+        }
+        _ => {}
+    }
+    // Receipts are canonical by criterion and every field is bounded. The
+    // task-id equality is checked by the task-aware transaction/checkpoint
+    // validator because a standalone anchor has no task identity.
     if anchor.acceptance_coverage.len() > MAX_TASK_ANCHOR_LIST_ITEMS {
         return Err(AgentError::InvalidRequest(format!(
             "anchor acceptance_coverage carries {} claims, above the {MAX_TASK_ANCHOR_LIST_ITEMS} cap",
             anchor.acceptance_coverage.len()
         )));
     }
+    anchor
+        .acceptance_coverage
+        .sort_by_key(|receipt| receipt.criterion_index);
+    if anchor
+        .acceptance_coverage
+        .windows(2)
+        .any(|pair| pair[0].criterion_index == pair[1].criterion_index)
+    {
+        return Err(AgentError::InvalidRequest(
+            "anchor acceptance_coverage contains duplicate criterion receipts".into(),
+        ));
+    }
     for claim in &anchor.acceptance_coverage {
-        check_bounded_text("anchor acceptance_coverage identity", &claim.verification_identity)?;
+        check_bounded_text(
+            "anchor acceptance_coverage identity",
+            &claim.verification_identity,
+        )?;
         if claim.criterion_index as usize >= anchor.acceptance_criteria.len() {
             return Err(AgentError::InvalidRequest(format!(
                 "anchor acceptance_coverage addresses criterion {}, beyond the {} declared criteria",
                 claim.criterion_index,
                 anchor.acceptance_criteria.len()
             )));
+        }
+        let criterion = &anchor.acceptance_criteria[claim.criterion_index as usize];
+        if anchor.completion_policy == TaskCompletionPolicy::OperatorClosureOnly {
+            // Legacy v4 anchors carried string criteria and weak claims.
+            // Preserve them for restore/audit but never interpret them as
+            // receipts: the explicit policy blocks model completion.
+            continue;
+        }
+        check_coverage_domain(&claim.coverage_domain)?;
+        if claim.coverage_domain != criterion.coverage_domain {
+            return Err(AgentError::InvalidRequest(format!(
+                "anchor acceptance receipt domain '{}' does not match criterion {} domain '{}'",
+                claim.coverage_domain, claim.criterion_index, criterion.coverage_domain
+            )));
+        }
+        if claim.verification_revision != anchor.verification_revision {
+            return Err(AgentError::InvalidRequest(format!(
+                "anchor acceptance receipt for criterion {} names verification revision {}, expected {}",
+                claim.criterion_index, claim.verification_revision, anchor.verification_revision
+            )));
+        }
+        if !claim.domain_source_digest.is_empty()
+            && claim
+                .domain_source_digest
+                .parse::<agent_contracts::ContentDigest>()
+                .is_err()
+        {
+            return Err(AgentError::InvalidRequest(
+                "anchor acceptance receipt has an invalid coverage-domain source digest".into(),
+            ));
+        }
+        let criterion_fully_bound =
+            criterion.domain_declaration_revision > 0 && !criterion.domain_source_digest.is_empty();
+        let receipt_fully_bound =
+            claim.domain_declaration_revision > 0 && !claim.domain_source_digest.is_empty();
+        if criterion_fully_bound
+            && receipt_fully_bound
+            && (claim.domain_declaration_revision != criterion.domain_declaration_revision
+                || claim.domain_source_digest != criterion.domain_source_digest)
+        {
+            return Err(AgentError::InvalidRequest(format!(
+                "anchor acceptance receipt declaration identity does not match criterion {}",
+                claim.criterion_index
+            )));
+        }
+        if claim
+            .verification_identity
+            .parse::<agent_contracts::ContentDigest>()
+            .is_err()
+        {
+            return Err(AgentError::InvalidRequest(
+                "anchor acceptance receipt has an invalid verification identity".into(),
+            ));
         }
     }
     check_bounded_text("anchor next_action", &anchor.next_action)?;
@@ -1160,16 +2056,37 @@ pub(crate) fn normalize_anchor(anchor: &mut TaskAnchor) -> AgentResult<()> {
     Ok(())
 }
 
-/// Authority fields of the anchor: moving any of them is a boundary-class
-/// change that invalidates dependent verification. Everything else
+fn check_coverage_domain(domain: &str) -> AgentResult<()> {
+    let chars = domain.chars().count();
+    if chars == 0 || chars > MAX_TASK_ANCHOR_ITEM_CHARS {
+        return Err(AgentError::InvalidRequest(format!(
+            "acceptance coverage domain has {chars} chars (allowed 1..={MAX_TASK_ANCHOR_ITEM_CHARS})"
+        )));
+    }
+    if !domain.chars().all(|character| {
+        character.is_ascii_alphanumeric() || matches!(character, '.' | '_' | '-' | ':')
+    }) {
+        return Err(AgentError::InvalidRequest(format!(
+            "acceptance coverage domain '{domain}': only [A-Za-z0-9._:-] are allowed"
+        )));
+    }
+    Ok(())
+}
+
+/// Verification-authority fields of the anchor: moving any of them
+/// invalidates dependent verification. This is deliberately orthogonal to
+/// approval classification: host-declared completion authority is not a
+/// user goal/constraint waiver. Everything else
 /// (interpretation, plan, open loops, next action, refs) advances only the
 /// record CAS. Acceptance criteria move the basis too: they are the
 /// authoritative verdict the completion outcome is measured against, so a
-/// changed criterion requires fresh proof. Model-derived criteria remain
-/// proposals — `task.manage` cannot submit this field — so no criterion
-/// approval gate is implied here; only dependent verification is staled.
+/// changed criterion requires fresh proof. `task.manage` cannot submit this
+/// field; trusted host/operator anchor APIs may ingest it directly.
 fn is_authority_field(field: &str) -> bool {
-    matches!(field, "original_goal" | "constraints" | "acceptance_criteria")
+    matches!(
+        field,
+        "original_goal" | "constraints" | "completion_policy" | "acceptance_criteria"
+    )
 }
 
 /// The capped list of anchor field names whose content differs from `old`,
@@ -1195,6 +2112,11 @@ pub(crate) fn anchor_changed_fields(old: &TaskAnchor, new: &TaskAnchor) -> Vec<S
     consider(
         "constraints",
         old.constraints != new.constraints,
+        &mut changed,
+    );
+    consider(
+        "completion_policy",
+        old.completion_policy != new.completion_policy,
         &mut changed,
     );
     consider(
@@ -1232,7 +2154,7 @@ pub(crate) fn anchor_changed_fields(old: &TaskAnchor, new: &TaskAnchor) -> Vec<S
 }
 
 /// The authority split of an anchor change whose moved fields are known:
-/// boundary when any goal/constraint field moved (user authority), else
+/// boundary when any goal/constraint field moved, else
 /// autonomous. Used both by whole-anchor replacements (audit labeling) and
 /// field-level patches (where `AnchorPatch::kind` classifies the intent and
 /// this labels the result consistently).
@@ -1256,57 +2178,6 @@ pub(crate) const SETTLED_CANDIDATE_PROMPT_LINE: &str = "TASK SETTLED: every acce
      is covered by a current trusted verification, the task epoch matches, and no open loop or \
      next action remains. You may give an ordinary final answer, call task.complete for durable \
      closure, or continue with concrete remaining work.";
-
-/// The task-aware settlement gate. `SettledCandidate` requires the
-/// execution-local world to be ready ([`ExecutionState::execution_ready`])
-/// and the task anchor to agree with it: the anchor epoch the execution
-/// tracked must be the anchor's current revision (boundary moves and
-/// reopenings invalidate readiness immediately), no open loop or next
-/// action may remain, and every declared acceptance criterion must carry a
-/// coverage claim resolving to the execution's current trusted verification
-/// pass. `in_flight_clear` is the actor gate: a live tool call or a pending
-/// cancel cleanup means the world is not settled even when the execution
-/// facts look ready. With no declared acceptance coverage the gate fails
-/// closed, so the strongest label stays `VerifiedCurrent`.
-pub fn task_ready(
-    anchor: &TaskAnchor,
-    execution: &crate::execution::ExecutionState,
-    in_flight_clear: bool,
-) -> bool {
-    if !in_flight_clear || !execution.execution_ready() {
-        return false;
-    }
-    if execution.anchor_revision != anchor.revision {
-        return false;
-    }
-    if !anchor.open_loops.is_empty() || !anchor.next_action.trim().is_empty() {
-        return false;
-    }
-    acceptance_covered(anchor, execution)
-}
-
-/// Whether every bounded acceptance criterion has live explicit evidence:
-/// a claim addressing exactly that criterion index whose verification
-/// identity is the execution's current trusted pass. A missing, stale or
-/// fabricated identity never covers, and zero declared criteria fail
-/// closed (no evidence coverage is claimed).
-fn acceptance_covered(anchor: &TaskAnchor, execution: &crate::execution::ExecutionState) -> bool {
-    if anchor.acceptance_criteria.is_empty() {
-        return false;
-    }
-    let Some(trusted) = execution.trusted_verification_identity() else {
-        return false;
-    };
-    anchor
-        .acceptance_criteria
-        .iter()
-        .enumerate()
-        .all(|(index, _)| {
-            anchor.acceptance_coverage.iter().any(|claim| {
-                claim.criterion_index as usize == index && claim.verification_identity == trusted
-            })
-        })
-}
 
 fn check_bounded_text(field: &str, value: &str) -> AgentResult<()> {
     let chars = value.chars().count();
@@ -1363,8 +2234,18 @@ pub(crate) fn validate_tool_requirement_set(
 /// consistent with the CAS flow: the initial anchor is revision 0 with no
 /// evolved fields (only the original goal), so a checkpoint cannot mint a
 /// zero-revision anchor that pretends to have evolved content.
-pub(crate) fn validate_anchor(anchor: &TaskAnchor) -> AgentResult<()> {
+pub(crate) fn validate_anchor(task_id: TaskId, anchor: &TaskAnchor) -> AgentResult<()> {
     normalize_anchor(&mut anchor.clone())?;
+    if anchor.completion_policy == TaskCompletionPolicy::EvidenceRequired
+        && anchor
+            .acceptance_coverage
+            .iter()
+            .any(|receipt| receipt.task_id != Some(task_id))
+    {
+        return Err(AgentError::InvalidRequest(
+            "task anchor contains an acceptance receipt for a different task".into(),
+        ));
+    }
     let empty_evolved = TaskAnchor {
         original_goal: anchor.original_goal.clone(),
         ..TaskAnchor::default()
@@ -1442,14 +2323,10 @@ mod tests {
         assert_eq!(tasks.get(b).map(|t| t.status), Some(TaskStatus::Suspended));
 
         let (txn, _record) = tasks
-            .prepare_complete(
-                "done".into(),
-                None,
-                None,
-                Vec::new(),
-                CompletionVerificationStatus::Unverified,
-                Vec::new(),
-            )
+            .prepare_complete(CompletionRecordDraft {
+                summary: "done".into(),
+                ..CompletionRecordDraft::default()
+            })
             .expect("a is active");
         tasks.commit(txn);
         assert_eq!(tasks.get(a).map(|t| t.status), Some(TaskStatus::Completed));
@@ -1477,14 +2354,10 @@ mod tests {
         assert!(tasks.prepare_activate(TaskId::new()).is_none());
         assert!(
             tasks
-                .prepare_complete(
-                    "done".into(),
-                    None,
-                    None,
-                    Vec::new(),
-                    CompletionVerificationStatus::Unverified,
-                    Vec::new(),
-                )
+                .prepare_complete(CompletionRecordDraft {
+                    summary: "done".into(),
+                    ..CompletionRecordDraft::default()
+                })
                 .is_none()
         );
     }
@@ -1503,7 +2376,8 @@ mod tests {
                 ..AnchorPatch::default()
             }
             .kind(),
-            AnchorPatchKind::Autonomous
+            AnchorPatchKind::Autonomous,
+            "trusted completion authority invalidates proof without requiring an approval round"
         );
 
         let boundary = AnchorPatch {
@@ -1536,6 +2410,7 @@ mod tests {
             original_goal: "goal".into(),
             current_interpretation: "interpretation".into(),
             constraints: vec!["c1".into()],
+            completion_policy: TaskCompletionPolicy::OperatorClosureOnly,
             acceptance_criteria: vec!["crit".into()],
             acceptance_coverage: Vec::new(),
             plan_progress: vec!["done".into()],
@@ -1562,7 +2437,7 @@ mod tests {
         assert_eq!(next.original_goal, "goal");
         assert_eq!(next.current_interpretation, "interpretation");
         assert_eq!(next.constraints, vec!["c1".to_string()]);
-        assert_eq!(next.acceptance_criteria, vec!["crit".to_string()]);
+        assert_eq!(next.acceptance_criteria[0].description, "crit");
         assert_eq!(next.plan_progress, vec!["next".to_string()]);
         assert_eq!(next.open_loops, vec!["loop".to_string()]);
         assert_eq!(next.working_refs.len(), 1);
@@ -1645,14 +2520,10 @@ mod tests {
         );
 
         let (txn, _record) = tasks
-            .prepare_complete(
-                "done".into(),
-                None,
-                None,
-                Vec::new(),
-                CompletionVerificationStatus::Unverified,
-                Vec::new(),
-            )
+            .prepare_complete(CompletionRecordDraft {
+                summary: "done".into(),
+                ..CompletionRecordDraft::default()
+            })
             .expect("active task completes");
         tasks.commit(txn);
         let closed = tasks.prepare_patch_anchor(
@@ -1800,9 +2671,7 @@ mod tests {
             .expect("initial CAS is valid");
         assert!(
             !changed.iter().any(|field| {
-                field == "original_goal"
-                    || field == "constraints"
-                    || field == "acceptance_criteria"
+                field == "original_goal" || field == "constraints" || field == "acceptance_criteria"
             }),
             "fixture must not touch authority fields, got {changed:?}"
         );
@@ -1838,8 +2707,7 @@ mod tests {
         };
         use crate::opportunity::derive_completion_opportunity;
         use agent_contracts::{
-            ResourceFreshness, ToolExecutionAttribution, ToolExecutionPurpose,
-            VerificationReuse,
+            ResourceFreshness, ToolExecutionAttribution, ToolExecutionPurpose, VerificationReuse,
         };
         use serde_json::json;
 
@@ -1907,43 +2775,36 @@ mod tests {
         assert_eq!(task.anchor.verification_revision, 0);
         assert_eq!(task.resume.verification.spec_revision, 0);
         assert_eq!(task.resume.validity(), VerificationState::Current);
+        let basis = VerificationBasis {
+            task_id: id,
+            verification_revision: task.anchor.verification_revision,
+            directive_revision: task.resume.directive_revision,
+            workspace_revision: task.resume.workspace_revision,
+        };
         assert!(
             matches!(
-                completion_from_execution(&task.resume)
-                    .unwrap()
-                    .0,
+                completion_evidence(&task.resume, Some(&basis)).0,
                 CompletionVerificationStatus::Current
             ),
             "progress-only CAS must keep completion verification Current"
         );
         assert!(
             task.resume
-                .current_exact_verification_pass(
-                    "test.verify",
-                    "arg-verify",
-                    0,
-                    &exact
-                )
+                .current_exact_verification_pass("test.verify", "arg-verify", 0, &exact)
                 .is_some(),
             "progress-only CAS must keep exact reuse on the same basis"
         );
-        let decision = derive_completion_opportunity(
-            id,
-            &task.anchor,
-            &task.resume,
-            false,
-            false,
-            false,
-        );
+        let decision =
+            derive_completion_opportunity(id, &task.anchor, &task.resume, false, false, false);
         assert!(
             decision.ready.is_some(),
             "progress-only CAS must keep the derived opportunity eligible"
         );
 
-        // A trusted acceptance-criteria change moves the basis without
-        // entering the approval gate (model-derived criteria stay
-        // proposals; only dependent verification is staled). Every consumer
-        // now agrees the old PASS is stale.
+        // A trusted host acceptance-criteria change moves the proof basis.
+        // Every consumer agrees the old PASS is stale; model-routable
+        // `task.manage` cannot submit this field, so no approval round is
+        // required merely to ingest the host declaration.
         let (txn, revision, _, kind) = tasks
             .prepare_patch_anchor(
                 id,
@@ -1957,7 +2818,7 @@ mod tests {
         assert_eq!(
             kind,
             AnchorPatchKind::Autonomous,
-            "criteria changes stay out of the approval gate; the basis moves"
+            "host completion authority is not a user goal/constraint boundary"
         );
         tasks.commit(txn);
         let task = tasks.get(id).unwrap();
@@ -1965,34 +2826,27 @@ mod tests {
         assert_eq!(task.anchor.verification_revision, 1);
         assert_eq!(task.resume.verification.spec_revision, 1);
         assert_eq!(task.resume.validity(), VerificationState::Stale);
+        let basis = VerificationBasis {
+            task_id: id,
+            verification_revision: task.anchor.verification_revision,
+            directive_revision: task.resume.directive_revision,
+            workspace_revision: task.resume.workspace_revision,
+        };
         assert!(
             matches!(
-                completion_from_execution(&task.resume)
-                    .unwrap()
-                    .0,
+                completion_evidence(&task.resume, Some(&basis)).0,
                 CompletionVerificationStatus::Unverified
             ),
             "a moved basis must downgrade completion verification"
         );
         assert!(
             task.resume
-                .current_exact_verification_pass(
-                    "test.verify",
-                    "arg-verify",
-                    1,
-                    &exact
-                )
+                .current_exact_verification_pass("test.verify", "arg-verify", 1, &exact)
                 .is_none(),
             "a moved basis must refuse exact reuse of the old PASS"
         );
-        let decision = derive_completion_opportunity(
-            id,
-            &task.anchor,
-            &task.resume,
-            false,
-            false,
-            false,
-        );
+        let decision =
+            derive_completion_opportunity(id, &task.anchor, &task.resume, false, false, false);
         assert!(
             decision.ready.is_none(),
             "a moved basis must block the derived opportunity"
@@ -2026,22 +2880,11 @@ mod tests {
         assert_eq!(task.resume.validity(), VerificationState::Stale);
         assert!(
             task.resume
-                .current_exact_verification_pass(
-                    "test.verify",
-                    "arg-verify",
-                    1,
-                    &exact
-                )
+                .current_exact_verification_pass("test.verify", "arg-verify", 1, &exact)
                 .is_none()
         );
-        let decision = derive_completion_opportunity(
-            id,
-            &task.anchor,
-            &task.resume,
-            false,
-            false,
-            false,
-        );
+        let decision =
+            derive_completion_opportunity(id, &task.anchor, &task.resume, false, false, false);
         assert!(decision.ready.is_none());
     }
 
@@ -2150,14 +2993,10 @@ mod tests {
         let mut tasks = TaskManager::new();
         let task_id = create(&mut tasks, "task A");
         let (txn, _record) = tasks
-            .prepare_complete(
-                "done".into(),
-                None,
-                None,
-                Vec::new(),
-                CompletionVerificationStatus::Unverified,
-                Vec::new(),
-            )
+            .prepare_complete(CompletionRecordDraft {
+                summary: "done".into(),
+                ..CompletionRecordDraft::default()
+            })
             .expect("task is active");
         tasks.commit(txn);
 
@@ -2198,6 +3037,7 @@ mod tests {
             original_goal: "task A".into(),
             current_interpretation: "refactor the auth module".into(),
             constraints: vec!["no dependency changes".into()],
+            completion_policy: TaskCompletionPolicy::OperatorClosureOnly,
             acceptance_criteria: vec!["tests pass".into(), "api unchanged".into()],
             acceptance_coverage: Vec::new(),
             plan_progress: vec!["read the module".into()],
@@ -2268,6 +3108,83 @@ mod tests {
     }
 
     #[test]
+    fn generic_anchor_updates_cannot_mint_receipts_and_boundary_change_clears_them() {
+        let mut tasks = TaskManager::new();
+        let task_id = create(&mut tasks, "task A");
+        let (authority, revision, _, _) = tasks
+            .prepare_patch_anchor(
+                task_id,
+                0,
+                &AnchorPatch {
+                    completion_policy: Some(TaskCompletionPolicy::EvidenceRequired),
+                    acceptance_criteria: Some(vec![AcceptanceCriterion::new(
+                        "workspace tests pass",
+                        "workspace-tests",
+                    )]),
+                    ..AnchorPatch::default()
+                },
+            )
+            .unwrap();
+        tasks.commit(authority);
+        assert_eq!(revision, 1);
+        let receipt = AcceptanceCoverage {
+            task_id: Some(task_id),
+            verification_revision: 1,
+            criterion_index: 0,
+            coverage_domain: "workspace-tests".into(),
+            domain_declaration_revision: 1,
+            domain_source_digest: agent_contracts::ContentDigest::sha256_bytes(
+                b"workspace-tests/source",
+            )
+            .to_string(),
+            directive_revision: 1,
+            workspace_revision: 2,
+            verification_identity: agent_contracts::ContentDigest::sha256_bytes(b"verifier")
+                .to_string(),
+        };
+        let (record, receipt_revision, _) = tasks
+            .prepare_record_acceptance_receipts(task_id, revision, vec![receipt.clone()])
+            .unwrap();
+        tasks.commit(record);
+        assert_eq!(receipt_revision, 2);
+
+        let mut fabricated = tasks.get(task_id).unwrap().anchor.clone();
+        fabricated.acceptance_coverage[0].workspace_revision += 1;
+        assert!(matches!(
+            tasks.prepare_replace_anchor(task_id, receipt_revision, fabricated),
+            Err(AgentError::InvalidRequest(_))
+        ));
+        assert!(matches!(
+            tasks.prepare_patch_anchor(
+                task_id,
+                receipt_revision,
+                &AnchorPatch {
+                    acceptance_coverage: Some(vec![receipt]),
+                    ..AnchorPatch::default()
+                }
+            ),
+            Err(AgentError::InvalidRequest(_))
+        ));
+
+        // A legitimate authority replacement need not echo Runtime-owned
+        // receipts. Empty input is accepted and the old proof is cleared.
+        let mut changed = tasks.get(task_id).unwrap().anchor.clone();
+        changed.acceptance_criteria.push(AcceptanceCriterion::new(
+            "public API remains compatible",
+            "api-contract",
+        ));
+        changed.acceptance_coverage.clear();
+        let (boundary, next_revision, _) = tasks
+            .prepare_replace_anchor(task_id, receipt_revision, changed)
+            .unwrap();
+        tasks.commit(boundary);
+        let anchor = &tasks.get(task_id).unwrap().anchor;
+        assert_eq!(next_revision, receipt_revision + 1);
+        assert!(anchor.acceptance_coverage.is_empty());
+        assert_eq!(anchor.verification_revision, 2);
+    }
+
+    #[test]
     fn anchor_validation_is_bounded_and_refuses_empty_entries() {
         let mut tasks = TaskManager::new();
         let task_id = create(&mut tasks, "task A");
@@ -2315,14 +3232,10 @@ mod tests {
         let mut tasks = TaskManager::new();
         let task_id = create(&mut tasks, "task A");
         let (txn, _record) = tasks
-            .prepare_complete(
-                "done".into(),
-                None,
-                None,
-                Vec::new(),
-                CompletionVerificationStatus::Unverified,
-                Vec::new(),
-            )
+            .prepare_complete(CompletionRecordDraft {
+                summary: "done".into(),
+                ..CompletionRecordDraft::default()
+            })
             .expect("task is active");
         tasks.commit(txn);
 
@@ -2362,14 +3275,10 @@ mod tests {
         tasks.commit(replace);
 
         let (txn, record) = tasks
-            .prepare_complete(
-                "auth refactor shipped".into(),
-                None,
-                None,
-                Vec::new(),
-                CompletionVerificationStatus::Unverified,
-                Vec::new(),
-            )
+            .prepare_complete(CompletionRecordDraft {
+                summary: "auth refactor shipped".into(),
+                ..CompletionRecordDraft::default()
+            })
             .unwrap();
         assert_eq!(record.task_id, task_id);
         assert_eq!(
@@ -2480,43 +3389,31 @@ mod tests {
     }
 
     #[test]
-    fn optional_stale_completion_is_unverified_and_current_attaches_refs() {
-        let mut state = crate::execution::ExecutionState::default();
-        let mut read = agent_contracts::ToolOutput {
-            call_id: "c".into(),
-            tool_name: "fs.read".into(),
-            ok: true,
-            summary: "read".into(),
-            model_content: "read".into(),
-            artifact_ref: None,
-            metadata: serde_json::json!({"path": "src/auth.rs", "revision": "abc"}),
+    fn exact_current_completion_evidence_attaches_refs_and_stale_does_not() {
+        let (mut state, _) = settled_execution();
+        state.verifications[0].evidence_ref = Some("artifact://v1/run/owner/digest".into());
+        let basis = VerificationBasis {
+            task_id: TaskId::new(),
+            verification_revision: 1,
+            directive_revision: 2,
+            workspace_revision: 3,
         };
-        state.observe_tool(&read, 1, 1);
-        let mut test = read.clone();
-        test.tool_name = "shell.exec".into();
-        test.summary = "ok".into();
-        test.artifact_ref = Some("artifact://v1/run/owner/digest".into());
-        test.metadata = serde_json::json!({"command": "cargo test", "verification": true});
-        state.observe_tool(&test, 1, 2);
-        let (status, refs) = completion_from_execution(&state).unwrap();
+        let (status, refs) = completion_evidence(&state, Some(&basis));
         assert_eq!(status, CompletionVerificationStatus::Current);
         assert_eq!(refs, vec!["artifact://v1/run/owner/digest"]);
 
-        read.metadata = serde_json::json!({"path": "src/auth.rs", "revision": "zzz"});
-        read.tool_name = "fs.write".into();
-        state.observe_tool(&read, 1, 3);
-        let (status, refs) = completion_from_execution(&state).unwrap();
+        state.verification.source_changed = true;
+        let (status, refs) = completion_evidence(&state, Some(&basis));
         assert_eq!(status, CompletionVerificationStatus::Unverified);
         assert!(refs.is_empty());
     }
 
     #[test]
-    fn required_completion_refuses_when_not_current() {
-        let mut state = crate::execution::ExecutionState::default();
-        state.verification.required_for_completion = true;
-        assert!(
-            completion_from_execution(&state).is_err(),
-            "required + no evidence must refuse"
+    fn evidence_snapshot_never_acts_as_a_completion_gate() {
+        let state = crate::execution::ExecutionState::default();
+        assert_eq!(
+            completion_evidence(&state, None),
+            (CompletionVerificationStatus::Unverified, Vec::new())
         );
     }
 
@@ -2524,7 +3421,17 @@ mod tests {
     /// verification world: one durable mutation and one exact attributed
     /// PASS whose basis tuple matches every revision. Returns the identity
     /// the anchor must claim.
+    fn test_declaration() -> agent_contracts::VerificationCoverageDeclaration {
+        agent_contracts::VerificationCoverageDeclaration {
+            domain_id: "workspace-tests".into(),
+            declaration_revision: 1,
+            source_digest: agent_contracts::ContentDigest::sha256_bytes(b"workspace-tests/v1")
+                .to_string(),
+        }
+    }
+
     fn settled_execution() -> (crate::execution::ExecutionState, String) {
+        let identity = agent_contracts::ContentDigest::sha256_bytes(b"test verifier").to_string();
         let mut execution = crate::execution::ExecutionState {
             anchor_revision: 1,
             directive_revision: 2,
@@ -2532,158 +3439,572 @@ mod tests {
             ..crate::execution::ExecutionState::default()
         };
         execution.verification.spec_revision = 1;
-        execution.checked_files.push(crate::execution::ResourceFact {
-            path: "src/lib.rs".into(),
-            digest: "deadbeef".into(),
-            freshness: agent_contracts::ResourceFreshness::Fresh,
-            turn: 1,
-            provenance: crate::execution::ResourceProvenance::MutationResult,
-        });
-        execution.verifications.push(crate::execution::VerificationFact {
-            summary: "tests pass".into(),
-            ok: true,
-            turn: 1,
-            anchor_revision: 1,
-            workspace_revision: 3,
-            source_tool_name: "test.verify".into(),
-            argument_digest: "arg-a".into(),
-            verification_identity: "identity-a".into(),
-            directive_revision: 2,
-            evidence_ref: None,
-            recipe_provenance: None,
-        });
-        (execution, "identity-a".to_string())
+        execution
+            .checked_files
+            .push(crate::execution::ResourceFact {
+                path: "src/lib.rs".into(),
+                digest: "deadbeef".into(),
+                freshness: agent_contracts::ResourceFreshness::Fresh,
+                turn: 1,
+                provenance: crate::execution::ResourceProvenance::MutationResult,
+            });
+        execution
+            .verifications
+            .push(crate::execution::VerificationFact {
+                summary: "tests pass".into(),
+                ok: true,
+                turn: 1,
+                anchor_revision: 1,
+                workspace_revision: 3,
+                source_tool_name: "test.verify".into(),
+                argument_digest: "arg-a".into(),
+                verification_identity: identity.clone(),
+                directive_revision: 2,
+                evidence_ref: None,
+                recipe_provenance: Some(agent_contracts::VerificationRecipeProvenance {
+                    recipe_id: "test.verify".into(),
+                    recipe_revision: "v1".into(),
+                    coverage_domain: Some("workspace-tests".into()),
+                    domain_declaration_revision: Some(1),
+                    domain_source_digest: test_declaration().source_digest,
+                    class_identity_digest: "class-a".into(),
+                }),
+            });
+        (execution, identity)
     }
 
     fn settled_anchor(revision: u64) -> TaskAnchor {
+        let identity = agent_contracts::ContentDigest::sha256_bytes(b"test verifier").to_string();
         TaskAnchor {
             original_goal: "close the loop".into(),
             revision,
-            acceptance_criteria: vec!["tests pass".into()],
+            verification_revision: 1,
+            completion_policy: TaskCompletionPolicy::EvidenceRequired,
+            acceptance_criteria: vec![AcceptanceCriterion::declared(
+                "tests pass",
+                &test_declaration(),
+            )],
             acceptance_coverage: vec![AcceptanceCoverage {
+                task_id: None,
+                verification_revision: 1,
                 criterion_index: 0,
-                verification_identity: "identity-a".into(),
+                coverage_domain: "workspace-tests".into(),
+                domain_declaration_revision: 1,
+                domain_source_digest: test_declaration().source_digest,
+                directive_revision: 2,
+                workspace_revision: 3,
+                verification_identity: identity,
             }],
             ..TaskAnchor::default()
         }
     }
 
-    #[test]
-    fn task_ready_accepts_the_fully_settled_task() {
-        let (execution, _) = settled_execution();
-        let anchor = settled_anchor(1);
-        assert!(task_ready(&anchor, &execution, true));
+    fn readiness(
+        intent: CompletionIntent,
+        anchor: TaskAnchor,
+        execution: crate::execution::ExecutionState,
+        safety: CompletionSafety,
+    ) -> CompletionReadiness {
+        readiness_with_declarations(intent, anchor, execution, safety, &[test_declaration()])
+    }
+
+    fn readiness_with_declarations(
+        intent: CompletionIntent,
+        mut anchor: TaskAnchor,
+        execution: crate::execution::ExecutionState,
+        safety: CompletionSafety,
+        declarations: &[agent_contracts::VerificationCoverageDeclaration],
+    ) -> CompletionReadiness {
+        let mut tasks = TaskManager::new();
+        let (txn, id) = tasks.prepare_create("close the loop");
+        tasks.commit(txn);
+        for receipt in &mut anchor.acceptance_coverage {
+            receipt.task_id = Some(id);
+        }
+        let task = tasks.get_mut(id).unwrap();
+        task.anchor = anchor;
+        task.resume = execution;
+        let task = tasks.get(id).unwrap();
+        derive_completion_readiness(
+            intent,
+            Some(id),
+            Some(task),
+            Some(&task.resume),
+            safety,
+            declarations,
+        )
     }
 
     #[test]
-    fn task_ready_fails_closed_without_declared_coverage() {
+    fn completion_readiness_accepts_the_fully_settled_task() {
+        let (execution, _) = settled_execution();
+        let anchor = settled_anchor(1);
+        let decision = readiness(
+            CompletionIntent::ModelProposal,
+            anchor,
+            execution,
+            CompletionSafety::default(),
+        );
+        assert!(decision.task_state_current);
+        assert!(decision.commit_safe);
+        assert!(decision.verified_ready);
+        assert!(decision.allows_completion());
+        assert_eq!(
+            decision.disposition(),
+            Some(CompletionDisposition::Verified)
+        );
+    }
+
+    #[test]
+    fn completion_readiness_fences_current_table_revision_and_source_recomposition() {
+        let (execution, _) = settled_execution();
+        let anchor = settled_anchor(1);
+        for current in [
+            agent_contracts::VerificationCoverageDeclaration {
+                declaration_revision: 2,
+                ..test_declaration()
+            },
+            agent_contracts::VerificationCoverageDeclaration {
+                source_digest: agent_contracts::ContentDigest::sha256_bytes(
+                    b"same-revision-different-host-table",
+                )
+                .to_string(),
+                ..test_declaration()
+            },
+        ] {
+            let decision = readiness_with_declarations(
+                CompletionIntent::ModelProposal,
+                anchor.clone(),
+                execution.clone(),
+                CompletionSafety::default(),
+                &[current],
+            );
+            assert!(!decision.allows_completion());
+            assert!(
+                decision
+                    .applicable_blockers()
+                    .iter()
+                    .any(|blocker| matches!(
+                        blocker,
+                        CompletionBlocker::AcceptanceDeclarationStale { remaining: 1 }
+                    ))
+            );
+        }
+    }
+
+    #[test]
+    fn receipt_requires_fact_provenance_to_share_the_declaration_identity() {
+        let (mut execution, _) = settled_execution();
+        execution.verifications[0]
+            .recipe_provenance
+            .as_mut()
+            .unwrap()
+            .domain_source_digest =
+            agent_contracts::ContentDigest::sha256_bytes(b"foreign-fact-source").to_string();
+        let decision = readiness(
+            CompletionIntent::ModelProposal,
+            settled_anchor(1),
+            execution,
+            CompletionSafety::default(),
+        );
+        assert!(!decision.allows_completion());
+        assert!(
+            decision
+                .applicable_blockers()
+                .iter()
+                .any(|blocker| matches!(
+                    blocker,
+                    CompletionBlocker::AcceptanceUncovered { remaining: 1 }
+                ))
+        );
+    }
+
+    #[test]
+    fn restored_anchor_cannot_follow_a_recomposed_host_table() {
+        let (execution, _) = settled_execution();
+        let persisted = serde_json::to_vec(&settled_anchor(1)).unwrap();
+        let restored: TaskAnchor = serde_json::from_slice(&persisted).unwrap();
+        let recomposed = agent_contracts::VerificationCoverageDeclaration {
+            source_digest: agent_contracts::ContentDigest::sha256_bytes(
+                b"recomposed-table-under-revision-one",
+            )
+            .to_string(),
+            ..test_declaration()
+        };
+        assert!(
+            !readiness_with_declarations(
+                CompletionIntent::ModelProposal,
+                restored,
+                execution,
+                CompletionSafety::default(),
+                &[recomposed],
+            )
+            .allows_completion(),
+            "persisted receipts must be inert under a differently composed current host table"
+        );
+    }
+
+    #[test]
+    fn legacy_unbound_criterion_deserializes_but_fails_closed() {
+        let (execution, _) = settled_execution();
+        let mut value = serde_json::to_value(settled_anchor(1)).unwrap();
+        let criterion = value["acceptance_criteria"][0].as_object_mut().unwrap();
+        criterion.remove("domain_declaration_revision");
+        criterion.remove("domain_source_digest");
+        let receipt = value["acceptance_coverage"][0].as_object_mut().unwrap();
+        receipt.remove("domain_source_digest");
+        let restored: TaskAnchor = serde_json::from_value(value).unwrap();
+        assert_eq!(
+            restored.acceptance_criteria[0].domain_declaration_revision,
+            0
+        );
+        assert!(
+            restored.acceptance_criteria[0]
+                .domain_source_digest
+                .is_empty()
+        );
+        let decision = readiness(
+            CompletionIntent::ModelProposal,
+            restored,
+            execution,
+            CompletionSafety::default(),
+        );
+        assert!(!decision.allows_completion());
+        assert!(
+            decision
+                .applicable_blockers()
+                .iter()
+                .any(|blocker| matches!(
+                    blocker,
+                    CompletionBlocker::AcceptanceDeclarationStale { remaining: 1 }
+                ))
+        );
+    }
+
+    #[test]
+    fn unbound_convenience_constructor_is_deliberately_fail_closed() {
+        let (execution, _) = settled_execution();
+        let mut anchor = settled_anchor(1);
+        anchor.acceptance_criteria[0] =
+            AcceptanceCriterion::new("tests pass", test_declaration().domain_id);
+        assert!(
+            !readiness(
+                CompletionIntent::ModelProposal,
+                anchor,
+                execution,
+                CompletionSafety::default(),
+            )
+            .allows_completion()
+        );
+    }
+
+    #[test]
+    fn model_proposal_fails_closed_without_declared_coverage() {
         let (execution, _) = settled_execution();
         let mut anchor = settled_anchor(1);
         anchor.acceptance_criteria.clear();
         anchor.acceptance_coverage.clear();
-        assert!(
-            !task_ready(&anchor, &execution, true),
-            "no declared acceptance coverage must fail closed"
+        anchor.completion_policy = TaskCompletionPolicy::OperatorClosureOnly;
+        let decision = readiness(
+            CompletionIntent::ModelProposal,
+            anchor,
+            execution,
+            CompletionSafety::default(),
         );
+        assert!(!decision.verified_ready);
+        assert!(!decision.allows_completion());
+        assert!(
+            decision
+                .applicable_blockers()
+                .contains(&CompletionBlocker::AcceptanceUndeclared)
+        );
+        assert!(decision.refusal().to_string().contains("explicit operator"));
     }
 
     #[test]
-    fn task_ready_requires_a_live_claim_for_every_criterion() {
+    fn evidence_required_without_criteria_has_an_explicit_undeclared_blocker() {
         let (execution, _) = settled_execution();
         let mut anchor = settled_anchor(1);
-        anchor.acceptance_criteria.push("no regressions".into());
-        assert!(
-            !task_ready(&anchor, &execution, true),
-            "a second criterion without a claim must not be covered"
+        anchor.completion_policy = TaskCompletionPolicy::EvidenceRequired;
+        anchor.acceptance_criteria.clear();
+        anchor.acceptance_coverage.clear();
+        let decision = readiness(
+            CompletionIntent::ModelProposal,
+            anchor,
+            execution,
+            CompletionSafety::default(),
         );
-        anchor.acceptance_coverage.push(AcceptanceCoverage {
-            criterion_index: 1,
-            verification_identity: "identity-a".into(),
-        });
-        assert!(task_ready(&anchor, &execution, true));
+        assert!(!decision.allows_completion());
+        assert_eq!(
+            decision.applicable_blockers(),
+            vec![CompletionBlocker::AcceptanceUndeclared]
+        );
     }
 
     #[test]
-    fn task_ready_rejects_stale_or_fabricated_identity() {
+    fn completion_readiness_requires_a_live_claim_for_every_criterion() {
+        let (execution, _) = settled_execution();
+        let mut anchor = settled_anchor(1);
+        anchor
+            .acceptance_criteria
+            .push(AcceptanceCriterion::declared(
+                "no regressions",
+                &test_declaration(),
+            ));
+        let decision = readiness(
+            CompletionIntent::ModelProposal,
+            anchor.clone(),
+            execution.clone(),
+            CompletionSafety::default(),
+        );
+        assert!(!decision.allows_completion());
+        anchor.acceptance_coverage.push(AcceptanceCoverage {
+            task_id: None,
+            verification_revision: 1,
+            criterion_index: 1,
+            coverage_domain: "workspace-tests".into(),
+            domain_declaration_revision: 1,
+            domain_source_digest: test_declaration().source_digest,
+            directive_revision: 2,
+            workspace_revision: 3,
+            verification_identity: agent_contracts::ContentDigest::sha256_bytes(b"test verifier")
+                .to_string(),
+        });
+        assert!(
+            readiness(
+                CompletionIntent::ModelProposal,
+                anchor,
+                execution,
+                CompletionSafety::default(),
+            )
+            .allows_completion()
+        );
+    }
+
+    #[test]
+    fn completion_readiness_rejects_stale_or_fabricated_identity() {
         let (execution, _) = settled_execution();
         let mut anchor = settled_anchor(1);
         anchor.acceptance_coverage[0].verification_identity = "other-identity".into();
         assert!(
-            !task_ready(&anchor, &execution, true),
+            !readiness(
+                CompletionIntent::ModelProposal,
+                anchor.clone(),
+                execution.clone(),
+                CompletionSafety::default(),
+            )
+            .allows_completion(),
             "a claim that does not resolve to the current trusted pass covers nothing"
         );
 
         // A new directive moves the world: the old PASS no longer binds.
+        anchor.acceptance_coverage[0].verification_identity = "identity-a".into();
         let mut moved = execution.clone();
         moved.directive_revision = 3;
         assert!(
-            !task_ready(&anchor, &moved, true),
+            !readiness(
+                CompletionIntent::ModelProposal,
+                anchor,
+                moved,
+                CompletionSafety::default(),
+            )
+            .allows_completion(),
             "a new directive must invalidate readiness immediately"
         );
     }
 
     #[test]
-    fn task_ready_rejects_open_loops_and_next_action() {
+    fn completion_readiness_rejects_open_loops_and_next_action() {
         let (execution, _) = settled_execution();
         let mut anchor = settled_anchor(1);
         anchor.open_loops.push("verify edge cases".into());
-        assert!(!task_ready(&anchor, &execution, true));
+        assert!(
+            !readiness(
+                CompletionIntent::ModelProposal,
+                anchor.clone(),
+                execution.clone(),
+                CompletionSafety::default(),
+            )
+            .allows_completion()
+        );
         anchor.open_loops.clear();
         anchor.next_action = "write the missing test".into();
-        assert!(!task_ready(&anchor, &execution, true));
-    }
-
-    #[test]
-    fn task_ready_rejects_epoch_mismatch() {
-        let (execution, _) = settled_execution();
-        let anchor = settled_anchor(2);
         assert!(
-            !task_ready(&anchor, &execution, true),
-            "the anchor epoch the execution tracked must be the current revision"
+            !readiness(
+                CompletionIntent::ModelProposal,
+                anchor,
+                execution,
+                CompletionSafety::default(),
+            )
+            .allows_completion()
         );
     }
 
     #[test]
-    fn task_ready_rejects_open_obligation_and_failed_command() {
+    fn task_state_and_verification_bases_move_independently() {
+        let (mut execution, _) = settled_execution();
+        let anchor = settled_anchor(2);
+        execution.anchor_revision = 2;
+        let decision = readiness(
+            CompletionIntent::ModelProposal,
+            anchor.clone(),
+            execution.clone(),
+            CompletionSafety::default(),
+        );
+        assert!(
+            decision.allows_completion(),
+            "progress-only task CAS must preserve verification basis"
+        );
+
+        execution.anchor_revision = 1;
+        assert!(
+            !readiness(
+                CompletionIntent::ModelProposal,
+                anchor,
+                execution,
+                CompletionSafety::default(),
+            )
+            .commit_safe,
+            "stale task-state basis blocks every intent"
+        );
+    }
+
+    #[test]
+    fn completion_readiness_rejects_open_obligation_and_failed_command() {
         let (execution, _) = settled_execution();
         let anchor = settled_anchor(1);
         let mut with_obligation = execution.clone();
-        with_obligation.obligations.push(crate::execution::ExecutionObligation {
-            domain: agent_contracts::ToolFailureDomain::ExecutableResolution,
-            scope_key: "scope-a".into(),
-            precondition: "fp-1".into(),
-            attempts: 1,
-            epoch: 0,
-            total_attempts: 1,
-            tried_targets: Vec::new(),
-            opened_at_evidence_revision: 1,
-            source_tool_name: String::new(),
-        });
-        assert!(!task_ready(&anchor, &with_obligation, true));
+        with_obligation
+            .obligations
+            .push(crate::execution::ExecutionObligation {
+                domain: agent_contracts::ToolFailureDomain::ExecutableResolution,
+                scope_key: "scope-a".into(),
+                precondition: "fp-1".into(),
+                attempts: 1,
+                epoch: 0,
+                total_attempts: 1,
+                tried_targets: Vec::new(),
+                opened_at_evidence_revision: 1,
+                source_tool_name: String::new(),
+            });
+        assert!(
+            !readiness(
+                CompletionIntent::ModelProposal,
+                anchor.clone(),
+                with_obligation,
+                CompletionSafety::default(),
+            )
+            .allows_completion()
+        );
 
         let mut with_failure = execution.clone();
-        with_failure.failed_commands.push(crate::execution::FailedCommandFact {
-            tool_name: "test.run".into(),
-            target: "pkg".into(),
-            summary: "crash".into(),
-            turn: 1,
-        });
-        assert!(!task_ready(&anchor, &with_failure, true));
+        with_failure
+            .failed_commands
+            .push(crate::execution::FailedCommandFact {
+                tool_name: "test.run".into(),
+                target: "pkg".into(),
+                summary: "crash".into(),
+                turn: 1,
+                ..crate::execution::FailedCommandFact::default()
+            });
+        assert!(
+            !readiness(
+                CompletionIntent::ModelProposal,
+                anchor,
+                with_failure,
+                CompletionSafety::default(),
+            )
+            .allows_completion()
+        );
+
+        let mut with_overflow = execution;
+        with_overflow.failure_overflow = crate::execution::UnresolvedFailureOverflow {
+            directive_revision: with_overflow.directive_revision,
+            omitted_obligations: 3,
+            omitted_failed_commands: 4,
+        };
+        let decision = readiness(
+            CompletionIntent::ModelProposal,
+            settled_anchor(1),
+            with_overflow.clone(),
+            CompletionSafety::default(),
+        );
+        assert!(!decision.allows_completion());
+        assert!(
+            decision
+                .applicable_blockers()
+                .contains(&CompletionBlocker::ExecutionObligations { remaining: 3 })
+        );
+        assert!(
+            decision
+                .applicable_blockers()
+                .contains(&CompletionBlocker::FailedCommands { remaining: 4 })
+        );
+
+        let operator = readiness(
+            CompletionIntent::ExplicitOperator,
+            settled_anchor(1),
+            with_overflow,
+            CompletionSafety::default(),
+        );
+        assert!(
+            operator.allows_completion(),
+            "only explicit operator authority may override opaque overflow debt"
+        );
+        assert!(
+            operator
+                .override_reasons()
+                .contains(&CompletionBlocker::ExecutionObligations { remaining: 3 })
+        );
     }
 
     #[test]
-    fn task_ready_rejects_in_flight_and_non_current_verification() {
+    fn explicit_operator_bypasses_semantic_blockers_but_not_commit_safety() {
         let (execution, _) = settled_execution();
+        let mut anchor = settled_anchor(1);
+        anchor.open_loops.push("operator accepted risk".into());
+        let override_decision = readiness(
+            CompletionIntent::ExplicitOperator,
+            anchor.clone(),
+            execution.clone(),
+            CompletionSafety::default(),
+        );
+        assert!(override_decision.allows_completion());
+        assert!(!override_decision.verified_ready);
+        assert_eq!(
+            override_decision.disposition(),
+            Some(CompletionDisposition::OperatorOverride)
+        );
+        assert_eq!(
+            override_decision.override_reasons(),
+            vec![CompletionBlocker::OpenLoops { remaining: 1 }]
+        );
+
+        let fenced = readiness(
+            CompletionIntent::ExplicitOperator,
+            anchor,
+            execution,
+            CompletionSafety {
+                recovery_required: true,
+                ..CompletionSafety::default()
+            },
+        );
+        assert!(!fenced.allows_completion());
+        assert!(!fenced.commit_safe);
+    }
+
+    #[test]
+    fn latest_failure_or_source_change_cannot_reanimate_an_old_pass() {
+        let (mut execution, _) = settled_execution();
         let anchor = settled_anchor(1);
-        assert!(
-            !task_ready(&anchor, &execution, false),
-            "a live tool or pending cleanup must block readiness"
+        execution.verification.source_changed = true;
+        let decision = readiness(
+            CompletionIntent::ModelProposal,
+            anchor,
+            execution,
+            CompletionSafety::default(),
         );
-        let mut stale = execution.clone();
-        stale.verification.spec_revision = 2;
-        assert!(
-            !task_ready(&anchor, &stale, true),
-            "a non-current verification basis must block readiness"
-        );
+        assert!(!decision.verified_ready);
+        assert!(!decision.allows_completion());
     }
 }

@@ -208,6 +208,15 @@ pub struct ComposeConfig {
     pub max_tool_rounds: Option<usize>,
     /// Ablation: omit TaskProgress from the Focus frame. Default true.
     pub project_task_progress: bool,
+    /// Project the neutral settlement fact inside TaskProgress. Default
+    /// false; it is independent from the product TaskProgress surface so an
+    /// experiment cannot also alter Context maintenance inputs.
+    pub project_settlement: bool,
+    /// Enable the expensive same-state settlement counterfactual audit and
+    /// common treatment-sized packing envelope. Default false for every
+    /// product and ordinary evaluation composition; paired causal cells set
+    /// the same true value in both arms.
+    pub settlement_projection_diagnostics: bool,
     /// LONG-TASK Slice C 候选开关（默认关）：派生 advisory 完成机会并
     /// 允许一次决策的 `task.complete` 租赁。晋级门通过前保持关。
     pub project_completion_opportunity: bool,
@@ -275,6 +284,8 @@ pub async fn compose(config: ComposeConfig) -> anyhow::Result<ComposedRuntime> {
         output_broker,
         max_tool_rounds,
         project_task_progress,
+        project_settlement,
+        settlement_projection_diagnostics,
         project_completion_opportunity,
         recovery_surface,
         host_policies,
@@ -354,6 +365,8 @@ pub async fn compose(config: ComposeConfig) -> anyhow::Result<ComposedRuntime> {
         AuthorityRecoveryServices::new(operation_journal, Some(Arc::new(workspace.clone()))),
     )?;
     services = services.with_project_task_progress(project_task_progress);
+    services = services.with_project_settlement(project_settlement);
+    services = services.with_settlement_projection_diagnostics(settlement_projection_diagnostics);
     services = services.with_project_completion_opportunity(project_completion_opportunity);
     services = services.with_recovery_surface(recovery_surface);
     let instance = RuntimeInstance::spawn(host, services);

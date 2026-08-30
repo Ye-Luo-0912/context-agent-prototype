@@ -13,9 +13,10 @@ use std::{
 };
 
 use agent_contracts::{
-    AgentResult, InputKind, ModelCapabilities, ModelOutput, ModelRequest, ModelTransport,
-    RuntimeEvent, RuntimeEventEnvelope, ToolCall, ToolDispatcher, ToolExecutionRequest,
-    ToolOutcome, ToolOutput, ToolRisk, ToolSpec,
+    AgentResult, ContextEngine, ContextKind, InputKind, ModelCapabilities, ModelOutput,
+    ModelRequest, ModelTransport, RuntimeEvent, RuntimeEventEnvelope, ToolCall, ToolDispatcher,
+    ToolExecutionAttribution, ToolExecutionPurpose, ToolExecutionRequest, ToolOutcome, ToolOutput,
+    ToolRisk, ToolSpec, VerificationReuse,
 };
 use agent_core::{CoreAuthorityConfig, PolicyApprovalGate};
 use agent_runtime::{ModuleHost, RuntimeInstance, RuntimeServices};
@@ -284,31 +285,80 @@ async fn continue_active_task_restarts_the_directive_without_a_new_instruction()
         tokio::time::sleep(Duration::from_millis(10)).await;
     }
 
+    let checkpoint_before = instance.checkpoint().await.unwrap();
+    let task_before = checkpoint_before
+        .tasks
+        .tasks
+        .iter()
+        .find(|task| Some(task.id) == checkpoint_before.current_task_id)
+        .expect("the continued task is present before continuation");
+    let directive_before = task_before.turn_intent.clone();
+    let directive_revision_before = task_before.resume.directive_revision;
+    let verification_revision_before = task_before.anchor.verification_revision;
+    let verification_spec_before = task_before.resume.verification.spec_revision;
+
+    // Exercise the cold-load boundary before the continuation. Restore must
+    // preserve the tuple, and continuation must not manufacture a new one.
+    instance.restore(checkpoint_before.clone()).await.unwrap();
+    let checkpoint_restored = instance.checkpoint().await.unwrap();
+    let task_restored = checkpoint_restored
+        .tasks
+        .tasks
+        .iter()
+        .find(|task| Some(task.id) == checkpoint_restored.current_task_id)
+        .expect("the continued task survives cold restore");
+    assert_eq!(task_restored.turn_intent, directive_before);
+    assert_eq!(
+        task_restored.resume.directive_revision,
+        directive_revision_before
+    );
+    assert_eq!(
+        task_restored.anchor.verification_revision,
+        verification_revision_before
+    );
+    assert_eq!(
+        task_restored.resume.verification.spec_revision,
+        verification_spec_before
+    );
+
     let mut events = handle.subscribe();
     handle.continue_active_task().await.unwrap();
 
     let mut saw_continuation = false;
+    let mut saw_continuation_input = false;
     let mut saw_dialogue = false;
+    let mut continuation_completed = false;
     let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
-    while tokio::time::Instant::now() < deadline && !saw_continuation {
+    while tokio::time::Instant::now() < deadline
+        && !(saw_continuation && saw_continuation_input && continuation_completed)
+    {
         while let Ok(envelope) = events.try_recv() {
             match envelope.event {
                 RuntimeEvent::TaskContinuationStarted { .. } => saw_continuation = true,
                 RuntimeEvent::UserMessageAccepted { input } => match input.kind {
-                    InputKind::TaskContinuation => {}
+                    InputKind::TaskContinuation => saw_continuation_input = true,
                     InputKind::Dialogue => saw_dialogue = true,
                     _ => {}
                 },
+                RuntimeEvent::TurnCompleted => continuation_completed = true,
                 _ => {}
             }
         }
-        if !saw_continuation {
+        if !(saw_continuation && saw_continuation_input && continuation_completed) {
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
     }
     assert!(
         saw_continuation,
         "continuation must publish its start event"
+    );
+    assert!(
+        saw_continuation_input,
+        "continuation must retain its typed input identity"
+    );
+    assert!(
+        continuation_completed,
+        "the continuation turn must finish inside the test deadline"
     );
     assert!(
         !saw_dialogue,
@@ -324,6 +374,26 @@ async fn continue_active_task_restarts_the_directive_without_a_new_instruction()
     assert_eq!(
         tasks_after[0].anchor_revision, anchor_revision_before,
         "continuation leaves the anchor untouched"
+    );
+    let checkpoint_after = instance.checkpoint().await.unwrap();
+    let task_after = checkpoint_after
+        .tasks
+        .tasks
+        .iter()
+        .find(|task| Some(task.id) == checkpoint_after.current_task_id)
+        .expect("the continued task remains present");
+    assert_eq!(task_after.turn_intent, directive_before);
+    assert_eq!(
+        task_after.resume.directive_revision, directive_revision_before,
+        "continuation must not mint a new directive revision"
+    );
+    assert_eq!(
+        task_after.anchor.verification_revision, verification_revision_before,
+        "continuation must not change the anchor verification basis"
+    );
+    assert_eq!(
+        task_after.resume.verification.spec_revision, verification_spec_before,
+        "continuation must retain the execution verification basis"
     );
     instance.shutdown().await.unwrap();
 }
@@ -362,19 +432,78 @@ async fn checkpoint_store_writes_atomically_and_fails_closed_on_a_bad_dir() {
 #[derive(Debug)]
 struct CompletionDispatcher;
 
+const COMPLETION_VERIFY_IDENTITY_MATERIAL: &str = "safe-point completion verifier v1";
+const COMPLETION_ACCEPTANCE_DOMAIN: &str = "safe-point-completion";
+
+fn completion_acceptance_declaration() -> agent_contracts::VerificationCoverageDeclaration {
+    agent_contracts::VerificationCoverageDeclaration {
+        domain_id: COMPLETION_ACCEPTANCE_DOMAIN.into(),
+        declaration_revision: 1,
+        source_digest: agent_contracts::ContentDigest::sha256_bytes(
+            b"safe-point-completion-declaration/v1",
+        )
+        .to_string(),
+    }
+}
+
 #[async_trait::async_trait]
 impl ToolDispatcher for CompletionDispatcher {
     fn specs(&self) -> Vec<ToolSpec> {
-        vec![ToolSpec {
-            name: "task.complete".into(),
-            description: "propose completion".into(),
-            input_schema: json!({"type": "object"}),
-            risk: ToolRisk::ReadOnly,
-            output_budget: None,
-            roles: Vec::new(),
-        }]
+        vec![
+            ToolSpec {
+                name: "test.verify".into(),
+                description: "verify the current completion basis".into(),
+                input_schema: json!({"type": "object"}),
+                risk: ToolRisk::ReadOnly,
+                output_budget: None,
+                roles: Vec::new(),
+            },
+            ToolSpec {
+                name: "task.complete".into(),
+                description: "propose completion".into(),
+                input_schema: json!({"type": "object"}),
+                risk: ToolRisk::ReadOnly,
+                output_budget: None,
+                roles: Vec::new(),
+            },
+        ]
+    }
+    fn execution_attribution(&self, call: &ToolCall) -> ToolExecutionAttribution {
+        if call.name == "test.verify" {
+            return ToolExecutionAttribution::bounded(
+                ToolExecutionPurpose::Verify,
+                Vec::<String>::new(),
+                VerificationReuse::ExactCurrentWorld,
+            )
+            .with_verification_identity_material(COMPLETION_VERIFY_IDENTITY_MATERIAL)
+            .with_verification_recipe(agent_contracts::VerificationRecipeProvenance {
+                recipe_id: "test.verify".into(),
+                recipe_revision: "v1".into(),
+                coverage_domain: Some(COMPLETION_ACCEPTANCE_DOMAIN.into()),
+                domain_declaration_revision: Some(1),
+                domain_source_digest: completion_acceptance_declaration().source_digest,
+                class_identity_digest: "safe-point-class".into(),
+            });
+        }
+        ToolExecutionAttribution::default()
+    }
+    fn verification_coverage_declarations(
+        &self,
+    ) -> Vec<agent_contracts::VerificationCoverageDeclaration> {
+        vec![completion_acceptance_declaration()]
     }
     async fn execute(&self, request: ToolExecutionRequest) -> AgentResult<ToolOutcome> {
+        if request.call.name == "test.verify" {
+            return Ok(ToolOutcome::Value(ToolOutput {
+                call_id: request.call.id,
+                tool_name: request.call.name,
+                ok: true,
+                summary: "completion basis verified".into(),
+                model_content: "completion basis verified".into(),
+                artifact_ref: None,
+                metadata: json!({"verification": true}),
+            }));
+        }
         Ok(ToolOutcome::RuntimeDirective {
             output: ToolOutput {
                 call_id: request.call.id,
@@ -395,7 +524,8 @@ impl ToolDispatcher for CompletionDispatcher {
     }
 }
 
-/// Round pattern per turn: complete, done, complete, done ...
+/// Each turn verifies its current directive before proposing completion. A
+/// refused proposal returns for one plain final round.
 #[derive(Debug)]
 struct CompletionTwiceModel {
     rounds: AtomicUsize,
@@ -408,7 +538,17 @@ impl ModelTransport for CompletionTwiceModel {
     }
     async fn complete(&self, _request: ModelRequest) -> AgentResult<ModelOutput> {
         let round = self.rounds.fetch_add(1, Ordering::SeqCst);
-        if round.is_multiple_of(2) {
+        if round == 0 || round == 3 {
+            Ok(ModelOutput {
+                content: String::new(),
+                tool_calls: vec![ToolCall {
+                    id: "verify-current".into(),
+                    name: "test.verify".into(),
+                    arguments: json!({}),
+                }],
+                usage: Default::default(),
+            })
+        } else if round == 1 || round == 4 {
             Ok(ModelOutput {
                 content: String::new(),
                 tool_calls: vec![ToolCall {
@@ -429,10 +569,17 @@ impl ModelTransport for CompletionTwiceModel {
 }
 
 async fn completion_instance(dir: &std::path::Path) -> RuntimeInstance {
+    completion_instance_with_context(dir, Arc::new(TestContextEngine)).await
+}
+
+async fn completion_instance_with_context(
+    dir: &std::path::Path,
+    context: Arc<dyn ContextEngine>,
+) -> RuntimeInstance {
     let workspace = agent_workspace::Workspace::open(dir).await.unwrap();
     let services = RuntimeServices::new(
         CoreAuthorityConfig::default(),
-        Arc::new(TestContextEngine),
+        context,
         Arc::new(CompletionTwiceModel {
             rounds: AtomicUsize::new(0),
         }),
@@ -462,6 +609,15 @@ async fn open_loops_return_completion_to_the_model_until_resolved() {
             task_id,
             0,
             agent_runtime::AnchorPatch {
+                completion_policy: Some(
+                    agent_runtime::task::TaskCompletionPolicy::EvidenceRequired,
+                ),
+                acceptance_criteria: Some(vec![
+                    agent_runtime::task::AcceptanceCriterion::declared(
+                        "the current completion basis passes",
+                        &completion_acceptance_declaration(),
+                    ),
+                ]),
                 open_loops: Some(vec!["prove saturation at the delay cap".into()]),
                 ..agent_runtime::AnchorPatch::default()
             },
@@ -470,8 +626,8 @@ async fn open_loops_return_completion_to_the_model_until_resolved() {
         .unwrap();
     assert_eq!(revision, 1);
 
-    // Turn 1: the proposal is stored but the gate refuses it; the decision
-    // returns to the model and the turn ends without committing the task.
+    // Turn 1: the unified readiness decision refuses the proposal; the
+    // decision returns to the model and the turn ends without committing.
     let mut events = handle.subscribe();
     handle.user_message("wrap it up".into()).await.unwrap();
     let mut labels: Vec<String> = Vec::new();
@@ -481,7 +637,7 @@ async fn open_loops_return_completion_to_the_model_until_resolved() {
         while let Ok(envelope) = events.try_recv() {
             match envelope.event {
                 RuntimeEvent::Warning { message }
-                    if message.contains("completion gate refused") =>
+                    if message.contains("completion proposal refused") =>
                 {
                     labels.push(format!("gate_refused:{message}"));
                 }
@@ -510,15 +666,17 @@ async fn open_loops_return_completion_to_the_model_until_resolved() {
     );
     let after_turn_one = handle.list_tasks().await.unwrap();
     assert_eq!(
-        after_turn_one[0].anchor_revision, 1,
-        "the anchor keeps its open loop while the gate holds"
+        after_turn_one[0].anchor_revision,
+        revision + 1,
+        "the post-observation receipt CAS advances only the full anchor revision"
     );
+    let receipt_revision = after_turn_one[0].anchor_revision;
 
     // The operator/model resolves the loop through the boundary CAS.
     handle
         .patch_task_anchor(
             task_id,
-            1,
+            receipt_revision,
             agent_runtime::AnchorPatch {
                 open_loops: Some(Vec::new()),
                 ..agent_runtime::AnchorPatch::default()
@@ -527,7 +685,8 @@ async fn open_loops_return_completion_to_the_model_until_resolved() {
         .await
         .unwrap();
 
-    // Turn 2: the same proposal flow now passes the gate; JSONL proves
+    // Turn 2: a fresh directive is reverified, then the same proposal flow
+    // passes the gate; JSONL proves
     // TurnCompleted -> durable checkpoint -> TaskCompleted. TaskCompleted
     // trails TurnCompleted, so keep draining through a quiet grace window
     // instead of stopping at the first completion event.
@@ -944,7 +1103,13 @@ async fn snapshot_sequences_increase_across_tasks_and_repeats() {
 #[tokio::test]
 async fn final_terminal_artifact_loads_verified_and_names_no_active_task() {
     let dir = tempfile::tempdir().unwrap();
-    let instance = completion_instance(dir.path()).await;
+    let instance = completion_instance_with_context(
+        dir.path(),
+        Arc::new(context_simple::SimpleContextEngine::new(
+            context_simple::SimpleContextConfig::default(),
+        )),
+    )
+    .await;
     let handle = instance.handle();
     handle
         .set_focus("implement bounded retry".into())
@@ -1011,12 +1176,30 @@ async fn final_terminal_artifact_loads_verified_and_names_no_active_task() {
         "the terminal snapshot allocates its own sequence"
     );
     assert!(
+        checkpoint.terminal_commit,
+        "the artifact is a terminal commit anchor"
+    );
+    assert!(
+        checkpoint.event_cover_seq > 0,
+        "the terminal anchor carries its journal cursor"
+    );
+    assert!(
         checkpoint
             .tasks
             .completed
             .iter()
             .any(|record| record.task_id == task_id),
         "the finished task owns exactly its committed completion record"
+    );
+    let restored =
+        context_simple::SimpleContextEngine::new(context_simple::SimpleContextConfig::default());
+    restored.restore(checkpoint.context.clone()).await.unwrap();
+    let restored_items = restored.inspect(128).await.unwrap();
+    assert!(
+        restored_items
+            .iter()
+            .any(|item| item.kind == ContextKind::Summary),
+        "the same terminal artifact must carry the post-TaskCompleted context plane"
     );
     instance.shutdown().await.unwrap();
 }
@@ -1056,5 +1239,49 @@ async fn blocked_terminal_write_leaves_the_task_completion_pending() {
         "the task must stay completion-pending: {:?}",
         pending.status
     );
+    instance.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn terminal_failure_restores_the_previous_durability_requirement() {
+    let dir = tempfile::tempdir().unwrap();
+    let focus_dir = dir.path().join(".focus-agent");
+    std::fs::create_dir_all(&focus_dir).unwrap();
+    std::fs::write(focus_dir.join("checkpoints"), b"not a directory").unwrap();
+
+    // A read-only turn establishes a reusable directive without accruing
+    // checkpoint debt of its own.
+    let instance = instance_with(dir.path(), "fs.read", json!({})).await;
+    let handle = instance.handle();
+    let mut events = handle.subscribe();
+    handle
+        .set_focus("implement bounded retry".into())
+        .await
+        .unwrap();
+    handle
+        .user_message("inspect before closing".into())
+        .await
+        .unwrap();
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+    loop {
+        let envelope = tokio::time::timeout_at(deadline, events.recv())
+            .await
+            .expect("read-only turn finishes")
+            .expect("event stream stays open");
+        if matches!(envelope.event, RuntimeEvent::TurnCompleted) {
+            break;
+        }
+    }
+
+    handle
+        .complete_current_task("done".into())
+        .await
+        .expect_err("the blocked terminal store must refuse completion");
+    assert!(
+        handle.continue_active_task().await.is_ok(),
+        "a failed terminal freeze must restore its prior required_sequence; the uncommitted terminal sequence cannot fence a valid earlier task state"
+    );
+    let tasks = handle.list_tasks().await.unwrap();
+    assert!(matches!(tasks[0].status, agent_runtime::TaskStatus::Active));
     instance.shutdown().await.unwrap();
 }

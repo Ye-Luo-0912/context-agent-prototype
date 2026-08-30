@@ -149,6 +149,9 @@ impl ContextEngine for NoopContext {
             selected: Vec::new(),
             approx_tokens: 0,
             foreground: Vec::new(),
+            required_item_ids: Vec::new(),
+            required_misses: Default::default(),
+            optional_misses: Default::default(),
             diagnostics: Default::default(),
         })
     }
@@ -1396,7 +1399,12 @@ async fn exception_execution_rows(
                 ("shell.exec", json!({"command": "exit 0"})),
                 (
                     "process.run",
-                    json!({"argv": [comspec, "/C", "exit", "0"], "cwd": "."}),
+                    // `cmd.exe /C` consumes one command-string argument. An
+                    // argv split as `["exit", "0"]` is not equivalent and
+                    // `exit` also requires `/b` for an explicit status code.
+                    // Keep the fixture aligned with process.run's verbatim
+                    // argv contract instead of relying on shell re-parsing.
+                    json!({"argv": [comspec, "/D", "/C", "exit /b 0"], "cwd": "."}),
                 ),
             ]
         } else {

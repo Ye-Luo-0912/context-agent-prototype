@@ -383,6 +383,23 @@ impl AppState {
                 self.context_selected = selected;
                 self.status = "model context prepared".into();
             }
+            RuntimeEvent::ContextDegraded {
+                model_round,
+                required_misses,
+                optional_misses,
+                ..
+            } => {
+                let required = required_misses.total();
+                let optional = optional_misses.total();
+                self.status = if required > 0 {
+                    "required context unavailable".into()
+                } else {
+                    "context partially unavailable".into()
+                };
+                self.push_system(format!(
+                    "context degraded in model round {model_round}: required misses {required}, optional misses {optional}"
+                ));
+            }
             RuntimeEvent::ContextConsumed { ack } => {
                 self.status = format!(
                     "model consumed {} context items and {} external refs",
@@ -591,6 +608,10 @@ impl AppState {
                 // Exact PASS lifecycle is audit/eval data. A reused result is
                 // already visible through its truthful ToolFinished row.
             }
+            RuntimeEvent::AcceptanceReceiptsRecorded { .. } => {
+                // Criterion receipt lifecycle is bounded audit data; the
+                // resulting readiness is already projected in task progress.
+            }
             RuntimeEvent::Diagnostics { diagnostics } => {
                 self.context = diagnostics.clone();
                 self.push_system(format!(
@@ -619,6 +640,21 @@ impl AppState {
                 self.push_system(format!(
                     "task {task_id} completed (anchor r{anchor_revision}): {summary}"
                 ));
+            }
+            RuntimeEvent::CompletionCommitFailed {
+                task_id,
+                retryable,
+                reason,
+            } => {
+                self.status = "completion failed".into();
+                self.push_system(format!(
+                    "task {task_id} completion commit failed{}: {reason}",
+                    if retryable { " (retryable)" } else { "" }
+                ));
+            }
+            RuntimeEvent::RuntimeCommitBarrier { .. } => {
+                // Durability/replay marker. The paired lifecycle event owns
+                // the user-visible state transition.
             }
             RuntimeEvent::TurnCompleted => {
                 // The turn is over: any delta still in flight belongs to a

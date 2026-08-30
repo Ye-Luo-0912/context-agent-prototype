@@ -133,9 +133,15 @@ impl RuntimeActor {
                         .anchor
                         .constraints
                         .iter()
-                        .chain(task.anchor.acceptance_criteria.iter())
-                        .chain(task.anchor.plan_progress.iter())
-                        .chain(task.anchor.open_loops.iter())
+                        .map(String::as_str)
+                        .chain(
+                            task.anchor
+                                .acceptance_criteria
+                                .iter()
+                                .map(|criterion| criterion.description.as_str()),
+                        )
+                        .chain(task.anchor.plan_progress.iter().map(String::as_str))
+                        .chain(task.anchor.open_loops.iter().map(String::as_str))
                         .any(|item| path_exactly_in_directive(item, target))
             });
             if mutation_precondition || structured || textual {
@@ -1229,6 +1235,9 @@ impl RuntimeActor {
                             self.apply_task_progress_proposal(&mut output, proposal)
                                 .await;
                         }
+                        RuntimeDirective::CompleteTask(proposal) => {
+                            self.apply_completion_proposal(&mut output, proposal).await;
+                        }
                         other => self.execute_directive(other).await,
                     }
                 }
@@ -1452,14 +1461,6 @@ impl RuntimeActor {
         if task.status == crate::task::TaskStatus::Completed {
             return None;
         }
-        // Bind declared acceptance coverage from the pre-dispatch
-        // verifier before the observation, so the observed anchor revision
-        // already carries the claim and this very round can rise to
-        // SettledCandidate. Without a pre-dispatch attribution there is no
-        // exact identity to bind and the gate stays fail-closed.
-        if let Some(attribution) = attribution {
-            self.bind_acceptance_coverage(attribution);
-        }
         let anchor_revision = self
             .state
             .tasks
@@ -1604,6 +1605,7 @@ impl RuntimeActor {
         let Some(observation) = observation else {
             return;
         };
+        let acceptance_passes = observation.verification_pass_events.clone();
         for event in observation.obligation_events {
             let _ = self
                 .core
@@ -1620,8 +1622,9 @@ impl RuntimeActor {
         for event in observation.negative_fact_events {
             self.report_negative_fact(Some(event)).await;
         }
+        let mut verification_events_durable = true;
         for event in observation.verification_pass_events {
-            let _ = self
+            if let Err(error) = self
                 .core
                 .emit_event(RuntimeEvent::ExecutionVerificationPass {
                     kind: event.kind,
@@ -1633,7 +1636,22 @@ impl RuntimeActor {
                     directive_revision: event.directive_revision,
                     workspace_revision: event.workspace_revision,
                 })
+                .await
+            {
+                verification_events_durable = false;
+                self.require_effect_recovery(format!(
+                    "trusted verification PASS could not be durably recorded: {error}"
+                ))
                 .await;
+            }
+        }
+        if verification_events_durable
+            && let Err(error) = self.record_acceptance_receipts(&acceptance_passes).await
+        {
+            self.require_effect_recovery(format!(
+                "acceptance receipt transaction could not be recorded: {error}"
+            ))
+            .await;
         }
         let settlement = {
             let current = self
@@ -1679,67 +1697,161 @@ impl RuntimeActor {
             .await;
     }
 
-    /// Bind the pre-dispatch verifier's exact identity as the acceptance
-    /// coverage claim for every declared criterion of the active task.
-    /// Voluntary and claim-only: with no declared criteria, no exact
-    /// identity or no active task this is a no-op, so the gate keeps its
-    /// fail-closed `VerifiedCurrent` default, and the patch never rewrites
-    /// user authority fields. It runs *before* the tool observation, so
-    /// the observed anchor revision already carries the claim and the
-    /// settlement label can rise to `SettledCandidate` in the same round;
-    /// an identity bound after the observation would bump the revision
-    /// out from under the observed snapshot. An unchanged identity is an
-    /// equivalent patch and bumps nothing. The change is audited by the
-    /// `ExecutionVerificationPass` event and the checkpoint diff, so no
-    /// separate anchor-change event is emitted here.
-    fn bind_acceptance_coverage(&mut self, attribution: &RuntimeExecutionAttribution) {
-        let Some(task_id) = self.state.task_id else {
-            return;
-        };
-        let Some(identity) = attribution.exact_verification_identity() else {
-            return;
-        };
-        let Some(anchor) = self.state.tasks.get(task_id).map(|task| task.anchor.clone()) else {
-            return;
-        };
-        if anchor.acceptance_criteria.is_empty() {
-            return;
-        }
-        let claims = anchor
-            .acceptance_criteria
-            .iter()
-            .enumerate()
-            .map(|(index, _)| crate::task::AcceptanceCoverage {
-                criterion_index: index as u32,
-                verification_identity: identity.to_string(),
-            })
-            .collect();
-        let patch = AnchorPatch {
-            acceptance_coverage: Some(claims),
-            ..AnchorPatch::default()
-        };
-        let Ok((txn, _, changed_fields, kind)) =
-            self.state
+    /// Mint criterion-addressed receipts only after a trusted PASS has been
+    /// observed into ExecutionState. Criteria explicitly opt into a host
+    /// coverage domain; one PASS may cover only criteria naming that exact
+    /// domain and declaration revision. The event is appended before the
+    /// infallible TaskManager commit, so an append failure exposes no ready
+    /// anchor and the caller can recovery-fence the decision.
+    async fn record_acceptance_receipts(
+        &mut self,
+        passes: &[crate::execution::VerificationPassTransition],
+    ) -> AgentResult<()> {
+        for pass in passes {
+            let Some(task_id) = self.state.task_id else {
+                continue;
+            };
+            let Some(task) = self.state.tasks.get(task_id).cloned() else {
+                continue;
+            };
+            if task.status != crate::task::TaskStatus::Active
+                || task.anchor.completion_policy
+                    != crate::task::TaskCompletionPolicy::EvidenceRequired
+            {
+                continue;
+            }
+            let Some(execution) = self.state.turn.as_ref().map(|turn| turn.execution.clone())
+            else {
+                continue;
+            };
+            if execution.anchor_revision != task.anchor.revision
+                || execution.verification.spec_revision != task.anchor.verification_revision
+                || execution.validity() != crate::execution::VerificationState::Current
+            {
+                continue;
+            }
+            let Some(fact) = execution.verifications.iter().rev().find(|fact| {
+                fact.ok
+                    && fact.anchor_revision == pass.anchor_revision
+                    && fact.directive_revision == pass.directive_revision
+                    && fact.workspace_revision == pass.workspace_revision
+                    && fact.source_tool_name == pass.tool_name
+                    && fact.argument_digest == pass.argument_digest
+                    && fact.verification_identity == pass.verification_identity
+            }) else {
+                continue;
+            };
+            let Some(provenance) = fact.recipe_provenance.as_ref() else {
+                continue;
+            };
+            let (Some(domain), Some(domain_declaration_revision)) = (
+                provenance.coverage_domain.as_deref(),
+                provenance.domain_declaration_revision,
+            ) else {
+                continue;
+            };
+            let domain_source_digest = provenance.domain_source_digest.as_str();
+            if domain_declaration_revision == 0
+                || domain_source_digest
+                    .parse::<agent_contracts::ContentDigest>()
+                    .is_err()
+            {
+                continue;
+            }
+            let Some(current_declaration) = self
+                .services
+                .verification_coverage_declarations()
+                .binary_search_by(|declaration| declaration.domain_id.as_str().cmp(domain))
+                .ok()
+                .map(|index| &self.services.verification_coverage_declarations()[index])
+            else {
+                continue;
+            };
+            if current_declaration.declaration_revision != domain_declaration_revision
+                || current_declaration.source_digest != domain_source_digest
+            {
+                continue;
+            }
+            let criterion_indices: Vec<u32> = task
+                .anchor
+                .acceptance_criteria
+                .iter()
+                .enumerate()
+                .filter_map(|(index, criterion)| {
+                    (criterion.coverage_domain == domain
+                        && criterion.domain_declaration_revision == domain_declaration_revision
+                        && criterion.domain_source_digest == domain_source_digest)
+                        .then_some(index as u32)
+                })
+                .collect();
+            if criterion_indices.is_empty() {
+                continue;
+            }
+
+            let basis = crate::task::VerificationBasis {
+                task_id,
+                verification_revision: task.anchor.verification_revision,
+                directive_revision: execution.directive_revision,
+                workspace_revision: execution.workspace_revision,
+            };
+            let mut receipts: Vec<crate::task::AcceptanceCoverage> = task
+                .anchor
+                .acceptance_coverage
+                .iter()
+                .filter(|receipt| {
+                    crate::task::acceptance_receipt_fact(&execution, &task, &basis, receipt)
+                        .is_some()
+                        && !criterion_indices.contains(&receipt.criterion_index)
+                })
+                .cloned()
+                .collect();
+            receipts.extend(criterion_indices.iter().map(|criterion_index| {
+                crate::task::AcceptanceCoverage {
+                    task_id: Some(task_id),
+                    verification_revision: task.anchor.verification_revision,
+                    criterion_index: *criterion_index,
+                    coverage_domain: domain.to_string(),
+                    domain_declaration_revision,
+                    domain_source_digest: domain_source_digest.to_string(),
+                    directive_revision: fact.directive_revision,
+                    workspace_revision: fact.workspace_revision,
+                    verification_identity: fact.verification_identity.clone(),
+                }
+            }));
+            receipts.sort_by_key(|receipt| receipt.criterion_index);
+            let (txn, revision, changed_fields) = self
+                .state
                 .tasks
-                .prepare_patch_anchor(task_id, anchor.revision, &patch)
-        else {
-            return;
-        };
-        if changed_fields.is_empty() {
-            // Equivalent pass identity: the claim is already current.
+                .prepare_record_acceptance_receipts(task_id, task.anchor.revision, receipts)?;
+            if changed_fields.is_empty() {
+                self.state.tasks.commit(txn);
+                continue;
+            }
+            self.bump_generation()?;
+            self.core
+                .emit_event(RuntimeEvent::AcceptanceReceiptsRecorded {
+                    task_id,
+                    anchor_revision: revision,
+                    verification_revision: task.anchor.verification_revision,
+                    criterion_indices,
+                    coverage_domain: domain.to_string(),
+                    domain_declaration_revision,
+                    domain_source_digest: domain_source_digest.to_string(),
+                    directive_revision: fact.directive_revision,
+                    workspace_revision: fact.workspace_revision,
+                    verification_identity: fact.verification_identity.clone(),
+                })
+                .await?;
             self.state.tasks.commit(txn);
-            return;
+            if let Some(turn) = self.state.turn.as_mut() {
+                // Receipt CAS advances only the full task-state revision.
+                // Keep the current execution projection synchronized without
+                // touching its verification basis.
+                turn.execution.anchor_revision = revision;
+            }
+            self.accrue_checkpoint_debt(crate::checkpoint::CheckpointDebtReason::TaskAnchorChanged);
         }
-        if kind == AnchorPatchKind::Boundary {
-            return; // coverage patches are autonomous by construction
-        }
-        if self.bump_generation().is_err() {
-            return;
-        }
-        self.state.tasks.commit(txn);
-        self.accrue_checkpoint_debt(
-            crate::checkpoint::CheckpointDebtReason::TaskAnchorChanged,
-        );
+        Ok(())
     }
 
     /// 无派发拒绝一次可证等价的重试：类型化 ToolFinished 入账、推进

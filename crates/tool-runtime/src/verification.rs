@@ -10,7 +10,8 @@ use std::io::Read;
 use std::path::{Path, PathBuf};
 
 use agent_contracts::{
-    HostEffectBinding, HostExecRecipe, HostToolPolicy, RuntimeFactsView, VerificationReuse,
+    HostEffectBinding, HostExecRecipe, HostToolPolicy, RuntimeFactsView,
+    VerificationCoverageDeclaration, VerificationReuse,
 };
 use agent_workspace::Workspace;
 use serde::{Deserialize, Serialize};
@@ -236,6 +237,7 @@ impl VerificationRecipe {
 pub struct VerificationRecipes {
     recipes: Vec<VerificationRecipe>,
     domains: Vec<VerificationCoverageDomain>,
+    declarations: Vec<VerificationCoverageDeclaration>,
 }
 
 const MAX_COVERAGE_DOMAINS: usize = 8;
@@ -273,6 +275,7 @@ impl VerificationRecipes {
         Ok(Self {
             recipes,
             domains: Vec::new(),
+            declarations: Vec::new(),
         })
     }
 
@@ -286,7 +289,7 @@ impl VerificationRecipes {
         if domains.len() > MAX_COVERAGE_DOMAINS {
             return Err(format!("at most {MAX_COVERAGE_DOMAINS} coverage domains"));
         }
-        for domain in &domains {
+        for domain in &mut domains {
             if domain.domain_id.trim().is_empty() || domain.domain_id.len() > MAX_RECIPE_ID_BYTES {
                 return Err(format!(
                     "coverage domain id must contain 1..={MAX_RECIPE_ID_BYTES} bytes"
@@ -300,9 +303,8 @@ impl VerificationRecipes {
                     "coverage domain members must contain 1..={MAX_CLASS_MEMBERS} recipe ids"
                 ));
             }
-            let mut members = domain.members.clone();
-            members.sort();
-            if members.windows(2).any(|pair| pair[0] == pair[1]) {
+            domain.members.sort();
+            if domain.members.windows(2).any(|pair| pair[0] == pair[1]) {
                 return Err("coverage domain members must be unique".into());
             }
             for member in &domain.members {
@@ -329,12 +331,67 @@ impl VerificationRecipes {
         {
             return Err("coverage domain ids must be unique".into());
         }
+        let declarations = domains
+            .iter()
+            .map(|domain| self.build_coverage_declaration(domain))
+            .collect::<Result<Vec<_>, _>>()?;
         self.domains = domains;
+        self.declarations = declarations;
         Ok(self)
     }
 
     pub fn domains(&self) -> &[VerificationCoverageDomain] {
         &self.domains
+    }
+
+    /// Bounded semantic projection consumed by Runtime's completion gate.
+    /// The digest covers the canonical domain row and every complete member
+    /// recipe, so reusing a revision while changing composition fails closed.
+    pub fn coverage_declarations(&self) -> &[VerificationCoverageDeclaration] {
+        &self.declarations
+    }
+
+    pub fn coverage_declaration(
+        &self,
+        domain_id: &str,
+    ) -> Option<&VerificationCoverageDeclaration> {
+        self.declarations
+            .binary_search_by(|declaration| declaration.domain_id.as_str().cmp(domain_id))
+            .ok()
+            .map(|index| &self.declarations[index])
+    }
+
+    fn build_coverage_declaration(
+        &self,
+        domain: &VerificationCoverageDomain,
+    ) -> Result<VerificationCoverageDeclaration, String> {
+        let members = domain
+            .members
+            .iter()
+            .map(|member| {
+                self.get(member).cloned().ok_or_else(|| {
+                    format!("coverage domain member '{member}' disappeared during projection")
+                })
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        let value = serde_json::json!({
+            "schema": "verification-coverage-declaration/v1",
+            "domain_id": domain.domain_id,
+            "declaration_revision": domain.declaration_revision,
+            "members": members,
+        });
+        let canonical = agent_contracts::jcs_serialize(&value)
+            .map_err(|error| format!("coverage declaration canonicalization failed: {error}"))?;
+        let declaration = VerificationCoverageDeclaration {
+            domain_id: domain.domain_id.clone(),
+            declaration_revision: domain.declaration_revision,
+            source_digest: agent_contracts::ContentDigest::sha256_bytes(canonical.as_bytes())
+                .to_string(),
+        };
+        if !declaration.is_valid() {
+            return Err("coverage declaration projection is invalid".into());
+        }
+        Ok(declaration)
     }
 
     /// Whether two (recipe id, revision) pairs sit in one currently declared
@@ -486,8 +543,12 @@ impl VerificationRecipes {
         } else {
             None
         };
+        let domain_declaration = recipe
+            .coverage_domain
+            .as_deref()
+            .and_then(|domain| self.coverage_declaration(domain));
         let value = serde_json::json!({
-            "schema": "verification-recipe-identity/v1",
+            "schema": "verification-recipe-identity/v2",
             "recipe": recipe_digest,
             "platform": runtime_facts.platform,
             "architecture": runtime_facts.architecture,
@@ -495,6 +556,8 @@ impl VerificationRecipes {
             "inherited_environment": inherited_environment_digest()?,
             "exact_inputs": exact_input_digest(workspace_root, &recipe.exact_inputs)?,
             "workspace_inputs": workspace_inputs,
+            "coverage_domain_declaration_revision": domain_declaration.map(|row| row.declaration_revision),
+            "coverage_domain_source_digest": domain_declaration.map(|row| row.source_digest.as_str()),
         });
         agent_contracts::jcs_serialize(&value).ok()
     }
@@ -513,8 +576,12 @@ impl VerificationRecipes {
         workspace_root: &Path,
         executable_identity: &str,
     ) -> Option<String> {
+        let domain_declaration = recipe
+            .coverage_domain
+            .as_deref()
+            .and_then(|domain| self.coverage_declaration(domain));
         let value = serde_json::json!({
-            "schema": "verification-class-identity/v1",
+            "schema": "verification-class-identity/v2",
             "platform": runtime_facts.platform,
             "architecture": runtime_facts.architecture,
             "executable": executable_identity,
@@ -525,6 +592,8 @@ impl VerificationRecipes {
             } else {
                 None
             },
+            "coverage_domain_declaration_revision": domain_declaration.map(|row| row.declaration_revision),
+            "coverage_domain_source_digest": domain_declaration.map(|row| row.source_digest.as_str()),
         });
         agent_contracts::jcs_serialize(&value).ok()
     }
@@ -953,6 +1022,76 @@ mod tests {
         let table = class_table();
         assert!(table.same_declared_class(("verify.a", "rev-1"), ("verify.b", "rev-1")));
         assert!(table.same_declared_class(("verify.b", "rev-1"), ("verify.a", "rev-1")));
+    }
+
+    #[tokio::test]
+    async fn domain_declaration_revision_is_part_of_exact_and_class_identity() {
+        let dir = tempfile::tempdir().unwrap();
+        let workspace = Workspace::open(dir.path()).await.unwrap();
+        let recipe = exact_recipe("verify.a", "rev-1")
+            .with_coverage_domain("workspace-tests")
+            .unwrap();
+        let table = |declaration_revision| {
+            VerificationRecipes::new(vec![recipe.clone()])
+                .unwrap()
+                .with_domains(vec![VerificationCoverageDomain {
+                    domain_id: "workspace-tests".into(),
+                    declaration_revision,
+                    members: vec!["verify.a".into()],
+                }])
+                .unwrap()
+        };
+        let old = table(1);
+        let current = table(2);
+        let facts = workspace.runtime_facts();
+        assert_ne!(
+            old.identity_material(&recipe, &facts, dir.path(), "cargo-v1"),
+            current.identity_material(&recipe, &facts, dir.path(), "cargo-v1")
+        );
+        assert_ne!(
+            old.class_shared_identity(&recipe, &facts, dir.path(), "cargo-v1"),
+            current.class_shared_identity(&recipe, &facts, dir.path(), "cargo-v1")
+        );
+    }
+
+    #[test]
+    fn declaration_projection_is_canonical_and_fences_same_revision_recomposition() {
+        let build = |extra_arg: Option<&str>, members: Vec<&str>| {
+            let recipe = |id: &str| {
+                let mut argv = vec!["cargo".into(), "test".into()];
+                if let Some(arg) = extra_arg {
+                    argv.push(arg.into());
+                }
+                VerificationRecipe::new(id, "desc", "rev-1", argv)
+                    .unwrap()
+                    .with_exact_current_world_reuse()
+                    .with_coverage_domain("workspace-tests")
+                    .unwrap()
+            };
+            VerificationRecipes::new(vec![recipe("verify.a"), recipe("verify.b")])
+                .unwrap()
+                .with_domains(vec![VerificationCoverageDomain {
+                    domain_id: "workspace-tests".into(),
+                    declaration_revision: 3,
+                    members: members.into_iter().map(str::to_string).collect(),
+                }])
+                .unwrap()
+        };
+        let first = build(None, vec!["verify.b", "verify.a"]);
+        let reordered = build(None, vec!["verify.a", "verify.b"]);
+        let recomposed = build(Some("--all-targets"), vec!["verify.a", "verify.b"]);
+
+        assert_eq!(first.domains()[0].members, ["verify.a", "verify.b"]);
+        assert_eq!(
+            first.coverage_declarations(),
+            reordered.coverage_declarations()
+        );
+        assert!(first.coverage_declarations()[0].is_valid());
+        assert_ne!(
+            first.coverage_declarations()[0].source_digest,
+            recomposed.coverage_declarations()[0].source_digest,
+            "complete canonical recipe authority must bind the declaration source"
+        );
     }
 
     #[test]

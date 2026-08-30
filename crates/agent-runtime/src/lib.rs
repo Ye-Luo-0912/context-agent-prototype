@@ -11,8 +11,8 @@ mod execution;
 // 定向再导出：类型已随 `TaskRecord::resume` 公开，replay/审计需要直接
 // 驱动同一投影以重建证据前沿；execution 模块本身保持私有。
 pub use execution::{
-    ExecutionState, FrontierObservation, NegativeExecutionFact, VerificationSourceLease,
-    VerificationState,
+    ExecutionState, FrontierObservation, NegativeExecutionFact, UnresolvedFailureOverflow,
+    VerificationSourceLease, VerificationState,
 };
 pub mod host;
 mod instance;
@@ -60,10 +60,13 @@ pub use plugin::{
     HookRef, HookView, PLUGIN_TEST_OUTPUT_TAIL_CHARS, PLUGIN_TEST_TIMEOUT, PluginPackageView,
     PluginRegistry, PluginTestReport, PluginTestResult, SkillView,
 };
-pub use prompt::{PromptAssembler, focus_frame_tokens};
+pub use prompt::{
+    PromptAssembler, SettlementProjectionPreflight, compare_settlement_projection,
+    focus_frame_tokens, settlement_projection_preflight,
+};
 pub use services::{AuthorityRecoveryServices, RuntimeServices};
 pub use task::{
-    AnchorPatch, ContextRootClaim, RootClaimRole, RootClaimStrength, TaskAnchor, TaskInfo,
-    TaskManager, TaskRecord, TaskStatus, TaskToolRequirementSet, anchor_root_claims,
-    task_anchor_view,
+    AcceptanceCoverage, AcceptanceCriterion, AnchorPatch, ContextRootClaim, RootClaimRole,
+    RootClaimStrength, TaskAnchor, TaskCompletionPolicy, TaskInfo, TaskManager, TaskRecord,
+    TaskStatus, TaskToolRequirementSet, anchor_root_claims, task_anchor_view,
 };

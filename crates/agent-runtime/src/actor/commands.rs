@@ -8,7 +8,7 @@ impl RuntimeActor {
     ) {
         match command {
             RuntimeCommand::Start { reply } => {
-                let _ = reply.send(self.core.start().await);
+                let _ = reply.send(self.start_serving().await);
             }
             RuntimeCommand::UserMessage { content, reply } => {
                 self.start_turn(content, reply, op_tx).await;
@@ -324,8 +324,13 @@ impl RuntimeActor {
             RuntimeCommand::CompleteTask { summary, reply } => {
                 let result = match self.ensure_idle().and_then(|_| self.next_focus_revision()) {
                     Ok(next_focus_revision) => {
-                        self.commit_completion(summary, Vec::new(), next_focus_revision)
-                            .await
+                        self.commit_completion(
+                            CompletionIntent::ExplicitOperator,
+                            summary,
+                            Vec::new(),
+                            next_focus_revision,
+                        )
+                        .await
                     }
                     Err(error) => Err(error),
                 };
@@ -346,7 +351,10 @@ impl RuntimeActor {
                 let _ = reply.send(result);
             }
             RuntimeCommand::PrepareRestore { checkpoint, reply } => {
-                let result = self.prepare_restore(checkpoint).await;
+                let result = match self.ensure_serving() {
+                    Ok(()) => self.prepare_restore(checkpoint).await,
+                    Err(error) => Err(error),
+                };
                 let _ = reply.send(result);
             }
             RuntimeCommand::FinalizeRestore {
@@ -354,14 +362,23 @@ impl RuntimeActor {
                 capabilities_applied,
                 reply,
             } => {
-                let result = self
-                    .finalize_restore(restore_id, capabilities_applied)
-                    .await;
+                let result = match self.ensure_serving() {
+                    Ok(()) => {
+                        self.finalize_restore(restore_id, capabilities_applied)
+                            .await
+                    }
+                    Err(error) => Err(error),
+                };
                 let _ = reply.send(result);
             }
             RuntimeCommand::EmitDiagnostics { reply } => {
-                // Pure read of engine state: allowed at any time.
-                let _ = reply.send(self.core.emit_diagnostics().await);
+                // Diagnostics persist events, so they must follow the startup
+                // format marker even though the engine query itself is read-only.
+                let result = match self.ensure_serving() {
+                    Ok(()) => self.core.emit_diagnostics().await,
+                    Err(error) => Err(error),
+                };
+                let _ = reply.send(result);
             }
             RuntimeCommand::InspectContext { limit, reply } => {
                 let _ = reply.send(self.services.inspect_context(limit).await);
@@ -376,16 +393,23 @@ impl RuntimeActor {
                 let _ = reply.send(Ok(self.core.query_operation(operation_id)));
             }
             RuntimeCommand::CancelOperation { identity, reply } => {
-                let result = self.cancel_operation(identity).await;
+                let result = match self.ensure_serving() {
+                    Ok(()) => self.cancel_operation(identity).await,
+                    Err(error) => Err(error),
+                };
                 if result.is_ok() {
                     self.drain_queued_user_input(op_tx).await;
                 }
                 let _ = reply.send(result);
             }
             RuntimeCommand::CancelTurn { reply } => {
-                let result = self
-                    .cancel_turn(TurnCancellationReason::Requested, None)
-                    .await;
+                let result = match self.ensure_serving() {
+                    Ok(()) => {
+                        self.cancel_turn(TurnCancellationReason::Requested, None)
+                            .await
+                    }
+                    Err(error) => Err(error),
+                };
                 if result.is_ok() {
                     self.drain_queued_user_input(op_tx).await;
                 }

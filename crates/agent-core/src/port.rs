@@ -416,6 +416,10 @@ pub trait CorePort: Send + Sync {
 
     async fn emit_event_durable(&self, event: RuntimeEvent) -> AgentResult<()>;
 
+    /// Append and flush a bounded ordered event transaction, then publish
+    /// its members in the same order.
+    async fn emit_events_durable(&self, events: Vec<RuntimeEvent>) -> AgentResult<()>;
+
     async fn emit_warning(&self, message: String) -> AgentResult<()>;
 
     async fn authorize(
@@ -545,6 +549,10 @@ impl CorePort for CoreAuthority {
 
     async fn emit_event_durable(&self, event: RuntimeEvent) -> AgentResult<()> {
         CoreAuthority::emit_event_durable(self, event).await
+    }
+
+    async fn emit_events_durable(&self, events: Vec<RuntimeEvent>) -> AgentResult<()> {
+        CoreAuthority::emit_events_durable(self, events).await
     }
 
     async fn emit_warning(&self, message: String) -> AgentResult<()> {
@@ -1058,6 +1066,9 @@ mod tests {
                 selected: Vec::new(),
                 approx_tokens: 0,
                 foreground: Vec::new(),
+                required_item_ids: Vec::new(),
+                required_misses: Default::default(),
+                optional_misses: Default::default(),
                 diagnostics: ContextDiagnostics::default(),
             })
         }
@@ -1909,6 +1920,13 @@ mod tests {
         assert!(matches!(
             events.recv().await.unwrap().event,
             RuntimeEvent::RunStarted
+        ));
+        assert!(matches!(
+            events.recv().await.unwrap().event,
+            RuntimeEvent::RuntimeCommitBarrier {
+                kind: agent_contracts::RuntimeCommitKind::RunStart,
+                checkpoint_sequence: None,
+            }
         ));
         assert!(matches!(
             events.recv().await.unwrap().event,

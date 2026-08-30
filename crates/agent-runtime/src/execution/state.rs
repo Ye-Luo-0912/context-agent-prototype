@@ -13,7 +13,8 @@ use agent_contracts::{
 use agent_contracts::{ToolResultDisposition, TurnFrame, TurnFrameStep};
 
 pub(crate) const MAX_RESUME_FILES: usize = 32;
-pub(super) const MAX_RESUME_FAILURES: usize = 8;
+pub(super) const MAX_RESUME_FAILURES: usize = 32;
+const MAX_VERIFICATION_FACTS: usize = 8;
 pub(super) const MAX_REVALIDATE_PER_ROUND: usize = 8;
 pub(super) const MAX_COVERAGE_PATHS: usize = 8;
 /// Consecutive identical no-progress rounds before the runtime tells the
@@ -30,8 +31,9 @@ const MAX_EVIDENCE_ROWS: usize = 16;
 const MAX_RECENT_DELTAS: usize = 8;
 /// 单条证据 outcome / 参数摘要的字符上限。
 const EVIDENCE_TEXT_CHARS: usize = 80;
-/// 义务账本上限（最旧淘汰）与单义务目标数上限。
-pub(super) const MAX_OBLIGATIONS: usize = 8;
+/// Exact obligation hot-set and per-obligation target caps. Overflow becomes
+/// a fail-closed omitted sentinel; unresolved rows are never silently evicted.
+pub(super) const MAX_OBLIGATIONS: usize = MAX_RESUME_FAILURES;
 const MAX_OBLIGATION_TARGETS: usize = 8;
 /// Speculative negative path observations and trusted verifier sources are
 /// operational identities, never transcript history. Both tables are small
@@ -119,6 +121,46 @@ pub struct FailureCluster {
     pub tried_targets: Vec<String>,
 }
 
+/// Fail-closed summary for unresolved identities that did not fit in the
+/// checkpoint hot set. We deliberately do not retain a lossy hash set and
+/// pretend it can prove later membership: exact successes resolve exact
+/// retained rows, while this sentinel remains a blocker for the lifetime of
+/// the task. Ordinary user directives and TaskContinuations are not waivers;
+/// only an explicit operator completion override or a new task boundary can
+/// leave opaque old debt behind.
+#[derive(Debug, Clone, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub struct UnresolvedFailureOverflow {
+    /// Directive epoch in which omission first occurred.
+    #[serde(default)]
+    pub directive_revision: u64,
+    /// Number of unresolved typed obligation identities omitted from the hot
+    /// set. Saturating and allocation-free.
+    #[serde(default)]
+    pub omitted_obligations: u32,
+    /// Number of unresolved failed-command identities omitted from the hot
+    /// set. Includes non-deterministic failures that do not open obligations.
+    #[serde(default)]
+    pub omitted_failed_commands: u32,
+}
+
+impl UnresolvedFailureOverflow {
+    fn is_empty(&self) -> bool {
+        self.omitted_obligations == 0 && self.omitted_failed_commands == 0
+    }
+}
+
+/// Bounded durable result of a deferred terminal-completion transaction.
+/// It retains no proposal body or transcript, only the latest failure and
+/// the attempt count needed by the next decision.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub struct CompletionCommitFailure {
+    pub reason: String,
+    #[serde(default)]
+    pub attempts: u32,
+}
+
 /// Bounded operational cache bound to `task_id + anchor_revision +
 /// workspace_revision`. Serialized as `resume` on `TaskRecord`.
 #[derive(Debug, Clone, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
@@ -142,7 +184,13 @@ pub struct ExecutionState {
     pub workspace_revision: u64,
     pub checked_files: Vec<ResourceFact>,
     pub verifications: Vec<VerificationFact>,
+    /// Bounded unresolved blocker projection. Historical attempts remain in
+    /// durable tool-result and obligation-transition events; they are not
+    /// copied into this checkpoint hot state. A row leaves this list only
+    /// through exact operation proof or the typed obligation matcher.
     pub failed_commands: Vec<FailedCommandFact>,
+    #[serde(default)]
+    pub completion_commit_failure: Option<CompletionCommitFailure>,
     #[serde(default)]
     pub verification: VerificationObligation,
     #[serde(default)]
@@ -163,6 +211,10 @@ pub struct ExecutionState {
     /// 仅前置变化或同类成功解除。
     #[serde(default)]
     pub obligations: Vec<ExecutionObligation>,
+    /// Conservative overflow sentinel for the two unresolved-failure hot
+    /// sets. This is task/checkpoint state, not transcript history.
+    #[serde(default)]
+    pub failure_overflow: UnresolvedFailureOverflow,
     /// Trusted path misses that were speculative rather than rooted in task
     /// authority. They are bound to `workspace_revision`, retain no body,
     /// and may be reused only after a live Workspace absence check.
@@ -181,13 +233,13 @@ pub struct ExecutionState {
 
 /// 一条已证明存在的执行 blocker（lineage 模型）。
 /// `scope_key` 是稳定 lineage 身份（ExecutableResolution = 解析上下文
-/// digest：cwd + effective PATH + 规则版本；EditTarget/ResourcePath =
+/// digest：规范化 argv0 + 有序候选族 + 平台规则；EditTarget/ResourcePath =
 /// 路径；ProjectMarker = 目标身份），跨 epoch 不变。`precondition` 是
 /// 当前 epoch 的前置指纹（ExecutableResolution = resolution_fingerprint，
 /// 覆盖完整有界目录状态；EditTarget = path@被拒revision；其余 = 目标
 /// 路径）。世界推进只推进 epoch、不解除义务——PreconditionChanged ≠
-/// ObligationResolved；只有 blocker 特定的证明（同 scope 同指纹的
-/// 成功，或目标以新身份落地）才解除。`attempts` 计当前 epoch 内失败，
+/// ObligationResolved；只有 blocker 特定的证明（同一规范化候选族的
+/// 成功启动，或目标以新身份落地）才解除。`attempts` 计当前 epoch 内失败，
 /// `total_attempts` 计整个 lineage 累计。
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -360,12 +412,29 @@ pub struct VerificationFact {
     pub recipe_provenance: Option<agent_contracts::VerificationRecipeProvenance>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub struct FailedCommandFact {
     pub tool_name: String,
     #[serde(default)]
     pub target: String,
+    /// Runtime-computed argument identity. New production observations use
+    /// this digest for exact-operation resolution; an empty value is a
+    /// fail-closed legacy row and is never matched to a new digest by
+    /// comparing display command text.
+    #[serde(default)]
+    pub argument_digest: String,
+    /// Typed retry domain and blocker identity captured from trusted output
+    /// facts. These fields mirror the obligation ledger so both views use
+    /// one resolution predicate. Legacy rows default to NonDeterministic and
+    /// remain fail-closed until an operator or migration supplies typed
+    /// evidence; display text is never promoted to identity authority.
+    #[serde(default)]
+    pub domain: ToolFailureDomain,
+    #[serde(default)]
+    pub scope_key: String,
+    #[serde(default)]
+    pub precondition: String,
     pub summary: String,
     pub turn: u64,
 }
@@ -445,9 +514,49 @@ pub struct VerificationPassTransition {
 pub(super) struct OperationIdentity {
     pub tool_name: String,
     pub target: String,
+    pub argument_digest: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct FailureBlockerIdentity {
+    domain: ToolFailureDomain,
+    scope_key: String,
+    precondition: String,
+}
+
+struct FailureResolutionEvidence<'a> {
+    observation_ok: bool,
+    incoming_failure: Option<FailureBlockerIdentity>,
+    launch_ok: bool,
+    launch_scope: String,
+    mutated_paths: Vec<String>,
+    /// Exact resource identities proved by this successful observation.
+    /// Historical `Fresh` rows are deliberately excluded: an unrelated
+    /// later tool call must not make a pre-failure cache entry look new.
+    observed_resources: std::collections::HashMap<&'a str, &'a str>,
+    verified_resources: &'a [String],
+}
+
+enum FailureResolution {
+    Keep,
+    Resolve,
 }
 
 impl ExecutionState {
+    pub(crate) fn record_completion_commit_failure(&mut self, reason: &str) {
+        let reason: String = reason.chars().take(MAX_TASK_ANCHOR_ITEM_CHARS).collect();
+        let attempts = self
+            .completion_commit_failure
+            .as_ref()
+            .map(|failure| failure.attempts.saturating_add(1))
+            .unwrap_or(1);
+        self.completion_commit_failure = Some(CompletionCommitFailure { reason, attempts });
+    }
+
+    pub(crate) fn clear_completion_commit_failure(&mut self) {
+        self.completion_commit_failure = None;
+    }
+
     /// New user directive: TurnIntent is replaced by the caller. Verification
     /// obligation is not wiped here — whether Verify is due this round is
     /// [`Self::verification_due_now`].
@@ -473,7 +582,17 @@ impl ExecutionState {
     /// drains through typed resolution evidence, so any positive count
     /// blocks a successful completion gate.
     pub fn open_obligation_count(&self) -> usize {
-        self.obligations.len()
+        self.obligations.len().saturating_add(
+            usize::try_from(self.failure_overflow.omitted_obligations).unwrap_or(usize::MAX),
+        )
+    }
+
+    /// Number of unresolved failed-command identities, including the
+    /// fail-closed omitted sentinel.
+    pub fn unresolved_failed_command_count(&self) -> usize {
+        self.failed_commands.len().saturating_add(
+            usize::try_from(self.failure_overflow.omitted_failed_commands).unwrap_or(usize::MAX),
+        )
     }
 
     /// Latest verification evidence, including epoch-stale rows.
@@ -647,7 +766,7 @@ impl ExecutionState {
     }
 
     pub fn has_failures(&self) -> bool {
-        !self.failed_commands.is_empty()
+        self.unresolved_failed_command_count() > 0
     }
 
     /// The verification identity of the latest positive, exactly-attributed
@@ -660,15 +779,18 @@ impl ExecutionState {
             return None;
         }
         let basis = self.verification.spec_revision;
-        self.verifications.iter().rev().find(|fact| {
-            fact.ok
-                && !fact.source_tool_name.is_empty()
-                && !fact.verification_identity.is_empty()
-                && fact.anchor_revision == basis
-                && fact.directive_revision == self.directive_revision
-                && fact.workspace_revision == self.workspace_revision
-        })
-        .map(|fact| fact.verification_identity.as_str())
+        self.verifications
+            .iter()
+            .rev()
+            .find(|fact| {
+                fact.ok
+                    && !fact.source_tool_name.is_empty()
+                    && !fact.verification_identity.is_empty()
+                    && fact.anchor_revision == basis
+                    && fact.directive_revision == self.directive_revision
+                    && fact.workspace_revision == self.workspace_revision
+            })
+            .map(|fact| fact.verification_identity.as_str())
     }
 
     /// Execution-local readiness layer of the settlement gate: a current
@@ -680,7 +802,7 @@ impl ExecutionState {
     pub fn execution_ready(&self) -> bool {
         self.trusted_verification_identity().is_some()
             && self.open_obligation_count() == 0
-            && self.failed_commands.is_empty()
+            && self.unresolved_failed_command_count() == 0
     }
 
     /// Derived settlement label: an evidence-driven decision boundary, not a
@@ -821,7 +943,13 @@ impl ExecutionState {
         attribution.exact_verification_identity()?;
         let requested = attribution.verification_recipe()?;
         let domain = requested.coverage_domain.as_deref()?;
-        if requested.domain_declaration_revision.is_none()
+        if requested
+            .domain_declaration_revision
+            .is_none_or(|revision| revision == 0)
+            || requested
+                .domain_source_digest
+                .parse::<agent_contracts::ContentDigest>()
+                .is_err()
             || requested.class_identity_digest.is_empty()
         {
             return None;
@@ -844,6 +972,7 @@ impl ExecutionState {
                             && recorded.coverage_domain.as_deref() == Some(domain)
                             && recorded.domain_declaration_revision
                                 == requested.domain_declaration_revision
+                            && recorded.domain_source_digest == requested.domain_source_digest
                     })
             })
             .cloned()
@@ -963,6 +1092,48 @@ impl ExecutionState {
     }
 
     pub fn view(&self) -> TaskProgressView {
+        let mut failed_commands: Vec<String> = self
+            .failed_commands
+            .iter()
+            // A current speculative miss has a more precise projection
+            // below. Do not spend prompt budget on both the generic
+            // failure row and its revision-bound known-absence identity.
+            .filter(|failure| {
+                !self.negative_facts.iter().any(|negative| {
+                    negative.workspace_revision == self.workspace_revision
+                        && negative.tool_name == failure.tool_name
+                        && negative.target == failure.target
+                })
+            })
+            .map(|row| {
+                if row.target.is_empty() {
+                    format!("{}:{}", row.tool_name, row.summary)
+                } else {
+                    format!("{} {}:{}", row.tool_name, row.target, row.summary)
+                }
+            })
+            .chain(
+                self.negative_facts
+                    .iter()
+                    .filter(|row| row.workspace_revision == self.workspace_revision)
+                    .map(|row| {
+                        format!(
+                            "known_absent {} {}:{} @ world={}",
+                            row.tool_name,
+                            row.target,
+                            row.failure.as_str(),
+                            row.workspace_revision
+                        )
+                    }),
+            )
+            .collect();
+        if self.failure_overflow.omitted_failed_commands > 0 {
+            failed_commands.push(format!(
+                "unresolved_failure_overflow omitted={} opened_directive_epoch={}",
+                self.failure_overflow.omitted_failed_commands,
+                self.failure_overflow.directive_revision
+            ));
+        }
         TaskProgressView {
             anchor_revision: self.anchor_revision,
             workspace_revision: self.workspace_revision,
@@ -976,41 +1147,13 @@ impl ExecutionState {
                 .current_verifications()
                 .map(|row| format!("{}:{}", if row.ok { "ok" } else { "fail" }, row.summary))
                 .collect(),
-            failed_commands: self
-                .failed_commands
-                .iter()
-                // A current speculative miss has a more precise projection
-                // below. Do not spend prompt budget on both the generic
-                // failure row and its revision-bound known-absence identity.
-                .filter(|failure| {
-                    !self.negative_facts.iter().any(|negative| {
-                        negative.workspace_revision == self.workspace_revision
-                            && negative.tool_name == failure.tool_name
-                            && negative.target == failure.target
-                    })
-                })
-                .map(|row| {
-                    if row.target.is_empty() {
-                        format!("{}:{}", row.tool_name, row.summary)
-                    } else {
-                        format!("{} {}:{}", row.tool_name, row.target, row.summary)
-                    }
-                })
-                .chain(
-                    self.negative_facts
-                        .iter()
-                        .filter(|row| row.workspace_revision == self.workspace_revision)
-                        .map(|row| {
-                            format!(
-                                "known_absent {} {}:{} @ world={}",
-                                row.tool_name,
-                                row.target,
-                                row.failure.as_str(),
-                                row.workspace_revision
-                            )
-                        }),
+            failed_commands,
+            completion_commit_failure: self.completion_commit_failure.as_ref().map(|failure| {
+                format!(
+                    "task.complete terminal commit failed (attempt {}): {}",
+                    failure.attempts, failure.reason
                 )
-                .collect(),
+            }),
             operational_evidence: self.evidence_rows(),
             unresolved_blockers: self.obligation_warnings(),
             stall_warning: self.stall_warning(),
@@ -1385,50 +1528,14 @@ impl ExecutionState {
         if output.ok || speculative_negative {
             return;
         }
-        // 注意走 output 的域判定而非裸 class 映射：外壳工具的
-        // path_not_found 属于 ExecutableResolution，不是 ResourcePath。
-        let domain = output.failure_domain();
-        if matches!(domain, ToolFailureDomain::NonDeterministic) {
+        let Some(blocker) = failure_blocker_identity(output) else {
             return;
-        }
-        let metadata_str = |key: &str| {
-            output
-                .metadata
-                .get(key)
-                .and_then(|value| value.as_str())
-                .unwrap_or_default()
-                .to_string()
         };
-        let touches = output.resource_touches();
-        let (scope_key, fingerprint) = match domain {
-            // resolver 在 preflight 统一盖章；旧格式失败只有指纹时退化为
-            // 单一 scope（scope 为空按匿名血统处理，仍可累计）。
-            ToolFailureDomain::ExecutableResolution => (
-                metadata_str("resolution_scope_key"),
-                metadata_str("resolution_fingerprint"),
-            ),
-            ToolFailureDomain::EditTarget | ToolFailureDomain::ResourcePath => {
-                let Some(touch) = touches.first() else {
-                    return;
-                };
-                let fingerprint = match (domain, touch.revision.as_deref()) {
-                    (ToolFailureDomain::EditTarget, Some(revision)) if !revision.is_empty() => {
-                        format!("{}@{}", touch.path, revision)
-                    }
-                    _ => String::new(),
-                };
-                (touch.path.clone(), fingerprint)
-            }
-            ToolFailureDomain::ProjectMarker => (
-                bound_evidence_text(output.operation_target().unwrap_or_default()),
-                String::new(),
-            ),
-            ToolFailureDomain::NonDeterministic => return,
-        };
-        let scope_key = bound_evidence_text(&scope_key);
-        if scope_key.is_empty() && fingerprint.is_empty() {
-            return;
-        }
+        let FailureBlockerIdentity {
+            domain,
+            scope_key,
+            precondition: fingerprint,
+        } = blocker;
         let target = bound_evidence_text(&identity.target);
         if let Some(row) = self
             .obligations
@@ -1462,6 +1569,17 @@ impl ExecutionState {
             });
             return;
         }
+        if self.obligations.len() >= MAX_OBLIGATIONS {
+            if self.failure_overflow.is_empty() {
+                self.failure_overflow.directive_revision = self.directive_revision;
+            }
+            self.failure_overflow.omitted_obligations =
+                self.failure_overflow.omitted_obligations.saturating_add(1);
+            // push_failure recorded the same output before this method; cap
+            // emits one durable Overflowed transition carrying its exact
+            // scope and keeps both projections fail-closed.
+            return;
+        }
         self.obligations.push(ExecutionObligation {
             domain,
             scope_key,
@@ -1482,54 +1600,32 @@ impl ExecutionState {
             attempts_in_epoch: row.attempts,
             total_attempts: row.total_attempts,
         });
-        let excess = self.obligations.len().saturating_sub(MAX_OBLIGATIONS);
-        if excess > 0 {
-            for dropped in self.obligations.drain(0..excess) {
-                let total = dropped.effective_total();
-                events.push(agent_contracts::ExecutionObligationEvent {
-                    kind: agent_contracts::ObligationEventKind::Dropped,
-                    domain: dropped.domain,
-                    scope_digest: dropped.scope_key,
-                    epoch: dropped.epoch,
-                    attempts_in_epoch: dropped.attempts,
-                    total_attempts: total,
-                });
-            }
-        }
     }
 
-    /// 义务只被 blocker 特定的证明解除——ExecutableResolution
-    /// 要求同 scope 且同前置指纹的成功（"同类成功"太宽：rustc 编译成功
-    /// 不能证明 tests.exe 的解析 blocker 已解决）；世界推进只把 epoch
-    /// 推进一格（PreconditionChanged ≠ Resolved）。EditTarget 以新
-    /// digest 落地，或被失败之后的可信当前验证 supersede；ResourcePath
-    /// 被 Known mutation 触碰或出现 Fresh 事实、ProjectMarker 被触碰——
-    /// 这些本身就是 blocker 消失的证明。验证只能来自调用方传入的可信
-    /// pre-dispatch attribution，不能由 ToolOutput metadata 自行声明。
-    pub(super) fn resolve_obligations(
+    /// Resolve both the live obligation ledger and its failed-command
+    /// projection with one blocker-specific predicate. ExecutableResolution
+    /// requires a successful launch in the exact normalized candidate-family
+    /// scope. The fingerprint may move when installing that executable; the
+    /// matched launch itself is the proof. EditTarget 以新
+    /// digest 落地，或被明确覆盖同一 rooted resource 的可信当前验证
+    /// supersede；ResourcePath 被 Known mutation 触碰或出现 Fresh 事实、
+    /// ProjectMarker 被触碰——这些本身就是 blocker 消失的证明。验证只能
+    /// 来自调用方传入的可信 pre-dispatch attribution，不能由 ToolOutput
+    /// metadata 自行声明。
+    pub(super) fn resolve_failure_blockers(
         &mut self,
         output: &ToolOutput,
-        trusted_verification_pass: bool,
+        attribution: Option<&RuntimeExecutionAttribution>,
         events: &mut Vec<agent_contracts::ExecutionObligationEvent>,
     ) {
         let launch_ok = output.ok && is_command_tool(&output.tool_name);
-        let success_scope = if launch_ok {
+        let launch_scope = if launch_ok {
             output
                 .metadata
                 .get("resolution_scope_key")
                 .and_then(|value| value.as_str())
+                .map(bound_evidence_text)
                 .unwrap_or_default()
-                .to_string()
-        } else {
-            String::new()
-        };
-        let success_fingerprint = if launch_ok {
-            output
-                .metadata
-                .get("resolution_fingerprint")
-                .and_then(|value| value.as_str())
-                .unwrap_or_default()
-                .to_string()
         } else {
             String::new()
         };
@@ -1541,97 +1637,52 @@ impl ExecutionState {
                 .collect(),
             _ => Vec::new(),
         };
-        // 物化事实表快照，闭包里不再借 self。
-        let fresh: std::collections::HashMap<&str, &str> = self
-            .checked_files
+        // Only the current successful output proves a resource observation
+        // happened after the blocker. Consulting every historical Fresh row
+        // would let an unrelated later success resolve a failure from an old
+        // cached fact merely because that fact was still resident.
+        let successful_touches = if output.ok {
+            output.resource_touches()
+        } else {
+            Vec::new()
+        };
+        let observed_resources = successful_touches
             .iter()
-            .filter(|fact| fact.freshness == ResourceFreshness::Fresh)
-            .map(|fact| (fact.path.as_str(), fact.digest.as_str()))
+            .map(|touch| {
+                (
+                    touch.path.as_str(),
+                    touch.revision.as_deref().unwrap_or_default(),
+                )
+            })
             .collect();
+        let verified_resources = if output.ok
+            && attribution.is_some_and(RuntimeExecutionAttribution::reusable_verification)
+        {
+            attribution
+                .map(|value| value.rooted_targets.as_slice())
+                .unwrap_or_default()
+        } else {
+            &[]
+        };
+        let evidence = FailureResolutionEvidence {
+            observation_ok: output.ok,
+            incoming_failure: if output.ok {
+                None
+            } else {
+                failure_blocker_identity(output)
+            },
+            launch_ok,
+            launch_scope,
+            mutated_paths,
+            observed_resources,
+            verified_resources,
+        };
 
-        enum Outcome {
-            Keep,
-            AdvanceEpoch,
-            Resolve,
-        }
         let mut kept = Vec::with_capacity(self.obligations.len());
-        for mut row in self.obligations.drain(..) {
-            let outcome = match row.domain {
-                ToolFailureDomain::ExecutableResolution => {
-                    if !launch_ok || row.scope_key != success_scope {
-                        Outcome::Keep
-                    } else if row.scope_key.is_empty() && success_scope.is_empty() {
-                        // 旧行/旧输出的退化匹配：指纹一致才认解决。
-                        if !success_fingerprint.is_empty()
-                            && row.precondition == success_fingerprint
-                        {
-                            Outcome::Resolve
-                        } else {
-                            Outcome::Keep
-                        }
-                    } else if row.precondition == success_fingerprint {
-                        Outcome::Resolve
-                    } else {
-                        Outcome::AdvanceEpoch
-                    }
-                }
-                ToolFailureDomain::EditTarget => {
-                    let path = if row.scope_key.is_empty() {
-                        row.precondition
-                            .split_once('@')
-                            .map(|(path, _)| path)
-                            .unwrap_or(row.precondition.as_str())
-                    } else {
-                        row.scope_key.as_str()
-                    };
-                    let old = row
-                        .precondition
-                        .rsplit_once('@')
-                        .map(|(_, rev)| rev)
-                        .unwrap_or_default();
-                    if trusted_verification_pass
-                        || fresh.get(path).is_some_and(|digest| *digest != old)
-                    {
-                        Outcome::Resolve
-                    } else {
-                        Outcome::Keep
-                    }
-                }
-                ToolFailureDomain::ResourcePath => {
-                    let touched = mutated_paths.iter().any(|p| p == &row.scope_key)
-                        || fresh.contains_key(row.scope_key.as_str());
-                    if touched {
-                        Outcome::Resolve
-                    } else {
-                        Outcome::Keep
-                    }
-                }
-                ToolFailureDomain::ProjectMarker => {
-                    if mutated_paths.iter().any(|p| p == &row.scope_key) {
-                        Outcome::Resolve
-                    } else {
-                        Outcome::Keep
-                    }
-                }
-                ToolFailureDomain::NonDeterministic => Outcome::Keep,
-            };
-            match outcome {
-                Outcome::Keep => kept.push(row),
-                Outcome::AdvanceEpoch => {
-                    row.epoch = row.epoch.saturating_add(1);
-                    row.attempts = 0;
-                    row.precondition = success_fingerprint.clone();
-                    events.push(agent_contracts::ExecutionObligationEvent {
-                        kind: agent_contracts::ObligationEventKind::PreconditionChanged,
-                        domain: row.domain,
-                        scope_digest: row.scope_key.clone(),
-                        epoch: row.epoch,
-                        attempts_in_epoch: row.attempts,
-                        total_attempts: row.effective_total(),
-                    });
-                    kept.push(row);
-                }
-                Outcome::Resolve => {
+        for row in self.obligations.drain(..) {
+            match failure_resolution(row.domain, &row.scope_key, &row.precondition, &evidence) {
+                FailureResolution::Keep => kept.push(row),
+                FailureResolution::Resolve => {
                     let total = row.effective_total();
                     events.push(agent_contracts::ExecutionObligationEvent {
                         kind: agent_contracts::ObligationEventKind::Resolved,
@@ -1645,14 +1696,25 @@ impl ExecutionState {
             }
         }
         self.obligations = kept;
+
+        let mut unresolved = Vec::with_capacity(self.failed_commands.len());
+        for row in self.failed_commands.drain(..) {
+            match failure_resolution(row.domain, &row.scope_key, &row.precondition, &evidence) {
+                FailureResolution::Keep => unresolved.push(row),
+                FailureResolution::Resolve => {}
+            }
+        }
+        self.failed_commands = unresolved;
     }
 
     /// 有界的逐义务警告行（≤2 条）：与全局 advisory 正交，模型仍自主
     /// 选择解法，但"换名字再猜"不再能靠无关进展隐藏。
     fn obligation_warnings(&self) -> Vec<String> {
-        self.obligations
+        let reserve_overflow = usize::from(self.failure_overflow.omitted_obligations > 0);
+        let mut warnings: Vec<String> = self
+            .obligations
             .iter()
-            .take(2)
+            .take(2usize.saturating_sub(reserve_overflow))
             .map(|row| {
                 format!(
                     "UNRESOLVED BLOCKER [{}] epoch={} attempts={} total={} targets={:?} precondition={} — change the preconditions (build/install/create the target), not more identical guesses",
@@ -1664,7 +1726,15 @@ impl ExecutionState {
                     row.precondition
                 )
             })
-            .collect()
+            .collect();
+        if self.failure_overflow.omitted_obligations > 0 {
+            warnings.push(format!(
+                "UNRESOLVED BLOCKER OVERFLOW omitted={} opened_directive_epoch={} — exact identities remain in durable events; completion stays blocked unless an operator explicitly overrides it or starts a new task",
+                self.failure_overflow.omitted_obligations,
+                self.failure_overflow.directive_revision
+            ));
+        }
+        warnings
     }
 
     /// Store successful observations in the bounded evidence table. A novel
@@ -1824,15 +1894,26 @@ impl ExecutionState {
 
     pub(super) fn push_failure(
         &mut self,
+        output: &ToolOutput,
         identity: &OperationIdentity,
         summary: String,
         turn: u64,
     ) {
+        let blocker = failure_blocker_identity(output);
         self.failed_commands
-            .retain(|row| !same_operation(row, identity));
+            .retain(|row| !same_failure_slot(row, identity, blocker.as_ref()));
+        let blocker = blocker.unwrap_or(FailureBlockerIdentity {
+            domain: ToolFailureDomain::NonDeterministic,
+            scope_key: String::new(),
+            precondition: String::new(),
+        });
         self.failed_commands.push(FailedCommandFact {
             tool_name: bound_item(&identity.tool_name),
             target: bound_item(&identity.target),
+            argument_digest: bound_item(&identity.argument_digest),
+            domain: blocker.domain,
+            scope_key: blocker.scope_key,
+            precondition: blocker.precondition,
             summary: bound_item(&summary),
             turn,
         });
@@ -1887,18 +1968,34 @@ impl ExecutionState {
         })
     }
 
-    pub(super) fn cap(&mut self) {
+    pub(super) fn cap(&mut self, events: &mut Vec<agent_contracts::ExecutionObligationEvent>) {
         if self.checked_files.len() > MAX_RESUME_FILES {
             let drop = self.checked_files.len() - MAX_RESUME_FILES;
             self.checked_files.drain(0..drop);
         }
-        if self.verifications.len() > MAX_RESUME_FAILURES {
-            let drop = self.verifications.len() - MAX_RESUME_FAILURES;
+        if self.verifications.len() > MAX_VERIFICATION_FACTS {
+            let drop = self.verifications.len() - MAX_VERIFICATION_FACTS;
             self.verifications.drain(0..drop);
         }
         if self.failed_commands.len() > MAX_RESUME_FAILURES {
-            let drop = self.failed_commands.len() - MAX_RESUME_FAILURES;
-            self.failed_commands.drain(0..drop);
+            let overflowed = self.failed_commands.split_off(MAX_RESUME_FAILURES);
+            if self.failure_overflow.is_empty() {
+                self.failure_overflow.directive_revision = self.directive_revision;
+            }
+            self.failure_overflow.omitted_failed_commands = self
+                .failure_overflow
+                .omitted_failed_commands
+                .saturating_add(overflowed.len().min(u32::MAX as usize) as u32);
+            for row in overflowed {
+                events.push(agent_contracts::ExecutionObligationEvent {
+                    kind: agent_contracts::ObligationEventKind::Overflowed,
+                    domain: row.domain,
+                    scope_digest: row.scope_key,
+                    epoch: 0,
+                    attempts_in_epoch: 0,
+                    total_attempts: 1,
+                });
+            }
         }
         if self.negative_facts.len() > MAX_NEGATIVE_FACTS {
             let drop = self.negative_facts.len() - MAX_NEGATIVE_FACTS;
@@ -1918,26 +2015,186 @@ impl ExecutionState {
     }
 }
 
-pub(super) fn operation_identity(output: &ToolOutput) -> OperationIdentity {
+fn failure_blocker_identity(output: &ToolOutput) -> Option<FailureBlockerIdentity> {
+    // Use the output's typed class/domain decision rather than inferring
+    // semantics from argv or summary text. Shell/process PathNotFound is an
+    // executable-resolution blocker; resource tools use ResourcePath.
+    let domain = output.failure_domain();
+    if domain == ToolFailureDomain::NonDeterministic {
+        return None;
+    }
+    let metadata_identity = |key: &str| {
+        output
+            .metadata
+            .get(key)
+            .and_then(|value| value.as_str())
+            .map(bound_evidence_text)
+            .unwrap_or_default()
+    };
+    let touches = output.resource_touches();
+    let (scope_key, precondition) = match domain {
+        ToolFailureDomain::ExecutableResolution => (
+            metadata_identity("resolution_scope_key"),
+            metadata_identity("resolution_fingerprint"),
+        ),
+        ToolFailureDomain::EditTarget | ToolFailureDomain::ResourcePath => {
+            let touch = touches.first()?;
+            let precondition = match (domain, touch.revision.as_deref()) {
+                (ToolFailureDomain::EditTarget, Some(revision)) if !revision.is_empty() => {
+                    bound_evidence_text(&format!("{}@{}", touch.path, revision))
+                }
+                _ => String::new(),
+            };
+            (bound_evidence_text(&touch.path), precondition)
+        }
+        // The trusted shell handler stamps the required marker separately;
+        // the whole command is display text and must not become equivalence
+        // authority.
+        ToolFailureDomain::ProjectMarker => (metadata_identity("missing_marker"), String::new()),
+        ToolFailureDomain::NonDeterministic => return None,
+    };
+    if scope_key.is_empty() && precondition.is_empty() {
+        return None;
+    }
+    Some(FailureBlockerIdentity {
+        domain,
+        scope_key,
+        precondition,
+    })
+}
+
+fn failure_resolution(
+    domain: ToolFailureDomain,
+    scope_key: &str,
+    precondition: &str,
+    evidence: &FailureResolutionEvidence<'_>,
+) -> FailureResolution {
+    if evidence
+        .incoming_failure
+        .as_ref()
+        .is_some_and(|incoming| incoming.domain == domain && incoming.scope_key == scope_key)
+    {
+        // This observation is another failed attempt in the same lineage,
+        // never its resolution. record_obligation runs after this matcher
+        // and will accumulate the attempt or advance the epoch.
+        return FailureResolution::Keep;
+    }
+    match domain {
+        ToolFailureDomain::ExecutableResolution => {
+            if !evidence.launch_ok || scope_key != evidence.launch_scope {
+                return FailureResolution::Keep;
+            }
+            FailureResolution::Resolve
+        }
+        ToolFailureDomain::EditTarget => {
+            let path = if scope_key.is_empty() {
+                precondition
+                    .split_once('@')
+                    .map(|(path, _)| path)
+                    .unwrap_or(precondition)
+            } else {
+                scope_key
+            };
+            let old_revision = precondition
+                .rsplit_once('@')
+                .map(|(_, revision)| revision)
+                .unwrap_or_default();
+            let identity_moved = evidence.observation_ok
+                && !old_revision.is_empty()
+                && evidence
+                    .observed_resources
+                    .get(path)
+                    .is_some_and(|digest| !digest.is_empty() && *digest != old_revision);
+            let covered_by_verifier = evidence
+                .verified_resources
+                .iter()
+                .any(|candidate| candidate == path);
+            if !path.is_empty() && (identity_moved || covered_by_verifier) {
+                FailureResolution::Resolve
+            } else {
+                FailureResolution::Keep
+            }
+        }
+        ToolFailureDomain::ResourcePath => {
+            if evidence
+                .mutated_paths
+                .iter()
+                .any(|candidate| candidate == scope_key)
+                || evidence.observed_resources.contains_key(scope_key)
+            {
+                FailureResolution::Resolve
+            } else {
+                FailureResolution::Keep
+            }
+        }
+        ToolFailureDomain::ProjectMarker => {
+            if evidence
+                .mutated_paths
+                .iter()
+                .any(|candidate| candidate == scope_key)
+                || evidence.observed_resources.contains_key(scope_key)
+            {
+                FailureResolution::Resolve
+            } else {
+                FailureResolution::Keep
+            }
+        }
+        ToolFailureDomain::NonDeterministic => FailureResolution::Keep,
+    }
+}
+
+fn same_failure_slot(
+    row: &FailedCommandFact,
+    operation: &OperationIdentity,
+    blocker: Option<&FailureBlockerIdentity>,
+) -> bool {
+    blocker.is_some_and(|blocker| {
+        blocker.domain != ToolFailureDomain::NonDeterministic
+            && row.domain == blocker.domain
+            && row.scope_key == blocker.scope_key
+    }) || blocker.is_none() && same_operation(row, operation)
+}
+
+pub(super) fn operation_identity(output: &ToolOutput, argument_digest: &str) -> OperationIdentity {
     let target = output.operation_target().unwrap_or("").to_string();
     OperationIdentity {
         tool_name: output.tool_name.clone(),
         target,
+        argument_digest: argument_digest.to_string(),
     }
 }
 
 pub(super) fn same_operation(row: &FailedCommandFact, identity: &OperationIdentity) -> bool {
-    row.tool_name == identity.tool_name && row.target == identity.target
+    row.tool_name == identity.tool_name
+        && !row.argument_digest.is_empty()
+        && !identity.argument_digest.is_empty()
+        && row.argument_digest == identity.argument_digest
 }
 
 pub(crate) fn validate_execution_state(state: &ExecutionState) -> Result<(), String> {
     if state.checked_files.len() > MAX_RESUME_FILES
-        || state.verifications.len() > MAX_RESUME_FAILURES
+        || state.verifications.len() > MAX_VERIFICATION_FACTS
         || state.failed_commands.len() > MAX_RESUME_FAILURES
         || state.negative_facts.len() > MAX_NEGATIVE_FACTS
         || state.verification_sources.len() > MAX_VERIFICATION_SOURCES
     {
         return Err("resume list exceeds its cap".into());
+    }
+    if state
+        .completion_commit_failure
+        .as_ref()
+        .is_some_and(|failure| {
+            failure.reason.chars().count() > MAX_TASK_ANCHOR_ITEM_CHARS || failure.attempts == 0
+        })
+    {
+        return Err("completion commit failure is invalid or exceeds its text bound".into());
+    }
+    if state.failure_overflow.is_empty() {
+        if state.failure_overflow.directive_revision != 0 {
+            return Err("empty failure overflow carries an epoch".into());
+        }
+    } else if state.failure_overflow.directive_revision > state.directive_revision {
+        return Err("failure overflow is inconsistent with its directive epoch".into());
     }
     // restore 契约不得假定 checkpoint 由当前 Runtime
     // 生成且未损坏——新增字段同样受界。
@@ -1973,6 +2230,17 @@ pub(crate) fn validate_execution_state(state: &ExecutionState) -> Result<(), Str
                 .is_some_and(|value| value.chars().count() > MAX_TASK_ANCHOR_ITEM_CHARS)
         {
             return Err("verification fact exceeds its text bound".into());
+        }
+    }
+    for row in &state.failed_commands {
+        if row.tool_name.chars().count() > MAX_TASK_ANCHOR_ITEM_CHARS
+            || row.target.chars().count() > MAX_TASK_ANCHOR_ITEM_CHARS
+            || row.argument_digest.chars().count() > MAX_TASK_ANCHOR_ITEM_CHARS
+            || row.scope_key.chars().count() > MAX_TASK_ANCHOR_ITEM_CHARS
+            || row.precondition.chars().count() > MAX_TASK_ANCHOR_ITEM_CHARS
+            || row.summary.chars().count() > MAX_TASK_ANCHOR_ITEM_CHARS
+        {
+            return Err("failed command fact exceeds its text bound".into());
         }
     }
     for row in &state.negative_facts {

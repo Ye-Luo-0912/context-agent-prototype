@@ -17,7 +17,7 @@ use agent_contracts::{
     MaterializedContext, ModelCapabilities, ModelEventSink, ModelOutput, ModelRequest,
     ModelTransport, ScopeId, ScopeKind, StorageGcReport, TaskId, ToolCall, ToolCatalogEntry,
     ToolDispatcher, ToolExecutionAttribution, ToolLeaseReconcileReport, ToolSpec,
-    ToolSurfaceSnapshot,
+    ToolSurfaceSnapshot, VerificationCoverageDeclaration,
 };
 use agent_core::{CoreAuthorityConfig, CorePort, build_core_port, try_build_core_port};
 use agent_workspace::Workspace;
@@ -35,6 +35,11 @@ pub struct RuntimeServices {
     context: Arc<dyn ContextEngine>,
     model: Arc<dyn ModelTransport>,
     tools: Arc<dyn ToolDispatcher>,
+    /// Immutable, bounded construction-time projection of the concrete
+    /// host's coverage table. Completion reads this narrow contract rather
+    /// than reaching into a tool implementation, and re-composition takes a
+    /// fresh snapshot so persisted receipts cannot follow an upgraded table.
+    verification_coverage_declarations: Arc<[VerificationCoverageDeclaration]>,
     /// Optional artifact destination (the run's workspace). When set, the
     /// actor persists each final assistant response in full before the
     /// bounded ContextItem is built, so the raw output survives ContextItem
@@ -43,6 +48,17 @@ pub struct RuntimeServices {
     artifact_workspace: Option<Arc<Workspace>>,
     /// Ablation: when false, PromptAssembler omits TaskProgress. Default true.
     project_task_progress: bool,
+    /// Ablation: when true, a settled-candidate fact is projected into the
+    /// otherwise unchanged TaskProgress view. Kept separate from
+    /// `project_task_progress` so paired evaluation arms do not remove the
+    /// runtime's progress memory as a confound.
+    project_settlement: bool,
+    /// Expensive causal-evaluation diagnostics. When enabled, both
+    /// settlement arms pack against the treatment-sized envelope and the
+    /// runtime emits a same-state counterfactual digest in request metadata.
+    /// Product runs keep this false: an off candidate must not pay for or
+    /// execute experiment-only packing, cloning, assembly, or hashing.
+    settlement_projection_diagnostics: bool,
     /// LONG-TASK Slice C: when false (the default), the runtime never
     /// derives completion-opportunity facts, never leases `task.complete`
     /// from derived readiness and emits no opportunity events.
@@ -57,6 +73,35 @@ pub struct RuntimeServices {
     /// spawn so the actor's safe-point checkpoints capture the full plane
     /// set. The actor snapshots it; it never mutates through this handle.
     capability_registry: Option<Arc<crate::capability::CapabilityRegistry>>,
+}
+
+fn snapshot_verification_coverage_declarations(
+    tools: &dyn ToolDispatcher,
+) -> Arc<[VerificationCoverageDeclaration]> {
+    let declarations = tools.verification_coverage_declarations();
+    let canonical = declarations.len() <= agent_contracts::MAX_VERIFICATION_COVERAGE_DECLARATIONS
+        && declarations
+            .iter()
+            .all(VerificationCoverageDeclaration::is_valid)
+        && declarations
+            .windows(2)
+            .all(|pair| pair[0].domain_id < pair[1].domain_id);
+    if canonical {
+        declarations.into()
+    } else {
+        // A partially usable host table is more dangerous than no table:
+        // keep the run operational but make every evidence closure fail.
+        Arc::from([])
+    }
+}
+
+/// A post-completion context plane that is live but not yet authorized by
+/// the terminal runtime checkpoint. RuntimeActor either consumes its report
+/// after that durable freeze or restores `before`; no other component can
+/// commit the cross-plane transaction.
+pub(crate) struct PreparedTaskCompletion {
+    before: serde_json::Value,
+    pub(crate) report: ContextMaintenanceReport,
 }
 
 impl RuntimeServices {
@@ -117,6 +162,8 @@ impl RuntimeServices {
         approval: Arc<dyn ApprovalGate>,
         journal: Option<Arc<dyn EventJournal>>,
     ) -> Self {
+        let verification_coverage_declarations =
+            snapshot_verification_coverage_declarations(tools.as_ref());
         let core = build_core_port(
             kernel_config.clone(),
             context.clone(),
@@ -130,8 +177,11 @@ impl RuntimeServices {
             context,
             model,
             tools,
+            verification_coverage_declarations,
             artifact_workspace: None,
             project_task_progress: true,
+            project_settlement: false,
+            settlement_projection_diagnostics: false,
             project_completion_opportunity: false,
             recovery_surface: false,
             capability_registry: None,
@@ -150,6 +200,8 @@ impl RuntimeServices {
         journal: Option<Arc<dyn EventJournal>>,
         authority_recovery: AuthorityRecoveryServices,
     ) -> AgentResult<Self> {
+        let verification_coverage_declarations =
+            snapshot_verification_coverage_declarations(tools.as_ref());
         let core = try_build_core_port(
             kernel_config.clone(),
             context.clone(),
@@ -165,8 +217,11 @@ impl RuntimeServices {
             context,
             model,
             tools,
+            verification_coverage_declarations,
             artifact_workspace: None,
             project_task_progress: true,
+            project_settlement: false,
+            settlement_projection_diagnostics: false,
             project_completion_opportunity: false,
             recovery_surface: false,
             capability_registry: None,
@@ -236,6 +291,30 @@ impl RuntimeServices {
         self.project_task_progress
     }
 
+    /// Opt the runtime into projecting the neutral settled-candidate fact.
+    /// TaskProgress itself stays independently enabled so an off/on pair
+    /// changes only this one fact.
+    pub fn with_project_settlement(mut self, project: bool) -> Self {
+        self.project_settlement = project;
+        self
+    }
+
+    pub(crate) fn project_settlement(&self) -> bool {
+        self.project_settlement
+    }
+
+    /// Enable the expensive same-state settlement comparison used by the
+    /// paired causal harness. This is deliberately independent of the arm:
+    /// a valid pair enables it identically in both cells.
+    pub fn with_settlement_projection_diagnostics(mut self, enabled: bool) -> Self {
+        self.settlement_projection_diagnostics = enabled;
+        self
+    }
+
+    pub(crate) fn settlement_projection_diagnostics(&self) -> bool {
+        self.settlement_projection_diagnostics
+    }
+
     /// Opt the runtime into deriving advisory completion-opportunity facts.
     /// Default off; promotion requires the ROADMAP item-8 off/on paired
     /// live gate before this may ship enabled.
@@ -269,6 +348,10 @@ impl RuntimeServices {
     /// time. Dispatch itself stays behind the Core port.
     pub(crate) fn tools(&self) -> Arc<dyn ToolDispatcher> {
         self.tools.clone()
+    }
+
+    pub(crate) fn verification_coverage_declarations(&self) -> &[VerificationCoverageDeclaration] {
+        &self.verification_coverage_declarations
     }
 
     /// Narrow authority port shared by the actor and spawn seam. It exposes
@@ -432,11 +515,11 @@ impl RuntimeServices {
             .await
     }
 
-    pub(crate) async fn complete_current_task(
+    pub(crate) async fn prepare_complete_current_task(
         &self,
         task_id: TaskId,
         summary: String,
-    ) -> AgentResult<ContextMaintenanceReport> {
+    ) -> AgentResult<PreparedTaskCompletion> {
         let checkpoint = self.context.checkpoint().await?;
         let transition = async {
             self.context
@@ -450,8 +533,33 @@ impl RuntimeServices {
                 .await
         }
         .await;
-        self.finish_context_transaction("complete task", checkpoint, transition)
+        match transition {
+            Ok(report) => Ok(PreparedTaskCompletion {
+                before: checkpoint,
+                report,
+            }),
+            Err(error) => {
+                self.finish_context_transaction("complete task", checkpoint, Err(error))
+                    .await
+            }
+        }
+    }
+
+    /// Roll back a prepared terminal context plane when checkpoint assembly
+    /// or persistence fails. Only rollback failure makes the planes
+    /// unknowable and therefore requires the runtime recovery fence.
+    pub(crate) async fn rollback_task_completion(
+        &self,
+        prepared: PreparedTaskCompletion,
+    ) -> AgentResult<()> {
+        self.context
+            .restore(prepared.before)
             .await
+            .map_err(|error| {
+                AgentError::RecoveryRequired(format!(
+                    "terminal task context rollback failed ({error})"
+                ))
+            })
     }
 
     /// Complete a context-only transaction. Context engines are replaceable
@@ -550,6 +658,9 @@ mod tests {
                 selected: Vec::new(),
                 approx_tokens: 0,
                 foreground: Vec::new(),
+                required_item_ids: Vec::new(),
+                required_misses: Default::default(),
+                optional_misses: Default::default(),
                 diagnostics: ContextDiagnostics::default(),
             })
         }

@@ -1141,7 +1141,18 @@ impl ContextEngine for SimpleContextEngine {
                     let external_read = match read_plan {
                         Some(item_id) => {
                             let dir = crate::store::store_dir(&self.config);
-                            Some((item_id, crate::store::read_item_async(&dir, item_id).await))
+                            match crate::store::read_item_async(&dir, item_id).await {
+                                Ok(item) => Some((item_id, Some(item))),
+                                Err(crate::store::StoreReadFailure::Missing) => {
+                                    Some((item_id, None))
+                                }
+                                Err(failure) => {
+                                    return Err(AgentError::Context(format!(
+                                        "context store read for {item_id} failed: {}",
+                                        crate::store::read_failure_name(failure)
+                                    )));
+                                }
+                            }
                         }
                         None => None,
                     };
@@ -1302,13 +1313,15 @@ impl ContextEngine for SimpleContextEngine {
                 })?;
         let materialization_id = state.materialization_revision;
         let foreground_plan = materializer::plan_foreground(&state, &query, &[]);
+        let required_plan = materializer::plan_required(&state, &query);
         drop(state);
-        let foreground = if foreground_plan.is_empty() {
-            Vec::new()
-        } else {
-            let dir = crate::store::store_dir(&self.config);
-            materializer::realize_foreground(foreground_plan, &dir).await
-        };
+        let dir = crate::store::store_dir(&self.config);
+        let (foreground_result, required_result) = tokio::join!(
+            materializer::realize_foreground(foreground_plan, &dir),
+            materializer::realize_required(required_plan, &dir),
+        );
+        let (foreground, optional_misses) = foreground_result;
+        let (required_bodies, required_misses) = required_result;
         let used: usize = foreground
             .iter()
             .map(|item| item::approx_tokens(&item.content))
@@ -1347,6 +1360,14 @@ impl ContextEngine for SimpleContextEngine {
         let mut materialized = materializer::materialize(&mut state, &self.config, &packed_query);
         materialized.materialization_id = materialization_id;
         materialized.foreground = foreground;
+        materialized.optional_misses = optional_misses;
+        materializer::apply_required(
+            &mut materialized,
+            &packed_query,
+            required_bodies,
+            required_misses,
+        );
+        materialized.validate_requirement_status()?;
         state.pending_materialization = Some(PendingMaterialization {
             id: materialization_id,
             item_ids: materialized.items.iter().map(|item| item.item_id).collect(),
@@ -1557,19 +1578,26 @@ impl ContextEngine for SimpleContextEngine {
         if !retrievable {
             return Ok(None);
         }
-        let item = crate::store::read_item_async(&dir, item_id).await;
-        if item.is_some() {
-            let mut state = self.state.lock().await;
-            let still_retrievable = state
-                .external
-                .get(item_id)
-                .is_some_and(crate::store::externally_retrievable);
-            if !still_retrievable {
-                return Ok(None);
+        let item = match crate::store::read_item_async(&dir, item_id).await {
+            Ok(item) => item,
+            Err(crate::store::StoreReadFailure::Missing) => return Ok(None),
+            Err(failure) => {
+                return Err(AgentError::Context(format!(
+                    "context store read for {item_id} failed: {}",
+                    crate::store::read_failure_name(failure)
+                )));
             }
-            crate::access::stamp_read(&mut state, item_id, agent_contracts::AccessSignal::Fetch);
+        };
+        let mut state = self.state.lock().await;
+        let still_retrievable = state
+            .external
+            .get(item_id)
+            .is_some_and(crate::store::externally_retrievable);
+        if !still_retrievable {
+            return Ok(None);
         }
-        Ok(item)
+        crate::access::stamp_read(&mut state, item_id, agent_contracts::AccessSignal::Fetch);
+        Ok(Some(item))
     }
 
     async fn checkpoint(&self) -> AgentResult<Value> {

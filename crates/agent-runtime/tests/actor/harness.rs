@@ -41,6 +41,9 @@ impl ContextEngine for TestContextEngine {
             selected: Vec::new(),
             approx_tokens: 0,
             foreground: Vec::new(),
+            required_item_ids: Vec::new(),
+            required_misses: Default::default(),
+            optional_misses: Default::default(),
             diagnostics: ContextDiagnostics::default(),
         })
     }
@@ -193,6 +196,9 @@ impl ContextEngine for RecordingContextEngine {
             selected: Vec::new(),
             approx_tokens: 0,
             foreground: Vec::new(),
+            required_item_ids: Vec::new(),
+            required_misses: Default::default(),
+            optional_misses: Default::default(),
             diagnostics: ContextDiagnostics::default(),
         })
     }
@@ -530,6 +536,9 @@ impl ContextEngine for RecordingFocusEngine {
             selected: Vec::new(),
             approx_tokens: 0,
             foreground: Vec::new(),
+            required_item_ids: Vec::new(),
+            required_misses: Default::default(),
+            optional_misses: Default::default(),
             diagnostics: ContextDiagnostics::default(),
         })
     }
@@ -585,6 +594,9 @@ impl ContextEngine for FailingFocusContextEngine {
             selected: Vec::new(),
             approx_tokens: 0,
             foreground: Vec::new(),
+            required_item_ids: Vec::new(),
+            required_misses: Default::default(),
+            optional_misses: Default::default(),
             diagnostics: ContextDiagnostics::default(),
         })
     }
@@ -697,6 +709,9 @@ impl ContextEngine for MutatingThenFailingFocusEngine {
             selected: Vec::new(),
             approx_tokens: 0,
             foreground: Vec::new(),
+            required_item_ids: Vec::new(),
+            required_misses: Default::default(),
+            optional_misses: Default::default(),
             diagnostics: ContextDiagnostics::default(),
         })
     }
@@ -837,6 +852,9 @@ impl ContextEngine for FailingClearFocusContextEngine {
             selected: Vec::new(),
             approx_tokens: 0,
             foreground: Vec::new(),
+            required_item_ids: Vec::new(),
+            required_misses: Default::default(),
+            optional_misses: Default::default(),
             diagnostics: ContextDiagnostics::default(),
         })
     }
@@ -973,6 +991,9 @@ impl ContextEngine for BigContextEngine {
             selected: Vec::new(),
             approx_tokens,
             foreground: Vec::new(),
+            required_item_ids: Vec::new(),
+            required_misses: Default::default(),
+            optional_misses: Default::default(),
             diagnostics: ContextDiagnostics::default(),
         })
     }
@@ -1700,11 +1721,15 @@ impl ModelTransport for TinyWindowModel {
 
 /// Records every event the actor appends and every barrier flush, with a
 /// switch to make the barrier fail. Lets a test assert the turn-commit
-/// ordering: all mandatory state writes precede `TurnCompleted`, and
-/// `TurnCompleted` is broadcast only after the barrier succeeds.
+/// ordering: all mandatory state writes precede the explicit commit marker,
+/// and no member of the terminal batch is broadcast before flush succeeds.
 #[derive(Debug, Default)]
 pub(crate) struct BarrierJournal {
     pub(crate) appended: Mutex<Vec<String>>,
+    pub(crate) append_attempts: AtomicUsize,
+    /// One-based append attempt to fail before accepting the envelope. Zero
+    /// keeps append healthy.
+    pub(crate) fail_append_at: AtomicUsize,
     pub(crate) flushes: AtomicUsize,
     pub(crate) fail_flush: AtomicBool,
 }
@@ -1712,6 +1737,12 @@ pub(crate) struct BarrierJournal {
 #[async_trait::async_trait]
 impl EventJournal for BarrierJournal {
     async fn append(&self, envelope: &RuntimeEventEnvelope) -> AgentResult<()> {
+        let attempt = self.append_attempts.fetch_add(1, Ordering::SeqCst) + 1;
+        if self.fail_append_at.load(Ordering::SeqCst) == attempt {
+            return Err(agent_contracts::AgentError::Storage(format!(
+                "simulated append failure at attempt {attempt}"
+            )));
+        }
         self.appended
             .lock()
             .unwrap()

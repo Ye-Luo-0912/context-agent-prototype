@@ -480,7 +480,16 @@ impl CoreAuthority {
 
     pub(crate) async fn start(&self) -> AgentResult<()> {
         self.event
-            .emit(self.run_id, RuntimeEvent::RunStarted)
+            .emit_batch_durable(
+                self.run_id,
+                vec![
+                    RuntimeEvent::RunStarted,
+                    RuntimeEvent::RuntimeCommitBarrier {
+                        kind: agent_contracts::RuntimeCommitKind::RunStart,
+                        checkpoint_sequence: None,
+                    },
+                ],
+            )
             .await?;
         if let AuthorityRecoveryStatus::RecoveryRequired { reason } = self.recovery_status() {
             let prefix = "Core authority recovery is required: ";
@@ -519,6 +528,12 @@ impl CoreAuthority {
     /// a commit that never landed.
     pub(crate) async fn emit_event_durable(&self, event: RuntimeEvent) -> AgentResult<()> {
         self.event.emit_durable(self.run_id, event).await
+    }
+
+    /// Append and flush one bounded runtime transaction before publishing
+    /// any of its audit members.
+    pub(crate) async fn emit_events_durable(&self, events: Vec<RuntimeEvent>) -> AgentResult<()> {
+        self.event.emit_batch_durable(self.run_id, events).await
     }
 
     /// Surface a runtime-level warning through the normal event stream.

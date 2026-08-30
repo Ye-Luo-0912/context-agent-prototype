@@ -343,6 +343,9 @@ impl ContextEngine for RollingSummaryEngine {
             selected,
             approx_tokens: approx_tokens_total,
             foreground: Vec::new(),
+            required_item_ids: Vec::new(),
+            required_misses: Default::default(),
+            optional_misses: Default::default(),
             diagnostics: state.diagnostics(),
         })
     }

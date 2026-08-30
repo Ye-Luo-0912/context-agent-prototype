@@ -65,8 +65,9 @@ pub use snapshot::VerificationProjection;
 pub use state::{ExecutionObligation, FailedCommandFact};
 pub use state::{
     ExecutionState, FrontierObservation, NegativeExecutionFact, NegativeFactTransition,
-    ResourceFact, ResourceProvenance, RuntimeExecutionAttribution, VerificationCause,
-    VerificationCoverage, VerificationFact, VerificationSourceLease, VerificationState,
+    ResourceFact, ResourceProvenance, RuntimeExecutionAttribution, UnresolvedFailureOverflow,
+    VerificationCause, VerificationCoverage, VerificationFact, VerificationPassTransition,
+    VerificationSourceLease, VerificationState,
 };
 
 /// Checkpoint/wire name for [`ExecutionState`]. The `TaskRecord` field is

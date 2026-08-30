@@ -8,6 +8,11 @@ semantics. The three legacy 2026-08-28 attempts are retained for diagnosis,
 but none is formal M15 evidence; see
 [`evidence/m15-window/REPORT.md`](../crates/agent-eval/evidence/m15-window/REPORT.md).
 
+**Prospective-route amendment, 2026-08-30.** Sections 5 and 7 now distinguish
+the base product candidate from an optional settlement-projection candidate.
+This does not change the frozen cell shape, evidence contract or verdict in
+§§2–4, and it does not reinterpret any prior formal M15 window.
+
 ## 0. Current decision state
 
 Three decisions remain frozen:
@@ -67,17 +72,26 @@ across the windows; formal diag is 6/12 and every failure uses the same invalid
 `checked_shl` saturation strategy. This is not a harness or transport defect;
 it is a model/solver weakness on the pinned serving. M15 remains open.
 
-The landed Completion Convergence slice does not yet justify another window:
-its label is not rendered to the model, eligibility is execution-local rather
-than task-aware, tail accounting survives reopened work, and its live runner
-has no projection-off treatment arm. Correct those issues and apply the
-prospective cross-window rule in §5 before spending another formal window.
+The later Completion Convergence implementation and report do not justify
+another window. The original review found split completion authority,
+continuation advancing the directive epoch, pre-success all-criterion coverage
+fan-out and replay of an uncommitted suffix. Candidate fixes now exist in the
+uncommitted worktree, including host declaration-bound receipts, prospective
+  terminal checkpoints and explicit replay barriers. Their local integrated
+  matrices are green, but recorded clean-source and dual-platform exits are not
+  yet banked. The experiment also
+changed the whole TaskProgress and checked-file GC projection between arms.
+Preserve its checker's mechanical FAIL, but classify settlement causality as
+`INVALID/CONFOUNDED`. Close the selected-path merged P0 queue in
+[`AUDIT_TODO.md`](AUDIT_TODO.md) before spending another formal window.
+A settlement-enabled candidate includes the common-prefix causal-fork exit; a
+settlement-off base does not.
 
 ## 1. V1 candidate composition
 
 | plane | evidence | status |
 | --- | --- | --- |
-| Platform gates | M12/M13 clean-tree closure audits in `evidence/platform-closure/{m12,m13}/` | banked |
+| Platform gates | M12/M13 clean-tree closure-audit artifacts in `evidence/platform-closure/{m12,m13}/` | evidence banked; overall status wording pending `GOV-STATUS-01` |
 | Context | frozen `context-mech.v2` 12-cell A/C evidence in `evidence/context-mech/`; no policy retune or rerun | banked |
 | Tool Surface | edit-gate v4 archival window plus deterministic crash/race/journal/disk-full coverage; production model surface remains v5; catalog-cold `fs.mkdir` baseline retained conservatively, recovery source behind a default-off switch | banked mechanisms; the `TOOL-DIR-SURFACE-01` deterministic mechanism is green but its 24-cell live run had zero treatment exposure and is not folded into M15; the v5 `task.complete` availability change is not promoted by the invalid M15 attempts |
 | Execution coherence | Convergence Bench 4/4 plus `longflow-post-obligation-2026-08-23/` | banked |
@@ -97,7 +111,11 @@ The live plane is exactly:
 - engine: the retained C composition;
 - source: one clean, unchanged HEAD for all 12 cells;
 - serving: one pinned provider/model/protocol/context-window tuple;
-- switches: advisory candidates off.
+- runtime surface for the current base candidate:
+  `project_task_progress=true`, `project_settlement=false`, and other advisory
+  candidates off. A future settlement-enabled source requires its own
+  prospective promotion and an explicit candidate-record amendment before
+  source pin.
 
 Resume interrupts after the first durably settled mutation and its durable
 checkpoint. Continuation must restore and continue from the exact acknowledged
@@ -106,7 +124,12 @@ A source, pack, host-policy, surface or serving change voids the window.
 
 ## 3. Evidence contract
 
-Formal cells use schema `retry-pilot-cell-v3`. Each immutable cell directory
+The three historical valid-FAIL windows remain immutable
+`retry-pilot-cell-v3` evidence. Any prospective candidate uses
+`retry-pilot-cell-v4`; this schema advance adds stable pair/source identity,
+independent acceptance-domain revision/source identity and bounded
+model-request causal-audit fields. It does not reinterpret v3 verdicts.
+No v4 formal M15 evidence is currently banked. Each immutable cell directory
 contains the manifest, full event stream, `dimensions.json`, hidden oracle
 records and workspace snapshot hash. The dimensions are persisted facts, not
 a projection from the exit branch:
@@ -117,6 +140,10 @@ a projection from the exit branch:
 - restored, exact-tuple-matched and continued as independent booleans;
 - turn completion and task closure as independent booleans;
 - phase counters and runtime error text, including failure exits;
+- completion policy plus the public acceptance domain, declaration revision
+  and canonical declaration-source digest;
+- exact `project_task_progress` / `project_settlement` values and the assembled
+  prompt-layer digest;
 - exact pack id/digest and the shared source/serving/surface identity.
 
 `provider_transport`, `model_output_limit`, `model`, `input_budget`,
@@ -129,10 +156,15 @@ The harness writes `_windows/<timestamp>/manifest.json` containing the exact
 12 claimed cell directories, then re-reads those directories and generates
 `REPORT.md`. Report generation refuses mixed identity, missing/duplicate
 cells, wrong pack digests, verdict drift, untyped provider health, absent
-terminal events, event loss/gaps, summary/dimension drift, escaped cell paths
-or a dirty tree. Per-cell and total/max round, tool, wall-time and token facts
+terminal events, event loss/gaps, missing switch/prompt identity,
+summary/dimension drift, escaped cell paths or a dirty tree. Per-cell and
+total/max round, tool, wall-time and token facts
 come from the persisted event-derived summaries. `agent-eval --m15-report
 <window-dir>` rebuilds the same report from persisted facts.
+For v4, the reporter requires all 16 identity/switch keys to be present,
+including the nullable acceptance-authority triple, and recomputes the frozen
+pack, provider, acceptance declaration and exact switch identities before it
+accepts the window.
 
 ## 4. Verdicts
 
@@ -174,8 +206,10 @@ source/serving until a lucky 12/12 is prohibited.
 Prospective rule for the current route:
 
 1. no fourth unchanged v3 window;
-2. a materially changed candidate must first pass its deterministic gates, a
-   true settlement-projection off/on gate, and an exact-source preflight;
+2. a materially changed candidate must first pass its deterministic gates and
+   an exact-source preflight; if it changes the model-visible settlement
+   projection, it must additionally pass an isolated settlement off/on causal
+   gate before that preflight;
 3. that candidate receives exactly one predeclared 12-cell confirmation
    window under §§2–4;
 4. a valid FAIL rejects that candidate and returns to diagnosis; only NOT_RUN
@@ -205,29 +239,34 @@ surface, reject a serving or close M15.
 
 Before spending another 12-cell window:
 
-1. keep the relevant deterministic evaluator/provider/runtime tests green;
-2. keep evaluator validity and fixture cleanliness green (done 2026-08-29);
-3. correct Task-aware Completion Convergence as specified in
-   `LONG_TASK_EVALUATION.md`: task/current-epoch eligibility, fail-closed
-   acceptance coverage, bounded default-off projection, episode metrics, and
-   deterministic reopening tests; no automatic closure, Context/GC change or
-   fixed-round stopping;
-4. pass a true same-source projection-off/on normal/resume gate with at least
-   two paired repeats, treatment exposure, mandatory-success parity, no lost
-   unfinished work and the frozen episode-efficiency criteria — the first
-   such gate ran 2026-08-29 (8 cells, `--allow-dirty`; 8/8 cells PASS but
-   verdict FAIL: pair-0 exposure asymmetry — the off cell recorded no
-   trusted pass because its model used only the TaskScoped `rust.workspace`
-   runner — plus marker needle-shape parity in 3/4 pairs and episode
-   medians 1→1), so this item is not yet met and the projection stays
-   default-off;
-5. freeze and record the candidate identity under the §5 cross-window rule;
-6. rerun the bounded one-cell exact-source/product preflight without changing
-   the serving tuple;
-7. use the preflight-pinned tuple without fallback or automatic protocol
-   negotiation, record the exact clean source identity, and set an explicit
-   `OPENAI_API_PROTOCOL`;
-8. run exactly one uninterrupted, predeclared 12-cell v3 window with
+The uncommitted 2026-08-30 candidate passed fmt, Clippy, build and the complete
+workspace suite locally. This is a development checkpoint, not a formal source
+or milestone exit. Continue in this order:
+
+1. record one clean source, repeat those four commands there, and pass Ubuntu
+   plus Windows CI on that exact source;
+2. retain the locally green completion/continuation/required-context,
+   criterion-receipt/failure-domain, real actor-order terminal, one-shot
+   RunStart/committed-prefix replay and strict provider matrices on that source;
+3. measure `VERIFY-ROUTE-01` to the first criterion-satisfying trusted PASS,
+   then close every P1 item exercised by the selected candidate/evidence path, or
+   record a deterministic proof that the item is out-of-path for this window;
+4. prove the base source has the production-aligned surface TaskProgress on and
+   settlement off. The default product path must not build/hash a
+   counterfactual second request;
+5. only if the candidate enables settlement, run a separately frozen off/on
+   gate whose arms fork from one pre-exposure durable checkpoint and
+   byte-identical workspace, preserve opaque ids, use one explicit provider
+   protocol, and reject any difference beyond `project_settlement`. Do not
+   alpha-normalize independently minted identities. A settlement-off base does
+   not need this live pair;
+6. freeze and record the candidate plus acceptance-declaration identity under
+   the §5 cross-window rule;
+7. run the bounded one-cell exact-source/product preflight without changing the
+   serving tuple or using protocol auto-negotiation;
+8. use the preflight-pinned tuple without fallback, record the exact clean
+   source identity, and set an explicit `OPENAI_API_PROTOCOL`;
+9. run exactly one uninterrupted, predeclared 12-cell v4 window with
    `agent-eval --m15-window` and accept only its mechanically regenerated
    report.
 

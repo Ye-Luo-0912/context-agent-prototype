@@ -147,7 +147,10 @@ impl ToolDispatcher for ScriptedRecoveryDispatcher {
 async fn run_turn_collecting_reports(
     instance: &RuntimeInstance,
     mut events: tokio::sync::broadcast::Receiver<RuntimeEventEnvelope>,
-) -> (std::collections::BTreeMap<usize, agent_contracts::ToolSurfacePlanReport>, bool) {
+) -> (
+    std::collections::BTreeMap<usize, agent_contracts::ToolSurfacePlanReport>,
+    bool,
+) {
     let handle = instance.handle();
     handle
         .set_focus("create a/b/file.txt".into())
@@ -177,7 +180,10 @@ async fn run_turn_collecting_reports(
 fn origin_of(
     report: &agent_contracts::ToolSurfacePlanReport,
     name: &str,
-) -> Option<(agent_contracts::ToolSurfaceOrigin, agent_contracts::ToolSurfaceDemand)> {
+) -> Option<(
+    agent_contracts::ToolSurfaceOrigin,
+    agent_contracts::ToolSurfaceDemand,
+)> {
     report
         .selected
         .iter()
@@ -276,8 +282,7 @@ async fn typed_missing_parent_arms_exact_recovery_surface_for_one_decision() {
         "the recovery surface must not outlive its single decision"
     );
     assert_ne!(
-        origin_of(round3, "fs.mkdir")
-            .map(|(origin, _)| origin),
+        origin_of(round3, "fs.mkdir").map(|(origin, _)| origin),
         Some(agent_contracts::ToolSurfaceOrigin::RecoverySurface),
         "fs.mkdir must lose recovery provenance after one decision"
     );
@@ -309,12 +314,10 @@ async fn unrelated_missing_read_never_arms_the_recovery_surface() {
          the surface must not change, got {round2:?}"
     );
     assert!(
-        reports
-            .values()
-            .all(|report| report
-                .selected
-                .iter()
-                .all(|row| row.origin != agent_contracts::ToolSurfaceOrigin::RecoverySurface)),
+        reports.values().all(|report| report
+            .selected
+            .iter()
+            .all(|row| row.origin != agent_contracts::ToolSurfaceOrigin::RecoverySurface)),
         "no decision in this turn may see a recovery surface"
     );
 }
@@ -391,12 +394,10 @@ async fn switch_off_preserves_the_catalog_cold_baseline() {
          got {round2:?}"
     );
     assert!(
-        reports
-            .values()
-            .all(|report| report
-                .selected
-                .iter()
-                .all(|row| row.origin != agent_contracts::ToolSurfaceOrigin::RecoverySurface)),
+        reports.values().all(|report| report
+            .selected
+            .iter()
+            .all(|row| row.origin != agent_contracts::ToolSurfaceOrigin::RecoverySurface)),
         "no decision in the baseline arm may see a recovery surface"
     );
 }

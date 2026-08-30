@@ -20,22 +20,22 @@ pub use retry::RetryingTransport;
 
 use std::{
     sync::atomic::{AtomicU8, Ordering},
-    time::Duration,
+    time::{Duration, SystemTime},
 };
 
 use agent_contracts::{
     AgentError, AgentResult, ModelCapabilities, ModelChunk, ModelEventSink, ModelOutput,
-    ModelRequest, ModelRole, ModelTransport,
+    ModelProtocolErrorKind, ModelRequest, ModelRole, ModelTransport, RetryAfterMillis,
 };
 use async_trait::async_trait;
 use futures_util::{StreamExt, TryStreamExt};
-use reqwest::Client;
+use reqwest::{Client, header::RETRY_AFTER};
 use serde_json::{Value, json};
 use tokio_util::codec::{FramedRead, LinesCodec};
 use tokio_util::io::StreamReader;
 
 use crate::responses::{ResponseStreamErrorKind, ResponsesAccumulator};
-use crate::sse::{StreamAccumulator, WireChunk, parse_sse_data};
+use crate::sse::{StreamAccumulator, parse_sse_data, parse_wire_chunk};
 use crate::wire_names::ToolNameCodec;
 
 const PROTOCOL_UNKNOWN: u8 = 0;
@@ -142,6 +142,40 @@ fn truncate_error_body(body: &str) -> String {
     }
     let head: String = trimmed.chars().take(MAX_ERROR_BODY_CHARS).collect();
     format!("{head}... ({total} chars total)")
+}
+
+fn parse_retry_after(
+    value: Option<&reqwest::header::HeaderValue>,
+    now: SystemTime,
+) -> Option<RetryAfterMillis> {
+    let value = value?.to_str().ok()?.trim();
+    if let Ok(seconds) = value.parse::<u64>() {
+        return Some(RetryAfterMillis::new_saturating(
+            seconds.saturating_mul(1_000),
+        ));
+    }
+    let deadline = httpdate::parse_http_date(value).ok()?;
+    let millis = deadline
+        .duration_since(now)
+        .unwrap_or_default()
+        .as_millis()
+        .min(u64::MAX as u128) as u64;
+    Some(RetryAfterMillis::new_saturating(millis))
+}
+
+fn parse_responses_event(payload: &str) -> AgentResult<Value> {
+    let event: Value =
+        serde_json::from_str(payload).map_err(|error| AgentError::ModelProtocol {
+            kind: ModelProtocolErrorKind::MalformedEvent,
+            message: format!("malformed Responses SSE JSON: {error}"),
+        })?;
+    if !event.is_object() {
+        return Err(AgentError::ModelProtocol {
+            kind: ModelProtocolErrorKind::MalformedEvent,
+            message: "Responses SSE data must be a JSON object".into(),
+        });
+    }
+    Ok(event)
 }
 
 pub struct OpenAiProvider {
@@ -253,6 +287,24 @@ impl ProtocolError {
         }
     }
 
+    fn http_transport(
+        retryable: bool,
+        retry_after: Option<RetryAfterMillis>,
+        message: String,
+    ) -> Self {
+        let error = match (retryable, retry_after) {
+            (true, Some(retry_after_ms)) => AgentError::TransportRetryAfter {
+                retry_after_ms,
+                message,
+            },
+            _ => AgentError::Transport { retryable, message },
+        };
+        Self {
+            error,
+            endpoint_unsupported: false,
+        }
+    }
+
     fn unsupported(code: u16, body: &str) -> Self {
         Self {
             error: AgentError::Transport {
@@ -298,9 +350,12 @@ impl OpenAiProvider {
         let status = response.status();
         if !status.is_success() {
             let code = status.as_u16();
+            let retry_after =
+                parse_retry_after(response.headers().get(RETRY_AFTER), SystemTime::now());
             let body = response.text().await.unwrap_or_default();
-            return Err(ProtocolError::transport(
+            return Err(ProtocolError::http_transport(
                 http_status_retryable(code, &body),
+                retry_after,
                 format!("HTTP {code}: {}", truncate_error_body(&body)),
             ));
         }
@@ -312,6 +367,7 @@ impl OpenAiProvider {
         let max_stream_bytes = self.config.max_stream_bytes;
         let mut total_bytes = 0usize;
         let mut accumulator = StreamAccumulator::default();
+        let mut saw_done = false;
         // A stream that stops delivering bytes without closing is a stalled
         // connection, not a slow model: bound the silent gap so the turn
         // fails retryable instead of hanging until the peer gives up.
@@ -351,17 +407,16 @@ impl OpenAiProvider {
                                 continue;
                             };
                             if payload == "[DONE]" {
+                                saw_done = true;
                                 break;
                             }
-                            match serde_json::from_str::<WireChunk>(payload) {
-                                Ok(chunk) => {
+                            match parse_wire_chunk(payload).map_err(ProtocolError::from)? {
+                                Some(chunk) => {
                                     for event in accumulator.apply(&chunk) {
                                         sink.on_chunk(codec.remap_chunk(event)).await.map_err(ProtocolError::from)?;
                                     }
                                 }
-                                Err(error) => {
-                                    tracing::debug!(%error, %payload, "skipping unparseable stream chunk");
-                                }
+                                None => tracing::debug!(%payload, "ignoring unknown Chat Completions extension event"),
                             }
                         }
                         Some(Err(error)) => {
@@ -379,8 +434,14 @@ impl OpenAiProvider {
         if let Some(message) = accumulator.take_terminal_error() {
             return Err(ProtocolError::transport(true, message));
         }
+        if !saw_done {
+            return Err(ProtocolError::transport(
+                true,
+                "Chat Completions stream ended before the [DONE] marker".into(),
+            ));
+        }
         let usage = accumulator.usage.clone().unwrap_or_default();
-        let (content, tool_calls) = accumulator.finalize();
+        let (content, tool_calls) = accumulator.finalize().map_err(ProtocolError::from)?;
         let tool_calls = codec.remap_calls(tool_calls);
         sink.on_chunk(ModelChunk::Done)
             .await
@@ -413,12 +474,15 @@ impl OpenAiProvider {
         let status = response.status();
         if !status.is_success() {
             let code = status.as_u16();
+            let retry_after =
+                parse_retry_after(response.headers().get(RETRY_AFTER), SystemTime::now());
             let body = response.text().await.unwrap_or_default();
             if responses_endpoint_unsupported(code, &body) {
                 return Err(ProtocolError::unsupported(code, &body));
             }
-            return Err(ProtocolError::transport(
+            return Err(ProtocolError::http_transport(
                 http_status_retryable(code, &body),
+                retry_after,
                 format!("HTTP {code}: {}", truncate_error_body(&body)),
             ));
         }
@@ -457,13 +521,12 @@ impl OpenAiProvider {
                             }
                             let Some(payload) = parse_sse_data(&line) else { continue; };
                             if payload == "[DONE]" { break; }
-                            match serde_json::from_str::<Value>(payload) {
-                                Ok(event) => {
-                                    for chunk in accumulator.apply(&event) {
-                                        sink.on_chunk(codec.remap_chunk(chunk)).await.map_err(ProtocolError::from)?;
-                                    }
-                                }
-                                Err(error) => tracing::debug!(%error, %payload, "skipping unparseable Responses stream event"),
+                            let event = parse_responses_event(payload).map_err(ProtocolError::from)?;
+                            for chunk in accumulator.apply(&event).map_err(ProtocolError::from)? {
+                                sink.on_chunk(codec.remap_chunk(chunk)).await.map_err(ProtocolError::from)?;
+                            }
+                            if accumulator.is_completed() {
+                                break;
                             }
                         }
                         Some(Err(error)) => {
@@ -490,7 +553,13 @@ impl OpenAiProvider {
                 }
             });
         }
-        let (content, tool_calls, usage) = accumulator.finalize();
+        if !accumulator.is_completed() {
+            return Err(ProtocolError::transport(
+                true,
+                "Responses stream ended before the response.completed marker".into(),
+            ));
+        }
+        let (content, tool_calls, usage) = accumulator.finalize().map_err(ProtocolError::from)?;
         let tool_calls = codec.remap_calls(tool_calls);
         sink.on_chunk(ModelChunk::Done)
             .await
@@ -846,6 +915,35 @@ mod tests {
         }
     }
 
+    #[derive(Default)]
+    struct RecordingSink {
+        chunks: std::sync::Mutex<Vec<ModelChunk>>,
+    }
+
+    #[async_trait]
+    impl ModelEventSink for RecordingSink {
+        async fn on_chunk(&self, chunk: ModelChunk) -> AgentResult<()> {
+            self.chunks.lock().unwrap().push(chunk);
+            Ok(())
+        }
+    }
+
+    async fn serve_sse_once(sse: &'static str) -> std::net::SocketAddr {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut buf = [0u8; 16 * 1024];
+            let _ = socket.read(&mut buf).await;
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{sse}",
+                sse.len()
+            );
+            socket.write_all(response.as_bytes()).await.unwrap();
+        });
+        addr
+    }
+
     #[tokio::test]
     async fn colliding_wire_names_fail_before_the_http_call() {
         let provider = OpenAiProvider::new(dummy_config("http://127.0.0.1:1/v1".into()));
@@ -1019,6 +1117,163 @@ mod tests {
             r#"{"error":{"message":"context_length_exceeded"}}"#
         ));
         assert!(!http_status_retryable(401, wrapped));
+    }
+
+    #[test]
+    fn retry_after_accepts_delta_and_http_date_and_clamps_both() {
+        let seconds = reqwest::header::HeaderValue::from_static("2");
+        assert_eq!(
+            parse_retry_after(Some(&seconds), SystemTime::UNIX_EPOCH)
+                .unwrap()
+                .get(),
+            2_000
+        );
+
+        let now = SystemTime::UNIX_EPOCH + Duration::from_secs(1_000_000);
+        let future = httpdate::fmt_http_date(now + Duration::from_secs(3));
+        let date: reqwest::header::HeaderValue = future.parse().unwrap();
+        assert_eq!(parse_retry_after(Some(&date), now).unwrap().get(), 3_000);
+
+        let excessive = reqwest::header::HeaderValue::from_static("999999999");
+        assert_eq!(
+            parse_retry_after(Some(&excessive), now).unwrap().get(),
+            RetryAfterMillis::MAX_MILLIS
+        );
+        let invalid = reqwest::header::HeaderValue::from_static("later");
+        assert!(parse_retry_after(Some(&invalid), now).is_none());
+    }
+
+    #[tokio::test]
+    async fn retry_after_is_exposed_as_bounded_typed_transport_metadata() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut buf = [0u8; 4096];
+            let _ = socket.read(&mut buf).await;
+            let body = r#"{"error":{"message":"rate limited"}}"#;
+            let response = format!(
+                "HTTP/1.1 429 Too Many Requests\r\nRetry-After: 120\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            socket.write_all(response.as_bytes()).await.unwrap();
+        });
+
+        let provider = OpenAiProvider::with_client(
+            dummy_config(format!("http://{addr}/v1")),
+            Client::builder().no_proxy().build().unwrap(),
+        );
+        let error = provider.complete(fs_list_request()).await.unwrap_err();
+        assert!(matches!(
+            error,
+            AgentError::TransportRetryAfter {
+                retry_after_ms,
+                ..
+            } if retry_after_ms.get() == RetryAfterMillis::MAX_MILLIS
+        ));
+    }
+
+    #[tokio::test]
+    async fn malformed_chat_sse_data_fails_with_a_typed_protocol_error() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut buf = [0u8; 4096];
+            let _ = socket.read(&mut buf).await;
+            let sse = "data: {\"choices\":[}\n\n";
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{sse}",
+                sse.len()
+            );
+            socket.write_all(response.as_bytes()).await.unwrap();
+        });
+
+        let provider = OpenAiProvider::with_client(
+            dummy_config(format!("http://{addr}/v1")),
+            Client::builder().no_proxy().build().unwrap(),
+        );
+        let error = provider.complete(fs_list_request()).await.unwrap_err();
+        assert!(matches!(
+            error,
+            AgentError::ModelProtocol {
+                kind: ModelProtocolErrorKind::MalformedEvent,
+                ..
+            }
+        ));
+    }
+
+    #[tokio::test]
+    async fn chat_eof_without_done_refuses_the_partial_stream() {
+        let addr =
+            serve_sse_once("data: {\"choices\":[{\"delta\":{\"content\":\"partial\"}}]}\n\n").await;
+        let provider = OpenAiProvider::with_client(
+            dummy_config(format!("http://{addr}/v1")),
+            Client::builder().no_proxy().build().unwrap(),
+        );
+        let sink = RecordingSink::default();
+        let error = provider
+            .complete_stream(fs_list_request(), &sink)
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            AgentError::Transport {
+                retryable: true,
+                ..
+            }
+        ));
+        assert_eq!(
+            &sink.chunks.lock().unwrap()[..],
+            &[ModelChunk::TextDelta {
+                delta: "partial".into()
+            }],
+            "a partial live delta may be observed, but Done must never be published"
+        );
+    }
+
+    #[tokio::test]
+    async fn valid_partial_arguments_do_not_replace_response_completed() {
+        let addr = serve_sse_once(concat!(
+            "data: {\"type\":\"response.output_item.added\",\"output_index\":0,\"item\":{\"type\":\"function_call\",\"call_id\":\"call_1\",\"name\":\"fs_list\",\"arguments\":\"\"}}\n\n",
+            "data: {\"type\":\"response.function_call_arguments.delta\",\"output_index\":0,\"item_id\":\"fc_1\",\"delta\":\"{}\"}\n\n",
+            "data: [DONE]\n\n",
+        ))
+        .await;
+        let mut config = dummy_config(format!("http://{addr}/v1"));
+        config.protocol = OpenAiProtocol::Responses;
+        let provider =
+            OpenAiProvider::with_client(config, Client::builder().no_proxy().build().unwrap());
+        let sink = RecordingSink::default();
+        let error = provider
+            .complete_stream(fs_list_request(), &sink)
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            &error,
+            AgentError::Transport {
+                retryable: true,
+                ..
+            }
+        ));
+        assert!(error.to_string().contains("response.completed"));
+        assert!(matches!(
+            &sink.chunks.lock().unwrap()[..],
+            [ModelChunk::ToolCallDelta { .. }]
+        ));
+    }
+
+    #[test]
+    fn malformed_responses_sse_data_is_not_an_ignorable_extension() {
+        let error = parse_responses_event(r#"{"type":"response.completed"#).unwrap_err();
+        assert!(matches!(
+            error,
+            AgentError::ModelProtocol {
+                kind: ModelProtocolErrorKind::MalformedEvent,
+                ..
+            }
+        ));
+        assert!(parse_responses_event(r#"{"type":"response.vendor_extension","value":7}"#).is_ok());
     }
 
     #[test]

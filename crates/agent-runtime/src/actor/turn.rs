@@ -9,6 +9,10 @@ impl RuntimeActor {
         reply: Reply<AgentResult<()>>,
         op_tx: &mpsc::Sender<OperationCompletion>,
     ) {
+        if let Err(error) = self.ensure_serving() {
+            let _ = reply.send(Err(error));
+            return;
+        }
         if self.state.recovery_required {
             let _ = reply.send(Err(AgentError::RecoveryRequired(
                 "runtime recovery is required before normal mutation may continue".into(),
@@ -48,7 +52,7 @@ impl RuntimeActor {
             persist.0,
             persist.1,
         );
-        let _ = reply.send(self.begin_applied_turn(content, input, op_tx, false).await);
+        let _ = reply.send(self.begin_applied_turn(content, input, op_tx).await);
     }
 
     pub(super) async fn begin_applied_turn(
@@ -56,8 +60,12 @@ impl RuntimeActor {
         content: String,
         mut input: RuntimeInputEnvelope,
         op_tx: &mpsc::Sender<OperationCompletion>,
-        continuation: bool,
     ) -> AgentResult<()> {
+        // The typed input envelope is the sole authority for whether this is
+        // a new instruction or a replay of the current directive. Keeping a
+        // second boolean beside it lets callers accidentally advance the
+        // directive identity during continuation.
+        let continuation = input.kind == InputKind::TaskContinuation;
         // Fence the new turn before an implicit focus or user-message write
         // becomes visible. If a later step fails, the unused epoch is safe;
         // an accepted turn can never run under an older Core authority.
@@ -122,13 +130,19 @@ impl RuntimeActor {
         self.emit_context_maintained(ContextMaintenanceTrigger::UserInput, report)
             .await?;
 
-        self.state.tasks.on_user_turn(&content);
+        if !continuation {
+            self.state.tasks.on_user_turn(&content);
+        }
 
         // A new turn has no active call from a previous turn: the
         // active-call policy only pins tools while the turn that issued
         // them still consumes their results.
         self.state.active_tool = None;
         self.state.discovery_budget.reset();
+        // Completion may rely only on the frame prepared for this active
+        // turn. A continuation therefore re-materializes just like a fresh
+        // directive instead of inheriting a prior round's readiness claim.
+        self.state.context_requirement_observation = None;
         let execution = self
             .state
             .task_id
@@ -221,7 +235,7 @@ impl RuntimeActor {
         // never landed, instead of starting a turn on an unfenced gap.
         self.continuation_durability_gate().await?;
         let input = RuntimeInputEnvelope::task_continuation(task_id, directive.clone());
-        self.begin_applied_turn(directive, input, op_tx, true).await
+        self.begin_applied_turn(directive, input, op_tx).await
     }
 
     /// Spawn the next operation the turn state says should run: a pending
@@ -263,10 +277,9 @@ impl RuntimeActor {
         let batch = turn.action_batch.as_ref()?;
         if batch.terminal != batch.requested
             || batch.failed != 0
-            || completion_from_execution(&turn.execution).is_err()
-            // A gated proposal must not ride the one-shot path past its
-            // refusal: the decision returns to the model instead.
-            || self.completion_gate().is_err()
+            || !self
+                .completion_readiness(CompletionIntent::ModelProposal, Some(&turn.execution))
+                .allows_completion()
         {
             return None;
         }
@@ -417,38 +430,17 @@ impl RuntimeActor {
                 }
             }
             RuntimeDirective::CompleteTask(proposal) => {
-                // Validated and stored on the turn; the CTX-10 transaction
-                // runs at the turn's safe point (after the turn commits),
-                // never mid-operation, so the completion cannot race an
-                // in-flight tool or model call.
-                if let Err(error) = self.accept_completion_proposal(proposal) {
-                    let _ = self
-                        .core
-                        .emit_warning(format!("completion proposal refused: {error}"))
-                        .await;
-                } else if self.services.project_completion_opportunity()
-                    && let Some(task_id) = self.state.tasks.active()
-                {
-                    // LONG-TASK advisory: the model answered an offered (or
-                    // explicitly directed) closure surface; account the
-                    // call before the commit.
-                    let key = self
-                        .state
-                        .turn
-                        .as_ref()
-                        .and_then(|turn| turn.opportunity_lease.clone())
-                        .unwrap_or_default();
-                    let _ = self
-                        .core
-                        .emit_event(RuntimeEvent::CompletionOpportunity {
-                            disposition: CompletionOpportunityDisposition::Called,
-                            task_id,
-                            key,
-                            anchor_revision: self.current_anchor_revision_value(),
-                            reason: "task.complete proposal accepted for commit".into(),
-                        })
-                        .await;
-                }
+                // Safety net only: the operation-commit path applies
+                // completion proposals itself so the acceptance decision is
+                // reflected in the model-visible ToolOutput. Applying here
+                // would recreate the old optimistic-success split brain.
+                let _ = self
+                    .core
+                    .emit_warning(
+                        "completion proposal refused: no model-visible result to attach".into(),
+                    )
+                    .await;
+                drop(proposal);
             }
             RuntimeDirective::UpdateTaskProgress(proposal) => {
                 // Safety net only: the operation-commit path applies
@@ -466,26 +458,123 @@ impl RuntimeActor {
         }
     }
 
+    /// Apply a structured completion proposal and replace the tool's
+    /// optimistic submission text with Runtime's authoritative gate result.
+    /// A refusal is a normal, bounded tool failure visible to the next model
+    /// decision; it never installs `pending_completion`.
+    pub(super) async fn apply_completion_proposal(
+        &mut self,
+        output: &mut ToolOutput,
+        proposal: CompletionProposal,
+    ) {
+        if let Err(error) = self.accept_completion_proposal(proposal) {
+            let readiness = self
+                .state
+                .turn
+                .as_ref()
+                .map(|turn| self.completion_proposal_readiness(Some(&turn.execution)));
+            let gate_refusal = readiness
+                .as_ref()
+                .is_some_and(|readiness| !readiness.allows_completion());
+            let refusal_class = if gate_refusal {
+                "completion_gate"
+            } else {
+                "proposal_validation"
+            };
+            let blockers = readiness
+                .as_ref()
+                .filter(|readiness| !readiness.allows_completion())
+                .map(CompletionReadiness::applicable_blockers)
+                .unwrap_or_default();
+            let reason = bounded_preview(
+                &error.to_string(),
+                agent_contracts::MAX_TASK_ANCHOR_ITEM_CHARS,
+            );
+            output.ok = false;
+            output.summary = bounded_preview(
+                &format!("task.complete refused: {reason}"),
+                agent_contracts::MAX_TOOL_SUMMARY_CHARS,
+            );
+            output.model_content = bounded_preview(
+                &format!("task.complete was not accepted by Runtime ({refusal_class}): {reason}"),
+                agent_contracts::MAX_TOOL_MODEL_CONTENT_CHARS,
+            );
+            output.metadata = serde_json::json!({
+                "accepted": false,
+                "refused": refusal_class,
+                "blockers": blockers,
+            });
+            let _ = self
+                .core
+                .emit_warning(format!("completion proposal refused: {reason}"))
+                .await;
+            return;
+        }
+
+        // Acceptance means only that Runtime admitted a terminal proposal;
+        // the actual task/context commit occurs after the turn barrier.
+        // Clear an older failure in the turn-local resume projection so a
+        // fresh attempt does not carry stale diagnostics if it commits.
+        if let Some(turn) = self.state.turn.as_mut() {
+            turn.execution.clear_completion_commit_failure();
+        }
+        output.ok = true;
+        output.summary = "task completion accepted; terminal commit pending".into();
+        output.model_content =
+            "Runtime accepted the proposal. Task closure remains pending_terminal_commit until the current turn crosses its durability barrier."
+                .into();
+        output.metadata = serde_json::json!({
+            "accepted": true,
+            "completion_state": "pending_terminal_commit",
+        });
+
+        if self.services.project_completion_opportunity()
+            && let Some(task_id) = self.state.tasks.active()
+        {
+            // LONG-TASK advisory: the model answered an offered (or
+            // explicitly directed) closure surface; account the call before
+            // the commit.
+            let key = self
+                .state
+                .turn
+                .as_ref()
+                .and_then(|turn| turn.opportunity_lease.clone())
+                .unwrap_or_default();
+            let _ = self
+                .core
+                .emit_event(RuntimeEvent::CompletionOpportunity {
+                    disposition: CompletionOpportunityDisposition::Called,
+                    task_id,
+                    key,
+                    anchor_revision: self.current_anchor_revision_value(),
+                    reason: "task.complete proposal accepted for commit".into(),
+                })
+                .await;
+        }
+    }
+
     /// Validate and accept a structured completion proposal from
     /// `task.complete`. It is stored on the turn and committed at the
     /// turn's safe point; a later proposal replaces an earlier one. The
-    /// model-facing tool result already told the model the proposal was
-    /// submitted — the refusal path here only fires for malformed input.
+    /// operation-commit caller owns the model-facing acceptance result.
     pub(super) fn accept_completion_proposal(
         &mut self,
         proposal: CompletionProposal,
     ) -> AgentResult<()> {
-        validate_completion_proposal(
-            &proposal,
-            self.services.artifact_workspace(),
-            self.core.run_id(),
-        )?;
         let Some(turn) = self.state.turn.as_ref() else {
             return Err(AgentError::InvalidRequest(
                 "no active turn to complete".into(),
             ));
         };
-        completion_from_execution(&turn.execution)?;
+        let readiness = self.completion_proposal_readiness(Some(&turn.execution));
+        if !readiness.allows_completion() {
+            return Err(readiness.refusal());
+        }
+        validate_completion_proposal(
+            &proposal,
+            self.services.artifact_workspace(),
+            self.core.run_id(),
+        )?;
         let Some(turn) = self.state.turn.as_mut() else {
             return Err(AgentError::InvalidRequest(
                 "no active turn to complete".into(),
@@ -559,6 +648,9 @@ impl RuntimeActor {
             // no anchor event — but the model still learns the live
             // revision for its next CAS base.
             self.state.tasks.commit(txn);
+            if let Some(turn) = self.state.turn.as_mut() {
+                turn.execution.anchor_revision = revision;
+            }
             output.summary = format!("task progress already current at anchor revision {revision}");
             output.metadata = serde_json::json!({ "anchor_revision": revision, "changed": 0 });
             let _ = self
@@ -614,6 +706,12 @@ impl RuntimeActor {
             })
             .await;
         self.state.tasks.commit(txn);
+        // The active Turn owns the live execution projection. Keep its
+        // task-state basis synchronized with the just-committed CAS before a
+        // safe-point resume install can clone it back over TaskManager.
+        if let Some(turn) = self.state.turn.as_mut() {
+            turn.execution.anchor_revision = revision;
+        }
         self.accrue_checkpoint_debt(crate::checkpoint::CheckpointDebtReason::TaskAnchorChanged);
         output.summary = format!(
             "task progress recorded at anchor revision {revision}: {}",
@@ -632,52 +730,14 @@ impl RuntimeActor {
     /// heap (durable retention; a GC failure after the commit is surfaced,
     /// never allowed to undo the outcome). Shared by the `/done` command
     /// and the model's `task.complete` proposal.
-    /// Acceptance gate for a SUCCESSFUL durable completion: no recovery
-    /// fence, no unsettled cancelled operation, every failure obligation
-    /// resolved, required verification current (re-checked by
-    /// `completion_from_execution`), and no open loops silently erased.
-    fn completion_gate(&self) -> AgentResult<()> {
-        if self.state.recovery_required {
-            return Err(AgentError::InvalidRequest(
-                "recovery is required; completion is fenced until a known-good restore".into(),
-            ));
-        }
-        if self.state.pending_tool_cleanup.is_some() {
-            return Err(AgentError::InvalidRequest(
-                "a cancelled tool operation is still unsettled".into(),
-            ));
-        }
-        let Some(task_id) = self.state.tasks.active() else {
-            return Err(AgentError::InvalidRequest(
-                "no active task to complete".into(),
-            ));
-        };
-        let task = self.state.tasks.get(task_id).expect("active id resolves");
-        if !task.anchor.open_loops.is_empty() {
-            return Err(AgentError::InvalidRequest(format!(
-                "{} explicit open loop(s) remain; success cannot erase them",
-                task.anchor.open_loops.len()
-            )));
-        }
-        let execution = match self.state.turn.as_ref() {
-            Some(turn) => &turn.execution,
-            None => &task.resume,
-        };
-        let open = execution.open_obligation_count();
-        if open > 0 {
-            return Err(AgentError::InvalidRequest(format!(
-                "{open} unresolved execution obligation(s) block completion"
-            )));
-        }
-        Ok(())
-    }
-
     /// Some(reason) when a pending proposal exists but the acceptance gate
     /// refuses it: the decision returns to the model instead of committing.
     pub(super) fn completion_gate_refusal(&self) -> Option<String> {
         let turn = self.state.turn.as_ref()?;
         turn.pending_completion.as_ref()?;
-        self.completion_gate().err().map(|error| error.to_string())
+        let readiness =
+            self.completion_readiness(CompletionIntent::ModelProposal, Some(&turn.execution));
+        (!readiness.allows_completion()).then(|| readiness.refusal().to_string())
     }
 
     /// LONG-TASK Slice C: one advisory completion-opportunity consult at a
@@ -731,6 +791,27 @@ impl RuntimeActor {
         if turn.pending_completion.is_some() {
             // Called/Refused own this settle; derivation would only repeat
             // the pending-proposal blocker behind their own events.
+            return;
+        }
+        // CompletionReadiness is the sole semantic/commit gate. The
+        // opportunity helper below deliberately knows only about the extra
+        // positive signal (durable work) and the once-per-basis key; it must
+        // never grow a second, drifting copy of acceptance, task-progress or
+        // required-context policy.
+        let readiness =
+            self.completion_readiness(CompletionIntent::ModelProposal, Some(&turn.execution));
+        if !readiness.settled_candidate() {
+            let anchor_revision = turn.execution.anchor_revision;
+            let _ = self
+                .core
+                .emit_event(RuntimeEvent::CompletionOpportunity {
+                    disposition: CompletionOpportunityDisposition::NotReady,
+                    task_id,
+                    key: String::new(),
+                    anchor_revision,
+                    reason: readiness.refusal().to_string(),
+                })
+                .await;
             return;
         }
         let anchor = &self
@@ -831,13 +912,17 @@ impl RuntimeActor {
 
     pub(super) async fn commit_completion(
         &mut self,
+        intent: CompletionIntent,
         summary: String,
         artifacts: Vec<String>,
         next_focus_revision: u64,
     ) -> AgentResult<()> {
         // The acceptance gate runs again at the commit safe point: state
         // may have moved since the proposal was stored.
-        self.completion_gate()?;
+        let readiness = self.completion_readiness(intent, None);
+        if !readiness.allows_completion() {
+            return Err(readiness.refusal());
+        }
         let active_task = self
             .state
             .tasks
@@ -934,21 +1019,31 @@ impl RuntimeActor {
                 self.state.tasks.get(active_task).map(|task| &task.resume)
             };
             match state {
-                Some(state) => crate::task::completion_from_execution(state)?,
+                Some(state) => {
+                    crate::task::completion_evidence(state, readiness.verification_basis.as_ref())
+                }
                 None => (
                     crate::task::CompletionVerificationStatus::Unverified,
                     Vec::new(),
                 ),
             }
         };
-        let Some((txn, record)) = self.state.tasks.prepare_complete(
-            summary.clone(),
-            final_output_ref,
-            final_output_digest,
-            merged_artifacts,
-            verification_status,
-            verification_refs,
-        ) else {
+        let Some((txn, record)) =
+            self.state
+                .tasks
+                .prepare_complete(crate::task::CompletionRecordDraft {
+                    summary: summary.clone(),
+                    final_output_ref,
+                    final_output_digest,
+                    artifacts: merged_artifacts,
+                    verification_status,
+                    verification_refs,
+                    disposition: readiness
+                        .disposition()
+                        .expect("an allowed completion has a disposition"),
+                    unmet_reasons: readiness.override_reasons(),
+                })
+        else {
             return Err(AgentError::InvalidRequest(
                 "no active task to complete".into(),
             ));
@@ -957,15 +1052,38 @@ impl RuntimeActor {
         let anchor_revision = record.anchor_revision;
         let event_summary = record.summary.clone();
 
-        // PHASE P — freeze and durably acknowledge the prospective terminal
-        // snapshot while every live value stays untouched. Nothing about the
-        // active task may move before this acknowledgement: a failed write
-        // leaves the task active/completion-pending, surfacing the error so
-        // the same authorized completion intent can retry. A composition
-        // with no store at all cannot claim resumability either way, so it
-        // completes in-memory behind one explicit failure event.
-        let durable = self.freeze_and_acknowledge_terminal(record).await?;
-        if !durable {
+        // Fence old operations before either mutable plane moves; every
+        // operation after this point either commits under the new generation
+        // or is rejected as stale.
+        self.bump_generation()?;
+
+        // PHASE P — prepare the post-completion context plane while retaining
+        // its portable rollback snapshot, then freeze that exact context
+        // together with the prospective terminal task plane. A failed
+        // assembly/write restores context and leaves TaskManager active. Only
+        // a failed restore makes the runtime unreconcilable.
+        let prepared_context = self
+            .services
+            .prepare_complete_current_task(task_id, summary)
+            .await
+            .map_err(|error| self.context_transition_failed(error))?;
+        let checkpoint_sequence = match self
+            .freeze_and_acknowledge_terminal(record, next_focus_revision)
+            .await
+        {
+            Ok(sequence) => sequence,
+            Err(error) => {
+                if let Err(rollback_error) = self
+                    .services
+                    .rollback_task_completion(prepared_context)
+                    .await
+                {
+                    return Err(self.context_transition_failed(rollback_error));
+                }
+                return Err(error);
+            }
+        };
+        if checkpoint_sequence.is_none() {
             let _ = self
                 .core
                 .emit_warning(
@@ -976,28 +1094,31 @@ impl RuntimeActor {
                 .await;
         }
 
-        // PHASE Q — the durable ack authorizes the real transition.
-        self.bump_generation()?;
-        let report = self
-            .services
-            .complete_current_task(task_id, summary)
-            .await
-            .map_err(|error| self.context_transition_failed(error))?;
+        // PHASE Q — the terminal checkpoint authorizes only infallible actor
+        // assignments. The context plane is already exactly the one frozen
+        // above; publishing its audit and the task outcome happens as one
+        // explicit durable event transaction.
+        let report = prepared_context.report;
         self.state.tasks.commit(txn);
         self.state.task_id = None;
         self.state.last_assistant_artifact = None;
         self.state.focus_revision = next_focus_revision;
-        let transition = self
-            .publish_context_transition(
-                RuntimeEvent::TaskCompleted {
-                    task_id,
-                    anchor_revision,
-                    summary: event_summary,
-                },
-                ContextMaintenanceTrigger::TaskCompleted,
-                report,
-            )
-            .await;
+        let mut terminal_events = vec![RuntimeEvent::TaskCompleted {
+            task_id,
+            anchor_revision,
+            summary: event_summary,
+        }];
+        terminal_events.extend(context_maintenance_events(
+            ContextMaintenanceTrigger::TaskCompleted,
+            report,
+        ));
+        terminal_events.push(RuntimeEvent::RuntimeCommitBarrier {
+            kind: RuntimeCommitKind::TaskCompletion,
+            checkpoint_sequence,
+        });
+        if let Err(error) = self.core.emit_events_durable(terminal_events).await {
+            return Err(self.audit_gap_after_commit(error).await);
+        }
         // LONG-TASK advisory: account closure against the opportunity
         // lifecycle. The key repeats the last offered key when the offer's
         // basis survived to the commit; empty rows mean an explicit path.
@@ -1019,11 +1140,9 @@ impl RuntimeActor {
                 })
                 .await;
         }
-        if transition.is_ok() {
-            self.compact_after_completion().await;
-            self.run_storage_gc_at_boundary().await;
-        }
-        transition
+        self.compact_after_completion().await;
+        self.run_storage_gc_at_boundary().await;
+        Ok(())
     }
 
     /// When the model stops calling tools, the turn's tool observations
@@ -1240,8 +1359,8 @@ impl RuntimeActor {
         {
             return self.commit_failed(TurnCommitPhase::GcEvent, error).await;
         }
-        // 输入记录的 Consumed/Archived 必须在 TurnCompleted 屏障之前入账，
-        // 这样 flush 覆盖它们，且 TurnCompleted 仍是屏障前最后一条事件。
+        // 输入记录的 Consumed/Archived 必须在显式提交屏障之前入账，
+        // 这样同一次 flush 覆盖它们。
         self.emit_input_consumed().await;
         if let Some(applied) = self
             .state
@@ -1251,16 +1370,19 @@ impl RuntimeActor {
         {
             self.emit_input_archived(applied).await;
         }
-        // The durability barrier: `emit_event_durable` appends TurnCompleted
-        // and then flushes the event journal, so every mandatory state write
-        // before it (tool observations, assistant message, maintains, GC)
-        // has left the process before the turn is Committed — the channel
-        // is FIFO, so the flush covers everything appended before it. A
-        // failed barrier means the trace has a gap: the turn is not
-        // Committed, and TurnCompleted is never broadcast.
+        // The lifecycle event and its explicit commit marker share one
+        // durable batch. Replay keys off the marker, while subscribers see
+        // neither member until all mandatory writes and both events have
+        // crossed the same flush barrier.
         if let Err(error) = self
             .core
-            .emit_event_durable(RuntimeEvent::TurnCompleted)
+            .emit_events_durable(vec![
+                RuntimeEvent::TurnCompleted,
+                RuntimeEvent::RuntimeCommitBarrier {
+                    kind: RuntimeCommitKind::Turn,
+                    checkpoint_sequence: None,
+                },
+            ])
             .await
         {
             return self
@@ -1312,18 +1434,72 @@ impl RuntimeActor {
                 .await;
             return;
         }
-        let Some(next_focus_revision) = self.next_focus_revision().ok() else {
-            return;
+        let task_id = self
+            .state
+            .tasks
+            .active()
+            .expect("active task checked above");
+        let result = match self.next_focus_revision() {
+            Ok(next_focus_revision) => {
+                self.commit_completion(
+                    CompletionIntent::ModelProposal,
+                    proposal.summary,
+                    proposal.artifacts,
+                    next_focus_revision,
+                )
+                .await
+            }
+            Err(error) => Err(error),
         };
-        if let Err(error) = self
-            .commit_completion(proposal.summary, proposal.artifacts, next_focus_revision)
-            .await
+        if let Err(error) = result {
+            self.record_completion_commit_failure(task_id, &error).await;
+        }
+    }
+
+    /// Persist and project a deferred completion failure onto the still-live
+    /// task. The accepted operation never masquerades as completed, and the
+    /// next model decision receives one bounded runtime fact instead of
+    /// relying on a warning that disappears with the previous turn.
+    async fn record_completion_commit_failure(&mut self, task_id: TaskId, error: &AgentError) {
+        // An audit-batch failure happens after the terminal checkpoint and
+        // infallible TaskManager commit. That outcome is already Completed
+        // and recovery-fenced; projecting it as a retryable pending proposal
+        // would create false active-task debt that no task can settle.
+        if self.state.tasks.completion_of(task_id).is_some()
+            || self.state.tasks.active() != Some(task_id)
         {
             let _ = self
                 .core
-                .emit_warning(format!("completion proposal failed: {error}"))
+                .emit_warning(format!(
+                    "task {task_id} completed, but terminal audit publication failed: {error}"
+                ))
                 .await;
+            return;
         }
+        let reason = bounded_preview(
+            &error.to_string(),
+            agent_contracts::MAX_TASK_ANCHOR_ITEM_CHARS,
+        );
+        if let Some(task) = self.state.tasks.get_mut(task_id) {
+            task.resume.record_completion_commit_failure(&reason);
+            self.accrue_checkpoint_debt(
+                crate::checkpoint::CheckpointDebtReason::CompletionCommitFailed,
+            );
+        }
+        let _ = self
+            .core
+            .emit_event(RuntimeEvent::CompletionCommitFailed {
+                task_id,
+                retryable: !matches!(error, AgentError::RecoveryRequired(_)),
+                reason: reason.clone(),
+            })
+            .await;
+        self.safe_point_resume_commit().await;
+        let _ = self.await_pending_checkpoint().await;
+        let _ = self
+            .core
+            .emit_warning(format!("completion proposal failed: {reason}"))
+            .await;
     }
 
     /// Abort the turn commit: journal the failed phase and the recovery

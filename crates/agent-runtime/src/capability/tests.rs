@@ -23,6 +23,34 @@ struct EmptyBase;
 /// 统一预算测试用 base：自身表面字节推过共享高水位。
 struct HeavyBase;
 
+struct DeclaredBase;
+
+fn test_coverage_declaration() -> agent_contracts::VerificationCoverageDeclaration {
+    agent_contracts::VerificationCoverageDeclaration {
+        domain_id: "workspace-tests".into(),
+        declaration_revision: 2,
+        source_digest: agent_contracts::ContentDigest::sha256_bytes(b"capability-base/v2")
+            .to_string(),
+    }
+}
+
+#[async_trait::async_trait]
+impl ToolDispatcher for DeclaredBase {
+    fn specs(&self) -> Vec<ToolSpec> {
+        Vec::new()
+    }
+
+    fn verification_coverage_declarations(
+        &self,
+    ) -> Vec<agent_contracts::VerificationCoverageDeclaration> {
+        vec![test_coverage_declaration()]
+    }
+
+    async fn execute(&self, _request: ToolExecutionRequest) -> AgentResult<ToolOutcome> {
+        unreachable!("projection-only base")
+    }
+}
+
 #[async_trait::async_trait]
 impl ToolDispatcher for HeavyBase {
     fn specs(&self) -> Vec<ToolSpec> {
@@ -44,6 +72,16 @@ impl ToolDispatcher for EmptyBase {
     async fn execute(&self, _request: ToolExecutionRequest) -> AgentResult<ToolOutcome> {
         Err(AgentError::Tool("empty base".into()))
     }
+}
+
+#[test]
+fn capability_wrapper_preserves_the_base_coverage_projection() {
+    let dispatcher =
+        CapabilityAwareDispatcher::new(Arc::new(DeclaredBase), Arc::new(CapabilityRegistry::new()));
+    assert_eq!(
+        dispatcher.verification_coverage_declarations(),
+        vec![test_coverage_declaration()]
+    );
 }
 
 #[async_trait::async_trait]

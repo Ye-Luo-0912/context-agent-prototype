@@ -95,19 +95,47 @@ impl EventAuthority {
     /// broadcasts nothing — the caller fences the turn instead of claiming
     /// a commit that never landed.
     pub async fn emit_durable(&self, run_id: RunId, event: RuntimeEvent) -> AgentResult<()> {
-        let _emit = self.emit_gate.lock().await;
-        let envelope = self.envelope(run_id, event);
-        if let Some(journal) = &self.journal {
-            journal.append(&envelope).await?;
-            // The append accepted this cursor. Commit it before the barrier:
-            // if flush fails, retrying the same sequence could duplicate an
-            // already queued/persisted envelope.
-            self.seq.store(envelope.seq, Ordering::Release);
-            journal.flush().await?;
-        } else {
-            self.seq.store(envelope.seq, Ordering::Release);
+        self.emit_batch_durable(run_id, vec![event]).await
+    }
+
+    /// Journal a bounded transaction of audit events, flush the complete
+    /// prefix once, and only then publish any member. A partial append or a
+    /// failed flush advances no caller-visible commit marker because the
+    /// final member is the explicit runtime barrier and nothing is
+    /// broadcast before the flush succeeds.
+    pub async fn emit_batch_durable(
+        &self,
+        run_id: RunId,
+        events: Vec<RuntimeEvent>,
+    ) -> AgentResult<()> {
+        const MAX_DURABLE_BATCH_EVENTS: usize = 64;
+        if events.is_empty() {
+            return Ok(());
         }
-        let _ = self.event_tx.send(envelope);
+        if events.len() > MAX_DURABLE_BATCH_EVENTS {
+            return Err(agent_contracts::AgentError::InvalidRequest(format!(
+                "durable event batch has {} members, above the {MAX_DURABLE_BATCH_EVENTS} cap",
+                events.len()
+            )));
+        }
+        let _emit = self.emit_gate.lock().await;
+        let mut envelopes = Vec::with_capacity(events.len());
+        for event in events {
+            let envelope = self.envelope(run_id, event);
+            if let Some(journal) = &self.journal {
+                journal.append(&envelope).await?;
+            }
+            // An accepted append owns its sequence even if a later member or
+            // the final flush fails; retry must never reuse that identity.
+            self.seq.store(envelope.seq, Ordering::Release);
+            envelopes.push(envelope);
+        }
+        if let Some(journal) = &self.journal {
+            journal.flush().await?;
+        }
+        for envelope in envelopes {
+            let _ = self.event_tx.send(envelope);
+        }
         Ok(())
     }
 
@@ -268,8 +296,8 @@ fn now_ms() -> u64 {
 mod tests {
     use super::*;
     use agent_contracts::{
-        AgentError, AgentResult, EffectDurability, EffectReceipt, EventJournal, RuntimeEvent,
-        RuntimeEventEnvelope, ToolCall, ToolFailureClass, ToolRisk,
+        AgentError, AgentResult, EffectDurability, EffectReceipt, EventJournal, RuntimeCommitKind,
+        RuntimeEvent, RuntimeEventEnvelope, ToolCall, ToolFailureClass, ToolRisk,
     };
     use serde_json::json;
     use std::sync::{
@@ -466,6 +494,79 @@ mod tests {
         assert_eq!(envelope.run_id, run);
         assert_eq!(envelope.seq, 1);
         assert!(matches!(envelope.event, RuntimeEvent::TurnCompleted));
+    }
+
+    struct BlockingFlushJournal {
+        appended: std::sync::Mutex<Vec<RuntimeEventEnvelope>>,
+        entered: tokio::sync::Notify,
+        release: tokio::sync::Notify,
+    }
+
+    #[async_trait::async_trait]
+    impl EventJournal for BlockingFlushJournal {
+        async fn append(&self, envelope: &RuntimeEventEnvelope) -> AgentResult<()> {
+            self.appended.lock().unwrap().push(envelope.clone());
+            Ok(())
+        }
+
+        async fn flush(&self) -> AgentResult<()> {
+            self.entered.notify_one();
+            self.release.notified().await;
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn durable_batch_appends_in_order_and_broadcasts_only_after_one_flush() {
+        let journal = Arc::new(BlockingFlushJournal {
+            appended: std::sync::Mutex::new(Vec::new()),
+            entered: tokio::sync::Notify::new(),
+            release: tokio::sync::Notify::new(),
+        });
+        let (tx, mut rx) = broadcast::channel(16);
+        let authority = Arc::new(EventAuthority::new(
+            Some(journal.clone()),
+            tx,
+            Arc::new(AtomicU64::new(0)),
+        ));
+        let writer = {
+            let authority = authority.clone();
+            tokio::spawn(async move {
+                authority
+                    .emit_batch_durable(
+                        run(),
+                        vec![
+                            RuntimeEvent::TurnCompleted,
+                            RuntimeEvent::RuntimeCommitBarrier {
+                                kind: RuntimeCommitKind::Turn,
+                                checkpoint_sequence: None,
+                            },
+                        ],
+                    )
+                    .await
+            })
+        };
+
+        journal.entered.notified().await;
+        assert_eq!(journal.appended.lock().unwrap().len(), 2);
+        assert!(matches!(
+            rx.try_recv(),
+            Err(broadcast::error::TryRecvError::Empty)
+        ));
+        journal.release.notify_one();
+        writer.await.unwrap().unwrap();
+
+        let first = rx.recv().await.unwrap();
+        let second = rx.recv().await.unwrap();
+        assert!(matches!(first.event, RuntimeEvent::TurnCompleted));
+        assert!(matches!(
+            second.event,
+            RuntimeEvent::RuntimeCommitBarrier {
+                kind: RuntimeCommitKind::Turn,
+                ..
+            }
+        ));
+        assert_eq!((first.seq, second.seq), (1, 2));
     }
 
     #[tokio::test]

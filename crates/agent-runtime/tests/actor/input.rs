@@ -539,6 +539,9 @@ async fn before_model_maintain_failure_journals_the_phase_and_settles_the_input(
                 selected: Vec::new(),
                 approx_tokens: 0,
                 foreground: Vec::new(),
+                required_item_ids: Vec::new(),
+                required_misses: Default::default(),
+                optional_misses: Default::default(),
                 diagnostics: ContextDiagnostics::default(),
             })
         }

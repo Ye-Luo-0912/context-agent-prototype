@@ -17,13 +17,15 @@
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use agent_contracts::{
     AgentResult, ApprovalDecision, ApprovalGate, CancellationToken,
-    CompletionOpportunityDisposition, ContextEngine, ModelTransport, RuntimeEvent,
-    RuntimeEventEnvelope, RuntimeFailureClass, TaskId, ToolCall, ToolDispatcher, ToolSpec,
+    CompletionOpportunityDisposition, ContextEngine, ModelCapabilities, ModelEventSink,
+    ModelOutput, ModelRequest, ModelTransport, RuntimeEvent, RuntimeEventEnvelope,
+    RuntimeFailureClass, TaskId, ToolCall, ToolDispatcher, ToolSpec,
+    VerificationCoverageDeclaration,
 };
 use anyhow::bail;
 use serde::{Deserialize, Serialize};
@@ -34,7 +36,7 @@ use crate::long_task::{self, DIRECTIVE, FIXTURE_FILES};
 use crate::m15_pack;
 use crate::workload::{HiddenAssertionResult, HiddenCommandResult, HiddenFileBody, HiddenReport};
 
-pub const PILOT_SCHEMA: &str = "retry-pilot-cell-v3";
+pub const PILOT_SCHEMA: &str = "retry-pilot-cell-v4";
 /// LONG_TASK_EVALUATION layer 2: normal and resume, two repeats each.
 pub const DEFAULT_REPEATS: u32 = 2;
 pub const M15_PACK_IDS: [&str; 3] = [
@@ -42,22 +44,41 @@ pub const M15_PACK_IDS: [&str; 3] = [
     m15_pack::RETRY_MIGRATE,
     "retry_policy_dev",
 ];
+const CONVERGENCE_CANDIDATE_ID: &str = "task-progress-settlement-v1";
+const PRODUCT_TOOL_SURFACE: &str = "production";
 
 /// Candidate switches for one live cell. Each paired gate runs identical
 /// cells with exactly one of these as the only variable; the evidence
 /// records every setting.
-#[derive(Debug, Clone, Copy, Default)]
+#[derive(Debug, Clone, Copy)]
 pub struct CellSwitches {
     /// Item-8 advisory completion-opportunity candidate (default off).
     pub opportunity: bool,
     /// Directory-tool admission recovery-surface candidate (default off).
     pub recovery_surface: bool,
-    /// Model projection switch of the TASK PROGRESS frame (default off):
-    /// when on, the runtime renders the bounded progress view and, at a
-    /// task-aware settled candidate, the neutral settlement fact. The
-    /// convergence gate runs identical cells with this as the only
-    /// variable; the switch is never hardcoded at the composition root.
-    pub project_progress: bool,
+    /// Product TASK PROGRESS projection. Product and formal-eval baselines
+    /// keep this on; a settlement experiment must never change it because it
+    /// also owns checked-file projection into Context maintenance.
+    pub project_task_progress: bool,
+    /// Neutral settlement line inside an already-enabled TASK PROGRESS frame.
+    /// Default off. This is the only treatment in the convergence gate.
+    pub project_settlement: bool,
+    /// Expensive same-state request audit and common treatment-sized packing
+    /// envelope. Ordinary product/M15 cells keep this false; a causal pair
+    /// sets the same true value in both arms.
+    pub settlement_projection_diagnostics: bool,
+}
+
+impl Default for CellSwitches {
+    fn default() -> Self {
+        Self {
+            opportunity: false,
+            recovery_surface: false,
+            project_task_progress: true,
+            project_settlement: false,
+            settlement_projection_diagnostics: false,
+        }
+    }
 }
 
 /// Harness-owned behavioral oracle. Injected into the finished workspace
@@ -88,12 +109,15 @@ pub(crate) struct PackSpec {
     pub allowed_diff: Box<dyn Fn(&str) -> bool>,
     /// Declarative acceptance text the harness patches onto the task after
     /// its creation, so the task-aware completion gate can arm in live
-    /// cells. The runtime binds the current trusted verification pass as
-    /// the coverage claim for the declared criteria on every verified
-    /// pass. `None` (the default) patches nothing and the gate stays
+    /// cells. After observing a matching trusted PASS, Runtime mints the
+    /// criterion receipt from the host-declared coverage domain. `None`
+    /// (the default) patches nothing and the gate stays
     /// fail-closed at `VerifiedCurrent`. The text is neutral and never
     /// carries hidden evaluation details.
     pub acceptance_declaration: Option<&'static str>,
+    /// Host-owned verifier coverage domain which can prove the public
+    /// acceptance declaration. `None` must accompany no declaration.
+    pub acceptance_domain: Option<&'static str>,
 }
 
 /// The same raw cell facts can serve gates with different lifecycle policy.
@@ -292,7 +316,10 @@ pub(crate) fn retry_pack() -> PackSpec {
             ]
         }),
         allowed_diff: Box::new(standard_allowed_diff),
-        acceptance_declaration: Some("the retry policy behaves correctly"),
+        acceptance_declaration: Some(
+            "attempts above the safe exponent saturate at max_delay without overflow",
+        ),
+        acceptance_domain: Some("retry-policy-public-contract"),
     }
 }
 
@@ -337,6 +364,7 @@ pub(crate) fn m15_diag_pack() -> PackSpec {
             standard_allowed_diff(relative) || relative == "DIAGNOSIS.md"
         }),
         acceptance_declaration: None,
+        acceptance_domain: None,
     }
 }
 
@@ -364,6 +392,7 @@ pub(crate) fn m15_migrate_pack() -> PackSpec {
         exact_recipe_inputs: Box::new(Vec::new),
         allowed_diff: Box::new(standard_allowed_diff),
         acceptance_declaration: None,
+        acceptance_domain: None,
     }
 }
 
@@ -555,13 +584,303 @@ impl ApprovalGate for AllowAllGate {
     }
 }
 
+#[derive(Debug, Clone, Serialize)]
+struct ModelRequestShape {
+    prompt_digest: String,
+    tool_surface_digest: String,
+}
+
+#[derive(Debug, Default)]
+struct ModelRequestCapture {
+    total: usize,
+    shapes: Vec<ModelRequestShape>,
+    settlement_audits: u64,
+    settlement_audit_invalid: u64,
+    first_settlement_normalized_prompt_digest: Option<String>,
+    first_settlement_tool_surface_digest: Option<String>,
+}
+
+/// Observational transport wrapper for live evidence. It hashes the exact
+/// assembled messages and tool specs before delegating without changing the
+/// request. The Context compactor receives the raw provider, so its private
+/// summarization requests cannot contaminate this cell-level model trace.
+struct RecordingModelTransport {
+    inner: Arc<dyn ModelTransport>,
+    expected_settlement_arm: &'static str,
+    capture: Mutex<ModelRequestCapture>,
+}
+
+impl RecordingModelTransport {
+    const CAP: usize = LIVE_MAX_MODEL_ROUNDS as usize * 2 + 2;
+
+    fn new(inner: Arc<dyn ModelTransport>, project_settlement: bool) -> Self {
+        Self {
+            inner,
+            expected_settlement_arm: if project_settlement { "on" } else { "off" },
+            capture: Mutex::new(ModelRequestCapture::default()),
+        }
+    }
+
+    fn record(&self, request: &ModelRequest) {
+        let mut capture = self
+            .capture
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        capture.total = capture.total.saturating_add(1);
+        if let Some(raw_audit) = request
+            .metadata
+            .get("settlement_projection_audit")
+            .filter(|value| !value.is_null())
+        {
+            capture.settlement_audits = capture.settlement_audits.saturating_add(1);
+            let parsed =
+                validate_live_settlement_audit(request, raw_audit, self.expected_settlement_arm);
+            match parsed {
+                Some((valid, normalized_prompt, tool_surface)) => {
+                    if !valid {
+                        capture.settlement_audit_invalid =
+                            capture.settlement_audit_invalid.saturating_add(1);
+                    }
+                    if capture.first_settlement_normalized_prompt_digest.is_none() {
+                        capture.first_settlement_normalized_prompt_digest = Some(normalized_prompt);
+                        capture.first_settlement_tool_surface_digest = Some(tool_surface);
+                    }
+                }
+                None => {
+                    capture.settlement_audit_invalid =
+                        capture.settlement_audit_invalid.saturating_add(1);
+                }
+            }
+        }
+        if capture.shapes.len() >= Self::CAP {
+            return;
+        }
+        capture.shapes.push(ModelRequestShape {
+            prompt_digest: serialized_digest(&request.messages),
+            tool_surface_digest: serialized_digest(&request.tools),
+        });
+    }
+
+    fn snapshot(&self) -> ModelRequestDigest {
+        let capture = self
+            .capture
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let prompt: Vec<&str> = capture
+            .shapes
+            .iter()
+            .map(|shape| shape.prompt_digest.as_str())
+            .collect();
+        let surface: Vec<&str> = capture
+            .shapes
+            .iter()
+            .map(|shape| shape.tool_surface_digest.as_str())
+            .collect();
+        ModelRequestDigest {
+            requests: capture.total as u64,
+            capture_truncated: capture.total > capture.shapes.len(),
+            prompt_digest: (!prompt.is_empty()).then(|| serialized_digest(&prompt)),
+            tool_surface_digest: (!surface.is_empty()).then(|| serialized_digest(&surface)),
+            settlement_audits: capture.settlement_audits,
+            settlement_audit_invalid: capture.settlement_audit_invalid,
+            first_settlement_normalized_prompt_digest: capture
+                .first_settlement_normalized_prompt_digest
+                .clone(),
+            first_settlement_tool_surface_digest: capture
+                .first_settlement_tool_surface_digest
+                .clone(),
+        }
+    }
+}
+
+#[async_trait::async_trait]
+impl ModelTransport for RecordingModelTransport {
+    fn capabilities(&self) -> ModelCapabilities {
+        self.inner.capabilities()
+    }
+
+    async fn complete(&self, request: ModelRequest) -> AgentResult<ModelOutput> {
+        self.record(&request);
+        self.inner.complete(request).await
+    }
+
+    async fn complete_stream(
+        &self,
+        request: ModelRequest,
+        sink: &dyn ModelEventSink,
+    ) -> AgentResult<ModelOutput> {
+        self.record(&request);
+        self.inner.complete_stream(request, sink).await
+    }
+}
+
+fn serialized_digest(value: &impl Serialize) -> String {
+    match serde_json::to_vec(value) {
+        Ok(bytes) => format!("{:x}", Sha256::digest(bytes)),
+        // All captured request types are serde values, so this is defensive.
+        // Keep the observer non-interfering if a future custom serializer
+        // rejects a value; the sentinel remains explicit and stable.
+        Err(_) => format!("{:x}", Sha256::digest(b"serialization-error")),
+    }
+}
+
+fn validate_live_settlement_audit(
+    request: &ModelRequest,
+    raw_audit: &serde_json::Value,
+    expected_arm: &str,
+) -> Option<(bool, String, String)> {
+    let comparison: agent_runtime::SettlementProjectionPreflight =
+        serde_json::from_value(raw_audit.clone()).ok()?;
+    let prompt_digest = serialized_digest(&request.messages);
+    let tool_surface_digest = serialized_digest(&request.tools);
+    let expected_prompt = match expected_arm {
+        "off" => &comparison.baseline_prompt_sha256,
+        "on" => &comparison.treatment_prompt_sha256,
+        _ => return None,
+    };
+    let expected_surface = match expected_arm {
+        "off" => &comparison.baseline_tool_surface_sha256,
+        "on" => &comparison.treatment_tool_surface_sha256,
+        _ => return None,
+    };
+    let valid = comparison.schema == "settlement-projection-preflight/v2"
+        && comparison.allowed_difference == "one task_progress.settlement fact"
+        && comparison.passed
+        && comparison.settlement_occurrences == 1
+        && comparison.baseline_request_sha256 == comparison.normalized_request_sha256
+        && comparison.baseline_prompt_sha256 == comparison.normalized_prompt_sha256
+        && comparison.baseline_tool_surface_sha256 == comparison.treatment_tool_surface_sha256
+        && prompt_digest == expected_prompt.as_str()
+        && tool_surface_digest == expected_surface.as_str();
+    Some((
+        valid,
+        comparison.normalized_prompt_sha256,
+        comparison.baseline_tool_surface_sha256,
+    ))
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ModelRequestDigest {
+    pub requests: u64,
+    pub capture_truncated: bool,
+    pub prompt_digest: Option<String>,
+    pub tool_surface_digest: Option<String>,
+    /// Same-state counterfactual audits attached by Runtime exactly when a
+    /// settled candidate is about to be exposed to the provider.
+    #[serde(default)]
+    pub settlement_audits: u64,
+    #[serde(default)]
+    pub settlement_audit_invalid: u64,
+    #[serde(default)]
+    pub first_settlement_normalized_prompt_digest: Option<String>,
+    #[serde(default)]
+    pub first_settlement_tool_surface_digest: Option<String>,
+}
+
 /// One finished live cell, before evidence serialization. Outcome
 /// dimensions are recorded independently: a lifecycle-closure failure must
 /// not erase whether the workspace was behaviorally correct, and the final
 /// verdict stays conjunctive.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct CellEvidenceIdentity {
+    /// Prospective candidate identity shared by both treatment arms.
+    pub candidate_id: String,
+    /// Digest of the repository source tree that supplied Runtime/eval code.
+    pub source_tree_digest: Option<String>,
+    /// Pack-owned fixture/directive identity.
+    pub fixture_sha256: String,
+    /// Logical repeat, independent of immutable `-attemptN` evidence paths.
+    pub repeat: u32,
+    /// Human-readable surface profile plus its stable configuration digest.
+    pub tool_surface: String,
+    pub surface_config_digest: String,
+    /// Prompt contract digest excluding the isolated settlement treatment;
+    /// the switch itself is persisted separately and actual request-shape
+    /// equality belongs to the deterministic causal preflight.
+    pub prompt_config_digest: String,
+    /// Host-owned acceptance authority recorded independently from the
+    /// prompt contract. A declaration revision without its canonical source
+    /// digest is not a reusable identity.
+    pub acceptance_domain: Option<String>,
+    pub acceptance_declaration_revision: Option<u64>,
+    pub acceptance_source_digest: Option<String>,
+    /// Stable digest of model/base-url/protocol/context-window only. API keys
+    /// and other credentials are deliberately absent.
+    pub provider_config_digest: String,
+    /// Common pair configuration, never the treatment: both arms must opt
+    /// into the same causal diagnostics envelope.
+    pub settlement_projection_diagnostics: bool,
+}
+
+impl CellEvidenceIdentity {
+    fn capture(
+        pack: &PackSpec,
+        pair: &PairSink,
+        switches: CellSwitches,
+        acceptance_profile: AcceptanceProfile,
+        acceptance_authority: Option<&VerificationCoverageDeclaration>,
+    ) -> Self {
+        let fixture_sha256 = (pack.identity_sha256)();
+        let exact_recipe_inputs = (pack.exact_recipe_inputs)();
+        let surface_config_digest = serialized_digest(&serde_json::json!({
+            "profile": PRODUCT_TOOL_SURFACE,
+            "recovery_surface": switches.recovery_surface,
+            "exact_recipe_inputs": exact_recipe_inputs,
+        }));
+        let prompt_config_digest = serialized_digest(&serde_json::json!({
+            "candidate": CONVERGENCE_CANDIDATE_ID,
+            "directive_sha256": format!("{:x}", Sha256::digest((pack.directive)().as_bytes())),
+            "acceptance_declaration": pack.acceptance_declaration,
+            "acceptance_domain": pack.acceptance_domain,
+            "acceptance_profile": acceptance_profile.id(),
+            "completion_opportunity": switches.opportunity,
+            "project_task_progress": switches.project_task_progress,
+            "settlement_projection_diagnostics": switches.settlement_projection_diagnostics,
+            // `project_settlement` is the isolated treatment and is recorded
+            // as its own dimension, not folded into the pair-baseline digest.
+        }));
+        let provider_context_window = crate::envfile::context_window()
+            .map(|value| value.to_string())
+            .unwrap_or_else(|_| "invalid".into());
+        let provider_config_digest = serialized_digest(&serde_json::json!({
+            "model": crate::envfile::get("OPENAI_MODEL")
+                .unwrap_or_else(|| "gpt-4o-mini".into()),
+            "base_url": crate::envfile::get("OPENAI_BASE_URL")
+                .unwrap_or_else(|| "https://api.openai.com/v1".into()),
+            "protocol": crate::envfile::get("OPENAI_API_PROTOCOL")
+                .unwrap_or_else(|| "auto".into()),
+            "context_window": provider_context_window,
+        }));
+        Self {
+            candidate_id: CONVERGENCE_CANDIDATE_ID.into(),
+            source_tree_digest: crate::bundle::source_tree_digest(),
+            fixture_sha256,
+            repeat: pair.repeat,
+            tool_surface: PRODUCT_TOOL_SURFACE.into(),
+            surface_config_digest,
+            prompt_config_digest,
+            acceptance_domain: pack.acceptance_domain.map(str::to_owned),
+            acceptance_declaration_revision: acceptance_authority
+                .map(|declaration| declaration.declaration_revision),
+            acceptance_source_digest: acceptance_authority
+                .map(|declaration| declaration.source_digest.clone()),
+            provider_config_digest,
+            settlement_projection_diagnostics: switches.settlement_projection_diagnostics,
+        }
+    }
+}
+
 pub struct CellOutcome {
     pub pack_id: &'static str,
     pub mode: PilotMode,
+    pub identity: CellEvidenceIdentity,
+    /// Runtime task identity is evidence provenance, never a pair key.
+    pub runtime_task_id: Option<TaskId>,
+    /// Exact runtime model-request shapes captured across both phases.
+    pub model_requests: ModelRequestDigest,
+    /// Immutable evidence directory selected by the retry wrapper. It is
+    /// runner bookkeeping and never participates in runtime behavior.
+    pub evidence_dir: Option<PathBuf>,
     pub acceptance_profile: AcceptanceProfile,
     pub verdict: CellVerdict,
     pub passed: bool,
@@ -605,9 +924,15 @@ pub struct CellOutcome {
     /// Whether the directory-tool recovery surface candidate was enabled
     /// for this cell (the isolation paired gate's only variable).
     pub recovery_surface: bool,
-    /// Whether the TASK PROGRESS model projection was enabled for this
-    /// cell (the convergence paired gate's only variable).
-    pub project_progress: bool,
+    /// Product TASK PROGRESS projection. This must be identical across a
+    /// settlement pair.
+    pub project_task_progress: bool,
+    /// Whether the neutral settlement node was projected. This is the
+    /// convergence paired gate's only treatment.
+    pub project_settlement: bool,
+    /// Common causal-diagnostic configuration. This must be identical in a
+    /// pair and remains false outside the isolated convergence runner.
+    pub settlement_projection_diagnostics: bool,
     /// Offered opportunity keys, in arrival order across both phases.
     pub opportunity_offers: Vec<String>,
     /// The model called `task.complete` after an offer was live.
@@ -623,6 +948,7 @@ pub struct CellOutcome {
     pub settlement_episode_rounds: u64,
     pub settlement_episode_calls: u64,
     pub settlement_episode_failures: u64,
+    pub settlement_episode_terminals: BTreeMap<crate::metrics::SettlementEpisodeTerminal, u64>,
 }
 
 impl CellOutcome {
@@ -631,12 +957,17 @@ impl CellOutcome {
         mode: PilotMode,
         acceptance_profile: AcceptanceProfile,
         switches: CellSwitches,
+        identity: CellEvidenceIdentity,
         wall_ms: u64,
         failure: CellFailure,
     ) -> Self {
         Self {
             pack_id,
             mode,
+            identity,
+            runtime_task_id: None,
+            model_requests: ModelRequestDigest::default(),
+            evidence_dir: None,
             acceptance_profile,
             verdict: CellVerdict::NotRun,
             passed: false,
@@ -671,12 +1002,15 @@ impl CellOutcome {
             opportunity_offers: Vec::new(),
             opportunity_called: false,
             recovery_surface: switches.recovery_surface,
-            project_progress: switches.project_progress,
+            project_task_progress: switches.project_task_progress,
+            project_settlement: switches.project_settlement,
+            settlement_projection_diagnostics: switches.settlement_projection_diagnostics,
             settlement_seen: false,
             settlement_episodes: 0,
             settlement_episode_rounds: 0,
             settlement_episode_calls: 0,
             settlement_episode_failures: 0,
+            settlement_episode_terminals: BTreeMap::new(),
         }
     }
 
@@ -701,6 +1035,15 @@ impl CellOutcome {
         } else {
             " recovery=off"
         };
+        let projection = format!(
+            " task_progress={} settlement_projection={}",
+            if self.project_task_progress {
+                "on"
+            } else {
+                "off"
+            },
+            if self.project_settlement { "on" } else { "off" }
+        );
         let settlement = if self.settlement_seen {
             format!(
                 " settled=seen episodes={} episode_rounds={} episode_calls={} episode_failures={}",
@@ -713,7 +1056,7 @@ impl CellOutcome {
             " settled=none".to_string()
         };
         format!(
-            "{} {:<6} {} profile={} behavior={} diff={} closure={} continuation={} provider={} rounds={}+{} resumes={} durables={}{}{}{}{}{}",
+            "{} {:<6} {} profile={} behavior={} diff={} closure={} continuation={} provider={} rounds={}+{} resumes={} durables={}{}{}{}{}{}{}",
             self.pack_id,
             self.mode.id(),
             status,
@@ -730,6 +1073,7 @@ impl CellOutcome {
             trigger,
             opp,
             recovery,
+            projection,
             settlement,
             self.error
                 .as_ref()
@@ -1087,15 +1431,14 @@ async fn compose_cell(
     model: Arc<dyn ModelTransport>,
     engine: Arc<dyn ContextEngine>,
     switches: CellSwitches,
-    pack: &PackSpec,
+    verification_recipes: &tool_runtime::VerificationRecipes,
 ) -> anyhow::Result<agent_compose::ComposedRuntime> {
     let workspace = agent_workspace::Workspace::open(root).await?;
-    let verification_recipes = pilot_verification_recipes((pack.exact_recipe_inputs)());
     let tools: Arc<dyn ToolDispatcher> = Arc::new(
         tool_runtime::BuiltinToolDispatcher::with_config_and_verification_recipes(
             workspace.clone(),
             tool_runtime::ToolLifecycleConfig::default(),
-            verification_recipes.clone(),
+            (*verification_recipes).clone(),
         ),
     );
     let composed = agent_compose::compose(agent_compose::ComposeConfig {
@@ -1112,12 +1455,14 @@ async fn compose_cell(
         artifact_store: Some(Arc::new(workspace.clone())),
         output_broker: None,
         max_tool_rounds: Some(LIVE_MAX_MODEL_ROUNDS as usize),
-        project_task_progress: switches.project_progress,
+        project_task_progress: switches.project_task_progress,
+        project_settlement: switches.project_settlement,
+        settlement_projection_diagnostics: switches.settlement_projection_diagnostics,
         project_completion_opportunity: switches.opportunity,
         recovery_surface: switches.recovery_surface,
         host_policies: Some(Arc::new(
             agent_compose::HostToolPolicyRegistry::with_builtins_and_verification(
-                &verification_recipes,
+                verification_recipes,
             )
             .map_err(anyhow::Error::msg)?,
         )),
@@ -1144,7 +1489,10 @@ fn c_engine(model: Arc<dyn ModelTransport>) -> Arc<dyn ContextEngine> {
 /// opportunity candidate's fail-closed precondition is unreachable (see
 /// opportunity-gate REPORT, attempt 1). The set is identical across off/on
 /// arms; the switch remains the only paired variable.
-fn pilot_verification_recipes(exact_inputs: Vec<String>) -> tool_runtime::VerificationRecipes {
+fn pilot_verification_recipes(
+    exact_inputs: Vec<String>,
+    acceptance_domain: Option<&str>,
+) -> tool_runtime::VerificationRecipes {
     let mut recipes = Vec::new();
     // Mirror of discovery for a Cargo workspace fixture.
     if let Ok(recipe) = tool_runtime::VerificationRecipe::new(
@@ -1160,7 +1508,7 @@ fn pilot_verification_recipes(exact_inputs: Vec<String>) -> tool_runtime::Verifi
     // inputs are exactly the seed-guaranteed files; content changes create a
     // new exact world.
     if !exact_inputs.is_empty() {
-        let exact = tool_runtime::VerificationRecipe::new(
+        let mut exact = tool_runtime::VerificationRecipe::new(
             "jobrunner.exact",
             "Exact-world jobrunner test suite (source-read-only)",
             "jobrunner-exact-v1",
@@ -1172,9 +1520,42 @@ fn pilot_verification_recipes(exact_inputs: Vec<String>) -> tool_runtime::Verifi
                 .with_exact_inputs(exact_inputs)
         })
         .expect("pilot exact recipe is valid");
+        if let Some(domain) = acceptance_domain {
+            exact = exact
+                .with_coverage_domain(domain)
+                .expect("pilot acceptance domain is valid");
+        }
         recipes.push(exact);
     }
-    tool_runtime::VerificationRecipes::new(recipes).expect("pilot recipe set is valid")
+    let recipes =
+        tool_runtime::VerificationRecipes::new(recipes).expect("pilot recipe set is valid");
+    if let Some(domain) = acceptance_domain {
+        recipes
+            .with_domains(vec![tool_runtime::VerificationCoverageDomain {
+                domain_id: domain.to_string(),
+                declaration_revision: 1,
+                members: vec!["jobrunner.exact".into()],
+            }])
+            .expect("pilot acceptance domain table is valid")
+    } else {
+        recipes
+    }
+}
+
+pub(crate) fn pack_verification_projection(
+    pack: &PackSpec,
+) -> (
+    tool_runtime::VerificationRecipes,
+    Option<VerificationCoverageDeclaration>,
+) {
+    let recipes = pilot_verification_recipes((pack.exact_recipe_inputs)(), pack.acceptance_domain);
+    let authority = pack.acceptance_domain.map(|domain| {
+        recipes
+            .coverage_declaration(domain)
+            .expect("pilot acceptance domain must have a host declaration")
+            .clone()
+    });
+    (recipes, authority)
 }
 
 /// Cold boundary: read the acknowledged safe-point artifact from the
@@ -1237,17 +1618,39 @@ pub async fn run_pack_cell(
     let CellSwitches {
         opportunity,
         recovery_surface,
-        project_progress,
+        project_task_progress,
+        project_settlement,
+        settlement_projection_diagnostics,
     } = switches;
+    // Construct the verifier authority once per cell. Both cold Runtime
+    // compositions, the task criterion, and the evidence identity consume
+    // this exact immutable projection rather than independently rebuilding
+    // lookalike declarations.
+    let (verification_recipes, acceptance_authority) = pack_verification_projection(pack);
+    let identity = CellEvidenceIdentity::capture(
+        pack,
+        pair,
+        switches,
+        acceptance_profile,
+        acceptance_authority.as_ref(),
+    );
+    let request_recorder = Arc::new(RecordingModelTransport::new(
+        model.clone(),
+        project_settlement,
+    ));
+    let runtime_model: Arc<dyn ModelTransport> = request_recorder.clone();
     let failed = |failure: CellFailure| {
-        CellOutcome::failed(
+        let mut outcome = CellOutcome::failed(
             pack.id,
             mode,
             acceptance_profile,
             switches,
+            identity.clone(),
             started.elapsed().as_millis() as u64,
             failure,
-        )
+        );
+        outcome.model_requests = request_recorder.snapshot();
+        outcome
     };
 
     if let Err(e) = (pack.seed)(root) {
@@ -1288,10 +1691,10 @@ pub async fn run_pack_cell(
     let mut checkpoint_task_id: Option<TaskId> = None;
     match compose_cell(
         root,
-        model.clone(),
+        runtime_model.clone(),
         c_engine(model.clone()),
         switches,
-        pack,
+        &verification_recipes,
     )
     .await
     {
@@ -1313,16 +1716,16 @@ pub async fn run_pack_cell(
                 // The task now exists and the actor is idle: patch the
                 // pack's declarative acceptance onto the anchor so the
                 // task-aware completion gate can arm in this live cell.
-                // The runtime binds the current trusted verification pass
-                // as the coverage claim; without a declaration nothing is
-                // patched and the gate stays fail-closed.
-                if let Some(declaration) = pack.acceptance_declaration {
-                    declare_acceptance(&handle, declaration)
+                // Only a later observed trusted PASS from the matching host
+                // domain may mint a receipt; without a declaration nothing
+                // is patched and the gate stays fail-closed.
+                if let (Some(declaration), Some(authority)) =
+                    (pack.acceptance_declaration, acceptance_authority.as_ref())
+                {
+                    declare_acceptance(&handle, declaration, authority)
                         .await
                         .map_err(|e| {
-                            CellFailure::runtime(format!(
-                                "acceptance declaration failed: {e:#}"
-                            ))
+                            CellFailure::runtime(format!("acceptance declaration failed: {e:#}"))
                         })?;
                 }
                 handle
@@ -1445,10 +1848,10 @@ pub async fn run_pack_cell(
                 } else {
                     match compose_cell(
                         root,
-                        model.clone(),
+                        runtime_model.clone(),
                         c_engine(model.clone()),
                         switches,
-                        pack,
+                        &verification_recipes,
                     )
                     .await
                     {
@@ -1660,50 +2063,67 @@ pub async fn run_pack_cell(
     // the outcome line and the evidence summary; `write_evidence` performs
     // its own aggregation for the full cell bundle.
     let metrics = crate::metrics::aggregate_metrics(&collector.events);
-    let outcome = CellOutcome {
-        pack_id: pack.id,
-        mode,
-        acceptance_profile,
-        verdict,
-        passed,
-        error,
-        error_class,
-        error_retryable,
-        wall_ms,
-        behavior,
-        observed_behavior,
-        diff: if diff_clean { "pass" } else { "fail" }.into(),
-        closure: closure.into(),
-        continuation,
-        exact_resume_tuple_matched,
-        restored: phase_two_restored,
-        continued: phase_two_continued,
-        turn_completed,
-        task_completed,
-        provider_health: if provider_failed {
-            "transport_failed".into()
-        } else {
-            "healthy".into()
-        },
-        self_check: self_check.into(),
-        resume_committed,
-        checkpoint_durable,
-        model_rounds_phase_one: rounds_one,
-        model_rounds_phase_two: rounds_two,
-        resume_trigger: trigger_tool,
-        diff_violations,
-        marker_violations,
-        opportunity,
-        recovery_surface,
-        project_progress,
-        opportunity_offers,
-        opportunity_called,
-        settlement_seen: metrics.settled_seen,
-        settlement_episodes: metrics.settlement_episodes,
-        settlement_episode_rounds: metrics.settlement_episode_rounds,
-        settlement_episode_calls: metrics.settlement_episode_calls,
-        settlement_episode_failures: metrics.settlement_episode_failures,
-    };
+    let outcome =
+        CellOutcome {
+            pack_id: pack.id,
+            mode,
+            identity,
+            runtime_task_id: collector.events.iter().rev().find_map(|envelope| {
+                match &envelope.event {
+                    RuntimeEvent::TaskCompleted { task_id, .. }
+                    | RuntimeEvent::TaskContinuationStarted { task_id, .. }
+                    | RuntimeEvent::TaskResumeCommitted { task_id, .. }
+                    | RuntimeEvent::FocusChanged { task_id, .. } => Some(*task_id),
+                    RuntimeEvent::UserMessageAccepted { input } => input.task_id,
+                    _ => None,
+                }
+            }),
+            model_requests: request_recorder.snapshot(),
+            evidence_dir: None,
+            acceptance_profile,
+            verdict,
+            passed,
+            error,
+            error_class,
+            error_retryable,
+            wall_ms,
+            behavior,
+            observed_behavior,
+            diff: if diff_clean { "pass" } else { "fail" }.into(),
+            closure: closure.into(),
+            continuation,
+            exact_resume_tuple_matched,
+            restored: phase_two_restored,
+            continued: phase_two_continued,
+            turn_completed,
+            task_completed,
+            provider_health: if provider_failed {
+                "transport_failed".into()
+            } else {
+                "healthy".into()
+            },
+            self_check: self_check.into(),
+            resume_committed,
+            checkpoint_durable,
+            model_rounds_phase_one: rounds_one,
+            model_rounds_phase_two: rounds_two,
+            resume_trigger: trigger_tool,
+            diff_violations,
+            marker_violations,
+            opportunity,
+            recovery_surface,
+            project_task_progress,
+            project_settlement,
+            settlement_projection_diagnostics,
+            opportunity_offers,
+            opportunity_called,
+            settlement_seen: metrics.settled_seen,
+            settlement_episodes: metrics.settlement_episodes,
+            settlement_episode_rounds: metrics.settlement_episode_rounds,
+            settlement_episode_calls: metrics.settlement_episode_calls,
+            settlement_episode_failures: metrics.settlement_episode_failures,
+            settlement_episode_terminals: metrics.settlement_episode_terminals,
+        };
     write_evidence(
         pair,
         root,
@@ -1725,11 +2145,12 @@ pub fn provider_transport_retryable(outcome: &CellOutcome) -> bool {
 
 /// Patch the pack's declarative acceptance criterion onto the active task
 /// between `set_focus` and the first user message. The actor is idle at
-/// that point, so the task-anchor CAS is allowed; the runtime then binds
-/// the current trusted verification pass as the coverage claim.
+/// that point, so the task-anchor CAS is allowed; Runtime can later mint a
+/// receipt only from a matching post-observation trusted PASS.
 async fn declare_acceptance(
     handle: &agent_runtime::RuntimeHandle,
     declaration: &'static str,
+    coverage_authority: &VerificationCoverageDeclaration,
 ) -> anyhow::Result<()> {
     let tasks = handle.list_tasks().await?;
     let task = tasks
@@ -1742,7 +2163,15 @@ async fn declare_acceptance(
             task.id,
             task.anchor_revision,
             agent_runtime::task::AnchorPatch {
-                acceptance_criteria: Some(vec![declaration.to_string()]),
+                completion_policy: Some(
+                    agent_runtime::task::TaskCompletionPolicy::EvidenceRequired,
+                ),
+                acceptance_criteria: Some(vec![
+                    agent_runtime::task::AcceptanceCriterion::declared(
+                        declaration,
+                        coverage_authority,
+                    ),
+                ]),
                 ..agent_runtime::task::AnchorPatch::default()
             },
         )
@@ -1781,7 +2210,7 @@ pub async fn run_pack_cell_retrying(
             repeats,
             true,
         );
-        let outcome = run_pack_cell(
+        let mut outcome = run_pack_cell(
             pack,
             mode,
             &pair,
@@ -1791,8 +2220,10 @@ pub async fn run_pack_cell_retrying(
             acceptance_profile,
         )
         .await?;
+        let cell_dir = pair.cell_dir("dynamic");
+        outcome.evidence_dir = Some(cell_dir.clone());
         println!("{}", outcome.render_line());
-        match crate::bundle::render_evidence(&pair.cell_dir("dynamic")) {
+        match crate::bundle::render_evidence(&cell_dir) {
             Ok(rendered) => println!("{rendered}"),
             Err(error) => eprintln!("warning: evidence render failed: {error}"),
         }
@@ -1864,6 +2295,20 @@ fn write_evidence(
     let dimensions = serde_json::json!({
         "schema": PILOT_SCHEMA,
         "pack_id": pack.id,
+        "candidate_id": outcome.identity.candidate_id,
+        "source_tree_digest": outcome.identity.source_tree_digest,
+        "fixture_sha256": outcome.identity.fixture_sha256,
+        "repeat": outcome.identity.repeat,
+        "tool_surface": outcome.identity.tool_surface,
+        "surface_config_digest": outcome.identity.surface_config_digest,
+        "prompt_config_digest": outcome.identity.prompt_config_digest,
+        "acceptance_domain": outcome.identity.acceptance_domain,
+        "acceptance_declaration_revision": outcome.identity.acceptance_declaration_revision,
+        "acceptance_source_digest": outcome.identity.acceptance_source_digest,
+        "provider_config_digest": outcome.identity.provider_config_digest,
+        "settlement_projection_diagnostics": outcome.settlement_projection_diagnostics,
+        "runtime_task_id": outcome.runtime_task_id,
+        "model_requests": outcome.model_requests,
         "mode": outcome.mode.id(),
         "acceptance_profile": outcome.acceptance_profile.id(),
         "verdict": outcome.verdict.id(),
@@ -1896,6 +2341,12 @@ fn write_evidence(
         // Directory-tool admission gate bookkeeping: the candidate switch
         // is the only variable between the two paired arms.
         "recovery_surface": if outcome.recovery_surface { "on" } else { "off" },
+        // Product/eval surface identity. These are separate so a settlement
+        // experiment cannot silently remove TaskProgress or checked-file GC
+        // projection from one arm.
+        "project_task_progress": outcome.project_task_progress,
+        "project_settlement": outcome.project_settlement,
+        "settlement_episode_terminals": outcome.settlement_episode_terminals,
     });
     let dimensions_path = pair.cell_dir("dynamic").join("dimensions.json");
     std::fs::write(&dimensions_path, serde_json::to_vec_pretty(&dimensions)?)?;
@@ -2211,17 +2662,18 @@ pub fn spec_sha256() -> String {
 }
 
 /// Judgment of the convergence paired gate. Both arms run the same
-/// source, pack, serving, mode and repeat; only the model projection
-/// switch differs. Zero on-arm exposure is inconclusive, never a pass.
+/// source, pack, serving, mode and repeat with product TaskProgress enabled;
+/// only the neutral settlement-node projection differs. Any planned pair
+/// without exposure is inconclusive, never silently selected out as a pass.
 /// Promotion requires behavior/diff/resume parity, no lost unfinished
 /// work, strictly lower candidate-episode rounds and calls, and no new
 /// maximum episode or whole-cell tail.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ConvGateJudgment {
-    /// pass | fail | inconclusive
+    /// pass | invalid | inconclusive | fail
     pub state: &'static str,
     pub reasons: Vec<String>,
-    /// Per-mode median/overall exposure and episode facts for the report.
+    /// Per-mode center/overall exposure and episode facts for the report.
     pub off_cells: usize,
     pub off_exposed: usize,
     pub on_cells: usize,
@@ -2230,7 +2682,10 @@ pub struct ConvGateJudgment {
 
 impl ConvGateJudgment {
     pub fn render(&self) -> String {
-        let mut out = format!("convergence gate: {} (off={} on={})", self.state, self.off_cells, self.on_cells);
+        let mut out = format!(
+            "convergence gate: {} (off={} on={})",
+            self.state, self.off_cells, self.on_cells
+        );
         for reason in &self.reasons {
             out.push_str("\n  - ");
             out.push_str(reason);
@@ -2239,42 +2694,478 @@ impl ConvGateJudgment {
     }
 }
 
-/// Evaluate the paired conv gate from outcome lists: one off and one on
-/// outcome per (mode, repeat), in the same order. Pure and deterministic
-/// so the gate decision can be tested without a live run. Per-pair
-/// settlement exposure must match (the label derives regardless of the
-/// switch), and episode efficiency compares only the cells that actually
-/// saw a settled candidate.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+struct ConvPairKey {
+    candidate_id: String,
+    source_tree_digest: String,
+    pack_id: String,
+    fixture_sha256: String,
+    mode: PilotMode,
+    repeat: u32,
+    acceptance_domain: String,
+    acceptance_declaration_revision: u64,
+    acceptance_source_digest: String,
+    provider_config_digest: String,
+    settlement_projection_diagnostics: bool,
+}
+
+impl ConvPairKey {
+    fn label(&self) -> String {
+        fn short(value: &str) -> &str {
+            value.get(..12).unwrap_or(value)
+        }
+        format!(
+            "{}/{} r{} source={} acceptance={}@{}:{} provider={}",
+            self.pack_id,
+            self.mode.id(),
+            self.repeat,
+            short(&self.source_tree_digest),
+            self.acceptance_domain,
+            self.acceptance_declaration_revision,
+            short(&self.acceptance_source_digest),
+            short(&self.provider_config_digest),
+        )
+    }
+}
+
+#[derive(Default)]
+struct ConvPairArms<'a> {
+    off: Vec<&'a CellOutcome>,
+    on: Vec<&'a CellOutcome>,
+}
+
+fn conv_pair_key(cell: &CellOutcome) -> Result<ConvPairKey, String> {
+    let identity = &cell.identity;
+    let source_tree_digest = identity
+        .source_tree_digest
+        .as_deref()
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| {
+            format!(
+                "{}/{} r{} has no source-tree digest",
+                cell.pack_id,
+                cell.mode.id(),
+                identity.repeat
+            )
+        })?;
+    let acceptance_domain = identity
+        .acceptance_domain
+        .as_deref()
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| {
+            format!(
+                "{}/{} r{} has no acceptance-domain identity",
+                cell.pack_id,
+                cell.mode.id(),
+                identity.repeat
+            )
+        })?;
+    let acceptance_declaration_revision = identity
+        .acceptance_declaration_revision
+        .filter(|revision| *revision > 0)
+        .ok_or_else(|| {
+            format!(
+                "{}/{} r{} has no acceptance declaration revision",
+                cell.pack_id,
+                cell.mode.id(),
+                identity.repeat
+            )
+        })?;
+    let acceptance_source_digest = identity
+        .acceptance_source_digest
+        .as_deref()
+        .filter(|digest| digest.parse::<agent_contracts::ContentDigest>().is_ok())
+        .ok_or_else(|| {
+            format!(
+                "{}/{} r{} has no valid acceptance source digest",
+                cell.pack_id,
+                cell.mode.id(),
+                identity.repeat
+            )
+        })?;
+    if identity.candidate_id != CONVERGENCE_CANDIDATE_ID {
+        return Err(format!(
+            "{}/{} r{} has candidate {:?}, expected {CONVERGENCE_CANDIDATE_ID:?}",
+            cell.pack_id,
+            cell.mode.id(),
+            identity.repeat,
+            identity.candidate_id
+        ));
+    }
+    if identity.fixture_sha256.is_empty()
+        || identity.provider_config_digest.is_empty()
+        || identity.surface_config_digest.is_empty()
+        || identity.prompt_config_digest.is_empty()
+        || identity.repeat == 0
+    {
+        return Err(format!(
+            "{}/{} has incomplete fixture/repeat/provider/surface/prompt identity",
+            cell.pack_id,
+            cell.mode.id()
+        ));
+    }
+    if identity.tool_surface != PRODUCT_TOOL_SURFACE {
+        return Err(format!(
+            "{}/{} r{} used tool surface {:?}, expected {PRODUCT_TOOL_SURFACE:?}",
+            cell.pack_id,
+            cell.mode.id(),
+            identity.repeat,
+            identity.tool_surface
+        ));
+    }
+    if identity.settlement_projection_diagnostics != cell.settlement_projection_diagnostics {
+        return Err(format!(
+            "{}/{} r{} has inconsistent diagnostic identity {}/{}",
+            cell.pack_id,
+            cell.mode.id(),
+            identity.repeat,
+            identity.settlement_projection_diagnostics,
+            cell.settlement_projection_diagnostics
+        ));
+    }
+    if !identity.settlement_projection_diagnostics {
+        return Err(format!(
+            "{}/{} r{} did not enable the common causal diagnostic envelope",
+            cell.pack_id,
+            cell.mode.id(),
+            identity.repeat
+        ));
+    }
+    Ok(ConvPairKey {
+        candidate_id: identity.candidate_id.clone(),
+        source_tree_digest: source_tree_digest.to_string(),
+        pack_id: cell.pack_id.to_string(),
+        fixture_sha256: identity.fixture_sha256.clone(),
+        mode: cell.mode,
+        repeat: identity.repeat,
+        acceptance_domain: acceptance_domain.to_string(),
+        acceptance_declaration_revision,
+        acceptance_source_digest: acceptance_source_digest.to_string(),
+        provider_config_digest: identity.provider_config_digest.clone(),
+        settlement_projection_diagnostics: identity.settlement_projection_diagnostics,
+    })
+}
+
+fn center_twice(samples: &[u64]) -> Option<u128> {
+    if samples.is_empty() {
+        return None;
+    }
+    let mut sorted = samples.to_vec();
+    sorted.sort_unstable();
+    let middle = sorted.len() / 2;
+    if sorted.len().is_multiple_of(2) {
+        Some(u128::from(sorted[middle - 1]) + u128::from(sorted[middle]))
+    } else {
+        Some(u128::from(sorted[middle]) * 2)
+    }
+}
+
+fn render_half(value_twice: u128) -> String {
+    if value_twice.is_multiple_of(2) {
+        (value_twice / 2).to_string()
+    } else {
+        format!("{}.5", value_twice / 2)
+    }
+}
+
+/// Bounded report rendering for exact observations plus an arithmetic center.
+/// With two repeats this deliberately says `midpoint`, not `median`: the old
+/// nearest-rank p50 selected the upper observation and overstated certainty.
+pub fn render_sample_center(samples: &[u64]) -> String {
+    const SAMPLE_RENDER_CAP: usize = 16;
+    if samples.is_empty() {
+        return "unavailable".into();
+    }
+    let mut sorted = samples.to_vec();
+    sorted.sort_unstable();
+    let shown: Vec<u64> = sorted.iter().take(SAMPLE_RENDER_CAP).copied().collect();
+    let suffix = if sorted.len() > shown.len() {
+        format!(" (+{} omitted)", sorted.len() - shown.len())
+    } else {
+        String::new()
+    };
+    let center = render_half(center_twice(&sorted).unwrap_or(0));
+    match sorted.len() {
+        1 => format!("observation={shown:?}{suffix} center={center}"),
+        2 => format!("observations={shown:?}{suffix} midpoint={center}"),
+        _ => format!("observations={shown:?}{suffix} median={center}"),
+    }
+}
+
+/// Evaluate the paired convergence gate from an unordered outcome set. Arms
+/// are joined by stable logical identity, never by vector order or runtime
+/// `TaskId`. Every key must have exactly one settlement-off and one
+/// settlement-on cell; missing, duplicate, or identity-mismatched cells fail
+/// closed. Per-pair settlement exposure must match, and episode efficiency
+/// compares only cells that actually saw a settled candidate.
 pub fn evaluate_conv_gate(outcomes: &[CellOutcome]) -> ConvGateJudgment {
+    const MAX_GATE_CELLS: usize = 2 * 2 * 4;
+    let invalid_surface = outcomes
+        .iter()
+        .filter(|cell| !cell.project_task_progress)
+        .count();
     let off: Vec<&CellOutcome> = outcomes
         .iter()
-        .filter(|cell| !cell.project_progress)
+        .filter(|cell| !cell.project_settlement)
         .collect();
     let on: Vec<&CellOutcome> = outcomes
         .iter()
-        .filter(|cell| cell.project_progress)
+        .filter(|cell| cell.project_settlement)
         .collect();
-    let mut reasons = Vec::new();
+    let mut invalidities = Vec::new();
+    let mut failures = Vec::new();
 
-    if on.is_empty() || off.is_empty() {
-        reasons.push("one arm produced no outcomes; the pair is not comparable".into());
+    if outcomes.len() > MAX_GATE_CELLS {
         return ConvGateJudgment {
-            state: "inconclusive",
+            state: "invalid",
             off_cells: off.len(),
             off_exposed: off.iter().filter(|cell| cell.settlement_seen).count(),
             on_cells: on.len(),
             on_exposed: on.iter().filter(|cell| cell.settlement_seen).count(),
-            reasons,
+            reasons: vec![format!(
+                "gate received {} cells, exceeding the declared {MAX_GATE_CELLS}-cell bound",
+                outcomes.len()
+            )],
         };
     }
 
-    // Zero on-arm exposure: with no candidate event the convergence path
-    // never armed, so no episode comparison is meaningful.
+    if invalid_surface > 0 {
+        invalidities.push(format!(
+            "{invalid_surface} cell(s) disabled product TaskProgress; settlement is not the isolated treatment"
+        ));
+        return ConvGateJudgment {
+            state: "invalid",
+            off_cells: off.len(),
+            off_exposed: off.iter().filter(|cell| cell.settlement_seen).count(),
+            on_cells: on.len(),
+            on_exposed: on.iter().filter(|cell| cell.settlement_seen).count(),
+            reasons: invalidities,
+        };
+    }
+
+    let mut keyed: BTreeMap<ConvPairKey, ConvPairArms<'_>> = BTreeMap::new();
+    for cell in outcomes {
+        match conv_pair_key(cell) {
+            Ok(key) => {
+                let arms = keyed.entry(key).or_default();
+                if cell.project_settlement {
+                    arms.on.push(cell);
+                } else {
+                    arms.off.push(cell);
+                }
+            }
+            Err(reason) => invalidities.push(reason),
+        }
+    }
+    if keyed.is_empty() && invalidities.is_empty() {
+        invalidities.push("no cells were supplied; no stable pair can be formed".into());
+    }
+
+    let mut pairs = Vec::new();
+    for (key, arms) in &keyed {
+        if arms.off.len() != 1 || arms.on.len() != 1 {
+            invalidities.push(format!(
+                "pair {} requires exactly one off and one on cell, found off={} on={}",
+                key.label(),
+                arms.off.len(),
+                arms.on.len()
+            ));
+            continue;
+        }
+        pairs.push((key, arms.off[0], arms.on[0]));
+    }
+    if !invalidities.is_empty() {
+        return ConvGateJudgment {
+            state: "invalid",
+            off_cells: off.len(),
+            off_exposed: off.iter().filter(|cell| cell.settlement_seen).count(),
+            on_cells: on.len(),
+            on_exposed: on.iter().filter(|cell| cell.settlement_seen).count(),
+            reasons: invalidities,
+        };
+    }
+
+    // Mandatory parity after identity join. Only project_settlement may
+    // differ; diagnostic marker shape remains observational below.
+    for (key, off_cell, on_cell) in &pairs {
+        let label = key.label();
+        if off_cell.acceptance_profile != on_cell.acceptance_profile {
+            invalidities.push(format!(
+                "pair {label}: acceptance profile {}/{}",
+                off_cell.acceptance_profile.id(),
+                on_cell.acceptance_profile.id()
+            ));
+        }
+        if off_cell.opportunity != on_cell.opportunity {
+            invalidities.push(format!(
+                "pair {label}: completion-opportunity switch {}/{}",
+                off_cell.opportunity, on_cell.opportunity
+            ));
+        }
+        if off_cell.recovery_surface != on_cell.recovery_surface {
+            invalidities.push(format!(
+                "pair {label}: recovery-surface switch {}/{}",
+                off_cell.recovery_surface, on_cell.recovery_surface
+            ));
+        }
+        if off_cell.project_task_progress != on_cell.project_task_progress {
+            invalidities.push(format!(
+                "pair {label}: TaskProgress switch {}/{}",
+                off_cell.project_task_progress, on_cell.project_task_progress
+            ));
+        }
+        if off_cell.identity.tool_surface != on_cell.identity.tool_surface
+            || off_cell.identity.surface_config_digest != on_cell.identity.surface_config_digest
+        {
+            invalidities.push(format!("pair {label}: tool-surface identity mismatch"));
+        }
+        if off_cell.identity.prompt_config_digest != on_cell.identity.prompt_config_digest {
+            invalidities.push(format!("pair {label}: prompt-baseline identity mismatch"));
+        }
+        if off_cell.model_requests.capture_truncated || on_cell.model_requests.capture_truncated {
+            invalidities.push(format!(
+                "pair {label}: model-request capture truncated off={} on={}",
+                off_cell.model_requests.capture_truncated, on_cell.model_requests.capture_truncated
+            ));
+        }
+        if off_cell.behavior != on_cell.behavior {
+            failures.push(format!(
+                "pair {label}: behavior {}/{}",
+                off_cell.behavior, on_cell.behavior
+            ));
+        }
+        if off_cell.diff != on_cell.diff {
+            failures.push(format!(
+                "pair {label}: diff {}/{}",
+                off_cell.diff, on_cell.diff
+            ));
+        }
+        if off_cell.closure != on_cell.closure {
+            failures.push(format!(
+                "pair {label}: closure {}/{}",
+                off_cell.closure, on_cell.closure
+            ));
+        }
+        if off_cell.continuation != on_cell.continuation {
+            failures.push(format!(
+                "pair {label}: continuation {}/{}",
+                off_cell.continuation, on_cell.continuation
+            ));
+        }
+        if off_cell.self_check != on_cell.self_check {
+            failures.push(format!(
+                "pair {label}: self_check {}/{}",
+                off_cell.self_check, on_cell.self_check
+            ));
+        }
+        if off_cell.passed != on_cell.passed {
+            failures.push(format!(
+                "pair {label}: verdict {}/{}",
+                off_cell.passed, on_cell.passed
+            ));
+        }
+        if !off_cell.passed || !on_cell.passed {
+            failures.push(format!(
+                "pair {label}: mandatory cell success is not true in both arms"
+            ));
+        }
+        if off_cell.settlement_seen != on_cell.settlement_seen {
+            invalidities.push(format!(
+                "pair {label}: settlement exposure {}/{}",
+                off_cell.settlement_seen, on_cell.settlement_seen
+            ));
+        }
+        if off_cell.settlement_seen && on_cell.settlement_seen {
+            if off_cell.model_requests.settlement_audits == 0
+                || on_cell.model_requests.settlement_audits == 0
+            {
+                invalidities.push(format!(
+                    "pair {label}: settled exposure lacks a live same-state request audit off={} on={}",
+                    off_cell.model_requests.settlement_audits,
+                    on_cell.model_requests.settlement_audits
+                ));
+            }
+            if off_cell.model_requests.settlement_audit_invalid > 0
+                || on_cell.model_requests.settlement_audit_invalid > 0
+            {
+                invalidities.push(format!(
+                    "pair {label}: invalid live settlement request audit off={} on={}",
+                    off_cell.model_requests.settlement_audit_invalid,
+                    on_cell.model_requests.settlement_audit_invalid
+                ));
+            }
+            if off_cell
+                .model_requests
+                .first_settlement_normalized_prompt_digest
+                != on_cell
+                    .model_requests
+                    .first_settlement_normalized_prompt_digest
+            {
+                invalidities.push(format!(
+                    "pair {label}: first exposed request differs after removing the treatment line"
+                ));
+            }
+            if off_cell.model_requests.first_settlement_tool_surface_digest
+                != on_cell.model_requests.first_settlement_tool_surface_digest
+            {
+                invalidities.push(format!(
+                    "pair {label}: first exposed tool-surface digest differs"
+                ));
+            }
+            if off_cell
+                .model_requests
+                .first_settlement_normalized_prompt_digest
+                .is_none()
+                || off_cell
+                    .model_requests
+                    .first_settlement_tool_surface_digest
+                    .is_none()
+            {
+                invalidities.push(format!(
+                    "pair {label}: first exposed normalized request identity is missing"
+                ));
+            }
+        }
+        if !off_cell.diff_violations.is_empty() || !on_cell.diff_violations.is_empty() {
+            failures.push(format!(
+                "pair {label}: diff violations off={} on={}",
+                off_cell.diff_violations.len(),
+                on_cell.diff_violations.len()
+            ));
+        }
+    }
+    if !invalidities.is_empty() {
+        let on_exposed = on.iter().filter(|cell| cell.settlement_seen).count();
+        return ConvGateJudgment {
+            state: "invalid",
+            off_cells: off.len(),
+            off_exposed: off.iter().filter(|cell| cell.settlement_seen).count(),
+            on_cells: on.len(),
+            on_exposed,
+            reasons: invalidities,
+        };
+    }
+    if !failures.is_empty() {
+        let on_exposed = on.iter().filter(|cell| cell.settlement_seen).count();
+        return ConvGateJudgment {
+            state: "fail",
+            off_cells: off.len(),
+            off_exposed: off.iter().filter(|cell| cell.settlement_seen).count(),
+            on_cells: on.len(),
+            on_exposed,
+            reasons: failures,
+        };
+    }
+
+    // Every planned pair must reach the pre-treatment settlement candidate.
+    // A partial sample is not a smaller valid sample: selecting only the
+    // exposed cells would bias the paired experiment. Identity and parity
+    // were validated above, so incomplete exposure is inconclusive.
     let on_exposed = on.iter().filter(|cell| cell.settlement_seen).count();
-    if on_exposed == 0 {
-        reasons.push(format!(
-            "zero on-arm exposure ({} cell(s)); gate is inconclusive, never a pass",
-            on.len()
+    if on_exposed != on.len() {
+        failures.push(format!(
+            "incomplete paired exposure ({on_exposed}/{} on-arm cell(s) exposed); gate is inconclusive, never a pass",
+            on.len(),
         ));
         return ConvGateJudgment {
             state: "inconclusive",
@@ -2282,108 +3173,23 @@ pub fn evaluate_conv_gate(outcomes: &[CellOutcome]) -> ConvGateJudgment {
             off_exposed: off.iter().filter(|cell| cell.settlement_seen).count(),
             on_cells: on.len(),
             on_exposed,
-            reasons,
+            reasons: failures,
         };
     }
 
-    // Mandatory parity per pair (same mode + repeat order): behavior,
-    // diff, closure, resume continuation, self-check, passed verdict.
-    for (index, (off_cell, on_cell)) in off.iter().zip(&on).enumerate() {
-        if off_cell.mode != on_cell.mode {
-            reasons.push(format!("pair {index}: arm mode mismatch ({} vs {})", off_cell.mode.id(), on_cell.mode.id()));
-        }
-        if off_cell.behavior != on_cell.behavior {
-            reasons.push(format!(
-                "pair {index} ({}): behavior {}/{}",
-                off_cell.mode.id(),
-                off_cell.behavior,
-                on_cell.behavior
-            ));
-        }
-        if off_cell.diff != on_cell.diff {
-            reasons.push(format!(
-                "pair {index} ({}): diff {}/{}",
-                off_cell.mode.id(),
-                off_cell.diff,
-                on_cell.diff
-            ));
-        }
-        if off_cell.closure != on_cell.closure {
-            reasons.push(format!(
-                "pair {index} ({}): closure {}/{}",
-                off_cell.mode.id(),
-                off_cell.closure,
-                on_cell.closure
-            ));
-        }
-        if off_cell.continuation != on_cell.continuation {
-            reasons.push(format!(
-                "pair {index} ({}): continuation {}/{}",
-                off_cell.mode.id(),
-                off_cell.continuation,
-                on_cell.continuation
-            ));
-        }
-        if off_cell.self_check != on_cell.self_check {
-            reasons.push(format!(
-                "pair {index} ({}): self_check {}/{}",
-                off_cell.mode.id(),
-                off_cell.self_check,
-                on_cell.self_check
-            ));
-        }
-        if off_cell.passed != on_cell.passed {
-            reasons.push(format!(
-                "pair {index} ({}): verdict {}/{}",
-                off_cell.mode.id(),
-                off_cell.passed,
-                on_cell.passed
-            ));
-        }
-        if off_cell.settlement_seen != on_cell.settlement_seen {
-            reasons.push(format!(
-                "pair {index} ({}): settlement exposure {}/{}",
-                off_cell.mode.id(),
-                off_cell.settlement_seen,
-                on_cell.settlement_seen
-            ));
-        }
-        if !off_cell.diff_violations.is_empty() || !on_cell.diff_violations.is_empty() {
-            reasons.push(format!(
-                "pair {index} ({}): diff violations off={} on={}",
-                off_cell.mode.id(),
-                off_cell.diff_violations.len(),
-                on_cell.diff_violations.len()
-            ));
-        }
-        if !off_cell.marker_violations.is_empty() || !on_cell.marker_violations.is_empty() {
-            reasons.push(format!(
-                "pair {index} ({}): marker violations off={} on={}",
-                off_cell.mode.id(),
-                off_cell.marker_violations.len(),
-                on_cell.marker_violations.len()
-            ));
-        }
-    }
-    if !reasons.is_empty() {
-        return ConvGateJudgment {
-            state: "fail",
-            off_cells: off.len(),
-            off_exposed: off.iter().filter(|cell| cell.settlement_seen).count(),
-            on_cells: on.len(),
-            on_exposed,
-            reasons,
-        };
+    let mut reasons = Vec::new();
+    let marker_off: usize = off.iter().map(|cell| cell.marker_violations.len()).sum();
+    let marker_on: usize = on.iter().map(|cell| cell.marker_violations.len()).sum();
+    if marker_off > 0 || marker_on > 0 {
+        reasons.push(format!(
+            "observational marker-shape counts off={marker_off} on={marker_on} (not a gate)"
+        ));
     }
 
     // Efficiency: lower candidate-episode rounds and calls, and no new
     // maximum episode or whole-cell tail. Episode metrics count only the
     // cells that saw a settled candidate; whole-cell tails count every
     // cell of the arm.
-    let med = |values: &mut Vec<u64>| {
-        values.sort_unstable();
-        crate::checked_percentile(values, 50).unwrap_or(0)
-    };
     fn exposed<'a>(cells: &'a [&'a CellOutcome]) -> Vec<&'a CellOutcome> {
         cells
             .iter()
@@ -2391,10 +3197,22 @@ pub fn evaluate_conv_gate(outcomes: &[CellOutcome]) -> ConvGateJudgment {
             .filter(|cell| cell.settlement_seen)
             .collect()
     }
-    let mut off_episode_rounds: Vec<u64> = exposed(&off).iter().map(|cell| cell.settlement_episode_rounds).collect();
-    let mut on_episode_rounds: Vec<u64> = exposed(&on).iter().map(|cell| cell.settlement_episode_rounds).collect();
-    let mut off_episode_calls: Vec<u64> = exposed(&off).iter().map(|cell| cell.settlement_episode_calls).collect();
-    let mut on_episode_calls: Vec<u64> = exposed(&on).iter().map(|cell| cell.settlement_episode_calls).collect();
+    let off_episode_rounds: Vec<u64> = exposed(&off)
+        .iter()
+        .map(|cell| cell.settlement_episode_rounds)
+        .collect();
+    let on_episode_rounds: Vec<u64> = exposed(&on)
+        .iter()
+        .map(|cell| cell.settlement_episode_rounds)
+        .collect();
+    let off_episode_calls: Vec<u64> = exposed(&off)
+        .iter()
+        .map(|cell| cell.settlement_episode_calls)
+        .collect();
+    let on_episode_calls: Vec<u64> = exposed(&on)
+        .iter()
+        .map(|cell| cell.settlement_episode_calls)
+        .collect();
     let off_whole_tail: Vec<u64> = off
         .iter()
         .map(|cell| u64::from(cell.model_rounds_phase_one + cell.model_rounds_phase_two))
@@ -2403,23 +3221,64 @@ pub fn evaluate_conv_gate(outcomes: &[CellOutcome]) -> ConvGateJudgment {
         .iter()
         .map(|cell| u64::from(cell.model_rounds_phase_one + cell.model_rounds_phase_two))
         .collect();
-    let off_med_rounds = med(&mut off_episode_rounds);
-    let on_med_rounds = med(&mut on_episode_rounds);
-    let off_med_calls = med(&mut off_episode_calls);
-    let on_med_calls = med(&mut on_episode_calls);
+    let off_center_rounds = center_twice(&off_episode_rounds).unwrap_or(0);
+    let on_center_rounds = center_twice(&on_episode_rounds).unwrap_or(0);
+    let off_center_calls = center_twice(&off_episode_calls).unwrap_or(0);
+    let on_center_calls = center_twice(&on_episode_calls).unwrap_or(0);
     let off_max_rounds = off_episode_rounds.iter().copied().max().unwrap_or(0);
     let on_max_rounds = on_episode_rounds.iter().copied().max().unwrap_or(0);
     let off_max_whole = off_whole_tail.iter().copied().max().unwrap_or(0);
     let on_max_whole = on_whole_tail.iter().copied().max().unwrap_or(0);
 
+    for mode in [PilotMode::Normal, PilotMode::Resume] {
+        let mode_pairs: Vec<_> = pairs
+            .iter()
+            .filter(|(key, _, _)| key.mode == mode)
+            .collect();
+        if mode_pairs.is_empty() {
+            continue;
+        }
+        let off_rounds: Vec<u64> = mode_pairs
+            .iter()
+            .filter(|(_, off_cell, _)| off_cell.settlement_seen)
+            .map(|(_, off_cell, _)| off_cell.settlement_episode_rounds)
+            .collect();
+        let on_rounds: Vec<u64> = mode_pairs
+            .iter()
+            .filter(|(_, _, on_cell)| on_cell.settlement_seen)
+            .map(|(_, _, on_cell)| on_cell.settlement_episode_rounds)
+            .collect();
+        let off_calls: Vec<u64> = mode_pairs
+            .iter()
+            .filter(|(_, off_cell, _)| off_cell.settlement_seen)
+            .map(|(_, off_cell, _)| off_cell.settlement_episode_calls)
+            .collect();
+        let on_calls: Vec<u64> = mode_pairs
+            .iter()
+            .filter(|(_, _, on_cell)| on_cell.settlement_seen)
+            .map(|(_, _, on_cell)| on_cell.settlement_episode_calls)
+            .collect();
+        reasons.push(format!(
+            "{} episode rounds off {}; on {}; calls off {}; on {}",
+            mode.id(),
+            render_sample_center(&off_rounds),
+            render_sample_center(&on_rounds),
+            render_sample_center(&off_calls),
+            render_sample_center(&on_calls),
+        ));
+    }
     reasons.push(format!(
-        "episode rounds median {off_med_rounds} -> {on_med_rounds}; episode calls median {off_med_calls} -> {on_med_calls}"
+        "aggregate episode rounds off {}; on {}; calls off {}; on {}",
+        render_sample_center(&off_episode_rounds),
+        render_sample_center(&on_episode_rounds),
+        render_sample_center(&off_episode_calls),
+        render_sample_center(&on_episode_calls),
     ));
     reasons.push(format!(
         "max episode round tail {off_max_rounds} -> {on_max_rounds}; max whole-cell round tail {off_max_whole} -> {on_max_whole}"
     ));
 
-    let lower_episodes = on_med_rounds < off_med_rounds && on_med_calls < off_med_calls;
+    let lower_episodes = on_center_rounds < off_center_rounds && on_center_calls < off_center_calls;
     let no_new_max = on_max_rounds <= off_max_rounds && on_max_whole <= off_max_whole;
     if !lower_episodes {
         reasons.push("candidate-episode rounds/calls are not strictly lower".into());
@@ -2427,7 +3286,11 @@ pub fn evaluate_conv_gate(outcomes: &[CellOutcome]) -> ConvGateJudgment {
     if !no_new_max {
         reasons.push("the on arm introduced a new maximum episode or whole-cell tail".into());
     }
-    let state = if lower_episodes && no_new_max { "pass" } else { "fail" };
+    let state = if lower_episodes && no_new_max {
+        "pass"
+    } else {
+        "fail"
+    };
     ConvGateJudgment {
         state,
         off_cells: off.len(),
@@ -2455,12 +3318,15 @@ mod tests {
         let dispatcher = tool_runtime::BuiltinToolDispatcher::with_config_and_verification_recipes(
             workspace,
             tool_runtime::ToolLifecycleConfig::default(),
-            pilot_verification_recipes(vec![
-                "Cargo.toml".into(),
-                "src/config.rs".into(),
-                "src/error.rs".into(),
-                "src/lib.rs".into(),
-            ]),
+            pilot_verification_recipes(
+                vec![
+                    "Cargo.toml".into(),
+                    "src/config.rs".into(),
+                    "src/error.rs".into(),
+                    "src/lib.rs".into(),
+                ],
+                Some("retry-policy-public-contract"),
+            ),
         );
         use agent_contracts::{ToolCall, ToolDispatcher as _, ToolExecutionPurpose};
         let call = ToolCall {
@@ -2479,6 +3345,15 @@ mod tests {
             "identity capture must succeed in this environment; \
              the opportunity gate cannot arm without it"
         );
+        let provenance = attribution
+            .verification_recipe
+            .as_ref()
+            .expect("the exact recipe carries host provenance");
+        assert_eq!(
+            provenance.coverage_domain.as_deref(),
+            Some("retry-policy-public-contract")
+        );
+        assert_eq!(provenance.domain_declaration_revision, Some(1));
     }
 
     #[test]
@@ -2641,15 +3516,33 @@ mod tests {
 
     /// Build one gate cell: the failed-outcome constructor is a convenient
     /// all-fields base; the test then sets the dimensions the gate reads.
+    #[allow(clippy::too_many_arguments)] // compact synthetic gate vector builder
     fn gate_cell(
         mode: PilotMode,
-        projection: bool,
+        repeat: u32,
+        settlement: bool,
         behavior: &str,
         exposed: bool,
         episode_rounds: u64,
         episode_calls: u64,
         whole_rounds: u32,
     ) -> CellOutcome {
+        let identity = CellEvidenceIdentity {
+            candidate_id: CONVERGENCE_CANDIDATE_ID.into(),
+            source_tree_digest: Some("source-tree".into()),
+            fixture_sha256: "fixture-sha".into(),
+            repeat,
+            tool_surface: PRODUCT_TOOL_SURFACE.into(),
+            surface_config_digest: "surface-config".into(),
+            prompt_config_digest: "prompt-config".into(),
+            acceptance_domain: Some("retry-policy-public-contract".into()),
+            acceptance_declaration_revision: Some(1),
+            acceptance_source_digest: Some(
+                "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".into(),
+            ),
+            provider_config_digest: "provider-config".into(),
+            settlement_projection_diagnostics: true,
+        };
         let mut cell = CellOutcome::failed(
             "retry_policy_dev",
             mode,
@@ -2657,14 +3550,22 @@ mod tests {
             CellSwitches {
                 opportunity: false,
                 recovery_surface: false,
-                project_progress: projection,
+                project_task_progress: true,
+                project_settlement: settlement,
+                settlement_projection_diagnostics: true,
             },
+            identity,
             0,
             CellFailure::runtime("gate test seed"),
         );
         cell.behavior = behavior.into();
         cell.diff = if behavior == "pass" { "pass" } else { "fail" }.into();
-        cell.closure = if behavior == "pass" { "completed" } else { "failed" }.into();
+        cell.closure = if behavior == "pass" {
+            "completed"
+        } else {
+            "failed"
+        }
+        .into();
         cell.continuation = match mode {
             PilotMode::Normal => "n/a".into(),
             PilotMode::Resume if behavior == "pass" => "restored".into(),
@@ -2676,24 +3577,33 @@ mod tests {
         cell.settlement_episodes = u64::from(exposed);
         cell.settlement_episode_rounds = episode_rounds;
         cell.settlement_episode_calls = episode_calls;
+        cell.model_requests = ModelRequestDigest {
+            requests: u64::from(whole_rounds),
+            settlement_audits: u64::from(exposed),
+            first_settlement_normalized_prompt_digest: exposed
+                .then(|| format!("normalized/{:?}/r{repeat}", mode)),
+            first_settlement_tool_surface_digest: exposed.then(|| "surface/v1".into()),
+            ..ModelRequestDigest::default()
+        };
         cell.model_rounds_phase_one = whole_rounds;
         cell.model_rounds_phase_two = 0;
+        cell.runtime_task_id = Some(TaskId::new());
         cell
     }
 
     #[test]
-    fn conv_gate_with_a_missing_arm_is_inconclusive() {
+    fn conv_gate_with_a_missing_arm_fails_closed() {
         let outcomes = vec![
-            gate_cell(PilotMode::Normal, false, "pass", true, 10, 12, 10),
-            gate_cell(PilotMode::Resume, false, "pass", true, 8, 9, 8),
+            gate_cell(PilotMode::Normal, 1, false, "pass", true, 10, 12, 10),
+            gate_cell(PilotMode::Resume, 1, false, "pass", true, 8, 9, 8),
         ];
         let judgment = evaluate_conv_gate(&outcomes);
-        assert_eq!(judgment.state, "inconclusive");
+        assert_eq!(judgment.state, "invalid");
         assert!(
             judgment
                 .reasons
                 .iter()
-                .any(|reason| reason.contains("one arm produced no outcomes")),
+                .any(|reason| reason.contains("exactly one off and one on")),
             "{:?}",
             judgment.reasons
         );
@@ -2702,10 +3612,10 @@ mod tests {
     #[test]
     fn conv_gate_zero_on_arm_exposure_is_inconclusive_not_a_pass() {
         let outcomes = vec![
-            gate_cell(PilotMode::Normal, false, "pass", true, 10, 12, 10),
-            gate_cell(PilotMode::Resume, false, "pass", true, 8, 9, 8),
-            gate_cell(PilotMode::Normal, true, "pass", false, 0, 0, 10),
-            gate_cell(PilotMode::Resume, true, "pass", false, 0, 0, 8),
+            gate_cell(PilotMode::Normal, 1, false, "pass", false, 0, 0, 10),
+            gate_cell(PilotMode::Resume, 1, false, "pass", false, 0, 0, 8),
+            gate_cell(PilotMode::Normal, 1, true, "pass", false, 0, 0, 10),
+            gate_cell(PilotMode::Resume, 1, true, "pass", false, 0, 0, 8),
         ];
         let judgment = evaluate_conv_gate(&outcomes);
         assert_eq!(judgment.state, "inconclusive");
@@ -2714,7 +3624,46 @@ mod tests {
             judgment
                 .reasons
                 .iter()
-                .any(|reason| reason.contains("zero on-arm exposure")),
+                .any(|reason| reason.contains("incomplete paired exposure")),
+            "{:?}",
+            judgment.reasons
+        );
+    }
+
+    #[test]
+    fn conv_gate_partial_paired_exposure_is_inconclusive_not_selected_away() {
+        let outcomes = vec![
+            gate_cell(PilotMode::Normal, 1, false, "pass", true, 12, 14, 12),
+            gate_cell(PilotMode::Normal, 1, true, "pass", true, 8, 10, 8),
+            gate_cell(PilotMode::Resume, 1, false, "pass", false, 0, 0, 10),
+            gate_cell(PilotMode::Resume, 1, true, "pass", false, 0, 0, 8),
+        ];
+        let judgment = evaluate_conv_gate(&outcomes);
+        assert_eq!(judgment.state, "inconclusive");
+        assert_eq!(judgment.off_exposed, 1);
+        assert_eq!(judgment.on_exposed, 1);
+        assert!(
+            judgment
+                .reasons
+                .iter()
+                .any(|reason| reason.contains("incomplete paired exposure (1/2")),
+            "{:?}",
+            judgment.reasons
+        );
+    }
+
+    #[test]
+    fn conv_gate_requires_diagnostics_in_both_cell_identity_and_outcome() {
+        let mut off = gate_cell(PilotMode::Normal, 1, false, "pass", true, 12, 14, 12);
+        let on = gate_cell(PilotMode::Normal, 1, true, "pass", true, 8, 10, 8);
+        off.settlement_projection_diagnostics = false;
+        let judgment = evaluate_conv_gate(&[off, on]);
+        assert_eq!(judgment.state, "invalid");
+        assert!(
+            judgment
+                .reasons
+                .iter()
+                .any(|reason| reason.contains("inconsistent diagnostic identity")),
             "{:?}",
             judgment.reasons
         );
@@ -2723,10 +3672,10 @@ mod tests {
     #[test]
     fn conv_gate_paired_cells_must_match_behavior_world_and_verdict() {
         let outcomes = vec![
-            gate_cell(PilotMode::Normal, false, "pass", true, 10, 12, 10),
-            gate_cell(PilotMode::Resume, false, "pass", true, 8, 9, 8),
-            gate_cell(PilotMode::Normal, true, "pass", true, 6, 6, 6),
-            gate_cell(PilotMode::Resume, true, "fail", true, 8, 9, 8),
+            gate_cell(PilotMode::Normal, 1, false, "pass", true, 10, 12, 10),
+            gate_cell(PilotMode::Resume, 1, false, "pass", true, 8, 9, 8),
+            gate_cell(PilotMode::Normal, 1, true, "pass", true, 6, 6, 6),
+            gate_cell(PilotMode::Resume, 1, true, "fail", true, 8, 9, 8),
         ];
         let judgment = evaluate_conv_gate(&outcomes);
         assert_eq!(judgment.state, "fail");
@@ -2743,13 +3692,13 @@ mod tests {
     #[test]
     fn conv_gate_per_pair_exposure_mismatch_fails() {
         let outcomes = vec![
-            gate_cell(PilotMode::Normal, false, "pass", true, 10, 12, 10),
-            gate_cell(PilotMode::Resume, false, "pass", true, 8, 9, 8),
-            gate_cell(PilotMode::Normal, true, "pass", true, 6, 6, 6),
-            gate_cell(PilotMode::Resume, true, "pass", false, 0, 0, 8),
+            gate_cell(PilotMode::Normal, 1, false, "pass", true, 10, 12, 10),
+            gate_cell(PilotMode::Resume, 1, false, "pass", true, 8, 9, 8),
+            gate_cell(PilotMode::Normal, 1, true, "pass", true, 6, 6, 6),
+            gate_cell(PilotMode::Resume, 1, true, "pass", false, 0, 0, 8),
         ];
         let judgment = evaluate_conv_gate(&outcomes);
-        assert_eq!(judgment.state, "fail");
+        assert_eq!(judgment.state, "invalid");
         assert!(
             judgment
                 .reasons
@@ -2763,22 +3712,200 @@ mod tests {
     #[test]
     fn conv_gate_passes_with_strictly_lower_episodes_and_no_new_max() {
         let outcomes = vec![
-            gate_cell(PilotMode::Normal, false, "pass", true, 12, 14, 12),
-            gate_cell(PilotMode::Resume, false, "pass", true, 14, 16, 14),
-            gate_cell(PilotMode::Normal, true, "pass", true, 8, 10, 8),
-            gate_cell(PilotMode::Resume, true, "pass", true, 10, 12, 10),
+            gate_cell(PilotMode::Normal, 1, false, "pass", true, 12, 14, 12),
+            gate_cell(PilotMode::Resume, 1, false, "pass", true, 14, 16, 14),
+            gate_cell(PilotMode::Normal, 1, true, "pass", true, 8, 10, 8),
+            gate_cell(PilotMode::Resume, 1, true, "pass", true, 10, 12, 10),
         ];
         let judgment = evaluate_conv_gate(&outcomes);
         assert_eq!(judgment.state, "pass", "{:?}", judgment.reasons);
     }
 
     #[test]
+    fn conv_gate_joins_shuffled_arms_by_stable_key_and_reports_midpoints() {
+        let outcomes = vec![
+            gate_cell(PilotMode::Normal, 2, true, "pass", true, 10, 12, 10),
+            gate_cell(PilotMode::Normal, 1, false, "pass", true, 12, 14, 12),
+            gate_cell(PilotMode::Normal, 1, true, "pass", true, 8, 10, 8),
+            gate_cell(PilotMode::Normal, 2, false, "pass", true, 14, 16, 14),
+        ];
+        let judgment = evaluate_conv_gate(&outcomes);
+        assert_eq!(judgment.state, "pass", "{:?}", judgment.reasons);
+        let rendered = judgment.render();
+        assert!(rendered.contains("observations=[12, 14] midpoint=13"));
+        assert!(rendered.contains("observations=[8, 10] midpoint=9"));
+        assert!(!rendered.contains("rounds median"));
+    }
+
+    #[test]
+    fn conv_gate_rejects_duplicate_logical_cells() {
+        let outcomes = vec![
+            gate_cell(PilotMode::Normal, 1, false, "pass", true, 12, 14, 12),
+            gate_cell(PilotMode::Normal, 1, false, "pass", true, 12, 14, 12),
+            gate_cell(PilotMode::Normal, 1, true, "pass", true, 8, 10, 8),
+        ];
+        let judgment = evaluate_conv_gate(&outcomes);
+        assert_eq!(judgment.state, "invalid");
+        assert!(
+            judgment
+                .reasons
+                .iter()
+                .any(|reason| reason.contains("found off=2 on=1"))
+        );
+    }
+
+    #[test]
+    fn conv_gate_rejects_provider_identity_mismatch_as_unpaired() {
+        let off = gate_cell(PilotMode::Normal, 1, false, "pass", true, 12, 14, 12);
+        let mut on = gate_cell(PilotMode::Normal, 1, true, "pass", true, 8, 10, 8);
+        on.identity.provider_config_digest = "different-provider".into();
+        let judgment = evaluate_conv_gate(&[off, on]);
+        assert_eq!(judgment.state, "invalid");
+        assert!(
+            judgment
+                .reasons
+                .iter()
+                .any(|reason| reason.contains("exactly one off and one on"))
+        );
+    }
+
+    #[test]
+    fn conv_gate_rejects_acceptance_authority_mismatch_as_unpaired() {
+        let mut outcomes = vec![
+            gate_cell(PilotMode::Normal, 1, false, "pass", true, 10, 12, 10),
+            gate_cell(PilotMode::Normal, 1, true, "pass", true, 9, 10, 9),
+        ];
+        outcomes[1].identity.acceptance_source_digest =
+            Some("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb".into());
+
+        let judgment = evaluate_conv_gate(&outcomes);
+        assert_eq!(judgment.state, "invalid");
+        assert!(
+            judgment
+                .reasons
+                .iter()
+                .any(|reason| reason.contains("exactly one off and one on")),
+            "{:?}",
+            judgment.reasons
+        );
+    }
+
+    #[test]
+    fn conv_gate_rejects_non_treatment_switch_mismatch() {
+        let off = gate_cell(PilotMode::Normal, 1, false, "pass", true, 12, 14, 12);
+        let mut on = gate_cell(PilotMode::Normal, 1, true, "pass", true, 8, 10, 8);
+        on.opportunity = true;
+        let judgment = evaluate_conv_gate(&[off, on]);
+        assert_eq!(judgment.state, "invalid");
+        assert!(
+            judgment
+                .reasons
+                .iter()
+                .any(|reason| reason.contains("completion-opportunity switch"))
+        );
+    }
+
+    #[test]
+    fn conv_gate_rejects_truncated_or_noncausal_live_request_capture() {
+        let mut off = gate_cell(PilotMode::Normal, 1, false, "pass", true, 12, 14, 12);
+        let on = gate_cell(PilotMode::Normal, 1, true, "pass", true, 8, 10, 8);
+        off.model_requests.capture_truncated = true;
+        let judgment = evaluate_conv_gate(&[off, on]);
+        assert_eq!(judgment.state, "invalid");
+        assert!(
+            judgment
+                .reasons
+                .iter()
+                .any(|reason| reason.contains("model-request capture truncated"))
+        );
+
+        let off = gate_cell(PilotMode::Normal, 1, false, "pass", true, 12, 14, 12);
+        let mut on = gate_cell(PilotMode::Normal, 1, true, "pass", true, 8, 10, 8);
+        on.model_requests.first_settlement_normalized_prompt_digest =
+            Some("different-state".into());
+        let judgment = evaluate_conv_gate(&[off, on]);
+        assert_eq!(judgment.state, "invalid");
+        assert!(
+            judgment
+                .reasons
+                .iter()
+                .any(|reason| reason.contains("differs after removing"))
+        );
+    }
+
+    #[test]
+    fn live_request_audit_is_bound_to_the_harness_arm_and_exact_request() {
+        let messages = vec![agent_contracts::ModelMessage::system("baseline")];
+        let tools = vec![ToolSpec {
+            name: "fs.read".into(),
+            ..ToolSpec::default()
+        }];
+        let prompt_digest = serialized_digest(&messages);
+        let surface_digest = serialized_digest(&tools);
+        let comparison = agent_runtime::SettlementProjectionPreflight {
+            schema: "settlement-projection-preflight/v2".into(),
+            passed: true,
+            allowed_difference: "one task_progress.settlement fact".into(),
+            settlement_occurrences: 1,
+            baseline_request_sha256: "baseline-request".into(),
+            treatment_request_sha256: "treatment-request".into(),
+            normalized_request_sha256: "baseline-request".into(),
+            baseline_prompt_sha256: prompt_digest.clone(),
+            treatment_prompt_sha256: "different-treatment-prompt".into(),
+            normalized_prompt_sha256: prompt_digest,
+            baseline_tool_surface_sha256: surface_digest.clone(),
+            treatment_tool_surface_sha256: surface_digest,
+        };
+        let request = ModelRequest {
+            messages,
+            tools,
+            metadata: serde_json::Value::Null,
+            cancel: CancellationToken::new(),
+        };
+        let off = serde_json::to_value(comparison).unwrap();
+        assert_eq!(
+            validate_live_settlement_audit(&request, &off, "off").map(|proof| proof.0),
+            Some(true)
+        );
+        assert_eq!(
+            validate_live_settlement_audit(&request, &off, "on").map(|proof| proof.0),
+            Some(false),
+            "the harness arm, not request metadata, selects the expected request"
+        );
+
+        let mut changed = request;
+        changed
+            .messages
+            .push(agent_contracts::ModelMessage::user("drift"));
+        assert_eq!(
+            validate_live_settlement_audit(&changed, &off, "off").map(|proof| proof.0),
+            Some(false),
+            "the proof must bind the exact request observed by the wrapper"
+        );
+    }
+
+    #[test]
+    fn marker_shape_is_observational_not_a_gate() {
+        let off = gate_cell(PilotMode::Normal, 1, false, "pass", true, 12, 14, 12);
+        let mut on = gate_cell(PilotMode::Normal, 1, true, "pass", true, 8, 10, 8);
+        on.marker_violations.push("shape changed".into());
+        let judgment = evaluate_conv_gate(&[off, on]);
+        assert_eq!(judgment.state, "pass", "{:?}", judgment.reasons);
+        assert!(
+            judgment
+                .reasons
+                .iter()
+                .any(|reason| reason.contains("observational marker-shape"))
+        );
+    }
+
+    #[test]
     fn conv_gate_rejects_episodes_that_are_not_strictly_lower() {
         let outcomes = vec![
-            gate_cell(PilotMode::Normal, false, "pass", true, 10, 12, 10),
-            gate_cell(PilotMode::Resume, false, "pass", true, 14, 16, 14),
-            gate_cell(PilotMode::Normal, true, "pass", true, 14, 16, 14),
-            gate_cell(PilotMode::Resume, true, "pass", true, 10, 12, 10),
+            gate_cell(PilotMode::Normal, 1, false, "pass", true, 10, 12, 10),
+            gate_cell(PilotMode::Resume, 1, false, "pass", true, 14, 16, 14),
+            gate_cell(PilotMode::Normal, 1, true, "pass", true, 14, 16, 14),
+            gate_cell(PilotMode::Resume, 1, true, "pass", true, 10, 12, 10),
         ];
         let judgment = evaluate_conv_gate(&outcomes);
         assert_eq!(judgment.state, "fail");
@@ -2795,12 +3922,12 @@ mod tests {
     #[test]
     fn conv_gate_new_maximum_episode_or_whole_cell_tail_fails() {
         let outcomes = vec![
-            gate_cell(PilotMode::Normal, false, "pass", true, 10, 12, 10),
-            gate_cell(PilotMode::Resume, false, "pass", true, 10, 12, 10),
-            gate_cell(PilotMode::Normal, false, "pass", true, 10, 12, 10),
-            gate_cell(PilotMode::Normal, true, "pass", true, 8, 8, 8),
-            gate_cell(PilotMode::Resume, true, "pass", true, 8, 8, 8),
-            gate_cell(PilotMode::Normal, true, "pass", true, 14, 8, 14),
+            gate_cell(PilotMode::Normal, 1, false, "pass", true, 10, 12, 10),
+            gate_cell(PilotMode::Resume, 1, false, "pass", true, 10, 12, 10),
+            gate_cell(PilotMode::Normal, 2, false, "pass", true, 10, 12, 10),
+            gate_cell(PilotMode::Normal, 1, true, "pass", true, 8, 8, 8),
+            gate_cell(PilotMode::Resume, 1, true, "pass", true, 8, 8, 8),
+            gate_cell(PilotMode::Normal, 2, true, "pass", true, 14, 8, 14),
         ];
         let judgment = evaluate_conv_gate(&outcomes);
         assert_eq!(judgment.state, "fail");
@@ -2824,8 +3951,11 @@ mod tests {
                 CellSwitches {
                     opportunity: false,
                     recovery_surface: false,
-                    project_progress: false,
+                    project_task_progress: true,
+                    project_settlement: false,
+                    settlement_projection_diagnostics: false,
                 },
+                CellEvidenceIdentity::default(),
                 0,
                 CellFailure::from_runtime(class, retryable, "outage"),
             )
@@ -2849,8 +3979,11 @@ mod tests {
             CellSwitches {
                 opportunity: false,
                 recovery_surface: false,
-                project_progress: false,
+                project_task_progress: true,
+                project_settlement: false,
+                settlement_projection_diagnostics: false,
             },
+            CellEvidenceIdentity::default(),
             0,
             CellFailure::harness_setup("no provider"),
         )));

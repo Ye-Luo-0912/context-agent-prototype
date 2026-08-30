@@ -360,6 +360,7 @@ async fn concurrent_full_restores_are_serialized_across_all_state_planes() {
             Some(journal.clone()),
         ),
     ));
+    instance.start().await.unwrap();
     let checkpoint_a = agent_runtime::RuntimeCheckpoint {
         version: agent_runtime::RUNTIME_CHECKPOINT_VERSION,
         run_metadata: agent_runtime::RunMetadata {
@@ -379,6 +380,8 @@ async fn concurrent_full_restores_are_serialized_across_all_state_planes() {
         authority: None,
         snapshot_sequence: 3,
         capability_generation: 4,
+        event_cover_seq: 0,
+        terminal_commit: false,
     };
     let mut checkpoint_b = checkpoint_a.clone();
     checkpoint_b.focus_revision = 41;

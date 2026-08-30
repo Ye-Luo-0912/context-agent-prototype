@@ -1,4 +1,61 @@
+use std::fmt;
+
 use thiserror::Error;
+
+/// Stable categories for model-provider wire damage. These are distinct from
+/// provider-declared model outcomes and retryable connection failures.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum ModelProtocolErrorKind {
+    MalformedEvent,
+    MalformedToolCall,
+}
+
+impl fmt::Display for ModelProtocolErrorKind {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(match self {
+            Self::MalformedEvent => "malformed-event",
+            Self::MalformedToolCall => "malformed-tool-call",
+        })
+    }
+}
+
+/// A server-requested retry delay with a hard cross-runtime bound.
+///
+/// Providers may report arbitrarily large values. The contract caps one retry
+/// interval at a minute so an upstream header cannot create an unbounded wait.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct RetryAfterMillis(u32);
+
+impl RetryAfterMillis {
+    pub const MAX_MILLIS: u32 = 60_000;
+
+    pub const fn new(millis: u32) -> Option<Self> {
+        if millis <= Self::MAX_MILLIS {
+            Some(Self(millis))
+        } else {
+            None
+        }
+    }
+
+    pub const fn new_saturating(millis: u64) -> Self {
+        if millis > Self::MAX_MILLIS as u64 {
+            Self(Self::MAX_MILLIS)
+        } else {
+            Self(millis as u32)
+        }
+    }
+
+    pub const fn get(self) -> u32 {
+        self.0
+    }
+}
+
+impl fmt::Display for RetryAfterMillis {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.0.fmt(formatter)
+    }
+}
 
 #[derive(Debug, Error)]
 pub enum AgentError {
@@ -11,6 +68,15 @@ pub enum AgentError {
     #[error("model error: {0}")]
     Model(String),
 
+    /// The provider's stream violated the selected model wire protocol. This
+    /// is a typed, non-retryable failure: accepting a partial response or
+    /// replaying it can duplicate already-published output.
+    #[error("model protocol error ({kind}): {message}")]
+    ModelProtocol {
+        kind: ModelProtocolErrorKind,
+        message: String,
+    },
+
     /// The provider completed the request protocol correctly but stopped the
     /// model because its configured output allowance was exhausted. This is
     /// a model/resource outcome, not a transport outage and not retryable
@@ -20,6 +86,15 @@ pub enum AgentError {
 
     #[error("transport error (retryable={retryable}): {message}")]
     Transport { retryable: bool, message: String },
+
+    /// A retryable transport failure with a provider-requested minimum wait.
+    /// The delay is bounded by construction and retry policy may impose a
+    /// lower ceiling before sleeping.
+    #[error("transport error (retryable=true, retry_after_ms={retry_after_ms}): {message}")]
+    TransportRetryAfter {
+        retry_after_ms: RetryAfterMillis,
+        message: String,
+    },
 
     #[error("cancelled")]
     Cancelled,
@@ -54,3 +129,33 @@ pub enum AgentError {
 }
 
 pub type AgentResult<T> = Result<T, AgentError>;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn retry_after_is_bounded_by_construction() {
+        assert_eq!(RetryAfterMillis::new(1_500).unwrap().get(), 1_500);
+        assert!(RetryAfterMillis::new(60_001).is_none());
+        assert_eq!(
+            RetryAfterMillis::new_saturating(u64::MAX).get(),
+            RetryAfterMillis::MAX_MILLIS
+        );
+    }
+
+    #[test]
+    fn protocol_kind_is_preserved_without_message_parsing() {
+        let error = AgentError::ModelProtocol {
+            kind: ModelProtocolErrorKind::MalformedToolCall,
+            message: "arguments ended early".into(),
+        };
+        assert!(matches!(
+            error,
+            AgentError::ModelProtocol {
+                kind: ModelProtocolErrorKind::MalformedToolCall,
+                ..
+            }
+        ));
+    }
+}

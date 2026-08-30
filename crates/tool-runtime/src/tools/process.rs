@@ -32,6 +32,12 @@ const MAX_ARGV: usize = 64;
 const MAX_ARG_CHARS: usize = 16_384;
 const MAX_ENV_KEYS: usize = 64;
 const MAX_ENV_VALUE_CHARS: usize = 16_384;
+/// Resolution itself must stay bounded even when the inherited PATH or a
+/// hostile PATHEXT contains thousands of entries. The truncation marker is
+/// part of the scope identity, so two different candidate families cannot
+/// silently alias at the boundary.
+const MAX_RESOLUTION_BASES: usize = 256;
+const MAX_PATHEXT_ENTRIES: usize = 32;
 
 // TOOL-PROC-01：argv0 的解析语义由 host 显式定义，不再依赖
 // `Command::new(argv0)` + `current_dir` 的平台隐式行为。Windows 的
@@ -54,16 +60,30 @@ const MAX_ATTEMPTED_CANDIDATES: usize = 8;
 struct ProgramResolution {
     /// 传给 `Command::new` 的绝对路径。
     executable: std::path::PathBuf,
-    /// 稳定 lineage scope：digest(cwd 身份 + effective PATH
-    /// + 规则版本)。目录内容变化不改变它。
+    /// 稳定 lineage scope：digest(规范化 argv0 + 有序候选族 +
+    /// 平台解析规则)。候选是否存在的变化不改变它。
     scope_key: String,
     /// 当前 epoch 前置指纹：完整有界目录状态 + PATH + 规范化 env 覆盖。
     /// build 产出 binary 会改变它；普通源码 edit 不变名字集时也不变。
     fingerprint: String,
 }
 
+#[derive(Debug)]
 struct ProgramResolutionFailure {
     candidates_tried: Vec<String>,
+    scope_key: String,
+    fingerprint: String,
+}
+
+/// Host-defined executable candidate family. `bases` is ordered exactly as
+/// resolution searches it (cwd first for a bare name, then effective PATH).
+/// Windows extension completion is represented separately so both lookup
+/// and the lineage digest consume one platform rule set.
+struct ProgramCandidateFamily {
+    normalized_argv0: String,
+    bases: Vec<std::path::PathBuf>,
+    extensions: Vec<String>,
+    truncated: bool,
 }
 
 fn has_path_separator(argv0: &str) -> bool {
@@ -71,12 +91,34 @@ fn has_path_separator(argv0: &str) -> bool {
 }
 
 fn is_absolute(argv0: &str) -> bool {
-    std::path::Path::new(argv0).is_absolute()
+    // Classify the same normalized spelling that lookup consumes. Otherwise
+    // a leading backslash would be treated as relative on Unix and then turn
+    // absolute only inside `Path::join`.
+    program_path(argv0).is_absolute()
+}
+
+fn program_path(argv0: &str) -> std::path::PathBuf {
+    // Windows already accepts both separator spellings. Preserve the native
+    // spelling there: rewriting an absolute `ComSpec` path to forward
+    // slashes changes how `cmd.exe` receives its command line when spawned
+    // directly. Unix needs the explicit alias because `Path` otherwise
+    // treats a backslash as a normal filename character.
+    #[cfg(windows)]
+    {
+        std::path::PathBuf::from(argv0)
+    }
+    #[cfg(not(windows))]
+    {
+        std::path::PathBuf::from(argv0.replace('\\', "/"))
+    }
 }
 
 /// Windows 下末段无扩展名的候选按 PATHEXT 顺序补全；其余平台只做直查。
 /// 返回第一个真实存在的具体路径。
-fn candidate_executable(path: std::path::PathBuf) -> Option<std::path::PathBuf> {
+fn candidate_executable(
+    path: std::path::PathBuf,
+    extensions: &[String],
+) -> Option<std::path::PathBuf> {
     if path.is_file() {
         return Some(path);
     }
@@ -84,13 +126,7 @@ fn candidate_executable(path: std::path::PathBuf) -> Option<std::path::PathBuf> 
     {
         let has_extension = path.extension().is_some_and(|ext| !ext.is_empty());
         if !has_extension {
-            let pathext = std::env::var("PATHEXT").unwrap_or_else(|_| ".COM;.EXE;.BAT;.CMD".into());
-            for ext in pathext.split(';') {
-                let ext = ext.trim();
-                if ext.is_empty() {
-                    continue;
-                }
-                let ext = ext.strip_prefix('.').unwrap_or(ext);
+            for ext in extensions {
                 let mut candidate = path.as_os_str().to_owned();
                 candidate.push(".");
                 candidate.push(ext);
@@ -104,10 +140,150 @@ fn candidate_executable(path: std::path::PathBuf) -> Option<std::path::PathBuf> 
     None
 }
 
-fn effective_path_dirs() -> Vec<std::path::PathBuf> {
-    std::env::split_paths(&std::env::var_os("PATH").unwrap_or_default())
-        .filter(|dir| !dir.as_os_str().is_empty())
-        .collect()
+fn env_override<'a>(env_overrides: &'a HashMap<String, String>, key: &str) -> Option<&'a str> {
+    #[cfg(windows)]
+    {
+        env_overrides
+            .iter()
+            .find(|(candidate, _)| candidate.eq_ignore_ascii_case(key))
+            .map(|(_, value)| value.as_str())
+    }
+    #[cfg(not(windows))]
+    {
+        env_overrides.get(key).map(String::as_str)
+    }
+}
+
+fn effective_env_value(env_overrides: &HashMap<String, String>, key: &str) -> String {
+    env_override(env_overrides, key)
+        .map(str::to_owned)
+        .or_else(|| std::env::var(key).ok())
+        .unwrap_or_default()
+}
+
+fn effective_path_dirs(env_overrides: &HashMap<String, String>) -> Vec<std::path::PathBuf> {
+    std::env::split_paths(&std::ffi::OsString::from(effective_env_value(
+        env_overrides,
+        "PATH",
+    )))
+    .filter(|dir| !dir.as_os_str().is_empty())
+    .collect()
+}
+
+fn effective_extensions(env_overrides: &HashMap<String, String>) -> Vec<String> {
+    #[cfg(windows)]
+    {
+        let raw = env_override(env_overrides, "PATHEXT")
+            .map(str::to_owned)
+            .or_else(|| std::env::var("PATHEXT").ok())
+            .unwrap_or_else(|| ".COM;.EXE;.BAT;.CMD".into());
+        let mut extensions = Vec::new();
+        for extension in raw.split(';') {
+            let extension = extension.trim().trim_start_matches('.');
+            if extension.is_empty() {
+                continue;
+            }
+            let normalized = extension.to_ascii_lowercase();
+            if !extensions.iter().any(|known| known == &normalized) {
+                extensions.push(normalized);
+                if extensions.len() == MAX_PATHEXT_ENTRIES {
+                    break;
+                }
+            }
+        }
+        extensions
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = env_overrides;
+        Vec::new()
+    }
+}
+
+fn normalized_path_identity(path: &std::path::Path) -> String {
+    let mut lexical = std::path::PathBuf::new();
+    for component in path.components() {
+        match component {
+            std::path::Component::CurDir => {}
+            std::path::Component::ParentDir
+                if matches!(
+                    lexical.components().next_back(),
+                    Some(std::path::Component::Normal(_))
+                ) =>
+            {
+                lexical.pop();
+            }
+            std::path::Component::ParentDir => lexical.push(component.as_os_str()),
+            _ => lexical.push(component.as_os_str()),
+        }
+    }
+    let normalized = lexical.to_string_lossy().replace('\\', "/");
+    #[cfg(windows)]
+    {
+        normalized.to_ascii_lowercase()
+    }
+    #[cfg(not(windows))]
+    {
+        normalized
+    }
+}
+
+fn normalized_argv0(argv0: &str) -> String {
+    let normalized = if has_path_separator(argv0) || is_absolute(argv0) {
+        normalized_path_identity(&program_path(argv0))
+    } else {
+        argv0.to_string()
+    };
+    #[cfg(windows)]
+    {
+        normalized.to_ascii_lowercase()
+    }
+    #[cfg(not(windows))]
+    {
+        normalized
+    }
+}
+
+fn candidate_family(
+    argv0: &str,
+    cwd: &std::path::Path,
+    env_overrides: &HashMap<String, String>,
+) -> ProgramCandidateFamily {
+    let mut truncated = false;
+    let mut bases = if is_absolute(argv0) {
+        vec![program_path(argv0)]
+    } else if has_path_separator(argv0) {
+        vec![cwd.join(program_path(argv0))]
+    } else {
+        let mut candidates = Vec::with_capacity(16);
+        candidates.push(cwd.join(argv0));
+        for dir in effective_path_dirs(env_overrides) {
+            if candidates.len() == MAX_RESOLUTION_BASES {
+                truncated = true;
+                break;
+            }
+            // Relative PATH entries are interpreted from the requested child
+            // cwd, then converted to the concrete candidate passed to spawn.
+            // This keeps preflight, lineage identity and execution aligned.
+            let dir = if dir.is_absolute() {
+                dir
+            } else {
+                cwd.join(dir)
+            };
+            candidates.push(dir.join(argv0));
+        }
+        candidates
+    };
+    if bases.len() > MAX_RESOLUTION_BASES {
+        bases.truncate(MAX_RESOLUTION_BASES);
+        truncated = true;
+    }
+    ProgramCandidateFamily {
+        normalized_argv0: normalized_argv0(argv0),
+        bases,
+        extensions: effective_extensions(env_overrides),
+        truncated,
+    }
 }
 
 /// 完整有界目录状态摘要：全部条目（含点文件）排序后逐个入哈希
@@ -159,33 +335,51 @@ fn canonical_env_bytes(env_overrides: &HashMap<String, String>) -> Vec<u8> {
     buffer
 }
 
-/// 解析身份二元组：(scope_key, fingerprint)。scope 只含 cwd 身份 +
-/// PATH + 规则版本（跨 epoch 稳定）；fingerprint 另含完整目录状态与
-/// 规范化 env（epoch 随世界变化）。HashMap 序列化顺序不稳定，env 一律
-/// 先规范化排序再入哈希。
+/// 解析身份二元组：(scope_key, fingerprint)。scope 绑定规范化 argv0、
+/// 有序候选族和平台补全规则；因此 `foo` 与 `bar` 永远不是同一 blocker，
+/// 而同一个 `foo` 在安装前后保持同一 lineage。fingerprint 另含 cwd
+/// 目录状态与规范化 env（epoch 随世界变化）。HashMap 序列化顺序不稳定，
+/// env 一律先规范化排序再入哈希。
 fn resolution_identity(
+    family: &ProgramCandidateFamily,
     cwd: &std::path::Path,
     env_overrides: &HashMap<String, String>,
 ) -> (String, String) {
-    let path_text = std::env::var("PATH").unwrap_or_default();
-    let scope_source: Vec<u8> = RESOLVER_RULES_VERSION
-        .iter()
-        .copied()
-        .chain(cwd.to_string_lossy().as_bytes().iter().copied())
-        .chain(b"\0PATH=".iter().copied())
-        .chain(path_text.as_bytes().iter().copied())
-        .collect();
+    use sha2::{Digest, Sha256};
+
+    let mut scope_hasher = Sha256::new();
+    scope_hasher.update(RESOLVER_RULES_VERSION);
+    #[cfg(windows)]
+    scope_hasher.update(b"\0platform=windows;case=insensitive;pathext=ordered");
+    #[cfg(not(windows))]
+    scope_hasher.update(b"\0platform=unix;case=sensitive;pathext=none");
+    scope_hasher.update(b"\0argv0=");
+    scope_hasher.update(family.normalized_argv0.as_bytes());
+    for base in &family.bases {
+        scope_hasher.update(b"\0candidate=");
+        scope_hasher.update(normalized_path_identity(base).as_bytes());
+        if base.extension().is_none() {
+            for extension in &family.extensions {
+                scope_hasher.update(b"\0candidate_extension=");
+                scope_hasher.update(extension.as_bytes());
+            }
+        }
+    }
+    scope_hasher.update(if family.truncated {
+        b"\0candidate_family=truncated".as_slice()
+    } else {
+        b"\0candidate_family=complete".as_slice()
+    });
+    let scope_key = format!("{:x}", scope_hasher.finalize());
+
     let mut fingerprint_source = directory_state_bytes(cwd);
-    fingerprint_source.extend_from_slice(b"\0PATH=");
-    fingerprint_source.extend_from_slice(path_text.as_bytes());
+    fingerprint_source.extend_from_slice(b"\0scope=");
+    fingerprint_source.extend_from_slice(scope_key.as_bytes());
     fingerprint_source.push(0);
     fingerprint_source.extend_from_slice(&canonical_env_bytes(env_overrides));
     fingerprint_source.push(0);
     fingerprint_source.extend_from_slice(RESOLVER_RULES_VERSION);
-    (
-        content_digest(&scope_source),
-        content_digest(&fingerprint_source),
-    )
+    (scope_key, content_digest(&fingerprint_source))
 }
 
 fn resolve_program(
@@ -193,55 +387,47 @@ fn resolve_program(
     cwd: &std::path::Path,
     env_overrides: &HashMap<String, String>,
 ) -> Result<ProgramResolution, ProgramResolutionFailure> {
+    let family = candidate_family(argv0, cwd, env_overrides);
+    let (scope_key, fingerprint) = resolution_identity(&family, cwd, env_overrides);
     let mut attempted: Vec<String> = Vec::new();
     let try_candidate = |candidate: std::path::PathBuf, attempted: &mut Vec<String>| {
         if attempted.len() < MAX_ATTEMPTED_CANDIDATES {
             attempted.push(candidate.to_string_lossy().into_owned());
         }
-        candidate_executable(candidate)
+        candidate_executable(candidate, &family.extensions)
     };
 
     // 相对路径禁止 `..` 逃逸出本次调用的 cwd（cwd 本身已被工作区约束，
     // argv0 不能绕过这层围栏）。
     if !is_absolute(argv0) && has_path_separator(argv0) {
-        let escapes = std::path::Path::new(argv0)
+        let request_path = program_path(argv0);
+        let escapes = request_path
             .components()
             .any(|component| component == std::path::Component::ParentDir);
         if escapes {
             return Err(ProgramResolutionFailure {
                 candidates_tried: Vec::new(),
+                scope_key,
+                fingerprint,
             });
         }
     }
 
-    let resolved = if is_absolute(argv0) {
-        try_candidate(std::path::PathBuf::from(argv0), &mut attempted)
-    } else if has_path_separator(argv0) {
-        try_candidate(cwd.join(argv0), &mut attempted)
-    } else {
-        // 裸名：cwd 优先（cmd.exe 语义），再按 PATH 顺序。
-        try_candidate(cwd.join(argv0), &mut attempted).or_else(|| {
-            effective_path_dirs().into_iter().find_map(|dir| {
-                let full = dir.join(argv0);
-                if attempted.len() < MAX_ATTEMPTED_CANDIDATES {
-                    attempted.push(full.to_string_lossy().into_owned());
-                }
-                candidate_executable(full)
-            })
-        })
-    };
+    let resolved = family
+        .bases
+        .iter()
+        .find_map(|candidate| try_candidate(candidate.clone(), &mut attempted));
 
     match resolved {
-        Some(executable) => {
-            let (scope_key, fingerprint) = resolution_identity(cwd, env_overrides);
-            Ok(ProgramResolution {
-                executable,
-                scope_key,
-                fingerprint,
-            })
-        }
+        Some(executable) => Ok(ProgramResolution {
+            executable,
+            scope_key,
+            fingerprint,
+        }),
         None => Err(ProgramResolutionFailure {
             candidates_tried: attempted,
+            scope_key,
+            fingerprint,
         }),
     }
 }
@@ -462,7 +648,6 @@ impl ProcessRunTool {
                 // 一次错误必须足以纠正。preview 只列前 20 个名字，
                 // 身份指纹则覆盖完整有界目录状态（同理）。
                 let entries = bounded_cwd_listing(&cwd);
-                let (scope_key, fingerprint) = resolution_identity(&cwd, &args.env);
                 let recovery_hint = "process.run launches an executable argv directly; shell syntax and built-ins require shell.exec (or an explicit shell executable plus its command flag)";
                 return Ok(ToolOutcome::Value(agent_contracts::tool_failure_output(
                     call_id,
@@ -484,8 +669,8 @@ impl ProcessRunTool {
                         "cwd": cwd.display().to_string(),
                         "entries": entries,
                         "attempted": failure.candidates_tried,
-                        "resolution_scope_key": scope_key,
-                        "resolution_fingerprint": fingerprint,
+                        "resolution_scope_key": failure.scope_key,
+                        "resolution_fingerprint": failure.fingerprint,
                         "recovery_hint": recovery_hint,
                     }),
                 )));
@@ -687,8 +872,8 @@ impl ProcessRunTool {
             "outcome": outcome,
             "cwd": if cwd_text.is_empty() { "." } else { &cwd_text },
             "argv": argv_text,
-            // matched-success：成功也携带解析身份，义务账本只
-            // 在 scope 与指纹都匹配时才认定 blocker 被真正解决。
+            // matched-success：成功也携带候选族 scope；安装目标会推进
+            // fingerprint，但同一 scope 的真实启动就是解除 blocker 的证明。
             "resolution_scope_key": resolution.scope_key,
             "resolution_fingerprint": resolution.fingerprint,
         });
@@ -890,12 +1075,14 @@ mod tests {
         }
         let env_a: HashMap<String, String> =
             [("K1".into(), "v1".into()), ("K2".into(), "v2".into())].into();
-        let (scope_a, fp_a) = resolution_identity(dir.path(), &env_a);
+        let family_a = candidate_family("probe", dir.path(), &env_a);
+        let (scope_a, fp_a) = resolution_identity(&family_a, dir.path(), &env_a);
 
         // 同一状态：指纹稳定（HashMap 迭代顺序无关）。
         let env_b: HashMap<String, String> =
             [("K2".into(), "v2".into()), ("K1".into(), "v1".into())].into();
-        let (scope_b, fp_b) = resolution_identity(dir.path(), &env_b);
+        let family_b = candidate_family("probe", dir.path(), &env_b);
+        let (scope_b, fp_b) = resolution_identity(&family_b, dir.path(), &env_b);
         assert_eq!(scope_a, scope_b);
         assert_eq!(fp_a, fp_b);
 
@@ -903,15 +1090,122 @@ mod tests {
         // （目录状态指纹覆盖名字集合——解析域的前置是“存在与否”，
         // 同名文件的字节重建不属于解析前置。）
         std::fs::remove_file(dir.path().join("file24.txt")).unwrap();
-        let (_scope_c, fp_c) = resolution_identity(dir.path(), &env_a);
+        let family_c = candidate_family("probe", dir.path(), &env_a);
+        let (_scope_c, fp_c) = resolution_identity(&family_c, dir.path(), &env_a);
         assert_ne!(fp_a, fp_c, "beyond-preview changes must move the epoch");
         assert_eq!(scope_a, _scope_c, "content changes never move the scope");
 
         // 新增文件同样推进 epoch，scope 不变。
         std::fs::write(dir.path().join("zz_new.bin"), "y").unwrap();
-        let (_scope_d, fp_d) = resolution_identity(dir.path(), &env_a);
+        let family_d = candidate_family("probe", dir.path(), &env_a);
+        let (_scope_d, fp_d) = resolution_identity(&family_d, dir.path(), &env_a);
         assert_ne!(fp_c, fp_d);
         assert_eq!(scope_a, _scope_d);
+    }
+
+    #[test]
+    fn resolution_scope_binds_normalized_program_and_candidate_family() {
+        let dir = tempfile::tempdir().unwrap();
+        let env = HashMap::new();
+        let foo_before = candidate_family("foo", dir.path(), &env);
+        let bar = candidate_family("bar", dir.path(), &env);
+        let (foo_scope_before, foo_fingerprint_before) =
+            resolution_identity(&foo_before, dir.path(), &env);
+        let (bar_scope, _) = resolution_identity(&bar, dir.path(), &env);
+        assert_ne!(
+            foo_scope_before, bar_scope,
+            "different argv0 candidate families must never share a blocker scope"
+        );
+
+        // Installing the requested candidate moves its world fingerprint but
+        // not its lineage. A later successful `foo` can therefore resolve
+        // the exact `foo` blocker without becoming equivalent to `bar`.
+        std::fs::write(dir.path().join("foo"), "program").unwrap();
+        let foo_after = candidate_family("foo", dir.path(), &env);
+        let (foo_scope_after, foo_fingerprint_after) =
+            resolution_identity(&foo_after, dir.path(), &env);
+        assert_eq!(foo_scope_before, foo_scope_after);
+        assert_ne!(foo_fingerprint_before, foo_fingerprint_after);
+
+        let slash_form = candidate_family("./foo", dir.path(), &env);
+        let backslash_form = candidate_family(".\\foo", dir.path(), &env);
+        let (slash_scope, _) = resolution_identity(&slash_form, dir.path(), &env);
+        let (backslash_scope, _) = resolution_identity(&backslash_form, dir.path(), &env);
+        assert_eq!(
+            slash_scope, backslash_scope,
+            "the model-visible slash aliases normalize to one candidate family"
+        );
+
+        let absolute = dir.path().join("foo");
+        let dotted_absolute = dir.path().join(".").join("foo");
+        let direct_family = candidate_family(&absolute.to_string_lossy(), dir.path(), &env);
+        let dotted_family = candidate_family(&dotted_absolute.to_string_lossy(), dir.path(), &env);
+        let (direct_scope, _) = resolution_identity(&direct_family, dir.path(), &env);
+        let (dotted_scope, _) = resolution_identity(&dotted_family, dir.path(), &env);
+        assert_eq!(
+            direct_scope, dotted_scope,
+            "lexical dot segments are normalized"
+        );
+
+        #[cfg(windows)]
+        {
+            let upper = candidate_family("FOO", dir.path(), &env);
+            let (upper_scope, _) = resolution_identity(&upper, dir.path(), &env);
+            assert_eq!(
+                foo_scope_after, upper_scope,
+                "Windows lookup is case-insensitive"
+            );
+        }
+        #[cfg(not(windows))]
+        {
+            let upper = candidate_family("FOO", dir.path(), &env);
+            let (upper_scope, _) = resolution_identity(&upper, dir.path(), &env);
+            assert_ne!(
+                foo_scope_after, upper_scope,
+                "Unix lookup is case-sensitive"
+            );
+        }
+    }
+
+    #[test]
+    fn explicit_path_and_platform_extensions_define_the_resolved_family() {
+        let dir = tempfile::tempdir().unwrap();
+        let bin = dir.path().join("bin");
+        std::fs::create_dir(&bin).unwrap();
+        #[cfg(windows)]
+        let source = std::path::PathBuf::from(
+            std::env::var("ComSpec").unwrap_or_else(|_| "C:\\Windows\\System32\\cmd.exe".into()),
+        );
+        #[cfg(not(windows))]
+        let source = std::path::PathBuf::from("/bin/echo");
+        let file_name = if cfg!(windows) {
+            "family.exe"
+        } else {
+            "family"
+        };
+        std::fs::copy(source, bin.join(file_name)).unwrap();
+
+        let mut env = HashMap::new();
+        env.insert(
+            "PATH".into(),
+            std::env::join_paths([std::path::Path::new("bin")])
+                .unwrap()
+                .to_string_lossy()
+                .into_owned(),
+        );
+        #[cfg(windows)]
+        env.insert("PATHEXT".into(), ".EXE".into());
+
+        let resolution = resolve_program("family", dir.path(), &env)
+            .expect("the requested-cwd-relative PATH candidate must resolve");
+        assert_eq!(
+            normalized_path_identity(&resolution.executable),
+            normalized_path_identity(&bin.join(file_name))
+        );
+
+        let other_family = candidate_family("other", dir.path(), &env);
+        let (other_scope, _) = resolution_identity(&other_family, dir.path(), &env);
+        assert_ne!(resolution.scope_key, other_scope);
     }
 
     #[tokio::test]
@@ -970,6 +1264,38 @@ mod tests {
             output.model_content, "process produced no stdout/stderr",
             "zero-byte success must be terminal without inviting artifact.read"
         );
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn absolute_comspec_preserves_a_verbatim_command_string() {
+        let dir = tempfile::tempdir().unwrap();
+        let workspace = Workspace::open(dir.path()).await.unwrap();
+        let tool = ProcessRunTool::new(workspace);
+        let run_id = RunId::new();
+        let arguments = json!({
+            "argv": [
+                std::env::var("ComSpec")
+                    .unwrap_or_else(|_| "C:\\Windows\\System32\\cmd.exe".into()),
+                "/D",
+                "/C",
+                "exit /b 0"
+            ]
+        });
+        let context = ctx(run_id, &arguments);
+        let output = value(
+            tool.execute(
+                run_id,
+                "c",
+                arguments,
+                Some(context),
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap(),
+        );
+
+        assert!(output.ok, "absolute ComSpec command failed: {output:?}");
     }
 
     fn write_marker_argv() -> Vec<String> {

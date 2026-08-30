@@ -26,6 +26,7 @@ use agent_contracts::{
     ContextItemSummary, ContextMaintenanceReport, ContextMaintenanceTrigger, ContextQuery,
     ContextStateTransition, MaterializedContext, ModelCapabilities, ModelOutput, ModelRequest,
     ModelTransport, RuntimeEvent, RuntimeEventEnvelope, ScopeId, ScopeKind, ToolCall,
+    VerificationCoverageDeclaration,
 };
 use agent_core::{CoreAuthorityConfig, PolicyApprovalGate};
 use agent_runtime::{ModuleHost, RuntimeCheckpoint, RuntimeInstance};
@@ -249,6 +250,9 @@ impl ContextEngine for GateContextEngine {
             selected: Vec::new(),
             approx_tokens: 0,
             foreground: Vec::new(),
+            required_item_ids: Vec::new(),
+            required_misses: Default::default(),
+            optional_misses: Default::default(),
             diagnostics: Default::default(),
         })
     }
@@ -343,6 +347,88 @@ impl GateReport {
     }
 }
 
+const GATE_ACCEPTANCE_DOMAIN: &str = "retry-policy-build";
+const GATE_ACCEPTANCE_CRITERION: &str =
+    "the completed retry-policy crate compiles against its frozen public module graph";
+
+/// Build the verifier catalog and the exact host declaration consumed by
+/// Runtime's completion gate. Compiler output stays under runtime state;
+/// every source input that rustc may load is hashed into the PASS identity.
+fn gate_verification_projection() -> anyhow::Result<(
+    tool_runtime::VerificationRecipes,
+    VerificationCoverageDeclaration,
+)> {
+    let exact_inputs = FIXTURE_FILES
+        .iter()
+        .filter(|(path, _)| path.starts_with("src/"))
+        .map(|(path, _)| (*path).to_string())
+        .collect();
+    let recipe = tool_runtime::VerificationRecipe::new(
+        "gate",
+        "Compile the retry-policy fixture without mutating its source inputs",
+        "retry-policy-build-v1",
+        vec![
+            "rustc".into(),
+            "--edition=2021".into(),
+            "--crate-name".into(),
+            "jobrunner".into(),
+            "--crate-type".into(),
+            "lib".into(),
+            "--emit=metadata=.focus-agent/artifacts/jobrunner-gate.rmeta".into(),
+            "src/lib.rs".into(),
+        ],
+    )
+    .map_err(|error| anyhow!("gate recipe: {error}"))?
+    .with_exact_current_world_reuse()
+    .with_exact_inputs(exact_inputs)
+    .map_err(|error| anyhow!("gate exact inputs: {error}"))?
+    .with_coverage_domain(GATE_ACCEPTANCE_DOMAIN)
+    .map_err(|error| anyhow!("gate coverage domain: {error}"))?;
+    let recipes = tool_runtime::VerificationRecipes::new(vec![recipe])
+        .and_then(|recipes| {
+            recipes.with_domains(vec![tool_runtime::VerificationCoverageDomain {
+                domain_id: GATE_ACCEPTANCE_DOMAIN.into(),
+                declaration_revision: 1,
+                members: vec!["gate".into()],
+            }])
+        })
+        .map_err(|error| anyhow!("gate verification projection: {error}"))?;
+    let declaration = recipes
+        .coverage_declaration(GATE_ACCEPTANCE_DOMAIN)
+        .cloned()
+        .ok_or_else(|| anyhow!("gate acceptance declaration is missing"))?;
+    Ok((recipes, declaration))
+}
+
+/// Install host-owned completion authority while the actor is idle. The
+/// model can later earn coverage only by running the matching trusted recipe.
+async fn declare_gate_acceptance(
+    handle: &agent_runtime::RuntimeHandle,
+    declaration: &VerificationCoverageDeclaration,
+) -> anyhow::Result<()> {
+    let task = handle
+        .list_tasks()
+        .await?
+        .into_iter()
+        .find(|task| task.status == agent_runtime::TaskStatus::Active)
+        .ok_or_else(|| anyhow!("gate task is not active after set_focus"))?;
+    handle
+        .patch_task_anchor(
+            task.id,
+            task.anchor_revision,
+            agent_runtime::task::AnchorPatch {
+                completion_policy: Some(agent_runtime::TaskCompletionPolicy::EvidenceRequired),
+                acceptance_criteria: Some(vec![agent_runtime::AcceptanceCriterion::declared(
+                    GATE_ACCEPTANCE_CRITERION,
+                    declaration,
+                )]),
+                ..agent_runtime::task::AnchorPatch::default()
+            },
+        )
+        .await?;
+    Ok(())
+}
+
 /// Run the deterministic normal/resume gate end to end.
 pub async fn run_deterministic_gate() -> anyhow::Result<GateReport> {
     let dir = tempfile::tempdir()?;
@@ -359,19 +445,10 @@ async fn spawn_instance(
     opportunity_switch: bool,
 ) -> anyhow::Result<RuntimeInstance> {
     let workspace = agent_workspace::Workspace::open(root).await?;
-    // One pinned source-read-only exact-world verifier, registered through
-    // the real host recipe path so the replay exercises production
-    // attribution and execution rather than a harness stand-in.
-    let recipe = tool_runtime::VerificationRecipe::new(
-        "gate",
-        "pinned deterministic verifier for the opportunity replay",
-        "v1",
-        vec!["cargo".into(), "--version".into()],
-    )
-    .map_err(|e| anyhow!("gate recipe: {e}"))?
-    .with_exact_current_world_reuse();
-    let recipes = tool_runtime::VerificationRecipes::new(vec![recipe])
-        .map_err(|e| anyhow!("gate recipes: {e}"))?;
+    // The exact same projection supplies both the executable recipe and the
+    // completion-authority snapshot. Cold instances must recompose the same
+    // declaration instead of inheriting an unchecked checkpoint claim.
+    let (recipes, _) = gate_verification_projection()?;
     let dispatcher = tool_runtime::BuiltinToolDispatcher::with_config_and_verification_recipes(
         workspace.clone(),
         tool_runtime::ToolLifecycleConfig::default(),
@@ -405,10 +482,7 @@ async fn drain_until(
     while tokio::time::Instant::now() < deadline {
         while let Ok(envelope) = events.try_recv() {
             match envelope.event {
-                RuntimeEvent::TaskResumeCommitted {
-                    ref debt,
-                    ..
-                } => {
+                RuntimeEvent::TaskResumeCommitted { ref debt, .. } => {
                     if debt.iter().any(|reason| reason == "opportunity_offered") {
                         labels.push("resume:opportunity_offered".into());
                     } else {
@@ -466,7 +540,7 @@ async fn drive_two_phases(root: &Path) -> anyhow::Result<GateReport> {
             "task.manage",
             "r2",
             json!({
-                "base_anchor_revision": 0,
+                "base_anchor_revision": 1,
                 "plan_progress": ["read the retry configuration"],
                 "next_action": "add max_delay_ms"
             }),
@@ -491,6 +565,10 @@ async fn drive_two_phases(root: &Path) -> anyhow::Result<GateReport> {
         .set_focus(DIRECTIVE.to_string())
         .await
         .map_err(|e| anyhow!("set_focus: {e}"))?;
+    let (_, gate_acceptance) = gate_verification_projection()?;
+    declare_gate_acceptance(handle_a, &gate_acceptance)
+        .await
+        .map_err(|e| anyhow!("declare acceptance: {e}"))?;
     handle_a
         .user_message(DIRECTIVE.to_string())
         .await
@@ -527,12 +605,16 @@ async fn drive_two_phases(root: &Path) -> anyhow::Result<GateReport> {
             ..
         } = envelope.event
         {
-            durable_tuple =
-                Some((artifact.clone(), checksum.clone(), sequence, capability_generation));
+            durable_tuple = Some((
+                artifact.clone(),
+                checksum.clone(),
+                sequence,
+                capability_generation,
+            ));
         }
     }
-    let (artifact, ack_checksum, acked_sequence, acked_generation) = durable_tuple
-        .ok_or_else(|| anyhow!("phase-a never acknowledged a durable checkpoint"))?;
+    let (artifact, ack_checksum, acked_sequence, acked_generation) =
+        durable_tuple.ok_or_else(|| anyhow!("phase-a never acknowledged a durable checkpoint"))?;
     instance_a
         .shutdown()
         .await
@@ -542,9 +624,7 @@ async fn drive_two_phases(root: &Path) -> anyhow::Result<GateReport> {
     // store, then the ack digest and snapshot sequence cross-checked against
     // the tuple before anything restores. Any mismatch bails here — phase B
     // must never silently resume from a stale or foreign snapshot.
-    let store = agent_runtime::CheckpointStore::new(
-        root.join(".focus-agent").join("checkpoints"),
-    );
+    let store = agent_runtime::CheckpointStore::new(root.join(".focus-agent").join("checkpoints"));
     let payload = store
         .load_verified(&artifact)
         .await
@@ -585,7 +665,7 @@ async fn drive_two_phases(root: &Path) -> anyhow::Result<GateReport> {
             "task.manage",
             "c1",
             json!({
-                "base_anchor_revision": 1,
+                "base_anchor_revision": 2,
                 "current_interpretation": "policy shape agreed; implement the loop",
                 "next_action": "implement transient-only retries with saturation"
             }),
@@ -606,13 +686,27 @@ async fn drive_two_phases(root: &Path) -> anyhow::Result<GateReport> {
             json!({"path": "README.md", "content": PHASE_TWO_README}),
         ),
         ScriptGateModel::call(
-            "capability.manage",
+            "task.manage",
             "c5",
+            json!({
+                "base_anchor_revision": 3,
+                "plan_progress": [
+                    "implemented bounded transient retries",
+                    "updated the public error taxonomy and README"
+                ],
+                "open_loops": [],
+                "next_action": ""
+            }),
+        ),
+        ScriptGateModel::call("verify.run", "c6", json!({"recipe_id": "gate"})),
+        ScriptGateModel::call(
+            "capability.manage",
+            "c7",
             json!({"op": "load", "name": "task.complete"}),
         ),
         ScriptGateModel::call(
             "task.complete",
-            "c6",
+            "c8",
             json!({"summary": "bounded exponential retry policy implemented and documented"}),
         ),
     ]));
@@ -658,11 +752,16 @@ async fn drive_two_phases(root: &Path) -> anyhow::Result<GateReport> {
             ..
         } = envelope.event
         {
-            final_tuple = Some((artifact.clone(), checksum.clone(), sequence, capability_generation));
+            final_tuple = Some((
+                artifact.clone(),
+                checksum.clone(),
+                sequence,
+                capability_generation,
+            ));
         }
     }
-    let (final_artifact, final_checksum, final_sequence, final_generation) = final_tuple
-        .ok_or_else(|| anyhow!("phase-b never acknowledged the terminal checkpoint"))?;
+    let (final_artifact, final_checksum, final_sequence, final_generation) =
+        final_tuple.ok_or_else(|| anyhow!("phase-b never acknowledged the terminal checkpoint"))?;
     let terminal_payload = store
         .load_verified(&final_artifact)
         .await
@@ -676,9 +775,8 @@ async fn drive_two_phases(root: &Path) -> anyhow::Result<GateReport> {
             "terminal artifact digest does not match its acknowledgement"
         );
     }
-    let terminal_checkpoint: RuntimeCheckpoint =
-        serde_json::from_slice(&terminal_payload)
-            .map_err(|e| anyhow!("terminal payload deserialization: {e}"))?;
+    let terminal_checkpoint: RuntimeCheckpoint = serde_json::from_slice(&terminal_payload)
+        .map_err(|e| anyhow!("terminal payload deserialization: {e}"))?;
     anyhow::ensure!(
         terminal_checkpoint.snapshot_sequence == final_sequence
             && terminal_checkpoint.capability_generation == final_generation,
@@ -948,10 +1046,7 @@ async fn drive_opportunity_arm(
                         _ => {}
                     }
                 }
-                RuntimeEvent::TaskResumeCommitted {
-                    ref debt,
-                    ..
-                } => {
+                RuntimeEvent::TaskResumeCommitted { ref debt, .. } => {
                     if debt.iter().any(|reason| reason == "opportunity_offered") {
                         obs.markers.push("resume_opportunity_debt");
                     }

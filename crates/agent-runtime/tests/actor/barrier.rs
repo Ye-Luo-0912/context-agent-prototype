@@ -42,29 +42,174 @@ async fn turn_completed_is_broadcast_only_after_the_barrier() {
         let appended = journal.appended.lock().unwrap();
         assert_eq!(
             appended.last().map(String::as_str),
-            Some("TurnCompleted"),
-            "TurnCompleted must be the last event appended before the barrier"
+            Some("RuntimeCommitBarrier { kind: Turn, checkpoint_sequence: None }"),
+            "the explicit marker must close the durable turn batch"
         );
         assert!(
             appended
                 .iter()
                 .any(|name| name.starts_with("AssistantMessage")),
-            "mandatory state writes must be appended before TurnCompleted: {appended:?}"
+            "mandatory state writes must be appended before the commit batch: {appended:?}"
         );
     }
     handle.stop().await.unwrap();
 }
 
 #[tokio::test]
-async fn failed_barrier_blocks_turn_completed_and_marks_recovery_required() {
+async fn work_requires_one_successful_start_and_duplicate_start_writes_no_marker() {
+    let journal = Arc::new(BarrierJournal::default());
+    let kernel = kernel_with_journal(journal.clone());
+    let (handle, _task) = spawn_runtime(kernel);
+
+    let before_start = handle
+        .user_message("must not run before start".into())
+        .await
+        .expect_err("business work must wait for the durable startup marker");
+    assert!(matches!(
+        before_start,
+        agent_contracts::AgentError::InvalidRequest(_)
+    ));
+    assert!(journal.appended.lock().unwrap().is_empty());
+
+    handle.start().await.unwrap();
+    let duplicate = handle
+        .start()
+        .await
+        .expect_err("startup is a one-shot actor transition");
+    assert!(matches!(
+        duplicate,
+        agent_contracts::AgentError::InvalidRequest(_)
+    ));
+    assert_eq!(
+        journal
+            .appended
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|event| event.starts_with("RuntimeCommitBarrier { kind: RunStart"))
+            .count(),
+        1,
+        "a duplicate Start must not append another format marker"
+    );
+
+    // Rejecting a duplicate does not poison the already serving actor.
+    handle.set_focus("still serving".into()).await.unwrap();
+    handle.stop().await.unwrap();
+}
+
+#[tokio::test]
+async fn partial_startup_append_failure_fences_work_without_stop_repairing_the_prefix() {
+    let journal = Arc::new(BarrierJournal {
+        fail_append_at: std::sync::atomic::AtomicUsize::new(2),
+        ..BarrierJournal::default()
+    });
+    let kernel = kernel_with_journal(journal.clone());
+    let (handle, _task) = spawn_runtime(kernel);
+
+    let start = handle
+        .start()
+        .await
+        .expect_err("the RunStart marker append must fail");
+    assert!(matches!(
+        start,
+        agent_contracts::AgentError::RecoveryRequired(_)
+    ));
+    assert_eq!(
+        journal.appended.lock().unwrap().as_slice(),
+        ["RunStarted"],
+        "only the accepted first batch member may remain forensic"
+    );
+
+    let work = handle
+        .user_message("must remain fenced".into())
+        .await
+        .expect_err("startup failure must reject later turns");
+    assert!(matches!(
+        work,
+        agent_contracts::AgentError::RecoveryRequired(_)
+    ));
+    let retry = handle
+        .start()
+        .await
+        .expect_err("a later Start must not sweep the partial prefix");
+    assert!(matches!(
+        retry,
+        agent_contracts::AgentError::RecoveryRequired(_)
+    ));
+    assert_eq!(journal.append_attempts.load(Ordering::SeqCst), 2);
+
+    handle.stop().await.unwrap();
+    assert_eq!(
+        journal.append_attempts.load(Ordering::SeqCst),
+        2,
+        "shutdown after failed startup must not append RunCompleted"
+    );
+    assert_eq!(journal.flushes.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
+async fn startup_flush_failure_fences_work_without_retrying_flush_on_stop() {
     let journal = Arc::new(BarrierJournal {
         fail_flush: AtomicBool::new(true),
         ..BarrierJournal::default()
     });
     let kernel = kernel_with_journal(journal.clone());
     let (handle, _task) = spawn_runtime(kernel);
+
+    let start = handle
+        .start()
+        .await
+        .expect_err("the startup durability flush must fail");
+    assert!(matches!(
+        start,
+        agent_contracts::AgentError::RecoveryRequired(_)
+    ));
+    assert_eq!(journal.flushes.load(Ordering::SeqCst), 1);
+    assert_eq!(
+        journal
+            .appended
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|event| event.starts_with("RuntimeCommitBarrier { kind: RunStart"))
+            .count(),
+        1
+    );
+
+    let work = handle
+        .user_message("must remain fenced".into())
+        .await
+        .expect_err("a failed startup flush must reject later turns");
+    assert!(matches!(
+        work,
+        agent_contracts::AgentError::RecoveryRequired(_)
+    ));
+    let retry = handle
+        .start()
+        .await
+        .expect_err("the actor must not retry a failed startup flush");
+    assert!(matches!(
+        retry,
+        agent_contracts::AgentError::RecoveryRequired(_)
+    ));
+
+    handle.stop().await.unwrap();
+    assert_eq!(
+        journal.flushes.load(Ordering::SeqCst),
+        1,
+        "shutdown after failed startup must not retry the failed prefix"
+    );
+    assert_eq!(journal.append_attempts.load(Ordering::SeqCst), 2);
+}
+
+#[tokio::test]
+async fn failed_barrier_blocks_turn_completed_and_marks_recovery_required() {
+    let journal = Arc::new(BarrierJournal::default());
+    let kernel = kernel_with_journal(journal.clone());
+    let (handle, _task) = spawn_runtime(kernel);
     let mut events = handle.subscribe();
     handle.start().await.unwrap();
+    journal.fail_flush.store(true, Ordering::SeqCst);
 
     handle.user_message("hello".into()).await.unwrap();
 
@@ -108,6 +253,12 @@ async fn failed_barrier_blocks_turn_completed_and_marks_recovery_required() {
             appended.iter().any(|name| name == "TurnCompleted"),
             "TurnCompleted must be appended into the FIFO before the failed flush: {appended:?}"
         );
+        assert!(
+            appended
+                .iter()
+                .any(|name| name.starts_with("RuntimeCommitBarrier")),
+            "the failed batch may leave an orphan marker in the forensic suffix: {appended:?}"
+        );
     }
     let next = handle
         .user_message("must wait for recovery".into())
@@ -117,6 +268,8 @@ async fn failed_barrier_blocks_turn_completed_and_marks_recovery_required() {
         matches!(next, agent_contracts::AgentError::RecoveryRequired(_)),
         "the runtime must stay fenced after the failed barrier: {next}"
     );
+    // The permanent same-run fence is what prevents any later successful
+    // barrier from sweeping the orphan failed batch into a trusted prefix.
     // The operator repairs storage before the runtime may run again: with
     // the barrier healthy, stop's own flush succeeds and teardown is clean.
     journal.fail_flush.store(false, Ordering::SeqCst);

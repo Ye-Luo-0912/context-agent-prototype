@@ -2,9 +2,8 @@
 //! context-engine state and locate the durability barrier after a failed
 //! turn commit.
 //!
-//! The runtime's `TurnCompleted` barrier is the successful-turn durability
-//! contract: events
-//! at or before the last successful `TurnCompleted` are durably committed,
+//! The runtime's explicit `RuntimeCommitBarrier` is the durability contract:
+//! events at or before the last marker are durably committed,
 //! and a failed barrier (`TurnCommitFailed` + `RecoveryRequired`) means the
 //! turn did *not* commit — the runtime drops the turn frame and fences
 //! further mutation until a known-good restore. This module answers the
@@ -14,8 +13,8 @@
 //!   failure that forced recovery, if any);
 //! - whether the envelope sequence is contiguous (a gap means events were
 //!   lost or duplicated on disk);
-//! - the context-engine state rebuilt from the trace (fresh engine, full
-//!   deterministic replay) — the "truth" a recovery can trust;
+//! - the context-engine state rebuilt from the committed trace prefix (fresh
+//!   engine, deterministic replay) — the "truth" a recovery can trust;
 //! - optionally, a restore-consistency proof: a context checkpoint restored
 //!   and then advanced by the events after it must equal the full rebuild,
 //!   which is the engine-level guarantee that the runtime and the context
@@ -32,6 +31,7 @@ use std::path::Path;
 use agent_contracts::{
     ContextDiagnostics, ContextEngine, RunId, RuntimeEvent, RuntimeEventEnvelope, TurnId,
 };
+use agent_runtime::RuntimeCheckpoint;
 use context_baselines::{AppendOnlyEngine, RollingConfig, RollingSummaryEngine};
 use context_simple::{SimpleContextConfig, SimpleContextEngine};
 use serde_json::Value;
@@ -68,11 +68,11 @@ fn build_engine(kind: ReplayEngineKind) -> std::sync::Arc<dyn ContextEngine> {
 /// Where the trace's durability barrier stands and why.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RecoveryBarrier {
-    /// seq of the last event covered by a successful `TurnCompleted`
-    /// barrier. Events at or before this seq are durably committed; a
-    /// crash-recovery rebuild may treat everything before it as trusted.
-    /// `0` means no turn ever committed (the crash happened before the
-    /// first barrier).
+    /// Seq of the last explicit runtime commit barrier. Events at or before
+    /// this seq are durably committed; a crash-recovery rebuild may treat
+    /// everything before it as trusted. A new-format run may stop at its
+    /// `RunStart` marker without committing a model turn. `0` means no
+    /// explicit marker (and no legacy turn fallback) committed.
     pub last_committed_seq: u64,
     /// The turn-commit failure that demanded recovery, when the trace
     /// shows one. The runtime stops committing after the first failure
@@ -103,9 +103,10 @@ pub struct RecoveryReport {
     /// The first gap found, as `(expected_seq, found_seq)`.
     pub seq_gap: Option<(u64, u64)>,
     pub barrier: RecoveryBarrier,
-    /// The context-engine state rebuilt from the trace: a fresh engine
-    /// replaying every event of the run in order. Deterministic — same
-    /// trace, same engine version, same rebuilt state.
+    /// The context-engine state rebuilt from the committed trace prefix: a
+    /// fresh engine replaying events through `barrier.last_committed_seq` in
+    /// order. The forensic suffix remains available to the diagnostics in
+    /// this report but never becomes restored Context truth.
     pub rebuilt: ReplayOutcome,
     /// Final diagnostics of the rebuilt engine (the "truth" state).
     pub rebuilt_diagnostics: ContextDiagnostics,
@@ -131,15 +132,34 @@ pub struct RestoreConsistencyReport {
     pub consistent: bool,
     /// The first dimension that disagreed, when inconsistent.
     pub first_difference: Option<String>,
+    /// Which durable source defined truth for this proof.
+    pub truth_source: RestoreTruthSource,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RestoreTruthSource {
+    TraceBarrier,
+    TerminalCheckpoint,
 }
 
 /// Analyze the durability barrier of one run's envelopes.
 pub fn analyze_barrier(events: &[RuntimeEventEnvelope]) -> RecoveryBarrier {
     let mut last_committed_seq = 0u64;
     let mut failure: Option<RecoveryFailure> = None;
+    // v4 traces written before the explicit marker remain readable, but a
+    // trace that contains any marker uses only marker semantics throughout.
+    // New runs durably append a RunStart marker before work begins, so a
+    // partially appended first turn can never fall back to legacy
+    // TurnCompleted inference merely because its final marker is absent.
+    let has_explicit_barrier = events
+        .iter()
+        .any(|envelope| matches!(envelope.event, RuntimeEvent::RuntimeCommitBarrier { .. }));
     for envelope in events {
         match &envelope.event {
-            RuntimeEvent::TurnCompleted => last_committed_seq = envelope.seq,
+            RuntimeEvent::RuntimeCommitBarrier { .. } => last_committed_seq = envelope.seq,
+            RuntimeEvent::TurnCompleted if !has_explicit_barrier => {
+                last_committed_seq = envelope.seq
+            }
             // TurnCancelled has its own durable audit barrier, but it
             // explicitly means that no model/context turn commit occurred.
             // It must never advance the successful-commit recovery marker.
@@ -180,6 +200,37 @@ pub fn first_seq_gap(events: &[RuntimeEventEnvelope]) -> Option<(u64, u64)> {
         }
     }
     None
+}
+
+/// Borrow the ordered prefix covered by the last successful runtime barrier.
+///
+/// Recovery traces are append-ordered by sequence. Sequence integrity is
+/// reported separately over the full trace; this selector deliberately does
+/// not discard the forensic suffix from those diagnostics. With no committed
+/// barrier (`last_committed_seq == 0`) the trusted Context prefix is empty.
+fn committed_prefix(
+    events: &[RuntimeEventEnvelope],
+    last_committed_seq: u64,
+) -> &[RuntimeEventEnvelope] {
+    let end = events
+        .iter()
+        .position(|envelope| envelope.seq > last_committed_seq)
+        .unwrap_or(events.len());
+    &events[..end]
+}
+
+/// Borrow the part of an already committed prefix not covered by a
+/// checkpoint. Keeping this as a slice avoids cloning bounded event payloads
+/// during offline recovery verification.
+fn events_after_sequence(
+    events: &[RuntimeEventEnvelope],
+    covered_seq: u64,
+) -> &[RuntimeEventEnvelope] {
+    let start = events
+        .iter()
+        .position(|envelope| envelope.seq > covered_seq)
+        .unwrap_or(events.len());
+    &events[start..]
 }
 
 /// One model round whose tool batch never settled: abrupt process loss
@@ -387,7 +438,8 @@ pub async fn recovery_replay(
     let barrier = analyze_barrier(events);
     let seq_gap = first_seq_gap(events);
     let batch_interruptions = analyze_batch_interruptions(events);
-    let (rebuilt, rebuilt_diagnostics) = rebuild_engine_state(events, config, kind).await?;
+    let trusted = committed_prefix(events, barrier.last_committed_seq);
+    let (rebuilt, rebuilt_diagnostics) = rebuild_engine_state(trusted, config, kind).await?;
     Ok(RecoveryReport {
         run_id,
         envelopes: events.len(),
@@ -400,16 +452,17 @@ pub async fn recovery_replay(
     })
 }
 
-/// Prove a context checkpoint agrees with the trace: restore it into a fresh
-/// engine, replay the events after `checkpoint_cover_seq`, and compare the
-/// resulting diagnostics with a full rebuild from the trace.
+/// Prove a context checkpoint agrees with committed trace truth: restore it
+/// into a fresh engine, replay committed events after
+/// `checkpoint_cover_seq`, and compare the resulting diagnostics with a
+/// fresh rebuild of the same committed prefix.
 ///
 /// `checkpoint_cover_seq` is the seq of the last event the checkpoint was
 /// captured after — the caller knows it because a checkpoint is captured at
-/// a runtime safe point (the runtime captures at turn boundaries, so the
-/// natural value is the last committed `TurnCompleted` seq). The checkpoint
-/// must be captured at a complete preview/consumption boundary, otherwise
-/// the incremental replay may encounter an unmatched acknowledgement.
+/// a runtime safe point and records the event cursor covered by that state.
+/// The checkpoint must be captured at a complete preview/consumption
+/// boundary, otherwise the incremental replay may encounter an unmatched
+/// acknowledgement.
 pub async fn verify_restore_consistency(
     checkpoint: &Value,
     checkpoint_cover_seq: u64,
@@ -417,20 +470,20 @@ pub async fn verify_restore_consistency(
     config: &ReplayConfig,
     kind: ReplayEngineKind,
 ) -> anyhow::Result<RestoreConsistencyReport> {
-    // Full rebuild: fresh engine replaying every event.
-    let (_, full_diagnostics) = rebuild_engine_state(events, config, kind).await?;
+    // Both sides prove the same committed truth. Events after the last
+    // successful runtime barrier remain forensic evidence and must not be
+    // resurrected into either rebuild path.
+    let barrier = analyze_barrier(events);
+    let trusted = committed_prefix(events, barrier.last_committed_seq);
+    let (_, full_diagnostics) = rebuild_engine_state(trusted, config, kind).await?;
 
     // Incremental: restore the checkpoint, then replay only the events that
     // landed after it. The engine's own `restore` is a whole-state replace,
     // so the replayed tail applies on exactly the captured state.
     let engine = build_engine(kind);
     engine.restore(checkpoint.clone()).await?;
-    let tail: Vec<RuntimeEventEnvelope> = events
-        .iter()
-        .filter(|envelope| envelope.seq > checkpoint_cover_seq)
-        .cloned()
-        .collect();
-    run_engine_observing(engine.clone(), &tail, config, |_, _| {}).await?;
+    let tail = events_after_sequence(trusted, checkpoint_cover_seq);
+    run_engine_observing(engine.clone(), tail, config, |_, _| {}).await?;
     let incremental_diagnostics = engine.diagnostics().await?;
 
     let (consistent, first_difference) =
@@ -441,6 +494,68 @@ pub async fn verify_restore_consistency(
         full_diagnostics,
         consistent,
         first_difference,
+        truth_source: RestoreTruthSource::TraceBarrier,
+    })
+}
+
+/// Verify a full runtime checkpoint without allowing an older journal
+/// prefix to roll back a durably frozen terminal context plane. A matching
+/// task-completion barrier becomes the checkpoint's logical cover boundary;
+/// before that marker exists, the terminal checkpoint is stronger truth.
+pub async fn verify_runtime_restore_consistency(
+    checkpoint: &RuntimeCheckpoint,
+    events: &[RuntimeEventEnvelope],
+    config: &ReplayConfig,
+    kind: ReplayEngineKind,
+) -> anyhow::Result<RestoreConsistencyReport> {
+    checkpoint.validate()?;
+    if !checkpoint.terminal_commit {
+        return verify_restore_consistency(
+            &checkpoint.context,
+            checkpoint.event_cover_seq,
+            events,
+            config,
+            kind,
+        )
+        .await;
+    }
+
+    let barrier = analyze_barrier(events);
+    let trusted = committed_prefix(events, barrier.last_committed_seq);
+    let matching_terminal_barrier = trusted.iter().find_map(|envelope| match &envelope.event {
+        RuntimeEvent::RuntimeCommitBarrier {
+            kind: agent_contracts::RuntimeCommitKind::TaskCompletion,
+            checkpoint_sequence: Some(sequence),
+        } if *sequence == checkpoint.snapshot_sequence => Some(envelope.seq),
+        _ => None,
+    });
+    let logical_cover_seq = matching_terminal_barrier.unwrap_or(checkpoint.event_cover_seq);
+
+    let engine = build_engine(kind);
+    engine.restore(checkpoint.context.clone()).await?;
+    let tail = events_after_sequence(trusted, logical_cover_seq);
+    run_engine_observing(engine.clone(), tail, config, |_, _| {}).await?;
+    let incremental_diagnostics = engine.diagnostics().await?;
+
+    let (full_diagnostics, truth_source) = if matching_terminal_barrier.is_some() {
+        let (_, diagnostics) = rebuild_engine_state(trusted, config, kind).await?;
+        (diagnostics, RestoreTruthSource::TraceBarrier)
+    } else {
+        // The event trace cannot reconstruct the terminal transaction in
+        // this crash window; the atomic runtime checkpoint is authoritative.
+        (
+            incremental_diagnostics.clone(),
+            RestoreTruthSource::TerminalCheckpoint,
+        )
+    };
+    let (consistent, first_difference) =
+        compare_diagnostics(&incremental_diagnostics, &full_diagnostics);
+    Ok(RestoreConsistencyReport {
+        incremental_diagnostics,
+        full_diagnostics,
+        consistent,
+        first_difference,
+        truth_source,
     })
 }
 
@@ -751,6 +866,108 @@ mod tests {
         events
     }
 
+    fn explicit_barriers(events: Vec<RuntimeEventEnvelope>) -> Vec<RuntimeEventEnvelope> {
+        let mut explicit = Vec::with_capacity(events.len() + 2);
+        for envelope in events {
+            let run_id = envelope.run_id;
+            let terminal = matches!(envelope.event, RuntimeEvent::TurnCompleted);
+            explicit.push(envelope);
+            if terminal {
+                explicit.push(RuntimeEventEnvelope {
+                    run_id,
+                    seq: 0,
+                    timestamp_ms: 0,
+                    event: RuntimeEvent::RuntimeCommitBarrier {
+                        kind: agent_contracts::RuntimeCommitKind::Turn,
+                        checkpoint_sequence: None,
+                    },
+                });
+            }
+        }
+        for (index, envelope) in explicit.iter_mut().enumerate() {
+            envelope.seq = index as u64 + 1;
+        }
+        explicit
+    }
+
+    #[test]
+    fn explicit_barrier_owns_normal_turn_and_ignores_uncommitted_terminal_tail() {
+        let run = RunId::new();
+        let mut events = explicit_barriers(happy_trace(run));
+        let committed = events.last().unwrap().seq;
+        events.push(envelope(
+            run,
+            committed + 1,
+            RuntimeEvent::TaskCompleted {
+                task_id: TaskId::new(),
+                anchor_revision: 0,
+                summary: "checkpoint landed but audit transaction did not".into(),
+            },
+        ));
+        assert_eq!(analyze_barrier(&events).last_committed_seq, committed);
+
+        events.push(envelope(
+            run,
+            committed + 2,
+            RuntimeEvent::RuntimeCommitBarrier {
+                kind: agent_contracts::RuntimeCommitKind::TaskCompletion,
+                checkpoint_sequence: Some(7),
+            },
+        ));
+        assert_eq!(analyze_barrier(&events).last_committed_seq, committed + 2);
+    }
+
+    #[test]
+    fn explicit_barrier_never_falls_back_to_a_later_bare_turn_completed() {
+        let run = RunId::new();
+        let mut events = explicit_barriers(happy_trace(run));
+        let committed = events.last().unwrap().seq;
+        events.push(envelope(run, committed + 1, RuntimeEvent::TurnCompleted));
+        events.push(envelope(
+            run,
+            committed + 2,
+            RuntimeEvent::TurnCommitFailed {
+                phase: "runtime_commit_barrier".into(),
+                message: "flush failed".into(),
+            },
+        ));
+        let barrier = analyze_barrier(&events);
+        assert_eq!(barrier.last_committed_seq, committed);
+        assert_eq!(barrier.failure.unwrap().seq, committed + 2);
+    }
+
+    #[test]
+    fn run_start_marker_prevents_legacy_fallback_for_a_partial_first_turn_batch() {
+        let run = RunId::new();
+        let events = vec![
+            envelope(run, 1, RuntimeEvent::RunStarted),
+            envelope(
+                run,
+                2,
+                RuntimeEvent::RuntimeCommitBarrier {
+                    kind: agent_contracts::RuntimeCommitKind::RunStart,
+                    checkpoint_sequence: None,
+                },
+            ),
+            // The lifecycle member reached the journal, but appending the
+            // final Turn marker failed. This must not look like a committed
+            // legacy turn.
+            envelope(run, 3, RuntimeEvent::TurnCompleted),
+            envelope(
+                run,
+                4,
+                RuntimeEvent::TurnCommitFailed {
+                    phase: "runtime_commit_barrier".into(),
+                    message: "marker append failed".into(),
+                },
+            ),
+        ];
+
+        let barrier = analyze_barrier(&events);
+        assert_eq!(barrier.last_committed_seq, 2);
+        assert_eq!(barrier.failure.unwrap().seq, 4);
+    }
+
     #[tokio::test]
     async fn recovery_locates_the_last_committed_barrier() {
         let run = RunId::new();
@@ -817,6 +1034,111 @@ mod tests {
         assert_eq!(failure.phase, "turn_completed_event");
         assert_eq!(barrier.events_after_failure, 2);
         assert!(report.seq_contiguous);
+    }
+
+    #[tokio::test]
+    async fn recovery_rebuild_excludes_the_uncommitted_tail_but_keeps_its_diagnostics() {
+        let run = RunId::new();
+        let mut events = happy_trace(run);
+        let committed_seq = events.last().unwrap().seq;
+        let failed_turn = TurnId::new();
+        let mut seq = committed_seq + 1;
+        events.push(envelope(
+            run,
+            seq,
+            RuntimeEvent::user_message_accepted("uncommitted third turn"),
+        ));
+        seq += 1;
+        events.push(model_started_event(run, seq, failed_turn, 3));
+        seq += 1;
+        events.push(tool_started_event(run, seq, "tail-call"));
+        seq += 1;
+        events.push(envelope(
+            run,
+            seq,
+            RuntimeEvent::ToolFinished {
+                output: tool_output(true, "uncommitted tail observation"),
+            },
+        ));
+        seq += 1;
+        events.push(envelope(
+            run,
+            seq,
+            RuntimeEvent::TurnCommitFailed {
+                phase: "turn_completed_event".into(),
+                message: "journal flush failed".into(),
+            },
+        ));
+        seq += 1;
+        events.push(envelope(run, seq, RuntimeEvent::RecoveryRequired));
+
+        let report = recovery_replay(&events, &ReplayConfig::default(), ReplayEngineKind::Dynamic)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            report.envelopes,
+            events.len(),
+            "the forensic trace stays intact"
+        );
+        assert_eq!(report.barrier.last_committed_seq, committed_seq);
+        assert_eq!(
+            report.rebuilt.events_consumed, committed_seq as usize,
+            "Context truth must stop at the last successful turn barrier"
+        );
+        assert_eq!(
+            report.rebuilt.turns, 2,
+            "the failed third turn is not restored"
+        );
+        assert_eq!(
+            report.rebuilt.tool_rounds, 1,
+            "the uncommitted tool observation is not restored"
+        );
+        assert_eq!(
+            report.batch_interruptions.interrupted_rounds.len(),
+            1,
+            "full-trace interruption diagnostics still inspect the failed suffix"
+        );
+    }
+
+    #[tokio::test]
+    async fn recovery_with_no_successful_turn_rebuilds_empty_context_truth() {
+        let run = RunId::new();
+        let events = vec![
+            envelope(run, 1, RuntimeEvent::RunStarted),
+            envelope(
+                run,
+                2,
+                RuntimeEvent::user_message_accepted("never committed"),
+            ),
+            envelope(
+                run,
+                3,
+                RuntimeEvent::AssistantMessage {
+                    content: "must remain forensic".into(),
+                },
+            ),
+            envelope(
+                run,
+                4,
+                RuntimeEvent::TurnCommitFailed {
+                    phase: "assistant_observation".into(),
+                    message: "context ingest failed".into(),
+                },
+            ),
+            envelope(run, 5, RuntimeEvent::RecoveryRequired),
+        ];
+
+        let report = recovery_replay(&events, &ReplayConfig::default(), ReplayEngineKind::Dynamic)
+            .await
+            .unwrap();
+
+        assert_eq!(report.barrier.last_committed_seq, 0);
+        assert_eq!(report.rebuilt.events_consumed, 0);
+        assert_eq!(report.rebuilt.turns, 0);
+        assert_eq!(report.rebuilt_diagnostics.total_items, 0);
+        assert_eq!(report.envelopes, events.len());
+        assert!(report.barrier.failure.is_some());
     }
 
     #[test]
@@ -955,6 +1277,186 @@ mod tests {
             report.full_diagnostics.turn, report.incremental_diagnostics.turn,
             "both paths replay the same turns"
         );
+    }
+
+    #[tokio::test]
+    async fn durable_terminal_checkpoint_wins_the_pre_audit_crash_window() {
+        use agent_runtime::task::{
+            CompletionDisposition, CompletionRecord, CompletionVerificationStatus, TaskAnchor,
+            TaskStatus, TaskToolRequirementSet,
+        };
+        use agent_runtime::{
+            ExecutionState, RunMetadata, RuntimeCheckpoint, TaskManagerSnapshot, TaskRecordSnapshot,
+        };
+
+        let run = RunId::new();
+        let task_id = TaskId::new();
+        let events = vec![
+            envelope(
+                run,
+                1,
+                RuntimeEvent::FocusChanged {
+                    task_id,
+                    goal: "finish atomically".into(),
+                },
+            ),
+            envelope(run, 2, RuntimeEvent::TurnCompleted),
+            envelope(
+                run,
+                3,
+                RuntimeEvent::RuntimeCommitBarrier {
+                    kind: agent_contracts::RuntimeCommitKind::Turn,
+                    checkpoint_sequence: None,
+                },
+            ),
+        ];
+
+        let engine = SimpleContextEngine::new(SimpleContextConfig::default());
+        engine
+            .ingest(agent_contracts::ContextIngress::FocusChanged {
+                focus: agent_contracts::FocusState::for_task(task_id, "finish atomically"),
+            })
+            .await
+            .unwrap();
+        engine
+            .maintain(ContextMaintenanceTrigger::FocusChanged)
+            .await
+            .unwrap();
+        engine
+            .ingest(agent_contracts::ContextIngress::TaskCompleted {
+                task_id: Some(task_id),
+                summary: "done".into(),
+            })
+            .await
+            .unwrap();
+        engine
+            .maintain(ContextMaintenanceTrigger::TaskCompleted)
+            .await
+            .unwrap();
+
+        let completion = CompletionRecord {
+            task_id,
+            anchor_revision: 0,
+            summary: "done".into(),
+            completed_at_ms: 1,
+            final_output_ref: None,
+            final_output_digest: None,
+            artifacts: Vec::new(),
+            verification_status: CompletionVerificationStatus::Unverified,
+            verification_refs: Vec::new(),
+            disposition: CompletionDisposition::LegacyUnclassified,
+            unmet_reasons: Vec::new(),
+        };
+        let checkpoint = RuntimeCheckpoint {
+            version: agent_runtime::RUNTIME_CHECKPOINT_VERSION,
+            run_metadata: RunMetadata {
+                run_id: run,
+                created_at_ms: 1,
+            },
+            tasks: TaskManagerSnapshot {
+                tasks: vec![TaskRecordSnapshot {
+                    id: task_id,
+                    goal: "finish atomically".into(),
+                    status: TaskStatus::Completed,
+                    created_at_ms: 0,
+                    last_active_ms: 1,
+                    tool_requirements: TaskToolRequirementSet::default(),
+                    anchor: TaskAnchor::default(),
+                    resume: ExecutionState::default(),
+                    turn_intent: String::new(),
+                }],
+                active: None,
+                completed: vec![completion],
+            },
+            current_task_id: None,
+            focus_revision: 1,
+            last_surface_revision: 0,
+            context: engine.checkpoint().await.unwrap(),
+            capabilities: Vec::new(),
+            authority: None,
+            snapshot_sequence: 7,
+            capability_generation: 0,
+            event_cover_seq: 3,
+            terminal_commit: true,
+        };
+
+        let report = verify_runtime_restore_consistency(
+            &checkpoint,
+            &events,
+            &ReplayConfig::default(),
+            ReplayEngineKind::Dynamic,
+        )
+        .await
+        .unwrap();
+        assert!(report.consistent);
+        assert_eq!(report.truth_source, RestoreTruthSource::TerminalCheckpoint);
+        assert!(
+            report.incremental_diagnostics.total_items > 0,
+            "recovery must retain the terminal context rather than rebuilding an older prefix"
+        );
+    }
+
+    #[tokio::test]
+    async fn restore_consistency_ignores_events_after_the_last_committed_barrier() {
+        let run = RunId::new();
+        let mut events = happy_trace(run);
+        let cover_index = events
+            .iter()
+            .position(|envelope| matches!(envelope.event, RuntimeEvent::TurnCompleted))
+            .expect("happy trace has a first committed turn");
+        let cover_seq = events[cover_index].seq;
+        let engine = std::sync::Arc::new(SimpleContextEngine::new(SimpleContextConfig::default()));
+        run_engine_observing(
+            engine.clone(),
+            &events[..=cover_index],
+            &ReplayConfig::default(),
+            |_, _| {},
+        )
+        .await
+        .unwrap();
+        let checkpoint = engine.checkpoint().await.unwrap();
+
+        let mut seq = events.last().unwrap().seq + 1;
+        events.push(envelope(
+            run,
+            seq,
+            RuntimeEvent::user_message_accepted("failed third turn"),
+        ));
+        seq += 1;
+        events.push(envelope(
+            run,
+            seq,
+            RuntimeEvent::AssistantMessage {
+                content: "uncommitted answer".into(),
+            },
+        ));
+        seq += 1;
+        events.push(envelope(
+            run,
+            seq,
+            RuntimeEvent::TurnCommitFailed {
+                phase: "turn_completed_event".into(),
+                message: "barrier failed".into(),
+            },
+        ));
+
+        let report = verify_restore_consistency(
+            &checkpoint,
+            cover_seq,
+            &events,
+            &ReplayConfig::default(),
+            ReplayEngineKind::Dynamic,
+        )
+        .await
+        .unwrap();
+
+        assert!(
+            report.consistent,
+            "checkpoint plus committed tail must equal committed full rebuild: {:?}",
+            report.first_difference
+        );
+        assert_eq!(report.full_diagnostics.turn, 2);
+        assert_eq!(report.incremental_diagnostics.turn, 2);
     }
 
     #[tokio::test]

@@ -122,10 +122,10 @@ fn usage() -> ! {
          the runtime.\n\
 \n\
          Completion Convergence V1 paired live gate: the frozen\n\
-         retry_policy_dev pack runs every normal/resume cell twice, once\n\
-         with the TASK PROGRESS model projection off and once on; the\n\
-         projection switch is the only variable between the arms, and the\n\
-         arm is part of the evidence pair name. Each cell reports\n\
+         retry_policy_dev pack runs every normal/resume cell twice, with\n\
+         product TaskProgress on in both arms and only the neutral\n\
+         settlement node projected off versus on; the arm is the only\n\
+         treatment and is part of the evidence pair name. Each cell reports\n\
          event-derived settlement exposure plus candidate-episode\n\
          rounds/calls/failures. Zero on-arm exposure makes the gate\n\
          inconclusive, never a pass; the deterministic pair-parity and\n\
@@ -696,11 +696,7 @@ async fn main() -> anyhow::Result<()> {
             }
             "--conv-gate" => {
                 let mode_filter = args.next().filter(|value| !value.starts_with('-'));
-                let repeats = if repeats_set {
-                    repeats
-                } else {
-                    2
-                };
+                let repeats = if repeats_set { repeats } else { 2 };
                 run_conv_gate(mode_filter, repeats, evidence_dir, allow_dirty).await?;
                 return Ok(());
             }
@@ -1230,7 +1226,7 @@ async fn run_m15_window(
     );
     let protocol = envfile::get("OPENAI_API_PROTOCOL").unwrap_or_else(|| "auto".into());
     anyhow::ensure!(
-        !protocol.eq_ignore_ascii_case("auto"),
+        !protocol.trim().eq_ignore_ascii_case("auto"),
         "--m15-window requires an explicit OPENAI_API_PROTOCOL pin; auto negotiation is not a reproducible serving identity"
     );
     bundle::require_clean_tree(allow_dirty)?;
@@ -1344,7 +1340,9 @@ async fn run_opportunity_gate(
                     long_live::CellSwitches {
                         opportunity,
                         recovery_surface: false,
-                        project_progress: false,
+                        project_task_progress: true,
+                        project_settlement: false,
+                        settlement_projection_diagnostics: false,
                     },
                 )
                 .await?;
@@ -1368,18 +1366,17 @@ async fn run_opportunity_gate(
             if cells.is_empty() {
                 continue;
             }
-            let mut rounds: Vec<u64> = cells
+            let rounds: Vec<u64> = cells
                 .iter()
                 .map(|cell| (cell.model_rounds_phase_one + cell.model_rounds_phase_two) as u64)
                 .collect();
-            let median_rounds = checked_percentile(&mut rounds, 50).unwrap_or(0);
             println!(
-                "{:<6} opp={} cells={} passed={} median_total_rounds={} offers={} called={} completed={}",
+                "{:<6} opp={} cells={} passed={} total_rounds={} offers={} called={} completed={}",
                 mode.id(),
                 label,
                 cells.len(),
                 cells.iter().filter(|cell| cell.passed).count(),
-                median_rounds,
+                long_live::render_sample_center(&rounds),
                 cells
                     .iter()
                     .map(|cell| cell.opportunity_offers.len())
@@ -1458,7 +1455,9 @@ async fn run_recovery_surface_gate(
                         long_live::CellSwitches {
                             opportunity: false,
                             recovery_surface,
-                            project_progress: false,
+                            project_task_progress: true,
+                            project_settlement: false,
+                            settlement_projection_diagnostics: false,
                         },
                         long_live::AcceptanceProfile::M15V1,
                     )
@@ -1489,22 +1488,24 @@ async fn run_recovery_surface_gate(
                 if cells.is_empty() {
                     continue;
                 }
-                let mut rounds: Vec<u64> = cells
+                let rounds: Vec<u64> = cells
                     .iter()
                     .map(|cell| (cell.model_rounds_phase_one + cell.model_rounds_phase_two) as u64)
                     .collect();
-                let median_rounds = checked_percentile(&mut rounds, 50).unwrap_or(0);
                 let max_rounds = rounds.iter().copied().max().unwrap_or(0);
                 println!(
-                    "{:<13} {:<6} recovery={} cells={} passed={} median_total_rounds={} max_total_rounds={} completed={}",
+                    "{:<13} {:<6} recovery={} cells={} passed={} total_rounds={} max_total_rounds={} completed={}",
                     pack.id,
                     mode.id(),
                     label,
                     cells.len(),
                     cells.iter().filter(|cell| cell.passed).count(),
-                    median_rounds,
+                    long_live::render_sample_center(&rounds),
                     max_rounds,
-                    cells.iter().filter(|cell| cell.closure == "completed").count(),
+                    cells
+                        .iter()
+                        .filter(|cell| cell.closure == "completed")
+                        .count(),
                 );
             }
         }
@@ -1513,12 +1514,158 @@ async fn run_recovery_surface_gate(
     Ok(())
 }
 
+const CONV_GATE_RUN_SCHEMA: &str = "agent-eval.conv-gate-run.v1";
+const CONV_GATE_VERDICT_SCHEMA: &str = "agent-eval.conv-gate-verdict.v1";
+
+fn require_pinned_conv_protocol(raw: Option<&str>) -> anyhow::Result<&'static str> {
+    match provider_openai::OpenAiProtocol::parse(raw.unwrap_or("auto"))
+        .map_err(anyhow::Error::msg)?
+    {
+        provider_openai::OpenAiProtocol::Responses => Ok("responses"),
+        provider_openai::OpenAiProtocol::ChatCompletions => Ok("chat"),
+        provider_openai::OpenAiProtocol::Auto => anyhow::bail!(
+            "INVALID: --conv-gate requires an explicit OPENAI_API_PROTOCOL pin; auto negotiation can make the first arm change the second arm's wire protocol"
+        ),
+    }
+}
+
+/// Claim one immutable parent for the entire causal attempt. Per-cell retry
+/// directories remain immutable below it, while plan/preflight/verdict can
+/// no longer be overwritten by a later invocation using the same CLI root.
+fn claim_conv_gate_run_dir(root: &std::path::Path) -> anyhow::Result<(String, std::path::PathBuf)> {
+    let runs = root.join("_runs");
+    std::fs::create_dir_all(&runs)?;
+    for _ in 0..8 {
+        let run_id = agent_contracts::RunId::new().to_string();
+        let run_dir = runs.join(format!("run-{run_id}"));
+        match std::fs::create_dir(&run_dir) {
+            Ok(()) => return Ok((run_id, run_dir)),
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(error) => return Err(error.into()),
+        }
+    }
+    anyhow::bail!("could not claim a unique convergence-gate run directory")
+}
+
+fn write_new_json(path: &std::path::Path, value: &impl serde::Serialize) -> anyhow::Result<()> {
+    use std::io::Write as _;
+
+    let bytes = serde_json::to_vec_pretty(value)?;
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(path)?;
+    file.write_all(&bytes)?;
+    file.sync_all()?;
+    Ok(())
+}
+
+fn conv_gate_exit(
+    verdict: &long_live::ConvGateJudgment,
+    verdict_path: &std::path::Path,
+) -> anyhow::Result<()> {
+    let reason = verdict
+        .reasons
+        .first()
+        .map(String::as_str)
+        .unwrap_or("no reason recorded");
+    match verdict.state {
+        "pass" => Ok(()),
+        "invalid" => anyhow::bail!(
+            "INVALID: convergence gate evidence is not causally admissible ({reason}); verdict={}",
+            verdict_path.display()
+        ),
+        "inconclusive" => anyhow::bail!(
+            "INCONCLUSIVE: convergence gate did not obtain the required exposure ({reason}); verdict={}",
+            verdict_path.display()
+        ),
+        "fail" => anyhow::bail!(
+            "FAIL: convergence candidate did not satisfy the frozen gate ({reason}); verdict={}",
+            verdict_path.display()
+        ),
+        state => anyhow::bail!(
+            "INVALID: convergence evaluator returned unknown state {state:?}; verdict={}",
+            verdict_path.display()
+        ),
+    }
+}
+
+fn write_conv_gate_verdict(
+    run_id: &str,
+    run_dir: &std::path::Path,
+    protocol: &str,
+    state: &str,
+    reasons: &[String],
+    outcomes: &[long_live::CellOutcome],
+) -> anyhow::Result<std::path::PathBuf> {
+    let off: Vec<&long_live::CellOutcome> = outcomes
+        .iter()
+        .filter(|cell| !cell.project_settlement)
+        .collect();
+    let on: Vec<&long_live::CellOutcome> = outcomes
+        .iter()
+        .filter(|cell| cell.project_settlement)
+        .collect();
+    let cells: Vec<serde_json::Value> = outcomes
+        .iter()
+        .map(|cell| {
+            let evidence_dir = cell.evidence_dir.as_ref().map(|path| {
+                path.strip_prefix(run_dir)
+                    .unwrap_or(path)
+                    .to_string_lossy()
+                    .replace('\\', "/")
+            });
+            serde_json::json!({
+                "pack_id": cell.pack_id,
+                "mode": cell.mode.id(),
+                "repeat": cell.identity.repeat,
+                "arm": if cell.project_settlement { "on" } else { "off" },
+                "project_task_progress": cell.project_task_progress,
+                "project_settlement": cell.project_settlement,
+                "settlement_projection_diagnostics": cell.settlement_projection_diagnostics,
+                "settlement_exposed": cell.settlement_seen,
+                "passed": cell.passed,
+                "evidence_dir": evidence_dir,
+                "identity": {
+                    "candidate_id": cell.identity.candidate_id,
+                    "source_tree_digest": cell.identity.source_tree_digest,
+                    "fixture_sha256": cell.identity.fixture_sha256,
+                    "tool_surface": cell.identity.tool_surface,
+                    "surface_config_digest": cell.identity.surface_config_digest,
+                    "prompt_config_digest": cell.identity.prompt_config_digest,
+                    "acceptance_domain": cell.identity.acceptance_domain,
+                    "acceptance_declaration_revision": cell.identity.acceptance_declaration_revision,
+                    "acceptance_source_digest": cell.identity.acceptance_source_digest,
+                    "provider_config_digest": cell.identity.provider_config_digest,
+                    "settlement_projection_diagnostics": cell.identity.settlement_projection_diagnostics,
+                },
+            })
+        })
+        .collect();
+    let record = serde_json::json!({
+        "schema": CONV_GATE_VERDICT_SCHEMA,
+        "run_id": run_id,
+        "state": state,
+        "classification": state.to_ascii_uppercase(),
+        "protocol": protocol,
+        "reasons": reasons,
+        "off_cells": off.len(),
+        "off_exposed": off.iter().filter(|cell| cell.settlement_seen).count(),
+        "on_cells": on.len(),
+        "on_exposed": on.iter().filter(|cell| cell.settlement_seen).count(),
+        "cells": cells,
+    });
+    let path = run_dir.join("verdict.json");
+    write_new_json(&path, &record)?;
+    Ok(path)
+}
+
 /// Completion Convergence V1 paired live gate: the frozen retry_policy_dev
-/// pack runs every normal/resume cell twice, once with the TASK PROGRESS
-/// model projection off and once on; the projection switch is the only
-/// variable between the arms. Each cell reports event-derived settlement
-/// exposure and candidate-episode rounds/calls/failures. Zero on-arm
-/// exposure makes the gate inconclusive, never a pass; the deterministic
+/// pack runs every normal/resume cell twice with product TaskProgress on in
+/// both arms; only the neutral settlement node is projected off versus on.
+/// Each cell reports event-derived settlement exposure and candidate-episode
+/// rounds/calls/failures. Any planned cell without paired exposure makes
+/// the gate inconclusive, never a selected-subset pass; the deterministic
 /// verdict (pair parity plus episode efficiency) is printed here, and
 /// promotion judgment lives in the evidence REPORT with the frozen
 /// criteria.
@@ -1530,26 +1677,92 @@ async fn run_conv_gate(
 ) -> anyhow::Result<()> {
     bundle::require_clean_tree(allow_dirty)?;
     let modes = long_live::PilotMode::parse(mode_filter.as_deref())?;
-    anyhow::ensure!((1..=4).contains(&repeats), "repeats must be 1..=4");
     anyhow::ensure!(
-        repeats >= 2,
-        "the convergence gate requires at least two paired repeats"
+        matches!(repeats, 2 | 4),
+        "the counterbalanced convergence gate requires 2 or 4 repeats"
     );
-    let model = driver::build_live_coding_model()?;
-    let evidence_root = evidence_dir.unwrap_or_else(|| {
-        std::path::PathBuf::from("crates/agent-eval/evidence/conv-gate")
-    });
+    let configured_protocol = envfile::get("OPENAI_API_PROTOCOL");
+    let protocol = require_pinned_conv_protocol(configured_protocol.as_deref())?;
+    let evidence_root = evidence_dir
+        .unwrap_or_else(|| std::path::PathBuf::from("crates/agent-eval/evidence/conv-gate"));
     std::fs::create_dir_all(&evidence_root)?;
-    eprintln!("evidence dir: {}", evidence_root.display());
+    let (run_id, run_dir) = claim_conv_gate_run_dir(&evidence_root)?;
+    eprintln!("evidence run dir: {}", run_dir.display());
+
+    // Fail closed before any provider call if the two same-state requests
+    // differ by more than the single settlement fact. Persist the exact
+    // deterministic verdict alongside the live cells so a later report
+    // cannot assume that unit tests happened to run first.
+    let preflight = agent_runtime::settlement_projection_preflight()?;
+    let preflight_path = run_dir.join("settlement-preflight.json");
+    write_new_json(&preflight_path, &preflight)?;
+    let preflight_sha256 = serialized_sha256(&preflight)?;
+    let planned_modes: Vec<&str> = modes.iter().map(|mode| mode.id()).collect();
+    let manifest = serde_json::json!({
+        "schema": CONV_GATE_RUN_SCHEMA,
+        "run_id": run_id,
+        "candidate_id": "task-progress-settlement-v1",
+        "state": "planned",
+        "source_tree_digest": bundle::source_tree_digest(),
+        "protocol": protocol,
+        "model": envfile::get("OPENAI_MODEL").unwrap_or_else(|| "gpt-4o-mini".into()),
+        "base_url": envfile::get("OPENAI_BASE_URL").unwrap_or_else(|| DEFAULT_OPENAI_BASE_URL.into()),
+        "modes": planned_modes,
+        "repeats": repeats,
+        "arms": ["off", "on"],
+        "project_task_progress": true,
+        "settlement_projection_diagnostics": true,
+        "preflight": {
+            "path": "settlement-preflight.json",
+            "sha256": preflight_sha256,
+            "schema": preflight.schema,
+            "passed": preflight.passed,
+        },
+        "planned_cells": modes.len() * repeats as usize * 2,
+    });
+    write_new_json(&run_dir.join("manifest.json"), &manifest)?;
+    if !preflight.passed {
+        let reasons = vec![
+            "settlement projection preflight found a difference outside the declared fact".into(),
+        ];
+        let verdict_path =
+            write_conv_gate_verdict(&run_id, &run_dir, protocol, "invalid", &reasons, &[])?;
+        anyhow::bail!(
+            "INVALID: settlement projection preflight found an extra request difference; verdict={}",
+            verdict_path.display()
+        );
+    }
+    eprintln!(
+        "settlement projection preflight: PASS (allowed={})",
+        preflight.allowed_difference
+    );
+
+    let model = match driver::build_live_coding_model() {
+        Ok(model) => model,
+        Err(error) => {
+            let reasons = vec![format!("provider configuration is unusable: {error:#}")];
+            let verdict_path =
+                write_conv_gate_verdict(&run_id, &run_dir, protocol, "invalid", &reasons, &[])?;
+            anyhow::bail!(
+                "INVALID: provider configuration is unusable; verdict={}: {error:#}",
+                verdict_path.display()
+            );
+        }
+    };
 
     let pack = long_live::retry_pack();
     let mut outcomes = Vec::new();
-    // Paired arms: identical source, pack, serving, mode and repeat; the
-    // model projection switch is the only difference. The arm is a loop
-    // variable, so the gate can never hardcode a single-arm construction.
-    for arm in ["off", "on"] {
-        for repeat in 1..=repeats {
-            for mode in &modes {
+    // Run each logical pair back-to-back and alternate arm order per repeat.
+    // This bounds systematic provider/time drift without random state, while
+    // stable pair keys remain independent of execution order.
+    for repeat in 1..=repeats {
+        for mode in &modes {
+            let arm_order = if repeat.is_multiple_of(2) {
+                ["on", "off"]
+            } else {
+                ["off", "on"]
+            };
+            for arm in arm_order {
                 eprintln!(
                     "== {} {} {arm} live repeat {repeat}/{repeats} ==",
                     pack.id,
@@ -1560,10 +1773,10 @@ async fn run_conv_gate(
                 // runs, 30s/60s backoff), so a provider outage that
                 // outlives the request-level retry window cannot silently
                 // turn gate evidence into NOT_RUN.
-                let outcome = long_live::run_pack_cell_retrying(
+                let outcome = match long_live::run_pack_cell_retrying(
                     &pack,
                     *mode,
-                    evidence_root.clone(),
+                    run_dir.clone(),
                     format!("{}-{}-{}", pack.id, mode.id(), arm),
                     repeat,
                     repeats,
@@ -1571,13 +1784,30 @@ async fn run_conv_gate(
                     long_live::CellSwitches {
                         opportunity: false,
                         recovery_surface: false,
-                        project_progress: arm == "on",
+                        project_task_progress: true,
+                        project_settlement: arm == "on",
+                        settlement_projection_diagnostics: true,
                     },
                     long_live::AcceptanceProfile::M15V1,
                     3,
                     std::time::Duration::from_secs(30),
                 )
-                .await?;
+                .await
+                {
+                    Ok(outcome) => outcome,
+                    Err(error) => {
+                        let reasons = vec![format!(
+                            "cell harness failed before producing a complete outcome: {error:#}"
+                        )];
+                        let verdict_path = write_conv_gate_verdict(
+                            &run_id, &run_dir, protocol, "invalid", &reasons, &outcomes,
+                        )?;
+                        anyhow::bail!(
+                            "INVALID: convergence cell harness failed; verdict={}: {error:#}",
+                            verdict_path.display()
+                        );
+                    }
+                };
                 outcomes.push(outcome);
             }
         }
@@ -1585,56 +1815,76 @@ async fn run_conv_gate(
 
     println!("\n== convergence paired summary (facts only) ==");
     for mode in &modes {
-        let cells: Vec<&long_live::CellOutcome> = outcomes
-            .iter()
-            .filter(|cell| cell.mode == *mode)
-            .collect();
-        let exposed: Vec<&long_live::CellOutcome> =
-            cells.iter().copied().filter(|cell| cell.settlement_seen).collect();
-        let mut total_rounds: Vec<u64> = cells
-            .iter()
-            .map(|cell| (cell.model_rounds_phase_one + cell.model_rounds_phase_two) as u64)
-            .collect();
-        let mut episode_rounds: Vec<u64> = exposed
-            .iter()
-            .map(|cell| cell.settlement_episode_rounds)
-            .collect();
-        let mut episode_calls: Vec<u64> =
-            exposed.iter().map(|cell| cell.settlement_episode_calls).collect();
-        println!(
-            "{:<6} cells={} passed={} median_total_rounds={} max_total_rounds={} exposed={} median_episode_rounds={} median_episode_calls={} completed={}",
-            mode.id(),
-            cells.len(),
-            cells.iter().filter(|cell| cell.passed).count(),
-            checked_percentile(&mut total_rounds, 50).unwrap_or(0),
-            total_rounds.iter().copied().max().unwrap_or(0),
-            exposed.len(),
-            checked_percentile(&mut episode_rounds, 50).unwrap_or(0),
-            checked_percentile(&mut episode_calls, 50).unwrap_or(0),
-            cells.iter().filter(|cell| cell.closure == "completed").count(),
-        );
-        if exposed.len() != cells.len() {
+        for (arm, projected) in [("off", false), ("on", true)] {
+            let cells: Vec<&long_live::CellOutcome> = outcomes
+                .iter()
+                .filter(|cell| cell.mode == *mode && cell.project_settlement == projected)
+                .collect();
+            let exposed: Vec<&long_live::CellOutcome> = cells
+                .iter()
+                .copied()
+                .filter(|cell| cell.settlement_seen)
+                .collect();
+            let total_rounds: Vec<u64> = cells
+                .iter()
+                .map(|cell| (cell.model_rounds_phase_one + cell.model_rounds_phase_two) as u64)
+                .collect();
+            let episode_rounds: Vec<u64> = exposed
+                .iter()
+                .map(|cell| cell.settlement_episode_rounds)
+                .collect();
+            let episode_calls: Vec<u64> = exposed
+                .iter()
+                .map(|cell| cell.settlement_episode_calls)
+                .collect();
             println!(
-                "  exposure incomplete ({} cell(s) saw no settled candidate): gate is inconclusive, not a pass",
-                cells.len() - exposed.len()
+                "{:<6} settlement={} cells={} passed={} total_rounds={} max_total_rounds={} exposed={} episode_rounds={} episode_calls={} completed={}",
+                mode.id(),
+                arm,
+                cells.len(),
+                cells.iter().filter(|cell| cell.passed).count(),
+                long_live::render_sample_center(&total_rounds),
+                total_rounds.iter().copied().max().unwrap_or(0),
+                exposed.len(),
+                long_live::render_sample_center(&episode_rounds),
+                long_live::render_sample_center(&episode_calls),
+                cells
+                    .iter()
+                    .filter(|cell| cell.closure == "completed")
+                    .count(),
             );
+            if exposed.len() != cells.len() {
+                println!(
+                    "  exposure incomplete ({} cell(s) saw no settled candidate): gate is inconclusive, not a pass",
+                    cells.len() - exposed.len()
+                );
+            }
         }
     }
     let verdict = long_live::evaluate_conv_gate(&outcomes);
     println!("\n{}", verdict.render());
+    let verdict_path = write_conv_gate_verdict(
+        &run_id,
+        &run_dir,
+        protocol,
+        verdict.state,
+        &verdict.reasons,
+        &outcomes,
+    )?;
+    println!("immutable verdict: {}", verdict_path.display());
+    conv_gate_exit(&verdict, &verdict_path)?;
     println!("promotion judgment belongs to the evidence REPORT, not this runner");
     Ok(())
 }
 
 /// Read-only event-level slice of every cell in a conv-gate evidence tree:
 /// what actually happened after the first settled candidate. Prints a
-/// bounded one-line profile per cell plus per-mode/arm medians. Accepts
-/// both legacy single-arm pair names (`{pack}-{mode}`) and paired-arm
+/// bounded one-line profile per cell plus per-mode/arm observation centers.
+/// Accepts both legacy single-arm pair names (`{pack}-{mode}`) and paired-arm
 /// names (`{pack}-{mode}-{off,on}`). Never writes.
 async fn run_conv_tail(evidence_dir: Option<std::path::PathBuf>) -> anyhow::Result<()> {
-    let evidence_root = evidence_dir.unwrap_or_else(|| {
-        std::path::PathBuf::from("crates/agent-eval/evidence/conv-gate")
-    });
+    let evidence_root = evidence_dir
+        .unwrap_or_else(|| std::path::PathBuf::from("crates/agent-eval/evidence/conv-gate"));
     anyhow::ensure!(
         evidence_root.is_dir(),
         "evidence dir {} not found",
@@ -1667,11 +1917,14 @@ async fn run_conv_tail(evidence_dir: Option<std::path::PathBuf>) -> anyhow::Resu
         }
     }
     rows.sort_by(|left, right| left.0.cmp(&right.0).then(left.1.cmp(&right.1)));
-    println!("== settlement episode profile (read-only, from {} ) ==", evidence_root.display());
     println!(
-        "pair                         rep events  episodes first_seq no_prog redundant advanced world_ch invalid reconf resolved episode_failed tools(read/verify/edit/process/shell)"
+        "== settlement episode profile (read-only, from {} ) ==",
+        evidence_root.display()
     );
-    let mut mode_medians: std::collections::BTreeMap<String, Vec<(u64, u64, u64)>> =
+    println!(
+        "pair                         rep events  episodes first_seq no_prog redundant advanced world_ch invalid reconf resolved episode_failed tools(read/verify/edit/process/shell) terminals"
+    );
+    let mut mode_samples: std::collections::BTreeMap<String, Vec<(u64, u64, u64)>> =
         std::collections::BTreeMap::new();
     for (pair, repeat, event_count, profile) in &rows {
         // Pair names are `{pack}-{mode}` (legacy single-arm evidence) or
@@ -1700,8 +1953,14 @@ async fn run_conv_tail(evidence_dir: Option<std::path::PathBuf>) -> anyhow::Resu
         let (read, verify) = (tool("fs.read"), tool("verify.run"));
         let (edits, failed_edits) = (tool("edit.patch"), failed("edit.patch"));
         let (process, shell) = (tool("process.run"), tool("shell.exec"));
+        let terminals = profile
+            .episode_terminals
+            .iter()
+            .map(|(terminal, count)| format!("{}:{count}", terminal.id()))
+            .collect::<Vec<_>>()
+            .join(",");
         println!(
-            "{:<28} {:<3} {:<7} {:<6} {:<9} {:<7} {:<6} {:<6} {:<7} {:<7} {:<6} {:<8} {:<14} {} {} {}",
+            "{:<28} {:<3} {:<7} {:<6} {:<9} {:<7} {:<6} {:<6} {:<7} {:<7} {:<6} {:<8} {:<14} {} {} {} {}",
             pair,
             repeat,
             event_count,
@@ -1718,35 +1977,39 @@ async fn run_conv_tail(evidence_dir: Option<std::path::PathBuf>) -> anyhow::Resu
             format_args!("{read}/{verify}"),
             format_args!("{edits}(er:{failed_edits})"),
             format_args!("{process}/{shell}"),
+            terminals,
         );
         let group = if arm.is_empty() {
             mode.to_string()
         } else {
             format!("{mode}/{arm}")
         };
-        mode_medians
-            .entry(group)
-            .or_default()
-            .push((delta("no_progress"), delta("redundant_evidence"), profile.episode_failures));
+        mode_samples.entry(group).or_default().push((
+            delta("no_progress"),
+            delta("redundant_evidence"),
+            profile.episode_failures,
+        ));
     }
     println!();
-    for (group, samples) in &mode_medians {
-        let mut no_progress: Vec<u64> = samples.iter().map(|row| row.0).collect();
-        let mut redundant: Vec<u64> = samples.iter().map(|row| row.1).collect();
-        let mut failed: Vec<u64> = samples.iter().map(|row| row.2).collect();
+    for (group, samples) in &mode_samples {
+        let no_progress: Vec<u64> = samples.iter().map(|row| row.0).collect();
+        let redundant: Vec<u64> = samples.iter().map(|row| row.1).collect();
+        let failed: Vec<u64> = samples.iter().map(|row| row.2).collect();
         println!(
-            "{:<12} median episode no_progress={} redundant={} episode_failed={} (n={})",
+            "{:<12} episode no_progress={} redundant={} episode_failed={} (n={})",
             group,
-            checked_percentile(&mut no_progress, 50).unwrap_or(0),
-            checked_percentile(&mut redundant, 50).unwrap_or(0),
-            checked_percentile(&mut failed, 50).unwrap_or(0),
+            long_live::render_sample_center(&no_progress),
+            long_live::render_sample_center(&redundant),
+            long_live::render_sample_center(&failed),
             samples.len()
         );
     }
     Ok(())
 }
 
-fn load_events_jsonl(path: &std::path::Path) -> anyhow::Result<Vec<agent_contracts::RuntimeEventEnvelope>> {
+fn load_events_jsonl(
+    path: &std::path::Path,
+) -> anyhow::Result<Vec<agent_contracts::RuntimeEventEnvelope>> {
     let text = std::fs::read_to_string(path)?;
     let mut events = Vec::new();
     for line in text.lines() {
@@ -1758,8 +2021,8 @@ fn load_events_jsonl(path: &std::path::Path) -> anyhow::Result<Vec<agent_contrac
     Ok(events)
 }
 
-/// Calibrated `retry_diag_dev` live smoke: the candidate switches (including
-/// the TASK PROGRESS model projection) stay off, only the diag pack runs,
+/// Calibrated `retry_diag_dev` live smoke: advisory candidates stay off while
+/// product TaskProgress stays on. Only the diag pack runs,
 /// and each cell proves the fixture is solvable by the current serving
 /// before a formal window spends its 12-cell budget.
 async fn run_diag_smoke(
@@ -1803,7 +2066,9 @@ async fn run_diag_smoke(
                 long_live::CellSwitches {
                     opportunity: false,
                     recovery_surface: false,
-                    project_progress: false,
+                    project_task_progress: true,
+                    project_settlement: false,
+                    settlement_projection_diagnostics: false,
                 },
                 long_live::AcceptanceProfile::M15V1,
             )
@@ -1819,28 +2084,30 @@ async fn run_diag_smoke(
 
     println!("\n== diag smoke summary (facts only) ==");
     for mode in &modes {
-        let cells: Vec<&long_live::CellOutcome> = outcomes
-            .iter()
-            .filter(|cell| cell.mode == *mode)
-            .collect();
-        let mut rounds: Vec<u64> = cells
+        let cells: Vec<&long_live::CellOutcome> =
+            outcomes.iter().filter(|cell| cell.mode == *mode).collect();
+        let rounds: Vec<u64> = cells
             .iter()
             .map(|cell| (cell.model_rounds_phase_one + cell.model_rounds_phase_two) as u64)
             .collect();
-        let median_rounds = checked_percentile(&mut rounds, 50).unwrap_or(0);
         let max_rounds = rounds.iter().copied().max().unwrap_or(0);
         println!(
-            "{:<13} {:<6} cells={} passed={} median_total_rounds={} max_total_rounds={} completed={}",
+            "{:<13} {:<6} cells={} passed={} total_rounds={} max_total_rounds={} completed={}",
             pack.id,
             mode.id(),
             cells.len(),
             cells.iter().filter(|cell| cell.passed).count(),
-            median_rounds,
+            long_live::render_sample_center(&rounds),
             max_rounds,
-            cells.iter().filter(|cell| cell.closure == "completed").count(),
+            cells
+                .iter()
+                .filter(|cell| cell.closure == "completed")
+                .count(),
         );
     }
-    println!("solvability judgment belongs to the per-cell oracle/hidden evidence, not this runner");
+    println!(
+        "solvability judgment belongs to the per-cell oracle/hidden evidence, not this runner"
+    );
     Ok(())
 }
 
@@ -2526,6 +2793,69 @@ fn default_evidence_dir() -> std::path::PathBuf {
 #[cfg(test)]
 mod tool_edit_main_tests {
     use super::*;
+
+    #[test]
+    fn conv_gate_protocol_must_be_explicitly_pinned() {
+        assert!(require_pinned_conv_protocol(None).is_err());
+        assert!(require_pinned_conv_protocol(Some("auto")).is_err());
+        assert_eq!(
+            require_pinned_conv_protocol(Some("responses")).unwrap(),
+            "responses"
+        );
+        assert_eq!(require_pinned_conv_protocol(Some("chat")).unwrap(), "chat");
+    }
+
+    #[test]
+    fn conv_gate_run_and_json_claims_never_overwrite() {
+        let temp = tempfile::tempdir().unwrap();
+        let (_, first) = claim_conv_gate_run_dir(temp.path()).unwrap();
+        let (_, second) = claim_conv_gate_run_dir(temp.path()).unwrap();
+        assert_ne!(first, second);
+        assert!(first.is_dir());
+        assert!(second.is_dir());
+
+        let manifest = first.join("manifest.json");
+        write_new_json(&manifest, &serde_json::json!({"attempt": 1})).unwrap();
+        assert!(write_new_json(&manifest, &serde_json::json!({"attempt": 2})).is_err());
+        let persisted: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(manifest).unwrap()).unwrap();
+        assert_eq!(persisted["attempt"], 1);
+    }
+
+    #[test]
+    fn conv_gate_nonpass_verdict_is_persisted_and_machine_fails() {
+        for (state, prefix) in [
+            ("invalid", "INVALID:"),
+            ("inconclusive", "INCONCLUSIVE:"),
+            ("fail", "FAIL:"),
+        ] {
+            let temp = tempfile::tempdir().unwrap();
+            let judgment = long_live::ConvGateJudgment {
+                state,
+                reasons: vec!["test reason".into()],
+                off_cells: 0,
+                off_exposed: 0,
+                on_cells: 0,
+                on_exposed: 0,
+            };
+            let verdict_path = write_conv_gate_verdict(
+                "run-id",
+                temp.path(),
+                "responses",
+                judgment.state,
+                &judgment.reasons,
+                &[],
+            )
+            .unwrap();
+            let persisted: serde_json::Value =
+                serde_json::from_slice(&std::fs::read(&verdict_path).unwrap()).unwrap();
+            assert_eq!(persisted["state"], state);
+            let error = conv_gate_exit(&judgment, &verdict_path)
+                .unwrap_err()
+                .to_string();
+            assert!(error.starts_with(prefix), "{error}");
+        }
+    }
 
     fn manifest() -> bundle::CellManifest {
         bundle::CellManifest {

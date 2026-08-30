@@ -5,6 +5,7 @@ mod entity;
 mod foreground;
 mod harness;
 mod lifecycle;
+mod required;
 mod residency;
 mod scope;
 mod search;

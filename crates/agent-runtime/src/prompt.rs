@@ -8,9 +8,10 @@
 use std::collections::HashSet;
 
 use agent_contracts::{
-    ContextKind, FocusState, MaterializedContext, MaterializedItem, ModelInput, ModelMessage,
-    RuntimeFactsView, TaskAnchorView, TaskProgressView, ToolCatalogEntry, ToolSpec, TurnFrame,
-    TurnFrameStep, render_tool_catalog_index,
+    AgentError, AgentResult, ContentDigest, ContextKind, FocusState, MaterializedContext,
+    MaterializedItem, ModelInput, ModelMessage, RuntimeFactsView, TaskAnchorView, TaskId,
+    TaskProgressView, ToolCatalogEntry, ToolSpec, TurnFrame, TurnFrameStep,
+    render_tool_catalog_index,
 };
 use agent_workspace::capture_host_runtime_facts;
 
@@ -28,6 +29,166 @@ use agent_workspace::capture_host_runtime_facts;
 pub struct PromptAssembler {
     system_prompt: String,
     runtime_facts: RuntimeFactsView,
+}
+
+/// Deterministic evidence produced before a settlement off/on live pair.
+/// Both requests are assembled from the same synthetic state and tool
+/// surface; removing the one allowed settlement fact must make them equal.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct SettlementProjectionPreflight {
+    pub schema: String,
+    pub passed: bool,
+    pub allowed_difference: String,
+    pub settlement_occurrences: u32,
+    pub baseline_request_sha256: String,
+    pub treatment_request_sha256: String,
+    pub normalized_request_sha256: String,
+    /// Exact model-message digests, kept separate from the tool surface so
+    /// live evidence can prove which request arm was actually sent.
+    #[serde(default)]
+    pub baseline_prompt_sha256: String,
+    #[serde(default)]
+    pub treatment_prompt_sha256: String,
+    #[serde(default)]
+    pub normalized_prompt_sha256: String,
+    #[serde(default)]
+    pub baseline_tool_surface_sha256: String,
+    #[serde(default)]
+    pub treatment_tool_surface_sha256: String,
+}
+
+fn serialized_content_digest(value: &impl serde::Serialize) -> AgentResult<String> {
+    let bytes = serde_json::to_vec(value).map_err(|error| {
+        AgentError::Internal(format!("serialize settlement digest input: {error}"))
+    })?;
+    Ok(ContentDigest::sha256_bytes(&bytes).to_string())
+}
+
+/// Compare two fully assembled requests produced from the same runtime
+/// state. `baseline` omits the settlement fact and `treatment` contains it.
+/// The comparison removes only an exact, whole settlement line; any other
+/// prompt or schema difference fails closed.
+pub fn compare_settlement_projection(
+    baseline: &ModelInput,
+    treatment: &ModelInput,
+) -> AgentResult<SettlementProjectionPreflight> {
+    let baseline_bytes = serde_json::to_vec(baseline)
+        .map_err(|error| AgentError::Internal(format!("serialize settlement baseline: {error}")))?;
+    let treatment_bytes = serde_json::to_vec(treatment).map_err(|error| {
+        AgentError::Internal(format!("serialize settlement treatment: {error}"))
+    })?;
+    let baseline_json: serde_json::Value = serde_json::from_slice(&baseline_bytes)
+        .map_err(|error| AgentError::Internal(format!("decode settlement baseline: {error}")))?;
+    let baseline_canonical = serde_json::to_vec(&baseline_json).map_err(|error| {
+        AgentError::Internal(format!("canonicalize settlement baseline: {error}"))
+    })?;
+    let mut normalized_json: serde_json::Value = serde_json::from_slice(&treatment_bytes)
+        .map_err(|error| AgentError::Internal(format!("decode settlement treatment: {error}")))?;
+    let treatment_canonical = serde_json::to_vec(&normalized_json).map_err(|error| {
+        AgentError::Internal(format!("canonicalize settlement treatment: {error}"))
+    })?;
+    let treatment_focus = normalized_json
+        .get("focus_frame")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| AgentError::Internal("settlement treatment has no focus frame".into()))?;
+    let occurrences = treatment_focus
+        .lines()
+        .filter(|line| *line == crate::task::SETTLED_CANDIDATE_PROMPT_LINE)
+        .count();
+    let without_settlement = treatment_focus
+        .lines()
+        .filter(|line| *line != crate::task::SETTLED_CANDIDATE_PROMPT_LINE)
+        .collect::<Vec<_>>()
+        .join("\n");
+    let normalized_focus = normalized_json
+        .get_mut("focus_frame")
+        .ok_or_else(|| AgentError::Internal("settlement treatment lost its focus frame".into()))?;
+    *normalized_focus = serde_json::Value::String(without_settlement);
+    let normalized_bytes = serde_json::to_vec(&normalized_json).map_err(|error| {
+        AgentError::Internal(format!("serialize normalized settlement request: {error}"))
+    })?;
+
+    let baseline_messages = baseline.clone().into_messages();
+    let treatment_messages = treatment.clone().into_messages();
+    let mut normalized_input = treatment.clone();
+    normalized_input.focus_frame = normalized_json
+        .get("focus_frame")
+        .and_then(serde_json::Value::as_str)
+        .map(str::to_owned);
+    let normalized_messages = normalized_input.into_messages();
+    Ok(SettlementProjectionPreflight {
+        schema: "settlement-projection-preflight/v2".into(),
+        passed: occurrences == 1 && baseline_json == normalized_json,
+        allowed_difference: "one task_progress.settlement fact".into(),
+        settlement_occurrences: occurrences.min(u32::MAX as usize) as u32,
+        baseline_request_sha256: ContentDigest::sha256_bytes(&baseline_canonical).to_string(),
+        treatment_request_sha256: ContentDigest::sha256_bytes(&treatment_canonical).to_string(),
+        normalized_request_sha256: ContentDigest::sha256_bytes(&normalized_bytes).to_string(),
+        baseline_prompt_sha256: serialized_content_digest(&baseline_messages)?,
+        treatment_prompt_sha256: serialized_content_digest(&treatment_messages)?,
+        normalized_prompt_sha256: serialized_content_digest(&normalized_messages)?,
+        baseline_tool_surface_sha256: serialized_content_digest(&baseline.tool_schemas)?,
+        treatment_tool_surface_sha256: serialized_content_digest(&treatment.tool_schemas)?,
+    })
+}
+
+/// Prove the prompt assembler's settlement treatment is structurally
+/// isolated before a live paired experiment spends provider calls.
+///
+/// This is executable gate evidence, not merely a unit-test assertion. The
+/// live harness persists the returned record and must stop with
+/// `INVALID_ARM_DIFF` when `passed` is false.
+pub fn settlement_projection_preflight() -> AgentResult<SettlementProjectionPreflight> {
+    let assembler = PromptAssembler::new("causal settlement preflight").with_runtime_facts(
+        RuntimeFactsView::new("preflight-os", "preflight-arch", vec!["Cargo.toml".into()]),
+    );
+    let task_id: TaskId = "00000000-0000-0000-0000-000000000001"
+        .parse()
+        .map_err(|error| AgentError::Internal(format!("invalid preflight task id: {error}")))?;
+    let focus = FocusState::for_task(task_id, "repair retry policy");
+    let task = TaskAnchorView {
+        revision: 7,
+        original_goal: "repair retry policy".into(),
+        ..TaskAnchorView::default()
+    };
+    let baseline_progress = TaskProgressView {
+        anchor_revision: 7,
+        checked_files: vec!["src/retry.rs@rev-4".into()],
+        verifications: vec!["cargo test -p retry-policy: pass".into()],
+        ..TaskProgressView::default()
+    };
+    let mut treatment_progress = baseline_progress.clone();
+    treatment_progress.settlement = Some(crate::task::SETTLED_CANDIDATE_PROMPT_LINE.into());
+    let history = MaterializedContext::default();
+    let turn = TurnFrame::new("continue");
+    let tools = vec![ToolSpec {
+        name: "fs.read".into(),
+        description: "read a bounded file range".into(),
+        input_schema: serde_json::json!({
+            "type": "object",
+            "required": ["path"],
+            "properties": {"path": {"type": "string"}}
+        }),
+        ..ToolSpec::default()
+    }];
+
+    let baseline = assembler.assemble(
+        Some(&focus),
+        Some(&task),
+        Some(&baseline_progress),
+        &history,
+        &turn,
+        tools.clone(),
+    );
+    let treatment = assembler.assemble(
+        Some(&focus),
+        Some(&task),
+        Some(&treatment_progress),
+        &history,
+        &turn,
+        tools,
+    );
+    compare_settlement_projection(&baseline, &treatment)
 }
 
 impl PromptAssembler {
@@ -631,6 +792,7 @@ fn render_task_progress(progress: &TaskProgressView) -> String {
         &verifications,
         &failed,
         &evidence,
+        progress.completion_commit_failure.as_deref(),
         &progress.unresolved_blockers,
         progress.stall_warning.as_deref(),
         progress.frontier_warning.as_deref(),
@@ -656,6 +818,7 @@ fn render_task_progress(progress: &TaskProgressView) -> String {
             &verifications,
             &failed,
             &evidence,
+            progress.completion_commit_failure.as_deref(),
             &progress.unresolved_blockers,
             progress.stall_warning.as_deref(),
             progress.frontier_warning.as_deref(),
@@ -681,6 +844,7 @@ fn format_task_progress(
     verifications: &[String],
     failed: &[String],
     evidence: &[String],
+    completion_commit_failure: Option<&str>,
     blockers: &[String],
     stall_warning: Option<&str>,
     frontier_warning: Option<&str>,
@@ -698,6 +862,10 @@ fn format_task_progress(
     // 收敛 advisory 同样不参与裁剪：它是重复行为的最后提醒。
     if let Some(warning) = frontier_warning {
         out.push_str(warning);
+        out.push('\n');
+    }
+    if let Some(failure) = completion_commit_failure {
+        out.push_str(failure);
         out.push('\n');
     }
     // 任务感知结算事实（默认关）：不参与列表裁剪，投影时直接可见。
@@ -849,6 +1017,9 @@ mod tests {
             approx_tokens: 0,
             diagnostics: Default::default(),
             foreground: Vec::new(),
+            required_item_ids: Vec::new(),
+            required_misses: Default::default(),
+            optional_misses: Default::default(),
         }
     }
 
@@ -1470,6 +1641,109 @@ mod tests {
         );
         assert_eq!(layers_off.task_progress_tokens, 0);
         assert_eq!(layers_off.task_anchor_tokens, layers.task_anchor_tokens);
+    }
+
+    #[test]
+    fn settlement_arm_changes_only_the_settlement_fact_for_the_same_state() {
+        use agent_contracts::{FocusState, TaskAnchorView, TaskId, TaskProgressView};
+
+        let assembler = PromptAssembler::new("policy");
+        let task_id = TaskId::new();
+        let focus = FocusState::for_task(task_id, "repair retry policy");
+        let task = TaskAnchorView {
+            revision: 7,
+            original_goal: "repair retry policy".into(),
+            ..Default::default()
+        };
+        let baseline_progress = TaskProgressView {
+            anchor_revision: 7,
+            checked_files: vec!["src/retry.rs@rev-4".into()],
+            verifications: vec!["cargo test -p retry-policy: pass".into()],
+            ..Default::default()
+        };
+        let mut treatment_progress = baseline_progress.clone();
+        treatment_progress.settlement =
+            Some(crate::task::SETTLED_CANDIDATE_PROMPT_LINE.to_string());
+        let history = materialized_with(Vec::new(), ContextMapView::default());
+        let turn = TurnFrame::new("continue");
+
+        let baseline = assembler.assemble(
+            Some(&focus),
+            Some(&task),
+            Some(&baseline_progress),
+            &history,
+            &turn,
+            Vec::new(),
+        );
+        let treatment = assembler.assemble(
+            Some(&focus),
+            Some(&task),
+            Some(&treatment_progress),
+            &history,
+            &turn,
+            Vec::new(),
+        );
+
+        let baseline_json = serde_json::to_value(&baseline).unwrap();
+        let mut treatment_json = serde_json::to_value(&treatment).unwrap();
+        assert_ne!(baseline_json, treatment_json);
+        let treatment_focus = treatment_json
+            .get("focus_frame")
+            .and_then(serde_json::Value::as_str)
+            .expect("the projected TaskProgress must be in the focus frame");
+        assert_eq!(
+            treatment_focus
+                .matches(crate::task::SETTLED_CANDIDATE_PROMPT_LINE)
+                .count(),
+            1,
+            "the treatment adds exactly one structured settlement fact"
+        );
+        let without_settlement = treatment_focus.replace(
+            &format!("{}\n", crate::task::SETTLED_CANDIDATE_PROMPT_LINE),
+            "",
+        );
+        *treatment_json.get_mut("focus_frame").unwrap() =
+            serde_json::Value::String(without_settlement);
+        assert_eq!(
+            baseline_json, treatment_json,
+            "same-state requests may differ only by the settlement fact"
+        );
+
+        let preflight = settlement_projection_preflight().unwrap();
+        assert!(preflight.passed);
+        assert_eq!(preflight.settlement_occurrences, 1);
+        assert_ne!(
+            preflight.baseline_request_sha256,
+            preflight.treatment_request_sha256
+        );
+        assert_eq!(
+            preflight.baseline_request_sha256,
+            preflight.normalized_request_sha256
+        );
+        assert_eq!(
+            preflight.baseline_prompt_sha256,
+            preflight.normalized_prompt_sha256
+        );
+        assert_ne!(
+            preflight.baseline_prompt_sha256,
+            preflight.treatment_prompt_sha256
+        );
+        assert_eq!(
+            preflight.baseline_tool_surface_sha256,
+            preflight.treatment_tool_surface_sha256
+        );
+
+        let mut changed_surface = treatment.clone();
+        changed_surface.tool_schemas.push(ToolSpec {
+            name: "unexpected".into(),
+            ..ToolSpec::default()
+        });
+        assert!(
+            !compare_settlement_projection(&baseline, &changed_surface)
+                .unwrap()
+                .passed,
+            "a schema drift must fail the same-state causal proof"
+        );
     }
 
     #[test]

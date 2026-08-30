@@ -16,10 +16,508 @@ M12/M13 must close before Self-Iteration. Do not add a database, vector
 search, or learned ranking. Do not claim a milestone complete because
 happy-path tests pass.
 
+## Current merged audit — 2026-08-30 (`ea8deef`)
+
+This section is the authoritative merged-audit tranche and active pre-M15
+route. It combines the repository audit with the instruction/runtime audit
+against the exact source above. Older non-conflicting open entries remain in
+the backlog; when their status or route conflicts with this tranche, this
+section wins. Raw reports and checker verdicts remain immutable.
+
+Evidence interpretation:
+
+- the audited `ea8deef` source was not green: `cargo fmt --all -- --check`
+  failed and both CI jobs stopped at formatting. The current uncommitted
+  candidate is locally green, but is not yet a recorded clean source and has no
+  Ubuntu/Windows CI result;
+- the 2026-08-29 convergence report remains a **mechanical FAIL**, but it is
+  **causally INVALID/CONFOUNDED** for settlement effectiveness. Its arm switch
+  removed the whole `TaskProgress` projection and also changed checked-file GC
+  projection; it did not isolate settlement;
+- formal M15 remains `3 fixtures × 2 modes (normal/resume) × 2 repeats = 12`
+  cells. Settlement off/on is a separate candidate experiment, never an M15
+  arm and never a retroactive M15 pass dimension;
+- the existing M12/M13 closure-audit artifacts stay banked and are not being
+  reopened by this queue. Repository governance contains conflicting closure
+  wording, so no new M12/M13 closure claim or Self-Iteration transition is
+  authorized until `GOV-STATUS-01` reconciles the authority texts;
+- no new live evidence or formal M15 window is decision-grade until the
+  baseline and selected-path P0 items below are closed. A settlement-changing
+  candidate includes the live causal-fork exit; a settlement-off base does not.
+
+**Working-tree implementation checkpoint (2026-08-30; not an evidence
+source).** The uncommitted tree based on `ea8deef` now contains candidate
+implementations for the unified completion join, continuation epoch,
+criterion receipts and host coverage-declaration identity, domain-scoped
+failure matching with fail-closed overflow, required-context misses,
+prospective terminal checkpoints, explicit commit barriers, committed-prefix
+replay, a one-shot startup gate, strict provider parsing, stable episode pairs
+and same-state settlement request auditing. The final tree passed the four
+local commands below on 2026-08-30 after repairing the integration regressions;
+this paragraph is still not a recorded evidence source and closes no heading
+by itself. `BASELINE-01` remains open until the same source is recorded clean
+and passes both CI platforms. The live causal runner still needs a common
+pre-exposure checkpoint/workspace fork only if the selected candidate enables
+settlement projection.
+
+### P0 — restore a trustworthy baseline
+
+#### BASELINE-01 — make the exact source green (**open**)
+
+Scope is formatting, warnings and real regressions exposed by those checks;
+do not hide an algorithm change in this item. Exit requires all of:
+
+```text
+cargo fmt --all -- --check
+cargo clippy --workspace --all-targets --all-features -- -D warnings
+cargo build --workspace --all-targets
+cargo test --workspace --all-targets
+Ubuntu CI PASS
+Windows CI PASS
+clean worktree at the recorded source
+```
+
+The full workspace test must complete; an external timeout is not a pass.
+
+Local checkpoint: the uncommitted Windows worktree passed all four commands on
+2026-08-30. This proves local integration only; it does not satisfy the
+recorded-clean-source or Ubuntu/Windows CI exits.
+
+### P0 — one completion authority
+
+#### COMPLETE-AUTH-01 — derive one bounded `CompletionReadiness` (**open — locally green; clean-source/CI exit pending**)
+
+Primary code: `crates/agent-runtime/src/task.rs`,
+`crates/agent-runtime/src/actor/{turn,model}.rs` and the bounded
+contracts/events they consume.
+
+Root cause: settlement uses the strong task-aware `task_ready` join, while
+`task.complete` and durable commit use a weaker gate. They can therefore
+disagree about whether the same task is complete.
+
+Implement one Runtime-owned, pure derived result and use it for settlement
+label/projection, completion proposal acceptance and durable completion. The
+derivation accepts `CompletionIntent = ModelProposal | ExplicitOperator`; this
+is one typed decision surface, not two hidden gates. Keep
+two orthogonal bases: `(task_id, anchor.revision)` synchronizes task/execution
+state, while `(task_id, anchor.verification_revision, directive_revision,
+workspace_revision)` decides verification currentness. A progress-only CAS may
+move the first and be synchronized without staling proof on the second. The
+result returns bounded typed refusal reasons and includes:
+
+```text
+current trusted verification PASS satisfies the task-declared identity strength
+(ExactCurrentWorld where that profile requires it)
++ criterion-addressed current acceptance receipts
++ no open loop or next action
++ no in-flight/cancel cleanup
++ no actor recovery fence
++ no unresolved failure or execution obligation
++ no hard required-context miss
+```
+
+The result separates `task_state_current`, `commit_safe` (valid authorized
+intent, active matching task, no recovery/in-flight/unresolved effect
+transaction) and `verified_ready` (all semantic/evidence rows above).
+Settlement and model `task.complete` require all three. Explicit user/host
+closure may bypass only `verified_ready`; it still requires current task state
+and `commit_safe`, persists a typed `OperatorOverride` disposition plus bounded
+unmet semantic reasons, and never fabricates a verified-success record. Future
+ACK debt from `EFFECT-ACK-01` joins `commit_safe` rather than creating another
+completion gate.
+
+Ordinary assistant final remains a separate turn boundary. Do not auto-close,
+add a fixed-round stop, move task authority into Core/Context, or add completion
+pressure to the prompt. Also make `TaskProgressView::is_empty()` account for
+`stall_warning`, `frontier_warning` and `completion_opportunity` so an advisory-
+only bounded view is not silently dropped.
+
+Exit tests must show the settlement predicate and `task.complete` decision are
+identical for positive and negative matrices: missing acceptance, mismatched
+coverage, stale verification, new directive, open loop, next action, unrelated
+failure, recovery fence, in-flight cleanup and hard required-context miss.
+Accepted completion remains one-shot, while ordinary final may end a turn
+without fabricating durable task closure.
+
+#### CONTINUATION-EPOCH-01 — continuation is not a new directive (**open — locally green; clean-source/CI exit pending**)
+
+Primary code: `crates/agent-runtime/src/actor/turn.rs`,
+`crates/agent-runtime/src/task.rs` and
+`crates/agent-runtime/src/execution/state.rs`.
+
+`continue_active_task_turn` currently enters `begin_applied_turn`, whose
+unconditional `on_user_turn` advances `directive_revision`. This invalidates an
+otherwise current verification even though the stored user instruction did not
+change.
+
+- `TaskContinuation` preserves task/directive/verification identity;
+- only new user dialogue advances the directive revision;
+- a real mutation, failure or boundary change after continuation still
+  invalidates old proof;
+- checkpoint/restore preserves the same rule.
+
+Add tuple assertions for continuation, new instruction, continuation followed
+by mutation, and cold restore. Existing anchor-only assertions are insufficient.
+
+#### ACCEPT-RECEIPT-01 — criterion-addressed acceptance evidence (**open — locally green; clean-source/CI exit pending**)
+
+Primary code: `crates/agent-runtime/src/actor/tools.rs`,
+`crates/agent-runtime/src/task.rs`, execution facts, events and checkpoint
+schema.
+
+The current observation path binds one pre-dispatch verifier identity to every
+criterion, before knowing whether the verification succeeded. Production tasks
+may also have no declared criteria. First add an authoritative, bounded
+task-creation/anchor-ingestion path; the model-routable `task.manage` must not
+mint its own acceptance authority. Each task carries an explicit completion
+policy:
+
+- `EvidenceRequired`: a non-empty set of stable criteria is supplied by the
+  user/host and matching receipts are required for model `task.complete`;
+- `OperatorClosureOnly`: the conservative default when no criteria were
+  supplied. Ordinary final remains available, model `task.complete` is refused,
+  and `CompletionIntent::ExplicitOperator` may close only through the shared
+  `commit_safe` decision while recording an override rather than fabricated
+  verification success.
+
+Replace the current fan-out with bounded receipts:
+
+- in V1 each criterion is addressed by
+  `(anchor.verification_revision, criterion_index)` plus a host-declared
+  verification/coverage domain; a new permanent string id is not required;
+- only an observed successful matching PASS may mint a receipt;
+- each receipt binds task, criterion identity, directive revision, workspace
+  revision, verification identity, and the exact host coverage-declaration
+  revision/source digest;
+- coverage changes emit a bounded event and survive checkpoint/replay;
+- missing declarations, domains or receipts stop at `VerifiedCurrent`.
+
+Criterion content/order changes advance `TaskAnchor.verification_revision` and
+invalidate old receipts. Receipt/coverage mutation advances only the full anchor
+CAS revision; it must not advance the verification basis and self-stale the PASS
+that just earned it. One actor transaction performs: match the observed PASS to
+the declared domain, CAS the receipts, synchronize `execution.anchor_revision`,
+append the bounded coverage event, then derive readiness. Append/CAS failure
+fences the decision and cannot expose a partially ready task.
+
+Do not infer equivalence from free-form commands and do not expose hidden
+oracles to the model. One receipt must not cover an unrelated criterion; a
+failed verifier must mint none.
+
+Eval task creation must ingest criteria from each frozen fixture's **public
+behavior contract**, not the current generic “behaves correctly” declaration
+and not hidden implementation needles. For example, a retry-policy diagnostic
+may declare that large attempts saturate at `max_delay`; satisfying it requires
+a matching boundary-test/probe receipt, while a broad Cargo PASS alone is
+insufficient. Persist the declaration/source digest so this rule generalizes by
+semantic domain rather than fixture id.
+
+#### FAILURE-LIFECYCLE-01 — resolve failures by domain (**open — locally green; clean-source/CI exit pending**)
+
+Primary code: `crates/agent-runtime/src/execution/freshness.rs` and the
+bounded failure/obligation ledger.
+
+A trusted PASS currently clears every `failed_command`. Preserve historical
+attempts separately from unresolved blockers and resolve only a matching
+identity/domain/resource/obligation. Unrelated failures must survive and keep
+completion blocked. This shares the typed coverage vocabulary with
+`ACCEPT-RECEIPT-01`; it must not become another string matcher.
+
+#### CONTEXT-REQUIRED-01 — required Context misses are completion-visible (**open — locally green; clean-source/CI exit pending**)
+
+Primary code: `crates/context-simple/src/{materializer,store}.rs`, bounded
+Context contracts and the Runtime readiness/event join.
+
+The root defect was that required or pinned material could be skipped without
+an explicit result while store read collapsed missing, corrupt and I/O failure
+to the same `None`. The landed candidate now:
+
+- store reads distinguish `Missing`, `Corrupt` and `IoFailed`;
+- materialization returns a bounded `required_misses` list with stable identity
+  and reason, including budget exclusion;
+- Runtime publishes a bounded degradation reason and treats a hard miss as not
+  ready;
+- optional Context misses remain observational and do not block completion;
+- required overlay is transactional per body: it plans largest-first optional
+  displacement without mutation, commits only when the body can satisfy both
+  token and item bounds, and otherwise records `BudgetExcluded` without
+  damaging the already useful frame.
+
+Exit covers budget exclusion, absent artifact, corrupt artifact, store I/O
+failure, cold reread success and bounded truncation of the miss list. This is a
+correctness signal only; it does not retune selection or GC.
+
+### P0 — restore causal and replay truth
+
+#### EVAL-CAUSAL-01 — isolate settlement as the only treatment (**conditional — same-state audit locally green; common-prefix fork required only for a settlement-enabled candidate**)
+
+Primary code: `crates/agent-runtime/src/services.rs`,
+`crates/agent-runtime/src/actor/{model,lifecycle}.rs` and
+`crates/agent-eval/src/long_live.rs`.
+
+Replace the overloaded eval switch with independent configuration:
+
+```text
+project_task_progress = true       # identical product surface in both arms
+project_settlement    = false|true # the only treatment
+```
+
+Before the split, the product default turned `project_task_progress` on and
+consequently also enabled settlement, while the eval default removed both. The
+implemented independent switches now express one common baseline.
+The treatment must not alter the TaskProgress body, Context query/materialized
+set, checked-file GC projection, tool surface, host policy or provider tuple.
+Product and formal-M15 defaults keep TaskProgress on and settlement off unless
+a later independent candidate gate promotes it.
+
+Before any live pair, a deterministic same-state preflight must compare the two
+assembled requests and prove that the only structured difference is the
+settlement node. This assertion applies before behavior diverges; it does not
+require live prompts from divergent trajectories to stay byte-identical.
+Persist both switch values plus source, pack, fixture, surface, prompt and
+provider/config digests. Any other preflight difference is
+`INVALID_ARM_DIFF`.
+
+The product hot path does not use the diagnostic envelope: settlement-off and
+settlement-on product requests pack only the arm they actually send, without a
+second assembled/cloned `ModelInput` or request-audit hashing. The explicitly
+enabled causal diagnostic alone uses the common treatment-sized envelope. A
+live off/on claim is still invalid until both arms fork from one pre-exposure
+durable Runtime checkpoint and one byte-identical workspace snapshot, preserve
+opaque runtime identities, and pin an explicit provider protocol. Do not
+alpha-normalize independently minted ids to manufacture equality.
+
+#### EVAL-EPISODE-PAIR-01 — bounded episodes and explicit pair joins (**open — locally green; clean-source/CI exit pending**)
+
+Primary code: `crates/agent-eval/src/{metrics,long_live}.rs` and its report
+path.
+
+- close an episode on reopening, `TaskCompleted`, ordinary-final
+  `TurnCompleted`, new-user boundary or continuation boundary, and record the
+  terminal mechanism;
+- join arms by stable logical identity
+  `(candidate/source, pack/fixture, mode, repeat, acceptance-domain revision/source,
+  provider-config digest)`;
+  runtime `TaskId` is cell provenance and is not a pair key;
+- reject missing, duplicate or mismatched cells rather than sorting and
+  `zip`-pairing them;
+- for two repeats, report both observations and their midpoint; do not label an
+  upper-nearest order statistic as an ordinary median;
+- diagnostic marker-shape counts remain observational unless prospectively
+  frozen against a behavior oracle.
+
+Terminal attribution follows the real actor order: a committed
+`TurnCompleted` remains pending through the following event tail and becomes
+`TaskCompleted` only when the matching `RuntimeCommitBarrier(TaskCompletion)`
+lands; otherwise the bounded quiet/trace boundary closes it as an ordinary
+turn. Tests must use this actor order, not a synthetic `TaskCompleted`-first
+trace.
+
+The old convergence bundle stays mechanically reproducible, but its settlement
+causal conclusion is superseded by this item.
+
+#### TERMINAL-COMMIT-01 — make task closure one recoverable transaction (**open — locally green; clean-source/CI exit pending**)
+
+Model `task.complete` first records `pending_terminal_commit`. Runtime prepares
+rollbackable post-completion Context, freezes the prospective terminal
+task/focus plane in checkpoint v4 (`event_cover_seq` and `terminal_commit` are
+serde-defaulted), durably acknowledges it, then performs only infallible actor
+assignments. `TaskCompleted`, maintenance events and
+`RuntimeCommitBarrier(TaskCompletion)` form one bounded durable batch.
+Pre-checkpoint failure leaves the task active and records bounded
+`CompletionCommitFailed`; post-checkpoint audit failure keeps completion
+authoritative and recovery-fences the runtime.
+
+#### STARTUP-COMMIT-01 — enter service only after the run marker commits (**open — locally green; clean-source/CI exit pending**)
+
+The actor owns a one-shot `NotStarted | Serving | StartFailed` lifecycle. Only
+a successfully appended and flushed `RunStarted +
+RuntimeCommitBarrier(RunStart)` batch enters `Serving`. Pre-start mutations and
+duplicate starts are rejected. Any startup append/flush failure permanently
+recovery-fences that actor: it cannot retry the marker or accept work, and
+shutdown performs no `RunCompleted` append or flush that could accidentally
+commit the forensic startup prefix. Read-only task/context/operation inspection
+remains available. Exit tests cover pre-start mutation, duplicate start,
+second-append failure, flush failure and shutdown after failed startup.
+
+#### REPLAY-COMMITTED-01 — rebuild Context from the committed prefix (**open — locally green; clean-source/CI exit pending**)
+
+Primary code: `crates/agent-replay/src/recovery.rs` and
+`crates/agent-replay/src/lib.rs`.
+
+If a trace contains any `RuntimeCommitBarrier`, only those markers advance the
+committed prefix. New runs durably write `RuntimeCommitBarrier(RunStart)` before
+work so a partially appended first turn cannot be mistaken for a legacy trace.
+Only a trace with no explicit marker may use bare `TurnCompleted` as a legacy
+fallback. Split the stream explicitly:
+
+```text
+committed_prefix = sequence <= last_committed_sequence
+forensic_suffix  = sequence >  last_committed_sequence
+```
+
+Context rebuild and restore-consistency truth consume only the prefix. The
+suffix remains available for batch/effect/failure diagnostics. This is a replay
+and audit-truth defect; do not overstate it as proof that the checkpoint-based
+production restore path already resurrects the suffix.
+
+For a terminal checkpoint, a matching `TaskCompletion` barrier advances trace
+truth to that transaction. In the checkpoint-to-audit crash window, the
+validated terminal checkpoint is the stronger truth; `event_cover_seq` is a
+replay cursor, not commit authorization.
+
+Tests cover no committed turn, one uncommitted tail, several committed turns
+plus a final failed turn, and suffix-only warnings/errors while preserving full-
+trace gap and interruption diagnostics.
+
+#### PROVIDER-PROTOCOL-01 — fail closed before new live evidence (**open — locally green; clean-source/CI exit pending**)
+
+Primary code: `crates/provider-openai/src/{lib,sse,responses,retry}.rs`.
+
+Valid SSE `data:` with malformed JSON is a typed protocol error, not a skipped
+line; incomplete tool arguments are `MalformedToolCall`, not `null`. Unknown
+but valid extension events may be ignored. Interactive/live sinks never replay
+after publishing content; buffering eval sinks may retry only before publish.
+Use bounded `Retry-After`, checked/saturating backoff and injectable
+deterministic jitter.
+
+### P1 — reduce calls before the settlement tail
+
+#### VERIFY-ROUTE-01 — make verifier eligibility explicit (**open**)
+
+The latest evidence often reaches a verifier quickly but sometimes selects a
+TaskScoped recipe that cannot establish an exact current-world PASS. This is a
+pre-settlement routing problem, not evidence that the settlement hint reduces
+work.
+
+Recipes declare a host-owned coverage domain, identity strength and declaration
+revision; criteria declare the minimum domain/strength. The model-visible
+schema says which recipe class can satisfy the requirement. Equivalence is
+host-declared, never inferred from argv. Reuse is allowed only on the same
+current world and domain.
+
+Measure decisions/tool calls to the first **criterion-satisfying** trusted PASS,
+recipe-choice rate, duplicate verification, discovery/load calls,
+pre-settlement rounds/calls and survival of unrelated failures. Include a
+negative in which a broad Cargo/test PASS is valid evidence but does not cover a
+criterion-specific boundary condition, plus a positive boundary receipt for the
+same public criterion. Context/GC/retrieval/packing remain frozen.
+
+#### FAILURE-SPILL-01 — retire overflowed blockers exactly in long tasks (**open P1; activate before long-horizon evidence or after measured overflow**)
+
+The current bounded hot sets retain at most 32 exact obligations and 32 exact
+failed commands; overflow becomes checkpointed body-free count/digest debt and
+therefore remains safely completion-blocking. For long-horizon liveness, store
+overflow identities once behind a task-owned artifact/ref and keep only its
+digest/count/ref hot. A matching success may retire exact spilled rows;
+missing/corrupt spill stays fail-closed. Never expand TaskProgress or the
+transcript, and do not build this path before measurement shows it is exercised.
+
+### P1 — V1 correctness hardening
+
+#### COMPOSE-LIFECYCLE-01 — make startup transactional (**open**)
+
+`compose()` starts the host before later fallible journal/authority/service
+preparation and has no outer rollback. Move all possible fallible preparation
+before `host.start()`; absent optional services may remain optional, but a
+present wrong type fails. Add a minimal startup guard only if a post-start
+fallible seam remains. Exit tests prove every failure point leaves no serving
+child or half-built runtime.
+
+#### CONTEXT-IO-01 — remove lock-across-I/O and loss-on-export (**open**)
+
+`Admit` holds the Context state lock across store I/O, and ledger export can
+lose `mem::take` rows on write/rename failure. Use plan/revision under lock,
+unlocked read, then revision-check/commit. On export failure merge rows back
+into the bounded ledger and move blocking temp/sync/rename work off the async
+hot path. Exit proves a slow read does not block unrelated Context work and an
+export failure loses no row. Store/readiness error truth is owned by
+`CONTEXT-REQUIRED-01`; do not retune GC.
+
+#### EFFECT-ACK-01 — persist unresolved ACK debt (**open**)
+
+Core ACK failure is logged but a receipt still returns as if clean. Preserve
+the real receipt plus typed unresolved debt/disposition, event/checkpoint it,
+reconcile it on restore and fence recovery/completion. Never pretend an
+already-applied effect can be rolled back. Exit covers Applied/NotApplied/
+Ambiguous debt through restart.
+
+#### DURABLE-FACTS-01 — make typed execution facts replayable (**open**)
+
+Native facts currently survive in reserved output metadata, but replay supplies
+`facts: None` and loses their typed semantics. Add top-level versioned facts to
+`ToolFinished`, prefer them on replay, retain metadata fallback for old events,
+repair `TaskCompleted.task_id`, then remove fallback only after migration. New
+and legacy event fixtures must rebuild the same typed observation.
+
+#### SIDECAR-ERROR-01 — preserve error categories across process boundaries (**open**)
+
+Context sidecar exposes string-only errors and its process main ignores
+`serve_session()` failure. Use a bounded typed error envelope with category and
+retryability parity; terminal protocol/I/O failure exits non-zero. In-process
+and sidecar conformance cases must classify the same injected errors identically.
+
+#### TOOL-MANIFEST-01 — align the actual model surface (**open**)
+
+Registry, JSON inventory and conformance expectations disagree about
+`task.complete`. First align inventory with the actual v5 production surface,
+persist the evaluated surface/schema digest and fail closed when a row cannot be
+inspected. A single host-owned generated manifest may follow as a separate
+change; do not combine it with M15 algorithm work.
+
+#### EVAL-ACCOUNT-01 — separate restored protocol from Context cost (**open**)
+
+Prompt historical-context accounting currently mixes restored protocol bodies
+into selected Context cost. Record those layers independently and reconstruct
+both from events. Episode terminal boundaries are owned and tested by
+`EVAL-EPISODE-PAIR-01`, not duplicated here.
+
+### P2 candidates — not actionable before measurement
+
+- add deterministic no-model benchmarks for Context admit/materialize/GC,
+  prompt assembly, tool-surface construction, replay and journal paths;
+- cache immutable `ToolSpec` values or optimize `clip_to_token_budget()` only
+  after profiling shows a material hotspot;
+- split large modules only at stable transaction boundaries after semantics are
+  frozen; do not mix the move with behavior changes.
+
+### GOV-MAINT-01 — bounded repository maintenance (**open P2**)
+
+Address the missing `LICENSE` and empty `inspect_outbound.sh` in one governance
+batch; keep `SECURITY`/`CONTRIBUTING` and archive cleanup non-blocking. Do not
+add `docs/state.json` as another authority source.
+
+### GOV-STATUS-01 — reconcile milestone authority (**open, governance**)
+
+`AGENTS.md` contains both banked-closure wording and an instruction not to
+claim M12/M13 closed. Reconcile that contradiction once, then align the compact
+status table. Until then, keep the evidence banked, do not reopen its mechanism
+work, do not claim closure, and keep Self-Iteration blocked.
+
+### Ordered execution and evidence gate
+
+```text
+local integrated candidate GREEN
+  -> record one clean source (BASELINE-01)
+  -> repeat fmt/clippy/build/full-test on that source + Ubuntu/Windows CI
+  -> VERIFY-ROUTE-01 evidence
+  -> selected-path P1 correctness closed or proven out-of-path
+  -> same-checkpoint causal fork only if project_settlement changes
+  -> exact-source/product M15 preflight
+  -> one predeclared formal 12-cell M15 window
+```
+
+The settlement candidate gate, if it is run again after deterministic fixes,
+is `normal/resume × off/on × at least two explicitly joined repeats`; only
+`project_settlement` may differ. It is optional: a corrected base product with
+settlement off may proceed to exact-source M15 preflight. A projection-changing
+candidate must pass its own causal paired gate before entering M15.
+
 ## Open P0 — trusted execution
 
-The platform gates closed 2026-08-27 on clean-tree closure-audit evidence
-(CORE-01/CORE-12 moved to the archive below). Residual OS isolation stays
+The platform closure-audit evidence was banked 2026-08-27
+(CORE-01/CORE-12 moved to the archive below), but `GOV-STATUS-01` withholds a
+new overall M12/M13 closure claim. Residual OS isolation stays
 outside the V1 availability floor — Linux UDP / raw / pathname-Unix, absolute
 OS-level reads, Windows OS-level network, I/O bandwidth quotas,
 seccomp / AppContainer — and `UntrustedGenerated` keeps failing closed on
@@ -195,6 +693,14 @@ traversal rejected); bare names search the cwd first, then effective
 PATH, PATHEXT-completed on Windows — and spawn always uses the resolved
 absolute path. preflight, RetryDomain fingerprints and spawn share one
 semantics; failures report the bounded candidate list they tried.
+
+2026-08-30 Windows regression: `program_path` now preserves the native
+spelling of an absolute `ComSpec` path rather than rewriting `\` to `/`; Unix
+alone keeps the backslash-as-separator compatibility alias. The closure fixture
+also follows `process.run`'s verbatim argv contract with one command string:
+`[ComSpec, "/D", "/C", "exit /b 0"]`. Direct absolute-ComSpec execution and
+the M12 deterministic closure gate cover this without reopening the fixed
+resolver design.
 
 ### TOOL-DIR-01 — transactional directory creation (fixed deterministically 2026-08-28)
 
@@ -475,7 +981,14 @@ TaskGraph/learned planner, or specialize behavior for a fixture/provider. Its
 corrected promotion gate is owned by CONV-CLOSE-02 and uses task-aware episodes,
 not the first-candidate lifetime tail.
 
-### CONV-CLOSE-02 — Task-aware Completion Convergence (steps 1–4 landed 2026-08-29; step-4 paired gate FAILED promotion; projection default-off)
+### CONV-CLOSE-02 — historical implementation record (superseded by the 2026-08-30 merged queue)
+
+This section records what landed and what the original checker reported. It is
+not the current action plan. In particular, the report's mechanical FAIL is
+preserved, while its settlement-effectiveness interpretation is now
+INVALID/CONFOUNDED. `COMPLETE-AUTH-01`, `CONTINUATION-EPOCH-01`,
+`ACCEPT-RECEIPT-01`, `FAILURE-LIFECYCLE-01`, `EVAL-CAUSAL-01` and
+`EVAL-EPISODE-PAIR-01` own the correction.
 
 Root cause: the first slice answered “is the current execution world verified?”
 but named the strongest answer `SettledCandidate`, which sounds like “is the
@@ -538,9 +1051,11 @@ Delivery order and exit:
    inconclusive. Promotion requires mandatory behavior/diff/resume parity, no
    lost unfinished work, lower candidate-episode rounds and calls, and no new
    maximum episode or whole-cell tail.
-5. Only a promoted, default-on projection may enter the next exact-source M15
-   preflight. A failed or inconclusive gate leaves projection off and returns
-   to observation; it does not trigger prompt tuning or Context/GC retuning.
+5. **Historical handoff (superseded):** this slice required a promoted,
+   default-on projection before exact-source M15 preflight. The current route
+   permits a corrected settlement-off base candidate; only an enabled
+   projection requires its own causal gate. Neither route triggers prompt
+   tuning or Context/GC retuning.
 
 Progress (2026-08-29):
 

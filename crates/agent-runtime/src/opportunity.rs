@@ -1,10 +1,10 @@
 //! Derived, advisory completion-opportunity facts.
 //!
-//! The opportunity is a safe-point observation, never completion authority:
-//! eligibility means the existing acceptance gate would accept, no proposal
-//! is pending, task-relevant durable work exists, and a positive trusted
-//! verification pass is current on the same basis. Everything here is pure
-//! so the mandatory deterministic negatives are testable without an actor.
+//! The opportunity is a safe-point observation, never completion authority.
+//! The actor first applies the shared `CompletionReadiness` decision; this
+//! module then adds only opportunity-specific positive evidence and derives
+//! a stable once-per-basis key. Everything here is pure so those additional
+//! deterministic conditions remain testable without an actor.
 
 use sha2::{Digest, Sha256};
 
@@ -46,9 +46,10 @@ impl OpportunityDecision {
 
 /// Derive one completion-opportunity observation for the active task.
 ///
-/// The checks mirror the actor's acceptance gate (`completion_gate`) in the
-/// same order, then add the two positive-evidence conditions the gate
-/// cannot see (durable task work and a current trusted verification pass).
+/// The actor must apply shared `CompletionReadiness` before calling this
+/// helper. These checks add the opportunity-specific conditions the shared
+/// gate does not own: a pending offer/proposal fence, durable task work and
+/// a current trusted verification pass used to derive the stable key.
 pub(crate) fn derive_completion_opportunity(
     task_id: TaskId,
     anchor: &TaskAnchor,

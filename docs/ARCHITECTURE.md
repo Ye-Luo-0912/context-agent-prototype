@@ -503,6 +503,15 @@ on either wire are mapped to
 Core ids. Two Core ids that collapse to the same wire name fail closed before
 the HTTP call. Kernel tool ids are unchanged.
 
+A Chat stream is complete only after `[DONE]`; a Responses stream only after
+`response.completed`. EOF before that terminal, malformed JSON in a valid
+`data:` frame, missing fields on a known Responses event, or incomplete tool
+arguments is a typed `ModelProtocol` failure. Unknown well-formed extension
+events may be ignored. Live sinks never retry after publication; buffering eval
+sinks publish only a successful attempt and are bounded by both chunk and byte
+caps. `RetryAfterMillis` is bounded and backoff arithmetic is checked or
+saturating.
+
 ### ToolDispatcher
 
 Tools receive a `ToolExecutionRequest` and return `ToolOutput`.
@@ -1424,7 +1433,12 @@ current task id), the context checkpoint, capability activation state and
 store generation/refs, and `RuntimeInstance::restore` puts the actor, context
 and capability planes — task table included — back together. RuntimeCheckpoint
 v4 also carries a stable marker for one verified prefix of the Core operation
-WAL (`journal_id + generation + epoch + sequence + folded-state digest`).
+WAL (`journal_id + generation + epoch + sequence + folded-state digest`). It
+also records the event cursor reflected by the frozen planes and a
+serde-defaulted `terminal_commit` bit. The wire version stays v4: older v4
+payloads default both additions to conservative non-terminal values, while
+validation rejects a terminal snapshot unless it has no active task and owns
+a matching completed-task record.
 Restore verifies that marker as an ancestor before any mutation, then advances
 the live epoch; checkpoint data can never replace or rewind Core authority.
 Ephemeral checkpoints without a marker are same-run only. V4 persists each
@@ -1438,11 +1452,24 @@ transitions transactionally: it validates and *prepares* a transition, the
 external side (kernel focus/context) commits first, and only then does the
 manager commit — a failed `set_focus` never leaves the task table changed.
 
-Focus/clear/complete are multi-step context transactions: the kernel takes a
+Focus and clear are multi-step context transactions: the kernel takes a
 portable engine checkpoint before ingest + maintenance and restores it on
 either failure; the actor commits task authority only after that succeeds,
-then publishes audit/UI events. Restore validates the redundant active-task
-fields and restored engine focus. `RuntimeInstance` installs task/context state
+then publishes audit/UI events. Terminal completion uses the stronger form of
+the same rule: Runtime prepares the post-completion Context plane while
+retaining its rollback checkpoint, freezes that exact plane together with a
+prospective completed `TaskManager` and next focus in one atomic
+`RuntimeCheckpoint`. In a composition with a checkpoint store, only a durable
+acknowledgement authorizes the in-memory task/focus assignments. A store-less
+composition may complete in memory behind an explicit warning, but makes no
+resumability claim. Assembly or write failure restores Context and leaves the
+task active. After acknowledgement the assignments are infallible;
+`TaskCompleted`, the maintenance report and an explicit
+`RuntimeCommitBarrier(TaskCompletion)` are flushed as one bounded event batch.
+If that audit batch fails, the terminal checkpoint remains the crash-window
+truth and ordinary mutation is recovery-fenced rather than rolling a completed
+task backwards. Restore validates the redundant active-task fields and restored
+engine focus. `RuntimeInstance` installs task/context state
 behind a recovery fence, applies capability activation through a fail-closed
 meet, and clears the fence only after durable bounded `RuntimeRestored`.
 Unknown ids do not count as applied and old Enabled cannot lift a newer
@@ -1970,10 +1997,15 @@ model to echo opaque runtime capabilities created avoidable invalid proposals
 without adding authority or evidence. Ending a model turn is implicit and does
 not close the durable task. Surface rev v5 keeps the compact `task.complete`
 schema visible, but visibility grants neither closure intent nor authority.
-Once accepted by the Runtime-owned completion gate, it terminates directly
-after the whole sibling batch settles successfully and current verification
-still passes. A failed sibling or invalidated completion gate returns the
-results to the model instead of hiding them behind task closure.
+Acceptance by the Runtime-owned completion gate records only a
+`pending_terminal_commit` proposal in the active turn; the authoritative tool
+result says so explicitly. After the whole sibling batch settles and the turn
+crosses its durable barrier, Runtime re-derives the same completion decision
+at the safe point and runs the terminal checkpoint transaction above. A failed
+sibling, invalidated gate or pre-commit checkpoint failure keeps the task active
+and projects one bounded typed failure into its resume state. An audit failure
+after the terminal checkpoint is a committed completion plus a recovery fence,
+not a retryable pending proposal.
 
 The default always-loaded model surface is `fs.list`, `fs.read`, `fs.write`,
 `search.grep`, `artifact.read`, `edit.patch`, `git.status`, `git.diff`,
@@ -2031,15 +2063,35 @@ Three consistency gaps closed before V2:
 **Turn finalization is a commit, not a fire-and-forget cleanup.** The
 actor's `finalize_turn` walks `TurnState` — `Running` → `ModelFinished` →
 `Committing` → `Committed` — and every mandatory state write must succeed
-before `TurnCompleted` is emitted: tool-observation ingest, the `AfterTool`
-and `AfterModel` maintenance passes, the full GC, and the journal events
-for each (`ContextMaintained`, `ContextGc`, `AssistantMessage`,
-`TurnCompleted`). On the first failure the commit aborts — later writes
+before the terminal event transaction is emitted: tool-observation ingest,
+the `AfterTool` and `AfterModel` maintenance passes, the full GC, and their
+journal events (`ContextMaintained`, `ContextGc`, `AssistantMessage`).
+`TurnCompleted` and `RuntimeCommitBarrier(Turn)` are appended, flushed and
+published as one bounded ordered batch; replay keys off the explicit marker,
+not the lifecycle event name. On the first failure the commit aborts — later writes
 would build on an inconsistent state — the turn frame is dropped, and the
 runtime journals `TurnCommitFailed { phase, message }` (naming the exact
 step) plus `RecoveryRequired` instead of pretending the turn completed.
 "The model answered" and "the runtime durably committed this turn" are two
 different facts; this is the foundation for crash recovery.
+
+Each new run first durably writes `RunStarted` plus
+`RuntimeCommitBarrier(RunStart)`. This opts the trace into explicit-marker
+semantics before any turn can begin. If any marker exists, only markers advance
+the committed replay prefix; completely marker-free historical traces alone
+may infer legacy commits from `TurnCompleted`. Thus a first-turn partial batch
+cannot become a false legacy commit merely because its final marker was the
+member that failed to append. `RuntimeCheckpoint.event_cover_seq` is the event
+cursor reflected by the frozen planes, not independent commit authorization.
+
+The actor enforces that boundary with a process-local one-shot lifecycle:
+`NotStarted | Serving | StartFailed`. Only a successful append **and flush** of
+the complete startup batch enters `Serving`; every state-changing command is
+rejected before then. A partial append or failed flush moves the actor to
+`StartFailed` permanently, because retrying in place could let a later marker
+authorize the earlier forensic prefix. Duplicate start is rejected, and
+shutdown from `NotStarted`/`StartFailed` performs no Core stop, event append or
+flush. Bounded read-only inspection remains available for diagnosis.
 
 **Capability start/stop is serialized per capability.** The registry no
 longer stores a `started: bool`; each entry carries a `CapabilityRunState`

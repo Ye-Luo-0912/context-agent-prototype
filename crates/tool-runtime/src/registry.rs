@@ -628,6 +628,12 @@ impl ToolDispatcher for BuiltinToolDispatcher {
         self.verification_recipes.same_declared_class(left, right)
     }
 
+    fn verification_coverage_declarations(
+        &self,
+    ) -> Vec<agent_contracts::VerificationCoverageDeclaration> {
+        self.verification_recipes.coverage_declarations().to_vec()
+    }
+
     async fn execute(&self, request: ToolExecutionRequest) -> AgentResult<ToolOutcome> {
         request.validate().map_err(AgentError::InvalidRequest)?;
         let name = request.call.name.clone();
@@ -774,18 +780,19 @@ impl BuiltinToolDispatcher {
                 })
                 .map(|material| format!("sha256-{:x}", Sha256::digest(material.trim().as_bytes())))
                 .unwrap_or_default();
-            let domain_declaration_revision = recipe.coverage_domain.as_ref().and_then(|domain| {
-                self.verification_recipes
-                    .domains()
-                    .iter()
-                    .find(|declared| declared.domain_id == *domain)
-                    .map(|declared| declared.declaration_revision)
-            });
+            let domain_declaration = recipe
+                .coverage_domain
+                .as_deref()
+                .and_then(|domain| self.verification_recipes.coverage_declaration(domain));
             let provenance = agent_contracts::VerificationRecipeProvenance {
                 recipe_id: recipe.id.clone(),
                 recipe_revision: recipe.revision.clone(),
                 coverage_domain: recipe.coverage_domain.clone(),
-                domain_declaration_revision,
+                domain_declaration_revision: domain_declaration
+                    .map(|declared| declared.declaration_revision),
+                domain_source_digest: domain_declaration
+                    .map(|declared| declared.source_digest.clone())
+                    .unwrap_or_default(),
                 class_identity_digest,
             };
             return attribution
@@ -1352,6 +1359,47 @@ mod tests {
         });
         assert_eq!(opaque.purpose, ToolExecutionPurpose::Opaque);
         assert_eq!(opaque.verification_reuse, VerificationReuse::None);
+    }
+
+    #[tokio::test]
+    async fn dispatcher_projects_and_stamps_the_same_coverage_declaration_identity() {
+        let (workspace, _dir) = open_workspace().await;
+        let recipe = crate::VerificationRecipe::new(
+            "project.check",
+            "Check project",
+            "v1",
+            vec!["rustc".into(), "--version".into()],
+        )
+        .unwrap()
+        .with_exact_current_world_reuse()
+        .with_coverage_domain("workspace-tests")
+        .unwrap();
+        let recipes = VerificationRecipes::new(vec![recipe])
+            .unwrap()
+            .with_domains(vec![crate::VerificationCoverageDomain {
+                domain_id: "workspace-tests".into(),
+                declaration_revision: 4,
+                members: vec!["project.check".into()],
+            }])
+            .unwrap();
+        let expected = recipes.coverage_declarations()[0].clone();
+        let dispatcher = BuiltinToolDispatcher::with_config_and_verification_recipes(
+            workspace,
+            ToolLifecycleConfig::default(),
+            recipes,
+        );
+        assert_eq!(
+            dispatcher.verification_coverage_declarations(),
+            vec![expected.clone()]
+        );
+        let attribution = dispatcher.execution_attribution(&ToolCall {
+            id: "verify".into(),
+            name: VERIFY_RUN_TOOL_NAME.into(),
+            arguments: json!({"recipe_id": "project.check"}),
+        });
+        let provenance = attribution.verification_recipe().unwrap();
+        assert_eq!(provenance.domain_declaration_revision, Some(4));
+        assert_eq!(provenance.domain_source_digest, expected.source_digest);
     }
 
     #[tokio::test]

@@ -242,7 +242,8 @@ impl RoundSurfacePlan {
             }
         }
         for name in relabel {
-            self.origins.insert(name, ToolSurfaceOrigin::RecoverySurface);
+            self.origins
+                .insert(name, ToolSurfaceOrigin::RecoverySurface);
         }
     }
 
@@ -896,9 +897,7 @@ mod tests {
             ..Default::default()
         };
         let mut plan = RoundSurfacePlan::build(candidates, &[], |_| true);
-        plan.mark_recovery_tools(&std::collections::HashSet::from([
-            "fs.mkdir".to_string(),
-        ]));
+        plan.mark_recovery_tools(&std::collections::HashSet::from(["fs.mkdir".to_string()]));
 
         // `fs.mkdir` is not in this plan at all; marking an absent tool must
         // not fabricate an origin entry. `fs.write` here is a plain catalog

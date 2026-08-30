@@ -39,6 +39,9 @@ impl ContextEngine for StubContextEngine {
             selected: Vec::new(),
             approx_tokens: 0,
             foreground: Vec::new(),
+            required_item_ids: Vec::new(),
+            required_misses: Default::default(),
+            optional_misses: Default::default(),
             diagnostics: ContextDiagnostics::default(),
         })
     }

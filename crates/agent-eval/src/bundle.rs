@@ -903,6 +903,7 @@ fn metrics_json(metrics: &RunMetrics) -> serde_json::Value {
                 "settlement_episode_rounds": metrics.settlement_episode_rounds,
                 "settlement_episode_calls": metrics.settlement_episode_calls,
                 "settlement_episode_failures": metrics.settlement_episode_failures,
+                "settlement_episode_terminals": metrics.settlement_episode_terminals,
             })
             .as_object()
             .cloned()
@@ -994,7 +995,12 @@ pub(crate) fn source_tree_digest() -> Option<String> {
         Some(output.stdout)
     }
     let head_tree = git_bytes(&["rev-parse", "HEAD^{tree}"])?;
-    let tracked_diff = git_bytes(&["diff", "HEAD"]).unwrap_or_default();
+    // Evidence is an output of the experiment, never part of the candidate
+    // source identity. Exclude it from tracked diffs as well as untracked
+    // files; otherwise writing the first cell can change every later cell's
+    // pair key when an evidence path already exists in git.
+    let tracked_diff =
+        git_bytes(&["diff", "HEAD", "--", ".", EVIDENCE_EXCLUDE_PATHSPEC]).unwrap_or_default();
     let untracked = git_bytes(&[
         "ls-files",
         "--others",
@@ -1138,6 +1144,12 @@ mod tests {
             settlement_episode_rounds: 3,
             settlement_episode_calls: 2,
             settlement_episode_failures: 1,
+            settlement_episode_terminals: [(
+                crate::metrics::SettlementEpisodeTerminal::TurnCompleted,
+                1,
+            )]
+            .into_iter()
+            .collect(),
             ..Default::default()
         };
         let value = metrics_json(&metrics);
@@ -1146,6 +1158,7 @@ mod tests {
         assert_eq!(value["settlement_episode_rounds"], 3);
         assert_eq!(value["settlement_episode_calls"], 2);
         assert_eq!(value["settlement_episode_failures"], 1);
+        assert_eq!(value["settlement_episode_terminals"]["turn_completed"], 1);
 
         let none = metrics_json(&RunMetrics::default());
         assert_eq!(none["settlement_seen"], false);
@@ -1153,6 +1166,7 @@ mod tests {
         assert_eq!(none["settlement_episode_rounds"], 0);
         assert_eq!(none["settlement_episode_calls"], 0);
         assert_eq!(none["settlement_episode_failures"], 0);
+        assert_eq!(none["settlement_episode_terminals"], serde_json::json!({}));
     }
 
     #[test]

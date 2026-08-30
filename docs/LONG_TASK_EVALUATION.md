@@ -128,10 +128,12 @@ pilot results are recorded below.
 
 ### LT-RUN-02 — safe-point resume commit and checkpoint policy
 
-Today a full `RuntimeCheckpoint` is externally requested and an active turn's
-final `ExecutionState` becomes durable only after `TurnCompleted`. Add an
-actor-owned safe-point continuation path; do not let the TUI/evaluator become
-a second orchestrator.
+This subsection records the historical design that led to the actor-owned
+safe-point path; it is not the current event contract. The current turn commit
+is `TurnCompleted + RuntimeCommitBarrier(Turn)`, and the durable continuation
+substrate is summarized in
+[`EXECUTION_COHERENCE.md`](EXECUTION_COHERENCE.md#long-task-continuation-boundary-durable-substrate-landed-autonomous-segmentation-deferred).
+The TUI/evaluator never becomes a second orchestrator.
 
 At a fully settled batch, meaningful durable changes accrue bounded
 `CheckpointDebt` reasons such as task-anchor change, durable workspace
@@ -188,9 +190,19 @@ is `Unknown`/`RecoveryRequired`. Runtime attaches its own assistant and
 verification refs. Partial/failed completion may retain explicit open loops;
 success cannot silently erase them.
 
-The final durable checkpoint is taken after `TurnCompleted` and before the
-task scope is reported safely closed. This slice extends existing completion
-tests; it does not make `task.complete` permanently visible.
+The current terminal transaction is:
+
+```text
+TurnCompleted + RuntimeCommitBarrier(Turn)
+→ prepare rollbackable post-completion Context
+→ prospective post-Context terminal checkpoint durable
+→ infallible task/focus commit
+→ TaskCompleted + maintenance + RuntimeCommitBarrier(TaskCompletion)
+```
+
+The validated terminal checkpoint is authoritative in the
+checkpoint-to-audit crash window. This does not make `task.complete` itself an
+authority source.
 
 Historical landing status (2026-08-25): the acceptance gate re-runs at
 every completion edge: no recovery fence, no unsettled cancelled operation,
@@ -425,12 +437,12 @@ the same predicate. Version the checkpoint representation for the second
 revision and reject an unsupported payload before mutating restored state;
 never silently infer currentness from a progress-only CAS revision.
 
-The current model-routable `task.manage` cannot edit acceptance criteria, but
-the trusted `AnchorPatch` API still classifies them as autonomous and a newly
-created task normally has no typed criteria. Before any criterion-level hard
-gate, define criterion origin/authority and how a user directive is ingested
-into stable criterion identities. Until then, acceptance-to-proof work is
-shadow-only research.
+The 2026-08-28 slice left a real gap: model-routable `task.manage` cannot edit
+acceptance criteria, the trusted `AnchorPatch` API classifies them as
+authoritative, and a newly created task normally has no typed criteria. The old
+“shadow-only” disposition is superseded by `ACCEPT-RECEIPT-01`: pre-M15 Runtime
+must ingest bounded user/host-owned criteria or explicitly choose the
+conservative no-criteria closure policy; the model cannot mint either.
 
 Acceptance for this slice:
 
@@ -460,10 +472,10 @@ acceptance-criteria change and a checkpoint round-trip in one test asserting
 consumer agreement (ActiveTurn validity, completion, exact reuse and the
 derived opportunity). Still tracked with the cold-resume matrix: the
 persisted offered-opportunity key accrues checkpoint debt and a crash-window
-proof must show once-per-basis discipline survives recovery. Criterion
-origin/authority is defined only to the extent that accepted criteria are
-authoritative; ingestion of user directives into stable criterion identities
-and any acceptance-to-proof hard gate remain shadow-only research.
+proof must show once-per-basis discipline survives recovery. At that date,
+criterion origin/authority was defined only to the extent that accepted
+criteria were authoritative. Its shadow-only ingestion/acceptance status is
+superseded by the current pre-M15 algorithm and `ACCEPT-RECEIPT-01`.
 
 ### Slice C — conservative `CompletionOpportunity` candidate
 
@@ -765,6 +777,16 @@ loads checksum-verified with no active authority and its own sequence, ack
 precedes TaskCompleted, blocked-store keeps completion pending) plus new
 checkpoint store-contract tests.
 
+2026-08-30 amendment: terminal preparation now includes the post-completion
+Context plane and its portable rollback snapshot, not only a prospective task
+table. The checkpoint carries serde-defaulted `event_cover_seq` and
+`terminal_commit`; the terminal audit is one bounded batch ending in
+`RuntimeCommitBarrier(TaskCompletion)`. Failure before acknowledgement restores
+Context, leaves the task active and retains a bounded `CompletionCommitFailed`
+fact. Failure after the terminal checkpoint does not roll completion back; it
+recovery-fences the audit gap. New runs also write a durable RunStart marker so
+replay never confuses a partial first turn with a marker-free legacy trace.
+
 ### Work package 3 — one verification basis
 
 Introduce an explicit verification-basis revision or digest distinct from the
@@ -816,8 +838,8 @@ the control-flow path by which a cell exited:
 Sequence-contiguity checks are per Runtime run/segment; a subscriber that starts
 after the run or a merge across run ids must not manufacture a product failure.
 
-Status 2026-08-28: the M15-facing reconstruction slice landed as
-`retry-pilot-cell-v3`. Cells now persist the acceptance profile, observed
+Historical status 2026-08-28: the M15-facing reconstruction slice landed as
+`retry-pilot-cell-v3`. Cells persist the acceptance profile, observed
 oracle result, verdict, actual pack identity/digest, typed failure class and
 independent restore/exact-tuple/continuation/turn/task facts. Runtime exposes
 provider transport, model output-limit, model, input-budget, round-budget and
@@ -830,7 +852,10 @@ summary/dimension and verdict consistency checks. Evidence writes fail the
 cell runner instead of degrading to warnings. The formal command rejects a
 dirty tree, pack subsets, repeat drift and automatic protocol negotiation.
 The three retained v2 M15 attempts predate these guarantees and are
-forensic-only; a fresh v3 window is still required.
+forensic-only. The three historical valid-FAIL formal windows remain v3. The
+prospective schema is `retry-pilot-cell-v4`, adding stable pair/source identity,
+acceptance-declaration identity and bounded request-audit facts; no v4 formal
+window is currently banked.
 
 Serving preflight status 2026-08-28: a source-bound dirty-tree diagnostic
 `retry_policy_dev` normal cell passed the stricter closure-required profile on
@@ -903,13 +928,183 @@ same-model A/C claim.
 
 ## Pre-M15 readiness task: Task-aware Completion Convergence
 
+**2026-08-30 correction.** The 2026-08-29 implementation record below is
+historical, not the current algorithm. Review of the exact source found that
+settlement and `task.complete` use different completion predicates,
+continuation advances the directive revision, acceptance coverage fans one
+pre-success verifier identity over every criterion, trusted PASS clears
+unrelated failures, and `agent-replay`'s Context rebuild admits events after the
+committed turn barrier. This is not a claim that checkpoint-based production
+restore already resurrects that suffix.
+The reported off/on experiment also changed all of TaskProgress and checked-
+file GC projection. Preserve its mechanical FAIL, but treat settlement
+causality as `INVALID/CONFOUNDED`.
+
+### Current algorithm: one dynamic readiness join
+
+Readiness is derived from current evidence; it is not a stored boolean, token
+threshold, fixed-round deadline or prompt instruction:
+
+```text
+TaskStateBasis =
+  (task_id, anchor.revision)
+
+TaskStateCurrent =
+  an active task exists and matches task_id
+  AND the completion intent/authority is valid
+  AND execution.anchor_revision matches anchor.revision
+
+VerificationBasis =
+  (task_id, anchor.verification_revision,
+   directive_revision, workspace_revision)
+
+CommitSafe =
+  TaskStateCurrent
+  AND no in-flight/cancel cleanup
+  AND no actor recovery fence
+  AND no unresolved effect transaction / ACK debt
+
+EvidenceReady =
+  trusted verification PASS satisfies the declared identity strength
+    (ExactCurrentWorld for the current development profile)
+  AND that PASS is current on VerificationBasis
+  AND no unresolved execution obligation
+  AND no unresolved matching or unrelated blocking failure
+  AND no hard required-context miss
+
+AcceptanceReady =
+  CompletionPolicy is EvidenceRequired
+  AND a non-empty bounded acceptance declaration exists
+  AND every declared criterion has a successful current receipt
+  whose host-declared coverage domain satisfies that criterion
+
+VerifiedReady =
+  EvidenceReady
+  AND AcceptanceReady
+  AND open_loops is empty
+  AND next_action is empty
+
+CompletionDecision(ModelProposal) = CommitSafe AND VerifiedReady
+CompletionDecision(ExplicitOperator) = CommitSafe
+  # if VerifiedReady is false, persist OperatorOverride + bounded reasons
+```
+
+One Runtime-owned pure derivation accepts
+`CompletionIntent = ModelProposal | ExplicitOperator` and supplies the
+settlement label, optional TaskProgress projection, `task.complete` acceptance
+and durable completion commit. Settlement and model `task.complete` use
+`ModelProposal`. Explicit user/host closure may bypass semantic acceptance but
+never runtime commit safety; it records a typed override and unmet reasons, not
+verified success. Ordinary assistant final is an independent turn boundary and
+never fabricates durable task closure.
+
+Task creation or a trusted anchor-ingestion path sets an explicit completion
+policy. `EvidenceRequired` carries a non-empty user/host-owned criterion set;
+the conservative no-criteria default is `OperatorClosureOnly`, where ordinary
+final remains valid, model `task.complete` is refused, and explicit user/host
+closure is recorded as an override rather than verification success. The
+model-routable `task.manage` cannot mint acceptance authority.
+
+For V1, a criterion identity is
+`(anchor.verification_revision, criterion_index)`. Its receipt also binds task,
+directive/workspace revisions and verification identity. Criteria content or
+order changes advance `verification_revision`; receipt mutation advances only
+the full anchor CAS revision. After a successful matching observation, Runtime
+atomically matches the host-declared domain, CAS-writes receipts, synchronizes
+`execution.anchor_revision`, appends the bounded coverage event, and only then
+derives readiness. This avoids immediately staling the PASS that earned the
+receipt. Runtime never guesses equivalence from command text, and a TaskScoped
+PASS cannot masquerade as `ExactCurrentWorld`.
+
+The eval host derives declarations from each frozen fixture's public behavior
+contract and persists that source digest. A retry saturation boundary may be a
+criterion; a hidden implementation marker may not. A broad Cargo PASS is useful
+evidence but cannot cover that boundary without the matching test/probe domain.
+
+Continuation reuses the stored instruction and therefore preserves the
+directive revision. New user dialogue advances it. A later mutation, failure,
+anchor-boundary change or hard context degradation still invalidates readiness.
+Failure resolution is domain/identity/resource/obligation scoped; a verifier
+PASS never clears unrelated blockers.
+
+### Current evaluation algorithm
+
+The corrected product baseline keeps TaskProgress on and settlement projection
+off. Independent switches now express that pair:
+
+```text
+project_task_progress = true
+project_settlement    = false | true
+```
+
+Treatment-sized common packing and the exact same-state request audit are
+implemented behind an explicit diagnostic switch. Runtime attaches an audit
+only for a genuinely settled final request; the eval transport validates it
+against the harness-owned arm and the exact observed messages/tools. Missing,
+truncated or mismatched request evidence fails closed. The ordinary product
+path packs only its actual arm and does not assemble, clone or hash a second
+`ModelInput`.
+
+This does not authorize a live causal claim: current off/on cells still start
+independently. If a selected candidate enables settlement, its evaluator slice
+must fork both arms from one pre-exposure durable Runtime checkpoint and
+byte-identical workspace snapshot, preserve opaque ids, and pin the provider
+protocol explicitly. Alpha-normalizing independently minted ids is forbidden.
+A settlement-off base does not run this slice.
+
+A settlement episode starts on entry to a ready candidate and closes on the
+first reopening, durable completion, ordinary-final `TurnCompleted`, new user
+boundary or continuation boundary. Persist the terminal mechanism. Pair cells
+by stable `(candidate/source, pack/fixture, mode, repeat, acceptance-domain
+revision/source, provider-config)` identity; runtime task ids are provenance
+only. Missing, duplicate or mismatched pairs invalidate the gate. With two
+repeats, report both values and their midpoint rather than hiding them behind
+an upper-nearest “median”.
+
+The real actor order places `TurnCompleted + RuntimeCommitBarrier(Turn)` before
+the optional task-completion transaction. Episode parsing therefore keeps the
+turn terminal pending and upgrades it only after the matching
+`RuntimeCommitBarrier(TaskCompletion)`; a bounded quiet/trace boundary otherwise
+closes it as an ordinary turn. Deterministic coverage uses that order.
+
+### Current delivery order
+
+The uncommitted 2026-08-30 tree passed the integrated fmt, Clippy, build and
+complete workspace regression. The readiness/declaration, continuation,
+required-context, failure-lifecycle, real-order terminal, RunStart/replay and
+strict-provider matrices are locally green. That is a development checkpoint,
+not a clean-source or M15 evidence claim. Continue in this order:
+
+1. Freeze one recorded clean source, repeat the four commands there, and pass
+   Ubuntu plus Windows CI on that exact source.
+2. Measure and improve verifier routing to the first criterion-satisfying
+   trusted PASS using host-declared coverage domains. Include a negative where
+   a broad Cargo/test PASS is valid but does not cover a criterion-specific
+   boundary; optimize pre-settlement rounds/calls without changing Context
+   policy or limiting model autonomy.
+3. Close every P1 item exercised by the selected candidate/evidence path, or
+   prove deterministically that it is out-of-path.
+4. A settlement-off base candidate may proceed to exact-source M15 preflight.
+   Only a candidate that enables model-visible settlement first needs the
+   same-checkpoint/byte-identical-workspace causal fork with an explicit
+   provider protocol.
+5. Run the bounded product preflight, then exactly one predeclared formal M15
+   window if every preceding gate remains green.
+
+No step expands the transcript, adds a second ResumePoint, introduces a
+TaskGraph/learned planner, auto-completes, fixes a task-specific round count or
+retunes Context/GC/retrieval/packing. Executable defect exits are centralized in
+[`AUDIT_TODO.md`](AUDIT_TODO.md#current-merged-audit--2026-08-30-ea8deef).
+
+### Historical 2026-08-29 implementation record (non-actionable)
+
 Do not start by rewriting `task.complete`. In the recovery-surface run its
 schema was always present, all 18 calls returned successful tool results, and
 17 reached durable `TaskCompleted`; the 55-round / 129-call tail made no
 completion call. The bottleneck is the decision before a completion mechanism,
 not the mechanism itself.
 
-### Audit of the landed first slice
+#### Audit of the landed first slice
 
 CONV-CLOSE-01 landed useful workspace-cleanliness alignment, bounded
 `SettlementLabel` events, first-candidate metrics and seven deterministic actor
@@ -933,7 +1128,7 @@ Those facts remain valid, but review found four gaps:
 The evidence report remains immutable; only its causal interpretation is
 superseded. No further live spend is justified until the four gaps are fixed.
 
-### Target algorithm
+#### Superseded target algorithm
 
 Use a two-level, evidence-driven join rather than a fixed round or token limit:
 
@@ -964,7 +1159,7 @@ express the join. A new directive/constraint, anchor-boundary change, accepted
 mutation, failure, stale verification, opened loop or non-empty next action
 reopens the state immediately. No fixed threshold decides readiness.
 
-### Ordered delivery and promotion gate
+#### Superseded delivery and promotion gate
 
 1. **Correct semantics first.** Keep settlement model projection absent and
    default-off. Add deterministic negative coverage for incomplete acceptance,
@@ -987,9 +1182,10 @@ reopens the state immediately. No fixed threshold decides readiness.
    Zero on-arm exposure is inconclusive. Promotion requires mandatory
    behavior/diff/resume parity, no lost unfinished work, lower candidate-episode
    rounds and calls, and no new maximum episode or whole-cell tail.
-5. **M15 handoff.** Only a promoted projection may enter exact-source preflight.
-   Then follow the prospective one-window rule in `M15_ACCEPTANCE.md`; do not
-   repeatedly sample an unchanged candidate.
+5. **Historical M15 handoff (superseded).** This slice required a promoted
+   projection before exact-source preflight. The current rule allows a corrected
+   settlement-off base candidate; only an enabled projection needs its own
+   causal gate. In either case, do not repeatedly sample an unchanged candidate.
 
 Steps 1–4 landed 2026-08-29 as a bounded batch. Live candidate emission
 required three driver repairs first: trusted verification PASS clears
@@ -1110,14 +1306,23 @@ Minimum deterministic coverage:
   `CheckpointDurable(S, artifact, digest, capability_generation)` ->
   `TaskContinuationStarted(S)` with no mismatched/older ack accepted;
 - the final completion artifact is validated, loaded and restored successfully
-  in a fresh Runtime before the test accepts `TurnCompleted` ->
-  `CheckpointDurable` -> `TaskCompleted`; final-write failure leaves the live
-  task completion-pending/retryable and emits no `TaskCompleted`;
+  in a fresh Runtime before the test accepts
+  `TurnCompleted + RuntimeCommitBarrier(Turn)` -> prospective terminal
+  `CheckpointDurable` -> `TaskCompleted +
+  RuntimeCommitBarrier(TaskCompletion)`; final-write failure leaves the live
+  task completion-pending/retryable and emits no `TaskCompleted`, while a
+  post-checkpoint audit failure keeps terminal truth and fences recovery;
 - a stress fixture creates `configured_retention_limit + 2` checkpoints and
   crosses the configured byte threshold; count/bytes remain bounded without
   deleting the latest required, pinned or referenced recovery artifact;
 - progress-only record movement preserves verification across every consumer,
   while authoritative basis movement invalidates it across every consumer;
+- criterion, receipt and verification provenance all bind the same current host
+  coverage-declaration revision/source digest; legacy/default or recomposed
+  mismatches fail closed;
+- any settlement-changing causal pair forks from one pre-exposure durable
+  checkpoint and byte-identical workspace, preserves opaque ids and uses an
+  explicit provider protocol; and
 - initial/incomplete tasks never receive a derived completion lease; current
   positive evidence offers one bounded decision; Offered -> Called -> Completed
   carries one non-empty identical key, which survives cold restore and cannot

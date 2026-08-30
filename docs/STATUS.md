@@ -18,6 +18,53 @@ and sandbox contracts live elsewhere. Experiment facts live in
 
 ## Now
 
+**Implementation checkpoint (2026-08-30, uncommitted worktree based on
+`ea8deefc873abee13106de92bbbb3ddbaeb2d423`; not an evidence source):**
+
+- P0 candidate code now derives one `CompletionReadiness`, preserves the
+  directive epoch on `TaskContinuation`, mints only post-PASS criterion
+  receipts bound to the current host coverage declaration, resolves failures
+  by typed identity/domain with fail-closed overflow, and makes required
+  Context misses completion-visible. Required-body overlay first proves a
+  displacement feasible and only then commits it, so an oversized mandatory
+  body records a miss without destroying the useful optional frame.
+- Task closure now uses a prospective terminal checkpoint and explicit
+  `RuntimeCommitBarrier`. New traces start with a durable format marker, replay
+  rebuilds only the committed prefix, and a validated terminal checkpoint is
+  stronger truth in the checkpoint-to-audit crash window.
+- Runtime startup is one-shot: only a successfully flushed `RunStarted +
+  RuntimeCommitBarrier(RunStart)` batch enters `Serving`; a partial append or
+  flush failure enters `StartFailed`, rejects later mutation/retry and writes no
+  synthetic shutdown completion.
+- Provider parsing now fails closed on malformed SSE/known events/tool
+  arguments and missing terminal markers. Buffered eval retry is bounded; a
+  live sink never replays already published output.
+- Eval now has independent task-progress/settlement switches, stable pair
+  identity, bounded real-order episode records and a harness-verified
+  same-state request audit. The product default path performs neither the
+  counterfactual second input nor its request hashing.
+- Live settlement causality is a conditional gap: if the selected candidate
+  enables settlement, both arms must fork from one pre-exposure durable
+  checkpoint and byte-identical workspace while preserving opaque ids and an
+  explicitly pinned provider protocol. A settlement-off base skips this live
+  pair. The historical
+  convergence bundle remains mechanical FAIL and causally
+  **INVALID/CONFOUNDED**; it is not reinterpreted.
+- The final uncommitted tree passed the four local commands on 2026-08-30:
+  fmt check, all-target/all-feature Clippy with warnings denied, all-target
+  build, and the complete workspace all-target suite. `BASELINE-01` remains
+  open because this is not a recorded clean source and neither Ubuntu nor
+  Windows CI has banked the same source.
+- M15 remains open. Its shape remains 3 fixtures × normal/resume × 2 repeats =
+  12 cells. Historical v3 FAIL windows remain immutable; no v4 formal evidence
+  has been run. M12/M13 artifacts remain banked, while `GOV-STATUS-01` still
+  forbids a new closure claim or Self-Iteration transition.
+
+### Historical evidence chronology (non-authoritative)
+
+The dated observations below remain useful evidence but do not override the
+snapshot, merged TODO or ordered route above.
+
 - M10, M11, and M14 are closed at their named gates.
 - Context V1 operational core and **Execution Coherence V1 are both
   freeze candidates**: the 2026-08-23 long-flow pass confirmed the
@@ -453,26 +500,30 @@ and sandbox contracts live elsewhere. Experiment facts live in
   `evidence/m15-window/REPORT.md`; their ratios and apparent deltas cannot be
   used for promotion or causality.
 
-  The evaluator repair is implemented as `retry-pilot-cell-v3`: actual pack
+  The historical evaluator repair landed as `retry-pilot-cell-v3`: actual pack
   identity/digest, acceptance-profile-aware verdicts, typed Runtime/provider/
   model/harness failure classes, independently persisted restore/exact-tuple/
   continuation/turn/task facts, and an exact window manifest whose report is
-  regenerated from the 12 immutable cell directories. The report also
-  cross-checks event continuity, summary/dimension counters, confined paths
-  and per-cell round/tool/wall/token facts; evidence-write failure is fatal.
-  Provider transport or harness failure yields NOT_RUN and censors a window;
-  `max_output_tokens` yields a model-output-limit cell FAIL. Formal execution
-  rejects dirty source, pack/repeat drift and protocol `auto`. M15 remains open
-  until a new clean, single-serving v3 window passes.
+  regenerated from the 12 immutable cell directories. Prospective evidence now
+  uses `retry-pilot-cell-v4`, adding stable pair/source identity, independent
+  acceptance-declaration revision/source identity and bounded request-audit
+  facts. Its reporter requires all 16 identity/switch keys and recomputes the
+  frozen identities. Provider transport or harness failure yields NOT_RUN and
+  censors a window; `max_output_tokens` yields a model-output-limit cell FAIL.
+  Formal execution rejects dirty source, pack/repeat drift and protocol `auto`.
+  M15 remains open until the current exact candidate passes its deterministic,
+  clean-source/CI, product-preflight and single-serving v4 window gates.
 
-  A bounded representative preflight now pins the serving tuple for that
-  window: PinAI `/v1`, `gpt-5.6-luna`, Responses protocol, 128,000-token
-  context window. The 2026-08-28 source-bound dirty-tree diagnostic cell
+  The 2026-08-28 bounded representative preflight pinned PinAI `/v1`,
+  `gpt-5.6-luna`, Responses protocol and a 128,000-token context window for its
+  source-bound dirty-tree diagnostic cell
   (`retry_policy_dev`, normal, closure-required) passed behavior, diff and
   committed closure in 26 rounds / 59 tool calls / 3 failed outputs /
   315,468 ms, with zero provider retries and a contiguous observed event
-  suffix. It is serving-selection evidence only, not a formal M15 cell or a
-  failure-rate estimate. An earlier preflight on the same serving failed
+  suffix. It is historical serving-selection evidence only, not a formal M15
+  cell, a current-source pin or a failure-rate estimate. The next exact-source
+  preflight must pin its own unchanged tuple. An earlier preflight on the same
+  serving failed
   closure after 30 rounds / 53 calls / 7 failed outputs; comparing two
   stochastic cells cannot establish a causal round/call improvement.
 
@@ -719,8 +770,9 @@ and sandbox contracts live elsewhere. Experiment facts live in
   `tool_surface=production`. It must not be used to silently change the
   frozen Context Mechanism pin.
 
-**M12 and M13 closed 2026-08-27 at their named clean-tree gates**
-(`platform-closure/m12/` and `/m13/` evidence reports). **Do not claim
+**Historical status recorded 2026-08-27:** M12 and M13 were marked closed at
+their named clean-tree gates (`platform-closure/m12/` and `/m13/` evidence
+reports). Current authority wording is pending `GOV-STATUS-01`. **Do not claim
 PLAT-06 closed**: slice 1–2 are landed and multiplexing stays out of v0.
 
 - The typed host-trusted execution-facts channel reached its last behavioral
@@ -764,12 +816,16 @@ PLAT-06 closed**: slice 1–2 are landed and multiplexing stays out of v0.
   not a new slice. WASI is V2.
 - Natural-language verify remains the four-needle hint.
 
-## P0 / P1
+## P0 / P1 — historical landed chronology
 
-**P0 — trusted execution (closed).** M12/M13 gates in
-[`PLATFORM_SECURITY.md`](PLATFORM_SECURITY.md) closed 2026-08-27 on their
-clean-tree closure-audit evidence; the gate history below is retained as
-context. Landed by 2026-08-26: the full admission flow —
+The current pre-M15 queue is the merged audit linked in **Now**. This section is
+retained as dated implementation/evidence chronology; its older milestone
+labels do not override `GOV-STATUS-01`, and non-conflicting residual backlog
+remains in `AUDIT_TODO.md`.
+
+**P0 — trusted execution closure-audit evidence (banked 2026-08-27).** The
+gate history below is retained as context. Landed by 2026-08-26: the full
+admission flow —
 an installed package manifest supplies candidate tool names only, the
 operator review artifact supplies the actual bindings,
 `admit_reviewed` installs them atomically, and versioned snapshots bind
@@ -810,9 +866,9 @@ The M13 counterpart landed the same day: `agent-eval --platform-closure-m13`
 (real child spawns, per-profile `required ⊆ actual` activation, both refusal
 cases, mechanism-proof attestations) wrote its first PASS report — 8 rows,
 zero unresolved — under `crates/agent-eval/evidence/platform-closure/m13/`.
-Both gates then closed 2026-08-27 on clean-tree regeneration of the two
-reports (commit-bound source digests in each manifest); nothing structural
-remains open in either item.
+  Both gates were then recorded as closed 2026-08-27 on clean-tree regeneration
+  of the two reports (commit-bound source digests in each manifest); current
+  closure wording remains governed by `GOV-STATUS-01`.
 M13 is likewise a closure audit: structured attestation must validate enforced
 evidence, activation must enforce `required ⊆ actual`, and unsupported native
 `UntrustedGenerated` must fail closed. Universal native availability belongs
@@ -972,67 +1028,35 @@ tail made no completion call. The first implementation landed useful
 observation labels, events and tests, but review found that the label is not
 rendered to the model, its eligibility is execution-local rather than
 task-aware, its tail metric does not stop when work reopens, and its live runner
-has no off/on treatment arm. The open task is therefore CONV-CLOSE-02, not
-another unchanged live run. Do not auto-close, resurrect CompletionOpportunity,
-add fixed stopping counts, or change Context/GC. Same-model A/C and broader
-diagnosis/multi-file twins remain after formal M15. Criterion/CPL and
-model-visible TaskGraph research stay deferred and evidence-gated.
+  has no off/on treatment arm. That historical judgment assigned the work to
+  CONV-CLOSE-02; the 2026-08-30 merged audit supersedes it. Do not auto-close,
+  resurrect CompletionOpportunity, add fixed stopping counts, or change
+  Context/GC. Same-model A/C and broader diagnosis/multi-file twins remain after
+  formal M15. Full CPL and model-visible TaskGraph research stay deferred;
+  bounded criterion receipts are current work under `ACCEPT-RECEIPT-01`.
 
 ## Next milestone
 
-Engineering mainline after the 2026-08-27 platform-gate closures remains the
-**V1 candidate and formal M15**, but no fourth unchanged formal window is
-allowed. Three clean, identity-consistent v3 windows have already failed
-(11/12, 9/12, 10/12); migrate and policy are 24/24 while formal diag is 6/12.
-The next bounded implementation task is **Task-aware Completion Convergence**:
+The next milestone is a **recorded and CI-proven V1 candidate**, not another
+live sample. Execute in this order:
 
-1. derive eligibility from the current user/task epoch, current trusted
-   verification, no in-flight work/obligations/known failures, no open loops or
-   next action, and explicit bounded acceptance coverage; absent task-level
-   coverage, the strongest label is `VerifiedCurrent`;
-2. invalidate eligibility on any new directive/constraint, accepted mutation,
-   failure, stale verification or task-progress reopening;
-3. only after that is deterministic, render one bounded neutral fact through
-   `PromptAssembler` behind a default-off projection switch; preserve ordinary
-   final, durable `task.complete`, and concrete continuation;
-4. measure candidate **episodes** that end when work reopens, then run a real
-   same-source projection-off/on paired gate (normal/resume in both arms) with
-   exposure, success, no-lost-work and tail criteria.
+1. freeze the candidate as one recorded clean source and repeat the four local
+   commands plus Ubuntu and Windows CI on that exact source;
+2. measure `VERIFY-ROUTE-01`, then close or prove out-of-path every P1 item
+   exercised by the selected candidate/evidence path;
+3. only if the selected candidate changes model-visible settlement, fork both
+   causal arms from one pre-exposure checkpoint/workspace and pin an explicit
+   provider protocol;
+4. run the bounded exact-source product preflight with the selected serving
+   tuple and explicit protocol;
+5. if every gate remains green, spend exactly one predeclared M15 window.
 
-Steps 1–4 landed 2026-08-29 (see the CONV-CLOSE-02 "Now" entry); the step-4
-paired gate then ran on the approved 8-cell budget and FAILED promotion on
-strict parity, leaving the projection default-off and the gate back at
-observation. The diagnosed causes are bounded and fixture-level (pair-0
-exposure is model recipe-choice — the cell that used only the TaskScoped
-`rust.workspace` runner recorded no trusted pass; marker needle-shape
-parity the behavioral oracle tolerates). Any change must first pass the
-deterministic reopening/restore suite; no rerun before that diagnosis.
+A base candidate with settlement projection off may proceed after these gates.
+Only a candidate that changes the model-visible settlement projection needs a
+new isolated off/on promotion gate. A valid formal failure rejects that source;
+only a typed `NOT_RUN` permits rerunning the whole frozen window.
 
-Before any further M15 spend, freeze the missing cross-window retry rule in
-[`M15_ACCEPTANCE.md`](M15_ACCEPTANCE.md). After the source changes, run the
-exact-source preflight and exactly one predeclared 12-cell confirmation window.
-A valid failure rejects that candidate and returns to diagnosis; it does not
-authorize repeated sampling until a lucky 12/12. V2 Self-Iteration stays
-blocked until M15 closes.
-The agent may grow capabilities, never evaluation or permission Core authority.
-
-In parallel, keep `LT-RUN-05` frozen and build only deterministic fixtures for
-the post-M15 `LT-EVAL-06` diagnosis/multi-file task pack. The deterministic
-side of that pack is now complete: the missing third task type —
-evaluation-harness maintenance — landed as `harness_maint_dev` (2026-08-29,
-`m15_pack` registry, frozen `c586021e…a2d91`): seeding a `summarize_results`
-misclassification (NOT_RUN rows counted as failed), an injected
-harness-owned oracle that rejects the seed and accepts the scripted minimal
-fix, content checks (report names the mechanism; `failed` counts only
-`Failed` rows; regression test locks the classification), and self-tests
-pinning seed-reject/solved-accept plus digest. It is a deterministic
-LT-EVAL-06 fixture, not an M15 window pack: `M15_PACK_IDS` stays 3 and the
-12-cell window contract is unchanged. Do not add TaskGraph,
-change Context/GC, or run another CompletionOpportunity/old 15-directive live
-pair. The first post-M15 live expansion compares normal/resume twins on the
-unchanged Runtime and asks whether repeated-work or lost-subgoal evidence is
-material before proposing another planning substrate.
-
-Context evaluation: `context-mech.v2` 12-cell evidence exists; do not
-expand to 27 or 300×3. Live `recall_after_fix` is refused.
-`--compare-live-reasonable` is `add_test` only.
+Post-M15 `LT-EVAL-06` development twins remain parked. The deterministic
+`harness_maint_dev` fixture is available, but no TaskGraph, learned planner,
+Context/GC retune, 27-cell expansion or 300×3 run is authorized. Self-Iteration
+remains blocked by the governing milestone gates.

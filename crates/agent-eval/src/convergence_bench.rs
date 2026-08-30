@@ -140,6 +140,8 @@ async fn run_session(
         output_broker: None,
         max_tool_rounds: Some(32),
         project_task_progress: true,
+        project_settlement: false,
+        settlement_projection_diagnostics: false,
         project_completion_opportunity: false,
         recovery_surface: false,
         host_policies: Some(Arc::new(

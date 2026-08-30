@@ -12,8 +12,8 @@ use agent_contracts::{
     ContextMaintenanceReport, ContextMaintenanceTrigger, ContextQuery, ContextScope,
     ContextStateTransition, EventJournal, MaterializedContext, ModelCapabilities, ModelOutput,
     ModelRequest, ModelRole, ModelTransport, RuntimeDirective, RuntimeEvent, RuntimeEventEnvelope,
-    ScopeId, ScopeKind, ToolCall, ToolDispatcher, ToolExecutionRequest, ToolOutcome, ToolOutput,
-    ToolSemanticRole, ToolSpec,
+    ScopeId, ScopeKind, ToolCall, ToolDispatcher, ToolExecutionAttribution, ToolExecutionPurpose,
+    ToolExecutionRequest, ToolOutcome, ToolOutput, ToolSemanticRole, ToolSpec, VerificationReuse,
 };
 
 use agent_core::{CoreAuthorityConfig, PolicyApprovalGate};
@@ -81,6 +81,9 @@ impl ContextEngine for RecordingContextEngine {
             selected: Vec::new(),
             approx_tokens: 0,
             foreground: Vec::new(),
+            required_item_ids: Vec::new(),
+            required_misses: Default::default(),
+            optional_misses: Default::default(),
             diagnostics: ContextDiagnostics::default(),
         })
     }
@@ -288,6 +291,9 @@ impl ContextEngine for ScopeRecordingEngine {
             selected: Vec::new(),
             approx_tokens: 0,
             foreground: Vec::new(),
+            required_item_ids: Vec::new(),
+            required_misses: Default::default(),
+            optional_misses: Default::default(),
             diagnostics: ContextDiagnostics::default(),
         })
     }
@@ -315,7 +321,9 @@ impl ContextEngine for ScopeRecordingEngine {
 }
 
 #[derive(Debug)]
-struct OneShotCompletionModel;
+struct OneShotCompletionModel {
+    rounds: AtomicUsize,
+}
 
 #[async_trait::async_trait]
 impl ModelTransport for OneShotCompletionModel {
@@ -324,12 +332,18 @@ impl ModelTransport for OneShotCompletionModel {
     }
 
     async fn complete(&self, _request: ModelRequest) -> AgentResult<ModelOutput> {
+        let round = self.rounds.fetch_add(1, Ordering::SeqCst);
+        let (id, name, arguments) = if round == 0 {
+            ("verify", "test.verify", json!({}))
+        } else {
+            ("complete", "task.complete", json!({"summary": "done"}))
+        };
         Ok(ModelOutput {
             content: String::new(),
             tool_calls: vec![ToolCall {
-                id: "complete".into(),
-                name: "task.complete".into(),
-                arguments: json!({"summary": "done"}),
+                id: id.into(),
+                name: name.into(),
+                arguments,
             }],
             usage: Default::default(),
         })
@@ -339,20 +353,81 @@ impl ModelTransport for OneShotCompletionModel {
 #[derive(Debug)]
 struct OneShotCompletionDispatcher;
 
+const ONE_SHOT_VERIFY_IDENTITY_MATERIAL: &str = "scope completion verifier v1";
+const ONE_SHOT_ACCEPTANCE_DOMAIN: &str = "scope-completion";
+
+fn one_shot_acceptance_declaration() -> agent_contracts::VerificationCoverageDeclaration {
+    agent_contracts::VerificationCoverageDeclaration {
+        domain_id: ONE_SHOT_ACCEPTANCE_DOMAIN.into(),
+        declaration_revision: 1,
+        source_digest: agent_contracts::ContentDigest::sha256_bytes(
+            b"scope-completion-declaration/v1",
+        )
+        .to_string(),
+    }
+}
+
 #[async_trait::async_trait]
 impl ToolDispatcher for OneShotCompletionDispatcher {
     fn specs(&self) -> Vec<ToolSpec> {
-        vec![ToolSpec {
-            name: "task.complete".into(),
-            description: "complete".into(),
-            input_schema: json!({"type": "object"}),
-            risk: agent_contracts::ToolRisk::ReadOnly,
-            output_budget: None,
-            roles: Vec::new(),
-        }]
+        vec![
+            ToolSpec {
+                name: "test.verify".into(),
+                description: "verify the current completion basis".into(),
+                input_schema: json!({"type": "object"}),
+                risk: agent_contracts::ToolRisk::ReadOnly,
+                output_budget: None,
+                roles: Vec::new(),
+            },
+            ToolSpec {
+                name: "task.complete".into(),
+                description: "complete".into(),
+                input_schema: json!({"type": "object"}),
+                risk: agent_contracts::ToolRisk::ReadOnly,
+                output_budget: None,
+                roles: Vec::new(),
+            },
+        ]
+    }
+
+    fn execution_attribution(&self, call: &ToolCall) -> ToolExecutionAttribution {
+        if call.name == "test.verify" {
+            return ToolExecutionAttribution::bounded(
+                ToolExecutionPurpose::Verify,
+                Vec::<String>::new(),
+                VerificationReuse::ExactCurrentWorld,
+            )
+            .with_verification_identity_material(ONE_SHOT_VERIFY_IDENTITY_MATERIAL)
+            .with_verification_recipe(agent_contracts::VerificationRecipeProvenance {
+                recipe_id: "test.verify".into(),
+                recipe_revision: "v1".into(),
+                coverage_domain: Some(ONE_SHOT_ACCEPTANCE_DOMAIN.into()),
+                domain_declaration_revision: Some(1),
+                domain_source_digest: one_shot_acceptance_declaration().source_digest,
+                class_identity_digest: "scope-completion-class".into(),
+            });
+        }
+        ToolExecutionAttribution::default()
+    }
+
+    fn verification_coverage_declarations(
+        &self,
+    ) -> Vec<agent_contracts::VerificationCoverageDeclaration> {
+        vec![one_shot_acceptance_declaration()]
     }
 
     async fn execute(&self, request: ToolExecutionRequest) -> AgentResult<ToolOutcome> {
+        if request.call.name == "test.verify" {
+            return Ok(ToolOutcome::Value(ToolOutput {
+                call_id: request.call.id,
+                tool_name: request.call.name,
+                ok: true,
+                summary: "completion basis verified".into(),
+                model_content: "completion basis verified".into(),
+                artifact_ref: None,
+                metadata: json!({"verification": true}),
+            }));
+        }
         Ok(ToolOutcome::RuntimeDirective {
             output: ToolOutput {
                 call_id: request.call.id,
@@ -375,12 +450,35 @@ impl ToolDispatcher for OneShotCompletionDispatcher {
 async fn one_shot_completion_closes_the_landed_tool_scope_without_a_next_model() {
     let context = Arc::new(ScopeRecordingEngine::default());
     let handle = spawn_with(
-        Arc::new(OneShotCompletionModel),
+        Arc::new(OneShotCompletionModel {
+            rounds: AtomicUsize::new(0),
+        }),
         context.clone(),
         Arc::new(OneShotCompletionDispatcher),
     )
     .await;
     let mut events = handle.subscribe();
+    handle.set_focus("complete the task".into()).await.unwrap();
+    let task_id = handle.list_tasks().await.unwrap()[0].id;
+    handle
+        .patch_task_anchor(
+            task_id,
+            0,
+            agent_runtime::AnchorPatch {
+                completion_policy: Some(
+                    agent_runtime::task::TaskCompletionPolicy::EvidenceRequired,
+                ),
+                acceptance_criteria: Some(vec![
+                    agent_runtime::task::AcceptanceCriterion::declared(
+                        "the current completion basis passes",
+                        &one_shot_acceptance_declaration(),
+                    ),
+                ]),
+                ..agent_runtime::AnchorPatch::default()
+            },
+        )
+        .await
+        .unwrap();
     handle
         .user_message("complete the task".into())
         .await
@@ -400,16 +498,22 @@ async fn one_shot_completion_closes_the_landed_tool_scope_without_a_next_model()
         );
     }
 
-    let tool_scope = context
+    let tool_scopes = context
         .opens
         .lock()
         .await
         .iter()
-        .find_map(|(kind, id)| (*kind == ScopeKind::Tool).then_some(*id))
-        .expect("task.complete must own a tool scope");
+        .filter_map(|(kind, id)| (*kind == ScopeKind::Tool).then_some(*id))
+        .collect::<Vec<_>>();
+    assert_eq!(
+        tool_scopes.len(),
+        2,
+        "verification and task.complete must each own a tool scope"
+    );
+    let closed = context.closes.lock().await;
     assert!(
-        context.closes.lock().await.contains(&tool_scope),
-        "terminal completion must explicitly consume its tool-result scope"
+        tool_scopes.iter().all(|scope| closed.contains(scope)),
+        "terminal completion must consume its tool-result scope without another model round"
     );
 }
 
@@ -665,6 +769,9 @@ impl ContextEngine for PublishingScopeEngine {
             selected: Vec::new(),
             approx_tokens: 0,
             foreground: Vec::new(),
+            required_item_ids: Vec::new(),
+            required_misses: Default::default(),
+            optional_misses: Default::default(),
             diagnostics: ContextDiagnostics::default(),
         })
     }
@@ -724,6 +831,9 @@ impl ContextEngine for FailingCloseScopeEngine {
             selected: Vec::new(),
             approx_tokens: 0,
             foreground: Vec::new(),
+            required_item_ids: Vec::new(),
+            required_misses: Default::default(),
+            optional_misses: Default::default(),
             diagnostics: ContextDiagnostics::default(),
         })
     }
@@ -869,6 +979,9 @@ impl ContextEngine for IngestRecordingEngine {
             selected: Vec::new(),
             approx_tokens: 0,
             foreground: Vec::new(),
+            required_item_ids: Vec::new(),
+            required_misses: Default::default(),
+            optional_misses: Default::default(),
             diagnostics: ContextDiagnostics::default(),
         })
     }

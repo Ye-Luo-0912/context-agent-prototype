@@ -7,11 +7,12 @@
 //! the authoritative CAS outcome back into the model-visible result, so a
 //! stale revision is retryable in the very next round.
 //!
-//! User authority stays structurally out of reach: the argument schema has
-//! no goal/constraints fields and unknown keys are rejected, while goal and
-//! constraint changes keep flowing through the existing boundary/approval
-//! path. The catalog-cold default means ordinary turns never see this tool;
-//! explicit long-task runs add it as a task requirement.
+//! User and completion authority stay structurally out of reach: the argument
+//! schema has no goal, constraints, completion policy, criteria or receipt
+//! fields and unknown keys are rejected. Goal/constraint changes keep flowing
+//! through the boundary/approval path; trusted hosts declare completion
+//! authority through runtime APIs. The catalog-cold default means ordinary
+//! turns never see this tool; explicit long-task runs add it as a requirement.
 
 use agent_contracts::{
     AgentError, AgentResult, CancellationToken, MAX_TASK_ANCHOR_ITEM_CHARS,
@@ -218,6 +219,27 @@ mod tests {
             .await
             .expect_err("user-authority fields must not pass through");
         assert!(refused.to_string().contains("task.manage args"));
+
+        let acceptance = tool
+            .execute(
+                RunId::new(),
+                "c2",
+                json!({
+                    "base_anchor_revision": 1,
+                    "completion_policy": "evidence_required",
+                    "acceptance_criteria": [{
+                        "description": "tests pass",
+                        "coverage_domain": "workspace-tests",
+                        "domain_declaration_revision": 3,
+                        "domain_source_digest": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+                    }]
+                }),
+                None,
+                CancellationToken::new(),
+            )
+            .await
+            .expect_err("model progress cannot mint completion authority");
+        assert!(acceptance.to_string().contains("task.manage args"));
     }
 
     #[tokio::test]

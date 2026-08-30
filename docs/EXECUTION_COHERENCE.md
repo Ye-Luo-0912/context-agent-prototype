@@ -45,8 +45,10 @@ Context packing, GC, and retrieval live in
    After BeforeModel revalidate, capture one [`RoundExecutionSnapshot`].
    Prompt, `ContextHints`, and tool-surface policy all read that snapshot.
    Do not clone `ExecutionState` and replay `TurnFrame` per consumer.
-   Durable `TaskRecord.resume` is installed only after `TurnCompleted`.
-   Cancel / fail / stale drops the ephemeral turn projection.
+   Durable `TaskRecord.resume` becomes authoritative only when the
+   `RuntimeCommitBarrier(Turn)` batch succeeds; `TurnCompleted` is lifecycle
+   audit and a marker-free legacy fallback only. Cancel / fail / stale drops
+   the ephemeral turn projection.
 
 5. **Evidence storage ≠ task-frontier advance ≠ blocker resolution.**
    Reading a new file, learning a status, or seeing a new error can all add
@@ -658,90 +660,99 @@ process launches the host-owned resolver defines resolution explicitly —
 absolute paths as-is; separator-relative forms join the call cwd; bare
 names search the cwd first, then effective PATH (PATHEXT-aware on
 Windows) — and stamps both the stable scope digest and the epoch
-fingerprint (full bounded cwd state + effective PATH + canonically
-sorted env overrides) into success *and* failure metadata: preflight,
-RetryDomain and spawn share one interpretation. Source edits do not move
-the epoch; a build that changes the directory state does.
+fingerprint (bounded cwd state + effective PATH + canonically sorted env
+overrides) into success *and* failure metadata: preflight, RetryDomain and
+spawn share one interpretation. The scope binds normalized argv0 and the
+ordered candidate family, so `foo` failure cannot be cleared by `bar`
+success. Source edits do not move the epoch; installing/building the target
+may change the fingerprint while preserving the lineage.
 Rules: unrelated progress never resolves an obligation; world movement
 advances the epoch (**PreconditionChanged ≠ ObligationResolved**) and
 keeps total attempts; resolution requires blocker-specific proof — a
-launch success with matching scope key *and* fingerprint, or the target
-identity proofs for the other domains; `NonDeterministic` domains open
-nothing. TASK PROGRESS renders at most two bounded UNRESOLVED BLOCKER
+real launch success from the same candidate-family scope, or the target
+identity proofs for the other domains; `NonDeterministic` failures remain
+failed-command facts but open no deterministic obligation. Obligations and
+failed commands each retain an independent 32-row exact hot set. Excess
+identities increment a checkpointed, body-free overflow sentinel and emit an
+`Overflowed` transition; ordinary directives and continuations never clear
+opaque debt, and `CompletionReadiness` counts exact plus omitted rows. This is
+correctly fail-closed but deliberately conservative: a future durable exact
+spill index may make repaired overflow auto-resolvable without increasing the
+prompt/checkpoint hot set. Until then only a new task boundary or explicit
+operator closure can leave it behind. TASK PROGRESS renders at most two bounded UNRESOLVED BLOCKER
 lines beside the global advisory, and every ledger transition is
 event-visible (`ExecutionObligation`). Evidence argument identity uses
 the Runtime-computed `ArgumentDigest` (not producer strings), so
 same-argv/different-env and same-path/different-cursor calls no longer
 collide on evidence identity.
 
-### Derived settlement observation (foundation landed 2026-08-29; task-aware boundary open)
+### Unified completion readiness and settlement observation
 
-Completion convergence must be a derived state, not a policy or round counter.
-The landed `ExecutionState::settlement()` cheaply recomputes a four-state label
-from verification validity and the typed execution-obligation ledger. It is
-not stored, so a checkpoint cannot carry a stale computed label, and changes
-are published as `ExecutionFrontier.settlement` events.
+Completion convergence is derived state, never a round counter or automatic
+stop policy. `ExecutionState::settlement()` remains the cheap execution-local
+four-state observation and is not checkpointed. The authoritative whole-task
+decision is the pure Runtime-owned `derive_completion_readiness` join, used by
+settlement labeling, model proposal admission, opportunity eligibility and the
+terminal commit recheck. There is no second completion predicate.
 
-That implementation is an **execution-local observation**, not yet the stable
-whole-task decision boundary. Review found three contract gaps:
+The join keeps two bases orthogonal:
 
-- `TaskProgressView.settlement` is populated but not rendered by
-  `PromptAssembler::render_task_progress`, so it is not model-visible;
-- `ExecutionState` cannot see current `TaskAnchor` acceptance criteria,
-  open loops, next action, actor in-flight state or all current user/task epoch
-  conditions, so its `SettledCandidate` can precede legitimate later work; and
-- current metrics count every action after the first candidate even after a
-  reopening mutation, which is observation rather than causal tail accounting.
+- `TaskStateBasis = (task_id, anchor.revision)` proves the task/execution CAS
+  views are synchronized;
+- `VerificationBasis = (task_id, anchor.verification_revision,
+  directive_revision, workspace_revision)` proves the PASS and receipts are
+  current. Progress-only anchor CAS updates the first basis without staling
+  the second.
 
-Until the task-aware join lands, interpret the strongest current label as
-“current execution world verified with no typed execution obligation,” not as
-“whole task ready to finish,” and do not project it to the model. The accepted
-next contract is:
+`CompletionReadiness` returns bounded typed blockers and separates
+`task_state_current`, `verified_ready`, and `commit_safe`. Model settlement and
+`task.complete` require all three. `CompletionIntent::ExplicitOperator` may
+override semantic blockers only; it cannot bypass a stale task basis,
+in-flight/cancel cleanup, unresolved effect transaction, or recovery fence,
+and its immutable completion record is marked `OperatorOverride` with the
+bounded unmet reasons. A normal assistant final still closes only the turn.
 
-```text
-ExecutionReady     current trusted verification matches task-verification,
-                   directive and workspace revisions; no in-flight cleanup,
-                   unresolved obligation or failed command
-VerifiedCurrent    ExecutionReady, but task-level readiness is unproved
-SettledCandidate   ExecutionReady plus current task/user epoch, empty open
-                   loops and next action, and explicit current evidence for
-                   every bounded acceptance criterion
-Working            any new directive/boundary, mutation, failure, stale proof
-                   or reopened task-progress fact invalidates readiness
-```
+Task completion authority is explicit. `OperatorClosureOnly` is the default
+when no host/user criteria exist, so autonomous model closure fails closed.
+`EvidenceRequired` criteria pair bounded public descriptions with host-declared
+coverage domains. Runtime mints criterion-addressed receipts only after an
+observed trusted PASS; each receipt binds task, verification/criterion,
+directive, workspace, host domain declaration revision/source digest and exact
+verification identity. Runtime reprojects the bounded current host declaration
+table at readiness and requires the criterion, receipt and verification fact to
+match it. A failed verifier, unrelated/currently replaced domain, legacy string
+criterion, or pre-dispatch attribution mints nothing. Receipt CAS advances task
+  state but not the verification basis; `task.manage` cannot author completion or
+  declaration authority. The integration and restore/recomposition matrix is
+  locally green; promotion still waits for the recorded-source and CI gates.
 
-The actor/runtime owns the join because it alone has task and in-flight
-authority. It reuses `TaskAnchor`, `ExecutionState`, the verification tuple and
-bounded evidence identities; it does not move turn state into Core or Context.
-Absent explicit acceptance coverage it fails closed at `VerifiedCurrent`.
-Only after deterministic reopening/restore tests pass may `PromptAssembler`
-render one neutral, bounded fact behind a default-off switch. That fact preserves
-the model's choice of ordinary final, durable `task.complete`, or concrete
-continuation and never auto-closes. Metrics use settlement episodes that end on
-reopening, and the live promotion gate compares true projection-off/on arms.
-Detailed task: [`LONG_TASK_EVALUATION.md`](LONG_TASK_EVALUATION.md).
+`InputKind::TaskContinuation` rebuilds a turn from the stored directive and
+resume state without calling `on_user_turn`; a real new dialogue alone advances
+`directive_revision`. Every continuation re-materializes required Context
+before a model proposal can rely on readiness. Required materialization misses
+join `verified_ready`; optional misses do not.
 
-The task-aware join landed 2026-08-29 behind the default-off
-`project_progress` switch: acceptance criteria declared on the anchor are
-bound by the current trusted verification pass at observation time (one
-criterion-addressed claim per declared criterion, evidence-linked to that
-pass; absent criteria fail closed at `VerifiedCurrent`), and settlement
-episodes start on entry to a task-aware candidate and end at the first
-reopening transition or terminal outcome. The true projection-off/on paired
-gate then ran on an approved 8-cell budget: 8/8 cells PASS with 0 NOT_RUN,
-but the verdict is FAIL — pair 0 (normal r1) settlement exposure is
-off=none / on=seen (the off cell recorded no trusted verification pass:
-its model used only the TaskScoped `rust.workspace` recipe, which executes
-but carries no exact identity, so the join never armed and the cell is
-inconclusive by rule; every exposed cell used the host `jobrunner.exact`
-recipe, whose pass arms the candidate synchronously with its observation),
-marker-violation counts differ in 3/4 pairs (needle-shape misses the
-harness oracle tolerates), and episode-rounds/calls medians are 1→1, not
-strictly lower. Projection rendering was arm-separated and bounded: off 0
-tokens every round, on 430–512 tokens once a candidate existed. The frozen
-rule keeps the projection default-off and returns the gate to observation;
-no promotion claim follows.
-Facts: [`evidence/conv-gate/REPORT.md`](../crates/agent-eval/evidence/conv-gate/REPORT.md).
+The bounded settlement prompt line is controlled independently from the rest
+of TaskProgress and remains product-default off. Causal diagnostics compare a
+same-state baseline/treatment `ModelInput`, remove exactly that one declared
+line, and reject any message or `ToolSpec` difference. Both experimental arms
+must pack against the same treatment-sized envelope; this conservative packing
+and the double assembly/hash belong only to the explicit diagnostic path, not
+the ordinary product hot path. A required miss discovered during final packing
+revokes the line from the request actually sent. Live episodes close on reopen,
+task completion, ordinary final, new-user boundary, continuation boundary or
+trace end and are joined by explicit bounded pair identity rather than
+`TaskId`. Because the actor emits the turn barrier before its optional terminal
+task transaction, episode parsing holds that turn terminal pending and upgrades
+it only after the matching task-completion barrier. Provider/runtime/cell
+failures remain separately typed outcomes, not invented episode terminals.
+
+The retained 2026-08-29 report keeps its mechanical FAIL but is not a causal
+settlement verdict: that harness changed all TaskProgress and checked-file GC
+projection. The corrected gate remains fail-closed until off/on arms fork from
+the same pre-exposure durable Runtime checkpoint and workspace snapshot; exact
+runtime IDs must not be alpha-normalized away. Detailed route:
+[`LONG_TASK_EVALUATION.md`](LONG_TASK_EVALUATION.md).
 
 ### Protocol working set (turn checkpointing)
 
@@ -847,7 +858,7 @@ identical-signature threshold stays 3. Advisory only. Replacing the
 full Resident+Warm heap scan in `run_minor` with bounded dirty batches
 (`MaintenanceDebt`) remains queued behind idle-round evidence.
 
-## Long-task continuation boundary (planned Runtime slice)
+## Long-task continuation boundary (durable substrate landed; autonomous segmentation deferred)
 
 The current state model is already sufficient for bounded continuation:
 `TaskAnchor` owns goal/constraints/acceptance/plan/open loops, and the existing
@@ -856,14 +867,7 @@ failed commands and obligations. Context owns selected evidence; `TurnFrame`
 owns only the active execution stack. Do not add a second task table, another
 ResumePoint, or a transcript snapshot.
 
-What is not yet complete is the durability boundary inside one long user
-directive. Today the final turn projection is installed on `TaskRecord.resume`
-after the durable `TurnCompleted` barrier, and full Runtime checkpoints are
-requested externally. That is correct for ordinary short turns, but a process
-restart during a long tool loop has no committed, bounded continuation point
-for the already settled substeps.
-
-The next Runtime slice is therefore state-driven safe-point continuation:
+The state-driven safe-point substrate is now present:
 
 1. A safe point exists only after the entire requested tool batch has terminal
    settlement, every prepared effect has committed or rolled back, required
@@ -872,7 +876,7 @@ The next Runtime slice is therefore state-driven safe-point continuation:
    progress, durable workspace mutation, verification, suspend/pause,
    completion, shutdown). Reasons coalesce; a fixed round count is not a
    semantic trigger.
-3. At that boundary Runtime may install the bounded `ExecutionState` into the
+3. At that boundary Runtime installs the bounded `ExecutionState` into the
    existing task resume and write one atomic full Runtime checkpoint. Raw tool
    bodies remain artifacts and raw transcript history is not serialized.
 4. Restore uses the existing authority marker and cross-plane validation. A
@@ -890,10 +894,14 @@ catalog-cold, not globally always visible. It may update autonomous progress
 fields but cannot rewrite user constraints. This is an explicit model
 proposal, not automatic free-text extraction and not a Runtime planner.
 
-This planned slice changes the current invariant that only `TurnCompleted`
-installs durable resume state, so it must land with a distinct durable
-safe-point event/barrier and cancellation/restart tests before that invariant
-is revised. Until then, do not claim mid-turn crash continuation.
+The actor owns a monotonic snapshot sequence, typed coalesced debt, one
+single-flight write and an exact durable acknowledgement. Continuation is
+admitted only with no debt, no failed/in-flight write and a durable sequence at
+least as new as the required sequence. `TaskContinuation` preserves the current
+directive epoch. What remains deferred is an automatic `task.yield`/segment
+scheduler: long work is not cut at a fixed round, token or checkpoint interval.
+The next work is evaluator common-checkpoint forking and representative
+development twins, not another ResumePoint or a transcript expansion.
 
 Detailed evaluation and the first one-directive development fixture are in
 [`LONG_TASK_EVALUATION.md`](LONG_TASK_EVALUATION.md).

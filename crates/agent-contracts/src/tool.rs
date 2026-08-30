@@ -423,7 +423,9 @@ pub struct ToolExecutionAttribution {
 }
 
 /// Host-declared identity of one exact verifier recipe plus its coverage
-/// domain, if the host registered one. Ids and revisions only.
+/// domain, if the host registered one. The domain source digest fences the
+/// full canonical declaration even when a host accidentally reuses a
+/// revision label.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct VerificationRecipeProvenance {
     pub recipe_id: String,
@@ -434,12 +436,56 @@ pub struct VerificationRecipeProvenance {
     /// attribution; a meaning bump invalidates older facts.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub domain_declaration_revision: Option<u64>,
+    /// Stable SHA-256 digest of the complete canonical host declaration
+    /// which introduced the coverage domain. A revision is only a monotonic
+    /// label; this digest also fences accidental table recomposition under
+    /// the same label. Empty legacy values fail closed at every reuse and
+    /// completion boundary.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub domain_source_digest: String,
     /// SHA-256 over the execution profile shared by every member of the
     /// class (platform, architecture, resolved executable, inherited
     /// environment), excluding recipe-specific material. Empty fails
     /// closed: domain-equivalent reuse requires it on both sides.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub class_identity_digest: String,
+}
+
+/// Maximum host coverage declarations which may cross the dispatcher /
+/// Runtime boundary. The concrete verifier catalog is allowed to use a
+/// tighter cap.
+pub const MAX_VERIFICATION_COVERAGE_DECLARATIONS: usize = 16;
+/// Coverage-domain ids use the same bounded identity envelope as verifier
+/// recipe ids.
+pub const MAX_VERIFICATION_COVERAGE_DOMAIN_BYTES: usize = 96;
+
+/// Bounded, implementation-agnostic projection of one current host-owned
+/// verification coverage declaration.
+///
+/// Runtime persists this identity in acceptance criteria and receipts, then
+/// compares it with a fresh dispatcher projection before accepting coverage.
+/// It never needs the concrete recipe table or execution implementation.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct VerificationCoverageDeclaration {
+    pub domain_id: String,
+    pub declaration_revision: u64,
+    /// Lowercase hexadecimal SHA-256 over the canonical declaration source.
+    #[serde(default)]
+    pub source_digest: String,
+}
+
+impl VerificationCoverageDeclaration {
+    /// Strict wire validation. Empty/defaulted legacy identity is never a
+    /// current host declaration.
+    pub fn is_valid(&self) -> bool {
+        !self.domain_id.is_empty()
+            && self.domain_id.len() <= MAX_VERIFICATION_COVERAGE_DOMAIN_BYTES
+            && self.domain_id.bytes().all(|byte| {
+                byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b':' | b'-')
+            })
+            && self.declaration_revision > 0
+            && self.source_digest.parse::<crate::ContentDigest>().is_ok()
+    }
 }
 
 impl ToolExecutionAttribution {
@@ -1179,8 +1225,16 @@ pub enum ObligationEventKind {
     PreconditionChanged,
     /// blocker 特定的证明到达（如同指纹成功、目标以新身份落地）。
     Resolved,
-    /// 超出账本容量被淘汰（最旧优先）。
+    /// Legacy event from checkpoints/traces that discarded a row when the
+    /// old ledger cap was exceeded. Current runtimes fail closed with
+    /// [`Self::Overflowed`] instead.
     Dropped,
+    /// An unresolved identity exceeded the checkpoint hot-set capacity. Its
+    /// body-free identity remains in the durable event; checkpoint state
+    /// carries a typed omitted-count sentinel that continues to block task
+    /// completion unless explicit operator authority overrides it or a new
+    /// task starts with fresh execution state.
+    Overflowed,
 }
 
 /// 义务账本的一条有界账目（不含任何工具正文）。scope_digest 是跨
@@ -2622,6 +2676,14 @@ pub trait ToolDispatcher: Send + Sync {
         false
     }
 
+    /// Current host-owned coverage declarations, projected without concrete
+    /// recipes. The default is fail-closed. Implementations must return at
+    /// most [`MAX_VERIFICATION_COVERAGE_DECLARATIONS`] unique, valid rows in
+    /// ascending domain-id order; Runtime defensively revalidates the slice.
+    fn verification_coverage_declarations(&self) -> Vec<VerificationCoverageDeclaration> {
+        Vec::new()
+    }
+
     async fn execute(&self, request: ToolExecutionRequest) -> AgentResult<ToolOutcome>;
 }
 
@@ -3140,6 +3202,7 @@ mod tests {
             recipe_revision: "cargo-workspace-v1".into(),
             coverage_domain: Some("workspace-tests".into()),
             domain_declaration_revision: Some(2),
+            domain_source_digest: crate::ContentDigest::sha256_bytes(b"domain-v2").to_string(),
             class_identity_digest: "class-digest".into(),
         };
         // Without a captured identity the provenance is dropped fail-closed.
@@ -3169,6 +3232,7 @@ mod tests {
             recipe_revision: "rev".into(),
             coverage_domain: None,
             domain_declaration_revision: None,
+            domain_source_digest: String::new(),
             class_identity_digest: String::new(),
         });
         assert!(task_scoped.verification_recipe().is_none());

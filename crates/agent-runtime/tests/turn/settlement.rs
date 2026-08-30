@@ -13,10 +13,10 @@ use std::{
 };
 
 use agent_contracts::{
-    AgentResult, ModelCapabilities, ModelOutput, ModelRequest, ModelTransport, RuntimeEvent,
-    RuntimeEventEnvelope, RuntimeDirective, SettlementLabel, ToolCall, ToolDispatcher,
-    ToolExecutionAttribution, ToolExecutionRequest, ToolExecutionPurpose, ToolOutcome, ToolOutput,
-    ToolRisk, ToolSpec, VerificationReuse,
+    AgentResult, EventJournal, ModelCapabilities, ModelOutput, ModelRequest, ModelTransport,
+    RuntimeDirective, RuntimeEvent, RuntimeEventEnvelope, SettlementLabel, TaskProgressProposal,
+    ToolCall, ToolDispatcher, ToolExecutionAttribution, ToolExecutionPurpose, ToolExecutionRequest,
+    ToolOutcome, ToolOutput, ToolRisk, ToolSpec, VerificationReuse,
 };
 use agent_core::{CoreAuthorityConfig, PolicyApprovalGate};
 use agent_runtime::{ModuleHost, RuntimeInstance, RuntimeServices};
@@ -32,6 +32,10 @@ enum Step {
     /// Run the accepting verifier; the revision it claims to cover must be
     /// the revision the mutation left on disk.
     Verify(&'static str),
+    /// Run a verifier from a different host-declared coverage domain.
+    VerifyOther(&'static str),
+    /// Apply one progress-only anchor CAS at the stated live base revision.
+    Manage(u64),
     /// Propose durable `task.complete`.
     Complete(&'static str),
     /// Ordinary final answer, no tool calls.
@@ -40,9 +44,32 @@ enum Step {
 
 /// Host-side identity material of the scripted verifier. The dispatcher
 /// hashes this into the exact verification identity stamped onto the PASS;
-/// the task-aware acceptance claims in these tests must carry the same
+/// post-observation acceptance receipts in these tests must carry the same
 /// digest or they resolve to nothing.
 const VERIFY_IDENTITY_MATERIAL: &str = "scripted verify recipe v1";
+const ACCEPTANCE_DOMAIN: &str = "workspace-tests";
+
+fn acceptance_declaration() -> agent_contracts::VerificationCoverageDeclaration {
+    agent_contracts::VerificationCoverageDeclaration {
+        domain_id: ACCEPTANCE_DOMAIN.into(),
+        declaration_revision: 1,
+        source_digest: agent_contracts::ContentDigest::sha256_bytes(
+            b"scripted-workspace-tests-declaration/v1",
+        )
+        .to_string(),
+    }
+}
+
+fn api_acceptance_declaration() -> agent_contracts::VerificationCoverageDeclaration {
+    agent_contracts::VerificationCoverageDeclaration {
+        domain_id: "api-contract".into(),
+        declaration_revision: 7,
+        source_digest: agent_contracts::ContentDigest::sha256_bytes(
+            b"scripted-api-contract-declaration/v7",
+        )
+        .to_string(),
+    }
+}
 
 fn verify_identity() -> String {
     agent_contracts::ContentDigest::sha256_bytes(VERIFY_IDENTITY_MATERIAL.trim().as_bytes())
@@ -96,6 +123,27 @@ impl ModelTransport for SettlementModel {
                 }],
                 usage: Default::default(),
             },
+            Step::VerifyOther(revision) => ModelOutput {
+                content: String::new(),
+                tool_calls: vec![ToolCall {
+                    id: format!("verify-other-{round}"),
+                    name: "test.verify.other".into(),
+                    arguments: json!({"command": "cargo test -- api", "revision": revision}),
+                }],
+                usage: Default::default(),
+            },
+            Step::Manage(base_anchor_revision) => ModelOutput {
+                content: String::new(),
+                tool_calls: vec![ToolCall {
+                    id: format!("manage-{round}"),
+                    name: "task.manage".into(),
+                    arguments: json!({
+                        "base_anchor_revision": base_anchor_revision,
+                        "plan_progress": ["verification observed; prepare closure"]
+                    }),
+                }],
+                usage: Default::default(),
+            },
             Step::Complete(summary) => ModelOutput {
                 content: String::new(),
                 tool_calls: vec![ToolCall {
@@ -145,8 +193,24 @@ impl ToolDispatcher for SettlementToolDispatcher {
                 roles: Vec::new(),
             },
             ToolSpec {
+                name: "test.verify.other".into(),
+                description: "scripted API verifier".into(),
+                input_schema: json!({"type": "object"}),
+                risk: ToolRisk::ReadOnly,
+                output_budget: None,
+                roles: Vec::new(),
+            },
+            ToolSpec {
                 name: "task.complete".into(),
                 description: "propose completion".into(),
+                input_schema: json!({"type": "object"}),
+                risk: ToolRisk::ReadOnly,
+                output_budget: None,
+                roles: Vec::new(),
+            },
+            ToolSpec {
+                name: "task.manage".into(),
+                description: "scripted progress CAS".into(),
                 input_schema: json!({"type": "object"}),
                 risk: ToolRisk::ReadOnly,
                 output_budget: None,
@@ -166,9 +230,38 @@ impl ToolDispatcher for SettlementToolDispatcher {
                 Vec::new(),
                 VerificationReuse::ExactCurrentWorld,
             )
-            .with_verification_identity_material(VERIFY_IDENTITY_MATERIAL),
+            .with_verification_identity_material(VERIFY_IDENTITY_MATERIAL)
+            .with_verification_recipe(agent_contracts::VerificationRecipeProvenance {
+                recipe_id: "test.verify".into(),
+                recipe_revision: "v1".into(),
+                coverage_domain: Some(ACCEPTANCE_DOMAIN.into()),
+                domain_declaration_revision: Some(1),
+                domain_source_digest: acceptance_declaration().source_digest,
+                class_identity_digest: "scripted-class".into(),
+            }),
+            "test.verify.other" => ToolExecutionAttribution::bounded(
+                ToolExecutionPurpose::Verify,
+                Vec::new(),
+                VerificationReuse::ExactCurrentWorld,
+            )
+            .with_verification_identity_material("scripted api verify recipe v1")
+            .with_verification_recipe(agent_contracts::VerificationRecipeProvenance {
+                recipe_id: "test.verify.other".into(),
+                recipe_revision: "v1".into(),
+                coverage_domain: Some("api-contract".into()),
+                domain_declaration_revision: Some(7),
+                domain_source_digest: api_acceptance_declaration().source_digest,
+                class_identity_digest: "scripted-api-class".into(),
+            }),
             _ => ToolExecutionAttribution::default(),
         }
+    }
+
+    fn verification_coverage_declarations(
+        &self,
+    ) -> Vec<agent_contracts::VerificationCoverageDeclaration> {
+        // Contract order is canonical by domain id.
+        vec![api_acceptance_declaration(), acceptance_declaration()]
     }
     async fn execute(&self, request: ToolExecutionRequest) -> AgentResult<ToolOutcome> {
         let revision = request.call.arguments["revision"]
@@ -185,7 +278,7 @@ impl ToolDispatcher for SettlementToolDispatcher {
                 artifact_ref: None,
                 metadata: json!({"path": "src/lib.rs", "revision": revision}),
             })),
-            "test.verify" => Ok(ToolOutcome::Value(ToolOutput {
+            "test.verify" | "test.verify.other" => Ok(ToolOutcome::Value(ToolOutput {
                 call_id: request.call.id,
                 tool_name: request.call.name,
                 ok: true,
@@ -222,15 +315,180 @@ impl ToolDispatcher for SettlementToolDispatcher {
                     ),
                 })
             }
+            "task.manage" => Ok(ToolOutcome::RuntimeDirective {
+                output: ToolOutput {
+                    call_id: request.call.id,
+                    tool_name: request.call.name,
+                    ok: true,
+                    summary: "progress proposed".into(),
+                    model_content: "progress proposed".into(),
+                    artifact_ref: None,
+                    metadata: json!({}),
+                },
+                directive: RuntimeDirective::UpdateTaskProgress(TaskProgressProposal {
+                    base_anchor_revision: request.call.arguments["base_anchor_revision"]
+                        .as_u64()
+                        .unwrap(),
+                    current_interpretation: None,
+                    plan_progress: Some(vec!["verification observed; prepare closure".into()]),
+                    open_loops: None,
+                    next_action: None,
+                }),
+            }),
             _ => Err(agent_contracts::AgentError::Tool("unexpected tool".into())),
         }
     }
 }
 
+#[tokio::test]
+async fn distinct_domain_passes_accumulate_criterion_receipts() {
+    let dir = tempfile::tempdir().unwrap();
+    let (instance, collector) = settlement_instance(
+        dir.path(),
+        vec![
+            Step::Write("r2"),
+            Step::Verify("r2"),
+            Step::VerifyOther("r2"),
+            Step::Plain("done"),
+        ],
+    )
+    .await;
+    started_task_with_patch(
+        &instance,
+        agent_runtime::AnchorPatch {
+            completion_policy: Some(agent_runtime::task::TaskCompletionPolicy::EvidenceRequired),
+            acceptance_criteria: Some(vec![
+                agent_runtime::task::AcceptanceCriterion::declared(
+                    "workspace tests pass",
+                    &acceptance_declaration(),
+                ),
+                agent_runtime::task::AcceptanceCriterion::declared(
+                    "the public API remains compatible",
+                    &api_acceptance_declaration(),
+                ),
+            ]),
+            ..agent_runtime::AnchorPatch::default()
+        },
+    )
+    .await;
+    let events = user_turn(&instance, collector).await;
+    assert!(
+        settlement_labels(&events).contains(&SettlementLabel::SettledCandidate),
+        "both explicitly matched domain receipts should settle the task"
+    );
+    let checkpoint = instance.checkpoint().await.unwrap();
+    let anchor = &checkpoint.tasks.tasks[0].anchor;
+    assert_eq!(anchor.acceptance_coverage.len(), 2);
+    assert_eq!(
+        anchor.acceptance_coverage[0].coverage_domain,
+        ACCEPTANCE_DOMAIN
+    );
+    assert_eq!(
+        anchor.acceptance_coverage[1].coverage_domain,
+        "api-contract"
+    );
+    assert_eq!(anchor.acceptance_coverage[1].domain_declaration_revision, 7);
+    assert!(events.iter().any(|envelope| matches!(
+        &envelope.event,
+        RuntimeEvent::AcceptanceReceiptsRecorded { criterion_indices, .. }
+            if criterion_indices == &[1]
+    )));
+    instance.shutdown().await.unwrap();
+}
+
+#[derive(Debug)]
+struct FailAcceptanceReceiptJournal;
+
+#[async_trait::async_trait]
+impl EventJournal for FailAcceptanceReceiptJournal {
+    async fn append(&self, envelope: &RuntimeEventEnvelope) -> AgentResult<()> {
+        if matches!(
+            &envelope.event,
+            RuntimeEvent::AcceptanceReceiptsRecorded { .. }
+        ) {
+            return Err(agent_contracts::AgentError::Storage(
+                "simulated acceptance-receipt event failure".into(),
+            ));
+        }
+        Ok(())
+    }
+}
+
+#[tokio::test]
+async fn receipt_event_failure_fences_recovery_without_partial_readiness() {
+    let dir = tempfile::tempdir().unwrap();
+    let (instance, collector, _) = settlement_instance_with_journal(
+        dir.path(),
+        vec![Step::Write("r2"), Step::Verify("r2"), Step::Plain("done")],
+        false,
+        Some(Arc::new(FailAcceptanceReceiptJournal)),
+    )
+    .await;
+    started_task_with_patch(&instance, settled_patch()).await;
+    let handle = instance.handle();
+    handle.user_message("keep going".into()).await.unwrap();
+
+    let mut receiver = collector.events;
+    let mut recovery_seen = false;
+    let mut settled_candidate_seen = false;
+    let mut receipt_seen = false;
+    let mut completed_seen = false;
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+    while tokio::time::Instant::now() < deadline && !recovery_seen {
+        if let Ok(Ok(envelope)) =
+            tokio::time::timeout(Duration::from_millis(50), receiver.recv()).await
+        {
+            recovery_seen |= matches!(&envelope.event, RuntimeEvent::RecoveryRequired);
+            settled_candidate_seen |= matches!(
+                &envelope.event,
+                RuntimeEvent::ExecutionFrontier {
+                    settlement: Some(SettlementLabel::SettledCandidate),
+                    ..
+                }
+            );
+            receipt_seen |= matches!(
+                &envelope.event,
+                RuntimeEvent::AcceptanceReceiptsRecorded { .. }
+            );
+            completed_seen |= matches!(&envelope.event, RuntimeEvent::TaskCompleted { .. });
+        }
+    }
+    assert!(
+        recovery_seen,
+        "a missing receipt audit row must recovery-fence Runtime"
+    );
+    assert!(
+        !settled_candidate_seen,
+        "the uncommitted receipt must never produce partial readiness"
+    );
+    assert!(
+        !receipt_seen && !completed_seen,
+        "a failed audit append must expose neither a receipt nor completion"
+    );
+    assert!(matches!(
+        instance.checkpoint().await,
+        Err(agent_contracts::AgentError::RecoveryRequired(_))
+    ));
+    instance.shutdown().await.unwrap();
+}
+
 async fn settlement_instance_with(
     dir: &std::path::Path,
     script: Vec<Step>,
-    project_progress: bool,
+    project_settlement: bool,
+) -> (
+    RuntimeInstance,
+    RuntimeEventEnvelopeCollector,
+    Arc<std::sync::Mutex<Vec<String>>>,
+) {
+    settlement_instance_with_journal(dir, script, project_settlement, None).await
+}
+
+async fn settlement_instance_with_journal(
+    dir: &std::path::Path,
+    script: Vec<Step>,
+    project_settlement: bool,
+    event_journal: Option<Arc<dyn EventJournal>>,
 ) -> (
     RuntimeInstance,
     RuntimeEventEnvelopeCollector,
@@ -248,10 +506,11 @@ async fn settlement_instance_with(
         }),
         Arc::new(SettlementToolDispatcher),
         Arc::new(PolicyApprovalGate::permissive()),
-        None,
+        event_journal,
     )
     .with_artifact_workspace(workspace)
-    .with_project_task_progress(project_progress);
+    .with_project_task_progress(true)
+    .with_project_settlement(project_settlement);
     let instance = RuntimeInstance::spawn(ModuleHost::new(), services);
     let collector = RuntimeEventEnvelopeCollector {
         events: instance.handle().subscribe(),
@@ -316,31 +575,31 @@ fn settlement_labels(events: &[RuntimeEventEnvelope]) -> Vec<SettlementLabel> {
 
 /// Start the instance, focus the scripted task, and apply one anchor patch
 /// to its fresh revision-0 anchor before the first user turn. Tests use
-/// this to declare acceptance criteria/coverage and any blocking open loop
+/// this to declare acceptance criteria and any blocking open loop
 /// or next action; the task-aware gate fails closed at `VerifiedCurrent`
 /// without it.
-async fn started_task_with_patch(
-    instance: &RuntimeInstance,
-    patch: agent_runtime::AnchorPatch,
-) {
+async fn started_task_with_patch(instance: &RuntimeInstance, patch: agent_runtime::AnchorPatch) {
     let handle = instance.handle();
     handle.start().await.unwrap();
-    handle.set_focus("implement bounded retry".into()).await.unwrap();
+    handle
+        .set_focus("implement bounded retry".into())
+        .await
+        .unwrap();
     let task_id = handle.list_tasks().await.unwrap()[0].id;
     let revision = handle.patch_task_anchor(task_id, 0, patch).await.unwrap();
     assert_eq!(revision, 1, "the declared task anchor must advance by one");
 }
 
 /// The acceptance authority every settled-candidate scenario needs: one
-/// criterion with a coverage claim resolving to the scripted verifier's
-/// exact identity.
+/// criterion whose domain can receive a post-observation receipt from the
+/// scripted verifier.
 fn settled_patch() -> agent_runtime::AnchorPatch {
     agent_runtime::AnchorPatch {
-        acceptance_criteria: Some(vec!["tests pass for the current world".into()]),
-        acceptance_coverage: Some(vec![agent_runtime::task::AcceptanceCoverage {
-            criterion_index: 0,
-            verification_identity: verify_identity(),
-        }]),
+        completion_policy: Some(agent_runtime::task::TaskCompletionPolicy::EvidenceRequired),
+        acceptance_criteria: Some(vec![agent_runtime::task::AcceptanceCriterion::declared(
+            "tests pass for the current world",
+            &acceptance_declaration(),
+        )]),
         ..agent_runtime::AnchorPatch::default()
     }
 }
@@ -350,12 +609,18 @@ async fn user_turn(
     collector: RuntimeEventEnvelopeCollector,
 ) -> Vec<RuntimeEventEnvelope> {
     let handle = instance.handle();
-    handle.set_focus("implement bounded retry".into()).await.unwrap();
+    handle
+        .set_focus("implement bounded retry".into())
+        .await
+        .unwrap();
     handle.user_message("keep going".into()).await.unwrap();
     collector.drain_until_turn_completed().await
 }
 
-async fn drive(instance: &RuntimeInstance, collector: RuntimeEventEnvelopeCollector) -> Vec<RuntimeEventEnvelope> {
+async fn drive(
+    instance: &RuntimeInstance,
+    collector: RuntimeEventEnvelopeCollector,
+) -> Vec<RuntimeEventEnvelope> {
     started_task_with_patch(instance, settled_patch()).await;
     user_turn(instance, collector).await
 }
@@ -373,8 +638,15 @@ async fn continue_turn(
 #[tokio::test]
 async fn settled_work_commits_durable_closure_with_current_verification() {
     let dir = tempfile::tempdir().unwrap();
-    let (instance, collector) =
-        settlement_instance(dir.path(), vec![Step::Write("r2"), Step::Verify("r2"), Step::Complete("done")]).await;
+    let (instance, collector) = settlement_instance(
+        dir.path(),
+        vec![
+            Step::Write("r2"),
+            Step::Verify("r2"),
+            Step::Complete("done"),
+        ],
+    )
+    .await;
     let events = drive(&instance, collector).await;
 
     let labels = settlement_labels(&events);
@@ -383,10 +655,9 @@ async fn settled_work_commits_durable_closure_with_current_verification() {
         "the verified mutation must surface a settled candidate: {labels:?}"
     );
     assert!(
-        events.iter().any(|envelope| matches!(
-            envelope.event,
-            RuntimeEvent::TaskCompleted { .. }
-        )),
+        events
+            .iter()
+            .any(|envelope| matches!(envelope.event, RuntimeEvent::TaskCompleted { .. })),
         "the model's durable closure choice must commit"
     );
     let checkpoint = instance.checkpoint().await.unwrap();
@@ -403,10 +674,49 @@ async fn settled_work_commits_durable_closure_with_current_verification() {
     instance.shutdown().await.unwrap();
 }
 
-/// The actor binds acceptance coverage from a trusted verification pass: a
-/// task that *declares* criteria but carries no coverage claim arms the
-/// task-aware gate once the verifier PASSes, so live cells do not need a
-/// second, identity-synchronized writer.
+#[tokio::test]
+async fn progress_only_cas_after_a_receipt_preserves_completion_readiness() {
+    let dir = tempfile::tempdir().unwrap();
+    let (instance, collector) = settlement_instance(
+        dir.path(),
+        vec![
+            Step::Write("r2"),
+            Step::Verify("r2"),
+            // Acceptance declaration is revision 1 and the post-PASS
+            // receipt transaction advances the full anchor to revision 2.
+            Step::Manage(2),
+            Step::Complete("done after progress bookkeeping"),
+        ],
+    )
+    .await;
+    let events = drive(&instance, collector).await;
+
+    assert!(events.iter().any(|envelope| matches!(
+        &envelope.event,
+        RuntimeEvent::TaskProgressUpdated {
+            accepted: true,
+            anchor_revision: 3,
+            ..
+        }
+    )));
+    assert!(
+        settlement_labels(&events).contains(&SettlementLabel::SettledCandidate),
+        "a progress-only CAS must not make the live execution task-state stale"
+    );
+    assert!(
+        events
+            .iter()
+            .any(|envelope| matches!(envelope.event, RuntimeEvent::TaskCompleted { .. }))
+    );
+    let checkpoint = instance.checkpoint().await.unwrap();
+    assert_eq!(checkpoint.tasks.completed[0].anchor_revision, 3);
+    instance.shutdown().await.unwrap();
+}
+
+/// The actor mints acceptance receipts from an already-observed trusted
+/// verification pass: a task that declares criteria but carries no receipt
+/// arms the task-aware gate once the matching verifier PASSes, so live cells
+/// do not need a second, identity-synchronized writer.
 #[tokio::test]
 async fn declared_acceptance_is_bound_by_the_trusted_verification_pass() {
     let dir = tempfile::tempdir().unwrap();
@@ -418,9 +728,13 @@ async fn declared_acceptance_is_bound_by_the_trusted_verification_pass() {
     started_task_with_patch(
         &instance,
         agent_runtime::AnchorPatch {
-            acceptance_criteria: Some(vec!["tests pass for the current world".into()]),
-            // deliberately no acceptance_coverage: the trusted pass must
-            // bind the claim itself
+            completion_policy: Some(agent_runtime::task::TaskCompletionPolicy::EvidenceRequired),
+            acceptance_criteria: Some(vec![agent_runtime::task::AcceptanceCriterion::declared(
+                "tests pass for the current world",
+                &acceptance_declaration(),
+            )]),
+            // Deliberately no acceptance_coverage: only the post-observation
+            // actor transaction may mint the receipt.
             ..agent_runtime::AnchorPatch::default()
         },
     )
@@ -441,12 +755,12 @@ async fn declared_acceptance_is_bound_by_the_trusted_verification_pass() {
     assert_eq!(
         task.anchor.acceptance_coverage.len(),
         1,
-        "the actor must have bound exactly one coverage claim"
+        "the actor must have minted exactly one criterion receipt"
     );
     assert_eq!(
         task.anchor.acceptance_coverage[0].verification_identity,
         verify_identity(),
-        "the claim must resolve to the scripted verifier's exact identity"
+        "the receipt must resolve to the scripted verifier's exact identity"
     );
     instance.shutdown().await.unwrap();
 }
@@ -464,7 +778,10 @@ async fn undeclared_acceptance_stays_fail_closed_at_verified_current() {
     .await;
     let handle = instance.handle();
     handle.start().await.unwrap();
-    handle.set_focus("implement bounded retry".into()).await.unwrap();
+    handle
+        .set_focus("implement bounded retry".into())
+        .await
+        .unwrap();
     let events = user_turn(&instance, collector).await;
     let labels = settlement_labels(&events);
     assert!(
@@ -483,7 +800,11 @@ async fn settled_work_leaves_ordinary_final_user_choice_intact() {
     let dir = tempfile::tempdir().unwrap();
     let (instance, collector) = settlement_instance(
         dir.path(),
-        vec![Step::Write("r2"), Step::Verify("r2"), Step::Plain("finished")],
+        vec![
+            Step::Write("r2"),
+            Step::Verify("r2"),
+            Step::Plain("finished"),
+        ],
     )
     .await;
     let events = drive(&instance, collector).await;
@@ -499,10 +820,9 @@ async fn settled_work_leaves_ordinary_final_user_choice_intact() {
         "no auto-close: ordinary final must not commit a durable completion"
     );
     assert!(
-        events.iter().any(|envelope| matches!(
-            envelope.event,
-            RuntimeEvent::AssistantMessage { .. }
-        )),
+        events
+            .iter()
+            .any(|envelope| matches!(envelope.event, RuntimeEvent::AssistantMessage { .. })),
         "the ordinary final answer must reach the user"
     );
     instance.shutdown().await.unwrap();
@@ -633,7 +953,7 @@ async fn mutation_after_settlement_without_fresh_verify_is_stale_not_settled() {
 }
 
 #[tokio::test]
-async fn boundary_criterion_change_reopens_and_trusted_pass_auto_binds() {
+async fn criterion_change_reopens_and_trusted_pass_mints_fresh_receipts() {
     let dir = tempfile::tempdir().unwrap();
     let (instance, collector) = settlement_instance(
         dir.path(),
@@ -656,30 +976,33 @@ async fn boundary_criterion_change_reopens_and_trusted_pass_auto_binds() {
         "the declared task settles before the boundary change"
     );
 
-    // Boundary change: a second criterion moves the verification basis.
-    // The explicit coverage claim still names only the first criterion;
-    // the next trusted pass re-binds every declared criterion.
+    // Completion-authority change: a second criterion moves the
+    // verification basis and clears old receipts; the next trusted PASS
+    // mints fresh receipts for both matching criteria.
     let handle = instance.handle();
     let task_id = handle.list_tasks().await.unwrap()[0].id;
+    let base_revision = handle.list_tasks().await.unwrap()[0].anchor_revision;
     let revision = handle
         .patch_task_anchor(
             task_id,
-            1,
+            base_revision,
             agent_runtime::AnchorPatch {
                 acceptance_criteria: Some(vec![
-                    "tests pass for the current world".into(),
-                    "api unchanged".into(),
+                    agent_runtime::task::AcceptanceCriterion::declared(
+                        "tests pass for the current world",
+                        &acceptance_declaration(),
+                    ),
+                    agent_runtime::task::AcceptanceCriterion::declared(
+                        "api unchanged",
+                        &acceptance_declaration(),
+                    ),
                 ]),
-                acceptance_coverage: Some(vec![agent_runtime::task::AcceptanceCoverage {
-                    criterion_index: 0,
-                    verification_identity: verify_identity(),
-                }]),
                 ..agent_runtime::AnchorPatch::default()
             },
         )
         .await
         .unwrap();
-    assert_eq!(revision, 2);
+    assert_eq!(revision, base_revision + 1);
 
     let reopened = continue_turn(
         &instance,
@@ -714,17 +1037,21 @@ async fn open_loop_blocks_candidate_even_with_full_coverage() {
     let dir = tempfile::tempdir().unwrap();
     let (instance, collector) = settlement_instance(
         dir.path(),
-        vec![Step::Write("r2"), Step::Verify("r2"), Step::Plain("loop open")],
+        vec![
+            Step::Write("r2"),
+            Step::Verify("r2"),
+            Step::Plain("loop open"),
+        ],
     )
     .await;
     started_task_with_patch(
         &instance,
         agent_runtime::AnchorPatch {
-            acceptance_criteria: Some(vec!["tests pass for the current world".into()]),
-            acceptance_coverage: Some(vec![agent_runtime::task::AcceptanceCoverage {
-                criterion_index: 0,
-                verification_identity: verify_identity(),
-            }]),
+            completion_policy: Some(agent_runtime::task::TaskCompletionPolicy::EvidenceRequired),
+            acceptance_criteria: Some(vec![agent_runtime::task::AcceptanceCriterion::declared(
+                "tests pass for the current world",
+                &acceptance_declaration(),
+            )]),
             open_loops: Some(vec!["verify edge cases".into()]),
             ..agent_runtime::AnchorPatch::default()
         },
@@ -744,17 +1071,21 @@ async fn next_action_blocks_candidate_even_with_full_coverage() {
     let dir = tempfile::tempdir().unwrap();
     let (instance, collector) = settlement_instance(
         dir.path(),
-        vec![Step::Write("r2"), Step::Verify("r2"), Step::Plain("next action")],
+        vec![
+            Step::Write("r2"),
+            Step::Verify("r2"),
+            Step::Plain("next action"),
+        ],
     )
     .await;
     started_task_with_patch(
         &instance,
         agent_runtime::AnchorPatch {
-            acceptance_criteria: Some(vec!["tests pass for the current world".into()]),
-            acceptance_coverage: Some(vec![agent_runtime::task::AcceptanceCoverage {
-                criterion_index: 0,
-                verification_identity: verify_identity(),
-            }]),
+            completion_policy: Some(agent_runtime::task::TaskCompletionPolicy::EvidenceRequired),
+            acceptance_criteria: Some(vec![agent_runtime::task::AcceptanceCriterion::declared(
+                "tests pass for the current world",
+                &acceptance_declaration(),
+            )]),
             next_action: Some("write the missing test".into()),
             ..agent_runtime::AnchorPatch::default()
         },
@@ -804,13 +1135,19 @@ async fn proposal_settlement_survives_cancel_resume_and_commits_durably() {
             .any(|task| task.status == agent_runtime::task::TaskStatus::Suspended),
         "suspend must leave one suspended task"
     );
-    let resumed = continue_turn(
-        &instance,
-        RuntimeEventEnvelopeCollector {
-            events: instance.handle().subscribe(),
-        },
-    )
-    .await;
+    // Reactivate the suspended task, then continue the stored directive. A
+    // new Dialogue input would intentionally advance directive_revision and
+    // require a fresh verification; TaskContinuation preserves the basis.
+    let resumed_collector = RuntimeEventEnvelopeCollector {
+        events: instance.handle().subscribe(),
+    };
+    instance
+        .handle()
+        .set_focus("implement bounded retry".into())
+        .await
+        .unwrap();
+    instance.handle().continue_active_task().await.unwrap();
+    let resumed = resumed_collector.drain_until_turn_completed().await;
     assert!(
         resumed
             .iter()
@@ -930,6 +1267,12 @@ async fn settlement_fact_is_absent_when_projection_is_off() {
                 .iter()
                 .all(|request| !request.contains("TASK SETTLED")),
             "projection is default-off: no model request may carry the settlement fact"
+        );
+        assert!(
+            captured
+                .iter()
+                .any(|request| request.contains("TASK PROGRESS anchor_rev=")),
+            "the off arm must retain TaskProgress; only the settlement fact is ablated"
         );
     }
     instance.shutdown().await.unwrap();

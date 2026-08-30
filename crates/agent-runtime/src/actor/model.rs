@@ -1,5 +1,119 @@
 use super::*;
 
+fn is_required_context_body(materialized: &MaterializedContext, item: &MaterializedItem) -> bool {
+    item.retention == ContextRetention::Pinned
+        || materialized.required_item_ids.contains(&item.item_id)
+}
+
+fn largest_final_pack_drop_index(
+    materialized: &MaterializedContext,
+    items: &[MaterializedItem],
+) -> Option<usize> {
+    items
+        .iter()
+        .enumerate()
+        .filter(|(_, item)| !is_required_context_body(materialized, item))
+        .max_by_key(|(_, item)| approx_tokens(&item.content))
+        .or_else(|| {
+            items
+                .iter()
+                .enumerate()
+                .max_by_key(|(_, item)| approx_tokens(&item.content))
+        })
+        .map(|(index, _)| index)
+}
+
+fn record_final_pack_drop(
+    materialized: &mut MaterializedContext,
+    dropped: &MaterializedItem,
+    active_anchor_revision: u64,
+) {
+    let required = is_required_context_body(materialized, dropped);
+    let miss = ContextMaterializationMiss {
+        identity: ContextMaterializationIdentity::new(
+            format!("context://run/{}", dropped.item_id),
+            Some(dropped.item_id),
+            "runtime:final_pack",
+            active_anchor_revision,
+        ),
+        reason: ContextMaterializationMissReason::BudgetExcluded,
+    };
+    if required {
+        materialized.required_misses.push(miss);
+    } else {
+        materialized.optional_misses.push(miss);
+    }
+}
+
+fn settlement_progress_views(
+    base: &Option<TaskProgressView>,
+    candidate: bool,
+    project_settlement: bool,
+    diagnostics: bool,
+) -> (Option<TaskProgressView>, Option<TaskProgressView>) {
+    let mut actual = base.clone();
+    if candidate
+        && project_settlement
+        && let Some(progress) = actual.as_mut()
+    {
+        progress.settlement = Some(crate::task::SETTLED_CANDIDATE_PROMPT_LINE.to_string());
+    }
+    let treatment = if diagnostics {
+        let mut treatment = base.clone();
+        if candidate && let Some(progress) = treatment.as_mut() {
+            progress.settlement = Some(crate::task::SETTLED_CANDIDATE_PROMPT_LINE.to_string());
+        }
+        treatment
+    } else {
+        None
+    };
+    (treatment, actual)
+}
+
+fn settlement_packing_projects(
+    candidate: bool,
+    project_settlement: bool,
+    diagnostics: bool,
+) -> bool {
+    candidate && (project_settlement || diagnostics)
+}
+
+fn settlement_audit_enabled(candidate: bool, diagnostics: bool) -> bool {
+    candidate && diagnostics
+}
+
+fn settlement_packing_requires_counterfactual(
+    candidate: bool,
+    project_settlement: bool,
+    diagnostics: bool,
+) -> bool {
+    candidate && diagnostics && !project_settlement
+}
+
+fn model_request_metadata(
+    run_id: RunId,
+    context_selected: usize,
+    context_approx_tokens: usize,
+    model_round: usize,
+    surface_revision: u64,
+    settlement_projection_audit: Option<serde_json::Value>,
+) -> serde_json::Value {
+    let mut metadata = serde_json::json!({
+        "run_id": run_id.to_string(),
+        "context_selected": context_selected,
+        "context_approx_tokens": context_approx_tokens,
+        "model_round": model_round,
+        "tool_surface_revision": surface_revision,
+    });
+    if let Some(audit) = settlement_projection_audit {
+        metadata
+            .as_object_mut()
+            .expect("request metadata is an object")
+            .insert("settlement_projection_audit".into(), audit);
+    }
+    metadata
+}
+
 impl RuntimeActor {
     /// Prepare + spawn one model round: close the consumed tool frames,
     /// maintenance, materialize, assemble, then the model call as an
@@ -432,12 +546,27 @@ impl RuntimeActor {
         } else {
             DEFAULT_OUTPUT_RESERVE
         };
-        let (runtime_focus, task_view, progress_view) =
+        let (runtime_focus, task_view, base_progress_view, settlement_candidate) =
             self.runtime_prompt_focus(&turn_frame).await;
+        let project_settlement = self.services.project_settlement();
+        let settlement_projection_diagnostics = self.services.settlement_projection_diagnostics();
+        // Product requests are budgeted against the arm they actually send.
+        // Only an explicitly paired causal diagnostic uses the common,
+        // treatment-sized envelope needed to prevent a one-line treatment
+        // from indirectly changing context or tool selection.
+        let mut budget_progress_view = base_progress_view.clone();
+        if settlement_packing_projects(
+            settlement_candidate,
+            project_settlement,
+            settlement_projection_diagnostics,
+        ) && let Some(progress) = budget_progress_view.as_mut()
+        {
+            progress.settlement = Some(crate::task::SETTLED_CANDIDATE_PROMPT_LINE.to_string());
+        }
         let runtime_focus_frame_tokens = crate::prompt::focus_frame_tokens(
             runtime_focus.as_ref(),
             task_view.as_ref(),
-            progress_view.as_ref(),
+            budget_progress_view.as_ref(),
         );
         let model_budget = ModelBudget::compute(
             pack_window,
@@ -462,7 +591,7 @@ impl RuntimeActor {
         let protocol_bodies = self.eligible_protocol_bodies();
         let visible_body_identities = crate::prompt::visible_body_identities_for_request(
             &turn_frame,
-            progress_view.as_ref(),
+            base_progress_view.as_ref(),
             &protocol_bodies,
         );
         let context_budget = model_budget.context_frame_budget;
@@ -475,7 +604,7 @@ impl RuntimeActor {
                     max_selected_items: Some(CONTEXT_CONSUMPTION_ACK_ITEM_CAP),
                     anchor_roots,
                     task: task_view.clone(),
-                    checked_files: progress_view
+                    checked_files: base_progress_view
                         .as_ref()
                         .map(|view| view.checked_files.clone())
                         .unwrap_or_default(),
@@ -495,6 +624,14 @@ impl RuntimeActor {
                 return;
             }
         };
+        if let Err(error) = materialized.validate_requirement_status() {
+            // Concrete and test context engines share this in-process trust
+            // boundary. Reject an oversized or malformed degradation view
+            // before it can be cloned into the durable event stream.
+            self.fail_round_preparation("context_requirement_status", error)
+                .await;
+            return;
+        }
         let materialize_ms = materialize_started.elapsed().as_millis() as u64;
         // Runtime final guard: the engine priced the working-set content,
         // but the assembler's rendering overhead (section headers, per-item
@@ -508,6 +645,30 @@ impl RuntimeActor {
         // silently over-budget send.
         let max_input_budget = send_window.saturating_sub(output_reserve);
         let mut materialized = materialized;
+        // A miss discovered by this exact final materialization invalidates
+        // the pre-materialization settlement observation for the request
+        // being prepared. Packing may still reserve the line, but neither
+        // arm claims the task is settled until all required bodies landed.
+        let mut settlement_candidate =
+            settlement_candidate && materialized.required_misses.is_empty();
+        let (mut treatment_progress_view, mut progress_view) = settlement_progress_views(
+            &base_progress_view,
+            settlement_candidate,
+            project_settlement,
+            settlement_projection_diagnostics,
+        );
+        let mut packing_progress_view = if settlement_projection_diagnostics {
+            treatment_progress_view.clone()
+        } else {
+            progress_view.clone()
+        };
+        let active_anchor_revision = self
+            .state
+            .tasks
+            .active()
+            .and_then(|task_id| self.state.tasks.get(task_id))
+            .map(|task| task.anchor.revision)
+            .unwrap_or_default();
         let (mut input, mut body_cache_stats) = self.assemble_model_input(
             runtime_focus.as_ref(),
             task_view.as_ref(),
@@ -516,31 +677,46 @@ impl RuntimeActor {
             &turn_frame,
             surface_plan.specs().to_vec(),
         );
+        // A second packed request exists only for the diagnostic off arm.
+        // Ordinary product off/on paths measure and trim `input` directly;
+        // they neither assemble nor clone a second ModelInput.
+        let mut packing_input = if settlement_packing_requires_counterfactual(
+            settlement_candidate,
+            project_settlement,
+            settlement_projection_diagnostics,
+        ) {
+            Some(
+                self.assemble_model_input(
+                    runtime_focus.as_ref(),
+                    task_view.as_ref(),
+                    packing_progress_view.as_ref(),
+                    &materialized,
+                    &turn_frame,
+                    surface_plan.specs().to_vec(),
+                )
+                .0,
+            )
+        } else {
+            None
+        };
         let assembled_total = |input: &ModelInput| {
             approx_layer_tokens(&input.into_messages()) + approx_layer_tokens(&input.tool_schemas)
         };
-        while assembled_total(&input) > max_input_budget && !materialized.items.is_empty() {
-            // Drop the largest unpinned item first (pinned items keep
-            // priority); when only pinned items remain, drop the largest
-            // anyway rather than overshoot the input budget.
-            let drop_index = materialized
-                .items
-                .iter()
-                .enumerate()
-                .filter(|(_, item)| item.retention != ContextRetention::Pinned)
-                .max_by_key(|(_, item)| approx_tokens(&item.content))
-                .or_else(|| {
-                    materialized
-                        .items
-                        .iter()
-                        .enumerate()
-                        .max_by_key(|(_, item)| approx_tokens(&item.content))
-                })
-                .map(|(index, _)| index);
+        let packed_total = |input: &ModelInput, packing: &Option<ModelInput>| {
+            assembled_total(packing.as_ref().unwrap_or(input))
+        };
+        while packed_total(&input, &packing_input) > max_input_budget
+            && !materialized.items.is_empty()
+        {
+            // Drop the largest optional item first. If only mandatory
+            // bodies remain, the hard provider budget still wins, but that
+            // removal becomes an explicit BudgetExcluded completion blocker.
+            let drop_index = largest_final_pack_drop_index(&materialized, &materialized.items);
             let Some(drop_index) = drop_index else {
                 break;
             };
             let dropped = materialized.items.remove(drop_index);
+            record_final_pack_drop(&mut materialized, &dropped, active_anchor_revision);
             materialized
                 .selected
                 .retain(|selection| selection.item_id != dropped.item_id);
@@ -555,18 +731,32 @@ impl RuntimeActor {
                 &turn_frame,
                 surface_plan.specs().to_vec(),
             );
+            if packing_input.is_some() {
+                packing_input = Some(
+                    self.assemble_model_input(
+                        runtime_focus.as_ref(),
+                        task_view.as_ref(),
+                        packing_progress_view.as_ref(),
+                        &materialized,
+                        &turn_frame,
+                        surface_plan.specs().to_vec(),
+                    )
+                    .0,
+                );
+            }
         }
-        while assembled_total(&input) > max_input_budget && !materialized.foreground.is_empty() {
-            let drop_index = materialized
-                .foreground
-                .iter()
-                .enumerate()
-                .max_by_key(|(_, item)| approx_tokens(&item.content))
-                .map(|(index, _)| index);
+        while packed_total(&input, &packing_input) > max_input_budget
+            && !materialized.foreground.is_empty()
+        {
+            let drop_index = largest_final_pack_drop_index(&materialized, &materialized.foreground);
             let Some(drop_index) = drop_index else {
                 break;
             };
-            materialized.foreground.remove(drop_index);
+            let dropped = materialized.foreground.remove(drop_index);
+            record_final_pack_drop(&mut materialized, &dropped, active_anchor_revision);
+            materialized.approx_tokens = materialized
+                .approx_tokens
+                .saturating_sub(approx_tokens(&dropped.content));
             (input, body_cache_stats) = self.assemble_model_input(
                 runtime_focus.as_ref(),
                 task_view.as_ref(),
@@ -575,6 +765,19 @@ impl RuntimeActor {
                 &turn_frame,
                 surface_plan.specs().to_vec(),
             );
+            if packing_input.is_some() {
+                packing_input = Some(
+                    self.assemble_model_input(
+                        runtime_focus.as_ref(),
+                        task_view.as_ref(),
+                        packing_progress_view.as_ref(),
+                        &materialized,
+                        &turn_frame,
+                        surface_plan.specs().to_vec(),
+                    )
+                    .0,
+                );
+            }
         }
 
         // The context frame is empty but the fixed layers still overshoot:
@@ -583,7 +786,7 @@ impl RuntimeActor {
         // generation or make a later, larger-budget round forget the tool.
         // The trimmed snapshot remains the one source for prompt assembly,
         // accounting and tool-call validation in this round.
-        while assembled_total(&input) > max_input_budget {
+        while packed_total(&input, &packing_input) > max_input_budget {
             if surface_plan.omit_largest_for_provider_budget().is_none() {
                 break;
             }
@@ -595,9 +798,76 @@ impl RuntimeActor {
                 &turn_frame,
                 surface_plan.specs().to_vec(),
             );
+            if packing_input.is_some() {
+                packing_input = Some(
+                    self.assemble_model_input(
+                        runtime_focus.as_ref(),
+                        task_view.as_ref(),
+                        packing_progress_view.as_ref(),
+                        &materialized,
+                        &turn_frame,
+                        surface_plan.specs().to_vec(),
+                    )
+                    .0,
+                );
+            }
+        }
+
+        // Runtime trimming itself may have displaced a required body and
+        // appended `BudgetExcluded`. Revoke the projected fact on the exact
+        // request being sent. Once the candidate is revoked there is no
+        // treatment exposure to compare, so a diagnostic off-arm probe is
+        // dropped as well instead of retaining a second large input.
+        if settlement_candidate && !materialized.required_misses.is_empty() {
+            settlement_candidate = false;
+            (treatment_progress_view, progress_view) = settlement_progress_views(
+                &base_progress_view,
+                false,
+                project_settlement,
+                settlement_projection_diagnostics,
+            );
+            packing_progress_view = if settlement_projection_diagnostics {
+                treatment_progress_view.clone()
+            } else {
+                progress_view.clone()
+            };
+            (input, body_cache_stats) = self.assemble_model_input(
+                runtime_focus.as_ref(),
+                task_view.as_ref(),
+                progress_view.as_ref(),
+                &materialized,
+                &turn_frame,
+                surface_plan.specs().to_vec(),
+            );
+            packing_input = if settlement_packing_requires_counterfactual(
+                settlement_candidate,
+                project_settlement,
+                settlement_projection_diagnostics,
+            ) {
+                Some(
+                    self.assemble_model_input(
+                        runtime_focus.as_ref(),
+                        task_view.as_ref(),
+                        packing_progress_view.as_ref(),
+                        &materialized,
+                        &turn_frame,
+                        surface_plan.specs().to_vec(),
+                    )
+                    .0,
+                )
+            } else {
+                None
+            };
+        }
+
+        if let Err(error) = materialized.validate_requirement_status() {
+            self.fail_round_preparation("final_context_requirement_status", error)
+                .await;
+            return;
         }
 
         let estimated_input_tokens = assembled_total(&input);
+        let packing_input_tokens = packed_total(&input, &packing_input);
         // 正文恢复账目出账（增量）。eligible 是最终
         // 组装的真实 checkpoint demand；失效/超限计数是自上一条账目
         // 以来的累计，drain 后归零。
@@ -644,8 +914,24 @@ impl RuntimeActor {
                 .await;
             return;
         }
+        if (!materialized.required_misses.is_empty() || !materialized.optional_misses.is_empty())
+            && let Err(error) = self
+                .core
+                .emit_event(RuntimeEvent::ContextDegraded {
+                    turn_id,
+                    model_round,
+                    materialization_id: materialized.materialization_id,
+                    required_misses: materialized.required_misses.clone(),
+                    optional_misses: materialized.optional_misses.clone(),
+                })
+                .await
+        {
+            self.fail_round_preparation("context_degraded_event", error)
+                .await;
+            return;
+        }
 
-        if estimated_input_tokens > max_input_budget {
+        if packing_input_tokens > max_input_budget {
             let blocked =
                 surface_plan.mandatory_blocks(ToolSurfaceBlockReason::ProviderInputBudget);
             let report = surface_plan.unsatisfiable_report(
@@ -678,13 +964,88 @@ impl RuntimeActor {
                     class: RuntimeFailureClass::InputBudget,
                     retryable: false,
                     message: format!(
-                        "model input exceeds the provider window even with the context frame emptied and optional tool schemas omitted for this round ({estimated_input_tokens} > {max_input_budget} input tokens); refusing to send"
+                        "model input exceeds the provider window even with the context frame emptied and optional tool schemas omitted for this round ({packing_input_tokens} > {max_input_budget} conservatively packed input tokens); refusing to send"
                     ),
                 })
                 .await;
             self.settle_aborted_turn().await;
             return;
         }
+
+        // Live causal proof from this exact runtime state and final packed
+        // surface. Both counterfactuals reuse the same materialized bodies,
+        // TurnFrame and schemas; the shared comparator removes only the
+        // declared settlement line. The proof rides request metadata for an
+        // observational eval transport and is not part of provider messages
+        // or tool schemas.
+        let settlement_projection_audit = if settlement_audit_enabled(
+            settlement_candidate,
+            settlement_projection_diagnostics,
+        ) {
+            // Reuse the actual request and (for the diagnostic off arm) the
+            // treatment-sized packing probe. The on arm constructs only its
+            // missing baseline counterfactual. Diagnostics therefore prove
+            // both shapes without assembling either shape twice.
+            let baseline_counterfactual;
+            let (baseline_input, treatment_input) = if project_settlement {
+                baseline_counterfactual = self
+                    .assemble_model_input(
+                        runtime_focus.as_ref(),
+                        task_view.as_ref(),
+                        base_progress_view.as_ref(),
+                        &materialized,
+                        &turn_frame,
+                        surface_plan.specs().to_vec(),
+                    )
+                    .0;
+                (&baseline_counterfactual, &input)
+            } else {
+                let Some(treatment_input) = packing_input.as_ref() else {
+                    self.fail_round_preparation(
+                        "settlement_projection_audit",
+                        AgentError::Internal(
+                            "diagnostic off-arm lost its treatment packing input".into(),
+                        ),
+                    )
+                    .await;
+                    return;
+                };
+                (&input, treatment_input)
+            };
+            match crate::prompt::compare_settlement_projection(baseline_input, treatment_input) {
+                Ok(audit) if audit.passed => match serde_json::to_value(audit) {
+                    Ok(value) => Some(value),
+                    Err(error) => {
+                        self.fail_round_preparation(
+                            "settlement_projection_audit",
+                            AgentError::Internal(format!(
+                                "settlement projection audit serialization failed: {error}"
+                            )),
+                        )
+                        .await;
+                        return;
+                    }
+                },
+                Ok(audit) => {
+                    self.fail_round_preparation(
+                        "settlement_projection_audit",
+                        AgentError::Internal(format!(
+                            "settlement treatment changed more than its declared fact (occurrences={})",
+                            audit.settlement_occurrences
+                        )),
+                    )
+                    .await;
+                    return;
+                }
+                Err(error) => {
+                    self.fail_round_preparation("settlement_projection_audit", error)
+                        .await;
+                    return;
+                }
+            }
+        } else {
+            None
+        };
 
         let report = surface_plan.ready_report(SurfaceReportContext {
             turn_id,
@@ -779,6 +1140,10 @@ impl RuntimeActor {
             return;
         }
 
+        // Completion proposals from this operation are evaluated against
+        // exactly the final packed frame whose start event is now durable.
+        self.record_context_requirement_observation(materialized.required_misses.total());
+
         let core = self.core.clone();
         let services = self.services.clone();
         let sink = LiveSink::new(
@@ -793,19 +1158,21 @@ impl RuntimeActor {
         let run_id = core.run_id();
         let task_id = self.state.task_id;
         let scope_id = self.state.scope_id;
+        let request_metadata = model_request_metadata(
+            run_id,
+            materialized.selected.len(),
+            materialized.approx_tokens,
+            model_round,
+            surface_revision,
+            settlement_projection_audit,
+        );
         tokio::spawn(async move {
             let outcome = match services
                 .run_model_round(
                     ModelRequest {
                         messages: input.into_messages(),
                         tools: input.tool_schemas.clone(),
-                        metadata: serde_json::json!({
-                            "run_id": run_id.to_string(),
-                            "context_selected": materialized.selected.len(),
-                            "context_approx_tokens": materialized.approx_tokens,
-                            "model_round": model_round,
-                            "tool_surface_revision": surface_revision,
-                        }),
+                        metadata: request_metadata,
                         cancel: cancel.clone(),
                     },
                     &sink,
@@ -861,8 +1228,13 @@ impl RuntimeActor {
             AgentError::Transport { retryable, .. } => {
                 (RuntimeFailureClass::ProviderTransport, *retryable)
             }
+            AgentError::TransportRetryAfter { .. } => {
+                (RuntimeFailureClass::ProviderTransport, true)
+            }
             AgentError::ModelOutputLimit { .. } => (RuntimeFailureClass::ModelOutputLimit, false),
-            AgentError::Model(_) => (RuntimeFailureClass::Model, false),
+            AgentError::Model(_) | AgentError::ModelProtocol { .. } => {
+                (RuntimeFailureClass::Model, false)
+            }
             _ => (RuntimeFailureClass::Runtime, false),
         }
     }
@@ -1153,12 +1525,13 @@ impl RuntimeActor {
         Option<FocusState>,
         Option<TaskAnchorView>,
         Option<TaskProgressView>,
+        bool,
     ) {
         let Some(task_id) = self.state.task_id else {
-            return (None, None, None);
+            return (None, None, None, false);
         };
         let Some(task) = self.state.tasks.get(task_id) else {
-            return (None, None, None);
+            return (None, None, None, false);
         };
         let mut focus = FocusState::for_task(task_id, task.goal.clone());
         if !turn_frame.user_message.is_empty() {
@@ -1186,13 +1559,11 @@ impl RuntimeActor {
             progress.completion_opportunity =
                 Some(crate::opportunity::OPPORTUNITY_PROMPT_LINE.to_string());
         }
-        // 任务感知结算事实（默认关）：仅当 joined 标签上升为
-        // `SettledCandidate` 时投影一行中性事实。execution 视图本身
-        // 从不携带该行，所以重开/缺失时它自然消失；它不构成停止
-        // 指令，也不附加任何 tool-surface lease。
-        if let Some(progress) = progress.as_mut().filter(|_| self.services.project_task_progress())
-        {
-            let settled = match self.state.turn.as_ref() {
+        // Compute the joined fact independently of the experiment switch.
+        // The caller builds baseline/treatment frames from this same value,
+        // packs against the larger frame, and sends only the selected arm.
+        let settlement_candidate = progress.is_some()
+            && match self.state.turn.as_ref() {
                 Some(turn) => {
                     self.task_settlement_label(&turn.execution)
                         == agent_contracts::SettlementLabel::SettledCandidate
@@ -1202,14 +1573,11 @@ impl RuntimeActor {
                         == agent_contracts::SettlementLabel::SettledCandidate
                 }
             };
-            if settled {
-                progress.settlement = Some(crate::task::SETTLED_CANDIDATE_PROMPT_LINE.to_string());
-            }
-        }
         (
             Some(focus),
             Some(crate::task::task_anchor_view(&task.anchor)),
             progress,
+            settlement_candidate,
         )
     }
 }
@@ -1217,6 +1585,156 @@ impl RuntimeActor {
 #[cfg(test)]
 mod failure_class_tests {
     use super::*;
+
+    fn context_item(retention: ContextRetention, content: &str) -> MaterializedItem {
+        MaterializedItem {
+            item_id: agent_contracts::ContextItemId::new(),
+            kind: agent_contracts::ContextKind::Note,
+            scope: agent_contracts::ContextScope::Task,
+            attention: agent_contracts::AttentionState::Active,
+            semantic: agent_contracts::SemanticState::Live,
+            retention,
+            content: content.into(),
+            source: None,
+            file_path: None,
+            file_revision: None,
+        }
+    }
+
+    #[test]
+    fn final_pack_prefers_optional_and_records_required_budget_exclusion() {
+        let required = context_item(ContextRetention::Working, &"r".repeat(1_000));
+        let optional = context_item(ContextRetention::Working, "optional");
+        let mut materialized = MaterializedContext {
+            items: vec![required.clone(), optional.clone()],
+            required_item_ids: vec![required.item_id],
+            ..Default::default()
+        };
+
+        assert_eq!(
+            largest_final_pack_drop_index(&materialized, &materialized.items),
+            Some(1),
+            "optional content is displaced before a larger mandatory body"
+        );
+        record_final_pack_drop(&mut materialized, &required, 9);
+        assert_eq!(materialized.required_misses.total(), 1);
+        let miss = &materialized.required_misses.as_slice()[0];
+        assert_eq!(miss.identity.item_id, Some(required.item_id));
+        assert_eq!(miss.identity.anchor_revision, 9);
+        assert_eq!(
+            miss.reason,
+            ContextMaterializationMissReason::BudgetExcluded
+        );
+
+        record_final_pack_drop(&mut materialized, &optional, 9);
+        assert_eq!(materialized.optional_misses.total(), 1);
+        assert_eq!(materialized.required_misses.total(), 1);
+    }
+
+    #[test]
+    fn final_required_miss_revokes_settlement_from_the_sent_arm() {
+        let base = Some(TaskProgressView {
+            anchor_revision: 7,
+            ..TaskProgressView::default()
+        });
+        let (treatment, projected) = settlement_progress_views(&base, true, true, true);
+        assert!(
+            treatment
+                .as_ref()
+                .and_then(|progress| progress.settlement.as_ref())
+                .is_some()
+        );
+        assert!(
+            projected
+                .as_ref()
+                .and_then(|progress| progress.settlement.as_ref())
+                .is_some()
+        );
+
+        // This is the branch taken after final packing appends a required
+        // BudgetExcluded miss: the treatment probe may remain conservative,
+        // but the actual provider request must return to baseline.
+        let (treatment, projected) = settlement_progress_views(&base, false, true, true);
+        assert!(
+            treatment
+                .as_ref()
+                .and_then(|progress| progress.settlement.as_ref())
+                .is_none()
+        );
+        assert!(
+            projected
+                .as_ref()
+                .and_then(|progress| progress.settlement.as_ref())
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn settlement_diagnostics_are_the_only_common_envelope_and_audit_path() {
+        // Ordinary product off: baseline packing and no counterfactual.
+        assert!(!settlement_packing_projects(true, false, false));
+        assert!(!settlement_audit_enabled(true, false));
+
+        // Ordinary product on: pack the treatment that is actually sent,
+        // without constructing the other arm or hashing it.
+        assert!(settlement_packing_projects(true, true, false));
+        assert!(!settlement_audit_enabled(true, false));
+
+        // Paired diagnostics: both arms share the treatment-sized envelope
+        // and only this explicit mode assembles the counterfactual audit.
+        assert!(settlement_packing_projects(true, false, true));
+        assert!(settlement_packing_projects(true, true, true));
+        assert!(settlement_audit_enabled(true, true));
+        assert!(settlement_packing_requires_counterfactual(
+            true, false, true
+        ));
+        assert!(!settlement_packing_requires_counterfactual(
+            true, false, false
+        ));
+        assert!(!settlement_packing_requires_counterfactual(
+            true, true, true
+        ));
+
+        // No candidate means no treatment work in any mode.
+        assert!(!settlement_packing_projects(false, true, true));
+        assert!(!settlement_audit_enabled(false, true));
+        assert!(!settlement_packing_requires_counterfactual(
+            false, false, true
+        ));
+
+        let base = Some(TaskProgressView::default());
+        let (diagnostic_treatment, actual) = settlement_progress_views(&base, true, false, false);
+        assert!(diagnostic_treatment.is_none());
+        assert!(
+            actual
+                .as_ref()
+                .and_then(|progress| progress.settlement.as_ref())
+                .is_none()
+        );
+        let (diagnostic_treatment, actual) = settlement_progress_views(&base, true, true, false);
+        assert!(diagnostic_treatment.is_none());
+        assert!(
+            actual
+                .as_ref()
+                .and_then(|progress| progress.settlement.as_ref())
+                .is_some()
+        );
+
+        let ordinary = model_request_metadata(RunId::new(), 0, 0, 0, 0, None);
+        assert!(
+            ordinary.get("settlement_projection_audit").is_none(),
+            "ordinary product requests must not even carry a null diagnostic key"
+        );
+        let diagnostic = model_request_metadata(
+            RunId::new(),
+            0,
+            0,
+            0,
+            0,
+            Some(serde_json::json!({"passed": true})),
+        );
+        assert_eq!(diagnostic["settlement_projection_audit"]["passed"], true);
+    }
 
     #[test]
     fn model_failures_keep_semantic_class_and_retryability() {
@@ -1235,6 +1753,20 @@ mod failure_class_tests {
         );
         assert_eq!(
             RuntimeActor::classify_model_failure(&AgentError::Model("filtered".into())),
+            (RuntimeFailureClass::Model, false)
+        );
+        assert_eq!(
+            RuntimeActor::classify_model_failure(&AgentError::TransportRetryAfter {
+                retry_after_ms: agent_contracts::RetryAfterMillis::new(250).unwrap(),
+                message: "busy".into(),
+            }),
+            (RuntimeFailureClass::ProviderTransport, true)
+        );
+        assert_eq!(
+            RuntimeActor::classify_model_failure(&AgentError::ModelProtocol {
+                kind: agent_contracts::ModelProtocolErrorKind::MalformedEvent,
+                message: "invalid event".into(),
+            }),
             (RuntimeFailureClass::Model, false)
         );
     }
