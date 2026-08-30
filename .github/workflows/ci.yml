@@ -10,9 +10,9 @@ env:
 
 jobs:
   check:
-    name: fmt / clippy / test (${{ matrix.os }})
+    name: fmt / clippy / build (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
-    timeout-minutes: 120
+    timeout-minutes: 30
     strategy:
       fail-fast: false
       matrix:
@@ -44,11 +44,49 @@ jobs:
       - name: cargo build --workspace
         run: cargo build --workspace
 
-      # Closure audits (agent-eval m12/m13) spawn real child processes and
-      # journals; at the default concurrency the shared runner exhausts its
-      # thread/process budget (tokio worker spawn EAGAIN, flock would-block
-      # on inherited fds, and the runner can lose its heartbeat). Cap both
-      # concurrent test binaries and per-binary test threads so the audits
-      # keep headroom on both platforms.
-      - name: cargo test --workspace
-        run: cargo test --workspace -j 2 -- --test-threads 2
+  test:
+    name: test (${{ matrix.os }}, part ${{ matrix.part }})
+    runs-on: ${{ matrix.os }}
+    # The check job fills the shared cargo cache, including all --all-targets
+    # test artifacts, so the test jobs restore it warm and compile nothing.
+    needs: check
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        # The hosted runner terminates a job at roughly 48 minutes of job wall
+        # time ("lost communication"), observed twice at 48m02s/47m59s while
+        # the whole Ubuntu suite was still in progress with zero test
+        # failures - once at full concurrency, once at -j 2. The full suite
+        # needs that much wall time, so a single test job cannot complete it:
+        # Ubuntu runs two halves sized from measured per-crate test durations
+        # in separate jobs (fresh VMs), while Windows keeps its single
+        # full-suite job. The per-binary and per-test-thread caps keep the
+        # closure audits (agent-eval m12/m13 spawn real child processes and
+        # journals) headroom on the shared runner. The 45-minute job cap is a
+        # clean-limit guard below the runner kill point: a part landing near
+        # it is a split-balance failure, not a pass.
+        include:
+          - os: ubuntu-latest
+            part: 1
+            cargo_pkgs: "-p context-simple -p agent-tui -p agent-workspace -p tool-runtime -p agent-process -p agent-conformance -p agent-replay"
+          - os: ubuntu-latest
+            part: 2
+            cargo_pkgs: "-p agent-runtime -p agent-eval -p agent-contracts -p agent-platform-protocol -p context-baselines -p context-contextcore -p agent-capability-process -p agent-context-service -p agent-storage -p agent-core -p provider-openai -p agent-compose"
+          - os: windows-latest
+            part: full
+            cargo_pkgs: ""
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain (1.97.1, matching local verification)
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.97.1
+          components: rustfmt, clippy
+
+      - name: Cache cargo artifacts
+        uses: Swatinem/rust-cache@v2
+
+      - name: cargo test (${{ matrix.part }})
+        run: cargo test -j 2 ${{ matrix.cargo_pkgs }} -- --test-threads 2
