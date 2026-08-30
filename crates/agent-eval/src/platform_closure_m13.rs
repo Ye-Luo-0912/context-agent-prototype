@@ -184,6 +184,12 @@ fn fixture_config(
     with_write_roots: bool,
 ) -> ProcessHostConfig {
     std::fs::create_dir_all(sandbox_root).expect("sandbox cwd");
+    if with_write_roots {
+        // The confinement mechanism opens each write root in the parent
+        // before spawning; the fixture must create them like a real host
+        // workspace would (landlock refuses to open a missing root).
+        std::fs::create_dir_all(sandbox_root.join("private")).expect("sandbox write root");
+    }
     let sandbox = default_sandbox(sandbox_root, with_write_roots);
     ProcessHostConfig {
         program: program.to_string_lossy().into_owned(),
@@ -191,8 +197,10 @@ fn fixture_config(
         // The fixture refuses to serve without this marker, which doubles
         // as proof that the configured env actually reached the child.
         env: vec![("MOCK_MARKER".to_string(), "1".to_string())],
-        startup_timeout: Duration::from_secs(10),
-        request_timeout: Duration::from_secs(10),
+        // Generous handshake budgets: on a loaded CI runner the first
+        // native spawn of the fixture can take well over 10s to exec.
+        startup_timeout: Duration::from_secs(30),
+        request_timeout: Duration::from_secs(30),
         max_frame_bytes: 1024 * 1024,
         max_call_bytes: 4 * 1024 * 1024,
         max_system_answer_bytes: 512 * 1024,

@@ -535,26 +535,46 @@ impl RuntimeEventEnvelopeCollector {
         let mut seen = Vec::new();
         let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
         let mut turn_done = false;
-        // Durable post-turn events (checkpoint, TaskCompleted) are emitted
-        // after the turn boundary, so once the queue is quiet we sweep a
-        // bounded grace window before returning. Under CI load the durable
-        // batch can arrive more than one 25ms round late, so require three
-        // consecutive empty rounds before declaring the turn fully drained.
-        let mut quiet_rounds = 0u32;
+        // Post-turn durable transactions (the task-completion batch) are
+        // emitted after the turn barrier from the same actor step, with a
+        // journal flush between them. Under CI load that flush can take
+        // well over 100ms, so a plain one-round quiet probe was flaky:
+        // the collector returned between the two batches. Sweep a bounded
+        // window of ~1s of consecutive quiet after the turn barrier before
+        // declaring the turn fully drained; the 5s deadline still caps the
+        // whole sweep.
+        const POST_TURN_QUIET_MS: u64 = 1000;
+        let mut quiet_start: Option<tokio::time::Instant> = None;
         while tokio::time::Instant::now() < deadline {
             let mut drained_any = false;
-            while let Ok(envelope) = self.events.try_recv() {
-                turn_done |= matches!(envelope.event, RuntimeEvent::TurnCompleted);
-                drained_any = true;
-                seen.push(envelope);
+            loop {
+                match self.events.try_recv() {
+                    Ok(envelope) => {
+                        turn_done |= matches!(envelope.event, RuntimeEvent::TurnCompleted);
+                        drained_any = true;
+                        seen.push(envelope);
+                    }
+                    // A lagged receiver means events were produced faster
+                    // than this drain; never treat that as quiet time.
+                    Err(tokio::sync::broadcast::error::TryRecvError::Lagged(_)) => {
+                        drained_any = true;
+                        break;
+                    }
+                    Err(tokio::sync::broadcast::error::TryRecvError::Empty) => break,
+                    // The instance shut down: no further events will come.
+                    Err(tokio::sync::broadcast::error::TryRecvError::Closed) => {
+                        return seen;
+                    }
+                }
             }
             if turn_done && !drained_any {
-                quiet_rounds += 1;
-                if quiet_rounds >= 3 {
+                let now = tokio::time::Instant::now();
+                let entry = *quiet_start.get_or_insert(now);
+                if now.duration_since(entry) >= Duration::from_millis(POST_TURN_QUIET_MS) {
                     break;
                 }
             } else {
-                quiet_rounds = 0;
+                quiet_start = None;
             }
             tokio::time::sleep(Duration::from_millis(25)).await;
         }
