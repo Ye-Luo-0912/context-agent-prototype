@@ -166,8 +166,21 @@ HEAD `41f06ad` (source tree digest `d4b4da3517f7a3e8...`): one
 `retry_policy_dev` normal cell, closure completed, provider healthy,
 16 model rounds / 27 tool calls, evidence
 `crates/agent-eval/evidence/m15-preflight-relay-fix/`. The predeclared
-12-cell v4 window on this source is scheduled 2026-08-31; no claim is
-made until its mechanically regenerated report passes.
+12-cell v4 window on this source ran 2026-08-31 on the clean HEAD
+`784d7aa` and is a **valid FAIL: 10/12 pass, 0 NOT_RUN** — the
+mechanical report at
+`crates/agent-eval/evidence/m15-window/_windows/1788115951355/`.
+Behavior passed 12/12 and every cell reported a healthy provider; the
+malformed-tool-call failure mode did not recur in any cell, and the new
+retry path was exercised twice (`retry_migrate_dev resume r2`,
+`retry_policy_dev resume r1`), both times ending in a passed cell (one
+`model_used` event records 2 attempts / 1 retry). The two failures are
+`retry_policy_dev normal r1` and `r2`, both erroring "phase one failed:
+tool round budget exhausted after 48 rounds" with `task.complete`
+refused 3/3 and 5/5 and no retries — the same cells that failed via
+malformed arguments on `ab4534a`. The harness fix removed its target
+failure mode and left a model task-execution failure on that fixture;
+per §5 the valid FAIL rejects the candidate and M15 remains open.
 
 The later Completion Convergence implementation and report do not justify
 another window. The original review found split completion authority,
@@ -392,9 +405,17 @@ checkpoint, not a milestone exit. Continue in this order:
    stream never leaked, `MalformedEvent` stays non-retryable, interactive
    hosts never replay). The exact-source preflight then passed on clean
    HEAD `41f06ad` (digest `d4b4da3517f7a3e8...`, evidence
-   `crates/agent-eval/evidence/m15-preflight-relay-fix/`). The next 12-cell
-   v4 window on this source is predeclared 2026-08-31; M15 stays open until
-   a window's mechanically regenerated report passes.
+   `crates/agent-eval/evidence/m15-preflight-relay-fix/`). That window
+   ran 2026-08-31 on the predeclared clean source `784d7aa` and is a
+   valid FAIL (10/12, mechanical report at
+   `crates/agent-eval/evidence/m15-window/_windows/1788115951355/`):
+   the malformed-argument failure mode did not recur (behavior 12/12,
+   provider healthy in every cell, no malformed outcome anywhere) and
+   the new retry path was exercised twice and passed both times, but
+   `retry_policy_dev normal r1` and `r2` exhausted the 48-round tool
+   budget with `task.complete` refused 3/3 and 5/5 — a model
+   task-execution failure, not a harness defect. §5 rejects the
+   candidate on the valid FAIL without rerun; M15 remains open.
 
 300×3 scale, `recall_after_fix`, a 27-cell context expansion, a second context
 engine comparison and model comparison remain parked until this gate closes.

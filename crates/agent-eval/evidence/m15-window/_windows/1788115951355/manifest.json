@@ -1,0 +1,48 @@
+{
+  "schema": "m15-window.v1",
+  "created_ms": 1788115951355,
+  "expected_repeats": 2,
+  "expected_packs": [
+    "retry_diag_dev",
+    "retry_migrate_dev",
+    "retry_policy_dev"
+  ],
+  "cells": [
+    {
+      "path": "../../m15-retry_diag_dev-normal/r1-attempt10/dynamic"
+    },
+    {
+      "path": "../../m15-retry_diag_dev-resume/r1-attempt10/dynamic"
+    },
+    {
+      "path": "../../m15-retry_diag_dev-normal/r2-attempt10/dynamic"
+    },
+    {
+      "path": "../../m15-retry_diag_dev-resume/r2-attempt10/dynamic"
+    },
+    {
+      "path": "../../m15-retry_migrate_dev-normal/r1-attempt10/dynamic"
+    },
+    {
+      "path": "../../m15-retry_migrate_dev-resume/r1-attempt10/dynamic"
+    },
+    {
+      "path": "../../m15-retry_migrate_dev-normal/r2-attempt10/dynamic"
+    },
+    {
+      "path": "../../m15-retry_migrate_dev-resume/r2-attempt10/dynamic"
+    },
+    {
+      "path": "../../m15-retry_policy_dev-normal/r1-attempt10/dynamic"
+    },
+    {
+      "path": "../../m15-retry_policy_dev-resume/r1-attempt10/dynamic"
+    },
+    {
+      "path": "../../m15-retry_policy_dev-normal/r2-attempt10/dynamic"
+    },
+    {
+      "path": "../../m15-retry_policy_dev-resume/r2-attempt10/dynamic"
+    }
+  ]
+}

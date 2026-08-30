@@ -224,9 +224,28 @@ and sandbox contracts live elsewhere. Experiment facts live in
   no source change happens during the run, the frozen-window rules of
   M15_ACCEPTANCE §5 apply, and the mechanically regenerated report is the
   only accepted verdict.
+- The 12-cell v4 window on the fixed source ran 2026-08-31 on the
+  predeclared clean source `784d7aa` (product surface, relay serving,
+  explicit protocol, 32,768 max output tokens) and is a **valid FAIL:
+  10/12 pass, 0 NOT_RUN** — the mechanical report at
+  `crates/agent-eval/evidence/m15-window/_windows/1788115951355/`. The
+  malformed-tool-call failure mode did not recur: behavior pass 12/12,
+  provider healthy in every cell, no malformed-JSON outcome in any
+  summary. The new retry path was exercised twice (`retry_migrate_dev
+  resume r2` and `retry_policy_dev resume r1`) and both cells passed —
+  one `model_used` event records 2 attempts / 1 retry. The two failures
+  are `retry_policy_dev normal r1` and `r2`, both erroring "phase one
+  failed: tool round budget exhausted after 48 rounds" with
+  `task.complete` refused 3/3 and 5/5 and no retries: the model failed
+  to close these cells (the same cells that failed via malformed
+  arguments on `ab4534a`), so the fix removed its target failure mode
+  and exposed a model task-execution failure on this fixture. Per
+  M15_ACCEPTANCE §5 the valid FAIL rejects the candidate; the window is
+  not rerun. M15 remains open.
 - M15 remains open. Its shape remains 3 fixtures × normal/resume × 2 repeats =
-  12 cells. Historical v3 FAIL windows remain immutable; the three v4 windows
-  (valid FAILs 9/12 on `d1936d4`, 10/12 on `a25a8a5`, 9/12 on `ab4534a`)
+  12 cells. Historical v3 FAIL windows remain immutable; the four v4 windows
+  (valid FAILs 9/12 on `d1936d4`, 10/12 on `a25a8a5`, 9/12 on `ab4534a`,
+  10/12 on `784d7aa`)
   are banked and no v4 window has passed. M12/M13 artifacts remain banked,
   while `GOV-STATUS-01` still forbids a new closure claim or Self-Iteration
   transition.
