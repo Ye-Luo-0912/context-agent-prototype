@@ -478,11 +478,11 @@ The P1 contract adds:
   delta from a cancelled turn can never leak into the next turn's view —
   the live stream is fenced the same way the final `OperationResult` is.
 - Retry/backoff lives at the transport boundary: `provider-openai` ships a
-  generic `RetryingTransport` wrapper that retries only
-  `AgentError::Transport { retryable: true }` errors (network, timeout, 5xx,
-  429, and gateway-wrapped upstream failures presented as HTTP 400
-  `Upstream request failed`) with exponential backoff. A genuine 400
-  (illegal tool name, context overflow) is not retryable.
+  generic `RetryingTransport` wrapper. Network, timeout, 5xx, 429 and
+  gateway-wrapped upstream failures use the configured bounded exponential
+  transport budget. Model-emitted malformed tool arguments use a separate
+  format class: at most one immediate regeneration, never the outage backoff.
+  A genuine 400, damaged SSE event or output-limit outcome is not retried.
 
 `provider-openai` speaks both Responses and Chat Completions SSE. Protocol is
 an explicit adapter setting (`responses`, `chat`, or `auto`); `auto` probes
@@ -507,10 +507,14 @@ A Chat stream is complete only after `[DONE]`; a Responses stream only after
 `response.completed`. EOF before that terminal, malformed JSON in a valid
 `data:` frame, missing fields on a known Responses event, or incomplete tool
 arguments is a typed `ModelProtocol` failure. Unknown well-formed extension
-events may be ignored. Live sinks never retry after publication; buffering eval
-sinks publish only a successful attempt and are bounded by both chunk and byte
-caps. `RetryAfterMillis` is bounded and backoff arithmetic is checked or
-saturating.
+events may be ignored. An unterminated SSE line is capped by the configured
+total stream-byte limit before the decoder can grow it further.
+`ModelEventSink::creates_replay_barrier` is fail-closed
+by default. Runtime's live sink declares tool-call deltas protocol-internal and
+text deltas irreversible, so a malformed call can be regenerated before any
+text publication but published text is never replayed. Buffering eval sinks
+publish only a successful attempt and are bounded by both chunk and byte caps.
+`RetryAfterMillis` is bounded and backoff arithmetic is checked or saturating.
 
 ### ToolDispatcher
 

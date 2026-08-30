@@ -1152,6 +1152,11 @@ pub struct TaskProgressView {
     /// bounded runtime fact, not a transcript retry instruction.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub completion_commit_failure: Option<String>,
+    /// Current Runtime-derived repair stage after a refused durable
+    /// completion. Recomputed from current task/world authority each model
+    /// decision; never copied from transcript history.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub completion_repair: Option<String>,
     /// 类型化操作证据行（身份/digest/计数），最新在前、有界。只含
     /// key + 结果 + world 版本，不含任何工具正文。
     #[serde(default)]
@@ -1193,6 +1198,7 @@ impl TaskProgressView {
             && self.verifications.is_empty()
             && self.failed_commands.is_empty()
             && self.completion_commit_failure.is_none()
+            && self.completion_repair.is_none()
             && self.operational_evidence.is_empty()
             && self.unresolved_blockers.is_empty()
             && self.stall_warning.is_none()
@@ -2259,10 +2265,9 @@ pub const CONTEXT_MAP_VIEW_CAP: usize = 32;
 /// contract, not a retrieval tutorial. Do not name ops, prefer/avoid lists,
 /// or retune scoring from this text.
 pub const DEFAULT_CODING_AGENT_SYSTEM_PROMPT: &str = concat!(
-    "You are a focused coding agent working on the current task only. ",
+    "You are a focused coding agent. Work on the current task only. ",
     "The selected working context is not the full catalog; prior evidence may remain outside this frame and can be searched or retrieved with context tools. ",
-    "Additional tools can be discovered and loaded with capability tools. ",
-    "Every tool call argument must be one complete valid JSON value, with all objects and arrays properly closed, never truncated."
+    "Additional tools can be discovered and loaded with capability tools."
 );
 
 /// The bounded, model-facing view of the external context map. The engine
@@ -2897,8 +2902,8 @@ mod tests {
         assert!(prompt.contains("context tools"));
         assert!(prompt.contains("capability tools"));
         assert!(
-            prompt.contains("valid JSON"),
-            "tool call arguments must be pinned as complete valid JSON: {prompt}"
+            !prompt.contains("JSON"),
+            "wire syntax is not prompt policy: {prompt}"
         );
         assert!(
             !prompt.contains("bounded cache"),

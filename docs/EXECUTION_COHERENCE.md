@@ -691,6 +691,15 @@ the Runtime-computed `ArgumentDigest` (not producer strings), so
 same-argv/different-env and same-path/different-cursor calls no longer
 collide on evidence identity.
 
+Pre-dispatch attempt incidents are not task obligations. A call rejected
+against the immutable round surface is typed `SurfaceUnavailable`; it remains
+visible in `ToolFinished` and wire-quality metrics, but its result is
+`TransientNoPersist`. It enters neither Context, `failed_commands`, obligations
+nor completion readiness because no approval, dispatch or effect occurred.
+Actual process/verification failure, ambiguous settlement and rooted typed
+precondition debt retain the conservative rules above. Provider wire spelling
+cannot change this classification.
+
 ### Unified completion readiness and settlement observation
 
 Completion convergence is derived state, never a round counter or automatic
@@ -716,6 +725,22 @@ override semantic blockers only; it cannot bypass a stale task basis,
 in-flight/cancel cleanup, unresolved effect transaction, or recovery fence,
 and its immutable completion record is marked `OperatorOverride` with the
 bounded unmet reasons. A normal assistant final still closes only the turn.
+
+A refused model completion also derives a bounded `completion-repair.v1`
+projection from that exact readiness result. Its basis records task,
+verification, directive and workspace revisions; it exposes exactly one
+current stage: `operator_required`, task-progress repair, execution debt,
+proof refresh, or completion retry. Proof refresh names only a recipe currently
+revalidated by trusted host attribution. The refusal carries typed stage
+metadata and terse model content; the actor re-derives the bounded current
+model-visible record in `TASK PROGRESS` each decision. This is a resolver
+protocol, not a planner: Runtime chooses no edit or command. The actor
+`PreferSurface`s only its helper, so an unavailable helper cannot abort the
+round. The standing `task.complete` control remains visible for an explicit
+stage refresh. The refusal ToolResult stays in the current turn but is
+`TransientNoPersist`; cross-round Context receives no stale repair prose. Any
+later basis change replaces the derived record and leaves the old refusal as
+descriptive turn history rather than authority.
 
 Task completion authority is explicit. `OperatorClosureOnly` is the default
 when no host/user criteria exist, so autonomous model closure fails closed.

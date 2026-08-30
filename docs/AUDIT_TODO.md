@@ -61,6 +61,139 @@ the item below). The live causal runner still needs a common
 pre-exposure checkpoint/workspace fork only if the selected candidate enables
 settlement projection.
 
+## Post-window execution and JSON audit — 2026-08-31 (`ac2eb2a`)
+
+The JSON-hardened v4 window at
+`evidence/m15-window/_windows/1788115951355/` is a valid FAIL (10/12,
+0 NOT_RUN). It proves behavior/diff 12/12 and healthy provider state, while the
+new malformed-tool retry recovered two format incidents. It does **not** prove
+the model stopped emitting malformed JSON. Both failing policy-normal cells
+completed the functional work but exhausted 48 rounds after `task.complete`
+refusals. The immutable diagnosis localizes three independent defects:
+
+- Core rejected early `shell.exec` calls before dispatch because the tool was
+  absent from the captured surface, yet Runtime persisted those attempt
+  incidents as permanent failed-command completion debt;
+- broad verification and later shell checks repeatedly invalidated the exact
+  acceptance receipt, while the refusal named counts rather than an ordered,
+  executable repair protocol;
+- the standing JSON sentence and the buffered retry landed together, so the
+  zero-final-malformed outcome cannot be attributed to prompt wording. Product
+  live streaming also treated internal tool-call deltas as already published,
+  unlike the buffered evaluator.
+
+No further formal window is authorized from the unchanged candidate. The
+current uncommitted repair tree is a deterministic candidate only; it has no
+live-evidence status.
+
+### EXEC-INCIDENT-01 — separate attempt incidents from task obligations (**open — candidate implemented; full local regression green, clean-source/CI exit pending**)
+
+An off-surface call is `RejectedBeforeDispatch`: no approval, dispatch or
+effect occurred. It remains a typed `ToolFinished` failure and counts in model
+wire-quality metrics, but must be `TransientNoPersist` and must not enter
+Context, `failed_commands`, execution obligations or completion readiness. The
+candidate adds trusted `SurfaceUnavailable` classification and that disposition;
+free-text diagnosis cannot mint the class, so only Core's captured-surface
+rejection receives the transient privilege.
+Real process/verification failure, ambiguous effect settlement and rooted typed
+precondition debt remain blocking.
+
+Exit requires an actor-level regression showing an unloaded canonical command
+is refused and visible, then a correct implementation plus current exact PASS
+can close without replaying the rejected command. Canonical dotted and provider
+wire spellings must have identical debt semantics.
+
+### COMPLETION-REPAIR-01 — derive an executable repair protocol (**open — bounded first slice implemented and locally green; proof-refresh transaction remains**)
+
+`CompletionReadiness` remains the sole authority. A refusal now derives
+one `completion-repair.v1` stage stamped with task/verification/workspace
+revisions. It selects only the current highest-priority blocker class; it does
+not predict later steps. Proof repair names only a `recipe_id` revalidated
+through current trusted host attribution; if no exact route exists it returns
+`operator_required` rather than turning a coverage-domain label into an
+argument. Typed metadata identifies the refusal snapshot basis. The immediate
+ToolResult is terse; while TaskProgress
+projection is active, Runtime replaces its bounded model-visible
+completion-repair record from current readiness every decision, so a partial
+repair cannot leave the previous recipe or anchor revision authoritative.
+`task.manage`/`verify.run` use `PreferSurface`; a helper load or schema-budget
+miss therefore cannot abort the model round. `task.complete` remains a standing
+control surface and may explicitly re-propose to refresh the stage. Refusal
+ToolResults are `TransientNoPersist`; the current turn re-derives repair from
+Runtime state rather than Context prose. Durable cross-turn/deferred-refusal
+repair state remains part of the next slice below.
+
+The remaining slice makes the state explicit and durable across the deferred
+safe-point refusal path, carries criterion/context details directly from
+`CompletionReadiness`, and adds an optional Runtime-owned proof-refresh
+transaction: only when proof is the sole blocker, an explicit `task.complete`
+intent may run the host-declared exact verifier under one pre/post world fence,
+recheck the same basis and commit. It never bypasses open loops, effect debt,
+recovery or approval.
+
+The deterministic matrix must also prove criterion A PASS changes the next
+projected stage to criterion B/recipe B, and bind resolver availability to the
+same captured surface/load result rather than catalog-name presence alone.
+
+The current candidate has passed format check, strict all-target/all-feature
+Clippy, all-target build and the complete local all-target workspace suite
+after rebuilding the freshness-guarded context service binary. That validates
+the first slice locally; it does not replace the remaining deterministic
+matrix, a recorded clean source or dual-platform CI.
+
+### JSON-RECOVERY-01 — make format recovery product-equivalent (**open — replay boundary and format budget implemented and locally green; protocol closure remains**)
+
+The candidate removes JSON syntax advice from the standing system prompt.
+`ModelEventSink` now declares whether a delivered chunk creates an irreversible
+replay boundary; Runtime's live sink treats tool-call deltas as internal and
+text as irreversible. A malformed tool-call body therefore gets at most one
+immediate regeneration in both product and buffered eval, independently from
+the transport retry/backoff budget. The two credits have one aggregate ceiling
+(`transport_attempt_limit + format_credit`), and the replay barrier is set
+before arbitrary sink code so publish-then-error cannot duplicate output.
+Persistent malformed output still fails closed; a published text prefix is
+never replayed. Both provider paths now
+bound an unterminated SSE line inside `LinesCodec` by the configured total
+stream cap, so raw bytes cannot grow past the boundary while waiting for `\n`.
+
+Remaining protocol exits before another live window:
+
+- replace the remaining line-at-a-time interpretation with an SSE event framer
+  that joins standard multi-`data:` events at the blank-line boundary;
+- make Responses/Chat tool-call assembly an explicit id/name/index/done state
+  machine, rejecting conflicts and using a terminal full-arguments snapshot
+  only when the protocol declares it authoritative;
+- persist typed format incident/retry/recovered/final-stage metrics rather than
+  relying on stderr or error-message parsing.
+
+### TOOL-SCHEMA-VALIDATE-01 — validate the captured schema before approval (**open P0**)
+
+JSON syntax is insufficient. Compile a bounded `SchemaProfile` once per tool
+catalog revision, then validate arguments against the immutable round surface
+before approval or dispatch. Start with the repository's actual subset:
+object/properties/required, primitives, enum, arrays/items/bounds and
+`additionalProperties`. Unsupported keywords fail capability admission rather
+than being ignored. A mismatch returns a typed no-dispatch result with a JSON
+pointer and expected shape; it never opens completion debt. Actual effect
+authority remains `HostToolPolicy`, not the schema.
+
+Exit includes catalog meta-validation and a shared corpus proving the central
+validator and each builtin parser agree. Missing fields, wrong union branch,
+extra fields, depth/node/byte overflow and duplicate keys must reach neither
+approval nor the effect journal. Provider-native strict schemas are enabled
+only through an explicit, source/serving-pinned capability; fallback validation
+remains authoritative for compatible relays.
+
+### TASK-PROGRESS-PACK-01 — pack facts and advisories as atomic records (**open P1**)
+
+Replace character slicing of the mixed TaskProgress prose with bounded records
+classified as hard Runtime blocker, model-resolvable fact, neutral observation
+or edge-triggered advisory. Pack whole records by priority; never cut a record
+mid-line. The same failure/basis appears once, stall/frontier advice is emitted
+only on state transition, and required-context misses name a bounded recovery
+affordance. This changes projection/observability only; Context selection, GC,
+retrieval and the transcript remain frozen.
+
 ### P0 — restore a trustworthy baseline
 
 #### BASELINE-01 — make the exact source green (**closed 2026-08-30 on `1455795`**)
@@ -546,16 +679,14 @@ work, do not claim closure, and keep Self-Iteration blocked.
 ### Ordered execution and evidence gate
 
 ```text
-local integrated candidate GREEN
-  -> record one clean source (BASELINE-01)
-  -> repeat fmt/clippy/build/full-test on that source + Ubuntu/Windows CI
-  -> VERIFY-ROUTE-01 evidence (done 2026-08-30: crates/agent-eval/evidence/verify-route/)
+latest JSON-hardened candidate REJECTED (valid FAIL 10/12 on 784d7aa)
+  -> deterministic AttemptIncident / CompletionRepair / JSON replay gates
+  -> bounded SSE + provider call-state + pre-approval schema validation
+  -> full local regression + recorded clean source + Ubuntu/Windows CI
   -> selected-path P1 correctness closed or proven out-of-path
   -> same-checkpoint causal fork only if project_settlement changes
-  -> exact-source/product M15 preflight (done 2026-08-30 on df85195: crates/agent-eval/evidence/m15-preflight/)
-  -> one predeclared formal 12-cell M15 window (run 2026-08-30 on d1936d4: valid FAIL 9/12,
-     evidence crates/agent-eval/evidence/m15-window/_windows/1788093162603;
-     per M15_ACCEPTANCE §5 the candidate is rejected and returns to diagnosis)
+  -> new exact-source/product M15 preflight
+  -> at most one freshly predeclared formal 12-cell M15 window
 ```
 
 The settlement candidate gate, if it is run again after deterministic fixes,

@@ -1033,7 +1033,9 @@ impl CoreAuthority {
                     error.to_string(),
                 )));
             }
-            return refused(ToolOutcome::Value(tool_error_output(&call, message)));
+            return refused(ToolOutcome::Value(surface_unavailable_output(
+                &call, message,
+            )));
         };
 
         let verdict = self.approval.authorize(&call, &spec, &cancel).await;
@@ -1649,6 +1651,17 @@ fn tool_error_output(call: &ToolCall, message: String) -> ToolOutput {
         artifact_ref: None,
         metadata,
     }
+}
+
+fn surface_unavailable_output(call: &ToolCall, message: String) -> ToolOutput {
+    agent_contracts::tool_failure_output(
+        call.id.clone(),
+        call.name.clone(),
+        agent_contracts::ToolFailureClass::SurfaceUnavailable,
+        message.clone(),
+        format!("tool error: {message}"),
+        serde_json::json!({"executed": false}),
+    )
 }
 
 fn bound_utf8(value: &str, max_bytes: usize) -> &str {

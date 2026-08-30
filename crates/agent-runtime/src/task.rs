@@ -571,6 +571,27 @@ impl CompletionBlocker {
         )
     }
 
+    /// Whether Runtime lacks a safe model-owned resolver for this blocker.
+    /// Repair projection must stop here instead of inventing a tool call.
+    pub(crate) fn requires_operator_repair(self) -> bool {
+        matches!(
+            self,
+            Self::NoActiveTask
+                | Self::TaskIdentityMismatch
+                | Self::TaskNotActive
+                | Self::TaskStateStale
+                | Self::VerificationBasisStale
+                | Self::OperatorClosureOnly
+                | Self::AcceptanceUndeclared
+                | Self::AcceptanceDeclarationStale { .. }
+                | Self::RequiredContextUnavailable { .. }
+                | Self::RecoveryRequired
+                | Self::CancelCleanupPending
+                | Self::OperationInFlight
+                | Self::PendingToolWork
+        )
+    }
+
     pub(crate) fn summary(self) -> String {
         match self {
             Self::NoActiveTask => "no active task".into(),

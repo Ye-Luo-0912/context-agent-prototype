@@ -31,7 +31,7 @@ use async_trait::async_trait;
 use futures_util::{StreamExt, TryStreamExt};
 use reqwest::{Client, header::RETRY_AFTER};
 use serde_json::{Value, json};
-use tokio_util::codec::{FramedRead, LinesCodec};
+use tokio_util::codec::{FramedRead, LinesCodec, LinesCodecError};
 use tokio_util::io::StreamReader;
 
 use crate::responses::{ResponseStreamErrorKind, ResponsesAccumulator};
@@ -362,7 +362,10 @@ impl OpenAiProvider {
 
         let byte_stream = response.bytes_stream().map_err(std::io::Error::other);
         let reader = StreamReader::new(byte_stream);
-        let mut lines = FramedRead::new(reader, LinesCodec::new());
+        let mut lines = FramedRead::new(
+            reader,
+            LinesCodec::new_with_max_length(self.config.max_stream_bytes.max(1)),
+        );
 
         let max_stream_bytes = self.config.max_stream_bytes;
         let mut total_bytes = 0usize;
@@ -418,6 +421,14 @@ impl OpenAiProvider {
                                 }
                                 None => tracing::debug!(%payload, "ignoring unknown Chat Completions extension event"),
                             }
+                        }
+                        Some(Err(LinesCodecError::MaxLineLengthExceeded)) => {
+                            return Err(ProtocolError::transport(
+                                false,
+                                format!(
+                                    "SSE line exceeded the {max_stream_bytes} byte cap before framing"
+                                ),
+                            ));
                         }
                         Some(Err(error)) => {
                             return Err(ProtocolError::transport(
@@ -489,7 +500,10 @@ impl OpenAiProvider {
 
         let byte_stream = response.bytes_stream().map_err(std::io::Error::other);
         let reader = StreamReader::new(byte_stream);
-        let mut lines = FramedRead::new(reader, LinesCodec::new());
+        let mut lines = FramedRead::new(
+            reader,
+            LinesCodec::new_with_max_length(self.config.max_stream_bytes.max(1)),
+        );
         let max_stream_bytes = self.config.max_stream_bytes;
         let mut total_bytes = 0usize;
         let mut accumulator = ResponsesAccumulator::default();
@@ -528,6 +542,12 @@ impl OpenAiProvider {
                             if accumulator.is_completed() {
                                 break;
                             }
+                        }
+                        Some(Err(LinesCodecError::MaxLineLengthExceeded)) => {
+                            return Err(ProtocolError::transport(
+                                false,
+                                format!("SSE line exceeded the {max_stream_bytes} byte cap before framing"),
+                            ));
                         }
                         Some(Err(error)) => {
                             return Err(ProtocolError::transport(true, format!("stream error: {error}")));
@@ -925,6 +945,41 @@ mod tests {
         async fn on_chunk(&self, chunk: ModelChunk) -> AgentResult<()> {
             self.chunks.lock().unwrap().push(chunk);
             Ok(())
+        }
+    }
+
+    async fn read_complete_http_request(socket: &mut tokio::net::TcpStream) {
+        const MAX_TEST_REQUEST_BYTES: usize = 64 * 1024;
+        let mut request = Vec::new();
+        let mut buf = [0u8; 4096];
+        loop {
+            let read = socket.read(&mut buf).await.unwrap();
+            assert!(read > 0, "client closed before sending the request");
+            request.extend_from_slice(&buf[..read]);
+            assert!(
+                request.len() <= MAX_TEST_REQUEST_BYTES,
+                "mock request exceeded its test bound"
+            );
+
+            let Some(header_end) = request
+                .windows(4)
+                .position(|window| window == b"\r\n\r\n")
+                .map(|offset| offset + 4)
+            else {
+                continue;
+            };
+            let headers = std::str::from_utf8(&request[..header_end]).unwrap();
+            let content_length = headers
+                .lines()
+                .find_map(|line| {
+                    let (name, value) = line.split_once(':')?;
+                    name.eq_ignore_ascii_case("content-length")
+                        .then(|| value.trim().parse::<usize>().unwrap())
+                })
+                .unwrap_or_default();
+            if request.len() >= header_end.saturating_add(content_length) {
+                return;
+            }
         }
     }
 
@@ -1344,6 +1399,49 @@ mod tests {
         assert!(
             error.contains("512"),
             "the cap value must be surfaced: {error}"
+        );
+    }
+
+    #[tokio::test]
+    async fn unterminated_sse_line_is_bounded_before_decode() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            read_complete_http_request(&mut socket).await;
+            let body = format!("data: {}", "x".repeat(1_024));
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            socket.write_all(response.as_bytes()).await.unwrap();
+            socket.shutdown().await.unwrap();
+        });
+
+        let config = OpenAiConfig {
+            api_key: "secret".into(),
+            base_url: format!("http://{addr}/v1"),
+            model: "mock".into(),
+            protocol: OpenAiProtocol::ChatCompletions,
+            max_output_tokens: 2_048,
+            timeout: Duration::from_secs(10),
+            send_stream_options: true,
+            send_max_tokens: true,
+            max_stream_bytes: 512,
+            context_window: None,
+        };
+        let provider = OpenAiProvider::new(config);
+        let request = ModelRequest {
+            messages: vec![ModelMessage::user("hi")],
+            tools: Vec::new(),
+            metadata: json!({}),
+            cancel: CancellationToken::new(),
+        };
+
+        let error = provider.complete(request).await.unwrap_err().to_string();
+        assert!(
+            error.contains("SSE line exceeded the 512 byte cap before framing"),
+            "the decoder must fail at the line bound: {error}"
         );
     }
 

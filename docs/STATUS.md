@@ -198,7 +198,8 @@ and sandbox contracts live elsewhere. Experiment facts live in
   intermittent malformed tool-call problem at the harness rather than
   switching models.
 - Harness fix (commit `41f06ad`, CI `33325617880` green, 2026-08-31):
-  the default system prompt now requires every tool call argument to be
+  that historical source made the default system prompt require every tool
+  call argument to be
   one complete valid JSON value, and `provider-openai` classifies the
   model-emitted `MalformedToolCall` (argument JSON that ends prematurely
   or breaks JSON syntax, at columns far below the output cap) as
@@ -264,11 +265,36 @@ and sandbox contracts live elsewhere. Experiment facts live in
   (non-streaming `retry()`, live streaming, buffered streaming) write one
   stderr line on each retry with the reason class
   (`malformed tool-call JSON` / `retryable transport error`), attempt,
-  delay and the full error; the eval harness redirects stderr into the
-  run log, so a future window/preflight will record exactly which error
-  kind triggered each retry. Pure observability: retry decisions, backoff
-  and sink behavior are unchanged; the reason-label helper has a unit
-  test. No window or preflight is rerun on this change.
+  and delay; provider error bodies are deliberately omitted. The eval harness
+  redirects stderr into the run log, so a future window/preflight will record
+  which error class triggered each retry without copying intermediate provider
+  content. Typed durable retry evidence remains open. No window or preflight
+  is rerun on this change.
+- Current repair checkpoint (2026-08-31, uncommitted tree based on
+  `ac2eb2a`; not evidence): off-surface command proposals are now typed
+  `SurfaceUnavailable` attempt incidents and remain visible without entering
+  Context or completion debt. A refused completion returns bounded
+  `completion-repair.v1` single-stage snapshot stamped with the current
+  task/verification/world basis. Runtime re-derives the current blocker stage
+  each decision, replaces the bounded `TASK PROGRESS` repair record and only
+  prefers its resolver; a repair helper cannot abort a model round when
+  loading or packing fails. The standing `task.complete` control remains
+  model-visible, so an explicit re-proposal can also refresh the stage.
+  This directly targets the two 48-round policy-normal loops without changing
+  Context/GC, adding a round TTL or reducing model autonomy.
+- JSON recovery is now a protocol mechanism rather than standing prompt text:
+  the global JSON sentence is removed, Runtime's live sink declares tool-call
+  deltas internal until text is published, and malformed tool arguments receive
+  one immediate format regeneration independent of network retry/backoff.
+  Targeted Provider, Runtime and contract tests are green. The complete local
+  all-target workspace suite is also green after rebuilding the freshness-
+  guarded context service binary (all tests passed; the existing 10k-turn
+  bounded-working-set test took about 128 seconds in the final run). Format,
+  strict all-target/all-feature Clippy, all-target build, full workspace tests
+  and diff check are green; this is still an uncommitted local candidate, not
+  clean-source/CI or live evidence. This is not full JSON closure: bounded SSE
+  event framing, per-call Responses/Chat terminal state and immutable-round
+  schema validation before approval remain open in `AUDIT_TODO.md`.
 - M15 remains open. Its shape remains 3 fixtures × normal/resume × 2 repeats =
   12 cells. Historical v3 FAIL windows remain immutable; the four v4 windows
   (valid FAILs 9/12 on `d1936d4`, 10/12 on `a25a8a5`, 9/12 on `ab4534a`,
@@ -1254,19 +1280,23 @@ task-aware, its tail metric does not stop when work reopens, and its live runner
 
 ## Next milestone
 
-The next milestone is a **recorded and CI-proven V1 candidate**, not another
-live sample. Execute in this order:
+The next milestone is a **mechanically convergent execution candidate**, not
+another prompt tweak or live sample. Execute in this order:
 
-1. freeze the candidate as one recorded clean source and repeat the four local
-   commands plus Ubuntu and Windows CI on that exact source;
-2. measure `VERIFY-ROUTE-01`, then close or prove out-of-path every P1 item
-   exercised by the selected candidate/evidence path;
-3. only if the selected candidate changes model-visible settlement, fork both
-   causal arms from one pre-exposure checkpoint/workspace and pin an explicit
-   provider protocol;
-4. run the bounded exact-source product preflight with the selected serving
-   tuple and explicit protocol;
-5. if every gate remains green, spend exactly one predeclared M15 window.
+1. close the deterministic `EXEC-INCIDENT-01`, `COMPLETION-REPAIR-01` and
+   `JSON-RECOVERY-01` matrices, including deferred completion refusal and live
+   replay-boundary behavior;
+2. add a byte-bounded SSE event framer, strict per-call Responses/Chat state
+   machine and immutable-round schema validation before approval
+   (`TOOL-SCHEMA-VALIDATE-01`);
+3. implement atomic proof refresh only when it is the sole completion blocker,
+   and convert TaskProgress to whole-record, edge-triggered packing;
+4. pass fmt/Clippy/build/full workspace tests, record one clean source and bank
+   Ubuntu plus Windows CI on that exact source;
+5. close or prove out-of-path every P1 item exercised by the candidate; only a
+   settlement-changing candidate additionally needs the same-checkpoint fork;
+6. run one exact-source product preflight, then at most one freshly
+   predeclared M15 window if every deterministic gate remains green.
 
 A base candidate with settlement projection off may proceed after these gates.
 Only a candidate that changes the model-visible settlement projection needs a

@@ -1069,30 +1069,28 @@ closes it as an ordinary turn. Deterministic coverage uses that order.
 
 ### Current delivery order
 
-`BASELINE-01` closed 2026-08-30: the merged audit (`a3bd23f`) plus the
-BASELINE-01 chain is recorded as the clean source `1455795` (Rust tree
-`8558886`); the readiness/declaration, continuation, required-context,
-failure-lifecycle, real-order terminal, RunStart/replay and strict-provider
-matrices stay locally green, the four local commands pass on that tree, and
-Ubuntu plus Windows CI are green on one complete run — Ubuntu runs the whole
-suite as two fresh-VM halves (3m09s + 4m49s) because the hosted runner
-terminates a single job near 48 minutes of wall time. Continue in this order:
+The latest JSON-hardened formal window (`784d7aa`) is a valid FAIL 10/12. Its
+two policy-normal cells finished the development work but exhausted 48 rounds
+behind pre-dispatch surface incidents recorded as permanent debt and repeatedly
+stale exact proof. Two malformed-tool incidents were recovered; zero final
+malformed outcomes does not prove the model stopped emitting them. Continue in
+this order:
 
-1. One recorded clean source with the four commands green and Ubuntu plus
-   Windows CI passed on that exact source (**done** — `BASELINE-01`).
-2. Measure and improve verifier routing to the first criterion-satisfying
-   trusted PASS using host-declared coverage domains. Include a negative where
-   a broad Cargo/test PASS is valid but does not cover a criterion-specific
-   boundary; optimize pre-settlement rounds/calls without changing Context
-   policy or limiting model autonomy.
-3. Close every P1 item exercised by the selected candidate/evidence path, or
-   prove deterministically that it is out-of-path.
-4. A settlement-off base candidate may proceed to exact-source M15 preflight.
-   Only a candidate that enables model-visible settlement first needs the
-   same-checkpoint/byte-identical-workspace causal fork with an explicit
-   provider protocol.
-5. Run the bounded product preflight, then exactly one predeclared formal M15
-   window if every preceding gate remains green.
+1. Separate `AttemptIncident` from `TaskObligation`; a rejected-before-dispatch
+   call stays measurable and model-visible but never blocks completion.
+2. Derive a bounded `CompletionRepairPlan` from the exact blocker/basis and
+   lease only its resolver. When proof alone blocks an explicit completion
+   intent, run one atomic host-owned proof refresh and recheck the same world.
+3. Move JSON recovery out of the standing prompt: share one replay-boundary and
+   format-regeneration policy across product/eval, then close bounded SSE,
+   per-call protocol state and captured-schema validation before approval.
+4. Pack TaskProgress as whole typed records with state-transition deduplication;
+   keep Context selection, GC, retrieval and transcript history unchanged.
+5. Pass deterministic gates and the complete local/dual-CI source gate. Close
+   selected-path P1 or prove it out-of-path; only a settlement-enabled candidate
+   needs the same-checkpoint causal fork.
+6. Run one new exact-source preflight and at most one freshly predeclared formal
+   window if every prior gate remains green.
 
 No step expands the transcript, adds a second ResumePoint, introduces a
 TaskGraph/learned planner, auto-completes, fixes a task-specific round count or

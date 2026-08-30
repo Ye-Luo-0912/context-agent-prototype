@@ -56,8 +56,8 @@ use crate::services::RuntimeServices;
 use crate::sink::LiveSink;
 use crate::surface::{RoundSurfacePlan, SurfaceReportContext};
 use crate::task::{
-    AnchorPatch, CompletionIntent, CompletionReadiness, CompletionSafety, TaskManager,
-    changed_fields_kind, derive_completion_readiness, normalize_tool_requirements,
+    AnchorPatch, CompletionBlocker, CompletionIntent, CompletionReadiness, CompletionSafety,
+    TaskManager, changed_fields_kind, derive_completion_readiness, normalize_tool_requirements,
     validate_completion_proposal,
 };
 
@@ -78,15 +78,38 @@ fn now_ms() -> u64 {
         .unwrap_or_default()
 }
 
-/// `capability.manage` search/inspect are read-only catalog views; they must
-/// not become ToolObservations. load/unload still persist.
+/// Catalog views and pre-dispatch surface refusals are turn-local protocol
+/// facts; they must not become task observations or completion debt.
 fn tool_value_disposition(output: &ToolOutput) -> ToolResultDisposition {
+    if output.failure_class() == Some(agent_contracts::ToolFailureClass::SurfaceUnavailable) {
+        return ToolResultDisposition::TransientNoPersist;
+    }
     if output.tool_name != CAPABILITY_MANAGE {
         return ToolResultDisposition::PersistObservation;
     }
     match output.metadata.get("op").and_then(|v| v.as_str()) {
         Some("search" | "inspect") => ToolResultDisposition::TransientNoPersist,
         _ => ToolResultDisposition::PersistObservation,
+    }
+}
+
+fn settled_tool_disposition(
+    output: &ToolOutput,
+    original: ToolResultDisposition,
+) -> ToolResultDisposition {
+    if output.tool_name == "task.complete"
+        && output
+            .metadata
+            .get("refused")
+            .and_then(|value| value.as_str())
+            == Some("completion_gate")
+    {
+        // The current turn receives the refusal directly. Cross-round repair
+        // is re-derived from task/world state, so stale instructions must not
+        // become a long-term Context observation.
+        ToolResultDisposition::TransientNoPersist
+    } else {
+        original
     }
 }
 
@@ -153,6 +176,32 @@ mod discovery_tests {
         assert_eq!(
             tool_value_disposition(&output("fs.read", "search")),
             ToolResultDisposition::PersistObservation
+        );
+    }
+
+    #[test]
+    fn off_surface_refusal_is_an_attempt_incident_not_task_history() {
+        let mut refused = output("shell.exec", "");
+        refused.ok = false;
+        agent_contracts::attach_failure_class(
+            &mut refused.metadata,
+            agent_contracts::ToolFailureClass::SurfaceUnavailable,
+        );
+
+        assert_eq!(
+            tool_value_disposition(&refused),
+            ToolResultDisposition::TransientNoPersist
+        );
+    }
+
+    #[test]
+    fn completion_gate_refusal_stays_out_of_long_term_context() {
+        let mut refused = output("task.complete", "");
+        refused.ok = false;
+        refused.metadata = serde_json::json!({"refused": "completion_gate"});
+        assert_eq!(
+            settled_tool_disposition(&refused, ToolResultDisposition::PersistObservation),
+            ToolResultDisposition::TransientNoPersist
         );
     }
 }

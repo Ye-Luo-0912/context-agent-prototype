@@ -479,17 +479,34 @@ async fn task_complete_without_evidence_policy_returns_a_model_visible_refusal()
             .contains("acceptance_undeclared")
     );
     assert!(output.model_content.contains("was not accepted by Runtime"));
+    assert!(output.model_content.contains("completion_repair/v1"));
+    assert_eq!(
+        output.metadata["repair_plan"]["schema"],
+        "completion-repair.v1"
+    );
+    assert_eq!(
+        output.metadata["repair_plan"]["steps"][0]["kind"],
+        "operator_required"
+    );
     assert!(
         requests
             .get(1)
             .is_some_and(|request| request.contains("was not accepted by Runtime")),
         "the next model decision must receive the refusal output"
     );
+    assert!(
+        requests.get(1).is_some_and(|request| {
+            request.contains("completion_repair/v1 basis")
+                && request.contains("TASK PROGRESS")
+                && request.contains("operator_required")
+        }),
+        "the next decision must receive the freshly derived repair record in TASK PROGRESS"
+    );
     assert!(checkpoint.tasks.completed.is_empty());
 }
 
 #[tokio::test]
-async fn task_complete_without_a_criterion_receipt_returns_a_model_visible_refusal() {
+async fn task_complete_without_a_registered_proof_route_fails_closed() {
     let (output, requests, checkpoint) = run_model_visible_completion_refusal(true).await;
     assert!(!output.ok);
     assert_eq!(output.metadata["refused"], "completion_gate");
@@ -499,6 +516,16 @@ async fn task_complete_without_a_criterion_receipt_returns_a_model_visible_refus
             .contains("acceptance_uncovered")
     );
     assert!(output.model_content.contains("lack current coverage"));
+    assert!(
+        output.metadata["repair_plan"]["steps"]
+            .as_array()
+            .is_some_and(|steps| steps.len() == 1 && steps[0]["kind"] == "operator_required")
+    );
+    assert!(
+        requests
+            .get(1)
+            .is_some_and(|request| request.contains("cannot prove a current exact recipe_id"))
+    );
     assert!(
         requests
             .get(1)

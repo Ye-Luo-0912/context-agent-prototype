@@ -486,6 +486,10 @@ impl RuntimeActor {
                 .filter(|readiness| !readiness.allows_completion())
                 .map(CompletionReadiness::applicable_blockers)
                 .unwrap_or_default();
+            let repair = readiness
+                .as_ref()
+                .filter(|readiness| !readiness.allows_completion())
+                .map(|readiness| self.completion_repair_plan(readiness));
             let reason = bounded_preview(
                 &error.to_string(),
                 agent_contracts::MAX_TASK_ANCHOR_ITEM_CHARS,
@@ -496,13 +500,16 @@ impl RuntimeActor {
                 agent_contracts::MAX_TOOL_SUMMARY_CHARS,
             );
             output.model_content = bounded_preview(
-                &format!("task.complete was not accepted by Runtime ({refusal_class}): {reason}"),
+                &format!(
+                    "task.complete was not accepted by Runtime ({refusal_class}): {reason}. Runtime re-derives the current completion_repair/v1 stage in TASK PROGRESS."
+                ),
                 agent_contracts::MAX_TOOL_MODEL_CONTENT_CHARS,
             );
             output.metadata = serde_json::json!({
                 "accepted": false,
                 "refused": refusal_class,
                 "blockers": blockers,
+                "repair_plan": repair.map(|(plan, _)| plan),
             });
             let _ = self
                 .core
@@ -721,6 +728,282 @@ impl RuntimeActor {
             "anchor_revision": revision,
             "changed": changed_fields,
         });
+    }
+
+    /// Build one bounded, state-derived repair stage for a refused completion
+    /// intent. This is not a task planner: it never predicts future stages or
+    /// invents a tool argument. The next completion proposal re-derives the
+    /// stage from current authority and world state.
+    pub(super) fn completion_repair_plan(
+        &self,
+        readiness: &CompletionReadiness,
+    ) -> (serde_json::Value, String) {
+        let blockers = readiness.applicable_blockers();
+        let basis = serde_json::json!({
+            "task_anchor_revision": readiness
+                .task_state_basis
+                .map(|basis| basis.anchor_revision),
+            "verification_revision": readiness
+                .verification_basis
+                .map(|basis| basis.verification_revision),
+            "directive_revision": readiness
+                .verification_basis
+                .map(|basis| basis.directive_revision),
+            "workspace_revision": readiness
+                .verification_basis
+                .map(|basis| basis.workspace_revision),
+        });
+        let basis_text = format!(
+            "basis anchor_rev={} verification_rev={} directive_rev={} world_rev={}",
+            readiness
+                .task_state_basis
+                .map(|value| value.anchor_revision.to_string())
+                .unwrap_or_else(|| "-".into()),
+            readiness
+                .verification_basis
+                .map(|value| value.verification_revision.to_string())
+                .unwrap_or_else(|| "-".into()),
+            readiness
+                .verification_basis
+                .map(|value| value.directive_revision.to_string())
+                .unwrap_or_else(|| "-".into()),
+            readiness
+                .verification_basis
+                .map(|value| value.workspace_revision.to_string())
+                .unwrap_or_else(|| "-".into()),
+        );
+
+        let operator_blockers: Vec<_> = blockers
+            .iter()
+            .copied()
+            .filter(|blocker| blocker.requires_operator_repair())
+            .collect();
+        let progress_blocked = blockers.iter().any(|blocker| {
+            matches!(
+                blocker,
+                CompletionBlocker::OpenLoops { .. } | CompletionBlocker::NextActionPending
+            )
+        });
+        let execution_blocked = blockers.iter().any(|blocker| {
+            matches!(
+                blocker,
+                CompletionBlocker::ExecutionObligations { .. }
+                    | CompletionBlocker::FailedCommands { .. }
+            )
+        });
+        let proof_blocked = blockers.iter().any(|blocker| {
+            matches!(
+                blocker,
+                CompletionBlocker::VerificationNotCurrent
+                    | CompletionBlocker::AcceptanceUncovered { .. }
+            )
+        });
+        let task_manage_available = !progress_blocked
+            || self
+                .services
+                .tool_catalog()
+                .iter()
+                .any(|entry| entry.name == "task.manage");
+
+        let (step, instruction) = if !operator_blockers.is_empty() {
+            (
+                serde_json::json!({
+                    "kind": "operator_required",
+                    "blockers": operator_blockers,
+                }),
+                "operator_required: Runtime/authority state has no safe model-owned resolver; do not retry task.complete unchanged."
+                    .into(),
+            )
+        } else if progress_blocked && !task_manage_available {
+            (
+                serde_json::json!({
+                    "kind": "operator_required",
+                    "reason": "task_progress_resolver_unavailable",
+                    "blockers": blockers,
+                }),
+                "operator_required: task progress blocks completion but task.manage is not present in the current host catalog."
+                    .into(),
+            )
+        } else if progress_blocked {
+            let anchor_revision = readiness
+                .task_state_basis
+                .map(|value| value.anchor_revision)
+                .unwrap_or_default();
+            let mut clears = Vec::new();
+            if blockers
+                .iter()
+                .any(|blocker| matches!(blocker, CompletionBlocker::OpenLoops { .. }))
+            {
+                clears.push("open_loops");
+            }
+            if blockers
+                .iter()
+                .any(|blocker| matches!(blocker, CompletionBlocker::NextActionPending))
+            {
+                clears.push("next_action");
+            }
+            (
+                serde_json::json!({
+                    "kind": "task_progress",
+                    "tool": "task.manage",
+                    "base_anchor_revision": anchor_revision,
+                    "clears": clears,
+                }),
+                "task_progress: after the listed work is actually resolved, call task.manage using the current TASK PROGRESS anchor_rev as base_anchor_revision; then re-propose completion for a freshly derived stage."
+                    .into(),
+            )
+        } else if execution_blocked {
+            (
+                serde_json::json!({
+                    "kind": "execution_debt",
+                    "source": "TASK PROGRESS",
+                    "clears": ["execution_obligations", "failed_commands"],
+                }),
+                "execution_debt: resolve the exact task-rooted blocker shown in TASK PROGRESS; unrelated successful commands cannot clear it; then re-propose completion."
+                    .into(),
+            )
+        } else if proof_blocked {
+            if let Some((criterion_index, domain, recipe_id)) =
+                self.current_completion_proof_route(readiness)
+            {
+                (
+                    serde_json::json!({
+                        "kind": "proof_refresh",
+                        "tool": "verify.run",
+                        "coverage_domain": domain,
+                        "criterion_index": criterion_index,
+                        "recipe_id": recipe_id,
+                        "must_be_after_workspace_calls": true,
+                    }),
+                    format!(
+                        "proof_refresh: after every edit/shell/process call, run verify.run with recipe_id={recipe_id}; do not run another workspace-changing command afterward; then re-propose completion."
+                    ),
+                )
+            } else {
+                (
+                    serde_json::json!({
+                        "kind": "operator_required",
+                        "reason": "no_current_exact_verification_route",
+                        "blockers": blockers,
+                    }),
+                    "operator_required: Runtime cannot prove a current exact recipe_id for the uncovered verification domain; do not invent coverage_domain as a verify.run argument."
+                        .into(),
+                )
+            }
+        } else {
+            (
+                serde_json::json!({
+                    "kind": "retry_completion",
+                    "tool": "task.complete",
+                }),
+                "retry_completion: no model-resolvable blocker remains; call task.complete once."
+                    .into(),
+            )
+        };
+        let plan = serde_json::json!({
+            "schema": "completion-repair.v1",
+            "basis": basis,
+            "steps": [step],
+        });
+        let text = format!(
+            "completion_repair/v1 {basis_text}\n1. {instruction}\nThis is a one-stage snapshot; after any state-changing result, use current TASK PROGRESS and re-propose completion instead of reusing stale arguments."
+        );
+        (plan, text)
+    }
+
+    /// Resolve one current exact verifier from trusted host attribution. The
+    /// first uncovered criterion wins; a missing route fails closed instead
+    /// of turning a coverage-domain label into a tool argument.
+    pub(super) fn current_completion_proof_route(
+        &self,
+        readiness: &CompletionReadiness,
+    ) -> Option<(Option<u32>, String, String)> {
+        if !self
+            .services
+            .tool_catalog()
+            .iter()
+            .any(|entry| entry.name == "verify.run")
+        {
+            return None;
+        }
+        let task = self
+            .state
+            .task_id
+            .and_then(|task_id| self.state.tasks.get(task_id))?;
+        let turn = self.state.turn.as_ref()?;
+        let basis = readiness.verification_basis?;
+
+        for (index, criterion) in task.anchor.acceptance_criteria.iter().enumerate() {
+            let covered = task.anchor.acceptance_coverage.iter().any(|receipt| {
+                receipt.criterion_index as usize == index
+                    && receipt.coverage_domain == criterion.coverage_domain
+                    && receipt.domain_declaration_revision == criterion.domain_declaration_revision
+                    && receipt.domain_source_digest == criterion.domain_source_digest
+                    && crate::task::acceptance_receipt_fact(&turn.execution, task, &basis, receipt)
+                        .is_some()
+            });
+            if covered {
+                continue;
+            }
+            let route = turn.execution.verifications.iter().rev().find_map(|fact| {
+                if fact.source_tool_name != "verify.run" {
+                    return None;
+                }
+                let prior = fact.recipe_provenance.as_ref()?;
+                if prior.coverage_domain.as_deref() != Some(criterion.coverage_domain.as_str())
+                    || prior.domain_declaration_revision
+                        != Some(criterion.domain_declaration_revision)
+                    || prior.domain_source_digest != criterion.domain_source_digest
+                {
+                    return None;
+                }
+                self.current_host_recipe_provenance(&prior.recipe_id)
+                    .filter(|current| {
+                        current.coverage_domain.as_deref()
+                            == Some(criterion.coverage_domain.as_str())
+                            && current.domain_declaration_revision
+                                == Some(criterion.domain_declaration_revision)
+                            && current.domain_source_digest == criterion.domain_source_digest
+                    })
+                    .map(|current| {
+                        (
+                            Some(index.min(u32::MAX as usize) as u32),
+                            criterion.coverage_domain.clone(),
+                            current.recipe_id,
+                        )
+                    })
+            });
+            return route;
+        }
+
+        turn.execution.verifications.iter().rev().find_map(|fact| {
+            if fact.source_tool_name != "verify.run" {
+                return None;
+            }
+            let prior = fact.recipe_provenance.as_ref()?;
+            self.current_host_recipe_provenance(&prior.recipe_id)
+                .map(|current| {
+                    (
+                        None,
+                        current.coverage_domain.unwrap_or_default(),
+                        current.recipe_id,
+                    )
+                })
+        })
+    }
+
+    fn current_host_recipe_provenance(
+        &self,
+        recipe_id: &str,
+    ) -> Option<agent_contracts::VerificationRecipeProvenance> {
+        let call = ToolCall {
+            id: "completion-repair-route".into(),
+            name: "verify.run".into(),
+            arguments: serde_json::json!({"recipe_id": recipe_id}),
+        };
+        self.services
+            .tool_execution_attribution(&call)
+            .verification_recipe
     }
 
     /// Commit the active task's typed CompletionRecord — the CTX-10

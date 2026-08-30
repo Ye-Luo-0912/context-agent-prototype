@@ -592,6 +592,18 @@ pub enum ModelChunk {
 /// model hot path.
 #[async_trait]
 pub trait ModelEventSink: Send + Sync {
+    /// Whether successfully delivering this chunk creates externally visible
+    /// state that makes replaying the model request unsafe. The default is
+    /// fail-closed because an arbitrary sink may publish every chunk.
+    ///
+    /// A sink may return `false` for protocol-internal chunks that it consumes
+    /// without exposing them. Retry wrappers use this signal only to decide
+    /// whether a failed attempt can be discarded and reissued; it never makes
+    /// a published text delta rewindable.
+    fn creates_replay_barrier(&self, _chunk: &ModelChunk) -> bool {
+        true
+    }
+
     async fn on_chunk(&self, chunk: ModelChunk) -> AgentResult<()>;
 }
 

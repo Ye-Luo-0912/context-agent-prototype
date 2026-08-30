@@ -25,59 +25,42 @@ copy them back.
 | M12 Effect Runtime | 🧾 closure-audit evidence banked; governance status pending | The clean-tree evidence table covers brokerable production effects, crash reconciliation, authority/revocation fencing and the named generic shell/process exception (`evidence/platform-closure/m12/`). `GOV-STATUS-01` must reconcile contradictory authority text before an overall closure claim; do not reopen mechanism work from this wording. Details: [`PLATFORM_SECURITY.md`](PLATFORM_SECURITY.md). |
 | M13 Extension Sandbox | 🧾 closure-audit evidence banked; governance status pending | The clean-tree audit covers real-child activation, required refusal and attestation rows (`evidence/platform-closure/m13/`). Universal native `UntrustedGenerated` availability is not the V1 contract and WASI remains V2. `GOV-STATUS-01` owns the status wording. Details: [`PLATFORM_SECURITY.md`](PLATFORM_SECURITY.md). |
 | M14 Resource Policy | ✅ | Schema/context quotas, standing grants, output broker, authority leases. Further typed policy is not a reopen of this gate. |
-| M15 Real Evaluation | 🛑 open; the predeclared v4 window ran and is a valid FAIL (9/12); base candidate rejected → diagnosis | Three valid v3 windows remain valid FAIL evidence (11/12, 9/12, 10/12). The later convergence report remains mechanically FAIL but is causally INVALID/CONFOUNDED because its arm changed all of TaskProgress and checked-file GC projection. `BASELINE-01` closed 2026-08-30 (recorded source `1455795`, four local commands green, Ubuntu and Windows CI green). `VERIFY-ROUTE-01` closed 2026-08-30 with its deterministic gate; the bounded one-cell exact-source/product preflight passed 2026-08-30 on commit `df85195`. The predeclared 12-cell v4 window ran 2026-08-30 on `d1936d4`: valid FAIL 9/12 (0 NOT_RUN; migrate 4/4, policy 3/4, diag 2/4 on the `checked_shl` saturation strategy); per M15_ACCEPTANCE §5 it rejects the base candidate and returns to diagnosis. A common-prefix causal fork is required only if the selected candidate enables model-visible settlement. Formal M15 remains 3 fixtures × normal/resume × 2 repeats, with the selected product configuration; it is not settlement off/on. See [`M15_ACCEPTANCE.md`](M15_ACCEPTANCE.md). |
+| M15 Real Evaluation | 🛑 open; latest v4 valid FAIL 10/12; candidate rejected → execution/JSON diagnosis | Three valid v3 windows remain immutable FAIL evidence. Four clean v4 windows are also valid FAILs: 9/12 on `d1936d4`, 10/12 on `a25a8a5`, 9/12 on `ab4534a`, and 10/12 on the JSON-hardened `784d7aa`, all with 0 NOT_RUN. The latest window recovered two malformed-tool incidents but its two policy-normal cells completed the functional work and then exhausted 48 rounds behind off-surface failure debt and stale acceptance proof. The current uncommitted repair candidate separates attempt incidents, emits typed completion repair and aligns live/buffered JSON recovery; bounded SSE/call-state/schema gates remain open. A common-prefix causal fork is required only if a later selected candidate enables model-visible settlement. Formal M15 remains 3 fixtures × normal/resume × 2 repeats; it is not settlement off/on. See [`M15_ACCEPTANCE.md`](M15_ACCEPTANCE.md). |
 | V2 Self-Iteration | 🔒 blocked | Until the governing M12/M13 status is reconciled and M15 closes. The agent may grow capabilities, never evaluation or permission Core authority. |
 
-Open gate order: record the locally green candidate as one clean source and
-repeat the local suite plus Ubuntu/Windows CI → verifier-route evidence and
-selected-path P1 → same-checkpoint causal runner only for a settlement-changing
-candidate → clean exact-source product preflight → one predeclared formal
-M15 window → governing milestone decision. The locally green completion,
-acceptance, required-context, terminal, replay and provider matrices remain
-mandatory regressions on the recorded source. The platform
+Open gate order: deterministic attempt-incident/completion-repair/JSON recovery
+→ bounded SSE and provider call-state machines → immutable-round schema
+validation before approval → full local suite plus recorded clean source and
+Ubuntu/Windows CI → selected-path P1 → same-checkpoint causal runner only for a
+settlement-changing candidate → new exact-source product preflight → at most one
+freshly predeclared M15 window → governing milestone decision. The platform
 audit evidence stays banked, M14 is not reopened, and Context/GC/retrieval/
 packing remain frozen.
 
 ## Ordered route
 
-1. The recorded clean source `1455795` (`BASELINE-01`, closed 2026-08-30)
-   passes the four local commands and one complete Ubuntu plus Windows CI
-   run. Do not generate new live evidence before the route preflight.
-2. On the recorded source, retain the locally green regression matrices for the
-   unified `CompletionReadiness`, continuation epoch, host-bound criterion
-   receipts, domain-scoped failure lifecycle, transactional required-context
-   overlay, real actor-order terminal attribution, one-shot RunStart, committed-
-   prefix replay and strict provider protocol. A regression in any matrix
-   returns to deterministic diagnosis rather than a live run.
-3. `VERIFY-ROUTE-01` closed 2026-08-30: host-declared verifier
-   coverage/identity strength is model-visible and the deterministic
-   three-cell gate measures calls to the first criterion-satisfying trusted
-   PASS. Every P1 item exercised by the selected candidate/evidence path is
-   closed on that evidence. The bounded queue is in
-   [`AUDIT_TODO.md`](AUDIT_TODO.md#p1--v1-correctness-hardening): transactional
-   composition, Context I/O/error truth, effect ACK debt, durable typed facts,
-   sidecar error semantics, and one aligned tool manifest. Performance rewrites
-   remain measure-first P2 work. This is the main efficiency route; Context/GC/
-   retrieval/packing do not change.
-4. The same-state request audit already isolates `project_settlement` while
-   TaskProgress and Context inputs stay identical. If—and only if—the selected
-   candidate enables settlement projection, complete `EVAL-CAUSAL-01` by
-   forking both arms from one pre-exposure durable checkpoint and byte-identical
-   workspace, preserving opaque ids and one explicit provider protocol. A
-   settlement-off base candidate skips this live pair.
-5. **done 2026-08-30** — the exact source, product switches,
-   acceptance-declaration identity, tool surface and serving tuple are frozen
-   and the bounded product preflight passed on commit `df85195`
-   (`agent-eval --m15-preflight`; evidence under
-   `crates/agent-eval/evidence/m15-preflight/`). The product hot path keeps
-   TaskProgress on, settlement off by default and never assembles/hashes a
-   counterfactual second request (recorded `diag=false`).
-6. Formal M15 uses only versioned per-cell artifacts and the already selected
-   product configuration. A corrected settlement-off base candidate may enter
-   exact-source preflight without a projection experiment. After the green
-   exact-source preflight, run exactly one predeclared 12-cell
-   window; valid FAIL rejects the candidate and `NOT_RUN` alone permits a full
-   frozen-window rerun.
+1. Preserve the latest valid FAIL and do not rerun `784d7aa`. Close
+   `EXEC-INCIDENT-01`: a pre-dispatch surface/schema incident remains visible
+   but cannot become task completion debt. Real effect/verification debt stays
+   fail-closed.
+2. Close `COMPLETION-REPAIR-01`: every blocker has a bounded resolver or
+   `operator_required`, resolver schemas are leased only while that basis is
+   live, deferred refusal reaches the next decision, and proof refresh is one
+   atomic explicit-completion transaction when it is the sole blocker.
+3. Close the JSON protocol gates: product/eval share the replay-boundary and
+   one-regeneration format budget; SSE framing is byte bounded and standards-
+   correct; Responses/Chat calls require consistent id/name/index/done state;
+   arguments are validated against the captured schema before approval.
+4. Convert TaskProgress to whole-record, edge-triggered packing and repair any
+   selected-path P1 correctness item. Run fmt, Clippy, build and the full suite;
+   then record the candidate and bank Ubuntu plus Windows CI on that exact
+   source. Context/GC/retrieval/packing selection does not change.
+5. If—and only if—the candidate enables settlement projection, complete the
+   same-checkpoint `EVAL-CAUSAL-01` fork. A settlement-off candidate skips it.
+6. Freeze source, surface, acceptance identity and serving; run one bounded
+   exact-source product preflight. Only a green preflight may authorize at most
+   one freshly predeclared 12-cell v4 window. Valid FAIL rejects the candidate;
+   only typed `NOT_RUN` permits rerunning the whole frozen window.
 
 ## Historical implementation notes (non-ordering)
 

@@ -1039,6 +1039,10 @@ pub enum ToolFailureClass {
     Cancellation,
     HiddenPath,
     PathNotFound,
+    /// Core rejected the call against the immutable model surface before
+    /// approval or dispatch. It is an attempt incident, not evidence that task
+    /// work or an effect remains unresolved.
+    SurfaceUnavailable,
     InvalidRequest,
     /// The runtime refused to dispatch: this call is byte-identical to a
     /// deterministic refusal against unchanged file identities, so
@@ -1063,6 +1067,7 @@ impl ToolFailureClass {
             Self::Cancellation => "cancellation",
             Self::HiddenPath => "hidden_path",
             Self::PathNotFound => "path_not_found",
+            Self::SurfaceUnavailable => "surface_unavailable",
             Self::InvalidRequest => "invalid_request",
             Self::DuplicateNoProgress => "duplicate_no_progress",
             Self::Io => "io",
@@ -1100,6 +1105,9 @@ impl ToolFailureClass {
             Self::PathNotFound => {
                 "Use a path that exists in the parent listing; do not invent manifests."
             }
+            Self::SurfaceUnavailable => {
+                "Discover or load the tool, then use only a schema present on the next captured surface."
+            }
             Self::InvalidRequest => "Fix the arguments against the tool schema.",
             Self::DuplicateNoProgress => {
                 "This exact call already failed deterministically and the files are unchanged. Change the arguments, re-read the target, or finish with the current state."
@@ -1123,6 +1131,7 @@ impl ToolFailureClass {
             "cancellation" => Self::Cancellation,
             "hidden_path" => Self::HiddenPath,
             "path_not_found" => Self::PathNotFound,
+            "surface_unavailable" => Self::SurfaceUnavailable,
             "invalid_request" => Self::InvalidRequest,
             "duplicate_no_progress" => Self::DuplicateNoProgress,
             "io" => Self::Io,
@@ -1146,6 +1155,7 @@ impl ToolFailureClass {
                 | Self::NoExactMatch
                 | Self::AmbiguousMatch
                 | Self::PathNotFound
+                | Self::SurfaceUnavailable
                 | Self::InvalidRequest
                 | Self::HiddenPath
                 | Self::DuplicateNoProgress
@@ -1168,6 +1178,7 @@ impl ToolFailureClass {
             | Self::NoSearchMatch
             | Self::HiddenPath
             | Self::PathNotFound => ToolFailureDomain::ResourcePath,
+            Self::SurfaceUnavailable => ToolFailureDomain::NonDeterministic,
             Self::ProcessExit
             | Self::VerificationFailure
             | Self::Timeout
@@ -3486,6 +3497,13 @@ mod tests {
         assert_eq!(
             failure_class_from_message("base_revision mismatch"),
             ToolFailureClass::StaleRevision
+        );
+        assert_eq!(
+            failure_class_from_message(
+                "tool 'shell.exec' was not exposed on model surface revision 7"
+            ),
+            ToolFailureClass::InvalidRequest,
+            "only Core may mint the typed pre-dispatch surface incident"
         );
         assert_eq!(
             failure_class_from_message("open dir C:\\tmp\\src: NTSTATUS 0xc0000034"),

@@ -793,6 +793,7 @@ fn render_task_progress(progress: &TaskProgressView) -> String {
         &failed,
         &evidence,
         progress.completion_commit_failure.as_deref(),
+        progress.completion_repair.as_deref(),
         &progress.unresolved_blockers,
         progress.stall_warning.as_deref(),
         progress.frontier_warning.as_deref(),
@@ -819,6 +820,7 @@ fn render_task_progress(progress: &TaskProgressView) -> String {
             &failed,
             &evidence,
             progress.completion_commit_failure.as_deref(),
+            progress.completion_repair.as_deref(),
             &progress.unresolved_blockers,
             progress.stall_warning.as_deref(),
             progress.frontier_warning.as_deref(),
@@ -845,6 +847,7 @@ fn format_task_progress(
     failed: &[String],
     evidence: &[String],
     completion_commit_failure: Option<&str>,
+    completion_repair: Option<&str>,
     blockers: &[String],
     stall_warning: Option<&str>,
     frontier_warning: Option<&str>,
@@ -866,6 +869,13 @@ fn format_task_progress(
     }
     if let Some(failure) = completion_commit_failure {
         out.push_str(failure);
+        out.push('\n');
+    }
+    // Completion repair is current derived control state, not historical
+    // prose. It stays above trimmable lists so the model and resolver surface
+    // are driven by the same task/world basis.
+    if let Some(repair) = completion_repair {
+        out.push_str(repair);
         out.push('\n');
     }
     // 任务感知结算事实（默认关）：不参与列表裁剪，投影时直接可见。

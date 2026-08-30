@@ -152,8 +152,8 @@ only `deepseek-v4-flash`, `deepseek-v4-pro` and `grok-4.5` are available,
 the Qwen models (`qwen3.8-max`, `qwen3.7-max`, ...) return 401 "not
 supported for format openai", and glm/kimi/hy3/mimo answer 501 (Responses
 unavailable). The fix is commit `41f06ad` (CI `33325617880` green): the
-default system prompt now states the requirement explicitly — every tool
-call argument must be one complete valid JSON value — and
+default system prompt stated the requirement explicitly — every tool call
+argument must be one complete valid JSON value — and
 `provider-openai` classifies the model-emitted `MalformedToolCall`
 (argument JSON ending prematurely or breaking JSON syntax, at columns far
 below the output cap) as retryable, so the eval's buffering transport
@@ -181,6 +181,15 @@ refused 3/3 and 5/5 and no retries — the same cells that failed via
 malformed arguments on `ab4534a`. The harness fix removed its target
 failure mode and left a model task-execution failure on that fixture;
 per §5 the valid FAIL rejects the candidate and M15 remains open.
+
+The uncommitted post-window repair candidate removes that standing JSON
+sentence and moves recovery into the protocol: sink-declared replay boundaries,
+one immediate format regeneration independent of transport backoff, and typed
+attempt incidents which cannot become task completion debt. It also emits a
+basis-stamped, single-stage completion repair snapshot. These are development
+changes only; they do not reinterpret the `784d7aa` verdict or authorize a new
+window. Bounded SSE framing, per-call terminal state and captured-schema
+validation remain required before a future source pin.
 
 Post-window diagnosis (2026-08-31,
 `crates/agent-eval/evidence/m15-diagnosis-closure-gate/REPORT.md`)
@@ -254,8 +263,8 @@ The three historical valid-FAIL windows remain immutable
 `retry-pilot-cell-v4`; this schema advance adds stable pair/source identity,
 independent acceptance-domain revision/source identity and bounded
 model-request causal-audit fields. It does not reinterpret v3 verdicts.
-The three formal v4 windows are banked as valid FAILs (9/12 on `d1936d4`,
-10/12 on `a25a8a5`, 9/12 on `ab4534a`); no v4 window has passed. Each
+The four formal v4 windows are banked as valid FAILs (9/12 on `d1936d4`,
+10/12 on `a25a8a5`, 9/12 on `ab4534a`, 10/12 on `784d7aa`); no v4 window has passed. Each
 immutable cell directory
 contains the manifest, full event stream, `dimensions.json`, hidden oracle
 records and workspace snapshot hash. The dimensions are persisted facts, not
@@ -364,73 +373,31 @@ surface, reject a serving or close M15.
 
 ## 7. Next execution gate
 
-Before spending another 12-cell window:
+Before spending another 12-cell window, preserve all four valid FAILs and do
+not rerun the unchanged JSON-hardened source. A materially new candidate must:
 
-`BASELINE-01` closed 2026-08-30 on recorded source `1455795`: the four local
-commands pass and Ubuntu plus Windows CI are green on one complete run
-(Ubuntu runs the suite as two fresh-VM halves because the hosted runner
-terminates a single job near 48 minutes of wall time). This is a development
-checkpoint, not a milestone exit. Continue in this order:
-
-1. **done — recorded clean source and dual-platform CI** (`BASELINE-01`);
-2. retain the locally green completion/continuation/required-context,
-   criterion-receipt/failure-domain, real actor-order terminal, one-shot
-   RunStart/committed-prefix replay and strict provider matrices on that source;
-3. **done 2026-08-30** — `VERIFY-ROUTE-01` closed with the deterministic
-   verify-route gate, and the P1 items exercised by the selected
-   candidate/evidence path are closed on that evidence;
-4. **done 2026-08-30** — the bounded product preflight recorded the base
-   source on the production-aligned surface: TaskProgress on and settlement
-   off, all advisory candidates off, and the default product path never
-   builds/hashes a counterfactual second request (`diag=false`);
-5. only if the candidate enables settlement, run a separately frozen off/on
-   gate whose arms fork from one pre-exposure durable checkpoint and
-   byte-identical workspace, preserve opaque ids, use one explicit provider
-   protocol, and reject any difference beyond `project_settlement`. Do not
-   alpha-normalize independently minted identities. A settlement-off base does
-   not need this live pair;
-6. freeze and record the candidate plus acceptance-declaration identity under
-   the §5 cross-window rule;
-7. **done 2026-08-30** — the bounded one-cell exact-source/product preflight
-   ran without changing the serving tuple and with an explicit protocol
-   (never auto): `agent-eval --m15-preflight`, one `retry_policy_dev` normal
-   cell, PASS (behavior/diff pass, closure completed, provider healthy) on
-   the relay tuple (`http://127.0.0.1:8787/v1`, `deepseek-v4-flash`,
-   Responses, 16,384 max output tokens after a `provider-openai` wire-name
-   fix) — 23 model rounds / 35 tool calls, no retryable transport outcome.
-   Evidence under `crates/agent-eval/evidence/m15-preflight-relay/`;
-8. use the preflight-pinned tuple without fallback, record the exact clean
-   source identity, and set an explicit `OPENAI_API_PROTOCOL` — next before
-   the window;
-9. run exactly one uninterrupted, predeclared 12-cell v4 window with
-   `agent-eval --m15-window` and accept only its mechanically regenerated
-   report. It ran 2026-08-30 on `a25a8a5` and is a valid FAIL (10/12); the
-   relay candidate was then re-pinned by user decision to 32,768 max output
-   tokens, its preflight passed on the re-pinned tuple (commit `f32f22d`),
-   and the re-pinned window ran 2026-08-30 on `ab4534a` and is a valid FAIL
-   (9/12, malformed tool-call argument JSON on three cells). §5 rejects a
-   candidate on a valid FAIL without rerun; M15 remains open. By user
-   decision (2026-08-31) the route became a harness fix instead of a model
-   switch — the relay serves only v4Flash/v4Pro/grok-4.5 on Responses, Qwen
-   returns 401 "not supported for format openai", glm/kimi 501 — landing in
-   commit `41f06ad` (CI `33325617880` green): the default system prompt
-   requires every tool call argument to be one complete valid JSON value,
-   and the model-emitted `MalformedToolCall` became retryable in the eval's
-   buffering transport (request re-issued from scratch, bounded, rejected
-   stream never leaked, `MalformedEvent` stays non-retryable, interactive
-   hosts never replay). The exact-source preflight then passed on clean
-   HEAD `41f06ad` (digest `d4b4da3517f7a3e8...`, evidence
-   `crates/agent-eval/evidence/m15-preflight-relay-fix/`). That window
-   ran 2026-08-31 on the predeclared clean source `784d7aa` and is a
-   valid FAIL (10/12, mechanical report at
-   `crates/agent-eval/evidence/m15-window/_windows/1788115951355/`):
-   the malformed-argument failure mode did not recur (behavior 12/12,
-   provider healthy in every cell, no malformed outcome anywhere) and
-   the new retry path was exercised twice and passed both times, but
-   `retry_policy_dev normal r1` and `r2` exhausted the 48-round tool
-   budget with `task.complete` refused 3/3 and 5/5 — a model
-   task-execution failure, not a harness defect. §5 rejects the
-   candidate on the valid FAIL without rerun; M15 remains open.
+1. pass deterministic attempt-incident versus task-obligation tests, including
+   off-surface canonical/wire-name calls which remain visible but create no
+   completion debt;
+2. return a bounded, basis-bound resolver for every completion blocker and make
+   deferred safe-point refusal visible. If proof is the sole blocker, an
+   explicit completion intent may run at most one host-declared exact proof-
+   refresh transaction under an unchanged world fence;
+3. align product and eval format recovery: one independent malformed-tool
+   regeneration before any published text, persistent failure fail-closed,
+   and typed attempt/recovery metrics;
+4. pass a byte-bounded standards-correct SSE framer, strict Responses/Chat
+   per-call state machine and immutable-round schema validator before approval;
+5. retain the completion/continuation/context/replay/provider matrices and pass
+   fmt, Clippy, build, full workspace tests plus Ubuntu and Windows CI on one
+   newly recorded clean source;
+6. close or prove out-of-path selected P1 items. Only a settlement-enabled
+   candidate additionally needs the same-checkpoint off/on causal fork;
+7. freeze source, product switches, acceptance identity, surface and serving,
+   then pass one bounded exact-source product preflight with explicit protocol;
+8. only then predeclare and run at most one uninterrupted 12-cell v4 window.
+   Valid FAIL rejects that candidate; only typed `NOT_RUN` permits rerunning the
+   whole frozen window.
 
 300×3 scale, `recall_after_fix`, a 27-cell context expansion, a second context
 engine comparison and model comparison remain parked until this gate closes.

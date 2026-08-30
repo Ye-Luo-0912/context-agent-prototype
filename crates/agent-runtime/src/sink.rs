@@ -56,6 +56,13 @@ impl LiveSink {
 
 #[async_trait::async_trait]
 impl ModelEventSink for LiveSink {
+    fn creates_replay_barrier(&self, chunk: &ModelChunk) -> bool {
+        // Tool-call deltas are parsed internally and never reach subscribers;
+        // Done carries no content. A malformed tool call can therefore retry
+        // safely until a text delta has actually been published.
+        matches!(chunk, ModelChunk::TextDelta { .. })
+    }
+
     async fn on_chunk(&self, chunk: ModelChunk) -> AgentResult<()> {
         match chunk {
             ModelChunk::TextDelta { delta } => {

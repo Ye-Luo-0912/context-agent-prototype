@@ -68,9 +68,10 @@ pub enum AgentError {
     #[error("model error: {0}")]
     Model(String),
 
-    /// The provider's stream violated the selected model wire protocol. This
-    /// is a typed, non-retryable failure: accepting a partial response or
-    /// replaying it can duplicate already-published output.
+    /// The provider's stream violated the selected model wire protocol.
+    /// Adapters fail closed; policy may regenerate a malformed tool-call body
+    /// only under a separate bounded format budget and only before the sink's
+    /// replay boundary. Damaged wire events are never regenerated.
     #[error("model protocol error ({kind}): {message}")]
     ModelProtocol {
         kind: ModelProtocolErrorKind,

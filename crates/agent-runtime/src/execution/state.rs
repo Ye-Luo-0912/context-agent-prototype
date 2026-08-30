@@ -1154,6 +1154,7 @@ impl ExecutionState {
                     failure.attempts, failure.reason
                 )
             }),
+            completion_repair: None,
             operational_evidence: self.evidence_rows(),
             unresolved_blockers: self.obligation_warnings(),
             stall_warning: self.stall_warning(),

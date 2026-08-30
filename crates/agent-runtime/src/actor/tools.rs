@@ -1241,6 +1241,7 @@ impl RuntimeActor {
                         other => self.execute_directive(other).await,
                     }
                 }
+                let disposition = settled_tool_disposition(&output, completion.disposition);
                 if output.ok
                     && matches!(
                         output.tool_name.as_str(),
@@ -1271,7 +1272,7 @@ impl RuntimeActor {
                     turn.turn_frame.push_tool_result_with(
                         output.clone(),
                         op_scope_id,
-                        completion.disposition,
+                        disposition,
                         facts,
                     );
                     // Exactly-once close scheduling: this result's frame is
@@ -1283,7 +1284,7 @@ impl RuntimeActor {
                 }
                 self.record_action_result(
                     &output,
-                    completion.disposition,
+                    disposition,
                     ActionDispatch::Spawned,
                     settled_attribution
                         .as_ref()
@@ -1293,7 +1294,7 @@ impl RuntimeActor {
                 let facts = self.services.tools().execution_facts(&output);
                 let frontier = self.observe_persistable_tool(
                     &output,
-                    completion.disposition,
+                    disposition,
                     completion
                         .argument_digest
                         .as_ref()

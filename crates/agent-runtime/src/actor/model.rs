@@ -1,5 +1,7 @@
 use super::*;
 
+const COMPLETION_REPAIR_VIEW_CHARS: usize = 768;
+
 fn is_required_context_body(materialized: &MaterializedContext, item: &MaterializedItem) -> bool {
     item.retention == ContextRetention::Pinned
         || materialized.required_item_ids.contains(&item.item_id)
@@ -88,6 +90,22 @@ fn settlement_packing_requires_counterfactual(
     diagnostics: bool,
 ) -> bool {
     candidate && diagnostics && !project_settlement
+}
+
+fn latest_completion_gate_was_refused(frame: &TurnFrame) -> bool {
+    frame.steps.iter().rev().find_map(|step| {
+        let TurnFrameStep::ToolResult { output, .. } = step else {
+            return None;
+        };
+        (output.tool_name == "task.complete").then(|| {
+            !output.ok
+                && output
+                    .metadata
+                    .get("refused")
+                    .and_then(|value| value.as_str())
+                    == Some("completion_gate")
+        })
+    }) == Some(true)
 }
 
 fn model_request_metadata(
@@ -248,6 +266,17 @@ impl RuntimeActor {
             .filter(|intent| !intent.is_empty());
         let completion_requested =
             turn_intent.is_some_and(crate::execution::ExecutionState::turn_requests_complete);
+        let completion_repair_due = self
+            .state
+            .turn
+            .as_ref()
+            .is_some_and(|turn| latest_completion_gate_was_refused(&turn.turn_frame));
+        let completion_repair_readiness = completion_repair_due
+            .then(|| self.completion_readiness(CompletionIntent::ModelProposal, None));
+        let completion_repair_blockers = completion_repair_readiness
+            .as_ref()
+            .map(CompletionReadiness::applicable_blockers)
+            .unwrap_or_default();
         let has_failures = snapshot
             .as_ref()
             .map(|snap| snap.needs.unresolved_failure)
@@ -265,12 +294,82 @@ impl RuntimeActor {
         // in the v5 catalog: this requirement only prefers it on the
         // surface when the current directive explicitly requests closure,
         // so ordinary work does not accidentally erase task affinity.
-        if completion_requested {
+        if completion_requested && !completion_repair_due {
             requirements.push(ToolSurfaceRequirement {
                 tool_name: "task.complete".into(),
                 demand: ToolSurfaceDemand::PreferSurface,
                 reason: "current user directive explicitly requests task closure".into(),
             });
+        }
+        // A refused completion starts a bounded repair episode. Re-derive the
+        // current stage every decision and prefer only its resolver; a repair
+        // helper may never abort the round if loading or packing it fails.
+        if completion_repair_due
+            && !completion_repair_blockers
+                .iter()
+                .any(|blocker| blocker.requires_operator_repair())
+        {
+            let catalog = self.services.tool_catalog();
+            let progress_blocked = completion_repair_blockers.iter().any(|blocker| {
+                matches!(
+                    blocker,
+                    CompletionBlocker::OpenLoops { .. } | CompletionBlocker::NextActionPending
+                )
+            });
+            let execution_blocked = completion_repair_blockers.iter().any(|blocker| {
+                matches!(
+                    blocker,
+                    CompletionBlocker::ExecutionObligations { .. }
+                        | CompletionBlocker::FailedCommands { .. }
+                )
+            });
+            let proof_blocked = completion_repair_blockers.iter().any(|blocker| {
+                matches!(
+                    blocker,
+                    CompletionBlocker::VerificationNotCurrent
+                        | CompletionBlocker::AcceptanceUncovered { .. }
+                )
+            });
+            let resolver = if progress_blocked {
+                Some((
+                    "task.manage",
+                    "completion repair: update only resolved open loops/next action",
+                ))
+            } else if execution_blocked {
+                None // obligation source tools are already rooted by ExecutionState
+            } else if proof_blocked
+                && completion_repair_readiness
+                    .as_ref()
+                    .and_then(|readiness| self.current_completion_proof_route(readiness))
+                    .is_some()
+            {
+                Some((
+                    "verify.run",
+                    "completion repair: refresh the exact host verifier after workspace calls",
+                ))
+            } else {
+                None
+            };
+            if let Some((tool_name, reason)) = resolver
+                && catalog.iter().any(|entry| entry.name == tool_name)
+            {
+                requirements.push(ToolSurfaceRequirement {
+                    tool_name: tool_name.into(),
+                    demand: ToolSurfaceDemand::PreferSurface,
+                    reason: reason.into(),
+                });
+            }
+            if !progress_blocked
+                && !execution_blocked
+                && !proof_blocked
+                && completion_repair_blockers.is_empty()
+            {
+                requirements.push(ToolSurfaceRequirement {
+                    tool_name: "task.complete".into(),
+                    demand: ToolSurfaceDemand::PreferSurface,
+                    reason: "completion repair: current blockers are resolved".into(),
+                });
+            }
         }
         // LONG-TASK advisory (Slice C, default off): while a derived
         // completion-opportunity lease is outstanding, this ONE decision
@@ -1548,6 +1647,17 @@ impl RuntimeActor {
         } else {
             None
         };
+        if let Some(progress) = progress.as_mut().filter(|_| {
+            self.state
+                .turn
+                .as_ref()
+                .is_some_and(|turn| latest_completion_gate_was_refused(&turn.turn_frame))
+        }) {
+            let readiness = self.completion_readiness(CompletionIntent::ModelProposal, None);
+            let (_, rendered) = self.completion_repair_plan(&readiness);
+            progress.completion_repair =
+                Some(bounded_preview(&rendered, COMPLETION_REPAIR_VIEW_CHARS));
+        }
         // LONG-TASK advisory (Slice C, default off): project the bounded
         // closure statement only while the one-decision lease is live.
         if let Some(progress) = progress.as_mut().filter(|_| {
@@ -1599,6 +1709,51 @@ mod failure_class_tests {
             file_path: None,
             file_revision: None,
         }
+    }
+
+    fn completion_result(ok: bool, refused: Option<&str>) -> ToolOutput {
+        ToolOutput {
+            call_id: "completion-call".into(),
+            tool_name: "task.complete".into(),
+            ok,
+            summary: "completion".into(),
+            model_content: "completion".into(),
+            artifact_ref: None,
+            metadata: refused
+                .map(|refused| serde_json::json!({"refused": refused}))
+                .unwrap_or_else(|| serde_json::json!({"accepted": true})),
+        }
+    }
+
+    #[test]
+    fn only_the_latest_completion_result_arms_repair() {
+        let mut frame = TurnFrame::new("task");
+        frame.push_tool_result(
+            completion_result(false, Some("completion_gate")),
+            None,
+            agent_contracts::ToolExecutionFacts::default(),
+        );
+        assert!(latest_completion_gate_was_refused(&frame));
+
+        let mut repair_action = completion_result(true, None);
+        repair_action.tool_name = "task.manage".into();
+        repair_action.metadata = serde_json::json!({});
+        frame.push_tool_result(
+            repair_action,
+            None,
+            agent_contracts::ToolExecutionFacts::default(),
+        );
+        assert!(
+            latest_completion_gate_was_refused(&frame),
+            "repair stays derived from the latest completion result until completion is proposed again"
+        );
+
+        frame.push_tool_result(
+            completion_result(true, None),
+            None,
+            agent_contracts::ToolExecutionFacts::default(),
+        );
+        assert!(!latest_completion_gate_was_refused(&frame));
     }
 
     #[test]

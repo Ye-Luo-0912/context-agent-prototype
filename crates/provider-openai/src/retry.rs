@@ -28,6 +28,10 @@ use async_trait::async_trait;
 
 const DEFAULT_MAX_RETRY_DELAY: Duration = Duration::from_secs(60);
 const MAX_BUFFERED_STREAM_CHUNKS: usize = 16_384;
+/// A malformed tool-call body is a model-format incident, not an outage.
+/// Permit one immediate regeneration, then surface persistent failure instead
+/// of spending the transport retry budget and exponential backoff.
+const MAX_TOOL_FORMAT_ATTEMPTS: u32 = 2;
 type JitterFn = dyn Fn(Duration, u32) -> Duration + Send + Sync;
 
 struct RetrySchedule {
@@ -95,23 +99,109 @@ fn default_jitter(delay: Duration, retry_number: u32) -> Duration {
         .min(delay)
 }
 
-fn retryable(error: &AgentError) -> bool {
-    matches!(
-        error,
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RetryClass {
+    Transport,
+    ToolCallFormat,
+}
+
+fn retry_class(error: &AgentError) -> Option<RetryClass> {
+    match error {
         AgentError::Transport {
-            retryable: true,
+            retryable: true, ..
+        }
+        | AgentError::TransportRetryAfter { .. } => Some(RetryClass::Transport),
+        AgentError::ModelProtocol {
+            kind: ModelProtocolErrorKind::MalformedToolCall,
             ..
-        } | AgentError::TransportRetryAfter { .. }
-            | AgentError::ModelProtocol {
-                kind: ModelProtocolErrorKind::MalformedToolCall,
-                ..
-            }
-    )
+        } => Some(RetryClass::ToolCallFormat),
+        _ => None,
+    }
+}
+
+#[cfg(test)]
+fn retryable(error: &AgentError) -> bool {
+    retry_class(error).is_some()
+}
+
+fn retry_attempt_limit(class: RetryClass, configured: u32) -> u32 {
+    match class {
+        RetryClass::Transport => configured.max(1),
+        RetryClass::ToolCallFormat => configured.clamp(1, MAX_TOOL_FORMAT_ATTEMPTS),
+    }
+}
+
+/// Independent retry credits with one aggregate ceiling. A format incident
+/// cannot consume transport recovery (or vice versa), while alternating
+/// failures still cannot create an unbounded call loop.
+#[derive(Debug, Clone, Copy)]
+struct RetryBudget {
+    attempts: u32,
+    transport_failures: u32,
+    format_failures: u32,
+    transport_attempt_limit: u32,
+    format_attempt_limit: u32,
+    total_attempt_limit: u32,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct RetryReservation {
+    next_attempt: u32,
+    total_attempt_limit: u32,
+    class_retry_number: u32,
+}
+
+impl RetryBudget {
+    fn new(configured: u32) -> Self {
+        let transport_attempt_limit = retry_attempt_limit(RetryClass::Transport, configured);
+        let format_attempt_limit = retry_attempt_limit(RetryClass::ToolCallFormat, configured);
+        Self {
+            attempts: 1,
+            transport_failures: 0,
+            format_failures: 0,
+            transport_attempt_limit,
+            format_attempt_limit,
+            total_attempt_limit: transport_attempt_limit
+                .saturating_add(format_attempt_limit.saturating_sub(1)),
+        }
+    }
+
+    fn reserve_retry(&mut self, class: RetryClass) -> Option<RetryReservation> {
+        let (failures, attempt_limit) = match class {
+            RetryClass::Transport => (&mut self.transport_failures, self.transport_attempt_limit),
+            RetryClass::ToolCallFormat => (&mut self.format_failures, self.format_attempt_limit),
+        };
+        *failures = failures.saturating_add(1);
+        let class_retry_number = *failures;
+        if class_retry_number >= attempt_limit || self.attempts >= self.total_attempt_limit {
+            return None;
+        }
+        self.attempts = self.attempts.saturating_add(1);
+        Some(RetryReservation {
+            next_attempt: self.attempts,
+            total_attempt_limit: self.total_attempt_limit,
+            class_retry_number,
+        })
+    }
+}
+
+fn retry_delay(
+    class: RetryClass,
+    schedule: &RetrySchedule,
+    attempt: u32,
+    error: &AgentError,
+) -> Duration {
+    match class {
+        RetryClass::Transport => schedule.delay(attempt, error),
+        RetryClass::ToolCallFormat => Duration::ZERO,
+    }
 }
 
 /// Short diagnostic label for the retry log line. Retries are real but
 /// infrequent; the reason is otherwise swallowed by the retry loop, so it
 /// is written to stderr (the eval harness redirects it into the run log).
+/// Provider error bodies are deliberately omitted: durable typed evidence is
+/// the destination, and intermediate bodies may contain sensitive data.
 fn retry_reason_label(error: &AgentError) -> &'static str {
     match error {
         AgentError::ModelProtocol {
@@ -128,7 +218,7 @@ fn retry_reason_label(error: &AgentError) -> &'static str {
 
 fn log_retry(attempt_next: u32, max_attempts: u32, delay_ms: u64, error: &AgentError) {
     eprintln!(
-        "[provider-openai] retrying model call: reason={} attempt={}/{} delay={}ms error={error}",
+        "[provider-openai] retrying model call: reason={} attempt={}/{} delay={}ms",
         retry_reason_label(error),
         attempt_next,
         max_attempts,
@@ -149,6 +239,10 @@ pub struct RetryingTransport<T: ModelTransport> {
 }
 
 impl<T: ModelTransport> RetryingTransport<T> {
+    /// `max_attempts` is the transport-attempt ceiling. When it permits
+    /// retries, one independent malformed-tool regeneration credit may raise
+    /// the aggregate call ceiling to `max_attempts + 1`; the mixed budget is
+    /// still hard-bounded and each class keeps its own credit.
     pub fn new(inner: T, max_attempts: u32, base_delay: Duration) -> Self {
         Self {
             inner,
@@ -206,11 +300,12 @@ impl ModelEventSink for EmissionTrackingSink<'_> {
 
     async fn on_chunk(&self, chunk: ModelChunk) -> AgentResult<()> {
         let creates_barrier = self.inner.creates_replay_barrier(&chunk);
-        self.inner.on_chunk(chunk).await?;
         if creates_barrier {
+            // Fail closed before arbitrary sink code: a sink may publish and
+            // then return an error, which is already irreversible.
             self.emitted.store(true, Ordering::Relaxed);
         }
-        Ok(())
+        self.inner.on_chunk(chunk).await
     }
 }
 
@@ -254,7 +349,7 @@ impl<T: ModelTransport> RetryingTransport<T> {
         sink: &dyn ModelEventSink,
     ) -> AgentResult<ModelOutput> {
         let emitted = AtomicBool::new(false);
-        let mut attempt = 0u32;
+        let mut budget = RetryBudget::new(self.max_attempts);
         loop {
             let tracking = EmissionTrackingSink {
                 inner: sink,
@@ -262,29 +357,36 @@ impl<T: ModelTransport> RetryingTransport<T> {
             };
             match self.inner.complete_stream(request.clone(), &tracking).await {
                 Ok(mut output) => {
-                    stamp_attempt_usage(&mut output, attempt.saturating_add(1));
+                    stamp_attempt_usage(&mut output, budget.attempts);
                     return Ok(output);
                 }
                 Err(error) => {
-                    if attempt.saturating_add(1) >= self.max_attempts
-                        || !retryable(&error)
-                        || emitted.load(Ordering::Relaxed)
-                    {
+                    let Some(class) = retry_class(&error) else {
+                        return Err(error);
+                    };
+                    if emitted.load(Ordering::Relaxed) {
                         // A stream that already emitted deltas cannot be
                         // replayed into the same sink: the live listener has
                         // no rewind, and a retry would duplicate the output.
                         return Err(error);
                     }
-                    attempt = attempt.saturating_add(1);
-                    let delay = self.schedule.delay(attempt, &error);
+                    let Some(reservation) = budget.reserve_retry(class) else {
+                        return Err(error);
+                    };
+                    let delay = retry_delay(
+                        class,
+                        &self.schedule,
+                        reservation.class_retry_number,
+                        &error,
+                    );
                     log_retry(
-                        attempt.saturating_add(1),
-                        self.max_attempts,
+                        reservation.next_attempt,
+                        reservation.total_attempt_limit,
                         delay.as_millis().min(u64::MAX as u128) as u64,
                         &error,
                     );
                     sink.on_chunk(ModelChunk::Retrying {
-                        attempt: attempt.saturating_add(1),
+                        attempt: reservation.next_attempt,
                         delay_ms: delay.as_millis().min(u64::MAX as u128) as u64,
                     })
                     .await?;
@@ -305,7 +407,7 @@ impl<T: ModelTransport> RetryingTransport<T> {
         request: ModelRequest,
         sink: &dyn ModelEventSink,
     ) -> AgentResult<ModelOutput> {
-        let mut attempt = 0u32;
+        let mut budget = RetryBudget::new(self.max_attempts);
         loop {
             let collected = BufferedSink::default();
             match self
@@ -317,23 +419,30 @@ impl<T: ModelTransport> RetryingTransport<T> {
                     for chunk in collected.take()? {
                         sink.on_chunk(chunk).await?;
                     }
-                    stamp_attempt_usage(&mut output, attempt.saturating_add(1));
+                    stamp_attempt_usage(&mut output, budget.attempts);
                     return Ok(output);
                 }
                 Err(error) => {
-                    if attempt.saturating_add(1) >= self.max_attempts || !retryable(&error) {
+                    let Some(class) = retry_class(&error) else {
                         return Err(error);
-                    }
-                    attempt = attempt.saturating_add(1);
-                    let delay = self.schedule.delay(attempt, &error);
+                    };
+                    let Some(reservation) = budget.reserve_retry(class) else {
+                        return Err(error);
+                    };
+                    let delay = retry_delay(
+                        class,
+                        &self.schedule,
+                        reservation.class_retry_number,
+                        &error,
+                    );
                     log_retry(
-                        attempt.saturating_add(1),
-                        self.max_attempts,
+                        reservation.next_attempt,
+                        reservation.total_attempt_limit,
                         delay.as_millis().min(u64::MAX as u128) as u64,
                         &error,
                     );
                     sink.on_chunk(ModelChunk::Retrying {
-                        attempt: attempt.saturating_add(1),
+                        attempt: reservation.next_attempt,
                         delay_ms: delay.as_millis().min(u64::MAX as u128) as u64,
                     })
                     .await?;
@@ -450,19 +559,21 @@ where
     F: FnMut() -> Fut,
     Fut: std::future::Future<Output = AgentResult<T>>,
 {
-    let mut attempt = 0u32;
+    let mut budget = RetryBudget::new(max_attempts);
     loop {
         match op().await {
-            Ok(value) => return Ok((value, attempt.saturating_add(1))),
+            Ok(value) => return Ok((value, budget.attempts)),
             Err(error) => {
-                if attempt.saturating_add(1) >= max_attempts || !retryable(&error) {
+                let Some(class) = retry_class(&error) else {
                     return Err(error);
-                }
-                attempt = attempt.saturating_add(1);
-                let delay = schedule.delay(attempt, &error);
+                };
+                let Some(reservation) = budget.reserve_retry(class) else {
+                    return Err(error);
+                };
+                let delay = retry_delay(class, schedule, reservation.class_retry_number, &error);
                 log_retry(
-                    attempt.saturating_add(1),
-                    max_attempts,
+                    reservation.next_attempt,
+                    reservation.total_attempt_limit,
                     delay.as_millis().min(u64::MAX as u128) as u64,
                     &error,
                 );
@@ -528,6 +639,24 @@ mod tests {
         async fn on_chunk(&self, chunk: ModelChunk) -> AgentResult<()> {
             self.chunks.lock().unwrap().push(chunk);
             Ok(())
+        }
+    }
+
+    /// Simulates a custom sink that publishes before discovering its own
+    /// retryable delivery failure. Replay must still fail closed.
+    #[derive(Debug, Default)]
+    struct PublishesThenFailsSink {
+        chunks: std::sync::Mutex<Vec<ModelChunk>>,
+    }
+
+    #[async_trait]
+    impl ModelEventSink for PublishesThenFailsSink {
+        async fn on_chunk(&self, chunk: ModelChunk) -> AgentResult<()> {
+            self.chunks.lock().unwrap().push(chunk);
+            Err(AgentError::Transport {
+                retryable: true,
+                message: "sink failed after publish".into(),
+            })
         }
     }
 
@@ -978,7 +1107,7 @@ mod tests {
             chunk,
             ModelChunk::Retrying {
                 attempt: 2,
-                delay_ms: 1
+                delay_ms: 0
             }
         )));
         assert!(chunks.contains(&ModelChunk::Done));
@@ -1021,6 +1150,31 @@ mod tests {
             1,
             "the listener sees exactly the first attempt's truncated delta"
         );
+    }
+
+    #[tokio::test]
+    async fn sink_that_fails_after_publication_cannot_be_replayed() {
+        let calls = Arc::new(AtomicU32::new(0));
+        let inner = EmitsThenFails {
+            calls: calls.clone(),
+            retryable: true,
+        };
+        let transport = RetryingTransport::new(inner, 3, Duration::from_millis(1));
+        let sink = PublishesThenFailsSink::default();
+
+        let error = transport
+            .complete_stream(request(), &sink)
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            AgentError::Transport {
+                retryable: true,
+                ..
+            }
+        ));
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert_eq!(sink.chunks.lock().unwrap().len(), 1);
     }
 
     #[tokio::test]
@@ -1153,6 +1307,83 @@ mod tests {
             !retryable(&wire_damage),
             "wire/protocol damage stays non-retryable"
         );
+        let class = retry_class(&malformed_call).expect("format class");
+        assert_eq!(class, RetryClass::ToolCallFormat);
+        assert_eq!(retry_attempt_limit(class, 6), 2);
+        assert_eq!(
+            retry_delay(
+                class,
+                &RetrySchedule::new(Duration::from_secs(2)),
+                1,
+                &malformed_call,
+            ),
+            Duration::ZERO,
+            "format regeneration does not use outage backoff"
+        );
+    }
+
+    #[test]
+    fn transport_and_format_retries_have_independent_bounded_credits() {
+        let mut budget = RetryBudget::new(3);
+        assert_eq!(
+            budget.reserve_retry(RetryClass::ToolCallFormat),
+            Some(RetryReservation {
+                next_attempt: 2,
+                total_attempt_limit: 4,
+                class_retry_number: 1,
+            })
+        );
+        assert_eq!(
+            budget.reserve_retry(RetryClass::Transport),
+            Some(RetryReservation {
+                next_attempt: 3,
+                total_attempt_limit: 4,
+                class_retry_number: 1,
+            })
+        );
+        assert_eq!(
+            budget.reserve_retry(RetryClass::Transport),
+            Some(RetryReservation {
+                next_attempt: 4,
+                total_attempt_limit: 4,
+                class_retry_number: 2,
+            })
+        );
+        assert_eq!(budget.reserve_retry(RetryClass::Transport), None);
+
+        let mut reverse = RetryBudget::new(3);
+        assert!(reverse.reserve_retry(RetryClass::Transport).is_some());
+        assert!(reverse.reserve_retry(RetryClass::ToolCallFormat).is_some());
+        assert_eq!(reverse.format_failures, 1);
+        assert_eq!(reverse.transport_failures, 1);
+    }
+
+    #[tokio::test]
+    async fn persistent_malformed_arguments_spend_only_one_regeneration() {
+        let calls = Arc::new(AtomicU32::new(0));
+        let schedule = RetrySchedule::new(Duration::from_secs(2));
+        let cancel = CancellationToken::new();
+
+        let error = retry(6, &schedule, &cancel, || {
+            calls.fetch_add(1, Ordering::SeqCst);
+            async {
+                Err::<(), _>(AgentError::ModelProtocol {
+                    kind: ModelProtocolErrorKind::MalformedToolCall,
+                    message: "EOF while parsing tool arguments".into(),
+                })
+            }
+        })
+        .await
+        .unwrap_err();
+
+        assert!(matches!(
+            error,
+            AgentError::ModelProtocol {
+                kind: ModelProtocolErrorKind::MalformedToolCall,
+                ..
+            }
+        ));
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
     }
 
     #[tokio::test]

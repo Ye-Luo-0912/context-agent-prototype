@@ -54,6 +54,12 @@ fn off_surface_rejection_uses_only_the_captured_omission_reason() {
     assert!(message.contains("provider input budget"));
     assert!(!message.contains("capability.manage"));
     assert!(!message.contains("load"));
+    let output = surface_unavailable_output(&call("optional.large"), message);
+    assert_eq!(
+        output.failure_class(),
+        Some(agent_contracts::ToolFailureClass::SurfaceUnavailable)
+    );
+    assert_eq!(output.metadata["executed"], false);
 }
 
 #[test]
