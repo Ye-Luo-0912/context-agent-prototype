@@ -10,10 +10,9 @@
 //! yields to the request's cancellation token, so a cancelled request
 //! aborts instead of sleeping out the wait.
 //!
-//! Streaming is retryable only while nothing has reached the sink: a stream
-//! that already emitted deltas cannot be replayed into the same sink, and a
-//! retry would duplicate the live output. The wrapper tracks emission and
-//! surfaces the error instead of retrying in that case.
+//! Streaming is retryable only while no chunk has crossed the sink's explicit
+//! replay barrier. A sink may consume protocol-internal tool-call deltas
+//! without publishing them; text already shown to a user remains irreversible.
 
 use std::sync::{
     Arc,
@@ -110,6 +109,33 @@ fn retryable(error: &AgentError) -> bool {
     )
 }
 
+/// Short diagnostic label for the retry log line. Retries are real but
+/// infrequent; the reason is otherwise swallowed by the retry loop, so it
+/// is written to stderr (the eval harness redirects it into the run log).
+fn retry_reason_label(error: &AgentError) -> &'static str {
+    match error {
+        AgentError::ModelProtocol {
+            kind: ModelProtocolErrorKind::MalformedToolCall,
+            ..
+        } => "malformed tool-call JSON",
+        AgentError::TransportRetryAfter { .. }
+        | AgentError::Transport {
+            retryable: true, ..
+        } => "retryable transport error",
+        _ => "unexpected retryable error",
+    }
+}
+
+fn log_retry(attempt_next: u32, max_attempts: u32, delay_ms: u64, error: &AgentError) {
+    eprintln!(
+        "[provider-openai] retrying model call: reason={} attempt={}/{} delay={}ms error={error}",
+        retry_reason_label(error),
+        attempt_next,
+        max_attempts,
+        delay_ms,
+    );
+}
+
 pub struct RetryingTransport<T: ModelTransport> {
     inner: T,
     max_attempts: u32,
@@ -164,8 +190,9 @@ impl<T: ModelTransport> RetryingTransport<T> {
     }
 }
 
-/// Forwards chunks and records whether anything reached the sink, so the
-/// retry wrapper can refuse to replay a stream that already produced output.
+/// Forwards chunks and records whether any successfully delivered chunk crossed
+/// the sink's replay barrier. The sink, not the provider adapter, knows which
+/// normalized chunks actually became externally visible.
 struct EmissionTrackingSink<'a> {
     inner: &'a dyn ModelEventSink,
     emitted: &'a AtomicBool,
@@ -173,9 +200,17 @@ struct EmissionTrackingSink<'a> {
 
 #[async_trait]
 impl ModelEventSink for EmissionTrackingSink<'_> {
+    fn creates_replay_barrier(&self, chunk: &ModelChunk) -> bool {
+        self.inner.creates_replay_barrier(chunk)
+    }
+
     async fn on_chunk(&self, chunk: ModelChunk) -> AgentResult<()> {
-        self.emitted.store(true, Ordering::Relaxed);
-        self.inner.on_chunk(chunk).await
+        let creates_barrier = self.inner.creates_replay_barrier(&chunk);
+        self.inner.on_chunk(chunk).await?;
+        if creates_barrier {
+            self.emitted.store(true, Ordering::Relaxed);
+        }
+        Ok(())
     }
 }
 
@@ -209,9 +244,10 @@ impl<T: ModelTransport> ModelTransport for RetryingTransport<T> {
 }
 
 impl<T: ModelTransport> RetryingTransport<T> {
-    /// Live mode: forward chunks as they arrive; a retryable failure after
-    /// anything was emitted cannot be replayed into the same sink, so it is
-    /// surfaced instead of retried.
+    /// Live mode: forward chunks as they arrive; a retryable failure after an
+    /// irreversible chunk cannot be replayed into the same sink, so it is
+    /// surfaced instead of retried. Protocol-internal chunks may remain below
+    /// that boundary when the sink explicitly says so.
     async fn complete_stream_live(
         &self,
         request: ModelRequest,
@@ -241,6 +277,12 @@ impl<T: ModelTransport> RetryingTransport<T> {
                     }
                     attempt = attempt.saturating_add(1);
                     let delay = self.schedule.delay(attempt, &error);
+                    log_retry(
+                        attempt.saturating_add(1),
+                        self.max_attempts,
+                        delay.as_millis().min(u64::MAX as u128) as u64,
+                        &error,
+                    );
                     sink.on_chunk(ModelChunk::Retrying {
                         attempt: attempt.saturating_add(1),
                         delay_ms: delay.as_millis().min(u64::MAX as u128) as u64,
@@ -284,6 +326,12 @@ impl<T: ModelTransport> RetryingTransport<T> {
                     }
                     attempt = attempt.saturating_add(1);
                     let delay = self.schedule.delay(attempt, &error);
+                    log_retry(
+                        attempt.saturating_add(1),
+                        self.max_attempts,
+                        delay.as_millis().min(u64::MAX as u128) as u64,
+                        &error,
+                    );
                     sink.on_chunk(ModelChunk::Retrying {
                         attempt: attempt.saturating_add(1),
                         delay_ms: delay.as_millis().min(u64::MAX as u128) as u64,
@@ -412,6 +460,12 @@ where
                 }
                 attempt = attempt.saturating_add(1);
                 let delay = schedule.delay(attempt, &error);
+                log_retry(
+                    attempt.saturating_add(1),
+                    max_attempts,
+                    delay.as_millis().min(u64::MAX as u128) as u64,
+                    &error,
+                );
                 tokio::select! {
                     _ = cancel.cancelled() => return Err(AgentError::Cancelled),
                     _ = tokio::time::sleep(delay) => {}
@@ -431,6 +485,28 @@ mod tests {
         atomic::{AtomicU32, Ordering},
     };
 
+    #[test]
+    fn retry_reason_label_names_the_retried_kind() {
+        assert_eq!(
+            retry_reason_label(&AgentError::ModelProtocol {
+                kind: ModelProtocolErrorKind::MalformedToolCall,
+                message: "arguments ended early".into(),
+            }),
+            "malformed tool-call JSON"
+        );
+        assert_eq!(
+            retry_reason_label(&AgentError::Transport {
+                retryable: true,
+                message: "connection reset".into(),
+            }),
+            "retryable transport error"
+        );
+        assert_eq!(
+            retry_reason_label(&AgentError::InvalidRequest("boot".into())),
+            "unexpected retryable error"
+        );
+    }
+
     fn request() -> ModelRequest {
         ModelRequest {
             messages: Vec::new(),
@@ -449,6 +525,25 @@ mod tests {
 
     #[async_trait]
     impl ModelEventSink for RecordingSink {
+        async fn on_chunk(&self, chunk: ModelChunk) -> AgentResult<()> {
+            self.chunks.lock().unwrap().push(chunk);
+            Ok(())
+        }
+    }
+
+    /// Mirrors the product sink: tool-call deltas are consumed internally and
+    /// only text creates an externally visible replay boundary.
+    #[derive(Debug, Default)]
+    struct InternalToolDeltaSink {
+        chunks: std::sync::Mutex<Vec<ModelChunk>>,
+    }
+
+    #[async_trait]
+    impl ModelEventSink for InternalToolDeltaSink {
+        fn creates_replay_barrier(&self, chunk: &ModelChunk) -> bool {
+            matches!(chunk, ModelChunk::TextDelta { .. })
+        }
+
         async fn on_chunk(&self, chunk: ModelChunk) -> AgentResult<()> {
             self.chunks.lock().unwrap().push(chunk);
             Ok(())
@@ -859,6 +954,33 @@ mod tests {
                 .any(|chunk| matches!(chunk, ModelChunk::ToolCallDelta { .. })),
             "the rejected attempt's deltas must not reach the sink"
         );
+        assert!(chunks.contains(&ModelChunk::Done));
+    }
+
+    #[tokio::test]
+    async fn live_mode_retries_malformed_internal_tool_deltas_before_publication() {
+        let calls = Arc::new(AtomicU32::new(0));
+        let inner = EmitsThenMalformedCall {
+            calls: calls.clone(),
+        };
+        let transport = RetryingTransport::new(inner, 3, Duration::from_millis(1))
+            .with_jitter(|delay, _| delay);
+        let sink = InternalToolDeltaSink::default();
+
+        let output = transport.complete_stream(request(), &sink).await.unwrap();
+
+        assert_eq!(output.tool_calls.len(), 1);
+        assert_eq!(output.usage.attempts, 2);
+        assert_eq!(output.usage.retries, 1);
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+        let chunks = sink.chunks.lock().unwrap();
+        assert!(chunks.iter().any(|chunk| matches!(
+            chunk,
+            ModelChunk::Retrying {
+                attempt: 2,
+                delay_ms: 1
+            }
+        )));
         assert!(chunks.contains(&ModelChunk::Done));
     }
 

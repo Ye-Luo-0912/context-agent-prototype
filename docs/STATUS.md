@@ -259,6 +259,16 @@ and sandbox contracts live elsewhere. Experiment facts live in
   tools loaded before first use, a current `verify.run` as the final
   action. Any harness-visible candidate fix requires deterministic
   gates plus an exact-source preflight and a fresh predeclared window.
+- POST-fix observation upgrade (2026-08-31): `provider-openai` retry
+  loops no longer swallow the first-attempt error. All three retry paths
+  (non-streaming `retry()`, live streaming, buffered streaming) write one
+  stderr line on each retry with the reason class
+  (`malformed tool-call JSON` / `retryable transport error`), attempt,
+  delay and the full error; the eval harness redirects stderr into the
+  run log, so a future window/preflight will record exactly which error
+  kind triggered each retry. Pure observability: retry decisions, backoff
+  and sink behavior are unchanged; the reason-label helper has a unit
+  test. No window or preflight is rerun on this change.
 - M15 remains open. Its shape remains 3 fixtures × normal/resume × 2 repeats =
   12 cells. Historical v3 FAIL windows remain immutable; the four v4 windows
   (valid FAILs 9/12 on `d1936d4`, 10/12 on `a25a8a5`, 9/12 on `ab4534a`,
