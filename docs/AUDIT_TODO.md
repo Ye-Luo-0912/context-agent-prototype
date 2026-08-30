@@ -27,9 +27,13 @@ section wins. Raw reports and checker verdicts remain immutable.
 Evidence interpretation:
 
 - the audited `ea8deef` source was not green: `cargo fmt --all -- --check`
-  failed and both CI jobs stopped at formatting. The current uncommitted
-  candidate is locally green, but is not yet a recorded clean source and has no
-  Ubuntu/Windows CI result;
+  failed and both CI jobs stopped at formatting. The merged audit landed as
+  recorded source `a3bd23f`; twelve `BASELINE-01` follow-up commits repair
+  every formatting/CI/live-settlement regression exposed since. Local four
+  commands are green on the final tree, Windows CI is repeatedly green, and
+  Ubuntu CI runs the complete suite with zero test-level failures — its
+  remaining exit is the ~48-minute hosted-runner loss-of-communication
+  termination described under BASELINE-01, not a test result;
 - the 2026-08-29 convergence report remains a **mechanical FAIL**, but it is
   **causally INVALID/CONFOUNDED** for settlement effectiveness. Its arm switch
   removed the whole `TaskProgress` projection and also changed checked-file GC
@@ -45,18 +49,19 @@ Evidence interpretation:
   baseline and selected-path P0 items below are closed. A settlement-changing
   candidate includes the live causal-fork exit; a settlement-off base does not.
 
-**Working-tree implementation checkpoint (2026-08-30; not an evidence
-source).** The uncommitted tree based on `ea8deef` now contains candidate
-implementations for the unified completion join, continuation epoch,
-criterion receipts and host coverage-declaration identity, domain-scoped
-failure matching with fail-closed overflow, required-context misses,
-prospective terminal checkpoints, explicit commit barriers, committed-prefix
-replay, a one-shot startup gate, strict provider parsing, stable episode pairs
-and same-state settlement request auditing. The final tree passed the four
-local commands below on 2026-08-30 after repairing the integration regressions;
-this paragraph is still not a recorded evidence source and closes no heading
-by itself. `BASELINE-01` remains open until the same source is recorded clean
-and passes both CI platforms. The live causal runner still needs a common
+**Recorded merged-audit source (2026-08-30; `a3bd23f` plus the
+`BASELINE-01` commit chain; not an evidence source by itself).** The merged
+audit contains candidate implementations for the unified completion join,
+continuation epoch, criterion receipts and host coverage-declaration identity,
+domain-scoped failure matching with fail-closed overflow, required-context
+misses, prospective terminal checkpoints, explicit commit barriers,
+committed-prefix replay, a one-shot startup gate, strict provider parsing,
+stable episode pairs and same-state settlement request auditing. The recorded
+tree passed the four local commands on 2026-08-30 after repairing the
+integration regressions. This closes no heading by itself: `BASELINE-01`
+remains open until the same source passes both CI platforms (the Ubuntu
+remaining exit is the runner termination below — the full suite already runs
+with zero test failures). The live causal runner still needs a common
 pre-exposure checkpoint/workspace fork only if the selected candidate enables
 settlement projection.
 
@@ -79,9 +84,20 @@ clean worktree at the recorded source
 
 The full workspace test must complete; an external timeout is not a pass.
 
-Local checkpoint: the uncommitted Windows worktree passed all four commands on
-2026-08-30. This proves local integration only; it does not satisfy the
-recorded-clean-source or Ubuntu/Windows CI exits.
+Local checkpoint: the merged audit tree passed all four commands locally on
+2026-08-30 and landed as `a3bd23f`; the twelve follow-up commits carry the
+BASELINE-01 CI repair (deterministic turn drain, m13 sandbox fixture and
+timeouts, per-binary test-thread cap, mock-host single-threaded runtime,
+process-quota headroom, broker-journal lock retry, attestation-string parity,
+longer job timeout). Windows CI is green on repeated full runs. Ubuntu CI
+passes fmt/clippy/build and the complete workspace suite with zero
+test-level failures, but both long Ubuntu runs lost the hosted runner at
+nearly identical wall times (~48m01s/48m02s) with the test step in progress —
+once at full concurrency and once with `-j 2 -- --test-threads 2`, so the
+termination tracks elapsed/accumulated runner state, not peak load. `Ubuntu
+CI PASS` therefore remains open until one job completes the full suite; the
+planned split reaps all test processes at step boundaries to reset the
+accumulation.
 
 ### P0 — one completion authority
 

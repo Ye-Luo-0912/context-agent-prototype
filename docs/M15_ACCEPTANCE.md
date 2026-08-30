@@ -75,11 +75,11 @@ it is a model/solver weakness on the pinned serving. M15 remains open.
 The later Completion Convergence implementation and report do not justify
 another window. The original review found split completion authority,
 continuation advancing the directive epoch, pre-success all-criterion coverage
-fan-out and replay of an uncommitted suffix. Candidate fixes now exist in the
-uncommitted worktree, including host declaration-bound receipts, prospective
+fan-out and replay of an uncommitted suffix. Candidate fixes landed in the
+merged audit (`a3bd23f`): host declaration-bound receipts, prospective
   terminal checkpoints and explicit replay barriers. Their local integrated
-  matrices are green, but recorded clean-source and dual-platform exits are not
-  yet banked. The experiment also
+  matrices are green and Windows CI is green, but the Ubuntu CI exit is not yet
+  banked (see `BASELINE-01` in [`AUDIT_TODO.md`](AUDIT_TODO.md)). The experiment also
 changed the whole TaskProgress and checked-file GC projection between arms.
 Preserve its checker's mechanical FAIL, but classify settlement causality as
 `INVALID/CONFOUNDED`. Close the selected-path merged P0 queue in
@@ -239,12 +239,13 @@ surface, reject a serving or close M15.
 
 Before spending another 12-cell window:
 
-The uncommitted 2026-08-30 candidate passed fmt, Clippy, build and the complete
-workspace suite locally. This is a development checkpoint, not a formal source
-or milestone exit. Continue in this order:
+The merged audit (`a3bd23f`) passed fmt, Clippy, build and the complete
+workspace suite locally; the `BASELINE-01` chain keeps that green and Windows
+CI green. This is a development checkpoint, not a formal source or milestone
+exit — Ubuntu CI still needs one complete job run. Continue in this order:
 
-1. record one clean source, repeat those four commands there, and pass Ubuntu
-   plus Windows CI on that exact source;
+1. finish `BASELINE-01`: one complete Ubuntu CI run on the recorded source
+   (Windows CI is already green on repeated full runs);
 2. retain the locally green completion/continuation/required-context,
    criterion-receipt/failure-domain, real actor-order terminal, one-shot
    RunStart/committed-prefix replay and strict provider matrices on that source;

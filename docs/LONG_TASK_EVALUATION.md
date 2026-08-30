@@ -1069,11 +1069,14 @@ closes it as an ordinary turn. Deterministic coverage uses that order.
 
 ### Current delivery order
 
-The uncommitted 2026-08-30 tree passed the integrated fmt, Clippy, build and
-complete workspace regression. The readiness/declaration, continuation,
-required-context, failure-lifecycle, real-order terminal, RunStart/replay and
-strict-provider matrices are locally green. That is a development checkpoint,
-not a clean-source or M15 evidence claim. Continue in this order:
+The merged audit landed as recorded source `a3bd23f`; the readiness/
+declaration, continuation, required-context, failure-lifecycle, real-order
+terminal, RunStart/replay and strict-provider matrices are locally green, and
+the four local commands pass on the final `BASELINE-01` tree (Windows CI is
+repeatedly green too). That is a development checkpoint, not a clean-source or
+M15 evidence claim: Ubuntu CI still needs one complete job run — the full
+suite already executes with zero test-level failures, but the hosted runner
+terminates at ~48 minutes of wall time. Continue in this order:
 
 1. Freeze one recorded clean source, repeat the four commands there, and pass
    Ubuntu plus Windows CI on that exact source.

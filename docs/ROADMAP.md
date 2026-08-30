@@ -25,7 +25,7 @@ copy them back.
 | M12 Effect Runtime | 🧾 closure-audit evidence banked; governance status pending | The clean-tree evidence table covers brokerable production effects, crash reconciliation, authority/revocation fencing and the named generic shell/process exception (`evidence/platform-closure/m12/`). `GOV-STATUS-01` must reconcile contradictory authority text before an overall closure claim; do not reopen mechanism work from this wording. Details: [`PLATFORM_SECURITY.md`](PLATFORM_SECURITY.md). |
 | M13 Extension Sandbox | 🧾 closure-audit evidence banked; governance status pending | The clean-tree audit covers real-child activation, required refusal and attestation rows (`evidence/platform-closure/m13/`). Universal native `UntrustedGenerated` availability is not the V1 contract and WASI remains V2. `GOV-STATUS-01` owns the status wording. Details: [`PLATFORM_SECURITY.md`](PLATFORM_SECURITY.md). |
 | M14 Resource Policy | ✅ | Schema/context quotas, standing grants, output broker, authority leases. Further typed policy is not a reopen of this gate. |
-| M15 Real Evaluation | 🛑 open; no new window before merged gates | Three valid v3 windows remain valid FAIL evidence (11/12, 9/12, 10/12). The later convergence report remains mechanically FAIL but is causally INVALID/CONFOUNDED because its arm changed all of TaskProgress and checked-file GC projection. The uncommitted P0 candidate passed the four local workspace commands on 2026-08-30, but a recorded clean source, Ubuntu/Windows CI, verifier-route evidence and selected-path P1 exits remain open. A common-prefix causal fork is required only if the selected candidate enables model-visible settlement. Formal M15 remains 3 fixtures × normal/resume × 2 repeats, with the selected product configuration; it is not settlement off/on. See [`M15_ACCEPTANCE.md`](M15_ACCEPTANCE.md). |
+| M15 Real Evaluation | 🛑 open; no new window before merged gates | Three valid v3 windows remain valid FAIL evidence (11/12, 9/12, 10/12). The later convergence report remains mechanically FAIL but is causally INVALID/CONFOUNDED because its arm changed all of TaskProgress and checked-file GC projection. The merged audit landed as recorded source `a3bd23f`; the `BASELINE-01` chain keeps the four local workspace commands green and Windows CI green, while Ubuntu CI passes fmt/clippy/build and the full suite with zero test failures but has not yet completed one job run (hosted-runner loss of communication at ~48 min). Verifier-route evidence and selected-path P1 exits remain open. A common-prefix causal fork is required only if the selected candidate enables model-visible settlement. Formal M15 remains 3 fixtures × normal/resume × 2 repeats, with the selected product configuration; it is not settlement off/on. See [`M15_ACCEPTANCE.md`](M15_ACCEPTANCE.md). |
 | V2 Self-Iteration | 🔒 blocked | Until the governing M12/M13 status is reconciled and M15 closes. The agent may grow capabilities, never evaluation or permission Core authority. |
 
 Open gate order: record the locally green candidate as one clean source and
@@ -40,9 +40,10 @@ packing remain frozen.
 
 ## Ordered route
 
-1. The uncommitted candidate has passed formatting, Clippy, build and the full
-   workspace suite locally. Record it as one clean source (`BASELINE-01`), repeat
-   those four commands, and pass Ubuntu plus Windows CI on that exact source.
+1. The merged audit has passed formatting, Clippy, build and the full
+   workspace suite locally and is recorded as `a3bd23f`; the `BASELINE-01`
+   chain keeps those four commands green and Windows CI green. Complete the
+   remaining exit: one complete Ubuntu CI run on that exact source.
    Do not generate new live evidence before that proof.
 2. On the recorded source, retain the locally green regression matrices for the
    unified `CompletionReadiness`, continuation epoch, host-bound criterion

@@ -18,8 +18,8 @@ and sandbox contracts live elsewhere. Experiment facts live in
 
 ## Now
 
-**Implementation checkpoint (2026-08-30, uncommitted worktree based on
-`ea8deefc873abee13106de92bbbb3ddbaeb2d423`; not an evidence source):**
+**Merged audit (2026-08-30; recorded source `a3bd23f` plus the
+`BASELINE-01` commit chain; not an evidence source by itself):**
 
 - P0 candidate code now derives one `CompletionReadiness`, preserves the
   directive epoch on `TaskContinuation`, mints only post-PASS criterion
@@ -50,11 +50,20 @@ and sandbox contracts live elsewhere. Experiment facts live in
   pair. The historical
   convergence bundle remains mechanical FAIL and causally
   **INVALID/CONFOUNDED**; it is not reinterpreted.
-- The final uncommitted tree passed the four local commands on 2026-08-30:
-  fmt check, all-target/all-feature Clippy with warnings denied, all-target
-  build, and the complete workspace all-target suite. `BASELINE-01` remains
-  open because this is not a recorded clean source and neither Ubuntu nor
-  Windows CI has banked the same source.
+- The merged audit tree passed the four local commands on 2026-08-30
+  (fmt check, all-target/all-feature Clippy with warnings denied, all-target
+  build, and the complete workspace all-target suite) and landed as commit
+  `a3bd23f`. `BASELINE-01` moved from "not a recorded clean source" to CI
+  only: twelve follow-up commits repair the formatting/CI/settlement
+  regressions exposed since, and Windows CI is repeatedly green (latest full
+  run green, 13m53s). Ubuntu CI passes fmt/clippy/build and then executes the
+  entire workspace suite with zero test-level failures, but the hosted runner
+  has lost communication at nearly identical wall times twice
+  (~48m01s/48m02s) with the test step in progress — once at full test
+  concurrency and once with `-j 2 -- --test-threads 2` — so the remaining
+  Ubuntu exit is a runner-level elapsed/accumulation termination, not a test
+  failure; the fix in flight reaps test processes at step boundaries rather
+  than capping concurrency further.
 - M15 remains open. Its shape remains 3 fixtures × normal/resume × 2 repeats =
   12 cells. Historical v3 FAIL windows remain immutable; no v4 formal evidence
   has been run. M12/M13 artifacts remain banked, while `GOV-STATUS-01` still
