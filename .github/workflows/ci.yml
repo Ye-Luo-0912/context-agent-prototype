@@ -91,13 +91,15 @@ jobs:
       # A scoped test job selects only its part's crates, so integration
       # tests that spawn sibling binaries (mock_host / broker_host from
       # agent-process, the agent-context-service wire boundary) must build
-      # them explicitly; the workspace job builds them by selecting every
-      # member. A warm cache restores the service binary with an older mtime
-      # than this checkout, tripping context-contextcore's freshness guard,
-      # so stamp it to now - the content is the same built artifact, only
-      # the restore loses the build-time ordering.
-      - name: Build cross-crate test fixtures (part 2)
-        if: matrix.part == 2
+      # them explicitly. The full-suite job needs the same in-job build:
+      # the check job only passes artifacts through the cargo cache, and a
+      # warm restore neither guarantees the binary is present at
+      # target/<profile>/ nor keeps its mtime newer than this checkout
+      # (context-contextcore's freshness guard compares mtimes), so the
+      # service is rebuilt and the restored artifact's timestamp stamped
+      # to now. Part 1 (Ubuntu) contains none of these crates.
+      - name: Build cross-crate test fixtures
+        if: matrix.part != 1
         shell: pwsh
         run: |
           cargo build -p agent-process
