@@ -85,6 +85,15 @@ and sandbox contracts live elsewhere. Experiment facts live in
   Evidence: `crates/agent-eval/evidence/m15-preflight/`. The single
   predeclared 12-cell v4 window (M15_ACCEPTANCE §2) is next and has not
   been run; the serving tuple stays pinned without fallback.
+- The 12-cell v4 window is **predeclared on commit `b3b4883` (2026-08-30)**:
+  3 fixtures × normal/resume × 2 repeats, the product surface, the pinned
+  serving tuple (PinAI `/v1`, `gpt-5.6-luna`, Responses, explicit
+  protocol), one uninterrupted `agent-eval --m15-window` run whose cell
+  directories land under
+  `crates/agent-eval/evidence/m15-window/_windows/<timestamp>/`. No source
+  change happens during the run; the frozen-window rules of M15_ACCEPTANCE
+  §5 apply and the mechanically regenerated report is the only accepted
+  verdict.
 - M15 remains open. Its shape remains 3 fixtures × normal/resume × 2 repeats =
   12 cells. Historical v3 FAIL windows remain immutable; no v4 formal evidence
   has been run. M12/M13 artifacts remain banked, while `GOV-STATUS-01` still
