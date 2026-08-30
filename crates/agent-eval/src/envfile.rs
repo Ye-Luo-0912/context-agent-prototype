@@ -11,6 +11,7 @@ const ALLOWED: &[&str] = &[
     "OPENAI_MODEL",
     "OPENAI_API_PROTOCOL",
     "OPENAI_CONTEXT_WINDOW",
+    "OPENAI_MAX_OUTPUT_TOKENS",
 ];
 
 struct Loaded {
@@ -49,6 +50,23 @@ pub fn get(key: &str) -> Option<String> {
 /// 声明的发送窗口。未设置时用 adapter 的保守默认，不是某模型的厂商数字。
 pub fn context_window() -> anyhow::Result<usize> {
     parse_context_window(get("OPENAI_CONTEXT_WINDOW").as_deref())
+}
+
+/// Bound per-request model output. Defaults to the provider-side 4096 the
+/// harness historically used; a reasoning-heavy candidate serving may need a
+/// larger pin, and the chosen value is part of the serving tuple identity.
+pub fn max_output_tokens() -> anyhow::Result<usize> {
+    const DEFAULT: usize = 4096;
+    let Some(raw) = get("OPENAI_MAX_OUTPUT_TOKENS").map(|value| value.trim().to_string()) else {
+        return Ok(DEFAULT);
+    };
+    let parsed: usize = raw.parse().map_err(|_| {
+        anyhow::anyhow!("OPENAI_MAX_OUTPUT_TOKENS must be a positive integer, got {raw:?}")
+    })?;
+    if parsed == 0 {
+        anyhow::bail!("OPENAI_MAX_OUTPUT_TOKENS must be > 0");
+    }
+    Ok(parsed)
 }
 
 pub fn parse_context_window(raw: Option<&str>) -> anyhow::Result<usize> {
@@ -96,7 +114,7 @@ pub fn parse_eval_env(text: &str) -> anyhow::Result<BTreeMap<String, String>> {
         let key = key.trim();
         if !ALLOWED.contains(&key) {
             anyhow::bail!(
-                "line {}: refusing to load {key} (only OPENAI_API_KEY / OPENAI_BASE_URL / OPENAI_MODEL / OPENAI_API_PROTOCOL / OPENAI_CONTEXT_WINDOW)",
+                "line {}: refusing to load {key} (only OPENAI_API_KEY / OPENAI_BASE_URL / OPENAI_MODEL / OPENAI_API_PROTOCOL / OPENAI_CONTEXT_WINDOW / OPENAI_MAX_OUTPUT_TOKENS)",
                 index + 1
             );
         }

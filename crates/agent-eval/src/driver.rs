@@ -109,12 +109,13 @@ fn build_model_with_timeout(timeout: Duration) -> anyhow::Result<Arc<dyn ModelTr
         .map_err(anyhow::Error::msg)?
         .unwrap_or_default();
     let context_window = crate::envfile::context_window()?;
+    let max_output_tokens = crate::envfile::max_output_tokens()?;
     let provider = OpenAiProvider::new(OpenAiConfig {
         api_key,
         base_url,
         model,
         protocol,
-        max_output_tokens: 4096,
+        max_output_tokens,
         timeout,
         send_stream_options: true,
         send_max_tokens: true,
