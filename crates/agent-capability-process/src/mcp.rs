@@ -585,6 +585,20 @@ impl McpClient<tokio::process::ChildStdout, tokio::process::ChildStdin> {
         let mut child = command
             .spawn()
             .map_err(|e| AgentError::Tool(format!("spawn MCP server '{}': {e}", decl.program)))?;
+        // On Unix the inherited-fd sweep closes tokio's exec-error pipe, so
+        // a missing executable surfaces as an immediate child exit instead
+        // of a spawn error. Normalize that state before the handshake so
+        // the caller sees the same clean start error on every platform.
+        if let Some(status) = child
+            .try_wait()
+            .map_err(|e| AgentError::Tool(format!("wait for MCP server '{}': {e}", decl.program)))?
+        {
+            let _ = child.wait().await;
+            return Err(AgentError::Tool(format!(
+                "spawn MCP server '{}' exited before the handshake (status: {status})",
+                decl.program
+            )));
+        }
         let Some(pid) = child.id() else {
             let _ = child.start_kill();
             let _ = child.wait().await;
