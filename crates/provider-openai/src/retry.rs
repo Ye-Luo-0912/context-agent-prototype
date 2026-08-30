@@ -1,11 +1,14 @@
 //! Generic retry/backoff wrapper for any `ModelTransport`.
 //!
-//! Only typed retryable transport errors (network failures, timeouts, 5xx,
-//! 429, and gateway-wrapped upstream 400 `Upstream request failed`) are
-//! retried. Auth errors, malformed provider protocol, and genuine
-//! provider-level rejections fail immediately. The backoff yields to the
-//! request's cancellation token, so a cancelled request aborts instead of
-//! sleeping out the wait.
+//! Typed retryable transport errors (network failures, timeouts, 5xx, 429,
+//! and gateway-wrapped upstream 400 `Upstream request failed`) are retried,
+//! and so is a model-emitted tool call whose argument JSON is malformed
+//! (`MalformedToolCall`): that is transient output noise the model can fix
+//! on re-issue, and in buffering mode nothing from the rejected stream
+//! reaches the sink. Wire/protocol damage (`MalformedEvent`), auth errors,
+//! and genuine provider-level rejections fail immediately. The backoff
+//! yields to the request's cancellation token, so a cancelled request
+//! aborts instead of sleeping out the wait.
 //!
 //! Streaming is retryable only while nothing has reached the sink: a stream
 //! that already emitted deltas cannot be replayed into the same sink, and a
@@ -100,6 +103,10 @@ fn retryable(error: &AgentError) -> bool {
             retryable: true,
             ..
         } | AgentError::TransportRetryAfter { .. }
+            | AgentError::ModelProtocol {
+                kind: ModelProtocolErrorKind::MalformedToolCall,
+                ..
+            }
     )
 }
 
@@ -780,6 +787,120 @@ mod tests {
         );
     }
 
+    /// Fails the first attempt with malformed tool-call argument JSON (model
+    /// output noise) after emitting one delta; succeeds on the second.
+    struct EmitsThenMalformedCall {
+        calls: Arc<AtomicU32>,
+    }
+
+    #[async_trait]
+    impl ModelTransport for EmitsThenMalformedCall {
+        fn capabilities(&self) -> ModelCapabilities {
+            ModelCapabilities::default()
+        }
+        async fn complete(&self, _request: ModelRequest) -> AgentResult<ModelOutput> {
+            unreachable!("streaming model should be driven through complete_stream")
+        }
+        async fn complete_stream(
+            &self,
+            _request: ModelRequest,
+            sink: &dyn ModelEventSink,
+        ) -> AgentResult<ModelOutput> {
+            let call = self.calls.fetch_add(1, Ordering::SeqCst) + 1;
+            if call == 1 {
+                sink.on_chunk(ModelChunk::ToolCallDelta {
+                    call_id: "call-1".into(),
+                    name: Some("fs_read".into()),
+                    arguments_delta: "{\"path\": \"src".into(),
+                })
+                .await?;
+                return Err(AgentError::ModelProtocol {
+                    kind: ModelProtocolErrorKind::MalformedToolCall,
+                    message: "EOF while parsing a list at line 1 column 10526".into(),
+                });
+            }
+            sink.on_chunk(ModelChunk::Done).await?;
+            Ok(ModelOutput {
+                content: String::new(),
+                tool_calls: vec![agent_contracts::ToolCall {
+                    id: "call-1".into(),
+                    name: "fs.read".into(),
+                    arguments: json!({"path": "src/lib.rs"}),
+                }],
+                usage: ModelUsage::default(),
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn buffering_mode_retries_malformed_tool_call_arguments_from_scratch() {
+        let calls = Arc::new(AtomicU32::new(0));
+        let inner = EmitsThenMalformedCall {
+            calls: calls.clone(),
+        };
+        let transport = RetryingTransport::new_buffering(inner, 3, Duration::from_millis(1))
+            .with_jitter(|delay, _| delay);
+        let sink = RecordingSink::default();
+
+        let output = transport.complete_stream(request(), &sink).await.unwrap();
+        assert_eq!(output.tool_calls.len(), 1);
+        assert_eq!(output.tool_calls[0].name, "fs.read");
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            2,
+            "one replay after the malformed call"
+        );
+        assert_eq!(output.usage.attempts, 2);
+        assert_eq!(output.usage.retries, 1);
+        let chunks = sink.chunks.lock().unwrap();
+        assert!(
+            !chunks
+                .iter()
+                .any(|chunk| matches!(chunk, ModelChunk::ToolCallDelta { .. })),
+            "the rejected attempt's deltas must not reach the sink"
+        );
+        assert!(chunks.contains(&ModelChunk::Done));
+    }
+
+    #[tokio::test]
+    async fn live_mode_does_not_replay_after_malformed_tool_call_deltas() {
+        // Interactive hosts stream deltas immediately; once the malformed
+        // delta reached the sink it cannot be un-sent, and a retry would
+        // duplicate output, so the error surfaces instead.
+        let calls = Arc::new(AtomicU32::new(0));
+        let inner = EmitsThenMalformedCall {
+            calls: calls.clone(),
+        };
+        let transport = RetryingTransport::new(inner, 3, Duration::from_millis(1));
+        let sink = RecordingSink::default();
+
+        let error = transport
+            .complete_stream(request(), &sink)
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            AgentError::ModelProtocol {
+                kind: ModelProtocolErrorKind::MalformedToolCall,
+                ..
+            }
+        ));
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            1,
+            "a live stream that already emitted must not be replayed"
+        );
+        let chunks = sink.chunks.lock().unwrap();
+        assert_eq!(
+            chunks
+                .iter()
+                .filter(|chunk| matches!(chunk, ModelChunk::ToolCallDelta { .. }))
+                .count(),
+            1,
+            "the listener sees exactly the first attempt's truncated delta"
+        );
+    }
+
     #[tokio::test]
     async fn buffering_mode_gives_up_after_max_attempts() {
         let calls = Arc::new(AtomicU32::new(0));
@@ -890,6 +1011,26 @@ mod tests {
             message: "damaged SSE JSON".into(),
         };
         assert!(!retryable(&error));
+    }
+
+    #[test]
+    fn malformed_model_tool_call_arguments_are_retryable() {
+        let malformed_call = AgentError::ModelProtocol {
+            kind: ModelProtocolErrorKind::MalformedToolCall,
+            message: "EOF while parsing a list at line 1 column 10526".into(),
+        };
+        let wire_damage = AgentError::ModelProtocol {
+            kind: ModelProtocolErrorKind::MalformedEvent,
+            message: "damaged SSE JSON".into(),
+        };
+        assert!(
+            retryable(&malformed_call),
+            "model-emitted malformed tool arguments are transient output the model can fix"
+        );
+        assert!(
+            !retryable(&wire_damage),
+            "wire/protocol damage stays non-retryable"
+        );
     }
 
     #[tokio::test]

@@ -2259,9 +2259,10 @@ pub const CONTEXT_MAP_VIEW_CAP: usize = 32;
 /// contract, not a retrieval tutorial. Do not name ops, prefer/avoid lists,
 /// or retune scoring from this text.
 pub const DEFAULT_CODING_AGENT_SYSTEM_PROMPT: &str = concat!(
-    "You are a focused coding agent. Work on the current task only. ",
+    "You are a focused coding agent working on the current task only. ",
     "The selected working context is not the full catalog; prior evidence may remain outside this frame and can be searched or retrieved with context tools. ",
-    "Additional tools can be discovered and loaded with capability tools."
+    "Additional tools can be discovered and loaded with capability tools. ",
+    "Every tool call argument must be one complete valid JSON value, with all objects and arrays properly closed, never truncated."
 );
 
 /// The bounded, model-facing view of the external context map. The engine
@@ -2895,6 +2896,10 @@ mod tests {
         assert!(prompt.contains("not the full catalog"));
         assert!(prompt.contains("context tools"));
         assert!(prompt.contains("capability tools"));
+        assert!(
+            prompt.contains("valid JSON"),
+            "tool call arguments must be pinned as complete valid JSON: {prompt}"
+        );
         assert!(
             !prompt.contains("bounded cache"),
             "calling the working set a cache made the model re-read it"
