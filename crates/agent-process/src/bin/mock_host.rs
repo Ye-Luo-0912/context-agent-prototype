@@ -27,7 +27,13 @@ fn main() {
         eprintln!("mock host requires MOCK_MARKER=1 (env injection test)");
         std::process::exit(1);
     }
-    let runtime = tokio::runtime::Runtime::new().expect("mock runtime");
+    // The fixture is a sequential ping-pong server: a single-threaded
+    // runtime keeps each spawned child to one thread, which matters when
+    // audits spawn many children on a shared host.
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("mock runtime");
     runtime.block_on(server_loop());
 }
 

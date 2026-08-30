@@ -12,7 +12,7 @@ jobs:
   check:
     name: fmt / clippy / test (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
-    timeout-minutes: 60
+    timeout-minutes: 120
     strategy:
       fail-fast: false
       matrix:
@@ -47,7 +47,8 @@ jobs:
       # Closure audits (agent-eval m12/m13) spawn real child processes and
       # journals; at the default concurrency the shared runner exhausts its
       # thread/process budget (tokio worker spawn EAGAIN, flock would-block
-      # on inherited fds). Cap concurrent test binaries so the audit keeps
-      # headroom on both platforms.
+      # on inherited fds, and the runner can lose its heartbeat). Cap both
+      # concurrent test binaries and per-binary test threads so the audits
+      # keep headroom on both platforms.
       - name: cargo test --workspace
-        run: cargo test --workspace -j 2
+        run: cargo test --workspace -j 2 -- --test-threads 2
