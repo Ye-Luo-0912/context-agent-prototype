@@ -1535,7 +1535,7 @@ mod tests {
                         .fs_write_confined
                         .as_deref()
                         .unwrap()
-                        .starts_with("landlock write roots=1")
+                        .starts_with("landlock ruleset confines writes to 1 roots")
                 );
             }
         }
