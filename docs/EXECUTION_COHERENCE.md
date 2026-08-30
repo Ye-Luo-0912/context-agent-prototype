@@ -533,7 +533,12 @@ infers it from command strings, argv or output text.
   `VerificationCoverageDomain { domain_id, declaration_revision }` with
   `members: Vec<(recipe_id, recipe_revision)>` declared per domain. The
   model-visible schema stays `verify.run { recipe_id }`; none of this is
-  model-authorable.
+  model-authorable. Eligibility is itself model-visible: the `verify.run`
+  catalog marks each recipe's identity class (`[task-scoped]` /
+  `[exact current-world]`) and its declared coverage domain, and the
+  acceptance-criterion view line names the required domain, so the model can
+  pick a recipe class that can satisfy the criterion instead of burning calls
+  on broad runners that can never mint a receipt.
 - A recorded PASS fact keeps its exact tuple exactly as today. The reuse
   predicate widens from "same recipe" to: resolve the requested recipe in the
   current composition; require its domain to equal the recorded fact's
@@ -723,7 +728,11 @@ table at readiness and requires the criterion, receipt and verification fact to
 match it. A failed verifier, unrelated/currently replaced domain, legacy string
 criterion, or pre-dispatch attribution mints nothing. Receipt CAS advances task
   state but not the verification basis; `task.manage` cannot author completion or
-  declaration authority. The integration and restore/recomposition matrix is
+  declaration authority. The deterministic verify-route gate
+  (evidence under `crates/agent-eval/evidence/verify-route/`) covers routing:
+  a task-scoped PASS never mints, the first exact PASS satisfies and identical
+  repeats reuse it, and an unrelated failed command survives the exact PASS and
+  keeps completion refused. The integration and restore/recomposition matrix is
   locally green; promotion still waits for the recorded-source and CI gates.
 
 `InputKind::TaskContinuation` rebuilds a turn from the stored directive and

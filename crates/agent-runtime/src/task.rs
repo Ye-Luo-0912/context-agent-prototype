@@ -163,6 +163,21 @@ impl AcceptanceCriterion {
             domain_source_digest: declaration.source_digest.clone(),
         }
     }
+
+    /// Bounded model-visible line: the description plus the host-declared
+    /// coverage domain that can satisfy it, when one is required. The
+    /// declaration revision/digest stay host-side; the model only needs to
+    /// pick a recipe class that can prove the requirement.
+    pub fn view_line(&self) -> String {
+        if self.coverage_domain.is_empty() {
+            self.description.clone()
+        } else {
+            format!(
+                "{} (requires domain {})",
+                self.description, self.coverage_domain
+            )
+        }
+    }
 }
 
 impl From<String> for AcceptanceCriterion {
@@ -455,7 +470,7 @@ pub fn task_anchor_view(anchor: &TaskAnchor) -> agent_contracts::TaskAnchorView 
         acceptance_criteria: anchor
             .acceptance_criteria
             .iter()
-            .map(|criterion| criterion.description.clone())
+            .map(|criterion| criterion.view_line())
             .collect(),
         plan_progress: anchor.plan_progress.clone(),
         open_loops: anchor.open_loops.clone(),
@@ -2282,6 +2297,28 @@ pub(crate) fn sha256_hex(content: &[u8]) -> String {
 mod tests {
     use super::*;
     use agent_contracts::ToolSurfaceDemand;
+
+    #[test]
+    fn criterion_view_line_names_the_required_domain_when_declared() {
+        let plain = AcceptanceCriterion {
+            description: "behaves correctly".into(),
+            coverage_domain: String::new(),
+            domain_declaration_revision: 0,
+            domain_source_digest: String::new(),
+        };
+        assert_eq!(plain.view_line(), "behaves correctly");
+        let declaration = agent_contracts::VerificationCoverageDeclaration {
+            domain_id: "saturation-boundary".into(),
+            declaration_revision: 1,
+            source_digest: "a1b2c3".into(),
+        };
+        let declared =
+            AcceptanceCriterion::declared("large attempts saturate at max_delay", &declaration);
+        assert_eq!(
+            declared.view_line(),
+            "large attempts saturate at max_delay (requires domain saturation-boundary)"
+        );
+    }
 
     fn create(tasks: &mut TaskManager, goal: &str) -> TaskId {
         let (txn, id) = tasks.prepare_create(goal);

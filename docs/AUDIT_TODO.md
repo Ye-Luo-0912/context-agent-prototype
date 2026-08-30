@@ -408,7 +408,7 @@ deterministic jitter.
 
 ### P1 — reduce calls before the settlement tail
 
-#### VERIFY-ROUTE-01 — make verifier eligibility explicit (**open**)
+#### VERIFY-ROUTE-01 — make verifier eligibility explicit (**closed 2026-08-30 on the deterministic verify-route gate**)
 
 The latest evidence often reaches a verifier quickly but sometimes selects a
 TaskScoped recipe that cannot establish an exact current-world PASS. This is a
@@ -427,6 +427,29 @@ pre-settlement rounds/calls and survival of unrelated failures. Include a
 negative in which a broad Cargo/test PASS is valid evidence but does not cover a
 criterion-specific boundary condition, plus a positive boundary receipt for the
 same public criterion. Context/GC/retrieval/packing remain frozen.
+
+Closure record (2026-08-30). Slice A makes eligibility model-visible: the
+`verify.run` schema catalog marks every recipe's identity class
+(`[task-scoped]` / `[exact current-world]`) plus its declared coverage domain,
+and the acceptance-criterion view line names the required domain, so the model
+can pick a recipe class that can satisfy the criterion. Slice B adds the
+deterministic verify-route gate (`agent-eval --verify-route-gate`; evidence
+under `crates/agent-eval/evidence/verify-route/`), three cells over the real
+runtime/tool surface:
+
+- negative: a broad `cargo test` PASS records valid evidence but never mints a
+  receipt, `task.complete` is refused ("lack current coverage"), and only the
+  declared exact recipe closes the task (calls-to-first-satisfying = 3);
+- positive: the first exact PASS satisfies the criterion
+  (calls-to-first-satisfying = 1), an identical repeat reuses the recorded
+  PASS without a second process, and completion is accepted;
+- unrelated failure survival: a failed `process.run` survives the exact PASS;
+  the receipt mints but completion stays refused by the
+  unresolved-failed-command gate.
+
+The four local commands pass on the closing commit; the dual-platform CI run on
+that commit is recorded in STATUS. No Context/GC/retrieval/packing path
+changed.
 
 #### FAILURE-SPILL-01 — retire overflowed blockers exactly in long tasks (**open P1; activate before long-horizon evidence or after measured overflow**)
 
@@ -525,7 +548,7 @@ work, do not claim closure, and keep Self-Iteration blocked.
 local integrated candidate GREEN
   -> record one clean source (BASELINE-01)
   -> repeat fmt/clippy/build/full-test on that source + Ubuntu/Windows CI
-  -> VERIFY-ROUTE-01 evidence
+  -> VERIFY-ROUTE-01 evidence (done 2026-08-30: crates/agent-eval/evidence/verify-route/)
   -> selected-path P1 correctness closed or proven out-of-path
   -> same-checkpoint causal fork only if project_settlement changes
   -> exact-source/product M15 preflight

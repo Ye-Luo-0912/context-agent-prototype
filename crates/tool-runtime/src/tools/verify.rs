@@ -52,13 +52,26 @@ impl Tool for VerificationRunTool {
             .recipes
             .as_slice()
             .iter()
-            .map(|recipe| format!("{}: {}", recipe.id, recipe.description))
+            .map(|recipe| {
+                let class = match recipe.reuse {
+                    agent_contracts::VerificationReuse::ExactCurrentWorld => "exact current-world",
+                    agent_contracts::VerificationReuse::TaskScoped => "task-scoped",
+                    agent_contracts::VerificationReuse::None => "plain",
+                };
+                match recipe.coverage_domain.as_deref() {
+                    Some(domain) => format!(
+                        "{}: {} [{class}, domain={domain}]",
+                        recipe.id, recipe.description
+                    ),
+                    None => format!("{}: {} [{class}]", recipe.id, recipe.description),
+                }
+            })
             .collect::<Vec<_>>()
             .join("; ");
         ToolSpec {
             name: VERIFY_RUN_TOOL_NAME.into(),
             description: format!(
-                "Run one trusted project verification recipe. The host owns argv, cwd and environment; choose only a recipe_id. Recipe ids are values for verify.run, not tool names and never need capability.manage load. Successful current-world PASS may be reused without another process. Recipes: {catalog}"
+                "Run one trusted project verification recipe. The host owns argv, cwd and environment; choose only a recipe_id. Recipe ids are values for verify.run, not tool names and never need capability.manage load. Successful current-world PASS may be reused without another process. Only an exact current-world recipe can satisfy an acceptance criterion that declares its coverage domain; a task-scoped run never mints an acceptance receipt. Recipes: {catalog}"
             ),
             input_schema: json!({
                 "type": "object",
@@ -183,6 +196,56 @@ mod tests {
         assert_eq!(
             spec.input_schema["properties"]["recipe_id"]["enum"][0],
             "echo.trusted"
+        );
+    }
+
+    /// The model-visible catalog marks every recipe's identity class and,
+    /// when declared, its coverage domain, so the model can pick a recipe
+    /// that can actually satisfy a criterion's requirement.
+    #[tokio::test]
+    async fn schema_marks_recipe_class_and_coverage_domain() {
+        let dir = tempfile::tempdir().unwrap();
+        let workspace = Workspace::open(dir.path()).await.unwrap();
+        let mut broad = crate::VerificationRecipe::new(
+            "cargo.all",
+            "Run every Cargo workspace test",
+            "cargo-all-v1",
+            vec!["cargo".into(), "test".into(), "--workspace".into()],
+        )
+        .unwrap();
+        broad.reuse = agent_contracts::VerificationReuse::TaskScoped;
+        let boundary = crate::VerificationRecipe::new(
+            "boundary.saturate",
+            "Compile the saturation boundary without mutating sources",
+            "boundary-v1",
+            vec!["rustc".into(), "--edition=2021".into(), "src/lib.rs".into()],
+        )
+        .unwrap()
+        .with_exact_current_world_reuse()
+        .with_exact_inputs(vec!["src/lib.rs".into()])
+        .unwrap()
+        .with_coverage_domain("saturation-boundary")
+        .unwrap();
+        let recipes = VerificationRecipes::new(vec![broad, boundary]).unwrap();
+        let spec = VerificationRunTool::new(workspace, Arc::new(recipes))
+            .unwrap()
+            .spec();
+        assert!(
+            spec.description
+                .contains("cargo.all: Run every Cargo workspace test [task-scoped]"),
+            "{}",
+            spec.description
+        );
+        assert!(
+            spec.description.contains(
+                "boundary.saturate: Compile the saturation boundary without mutating sources [exact current-world, domain=saturation-boundary]"
+            ),
+            "{}",
+            spec.description
+        );
+        assert!(
+            spec.description
+                .contains("never mints an acceptance receipt")
         );
     }
 

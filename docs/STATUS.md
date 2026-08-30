@@ -63,6 +63,16 @@ and sandbox contracts live elsewhere. Experiment facts live in
   the all-members layout had masked (the Unix process-group kill contract in
   the persist tests, missing sibling binaries in the part-2 / full jobs, and
   the context-service binary mtime guard against warm-cache restore).
+- `VERIFY-ROUTE-01` closed 2026-08-30 on the deterministic verify-route gate:
+  the `verify.run` schema catalog marks each recipe's identity class and
+  declared coverage domain, the acceptance-criterion view line names the
+  required domain, and the three-cell gate
+  (`crates/agent-eval/evidence/verify-route/`) proves a broad task-scoped
+  PASS never mints a receipt (completion refused until the declared exact
+  recipe runs), the first exact PASS satisfies and identical repeats reuse
+  it, and an unrelated failed command survives and keeps completion refused.
+  Evidence is event-derived, not fixture-derived; Context/GC/retrieval/
+  packing are untouched.
 - M15 remains open. Its shape remains 3 fixtures × normal/resume × 2 repeats =
   12 cells. Historical v3 FAIL windows remain immutable; no v4 formal evidence
   has been run. M12/M13 artifacts remain banked, while `GOV-STATUS-01` still

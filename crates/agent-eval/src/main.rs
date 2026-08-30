@@ -37,6 +37,7 @@ mod suite;
 mod task;
 mod tool_edit_gate;
 mod tool_edit_pack;
+mod verify_route;
 mod workload;
 
 fn usage() -> ! {
@@ -172,6 +173,17 @@ fn usage() -> ! {
          and explicit not-run rows for landlock-backed platforms this runner\n\
          cannot execute. Writes manifest.json / rows.jsonl / REPORT.md under\n\
          crates/agent-eval/evidence/platform-closure/m13/.\n\
+         \n\
+         usage: agent-eval --verify-route-gate [--evidence-dir <dir>]\n\
+         \n\
+         Deterministic verifier-eligibility gate: three scripted-model cells\n\
+         over the real runtime assert that a task-scoped PASS never mints an\n\
+         acceptance receipt (task.complete refused until the declared exact\n\
+         recipe runs), that the first exact PASS already satisfies and later\n\
+         identical calls reuse it, and that an unrelated failed command\n\
+         survives the exact PASS and keeps completion refused. Writes\n\
+         manifest.json / REPORT.md under\n\
+         crates/agent-eval/evidence/verify-route/.\n\
          \n\
          usage: agent-eval --long-task-gate\n\
          \n\
@@ -643,6 +655,23 @@ async fn main() -> anyhow::Result<()> {
                 );
                 if !passed {
                     anyhow::bail!("platform closure m13 gate failed");
+                }
+                return Ok(());
+            }
+            "--verify-route-gate" => {
+                let out_dir = evidence_dir.clone().unwrap_or_else(|| {
+                    std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                        .join("evidence")
+                        .join("verify-route")
+                });
+                let (report, passed) = verify_route::run_verify_route_gate(&out_dir).await?;
+                print!("{report}");
+                println!(
+                    "verify-route gate: {}",
+                    if passed { "PASS" } else { "FAIL" }
+                );
+                if !passed {
+                    anyhow::bail!("verify-route gate failed");
                 }
                 return Ok(());
             }

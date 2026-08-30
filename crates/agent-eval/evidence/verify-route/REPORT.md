@@ -1,0 +1,18 @@
+# verify-route gate (verifier eligibility)
+
+Criterion: `large attempts saturate at max_delay instead of wrapping`
+
+Coverage domain `saturation-boundary` (declaration revision 1): only an exact, source-read-only recipe run mints the receipt; a task-scoped PASS records valid evidence but never satisfies a declared criterion.
+
+| cell | verdict | observed |
+|---|---|---|
+| negative_positive | PASS | `{"calls_to_first_satisfying":3,"capability.manage_started":0,"completion_refused_lack_coverage":true,"receipts":[[0]],"receipts_before_completion":true,"task_completed":1,"verify.run_started_by_recipe":{"boundary.saturate":1,"cargo.all":1},"warnings":["completion proposal refused: invalid request: completion is not ready: trusted verification is not current; 1 acceptance criterion/criteria lack current coverage","task completed in a composition with no checkpoint store; it is not resumable by design"]}` |
+| positive_control | PASS | `{"calls_to_first_satisfying":1,"pass_recorded":1,"pass_reused":1,"receipts":[[0]],"task_completed":1,"verify.run_passed_finished":2,"verify.run_started":1,"warnings":["task completed in a composition with no checkpoint store; it is not resumable by design"]}` |
+| unrelated_failure | PASS | `{"completion_refused_failed_command":true,"process.run_started":1,"process.run_succeeded":0,"receipts":[[0]],"task_completed":0,"warnings":["completion proposal refused: invalid request: completion is not ready: 1 unresolved execution obligation(s) remain; 1 unresolved failed command(s) remain"]}` |
+
+Details:
+
+- **negative_positive**: broad cargo.all PASS (2) then refused task.complete (completion proposal refused: invalid request: completion is not ready: trusted verification is not current; 1 acceptance criterion/criteria lack current coverage) then exact boundary PASS (2) closed the task; receipts=[[0]] warnings=2 (observed `{"calls_to_first_satisfying":3,"capability.manage_started":0,"completion_refused_lack_coverage":true,"receipts":[[0]],"receipts_before_completion":true,"task_completed":1,"verify.run_started_by_recipe":{"boundary.saturate":1,"cargo.all":1},"warnings":["completion proposal refused: invalid request: completion is not ready: trusted verification is not current; 1 acceptance criterion/criteria lack current coverage","task completed in a composition with no checkpoint store; it is not resumable by design"]}`)
+- **positive_control**: first boundary PASS satisfied the criterion (calls_to_first=Some(1)); second identical verify.run reused the PASS (started=1, finished=2); completion accepted, pass_recorded=1 pass_reused=1 (observed `{"calls_to_first_satisfying":1,"pass_recorded":1,"pass_reused":1,"receipts":[[0]],"task_completed":1,"verify.run_passed_finished":2,"verify.run_started":1,"warnings":["task completed in a composition with no checkpoint store; it is not resumable by design"]}`)
+- **unrelated_failure**: failed process.run (starts=1, ok=0), exact boundary PASS minted the receipt, task.complete refused: completion proposal refused: invalid request: completion is not ready: 1 unresolved execution obligation(s) remain; 1 unresolved failed command(s) remain (observed `{"completion_refused_failed_command":true,"process.run_started":1,"process.run_succeeded":0,"receipts":[[0]],"task_completed":0,"warnings":["completion proposal refused: invalid request: completion is not ready: 1 unresolved execution obligation(s) remain; 1 unresolved failed command(s) remain"]}`)
+Verdict: PASS
