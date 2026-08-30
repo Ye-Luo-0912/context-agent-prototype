@@ -112,8 +112,18 @@ fn usage() -> ! {
          usage: agent-eval --recovery-surface-gate [normal|resume]\n\
          usage: agent-eval [--repeats N] --conv-gate [normal|resume]\n\
          usage: agent-eval --conv-tail [--evidence-dir <dir>]\n\
+         usage: agent-eval --m15-preflight [--evidence-dir <dir>]\n\
          usage: agent-eval --m15-window\n\
          usage: agent-eval --m15-report <window-dir>\n\
+\n\
+         Bounded one-cell exact-source/product preflight before the single\n\
+         predeclared 12-cell window: one retry_policy_dev normal cell on a\n\
+         clean HEAD with the product surface (project TaskProgress on,\n\
+         settlement and all advisory candidates off) and the pinned serving\n\
+         tuple with an explicit OPENAI_API_PROTOCOL. Refuses --allow-dirty\n\
+         and protocol auto; writes the cell evidence plus a top-level\n\
+         manifest.json/REPORT.md under\n\
+         crates/agent-eval/evidence/m15-preflight/.\n\
 \n\
          Read-only post-settlement tail analysis over a conv-gate evidence\n\
          tree: for every cell, the first settled-candidate frontier event\n\
@@ -733,6 +743,10 @@ async fn main() -> anyhow::Result<()> {
                 run_conv_tail(evidence_dir).await?;
                 return Ok(());
             }
+            "--m15-preflight" => {
+                run_m15_preflight(evidence_dir, allow_dirty).await?;
+                return Ok(());
+            }
             "--m15-window" => {
                 let fixture_filter = args.next().filter(|value| !value.starts_with('-'));
                 let repeats = if repeats_set {
@@ -1218,6 +1232,164 @@ async fn run_long_task_live(
             }
         }
     }
+    Ok(())
+}
+
+/// The bounded one-cell exact-source/product preflight (`M15_ACCEPTANCE.md`
+/// §7 item 7): one `retry_policy_dev` normal cell on a clean HEAD with the
+/// product surface and the pinned serving tuple, to prove the tuple can
+/// start, edit and finish a fixture before the single predeclared 12-cell
+/// window. Execution is identical to a window cell (same pack, runner,
+/// retry policy and acceptance profile); only the cell count differs.
+async fn run_m15_preflight(
+    evidence_dir: Option<std::path::PathBuf>,
+    allow_dirty: bool,
+) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        !allow_dirty,
+        "--m15-preflight is exact-source evidence and does not permit --allow-dirty"
+    );
+    let protocol = envfile::get("OPENAI_API_PROTOCOL").unwrap_or_else(|| "auto".into());
+    anyhow::ensure!(
+        !protocol.trim().eq_ignore_ascii_case("auto"),
+        "--m15-preflight requires an explicit OPENAI_API_PROTOCOL pin; auto negotiation is not a reproducible serving identity"
+    );
+    bundle::require_clean_tree(allow_dirty)?;
+    let model = driver::build_live_coding_model()?;
+    let evidence_root = evidence_dir
+        .unwrap_or_else(|| std::path::PathBuf::from("crates/agent-eval/evidence/m15-preflight"));
+    std::fs::create_dir_all(&evidence_root)?;
+    eprintln!("evidence dir: {}", evidence_root.display());
+
+    let outcome = long_live::run_pack_cell_retrying(
+        &long_live::retry_pack(),
+        long_live::PilotMode::Normal,
+        evidence_root.clone(),
+        "retry_policy_dev-normal".into(),
+        1,
+        1,
+        model,
+        long_live::CellSwitches::default(),
+        long_live::AcceptanceProfile::M15V1,
+        3,
+        std::time::Duration::from_secs(30),
+    )
+    .await?;
+    println!("{}", outcome.render_line());
+
+    let cell_dir = outcome
+        .evidence_dir
+        .clone()
+        .ok_or_else(|| anyhow::anyhow!("preflight cell did not record an evidence directory"))?;
+    let source_digest = bundle::source_tree_digest();
+    let manifest = serde_json::json!({
+        "schema": "m15-preflight.v1",
+        "source": {
+            "clean": true,
+            "source_tree_digest": source_digest,
+        },
+        "serving": {
+            "protocol": protocol,
+            "model": envfile::get("OPENAI_MODEL").unwrap_or_default(),
+            "base_url": envfile::get("OPENAI_BASE_URL"),
+        },
+        "switches": {
+            "project_task_progress": outcome.project_task_progress,
+            "project_settlement": outcome.project_settlement,
+            "opportunity": outcome.opportunity,
+            "recovery_surface": outcome.recovery_surface,
+            "settlement_projection_diagnostics": outcome.settlement_projection_diagnostics,
+        },
+        "cell": {
+            "pack_id": outcome.pack_id,
+            "mode": outcome.mode.id(),
+            "repeat": 1,
+            "repeats": 1,
+            "dir": cell_dir.display().to_string(),
+        },
+        "outcome": {
+            "verdict": outcome.verdict.id(),
+            "passed": outcome.passed,
+            "behavior": outcome.behavior,
+            "observed_behavior": outcome.observed_behavior,
+            "diff": outcome.diff,
+            "closure": outcome.closure,
+            "continuation": outcome.continuation,
+            "provider_health": outcome.provider_health,
+            "self_check": outcome.self_check,
+            "turn_completed": outcome.turn_completed,
+            "task_completed": outcome.task_completed,
+            "model_rounds": outcome.model_rounds_phase_one + outcome.model_rounds_phase_two,
+            "wall_ms": outcome.wall_ms,
+            "error": outcome.error,
+        },
+    });
+    std::fs::write(
+        evidence_root.join("manifest.json"),
+        serde_json::to_vec_pretty(&manifest)?,
+    )?;
+
+    let mut report = String::new();
+    report.push_str("# M15 exact-source/product preflight\n\n");
+    report.push_str(&format!(
+        "One `retry_policy_dev` normal cell on a clean HEAD with the product \
+         surface (TaskProgress on, settlement and all advisory candidates off), \
+         the pinned serving tuple and explicit protocol, before the single \
+         predeclared 12-cell window. Cell dir: `{}`.\n\n",
+        cell_dir.display()
+    ));
+    report.push_str("| dimension | value |\n|---|---|\n");
+    report.push_str(&format!(
+        "| verdict | {} |\n",
+        if outcome.passed { "PASS" } else { "FAIL" }
+    ));
+    report.push_str(&format!(
+        "| cell verdict | {} (behavior {}, diff {}, closure {}, continuation {}) |\n",
+        outcome.verdict.id(),
+        outcome.behavior,
+        outcome.diff,
+        outcome.closure,
+        outcome.continuation,
+    ));
+    report.push_str(&format!(
+        "| provider health | {} |\n",
+        outcome.provider_health
+    ));
+    report.push_str(&format!(
+        "| turns/task closed | {} / {} |\n",
+        outcome.turn_completed, outcome.task_completed
+    ));
+    report.push_str(&format!(
+        "| model rounds | {} |\n",
+        outcome.model_rounds_phase_one + outcome.model_rounds_phase_two
+    ));
+    report.push_str(&format!("| wall ms | {} |\n", outcome.wall_ms));
+    report.push_str(&format!(
+        "| source tree digest | {} |\n",
+        source_digest.as_deref().unwrap_or("<unavailable>")
+    ));
+    report.push_str(&format!(
+        "| switches | task_progress={} settlement={} opportunity={} recovery={} diag={} |\n",
+        outcome.project_task_progress,
+        outcome.project_settlement,
+        outcome.opportunity,
+        outcome.recovery_surface,
+        outcome.settlement_projection_diagnostics,
+    ));
+    if let Some(error) = &outcome.error {
+        report.push_str(&format!("| error | `{error}` |\n"));
+    }
+    report.push_str(&format!(
+        "\nVerdict: {}\n",
+        if outcome.passed { "PASS" } else { "FAIL" }
+    ));
+    std::fs::write(evidence_root.join("REPORT.md"), &report)?;
+
+    println!("preflight evidence: {}", evidence_root.display());
+    if !outcome.passed {
+        anyhow::bail!("m15 exact-source/product preflight FAILED");
+    }
+    println!("m15 exact-source/product preflight: PASS");
     Ok(())
 }
 
