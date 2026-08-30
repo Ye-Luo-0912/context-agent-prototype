@@ -72,7 +72,9 @@ and sandbox contracts live elsewhere. Experiment facts live in
   recipe runs), the first exact PASS satisfies and identical repeats reuse
   it, and an unrelated failed command survives and keeps completion refused.
   Evidence is event-derived, not fixture-derived; Context/GC/retrieval/
-  packing are untouched.
+  packing are untouched. Closed on commit `7ee56e8` with the four local
+  commands green and dual-platform CI green (run `33305302134`: Ubuntu
+  parts 1+2 and the Windows full suite).
 - M15 remains open. Its shape remains 3 fixtures × normal/resume × 2 repeats =
   12 cells. Historical v3 FAIL windows remain immutable; no v4 formal evidence
   has been run. M12/M13 artifacts remain banked, while `GOV-STATUS-01` still

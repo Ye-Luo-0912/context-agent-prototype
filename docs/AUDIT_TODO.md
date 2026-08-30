@@ -447,8 +447,9 @@ runtime/tool surface:
   the receipt mints but completion stays refused by the
   unresolved-failed-command gate.
 
-The four local commands pass on the closing commit; the dual-platform CI run on
-that commit is recorded in STATUS. No Context/GC/retrieval/packing path
+The four local commands pass on the closing commit `7ee56e8`, and the
+dual-platform CI run `33305302134` is green (Ubuntu parts 1+2 and Windows
+full, check job included). No Context/GC/retrieval/packing path
 changed.
 
 #### FAILURE-SPILL-01 — retire overflowed blockers exactly in long tasks (**open P1; activate before long-horizon evidence or after measured overflow**)
