@@ -25,6 +25,7 @@ use agent_contracts::{
     ModelOutput, ModelProtocolErrorKind, ModelRequest, ModelTransport, RetryAfterMillis,
 };
 use async_trait::async_trait;
+use serde::Serialize;
 
 const DEFAULT_MAX_RETRY_DELAY: Duration = Duration::from_secs(60);
 const MAX_BUFFERED_STREAM_CHUNKS: usize = 16_384;
@@ -99,8 +100,8 @@ fn default_jitter(delay: Duration, retry_number: u32) -> Duration {
         .min(delay)
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum RetryClass {
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub enum RetryClass {
     Transport,
     ToolCallFormat,
 }
@@ -117,6 +118,92 @@ fn retry_class(error: &AgentError) -> Option<RetryClass> {
         } => Some(RetryClass::ToolCallFormat),
         _ => None,
     }
+}
+
+/// One decided retry of a model call. The record is deliberately free of
+/// provider error bodies: those may carry sensitive bytes and belong to
+/// durable typed evidence, not to a retry label.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct RetryIncident {
+    pub class: RetryClass,
+    /// 1-based number of the attempt about to run.
+    pub attempt: u32,
+    /// 1-based within-class retry count for this call.
+    pub class_retry_number: u32,
+    /// Aggregate attempt ceiling of this call.
+    pub total_attempt_limit: u32,
+    pub delay_ms: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub enum StageOutcome {
+    /// Succeeded with no retries.
+    Clean,
+    /// Succeeded after at least one retry.
+    Recovered,
+    /// Failed after the retry budget was exhausted, or the error was not
+    /// retryable at all.
+    GaveUp,
+}
+
+/// Terminal stage of one model call once the retry loop exits.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct CallStage {
+    /// Attempts executed, including the final one.
+    pub attempts: u32,
+    /// Retries consumed by the transport credit.
+    pub transport_retries: u32,
+    /// Retries consumed by the tool-call format credit.
+    pub format_retries: u32,
+    pub outcome: StageOutcome,
+}
+
+fn final_stage(budget: &RetryBudget, succeeded: bool, last_class: Option<RetryClass>) -> CallStage {
+    // The failure counters include the final attempt. Actual retries are one
+    // less for the class of a failed call; on success every failure was a
+    // retry.
+    let (transport_retries, format_retries) = match (succeeded, last_class) {
+        (true, _) => (budget.transport_failures, budget.format_failures),
+        (false, Some(RetryClass::Transport)) => (
+            budget.transport_failures.saturating_sub(1),
+            budget.format_failures,
+        ),
+        (false, Some(RetryClass::ToolCallFormat)) => (
+            budget.transport_failures,
+            budget.format_failures.saturating_sub(1),
+        ),
+        (false, None) => (budget.transport_failures, budget.format_failures),
+    };
+    let outcome = if !succeeded {
+        StageOutcome::GaveUp
+    } else if transport_retries.saturating_add(format_retries) == 0 {
+        StageOutcome::Clean
+    } else {
+        StageOutcome::Recovered
+    };
+    CallStage {
+        attempts: budget.attempts,
+        transport_retries,
+        format_retries,
+        outcome,
+    }
+}
+
+/// Receives typed retry records of model calls. The provider only produces
+/// the records; the host decides persistence (JSONL artifact, event stream,
+/// metrics endpoint). `NullRetryObserver` is the default no-op.
+pub trait RetryObserver: Send + Sync {
+    fn on_incident(&self, incident: &RetryIncident);
+    fn on_stage(&self, stage: &CallStage);
+}
+
+/// Default observer: every method is a no-op, so an unwired transport does
+/// not pay for record formatting.
+pub struct NullRetryObserver;
+
+impl RetryObserver for NullRetryObserver {
+    fn on_incident(&self, _incident: &RetryIncident) {}
+    fn on_stage(&self, _stage: &CallStage) {}
 }
 
 #[cfg(test)]
@@ -230,6 +317,7 @@ pub struct RetryingTransport<T: ModelTransport> {
     inner: T,
     max_attempts: u32,
     schedule: RetrySchedule,
+    observer: Arc<dyn RetryObserver>,
     /// Whole-response buffering mode: chunks are collected internally and
     /// only forwarded to the real sink after a successful attempt, so a
     /// retryable mid-stream failure can replay from scratch. Harnesses
@@ -248,6 +336,7 @@ impl<T: ModelTransport> RetryingTransport<T> {
             inner,
             max_attempts: max_attempts.max(1),
             schedule: RetrySchedule::new(base_delay),
+            observer: Arc::new(NullRetryObserver),
             buffering: false,
         }
     }
@@ -260,8 +349,16 @@ impl<T: ModelTransport> RetryingTransport<T> {
             inner,
             max_attempts: max_attempts.max(1),
             schedule: RetrySchedule::new(base_delay),
+            observer: Arc::new(NullRetryObserver),
             buffering: true,
         }
+    }
+
+    /// Attach a typed retry-record observer. The default is a no-op, so
+    /// callers that only want the stderr log line do not have to opt in.
+    pub fn with_observer(mut self, observer: Arc<dyn RetryObserver>) -> Self {
+        self.observer = observer;
+        self
     }
 
     /// Cap every computed or provider-requested delay. The hard protocol
@@ -316,11 +413,14 @@ impl<T: ModelTransport> ModelTransport for RetryingTransport<T> {
     }
 
     async fn complete(&self, request: ModelRequest) -> AgentResult<ModelOutput> {
-        let (mut output, attempts) =
-            retry(self.max_attempts, &self.schedule, &request.cancel, || {
-                self.inner.complete(request.clone())
-            })
-            .await?;
+        let (mut output, attempts) = retry(
+            self.max_attempts,
+            &self.schedule,
+            &request.cancel,
+            &*self.observer,
+            || self.inner.complete(request.clone()),
+        )
+        .await?;
         stamp_attempt_usage(&mut output, attempts);
         Ok(output)
     }
@@ -357,20 +457,26 @@ impl<T: ModelTransport> RetryingTransport<T> {
             };
             match self.inner.complete_stream(request.clone(), &tracking).await {
                 Ok(mut output) => {
+                    self.observer.on_stage(&final_stage(&budget, true, None));
                     stamp_attempt_usage(&mut output, budget.attempts);
                     return Ok(output);
                 }
                 Err(error) => {
                     let Some(class) = retry_class(&error) else {
+                        self.observer.on_stage(&final_stage(&budget, false, None));
                         return Err(error);
                     };
                     if emitted.load(Ordering::Relaxed) {
                         // A stream that already emitted deltas cannot be
                         // replayed into the same sink: the live listener has
                         // no rewind, and a retry would duplicate the output.
+                        self.observer
+                            .on_stage(&final_stage(&budget, false, Some(class)));
                         return Err(error);
                     }
                     let Some(reservation) = budget.reserve_retry(class) else {
+                        self.observer
+                            .on_stage(&final_stage(&budget, false, Some(class)));
                         return Err(error);
                     };
                     let delay = retry_delay(
@@ -379,6 +485,13 @@ impl<T: ModelTransport> RetryingTransport<T> {
                         reservation.class_retry_number,
                         &error,
                     );
+                    self.observer.on_incident(&RetryIncident {
+                        class,
+                        attempt: reservation.next_attempt,
+                        class_retry_number: reservation.class_retry_number,
+                        total_attempt_limit: reservation.total_attempt_limit,
+                        delay_ms: delay.as_millis().min(u64::MAX as u128) as u64,
+                    });
                     log_retry(
                         reservation.next_attempt,
                         reservation.total_attempt_limit,
@@ -419,14 +532,18 @@ impl<T: ModelTransport> RetryingTransport<T> {
                     for chunk in collected.take()? {
                         sink.on_chunk(chunk).await?;
                     }
+                    self.observer.on_stage(&final_stage(&budget, true, None));
                     stamp_attempt_usage(&mut output, budget.attempts);
                     return Ok(output);
                 }
                 Err(error) => {
                     let Some(class) = retry_class(&error) else {
+                        self.observer.on_stage(&final_stage(&budget, false, None));
                         return Err(error);
                     };
                     let Some(reservation) = budget.reserve_retry(class) else {
+                        self.observer
+                            .on_stage(&final_stage(&budget, false, Some(class)));
                         return Err(error);
                     };
                     let delay = retry_delay(
@@ -435,6 +552,13 @@ impl<T: ModelTransport> RetryingTransport<T> {
                         reservation.class_retry_number,
                         &error,
                     );
+                    self.observer.on_incident(&RetryIncident {
+                        class,
+                        attempt: reservation.next_attempt,
+                        class_retry_number: reservation.class_retry_number,
+                        total_attempt_limit: reservation.total_attempt_limit,
+                        delay_ms: delay.as_millis().min(u64::MAX as u128) as u64,
+                    });
                     log_retry(
                         reservation.next_attempt,
                         reservation.total_attempt_limit,
@@ -553,6 +677,7 @@ async fn retry<T, F, Fut>(
     max_attempts: u32,
     schedule: &RetrySchedule,
     cancel: &CancellationToken,
+    observer: &dyn RetryObserver,
     mut op: F,
 ) -> AgentResult<(T, u32)>
 where
@@ -562,15 +687,27 @@ where
     let mut budget = RetryBudget::new(max_attempts);
     loop {
         match op().await {
-            Ok(value) => return Ok((value, budget.attempts)),
+            Ok(value) => {
+                observer.on_stage(&final_stage(&budget, true, None));
+                return Ok((value, budget.attempts));
+            }
             Err(error) => {
                 let Some(class) = retry_class(&error) else {
+                    observer.on_stage(&final_stage(&budget, false, None));
                     return Err(error);
                 };
                 let Some(reservation) = budget.reserve_retry(class) else {
+                    observer.on_stage(&final_stage(&budget, false, Some(class)));
                     return Err(error);
                 };
                 let delay = retry_delay(class, schedule, reservation.class_retry_number, &error);
+                observer.on_incident(&RetryIncident {
+                    class,
+                    attempt: reservation.next_attempt,
+                    class_retry_number: reservation.class_retry_number,
+                    total_attempt_limit: reservation.total_attempt_limit,
+                    delay_ms: delay.as_millis().min(u64::MAX as u128) as u64,
+                });
                 log_retry(
                     reservation.next_attempt,
                     reservation.total_attempt_limit,
@@ -1364,7 +1501,7 @@ mod tests {
         let schedule = RetrySchedule::new(Duration::from_secs(2));
         let cancel = CancellationToken::new();
 
-        let error = retry(6, &schedule, &cancel, || {
+        let error = retry(6, &schedule, &cancel, &NullRetryObserver, || {
             calls.fetch_add(1, Ordering::SeqCst);
             async {
                 Err::<(), _>(AgentError::ModelProtocol {
@@ -1447,5 +1584,152 @@ mod tests {
         tokio::time::timeout(Duration::from_secs(1), token.cancelled())
             .await
             .expect("cancelled() on an already-cancelled token must resolve");
+    }
+
+    #[derive(Debug, Default)]
+    struct RecordingObserver {
+        incidents: std::sync::Mutex<Vec<RetryIncident>>,
+        stages: std::sync::Mutex<Vec<CallStage>>,
+    }
+
+    impl RetryObserver for RecordingObserver {
+        fn on_incident(&self, incident: &RetryIncident) {
+            self.incidents.lock().unwrap().push(incident.clone());
+        }
+        fn on_stage(&self, stage: &CallStage) {
+            self.stages.lock().unwrap().push(stage.clone());
+        }
+    }
+
+    #[tokio::test]
+    async fn observer_records_recovery_with_class_and_counts() {
+        let calls = Arc::new(AtomicU32::new(0));
+        let inner = Flaky {
+            calls: calls.clone(),
+            failures_before_success: 2,
+            retryable: true,
+        };
+        let observer = Arc::new(RecordingObserver::default());
+        let transport = RetryingTransport::new(inner, 5, Duration::from_millis(1))
+            .with_jitter(|delay, _| delay)
+            .with_observer(observer.clone());
+        let output = transport.complete(request()).await.unwrap();
+        assert_eq!(output.content, "ok");
+        assert_eq!(output.usage.attempts, 3);
+
+        let incidents = observer.incidents.lock().unwrap();
+        assert_eq!(incidents.len(), 2);
+        assert!(incidents.iter().all(|incident| {
+            incident.class == RetryClass::Transport
+                && incident.class_retry_number == incident.attempt.saturating_sub(1)
+        }));
+        assert_eq!(incidents[0].attempt, 2);
+        assert_eq!(incidents[1].attempt, 3);
+        drop(incidents);
+
+        let stages = observer.stages.lock().unwrap();
+        assert_eq!(stages.len(), 1);
+        assert_eq!(stages[0].outcome, StageOutcome::Recovered);
+        assert_eq!(stages[0].attempts, 3);
+        assert_eq!(stages[0].transport_retries, 2);
+        assert_eq!(stages[0].format_retries, 0);
+    }
+
+    #[tokio::test]
+    async fn observer_records_tool_call_format_incidents_separately() {
+        let calls = Arc::new(AtomicU32::new(0));
+        let schedule = RetrySchedule::new(Duration::from_millis(1));
+        let cancel = CancellationToken::new();
+        let observer = Arc::new(RecordingObserver::default());
+        let error = retry(6, &schedule, &cancel, &*observer, || {
+            calls.fetch_add(1, Ordering::SeqCst);
+            async {
+                Err::<(), _>(AgentError::ModelProtocol {
+                    kind: ModelProtocolErrorKind::MalformedToolCall,
+                    message: "EOF while parsing tool arguments".into(),
+                })
+            }
+        })
+        .await
+        .unwrap_err();
+        assert!(matches!(
+            error,
+            AgentError::ModelProtocol {
+                kind: ModelProtocolErrorKind::MalformedToolCall,
+                ..
+            }
+        ));
+        let incidents = observer.incidents.lock().unwrap();
+        assert_eq!(incidents.len(), 1, "one immediate regeneration credit");
+        assert_eq!(incidents[0].class, RetryClass::ToolCallFormat);
+        assert_eq!(incidents[0].delay_ms, 0);
+        drop(incidents);
+        let stages = observer.stages.lock().unwrap();
+        assert_eq!(stages.len(), 1);
+        assert_eq!(stages[0].outcome, StageOutcome::GaveUp);
+        assert_eq!(stages[0].format_retries, 1);
+        assert_eq!(stages[0].transport_retries, 0);
+    }
+
+    #[tokio::test]
+    async fn observer_records_clean_success_and_non_retryable_give_up() {
+        let calls = Arc::new(AtomicU32::new(0));
+        let observer = Arc::new(RecordingObserver::default());
+        let inner = Flaky {
+            calls: calls.clone(),
+            failures_before_success: 0,
+            retryable: true,
+        };
+        let transport = RetryingTransport::new(inner, 5, Duration::from_millis(1))
+            .with_observer(observer.clone());
+        transport.complete(request()).await.unwrap();
+        {
+            let stages = observer.stages.lock().unwrap();
+            assert_eq!(stages.len(), 1);
+            assert_eq!(stages[0].outcome, StageOutcome::Clean);
+            assert_eq!(stages[0].attempts, 1);
+        }
+        assert!(observer.incidents.lock().unwrap().is_empty());
+
+        let calls = Arc::new(AtomicU32::new(0));
+        let observer = Arc::new(RecordingObserver::default());
+        let inner = Flaky {
+            calls: calls.clone(),
+            failures_before_success: 100,
+            retryable: false,
+        };
+        let transport = RetryingTransport::new(inner, 5, Duration::from_millis(1))
+            .with_observer(observer.clone());
+        assert!(transport.complete(request()).await.is_err());
+        {
+            let stages = observer.stages.lock().unwrap();
+            assert_eq!(stages.len(), 1);
+            assert_eq!(stages[0].outcome, StageOutcome::GaveUp);
+            assert_eq!(stages[0].attempts, 1);
+        }
+    }
+
+    #[tokio::test]
+    async fn buffered_stream_observer_records_stage_after_replay() {
+        let calls = Arc::new(AtomicU32::new(0));
+        let inner = EmitsThenFails {
+            calls: calls.clone(),
+            retryable: true,
+        };
+        let observer = Arc::new(RecordingObserver::default());
+        let transport = RetryingTransport::new_buffering(inner, 5, Duration::from_millis(1))
+            .with_jitter(|delay, _| delay)
+            .with_observer(observer.clone());
+        let sink = RecordingSink::default();
+        let output = transport.complete_stream(request(), &sink).await.unwrap();
+        assert_eq!(output.content, "full");
+        let incidents = observer.incidents.lock().unwrap();
+        assert_eq!(incidents.len(), 1);
+        assert_eq!(incidents[0].class, RetryClass::Transport);
+        drop(incidents);
+        let stages = observer.stages.lock().unwrap();
+        assert_eq!(stages.len(), 1);
+        assert_eq!(stages[0].outcome, StageOutcome::Recovered);
+        assert_eq!(stages[0].attempts, 2);
     }
 }

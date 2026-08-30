@@ -16,7 +16,10 @@ mod retry;
 mod sse;
 mod wire_names;
 
-pub use retry::RetryingTransport;
+pub use retry::{
+    CallStage, NullRetryObserver, RetryClass, RetryIncident, RetryObserver, RetryingTransport,
+    StageOutcome,
+};
 
 use std::{
     sync::atomic::{AtomicU8, Ordering},

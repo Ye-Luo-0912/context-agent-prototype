@@ -293,7 +293,11 @@ impl StreamAccumulator {
                     }
                 }
                 if let Some(name) = delta.function.as_ref().and_then(|f| f.name.clone()) {
-                    if slot.name.as_deref().is_some_and(|bound| bound != name.as_str()) {
+                    if slot
+                        .name
+                        .as_deref()
+                        .is_some_and(|bound| bound != name.as_str())
+                    {
                         return Err(protocol_event_error(format!(
                             "Chat Completions tool call at index {} bound name `{name}` but is already `{}`",
                             delta.index,
