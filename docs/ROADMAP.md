@@ -25,7 +25,7 @@ copy them back.
 | M12 Effect Runtime | 🧾 closure-audit evidence banked; governance status pending | The clean-tree evidence table covers brokerable production effects, crash reconciliation, authority/revocation fencing and the named generic shell/process exception (`evidence/platform-closure/m12/`). `GOV-STATUS-01` must reconcile contradictory authority text before an overall closure claim; do not reopen mechanism work from this wording. Details: [`PLATFORM_SECURITY.md`](PLATFORM_SECURITY.md). |
 | M13 Extension Sandbox | 🧾 closure-audit evidence banked; governance status pending | The clean-tree audit covers real-child activation, required refusal and attestation rows (`evidence/platform-closure/m13/`). Universal native `UntrustedGenerated` availability is not the V1 contract and WASI remains V2. `GOV-STATUS-01` owns the status wording. Details: [`PLATFORM_SECURITY.md`](PLATFORM_SECURITY.md). |
 | M14 Resource Policy | ✅ | Schema/context quotas, standing grants, output broker, authority leases. Further typed policy is not a reopen of this gate. |
-| M15 Real Evaluation | 🛑 open; no new window before merged gates | Three valid v3 windows remain valid FAIL evidence (11/12, 9/12, 10/12). The later convergence report remains mechanically FAIL but is causally INVALID/CONFOUNDED because its arm changed all of TaskProgress and checked-file GC projection. `BASELINE-01` closed 2026-08-30: recorded source `1455795`, four local commands green, Ubuntu and Windows CI green on one complete run (Ubuntu runs the suite as two fresh-VM halves because the hosted runner terminates single jobs near 48 minutes of wall time). Verifier-route evidence and selected-path P1 exits remain open. A common-prefix causal fork is required only if the selected candidate enables model-visible settlement. Formal M15 remains 3 fixtures × normal/resume × 2 repeats, with the selected product configuration; it is not settlement off/on. See [`M15_ACCEPTANCE.md`](M15_ACCEPTANCE.md). |
+| M15 Real Evaluation | 🛑 open; exactly one predeclared 12-cell window remains before the gate | Three valid v3 windows remain valid FAIL evidence (11/12, 9/12, 10/12). The later convergence report remains mechanically FAIL but is causally INVALID/CONFOUNDED because its arm changed all of TaskProgress and checked-file GC projection. `BASELINE-01` closed 2026-08-30 (recorded source `1455795`, four local commands green, Ubuntu and Windows CI green). `VERIFY-ROUTE-01` closed 2026-08-30 with its deterministic gate; the bounded one-cell exact-source/product preflight passed 2026-08-30 on commit `df85195` (product surface, explicit protocol, unswitched serving; evidence under `crates/agent-eval/evidence/m15-preflight/`). A common-prefix causal fork is required only if the selected candidate enables model-visible settlement. Formal M15 remains 3 fixtures × normal/resume × 2 repeats, with the selected product configuration; it is not settlement off/on. See [`M15_ACCEPTANCE.md`](M15_ACCEPTANCE.md). |
 | V2 Self-Iteration | 🔒 blocked | Until the governing M12/M13 status is reconciled and M15 closes. The agent may grow capabilities, never evaluation or permission Core authority. |
 
 Open gate order: record the locally green candidate as one clean source and
@@ -49,11 +49,11 @@ packing remain frozen.
    overlay, real actor-order terminal attribution, one-shot RunStart, committed-
    prefix replay and strict provider protocol. A regression in any matrix
    returns to deterministic diagnosis rather than a live run.
-3. Pursue `VERIFY-ROUTE-01`: expose host-declared verifier coverage/identity
-   strength and measure calls to the first criterion-satisfying trusted PASS.
-   Then, for every P1 item exercised by the selected candidate/evidence path,
-   either close it or prove deterministically that it is out-of-path for the formal
-   window. The bounded queue is in
+3. `VERIFY-ROUTE-01` closed 2026-08-30: host-declared verifier
+   coverage/identity strength is model-visible and the deterministic
+   three-cell gate measures calls to the first criterion-satisfying trusted
+   PASS. Every P1 item exercised by the selected candidate/evidence path is
+   closed on that evidence. The bounded queue is in
    [`AUDIT_TODO.md`](AUDIT_TODO.md#p1--v1-correctness-hardening): transactional
    composition, Context I/O/error truth, effect ACK debt, durable typed facts,
    sidecar error semantics, and one aligned tool manifest. Performance rewrites
@@ -65,13 +65,16 @@ packing remain frozen.
    forking both arms from one pre-exposure durable checkpoint and byte-identical
    workspace, preserving opaque ids and one explicit provider protocol. A
    settlement-off base candidate skips this live pair.
-5. Freeze the exact source, product switches, acceptance-declaration identity,
-   tool surface and serving tuple, then run the bounded product preflight. The
-   product hot path must keep TaskProgress on, settlement off by default and
-   must not assemble/hash a counterfactual second request.
+5. **done 2026-08-30** — the exact source, product switches,
+   acceptance-declaration identity, tool surface and serving tuple are frozen
+   and the bounded product preflight passed on commit `df85195`
+   (`agent-eval --m15-preflight`; evidence under
+   `crates/agent-eval/evidence/m15-preflight/`). The product hot path keeps
+   TaskProgress on, settlement off by default and never assembles/hashes a
+   counterfactual second request (recorded `diag=false`).
 6. Formal M15 uses only versioned per-cell artifacts and the already selected
    product configuration. A corrected settlement-off base candidate may enter
-   exact-source preflight without a projection experiment. After a green
+   exact-source preflight without a projection experiment. After the green
    exact-source preflight, run exactly one predeclared 12-cell
    window; valid FAIL rejects the candidate and `NOT_RUN` alone permits a full
    frozen-window rerun.

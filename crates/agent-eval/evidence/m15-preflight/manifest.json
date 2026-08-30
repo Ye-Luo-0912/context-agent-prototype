@@ -1,0 +1,42 @@
+{
+  "cell": {
+    "dir": "crates/agent-eval/evidence/m15-preflight\\retry_policy_dev-normal\\r1\\dynamic",
+    "mode": "normal",
+    "pack_id": "retry_policy_dev",
+    "repeat": 1,
+    "repeats": 1
+  },
+  "outcome": {
+    "behavior": "pass",
+    "closure": "completed",
+    "continuation": "n/a",
+    "diff": "pass",
+    "error": null,
+    "model_rounds": 32,
+    "observed_behavior": "pass",
+    "passed": true,
+    "provider_health": "healthy",
+    "self_check": "pass",
+    "task_completed": true,
+    "turn_completed": true,
+    "verdict": "pass",
+    "wall_ms": 309301
+  },
+  "schema": "m15-preflight.v1",
+  "serving": {
+    "base_url": "https://api.pinaic.com/v1",
+    "model": "gpt-5.6-luna",
+    "protocol": "responses"
+  },
+  "source": {
+    "clean": true,
+    "source_tree_digest": "6ae2509007ee225e5bb9b6e2054d22d6a8a39a06397fb4f00b229ccb203ccff9"
+  },
+  "switches": {
+    "opportunity": false,
+    "project_settlement": false,
+    "project_task_progress": true,
+    "recovery_surface": false,
+    "settlement_projection_diagnostics": false
+  }
+}

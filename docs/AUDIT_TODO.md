@@ -552,7 +552,7 @@ local integrated candidate GREEN
   -> VERIFY-ROUTE-01 evidence (done 2026-08-30: crates/agent-eval/evidence/verify-route/)
   -> selected-path P1 correctness closed or proven out-of-path
   -> same-checkpoint causal fork only if project_settlement changes
-  -> exact-source/product M15 preflight
+  -> exact-source/product M15 preflight (done 2026-08-30 on df85195: crates/agent-eval/evidence/m15-preflight/)
   -> one predeclared formal 12-cell M15 window
 ```
 

@@ -249,12 +249,13 @@ checkpoint, not a milestone exit. Continue in this order:
 2. retain the locally green completion/continuation/required-context,
    criterion-receipt/failure-domain, real actor-order terminal, one-shot
    RunStart/committed-prefix replay and strict provider matrices on that source;
-3. measure `VERIFY-ROUTE-01` to the first criterion-satisfying trusted PASS,
-   then close every P1 item exercised by the selected candidate/evidence path, or
-   record a deterministic proof that the item is out-of-path for this window;
-4. prove the base source has the production-aligned surface TaskProgress on and
-   settlement off. The default product path must not build/hash a
-   counterfactual second request;
+3. **done 2026-08-30** — `VERIFY-ROUTE-01` closed with the deterministic
+   verify-route gate, and the P1 items exercised by the selected
+   candidate/evidence path are closed on that evidence;
+4. **done 2026-08-30** — the bounded product preflight recorded the base
+   source on the production-aligned surface: TaskProgress on and settlement
+   off, all advisory candidates off, and the default product path never
+   builds/hashes a counterfactual second request (`diag=false`);
 5. only if the candidate enables settlement, run a separately frozen off/on
    gate whose arms fork from one pre-exposure durable checkpoint and
    byte-identical workspace, preserve opaque ids, use one explicit provider
@@ -263,13 +264,18 @@ checkpoint, not a milestone exit. Continue in this order:
    not need this live pair;
 6. freeze and record the candidate plus acceptance-declaration identity under
    the §5 cross-window rule;
-7. run the bounded one-cell exact-source/product preflight without changing the
-   serving tuple or using protocol auto-negotiation;
+7. **done 2026-08-30** — the bounded one-cell exact-source/product preflight
+   ran without changing the serving tuple and with an explicit protocol
+   (never auto): `agent-eval --m15-preflight`, one `retry_policy_dev` normal
+   cell, PASS (behavior/diff pass, closure completed, provider healthy,
+   32 model rounds / 76 tool calls, no retryable transport outcome). Evidence
+   under `crates/agent-eval/evidence/m15-preflight/`;
 8. use the preflight-pinned tuple without fallback, record the exact clean
-   source identity, and set an explicit `OPENAI_API_PROTOCOL`;
+   source identity, and set an explicit `OPENAI_API_PROTOCOL` — next before
+   the window;
 9. run exactly one uninterrupted, predeclared 12-cell v4 window with
    `agent-eval --m15-window` and accept only its mechanically regenerated
-   report.
+   report. It has not been run.
 
 300×3 scale, `recall_after_fix`, a 27-cell context expansion, a second context
 engine comparison and model comparison remain parked until this gate closes.

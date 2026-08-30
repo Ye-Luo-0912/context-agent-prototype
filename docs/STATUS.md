@@ -75,6 +75,16 @@ and sandbox contracts live elsewhere. Experiment facts live in
   packing are untouched. Closed on commit `7ee56e8` with the four local
   commands green and dual-platform CI green (run `33305302134`: Ubuntu
   parts 1+2 and the Windows full suite).
+- M15 exact-source/product preflight passed 2026-08-30 on commit `df85195`
+  (clean head; source tree digest `6ae2509007ee225e...`): one
+  `retry_policy_dev` normal cell with the product surface (TaskProgress on,
+  settlement and advisory candidates off, no counterfactual second request)
+  and the unswitched pinned serving tuple with an explicit protocol
+  completed cleanly — behavior/diff pass, closure completed, provider
+  healthy, 32 model rounds / 76 tool calls, no retryable transport outcome.
+  Evidence: `crates/agent-eval/evidence/m15-preflight/`. The single
+  predeclared 12-cell v4 window (M15_ACCEPTANCE §2) is next and has not
+  been run; the serving tuple stays pinned without fallback.
 - M15 remains open. Its shape remains 3 fixtures × normal/resume × 2 repeats =
   12 cells. Historical v3 FAIL windows remain immutable; no v4 formal evidence
   has been run. M12/M13 artifacts remain banked, while `GOV-STATUS-01` still
