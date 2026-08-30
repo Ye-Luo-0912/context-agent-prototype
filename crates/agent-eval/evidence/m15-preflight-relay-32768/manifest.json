@@ -1,0 +1,42 @@
+{
+  "cell": {
+    "dir": "crates/agent-eval/evidence/m15-preflight-relay-32768\\retry_policy_dev-normal\\r1\\dynamic",
+    "mode": "normal",
+    "pack_id": "retry_policy_dev",
+    "repeat": 1,
+    "repeats": 1
+  },
+  "outcome": {
+    "behavior": "pass",
+    "closure": "completed",
+    "continuation": "n/a",
+    "diff": "pass",
+    "error": null,
+    "model_rounds": 17,
+    "observed_behavior": "pass",
+    "passed": true,
+    "provider_health": "healthy",
+    "self_check": "pass",
+    "task_completed": true,
+    "turn_completed": true,
+    "verdict": "pass",
+    "wall_ms": 137449
+  },
+  "schema": "m15-preflight.v1",
+  "serving": {
+    "base_url": "http://127.0.0.1:8787/v1",
+    "model": "deepseek-v4-flash",
+    "protocol": "responses"
+  },
+  "source": {
+    "clean": true,
+    "source_tree_digest": "16d97ccb81696f8bc7cb30eaa54fcbfef0d1d0d749ccdd2d1a576593af874ad2"
+  },
+  "switches": {
+    "opportunity": false,
+    "project_settlement": false,
+    "project_task_progress": true,
+    "recovery_surface": false,
+    "settlement_projection_diagnostics": false
+  }
+}

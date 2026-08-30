@@ -123,6 +123,17 @@ parser rejected fail-closed). No harness, transport or oracle defect; per
 §5 the valid FAIL rejects the relay candidate and M15 remains open.
 Candidate selection is a user decision.
 
+By user decision (2026-08-30) the same relay model was re-pinned with
+32,768 max output tokens. A bounded probe established the tuple can honor
+the cap: the upstream emitted 22,341 output tokens in one response without
+truncation (well beyond the 16,384 that cut the two policy cells). The new
+bounded preflight passed 2026-08-30 on clean HEAD `f32f22d` (source tree
+digest `16d97ccb81696f8b...`): one `retry_policy_dev` normal cell with the
+product surface completed with closure completed, provider healthy, 17
+model rounds / 33 tool calls. Evidence:
+`crates/agent-eval/evidence/m15-preflight-relay-32768/`. The next 12-cell
+window is predeclared on this tuple (§2) and has not been run.
+
 The later Completion Convergence implementation and report do not justify
 another window. The original review found split completion authority,
 continuation advancing the directive epoch, pre-success all-criterion coverage
@@ -330,8 +341,11 @@ checkpoint, not a milestone exit. Continue in this order:
 9. run exactly one uninterrupted, predeclared 12-cell v4 window with
    `agent-eval --m15-window` and accept only its mechanically regenerated
    report. It ran 2026-08-30 on `a25a8a5` and is a valid FAIL (10/12,
-   output-cap truncation on the two `retry_policy_dev` cells); §5 rejects
-   the candidate and M15 remains open.
+   output-cap truncation on the two `retry_policy_dev` cells); the relay
+   candidate was then re-pinned by user decision to 32,768 max output
+   tokens, its preflight passed on the re-pinned tuple (commit `f32f22d`),
+   and the new predeclared window has not been run. §5 rejects a candidate
+   on a valid FAIL without rerun.
 
 300×3 scale, `recall_after_fix`, a 27-cell context expansion, a second context
 engine comparison and model comparison remain parked until this gate closes.

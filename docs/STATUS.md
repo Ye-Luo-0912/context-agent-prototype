@@ -151,6 +151,27 @@ and sandbox contracts live elsewhere. Experiment facts live in
   the relay candidate and returns to diagnosis at
   `crates/agent-eval/evidence/m15-diagnosis-relay/REPORT.md`; the window is
   not rerun. M15 remains open; candidate selection is a user decision.
+- By user decision (2026-08-30) the same relay model was re-pinned with
+  32,768 max output tokens. A bounded probe established the tuple can honor
+  the cap: the upstream emitted 22,341 output tokens in one response without
+  truncation (well beyond the 16,384 that cut the two policy cells).
+- The 32,768-tuple exact-source/product preflight passed 2026-08-30 on
+  commit `f32f22d` (clean head; source tree digest `16d97ccb81696f8b...`):
+  one `retry_policy_dev` normal cell with the product surface (TaskProgress
+  on, settlement and advisory candidates off, no counterfactual second
+  request) completed cleanly — behavior/diff pass, closure completed,
+  provider healthy, 17 model rounds / 33 tool calls. Evidence:
+  `crates/agent-eval/evidence/m15-preflight-relay-32768/`.
+- The 12-cell v4 window on the 32,768-tuple is **predeclared 2026-08-30
+  before the run**: 3 fixtures × normal/resume × 2 repeats, the product
+  surface, the relay serving tuple with an explicit protocol and 32,768 max
+  output tokens, one uninterrupted `agent-eval --m15-window` run whose cell
+  directories land under
+  `crates/agent-eval/evidence/m15-window/_windows/<timestamp>/`. The exact
+  clean source identity is recorded at launch per M15_ACCEPTANCE §7 item 8;
+  no source change happens during the run, the frozen-window rules of
+  M15_ACCEPTANCE §5 apply, and the mechanically regenerated report is the
+  only accepted verdict.
 - M15 remains open. Its shape remains 3 fixtures × normal/resume × 2 repeats =
   12 cells. Historical v3 FAIL windows remain immutable; the two v4 windows
   (valid FAILs 9/12 on `d1936d4` and 10/12 on `a25a8a5`) are banked and no
