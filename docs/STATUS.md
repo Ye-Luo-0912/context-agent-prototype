@@ -95,6 +95,15 @@ and sandbox contracts live elsewhere. Experiment facts live in
   item 8; no source change happens during the run, the frozen-window rules
   of M15_ACCEPTANCE §5 apply, and the mechanically regenerated report is
   the only accepted verdict.
+- The 12-cell v4 window ran 2026-08-30 on the predeclared clean source
+  `d1936d4` (product surface, pinned serving, explicit protocol) and is a
+  **valid FAIL: 9/12 pass, 0 NOT_RUN** — the mechanical report at
+  `crates/agent-eval/evidence/m15-window/_windows/1788093162603/`. Migrate
+  4/4; policy 3/4 (normal r2 exhausted the 48-round tool budget before
+  closure); diag 2/4, both failures using the invalid `checked_shl`
+  saturation strategy against the frozen saturate-not-wrap oracle. Per
+  M15_ACCEPTANCE §5 the valid FAIL rejects the current base candidate and
+  returns to diagnosis; the window is not rerun.
 - M15 remains open. Its shape remains 3 fixtures × normal/resume × 2 repeats =
   12 cells. Historical v3 FAIL windows remain immutable; no v4 formal evidence
   has been run. M12/M13 artifacts remain banked, while `GOV-STATUS-01` still

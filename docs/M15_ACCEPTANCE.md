@@ -72,6 +72,17 @@ across the windows; formal diag is 6/12 and every failure uses the same invalid
 `checked_shl` saturation strategy. This is not a harness or transport defect;
 it is a model/solver weakness on the pinned serving. M15 remains open.
 
+The first formal v4 window is also a valid FAIL:
+`crates/agent-eval/evidence/m15-window/_windows/1788093162603` (run
+2026-08-30 on the predeclared clean source `d1936d4`, product surface,
+pinned serving): 9/12 pass, 0 NOT_RUN, all provider healthy. Migrate 4/4 and
+policy 3/4 (normal r2 exhausted the 48-round tool budget before closing);
+diag 2/4, its two failures again using the invalid `checked_shl` saturation
+strategy against the frozen saturate-not-wrap oracle while the r1 and the
+resume r2 of the same pack passed. Per the §5 cross-window rule this valid
+FAIL rejects the current base candidate and returns to diagnosis; the window
+is not rerun. M15 remains open.
+
 The later Completion Convergence implementation and report do not justify
 another window. The original review found split completion authority,
 continuation advancing the directive epoch, pre-success all-criterion coverage

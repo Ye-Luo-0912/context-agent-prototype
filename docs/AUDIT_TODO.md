@@ -553,7 +553,9 @@ local integrated candidate GREEN
   -> selected-path P1 correctness closed or proven out-of-path
   -> same-checkpoint causal fork only if project_settlement changes
   -> exact-source/product M15 preflight (done 2026-08-30 on df85195: crates/agent-eval/evidence/m15-preflight/)
-  -> one predeclared formal 12-cell M15 window
+  -> one predeclared formal 12-cell M15 window (run 2026-08-30 on d1936d4: valid FAIL 9/12,
+     evidence crates/agent-eval/evidence/m15-window/_windows/1788093162603;
+     per M15_ACCEPTANCE §5 the candidate is rejected and returns to diagnosis)
 ```
 
 The settlement candidate gate, if it is run again after deterministic fixes,
