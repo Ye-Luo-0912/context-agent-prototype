@@ -100,10 +100,16 @@ and sandbox contracts live elsewhere. Experiment facts live in
   **valid FAIL: 9/12 pass, 0 NOT_RUN** — the mechanical report at
   `crates/agent-eval/evidence/m15-window/_windows/1788093162603/`. Migrate
   4/4; policy 3/4 (normal r2 exhausted the 48-round tool budget before
-  closure); diag 2/4, both failures using the invalid `checked_shl`
-  saturation strategy against the frozen saturate-not-wrap oracle. Per
+  closure); strategi against the frozen saturate-not-wrap oracle. Per
   M15_ACCEPTANCE §5 the valid FAIL rejects the current base candidate and
-  returns to diagnosis; the window is not rerun.
+  returns to diagnosis; the window is not rerun. Post-window diagnosis at
+  `crates/agent-eval/evidence/m15-diagnosis/REPORT.md` closes both
+  mechanisms from the immutable cell streams (diag: `checked_shl`
+  truncates overflow to zero — `100u64 << 62` → 0 — against the frozen
+  `u128`-widening marker; policy: completion refused on a stale
+  verification basis plus one unresolved failed command, then no re-proposal
+  and budget exhaustion). No harness/transport/oracle defect; candidate
+  selection is a user decision.
 - M15 remains open. Its shape remains 3 fixtures × normal/resume × 2 repeats =
   12 cells. Historical v3 FAIL windows remain immutable; no v4 formal evidence
   has been run. M12/M13 artifacts remain banked, while `GOV-STATUS-01` still

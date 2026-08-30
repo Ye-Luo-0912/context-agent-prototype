@@ -83,6 +83,17 @@ resume r2 of the same pack passed. Per the §5 cross-window rule this valid
 FAIL rejects the current base candidate and returns to diagnosis; the window
 is not rerun. M15 remains open.
 
+Post-window diagnosis (2026-08-30) under
+`crates/agent-eval/evidence/m15-diagnosis/REPORT.md` closes both mechanisms
+from the immutable cell streams: the diag failures are an exact
+overflow-truncation fault (`checked_shl` checks only the shift count, so
+`100u64 << 62` truncates to `0`; the frozen `u128`-widening marker names the
+same defect class), and the policy failure is an incomplete closure loop
+(completion refused on a stale verification basis plus one unresolved failed
+command; the model refreshes the PASS but never re-proposes). No harness,
+transport or oracle defect is present; candidate selection is a user
+decision.
+
 The later Completion Convergence implementation and report do not justify
 another window. The original review found split completion authority,
 continuation advancing the directive epoch, pre-success all-criterion coverage
