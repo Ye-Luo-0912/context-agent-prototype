@@ -143,18 +143,18 @@ and sandbox contracts live elsewhere. Experiment facts live in
   clean source `a25a8a5` (product surface, relay serving, explicit protocol)
   and is a **valid FAIL: 10/12 pass, 0 NOT_RUN** — the mechanical report at
   `crates/agent-eval/evidence/m15-window/_windows/1788105967425/`. Diag 4/4
-  and migrate 4/4; policy 2/4, its two failures sharing one mechanism: the
-  model emitted single responses beyond the pinned 16,384 max output tokens
-  (normal r2: explicit output-limit error at round 6; resume r2: a
-  truncated ~8 KB list-typed tool-call argument rejected fail-closed by the
-  provider's strict parser). Per M15_ACCEPTANCE §5 the valid FAIL rejects
-  the relay candidate and returns to diagnosis at
+  and migrate 4/4; policy 2/4, its two failures resolved into two
+  mechanisms (the attribution is corrected by the 32,768 window below):
+  `normal r2` died on the explicit output-limit error, while `resume r2`'s
+  ~8 KB malformed tool-call argument is the same model wire-quality
+  weakness that recurs independently of the cap. Per M15_ACCEPTANCE §5 the
+  valid FAIL rejects the relay candidate and returns to diagnosis at
   `crates/agent-eval/evidence/m15-diagnosis-relay/REPORT.md`; the window is
   not rerun. M15 remains open; candidate selection is a user decision.
 - By user decision (2026-08-30) the same relay model was re-pinned with
   32,768 max output tokens. A bounded probe established the tuple can honor
   the cap: the upstream emitted 22,341 output tokens in one response without
-  truncation (well beyond the 16,384 that cut the two policy cells).
+  truncation.
 - The 32,768-tuple exact-source/product preflight passed 2026-08-30 on
   commit `f32f22d` (clean head; source tree digest `16d97ccb81696f8b...`):
   one `retry_policy_dev` normal cell with the product surface (TaskProgress
@@ -172,11 +172,28 @@ and sandbox contracts live elsewhere. Experiment facts live in
   no source change happens during the run, the frozen-window rules of
   M15_ACCEPTANCE §5 apply, and the mechanically regenerated report is the
   only accepted verdict.
+- The 12-cell v4 window on the 32,768-tuple ran 2026-08-30 on the
+  predeclared clean source `ab4534a` (product surface, relay serving,
+  explicit protocol, 32,768 max output tokens) and is a **valid FAIL:
+  9/12 pass, 0 NOT_RUN** — the mechanical report at
+  `crates/agent-eval/evidence/m15-window/_windows/1788109477415/`. Diag
+  3/4 and migrate 4/4; policy 2/4. All three failures are
+  `malformed-tool-call` at argument columns far below either output cap
+  (521 / 10,526 / 10,736 characters): the model emitted tool-call argument
+  JSON that ends prematurely (EOF mid-list) or breaks JSON syntax,
+  rejected fail-closed by the provider's strict parser. This corrects the
+  16,384-window attribution: only `policy normal r2`'s explicit
+  output-limit error was cap-bound; malformed arguments recur
+  independently of the cap (diagnosis at
+  `crates/agent-eval/evidence/m15-diagnosis-relay-32768/REPORT.md`). Per
+  M15_ACCEPTANCE §5 the valid FAIL rejects the 32,768 relay tuple; the
+  window is not rerun. M15 remains open; candidate selection is a user
+  decision.
 - M15 remains open. Its shape remains 3 fixtures × normal/resume × 2 repeats =
-  12 cells. Historical v3 FAIL windows remain immutable; the two v4 windows
-  (valid FAILs 9/12 on `d1936d4` and 10/12 on `a25a8a5`) are banked and no
-  v4 window has passed. M12/M13 artifacts remain banked, while
-  `GOV-STATUS-01` still forbids a new closure claim or Self-Iteration
+  12 cells. Historical v3 FAIL windows remain immutable; the three v4 windows
+  (valid FAILs 9/12 on `d1936d4`, 10/12 on `a25a8a5`, 9/12 on `ab4534a`)
+  are banked and no v4 window has passed. M12/M13 artifacts remain banked,
+  while `GOV-STATUS-01` still forbids a new closure claim or Self-Iteration
   transition.
 
 ### Historical evidence chronology (non-authoritative)
