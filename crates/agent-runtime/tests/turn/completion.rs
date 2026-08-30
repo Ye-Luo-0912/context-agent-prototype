@@ -1798,3 +1798,143 @@ async fn an_accepted_completion_leaves_a_clean_turn_for_queued_input() {
     );
     instance.shutdown().await.unwrap();
 }
+
+/// Scripts two off-surface attempts (canonical dotted name, then provider
+/// wire spelling), an exact-current verify, then one completion proposal.
+/// Refusals stay visible in the next request; the task closes in one pass.
+#[derive(Debug)]
+struct OffSurfaceAttemptModel {
+    rounds: AtomicUsize,
+    requests: Arc<std::sync::Mutex<Vec<String>>>,
+}
+
+#[async_trait::async_trait]
+impl ModelTransport for OffSurfaceAttemptModel {
+    fn capabilities(&self) -> ModelCapabilities {
+        ModelCapabilities::default()
+    }
+
+    async fn complete(&self, request: ModelRequest) -> AgentResult<ModelOutput> {
+        self.requests.lock().unwrap().push(
+            request
+                .messages
+                .iter()
+                .map(|message| message.content.as_str())
+                .collect::<Vec<_>>()
+                .join("\n"),
+        );
+        let round = self.rounds.fetch_add(1, Ordering::SeqCst);
+        let call = match round {
+            0 => ToolCall {
+                id: "off-surface-dotted".into(),
+                name: "fs.write".into(),
+                arguments: json!({"path": "src/lib.rs", "body": "fix"}),
+            },
+            1 => ToolCall {
+                id: "off-surface-wire".into(),
+                name: "fs_mkdir".into(),
+                arguments: json!({"path": "src/generated"}),
+            },
+            2 => ToolCall {
+                id: "exact-verify".into(),
+                name: "test.verify".into(),
+                arguments: json!({"suite": "all"}),
+            },
+            _ => ToolCall {
+                id: "complete".into(),
+                name: "task.complete".into(),
+                arguments: json!({"summary": "implemented and verified", "artifacts": []}),
+            },
+        };
+        Ok(ModelOutput {
+            content: String::new(),
+            tool_calls: vec![call],
+            usage: Default::default(),
+        })
+    }
+}
+
+#[tokio::test]
+async fn unloaded_surface_attempts_are_visible_but_never_completion_debt() {
+    let requests = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let model = Arc::new(OffSurfaceAttemptModel {
+        rounds: AtomicUsize::new(0),
+        requests: requests.clone(),
+    });
+    let services = RuntimeServices::new(
+        CoreAuthorityConfig::default(),
+        Arc::new(TestContextEngine),
+        model.clone(),
+        Arc::new(WithCompletionVerificationTools {
+            inner: CompletionToolDispatcher { workspace: None },
+        }),
+        Arc::new(PolicyApprovalGate::read_only()),
+        None,
+    );
+    let instance = RuntimeInstance::spawn(ModuleHost::new(), services);
+    let handle = instance.handle();
+    let mut events = handle.subscribe();
+    handle.start().await.unwrap();
+    declare_completion_acceptance(handle, "implement and verify before closing").await;
+    handle.user_message("do the work".into()).await.unwrap();
+
+    let mut task_completed = false;
+    let mut surface_refusals = Vec::new();
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+    while tokio::time::Instant::now() < deadline && !task_completed {
+        if let Ok(Ok(envelope)) =
+            tokio::time::timeout(Duration::from_millis(50), events.recv()).await
+        {
+            match envelope.event {
+                RuntimeEvent::ToolFinished { output }
+                    if matches!(output.tool_name.as_str(), "fs.write" | "fs_mkdir") =>
+                {
+                    surface_refusals.push(output);
+                }
+                RuntimeEvent::ToolFinished { output } if output.tool_name == "task.complete" => {
+                    assert!(
+                        output.ok,
+                        "completion must be accepted once: {}",
+                        output.model_content
+                    );
+                }
+                RuntimeEvent::TaskCompleted { .. } => task_completed = true,
+                _ => {}
+            }
+        }
+    }
+    assert!(
+        task_completed,
+        "an off-surface attempt incident must not block a verified completion"
+    );
+    assert_eq!(
+        surface_refusals.len(),
+        2,
+        "both the dotted canonical name and the wire spelling must be refused"
+    );
+    for refused in &surface_refusals {
+        assert!(!refused.ok);
+        assert_eq!(
+            refused.failure_class(),
+            Some(agent_contracts::ToolFailureClass::SurfaceUnavailable),
+            "off-surface refusals keep the typed surface-unavailable class: {refused:?}"
+        );
+        assert_eq!(refused.metadata["executed"], false);
+    }
+    let captured = requests.lock().unwrap().clone();
+    assert!(
+        captured
+            .get(1)
+            .is_some_and(|text| text.contains("only schemas in that captured surface may be called")),
+        "the first refusal must be visible to the next model decision"
+    );
+    assert!(
+        captured
+            .get(2)
+            .is_some_and(|text| text.contains("only schemas in that captured surface may be called")),
+        "the wire-spelling refusal must also be visible to the next model decision"
+    );
+    let checkpoint = instance.checkpoint().await.unwrap();
+    assert_eq!(checkpoint.tasks.completed.len(), 1);
+    instance.shutdown().await.unwrap();
+}
