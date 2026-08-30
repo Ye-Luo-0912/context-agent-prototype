@@ -145,6 +145,30 @@ recur independently of the cap. No harness, transport or oracle defect;
 per §5 the valid FAIL rejects the 32,768 relay tuple and M15 remains open.
 Candidate selection is a user decision.
 
+By user decision (2026-08-31) the route changed from switching models to
+fixing the intermittent malformed tool-call output at the harness. The
+relay serves no suitable alternative on the pinned Responses protocol:
+only `deepseek-v4-flash`, `deepseek-v4-pro` and `grok-4.5` are available,
+the Qwen models (`qwen3.8-max`, `qwen3.7-max`, ...) return 401 "not
+supported for format openai", and glm/kimi/hy3/mimo answer 501 (Responses
+unavailable). The fix is commit `41f06ad` (CI `33325617880` green): the
+default system prompt now states the requirement explicitly — every tool
+call argument must be one complete valid JSON value — and
+`provider-openai` classifies the model-emitted `MalformedToolCall`
+(argument JSON ending prematurely or breaking JSON syntax, at columns far
+below the output cap) as retryable, so the eval's buffering transport
+re-issues the request from scratch: bounded, never leaking the rejected
+stream into the sink, with persistent malformed output still failing
+honestly and recording the attempt count. Wire damage (`MalformedEvent`)
+stays non-retryable and interactive hosts never replay emitted deltas.
+The re-pinned exact-source/product preflight passed 2026-08-31 on clean
+HEAD `41f06ad` (source tree digest `d4b4da3517f7a3e8...`): one
+`retry_policy_dev` normal cell, closure completed, provider healthy,
+16 model rounds / 27 tool calls, evidence
+`crates/agent-eval/evidence/m15-preflight-relay-fix/`. The predeclared
+12-cell v4 window on this source is scheduled 2026-08-31; no claim is
+made until its mechanically regenerated report passes.
+
 The later Completion Convergence implementation and report do not justify
 another window. The original review found split completion authority,
 continuation advancing the directive epoch, pre-success all-criterion coverage
@@ -357,7 +381,20 @@ checkpoint, not a milestone exit. Continue in this order:
    tokens, its preflight passed on the re-pinned tuple (commit `f32f22d`),
    and the re-pinned window ran 2026-08-30 on `ab4534a` and is a valid FAIL
    (9/12, malformed tool-call argument JSON on three cells). §5 rejects a
-   candidate on a valid FAIL without rerun; M15 remains open.
+   candidate on a valid FAIL without rerun; M15 remains open. By user
+   decision (2026-08-31) the route became a harness fix instead of a model
+   switch — the relay serves only v4Flash/v4Pro/grok-4.5 on Responses, Qwen
+   returns 401 "not supported for format openai", glm/kimi 501 — landing in
+   commit `41f06ad` (CI `33325617880` green): the default system prompt
+   requires every tool call argument to be one complete valid JSON value,
+   and the model-emitted `MalformedToolCall` became retryable in the eval's
+   buffering transport (request re-issued from scratch, bounded, rejected
+   stream never leaked, `MalformedEvent` stays non-retryable, interactive
+   hosts never replay). The exact-source preflight then passed on clean
+   HEAD `41f06ad` (digest `d4b4da3517f7a3e8...`, evidence
+   `crates/agent-eval/evidence/m15-preflight-relay-fix/`). The next 12-cell
+   v4 window on this source is predeclared 2026-08-31; M15 stays open until
+   a window's mechanically regenerated report passes.
 
 300×3 scale, `recall_after_fix`, a 27-cell context expansion, a second context
 engine comparison and model comparison remain parked until this gate closes.

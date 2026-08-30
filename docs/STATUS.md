@@ -189,6 +189,41 @@ and sandbox contracts live elsewhere. Experiment facts live in
   M15_ACCEPTANCE §5 the valid FAIL rejects the 32,768 relay tuple; the
   window is not rerun. M15 remains open; candidate selection is a user
   decision.
+- Model-candidate probes (2026-08-31): the relay serves only
+  `deepseek-v4-flash`, `deepseek-v4-pro` and `grok-4.5` on the Responses
+  endpoint (the protocol the harness pins); the Qwen models
+  (`qwen3.8-max`, `qwen3.7-max`, ...) exist on the relay but return 401
+  "not supported for format openai", and glm/kimi/hy3/mimo answer 501
+  (Responses unavailable). By user decision the route became: solve the
+  intermittent malformed tool-call problem at the harness rather than
+  switching models.
+- Harness fix (commit `41f06ad`, CI `33325617880` green, 2026-08-31):
+  the default system prompt now requires every tool call argument to be
+  one complete valid JSON value, and `provider-openai` classifies the
+  model-emitted `MalformedToolCall` (argument JSON that ends prematurely
+  or breaks JSON syntax, at columns far below the output cap) as
+  retryable: the eval's buffering transport re-issues the request from
+  scratch, never leaks the rejected stream into the sink, and is bounded,
+  so persistent malformed output still fails honestly with the attempt
+  count recorded. Wire damage (`MalformedEvent`) stays non-retryable and
+  interactive (live) hosts never replay emitted deltas.
+- The re-pinned exact-source/product preflight passed 2026-08-31 on
+  commit `41f06ad` (clean head; source tree digest `d4b4da3517f7a3e8...`):
+  one `retry_policy_dev` normal cell with the product surface (TaskProgress
+  on, settlement and advisory candidates off, no counterfactual second
+  request) completed cleanly — behavior/diff pass, closure completed,
+  provider healthy, 16 model rounds / 27 tool calls. Evidence:
+  `crates/agent-eval/evidence/m15-preflight-relay-fix/`.
+- The 12-cell v4 window on the fixed source is **predeclared 2026-08-31
+  before the run**: 3 fixtures × normal/resume × 2 repeats, the product
+  surface, the relay serving tuple (v4Flash, Responses, 32,768 max output
+  tokens), one uninterrupted `agent-eval --m15-window` run whose cell
+  directories land under
+  `crates/agent-eval/evidence/m15-window/_windows/<timestamp>/`. The exact
+  clean source identity is recorded at launch per M15_ACCEPTANCE §7 item 8;
+  no source change happens during the run, the frozen-window rules of
+  M15_ACCEPTANCE §5 apply, and the mechanically regenerated report is the
+  only accepted verdict.
 - M15 remains open. Its shape remains 3 fixtures × normal/resume × 2 repeats =
   12 cells. Historical v3 FAIL windows remain immutable; the three v4 windows
   (valid FAILs 9/12 on `d1936d4`, 10/12 on `a25a8a5`, 9/12 on `ab4534a`)
