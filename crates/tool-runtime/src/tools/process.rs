@@ -37,6 +37,7 @@ const MAX_ENV_VALUE_CHARS: usize = 16_384;
 /// part of the scope identity, so two different candidate families cannot
 /// silently alias at the boundary.
 const MAX_RESOLUTION_BASES: usize = 256;
+#[cfg(windows)]
 const MAX_PATHEXT_ENTRIES: usize = 32;
 
 // TOOL-PROC-01：argv0 的解析语义由 host 显式定义，不再依赖
@@ -119,6 +120,8 @@ fn candidate_executable(
     path: std::path::PathBuf,
     extensions: &[String],
 ) -> Option<std::path::PathBuf> {
+    #[cfg(not(windows))]
+    let _ = extensions;
     if path.is_file() {
         return Some(path);
     }
