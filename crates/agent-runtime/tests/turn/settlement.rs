@@ -537,8 +537,10 @@ impl RuntimeEventEnvelopeCollector {
         let mut turn_done = false;
         // Durable post-turn events (checkpoint, TaskCompleted) are emitted
         // after the turn boundary, so once the queue is quiet we sweep a
-        // bounded grace window before returning.
-        let mut quiet = false;
+        // bounded grace window before returning. Under CI load the durable
+        // batch can arrive more than one 25ms round late, so require three
+        // consecutive empty rounds before declaring the turn fully drained.
+        let mut quiet_rounds = 0u32;
         while tokio::time::Instant::now() < deadline {
             let mut drained_any = false;
             while let Ok(envelope) = self.events.try_recv() {
@@ -547,10 +549,12 @@ impl RuntimeEventEnvelopeCollector {
                 seen.push(envelope);
             }
             if turn_done && !drained_any {
-                if quiet {
+                quiet_rounds += 1;
+                if quiet_rounds >= 3 {
                     break;
                 }
-                quiet = true;
+            } else {
+                quiet_rounds = 0;
             }
             tokio::time::sleep(Duration::from_millis(25)).await;
         }

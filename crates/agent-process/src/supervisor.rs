@@ -111,6 +111,13 @@ impl ProcessSupervisor {
         self.pid.store(0, Ordering::Relaxed);
     }
 
+    /// Non-blocking exit probe: true once the child has been reaped as
+    /// exited. Used to distinguish a server that never started (spawn
+    /// error swallowed on unix) from one that died after a handshake.
+    pub async fn try_exited(&self) -> bool {
+        self.child.lock().await.try_wait().ok().flatten().is_some()
+    }
+
     /// Kill the tree then await reap. Error/cancel/timeout paths use this
     /// before returning.
     pub async fn terminate(&self) {

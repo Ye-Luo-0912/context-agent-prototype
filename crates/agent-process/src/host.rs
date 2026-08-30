@@ -262,6 +262,14 @@ pub fn apply_unix_rlimits(
 pub fn close_inherited_fds() {
     const MAX_INHERITED_FD_SCAN: libc::c_int = 4096;
     for fd in 3..MAX_INHERITED_FD_SCAN {
+        // Skip descriptors that exec closes anyway (FD_CLOEXEC): the
+        // spawn error pipe relies on surviving until exec, so sweeping it
+        // would turn a missing executable into a silent immediate child
+        // exit instead of a spawn error.
+        let flags = unsafe { libc::fcntl(fd, libc::F_GETFD) };
+        if flags >= 0 && (flags & libc::FD_CLOEXEC) != 0 {
+            continue;
+        }
         let _ = unsafe { libc::close(fd) };
     }
 }

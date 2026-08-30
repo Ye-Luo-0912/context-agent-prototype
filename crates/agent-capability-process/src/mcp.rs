@@ -622,9 +622,22 @@ impl McpClient<tokio::process::ChildStdout, tokio::process::ChildStdin> {
         client.supervisor = Some(ProcessSupervisor::from_child(child, pid));
         if let Err(error) = client.initialize().await {
             // The handshake failed: the spawned server must not be left
-            // running. Kill and reap it before surfacing the error.
+            // running. Kill and reap it before surfacing the error. When
+            // the child already exited (a missing executable or a server
+            // that dies before speaking), surface a clean start error
+            // rather than a protocol poisoning.
+            let server_exited = match &client.supervisor {
+                Some(supervisor) => supervisor.try_exited().await,
+                None => false,
+            };
             client.poison("initialize handshake failed".into());
             client.reap().await;
+            if server_exited {
+                return Err(AgentError::Tool(format!(
+                    "spawn MCP server '{}' exited before the handshake completed",
+                    decl.program
+                )));
+            }
             return Err(error);
         }
         // The private cwd is owned by the client: it lives for the child's
