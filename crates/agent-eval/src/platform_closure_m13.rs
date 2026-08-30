@@ -145,6 +145,7 @@ fn evidence_refs(evidence: &SandboxEvidence) -> Vec<String> {
 // Fixture plumbing
 // ---------------------------------------------------------------------------
 
+#[cfg(windows)]
 const WINDOWS_BACKEND: &str = "windows/integrity+jobobject v1";
 
 fn demo_manifest(profile: SandboxProfile, program: &str) -> CapabilityManifest {
