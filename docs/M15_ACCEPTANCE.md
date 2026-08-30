@@ -36,15 +36,16 @@ serving may be pinned only after a bounded representative preflight proves the
 same endpoint/model/protocol/context-window tuple can start, edit and finish
 one fixture. The formal window then uses that one tuple without switching.
 
-That preflight passed on 2026-08-28 and pins PinAI `/v1`,
+That preflight passed on 2026-08-28 and pinned PinAI `/v1`,
 `gpt-5.6-luna`, Responses, 128,000 tokens. The source-bound dirty-tree
 `retry_policy_dev` normal cell passed behavior, diff and closure-required
 completion in 26 rounds / 59 calls with zero provider retries. It is not one
 of the formal cells and makes no comparative performance claim; its role is
 only to prevent spending the clean 12-cell budget on an unproven serving.
 
-The serving tuple remains pinned, but this source-bound product preflight
-predates the catalog-cold `fs.mkdir` addition and its admission decision.
+The PinAI serving tuple stayed pinned through the first v4 window, but this
+source-bound product preflight predates the catalog-cold `fs.mkdir` addition
+and its admission decision.
 The `TOOL-DIR-SURFACE-01` deterministic gate landed (2026-08-28): a typed
 missing-parent refusal surfaces exactly `fs.mkdir` with `RecoverySurface`
 provenance for one decision, approval unchanged, unrelated missing reads
@@ -93,6 +94,25 @@ same defect class), and the policy failure is an incomplete closure loop
 command; the model refreshes the PASS but never re-proposes). No harness,
 transport or oracle defect is present; candidate selection is a user
 decision.
+
+The serving/model candidate then switched by user decision (2026-08-30) to
+the localhost OpenCode relay tuple (`http://127.0.0.1:8787/v1`,
+`deepseek-v4-flash`, Responses, 128,000 tokens, 16,384 max output tokens).
+Its preflight chain surfaced one harness defect, fixed in `provider-openai`
+(commit `a242736`): a model call recorded raw while its tool was not yet
+exposed (e.g. `fs_mkdir` for `fs.mkdir`) stayed in history, and the
+per-request wire-name codec failed closed once the spec became exposed.
+Spec mappings are now authoritative and colliding history wire names are
+that tool's wire form (skipped, not errors); spec-vs-spec collisions still
+fail closed. The relay bounded preflight then passed 2026-08-30 on commit
+`a242736` (clean head; source tree digest `f8b57b46a3e56c49...`): one
+`retry_policy_dev` normal cell with the product surface (TaskProgress on,
+settlement and advisory candidates off) completed with behavior/diff pass,
+closure completed, provider healthy, 23 model rounds / 35 tool calls.
+Evidence: `crates/agent-eval/evidence/m15-preflight-relay/`, with the three
+earlier failed attempts retained (Chat SSE shape, 4,096-token output
+truncation, wire-name collision). The next 12-cell window is predeclared on
+this tuple (§2) and has not been run.
 
 The later Completion Convergence implementation and report do not justify
 another window. The original review found split completion authority,
@@ -289,9 +309,11 @@ checkpoint, not a milestone exit. Continue in this order:
 7. **done 2026-08-30** — the bounded one-cell exact-source/product preflight
    ran without changing the serving tuple and with an explicit protocol
    (never auto): `agent-eval --m15-preflight`, one `retry_policy_dev` normal
-   cell, PASS (behavior/diff pass, closure completed, provider healthy,
-   32 model rounds / 76 tool calls, no retryable transport outcome). Evidence
-   under `crates/agent-eval/evidence/m15-preflight/`;
+   cell, PASS (behavior/diff pass, closure completed, provider healthy) on
+   the relay tuple (`http://127.0.0.1:8787/v1`, `deepseek-v4-flash`,
+   Responses, 16,384 max output tokens after a `provider-openai` wire-name
+   fix) — 23 model rounds / 35 tool calls, no retryable transport outcome.
+   Evidence under `crates/agent-eval/evidence/m15-preflight-relay/`;
 8. use the preflight-pinned tuple without fallback, record the exact clean
    source identity, and set an explicit `OPENAI_API_PROTOCOL` — next before
    the window;

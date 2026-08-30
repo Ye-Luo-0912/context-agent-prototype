@@ -1,0 +1,18 @@
+{
+  "schema": "agent-eval.cell.v1",
+  "fixture_id": "retry_policy_dev",
+  "engine": "dynamic",
+  "repeat": 1,
+  "repeats": 1,
+  "live": true,
+  "tool_surface": "production",
+  "fixture_sha256": "5055c1c58b0b24ac6e12f696a342bc214ea0c239dc91b5b5866e2378719762ca",
+  "git_head": "290a135eafbf4c13f613ff666ed7513a9cc8a2d2",
+  "git_dirty": false,
+  "git_dirty_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+  "source_tree_digest": "b4cef0248ab4548be92c039cf96f54370d79d9299d30f69da5058b3d8fdf2bb2",
+  "openai_model": "deepseek-v4-flash",
+  "openai_base_url": "http://127.0.0.1:8787/v1",
+  "openai_protocol": "responses",
+  "openai_context_window": "128000"
+}

@@ -110,10 +110,41 @@ and sandbox contracts live elsewhere. Experiment facts live in
   verification basis plus one unresolved failed command, then no re-proposal
   and budget exhaustion). No harness/transport/oracle defect; candidate
   selection is a user decision.
+- The serving/model candidate switched by user decision (2026-08-30) to the
+  localhost OpenCode relay tuple (`http://127.0.0.1:8787/v1`,
+  `deepseek-v4-flash`, Responses, 128k context, 16,384 max output tokens).
+  Its preflight chain surfaced one harness defect, fixed in `provider-openai`
+  (commit `a242736`, CI run `33319082971` green): a model call recorded raw
+  while its tool was not yet exposed (e.g. `fs_mkdir` for `fs.mkdir`) stayed
+  in history, and the per-request wire-name codec failed closed once the spec
+  became exposed. Spec mappings are now authoritative and colliding history
+  wire names are that tool's wire form (skipped, not errors); spec-vs-spec
+  collisions still fail closed.
+- The relay exact-source/product preflight passed 2026-08-30 on commit
+  `a242736` (clean head; source tree digest `f8b57b46a3e56c49...`): one
+  `retry_policy_dev` normal cell with the product surface (TaskProgress on,
+  settlement and advisory candidates off, no counterfactual second request)
+  and the relay serving tuple with an explicit protocol completed cleanly —
+  behavior/diff pass, closure completed, provider healthy, 23 model rounds /
+  35 tool calls, no retryable transport outcome. Evidence:
+  `crates/agent-eval/evidence/m15-preflight-relay/` (the earlier failed
+  attempts are retained: Chat SSE shape, 4,096-token output truncation, and
+  the wire-name collision above). The single predeclared 12-cell v4 window
+  on this tuple (M15_ACCEPTANCE §2) is next.
+- The 12-cell v4 window on the relay tuple is **predeclared 2026-08-30
+  before the run**: 3 fixtures × normal/resume × 2 repeats, the product
+  surface, the relay serving tuple above with an explicit protocol, one
+  uninterrupted `agent-eval --m15-window` run whose cell directories land
+  under `crates/agent-eval/evidence/m15-window/_windows/<timestamp>/`. The
+  exact clean source identity is recorded at launch per M15_ACCEPTANCE §7
+  item 8; no source change happens during the run, the frozen-window rules
+  of M15_ACCEPTANCE §5 apply, and the mechanically regenerated report is the
+  only accepted verdict.
 - M15 remains open. Its shape remains 3 fixtures × normal/resume × 2 repeats =
-  12 cells. Historical v3 FAIL windows remain immutable; no v4 formal evidence
-  has been run. M12/M13 artifacts remain banked, while `GOV-STATUS-01` still
-  forbids a new closure claim or Self-Iteration transition.
+  12 cells. Historical v3 FAIL windows remain immutable; the first v4 window
+  (valid FAIL 9/12) is banked and no v4 window has passed. M12/M13 artifacts
+  remain banked, while `GOV-STATUS-01` still forbids a new closure claim or
+  Self-Iteration transition.
 
 ### Historical evidence chronology (non-authoritative)
 
