@@ -196,8 +196,15 @@ impl ContextEngine for ContextServiceAdapter {
 
     async fn materialize(&self, query: ContextQuery) -> AgentResult<MaterializedContext> {
         let value = self.call(ServiceOp::Materialize { query }).await?;
-        serde_json::from_value(value)
-            .map_err(|e| AgentError::Context(format!("decode materialized context: {e}")))
+        let materialized: MaterializedContext = serde_json::from_value(value)
+            .map_err(|e| AgentError::Context(format!("decode materialized context: {e}")))?;
+        // Cross-process adapters bypass the in-process engine boundary, so
+        // the service response is re-validated here before it can reach the
+        // durable event stream or the provider.
+        materialized
+            .validate_materialization()
+            .map_err(|e| AgentError::Context(format!("materialized context failed: {e}")))?;
+        Ok(materialized)
     }
 
     async fn acknowledge_consumption(&self, ack: ContextConsumptionAck) -> AgentResult<()> {

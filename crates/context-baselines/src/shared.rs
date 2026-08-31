@@ -136,7 +136,7 @@ pub(crate) fn records_for_ingress(ingress: &ContextIngress, turn: u64) -> Vec<Re
 /// UserMessages stay; the current turn's UserMessage is skipped by turn
 /// stamp so A/B do not double-count what the turn frame already carries.
 pub(crate) fn materialized_items(
-    records: &[Record],
+    records: &[&Record],
     summary: Option<&Record>,
     current_turn: u64,
 ) -> Vec<MaterializedItem> {
@@ -179,6 +179,33 @@ pub(crate) fn is_current_user_input(record: &Record, current_turn: u64) -> bool 
     current_turn > 0
         && record.kind == ContextKind::UserMessage
         && record.created_turn == current_turn
+}
+
+/// The prior-history slice one baseline materialization may surface.
+/// Excludes the current user input and keeps the most recent records,
+/// honoring the same selected-item cap the production engine enforces:
+/// never more than `max_selected_items` records, so a long append-only
+/// history can no longer produce a consumption ACK above the frame cap.
+/// Baseline semantics deliberately ignore the token budget: the unbounded
+/// "everything retained" cost is the point of the A/B/C comparison.
+pub(crate) fn bounded_prior(
+    records: &[Record],
+    current_turn: u64,
+    max_selected_items: Option<usize>,
+) -> Vec<&Record> {
+    let cap = max_selected_items.unwrap_or(usize::MAX);
+    let mut chosen: Vec<&Record> = Vec::new();
+    for record in records.iter().rev() {
+        if chosen.len() >= cap {
+            break;
+        }
+        if is_current_user_input(record, current_turn) {
+            continue;
+        }
+        chosen.push(record);
+    }
+    chosen.reverse();
+    chosen
 }
 
 /// Diagnostics for engines where everything retained counts as active.

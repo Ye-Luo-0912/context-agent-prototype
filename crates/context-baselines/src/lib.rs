@@ -403,4 +403,67 @@ mod tests {
             diagnostics_after.tombstoned_items
         );
     }
+
+    async fn seed_history(engine: &dyn ContextEngine, count: usize) {
+        for index in 0..count {
+            engine
+                .ingest(ContextIngress::AssistantMessage {
+                    content: format!("history record {index}"),
+                })
+                .await
+                .unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn baselines_honor_max_selected_items_and_budget_caps() {
+        let append = AppendOnlyEngine::new();
+        seed_history(&append, 257).await;
+        let materialized = append
+            .materialize(ContextQuery {
+                current_input: "next".into(),
+                budget_tokens: 100_000,
+                hints: ContextHints {
+                    max_selected_items: Some(256),
+                    ..Default::default()
+                },
+            })
+            .await
+            .unwrap();
+        assert_eq!(materialized.items.len(), 256);
+        assert_eq!(materialized.selected.len(), 256);
+        materialized.validate_materialization().unwrap();
+
+        // Without the item cap the baseline keeps its unbounded history:
+        // the A/B/C comparison deliberately measures that cost.
+        let uncapped = append
+            .materialize(ContextQuery {
+                current_input: "next".into(),
+                budget_tokens: 100_000,
+                hints: ContextHints::default(),
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            uncapped.items.len(),
+            257,
+            "baseline stays unbounded without a cap"
+        );
+
+        let rolling = RollingSummaryEngine::new();
+        seed_history(&rolling, 257).await;
+        let materialized = rolling
+            .materialize(ContextQuery {
+                current_input: "next".into(),
+                budget_tokens: 100_000,
+                hints: ContextHints {
+                    max_selected_items: Some(256),
+                    ..Default::default()
+                },
+            })
+            .await
+            .unwrap();
+        assert_eq!(materialized.selected.len(), 256);
+        materialized.validate_materialization().unwrap();
+    }
 }

@@ -1374,6 +1374,12 @@ impl From<&AnchorRootClaim> for AnchorRootProtection {
 /// the audit/event payload cannot grow with the history length.
 pub const CONTEXT_CONSUMPTION_ACK_ITEM_CAP: usize = 256;
 
+/// Maximum visible chars in one selection reason. Explanatory text about
+/// why an item entered the frame must stay out of the prompt-adjacent
+/// durable event surface; 512 chars keeps real engine reasons intact while
+/// bounding hostile adapters.
+pub const CONTEXT_SELECTION_REASON_CHARS: usize = 512;
+
 /// Exact, bounded acknowledgement of the context frame a successful model
 /// operation consumed. `materialize` is a non-consuming preview; only this
 /// commit may reinforce access/recency. Refused, failed, cancelled or stale
@@ -1431,6 +1437,13 @@ impl ContextConsumptionAck {
         // Foreground identities only need distinctness among themselves:
         // the same body may legitimately be both selected and foreground
         // rehydrated in one frame, and that overlap is not an error.
+        if self.foreground_item_ids.len() > CONTEXT_CONSUMPTION_ACK_ITEM_CAP {
+            return Err(AgentError::InvalidRequest(format!(
+                "context consumption ack carries {} foreground ids, above the {} cap",
+                self.foreground_item_ids.len(),
+                CONTEXT_CONSUMPTION_ACK_ITEM_CAP
+            )));
+        }
         let mut foreground_seen = HashSet::with_capacity(self.foreground_item_ids.len());
         if self
             .foreground_item_ids
@@ -1987,6 +2000,135 @@ impl MaterializedContext {
         }
         self.required_misses.validate()?;
         self.optional_misses.validate()?;
+        Ok(())
+    }
+
+    /// Complete materialization validation at the adapter trust boundary,
+    /// run before durable `ContextPrepared` publication or provider
+    /// execution. Counts, uniqueness, id ownership, semantic eligibility
+    /// and the final acknowledgement envelope are bound here so a hostile
+    /// or drifting adapter can never push an oversized or malformed frame
+    /// into the durable event stream and the consumption ack.
+    pub fn validate_materialization(&self) -> AgentResult<()> {
+        self.validate_requirement_status()?;
+        if self.items.len() > CONTEXT_CONSUMPTION_ACK_ITEM_CAP {
+            return Err(AgentError::InvalidRequest(format!(
+                "context materialization carries {} items, above the {} cap",
+                self.items.len(),
+                CONTEXT_CONSUMPTION_ACK_ITEM_CAP
+            )));
+        }
+        if self.selected.len() > CONTEXT_CONSUMPTION_ACK_ITEM_CAP {
+            return Err(AgentError::InvalidRequest(format!(
+                "context materialization selects {} items, above the {} cap",
+                self.selected.len(),
+                CONTEXT_CONSUMPTION_ACK_ITEM_CAP
+            )));
+        }
+        if self.foreground.len() > CONTEXT_CONSUMPTION_ACK_ITEM_CAP {
+            return Err(AgentError::InvalidRequest(format!(
+                "context materialization carries {} foreground items, above the {} cap",
+                self.foreground.len(),
+                CONTEXT_CONSUMPTION_ACK_ITEM_CAP
+            )));
+        }
+        if self.external.len() > CONTEXT_MAP_VIEW_CAP {
+            return Err(AgentError::InvalidRequest(format!(
+                "context materialization carries {} external refs, above the {} cap",
+                self.external.len(),
+                CONTEXT_MAP_VIEW_CAP
+            )));
+        }
+
+        let mut item_ids = HashSet::with_capacity(self.items.len());
+        for item in &self.items {
+            if !item_ids.insert(item.item_id) {
+                return Err(AgentError::InvalidRequest(format!(
+                    "context materialization contains duplicate item id {}",
+                    item.item_id
+                )));
+            }
+        }
+        let mut selected_ids = HashSet::with_capacity(self.selected.len());
+        for selection in &self.selected {
+            if !selected_ids.insert(selection.item_id) {
+                return Err(AgentError::InvalidRequest(format!(
+                    "context materialization selects duplicate item id {}",
+                    selection.item_id
+                )));
+            }
+            if !selection.score.is_finite() {
+                return Err(AgentError::InvalidRequest(format!(
+                    "context selection for {} carries a non-finite score",
+                    selection.item_id
+                )));
+            }
+            if selection.reason.len() > CONTEXT_SELECTION_REASON_CHARS {
+                return Err(AgentError::InvalidRequest(format!(
+                    "context selection reason for {} exceeds {} chars",
+                    selection.item_id, CONTEXT_SELECTION_REASON_CHARS
+                )));
+            }
+            let owned = self
+                .items
+                .iter()
+                .find(|item| item.item_id == selection.item_id);
+            match owned {
+                Some(item) => {
+                    if !item.semantic.is_live() {
+                        return Err(AgentError::InvalidRequest(format!(
+                            "context selection {} references a semantically dead item",
+                            selection.item_id
+                        )));
+                    }
+                }
+                None => {
+                    return Err(AgentError::InvalidRequest(format!(
+                        "context selection {} is not owned by the materialized items",
+                        selection.item_id
+                    )));
+                }
+            }
+        }
+
+        let mut foreground_ids = HashSet::with_capacity(self.foreground.len());
+        let mut foreground_tokens: usize = 0;
+        for item in &self.foreground {
+            if !foreground_ids.insert(item.item_id) {
+                return Err(AgentError::InvalidRequest(format!(
+                    "context materialization carries duplicate foreground id {}",
+                    item.item_id
+                )));
+            }
+            if !item.semantic.is_live() {
+                return Err(AgentError::InvalidRequest(format!(
+                    "foreground item {} is not semantically live",
+                    item.item_id
+                )));
+            }
+            foreground_tokens =
+                foreground_tokens.saturating_add(crate::tokens::approx_tokens(&item.content));
+        }
+        if foreground_tokens > MAX_FOREGROUND_TOKENS {
+            return Err(AgentError::InvalidRequest(format!(
+                "context materialization foreground bodies cost ~{foreground_tokens} tokens, above the {} cap",
+                MAX_FOREGROUND_TOKENS
+            )));
+        }
+
+        // Every required identity must actually be present in the final
+        // frame; a required body that could not fit is reported as a miss,
+        // never silently dropped from both the id list and the body list.
+        for id in &self.required_item_ids {
+            let present = self.items.iter().any(|item| item.item_id == *id)
+                || self.foreground.iter().any(|item| item.item_id == *id);
+            if !present {
+                return Err(AgentError::InvalidRequest(format!(
+                    "required item {} is missing from the final materialized frame",
+                    id
+                )));
+            }
+        }
         Ok(())
     }
 }
@@ -3052,5 +3194,159 @@ mod tests {
                 .to_string()
                 .contains("cap")
         );
+    }
+
+    fn live_item(id: ContextItemId) -> MaterializedItem {
+        MaterializedItem {
+            item_id: id,
+            kind: ContextKind::FileObservation,
+            scope: ContextScope::Task,
+            attention: AttentionState::Active,
+            semantic: SemanticState::Live,
+            retention: ContextRetention::Working,
+            content: "body".into(),
+            source: None,
+            file_path: None,
+            file_revision: None,
+        }
+    }
+
+    fn valid_materialization() -> MaterializedContext {
+        let id = ContextItemId::new();
+        MaterializedContext {
+            items: vec![live_item(id)],
+            selected: vec![ContextSelection {
+                item_id: id,
+                score: 1.0,
+                approx_tokens: 4,
+                reason: "scored".into(),
+                breakdown: Default::default(),
+                kind: Some(ContextKind::FileObservation),
+                source: None,
+                reactivated: false,
+            }],
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn materialization_validator_accepts_a_well_formed_frame() {
+        valid_materialization().validate_materialization().unwrap();
+    }
+
+    #[test]
+    fn materialization_validator_bounds_counts() {
+        let mut materialized = valid_materialization();
+        materialized.selected = (0..=CONTEXT_CONSUMPTION_ACK_ITEM_CAP)
+            .map(|_| ContextSelection {
+                item_id: ContextItemId::new(),
+                score: 1.0,
+                approx_tokens: 1,
+                reason: "x".into(),
+                breakdown: Default::default(),
+                ..Default::default()
+            })
+            .collect();
+        let error = materialized
+            .validate_materialization()
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("selects"), "{error}");
+        // The requirement check still rejects an oversized required set.
+        let mut materialized = valid_materialization();
+        materialized.required_item_ids = (0..=CONTEXT_CONSUMPTION_ACK_ITEM_CAP)
+            .map(|_| ContextItemId::new())
+            .collect();
+        assert!(
+            materialized
+                .validate_materialization()
+                .unwrap_err()
+                .to_string()
+                .contains("required")
+        );
+    }
+
+    #[test]
+    fn materialization_validator_rejects_unowned_and_dead_selections() {
+        let mut materialized = valid_materialization();
+        materialized.selected[0].item_id = ContextItemId::new();
+        let error = materialized
+            .validate_materialization()
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("not owned"), "{error}");
+
+        let mut materialized = valid_materialization();
+        materialized.items[0].semantic = SemanticState::Superseded { by: None };
+        let error = materialized
+            .validate_materialization()
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("dead"), "{error}");
+    }
+
+    #[test]
+    fn materialization_validator_rejects_duplicate_items_and_selections() {
+        let mut materialized = valid_materialization();
+        let id = materialized.items[0].item_id;
+        materialized.items.push(live_item(id));
+        assert!(
+            materialized
+                .validate_materialization()
+                .unwrap_err()
+                .to_string()
+                .contains("duplicate")
+        );
+
+        let mut materialized = valid_materialization();
+        let id = materialized.selected[0].item_id;
+        materialized.selected.push(ContextSelection {
+            item_id: id,
+            score: 1.0,
+            approx_tokens: 4,
+            reason: "again".into(),
+            breakdown: Default::default(),
+            ..Default::default()
+        });
+        assert!(
+            materialized
+                .validate_materialization()
+                .unwrap_err()
+                .to_string()
+                .contains("duplicate")
+        );
+    }
+
+    #[test]
+    fn materialization_validator_bounds_reason_and_foreground_tokens() {
+        let mut materialized = valid_materialization();
+        materialized.selected[0].reason = "r".repeat(CONTEXT_SELECTION_REASON_CHARS + 1);
+        let error = materialized
+            .validate_materialization()
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("reason"), "{error}");
+
+        let mut materialized = valid_materialization();
+        materialized.foreground = vec![MaterializedItem {
+            content: "d".repeat(MAX_FOREGROUND_TOKENS * 4 * 2),
+            ..live_item(ContextItemId::new())
+        }];
+        let error = materialized
+            .validate_materialization()
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("foreground"), "{error}");
+    }
+
+    #[test]
+    fn materialization_validator_requires_required_ids_in_the_frame() {
+        let mut materialized = valid_materialization();
+        materialized.required_item_ids = vec![ContextItemId::new()];
+        let error = materialized
+            .validate_materialization()
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("missing from the final"), "{error}");
     }
 }

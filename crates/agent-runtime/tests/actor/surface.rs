@@ -219,6 +219,38 @@ async fn send_guard_uses_provider_window_pack_uses_kernel_cap() {
 }
 
 #[tokio::test]
+async fn oversized_materialization_is_rejected_before_the_provider() {
+    // A 257-item append-only round through an adapter that ignores the
+    // query caps must be rejected by the materialization validator before
+    // any provider request, instead of relying on the consumption ACK to
+    // discard the oversized frame later.
+    let model = Arc::new(RecordingModel::default());
+    let context = Arc::new(BigContextEngine::with_items(257));
+    let kernel = Arc::new(RuntimeServices::new(
+        CoreAuthorityConfig::default(),
+        context.clone(),
+        model.clone(),
+        Arc::new(OneToolDispatcher),
+        Arc::new(PolicyApprovalGate::read_only()),
+        None,
+    ));
+    let (handle, _task) = spawn_runtime(kernel.clone());
+    handle.start().await.unwrap();
+    handle.user_message("hello".into()).await.unwrap();
+    tokio::time::sleep(Duration::from_millis(150)).await;
+    assert_eq!(
+        model.calls.load(Ordering::SeqCst),
+        0,
+        "the provider must never run for an oversized frame"
+    );
+    assert!(
+        context.acks.lock().unwrap().is_empty(),
+        "no frame may reach the consumption ack"
+    );
+    handle.stop().await.unwrap();
+}
+
+#[tokio::test]
 async fn final_guard_omits_optional_schema_without_unloading_it() {
     let model = Arc::new(VariableWindowModel::new(1_600));
     let tools = Arc::new(RoundLocalToolDispatcher::new());

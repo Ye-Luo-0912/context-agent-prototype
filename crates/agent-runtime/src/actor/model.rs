@@ -723,11 +723,12 @@ impl RuntimeActor {
                 return;
             }
         };
-        if let Err(error) = materialized.validate_requirement_status() {
+        if let Err(error) = materialized.validate_materialization() {
             // Concrete and test context engines share this in-process trust
-            // boundary. Reject an oversized or malformed degradation view
-            // before it can be cloned into the durable event stream.
-            self.fail_round_preparation("context_requirement_status", error)
+            // boundary. Reject an oversized, malformed or unowned frame
+            // before it can be cloned into the durable event stream or sent
+            // to the provider.
+            self.fail_round_preparation("context_materialization", error)
                 .await;
             return;
         }
@@ -959,8 +960,8 @@ impl RuntimeActor {
             };
         }
 
-        if let Err(error) = materialized.validate_requirement_status() {
-            self.fail_round_preparation("final_context_requirement_status", error)
+        if let Err(error) = materialized.validate_materialization() {
+            self.fail_round_preparation("final_context_materialization", error)
                 .await;
             return;
         }

@@ -1367,7 +1367,7 @@ impl ContextEngine for SimpleContextEngine {
             required_bodies,
             required_misses,
         );
-        materialized.validate_requirement_status()?;
+        materialized.validate_materialization()?;
         state.pending_materialization = Some(PendingMaterialization {
             id: materialization_id,
             item_ids: materialized.items.iter().map(|item| item.item_id).collect(),
