@@ -1376,15 +1376,23 @@ mod tests {
         );
         // The child races its own pidfile write against the artifact
         // failure; whichever wins, nothing may be left running afterwards.
-        if child_pidfile.exists() {
-            let child_pid = super::super::test_procs::read_pid(&child_pidfile);
-            let heir_pid: Option<u32> = std::fs::read_to_string(&heir_pidfile)
-                .ok()
-                .and_then(|text| text.trim().parse().ok());
-            let mut tracked = vec![child_pid];
-            if let Some(heir_pid) = heir_pid {
-                tracked.push(heir_pid);
-            }
+        // Existence is not content: a shell redirect truncates the pid
+        // file before writing the pid, so only read a pid the child
+        // actually wrote.
+        let child_pid = std::fs::read_to_string(&child_pidfile)
+            .ok()
+            .and_then(|text| text.trim().parse::<u32>().ok());
+        let heir_pid: Option<u32> = std::fs::read_to_string(&heir_pidfile)
+            .ok()
+            .and_then(|text| text.trim().parse().ok());
+        let mut tracked = Vec::new();
+        if let Some(child_pid) = child_pid {
+            tracked.push(child_pid);
+        }
+        if let Some(heir_pid) = heir_pid {
+            tracked.push(heir_pid);
+        }
+        if !tracked.is_empty() {
             super::super::test_procs::wait_for_all_dead(&tracked, "the failed start's tree");
         }
     }
