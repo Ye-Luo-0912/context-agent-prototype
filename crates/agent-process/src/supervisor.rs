@@ -18,6 +18,12 @@ use crate::host::kill_process_tree;
 #[cfg(windows)]
 use crate::host::JobObject;
 
+/// How long `reap` waits for the child to exit before escalating to a tree
+/// kill (a graceful shutdown the child ignored must not stall teardown).
+/// A tree kill cannot be ignored (SIGKILL / job terminate), so the second
+/// bounded wait is the last boundary a stuck child can cross.
+const REAP_GRACE: std::time::Duration = std::time::Duration::from_secs(5);
+
 /// Owns one spawned child and its containment.
 ///
 /// Kill is synchronous so timeout/cancel paths can fence the tree without
@@ -101,13 +107,22 @@ impl ProcessSupervisor {
         }
     }
 
-    /// Await the child's exit. Safe after [`Self::kill_tree`] or a graceful
-    /// shutdown; a second wait on an already-reaped child returns immediately.
-    /// Clears the pid afterwards so Drop cannot `kill_process_tree` a
-    /// numeric pid the OS has already reused.
+    /// Await the child's exit within a bounded grace. Safe after
+    /// [`Self::kill_tree`] or a graceful shutdown; a second wait on an
+    /// already-reaped child returns immediately. A child that ignores the
+    /// graceful shutdown escalates to a tree kill and gets one more bounded
+    /// wait, so teardown can never hang on a stuck child. Clears the pid
+    /// afterwards so Drop cannot `kill_process_tree` a numeric pid the OS
+    /// has already reused.
     pub async fn reap(&self) {
         let mut child = self.child.lock().await;
-        let _ = child.wait().await;
+        if tokio::time::timeout(REAP_GRACE, child.wait())
+            .await
+            .is_err()
+        {
+            self.kill_tree();
+            let _ = tokio::time::timeout(REAP_GRACE, child.wait()).await;
+        }
         self.pid.store(0, Ordering::Relaxed);
     }
 

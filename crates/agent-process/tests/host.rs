@@ -118,6 +118,108 @@ async fn peer_cancel_ack_quarantines_and_does_not_admit_a_value() {
 }
 
 #[tokio::test]
+async fn acknowledged_cancel_still_kills_the_child() {
+    // The mock writes a heartbeat file from its own thread as long as the
+    // process lives. An ACKed cancel must still kill-then-reap: the ACK is
+    // optional evidence, never permission to keep the child running.
+    let dir = tempfile::tempdir().unwrap();
+    let heartbeat = dir.path().join("alive.ticks");
+    let host = spawn_mock(|config| {
+        config.env.push((
+            "MOCK_HEARTBEAT".into(),
+            heartbeat.to_string_lossy().into_owned(),
+        ));
+    })
+    .await;
+    for _ in 0..100 {
+        if std::fs::read(&heartbeat).is_ok_and(|bytes| !bytes.is_empty()) {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert!(
+        std::fs::read(&heartbeat).is_ok_and(|bytes| !bytes.is_empty()),
+        "the mock heartbeat must be running before the cancel"
+    );
+
+    let cancel = CancellationToken::new();
+    let fire = cancel.clone();
+    tokio::spawn(async move {
+        tokio::time::sleep(Duration::from_millis(80)).await;
+        fire.cancel();
+    });
+    let error = host
+        .call_with_cancel(json!({ "op": "ack_cancel" }), &cancel)
+        .await
+        .unwrap_err();
+    assert!(matches!(error, agent_contracts::AgentError::Cancelled));
+
+    // The heartbeat thread dies with the child: the file stops updating.
+    let before = std::fs::read(&heartbeat).unwrap_or_default();
+    tokio::time::sleep(Duration::from_millis(400)).await;
+    let after = std::fs::read(&heartbeat).unwrap_or_default();
+    assert_eq!(
+        before, after,
+        "an acknowledged cancel must still kill the child, not trust the ACK"
+    );
+}
+
+#[tokio::test]
+async fn cancel_aborts_broker_work_promptly() {
+    // A broker that stalls answering a brokered fs.read must not defuse
+    // cancel: the host settles the call kill-then-reap well inside the
+    // request deadline instead of waiting for the broker to finish.
+    struct StallingBroker;
+    #[async_trait::async_trait]
+    impl agent_process::SystemBroker for StallingBroker {
+        async fn handle(
+            &self,
+            _request: serde_json::Value,
+        ) -> agent_contracts::AgentResult<serde_json::Value> {
+            tokio::time::sleep(Duration::from_secs(30)).await;
+            Ok(serde_json::json!("late"))
+        }
+    }
+
+    let host = spawn_mock(|config| config.request_timeout = Duration::from_secs(10)).await;
+    let cancel = CancellationToken::new();
+    let fire = cancel.clone();
+    tokio::spawn(async move {
+        tokio::time::sleep(Duration::from_millis(80)).await;
+        fire.cancel();
+    });
+    let started = std::time::Instant::now();
+    let error = host
+        .call_with_cancel_and_broker(
+            json!({
+                "op": "invoke",
+                "call": {
+                    "id": "c-broker",
+                    "name": "process-demo.invoke",
+                    "arguments": { "ask_fs_read": "notes.txt" }
+                }
+            }),
+            &cancel,
+            &StallingBroker,
+        )
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(error, agent_contracts::AgentError::Cancelled),
+        "a cancel during broker work must surface as Cancelled: {error}"
+    );
+    assert!(
+        started.elapsed() < Duration::from_secs(3),
+        "cancel must abort broker work well inside the request deadline"
+    );
+    assert_eq!(
+        host.status().health,
+        ConnectionHealth::Quarantined,
+        "the settled connection must not be reused"
+    );
+}
+
+#[tokio::test]
 async fn cancel_without_peer_ack_still_kills_after_the_bound() {
     let host = spawn_mock(|config| config.request_timeout = Duration::from_secs(5)).await;
     let cancel = CancellationToken::new();

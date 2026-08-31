@@ -42,6 +42,12 @@ pub const MAX_SYSTEM_REQUESTS_PER_CALL: usize = 256;
 /// past this window. Connection ACK is not Core `OperationCancelAck`.
 pub const DEFAULT_CANCEL_ACK_TIMEOUT: Duration = Duration::from_millis(250);
 
+/// Bound on writing the `op=cancel` frame itself. A peer that stopped
+/// reading must not stall the abort on a full pipe: if the frame cannot be
+/// written within this window, the connection is settled kill-then-reap
+/// exactly like a cancel-ACK timeout.
+pub const CANCEL_SEND_TIMEOUT: Duration = Duration::from_secs(2);
+
 /// Coalesced progress notes stay tiny. The latest frame wins; earlier notes
 /// are dropped. This is connection backpressure, never task or Core state.
 pub const MAX_PROGRESS_NOTE_CHARS: usize = 128;
@@ -928,7 +934,19 @@ impl ProcessHost {
                         && total <= self.config.max_call_bytes
                     {
                         exchanged = total;
-                        let _ = transport.send_encoded_line(&line).await;
+                        // The cancel frame write is itself bounded: a peer
+                        // that stopped reading must not stall the abort on
+                        // a full pipe. Settlement is kill-then-reap either
+                        // way.
+                        if tokio::time::timeout(
+                            CANCEL_SEND_TIMEOUT,
+                            transport.send_encoded_line(&line),
+                        )
+                        .await
+                        .is_err()
+                        {
+                            return Err(self.settle_cancelled(&mut *transport));
+                        }
                     }
                     cancel_sent = true;
                     ack_deadline = Some(Instant::now() + DEFAULT_CANCEL_ACK_TIMEOUT);
@@ -999,9 +1017,28 @@ impl ProcessHost {
                                 ),
                             ));
                         }
-                        let answer = match broker.handle(response).await {
+                        // Broker work must not defuse cancel: a cancel that
+                        // arrives while the broker answers the child's
+                        // system request settles like any other
+                        // cancel-after-write (kill-then-reap) instead of
+                        // letting the broker run to completion.
+                        let answered = tokio::select! {
+                            biased;
+                            _ = async {
+                                match cancel {
+                                    Some(token) => token.cancelled().await,
+                                    None => std::future::pending::<()>().await,
+                                }
+                            } => {
+                                return Err(self.settle_cancelled(&mut *transport));
+                            }
+                            handled = broker.handle(response) => handled,
+                        };
+                        let answer = match answered {
                             Ok(value) => json!({ "system_ok": true, "value": value }),
-                            Err(error) => json!({ "system_ok": false, "error": error.to_string() }),
+                            Err(error) => {
+                                json!({ "system_ok": false, "error": error.to_string() })
+                            }
                         };
                         let encoded = serde_json::to_string(&answer).map_err(|e| {
                             AgentError::Context(format!("serialize system answer: {e}"))

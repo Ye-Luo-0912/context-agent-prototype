@@ -39,6 +39,10 @@ pub const MAX_MCP_TOOL_TEXT_CHARS: usize = 16_000;
 /// response.
 pub const DEFAULT_MAX_SKIPPED_FRAMES_PER_REQUEST: usize = 64;
 pub const DEFAULT_MAX_SKIPPED_BYTES_PER_REQUEST: u64 = 1024 * 1024;
+/// Bound on writing the cancel notification frame. A peer that stopped
+/// reading must not stall the abort on a full pipe; the notify is best
+/// effort and settlement is kill-then-reap either way.
+pub const CANCEL_NOTIFY_SEND_TIMEOUT: Duration = Duration::from_secs(2);
 /// MCP peer cancel notification. Not Core `OperationCancelAck`.
 pub const MCP_CANCEL_NOTIFICATION: &str = "notifications/cancelled";
 
@@ -303,19 +307,41 @@ where
         let id = OperationId::new().to_string();
         let request = json!({"jsonrpc": "2.0", "id": id, "method": method, "params": params});
 
-        self.send_frame(&request).await?;
+        // The request write shares the request deadline with the response
+        // read (one budget per exchange): a peer that stopped reading must
+        // not stall the call past its own deadline.
+        let deadline = std::time::Instant::now() + self.request_timeout;
+        match tokio::time::timeout_at(deadline.into(), self.send_frame(&request)).await {
+            Err(_) => {
+                let error = self.poison(format!(
+                    "request '{method}' write timed out after {:?}",
+                    self.request_timeout
+                ));
+                self.reap().await;
+                return Err(error);
+            }
+            // A write error (`Ok(Err(_))`) already poisons the connection
+            // when bytes may have been written; the outbound over-cap
+            // rejection deliberately keeps the connection usable.
+            Ok(result) => result?,
+        }
 
-        let request_timeout = self.request_timeout;
         tokio::select! {
             biased;
             _ = cancel.cancelled() => {
-                let _ = self
-                    .send_frame(&json!({
+                // The abort notification itself is bounded: a peer that
+                // stopped reading must not stall the abort on a full pipe.
+                // It is best effort — settlement is poison + kill-then-reap
+                // either way.
+                let _ = tokio::time::timeout(
+                    CANCEL_NOTIFY_SEND_TIMEOUT,
+                    self.send_frame(&json!({
                         "jsonrpc": "2.0",
                         "method": MCP_CANCEL_NOTIFICATION,
                         "params": { "requestId": id },
-                    }))
-                    .await;
+                    })),
+                )
+                .await;
                 // Implicit ACK: a matching response, discarded. Silent peers
                 // cannot stall past DEFAULT_CANCEL_ACK_TIMEOUT.
                 let _ = tokio::time::timeout(
@@ -327,7 +353,7 @@ where
                 self.reap().await;
                 Err(AgentError::Cancelled)
             }
-            result = tokio::time::timeout(request_timeout, self.read_matching(&id)) => {
+            result = tokio::time::timeout_at(deadline.into(), self.read_matching(&id)) => {
                 match result {
                     Ok(inner) => {
                         if inner.is_err() && self.is_poisoned() {
@@ -1060,6 +1086,70 @@ mod tests {
         assert_eq!(tools[0].name, "mock.add");
         assert_eq!(tools[1].name, "mock.echo");
         assert!(tools[0].input_schema.get("type").is_some());
+    }
+
+    #[tokio::test]
+    async fn request_write_is_bounded_when_the_peer_stops_reading() {
+        // A server that answers the handshake and then never reads again:
+        // the client's next request write fills the small duplex buffer and
+        // must fail within its own write deadline instead of hanging on
+        // the pipe (backpressure must not stall the call).
+        let (client_read, mut server_write) = duplex(64 * 1024);
+        let (mut server_read, client_write) = duplex(64);
+        tokio::spawn(async move {
+            // Handshake: one initialize request (reply), then the
+            // initialized notification (no id, no reply) — both read.
+            for _ in 0..2 {
+                let mut line = Vec::new();
+                let Ok(read_count) = read_line(&mut server_read, &mut line).await else {
+                    return;
+                };
+                if read_count == 0 {
+                    return;
+                }
+                let Ok(request) = serde_json::from_slice::<Value>(&line) else {
+                    return;
+                };
+                let Some(id) = request.get("id").cloned() else {
+                    continue; // notifications/initialized has no id
+                };
+                let response = json!({
+                    "jsonrpc": "2.0", "id": id,
+                    "result": {"protocolVersion": MCP_PROTOCOL_VERSION, "capabilities": {}, "serverInfo": {"name": "m", "version": "0.1.0"}}
+                });
+                let mut frame = serde_json::to_string(&response).unwrap();
+                frame.push('\n');
+                if server_write.write_all(frame.as_bytes()).await.is_err() {
+                    return;
+                }
+            }
+            // Never read again: the client's next frame hits backpressure.
+            std::future::pending::<()>().await;
+        });
+        let mut client = McpClient::new(
+            client_read,
+            client_write,
+            Duration::from_millis(400),
+            1024 * 1024,
+        );
+        client.initialize().await.expect("handshake succeeds");
+        let started = std::time::Instant::now();
+        let error = client
+            .call_tool("mock.echo", json!({ "text": "x".repeat(512) }))
+            .await
+            .unwrap_err();
+        assert!(
+            error.to_string().contains("write timed out"),
+            "a stuck request write must surface its bound: {error}"
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "the stuck write must be bounded, not hung"
+        );
+        assert!(
+            client.is_poisoned(),
+            "a stuck write must poison the connection"
+        );
     }
 
     #[tokio::test]

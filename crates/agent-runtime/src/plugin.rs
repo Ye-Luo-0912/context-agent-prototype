@@ -25,6 +25,10 @@ use tokio::io::AsyncReadExt;
 pub const PLUGIN_TEST_TIMEOUT: Duration = Duration::from_secs(30);
 pub const PLUGIN_TEST_OUTPUT_TAIL_CHARS: usize = 2_000;
 pub const PLUGIN_TEST_OUTPUT_TAIL_BYTES: u64 = 8 * 1024;
+/// Bounded post-kill wait after a timeout (a failed kill must not hang the
+/// runner) and the bound for the output tail drain once the child exits.
+const PLUGIN_TEST_KILL_REAP_GRACE: Duration = Duration::from_secs(2);
+const PLUGIN_TEST_TAIL_DRAIN_GRACE: Duration = Duration::from_secs(2);
 
 /// Environment keys a self-check inherits from the parent (plus nothing
 /// else): the child must not see API keys, credentials or HOME.
@@ -445,49 +449,80 @@ async fn run_test_command(command: &[String], timeout: Duration) -> PluginTestRe
         }
     };
 
-    // Race the child against the timeout, then capture a bounded output
-    // tail. The temp dir is kept alive until the child is reaped.
-    let (status, tail) = tokio::select! {
-        status = child.wait() => {
-            let status = Some(status.unwrap_or_default());
-            let tail = drain_tail(&mut child, PLUGIN_TEST_OUTPUT_TAIL_BYTES).await;
-            (status, tail)
-        }
+    // Take the pipes before racing the child so the drain runs
+    // concurrently: a check that fills the pipe then waits must not block
+    // on its own output, and the drain ends at EOF or its own budget — a
+    // living child can never stall the runner. The temp dir stays alive
+    // until the child is reaped below.
+    let stdout = child.stdout.take();
+    let stderr = child.stderr.take();
+    let drain =
+        tokio::spawn(
+            async move { drain_output(stdout, stderr, PLUGIN_TEST_OUTPUT_TAIL_BYTES).await },
+        );
+
+    // Race the child against the timeout. A failed tree kill is reported
+    // instead of ignored — it must not silently leave the check running —
+    // and the post-kill wait stays bounded either way.
+    let (status, kill_ok) = tokio::select! {
+        status = child.wait() => (Some(status.unwrap_or_default()), true),
         _ = tokio::time::sleep(timeout) => {
-            kill_tree(&mut child).await;
-            let _ = child.wait().await;
-            let tail = drain_tail(&mut child, PLUGIN_TEST_OUTPUT_TAIL_BYTES).await;
-            (None, tail)
+            let kill_ok = kill_tree(&mut child).await;
+            let _ = tokio::time::timeout(PLUGIN_TEST_KILL_REAP_GRACE, child.wait()).await;
+            (None, kill_ok)
         }
     };
+    let tail = drain.await.unwrap_or_default();
 
     let exit_code = status.and_then(|s| s.code());
     let timed_out = status.is_none();
     let ok = !timed_out && exit_code == Some(0);
+    let mut tail = clip_tail(&tail);
+    if timed_out && !kill_ok {
+        tail.push_str(" (the check process tree could not be killed)");
+    }
     PluginTestResult {
         id,
         ok,
         exit_code,
         timed_out,
-        output_tail: clip_tail(&tail),
+        output_tail: tail,
     }
 }
 
-/// Drain the child's piped stdout/stderr into one bounded buffer (bytes
-/// capped, then char-clipped for the model-facing tail).
-async fn drain_tail(child: &mut tokio::process::Child, cap_bytes: u64) -> String {
-    let mut output = String::new();
-    if let Some(stdout) = child.stdout.take() {
-        let mut buf = Vec::new();
-        let _ = stdout.take(cap_bytes + 1).read_to_end(&mut buf).await;
-        output.push_str(&String::from_utf8_lossy(&buf));
-    }
-    if let Some(stderr) = child.stderr.take() {
-        let mut buf = Vec::new();
-        let _ = stderr.take(cap_bytes + 1).read_to_end(&mut buf).await;
-        output.push_str(&String::from_utf8_lossy(&buf));
-    }
-    output
+/// Read both piped streams into one bounded buffer. Each stream is capped
+/// like the tail bound, and the whole read ends at EOF or the drain budget
+/// — never on a child that keeps a write end open.
+async fn drain_output(
+    stdout: Option<tokio::process::ChildStdout>,
+    stderr: Option<tokio::process::ChildStderr>,
+    cap_bytes: u64,
+) -> String {
+    let stdout_buf = bounded_read(stdout, cap_bytes).await;
+    let stderr_buf = bounded_read(stderr, cap_bytes).await;
+    format!(
+        "{}{}",
+        String::from_utf8_lossy(&stdout_buf),
+        String::from_utf8_lossy(&stderr_buf)
+    )
+}
+
+/// Read one stream up to the cap plus one byte (the extra byte marks
+/// truncation), within the drain budget.
+async fn bounded_read<R>(stream: Option<R>, cap_bytes: u64) -> Vec<u8>
+where
+    R: tokio::io::AsyncRead + Unpin,
+{
+    let Some(stream) = stream else {
+        return Vec::new();
+    };
+    let mut buf = Vec::new();
+    let _ = tokio::time::timeout(
+        PLUGIN_TEST_TAIL_DRAIN_GRACE,
+        stream.take(cap_bytes + 1).read_to_end(&mut buf),
+    )
+    .await;
+    buf
 }
 
 fn clip_tail(text: &str) -> String {
@@ -508,32 +543,38 @@ fn clip_tail(text: &str) -> String {
 
 /// Kill the child's whole tree: on Windows `taskkill /T /F` walks the tree
 /// by pid; on Unix the child leads its own process group (set at spawn),
-/// so killing the negative pid reaps every descendant.
-async fn kill_tree(child: &mut tokio::process::Child) {
+/// so killing the negative pid reaps every descendant. Returns false when
+/// the kill could not be issued or is known to have failed, so the timeout
+/// path can report the leak instead of silently leaving the check running.
+async fn kill_tree(child: &mut tokio::process::Child) -> bool {
     #[cfg(windows)]
     {
         if let Some(pid) = child.id() {
-            let _ = tokio::process::Command::new("taskkill")
+            tokio::process::Command::new("taskkill")
                 .args(["/T", "/F", "/PID", &pid.to_string()])
                 .stdout(std::process::Stdio::null())
                 .stderr(std::process::Stdio::null())
                 .status()
-                .await;
+                .await
+                .map(|status| status.success())
+                .unwrap_or(false)
         } else {
-            let _ = child.kill().await;
+            child.kill().await.is_ok()
         }
     }
     #[cfg(not(windows))]
     {
         if let Some(pid) = child.id() {
-            let _ = tokio::process::Command::new("kill")
+            tokio::process::Command::new("kill")
                 .args(["-KILL", &format!("-{pid}")])
                 .stdout(std::process::Stdio::null())
                 .stderr(std::process::Stdio::null())
                 .status()
-                .await;
+                .await
+                .map(|status| status.success())
+                .unwrap_or(false)
         } else {
-            let _ = child.kill().await;
+            child.kill().await.is_ok()
         }
     }
 }
@@ -812,6 +853,57 @@ mod tests {
         assert!(!result.ok);
     }
 
+    #[tokio::test]
+    async fn test_that_floods_the_pipe_still_completes_bounded() {
+        // A check that writes far past the pipe capacity before waiting
+        // must not block the runner on its own output: the drain runs
+        // concurrently and the timeout path stays bounded. The flooded
+        // check is killed and reported timed out, not hung.
+        #[cfg(windows)]
+        let flood = vec![
+            "powershell".into(),
+            "-NoProfile".into(),
+            "-Command".into(),
+            "1..400 | ForEach-Object { 'x' * 400 }; Start-Sleep -Seconds 60".into(),
+        ];
+        #[cfg(not(windows))]
+        let flood = vec![
+            "sh".into(),
+            "-c".into(),
+            "head -c 1048576 /dev/zero; sleep 60".into(),
+        ];
+        let registry = PluginRegistry::new();
+        registry
+            .install(package_with_tests(
+                "pack",
+                vec![TestDeclaration {
+                    id: "flood".into(),
+                    command: flood,
+                }],
+            ))
+            .expect("install succeeds");
+
+        let started = std::time::Instant::now();
+        let report = tokio::time::timeout(
+            Duration::from_secs(15),
+            registry.test_with_timeout("pack", Duration::from_millis(1_500)),
+        )
+        .await
+        .expect("a flooded check must complete within the outer bound")
+        .expect("tests run");
+        let result = &report.tests[0];
+        assert!(result.timed_out, "a flooding sleeper must time out");
+        assert!(!result.ok);
+        assert!(
+            started.elapsed() < Duration::from_secs(15),
+            "the flooded check must be bounded, not hung"
+        );
+        assert!(
+            result.output_tail.chars().count() <= PLUGIN_TEST_OUTPUT_TAIL_CHARS + 64,
+            "the output tail must stay bounded"
+        );
+    }
+
     #[test]
     fn skill_views_are_metadata_and_never_read_instructions() {
         // ECO-06 anchor: the skill's referenced instruction file exists on
@@ -1042,7 +1134,10 @@ mod tests {
     async fn test_runs_outside_the_workspace_with_a_scrubbed_env() {
         // The self-check must see a private cwd and a scrubbed environment:
         // no API keys, no HOME. The command prints its cwd and the value of
-        // a planted secret (empty when scrubbed), and we assert both.
+        // a planted secret (empty when scrubbed), and we assert both. The
+        // planted variable is the exact one the command reads (`SECRET`),
+        // so a broken scrub would actually leak it — the oracle is not
+        // vacuous.
         #[cfg(windows)]
         let print = vec![
             "cmd".into(),
@@ -1061,7 +1156,7 @@ mod tests {
         // unsafe on edition 2024; this is test-only global-env mutation,
         // not an optimization.)
         unsafe {
-            std::env::set_var("PLUGIN_TEST_SECRET_VAR", "s3cr3t");
+            std::env::set_var("SECRET", "s3cr3t");
         }
         let registry = PluginRegistry::new();
         registry
@@ -1079,7 +1174,7 @@ mod tests {
             .expect("tests run");
         let tail = &report.tests[0].output_tail;
         unsafe {
-            std::env::remove_var("PLUGIN_TEST_SECRET_VAR");
+            std::env::remove_var("SECRET");
         }
 
         assert!(
