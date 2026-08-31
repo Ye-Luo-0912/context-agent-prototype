@@ -7,12 +7,15 @@ description = "Shared tool/capability conformance harness: schema contract, outp
 
 [dependencies]
 agent-contracts.workspace = true
-agent-workspace.workspace = true
 tokio.workspace = true
 serde_json.workspace = true
 tempfile = "3"
 
+# Test-only composition: integration tests combine concrete implementations
+# that shipped libraries must never select; these never enter the production
+# graph and are non-transitive by construction.
 [dev-dependencies]
+agent-workspace.workspace = true
 tool-runtime.workspace = true
 agent-process.workspace = true
 agent-capability-process.workspace = true
