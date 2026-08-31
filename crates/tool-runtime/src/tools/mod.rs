@@ -26,7 +26,7 @@ pub(crate) use process::{
     ProcessArgs, ProcessInvocation, ProcessRunTool, verification_executable_identity,
 };
 pub(crate) use search::SearchGrepTool;
-pub(crate) use session::{ProcessSession, ProcessSessionTool};
+pub(crate) use session::{ProcessSessionTool, SessionRegistry, SessionSlot, drain_sessions};
 pub(crate) use shell::ShellExecTool;
 pub use shell::{ShellDialect, ShellKind};
 pub(crate) use task::TaskCompleteTool;
@@ -1008,6 +1008,34 @@ pub(crate) async fn read_snapshot_lines(
         .collect())
 }
 
+/// Synchronous tree-kill guard for one-shot process tools: armed right
+/// after spawn, disarmed only after the direct child is reaped. Any
+/// early return (artifact I/O failure, persistence error) then kills
+/// the whole process tree instead of leaving descendants behind, which
+/// is what `kill_on_drop` alone would do (it kills only the direct
+/// child).
+pub(crate) struct ProcessTreeGuard {
+    pid: u32,
+}
+
+impl ProcessTreeGuard {
+    pub(crate) fn new(pid: u32) -> Self {
+        Self { pid }
+    }
+
+    pub(crate) fn disarm(&mut self) {
+        self.pid = 0;
+    }
+}
+
+impl Drop for ProcessTreeGuard {
+    fn drop(&mut self) {
+        if self.pid != 0 {
+            kill_process_tree(self.pid);
+        }
+    }
+}
+
 /// spawn 成功后立刻记下 PID；没有 Core 身份时杀树并失败，避免留下无证据孩子。
 pub(crate) fn persist_spawned_process(
     workspace: &Workspace,
@@ -1106,6 +1134,105 @@ pub(crate) fn test_process_effect_context(
             argument_digest: ArgumentDigest::from_json(arguments),
         },
         effect_id: EffectId::new(),
+    }
+}
+
+/// Process-tree helpers shared by the session and dispatcher tests: an
+/// argv that writes its own pid and a descendant's pid before sleeping,
+/// pid liveness checks and bounded waits. All platform-independent
+/// enough for the Windows and Linux CI jobs.
+#[cfg(test)]
+pub(crate) mod test_procs {
+    use std::path::Path;
+
+    pub(crate) fn tree_pidfile_argv(
+        dir: &Path,
+    ) -> (Vec<String>, std::path::PathBuf, std::path::PathBuf) {
+        let child_pidfile = dir.join("session.pid");
+        let heir_pidfile = dir.join("heir.pid");
+        #[cfg(windows)]
+        let argv = vec![
+            "powershell".into(),
+            "-NoProfile".into(),
+            "-Command".into(),
+            format!(
+                "$PID | Set-Content '{}'; Start-Process -WindowStyle Hidden -FilePath ping -ArgumentList '-n','20','127.0.0.1' -PassThru | ForEach-Object {{ $_.Id | Set-Content '{}' }}; Start-Sleep -Seconds 30",
+                child_pidfile.display(),
+                heir_pidfile.display()
+            ),
+        ];
+        #[cfg(not(windows))]
+        let argv = vec![
+            "sh".into(),
+            "-c".into(),
+            format!(
+                "echo $$ > {}; sleep 30 & echo $! > {}; wait",
+                child_pidfile.display(),
+                heir_pidfile.display()
+            ),
+        ];
+        (argv, child_pidfile, heir_pidfile)
+    }
+
+    pub(crate) async fn wait_for_path(path: &Path) {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(8);
+        while !path.exists() && std::time::Instant::now() < deadline {
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+        assert!(path.exists(), "expected {} to appear", path.display());
+    }
+
+    pub(crate) fn read_pid(path: &Path) -> u32 {
+        std::fs::read_to_string(path)
+            .unwrap_or_else(|error| panic!("read {}: {error}", path.display()))
+            .trim()
+            .parse()
+            .unwrap_or_else(|error| panic!("parse pid from {}: {error}", path.display()))
+    }
+
+    pub(crate) fn pid_alive(pid: u32) -> bool {
+        #[cfg(target_os = "linux")]
+        {
+            Path::new(&format!("/proc/{pid}")).exists()
+        }
+        #[cfg(all(unix, not(target_os = "linux")))]
+        {
+            std::process::Command::new("kill")
+                .args(["-0", &pid.to_string()])
+                .status()
+                .map(|status| status.success())
+                .unwrap_or(true)
+        }
+        #[cfg(windows)]
+        {
+            // tasklist exits 0 for a filter that matches nothing (the
+            // "no tasks" notice is localized), so liveness has to come
+            // from the CSV: a matching line quotes the pid between two
+            // separators, a no-match notice never carries it.
+            std::process::Command::new("tasklist")
+                .args(["/FO", "CSV", "/NH", "/FI", &format!("PID eq {pid}")])
+                .output()
+                .map(|output| {
+                    let text = String::from_utf8_lossy(&output.stdout);
+                    text.contains(&format!("\",\"{pid}\""))
+                })
+                .unwrap_or(true)
+        }
+    }
+
+    pub(crate) fn wait_for_all_dead(pids: &[u32], what: &str) {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(8);
+        loop {
+            let alive: Vec<u32> = pids.iter().copied().filter(|pid| pid_alive(*pid)).collect();
+            if alive.is_empty() {
+                return;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "{what} still alive after the wait window: {alive:?}"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
     }
 }
 

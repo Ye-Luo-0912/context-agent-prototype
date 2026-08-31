@@ -23,7 +23,7 @@ use serde_json::{Value, json};
 use tokio::{
     io::{AsyncWriteExt, BufWriter},
     process::Command,
-    sync::{Mutex, mpsc},
+    sync::mpsc,
 };
 
 use super::Tool;
@@ -53,7 +53,7 @@ const EXIT_DRAIN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(1
 /// the channel; `poll` drains them into the bounded tail and the artifact.
 pub(crate) struct ProcessSession {
     child: tokio::process::Child,
-    pid: u32,
+    pub(crate) pid: u32,
     rx: mpsc::Receiver<StreamChunk>,
     capture: StreamCapture,
     artifact_ref: String,
@@ -110,16 +110,62 @@ impl ProcessSession {
     }
 }
 
+/// One slot in the per-dispatcher session registry. `Pending` is a
+/// capacity reservation while `start` is between spawn and commit; the
+/// model can never observe it (a start returns the id only after the
+/// slot became `Running`), but it closes the race where concurrent
+/// starts exceed [`MAX_SESSIONS`]. Every exit path of `start` removes
+/// its own reservation.
+pub(crate) enum SessionSlot {
+    Pending,
+    Running(Box<ProcessSession>),
+}
+
+/// The per-dispatcher session registry, shared by every
+/// `process.session` tool instance.
+pub(crate) type SessionRegistry = Arc<tokio::sync::Mutex<HashMap<String, SessionSlot>>>;
+
+/// Owns a just-spawned child until a `start` settles: every post-spawn
+/// exit (persistence, artifact or cancellation failure) funnels through
+/// [`SpawnedChildGuard::abandon`], which kills the whole process tree
+/// and reaps the direct child within a bounded wait. `keep` hands the
+/// live child to the registry.
+struct SpawnedChildGuard {
+    child: Option<tokio::process::Child>,
+    pid: u32,
+}
+
+impl SpawnedChildGuard {
+    fn child_ref(&self) -> &tokio::process::Child {
+        self.child
+            .as_ref()
+            .expect("a guarded child exists until keep or abandon")
+    }
+
+    /// Kill the whole tree and reap the direct child within a bounded
+    /// wait, so a failed start cannot leave a child or descendant behind.
+    async fn abandon(mut self) {
+        kill_process_tree(self.pid);
+        if let Some(child) = self.child.as_mut() {
+            let _ = child.kill().await;
+            let _ = tokio::time::timeout(EXIT_DRAIN_TIMEOUT, child.wait()).await;
+        }
+    }
+
+    fn keep(mut self) -> tokio::process::Child {
+        self.child
+            .take()
+            .expect("a guarded child exists until keep or abandon")
+    }
+}
+
 pub struct ProcessSessionTool {
     workspace: Workspace,
-    sessions: Arc<Mutex<HashMap<String, ProcessSession>>>,
+    sessions: SessionRegistry,
 }
 
 impl ProcessSessionTool {
-    pub fn new(
-        workspace: Workspace,
-        sessions: Arc<Mutex<HashMap<String, ProcessSession>>>,
-    ) -> Self {
+    pub fn new(workspace: Workspace, sessions: SessionRegistry) -> Self {
         Self {
             workspace,
             sessions,
@@ -195,7 +241,7 @@ impl ProcessSessionTool {
         arguments: &Value,
         args: SessionArgs,
         effect_context: Option<agent_contracts::OperationEffectContext>,
-        _cancel: CancellationToken,
+        cancel: CancellationToken,
     ) -> AgentResult<ToolOutcome> {
         if args.argv.is_empty() {
             return Err(AgentError::InvalidRequest(
@@ -235,21 +281,39 @@ impl ProcessSessionTool {
             None => self.workspace.root().to_path_buf(),
         };
 
-        {
-            let sessions = self.sessions.lock().await;
-            if sessions.len() >= MAX_SESSIONS {
-                return Err(AgentError::InvalidRequest(format!(
-                    "process.session is limited to {MAX_SESSIONS} concurrent sessions"
-                )));
-            }
-        }
-
         super::require_process_effect_context(&effect_context, "process.session")?;
         super::require_covered_process_spawn(
             "process.session",
             arguments,
             &agent_contracts::exec_argv_intent(&args.argv),
         )?;
+
+        // Cancellation is selected through the whole start: a token that
+        // fired before spawn refuses without reserving a slot, and the
+        // post-spawn section is a select so a mid-flight cancel kills the
+        // spawned tree and releases the reservation.
+        if cancel.is_cancelled() {
+            return Ok(cancelled_start_output(call_id, "before spawn"));
+        }
+
+        // Reserve a session slot before spawning: the capacity check and
+        // the insertion are one atomic step, so concurrent starts cannot
+        // exceed MAX_SESSIONS (`Pending` marks the reservation; the model
+        // only ever sees a `Running` session).
+        let session_id = ContextItemId::new().to_string();
+        {
+            let mut sessions = self.sessions.lock().await;
+            if sessions.len() >= MAX_SESSIONS {
+                return Err(AgentError::InvalidRequest(format!(
+                    "process.session is limited to {MAX_SESSIONS} concurrent sessions"
+                )));
+            }
+            sessions.insert(session_id.clone(), SessionSlot::Pending);
+        }
+        if cancel.is_cancelled() {
+            self.sessions.lock().await.remove(&session_id);
+            return Ok(cancelled_start_output(call_id, "before spawn"));
+        }
 
         // Resolution, authority binding and the pre-spawn identity check
         // share process.run semantics: a failed resolution is a typed
@@ -350,47 +414,74 @@ impl ProcessSessionTool {
         let mut child = command
             .spawn()
             .map_err(|error| AgentError::Tool(format!("spawn {}: {error}", args.argv[0])))?;
-        let pid = match super::persist_spawned_process(
+        let pid = child
+            .id()
+            .ok_or_else(|| AgentError::Tool("spawned process has no pid".into()))?;
+        let stdout = child.stdout.take();
+        let stderr = child.stderr.take();
+        let guard = SpawnedChildGuard {
+            child: Some(child),
+            pid,
+        };
+        if let Err(error) = super::persist_spawned_process(
             &self.workspace,
             &effect_context,
-            &child,
+            guard.child_ref(),
             "process.session",
         ) {
-            Ok(pid) => pid,
-            Err(error) => {
-                super::abandon_spawned_process(&mut child);
-                let _ = child.kill().await;
-                return Err(error);
+            guard.abandon().await;
+            self.sessions.lock().await.remove(&session_id);
+            return Err(error);
+        }
+
+        // Everything between spawn and commit is cancellable, and every
+        // exit funnels through the guard (kill the whole tree, bounded
+        // reap) and releases the reservation.
+        let (artifact_ref, line_rx, draft) = tokio::select! {
+            biased;
+            _ = cancel.cancelled() => {
+                guard.abandon().await;
+                self.sessions.lock().await.remove(&session_id);
+                return Ok(cancelled_start_output(call_id, "during start"));
             }
+            phase = async {
+                // 会话存活期间发布 draft 定位符，stop 时再封口。
+                let draft = self
+                    .workspace
+                    .create_artifact(run_id, "process-session", "log")
+                    .await?;
+                let artifact_ref = draft.locator().to_string();
+                let (line_tx, line_rx) = mpsc::channel::<StreamChunk>(512);
+                if let Some(stdout) = stdout {
+                    spawn_stdout_reader(stdout, line_tx.clone());
+                }
+                if let Some(stderr) = stderr {
+                    spawn_stderr_reader(stderr, line_tx.clone());
+                }
+                drop(line_tx);
+                Ok::<_, AgentError>((artifact_ref, line_rx, draft))
+            } => match phase {
+                Ok(phase) => phase,
+                Err(error) => {
+                    guard.abandon().await;
+                    self.sessions.lock().await.remove(&session_id);
+                    return Err(error);
+                }
+            },
         };
 
-        // 会话存活期间发布 draft 定位符，stop 时再封口。
-        let draft = self
-            .workspace
-            .create_artifact(run_id, "process-session", "log")
-            .await?;
-        let artifact_ref = draft.locator().to_string();
-
-        let (line_tx, line_rx) = mpsc::channel::<StreamChunk>(512);
-        if let Some(stdout) = child.stdout.take() {
-            spawn_stdout_reader(stdout, line_tx.clone());
-        }
-        if let Some(stderr) = child.stderr.take() {
-            spawn_stderr_reader(stderr, line_tx.clone());
-        }
-        drop(line_tx);
-
-        let session_id = ContextItemId::new().to_string();
+        let pid = guard.pid;
+        let child = guard.keep();
         self.sessions.lock().await.insert(
             session_id.clone(),
-            ProcessSession {
+            SessionSlot::Running(Box::new(ProcessSession {
                 child,
                 pid,
                 rx: line_rx,
                 capture: StreamCapture::new(),
                 artifact_ref: artifact_ref.clone(),
                 artifact: BufWriter::new(draft),
-            },
+            })),
         );
 
         Ok(ToolOutcome::Value(
@@ -422,11 +513,11 @@ impl ProcessSessionTool {
             AgentError::InvalidRequest("process.session poll requires a session_id".into())
         })?;
         let mut sessions = self.sessions.lock().await;
-        let session = sessions.get_mut(&session_id).ok_or_else(|| {
-            AgentError::InvalidRequest(format!(
+        let Some(SessionSlot::Running(session)) = sessions.get_mut(&session_id) else {
+            return Err(AgentError::InvalidRequest(format!(
                 "process.session: no session '{session_id}' (unknown or already stopped)"
-            ))
-        })?;
+            )));
+        };
 
         let (new_lines, exited) = session.drain().await?;
         session
@@ -504,30 +595,19 @@ impl ProcessSessionTool {
             AgentError::InvalidRequest("process.session stop requires a session_id".into())
         })?;
         let mut sessions = self.sessions.lock().await;
-        let mut session = sessions.remove(&session_id).ok_or_else(|| {
-            AgentError::InvalidRequest(format!(
+        let Some(SessionSlot::Running(session)) = sessions.remove(&session_id) else {
+            return Err(AgentError::InvalidRequest(format!(
                 "process.session: no session '{session_id}' (unknown or already stopped)"
-            ))
-        })?;
-
-        kill_process_tree(session.pid);
-        let _ = session.child.kill().await;
-        let exit_code = session
-            .child
-            .wait()
-            .await
-            .ok()
-            .and_then(|status| status.code());
-        super::persist_process_exit(&self.workspace, session.pid, exit_code)?;
-        let artifact_ref = self
-            .workspace
-            .seal_buffered_artifact(session.artifact)
-            .await?;
-
+            )));
+        };
         let total_lines = session.capture.total_lines();
         let output_bytes = session.capture.total_bytes();
         let artifact_bytes = session.capture.artifact_bytes();
         let artifact_truncated = session.capture.artifact_truncated();
+        drop(sessions);
+
+        let artifact_ref = teardown_session(&self.workspace, *session).await?;
+
         let truncation_summary = if artifact_truncated {
             ", artifact truncated"
         } else {
@@ -563,6 +643,78 @@ impl ProcessSessionTool {
             }
             .with_native_execution_facts(super::builtin_bound(true)),
         ))
+    }
+}
+
+/// A typed failure for a `start` that never created a session: pre-spawn
+/// cancellation and the post-spawn select both land here, so the model
+/// sees one shape and cannot poll or stop an id that was never issued.
+fn cancelled_start_output(call_id: &str, phase: &str) -> ToolOutcome {
+    let mut metadata = json!({
+        "action": "start",
+        "outcome": "cancelled",
+        "phase": phase,
+    });
+    agent_contracts::attach_failure_class(
+        &mut metadata,
+        agent_contracts::ToolFailureClass::Cancellation,
+    );
+    ToolOutcome::Value(ToolOutput {
+        call_id: call_id.into(),
+        tool_name: "process.session".into(),
+        ok: false,
+        summary: format!("process.session start cancelled ({phase})"),
+        model_content: format!(
+            "process.session start was cancelled {phase}; no session was created and its process tree was terminated."
+        ),
+        artifact_ref: None,
+        metadata,
+    })
+}
+
+/// The single teardown path for a running session, shared by `stop` and
+/// module shutdown: kill the whole process tree, reap the direct child
+/// within a bounded wait, persist the exit and seal the buffered
+/// artifact. Bounded per session so teardown itself cannot hang.
+async fn teardown_session(
+    workspace: &Workspace,
+    mut session: ProcessSession,
+) -> AgentResult<String> {
+    kill_process_tree(session.pid);
+    let _ = session.child.kill().await;
+    let exit_code = tokio::time::timeout(EXIT_DRAIN_TIMEOUT, session.child.wait())
+        .await
+        .ok()
+        .and_then(Result::ok)
+        .and_then(|status| status.code());
+    super::persist_process_exit(workspace, session.pid, exit_code)?;
+    workspace.seal_buffered_artifact(session.artifact).await
+}
+
+/// Module shutdown: stop every live session with the same teardown as
+/// `stop`, so a dispatcher teardown kills and reaps children instead of
+/// leaving them to direct-child drop. Pending reservations carry no
+/// child and are simply dropped. Best effort across sessions; the first
+/// error is reported after the rest have been drained.
+pub(crate) async fn drain_sessions(
+    workspace: &Workspace,
+    sessions: &SessionRegistry,
+) -> AgentResult<()> {
+    let mut slots = sessions.lock().await;
+    let entries: Vec<(String, SessionSlot)> = std::mem::take(&mut *slots).into_iter().collect();
+    drop(slots);
+    let mut first_error: Option<AgentError> = None;
+    for (_, slot) in entries {
+        if let SessionSlot::Running(session) = slot
+            && let Err(error) = teardown_session(workspace, *session).await
+            && first_error.is_none()
+        {
+            first_error = Some(error);
+        }
+    }
+    match first_error {
+        Some(error) => Err(error),
+        None => Ok(()),
     }
 }
 
@@ -621,7 +773,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let tool = ProcessSessionTool::new(
             Workspace::open(dir.path()).await.unwrap(),
-            Arc::new(Mutex::new(HashMap::new())),
+            SessionRegistry::default(),
         );
         let marker = dir.path().join("marker.txt");
         let error = tool
@@ -651,7 +803,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let tool = ProcessSessionTool::new(
             Workspace::open(dir.path()).await.unwrap(),
-            Arc::new(Mutex::new(HashMap::new())),
+            SessionRegistry::default(),
         );
         let marker = dir.path().join("marker.txt");
         let run_id = RunId::new();
@@ -685,7 +837,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let tool = ProcessSessionTool::new(
             Workspace::open(dir.path()).await.unwrap(),
-            Arc::new(Mutex::new(HashMap::new())),
+            SessionRegistry::default(),
         );
         let error = tool
             .execute(
@@ -713,7 +865,7 @@ mod tests {
     async fn session_start_ignores_an_unused_command_field() {
         let dir = tempfile::tempdir().unwrap();
         let workspace = Workspace::open(dir.path()).await.unwrap();
-        let tool = ProcessSessionTool::new(workspace, Arc::new(Mutex::new(HashMap::new())));
+        let tool = ProcessSessionTool::new(workspace, SessionRegistry::default());
         let marker = dir.path().join("marker.txt");
         let unused = dir.path().join("unused.txt");
         let run_id = RunId::new();
@@ -767,7 +919,7 @@ mod tests {
     async fn session_start_refuses_bare_name_shadow_and_control_env() {
         let dir = tempfile::tempdir().unwrap();
         let workspace = Workspace::open(dir.path()).await.unwrap();
-        let tool = ProcessSessionTool::new(workspace, Arc::new(Mutex::new(HashMap::new())));
+        let tool = ProcessSessionTool::new(workspace, SessionRegistry::default());
         #[cfg(windows)]
         let src = std::path::PathBuf::from(
             std::env::var("ComSpec").unwrap_or_else(|_| "C:\\Windows\\System32\\cmd.exe".into()),
@@ -834,7 +986,7 @@ mod tests {
     async fn session_stop_settles_start_as_completed_value_not_unapplied() {
         let dir = tempfile::tempdir().unwrap();
         let workspace = Workspace::open(dir.path()).await.unwrap();
-        let tool = ProcessSessionTool::new(workspace.clone(), Arc::new(Mutex::new(HashMap::new())));
+        let tool = ProcessSessionTool::new(workspace.clone(), SessionRegistry::default());
         let run_id = RunId::new();
         let start_args = json!({"action": "start", "argv": long_argv()});
         let start_context = start_ctx(run_id, &start_args);
@@ -895,7 +1047,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let tool = ProcessSessionTool::new(
             Workspace::open(dir.path()).await.unwrap(),
-            Arc::new(Mutex::new(HashMap::new())),
+            SessionRegistry::default(),
         );
         let run_id = RunId::new();
 
@@ -962,7 +1114,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let tool = ProcessSessionTool::new(
             Workspace::open(dir.path()).await.unwrap(),
-            Arc::new(Mutex::new(HashMap::new())),
+            SessionRegistry::default(),
         );
         let run_id = RunId::new();
 
@@ -1036,5 +1188,238 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(value(output).metadata["status"], "stopped");
+    }
+
+    #[tokio::test]
+    async fn pre_cancelled_start_does_not_spawn() {
+        let dir = tempfile::tempdir().unwrap();
+        let tool = ProcessSessionTool::new(
+            Workspace::open(dir.path()).await.unwrap(),
+            SessionRegistry::default(),
+        );
+        let marker = dir.path().join("marker.txt");
+        let run_id = RunId::new();
+        let arguments = json!({"action": "start", "argv": write_marker_argv()});
+        let context = start_ctx(run_id, &arguments);
+        let cancel = CancellationToken::new();
+        cancel.cancel();
+        let output = value(
+            tool.execute(run_id, "c", arguments, Some(context), cancel)
+                .await
+                .unwrap(),
+        );
+        assert!(!output.ok, "a pre-cancelled start must report failure");
+        assert!(
+            output.summary.contains("cancelled"),
+            "summary should mention cancellation: {}",
+            output.summary
+        );
+        assert!(
+            !marker.exists(),
+            "no child may spawn under a pre-cancelled start"
+        );
+    }
+
+    #[tokio::test]
+    async fn concurrent_starts_at_the_cap_are_reserved_atomically() {
+        let dir = tempfile::tempdir().unwrap();
+        let workspace = Workspace::open(dir.path()).await.unwrap();
+        let sessions = SessionRegistry::default();
+        let tool = std::sync::Arc::new(ProcessSessionTool::new(workspace, sessions.clone()));
+        let attempts = MAX_SESSIONS + 4;
+        let mut set = tokio::task::JoinSet::new();
+        for _ in 0..attempts {
+            let tool = tool.clone();
+            set.spawn(async move {
+                let run_id = RunId::new();
+                let arguments = json!({"action": "start", "argv": long_argv()});
+                let context = start_ctx(run_id, &arguments);
+                tool.execute(
+                    run_id,
+                    "c",
+                    arguments,
+                    Some(context),
+                    CancellationToken::new(),
+                )
+                .await
+            });
+        }
+        let mut started = 0usize;
+        let mut refused = 0usize;
+        while let Some(result) = set.join_next().await {
+            match result.expect("the start task must not panic") {
+                Ok(ToolOutcome::Value(output)) => {
+                    assert!(
+                        output.ok,
+                        "a reserved start must succeed: {}",
+                        output.summary
+                    );
+                    started += 1;
+                }
+                Ok(other) => panic!("session start must return a plain value: {other:?}"),
+                Err(error) => {
+                    assert!(
+                        error
+                            .to_string()
+                            .contains("limited to 16 concurrent sessions"),
+                        "{error}"
+                    );
+                    refused += 1;
+                }
+            }
+        }
+        assert_eq!(started, MAX_SESSIONS);
+        assert_eq!(refused, attempts - MAX_SESSIONS);
+        assert_eq!(
+            sessions.lock().await.len(),
+            MAX_SESSIONS,
+            "every reservation must have become a running session"
+        );
+        drain_sessions(&tool.workspace, &sessions).await.unwrap();
+        assert!(sessions.lock().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn cancel_mid_start_kills_the_spawned_tree() {
+        let dir = tempfile::tempdir().unwrap();
+        let workspace = Workspace::open(dir.path()).await.unwrap();
+        let sessions = SessionRegistry::default();
+        let tool =
+            std::sync::Arc::new(ProcessSessionTool::new(workspace.clone(), sessions.clone()));
+        let (argv, child_pidfile, heir_pidfile) =
+            super::super::test_procs::tree_pidfile_argv(dir.path());
+        let run_id = RunId::new();
+        let arguments = json!({"action": "start", "argv": argv});
+        let context = start_ctx(run_id, &arguments);
+        let cancel = CancellationToken::new();
+        let task_tool = tool.clone();
+        let start_cancel = cancel.clone();
+        let handle = tokio::spawn(async move {
+            let output = task_tool
+                .execute(run_id, "c", arguments, Some(context), start_cancel)
+                .await
+                .unwrap();
+            value(output)
+        });
+        super::super::test_procs::wait_for_path(&child_pidfile).await;
+        let child_pid = super::super::test_procs::read_pid(&child_pidfile);
+        cancel.cancel();
+        let output = tokio::time::timeout(std::time::Duration::from_secs(10), handle)
+            .await
+            .expect("start must stop after cancellation")
+            .unwrap();
+        let heir_pid: Option<u32> = std::fs::read_to_string(&heir_pidfile)
+            .ok()
+            .and_then(|text| text.trim().parse().ok());
+        if output.ok {
+            // The start committed before the cancel landed: the session is
+            // running, and its own stop path tears the tree down.
+            let session_id = output.metadata["session_id"].as_str().unwrap();
+            let stop = tool
+                .execute(
+                    run_id,
+                    "c",
+                    json!({"action": "stop", "session_id": session_id}),
+                    None,
+                    CancellationToken::new(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(value(stop).metadata["status"], "stopped");
+        } else {
+            assert!(output.summary.contains("cancelled"), "{}", output.summary);
+            assert!(
+                sessions.lock().await.is_empty(),
+                "a cancelled start must release its reservation"
+            );
+        }
+        let mut tracked = vec![child_pid];
+        if let Some(heir_pid) = heir_pid {
+            tracked.push(heir_pid);
+        }
+        super::super::test_procs::wait_for_all_dead(&tracked, "the cancelled start's tree");
+    }
+
+    #[tokio::test]
+    async fn artifact_failure_after_spawn_releases_the_reservation() {
+        let dir = tempfile::tempdir().unwrap();
+        let workspace = Workspace::open(dir.path()).await.unwrap();
+        let sessions = SessionRegistry::default();
+        let tool = ProcessSessionTool::new(workspace.clone(), sessions.clone());
+        let run_id = RunId::new();
+        // Sabotage the artifact owner directory so the post-spawn artifact
+        // phase fails deterministically.
+        let artifact_run_dir = workspace
+            .state_dir()
+            .join("artifacts")
+            .join(run_id.to_string());
+        std::fs::create_dir_all(&artifact_run_dir).unwrap();
+        std::fs::write(artifact_run_dir.join("process-session"), b"block").unwrap();
+        let (argv, child_pidfile, heir_pidfile) =
+            super::super::test_procs::tree_pidfile_argv(dir.path());
+        let arguments = json!({"action": "start", "argv": argv});
+        let context = start_ctx(run_id, &arguments);
+        let error = tool
+            .execute(run_id, "c", arguments, Some(context), CancellationToken::new())
+            .await
+            .expect_err("the sabotaged artifact phase must fail the start");
+        assert!(error.to_string().contains("artifact"), "{error}");
+        assert!(
+            sessions.lock().await.is_empty(),
+            "a failed start must release its reservation"
+        );
+        // The child races its own pidfile write against the artifact
+        // failure; whichever wins, nothing may be left running afterwards.
+        if child_pidfile.exists() {
+            let child_pid = super::super::test_procs::read_pid(&child_pidfile);
+            let heir_pid: Option<u32> = std::fs::read_to_string(&heir_pidfile)
+                .ok()
+                .and_then(|text| text.trim().parse().ok());
+            let mut tracked = vec![child_pid];
+            if let Some(heir_pid) = heir_pid {
+                tracked.push(heir_pid);
+            }
+            super::super::test_procs::wait_for_all_dead(&tracked, "the failed start's tree");
+        }
+    }
+
+    #[tokio::test]
+    async fn drain_stops_every_session_with_its_tree() {
+        let dir = tempfile::tempdir().unwrap();
+        let workspace = Workspace::open(dir.path()).await.unwrap();
+        let sessions = SessionRegistry::default();
+        let tool = ProcessSessionTool::new(workspace.clone(), sessions.clone());
+        let mut tracked = Vec::new();
+        for index in 0..2 {
+            let pid_dir = dir.path().join(format!("run{index}"));
+            std::fs::create_dir_all(&pid_dir).unwrap();
+            let (argv, child_pidfile, heir_pidfile) =
+                super::super::test_procs::tree_pidfile_argv(&pid_dir);
+            let run_id = RunId::new();
+            let arguments = json!({"action": "start", "argv": argv});
+            let context = start_ctx(run_id, &arguments);
+            let output = value(
+                tool.execute(
+                    run_id,
+                    "c",
+                    arguments,
+                    Some(context),
+                    CancellationToken::new(),
+                )
+                .await
+                .unwrap(),
+            );
+            assert!(output.ok, "{}", output.summary);
+            super::super::test_procs::wait_for_path(&child_pidfile).await;
+            tracked.push(super::super::test_procs::read_pid(&child_pidfile));
+            super::super::test_procs::wait_for_path(&heir_pidfile).await;
+            tracked.push(super::super::test_procs::read_pid(&heir_pidfile));
+        }
+        drain_sessions(&workspace, &sessions).await.unwrap();
+        assert!(
+            sessions.lock().await.is_empty(),
+            "shutdown drain must empty the registry"
+        );
+        super::super::test_procs::wait_for_all_dead(&tracked, "the drained sessions");
     }
 }

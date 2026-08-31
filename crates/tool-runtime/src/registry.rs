@@ -20,6 +20,7 @@ use agent_contracts::{
     ToolOutcome, ToolOutput, ToolRisk, ToolSemanticRole, ToolSpec, ToolSurfaceSnapshot,
     VerificationReuse, reject_staged_effect_for_process_tool, search_tool_catalog_filtered,
 };
+use agent_process::kill_process_tree;
 use agent_workspace::Workspace;
 use serde::Deserialize;
 use serde_json::json;
@@ -28,8 +29,8 @@ use sha2::{Digest, Sha256};
 use crate::tools::{
     ArtifactReadTool, CodeDiagnosticsTool, CodeSymbolsTool, ContextManageTool, EditPatchTool,
     EditReplaceTool, FsListTool, FsMkdirTool, FsReadTool, FsWriteTool, GitDiffTool, GitStatusTool,
-    ProcessRunTool, ProcessSession, ProcessSessionTool, SearchGrepTool, ShellExecTool,
-    TaskCompleteTool, TaskManageTool, Tool, VerificationRunTool,
+    ProcessRunTool, ProcessSessionTool, SearchGrepTool, SessionRegistry, SessionSlot,
+    ShellExecTool, TaskCompleteTool, TaskManageTool, Tool, VerificationRunTool,
 };
 use crate::{VERIFY_RUN_TOOL_NAME, VerificationRecipes};
 
@@ -124,6 +125,10 @@ pub struct BuiltinToolDispatcher {
     /// Kept for `capability.search` artifact spill: a catalog that does not
     /// fit the model-facing page writes its full listing here.
     workspace: Workspace,
+    /// The shared `process.session` registry, kept by the dispatcher so
+    /// module teardown can drain every live session (see [`Drop`] and
+    /// [`BuiltinToolDispatcher::shutdown_sessions`]).
+    sessions: SessionRegistry,
     tick: AtomicU64,
     /// Bumped on every lifecycle change (load/unload/gc transitions), so a
     /// `ToolSurfaceSnapshot` is auditably identifiable.
@@ -131,6 +136,23 @@ pub struct BuiltinToolDispatcher {
     /// Immutable host recipe table. The matching host-effect policy is
     /// derived from this same value by the composition root.
     verification_recipes: Arc<VerificationRecipes>,
+}
+
+impl Drop for BuiltinToolDispatcher {
+    fn drop(&mut self) {
+        // Synchronous teardown complement to `shutdown_sessions`: kill
+        // every live session's whole process tree. Drop cannot await, so
+        // the direct children are reaped when their handles drop with the
+        // registry; the explicit async drain is the bounded-reap path
+        // callers with an await budget (tests, hosts) use.
+        if let Ok(sessions) = self.sessions.try_lock() {
+            for slot in sessions.values() {
+                if let SessionSlot::Running(session) = slot {
+                    kill_process_tree(session.pid);
+                }
+            }
+        }
+    }
 }
 
 impl BuiltinToolDispatcher {
@@ -159,10 +181,9 @@ impl BuiltinToolDispatcher {
     ) -> Self {
         let verification_recipes = Arc::new(verification_recipes);
         // One session registry per dispatcher, shared by every
-        // `process.session` tool instance.
-        let sessions: std::sync::Arc<
-            tokio::sync::Mutex<std::collections::HashMap<String, ProcessSession>>,
-        > = std::sync::Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new()));
+        // `process.session` tool instance and kept by the dispatcher for
+        // module-shutdown draining.
+        let sessions = SessionRegistry::default();
         let mut tools: Vec<Arc<dyn Tool>> = vec![
             Arc::new(FsListTool::new(workspace.clone())),
             Arc::new(FsReadTool::new(workspace.clone())),
@@ -176,7 +197,7 @@ impl BuiltinToolDispatcher {
             Arc::new(GitDiffTool::new(workspace.clone())),
             Arc::new(ShellExecTool::new(workspace.clone())),
             Arc::new(ProcessRunTool::new(workspace.clone())),
-            Arc::new(ProcessSessionTool::new(workspace.clone(), sessions)),
+            Arc::new(ProcessSessionTool::new(workspace.clone(), sessions.clone())),
             // Local symbol/diagnostic navigation: catalog-optional
             // first-party tools loaded on demand when a task needs precise
             // navigation (pure local scans, no embeddings/vector storage).
@@ -223,10 +244,18 @@ impl BuiltinToolDispatcher {
             catalog: RwLock::new(catalog),
             config,
             workspace,
+            sessions,
             tick: AtomicU64::new(0),
             generation: AtomicU64::new(0),
             verification_recipes,
         }
+    }
+
+    /// Module shutdown: stop every live `process.session` child with the
+    /// same teardown as `stop` (tree kill, bounded reap, artifact seal,
+    /// exit persist). Idempotent; best effort across sessions.
+    pub async fn shutdown_sessions(&self) -> AgentResult<()> {
+        super::tools::drain_sessions(&self.workspace, &self.sessions).await
     }
 
     pub fn verification_recipes(&self) -> VerificationRecipes {
@@ -2668,6 +2697,38 @@ mod tests {
                 "dispatch must refuse {arguments} without identity: {error}"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn dispatcher_drop_kills_live_session_trees() {
+        let (workspace, dir) = open_workspace().await;
+        let dispatcher = BuiltinToolDispatcher::new(workspace);
+        let (argv, child_pidfile, heir_pidfile) =
+            crate::tools::test_procs::tree_pidfile_argv(dir.path());
+        let arguments = json!({"action": "start", "argv": argv});
+        let mut request = request("process.session", arguments.clone());
+        request.effect_context = Some(crate::tools::test_process_effect_context(
+            request.run_id,
+            &request.call.id,
+            "process.session",
+            &arguments,
+        ));
+        let outcome = dispatcher.execute(request).await.unwrap();
+        match outcome {
+            ToolOutcome::Value(output) => assert!(output.ok, "{}", output.summary),
+            other => panic!("session start must return a plain value: {other:?}"),
+        }
+        crate::tools::test_procs::wait_for_path(&child_pidfile).await;
+        let child_pid = crate::tools::test_procs::read_pid(&child_pidfile);
+        let heir_pid: Option<u32> = std::fs::read_to_string(&heir_pidfile)
+            .ok()
+            .and_then(|text| text.trim().parse().ok());
+        drop(dispatcher);
+        let mut tracked = vec![child_pid];
+        if let Some(heir_pid) = heir_pid {
+            tracked.push(heir_pid);
+        }
+        crate::tools::test_procs::wait_for_all_dead(&tracked, "the dropped dispatcher's sessions");
     }
 
     #[tokio::test]

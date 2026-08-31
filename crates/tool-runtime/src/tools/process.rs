@@ -906,6 +906,10 @@ impl ProcessRunTool {
             }
             Err(e) => return Err(AgentError::Tool(format!("spawn {}: {e}", args.argv[0]))),
         };
+        // Every early return after this point must kill the whole tree,
+        // not just the direct child (`kill_on_drop` kills only the child
+        // itself). The guard is disarmed only after the child is reaped.
+        let mut tree_guard = super::ProcessTreeGuard::new(child.id().unwrap_or(0));
         // The host-owned proof lane is a synchronous short transaction: the
         // composition root has no Core identity to persist, and cancel or
         // timeout kill the whole tree before the run returns. Crash recovery
@@ -1004,6 +1008,11 @@ impl ProcessRunTool {
                     .map_err(|e| AgentError::Tool(format!("wait: {e}")))?,
             );
         }
+        // The direct child is reaped here; background descendants that
+        // kept pipes open past the grace window are intentional
+        // completions. From this point an early return cannot leak a
+        // live process.
+        tree_guard.disarm();
         if let Some(pid) = pid {
             super::persist_process_exit(
                 &self.workspace,

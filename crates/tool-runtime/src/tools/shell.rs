@@ -296,6 +296,10 @@ impl Tool for ShellExecTool {
         let mut child = command
             .spawn()
             .map_err(|e| AgentError::Tool(format!("spawn command: {e}")))?;
+        // Every early return after this point must kill the whole tree,
+        // not just the direct shell (`kill_on_drop`). The guard is
+        // disarmed only after the shell is reaped.
+        let mut tree_guard = super::ProcessTreeGuard::new(child.id().unwrap_or(0));
         let pid = match super::persist_spawned_process(
             &self.workspace,
             &effect_context,
@@ -387,6 +391,9 @@ impl Tool for ShellExecTool {
                     .map_err(|e| AgentError::Tool(format!("wait: {e}")))?,
             );
         }
+        // The shell is reaped here; background descendants that kept
+        // pipes open past the grace window are intentional completions.
+        tree_guard.disarm();
         super::persist_process_exit(
             &self.workspace,
             pid,
