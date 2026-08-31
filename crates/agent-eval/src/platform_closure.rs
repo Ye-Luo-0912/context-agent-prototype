@@ -1245,7 +1245,9 @@ async fn drive_coordinator_inner(
             .ack(EffectAck {
                 reservation_id,
                 operation_id: identity.operation_id,
-                applied: true,
+                settlement: agent_contracts::EffectAckSettlement::Applied {
+                    durability: agent_contracts::EffectDurability::Durable,
+                },
                 receipt_summary: "closure applied cycle".into(),
             })
             .await?;

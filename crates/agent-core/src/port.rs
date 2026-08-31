@@ -218,10 +218,14 @@ pub struct ReservedEffect {
 }
 
 /// Phase 3 input: durable acknowledgement keyed by the reservation.
+/// Carries the typed settlement, never a boolean: `Unknown` and
+/// `Applied { durability: DurabilityFailed }` receipts must stay weak through
+/// broker persistence and recovery instead of being laundered into durable
+/// success.
 pub struct EffectAck {
     pub reservation_id: String,
     pub operation_id: OperationId,
-    pub applied: bool,
+    pub settlement: agent_contracts::EffectAckSettlement,
     /// Bounded receipt summary for broker-side audit.
     pub receipt_summary: String,
 }
@@ -850,14 +854,25 @@ impl CorePort for CoreAuthority {
                     effect,
                 })
                 .await;
-            let applied = !matches!(receipt, EffectReceipt::NotApplied { .. });
+            let settlement = match &receipt {
+                EffectReceipt::NotApplied { .. } => {
+                    agent_contracts::EffectAckSettlement::NotApplied
+                }
+                EffectReceipt::Applied { durability, .. } => {
+                    agent_contracts::EffectAckSettlement::Applied {
+                        durability: durability.clone(),
+                    }
+                }
+                EffectReceipt::Unknown { .. } => agent_contracts::EffectAckSettlement::Unknown,
+            };
+            let settlement_label = settlement.label();
             if let Err(error) = self
                 .broker()
                 .ack(EffectAck {
                     reservation_id,
                     operation_id,
-                    applied,
-                    receipt_summary: format!("applied={applied}"),
+                    settlement,
+                    receipt_summary: format!("settlement={settlement_label}"),
                 })
                 .await
             {
@@ -1406,8 +1421,9 @@ mod tests {
 
         async fn ack(&self, ack: EffectAck) -> AgentResult<()> {
             self.phases.lock().unwrap().push(format!(
-                "ack:{}:applied={}",
-                ack.reservation_id, ack.applied
+                "ack:{}:settlement={}",
+                ack.reservation_id,
+                ack.settlement.label()
             ));
             Ok(())
         }
@@ -2298,7 +2314,10 @@ mod tests {
             .expect("phase 1 is reserve")
             .to_string();
         assert_eq!(phases[1], format!("dispatch:{reservation_id}"));
-        assert_eq!(phases[2], format!("ack:{reservation_id}:applied=true"));
+        assert_eq!(
+            phases[2],
+            format!("ack:{reservation_id}:settlement=applied_durable")
+        );
         assert_eq!(&*state.lock().unwrap(), "committed");
     }
 

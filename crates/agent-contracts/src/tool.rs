@@ -1678,6 +1678,35 @@ pub trait Effect: Send + Sync {
     async fn rollback(self: Box<Self>, reason: &str) -> AgentResult<()>;
 }
 
+/// The durable acknowledgement settlement an effect broker persists across
+/// the ACK/Core-terminal crash window. It preserves the receipt category so
+/// recovery can never strengthen a weaker truth: an `Unknown` or
+/// `Applied { durability: DurabilityFailed }` dispatch must not come back as
+/// durable success. Unknown future variants are rejected by deserialization.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum EffectAckSettlement {
+    NotApplied,
+    Applied { durability: EffectDurability },
+    Unknown,
+}
+
+impl EffectAckSettlement {
+    /// A short human-readable label for logs and audit summaries.
+    pub fn label(&self) -> &'static str {
+        match self {
+            Self::NotApplied => "not_applied",
+            Self::Applied {
+                durability: EffectDurability::Durable,
+            } => "applied_durable",
+            Self::Applied {
+                durability: EffectDurability::DurabilityFailed(_),
+            } => "applied_durability_failed",
+            Self::Unknown => "unknown",
+        }
+    }
+}
+
 /// How durably an applied effect is recorded.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum EffectDurability {
@@ -2819,6 +2848,51 @@ mod tests {
             .risk(),
             ToolRisk::ProcessExecution
         );
+    }
+
+    #[test]
+    fn effect_ack_settlement_round_trips_typed_and_rejects_unknown_kinds() {
+        let cases = [
+            (
+                EffectAckSettlement::NotApplied,
+                serde_json::json!({"kind": "not_applied"}),
+            ),
+            (
+                EffectAckSettlement::Applied {
+                    durability: EffectDurability::Durable,
+                },
+                serde_json::json!({"kind": "applied", "durability": "Durable"}),
+            ),
+            (
+                EffectAckSettlement::Applied {
+                    durability: EffectDurability::DurabilityFailed("lost write".into()),
+                },
+                serde_json::json!({
+                    "kind": "applied",
+                    "durability": {"DurabilityFailed": "lost write"}
+                }),
+            ),
+            (
+                EffectAckSettlement::Unknown,
+                serde_json::json!({"kind": "unknown"}),
+            ),
+        ];
+        for (settlement, expected) in cases {
+            let value = serde_json::to_value(&settlement).unwrap();
+            assert_eq!(value, expected, "typed settlement wire shape");
+            let back: EffectAckSettlement = serde_json::from_value(value).unwrap();
+            assert_eq!(back, settlement);
+        }
+        // 未记录的 future kind 必须被拒绝，绝不能静默接受或折叠。
+        let error = serde_json::from_value::<EffectAckSettlement>(serde_json::json!({
+            "kind": "future_settlement"
+        }))
+        .unwrap_err();
+        assert!(error.to_string().contains("future_settlement"), "{error}");
+        // 破旧布尔帧也不再静默解码：新日志只接受 typed settlement。
+        let error =
+            serde_json::from_value::<EffectAckSettlement>(serde_json::json!(true)).unwrap_err();
+        assert!(error.to_string().contains("invalid type"), "{error}");
     }
 
     #[test]

@@ -115,7 +115,9 @@ async fn ledger_classes_survive_client_reconnects() {
             .ack(EffectAck {
                 reservation_id: reservation,
                 operation_id: identity.operation_id,
-                applied: true,
+                settlement: agent_contracts::EffectAckSettlement::Applied {
+                    durability: agent_contracts::EffectDurability::Durable,
+                },
                 receipt_summary: "fixture".into(),
             })
             .await
@@ -144,7 +146,7 @@ async fn ledger_classes_survive_client_reconnects() {
             .ack(EffectAck {
                 reservation_id: reservation,
                 operation_id: identity.operation_id,
-                applied: false,
+                settlement: agent_contracts::EffectAckSettlement::NotApplied,
                 receipt_summary: "fixture".into(),
             })
             .await

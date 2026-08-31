@@ -24,7 +24,7 @@ use sha2::{Digest as _, Sha256};
 
 use crate::port::{EffectAck, EffectBroker, EffectReservation, ReservedEffect};
 
-const JOURNAL_VERSION: u32 = 1;
+const JOURNAL_VERSION: u32 = 2;
 const MAX_FRAME_BYTES: usize = 16 * 1024;
 const MAX_FILE_BYTES: u64 = 64 * 1024 * 1024;
 const MAX_RESERVATIONS: usize = 65_536;
@@ -77,7 +77,11 @@ enum ReservationTransition {
     },
     Acknowledged {
         effect_id: EffectId,
-        applied: bool,
+        /// Typed settlement preserved through recovery. Version 1 journals
+        /// stored an `applied` boolean and are rejected at load by the
+        /// version check: the boolean could only record durable truth, so a
+        /// silent decode would risk laundering weaker settlements.
+        settlement: agent_contracts::EffectAckSettlement,
     },
 }
 
@@ -99,7 +103,7 @@ struct ReservationEntry {
     effect_id: EffectId,
     record: ReservedRecord,
     dispatched: bool,
-    acked_applied: Option<bool>,
+    acked_settlement: Option<agent_contracts::EffectAckSettlement>,
 }
 
 #[derive(Debug, Default)]
@@ -191,10 +195,16 @@ impl ReservationJournal {
         self.append(ReservationTransition::Dispatched { effect_id })
     }
 
-    /// 记录一次持久应答；`applied` 决定崩溃分类落在 Applied 还是
-    /// NotApplied。
-    pub fn record_acked(&self, effect_id: EffectId, applied: bool) -> AgentResult<()> {
-        self.append(ReservationTransition::Acknowledged { effect_id, applied })
+    /// 记录一次持久应答；settlement 的类别原样保留到恢复，绝不加强。
+    pub fn record_acked(
+        &self,
+        effect_id: EffectId,
+        settlement: agent_contracts::EffectAckSettlement,
+    ) -> AgentResult<()> {
+        self.append(ReservationTransition::Acknowledged {
+            effect_id,
+            settlement,
+        })
     }
 
     /// 由经纪分配的预留 id 反查效果身份；应答路径需要它定位日志条目。
@@ -247,7 +257,7 @@ impl ReservationJournal {
                 ),
             }));
         }
-        Ok(Some(match (entry.dispatched, entry.acked_applied) {
+        Ok(Some(match (entry.dispatched, &entry.acked_settlement) {
             (false, _) => EffectReconciliation::NotApplied {
                 evidence: Some("broker reservation was never dispatched".into()),
             },
@@ -257,16 +267,43 @@ impl ReservationJournal {
                     entry.record.reservation_id
                 ),
             },
-            (true, Some(true)) => EffectReconciliation::Applied {
+            (
+                true,
+                Some(agent_contracts::EffectAckSettlement::Applied {
+                    durability: EffectDurability::Durable,
+                }),
+            ) => EffectReconciliation::Applied {
                 durability: EffectDurability::Durable,
                 evidence: Some(format!(
                     "broker:{}:acked-applied",
                     entry.record.reservation_id
                 )),
             },
-            (true, Some(false)) => EffectReconciliation::NotApplied {
-                evidence: Some("broker acknowledged the dispatch as not applied".into()),
+            (
+                true,
+                Some(agent_contracts::EffectAckSettlement::Applied {
+                    durability: EffectDurability::DurabilityFailed(reason),
+                }),
+            ) => EffectReconciliation::Applied {
+                durability: EffectDurability::DurabilityFailed(reason.clone()),
+                evidence: Some(format!(
+                    "broker:{}:acked-applied-durability-failed",
+                    entry.record.reservation_id
+                )),
             },
+            (true, Some(agent_contracts::EffectAckSettlement::NotApplied)) => {
+                EffectReconciliation::NotApplied {
+                    evidence: Some("broker acknowledged the dispatch as not applied".into()),
+                }
+            }
+            (true, Some(agent_contracts::EffectAckSettlement::Unknown)) => {
+                EffectReconciliation::Ambiguous {
+                    reason: format!(
+                        "broker reservation {} was acknowledged with an unknown settlement",
+                        entry.record.reservation_id
+                    ),
+                }
+            }
         }))
     }
 
@@ -341,13 +378,13 @@ fn validate_fold(state: &RecoveryState, transition: &ReservationTransition) -> R
             Ok(())
         }
         ReservationTransition::Dispatched { effect_id } => match state.by_effect.get(effect_id) {
-            Some(entry) if !entry.dispatched && entry.acked_applied.is_none() => Ok(()),
+            Some(entry) if !entry.dispatched && entry.acked_settlement.is_none() => Ok(()),
             Some(_) => Err(format!("effect {effect_id} is not waiting for dispatch")),
             None => Err(format!("effect {effect_id} has no broker reservation")),
         },
         ReservationTransition::Acknowledged { effect_id, .. } => {
             match state.by_effect.get(effect_id) {
-                Some(entry) if entry.dispatched && entry.acked_applied.is_none() => Ok(()),
+                Some(entry) if entry.dispatched && entry.acked_settlement.is_none() => Ok(()),
                 Some(_) => Err(format!(
                     "effect {effect_id} is not waiting for acknowledgement"
                 )),
@@ -369,7 +406,7 @@ fn apply_transition(
                     effect_id,
                     record: *record,
                     dispatched: false,
-                    acked_applied: None,
+                    acked_settlement: None,
                 },
             );
             Ok(())
@@ -383,13 +420,15 @@ fn apply_transition(
             Ok(())
         }
         ReservationTransition::Acknowledged {
-            effect_id, applied, ..
+            effect_id,
+            settlement,
+            ..
         } => {
             let entry = state
                 .by_effect
                 .get_mut(&effect_id)
                 .ok_or_else(|| format!("effect {effect_id} has no broker reservation"))?;
-            entry.acked_applied = Some(applied);
+            entry.acked_settlement = Some(settlement.clone());
             Ok(())
         }
     }
@@ -586,7 +625,8 @@ impl EffectBroker for JournaledEffectBroker {
                 ack.reservation_id
             )));
         };
-        self.journal.record_acked(effect_id, ack.applied)?;
+        self.journal
+            .record_acked(effect_id, ack.settlement.clone())?;
         self.inner.ack(ack).await
     }
 
@@ -617,7 +657,7 @@ pub enum CoordinatorRequest {
     },
     Acknowledged {
         reservation_id: String,
-        applied: bool,
+        settlement: agent_contracts::EffectAckSettlement,
     },
     Reconcile {
         context: OperationEffectContext,
@@ -685,9 +725,9 @@ fn handle_coordinator_request(
         },
         CoordinatorRequest::Acknowledged {
             reservation_id,
-            applied,
+            settlement,
         } => match journal.effect_id_for(&reservation_id) {
-            Ok(Some(effect_id)) => match journal.record_acked(effect_id, applied) {
+            Ok(Some(effect_id)) => match journal.record_acked(effect_id, settlement) {
                 Ok(()) => CoordinatorReply::ok(Some(reservation_id)),
                 Err(error) => CoordinatorReply::error(error),
             },
@@ -922,7 +962,7 @@ impl EffectBroker for ProcessEffectBroker {
             connection,
             CoordinatorRequest::Acknowledged {
                 reservation_id: ack.reservation_id,
-                applied: ack.applied,
+                settlement: ack.settlement,
             },
         )?)?;
         Ok(())
@@ -1094,7 +1134,9 @@ mod tests {
                 .ack(EffectAck {
                     reservation_id: format!("pass/{applied}"),
                     operation_id: identity.operation_id,
-                    applied: true,
+                    settlement: agent_contracts::EffectAckSettlement::Applied {
+                        durability: agent_contracts::EffectDurability::Durable,
+                    },
                     receipt_summary: "fixture".into(),
                 })
                 .await
@@ -1108,7 +1150,7 @@ mod tests {
                 .ack(EffectAck {
                     reservation_id: format!("pass/{refused}"),
                     operation_id: identity.operation_id,
-                    applied: false,
+                    settlement: agent_contracts::EffectAckSettlement::NotApplied,
                     receipt_summary: "fixture".into(),
                 })
                 .await
@@ -1154,6 +1196,135 @@ mod tests {
                 .unwrap()
                 .is_none()
         );
+    }
+
+    /// 四类应答结算全部按原样穿过 ACK/Core-terminal 崩溃窗口重开：
+    /// durable 仍是 durable，durability-failed 绝不升级成 durable，
+    /// not-applied 仍是 not-applied，unknown 恢复为 Ambiguous 而绝
+    /// 不是已应用。旧布尔日志只可能把 true 记成 durable（当时唯一
+    /// 可记录的真值），因此任何恢复路径都不能加强更弱的真相。
+    #[tokio::test]
+    async fn settlement_classes_are_never_strengthened_by_recovery() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("r.jsonl");
+        let identity = identity();
+        let durable = EffectId::new();
+        let durability_failed = EffectId::new();
+        let refused = EffectId::new();
+        let unknown = EffectId::new();
+
+        {
+            let broker = journaled(&dir).await;
+            for (effect_id, settlement) in [
+                (
+                    durable,
+                    agent_contracts::EffectAckSettlement::Applied {
+                        durability: EffectDurability::Durable,
+                    },
+                ),
+                (
+                    durability_failed,
+                    agent_contracts::EffectAckSettlement::Applied {
+                        durability: EffectDurability::DurabilityFailed("journal write lost".into()),
+                    },
+                ),
+                (refused, agent_contracts::EffectAckSettlement::NotApplied),
+                (unknown, agent_contracts::EffectAckSettlement::Unknown),
+            ] {
+                broker
+                    .reserve(reservation_for(&identity, effect_id, None))
+                    .await
+                    .unwrap();
+                dispatch_as(&broker, &identity, effect_id, true).await;
+                broker
+                    .ack(EffectAck {
+                        reservation_id: format!("pass/{effect_id}"),
+                        operation_id: identity.operation_id,
+                        settlement,
+                        receipt_summary: "fixture".into(),
+                    })
+                    .await
+                    .unwrap();
+            }
+        }
+
+        let reopened = JournaledEffectBroker::open(Arc::new(PassThroughBroker), &path).unwrap();
+        let durable_rc = reopened.reconcile(&context_of(&identity, durable)).unwrap();
+        assert!(
+            matches!(
+                durable_rc,
+                Some(EffectReconciliation::Applied {
+                    durability: EffectDurability::Durable,
+                    ..
+                })
+            ),
+            "durable settlement must stay durable: {durable_rc:?}"
+        );
+        let failed_rc = reopened
+            .reconcile(&context_of(&identity, durability_failed))
+            .unwrap();
+        assert!(
+            matches!(
+                failed_rc,
+                Some(EffectReconciliation::Applied {
+                    durability: EffectDurability::DurabilityFailed(_),
+                    ..
+                })
+            ),
+            "a durability-failed settlement must not come back as durable: {failed_rc:?}"
+        );
+        let refused_rc = reopened.reconcile(&context_of(&identity, refused)).unwrap();
+        assert!(
+            matches!(refused_rc, Some(EffectReconciliation::NotApplied { .. })),
+            "a not-applied settlement must stay not-applied: {refused_rc:?}"
+        );
+        let unknown_rc = reopened.reconcile(&context_of(&identity, unknown)).unwrap();
+        assert!(
+            matches!(unknown_rc, Some(EffectReconciliation::Ambiguous { .. })),
+            "an unknown settlement must not come back as applied: {unknown_rc:?}"
+        );
+    }
+
+    /// v1 布尔日志被明确拒绝而不是静默解码：旧 `applied: bool` 只能记录
+    /// durable 真值，无法表达 Unknown/DurabilityFailed，任何解码都是潜在
+    /// 加强。升级路径必须显式迁移，恢复绝不猜测。
+    #[tokio::test]
+    async fn version_one_boolean_journals_are_rejected_not_silently_decoded() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("r.jsonl");
+        let identity = identity();
+
+        // 用 v1 Reserved 帧（v1/v2 结构相同）专门验证版本检查路径：
+        // 明确报 unsupported version，而不是任何形式的静默解码。
+        let frame = JournalFrame {
+            version: 1,
+            seq: 1,
+            transition: ReservationTransition::Reserved {
+                effect_id: EffectId::new(),
+                record: Box::new(ReservedRecord {
+                    reservation_id: "legacy/1".into(),
+                    run_id: identity.run_id,
+                    operation_id: identity.operation_id,
+                    argument_digest: identity.argument_digest,
+                    generation: identity.generation,
+                    intent: None,
+                }),
+            },
+        };
+        let encoded = serde_json::to_vec(&frame).unwrap();
+        let mut line = serde_json::to_string(&StoredFrame {
+            checksum: checksum_hex(&encoded),
+            frame,
+        })
+        .unwrap();
+        line.push('\n');
+        std::fs::write(&path, line).unwrap();
+
+        let error = match JournaledEffectBroker::open(Arc::new(PassThroughBroker), &path) {
+            Ok(_) => panic!("a version 1 journal must be rejected"),
+            Err(error) => error,
+        };
+        assert!(error.to_string().contains("unsupported version"), "{error}");
     }
 
     /// 状态机拒绝：重复预约、先派发后预约、二次派发、二次应答。
