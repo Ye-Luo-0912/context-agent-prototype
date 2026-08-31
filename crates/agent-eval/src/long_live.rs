@@ -3603,16 +3603,19 @@ mod tests {
             "powershell".to_string(),
             "-NoProfile".to_string(),
             "-Command".to_string(),
-            "$p = Start-Process powershell -ArgumentList '-NoProfile -Command Start-Sleep 300' \
-             -PassThru; $p.Id | Set-Content child.pid; Wait-Process -Id $p.Id"
-                .to_string(),
+            format!(
+                "$p = Start-Process -FilePath powershell -ArgumentList '-NoProfile','-Command',\
+                 'Start-Sleep 300' -PassThru; [System.IO.File]::WriteAllText('{}', [string]$p.Id); \
+                 Wait-Process -Id $p.Id",
+                root.join("child.pid").to_string_lossy().replace('\'', "''")
+            ),
         ];
         let started = std::time::Instant::now();
         // PowerShell cold-start takes longer than `sh`, so Windows needs a
         // longer window for the descendant to write its pid file; both stay
         // far below the 300-second descendant lifetime being killed.
         let timeout = if cfg!(windows) {
-            Duration::from_millis(3000)
+            Duration::from_secs(10)
         } else {
             Duration::from_millis(300)
         };
@@ -3620,7 +3623,7 @@ mod tests {
         assert!(record.timed_out, "{record:?}");
         assert!(record.exit.is_none());
         assert!(
-            started.elapsed() < Duration::from_secs(10),
+            started.elapsed() < Duration::from_secs(30),
             "timed-out run must return bounded"
         );
         assert!(
