@@ -13,8 +13,8 @@ use agent_contracts::{
     OperationEffectContext, OperationId, RunId, ToolOperationIdentity, TurnId,
 };
 use agent_core::{
-    EffectAck, EffectBroker as _, EffectReservation, ProcessEffectBroker, ReservedEffect,
-    ReservedRecord,
+    CoordinatorRequest, EffectAck, EffectBroker as _, EffectReservation, ProcessEffectBroker,
+    ReservedEffect, ReservedRecord,
 };
 
 fn identity(operation_id: OperationId) -> ToolOperationIdentity {
@@ -233,4 +233,273 @@ async fn killed_host_leaves_an_ambiguous_dispatched_window() {
             .unwrap(),
         Some(EffectReconciliation::Ambiguous { .. })
     ));
+}
+
+// ---------------------------------------------------------------------------
+// 失败场景：服务端严格帧语义（进程内 duplex）+ 客户端有界/超时/毒化
+// （测试专用假宿主子进程）。全部 fail closed。
+// ---------------------------------------------------------------------------
+
+fn fake_program() -> &'static str {
+    env!("CARGO_BIN_EXE_coordinator_fake")
+}
+
+fn reserve_request(identity: &ToolOperationIdentity, effect_id: EffectId) -> CoordinatorRequest {
+    CoordinatorRequest::Reserve {
+        effect_id,
+        record: Box::new(ReservedRecord::from_reservation(
+            String::new(),
+            &reservation_for(identity, effect_id),
+        )),
+    }
+}
+
+async fn read_frame_from(reader: &mut (impl tokio::io::AsyncRead + Unpin)) -> Vec<u8> {
+    use tokio::io::AsyncReadExt;
+    let mut frame = Vec::new();
+    let mut byte = [0u8; 1];
+    loop {
+        let read = reader.read(&mut byte).await.unwrap();
+        if read == 0 {
+            return frame;
+        }
+        frame.push(byte[0]);
+        if byte[0] == b'\n' {
+            return frame;
+        }
+    }
+}
+
+/// 进程内帧服务器：`serve_broker_frames` 跑在 duplex 服务端，返回
+/// 服务端任务与客户端 stream（测试直接驱动客户端侧）。
+async fn spawn_frame_server(
+    dir: &tempfile::TempDir,
+) -> (
+    tokio::task::JoinHandle<agent_contracts::AgentResult<()>>,
+    tokio::io::DuplexStream,
+) {
+    let journal_path = dir.path().join("j.jsonl");
+    let journal = agent_core::ReservationJournal::open(journal_path.as_path()).unwrap();
+    let (duplex, client) = tokio::io::duplex(64 * 1024);
+    let (read_half, write_half) = tokio::io::split(duplex);
+    let task = tokio::spawn(async move {
+        let mut server_read = tokio::io::BufReader::new(read_half);
+        let mut server_write = write_half;
+        agent_core::serve_broker_frames(&mut server_read, &mut server_write, &journal).await
+    });
+    (task, client)
+}
+
+#[tokio::test]
+async fn server_rejects_oversize_request() {
+    use tokio::io::AsyncWriteExt;
+
+    let dir = tempfile::tempdir().unwrap();
+    let (task, mut client) = spawn_frame_server(&dir).await;
+    let _ = client
+        .write_all(&vec![b'x'; agent_core::MAX_COORDINATOR_LINE_BYTES + 1])
+        .await;
+    let _ = client.write_all(b"\n").await;
+    let _ = client.flush().await;
+    let error = tokio::time::timeout(std::time::Duration::from_secs(5), task)
+        .await
+        .expect("server must terminate on an oversize frame")
+        .unwrap()
+        .expect_err("oversize request must fail closed");
+    assert!(
+        error.to_string().contains("bound"),
+        "server error must mention the bound: {error}"
+    );
+}
+
+#[tokio::test]
+async fn server_rejects_empty_and_partial_eof_frames() {
+    use tokio::io::AsyncWriteExt;
+
+    let dir = tempfile::tempdir().unwrap();
+    let (task, mut client) = spawn_frame_server(&dir).await;
+    // 空帧：严格帧语义下是协议违规，不再是「跳过」。
+    let _ = client.write_all(b"\n").await;
+    let error = tokio::time::timeout(std::time::Duration::from_secs(5), task)
+        .await
+        .expect("server must terminate on an empty frame")
+        .unwrap()
+        .expect_err("empty frame must fail closed");
+    assert!(error.to_string().contains("empty"), "{error}");
+}
+
+#[tokio::test]
+async fn server_rejects_partial_eof_frame() {
+    use tokio::io::AsyncWriteExt;
+
+    let dir = tempfile::tempdir().unwrap();
+    let (task, mut client) = spawn_frame_server(&dir).await;
+    // 有字节、无换行终止符的 EOF：之前会被 `read_line` 静默当成完整行。
+    let _ = client.write_all(br#"{"op":"shutdown"}"#).await;
+    let _ = client.flush().await;
+    drop(client);
+    let error = tokio::time::timeout(std::time::Duration::from_secs(5), task)
+        .await
+        .expect("server must terminate on a partial EOF frame")
+        .unwrap()
+        .expect_err("partial EOF must fail closed");
+    assert!(
+        error.to_string().contains("mid-frame"),
+        "server error must call out the mid-frame EOF: {error}"
+    );
+}
+
+#[tokio::test]
+async fn server_rejects_malformed_json() {
+    use tokio::io::AsyncWriteExt;
+
+    let dir = tempfile::tempdir().unwrap();
+    let (task, mut client) = spawn_frame_server(&dir).await;
+    let _ = client.write_all(b"this is not json\n").await;
+    let _ = client.flush().await;
+    let error = tokio::time::timeout(std::time::Duration::from_secs(5), task)
+        .await
+        .expect("server must terminate on a malformed request")
+        .unwrap()
+        .expect_err("malformed JSON must fail closed, not reply-and-continue");
+    assert!(error.to_string().contains("malformed"), "{error}");
+}
+
+#[tokio::test]
+async fn server_roundtrips_reserve_then_shutdown_and_clean_eof() {
+    use tokio::io::AsyncWriteExt;
+
+    let dir = tempfile::tempdir().unwrap();
+    let (task, mut client) = spawn_frame_server(&dir).await;
+    let identity = identity(OperationId::new());
+    let effect_id = EffectId::new();
+    let encoded = serde_json::to_vec(&reserve_request(&identity, effect_id)).unwrap();
+    client.write_all(&encoded).await.unwrap();
+    client.write_all(b"\n").await.unwrap();
+    client.flush().await.unwrap();
+    let reply_frame = read_frame_from(&mut client).await;
+    let reply: agent_core::CoordinatorReply =
+        serde_json::from_str(std::str::from_utf8(&reply_frame).unwrap()).unwrap();
+    assert!(reply.ok, "reserve must be accepted: {reply:?}");
+    assert!(reply.reservation_id.is_some());
+    // shutdown 帧：宿主干净返回。
+    client.write_all(br#"{"op":"shutdown"}"#).await.unwrap();
+    client.write_all(b"\n").await.unwrap();
+    client.flush().await.unwrap();
+    tokio::time::timeout(std::time::Duration::from_secs(5), task)
+        .await
+        .expect("shutdown must end the session")
+        .unwrap()
+        .expect("clean shutdown is not an error");
+}
+
+#[tokio::test]
+async fn stalled_peer_rpc_times_out_and_poisons() {
+    let timeouts = agent_core::CoordinatorTimeouts {
+        rpc: std::time::Duration::from_millis(300),
+        ..Default::default()
+    };
+    let coordinator = ProcessEffectBroker::connect_with_timeouts(
+        Path::new(fake_program()),
+        // 假宿主把唯一参数当行为模式；真实 journal 从未被它打开。
+        Path::new("silent"),
+        timeouts,
+    )
+    .unwrap();
+    let identity = identity(OperationId::new());
+    let error = coordinator
+        .reserve(reservation_for(&identity, EffectId::new()))
+        .await
+        .expect_err("a silent host must time out");
+    assert!(error.to_string().contains("timed out"), "{error}");
+    let again = coordinator
+        .reserve(reservation_for(&identity, EffectId::new()))
+        .await
+        .expect_err("a poisoned connection must stay fail-closed");
+    assert!(again.to_string().contains("poisoned"), "{again}");
+    coordinator.shutdown();
+}
+
+#[tokio::test]
+async fn oversize_reply_poisons_the_client() {
+    let timeouts = agent_core::CoordinatorTimeouts {
+        rpc: std::time::Duration::from_secs(2),
+        ..Default::default()
+    };
+    let coordinator = ProcessEffectBroker::connect_with_timeouts(
+        Path::new(fake_program()),
+        Path::new("oversize_reply"),
+        timeouts,
+    )
+    .unwrap();
+    let identity = identity(OperationId::new());
+    let error = coordinator
+        .reserve(reservation_for(&identity, EffectId::new()))
+        .await
+        .expect_err("an oversize reply must fail closed");
+    assert!(error.to_string().contains("bound"), "{error}");
+    coordinator.shutdown();
+}
+
+#[tokio::test]
+async fn partial_eof_reply_fails_closed() {
+    let timeouts = agent_core::CoordinatorTimeouts {
+        rpc: std::time::Duration::from_secs(2),
+        ..Default::default()
+    };
+    let coordinator = ProcessEffectBroker::connect_with_timeouts(
+        Path::new(fake_program()),
+        Path::new("partial_eof_reply"),
+        timeouts,
+    )
+    .unwrap();
+    let identity = identity(OperationId::new());
+    let error = coordinator
+        .reserve(reservation_for(&identity, EffectId::new()))
+        .await
+        .expect_err("a reply without a frame terminator must fail closed");
+    assert!(error.to_string().contains("mid-frame"), "{error}");
+    coordinator.shutdown();
+}
+
+#[tokio::test]
+async fn stubborn_child_shutdown_is_bounded() {
+    let timeouts = agent_core::CoordinatorTimeouts {
+        rpc: std::time::Duration::from_millis(300),
+        ..Default::default()
+    };
+    let coordinator = ProcessEffectBroker::connect_with_timeouts(
+        Path::new(fake_program()),
+        Path::new("stubborn"),
+        timeouts,
+    )
+    .unwrap();
+    // 假宿主对 shutdown 既不答复也不退出：shutdown 必须靠 kill 兜底
+    // 并在有界时间内返回，绝不无限阻塞在 child.wait()。
+    tokio::time::timeout(std::time::Duration::from_secs(3), async move {
+        coordinator.shutdown()
+    })
+    .await
+    .expect("shutdown must be bounded by kill + reap");
+}
+
+#[tokio::test]
+async fn drop_does_not_block_on_a_stubborn_host() {
+    let timeouts = agent_core::CoordinatorTimeouts {
+        rpc: std::time::Duration::from_millis(300),
+        ..Default::default()
+    };
+    let coordinator = ProcessEffectBroker::connect_with_timeouts(
+        Path::new(fake_program()),
+        Path::new("stubborn"),
+        timeouts,
+    )
+    .unwrap();
+    // 不先做任何 RPC：假宿主还在等第一条帧。Drop 必须立即返回（只
+    // kill，不 wait）。spawn_blocking 断言同步 drop 不会卡住线程。
+    let join = tokio::task::spawn_blocking(move || drop(coordinator));
+    tokio::time::timeout(std::time::Duration::from_secs(3), join)
+        .await
+        .expect("Drop must not block on the child wait")
+        .unwrap();
 }

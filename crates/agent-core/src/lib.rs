@@ -15,8 +15,10 @@ pub use approval::{
 };
 pub use authority::ApprovalVerdict;
 pub use broker::{
-    CoordinatorReply, CoordinatorRequest, JournaledEffectBroker, ProcessEffectBroker,
-    ReservationJournal, ReservedRecord, serve_broker_lines,
+    CoordinatorFrameError, CoordinatorFrameErrorKind, CoordinatorReply, CoordinatorRequest,
+    CoordinatorTimeouts, JournaledEffectBroker, MAX_COORDINATOR_LINE_BYTES, ProcessEffectBroker,
+    ReservationJournal, ReservedRecord, read_coordinator_frame, read_coordinator_frame_sync,
+    serve_broker_frames, write_coordinator_frame, write_coordinator_frame_sync,
 };
 pub use capability_admission::{
     AdmissionContext, CapabilityAdmission, MAX_TOOL_DESCRIPTION_CHARS, MAX_TOOL_NAME_CHARS,

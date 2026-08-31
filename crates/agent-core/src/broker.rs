@@ -13,6 +13,7 @@ use std::{
     io::{BufRead, BufReader, Read, Seek, SeekFrom, Write},
     path::Path,
     sync::{Arc, Mutex},
+    time::Duration,
 };
 
 use agent_contracts::{
@@ -642,6 +643,256 @@ impl EffectBroker for JournaledEffectBroker {
 /// 会话。serde 的内部标签表示法本身容忍多余字段，所以这里的把关
 /// 是行界、已知操作集合与 fold 校验，而不是字段白名单。
 pub const MAX_COORDINATOR_LINE_BYTES: usize = 64 * 1024;
+/// 单次协调器 RPC 往返的最长等待。宿主是本地进程，正常应答是毫秒
+/// 级；超时视为会话级违规：毒化连接、终止宿主并 fail closed。
+pub const COORDINATOR_RPC_TIMEOUT: Duration = Duration::from_secs(30);
+/// shutdown 帧后宿主应自行退出的最长时间；超时则显式终止。
+pub const COORDINATOR_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
+/// 终止宿主后收割子进程的最长等待；超时后不再等待（进程表记录由
+/// OS 收养），绝不无限阻塞在 `child.wait()`。
+pub const COORDINATOR_REAP_GRACE: Duration = Duration::from_secs(2);
+
+/// 协调器帧的读错误分类，与 `agent-process` 的帧语义一致：
+/// EOF 前有字节但无换行终止符是 `PartialEof`，绝不静默当作完整帧
+/// 接受；入站上限在追加每个 chunk 之前强制，分配不会超过上限。
+#[derive(Debug)]
+pub enum CoordinatorFrameErrorKind {
+    Oversize { limit: usize },
+    Eof,
+    PartialEof { bytes: usize },
+    Io(String),
+}
+
+/// 一次协调器帧错误：分类加上进帧时的已读字节计数（诊断用）。
+#[derive(Debug)]
+pub struct CoordinatorFrameError {
+    pub kind: CoordinatorFrameErrorKind,
+    pub bytes: usize,
+}
+
+impl std::fmt::Display for CoordinatorFrameError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self.kind {
+            CoordinatorFrameErrorKind::Oversize { limit } => write!(
+                formatter,
+                "coordinator frame is over the {limit} byte bound"
+            ),
+            CoordinatorFrameErrorKind::Eof => {
+                write!(formatter, "coordinator stream ended before a frame")
+            }
+            CoordinatorFrameErrorKind::PartialEof { bytes } => write!(
+                formatter,
+                "coordinator stream ended mid-frame after {bytes} bytes without a newline"
+            ),
+            CoordinatorFrameErrorKind::Io(ref error) => {
+                write!(formatter, "coordinator io: {error}")
+            }
+        }
+    }
+}
+
+impl std::error::Error for CoordinatorFrameError {}
+
+/// 同步版 [`read_coordinator_frame`]：崩溃恢复路径没有 runtime 句柄，
+/// 用 std `BufRead::fill_buf` 实现同一有界、严格帧语义。
+pub fn read_coordinator_frame_sync(
+    reader: &mut impl std::io::BufRead,
+    max_frame_bytes: usize,
+) -> Result<Vec<u8>, CoordinatorFrameError> {
+    let mut frame: Vec<u8> = Vec::with_capacity(256.min(max_frame_bytes));
+    loop {
+        let buffer = match reader.fill_buf() {
+            Ok(buffer) => buffer,
+            Err(error) => {
+                return Err(CoordinatorFrameError {
+                    kind: CoordinatorFrameErrorKind::Io(error.to_string()),
+                    bytes: frame.len(),
+                });
+            }
+        };
+        if buffer.is_empty() {
+            if frame.is_empty() {
+                return Err(CoordinatorFrameError {
+                    kind: CoordinatorFrameErrorKind::Eof,
+                    bytes: 0,
+                });
+            }
+            return Err(CoordinatorFrameError {
+                kind: CoordinatorFrameErrorKind::PartialEof { bytes: frame.len() },
+                bytes: frame.len(),
+            });
+        }
+        match buffer.iter().position(|byte| *byte == b'\n') {
+            Some(newline) => {
+                let total = frame.len() + newline;
+                if total > max_frame_bytes {
+                    return Err(CoordinatorFrameError {
+                        kind: CoordinatorFrameErrorKind::Oversize {
+                            limit: max_frame_bytes,
+                        },
+                        bytes: total,
+                    });
+                }
+                frame.extend_from_slice(&buffer[..newline]);
+                reader.consume(newline + 1);
+                return Ok(frame);
+            }
+            None => {
+                let remaining = max_frame_bytes.saturating_sub(frame.len());
+                let len = buffer.len();
+                if len > remaining {
+                    return Err(CoordinatorFrameError {
+                        kind: CoordinatorFrameErrorKind::Oversize {
+                            limit: max_frame_bytes,
+                        },
+                        bytes: frame.len().saturating_add(len),
+                    });
+                }
+                frame.extend_from_slice(buffer);
+                reader.consume(len);
+            }
+        }
+    }
+}
+
+/// 同步版 [`write_coordinator_frame`]：写前检查、有界，写失败如实上报。
+pub fn write_coordinator_frame_sync(
+    writer: &mut impl std::io::Write,
+    payload: &[u8],
+    max_frame_bytes: usize,
+) -> AgentResult<()> {
+    if payload.is_empty() {
+        return Err(AgentError::InvalidRequest(
+            "coordinator frame payload is empty; nothing was written".into(),
+        ));
+    }
+    if payload.contains(&b'\n') {
+        return Err(AgentError::InvalidRequest(
+            "coordinator frame payload contains a newline; nothing was written".into(),
+        ));
+    }
+    if payload.len() > max_frame_bytes {
+        return Err(AgentError::InvalidRequest(format!(
+            "coordinator frame is {} bytes, above the {max_frame_bytes} byte bound; nothing was written",
+            payload.len()
+        )));
+    }
+    writer
+        .write_all(payload)
+        .map_err(|error| AgentError::Storage(format!("write coordinator frame: {error}")))?;
+    writer
+        .write_all(b"\n")
+        .map_err(|error| AgentError::Storage(format!("write coordinator frame: {error}")))?;
+    writer
+        .flush()
+        .map_err(|error| AgentError::Storage(format!("flush coordinator frame: {error}")))?;
+    Ok(())
+}
+
+/// 读恰好一条换行终止的协调器帧（剩余字节留在 reader 供下一帧）。
+/// 上限边读边强制；EOF 前零字节是 `Eof`，有字节无换行是
+/// `PartialEof`；返回的帧不含终止换行。
+pub async fn read_coordinator_frame(
+    reader: &mut (impl tokio::io::AsyncBufRead + Unpin),
+    max_frame_bytes: usize,
+) -> Result<Vec<u8>, CoordinatorFrameError> {
+    use tokio::io::AsyncBufReadExt;
+    let mut frame: Vec<u8> = Vec::with_capacity(256.min(max_frame_bytes));
+    loop {
+        let buffer = match reader.fill_buf().await {
+            Ok(buffer) => buffer,
+            Err(error) => {
+                return Err(CoordinatorFrameError {
+                    kind: CoordinatorFrameErrorKind::Io(error.to_string()),
+                    bytes: frame.len(),
+                });
+            }
+        };
+        if buffer.is_empty() {
+            if frame.is_empty() {
+                return Err(CoordinatorFrameError {
+                    kind: CoordinatorFrameErrorKind::Eof,
+                    bytes: 0,
+                });
+            }
+            return Err(CoordinatorFrameError {
+                kind: CoordinatorFrameErrorKind::PartialEof { bytes: frame.len() },
+                bytes: frame.len(),
+            });
+        }
+        match buffer.iter().position(|byte| *byte == b'\n') {
+            Some(newline) => {
+                // 上限同样作用于换行与整条超限行同批到达的情况：单次
+                // 大 fill_buf 不得绕过飞行中上限。
+                let total = frame.len() + newline;
+                if total > max_frame_bytes {
+                    return Err(CoordinatorFrameError {
+                        kind: CoordinatorFrameErrorKind::Oversize {
+                            limit: max_frame_bytes,
+                        },
+                        bytes: total,
+                    });
+                }
+                frame.extend_from_slice(&buffer[..newline]);
+                reader.consume(newline + 1);
+                return Ok(frame);
+            }
+            None => {
+                let remaining = max_frame_bytes.saturating_sub(frame.len());
+                let len = buffer.len();
+                if len > remaining {
+                    return Err(CoordinatorFrameError {
+                        kind: CoordinatorFrameErrorKind::Oversize {
+                            limit: max_frame_bytes,
+                        },
+                        bytes: frame.len().saturating_add(len),
+                    });
+                }
+                frame.extend_from_slice(buffer);
+                reader.consume(len);
+            }
+        }
+    }
+}
+
+/// 写一条换行终止的协调器帧。空载荷 / 内嵌换行 / 超长在写之前拒绝
+/// （连接保持同步、可继续用）；写失败如实上报。
+pub async fn write_coordinator_frame(
+    writer: &mut (impl tokio::io::AsyncWrite + Unpin),
+    payload: &[u8],
+    max_frame_bytes: usize,
+) -> AgentResult<()> {
+    use tokio::io::AsyncWriteExt as _;
+    if payload.is_empty() {
+        return Err(AgentError::InvalidRequest(
+            "coordinator frame payload is empty; nothing was written".into(),
+        ));
+    }
+    if payload.contains(&b'\n') {
+        return Err(AgentError::InvalidRequest(
+            "coordinator frame payload contains a newline; nothing was written".into(),
+        ));
+    }
+    if payload.len() > max_frame_bytes {
+        return Err(AgentError::InvalidRequest(format!(
+            "coordinator frame is {} bytes, above the {max_frame_bytes} byte bound; nothing was written",
+            payload.len()
+        )));
+    }
+    writer
+        .write_all(payload)
+        .await
+        .map_err(|error| AgentError::Storage(format!("write coordinator frame: {error}")))?;
+    writer
+        .write_all(b"\n")
+        .await
+        .map_err(|error| AgentError::Storage(format!("write coordinator frame: {error}")))?;
+    writer
+        .flush()
+        .await
+        .map_err(|error| AgentError::Storage(format!("flush coordinator frame: {error}")))?;
+    Ok(())
+}
 
 /// 协调器收到的请求。客户端编码、宿主解码，两侧各持一半 derive。
 #[derive(Debug, Serialize, Deserialize)]
@@ -749,64 +1000,124 @@ fn handle_coordinator_request(
     }
 }
 
-/// 以行分隔帧驱动一次协调器会话：EOF 或 `shutdown` 正常返回，协议
-/// 违规报错。输入输出泛化，进程内即可确定性测试。
-pub fn serve_broker_lines<R: std::io::BufRead, W: std::io::Write>(
+/// 以换行终止帧驱动一次协调器会话（有界、严格帧）：
+/// - 每帧边读边强制 `MAX_COORDINATOR_LINE_BYTES`，超限即违规；
+/// - 零字节 EOF 干净返回（客户端优雅关闭的兼容语义）；
+/// - EOF 前有无换行终止符的残帧（`PartialEof`）是协议违规；
+/// - 空帧、非 UTF-8 与 malformed JSON 都是协议违规（不再静默跳过
+///   或回 error reply 继续，fail closed）；
+/// - 应答写回同样有界；`shutdown` 请求正常返回。
+pub async fn serve_broker_frames<R, W>(
     input: &mut R,
     output: &mut W,
     journal: &ReservationJournal,
-) -> AgentResult<()> {
+) -> AgentResult<()>
+where
+    R: tokio::io::AsyncBufRead + Unpin,
+    W: tokio::io::AsyncWrite + Unpin,
+{
     loop {
-        let mut line = String::new();
-        let read = input
-            .read_line(&mut line)
-            .map_err(|error| AgentError::Storage(format!("read coordinator request: {error}")))?;
-        if read == 0 {
-            return Ok(());
-        }
-        if line.trim().is_empty() {
-            continue;
-        }
-        if line.len() > MAX_COORDINATOR_LINE_BYTES {
-            return Err(AgentError::InvalidRequest(
-                "coordinator request exceeds its line bound".into(),
-            ));
-        }
-        let reply = match serde_json::from_str::<CoordinatorRequest>(&line) {
-            Ok(CoordinatorRequest::Shutdown) => return Ok(()),
-            Ok(request) => handle_coordinator_request(journal, request),
+        let frame = match read_coordinator_frame(input, MAX_COORDINATOR_LINE_BYTES).await {
+            Ok(frame) => frame,
+            Err(CoordinatorFrameError {
+                kind: CoordinatorFrameErrorKind::Eof,
+                ..
+            }) => {
+                // 零字节 EOF：客户端已主动关闭。
+                return Ok(());
+            }
             Err(error) => {
-                CoordinatorReply::error(format!("malformed coordinator request: {error}"))
+                return Err(AgentError::Storage(format!(
+                    "read coordinator request: {error}"
+                )));
             }
         };
-        let mut encoded = serde_json::to_vec(&reply).map_err(|error| {
+        if frame.is_empty() {
+            return Err(AgentError::InvalidRequest(
+                "coordinator sent an empty frame".into(),
+            ));
+        }
+        let line = std::str::from_utf8(&frame).map_err(|error| {
+            AgentError::Storage(format!("coordinator request is not utf-8: {error}"))
+        })?;
+        let request = match serde_json::from_str::<CoordinatorRequest>(line) {
+            Ok(CoordinatorRequest::Shutdown) => return Ok(()),
+            Ok(request) => request,
+            Err(error) => {
+                return Err(AgentError::InvalidRequest(format!(
+                    "malformed coordinator request: {error}"
+                )));
+            }
+        };
+        let reply = handle_coordinator_request(journal, request);
+        let encoded = serde_json::to_vec(&reply).map_err(|error| {
             AgentError::Storage(format!("serialize coordinator reply: {error}"))
         })?;
-        encoded.push(b'\n');
-        output
-            .write_all(&encoded)
-            .and_then(|_| output.flush())
-            .map_err(|error| AgentError::Storage(format!("write coordinator reply: {error}")))?;
+        write_coordinator_frame(output, &encoded, MAX_COORDINATOR_LINE_BYTES).await?;
     }
 }
 
 /// 进程外协调器客户端：把本地执行包进持久三相。预约与应答跨进程
 /// 落到协调器日志；派发意图先落账、效果体在请求方本地应用——崩溃
-/// 窗口与进程内版本一致，只能是 Ambiguous。连接单飞行；丢弃时先
-/// 尽力发送 shutdown，宿主见 EOF 也会自行退出。
+/// 窗口与进程内版本一致，只能是 Ambiguous。连接单飞行；每次 RPC
+/// 都有界超时，帧违规/超时即毒化会话并终止宿主；优雅关闭走显式
+/// `shutdown()`（有界收割），`Drop` 只做非阻塞兜底。
 pub struct ProcessEffectBroker {
     connection: Mutex<Option<CoordinatorConnection>>,
 }
 
+/// 协调器会话的超时配置；`connect` 使用默认值，测试可以注入更短
+/// 的超时来确定性验证 stalled peer / stubborn child。
+#[derive(Debug, Clone, Copy)]
+pub struct CoordinatorTimeouts {
+    pub rpc: Duration,
+    pub shutdown: Duration,
+    pub reap: Duration,
+}
+
+impl Default for CoordinatorTimeouts {
+    fn default() -> Self {
+        Self {
+            rpc: COORDINATOR_RPC_TIMEOUT,
+            shutdown: COORDINATOR_SHUTDOWN_TIMEOUT,
+            reap: COORDINATOR_REAP_GRACE,
+        }
+    }
+}
+
 struct CoordinatorConnection {
-    child: std::process::Child,
-    stdin: std::process::ChildStdin,
-    stdout: std::io::BufReader<std::process::ChildStdout>,
+    child: Option<std::process::Child>,
+    stdin: Option<std::process::ChildStdin>,
+    stdout: Option<std::process::ChildStdout>,
+    /// 会话级违规后置位；之后的任何 RPC 都 fail closed。
+    poisoned: Option<String>,
+    timeouts: CoordinatorTimeouts,
+}
+
+/// 在独立线程收割子进程，主线程最多等 `grace`：绝不无限阻塞在
+/// `child.wait()`。调用方应已 kill（或宿主已自行退出），wait 正常
+/// 立即返回；极端情形下工作线程继续挂到宿主退出，主线程不等待。
+fn reap_with_grace(mut child: std::process::Child, grace: Duration) {
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let _ = tx.send(child.wait());
+    });
+    let _ = rx.recv_timeout(grace);
 }
 
 impl ProcessEffectBroker {
     /// 启动协调器宿主子进程，`journal_path` 作为它的唯一参数。
     pub fn connect(program: &Path, journal_path: &Path) -> AgentResult<Self> {
+        Self::connect_with_timeouts(program, journal_path, CoordinatorTimeouts::default())
+    }
+
+    /// 带显式超时配置的连接（stalled peer / stubborn child 测试注入
+    /// 短超时；生产路径用 [`ProcessEffectBroker::connect`]）。
+    pub fn connect_with_timeouts(
+        program: &Path,
+        journal_path: &Path,
+        timeouts: CoordinatorTimeouts,
+    ) -> AgentResult<Self> {
         let mut child = std::process::Command::new(program)
             .arg(journal_path)
             .stdin(std::process::Stdio::piped())
@@ -829,44 +1140,104 @@ impl ProcessEffectBroker {
             .ok_or_else(|| AgentError::Storage("coordinator stdout unavailable".into()))?;
         Ok(Self {
             connection: Mutex::new(Some(CoordinatorConnection {
-                child,
-                stdin,
-                stdout: std::io::BufReader::new(stdout),
+                child: Some(child),
+                stdin: Some(stdin),
+                stdout: Some(stdout),
+                poisoned: None,
+                timeouts,
             })),
         })
     }
 
+    /// 会话级违规：标记毒化、终止宿主，做有界收割。
+    fn poison_and_reap(connection: &mut CoordinatorConnection, reason: String) {
+        connection.poisoned = Some(reason);
+        if let Some(mut child) = connection.child.take() {
+            let _ = child.kill();
+            reap_with_grace(child, connection.timeouts.reap);
+        }
+    }
+
+    /// 一次有界 RPC：把管道句柄借给独立线程做有界帧读写，主线程用
+    /// RPC 上限等待。超时或读侧帧错误都是会话级违规：毒化 + kill +
+    /// 有界收割，fail closed。句柄随结果归还；超时路径里句柄留在线程
+    /// （kill 关闭管道后线程结束、句柄随之释放），连接已毒化不再使用。
     fn rpc(
         connection: &mut CoordinatorConnection,
         request: CoordinatorRequest,
     ) -> AgentResult<CoordinatorReply> {
-        use std::io::Write as _;
+        if let Some(reason) = &connection.poisoned {
+            return Err(AgentError::Storage(format!(
+                "effect coordinator is poisoned: {reason}"
+            )));
+        }
         let encoded = serde_json::to_vec(&request).map_err(|error| {
             AgentError::Storage(format!("serialize coordinator request: {error}"))
         })?;
-        connection
+        let mut stdin = connection
             .stdin
-            .write_all(&encoded)
-            .and_then(|_| connection.stdin.write_all(b"\n"))
-            .and_then(|_| connection.stdin.flush())
-            .map_err(|error| AgentError::Storage(format!("write coordinator request: {error}")))?;
-        let mut line = String::new();
-        let read = connection
+            .take()
+            .ok_or_else(|| AgentError::Storage("effect coordinator is closed".into()))?;
+        let stdout = connection
             .stdout
-            .read_line(&mut line)
-            .map_err(|error| AgentError::Storage(format!("read coordinator reply: {error}")))?;
-        if read == 0 {
-            return Err(AgentError::Storage(
-                "effect coordinator exited before replying".into(),
-            ));
+            .take()
+            .ok_or_else(|| AgentError::Storage("effect coordinator is closed".into()))?;
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let (result, reader) = {
+                let mut reader = std::io::BufReader::new(stdout);
+                let outcome = (|| {
+                    write_coordinator_frame_sync(&mut stdin, &encoded, MAX_COORDINATOR_LINE_BYTES)
+                        .map_err(|error| {
+                            AgentError::Storage(format!("write coordinator request: {error}"))
+                        })?;
+                    let frame =
+                        read_coordinator_frame_sync(&mut reader, MAX_COORDINATOR_LINE_BYTES)
+                            .map_err(|error| {
+                                AgentError::Storage(format!("read coordinator reply: {error}"))
+                            })?;
+                    if frame.is_empty() {
+                        return Err(AgentError::Storage(
+                            "coordinator sent an empty reply frame".into(),
+                        ));
+                    }
+                    let line = std::str::from_utf8(&frame).map_err(|error| {
+                        AgentError::Storage(format!("coordinator reply is not utf-8: {error}"))
+                    })?;
+                    serde_json::from_str::<CoordinatorReply>(line).map_err(|error| {
+                        AgentError::Storage(format!("malformed coordinator reply: {error}"))
+                    })
+                })();
+                (outcome, reader.into_inner())
+            };
+            let _ = tx.send((result, stdin, reader));
+        });
+        match rx.recv_timeout(connection.timeouts.rpc) {
+            Ok((result, stdin, stdout)) => {
+                connection.stdin = Some(stdin);
+                connection.stdout = Some(stdout);
+                match result {
+                    Ok(reply) => Ok(reply),
+                    Err(error) => {
+                        // 协议/IO 层错误是会话级违规：毒化并终止宿主，
+                        // 避免后续调用继续使用损坏的连接。
+                        let reason = format!("coordinator RPC failed: {error}");
+                        Self::poison_and_reap(connection, reason);
+                        Err(error)
+                    }
+                }
+            }
+            Err(_) => {
+                let reason = format!(
+                    "coordinator RPC timed out after {:?}",
+                    connection.timeouts.rpc
+                );
+                Self::poison_and_reap(connection, reason);
+                Err(AgentError::Storage(
+                    "effect coordinator RPC timed out".into(),
+                ))
+            }
         }
-        if line.len() > MAX_COORDINATOR_LINE_BYTES {
-            return Err(AgentError::InvalidRequest(
-                "coordinator reply exceeds its line bound".into(),
-            ));
-        }
-        serde_json::from_str(&line)
-            .map_err(|error| AgentError::Storage(format!("malformed coordinator reply: {error}")))
     }
 
     fn require_ok(reply: CoordinatorReply) -> AgentResult<CoordinatorReply> {
@@ -878,22 +1249,50 @@ impl ProcessEffectBroker {
             ))
         }
     }
+
+    /// 显式优雅关闭：尽力发送 shutdown 帧，然后终止宿主并做有界
+    /// 收割（kill 后 wait 立即返回，`reap_with_grace` 只是保险）。
+    /// 这是有意收尾与测试的正确路径——与 `Drop` 不同，它有界等待。
+    pub fn shutdown(self) {
+        let mut guard = self.connection.lock().expect("coordinator poisoned");
+        let Some(mut connection) = guard.take() else {
+            return;
+        };
+        if let Some(mut stdin) = connection.stdin.take() {
+            let _ = write_coordinator_frame_sync(
+                &mut stdin,
+                br#"{"op":"shutdown"}"#,
+                MAX_COORDINATOR_LINE_BYTES,
+            );
+            drop(stdin);
+        }
+        if let Some(mut child) = connection.child.take() {
+            let _ = child.kill();
+            reap_with_grace(child, connection.timeouts.reap);
+        }
+    }
 }
 
 impl Drop for ProcessEffectBroker {
     fn drop(&mut self) {
-        // 尽力优雅关闭；随后显式丢弃 stdin 让宿主见 EOF，最后收割
-        // 子进程——任何路径都不留下僵尸。之后的方法调用按"已关闭"
-        // 拒绝。
-        use std::io::Write as _;
-        let mut guard = self.connection.lock().expect("coordinator poisoned");
+        // 兜底收尾，绝不等待：尽力发一条 shutdown 帧，然后终止宿主
+        // 并丢弃连接。`child.wait()` 不在 `Drop` 里调用——完整的有界
+        // 收割由显式 `shutdown()` 或 OS 收养承担。
+        let Ok(mut guard) = self.connection.try_lock() else {
+            return;
+        };
         if let Some(mut connection) = guard.take() {
-            let _ = connection
-                .stdin
-                .write_all(b"{\"op\":\"shutdown\"}\n")
-                .and_then(|_| connection.stdin.flush());
-            drop(connection.stdin);
-            let _ = connection.child.wait();
+            if let Some(mut stdin) = connection.stdin.take() {
+                let _ = write_coordinator_frame_sync(
+                    &mut stdin,
+                    br#"{"op":"shutdown"}"#,
+                    MAX_COORDINATOR_LINE_BYTES,
+                );
+                drop(stdin);
+            }
+            if let Some(mut child) = connection.child.take() {
+                let _ = child.kill();
+            }
         }
     }
 }
@@ -972,6 +1371,9 @@ impl EffectBroker for ProcessEffectBroker {
         &self,
         context: &OperationEffectContext,
     ) -> AgentResult<Option<EffectReconciliation>> {
+        // 崩溃恢复路径是同步的（Core 构造点没有 runtime 句柄可用），
+        // 而 `rpc` 自身就是同步有界实现（独立线程 + 主线程超时），
+        // 所以这里直接复用同一套有界 RPC 语义。
         let mut guard = self.connection.lock().expect("coordinator poisoned");
         let connection = guard
             .as_mut()
