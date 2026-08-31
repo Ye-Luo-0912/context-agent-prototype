@@ -395,6 +395,13 @@ fn write_fence_main(write_root: &str, denied: &str) {
         }
     };
 
+    // The kernel ABI the fence actually runs under, so a gate test can
+    // demand `:ok` exactly for the ops that ABI enforces.
+    #[cfg(target_os = "linux")]
+    println!("abi:{}", agent_process::landlock::abi_level());
+    #[cfg(not(target_os = "linux"))]
+    println!("abi:none");
+
     // 1. Creating a file inside the write root must succeed.
     let inside = std::path::Path::new(&write_root).join("probe-inside.txt");
     match std::fs::write(&inside, b"x") {
@@ -413,6 +420,94 @@ fn write_fence_main(write_root: &str, denied: &str) {
             &mut ok,
         ),
         Err(error) => check("write-outside", true, error.to_string(), &mut ok),
+    }
+
+    // Fixture ops: the parent pre-creates one file per mutation, because a
+    // confined child cannot create anything outside its roots. When the
+    // fixture is absent (simple probes do not pre-create it) the op is
+    // not attempted and reported as unhandled.
+
+    // 3. Overwriting an existing file outside every write root must be
+    // refused by the kernel (WRITE_FILE is handled from ABI v1).
+    let overwrite = std::path::Path::new(&denied).join("probe-overwrite.txt");
+    if overwrite.exists() {
+        match std::fs::write(&overwrite, b"y") {
+            Ok(()) => check(
+                "overwrite-outside",
+                false,
+                format!(
+                    "overwrite of {} succeeded (not confined!)",
+                    overwrite.display()
+                ),
+                &mut ok,
+            ),
+            Err(error) => check("overwrite-outside", true, error.to_string(), &mut ok),
+        }
+    } else {
+        println!("overwrite-outside:unhandled");
+        println!("  detail: fixture missing");
+    }
+
+    // 4. Truncating an existing file outside every write root is
+    // kernel-refused from ABI v3 (LANDLOCK_ACCESS_FS_TRUNCATE covers open
+    // with O_TRUNC and truncate/ftruncate). Older ABIs leave truncate
+    // unhandled; the probe reports that raw gap instead of failing the
+    // fence (the attestation gates `fs_write_confined` on this ABI).
+    let truncate = std::path::Path::new(&denied).join("probe-truncate.txt");
+    if truncate.exists() {
+        let refused = std::fs::OpenOptions::new()
+            .write(true)
+            .truncate(true)
+            .open(&truncate)
+            .and_then(|file| file.set_len(0))
+            .is_err();
+        if refused {
+            check("truncate-outside", true, String::new(), &mut ok);
+        } else {
+            println!("truncate-outside:unhandled");
+            println!("  detail: truncate succeeded (ABI < 3 does not handle FS_TRUNCATE)");
+        }
+    } else {
+        println!("truncate-outside:unhandled");
+        println!("  detail: fixture missing");
+    }
+
+    // 5. Renaming an existing file from outside into the write root is a
+    // cross-hierarchy move: kernel-refused from ABI v2
+    // (LANDLOCK_ACCESS_FS_REFER handled, never granted). ABI v1 does not
+    // handle REFER; the probe reports that raw gap.
+    let rename_src = std::path::Path::new(&denied).join("probe-rename-src.txt");
+    let rename_dst = std::path::Path::new(&write_root).join("probe-renamed.txt");
+    if rename_src.exists() {
+        match std::fs::rename(&rename_src, &rename_dst) {
+            Ok(()) => {
+                println!("rename-outside:unhandled");
+                println!("  detail: rename succeeded (ABI < 2 does not handle FS_REFER)");
+                let _ = std::fs::remove_file(&rename_dst);
+            }
+            Err(error) => check("rename-outside", true, error.to_string(), &mut ok),
+        }
+    } else {
+        println!("rename-outside:unhandled");
+        println!("  detail: fixture missing");
+    }
+
+    // 6. Unlinking an existing file outside every write root must be
+    // refused by the kernel (REMOVE_FILE is handled from ABI v1).
+    let unlink = std::path::Path::new(&denied).join("probe-unlink.txt");
+    if unlink.exists() {
+        match std::fs::remove_file(&unlink) {
+            Ok(()) => check(
+                "unlink-outside",
+                false,
+                format!("unlink of {} succeeded (not confined!)", unlink.display()),
+                &mut ok,
+            ),
+            Err(error) => check("unlink-outside", true, error.to_string(), &mut ok),
+        }
+    } else {
+        println!("unlink-outside:unhandled");
+        println!("  detail: fixture missing");
     }
 
     // 3. Reading a system file stays allowed (the read floor).

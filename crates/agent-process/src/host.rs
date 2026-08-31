@@ -283,11 +283,24 @@ fn attest_sandbox(
     let mut evidence = agent_contracts::SandboxEvidence::default();
     #[cfg(target_os = "linux")]
     if landlock_applied {
-        actual.fs_write_confined = true;
-        evidence.fs_write_confined = Some(format!(
-            "landlock ruleset confines writes to {} roots",
-            sandbox.landlock_write_roots.len()
-        ));
+        // The claimed write floor must name only what the kernel actually
+        // enforces. LANDLOCK_ACCESS_FS_TRUNCATE (truncate / open with
+        // O_TRUNC) exists from ABI v3 (kernel 6.2+) and
+        // LANDLOCK_ACCESS_FS_REFER (cross-hierarchy rename) from ABI v2
+        // (kernel 5.19+); on ABI 1/2 the applied ruleset cannot block
+        // those mutations outside the roots. Attest the full flag only
+        // when every mutation it names is kernel-enforced; below that the
+        // flag stays false so `Restricted` fails closed instead of
+        // trusting a partial fence. `backend_version` still names the
+        // probed ABI, so the operator sees which floor is missing.
+        let abi = crate::landlock::abi_level();
+        if abi >= 3 {
+            actual.fs_write_confined = true;
+            evidence.fs_write_confined = Some(format!(
+                "landlock ruleset (abi{abi}) confines writes to {} roots",
+                sandbox.landlock_write_roots.len()
+            ));
+        }
         actual.tcp_connect_denied = crate::landlock::tcp_deny_available();
         if actual.tcp_connect_denied {
             evidence.tcp_connect_denied =
@@ -1530,19 +1543,60 @@ mod tests {
             );
             #[cfg(target_os = "linux")]
             {
-                assert!(attestation.capabilities.fs_write_confined);
-                assert!(
-                    attestation
-                        .evidence
-                        .fs_write_confined
-                        .as_deref()
-                        .unwrap()
-                        .starts_with("landlock ruleset confines writes to 1 roots")
+                // The write floor is attested only when the kernel can
+                // enforce every mutation it names (TRUNCATE needs ABI
+                // v3+); on older ABIs the flag must stay false.
+                let abi = crate::landlock::abi_level();
+                assert_eq!(
+                    attestation.capabilities.fs_write_confined,
+                    abi >= 3,
+                    "fs_write_confined must match the kernel's truncate coverage (abi {abi})"
                 );
+                if abi >= 3 {
+                    let proof = attestation.evidence.fs_write_confined.as_deref().unwrap();
+                    assert!(
+                        proof.starts_with("landlock ruleset") && proof.contains("1 roots"),
+                        "{proof}"
+                    );
+                } else {
+                    assert!(attestation.evidence.fs_write_confined.is_none());
+                }
             }
         }
         // 未强制的标志不得携带证明（validate 已整体检查，这里抽查）。
         assert!(attestation.evidence.udp_denied.is_none());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn attestation_leaves_the_write_floor_false_below_truncate_coverage() {
+        let sandbox = ProcessSandbox {
+            landlock_write_roots: vec![std::path::PathBuf::from("/tmp/sandbox")],
+            ..ProcessSandbox::default()
+        };
+        let attestation = attest_sandbox(&sandbox, true, false);
+        attestation
+            .validate()
+            .expect("a partial write floor must still attest validly");
+        let abi = crate::landlock::abi_level();
+        assert_eq!(
+            attestation.capabilities.fs_write_confined,
+            abi >= 3,
+            "the write floor must be claimed exactly when the kernel handles truncate (abi {abi})"
+        );
+        assert_eq!(
+            attestation.backend_version,
+            format!("abi{abi}"),
+            "the partial floor must still name its ABI"
+        );
+        if abi >= 3 {
+            assert!(attestation.evidence.fs_write_confined.is_some());
+        } else {
+            assert!(
+                attestation.evidence.fs_write_confined.is_none(),
+                "a false flag must not carry proof text"
+            );
+        }
     }
 
     #[test]

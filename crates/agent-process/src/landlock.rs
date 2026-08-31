@@ -24,6 +24,14 @@
 //! and pathname Unix sockets stay unhandled (Landlock has no UDP bit;
 //! seccomp/AppContainer stay out of v0). Windows has no Landlock.
 //!
+//! ABI floors on the write claim: cross-hierarchy renames are blocked
+//! only from ABI v2 (`FS_REFER`, kernel 5.19+) and truncate /
+//! open-with-O_TRUNC only from ABI v3 (`FS_TRUNCATE`, kernel 6.2+). The
+//! adapter attests `fs_write_confined` only when those floors are
+//! kernel-enforced; on ABI 1/2 the ruleset still confines create /
+//! overwrite / unlink, but truncate (and on ABI 1, rename) stay raw
+//! kernel behavior outside the claim.
+//!
 //! ABI adaptation: the handled-access set is tried newest-first (v6 net+
 //! scope, v4 net, then v5/v3/v2/v1 filesystem-only). Older kernels refuse
 //! unknown bits with `EINVAL`, or `E2BIG` when the attr is larger than

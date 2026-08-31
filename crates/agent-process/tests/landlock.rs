@@ -74,6 +74,65 @@ fn child_cannot_write_outside_its_landlock_root() {
     );
 }
 
+/// The whole mutation set the write floor claims — create, overwrite,
+/// cross-root rename and unlink outside the write roots — must be
+/// kernel-refused, and truncate must be kernel-refused exactly when the
+/// ABI can enforce it. This is the real-child evidence behind the
+/// attestation gate: `fs_write_confined` is claimed only when the kernel
+/// handles TRUNCATE (ABI v3+) and REFER (ABI v2+), so the probe's raw
+/// `:unhandled` reports below those ABIs document the gap instead of
+/// hiding it.
+#[test]
+fn child_write_fence_covers_every_claimed_mutation_outside_roots() {
+    if !landlock::available() {
+        eprintln!("landlock unavailable on this kernel; skipping");
+        return;
+    }
+    let allowed = tempfile::tempdir().unwrap();
+    let denied = tempfile::tempdir().unwrap();
+    for name in [
+        "probe-overwrite.txt",
+        "probe-truncate.txt",
+        "probe-rename-src.txt",
+        "probe-unlink.txt",
+    ] {
+        std::fs::write(denied.path().join(name), b"seed").unwrap();
+    }
+    let output = spawn_probe(allowed.path(), denied.path());
+    let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+    assert!(
+        output.status.success(),
+        "probe must pass, got status {:?}\n{stdout}",
+        output.status.code()
+    );
+    let abi = landlock::abi_level();
+    assert!(
+        stdout.lines().any(|line| line == format!("abi:{abi}")),
+        "the probe must report the same ABI the parent probed\n{stdout}"
+    );
+    assert!(stdout.contains("write-inside:ok"), "{stdout}");
+    assert!(stdout.contains("write-outside:ok"), "{stdout}");
+    assert!(stdout.contains("overwrite-outside:ok"), "{stdout}");
+    assert!(stdout.contains("unlink-outside:ok"), "{stdout}");
+    if abi >= 2 {
+        assert!(stdout.contains("rename-outside:ok"), "{stdout}");
+    } else {
+        assert!(
+            stdout.contains("rename-outside:"),
+            "rename behavior must be reported at every ABI\n{stdout}"
+        );
+    }
+    if abi >= 3 {
+        assert!(stdout.contains("truncate-outside:ok"), "{stdout}");
+    } else {
+        assert!(
+            stdout.contains("truncate-outside:"),
+            "truncate behavior must be reported at every ABI\n{stdout}"
+        );
+    }
+    assert!(stdout.contains("RESULT:PASS"), "{stdout}");
+}
+
 #[test]
 fn child_cannot_connect_tcp_under_landlock() {
     if !landlock::tcp_deny_available() {
