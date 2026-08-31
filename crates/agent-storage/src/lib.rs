@@ -344,7 +344,7 @@ fn sync_directory(path: &Path) -> AgentResult<()> {
         .and_then(|directory| directory.sync_all())
         .map_err(|error| {
             AgentError::Storage(format!(
-                "sync operation journal directory {}: {error}",
+                "sync journal directory {}: {error}",
                 path.display()
             ))
         })
@@ -508,6 +508,20 @@ fn compact_locked(
                 snapshot: Box::new(snapshot.clone()),
             },
         });
+    }
+
+    // Reject before touching any file: a compacted WAL at or beyond the
+    // recovery record limit is unreadable on the next open, so switching
+    // the metadata to it and deleting the old generation would destroy the
+    // last readable state for an append that can never succeed. Keep the
+    // current generation intact and report the saturated state instead.
+    if records.len() > MAX_OPERATION_JOURNAL_RECOVERY_RECORDS {
+        return Err(AgentError::RecoveryRequired(format!(
+            "operation journal holds {} live operations; compaction would produce {} records, exceeding the {} record recovery limit",
+            operations.len(),
+            records.len(),
+            MAX_OPERATION_JOURNAL_RECOVERY_RECORDS
+        )));
     }
 
     let mut new_file = OpenOptions::new()
@@ -1070,9 +1084,11 @@ enum JournalCommand {
 /// The async hot path only enqueues events. A dedicated blocking writer owns
 /// all files. `flush` is the *durability barrier*: because the channel is
 /// FIFO, a successful `flush` guarantees every event appended before it has
-/// left the process (the writer drained and flushed each `BufWriter` to the
-/// OS), which is the turn-commit durability contract — events buffered in
-/// userspace or in the pipe are not durable until the barrier passes.
+/// crossed stable storage — the writer drains each `BufWriter` to the OS and
+/// then `sync_all`s the file, and a brand-new trace file syncs its directory
+/// entry first — which is the turn-commit durability contract. Events
+/// buffered in userspace, in the pipe, or in an OS page cache are not
+/// durable until the barrier passes.
 /// Writer errors are sticky: the first failed write poisons the writer, and
 /// every later barrier reports that error instead of pretending the trace
 /// is intact.
@@ -1172,6 +1188,9 @@ fn append_event(
                 .append(true)
                 .open(&path)
                 .map_err(|e| AgentError::Storage(format!("open trace {}: {e}", path.display())))?;
+            // A brand-new trace file needs its directory entry durable
+            // before a later barrier can call it stable storage.
+            sync_directory(directory)?;
             entry.insert(BufWriter::with_capacity(64 * 1024, file));
         }
     }
@@ -1192,6 +1211,13 @@ fn flush_all(writers: &mut HashMap<RunId, BufWriter<File>>) -> AgentResult<()> {
         writer
             .flush()
             .map_err(|e| AgentError::Storage(format!("flush trace: {e}")))?;
+        // The barrier promises stable storage, not just an OS page-cache
+        // handoff: drain the userspace buffer, then cross the file
+        // stability barrier before the acknowledgement.
+        writer
+            .get_ref()
+            .sync_all()
+            .map_err(|e| AgentError::Storage(format!("sync trace: {e}")))?;
     }
     Ok(())
 }
@@ -1542,6 +1568,107 @@ mod tests {
             Err(AgentError::RecoveryRequired(_))
         ));
         assert_eq!(fs::metadata(&path).unwrap().len(), before);
+    }
+
+    #[test]
+    fn saturated_compaction_is_refused_and_preserves_the_readable_generation() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("operations.jsonl");
+        let (journal, _) = FileOperationJournal::open(&path).unwrap();
+        journal
+            .append_and_sync(&upsert(operation_snapshot(
+                OperationId::new(),
+                OperationState::Accepted,
+            )))
+            .unwrap();
+
+        // Saturate the in-memory recovery with the maximum number of
+        // distinct live operations: the Compacted baseline raises the
+        // output one record past the recovery limit.
+        {
+            let mut writer = journal.writer.lock().unwrap();
+            writer.recovery.operations = (0..MAX_OPERATION_JOURNAL_RECOVERY_RECORDS)
+                .map(|_| operation_snapshot(OperationId::new(), OperationState::Accepted))
+                .collect();
+        }
+
+        assert!(
+            matches!(journal.compact(), Err(AgentError::RecoveryRequired(_))),
+            "a compaction that would exceed the recovery record limit must be refused"
+        );
+
+        // The refusal touched nothing: the old WAL and metadata survive,
+        // no switched-generation file claims exist, and the writer still
+        // describes generation 1.
+        assert!(
+            path.exists(),
+            "the last readable generation WAL must survive a refused compaction"
+        );
+        assert!(
+            !path.with_file_name("operations.jsonl.g2").exists(),
+            "a refused compaction must not leave a switched-generation file"
+        );
+        assert_eq!(journal.authority_checkpoint_marker().unwrap().generation, 1);
+        assert_eq!(journal.recover().unwrap().last_seq, 1);
+
+        // Reopening the journal still describes only the disk truth.
+        drop(journal);
+        let (reopened, recovery) = FileOperationJournal::open(&path).unwrap();
+        assert_eq!(recovery.last_seq, 1);
+        assert_eq!(recovery.operations.len(), 1);
+        reopened
+            .append_and_sync(&upsert(operation_snapshot(
+                OperationId::new(),
+                OperationState::Accepted,
+            )))
+            .unwrap();
+        assert_eq!(reopened.recover().unwrap().last_seq, 2);
+    }
+
+    #[test]
+    fn compaction_metadata_failure_preserves_the_last_readable_generation() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("operations.jsonl");
+        let (journal, _) = FileOperationJournal::open(&path).unwrap();
+        journal
+            .append_and_sync(&upsert(operation_snapshot(
+                OperationId::new(),
+                OperationState::Accepted,
+            )))
+            .unwrap();
+        let meta_path = path.with_extension("meta.json");
+        let meta_backup = fs::read(&meta_path).unwrap();
+
+        // Squat a directory on the metadata path so the compaction's
+        // metadata commit fails after its new WAL was written.
+        fs::remove_file(&meta_path).unwrap();
+        fs::create_dir(&meta_path).unwrap();
+
+        assert!(
+            matches!(journal.compact(), Err(AgentError::Storage(_))),
+            "a failed metadata commit must surface as a storage error"
+        );
+
+        // The writer never switched: generation 1 stays authoritative and
+        // the in-memory recovery still describes the pre-compaction state.
+        assert_eq!(journal.authority_checkpoint_marker().unwrap().generation, 1);
+        assert_eq!(journal.recover().unwrap().last_seq, 1);
+
+        // Restore the metadata and reopen: the old WAL is intact and
+        // writable, so the runtime recovers rather than fencing.
+        fs::remove_dir(&meta_path).unwrap();
+        fs::write(&meta_path, &meta_backup).unwrap();
+        drop(journal);
+        let (reopened, recovery) = FileOperationJournal::open(&path).unwrap();
+        assert_eq!(recovery.last_seq, 1);
+        assert_eq!(recovery.operations.len(), 1);
+        reopened
+            .append_and_sync(&upsert(operation_snapshot(
+                OperationId::new(),
+                OperationState::Accepted,
+            )))
+            .unwrap();
+        assert_eq!(reopened.recover().unwrap().last_seq, 2);
     }
 
     #[test]
