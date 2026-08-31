@@ -6,6 +6,7 @@ mod completion;
 mod effects;
 mod focus;
 mod harness;
+mod input_bounds;
 mod opportunity;
 mod policy;
 mod recovery_surface;

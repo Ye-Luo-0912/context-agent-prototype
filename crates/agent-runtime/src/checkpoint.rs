@@ -825,7 +825,7 @@ mod tests {
 
     fn task_manager_with_requirements() -> TaskManager {
         let mut tasks = TaskManager::new();
-        let (create, task_id) = tasks.prepare_create("finish the runtime");
+        let (create, task_id) = tasks.prepare_create("finish the runtime").unwrap();
         tasks.commit(create);
         let (replace, revision) = tasks
             .prepare_replace_tool_requirements(

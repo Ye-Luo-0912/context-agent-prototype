@@ -31,6 +31,14 @@ pub enum TaskStatus {
     Completed,
 }
 
+/// Cap on the resumable task catalog (Active/Suspended records):
+/// `prepare_create` fails closed once it is saturated, so an ever-growing
+/// set of open task goals cannot inflate checkpoints without bound. One
+/// task per meaningful goal is the intended shape. Completed tasks are
+/// immutable outcomes and are deliberately outside this cap — they never
+/// grow the resumable directory.
+pub(crate) const MAX_TASK_RECORDS: usize = 256;
+
 /// One long-lived task the runtime knows about.
 #[derive(Debug, Clone)]
 pub struct TaskRecord {
@@ -1353,15 +1361,24 @@ impl TaskManager {
     /// same goal is resumed instead — the `/focus A -> /focus B ->
     /// /focus A` sequence must come back to task A, not spawn task C. A
     /// fresh task id is minted here only when no match exists, and it is
-    /// discarded if the transition is never committed.
-    pub fn prepare_create(&self, goal: &str) -> (TaskTxn, TaskId) {
+    /// discarded if the transition is never committed. Creating a task
+    /// fails closed when the catalog is saturated or the goal exceeds the
+    /// anchor text bound: nothing may be committed, persisted, or
+    /// published past those limits.
+    pub fn prepare_create(&self, goal: &str) -> AgentResult<(TaskTxn, TaskId)> {
+        if goal.chars().count() > MAX_TASK_ANCHOR_TEXT_CHARS {
+            return Err(AgentError::InvalidRequest(format!(
+                "task goal has {} chars, above the {MAX_TASK_ANCHOR_TEXT_CHARS} cap",
+                goal.chars().count()
+            )));
+        }
         let existing = self
             .tasks
             .iter()
             .find(|task| task.goal == goal && task.status != TaskStatus::Completed)
             .map(|task| task.id);
         match existing {
-            Some(id) => (
+            Some(id) => Ok((
                 TaskTxn {
                     plan: TaskPlan::Activate {
                         target: id,
@@ -1369,10 +1386,21 @@ impl TaskManager {
                     },
                 },
                 id,
-            ),
+            )),
             None => {
+                let resumable = self
+                    .tasks
+                    .iter()
+                    .filter(|task| task.status != TaskStatus::Completed)
+                    .count();
+                if resumable >= MAX_TASK_RECORDS {
+                    return Err(AgentError::InvalidRequest(format!(
+                        "task catalog is full ({} resumable records, cap {MAX_TASK_RECORDS})",
+                        resumable
+                    )));
+                }
                 let id = TaskId::new();
-                (
+                Ok((
                     TaskTxn {
                         plan: TaskPlan::Create {
                             target: id,
@@ -1381,7 +1409,7 @@ impl TaskManager {
                         },
                     },
                     id,
-                )
+                ))
             }
         }
     }
@@ -2384,7 +2412,7 @@ mod tests {
     }
 
     fn create(tasks: &mut TaskManager, goal: &str) -> TaskId {
-        let (txn, id) = tasks.prepare_create(goal);
+        let (txn, id) = tasks.prepare_create(goal).unwrap();
         tasks.commit(txn);
         id
     }
@@ -2402,11 +2430,43 @@ mod tests {
         let mut tasks = TaskManager::new();
         let a = create(&mut tasks, "fix AuthService");
         let b = create(&mut tasks, "write docs");
-        let (txn, again) = tasks.prepare_create("fix AuthService");
+        let (txn, again) = tasks.prepare_create("fix AuthService").unwrap();
         assert_eq!(a, again, "same goal resumes the existing task");
         tasks.commit(txn);
         assert_ne!(a, b);
         assert_eq!(tasks.active(), Some(a));
+    }
+
+    #[test]
+    fn task_goal_over_anchor_bound_is_rejected() {
+        let tasks = TaskManager::new();
+        let goal = "g".repeat(MAX_TASK_ANCHOR_TEXT_CHARS + 1);
+        let error = match tasks.prepare_create(&goal) {
+            Ok(_) => panic!("an oversized task goal must fail closed"),
+            Err(error) => error,
+        };
+        assert!(error.to_string().contains("cap"), "{error}");
+    }
+
+    #[test]
+    fn task_catalog_saturation_fails_closed() {
+        let mut tasks = TaskManager::new();
+        for index in 0..MAX_TASK_RECORDS {
+            let (txn, _) = tasks
+                .prepare_create(&format!("task {index}"))
+                .expect("catalog below the cap accepts new tasks");
+            tasks.commit(txn);
+        }
+        let error = match tasks.prepare_create("one more task") {
+            Ok(_) => panic!("a saturated catalog must refuse new tasks"),
+            Err(error) => error,
+        };
+        assert!(error.to_string().contains("catalog"), "{error}");
+        // Re-focusing an existing goal still resumes it under saturation:
+        // only minting a fresh record is refused.
+        let (txn, resumed) = tasks.prepare_create("task 0").unwrap();
+        tasks.commit(txn);
+        assert_eq!(tasks.active(), Some(resumed));
     }
 
     #[test]
@@ -2994,7 +3054,7 @@ mod tests {
         let a = create(&mut tasks, "task A");
         // Prepare a switch to a new task but never commit it: the table
         // must stay exactly as it was (the external transition failed).
-        let (_txn, _b) = tasks.prepare_create("task B");
+        let (_txn, _b) = tasks.prepare_create("task B").unwrap();
         assert_eq!(tasks.active(), Some(a));
         assert_eq!(tasks.list().len(), 1);
     }
@@ -3616,7 +3676,7 @@ mod tests {
         declarations: &[agent_contracts::VerificationCoverageDeclaration],
     ) -> CompletionReadiness {
         let mut tasks = TaskManager::new();
-        let (txn, id) = tasks.prepare_create("close the loop");
+        let (txn, id) = tasks.prepare_create("close the loop").unwrap();
         tasks.commit(txn);
         for receipt in &mut anchor.acceptance_coverage {
             receipt.task_id = Some(id);

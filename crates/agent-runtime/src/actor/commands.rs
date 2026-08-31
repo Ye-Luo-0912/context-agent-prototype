@@ -22,33 +22,39 @@ impl RuntimeActor {
                         // re-focusing returns to the same task id. The
                         // TaskManager transition is committed only after
                         // the engine's focus change succeeded, so the two
-                        // can never diverge.
-                        let (txn, task_id) = self.state.tasks.prepare_create(&goal);
-                        let event_goal = goal.clone();
-                        match self.bump_generation() {
+                        // can never diverge. An oversized goal or a
+                        // saturated catalog fails closed here, before any
+                        // engine or event mutation.
+                        match self.state.tasks.prepare_create(&goal) {
                             Err(error) => Err(error),
-                            Ok(_) => match self.services.set_focus(task_id, goal).await {
-                                Ok(report) => {
-                                    self.state.tasks.commit(txn);
-                                    self.state.task_id = Some(task_id);
-                                    self.state.last_assistant_artifact = None;
-                                    self.state
-                                        .task_requirement_high_water
-                                        .entry(task_id)
-                                        .or_insert(0);
-                                    self.state.focus_revision = next_focus_revision;
-                                    self.publish_context_transition(
-                                        RuntimeEvent::FocusChanged {
-                                            task_id,
-                                            goal: event_goal,
-                                        },
-                                        ContextMaintenanceTrigger::FocusChanged,
-                                        report,
-                                    )
-                                    .await
+                            Ok((txn, task_id)) => {
+                                let event_goal = goal.clone();
+                                match self.bump_generation() {
+                                    Err(error) => Err(error),
+                                    Ok(_) => match self.services.set_focus(task_id, goal).await {
+                                        Ok(report) => {
+                                            self.state.tasks.commit(txn);
+                                            self.state.task_id = Some(task_id);
+                                            self.state.last_assistant_artifact = None;
+                                            self.state
+                                                .task_requirement_high_water
+                                                .entry(task_id)
+                                                .or_insert(0);
+                                            self.state.focus_revision = next_focus_revision;
+                                            self.publish_context_transition(
+                                                RuntimeEvent::FocusChanged {
+                                                    task_id,
+                                                    goal: event_goal,
+                                                },
+                                                ContextMaintenanceTrigger::FocusChanged,
+                                                report,
+                                            )
+                                            .await
+                                        }
+                                        Err(error) => Err(self.context_transition_failed(error)),
+                                    },
                                 }
-                                Err(error) => Err(self.context_transition_failed(error)),
-                            },
+                            }
                         }
                     }
                     Err(error) => Err(error),
@@ -302,19 +308,26 @@ impl RuntimeActor {
             RuntimeCommand::Pin { content, reply } => {
                 let result = match self.ensure_idle() {
                     Ok(()) => {
-                        let event_content = content.clone();
-                        match self.services.pin(content).await {
-                            Ok(report) => {
-                                self.publish_context_transition(
-                                    RuntimeEvent::Pinned {
-                                        content: event_content,
-                                    },
-                                    ContextMaintenanceTrigger::FocusChanged,
-                                    report,
-                                )
-                                .await
+                        if content.chars().count() > MAX_PINNED_CONTENT_CHARS {
+                            Err(AgentError::InvalidRequest(format!(
+                                "pinned content is {} chars, above the {MAX_PINNED_CONTENT_CHARS} cap",
+                                content.chars().count()
+                            )))
+                        } else {
+                            let event_content = content.clone();
+                            match self.services.pin(content).await {
+                                Ok(report) => {
+                                    self.publish_context_transition(
+                                        RuntimeEvent::Pinned {
+                                            content: event_content,
+                                        },
+                                        ContextMaintenanceTrigger::FocusChanged,
+                                        report,
+                                    )
+                                    .await
+                                }
+                                Err(error) => Err(self.context_transition_failed(error)),
                             }
-                            Err(error) => Err(self.context_transition_failed(error)),
                         }
                     }
                     Err(error) => Err(error),

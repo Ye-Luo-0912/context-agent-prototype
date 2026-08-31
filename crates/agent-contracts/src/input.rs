@@ -17,6 +17,9 @@ pub const USER_INPUT_ARTIFACT_OWNER: &str = "user-input";
 pub const USER_INPUT_QUEUE_CAP: usize = 1;
 /// 回放从 artifact 读用户正文的上限；超限 fail closed。
 pub const USER_INPUT_REPLAY_MAX_BYTES: usize = 256 * 1024;
+/// 一条用户正文的全量字节上限（实时接受与回放同一条策略）：
+/// 超限的输入在持久化/入账前被拒，绝不写入 artifact。
+pub const USER_INPUT_MAX_BYTES: usize = USER_INPUT_REPLAY_MAX_BYTES;
 
 /// 输入从哪条权威路径进来。本地传输身份本身不是 grant。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
@@ -198,6 +201,16 @@ impl RuntimeInputEnvelope {
                 "input preview exceeds {USER_INPUT_PREVIEW_CHARS} chars"
             ));
         }
+        // Accepted inputs (Applied/Queued/Consumed/Archived/Interrupt) must
+        // stay within the full-body budget; Rejected records are terminal
+        // audit evidence carrying only the bounded preview.
+        if self.lifecycle != InputLifecycle::Rejected && self.bytes as usize > USER_INPUT_MAX_BYTES
+        {
+            return Err(format!(
+                "input body is {} bytes, above the {USER_INPUT_MAX_BYTES} byte cap",
+                self.bytes
+            ));
+        }
         Ok(())
     }
 
@@ -239,6 +252,16 @@ pub fn bounded_preview(text: &str, max_chars: usize) -> String {
     let mut preview: String = text.chars().take(keep).collect();
     preview.push('…');
     preview
+}
+
+/// 稳定前缀截断：同一输入永远得到同一有界输出，不追加省略号。
+/// 任务目标 / 事件文本在进入任务目录或事件日志前用它保持同一策略。
+pub fn bounded_text_chars(text: &str, max_chars: usize) -> String {
+    if text.chars().count() <= max_chars {
+        text.to_string()
+    } else {
+        text.chars().take(max_chars).collect()
+    }
 }
 
 #[cfg(test)]
@@ -303,5 +326,41 @@ mod tests {
         envelope
             .validate()
             .expect("rejected dialogue is still a legal record");
+    }
+
+    #[test]
+    fn accepted_input_over_the_body_cap_is_rejected() {
+        let body = "x".repeat(USER_INPUT_MAX_BYTES + 1);
+        let envelope = RuntimeInputEnvelope::from_preview(&body);
+        assert_eq!(envelope.bytes, body.len() as u64);
+        let error = envelope.validate().expect_err("oversized body must fail");
+        assert!(error.contains("byte cap"), "error: {error}");
+    }
+
+    #[test]
+    fn body_at_the_cap_validates() {
+        let body = "x".repeat(USER_INPUT_MAX_BYTES);
+        let envelope = RuntimeInputEnvelope::from_preview(&body);
+        envelope.validate().expect("at-cap body is legal");
+    }
+
+    #[test]
+    fn rejected_record_may_carry_evidence_of_an_oversized_body() {
+        let body = "x".repeat(USER_INPUT_MAX_BYTES + 1);
+        let envelope =
+            RuntimeInputEnvelope::from_preview(&body).with_lifecycle(InputLifecycle::Rejected);
+        envelope
+            .validate()
+            .expect("a rejected record is terminal audit evidence, not an accepted body");
+    }
+
+    #[test]
+    fn bounded_text_chars_is_a_stable_prefix() {
+        assert_eq!(bounded_text_chars("short", 10), "short");
+        let long = "ab界cd".to_string();
+        let cut = bounded_text_chars(&long, 3);
+        assert_eq!(cut, "ab界");
+        assert_eq!(cut.chars().count(), 3);
+        assert_eq!(bounded_text_chars(&long, 3), cut, "deterministic");
     }
 }

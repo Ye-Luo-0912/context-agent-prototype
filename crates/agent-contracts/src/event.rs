@@ -9,6 +9,11 @@ use crate::{
     ToolLeaseReconcileReport, ToolOutput, ToolSurfacePlanReport, ToolSurfaceRequirement, TurnId,
 };
 
+/// Cap on `RuntimeEvent::Pinned` content: a pinned constraint is model-facing
+/// event text and shares the anchor text bound of other task-owned strings.
+/// Oversized pins are rejected before the engine or the journal sees them.
+pub const MAX_PINNED_CONTENT_CHARS: usize = 2_000;
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RuntimeEventEnvelope {
     pub run_id: RunId,

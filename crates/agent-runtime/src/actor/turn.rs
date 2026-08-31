@@ -34,6 +34,13 @@ impl RuntimeActor {
             let _ = reply.send(Ok(()));
             return;
         }
+        if content.len() > USER_INPUT_MAX_BYTES {
+            let _ = reply.send(Err(AgentError::InvalidRequest(format!(
+                "user input is {} bytes, above the {USER_INPUT_MAX_BYTES} byte cap",
+                content.len()
+            ))));
+            return;
+        }
         if self.state.turn.is_some() {
             let _ = reply.send(self.queue_user_dialogue(content).await);
             return;
@@ -78,11 +85,14 @@ impl RuntimeActor {
         // the long-lived entity and the engine must never mint a TaskId, so
         // this is the single place an implicit task can be born. The focus
         // change lands before the message is ingested, exactly like an
-        // explicit `/focus`.
+        // explicit `/focus`. The full message stays legitimate dialogue,
+        // but the task goal and the FocusChanged event are normalized to
+        // the anchor bound before the record or event exists.
         if self.state.tasks.active().is_none() {
             let next_focus_revision = self.next_focus_revision()?;
-            let (txn, task_id) = self.state.tasks.prepare_create(content.trim());
-            match self.services.set_focus(task_id, content.clone()).await {
+            let goal = bounded_text_chars(content.trim(), MAX_TASK_ANCHOR_TEXT_CHARS);
+            let (txn, task_id) = self.state.tasks.prepare_create(&goal)?;
+            match self.services.set_focus(task_id, goal.clone()).await {
                 Err(error) => return Err(self.context_transition_failed(error)),
                 Ok(report) => {
                     self.state.tasks.commit(txn);
@@ -93,10 +103,7 @@ impl RuntimeActor {
                         .or_insert(0);
                     self.state.focus_revision = next_focus_revision;
                     self.publish_context_transition(
-                        RuntimeEvent::FocusChanged {
-                            task_id,
-                            goal: content.clone(),
-                        },
+                        RuntimeEvent::FocusChanged { task_id, goal },
                         ContextMaintenanceTrigger::FocusChanged,
                         report,
                     )

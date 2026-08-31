@@ -401,12 +401,10 @@ pub async fn recovery_replay_file(
     config: &ReplayConfig,
     kind: ReplayEngineKind,
 ) -> anyhow::Result<RecoveryReport> {
-    let content = tokio::fs::read_to_string(path)
-        .await
-        .map_err(|error| anyhow::anyhow!("read trace {}: {error}", path.display()))?;
+    let lines = crate::read_trace_lines(path).await?;
 
     let mut envelopes: Vec<RuntimeEventEnvelope> = Vec::new();
-    for (index, line) in content.lines().enumerate() {
+    for (index, line) in lines.iter().enumerate() {
         let line = line.trim();
         if line.is_empty() {
             continue;

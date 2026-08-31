@@ -31,8 +31,9 @@ use std::{
 use agent_contracts::{
     AttentionState, ContextConsumptionAck, ContextDiagnostics, ContextEngine, ContextHints,
     ContextIngress, ContextItemId, ContextItemSummary, ContextKind, ContextQuery, ContextSelection,
-    FocusState, MaterializedContext, MaterializedItem, OperationId, RunId, RuntimeEvent,
-    RuntimeEventEnvelope, RuntimeInputEnvelope, TurnId, USER_INPUT_REPLAY_MAX_BYTES, tokens,
+    FocusState, InputKind, MAX_PINNED_CONTENT_CHARS, MAX_TASK_ANCHOR_TEXT_CHARS,
+    MaterializedContext, MaterializedItem, OperationId, RunId, RuntimeEvent, RuntimeEventEnvelope,
+    RuntimeInputEnvelope, TurnId, USER_INPUT_REPLAY_MAX_BYTES, bounded_text_chars, tokens,
 };
 use context_simple::{SimpleContextConfig, SimpleContextEngine};
 
@@ -135,6 +136,18 @@ async fn resolve_user_message_body(
     workspace: Option<&agent_workspace::Workspace>,
 ) -> anyhow::Result<String> {
     let Some(body_ref) = input.body_ref.as_deref() else {
+        // Continuation records deliberately carry only the bounded preview:
+        // the full directive lives in the task record, not the event, so
+        // the preview is the best the journal can reconstruct.
+        if input.kind == InputKind::TaskContinuation {
+            return Ok(input.preview.clone());
+        }
+        anyhow::ensure!(
+            input.preview_covers_body(),
+            "replay cannot resolve truncated user input without an artifact workspace (recorded {} bytes, preview {} chars)",
+            input.bytes,
+            input.preview.chars().count()
+        );
         return Ok(input.preview.clone());
     };
     let Some(workspace) = workspace else {
@@ -148,9 +161,15 @@ async fn resolve_user_message_body(
         .open_artifact_for_run(body_ref, run_id)
         .await
         .map_err(|error| anyhow::anyhow!("read user-input artifact {body_ref}: {error}"))?;
+    // Stream under the same byte cap instead of materializing an unbounded
+    // artifact first: read at most cap+1 bytes and fail on oversize.
     let mut file = file.into_tokio();
     let mut bytes = Vec::new();
-    tokio::io::AsyncReadExt::read_to_end(&mut file, &mut bytes).await?;
+    {
+        use tokio::io::AsyncReadExt;
+        let mut bounded = (&mut file).take(USER_INPUT_REPLAY_MAX_BYTES as u64 + 1);
+        bounded.read_to_end(&mut bytes).await?;
+    }
     anyhow::ensure!(
         bytes.len() <= USER_INPUT_REPLAY_MAX_BYTES,
         "user-input artifact {body_ref} exceeds the replay cap of {USER_INPUT_REPLAY_MAX_BYTES} bytes"
@@ -249,7 +268,13 @@ pub(crate) async fn run_engine_observing(
                 // Replay preserves the task identity: re-focusing a task
                 // with the same id resumes its scopes exactly like the live
                 // runtime, instead of minting a fresh task per event.
-                let focus = FocusState::for_task(*task_id, goal.clone());
+                // Legacy journals may carry goals recorded before the anchor
+                // bound existed; apply the same bounded policy the live
+                // runtime uses so an oversized goal cannot enter the engine.
+                let focus = FocusState::for_task(
+                    *task_id,
+                    bounded_text_chars(goal, MAX_TASK_ANCHOR_TEXT_CHARS),
+                );
                 engine
                     .ingest(ContextIngress::FocusChanged { focus })
                     .await?;
@@ -260,7 +285,7 @@ pub(crate) async fn run_engine_observing(
             RuntimeEvent::Pinned { content } => {
                 engine
                     .ingest(ContextIngress::Pin {
-                        content: content.clone(),
+                        content: bounded_text_chars(content, MAX_PINNED_CONTENT_CHARS),
                         kind: ContextKind::Constraint,
                     })
                     .await?;
@@ -513,12 +538,10 @@ const SELECTION_SCORE_TOLERANCE: f32 = 1e-4;
 /// Read a JSONL trace file (one `RuntimeEventEnvelope` per line) and replay it.
 /// If the file contains multiple runs, only the first run's events are used.
 pub async fn replay_file(path: &Path, config: &ReplayConfig) -> anyhow::Result<ReplayOutcome> {
-    let content = tokio::fs::read_to_string(path)
-        .await
-        .map_err(|e| anyhow::anyhow!("read trace {}: {e}", path.display()))?;
+    let lines = read_trace_lines(path).await?;
 
     let mut envelopes: Vec<RuntimeEventEnvelope> = Vec::new();
-    for (index, line) in content.lines().enumerate() {
+    for (index, line) in lines.iter().enumerate() {
         let line = line.trim();
         if line.is_empty() {
             continue;
@@ -535,6 +558,86 @@ pub async fn replay_file(path: &Path, config: &ReplayConfig) -> anyhow::Result<R
     envelopes.retain(|envelope| envelope.run_id == run_id);
 
     replay_events(&envelopes, config).await
+}
+
+/// Cap on a single JSONL trace line. Every journaled event is bounded by
+/// construction (previews, reports, bounded tool output), so a larger line
+/// means a corrupt or hostile trace; the reader fails closed instead of
+/// allocating it without bound.
+pub(crate) const MAX_REPLAY_LINE_BYTES: usize = 1024 * 1024;
+
+/// Read a JSONL trace one line at a time, failing closed when any single
+/// line exceeds [`MAX_REPLAY_LINE_BYTES`]. Unlike `read_to_string`, no
+/// whole-file buffer is allocated and a hostile line cannot grow past the
+/// cap. Lines have their trailing newline/CR stripped, like `str::lines`.
+pub(crate) async fn read_trace_lines(path: &Path) -> anyhow::Result<Vec<String>> {
+    use tokio::io::AsyncBufReadExt;
+
+    let file = tokio::fs::File::open(path)
+        .await
+        .map_err(|e| anyhow::anyhow!("read trace {}: {e}", path.display()))?;
+    let mut reader = tokio::io::BufReader::new(file);
+    let mut lines = Vec::new();
+    let mut line: Vec<u8> = Vec::with_capacity(16 * 1024);
+    let mut line_number = 0usize;
+    loop {
+        line.clear();
+        let mut complete = false;
+        loop {
+            let buf = reader
+                .fill_buf()
+                .await
+                .map_err(|e| anyhow::anyhow!("read trace {}: {e}", path.display()))?;
+            if buf.is_empty() {
+                break;
+            }
+            let newline = buf.iter().position(|byte| *byte == b'\n');
+            match newline {
+                Some(index) => {
+                    line.extend_from_slice(&buf[..=index]);
+                    reader.consume(index + 1);
+                    complete = true;
+                }
+                None => {
+                    let len = buf.len();
+                    line.extend_from_slice(buf);
+                    reader.consume(len);
+                }
+            }
+            // The cap check must run before the completed line is accepted:
+            // the chunk that carries the trailing newline can push the line
+            // past the cap in a single extend.
+            anyhow::ensure!(
+                line.len() <= MAX_REPLAY_LINE_BYTES,
+                "trace line {} exceeds the {MAX_REPLAY_LINE_BYTES} byte cap",
+                line_number + 1
+            );
+            if complete {
+                break;
+            }
+        }
+        if !complete && line.is_empty() {
+            break;
+        }
+        line_number += 1;
+        if line.iter().all(|byte| byte.is_ascii_whitespace()) {
+            continue;
+        }
+        let mut content = line.as_slice();
+        if let Some(stripped) = content.strip_suffix(b"\n") {
+            content = stripped;
+        }
+        if let Some(stripped) = content.strip_suffix(b"\r") {
+            content = stripped;
+        }
+        let text = String::from_utf8(content.to_vec())
+            .map_err(|e| anyhow::anyhow!("trace line {} is not utf-8: {e}", line_number))?;
+        lines.push(text);
+        if !complete {
+            break;
+        }
+    }
+    Ok(lines)
 }
 
 fn build_replayed_items(
@@ -1432,5 +1535,129 @@ mod tests {
                 .is_err(),
             "truncated body_ref without a workspace must fail closed"
         );
+    }
+
+    #[tokio::test]
+    async fn truncated_preview_without_body_ref_fails_closed() {
+        let run = RunId::new();
+        // The journal only ever carries the bounded preview, and there is
+        // no artifact workspace and no body_ref: replaying the preview as
+        // the full input would fabricate a body.
+        let input =
+            RuntimeInputEnvelope::user_dialogue("a".repeat(300), None, None, None, None, None);
+        assert!(
+            !input.preview_covers_body(),
+            "the truncated preview must not cover the recorded body"
+        );
+        let events = vec![
+            envelope(run, 1, RuntimeEvent::RunStarted),
+            envelope(
+                run,
+                2,
+                RuntimeEvent::UserMessageAccepted {
+                    input: input.clone(),
+                },
+            ),
+        ];
+        let error = replay_events(&events, &ReplayConfig::default())
+            .await
+            .expect_err("truncated preview with no body_ref must fail closed");
+        assert!(error.to_string().contains("truncated"), "{error}");
+    }
+
+    #[tokio::test]
+    async fn user_input_artifact_over_the_replay_cap_fails_closed() {
+        let dir = tempfile::tempdir().unwrap();
+        let workspace = Arc::new(agent_workspace::Workspace::open(dir.path()).await.unwrap());
+        let run = RunId::new();
+        let body = "x".repeat(USER_INPUT_REPLAY_MAX_BYTES + 1);
+        let body_ref = workspace
+            .write_artifact(
+                run,
+                agent_contracts::USER_INPUT_ARTIFACT_OWNER,
+                "txt",
+                body.as_bytes(),
+            )
+            .await
+            .unwrap();
+        let input = RuntimeInputEnvelope::user_dialogue(
+            body.clone(),
+            None,
+            None,
+            None,
+            Some(body_ref),
+            None,
+        );
+        assert!(
+            resolve_user_message_body(&input, run, Some(workspace.as_ref()))
+                .await
+                .is_err(),
+            "an artifact over the replay cap must fail closed even with a workspace"
+        );
+    }
+
+    #[tokio::test]
+    async fn trace_line_over_the_cap_fails_closed() {
+        use std::io::Write;
+
+        let run = RunId::new();
+        let path = std::env::temp_dir().join(format!("replay-huge-line-{run}.jsonl"));
+        let mut file = std::fs::File::create(&path).unwrap();
+        file.write_all(
+            serde_json::to_string(&envelope(run, 1, RuntimeEvent::RunStarted))
+                .unwrap()
+                .as_bytes(),
+        )
+        .unwrap();
+        file.write_all(b"\n").unwrap();
+        drop(file);
+
+        let before = read_trace_lines(&path).await.unwrap();
+        assert_eq!(before.len(), 1, "start line reads back");
+
+        let mut file = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .unwrap();
+        file.write_all(&vec![b'x'; MAX_REPLAY_LINE_BYTES + 1])
+            .unwrap();
+        file.write_all(b"\n").unwrap();
+        drop(file);
+
+        let error = replay_file(&path, &ReplayConfig::default())
+            .await
+            .expect_err("an oversized trace line must fail closed");
+        assert!(error.to_string().contains("cap"), "{error}");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[tokio::test]
+    async fn legacy_oversized_focus_and_pin_replay_without_failing() {
+        // Journals written before the event bounds existed may carry long
+        // focus goals and pinned constraints; replay bounds them to the same
+        // policy instead of failing the whole trace.
+        let run = RunId::new();
+        let events = vec![
+            envelope(run, 1, RuntimeEvent::RunStarted),
+            envelope(
+                run,
+                2,
+                RuntimeEvent::FocusChanged {
+                    task_id: TaskId::new(),
+                    goal: "g".repeat(MAX_TASK_ANCHOR_TEXT_CHARS + 5_000),
+                },
+            ),
+            envelope(
+                run,
+                3,
+                RuntimeEvent::Pinned {
+                    content: "p".repeat(MAX_PINNED_CONTENT_CHARS + 5_000),
+                },
+            ),
+        ];
+        let outcome = replay_events(&events, &ReplayConfig::default())
+            .await
+            .expect("bounded replay of oversized legacy focus/pin text must succeed");
+        assert_eq!(outcome.events_consumed, 3);
     }
 }

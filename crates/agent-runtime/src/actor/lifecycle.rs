@@ -462,6 +462,13 @@ impl RuntimeActor {
 
     /// 周转中最多排队 `USER_INPUT_QUEUE_CAP` 条。槽满则 Rejected。
     pub(super) async fn queue_user_dialogue(&mut self, content: String) -> AgentResult<()> {
+        // 与 start_turn 同一入口策略：超限正文在持久化/入账前拒绝。
+        if content.len() > USER_INPUT_MAX_BYTES {
+            return Err(AgentError::InvalidRequest(format!(
+                "user input is {} bytes, above the {USER_INPUT_MAX_BYTES} byte cap",
+                content.len()
+            )));
+        }
         if self.state.pending_user_input.is_some() {
             let _ = self.record_rejected_user_dialogue(&content).await;
             return Err(AgentError::InvalidRequest(format!(

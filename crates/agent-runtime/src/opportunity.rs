@@ -171,7 +171,7 @@ mod tests {
 
     fn seeded_task() -> (TaskManager, TaskId, TaskAnchor) {
         let mut tasks = TaskManager::new();
-        let (txn, id) = tasks.prepare_create("close the loop");
+        let (txn, id) = tasks.prepare_create("close the loop").unwrap();
         tasks.commit(txn);
         let anchor = tasks.get(id).unwrap().anchor.clone();
         (tasks, id, anchor)
