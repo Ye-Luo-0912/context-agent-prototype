@@ -2491,7 +2491,9 @@ async fn run_tree_bounded(root: &Path, argv: &[String], timeout: Duration) -> Hi
     }
     #[cfg(unix)]
     {
-        use std::os::unix::process::CommandExt;
+        // tokio::process::Command's own unix extension spawns the child as
+        // its own process-group leader, so `kill_process_tree` can signal
+        // the whole tree on timeout instead of leaving descendants running.
         command.process_group(0);
     }
     let mut child = match command.spawn() {
