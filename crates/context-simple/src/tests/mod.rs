@@ -4,6 +4,7 @@ mod directive;
 mod distill;
 mod entity;
 mod foreground;
+mod gc_bounds;
 mod harness;
 mod lifecycle;
 mod required;

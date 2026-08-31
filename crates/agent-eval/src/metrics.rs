@@ -2032,6 +2032,7 @@ mod tests {
                     aged_external: 0,
                     anchor_roots_protected: 1,
                     evictions: Vec::new(),
+                    evictions_truncated: 0,
                     reactivations: Vec::new(),
                     store_blob_delete_errors: 0,
                     store_write_bytes: 512,

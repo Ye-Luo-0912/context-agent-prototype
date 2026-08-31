@@ -26,6 +26,24 @@ use crate::materializer;
 use crate::scope;
 use crate::store;
 
+/// Bounded row budget for explainable report vectors (maintenance
+/// transitions, GC evictions, storage-GC and reconcile reasons). Passes may
+/// *count* far more rows; only the report rows are capped, with the omitted
+/// count surfaced in the report.
+pub(crate) const MAX_REPORT_ROWS: usize = 4096;
+
+/// Cap a report vector to the bounded row budget, returning how many rows
+/// were omitted. The caller keeps its own authoritative counters; this only
+/// bounds the explainable rows.
+pub(crate) fn truncate_report_rows<T>(rows: &mut Vec<T>, cap: usize) -> usize {
+    if rows.len() <= cap {
+        return 0;
+    }
+    let omitted = rows.len() - cap;
+    rows.truncate(cap);
+    omitted
+}
+
 /// 一条 anchor 根声明的 item_ref 是否匹配给定 id + entity 签名：精确
 /// id、`context://run/<id>` uri，或精确 entity 名。TaskAnchor 声明的是
 /// 引用（不嵌入 body），engine 只按这三类键解析它指向谁。
@@ -332,6 +350,12 @@ pub(crate) struct State {
     /// context store (never purged).
     #[serde(default)]
     pub(crate) eviction_buffer: Vec<ContextItem>,
+    /// Overflow items whose store write failed. They spill out of the
+    /// bounded warm buffer into this retry list (content preserved, never
+    /// absorbed back into the buffer past its cap); the next full GC pass
+    /// retries them before taking new overflow from the buffer.
+    #[serde(default)]
+    pub(crate) pending_externalize_retry: Vec<ContextItem>,
     /// The external context map: lightweight entries for items whose content
     /// lives in the context store. `Cold` entries can still be recalled by
     /// hot-entity matches; `External` entries only exist as references. The

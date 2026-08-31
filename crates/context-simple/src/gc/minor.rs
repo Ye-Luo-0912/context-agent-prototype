@@ -196,6 +196,19 @@ pub(crate) fn run_minor(
     report.compaction_output_tokens = pending.iter().map(|c| c.output_tokens).sum();
     report.compactions = pending;
 
+    // Report rows are a bounded collector: a pass that changed more items
+    // reports the aggregate counters (promoted/cooled/archived/…), keeps at
+    // most the row budget, and surfaces how many explainable rows were
+    // omitted. The counters above remain authoritative.
+    report.transitions_truncated = crate::engine::truncate_report_rows(
+        &mut report.transitions,
+        crate::engine::MAX_REPORT_ROWS,
+    );
+    report.compactions_truncated = crate::engine::truncate_report_rows(
+        &mut report.compactions,
+        crate::engine::MAX_REPORT_ROWS,
+    );
+
     report.diagnostics = diagnostics::compute(state);
     report
 }

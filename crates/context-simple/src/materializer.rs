@@ -588,6 +588,9 @@ fn external_view(
     }
     let mut seen_checked_paths = HashSet::new();
     for row in checked_files {
+        if ranked.len() >= MAX_EXTERNAL_REFS {
+            break;
+        }
         let Some(path) = checked_row_lookup_path(row) else {
             continue;
         };
@@ -597,6 +600,9 @@ fn external_view(
         push_store_entity_hits(state, &path, &mut seen, &mut ranked);
     }
     for item in &state.eviction_buffer {
+        if ranked.len() >= MAX_EXTERNAL_REFS {
+            break;
+        }
         if !item.semantic.is_live() || seen.contains(&item.id) {
             continue;
         }
@@ -615,6 +621,9 @@ fn external_view(
     let total = state.external.len();
     let tail_start = total.saturating_sub(MAX_EXTERNAL_REFS);
     for entry in &state.external[tail_start..] {
+        if ranked.len() >= MAX_EXTERNAL_REFS {
+            break;
+        }
         if seen.insert(entry.item_id) && crate::store::externally_retrievable(entry) {
             ranked.push(crate::store::prompt_evidence_descriptor(entry.clone()));
         }
@@ -680,7 +689,13 @@ fn push_store_entity_hits(
     seen: &mut HashSet<ContextItemId>,
     ranked: &mut Vec<agent_contracts::ExternalizedContext>,
 ) {
+    // The 32-row view cap is applied during collection: a hot entity with a
+    // huge bucket must not clone and stage every descriptor before the limit
+    // cuts in.
     for id in state.external.ids_for_entity(entity) {
+        if ranked.len() >= MAX_EXTERNAL_REFS {
+            return;
+        }
         if seen.insert(*id)
             && let Some(entry) = state.external.get(*id)
             && crate::store::externally_retrievable(entry)

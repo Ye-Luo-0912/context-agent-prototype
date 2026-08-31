@@ -274,6 +274,14 @@ pub(crate) fn plan_full_gc(
     // under the lock so the IO phase can write without re-reading state;
     // the writes happen in the IO phase so the lock is not held across
     // disk IO. Only Storage GC may delete store files.
+    //
+    // Spilled writes from a failed pass retry first: they are the oldest
+    // overflow and are already out of the (bounded) warm buffer.
+    let spill = std::mem::take(&mut state.pending_externalize_retry);
+    plan.externalize.extend(spill.into_iter().map(|item| {
+        let bytes = serde_json::to_vec(&item).expect("context items serialize");
+        (item, bytes)
+    }));
     while state.eviction_buffer.len() > config.gc_buffer_capacity {
         let item = state.eviction_buffer.remove(0);
         let bytes = serde_json::to_vec(&item).expect("context items serialize");
@@ -322,7 +330,11 @@ pub(crate) async fn run_store_io(config: &SimpleContextConfig, plan: &mut GcPlan
             .map(|(item, bytes)| (item.id, (item, bytes)))
             .collect();
     let mut writes = tokio::task::JoinSet::new();
-    for (id, (_, bytes)) in pending_items.clone() {
+    for (id, (_, bytes)) in &pending_items {
+        // Only the pre-serialized bytes cross into the task; the map (and
+        // the full items it holds for error recovery) is never cloned.
+        let id = *id;
+        let bytes = bytes.clone();
         let dir = dir.clone();
         let semaphore = std::sync::Arc::clone(&semaphore);
         let permit = semaphore.acquire_owned().await.expect("semaphore");
@@ -398,14 +410,16 @@ pub(crate) async fn run_store_io(config: &SimpleContextConfig, plan: &mut GcPlan
 pub(crate) fn commit_full_gc(
     state: &mut State,
     now_tick: u64,
-    plan: GcPlan,
+    mut plan: GcPlan,
     io: GcIoResult,
 ) -> (ContextGcReport, Vec<ContextItemId>) {
-    // The buffer: failed/undone writes come back at the front, so the
-    // overflow retries on the next pass (order preserved, oldest first).
-    let mut buffer = io.externalize_failed;
-    buffer.append(&mut state.eviction_buffer);
-    state.eviction_buffer = buffer;
+    // Failed overflow writes spill into the retry list instead of growing
+    // the warm buffer past its cap: the hot buffer stays bounded, the
+    // content stays lossless, and the next pass retries the spill first
+    // (order preserved, oldest first).
+    state
+        .pending_externalize_retry
+        .extend(io.externalize_failed);
 
     // The store map: successful writes become Cold entries (carrying the
     // checksum captured at write time for the reconcile)...
@@ -505,6 +519,10 @@ pub(crate) fn commit_full_gc(
         ..ContextGcReport::default()
     };
     report.externalized_ids = externalized_ids;
+    // Explainable eviction rows are a bounded collector; `evicted` above is
+    // the authoritative total and the omitted-row count is surfaced.
+    report.evictions_truncated =
+        crate::engine::truncate_report_rows(&mut plan.evictions, crate::engine::MAX_REPORT_ROWS);
     report.evictions = plan.evictions;
     let mut reactivations = plan.buffer_reactivations;
     reactivations.extend(recalled_reactivations);

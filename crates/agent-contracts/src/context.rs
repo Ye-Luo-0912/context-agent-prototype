@@ -2148,8 +2148,15 @@ pub struct ContextMaintenanceReport {
     pub tombstoned: usize,
     #[serde(default)]
     pub turn: u64,
+    /// Explainable state transitions, capped to a bounded row budget: a
+    /// pass that changes more rows reports the authoritative aggregate
+    /// counters above and the number of omitted rows here.
     #[serde(default)]
     pub transitions: Vec<ContextStateTransition>,
+    /// Rows omitted from [`Self::transitions`] because the pass exceeded
+    /// the bounded report budget.
+    #[serde(default)]
+    pub transitions_truncated: usize,
     pub diagnostics: ContextDiagnostics,
     /// 本轮维护里压缩器花费的 provider 输入 token（脚本化实现为 0）。
     #[serde(default)]
@@ -2161,6 +2168,9 @@ pub struct ContextMaintenanceReport {
     /// rotation plus in-pass folds). Eval sums [`crate::RuntimeEvent::ContextCompacted`].
     #[serde(default)]
     pub compactions: Vec<ContextCompaction>,
+    /// Rows omitted from [`Self::compactions`] past the bounded budget.
+    #[serde(default)]
+    pub compactions_truncated: usize,
 }
 
 /// Why a bounded compaction pass ran.
@@ -2248,6 +2258,11 @@ pub struct ContextGcReport {
     pub anchor_root_protections: Vec<AnchorRootProtection>,
     #[serde(default)]
     pub evictions: Vec<ContextEviction>,
+    /// Rows omitted from [`Self::evictions`] because the pass exceeded the
+    /// bounded report budget; [`Self::evicted`] remains the authoritative
+    /// total.
+    #[serde(default)]
+    pub evictions_truncated: usize,
     #[serde(default)]
     pub reactivations: Vec<ContextReactivation>,
     /// Store blob deletions that failed after a successful recall commit
@@ -2566,8 +2581,14 @@ pub struct StorageGcReport {
     /// an IO failure must never be mistaken for "the file is already gone".
     #[serde(default)]
     pub io_errors: usize,
+    /// Per-entry deletion/keep explanations, capped to a bounded row
+    /// budget; [`Self::deleted`] and [`Self::io_errors`] remain the
+    /// authoritative totals.
     #[serde(default)]
     pub reasons: Vec<String>,
+    /// Rows omitted from [`Self::reasons`] past the bounded budget.
+    #[serde(default)]
+    pub reasons_truncated: usize,
 }
 
 /// The outcome of a store reconcile pass: the on-disk blob directory is
@@ -2606,8 +2627,13 @@ pub struct StoreReconcileReport {
     /// place and surfaced, not guessed at.
     #[serde(default)]
     pub io_errors: usize,
+    /// Per-blob outcomes, capped to a bounded row budget; the typed
+    /// counters above remain the authoritative totals.
     #[serde(default)]
     pub reasons: Vec<String>,
+    /// Rows omitted from [`Self::reasons`] past the bounded budget.
+    #[serde(default)]
+    pub reasons_truncated: usize,
 }
 
 /// A bounded, UI/replay-friendly projection of one context item.

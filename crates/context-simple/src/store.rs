@@ -775,11 +775,18 @@ pub(crate) async fn run_storage_io(
     dir: &Path,
     plan: &StorageGcPlan,
 ) -> Vec<(ContextItemId, Result<DeleteOutcome, std::io::Error>)> {
+    // Bounded concurrency like every other store IO phase: a store with
+    // many candidates must not pile up one task per candidate before the
+    // first join.
+    let semaphore = std::sync::Arc::new(tokio::sync::Semaphore::new(MAX_STORE_IO_CONCURRENCY));
     let mut tasks = tokio::task::JoinSet::new();
     for (item_id, _) in &plan.candidates {
         let item_id = *item_id;
         let path = file_path(dir, item_id);
+        let semaphore = std::sync::Arc::clone(&semaphore);
+        let permit = semaphore.acquire_owned().await.expect("semaphore");
         tasks.spawn(async move {
+            let _permit = permit;
             let outcome = match tokio::fs::remove_file(&path).await {
                 Ok(()) => Ok(DeleteOutcome::Deleted),
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(DeleteOutcome::NotFound),
@@ -851,6 +858,10 @@ pub(crate) fn commit_storage_gc(
     report.scanned = state.external.len() + report.deleted;
     report.anchor_roots_protected = plan.anchor_roots_protected;
     report.anchor_root_protections = plan.anchor_root_protections;
+    // Explainable reason rows are a bounded collector; the typed counters
+    // above remain the authoritative totals.
+    report.reasons_truncated =
+        crate::engine::truncate_report_rows(&mut report.reasons, crate::engine::MAX_REPORT_ROWS);
     report
 }
 
@@ -1175,7 +1186,7 @@ pub(crate) fn commit_reconcile(
         owner_quarantined = before.saturating_sub(external.len());
         state.external.replace_all(external);
     }
-    StoreReconcileReport {
+    let mut report = StoreReconcileReport {
         scanned: io.scanned,
         rebuilt,
         deleted_stale: io.deleted_stale,
@@ -1184,7 +1195,13 @@ pub(crate) fn commit_reconcile(
         temp_cleaned: io.temp_cleaned,
         io_errors: io.io_errors,
         reasons: io.reasons,
-    }
+        ..StoreReconcileReport::default()
+    };
+    // Explainable reason rows are a bounded collector; the typed counters
+    // above remain the authoritative totals.
+    report.reasons_truncated =
+        crate::engine::truncate_report_rows(&mut report.reasons, crate::engine::MAX_REPORT_ROWS);
+    report
 }
 
 #[cfg(test)]
