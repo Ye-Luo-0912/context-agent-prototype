@@ -24,6 +24,16 @@ pub const ANALYSIS_SCHEMA: &str = "agent-eval.analysis.v2";
 /// 工作区文件清单上限：哈希覆盖全部，清单只留前 N 条路径。
 const WORKSPACE_LIST_CAP: usize = 256;
 
+/// One canonical workspace scan domain, shared by the allowed-diff verdict
+/// and the evidence hash. Everything outside this domain (harness-owned
+/// state, build artifacts, vendored lockfiles) never counts against a
+/// model's diff and never enters the workspace digest, so the two views of
+/// the finished workspace cannot drift apart.
+pub(crate) const WORKSPACE_SCAN_MAX_FILES: usize = 512;
+pub(crate) const WORKSPACE_SCAN_MAX_FILE_BYTES: usize = 4 * 1024 * 1024;
+pub(crate) const WORKSPACE_SCAN_SKIP_DIRS: [&str; 4] = [".git", ".focus-agent", ".gate", "target"];
+pub(crate) const WORKSPACE_SCAN_SKIP_FILES: [&str; 2] = ["Cargo.lock", ".gitignore"];
+
 /// 一次配对（同一 fixture × 同一 repeat 的 A/B/C）。
 #[derive(Debug, Clone)]
 pub struct PairSink {
@@ -276,12 +286,13 @@ pub(crate) fn write_cell_parts(
         jsonl.write_all(b"\n")?;
     }
 
-    let (workspace_sha256, files) = hash_workspace(workspace_root)?;
+    let (workspace_sha256, workspace_file_set_sha256, files) = hash_workspace(workspace_root)?;
     let file_list: Vec<_> = files.iter().take(WORKSPACE_LIST_CAP).collect();
     write_json(
         dir.join("workspace.json"),
         &json!({
             "sha256": workspace_sha256,
+            "file_set_sha256": workspace_file_set_sha256,
             "files": files.len(),
             "listed": file_list,
         }),
@@ -670,43 +681,84 @@ pub fn tool_histogram(events: &[RuntimeEventEnvelope]) -> Vec<ToolCount> {
         .collect()
 }
 
-fn hash_workspace(root: &Path) -> anyhow::Result<(String, Vec<String>)> {
-    let mut files = Vec::new();
-    collect_files(root, root, &mut files)?;
-    files.sort();
-    let mut hasher = Sha256::new();
-    for rel in &files {
-        hasher.update(rel.as_bytes());
-        hasher.update(b"\0");
-        let bytes = fs::read(root.join(rel))?;
-        hasher.update((bytes.len() as u64).to_le_bytes());
-        hasher.update(&bytes);
-        hasher.update(b"\n");
+/// Content digest and file-set digest of the bounded workspace domain, plus
+/// the sorted relative paths. The content digest folds each file's own
+/// SHA-256 (never raw bytes, so the scan stays byte-bounded), the file-set
+/// digest folds only the relative path set, and both share the exact same
+/// link-safe, file/byte-bounded domain as the allowed-diff verdict.
+fn hash_workspace(root: &Path) -> anyhow::Result<(String, String, Vec<String>)> {
+    let files = collect_workspace_files(root)?;
+    let mut content = Sha256::new();
+    let mut file_set = Sha256::new();
+    for (relative, file_sha256) in &files {
+        content.update(relative.as_bytes());
+        content.update(b"\0");
+        content.update(file_sha256.as_bytes());
+        content.update(b"\n");
+        file_set.update(relative.as_bytes());
+        file_set.update(b"\0");
     }
-    Ok((hex_encode(hasher.finalize()), files))
+    let paths: Vec<String> = files.into_iter().map(|(relative, _)| relative).collect();
+    Ok((
+        hex_encode(content.finalize()),
+        hex_encode(file_set.finalize()),
+        paths,
+    ))
 }
 
-fn collect_files(root: &Path, dir: &Path, out: &mut Vec<String>) -> anyhow::Result<()> {
-    if !dir.is_dir() {
-        return Ok(());
-    }
-    let mut entries: Vec<_> = fs::read_dir(dir)?.collect::<Result<Vec<_>, _>>()?;
+/// Scan a workspace with the canonical, link-safe, file/byte-bounded domain
+/// and return sorted `(relative path, file SHA-256)` pairs. Symlink and
+/// junction entries are excluded entirely: they could point at a directory
+/// or file outside the fixture, so following them would violate the domain.
+/// Oversized files and over-limit directories fail, exactly like the
+/// allowed-diff scan, so a misbehaving workspace is visible to the harness.
+pub(crate) fn collect_workspace_files(root: &Path) -> anyhow::Result<Vec<(String, String)>> {
+    let mut files = Vec::new();
+    collect_workspace_files_inner(root, PathBuf::new(), &mut files)?;
+    files.sort();
+    Ok(files)
+}
+
+fn collect_workspace_files_inner(
+    directory: &Path,
+    prefix: PathBuf,
+    out: &mut Vec<(String, String)>,
+) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        out.len() < WORKSPACE_SCAN_MAX_FILES,
+        "workspace holds more than {WORKSPACE_SCAN_MAX_FILES} files"
+    );
+    let mut entries: Vec<std::fs::DirEntry> =
+        std::fs::read_dir(directory)?.collect::<Result<Vec<_>, _>>()?;
     entries.sort_by_key(|entry| entry.file_name());
     for entry in entries {
-        let path = entry.path();
-        let name = entry.file_name();
-        if name == ".focus-agent" {
+        let name = entry.file_name().to_string_lossy().into_owned();
+        let file_type = std::fs::symlink_metadata(entry.path())?.file_type();
+        if file_type.is_symlink() {
             continue;
         }
-        if path.is_dir() {
-            collect_files(root, &path, out)?;
-        } else if path.is_file() {
-            let rel = path
-                .strip_prefix(root)
-                .unwrap_or(&path)
-                .to_string_lossy()
-                .replace('\\', "/");
-            out.push(rel);
+        let path = entry.path();
+        if file_type.is_dir() {
+            if WORKSPACE_SCAN_SKIP_DIRS.contains(&name.as_str()) {
+                continue;
+            }
+            collect_workspace_files_inner(&path, prefix.join(&name), out)?;
+        } else if WORKSPACE_SCAN_SKIP_FILES.contains(&name.as_str()) {
+            continue;
+        } else {
+            anyhow::ensure!(
+                out.len() < WORKSPACE_SCAN_MAX_FILES,
+                "workspace holds more than {WORKSPACE_SCAN_MAX_FILES} files"
+            );
+            let metadata = entry.metadata()?;
+            if metadata.len() as usize > WORKSPACE_SCAN_MAX_FILE_BYTES {
+                anyhow::bail!("file {} exceeds the size cap", prefix.join(&name).display());
+            }
+            let bytes = std::fs::read(&path)?;
+            // Normalize to forward slashes so the policy and seed lookups
+            // are identical across host path separators.
+            let relative = prefix.join(&name).to_string_lossy().replace('\\', "/");
+            out.push((relative, hex_encode(Sha256::digest(&bytes))));
         }
     }
     Ok(())
@@ -1296,5 +1348,81 @@ mod tests {
         let summary: CellSummary =
             serde_json::from_str(&fs::read_to_string(cell.join("summary.json")).unwrap()).unwrap();
         assert_eq!(summary.outcome, "passed");
+    }
+
+    /// The canonical scan domain excludes harness-owned state and build
+    /// artifacts, and never follows links out of the fixture.
+    #[test]
+    fn scan_skips_git_target_and_links() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("ws");
+        fs::create_dir_all(root.join("src")).unwrap();
+        fs::write(root.join("src/lib.rs"), "pub fn f() {}\n").unwrap();
+        fs::create_dir_all(root.join(".git/objects")).unwrap();
+        fs::write(root.join(".git/objects/a"), "loose-object").unwrap();
+        fs::create_dir_all(root.join("target/debug")).unwrap();
+        fs::write(root.join("target/debug/app.exe"), "artifact").unwrap();
+        fs::write(root.join("Cargo.lock"), "lock\n").unwrap();
+        fs::write(root.join(".gitignore"), "target/\n").unwrap();
+
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::symlink(tmp.path().join("outside"), root.join("escaped")).unwrap();
+            std::fs::create_dir_all(tmp.path().join("outside")).unwrap();
+            fs::write(tmp.path().join("outside/secret.txt"), "out-of-fixture").unwrap();
+        }
+
+        let files = collect_workspace_files(&root).unwrap();
+        let paths: Vec<&str> = files
+            .iter()
+            .map(|(relative, _)| relative.as_str())
+            .collect();
+        assert_eq!(paths, vec!["src/lib.rs"], "{paths:?}");
+        let (content, file_set, all) = hash_workspace(&root).unwrap();
+        assert_eq!(all, vec!["src/lib.rs"]);
+        assert_eq!(content.len(), 64);
+        assert_eq!(file_set.len(), 64);
+        assert_ne!(content, file_set);
+    }
+
+    /// The same bounded domain that guards the allowed-diff verdict also
+    /// guards the hash: an oversized file fails the scan instead of being
+    /// read whole.
+    #[test]
+    fn scan_bails_on_oversized_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("ws");
+        fs::create_dir_all(&root).unwrap();
+        fs::write(root.join("small.txt"), "ok\n").unwrap();
+        fs::write(
+            root.join("huge.bin"),
+            vec![0u8; WORKSPACE_SCAN_MAX_FILE_BYTES + 1],
+        )
+        .unwrap();
+        let error = collect_workspace_files(&root).unwrap_err();
+        assert!(
+            error.to_string().contains("exceeds the size cap"),
+            "{error}"
+        );
+        assert!(hash_workspace(&root).is_err());
+    }
+
+    /// File-count overflow is bounded too: more files than the scan cap
+    /// fail the scan rather than letting the tool and hasher diverge.
+    #[test]
+    fn scan_bails_over_the_file_cap() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("ws");
+        fs::create_dir_all(&root).unwrap();
+        for index in 0..WORKSPACE_SCAN_MAX_FILES + 1 {
+            fs::write(root.join(format!("f{index:04}.txt")), "x").unwrap();
+        }
+        let error = collect_workspace_files(&root).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains(&format!("{WORKSPACE_SCAN_MAX_FILES} files")),
+            "{error}"
+        );
     }
 }

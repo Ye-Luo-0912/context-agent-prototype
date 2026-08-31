@@ -233,6 +233,19 @@ impl CellFailure {
     }
 }
 
+/// Absorb a later failure into the cell's failure slot, keeping the
+/// classification monotone. A harness setup/watchdog failure (a NOT_RUN
+/// censor) always wins over anything recorded earlier, because the oracle
+/// verdict is unreadable once the harness itself failed; a behavior or
+/// runtime failure is recorded only when no failure exists yet, so the
+/// first diagnostic survives.
+fn absorb_failure(current: &mut Option<CellFailure>, incoming: Option<CellFailure>) {
+    let Some(incoming) = incoming else { return };
+    if incoming.class.not_run() || current.is_none() {
+        *current = Some(incoming);
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum CellVerdict {
@@ -535,14 +548,8 @@ const LIVE_MAX_MODEL_ROUNDS: u32 = 48;
 /// durable checkpoint / completion tail lands before concluding.
 const TURN_QUIET_GRACE: Duration = Duration::from_secs(15);
 const CARGO_TEST_TIMEOUT: Duration = Duration::from_secs(600);
-const MAX_DIFF_FILES: usize = 512;
-const MAX_FILE_BYTES: usize = 4 * 1024 * 1024;
 const FILE_BODY_CAP: usize = 64 * 1024;
 const COMMAND_CAPTURE_CAP: usize = 16 * 1024;
-/// Harness-owned or build-artifact paths that never count against the
-/// allowed-diff rule.
-const SKIP_DIRS: [&str; 4] = [".git", ".focus-agent", ".gate", "target"];
-const SKIP_FILES: [&str; 2] = ["Cargo.lock", ".gitignore"];
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -1700,11 +1707,12 @@ pub async fn run_pack_cell(
     )
     .await
     {
-        Err(e) => {
-            failure = Some(CellFailure::harness_setup(format!(
+        Err(e) => absorb_failure(
+            &mut failure,
+            Some(CellFailure::harness_setup(format!(
                 "phase-one compose failed: {e:#}"
-            )))
-        }
+            ))),
+        ),
         Ok(composed) => {
             let handle = composed.handle().clone();
             let mut events = composed.subscribe();
@@ -1781,21 +1789,27 @@ pub async fn run_pack_cell(
                                 checkpoint_task_id = Some(task_id);
                             }
                             _ => {
-                                failure = Some(CellFailure::runtime(
-                                    "trigger fired without an acknowledged checkpoint tuple",
-                                ));
+                                absorb_failure(
+                                    &mut failure,
+                                    Some(CellFailure::runtime(
+                                        "trigger fired without an acknowledged checkpoint tuple",
+                                    )),
+                                );
                             }
                         }
                     }
                 }
-                Err(reason) => failure = Some(reason.context("phase one failed")),
+                Err(reason) => {
+                    absorb_failure(&mut failure, Some(reason.context("phase one failed")))
+                }
             }
-            if let Err(e) = composed.shutdown().await
-                && failure.is_none()
-            {
-                failure = Some(CellFailure::runtime(format!(
-                    "phase-one shutdown failed: {e}"
-                )));
+            if let Err(e) = composed.shutdown().await {
+                absorb_failure(
+                    &mut failure,
+                    Some(CellFailure::runtime(format!(
+                        "phase-one shutdown failed: {e}"
+                    ))),
+                );
             }
             while let Ok(envelope) = events.try_recv() {
                 collector.push(envelope);
@@ -1813,11 +1827,12 @@ pub async fn run_pack_cell(
             Some(artifact) => load_checkpoint_artifact(root, artifact).await,
         };
         match loaded {
-            Err(e) => {
-                failure = Some(CellFailure::runtime(format!(
+            Err(e) => absorb_failure(
+                &mut failure,
+                Some(CellFailure::runtime(format!(
                     "checkpoint artifact load failed: {e:#}"
-                )))
-            }
+                ))),
+            ),
             Ok((checkpoint, loaded_checksum)) => {
                 if checkpoint_sequence != Some(checkpoint.snapshot_sequence) {
                     failure = Some(CellFailure::runtime(format!(
@@ -1939,11 +1954,12 @@ pub async fn run_pack_cell(
         match diff_violations(root, &diff_seed_files.to_vec(), pack.allowed_diff.as_ref()) {
             Ok(violations) => violations,
             Err(e) => {
-                if failure.is_none() {
-                    failure = Some(CellFailure::harness_setup(format!(
+                absorb_failure(
+                    &mut failure,
+                    Some(CellFailure::harness_setup(format!(
                         "allowed-diff scan failed: {e:#}"
-                    )));
-                }
+                    ))),
+                );
                 vec![format!("diff scan failed: {e:#}")]
             }
         };
@@ -2020,9 +2036,7 @@ pub async fn run_pack_cell(
         "fail"
     }
     .to_string();
-    if failure.is_none() {
-        failure = oracle_failure;
-    }
+    absorb_failure(&mut failure, oracle_failure);
     let behavior = if failure
         .as_ref()
         .is_some_and(|failure| failure.class.not_run())
@@ -2433,20 +2447,24 @@ fn cargo_argv() -> Vec<String> {
 /// the target set: the harness-owned oracle runs as an isolated
 /// integration test, the agent-authored self-check runs everything.
 async fn run_cargo_test(root: &Path, args: &[&str]) -> HiddenCommandResult {
+    let argv = std::iter::once("cargo".to_string())
+        .chain(std::iter::once("test".to_string()))
+        .chain(args.iter().map(|arg| (*arg).to_string()))
+        .collect::<Vec<_>>();
+    run_tree_bounded(root, &argv, CARGO_TEST_TIMEOUT).await
+}
+
+/// Run one command with a bounded lifetime and a bounded capture. A
+/// timed-out run is killed tree-wide (the command's own descendants
+/// included) and reaped before the record is returned, so a runaway
+/// process can never keep mutating the workspace after the verdict or the
+/// evidence hash. Cargo runs additionally pin the target directory and
+/// quiet the terminal color, exactly like the file-suite runner.
+async fn run_tree_bounded(root: &Path, argv: &[String], timeout: Duration) -> HiddenCommandResult {
     use std::process::Stdio;
 
-    let mut command = tokio::process::Command::new("cargo");
-    command
-        .arg("test")
-        .args(args)
-        .current_dir(root)
-        .env("CARGO_TERM_COLOR", "never")
-        .stdin(Stdio::null());
     let mut record = HiddenCommandResult {
-        argv: std::iter::once("cargo".to_string())
-            .chain(std::iter::once("test".to_string()))
-            .chain(args.iter().map(|arg| (*arg).to_string()))
-            .collect(),
+        argv: argv.to_vec(),
         expect_exit: 0,
         exit: None,
         timed_out: false,
@@ -2456,24 +2474,88 @@ async fn run_cargo_test(root: &Path, args: &[&str]) -> HiddenCommandResult {
         stderr_truncated: false,
         passed: false,
     };
-    match tokio::time::timeout(CARGO_TEST_TIMEOUT, command.output()).await {
+    if argv.is_empty() {
+        record.stderr = "command argv is empty".to_string();
+        return record;
+    }
+    let mut command = tokio::process::Command::new(&argv[0]);
+    command
+        .args(&argv[1..])
+        .current_dir(root)
+        .env("CARGO_TERM_COLOR", "never")
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    if argv.iter().any(|arg| arg == "cargo") {
+        command.env("CARGO_TARGET_DIR", root.join("target"));
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        command.process_group(0);
+    }
+    let mut child = match command.spawn() {
+        Ok(child) => child,
+        Err(e) => {
+            record.stderr = format!("failed to spawn {}: {e}", argv[0]);
+            return record;
+        }
+    };
+    let pid = child.id();
+    let stdout_task = child.stdout.take().map(|mut pipe| {
+        tokio::spawn(async move {
+            use tokio::io::AsyncReadExt;
+            let mut buffer = Vec::new();
+            let _ = pipe.read_to_end(&mut buffer).await;
+            buffer
+        })
+    });
+    let stderr_task = child.stderr.take().map(|mut pipe| {
+        tokio::spawn(async move {
+            use tokio::io::AsyncReadExt;
+            let mut buffer = Vec::new();
+            let _ = pipe.read_to_end(&mut buffer).await;
+            buffer
+        })
+    });
+    match tokio::time::timeout(timeout, child.wait()).await {
         Err(_) => {
             record.timed_out = true;
-            record.stderr = format!("cargo test did not finish within {CARGO_TEST_TIMEOUT:?}");
+            record.stderr = format!("command did not finish within {timeout:?}");
+            if let Some(pid) = pid {
+                let _ = tokio::task::spawn_blocking(move || {
+                    agent_process::kill_process_tree(pid);
+                })
+                .await;
+            }
+            // Reap the direct child so the tree cannot linger as a zombie
+            // or keep running; the wait below must not hang the cell even
+            // if the tree kill failed.
+            let _ = tokio::time::timeout(Duration::from_secs(5), child.wait()).await;
         }
-        Ok(Err(e)) => record.stderr = format!("failed to spawn cargo test: {e}"),
-        Ok(Ok(output)) => {
-            record.exit = output.status.code();
-            let stdout = String::from_utf8_lossy(&output.stdout);
-            let stderr = String::from_utf8_lossy(&output.stderr);
+        Ok(Err(e)) => {
+            record.stderr = format!("failed to wait for {}: {e}", argv[0]);
+        }
+        Ok(Ok(status)) => {
+            record.exit = status.code();
+            let stdout = match stdout_task {
+                Some(task) => task.await.unwrap_or_default(),
+                None => Vec::new(),
+            };
+            let stderr = match stderr_task {
+                Some(task) => task.await.unwrap_or_default(),
+                None => Vec::new(),
+            };
+            let stdout = String::from_utf8_lossy(&stdout);
+            let stderr = String::from_utf8_lossy(&stderr);
             record.stdout_truncated = stdout.len() > COMMAND_CAPTURE_CAP;
             record.stderr_truncated = stderr.len() > COMMAND_CAPTURE_CAP;
             record.stdout = tail_capture(&stdout);
             record.stderr = tail_capture(&stderr);
             let combined = format!("{}\n{stdout}\n{stderr}", record.stdout);
             let (passed_tests, failed_tests) = parse_test_totals(&combined);
-            record.passed = output.status.success() && failed_tests == 0 && passed_tests >= 1;
-            if output.status.success() && passed_tests == 0 {
+            record.passed = status.success() && failed_tests == 0 && passed_tests >= 1;
+            if status.success() && passed_tests == 0 {
                 record
                     .stderr
                     .push_str("\noracle: cargo test succeeded but executed zero tests");
@@ -2525,8 +2607,9 @@ fn diff_violations(
     diff_seed_files: &[&str],
     allowed_diff: &dyn Fn(&str) -> bool,
 ) -> anyhow::Result<Vec<String>> {
-    let mut present: BTreeMap<String, String> = BTreeMap::new();
-    collect_files(root, PathBuf::new(), &mut present)?;
+    let present: BTreeMap<String, String> = crate::bundle::collect_workspace_files(root)?
+        .into_iter()
+        .collect();
     let mut violations = Vec::new();
     for relative in present.keys() {
         if !allowed_diff(relative) {
@@ -2541,44 +2624,6 @@ fn diff_violations(
     violations.sort();
     violations.truncate(32);
     Ok(violations)
-}
-
-fn collect_files(
-    directory: &Path,
-    prefix: PathBuf,
-    out: &mut BTreeMap<String, String>,
-) -> anyhow::Result<()> {
-    anyhow::ensure!(
-        out.len() < MAX_DIFF_FILES,
-        "workspace holds more than {MAX_DIFF_FILES} files"
-    );
-    let mut entries: Vec<std::fs::DirEntry> =
-        std::fs::read_dir(directory)?.collect::<Result<Vec<_>, _>>()?;
-    entries.sort_by_key(|entry| entry.file_name());
-    for entry in entries {
-        let name = entry.file_name();
-        let name = name.to_string_lossy().into_owned();
-        let path = entry.path();
-        if path.is_dir() {
-            if SKIP_DIRS.contains(&name.as_str()) {
-                continue;
-            }
-            collect_files(&path, prefix.join(&name), out)?;
-        } else if SKIP_FILES.contains(&name.as_str()) {
-            continue;
-        } else {
-            let metadata = entry.metadata()?;
-            if metadata.len() as usize > MAX_FILE_BYTES {
-                anyhow::bail!("file {} exceeds the size cap", prefix.join(&name).display());
-            }
-            let bytes = std::fs::read(&path)?;
-            // Normalize to forward slashes so the policy and seed lookups
-            // are identical across host path separators.
-            let relative = prefix.join(&name).to_string_lossy().replace('\\', "/");
-            out.insert(relative, sha256_hex(&bytes));
-        }
-    }
-    Ok(())
 }
 
 /// Bounded body records for the evidence bundle: finals plus added tests.
@@ -3484,6 +3529,133 @@ mod tests {
             verdict(CellFailureClass::ModelOutputLimit),
             CellVerdict::Fail
         );
+    }
+
+    /// Failure classification is monotone: a later harness failure upgrades
+    /// the cell to NOT_RUN even when a behavior failure was recorded first,
+    /// while the first behavior failure still survives a later runtime
+    /// failure and a harness failure is never downgraded.
+    #[test]
+    fn absorb_failure_prefers_not_run_and_keeps_first_behavior_failure() {
+        fn class_of(failure: &Option<CellFailure>) -> Option<CellFailureClass> {
+            failure.as_ref().map(|failure| failure.class)
+        }
+        let harness = Some(CellFailure::harness_setup("oracle unavailable"));
+        let watchdog = Some(CellFailure::new(
+            CellFailureClass::HarnessWatchdog,
+            "cell stalled",
+        ));
+        let behavior = Some(CellFailure::new(
+            CellFailureClass::Model,
+            "model misbehaved",
+        ));
+        let runtime = Some(CellFailure::runtime("runtime hiccup"));
+
+        // Behavior failure recorded first, then a harness failure: the
+        // harness failure wins, censoring the cell to NOT_RUN.
+        let mut current = behavior.clone();
+        absorb_failure(&mut current, harness.clone());
+        assert_eq!(class_of(&current), class_of(&harness));
+        assert!(current.as_ref().unwrap().class.not_run());
+
+        // Harness failure first: a later behavior failure must not
+        // downgrade the censor.
+        let mut current = harness.clone();
+        absorb_failure(&mut current, behavior.clone());
+        assert_eq!(class_of(&current), class_of(&harness));
+
+        // First behavior failure survives a later runtime failure.
+        let mut current = behavior.clone();
+        absorb_failure(&mut current, runtime.clone());
+        assert_eq!(class_of(&current), class_of(&behavior));
+
+        // No incoming failure changes nothing.
+        let mut current = Some(CellFailure::runtime("r"));
+        absorb_failure(&mut current, None);
+        assert!(current.is_some());
+
+        // Empty slot accepts the first failure regardless of class.
+        let mut current = None;
+        absorb_failure(&mut current, watchdog.clone());
+        assert_eq!(class_of(&current), class_of(&watchdog));
+    }
+
+    /// A timed-out bounded run kills the whole tree and reports the
+    /// timeout without hanging the cell. Unix asserts the descendant is
+    /// actually dead; Windows asserts the bounded return plus the timeout
+    /// flag (the tree kill itself is agent-process' `kill_process_tree`,
+    /// covered by its own tests).
+    #[tokio::test]
+    async fn run_tree_bounded_timeout_kills_the_process_tree() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("ws");
+        std::fs::create_dir_all(&root).unwrap();
+        #[cfg(unix)]
+        let argv = vec![
+            "sh".to_string(),
+            "-c".to_string(),
+            "sleep 300 & echo $! > child.pid; wait".to_string(),
+        ];
+        #[cfg(windows)]
+        let argv = vec![
+            "powershell".to_string(),
+            "-NoProfile".to_string(),
+            "-Command".to_string(),
+            "$p = Start-Process powershell -ArgumentList '-NoProfile -Command Start-Sleep 300' \
+             -PassThru; $p.Id | Set-Content child.pid; Wait-Process -Id $p.Id"
+                .to_string(),
+        ];
+        let started = std::time::Instant::now();
+        // PowerShell cold-start takes longer than `sh`, so Windows needs a
+        // longer window for the descendant to write its pid file; both stay
+        // far below the 300-second descendant lifetime being killed.
+        let timeout = if cfg!(windows) {
+            Duration::from_millis(3000)
+        } else {
+            Duration::from_millis(300)
+        };
+        let record = run_tree_bounded(&root, &argv, timeout).await;
+        assert!(record.timed_out, "{record:?}");
+        assert!(record.exit.is_none());
+        assert!(
+            started.elapsed() < Duration::from_secs(10),
+            "timed-out run must return bounded"
+        );
+        assert!(
+            record.stderr.contains("did not finish"),
+            "{}",
+            record.stderr
+        );
+
+        #[cfg(unix)]
+        {
+            let pid_text =
+                std::fs::read_to_string(root.join("child.pid")).expect("descendant pid file");
+            let pid: u32 = pid_text.trim().parse().expect("parse descendant pid");
+            // The descendant must be dead after the tree kill: `kill -0`
+            // succeeds on a live process and fails on a dead one.
+            let probe = std::process::Command::new("kill")
+                .arg("-0")
+                .arg(pid.to_string())
+                .output()
+                .expect("run kill -0");
+            assert!(!probe.status.success(), "descendant {pid} still alive");
+        }
+        #[cfg(windows)]
+        {
+            let pid_text =
+                std::fs::read_to_string(root.join("child.pid")).expect("descendant pid file");
+            let pid = pid_text.trim().to_string();
+            let probe = std::process::Command::new("powershell")
+                .args(["-NoProfile", "-Command"])
+                .arg(format!(
+                    "Get-Process -Id {pid} -ErrorAction SilentlyContinue"
+                ))
+                .output()
+                .expect("run process probe");
+            let out = String::from_utf8_lossy(&probe.stdout);
+            assert!(out.trim().is_empty(), "descendant {pid} still alive: {out}");
+        }
     }
 
     /// The harness-owned oracle must accept the reference solution and
