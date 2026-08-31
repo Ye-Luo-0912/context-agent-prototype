@@ -1,24 +1,46 @@
-//! Mechanical M15 window reporting from immutable cell bundles.
+//! Mechanical M15 window reporting from content-addressed cell bundles.
 //!
-//! The live runner persists an exact cell list first. Re-rendering reads only
-//! that manifest plus each cell's manifest, dimensions, and summary; it
-//! validates the frozen identity and recomputes every verdict from raw facts.
+//! The live runner persists an exact cell list first. The window manifest
+//! binds a sha256 digest for every acceptance input of every cell
+//! (manifest, dimensions, summary, events stream, workspace hash, hidden
+//! verification). Re-rendering re-reads the raw streams, derives the
+//! event-backed facts, compares them with the stored projections, recomputes
+//! every verdict from raw facts, and fails closed on any post-persist
+//! mutation or drift.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use agent_contracts::{RuntimeEvent, RuntimeEventEnvelope};
 use anyhow::{Context, ensure};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
 
-use crate::bundle::{CELL_SCHEMA, CellManifest, CellSummary};
+use crate::bundle::{
+    CELL_SCHEMA, CellManifest, CellSummary, first_journaled_seq_gap, tool_histogram,
+};
 use crate::long_live::{
     AcceptanceProfile, CellFailureClass, CellVerdict, M15_PACK_IDS, PILOT_SCHEMA, PilotMode,
     evaluate_verdict,
 };
 
-const WINDOW_SCHEMA: &str = "m15-window.v1";
+const WINDOW_SCHEMA: &str = "m15-window.v2";
+/// Every acceptance input of a formal cell is content-addressed into the
+/// window manifest. Mutation tests flip each one and require fail-closed.
+const RAW_CELL_FILES: [&str; 6] = [
+    "manifest.json",
+    "dimensions.json",
+    "summary.json",
+    "events.jsonl",
+    "workspace.json",
+    "verify.json",
+];
+/// Bounded raw-stream parsing: a cell stream beyond these caps cannot be
+/// honestly accounted, so the window fails closed instead of promising a
+/// verdict from an unread tail.
+const MAX_RAW_EVENTS: usize = 65_536;
+const MAX_RAW_BYTES: u64 = 32 * 1024 * 1024;
 const FORMAL_CANDIDATE_ID: &str = "task-progress-settlement-v1";
 const FORMAL_TOOL_SURFACE: &str = "production";
 const REQUIRED_DIMENSION_IDENTITY_FIELDS: [&str; 16] = [
@@ -43,6 +65,11 @@ const REQUIRED_DIMENSION_IDENTITY_FIELDS: [&str; 16] = [
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct WindowCellRef {
     path: String,
+    /// sha256 over every [`RAW_CELL_FILES`] input, fixed at persist time.
+    /// Older v1 window manifests (no digests) deserialize with an empty map
+    /// and are rejected as forensic-only by the schema gate.
+    #[serde(default)]
+    digests: BTreeMap<String, String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -105,6 +132,33 @@ struct Cell {
     manifest: CellManifest,
     dimensions: Dimensions,
     summary: CellSummary,
+    raw: CellRaw,
+}
+
+/// Raw acceptance inputs of one cell, re-parsed (bounded) at render time.
+#[derive(Debug)]
+struct CellRaw {
+    events: Vec<RuntimeEventEnvelope>,
+    workspace: RawWorkspace,
+    verify: RawVerify,
+}
+
+/// The part of `workspace.json` the reporter re-checks against the stored
+/// summary; the listed file paths remain diagnostics.
+#[derive(Debug, Deserialize)]
+struct RawWorkspace {
+    sha256: String,
+    files: u64,
+}
+
+/// The part of `verify.json` the reporter re-checks against the stored
+/// oracle projection; assertion/file bodies stay diagnostics.
+#[derive(Debug, Deserialize)]
+struct RawVerify {
+    schema: String,
+    passed: bool,
+    #[serde(default)]
+    replay_complete: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -172,7 +226,12 @@ pub fn persist_window(
             .join(relative)
             .to_string_lossy()
             .replace('\\', "/");
-        cells.push(WindowCellRef { path });
+        let mut digests = BTreeMap::new();
+        for file in RAW_CELL_FILES {
+            let digest = sha256_file(&cell_dir.join(file))?;
+            digests.insert(file.to_string(), digest);
+        }
+        cells.push(WindowCellRef { path, digests });
     }
     let manifest = WindowManifest {
         schema: WINDOW_SCHEMA.into(),
@@ -194,7 +253,8 @@ pub fn render_window(window_dir: &Path) -> anyhow::Result<RenderedWindow> {
     let manifest: WindowManifest = read_json(&window_dir.join("manifest.json"))?;
     ensure!(
         manifest.schema == WINDOW_SCHEMA,
-        "unsupported window schema"
+        "unsupported window schema {} (legacy m15-window.v1 windows are forensic-only: rebuild the window with the content-addressed reporter before any formal PASS claim)",
+        manifest.schema
     );
     ensure!(
         manifest.expected_repeats == crate::long_live::DEFAULT_REPEATS,
@@ -238,14 +298,41 @@ pub fn render_window(window_dir: &Path) -> anyhow::Result<RenderedWindow> {
             cell_dir.starts_with(&evidence_root),
             "window cell escapes the evidence root"
         );
+        verify_cell_digests(&cell_dir, cell_ref)?;
         cells.push(Cell {
             manifest: read_json(&cell_dir.join("manifest.json"))?,
             dimensions: read_dimensions(&cell_dir.join("dimensions.json"))?,
             summary: read_json(&cell_dir.join("summary.json"))?,
+            raw: CellRaw {
+                events: read_events_bounded(&cell_dir.join("events.jsonl"))?,
+                workspace: read_json(&cell_dir.join("workspace.json"))?,
+                verify: read_json(&cell_dir.join("verify.json"))?,
+            },
         });
     }
     validate_cells(&manifest, &cells)?;
     Ok(render_cells(&cells))
+}
+
+/// Any post-persist mutation of a bound acceptance input fails closed:
+/// the stored digest was fixed when the window was persisted, so a changed
+/// file can no longer regenerate a formal verdict from unbound facts.
+fn verify_cell_digests(cell_dir: &Path, cell_ref: &WindowCellRef) -> anyhow::Result<()> {
+    for file in RAW_CELL_FILES {
+        let stored = cell_ref.digests.get(file).with_context(|| {
+            format!(
+                "window cell {} has no bound digest for {file}",
+                cell_ref.path
+            )
+        })?;
+        let actual = sha256_file(&cell_dir.join(file))?;
+        ensure!(
+            actual == *stored,
+            "window cell {} digest mismatch for {file} (persisted {stored}, current {actual})",
+            cell_ref.path
+        );
+    }
+    Ok(())
 }
 
 fn validate_cells(manifest: &WindowManifest, cells: &[Cell]) -> anyhow::Result<()> {
@@ -547,6 +634,7 @@ fn validate_cells(manifest: &WindowManifest, cells: &[Cell]) -> anyhow::Result<(
             Some(expected) => ensure!(*expected == current, "window identity drift"),
             None => shared = Some(current),
         }
+        validate_raw_derived(cell)?;
     }
     ensure!(
         pack_digests.len() == expected_packs.len(),
@@ -567,6 +655,138 @@ fn validate_cells(manifest: &WindowManifest, cells: &[Cell]) -> anyhow::Result<(
         "distinct packs must carry distinct fixture digests"
     );
     Ok(())
+}
+
+/// Re-derive the event-backed facts from the raw streams and compare them
+/// with the stored summary/dimensions projections. The verdict alone can
+/// never outlive drift in these inputs; the derived record must match.
+fn validate_raw_derived(cell: &Cell) -> anyhow::Result<()> {
+    let events = &cell.raw.events;
+    let summary = &cell.summary;
+
+    let seq_gap = first_journaled_seq_gap(events);
+    ensure!(
+        seq_gap.is_none() == summary.seq_contiguous,
+        "event-derived sequence drift: summary seq_contiguous={}, raw stream first gap {seq_gap:?}",
+        summary.seq_contiguous
+    );
+    ensure!(
+        seq_gap == summary.seq_gap,
+        "event-derived sequence drift: summary seq_gap={:?}, raw stream first gap {seq_gap:?}",
+        summary.seq_gap
+    );
+
+    let model_started = count_event(events, |e| matches!(e, RuntimeEvent::ModelStarted { .. }));
+    let model_used = count_event(events, |e| matches!(e, RuntimeEvent::ModelUsed { .. }));
+    ensure!(
+        model_started == summary.model_started,
+        "event-derived model-start drift: summary {}, raw stream {model_started}",
+        summary.model_started
+    );
+    ensure!(
+        model_used == summary.model_used,
+        "event-derived model-use drift: summary {}, raw stream {model_used}",
+        summary.model_used
+    );
+
+    let tool_calls: u64 = tool_histogram(events).iter().map(|tool| tool.calls).sum();
+    ensure!(
+        tool_calls == metric_u64(summary, "tool_calls")?,
+        "event-derived tool-call drift: summary metric {}, raw stream histogram {tool_calls}",
+        metric_u64(summary, "tool_calls")?
+    );
+
+    // Stuck-card detection: a projection that claims a terminal event must
+    // be backed by that event in the raw stream, and the runtime derives
+    // these flags from the same events, so the comparison is bidirectional.
+    let turn_completed = events
+        .iter()
+        .any(|e| matches!(e.event, RuntimeEvent::TurnCompleted));
+    ensure!(
+        turn_completed == cell.dimensions.turn_completed,
+        "terminal event drift: dimensions turn_completed={}, raw stream has TurnCompleted={turn_completed}",
+        cell.dimensions.turn_completed
+    );
+    let task_completed = events
+        .iter()
+        .any(|e| matches!(e.event, RuntimeEvent::TaskCompleted { .. }));
+    ensure!(
+        task_completed == cell.dimensions.task_completed,
+        "terminal event drift: dimensions task_completed={}, raw stream has TaskCompleted={task_completed}",
+        cell.dimensions.task_completed
+    );
+
+    ensure!(
+        summary.workspace_sha256 == cell.raw.workspace.sha256,
+        "workspace projection drift: summary sha256 {}, raw workspace.json sha256 {}",
+        summary.workspace_sha256,
+        cell.raw.workspace.sha256
+    );
+    ensure!(
+        u64::try_from(summary.workspace_files).unwrap_or(u64::MAX) == cell.raw.workspace.files,
+        "workspace projection drift: summary files {}, raw workspace.json files {}",
+        summary.workspace_files,
+        cell.raw.workspace.files
+    );
+
+    ensure!(
+        cell.raw.verify.schema == PILOT_SCHEMA,
+        "verify projection drift: raw verify schema {} is not the pilot oracle schema",
+        cell.raw.verify.schema
+    );
+    ensure!(
+        cell.raw.verify.replay_complete,
+        "verify projection drift: raw oracle replay is incomplete"
+    );
+    ensure!(
+        !cell.raw.verify.passed || cell.dimensions.observed_behavioral_oracle == "pass",
+        "verify projection drift: raw oracle passed=true but the stored observed oracle is {}",
+        cell.dimensions.observed_behavioral_oracle
+    );
+    Ok(())
+}
+
+fn count_event(events: &[RuntimeEventEnvelope], pred: impl Fn(&RuntimeEvent) -> bool) -> u64 {
+    events
+        .iter()
+        .filter(|envelope| pred(&envelope.event))
+        .count() as u64
+}
+
+/// Parse the cell's journaled stream under explicit byte and row caps.
+/// Beyond a cap the stream cannot be honestly accounted, so the window
+/// fails closed instead of deriving a verdict from a partial read.
+fn read_events_bounded(path: &Path) -> anyhow::Result<Vec<RuntimeEventEnvelope>> {
+    let len = std::fs::metadata(path)
+        .with_context(|| format!("stat {}", path.display()))?
+        .len();
+    ensure!(
+        len <= MAX_RAW_BYTES,
+        "{} exceeds the bounded raw cap ({} bytes > {MAX_RAW_BYTES} bytes)",
+        path.display(),
+        len
+    );
+    let bytes = std::fs::read(path).with_context(|| format!("read {}", path.display()))?;
+    let mut events = Vec::new();
+    for line in bytes.split(|byte| *byte == b'\n') {
+        if line.is_empty() {
+            continue;
+        }
+        ensure!(
+            events.len() < MAX_RAW_EVENTS,
+            "{} exceeds the bounded raw cap ({MAX_RAW_EVENTS} rows)",
+            path.display()
+        );
+        let envelope: RuntimeEventEnvelope =
+            serde_json::from_slice(line).with_context(|| format!("decode {}", path.display()))?;
+        events.push(envelope);
+    }
+    Ok(events)
+}
+
+fn sha256_file(path: &Path) -> anyhow::Result<String> {
+    let bytes = std::fs::read(path).with_context(|| format!("read {}", path.display()))?;
+    Ok(format!("{:x}", Sha256::digest(bytes)))
 }
 
 fn expected_pack_identity(pack_id: &str) -> anyhow::Result<PackIdentity> {
@@ -775,7 +995,7 @@ fn render_cells(cells: &[Cell]) -> RenderedWindow {
         "FAILED"
     };
     let mut markdown = format!(
-        "# M15 development window — {verdict}\n\nSchema `{WINDOW_SCHEMA}`. Generated mechanically from immutable cell bundles.\n\n| cell | behavior | diff | closure | continuation | provider | rounds | tools | wall ms | verdict |\n| --- | --- | --- | --- | --- | --- | ---: | ---: | ---: | --- |\n"
+        "# M15 development window — {verdict}\n\nSchema `{WINDOW_SCHEMA}`. Generated mechanically from content-addressed cell bundles.\n\n| cell | behavior | diff | closure | continuation | provider | rounds | tools | wall ms | verdict |\n| --- | --- | --- | --- | --- | --- | ---: | ---: | ---: | --- |\n"
     );
     for cell in &ordered {
         let d = &cell.dimensions;
@@ -993,7 +1213,121 @@ mod tests {
             serde_json::to_vec_pretty(&summary).unwrap(),
         )
         .unwrap();
+        write_raw_inputs(&dir, pack, mode, verdict == CellVerdict::Pass, !not_run).unwrap();
         dir
+    }
+
+    /// Write the raw acceptance inputs (events stream, workspace hash,
+    /// hidden verification) that a real cell bundle carries. The fixture
+    /// stream is self-consistent with the stored summary/dimensions, so
+    /// the derived-vs-projection checks pass on the happy path.
+    fn write_raw_inputs(
+        dir: &Path,
+        pack: &str,
+        mode: PilotMode,
+        verify_passed: bool,
+        turn_completed: bool,
+    ) -> anyhow::Result<()> {
+        let events = make_events(turn_completed);
+        let jsonl = events
+            .iter()
+            .map(|envelope| {
+                serde_json::to_string(envelope)
+                    .map(|line| line + "\n")
+                    .map_err(anyhow::Error::from)
+            })
+            .collect::<anyhow::Result<Vec<_>>>()?;
+        std::fs::write(dir.join("events.jsonl"), jsonl.concat())?;
+        std::fs::write(
+            dir.join("workspace.json"),
+            serde_json::to_vec_pretty(&serde_json::json!({
+                "sha256": "0".repeat(64),
+                "files": 1,
+                "listed": [],
+            }))?,
+        )?;
+        std::fs::write(
+            dir.join("verify.json"),
+            serde_json::to_vec_pretty(&serde_json::json!({
+                "schema": PILOT_SCHEMA,
+                "kind": "retry_pilot_oracle",
+                "fixture_id": format!("{pack}-{}", mode.id()),
+                "expected_edit": "",
+                "passed": verify_passed,
+                "replay_complete": true,
+                "assertions": [],
+                "files": [],
+                "commands": [],
+            }))?,
+        )?;
+        Ok(())
+    }
+
+    fn make_events(turn_completed: bool) -> Vec<RuntimeEventEnvelope> {
+        use agent_contracts::{OperationId, RunId, ToolCall, ToolOutput, TurnId};
+        let run_id = RunId::new();
+        let turn_id = TurnId::new();
+        let operation_id = OperationId::new();
+        let call = ToolCall {
+            id: "t1".into(),
+            name: "fs.read".into(),
+            arguments: serde_json::json!({}),
+        };
+        let output = ToolOutput {
+            call_id: "t1".into(),
+            tool_name: "fs.read".into(),
+            ok: true,
+            summary: "ok".into(),
+            model_content: "ok".into(),
+            artifact_ref: None,
+            metadata: serde_json::json!({}),
+        };
+        let mut events = vec![
+            envelope(run_id, 1, RuntimeEvent::RunStarted),
+            envelope(
+                run_id,
+                2,
+                RuntimeEvent::ModelStarted {
+                    turn_id,
+                    operation_id,
+                    generation: 0,
+                    surface_revision: 0,
+                    model_round: 0,
+                    prompt_layers: Default::default(),
+                    turn_checkpoint: Default::default(),
+                },
+            ),
+            envelope(run_id, 3, RuntimeEvent::ToolStarted { call }),
+            envelope(run_id, 4, RuntimeEvent::ToolFinished { output }),
+            envelope(
+                run_id,
+                5,
+                RuntimeEvent::ModelUsed {
+                    input_tokens: 10,
+                    output_tokens: 5,
+                    cached_input_tokens: 0,
+                    attempts: 1,
+                    retries: 0,
+                },
+            ),
+        ];
+        if turn_completed {
+            events.push(envelope(run_id, 6, RuntimeEvent::TurnCompleted));
+        }
+        events
+    }
+
+    fn envelope(
+        run_id: agent_contracts::RunId,
+        seq: u64,
+        event: RuntimeEvent,
+    ) -> RuntimeEventEnvelope {
+        RuntimeEventEnvelope {
+            run_id,
+            seq,
+            timestamp_ms: 1,
+            event,
+        }
     }
 
     fn full_window(root: &Path, failed_cell: bool) -> Vec<PathBuf> {
@@ -1219,5 +1553,150 @@ mod tests {
         .err()
         .expect("missing v4 identity must be rejected");
         assert!(error.to_string().contains("missing required v4 identity"));
+    }
+
+    #[test]
+    fn report_fails_closed_on_any_post_persist_raw_mutation() {
+        for file in RAW_CELL_FILES {
+            let temp = tempfile::tempdir().unwrap();
+            let cells = full_window(temp.path(), false);
+            let (window, rendered) = persist_window(
+                temp.path(),
+                &cells,
+                &M15_PACK_IDS,
+                crate::long_live::DEFAULT_REPEATS,
+            )
+            .unwrap();
+            assert!(rendered.passed, "{file} window must start passed");
+            let target = cells[0].join(file);
+            let mut mutated = std::fs::read(&target).unwrap();
+            mutated.push(b' ');
+            std::fs::write(&target, mutated).unwrap();
+            let error = render_window(&window)
+                .err()
+                .expect("bound raw mutation must fail closed");
+            assert!(
+                error.to_string().contains("digest mismatch"),
+                "{file}: unexpected error {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn report_rejects_event_derived_sequence_drift() {
+        let temp = tempfile::tempdir().unwrap();
+        let cells = full_window(temp.path(), false);
+        // Rewrite the first cell's stream with a journaled gap: the stored
+        // summary claims contiguous, so the derived record must disagree.
+        let events_path = cells[0].join("events.jsonl");
+        let run_id = agent_contracts::RunId::new();
+        let mut lines = String::new();
+        for seq in [1u64, 3u64] {
+            lines.push_str(
+                &serde_json::to_string(&envelope(run_id, seq, RuntimeEvent::RunStarted)).unwrap(),
+            );
+            lines.push('\n');
+        }
+        std::fs::write(&events_path, lines).unwrap();
+        let error = persist_window(
+            temp.path(),
+            &cells,
+            &M15_PACK_IDS,
+            crate::long_live::DEFAULT_REPEATS,
+        )
+        .err()
+        .expect("event sequence drift must be rejected");
+        assert!(error.to_string().contains("sequence drift"), "{error}");
+    }
+
+    #[test]
+    fn report_rejects_workspace_projection_drift() {
+        let temp = tempfile::tempdir().unwrap();
+        let cells = full_window(temp.path(), false);
+        let workspace_path = cells[0].join("workspace.json");
+        let mut workspace: serde_json::Value = read_json(&workspace_path).unwrap();
+        workspace["sha256"] = serde_json::json!("f".repeat(64));
+        std::fs::write(
+            &workspace_path,
+            serde_json::to_vec_pretty(&workspace).unwrap(),
+        )
+        .unwrap();
+        let error = persist_window(
+            temp.path(),
+            &cells,
+            &M15_PACK_IDS,
+            crate::long_live::DEFAULT_REPEATS,
+        )
+        .err()
+        .expect("workspace projection drift must be rejected");
+        assert!(
+            error.to_string().contains("workspace projection drift"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn report_rejects_verify_oracle_drift() {
+        let temp = tempfile::tempdir().unwrap();
+        let cells = full_window(temp.path(), true);
+        // The failing cell stores observed oracle "fail"; flipping its raw
+        // verification to passed must fail closed.
+        let failing = cells
+            .iter()
+            .find(|path| {
+                path.to_string_lossy().contains("retry_policy_dev-resume")
+                    && path.to_string_lossy().contains("r2")
+            })
+            .expect("failing cell must exist");
+        let verify_path = failing.join("verify.json");
+        let mut verify: serde_json::Value = read_json(&verify_path).unwrap();
+        verify["passed"] = serde_json::json!(true);
+        std::fs::write(&verify_path, serde_json::to_vec_pretty(&verify).unwrap()).unwrap();
+        let error = persist_window(
+            temp.path(),
+            &cells,
+            &M15_PACK_IDS,
+            crate::long_live::DEFAULT_REPEATS,
+        )
+        .err()
+        .expect("verify oracle drift must be rejected");
+        assert!(
+            error.to_string().contains("verify projection drift"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn report_rejects_missing_terminal_event() {
+        let temp = tempfile::tempdir().unwrap();
+        let cells = full_window(temp.path(), false);
+        // cell[0] is diag Normal r1 with turn_completed=true: drop its
+        // TurnCompleted event so the raw stream no longer backs the flag.
+        let events_path = cells[0].join("events.jsonl");
+        let events = read_events_bounded(&events_path).unwrap();
+        let text = events
+            .iter()
+            .filter(|envelope| !matches!(envelope.event, RuntimeEvent::TurnCompleted))
+            .map(|envelope| {
+                serde_json::to_string(envelope)
+                    .map(|line| line + "\n")
+                    .map_err(anyhow::Error::from)
+            })
+            .collect::<anyhow::Result<Vec<_>>>()
+            .unwrap()
+            .concat();
+        std::fs::write(&events_path, text).unwrap();
+        let error = persist_window(
+            temp.path(),
+            &cells,
+            &M15_PACK_IDS,
+            crate::long_live::DEFAULT_REPEATS,
+        )
+        .err()
+        .expect("missing terminal event must be rejected");
+        assert!(
+            error.to_string().contains("terminal event drift"),
+            "{error}"
+        );
     }
 }
