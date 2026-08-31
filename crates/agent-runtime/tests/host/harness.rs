@@ -599,3 +599,107 @@ pub(crate) fn instrumented_manifest(id: &str) -> CapabilityManifest {
         sandbox_profile: Default::default(),
     }
 }
+
+/// A capability whose lifecycle a test can gate and observe: `start()` can
+/// be held open, every stop is counted, liveness can be flipped (a child
+/// that died behind a Started record), and `invoke()` either signals
+/// entry and waits for its cancellation handle or fails immediately,
+/// depending on `invoke_hangs`.
+pub(crate) struct LifecycleProbeCapability {
+    pub(crate) manifest: CapabilityManifest,
+    /// When set, `start()` reports entry through this channel and then
+    /// waits at the gate until the test passes the barrier.
+    pub(crate) start_entered: Option<tokio::sync::mpsc::UnboundedSender<()>>,
+    pub(crate) start_gate: Option<Arc<tokio::sync::Barrier>>,
+    pub(crate) starts: Arc<AtomicUsize>,
+    pub(crate) stops: Arc<AtomicUsize>,
+    /// The adapter liveness `is_live()` reports; flip to simulate a dead
+    /// connection behind a Started record.
+    pub(crate) live: Arc<AtomicBool>,
+    /// When true, `invoke()` signals entry and then sleeps until its
+    /// cancellation handle fires (an in-flight call the runtime must
+    /// settle). When false, `invoke()` fails immediately with a poison-like
+    /// error regardless of liveness.
+    pub(crate) invoke_hangs: Arc<AtomicBool>,
+    pub(crate) invoke_entered: Option<tokio::sync::mpsc::UnboundedSender<()>>,
+    pub(crate) invoke_result: Arc<Mutex<Result<(), String>>>,
+}
+
+#[async_trait::async_trait]
+impl Capability for LifecycleProbeCapability {
+    fn manifest(&self) -> &CapabilityManifest {
+        &self.manifest
+    }
+    async fn start(&self) -> AgentResult<()> {
+        self.starts.fetch_add(1, Ordering::SeqCst);
+        if let Some(entered) = &self.start_entered {
+            let _ = entered.send(());
+        }
+        if let Some(gate) = &self.start_gate {
+            // The test holds the far side of the barrier; waiting here
+            // keeps the lifecycle lock held on purpose (a racing
+            // disable must queue behind this start).
+            gate.wait().await;
+        }
+        Ok(())
+    }
+    async fn stop(&self) -> AgentResult<()> {
+        self.stops.fetch_add(1, Ordering::SeqCst);
+        Ok(())
+    }
+    async fn is_live(&self) -> bool {
+        self.live.load(Ordering::SeqCst)
+    }
+    async fn invoke(
+        &self,
+        call: ToolCall,
+        ctx: CapabilityInvocationContext,
+    ) -> AgentResult<CapabilityOutcome> {
+        if self.invoke_hangs.load(Ordering::SeqCst) {
+            if let Some(entered) = &self.invoke_entered {
+                let _ = entered.send(());
+            }
+            ctx.cancel.cancelled().await;
+            return Err(AgentError::Cancelled);
+        }
+        match self.invoke_result.lock().unwrap().as_ref() {
+            Ok(()) => Ok(CapabilityOutcome::Value(ToolOutput {
+                call_id: call.id,
+                tool_name: call.name.clone(),
+                ok: true,
+                summary: "probe ran".into(),
+                model_content: "probe ran".into(),
+                artifact_ref: None,
+                metadata: json!({}),
+            })),
+            Err(message) => Err(AgentError::Tool(message.clone())),
+        }
+    }
+}
+
+pub(crate) fn probe_manifest(id: &str, tool_names: &[&str]) -> CapabilityManifest {
+    CapabilityManifest {
+        id: id.into(),
+        version: "1.0.0".into(),
+        name: id.into(),
+        summary: "lifecycle probe".into(),
+        status: CapabilityStatus::Experimental,
+        provides: vec![agent_contracts::CapabilityKind::Tool],
+        permissions: vec!["workspace:read".into()],
+        requires: Vec::new(),
+        tools: tool_names
+            .iter()
+            .map(|name| ToolSpec {
+                name: name.to_string(),
+                description: "probe tool".into(),
+                input_schema: json!({"type": "object"}),
+                risk: ToolRisk::ReadOnly,
+                output_budget: None,
+                roles: Vec::new(),
+            })
+            .collect(),
+        lifecycle: CapabilityLifecycle::Lazy,
+        transport: CapabilityTransport::Builtin,
+        sandbox_profile: Default::default(),
+    }
+}

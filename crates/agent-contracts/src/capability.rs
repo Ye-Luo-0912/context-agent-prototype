@@ -611,6 +611,16 @@ pub trait Capability: Send + Sync {
     async fn stop(&self) -> AgentResult<()> {
         Ok(())
     }
+
+    /// Whether the backing service is live enough to serve a call right
+    /// now (a process host that is serving and healthy, an MCP client that
+    /// is not poisoned). Defaults to true for in-process capabilities:
+    /// adapters own liveness, and the runtime only observes it to decide
+    /// whether a failed invocation must downgrade the lifecycle record so
+    /// the next start reaches the adapter's restart path.
+    async fn is_live(&self) -> bool {
+        true
+    }
 }
 
 #[cfg(test)]

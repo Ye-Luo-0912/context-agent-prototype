@@ -42,7 +42,7 @@ async fn snapshot_generation_tracks_dynamic_capability_changes() {
         "unloading must bump the generation"
     );
 
-    registry.enable("gen-a").unwrap();
+    registry.enable("gen-a").await.unwrap();
     let after_activate = dispatcher.snapshot().generation;
     assert!(
         after_activate > after_unload,
@@ -232,7 +232,11 @@ async fn catalog_rows_are_cached_and_invalidate_on_surface_changes() {
 
     // An executing tool flips its row to Active; the cache must not serve
     // a stale Loaded state across a call boundary.
-    registry.mark_active("cache-demo.demo");
+    let cancel = CancellationToken::new();
+    registry
+        .mark_active("cache-demo.demo", &cancel)
+        .await
+        .unwrap();
     let fourth = registry.catalog_rows();
     assert!(
         !Arc::ptr_eq(&third, &fourth),
@@ -244,7 +248,10 @@ async fn catalog_rows_are_cached_and_invalidate_on_surface_changes() {
             .any(|row| row.name == "cache-demo.demo" && row.state == ToolLifecycle::Active),
         "an executing tool must report Active in the fresh rows"
     );
-    registry.mark_idle("cache-demo.demo");
+    registry
+        .mark_idle("cache-demo.demo", &cancel)
+        .await
+        .unwrap();
     let fifth = registry.catalog_rows();
     assert!(
         !Arc::ptr_eq(&fourth, &fifth),

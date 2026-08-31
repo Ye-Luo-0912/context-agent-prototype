@@ -281,7 +281,7 @@ async fn rejected_actor_restore_does_not_change_capability_flags() {
     host.register_capability(Arc::new(CheckpointCapability::new()))
         .unwrap();
     let registry = host.capability_registry();
-    registry.enable("checkpoint-capability").unwrap();
+    registry.enable("checkpoint-capability").await.unwrap();
     registry.load_tool("checkpoint.tool").unwrap();
 
     let instance = RuntimeInstance::spawn(host, services());

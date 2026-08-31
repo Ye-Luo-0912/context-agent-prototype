@@ -228,6 +228,13 @@ impl Capability for ProcessCapabilityAdapter {
         Ok(())
     }
 
+    async fn is_live(&self) -> bool {
+        match &*self.host.lock().await {
+            HostLifecycle::Serving(host) => host.status().health.allows_call(),
+            _ => false,
+        }
+    }
+
     async fn invoke(
         &self,
         call: ToolCall,

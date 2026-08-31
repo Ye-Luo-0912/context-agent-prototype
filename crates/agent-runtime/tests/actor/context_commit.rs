@@ -338,6 +338,7 @@ async fn checkpoint_assembly_runs_checkpoint_maintenance_once() {
         tokio::time::sleep(Duration::from_millis(40)).await;
         racing
             .disable("demo")
+            .await
             .expect("disable bumps the generation");
     });
     instance.checkpoint().await.unwrap();

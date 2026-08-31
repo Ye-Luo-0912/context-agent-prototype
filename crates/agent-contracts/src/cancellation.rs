@@ -31,6 +31,15 @@ impl CancellationToken {
         self.cancelled.load(Ordering::Acquire)
     }
 
+    /// Whether two handles refer to the same cancellation state (one is a
+    /// clone of the other). Used to settle one execution's record by
+    /// identity: an invocation registers its handle while active and
+    /// removes exactly that handle when it finishes, even when several
+    /// invocations share the registry.
+    pub fn same_token(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.cancelled, &other.cancelled)
+    }
+
     /// Resolves once the token is cancelled (immediately if already so).
     pub async fn cancelled(&self) {
         if self.is_cancelled() {

@@ -1,10 +1,15 @@
 use std::sync::{
-    Arc,
+    Arc, Mutex,
     atomic::{AtomicBool, AtomicUsize, Ordering},
 };
+use std::time::Duration;
 
-use agent_contracts::{CapabilityTransport, ToolDispatcher};
+use agent_contracts::{
+    AgentError, CancellationToken, CapabilityTransport, RunId, ToolCall, ToolDispatcher,
+    ToolExecutionRequest,
+};
 use agent_runtime::{CapabilityAwareDispatcher, CapabilityRunState, ModuleHost, ToolModule};
+use serde_json::json;
 
 use crate::harness::*;
 
@@ -38,7 +43,7 @@ async fn disabled_capabilities_cannot_load_or_run_until_enabled() {
     assert!(error.to_string().contains("disabled"), "{error}");
 
     // Enabling makes it loadable and runnable.
-    registry.enable("ext-gated").unwrap();
+    registry.enable("ext-gated").await.unwrap();
     dispatcher.load_tool("ext-gated.run").unwrap();
     let output = execute(tools, "ext-gated.run").await;
     assert!(output.ok);
@@ -72,7 +77,7 @@ async fn activation_can_be_disabled_and_quarantined_after_use() {
 
     // After misbehavior the operator disables it: tools leave the surface
     // and calls are blocked at the gate.
-    registry.disable("flaky").unwrap();
+    registry.disable("flaky").await.unwrap();
     let names: Vec<String> = tools.specs().iter().map(|spec| spec.name.clone()).collect();
     assert!(
         !names.contains(&"flaky.run".to_string()),
@@ -85,8 +90,8 @@ async fn activation_can_be_disabled_and_quarantined_after_use() {
     );
 
     // Quarantine is the same gate, with its own label.
-    registry.enable("flaky").unwrap();
-    registry.quarantine("flaky").unwrap();
+    registry.enable("flaky").await.unwrap();
+    registry.quarantine("flaky").await.unwrap();
     let error = execute_raw(tools, "flaky.run").await;
     assert!(error.contains("quarantined"), "{error}");
 
@@ -325,6 +330,261 @@ async fn undeclared_permissions_receive_no_handle() {
     // 4. An unknown permission string is refused at registration (asserted
     //    above) — unknown access is denied by refusing the declaration,
     //    before any handle could ever be granted.
+
+    host.stop().await.unwrap();
+}
+
+#[tokio::test]
+async fn disable_waits_for_a_start_that_won_the_lifecycle_lock_and_then_stops() {
+    let host = ModuleHost::new();
+    let registry = host.capability_registry();
+    let (entered_tx, mut entered_rx) = tokio::sync::mpsc::unbounded_channel();
+    let gate = Arc::new(tokio::sync::Barrier::new(2));
+    let starts = Arc::new(AtomicUsize::new(0));
+    let stops = Arc::new(AtomicUsize::new(0));
+    host.register_capability(Arc::new(LifecycleProbeCapability {
+        manifest: probe_manifest("probe", &[]),
+        start_entered: Some(entered_tx),
+        start_gate: Some(gate.clone()),
+        starts: starts.clone(),
+        stops: stops.clone(),
+        live: Arc::new(AtomicBool::new(true)),
+        invoke_hangs: Arc::new(AtomicBool::new(false)),
+        invoke_entered: None,
+        invoke_result: Arc::new(Mutex::new(Ok(()))),
+    }))
+    .unwrap();
+
+    // The start wins the lifecycle lock and is held open at the gate.
+    let start_task = tokio::spawn({
+        let registry = registry.clone();
+        async move { registry.ensure_started("probe").await }
+    });
+    entered_rx.recv().await.unwrap(); // start() is inside, holding the lock
+
+    // The disable queues behind it; when the gate opens, it settles the
+    // just-started service exactly once.
+    let disable_task = tokio::spawn({
+        let registry = registry.clone();
+        async move { registry.disable("probe").await }
+    });
+    tokio::time::sleep(Duration::from_millis(20)).await;
+    gate.wait().await;
+
+    start_task.await.unwrap().unwrap();
+    disable_task.await.unwrap().unwrap();
+
+    assert_eq!(starts.load(Ordering::SeqCst), 1, "exactly one start()");
+    assert_eq!(
+        stops.load(Ordering::SeqCst),
+        1,
+        "the disable must stop the started service once"
+    );
+    let entry = registry
+        .catalog()
+        .into_iter()
+        .find(|entry| entry.id == "probe")
+        .expect("catalog must list the capability");
+    assert_eq!(
+        entry.run_state,
+        CapabilityRunState::Stopped,
+        "a settled disable must leave the record Stopped"
+    );
+    assert!(
+        registry.ensure_started("probe").await.is_err(),
+        "a disabled capability must refuse a later start"
+    );
+}
+
+#[tokio::test]
+async fn quarantine_cancels_an_in_flight_invocation_and_stops_the_service() {
+    let mut host = ModuleHost::new();
+    let registry = host.capability_registry();
+    let dispatcher = Arc::new(CapabilityAwareDispatcher::new(
+        Arc::new(StubTools),
+        registry.clone(),
+    ));
+    host.add_module(Arc::new(ToolModule::new(dispatcher.clone())))
+        .unwrap();
+    let (entered_tx, mut entered_rx) = tokio::sync::mpsc::unbounded_channel();
+    let stops = Arc::new(AtomicUsize::new(0));
+    host.register_capability(Arc::new(LifecycleProbeCapability {
+        manifest: probe_manifest("probe", &["probe.run"]),
+        start_entered: None,
+        start_gate: None,
+        starts: Arc::new(AtomicUsize::new(0)),
+        stops: stops.clone(),
+        live: Arc::new(AtomicBool::new(true)),
+        invoke_hangs: Arc::new(AtomicBool::new(true)),
+        invoke_entered: Some(entered_tx),
+        invoke_result: Arc::new(Mutex::new(Ok(()))),
+    }))
+    .unwrap();
+    host.start().await.unwrap();
+    let _tools = host.registry().tool_provider().unwrap();
+    dispatcher.load_tool("probe.run").unwrap();
+
+    // The invocation blocks inside the capability on its cancellation
+    // handle — the in-flight state the quarantine must settle.
+    let executing = tokio::spawn({
+        let dispatcher = dispatcher.clone();
+        async move {
+            dispatcher
+                .execute(ToolExecutionRequest {
+                    run_id: RunId::new(),
+                    call: ToolCall {
+                        id: "call-probe".into(),
+                        name: "probe.run".into(),
+                        arguments: json!({}),
+                    },
+                    effect_context: None,
+                    cancel: CancellationToken::new(),
+                })
+                .await
+        }
+    });
+    entered_rx.recv().await.unwrap();
+
+    registry.quarantine("probe").await.unwrap();
+
+    let result = executing.await.unwrap();
+    assert!(
+        matches!(result, Err(AgentError::Cancelled)),
+        "quarantine must settle the in-flight invocation: {result:?}"
+    );
+    assert_eq!(
+        stops.load(Ordering::SeqCst),
+        1,
+        "quarantine must stop the service exactly once"
+    );
+    let entry = registry
+        .catalog()
+        .into_iter()
+        .find(|entry| entry.id == "probe")
+        .expect("catalog must list the capability");
+    assert_eq!(entry.run_state, CapabilityRunState::Stopped);
+
+    host.stop().await.unwrap();
+}
+
+#[tokio::test]
+async fn a_poisoned_invoke_downgrades_the_record_and_the_next_start_restarts() {
+    let mut host = ModuleHost::new();
+    let registry = host.capability_registry();
+    let dispatcher = Arc::new(CapabilityAwareDispatcher::new(
+        Arc::new(StubTools),
+        registry.clone(),
+    ));
+    host.add_module(Arc::new(ToolModule::new(dispatcher.clone())))
+        .unwrap();
+    let starts = Arc::new(AtomicUsize::new(0));
+    let dead = Arc::new(AtomicBool::new(false));
+    host.register_capability(Arc::new(LifecycleProbeCapability {
+        manifest: probe_manifest("probe", &["probe.run"]),
+        start_entered: None,
+        start_gate: None,
+        starts: starts.clone(),
+        stops: Arc::new(AtomicUsize::new(0)),
+        live: dead.clone(),
+        invoke_hangs: Arc::new(AtomicBool::new(false)),
+        invoke_entered: None,
+        invoke_result: Arc::new(Mutex::new(Err("poisoned connection".into()))),
+    }))
+    .unwrap();
+    host.start().await.unwrap();
+    let _tools = host.registry().tool_provider().unwrap();
+    dispatcher.load_tool("probe.run").unwrap();
+
+    // The connection dies while the call fails, so the invoke sees a dead
+    // adapter and the Started record must downgrade.
+    dead.store(false, Ordering::SeqCst);
+    let error = dispatcher
+        .execute(ToolExecutionRequest {
+            run_id: RunId::new(),
+            call: ToolCall {
+                id: "call-probe".into(),
+                name: "probe.run".into(),
+                arguments: json!({}),
+            },
+            effect_context: None,
+            cancel: CancellationToken::new(),
+        })
+        .await
+        .expect_err("the dead invocation must fail");
+    assert!(error.to_string().contains("poisoned connection"), "{error}");
+    assert_eq!(
+        registry
+            .catalog()
+            .into_iter()
+            .find(|entry| entry.id == "probe")
+            .map(|entry| entry.run_state),
+        Some(CapabilityRunState::Failed),
+        "a failed invoke behind a dead connection must downgrade Started to Failed"
+    );
+
+    // The next start goes through the start path again (the adapter's
+    // restart path), now that the connection is alive.
+    dead.store(true, Ordering::SeqCst);
+    registry.ensure_started("probe").await.unwrap();
+    assert_eq!(
+        starts.load(Ordering::SeqCst),
+        2,
+        "the restart must call start() again"
+    );
+    assert_eq!(
+        registry
+            .catalog()
+            .into_iter()
+            .find(|entry| entry.id == "probe")
+            .map(|entry| entry.run_state),
+        Some(CapabilityRunState::Started)
+    );
+
+    // A domain failure with a live connection does not downgrade: only a
+    // dead connection consumes the restart path.
+    let healthy_starts = Arc::new(AtomicUsize::new(0));
+    host.register_capability(Arc::new(LifecycleProbeCapability {
+        manifest: probe_manifest("healthy", &["healthy.run"]),
+        start_entered: None,
+        start_gate: None,
+        starts: healthy_starts.clone(),
+        stops: Arc::new(AtomicUsize::new(0)),
+        live: Arc::new(AtomicBool::new(true)),
+        invoke_hangs: Arc::new(AtomicBool::new(false)),
+        invoke_entered: None,
+        invoke_result: Arc::new(Mutex::new(Err("domain refusal".into()))),
+    }))
+    .unwrap();
+    dispatcher.load_tool("healthy.run").unwrap();
+    let error = dispatcher
+        .execute(ToolExecutionRequest {
+            run_id: RunId::new(),
+            call: ToolCall {
+                id: "call-healthy".into(),
+                name: "healthy.run".into(),
+                arguments: json!({}),
+            },
+            effect_context: None,
+            cancel: CancellationToken::new(),
+        })
+        .await
+        .expect_err("the refused call must fail");
+    assert!(error.to_string().contains("domain refusal"), "{error}");
+    assert_eq!(
+        registry
+            .catalog()
+            .into_iter()
+            .find(|entry| entry.id == "healthy")
+            .map(|entry| entry.run_state),
+        Some(CapabilityRunState::Started),
+        "a live connection must keep the Started record"
+    );
+    registry.ensure_started("healthy").await.unwrap();
+    assert_eq!(
+        healthy_starts.load(Ordering::SeqCst),
+        1,
+        "a live Started record must not re-start"
+    );
 
     host.stop().await.unwrap();
 }

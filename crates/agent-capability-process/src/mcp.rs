@@ -855,6 +855,13 @@ impl Capability for McpCapabilityAdapter {
         }
         Ok(())
     }
+
+    async fn is_live(&self) -> bool {
+        match &*self.client.lock().await {
+            HostLifecycle::Serving(client) => !client.is_poisoned(),
+            _ => false,
+        }
+    }
 }
 
 #[cfg(test)]

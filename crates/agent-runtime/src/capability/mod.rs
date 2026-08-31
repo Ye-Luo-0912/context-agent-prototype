@@ -17,12 +17,12 @@ use std::{
 
 use agent_contracts::{
     AgentError, AgentResult, ArtifactHandle, CAPABILITY_MANAGE, CAPABILITY_SEARCH_DEFAULT_LIMIT,
-    CAPABILITY_SEARCH_MAX_LIMIT, Capability, CapabilityActivation, CapabilityInvocationContext,
-    CapabilityLifecycle, CapabilityManifest, CapabilityOutcome, CapabilityStatus,
-    CapabilityTransport, Effect, HostToolPolicies, RUNTIME_CONTEXT_CONTROL, ResourceDescriptor,
-    ToolCatalogEntry, ToolDispatcher, ToolExecutionRequest, ToolLeaseReconcileReport,
-    ToolLifecycle, ToolOutcome, ToolOutput, ToolSemanticRole, ToolSpec, ToolSurfaceSnapshot,
-    WORKSPACE_READ, WORKSPACE_WRITE, WorkspaceHandle, compact_tool_purpose,
+    CAPABILITY_SEARCH_MAX_LIMIT, CancellationToken, Capability, CapabilityActivation,
+    CapabilityInvocationContext, CapabilityLifecycle, CapabilityManifest, CapabilityOutcome,
+    CapabilityStatus, CapabilityTransport, Effect, HostToolPolicies, RUNTIME_CONTEXT_CONTROL,
+    ResourceDescriptor, ToolCatalogEntry, ToolDispatcher, ToolExecutionRequest,
+    ToolLeaseReconcileReport, ToolLifecycle, ToolOutcome, ToolOutput, ToolSemanticRole, ToolSpec,
+    ToolSurfaceSnapshot, WORKSPACE_READ, WORKSPACE_WRITE, WorkspaceHandle, compact_tool_purpose,
     sanitize_untrusted_producer_output, search_tool_catalog_filtered, unbound_effect_intent,
 };
 use agent_core::{CapabilityAdmission, CapabilityState, CapabilityStateAuthority};
@@ -113,6 +113,12 @@ struct Entry {
     /// A tool of this capability is executing right now (per-capability
     /// executing marker; the catalog's `Active` row).
     active: bool,
+    /// Cancellation handles of in-flight invocations. `set_activation`
+    /// cancels every live handle when the capability turns unusable, so a
+    /// disable or quarantine settles running calls before the service
+    /// stops. Registered and removed under the per-capability lifecycle
+    /// lock, like `active`.
+    inflight: Vec<CancellationToken>,
 }
 
 /// Per-tool surface lifecycle of one capability tool: the tool's
@@ -334,6 +340,7 @@ impl CapabilityRegistry {
                 run_lock: Arc::new(tokio::sync::Mutex::new(())),
                 tool_states: HashMap::new(),
                 active: false,
+                inflight: Vec::new(),
             },
         );
         // A new capability changes the catalog; surface-related flags are
@@ -365,49 +372,114 @@ impl CapabilityRegistry {
     }
 
     /// Set a capability's activation: `Enabled` makes it loadable and
-    /// invocable, `Disabled`/`Quarantined` take its tools off the model
-    /// surface and block further calls. Enabling is the operator/evaluator
-    /// action that external capabilities wait for. The transition is
-    /// decided and recorded by the core's capability-state authority; the
-    /// registry reacts to it with the surface effects (loaded tools,
-    /// generation bumps).
-    pub fn set_activation(&self, id: &str, activation: CapabilityActivation) -> AgentResult<()> {
-        let _surface = self
-            .surface_gate
-            .write()
-            .expect("capability registry poisoned");
-        let mut inner = self.inner.write().expect("capability registry poisoned");
-        // The entry must exist for the surface effects below; the authority
-        // record is updated right after, so the two never diverge.
-        let entry = inner.get_mut(id).ok_or_else(|| {
-            AgentError::InvalidRequest(format!("capability '{id}' is not registered"))
-        })?;
-        self.state.set_activation(id, activation)?;
-        // A capability that cannot run must not keep its tools on the
-        // model surface.
-        if !activation.usable() {
-            entry.tool_states.clear();
+    /// invocable; `Disabled`/`Quarantined` take its tools off the model
+    /// surface, cancel every in-flight invocation and stop the backing
+    /// service. Enabling is the operator/evaluator action that external
+    /// capabilities wait for; it records the usable surface without
+    /// starting anything (the first call starts lazily or at host start).
+    ///
+    /// The transition is decided and recorded by the core's capability-
+    /// state authority; the registry reacts with the surface and lifecycle
+    /// effects (loaded tools, running invocations, generation bumps). The
+    /// lifecycle half is serialized per capability with the same
+    /// [`run_lock`] every start/stop uses, so settling a running
+    /// capability never races its start or a newly admitted invocation: an
+    /// invocation admitted before the transition is cancelled, one
+    /// admitted after it is refused at `ensure_started`/`mark_active`.
+    pub async fn set_activation(
+        &self,
+        id: &str,
+        activation: CapabilityActivation,
+    ) -> AgentResult<()> {
+        let run_lock = {
+            let inner = self.inner.read().expect("capability registry poisoned");
+            match inner.get(id) {
+                Some(entry) => entry.run_lock.clone(),
+                None => {
+                    return Err(AgentError::InvalidRequest(format!(
+                        "capability '{id}' is not registered"
+                    )));
+                }
+            }
+        };
+        // Serialize the transition with start/stop and invocation
+        // admission; the whole unusable direction settles under it.
+        let _guard = run_lock.lock().await;
+        let (becoming_unusable, inflight) = {
+            let _surface = self
+                .surface_gate
+                .write()
+                .expect("capability registry poisoned");
+            let mut inner = self.inner.write().expect("capability registry poisoned");
+            // The entry must exist for the surface effects below; the
+            // authority record is updated right after, so the two never
+            // diverge.
+            let entry = inner.get_mut(id).ok_or_else(|| {
+                AgentError::InvalidRequest(format!("capability '{id}' is not registered"))
+            })?;
+            self.state.set_activation(id, activation)?;
+            // A capability that cannot run must not keep its tools on the
+            // model surface, and every invocation it was serving is
+            // settled before the service stops.
+            let becoming_unusable = !activation.usable();
+            if becoming_unusable {
+                entry.tool_states.clear();
+            }
+            let inflight = std::mem::take(&mut entry.inflight);
+            // Activation flips the usable surface: bump the generation.
+            self.generation.fetch_add(1, Ordering::Relaxed);
+            // ... and the derived discovery rows.
+            self.catalog_version.fetch_add(1, Ordering::Relaxed);
+            (becoming_unusable, inflight)
+        };
+        if !becoming_unusable {
+            return Ok(());
         }
-        // Activation flips the usable surface: bump the generation.
-        self.generation.fetch_add(1, Ordering::Relaxed);
-        // ... and the derived discovery rows.
-        self.catalog_version.fetch_add(1, Ordering::Relaxed);
-        Ok(())
+        // Cancel current invocations first (their children abort), then
+        // stop the service once they have settled. All registry locks are
+        // released while awaiting; the lifecycle lock alone keeps this
+        // transition exclusive without stalling unrelated registry reads.
+        for token in &inflight {
+            token.cancel();
+        }
+        let capability = {
+            let inner = self.inner.read().expect("capability registry poisoned");
+            match inner.get(id) {
+                Some(entry) => entry.capability.clone(),
+                None => return Ok(()),
+            }
+        };
+        let outcome = capability.stop().await;
+        // The transition endpoint stays idempotent: a later transition
+        // under the same lock either settles the already-stopped service
+        // again (a no-op) or sees the record written here.
+        let mut inner = self.inner.write().expect("capability registry poisoned");
+        if let Some(entry) = inner.get_mut(id) {
+            entry.run_state = if outcome.is_ok() {
+                CapabilityRunState::Stopped
+            } else {
+                CapabilityRunState::Failed
+            };
+        }
+        outcome
     }
 
-    /// Convenience: enable a capability (usable from now on).
-    pub fn enable(&self, id: &str) -> AgentResult<()> {
-        self.set_activation(id, CapabilityActivation::Enabled)
+    /// Convenience: enable a capability (usable from now on). Enabling
+    /// never starts the service; the first use or host start does.
+    pub async fn enable(&self, id: &str) -> AgentResult<()> {
+        self.set_activation(id, CapabilityActivation::Enabled).await
     }
 
     /// Convenience: disable a capability (registered, but not usable).
-    pub fn disable(&self, id: &str) -> AgentResult<()> {
+    pub async fn disable(&self, id: &str) -> AgentResult<()> {
         self.set_activation(id, CapabilityActivation::Disabled)
+            .await
     }
 
     /// Convenience: quarantine a capability after misbehavior.
-    pub fn quarantine(&self, id: &str) -> AgentResult<()> {
+    pub async fn quarantine(&self, id: &str) -> AgentResult<()> {
         self.set_activation(id, CapabilityActivation::Quarantined)
+            .await
     }
 
     /// Snapshot of every registered capability, for the discovery surface.
@@ -689,40 +761,82 @@ impl CapabilityRegistry {
 
     /// Mark a capability tool as executing (Active until `mark_idle`).
     /// Executing a tool also refreshes its idle clock: a tool in active use
-    /// never ages out mid-work.
-    pub fn mark_active(&self, tool_name: &str) {
+    /// never ages out mid-work. The per-capability lifecycle lock
+    /// serializes the mark with an activation transition, so a
+    /// disable/quarantine that is settling the capability either precedes
+    /// this call (the invocation is refused and returns `false`) or follows
+    /// it (the recorded cancellation handle is settled with the service).
+    pub async fn mark_active(
+        &self,
+        tool_name: &str,
+        cancel: &CancellationToken,
+    ) -> AgentResult<bool> {
         let tick = self.stamp_now();
-        let owner = self.owner_of(tool_name);
-        if let Some(owner) = owner
-            && let Some(entry) = self
-                .inner
-                .write()
-                .expect("capability registry poisoned")
-                .get_mut(&owner)
+        let Some(owner) = self.owner_of(tool_name) else {
+            return Ok(false);
+        };
+        let run_lock = {
+            let inner = self.inner.read().expect("capability registry poisoned");
+            match inner.get(&owner) {
+                Some(entry) => entry.run_lock.clone(),
+                None => return Ok(false),
+            }
+        };
+        let _guard = run_lock.lock().await;
+        // Re-check usability under the lifecycle lock: a transition that
+        // waits here finished first and turned the capability unusable.
+        let usable = self
+            .state
+            .activation(&owner)
+            .is_some_and(|activation| activation.usable());
+        if !usable {
+            return Ok(false);
+        }
+        if let Some(entry) = self
+            .inner
+            .write()
+            .expect("capability registry poisoned")
+            .get_mut(&owner)
         {
             entry.active = true;
+            entry.inflight.push(cancel.clone());
             if let Some(state) = entry.tool_states.get_mut(tool_name) {
                 state.last_used_tick = tick;
             }
         }
         // The discovery rows carry the Active state: invalidate the cache.
         self.catalog_version.fetch_add(1, Ordering::Relaxed);
+        Ok(true)
     }
 
-    /// Clear the executing marker after a call finished.
-    pub fn mark_idle(&self, tool_name: &str) {
-        let owner = self.owner_of(tool_name);
-        if let Some(owner) = owner
-            && let Some(entry) = self
-                .inner
-                .write()
-                .expect("capability registry poisoned")
-                .get_mut(&owner)
+    /// Clear the executing marker after a call finished and drop the
+    /// invocation's cancellation handle from the in-flight set. Serialized
+    /// with activation transitions like `mark_active`, so a settling
+    /// disable cannot observe a half-cleared record.
+    pub async fn mark_idle(&self, tool_name: &str, cancel: &CancellationToken) -> AgentResult<()> {
+        let Some(owner) = self.owner_of(tool_name) else {
+            return Ok(());
+        };
+        let run_lock = {
+            let inner = self.inner.read().expect("capability registry poisoned");
+            match inner.get(&owner) {
+                Some(entry) => entry.run_lock.clone(),
+                None => return Ok(()),
+            }
+        };
+        let _guard = run_lock.lock().await;
+        if let Some(entry) = self
+            .inner
+            .write()
+            .expect("capability registry poisoned")
+            .get_mut(&owner)
         {
             entry.active = false;
+            entry.inflight.retain(|token| !token.same_token(cancel));
         }
         // The discovery rows carry the Active state: invalidate the cache.
         self.catalog_version.fetch_add(1, Ordering::Relaxed);
+        Ok(())
     }
 
     /// The per-tool lifecycle safe point, called by the merged dispatcher
@@ -1104,16 +1218,30 @@ impl CapabilityRegistry {
     /// issues a second `start()`. The per-capability lock is held across the
     /// async `start()` call, so the capability's `start` must not re-enter
     /// the registry for the same capability.
+    ///
+    /// The `Started` record is probed against the adapter's liveness: a
+    /// child that died behind a stale record is downgraded and re-started
+    /// through the adapter's restart path instead of being trusted because
+    /// the registry never observed the death.
     pub async fn ensure_started(&self, id: &str) -> AgentResult<()> {
-        // Fast path: already running — no lock round-trip.
-        if self
-            .inner
-            .read()
-            .expect("capability registry poisoned")
-            .get(id)
-            .is_some_and(|entry| entry.run_state == CapabilityRunState::Started)
+        // Fast path: a Started record whose adapter probes live is ready —
+        // no lifecycle-lock round-trip. A stale Started record (dead
+        // child) falls through to the serialized path below.
         {
-            return Ok(());
+            let capability = {
+                let inner = self.inner.read().expect("capability registry poisoned");
+                match inner.get(id) {
+                    Some(entry) if entry.run_state == CapabilityRunState::Started => {
+                        Some(entry.capability.clone())
+                    }
+                    _ => None,
+                }
+            };
+            if let Some(capability) = capability
+                && capability.is_live().await
+            {
+                return Ok(());
+            }
         }
         let run_lock = {
             let inner = self.inner.read().expect("capability registry poisoned");
@@ -1134,31 +1262,45 @@ impl CapabilityRegistry {
             .state
             .activation(id)
             .unwrap_or(CapabilityActivation::Disabled);
-        let capability = {
+        // The record snapshot is stable while the lifecycle lock is held
+        // (every transition mutates `run_state` under it), so the probe
+        // below cannot race a concurrent start/stop/activation.
+        let (capability, run_state) = {
             let inner = self.inner.read().expect("capability registry poisoned");
             let entry = inner.get(id).ok_or_else(|| {
                 AgentError::InvalidRequest(format!("capability '{id}' is not registered"))
             })?;
-            match entry.run_state {
-                CapabilityRunState::Started => return Ok(()),
-                // Unreachable while holding the run lock (the other caller
-                // finished before we acquired it), kept defensive.
-                CapabilityRunState::Starting | CapabilityRunState::Stopping => {
-                    return Err(AgentError::InvalidRequest(format!(
-                        "capability '{id}' is {}; cannot start now",
-                        entry.run_state.as_str()
-                    )));
+            (entry.capability.clone(), entry.run_state)
+        };
+        match run_state {
+            CapabilityRunState::Started => {
+                if capability.is_live().await {
+                    return Ok(());
                 }
-                CapabilityRunState::Stopped | CapabilityRunState::Failed => {}
+                // Live probe failed behind a Started record: the service
+                // died without the registry noticing. Downgrade so the
+                // start path below runs the adapter's restart path.
+                let mut inner = self.inner.write().expect("capability registry poisoned");
+                if let Some(entry) = inner.get_mut(id) {
+                    entry.run_state = CapabilityRunState::Failed;
+                }
             }
-            if !activation.usable() {
+            // Unreachable while holding the run lock (the other caller
+            // finished before we acquired it), kept defensive.
+            CapabilityRunState::Starting | CapabilityRunState::Stopping => {
                 return Err(AgentError::InvalidRequest(format!(
-                    "capability '{id}' is {}; enable it before use",
-                    activation.as_str()
+                    "capability '{id}' is {}; cannot start now",
+                    run_state.as_str()
                 )));
             }
-            entry.capability.clone()
-        };
+            CapabilityRunState::Stopped | CapabilityRunState::Failed => {}
+        }
+        if !activation.usable() {
+            return Err(AgentError::InvalidRequest(format!(
+                "capability '{id}' is {}; enable it before use",
+                activation.as_str()
+            )));
+        }
         {
             let mut inner = self.inner.write().expect("capability registry poisoned");
             if let Some(entry) = inner.get_mut(id) {
@@ -1180,6 +1322,41 @@ impl CapabilityRegistry {
                 }
                 Err(error)
             }
+        }
+    }
+
+    /// Whether the capability's backing service is live right now (the
+    /// adapter's answer, not the registry record). Consulted after a failed
+    /// invocation to decide whether the lifecycle record must downgrade.
+    pub async fn is_live(&self, id: &str) -> bool {
+        let capability = {
+            let inner = self.inner.read().expect("capability registry poisoned");
+            match inner.get(id) {
+                Some(entry) => entry.capability.clone(),
+                None => return false,
+            }
+        };
+        capability.is_live().await
+    }
+
+    /// Downgrade a Started capability to Failed after an invocation left
+    /// its connection dead, so the next start drives the adapter's restart
+    /// path. Conditional on purpose: a disable/quarantine transition owns
+    /// the record while it settles (never overwrite its Stopped endpoint),
+    /// and an unusable capability must not be pushed into a restart.
+    pub fn record_poisoned(&self, id: &str) {
+        let usable = self
+            .state
+            .activation(id)
+            .is_some_and(|activation| activation.usable());
+        if !usable {
+            return;
+        }
+        let mut inner = self.inner.write().expect("capability registry poisoned");
+        if let Some(entry) = inner.get_mut(id)
+            && entry.run_state == CapabilityRunState::Started
+        {
+            entry.run_state = CapabilityRunState::Failed;
         }
     }
 
@@ -1556,12 +1733,37 @@ impl ToolDispatcher for CapabilityAwareDispatcher {
                         None => return Err(AgentError::Tool(format!("unknown tool: {name}"))),
                     }
                     self.capabilities.ensure_started(&id).await?;
-                    self.capabilities.mark_active(&name);
+                    // Disable/quarantine waits on the same per-capability
+                    // lifecycle lock, so this admission is race-free: a
+                    // capability that turned unusable between the start
+                    // and the mark refuses the invocation instead of
+                    // starting a call against a settling service.
+                    if !self
+                        .capabilities
+                        .mark_active(&name, &request.cancel)
+                        .await?
+                    {
+                        return Err(AgentError::Tool(format!(
+                            "capability '{id}' became {} while its tool was starting",
+                            self.capabilities
+                                .activation(&id)
+                                .map(|activation| activation.as_str())
+                                .unwrap_or("unavailable")
+                        )));
+                    }
+                    let cancel = request.cancel.clone();
                     let ctx = self.invocation_context(&grant, &request);
                     let outcome = self
                         .invoke_capability_with_remote_barrier(capability.as_ref(), request, ctx)
                         .await;
-                    self.capabilities.mark_idle(&name);
+                    let _ = self.capabilities.mark_idle(&name, &cancel).await;
+                    // A failed invocation that left the adapter dead
+                    // (poisoned connection) downgrades the lifecycle record
+                    // so the next start uses the adapter's restart path.
+                    // Domain failures with a live connection stay untouched.
+                    if outcome.is_err() && !self.capabilities.is_live(&id).await {
+                        self.capabilities.record_poisoned(&id);
+                    }
                     return Self::map_capability_outcome(&id, &grant, outcome);
                 }
                 self.base.execute(request).await

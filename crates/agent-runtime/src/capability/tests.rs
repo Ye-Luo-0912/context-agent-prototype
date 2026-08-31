@@ -534,8 +534,8 @@ fn unloading_one_capability_tool_keeps_siblings_loaded() {
     assert_eq!(registry.tool_state("demo.two"), Some(ToolLifecycle::Loaded));
 }
 
-#[test]
-fn capability_tools_cool_under_the_unified_surface_budget_with_root_protection() {
+#[tokio::test]
+async fn capability_tools_cool_under_the_unified_surface_budget_with_root_protection() {
     let registry = CapabilityRegistry::with_idle_thresholds(2, 4);
     registry
         .register(Arc::new(demo_capability("demo")))
@@ -607,8 +607,9 @@ fn capability_tools_cool_under_the_unified_surface_budget_with_root_protection()
     registry
         .load_tool_for_lease("demo.one")
         .expect("lease reload");
-    registry.mark_active("demo.one");
-    registry.mark_idle("demo.one");
+    let cancel = CancellationToken::new();
+    registry.mark_active("demo.one", &cancel).await.unwrap();
+    registry.mark_idle("demo.one", &cancel).await.unwrap();
     registry.gc(&[]);
     assert_eq!(
         registry.tool_state("demo.one"),
@@ -740,8 +741,8 @@ fn restore_unions_current_host_sources_with_checkpoint_residency() {
     assert_eq!(restored.tool_state("demo.two"), Some(ToolLifecycle::Warm));
 }
 
-#[test]
-fn capability_restore_cannot_promote_live_disabled_or_quarantined_authority() {
+#[tokio::test]
+async fn capability_restore_cannot_promote_live_disabled_or_quarantined_authority() {
     for live_activation in [
         CapabilityActivation::Disabled,
         CapabilityActivation::Quarantined,
@@ -752,6 +753,7 @@ fn capability_restore_cannot_promote_live_disabled_or_quarantined_authority() {
             .expect("registration succeeds");
         registry
             .set_activation("demo", live_activation)
+            .await
             .expect("live restriction applies");
 
         let applied = registry.restore(&[crate::checkpoint::CapabilitySnapshot {
