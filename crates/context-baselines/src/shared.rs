@@ -153,6 +153,7 @@ pub(crate) fn materialized_items(
             source: summary.source.clone(),
             file_path: None,
             file_revision: None,
+            partial_body: false,
         });
     }
     items.extend(
@@ -170,6 +171,7 @@ pub(crate) fn materialized_items(
                 source: record.source.clone(),
                 file_path: None,
                 file_revision: None,
+                partial_body: false,
             }),
     );
     items

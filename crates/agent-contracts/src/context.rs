@@ -1922,6 +1922,11 @@ pub struct MaterializedItem {
     /// `path@revision`; the assembler must not parse it out of `content`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub file_revision: Option<String>,
+    /// True when the body was clipped to a token budget: it is a partial
+    /// projection and must never stand in for the full revision in
+    /// required-body claims, consumption ledgers, or reread attribution.
+    #[serde(default)]
+    pub partial_body: bool,
 }
 
 /// Missing `retention` on old wire/checkpoint data means a normal working
@@ -3213,6 +3218,7 @@ mod tests {
             source: None,
             file_path: None,
             file_revision: None,
+            partial_body: false,
         }
     }
 

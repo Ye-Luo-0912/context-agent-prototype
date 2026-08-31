@@ -495,6 +495,9 @@ pub(crate) fn materialize(
                 source: item.source.clone(),
                 file_path: item.file_path.clone(),
                 file_revision: item.file_revision.clone(),
+                // Selected bodies are full (never preview-clipped);
+                // foreground clipping is the only partial projection.
+                partial_body: false,
             }
         })
         .collect();
@@ -963,7 +966,7 @@ pub(crate) async fn realize_foreground(
             continue;
         }
         let remaining = MAX_FOREGROUND_TOKENS.saturating_sub(used);
-        let content = clip_to_token_budget(&item.content, remaining);
+        let (content, clipped) = clip_to_token_budget(&item.content, remaining);
         if content.is_empty() {
             misses.push(context_miss(
                 identity,
@@ -983,6 +986,10 @@ pub(crate) async fn realize_foreground(
             source: item.source.clone(),
             file_path: item.file_path.clone(),
             file_revision: item.file_revision.clone(),
+            // A clipped foreground body is an explicit partial projection:
+            // it keeps its identity for display but must never be treated
+            // as the full revision by required claims or downstream ledgers.
+            partial_body: clipped,
         });
     }
     (out, misses)
@@ -1502,7 +1509,7 @@ pub(crate) fn apply_required(
             .items
             .iter()
             .chain(materialized.foreground.iter())
-            .any(|item| item.item_id == item_id);
+            .any(|item| item.item_id == item_id && !item.partial_body);
         if already_visible {
             materialized.required_item_ids.push(item_id);
             remove_external_descriptor(materialized, item_id);
@@ -1542,6 +1549,9 @@ pub(crate) fn apply_required(
             source: required.item.source.clone(),
             file_path: required.item.file_path.clone(),
             file_revision: required.item.file_revision.clone(),
+            // Required bodies are always embedded in full; a partial
+            // foreground copy was already rejected above.
+            partial_body: false,
         });
         materialized.selected.push(ContextSelection {
             item_id,
@@ -1657,12 +1667,15 @@ fn remove_external_descriptor(materialized: &mut MaterializedContext, item_id: C
     );
 }
 
-fn clip_to_token_budget(text: &str, max_tokens: usize) -> String {
+/// Clip `text` to a token budget, returning the prefix plus whether any
+/// content was cut. A cut body is a partial projection; callers must mark
+/// it so it cannot stand in for the full revision.
+fn clip_to_token_budget(text: &str, max_tokens: usize) -> (String, bool) {
     if max_tokens == 0 {
-        return String::new();
+        return (String::new(), true);
     }
     if approx_tokens(text) <= max_tokens {
-        return text.to_string();
+        return (text.to_string(), false);
     }
     let chars: Vec<char> = text.chars().collect();
     let mut lo = 0usize;
@@ -1676,5 +1689,5 @@ fn clip_to_token_budget(text: &str, max_tokens: usize) -> String {
             hi = mid - 1;
         }
     }
-    chars[..lo].iter().collect()
+    (chars[..lo].iter().collect(), true)
 }

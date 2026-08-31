@@ -221,6 +221,10 @@ pub(crate) struct PendingMaterialization {
     item_ids: std::collections::HashSet<ContextItemId>,
     external_item_ids: std::collections::HashSet<ContextItemId>,
     pub(crate) foreground_item_ids: std::collections::HashSet<ContextItemId>,
+    /// Normalized paths of the foreground bodies, with their ids, so the
+    /// ack can stamp final-frame exposure for bodies the model consumed
+    /// without changing their residency.
+    pub(crate) foreground_paths: Vec<(ContextItemId, String)>,
 }
 
 #[derive(Debug, Default, Serialize, Deserialize)]
@@ -1398,6 +1402,14 @@ impl ContextEngine for SimpleContextEngine {
                 .iter()
                 .map(|item| item.item_id)
                 .collect(),
+            foreground_paths: materialized
+                .foreground
+                .iter()
+                .filter_map(|item| {
+                    let path = item.file_path.as_deref().map(normalize_resource_path)?;
+                    (!path.is_empty()).then_some((item.item_id, path))
+                })
+                .collect(),
         });
         drop(state);
         Ok(materialized)
@@ -1458,6 +1470,16 @@ impl ContextEngine for SimpleContextEngine {
             .event_seq
             .checked_add(1)
             .ok_or_else(|| AgentError::Internal("context event sequence is exhausted".into()))?;
+        // Final-frame exposure, resolved before any mutation so the pending
+        // borrow ends: the ack confirms exactly which bodies were rendered.
+        let acked_item_ids: std::collections::HashSet<ContextItemId> =
+            ack.item_ids.iter().copied().collect();
+        let acked_foreground_paths: Vec<String> = pending
+            .foreground_paths
+            .iter()
+            .filter(|(item_id, _)| ack.foreground_item_ids.contains(item_id))
+            .map(|(_, path)| path.clone())
+            .collect();
         state.event_seq = now_event_seq;
         let turn = state.turn;
         let gc_epoch = state.gc_epoch;
@@ -1481,6 +1503,34 @@ impl ContextEngine for SimpleContextEngine {
         state.foreground_consumed_acks = state
             .foreground_consumed_acks
             .saturating_add(ack.foreground_item_ids.len() as u64);
+        // The exposure ledger is rewritten from the exact final frame the
+        // ack confirms: only bodies that were actually rendered stay
+        // classified as previously selected. A body the runtime trimmed out
+        // of the final request stops counting as selected, and a
+        // foreground-only body the model consumed is attributed as consumed
+        // on its next reread instead of reading as unselected/GC-rewarmed.
+        let mut final_body_paths: std::collections::HashSet<String> =
+            std::collections::HashSet::new();
+        for item in state.items.iter().chain(state.eviction_buffer.iter()) {
+            if acked_item_ids.contains(&item.id)
+                && let Some(path) = crate::index::entity::observation_file_path(item)
+            {
+                let path = normalize_resource_path(path);
+                if !path.is_empty() {
+                    final_body_paths.insert(path);
+                }
+            }
+        }
+        for path in &acked_foreground_paths {
+            final_body_paths.insert(path.clone());
+        }
+        state.selected_body_paths = final_body_paths.clone();
+        state
+            .selected_descriptor_paths
+            .retain(|path| !final_body_paths.contains(path));
+        state
+            .external_descriptor_paths
+            .retain(|path| !final_body_paths.contains(path));
         state.pending_materialization = None;
         Ok(())
     }

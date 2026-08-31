@@ -25,11 +25,46 @@ fn largest_final_pack_drop_index(
         .map(|(index, _)| index)
 }
 
+fn final_frame_body_key(item: &MaterializedItem) -> Option<String> {
+    let path = item
+        .file_path
+        .as_deref()
+        .map(str::trim)
+        .filter(|p| !p.is_empty())?;
+    match item
+        .file_revision
+        .as_deref()
+        .map(str::trim)
+        .filter(|r| !r.is_empty())
+    {
+        Some(revision) => Some(format!("{path}@{revision}")),
+        None => Some(path.to_string()),
+    }
+}
+
 fn record_final_pack_drop(
     materialized: &mut MaterializedContext,
     dropped: &MaterializedItem,
     active_anchor_revision: u64,
 ) {
+    // The same body may legitimately live in both the selected and the
+    // foreground layer (a resource that was both scored and explicitly
+    // requested). Removing one copy is not a miss while another copy of
+    // the same body stays in the final frame; recording a
+    // `BudgetExcluded` entry for it would misclassify a body that remains
+    // visible to the model.
+    let dropped_key = final_frame_body_key(dropped);
+    let still_visible = materialized
+        .items
+        .iter()
+        .chain(materialized.foreground.iter())
+        .any(|item| {
+            item.item_id == dropped.item_id
+                || (dropped_key.is_some() && final_frame_body_key(item) == dropped_key)
+        });
+    if still_visible {
+        return;
+    }
     let required = is_required_context_body(materialized, dropped);
     let miss = ContextMaterializationMiss {
         identity: ContextMaterializationIdentity::new(
@@ -1721,6 +1756,7 @@ mod failure_class_tests {
             source: None,
             file_path: None,
             file_revision: None,
+            partial_body: false,
         }
     }
 
@@ -1784,6 +1820,12 @@ mod failure_class_tests {
             Some(1),
             "optional content is displaced before a larger mandatory body"
         );
+        // The runtime removes the optional copy first, then has nothing
+        // left but the required body; dropping it removes the body from
+        // the frame entirely and is recorded as a BudgetExcluded miss.
+        let dropped_optional = materialized.items.remove(1);
+        record_final_pack_drop(&mut materialized, &dropped_optional, 9);
+        materialized.items.remove(0);
         record_final_pack_drop(&mut materialized, &required, 9);
         assert_eq!(materialized.required_misses.total(), 1);
         let miss = &materialized.required_misses.as_slice()[0];
@@ -1793,10 +1835,33 @@ mod failure_class_tests {
             miss.reason,
             ContextMaterializationMissReason::BudgetExcluded
         );
-
-        record_final_pack_drop(&mut materialized, &optional, 9);
         assert_eq!(materialized.optional_misses.total(), 1);
-        assert_eq!(materialized.required_misses.total(), 1);
+    }
+
+    #[test]
+    fn final_pack_drop_of_a_duplicate_that_stays_visible_is_not_a_miss() {
+        // The same body may be present in both the selected and the
+        // foreground layer; removing one copy while the other stays in the
+        // final frame must not record a BudgetExcluded miss.
+        let required = context_item(ContextRetention::Working, &"r".repeat(1_000));
+        let mut materialized = MaterializedContext {
+            items: vec![required.clone()],
+            foreground: vec![required.clone()],
+            required_item_ids: vec![required.item_id],
+            ..Default::default()
+        };
+        materialized.items.remove(0);
+        record_final_pack_drop(&mut materialized, &required, 9);
+        assert_eq!(
+            materialized.required_misses.total(),
+            0,
+            "the duplicate copy is still visible in the final frame"
+        );
+        assert_eq!(
+            materialized.required_misses.total() + materialized.optional_misses.total(),
+            0,
+            "no miss entry may be recorded for a body that remains visible"
+        );
     }
 
     #[test]

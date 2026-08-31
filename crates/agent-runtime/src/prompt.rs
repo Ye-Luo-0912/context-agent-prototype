@@ -1054,6 +1054,7 @@ mod tests {
             source: None,
             file_path: None,
             file_revision: None,
+            partial_body: false,
         }
     }
 
