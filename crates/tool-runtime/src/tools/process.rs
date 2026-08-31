@@ -58,7 +58,7 @@ const MAX_FINGERPRINT_ENTRIES: usize = 4096;
 const MAX_FINGERPRINT_BUFFER_BYTES: usize = 128 * 1024;
 const MAX_ATTEMPTED_CANDIDATES: usize = 8;
 
-struct ProgramResolution {
+pub(crate) struct ProgramResolution {
     /// 传给 `Command::new` 的绝对路径。
     executable: std::path::PathBuf,
     /// 稳定 lineage scope：digest(规范化 argv0 + 有序候选族 +
@@ -69,11 +69,35 @@ struct ProgramResolution {
     fingerprint: String,
 }
 
+impl ProgramResolution {
+    pub(crate) fn executable(&self) -> &std::path::Path {
+        &self.executable
+    }
+    pub(crate) fn scope_key(&self) -> &str {
+        &self.scope_key
+    }
+    pub(crate) fn fingerprint_identity(&self) -> &str {
+        &self.fingerprint
+    }
+}
+
 #[derive(Debug)]
-struct ProgramResolutionFailure {
+pub(crate) struct ProgramResolutionFailure {
     candidates_tried: Vec<String>,
     scope_key: String,
     fingerprint: String,
+}
+
+impl ProgramResolutionFailure {
+    pub(crate) fn candidates_tried(&self) -> &[String] {
+        &self.candidates_tried
+    }
+    pub(crate) fn scope_key(&self) -> &str {
+        &self.scope_key
+    }
+    pub(crate) fn fingerprint_identity(&self) -> &str {
+        &self.fingerprint
+    }
 }
 
 /// Host-defined executable candidate family. `bases` is ordered exactly as
@@ -385,7 +409,7 @@ fn resolution_identity(
     (scope_key, content_digest(&fingerprint_source))
 }
 
-fn resolve_program(
+pub(crate) fn resolve_program(
     argv0: &str,
     cwd: &std::path::Path,
     env_overrides: &HashMap<String, String>,
@@ -433,6 +457,103 @@ fn resolve_program(
             fingerprint,
         }),
     }
+}
+
+/// Env overrides that can redirect what an approved program actually
+/// executes: wrappers, preloads, library/module search paths and startup
+/// files. Refused as explicit overrides; values may still be inherited
+/// from the host environment, which is the trust boundary this list does
+/// not widen.
+const EXECUTION_CONTROL_ENV_KEYS: &[&str] = &[
+    "RUSTC_WRAPPER",
+    "RUSTC_WORKSPACE_WRAPPER",
+    "RUSTFLAGS",
+    "LD_PRELOAD",
+    "LD_AUDIT",
+    "LD_DEBUG",
+    "LD_LIBRARY_PATH",
+    "DYLD_INSERT_LIBRARIES",
+    "DYLD_LIBRARY_PATH",
+    "DYLD_FRAMEWORK_PATH",
+    "PYTHONPATH",
+    "PYTHONSTARTUP",
+    "NODE_OPTIONS",
+    "JAVA_TOOL_OPTIONS",
+    "_JAVA_OPTIONS",
+    "BASH_ENV",
+    "ENV",
+];
+/// Error-message bound: list at most this many refused keys by name.
+const MAX_REFUSED_ENV_KEYS_SHOWN: usize = 6;
+
+/// Post-resolution authority gate for `ExecArgv`-approved spawns.
+/// Preflight canonicalization already produced the executable path from
+/// `candidate_family`; this check closes the two remaining gaps between
+/// "the model approved `python3`" and "some other bytes execute":
+/// - a bare-name program (no separators, not absolute) must not resolve
+///   to a workspace file: dropping a same-named file into the workspace
+///   would shadow an external program under a standing grant. The
+///   explicit `./name` spelling is the unambiguous way to run a workspace
+///   binary, so bare-name workspace hits are refused instead.
+/// - env overrides may not set execution-control variables (see
+///   `EXECUTION_CONTROL_ENV_KEYS`), which could swap in different
+///   compiled or interpreted code than the approved program name.
+///
+/// Returns the canonicalized executable path as a seal the caller must
+/// recheck immediately before spawn, shrinking the resolve-to-spawn
+/// window for symlink/path swaps.
+pub(crate) fn validate_execution_authority_binding(
+    workspace: &Workspace,
+    argv0: &str,
+    resolution: &ProgramResolution,
+    env_overrides: &HashMap<String, String>,
+    tool_name: &str,
+) -> AgentResult<std::path::PathBuf> {
+    if !is_absolute(argv0) && !has_path_separator(argv0) {
+        let canonical_root = std::fs::canonicalize(workspace.root())
+            .map_err(|error| AgentError::Tool(format!("workspace root canonicalize: {error}")))?;
+        let canonical_executable = std::fs::canonicalize(&resolution.executable)
+            .map_err(|error| AgentError::Tool(format!("resolved program canonicalize: {error}")))?;
+        if canonical_executable.starts_with(&canonical_root) {
+            return Err(AgentError::InvalidRequest(format!(
+                "{tool_name} refused: argv0 `{argv0}` resolved to a workspace file ({}) \
+                 and would shadow an external program of the same name; spell the \
+                 workspace-relative path explicitly (for example `./{argv0}`) when a \
+                 workspace binary is intended",
+                resolution.executable.display()
+            )));
+        }
+    }
+    let refused: Vec<&str> = EXECUTION_CONTROL_ENV_KEYS
+        .iter()
+        .copied()
+        .filter(|key| env_override(env_overrides, key).is_some())
+        .collect();
+    if !refused.is_empty() {
+        let listed = refused
+            .iter()
+            .take(MAX_REFUSED_ENV_KEYS_SHOWN)
+            .copied()
+            .collect::<Vec<_>>()
+            .join(", ");
+        let more = refused.len().saturating_sub(MAX_REFUSED_ENV_KEYS_SHOWN);
+        return Err(AgentError::InvalidRequest(format!(
+            "{tool_name} refused: env overrides on execution-control variables ({}{}) \
+             cannot be set through the tool; they redirect what an approved program \
+             actually executes. Remove these keys from the env argument.",
+            listed,
+            if more > 0 {
+                format!(", and {more} more")
+            } else {
+                String::new()
+            }
+        )));
+    }
+    std::fs::canonicalize(&resolution.executable).map_err(|error| {
+        AgentError::Tool(format!(
+            "resolved program disappeared before spawn: {error}"
+        ))
+    })
 }
 
 /// Bounded host-side executable identity used by exact verification reuse.
@@ -690,6 +811,51 @@ impl ProcessRunTool {
             }
         };
 
+        // Authority binding gate: a bare-name resolving inside the
+        // workspace (shadow) or an env override on an execution-control
+        // variable refuses the spawn here; the returned canonicalized
+        // path is the seal rechecked immediately before spawn.
+        let sealed_executable = validate_execution_authority_binding(
+            &self.workspace,
+            &args.argv[0],
+            &resolution,
+            &args.env,
+            tool_name,
+        )?;
+
+        // Seal recheck: a target deleted or replaced between resolution
+        // and spawn is refused on the same typed path as a disappeared
+        // program (its identity is no longer the approved one).
+        let seal_intact = std::fs::canonicalize(&resolution.executable)
+            .is_ok_and(|current| current == sealed_executable);
+        if !seal_intact {
+            let entries = bounded_cwd_listing(&cwd);
+            return Ok(ToolOutcome::Value(agent_contracts::tool_failure_output(
+                call_id,
+                tool_name,
+                agent_contracts::ToolFailureClass::PathNotFound,
+                format!("{tool_name} refused: program_not_found ({})", args.argv[0]),
+                format!(
+                    "program `{}` changed identity before spawn.\ncwd `{}` contains: {}",
+                    args.argv[0],
+                    cwd.display(),
+                    if entries.is_empty() {
+                        "(empty)".into()
+                    } else {
+                        entries.join(", ")
+                    }
+                ),
+                json!({
+                    "argv0": args.argv[0],
+                    "cwd": cwd.display().to_string(),
+                    "entries": entries,
+                    "resolution_scope_key": resolution.scope_key,
+                    "resolution_fingerprint": resolution.fingerprint,
+                    "recovery_hint": "rebuild or reinstall the binary before running it",
+                }),
+            )));
+        }
+
         let mut command = Command::new(&resolution.executable);
         command
             .args(&args.argv[1..])
@@ -937,7 +1103,7 @@ impl ProcessRunTool {
 /// Bounded, deterministic listing of the spawn cwd for the
 /// program-not-found failure envelope. Dot-entries (.git,
 /// .focus-agent) are skipped to match the fs.list conventions.
-fn bounded_cwd_listing(dir: &std::path::Path) -> Vec<String> {
+pub(crate) fn bounded_cwd_listing(dir: &std::path::Path) -> Vec<String> {
     let mut names: Vec<String> = std::fs::read_dir(dir)
         .into_iter()
         .flatten()
@@ -1001,10 +1167,11 @@ mod tests {
         crate::tools::test_process_effect_context(run_id, "c", "process.run", arguments)
     }
 
-    /// TOOL-PROC-01 回归：cwd 里真实存在的可执行文件，裸名 / `.\` /
-    /// `./` 三种写法都必须能跑（Windows CreateProcess 不搜子进程 cwd
-    /// 的平台行为被 resolver 显式抹平），绝对路径照常；不存在的名字
-    /// 返回类型化失败并附尝试过的候选。
+    /// TOOL-PROC-01 回归：cwd 里真实存在的可执行文件，`.\` / `./` /
+    /// 绝对路径三种写法都能跑（Windows CreateProcess 不搜子进程 cwd
+    /// 的平台行为被 resolver 显式抹平）；裸名命中 cwd 内的工作区文件
+    /// 属于 shadow，被授权绑定拒绝；不存在的名字返回类型化失败并附
+    /// 尝试过的候选。
     #[tokio::test]
     async fn resolution_forms_for_a_binary_in_cwd_all_spawn() {
         let dir = tempfile::tempdir().unwrap();
@@ -1020,8 +1187,8 @@ mod tests {
         std::fs::copy(&src, dir.path().join(program_name)).unwrap();
 
         let tool = ProcessRunTool::new(workspace.clone());
+        // 显式相对/绝对拼写不受 shadow 限制：`.\`、`./`、绝对路径照常执行。
         for form in [
-            program_name.to_string(),
             format!(".\\{program_name}"),
             format!("./{program_name}"),
             dir.path().join(program_name).to_string_lossy().to_string(),
@@ -1055,6 +1222,31 @@ mod tests {
             );
         }
 
+        // 裸名命中 cwd 内的工作区文件：与同名外部程序形成 shadow，
+        // 授权绑定拒绝并要求用显式相对拼写表达意图。
+        let run_id = RunId::new();
+        let arguments = json!({"argv": [program_name, "hi"], "cwd": "."});
+        let context = ctx(run_id, &arguments);
+        let error = tool
+            .execute(
+                run_id,
+                "c",
+                arguments,
+                Some(context),
+                CancellationToken::new(),
+            )
+            .await
+            .expect_err("bare-name workspace shadow must be refused");
+        let message = error.to_string();
+        assert!(
+            message.contains("shadow"),
+            "the refusal must name the shadow mechanism: {message}"
+        );
+        assert!(
+            message.contains(program_name),
+            "the refusal must name the program: {message}"
+        );
+
         // 不存在的名字：类型化失败，候选列表里能看到 resolver 试过的路径。
         let run_id = RunId::new();
         let arguments = json!({"argv": ["nope.exe"], "cwd": "."});
@@ -1086,6 +1278,38 @@ mod tests {
         // 失败与成功使用同一套身份语义：scope 稳定，指纹随目录状态变化。
         assert!(output.metadata["resolution_scope_key"].is_string());
         assert!(output.metadata["resolution_fingerprint"].is_string());
+    }
+
+    #[tokio::test]
+    async fn execution_control_env_override_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let workspace = Workspace::open(dir.path()).await.unwrap();
+        let tool = ProcessRunTool::new(workspace);
+        let run_id = RunId::new();
+        let arguments = json!({
+            "argv": echo_argv("hi"),
+            "env": {"PYTHONPATH": "/tmp/injected"}
+        });
+        let context = ctx(run_id, &arguments);
+        let error = tool
+            .execute(
+                run_id,
+                "c",
+                arguments,
+                Some(context),
+                CancellationToken::new(),
+            )
+            .await
+            .expect_err("execution-control env override must be refused");
+        let message = error.to_string();
+        assert!(
+            message.contains("PYTHONPATH"),
+            "the refusal must name the variable: {message}"
+        );
+        assert!(
+            message.contains("execution-control"),
+            "the refusal must name the mechanism: {message}"
+        );
     }
 
     /// 指纹 v2：目录状态超过 preview 的 20 个名字后，第 25 个条目变化

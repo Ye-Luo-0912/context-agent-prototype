@@ -27,6 +27,7 @@ use tokio::{
 };
 
 use super::Tool;
+use super::process::{bounded_cwd_listing, resolve_program, validate_execution_authority_binding};
 use super::stream::{
     MAX_ARTIFACT_BYTES, StreamCapture, StreamChunk, spawn_stderr_reader, spawn_stdout_reader,
 };
@@ -243,7 +244,97 @@ impl ProcessSessionTool {
             }
         }
 
-        let mut command = Command::new(&args.argv[0]);
+        super::require_process_effect_context(&effect_context, "process.session")?;
+        super::require_covered_process_spawn(
+            "process.session",
+            arguments,
+            &agent_contracts::exec_argv_intent(&args.argv),
+        )?;
+
+        // Resolution, authority binding and the pre-spawn identity check
+        // share process.run semantics: a failed resolution is a typed
+        // PathNotFound carrying the attempted candidates and identity
+        // fingerprint; a workspace shadow or an execution-control env
+        // override refuses the spawn; the canonicalized seal is rechecked
+        // immediately before spawn.
+        let resolution = match resolve_program(&args.argv[0], &cwd, &args.env) {
+            Ok(resolution) => resolution,
+            Err(failure) => {
+                let entries = bounded_cwd_listing(&cwd);
+                let recovery_hint = "process.session start launches an argv executable directly; shell syntax and built-ins require shell.exec (or an explicit shell executable plus its command flag)";
+                return Ok(ToolOutcome::Value(agent_contracts::tool_failure_output(
+                    call_id,
+                    "process.session",
+                    agent_contracts::ToolFailureClass::PathNotFound,
+                    format!(
+                        "process.session refused: program_not_found ({})",
+                        args.argv[0]
+                    ),
+                    format!(
+                        "program `{}` was not found.\ncwd `{}` contains: {}\n{recovery_hint}.",
+                        args.argv[0],
+                        cwd.display(),
+                        if entries.is_empty() {
+                            "(empty)".into()
+                        } else {
+                            entries.join(", ")
+                        }
+                    ),
+                    json!({
+                        "argv0": args.argv[0],
+                        "cwd": cwd.display().to_string(),
+                        "entries": entries,
+                        "attempted": failure.candidates_tried(),
+                        "resolution_scope_key": failure.scope_key(),
+                        "resolution_fingerprint": failure.fingerprint_identity(),
+                        "recovery_hint": recovery_hint,
+                    }),
+                )));
+            }
+        };
+
+        let sealed_executable = validate_execution_authority_binding(
+            &self.workspace,
+            &args.argv[0],
+            &resolution,
+            &args.env,
+            "process.session",
+        )?;
+
+        let seal_intact = std::fs::canonicalize(resolution.executable())
+            .is_ok_and(|current| current == sealed_executable);
+        if !seal_intact {
+            let entries = bounded_cwd_listing(&cwd);
+            return Ok(ToolOutcome::Value(agent_contracts::tool_failure_output(
+                call_id,
+                "process.session",
+                agent_contracts::ToolFailureClass::PathNotFound,
+                format!(
+                    "process.session refused: program_not_found ({})",
+                    args.argv[0]
+                ),
+                format!(
+                    "program `{}` changed identity before spawn.\ncwd `{}` contains: {}",
+                    args.argv[0],
+                    cwd.display(),
+                    if entries.is_empty() {
+                        "(empty)".into()
+                    } else {
+                        entries.join(", ")
+                    }
+                ),
+                json!({
+                    "argv0": args.argv[0],
+                    "cwd": cwd.display().to_string(),
+                    "entries": entries,
+                    "resolution_scope_key": resolution.scope_key(),
+                    "resolution_fingerprint": resolution.fingerprint_identity(),
+                    "recovery_hint": "rebuild or reinstall the binary before running it",
+                }),
+            )));
+        }
+
+        let mut command = Command::new(resolution.executable());
         command
             .args(&args.argv[1..])
             .current_dir(&cwd)
@@ -256,16 +347,9 @@ impl ProcessSessionTool {
         #[cfg(unix)]
         command.process_group(0);
 
-        super::require_process_effect_context(&effect_context, "process.session")?;
-        super::require_covered_process_spawn(
-            "process.session",
-            arguments,
-            &agent_contracts::exec_argv_intent(&args.argv),
-        )?;
-
         let mut child = command
             .spawn()
-            .map_err(|e| AgentError::Tool(format!("spawn {}: {e}", args.argv[0])))?;
+            .map_err(|error| AgentError::Tool(format!("spawn {}: {error}", args.argv[0])))?;
         let pid = match super::persist_spawned_process(
             &self.workspace,
             &effect_context,
@@ -676,6 +760,73 @@ mod tests {
         assert!(
             !unused.exists(),
             "the unused command field must not be executed"
+        );
+    }
+
+    #[tokio::test]
+    async fn session_start_refuses_bare_name_shadow_and_control_env() {
+        let dir = tempfile::tempdir().unwrap();
+        let workspace = Workspace::open(dir.path()).await.unwrap();
+        let tool = ProcessSessionTool::new(workspace, Arc::new(Mutex::new(HashMap::new())));
+        #[cfg(windows)]
+        let src = std::path::PathBuf::from(
+            std::env::var("ComSpec").unwrap_or_else(|_| "C:\\Windows\\System32\\cmd.exe".into()),
+        );
+        #[cfg(not(windows))]
+        let src = std::path::PathBuf::from("/bin/echo");
+        assert!(src.is_file(), "source exe missing: {}", src.display());
+        let program_name = if cfg!(windows) { "probe.exe" } else { "probe" };
+        std::fs::copy(&src, dir.path().join(program_name)).unwrap();
+
+        // 裸名命中 cwd 内的工作区文件：与 process.run 同一套 shadow 拒绝。
+        let run_id = RunId::new();
+        let arguments = json!({
+            "action": "start",
+            "argv": [program_name],
+            "cwd": "."
+        });
+        let context = start_ctx(run_id, &arguments);
+        let error = tool
+            .execute(
+                run_id,
+                "c",
+                arguments,
+                Some(context),
+                CancellationToken::new(),
+            )
+            .await
+            .expect_err("bare-name workspace shadow must be refused");
+        assert!(
+            error.to_string().contains("shadow"),
+            "the refusal must name the shadow mechanism: {error}"
+        );
+
+        // 执行控制 env 覆盖：拒绝且不启动子进程。
+        let run_id = RunId::new();
+        let arguments = json!({
+            "action": "start",
+            "argv": write_marker_argv(),
+            "env": {"LD_PRELOAD": "/tmp/injected.so"}
+        });
+        let context = start_ctx(run_id, &arguments);
+        let error = tool
+            .execute(
+                run_id,
+                "c",
+                arguments,
+                Some(context),
+                CancellationToken::new(),
+            )
+            .await
+            .expect_err("execution-control env override must be refused");
+        let message = error.to_string();
+        assert!(
+            message.contains("LD_PRELOAD"),
+            "the refusal must name the variable: {message}"
+        );
+        assert!(
+            !dir.path().join("marker.txt").exists(),
+            "no child may spawn under a refused env override"
         );
     }
 
