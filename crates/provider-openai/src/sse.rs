@@ -3,6 +3,8 @@
 //! Kept free of I/O so the mapping from wire chunks to `ModelChunk` events is
 //! unit-testable without a network.
 
+use std::collections::BTreeMap;
+
 use agent_contracts::{
     AgentError, AgentResult, ModelChunk, ModelProtocolErrorKind, ModelUsage, ToolCall,
 };
@@ -207,6 +209,9 @@ struct AccToolCall {
 pub struct StreamAccumulator {
     content: String,
     tool_calls: Vec<AccToolCall>,
+    /// Tool-call id bound to its index, global to the whole stream so one
+    /// identity cannot be split across two calls.
+    id_indexes: BTreeMap<String, usize>,
     pub usage: Option<ModelUsage>,
     terminal_error: Option<String>,
     sealed: bool,
@@ -281,6 +286,14 @@ impl StreamAccumulator {
                     .expect("slot was just ensured");
 
                 if let Some(id) = &delta.id {
+                    if let Some(owner) = self.id_indexes.get(id).copied()
+                        && owner != delta.index
+                    {
+                        return Err(protocol_event_error(format!(
+                            "Chat Completions tool call id `{id}` is bound to index {owner} and index {}",
+                            delta.index
+                        )));
+                    }
                     if slot.id.as_deref().is_some_and(|bound| bound != id) {
                         return Err(protocol_event_error(format!(
                             "Chat Completions tool call at index {} bound id `{id}` but is already `{}`",
@@ -290,6 +303,7 @@ impl StreamAccumulator {
                     }
                     if slot.id.is_none() {
                         slot.id = Some(id.clone());
+                        self.id_indexes.insert(id.clone(), delta.index);
                     }
                 }
                 if let Some(name) = delta.function.as_ref().and_then(|f| f.name.clone()) {
@@ -342,12 +356,32 @@ impl StreamAccumulator {
     }
 
     /// Finalize into `(content, tool_calls)` and fail closed when a streamed
-    /// function-call argument never became complete JSON.
+    /// function-call argument never became complete JSON or the provider
+    /// never supplied the call id/name (a synthesized identity would make a
+    /// later artifact reference or retry unreachable).
     pub fn finalize(self) -> AgentResult<(String, Vec<ToolCall>)> {
         let mut tool_calls = Vec::new();
         for slot in self.tool_calls {
-            let id = slot.id.unwrap_or_else(|| format!("call-{}", slot.index));
-            let name = slot.name.unwrap_or_default();
+            let id = slot
+                .id
+                .clone()
+                .filter(|value| !value.is_empty())
+                .ok_or_else(|| {
+                    protocol_event_error(format!(
+                        "Chat Completions tool call at index {} has no call id",
+                        slot.index
+                    ))
+                })?;
+            let name = slot
+                .name
+                .clone()
+                .filter(|value| !value.is_empty())
+                .ok_or_else(|| {
+                    protocol_event_error(format!(
+                        "Chat Completions tool call at index {} has no function name",
+                        slot.index
+                    ))
+                })?;
             let arguments: Value =
                 agent_contracts::parse_arguments_strict(&slot.arguments).map_err(|error| {
                     AgentError::ModelProtocol {
@@ -601,6 +635,48 @@ mod tests {
         let error = acc.apply(&conflicting_name).unwrap_err();
         assert!(
             error.to_string().contains("bound name `fs_write`"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn chat_finalize_refuses_missing_id_or_name_without_synthesizing() {
+        let mut acc = StreamAccumulator::default();
+        let chunk: WireChunk = serde_json::from_str(
+            r#"{"choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"function":{"arguments":"{\"a\":1}"}}]}}]}"#,
+        )
+        .unwrap();
+        acc.apply(&chunk).unwrap();
+        let error = acc.finalize().unwrap_err();
+        assert!(error.to_string().contains("no call id"), "{error}");
+
+        let mut acc = StreamAccumulator::default();
+        let chunk: WireChunk = serde_json::from_str(
+            r#"{"choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"c1","function":{"arguments":"{\"a\":1}"}}]}}]}"#,
+        )
+        .unwrap();
+        acc.apply(&chunk).unwrap();
+        let error = acc.finalize().unwrap_err();
+        assert!(error.to_string().contains("no function name"), "{error}");
+    }
+
+    #[test]
+    fn chat_one_id_bound_to_two_indexes_is_rejected() {
+        let mut acc = StreamAccumulator::default();
+        let first: WireChunk = serde_json::from_str(
+            r#"{"choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"c1","function":{"name":"fs.read","arguments":""}}]}}]}"#,
+        )
+        .unwrap();
+        acc.apply(&first).unwrap();
+        let second: WireChunk = serde_json::from_str(
+            r#"{"choices":[{"index":0,"delta":{"tool_calls":[{"index":1,"id":"c1","function":{"name":"fs.write","arguments":"{}"}}]}}]}"#,
+        )
+        .unwrap();
+        let error = acc.apply(&second).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("is bound to index 0 and index 1"),
             "{error}"
         );
     }
