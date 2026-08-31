@@ -49,6 +49,23 @@ pub(crate) fn record(
     }
 }
 
+/// Re-append rows that a failed export could not persist. Rows recorded
+/// while the export ran are newer than the returned rows, which sit ahead
+/// in time but are not yet persisted, so the returned rows are spliced back
+/// in front and the bounded cap is re-applied (oldest rows drain first):
+/// an export failure loses no row and the buffer never grows past its cap.
+pub(crate) fn merge_back(state: &mut State, rows: Vec<ContextLifecycleRecord>) {
+    if rows.is_empty() {
+        return;
+    }
+    state.ledger.splice(0..0, rows);
+    let cap = state.ledger_cap.max(1);
+    if state.ledger.len() > cap {
+        let overflow = state.ledger.len() - cap;
+        state.ledger.drain(..overflow);
+    }
+}
+
 /// JSONL-serialize the buffered rows (one record per line) without touching
 /// the engine state; `export_ledger` owns the file write.
 pub(crate) fn encode(rows: &[ContextLifecycleRecord]) -> String {

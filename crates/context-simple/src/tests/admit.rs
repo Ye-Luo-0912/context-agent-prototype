@@ -3708,3 +3708,149 @@ async fn admit_rejects_a_tampered_blob() {
         "the substituted body must never enter the working set"
     );
 }
+
+/// An export that cannot commit its artifact must not lose the taken rows:
+/// they merge back (FIFO, bounded) and a later export persists them.
+#[tokio::test]
+async fn failed_ledger_export_merges_rows_back() {
+    let dir = tempfile::tempdir().unwrap();
+    let engine = SimpleContextEngine::new(SimpleContextConfig {
+        gc_buffer_capacity: 1,
+        context_store_dir: Some(dir.path().to_path_buf()),
+        ..SimpleContextConfig::default()
+    });
+    open_focus(&engine, "service layer").await;
+    engine
+        .ingest(ContextIngress::UserMessage {
+            content: "work on AuthService.rs".into(),
+        })
+        .await
+        .unwrap();
+    engine
+        .ingest(ContextIngress::ToolObservation {
+            facts: None,
+            output: observation_touching("step-0", true, "step: read view", Some("AuthService.rs")),
+            scope_id: None,
+        })
+        .await
+        .unwrap();
+    engine
+        .maintain(ContextMaintenanceTrigger::AfterModel)
+        .await
+        .unwrap();
+    engine.gc().await.unwrap();
+
+    // The commit target is a directory, so the temp -> target rename fails
+    // and the export must report the failure instead of wiping its rows.
+    let target = dir.path().join("lifecycle.jsonl");
+    std::fs::create_dir_all(&target).unwrap();
+    let error = engine
+        .export_ledger(&target)
+        .await
+        .expect_err("a directory target must fail the export");
+    assert!(
+        error.to_string().contains("commit ledger artifact"),
+        "{error}"
+    );
+
+    // The taken rows came back: a later export to a writable path persists
+    // exactly what the failed one took.
+    let retry = dir.path().join("retry.jsonl");
+    let count = engine.export_ledger(&retry).await.unwrap();
+    assert!(
+        count >= 2,
+        "the failed export must not lose rows, got {count}"
+    );
+    let text = std::fs::read_to_string(&retry).unwrap();
+    assert_eq!(
+        text.lines().count(),
+        count,
+        "every persisted row must be one artifact line"
+    );
+}
+
+/// The admit store read runs outside the state lock: while a large blob is
+/// read back, unrelated context work (diagnostics) completes without
+/// waiting for the read. A lock-across-IO regression makes diagnostics
+/// queue behind the whole read, so the timing split disappears.
+#[tokio::test]
+async fn admit_store_read_does_not_block_unrelated_context_work() {
+    let dir = tempfile::tempdir().unwrap();
+    let engine = SimpleContextEngine::new(SimpleContextConfig {
+        gc_buffer_capacity: 1,
+        gc_reactivate_per_pass: 8,
+        context_store_dir: Some(dir.path().to_path_buf()),
+        ..SimpleContextConfig::default()
+    });
+    open_focus(&engine, "service layer").await;
+    engine
+        .ingest(ContextIngress::UserMessage {
+            content: "work on AuthService.rs".into(),
+        })
+        .await
+        .unwrap();
+    // One oversized observation feeds the eviction queue first, so the
+    // buffer overflow externalizes it and reading it back measurably
+    // outlives any lock section.
+    let large = format!(
+        "step 0: fix AuthService.rs {}",
+        "y".repeat(32 * 1024 * 1024)
+    );
+    let observations = [
+        observation_touching("step-0", true, &large, Some("AuthService.rs")),
+        observation_touching("step-1", true, "step: read view", Some("CacheStore.rs")),
+        observation_touching("step-2", true, "step: token cache", Some("TokenCache.rs")),
+    ];
+    for output in observations {
+        engine
+            .ingest(ContextIngress::ToolObservation {
+                facts: None,
+                output,
+                scope_id: None,
+            })
+            .await
+            .unwrap();
+    }
+    engine
+        .maintain(ContextMaintenanceTrigger::AfterModel)
+        .await
+        .unwrap();
+    let gc_report = engine.gc().await.unwrap();
+    assert!(
+        gc_report.externalized >= 1,
+        "overflow must externalize: {gc_report:?}"
+    );
+    let target = gc_report.externalized_ids[0];
+
+    let t0 = std::time::Instant::now();
+    let admit = engine.ingest(ContextIngress::ContextDirective {
+        action: ContextAction::Admit {
+            item_id: target,
+            reason: "the model needs this step again".into(),
+        },
+    });
+    let diag = engine.diagnostics();
+    tokio::pin!(admit);
+    tokio::pin!(diag);
+    let mut diag_done = None;
+    let mut admit_done = None;
+    while diag_done.is_none() || admit_done.is_none() {
+        tokio::select! {
+            outcome = &mut diag, if diag_done.is_none() => {
+                outcome.unwrap();
+                diag_done = Some(t0.elapsed());
+            }
+            outcome = &mut admit, if admit_done.is_none() => {
+                outcome.unwrap();
+                admit_done = Some(t0.elapsed());
+            }
+        }
+    }
+    let diag_done = diag_done.unwrap();
+    let admit_total = admit_done.unwrap();
+    assert!(
+        diag_done < std::time::Duration::from_millis(300) && admit_total > diag_done * 3,
+        "diagnostics must not queue behind the admit store read \
+         (diagnostics {diag_done:?}, admit {admit_total:?})"
+    );
+}

@@ -747,13 +747,26 @@ impl SimpleContextEngine {
         }
         let text = crate::ledger::encode(&rows);
         let tmp = path.with_extension("jsonl.tmp");
-        std::fs::write(&tmp, text).map_err(|error| {
-            agent_contracts::AgentError::Storage(format!("write ledger artifact: {error}"))
-        })?;
-        std::fs::rename(&tmp, path).map_err(|error| {
-            agent_contracts::AgentError::Storage(format!("commit ledger artifact: {error}"))
-        })?;
-        Ok(rows.len())
+        // The temp write and rename run as async IO rather than blocking
+        // calls; when either fails, the taken rows are merged back (FIFO,
+        // bounded) so an export failure loses no row.
+        let outcome = async {
+            tokio::fs::write(&tmp, text).await.map_err(|error| {
+                agent_contracts::AgentError::Storage(format!("write ledger artifact: {error}"))
+            })?;
+            tokio::fs::rename(&tmp, path).await.map_err(|error| {
+                agent_contracts::AgentError::Storage(format!("commit ledger artifact: {error}"))
+            })?;
+            Ok::<usize, agent_contracts::AgentError>(rows.len())
+        }
+        .await;
+        match outcome {
+            Ok(count) => Ok(count),
+            Err(error) => {
+                crate::ledger::merge_back(&mut *self.state.lock().await, rows);
+                Err(error)
+            }
+        }
     }
 }
 
@@ -785,6 +798,11 @@ fn stamp_consumed(
 impl ContextEngine for SimpleContextEngine {
     async fn ingest(&self, ingress: ContextIngress) -> AgentResult<()> {
         let mut distill: Option<DistillJob> = None;
+        // The only lock boundary inside one ingest: a directive may read an
+        // externalized blob with the state lock released. `(action, store id
+        // when a read is planned, captured ownership checksum)`.
+        let mut pending_directive: Option<(ContextAction, Option<ContextItemId>, Option<String>)> =
+            None;
         {
             let mut state = self.state.lock().await;
             state.event_seq += 1;
@@ -1149,10 +1167,13 @@ impl ContextEngine for SimpleContextEngine {
                     );
                 }
                 ContextIngress::ContextDirective { action } => {
-                    // Admit of an externalized item reads its content back from
-                    // the context store. Plan under the lock, read outside it,
-                    // re-apply under a fresh lock — the state lock is never held
-                    // across disk IO (same phases as the GC's store step).
+                    // Admit of an externalized item reads its content back
+                    // from the context store. Plan under this lock, read
+                    // outside it, then re-apply under a fresh lock, so the
+                    // state lock is never held across disk IO (same phases
+                    // as the GC's store step). The apply re-validates the
+                    // plan because a concurrent lifecycle transition may
+                    // have changed the entry while the file was read.
                     let read_plan = match &action {
                         ContextAction::Admit { item_id, .. } => {
                             match crate::directive::plan_admit(&state, *item_id) {
@@ -1166,50 +1187,58 @@ impl ContextEngine for SimpleContextEngine {
                         }
                         _ => None,
                     };
-                    let external_read = match read_plan {
+                    match read_plan {
                         Some(item_id) => {
-                            let dir = crate::store::store_dir(&self.config);
-                            // Admit of an externalized item re-reads the
-                            // owner's blob; the ownership checksum is
-                            // captured on the external entry, so a tampered
-                            // body is a hard read failure, never a silent
-                            // admit of changed content. The state lock is
-                            // already held by this ingest, so the checksum
-                            // is read from the guard already in scope.
                             let expected_checksum = state
                                 .external
                                 .get(item_id)
                                 .and_then(|entry| entry.blob_checksum.clone());
-                            match crate::store::read_item_checked_async(
-                                &dir,
-                                item_id,
-                                expected_checksum.as_deref(),
-                            )
-                            .await
-                            {
-                                Ok(item) => Some((item_id, Some(item))),
-                                Err(crate::store::StoreReadFailure::Missing) => {
-                                    Some((item_id, None))
-                                }
-                                Err(failure) => {
-                                    return Err(AgentError::Context(format!(
-                                        "context store read for {item_id} failed: {}",
-                                        crate::store::read_failure_name(failure)
-                                    )));
-                                }
-                            }
+                            pending_directive = Some((action, Some(item_id), expected_checksum));
                         }
-                        None => None,
-                    };
-                    if let Some(reason) =
-                        apply_directive(&mut state, &self.config, action, external_read)
-                    {
-                        // A quota refused the directive: surface it so the model
-                        // (which believes the hint/lease was granted) learns it
-                        // was not.
-                        return Err(AgentError::InvalidRequest(reason));
+                        None => pending_directive = Some((action, None, None)),
                     }
                 }
+            }
+        }
+
+        // Phase 2: the planned external read runs with the state lock
+        // released, so a slow store read never blocks unrelated context work.
+        let external_read = match &pending_directive {
+            Some((_, Some(item_id), expected_checksum)) => {
+                let dir = crate::store::store_dir(&self.config);
+                // The ownership checksum was captured under the lock; the
+                // blob must still match it, so a tampered body is a hard
+                // read failure, never a silent admit of changed content.
+                match crate::store::read_item_checked_async(
+                    &dir,
+                    *item_id,
+                    expected_checksum.as_deref(),
+                )
+                .await
+                {
+                    Ok(item) => Some((*item_id, Some(item))),
+                    Err(crate::store::StoreReadFailure::Missing) => Some((*item_id, None)),
+                    Err(failure) => {
+                        return Err(AgentError::Context(format!(
+                            "context store read for {item_id} failed: {}",
+                            crate::store::read_failure_name(failure)
+                        )));
+                    }
+                }
+            }
+            _ => None,
+        };
+
+        // Phase 3: re-apply the directive under a fresh lock. The admit
+        // path re-validates its plan here because a concurrent lifecycle
+        // transition may have made the entry terminal while the file read.
+        if let Some((action, _, _)) = pending_directive {
+            let mut state = self.state.lock().await;
+            if let Some(reason) = apply_directive(&mut state, &self.config, action, external_read) {
+                // A quota refused the directive: surface it so the model
+                // (which believes the hint/lease was granted) learns it
+                // was not.
+                return Err(AgentError::InvalidRequest(reason));
             }
         }
 
