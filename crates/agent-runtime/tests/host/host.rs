@@ -1,8 +1,10 @@
 use std::sync::{Arc, Mutex};
 
 use agent_contracts::{AgentResult, CapabilityLifecycle, ToolRisk, ToolSpec};
+use agent_core::CoreAuthorityConfig;
 use agent_runtime::{
-    CapabilityId, ContextModule, ModelModule, Module, ModuleHost, ServiceRegistry, ToolModule,
+    CapabilityId, ContextModule, ModelModule, Module, ModuleHost, RuntimeInstance, RuntimeServices,
+    ServiceRegistry, ToolModule,
 };
 use serde_json::json;
 
@@ -317,4 +319,40 @@ async fn registration_rejects_oversized_or_malformed_tool_schemas() {
         .register(Arc::new(bad))
         .expect_err("a malformed tool name must be rejected");
     assert!(error.to_string().contains("[A-Za-z0-9._:-]"), "{error}");
+}
+
+#[tokio::test]
+async fn host_rejects_a_duplicate_start() {
+    let mut host = ModuleHost::new();
+    host.add_module(Arc::new(ContextModule::new(Arc::new(StubContextEngine))))
+        .unwrap();
+    host.start().await.unwrap();
+
+    let error = host
+        .start()
+        .await
+        .expect_err("a second start must be rejected");
+    assert!(
+        error.to_string().contains("cannot be started twice"),
+        "{error}"
+    );
+    host.stop().await.unwrap();
+}
+
+#[test]
+#[should_panic(expected = "requires the module host to have reached Serving")]
+fn spawn_over_an_unstarted_host_panics() {
+    // A runtime spawned over unstarted modules would observe half-built
+    // state; the composition contract makes this a panic instead of
+    // returning an instance the caller cannot reason about.
+    let host = ModuleHost::new();
+    let services = RuntimeServices::new(
+        CoreAuthorityConfig::default(),
+        Arc::new(StubContextEngine),
+        Arc::new(StubModel),
+        Arc::new(StubTools),
+        Arc::new(StubApproval),
+        None,
+    );
+    let _ = RuntimeInstance::spawn(host, services);
 }

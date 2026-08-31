@@ -209,7 +209,9 @@ async fn instance_with(
         None,
     )
     .with_recovery_surface(recovery_surface);
-    let instance = RuntimeInstance::spawn(ModuleHost::new(), services);
+    let mut host = ModuleHost::new();
+    host.start().await.expect("test module host starts");
+    let instance = RuntimeInstance::spawn(host, services);
     instance.handle().start().await.unwrap();
     instance
 }

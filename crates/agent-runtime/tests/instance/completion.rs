@@ -89,7 +89,9 @@ async fn context_manage_admit_routes_end_to_end() {
         Arc::new(PolicyApprovalGate::read_only()),
         None,
     );
-    let instance = RuntimeInstance::spawn(ModuleHost::new(), services);
+    let mut host = ModuleHost::new();
+    host.start().await.expect("test module host starts");
+    let instance = RuntimeInstance::spawn(host, services);
     instance.start().await.unwrap();
     let mut events = instance.handle().subscribe();
     instance
@@ -268,8 +270,10 @@ async fn completion_failure_never_leaves_a_half_closed_task() {
     // The context side refuses the completion ingest: the transaction must
     // fail before the task authority plane commits, so the task stays
     // Active, the active slot stays, and no outcome record exists.
+    let mut host = ModuleHost::new();
+    host.start().await.expect("test module host starts");
     let instance = RuntimeInstance::spawn(
-        ModuleHost::new(),
+        host,
         RuntimeServices::new(
             CoreAuthorityConfig::default(),
             Arc::new(FailingCompleteEngine),
@@ -318,8 +322,10 @@ async fn completion_audit_gap_marks_recovery_but_keeps_the_commit() {
     // the mandatory typed event cannot be journaled: the runtime must keep
     // the aligned committed state, mark recovery-required and emit the
     // standard recovery signal — never report an un-audited success.
+    let mut host = ModuleHost::new();
+    host.start().await.expect("test module host starts");
     let instance = RuntimeInstance::spawn(
-        ModuleHost::new(),
+        host,
         RuntimeServices::new(
             CoreAuthorityConfig::default(),
             Arc::new(context_simple::SimpleContextEngine::new(

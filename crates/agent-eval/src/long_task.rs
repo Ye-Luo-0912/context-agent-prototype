@@ -468,7 +468,11 @@ async fn spawn_instance(
     )?
     .with_artifact_workspace(Arc::new(workspace))
     .with_project_completion_opportunity(opportunity_switch);
-    let instance = RuntimeInstance::spawn(ModuleHost::new(), services);
+    // An intentional standalone composition: services are built directly
+    // and the host starts with no modules before the runtime is spawned.
+    let mut host = ModuleHost::new();
+    host.start().await?;
+    let instance = RuntimeInstance::spawn(host, services);
     instance.handle().start().await?;
     Ok(instance)
 }

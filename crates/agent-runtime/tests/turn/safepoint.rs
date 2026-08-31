@@ -110,7 +110,9 @@ async fn instance_with(
         None,
     )
     .with_artifact_workspace(Arc::new(workspace));
-    let instance = RuntimeInstance::spawn(ModuleHost::new(), services);
+    let mut host = ModuleHost::new();
+    host.start().await.expect("test module host starts");
+    let instance = RuntimeInstance::spawn(host, services);
     instance.handle().start().await.unwrap();
     instance
 }
@@ -588,7 +590,9 @@ async fn completion_instance_with_context(
         None,
     )
     .with_artifact_workspace(Arc::new(workspace));
-    let instance = RuntimeInstance::spawn(ModuleHost::new(), services);
+    let mut host = ModuleHost::new();
+    host.start().await.expect("test module host starts");
+    let instance = RuntimeInstance::spawn(host, services);
     instance.handle().start().await.unwrap();
     instance
 }

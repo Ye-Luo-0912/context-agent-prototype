@@ -88,6 +88,10 @@ pub struct EvalSummary {
     pub passed: bool,
     pub final_answer: String,
     pub note: String,
+    /// False when the harness composed a narrower runtime than the product
+    /// root (permissive approval, no tools, in-memory baseline engines);
+    /// such a run is never product-equivalent.
+    pub is_product_equivalent: bool,
 }
 
 impl EvalSummary {
@@ -100,6 +104,7 @@ impl EvalSummary {
             passed: false,
             final_answer: String::new(),
             note: String::new(),
+            is_product_equivalent: !EVALUATION_COMPOSITION_IS_NOT_PRODUCT_EQUIVALENT,
         }
     }
 }
@@ -193,6 +198,13 @@ fn build_model_with_timeout(timeout: Duration) -> anyhow::Result<Arc<dyn ModelTr
             .with_observer(Arc::new(JsonlRetryObserver::from_env())),
     ))
 }
+
+/// The headless evaluation harness composes a deliberately narrower runtime
+/// than the product root: permissive approval, no tool dispatcher, and
+/// in-memory baseline context engines. It produces measurements, not a
+/// product wiring, so this label stays explicit: the composition must never
+/// be presented as product-equivalent.
+pub(crate) const EVALUATION_COMPOSITION_IS_NOT_PRODUCT_EQUIVALENT: bool = true;
 
 /// Run one engine through the constraint-retention script and measure the
 /// outcome. `prompts` is the turn script; `verify` scores the final answer.
@@ -314,6 +326,9 @@ pub fn render_comparison(results: &[EvalSummary]) -> String {
             let preview: String = result.final_answer.chars().take(160).collect();
             out.push_str(&format!("    final: {preview}\n"));
         }
+        if !result.is_product_equivalent {
+            out.push_str("    (non-product-equivalent harness composition)\n");
+        }
     }
     out
 }
@@ -374,6 +389,18 @@ mod tests {
             "a full artifact must not grow"
         );
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn evaluation_composition_labels_itself_non_product_equivalent() {
+        let summary = EvalSummary::new("append");
+        // Guards the label against refactors that silently drop it: the
+        // harness composition is narrower than the product root and every
+        // measurement must stay visibly marked as such.
+        assert!(
+            !summary.is_product_equivalent,
+            "the harness composition is not product-equivalent"
+        );
     }
 
     #[test]

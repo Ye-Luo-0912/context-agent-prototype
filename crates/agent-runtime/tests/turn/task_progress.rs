@@ -100,7 +100,7 @@ impl ModelTransport for ProgressProposalModel {
     }
 }
 
-fn progress_instance(
+async fn progress_instance(
     arguments: serde_json::Value,
 ) -> (
     RuntimeInstance,
@@ -118,7 +118,9 @@ fn progress_instance(
         Arc::new(PolicyApprovalGate::read_only()),
         None,
     );
-    let instance = RuntimeInstance::spawn(ModuleHost::new(), services);
+    let mut host = ModuleHost::new();
+    host.start().await.expect("test module host starts");
+    let instance = RuntimeInstance::spawn(host, services);
     let handle = instance.handle();
     let events = handle.subscribe();
     (instance, events)
@@ -186,7 +188,8 @@ async fn progress_proposal_applies_and_orders_its_events() {
         "current_interpretation": "retry policy spans config, errors and execution",
         "plan_progress": ["read the runner"],
         "next_action": "add the fake-sleeper unit test",
-    }));
+    }))
+    .await;
     let observations = run_progress_turn(&instance, events).await;
 
     // The audit row precedes the typed CAS outcome, and eval can prove
@@ -228,7 +231,8 @@ async fn stale_base_revision_refuses_without_changing_task_state() {
     let (instance, events) = progress_instance(json!({
         "base_anchor_revision": 99,
         "next_action": "written against a stale anchor",
-    }));
+    }))
+    .await;
     let observations = run_progress_turn(&instance, events).await;
 
     let refusal = observations

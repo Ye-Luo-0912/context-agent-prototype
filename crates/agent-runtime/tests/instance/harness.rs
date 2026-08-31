@@ -33,7 +33,9 @@ pub(crate) async fn simple_instance() -> (RuntimeInstance, Arc<context_simple::S
         Arc::new(PolicyApprovalGate::read_only()),
         None,
     );
-    let instance = RuntimeInstance::spawn(ModuleHost::new(), services);
+    let mut host = ModuleHost::new();
+    host.start().await.expect("test module host starts");
+    let instance = RuntimeInstance::spawn(host, services);
     instance.start().await.unwrap();
     (instance, context)
 }
@@ -58,7 +60,9 @@ pub(crate) async fn durable_simple_instance(
         AuthorityRecoveryServices::new(operation_journal, None),
     )
     .unwrap();
-    let instance = RuntimeInstance::spawn(ModuleHost::new(), services);
+    let mut host = ModuleHost::new();
+    host.start().await.expect("test module host starts");
+    let instance = RuntimeInstance::spawn(host, services);
     instance.start().await.unwrap();
     (instance, context)
 }

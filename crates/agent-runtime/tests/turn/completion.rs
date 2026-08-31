@@ -425,7 +425,9 @@ async fn run_model_visible_completion_refusal(
         Arc::new(PolicyApprovalGate::read_only()),
         None,
     );
-    let instance = RuntimeInstance::spawn(ModuleHost::new(), services);
+    let mut host = ModuleHost::new();
+    host.start().await.expect("test module host starts");
+    let instance = RuntimeInstance::spawn(host, services);
     let handle = instance.handle();
     let mut events = handle.subscribe();
     handle.start().await.unwrap();
@@ -557,7 +559,9 @@ async fn task_complete_proposal_commits_the_typed_record_at_turn_end() {
         None,
     )
     .with_artifact_workspace(workspace);
-    let instance = RuntimeInstance::spawn(ModuleHost::new(), services);
+    let mut host = ModuleHost::new();
+    host.start().await.expect("test module host starts");
+    let instance = RuntimeInstance::spawn(host, services);
     let handle = instance.handle();
     let mut events = handle.subscribe();
     handle.start().await.unwrap();
@@ -665,7 +669,9 @@ async fn deferred_completion_failure_rolls_back_context_and_persists_resume_fact
         None,
     )
     .with_artifact_workspace(workspace);
-    let instance = RuntimeInstance::spawn(ModuleHost::new(), services);
+    let mut host = ModuleHost::new();
+    host.start().await.expect("test module host starts");
+    let instance = RuntimeInstance::spawn(host, services);
     let handle = instance.handle();
     let mut events = handle.subscribe();
     handle.start().await.unwrap();
@@ -746,7 +752,9 @@ async fn post_commit_audit_failure_never_projects_a_pending_completion_failure()
         Some(Arc::new(FailTaskCompletedJournal)),
     )
     .with_artifact_workspace(workspace);
-    let instance = RuntimeInstance::spawn(ModuleHost::new(), services);
+    let mut host = ModuleHost::new();
+    host.start().await.expect("test module host starts");
+    let instance = RuntimeInstance::spawn(host, services);
     let handle = instance.handle();
     let mut events = handle.subscribe();
     handle.start().await.unwrap();
@@ -875,7 +883,9 @@ async fn task_complete_waits_for_model_when_a_sibling_action_failed() {
         Arc::new(PolicyApprovalGate::read_only()),
         None,
     );
-    let instance = RuntimeInstance::spawn(ModuleHost::new(), services);
+    let mut host = ModuleHost::new();
+    host.start().await.expect("test module host starts");
+    let instance = RuntimeInstance::spawn(host, services);
     let handle = instance.handle();
     let mut events = handle.subscribe();
     handle.start().await.unwrap();
@@ -972,7 +982,9 @@ async fn final_assistant_response_is_persisted_in_full_before_contextitem_trunca
         None,
     )
     .with_artifact_workspace(workspace.clone());
-    let instance = RuntimeInstance::spawn(ModuleHost::new(), services);
+    let mut host = ModuleHost::new();
+    host.start().await.expect("test module host starts");
+    let instance = RuntimeInstance::spawn(host, services);
     let handle = instance.handle();
     handle.start().await.unwrap();
     let mut events = handle.subscribe();
@@ -1104,7 +1116,9 @@ async fn completion_record_attaches_the_raw_final_response_artifact() {
         None,
     )
     .with_artifact_workspace(workspace.clone());
-    let instance = RuntimeInstance::spawn(ModuleHost::new(), services);
+    let mut host = ModuleHost::new();
+    host.start().await.expect("test module host starts");
+    let instance = RuntimeInstance::spawn(host, services);
     let handle = instance.handle();
     handle.start().await.unwrap();
     declare_completion_acceptance(handle, "finish the work").await;
@@ -1198,7 +1212,9 @@ async fn completion_proposal_cannot_attach_a_cross_run_artifact() {
         None,
     )
     .with_artifact_workspace(workspace);
-    let instance = RuntimeInstance::spawn(ModuleHost::new(), services);
+    let mut host = ModuleHost::new();
+    host.start().await.expect("test module host starts");
+    let instance = RuntimeInstance::spawn(host, services);
     let handle = instance.handle();
     handle.start().await.unwrap();
     handle.user_message("finish".into()).await.unwrap();
@@ -1380,7 +1396,9 @@ async fn completion_artifacts_keep_raw_evidence_first_and_cap_the_merged_set() {
         None,
     )
     .with_artifact_workspace(workspace);
-    let instance = RuntimeInstance::spawn(ModuleHost::new(), services);
+    let mut host = ModuleHost::new();
+    host.start().await.expect("test module host starts");
+    let instance = RuntimeInstance::spawn(host, services);
     let handle = instance.handle();
     let mut events = handle.subscribe();
     instance.start().await.unwrap();
@@ -1424,7 +1442,9 @@ async fn completion_artifacts_are_normalized_and_stably_deduplicated() {
         None,
     )
     .with_artifact_workspace(workspace);
-    let instance = RuntimeInstance::spawn(ModuleHost::new(), services);
+    let mut host = ModuleHost::new();
+    host.start().await.expect("test module host starts");
+    let instance = RuntimeInstance::spawn(host, services);
     let handle = instance.handle();
     let mut events = handle.subscribe();
     instance.start().await.unwrap();
@@ -1460,7 +1480,9 @@ async fn completion_safe_point_rejects_a_current_run_directory_reference() {
         None,
     )
     .with_artifact_workspace(workspace);
-    let instance = RuntimeInstance::spawn(ModuleHost::new(), services);
+    let mut host = ModuleHost::new();
+    host.start().await.expect("test module host starts");
+    let instance = RuntimeInstance::spawn(host, services);
     instance.start().await.unwrap();
     instance
         .handle()
@@ -1493,7 +1515,9 @@ async fn focus_switch_clears_previous_tasks_raw_assistant_evidence() {
         None,
     )
     .with_artifact_workspace(workspace);
-    let instance = RuntimeInstance::spawn(ModuleHost::new(), services);
+    let mut host = ModuleHost::new();
+    host.start().await.expect("test module host starts");
+    let instance = RuntimeInstance::spawn(host, services);
     let handle = instance.handle();
     let mut events = handle.subscribe();
     instance.start().await.unwrap();
@@ -1616,7 +1640,9 @@ async fn duplicate_completions_in_one_batch_commit_exactly_one_record() {
         rounds: AtomicUsize::new(0),
     });
     let services = completion_services(&dir, model.clone()).await;
-    let instance = RuntimeInstance::spawn(ModuleHost::new(), services);
+    let mut host = ModuleHost::new();
+    host.start().await.expect("test module host starts");
+    let instance = RuntimeInstance::spawn(host, services);
     let handle = instance.handle();
     let mut events = handle.subscribe();
     instance.start().await.unwrap();
@@ -1697,7 +1723,9 @@ async fn an_accepted_completion_leaves_a_clean_turn_for_queued_input() {
         rounds: AtomicUsize::new(0),
     });
     let services = completion_services(&dir, model.clone()).await;
-    let instance = RuntimeInstance::spawn(ModuleHost::new(), services);
+    let mut host = ModuleHost::new();
+    host.start().await.expect("test module host starts");
+    let instance = RuntimeInstance::spawn(host, services);
     let handle = instance.handle();
     let mut events = handle.subscribe();
     instance.start().await.unwrap();
@@ -1872,7 +1900,9 @@ async fn unloaded_surface_attempts_are_visible_but_never_completion_debt() {
         Arc::new(PolicyApprovalGate::read_only()),
         None,
     );
-    let instance = RuntimeInstance::spawn(ModuleHost::new(), services);
+    let mut host = ModuleHost::new();
+    host.start().await.expect("test module host starts");
+    let instance = RuntimeInstance::spawn(host, services);
     let handle = instance.handle();
     let mut events = handle.subscribe();
     handle.start().await.unwrap();
@@ -2042,7 +2072,9 @@ async fn consecutive_refusals_against_the_same_basis_accrue_durably() {
         Arc::new(PolicyApprovalGate::read_only()),
         None,
     );
-    let instance = RuntimeInstance::spawn(ModuleHost::new(), services);
+    let mut host = ModuleHost::new();
+    host.start().await.expect("test module host starts");
+    let instance = RuntimeInstance::spawn(host, services);
     let handle = instance.handle();
     let mut events = handle.subscribe();
     handle.start().await.unwrap();
@@ -2316,7 +2348,9 @@ async fn run_proof_refresh_scenario(
     )
     .with_proof_verifier(verifier.clone())
     .with_project_proof_refresh(true);
-    let instance = RuntimeInstance::spawn(ModuleHost::new(), services);
+    let mut host = ModuleHost::new();
+    host.start().await.expect("test module host starts");
+    let instance = RuntimeInstance::spawn(host, services);
     let handle = instance.handle();
     let mut events = handle.subscribe();
     handle.start().await.unwrap();

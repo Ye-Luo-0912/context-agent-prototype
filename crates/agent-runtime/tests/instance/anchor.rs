@@ -95,7 +95,9 @@ async fn autonomous_anchor_patch_applies_without_approval() {
         Arc::new(PolicyApprovalGate::read_only()),
         None,
     );
-    let instance = RuntimeInstance::spawn(ModuleHost::new(), services);
+    let mut host = ModuleHost::new();
+    host.start().await.expect("test module host starts");
+    let instance = RuntimeInstance::spawn(host, services);
     instance.start().await.unwrap();
     let mut events = instance.handle().subscribe();
     instance
@@ -154,7 +156,9 @@ async fn boundary_anchor_patch_clears_approval_and_is_labeled_boundary() {
         Arc::new(PolicyApprovalGate::permissive()),
         None,
     );
-    let instance = RuntimeInstance::spawn(ModuleHost::new(), services);
+    let mut host = ModuleHost::new();
+    host.start().await.expect("test module host starts");
+    let instance = RuntimeInstance::spawn(host, services);
     instance.start().await.unwrap();
     let mut events = instance.handle().subscribe();
     instance
@@ -213,7 +217,9 @@ async fn boundary_anchor_patch_denied_leaves_the_anchor_untouched() {
         Arc::new(PolicyApprovalGate::read_only()),
         None,
     );
-    let instance = RuntimeInstance::spawn(ModuleHost::new(), services);
+    let mut host = ModuleHost::new();
+    host.start().await.expect("test module host starts");
+    let instance = RuntimeInstance::spawn(host, services);
     instance.start().await.unwrap();
     let mut events = instance.handle().subscribe();
     instance

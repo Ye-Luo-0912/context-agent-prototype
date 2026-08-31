@@ -37,12 +37,18 @@ pub struct RuntimeInstance {
 }
 
 impl RuntimeInstance {
-    /// Spawn the actor over the resolved services. The host must already be
-    /// started; the services may come from its registry
+    /// Spawn the actor over the resolved services. The host must already
+    /// have reached Serving; the services may come from its registry
     /// (`RuntimeServices::from_registry`) or be built directly. The kernel
     /// is derived from the services inside this seam — a composition root
-    /// never constructs the authority facade itself.
+    /// never constructs the authority facade itself. Spawning over an
+    /// unstarted host is a composition bug and panics rather than leaking
+    /// a runtime over half-built modules.
     pub fn spawn(host: ModuleHost, services: RuntimeServices) -> Self {
+        assert!(
+            host.is_started(),
+            "RuntimeInstance::spawn requires the module host to have reached Serving"
+        );
         // Safe-point checkpoints must capture the full plane set: hand the
         // actor a read-only registry handle unless the composition root
         // already wired one. The host stays the registration authority;

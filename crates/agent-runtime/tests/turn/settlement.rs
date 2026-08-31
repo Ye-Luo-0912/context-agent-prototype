@@ -511,7 +511,9 @@ async fn settlement_instance_with_journal(
     .with_artifact_workspace(workspace)
     .with_project_task_progress(true)
     .with_project_settlement(project_settlement);
-    let instance = RuntimeInstance::spawn(ModuleHost::new(), services);
+    let mut host = ModuleHost::new();
+    host.start().await.expect("test module host starts");
+    let instance = RuntimeInstance::spawn(host, services);
     let collector = RuntimeEventEnvelopeCollector {
         events: instance.handle().subscribe(),
     };

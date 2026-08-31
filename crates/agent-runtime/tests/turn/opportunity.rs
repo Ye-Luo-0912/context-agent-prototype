@@ -104,7 +104,9 @@ async fn instance_with(dir: &std::path::Path, opportunity_switch: bool) -> Runti
     } else {
         services
     };
-    let instance = RuntimeInstance::spawn(ModuleHost::new(), services);
+    let mut host = ModuleHost::new();
+    host.start().await.expect("test module host starts");
+    let instance = RuntimeInstance::spawn(host, services);
     instance.handle().start().await.unwrap();
     instance
 }

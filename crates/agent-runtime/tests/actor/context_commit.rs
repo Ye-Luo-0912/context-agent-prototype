@@ -296,7 +296,7 @@ async fn user_input_maintained_audit_failure_fences_the_runtime() {
 
 /// Wire an instance whose service registry sees a live capability so the
 /// safe-point capture handshake has a real generation plane.
-fn instance_with_registry(
+async fn instance_with_registry(
     engine: Arc<BodyTrackingEngine>,
     registry: Arc<CapabilityRegistry>,
 ) -> RuntimeInstance {
@@ -315,6 +315,7 @@ fn instance_with_registry(
         Arc::new(PolicyApprovalGate::read_only()),
         None,
     );
+    host.start().await.expect("test module host starts");
     RuntimeInstance::spawn(host, services)
 }
 
@@ -328,7 +329,7 @@ async fn checkpoint_assembly_runs_checkpoint_maintenance_once() {
     registry
         .register(Arc::new(TestCapability::new("demo")))
         .expect("capability registers");
-    let instance = instance_with_registry(engine.clone(), registry.clone());
+    let instance = instance_with_registry(engine.clone(), registry.clone()).await;
     instance.start().await.unwrap();
 
     // Flip the surface mid-capture: the first attempt observes a stale

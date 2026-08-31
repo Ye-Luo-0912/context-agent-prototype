@@ -277,12 +277,13 @@ async fn restore_rejects_context_focus_that_disagrees_with_task_authority() {
 
 #[tokio::test]
 async fn rejected_actor_restore_does_not_change_capability_flags() {
-    let host = ModuleHost::new();
+    let mut host = ModuleHost::new();
     host.register_capability(Arc::new(CheckpointCapability::new()))
         .unwrap();
     let registry = host.capability_registry();
     registry.enable("checkpoint-capability").await.unwrap();
     registry.load_tool("checkpoint.tool").unwrap();
+    host.start().await.unwrap();
 
     let instance = RuntimeInstance::spawn(host, services());
     instance.start().await.unwrap();
@@ -349,8 +350,10 @@ async fn concurrent_full_restores_are_serialized_across_all_state_planes() {
     let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
     let (release_tx, release_rx) = tokio::sync::oneshot::channel();
     let journal = Arc::new(BlockingFirstRestoreJournal::new(entered_tx, release_rx));
+    let mut host = ModuleHost::new();
+    host.start().await.unwrap();
     let instance = Arc::new(RuntimeInstance::spawn(
-        ModuleHost::new(),
+        host,
         RuntimeServices::new(
             CoreAuthorityConfig::default(),
             Arc::new(TestContextEngine),
@@ -533,8 +536,10 @@ async fn restore_audit_failure_demands_recovery_and_fences_mutation() {
     let mut checkpoint = source.checkpoint().await.unwrap();
 
     // The actor with a journal that refuses the restore-commit record.
+    let mut host = ModuleHost::new();
+    host.start().await.unwrap();
     let failing = RuntimeInstance::spawn(
-        ModuleHost::new(),
+        host,
         RuntimeServices::new(
             CoreAuthorityConfig::default(),
             // The real reference engine: restore must pass the

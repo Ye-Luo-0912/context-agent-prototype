@@ -166,6 +166,13 @@ impl ModuleHost {
         self.capabilities.register(capability)
     }
 
+    /// Whether the host reached the serving state via [`Self::start`].
+    /// [`RuntimeInstance::spawn`] proves this before it will accept a host,
+    /// so a runtime can never be spawned over unstarted modules.
+    pub fn is_started(&self) -> bool {
+        self.started
+    }
+
     /// Register a module and publish its capabilities. Rejects duplicate
     /// capability claims up front so composition fails fast.
     pub fn add_module(&mut self, module: Arc<dyn Module>) -> AgentResult<()> {
@@ -191,8 +198,15 @@ impl ModuleHost {
     /// capabilities. Transactional: if any module or capability fails to
     /// start, everything that already started is stopped again (best
     /// effort) and all errors — the original failure plus every rollback
-    /// failure — are aggregated into one result.
+    /// failure — are aggregated into one result. A host that already
+    /// reached Serving rejects a duplicate start instead of restarting
+    /// every module under the same identity.
     pub async fn start(&mut self) -> AgentResult<()> {
+        if self.started {
+            return Err(AgentError::InvalidRequest(
+                "the module host cannot be started twice".into(),
+            ));
+        }
         let mut started: Vec<Arc<dyn Module>> = Vec::new();
         for module in &self.modules {
             if let Err(first) = module.start().await {

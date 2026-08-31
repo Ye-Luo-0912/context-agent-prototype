@@ -18,7 +18,9 @@ async fn checkpoint_restore_rebuilds_surface_from_suspended_task_requirements() 
         Arc::new(PolicyApprovalGate::read_only()),
         None,
     );
-    let instance = RuntimeInstance::spawn(ModuleHost::new(), services);
+    let mut host = ModuleHost::new();
+    host.start().await.expect("test module host starts");
+    let instance = RuntimeInstance::spawn(host, services);
     let handle = instance.handle();
     let mut surface_events = handle.subscribe();
     let mut turn_events = handle.subscribe();
@@ -102,7 +104,9 @@ async fn live_restore_cas_high_water_survives_a_checkpoint_that_removes_the_task
         Arc::new(PolicyApprovalGate::read_only()),
         None,
     );
-    let instance = RuntimeInstance::spawn(ModuleHost::new(), services);
+    let mut host = ModuleHost::new();
+    host.start().await.expect("test module host starts");
+    let instance = RuntimeInstance::spawn(host, services);
     let handle = instance.handle();
     handle.start().await.unwrap();
     let empty_checkpoint = instance.checkpoint().await.unwrap();

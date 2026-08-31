@@ -341,17 +341,11 @@ pub async fn compose(config: ComposeConfig) -> anyhow::Result<ComposedRuntime> {
     if let Some(artifact_store) = artifact_store {
         host.add_module(Arc::new(ArtifactModule::new(artifact_store)))?;
     }
-    host.start().await?;
 
-    // Startup store reconcile, part of the start transaction: converge the
-    // on-disk blob directory with the external map before the actor serves
-    // (crash-recovery authority over formal blobs; a missing store dir
-    // reconciles as empty). A failure fails the composition closed.
-    host.registry().context_service()?.reconcile_store().await?;
-
-    // The composition seam: every service the run needs is resolved from
-    // the host's typed registry and handed to the runtime as one
-    // `RuntimeServices`; the kernel is derived inside the runtime.
+    // All fallible preparation runs before any module starts, so a
+    // preparation failure can never leave a serving child or a half-built
+    // runtime behind: the host is started only after the journal, broker,
+    // authority and service set are fully constructed.
     let operation_journal = Arc::new(
         FileOperationJournal::open(
             workspace
@@ -400,6 +394,25 @@ pub async fn compose(config: ComposeConfig) -> anyhow::Result<ComposedRuntime> {
         services = services.with_proof_verifier(Arc::new(HostProofVerifier::new(runner)));
         services = services.with_project_proof_refresh(true);
     }
+
+    // Everything fallible is constructed; only the module start transaction
+    // and the startup store reconcile remain, and both are rolled back
+    // closed when they fail.
+    host.start().await?;
+    if let Err(error) = host.registry().context_service()?.reconcile_store().await {
+        // The store reconcile races nothing yet (the actor is not spawned),
+        // but it is the last post-start seam: stop every started module
+        // before reporting the failure so no serving child survives.
+        let stop_error = host.stop().await.err();
+        let message = match stop_error {
+            Some(stop_error) => format!(
+                "startup store reconcile failed: {error}; module stop also failed: {stop_error}"
+            ),
+            None => format!("startup store reconcile failed: {error}"),
+        };
+        return Err(anyhow::anyhow!(message));
+    }
+
     let instance = RuntimeInstance::spawn(host, services);
     Ok(ComposedRuntime {
         workspace,
@@ -529,5 +542,104 @@ mod tests {
         assert!(outcome.ok, "{}", outcome.summary);
         assert!(!outcome.verification_identity.is_empty());
         assert_eq!(outcome.verification_identity.len(), 64);
+    }
+
+    /// A context engine that fails the startup store reconcile — the single
+    /// post-start seam in `compose` — so a test can prove the rollback guard
+    /// stops every module instead of handing out a half-built runtime.
+    struct ReconcileFaultEngine {
+        inner: Arc<SimpleContextEngine>,
+    }
+
+    #[async_trait::async_trait]
+    impl ContextEngine for ReconcileFaultEngine {
+        async fn ingest(&self, ingress: agent_contracts::ContextIngress) -> AgentResult<()> {
+            self.inner.ingest(ingress).await
+        }
+        async fn maintain(
+            &self,
+            trigger: agent_contracts::ContextMaintenanceTrigger,
+        ) -> AgentResult<agent_contracts::ContextMaintenanceReport> {
+            self.inner.maintain(trigger).await
+        }
+        async fn materialize(
+            &self,
+            query: agent_contracts::ContextQuery,
+        ) -> AgentResult<agent_contracts::MaterializedContext> {
+            self.inner.materialize(query).await
+        }
+        async fn open_scope(
+            &self,
+            kind: agent_contracts::ScopeKind,
+            parent: Option<agent_contracts::ScopeId>,
+        ) -> AgentResult<agent_contracts::ScopeId> {
+            self.inner.open_scope(kind, parent).await
+        }
+        async fn close_scope(
+            &self,
+            scope_id: agent_contracts::ScopeId,
+        ) -> AgentResult<Vec<agent_contracts::ContextStateTransition>> {
+            self.inner.close_scope(scope_id).await
+        }
+        async fn diagnostics(&self) -> AgentResult<agent_contracts::ContextDiagnostics> {
+            self.inner.diagnostics().await
+        }
+        async fn inspect(
+            &self,
+            limit: usize,
+        ) -> AgentResult<Vec<agent_contracts::ContextItemSummary>> {
+            self.inner.inspect(limit).await
+        }
+        async fn checkpoint(&self) -> AgentResult<serde_json::Value> {
+            self.inner.checkpoint().await
+        }
+        async fn restore(&self, data: serde_json::Value) -> AgentResult<()> {
+            self.inner.restore(data).await
+        }
+        async fn reconcile_store(&self) -> AgentResult<agent_contracts::StoreReconcileReport> {
+            Err(agent_contracts::AgentError::Internal(
+                "simulated startup store reconcile failure".into(),
+            ))
+        }
+    }
+
+    /// The only post-start seam rolls every started module back and returns
+    /// an error: a failed composition never yields an instance.
+    #[tokio::test]
+    async fn failed_post_start_seam_rolls_back_and_leaves_no_runtime() {
+        let dir = tempfile::tempdir().unwrap();
+        let workspace = Workspace::open(dir.path()).await.unwrap();
+        let mut config = compose_config(workspace, None, false);
+        config.context_engine = Arc::new(ReconcileFaultEngine {
+            inner: Arc::new(SimpleContextEngine::new(SimpleContextConfig::default())),
+        });
+        let error = match compose(config).await {
+            Ok(_) => panic!("a failed startup reconcile must fail the composition"),
+            Err(error) => error,
+        };
+        assert!(
+            error.to_string().contains("startup store reconcile failed"),
+            "{error}"
+        );
+    }
+
+    /// Every fallible preparation step runs before the host starts, so a
+    /// journal that cannot be opened locks the composition down without any
+    /// module reaching the serving state.
+    #[tokio::test]
+    async fn locked_effect_journal_fails_before_any_module_starts() {
+        let dir = tempfile::tempdir().unwrap();
+        let workspace = Workspace::open(dir.path()).await.unwrap();
+        let journal_path = dir.path().join("journal").join("effect-reservations.jsonl");
+        // Hold the exclusive journal lock so the composition's own open must
+        // fail closed before any module starts.
+        let _holder = agent_core::ReservationJournal::open(&journal_path).unwrap();
+        let mut config = compose_config(workspace, None, false);
+        config.effect_reservation_journal = Some(journal_path);
+        let error = match compose(config).await {
+            Ok(_) => panic!("a locked effect journal must fail the composition"),
+            Err(error) => error,
+        };
+        assert!(!error.to_string().is_empty());
     }
 }
