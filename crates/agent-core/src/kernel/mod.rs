@@ -1038,6 +1038,30 @@ impl CoreAuthority {
             )));
         };
 
+        // The immutable round surface carries the compiled bounded schema
+        // for every admitted tool (the surface builder rejects tools whose
+        // schema does not compile, so a production snapshot never lists a
+        // spec without a profile). Arguments are validated here, before
+        // approval and dispatch: a mismatch is a typed no-dispatch result
+        // that never reaches the approval gate, the effect journal or
+        // completion debt. Snapshots with no profile (legacy formats and
+        // hand-built test fixtures) keep the previous behavior.
+        if let Some(profile) = surface.schema_profiles.get(&call.name)
+            && let Some(violation) = profile.validate(&call.arguments).err()
+        {
+            let message = schema_mismatch_message(&call, &violation);
+            if let Err(error) = self
+                .operations
+                .finish_refused(identity.operation_id, &message)
+            {
+                return refused(ToolOutcome::Value(tool_error_output(
+                    &call,
+                    error.to_string(),
+                )));
+            }
+            return refused(ToolOutcome::Value(schema_mismatch_output(&call, violation)));
+        }
+
         let verdict = self.approval.authorize(&call, &spec, &cancel).await;
         let legacy_allowed = matches!(verdict, ApprovalVerdict::Allowed);
 
@@ -1661,6 +1685,41 @@ fn surface_unavailable_output(call: &ToolCall, message: String) -> ToolOutput {
         message.clone(),
         format!("tool error: {message}"),
         serde_json::json!({"executed": false}),
+    )
+}
+
+/// Typed no-dispatch result for arguments that fail the compiled round
+/// surface schema. Carries the JSON pointer and the expected/observed
+/// shapes so the model can repair the next call instead of guessing.
+fn schema_mismatch_output(
+    call: &ToolCall,
+    violation: agent_contracts::SchemaViolation,
+) -> ToolOutput {
+    let message = schema_mismatch_message(call, &violation);
+    agent_contracts::tool_failure_output(
+        call.id.clone(),
+        call.name.clone(),
+        agent_contracts::ToolFailureClass::SchemaMismatch,
+        message.clone(),
+        format!("tool error: {message}"),
+        serde_json::json!({
+            "executed": false,
+            "schema": {
+                "pointer": violation.pointer,
+                "expected": violation.expected,
+                "actual": violation.actual,
+            }
+        }),
+    )
+}
+
+fn schema_mismatch_message(
+    call: &ToolCall,
+    violation: &agent_contracts::SchemaViolation,
+) -> String {
+    format!(
+        "tool dispatch rejected: arguments do not match the {} schema ({}): expected {}, found {}",
+        call.name, violation.pointer, violation.expected, violation.actual
     )
 }
 

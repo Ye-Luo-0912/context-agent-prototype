@@ -18,6 +18,7 @@ pub mod operation;
 pub mod plugin;
 pub mod runtime;
 pub mod runtime_facts;
+pub mod schema_profile;
 pub mod search;
 pub mod tokens;
 pub mod tool;
@@ -45,6 +46,7 @@ pub use operation::*;
 pub use plugin::*;
 pub use runtime::*;
 pub use runtime_facts::*;
+pub use schema_profile::*;
 pub use search::{
     ScoredMatch, SearchCandidates, SearchIncompleteReason, TextIndex, TokenRarity, tokenize,
 };

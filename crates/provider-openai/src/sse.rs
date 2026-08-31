@@ -348,15 +348,16 @@ impl StreamAccumulator {
         for slot in self.tool_calls {
             let id = slot.id.unwrap_or_else(|| format!("call-{}", slot.index));
             let name = slot.name.unwrap_or_default();
-            let arguments: Value = serde_json::from_str(&slot.arguments).map_err(|error| {
-                AgentError::ModelProtocol {
-                    kind: ModelProtocolErrorKind::MalformedToolCall,
-                    message: format!(
-                        "Chat Completions tool call at index {} has incomplete or invalid arguments: {error}",
-                        slot.index
-                    ),
-                }
-            })?;
+            let arguments: Value =
+                agent_contracts::parse_arguments_strict(&slot.arguments).map_err(|error| {
+                    AgentError::ModelProtocol {
+                        kind: ModelProtocolErrorKind::MalformedToolCall,
+                        message: format!(
+                            "Chat Completions tool call at index {} has incomplete or invalid arguments: {error}",
+                            slot.index
+                        ),
+                    }
+                })?;
             tool_calls.push(ToolCall {
                 id,
                 name,

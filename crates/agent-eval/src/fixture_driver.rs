@@ -1967,8 +1967,8 @@ mod tests {
                             "path": "src/settings.cfg",
                             "base_revision": revision,
                             "hunks": [
-                                {"old": "mode=legacy", "new": "mode=strict"},
-                                {"old": "timeout=30", "new": "timeout=45"}
+                                {"op": "replace", "old": "mode=legacy", "new": "mode=strict"},
+                                {"op": "replace", "old": "timeout=30", "new": "timeout=45"}
                             ]
                         }]
                     }),

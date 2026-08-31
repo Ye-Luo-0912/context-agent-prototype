@@ -365,13 +365,14 @@ fn apply_terminal_arguments(
 /// The assembled deltas parse, or the authoritative terminal snapshot does,
 /// or the call is a typed failure. The terminal snapshot only rescues an
 /// assembly the provider itself cut short; it never overrides live deltas.
-fn assemble_arguments(assembled: &str, terminal: Option<&str>) -> Result<Value, serde_json::Error> {
-    if let Ok(value) = serde_json::from_str(assembled) {
+/// Parsing is strict: duplicate object keys and unbounded documents fail.
+fn assemble_arguments(assembled: &str, terminal: Option<&str>) -> Result<Value, String> {
+    if let Ok(value) = agent_contracts::parse_arguments_strict(assembled) {
         return Ok(value);
     }
     match terminal {
-        Some(snapshot) if !snapshot.is_empty() => serde_json::from_str(snapshot),
-        _ => serde_json::from_str(assembled),
+        Some(snapshot) if !snapshot.is_empty() => agent_contracts::parse_arguments_strict(snapshot),
+        _ => agent_contracts::parse_arguments_strict(assembled),
     }
 }
 

@@ -1037,6 +1037,7 @@ impl BuiltinToolDispatcher {
 mod tests {
     use super::*;
     use agent_contracts::CONTEXT_MANAGE;
+    use agent_contracts::SchemaProfile;
     use agent_contracts::{CancellationToken, ContextAction, ToolCall, ToolExecutionRequest};
     use serde_json::Value;
 
@@ -1143,6 +1144,107 @@ mod tests {
             stamped,
             "host proof and model attribution must agree on the identity"
         );
+    }
+
+    /// Catalog meta-validation: every builtin `input_schema` (loaded or
+    /// catalog-cold) must compile into the bounded central `SchemaProfile`.
+    /// A schema that used an unsupported keyword or an unbounded shape would
+    /// fail capability admission here instead of silently skipping
+    /// validation.
+    #[tokio::test]
+    async fn every_builtin_schema_compiles_into_a_profile() {
+        let tools = dispatcher().await;
+        let catalog = tools.inner.catalog.read().expect("tool catalog poisoned");
+        let specs: Vec<ToolSpec> = catalog.values().map(|entry| entry.tool.spec()).collect();
+        assert!(
+            specs.len() >= 12,
+            "catalog unexpectedly small: {}",
+            specs.len()
+        );
+        for spec in &specs {
+            SchemaProfile::compile(&spec.input_schema).unwrap_or_else(|error| {
+                panic!("builtin '{}' schema must compile: {error}", spec.name)
+            });
+        }
+    }
+
+    /// Shared corpus: for read-only builtins the central validator and the
+    /// real tool agree — arguments the profile rejects never produce a
+    /// successful dispatch, and arguments it accepts do.
+    #[tokio::test]
+    async fn shared_corpus_validator_agrees_with_builtin_parsers() {
+        let tools = dispatcher().await;
+        let surfaced: Vec<String> = tools.specs().into_iter().map(|spec| spec.name).collect();
+        let profile_for = |name: &str| {
+            SchemaProfile::compile(
+                &tools
+                    .specs()
+                    .into_iter()
+                    .find(|spec| spec.name == name)
+                    .expect("row tool must be surfaced")
+                    .input_schema,
+            )
+            .expect("builtin schema compiles")
+        };
+        let surfaced = |name: &str| surfaced.iter().any(|present| present == name);
+
+        fn successful(outcome: &AgentResult<ToolOutcome>) -> bool {
+            matches!(outcome, Ok(ToolOutcome::Value(output)) if output.ok)
+        }
+
+        // Bad shapes: wrong type, out-of-bounds, extra fields on a closed
+        // object, and missing required keys. Every row must fail the central
+        // validator and never produce a successful dispatch.
+        let bad_rows: Vec<(&str, Value)> = vec![
+            ("fs.read", serde_json::json!({"path": 7})),
+            ("fs.list", serde_json::json!({"path": 5})),
+            ("search.grep", serde_json::json!({"pattern": 3})),
+            (
+                "search.grep",
+                serde_json::json!({"pattern": "x", "limit": 0}),
+            ),
+            ("fs.mkdir", serde_json::json!({"path": "", "extra": 1})),
+            ("edit.patch", serde_json::json!({"path": []})),
+        ];
+        for (name, arguments) in bad_rows {
+            if !surfaced(name) {
+                continue;
+            }
+            let profile = profile_for(name);
+            let validation = profile.validate(&arguments);
+            assert!(
+                validation.is_err(),
+                "'{name}' arguments must fail the central validator: {arguments}"
+            );
+            let outcome = tools.execute(request(name, arguments)).await;
+            assert!(
+                !successful(&outcome),
+                "'{name}' with schema-invalid arguments must not dispatch successfully: {outcome:?}"
+            );
+        }
+
+        // Good shapes: on-surface arguments pass the validator and reach a
+        // real dispatch.
+        let good_rows: Vec<(&str, Value)> = vec![
+            ("fs.read", serde_json::json!({"path": ".", "start_line": 1})),
+            ("fs.list", serde_json::json!({"path": ""})),
+            (
+                "search.grep",
+                serde_json::json!({"pattern": "x", "limit": 5}),
+            ),
+        ];
+        for (name, arguments) in good_rows {
+            if !surfaced(name) {
+                continue;
+            }
+            let profile = profile_for(name);
+            let validation = profile.validate(&arguments);
+            assert!(
+                validation.is_ok(),
+                "'{name}' valid row rejected: {validation:?}"
+            );
+            let _ = tools.execute(request(name, arguments)).await;
+        }
     }
 
     /// the trusted host translates only its own stamped

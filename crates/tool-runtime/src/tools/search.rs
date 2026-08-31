@@ -180,7 +180,16 @@ impl Tool for SearchGrepTool {
         }
         files.sort();
 
-        let limit = args.limit.clamp(1, 1_000);
+        // The schema declares limit in 1..=1000; a value outside that range
+        // is a shape violation, not something to silently clamp. The
+        // argument parser and the schema must agree.
+        if args.limit < 1 || args.limit > 1_000 {
+            return Err(AgentError::InvalidRequest(format!(
+                "search.grep limit must be in 1..=1000, got {}",
+                args.limit
+            )));
+        }
+        let limit = args.limit;
         let mut hits: Vec<String> = Vec::new();
         let mut scanned_files = 0usize;
 

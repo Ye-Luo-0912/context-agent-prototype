@@ -1043,6 +1043,11 @@ pub enum ToolFailureClass {
     /// approval or dispatch. It is an attempt incident, not evidence that task
     /// work or an effect remains unresolved.
     SurfaceUnavailable,
+    /// Arguments do not match the tool's compiled round-surface schema
+    /// (missing/extra fields, wrong type, out-of-bounds, unsupported shape).
+    /// A typed no-dispatch result: never reaches approval or the effect
+    /// journal and never opens completion debt.
+    SchemaMismatch,
     InvalidRequest,
     /// The runtime refused to dispatch: this call is byte-identical to a
     /// deterministic refusal against unchanged file identities, so
@@ -1068,6 +1073,7 @@ impl ToolFailureClass {
             Self::HiddenPath => "hidden_path",
             Self::PathNotFound => "path_not_found",
             Self::SurfaceUnavailable => "surface_unavailable",
+            Self::SchemaMismatch => "schema_mismatch",
             Self::InvalidRequest => "invalid_request",
             Self::DuplicateNoProgress => "duplicate_no_progress",
             Self::Io => "io",
@@ -1108,6 +1114,9 @@ impl ToolFailureClass {
             Self::SurfaceUnavailable => {
                 "Discover or load the tool, then use only a schema present on the next captured surface."
             }
+            Self::SchemaMismatch => {
+                "Fix the arguments to match the tool schema exactly: keys, types, enums and bounds."
+            }
             Self::InvalidRequest => "Fix the arguments against the tool schema.",
             Self::DuplicateNoProgress => {
                 "This exact call already failed deterministically and the files are unchanged. Change the arguments, re-read the target, or finish with the current state."
@@ -1132,6 +1141,7 @@ impl ToolFailureClass {
             "hidden_path" => Self::HiddenPath,
             "path_not_found" => Self::PathNotFound,
             "surface_unavailable" => Self::SurfaceUnavailable,
+            "schema_mismatch" => Self::SchemaMismatch,
             "invalid_request" => Self::InvalidRequest,
             "duplicate_no_progress" => Self::DuplicateNoProgress,
             "io" => Self::Io,
@@ -1156,6 +1166,7 @@ impl ToolFailureClass {
                 | Self::AmbiguousMatch
                 | Self::PathNotFound
                 | Self::SurfaceUnavailable
+                | Self::SchemaMismatch
                 | Self::InvalidRequest
                 | Self::HiddenPath
                 | Self::DuplicateNoProgress
@@ -1185,6 +1196,7 @@ impl ToolFailureClass {
             | Self::Cancellation
             | Self::DuplicateNoProgress
             | Self::InvalidRequest
+            | Self::SchemaMismatch
             | Self::Io => ToolFailureDomain::NonDeterministic,
         }
     }
@@ -2375,6 +2387,19 @@ pub struct ToolSurfaceSnapshot {
     pub omissions: Vec<ToolSurfaceOmission>,
     #[serde(default)]
     pub omitted_total: usize,
+    /// Compiled bounded argument profiles, one per surfaced spec, produced
+    /// once per surface revision. Core validates arguments against these
+    /// before approval or dispatch. Production snapshots never list a spec
+    /// without a profile (the surface builder drops un-compiled tools);
+    /// legacy snapshots that predate schema validation carry none and keep
+    /// the previous behavior.
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub schema_profiles: std::collections::BTreeMap<String, crate::schema_profile::SchemaProfile>,
+    /// Tool names whose input schema failed to compile. Those tools are not
+    /// admitted to the model surface: the schema gate refuses rather than
+    /// silently skipping validation.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub schema_rejected: Vec<String>,
 }
 
 /// The unified tool/capability lifecycle shared by the builtin catalog and

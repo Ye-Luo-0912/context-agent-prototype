@@ -1665,3 +1665,145 @@ fn broker_reconciliation_settles_not_applied_without_fencing() {
         other => panic!("unexpected query result: {other:?}"),
     }
 }
+
+/// Counts every approval call; used to prove the schema gate fires strictly
+/// before the approval gate.
+struct CountingApproval(std::sync::Arc<std::sync::atomic::AtomicUsize>);
+
+#[async_trait::async_trait]
+impl ApprovalGate for CountingApproval {
+    async fn authorize(
+        &self,
+        _call: &ToolCall,
+        _spec: &ToolSpec,
+        _cancel: &CancellationToken,
+    ) -> AgentResult<ApprovalDecision> {
+        self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        Ok(ApprovalDecision::Allow)
+    }
+}
+
+/// Panics if dispatch is reached; proves a refusal happened earlier.
+struct PanicDispatcher;
+
+#[async_trait::async_trait]
+impl ToolDispatcher for PanicDispatcher {
+    fn specs(&self) -> Vec<ToolSpec> {
+        Vec::new()
+    }
+    async fn execute(&self, _request: ToolExecutionRequest) -> AgentResult<ToolOutcome> {
+        panic!("dispatch must not run for a schema-refused call")
+    }
+}
+
+/// A `Path`-typed tool whose round-surface profile is compiled and attached.
+fn typed_surface() -> ToolSurfaceSnapshot {
+    let profile = agent_contracts::SchemaProfile::compile(&serde_json::json!({
+        "type": "object",
+        "properties": {"path": {"type": "string"}},
+        "required": ["path"],
+        "additionalProperties": false,
+    }))
+    .unwrap();
+    ToolSurfaceSnapshot {
+        specs: vec![ToolSpec {
+            name: "typed.tool".into(),
+            description: "typed surface fixture".into(),
+            input_schema: serde_json::json!({"type": "object"}),
+            risk: ToolRisk::ReadOnly,
+            output_budget: None,
+            roles: Vec::new(),
+        }],
+        schema_profiles: std::collections::BTreeMap::from([("typed.tool".to_string(), profile)]),
+        ..ToolSurfaceSnapshot::default()
+    }
+}
+
+/// Arguments that fail the compiled round-surface schema are a typed
+/// no-dispatch result: the approval gate is never consulted, dispatch never
+/// runs, and the outcome carries the JSON pointer plus expected/observed
+/// shapes. No effect journal row and no completion debt can attach.
+#[tokio::test]
+async fn schema_mismatch_refuses_before_approval_or_dispatch() {
+    let approvals = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let kernel = Arc::new(CoreAuthority::new(
+        CoreAuthorityConfig::default(),
+        Arc::new(RecordingEngine::default()),
+        Arc::new(PanicDispatcher),
+        Arc::new(CountingApproval(approvals.clone())),
+        None,
+        None,
+    ));
+    let surface = typed_surface();
+    let mut tool_call = call("typed.tool");
+    tool_call.arguments = serde_json::json!({"bad": 1});
+    let generation = kernel.current_authority_epoch();
+    let execution = kernel
+        .execute_tool(
+            operation_identity(&kernel, &tool_call, generation),
+            tool_call,
+            CancellationToken::new(),
+            &surface,
+            generation,
+        )
+        .await;
+    let ToolOutcome::Value(output) = execution.outcome else {
+        panic!("schema refusal is a plain value outcome")
+    };
+    assert!(!output.ok, "{}", output.model_content);
+    assert_eq!(output.metadata["schema"]["pointer"], "");
+    assert!(
+        output.metadata["schema"]["expected"]
+            .as_str()
+            .is_some_and(|text| text.contains("required field 'path'")),
+        "{}",
+        output.metadata
+    );
+    assert!(execution.lease.is_none());
+    assert!(execution.effect_id.is_none());
+    assert_eq!(approvals.load(std::sync::atomic::Ordering::SeqCst), 0);
+}
+
+/// Matching arguments pass the schema gate and reach approval plus dispatch
+/// exactly as before.
+#[tokio::test]
+async fn schema_valid_arguments_reach_approval_and_dispatch() {
+    let approvals = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let dispatcher = Arc::new(EchoDispatcher {
+        output: ToolOutput {
+            call_id: "call-ok".into(),
+            tool_name: "typed.tool".into(),
+            ok: true,
+            summary: "ok".into(),
+            model_content: "ok".into(),
+            artifact_ref: None,
+            metadata: serde_json::Value::Null,
+        },
+    });
+    let kernel = Arc::new(CoreAuthority::new(
+        CoreAuthorityConfig::default(),
+        Arc::new(RecordingEngine::default()),
+        dispatcher,
+        Arc::new(CountingApproval(approvals.clone())),
+        None,
+        None,
+    ));
+    let surface = typed_surface();
+    let mut tool_call = call("typed.tool");
+    tool_call.arguments = serde_json::json!({"path": "src/lib.rs"});
+    let generation = kernel.current_authority_epoch();
+    let execution = kernel
+        .execute_tool(
+            operation_identity(&kernel, &tool_call, generation),
+            tool_call,
+            CancellationToken::new(),
+            &surface,
+            generation,
+        )
+        .await;
+    let ToolOutcome::Value(output) = execution.outcome else {
+        panic!("a valid call executes to a plain value")
+    };
+    assert!(output.ok, "{}", output.model_content);
+    assert_eq!(approvals.load(std::sync::atomic::Ordering::SeqCst), 1);
+}

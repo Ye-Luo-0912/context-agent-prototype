@@ -9,10 +9,10 @@ use std::collections::{BTreeMap, HashSet};
 use agent_contracts::{
     MAX_TOOL_REQUIREMENT_NAME_CHARS, MAX_TOOL_SURFACE_REPORT_BLOCKED,
     MAX_TOOL_SURFACE_REPORT_NAME_BYTES, MAX_TOOL_SURFACE_REPORT_OMITTED,
-    MAX_TOOL_SURFACE_REPORT_SELECTED, ToolSpec, ToolSurfaceBlock, ToolSurfaceBlockReason,
-    ToolSurfaceDemand, ToolSurfaceOmission, ToolSurfaceOmissionReason, ToolSurfaceOrigin,
-    ToolSurfacePlanReport, ToolSurfacePlanStatus, ToolSurfaceRequirement, ToolSurfaceSelection,
-    ToolSurfaceSnapshot, ToolSurfaceSourceRevisions, TurnId,
+    MAX_TOOL_SURFACE_REPORT_SELECTED, SchemaProfile, ToolSpec, ToolSurfaceBlock,
+    ToolSurfaceBlockReason, ToolSurfaceDemand, ToolSurfaceOmission, ToolSurfaceOmissionReason,
+    ToolSurfaceOrigin, ToolSurfacePlanReport, ToolSurfacePlanStatus, ToolSurfaceRequirement,
+    ToolSurfaceSelection, ToolSurfaceSnapshot, ToolSurfaceSourceRevisions, TurnId,
 };
 
 use crate::budget::{MAX_TOOL_SURFACE_TOKENS, approx_layer_tokens};
@@ -403,7 +403,28 @@ impl RoundSurfacePlan {
         }
     }
 
-    pub(crate) fn into_snapshot(self, surface_revision: u64) -> ToolSurfaceSnapshot {
+    pub(crate) fn into_snapshot(mut self, surface_revision: u64) -> ToolSurfaceSnapshot {
+        // Compile the bounded schema profile for every surfaced tool once
+        // per revision. A schema that uses an unsupported keyword or exceeds
+        // the compile bounds fails capability admission: the tool is not
+        // presented to the model and its rejection is recorded for
+        // diagnostics. The gate refuses rather than silently skipping
+        // validation.
+        let mut schema_profiles: BTreeMap<String, SchemaProfile> = BTreeMap::new();
+        let mut schema_rejected: Vec<String> = Vec::new();
+        for spec in &self.specs {
+            match SchemaProfile::compile(&spec.input_schema) {
+                Ok(profile) => {
+                    schema_profiles.insert(spec.name.clone(), profile);
+                }
+                Err(error) if schema_rejected.len() < MAX_SCHEMA_REJECTED_ROWS => {
+                    schema_rejected.push(format!("{}: {error}", bounded_schema_name(&spec.name)));
+                }
+                Err(_) => {}
+            }
+        }
+        self.specs
+            .retain(|spec| schema_profiles.contains_key(&spec.name));
         ToolSurfaceSnapshot {
             specs: self.specs,
             generation: self.legacy_generation,
@@ -411,9 +432,24 @@ impl RoundSurfacePlan {
             source_revisions: self.source_revisions,
             omissions: self.omissions,
             omitted_total: self.omitted_total,
+            schema_profiles,
+            schema_rejected,
         }
     }
 }
+
+/// Keep rejected-schema diagnostics bounded without truncating an exact
+/// tool name below its identity.
+fn bounded_schema_name(name: &str) -> String {
+    if name.chars().count() > 96 {
+        let preview: String = name.chars().take(96).collect();
+        format!("{preview}...")
+    } else {
+        name.to_string()
+    }
+}
+
+const MAX_SCHEMA_REJECTED_ROWS: usize = 16;
 
 fn push_omission(
     rows: &mut Vec<ToolSurfaceOmission>,
@@ -915,5 +951,47 @@ mod tests {
             plan.origins.get("fs.read"),
             Some(&ToolSurfaceOrigin::CatalogLoadedOptional)
         );
+    }
+
+    /// A tool whose schema uses an unsupported JSON-schema keyword fails
+    /// capability admission: it is not presented on the round surface and
+    /// the rejection is recorded, so the model can neither see nor call it.
+    #[test]
+    fn unsupported_schema_keywords_exclude_the_tool_from_the_surface() {
+        let mut broken = spec("plugin.broken", 10);
+        broken.input_schema = json!({
+            "type": "object",
+            "properties": {"x": {"anyOf": [{"type": "string"}]}}
+        });
+        let snapshot = RoundSurfacePlan::build(
+            ToolSurfaceSnapshot {
+                specs: vec![spec("fs.read", 10), broken],
+                ..Default::default()
+            },
+            &[],
+            |_| true,
+        )
+        .into_snapshot(7);
+        let names: Vec<&str> = snapshot
+            .specs
+            .iter()
+            .map(|spec| spec.name.as_str())
+            .collect();
+        assert!(
+            !names.contains(&"plugin.broken"),
+            "a schema-rejected tool must not be surfaced: {names:?}"
+        );
+        assert!(names.contains(&"fs.read"));
+        assert_eq!(snapshot.surface_revision, 7);
+        assert!(
+            snapshot
+                .schema_rejected
+                .iter()
+                .any(|row| row.contains("plugin.broken")),
+            "the rejection must be recorded: {:?}",
+            snapshot.schema_rejected
+        );
+        assert!(!snapshot.schema_profiles.contains_key("plugin.broken"));
+        assert!(snapshot.schema_profiles.contains_key("fs.read"));
     }
 }
