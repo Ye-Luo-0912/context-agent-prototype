@@ -1177,12 +1177,19 @@ pub(crate) mod test_procs {
     pub(crate) async fn wait_for_path(path: &Path) {
         // Cold-start of the pid-writing child (powershell on Windows CI
         // runners, sh elsewhere) can be slow under parallel test load; the
-        // deadline is a sanity bound, not a timing assertion.
+        // deadline is a sanity bound, not a timing assertion. A shell
+        // redirect truncates (creates) the pid file before the pid is
+        // written, so existence alone is not content: wait until the file
+        // holds an integer `read_pid` can parse.
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
-        while !path.exists() && std::time::Instant::now() < deadline {
+        while std::time::Instant::now() < deadline {
+            let content = std::fs::read_to_string(path).unwrap_or_default();
+            if content.trim().parse::<u32>().is_ok() {
+                return;
+            }
             tokio::time::sleep(std::time::Duration::from_millis(25)).await;
         }
-        assert!(path.exists(), "expected {} to appear", path.display());
+        panic!("expected {} to hold a pid", path.display());
     }
 
     pub(crate) fn read_pid(path: &Path) -> u32 {
