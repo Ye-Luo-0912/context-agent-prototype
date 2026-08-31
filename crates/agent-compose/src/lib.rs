@@ -343,6 +343,12 @@ pub async fn compose(config: ComposeConfig) -> anyhow::Result<ComposedRuntime> {
     }
     host.start().await?;
 
+    // Startup store reconcile, part of the start transaction: converge the
+    // on-disk blob directory with the external map before the actor serves
+    // (crash-recovery authority over formal blobs; a missing store dir
+    // reconciles as empty). A failure fails the composition closed.
+    host.registry().context_service()?.reconcile_store().await?;
+
     // The composition seam: every service the run needs is resolved from
     // the host's typed registry and handed to the runtime as one
     // `RuntimeServices`; the kernel is derived inside the runtime.

@@ -991,6 +991,12 @@ async fn full_contract_parity_across_the_process_boundary() {
         context_store_dir: Some(local_store.path().to_path_buf()),
         ..context_simple::SimpleContextConfig::default()
     });
+    // The service runs its startup reconcile before serving (crash-recovery
+    // authority over an explicit store); the in-process engine only gets
+    // one on this explicit call. Reconciling the local side here keeps the
+    // `event_seq` clocks aligned so the parity comparison measures the
+    // contract, not the startup transaction.
+    local.reconcile_store().await.unwrap();
 
     let service_snapshot = contract_snapshot(&service).await;
     let local_snapshot = contract_snapshot(&local).await;

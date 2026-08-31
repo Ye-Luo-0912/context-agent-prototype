@@ -2588,6 +2588,11 @@ pub struct StoreReconcileReport {
     /// `quarantine/` subdirectory instead of being treated as deleted.
     #[serde(default)]
     pub quarantined: usize,
+    /// Of the quarantined blobs, how many had a live external-map owner.
+    /// Reconcile atomically retires those owner entries too, so the map
+    /// never advertises a blob that no longer exists.
+    #[serde(default)]
+    pub owner_quarantined: usize,
     /// Abandoned temp files (`*.tmp` from an interrupted atomic write)
     /// removed.
     #[serde(default)]

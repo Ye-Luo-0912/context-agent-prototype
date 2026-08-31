@@ -199,6 +199,21 @@ impl RuntimeActor {
                     self.core.recovery_status(),
                     agent_contracts::AuthorityRecoveryStatus::RecoveryRequired { .. }
                 );
+                // The restore transaction is committed. Converge the store
+                // with the restored checkpoint's external map before the
+                // runtime serves again — reconcile is the crash-recovery
+                // authority over formal blobs (a missing store dir
+                // reconciles as empty). A failure is surfaced as an
+                // observable warning, never used to roll the committed
+                // restore back.
+                if let Err(error) = self.services.context_reconcile_store().await {
+                    let _ = self
+                        .core
+                        .emit_event(RuntimeEvent::Warning {
+                            message: format!("store reconcile after restore failed: {error}"),
+                        })
+                        .await;
+                }
                 Ok(())
             }
             Err(error) => {

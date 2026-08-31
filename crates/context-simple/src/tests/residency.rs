@@ -90,6 +90,171 @@ async fn gc_externalizes_overflow_and_recalls_via_the_store() {
     );
 }
 
+/// A tampered store blob must never reach a consumer: `fetch` turns the
+/// ownership-checksum mismatch into a hard read failure instead of serving
+/// substituted content.
+#[tokio::test]
+async fn fetch_rejects_a_tampered_blob() {
+    let dir = tempfile::tempdir().unwrap();
+    let engine = SimpleContextEngine::new(SimpleContextConfig {
+        gc_buffer_capacity: 1,
+        gc_reactivate_per_pass: 8,
+        recent_file_bodies: 1,
+        context_store_dir: Some(dir.path().to_path_buf()),
+        ..SimpleContextConfig::default()
+    });
+    open_focus(&engine, "service layer").await;
+    engine
+        .ingest(ContextIngress::UserMessage {
+            content: "work on AuthService.rs".into(),
+        })
+        .await
+        .unwrap();
+    let files = ["AuthService.rs", "CacheStore.rs", "TokenCache.rs"];
+    for (i, path) in files.iter().enumerate() {
+        engine
+            .ingest(ContextIngress::ToolObservation {
+                facts: None,
+                output: fs_read_touching(
+                    &format!("step-{i}"),
+                    path,
+                    &format!("     1 | step {i}: fix {path}"),
+                ),
+                scope_id: None,
+            })
+            .await
+            .unwrap();
+    }
+    engine
+        .maintain(ContextMaintenanceTrigger::AfterModel)
+        .await
+        .unwrap();
+    let report = engine.gc().await.unwrap();
+    assert_eq!(
+        report.externalized, 1,
+        "overflow must externalize: {report:?}"
+    );
+    let externalized_id = report.externalized_ids[0];
+
+    // Valid JSON, same id, changed body: the checksum mismatch must fail
+    // the authoritative read, not substitute the bytes.
+    std::fs::write(
+        dir.path().join(format!("{externalized_id}.json")),
+        serde_json::to_vec(&agent_contracts::ContextItem {
+            content: "substituted body".into(),
+            ..engine
+                .fetch_external(externalized_id)
+                .await
+                .expect("fetch must still resolve the pre-tamper entry")
+                .expect("the item must still be external")
+        })
+        .unwrap(),
+    )
+    .unwrap();
+
+    let failure = engine.fetch_external(externalized_id).await.unwrap_err();
+    assert!(
+        failure.to_string().contains("corrupt"),
+        "the tampered read must surface as a corruption failure, got: {failure}"
+    );
+}
+
+/// A tampered store blob must never re-enter the resident heap: the GC
+/// recall read verifies the ownership checksum, so a substituted body is
+/// left in the store (for the reconcile to quarantine) instead of being
+/// reactivated under the original identity.
+#[tokio::test]
+async fn recall_rejects_a_tampered_blob() {
+    let dir = tempfile::tempdir().unwrap();
+    let engine = SimpleContextEngine::new(SimpleContextConfig {
+        gc_buffer_capacity: 1,
+        gc_reactivate_per_pass: 8,
+        recent_file_bodies: 1,
+        context_store_dir: Some(dir.path().to_path_buf()),
+        ..SimpleContextConfig::default()
+    });
+    open_focus(&engine, "service layer").await;
+    engine
+        .ingest(ContextIngress::UserMessage {
+            content: "work on AuthService.rs".into(),
+        })
+        .await
+        .unwrap();
+    let files = ["AuthService.rs", "CacheStore.rs", "TokenCache.rs"];
+    for (i, path) in files.iter().enumerate() {
+        engine
+            .ingest(ContextIngress::ToolObservation {
+                facts: None,
+                output: fs_read_touching(
+                    &format!("step-{i}"),
+                    path,
+                    &format!("     1 | step {i}: fix {path}"),
+                ),
+                scope_id: None,
+            })
+            .await
+            .unwrap();
+    }
+    engine
+        .maintain(ContextMaintenanceTrigger::AfterModel)
+        .await
+        .unwrap();
+    let report = engine.gc().await.unwrap();
+    assert_eq!(
+        report.externalized, 1,
+        "first GC must externalize: {report:?}"
+    );
+    let externalized_id = report.externalized_ids[0];
+    let entry = engine
+        .search_external(agent_contracts::ContextSearchQuery {
+            query: "AuthService".into(),
+            kind: None,
+            scope: None,
+            task_id: None,
+            label: None,
+            limit: 16,
+        })
+        .await
+        .unwrap();
+    assert!(
+        entry.iter().any(|hit| hit.item_id == externalized_id),
+        "the externalized item must be searchable before the tamper"
+    );
+
+    // Tamper the blob under the same id, then make its entity hot again.
+    std::fs::write(
+        dir.path().join(format!("{externalized_id}.json")),
+        serde_json::to_vec(&agent_contracts::ContextItem {
+            content: "substituted body".into(),
+            ..engine
+                .fetch_external(externalized_id)
+                .await
+                .expect("fetch must still resolve the pre-tamper entry")
+                .expect("the item must still be external")
+        })
+        .unwrap(),
+    )
+    .unwrap();
+    engine
+        .ingest(ContextIngress::UserMessage {
+            content: "continue on AuthService.rs".into(),
+        })
+        .await
+        .unwrap();
+    let report = engine.gc().await.unwrap();
+    assert!(
+        !report
+            .reactivations
+            .iter()
+            .any(|r| r.reason.contains("recalled from the context store")),
+        "the tampered blob must not be recalled: {report:?}"
+    );
+    assert!(
+        dir.path().join(format!("{externalized_id}.json")).exists(),
+        "the rejected blob stays in the store for the reconcile to quarantine"
+    );
+}
+
 /// The external store is a fidelity boundary: `fetch(ref)` must recover the
 /// exact content that was externalized, not a summary or a truncated copy.
 #[tokio::test]

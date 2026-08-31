@@ -33,8 +33,11 @@ pub(crate) struct GcPlan {
     /// lock to re-read the item.
     pub(crate) externalize: Vec<(ContextItem, Vec<u8>)>,
     /// Cold-store entry ids whose entities match the hot set; read back in
-    /// the IO phase. Entries stay in the map until a successful read.
-    pub(crate) recall_candidates: Vec<ContextItemId>,
+    /// the IO phase. Each carries the ownership checksum captured on the
+    /// external entry so the read is a verified recall, never a silent
+    /// substitute of tampered content. Entries stay in the map until a
+    /// successful read.
+    pub(crate) recall_candidates: Vec<(ContextItemId, Option<String>)>,
     /// Report data decided under lock.
     pub(crate) evictions: Vec<ContextEviction>,
     pub(crate) buffer_reactivations: Vec<ContextReactivation>,
@@ -362,15 +365,18 @@ pub(crate) async fn run_store_io(config: &SimpleContextConfig, plan: &mut GcPlan
     // Recall reads: only entries whose entities matched are read; failed
     // reads leave the entry in the map for a later pass. Same bounded
     // concurrency rationale as the writes.
-    let recall: Vec<ContextItemId> = plan.recall_candidates.drain(..).collect();
+    let recall: Vec<(ContextItemId, Option<String>)> = plan.recall_candidates.drain(..).collect();
     let mut reads = tokio::task::JoinSet::new();
-    for item_id in recall {
+    for (item_id, expected_checksum) in recall {
         let dir = dir.clone();
         let semaphore = std::sync::Arc::clone(&semaphore);
         let permit = semaphore.acquire_owned().await.expect("semaphore");
         reads.spawn(async move {
             let _permit = permit;
-            (item_id, store::read_item_async(&dir, item_id).await)
+            (
+                item_id,
+                store::read_item_checked_async(&dir, item_id, expected_checksum.as_deref()).await,
+            )
         });
     }
     while let Some(joined) = reads.join_next().await {
@@ -967,7 +973,8 @@ fn reactivate(
                     && store::recallable(entry)
                     && covered.insert(entry.item_id)
                 {
-                    plan.recall_candidates.push(entry.item_id);
+                    plan.recall_candidates
+                        .push((entry.item_id, entry.blob_checksum.clone()));
                     plan.anchor_roots_protected += 1;
                     remaining -= 1;
                 }
@@ -984,7 +991,8 @@ fn reactivate(
                 && store::recallable(entry)
                 && covered.insert(entry.item_id)
             {
-                plan.recall_candidates.push(entry.item_id);
+                plan.recall_candidates
+                    .push((entry.item_id, entry.blob_checksum.clone()));
                 remaining -= 1;
             }
         }
@@ -1023,7 +1031,8 @@ fn reactivate(
                         ) {
                             continue;
                         }
-                        plan.recall_candidates.push(*id);
+                        plan.recall_candidates
+                            .push((*id, entry.blob_checksum.clone()));
                         remaining -= 1;
                     }
                 }
@@ -1051,7 +1060,8 @@ fn reactivate(
                         ) {
                             continue;
                         }
-                        plan.recall_candidates.push(entry.item_id);
+                        plan.recall_candidates
+                            .push((entry.item_id, entry.blob_checksum.clone()));
                         remaining -= 1;
                     }
                 }

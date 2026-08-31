@@ -155,15 +155,6 @@ pub(crate) fn read_item(
     decode_item(item_id, &bytes, None)
 }
 
-/// Async variant of [`read_item`] for the GC's IO phase (recall), which
-/// must not hold the state lock across disk reads.
-pub(crate) async fn read_item_async(
-    dir: &Path,
-    item_id: ContextItemId,
-) -> Result<ContextItem, StoreReadFailure> {
-    read_item_checked_async(dir, item_id, None).await
-}
-
 /// Read a catalog-owned blob and, when the entry has a captured checksum,
 /// prove that the body still matches it. Required materialization uses this
 /// path; a corrupted body must become an explicit completion-visible miss.
@@ -966,6 +957,10 @@ pub(crate) struct ReconcileIo {
     pub(crate) scanned: usize,
     pub(crate) deleted_stale: usize,
     pub(crate) quarantined: usize,
+    /// External-map ids whose owned blob was quarantined. The commit phase
+    /// retires these owner entries so the map never advertises a blob that
+    /// no longer exists.
+    pub(crate) owner_quarantined_ids: Vec<ContextItemId>,
     pub(crate) temp_cleaned: usize,
     pub(crate) io_errors: usize,
     pub(crate) reasons: Vec<String>,
@@ -1073,7 +1068,9 @@ pub(crate) async fn run_reconcile_io(
 
         match map_checksums.get(&item_id) {
             // The map owns this blob: a checksum mismatch means the file
-            // was corrupted or tampered with after the write.
+            // was corrupted or tampered with after the write. The blob is
+            // quarantined and its owner entry is retired atomically in the
+            // commit phase, so the map never advertises the moved blob.
             Some(Some(expected)) if *expected != checksum => {
                 quarantine(
                     &quarantine_dir,
@@ -1083,6 +1080,7 @@ pub(crate) async fn run_reconcile_io(
                     "checksum mismatch: blob changed since the owning entry captured it",
                 )
                 .await;
+                io.owner_quarantined_ids.push(item_id);
             }
             // Consistent owner (or a pre-checksum entry: parse + id match
             // is the best available signal).
@@ -1164,11 +1162,25 @@ pub(crate) fn commit_reconcile(
         state.gc_externalized_total += 1;
         rebuilt += 1;
     }
+    // Retire every owner whose blob was quarantined: the entry would
+    // otherwise keep advertising a moved blob, so the two are retired as
+    // one atomic act. The blob itself stays preserved in quarantine/ as
+    // evidence. A later GC pass may re-own a rebuilt file, never this one.
+    let mut owner_quarantined = 0usize;
+    if !io.owner_quarantined_ids.is_empty() {
+        let doomed: HashSet<ContextItemId> = io.owner_quarantined_ids.iter().copied().collect();
+        let mut external = state.external.take_all();
+        let before = external.len();
+        external.retain(|entry| !doomed.contains(&entry.item_id));
+        owner_quarantined = before.saturating_sub(external.len());
+        state.external.replace_all(external);
+    }
     StoreReconcileReport {
         scanned: io.scanned,
         rebuilt,
         deleted_stale: io.deleted_stale,
         quarantined: io.quarantined,
+        owner_quarantined,
         temp_cleaned: io.temp_cleaned,
         io_errors: io.io_errors,
         reasons: io.reasons,
@@ -1932,6 +1944,63 @@ mod tests {
             state.external.iter().all(|e| e.item_id != stale_id),
             "the reclaimed id has no entry anymore"
         );
+    }
+
+    /// Restart with a quarantined owned blob: the owner entry retires with
+    /// its blob, so the map never advertises content that moved to
+    /// quarantine/. The evidence is preserved; a later pass can re-own a
+    /// rebuilt file, never this one.
+    #[tokio::test]
+    async fn reconcile_retires_an_owner_whose_blob_was_quarantined() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut state = State::default();
+
+        let id = ContextItemId::new();
+        let item = test_item(id, "original body");
+        let checksum = externalize_async(dir.path(), id, &serde_json::to_vec(&item).unwrap())
+            .await
+            .unwrap();
+        state.external.push(to_external_entry(
+            &item,
+            make_context_ref(&item),
+            1,
+            1,
+            Some(checksum.clone()),
+        ));
+
+        // Tamper after the entry captured its checksum: valid JSON, same
+        // id, changed body — the exact substitution the ownership checksum
+        // exists to detect.
+        std::fs::write(
+            dir.path().join(format!("{id}.json")),
+            serde_json::to_vec(&test_item(id, "substituted body")).unwrap(),
+        )
+        .unwrap();
+
+        let owned: HashMap<_, _> = [(id, Some(checksum))].into_iter().collect();
+        let io = run_reconcile_io(dir.path(), &owned, &HashSet::new()).await;
+        let report = commit_reconcile(&mut state, io, 1, 1);
+
+        assert_eq!(
+            report.quarantined, 1,
+            "tampered blob quarantined: {report:?}"
+        );
+        assert_eq!(
+            report.owner_quarantined, 1,
+            "the owning entry retired atomically: {report:?}"
+        );
+        assert!(
+            state.external.get(id).is_none(),
+            "the map must stop advertising the moved blob"
+        );
+        assert!(
+            dir.path()
+                .join("quarantine")
+                .join(format!("{id}.json"))
+                .exists(),
+            "the tampered evidence is preserved for inspection"
+        );
+        assert_eq!(state.external.len(), 0, "no entry survives the retire");
     }
 
     /// The ownership invariant after a full externalize → recall → reconcile

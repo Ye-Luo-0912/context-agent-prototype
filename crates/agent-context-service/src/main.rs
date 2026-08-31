@@ -69,8 +69,21 @@ async fn main() {
         );
         std::process::exit(2);
     }
-    let engine = build_engine(&engine_name, store_dir);
+    let engine = build_engine(&engine_name, store_dir.clone());
     let engine: &dyn ContextEngine = engine.as_ref();
+
+    // Startup store reconcile, part of the serve transaction: converge the
+    // on-disk blob directory with the external map before serving framed
+    // operations (crash-recovery authority over formal blobs). It runs only
+    // when the service owns an explicit store — the temp-dir fallback is
+    // not a persistence domain to reconcile. Refuse to serve on failure
+    // instead of running a session over an unreconciled store.
+    if store_dir.is_some()
+        && let Err(problem) = engine.reconcile_store().await
+    {
+        eprintln!("startup store reconcile failed: {problem}");
+        std::process::exit(1);
+    }
 
     let mut stdin = BufReader::new(tokio::io::stdin());
     let stdout = tokio::io::stdout();

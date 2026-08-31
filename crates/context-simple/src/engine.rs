@@ -1141,7 +1141,24 @@ impl ContextEngine for SimpleContextEngine {
                     let external_read = match read_plan {
                         Some(item_id) => {
                             let dir = crate::store::store_dir(&self.config);
-                            match crate::store::read_item_async(&dir, item_id).await {
+                            // Admit of an externalized item re-reads the
+                            // owner's blob; the ownership checksum is
+                            // captured on the external entry, so a tampered
+                            // body is a hard read failure, never a silent
+                            // admit of changed content. The state lock is
+                            // already held by this ingest, so the checksum
+                            // is read from the guard already in scope.
+                            let expected_checksum = state
+                                .external
+                                .get(item_id)
+                                .and_then(|entry| entry.blob_checksum.clone());
+                            match crate::store::read_item_checked_async(
+                                &dir,
+                                item_id,
+                                expected_checksum.as_deref(),
+                            )
+                            .await
+                            {
                                 Ok(item) => Some((item_id, Some(item))),
                                 Err(crate::store::StoreReadFailure::Missing) => {
                                     Some((item_id, None))
@@ -1568,20 +1585,32 @@ impl ContextEngine for SimpleContextEngine {
             }
         }
         let dir = crate::store::store_dir(&self.config);
-        let retrievable = {
+        let (retrievable, expected_checksum) = {
             let state = self.state.lock().await;
-            state
-                .external
-                .get(item_id)
-                .is_some_and(crate::store::externally_retrievable)
+            let entry = state.external.get(item_id);
+            (
+                entry.is_some_and(crate::store::externally_retrievable),
+                entry.and_then(|entry| entry.blob_checksum.clone()),
+            )
         };
         if !retrievable {
             return Ok(None);
         }
-        let item = match crate::store::read_item_async(&dir, item_id).await {
+        let item = match crate::store::read_item_checked_async(
+            &dir,
+            item_id,
+            expected_checksum.as_deref(),
+        )
+        .await
+        {
             Ok(item) => item,
             Err(crate::store::StoreReadFailure::Missing) => return Ok(None),
             Err(failure) => {
+                // A checksum mismatch here means the stored body no longer
+                // matches the bytes the external entry owns; the entry can
+                // never be served again. Surface that as a hard read
+                // failure (and the next reconcile quarantines the blob),
+                // not as silent content substitution.
                 return Err(AgentError::Context(format!(
                     "context store read for {item_id} failed: {}",
                     crate::store::read_failure_name(failure)

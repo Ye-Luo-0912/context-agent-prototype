@@ -3627,3 +3627,84 @@ async fn storage_required_is_not_a_residency_root() {
         "StorageRequired 条目可以离开 heap"
     );
 }
+
+/// Admit of an externalized item re-reads the owner's blob; a tampered body
+/// (valid JSON, same id, changed content) under the original checksum must
+/// fail the admit instead of substituting changed content into the working
+/// set.
+#[tokio::test]
+async fn admit_rejects_a_tampered_blob() {
+    let dir = tempfile::tempdir().unwrap();
+    let engine = SimpleContextEngine::new(SimpleContextConfig {
+        gc_buffer_capacity: 1,
+        gc_reactivate_per_pass: 8,
+        recent_file_bodies: 1,
+        context_store_dir: Some(dir.path().to_path_buf()),
+        ..SimpleContextConfig::default()
+    });
+    open_focus(&engine, "service layer").await;
+    engine
+        .ingest(ContextIngress::UserMessage {
+            content: "work on AuthService.rs".into(),
+        })
+        .await
+        .unwrap();
+    let files = ["AuthService.rs", "CacheStore.rs", "TokenCache.rs"];
+    for (i, path) in files.iter().enumerate() {
+        engine
+            .ingest(ContextIngress::ToolObservation {
+                facts: None,
+                output: fs_read_touching(
+                    &format!("step-{i}"),
+                    path,
+                    &format!("     1 | step {i}: fix {path}"),
+                ),
+                scope_id: None,
+            })
+            .await
+            .unwrap();
+    }
+    engine
+        .maintain(ContextMaintenanceTrigger::AfterModel)
+        .await
+        .unwrap();
+    let gc_report = engine.gc().await.unwrap();
+    assert_eq!(
+        gc_report.externalized, 1,
+        "overflow must externalize: {gc_report:?}"
+    );
+    let target = gc_report.externalized_ids[0];
+
+    // Tamper the blob under the same id, then admit it.
+    std::fs::write(
+        dir.path().join(format!("{target}.json")),
+        serde_json::to_vec(&agent_contracts::ContextItem {
+            content: "substituted body".into(),
+            ..engine
+                .fetch_external(target)
+                .await
+                .expect("the pre-tamper fetch must resolve")
+                .expect("the item must still be external")
+        })
+        .unwrap(),
+    )
+    .unwrap();
+    let failure = engine
+        .ingest(ContextIngress::ContextDirective {
+            action: ContextAction::Admit {
+                item_id: target,
+                reason: "the model needs this step again".into(),
+            },
+        })
+        .await
+        .unwrap_err();
+    assert!(
+        failure.to_string().contains("corrupt"),
+        "the tampered admit must fail as corruption, got: {failure}"
+    );
+    let state = engine.state.lock().await;
+    assert!(
+        !state.items.iter().any(|item| item.id == target),
+        "the substituted body must never enter the working set"
+    );
+}

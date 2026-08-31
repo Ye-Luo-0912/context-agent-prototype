@@ -15,8 +15,8 @@ use agent_contracts::{
     ContextItemSummary, ContextMaintenanceReport, ContextMaintenanceTrigger, ContextQuery,
     ContextStateTransition, EffectReconciler, EventJournal, FocusState, FsRereadClass,
     MaterializedContext, ModelCapabilities, ModelEventSink, ModelOutput, ModelRequest,
-    ModelTransport, ScopeId, ScopeKind, StorageGcReport, TaskId, ToolCall, ToolCatalogEntry,
-    ToolDispatcher, ToolExecutionAttribution, ToolLeaseReconcileReport, ToolSpec,
+    ModelTransport, ScopeId, ScopeKind, StorageGcReport, StoreReconcileReport, TaskId, ToolCall,
+    ToolCatalogEntry, ToolDispatcher, ToolExecutionAttribution, ToolLeaseReconcileReport, ToolSpec,
     ToolSurfaceSnapshot, VerificationCoverageDeclaration,
 };
 use agent_core::{CoreAuthorityConfig, CorePort, build_core_port, try_build_core_port};
@@ -481,6 +481,14 @@ impl RuntimeServices {
     /// hot path.
     pub(crate) async fn context_storage_gc(&self) -> AgentResult<StorageGcReport> {
         self.context.storage_gc().await
+    }
+
+    /// Run one store reconcile: converge the on-disk blob directory with
+    /// the external map (the crash-recovery authority over formal blobs; a
+    /// missing store dir reconciles as empty). The runtime schedules it
+    /// only at session boundaries — restore/start — never on the hot path.
+    pub(crate) async fn context_reconcile_store(&self) -> AgentResult<StoreReconcileReport> {
+        self.context.reconcile_store().await
     }
 
     /// Materialize the working set for one model request. The result is
