@@ -2,10 +2,10 @@ use super::*;
 use agent_contracts::{
     AccessSignal, ApprovalDecision, ApprovalGate, AttentionState, ContextDiagnostics,
     ContextIngress, ContextItem, ContextItemId, ContextItemSummary, ContextKind,
-    ContextMaintenanceReport, ContextQuery, ContextRef, ContextResidency, ContextRetention,
-    ContextScope, ContextStateTransition, ExternalizedContext, MaterializedContext, ScopeId,
-    ScopeKind, SemanticState, ToolRisk, ToolSemanticRole, ToolSpec, ToolSurfaceDemand,
-    ToolSurfaceOmission, ToolSurfaceOmissionReason, TurnId,
+    ContextMaintenanceReport, ContextMaintenanceTrigger, ContextQuery, ContextRef,
+    ContextResidency, ContextRetention, ContextScope, ContextStateTransition, ExternalizedContext,
+    MaterializedContext, ScopeId, ScopeKind, SemanticState, ToolRisk, ToolSemanticRole, ToolSpec,
+    ToolSurfaceDemand, ToolSurfaceOmission, ToolSurfaceOmissionReason, TurnId,
 };
 fn call(name: &str) -> ToolCall {
     ToolCall {

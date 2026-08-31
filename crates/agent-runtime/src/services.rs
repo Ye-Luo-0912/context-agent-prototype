@@ -445,6 +445,29 @@ impl RuntimeServices {
         self.context.maintain(trigger).await
     }
 
+    /// Apply one user message transactionally: ingest the body and run the
+    /// UserInput maintenance pass against one portable checkpoint,
+    /// restoring the engine if either mutation fails. The actor publishes
+    /// the audit events only after this commits; a publish failure is an
+    /// audit gap and fences the runtime.
+    pub(crate) async fn apply_user_message(
+        &self,
+        content: String,
+    ) -> AgentResult<ContextMaintenanceReport> {
+        let checkpoint = self.context.checkpoint().await?;
+        let transition = async {
+            self.context
+                .ingest(ContextIngress::UserMessage { content })
+                .await?;
+            self.context
+                .maintain(ContextMaintenanceTrigger::UserInput)
+                .await
+        }
+        .await;
+        self.finish_context_transaction("apply user message", checkpoint, transition)
+            .await
+    }
+
     /// Run a full GC pass (mark roots, sweep, reversible eviction). Called
     /// by the actor at turn boundaries; engines without a GC pass return an
     /// empty report.

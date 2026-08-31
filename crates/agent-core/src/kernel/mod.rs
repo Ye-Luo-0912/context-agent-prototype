@@ -6,13 +6,12 @@ use std::sync::{
 use agent_contracts::{
     AgentError, AgentResult, ArgumentDigest, AuthorityLease, AuthorityRecoveryStatus,
     CONTEXT_SEARCH_MAX_LIMIT, CONTEXT_SEARCH_MAX_QUERY_CHARS, CancellationToken,
-    ContextConsumptionAck, ContextEngine, ContextItemId, ContextMaintenanceTrigger,
-    ContextResidency, ContextSearchQuery, DiscoveryMiss, EffectDurability, EffectId,
-    EffectReconciler, EffectReconciliation, EngineQuery, OperationEffectContext, OperationId,
-    OperationQueryResult, OperationSnapshot, OperationState, OperationTerminal, OutputBroker,
-    ResourceDescriptor, RunId, RuntimeEvent, TaskId, ToolCall, ToolDispatcher,
-    ToolExecutionRequest, ToolOperationIdentity, ToolOutcome, ToolOutput, ToolRisk,
-    ToolSurfaceSnapshot, context_maintenance_events,
+    ContextConsumptionAck, ContextEngine, ContextItemId, ContextResidency, ContextSearchQuery,
+    DiscoveryMiss, EffectDurability, EffectId, EffectReconciler, EffectReconciliation, EngineQuery,
+    OperationEffectContext, OperationId, OperationQueryResult, OperationSnapshot, OperationState,
+    OperationTerminal, OutputBroker, ResourceDescriptor, RunId, RuntimeEvent, TaskId, ToolCall,
+    ToolDispatcher, ToolExecutionRequest, ToolOperationIdentity, ToolOutcome, ToolOutput, ToolRisk,
+    ToolSurfaceSnapshot,
 };
 
 use crate::authority::{
@@ -1392,22 +1391,10 @@ impl CoreAuthority {
     }
 
     pub(crate) async fn checkpoint(&self) -> AgentResult<serde_json::Value> {
-        // A fenced Core remains inspectable. Context maintenance is a
-        // mutation, so recovery-mode checkpoints snapshot the current engine
-        // exactly as-is and publish no maintenance claim.
-        if matches!(
-            self.recovery_status(),
-            AuthorityRecoveryStatus::RecoveryRequired { .. }
-        ) {
-            return self.context.checkpoint().await;
-        }
-        let report = self
-            .context
-            .maintain(ContextMaintenanceTrigger::Checkpoint)
-            .await?;
-        for event in context_maintenance_events(ContextMaintenanceTrigger::Checkpoint, report) {
-            self.emit_event(event).await?;
-        }
+        // Core only snapshots the engine's current state. Context
+        // maintenance is a mutation and therefore belongs to the runtime
+        // actor's schedule, never to a Core read; the actor runs
+        // `maintain(Checkpoint)` explicitly once before assembling.
         self.context.checkpoint().await
     }
 

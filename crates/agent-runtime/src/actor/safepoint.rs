@@ -66,6 +66,21 @@ impl RuntimeActor {
         &self,
         terminal_override: Option<(crate::checkpoint::TaskManagerSnapshot, u64)>,
     ) -> AgentResult<RuntimeCheckpoint> {
+        // The runtime owns the Checkpoint maintenance schedule: run it
+        // once per assembly, outside the generation-stability retry loop,
+        // so a retry never repeats logical maintenance. A fenced Core
+        // still receives a pure snapshot with no maintenance claim.
+        if !matches!(
+            self.core.recovery_status(),
+            agent_contracts::AuthorityRecoveryStatus::RecoveryRequired { .. }
+        ) {
+            let report = self
+                .services
+                .context_maintain(ContextMaintenanceTrigger::Checkpoint)
+                .await?;
+            self.emit_context_maintained(ContextMaintenanceTrigger::Checkpoint, report)
+                .await?;
+        }
         let registry = self.services.capability_registry();
         let mut last_error: Option<AgentError> = None;
         for _ in 0..3 {

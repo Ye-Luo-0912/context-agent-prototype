@@ -116,24 +116,36 @@ impl RuntimeActor {
         input.turn_id = Some(turn_id);
         input.task_id = self.state.task_id;
         input.lifecycle = InputLifecycle::Applied;
-        // ingest 成功后再发 Applied 事件，避免日志里有 Accepted 而上下文没有正文。
-        if !continuation {
-            self.services
-                .context_ingest(ContextIngress::UserMessage {
-                    content: content.clone(),
-                })
-                .await?;
-        }
         let applied = input.with_lifecycle(InputLifecycle::Applied);
-        self.emit_user_input(applied.clone()).await?;
-        let report = self
-            .services
-            .context_maintain(ContextMaintenanceTrigger::UserInput)
-            .await?;
-        self.emit_context_maintained(ContextMaintenanceTrigger::UserInput, report)
-            .await?;
-
-        if !continuation {
+        if continuation {
+            // A continuation re-runs the stored directive without
+            // ingesting a new body: no context mutation precedes these
+            // audit events, so an event failure is a plain error, not an
+            // audit gap.
+            self.emit_user_input(applied.clone()).await?;
+            let report = self
+                .services
+                .context_maintain(ContextMaintenanceTrigger::UserInput)
+                .await?;
+            self.emit_context_maintained(ContextMaintenanceTrigger::UserInput, report)
+                .await?;
+        } else {
+            // Context application is one recoverable transaction: a
+            // UserInput maintenance failure restores the engine, so the
+            // context plane never runs ahead of task/audit state. The
+            // audit events are published only after the transaction
+            // commits; a publish failure is an audit gap and fences the
+            // runtime before any further mutation.
+            let report = self.services.apply_user_message(content.clone()).await?;
+            if let Err(error) = self.emit_user_input(applied.clone()).await {
+                return Err(self.audit_gap_after_commit(error).await);
+            }
+            if let Err(error) = self
+                .emit_context_maintained(ContextMaintenanceTrigger::UserInput, report)
+                .await
+            {
+                return Err(self.audit_gap_after_commit(error).await);
+            }
             self.state.tasks.on_user_turn(&content);
         }
 
