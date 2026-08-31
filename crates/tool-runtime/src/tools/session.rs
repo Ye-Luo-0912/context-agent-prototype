@@ -1360,7 +1360,13 @@ mod tests {
         let arguments = json!({"action": "start", "argv": argv});
         let context = start_ctx(run_id, &arguments);
         let error = tool
-            .execute(run_id, "c", arguments, Some(context), CancellationToken::new())
+            .execute(
+                run_id,
+                "c",
+                arguments,
+                Some(context),
+                CancellationToken::new(),
+            )
             .await
             .expect_err("the sabotaged artifact phase must fail the start");
         assert!(error.to_string().contains("artifact"), "{error}");
