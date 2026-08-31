@@ -461,6 +461,108 @@ impl RuntimeActor {
         }
     }
 
+    /// Runtime-owned proof-refresh transaction for the completion gate.
+    /// When the only applicable blockers are proof-shaped
+    /// (`VerificationNotCurrent` / `AcceptanceUncovered`), an explicit
+    /// completion intent may run the host-declared exact verifier once
+    /// under a pre/post world fence: the PASS is recorded through the same
+    /// trusted observation lane as a `verify.run` result and receipts are
+    /// minted against the same basis. The transaction never bypasses open
+    /// loops, effect debt, recovery or approval — any such blocker makes
+    /// it ineligible — and every failure keeps the ordinary refusal.
+    pub(super) async fn refresh_proof_before_completion(&mut self) {
+        if !self.services.project_proof_refresh() {
+            return;
+        }
+        let Some(verifier) = self.services.proof_verifier().cloned() else {
+            return;
+        };
+        let Some(turn) = self.state.turn.as_ref() else {
+            return;
+        };
+        let readiness = self.completion_proposal_readiness(Some(&turn.execution));
+        if readiness.allows_completion() || !proof_is_sole_blocker(&readiness) {
+            return;
+        }
+        let Some((_, _, recipe_id)) = self.current_completion_proof_route(&readiness) else {
+            return;
+        };
+        let Some(basis) = readiness.verification_basis else {
+            return;
+        };
+        let request = crate::verification::ProofVerifierRequest {
+            run_id: self.core.run_id(),
+            task_id: basis.task_id,
+            recipe_id: recipe_id.clone(),
+            verification_revision: basis.verification_revision,
+            directive_revision: basis.directive_revision,
+            workspace_revision: basis.workspace_revision,
+        };
+        let Ok(outcome) = verifier.verify_exact(request).await else {
+            return;
+        };
+        // Fence post: the same world must still hold. A moved world forgets
+        // the run instead of trusting a stale check.
+        let Some(turn) = self.state.turn.as_ref() else {
+            return;
+        };
+        if turn.execution.verification.spec_revision != basis.verification_revision
+            || turn.execution.directive_revision != basis.directive_revision
+            || turn.execution.workspace_revision != basis.workspace_revision
+        {
+            return;
+        }
+        if !outcome.ok || outcome.verification_identity.is_empty() {
+            return;
+        }
+        // The host executor and the gate's attribution must agree on the
+        // exact identity for the recipe; a mismatch fails closed.
+        let call = ToolCall {
+            id: format!("proof-refresh-{}", now_ms()),
+            name: "verify.run".into(),
+            arguments: serde_json::json!({ "recipe_id": recipe_id.clone() }),
+        };
+        let attribution = self.runtime_execution_attribution(&call);
+        if attribution.exact_verification_identity() != Some(outcome.verification_identity.as_str())
+        {
+            return;
+        }
+        let argument_digest = agent_contracts::ContentDigest::sha256_bytes(
+            serde_json::to_vec(&call.arguments)
+                .as_deref()
+                .unwrap_or_default(),
+        )
+        .to_string();
+        // Record the PASS through the same trusted observation lane as a
+        // `verify.run` result: exact-current-world verification with a
+        // bounded mutation bound, attributed to the same host recipe.
+        let mut output = ToolOutput {
+            call_id: call.id,
+            tool_name: call.name,
+            ok: true,
+            summary: bounded_preview(&outcome.summary, agent_contracts::MAX_TOOL_SUMMARY_CHARS),
+            model_content: String::new(),
+            artifact_ref: None,
+            metadata: serde_json::json!({ "verification": true }),
+        };
+        output.set_native_execution_facts(
+            agent_contracts::ToolExecutionFacts::empty()
+                .with_verification(true)
+                .with_mutation_bound(true),
+        );
+        let facts = self.services.tools().execution_facts(&output);
+        let observation = self.observe_persistable_tool(
+            &output,
+            ToolResultDisposition::PersistObservation,
+            &argument_digest,
+            &facts,
+            Some(&attribution),
+        );
+        if let Some(observation) = observation {
+            let _ = self.report_frontier(Some(observation)).await;
+        }
+    }
+
     /// Apply a structured completion proposal and replace the tool's
     /// optimistic submission text with Runtime's authoritative gate result.
     /// A refusal is a normal, bounded tool failure visible to the next model
@@ -470,6 +572,12 @@ impl RuntimeActor {
         output: &mut ToolOutput,
         proposal: CompletionProposal,
     ) {
+        // Runtime-owned proof-refresh transaction: before accepting, one
+        // explicit completion intent may refresh a stale proof itself. A
+        // PASS only lands when proof is the sole blocker and the host
+        // verifier agrees with the gate's attribution; everything else
+        // falls through to the ordinary refusal below.
+        self.refresh_proof_before_completion().await;
         if let Err(error) = self.accept_completion_proposal(proposal) {
             let readiness = self
                 .state
@@ -2309,4 +2417,20 @@ impl RuntimeActor {
             "{message}; runtime remains fenced"
         )))
     }
+}
+
+/// Whether the only applicable completion blockers are proof-shaped. The
+/// runtime-owned proof-refresh transaction may run only then: any other
+/// blocker (open loops, effect debt, recovery, approval, operator closure)
+/// makes it ineligible and the gate keeps its ordinary refusal.
+fn proof_is_sole_blocker(readiness: &CompletionReadiness) -> bool {
+    let blockers = readiness.applicable_blockers();
+    !blockers.is_empty()
+        && blockers.iter().all(|blocker| {
+            matches!(
+                blocker,
+                CompletionBlocker::VerificationNotCurrent
+                    | CompletionBlocker::AcceptanceUncovered { .. }
+            )
+        })
 }

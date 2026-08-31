@@ -27,6 +27,7 @@ mod services;
 mod sink;
 mod surface;
 pub mod task;
+mod verification;
 
 pub use actor::spawn_runtime;
 pub use budget::{
@@ -70,3 +71,4 @@ pub use task::{
     RootClaimStrength, TaskAnchor, TaskCompletionPolicy, TaskInfo, TaskManager, TaskRecord,
     TaskStatus, TaskToolRequirementSet, anchor_root_claims, task_anchor_view,
 };
+pub use verification::{ProofVerifier, ProofVerifierOutcome, ProofVerifierRequest};

@@ -1,4 +1,5 @@
 use std::{
+    collections::VecDeque,
     sync::{
         Arc,
         atomic::{AtomicBool, AtomicUsize, Ordering},
@@ -2095,4 +2096,410 @@ async fn consecutive_refusals_against_the_same_basis_accrue_durably() {
     );
     assert_eq!(record.plan["schema"], "completion-repair.v1");
     instance.shutdown().await.unwrap();
+}
+
+// ---------------------------------------------------------------------------
+// Runtime-owned proof-refresh transaction: a task whose only remaining
+// completion blockers are proof-shaped (`VerificationNotCurrent` /
+// `AcceptanceUncovered`) may run the host-declared exact verifier once
+// before accepting. A PASS lands only when the verifier identity matches
+// the trusted host attribution for the same recipe; every failure keeps
+// the ordinary refusal.
+// ---------------------------------------------------------------------------
+
+/// Serves `verify.run` under the exact name the proof route resolves,
+/// plus `task.complete`, over the completion-fixture coverage domain.
+#[derive(Debug)]
+struct ProofRefreshDispatcher;
+
+#[async_trait::async_trait]
+impl ToolDispatcher for ProofRefreshDispatcher {
+    fn specs(&self) -> Vec<ToolSpec> {
+        let mut specs = vec![ToolSpec {
+            name: "verify.run".into(),
+            description: "trusted completion fixture verifier".into(),
+            input_schema: json!({"type": "object"}),
+            risk: ToolRisk::ProcessExecution,
+            output_budget: None,
+            roles: Vec::new(),
+        }];
+        specs.push(ToolSpec {
+            name: "task.complete".into(),
+            description: "propose completion".into(),
+            input_schema: json!({"type": "object"}),
+            risk: ToolRisk::ReadOnly,
+            output_budget: None,
+            roles: Vec::new(),
+        });
+        specs
+    }
+
+    fn execution_attribution(&self, call: &ToolCall) -> ToolExecutionAttribution {
+        if call.name == "verify.run" {
+            return ToolExecutionAttribution::bounded(
+                ToolExecutionPurpose::Verify,
+                Vec::<String>::new(),
+                VerificationReuse::ExactCurrentWorld,
+            )
+            .with_verification_identity_material(COMPLETION_VERIFY_IDENTITY_MATERIAL)
+            .with_verification_recipe(agent_contracts::VerificationRecipeProvenance {
+                recipe_id: "completion-fixture-recipe".into(),
+                recipe_revision: "v1".into(),
+                coverage_domain: Some(COMPLETION_ACCEPTANCE_DOMAIN.into()),
+                domain_declaration_revision: Some(1),
+                domain_source_digest: completion_acceptance_declaration().source_digest,
+                class_identity_digest: "completion-fixture-class".into(),
+            });
+        }
+        ToolExecutionAttribution::default()
+    }
+
+    fn verification_coverage_declarations(
+        &self,
+    ) -> Vec<agent_contracts::VerificationCoverageDeclaration> {
+        vec![completion_acceptance_declaration()]
+    }
+
+    async fn execute(&self, request: ToolExecutionRequest) -> AgentResult<ToolOutcome> {
+        if request.call.name == "verify.run" {
+            return Ok(ToolOutcome::Value(ToolOutput {
+                call_id: request.call.id,
+                tool_name: request.call.name,
+                ok: true,
+                summary: "completion fixture verified".into(),
+                model_content: "completion fixture verified".into(),
+                artifact_ref: None,
+                metadata: json!({"verification": true}),
+            }));
+        }
+        let summary: String = request.call.arguments["summary"]
+            .as_str()
+            .unwrap_or_default()
+            .to_string();
+        Ok(ToolOutcome::RuntimeDirective {
+            output: ToolOutput {
+                call_id: request.call.id,
+                tool_name: request.call.name,
+                ok: true,
+                summary: "completion proposed".into(),
+                model_content: "completion proposed".into(),
+                artifact_ref: None,
+                metadata: json!({}),
+            },
+            directive: agent_contracts::RuntimeDirective::CompleteTask(
+                agent_contracts::CompletionProposal {
+                    summary,
+                    artifacts: Vec::new(),
+                },
+            ),
+        })
+    }
+}
+
+/// The host's exact verifier identity for the completion-fixture material.
+fn completion_verifier_identity() -> String {
+    agent_contracts::ContentDigest::sha256_bytes(
+        COMPLETION_VERIFY_IDENTITY_MATERIAL.trim().as_bytes(),
+    )
+    .to_string()
+}
+
+/// Scripted host verifier: records each request and yields queued outcomes.
+/// `None` outcomes count as errors, so refusal paths can assert zero calls
+/// without fabricating results.
+#[derive(Debug, Clone)]
+struct ScriptedProofVerifier {
+    outcomes: Arc<tokio::sync::Mutex<VecDeque<AgentResult<agent_runtime::ProofVerifierOutcome>>>>,
+    calls: Arc<std::sync::Mutex<Vec<agent_runtime::ProofVerifierRequest>>>,
+}
+
+impl ScriptedProofVerifier {
+    fn new(outcomes: Vec<AgentResult<agent_runtime::ProofVerifierOutcome>>) -> Self {
+        Self {
+            outcomes: Arc::new(tokio::sync::Mutex::new(outcomes.into())),
+            calls: Arc::new(std::sync::Mutex::new(Vec::new())),
+        }
+    }
+
+    fn call_count(&self) -> usize {
+        self.calls.lock().unwrap().len()
+    }
+
+    fn requests(&self) -> Vec<agent_runtime::ProofVerifierRequest> {
+        self.calls.lock().unwrap().clone()
+    }
+}
+
+#[async_trait::async_trait]
+impl agent_runtime::ProofVerifier for ScriptedProofVerifier {
+    async fn verify_exact(
+        &self,
+        request: agent_runtime::ProofVerifierRequest,
+    ) -> AgentResult<agent_runtime::ProofVerifierOutcome> {
+        self.calls.lock().unwrap().push(request.clone());
+        self.outcomes
+            .lock()
+            .await
+            .pop_front()
+            .unwrap_or_else(|| Err(AgentError::Tool("no scripted proof outcome queued".into())))
+    }
+}
+
+/// Round 0 verifies, round 2 proposes completion; odd rounds end the turn.
+/// The first user turn ends after the verification, a second user turn
+/// moves the directive (stale PASS/receipt) and proposes completion.
+#[derive(Debug)]
+struct ProofRefreshModel {
+    rounds: AtomicUsize,
+}
+
+#[async_trait::async_trait]
+impl ModelTransport for ProofRefreshModel {
+    fn capabilities(&self) -> ModelCapabilities {
+        ModelCapabilities::default()
+    }
+    async fn complete(&self, _request: ModelRequest) -> AgentResult<ModelOutput> {
+        let round = self.rounds.fetch_add(1, Ordering::SeqCst);
+        Ok(if round == 0 {
+            ModelOutput {
+                content: String::new(),
+                tool_calls: vec![ToolCall {
+                    id: "proof-verify".into(),
+                    name: "verify.run".into(),
+                    arguments: json!({"recipe_id": "completion-fixture-recipe"}),
+                }],
+                usage: Default::default(),
+            }
+        } else if round == 2 {
+            ModelOutput {
+                content: String::new(),
+                tool_calls: vec![ToolCall {
+                    id: "proof-complete".into(),
+                    name: "task.complete".into(),
+                    arguments: json!({"summary": "the fixture is verified", "artifacts": []}),
+                }],
+                usage: Default::default(),
+            }
+        } else {
+            ModelOutput {
+                content: "round done".into(),
+                tool_calls: Vec::new(),
+                usage: Default::default(),
+            }
+        })
+    }
+}
+
+/// Runs the proof-refresh scenario: first a user turn verifies (PASS
+/// recorded against directive revision N), then a second user turn moves
+/// the directive and proposes completion. Returns the authoritative
+/// `task.complete` output, the verifier's recorded requests and the
+/// checkpoint once the second turn settles.
+async fn run_proof_refresh_scenario(
+    verifier: Arc<ScriptedProofVerifier>,
+    open_loop: bool,
+) -> (
+    ToolOutput,
+    Vec<agent_runtime::ProofVerifierRequest>,
+    agent_runtime::checkpoint::RuntimeCheckpoint,
+) {
+    let model = Arc::new(ProofRefreshModel {
+        rounds: AtomicUsize::new(0),
+    });
+    let services = RuntimeServices::new(
+        CoreAuthorityConfig::default(),
+        Arc::new(TestContextEngine),
+        model,
+        Arc::new(ProofRefreshDispatcher),
+        Arc::new(PolicyApprovalGate::permissive()),
+        None,
+    )
+    .with_proof_verifier(verifier.clone())
+    .with_project_proof_refresh(true);
+    let instance = RuntimeInstance::spawn(ModuleHost::new(), services);
+    let handle = instance.handle();
+    let mut events = handle.subscribe();
+    handle.start().await.unwrap();
+    handle
+        .set_focus("finish only with evidence".into())
+        .await
+        .unwrap();
+    let task_id = handle.list_tasks().await.unwrap()[0].id;
+    let patch = agent_runtime::AnchorPatch {
+        completion_policy: Some(agent_runtime::task::TaskCompletionPolicy::EvidenceRequired),
+        acceptance_criteria: Some(vec![agent_runtime::task::AcceptanceCriterion::declared(
+            "trusted completion fixture passes",
+            &completion_acceptance_declaration(),
+        )]),
+        open_loops: open_loop.then(|| vec!["verify one more edge case".into()]),
+        ..agent_runtime::AnchorPatch::default()
+    };
+    handle.patch_task_anchor(task_id, 0, patch).await.unwrap();
+
+    // Turn 1: the model verifies the fixture (PASS observed + receipt).
+    handle
+        .user_message("verify the fixture".into())
+        .await
+        .unwrap();
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+    while tokio::time::Instant::now() < deadline {
+        if let Ok(Ok(envelope)) =
+            tokio::time::timeout(Duration::from_millis(50), events.recv()).await
+            && matches!(envelope.event, RuntimeEvent::TurnCompleted)
+        {
+            break;
+        }
+    }
+
+    // Turn 2: the world moved (directive revision), the stale proof is the
+    // only remaining blocker, and the model proposes completion.
+    handle
+        .user_message("now finish the task".into())
+        .await
+        .unwrap();
+    let mut completion_output = None;
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+    while tokio::time::Instant::now() < deadline {
+        if let Ok(Ok(envelope)) =
+            tokio::time::timeout(Duration::from_millis(50), events.recv()).await
+        {
+            match envelope.event {
+                RuntimeEvent::ToolFinished { output } if output.tool_name == "task.complete" => {
+                    completion_output = Some(output);
+                }
+                RuntimeEvent::TurnCompleted if completion_output.is_some() => break,
+                _ => {}
+            }
+        }
+    }
+    let output = completion_output.expect("task.complete must publish its authoritative result");
+    let checkpoint = instance.checkpoint().await.unwrap();
+    instance.shutdown().await.unwrap();
+    (output, verifier.requests(), checkpoint)
+}
+
+#[tokio::test]
+async fn proof_refresh_passes_only_proof_blocker_and_commits_completion() {
+    let verifier = Arc::new(ScriptedProofVerifier::new(vec![Ok(
+        agent_runtime::ProofVerifierOutcome {
+            ok: true,
+            summary: "fixture re-verified at the new directive".into(),
+            verification_identity: completion_verifier_identity(),
+        },
+    )]));
+    let (output, requests, checkpoint) = run_proof_refresh_scenario(verifier.clone(), false).await;
+
+    assert!(
+        output.ok,
+        "the refreshed proof must admit the completion; got {output:?}"
+    );
+    assert_eq!(
+        output.metadata["completion_state"],
+        "pending_terminal_commit"
+    );
+    assert_eq!(
+        verifier.call_count(),
+        1,
+        "the transaction must run the host verifier exactly once"
+    );
+    let request = requests.into_iter().next().expect("one recorded request");
+    assert_eq!(request.recipe_id, "completion-fixture-recipe");
+    assert!(
+        checkpoint.tasks.completed.iter().any(|record| {
+            record.summary == "the fixture is verified" && record.anchor_revision >= 1
+        }),
+        "the refreshed completion must commit a durable CompletionRecord"
+    );
+}
+
+#[tokio::test]
+async fn proof_refresh_failure_keeps_the_ordinary_refusal() {
+    let verifier = Arc::new(ScriptedProofVerifier::new(vec![Ok(
+        agent_runtime::ProofVerifierOutcome {
+            ok: false,
+            summary: "the fixture still fails at the new directive".into(),
+            verification_identity: String::new(),
+        },
+    )]));
+    let (output, requests, checkpoint) = run_proof_refresh_scenario(verifier.clone(), false).await;
+
+    assert!(
+        !output.ok,
+        "a failed verifier must keep the ordinary refusal"
+    );
+    assert_eq!(output.metadata["refused"], "completion_gate");
+    assert_eq!(
+        verifier.call_count(),
+        1,
+        "the transaction still ran the verifier; the refusal comes from its outcome"
+    );
+    assert_eq!(requests.len(), 1);
+    assert!(checkpoint.tasks.completed.is_empty());
+}
+
+#[tokio::test]
+async fn proof_refresh_identity_mismatch_fails_closed() {
+    let verifier = Arc::new(ScriptedProofVerifier::new(vec![Ok(
+        agent_runtime::ProofVerifierOutcome {
+            ok: true,
+            summary: "the verifier claims success".into(),
+            verification_identity: "a-different-host-identity".into(),
+        },
+    )]));
+    let (output, _requests, checkpoint) = run_proof_refresh_scenario(verifier.clone(), false).await;
+
+    assert!(
+        !output.ok,
+        "an identity mismatch must fail closed instead of trusting the PASS"
+    );
+    assert_eq!(output.metadata["refused"], "completion_gate");
+    assert_eq!(
+        verifier.call_count(),
+        1,
+        "the verifier ran, but its identity did not match the host attribution"
+    );
+    assert!(checkpoint.tasks.completed.is_empty());
+}
+
+#[tokio::test]
+async fn proof_refresh_verifier_error_keeps_the_ordinary_refusal() {
+    let verifier = Arc::new(ScriptedProofVerifier::new(vec![Err(AgentError::Tool(
+        "scripted verifier failure".into(),
+    ))]));
+    let (output, requests, checkpoint) = run_proof_refresh_scenario(verifier.clone(), false).await;
+
+    assert!(!output.ok, "a verifier error must not manufacture a PASS");
+    assert_eq!(output.metadata["refused"], "completion_gate");
+    assert_eq!(verifier.call_count(), 1);
+    assert_eq!(requests.len(), 1);
+    assert!(checkpoint.tasks.completed.is_empty());
+}
+
+#[tokio::test]
+async fn proof_refresh_is_skipped_when_an_open_loop_blocks_completion() {
+    let verifier = Arc::new(ScriptedProofVerifier::new(vec![Ok(
+        agent_runtime::ProofVerifierOutcome {
+            ok: true,
+            summary: "must never be produced".into(),
+            verification_identity: completion_verifier_identity(),
+        },
+    )]));
+    let (output, _requests, checkpoint) = run_proof_refresh_scenario(verifier.clone(), true).await;
+
+    assert!(
+        !output.ok,
+        "an open loop is not a proof-shaped blocker; the gate must refuse ordinarily"
+    );
+    assert_eq!(output.metadata["refused"], "completion_gate");
+    assert!(
+        output.metadata["blockers"]
+            .to_string()
+            .contains("open_loops")
+    );
+    assert_eq!(
+        verifier.call_count(),
+        0,
+        "the transaction must be ineligible while any non-proof blocker remains"
+    );
+    assert!(checkpoint.tasks.completed.is_empty());
 }

@@ -114,7 +114,10 @@ impl RuntimeActor {
     /// the last pre-dispatch safe point. Exact textual path mentions are
     /// allowed only from current/evolvable task fields; the historical task
     /// origin alone is not a perpetual precondition.
-    fn runtime_execution_attribution(&self, call: &ToolCall) -> RuntimeExecutionAttribution {
+    pub(super) fn runtime_execution_attribution(
+        &self,
+        call: &ToolCall,
+    ) -> RuntimeExecutionAttribution {
         let host = self.services.tool_execution_attribution(call);
         let active_task = self
             .state
@@ -1446,7 +1449,7 @@ impl RuntimeActor {
         task.resume.fact_for(path).cloned()
     }
 
-    fn observe_persistable_tool(
+    pub(super) fn observe_persistable_tool(
         &mut self,
         output: &ToolOutput,
         disposition: ToolResultDisposition,
@@ -1599,7 +1602,7 @@ impl RuntimeActor {
     /// 计数，不含任何工具正文；收敛指标从这里聚合。同批的义务账目
     /// 事件（ ）逐条出账，报告可从事件流独立验证
     /// max_attempts_per_epoch / max_total_attempts_per_lineage。
-    async fn report_frontier(
+    pub(super) async fn report_frontier(
         &mut self,
         observation: Option<crate::execution::FrontierObservation>,
     ) {

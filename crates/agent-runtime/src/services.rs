@@ -73,6 +73,12 @@ pub struct RuntimeServices {
     /// spawn so the actor's safe-point checkpoints capture the full plane
     /// set. The actor snapshots it; it never mutates through this handle.
     capability_registry: Option<Arc<crate::capability::CapabilityRegistry>>,
+    /// Optional host-side exact verifier for the completion-gate
+    /// proof-refresh transaction. `None` keeps ordinary refusals.
+    proof_verifier: Option<Arc<dyn crate::verification::ProofVerifier>>,
+    /// Ablation: when false (the default), the gate never runs the
+    /// proof-refresh transaction even with a verifier injected.
+    project_proof_refresh: bool,
 }
 
 fn snapshot_verification_coverage_declarations(
@@ -185,6 +191,8 @@ impl RuntimeServices {
             project_completion_opportunity: false,
             recovery_surface: false,
             capability_registry: None,
+            proof_verifier: None,
+            project_proof_refresh: false,
         }
     }
 
@@ -225,6 +233,8 @@ impl RuntimeServices {
             project_completion_opportunity: false,
             recovery_surface: false,
             capability_registry: None,
+            proof_verifier: None,
+            project_proof_refresh: false,
         })
     }
 
@@ -338,6 +348,32 @@ impl RuntimeServices {
 
     pub(crate) fn recovery_surface(&self) -> bool {
         self.recovery_surface
+    }
+
+    /// Inject the host-side exact verifier for the completion-gate
+    /// proof-refresh transaction. Without it (the default) the gate always
+    /// returns ordinary refusals even when the switch is on.
+    pub fn with_proof_verifier(
+        mut self,
+        verifier: Arc<dyn crate::verification::ProofVerifier>,
+    ) -> Self {
+        self.proof_verifier = Some(verifier);
+        self
+    }
+
+    /// Opt the gate into the runtime-owned proof-refresh transaction.
+    /// Default off; only a consciously injected host verifier may enable it.
+    pub fn with_project_proof_refresh(mut self, project: bool) -> Self {
+        self.project_proof_refresh = project;
+        self
+    }
+
+    pub(crate) fn proof_verifier(&self) -> Option<&Arc<dyn crate::verification::ProofVerifier>> {
+        self.proof_verifier.as_ref()
+    }
+
+    pub(crate) fn project_proof_refresh(&self) -> bool {
+        self.project_proof_refresh
     }
 
     pub(crate) fn artifact_workspace(&self) -> Option<&Workspace> {
