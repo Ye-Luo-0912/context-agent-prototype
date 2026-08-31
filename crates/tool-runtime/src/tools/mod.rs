@@ -22,7 +22,9 @@ pub(crate) use edit::EditReplaceTool;
 pub(crate) use fs::{FsListTool, FsMkdirTool, FsReadTool, FsWriteTool};
 pub(crate) use git::{GitDiffTool, GitStatusTool};
 pub(crate) use patch::EditPatchTool;
-pub(crate) use process::{ProcessRunTool, verification_executable_identity};
+pub(crate) use process::{
+    ProcessArgs, ProcessInvocation, ProcessRunTool, verification_executable_identity,
+};
 pub(crate) use search::SearchGrepTool;
 pub(crate) use session::{ProcessSession, ProcessSessionTool};
 pub(crate) use shell::ShellExecTool;

@@ -511,6 +511,12 @@ pub(crate) struct ProcessInvocation<'a> {
     pub(crate) args: ProcessArgs,
     pub(crate) effect_context: Option<OperationEffectContext>,
     pub(crate) cancel: CancellationToken,
+    /// Host-owned lane (proof refresh): the composition root is the
+    /// authority, so there is no Core-issued effect identity to require or
+    /// persist. Intent coverage still runs against the caller-provided
+    /// policy (the recipe host policy), and bounded execution, timeouts and
+    /// whole-tree kill are unchanged.
+    pub(crate) host_trusted: bool,
 }
 
 fn default_timeout_ms() -> u64 {
@@ -568,6 +574,7 @@ impl Tool for ProcessRunTool {
             args,
             effect_context,
             cancel,
+            host_trusted: false,
         })
         .await
     }
@@ -587,6 +594,7 @@ impl ProcessRunTool {
             args,
             effect_context,
             cancel,
+            host_trusted,
         } = invocation;
         if args.argv.is_empty() {
             return Err(AgentError::InvalidRequest(format!(
@@ -631,7 +639,9 @@ impl ProcessRunTool {
             None => self.workspace.root().to_path_buf(),
         };
 
-        super::require_process_effect_context(&effect_context, tool_name)?;
+        if !host_trusted {
+            super::require_process_effect_context(&effect_context, tool_name)?;
+        }
         let actual_intent = agent_contracts::exec_argv_intent(&args.argv);
         if !authority_policy
             .intent_from(authority_arguments)
@@ -730,17 +740,26 @@ impl ProcessRunTool {
             }
             Err(e) => return Err(AgentError::Tool(format!("spawn {}: {e}", args.argv[0]))),
         };
-        let pid = match super::persist_spawned_process(
-            &self.workspace,
-            &effect_context,
-            &child,
-            tool_name,
-        ) {
-            Ok(pid) => pid,
-            Err(error) => {
-                super::abandon_spawned_process(&mut child);
-                let _ = child.kill().await;
-                return Err(error);
+        // The host-owned proof lane is a synchronous short transaction: the
+        // composition root has no Core identity to persist, and cancel or
+        // timeout kill the whole tree before the run returns. Crash recovery
+        // therefore never reaps a host proof child, which is safe because
+        // nothing outlives the run.
+        let pid: Option<u32> = if host_trusted {
+            None
+        } else {
+            match super::persist_spawned_process(
+                &self.workspace,
+                &effect_context,
+                &child,
+                tool_name,
+            ) {
+                Ok(pid) => Some(pid),
+                Err(error) => {
+                    super::abandon_spawned_process(&mut child);
+                    let _ = child.kill().await;
+                    return Err(error);
+                }
             }
         };
 
@@ -819,11 +838,13 @@ impl ProcessRunTool {
                     .map_err(|e| AgentError::Tool(format!("wait: {e}")))?,
             );
         }
-        super::persist_process_exit(
-            &self.workspace,
-            pid,
-            exited.as_ref().and_then(|status| status.code()),
-        )?;
+        if let Some(pid) = pid {
+            super::persist_process_exit(
+                &self.workspace,
+                pid,
+                exited.as_ref().and_then(|status| status.code()),
+            )?;
+        }
         let model_content = capture.model_tail();
         let total_lines = capture.total_lines();
         let total_bytes = capture.total_bytes();

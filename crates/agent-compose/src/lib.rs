@@ -36,8 +36,10 @@ use tokio::sync::broadcast;
 mod compactor;
 mod host_policies;
 mod mock_model;
+mod proof_verifier;
 
 pub use host_policies::HostToolPolicyRegistry;
+pub use proof_verifier::HostProofVerifier;
 
 pub use compactor::ModelBackedCompactor;
 pub use mock_model::MockModelTransport;
@@ -230,6 +232,15 @@ pub struct ComposeConfig {
     /// 预留日志开关（默认关）：给出路径后，每个已批准效果跨持久
     /// 三相屏障，崩溃后启动对账可咨询经纪预留面。晋级语义不变。
     pub effect_reservation_journal: Option<std::path::PathBuf>,
+    /// Host verification recipes shared with the `verify.run` tool surface.
+    /// When present, `compose` can inject a host proof runner into the
+    /// completion gate. Nothing executes unless `project_proof_refresh` is
+    /// also enabled (default closed).
+    pub verification_recipes: Option<Arc<tool_runtime::VerificationRecipes>>,
+    /// Enable the composition-owned exact proof-refresh transaction (default
+    /// false). Requires `verification_recipes`: a true flag without the table
+    /// fails the composition closed instead of silently disabling.
+    pub project_proof_refresh: bool,
 }
 
 /// A composed runtime. Owns the workspace and the spawned `RuntimeInstance`
@@ -290,6 +301,8 @@ pub async fn compose(config: ComposeConfig) -> anyhow::Result<ComposedRuntime> {
         recovery_surface,
         host_policies,
         effect_reservation_journal,
+        verification_recipes,
+        project_proof_refresh,
     } = config;
 
     // 授权映射是组合根的决定：内置表加运维准入的插件绑定，内核与
@@ -369,9 +382,146 @@ pub async fn compose(config: ComposeConfig) -> anyhow::Result<ComposedRuntime> {
     services = services.with_settlement_projection_diagnostics(settlement_projection_diagnostics);
     services = services.with_project_completion_opportunity(project_completion_opportunity);
     services = services.with_recovery_surface(recovery_surface);
+    // 宿主 exact 证明刷新（默认关）：开启后 completion gate 在仅剩
+    // proof blocker 时自动重跑宿主注册的 exact recipe。要求 recipe 表
+    // 在场，否则整次组合失败关闭——开关被打开却静默失效比拒绝更危险。
+    if project_proof_refresh {
+        let recipes = verification_recipes.ok_or_else(|| {
+            anyhow::anyhow!("project proof refresh requires host verification recipes")
+        })?;
+        let runner = tool_runtime::RecipeProofRunner::new(workspace.clone(), recipes)
+            .ok_or_else(|| anyhow::anyhow!("verification recipes register no host policy"))?;
+        services = services.with_proof_verifier(Arc::new(HostProofVerifier::new(runner)));
+        services = services.with_project_proof_refresh(true);
+    }
     let instance = RuntimeInstance::spawn(host, services);
     Ok(ComposedRuntime {
         workspace,
         instance,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use agent_contracts::{ApprovalGate, ContextEngine, ModelTransport, ToolDispatcher};
+    use agent_core::PolicyApprovalGate;
+    use agent_runtime::ProofVerifier;
+    use context_simple::{SimpleContextConfig, SimpleContextEngine};
+    use tool_runtime::{BuiltinToolDispatcher, VerificationRecipe, VerificationRecipes};
+
+    fn host_echo_recipe() -> VerificationRecipe {
+        #[cfg(windows)]
+        let argv = vec![
+            "cmd".into(),
+            "/C".into(),
+            "echo".into(),
+            "host-proof".into(),
+        ];
+        #[cfg(not(windows))]
+        let argv = vec!["echo".into(), "host-proof".into()];
+        VerificationRecipe::new("host.echo", "Echo host proof marker", "v1", argv)
+            .unwrap()
+            .with_exact_current_world_reuse()
+    }
+
+    fn compose_config(
+        workspace: Workspace,
+        recipes: Option<Arc<VerificationRecipes>>,
+        refresh: bool,
+    ) -> ComposeConfig {
+        let engine: Arc<dyn ContextEngine> =
+            Arc::new(SimpleContextEngine::new(SimpleContextConfig::default()));
+        let model: Arc<dyn ModelTransport> = Arc::new(MockModelTransport);
+        let approval: Arc<dyn ApprovalGate> = Arc::new(PolicyApprovalGate::permissive());
+        let base_tools: Arc<dyn ToolDispatcher> =
+            Arc::new(BuiltinToolDispatcher::new(workspace.clone()));
+        ComposeConfig {
+            workspace,
+            context_engine: engine,
+            model,
+            approval,
+            base_tools,
+            capability_aware: false,
+            journal: None,
+            artifact_store: None,
+            output_broker: None,
+            max_tool_rounds: None,
+            project_task_progress: true,
+            project_settlement: false,
+            settlement_projection_diagnostics: false,
+            project_completion_opportunity: false,
+            recovery_surface: false,
+            host_policies: None,
+            effect_reservation_journal: None,
+            verification_recipes: recipes,
+            project_proof_refresh: refresh,
+        }
+    }
+
+    async fn run_smoke(config: ComposeConfig) {
+        let composed = compose(config).await.unwrap();
+        composed.instance.start().await.unwrap();
+        composed.shutdown().await.unwrap();
+    }
+
+    /// The default composition injects no host verifier and keeps the
+    /// proof-refresh switch off: existing compositions are unchanged.
+    #[tokio::test]
+    async fn default_composition_keeps_proof_refresh_closed() {
+        let dir = tempfile::tempdir().unwrap();
+        let workspace = Workspace::open(dir.path()).await.unwrap();
+        run_smoke(compose_config(workspace, None, false)).await;
+    }
+
+    /// Enabling the switch without the recipe table fails the composition
+    /// closed; a silently disabled gate is worse than a refused boot.
+    #[tokio::test]
+    async fn enabled_refresh_without_recipes_fails_closed() {
+        let dir = tempfile::tempdir().unwrap();
+        let workspace = Workspace::open(dir.path()).await.unwrap();
+        let error = match compose(compose_config(workspace, None, true)).await {
+            Ok(_) => panic!("composition with refresh but no recipes must fail closed"),
+            Err(error) => error,
+        };
+        assert!(
+            error.to_string().contains("verification recipes"),
+            "{error}"
+        );
+    }
+
+    /// With the recipe table present the enabled composition boots and
+    /// injects the host verifier; the model tool surface is unchanged.
+    #[tokio::test]
+    async fn enabled_refresh_with_recipes_composes() {
+        let dir = tempfile::tempdir().unwrap();
+        let workspace = Workspace::open(dir.path()).await.unwrap();
+        let recipes = Arc::new(VerificationRecipes::new(vec![host_echo_recipe()]).unwrap());
+        run_smoke(compose_config(workspace, Some(recipes), true)).await;
+    }
+
+    /// The adapter maps one host proof run onto the runtime verifier
+    /// contract: outcome and identity pass through unchanged.
+    #[tokio::test]
+    async fn host_proof_verifier_maps_runner_outcome() {
+        let dir = tempfile::tempdir().unwrap();
+        let workspace = Workspace::open(dir.path()).await.unwrap();
+        let recipes = Arc::new(VerificationRecipes::new(vec![host_echo_recipe()]).unwrap());
+        let runner = tool_runtime::RecipeProofRunner::new(workspace, recipes).unwrap();
+        let verifier = HostProofVerifier::new(runner);
+        let outcome = verifier
+            .verify_exact(agent_runtime::ProofVerifierRequest {
+                run_id: agent_contracts::RunId::new(),
+                task_id: agent_contracts::TaskId::new(),
+                recipe_id: "host.echo".into(),
+                verification_revision: 1,
+                directive_revision: 1,
+                workspace_revision: 1,
+            })
+            .await
+            .unwrap();
+        assert!(outcome.ok, "{}", outcome.summary);
+        assert!(!outcome.verification_identity.is_empty());
+        assert_eq!(outcome.verification_identity.len(), 64);
+    }
 }

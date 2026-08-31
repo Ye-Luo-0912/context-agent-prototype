@@ -128,6 +128,7 @@ impl Tool for VerificationRunTool {
                 args: process_args,
                 effect_context,
                 cancel,
+                host_trusted: false,
             })
             .await?;
         Ok(match outcome {

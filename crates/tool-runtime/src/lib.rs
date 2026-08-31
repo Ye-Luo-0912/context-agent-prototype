@@ -1,4 +1,5 @@
 mod host_policies;
+mod proof_runner;
 mod registry;
 pub mod tools;
 mod verification;
@@ -8,6 +9,7 @@ pub use agent_contracts::{
     ToolLifecycle,
 };
 pub use host_policies::{BUILTIN_TOOL_POLICIES, BuiltinToolPolicies};
+pub use proof_runner::{RecipeProofRun, RecipeProofRunner};
 pub use registry::{BuiltinToolDispatcher, ToolLifecycleConfig};
 pub use tools::{ShellDialect, ShellKind};
 pub use verification::{

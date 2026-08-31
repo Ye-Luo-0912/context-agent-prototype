@@ -1467,6 +1467,8 @@ async fn compose_cell(
             .map_err(anyhow::Error::msg)?,
         )),
         effect_reservation_journal: None,
+        verification_recipes: None,
+        project_proof_refresh: false,
     })
     .await?;
     composed.instance.start().await?;

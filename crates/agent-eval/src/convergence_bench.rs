@@ -151,6 +151,8 @@ async fn run_session(
             .map_err(anyhow::Error::msg)?,
         )),
         effect_reservation_journal: None,
+        verification_recipes: None,
+        project_proof_refresh: false,
     })
     .await?;
     let mut events = composed.subscribe();

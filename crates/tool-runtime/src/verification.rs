@@ -5,7 +5,7 @@
 //! environment. The same immutable set produces both the tool implementation
 //! and the Core host-effect policy, preventing authority/execution drift.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::io::Read;
 use std::path::{Path, PathBuf};
 
@@ -597,6 +597,52 @@ impl VerificationRecipes {
         });
         agent_contracts::jcs_serialize(&value).ok()
     }
+}
+
+/// One recipe's complete exact-identity inputs computed against the current
+/// world. The dispatcher attribution and the host proof lane share this
+/// single computation, so a host-issued PASS can never disagree with the
+/// model-lane attribution for the same recipe.
+pub(crate) struct RecipeExactIdentity {
+    pub(crate) material: String,
+    pub(crate) executable_identity: String,
+}
+
+/// Compute the exact-identity material and the executable identity for one
+/// current-world recipe. `None` means exact equivalence cannot be captured
+/// completely (non-exact reuse, oversized inherited environment, unreadable
+/// or escaping inputs); callers must fail closed or downgrade, never invent
+/// an identity.
+pub(crate) fn recipe_exact_identity(
+    recipes: &VerificationRecipes,
+    recipe: &VerificationRecipe,
+    workspace: &Workspace,
+) -> Option<RecipeExactIdentity> {
+    if recipe.reuse != VerificationReuse::ExactCurrentWorld {
+        return None;
+    }
+    let cwd = recipe
+        .cwd
+        .as_deref()
+        .map(|relative| workspace.root().join(relative))
+        .unwrap_or_else(|| workspace.root().to_path_buf());
+    let env: HashMap<String, String> = recipe
+        .env
+        .iter()
+        .map(|(key, value)| (key.clone(), value.clone()))
+        .collect();
+    let executable_identity =
+        crate::tools::verification_executable_identity(&recipe.argv[0], &cwd, &env);
+    let material = recipes.identity_material(
+        recipe,
+        &workspace.runtime_facts(),
+        workspace.root(),
+        &executable_identity,
+    )?;
+    Some(RecipeExactIdentity {
+        material,
+        executable_identity,
+    })
 }
 
 fn is_false(value: &bool) -> bool {

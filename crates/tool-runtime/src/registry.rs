@@ -740,33 +740,18 @@ impl BuiltinToolDispatcher {
             if recipe.reuse != VerificationReuse::ExactCurrentWorld {
                 return attribution;
             }
-            let cwd = recipe
-                .cwd
-                .as_deref()
-                .map(|relative| self.workspace.root().join(relative))
-                .unwrap_or_else(|| self.workspace.root().to_path_buf());
-            let env = recipe
-                .env
-                .iter()
-                .map(|(key, value)| (key.clone(), value.clone()))
-                .collect();
-            let executable_identity =
-                crate::tools::verification_executable_identity(&recipe.argv[0], &cwd, &env);
-            let Some(identity_material) = self.verification_recipes.identity_material(
+            let Some(exact_identity) = crate::verification::recipe_exact_identity(
+                &self.verification_recipes,
                 recipe,
-                &self.workspace.runtime_facts(),
-                self.workspace.root(),
-                &executable_identity,
+                &self.workspace,
             ) else {
                 // Exact equivalence could not be captured completely (for
                 // example an oversized inherited environment). Keep typed
                 // verification, but execute every request.
-                return ToolExecutionAttribution::bounded(
-                    ToolExecutionPurpose::Verify,
-                    recipe.cwd.clone().or_else(|| Some(".".into())),
-                    VerificationReuse::TaskScoped,
-                );
+                return attribution;
             };
+            let identity_material = &exact_identity.material;
+            let executable_identity = &exact_identity.executable_identity;
             let class_identity_digest = recipe
                 .coverage_domain
                 .as_ref()
@@ -775,7 +760,7 @@ impl BuiltinToolDispatcher {
                         recipe,
                         &self.workspace.runtime_facts(),
                         self.workspace.root(),
-                        &executable_identity,
+                        executable_identity,
                     )
                 })
                 .map(|material| format!("sha256-{:x}", Sha256::digest(material.trim().as_bytes())))
@@ -796,7 +781,7 @@ impl BuiltinToolDispatcher {
                 class_identity_digest,
             };
             return attribution
-                .with_verification_identity_material(&identity_material)
+                .with_verification_identity_material(identity_material)
                 .with_verification_recipe(provenance);
         }
         let purpose = match call.name.as_str() {
@@ -1075,6 +1060,16 @@ mod tests {
         (workspace, dir)
     }
 
+    fn host_echo_recipe() -> crate::VerificationRecipe {
+        #[cfg(windows)]
+        let argv = vec!["cmd".into(), "/C".into(), "echo".into(), "trusted".into()];
+        #[cfg(not(windows))]
+        let argv = vec!["echo".into(), "trusted".into()];
+        crate::VerificationRecipe::new("echo.trusted", "Echo trusted marker", "v1", argv)
+            .unwrap()
+            .with_exact_current_world_reuse()
+    }
+
     struct TestDispatcher {
         inner: BuiltinToolDispatcher,
         _dir: tempfile::TempDir,
@@ -1115,6 +1110,39 @@ mod tests {
             .into_iter()
             .map(|spec| spec.name)
             .collect()
+    }
+
+    /// The host proof lane and the model-lane attribution must mint the
+    /// same identity for the same recipe/world; otherwise the completion
+    /// gate's identity fence can never agree with the observation it
+    /// records.
+    #[tokio::test]
+    async fn host_proof_identity_agrees_with_dispatcher_attribution() {
+        let (workspace, dir) = open_workspace().await;
+        let recipes = Arc::new(VerificationRecipes::new(vec![host_echo_recipe()]).unwrap());
+        let inner = BuiltinToolDispatcher::with_config_and_verification_recipes(
+            workspace.clone(),
+            ToolLifecycleConfig::default(),
+            (*recipes).clone(),
+        );
+        let dispatcher = TestDispatcher { inner, _dir: dir };
+        let runner = crate::RecipeProofRunner::new(workspace, recipes).unwrap();
+
+        let call = ToolCall {
+            id: "c".into(),
+            name: VERIFY_RUN_TOOL_NAME.into(),
+            arguments: serde_json::json!({"recipe_id": "echo.trusted"}),
+        };
+        let stamped = dispatcher
+            .builtin_execution_attribution(&call)
+            .exact_verification_identity()
+            .expect("exact recipe attribution must carry an identity")
+            .to_string();
+        assert_eq!(
+            runner.exact_identity("echo.trusted").unwrap(),
+            stamped,
+            "host proof and model attribution must agree on the identity"
+        );
     }
 
     /// the trusted host translates only its own stamped
