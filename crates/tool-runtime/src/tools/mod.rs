@@ -1175,7 +1175,10 @@ pub(crate) mod test_procs {
     }
 
     pub(crate) async fn wait_for_path(path: &Path) {
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(8);
+        // Cold-start of the pid-writing child (powershell on Windows CI
+        // runners, sh elsewhere) can be slow under parallel test load; the
+        // deadline is a sanity bound, not a timing assertion.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
         while !path.exists() && std::time::Instant::now() < deadline {
             tokio::time::sleep(std::time::Duration::from_millis(25)).await;
         }
