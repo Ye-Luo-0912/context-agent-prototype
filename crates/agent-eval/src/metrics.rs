@@ -384,6 +384,9 @@ pub struct RunMetrics {
     pub prompt_task_progress_tokens: u64,
     pub prompt_current_focus_tokens: u64,
     pub prompt_historical_context_tokens: u64,
+    /// Rehydrated protocol bodies (checkpoint-restored fs.read rows),
+    /// recorded independently from selected working-set context.
+    pub prompt_restored_protocol_tokens: u64,
     pub prompt_turn_frame_tokens: u64,
     pub prompt_tool_schema_tokens: u64,
     /// Sum of `PromptLayerCosts.tool_catalog_index_tokens` across rounds.
@@ -1013,6 +1016,9 @@ pub fn aggregate_metrics(events: &[RuntimeEventEnvelope]) -> RunMetrics {
                 metrics.prompt_historical_context_tokens = metrics
                     .prompt_historical_context_tokens
                     .saturating_add(prompt_layers.historical_context_tokens);
+                metrics.prompt_restored_protocol_tokens = metrics
+                    .prompt_restored_protocol_tokens
+                    .saturating_add(prompt_layers.restored_protocol_tokens);
                 metrics.prompt_turn_frame_tokens = metrics
                     .prompt_turn_frame_tokens
                     .saturating_add(prompt_layers.turn_frame_tokens);
@@ -2096,6 +2102,7 @@ mod tests {
                     task_progress_tokens: 40,
                     current_focus_tokens: 15,
                     historical_context_tokens: 800,
+                    restored_protocol_tokens: 120,
                     turn_frame_tokens: 50,
                     tool_schema_tokens: 512,
                     tool_catalog_index_tokens: 40,
@@ -2217,6 +2224,7 @@ mod tests {
         assert!(!metrics.provider_tokens_lower_bound);
         assert_eq!(metrics.prompt_task_progress_tokens, 40);
         assert_eq!(metrics.prompt_historical_context_tokens, 800);
+        assert_eq!(metrics.prompt_restored_protocol_tokens, 120);
         assert_eq!(metrics.turn_checkpoint_rounds, 1);
         assert_eq!(metrics.turn_checkpoint_compacted_exchanges, 4);
         assert_eq!(metrics.turn_checkpoint_receipts, 3);

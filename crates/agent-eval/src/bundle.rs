@@ -922,6 +922,7 @@ fn metrics_json(metrics: &RunMetrics) -> serde_json::Value {
                 "prompt_task_progress_tokens": metrics.prompt_task_progress_tokens,
                 "prompt_current_focus_tokens": metrics.prompt_current_focus_tokens,
                 "prompt_historical_context_tokens": metrics.prompt_historical_context_tokens,
+                "prompt_restored_protocol_tokens": metrics.prompt_restored_protocol_tokens,
                 "prompt_turn_frame_tokens": metrics.prompt_turn_frame_tokens,
                 "prompt_tool_schema_tokens": metrics.prompt_tool_schema_tokens,
                 "prompt_tool_catalog_index_tokens": metrics.prompt_tool_catalog_index_tokens,

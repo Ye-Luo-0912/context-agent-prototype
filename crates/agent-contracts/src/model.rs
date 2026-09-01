@@ -509,7 +509,15 @@ pub struct PromptLayerCosts {
     pub task_anchor_tokens: u64,
     pub task_progress_tokens: u64,
     pub current_focus_tokens: u64,
+    /// Selected working-set context. Restored protocol bodies are recorded
+    /// separately (`restored_protocol_tokens`), so growth in one layer is
+    /// not attributed to the other.
     pub historical_context_tokens: u64,
+    /// Token cost of rehydrated protocol bodies the checkpoint spilled
+    /// (`RESTORED TURN BODIES`). Older events without the field decode as
+    /// zero and keep their historical accounting unchanged.
+    #[serde(default)]
+    pub restored_protocol_tokens: u64,
     pub turn_frame_tokens: u64,
     pub tool_schema_tokens: u64,
     /// Bounded TOOL CATALOG index (names not on this round's schema surface).
@@ -536,6 +544,9 @@ impl PromptLayerCosts {
             historical_context_tokens: self
                 .historical_context_tokens
                 .saturating_add(other.historical_context_tokens),
+            restored_protocol_tokens: self
+                .restored_protocol_tokens
+                .saturating_add(other.restored_protocol_tokens),
             turn_frame_tokens: self
                 .turn_frame_tokens
                 .saturating_add(other.turn_frame_tokens),
@@ -1060,5 +1071,36 @@ mod tests {
             completion_validity("", &[tool_call("c1")], &usage),
             ModelCompletionValidity::Meaningful
         );
+    }
+
+    #[test]
+    fn restored_protocol_tokens_default_zero_and_round_trip() {
+        // Older events without the layer keep zero and unchanged accounting.
+        let legacy: PromptLayerCosts =
+            serde_json::from_str(r#"{"system_tokens":1,"runtime_facts_tokens":1,"task_anchor_tokens":1,"task_progress_tokens":1,"current_focus_tokens":1,"historical_context_tokens":40,"turn_frame_tokens":1,"tool_schema_tokens":1}"#)
+                .expect("legacy prompt layers decode");
+        assert_eq!(legacy.restored_protocol_tokens, 0);
+        assert_eq!(legacy.historical_context_tokens, 40);
+
+        let current = PromptLayerCosts {
+            system_tokens: 1,
+            runtime_facts_tokens: 1,
+            task_anchor_tokens: 1,
+            task_progress_tokens: 1,
+            current_focus_tokens: 1,
+            historical_context_tokens: 30,
+            restored_protocol_tokens: 10,
+            turn_frame_tokens: 1,
+            tool_schema_tokens: 1,
+            tool_catalog_index_tokens: 0,
+        };
+        let wire = serde_json::to_value(current).unwrap();
+        assert_eq!(wire["restored_protocol_tokens"], 10);
+        let back: PromptLayerCosts = serde_json::from_value(wire).unwrap();
+        assert_eq!(back, current);
+
+        let summed = current.saturating_add(current);
+        assert_eq!(summed.historical_context_tokens, 60);
+        assert_eq!(summed.restored_protocol_tokens, 20);
     }
 }

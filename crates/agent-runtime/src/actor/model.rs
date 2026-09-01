@@ -1263,6 +1263,7 @@ impl RuntimeActor {
                     &turn_frame,
                     &input.tool_schemas,
                     &self.services.tool_catalog(),
+                    &self.eligible_protocol_bodies(),
                 ),
             })
             .await

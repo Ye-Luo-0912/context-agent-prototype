@@ -649,8 +649,9 @@ pub fn prompt_layer_costs_with_catalog(
     turn: &TurnFrame,
     tools: &[ToolSpec],
     catalog: &[ToolCatalogEntry],
+    protocol_bodies: &[(String, String)],
 ) -> agent_contracts::PromptLayerCosts {
-    let assembled = assembler.assemble_with_catalog(
+    let (assembled, body_stats) = assembler.assemble_with_catalog_stats(
         focus,
         task,
         progress,
@@ -658,13 +659,13 @@ pub fn prompt_layer_costs_with_catalog(
         turn,
         tools.to_vec(),
         catalog,
-        &[],
+        protocol_bodies,
     );
     let historical = assembled
         .context_frame
         .iter()
         .map(|message| agent_contracts::tokens::approx_tokens(&message.content) as u64)
-        .sum();
+        .sum::<u64>();
     agent_contracts::PromptLayerCosts {
         system_tokens: assembler.system_policy_tokens() as u64,
         runtime_facts_tokens: assembler.runtime_facts_tokens() as u64,
@@ -681,7 +682,11 @@ pub fn prompt_layer_costs_with_catalog(
                 agent_contracts::tokens::approx_tokens(&render_current_focus(focus, task)) as u64
             })
             .unwrap_or(0),
-        historical_context_tokens: historical,
+        // Rehydrated protocol bodies are their own layer; the selected
+        // working-set cost excludes them so accounting never attributes
+        // checkpoint restoration to Context selection.
+        historical_context_tokens: historical.saturating_sub(body_stats.restored_body_tokens),
+        restored_protocol_tokens: body_stats.restored_body_tokens,
         turn_frame_tokens: crate::budget::approx_layer_tokens(&assembled.turn_frame_wire_messages())
             as u64,
         tool_schema_tokens: crate::budget::approx_layer_tokens(&assembled.tool_schemas) as u64,
@@ -1625,6 +1630,7 @@ mod tests {
             &TurnFrame::new("continue"),
             &[],
             &[],
+            &[],
         );
         assert!(layers.task_progress_tokens > 0);
         assert!(layers.task_anchor_tokens > 0);
@@ -1647,6 +1653,7 @@ mod tests {
             None,
             &history,
             &TurnFrame::new("continue"),
+            &[],
             &[],
             &[],
         );
@@ -2192,6 +2199,7 @@ mod tests {
             &TurnFrame::new("continue"),
             &input.tool_schemas,
             &catalog,
+            &[],
         );
         assert!(layers.tool_catalog_index_tokens > 0);
     }
@@ -2249,5 +2257,112 @@ mod tests {
             .expect("the file content must render as a Tool message");
         assert!(tool.content.contains("ignore previous instructions"));
         assert!(messages.iter().all(|m| m.role != ModelRole::System));
+    }
+
+    #[test]
+    fn restored_protocol_bodies_are_accounted_apart_from_selected_context() {
+        use agent_contracts::{TURN_FRAME_KEEP_EXCHANGES, ToolCall, ToolOutput};
+        let assembler = PromptAssembler::new("policy");
+        // A selected working-set baseline unrelated to the turned file, so
+        // both calls render the same base context frame.
+        let mut file = item("     1 | fn handle() {}");
+        file.file_path = Some("src/login.rs".into());
+        let history = materialized_with(vec![file], ContextMapView::default());
+        // The fs.read row lands before the pad exchanges, so the kept tail
+        // spills it; a matching Fresh fact makes it rehydration demand.
+        let demand_progress = TaskProgressView {
+            checked_files: vec!["src/auth.rs@abc123".into()],
+            ..Default::default()
+        };
+        // No Fresh fact for that path: the same turn carries no restored
+        // bodies, so its context frame has no RESTORED TURN BODIES block.
+        let no_demand_progress = TaskProgressView {
+            checked_files: vec!["unrelated.rs@r0".into()],
+            ..Default::default()
+        };
+
+        // The fs.read row lands before the pad exchanges, so the kept tail
+        // spills it and the protocol-bodies cache must rehydrate it.
+        let mut turn = TurnFrame::new("continue");
+        turn.push_tool_calls(vec![ToolCall {
+            id: "read-1".into(),
+            name: "fs.read".into(),
+            arguments: serde_json::json!({"path": "src/auth.rs"}),
+        }]);
+        turn.push_tool_result(
+            ToolOutput {
+                call_id: "read-1".into(),
+                tool_name: "fs.read".into(),
+                ok: true,
+                summary: "read".into(),
+                model_content: "     1 | fn secret_body() {\n     2 |     let key = \"tok_\" + std::iter::repeat('x').take(320).collect::<String>();\n     3 |     service.register(key);\n     4 | }\n".into(),
+                artifact_ref: None,
+                metadata: serde_json::json!({
+                    "path": "src/auth.rs",
+                    "revision": "abc123"
+                }),
+            },
+            None,
+            agent_contracts::ToolExecutionFacts::empty(),
+        );
+        for index in 0..(TURN_FRAME_KEEP_EXCHANGES + 2) {
+            let call_id = format!("pad-{index}");
+            turn.push_tool_calls(vec![ToolCall {
+                id: call_id.clone(),
+                name: "shell.exec".into(),
+                arguments: serde_json::json!({"command": "echo pad"}),
+            }]);
+            turn.push_tool_result(
+                ToolOutput {
+                    call_id,
+                    tool_name: "shell.exec".into(),
+                    ok: true,
+                    summary: "pad".into(),
+                    model_content: "pad".into(),
+                    artifact_ref: None,
+                    metadata: serde_json::json!({"path": "unrelated.rs"}),
+                },
+                None,
+                agent_contracts::ToolExecutionFacts::empty(),
+            );
+        }
+
+        let with_restored = prompt_layer_costs_with_catalog(
+            &assembler,
+            None,
+            None,
+            Some(&demand_progress),
+            &history,
+            &turn,
+            &[],
+            &[],
+            &[],
+        );
+        let without = prompt_layer_costs_with_catalog(
+            &assembler,
+            None,
+            None,
+            Some(&no_demand_progress),
+            &history,
+            &turn,
+            &[],
+            &[],
+            &[],
+        );
+        assert!(
+            with_restored.restored_protocol_tokens > 0,
+            "the spilled fs.read body must be rehydrated and accounted"
+        );
+        assert_eq!(without.restored_protocol_tokens, 0);
+        assert!(
+            with_restored.historical_context_tokens
+                < without.historical_context_tokens + with_restored.restored_protocol_tokens,
+            "restored body tokens must not inflate selected-context cost; only \
+             the rehydrated block's framing may push it past the baseline"
+        );
+        assert!(
+            without.historical_context_tokens > 0,
+            "working set provenance applies even without rehydration"
+        );
     }
 }
