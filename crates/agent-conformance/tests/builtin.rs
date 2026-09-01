@@ -304,3 +304,38 @@ async fn artifact_read_is_bounded_confined_and_references_real_artifacts() {
         }
     }
 }
+
+/// The shipped machine-readable inventory must match the actual production
+/// surface: every row inspectable (fail closed), and the inventory's
+/// default-surface sets equal to what the dispatcher actually offers. The
+/// evaluated surface digest is returned and recorded on the report, so a
+/// supervisor can persist it and detect surface drift later.
+#[tokio::test]
+async fn shipped_inventory_matches_the_production_surface_and_reports_a_digest() {
+    let inventory: serde_json::Value =
+        serde_json::from_str(include_str!("../../../docs/TOOL_INVENTORY.json"))
+            .expect("the shipped inventory is valid JSON");
+    let dir = tempfile::tempdir().unwrap();
+    seed(dir.path());
+    let workspace = Workspace::open(dir.path()).await.unwrap();
+    let dispatcher = BuiltinToolDispatcher::new(workspace);
+
+    let (violations, digest) = agent_conformance::check_inventory_parity(&dispatcher, &inventory);
+    assert!(
+        violations.is_empty(),
+        "the shipped inventory drifted from the production surface:\n{}",
+        violations
+            .iter()
+            .map(|violation| violation.to_string())
+            .collect::<Vec<_>>()
+            .join("\n")
+    );
+    assert!(
+        !digest.is_empty(),
+        "the evaluated surface digest is recorded"
+    );
+    assert!(
+        !digest.chars().any(|ch| !ch.is_ascii_hexdigit()),
+        "digest is lowercase hex: {digest}"
+    );
+}

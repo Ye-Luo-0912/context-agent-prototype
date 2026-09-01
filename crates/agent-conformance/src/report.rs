@@ -38,6 +38,10 @@ impl fmt::Display for ConformanceViolation {
 pub struct ConformanceReport {
     pub subjects_checked: usize,
     pub violations: Vec<ConformanceViolation>,
+    /// Evaluated surface/schema digest (SHA-256 hex, see
+    /// [`crate::checks::surface_digest`]). Filled by inventory-parity
+    /// evaluation so the host can persist it and detect surface drift.
+    pub surface_digest: Option<String>,
 }
 
 impl ConformanceReport {
@@ -96,6 +100,7 @@ mod tests {
         let clean = ConformanceReport {
             subjects_checked: 2,
             violations: Vec::new(),
+            surface_digest: None,
         };
         assert!(clean.is_clean());
         assert!(clean.render().contains("verdict: clean"));

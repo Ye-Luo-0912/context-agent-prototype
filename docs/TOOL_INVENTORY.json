@@ -2,10 +2,10 @@
   "generated": "2026-08-24",
   "purpose": "TOOLS-01 machine-readable matrix: inventory of the current tool schemas, limits, context dispositions, effects and platform behavior as of this commit. The code remains authoritative; this file is the ACI specification input for TOOLS-02/03/04.",
   "surface": {
-    "core": ["fs.list", "fs.read", "fs.write", "artifact.read", "search.grep", "edit.patch", "git.status", "git.diff"],
+    "core": ["fs.list", "fs.read", "fs.write", "artifact.read", "search.grep", "edit.patch", "git.status", "git.diff", "task.complete"],
     "control": ["capability.manage"],
     "conditional_required": ["verify.run when the host discovers at least one bounded recipe"],
-    "catalog_optional": ["edit.replace", "shell.exec", "process.run", "process.session", "code.symbols", "code.diagnostics", "context.manage", "task.complete", "task.manage"]
+    "catalog_optional": ["edit.replace", "shell.exec", "process.run", "process.session", "code.symbols", "code.diagnostics", "context.manage", "task.manage"]
   },
   "global_limits": {
     "MAX_TOOL_MODEL_CONTENT_CHARS": 16000,
@@ -298,7 +298,7 @@
     },
     "task.complete": {
       "risk": "ReadOnly",
-      "surface_class": "catalog_optional",
+      "surface_class": "core",
       "schema": {
         "summary": {"type": "string", "required": true, "note": "the only model-visible field; bounded completion summary"}
       },
@@ -306,9 +306,23 @@
         "max_completion_summary_chars": 2000,
         "max_completion_artifacts": 32,
         "max_completion_ref_chars": 256,
-        "note": "the tool performs no side effect itself: it attaches a typed RuntimeDirective::CompleteTask that the runtime validates and commits at the durable turn safe point; current assistant and verification refs are attached by Runtime, while the older model-supplied artifacts field is parser-only compatibility; the tool is surfaced only for explicit closure intent, a task requirement, or deliberate catalog load"
+        "note": "the tool performs no side effect itself: it attaches a typed RuntimeDirective::CompleteTask that the runtime validates and commits at the durable turn safe point; current assistant and verification refs are attached by Runtime, while the older model-supplied artifacts field is parser-only compatibility; the schema ships on the default production surface (closure discovery), while the completion acceptance gate remains the sole closure authority and refuses premature or unverified proposals with a typed per-turn warning"
       },
       "effects": ["task:complete"],
+      "context_disposition": "PersistObservation",
+      "platform": {}
+    },
+    "verify.run": {
+      "risk": "ProcessExecution",
+      "surface_class": "conditional_required",
+      "schema": {
+        "recipe_id": {"type": "string", "required": true, "note": "exact host-registered recipe id; values for verify.run, never loadable tool names"}
+      },
+      "limits": {
+        "max_verification_recipes": 16,
+        "note": "surfaced only when the host discovers at least one bounded recipe; the host owns argv/cwd/env, the model chooses only a recipe_id; an exact current-world PASS may be reused without another process, while task-scoped runs never mint an acceptance receipt"
+      },
+      "effects": ["process:exec", "verification"],
       "context_disposition": "PersistObservation",
       "platform": {}
     },
@@ -356,6 +370,6 @@
     "per_tool_output_budget": "ToolSpec::output_budget (Option<usize>) declares a model-content cap per tool; the trusted output broker clamps it to MAX_TOOL_MODEL_CONTENT_CHARS and spills at the declared limit (M14).",
     "approval": "ReadOnly auto-allows; WorkspaceWrite/ProcessExecution prompt the interactive gate (or deny under --read-only); standing grants (TaskExecutionPolicy, CORE-08) can cover matching effects.",
     "workspace_confinement": "all paths resolve through the workspace confinement check (lexical + canonical walk); mutations additionally reject the state dir and use journaled transactions.",
-    "model_surface": "core + control tools are always on the surface; catalog-optional tools load on demand and cool to unloaded after idle GC; capability tools share the same per-tool lifecycle (Loaded -> Warm -> Unloaded with the same thresholds and TaskAnchor roots) — loading one capability tool never surfaces its siblings; the active task's tool-demand set roots both builtin and capability tools against idle aging; local navigation tools (code.symbols, code.diagnostics) are catalog-optional pure-local scans with no embeddings or vector storage"
+    "model_surface": "core + control tools are always on the surface (including task.complete for closure discovery; its execution stays gated by the completion acceptance gate); catalog-optional tools load on demand and cool to unloaded after idle GC; capability tools share the same per-tool lifecycle (Loaded -> Warm -> Unloaded with the same thresholds and TaskAnchor roots) — loading one capability tool never surfaces its siblings; the active task's tool-demand set roots both builtin and capability tools against idle aging; local navigation tools (code.symbols, code.diagnostics) are catalog-optional pure-local scans with no embeddings or vector storage"
   }
 }

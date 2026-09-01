@@ -234,9 +234,17 @@ pub async fn check_catalog(dispatcher: &dyn ToolDispatcher) -> ConformanceReport
     let mut report = ConformanceReport::default();
 
     for entry in dispatcher.catalog() {
-        if let Some(spec) = dispatcher.inspect_tool(&entry.name) {
-            report.subjects_checked += 1;
-            report.extend(check_schema_contract(&spec));
+        report.subjects_checked += 1;
+        match dispatcher.inspect_tool(&entry.name) {
+            Some(spec) => report.extend(check_schema_contract(&spec)),
+            None => report.push(ConformanceViolation::new(
+                "surface",
+                "surface",
+                format!(
+                    "catalog row '{}' exists but cannot be inspected; fail closed",
+                    entry.name
+                ),
+            )),
         }
     }
     // Meta/control specs are not catalog rows; they still must conform.
@@ -248,6 +256,137 @@ pub async fn check_catalog(dispatcher: &dyn ToolDispatcher) -> ConformanceReport
     }
     report.extend(check_tool_surface(dispatcher).await);
     report
+}
+
+/// Stable evaluated-surface digest: SHA-256 over the sorted
+/// `(name, canonical input schema)` pairs of a dispatcher's current model
+/// surface. Order-independent and schema-shape-sensitive, so a persisted
+/// digest detects any surface drift — a tool added, removed, or with a
+/// changed input schema.
+pub fn surface_digest(specs: &[ToolSpec]) -> String {
+    use sha2::{Digest, Sha256};
+    let mut pairs: Vec<(&str, String)> = specs
+        .iter()
+        .map(|spec| {
+            (
+                spec.name.as_str(),
+                serde_json::to_string(&spec.input_schema)
+                    .expect("a ToolSpec input schema always serializes"),
+            )
+        })
+        .collect();
+    pairs.sort_unstable();
+    let mut hasher = Sha256::new();
+    for (name, schema) in pairs {
+        hasher.update(name.as_bytes());
+        hasher.update(b"\0");
+        hasher.update(schema.as_bytes());
+        hasher.update(b"\0");
+    }
+    format!("{:x}", hasher.finalize())
+}
+
+/// Check the machine-readable inventory (`docs/TOOL_INVENTORY.json`,
+/// already parsed) against a dispatcher's actual catalog and surface:
+///
+/// - every inventory row must be recognizable (specs ∪ catalog); an
+///   inventory row the dispatcher cannot produce a spec/entry for is a
+///   fail-closed conformance failure, never a silent skip;
+/// - every inventory default-surface tool (`surface.core` +
+///   `surface.control`) must be offered by the dispatcher's current model
+///   surface (conditional/catalog-optional tools may be absent until
+///   discovered or loaded);
+/// - a dispatcher surface tool the inventory does not list anywhere is
+///   drift in the other direction.
+///
+/// Returns the violations plus the evaluated surface digest (`surface_digest`
+/// over the actual specs) for the caller to persist.
+pub fn check_inventory_parity(
+    dispatcher: &dyn ToolDispatcher,
+    inventory: &serde_json::Value,
+) -> (Vec<ConformanceViolation>, String) {
+    let mut violations = Vec::new();
+
+    let mut expected: Vec<String> = Vec::new();
+    for group in ["core", "control"] {
+        match inventory
+            .pointer(&format!("/surface/{group}"))
+            .and_then(serde_json::Value::as_array)
+        {
+            Some(names) => expected.extend(
+                names
+                    .iter()
+                    .filter_map(|name| name.as_str().map(str::to_owned)),
+            ),
+            None => violations.push(ConformanceViolation::new(
+                "surface",
+                "surface",
+                format!("inventory is missing /surface/{group}"),
+            )),
+        }
+    }
+    expected.sort_unstable();
+    expected.dedup();
+
+    // Rows the inventory names anywhere (default surface or the tools
+    // table): a dispatcher surface tool outside this set is drift.
+    let mut known: std::collections::BTreeSet<String> = expected.clone().into_iter().collect();
+    let tools = inventory
+        .get("tools")
+        .and_then(serde_json::Value::as_object);
+    match tools {
+        Some(tools) => known.extend(tools.keys().cloned()),
+        None => violations.push(ConformanceViolation::new(
+            "surface",
+            "surface",
+            "inventory is missing /tools",
+        )),
+    }
+
+    // Every inventory row must be recognizable by the dispatcher.
+    for name in known.iter() {
+        let recognizable = dispatcher.specs().iter().any(|spec| &spec.name == name)
+            || dispatcher.catalog().iter().any(|entry| &entry.name == name);
+        if !recognizable {
+            violations.push(ConformanceViolation::new(
+                "surface",
+                "surface",
+                format!("inventory row '{name}' cannot be inspected; fail closed"),
+            ));
+        }
+    }
+
+    let mut actual: Vec<String> = dispatcher
+        .specs()
+        .into_iter()
+        .map(|spec| spec.name)
+        .collect();
+    actual.sort_unstable();
+    actual.dedup();
+
+    for name in &expected {
+        if !actual.contains(name) {
+            violations.push(ConformanceViolation::new(
+                "surface",
+                "surface",
+                format!(
+                    "inventory surface lists '{name}' but the dispatcher surface does not offer it"
+                ),
+            ));
+        }
+    }
+    for name in &actual {
+        if !expected.contains(name) && !known.contains(name) {
+            violations.push(ConformanceViolation::new(
+                "surface",
+                "surface",
+                format!("dispatcher surface offers '{name}' but the inventory does not list it"),
+            ));
+        }
+    }
+
+    let digest = surface_digest(&dispatcher.specs());
+    (violations, digest)
 }
 
 #[cfg(test)]
@@ -410,5 +549,181 @@ mod tests {
         assert!(view.operational_evidence.is_empty());
         assert!(view.stall_warning.is_none());
         assert!(view.frontier_warning.is_none());
+    }
+
+    struct FakeDispatcher {
+        specs: Vec<ToolSpec>,
+        /// Names whose spec `inspect_tool` answers; a row not listed here
+        /// simulates an uninspectable catalog row.
+        inspectable: std::collections::HashSet<String>,
+    }
+
+    impl FakeDispatcher {
+        fn aligned() -> Self {
+            let mut inspectable = std::collections::HashSet::new();
+            for name in ["task.complete", "capability.manage"] {
+                inspectable.insert(name.to_string());
+            }
+            Self {
+                specs: vec![spec("task.complete"), spec("capability.manage")],
+                inspectable,
+            }
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl ToolDispatcher for FakeDispatcher {
+        fn specs(&self) -> Vec<ToolSpec> {
+            self.specs.clone()
+        }
+
+        fn catalog(&self) -> Vec<agent_contracts::ToolCatalogEntry> {
+            self.specs
+                .iter()
+                .map(|spec| agent_contracts::ToolCatalogEntry {
+                    name: spec.name.clone(),
+                    state: agent_contracts::ToolLifecycle::Available,
+                    owner: "fake".into(),
+                    description: spec.description.clone(),
+                    risk: spec.risk,
+                    roles: Vec::new(),
+                })
+                .collect()
+        }
+
+        fn inspect_tool(&self, name: &str) -> Option<ToolSpec> {
+            self.inspectable
+                .contains(name)
+                .then(|| self.specs.iter().find(|spec| spec.name == name).cloned())
+                .flatten()
+        }
+
+        async fn execute(
+            &self,
+            _request: agent_contracts::ToolExecutionRequest,
+        ) -> agent_contracts::AgentResult<agent_contracts::ToolOutcome> {
+            Err(agent_contracts::AgentError::InvalidRequest(
+                "fake dispatcher".into(),
+            ))
+        }
+    }
+
+    #[test]
+    fn surface_digest_is_stable_order_independent_and_shape_sensitive() {
+        use agent_contracts::ToolSpec;
+        let alpha = ToolSpec {
+            name: "alpha".into(),
+            description: "a".into(),
+            input_schema: json!({"type": "object", "properties": {"x": {"type": "string"}}}),
+            risk: agent_contracts::ToolRisk::ReadOnly,
+            output_budget: None,
+            roles: Vec::new(),
+        };
+        let beta = ToolSpec {
+            name: "beta".into(),
+            description: "b".into(),
+            input_schema: json!({"type": "object", "properties": {}}),
+            risk: agent_contracts::ToolRisk::ReadOnly,
+            output_budget: None,
+            roles: Vec::new(),
+        };
+        let forward = surface_digest(&[alpha.clone(), beta.clone()]);
+        let reversed = surface_digest(&[beta.clone(), alpha.clone()]);
+        assert_eq!(forward, reversed, "digest must be order-independent");
+
+        let grown = surface_digest(&[alpha.clone(), beta.clone(), spec("gamma")]);
+        assert_ne!(forward, grown, "an added tool must change the digest");
+
+        let mut changed = beta;
+        changed.input_schema = json!({"type": "object", "properties": {"y": {"type": "integer"}}});
+        assert_ne!(
+            forward,
+            surface_digest(&[alpha.clone(), changed]),
+            "a changed schema must change the digest"
+        );
+    }
+
+    #[test]
+    fn inventory_parity_passes_when_aligned() {
+        let dispatcher = FakeDispatcher::aligned();
+        let inventory = json!({
+            "surface": {
+                "core": ["task.complete"],
+                "control": ["capability.manage"]
+            },
+            "tools": {
+                "task.complete": {"schema": {}},
+                "capability.manage": {"schema": {}}
+            }
+        });
+        let (violations, digest) = check_inventory_parity(&dispatcher, &inventory);
+        assert!(violations.is_empty(), "{violations:?}");
+        assert_eq!(digest, surface_digest(&dispatcher.specs()));
+    }
+
+    #[test]
+    fn inventory_parity_fails_closed_on_unknown_rows_and_surface_drift() {
+        let dispatcher = FakeDispatcher::aligned();
+        let inventory = json!({
+            "surface": {
+                "core": ["task.complete", "fs.read"],
+                "control": ["capability.manage"]
+            },
+            "tools": {
+                "task.complete": {},
+                "capability.manage": {},
+                "ghost.tool": {}
+            }
+        });
+        let (violations, _) = check_inventory_parity(&dispatcher, &inventory);
+        assert!(
+            violations
+                .iter()
+                .any(|v| v.message.contains("'fs.read'") && v.message.contains("does not offer")),
+            "{violations:?}"
+        );
+        assert!(
+            violations
+                .iter()
+                .any(|v| v.message.contains("ghost.tool")
+                    && v.message.contains("cannot be inspected")),
+            "{violations:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn check_catalog_fails_closed_when_a_catalog_row_cannot_be_inspected() {
+        let dispatcher = FakeDispatcher {
+            inspectable: std::collections::HashSet::new(),
+            ..FakeDispatcher::aligned()
+        };
+        let report = check_catalog(&dispatcher).await;
+        assert!(
+            report
+                .violations
+                .iter()
+                .any(|v| v.message.contains("cannot be inspected")),
+            "{:?}",
+            report.violations
+        );
+    }
+
+    #[test]
+    fn inventory_surface_missing_field_is_a_violation() {
+        let dispatcher = FakeDispatcher {
+            inspectable: std::collections::HashSet::new(),
+            ..FakeDispatcher::aligned()
+        };
+        let (violations, _) = check_inventory_parity(&dispatcher, &json!({}));
+        assert!(
+            violations
+                .iter()
+                .any(|v| v.message.contains("/surface/core")),
+            "{violations:?}"
+        );
+        assert!(
+            violations.iter().any(|v| v.message.contains("/tools")),
+            "{violations:?}"
+        );
     }
 }

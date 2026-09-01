@@ -28,7 +28,7 @@ pub mod checks;
 pub mod report;
 
 pub use checks::{
-    check_catalog, check_error_envelope, check_output_envelope, check_schema_contract,
-    check_tool_surface,
+    check_catalog, check_error_envelope, check_inventory_parity, check_output_envelope,
+    check_schema_contract, check_tool_surface, surface_digest,
 };
 pub use report::{ConformanceReport, ConformanceViolation};

@@ -7,6 +7,8 @@ description = "Shared tool/capability conformance harness: schema contract, outp
 
 [dependencies]
 agent-contracts.workspace = true
+async-trait.workspace = true
+sha2.workspace = true
 tokio.workspace = true
 serde_json.workspace = true
 tempfile = "3"
