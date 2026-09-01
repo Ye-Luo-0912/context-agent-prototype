@@ -1291,6 +1291,135 @@ async fn proposal_settlement_survives_cancel_resume_and_commits_durably() {
 }
 
 #[tokio::test]
+async fn new_user_instruction_advances_directive_revision_and_invalidates_prior_proof() {
+    let dir = tempfile::tempdir().unwrap();
+    let (instance, collector) = settlement_instance(
+        dir.path(),
+        vec![
+            Step::Write("r2"),
+            Step::Verify("r2"),
+            Step::Plain("settled"),
+            Step::Write("r3"),
+            Step::Plain("fresh instruction mutation, no re-verify"),
+        ],
+    )
+    .await;
+    let first = drive(&instance, collector).await;
+    assert!(
+        settlement_labels(&first).contains(&SettlementLabel::SettledCandidate),
+        "the first verified mutation settles: {:?}",
+        settlement_labels(&first)
+    );
+    let revision_before = {
+        let checkpoint = instance.checkpoint().await.unwrap();
+        checkpoint
+            .tasks
+            .tasks
+            .iter()
+            .find(|task| task.status != agent_runtime::task::TaskStatus::Completed)
+            .expect("the active task owns the revision")
+            .resume
+            .directive_revision
+    };
+
+    // A NEW user instruction, unlike a continuation, is re-ingested as
+    // dialogue: it advances the directive revision, so the prior PASS can
+    // no longer vouch for the current directive, and the following mutation
+    // without a fresh verification stays stale rather than settled.
+    let resumed_collector = RuntimeEventEnvelopeCollector {
+        events: instance.handle().subscribe(),
+    };
+    let second = continue_turn(&instance, resumed_collector).await;
+    let labels = settlement_labels(&second);
+    assert!(
+        !labels.contains(&SettlementLabel::SettledCandidate),
+        "a new instruction followed by an unverified mutation must not re-settle: {labels:?}"
+    );
+    let checkpoint = instance.checkpoint().await.unwrap();
+    let task = checkpoint
+        .tasks
+        .tasks
+        .iter()
+        .find(|task| task.status != agent_runtime::task::TaskStatus::Completed)
+        .expect("the active task owns the advanced revision");
+    assert!(
+        task.resume.directive_revision > revision_before,
+        "a new user instruction must advance the directive revision"
+    );
+    assert_eq!(
+        task.resume.validity(),
+        agent_runtime::VerificationState::Stale,
+        "the new instruction's mutation invalidates the prior proof without a fresh verification"
+    );
+    instance.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn continuation_preserves_directive_revision_but_mutation_invalidates_old_proof() {
+    let dir = tempfile::tempdir().unwrap();
+    let (instance, collector) = settlement_instance(
+        dir.path(),
+        vec![
+            Step::Write("r2"),
+            Step::Verify("r2"),
+            Step::Plain("settled"),
+            Step::Write("r3"),
+            Step::Plain("continuation mutation, no re-verify"),
+        ],
+    )
+    .await;
+    let first = drive(&instance, collector).await;
+    assert!(
+        settlement_labels(&first).contains(&SettlementLabel::SettledCandidate),
+        "the verified mutation settles before the continuation: {:?}",
+        settlement_labels(&first)
+    );
+    let revision_before = {
+        let checkpoint = instance.checkpoint().await.unwrap();
+        checkpoint
+            .tasks
+            .tasks
+            .iter()
+            .find(|task| task.status != agent_runtime::task::TaskStatus::Completed)
+            .expect("the active task owns the revision")
+            .resume
+            .directive_revision
+    };
+
+    // A continuation re-runs the stored directive without re-ingesting it
+    // as dialogue: the directive revision is preserved. A real mutation
+    // after the continuation still invalidates the old proof until a fresh
+    // verification covers the new world.
+    let resumed_collector = RuntimeEventEnvelopeCollector {
+        events: instance.handle().subscribe(),
+    };
+    instance.handle().continue_active_task().await.unwrap();
+    let second = resumed_collector.drain_until_turn_completed().await;
+    let labels = settlement_labels(&second);
+    assert!(
+        !labels.contains(&SettlementLabel::SettledCandidate),
+        "a mutation after continuation without a fresh verification must not re-settle: {labels:?}"
+    );
+    let checkpoint = instance.checkpoint().await.unwrap();
+    let task = checkpoint
+        .tasks
+        .tasks
+        .iter()
+        .find(|task| task.status != agent_runtime::task::TaskStatus::Completed)
+        .expect("the active task owns the preserved revision");
+    assert_eq!(
+        task.resume.directive_revision, revision_before,
+        "continuation must not mint a new directive revision"
+    );
+    assert_eq!(
+        task.resume.validity(),
+        agent_runtime::VerificationState::Stale,
+        "a real mutation after continuation invalidates the old proof without a fresh verification"
+    );
+    instance.shutdown().await.unwrap();
+}
+
+#[tokio::test]
 async fn cold_restore_preserves_settlement_and_reopen_resettles() {
     let dir = tempfile::tempdir().unwrap();
     let (instance, collector) = settlement_instance(
