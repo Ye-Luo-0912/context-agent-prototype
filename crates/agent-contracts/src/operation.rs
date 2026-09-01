@@ -464,6 +464,39 @@ pub trait EffectReconciler: Send + Sync {
     }
 }
 
+/// A dispatch that produced a real receipt but whose typed settlement could
+/// not be durably acknowledged. The receipt stays the caller's truth — an
+/// already-applied effect is never pretending to be rolled back — and this
+/// debt names the reservation the broker must reconcile before later
+/// mutation or completion may proceed.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct EffectAckDebt {
+    pub operation_id: OperationId,
+    pub effect_id: EffectId,
+    /// The broker reservation whose acknowledgement was lost; bounded like
+    /// the broker's own id cap.
+    pub reservation_id: String,
+    /// The typed settlement of the receipt that could not be acknowledged.
+    pub settlement: crate::tool::EffectAckSettlement,
+    /// Bounded reason the acknowledgement could not be persisted.
+    pub error: String,
+}
+
+impl EffectAckDebt {
+    pub fn validate(&self) -> Result<(), String> {
+        let id_chars = self.reservation_id.chars().count();
+        if id_chars == 0 || id_chars > 256 {
+            return Err("ack debt reservation id is empty or oversized".into());
+        }
+        validate_bounded_text(
+            "ack debt error",
+            &self.error,
+            MAX_OPERATION_DIAGNOSTIC_BYTES,
+        )
+    }
+}
+
 /// Whether Core can safely accept new effectful work after authority recovery.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "status", rename_all = "snake_case")]

@@ -14,10 +14,10 @@ use std::sync::Arc;
 use agent_contracts::{
     AgentError, AgentResult, ApprovalGate, ArgumentDigest, AuthorityCheckpointMarker,
     AuthorityLease, AuthorityRecoveryStatus, CancellationToken, ContextConsumptionAck,
-    ContextEngine, Effect, EffectId, EffectReceipt, EffectReconciler, EngineQuery, EventJournal,
-    OperationId, OperationQueryResult, OperationSnapshot, OperationState, OperationTerminal, RunId,
-    RuntimeEvent, RuntimeEventEnvelope, TaskId, ToolCall, ToolDispatcher, ToolOperationIdentity,
-    ToolOutcome, ToolOutput, ToolSpec, ToolSurfaceSnapshot, TurnId,
+    ContextEngine, Effect, EffectAckDebt, EffectId, EffectReceipt, EffectReconciler, EngineQuery,
+    EventJournal, OperationId, OperationQueryResult, OperationSnapshot, OperationState,
+    OperationTerminal, RunId, RuntimeEvent, RuntimeEventEnvelope, TaskId, ToolCall, ToolDispatcher,
+    ToolOperationIdentity, ToolOutcome, ToolOutput, ToolSpec, ToolSurfaceSnapshot, TurnId,
 };
 use async_trait::async_trait;
 use tokio::sync::broadcast;
@@ -98,7 +98,14 @@ pub struct EffectRollbackRequest {
 /// explain an expired, missing, or foreign authorization.
 #[derive(Debug, Clone)]
 pub enum EffectCommitDisposition {
-    Receipt(EffectReceipt),
+    Receipt {
+        receipt: EffectReceipt,
+        /// Typed unresolved debt when the broker acknowledgement could not
+        /// be persisted. The receipt stays the caller's truth; Runtime must
+        /// surface the debt and fence later mutation until the broker
+        /// journal is reconciled.
+        ack_debt: Option<EffectAckDebt>,
+    },
     Rejected(EffectCommitRejection),
     /// The effect receipt is the best-known world-state truth, but rollback
     /// cleanup or the matching terminal authority record could not be
@@ -866,19 +873,29 @@ impl CorePort for CoreAuthority {
                 EffectReceipt::Unknown { .. } => agent_contracts::EffectAckSettlement::Unknown,
             };
             let settlement_label = settlement.label();
+            let mut ack_debt: Option<EffectAckDebt> = None;
             if let Err(error) = self
                 .broker()
                 .ack(EffectAck {
-                    reservation_id,
+                    reservation_id: reservation_id.clone(),
                     operation_id,
-                    settlement,
+                    settlement: settlement.clone(),
                     receipt_summary: format!("settlement={settlement_label}"),
                 })
                 .await
             {
                 // The effect already applied (or truthfully reported
-                // NotApplied); an ack failure never rolls it back.
-                tracing::error!(%error, %operation_id, "effect broker ack failed");
+                // NotApplied); an ack failure never rolls it back. Keep the
+                // typed settlement as a debt that Runtime surfaces, and
+                // write the operation terminal first so the receipt truth is
+                // durable before the recovery fence blocks further mutation.
+                ack_debt = Some(EffectAckDebt {
+                    operation_id,
+                    effect_id,
+                    reservation_id,
+                    settlement,
+                    error: bounded_effect_error(&error.to_string()),
+                });
             }
             if let Err(error) = self.finish_operation_effect(operation_id, &receipt) {
                 tracing::error!(%error, %operation_id, "operation terminal record failed");
@@ -887,7 +904,11 @@ impl CorePort for CoreAuthority {
                     error: format!("operation terminal record failed: {error}"),
                 };
             }
-            EffectCommitDisposition::Receipt(receipt)
+            // The receipt truth is durable; the missing acknowledgement is
+            // Runtime's debt to surface and fence (the active turn must
+            // still carry the truthful receipt back to the model), and a
+            // restart reconciles it through the broker journal.
+            EffectCommitDisposition::Receipt { receipt, ack_debt }
         }
     }
 
@@ -1429,6 +1450,37 @@ mod tests {
         }
     }
 
+    /// 效果已应用但应答必然失败：reserve/dispatch 转发给内部经纪，
+    /// ack 一律拒绝，用于证明 ack 失败时 receipt 与 typed debt 的
+    /// 保留语义（不会假装已应用效果可以回滚）。
+    struct FailingAckBroker {
+        inner: Arc<dyn EffectBroker>,
+    }
+
+    #[async_trait::async_trait]
+    impl EffectBroker for FailingAckBroker {
+        async fn reserve(&self, reservation: EffectReservation) -> AgentResult<String> {
+            self.inner.reserve(reservation).await
+        }
+
+        async fn dispatch(&self, reserved: ReservedEffect) -> EffectReceipt {
+            self.inner.dispatch(reserved).await
+        }
+
+        async fn ack(&self, _ack: EffectAck) -> AgentResult<()> {
+            Err(AgentError::Storage(
+                "simulated broker acknowledgement failure".into(),
+            ))
+        }
+
+        fn reconcile_reservation(
+            &self,
+            context: &OperationEffectContext,
+        ) -> AgentResult<Option<EffectReconciliation>> {
+            self.inner.reconcile_reservation(context)
+        }
+    }
+
     /// 可控绑定纪元的策略桩：只服务撤销围栏行为测试。
     struct EpochPolicies {
         epoch: std::sync::atomic::AtomicU64,
@@ -1451,6 +1503,7 @@ mod tests {
     async fn prepare_leased_effect(
         state: &Arc<Mutex<String>>,
         policies: Arc<EpochPolicies>,
+        broker: Option<Arc<dyn EffectBroker>>,
     ) -> (
         Arc<dyn CorePort>,
         OperationId,
@@ -1463,6 +1516,7 @@ mod tests {
         let port = build_core_port(
             CoreAuthorityConfig {
                 host_policies: Some(policies),
+                effect_broker: broker,
                 ..CoreAuthorityConfig::default()
             },
             Arc::new(StubContext),
@@ -1540,7 +1594,7 @@ mod tests {
             epoch: std::sync::atomic::AtomicU64::new(5),
         });
         let (port, operation_id, effect_id, argument_digest, generation, lease, effect) =
-            prepare_leased_effect(&state, policies.clone()).await;
+            prepare_leased_effect(&state, policies.clone(), None).await;
         assert_eq!(
             lease.binding_epoch,
             Some(5),
@@ -1578,7 +1632,7 @@ mod tests {
             epoch: std::sync::atomic::AtomicU64::new(5),
         });
         let (port, operation_id, effect_id, argument_digest, generation, lease, effect) =
-            prepare_leased_effect(&state, policies).await;
+            prepare_leased_effect(&state, policies, None).await;
 
         // 纪元未变（包括其他工具的准入变动也不推进它）：提交照常。
         let receipt = port
@@ -1595,13 +1649,177 @@ mod tests {
             .await;
         assert!(matches!(
             receipt,
-            EffectCommitDisposition::Receipt(EffectReceipt::Applied { .. })
+            EffectCommitDisposition::Receipt {
+                receipt: EffectReceipt::Applied { .. },
+                ack_debt: None
+            }
         ));
         assert_eq!(&*state.lock().unwrap(), "committed");
     }
 
-    /// 端到端：真实带日志经纪作为配置传入时，启动对账按持久预留
-    /// 分类终结未决操作——只预约未派发无围栏终结，已派发未应答围栏。
+    /// 经纪把效果置为已应用但拒绝持久应答：receipt 保有真实类别，typed
+    /// settlement 成为 debt，Core 安装恢复围栏——绝不会假装已应用效果
+    /// 可以回滚。
+    #[tokio::test]
+    async fn ack_failure_preserves_receipt_with_typed_debt_and_fences_later_work() {
+        let state = Arc::new(Mutex::new(String::new()));
+        let policies = Arc::new(EpochPolicies {
+            epoch: std::sync::atomic::AtomicU64::new(5),
+        });
+        let failing: Arc<dyn EffectBroker> = Arc::new(FailingAckBroker {
+            inner: Arc::new(LocalEffectBroker),
+        });
+        let (port, operation_id, effect_id, argument_digest, generation, lease, effect) =
+            prepare_leased_effect(&state, policies, Some(failing)).await;
+
+        let disposition = port
+            .commit_effect(EffectCommitRequest {
+                run_id: port.run_id(),
+                turn_id: TurnId::new(),
+                operation_id,
+                effect_id,
+                argument_digest,
+                generation,
+                lease: Some(lease),
+                effect,
+            })
+            .await;
+        let EffectCommitDisposition::Receipt {
+            receipt,
+            ack_debt: Some(debt),
+        } = disposition
+        else {
+            panic!(
+                "an ack failure must still return the real receipt plus the typed debt: {disposition:?}"
+            )
+        };
+        assert!(matches!(
+            receipt,
+            EffectReceipt::Applied {
+                durability: EffectDurability::Durable,
+                ..
+            }
+        ));
+        assert_eq!(
+            debt.settlement,
+            agent_contracts::EffectAckSettlement::Applied {
+                durability: EffectDurability::Durable
+            },
+            "the debt carries the typed settlement of the real receipt"
+        );
+        assert_eq!(debt.operation_id, operation_id);
+        assert_eq!(debt.effect_id, effect_id);
+        assert!(!debt.reservation_id.is_empty());
+        debt.validate()
+            .expect("the debt must be bounded and well-formed");
+
+        // The receipt truth is durable in the operation registry even though
+        // the acknowledgement failed.
+        assert!(matches!(
+            port.query_operation(operation_id),
+            OperationQueryResult::Found { snapshot }
+                if matches!(
+                    snapshot.state,
+                    OperationState::Terminal {
+                        terminal: OperationTerminal::Applied { .. },
+                        ..
+                    }
+                )
+        ));
+        assert!(
+            debt.validate().is_ok(),
+            "the debt must be bounded and well-formed"
+        );
+
+        // Core stays Ready: the runtime actor owns the debt fence so the
+        // current turn can still carry the truthful receipt to the model;
+        // a restart reconciles the missing acknowledgement via the broker
+        // journal instead.
+        assert!(
+            matches!(port.recovery_status(), AuthorityRecoveryStatus::Ready),
+            "the ack debt fences at the runtime actor, not inside Core"
+        );
+    }
+
+    /// 重启分类：ack 失败时经纪日志如实报告缺失应答（Ambiguous），绝不
+    /// 伪造结算；真实 receipt 的分类由调用方保留。
+    #[tokio::test]
+    async fn ack_failure_debt_is_classified_through_restart() {
+        let dir = tempfile::tempdir().unwrap();
+        let journal_path = dir.path().join("reservations.jsonl");
+        let state = Arc::new(Mutex::new(String::new()));
+        let policies = Arc::new(EpochPolicies {
+            epoch: std::sync::atomic::AtomicU64::new(5),
+        });
+        let journaled = Arc::new(
+            crate::broker::JournaledEffectBroker::open(Arc::new(LocalEffectBroker), &journal_path)
+                .unwrap(),
+        );
+        let failing: Arc<dyn EffectBroker> = Arc::new(FailingAckBroker { inner: journaled });
+        let (port, operation_id, effect_id, argument_digest, generation, lease, effect) =
+            prepare_leased_effect(&state, policies, Some(failing)).await;
+
+        // The real commit path: dispatch lands in the broker journal, the
+        // acknowledgement fails, and the typed debt names the reservation.
+        let disposition = port
+            .commit_effect(EffectCommitRequest {
+                run_id: port.run_id(),
+                turn_id: TurnId::new(),
+                operation_id,
+                effect_id,
+                argument_digest,
+                generation,
+                lease: Some(lease),
+                effect,
+            })
+            .await;
+        let EffectCommitDisposition::Receipt {
+            receipt: _,
+            ack_debt: Some(debt),
+        } = disposition
+        else {
+            panic!(
+                "an ack failure must return the real receipt plus the typed debt: {disposition:?}"
+            )
+        };
+
+        // Drop the live Core; reopen the same journal file like a fresh
+        // process. The reservation was dispatched but never acknowledged:
+        // recovery must report Ambiguous — never a fabricated settlement.
+        drop(port);
+        let reopened =
+            crate::broker::JournaledEffectBroker::open(Arc::new(LocalEffectBroker), &journal_path)
+                .unwrap();
+        let reconciliation = reopened
+            .reconcile(&OperationEffectContext {
+                identity: ToolOperationIdentity {
+                    run_id: RunId::new(),
+                    task_id: None,
+                    turn_id: TurnId::new(),
+                    scope_id: None,
+                    operation_id,
+                    generation,
+                    call_id: "ack-debt".into(),
+                    tool_name: "prepared.effect".into(),
+                    argument_digest,
+                },
+                effect_id,
+            })
+            .unwrap()
+            .expect("the broker journal must still hold the reservation");
+        assert!(
+            matches!(reconciliation, EffectReconciliation::Ambiguous { .. }),
+            "a dispatched reservation without an acknowledgement must stay Ambiguous: {reconciliation:?}"
+        );
+        assert!(
+            debt.settlement
+                == agent_contracts::EffectAckSettlement::Applied {
+                    durability: EffectDurability::Durable
+                },
+            "the typed debt keeps the real receipt category"
+        );
+    }
+
     #[tokio::test]
     async fn startup_reconciles_through_a_configured_journaled_broker() {
         let dir = tempfile::tempdir().unwrap();
@@ -2305,7 +2523,10 @@ mod tests {
             .await;
         assert!(matches!(
             receipt,
-            EffectCommitDisposition::Receipt(EffectReceipt::Applied { .. })
+            EffectCommitDisposition::Receipt {
+                receipt: EffectReceipt::Applied { .. },
+                ack_debt: None
+            }
         ));
         let phases = phases.lock().unwrap().clone();
         assert_eq!(phases.len(), 3, "{phases:?}");
@@ -3255,7 +3476,10 @@ mod tests {
             .await;
         assert!(matches!(
             first,
-            EffectCommitDisposition::Receipt(EffectReceipt::Applied { .. })
+            EffectCommitDisposition::Receipt {
+                receipt: EffectReceipt::Applied { .. },
+                ack_debt: None
+            }
         ));
         assert_eq!(&*state.lock().unwrap(), "committed");
         let OperationQueryResult::Found { snapshot } = port.query_operation(operation_id) else {

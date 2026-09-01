@@ -1067,23 +1067,79 @@ impl RuntimeActor {
                         })
                         .await
                     {
-                        EffectCommitDisposition::Receipt(EffectReceipt::Applied {
-                            durability: EffectDurability::Durable,
-                            ..
-                        }) => {
+                        EffectCommitDisposition::Receipt {
+                            receipt,
+                            ack_debt: Some(debt),
+                        } => {
+                            // The receipt already happened (an applied effect
+                            // is never rolled back), but its typed settlement
+                            // was not durably acknowledged. Surface the debt
+                            // and fence later mutation until the broker
+                            // journal is reconciled.
+                            self.require_effect_recovery(format!(
+                                "effect {} acknowledged as {} but the broker acknowledgement is unresolved: {}",
+                                debt.effect_id,
+                                debt.settlement.label(),
+                                debt.error
+                            ))
+                            .await;
+                            let _ = self
+                                .core
+                                .emit_event(RuntimeEvent::EffectAckDebt { debt: debt.clone() })
+                                .await;
+                            match &receipt {
+                                EffectReceipt::NotApplied { error } => unsettled_effect_output(
+                                    output,
+                                    "not_applied_ack_debt_recovery_required",
+                                    "effect was not applied, but its acknowledgement is unresolved",
+                                    "the change was not applied, but the effect settlement could not be durably acknowledged; recovery is required before another mutation",
+                                    &format!("{error}; ack debt: {}", debt.error),
+                                    true,
+                                ),
+                                EffectReceipt::Applied { .. } => unsettled_effect_output(
+                                    output,
+                                    "applied_ack_debt_recovery_required",
+                                    "effect applied but its acknowledgement is unresolved",
+                                    "the change WAS applied, but the effect settlement could not be durably acknowledged; recovery is required before another mutation",
+                                    &format!("ack debt: {}", debt.error),
+                                    false,
+                                ),
+                                EffectReceipt::Unknown { error } => unsettled_effect_output(
+                                    output,
+                                    "unknown_ack_debt_recovery_required",
+                                    "effect state unknown and its acknowledgement is unresolved",
+                                    "the change may or may not have been applied, and the effect settlement could not be durably acknowledged; do not retry blindly, and recover before another mutation",
+                                    &format!("{error}; ack debt: {}", debt.error),
+                                    false,
+                                ),
+                            }
+                        }
+                        EffectCommitDisposition::Receipt {
+                            receipt:
+                                EffectReceipt::Applied {
+                                    durability: EffectDurability::Durable,
+                                    ..
+                                },
+                            ack_debt: None,
+                        } => {
                             self.refresh_runtime_fact_markers();
                             self.accrue_checkpoint_debt(
                                 crate::checkpoint::CheckpointDebtReason::DurableWorkspaceMutation,
                             );
                             output
                         }
-                        EffectCommitDisposition::Receipt(EffectReceipt::NotApplied { error }) => {
-                            not_applied_effect_output(output, &error)
-                        }
-                        EffectCommitDisposition::Receipt(EffectReceipt::Applied {
-                            durability: EffectDurability::DurabilityFailed(error),
-                            ..
-                        }) => {
+                        EffectCommitDisposition::Receipt {
+                            receipt: EffectReceipt::NotApplied { error },
+                            ack_debt: None,
+                        } => not_applied_effect_output(output, &error),
+                        EffectCommitDisposition::Receipt {
+                            receipt:
+                                EffectReceipt::Applied {
+                                    durability: EffectDurability::DurabilityFailed(error),
+                                    ..
+                                },
+                            ack_debt: None,
+                        } => {
                             // At least one side effect landed, but the
                             // operation is not durably complete (a journal
                             // failure or a partial sequential composite).
@@ -1103,7 +1159,10 @@ impl RuntimeActor {
                                 false,
                             )
                         }
-                        EffectCommitDisposition::Receipt(EffectReceipt::Unknown { error }) => {
+                        EffectCommitDisposition::Receipt {
+                            receipt: EffectReceipt::Unknown { error },
+                            ack_debt: None,
+                        } => {
                             // Retrying or accepting another mutation would
                             // build on a world whose state is unknowable.
                             // The current turn still receives this honest

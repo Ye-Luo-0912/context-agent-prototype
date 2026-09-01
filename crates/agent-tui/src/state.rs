@@ -689,6 +689,16 @@ impl AppState {
                 self.busy = false;
                 self.status = "recovery_required".into();
             }
+            RuntimeEvent::EffectAckDebt { debt } => {
+                self.busy = false;
+                self.status = "recovery_required".into();
+                self.push_system(format!(
+                    "effect {} acknowledged as {} but its acknowledgement is unresolved: {}",
+                    debt.effect_id,
+                    debt.settlement.label(),
+                    debt.error
+                ));
+            }
             RuntimeEvent::Failure {
                 class,
                 retryable,

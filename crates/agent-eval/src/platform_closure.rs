@@ -633,7 +633,10 @@ async fn drive_applied_family(
         };
         let disposition = commit_prepared(core.port.as_ref(), lease, &identity, effect_id, effect).await;
         match disposition {
-            EffectCommitDisposition::Receipt(EffectReceipt::Applied { .. }) => {}
+            EffectCommitDisposition::Receipt {
+                receipt: EffectReceipt::Applied { .. },
+                ..
+            } => {}
             other => return Err(anyhow!("{tool_name} commit settled {other:?}")),
         }
         // Durable truth after reopening: the exact effect identity folds to
@@ -930,7 +933,10 @@ async fn drive_plugin_binding_fence(
         anyhow::ensure!(
             matches!(
                 disposition2,
-                EffectCommitDisposition::Receipt(EffectReceipt::Applied { .. })
+                EffectCommitDisposition::Receipt {
+                    receipt: EffectReceipt::Applied { .. },
+                    ..
+                }
             ),
             "replacement-bound commit must apply, got {disposition2:?}"
         );

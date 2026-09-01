@@ -189,6 +189,29 @@ pub(crate) async fn spawn_with_approval(
     handle
 }
 
+pub(crate) async fn spawn_with_approval_and_broker(
+    model: Arc<dyn ModelTransport>,
+    context: Arc<dyn ContextEngine>,
+    tools: Arc<dyn ToolDispatcher>,
+    approval: Arc<dyn agent_contracts::ApprovalGate>,
+    broker: Arc<dyn agent_core::EffectBroker>,
+) -> RuntimeHandle {
+    let kernel = Arc::new(RuntimeServices::new(
+        CoreAuthorityConfig {
+            effect_broker: Some(broker),
+            ..CoreAuthorityConfig::default()
+        },
+        context,
+        model,
+        tools,
+        approval,
+        None,
+    ));
+    let (handle, _task) = spawn_runtime(kernel);
+    handle.start().await.unwrap();
+    handle
+}
+
 pub(crate) async fn spawn_with_journal(
     model: Arc<dyn ModelTransport>,
     journal: Arc<dyn EventJournal>,

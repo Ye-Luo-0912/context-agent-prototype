@@ -822,6 +822,97 @@ async fn unknown_effect_state_surfaces_truth_and_fences_later_mutation() {
     handle.stop().await.unwrap();
 }
 
+/// An effect broker that accepts reservations and dispatches but always
+/// fails the acknowledgement, so a committed effect's typed settlement
+/// becomes a debt that must fence later mutation.
+struct FailingAckBroker;
+
+#[async_trait::async_trait]
+impl agent_core::EffectBroker for FailingAckBroker {
+    async fn reserve(&self, reservation: agent_core::EffectReservation) -> AgentResult<String> {
+        Ok(format!("broker/{}", reservation.operation_id))
+    }
+
+    async fn dispatch(&self, reserved: agent_core::ReservedEffect) -> EffectReceipt {
+        reserved.effect.commit().await
+    }
+
+    async fn ack(&self, _ack: agent_core::EffectAck) -> AgentResult<()> {
+        Err(AgentError::Storage(
+            "simulated broker acknowledgement failure".into(),
+        ))
+    }
+}
+
+/// An acknowledgement that cannot be persisted does not hide the applied
+/// effect: the typed debt event is published, the runtime demands recovery,
+/// and the next mutation is fenced instead of stacking on the debt.
+#[tokio::test]
+async fn committed_effect_ack_debt_emits_event_and_fences_later_mutation() {
+    let committed = Arc::new(AtomicUsize::new(0));
+    let handle = spawn_with_approval_and_broker(
+        Arc::new(RetryAfterUnknownModel::default()),
+        Arc::new(TestContextEngine),
+        Arc::new(EffectToolDispatcher {
+            committed: committed.clone(),
+            rolled_back: Arc::new(AtomicUsize::new(0)),
+            release: None,
+        }),
+        Arc::new(PolicyApprovalGate::permissive()),
+        Arc::new(FailingAckBroker),
+    )
+    .await;
+    let mut events = handle.subscribe();
+    handle.user_message("go".into()).await.unwrap();
+
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+    let mut ack_debt = None;
+    let mut refused = None;
+    let mut recovery = false;
+    let mut completed = false;
+    while tokio::time::Instant::now() < deadline {
+        while let Ok(envelope) = events.try_recv() {
+            match envelope.event {
+                RuntimeEvent::EffectAckDebt { debt } => ack_debt = Some(debt),
+                RuntimeEvent::ToolFinished { output } if output.call_id == "must-be-refused" => {
+                    refused = Some(output)
+                }
+                RuntimeEvent::RecoveryRequired => recovery = true,
+                RuntimeEvent::TurnCompleted => completed = true,
+                _ => {}
+            }
+        }
+        if completed && refused.is_some() && ack_debt.is_some() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+
+    let debt = ack_debt.expect("the typed ack debt must be published");
+    assert_eq!(
+        debt.settlement,
+        agent_contracts::EffectAckSettlement::Applied {
+            durability: EffectDurability::Durable
+        },
+        "the debt carries the typed settlement of the real receipt"
+    );
+    assert!(!debt.reservation_id.is_empty());
+    assert!(recovery, "an ack debt must demand recovery");
+    let refused = refused.expect("the second call must receive a typed refusal");
+    assert!(!refused.ok);
+    assert_eq!(
+        refused.metadata["code"], "runtime.recovery_required",
+        "the fence must refuse further mutation: {refused:?}"
+    );
+    assert_eq!(
+        committed.load(Ordering::SeqCst),
+        1,
+        "the fenced second call must never reach the dispatcher"
+    );
+    assert!(completed, "the model must still be able to close the turn");
+    handle.stop().await.unwrap();
+}
+
 #[derive(Debug, Default)]
 struct RetryAfterUnknownModel {
     rounds: AtomicUsize,

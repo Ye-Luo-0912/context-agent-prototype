@@ -4,7 +4,7 @@ use serde::{Deserialize, Serialize};
 use crate::{
     AgentResult, CompactionReason, ContextConsumptionAck, ContextDiagnostics, ContextGcReport,
     ContextMaintenanceReport, ContextMaintenanceTrigger, ContextMaterializationMisses,
-    ContextSelection, ContextStateTransition, OperationId, OperationSnapshot, RunId,
+    ContextSelection, ContextStateTransition, EffectAckDebt, OperationId, OperationSnapshot, RunId,
     RuntimeFailureClass, RuntimeInputEnvelope, ScopeId, StorageGcReport, TaskId, ToolCall,
     ToolLeaseReconcileReport, ToolOutput, ToolSurfacePlanReport, ToolSurfaceRequirement, TurnId,
 };
@@ -635,6 +635,13 @@ pub enum RuntimeEvent {
     /// crash-recovery machinery must intervene before normal operation
     /// resumes with full consistency guarantees.
     RecoveryRequired,
+    /// A committed effect's typed settlement could not be durably
+    /// acknowledged. The receipt already happened (an applied effect is
+    /// never rolled back); this debt names the broker reservation that must
+    /// be reconciled before later mutation or completion proceeds.
+    EffectAckDebt {
+        debt: EffectAckDebt,
+    },
     /// A restore committed: context + task authority were transactionally
     /// restored, and the host re-applied the checkpoint's capability flags.
     /// This is the bounded audit record of that commit. If it cannot be
