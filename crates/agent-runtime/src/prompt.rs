@@ -785,25 +785,34 @@ fn render_task_anchor(task: &TaskAnchorView) -> String {
     out
 }
 
+/// 固定行打包优先级：数字越大越不可因预算而丢。stall 是确定性停滞
+/// 信号（模型最不能错过），blockers 是逐义务硬性提示，soft 提示
+/// （settlement/opportunity）在预算紧张时最先整条走。
+const PRIO_STALL: u8 = 100;
+const PRIO_BLOCKER: u8 = 95;
+const PRIO_FRONTIER: u8 = 90;
+const PRIO_REPAIR: u8 = 85;
+const PRIO_COMMIT_FAILURE: u8 = 80;
+const PRIO_SETTLEMENT: u8 = 70;
+const PRIO_OPPORTUNITY: u8 = 60;
+
 fn render_task_progress(progress: &TaskProgressView) -> String {
     let mut checked = progress.checked_files.clone();
     let mut verifications = progress.verifications.clone();
     let mut failed = progress.failed_commands.clone();
     let mut evidence = progress.operational_evidence.clone();
+    let mut fixed = progress_fixed_blocks(progress);
+    // 记录级打包：整条追加、整条丢弃，绝不把一行切成半行。列表行
+    // （最新在前，最旧先走）优先让位；列表清空后按优先级从最低的
+    // 固定块开始整块丢弃；stall 与 header 各自有界，永不因预算丢失。
     let mut rendered = format_task_progress(
         progress.anchor_revision,
         progress.workspace_revision,
+        &fixed,
         &checked,
         &verifications,
         &failed,
         &evidence,
-        progress.completion_commit_failure.as_deref(),
-        progress.completion_repair.as_deref(),
-        &progress.unresolved_blockers,
-        progress.stall_warning.as_deref(),
-        progress.frontier_warning.as_deref(),
-        progress.settlement.as_deref(),
-        progress.completion_opportunity.as_deref(),
     );
     while rendered.chars().count() > agent_contracts::MAX_TASK_PROGRESS_PROMPT_CHARS {
         if !failed.is_empty() {
@@ -814,89 +823,97 @@ fn render_task_progress(progress: &TaskProgressView) -> String {
             verifications.remove(0);
         } else if !evidence.is_empty() {
             evidence.remove(0);
+        } else if let Some(index) = lowest_priority_fixed_index(&fixed) {
+            fixed.remove(index);
         } else {
-            break;
+            // 只剩 header + stall 仍超限：源端必已越界。保留整行、
+            // 宁可略超预算也不切半行；调试断言暴露越界的生成端。
+            debug_assert!(
+                !progress.stall_warning.is_some(),
+                "TASK PROGRESS stall row alone exceeded the cap; keep advisory rows bounded at the source"
+            );
+            return rendered;
         }
         rendered = format_task_progress(
             progress.anchor_revision,
             progress.workspace_revision,
+            &fixed,
             &checked,
             &verifications,
             &failed,
             &evidence,
-            progress.completion_commit_failure.as_deref(),
-            progress.completion_repair.as_deref(),
-            &progress.unresolved_blockers,
-            progress.stall_warning.as_deref(),
-            progress.frontier_warning.as_deref(),
-            progress.settlement.as_deref(),
-            progress.completion_opportunity.as_deref(),
         );
     }
-    if rendered.chars().count() > agent_contracts::MAX_TASK_PROGRESS_PROMPT_CHARS {
-        rendered
-            .chars()
-            .take(agent_contracts::MAX_TASK_PROGRESS_PROMPT_CHARS)
-            .collect()
-    } else {
-        rendered
-    }
+    rendered
 }
 
-#[allow(clippy::too_many_arguments)]
+/// The fixed region as whole rows/row-groups in visual order, each tagged
+/// with a packing priority. Generation sites bound every row, so this list
+/// stays small; the packing loop only ever drops whole entries from it.
+fn progress_fixed_blocks(progress: &TaskProgressView) -> Vec<(u8, String)> {
+    let mut blocks = Vec::new();
+    if let Some(line) = progress.stall_warning.as_deref() {
+        blocks.push((PRIO_STALL, format!("{line}\n")));
+    }
+    if let Some(line) = progress.frontier_warning.as_deref() {
+        blocks.push((PRIO_FRONTIER, format!("{line}\n")));
+    }
+    if let Some(line) = progress.completion_commit_failure.as_deref() {
+        blocks.push((PRIO_COMMIT_FAILURE, format!("{line}\n")));
+    }
+    if let Some(line) = progress.completion_repair.as_deref() {
+        blocks.push((PRIO_REPAIR, format!("{line}\n")));
+    }
+    if let Some(line) = progress.settlement.as_deref() {
+        blocks.push((PRIO_SETTLEMENT, format!("{line}\n")));
+    }
+    if let Some(line) = progress.completion_opportunity.as_deref() {
+        blocks.push((PRIO_OPPORTUNITY, format!("{line}\n")));
+    }
+    if !progress.unresolved_blockers.is_empty() {
+        // The blocker label group is one record: dropped whole or kept
+        // whole, so a surviving label can never dangle over a cut row.
+        let mut group = String::from("Unresolved blockers\n");
+        for blocker in &progress.unresolved_blockers {
+            group.push_str("- ");
+            group.push_str(blocker);
+            group.push('\n');
+        }
+        blocks.push((PRIO_BLOCKER, group));
+    }
+    blocks
+}
+
+fn lowest_priority_fixed_index(blocks: &[(u8, String)]) -> Option<usize> {
+    let mut lowest: Option<(usize, u8)> = None;
+    for (index, (priority, _)) in blocks.iter().enumerate() {
+        if *priority == PRIO_STALL {
+            continue;
+        }
+        if lowest.is_none_or(|(_, current)| *priority < current) {
+            lowest = Some((index, *priority));
+        }
+    }
+    lowest.map(|(index, _)| index)
+}
+
 fn format_task_progress(
     anchor_revision: u64,
     workspace_revision: u64,
+    fixed: &[(u8, String)],
     checked: &[String],
     verifications: &[String],
     failed: &[String],
     evidence: &[String],
-    completion_commit_failure: Option<&str>,
-    completion_repair: Option<&str>,
-    blockers: &[String],
-    stall_warning: Option<&str>,
-    frontier_warning: Option<&str>,
-    settlement: Option<&str>,
-    completion_opportunity: Option<&str>,
 ) -> String {
     let mut out =
         format!("TASK PROGRESS anchor_rev={anchor_revision} world_rev={workspace_revision}\n");
-    // The deterministic stall signal is the one line the model must not
-    // lose to list trimming, so it renders directly under the header.
-    if let Some(warning) = stall_warning {
-        out.push_str(warning);
-        out.push('\n');
+    // 固定区按视觉顺序完整平铺：stall/frontier 是模型最不能错过的
+    // 信号，commit_failure/repair 是当前派生控制态，settlement/
+    // opportunity 是默认关闭的软提示，blockers 是逐义务硬性提示。
+    for (_, block) in fixed {
+        out.push_str(block);
     }
-    // 收敛 advisory 同样不参与裁剪：它是重复行为的最后提醒。
-    if let Some(warning) = frontier_warning {
-        out.push_str(warning);
-        out.push('\n');
-    }
-    if let Some(failure) = completion_commit_failure {
-        out.push_str(failure);
-        out.push('\n');
-    }
-    // Completion repair is current derived control state, not historical
-    // prose. It stays above trimmable lists so the model and resolver surface
-    // are driven by the same task/world basis.
-    if let Some(repair) = completion_repair {
-        out.push_str(repair);
-        out.push('\n');
-    }
-    // 任务感知结算事实（默认关）：不参与列表裁剪，投影时直接可见。
-    // 它保留 ordinary final / durable closure / 具体续做的自主选择。
-    if let Some(line) = settlement {
-        out.push_str(line);
-        out.push('\n');
-    }
-    // 机会投影（Slice C，默认关）：只在租赁存活的那一次决策可见。
-    if let Some(opportunity) = completion_opportunity {
-        out.push_str(opportunity);
-        out.push('\n');
-    }
-    // 逐义务 blocker（≤2 行有界）：无关推进清不掉它们，
-    // 与全局 advisory 的语义不同，必须分开可见。
-    append_list(&mut out, "Unresolved blockers", blockers);
     append_list(&mut out, "Checked", checked);
     append_list(&mut out, "Verification", verifications);
     append_list(&mut out, "Failed commands", failed);
@@ -1799,6 +1816,120 @@ mod tests {
         assert!(
             rendered.contains("TASK SETTLED"),
             "the settlement fact must survive row trimming and the final cap"
+        );
+    }
+
+    /// Record packing is whole-row or whole-group: after trimming, every
+    /// rendered line is either the header or an exact source record. A
+    /// mid-line cut would leave a line that matches no source record.
+    #[test]
+    fn task_progress_packing_never_cuts_a_record_mid_line() {
+        use std::collections::HashSet;
+        let stall = "EXECUTION STALL: edit.replace on src/a.rs repeated 3 time(s) without world progress (last failure: stale_revision). Choose another strategy or finish with the current state.";
+        let block = "B".repeat(400);
+        let progress = TaskProgressView {
+            checked_files: (0..16).map(|i| format!("src/f{i}.rs@{block}")).collect(),
+            verifications: (0..8).map(|i| format!("ok:{block}{i}")).collect(),
+            failed_commands: (0..8).map(|i| format!("shell.exec {block}{i}")).collect(),
+            operational_evidence: (0..6)
+                .map(|i| format!("key:{block}{i} @ world=0"))
+                .collect(),
+            unresolved_blockers: vec![format!("UNRESOLVED BLOCKER {block}")],
+            stall_warning: Some(stall.into()),
+            frontier_warning: Some(format!("EXECUTION FRONTIER {block}")),
+            settlement: Some(format!("TASK SETTLED {block}")),
+            completion_commit_failure: Some(format!("commit failed {block}")),
+            completion_repair: Some(format!("repair {block}")),
+            completion_opportunity: Some(format!("opportunity {block}")),
+            ..Default::default()
+        };
+        let rendered = render_task_progress(&progress);
+        assert!(
+            rendered.chars().count() <= agent_contracts::MAX_TASK_PROGRESS_PROMPT_CHARS,
+            "packing must stay under the hard cap"
+        );
+        let mut whole_rows: HashSet<String> = HashSet::new();
+        whole_rows.insert(format!(
+            "TASK PROGRESS anchor_rev={} world_rev={}",
+            progress.anchor_revision, progress.workspace_revision
+        ));
+        whole_rows.insert(stall.to_string());
+        whole_rows.insert(format!("EXECUTION FRONTIER {block}"));
+        whole_rows.insert(format!("TASK SETTLED {block}"));
+        whole_rows.insert(format!("commit failed {block}"));
+        whole_rows.insert(format!("repair {block}"));
+        whole_rows.insert(format!("opportunity {block}"));
+        whole_rows.insert(format!("UNRESOLVED BLOCKER {block}"));
+        whole_rows.insert("Unresolved blockers".into());
+        whole_rows.insert("Checked".into());
+        whole_rows.insert("Verification".into());
+        whole_rows.insert("Failed commands".into());
+        whole_rows.insert("Operational evidence".into());
+        for index in 0..16 {
+            whole_rows.insert(format!("src/f{index}.rs@{block}"));
+        }
+        for index in 0..8 {
+            whole_rows.insert(format!("ok:{block}{index}"));
+            whole_rows.insert(format!("shell.exec {block}{index}"));
+        }
+        for index in 0..6 {
+            whole_rows.insert(format!("key:{block}{index} @ world=0"));
+        }
+        for line in rendered.lines() {
+            let stripped = line.strip_prefix("- ").unwrap_or(line);
+            assert!(
+                whole_rows.contains(stripped),
+                "rendered line is neither a whole source record nor the header: {line:?}"
+            );
+        }
+        assert!(
+            rendered.contains("EXECUTION STALL"),
+            "the stall signal must survive record packing: {rendered}"
+        );
+    }
+
+    /// Whole fixed rows drop by packing priority, soft hints first, the
+    /// deterministic stall signal last; a dropped row leaves no fragment
+    /// and no dangling blocker label.
+    #[test]
+    fn task_progress_drops_whole_fixed_rows_by_priority() {
+        use agent_contracts::{MAX_TASK_PROGRESS_PROMPT_CHARS, TaskProgressView};
+        let block = "Q".repeat(500);
+        let progress = TaskProgressView {
+            stall_warning: Some("EXECUTION STALL: fixture marker, never dropped".into()),
+            frontier_warning: Some(format!("EXECUTION FRONTIER {block}")),
+            settlement: Some(format!("TASK SETTLED {block}")),
+            completion_commit_failure: Some(format!("commit failed {block}")),
+            completion_repair: Some(format!("repair {block}")),
+            completion_opportunity: Some(format!("opportunity {block}")),
+            unresolved_blockers: vec![format!("UNRESOLVED BLOCKER {block}")],
+            checked_files: (0..24).map(|i| format!("src/f{i}.rs@{block}")).collect(),
+            ..Default::default()
+        };
+        let rendered = render_task_progress(&progress);
+        assert!(
+            rendered.chars().count() <= MAX_TASK_PROGRESS_PROMPT_CHARS,
+            "priority packing must honor the cap"
+        );
+        assert!(
+            rendered.contains("EXECUTION STALL: fixture marker, never dropped"),
+            "the stall signal is the last fixed row to go: {rendered}"
+        );
+        assert!(rendered.contains("EXECUTION FRONTIER"));
+        assert!(
+            rendered.contains("repair "),
+            "repair outranks commit failure"
+        );
+        assert!(rendered.contains("UNRESOLVED BLOCKER"));
+        for dropped in ["opportunity ", "TASK SETTLED ", "commit failed "] {
+            assert!(
+                !rendered.contains(dropped),
+                "low-priority fixed rows drop whole, no fragment '{dropped}' in: {rendered}"
+            );
+        }
+        assert!(
+            rendered.contains("Unresolved blockers"),
+            "the blocker label survives while its group does: {rendered}"
         );
     }
 
