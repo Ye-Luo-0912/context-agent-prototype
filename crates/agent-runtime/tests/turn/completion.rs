@@ -9,11 +9,13 @@ use std::{
 
 use agent_contracts::{
     AgentError, AgentResult, ContextDiagnostics, ContextEngine, ContextIngress, ContextItemSummary,
-    ContextMaintenanceReport, ContextMaintenanceTrigger, ContextQuery, ContextStateTransition,
-    EventJournal, MaterializedContext, ModelCapabilities, ModelChunk, ModelEventSink, ModelOutput,
-    ModelRequest, ModelTransport, RunId, RuntimeEvent, RuntimeEventEnvelope, ScopeId, ScopeKind,
-    ToolCall, ToolDispatcher, ToolExecutionAttribution, ToolExecutionPurpose, ToolExecutionRequest,
-    ToolOutcome, ToolOutput, ToolRisk, ToolSpec, VerificationReuse,
+    ContextMaintenanceReport, ContextMaintenanceTrigger, ContextMaterializationIdentity,
+    ContextMaterializationMiss, ContextMaterializationMissReason, ContextMaterializationMisses,
+    ContextQuery, ContextStateTransition, EventJournal, MaterializedContext, ModelCapabilities,
+    ModelChunk, ModelEventSink, ModelOutput, ModelRequest, ModelTransport, RunId, RuntimeEvent,
+    RuntimeEventEnvelope, ScopeId, ScopeKind, ToolCall, ToolDispatcher, ToolExecutionAttribution,
+    ToolExecutionPurpose, ToolExecutionRequest, ToolOutcome, ToolOutput, ToolRisk, ToolSpec,
+    VerificationReuse,
 };
 
 use agent_core::{CoreAuthorityConfig, PolicyApprovalGate};
@@ -466,6 +468,137 @@ async fn run_model_visible_completion_refusal(
     instance.shutdown().await.unwrap();
     let captured = requests.lock().unwrap().clone();
     (output, captured, checkpoint)
+}
+
+/// A context engine whose materialized frame always reports one required
+/// context miss (budget exclusion), so completion readiness must surface
+/// `RequiredContextUnavailable` and refuse the proposal.
+#[derive(Debug, Default)]
+struct RequiredMissContextEngine;
+
+#[async_trait::async_trait]
+impl ContextEngine for RequiredMissContextEngine {
+    async fn ingest(&self, _ingress: ContextIngress) -> AgentResult<()> {
+        Ok(())
+    }
+    async fn maintain(
+        &self,
+        _trigger: ContextMaintenanceTrigger,
+    ) -> AgentResult<ContextMaintenanceReport> {
+        Ok(ContextMaintenanceReport::default())
+    }
+    async fn materialize(&self, _query: ContextQuery) -> AgentResult<MaterializedContext> {
+        let mut required_misses = ContextMaterializationMisses::default();
+        required_misses.push(ContextMaterializationMiss {
+            identity: ContextMaterializationIdentity::new(
+                "context://run/required",
+                None,
+                "evidence_refs",
+                1,
+            ),
+            reason: ContextMaterializationMissReason::BudgetExcluded,
+        });
+        Ok(MaterializedContext {
+            materialization_id: 0,
+            focus: None,
+            task: None,
+            items: Vec::new(),
+            external: agent_contracts::ContextMapView::default(),
+            selected: Vec::new(),
+            approx_tokens: 0,
+            foreground: Vec::new(),
+            required_item_ids: Vec::new(),
+            required_misses,
+            optional_misses: Default::default(),
+            diagnostics: ContextDiagnostics::default(),
+        })
+    }
+    async fn open_scope(&self, _kind: ScopeKind, _parent: Option<ScopeId>) -> AgentResult<ScopeId> {
+        Ok(ScopeId::new())
+    }
+    async fn close_scope(&self, _scope_id: ScopeId) -> AgentResult<Vec<ContextStateTransition>> {
+        Ok(Vec::new())
+    }
+    async fn diagnostics(&self) -> AgentResult<ContextDiagnostics> {
+        Ok(ContextDiagnostics::default())
+    }
+    async fn inspect(&self, _limit: usize) -> AgentResult<Vec<ContextItemSummary>> {
+        Ok(Vec::new())
+    }
+    async fn checkpoint(&self) -> AgentResult<serde_json::Value> {
+        Ok(serde_json::Value::Null)
+    }
+    async fn restore(&self, _data: serde_json::Value) -> AgentResult<()> {
+        Ok(())
+    }
+}
+
+/// The hard-required-context-miss negative of the completion matrix: a
+/// materialized frame that cannot supply a required body keeps completion
+/// refused with the typed blocker and an operator repair stage, even when
+/// every evidence row is otherwise current.
+#[tokio::test]
+async fn hard_required_context_miss_keeps_completion_refused() {
+    let services = RuntimeServices::new(
+        CoreAuthorityConfig::default(),
+        Arc::new(RequiredMissContextEngine),
+        Arc::new(CompletionRefusalModel {
+            rounds: AtomicUsize::new(0),
+            requests: Arc::new(std::sync::Mutex::new(Vec::new())),
+        }),
+        Arc::new(WithCompletionVerificationTools {
+            inner: CompletionToolDispatcher { workspace: None },
+        }),
+        Arc::new(PolicyApprovalGate::read_only()),
+        None,
+    );
+    let mut host = ModuleHost::new();
+    host.start().await.expect("test module host starts");
+    let instance = RuntimeInstance::spawn(host, services);
+    let handle = instance.handle();
+    let mut events = handle.subscribe();
+    handle.start().await.unwrap();
+    declare_completion_acceptance(handle, "finish only with evidence").await;
+    handle.user_message("try to finish".into()).await.unwrap();
+
+    let mut completion_output = None;
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+    while tokio::time::Instant::now() < deadline {
+        if let Ok(Ok(envelope)) =
+            tokio::time::timeout(Duration::from_millis(50), events.recv()).await
+        {
+            match envelope.event {
+                RuntimeEvent::ToolFinished { output, .. }
+                    if output.tool_name == "task.complete" =>
+                {
+                    completion_output = Some(output);
+                }
+                RuntimeEvent::TaskCompleted { .. } => {
+                    panic!("a required-context miss must keep completion refused")
+                }
+                RuntimeEvent::TurnCompleted if completion_output.is_some() => break,
+                _ => {}
+            }
+        }
+    }
+    let output = completion_output.expect("task.complete must publish its authoritative result");
+    assert!(!output.ok);
+    assert_eq!(output.metadata["refused"].as_str(), Some("completion_gate"));
+    let blockers = output.metadata["blockers"]
+        .as_array()
+        .expect("refusal must carry typed blockers");
+    assert!(
+        blockers.iter().any(|blocker| blocker
+            .get("required_context_unavailable")
+            .and_then(serde_json::Value::as_object)
+            .is_some_and(|value| value["remaining"] == 1)),
+        "the typed required-context blocker must be present: {blockers:?}"
+    );
+    assert_eq!(
+        output.metadata["repair_plan"]["steps"][0]["kind"],
+        "operator_required"
+    );
+    instance.shutdown().await.unwrap();
 }
 
 #[tokio::test]
