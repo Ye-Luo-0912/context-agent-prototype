@@ -396,6 +396,102 @@ async fn distinct_domain_passes_accumulate_criterion_receipts() {
     instance.shutdown().await.unwrap();
 }
 
+/// The deterministic repair matrix: rejecting completion while a second
+/// criterion is still uncovered derives the projected stage from current
+/// readiness. Once the first criterion's PASS mints its receipt, the
+/// projected stage names only the second criterion; the follow-up PASS
+/// then closes it and the next completion is accepted.
+#[tokio::test]
+async fn criterion_a_pass_advances_the_projected_repair_stage_to_criterion_b() {
+    let dir = tempfile::tempdir().unwrap();
+    let (instance, collector) = settlement_instance(
+        dir.path(),
+        vec![
+            Step::Write("r1"),
+            Step::Verify("r1"),
+            Step::Complete("partial"),
+            Step::VerifyOther("r1"),
+            Step::Complete("done"),
+        ],
+    )
+    .await;
+    started_task_with_patch(
+        &instance,
+        agent_runtime::AnchorPatch {
+            completion_policy: Some(agent_runtime::task::TaskCompletionPolicy::EvidenceRequired),
+            acceptance_criteria: Some(vec![
+                agent_runtime::task::AcceptanceCriterion::declared(
+                    "workspace tests pass",
+                    &acceptance_declaration(),
+                ),
+                agent_runtime::task::AcceptanceCriterion::declared(
+                    "the public API remains compatible",
+                    &api_acceptance_declaration(),
+                ),
+            ]),
+            ..agent_runtime::AnchorPatch::default()
+        },
+    )
+    .await;
+    let events = user_turn(&instance, collector).await;
+
+    let receipt_batches: Vec<Vec<u32>> = events
+        .iter()
+        .filter_map(|envelope| match &envelope.event {
+            RuntimeEvent::AcceptanceReceiptsRecorded {
+                criterion_indices, ..
+            } => Some(criterion_indices.clone()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        receipt_batches,
+        vec![vec![0], vec![1]],
+        "each domain PASS must mint exactly its own criterion receipt"
+    );
+
+    let completions: Vec<ToolOutput> = events
+        .iter()
+        .filter_map(|envelope| match &envelope.event {
+            RuntimeEvent::ToolFinished { output, .. } if output.tool_name == "task.complete" => {
+                Some(output.clone())
+            }
+            _ => None,
+        })
+        .collect();
+    assert_eq!(completions.len(), 2);
+
+    // First completion: the workspace-tests receipt is already minted, so
+    // the projected repair stage names only the still-uncovered criterion.
+    assert!(!completions[0].ok, "the partial completion must be refused");
+    assert_eq!(
+        completions[0].metadata["refused"].as_str(),
+        Some("completion_gate")
+    );
+    let details = completions[0].metadata["repair_plan"]["steps"][0]["criterion_details"]
+        .as_array()
+        .expect("the refusal must carry criterion details");
+    assert_eq!(
+        details.len(),
+        1,
+        "the criterion-0 PASS must advance the stage off criterion 0"
+    );
+    assert_eq!(details[0]["criterion_index"], 1);
+    assert_eq!(details[0]["coverage_domain"], "api-contract");
+
+    // Second completion: the api-contract receipt lands and the task closes.
+    assert!(
+        completions[1].ok,
+        "both covered criteria must accept completion"
+    );
+    assert!(
+        events
+            .iter()
+            .any(|envelope| matches!(&envelope.event, RuntimeEvent::TaskCompleted { .. }))
+    );
+    instance.shutdown().await.unwrap();
+}
+
 #[derive(Debug)]
 struct FailAcceptanceReceiptJournal;
 
