@@ -29,6 +29,7 @@ use crate::harness::*;
 struct BodyTrackingEngine {
     state: Mutex<Vec<String>>,
     fail_user_input_maintain: AtomicBool,
+    fail_restore: AtomicBool,
     checkpoint_maintains: AtomicUsize,
     slow_checkpoint_ms: AtomicU64,
 }
@@ -94,6 +95,9 @@ impl ContextEngine for BodyTrackingEngine {
             .map_err(|e| AgentError::Internal(format!("test checkpoint: {e}")))
     }
     async fn restore(&self, data: serde_json::Value) -> AgentResult<()> {
+        if self.fail_restore.load(Ordering::SeqCst) {
+            return Err(AgentError::Context("simulated rollback failure".into()));
+        }
         *self.state.lock().unwrap() = serde_json::from_value(data)
             .map_err(|e| AgentError::Internal(format!("test restore: {e}")))?;
         Ok(())
@@ -233,6 +237,33 @@ async fn user_input_maintain_failure_rolls_back_the_context_plane() {
         engine.state.lock().unwrap().as_slice(),
         &["again".to_string()],
         "the second body must commit after the rolled-back failure"
+    );
+    handle.stop().await.unwrap();
+}
+
+/// A UserInput maintenance failure whose rollback also fails must fence
+/// the runtime: the context plane may be ahead of task/audit state and
+/// there is no proof it was restored, so no further mutation is allowed.
+#[tokio::test]
+async fn user_input_maintain_rollback_failure_fences_the_runtime() {
+    let engine = Arc::new(BodyTrackingEngine::default());
+    engine
+        .fail_user_input_maintain
+        .store(true, Ordering::SeqCst);
+    engine.fail_restore.store(true, Ordering::SeqCst);
+    let (handle, _task) = spawn_runtime(actor_kernel(engine.clone()));
+    handle.start().await.unwrap();
+
+    let error = handle.user_message("hello".into()).await.unwrap_err();
+    assert!(
+        matches!(error, AgentError::RecoveryRequired(_)),
+        "an unprovable rollback must fence the runtime: {error}"
+    );
+
+    let error = handle.user_message("again".into()).await.unwrap_err();
+    assert!(
+        matches!(error, AgentError::RecoveryRequired(_)),
+        "a fenced runtime must reject further mutation: {error}"
     );
     handle.stop().await.unwrap();
 }
