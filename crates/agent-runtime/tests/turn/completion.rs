@@ -448,7 +448,9 @@ async fn run_model_visible_completion_refusal(
             tokio::time::timeout(Duration::from_millis(50), events.recv()).await
         {
             match envelope.event {
-                RuntimeEvent::ToolFinished { output } if output.tool_name == "task.complete" => {
+                RuntimeEvent::ToolFinished { output, .. }
+                    if output.tool_name == "task.complete" =>
+                {
                     completion_output = Some(output);
                 }
                 RuntimeEvent::TaskCompleted { .. } => {
@@ -573,7 +575,7 @@ async fn task_complete_proposal_commits_the_typed_record_at_turn_end() {
     let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
     while tokio::time::Instant::now() < deadline {
         while let Ok(envelope) = events.try_recv() {
-            if let RuntimeEvent::ToolFinished { output } = &envelope.event
+            if let RuntimeEvent::ToolFinished { output, .. } = &envelope.event
                 && output.tool_name == "task.complete"
             {
                 pending_receipt = Some(output.clone());
@@ -1917,12 +1919,14 @@ async fn unloaded_surface_attempts_are_visible_but_never_completion_debt() {
             tokio::time::timeout(Duration::from_millis(50), events.recv()).await
         {
             match envelope.event {
-                RuntimeEvent::ToolFinished { output }
+                RuntimeEvent::ToolFinished { output, .. }
                     if matches!(output.tool_name.as_str(), "fs.write" | "fs_mkdir") =>
                 {
                     surface_refusals.push(output);
                 }
-                RuntimeEvent::ToolFinished { output } if output.tool_name == "task.complete" => {
+                RuntimeEvent::ToolFinished { output, .. }
+                    if output.tool_name == "task.complete" =>
+                {
                     assert!(
                         output.ok,
                         "completion must be accepted once: {}",
@@ -2088,7 +2092,9 @@ async fn consecutive_refusals_against_the_same_basis_accrue_durably() {
             tokio::time::timeout(Duration::from_millis(50), events.recv()).await
         {
             match envelope.event {
-                RuntimeEvent::ToolFinished { output } if output.tool_name == "task.complete" => {
+                RuntimeEvent::ToolFinished { output, .. }
+                    if output.tool_name == "task.complete" =>
+                {
                     assert!(!output.ok, "the gate must refuse both proposals");
                     refusals.push(output);
                 }
@@ -2398,7 +2404,9 @@ async fn run_proof_refresh_scenario(
             tokio::time::timeout(Duration::from_millis(50), events.recv()).await
         {
             match envelope.event {
-                RuntimeEvent::ToolFinished { output } if output.tool_name == "task.complete" => {
+                RuntimeEvent::ToolFinished { output, .. }
+                    if output.tool_name == "task.complete" =>
+                {
                     completion_output = Some(output);
                 }
                 RuntimeEvent::TurnCompleted if completion_output.is_some() => break,

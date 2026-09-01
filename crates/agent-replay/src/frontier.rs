@@ -46,7 +46,7 @@ pub fn rebuild_frontier(envelopes: &[RuntimeEventEnvelope]) -> FrontierRebuild {
     let mut state = ExecutionState::default();
     let mut rebuild = FrontierRebuild::default();
     for envelope in envelopes {
-        let RuntimeEvent::ToolFinished { output } = &envelope.event else {
+        let RuntimeEvent::ToolFinished { output, .. } = &envelope.event else {
             continue;
         };
         // 每条入账的 ToolFinished 都是一次持久化观察；轮号仅用于
@@ -104,9 +104,11 @@ mod tests {
         let trace = vec![
             envelope(RuntimeEvent::ToolFinished {
                 output: git_status(),
+                facts: None,
             }),
             envelope(RuntimeEvent::ToolFinished {
                 output: git_status(),
+                facts: None,
             }),
         ];
         let rebuild = rebuild_frontier(&trace);

@@ -1298,7 +1298,14 @@ mod tests {
                 },
             ),
             envelope(run_id, 3, RuntimeEvent::ToolStarted { call }),
-            envelope(run_id, 4, RuntimeEvent::ToolFinished { output }),
+            envelope(
+                run_id,
+                4,
+                RuntimeEvent::ToolFinished {
+                    output,
+                    facts: None,
+                },
+            ),
             envelope(
                 run_id,
                 5,

@@ -665,7 +665,7 @@ pub fn tool_histogram(events: &[RuntimeEventEnvelope]) -> Vec<ToolCount> {
             RuntimeEvent::ToolStarted { call } => {
                 *started.entry(call.name.clone()).or_default() += 1;
             }
-            RuntimeEvent::ToolFinished { output } if !output.ok => {
+            RuntimeEvent::ToolFinished { output, .. } if !output.ok => {
                 *failed.entry(output.tool_name.clone()).or_default() += 1;
             }
             _ => {}
@@ -1250,6 +1250,7 @@ mod tests {
             envelope(
                 3,
                 RuntimeEvent::ToolFinished {
+                    facts: None,
                     output: ToolOutput {
                         call_id: "c1".into(),
                         tool_name: "fs.read".into(),

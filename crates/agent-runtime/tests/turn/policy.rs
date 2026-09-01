@@ -315,7 +315,7 @@ async fn expired_authority_lease_rolls_back_the_staged_effect() {
     while tokio::time::Instant::now() < deadline {
         while let Ok(envelope) = events.try_recv() {
             match envelope.event {
-                RuntimeEvent::ToolFinished { output } => {
+                RuntimeEvent::ToolFinished { output, .. } => {
                     if output.tool_name == "fs.write" {
                         refused_output = Some(output);
                     }

@@ -213,7 +213,7 @@ fn count_started(events: &[RuntimeEventEnvelope], tool: &str) -> usize {
 fn failure_classes(events: &[RuntimeEventEnvelope], tool: &str) -> HashMap<String, usize> {
     let mut classes = HashMap::new();
     for envelope in events {
-        if let agent_contracts::RuntimeEvent::ToolFinished { output } = &envelope.event
+        if let agent_contracts::RuntimeEvent::ToolFinished { output, .. } = &envelope.event
             && output.tool_name == tool
             && let Some(class) = output.failure_class()
         {
@@ -289,7 +289,7 @@ pub async fn scenario_operational_evidence() -> anyhow::Result<ConvergenceBenchR
         .collect();
     let mut list_meta = String::new();
     for envelope in &events {
-        if let agent_contracts::RuntimeEvent::ToolFinished { output } = &envelope.event
+        if let agent_contracts::RuntimeEvent::ToolFinished { output, .. } = &envelope.event
             && output.tool_name == "fs.list"
         {
             list_meta.push_str(&format!(
@@ -373,7 +373,7 @@ pub async fn scenario_verification_reuse() -> anyhow::Result<ConvergenceBenchRep
         .filter(|envelope| {
             matches!(
                 &envelope.event,
-                agent_contracts::RuntimeEvent::ToolFinished { output }
+                agent_contracts::RuntimeEvent::ToolFinished { output, .. }
                     if output.tool_name == "verify.run" && output.ok
             )
         })
@@ -385,7 +385,7 @@ pub async fn scenario_verification_reuse() -> anyhow::Result<ConvergenceBenchRep
             agent_contracts::RuntimeEvent::ToolStarted { call } if call.name == "verify.run" => {
                 Some(format!("started:{}", call.id))
             }
-            agent_contracts::RuntimeEvent::ToolFinished { output }
+            agent_contracts::RuntimeEvent::ToolFinished { output, .. }
                 if output.tool_name == "verify.run" =>
             {
                 Some(format!(

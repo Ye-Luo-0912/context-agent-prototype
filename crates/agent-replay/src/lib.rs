@@ -31,9 +31,10 @@ use std::{
 use agent_contracts::{
     AttentionState, ContextConsumptionAck, ContextDiagnostics, ContextEngine, ContextHints,
     ContextIngress, ContextItemId, ContextItemSummary, ContextKind, ContextQuery, ContextSelection,
-    FocusState, InputKind, MAX_PINNED_CONTENT_CHARS, MAX_TASK_ANCHOR_TEXT_CHARS,
-    MaterializedContext, MaterializedItem, OperationId, RunId, RuntimeEvent, RuntimeEventEnvelope,
-    RuntimeInputEnvelope, TurnId, USER_INPUT_REPLAY_MAX_BYTES, bounded_text_chars, tokens,
+    ExecutionFactsEnvelope, FocusState, InputKind, MAX_PINNED_CONTENT_CHARS,
+    MAX_TASK_ANCHOR_TEXT_CHARS, MaterializedContext, MaterializedItem, OperationId, RunId,
+    RuntimeEvent, RuntimeEventEnvelope, RuntimeInputEnvelope, ToolExecutionFacts, ToolOutput,
+    TurnId, USER_INPUT_REPLAY_MAX_BYTES, bounded_text_chars, tokens,
 };
 use context_simple::{SimpleContextConfig, SimpleContextEngine};
 
@@ -186,6 +187,29 @@ async fn resolve_user_message_body(
         .map_err(|error| anyhow::anyhow!("user-input artifact {body_ref} is not utf-8: {error}"))
 }
 
+/// Resolve the trusted execution facts for one finished tool: the
+/// versioned top-level event carrier wins over the output's reserved
+/// metadata key, which stays the fallback for older journals. Rejected
+/// envelopes are a replay integrity error, never a silent decode.
+pub(crate) fn resolve_observation_facts(
+    output: &ToolOutput,
+    facts: Option<ExecutionFactsEnvelope>,
+) -> anyhow::Result<Option<Box<ToolExecutionFacts>>> {
+    let native = match facts {
+        Some(envelope) => {
+            envelope.validate().map_err(|error| {
+                anyhow::anyhow!(
+                    "replay rejected ToolFinished facts from call {}: {error}",
+                    output.call_id
+                )
+            })?;
+            Some(envelope.facts)
+        }
+        None => output.native_execution_facts(),
+    };
+    Ok(native.map(Box::new))
+}
+
 /// Replay a slice of envelopes through the dynamic working-set engine.
 /// Deterministic: same events, same engine version, same story.
 pub async fn replay_events(
@@ -290,10 +314,12 @@ pub(crate) async fn run_engine_observing(
                     })
                     .await?;
             }
-            RuntimeEvent::TaskCompleted { summary, .. } => {
+            RuntimeEvent::TaskCompleted {
+                task_id, summary, ..
+            } => {
                 engine
                     .ingest(ContextIngress::TaskCompleted {
-                        task_id: None,
+                        task_id: Some(*task_id),
                         summary: summary.clone(),
                     })
                     .await?;
@@ -305,11 +331,12 @@ pub(crate) async fn run_engine_observing(
                     })
                     .await?;
             }
-            RuntimeEvent::ToolFinished { output } => {
+            RuntimeEvent::ToolFinished { output, facts } => {
                 total_tool_rounds += 1;
+                let facts = resolve_observation_facts(output, facts.clone())?;
                 engine
                     .ingest(ContextIngress::ToolObservation {
-                        facts: None,
+                        facts,
                         output: output.clone(),
                         scope_id: None,
                     })
@@ -754,8 +781,8 @@ fn join_turns(turns: &[u64]) -> String {
 mod tests {
     use super::*;
     use agent_contracts::{
-        ContextMaintenanceReport, ContextMaintenanceTrigger, ContextScope, RunId, RuntimeEvent,
-        TaskId, ToolOutput,
+        ContextMaintenanceReport, ContextMaintenanceTrigger, ContextScope, ExecutionFactsEnvelope,
+        RunId, RuntimeEvent, TaskId, ToolExecutionFacts, ToolOutput,
     };
     use serde_json::json;
 
@@ -811,6 +838,104 @@ mod tests {
             })
             .await
             .unwrap()
+    }
+
+    #[test]
+    fn top_level_facts_win_over_the_metadata_fallback() {
+        // The output carries its own native facts under the reserved key;
+        // the top-level envelope disagrees on purpose.
+        let mut output = ToolOutput {
+            call_id: "call-1".into(),
+            tool_name: "fs.read".into(),
+            ok: true,
+            summary: "ok".into(),
+            model_content: String::new(),
+            artifact_ref: None,
+            metadata: json!({"path": "legacy.rs"}),
+        };
+        output.set_native_execution_facts(
+            ToolExecutionFacts::from_resource_touches([("legacy.rs", None)])
+                .with_verification(false),
+        );
+        let top_level = ExecutionFactsEnvelope::new(
+            ToolExecutionFacts::from_resource_touches([("typed.rs", Some("r9".to_owned()))])
+                .with_verification(true),
+        );
+
+        let resolved = resolve_observation_facts(&output, Some(top_level)).unwrap();
+        let facts = resolved.expect("the top-level envelope resolves");
+        assert_eq!(facts.resource_touches()[0].path, "typed.rs");
+        assert_eq!(facts.resource_touches()[0].revision.as_deref(), Some("r9"));
+        assert_eq!(facts.is_verification(), Some(true));
+    }
+
+    #[test]
+    fn legacy_metadata_fallback_still_resolves_without_a_top_level_envelope() {
+        let mut output = ToolOutput {
+            call_id: "call-1".into(),
+            tool_name: "edit.patch".into(),
+            ok: true,
+            summary: "patched".into(),
+            model_content: String::new(),
+            artifact_ref: None,
+            metadata: json!({"path": "src/auth.rs", "revision": "r3"}),
+        };
+        output.set_native_execution_facts(
+            ToolExecutionFacts::from_resource_touches([("src/auth.rs", Some("r3".to_owned()))])
+                .with_mutation_bound(true),
+        );
+
+        let resolved = resolve_observation_facts(&output, None).unwrap();
+        let facts = resolved.expect("the metadata fallback resolves");
+        assert_eq!(facts.resource_touches()[0].path, "src/auth.rs");
+        assert_eq!(facts.may_mutate_workspace(), Some(true));
+    }
+
+    #[test]
+    fn old_and_new_event_forms_rebuild_identical_facts() {
+        let mut output = ToolOutput {
+            call_id: "call-1".into(),
+            tool_name: "edit.patch".into(),
+            ok: true,
+            summary: "patched".into(),
+            model_content: String::new(),
+            artifact_ref: None,
+            metadata: json!({"path": "src/auth.rs", "revision": "r3"}),
+        };
+        // The new event form carries the same facts as a typed envelope;
+        // the legacy form carries them only under the reserved key.
+        let stamped =
+            ToolExecutionFacts::from_resource_touches([("src/auth.rs", Some("r3".to_owned()))])
+                .with_mutation_bound(true);
+        output.set_native_execution_facts(stamped.clone());
+
+        let legacy = resolve_observation_facts(&output, None).unwrap();
+        let current =
+            resolve_observation_facts(&output, Some(ExecutionFactsEnvelope::new(stamped))).unwrap();
+        assert_eq!(
+            serde_json::to_value(legacy.unwrap()).unwrap(),
+            serde_json::to_value(current.unwrap()).unwrap()
+        );
+    }
+
+    #[test]
+    fn invalid_facts_envelope_fails_the_replay_resolution() {
+        let output = ToolOutput {
+            call_id: "call-1".into(),
+            tool_name: "fs.read".into(),
+            ok: true,
+            summary: "ok".into(),
+            model_content: String::new(),
+            artifact_ref: None,
+            metadata: json!({}),
+        };
+        let mut envelope = ExecutionFactsEnvelope::new(ToolExecutionFacts::empty());
+        envelope.version = 99;
+        let error = resolve_observation_facts(&output, Some(envelope)).unwrap_err();
+        assert!(
+            error.to_string().contains("unsupported"),
+            "resolved with an unknown envelope version: {error}"
+        );
     }
 
     #[tokio::test]
@@ -1104,12 +1229,13 @@ mod tests {
     #[tokio::test]
     async fn replay_tracks_pin_and_task_completion() {
         let run = RunId::new();
+        let task_id = TaskId::new();
         let events = vec![
             envelope(
                 run,
                 1,
                 RuntimeEvent::FocusChanged {
-                    task_id: TaskId::new(),
+                    task_id,
                     goal: "task one".into(),
                 },
             ),
@@ -1141,7 +1267,7 @@ mod tests {
                 run,
                 6,
                 RuntimeEvent::TaskCompleted {
-                    task_id: TaskId::new(),
+                    task_id,
                     anchor_revision: 0,
                     summary: "task one done".into(),
                 },
@@ -1271,6 +1397,7 @@ mod tests {
                         "tests failed: AuthService.rs:42",
                         Some("AuthService.rs"),
                     ),
+                    facts: None,
                 },
             ),
             envelope(
@@ -1335,6 +1462,7 @@ mod tests {
                         "tests passed in AuthService.rs",
                         Some("AuthService.rs"),
                     ),
+                    facts: None,
                 },
             ),
             envelope(

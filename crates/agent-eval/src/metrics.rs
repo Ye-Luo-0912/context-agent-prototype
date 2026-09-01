@@ -519,7 +519,7 @@ pub fn aggregate_metrics(events: &[RuntimeEventEnvelope]) -> RunMetrics {
                     );
                 }
             }
-            RuntimeEvent::ToolFinished { output } => {
+            RuntimeEvent::ToolFinished { output, .. } => {
                 note_catalog_optional_request(
                     &mut metrics,
                     catalog_optional_round.as_mut(),
@@ -1292,7 +1292,7 @@ pub fn settlement_episode_profile(events: &[RuntimeEventEnvelope]) -> Settlement
                     .entry(call.name.clone())
                     .or_insert(0) += 1;
             }
-            RuntimeEvent::ToolFinished { output } if in_episode => {
+            RuntimeEvent::ToolFinished { output, .. } if in_episode => {
                 if !output.ok {
                     profile.episode_failures += 1;
                     *profile
@@ -1960,6 +1960,7 @@ mod tests {
             run,
             seq,
             RuntimeEvent::ToolFinished {
+                facts: None,
                 output: ToolOutput {
                     call_id: "1".into(),
                     tool_name: "fs.read".into(),
@@ -1989,6 +1990,7 @@ mod tests {
             run,
             seq,
             RuntimeEvent::ToolFinished {
+                facts: None,
                 output: ToolOutput {
                     call_id: "2".into(),
                     tool_name: "fs.read".into(),
@@ -2320,6 +2322,7 @@ mod tests {
             },
         };
         let output = |id: &str, name: &str, metadata| RuntimeEvent::ToolFinished {
+            facts: None,
             output: ToolOutput {
                 call_id: id.into(),
                 tool_name: name.into(),
@@ -2625,6 +2628,7 @@ mod tests {
                 seq: 3,
                 timestamp_ms: 50,
                 event: RuntimeEvent::ToolFinished {
+                    facts: None,
                     output: ToolOutput {
                         call_id: call_id.into(),
                         tool_name: agent_contracts::CONTEXT_MANAGE.into(),
@@ -2691,6 +2695,7 @@ mod tests {
                 2,
                 20,
                 RuntimeEvent::ToolFinished {
+                    facts: None,
                     output: ToolOutput {
                         call_id: "edit-1".into(),
                         tool_name: "edit.replace".into(),
@@ -2733,6 +2738,7 @@ mod tests {
                 5,
                 50,
                 RuntimeEvent::ToolFinished {
+                    facts: None,
                     output: ToolOutput {
                         call_id: "edit-2".into(),
                         tool_name: "edit.patch".into(),
@@ -2767,6 +2773,7 @@ mod tests {
                 7,
                 70,
                 RuntimeEvent::ToolFinished {
+                    facts: None,
                     output: ToolOutput {
                         call_id: "read-1".into(),
                         tool_name: "fs.read".into(),
@@ -2838,6 +2845,7 @@ mod tests {
                 seq: index as u64 + 1,
                 timestamp_ms: index as u64,
                 event: RuntimeEvent::ToolFinished {
+                    facts: None,
                     output: ToolOutput {
                         call_id: format!("edit-{index}"),
                         tool_name: "edit.patch".into(),
@@ -2893,6 +2901,7 @@ mod tests {
                 run,
                 2,
                 RuntimeEvent::ToolFinished {
+                    facts: None,
                     output: ToolOutput {
                         call_id: "s".into(),
                         tool_name: agent_contracts::CONTEXT_MANAGE.into(),
@@ -3026,6 +3035,7 @@ mod tests {
             run,
             1,
             RuntimeEvent::ToolFinished {
+                facts: None,
                 output: ToolOutput {
                     call_id: "r1".into(),
                     tool_name: "fs.read".into(),
@@ -3053,6 +3063,7 @@ mod tests {
             run,
             1,
             RuntimeEvent::ToolFinished {
+                facts: None,
                 output: ToolOutput {
                     call_id: "r1".into(),
                     tool_name: "fs.read".into(),
@@ -3079,6 +3090,7 @@ mod tests {
             run,
             1,
             RuntimeEvent::ToolFinished {
+                facts: None,
                 output: ToolOutput {
                     call_id: "r1".into(),
                     tool_name: "fs.read".into(),
@@ -3228,6 +3240,7 @@ mod tests {
                 run,
                 1,
                 RuntimeEvent::ToolFinished {
+                    facts: None,
                     output: ToolOutput {
                         call_id: "c-pre".into(),
                         tool_name: "fs.read".into(),
@@ -3244,6 +3257,7 @@ mod tests {
                 run,
                 3,
                 RuntimeEvent::ToolFinished {
+                    facts: None,
                     output: ToolOutput {
                         call_id: "c1".into(),
                         tool_name: "fs.read".into(),
@@ -3270,6 +3284,7 @@ mod tests {
                 run,
                 5,
                 RuntimeEvent::ToolFinished {
+                    facts: None,
                     output: ToolOutput {
                         call_id: "c2".into(),
                         tool_name: "edit.patch".into(),
@@ -3296,6 +3311,7 @@ mod tests {
                 run,
                 7,
                 RuntimeEvent::ToolFinished {
+                    facts: None,
                     output: ToolOutput {
                         call_id: "c3".into(),
                         tool_name: "verify.run".into(),

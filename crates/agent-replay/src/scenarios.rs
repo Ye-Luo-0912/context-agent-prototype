@@ -128,6 +128,9 @@ struct Script {
     /// re-focusing a goal resumes the same task instead of minting a new
     /// one, so replay exercises the real suspension/resume semantics.
     tasks: std::collections::HashMap<String, TaskId>,
+    /// The most recently focused task; `done` completes it so the engine
+    /// archives the right working set.
+    current_task: Option<TaskId>,
 }
 
 impl Script {
@@ -137,6 +140,7 @@ impl Script {
             seq: 0,
             events: Vec::new(),
             tasks: std::collections::HashMap::new(),
+            current_task: None,
         }
     }
 
@@ -170,6 +174,7 @@ impl Script {
             self.prepare();
             self.push(RuntimeEvent::ToolFinished {
                 output: output.clone(),
+                facts: None,
             });
             self.push(RuntimeEvent::ContextMaintained {
                 trigger: ContextMaintenanceTrigger::AfterTool,
@@ -195,6 +200,7 @@ impl Script {
 
     fn focus(&mut self, goal: &str) {
         let task_id = self.tasks.entry(goal.to_string()).or_default().to_owned();
+        self.current_task = Some(task_id);
         self.push(RuntimeEvent::FocusChanged {
             task_id,
             goal: goal.into(),
@@ -216,8 +222,9 @@ impl Script {
     }
 
     fn done(&mut self, summary: &str) {
+        let task_id = self.current_task.take().unwrap_or_default();
         self.push(RuntimeEvent::TaskCompleted {
-            task_id: TaskId::new(),
+            task_id,
             anchor_revision: 0,
             summary: summary.into(),
         });

@@ -180,7 +180,7 @@ async fn wait_for_tool_finished(
     let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
     while tokio::time::Instant::now() < deadline {
         while let Ok(envelope) = events.try_recv() {
-            if let RuntimeEvent::ToolFinished { output } = envelope.event {
+            if let RuntimeEvent::ToolFinished { output, .. } = envelope.event {
                 return output;
             }
         }

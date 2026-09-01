@@ -231,6 +231,9 @@ impl RuntimeActor {
                     .core
                     .emit_event(RuntimeEvent::ToolFinished {
                         output: output.clone(),
+                        facts: output
+                            .native_execution_facts()
+                            .map(agent_contracts::ExecutionFactsEnvelope::new),
                     })
                     .await;
                 self.record_action_result(
@@ -267,6 +270,9 @@ impl RuntimeActor {
                     .core
                     .emit_event(RuntimeEvent::ToolFinished {
                         output: output.clone(),
+                        facts: output
+                            .native_execution_facts()
+                            .map(agent_contracts::ExecutionFactsEnvelope::new),
                     })
                     .await;
                 self.record_action_result(
@@ -1393,9 +1399,12 @@ impl RuntimeActor {
                 {
                     turn.recovery_surface_request = Some(request);
                 }
+                let facts = output
+                    .native_execution_facts()
+                    .map(agent_contracts::ExecutionFactsEnvelope::new);
                 let _ = self
                     .core
-                    .emit_event(RuntimeEvent::ToolFinished { output })
+                    .emit_event(RuntimeEvent::ToolFinished { output, facts })
                     .await;
                 self.report_frontier(frontier).await;
                 // LONG-TASK SAFE POINT: the batch is terminally settled and
@@ -1951,6 +1960,9 @@ impl RuntimeActor {
             .core
             .emit_event(RuntimeEvent::ToolFinished {
                 output: output.clone(),
+                facts: output
+                    .native_execution_facts()
+                    .map(agent_contracts::ExecutionFactsEnvelope::new),
             })
             .await;
         self.record_action_result(
@@ -1991,6 +2003,9 @@ impl RuntimeActor {
             .core
             .emit_event(RuntimeEvent::ToolFinished {
                 output: output.clone(),
+                facts: output
+                    .native_execution_facts()
+                    .map(agent_contracts::ExecutionFactsEnvelope::new),
             })
             .await;
         self.record_action_result(

@@ -563,7 +563,7 @@ impl AppState {
                 self.busy = true;
                 self.tool_status = format!("running {}", call.name);
             }
-            RuntimeEvent::ToolFinished { output } => {
+            RuntimeEvent::ToolFinished { output, .. } => {
                 self.tool_status = format!("{}: {}", output.tool_name, output.summary);
                 self.messages.push(UiMessage {
                     role: UiRole::Tool,

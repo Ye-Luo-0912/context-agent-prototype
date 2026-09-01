@@ -623,7 +623,7 @@ async fn run_effect_receipt_turn(
     while tokio::time::Instant::now() < deadline {
         while let Ok(envelope) = events.try_recv() {
             match envelope.event {
-                RuntimeEvent::ToolFinished { output } => finished = Some(output),
+                RuntimeEvent::ToolFinished { output, .. } => finished = Some(output),
                 RuntimeEvent::Warning { message } => warnings.push(message),
                 RuntimeEvent::RecoveryRequired => recovery_required = true,
                 RuntimeEvent::TurnCompleted => completed = true,
@@ -695,7 +695,7 @@ async fn execution_cleanup_recovery_is_structured_fenced_and_queryable() {
                 {
                     operation_id = Some(snapshot.identity.operation_id);
                 }
-                RuntimeEvent::ToolFinished { output } if output.call_id == "call-1" => {
+                RuntimeEvent::ToolFinished { output, .. } if output.call_id == "call-1" => {
                     finished = Some(output);
                 }
                 RuntimeEvent::RecoveryRequired => recovery_required = true,
@@ -874,7 +874,9 @@ async fn committed_effect_ack_debt_emits_event_and_fences_later_mutation() {
         while let Ok(envelope) = events.try_recv() {
             match envelope.event {
                 RuntimeEvent::EffectAckDebt { debt } => ack_debt = Some(debt),
-                RuntimeEvent::ToolFinished { output } if output.call_id == "must-be-refused" => {
+                RuntimeEvent::ToolFinished { output, .. }
+                    if output.call_id == "must-be-refused" =>
+                {
                     refused = Some(output)
                 }
                 RuntimeEvent::RecoveryRequired => recovery = true,
@@ -974,7 +976,9 @@ async fn recovery_state_refuses_another_tool_in_the_same_turn() {
     while tokio::time::Instant::now() < deadline {
         while let Ok(envelope) = events.try_recv() {
             match envelope.event {
-                RuntimeEvent::ToolFinished { output } if output.call_id == "must-be-refused" => {
+                RuntimeEvent::ToolFinished { output, .. }
+                    if output.call_id == "must-be-refused" =>
+                {
                     refused = Some(output)
                 }
                 RuntimeEvent::TurnCompleted => completed = true,

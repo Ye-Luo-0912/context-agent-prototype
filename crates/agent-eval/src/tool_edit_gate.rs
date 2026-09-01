@@ -370,7 +370,7 @@ pub fn analyze_cell(
                     },
                 );
             }
-            RuntimeEvent::ToolFinished { output } => {
+            RuntimeEvent::ToolFinished { output, .. } => {
                 if !finished_call_ids.insert(output.call_id.clone()) {
                     duplicate_call_ids += 1;
                     continue;
@@ -1426,6 +1426,7 @@ mod tests {
             seq,
             timestamp_ms,
             RuntimeEvent::ToolFinished {
+                facts: None,
                 output: ToolOutput {
                     call_id: id.into(),
                     tool_name: "fs.read".into(),
@@ -1482,6 +1483,7 @@ mod tests {
             seq,
             timestamp_ms,
             RuntimeEvent::ToolFinished {
+                facts: None,
                 output: ToolOutput {
                     call_id: id.into(),
                     tool_name: "edit.patch".into(),
@@ -1538,6 +1540,7 @@ mod tests {
                 4,
                 30,
                 RuntimeEvent::ToolFinished {
+                    facts: None,
                     output: ToolOutput {
                         call_id: "read".into(),
                         tool_name: "fs.read".into(),
@@ -1580,6 +1583,7 @@ mod tests {
                 7,
                 70,
                 RuntimeEvent::ToolFinished {
+                    facts: None,
                     output: ToolOutput {
                         call_id: "patch".into(),
                         tool_name: "edit.patch".into(),
@@ -1638,6 +1642,7 @@ mod tests {
                 4,
                 30,
                 RuntimeEvent::ToolFinished {
+                    facts: None,
                     output: ToolOutput {
                         call_id: "bad".into(),
                         tool_name: "edit.patch".into(),
@@ -1666,6 +1671,7 @@ mod tests {
                 6,
                 50,
                 RuntimeEvent::ToolFinished {
+                    facts: None,
                     output: ToolOutput {
                         call_id: "fallback".into(),
                         tool_name: "shell.exec".into(),
@@ -1724,6 +1730,7 @@ mod tests {
                 5,
                 40,
                 RuntimeEvent::ToolFinished {
+                    facts: None,
                     output: ToolOutput {
                         call_id: "patch".into(),
                         tool_name: "edit.patch".into(),
@@ -2061,6 +2068,7 @@ mod tests {
                 4,
                 30,
                 RuntimeEvent::ToolFinished {
+                    facts: None,
                     output: ToolOutput {
                         call_id: "r1".into(),
                         tool_name: "fs.read".into(),
@@ -2089,6 +2097,7 @@ mod tests {
                 6,
                 50,
                 RuntimeEvent::ToolFinished {
+                    facts: None,
                     output: ToolOutput {
                         call_id: "r2".into(),
                         tool_name: "fs.read".into(),
@@ -2118,6 +2127,7 @@ mod tests {
                 9,
                 80,
                 RuntimeEvent::ToolFinished {
+                    facts: None,
                     output: ToolOutput {
                         call_id: "patch".into(),
                         tool_name: "edit.patch".into(),

@@ -47,6 +47,39 @@ pub struct ToolExecutionFacts {
     failure: Option<RuntimeDiagnosis>,
 }
 
+/// Versioned top-level carrier for trusted execution facts on the durable
+/// `ToolFinished` event, so replay can prefer typed facts over the output
+/// metadata fallback. Version 1 is the current `ToolExecutionFacts` shape;
+/// unknown versions are rejected rather than silently decoded.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ExecutionFactsEnvelope {
+    pub version: u32,
+    pub facts: ToolExecutionFacts,
+}
+
+impl ExecutionFactsEnvelope {
+    pub const VERSION: u32 = 1;
+
+    pub fn new(facts: ToolExecutionFacts) -> Self {
+        Self {
+            version: Self::VERSION,
+            facts,
+        }
+    }
+
+    pub fn validate(&self) -> Result<(), String> {
+        if self.version != Self::VERSION {
+            return Err(format!(
+                "execution facts envelope version {} is unsupported; expected {}",
+                self.version,
+                Self::VERSION
+            ));
+        }
+        Ok(())
+    }
+}
+
 impl ToolExecutionFacts {
     /// The capability default: no resource fact, no stamped bound, no
     /// verification claim, no failure class. Untrusted producers cannot
@@ -356,5 +389,61 @@ mod tests {
     fn outputs_without_the_key_keep_the_legacy_derivation_path() {
         let output = output_with(json!({"path": "src/auth.rs", "verification": true}));
         assert!(output.native_execution_facts().is_none());
+    }
+
+    #[test]
+    fn envelope_round_trips_and_rejects_unknown_versions() {
+        let facts =
+            ToolExecutionFacts::from_resource_touches([("src/auth.rs", Some("r1".to_owned()))])
+                .with_verification(true);
+        let envelope = ExecutionFactsEnvelope::new(facts.clone());
+        assert_eq!(envelope.version, ExecutionFactsEnvelope::VERSION);
+        envelope.validate().expect("version 1 is supported");
+
+        let wire = serde_json::to_value(&envelope).unwrap();
+        let read: ExecutionFactsEnvelope = serde_json::from_value(wire.clone()).unwrap();
+        read.validate().expect("round-trip keeps the version");
+        assert_eq!(
+            serde_json::to_value(read.facts).unwrap(),
+            serde_json::to_value(facts).unwrap()
+        );
+
+        let mut unknown = wire;
+        unknown["version"] = json!(99);
+        let rejected: ExecutionFactsEnvelope = serde_json::from_value(unknown).unwrap();
+        assert!(
+            rejected.validate().is_err(),
+            "future envelope versions fail closed"
+        );
+    }
+
+    #[test]
+    fn envelope_rejects_unknown_fields() {
+        let wire = json!({"version": 1, "facts": {}, "surprise": true});
+        assert!(
+            serde_json::from_value::<ExecutionFactsEnvelope>(wire).is_err(),
+            "deny_unknown_fields keeps the wire shape honest"
+        );
+    }
+
+    #[test]
+    fn legacy_tool_finished_json_without_facts_decodes_as_none() {
+        let wire = json!({
+            "type": "tool_finished",
+            "output": {
+                "call_id": "call-1",
+                "tool_name": "fs.read",
+                "ok": true,
+                "summary": "ok",
+                "model_content": "",
+                "artifact_ref": null,
+                "metadata": {"path": "src/auth.rs"}
+            }
+        });
+        let event: crate::event::RuntimeEvent = serde_json::from_value(wire).unwrap();
+        assert!(matches!(
+            event,
+            crate::event::RuntimeEvent::ToolFinished { facts: None, .. }
+        ));
     }
 }

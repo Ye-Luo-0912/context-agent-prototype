@@ -819,6 +819,7 @@ mod tests {
             seq,
             RuntimeEvent::ToolFinished {
                 output: tool_output(true, "found AuthService.rs"),
+                facts: None,
             },
         ));
         seq += 1;
@@ -1056,6 +1057,7 @@ mod tests {
             seq,
             RuntimeEvent::ToolFinished {
                 output: tool_output(true, "uncommitted tail observation"),
+                facts: None,
             },
         ));
         seq += 1;
@@ -1580,6 +1582,7 @@ mod tests {
                 5,
                 RuntimeEvent::ToolFinished {
                     output: tool_output(true, "one result landed before the loss"),
+                    facts: None,
                 },
             ),
         ];
@@ -1614,6 +1617,7 @@ mod tests {
                 4,
                 RuntimeEvent::ToolFinished {
                     output: tool_output(true, "settled normally"),
+                    facts: None,
                 },
             ),
             settled_event(run, 5, turn, 1, 0, 0),
@@ -1670,6 +1674,7 @@ mod tests {
                 3,
                 RuntimeEvent::ToolFinished {
                     output: tool_output(true, "finished but unaccounted"),
+                    facts: None,
                 },
             ),
             settled_event(run, 4, turn, 1, 1, 0),
@@ -1704,6 +1709,7 @@ mod tests {
                 4,
                 RuntimeEvent::ToolFinished {
                     output: tool_output(true, "lost mid-batch"),
+                    facts: None,
                 },
             ),
         ];

@@ -292,6 +292,12 @@ pub enum RuntimeEvent {
     },
     ToolFinished {
         output: ToolOutput,
+        /// Top-level trusted execution facts for this finished tool,
+        /// versioned on the event wire. Replay prefers them over the
+        /// output metadata fallback; older events without the field keep
+        /// deriving from the reserved metadata key.
+        #[serde(default)]
+        facts: Option<crate::execution_facts::ExecutionFactsEnvelope>,
     },
     /// One model-requested tool batch settled in the actor. This body-free
     /// accounting is orthogonal to Context persistence: transient catalog /

@@ -499,7 +499,7 @@ async fn drain_until(
                 }
                 RuntimeEvent::TaskContinuationStarted { .. } => labels.push("continuation".into()),
                 RuntimeEvent::TaskCompleted { .. } => labels.push("completed".into()),
-                RuntimeEvent::ToolFinished { ref output } if !output.ok => {
+                RuntimeEvent::ToolFinished { ref output, .. } if !output.ok => {
                     let preview: String = output.summary.chars().take(200).collect();
                     labels.push(format!("tool_failed:{}:{preview}", output.tool_name))
                 }

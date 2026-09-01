@@ -1173,7 +1173,7 @@ fn step_event(
             collector.push(envelope);
             StepOutcome::Continue
         }
-        RuntimeEvent::ToolFinished { ref output }
+        RuntimeEvent::ToolFinished { ref output, .. }
             if output.ok
                 && matches!(
                     output.tool_name.as_str(),

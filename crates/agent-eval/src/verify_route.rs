@@ -297,7 +297,7 @@ fn count_ok_finished(events: &[RuntimeEventEnvelope], tool: &str) -> usize {
         .filter(|envelope| {
             matches!(
                 &envelope.event,
-                RuntimeEvent::ToolFinished { output }
+                RuntimeEvent::ToolFinished { output, .. }
                     if output.tool_name == tool && output.ok
             )
         })
@@ -382,7 +382,7 @@ fn calls_to_first_satisfying(events: &[RuntimeEventEnvelope]) -> Option<usize> {
             && events[index + 1..].iter().any(|later| {
                 matches!(
                     &later.event,
-                    RuntimeEvent::ToolFinished { output }
+                    RuntimeEvent::ToolFinished { output, .. }
                         if output.tool_name == "verify.run"
                             && output.ok
                             && output.call_id == call.id

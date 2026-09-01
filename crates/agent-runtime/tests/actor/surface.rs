@@ -691,7 +691,7 @@ async fn speculative_missing_path_is_reused_only_after_live_workspace_check() {
                     RuntimeEvent::ToolStarted { call } if call.name == "fs.read" => {
                         started += 1;
                     }
-                    RuntimeEvent::ToolFinished { output } if output.tool_name == "fs.read" => {
+                    RuntimeEvent::ToolFinished { output, .. } if output.tool_name == "fs.read" => {
                         finished += 1;
                     }
                     RuntimeEvent::ExecutionNegativeFact { kind, .. } => match kind {
@@ -760,7 +760,9 @@ async fn exact_current_verification_pass_avoids_only_the_equivalent_dispatch() {
                     RuntimeEvent::ToolStarted { call } if call.name == "test.verify" => {
                         started += 1;
                     }
-                    RuntimeEvent::ToolFinished { output } if output.tool_name == "test.verify" => {
+                    RuntimeEvent::ToolFinished { output, .. }
+                        if output.tool_name == "test.verify" =>
+                    {
                         finished += 1;
                         reused_output |= output
                             .metadata
@@ -836,7 +838,9 @@ async fn exact_verification_identity_drift_executes_again_and_marks_the_result()
                     RuntimeEvent::ToolStarted { call } if call.name == "test.verify" => {
                         started += 1;
                     }
-                    RuntimeEvent::ToolFinished { output } if output.tool_name == "test.verify" => {
+                    RuntimeEvent::ToolFinished { output, .. }
+                        if output.tool_name == "test.verify" =>
+                    {
                         drifted += usize::from(
                             output
                                 .metadata
