@@ -76,7 +76,14 @@ fn context_error(output: &[u8]) -> String {
     let line = output.split(|byte| *byte == b'\n').next().unwrap_or(output);
     let value: Value = serde_json::from_slice(line).expect("one JSON error frame");
     assert_eq!(value["ok"], false);
-    value["error"].as_str().expect("error string").to_string()
+    assert_eq!(
+        value["error"]["retryable"], false,
+        "injected request faults are not blindly retried: {value}"
+    );
+    value["error"]["message"]
+        .as_str()
+        .unwrap_or_else(|| panic!("the error envelope must carry a message: {value}"))
+        .to_string()
 }
 
 fn process_direct(stream: DuplexStream, max_frame_bytes: usize) -> impl DuplexTransport {

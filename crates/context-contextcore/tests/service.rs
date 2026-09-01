@@ -541,10 +541,14 @@ async fn oversized_request_frames_end_the_session_with_a_bounded_error() {
     let response: serde_json::Value =
         serde_json::from_slice(&response).expect("the service's answer must be a parseable frame");
     assert_eq!(response["ok"], false);
+    assert_eq!(
+        response["error"]["category"], "framing",
+        "the refusal must carry the framing category: {response}"
+    );
     assert!(
-        response["error"]
+        response["error"]["message"]
             .as_str()
-            .is_some_and(|error| error.contains("bad request")),
+            .is_some_and(|message| message.contains("bad request")),
         "the refusal must name the framing violation: {response}"
     );
 
@@ -1233,5 +1237,159 @@ async fn reconcile_store_parity_between_in_process_and_service_boundary() {
     assert_eq!(
         reports[0], reports[1],
         "Store reconcile must behave identically across the process boundary"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Exit-code contract at the process boundary
+// ---------------------------------------------------------------------------
+
+/// Spawn the real service process and drive its stdin/stdout directly so
+/// the exit-code contract is exercised where a supervisor sees it.
+struct SpawnedService {
+    child: tokio::process::Child,
+    stdin: tokio::process::ChildStdin,
+    stdout: tokio::process::ChildStdout,
+}
+
+fn service_program() -> String {
+    let name = if cfg!(windows) {
+        "agent-context-service.exe"
+    } else {
+        "agent-context-service"
+    };
+    agent_process::resolve_program(Some("CARGO_BIN_EXE_agent-context-service"), name)
+}
+
+async fn spawn_raw_service() -> SpawnedService {
+    require_fresh_service_binary();
+    let mut child = tokio::process::Command::new(service_program())
+        .args(["--engine", "append"])
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .expect("spawn the context service binary");
+    let stdin = child.stdin.take().expect("service child stdin");
+    let stdout = child.stdout.take().expect("service child stdout");
+    SpawnedService {
+        child,
+        stdin,
+        stdout,
+    }
+}
+
+/// Read the single response line the service writes before it closes.
+async fn read_response_line(service: &mut SpawnedService) -> serde_json::Value {
+    let mut reader = tokio::io::BufReader::new(&mut service.stdout);
+    let mut line = String::new();
+    use tokio::io::AsyncBufReadExt;
+    reader.read_line(&mut line).await.expect("a response line");
+    serde_json::from_str(line.trim()).expect("a valid JSON response")
+}
+
+#[tokio::test]
+async fn malformed_json_gets_protocol_category_and_exits_non_zero() {
+    let mut service = spawn_raw_service().await;
+    {
+        use tokio::io::AsyncWriteExt;
+        service
+            .stdin
+            .write_all(b"{not-json}\n")
+            .await
+            .expect("write the malformed frame");
+    }
+    let response = read_response_line(&mut service).await;
+    assert_eq!(response["ok"], serde_json::Value::Bool(false));
+    assert_eq!(
+        response["error"]["category"], "protocol",
+        "the sidecar must classify the same injected error as the in-process handler"
+    );
+    assert_eq!(
+        response["error"]["retryable"],
+        serde_json::Value::Bool(false)
+    );
+    drop(service.stdin);
+    drop(service.stdout);
+    let status = service
+        .child
+        .wait()
+        .await
+        .expect("the service process exits");
+    assert!(
+        !status.success(),
+        "a terminal protocol violation must exit non-zero"
+    );
+}
+
+#[tokio::test]
+async fn malformed_utf8_gets_protocol_category_and_exits_non_zero() {
+    let mut service = spawn_raw_service().await;
+    {
+        use tokio::io::AsyncWriteExt;
+        service
+            .stdin
+            .write_all(&[0xff, b'\n'])
+            .await
+            .expect("write the undecodable frame");
+    }
+    let response = read_response_line(&mut service).await;
+    assert_eq!(response["ok"], serde_json::Value::Bool(false));
+    assert_eq!(
+        response["error"]["category"], "protocol",
+        "undecodable bytes fail at the JSON decode layer, not the frame reader"
+    );
+    drop(service.stdin);
+    drop(service.stdout);
+    let status = service
+        .child
+        .wait()
+        .await
+        .expect("the service process exits");
+    assert!(
+        !status.success(),
+        "a terminal protocol failure must exit non-zero"
+    );
+}
+
+#[tokio::test]
+async fn clean_eof_exits_zero() {
+    let mut service = spawn_raw_service().await;
+    drop(service.stdin);
+    drop(service.stdout);
+    let status = service
+        .child
+        .wait()
+        .await
+        .expect("the service process exits");
+    assert!(
+        status.success(),
+        "a clean EOF is a normal disconnect and must exit zero"
+    );
+}
+
+#[tokio::test]
+async fn graceful_shutdown_exits_zero() {
+    let mut service = spawn_raw_service().await;
+    {
+        use tokio::io::AsyncWriteExt;
+        service
+            .stdin
+            .write_all(b"{\"id\":1,\"version\":1,\"op\":\"shutdown\"}\n")
+            .await
+            .expect("write the shutdown request");
+    }
+    let response = read_response_line(&mut service).await;
+    assert_eq!(response["ok"], serde_json::Value::Bool(true));
+    drop(service.stdin);
+    drop(service.stdout);
+    let status = service
+        .child
+        .wait()
+        .await
+        .expect("the service process exits");
+    assert!(
+        status.success(),
+        "a graceful shutdown request must exit zero"
     );
 }

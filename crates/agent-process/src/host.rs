@@ -1146,11 +1146,28 @@ impl ProcessHost {
                     match response.get("ok").and_then(Value::as_bool) {
                         Some(true) => {}
                         Some(false) => {
-                            let error = response
-                                .get("error")
-                                .and_then(Value::as_str)
-                                .unwrap_or("unknown child error");
-                            return Err(AgentError::Context(format!("process error: {error}")));
+                            // The context service carries a bounded typed
+                            // envelope; other children may still answer with
+                            // a plain string. Both collapse onto the same
+                            // Context failure so callers classify identically.
+                            let error = match response.get("error") {
+                                Some(Value::Object(map)) => {
+                                    let category = map
+                                        .get("category")
+                                        .and_then(Value::as_str)
+                                        .unwrap_or("unknown");
+                                    let message = map
+                                        .get("message")
+                                        .and_then(Value::as_str)
+                                        .unwrap_or("unknown child error");
+                                    format!("process error [{category}]: {message}")
+                                }
+                                Some(Value::String(message)) => {
+                                    format!("process error: {message}")
+                                }
+                                _ => "unknown child error".into(),
+                            };
+                            return Err(AgentError::Context(error));
                         }
                         None => {
                             return Err(self.frame_violation(

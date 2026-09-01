@@ -97,8 +97,10 @@ pub enum ServiceOp {
     Shutdown,
 }
 
-/// One response per request. `ok: false` carries a human-readable error the
-/// adapter maps back onto `AgentError::Context`.
+/// One response per request. `ok: false` carries a bounded typed error the
+/// adapter maps back onto `AgentError::Context`; the category travels the
+/// wire so in-process and process-boundary callers classify the failure
+/// identically.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ServiceResponse {
     pub id: u64,
@@ -111,7 +113,59 @@ pub struct ServiceResponse {
     #[serde(default)]
     pub value: Value,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub error: Option<String>,
+    pub error: Option<ServiceErrorEnvelope>,
+}
+
+/// Structural error category shared across the process boundary. Classifying
+/// at the wire shape — not inside a diagnostic string — keeps the in-process
+/// handler and the adapter on the same retry/terminal policy.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ServiceErrorCategory {
+    /// The sidecar failed to read one request frame (delimiter, UTF-8, or a
+    /// frame that extends past EOF). The byte stream is no longer trusted.
+    Framing,
+    /// The request violated the wire contract after framing (JSON decode
+    /// budget, body shape, protocol version). The stream is still framed.
+    Protocol,
+    /// The engine operation itself failed.
+    Engine,
+    /// The engine's persistence/store layer failed.
+    Store,
+    /// The sidecar failed to write one response frame.
+    Io,
+}
+
+/// Bounded diagnostic budget for `message`: the envelope must always fit a
+/// minimal frame cap (UTF-8 worst case is four bytes per character plus the
+/// envelope's own JSON structure).
+pub const MAX_SERVICE_ERROR_CHARS: usize = 192;
+
+/// Bounded typed error carried by [`ServiceResponse`]. `category` and
+/// `retryable` are contract; `message` is human-readable diagnostics and is
+/// truncated at construction so an oversized engine error cannot blow the
+/// frame bound.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ServiceErrorEnvelope {
+    pub category: ServiceErrorCategory,
+    pub retryable: bool,
+    pub message: String,
+}
+
+impl ServiceErrorEnvelope {
+    pub fn new(category: ServiceErrorCategory, retryable: bool, message: impl AsRef<str>) -> Self {
+        let bounded: String = message
+            .as_ref()
+            .chars()
+            .take(MAX_SERVICE_ERROR_CHARS)
+            .collect();
+        Self {
+            category,
+            retryable,
+            message: bounded,
+        }
+    }
 }
 
 impl ServiceResponse {
@@ -125,13 +179,18 @@ impl ServiceResponse {
         }
     }
 
-    pub fn error(id: u64, error: impl Into<String>) -> Self {
+    pub fn error(
+        id: u64,
+        category: ServiceErrorCategory,
+        retryable: bool,
+        message: impl AsRef<str>,
+    ) -> Self {
         Self {
             id,
             version: PROTOCOL_VERSION,
             ok: false,
             value: Value::Null,
-            error: Some(error.into()),
+            error: Some(ServiceErrorEnvelope::new(category, retryable, message)),
         }
     }
 }
@@ -175,11 +234,40 @@ mod tests {
         assert_eq!(decoded.id, 7);
         assert_eq!(decoded.version, PROTOCOL_VERSION);
 
-        let error = ServiceResponse::error(8, "boom");
+        let error = ServiceResponse::error(8, ServiceErrorCategory::Engine, false, "boom");
         let decoded: ServiceResponse =
             serde_json::from_str(&serde_json::to_string(&error).unwrap()).unwrap();
         assert!(!decoded.ok);
-        assert_eq!(decoded.error.as_deref(), Some("boom"));
+        let envelope = decoded.error.expect("a typed error envelope");
+        assert_eq!(envelope.category, ServiceErrorCategory::Engine);
+        assert!(!envelope.retryable);
+        assert_eq!(envelope.message, "boom");
+    }
+
+    #[test]
+    fn error_message_is_bounded_at_construction() {
+        let envelope = ServiceErrorEnvelope::new(
+            ServiceErrorCategory::Engine,
+            true,
+            "x".repeat(MAX_SERVICE_ERROR_CHARS * 4),
+        );
+        assert_eq!(envelope.message.chars().count(), MAX_SERVICE_ERROR_CHARS);
+        let wire = serde_json::to_value(&envelope).unwrap();
+        assert!(
+            wire.to_string().len() < MIN_CONTEXT_SERVICE_MAX_FRAME_BYTES,
+            "the bounded envelope always fits a minimal frame"
+        );
+    }
+
+    #[test]
+    fn error_category_is_snake_case_on_the_wire() {
+        let wire = serde_json::to_value(ServiceErrorEnvelope::new(
+            ServiceErrorCategory::Protocol,
+            false,
+            "bad version",
+        ))
+        .unwrap();
+        assert_eq!(wire["category"], serde_json::json!("protocol"));
     }
 
     #[test]

@@ -89,5 +89,19 @@ async fn main() {
     let stdout = tokio::io::stdout();
     let mut writer = BufWriter::new(stdout);
 
-    let _ = serve_session(&mut stdin, &mut writer, engine, max_frame_bytes).await;
+    match serve_session(&mut stdin, &mut writer, engine, max_frame_bytes).await {
+        // Clean EOF or a graceful Shutdown request: exit 0.
+        Ok(agent_context_service::SessionEnd::Clean) => {}
+        // A terminal protocol violation already received an error frame;
+        // exit non-zero so a supervisor never mistakes the dead protocol
+        // run for a healthy service.
+        Ok(agent_context_service::SessionEnd::ProtocolViolation) => {
+            eprintln!("context service: terminal protocol violation, exiting non-zero");
+            std::process::exit(1);
+        }
+        Err(error) => {
+            eprintln!("context service session failed: {error}");
+            std::process::exit(1);
+        }
+    }
 }
