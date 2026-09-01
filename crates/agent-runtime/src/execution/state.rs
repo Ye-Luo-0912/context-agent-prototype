@@ -197,6 +197,16 @@ pub struct ExecutionState {
     pub stall: StallState,
     #[serde(default)]
     pub failure_cluster: FailureCluster,
+    /// Edge-triggered advisory ledger: whether the current non-advancing
+    /// period already projected its stall/frontier hint into the model
+    /// frame. A frontier advance resets both, so the same advice emits once
+    /// per state transition and never repeats round after round while the
+    /// underlying state has not changed. `view()` stays a pure read; only
+    /// `view_emitting` consumes the ledger.
+    #[serde(default)]
+    pub stall_advice_emitted: bool,
+    #[serde(default)]
+    pub frontier_advice_emitted: bool,
     /// 证据前沿：成功只读观察与成功命令运行的有界记录（最新在前）。
     /// 只存身份/结果/版本，不存正文。
     #[serde(default)]
@@ -1211,6 +1221,32 @@ impl ExecutionState {
         }
     }
 
+    /// Edge-triggered projection for the model frame: a stall/frontier
+    /// advisory is emitted on the first projection of a non-advancing
+    /// period and suppressed on every later projection until a provable
+    /// frontier advance resets the period. `view()` stays the pure read
+    /// (tests, snapshots, GC-root projections); only this form consumes
+    /// the ledger, so the exact same advice never repeats round after
+    /// round while the underlying state has not transitioned.
+    pub(crate) fn view_emitting(&mut self) -> TaskProgressView {
+        let mut view = self.view();
+        if view.stall_warning.is_some() {
+            if self.stall_advice_emitted {
+                view.stall_warning = None;
+            } else {
+                self.stall_advice_emitted = true;
+            }
+        }
+        if view.frontier_warning.is_some() {
+            if self.frontier_advice_emitted {
+                view.frontier_warning = None;
+            } else {
+                self.frontier_advice_emitted = true;
+            }
+        }
+        view
+    }
+
     /// 类型化证据行，最新在前、有界。只含 key + 结果 + world 版本；
     /// Resource 有效性附带 path@digest 身份。无任何正文。投影前先按
     /// currentness 谓词过滤——过期证据不渲染。
@@ -1301,6 +1337,10 @@ impl ExecutionState {
             self.stall = StallState::default();
             self.failure_cluster = FailureCluster::default();
             self.convergence.actions_since_frontier_advance = 0;
+            // A provable advance ends the advisory period: the next
+            // non-advancing run emits its hints again.
+            self.stall_advice_emitted = false;
+            self.frontier_advice_emitted = false;
             return;
         }
         self.convergence.actions_since_frontier_advance = self

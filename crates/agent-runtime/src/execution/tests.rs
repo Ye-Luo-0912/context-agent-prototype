@@ -1,9 +1,9 @@
 //! Algorithm tests for ExecutionState (formerly ResumePoint).
 
 use super::state::{
-    MAX_NEGATIVE_FACTS, MAX_OBLIGATIONS, MAX_RESUME_FAILURES, MAX_RESUME_FILES,
-    MAX_REVALIDATE_PER_ROUND, MAX_VERIFICATION_SOURCES, VerificationCause, VerificationCoverage,
-    VerificationState,
+    FRONTIER_ADVISORY_THRESHOLD, MAX_NEGATIVE_FACTS, MAX_OBLIGATIONS, MAX_RESUME_FAILURES,
+    MAX_RESUME_FILES, MAX_REVALIDATE_PER_ROUND, MAX_VERIFICATION_SOURCES, STALL_THRESHOLD,
+    StallState, VerificationCause, VerificationCoverage, VerificationState,
 };
 use super::*;
 use agent_contracts::{
@@ -2381,4 +2381,110 @@ fn failure_after_trusted_verification_reblocks_readiness() {
     observed_exact_pass(&mut resume, 1, 6);
     assert_eq!(resume.settlement(), SettlementLabel::VerifiedCurrent);
     assert!(resume.execution_ready());
+}
+
+#[test]
+fn stall_advice_emits_once_per_non_advancing_period() {
+    let mut state = ExecutionState {
+        stall: StallState {
+            consecutive_no_progress: STALL_THRESHOLD,
+            tool: "shell.exec".into(),
+            target: "cargo test".into(),
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    let first = state.view_emitting();
+    assert!(
+        first.stall_warning.is_some(),
+        "first projection of a stalled period must emit the hint"
+    );
+    assert!(state.stall_advice_emitted);
+    let second = state.view_emitting();
+    assert!(
+        second.stall_warning.is_none(),
+        "the same stalled period must not repeat the hint"
+    );
+
+    // A provable advance ends the period; the next stall re-emits.
+    state.observe_tool(&read_output("src/auth.rs", "rev-advance"), 1, 99);
+    assert!(!state.stall_advice_emitted);
+    state.stall = StallState {
+        consecutive_no_progress: STALL_THRESHOLD,
+        tool: "shell.exec".into(),
+        target: "cargo test".into(),
+        ..Default::default()
+    };
+    let reemit = state.view_emitting();
+    assert!(
+        reemit.stall_warning.is_some(),
+        "a fresh stalled period after an advance re-emits the hint"
+    );
+}
+
+#[test]
+fn frontier_advice_emits_once_until_an_advance() {
+    let mut state = ExecutionState::default();
+    state.convergence.actions_since_frontier_advance = FRONTIER_ADVISORY_THRESHOLD;
+    let first = state.view_emitting();
+    assert!(
+        first.frontier_warning.is_some(),
+        "first projection past the frontier threshold must emit the advisory"
+    );
+    assert!(state.frontier_advice_emitted);
+    let second = state.view_emitting();
+    assert!(
+        second.frontier_warning.is_none(),
+        "the same non-advancing period must not repeat the advisory"
+    );
+
+    state.observe_tool(&read_output("src/auth.rs", "rev-advance"), 1, 7);
+    assert!(!state.frontier_advice_emitted);
+    state.convergence.actions_since_frontier_advance = FRONTIER_ADVISORY_THRESHOLD;
+    let reemit = state.view_emitting();
+    assert!(
+        reemit.frontier_warning.is_some(),
+        "a fresh non-advancing period after an advance re-emits"
+    );
+}
+
+#[test]
+fn emission_ledger_survives_resume_serialization() {
+    let mut state = ExecutionState {
+        stall: StallState {
+            consecutive_no_progress: STALL_THRESHOLD,
+            tool: "shell.exec".into(),
+            target: "cargo test".into(),
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    let _ = state.view_emitting();
+    assert!(state.stall_advice_emitted);
+    let wire = serde_json::to_string(&state).expect("ExecutionState must serialize");
+    let mut back: ExecutionState =
+        serde_json::from_str(&wire).expect("ExecutionState must deserialize");
+    assert!(back.stall_advice_emitted);
+    assert!(!back.frontier_advice_emitted);
+    // A restored mid-period state keeps suppressing the same hint.
+    assert!(
+        back.view_emitting().stall_warning.is_none(),
+        "restoring an emitted period must not re-arm the hint"
+    );
+}
+
+#[test]
+fn view_stays_a_pure_read_and_never_consumes_the_ledger() {
+    let state = ExecutionState {
+        stall: StallState {
+            consecutive_no_progress: STALL_THRESHOLD,
+            tool: "shell.exec".into(),
+            target: "cargo test".into(),
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    let pure = state.view();
+    assert!(pure.stall_warning.is_some());
+    assert!(!state.stall_advice_emitted);
 }

@@ -34,7 +34,7 @@ pub struct RoundExecutionSnapshot {
 
 impl RoundExecutionSnapshot {
     pub fn capture(
-        state: &ExecutionState,
+        state: &mut ExecutionState,
         turn_intent: &str,
         focus_goal: Option<&str>,
         anchor: Option<&TaskAnchor>,
@@ -42,7 +42,10 @@ impl RoundExecutionSnapshot {
     ) -> Self {
         let due = state.verification_due_now(turn_intent);
         Self {
-            progress: state.view(),
+            // The round snapshot is the model frame's progress source, so
+            // it consumes the edge-triggered advisory ledger: the same
+            // stall/frontier hint emits once per non-advancing period.
+            progress: state.view_emitting(),
             foreground_resources: state.foreground_resources(turn_intent),
             verification: VerificationProjection {
                 validity: state.validity(),

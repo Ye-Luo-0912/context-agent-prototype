@@ -1615,7 +1615,7 @@ impl RuntimeActor {
             return;
         };
         turn.round_snapshot = Some(crate::execution::RoundExecutionSnapshot::capture(
-            &turn.execution,
+            &mut turn.execution,
             current_input,
             focus_goal.as_deref(),
             anchor.as_ref(),
