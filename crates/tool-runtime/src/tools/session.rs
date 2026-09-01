@@ -27,7 +27,10 @@ use tokio::{
 };
 
 use super::Tool;
-use super::process::{bounded_cwd_listing, resolve_program, validate_execution_authority_binding};
+use super::process::{
+    bounded_cwd_listing, executable_seal_intact, resolve_program,
+    validate_execution_authority_binding,
+};
 use super::stream::{
     MAX_ARTIFACT_BYTES, StreamCapture, StreamChunk, spawn_stderr_reader, spawn_stdout_reader,
 };
@@ -365,8 +368,7 @@ impl ProcessSessionTool {
             "process.session",
         )?;
 
-        let seal_intact = std::fs::canonicalize(resolution.executable())
-            .is_ok_and(|current| current == sealed_executable);
+        let seal_intact = executable_seal_intact(resolution.executable(), &sealed_executable);
         if !seal_intact {
             let entries = bounded_cwd_listing(&cwd);
             return Ok(ToolOutcome::Value(agent_contracts::tool_failure_output(

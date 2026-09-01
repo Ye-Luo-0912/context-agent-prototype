@@ -556,6 +556,16 @@ pub(crate) fn validate_execution_authority_binding(
     })
 }
 
+/// Recheck the resolution seal immediately before spawn: canonicalizing
+/// the resolved path again must land on the exact identity approved by
+/// [`validate_execution_authority_binding`]. A missing, replaced or
+/// re-pointed target (symlink/path swap inside the resolve-to-spawn
+/// window) returns false and the caller fails closed with the typed
+/// path-not-found result.
+pub(crate) fn executable_seal_intact(executable: &std::path::Path, seal: &std::path::Path) -> bool {
+    std::fs::canonicalize(executable).is_ok_and(|current| current == seal)
+}
+
 /// Bounded host-side executable identity used by exact verification reuse.
 /// It intentionally excludes general cwd contents (build output would change
 /// those during a successful verifier) and includes only resolver version,
@@ -826,8 +836,7 @@ impl ProcessRunTool {
         // Seal recheck: a target deleted or replaced between resolution
         // and spawn is refused on the same typed path as a disappeared
         // program (its identity is no longer the approved one).
-        let seal_intact = std::fs::canonicalize(&resolution.executable)
-            .is_ok_and(|current| current == sealed_executable);
+        let seal_intact = executable_seal_intact(&resolution.executable, &sealed_executable);
         if !seal_intact {
             let entries = bounded_cwd_listing(&cwd);
             return Ok(ToolOutcome::Value(agent_contracts::tool_failure_output(
@@ -1319,6 +1328,61 @@ mod tests {
             message.contains("execution-control"),
             "the refusal must name the mechanism: {message}"
         );
+    }
+
+    /// The pre-spawn seal recheck fails closed when the resolved target
+    /// disappears or its canonical identity changes (symlink re-point)
+    /// inside the resolve-to-spawn window. A stable target keeps passing.
+    #[test]
+    fn executable_seal_intact_rejects_deleted_and_repointed_targets() {
+        let dir = tempfile::tempdir().unwrap();
+        let target_a = dir.path().join("target-a");
+        let target_b = dir.path().join("target-b");
+        std::fs::write(&target_a, b"a").unwrap();
+        std::fs::write(&target_b, b"b").unwrap();
+
+        // A plain file path: the canonical identity is stable, and it
+        // fails closed once the file is gone.
+        let plain = dir.path().join("plain-tool");
+        std::fs::write(&plain, b"plain").unwrap();
+        let plain_seal = std::fs::canonicalize(&plain).unwrap();
+        assert!(executable_seal_intact(&plain, &plain_seal));
+        std::fs::remove_file(&plain).unwrap();
+        assert!(!executable_seal_intact(&plain, &plain_seal));
+
+        // A symlinked program path: the seal is the canonicalized target,
+        // so re-pointing the link to a different target invalidates it.
+        // Windows may refuse to create symlinks without the developer
+        // mode; that environment skips the re-point scenario.
+        let link = dir.path().join("tool");
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::symlink(&target_a, &link).unwrap();
+            let seal = std::fs::canonicalize(&link).unwrap();
+            assert_eq!(seal, std::fs::canonicalize(&target_a).unwrap());
+            assert!(executable_seal_intact(&link, &seal));
+
+            std::fs::remove_file(&link).unwrap();
+            std::os::unix::fs::symlink(&target_b, &link).unwrap();
+            assert!(
+                !executable_seal_intact(&link, &seal),
+                "a re-pointed symlink must fail the seal recheck"
+            );
+        }
+        #[cfg(windows)]
+        {
+            use std::os::windows::fs::symlink_file;
+            if symlink_file(&target_a, &link).is_ok() {
+                let seal = std::fs::canonicalize(&link).unwrap();
+                assert_eq!(seal, std::fs::canonicalize(&target_a).unwrap());
+                assert!(executable_seal_intact(&link, &seal));
+
+                let _ = std::fs::remove_file(&link);
+                if symlink_file(&target_b, &link).is_ok() {
+                    assert!(!executable_seal_intact(&link, &seal));
+                }
+            }
+        }
     }
 
     /// 指纹 v2：目录状态超过 preview 的 20 个名字后，第 25 个条目变化
