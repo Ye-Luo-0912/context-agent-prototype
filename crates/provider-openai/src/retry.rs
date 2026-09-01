@@ -125,6 +125,10 @@ fn retry_class(error: &AgentError) -> Option<RetryClass> {
 /// durable typed evidence, not to a retry label.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct RetryIncident {
+    /// Monotonic per-transport call sequence sharing the value of the
+    /// call's terminal `CallStage`, so a JSONL observer can pair incidents
+    /// with their call.
+    pub call_seq: u64,
     pub class: RetryClass,
     /// 1-based number of the attempt about to run.
     pub attempt: u32,
@@ -135,7 +139,7 @@ pub struct RetryIncident {
     pub delay_ms: u64,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub enum StageOutcome {
     /// Succeeded with no retries.
     Clean,
@@ -144,11 +148,19 @@ pub enum StageOutcome {
     /// Failed after the retry budget was exhausted, or the error was not
     /// retryable at all.
     GaveUp,
+    /// The request's cancellation token fired during a retry wait; the
+    /// call never completed or produced further output.
+    Cancelled,
 }
 
 /// Terminal stage of one model call once the retry loop exits.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct CallStage {
+    /// Monotonic per-transport call sequence: every incident and stage of
+    /// the same model call carry the same value, so JSONL observers can
+    /// attribute records to one request even when callers and arms share
+    /// the transport.
+    pub call_seq: u64,
     /// Attempts executed, including the final one.
     pub attempts: u32,
     /// Retries consumed by the transport credit.
@@ -158,7 +170,12 @@ pub struct CallStage {
     pub outcome: StageOutcome,
 }
 
-fn final_stage(budget: &RetryBudget, succeeded: bool, last_class: Option<RetryClass>) -> CallStage {
+fn final_stage(
+    budget: &RetryBudget,
+    succeeded: bool,
+    last_class: Option<RetryClass>,
+    call_seq: u64,
+) -> CallStage {
     // The failure counters include the final attempt. Actual retries are one
     // less for the class of a failed call; on success every failure was a
     // retry.
@@ -182,10 +199,23 @@ fn final_stage(budget: &RetryBudget, succeeded: bool, last_class: Option<RetryCl
         StageOutcome::Recovered
     };
     CallStage {
+        call_seq,
         attempts: budget.attempts,
         transport_retries,
         format_retries,
         outcome,
+    }
+}
+
+/// Terminal stage for a request cancelled during a retry wait: no further
+/// attempt ran, and the counters are the failures the loop already burned.
+fn cancelled_stage(budget: &RetryBudget, call_seq: u64) -> CallStage {
+    CallStage {
+        call_seq,
+        attempts: budget.attempts,
+        transport_retries: budget.transport_failures,
+        format_retries: budget.format_failures,
+        outcome: StageOutcome::Cancelled,
     }
 }
 
@@ -318,6 +348,10 @@ pub struct RetryingTransport<T: ModelTransport> {
     max_attempts: u32,
     schedule: RetrySchedule,
     observer: Arc<dyn RetryObserver>,
+    /// Monotonic call sequence: every `complete`/`complete_stream` call
+    /// consumes the next value, so typed retry records stay attributable
+    /// to one request even under concurrent callers.
+    call_seq: AtomicU64,
     /// Whole-response buffering mode: chunks are collected internally and
     /// only forwarded to the real sink after a successful attempt, so a
     /// retryable mid-stream failure can replay from scratch. Harnesses
@@ -337,6 +371,7 @@ impl<T: ModelTransport> RetryingTransport<T> {
             max_attempts: max_attempts.max(1),
             schedule: RetrySchedule::new(base_delay),
             observer: Arc::new(NullRetryObserver),
+            call_seq: AtomicU64::new(0),
             buffering: false,
         }
     }
@@ -350,6 +385,7 @@ impl<T: ModelTransport> RetryingTransport<T> {
             max_attempts: max_attempts.max(1),
             schedule: RetrySchedule::new(base_delay),
             observer: Arc::new(NullRetryObserver),
+            call_seq: AtomicU64::new(0),
             buffering: true,
         }
     }
@@ -413,10 +449,12 @@ impl<T: ModelTransport> ModelTransport for RetryingTransport<T> {
     }
 
     async fn complete(&self, request: ModelRequest) -> AgentResult<ModelOutput> {
+        let call_seq = self.call_seq.fetch_add(1, Ordering::Relaxed);
         let (mut output, attempts) = retry(
             self.max_attempts,
             &self.schedule,
             &request.cancel,
+            call_seq,
             &*self.observer,
             || self.inner.complete(request.clone()),
         )
@@ -430,10 +468,11 @@ impl<T: ModelTransport> ModelTransport for RetryingTransport<T> {
         request: ModelRequest,
         sink: &dyn ModelEventSink,
     ) -> AgentResult<ModelOutput> {
+        let call_seq = self.call_seq.fetch_add(1, Ordering::Relaxed);
         if self.buffering {
-            self.complete_stream_buffered(request, sink).await
+            self.complete_stream_buffered(request, sink, call_seq).await
         } else {
-            self.complete_stream_live(request, sink).await
+            self.complete_stream_live(request, sink, call_seq).await
         }
     }
 }
@@ -447,6 +486,7 @@ impl<T: ModelTransport> RetryingTransport<T> {
         &self,
         request: ModelRequest,
         sink: &dyn ModelEventSink,
+        call_seq: u64,
     ) -> AgentResult<ModelOutput> {
         let emitted = AtomicBool::new(false);
         let mut budget = RetryBudget::new(self.max_attempts);
@@ -457,13 +497,15 @@ impl<T: ModelTransport> RetryingTransport<T> {
             };
             match self.inner.complete_stream(request.clone(), &tracking).await {
                 Ok(mut output) => {
-                    self.observer.on_stage(&final_stage(&budget, true, None));
+                    self.observer
+                        .on_stage(&final_stage(&budget, true, None, call_seq));
                     stamp_attempt_usage(&mut output, budget.attempts);
                     return Ok(output);
                 }
                 Err(error) => {
                     let Some(class) = retry_class(&error) else {
-                        self.observer.on_stage(&final_stage(&budget, false, None));
+                        self.observer
+                            .on_stage(&final_stage(&budget, false, None, call_seq));
                         return Err(error);
                     };
                     if emitted.load(Ordering::Relaxed) {
@@ -471,12 +513,12 @@ impl<T: ModelTransport> RetryingTransport<T> {
                         // replayed into the same sink: the live listener has
                         // no rewind, and a retry would duplicate the output.
                         self.observer
-                            .on_stage(&final_stage(&budget, false, Some(class)));
+                            .on_stage(&final_stage(&budget, false, Some(class), call_seq));
                         return Err(error);
                     }
                     let Some(reservation) = budget.reserve_retry(class) else {
                         self.observer
-                            .on_stage(&final_stage(&budget, false, Some(class)));
+                            .on_stage(&final_stage(&budget, false, Some(class), call_seq));
                         return Err(error);
                     };
                     let delay = retry_delay(
@@ -486,6 +528,7 @@ impl<T: ModelTransport> RetryingTransport<T> {
                         &error,
                     );
                     self.observer.on_incident(&RetryIncident {
+                        call_seq,
                         class,
                         attempt: reservation.next_attempt,
                         class_retry_number: reservation.class_retry_number,
@@ -498,13 +541,25 @@ impl<T: ModelTransport> RetryingTransport<T> {
                         delay.as_millis().min(u64::MAX as u128) as u64,
                         &error,
                     );
-                    sink.on_chunk(ModelChunk::Retrying {
-                        attempt: reservation.next_attempt,
-                        delay_ms: delay.as_millis().min(u64::MAX as u128) as u64,
-                    })
-                    .await?;
+                    if let Err(error) = sink
+                        .on_chunk(ModelChunk::Retrying {
+                            attempt: reservation.next_attempt,
+                            delay_ms: delay.as_millis().min(u64::MAX as u128) as u64,
+                        })
+                        .await
+                    {
+                        // The retry notification itself failed: the call
+                        // ends here, and the terminal stage records it.
+                        self.observer
+                            .on_stage(&final_stage(&budget, false, Some(class), call_seq));
+                        return Err(error);
+                    }
                     tokio::select! {
-                        _ = request.cancel.cancelled() => return Err(AgentError::Cancelled),
+                        _ = request.cancel.cancelled() => {
+                            self.observer
+                                .on_stage(&cancelled_stage(&budget, call_seq));
+                            return Err(AgentError::Cancelled);
+                        }
                         _ = tokio::time::sleep(delay) => {}
                     }
                 }
@@ -519,6 +574,7 @@ impl<T: ModelTransport> RetryingTransport<T> {
         &self,
         request: ModelRequest,
         sink: &dyn ModelEventSink,
+        call_seq: u64,
     ) -> AgentResult<ModelOutput> {
         let mut budget = RetryBudget::new(self.max_attempts);
         loop {
@@ -529,21 +585,39 @@ impl<T: ModelTransport> RetryingTransport<T> {
                 .await
             {
                 Ok(mut output) => {
-                    for chunk in collected.take()? {
-                        sink.on_chunk(chunk).await?;
+                    match collected.take() {
+                        Ok(chunks) => {
+                            for chunk in chunks {
+                                if let Err(error) = sink.on_chunk(chunk).await {
+                                    // Replay into the real sink failed: the
+                                    // call ends here; the terminal stage
+                                    // records it.
+                                    self.observer
+                                        .on_stage(&final_stage(&budget, false, None, call_seq));
+                                    return Err(error);
+                                }
+                            }
+                        }
+                        Err(error) => {
+                            self.observer
+                                .on_stage(&final_stage(&budget, false, None, call_seq));
+                            return Err(error);
+                        }
                     }
-                    self.observer.on_stage(&final_stage(&budget, true, None));
+                    self.observer
+                        .on_stage(&final_stage(&budget, true, None, call_seq));
                     stamp_attempt_usage(&mut output, budget.attempts);
                     return Ok(output);
                 }
                 Err(error) => {
                     let Some(class) = retry_class(&error) else {
-                        self.observer.on_stage(&final_stage(&budget, false, None));
+                        self.observer
+                            .on_stage(&final_stage(&budget, false, None, call_seq));
                         return Err(error);
                     };
                     let Some(reservation) = budget.reserve_retry(class) else {
                         self.observer
-                            .on_stage(&final_stage(&budget, false, Some(class)));
+                            .on_stage(&final_stage(&budget, false, Some(class), call_seq));
                         return Err(error);
                     };
                     let delay = retry_delay(
@@ -553,6 +627,7 @@ impl<T: ModelTransport> RetryingTransport<T> {
                         &error,
                     );
                     self.observer.on_incident(&RetryIncident {
+                        call_seq,
                         class,
                         attempt: reservation.next_attempt,
                         class_retry_number: reservation.class_retry_number,
@@ -565,13 +640,23 @@ impl<T: ModelTransport> RetryingTransport<T> {
                         delay.as_millis().min(u64::MAX as u128) as u64,
                         &error,
                     );
-                    sink.on_chunk(ModelChunk::Retrying {
-                        attempt: reservation.next_attempt,
-                        delay_ms: delay.as_millis().min(u64::MAX as u128) as u64,
-                    })
-                    .await?;
+                    if let Err(error) = sink
+                        .on_chunk(ModelChunk::Retrying {
+                            attempt: reservation.next_attempt,
+                            delay_ms: delay.as_millis().min(u64::MAX as u128) as u64,
+                        })
+                        .await
+                    {
+                        self.observer
+                            .on_stage(&final_stage(&budget, false, Some(class), call_seq));
+                        return Err(error);
+                    }
                     tokio::select! {
-                        _ = request.cancel.cancelled() => return Err(AgentError::Cancelled),
+                        _ = request.cancel.cancelled() => {
+                            self.observer
+                                .on_stage(&cancelled_stage(&budget, call_seq));
+                            return Err(AgentError::Cancelled);
+                        }
                         _ = tokio::time::sleep(delay) => {}
                     }
                 }
@@ -677,6 +762,7 @@ async fn retry<T, F, Fut>(
     max_attempts: u32,
     schedule: &RetrySchedule,
     cancel: &CancellationToken,
+    call_seq: u64,
     observer: &dyn RetryObserver,
     mut op: F,
 ) -> AgentResult<(T, u32)>
@@ -688,20 +774,21 @@ where
     loop {
         match op().await {
             Ok(value) => {
-                observer.on_stage(&final_stage(&budget, true, None));
+                observer.on_stage(&final_stage(&budget, true, None, call_seq));
                 return Ok((value, budget.attempts));
             }
             Err(error) => {
                 let Some(class) = retry_class(&error) else {
-                    observer.on_stage(&final_stage(&budget, false, None));
+                    observer.on_stage(&final_stage(&budget, false, None, call_seq));
                     return Err(error);
                 };
                 let Some(reservation) = budget.reserve_retry(class) else {
-                    observer.on_stage(&final_stage(&budget, false, Some(class)));
+                    observer.on_stage(&final_stage(&budget, false, Some(class), call_seq));
                     return Err(error);
                 };
                 let delay = retry_delay(class, schedule, reservation.class_retry_number, &error);
                 observer.on_incident(&RetryIncident {
+                    call_seq,
                     class,
                     attempt: reservation.next_attempt,
                     class_retry_number: reservation.class_retry_number,
@@ -715,7 +802,10 @@ where
                     &error,
                 );
                 tokio::select! {
-                    _ = cancel.cancelled() => return Err(AgentError::Cancelled),
+                    _ = cancel.cancelled() => {
+                        observer.on_stage(&cancelled_stage(&budget, call_seq));
+                        return Err(AgentError::Cancelled);
+                    }
                     _ = tokio::time::sleep(delay) => {}
                 }
             }
@@ -1385,6 +1475,76 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn cancelled_call_still_emits_a_terminal_stage() {
+        let calls = Arc::new(AtomicU32::new(0));
+        let inner = Flaky {
+            calls: calls.clone(),
+            failures_before_success: 100,
+            retryable: true,
+        };
+        let observer = Arc::new(RecordingObserver::default());
+        let transport = RetryingTransport::new(inner, 5, Duration::from_secs(60))
+            .with_observer(observer.clone());
+        let token = CancellationToken::new();
+        let request = ModelRequest {
+            messages: Vec::new(),
+            tools: Vec::new(),
+            metadata: json!({}),
+            cancel: token.clone(),
+        };
+        let run = tokio::spawn(async move { transport.complete(request).await });
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        token.cancel();
+        let result = tokio::time::timeout(Duration::from_secs(1), run)
+            .await
+            .expect("cancellation must abort the backoff")
+            .expect("retry task panicked");
+        assert!(matches!(result, Err(AgentError::Cancelled)));
+        let stages = observer.stages.lock().unwrap();
+        assert_eq!(
+            stages.len(),
+            1,
+            "a cancelled call must still record one terminal stage"
+        );
+        assert_eq!(stages[0].outcome, StageOutcome::Cancelled);
+        assert_eq!(
+            stages[0].attempts,
+            stages[0].transport_retries.saturating_add(1),
+            "the burned failure attempts are counted"
+        );
+    }
+
+    #[tokio::test]
+    async fn call_seq_pairs_records_and_increments_across_calls() {
+        let calls = Arc::new(AtomicU32::new(0));
+        let inner = Flaky {
+            calls: calls.clone(),
+            failures_before_success: 2,
+            retryable: true,
+        };
+        let observer = Arc::new(RecordingObserver::default());
+        let transport = RetryingTransport::new(inner, 5, Duration::from_millis(1))
+            .with_jitter(|delay, _| delay)
+            .with_observer(observer.clone());
+        transport.complete(request()).await.unwrap();
+        transport.complete(request()).await.unwrap();
+
+        let incidents = observer.incidents.lock().unwrap();
+        assert_eq!(incidents.len(), 2);
+        assert!(
+            incidents.iter().all(|incident| incident.call_seq == 0),
+            "both incidents belong to the first call"
+        );
+        drop(incidents);
+        let stages = observer.stages.lock().unwrap();
+        assert_eq!(stages.len(), 2);
+        assert_eq!(stages[0].call_seq, 0);
+        assert_eq!(stages[1].call_seq, 1);
+        assert_eq!(stages[0].outcome, StageOutcome::Recovered);
+        assert_eq!(stages[1].outcome, StageOutcome::Clean);
+    }
+
     #[test]
     fn backoff_is_checked_capped_and_deterministically_jitterable() {
         let mut schedule = RetrySchedule::new(Duration::from_secs(2));
@@ -1501,7 +1661,7 @@ mod tests {
         let schedule = RetrySchedule::new(Duration::from_secs(2));
         let cancel = CancellationToken::new();
 
-        let error = retry(6, &schedule, &cancel, &NullRetryObserver, || {
+        let error = retry(6, &schedule, &cancel, 0, &NullRetryObserver, || {
             calls.fetch_add(1, Ordering::SeqCst);
             async {
                 Err::<(), _>(AgentError::ModelProtocol {
@@ -1641,7 +1801,7 @@ mod tests {
         let schedule = RetrySchedule::new(Duration::from_millis(1));
         let cancel = CancellationToken::new();
         let observer = Arc::new(RecordingObserver::default());
-        let error = retry(6, &schedule, &cancel, &*observer, || {
+        let error = retry(6, &schedule, &cancel, 0, &*observer, || {
             calls.fetch_add(1, Ordering::SeqCst);
             async {
                 Err::<(), _>(AgentError::ModelProtocol {

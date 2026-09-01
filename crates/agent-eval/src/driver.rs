@@ -33,34 +33,44 @@ const MAX_RETRY_METRICS_BYTES: u64 = 4 * 1024 * 1024;
 /// stderr retry line remains the human channel.
 struct JsonlRetryObserver {
     path: Option<std::path::PathBuf>,
+    /// Serializes appends for this process so the remaining-cap accounting
+    /// and the line write are one observation; a line that would cross the
+    /// cap is dropped whole, never partial-appended. Cross-process writers
+    /// are out of scope for this best-effort diagnostic channel, but every
+    /// line is still one complete JSON value.
+    gate: std::sync::Mutex<()>,
 }
 
 impl JsonlRetryObserver {
     fn from_env() -> Self {
         Self {
             path: crate::envfile::get("OPENAI_RETRY_METRICS_FILE").map(std::path::PathBuf::from),
+            gate: std::sync::Mutex::new(()),
         }
     }
 
     fn append(&self, kind: &str, record: &impl serde::Serialize) {
         let Some(path) = &self.path else { return };
-        let Ok(payload) = serde_json::to_string(record) else {
+        let Ok(line) =
+            serde_json::to_string(&serde_json::json!({ "kind": kind, "record": record }))
+        else {
             return;
         };
         use std::io::Write;
+        let _guard = self.gate.lock().expect("retry metrics observer poisoned");
         let result = std::fs::OpenOptions::new()
             .create(true)
             .append(true)
             .open(path)
             .and_then(|mut file| {
-                let bounded = file
-                    .metadata()
-                    .map(|meta| meta.len() < MAX_RETRY_METRICS_BYTES)
-                    .unwrap_or(false);
-                if !bounded {
+                let current = file.metadata().map(|meta| meta.len()).unwrap_or(0);
+                let line_bytes = line.len() as u64;
+                // Exact remaining accounting: the line's own byte length
+                // decides, so the artifact cannot drift past the cap.
+                if current.saturating_add(line_bytes) > MAX_RETRY_METRICS_BYTES {
                     return Ok(());
                 }
-                writeln!(file, "{{\"kind\":\"{kind}\",\"record\":{payload}}}")?;
+                writeln!(file, "{line}")?;
                 file.flush()
             });
         if let Err(error) = result {
@@ -345,8 +355,10 @@ mod tests {
         let path = dir.join("metrics.jsonl");
         let observer = JsonlRetryObserver {
             path: Some(path.clone()),
+            gate: std::sync::Mutex::new(()),
         };
         observer.on_incident(&RetryIncident {
+            call_seq: 7,
             class: RetryClass::ToolCallFormat,
             attempt: 2,
             class_retry_number: 1,
@@ -354,6 +366,7 @@ mod tests {
             delay_ms: 0,
         });
         observer.on_stage(&CallStage {
+            call_seq: 7,
             attempts: 2,
             transport_retries: 0,
             format_retries: 1,
@@ -365,6 +378,10 @@ mod tests {
         assert!(lines[0].contains("\"kind\":\"incident\""));
         assert!(lines[1].contains("\"kind\":\"stage\""));
         assert!(lines[1].contains("\"outcome\":\"Recovered\""));
+        // The call identity rides inside the typed record, so concurrent
+        // cells can attribute each line to its call.
+        assert!(lines[0].contains("\"call_seq\":7"));
+        assert!(lines[1].contains("\"call_seq\":7"));
         std::fs::remove_dir_all(&dir).ok();
     }
 
@@ -376,8 +393,10 @@ mod tests {
         std::fs::write(&path, "x".repeat(MAX_RETRY_METRICS_BYTES as usize + 1)).unwrap();
         let observer = JsonlRetryObserver {
             path: Some(path.clone()),
+            gate: std::sync::Mutex::new(()),
         };
         observer.on_stage(&CallStage {
+            call_seq: 0,
             attempts: 1,
             transport_retries: 0,
             format_retries: 0,
@@ -405,14 +424,19 @@ mod tests {
 
     #[test]
     fn jsonl_observer_without_a_path_is_a_no_op() {
-        let observer = JsonlRetryObserver { path: None };
+        let observer = JsonlRetryObserver {
+            path: None,
+            gate: std::sync::Mutex::new(()),
+        };
         observer.on_stage(&CallStage {
+            call_seq: 0,
             attempts: 1,
             transport_retries: 0,
             format_retries: 0,
             outcome: StageOutcome::GaveUp,
         });
         observer.on_incident(&RetryIncident {
+            call_seq: 0,
             class: RetryClass::Transport,
             attempt: 2,
             class_retry_number: 1,
