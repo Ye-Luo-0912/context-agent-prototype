@@ -2678,3 +2678,175 @@ async fn proof_refresh_is_skipped_when_an_open_loop_blocks_completion() {
     );
     assert!(checkpoint.tasks.completed.is_empty());
 }
+
+/// Same rounds as [`ProofRefreshModel`] (round 0 verifies, round 2 proposes
+/// completion, odd rounds end the turn) but every assembled request text is
+/// recorded so the projected repair stage can be asserted on the next
+/// model decision.
+#[derive(Debug)]
+struct ProofRefreshRecordingModel {
+    rounds: AtomicUsize,
+    requests: Arc<std::sync::Mutex<Vec<String>>>,
+}
+
+#[async_trait::async_trait]
+impl ModelTransport for ProofRefreshRecordingModel {
+    fn capabilities(&self) -> ModelCapabilities {
+        ModelCapabilities::default()
+    }
+    async fn complete(&self, request: ModelRequest) -> AgentResult<ModelOutput> {
+        self.requests.lock().unwrap().push(
+            request
+                .messages
+                .iter()
+                .map(|message| message.content.as_str())
+                .collect::<Vec<_>>()
+                .join("\n"),
+        );
+        let round = self.rounds.fetch_add(1, Ordering::SeqCst);
+        Ok(if round == 0 {
+            ModelOutput {
+                content: String::new(),
+                tool_calls: vec![ToolCall {
+                    id: "proof-verify".into(),
+                    name: "verify.run".into(),
+                    arguments: json!({"recipe_id": "completion-fixture-recipe"}),
+                }],
+                usage: Default::default(),
+            }
+        } else if round == 2 {
+            ModelOutput {
+                content: String::new(),
+                tool_calls: vec![ToolCall {
+                    id: "proof-complete".into(),
+                    name: "task.complete".into(),
+                    arguments: json!({"summary": "the fixture is verified", "artifacts": []}),
+                }],
+                usage: Default::default(),
+            }
+        } else {
+            ModelOutput {
+                content: "round done".into(),
+                tool_calls: Vec::new(),
+                usage: Default::default(),
+            }
+        })
+    }
+}
+
+/// Without the runtime-owned proof-refresh transaction, a stale
+/// verification refusal must still name the exact final action: refresh the
+/// trusted proof with `verify.run` after every workspace call and stop
+/// mutating before re-proposing. This is the model-visible repair signal the
+/// long-task failure diagnosis needs — a refusal that only says "not
+/// current" leaves the model looping.
+#[tokio::test]
+async fn stale_proof_refusal_projects_a_final_verify_as_the_repair_action() {
+    let requests = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let model = Arc::new(ProofRefreshRecordingModel {
+        rounds: AtomicUsize::new(0),
+        requests: requests.clone(),
+    });
+    let services = RuntimeServices::new(
+        CoreAuthorityConfig::default(),
+        Arc::new(TestContextEngine),
+        model,
+        Arc::new(ProofRefreshDispatcher),
+        Arc::new(PolicyApprovalGate::permissive()),
+        None,
+    );
+    // Deliberately no `.with_project_proof_refresh(true)`: the shared
+    // verification path must refuse with the repair stage, not transparently
+    // re-verify.
+    let mut host = ModuleHost::new();
+    host.start().await.expect("test module host starts");
+    let instance = RuntimeInstance::spawn(host, services);
+    let handle = instance.handle();
+    let mut events = handle.subscribe();
+    handle.start().await.unwrap();
+    handle
+        .set_focus("finish only with evidence".into())
+        .await
+        .unwrap();
+    let task_id = handle.list_tasks().await.unwrap()[0].id;
+    let patch = agent_runtime::AnchorPatch {
+        completion_policy: Some(agent_runtime::task::TaskCompletionPolicy::EvidenceRequired),
+        acceptance_criteria: Some(vec![agent_runtime::task::AcceptanceCriterion::declared(
+            "trusted completion fixture passes",
+            &completion_acceptance_declaration(),
+        )]),
+        ..agent_runtime::AnchorPatch::default()
+    };
+    handle.patch_task_anchor(task_id, 0, patch).await.unwrap();
+
+    // Turn 1: the model verifies the fixture (PASS observed + receipt).
+    handle
+        .user_message("verify the fixture".into())
+        .await
+        .unwrap();
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+    while tokio::time::Instant::now() < deadline {
+        if let Ok(Ok(envelope)) =
+            tokio::time::timeout(Duration::from_millis(50), events.recv()).await
+            && matches!(envelope.event, RuntimeEvent::TurnCompleted)
+        {
+            break;
+        }
+    }
+
+    // Turn 2: the world moved (directive revision), the stale proof is the
+    // only remaining blocker, and the model proposes completion.
+    handle
+        .user_message("now finish the task".into())
+        .await
+        .unwrap();
+    let mut completion_output = None;
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+    while tokio::time::Instant::now() < deadline {
+        if let Ok(Ok(envelope)) =
+            tokio::time::timeout(Duration::from_millis(50), events.recv()).await
+        {
+            match envelope.event {
+                RuntimeEvent::ToolFinished { output, .. }
+                    if output.tool_name == "task.complete" =>
+                {
+                    completion_output = Some(output);
+                }
+                RuntimeEvent::TaskCompleted { .. } => {
+                    panic!("a stale proof must keep completion refused")
+                }
+                RuntimeEvent::TurnCompleted if completion_output.is_some() => break,
+                _ => {}
+            }
+        }
+    }
+    let output = completion_output.expect("task.complete must publish its authoritative result");
+    assert!(
+        !output.ok,
+        "the stale proof must refuse completion: {output:?}"
+    );
+    assert_eq!(output.metadata["refused"], "completion_gate");
+
+    let step = &output.metadata["repair_plan"]["steps"][0];
+    assert_eq!(step["kind"], "proof_refresh");
+    assert_eq!(step["tool"], "verify.run");
+    assert_eq!(step["recipe_id"], "completion-fixture-recipe");
+    assert_eq!(
+        step["must_be_after_workspace_calls"], true,
+        "the repair must order the final verification after every workspace call"
+    );
+
+    // The projected stage must reach the next model decision so the loop
+    // can act on it, not consume the refusal in silence.
+    let captured = requests.lock().unwrap().clone();
+    assert!(
+        captured.iter().enumerate().any(|(index, request)| {
+            index >= 1
+                && request.contains("proof_refresh")
+                && request.contains("run verify.run with recipe_id=completion-fixture-recipe")
+                && request.contains("do not run another workspace-changing command afterward")
+        }),
+        "the next model decision must receive the projected proof_refresh stage: {captured:?}"
+    );
+    instance.shutdown().await.unwrap();
+}
