@@ -864,9 +864,10 @@ and binds window manifests to cell digests rather than paths
 (`M15-RAW-EVIDENCE-01`, `ea821bb`); workspace hashing shares the bounded,
 link-safe allowed-diff domain, oracle timeouts kill/reap their cargo tree, and
 harness failures are failure-monotone (`M15-HARNESS-BOUNDARY-01`, `f57a118`).
-Historical FAIL bundles remain immutable diagnostics; residual pre-window
-exits (formal-path retry observer, M10 re-audit record, `GOV-STATUS-01`,
-recorded clean source) are listed in [`STATUS.md`](STATUS.md).
+Historical FAIL bundles remain immutable diagnostics; the pre-window
+implementation exits (formal-path retry observer `7e02488`, M10 re-audit
+record, `GOV-STATUS-01` on `bba1c76`) are recorded 2026-09-03, leaving one
+recorded clean source as listed in [`STATUS.md`](STATUS.md).
 
 Serving preflight status 2026-08-28: a source-bound dirty-tree diagnostic
 `retry_policy_dev` normal cell passed the stricter closure-required profile on

@@ -60,15 +60,17 @@ run `33624084700`, 2026-09-02):**
   reconciled to one suspended-claims statement and README is aligned
   (renamed crate, complete crate list, historical `CONTEXT_RUNTIME_TODO.md`,
   authority pointers); it closes when this commit is recorded.
-- Remaining exits before any new formal window: wire the typed retry observer
-  into the formal long-live/M15 provider path (`driver.rs` has it;
-  `long_live.rs`, `fixture_driver.rs` and `agent-compose` do not); then freeze
-  one exact clean source for the preflight with Ubuntu plus Windows CI. The
-  M10 fault-gate re-audit is recorded (2026-09-03, local run on `e357bed`;
+- Remaining exits before any new formal window: freeze one exact clean source
+  for the preflight with Ubuntu plus Windows CI, then the M15 gate sequence
+  itself (selected-path P1 spot-checks if the candidate changes, exact-source
+  product preflight, at most one freshly predeclared window). All
+  implementation exits are recorded: the M10 fault-gate re-audit (2026-09-03,
   see the `RUNTIME-CONTEXT-COMMIT-01` re-audit record in
-  [`AUDIT_TODO.md`](AUDIT_TODO.md)), `GOV-STATUS-01` closed on `bba1c76`, and
-  the actor protocol-body regression landed on `e357bed`. The historical FAIL
-  packs stay immutable and Context/GC/retrieval/packing remain frozen.
+  [`AUDIT_TODO.md`](AUDIT_TODO.md)), `GOV-STATUS-01` (closed on `bba1c76`),
+  the actor protocol-body regression (`e357bed`), and the formal-path/product
+  retry observer (`7e02488`, closing the `JSON-RECOVERY-01` residual). The
+  historical FAIL packs stay immutable and Context/GC/retrieval/packing
+  remain frozen.
 
 **Repository-wide architecture audit (2026-08-31; started at `c8b9dbb`,
 incrementally reviewed through `c55429c`; findings now repaired by the
@@ -1373,7 +1375,10 @@ closed the selected-path P0/P1 and post-window implementation items on
 2. wire the typed retry observer into the formal long-live/M15 provider path
    — `driver.rs` carries it, `long_live.rs`, `fixture_driver.rs` and
    `agent-compose` do not — and close the residual `JSON-RECOVERY-01`
-   formal-path exit;
+   formal-path exit — **done on `7e02488`**: the JSONL observer moved into
+   `provider-openai`, and the formal eval paths plus `agent-compose` share
+   it (the eval paths build their transport through `driver.rs`, so the
+   file-level gap was the product composition root);
 3. land this documentation tranche (AGENTS.md reconciliation, README
    alignment, repair-status records) so `GOV-STATUS-01` closes on a recorded
    commit — **done on `bba1c76`**;

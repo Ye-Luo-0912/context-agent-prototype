@@ -143,7 +143,7 @@ after rebuilding the freshness-guarded context service binary. That validates
 the first slice locally; it does not replace the remaining deterministic
 matrix, a recorded clean source or dual-platform CI.
 
-### JSON-RECOVERY-01 — make format recovery product-equivalent (**open — Responses terminal state, typed retry records and SSE name routing repaired in `1768914`/`f528a92`/`328ec5d`; the formal long-live/M15 provider path still lacks the retry observer**)
+### JSON-RECOVERY-01 — make format recovery product-equivalent (**closed on source: `1768914`/`f528a92`/`328ec5d`; shared formal-path/product observer wired in `7e02488`**)
 
 The candidate removes JSON syntax advice from the standing system prompt.
 `ModelEventSink` now declares whether a delivered chunk creates an irreversible
@@ -160,39 +160,28 @@ stream cap, so raw bytes cannot grow past the boundary while waiting for `\n`.
 
 Remaining protocol exits before another live window:
 
-- `dfb9ade` adds a byte-bounded blank-line SSE framer and the Chat call-state
-  checks. Its Responses state remains incomplete: `response.output_item.done`
-  never sets the slot's `sealed` flag, so later `output_item.added/done` can
-  reopen/mutate it, and `response.function_call_arguments.done` ignores a name
-  that conflicts with an already-bound name. A parseable delta assembly also
-  wins silently over a different terminal arguments snapshot instead of
-  proving consistency or failing closed. Both Chat and Responses can synthesize
-  a missing final id/name and do not reject one call/item id bound to multiple
-  indexes. Add direct regressions and make identity global to the call, compare
-  terminal snapshots, and make every terminal transition idempotent-or-rejected
-  before marking this slice closed;
-- `c55429c` adds typed retry records and an optional JSONL observer to the
-  generic eval driver, but not to `agent-compose` or the formal long-live/M15
-  path. Observer serialization/write/cap failure is ignored; cancellation, a
-  failing retry notification, or buffered replay failure can exit without a
-  terminal stage. The published-stream failure path subtracts a retry that was
-  never reserved, terminal records carry no final failure/cancel/sink reason,
-  and records have no call/run/arm identity, so concurrent arms can interleave
-  without attribution. The JSONL cap is check-then-append without accounting
-  for the remaining bytes or taking a cross-handle lock, so it can exceed the
-  cap or interleave lines. Treat this as a best-effort diagnostic slice, not
-  persisted formal incident/retry/recovered/final-stage evidence.
+- `1768914` repairs the `dfb9ade` Responses/Chat terminal-state residual:
+  identity is global to the call, terminal snapshots are compared instead of
+  silently overwritten, and every terminal transition is idempotent-or-
+  rejected, with direct regressions;
+- `f528a92` repairs the `c55429c` observer residual: terminal records carry
+  call identity and typed terminal stages (including cancelled and gave-up),
+  the JSONL cap uses exact remaining-byte accounting under a per-process
+  gate, and the published-stream failure path no longer subtracts a retry
+  that was never reserved;
+- `328ec5d` makes the retained SSE `event:` name versus the JSON payload's
+  declared type fail closed instead of silently preferring one identity;
+- `7e02488` completes the observer wiring: the JSONL observer moved into
+  `provider-openai`, so the formal eval paths (which build their transport
+  through the eval driver) and the product composition root
+  (`agent-compose::model_from_env`) share one bounded implementation; the
+  eval driver keeps resolving `OPENAI_RETRY_METRICS_FILE` through eval.env.
 
-The retained SSE `event:` name is also ignored when the JSON payload declares a
-different known event type. Treat that as a P2 protocol-hardening case: either
-validate the two routing identities or document why only payload type is
-authoritative. It does not undo the byte-bounded framing slice.
-
-The 77 provider tests and strict provider Clippy passed on `dfb9ade`, but that
-exact commit failed `cargo fmt --all -- --check`. `c55429c` repaired formatting
-and passed format plus strict Provider/Eval Clippy; it still needs the missing
-protocol/observer regressions and a complete exact-source suite before it can be
-a closure record.
+The formal long-live/M15 provider path therefore persists typed
+incident/stage records whenever `OPENAI_RETRY_METRICS_FILE` selects an
+artifact; without it the stderr retry line stays the human channel. The
+channel remains a best-effort diagnostic artifact, not durable formal
+evidence: a cell verdict never depends on it.
 
 ### TOOL-SCHEMA-VALIDATE-01 — validate the captured schema before approval (**closed on `33d0395`**)
 
@@ -238,10 +227,13 @@ now has a landed repair in `615b5ed..6fdb4f0`, and dual-platform CI is green
 on `6fdb4f0` (run `33624084700`). The item headings carry the repair commit.
 The 2026-09-03 tranche also recorded the M10 fault-gate re-audit (see
 `RUNTIME-CONTEXT-COMMIT-01`), closed `GOV-STATUS-01` on `bba1c76`, and
-committed the actor protocol-body regression on `e357bed`. The remaining open
-exit is not an implementation gap: the `JSON-RECOVERY-01` formal-path retry
-observer. Treat each item below as closed-on-source unless its heading says
-otherwise.
+committed the actor protocol-body regression on `e357bed`, and wired the
+formal-path/product retry observer on `7e02488` (closing the
+`JSON-RECOVERY-01` residual). Every confirmed P0/P1 in this file is now
+closed on source; the remaining pre-window exits are operational: one
+recorded clean source with dual-platform CI, selected-path P1 spot-checks if
+the candidate changes, and the M15 gate sequence itself. Treat each item
+below as closed-on-source unless its heading says otherwise.
 
 This is the current route/status authority inside this file. It supersedes the
 2026-08-30 and post-window ordering where a newly confirmed P0/P1 changes the

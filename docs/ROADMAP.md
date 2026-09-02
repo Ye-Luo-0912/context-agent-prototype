@@ -25,13 +25,14 @@ copy them back.
 | M12 Effect Runtime | 🧾 closure-audit evidence banked; recovery P0 repaired, claims suspended | The clean-tree evidence table remains immutable. `EFFECT-ACK-CLASS-01` (typed settlements, journal v2, no-strengthening recovery) and `PROCESS-COORDINATOR-01` (bounded coordinator wire) are repaired in `6112ffd`/`43eb87b`. No new closure claim until the recorded 2026-09-03 doc tranche and the M15-facing exits land. Details: [`PLATFORM_SECURITY.md`](PLATFORM_SECURITY.md). |
 | M13 Extension Sandbox | 🧾 closure-audit evidence banked; attestation P0 repaired, claims suspended | The clean-tree audit remains immutable. `SANDBOX-ATTEST-TRUNCATE-01` is repaired in `e5e712f` (write-floor attestation only at enforcing ABIs). Universal native `UntrustedGenerated` availability is not V1 and WASI remains V2. No new closure claim until the recorded 2026-09-03 doc tranche and the M15-facing exits land. Details: [`PLATFORM_SECURITY.md`](PLATFORM_SECURITY.md). |
 | M14 Resource Policy | ✅ | Schema/context quotas, standing grants, output broker, authority leases. Further typed policy is not a reopen of this gate. |
-| M15 Real Evaluation | 🛑 open; latest v4 valid FAIL 10/12; reporter P0 repaired, residual exits remain | Three valid v3 and four valid v4 FAIL windows remain immutable diagnostics. The latest v4 was 10/12 on `784d7aa`. `M15-RAW-EVIDENCE-01` (content-addressed raw cells, `ea821bb`) and `M15-HARNESS-BOUNDARY-01` (`f57a118`) are repaired; the remaining pre-window exits are the formal-path retry observer (`JSON-RECOVERY-01` residual) and one recorded clean source with dual-platform CI (the M10 re-audit record, the doc tranche and the actor regression are recorded 2026-09-03). Formal M15 remains 3 fixtures × normal/resume × 2 repeats, never settlement off/on. See [`M15_ACCEPTANCE.md`](M15_ACCEPTANCE.md). |
+| M15 Real Evaluation | 🛑 open; latest v4 valid FAIL 10/12; reporter P0 repaired, pre-window implementation exits recorded | Three valid v3 and four valid v4 FAIL windows remain immutable diagnostics. The latest v4 was 10/12 on `784d7aa`. `M15-RAW-EVIDENCE-01` (content-addressed raw cells, `ea821bb`) and `M15-HARNESS-BOUNDARY-01` (`f57a118`) are repaired; the M10 re-audit record, the doc tranche, the actor regression and the formal-path retry observer (`7e02488`) are recorded 2026-09-03, so the remaining exit is one recorded clean source with dual-platform CI and then the gate sequence. Formal M15 remains 3 fixtures × normal/resume × 2 repeats, never settlement off/on. See [`M15_ACCEPTANCE.md`](M15_ACCEPTANCE.md). |
 | V2 Self-Iteration | 🔒 blocked | Until the governing M12/M13 status is reconciled and M15 closes. The agent may grow capabilities, never evaluation or permission Core authority. |
 
 Open gate order (post-repair, updated 2026-09-03): ~~M10 fault-gate re-audit
-record~~ (recorded) → wire the typed retry observer into the formal
-long-live/M15 provider path → ~~`GOV-STATUS-01` reconciliation~~ (closed on
-`bba1c76`) → ~~commit pending tests/docs~~ (done on `e357bed`/`bba1c76`) and
+record~~ (recorded) → ~~wire the typed retry observer into the formal
+long-live/M15 provider path~~ (done on `7e02488`) → ~~`GOV-STATUS-01`
+reconciliation~~ (closed on `bba1c76`) → ~~commit pending tests/docs~~ (done
+on `e357bed`/`bba1c76`) →
 record one clean
 source with Ubuntu/Windows CI → selected-path P1 spot-checks if the candidate
 changes → same-checkpoint causal runner only for a settlement-changing
@@ -47,9 +48,10 @@ remain frozen.
    the M10 fault gate was re-run and recorded on `e357bed` (2026-09-03). The
    2026-09-03 documentation tranche resolved `GOV-STATUS-01` (AGENTS.md
    reconciliation + README alignment) on `bba1c76`.
-2. Wire the typed retry observer into `long_live.rs`, `fixture_driver.rs` and
-   `agent-compose` so the formal path persists complete typed retry evidence
-   (`JSON-RECOVERY-01` residual).
+2. Wire the typed retry observer into the formal provider path — done on
+   `7e02488`: the JSONL observer lives in `provider-openai`, the eval formal
+   paths keep it through `driver.rs`, and `agent-compose::model_from_env`
+   now attaches it too (`JSON-RECOVERY-01` residual closed).
 3. Rerun fmt, Clippy, build and the full suite; record the clean source and
    bank Ubuntu plus Windows CI on that exact tree. Context/GC/retrieval/
    packing selection does not change.
