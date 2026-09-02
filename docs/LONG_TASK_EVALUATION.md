@@ -857,6 +857,17 @@ prospective schema is `retry-pilot-cell-v4`, adding stable pair/source identity,
 acceptance-declaration identity and bounded request-audit facts; no v4 formal
 window is currently banked.
 
+Repository-audit correction (2026-08-31; repaired 2026-08-31/09-01): four v4
+valid-FAIL windows are banked. The reporter now reconstructs dimensions and
+verdicts from content-addressed events/hidden verification/workspace records
+and binds window manifests to cell digests rather than paths
+(`M15-RAW-EVIDENCE-01`, `ea821bb`); workspace hashing shares the bounded,
+link-safe allowed-diff domain, oracle timeouts kill/reap their cargo tree, and
+harness failures are failure-monotone (`M15-HARNESS-BOUNDARY-01`, `f57a118`).
+Historical FAIL bundles remain immutable diagnostics; residual pre-window
+exits (formal-path retry observer, M10 re-audit record, `GOV-STATUS-01`,
+recorded clean source) are listed in [`STATUS.md`](STATUS.md).
+
 Serving preflight status 2026-08-28: a source-bound dirty-tree diagnostic
 `retry_policy_dev` normal cell passed the stricter closure-required profile on
 PinAI `/v1` + `gpt-5.6-luna` + Responses + 128,000 context. It completed in 26

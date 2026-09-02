@@ -65,9 +65,11 @@ Do not duplicate those lists here. Do not treat
 8. **Keep v0 non-vector.** No embeddings, vector DB, graph retrieval, or RAG
    until the dynamic working-set baseline is measured. Context operational
    core is a freeze candidate: do not retune GC thresholds or reactivation
-   scoring; do not add a learned router. The platform gates M12/M13 closed
-   on their clean-tree closure-audit evidence (2026-08-27); main engineering
-   is the V1 candidate and formal M15. Do not claim M15 or V2 closed.
+   scoring; do not add a learned router. M12/M13 mechanism substrate is
+   implemented with clean-tree closure-audit evidence banked (2026-08-27);
+   the 2026-08-31 audit defects are repaired on `615b5ed..6fdb4f0`, but the
+   closure claims stay suspended until the M15-facing exits in
+   `docs/STATUS.md` are recorded. Do not claim M15 or V2 closed.
 
 ## Architecture and dependencies
 
@@ -185,8 +187,9 @@ error/fix state.
 ## Delivery order
 
 See [`docs/ROADMAP.md`](docs/ROADMAP.md) and [`docs/STATUS.md`](docs/STATUS.md).
-M12 and M13 must still finish before Self-Iteration. Do not claim those
-milestones closed. Context live `context-mech.v2` (12 cells) evidence is
+M12/M13 evidence stays banked with closure claims suspended (see
+`GOV-STATUS-01` in [`docs/AUDIT_TODO.md`](docs/AUDIT_TODO.md)); Self-Iteration
+remains blocked behind M15. Context live `context-mech.v2` (12 cells) evidence is
 under `crates/agent-eval/evidence/context-mech/`; do not retune GC from
 it. `add_test` is Tool Surface, not Context.
 

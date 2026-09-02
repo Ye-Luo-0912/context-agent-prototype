@@ -87,7 +87,10 @@ injected by composition. Core performs journal-first state publication;
 `FileOperationJournal` uses an exclusive writer, checksummed monotonic records
 and `sync_all`, repairs only a structurally incomplete final fragment, and
 fails closed on other corruption. It refuses new records before bounded
-recovery/file limits could make the next startup unrecoverable. PLAT-03a4 now
+recovery/file limits could make the next startup unrecoverable, and compaction
+preflights the output record count against that recovery limit before writing a
+new generation, switching metadata or deleting the old WAL
+(`DURABILITY-BARRIER-01`, repaired in `f055e39`). PLAT-03a4 now
 preallocates the Core-issued `EffectId` before builtin workspace dispatch and
 passes exact operation/digest/effect identity into a separate, bounded,
 checksummed, exclusively locked and `sync_all`-barriered workspace-effect
@@ -356,9 +359,13 @@ Important consequences:
 - `agent-runtime` is the only orchestrator and never imports a concrete
   context engine or tool dispatcher; `agent-core` never imports
   `agent-runtime`.
-- `agent-conformance/tests/dependency_boundaries.rs` checks these production
-  paths transitively, keeps `agent-contracts` at the bottom, and prevents
-  isolated/adapted Platform clients from depending on Core or Runtime.
+- `agent-conformance/tests/dependency_boundaries.rs` checks the complete
+  production layer graph transitively through a layer/role matrix: every
+  workspace crate carries exactly one role, a role may depend only on its
+  admitted suppliers, and new crates fail until assigned a role. It keeps
+  `agent-contracts` at the bottom and prevents isolated/adapted Platform
+  clients from depending on Core or Runtime
+  (`DEPENDENCY-CONFORMANCE-01`, repaired in `2436249`).
 - Target dynamic extensions depend on Platform contracts only. They never import
   `agent-core`, call `CorePort`, access RuntimeActor internals, or turn a
   connection identity into a permission.
@@ -378,6 +385,14 @@ Important consequences:
   and coalescible progress are landed. Remaining
   `PLAT-06` (multiplexing) and
   `PLAT-07` SDK-facing adapters remain. Named Pipe/UDS remain `PLAT-08`.
+
+**Implementation audit note (2026-08-31; repaired 2026-09-01).** The shipped
+graph still has `agent-workspace -> agent-process` for process journal
+identity/kill helpers even though those crates are drawn as siblings. That
+edge is now deliberately admitted by the layer/role matrix above
+(`2436249`); the earlier hard-coded denylist could not catch it, new role
+crates, or the type-level ban on `tool-runtime` using `ContextEngine`, all of
+which the matrix enforces.
 
 ## 4. Stable contracts
 
@@ -942,6 +957,13 @@ deserialize. A second dialogue while a turn runs occupies one in-memory
 `TurnCancelled` barrier and then emits `InterruptCommitted`. Replay
 resolves `body_ref` when given a workspace (`--workspace`).
 
+A `RuntimeCommitBarrier` described as durable is acknowledged only after the
+event file (and required directory metadata) reaches stable storage.
+`FileEventJournal::flush` syncs each trace file — and a brand-new file's
+directory entry — before acknowledging (`DURABILITY-BARRIER-01`, repaired in
+`f055e39`), so the acknowledgment now satisfies the crash/power-loss
+contract rather than only process-visible ordering.
+
 ## 5. Agent loop
 
 ```text
@@ -1453,10 +1475,10 @@ deserialize only far enough to receive an explicit unsupported-version error—
 there is no silent empty-authority migration.
 The `TaskManager` applies its
 transitions transactionally: it validates and *prepares* a transition, the
-external side (kernel focus/context) commits first, and only then does the
-manager commit — a failed `set_focus` never leaves the task table changed.
+external side (Runtime's Context transaction) commits first, and only then does
+the manager commit — a failed `set_focus` never leaves the task table changed.
 
-Focus and clear are multi-step context transactions: the kernel takes a
+Focus and clear are multi-step context transactions: Runtime takes a
 portable engine checkpoint before ingest + maintenance and restores it on
 either failure; the actor commits task authority only after that succeeds,
 then publishes audit/UI events. Terminal completion uses the stronger form of
@@ -1485,6 +1507,15 @@ record is an explicit recovery gap rather than a retryable "nothing happened"
 result. Cross-plane capture uses a bounded capability-generation handshake; a
 moving surface retries instead of returning a mixed snapshot. `CORE-03` owns
 the fault regressions for both directions.
+
+Checkpoint-triggered Context maintenance is governed by the same ownership:
+Runtime chooses and commits the schedule; Core supplies authority/durability
+operations only. Runtime owns the turn-start transaction (ingest + maintenance
++ audit rows) and checkpoint maintenance through its own schedule, fences the
+turn when a Context rollback fails, and validates checkpoint restores on a
+scratch state before committing (`RUNTIME-CONTEXT-COMMIT-01`, repaired in
+`9ba85d3`/`f42a898`/`f622cf3`; the M10 fault-gate re-audit record is the
+remaining exit).
 
 ## 8c. Runtime actor and module host (V1-M3, hardened V1-P0-1/V1-P0-4)
 
@@ -1578,8 +1609,10 @@ There is no universal `handle_event`: trusted modules publish typed services
 `agent-contracts`) and Platform consumers look them up by type. The shared
 `agent-compose` bootloader builds the host, resolves one `RuntimeServices`,
 constructs one private Core implementation behind `CorePort` and spawns the
-sole RuntimeActor; the TUI, CLI and evaluator only select implementations and
-drive that instance.
+sole RuntimeActor. Product frontends and any evaluator claiming product
+equivalence use that root and only select implementations. Isolated mechanism
+harnesses may construct a deliberately narrowed `RuntimeServices` directly,
+but must label that boundary and cannot use it as product-equivalence evidence.
 
 Since V1-M9 the host lifecycle is transactional. Start is all-or-nothing
 in order (a failing module rolls back the already-started ones), and stop
@@ -1789,9 +1822,10 @@ explicit `ProcessSandbox` (shared `ProcessHost`, since the crate split in
   landlock confinement in `pre_exec` — no_new_privs via `prctl`, a
   ruleset whose handled access is tried newest-first across ABIs, one
   path-beneath rule per root (opened as `O_PATH` fds in the parent), then
-  an irrevocable `landlock_restrict_self`. The kernel then refuses any
-  create/modify/destroy outside the roots, inherited by every descendant;
-  a kernel without landlock degrades to a warning, and a child that cannot
+  an irrevocable `landlock_restrict_self`. A claim covering every
+  create/modify/truncate/destroy operation requires Landlock ABI v3 or newer;
+  the enforced operations are inherited by every descendant. A kernel without
+  landlock degrades to a warning, and a child that cannot
   be confined fails the spawn (never runs unconfined). The capability
   adapter confines children to their private dir; stdio MCP servers are
   confined to their private temp cwd. Reads stay unhandled (loader must
@@ -1958,6 +1992,15 @@ and a plugin cannot self-authorize via `ToolRisk` plus parameter names
 (`command` / `argv` / `destination` / `payload`). `process.session`
 poll/stop do not spawn and cannot spend an argv-prefix grant. Session
 recovery is keyed by the start identity.
+
+The complete execution authority binds the canonical resolved executable,
+cwd scope and security-relevant environment used by dispatch. `ExecArgv`
+authority covers the resolved executable identity, and the pre-spawn seal
+recheck refuses a changed executable between approval and spawn
+(`PROCESS-AUTHORITY-BOUND-01`, repaired in `f460558`/`13cf6c1`); cwd/PATH
+shadowing and environment-controlled wrappers are therefore inside the
+approved bound, not merely beside it.
+
 Process-connection state is `HostLifecycle` (`NeverStarted` / `Serving`
 / `Quarantined` / `Stopped`): first connect is not a restart, and a
 failed replacement stays quarantined. Capability start compares

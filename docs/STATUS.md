@@ -18,6 +18,81 @@ and sandbox contracts live elsewhere. Experiment facts live in
 
 ## Now
 
+**Repository-wide P0/P1 repair tranche (2026-08-31 through 2026-09-02;
+recorded source `615b5ed..6fdb4f0`; dual-platform CI green on `6fdb4f0`,
+run `33624084700`, 2026-09-02):**
+
+- Every selected-path P0 from the 2026-08-31 repository audit now has a
+  landed repair: typed effect-ack settlements with journal v2 and
+  no-strengthening recovery (`6112ffd`); Runtime-owned turn-start/checkpoint
+  Context transactions with rollback fencing and scratch-state restore
+  validation (`9ba85d3`, `f42a898`, `f622cf3`); fsynced event-flush barriers
+  and preflighted WAL compaction (`f055e39`); ExecArgv grants bound to the
+  resolved executable identity with a pre-spawn seal recheck (`f460558`,
+  `13cf6c1`); Landlock write-floor attestation gated to enforcing ABIs
+  (`e5e712f`); process.session capacity/cancel/kill-then-reap enforcement
+  (`64607f6`); and content-addressed M15 cell inputs with fail-closed
+  mutation tests (`ea821bb`).
+- All ten audited P1 implementation repairs landed: materialization
+  validation before provider execution (`d9807e7`), authoritative blob
+  checksums plus session-boundary reconcile (`1ea671f`), consumption ledger
+  from the final rendered frame (`7a8a663`), allocation-time GC/report bounds
+  (`cfc17a3`), live-input/task/event/replay byte bounds (`ab27f86`), the
+  bounded effect-coordinator wire protocol (`43eb87b`), capability lifecycle
+  settlement (`abcb4ba`), process-hygiene abort/drain bounds (`ebe02ff`),
+  the declared layer/role graph enforced as an allowlist (`2436249`), and
+  bounded failure-monotone eval cells (`f57a118`).
+- Post-window execution items closed on this source: the durable
+  completion-repair stage with criterion details and the atomic
+  proof-refresh transaction (`615b5ed`, `b148b4d`, `d92b250`, regressions
+  `b554058`, `8dfa452`, `93e434a`, `7026d8a`); Responses/Chat terminal-state
+  hardening against identity and snapshot drift (`1768914`); typed retry
+  records with call identity and terminal stages (`f528a92`); SSE event-name
+  versus payload-type fail-closed routing (`328ec5d`); pre-approval schema
+  validation against compiled round surfaces (`33d0395`); whole-record
+  edge-triggered TaskProgress packing (`531a77e`, `df2f72c`); the production
+  tool inventory aligned and fail-closed (`23abe1c`); restored protocol
+  bodies accounted apart from selected-context cost (`83cbd60`, actor
+  regression in the uncommitted `protocol_bodies` test).
+- Governance: `GOV-MAINT-01` is closed — `LICENSE` (MIT) and a minimal
+  `inspect_outbound.sh` landed in `6fdb4f0`. `GOV-STATUS-01` is resolved in
+  this documentation tranche (2026-09-03): the AGENTS.md M12/M13 wording is
+  reconciled to one suspended-claims statement and README is aligned
+  (renamed crate, complete crate list, historical `CONTEXT_RUNTIME_TODO.md`,
+  authority pointers); it closes when this commit is recorded.
+- Remaining exits before any new formal window: record the M10 fault-gate
+  re-audit on the repaired turn-start/checkpoint transaction; wire the typed
+  retry observer into the formal long-live/M15 provider path (`driver.rs`
+  has it; `long_live.rs`, `fixture_driver.rs` and `agent-compose` do not);
+  commit the pending actor-level protocol-body regression; then freeze one
+  exact clean source for the preflight. The historical FAIL packs stay
+  immutable and Context/GC/retrieval/packing remain frozen.
+
+**Repository-wide architecture audit (2026-08-31; started at `c8b9dbb`,
+incrementally reviewed through `c55429c`; findings now repaired by the
+tranche above):**
+
+- Seven new P0s are confirmed: typed effect receipts are collapsed to a bool
+  across broker ACK recovery; turn-start/checkpoint Context mutations are not
+  one Runtime-owned recoverable transaction; advertised durable event/WAL
+  barriers have fsync/compaction gaps; process standing grants omit resolved
+  executable/cwd/environment identity; old Landlock ABIs over-attest truncate
+  confinement; process sessions do not fully enforce cancel/capacity/reap; and
+  the M15 reporter trusts derived files instead of rebuilding content-addressed
+  raw cell evidence.
+- P1 findings cover complete Context adapter validation, store checksum/startup
+  reconcile, exact post-pack consumption truth, GC/report allocation bounds,
+  live-input/task/event/replay limits, capability/process supervision, the
+  declared dependency graph/conformance guard, and bounded failure-monotone M15
+  harness execution. Exact evidence and exits are in the 2026-08-31 tranche of
+  [`AUDIT_TODO.md`](AUDIT_TODO.md).
+- The findings do not reinterpret immutable historical FAIL packs or authorize
+  Context/GC retuning. They do invalidate a new product preflight/formal M15
+  window until `M15-RAW-EVIDENCE-01` and every selected-path P0 close; a
+  conditional/non-selected P0 needs exact source/surface/OS exclusion evidence.
+  `RUNTIME-CONTEXT-COMMIT-01` requires the M10 runtime-consistency gate to be
+  re-audited rather than assumed from happy-path tests.
+
 **Merged audit (2026-08-30; recorded source `a3bd23f` plus the
 `BASELINE-01` commit chain; not an evidence source by itself):**
 
@@ -270,8 +345,8 @@ and sandbox contracts live elsewhere. Experiment facts live in
   which error class triggered each retry without copying intermediate provider
   content. Typed durable retry evidence remains open. No window or preflight
   is rerun on this change.
-- Current repair checkpoint (2026-08-31, uncommitted tree based on
-  `ac2eb2a`; not evidence): off-surface command proposals are now typed
+- Current repair checkpoint (2026-08-31, recorded in `7dc9f46` with the actor
+  regression in `c8b9dbb`; not live evidence): off-surface command proposals are now typed
   `SurfaceUnavailable` attempt incidents and remain visible without entering
   Context or completion debt. A refused completion returns bounded
   `completion-repair.v1` single-stage snapshot stamped with the current
@@ -291,10 +366,12 @@ and sandbox contracts live elsewhere. Experiment facts live in
   guarded context service binary (all tests passed; the existing 10k-turn
   bounded-working-set test took about 128 seconds in the final run). Format,
   strict all-target/all-feature Clippy, all-target build, full workspace tests
-  and diff check are green; this is still an uncommitted local candidate, not
-  clean-source/CI or live evidence. This is not full JSON closure: bounded SSE
-  event framing, per-call Responses/Chat terminal state and immutable-round
-  schema validation before approval remain open in `AUDIT_TODO.md`.
+  and diff check were green for that candidate; this is not yet the complete
+  clean-source/dual-CI or live-evidence exit. `dfb9ade` later added the bounded
+  SSE framer and protocol state candidate; `c55429c` repaired formatting and
+  added diagnostic typed retry records. Responses terminal/identity conflicts,
+  formal-path complete retry evidence and immutable-round schema validation
+  remain open in `AUDIT_TODO.md`.
 - M15 remains open. Its shape remains 3 fixtures × normal/resume × 2 repeats =
   12 cells. Historical v3 FAIL windows remain immutable; the four v4 windows
   (valid FAILs 9/12 on `d1936d4`, 10/12 on `a25a8a5`, 9/12 on `ab4534a`,
@@ -308,7 +385,9 @@ and sandbox contracts live elsewhere. Experiment facts live in
 The dated observations below remain useful evidence but do not override the
 snapshot, merged TODO or ordered route above.
 
-- M10, M11, and M14 are closed at their named gates.
+- M11 and M14 are closed at their named gates. M10 was historically recorded
+  closed, but the 2026-08-31 `RUNTIME-CONTEXT-COMMIT-01` evidence supersedes
+  that claim until its fault gate is re-audited.
 - Context V1 operational core and **Execution Coherence V1 are both
   freeze candidates**: the 2026-08-23 long-flow pass confirmed the
   coherence machinery (MOD-OBS-01 observation, MOD-PROG-01 stall,
@@ -1281,18 +1360,23 @@ task-aware, its tail metric does not stop when work reopens, and its live runner
 ## Next milestone
 
 The next milestone is a **mechanically convergent execution candidate**, not
-another prompt tweak or live sample. Execute in this order:
+another prompt tweak or live sample. The 2026-08-31/09-02 repair tranche
+closed the selected-path P0/P1 and post-window implementation items on
+`615b5ed..6fdb4f0`; the remaining order is:
 
-1. close the deterministic `EXEC-INCIDENT-01`, `COMPLETION-REPAIR-01` and
-   `JSON-RECOVERY-01` matrices, including deferred completion refusal and live
-   replay-boundary behavior;
-2. add a byte-bounded SSE event framer, strict per-call Responses/Chat state
-   machine and immutable-round schema validation before approval
-   (`TOOL-SCHEMA-VALIDATE-01`);
-3. implement atomic proof refresh only when it is the sole completion blocker,
-   and convert TaskProgress to whole-record, edge-triggered packing;
-4. pass fmt/Clippy/build/full workspace tests, record one clean source and bank
-   Ubuntu plus Windows CI on that exact source;
+1. record the M10 fault-gate re-audit on the repaired turn-start/checkpoint
+   transaction (repair landed in `9ba85d3`/`f42a898`/`f622cf3`; the re-audit
+   record, not a new implementation, is the open part);
+2. wire the typed retry observer into the formal long-live/M15 provider path
+   — `driver.rs` carries it, `long_live.rs`, `fixture_driver.rs` and
+   `agent-compose` do not — and close the residual `JSON-RECOVERY-01`
+   formal-path exit;
+3. land this documentation tranche (AGENTS.md reconciliation, README
+   alignment, repair-status records) so `GOV-STATUS-01` closes on a recorded
+   commit;
+4. commit the pending actor-level protocol-body regression, rerun
+   fmt/Clippy/build/full workspace tests, and record one clean source with
+   Ubuntu plus Windows CI on that exact tree;
 5. close or prove out-of-path every P1 item exercised by the candidate; only a
    settlement-changing candidate additionally needs the same-checkpoint fork;
 6. run one exact-source product preflight, then at most one freshly

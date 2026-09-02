@@ -18,11 +18,12 @@ happy-path tests pass.
 
 ## Current merged audit — 2026-08-30 (`ea8deef`)
 
-This section is the authoritative merged-audit tranche and active pre-M15
-route. It combines the repository audit with the instruction/runtime audit
-against the exact source above. Older non-conflicting open entries remain in
-the backlog; when their status or route conflicts with this tranche, this
-section wins. Raw reports and checker verdicts remain immutable.
+This section was the authoritative merged-audit tranche and active pre-M15
+route as of 2026-08-30. It combines the repository audit with the
+instruction/runtime audit against the exact source above. The later 2026-08-31
+repository-wide tranche supersedes this section's route/status where they
+conflict; older non-conflicting open entries remain in the backlog. Raw reports
+and checker verdicts remain immutable.
 
 Evidence interpretation:
 
@@ -38,10 +39,11 @@ Evidence interpretation:
 - formal M15 remains `3 fixtures × 2 modes (normal/resume) × 2 repeats = 12`
   cells. Settlement off/on is a separate candidate experiment, never an M15
   arm and never a retroactive M15 pass dimension;
-- the existing M12/M13 closure-audit artifacts stay banked and are not being
-  reopened by this queue. Repository governance contains conflicting closure
-  wording, so no new M12/M13 closure claim or Self-Iteration transition is
-  authorized until `GOV-STATUS-01` reconciles the authority texts;
+- the existing M12/M13 closure-audit artifacts stay banked and immutable. The
+  2026-08-31 effect/coordinator/Landlock findings later reopened the conclusions
+  needed for a new closure claim, not those historical artifacts. No new
+  M12/M13 closure claim or Self-Iteration transition is authorized until those
+  findings and `GOV-STATUS-01` are resolved;
 - no new live evidence or formal M15 window is decision-grade until the
   baseline and selected-path P0 items below are closed. A settlement-changing
   candidate includes the live causal-fork exit; a settlement-off base does not.
@@ -83,10 +85,10 @@ refusals. The immutable diagnosis localizes three independent defects:
   unlike the buffered evaluator.
 
 No further formal window is authorized from the unchanged candidate. The
-current uncommitted repair tree is a deterministic candidate only; it has no
-live-evidence status.
+repair candidate was recorded in `7dc9f46` with its actor regression in
+`c8b9dbb`; it remains deterministic code only and has no live-evidence status.
 
-### EXEC-INCIDENT-01 — separate attempt incidents from task obligations (**open — candidate implemented; full local regression green, clean-source/CI exit pending**)
+### EXEC-INCIDENT-01 — separate attempt incidents from task obligations (**closed on source: candidate `7dc9f46`/`c8b9dbb`, dual-platform CI green through `6fdb4f0`**)
 
 An off-surface call is `RejectedBeforeDispatch`: no approval, dispatch or
 effect occurred. It remains a typed `ToolFinished` failure and counts in model
@@ -103,7 +105,7 @@ is refused and visible, then a correct implementation plus current exact PASS
 can close without replaying the rejected command. Canonical dotted and provider
 wire spellings must have identical debt semantics.
 
-### COMPLETION-REPAIR-01 — derive an executable repair protocol (**open — bounded first slice implemented and locally green; proof-refresh transaction remains**)
+### COMPLETION-REPAIR-01 — derive an executable repair protocol (**closed on source: durable stage `615b5ed`, proof-refresh transaction `b148b4d`/`d92b250`, deterministic matrix regressions `b554058`/`8dfa452`/`93e434a`/`7026d8a`)
 
 `CompletionReadiness` remains the sole authority. A refusal now derives
 one `completion-repair.v1` stage stamped with task/verification/workspace
@@ -141,7 +143,7 @@ after rebuilding the freshness-guarded context service binary. That validates
 the first slice locally; it does not replace the remaining deterministic
 matrix, a recorded clean source or dual-platform CI.
 
-### JSON-RECOVERY-01 — make format recovery product-equivalent (**open — replay boundary and format budget implemented and locally green; protocol closure remains**)
+### JSON-RECOVERY-01 — make format recovery product-equivalent (**open — Responses terminal state, typed retry records and SSE name routing repaired in `1768914`/`f528a92`/`328ec5d`; the formal long-live/M15 provider path still lacks the retry observer**)
 
 The candidate removes JSON syntax advice from the standing system prompt.
 `ModelEventSink` now declares whether a delivered chunk creates an irreversible
@@ -158,15 +160,41 @@ stream cap, so raw bytes cannot grow past the boundary while waiting for `\n`.
 
 Remaining protocol exits before another live window:
 
-- replace the remaining line-at-a-time interpretation with an SSE event framer
-  that joins standard multi-`data:` events at the blank-line boundary;
-- make Responses/Chat tool-call assembly an explicit id/name/index/done state
-  machine, rejecting conflicts and using a terminal full-arguments snapshot
-  only when the protocol declares it authoritative;
-- persist typed format incident/retry/recovered/final-stage metrics rather than
-  relying on stderr or error-message parsing.
+- `dfb9ade` adds a byte-bounded blank-line SSE framer and the Chat call-state
+  checks. Its Responses state remains incomplete: `response.output_item.done`
+  never sets the slot's `sealed` flag, so later `output_item.added/done` can
+  reopen/mutate it, and `response.function_call_arguments.done` ignores a name
+  that conflicts with an already-bound name. A parseable delta assembly also
+  wins silently over a different terminal arguments snapshot instead of
+  proving consistency or failing closed. Both Chat and Responses can synthesize
+  a missing final id/name and do not reject one call/item id bound to multiple
+  indexes. Add direct regressions and make identity global to the call, compare
+  terminal snapshots, and make every terminal transition idempotent-or-rejected
+  before marking this slice closed;
+- `c55429c` adds typed retry records and an optional JSONL observer to the
+  generic eval driver, but not to `agent-compose` or the formal long-live/M15
+  path. Observer serialization/write/cap failure is ignored; cancellation, a
+  failing retry notification, or buffered replay failure can exit without a
+  terminal stage. The published-stream failure path subtracts a retry that was
+  never reserved, terminal records carry no final failure/cancel/sink reason,
+  and records have no call/run/arm identity, so concurrent arms can interleave
+  without attribution. The JSONL cap is check-then-append without accounting
+  for the remaining bytes or taking a cross-handle lock, so it can exceed the
+  cap or interleave lines. Treat this as a best-effort diagnostic slice, not
+  persisted formal incident/retry/recovered/final-stage evidence.
 
-### TOOL-SCHEMA-VALIDATE-01 — validate the captured schema before approval (**open P0**)
+The retained SSE `event:` name is also ignored when the JSON payload declares a
+different known event type. Treat that as a P2 protocol-hardening case: either
+validate the two routing identities or document why only payload type is
+authoritative. It does not undo the byte-bounded framing slice.
+
+The 77 provider tests and strict provider Clippy passed on `dfb9ade`, but that
+exact commit failed `cargo fmt --all -- --check`. `c55429c` repaired formatting
+and passed format plus strict Provider/Eval Clippy; it still needs the missing
+protocol/observer regressions and a complete exact-source suite before it can be
+a closure record.
+
+### TOOL-SCHEMA-VALIDATE-01 — validate the captured schema before approval (**closed on `33d0395`**)
 
 JSON syntax is insufficient. Compile a bounded `SchemaProfile` once per tool
 catalog revision, then validate arguments against the immutable round surface
@@ -184,7 +212,7 @@ approval nor the effect journal. Provider-native strict schemas are enabled
 only through an explicit, source/serving-pinned capability; fallback validation
 remains authoritative for compatible relays.
 
-### TASK-PROGRESS-PACK-01 — pack facts and advisories as atomic records (**open P1**)
+### TASK-PROGRESS-PACK-01 — pack facts and advisories as atomic records (**closed on `531a77e` + `df2f72c`**)
 
 Replace character slicing of the mixed TaskProgress prose with bounded records
 classified as hard Runtime blocker, model-resolvable fact, neutral observation
@@ -193,6 +221,367 @@ mid-line. The same failure/basis appears once, stall/frontier advice is emitted
 only on state transition, and required-context misses name a bounded recovery
 affordance. This changes projection/observability only; Context selection, GC,
 retrieval and the transcript remain frozen.
+
+## Repository-wide architecture audit — 2026-08-31 (reviewed through `c55429c`; repaired 2026-08-31 → 2026-09-02)
+
+This tranche records a whole-repository static review of the production Cargo
+graph, Core/Runtime/Context transactions, process and sandbox boundaries,
+storage/replay, and the formal evaluator. The review began from `c8b9dbb`, then
+incorporated the recorded `dfb9ade` provider-protocol delta and `c55429c` typed
+retry-observer delta. Later concurrent uncommitted task/completion edits were
+deliberately left untouched and carry no audit/evidence status. Older audit
+entries remain authoritative where they do not conflict with the narrower
+findings below.
+
+**Repair status (2026-09-03):** every P0 and P1 implementation finding below
+now has a landed repair in `615b5ed..6fdb4f0`, and dual-platform CI is green
+on `6fdb4f0` (run `33624084700`). The item headings carry the repair commit.
+Remaining open exits are not implementation gaps: the M10 fault-gate re-audit
+record, the `JSON-RECOVERY-01` formal-path retry observer, and `GOV-STATUS-01`
+governance reconciliation. Treat each item below as closed-on-source unless
+its heading says otherwise.
+
+This is the current route/status authority inside this file. It supersedes the
+2026-08-30 and post-window ordering where a newly confirmed P0/P1 changes the
+gate; it does not rewrite historical experiment verdicts.
+
+The existing selected-path rule still applies. `M15-RAW-EVIDENCE-01` is always
+on the formal-report path. Every other new P0 must close if the candidate uses
+that path, or have exact source/surface/OS evidence proving it is not exercised;
+“conditional” is not a silent waiver.
+
+The review also confirmed the important negative facts: Core still owns no
+authoritative transcript/task/turn/prompt-frame state; Runtime remains the sole
+turn actor; `PromptAssembler` consumes `MaterializedContext`; no production
+Cargo path currently matches the seven explicitly forbidden dependency pairs;
+and token pressure is still final packing rather than a forgetting trigger.
+Green happy-path tests do not cover the crash, corruption, saturation and
+concurrent-lifecycle windows below.
+
+Validation snapshot:
+
+- the full all-target workspace suite, format check, strict all-feature Clippy
+  and conformance suite were green on the pre-delta candidate represented by
+  `c8b9dbb`;
+- on `c55429c`, format and strict Provider/Eval Clippy passed, all 81 Provider
+  tests passed, and the dependency conformance test still passed (which also
+  demonstrates its guard blind spot);
+- a complete all-target workspace run was not banked for `c55429c`; concurrent
+  uncommitted Runtime work changed under that command and was excluded from
+  this review cut. No local result substitutes for recorded dual-platform CI;
+- the repair tranche ends at `6fdb4f0` with dual-platform CI green on that
+  exact source (run `33624084700`, 2026-09-02). The uncommitted
+  actor-level protocol-body regression and this documentation tranche are the
+  only tree deltas beyond that recorded source.
+
+### New P0 — authority, recovery and acceptance truth
+
+#### EFFECT-ACK-CLASS-01 — preserve the typed settlement through broker ACK (**closed on `6112ffd`**)
+
+`EffectBrokerAck` stores only `applied: bool`. Core maps every receipt except
+`NotApplied` to `true` (`agent-core/src/port.rs`), while both journaled broker
+paths persist that boolean and recovery turns `true` into
+`Applied { durability: Durable }` (`agent-core/src/broker.rs`). A crash after a
+broker ACK but before the Core terminal record can therefore upgrade both
+`Unknown` and `Applied { durability: DurabilityFailed }` into durable success.
+This is authority laundering, not merely missing diagnostics.
+
+Replace the boolean with a versioned typed settlement carrying at least
+`NotApplied | Applied(durability) | Unknown`; preserve it in the coordinator
+wire/journal and reject unknown future variants. Exit tests reopen every receipt
+class after the ACK/Core-terminal crash window and prove no recovery path can
+strengthen it. `EFFECT-ACK-01` still owns failure to persist/send the ACK itself;
+it must consume this typed result rather than invent another truth source.
+
+#### RUNTIME-CONTEXT-COMMIT-01 — make turn start and checkpoint maintenance transactional (**repair landed in `9ba85d3`/`f42a898`/`f622cf3`; M10 fault-gate re-audit record pending**)
+
+For an existing task, `begin_applied_turn` ingests the user message, appends
+`UserMessageAccepted`, then runs `UserInput` maintenance with direct `?`
+returns. An applied-but-reply-lost sidecar operation or event failure can leave
+Context ahead of task/audit state without rollback or `recovery_required`.
+Separately, `CoreAuthority::checkpoint()` runs
+`ContextEngine::maintain(Checkpoint)` and publishes its events after mutation,
+although CorePort and RuntimeServices declare that Context scheduling belongs
+to Runtime. A checkpoint assembly retry can repeat that maintenance.
+
+Runtime must own both schedules and commit them through a portable Context
+checkpoint/restore or an idempotent prepare/commit protocol. Once application
+may have occurred, an unprovable reply or audit failure must rollback or enter a
+durable recovery fence before any further mutation. Exit tests inject failure
+after ingest, after the accepted event, during maintenance event publication,
+and between sidecar apply/reply; repeated checkpoint assembly must not repeat
+logical maintenance. This restores the intended CorePort boundary rather than
+moving more orchestration into Core.
+
+#### DURABILITY-BARRIER-01 — make every advertised durable barrier recoverable (**closed on `f055e39`**)
+
+Two storage paths currently overstate their recovery guarantee:
+
+- `FileEventJournal::flush()` only flushes the Rust buffer and never calls
+  `sync_data`/`sync_all`, while startup/turn/task `RuntimeCommitBarrier` records
+  are treated as durable truth;
+- operation-WAL compaction can serialize more than 65,536 live operation
+  snapshots, switch metadata to that unreadable generation, delete the old WAL,
+  and only then let the next append reject the still-over-limit sequence.
+
+Either narrow the documented durability model explicitly to process-crash
+visibility or fsync the file and required directory metadata before publishing
+the acknowledgement; the current contract requires the latter. Compaction must
+preflight the output record count/bytes before switching metadata and retain the
+last readable generation on every failure. Exit evidence includes reopen and
+fault-injection tests plus a saturated 65,536-distinct-operation recovery case.
+
+#### PROCESS-AUTHORITY-BOUND-01 — bind execution grants to the executable world (**closed on `f460558` + seal-recheck regression `13cf6c1`)
+
+`ExecArgv` authority covers only the submitted program string and argv prefix.
+Actual execution also depends on cwd-based/PATH resolution and caller-supplied
+environment (`RUSTC_WRAPPER`, loader variables, language runtime hooks, and
+similar controls). A standing grant for a familiar command can therefore run a
+workspace-shadowed executable or materially different program under the same
+approved identity. The same gap reaches `process.session`.
+
+Before approval, resolve and bind a canonical executable identity, cwd scope
+and the security-relevant environment (or disallow mutable cwd/env for standing
+reuse); dispatch must prove its actual spawn is a subset of that immutable
+bound. Exit tests cover workspace/PATH shadowing, cwd drift, wrapper/loader
+variables, symlink replacement and session start. `ToolSpec` remains
+model-visible schema and cannot authorize any of these fields.
+
+#### SANDBOX-ATTEST-TRUNCATE-01 — do not over-attest old Landlock ABIs (**closed on `e5e712f`; Linux CI path exercised**)
+
+The Linux adapter falls back to Landlock ABI 1/2, where
+`LANDLOCK_ACCESS_FS_TRUNCATE` is unavailable, but reports
+`fs_write_confined=true` whenever the ruleset was applied. `Restricted` trusts
+that boolean. On those kernels, a truncate/O_TRUNC path outside the allowed
+roots is not covered by the claimed write floor.
+
+Require an ABI that can enforce every write operation represented by the flag,
+or leave the flag false and make `Restricted` fail closed. Add real-child tests
+for create, overwrite, truncate, rename and unlink outside roots at each
+supported ABI. The clean-tree M13 artifact remains immutable evidence; it does
+not authorize a stronger claim than the kernel mechanism supplied.
+
+#### PROCESS-SESSION-LIFECYCLE-01 — enforce cancel, capacity and kill-then-reap (**closed on `64607f6`**)
+
+`process.session` start does not consult its cancellation token, and the
+capacity check is separated from insertion, so concurrent starts can exceed the
+declared maximum. Sessions live only in the dispatcher map; the dispatcher/tool
+module has no explicit shutdown hook, leaving graceful teardown to direct-child
+drop rather than the promised process-tree kill and reap. Adjacent one-shot
+process paths can also return through artifact I/O failure after spawn without
+the same explicit cleanup.
+
+Reserve capacity atomically before spawn, select cancellation through the full
+start, and centralize every post-spawn exit in a bounded kill-tree/reap guard.
+Module shutdown must drain all sessions. Exit tests race starts at the cap,
+cancel during spawn and artifact failure, and prove both child and descendant
+processes are gone after cancellation and normal runtime shutdown.
+
+#### M15-RAW-EVIDENCE-01 — derive the formal verdict from content-addressed raw cells (**closed on `ea821bb`; fail-closed mutation regression included**)
+
+`m15_report` says it reconstructs raw facts, but currently reads only the
+window manifest plus per-cell `dimensions.json` and summary. It neither reads
+nor hashes `events.jsonl`, hidden verification records or `workspace.json`, and
+the window manifest stores paths without cell/file digests. A coordinated edit
+to dimensions/summary, or drift between raw events and those projections, can
+therefore regenerate a formally valid PASS. Claims that the reporter detects
+terminal/event gaps and rebuilds event-derived summaries are not implemented.
+
+Define one content-addressed cell manifest over every acceptance input, parse
+the bounded raw streams, derive the dimensions/summary, and compare the derived
+record with the stored projection. The window manifest must bind those cell
+digests. Mutation tests for every raw file and every derived file must fail
+closed. Historical FAIL directories remain immutable diagnostics; no formal
+M15 PASS or closure claim is allowed until this reporter proof is real.
+
+### New P1 — replaceability, boundedness and process supervision
+
+#### CONTEXT-MATERIALIZATION-VALIDATE-01 — validate adapters before provider execution (**closed on `d9807e7`**)
+
+`MaterializedContext::validate_requirement_status()` validates only required
+ids/misses. It does not bound or cross-check selected/foreground entries,
+content/reason sizes or all acknowledgement ids. Runtime sends that result to
+the provider before Core validates the consumption ACK. The shipped
+`AppendOnlyEngine` ignores `max_selected_items`; 257 short history items can
+produce a successful model result that is discarded only when the ACK rejects
+the oversized id list. Foreground ids themselves have no ACK count limit.
+
+Add one complete materialization validator at the adapter trust boundary and
+run it before durable `ContextPrepared` publication or provider execution.
+Validate counts, bytes/tokens, uniqueness, ownership, semantic eligibility,
+required/selected/foreground relationships and the eventual ACK envelope.
+Baselines must honor the same query caps. Exit tests use hostile adapters and a
+257-item append-only actor round.
+
+#### CONTEXT-STORE-TRUTH-01 — verify every blob and run startup reconcile (**closed on `1ea671f`**)
+
+Normal fetch/admit/GC-recall calls use `read_item_async(..., checksum=None)`
+even though the external-map owner stores `blob_checksum`. A valid JSON blob
+with the same id but changed body can therefore enter the model or resident
+heap. The ContextEngine contract also requires the composition root to call
+`reconcile_store()` after restore/start, but the product composition does not.
+When reconcile quarantines an owned checksum mismatch, it leaves the external
+map entry advertising the now-moved blob.
+
+Verify the owner checksum and shape on every authority-bearing read (with
+measurement before any cache optimization), invoke reconcile in the production
+restore/start transaction, and atomically invalidate or quarantine the owner
+entry with its blob. Exit tests cover tampered fetch/admit/recall, orphan and
+stale blobs, sidecar parity, and restart with a quarantined owned blob.
+
+#### CONTEXT-CONSUMPTION-TRUTH-01 — acknowledge only the final visible frame (**closed on `7a8a663`**)
+
+Selection exposure is recorded during materialization, before Runtime's final
+packing can remove items. Foreground-only bodies are not stamped as consumed;
+selected/foreground duplicates can be labelled `BudgetExcluded` when one copy
+remains visible; and foreground clipping keeps the original path/revision
+identity without a truncation marker. These paths can create false completion
+misses and misclassify later rereads as previously selected or GC-induced.
+
+Build the ACK and miss ledger from the exact final rendered frame. Deduplicate
+body identity across selected/foreground layers, stamp every body the model
+actually consumed, and represent a clipped foreground body as an explicit
+partial artifact that cannot stand for the full revision. Do not change GC
+thresholds or selection scoring. Exit tests cover final trim, foreground-only
+consumption, duplicate required bodies and foreground truncation.
+
+#### CONTEXT-RESOURCE-BOUND-01 — bound reports and GC work at allocation time (**closed on `cfc17a3`**)
+
+Several advertised bounds are applied only after work has grown: maintenance,
+GC and reconcile DTO vectors can contain a full scan; storage GC spawns one task
+per candidate before its I/O semaphore; full GC clones the pending item/byte
+map; failed externalization can return the whole overflow set to a warm buffer
+without reapplying capacity; and one hot external entity bucket is cloned and
+sorted before the 32-row view limit. These are memory/concurrency bounds, not a
+request to retune policy.
+
+Use bounded collectors, pre-spawn work queues/semaphores, references instead of
+large item clones, and a lossless spill/retry representation that never exceeds
+the hot-buffer cap. Reports must include truncated counts/digests and reasons.
+Stress tests need large candidate/entity sets and persistent store failures.
+
+#### INPUT-STATE-BOUND-01 — align live input, task, event and replay limits (**closed on `ab27f86`**)
+
+Live input validates a 240-character preview but has no full-body byte cap and
+writes the body artifact unchanged. Replay advertises 256 KiB, yet reads the
+whole file before checking; without an artifact workspace, a truncated preview
+is silently replayed as the full input. Separately, task creation stores a raw
+goal before applying the 2,000-character `TaskAnchor` bound, so an oversized
+first message/focus is committed and only later makes every checkpoint fail.
+Task/completed catalogs have no count bound, and `FocusChanged.goal` plus
+`Pinned.content` have no event byte bound; eventual 16 MiB checkpoint rejection
+can make a long-lived runtime permanently non-resumable.
+
+Apply one byte/character policy before live acceptance, artifact write, task
+commit and event publication. Replay must stream under the same bound and fail
+closed when a preview does not cover a missing body. Normalize every anchor
+before any state/event mutation, paginate/bound task catalogs, and define a
+recoverable overflow representation. Exit tests cover 256 KiB + 1, no-workspace
+truncation, 2,001-character implicit/explicit focus, event-size overflow and
+task-catalog saturation.
+
+#### PROCESS-COORDINATOR-01 — use the shared bounded process transport (**closed on `43eb87b`**)
+
+`ProcessEffectBroker` and `broker_host` use blocking `std::process` pipes and
+`read_line`, then check 64 KiB only after the full line is allocated. EOF after
+JSON is accepted without a frame terminator, RPC has no deadline/cancellation,
+and `Drop` can block forever in `child.wait()`. This bypasses the bounded framed
+codec and lifecycle controls already owned by `agent-process`; the platform
+security document's “bounded frames” claim is therefore false today.
+
+Move the coordinator behind the shared framed process facility (or an equally
+bounded narrow adapter), enforce the cap while reading, require complete frame
+boundaries, and make request/cancel/shutdown/kill/reap deadlines explicit.
+Oversize, partial EOF, stalled peer, malformed session and stubborn-child tests
+must all fail closed.
+
+#### CAPABILITY-PROCESS-LIFECYCLE-01 — serialize activation with native host state (**closed on `abcb4ba`**)
+
+Disabling or quarantining a capability clears its model surface but does not
+stop an already serving child. `set_activation` also bypasses the per-entry
+`run_lock`, so it can race `ensure_started`. After a native invoke poisons the
+host, registry state can remain `Started`; later `ensure_started` fast-returns,
+so the replacement path and `RestartCircuit` are unreachable. A quarantined
+capability may consequently keep running while the registry says it is absent.
+
+Make activation change one lifecycle transaction under the same lock: revoke
+leases/surface, cancel inflight work, stop and reap the child, then publish the
+new generation. Poisoned invoke must transition to a restartable/quarantined
+state and consume the circuit exactly once per replacement attempt. Add
+disable-vs-start races, inflight quarantine and invoke-poison recovery tests.
+
+#### EXTENSION-PROCESS-HYGIENE-01 — bound every control-plane send and teardown (**closed on `ebe02ff`**)
+
+The MCP request path sends its frame before entering the timeout/cancellation
+select; cancellation notification can also block on a peer that stopped
+reading. `ProcessHost` performs a bounded shutdown call followed by unbounded
+supervisor reap, and its broker handler awaits broker work without selecting
+the request cancellation. The dormant plugin self-check uses raw `Command`,
+waits for exit before draining pipes, ignores some timeout-kill failures, lacks
+the normal sandbox/attestation path, and its env-scrub test sets one variable
+while the helper reads another.
+
+Every send, broker wait, pipe drain, shutdown and reap needs one end-to-end
+deadline/cancellation budget and a kill-tree fallback. If plugin self-check is
+activated, route it through the normal ProcessHost containment floor and repair
+the test oracle first. Backpressure, full-pipe, acknowledged-but-still-alive,
+cancelled-broker and secret-variable tests are required.
+
+#### DEPENDENCY-CONFORMANCE-01 — enforce the declared layer graph, not seven pairs (**closed on `2436249`**)
+
+The shipped graph contains `agent-workspace -> agent-process` for process
+journal identity/kill helpers, while the contract and architecture diagram
+present them as siblings. The edge is not currently forbidden, but it is an
+undocumented architectural choice. `agent-conformance` uses a hard-coded
+seven-pair denylist and hard-coded role lists, so it cannot detect this drift,
+new implementation crates, or the semantic prohibition on
+`tool-runtime -> ContextEngine` (the trait lives in the otherwise legal
+`agent-contracts` crate).
+
+Decide the narrow edge explicitly: invert it behind a workspace-owned process
+control port, or document and constrain the exact dependency. Then replace the
+partial guard with an allowed-layer/role matrix plus a source/API-level check
+for forbidden ContextEngine use. New production crates must fail until assigned
+a role. Keep test-only composition exceptions explicit and non-transitive.
+
+#### M15-HARNESS-BOUNDARY-01 — make cell execution bounded and failure-monotone (**closed on `f57a118`**)
+
+The workspace hash recursively follows ordinary directory classification,
+reads every file in full, and excludes only `.focus-agent`; it can traverse
+links/junctions outside the fixture and includes `.git`/`target`, unlike the
+bounded allowed-diff domain. Oracle timeout wraps `Command::output()` without
+owning a kill/reap guard, so timed-out cargo descendants may continue mutating
+the workspace. If an earlier model/runtime failure is present, a later harness
+setup/watchdog failure is recorded only when the old failure slot is empty,
+which can downgrade the required `NOT_RUN` censor to behavior `FAIL`.
+
+Use one canonical, link-safe, file/byte-bounded workspace domain for diff and
+hash; persist its file-set digest. Kill-tree/reap oracle children before verdict
+or hashing. Failure classification must be monotone: any harness failure makes
+the cell `NOT_RUN` regardless of an earlier behavior failure. Add symlink,
+`.git`/`target`, large-file, timeout-descendant and dual-failure tests.
+
+### P2 / governance observations from this review
+
+- The README still presents `CONTEXT_RUNTIME_TODO.md` as a live queue, calls
+  ROADMAP a general status authority, and describes landed checkpoint/effect
+  mechanisms as wholly open. `GOV-STATUS-01` owns the correction.
+- The architecture text overstates composition equivalence: product/TUI and
+  product-equivalent M15 paths use `agent-compose`, while isolated evaluator
+  harnesses deliberately build narrowed `RuntimeServices` directly. Those
+  harnesses must not claim product equivalence unless they use the product root.
+- `ModuleHost` does not reject duplicate start or unstarted
+  `RuntimeInstance::spawn`; `COMPOSE-LIFECYCLE-01` must include those guards and
+  post-start rollback.
+- `context-simple::materialize` performs I/O between state-lock phases without
+  the engine operation gate; direct restore replaces live state before final
+  validation; external scope promotion does not dirty the catalog; and ledger
+  export removes rows before its fallible write. These are transactional P2
+  follow-ups under `CONTEXT-IO-01`; fix them without changing policy scores.
+- The TUI task/grant notice path uses an unbounded channel, and numerous code
+  comments still carry milestone/defect ids contrary to the repository
+  maintenance rule. Bound the channel and remove tracking vocabulary when each
+  affected module is next touched; neither justifies Context/GC changes.
 
 ### P0 — restore a trustworthy baseline
 
@@ -519,14 +908,24 @@ suffix remains available for batch/effect/failure diagnostics. This is a replay
 and audit-truth defect; do not overstate it as proof that the checkpoint-based
 production restore path already resurrects the suffix.
 
+The repository-wide review adds three fail-closed requirements to this item.
+File entry points must bound bytes/lines/events while reading and reject a
+mixed-run stream instead of silently retaining only the first run id.
+`verify_restore_consistency` must reject gaps, duplicates and out-of-order
+sequences before comparing two reconstructions; equality over the same damaged
+prefix is not consistency proof. A no-artifact truncated user-input preview is
+also unreplayable and must fail rather than silently replace the original body.
+
 For a terminal checkpoint, a matching `TaskCompletion` barrier advances trace
 truth to that transaction. In the checkpoint-to-audit crash window, the
 validated terminal checkpoint is the stronger truth; `event_cover_seq` is a
 replay cursor, not commit authorization.
 
 Tests cover no committed turn, one uncommitted tail, several committed turns
-plus a final failed turn, and suffix-only warnings/errors while preserving full-
-trace gap and interruption diagnostics.
+plus a final failed turn, suffix-only warnings/errors, mixed-run input, byte and
+event overflow, missing/duplicate/out-of-order sequence rows, and missing
+truncated bodies. Gap/interruption diagnostics remain visible, but any gap makes
+restore-consistency proof invalid.
 
 #### PROVIDER-PROTOCOL-01 — fail closed before new live evidence (**open — locally green; clean-source/CI exit pending**)
 
@@ -604,7 +1003,10 @@ preparation and has no outer rollback. Move all possible fallible preparation
 before `host.start()`; absent optional services may remain optional, but a
 present wrong type fails. Add a minimal startup guard only if a post-start
 fallible seam remains. Exit tests prove every failure point leaves no serving
-child or half-built runtime.
+child or half-built runtime. `ModuleHost::start` must reject duplicate start,
+`RuntimeInstance::spawn` must prove the host reached Serving, and an isolated
+evaluator that intentionally uses a narrower composition must label itself
+non-product-equivalent.
 
 #### CONTEXT-IO-01 — remove lock-across-I/O and loss-on-export (**open**)
 
@@ -622,7 +1024,9 @@ Core ACK failure is logged but a receipt still returns as if clean. Preserve
 the real receipt plus typed unresolved debt/disposition, event/checkpoint it,
 reconcile it on restore and fence recovery/completion. Never pretend an
 already-applied effect can be rolled back. Exit covers Applied/NotApplied/
-Ambiguous debt through restart.
+Ambiguous debt through restart. The persisted receipt is the typed settlement
+defined by `EFFECT-ACK-CLASS-01`; a boolean `applied` field is not an acceptable
+serialization or migration fallback.
 
 #### DURABLE-FACTS-01 — make typed execution facts replayable (**open**)
 
@@ -663,27 +1067,50 @@ both from events. Episode terminal boundaries are owned and tested by
 - split large modules only at stable transaction boundaries after semantics are
   frozen; do not mix the move with behavior changes.
 
-### GOV-MAINT-01 — bounded repository maintenance (**open P2**)
+### GOV-MAINT-01 — bounded repository maintenance (**closed on `6fdb4f0`**)
 
-Address the missing `LICENSE` and empty `inspect_outbound.sh` in one governance
-batch; keep `SECURITY`/`CONTRIBUTING` and archive cleanup non-blocking. Do not
-add `docs/state.json` as another authority source.
+The MIT `LICENSE` and a minimal `inspect_outbound.sh` landed in `6fdb4f0`
+(2026-09-02) with dual-platform CI green on that source. No `docs/state.json`
+authority source was added.
 
-### GOV-STATUS-01 — reconcile milestone authority (**open, governance**)
+### GOV-STATUS-01 — reconcile milestone authority (**resolved in the 2026-09-03 documentation tranche; closes when that commit is recorded**)
 
-`AGENTS.md` contains both banked-closure wording and an instruction not to
-claim M12/M13 closed. Reconcile that contradiction once, then align the compact
-status table. Until then, keep the evidence banked, do not reopen its mechanism
-work, do not claim closure, and keep Self-Iteration blocked.
+`AGENTS.md` previously contained both banked-closure wording ("The platform
+gates M12/M13 closed...") and an instruction not to claim M12/M13 closed
+("M12 and M13 must still finish..."). The 2026-09-03 edit reconciles both
+spots to one statement: mechanism substrate implemented, evidence banked,
+closure claims suspended until the M15-facing exits in `docs/STATUS.md` are
+recorded, Self-Iteration blocked. README is aligned in the same tranche:
+`agent-kernel` renamed to `agent-core`, the crate list now includes
+`agent-platform-protocol`/`agent-conformance`/`agent-compose`,
+`CONTEXT_RUNTIME_TODO.md` is labeled historical, landed mechanisms are no
+longer listed as open, and the authority pointers now name STATUS (Now/
+freeze), ROADMAP (gates/order), AUDIT_TODO (defects) and M15_ACCEPTANCE.
+Keep the evidence banked, do not reopen its mechanism work, do not claim
+closure, and keep Self-Iteration blocked until the remaining exits land.
 
 ### Ordered execution and evidence gate
 
 ```text
 latest JSON-hardened candidate REJECTED (valid FAIL 10/12 on 784d7aa)
+  -> repository-wide P0 close or exact selected-path exclusion
+     [DONE 2026-09-02: all repaired in 615b5ed..6fdb4f0, CI green on 6fdb4f0]
   -> deterministic AttemptIncident / CompletionRepair / JSON replay gates
-  -> bounded SSE + provider call-state + pre-approval schema validation
+     [DONE 2026-08-31..09-02: 615b5ed, b148b4d, d92b250, 1768914, 33d0395,
+      531a77e, df2f72c and regressions]
+  -> close the dfb9ade Responses terminal-state defects + typed retry evidence
+     [DONE: 1768914, f528a92, 328ec5d; FORMAL-PATH OBSERVER STILL MISSING]
+  -> pre-approval schema validation
+     [DONE: 33d0395]
   -> full local regression + recorded clean source + Ubuntu/Windows CI
-  -> selected-path P1 correctness closed or proven out-of-path
+     [PARTIAL: CI green on 6fdb4f0; the uncommitted protocol-body regression
+      and doc updates must land and be re-recorded]
+  -> M10 fault-gate re-audit on the repaired turn/context transaction
+     [OPEN: repair landed, audit record pending]
+  -> GOV-STATUS-01 reconciliation (AGENTS.md wording + README alignment)
+     [RESOLVED IN THE 2026-09-03 DOC TRANCHE; closes when recorded]
+  -> wire the typed retry observer into long_live/fixture_driver/agent-compose
+     [OPEN]
   -> same-checkpoint causal fork only if project_settlement changes
   -> new exact-source/product M15 preflight
   -> at most one freshly predeclared formal 12-cell M15 window
@@ -2327,7 +2754,7 @@ Full text: git history of this file.
 | MOD-AUTH-01 | `edit.patch files[]` multi-file authority widening → `EffectIntent::WorkspaceWriteSet` + all-paths `grant_matches` (2026-08-21; see PLATFORM_SECURITY.md) |
 | MOD-AUTH-02 | Prepared effects report canonical `ActualWorkspaceWrite` (real path + real staged bytes); Core commit rejects `ActualExceedsApproved` outside the approved set (2026-08-21) |
 | LONGTASK-01/02 | Catalog-cold progress CAS, actor safe-point resume install, coalesced checkpointing and same-task continuation landed deterministically (2026-08-24/25); remaining residuals are the LT-RUN-05 cold-resume matrix items under LONGTASK-03/04 (EXEC-REV-01 closed 2026-08-27) |
-| CORE-11 | HostToolPolicy registry| CORE-12 | M13 sandbox gate: structured attestation with per-flag mechanism proofs, `required ⊆ actual` activation, native fail-closed UntrustedGenerated. Closed 2026-08-27 on the clean-tree closure-audit report (`evidence/platform-closure/m13/`) |
+| CORE-12 | M13 sandbox gate: structured attestation with per-flag mechanism proofs, `required ⊆ actual` activation, native fail-closed UntrustedGenerated. Closed 2026-08-27 on the clean-tree closure-audit report (`evidence/platform-closure/m13/`) |
 | Sandbox floor | `UntrustedGenerated.required` now includes `fs_read_confined` + `cpu_quota` (still fail-closed on native until provable); `process_spawn_controlled` → `process_count_quota` with a wire-compat serde alias (2026-08-21) |
 | Foreground ack | `ContextConsumptionAck.foreground_item_ids` + engine counter: foreground bodies the model saw are observable (weak signal; no residency / admission change) (2026-08-21) |
 | TOOL-02 | `search.grep` `path` accepts a file target (file-or-directory), removing a class of `path_not_found` tool failures (2026-08-21) |

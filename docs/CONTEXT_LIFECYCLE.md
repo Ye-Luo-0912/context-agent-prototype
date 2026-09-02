@@ -166,6 +166,14 @@ full-item acknowledgement at 256 ids and external descriptors at the
 `ContextMapView` cap of 32. This makes GC recency/access signals describe
 successful model use rather than candidate generation.
 
+**Implementation status (repaired 2026-08-31/09-01).** The adapter boundary
+now validates selected/foreground counts, body/reason sizes and the eventual
+ACK envelope before provider execution, and the consumption ledger is built
+from the final rendered frame with foreground bodies stamped as visible
+without residency change (`CONTEXT-MATERIALIZATION-VALIDATE-01` in `d9807e7`,
+`CONTEXT-CONSUMPTION-TRUTH-01` in `7a8a663`). The sequence above is enforced,
+not merely required.
+
 ## 6b. The selection universe: secondary indexes
 
 Since V1-M9 the engine keeps slot-based secondary indexes beside the
@@ -964,14 +972,18 @@ When CURRENT DIRECTIVE *exactly* names an ExecutionState-known path
 (path-token match, no embeddings, no classifier), Runtime fills
 `ContextHints.foreground_resources` (max 2). The engine may copy the
 latest matching file body into `MaterializedContext.foreground` for this
-request only: Warm stays Warm, Stored is not Admitted, consumption ack
-does not stamp those ids. Assembler renders `CURRENT FOREGROUND EVIDENCE`
+request only: Warm stays Warm, Stored is not Admitted, and the final
+consumption acknowledgement stamps the body as visible without changing its
+residency. Assembler renders `CURRENT FOREGROUND EVIDENCE`
 before SELECTED WORKING CONTEXT. Foreground is itself exact body presence,
 not a TaskProgress identity.
 The engine packs foreground first, then subtracts **actual** body tokens
 from `budget_tokens` before historical packing. Runtime must not
 worst-case-reserve `MAX_FOREGROUND_TOKENS` (~2048); that constant is the
-foreground cap inside `realize_foreground`, not a frame reservation.
+foreground cap inside `realize_foreground`, not a frame reservation. If the
+body cannot fit that cap, the materialization must carry an explicit identity
+for the truncated body; an unmarked prefix cannot stand for the complete
+`path@revision` evidence.
 GC-induced reread is `Warm` + `Stored` only (`FsReadMotive` /
 `FsRereadClass.gc_induced()`). Do not retune `active_threshold` /
 `archive_threshold` / `gc_max_generation`. P3/P4 stay ablation-only.
@@ -1145,6 +1157,15 @@ map, recalled items re-enter the heap, failed writes return to the front
 of the buffer so overflow retries next pass). The tail latency of a
 growing store stops being synchronous with the state lock.
 
+Allocation and report construction are part of the bound. The implementation
+does not spawn one task per unbounded candidate before the I/O semaphore, clone
+the full pending item/body map, return failed writes beyond
+`gc_buffer_capacity`, or collect/sort an unlimited external entity bucket before
+truncating the view; maintenance/GC/reconcile reports carry bounded rows plus
+overflow counts/digests (`CONTEXT-RESOURCE-BOUND-01`, repaired in `cfc17a3`).
+This is resource hardening, not permission to tune GC thresholds or
+reactivation scoring.
+
 Because the state lock is released between the phases, the multi-phase
 operations (GC, storage GC, store reconcile, checkpoint, restore) are
 serialized by an engine-level operation gate: a plan computed against one
@@ -1281,8 +1302,8 @@ the scopes; the index rebuilds on restore.
 Every formal blob (`<id>.json` under the store dir) has exactly one owner:
 the external-map entry whose `ExternalizedContext.blob_checksum` is the
 FNV-1a content hash captured at write time (corruption/bit-rot detection
-for the reconcile; the hot read path skips it so per-item retrieval stays
-IO-cheap). Ownership holds across every state transition:
+for reconcile and every authority-bearing read). Ownership holds across every
+state transition:
 
 - **Externalize** pre-serializes the bytes under the lock and keeps the
   source item with the caller (`GcPlan::externalize` carries `(item,
@@ -1313,6 +1334,14 @@ IO-cheap). Ownership holds across every state transition:
   forwards it (`ServiceOp::ReconcileStore`), with parity tests proving the
   wire op, the adapter override and the sidecar handling agree with the
   in-process engine.
+
+The 2026-08-31 audit found three implementation deviations from this ownership
+contract; all three are repaired in `1ea671f`
+(`CONTEXT-STORE-TRUTH-01`): normal fetch/admit/GC recall now verify the stored
+checksum, product composition calls `reconcile_store()` after restore/start,
+and quarantining an owned checksum mismatch invalidates its external-map owner.
+Read-path caching is permitted only after measurement and must preserve
+equivalent integrity evidence.
 
 ## 10. What should become durable later
 

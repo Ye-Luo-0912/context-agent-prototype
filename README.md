@@ -9,7 +9,7 @@ This repository intentionally does **not** include vectors, RAG, knowledge graph
 ## Architecture
 
 ```text
-TUI / composition root
+TUI (agent-tui) / composition root (agent-compose)
         │
         v
 RuntimeInstance ── owns ── ModuleHost / capability registry
@@ -18,7 +18,7 @@ RuntimeInstance ── owns ── ModuleHost / capability registry
 RuntimeActor (the only turn/task orchestrator)
         │
         v
-AgentKernel (stateless trusted facade)
+agent-core CorePort (stateless trusted facade)
    ├─ ContextEngine ──> MaterializedContext ──> PromptAssembler
    ├─ ToolDispatcher ─> bounded ToolOutput / prepared Effect
    ├─ ModelTransport
@@ -36,30 +36,34 @@ AgentKernel (stateless trusted facade)
 6. **Raw tool output is disposable.** Large output lives in artifacts; only a bounded observation enters the model working set.
 7. **Message-scoped data expires by default.** Explicitly pinned items are the exception.
 8. **There is one orchestrator.** `agent-runtime::RuntimeActor` owns task,
-   turn, scope and prompt state. `agent-kernel` stays a stateless trusted
-   facade and concrete implementations are wired only by the composition root.
+   turn, scope and prompt state. `agent-core` stays a turn-stateless trusted
+   facade behind `CorePort` and concrete implementations are wired only by
+   the composition root.
 
 ## Workspace crates
 
 - `agent-contracts`: stable cross-layer contracts.
+- `agent-platform-protocol`: bounded semantic wire DTOs for extension
+  clients (parse-time JSON budgets, no transport/runtime).
 - `context-simple`: first non-vector working-set implementation (dynamic).
 - `context-baselines`: baseline A (append-only) and B (rolling-window + fixed
   marker, despite the legacy `RollingSummaryEngine` name) for A/B/C experiments.
 - `context-contextcore`: `ContextEngine` adapter over a context-service process boundary (the ContextCore integration shape).
 - `agent-context-service`: standalone context-service process speaking the adapter's JSON-lines protocol.
 - `agent-workspace`: workspace root and artifact storage.
-- `tool-runtime`: tool registry — file tools, `search.grep`, `edit.replace`, git status/diff, streaming `shell.exec`.
-- `agent-storage`: append-only JSONL event journal.
+- `tool-runtime`: tool registry — file tools, `search.grep`, `edit.replace`, git status/diff, streaming `shell.exec`, `process.run`/`process.session`.
 - `agent-process`: framed child-process host, cancellation and sandbox hooks.
 - `agent-capability-process`: process-capability adapter over `agent-process`.
-- `agent-kernel`: stateless context/tool/model/approval/event facade.
+- `agent-storage`: append-only JSONL event and operation journals with fsynced durability barriers.
+- `agent-core`: turn-stateless trusted Core facade behind `CorePort` (contracts, budgets, approval, events/audit/durability).
+- `agent-conformance`: enforces the declared dependency layer/role graph.
 - `agent-runtime`: sole actor/orchestrator, task state, prompt assembly,
   checkpoints, tool-surface planning and capability host.
 - `agent-replay`: offline deterministic replay of a context lifecycle from a trace, plus the A/B/C scenario comparison.
-- `agent-eval`: headless live-model smoke runner; it is not yet the real
-  coding-workload acceptance suite.
+- `agent-eval`: evaluation harness including the M15 formal-window runner.
 - `provider-openai`: OpenAI-compatible streaming model provider (also DeepSeek/Qwen/Moonshot/GLM).
-- `agent-tui`: minimal TUI and wiring; mock model by default.
+- `agent-compose`: trusted composition root that wires implementations and spawns the sole RuntimeActor.
+- `agent-tui`: minimal TUI; one product host built on the composition root.
 
 ## Run
 
@@ -179,18 +183,20 @@ lifecycle transitions / dependency edges and covered in
 `docs/CONTEXT_LIFECYCLE.md` §9b–9c.
 
 See `docs/ARCHITECTURE.md`, `docs/CONTEXT_LIFECYCLE.md`,
-`docs/CONTEXT_RUNTIME_TODO.md` (the code-grounded continuous-GC design queue),
-`docs/TOOL_ECOSYSTEM_TODO.md` (modular trust boundaries, builtin ACI, and
-extension ecosystem design queue),
-and `docs/ROADMAP.md`.
+`docs/CONTEXT_RUNTIME_TODO.md` (historical design queue; not a live
+authority), `docs/TOOL_ECOSYSTEM_TODO.md` (modular trust boundaries, builtin
+ACI, and extension ecosystem design queue), and `docs/ROADMAP.md`.
 
 ## Current status
 
 The dynamic-context and round-surface baselines are substantial, but this is
 still a research prototype. Runtime transactions, external recall, exact
-model-consumption acknowledgement and store-backed GC are implemented.
-Cross-plane checkpoints, canonical context ownership, TaskAnchor/completion
-semantics, process effect brokering, real filesystem/network isolation,
-standing unattended-task policy and real coding non-inferiority remain open.
-The code-grounded status table in `docs/ROADMAP.md` is authoritative; confirmed
-defects and acceptance tests are tracked in `docs/AUDIT_TODO.md`.
+model-consumption acknowledgement, store-backed GC, cross-plane checkpoints,
+canonical context ownership, TaskAnchor/completion semantics, process effect
+brokering, typed effect settlements, bounded process authority and real
+filesystem isolation are implemented; their exit evidence and remaining gates
+are tracked in the docs below. Standing unattended-task policy and real
+coding non-inferiority (formal M15) remain open.
+`docs/STATUS.md` owns Now/freeze status, `docs/ROADMAP.md` owns milestone
+gates/order, `docs/AUDIT_TODO.md` owns confirmed defects and acceptance
+tests, and `docs/M15_ACCEPTANCE.md` owns the formal-window design.

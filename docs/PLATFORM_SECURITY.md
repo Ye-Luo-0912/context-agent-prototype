@@ -143,9 +143,22 @@ authority check.
 spend an argv-prefix grant. Session recovery is keyed by the **start**
 identity.
 
+The lifecycle floor is equally mandatory: capacity is reserved atomically,
+start observes cancellation, and cancel/shutdown kill the process tree then
+reap it. These floors are enforced by the hardened dispatcher
+(`PROCESS-SESSION-LIFECYCLE-01`, repaired in `64607f6`), including
+module-level session drain on shutdown.
+
 Standing grants: a process grant is exactly one of `exec_argv_prefix` or
 `shell_command_digest`. Spawn fails closed unless the approved bound
 covers the actual spawn.
+
+The complete execution authority binds the canonically resolved executable,
+cwd scope and security-relevant environment, not just program text and argv
+prefix; `ExecArgv` authority covers the resolved identity and is rechecked
+against the pre-spawn seal (`PROCESS-AUTHORITY-BOUND-01`, repaired in
+`f460558` with the seal-recheck regression in `13cf6c1`). Standing argv
+grants are therefore bound to the executable world they were approved for.
 
 M12 implemented substrate: one `EffectRequest`/commit path for brokerable side
 effects. The reserved/dispatch/ack barrier is structured in Core:
@@ -167,7 +180,7 @@ reconciliation enum (reserved-not-dispatched → NotApplied, dispatched-unacked
 The out-of-process coordinator transport exists as a process-separated
 durable ledger, not an executor: `broker_host` opens the same
 `ReservationJournal` and serves line-delimited reserve/dispatched/ack/
-reconcile requests on stdin/stdout (bounded frames, exclusive journal lock,
+reconcile requests on stdin/stdout (exclusive journal lock,
 fold-validated transitions), while `ProcessEffectBroker` journals each phase
 across the pipe and applies the effect body locally at the requester —
 effect bodies are not remotable in v0, so the crash-window semantics are
@@ -180,6 +193,16 @@ NotApplied/Applied/Ambiguous, authority/revocation fencing holds, and generic
 shell/process are documented non-transactional exceptions. Requester-side
 application is the V1 contract; remote execution is not an acceptance
 condition without a remotable consumer.
+
+**Implementation status (repaired 2026-08-31/09-01).** The coordinator
+transport is now strictly framed with a pre-allocation length cap, deadline
+and cancellation on every RPC, and non-blocking drop
+(`PROCESS-COORDINATOR-01`, repaired in `43eb87b`). Broker ACK receipts carry
+a typed settlement — not-applied / applied-with-durability / unknown — and
+journal v2 rejects boolean-v1 records at the version gate; recovery never
+strengthens a settlement class (`EFFECT-ACK-CLASS-01`, repaired in
+`6112ffd`). Effect bodies remain non-remotable in v0 and remote execution
+is still not an acceptance condition without a remotable consumer.
 
 ### M12 closure evidence artifact
 
@@ -262,7 +285,7 @@ What v0 can currently *attest* as true. Blank / false = not proven.
 
 | Capability | Linux | Windows | Unix non-Linux |
 | --- | --- | --- | --- |
-| `fs_write_confined` | Landlock write roots (`MOD-06`) | Low-IL labeled roots (`MOD-08`) | — |
+| `fs_write_confined` | Landlock ABI v3+ write roots (create/modify/truncate/destroy) | Low-IL labeled roots (`MOD-08`) | — |
 | `fs_read_confined` | App-level broker only; no landlock read fence | App-level broker only | App-level broker only |
 | `tcp_connect_denied` | Landlock ABI v4+ when write roots set (`MOD-07`) | — | — |
 | `udp_denied` | — | — | — |
@@ -280,6 +303,12 @@ workspace opens (`CORE-07`), mid-invoke `fs.read` brokered under
 deny (`MOD-12`), `RLIMIT_FSIZE` (`MOD-10`), `RLIMIT_CORE=0` (`MOD-15`),
 Linux NICE/RTPRIO + `no_new_privs` (`MOD-16`), Windows Job
 `PRIORITY_CLASS=NORMAL` (`MOD-17`).
+
+The Linux adapter gates the write-floor attestation on the probed ABI: only
+ABIs that actually enforce `LANDLOCK_ACCESS_FS_TRUNCATE` (v3+) may report
+`fs_write_confined=true`; older ABIs fail closed on that flag
+(`SANDBOX-ATTEST-TRUNCATE-01`, repaired in `e5e712f`). A successful ruleset
+application is not by itself proof of the whole write capability.
 
 `process_count_quota` was renamed from `process_spawn_controlled`
 (2026-08-21; a serde alias keeps the wire compatible). `RLIMIT_NPROC`

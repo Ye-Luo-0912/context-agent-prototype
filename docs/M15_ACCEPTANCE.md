@@ -302,6 +302,19 @@ including the nullable acceptance-authority triple, and recomputes the frozen
 pack, provider, acceptance declaration and exact switch identities before it
 accepts the window.
 
+**Acceptance-path status (repaired 2026-08-31/09-01).** The reporter now
+reconstructs verdicts from content-addressed raw cells: window manifests bind
+per-cell content digests, events/hidden-verification/workspace records are
+parsed and hashed rather than trusted from stored dimensions/summary, and any
+post-persist mutation of a bound acceptance input fails closed
+(`M15-RAW-EVIDENCE-01`, repaired in `ea821bb`). The workspace hash shares one
+canonical, link-safe, file/byte-bounded scan domain with the allowed-diff
+verdict; oracle timeouts kill and reap their cargo tree; and a later harness
+failure can no longer be masked by an earlier behavior failure
+(`M15-HARNESS-BOUNDARY-01`, repaired in `f57a118`). Historical FAIL packs
+remain immutable diagnostic evidence; the residual pre-window exits are
+recorded in [`STATUS.md`](STATUS.md).
+
 ## 4. Verdicts
 
 For the M15 V1 profile:

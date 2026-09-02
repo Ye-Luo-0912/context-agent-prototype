@@ -105,6 +105,18 @@ Context packing, GC, and retrieval live in
    path@digest Fresh again; a changed identity can never pass the gate.
    Known-footprint mutations still physically drop their touched paths.
 
+10. **ContextApplied ≠ RuntimeCommitted.**
+    User-input ingest, trigger maintenance and their audit rows form one
+    Runtime-owned turn-start transaction. Checkpoint maintenance is scheduled
+    and committed by the same Runtime authority; Core cannot become a second
+    scheduler. If an in-process or sidecar operation may have applied but its
+    reply/event commit is lost, Runtime must restore the prior Context plane or
+    enter a durable recovery fence before accepting another mutation. The
+    turn-start transaction, rollback fencing and scratch-state restore
+    validation are repaired (`RUNTIME-CONTEXT-COMMIT-01`, `9ba85d3`/
+    `f42a898`/`f622cf3`); the recorded M10 fault-gate re-audit is the
+    remaining exit.
+
 There is no planner. The LLM still chooses actions. Runtime only
 maintains what the world can currently prove.
 
