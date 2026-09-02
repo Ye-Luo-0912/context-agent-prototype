@@ -1477,6 +1477,19 @@ candidate**, not another prompt tweak or an immediate rerun. The repaired-source
    then one fresh exact-source product preflight and at most one freshly
    predeclared M15 window.
 
+**Workload disposition (2026-09-03; documentation only):** the proposed
+"one-stop reliability" umbrella is a **large, multi-slice effort**, not one
+bounded M15 candidate. It spans Runtime failure/closure semantics, Provider
+buffering, eval CLI and environment preflight, CI, and frozen evidence identity.
+No implementation, serving change, acceptance refreeze, preflight or live
+window is authorized by this estimate. The small argument-order defect can be
+fixed independently, but cannot repair or justify rerunning the valid 6/12
+FAIL. Candidate selection in item 3 therefore remains open. The implementation
+boundaries and relative sizes are recorded in
+[`LONG_TASK_EVALUATION.md`](LONG_TASK_EVALUATION.md#2026-09-03-workload-split),
+and the supporting hermetic gate-runner defect is
+`EVAL-PREFLIGHT-01` in [`AUDIT_TODO.md`](AUDIT_TODO.md).
+
 A valid formal failure rejects its exact candidate; only a typed `NOT_RUN`
 permits rerunning that frozen window. Candidate selection is a user decision.
 

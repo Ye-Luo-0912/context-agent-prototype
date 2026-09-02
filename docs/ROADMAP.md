@@ -67,6 +67,34 @@ remain frozen.
    v4 window. A valid FAIL rejects that candidate; only typed `NOT_RUN` permits
    rerunning the whole frozen window.
 
+### Workload disposition after the 6/12 FAIL
+
+The 2026-09-03 "one-stop reliability" proposal is assessed as a large umbrella,
+not a candidate selection. Its operational gate runner, Runtime convergence
+semantics, Provider buffering and any public property verifier have independent
+authorities and acceptance risks; they must not be bundled into one change and
+then credited with one aggregate result.
+
+- Step 3 above remains open: select exactly one materially new product/serving
+  candidate before changing formal evidence.
+- `EVAL-PREFLIGHT-01` may improve the developer/evaluation gate independently,
+  but it neither repairs a valid cell FAIL nor authorizes a formal window.
+- A Runtime candidate must reuse the sole `CompletionReadiness` and the existing
+  basis-fenced proof-refresh/terminal transactions. It may not add another
+  completion coordinator, infer debt resolution from prose, auto-clear blockers
+  or auto-complete.
+- A buffered-stream change must preserve independent byte, chunk and wire
+  bounds and fail closed. Raising or deriving away the 16,384-chunk bound is not
+  accepted without deterministic evidence that normalization preserves the
+  resource floor.
+- A public counterexample/property verifier changes the task and acceptance
+  surface. It is not a repair to the frozen diag fixture and requires an
+  explicit prospective refreeze before it can enter a future formal candidate.
+
+Detailed slice sizes and gates are in
+[`LONG_TASK_EVALUATION.md`](LONG_TASK_EVALUATION.md#2026-09-03-workload-split).
+The frozen M15 acceptance text is unchanged.
+
 ## Post-M15 candidate order (proposal)
 
 This is a directional proposal extracted from the verified 2026-09-03

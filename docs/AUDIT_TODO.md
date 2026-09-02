@@ -216,6 +216,45 @@ artifact; without it the stderr retry line stays the human channel. The
 channel remains a best-effort diagnostic artifact, not durable formal
 evidence: a cell verdict never depends on it.
 
+### EVAL-PREFLIGHT-01 — one hermetic developer/evaluation gate runner (**open P1; supporting infrastructure, not an M15 candidate**)
+
+Repeated operational failures have one tooling-level cause: repository gates
+do not yet share one parse-before-side-effect entry point and one exact runtime
+environment check. This does not reinterpret the latest valid FAIL. In
+particular, Python exit `9009`, a stale helper binary, a Provider control-plane
+probe that does not exercise the selected streaming/tool data plane, and an
+ignored trailing `--evidence-dir` are preflight defects, not evidence that a
+behavior-failing cell passed.
+
+Add one dev-only doctor/gate runner, either as an `agent-eval` subcommand or a
+thin `xtask`, which:
+
+- parses and validates the complete command line before creating files or
+  starting a process; option order is semantically irrelevant and unknown,
+  duplicate or conflicting values fail;
+- resolves and probes the exact Git/Rust/Python executables and owned helper
+  binaries before tests. It reuses the existing helper freshness/build rules
+  rather than reopening `CTX-12`;
+- executes the same bounded format/check/Clippy/build/test list locally and in
+  CI, and probes the exact selected Provider model/protocol/streaming/tool data
+  plane rather than treating `/models` as serving proof;
+- creates one unique, non-overwriting output directory and emits a bounded
+  readiness report which references the existing source, pack, surface,
+  acceptance, serving and content-addressed manifest digests. It is a derived
+  check, never a second evidence authority or an automatic `STATUS.md` writer;
+  secrets are never persisted; and
+- keeps formal preflight and the predeclared window as separate explicit
+  commands. It must never rerun a valid FAIL, silently change serving/bounds, or
+  launch a formal window without the intervening freeze and operator decision.
+
+Exit tests cover option-order equivalence, the Windows Store Python alias ahead
+of a real interpreter, no usable interpreter, stale/missing helper binaries,
+`/models` healthy with the actual Responses data plane unavailable, exact
+evidence-directory selection, collision refusal, bounded logs, manifest-digest
+mismatch and proof that the runner does not start a formal window. This work may
+land independently, but it cannot satisfy M15 candidate selection or convert
+any retained FAIL into `NOT_RUN`.
+
 ### TOOL-SCHEMA-VALIDATE-01 — validate the captured schema before approval (**closed on `33d0395`**)
 
 JSON syntax is insufficient. Compile a bounded `SchemaProfile` once per tool

@@ -1100,6 +1100,30 @@ order:
 6. Run one fresh exact-source product preflight and at most one freshly
    predeclared formal window if every prior gate remains green.
 
+#### 2026-09-03 workload split
+
+The proposed one-stop reliability path is **large overall** and is recorded here
+before implementation. It is at least five independently reviewable slices;
+the size labels below are relative implementation plus deterministic-test
+costs and exclude a live M15 window.
+
+| Slice | Size | Boundary and disposition |
+| --- | --- | --- |
+| Eval CLI parses every option before side effects, including position-independent `--evidence-dir` | S | Supporting fix only; it does not change the rejected candidate or any historical verdict. |
+| Hermetic developer/eval doctor and gate runner (real Python/tool paths, owned helper binaries, exact Provider data-plane probe, unique evidence output, local/CI parity) | L | `EVAL-PREFLIGHT-01`; orchestration of existing commands and manifests only, never a second Runtime authority. |
+| General `AttemptIncident` versus completion-debt admission | L | Requires trusted dispatch/effect/task-root attribution and checkpoint-compatible negative tests; never infer safety from argv, prose or exit code alone. This is a possible product candidate, not yet selected. |
+| Broader completion convergence beyond the existing sole-proof refresh | L | Highest authority risk. Any candidate stays inside the single `RuntimeActor`, reuses `CompletionReadiness`, requires explicit intent and the same basis, and may resolve only a host-proved mechanical blocker. No automatic debt/progress clearing or task completion. |
+| Buffered stream normalization and local-cap taxonomy | M | Preserve independent byte/chunk/wire bounds. First prove coalescing and attribution without accepting a runaway stream or weakening fail-closed behavior. Not currently required to explain the valid FAIL. |
+| Public behavior/property verifier with a separate hidden holdout | M code / L governance | Changes fixture/acceptance identity and task difficulty. Parked unless an explicit prospective M15 refreeze selects it; never rewrite prior cells. |
+
+The umbrella therefore cannot be implemented or evaluated as one patch. A
+pre-M15 decision chooses one bounded product/serving candidate and gives it its
+own deterministic matrix. Supporting gate-runner work may proceed separately,
+but formal preflight and window remain two explicit operator-reviewed steps;
+the runner must never chain them automatically. Any readiness receipt is a
+derived check over the existing content-addressed manifests and digests, not a
+second source of evidence authority.
+
 No step expands the transcript, adds a second ResumePoint, introduces a
 TaskGraph/learned planner, auto-completes, fixes a task-specific round count or
 retunes Context/GC/retrieval/packing. Executable defect exits are centralized in
