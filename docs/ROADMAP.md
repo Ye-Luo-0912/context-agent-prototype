@@ -34,7 +34,9 @@ long-live/M15 provider path~~ (done on `7e02488`) → ~~`GOV-STATUS-01`
 reconciliation~~ (closed on `bba1c76`) → ~~commit pending tests/docs~~ (done
 on `e357bed`/`bba1c76`) → ~~record one clean
 source with Ubuntu/Windows CI~~ (recorded: `4e56f69` code, run
-`33663057012`) → ~~selected-path P1 spot-checks~~ (P0/P1 all closed-on-source)
+`33663057012`) → ~~selected-path P1 disposition for this candidate~~
+(accepted for the frozen run; repository-wide residuals remain in
+`AUDIT_TODO.md`)
 → ~~same-checkpoint causal runner~~ (settlement-off candidate skips it) →
 ~~new exact-source product preflight~~ (relay NOT_RUN retained; PinAI tuple
 PASS 2026-09-03) → ~~predeclared M15 window~~ (ran 2026-09-03: valid FAIL
@@ -45,31 +47,25 @@ remain frozen.
 
 ## Ordered route
 
-1. Preserve the latest valid FAIL and do not rerun `784d7aa`. The
-   repository-wide P0/P1 repairs are landed (`615b5ed..6fdb4f0`, CI green);
-   the M10 fault gate was re-run and recorded on `e357bed` (2026-09-03). The
-   2026-09-03 documentation tranche resolved `GOV-STATUS-01` (AGENTS.md
-   reconciliation + README alignment) on `bba1c76`.
-2. Wire the typed retry observer into the formal provider path — done on
-   `7e02488`: the JSONL observer lives in `provider-openai`, the eval formal
-   paths keep it through `driver.rs`, and `agent-compose::model_from_env`
-   now attaches it too (`JSON-RECOVERY-01` residual closed).
-3. Rerun fmt, Clippy, build and the full suite — done locally on the clean
-   tree `4e56f69` (2026-09-03, Windows; all green, observer regressions
-   included). Dual-platform CI is green on that exact code (run
-   `33663057012`, head `11070ac`, 2026-09-03). The clean source for the next
-   preflight is this recorded tree. Context/GC/retrieval/packing selection
-   does not change.
-4. If—and only if—the candidate enables settlement projection, complete the
+1. Preserve the valid 6/12 FAIL at
+   `evidence/m15-window/_windows/1788385151733/` and every earlier valid FAIL.
+   Do not rerun the repaired-source + PinAI/Luna candidate.
+2. Reconstruct a bounded diagnosis from the immutable cells. Keep the diag
+   overflow-edge failures, policy completion-gate tails and the one bounded-
+   framer malformed-event separate until typed evidence establishes a common
+   cause.
+3. Select one materially new candidate from that diagnosis. Do not retune
+   Context/GC/retrieval/packing, weaken resource/protocol bounds, add prompt
+   pressure or introduce a TaskGraph to repair this gate.
+4. Pass the candidate's deterministic regressions, applicable open P1 exits
+   (or exact selected-path exclusion), then record one clean source with the
+   complete local gate and Ubuntu/Windows CI.
+5. If—and only if—the candidate enables settlement projection, complete the
    same-checkpoint `EVAL-CAUSAL-01` fork. A settlement-off candidate skips it.
-5. Freeze source, surface, acceptance identity and serving; run one bounded
-   exact-source product preflight. The 2026-09-03 attempt on the repaired
-   clean source is a typed NOT_RUN (relay `/v1/responses` transport
-   failures, evidence retained under `evidence/m15-preflight/`): the
-   candidate is not rejected, and the preflight is rerun once the serving is
-   restored. Only a green preflight may authorize at
-   most one freshly predeclared 12-cell v4 window. Valid FAIL rejects the
-    candidate; only typed `NOT_RUN` permits rerunning the whole frozen window.
+6. Freeze source, surface, acceptance identity and serving; pass one bounded
+   exact-source product preflight, then predeclare and run at most one 12-cell
+   v4 window. A valid FAIL rejects that candidate; only typed `NOT_RUN` permits
+   rerunning the whole frozen window.
 
 ## Post-M15 candidate order (proposal)
 

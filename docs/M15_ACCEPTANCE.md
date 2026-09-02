@@ -214,12 +214,24 @@ M10 re-audit, formal-path retry observer, governance reconciliation and one
 clean source with local plus dual-platform CI are now recorded (code identity
 `4e56f69`, CI run `33663057012`; see [`STATUS.md`](STATUS.md)).
 
-The first repaired-source exact-product preflight attempt on 2026-09-03 is a
+The first repaired-source exact-product preflight attempt on 2026-09-03 was a
 typed `NOT_RUN`: every `/v1/responses` request exhausted its retry budget on the
-pinned relay transport while `/v1/models` remained reachable. This is serving
-availability, not a candidate FAIL, and permits rerunning the preflight once the
-relay is stable. M15 remains open. A settlement-enabled candidate includes the
-common-prefix causal-fork exit; the current settlement-off base does not.
+local relay while `/v1/models` remained reachable. By user decision the serving
+then moved back to PinAI `/v1`, `gpt-5.6-luna`, Responses, 128,000 context and
+4,096 max output tokens. The same product preflight passed on clean
+`c823a1c` (attempt `r1-attempt5`, source digest `9437882d...`), authorizing one
+freshly predeclared window. The intervening `43e1033` commit banked that
+preflight and its declaration only; it did not change candidate code, fixtures,
+surface or Runtime policy.
+
+That fifth v4 window ran on the predeclared clean source `43e1033` (source
+digest `fd9799c9...`) and is a **valid FAIL: 6/12 pass, 0 NOT_RUN**, mechanically
+reported at `evidence/m15-window/_windows/1788385151733/`. Migrate passed 4/4;
+diag passed 1/4; policy passed 1/4. All providers were healthy, behavior passed
+8/12, and the failures include overflow-edge misses, two completion-gate tails
+and one bounded-framer malformed-event. The candidate is rejected, the window
+is not rerun and M15 remains open. A settlement-enabled future candidate
+includes the common-prefix causal-fork exit; a settlement-off base does not.
 
 ## 1. V1 candidate composition
 
@@ -263,8 +275,9 @@ The three historical valid-FAIL windows remain immutable
 `retry-pilot-cell-v4`; this schema advance adds stable pair/source identity,
 independent acceptance-domain revision/source identity and bounded
 model-request causal-audit fields. It does not reinterpret v3 verdicts.
-The four formal v4 windows are banked as valid FAILs (9/12 on `d1936d4`,
-10/12 on `a25a8a5`, 9/12 on `ab4534a`, 10/12 on `784d7aa`); no v4 window has passed. Each
+Five formal v4 windows are banked as valid FAILs (9/12 on `d1936d4`,
+10/12 on `a25a8a5`, 9/12 on `ab4534a`, 10/12 on `784d7aa`, and 6/12 on
+`43e1033`); no v4 window has passed. Each
 immutable cell directory
 contains the manifest, full event stream, `dimensions.json`, hidden oracle
 records and workspace snapshot hash. The dimensions are persisted facts, not
@@ -386,8 +399,10 @@ surface, reject a serving or close M15.
 
 ## 7. Next execution gate
 
-Before spending another 12-cell window, preserve all four valid FAILs and do
-not rerun the unchanged JSON-hardened source. A materially new candidate must:
+Before spending another 12-cell window, preserve all five valid v4 FAILs and
+the three valid v3 FAILs; do not rerun the rejected `43e1033` source/serving
+candidate. A materially new candidate must first diagnose the latest immutable
+cells, then:
 
 1. pass deterministic attempt-incident versus task-obligation tests, including
    off-surface canonical/wire-name calls which remain visible but create no

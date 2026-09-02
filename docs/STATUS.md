@@ -41,9 +41,11 @@ and sandbox contracts live elsewhere. Experiment facts live in
   [`AUDIT_TODO.md`](AUDIT_TODO.md#continuation-review-verification--2026-09-03-c823a1c).
 - This review does not change the frozen M15 experiment: formal M15 remains
   TaskProgress-on / settlement-off, 3 fixtures × normal/resume × 2 repeats.
-  The repaired-source preflight remains a typed `NOT_RUN` caused by relay
-  transport availability, so M15 is open and no TaskGraph, worker or
-  Self-Iteration work is authorized by this review.
+  At the audited `c823a1c` boundary the governing relay preflight was a typed
+  `NOT_RUN`; the later PinAI preflight and valid FAIL window recorded below
+  supersede that gate state without changing this review's scope. M15 remains
+  open and no TaskGraph, worker or Self-Iteration work is authorized by the
+  review.
 
 **Repository-wide P0/P1 repair tranche (2026-08-31 through 2026-09-02;
 recorded source `615b5ed..6fdb4f0`; dual-platform CI green on `6fdb4f0`,
@@ -86,9 +88,9 @@ run `33624084700`, 2026-09-02):**
   this documentation tranche (2026-09-03): the AGENTS.md M12/M13 wording is
   reconciled to one suspended-claims statement and README is aligned
   (renamed crate, complete crate list, historical `CONTEXT_RUNTIME_TODO.md`,
-  authority pointers); it closes when this commit is recorded.
-- Remaining exits before any new formal window: the freshly predeclared
-  window itself. By user decision (2026-09-03) the serving moved from the
+  authority pointers); it closed on `bba1c76`.
+- The repaired-candidate gate sequence advanced after this tranche. By user
+  decision (2026-09-03) the serving moved from the
   broken localhost relay back to the original PinAI tuple
   (`https://api.pinaic.com/v1`, `gpt-5.6-luna`, Responses, explicit
   protocol, 128,000-token context, 4,096 max output tokens); the
@@ -109,8 +111,8 @@ run `33624084700`, 2026-09-02):**
   recorded clean source with local plus dual-platform CI green (`4e56f69`
   code, run `33663057012`). The historical FAIL packs stay immutable and
   Context/GC/retrieval/packing remain frozen.
-- The 12-cell v4 window on the PinAI tuple is **predeclared 2026-09-03
-  before the run** (M15_ACCEPTANCE §7 item 8): 3 fixtures × normal/resume ×
+- The 12-cell v4 window on the PinAI tuple was **predeclared 2026-09-03
+  before its run** (M15_ACCEPTANCE §7 item 8): 3 fixtures × normal/resume ×
   2 repeats, the product surface (TaskProgress on, settlement and advisory
   candidates off, no counterfactual second request), the pinned serving
   tuple above, one uninterrupted `agent-eval --m15-window` run whose cell
@@ -448,12 +450,12 @@ tranche above):**
   formal-path complete retry evidence and immutable-round schema validation
   remain open in `AUDIT_TODO.md`.
 - M15 remains open. Its shape remains 3 fixtures × normal/resume × 2 repeats =
-  12 cells. Historical v3 FAIL windows remain immutable; the four v4 windows
-  (valid FAILs 9/12 on `d1936d4`, 10/12 on `a25a8a5`, 9/12 on `ab4534a`,
-  10/12 on `784d7aa`)
-  are banked and no v4 window has passed. M12/M13 artifacts remain banked,
-  while `GOV-STATUS-01` still forbids a new closure claim or Self-Iteration
-  transition.
+  12 cells. Historical v3 FAIL windows remain immutable; five v4 valid FAILs
+  are banked: 9/12 on `d1936d4`, 10/12 on `a25a8a5`, 9/12 on `ab4534a`,
+  10/12 on `784d7aa`, and 6/12 on `43e1033`
+  (`_windows/1788385151733`, 0 NOT_RUN). No v4 window has passed.
+  `GOV-STATUS-01` closed on `bba1c76`; M12/M13 claims remain suspended by
+  the open M15 gate, so Self-Iteration remains blocked.
 
 ### Historical evidence chronology (non-authoritative)
 
@@ -1434,48 +1436,27 @@ task-aware, its tail metric does not stop when work reopens, and its live runner
 
 ## Next milestone
 
-The next milestone is a **mechanically convergent execution candidate**, not
-another prompt tweak or live sample. The 2026-08-31/09-02 repair tranche
-closed the selected-path P0/P1 and post-window implementation items on
-`615b5ed..6fdb4f0`; the remaining order is:
+The next milestone is a **materially new, mechanically convergent execution
+candidate**, not another prompt tweak or an immediate rerun. The repaired-source
++ PinAI/Luna candidate was rejected by the valid 6/12 window at
+`_windows/1788385151733`; the current order is:
 
-1. record the M10 fault-gate re-audit on the repaired turn-start/checkpoint
-   transaction (repair landed in `9ba85d3`/`f42a898`/`f622cf3`; the re-audit
-   record, not a new implementation, is the open part) — **done 2026-09-03**,
-   recorded in [`AUDIT_TODO.md`](AUDIT_TODO.md);
-2. wire the typed retry observer into the formal long-live/M15 provider path
-   — `driver.rs` carries it, `long_live.rs`, `fixture_driver.rs` and
-   `agent-compose` do not — and close the residual `JSON-RECOVERY-01`
-   formal-path exit — **done on `7e02488`**: the JSONL observer moved into
-   `provider-openai`, and the formal eval paths plus `agent-compose` share
-   it (the eval paths build their transport through `driver.rs`, so the
-   file-level gap was the product composition root);
-3. land this documentation tranche (AGENTS.md reconciliation, README
-   alignment, repair-status records) so `GOV-STATUS-01` closes on a recorded
-   commit — **done on `bba1c76`**;
-4. commit the pending actor-level protocol-body regression — **done on
-   `e357bed`**; rerun fmt/Clippy/build/full workspace tests, and record one
-   clean source with Ubuntu plus Windows CI on that exact tree — the local
-   half is done: on the clean tree `4e56f69` (2026-09-03, Windows) `cargo
-   fmt --all -- --check`, strict all-target/all-feature Clippy, and the
-   complete all-target workspace test suite all pass (the M10-facing suites
-   are enumerated in the `RUNTIME-CONTEXT-COMMIT-01` re-audit record;
-   provider-openai 101, agent-eval 203, agent-compose 18 include the
-   observer regressions); dual-platform CI is green on that exact code
-   (run `33663057012`, head `11070ac`, 2026-09-03) — this exit is closed;
-5. close or prove out-of-path every P1 item exercised by the candidate; only a
-   settlement-changing candidate additionally needs the same-checkpoint fork;
-6. run one exact-source product preflight, then at most one freshly
-   predeclared M15 window if every deterministic gate remains green — the
-   2026-09-03 preflight attempt on the repaired source came back typed
-   NOT_RUN on relay transport failures (see the remaining-exits record
-   above); the candidate is not rejected and the preflight is rerun once
-   serving is stable;
+1. preserve that window and its predecessors unchanged; do not rerun the
+   rejected source/serving candidate;
+2. diagnose the immutable cell streams: the diag overflow-edge misses, the
+   policy completion-gate tails and the bounded-framer malformed-event are
+   distinct observations until evidence proves a shared cause;
+3. select one bounded candidate from those facts. Do not retune Context/GC,
+   weaken protocol bounds, add a fixed round stop or introduce TaskGraph;
+4. pass the candidate's deterministic failure matrix, the applicable open P1
+   exits (or exact out-of-path proof), and a newly recorded clean local /
+   dual-platform CI source;
+5. run the same-checkpoint causal fork only if settlement projection changes,
+   then one fresh exact-source product preflight and at most one freshly
+   predeclared M15 window.
 
-A base candidate with settlement projection off may proceed after these gates.
-Only a candidate that changes the model-visible settlement projection needs a
-new isolated off/on promotion gate. A valid formal failure rejects that source;
-only a typed `NOT_RUN` permits rerunning the whole frozen window.
+A valid formal failure rejects its exact candidate; only a typed `NOT_RUN`
+permits rerunning that frozen window. Candidate selection is a user decision.
 
 Post-M15 `LT-EVAL-06` development twins remain parked. The deterministic
 `harness_maint_dev` fixture is available, but no TaskGraph, learned planner,

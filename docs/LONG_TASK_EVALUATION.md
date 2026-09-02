@@ -855,10 +855,10 @@ The three retained v2 M15 attempts predate these guarantees and are
 forensic-only. The three historical valid-FAIL formal windows remain v3. The
 prospective schema is `retry-pilot-cell-v4`, adding stable pair/source identity,
 acceptance-declaration identity and bounded request-audit facts; no v4 formal
-window is currently banked.
+window was banked at that point.
 
-Repository-audit correction (2026-08-31; repaired 2026-08-31/09-01): four v4
-valid-FAIL windows are banked. The reporter now reconstructs dimensions and
+Repository-audit correction (2026-08-31; updated 2026-09-03): five v4
+valid-FAIL windows are banked. The reporter reconstructs dimensions and
 verdicts from content-addressed events/hidden verification/workspace records
 and binds window manifests to cell digests rather than paths
 (`M15-RAW-EVIDENCE-01`, `ea821bb`); workspace hashing shares the bounded,
@@ -866,14 +866,14 @@ link-safe allowed-diff domain, oracle timeouts kill/reap their cargo tree, and
 harness failures are failure-monotone (`M15-HARNESS-BOUNDARY-01`, `f57a118`).
 Historical FAIL bundles remain immutable diagnostics; the pre-window
 implementation exits (formal-path retry observer `7e02488`, M10 re-audit
-record, `GOV-STATUS-01` on `bba1c76`) are recorded 2026-09-03, leaving one
-recorded clean source as listed in [`STATUS.md`](STATUS.md).
+record, `GOV-STATUS-01` on `bba1c76`), the PinAI product preflight and the
+latest 6/12 valid FAIL are recorded in [`STATUS.md`](STATUS.md).
 
 Serving preflight status 2026-08-28: a source-bound dirty-tree diagnostic
 `retry_policy_dev` normal cell passed the stricter closure-required profile on
 PinAI `/v1` + `gpt-5.6-luna` + Responses + 128,000 context. It completed in 26
 rounds / 59 calls / 3 failed outputs / 315,468 ms with zero provider retries.
-This pins the serving tuple for the next clean formal window; it does not enter
+This pinned the serving tuple for the next clean formal window at that point; it does not enter
 the 12-cell result. The prior cell used 30 rounds / 53 calls / 7 failures and
 did not close. The samples are too few and tool calls moved in the opposite
 direction, so they prove readiness and expose failure chains, not a causal
@@ -1081,38 +1081,24 @@ closes it as an ordinary turn. Deterministic coverage uses that order.
 
 ### Current delivery order
 
-The latest JSON-hardened formal window (`784d7aa`) is a valid FAIL 10/12. Its
-two policy-normal cells finished the development work but exhausted 48 rounds
-behind pre-dispatch surface incidents recorded as permanent debt and repeatedly
-stale exact proof. Two malformed-tool incidents were recovered; zero final
-malformed outcomes does not prove the model stopped emitting them. Continue in
-this order:
+The latest formal window (`_windows/1788385151733`, 2026-09-03) is a valid FAIL
+6/12 with 0 NOT_RUN on clean source `43e1033` and the PinAI/Luna tuple. Migrate
+passed 4/4; diag passed 1/4; policy passed 1/4. The immutable streams show three
+separate failure surfaces: the overflow-edge behavior miss, long completion-
+gate tails, and one fail-closed bounded-framer malformed-event. Continue in this
+order:
 
-1. Separate `AttemptIncident` from `TaskObligation`; a rejected-before-dispatch
-   call stays measurable and model-visible but never blocks completion.
-2. Derive a bounded `CompletionRepairPlan` from the exact blocker/basis and
-   lease only its resolver. When proof alone blocks an explicit completion
-   intent, run one atomic host-owned proof refresh and recheck the same world.
-3. Move JSON recovery out of the standing prompt: share one replay-boundary and
-   format-regeneration policy across product/eval, then close bounded SSE,
-   per-call protocol state and captured-schema validation before approval.
-4. Pack TaskProgress as whole typed records with state-transition deduplication;
-   keep Context selection, GC, retrieval and transcript history unchanged.
-5. Pass deterministic gates and the complete local/dual-CI source gate. Close
-   selected-path P1 or prove it out-of-path; only a settlement-enabled candidate
-   needs the same-checkpoint causal fork.
-6. Run one new exact-source preflight and at most one freshly predeclared formal
-   window if every prior gate remains green.
-
-**Current status (2026-09-03, `c823a1c`).** Steps 1–5 have landed, the M10
-fault-gate re-audit and formal provider observer are recorded, and the shared
-code identity `4e56f69` passed the complete local source gate plus dual-platform
-CI run `33663057012`. Step 6 has been attempted once on that repaired source but
-is a typed `NOT_RUN`: the pinned relay accepted TCP and served `/v1/models`, then
-closed every `/v1/responses` POST through all bounded retries. The next action is
-only to rerun the exact-source product preflight after serving is stable; no
-formal window, TaskGraph or new execution mechanism is authorized by the
-`NOT_RUN`.
+1. Preserve the window and do not rerun its exact source/serving candidate.
+2. Reconstruct each failure from typed events, verification and final workspace
+   truth; do not merge the three surfaces without evidence.
+3. Select one bounded execution/provider candidate from that diagnosis. Keep
+   Context selection, GC, retrieval, packing and transcript history unchanged.
+4. Pass deterministic failure-path regressions and the applicable open P1 exits
+   or exact selected-path exclusions, then record the complete local/dual-CI
+   source gate.
+5. Run the same-checkpoint causal fork only for a settlement-enabled candidate.
+6. Run one fresh exact-source product preflight and at most one freshly
+   predeclared formal window if every prior gate remains green.
 
 No step expands the transcript, adds a second ResumePoint, introduces a
 TaskGraph/learned planner, auto-completes, fixes a task-specific round count or

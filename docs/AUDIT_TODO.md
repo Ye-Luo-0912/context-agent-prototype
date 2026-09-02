@@ -20,9 +20,11 @@ happy-path tests pass.
 
 The supplied continuation-review synopsis was independently checked against
 the exact clean `main` above, with `ea8deefc873abee13106de92bbbb3ddbaeb2d423`
-as its stated comparison baseline. Its three transient
-`sandbox:/mnt/data/context-agent-prototype-audit/...` appendix files were not
-present in the workspace or attachment cache and are not evidence for any
+as its stated comparison baseline. A recovered copy of the original conversation
+shows that its final file read already failed with `FileNotFoundError`, the final
+message carried `attachments = null`, and the last fetched `main` was
+`e357bed`; the three `sandbox:/mnt/data/context-agent-prototype-audit/...`
+links were therefore never registered artifacts and are not evidence for any
 status below. The source gate was independently rerun: format, all-target /
 all-feature check, strict Clippy, all-target build and the complete all-target
 workspace suite pass (the Windows test run used the bundled Python 3.12 rather
@@ -1151,7 +1153,7 @@ The MIT `LICENSE` and a minimal `inspect_outbound.sh` landed in `6fdb4f0`
 (2026-09-02) with dual-platform CI green on that source. No `docs/state.json`
 authority source was added.
 
-### GOV-STATUS-01 — reconcile milestone authority (**resolved in the 2026-09-03 documentation tranche; closes when that commit is recorded**)
+### GOV-STATUS-01 — reconcile milestone authority (**closed on `bba1c76`**)
 
 `AGENTS.md` previously contained both banked-closure wording ("The platform
 gates M12/M13 closed...") and an instruction not to claim M12/M13 closed
@@ -1170,7 +1172,8 @@ closure, and keep Self-Iteration blocked until the remaining exits land.
 ### Ordered execution and evidence gate
 
 ```text
-latest JSON-hardened candidate REJECTED (valid FAIL 10/12 on 784d7aa)
+repaired-source + PinAI/Luna candidate REJECTED
+  (latest valid FAIL 6/12 on 43e1033; prior 784d7aa FAIL retained)
   -> repository-wide P0 close or exact selected-path exclusion
      [DONE 2026-09-02: all repaired in 615b5ed..6fdb4f0, CI green on 6fdb4f0]
   -> deterministic AttemptIncident / CompletionRepair / JSON replay gates
@@ -1181,9 +1184,7 @@ latest JSON-hardened candidate REJECTED (valid FAIL 10/12 on 784d7aa)
   -> pre-approval schema validation
      [DONE: 33d0395]
   -> full local regression + recorded clean source + Ubuntu/Windows CI
-     [PARTIAL: CI green on 6fdb4f0; the protocol-body regression and doc
-      updates landed on e357bed/bba1c76; the recorded clean source for the
-      next preflight is still to be frozen and CI-banked]
+     [DONE: clean code identity 4e56f69; dual-platform run 33663057012]
   -> M10 fault-gate re-audit on the repaired turn/context transaction
      [DONE 2026-09-03: recorded on e357bed in RUNTIME-CONTEXT-COMMIT-01]
   -> GOV-STATUS-01 reconciliation (AGENTS.md wording + README alignment)
@@ -1191,8 +1192,12 @@ latest JSON-hardened candidate REJECTED (valid FAIL 10/12 on 784d7aa)
   -> wire the typed retry observer into long_live/fixture_driver/agent-compose
      [DONE: 7e02488]
   -> same-checkpoint causal fork only if project_settlement changes
+     [SKIPPED FOR THIS CANDIDATE: project_settlement=false]
   -> new exact-source/product M15 preflight
+     [DONE: relay attempt retained NOT_RUN; PinAI/Luna attempt5 PASS]
   -> at most one freshly predeclared formal 12-cell M15 window
+     [DONE 2026-09-03: valid FAIL 6/12, 0 NOT_RUN, _windows/1788385151733]
+  -> candidate rejected; preserve the window and return to bounded diagnosis
 ```
 
 The settlement candidate gate, if it is run again after deterministic fixes,
@@ -2761,68 +2766,13 @@ observations), and the frozen paired gate then RERAN decision-grade — its
 promotion verdict (FAIL; candidate ended) is recorded in
 `evidence/opportunity-gate/REPORT.md` (2026-08-28 section).
 
-### EVAL-07 — M15 v2 evidence projected the wrong contract (runtime fixed; evidence exit pending)
-
-The three 2026-08-28 M15 attempts cannot be formal evidence. Missing
-`task.complete` was turned into Runtime failure although M15 V1 made closure
-report-only; diagnosis and migration manifests reused the retry-policy pack
-id/digest; provider health came from message substrings; six
-`max_output_tokens` outcomes were labeled transport failures; and aggregate
-Markdown arithmetic drifted from cell facts. The raw bundles remain immutable
-for forensic use, but their ratios, deltas and causal explanations cannot
-select a serving, promote surface v5 or close M15.
-
-The repaired `retry-pilot-cell-v3` path persists an acceptance profile,
-PASS/FAIL/NOT_RUN verdict, actual pack identity/digest, typed failure class
-and independent restored/exact-tuple/continued/turn/task facts. Provider
-transport and harness failure produce NOT_RUN; model output limit produces
-FAIL. The harness writes an exact window manifest and mechanically regenerates
-the report while rejecting mixed identity, duplicate/missing cells, verdict
-drift, absent terminal evidence, event gaps/loss, counter drift and paths
-outside the evidence root. Evidence-write errors are fatal; the formal command
-rejects a dirty tree, partial pack, repeat drift and protocol `auto`. Runtime
-publishes typed failures and provider retry progress rather than making the
-evaluator infer either from text. The deterministic suite is green
-(`cargo test --workspace`, 2026-08-29) and the serving tuple stayed pinned
-by the passing bounded one-cell preflights (both arms). The first formal
-clean-tree 12-cell v3 window ran and was committed 2026-08-29 (window
-`evidence/m15-window/_windows/1787966622822/`, mechanical report, 0 NOT_RUN):
-11/12 PASS; the only failure is `retry_diag_dev` resume r2, which ends
-without satisfying the hidden oracle on the overflow edge. M15 therefore
-remains open — the frozen verdict demands all 12 cells pass, and the diag
-overflow edge is the one recurring failure surface. A second clean-tree v3
-window ran 2026-08-29 at clean HEAD `f625d39`
-(`evidence/m15-window/_windows/1787970773734/`, mechanical report, 0 NOT_RUN,
-cached input metered): 9/12 PASS; all three failures are diag cells (normal
-r1/r2, resume r1), while migrate and policy pass all 8 cells with exact-tuple
-continuation. A third clean-tree v3 window ran 2026-08-29 at clean HEAD
-`779604559f682dddc54018e99e5fb35b0080e965`
-(`evidence/m15-window/_windows/1787973547152/`, 10/12 PASS, rounds/tools
-179/403, cached/input 200,704/1,942,278): the two failures are again diag
-cells; `retry_migrate_dev` + `retry_policy_dev` have passed 24/24 across the
-three windows. All six failing formal diag cells finalize `checked_shl`
-(guards shift-count ≥ 64 only, not bits shifted out), and all six passing
-formal diag cells use `checked_mul`/`saturating_mul`. Formal diag is therefore
-6/12 PASS; including all calibrated same-fixture `diag-smoke` evidence it is
-9/17 PASS. This is a deterministic semantic trap and a model/solver weakness
-on the pinned serving, not a harness or transport defect. M15 remains open.
-
-The original acceptance contract bounded repeats inside one window but did not
-define valid-FAIL retries across windows. Three valid failed windows now make
-that omission decision-relevant: repeated unchanged sampling until a lucky
-12/12 would invalidate the gate. Do not run a fourth unchanged window.
-`M15_ACCEPTANCE.md` now requires a prospective rule: after a source change,
-deterministic and paired convergence gates, and exact-source preflight, exactly
-one predeclared confirmation window is allowed for that candidate. A valid
-failure rejects it and returns to diagnosis. Historical windows remain facts
-and are not retroactively aggregated into a new rule.
-
 ## Closed archive (index only)
 
 Full text: git history of this file.
 
 | ID | Closed as |
 | --- | --- |
+| EVAL-07 | M15 v2 evidence remains forensic-only; the typed v3/v4 reconstruction, content-addressed reporter (`ea821bb`), bounded failure-monotone harness (`f57a118`) and decision-grade windows close the evidence-projection defect. Five v4 valid FAILs are banked through `_windows/1788385151733` (6/12, 0 NOT_RUN); M15 remains open. |
 | 2026-08-10 repair pass | Workspace prefix, git.diff, focus/restore fences, context-service parity, journal/restore |
 | CTX-01..CTX-10 | Episode, residency, fetch/search persist, store, Storage GC, GC ops, materializer, mid-turn signals, clocks, TaskAnchor |
 | CTX-06..CTX-09 | GC/storage ops, materializer budget, working-set signals, lifecycle clocks |
