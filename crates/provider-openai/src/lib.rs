@@ -567,10 +567,15 @@ impl OpenAiProvider {
                                 ));
                             }
                             match framer.push_line(&line) {
-                                Ok(Some(event)) => {
-                                    if event.data == "[DONE]" { break; }
-                                    let event = parse_responses_event(&event.data)
+                                Ok(Some(frame)) => {
+                                    if frame.data == "[DONE]" { break; }
+                                    let event = parse_responses_event(&frame.data)
                                         .map_err(ProtocolError::from)?;
+                                    crate::sse::validate_sse_event_routing(
+                                        frame.event.as_deref(),
+                                        &event,
+                                    )
+                                    .map_err(ProtocolError::from)?;
                                     for chunk in accumulator.apply(&event).map_err(ProtocolError::from)? {
                                         sink.on_chunk(codec.remap_chunk(chunk)).await.map_err(ProtocolError::from)?;
                                     }
@@ -1204,6 +1209,81 @@ mod tests {
         assert_eq!(output.tool_calls[0].arguments, json!({}));
         assert_eq!(output.usage.input_tokens, Some(10));
         assert_eq!(output.usage.output_tokens, Some(2));
+        assert_eq!(output.usage.cached_input_tokens, Some(6));
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn responses_stream_with_declared_event_names_must_agree_with_payload_types() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut buf = vec![0u8; 16 * 1024];
+            let n = socket.read(&mut buf).await.unwrap();
+            let request = String::from_utf8_lossy(&buf[..n]);
+            assert!(request.starts_with("POST /v1/responses HTTP/1.1"));
+            // The event name and the payload type say different things; the
+            // second routing identity must fail closed instead of winning
+            // silently over the payload.
+            let sse = concat!(
+                "event: response.output_item.done\n",
+                "data: {\"type\":\"response.output_item.added\",\"output_index\":0,\"item\":{\"type\":\"function_call\",\"call_id\":\"call_1\",\"name\":\"fs_list\",\"arguments\":\"{}\"}}\n\n",
+                "data: [DONE]\n\n",
+            );
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{sse}",
+                sse.len()
+            );
+            socket.write_all(response.as_bytes()).await.unwrap();
+        });
+
+        let mut config = dummy_config(format!("http://{addr}/v1"));
+        config.protocol = OpenAiProtocol::Responses;
+        let provider =
+            OpenAiProvider::with_client(config, Client::builder().no_proxy().build().unwrap());
+        let error = provider.complete(fs_list_request()).await.unwrap_err();
+        assert!(
+            error.to_string().contains("contradicts the payload type"),
+            "a contradicting SSE event name must surface as a typed protocol error: {error}"
+        );
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn responses_stream_with_matching_event_names_round_trips() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut buf = vec![0u8; 16 * 1024];
+            let n = socket.read(&mut buf).await.unwrap();
+            let request = String::from_utf8_lossy(&buf[..n]);
+            assert!(request.starts_with("POST /v1/responses HTTP/1.1"));
+            let sse = concat!(
+                "event: response.output_item.added\n",
+                "data: {\"type\":\"response.output_item.added\",\"output_index\":0,\"item\":{\"type\":\"function_call\",\"call_id\":\"call_1\",\"name\":\"fs_list\",\"arguments\":\"\"}}\n\n",
+                "event: response.function_call_arguments.delta\n",
+                "data: {\"type\":\"response.function_call_arguments.delta\",\"output_index\":0,\"item_id\":\"fc_1\",\"delta\":\"{}\"}\n\n",
+                "event: response.completed\n",
+                "data: {\"type\":\"response.completed\",\"response\":{\"usage\":{\"input_tokens\":10,\"output_tokens\":2,\"input_tokens_details\":{\"cached_tokens\":6}}}}\n\n",
+                "data: [DONE]\n\n",
+            );
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{sse}",
+                sse.len()
+            );
+            socket.write_all(response.as_bytes()).await.unwrap();
+        });
+
+        let mut config = dummy_config(format!("http://{addr}/v1"));
+        config.protocol = OpenAiProtocol::Responses;
+        let provider =
+            OpenAiProvider::with_client(config, Client::builder().no_proxy().build().unwrap());
+        let output = provider.complete(fs_list_request()).await.unwrap();
+        assert_eq!(output.tool_calls.len(), 1);
+        assert_eq!(output.tool_calls[0].name, "fs.list");
+        assert_eq!(output.tool_calls[0].arguments, json!({}));
         assert_eq!(output.usage.cached_input_tokens, Some(6));
         server.await.unwrap();
     }

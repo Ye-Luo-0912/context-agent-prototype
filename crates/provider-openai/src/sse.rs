@@ -163,6 +163,31 @@ fn protocol_event_error(message: impl Into<String>) -> AgentError {
     }
 }
 
+/// Validate that the SSE `event:` name agrees with the JSON payload's own
+/// `type` field when both are present. Some relays name the stream frame
+/// differently from the payload's routing identity; the payload `type` is
+/// the authority for the state machines, so a contradicting `event:` name
+/// must fail closed instead of being silently ignored.
+///
+/// Payloads without a `type` field (Chat Completions shapes carry only
+/// `choices`/`usage`/`error`) have no second routing identity to compare;
+/// the payload remains the sole authority there.
+pub fn validate_sse_event_routing(event_name: Option<&str>, payload: &Value) -> AgentResult<()> {
+    let Some(name) = event_name else {
+        return Ok(());
+    };
+    let Some(declared_type) = payload.get("type").and_then(Value::as_str) else {
+        return Ok(());
+    };
+    if name == declared_type {
+        return Ok(());
+    }
+    Err(AgentError::ModelProtocol {
+        kind: ModelProtocolErrorKind::MalformedEvent,
+        message: format!("SSE event `{name}` contradicts the payload type `{declared_type}`"),
+    })
+}
+
 /// Parse one Chat Completions SSE payload.
 ///
 /// A syntactically valid object that does not carry any Chat Completions
@@ -427,6 +452,45 @@ mod tests {
         let event = framer.push_line("").unwrap().expect("blank boundary");
         assert_eq!(event.event.as_deref(), Some("response.custom"));
         assert_eq!(event.data, "payload");
+    }
+
+    #[test]
+    fn routing_validation_accepts_matching_event_and_payload_type() {
+        let payload = serde_json::json!({"type": "response.output_text.delta", "delta": "x"});
+        assert!(
+            validate_sse_event_routing(Some("response.output_text.delta"), &payload).is_ok(),
+            "a matching event name and payload type stay routable"
+        );
+        assert!(
+            validate_sse_event_routing(None, &payload).is_ok(),
+            "a missing event name leaves the payload type authoritative"
+        );
+    }
+
+    #[test]
+    fn routing_validation_ignores_payloads_without_a_type_field() {
+        let chat_payload = serde_json::json!({"choices": [{"delta": {}}]});
+        assert!(
+            validate_sse_event_routing(Some("chat.completion.chunk"), &chat_payload).is_ok(),
+            "a payload without its own type field has no second routing identity to compare"
+        );
+    }
+
+    #[test]
+    fn routing_validation_rejects_a_contradicting_event_name() {
+        let payload = serde_json::json!({"type": "response.output_text.delta", "delta": "x"});
+        let error = validate_sse_event_routing(Some("response.output_item.added"), &payload)
+            .expect_err("a contradicting event name must fail closed");
+        assert!(
+            matches!(
+                error,
+                AgentError::ModelProtocol {
+                    kind: ModelProtocolErrorKind::MalformedEvent,
+                    ..
+                }
+            ),
+            "routing contradiction is a typed malformed-event protocol error: {error:?}"
+        );
     }
 
     #[test]
