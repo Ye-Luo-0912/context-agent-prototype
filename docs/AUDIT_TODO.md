@@ -16,6 +16,37 @@ M12/M13 must close before Self-Iteration. Do not add a database, vector
 search, or learned ranking. Do not claim a milestone complete because
 happy-path tests pass.
 
+## Continuation review verification — 2026-09-03 (`c823a1c`)
+
+The supplied continuation-review synopsis was independently checked against
+the exact clean `main` above, with `ea8deefc873abee13106de92bbbb3ddbaeb2d423`
+as its stated comparison baseline. Its three transient
+`sandbox:/mnt/data/context-agent-prototype-audit/...` appendix files were not
+present in the workspace or attachment cache and are not evidence for any
+status below. The source gate was independently rerun: format, all-target /
+all-feature check, strict Clippy, all-target build and the complete all-target
+workspace suite pass (the Windows test run used the bundled Python 3.12 rather
+than the non-functional Windows Store alias).
+
+The review correctly identifies a missing cross-run query/projection plane, no
+authoritative structured TaskGraph, and an incomplete product operations
+surface. Those are post-M15 direction, not evidence that the existing Runtime,
+Context, recovery or effect substrates are absent. Its implementation list is
+partly stale: committed-prefix replay, required-context misses, strict provider
+parsing, transactional startup/admit slices, typed ACK debt, durable execution
+facts, sidecar framing errors, tool-inventory parity and split prompt accounting
+already have landed code. This tranche therefore creates no duplicate defect
+ids. It narrows the remaining seams under `COMPOSE-LIFECYCLE-01`,
+`CONTEXT-IO-01`, `EFFECT-ACK-01`, `SIDECAR-ERROR-01` and
+`TOOL-MANIFEST-01`, and records `DURABLE-FACTS-01` plus `EVAL-ACCOUNT-01`
+closed below.
+
+The synopsis's settlement off/on design is not formal M15. The frozen formal
+window remains TaskProgress-on / settlement-off; only a future candidate that
+enables settlement projection needs the separate same-checkpoint causal fork.
+The directional Chronicle/TaskGraph order is recorded as a guarded post-M15
+proposal in [`ROADMAP.md`](ROADMAP.md#post-m15-candidate-order-proposal).
+
 ## Current merged audit — 2026-08-30 (`ea8deef`)
 
 This section was the authoritative merged-audit tranche and active pre-M15
@@ -1003,67 +1034,107 @@ transcript, and do not build this path before measurement shows it is exercised.
 
 ### P1 — V1 correctness hardening
 
-#### COMPOSE-LIFECYCLE-01 — make startup transactional (**open**)
+Every landed slice named below is part of the `4e56f69` code identity whose
+local source gate and dual-platform CI run `33663057012` are recorded in
+[`STATUS.md`](STATUS.md). An **open** heading now names only its explicit
+residual; it does not mean the landed slice is absent.
 
-`compose()` starts the host before later fallible journal/authority/service
-preparation and has no outer rollback. Move all possible fallible preparation
-before `host.start()`; absent optional services may remain optional, but a
-present wrong type fails. Add a minimal startup guard only if a post-start
-fallible seam remains. Exit tests prove every failure point leaves no serving
-child or half-built runtime. `ModuleHost::start` must reject duplicate start,
-`RuntimeInstance::spawn` must prove the host reached Serving, and an isolated
-evaluator that intentionally uses a narrower composition must label itself
-non-product-equivalent.
+#### COMPOSE-LIFECYCLE-01 — make startup transactional (**open — transaction body landed on `e566615`; optional-service type residual remains**)
 
-#### CONTEXT-IO-01 — remove lock-across-I/O and loss-on-export (**open**)
+`e566615` moved fallible journal/authority/service preparation before
+`host.start()`, rolls the sole post-start reconcile seam back, rejects duplicate
+`ModuleHost::start`, and refuses `RuntimeInstance::spawn` over an unstarted host.
+The failure and lifecycle tests cover locked preparation, post-start rollback,
+module-start rollback, duplicate start and the serving assertion; narrowed eval
+compositions are labelled non-product-equivalent.
 
-`Admit` holds the Context state lock across store I/O, and ledger export can
-lose `mem::take` rows on write/rename failure. Use plan/revision under lock,
-unlocked read, then revision-check/commit. On export failure merge rows back
-into the bounded ledger and move blocking temp/sync/rename work off the async
-hot path. Exit proves a slow read does not block unrelated Context work and an
-export failure loses no row. Store/readiness error truth is owned by
-`CONTEXT-REQUIRED-01`; do not retune GC.
+The remaining defect is typed optional lookup. `ServiceRegistry::event_store()`
+and `artifact_store()` currently turn every `get()` error into `None`, so a
+registered capability with the wrong concrete type is indistinguishable from an
+absent optional service. Preserve absence as optional, but return an error for a
+present wrong type. Exit adds both positive absence and negative wrong-type
+tests without weakening the existing startup rollback matrix.
 
-#### EFFECT-ACK-01 — persist unresolved ACK debt (**open**)
+#### CONTEXT-IO-01 — remove lock-across-I/O and loss-on-export (**open — admit/export slice landed on `c7ed011`; materialization/catalog transaction residual remains**)
 
-Core ACK failure is logged but a receipt still returns as if clean. Preserve
-the real receipt plus typed unresolved debt/disposition, event/checkpoint it,
-reconcile it on restore and fence recovery/completion. Never pretend an
-already-applied effect can be rolled back. Exit covers Applied/NotApplied/
-Ambiguous debt through restart. The persisted receipt is the typed settlement
-defined by `EFFECT-ACK-CLASS-01`; a boolean `applied` field is not an acceptable
-serialization or migration fallback.
+`c7ed011` plans external `Admit` under the state lock, performs the checked
+store read outside it, revalidates on commit, and merges bounded lifecycle rows
+back after a failed ledger write/rename. The slow-read and failed-export tests
+prove those two original failures. GC, storage GC and store reconcile already
+use the engine operation gate around plan/I/O/commit, and restore validates a
+scratch replacement before committing it.
 
-#### DURABLE-FACTS-01 — make typed execution facts replayable (**open**)
+Two transactional seams remain. `materialize()` plans foreground/required store
+reads, releases the state lock for I/O, then commits without the operation gate
+or a captured-revision check; a concurrent whole-state replacement can therefore
+make the realized plan stale. External scope promotion also mutates catalog-
+relevant descriptor fields without marking the external catalog dirty. Exit
+requires a concurrent restore/GC regression that cannot publish a stale
+materialization, plus a search/inspect regression for external promotion. Keep
+Context selection and GC scoring frozen.
 
-Native facts currently survive in reserved output metadata, but replay supplies
-`facts: None` and loses their typed semantics. Add top-level versioned facts to
-`ToolFinished`, prefer them on replay, retain metadata fallback for old events,
-repair `TaskCompleted.task_id`, then remove fallback only after migration. New
-and legacy event fixtures must rebuild the same typed observation.
+#### EFFECT-ACK-01 — persist unresolved ACK debt (**open — typed debt/event/fence landed on `245b2a6`; durable lifecycle residual remains**)
 
-#### SIDECAR-ERROR-01 — preserve error categories across process boundaries (**open**)
+`245b2a6` preserves the real typed receipt when broker acknowledgement fails,
+emits bounded `EffectAckDebt`, enters the Runtime recovery fence and refuses
+later mutation. Existing tests cover the truthful Applied debt, event and live
+fence, while the broker journal truthfully reopens dispatched-without-ACK as
+ambiguous rather than strengthening it.
 
-Context sidecar exposes string-only errors and its process main ignores
-`serve_session()` failure. Use a bounded typed error envelope with category and
-retryability parity; terminal protocol/I/O failure exits non-zero. In-process
-and sidecar conformance cases must classify the same injected errors identically.
+The debt itself is not yet a checkpointed lifecycle: `RuntimeCheckpoint` carries
+no unresolved ACK-debt set, there is no typed resolved event/operation, and the
+restart matrix does not resolve Applied/NotApplied/Ambiguous debts end to end.
+Add the bounded checkpoint/run-status projection and explicit reconciliation
+path before closing this item. Never pretend an already-applied effect rolled
+back, and never serialize the typed settlement as a boolean.
 
-#### TOOL-MANIFEST-01 — align the actual model surface (**open**)
+#### DURABLE-FACTS-01 — make typed execution facts replayable (**closed on `c0c1c5c`**)
 
-Registry, JSON inventory and conformance expectations disagree about
-`task.complete`. First align inventory with the actual v5 production surface,
-persist the evaluated surface/schema digest and fail closed when a row cannot be
-inspected. A single host-owned generated manifest may follow as a separate
-change; do not combine it with M15 algorithm work.
+`ToolFinished` now carries a versioned top-level `ExecutionFactsEnvelope`.
+Runtime stamps it from trusted native facts; replay validates and prefers it,
+retains the reserved-metadata fallback for legacy events, and fails closed on
+an unknown envelope version. `TaskCompleted` replay uses the event's real
+`task_id`. Tests prove top-level precedence, legacy fallback, old/new semantic
+equivalence, invalid-version refusal and task completion identity. The fallback
+may be removed only under a separately versioned migration.
 
-#### EVAL-ACCOUNT-01 — separate restored protocol from Context cost (**open**)
+#### SIDECAR-ERROR-01 — preserve error categories across process boundaries (**open — framing envelope landed on `726f2a5`; semantic parity residual remains**)
 
-Prompt historical-context accounting currently mixes restored protocol bodies
-into selected Context cost. Record those layers independently and reconstruct
-both from events. Episode terminal boundaries are owned and tested by
-`EVAL-EPISODE-PAIR-01`, not duplicated here.
+`726f2a5` introduced a bounded `ServiceErrorEnvelope` with category,
+retryability and message, and makes terminal framing/protocol failures exit
+non-zero. Malformed JSON/UTF-8/EOF/version/budget cases and clean EOF are
+covered.
+
+Engine semantics still collapse at the boundary: the service currently maps
+every `ContextEngine` error to `Engine, retryable=false`, and the adapter wraps
+the envelope back into a generic `AgentError::Context` string. Storage,
+`RecoveryRequired` and retryability therefore cannot drive the same Runtime
+decision as their in-process forms. Exit injects those categories through both
+adapters and proves identical typed decisions; bounded diagnostic text remains
+non-authoritative.
+
+#### TOOL-MANIFEST-01 — align the actual model surface (**open — v5 parity landed on `23abe1c`; evaluated-identity persistence remains**)
+
+`23abe1c` aligned `TOOL_INVENTORY.json` with the actual v5 production surface,
+made unknown/uninspectable rows and default-surface drift fail closed, and
+computes a stable surface/schema digest. The digest is currently returned only
+to the caller/test; it is not assigned to the conformance report or persisted
+with the evaluated run/evidence identity. Wire that existing digest into the
+real report/evidence path before closing the item.
+
+A single host-owned generated manifest may be evaluated later as a separate
+post-M15 simplification. It is not required to prove current parity and must not
+be mixed with M15 algorithm work.
+
+#### EVAL-ACCOUNT-01 — separate restored protocol from Context cost (**closed on `83cbd60`; actor path proved on `e357bed`**)
+
+Prompt accounting now reports `restored_protocol_tokens` independently and
+excludes those rehydrated bodies from `historical_context_tokens`; the event and
+eval aggregate retain both fields, with zero-default compatibility for legacy
+records. Unit coverage proves the split and aggregation, while the actor-level
+checkpointed body regression on `e357bed` proves the real model request and
+`ModelUsed` accounting path. Episode terminal boundaries remain owned by
+`EVAL-EPISODE-PAIR-01`.
 
 ### P2 candidates — not actionable before measurement
 

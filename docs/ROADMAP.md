@@ -67,7 +67,38 @@ remain frozen.
    candidate is not rejected, and the preflight is rerun once the serving is
    restored. Only a green preflight may authorize at
    most one freshly predeclared 12-cell v4 window. Valid FAIL rejects the
-   candidate; only typed `NOT_RUN` permits rerunning the whole frozen window.
+    candidate; only typed `NOT_RUN` permits rerunning the whole frozen window.
+
+## Post-M15 candidate order (proposal)
+
+This is a directional proposal extracted from the verified 2026-09-03
+continuation review. It does not add a milestone, change the current gate, or
+authorize work before M15 closes:
+
+```text
+M15
+  -> LT-EVAL-06 / Reliable Local Agent breadth
+  -> rebuildable Run Catalog / Execution Chronicle
+  -> conditional serial TaskGraph
+  -> worker / multi-Agent capability execution
+  -> Self-Iteration
+```
+
+The Chronicle candidate is a disposable, rebuildable projection over domain
+journals, the committed Runtime-event prefix and validated checkpoints. It must
+reuse the event-driven `RunStateAggregator` direction, cannot become a second
+`TaskManager`, and cannot drive effect commit or recovery authority. A first
+projection may index Run, Task, Turn/episode, Operation, Effect, Checkpoint,
+Completion and recovery debt. The current authority plane has no stable
+step identity, so it must not invent `StepRecord` rows before a separately
+accepted TaskGraph/typed-step contract. Raw traces remain filesystem artifacts;
+no database or storage choice is accepted by this proposal.
+
+TaskGraph remains conditional on Chronicle evidence and starts serially if
+accepted. Worker parallelism, multi-Agent delegation and recursive improvement
+stay later because they add workspace conflicts, leases, consistent-cut
+checkpointing and promotion authority. M12/M13 claims remain suspended as
+recorded above, and Self-Iteration remains blocked by the governing gates.
 
 ## Historical implementation notes (non-ordering)
 

@@ -182,14 +182,14 @@ malformed arguments on `ab4534a`. The harness fix removed its target
 failure mode and left a model task-execution failure on that fixture;
 per §5 the valid FAIL rejects the candidate and M15 remains open.
 
-The uncommitted post-window repair candidate removes that standing JSON
-sentence and moves recovery into the protocol: sink-declared replay boundaries,
-one immediate format regeneration independent of transport backoff, and typed
-attempt incidents which cannot become task completion debt. It also emits a
-basis-stamped, single-stage completion repair snapshot. These are development
-changes only; they do not reinterpret the `784d7aa` verdict or authorize a new
-window. Bounded SSE framing, per-call terminal state and captured-schema
-validation remain required before a future source pin.
+The post-window repair candidate is now a committed repair chain. It removes
+the standing JSON sentence, moves bounded format recovery into the protocol,
+separates attempt incidents from task obligations, emits a basis-stamped
+completion-repair plan, validates the captured round schema before approval,
+and fails closed on malformed terminal protocol state. The related Runtime,
+replay, composition, Context, sidecar, tool-inventory and accounting slices are
+recorded in [`AUDIT_TODO.md`](AUDIT_TODO.md). These changes do not reinterpret
+the `784d7aa` verdict or authorize a window by themselves.
 
 Post-window diagnosis (2026-08-31,
 `crates/agent-eval/evidence/m15-diagnosis-closure-gate/REPORT.md`)
@@ -206,26 +206,26 @@ fixture's hidden checks also bind implementation detail (needle text)
 and flag three equivalently correct implementations false. Per §5 the
 valid FAIL rejects the candidate; M15 remains open.
 
-The later Completion Convergence implementation and report do not justify
-another window. The original review found split completion authority,
-continuation advancing the directive epoch, pre-success all-criterion coverage
-fan-out and replay of an uncommitted suffix. Candidate fixes landed in the
-merged audit (`a3bd23f`): host declaration-bound receipts, prospective
-  terminal checkpoints and explicit replay barriers. Their local integrated
-  matrices are green and Windows CI is green, but the Ubuntu CI exit is not yet
-  banked (see `BASELINE-01` in [`AUDIT_TODO.md`](AUDIT_TODO.md)). The experiment also
-changed the whole TaskProgress and checked-file GC projection between arms.
-Preserve its checker's mechanical FAIL, but classify settlement causality as
-`INVALID/CONFOUNDED`. Close the selected-path merged P0 queue in
-[`AUDIT_TODO.md`](AUDIT_TODO.md) before spending another formal window.
-A settlement-enabled candidate includes the common-prefix causal-fork exit; a
-settlement-off base does not.
+The later Completion Convergence implementation and report still do not justify
+another window. Its experiment changed the whole TaskProgress and checked-file
+GC projection between arms, so preserve the checker's mechanical FAIL while
+classifying settlement causality as `INVALID/CONFOUNDED`. The candidate fixes,
+M10 re-audit, formal-path retry observer, governance reconciliation and one
+clean source with local plus dual-platform CI are now recorded (code identity
+`4e56f69`, CI run `33663057012`; see [`STATUS.md`](STATUS.md)).
+
+The first repaired-source exact-product preflight attempt on 2026-09-03 is a
+typed `NOT_RUN`: every `/v1/responses` request exhausted its retry budget on the
+pinned relay transport while `/v1/models` remained reachable. This is serving
+availability, not a candidate FAIL, and permits rerunning the preflight once the
+relay is stable. M15 remains open. A settlement-enabled candidate includes the
+common-prefix causal-fork exit; the current settlement-off base does not.
 
 ## 1. V1 candidate composition
 
 | plane | evidence | status |
 | --- | --- | --- |
-| Platform gates | M12/M13 clean-tree closure-audit artifacts in `evidence/platform-closure/{m12,m13}/` | evidence banked; overall status wording pending `GOV-STATUS-01` |
+| Platform gates | M12/M13 clean-tree closure-audit artifacts in `evidence/platform-closure/{m12,m13}/` | evidence banked; `GOV-STATUS-01` reconciled on `bba1c76`; closure claims remain suspended until the M15-facing exits recorded in `STATUS.md` hold |
 | Context | frozen `context-mech.v2` 12-cell A/C evidence in `evidence/context-mech/`; no policy retune or rerun | banked |
 | Tool Surface | edit-gate v4 archival window plus deterministic crash/race/journal/disk-full coverage; production model surface remains v5; catalog-cold `fs.mkdir` baseline retained conservatively, recovery source behind a default-off switch | banked mechanisms; the `TOOL-DIR-SURFACE-01` deterministic mechanism is green but its 24-cell live run had zero treatment exposure and is not folded into M15; the v5 `task.complete` availability change is not promoted by the invalid M15 attempts |
 | Execution coherence | Convergence Bench 4/4 plus `longflow-post-obligation-2026-08-23/` | banked |

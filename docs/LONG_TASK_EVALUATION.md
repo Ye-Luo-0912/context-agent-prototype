@@ -1104,6 +1104,16 @@ this order:
 6. Run one new exact-source preflight and at most one freshly predeclared formal
    window if every prior gate remains green.
 
+**Current status (2026-09-03, `c823a1c`).** Steps 1–5 have landed, the M10
+fault-gate re-audit and formal provider observer are recorded, and the shared
+code identity `4e56f69` passed the complete local source gate plus dual-platform
+CI run `33663057012`. Step 6 has been attempted once on that repaired source but
+is a typed `NOT_RUN`: the pinned relay accepted TCP and served `/v1/models`, then
+closed every `/v1/responses` POST through all bounded retries. The next action is
+only to rerun the exact-source product preflight after serving is stable; no
+formal window, TaskGraph or new execution mechanism is authorized by the
+`NOT_RUN`.
+
 No step expands the transcript, adds a second ResumePoint, introduces a
 TaskGraph/learned planner, auto-completes, fixes a task-specific round count or
 retunes Context/GC/retrieval/packing. Executable defect exits are centralized in

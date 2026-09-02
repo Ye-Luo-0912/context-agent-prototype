@@ -18,6 +18,33 @@ and sandbox contracts live elsewhere. Experiment facts live in
 
 ## Now
 
+**Continuation-review verification (2026-09-03; audited source
+`c823a1c2641099ccd42517c4ec96c6ebbe2ca953` against
+`ea8deefc873abee13106de92bbbb3ddbaeb2d423`):**
+
+- The supplied review synopsis was checked against the current code, tests,
+  committed evidence and git history; its transient `sandbox:/mnt/data/...`
+  appendix is not treated as repository evidence. The worktree was clean and
+  `main` matched `origin/main` at the audited source.
+- The local source gate was rerun: `cargo fmt --all -- --check`,
+  `cargo check --workspace --all-targets --all-features`, strict all-target /
+  all-feature Clippy, `cargo build --workspace --all-targets`, and the complete
+  all-target workspace suite all pass. On this Windows host the test command
+  needs the bundled Python 3.12 ahead of the Windows Store `python.exe` stub;
+  the uncorrected stub produced only exit `9009`, while the corrected full run
+  passed.
+- The review's high-level product diagnosis is accepted: the trusted Runtime,
+  Context, effect and recovery substrate is substantially formed, while a
+  cross-run queryable execution projection and the product operation surface
+  remain post-M15 work. Several proposed "next" repairs were already landed;
+  the exact remaining seams and closure records are reconciled in
+  [`AUDIT_TODO.md`](AUDIT_TODO.md#continuation-review-verification--2026-09-03-c823a1c).
+- This review does not change the frozen M15 experiment: formal M15 remains
+  TaskProgress-on / settlement-off, 3 fixtures × normal/resume × 2 repeats.
+  The repaired-source preflight remains a typed `NOT_RUN` caused by relay
+  transport availability, so M15 is open and no TaskGraph, worker or
+  Self-Iteration work is authorized by this review.
+
 **Repository-wide P0/P1 repair tranche (2026-08-31 through 2026-09-02;
 recorded source `615b5ed..6fdb4f0`; dual-platform CI green on `6fdb4f0`,
 run `33624084700`, 2026-09-02):**
