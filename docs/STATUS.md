@@ -53,7 +53,7 @@ run `33624084700`, 2026-09-02):**
   edge-triggered TaskProgress packing (`531a77e`, `df2f72c`); the production
   tool inventory aligned and fail-closed (`23abe1c`); restored protocol
   bodies accounted apart from selected-context cost (`83cbd60`, actor
-  regression in the uncommitted `protocol_bodies` test).
+  regression committed on `e357bed`).
 - Governance: `GOV-MAINT-01` is closed — `LICENSE` (MIT) and a minimal
   `inspect_outbound.sh` landed in `6fdb4f0`. `GOV-STATUS-01` is resolved in
   this documentation tranche (2026-09-03): the AGENTS.md M12/M13 wording is

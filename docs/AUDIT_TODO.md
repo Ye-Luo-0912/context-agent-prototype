@@ -264,9 +264,10 @@ Validation snapshot:
   uncommitted Runtime work changed under that command and was excluded from
   this review cut. No local result substitutes for recorded dual-platform CI;
 - the repair tranche ends at `6fdb4f0` with dual-platform CI green on that
-  exact source (run `33624084700`, 2026-09-02). The uncommitted
-  actor-level protocol-body regression and this documentation tranche are the
-  only tree deltas beyond that recorded source.
+  exact source (run `33624084700`, 2026-09-02). The actor-level
+  protocol-body regression (`e357bed`), the doc tranche (`bba1c76`,
+  `3888553`, `345fbd0`), and the observer wiring (`7e02488`) are the tree
+  deltas beyond that recorded source.
 
 ### New P0 — authority, recovery and acceptance truth
 
@@ -1105,18 +1106,19 @@ latest JSON-hardened candidate REJECTED (valid FAIL 10/12 on 784d7aa)
      [DONE 2026-08-31..09-02: 615b5ed, b148b4d, d92b250, 1768914, 33d0395,
       531a77e, df2f72c and regressions]
   -> close the dfb9ade Responses terminal-state defects + typed retry evidence
-     [DONE: 1768914, f528a92, 328ec5d; FORMAL-PATH OBSERVER STILL MISSING]
+     [DONE: 1768914, f528a92, 328ec5d; formal-path/product observer 7e02488]
   -> pre-approval schema validation
      [DONE: 33d0395]
   -> full local regression + recorded clean source + Ubuntu/Windows CI
-     [PARTIAL: CI green on 6fdb4f0; the uncommitted protocol-body regression
-      and doc updates must land and be re-recorded]
+     [PARTIAL: CI green on 6fdb4f0; the protocol-body regression and doc
+      updates landed on e357bed/bba1c76; the recorded clean source for the
+      next preflight is still to be frozen and CI-banked]
   -> M10 fault-gate re-audit on the repaired turn/context transaction
-     [OPEN: repair landed, audit record pending]
+     [DONE 2026-09-03: recorded on e357bed in RUNTIME-CONTEXT-COMMIT-01]
   -> GOV-STATUS-01 reconciliation (AGENTS.md wording + README alignment)
-     [RESOLVED IN THE 2026-09-03 DOC TRANCHE; closes when recorded]
+     [DONE: bba1c76]
   -> wire the typed retry observer into long_live/fixture_driver/agent-compose
-     [OPEN]
+     [DONE: 7e02488]
   -> same-checkpoint causal fork only if project_settlement changes
   -> new exact-source/product M15 preflight
   -> at most one freshly predeclared formal 12-cell M15 window
