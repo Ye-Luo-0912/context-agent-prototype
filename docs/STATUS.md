@@ -87,18 +87,21 @@ run `33624084700`, 2026-09-02):**
   reconciled to one suspended-claims statement and README is aligned
   (renamed crate, complete crate list, historical `CONTEXT_RUNTIME_TODO.md`,
   authority pointers); it closes when this commit is recorded.
-- Remaining exits before any new formal window: a green exact-source product
-  preflight, then at most one freshly predeclared window. The first preflight
-  attempt on the repaired clean source ran 2026-09-03 and is a typed
-  **NOT_RUN** (`crates/agent-eval/evidence/m15-preflight/`, source tree
-  digest `83b47da5...`, retained attempts 2–4): every model call to the
-  pinned relay's `/v1/responses` failed at connection level (the relay
-  accepts TCP and then closes on POST while `/v1/models` still answers 200)
-  across the full per-call retry budget and all three cell-level attempts.
-  This is the same relay transport-failure class that censored the earlier
-  serving-switch window; it is a serving availability problem, not a
-  candidate FAIL, so the candidate is not rejected and the preflight may be
-  rerun once the relay is restored. All other implementation exits are
+- Remaining exits before any new formal window: the freshly predeclared
+  window itself. By user decision (2026-09-03) the serving moved from the
+  broken localhost relay back to the original PinAI tuple
+  (`https://api.pinaic.com/v1`, `gpt-5.6-luna`, Responses, explicit
+  protocol, 128,000-token context, 4,096 max output tokens); the
+  exact-source product preflight on that tuple **PASSED** the same day on
+  the clean tree (attempt `r1-attempt5` under `evidence/m15-preflight/`,
+  source tree digest `9437882d...`, serving recorded in the attempt
+  manifest): `retry_policy_dev` normal, product surface, behavior/diff
+  pass, closure completed, provider healthy, 16 model rounds / 39 tool
+  calls / 0 failed outputs, wall 192,596 ms, hidden oracle green. The
+  earlier relay attempt is a retained NOT_RUN (see below);
+  `--m15-preflight --evidence-dir` was not honored by the subcommand, so
+  the attempts share the directory and are attributed by their per-attempt
+  serving manifests. All other implementation exits are
   recorded: the M10 fault-gate re-audit (2026-09-03,
   `RUNTIME-CONTEXT-COMMIT-01` in [`AUDIT_TODO.md`](AUDIT_TODO.md)),
   `GOV-STATUS-01` (`bba1c76`), the actor protocol-body regression
@@ -106,6 +109,18 @@ run `33624084700`, 2026-09-02):**
   recorded clean source with local plus dual-platform CI green (`4e56f69`
   code, run `33663057012`). The historical FAIL packs stay immutable and
   Context/GC/retrieval/packing remain frozen.
+- The 12-cell v4 window on the PinAI tuple is **predeclared 2026-09-03
+  before the run** (M15_ACCEPTANCE §7 item 8): 3 fixtures × normal/resume ×
+  2 repeats, the product surface (TaskProgress on, settlement and advisory
+  candidates off, no counterfactual second request), the pinned serving
+  tuple above, one uninterrupted `agent-eval --m15-window` run whose cell
+  directories land under
+  `crates/agent-eval/evidence/m15-window/_windows/<timestamp>/`. The exact
+  clean source identity is recorded at launch; no source change happens
+  during the run, the frozen-window rules of M15_ACCEPTANCE §5 apply, and
+  the mechanically regenerated report is the only accepted verdict. Valid
+  FAIL rejects the candidate; only a typed NOT_RUN permits a whole-window
+  rerun.
 
 **Repository-wide architecture audit (2026-08-31; started at `c8b9dbb`,
 incrementally reviewed through `c55429c`; findings now repaired by the

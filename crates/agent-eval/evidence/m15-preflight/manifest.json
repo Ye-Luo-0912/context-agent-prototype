@@ -1,36 +1,36 @@
 {
   "cell": {
-    "dir": "crates/agent-eval/evidence/m15-preflight\\retry_policy_dev-normal\\r1-attempt4\\dynamic",
+    "dir": "crates/agent-eval/evidence/m15-preflight\\retry_policy_dev-normal\\r1-attempt5\\dynamic",
     "mode": "normal",
     "pack_id": "retry_policy_dev",
     "repeat": 1,
     "repeats": 1
   },
   "outcome": {
-    "behavior": "not_run",
-    "closure": "failed",
+    "behavior": "pass",
+    "closure": "completed",
     "continuation": "n/a",
     "diff": "pass",
-    "error": "phase one failed: transport error (retryable=true): request failed: error sending request for url (http://127.0.0.1:8787/v1/responses)",
-    "model_rounds": 1,
-    "observed_behavior": "fail",
-    "passed": false,
-    "provider_health": "transport_failed",
-    "self_check": "not_run",
-    "task_completed": false,
-    "turn_completed": false,
-    "verdict": "not_run",
-    "wall_ms": 59625
+    "error": null,
+    "model_rounds": 16,
+    "observed_behavior": "pass",
+    "passed": true,
+    "provider_health": "healthy",
+    "self_check": "pass",
+    "task_completed": true,
+    "turn_completed": true,
+    "verdict": "pass",
+    "wall_ms": 192596
   },
   "schema": "m15-preflight.v1",
   "serving": {
-    "base_url": "http://127.0.0.1:8787/v1",
-    "model": "deepseek-v4-flash",
+    "base_url": "https://api.pinaic.com/v1",
+    "model": "gpt-5.6-luna",
     "protocol": "responses"
   },
   "source": {
     "clean": true,
-    "source_tree_digest": "83b47da50d71cb662b2ad2cc4f028e1ee54cf28b5b93a4d2b92101cd8af11bb0"
+    "source_tree_digest": "9437882d20352ec2656d0579aaf727a64312db671c6f84a443c303b83ff9f3bf"
   },
   "switches": {
     "opportunity": false,
