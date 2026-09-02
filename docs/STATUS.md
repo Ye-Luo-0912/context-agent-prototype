@@ -144,6 +144,24 @@ run `33624084700`, 2026-09-02):**
   diagnosis; the window is not rerun. M15 remains open; candidate selection
   is a user decision. The relay NOT_RUN preflight and the preflight PASS
   attempt remain retained evidence.
+- Post-window diagnosis recorded 2026-09-03 at
+  [`evidence/m15-diagnosis-repaired-source/REPORT.md`](../crates/agent-eval/evidence/m15-diagnosis-repaired-source/REPORT.md),
+  read entirely from the immutable cell streams. The three failure
+  observations stay distinct with no shared cause: (1) all three failing
+  diag cells wrote the `checked_shl` trap (the passing cell wrote
+  `checked_mul`) — the same solver limitation attributed across the v3
+  windows, now on a third serving; (2) both policy 48-round tails are the
+  `784d7aa` completion-gate loop recurring with the completion-repair stage
+  live — in `normal r1` the persistent blocker is one `process.run` exit=1
+  plus patch churn that re-opens failed-command rows and re-stales
+  verification, and the loop is stochastic (`normal r2` closed in 20
+  rounds); (3) the framer malformed-event is a first-occurrence runaway
+  delta stream (16,385/16,384 chunks) where the bound failed closed as
+  designed. No harness, transport or oracle defect in any class; the
+  deterministic gate chain is fully green on this source, so the remaining
+  surface is per-cell model behavior. Candidate selection is a user
+  decision bounded by the frozen route (no Context/GC retune, no protocol
+  weakening, no round stop, no TaskGraph, no prompt pressure).
 
 **Repository-wide architecture audit (2026-08-31; started at `c8b9dbb`,
 incrementally reviewed through `c55429c`; findings now repaired by the
@@ -1445,7 +1463,11 @@ candidate**, not another prompt tweak or an immediate rerun. The repaired-source
    rejected source/serving candidate;
 2. diagnose the immutable cell streams: the diag overflow-edge misses, the
    policy completion-gate tails and the bounded-framer malformed-event are
-   distinct observations until evidence proves a shared cause;
+   distinct observations until evidence proves a shared cause — **done
+   2026-09-03**,
+   [`evidence/m15-diagnosis-repaired-source/REPORT.md`](../crates/agent-eval/evidence/m15-diagnosis-repaired-source/REPORT.md)
+   confirms three distinct model-quality surfaces with no shared cause and
+   no harness/transport/oracle defect;
 3. select one bounded candidate from those facts. Do not retune Context/GC,
    weaken protocol bounds, add a fixed round stop or introduce TaskGraph;
 4. pass the candidate's deterministic failure matrix, the applicable open P1
