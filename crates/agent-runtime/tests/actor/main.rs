@@ -9,5 +9,6 @@ mod context_commit;
 mod focus;
 mod harness;
 mod input;
+mod protocol_bodies;
 mod restore;
 mod surface;

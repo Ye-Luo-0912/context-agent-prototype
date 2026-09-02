@@ -882,6 +882,106 @@ async fn exact_verification_identity_drift_executes_again_and_marks_the_result()
     handle.stop().await.unwrap();
 }
 
+/// A verification-PASS reuse must not be minted without its audit row: if
+/// the `ExecutionVerificationPass::Reused` event cannot be appended, the
+/// runtime dispatches the identical verifier call for real instead of
+/// skipping it. An unobserved reused PASS would be fabricated verified
+/// evidence.
+#[derive(Debug)]
+struct FailReusedEventJournal;
+
+#[async_trait::async_trait]
+impl agent_contracts::EventJournal for FailReusedEventJournal {
+    async fn append(&self, envelope: &RuntimeEventEnvelope) -> AgentResult<()> {
+        if matches!(
+            &envelope.event,
+            RuntimeEvent::ExecutionVerificationPass {
+                kind: agent_contracts::VerificationPassEventKind::Reused,
+                ..
+            }
+        ) {
+            return Err(agent_contracts::AgentError::Storage(
+                "simulated reused-pass event failure".into(),
+            ));
+        }
+        Ok(())
+    }
+}
+
+#[tokio::test]
+async fn reused_verification_without_a_durable_audit_record_dispatches_for_real() {
+    let tools = Arc::new(ExactVerifyDispatcher::default());
+    let services = RuntimeServices::new(
+        CoreAuthorityConfig::default(),
+        Arc::new(TestContextEngine),
+        Arc::new(DuplicateExactVerifyModel::default()),
+        tools.clone(),
+        Arc::new(PolicyApprovalGate::read_only()),
+        Some(Arc::new(FailReusedEventJournal)),
+    );
+    let (handle, _task) = spawn_runtime(Arc::new(services));
+    let mut events = handle.subscribe();
+    handle.start().await.unwrap();
+    handle
+        .user_message("run one deterministic verification recipe".into())
+        .await
+        .unwrap();
+
+    let (started, finished, recorded, reused, reused_output) =
+        tokio::time::timeout(Duration::from_secs(3), async {
+            let mut started = 0;
+            let mut finished = 0;
+            let mut recorded = 0;
+            let mut reused = 0;
+            let mut reused_output = false;
+            loop {
+                match events.recv().await.unwrap().event {
+                    RuntimeEvent::ToolStarted { call } if call.name == "test.verify" => {
+                        started += 1;
+                    }
+                    RuntimeEvent::ToolFinished { output, .. }
+                        if output.tool_name == "test.verify" =>
+                    {
+                        finished += 1;
+                        reused_output |= output
+                            .metadata
+                            .get("verification_pass_reused")
+                            .and_then(serde_json::Value::as_bool)
+                            .unwrap_or(false);
+                    }
+                    RuntimeEvent::ExecutionVerificationPass { kind, .. } => match kind {
+                        agent_contracts::VerificationPassEventKind::Recorded => recorded += 1,
+                        agent_contracts::VerificationPassEventKind::Reused => reused += 1,
+                    },
+                    RuntimeEvent::TurnCompleted => {
+                        break (started, finished, recorded, reused, reused_output);
+                    }
+                    _ => {}
+                }
+            }
+        })
+        .await
+        .expect("second identical verifier turn completes");
+
+    assert_eq!(
+        tools.executions.load(std::sync::atomic::Ordering::SeqCst),
+        2,
+        "the failed audit append must force a real dispatch"
+    );
+    assert_eq!(started, 2, "both identical calls must dispatch");
+    assert_eq!(finished, 2, "both calls receive terminal results");
+    assert_eq!(recorded, 2, "each real dispatch records its own PASS");
+    assert_eq!(
+        reused, 0,
+        "no reused PASS may be minted without its audit row"
+    );
+    assert!(
+        !reused_output,
+        "the second result must not claim a reused verification pass"
+    );
+    handle.stop().await.unwrap();
+}
+
 #[tokio::test]
 async fn lease_transition_audit_failure_fences_before_model_start() {
     let model = Arc::new(RecordingModel::default());
