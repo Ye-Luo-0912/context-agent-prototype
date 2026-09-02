@@ -27,6 +27,13 @@ use ratatui::{Terminal, backend::CrosstermBackend};
 use state::AppState;
 use tool_runtime::{BuiltinToolDispatcher, VerificationRecipes};
 
+/// Cap on the note channel that carries off-input-thread command output
+/// (`/tasks`, `/grants`) back into the alternate-screen frame. The channel
+/// is bounded so a pathological catalog listing cannot grow the UI's
+/// pending-notice queue without limit; full notifications are dropped whole
+/// rather than blocking the command task.
+const NOTICE_CHANNEL_CAP: usize = 64;
+
 /// UI-side handles for interactive approval: the broker carries requests from
 /// the kernel to the UI, the gate carries the user's decision back, and the
 /// task gate holds the standing grants (established from `--grant` on the
@@ -209,7 +216,7 @@ async fn run_ui(
     // Command output that resolves off the input thread (/tasks, /grants)
     // comes back through this channel: printing to stdout directly would
     // corrupt the alternate-screen frame.
-    let (notice_tx, mut notice_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
+    let (notice_tx, mut notice_rx) = tokio::sync::mpsc::channel::<String>(NOTICE_CHANNEL_CAP);
 
     loop {
         while let Ok(event) = runtime_events.try_recv() {
@@ -315,7 +322,7 @@ async fn run_ui(
                             match handle.list_tasks().await {
                                 Ok(tasks) => {
                                     for task in tasks {
-                                        let _ = notice_tx.send(format!(
+                                        let _ = notice_tx.try_send(format!(
                                             "task {} [{:?}] tools=r{}/{} {}",
                                             task.id,
                                             task.status,
@@ -339,10 +346,10 @@ async fn run_ui(
                         tokio::spawn(async move {
                             let grants = task_grants.active_grants().await;
                             if grants.is_empty() {
-                                let _ = notice_tx.send("no active standing grants".into());
+                                let _ = notice_tx.try_send("no active standing grants".into());
                             }
                             for grant in grants {
-                                let _ = notice_tx.send(format!(
+                                let _ = notice_tx.try_send(format!(
                                     "grant {} risk={:?} workspace={:?} argv={:?} shell={:?} \
                                      max_runs={:?} max_bytes={:?} expires_at_ms={}",
                                     grant.id,
