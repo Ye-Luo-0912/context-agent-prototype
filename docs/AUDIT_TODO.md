@@ -216,7 +216,17 @@ artifact; without it the stderr retry line stays the human channel. The
 channel remains a best-effort diagnostic artifact, not durable formal
 evidence: a cell verdict never depends on it.
 
-### EVAL-PREFLIGHT-01 — one hermetic developer/evaluation gate runner (**open P1; supporting infrastructure, not an M15 candidate**)
+### EVAL-PREFLIGHT-01 — one hermetic developer/evaluation gate runner (**open P1 — parse-first CLI slice landed on `131c82f`; the hermetic doctor/gate runner remains**)
+
+Landed slice (2026-09-03, `131c82f`): `agent-eval` now parses and validates
+every global option (`--repeats`, `--evidence-dir`, `--include-swebench`,
+`--file-only`, `--allow-dirty`, `--pilot-id`) in one pre-pass before any
+subcommand runs, so option order is semantically irrelevant and unknown,
+duplicate or missing values fail before files are created or processes
+started; the ignored trailing `--evidence-dir` class is closed with direct
+regressions.
+
+Remaining scope of this item:
 
 Repeated operational failures have one tooling-level cause: repository gates
 do not yet share one parse-before-side-effect entry point and one exact runtime
