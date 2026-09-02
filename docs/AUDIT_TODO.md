@@ -236,10 +236,12 @@ findings below.
 **Repair status (2026-09-03):** every P0 and P1 implementation finding below
 now has a landed repair in `615b5ed..6fdb4f0`, and dual-platform CI is green
 on `6fdb4f0` (run `33624084700`). The item headings carry the repair commit.
-Remaining open exits are not implementation gaps: the M10 fault-gate re-audit
-record, the `JSON-RECOVERY-01` formal-path retry observer, and `GOV-STATUS-01`
-governance reconciliation. Treat each item below as closed-on-source unless
-its heading says otherwise.
+The 2026-09-03 tranche also recorded the M10 fault-gate re-audit (see
+`RUNTIME-CONTEXT-COMMIT-01`), closed `GOV-STATUS-01` on `bba1c76`, and
+committed the actor protocol-body regression on `e357bed`. The remaining open
+exit is not an implementation gap: the `JSON-RECOVERY-01` formal-path retry
+observer. Treat each item below as closed-on-source unless its heading says
+otherwise.
 
 This is the current route/status authority inside this file. It supersedes the
 2026-08-30 and post-window ordering where a newly confirmed P0/P1 changes the
@@ -293,7 +295,7 @@ class after the ACK/Core-terminal crash window and prove no recovery path can
 strengthen it. `EFFECT-ACK-01` still owns failure to persist/send the ACK itself;
 it must consume this typed result rather than invent another truth source.
 
-#### RUNTIME-CONTEXT-COMMIT-01 — make turn start and checkpoint maintenance transactional (**repair landed in `9ba85d3`/`f42a898`/`f622cf3`; M10 fault-gate re-audit record pending**)
+#### RUNTIME-CONTEXT-COMMIT-01 — make turn start and checkpoint maintenance transactional (**closed: repair `9ba85d3`/`f42a898`/`f622cf3`; M10 fault-gate re-audit recorded 2026-09-03 on `e357bed`**)
 
 For an existing task, `begin_applied_turn` ingests the user message, appends
 `UserMessageAccepted`, then runs `UserInput` maintenance with direct `?`
@@ -312,6 +314,18 @@ after ingest, after the accepted event, during maintenance event publication,
 and between sidecar apply/reply; repeated checkpoint assembly must not repeat
 logical maintenance. This restores the intended CorePort boundary rather than
 moving more orchestration into Core.
+
+Re-audit record (2026-09-03, local Windows run on `e357bed`, the repaired
+transaction plus the actor regression tranche): the M10-facing suites are
+green — agent-runtime unit 324, actor 59 (including the turn-start/checkpoint
+fault-injection and rollback-fencing scenarios in `tests/actor/context_commit.rs`
+and the scratch-state restore validation in `tests/actor/restore.rs`), turn 105,
+instance 30, host 32, approval 4, recall 3; agent-replay 52 (barrier location,
+seq-gap detection, deterministic context rebuild, restore-vs-full-rebuild
+consistency); context-simple 250 (checkpoint restore validation); agent-core
+149 + 12; agent-storage 15; agent-workspace 98 with `test-faults` enabled.
+Zero failures across all suites; no Context/GC/retrieval/packing surface was
+retuned for this record.
 
 #### DURABILITY-BARRIER-01 — make every advertised durable barrier recoverable (**closed on `f055e39`**)
 

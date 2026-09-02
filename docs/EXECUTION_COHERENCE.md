@@ -114,8 +114,8 @@ Context packing, GC, and retrieval live in
     enter a durable recovery fence before accepting another mutation. The
     turn-start transaction, rollback fencing and scratch-state restore
     validation are repaired (`RUNTIME-CONTEXT-COMMIT-01`, `9ba85d3`/
-    `f42a898`/`f622cf3`); the recorded M10 fault-gate re-audit is the
-    remaining exit.
+    `f42a898`/`f622cf3`); the M10 fault-gate re-audit was recorded 2026-09-03
+    on `e357bed` (record in [`AUDIT_TODO.md`](AUDIT_TODO.md)).
 
 There is no planner. The LLM still chooses actions. Runtime only
 maintains what the world can currently prove.

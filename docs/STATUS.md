@@ -60,13 +60,15 @@ run `33624084700`, 2026-09-02):**
   reconciled to one suspended-claims statement and README is aligned
   (renamed crate, complete crate list, historical `CONTEXT_RUNTIME_TODO.md`,
   authority pointers); it closes when this commit is recorded.
-- Remaining exits before any new formal window: record the M10 fault-gate
-  re-audit on the repaired turn-start/checkpoint transaction; wire the typed
-  retry observer into the formal long-live/M15 provider path (`driver.rs`
-  has it; `long_live.rs`, `fixture_driver.rs` and `agent-compose` do not);
-  commit the pending actor-level protocol-body regression; then freeze one
-  exact clean source for the preflight. The historical FAIL packs stay
-  immutable and Context/GC/retrieval/packing remain frozen.
+- Remaining exits before any new formal window: wire the typed retry observer
+  into the formal long-live/M15 provider path (`driver.rs` has it;
+  `long_live.rs`, `fixture_driver.rs` and `agent-compose` do not); then freeze
+  one exact clean source for the preflight with Ubuntu plus Windows CI. The
+  M10 fault-gate re-audit is recorded (2026-09-03, local run on `e357bed`;
+  see the `RUNTIME-CONTEXT-COMMIT-01` re-audit record in
+  [`AUDIT_TODO.md`](AUDIT_TODO.md)), `GOV-STATUS-01` closed on `bba1c76`, and
+  the actor protocol-body regression landed on `e357bed`. The historical FAIL
+  packs stay immutable and Context/GC/retrieval/packing remain frozen.
 
 **Repository-wide architecture audit (2026-08-31; started at `c8b9dbb`,
 incrementally reviewed through `c55429c`; findings now repaired by the
@@ -1366,17 +1368,18 @@ closed the selected-path P0/P1 and post-window implementation items on
 
 1. record the M10 fault-gate re-audit on the repaired turn-start/checkpoint
    transaction (repair landed in `9ba85d3`/`f42a898`/`f622cf3`; the re-audit
-   record, not a new implementation, is the open part);
+   record, not a new implementation, is the open part) — **done 2026-09-03**,
+   recorded in [`AUDIT_TODO.md`](AUDIT_TODO.md);
 2. wire the typed retry observer into the formal long-live/M15 provider path
    — `driver.rs` carries it, `long_live.rs`, `fixture_driver.rs` and
    `agent-compose` do not — and close the residual `JSON-RECOVERY-01`
    formal-path exit;
 3. land this documentation tranche (AGENTS.md reconciliation, README
    alignment, repair-status records) so `GOV-STATUS-01` closes on a recorded
-   commit;
-4. commit the pending actor-level protocol-body regression, rerun
-   fmt/Clippy/build/full workspace tests, and record one clean source with
-   Ubuntu plus Windows CI on that exact tree;
+   commit — **done on `bba1c76`**;
+4. commit the pending actor-level protocol-body regression — **done on
+   `e357bed`**; rerun fmt/Clippy/build/full workspace tests, and record one
+   clean source with Ubuntu plus Windows CI on that exact tree;
 5. close or prove out-of-path every P1 item exercised by the candidate; only a
    settlement-changing candidate additionally needs the same-checkpoint fork;
 6. run one exact-source product preflight, then at most one freshly

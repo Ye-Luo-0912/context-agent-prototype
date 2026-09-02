@@ -1514,8 +1514,8 @@ operations only. Runtime owns the turn-start transaction (ingest + maintenance
 + audit rows) and checkpoint maintenance through its own schedule, fences the
 turn when a Context rollback fails, and validates checkpoint restores on a
 scratch state before committing (`RUNTIME-CONTEXT-COMMIT-01`, repaired in
-`9ba85d3`/`f42a898`/`f622cf3`; the M10 fault-gate re-audit record is the
-remaining exit).
+`9ba85d3`/`f42a898`/`f622cf3`; the M10 fault-gate re-audit was recorded
+2026-09-03 on `e357bed`, record in [`AUDIT_TODO.md`](AUDIT_TODO.md)).
 
 ## 8c. Runtime actor and module host (V1-M3, hardened V1-P0-1/V1-P0-4)
 

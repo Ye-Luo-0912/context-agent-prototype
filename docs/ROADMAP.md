@@ -20,18 +20,19 @@ copy them back.
 
 | Milestone | Status | Gate |
 | --- | --- | --- |
-| M10 Runtime Consistency | ⚠️ repair landed, re-audit record pending | `RUNTIME-CONTEXT-COMMIT-01` repairs landed (`9ba85d3`/`f42a898`/`f622cf3`) with rollback fencing and scratch-state restore validation; the M10 fault gate must be re-run and recorded on that source before the closure claim is restored. |
+| M10 Runtime Consistency | ✅ repair landed, re-audit recorded 2026-09-03 | `RUNTIME-CONTEXT-COMMIT-01` repairs landed (`9ba85d3`/`f42a898`/`f622cf3`) with rollback fencing and scratch-state restore validation. The M10 fault gate was re-run and recorded on `e357bed` (2026-09-03): all runtime/replay/storage/context fault and restore-consistency suites green; record in `RUNTIME-CONTEXT-COMMIT-01`, [`AUDIT_TODO.md`](AUDIT_TODO.md). |
 | M11 Context Recall | ✅ narrow retrieval | Search/inspect/fetch without polluting prompt history. Broader catalog work is not a reason to reopen recall. |
 | M12 Effect Runtime | 🧾 closure-audit evidence banked; recovery P0 repaired, claims suspended | The clean-tree evidence table remains immutable. `EFFECT-ACK-CLASS-01` (typed settlements, journal v2, no-strengthening recovery) and `PROCESS-COORDINATOR-01` (bounded coordinator wire) are repaired in `6112ffd`/`43eb87b`. No new closure claim until the recorded 2026-09-03 doc tranche and the M15-facing exits land. Details: [`PLATFORM_SECURITY.md`](PLATFORM_SECURITY.md). |
 | M13 Extension Sandbox | 🧾 closure-audit evidence banked; attestation P0 repaired, claims suspended | The clean-tree audit remains immutable. `SANDBOX-ATTEST-TRUNCATE-01` is repaired in `e5e712f` (write-floor attestation only at enforcing ABIs). Universal native `UntrustedGenerated` availability is not V1 and WASI remains V2. No new closure claim until the recorded 2026-09-03 doc tranche and the M15-facing exits land. Details: [`PLATFORM_SECURITY.md`](PLATFORM_SECURITY.md). |
 | M14 Resource Policy | ✅ | Schema/context quotas, standing grants, output broker, authority leases. Further typed policy is not a reopen of this gate. |
-| M15 Real Evaluation | 🛑 open; latest v4 valid FAIL 10/12; reporter P0 repaired, residual exits remain | Three valid v3 and four valid v4 FAIL windows remain immutable diagnostics. The latest v4 was 10/12 on `784d7aa`. `M15-RAW-EVIDENCE-01` (content-addressed raw cells, `ea821bb`) and `M15-HARNESS-BOUNDARY-01` (`f57a118`) are repaired; the remaining pre-window exits are the formal-path retry observer (`JSON-RECOVERY-01` residual), the M10 re-audit record, recording this doc/test tranche, and one recorded clean source. Formal M15 remains 3 fixtures × normal/resume × 2 repeats, never settlement off/on. See [`M15_ACCEPTANCE.md`](M15_ACCEPTANCE.md). |
+| M15 Real Evaluation | 🛑 open; latest v4 valid FAIL 10/12; reporter P0 repaired, residual exits remain | Three valid v3 and four valid v4 FAIL windows remain immutable diagnostics. The latest v4 was 10/12 on `784d7aa`. `M15-RAW-EVIDENCE-01` (content-addressed raw cells, `ea821bb`) and `M15-HARNESS-BOUNDARY-01` (`f57a118`) are repaired; the remaining pre-window exits are the formal-path retry observer (`JSON-RECOVERY-01` residual) and one recorded clean source with dual-platform CI (the M10 re-audit record, the doc tranche and the actor regression are recorded 2026-09-03). Formal M15 remains 3 fixtures × normal/resume × 2 repeats, never settlement off/on. See [`M15_ACCEPTANCE.md`](M15_ACCEPTANCE.md). |
 | V2 Self-Iteration | 🔒 blocked | Until the governing M12/M13 status is reconciled and M15 closes. The agent may grow capabilities, never evaluation or permission Core authority. |
 
-Open gate order (post-repair, 2026-09-03): M10 fault-gate re-audit record on
-the repaired transaction → wire the typed retry observer into the formal
-long-live/M15 provider path → `GOV-STATUS-01` reconciliation (AGENTS.md
-wording + README alignment) → commit pending tests/docs and record one clean
+Open gate order (post-repair, updated 2026-09-03): ~~M10 fault-gate re-audit
+record~~ (recorded) → wire the typed retry observer into the formal
+long-live/M15 provider path → ~~`GOV-STATUS-01` reconciliation~~ (closed on
+`bba1c76`) → ~~commit pending tests/docs~~ (done on `e357bed`/`bba1c76`) and
+record one clean
 source with Ubuntu/Windows CI → selected-path P1 spot-checks if the candidate
 changes → same-checkpoint causal runner only for a settlement-changing
 candidate → new exact-source product preflight → at most one freshly
@@ -43,14 +44,13 @@ remain frozen.
 
 1. Preserve the latest valid FAIL and do not rerun `784d7aa`. The
    repository-wide P0/P1 repairs are landed (`615b5ed..6fdb4f0`, CI green);
-   re-run and record the M10 fault gate on that source. The 2026-09-03
-   documentation tranche resolves `GOV-STATUS-01` (AGENTS.md reconciliation +
-   README alignment); it closes when that commit is recorded.
+   the M10 fault gate was re-run and recorded on `e357bed` (2026-09-03). The
+   2026-09-03 documentation tranche resolved `GOV-STATUS-01` (AGENTS.md
+   reconciliation + README alignment) on `bba1c76`.
 2. Wire the typed retry observer into `long_live.rs`, `fixture_driver.rs` and
    `agent-compose` so the formal path persists complete typed retry evidence
    (`JSON-RECOVERY-01` residual).
-3. Commit the pending actor-level protocol-body regression and documentation;
-   rerun fmt, Clippy, build and the full suite; record the clean source and
+3. Rerun fmt, Clippy, build and the full suite; record the clean source and
    bank Ubuntu plus Windows CI on that exact tree. Context/GC/retrieval/
    packing selection does not change.
 4. If—and only if—the candidate enables settlement projection, complete the
