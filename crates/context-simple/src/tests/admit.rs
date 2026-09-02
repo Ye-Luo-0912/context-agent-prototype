@@ -970,6 +970,102 @@ async fn expect_restore_rejected(state: &crate::engine::State, needle: &str) {
     );
 }
 
+/// A refused restore must leave the running state untouched: structural
+/// validation runs on a scratch copy before any replacement, so a corrupt
+/// or hostile checkpoint cannot clobber live items. Regression: the live
+/// state was committed first and stayed clobbered after the validation
+/// error. A blob that fails to deserialize at all is refused the same way,
+/// before anything is committed.
+#[tokio::test]
+async fn rejected_restore_leaves_the_running_state_intact() {
+    let config = SimpleContextConfig::default();
+    let engine = SimpleContextEngine::new(config.clone());
+    let body = "live observation that must survive a refused restore";
+
+    // A self-consistent live state: one resident item plus its catalog.
+    let live_id = {
+        let mut state = engine.state.lock().await;
+        let mut item = crate::item::make_item(
+            &state,
+            &config,
+            body.into(),
+            ContextKind::FileObservation,
+            ContextScope::Task,
+            ContextRetention::Working,
+            0.5,
+            None,
+        );
+        item.id = ContextItemId::new();
+        let id = item.id;
+        state.items.replace_all(vec![item]);
+        state.sync_catalog();
+        id
+    };
+
+    // A checkpoint that deserializes but violates the structural
+    // invariants (one id held twice by the heap). Restore must refuse it
+    // and keep the live heap, catalog and scope tree untouched.
+    let duplicate_id_blob = {
+        let mut corrupt = crate::engine::State::default();
+        let mut dup = crate::item::make_item(
+            &corrupt,
+            &config,
+            "corrupt duplicate body".into(),
+            ContextKind::FileObservation,
+            ContextScope::Task,
+            ContextRetention::Working,
+            0.5,
+            None,
+        );
+        dup.id = ContextItemId::new();
+        corrupt.items.replace_all(vec![dup.clone(), dup]);
+        crate::checkpoint::serialize(&corrupt).unwrap()
+    };
+    let error = engine
+        .restore(duplicate_id_blob)
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(
+        error.contains("checkpoint restore validation") && error.contains("more than once"),
+        "expected the duplicate-id validation error, got: {error}"
+    );
+    {
+        let state = engine.state.lock().await;
+        assert_eq!(
+            state.items.len(),
+            1,
+            "the refused restore replaced the live heap"
+        );
+        assert_eq!(state.items[0].content, body);
+        assert!(
+            state.catalog.contains(live_id),
+            "the refused restore dropped the live id from the catalog"
+        );
+    }
+
+    // A blob that cannot deserialize at all (null is not a state) fails
+    // before anything is committed, with the live state still in place.
+    let error = engine
+        .restore(serde_json::Value::Null)
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(
+        error.contains("checkpoint restore"),
+        "expected a restore error, got: {error}"
+    );
+    {
+        let state = engine.state.lock().await;
+        assert_eq!(
+            state.items.len(),
+            1,
+            "the failed deserialize replaced the live heap"
+        );
+        assert_eq!(state.items[0].content, body);
+    }
+}
+
 /// A dependency demoted to the warm buffer is still recalled when a live
 /// root depends on it — the mark phase and the reactivate phase share one
 /// universe. Regression: the mark traversal only followed edges through

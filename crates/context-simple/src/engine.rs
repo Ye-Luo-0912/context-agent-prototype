@@ -1746,12 +1746,13 @@ impl ContextEngine for SimpleContextEngine {
         // commit stale transitions against the restored state.
         let _gate = self.op_gate.lock().await;
         let mut state = self.state.lock().await;
-        *state = checkpoint::deserialize(data)?;
+        // Deserialize and structurally validate the replacement before it
+        // becomes live: a corrupt or hostile checkpoint must not clobber the
+        // running state. Only a valid snapshot is committed into the lock.
+        let next = checkpoint::deserialize(data)?;
+        checkpoint::validate(&next)?;
+        *state = next;
         state.sync_catalog();
-        // Structural validation before the state becomes live: duplicate
-        // ids, cross-location ownership, scope ancestry and item scope
-        // references must all hold (see checkpoint::validate).
-        checkpoint::validate(&state)?;
         crate::reactivation::clear_segment(&mut state);
         // Old checkpoints predate the entity signature cache; backfill it
         // once so restored items keep scoring and dependency behavior. The
