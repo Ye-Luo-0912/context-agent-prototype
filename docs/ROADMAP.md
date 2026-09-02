@@ -52,9 +52,10 @@ remain frozen.
    `7e02488`: the JSONL observer lives in `provider-openai`, the eval formal
    paths keep it through `driver.rs`, and `agent-compose::model_from_env`
    now attaches it too (`JSON-RECOVERY-01` residual closed).
-3. Rerun fmt, Clippy, build and the full suite; record the clean source and
-   bank Ubuntu plus Windows CI on that exact tree. Context/GC/retrieval/
-   packing selection does not change.
+3. Rerun fmt, Clippy, build and the full suite — done locally on the clean
+   tree `4e56f69` (2026-09-03, Windows; all green, observer regressions
+   included). Record the clean source and bank Ubuntu plus Windows CI on
+   that exact tree. Context/GC/retrieval/packing selection does not change.
 4. If—and only if—the candidate enables settlement projection, complete the
    same-checkpoint `EVAL-CAUSAL-01` fork. A settlement-off candidate skips it.
 5. Freeze source, surface, acceptance identity and serving; run one bounded

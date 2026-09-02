@@ -1384,7 +1384,14 @@ closed the selected-path P0/P1 and post-window implementation items on
    commit — **done on `bba1c76`**;
 4. commit the pending actor-level protocol-body regression — **done on
    `e357bed`**; rerun fmt/Clippy/build/full workspace tests, and record one
-   clean source with Ubuntu plus Windows CI on that exact tree;
+   clean source with Ubuntu plus Windows CI on that exact tree — the local
+   half is done: on the clean tree `4e56f69` (2026-09-03, Windows) `cargo
+   fmt --all -- --check`, strict all-target/all-feature Clippy, and the
+   complete all-target workspace test suite all pass (the M10-facing suites
+   are enumerated in the `RUNTIME-CONTEXT-COMMIT-01` re-audit record;
+   provider-openai 101, agent-eval 203, agent-compose 18 include the
+   observer regressions); banking Ubuntu plus Windows CI on that exact tree
+   is the remaining half;
 5. close or prove out-of-path every P1 item exercised by the candidate; only a
    settlement-changing candidate additionally needs the same-checkpoint fork;
 6. run one exact-source product preflight, then at most one freshly
