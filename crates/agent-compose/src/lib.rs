@@ -30,7 +30,9 @@ use agent_workspace::Workspace;
 use context_baselines::{AppendOnlyEngine, RollingConfig, RollingSummaryEngine};
 use context_contextcore::{ContextServiceConfig, ServiceEngine, connect_engine};
 use context_simple::{SimpleContextConfig, SimpleContextEngine};
-use provider_openai::{OpenAiConfig, OpenAiProtocol, OpenAiProvider, RetryingTransport};
+use provider_openai::{
+    JsonlRetryObserver, OpenAiConfig, OpenAiProtocol, OpenAiProvider, RetryingTransport,
+};
 use tokio::sync::broadcast;
 
 mod compactor;
@@ -163,11 +165,13 @@ pub fn model_from_env() -> Arc<dyn ModelTransport> {
         max_stream_bytes: provider_openai::DEFAULT_MAX_STREAM_BYTES,
         context_window: Some(context_window),
     });
-    Arc::new(RetryingTransport::new(
-        provider,
-        3,
-        std::time::Duration::from_millis(500),
-    ))
+    Arc::new(
+        RetryingTransport::new(provider, 3, std::time::Duration::from_millis(500))
+            // Same retry-observability contract as the evaluation harness: set
+            // `OPENAI_RETRY_METRICS_FILE` to persist typed incident/stage
+            // records; without it the stderr retry line stays the only channel.
+            .with_observer(Arc::new(JsonlRetryObserver::from_env())),
+    )
 }
 
 fn env_declared_context_window() -> usize {

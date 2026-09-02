@@ -236,6 +236,83 @@ impl RetryObserver for NullRetryObserver {
     fn on_stage(&self, _stage: &CallStage) {}
 }
 
+/// One typed retry-metrics file is diagnostic, not an audit trail: a runaway
+/// provider must not grow the artifact unbounded.
+const MAX_RETRY_METRICS_BYTES: u64 = 4 * 1024 * 1024;
+
+/// Persists the transport's typed retry records as JSONL (one line per
+/// record) under the path the host selects. Without a path it is a no-op and
+/// the stderr retry line remains the human channel.
+pub struct JsonlRetryObserver {
+    path: Option<std::path::PathBuf>,
+    /// Serializes appends for this process so the remaining-cap accounting
+    /// and the line write are one observation; a line that would cross the
+    /// cap is dropped whole, never partial-appended. Cross-process writers
+    /// are out of scope for this best-effort diagnostic channel, but every
+    /// line is still one complete JSON value.
+    gate: std::sync::Mutex<()>,
+}
+
+impl JsonlRetryObserver {
+    /// The host owns the artifact location; the observer never invents one.
+    pub fn new(path: Option<std::path::PathBuf>) -> Self {
+        Self {
+            path,
+            gate: std::sync::Mutex::new(()),
+        }
+    }
+
+    /// Reads `OPENAI_RETRY_METRICS_FILE` from the process environment; an
+    /// unset or empty value means no artifact.
+    pub fn from_env() -> Self {
+        Self::new(
+            std::env::var("OPENAI_RETRY_METRICS_FILE")
+                .ok()
+                .filter(|value| !value.trim().is_empty())
+                .map(std::path::PathBuf::from),
+        )
+    }
+
+    fn append(&self, kind: &str, record: &impl serde::Serialize) {
+        let Some(path) = &self.path else { return };
+        let Ok(line) =
+            serde_json::to_string(&serde_json::json!({ "kind": kind, "record": record }))
+        else {
+            return;
+        };
+        use std::io::Write;
+        let _guard = self.gate.lock().expect("retry metrics observer poisoned");
+        let result = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(path)
+            .and_then(|mut file| {
+                let current = file.metadata().map(|meta| meta.len()).unwrap_or(0);
+                let line_bytes = line.len() as u64;
+                // Exact remaining accounting: the line's own byte length
+                // decides, so the artifact cannot drift past the cap.
+                if current.saturating_add(line_bytes) > MAX_RETRY_METRICS_BYTES {
+                    return Ok(());
+                }
+                writeln!(file, "{line}")?;
+                file.flush()
+            });
+        if let Err(error) = result {
+            eprintln!("[provider-openai] retry metrics write failed: {error}");
+        }
+    }
+}
+
+impl RetryObserver for JsonlRetryObserver {
+    fn on_incident(&self, incident: &RetryIncident) {
+        self.append("incident", incident);
+    }
+
+    fn on_stage(&self, stage: &CallStage) {
+        self.append("stage", stage);
+    }
+}
+
 #[cfg(test)]
 fn retryable(error: &AgentError) -> bool {
     retry_class(error).is_some()
@@ -822,6 +899,82 @@ mod tests {
         Arc,
         atomic::{AtomicU32, Ordering},
     };
+
+    #[test]
+    fn jsonl_observer_writes_one_typed_line_per_record() {
+        let dir = std::env::temp_dir().join(format!("retry-metrics-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("metrics.jsonl");
+        let observer = JsonlRetryObserver::new(Some(path.clone()));
+        observer.on_incident(&RetryIncident {
+            call_seq: 7,
+            class: RetryClass::ToolCallFormat,
+            attempt: 2,
+            class_retry_number: 1,
+            total_attempt_limit: 7,
+            delay_ms: 0,
+        });
+        observer.on_stage(&CallStage {
+            call_seq: 7,
+            attempts: 2,
+            transport_retries: 0,
+            format_retries: 1,
+            outcome: StageOutcome::Recovered,
+        });
+        let lines = std::fs::read_to_string(&path).unwrap();
+        let lines: Vec<&str> = lines.lines().collect();
+        assert_eq!(lines.len(), 2);
+        assert!(lines[0].contains("\"kind\":\"incident\""));
+        assert!(lines[1].contains("\"kind\":\"stage\""));
+        assert!(lines[1].contains("\"outcome\":\"Recovered\""));
+        // The call identity rides inside the typed record, so concurrent
+        // cells can attribute each line to its call.
+        assert!(lines[0].contains("\"call_seq\":7"));
+        assert!(lines[1].contains("\"call_seq\":7"));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn jsonl_observer_never_grows_the_artifact_past_the_bound() {
+        let dir = std::env::temp_dir().join(format!("retry-metrics-bound-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("metrics.jsonl");
+        std::fs::write(&path, "x".repeat(MAX_RETRY_METRICS_BYTES as usize + 1)).unwrap();
+        let observer = JsonlRetryObserver::new(Some(path.clone()));
+        observer.on_stage(&CallStage {
+            call_seq: 0,
+            attempts: 1,
+            transport_retries: 0,
+            format_retries: 0,
+            outcome: StageOutcome::Clean,
+        });
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().len(),
+            MAX_RETRY_METRICS_BYTES + 1,
+            "a full artifact must not grow"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn jsonl_observer_without_a_path_is_a_no_op() {
+        let observer = JsonlRetryObserver::new(None);
+        observer.on_stage(&CallStage {
+            call_seq: 0,
+            attempts: 1,
+            transport_retries: 0,
+            format_retries: 0,
+            outcome: StageOutcome::GaveUp,
+        });
+        observer.on_incident(&RetryIncident {
+            call_seq: 0,
+            class: RetryClass::Transport,
+            attempt: 1,
+            class_retry_number: 1,
+            total_attempt_limit: 3,
+            delay_ms: 0,
+        });
+    }
 
     #[test]
     fn retry_reason_label_names_the_retried_kind() {

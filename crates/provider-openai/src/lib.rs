@@ -17,8 +17,8 @@ mod sse;
 mod wire_names;
 
 pub use retry::{
-    CallStage, NullRetryObserver, RetryClass, RetryIncident, RetryObserver, RetryingTransport,
-    StageOutcome,
+    CallStage, JsonlRetryObserver, NullRetryObserver, RetryClass, RetryIncident, RetryObserver,
+    RetryingTransport, StageOutcome,
 };
 
 use std::{
