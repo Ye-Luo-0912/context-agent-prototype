@@ -1356,7 +1356,7 @@ async fn actor_routes_collect_directive_into_a_full_gc_pass() {
 
 // ---------------------------------------------------------------------------
 // Audit failures must be propagated, not silent: a state change must never
-// outrun its journal event (CTX-09 audit-failure propagation).
+// outrun its journal event (audit-failure propagation).
 // ---------------------------------------------------------------------------
 
 #[derive(Debug)]

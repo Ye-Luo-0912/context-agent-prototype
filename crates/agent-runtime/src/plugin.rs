@@ -1,5 +1,5 @@
 //! Plugin package lifecycle: install / inspect / test / enable / disable /
-//! quarantine (ECO-04). Installation never implies activation or
+//! quarantine. Installation never implies activation or
 //! permission: a package enters `Installed` and stays inert until an
 //! explicit operator action moves it. Admission is a core decision
 //! (`PluginPackageAdmission`), activation state is owned by the core
@@ -39,7 +39,7 @@ const PLUGIN_TEST_ENV_KEYS: &[&str] = &["PATH", "SystemRoot", "TEMP", "TMP", "CO
 struct PackageEntry {
     manifest: PluginPackageManifest,
     /// Monotonic install sequence, so cross-package hook ordering has a
-    /// deterministic tie-break (ECO-07).
+    /// deterministic tie-break.
     installed_at: u64,
 }
 
@@ -219,7 +219,7 @@ impl PluginRegistry {
     }
 
     /// The declared hooks of one package, as a bounded metadata view, in
-    /// declaration order (ECO-07). Metadata only — nothing fires in v0.
+    /// declaration order. Metadata only — nothing fires in v0.
     pub fn hooks(&self, package: &str) -> Option<Vec<HookView>> {
         let packages = self.packages.read().expect("plugin catalog poisoned");
         packages.get(package).map(|entry| {
@@ -242,7 +242,7 @@ impl PluginRegistry {
     }
 
     /// The deterministic firing order for one lifecycle event across every
-    /// active package (ECO-07): ascending `order`, then package install
+    /// active package: ascending `order`, then package install
     /// order, then declaration order within the package. Packages that are
     /// not `Active` contribute no hooks; an event outside the known
     /// vocabulary yields an empty order. Metadata only — nothing fires in
@@ -273,7 +273,7 @@ impl PluginRegistry {
             .collect()
     }
 
-    /// Activate a declared skill. Metadata intent only (ECO-06): the
+    /// Activate a declared skill. Metadata intent only: the
     /// runtime never executes a skill and never turns its instructions
     /// into System-authority content — activation only records that the
     /// skill may be offered.
@@ -328,7 +328,7 @@ pub struct PluginPackageView {
     pub tests: usize,
 }
 
-/// A bounded metadata view of one declared skill (ECO-06). The reference
+/// A bounded metadata view of one declared skill. The reference
 /// is a package-relative location; the runtime never reads it and never
 /// injects skill instructions as System-authority content.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -341,7 +341,7 @@ pub struct SkillView {
     pub activation: SkillActivation,
 }
 
-/// A bounded metadata view of one declared hook (ECO-07). The firing
+/// A bounded metadata view of one declared hook. The firing
 /// contract is pinned here — ordering, time/output bounds, fail-closed
 /// failure policy and a permission set that can never widen the package's
 /// own — while the runtime still never fires a hook in v0.
@@ -357,7 +357,7 @@ pub struct HookView {
     pub permissions: Vec<String>,
 }
 
-/// One hook in the deterministic firing order for an event (ECO-07):
+/// One hook in the deterministic firing order for an event:
 /// package + hook id; details come from `PluginRegistry::hooks(package)`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct HookRef {
@@ -906,7 +906,7 @@ mod tests {
 
     #[test]
     fn skill_views_are_metadata_and_never_read_instructions() {
-        // ECO-06 anchor: the skill's referenced instruction file exists on
+        // The skill's referenced instruction file exists on
         // disk with a marker, but no registry view ever reads it — a skill
         // is metadata, never a source of System-authority content.
         let dir = tempfile::tempdir().unwrap();
@@ -1002,7 +1002,7 @@ mod tests {
 
     #[test]
     fn hook_views_expose_the_bounded_firing_contract() {
-        // ECO-07 anchor: the view carries the firing contract — order,
+        // The view carries the firing contract — order,
         // time/output bounds, fail-closed policy, subset permissions —
         // while nothing fires in v0.
         let registry = PluginRegistry::new();
@@ -1044,7 +1044,7 @@ mod tests {
 
     #[test]
     fn hook_order_is_deterministic_across_active_packages() {
-        // ECO-07 ordering: ascending `order` first; ties break by package
+        // Hook ordering: ascending `order` first; ties break by package
         // install order, then declaration order within the package. Only
         // Active packages contribute.
         let registry = PluginRegistry::new();
@@ -1069,7 +1069,7 @@ mod tests {
                 vec![observe_hook("z", "after_tool", 0)],
             ))
             .expect("install c");
-        // Only active packages contribute hooks (ECO-07).
+        // Only active packages contribute hooks.
         registry.enable("pack-a").expect("enable a");
         registry.enable("pack-b").expect("enable b");
         // pack-c stays Installed (inert): its hooks must not appear.

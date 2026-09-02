@@ -1204,8 +1204,9 @@ impl RuntimeActor {
             .verification_recipe
     }
 
-    /// Commit the active task's typed CompletionRecord — the CTX-10
-    /// transaction: prepare the record, run the engine's focus/context
+    /// Commit the active task's typed CompletionRecord — the
+    /// shared commit transaction: prepare the record, run the engine's
+    /// focus/context
     /// transition, commit the task flip, publish `TaskCompleted`, then one
     /// full GC pass so the completed task's records leave the resident
     /// heap (durable retention; a GC failure after the commit is surfaced,
@@ -1221,7 +1222,7 @@ impl RuntimeActor {
         (!readiness.allows_completion()).then(|| readiness.refusal().to_string())
     }
 
-    /// LONG-TASK Slice C: one advisory completion-opportunity consult at a
+    /// Advisory completion-opportunity consult: one bounded check at a
     /// settled tool-batch safe point. Emits one bounded, body-free event
     /// per consult; an eligible key whose decision has not consumed it
     /// leases `task.complete` onto the next decision's surface and arms
@@ -1886,7 +1887,7 @@ impl RuntimeActor {
         self.state.last_assistant_artifact = pending_assistant_evidence;
         // A `task.complete` proposal must run at the safe point — after the
         // turn is durably committed and no operation is in flight — through
-        // the same CTX-10 transaction as `/done`. A completion failure here
+        // the same commit transaction as `/done`. A completion failure here
         // is surfaced, never allowed to undo the committed turn.
         let pending_completion = self
             .state

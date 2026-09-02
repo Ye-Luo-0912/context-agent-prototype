@@ -31,7 +31,8 @@ async fn connect() -> Arc<dyn ContextEngine> {
     Arc::new(adapter)
 }
 
-/// CTX-12 guard: a stale service binary must fail loudly, never silently.
+/// Stale-service guard: a stale service binary must fail loudly, never
+/// silently.
 ///
 /// `cargo test` compiles dev-dependency *libraries* only — it never
 /// refreshes the plain `target/<profile>/agent-context-service.exe`

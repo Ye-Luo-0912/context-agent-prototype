@@ -406,8 +406,8 @@ impl RuntimeActor {
                 });
             }
         }
-        // LONG-TASK advisory (Slice C, default off): while a derived
-        // completion-opportunity lease is outstanding, this ONE decision
+        // Advisory completion-opportunity lease (default off): while a
+        // derived lease is outstanding, this ONE decision
         // sees `task.complete` preferred on its surface. The model still
         // chooses; the lease dies with the decision.
         if self
@@ -1707,7 +1707,7 @@ impl RuntimeActor {
             progress.completion_repair =
                 Some(bounded_preview(&rendered, COMPLETION_REPAIR_VIEW_CHARS));
         }
-        // LONG-TASK advisory (Slice C, default off): project the bounded
+        // Advisory completion-opportunity (default off): project the bounded
         // closure statement only while the one-decision lease is live.
         if let Some(progress) = progress.as_mut().filter(|_| {
             self.state

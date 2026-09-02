@@ -1013,7 +1013,7 @@ async fn drive_opportunity_arm(
     let mut obs = OpportunityArmObservation::default();
     let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
     // `TaskCompleted`/`Completed` publish after `TurnCompleted` (the
-    // deferred CTX-10 commit runs behind the turn-end barrier), so the
+    // deferred completion commit runs behind the turn-end barrier), so the
     // drain keeps going through a short quiet window instead of stopping
     // at the first turn-completed event.
     const QUIET_POLLS: u32 = 15;

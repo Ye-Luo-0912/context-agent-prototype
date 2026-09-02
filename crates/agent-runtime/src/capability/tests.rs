@@ -268,7 +268,8 @@ fn demo_capability(id: &str) -> DemoCapability {
     }
 }
 
-/// ECO-01 anchor: a manifest whose `provides` declares a Skill. The
+/// Skill-declaration anchor: a manifest whose `provides` declares a
+/// Skill. The
 /// declaration must be accepted and validated as metadata, but the
 /// runtime must not interpret it: no tool schema reaches the model
 /// surface, the skill is not loadable as a tool, and nothing is

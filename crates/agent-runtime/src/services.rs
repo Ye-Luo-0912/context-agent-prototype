@@ -59,9 +59,10 @@ pub struct RuntimeServices {
     /// Product runs keep this false: an off candidate must not pay for or
     /// execute experiment-only packing, cloning, assembly, or hashing.
     settlement_projection_diagnostics: bool,
-    /// LONG-TASK Slice C: when false (the default), the runtime never
-    /// derives completion-opportunity facts, never leases `task.complete`
-    /// from derived readiness and emits no opportunity events.
+    /// Completion-opportunity advisory: when false (the default), the
+    /// runtime never derives completion-opportunity facts, never leases
+    /// `task.complete` from derived readiness and emits no opportunity
+    /// events.
     project_completion_opportunity: bool,
     /// Directory-tool admission candidate: when false (the default), a
     /// typed missing-parent refusal never changes the model surface, so

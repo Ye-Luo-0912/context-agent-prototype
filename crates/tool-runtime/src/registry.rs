@@ -84,9 +84,10 @@ impl Default for ToolLifecycleConfig {
                 "fs.write".into(),
                 "git.status".into(),
                 "git.diff".into(),
-                // Structured task closure. M15-window evidence (2026-08-28):
-                // 10 behavioral-pass cells never closed because the model
-                // never discovered this schema through the catalog. Presence
+                // Structured task closure is always on the surface: live
+                // evidenced cells never closed because the model
+                // could not discover this schema through the catalog.
+                // Presence
                 // is not pressure — the completion acceptance gate remains
                 // the sole closure authority and refuses premature or
                 // unverified proposals with a typed per-turn warning, so

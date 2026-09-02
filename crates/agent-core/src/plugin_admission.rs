@@ -3,10 +3,10 @@
 //! a *core* decision (mirroring `CapabilityAdmission`): everything here is
 //! a pure function of the manifest, so the same rules apply no matter which
 //! installer (or future host) asks. Installing a package never implies
-//! activation or permission — that is the installer's job (ECO-04); this
+//! activation or permission — that is the installer's job; this
 //! authority only refuses manifests that cannot be installed at all.
 //!
-//! Per ECO-01, skills, hooks and adapters are *declared metadata*: they are
+//! Skills, hooks and adapters are *declared metadata*: they are
 //! shape-checked here (id, version, references, bounded counts) but are
 //! never interpreted by the runtime. Only `tools` go through the same
 //! schema validation as capability tools, so a package cannot smuggle in a
@@ -26,7 +26,7 @@ pub const MAX_ADAPTERS_PER_PACKAGE: usize = 8;
 pub const MAX_DEPENDENCIES_PER_PACKAGE: usize = 16;
 pub const MAX_TESTS_PER_PACKAGE: usize = 16;
 
-/// Per-hook firing bounds (ECO-07): a hook declares its budget explicitly
+/// Per-hook firing bounds: a hook declares its budget explicitly
 /// and admission refuses anything above the hard cap, so a future hook
 /// runtime can never be pushed past the model-facing or wall-clock limits
 /// by the manifest alone.
@@ -169,7 +169,7 @@ fn validate_hooks(package: &PluginPackageManifest) -> AgentResult<()> {
         }
         // The event must be part of the known lifecycle vocabulary, so a
         // misspelled or invented event cannot register a hook that never
-        // fires (ECO-07).
+        // fires.
         if !agent_contracts::KNOWN_HOOK_EVENTS.contains(&hook.event.as_str()) {
             return Err(AgentError::InvalidRequest(format!(
                 "package '{}' hook '{}' targets unknown event '{}' (known: {})",
@@ -179,7 +179,7 @@ fn validate_hooks(package: &PluginPackageManifest) -> AgentResult<()> {
                 agent_contracts::KNOWN_HOOK_EVENTS.join(", ")
             )));
         }
-        // Time and output bounds are explicit and hard-capped (ECO-07): a
+        // Time and output bounds are explicit and hard-capped: a
         // zero budget can never complete, an over-cap budget could push a
         // future hook runtime past its limits.
         if hook.timeout_ms == Some(0) || hook.timeout_ms.is_some_and(|ms| ms > MAX_HOOK_TIMEOUT_MS)
@@ -199,7 +199,7 @@ fn validate_hooks(package: &PluginPackageManifest) -> AgentResult<()> {
                 package.id, hook.id, hook.output_budget_chars
             )));
         }
-        // Failure policy must match the mode (ECO-07): observers
+        // Failure policy must match the mode: observers
         // record-and-continue, gates fail closed. A gate that records and
         // continues is a silent fail-open and is refused outright.
         let policy_ok = match hook.mode {
@@ -219,7 +219,7 @@ fn validate_hooks(package: &PluginPackageManifest) -> AgentResult<()> {
                 hook.failure
             )));
         }
-        // A hook can never widen the package's permission set (ECO-07):
+        // A hook can never widen the package's permission set:
         // every declared hook permission must be known and a subset of the
         // package's own permissions.
         let mut seen_permission = std::collections::HashSet::new();
@@ -407,7 +407,7 @@ fn validate_version(what: &str, version: &str) -> AgentResult<()> {
 }
 
 /// Range shape: non-empty, bounded, printable ASCII without control
-/// characters. Actual semver matching is the installer's job (ECO-04);
+/// characters. Actual semver matching is the installer's job;
 /// admission only refuses ranges that cannot be parsed as a range token at
 /// all.
 fn validate_range(range: &VersionRange) -> AgentResult<()> {
@@ -545,7 +545,7 @@ mod tests {
     #[test]
     fn rejects_hook_bounds_outside_the_hard_caps() {
         // A zero budget can never complete; an over-cap budget could push
-        // a future hook runtime past its limits (ECO-07).
+        // a future hook runtime past its limits.
         for timeout in [Some(0u64), Some(MAX_HOOK_TIMEOUT_MS + 1)] {
             let mut package = valid_package();
             package.hooks[0].timeout_ms = timeout;
@@ -564,7 +564,7 @@ mod tests {
     fn rejects_inconsistent_hook_failure_policy() {
         // A gate that records-and-continues is a silent fail-open and is
         // refused outright; an observer that denies would block the event
-        // it is only supposed to watch (ECO-07).
+        // it is only supposed to watch.
         let mut package = valid_package();
         package.hooks[0].mode = HookMode::Gate;
         package.hooks[0].failure = HookFailurePolicy::RecordAndContinue;
@@ -579,7 +579,7 @@ mod tests {
 
     #[test]
     fn rejects_hook_permissions_outside_the_package_set() {
-        // A hook can never widen the package's permission set (ECO-07).
+        // A hook can never widen the package's permission set.
         // `workspace:write` is a known word but outside this package's
         // {workspace:read} set, so the subset rule refuses it.
         let mut package = valid_package();

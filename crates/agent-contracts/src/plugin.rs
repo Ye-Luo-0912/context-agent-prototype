@@ -2,15 +2,15 @@
 //! declares its components — tools, skills, hooks, adapters — plus
 //! dependencies, permissions, schemas, tests and a compatibility range.
 //!
-//! Per the ECO-01 decision, skills and hooks are *declared metadata*: they
+//! Skills and hooks are *declared metadata*: they
 //! are versioned, validated and source-attributed at install, but the
 //! runtime never interprets them (no instruction injection, no lifecycle
 //! firing) and they carry no authority of their own. Adapters are metadata
-//! too until the adapter plane (ECO-05) interprets them; installing one
+//! too until the adapter plane interprets them; installing one
 //! must not inject its schema catalog into every model request. Only
 //! `tools` are interpreted, by the existing capability machinery. The
 //! manifest itself is the installation unit: installing it never implies
-//! activation or permission (ECO-04).
+//! activation or permission.
 
 use serde::{Deserialize, Serialize};
 
@@ -18,7 +18,7 @@ use crate::ToolSpec;
 
 /// A version range for package compatibility, e.g. `"0.1"` or
 /// `">=0.2 <1"`. Lexically validated at admission; actual resolution is
-/// the installer's job (ECO-04).
+/// the installer's job.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct VersionRange(pub String);
 
@@ -34,16 +34,16 @@ impl VersionRange {
 #[serde(rename_all = "snake_case")]
 pub enum HookMode {
     /// Observes the lifecycle event without blocking it. Failure policy is
-    /// always `HookFailurePolicy::RecordAndContinue` (ECO-07).
+    /// always `HookFailurePolicy::RecordAndContinue`.
     Observe,
     /// May gate (allow/deny) the lifecycle event. Failure policy is always
-    /// `HookFailurePolicy::DenyOnFailure` — a gate fails closed (ECO-07).
+    /// `HookFailurePolicy::DenyOnFailure` — a gate fails closed.
     Gate,
 }
 
 /// What the runtime does when a hook firing itself fails (errors, exceeds
 /// its timeout or output bound). Pinned at admission so a gate can never
-/// silently fail open (ECO-07): `RecordAndContinue` is only valid for
+/// silently fail open: `RecordAndContinue` is only valid for
 /// observers, `DenyOnFailure` only for gates.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -57,7 +57,7 @@ pub enum HookFailurePolicy {
     DenyOnFailure,
 }
 
-/// The known lifecycle-event vocabulary a hook may target (ECO-07). This
+/// The known lifecycle-event vocabulary a hook may target. This
 /// mirrors the runtime maintenance triggers; admission refuses any event
 /// outside it, so a misspelled or invented event cannot silently register
 /// a hook that never fires.
@@ -71,8 +71,8 @@ pub const KNOWN_HOOK_EVENTS: &[&str] = &[
     "checkpoint",
 ];
 
-/// A declared hook: a lifecycle observation/gating point. Metadata only
-/// (ECO-01): never fired in v0. ECO-07 pins the firing contract in the
+/// A declared hook: a lifecycle observation/gating point. Metadata only:
+/// never fired in v0. The firing contract lives in the
 /// declaration itself — deterministic ordering, bounded time/output,
 /// explicit fail-closed failure policy and permissions that can never
 /// widen the package's set — so a future first-class hook runtime has the
@@ -86,7 +86,7 @@ pub struct HookDeclaration {
     pub mode: HookMode,
     /// Explicit priority among hooks on the same event: ascending `order`
     /// runs first; ties break by declaration order within a package, then
-    /// by package install order (deterministic, ECO-07).
+    /// by package install order (deterministic).
     #[serde(default)]
     pub order: u32,
     /// Wall-clock budget for one firing, capped by
@@ -104,13 +104,13 @@ pub struct HookDeclaration {
     pub failure: HookFailurePolicy,
     /// Permissions this hook may exercise. Must be a subset of the
     /// package's declared permissions (validated at admission): a hook
-    /// can never widen the package's permission set (ECO-07).
+    /// can never widen the package's permission set.
     #[serde(default)]
     pub permissions: Vec<String>,
 }
 
 /// Activation state of an installed plugin package. Installation never
-/// implies activation (ECO-04): a package enters `Installed` and stays
+/// implies activation: a package enters `Installed` and stays
 /// inert — nothing loaded, nothing run — until an explicit operator action
 /// moves it. A misbehaving package can be suspended without uninstalling.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
@@ -139,7 +139,7 @@ impl PluginActivation {
 }
 
 /// Where a skill came from. Provenance is recorded so a skill is always
-/// attributable; it never grants authority by itself (ECO-01/ECO-06).
+/// attributable; it never grants authority by itself.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum SkillSource {
@@ -166,10 +166,10 @@ pub enum SkillActivation {
 }
 
 /// A declared skill: versioned procedural knowledge built from existing
-/// tools. Metadata only (ECO-01): never executed, never injected into
+/// tools. Metadata only: never executed, never injected into
 /// context, adds no authority. The referenced instructions, when they are
 /// offered, enter context as ordinary (non-System-authority) content and
-/// only while the skill is active (ECO-06).
+/// only while the skill is active.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SkillDeclaration {
     /// Component id (same grammar as a capability id).
@@ -190,7 +190,7 @@ pub struct SkillDeclaration {
 }
 
 /// A declared adapter (e.g. an MCP endpoint). Metadata only until the
-/// adapter plane (ECO-05) interprets it; installing one must not inject
+/// adapter plane  interprets it; installing one must not inject
 /// its schema catalog into every request.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AdapterDeclaration {
@@ -211,7 +211,7 @@ pub struct PackageDependency {
 }
 
 /// A declared self-check: a bounded argv command run inside the sandbox at
-/// install/test time (ECO-04). The core never runs it during a turn.
+/// install/test time. The core never runs it during a turn.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TestDeclaration {
     pub id: String,
@@ -236,13 +236,14 @@ pub struct PluginPackageManifest {
     /// Contributed tool schemas, same shape and limits as capability tools.
     #[serde(default)]
     pub tools: Vec<ToolSpec>,
-    /// Declared skills (metadata only, ECO-01).
+    /// Declared skills (metadata only).
     #[serde(default)]
     pub skills: Vec<SkillDeclaration>,
-    /// Declared hooks (metadata only, ECO-01).
+    /// Declared hooks (metadata only).
     #[serde(default)]
     pub hooks: Vec<HookDeclaration>,
-    /// Declared adapters (metadata only until ECO-05).
+    /// Declared adapters (metadata only until the adapter plane
+    /// interprets them).
     #[serde(default)]
     pub adapters: Vec<AdapterDeclaration>,
     /// Package dependencies (shape-validated now, resolved at install).

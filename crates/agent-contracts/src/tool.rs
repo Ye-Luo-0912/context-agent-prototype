@@ -1003,7 +1003,7 @@ pub const TOOL_RECOVERY_HINT_KEY: &str = "recovery_hint";
 /// Hard cap on `recovery_hint` characters.
 pub const TOOL_RECOVERY_HINT_MAX_CHARS: usize = 256;
 /// Core-owned diagnosis object. Producers cannot write this key; the output
-/// authority strips it and writes the trusted copy (`TOOL-ERROR-01`).
+/// authority strips it and writes the trusted copy.
 /// Reserved metadata key carrying handler-native typed
 /// [`crate::ToolExecutionFacts`]. Only operator-trusted handlers stamp it at
 /// construction time; [`sanitize_untrusted_producer_output`] strips it from
@@ -1022,7 +1022,7 @@ const RESERVED_RUNTIME_METADATA_KEYS: &[&str] = &[
 /// Trusted, model-facing cause of a tool refusal or failed execution.
 ///
 /// The kernel/runtime projects this class. A producer must not mark its own
-/// failure retryable or widen authority (`TOOL-ERROR-01`).
+/// failure retryable or widen authority.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ToolFailureClass {
@@ -2070,8 +2070,8 @@ impl std::error::Error for EffectCommitError {}
 /// A structured completion proposal the model attaches to its last tool
 /// call (`task.complete`). The runtime validates it and commits it as the
 /// active task's typed `CompletionRecord` at the turn's safe point — after
-/// the turn commits, never mid-operation — through the same CTX-10
-/// transaction the `/done` path uses. Every field is bounded.
+/// the turn commits, never mid-operation — through the same
+/// commit transaction the `/done` path uses. Every field is bounded.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CompletionProposal {
     /// Bounded completion summary (becomes the CompletionRecord summary).

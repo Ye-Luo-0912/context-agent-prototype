@@ -1,6 +1,6 @@
-//! LONG-TASK Slice C wiring at the actor level: the advisory
-//! completion-opportunity consult is fully silent while the host switch is
-//! off (the default), and once enabled it emits typed, body-free
+//! Completion-opportunity advisory wiring at the actor level: the
+//! consult is fully silent while the host switch is off (the default),
+//! and once enabled it emits typed, body-free
 //! observations instead of ever leasing `task.complete` from an initial
 //! task with no durable work.
 

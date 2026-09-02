@@ -425,14 +425,14 @@ struct ActiveTurn {
     round_snapshot: Option<RoundExecutionSnapshot>,
     /// A structured completion proposal the model attached to a tool call
     /// (`task.complete`). Committed at the turn's safe point — after the
-    /// turn commits — through the CTX-10 transaction, so completion never
-    /// races an in-flight operation.
+    /// turn commits — through the shared commit transaction, so completion
+    /// never races an in-flight operation.
     pending_completion: Option<CompletionProposal>,
-    /// LONG-TASK advisory (Slice C): opportunity key whose one-decision
-    /// lease is outstanding — `task.complete` is preferred on this
-    /// decision's surface and the prompt carries the bounded statement.
-    /// Dies with the turn on cancel/fail (retraction); cleared after one
-    /// decision regardless of outcome.
+    /// Advisory completion-opportunity: opportunity key whose
+    /// one-decision lease is outstanding — `task.complete` is preferred on
+    /// this decision's surface and the prompt carries the bounded
+    /// statement. Dies with the turn on cancel/fail (retraction); cleared
+    /// after one decision regardless of outcome.
     opportunity_lease: Option<String>,
     /// Trusted runtime-derived recovery source for the NEXT decision only:
     /// a typed `parent_path_not_found` proved topology mutation is the

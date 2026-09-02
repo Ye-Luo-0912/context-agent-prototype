@@ -4,7 +4,7 @@
 //! proposal (a bounded summary plus bounded `artifact://` refs) as a typed
 //! `RuntimeDirective::CompleteTask` that the runtime validates and commits
 //! as the active task's `CompletionRecord` at the turn's safe point — after
-//! the turn commits, through the same CTX-10 transaction the `/done` path
+//! the turn commits, through the same commit transaction the `/done` path
 //! uses. Tools never touch task authority directly (the runtime owns the
 //! task table); this tool only names *what* the model wants completed.
 

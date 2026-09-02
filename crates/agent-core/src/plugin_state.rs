@@ -2,7 +2,7 @@
 //! package's activation state, mirroring `CapabilityStateAuthority`
 //! Admission decides whether a package may be installed at all
 //! (`PluginPackageAdmission`); this authority owns *whether it runs* after
-//! installation, and installation never implies activation (ECO-04): a
+//! installation, and installation never implies activation: a
 //! package enters `Installed` and stays inert until an explicit operator
 //! action moves it. Transitions are validated, so the state machine cannot
 //! be driven into an inconsistent state (e.g. quarantined -> active

@@ -1,4 +1,4 @@
-//! Typed runtime input envelope (`CTX-EVENT-01..03`).
+//! Typed runtime input envelope.
 //!
 //! User input shares event/fence/consumption machinery with tools, but it is
 //! not a `ToolOutput`. Only the user source may steer, interrupt, constrain,

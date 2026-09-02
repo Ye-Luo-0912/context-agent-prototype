@@ -266,7 +266,7 @@ async fn declare_completion_acceptance(handle: &agent_runtime::RuntimeHandle, go
 // ---------------------------------------------------------------------------
 // Structured completion: `task.complete` attaches a typed proposal that the
 // runtime commits at the turn's safe point (after the turn commits) as the
-// active task's CompletionRecord — the CTX-10 transaction.
+// active task's CompletionRecord.
 // ---------------------------------------------------------------------------
 
 /// Calls `task.complete` with the given summary on round 0, then finishes.
@@ -747,7 +747,7 @@ async fn task_complete_proposal_commits_the_typed_record_at_turn_end() {
     );
 
     // The typed record is durable in the checkpoint, with the proposal's
-    // artifact ref attached — the CTX-10 transaction end to end.
+    // artifact ref attached — the shared commit transaction end to end.
     let checkpoint = instance.checkpoint().await.unwrap();
     let record = checkpoint
         .tasks

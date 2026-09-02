@@ -1,4 +1,4 @@
-//! Reusable application/bootstrap composition (COMPOSE-01): one stateless,
+//! Reusable application/bootstrap composition: one stateless,
 //! actor-free function turns a `ComposeConfig` into a `RuntimeInstance`
 //! wired over the module host. The TUI, any future CLI and the evaluation
 //! harness share the same host wiring — context/model/tool/approval
@@ -219,7 +219,7 @@ pub struct ComposeConfig {
     /// product and ordinary evaluation composition; paired causal cells set
     /// the same true value in both arms.
     pub settlement_projection_diagnostics: bool,
-    /// LONG-TASK Slice C 候选开关（默认关）：派生 advisory 完成机会并
+    /// 完成机会候选开关（默认关）：派生 advisory 完成机会并
     /// 允许一次决策的 `task.complete` 租赁。晋级门通过前保持关。
     pub project_completion_opportunity: bool,
     /// 目录工具准入候选开关（默认关）：类型化缺失父目录失败不改变
