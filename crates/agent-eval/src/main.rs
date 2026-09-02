@@ -316,23 +316,120 @@ fn usage() -> ! {
     std::process::exit(2);
 }
 
+/// Global options accepted at any position, before any subcommand-specific
+/// argument is interpreted. Parsing the whole command line up front keeps
+/// option order semantically irrelevant: a trailing `--evidence-dir` reaches
+/// the selected gate instead of silently falling through to an unrelated arm.
+/// The parse creates no files and starts no process, so a malformed command
+/// line can never leave a half-configured run behind.
+struct GlobalOptions {
+    repeats: u32,
+    repeats_set: bool,
+    evidence_dir: Option<std::path::PathBuf>,
+    include_swebench: bool,
+    file_only: bool,
+    pilot_id: Option<String>,
+    allow_dirty: bool,
+}
+
+fn parse_global_options(argv: &[String]) -> anyhow::Result<(GlobalOptions, Vec<String>)> {
+    let mut options = GlobalOptions {
+        repeats: 1,
+        repeats_set: false,
+        evidence_dir: None,
+        include_swebench: false,
+        file_only: false,
+        pilot_id: None,
+        allow_dirty: false,
+    };
+    let mut rest = Vec::with_capacity(argv.len());
+    let mut index = 0;
+    while index < argv.len() {
+        let arg = argv[index].as_str();
+        // A value-taking option consumes the following token verbatim, so an
+        // option-shaped value fails its own parse with a clear message
+        // instead of being silently skipped.
+        macro_rules! take_value {
+            ($name:literal) => {{
+                let Some(value) = argv.get(index + 1) else {
+                    anyhow::bail!("{} needs a value", $name);
+                };
+                index += 1;
+                value.clone()
+            }};
+        }
+        match arg {
+            "--repeats" => {
+                if options.repeats_set {
+                    anyhow::bail!("--repeats given more than once");
+                }
+                let value = take_value!("--repeats");
+                options.repeats = value.parse().map_err(|_| {
+                    anyhow::anyhow!("--repeats needs an integer 1..=8, got {value}")
+                })?;
+                if !(1..=8).contains(&options.repeats) {
+                    anyhow::bail!("--repeats must be 1..=8 (harness smoke, not the 300×3 gate)");
+                }
+                options.repeats_set = true;
+            }
+            "--evidence-dir" => {
+                if options.evidence_dir.is_some() {
+                    anyhow::bail!("--evidence-dir given more than once");
+                }
+                options.evidence_dir =
+                    Some(std::path::PathBuf::from(take_value!("--evidence-dir")));
+            }
+            "--include-swebench" => {
+                if options.include_swebench {
+                    anyhow::bail!("--include-swebench given more than once");
+                }
+                options.include_swebench = true;
+            }
+            "--file-only" => {
+                if options.file_only {
+                    anyhow::bail!("--file-only given more than once");
+                }
+                options.file_only = true;
+            }
+            "--allow-dirty" => {
+                if options.allow_dirty {
+                    anyhow::bail!("--allow-dirty given more than once");
+                }
+                options.allow_dirty = true;
+            }
+            "--pilot-id" => {
+                if options.pilot_id.is_some() {
+                    anyhow::bail!("--pilot-id given more than once");
+                }
+                options.pilot_id = Some(take_value!("--pilot-id"));
+            }
+            _ => rest.push(argv[index].clone()),
+        }
+        index += 1;
+    }
+    Ok((options, rest))
+}
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     if let Some(path) = envfile::load()? {
         eprintln!("{}", envfile::status_line(&path));
     }
-    let mut engines: Vec<&'static str> = Vec::new();
-    let mut repeats: u32 = 1;
-    let mut repeats_set = false;
-    let mut evidence_dir: Option<std::path::PathBuf> = None;
-    let mut include_swebench = false;
-    let mut file_only = false;
-    let mut pilot_id: Option<String> = None;
     // Evidence identity gate: live evidence runs refuse a dirty tree unless
     // the operator explicitly accepts a source_tree_digest diagnostic.
-    let mut allow_dirty = false;
-
-    let mut args = std::env::args().skip(1);
+    let argv: Vec<String> = std::env::args().skip(1).collect();
+    let (options, rest) = parse_global_options(&argv)?;
+    let GlobalOptions {
+        repeats,
+        repeats_set,
+        evidence_dir,
+        include_swebench,
+        file_only,
+        pilot_id,
+        allow_dirty,
+    } = options;
+    let mut engines: Vec<&'static str> = Vec::new();
+    let mut args = rest.into_iter();
     while let Some(arg) = args.next() {
         match arg.as_str() {
             "--fixtures" => {
@@ -421,24 +518,6 @@ async fn main() -> anyhow::Result<()> {
                 );
                 return Ok(());
             }
-            "--repeats" => {
-                let Some(value) = args.next() else {
-                    usage();
-                };
-                repeats = value.parse().map_err(|_| {
-                    anyhow::anyhow!("--repeats needs an integer 1..=8, got {value}")
-                })?;
-                if !(1..=8).contains(&repeats) {
-                    anyhow::bail!("--repeats must be 1..=8 (harness smoke, not the 300×3 gate)");
-                }
-                repeats_set = true;
-            }
-            "--evidence-dir" => {
-                let Some(value) = args.next() else {
-                    usage();
-                };
-                evidence_dir = Some(std::path::PathBuf::from(value));
-            }
             "--show-evidence" => {
                 let Some(path) = args.next() else {
                     usage();
@@ -453,21 +532,6 @@ async fn main() -> anyhow::Result<()> {
             "--acceptance" => {
                 print!("{}", acceptance::render_acceptance(&suite::load_pack()?)?);
                 return Ok(());
-            }
-            "--include-swebench" => {
-                include_swebench = true;
-            }
-            "--file-only" => {
-                file_only = true;
-            }
-            "--allow-dirty" => {
-                allow_dirty = true;
-            }
-            "--pilot-id" => {
-                let Some(id) = args.next() else {
-                    usage();
-                };
-                pilot_id = Some(id);
             }
             "--pilot" => {
                 let sample = pilot::select_pilot(&suite::load_pack()?)?;
@@ -2994,6 +3058,48 @@ fn default_evidence_dir() -> std::path::PathBuf {
 #[cfg(test)]
 mod tool_edit_main_tests {
     use super::*;
+
+    fn argv(items: &[&str]) -> Vec<String> {
+        items.iter().map(|value| value.to_string()).collect()
+    }
+
+    #[test]
+    fn global_options_are_position_independent_and_leave_the_rest_intact() {
+        let (options, rest) =
+            parse_global_options(&argv(&["--m15-preflight", "--evidence-dir", "out/dir"])).unwrap();
+        assert_eq!(
+            options.evidence_dir,
+            Some(std::path::PathBuf::from("out/dir"))
+        );
+        assert_eq!(rest, argv(&["--m15-preflight"]));
+
+        let (options, rest) = parse_global_options(&argv(&[
+            "--repeats",
+            "2",
+            "--compare-live",
+            "add_test",
+            "--allow-dirty",
+        ]))
+        .unwrap();
+        assert_eq!(options.repeats, 2);
+        assert!(options.repeats_set);
+        assert!(options.allow_dirty);
+        assert_eq!(rest, argv(&["--compare-live", "add_test"]));
+    }
+
+    #[test]
+    fn duplicate_and_missing_global_option_values_fail_before_side_effects() {
+        assert!(parse_global_options(&argv(&["--repeats", "2", "--repeats", "3"])).is_err());
+        assert!(
+            parse_global_options(&argv(&["--evidence-dir", "a", "--evidence-dir", "b"])).is_err()
+        );
+        assert!(parse_global_options(&argv(&["--repeats"])).is_err());
+        assert!(parse_global_options(&argv(&["--repeats", "9"])).is_err());
+        assert!(parse_global_options(&argv(&["--repeats", "--evidence-dir"])).is_err());
+        // Unknown tokens pass through untouched for the subcommand loop.
+        let (_, rest) = parse_global_options(&argv(&["--bogus", "x"])).unwrap();
+        assert_eq!(rest, argv(&["--bogus", "x"]));
+    }
 
     #[test]
     fn conv_gate_protocol_must_be_explicitly_pinned() {
