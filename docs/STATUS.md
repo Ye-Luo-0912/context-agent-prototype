@@ -121,6 +121,27 @@ run `33624084700`, 2026-09-02):**
   the mechanically regenerated report is the only accepted verdict. Valid
   FAIL rejects the candidate; only a typed NOT_RUN permits a whole-window
   rerun.
+- The 12-cell v4 window on the PinAI tuple ran 2026-09-03 on the
+  predeclared clean source `43e1033` (cell-recorded source tree digest
+  `fd9799c9...`) and is a **valid FAIL: 6/12 pass, 0 NOT_RUN** — the
+  mechanical report at
+  `crates/agent-eval/evidence/m15-window/_windows/1788385151733/`. Migrate
+  4/4 (all ~10–11 rounds); diag 1/4 (normal r1/r2 fail fast on the
+  overflow-edge needle, resume r2 fail after 47 rounds; resume r1 pass);
+  policy 1/4 — normal r1 exhausted the 48-round tool budget with
+  behavior/diff passing (the completion-gate compliance loop previously
+  diagnosed at `784d7aa`: `edit.patch` 7 failed of 14, closure refused),
+  resume r1 died on a new malformed-event surface (the model's buffered
+  stream exceeded the bounded-framer chunk cap, 16,385/16,384 — the guard
+  worked as designed and is non-retryable), and resume r2 exhausted the
+  48-round budget in phase two (`task.complete` refused 6/6, 15
+  `verify.run` calls, 125 tool calls). Provider healthy in every cell;
+  behavior pass 8/12; rounds 243 total / max 53; provider input 2,441,871 /
+  output 81,827 (cached 217,600). Per M15_ACCEPTANCE §5 the valid FAIL
+  rejects the repaired-source + PinAI-luna candidate and returns to
+  diagnosis; the window is not rerun. M15 remains open; candidate selection
+  is a user decision. The relay NOT_RUN preflight and the preflight PASS
+  attempt remain retained evidence.
 
 **Repository-wide architecture audit (2026-08-31; started at `c8b9dbb`,
 incrementally reviewed through `c55429c`; findings now repaired by the

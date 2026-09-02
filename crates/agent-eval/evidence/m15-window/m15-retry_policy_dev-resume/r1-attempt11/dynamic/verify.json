@@ -1,0 +1,135 @@
+{
+  "schema": "retry-pilot-cell-v4",
+  "kind": "retry_pilot_oracle",
+  "fixture_id": "retry_policy_dev-resume",
+  "expected_edit": "",
+  "passed": false,
+  "replay_complete": true,
+  "assertions": [
+    {
+      "path": "src/config.rs",
+      "pred": "max_delay_ms field exists exactly once",
+      "needles": [],
+      "passed": true,
+      "file_exists": true
+    },
+    {
+      "path": "src/error.rs",
+      "pred": "transient classification implemented",
+      "needles": [],
+      "passed": false,
+      "file_exists": true
+    },
+    {
+      "path": "src/lib.rs",
+      "pred": "retry loop bounds on max_attempts",
+      "needles": [],
+      "passed": false,
+      "file_exists": true
+    },
+    {
+      "path": "src/lib.rs",
+      "pred": "delay growth saturates at max_delay_ms",
+      "needles": [],
+      "passed": true,
+      "file_exists": true
+    },
+    {
+      "path": "src/lib.rs",
+      "pred": "public run_job signature preserved",
+      "needles": [],
+      "passed": true,
+      "file_exists": true
+    },
+    {
+      "path": "README.md",
+      "pred": "README documents the saturation boundary",
+      "needles": [],
+      "passed": true,
+      "file_exists": true
+    }
+  ],
+  "files": [
+    {
+      "path": "Cargo.toml",
+      "exists": true,
+      "sha256": "c1b470a7b7d62d1114f5f56721cf579ae68b7d1db8ad9c403534f7635a62f098",
+      "bytes": 80,
+      "truncated": false,
+      "body": "[package]\nname = \"jobrunner\"\nversion = \"0.1.0\"\nedition = \"2021\"\n\n[dependencies]\n"
+    },
+    {
+      "path": "src/error.rs",
+      "exists": true,
+      "sha256": "e7ea3a4a8aab4d56f04de1d9e2def5777ee59e526677e3a26dbbe7b63a77ad38",
+      "bytes": 408,
+      "truncated": false,
+      "body": "//! Error taxonomy for the job runner.\n#[derive(Debug, Clone, PartialEq, Eq)]\npub enum RetryError {\n    /// Transient faults may be retried (network blips, temporary locks).\n    Transient(String),\n    /// Permanent faults must return immediately (bad input, missing job).\n    Permanent(String),\n}\n\nimpl RetryError {\n    pub fn is_transient(&self) -> bool {\n        matches!(self, Self::Transient(_))\n    }\n}\n"
+    },
+    {
+      "path": "src/config.rs",
+      "exists": true,
+      "sha256": "6d868d0005d21e7fffe948d9fada9ed4a5412431a5361571999122435b1c1544",
+      "bytes": 573,
+      "truncated": false,
+      "body": "//! Retry configuration.\n#[derive(Debug, Clone, PartialEq, Eq)]\npub struct RetryConfig {\n    /// Total attempts allowed, including the first call. Must be >= 1.\n    pub max_attempts: u32,\n    /// Base delay before the first retry, in milliseconds.\n    /// Maximum delay between retries, in milliseconds.\n    pub max_delay_ms: u64,\n}\n\nimpl RetryConfig {\n    /// Creates a retry configuration with the supplied bounds.\n    pub const fn new(max_attempts: u32, base_delay_ms: u64, max_delay_ms: u64) -> Self {\n        Self { max_attempts, base_delay_ms, max_delay_ms }\n    }\n}\n"
+    },
+    {
+      "path": "src/sleeper.rs",
+      "exists": true,
+      "sha256": "29961c03c8941ddb6824d82833311ed7afe7a258423cfa9d68d9659e12534458",
+      "bytes": 350,
+      "truncated": false,
+      "body": "//! Injected sleeper so tests never really wait.\npub trait Sleeper {\n    fn sleep_ms(&mut self, ms: u64);\n}\n\n/// Records every requested delay instead of waiting.\n#[derive(Debug, Default)]\npub struct FakeSleeper {\n    pub sleeps: Vec<u64>,\n}\n\nimpl Sleeper for FakeSleeper {\n    fn sleep_ms(&mut self, ms: u64) {\n        self.sleeps.push(ms);\n    }\n}\n"
+    },
+    {
+      "path": "src/lib.rs",
+      "exists": true,
+      "sha256": "bb831abf96110be24a3d62c21bede2b49f0f891f2efd83864c330233dadb3540",
+      "bytes": 993,
+      "truncated": false,
+      "body": "mod config;\nmod error;\nmod sleeper;\n\npub use config::RetryConfig;\npub use error::RetryError;\npub use sleeper::{FakeSleeper, Sleeper};\n\n/// Runs `job` until it succeeds or the retry budget is exhausted.\n/// The public signature is frozen; do not change it.\npub fn run_job(\n    config: &RetryConfig,\n    sleeper: &mut dyn Sleeper,\n    mut job: impl FnMut() -> Result<(), RetryError>,\n) -> Result<(), RetryError> {\n    let mut attempt = 0;\n    let mut delay = config.base_delay_ms.min(config.max_delay_ms);\n\n    loop {\n        attempt += 1;\n        match job() {\n            Ok(()) => return Ok(()),\n            Err(error) if !error.is_transient() || attempt >= config.max_attempts => {\n                return Err(error);\n            }\n            Err(_) => {\n                sleeper.sleep_ms(delay);\n                // Saturating multiplication prevents overflow for large attempt counts.\n                delay = delay.saturating_mul(2).min(config.max_delay_ms);\n            }\n        }\n    }\n}\n"
+    },
+    {
+      "path": "README.md",
+      "exists": true,
+      "sha256": "37001797b868cd827dc59f72394f544b2ccaba98ddc640456d786277b3431e18",
+      "bytes": 672,
+      "truncated": false,
+      "body": "# jobrunner\n\nSmall job runner with a configurable, bounded exponential retry policy.\n\n## Retry policy\n\n`RetryConfig::new(max_attempts, base_delay_ms, max_delay_ms)` configures the\nrunner. `max_attempts` includes the initial call. Only `RetryError::Transient`\nfailures are retried; permanent failures are returned immediately. Before each\nretry, the runner sleeps for `base_delay_ms`, then doubles the delay for the\nnext retry. Delays are capped at `max_delay_ms`, including configurations whose\nvalues would otherwise overflow a `u64`.\n\nDelays are sent to the injected `Sleeper`, so applications can provide a real\nsleeper and tests can use `FakeSleeper` without waiting.\n"
+    }
+  ],
+  "commands": [
+    {
+      "argv": [
+        "cargo",
+        "test",
+        "--test",
+        "retry_policy_oracle"
+      ],
+      "expect_exit": 0,
+      "exit": 101,
+      "timed_out": false,
+      "stdout": "",
+      "stderr": "   Compiling jobrunner v0.1.0 (C:\\Users\\Ye_Luo\\AppData\\Local\\Temp\\.tmpTXIBMW)\nerror[E0560]: struct `RetryConfig` has no field named `base_delay_ms`\n  --> src\\config.rs:14:30\n   |\n14 |         Self { max_attempts, base_delay_ms, max_delay_ms }\n   |                              ^^^^^^^^^^^^^ `RetryConfig` does not have this field\n   |\n   = note: all struct fields are already assigned\n\nerror[E0609]: no field `base_delay_ms` on type `&RetryConfig`\n  --> src\\lib.rs:17:28\n   |\n17 |     let mut delay = config.base_delay_ms.min(config.max_delay_ms);\n   |                            ^^^^^^^^^^^^^ unknown field\n   |\nhelp: a field with a similar name exists\n   |\n17 -     let mut delay = config.base_delay_ms.min(config.max_delay_ms);\n17 +     let mut delay = config.max_delay_ms.min(config.max_delay_ms);\n   |\n\nSome errors have detailed explanations: E0560, E0609.\nFor more information about an error, try `rustc --explain E0560`.\nerror: could not compile `jobrunner` (lib) due to 2 previous errors\n",
+      "stdout_truncated": false,
+      "stderr_truncated": false,
+      "passed": false
+    },
+    {
+      "argv": [
+        "cargo",
+        "test",
+        "--quiet"
+      ],
+      "expect_exit": 0,
+      "exit": 101,
+      "timed_out": false,
+      "stdout": "",
+      "stderr": "error[E0560]: struct `RetryConfig` has no field named `base_delay_ms`\n  --> src\\config.rs:14:30\n   |\n14 |         Self { max_attempts, base_delay_ms, max_delay_ms }\n   |                              ^^^^^^^^^^^^^ `RetryConfig` does not have this field\n   |\n   = note: all struct fields are already assigned\n\nerror[E0609]: no field `base_delay_ms` on type `&RetryConfig`\n  --> src\\lib.rs:17:28\n   |\n17 |     let mut delay = config.base_delay_ms.min(config.max_delay_ms);\n   |                            ^^^^^^^^^^^^^ unknown field\n   |\nhelp: a field with a similar name exists\n   |\n17 -     let mut delay = config.base_delay_ms.min(config.max_delay_ms);\n17 +     let mut delay = config.max_delay_ms.min(config.max_delay_ms);\n   |\n\nSome errors have detailed explanations: E0560, E0609.\nFor more information about an error, try `rustc --explain E0560`.\nerror: could not compile `jobrunner` (lib test) due to 2 previous errors\nerror: could not compile `jobrunner` (lib) due to 2 previous errors\n\n(self-check over agent-authored tests; informational)",
+      "stdout_truncated": false,
+      "stderr_truncated": false,
+      "passed": false
+    }
+  ]
+}
