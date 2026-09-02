@@ -60,17 +60,18 @@ run `33624084700`, 2026-09-02):**
   reconciled to one suspended-claims statement and README is aligned
   (renamed crate, complete crate list, historical `CONTEXT_RUNTIME_TODO.md`,
   authority pointers); it closes when this commit is recorded.
-- Remaining exits before any new formal window: freeze one exact clean source
-  for the preflight with Ubuntu plus Windows CI, then the M15 gate sequence
-  itself (selected-path P1 spot-checks if the candidate changes, exact-source
+- Remaining exits before any new formal window: the M15 gate sequence itself
+  (selected-path P1 spot-checks if the candidate changes, same-checkpoint
+  causal runner only for a settlement-changing candidate, one exact-source
   product preflight, at most one freshly predeclared window). All
   implementation exits are recorded: the M10 fault-gate re-audit (2026-09-03,
   see the `RUNTIME-CONTEXT-COMMIT-01` re-audit record in
   [`AUDIT_TODO.md`](AUDIT_TODO.md)), `GOV-STATUS-01` (closed on `bba1c76`),
-  the actor protocol-body regression (`e357bed`), and the formal-path/product
-  retry observer (`7e02488`, closing the `JSON-RECOVERY-01` residual). The
-  historical FAIL packs stay immutable and Context/GC/retrieval/packing
-  remain frozen.
+  the actor protocol-body regression (`e357bed`), the formal-path/product
+  retry observer (`7e02488`, closing the `JSON-RECOVERY-01` residual), and
+  one recorded clean source with local plus dual-platform CI green
+  (`4e56f69` code, run `33663057012`). The historical FAIL packs stay
+  immutable and Context/GC/retrieval/packing remain frozen.
 
 **Repository-wide architecture audit (2026-08-31; started at `c8b9dbb`,
 incrementally reviewed through `c55429c`; findings now repaired by the
@@ -1390,8 +1391,8 @@ closed the selected-path P0/P1 and post-window implementation items on
    complete all-target workspace test suite all pass (the M10-facing suites
    are enumerated in the `RUNTIME-CONTEXT-COMMIT-01` re-audit record;
    provider-openai 101, agent-eval 203, agent-compose 18 include the
-   observer regressions); banking Ubuntu plus Windows CI on that exact tree
-   is the remaining half;
+   observer regressions); dual-platform CI is green on that exact code
+   (run `33663057012`, head `11070ac`, 2026-09-03) — this exit is closed;
 5. close or prove out-of-path every P1 item exercised by the candidate; only a
    settlement-changing candidate additionally needs the same-checkpoint fork;
 6. run one exact-source product preflight, then at most one freshly
