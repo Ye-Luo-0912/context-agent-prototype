@@ -60,18 +60,25 @@ run `33624084700`, 2026-09-02):**
   reconciled to one suspended-claims statement and README is aligned
   (renamed crate, complete crate list, historical `CONTEXT_RUNTIME_TODO.md`,
   authority pointers); it closes when this commit is recorded.
-- Remaining exits before any new formal window: the M15 gate sequence itself
-  (selected-path P1 spot-checks if the candidate changes, same-checkpoint
-  causal runner only for a settlement-changing candidate, one exact-source
-  product preflight, at most one freshly predeclared window). All
-  implementation exits are recorded: the M10 fault-gate re-audit (2026-09-03,
-  see the `RUNTIME-CONTEXT-COMMIT-01` re-audit record in
-  [`AUDIT_TODO.md`](AUDIT_TODO.md)), `GOV-STATUS-01` (closed on `bba1c76`),
-  the actor protocol-body regression (`e357bed`), the formal-path/product
-  retry observer (`7e02488`, closing the `JSON-RECOVERY-01` residual), and
-  one recorded clean source with local plus dual-platform CI green
-  (`4e56f69` code, run `33663057012`). The historical FAIL packs stay
-  immutable and Context/GC/retrieval/packing remain frozen.
+- Remaining exits before any new formal window: a green exact-source product
+  preflight, then at most one freshly predeclared window. The first preflight
+  attempt on the repaired clean source ran 2026-09-03 and is a typed
+  **NOT_RUN** (`crates/agent-eval/evidence/m15-preflight/`, source tree
+  digest `83b47da5...`, retained attempts 2–4): every model call to the
+  pinned relay's `/v1/responses` failed at connection level (the relay
+  accepts TCP and then closes on POST while `/v1/models` still answers 200)
+  across the full per-call retry budget and all three cell-level attempts.
+  This is the same relay transport-failure class that censored the earlier
+  serving-switch window; it is a serving availability problem, not a
+  candidate FAIL, so the candidate is not rejected and the preflight may be
+  rerun once the relay is restored. All other implementation exits are
+  recorded: the M10 fault-gate re-audit (2026-09-03,
+  `RUNTIME-CONTEXT-COMMIT-01` in [`AUDIT_TODO.md`](AUDIT_TODO.md)),
+  `GOV-STATUS-01` (`bba1c76`), the actor protocol-body regression
+  (`e357bed`), the formal-path/product retry observer (`7e02488`), and one
+  recorded clean source with local plus dual-platform CI green (`4e56f69`
+  code, run `33663057012`). The historical FAIL packs stay immutable and
+  Context/GC/retrieval/packing remain frozen.
 
 **Repository-wide architecture audit (2026-08-31; started at `c8b9dbb`,
 incrementally reviewed through `c55429c`; findings now repaired by the
@@ -1396,7 +1403,11 @@ closed the selected-path P0/P1 and post-window implementation items on
 5. close or prove out-of-path every P1 item exercised by the candidate; only a
    settlement-changing candidate additionally needs the same-checkpoint fork;
 6. run one exact-source product preflight, then at most one freshly
-   predeclared M15 window if every deterministic gate remains green.
+   predeclared M15 window if every deterministic gate remains green — the
+   2026-09-03 preflight attempt on the repaired source came back typed
+   NOT_RUN on relay transport failures (see the remaining-exits record
+   above); the candidate is not rejected and the preflight is rerun once
+   serving is stable;
 
 A base candidate with settlement projection off may proceed after these gates.
 Only a candidate that changes the model-visible settlement projection needs a

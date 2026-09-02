@@ -61,7 +61,11 @@ remain frozen.
 4. If—and only if—the candidate enables settlement projection, complete the
    same-checkpoint `EVAL-CAUSAL-01` fork. A settlement-off candidate skips it.
 5. Freeze source, surface, acceptance identity and serving; run one bounded
-   exact-source product preflight. Only a green preflight may authorize at
+   exact-source product preflight. The 2026-09-03 attempt on the repaired
+   clean source is a typed NOT_RUN (relay `/v1/responses` transport
+   failures, evidence retained under `evidence/m15-preflight/`): the
+   candidate is not rejected, and the preflight is rerun once the serving is
+   restored. Only a green preflight may authorize at
    most one freshly predeclared 12-cell v4 window. Valid FAIL rejects the
    candidate; only typed `NOT_RUN` permits rerunning the whole frozen window.
 
