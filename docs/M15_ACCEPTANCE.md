@@ -233,6 +233,26 @@ and one bounded-framer malformed-event. The candidate is rejected, the window
 is not rerun and M15 remains open. A settlement-enabled future candidate
 includes the common-prefix causal-fork exit; a settlement-off base does not.
 
+The attempt-incident admission candidate (operator-selected 2026-09-03 from
+that diagnosis; landed on `e897c5c`, deterministic matrix and clean-source/CI
+gates green, preflight PASS recorded on clean `51559d4`) then ran its own
+predeclared 12-cell v4 window on the same PinAI tuple at clean source
+`38d458e` (source digest `0cecc539...`) and is a **valid FAIL: 10/12 pass,
+0 NOT_RUN**, mechanically reported at
+`evidence/m15-window/_windows/1788402676712/`. Migrate 4/4; diag 3/4; policy
+3/4; behavior and allowed-diff pass 12/12; provider healthy in every cell.
+The two failures are completion-gate tails on functionally-correct workspaces:
+`retry_diag_dev normal r2` (48-round phase-one budget, `task.complete` refused
+18/18 on `acceptance_undeclared`/`operator_closure_only` plus later
+next-action; the written `checked_mul`/`min(63)` fix is correct and misses
+only the static `u128`/`leading_zeros` marker) and `retry_policy_dev resume
+r1` (48-round phase-two budget, `task.complete` refused 12/12 on
+verification-currentness/acceptance-coverage/open-loop/next-action; the
+2026-08-31 admission guarantee held — refusals never cite failed-command
+debt). Per §5 the valid FAIL rejects the candidate and returns to diagnosis;
+the window is not rerun and M15 remains open. Post-window diagnosis at
+[`evidence/m15-diagnosis-attempt-incident/REPORT.md`](../crates/agent-eval/evidence/m15-diagnosis-attempt-incident/REPORT.md).
+
 ## 1. V1 candidate composition
 
 | plane | evidence | status |
@@ -277,7 +297,8 @@ independent acceptance-domain revision/source identity and bounded
 model-request causal-audit fields. It does not reinterpret v3 verdicts.
 Five formal v4 windows are banked as valid FAILs (9/12 on `d1936d4`,
 10/12 on `a25a8a5`, 9/12 on `ab4534a`, 10/12 on `784d7aa`, and 6/12 on
-`43e1033`); no v4 window has passed. Each
+`43e1033`); a sixth valid FAIL (10/12 on `38d458e`) is recorded in §0; no
+v4 window has passed. Each
 immutable cell directory
 contains the manifest, full event stream, `dimensions.json`, hidden oracle
 records and workspace snapshot hash. The dimensions are persisted facts, not
@@ -399,10 +420,11 @@ surface, reject a serving or close M15.
 
 ## 7. Next execution gate
 
-Before spending another 12-cell window, preserve all five valid v4 FAILs and
-the three valid v3 FAILs; do not rerun the rejected `43e1033` source/serving
-candidate. A materially new candidate must first diagnose the latest immutable
-cells, then:
+Before spending another 12-cell window, preserve all six valid v4 FAILs (the
+latest 10/12 on `38d458e`) and
+the three valid v3 FAILs; do not rerun the rejected `43e1033` or `38d458e`
+source/serving candidates. A materially new candidate must first diagnose the
+latest immutable cells, then:
 
 1. pass deterministic attempt-incident versus task-obligation tests, including
    off-surface canonical/wire-name calls which remain visible but create no

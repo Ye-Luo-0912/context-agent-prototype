@@ -1216,7 +1216,7 @@ closure, and keep Self-Iteration blocked until the remaining exits land.
 
 ```text
 repaired-source + PinAI/Luna candidate REJECTED
-  (latest valid FAIL 6/12 on 43e1033; prior 784d7aa FAIL retained)
+  (latest valid FAIL at the time 6/12 on 43e1033; prior 784d7aa FAIL retained)
   -> repository-wide P0 close or exact selected-path exclusion
      [DONE 2026-09-02: all repaired in 615b5ed..6fdb4f0, CI green on 6fdb4f0]
   -> deterministic AttemptIncident / CompletionRepair / JSON replay gates
@@ -1236,11 +1236,16 @@ repaired-source + PinAI/Luna candidate REJECTED
      [DONE: 7e02488]
   -> same-checkpoint causal fork only if project_settlement changes
      [SKIPPED FOR THIS CANDIDATE: project_settlement=false]
+attempt-incident admission candidate (e897c5c)
+  -> deterministic attempt-incident/negative-fact matrix + record clean source
+     [DONE 2026-09-03: matrix green; clean source 03bc6d5; run 33703472111]
   -> new exact-source/product M15 preflight
-     [DONE: relay attempt retained NOT_RUN; PinAI/Luna attempt5 PASS]
+     [DONE: relay attempt retained NOT_RUN; PinAI/Luna attempt5 PASS on
+      c823a1c; attempt6 PASS on 51559d4]
   -> at most one freshly predeclared formal 12-cell M15 window
-     [DONE 2026-09-03: valid FAIL 6/12, 0 NOT_RUN, _windows/1788385151733]
-  -> candidate rejected; preserve the window and return to bounded diagnosis
+     [DONE 2026-09-03: valid FAIL 10/12, 0 NOT_RUN, _windows/1788402676712]
+  -> both candidates rejected; preserve the windows and return to bounded
+     diagnosis (m15-diagnosis-attempt-incident/REPORT.md)
 ```
 
 The settlement candidate gate, if it is run again after deterministic fixes,
@@ -2815,7 +2820,7 @@ Full text: git history of this file.
 
 | ID | Closed as |
 | --- | --- |
-| EVAL-07 | M15 v2 evidence remains forensic-only; the typed v3/v4 reconstruction, content-addressed reporter (`ea821bb`), bounded failure-monotone harness (`f57a118`) and decision-grade windows close the evidence-projection defect. Five v4 valid FAILs are banked through `_windows/1788385151733` (6/12, 0 NOT_RUN); M15 remains open. |
+| EVAL-07 | M15 v2 evidence remains forensic-only; the typed v3/v4 reconstruction, content-addressed reporter (`ea821bb`), bounded failure-monotone harness (`f57a118`) and decision-grade windows close the evidence-projection defect. Six v4 valid FAILs are banked through `_windows/1788402676712` (10/12, 0 NOT_RUN); M15 remains open. |
 | 2026-08-10 repair pass | Workspace prefix, git.diff, focus/restore fences, context-service parity, journal/restore |
 | CTX-01..CTX-10 | Episode, residency, fetch/search persist, store, Storage GC, GC ops, materializer, mid-turn signals, clocks, TaskAnchor |
 | CTX-06..CTX-09 | GC/storage ops, materializer budget, working-set signals, lifecycle clocks |

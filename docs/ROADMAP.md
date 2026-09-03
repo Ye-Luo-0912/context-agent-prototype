@@ -25,7 +25,7 @@ copy them back.
 | M12 Effect Runtime | 🧾 closure-audit evidence banked; recovery P0 repaired, claims suspended | The clean-tree evidence table remains immutable. `EFFECT-ACK-CLASS-01` (typed settlements, journal v2, no-strengthening recovery) and `PROCESS-COORDINATOR-01` (bounded coordinator wire) are repaired in `6112ffd`/`43eb87b`. No new closure claim until the recorded 2026-09-03 doc tranche and the M15-facing exits land. Details: [`PLATFORM_SECURITY.md`](PLATFORM_SECURITY.md). |
 | M13 Extension Sandbox | 🧾 closure-audit evidence banked; attestation P0 repaired, claims suspended | The clean-tree audit remains immutable. `SANDBOX-ATTEST-TRUNCATE-01` is repaired in `e5e712f` (write-floor attestation only at enforcing ABIs). Universal native `UntrustedGenerated` availability is not V1 and WASI remains V2. No new closure claim until the recorded 2026-09-03 doc tranche and the M15-facing exits land. Details: [`PLATFORM_SECURITY.md`](PLATFORM_SECURITY.md). |
 | M14 Resource Policy | ✅ | Schema/context quotas, standing grants, output broker, authority leases. Further typed policy is not a reopen of this gate. |
-| M15 Real Evaluation | 🛑 open; five v4 valid FAILs banked, latest 6/12; returns to diagnosis | Five valid v4 FAIL windows and three valid v3 windows remain immutable diagnostics. The latest window (2026-09-03, repaired source `43e1033`, PinAI `gpt-5.6-luna` tuple) is 6/12 — migrate 4/4, diag 1/4 (overflow edge), policy 1/4 (two 48-round completion-gate loops, one bounded-framer chunk-cap malformed-event). Per M15_ACCEPTANCE §5 the candidate is rejected and the window is not rerun; a new candidate needs diagnosis, deterministic gates, a fresh preflight and a fresh predeclared window. Formal M15 remains 3 fixtures × normal/resume × 2 repeats, never settlement off/on. See [`M15_ACCEPTANCE.md`](M15_ACCEPTANCE.md). |
+| M15 Real Evaluation | 🛑 open; six v4 valid FAILs banked, latest 10/12; returns to diagnosis | Six valid v4 FAIL windows and three valid v3 windows remain immutable diagnostics. The latest window (2026-09-03, attempt-incident candidate source `38d458e`, PinAI `gpt-5.6-luna` tuple) is 10/12 — migrate 4/4, diag 3/4, policy 3/4, behavior/diff pass 12/12 with provider healthy everywhere; the two failures are completion-gate tails on functionally-correct workspaces (static marker-check misses plus `task.complete` refusal loops). Per M15_ACCEPTANCE §5 the candidate is rejected and the window is not rerun; a new candidate needs diagnosis, deterministic gates, a fresh preflight and a fresh predeclared window. Formal M15 remains 3 fixtures × normal/resume × 2 repeats, never settlement off/on. See [`M15_ACCEPTANCE.md`](M15_ACCEPTANCE.md). |
 | V2 Self-Iteration | 🔒 blocked | Until the governing M12/M13 status is reconciled and M15 closes. The agent may grow capabilities, never evaluation or permission Core authority. |
 
 Open gate order (post-repair, updated 2026-09-03): ~~M10 fault-gate re-audit
@@ -37,10 +37,13 @@ source with Ubuntu/Windows CI~~ (recorded: `4e56f69` code, run
 `33663057012`) → ~~selected-path P1 disposition for this candidate~~
 (accepted for the frozen run; repository-wide residuals remain in
 `AUDIT_TODO.md`)
-→ ~~same-checkpoint causal runner~~ (settlement-off candidate skips it) →
-~~new exact-source product preflight~~ (relay NOT_RUN retained; PinAI tuple
+→ ~~same-checkpoint causal runner~~ (settlement-off candidate skips it) → ~~new exact-source product preflight~~ (relay NOT_RUN retained; PinAI tuple
 PASS 2026-09-03) → ~~predeclared M15 window~~ (ran 2026-09-03: valid FAIL
-6/12, `_windows/1788385151733`) → the route returns to diagnosis and a new
+6/12, `_windows/1788385151733`) → ~~attempt-incident candidate selected
+2026-09-03 (`e897c5c`), deterministic matrix + clean source + dual-platform
+CI green, product preflight PASS on `51559d4`, at most one freshly
+predeclared window~~ (ran 2026-09-03 on `38d458e`: valid FAIL 10/12,
+`_windows/1788402676712`) → the route returns to diagnosis and a new
 candidate decision. The platform audit
 evidence stays banked, M14 is not reopened, and Context/GC/retrieval/packing
 remain frozen.
@@ -48,12 +51,16 @@ remain frozen.
 ## Ordered route
 
 1. Preserve the valid 6/12 FAIL at
-   `evidence/m15-window/_windows/1788385151733/` and every earlier valid FAIL.
-   Do not rerun the repaired-source + PinAI/Luna candidate.
+   `evidence/m15-window/_windows/1788385151733/` and the valid 10/12 FAIL at
+   `evidence/m15-window/_windows/1788402676712/` plus every earlier valid FAIL.
+   Do not rerun the repaired-source + PinAI/Luna candidate or the
+   attempt-incident admission candidate.
 2. Reconstruct a bounded diagnosis from the immutable cells. Keep the diag
    overflow-edge failures, policy completion-gate tails and the one bounded-
    framer malformed-event separate until typed evidence establishes a common
-   cause.
+   cause. The attempt-incident window (10/12) is now its own valid FAIL with
+   its own post-window diagnosis at
+   `evidence/m15-diagnosis-attempt-incident/REPORT.md`.
 3. Select one materially new candidate from that diagnosis. Do not retune
    Context/GC/retrieval/packing, weaken resource/protocol bounds, add prompt
    pressure or introduce a TaskGraph to repair this gate.
@@ -75,7 +82,10 @@ semantics, Provider buffering and any public property verifier have independent
 authorities and acceptance risks; they must not be bundled into one change and
 then credited with one aggregate result.
 
-- Step 3 above remains open: select exactly one materially new product/serving
+- The attempt-incident admission candidate was selected from the 6/12
+  diagnosis (`e897c5c`, 2026-09-03) and has now run its own predeclared
+  window: valid FAIL 10/12 on `38d458e` (`_windows/1788402676712`). Step 3
+  above is therefore open again: select one materially new product/serving
   candidate before changing formal evidence.
 - `EVAL-PREFLIGHT-01` may improve the developer/evaluation gate independently,
   but it neither repairs a valid cell FAIL nor authorizes a formal window.

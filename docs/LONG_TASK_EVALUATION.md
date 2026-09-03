@@ -857,7 +857,7 @@ prospective schema is `retry-pilot-cell-v4`, adding stable pair/source identity,
 acceptance-declaration identity and bounded request-audit facts; no v4 formal
 window was banked at that point.
 
-Repository-audit correction (2026-08-31; updated 2026-09-03): five v4
+Repository-audit correction (2026-08-31; updated 2026-09-03): six v4
 valid-FAIL windows are banked. The reporter reconstructs dimensions and
 verdicts from content-addressed events/hidden verification/workspace records
 and binds window manifests to cell digests rather than paths
@@ -867,7 +867,7 @@ harness failures are failure-monotone (`M15-HARNESS-BOUNDARY-01`, `f57a118`).
 Historical FAIL bundles remain immutable diagnostics; the pre-window
 implementation exits (formal-path retry observer `7e02488`, M10 re-audit
 record, `GOV-STATUS-01` on `bba1c76`), the PinAI product preflight and the
-latest 6/12 valid FAIL are recorded in [`STATUS.md`](STATUS.md).
+latest 10/12 valid FAIL are recorded in [`STATUS.md`](STATUS.md).
 
 Serving preflight status 2026-08-28: a source-bound dirty-tree diagnostic
 `retry_policy_dev` normal cell passed the stricter closure-required profile on
@@ -1081,12 +1081,21 @@ closes it as an ordinary turn. Deterministic coverage uses that order.
 
 ### Current delivery order
 
-The latest formal window (`_windows/1788385151733`, 2026-09-03) is a valid FAIL
-6/12 with 0 NOT_RUN on clean source `43e1033` and the PinAI/Luna tuple. Migrate
+The latest formal window (`_windows/1788402676712`, 2026-09-03) is a valid
+FAIL 10/12 with 0 NOT_RUN on clean source `38d458e` (attempt-incident
+admission candidate, `e897c5c`) and the PinAI/Luna tuple. Migrate passed 4/4;
+diag passed 3/4; policy passed 3/4; behavior/diff pass 12/12 with provider
+healthy everywhere. The two failures are completion-gate tails on
+functionally-correct workspaces (injected oracle tests pass in both; the
+failing diag cell missed only the static `u128`/`leading_zeros` marker, and
+the policy refusals never cite failed-command debt). Post-window diagnosis at
+`crates/agent-eval/evidence/m15-diagnosis-attempt-incident/REPORT.md`.
+The prior window (`_windows/1788385151733`, 2026-09-03) was a valid FAIL
+6/12 with 0 NOT_RUN on clean source `43e1033`. Migrate
 passed 4/4; diag passed 1/4; policy passed 1/4. The immutable streams show three
 separate failure surfaces: the overflow-edge behavior miss, long completion-
-gate tails, and one fail-closed bounded-framer malformed-event. Continue in this
-order:
+gate tails, and one fail-closed bounded-framer malformed-event. Continue in
+this order:
 
 1. Preserve the window and do not rerun its exact source/serving candidate.
 2. Reconstruct each failure from typed events, verification and final workspace

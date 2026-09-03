@@ -163,6 +163,43 @@ run `33624084700`, 2026-09-02):**
   decision bounded by the frozen route (no Context/GC retune, no protocol
   weakening, no round stop, no TaskGraph, no prompt pressure).
 
+**Attempt-incident admission candidate window (2026-09-03; source `38d458e`,
+preflight PASS and predeclaration recorded in that commit):**
+
+- The 12-cell v4 window on the attempt-incident candidate + PinAI tuple is
+  **predeclared 2026-09-03 before its run** (M15_ACCEPTANCE §7 item 8):
+  3 fixtures × normal/resume × 2 repeats, the product surface (TaskProgress
+  on, settlement and advisory candidates off, no counterfactual second
+  request), the pinned serving tuple above, one uninterrupted
+  `agent-eval --m15-window` run whose cell directories land under
+  `crates/agent-eval/evidence/m15-window/_windows/1788402676712/`. The
+  exact clean source identity is recorded at launch; no source change
+  happens during the run, the frozen-window rules of M15_ACCEPTANCE §5
+  apply, and the mechanically regenerated report is the only accepted
+  verdict.
+- The 12-cell window ran on the predeclared clean source `38d458e`
+  (cell-recorded source tree digest `0cecc539...`) and is a **valid FAIL:
+  10/12 pass, 0 NOT_RUN** — the mechanical report at
+  `crates/agent-eval/evidence/m15-window/_windows/1788402676712/`. Migrate
+  4/4 (7–19 rounds, clean continuation everywhere resumed); diag 3/4;
+  policy 3/4. Behavior and allowed-diff pass 12/12; provider healthy in
+  every cell; closures 3/12 (all three policy cells that closed used
+  `task.complete`). The two failures are `retry_diag_dev normal r2`
+  (48-round phase-one budget; `task.complete` refused 18/18 over
+  `acceptance_undeclared` + `operator_closure_only` + later next-action)
+  and `retry_policy_dev resume r1` (48-round phase-two budget;
+  `task.complete` refused 12/12 over verification-currentness /
+  acceptance-coverage / open-loop / next-action blockers). Both failing
+  cells carry functionally-correct workspaces whose injected oracle tests
+  pass — the `checked_shl` diag trap did not recur (the failing diag cell
+  wrote a correct `checked_mul`/`min(63)` shape and missed only the static
+  `u128`/`leading_zeros` marker), and the 2026-08-31 P1 admission guarantee
+  held (policy refusals never cite failed-command debt). Per
+  M15_ACCEPTANCE §5 the valid FAIL rejects the candidate and returns to
+  diagnosis; the window is not rerun. Post-window diagnosis at
+  [`evidence/m15-diagnosis-attempt-incident/REPORT.md`](../crates/agent-eval/evidence/m15-diagnosis-attempt-incident/REPORT.md).
+  M15 remains open; candidate selection is a user decision.
+
 **Repository-wide architecture audit (2026-08-31; started at `c8b9dbb`,
 incrementally reviewed through `c55429c`; findings now repaired by the
 tranche above):**
@@ -468,10 +505,11 @@ tranche above):**
   formal-path complete retry evidence and immutable-round schema validation
   remain open in `AUDIT_TODO.md`.
 - M15 remains open. Its shape remains 3 fixtures × normal/resume × 2 repeats =
-  12 cells. Historical v3 FAIL windows remain immutable; five v4 valid FAILs
+  12 cells. Historical v3 FAIL windows remain immutable; six v4 valid FAILs
   are banked: 9/12 on `d1936d4`, 10/12 on `a25a8a5`, 9/12 on `ab4534a`,
-  10/12 on `784d7aa`, and 6/12 on `43e1033`
-  (`_windows/1788385151733`, 0 NOT_RUN). No v4 window has passed.
+  10/12 on `784d7aa`, 6/12 on `43e1033`
+  (`_windows/1788385151733`, 0 NOT_RUN), and 10/12 on `38d458e`
+  (`_windows/1788402676712`, 0 NOT_RUN). No v4 window has passed.
   `GOV-STATUS-01` closed on `bba1c76`; M12/M13 claims remain suspended by
   the open M15 gate, so Self-Iteration remains blocked.
 
@@ -1457,10 +1495,12 @@ task-aware, its tail metric does not stop when work reopens, and its live runner
 The next milestone is a **materially new, mechanically convergent execution
 candidate**, not another prompt tweak or an immediate rerun. The repaired-source
 + PinAI/Luna candidate was rejected by the valid 6/12 window at
-`_windows/1788385151733`; the current order is:
+`_windows/1788385151733`, and the attempt-incident admission candidate was then
+rejected by the valid 10/12 window at `_windows/1788402676712`; the current
+order is:
 
-1. preserve that window and its predecessors unchanged; do not rerun the
-   rejected source/serving candidate;
+1. preserve both windows and their predecessors unchanged; do not rerun the
+   rejected source/serving candidates;
 2. diagnose the immutable cell streams: the diag overflow-edge misses, the
    policy completion-gate tails and the bounded-framer malformed-event are
    distinct observations until evidence proves a shared cause — **done
@@ -1501,15 +1541,35 @@ candidate**, not another prompt tweak or an immediate rerun. The repaired-source
    recorded in the attempt manifest): `retry_policy_dev` normal, product
    surface, behavior/diff pass, closure completed, provider healthy,
    27 model rounds, hidden oracle green.
-- The 12-cell v4 window on the attempt-incident candidate + PinAI tuple is
+- The 12-cell v4 window on the attempt-incident candidate + PinAI tuple was
   **predeclared 2026-09-03 before its run** (M15_ACCEPTANCE §7 item 8):
   3 fixtures × normal/resume × 2 repeats, the product surface, the pinned
   serving tuple (`https://api.pinaic.com/v1`, `gpt-5.6-luna`, Responses,
   128,000-token context, 4,096 max output tokens), one uninterrupted
-  `agent-eval --m15-window` run. The exact clean source identity is recorded
-  at launch; no source change happens during the run; the mechanically
-  regenerated report is the only accepted verdict. Valid FAIL rejects the
-  candidate; only a typed NOT_RUN permits a whole-window rerun.
+  `agent-eval --m15-window` run; the exact clean source identity was recorded
+  at launch (cell-recorded source tree digest `0cecc539...`), no source
+  change happened during the run, and the mechanically regenerated report is
+  the only accepted verdict.
+- The 12-cell v4 window ran 2026-09-03 on the predeclared clean source
+  `38d458e` and is a **valid FAIL: 10/12 pass, 0 NOT_RUN** — the mechanical
+  report at `crates/agent-eval/evidence/m15-window/_windows/1788402676712/`.
+  Migrate 4/4 (7–19 rounds, clean continuation where resumed); diag 3/4;
+  policy 3/4. Behavior and allowed-diff pass 12/12; provider healthy in
+  every cell; closures 3/12 (all three policy cells that closed used
+  `task.complete`). The two failures are `retry_diag_dev normal r2`
+  (48-round phase-one budget; `task.complete` refused 18/18 over
+  `acceptance_undeclared` + `operator_closure_only` + later next-action) and
+  `retry_policy_dev resume r1` (48-round phase-two budget; `task.complete`
+  refused 12/12 over verification-currentness/acceptance-coverage/open-loop
+  blockers). Both failing cells carry functionally-correct workspaces whose
+  injected oracle tests pass — the `checked_shl` diag trap did not recur
+  (the failing diag cell wrote a correct `checked_mul`/`min(63)` shape and
+  missed only the static `u128`/`leading_zeros` marker), and the 2026-08-31
+  P1 admission guarantee held (the policy refusals never cite failed-command
+  debt). Per M15_ACCEPTANCE §5 the valid FAIL rejects the candidate and
+  returns to diagnosis; the window is not rerun. Post-window diagnosis at
+  [`crates/agent-eval/evidence/m15-diagnosis-attempt-incident/REPORT.md`](../crates/agent-eval/evidence/m15-diagnosis-attempt-incident/REPORT.md).
+  M15 remains open; candidate selection is a user decision.
 
 **Workload disposition (2026-09-03; documentation only):** the proposed
 "one-stop reliability" umbrella is a **large, multi-slice effort**, not one
