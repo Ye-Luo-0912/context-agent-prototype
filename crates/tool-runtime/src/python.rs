@@ -561,10 +561,14 @@ mod tests {
                     .stderr(Stdio::null());
                 // Give the fixture its own group so identity-checked test
                 // cleanup can terminate it without using the already-reaped
-                // parent's stale PID.
+                // parent's stale PID. The fixture process must outlive this
+                // handler, so the child is reaped on a detached thread.
                 use std::os::unix::process::CommandExt;
                 descendant.process_group(0);
-                descendant.spawn().unwrap();
+                let child = descendant.spawn().unwrap();
+                std::thread::spawn(move || {
+                    let _ = child.wait();
+                });
             }
             #[cfg(target_os = "linux")]
             Ok("inherited-stdout-descendant") => {
