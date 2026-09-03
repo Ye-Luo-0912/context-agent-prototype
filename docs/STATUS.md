@@ -1494,7 +1494,22 @@ candidate**, not another prompt tweak or an immediate rerun. The repaired-source
    (run `33703472111`, 2026-09-03);
 5. run the same-checkpoint causal fork only if settlement projection changes,
    then one fresh exact-source product preflight and at most one freshly
-   predeclared M15 window.
+   predeclared M15 window — the candidate does not touch the settlement
+   projection (skip the fork); the fresh preflight **PASSED** 2026-09-03 on
+   the clean source `51559d4` (attempt `r1-attempt6` under
+   `evidence/m15-preflight/`, source tree digest `7afea564...`, serving
+   recorded in the attempt manifest): `retry_policy_dev` normal, product
+   surface, behavior/diff pass, closure completed, provider healthy,
+   27 model rounds, hidden oracle green.
+- The 12-cell v4 window on the attempt-incident candidate + PinAI tuple is
+  **predeclared 2026-09-03 before its run** (M15_ACCEPTANCE §7 item 8):
+  3 fixtures × normal/resume × 2 repeats, the product surface, the pinned
+  serving tuple (`https://api.pinaic.com/v1`, `gpt-5.6-luna`, Responses,
+  128,000-token context, 4,096 max output tokens), one uninterrupted
+  `agent-eval --m15-window` run. The exact clean source identity is recorded
+  at launch; no source change happens during the run; the mechanically
+  regenerated report is the only accepted verdict. Valid FAIL rejects the
+  candidate; only a typed NOT_RUN permits a whole-window rerun.
 
 **Workload disposition (2026-09-03; documentation only):** the proposed
 "one-stop reliability" umbrella is a **large, multi-slice effort**, not one
