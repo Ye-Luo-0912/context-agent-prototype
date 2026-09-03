@@ -216,7 +216,7 @@ artifact; without it the stderr retry line stays the human channel. The
 channel remains a best-effort diagnostic artifact, not durable formal
 evidence: a cell verdict never depends on it.
 
-### EVAL-PREFLIGHT-01 — one hermetic developer/evaluation gate runner (**closed on `<doctor commit>`: parse-first CLI `131c82f` + the `--doctor` gate runner, verified end-to-end 2026-09-03**)
+### EVAL-PREFLIGHT-01 — one hermetic developer/evaluation gate runner (**closed on `1c94c31`: parse-first CLI `131c82f` + the `--doctor` gate runner, verified end-to-end 2026-09-03**)
 
 Landed slice (2026-09-03, `131c82f`): `agent-eval` now parses and validates
 every global option (`--repeats`, `--evidence-dir`, `--include-swebench`,
