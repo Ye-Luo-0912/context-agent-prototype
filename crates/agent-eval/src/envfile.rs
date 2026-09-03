@@ -1,4 +1,5 @@
-//! 本地 live 配置：从 `eval.env` 读 `OPENAI_*`，不把 key 写进证据包。
+//! 本地 live/eval 配置：从 `eval.env` 读允许的 Provider 与 Python 项，
+//! 不把 key 写进证据包。
 //! 进程环境里已有的变量优先，方便 CI / 临时覆盖。
 
 use std::collections::BTreeMap;
@@ -12,6 +13,8 @@ const ALLOWED: &[&str] = &[
     "OPENAI_API_PROTOCOL",
     "OPENAI_CONTEXT_WINDOW",
     "OPENAI_MAX_OUTPUT_TOKENS",
+    "AGENT_PYTHON",
+    "AGENT_EVAL_PYTHON",
 ];
 
 struct Loaded {
@@ -114,7 +117,7 @@ pub fn parse_eval_env(text: &str) -> anyhow::Result<BTreeMap<String, String>> {
         let key = key.trim();
         if !ALLOWED.contains(&key) {
             anyhow::bail!(
-                "line {}: refusing to load {key} (only OPENAI_API_KEY / OPENAI_BASE_URL / OPENAI_MODEL / OPENAI_API_PROTOCOL / OPENAI_CONTEXT_WINDOW / OPENAI_MAX_OUTPUT_TOKENS)",
+                "line {}: refusing to load {key} (only declared OPENAI_* serving keys and AGENT_PYTHON / AGENT_EVAL_PYTHON are allowed)",
                 index + 1
             );
         }
@@ -173,7 +176,8 @@ mod tests {
              OPENAI_BASE_URL=https://api.pinaic.com/v1\n\
              OPENAI_API_KEY='sk-test'\n\
              OPENAI_API_PROTOCOL=responses\n\
-             OPENAI_CONTEXT_WINDOW=128000\n",
+             OPENAI_CONTEXT_WINDOW=128000\n\
+             AGENT_PYTHON=/opt/python3\n",
         )
         .unwrap();
         assert_eq!(
@@ -195,6 +199,10 @@ mod tests {
         assert_eq!(
             map.get("OPENAI_CONTEXT_WINDOW").map(String::as_str),
             Some("128000")
+        );
+        assert_eq!(
+            map.get("AGENT_PYTHON").map(String::as_str),
+            Some("/opt/python3")
         );
     }
 

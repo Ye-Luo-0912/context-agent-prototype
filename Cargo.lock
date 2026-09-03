@@ -63,8 +63,11 @@ name = "agent-context-service"
 version = "0.1.0"
 dependencies = [
  "agent-contracts",
+ "agent-core",
  "agent-platform-protocol",
  "agent-process",
+ "agent-runtime",
+ "async-trait",
  "context-baselines",
  "context-contextcore",
  "context-simple",
@@ -439,16 +442,11 @@ dependencies = [
 name = "context-contextcore"
 version = "0.1.0"
 dependencies = [
- "agent-context-service",
  "agent-contracts",
- "agent-core",
  "agent-process",
- "agent-runtime",
  "async-trait",
- "context-simple",
  "serde",
  "serde_json",
- "tokio",
 ]
 
 [[package]]

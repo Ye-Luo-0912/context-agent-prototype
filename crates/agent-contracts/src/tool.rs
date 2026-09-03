@@ -1052,10 +1052,12 @@ pub enum ToolFailureClass {
     /// boundary. An attempt incident: nothing was read or written, and the
     /// boundary itself is not task work.
     HiddenPath,
-    /// A path precondition failed. A missing parent or a missing required
+    /// A path precondition failed. A missing parent or a missing task-rooted
     /// read target is a real resource reconciliation, so the failure keeps
     /// its completion-debt semantics (recoverable through the typed
-    /// directory-recovery surface for writes).
+    /// directory-recovery surface for writes). A trusted, unrooted
+    /// observation/search miss may instead remain a revision-bound negative
+    /// fact without becoming task debt.
     PathNotFound,
     /// Core rejected the call against the immutable model surface before
     /// approval or dispatch. It is an attempt incident, not evidence that task

@@ -271,7 +271,7 @@ async fn scenario_core(
             lifecycle.always_loaded.push(name.to_string());
         }
     }
-    let base = Arc::new(BuiltinToolDispatcher::with_config(workspace, lifecycle));
+    let base = Arc::new(BuiltinToolDispatcher::with_config(workspace, lifecycle)?);
     let tools: Arc<dyn ToolDispatcher> = match extra {
         Some(extra) => Arc::new(ChainedDispatcher {
             builtin: base.clone(),
@@ -793,7 +793,7 @@ async fn drive_broker_unavailable(
             effect_broker: Some(Arc::new(FailingBroker)),
             ..CoreAuthorityConfig::default()
         };
-        let tools = Arc::new(BuiltinToolDispatcher::new(workspace.clone()));
+        let tools = Arc::new(BuiltinToolDispatcher::new(workspace.clone())?);
         let port = build_core_port(
             config,
             Arc::new(NoopContext),
@@ -1329,7 +1329,8 @@ fn binding_kind(binding: &HostEffectBinding) -> &'static str {
 /// classification; anything the production dispatcher surfaces without a
 /// table entry shows up unresolved instead of passing silently.
 async fn mechanical_rows(rows: &mut Vec<ClosureRow>, workspace: &Workspace) {
-    let dispatcher = BuiltinToolDispatcher::new(workspace.clone());
+    let dispatcher = BuiltinToolDispatcher::new(workspace.clone())
+        .expect("closure fixture has no fallible Python verifier discovery");
     let specs = dispatcher.specs();
 
     for policy in BUILTIN_TOOL_POLICIES.iter() {
@@ -1682,7 +1683,7 @@ async fn readonly_spot_check(rows: &mut Vec<ClosureRow>, fixtures: &TempDir, wor
             effect_broker: Some(Arc::new(broker)),
             ..CoreAuthorityConfig::default()
         };
-        let tools = Arc::new(BuiltinToolDispatcher::new(workspace));
+        let tools = Arc::new(BuiltinToolDispatcher::new(workspace)?);
         let port = build_core_port(
             config,
             Arc::new(NoopContext),

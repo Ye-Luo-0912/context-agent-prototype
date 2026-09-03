@@ -20,6 +20,27 @@ impl fmt::Display for ModelProtocolErrorKind {
     }
 }
 
+/// A bounded local resource owned by the runtime or one of its adapters.
+///
+/// This is deliberately separate from [`ModelProtocolErrorKind`]: exhausting
+/// a local buffer says nothing about whether the provider's wire data was
+/// malformed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum LocalResourceLimitKind {
+    BufferedModelStreamChunks,
+    BufferedModelStreamBytes,
+}
+
+impl fmt::Display for LocalResourceLimitKind {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(match self {
+            Self::BufferedModelStreamChunks => "buffered-model-stream-chunks",
+            Self::BufferedModelStreamBytes => "buffered-model-stream-bytes",
+        })
+    }
+}
+
 /// A server-requested retry delay with a hard cross-runtime bound.
 ///
 /// Providers may report arbitrarily large values. The contract caps one retry
@@ -84,6 +105,16 @@ pub enum AgentError {
     /// with the same request budget.
     #[error("model output limit reached: {reason}")]
     ModelOutputLimit { reason: String },
+
+    /// A process-local safety bound was reached while handling otherwise
+    /// unclassified data. This is non-retryable by default: retrying the same
+    /// request against the same local limit cannot make more capacity appear.
+    #[error("local resource limit exceeded ({kind}): observed={observed}, limit={limit}")]
+    LocalResourceLimit {
+        kind: LocalResourceLimitKind,
+        observed: u64,
+        limit: u64,
+    },
 
     #[error("transport error (retryable={retryable}): {message}")]
     Transport { retryable: bool, message: String },
@@ -156,6 +187,23 @@ mod tests {
             AgentError::ModelProtocol {
                 kind: ModelProtocolErrorKind::MalformedToolCall,
                 ..
+            }
+        ));
+    }
+
+    #[test]
+    fn local_resource_limit_is_not_protocol_damage() {
+        let error = AgentError::LocalResourceLimit {
+            kind: LocalResourceLimitKind::BufferedModelStreamChunks,
+            observed: 17,
+            limit: 16,
+        };
+        assert!(matches!(
+            error,
+            AgentError::LocalResourceLimit {
+                kind: LocalResourceLimitKind::BufferedModelStreamChunks,
+                observed: 17,
+                limit: 16,
             }
         ));
     }

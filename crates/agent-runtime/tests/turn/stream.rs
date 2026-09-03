@@ -5,6 +5,10 @@ use agent_contracts::{
     ModelOutput, ModelRequest, ModelTransport, OperationId, RuntimeEvent, RuntimeEventEnvelope,
     TurnCancelAck, TurnCancellationReason,
 };
+use agent_core::{CoreAuthorityConfig, PolicyApprovalGate};
+use agent_runtime::{RuntimeServices, spawn_runtime};
+use agent_workspace::Workspace;
+use tokio::sync::Notify;
 
 use crate::harness::*;
 
@@ -19,6 +23,28 @@ impl ModelTransport for HangingModel {
     async fn complete(&self, request: ModelRequest) -> AgentResult<ModelOutput> {
         request.cancel.cancelled().await;
         Err(agent_contracts::AgentError::Cancelled)
+    }
+}
+
+/// Deliberately ignores cancellation until the test releases it. Real
+/// provider transports can have the same short-lived lag while a request is
+/// unwinding, so actor shutdown may not assume the model future is gone.
+#[derive(Debug)]
+struct CancellationLagModel {
+    entered: Arc<Notify>,
+    release: Arc<Notify>,
+}
+
+#[async_trait::async_trait]
+impl ModelTransport for CancellationLagModel {
+    fn capabilities(&self) -> ModelCapabilities {
+        ModelCapabilities::default()
+    }
+
+    async fn complete(&self, _request: ModelRequest) -> AgentResult<ModelOutput> {
+        self.entered.notify_one();
+        self.release.notified().await;
+        Err(AgentError::Cancelled)
     }
 }
 
@@ -197,6 +223,53 @@ async fn streamed_cancellation_and_shutdown_leave_a_contiguous_recovery_trace() 
     for (expected, envelope) in (1u64..).zip(durable.iter()) {
         assert_eq!(envelope.seq, expected);
     }
+}
+
+#[tokio::test]
+async fn cancelled_model_future_does_not_retain_runtime_services_after_shutdown() {
+    let entered = Arc::new(Notify::new());
+    let release = Arc::new(Notify::new());
+    let tools = Arc::new(TestToolDispatcher);
+    let directory = tempfile::tempdir().unwrap();
+    let workspace = Workspace::open(directory.path()).await.unwrap();
+    let services = Arc::new(
+        RuntimeServices::new(
+            CoreAuthorityConfig::default(),
+            Arc::new(TestContextEngine),
+            Arc::new(CancellationLagModel {
+                entered: entered.clone(),
+                release: release.clone(),
+            }),
+            tools.clone(),
+            Arc::new(PolicyApprovalGate::read_only()),
+            None,
+        )
+        .with_artifact_workspace(Arc::new(workspace)),
+    );
+    let (handle, actor_task) = spawn_runtime(services.clone());
+    drop(services);
+    handle.start().await.unwrap();
+    handle
+        .user_message("start slow request".into())
+        .await
+        .unwrap();
+    tokio::time::timeout(Duration::from_secs(2), entered.notified())
+        .await
+        .expect("model request never started");
+
+    handle.stop().await.unwrap();
+    actor_task.await.unwrap();
+
+    assert_eq!(
+        Arc::strong_count(&tools),
+        1,
+        "a cancelled provider future must not retain the tool/workspace service bundle"
+    );
+    let reopened = Workspace::open(directory.path())
+        .await
+        .expect("shutdown must release the workspace effect-journal lock");
+    drop(reopened);
+    release.notify_waiters();
 }
 
 /// Returns one plain text answer with a fixed provider usage report.

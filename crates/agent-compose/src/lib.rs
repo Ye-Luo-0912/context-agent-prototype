@@ -458,7 +458,7 @@ mod tests {
         let model: Arc<dyn ModelTransport> = Arc::new(MockModelTransport);
         let approval: Arc<dyn ApprovalGate> = Arc::new(PolicyApprovalGate::permissive());
         let base_tools: Arc<dyn ToolDispatcher> =
-            Arc::new(BuiltinToolDispatcher::new(workspace.clone()));
+            Arc::new(BuiltinToolDispatcher::new(workspace.clone()).unwrap());
         ComposeConfig {
             workspace,
             context_engine: engine,

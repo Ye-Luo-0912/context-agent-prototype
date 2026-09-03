@@ -597,15 +597,26 @@ pub fn standin_reason(task: &SuiteTask) -> Option<String> {
     None
 }
 
-fn resolve_program(name: &str) -> String {
-    if name == "python" {
-        crate::harvest::python_bin()
+fn resolve_program(argv: &[String]) -> anyhow::Result<Vec<String>> {
+    if argv.first().is_some_and(|name| name == "python") {
+        Ok(crate::harvest::python_interpreter()?.command_argv(argv.iter().skip(1).cloned()))
     } else {
-        name.to_string()
+        Ok(argv.to_vec())
     }
 }
 
 pub fn run_hidden_command(root: &Path, spec: &SuiteHiddenCommand) -> HiddenCommandResult {
+    run_hidden_command_with(root, spec, resolve_program)
+}
+
+fn run_hidden_command_with<F>(
+    root: &Path,
+    spec: &SuiteHiddenCommand,
+    resolve: F,
+) -> HiddenCommandResult
+where
+    F: FnOnce(&[String]) -> anyhow::Result<Vec<String>>,
+{
     if spec.argv.is_empty() {
         return HiddenCommandResult {
             argv: spec.argv.clone(),
@@ -619,16 +630,30 @@ pub fn run_hidden_command(root: &Path, spec: &SuiteHiddenCommand) -> HiddenComma
     } else {
         spec.timeout_ms.clamp(1, MAX_TIMEOUT_MS)
     });
-    let program = resolve_program(&spec.argv[0]);
-    let mut command = Command::new(&program);
+    let argv = match resolve(&spec.argv) {
+        Ok(argv) => argv,
+        Err(error) => {
+            return HiddenCommandResult {
+                argv: spec.argv.clone(),
+                expect_exit: spec.expect_exit,
+                stderr: error.to_string(),
+                setup_failure: Some(
+                    crate::workload::HiddenCommandSetupFailure::PythonInterpreterUnavailable,
+                ),
+                passed: false,
+                ..HiddenCommandResult::default()
+            };
+        }
+    };
+    let mut command = Command::new(&argv[0]);
     command
-        .args(&spec.argv[1..])
+        .args(&argv[1..])
         .current_dir(root)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
     scrub_env(&mut command);
-    if spec.argv.iter().any(|arg| arg == "cargo") {
+    if argv.iter().any(|arg| arg == "cargo") {
         command.env("CARGO_TARGET_DIR", root.join("target"));
         command.env("CARGO_TERM_COLOR", "never");
         command.env("CARGO_INCREMENTAL", "0");
@@ -637,7 +662,7 @@ pub fn run_hidden_command(root: &Path, spec: &SuiteHiddenCommand) -> HiddenComma
         Ok(child) => child,
         Err(error) => {
             return HiddenCommandResult {
-                argv: spec.argv.clone(),
+                argv: argv.clone(),
                 expect_exit: spec.expect_exit,
                 stderr: format!("spawn failed: {error}"),
                 passed: false,
@@ -661,7 +686,7 @@ pub fn run_hidden_command(root: &Path, spec: &SuiteHiddenCommand) -> HiddenComma
             Ok(None) => std::thread::sleep(Duration::from_millis(10)),
             Err(error) => {
                 return HiddenCommandResult {
-                    argv: spec.argv.clone(),
+                    argv: argv.clone(),
                     expect_exit: spec.expect_exit,
                     stderr: format!("wait failed: {error}"),
                     passed: false,
@@ -674,7 +699,7 @@ pub fn run_hidden_command(root: &Path, spec: &SuiteHiddenCommand) -> HiddenComma
     let (stderr, stderr_truncated) = stderr_handle.join().unwrap_or_default();
     let passed = !timed_out && exit == Some(spec.expect_exit);
     HiddenCommandResult {
-        argv: spec.argv.clone(),
+        argv,
         expect_exit: spec.expect_exit,
         exit,
         timed_out,
@@ -682,6 +707,7 @@ pub fn run_hidden_command(root: &Path, spec: &SuiteHiddenCommand) -> HiddenComma
         stderr,
         stdout_truncated,
         stderr_truncated,
+        setup_failure: None,
         passed,
     }
 }
@@ -1030,6 +1056,27 @@ mod tests {
         assert!(!bad.passed);
         assert_eq!(bad.exit, Some(7));
         assert!(!bad.timed_out);
+    }
+
+    #[test]
+    fn python_setup_failure_is_typed_and_never_spawns_the_placeholder() {
+        let dir = tempfile::tempdir().unwrap();
+        let spec = SuiteHiddenCommand {
+            argv: vec!["python".into(), "-m".into(), "pytest".into()],
+            timeout_ms: 5_000,
+            expect_exit: 0,
+        };
+        let result = run_hidden_command_with(dir.path(), &spec, |_| {
+            anyhow::bail!("python_interpreter_unavailable: deterministic fixture")
+        });
+        assert_eq!(result.exit, None);
+        assert!(!result.timed_out);
+        assert_eq!(
+            result.setup_failure,
+            Some(crate::workload::HiddenCommandSetupFailure::PythonInterpreterUnavailable)
+        );
+        assert!(result.stderr.contains("python_interpreter_unavailable"));
+        assert_eq!(result.argv, spec.argv);
     }
 
     #[test]

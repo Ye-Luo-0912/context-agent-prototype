@@ -712,6 +712,17 @@ Actual process/verification failure, ambiguous settlement and rooted typed
 precondition debt retain the conservative rules above. Provider wire spelling
 cannot change this classification.
 
+A post-dispatch speculative path miss is the other narrow non-debt case. It is
+admitted only when trusted pre-dispatch attribution says `Observe` or `Search`,
+the failed output is typed `PathNotFound`, its normalized path exactly matches
+the host-attributed target, and Runtime finds that target absent from the
+current task roots. The output remains in the turn frame and becomes a bounded,
+revision-bound negative fact; it simply does not enter `failed_commands` or the
+obligation ledger. Any workspace mutation invalidates that fact. A rooted
+target, an unattributed/mismatched target, or any other failure class stays
+fail-closed as completion debt. Negative-fact admission and failed-command
+disposition use the same predicate so the two projections cannot diverge.
+
 ### Unified completion readiness and settlement observation
 
 Completion convergence is derived state, never a round counter or automatic

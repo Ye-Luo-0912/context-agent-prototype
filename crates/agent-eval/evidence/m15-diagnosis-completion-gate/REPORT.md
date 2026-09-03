@@ -11,6 +11,44 @@ from the immutable per-cell event streams, per-cell `summary.json`,
 `dimensions.json` and the harness `verify.json` records; no new live run
 produced them.
 
+## Successor-source implementation re-audit (2026-09-03; no evidence rewrite)
+
+A code-and-event re-audit after this report was recorded corrected the causal
+attribution in §1 while preserving the window and its 10/12 FAIL verdict. The
+failed formatting check was not the surviving row: its failed operation at
+seq 382/385 and successful rerun at seq 410/413 have the same tool name and
+the same non-empty Runtime `argument_digest` (`6359474a…`), so the existing
+`same_operation` success path retires that `NonDeterministic` row. The earlier
+`fs.read src/job.rs` miss at seq 56–58 is the row that survived. It was a
+trusted `PathNotFound` negative observation, but `freshness.rs` also inserted
+every failed read into `failed_commands` even when Runtime had not rooted that
+speculative path in the task. Later model actions explicitly try to clear the
+“stale `src/job.rs` observation” (for example seq 756 onward), independently
+confirming which blocker it continued to see.
+
+The successor repair therefore does not auto-clear a command, infer success
+from prose, or weaken rooted resource debt. It makes one already-attributed
+case internally consistent: `Observe/Search + PathNotFound + exact host target
+match + unrooted by Runtime` remains a revision-bound negative fact but never
+becomes task-completion debt. Rooted, unattributed, target-mismatched and other
+failure classes remain conservative. Deterministic regressions cover all of
+those branches.
+
+The §2 source audit also found why the lock could outlive shutdown: the
+detached model future cloned the complete `RuntimeServices`, which includes
+tool/artifact `Workspace` handles. A provider that observed cancellation late
+could therefore retain the exclusive workspace-effect journal after the actor
+had emitted `RunCompleted`. The successor implementation captures only the
+`ModelTransport` in that future. Its regression keeps a cancellation-ignoring
+model future alive, shuts down the actor, and successfully reopens the same
+workspace (and its exclusive journal lock) before releasing the model.
+
+These are successor-source repairs only. No formal preflight or live cell was
+run, no historical artifact was regenerated, and this valid FAIL remains the
+decision for source `a6dc33e`. The original post-window interpretation is kept
+below for audit history; this addendum governs the corrected root-cause
+attribution.
+
 Verdict shape: **10/12 pass, 0 NOT\_RUN** — the mechanical report at
 `_windows/1788438275930/REPORT.md`. Behavior pass 12/12 and allowed-diff pass
 12/12; provider healthy in every cell; closures 2/12. Migrate 4/4

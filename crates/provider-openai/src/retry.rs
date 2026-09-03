@@ -21,8 +21,9 @@ use std::sync::{
 use std::time::{Duration, SystemTime};
 
 use agent_contracts::{
-    AgentError, AgentResult, CancellationToken, ModelCapabilities, ModelChunk, ModelEventSink,
-    ModelOutput, ModelProtocolErrorKind, ModelRequest, ModelTransport, RetryAfterMillis,
+    AgentError, AgentResult, CancellationToken, LocalResourceLimitKind, ModelCapabilities,
+    ModelChunk, ModelEventSink, ModelOutput, ModelProtocolErrorKind, ModelRequest, ModelTransport,
+    RetryAfterMillis,
 };
 use async_trait::async_trait;
 use serde::Serialize;
@@ -754,8 +755,18 @@ struct BufferedSink {
 #[derive(Default)]
 struct BufferedState {
     chunks: Vec<ModelChunk>,
+    /// Count every chunk accepted from the inner transport. The hard chunk
+    /// bound is an ingress bound and stays independent from the byte bound.
+    received_chunks: usize,
     bytes: usize,
-    limit_error: Option<String>,
+    limit_error: Option<BufferedLimitError>,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct BufferedLimitError {
+    kind: LocalResourceLimitKind,
+    observed: usize,
+    limit: usize,
 }
 
 impl Default for BufferedSink {
@@ -775,8 +786,8 @@ impl BufferedSink {
 
     fn take(&self) -> AgentResult<Vec<ModelChunk>> {
         let mut state = self.state.lock().expect("buffered sink poisoned");
-        if let Some(message) = &state.limit_error {
-            return Err(buffer_limit_error(message.clone()));
+        if let Some(error) = state.limit_error {
+            return Err(buffer_limit_error(error));
         }
         Ok(std::mem::take(&mut state.chunks))
     }
@@ -787,19 +798,31 @@ impl ModelEventSink for BufferedSink {
     async fn on_chunk(&self, chunk: ModelChunk) -> AgentResult<()> {
         let chunk_bytes = buffered_chunk_bytes(&chunk);
         let mut state = self.state.lock().expect("buffered sink poisoned");
-        if let Some(message) = &state.limit_error {
-            return Err(buffer_limit_error(message.clone()));
+        if let Some(error) = state.limit_error {
+            return Err(buffer_limit_error(error));
         }
-        let next_chunks = state.chunks.len().saturating_add(1);
+        let next_chunks = state.received_chunks.saturating_add(1);
         let next_bytes = state.bytes.saturating_add(chunk_bytes);
-        if next_chunks > self.max_chunks || next_bytes > self.max_bytes {
-            let message = format!(
-                "buffered model stream exceeded its limits (chunks {next_chunks}/{}, bytes {next_bytes}/{})",
-                self.max_chunks, self.max_bytes
-            );
-            state.limit_error = Some(message.clone());
-            return Err(buffer_limit_error(message));
+        let limit_error = if next_chunks > self.max_chunks {
+            Some(BufferedLimitError {
+                kind: LocalResourceLimitKind::BufferedModelStreamChunks,
+                observed: next_chunks,
+                limit: self.max_chunks,
+            })
+        } else if next_bytes > self.max_bytes {
+            Some(BufferedLimitError {
+                kind: LocalResourceLimitKind::BufferedModelStreamBytes,
+                observed: next_bytes,
+                limit: self.max_bytes,
+            })
+        } else {
+            None
+        };
+        if let Some(error) = limit_error {
+            state.limit_error = Some(error);
+            return Err(buffer_limit_error(error));
         }
+        state.received_chunks = next_chunks;
         state.bytes = next_bytes;
         state.chunks.push(chunk);
         Ok(())
@@ -823,10 +846,11 @@ fn buffered_chunk_bytes(chunk: &ModelChunk) -> usize {
     inline.saturating_add(dynamic)
 }
 
-fn buffer_limit_error(message: String) -> AgentError {
-    AgentError::ModelProtocol {
-        kind: ModelProtocolErrorKind::MalformedEvent,
-        message,
+fn buffer_limit_error(error: BufferedLimitError) -> AgentError {
+    AgentError::LocalResourceLimit {
+        kind: error.kind,
+        observed: u64::try_from(error.observed).unwrap_or(u64::MAX),
+        limit: u64::try_from(error.limit).unwrap_or(u64::MAX),
     }
 }
 
@@ -1843,14 +1867,58 @@ mod tests {
         let error = sink.on_chunk(ModelChunk::Done).await.unwrap_err();
         assert!(matches!(
             error,
-            AgentError::ModelProtocol {
-                kind: ModelProtocolErrorKind::MalformedEvent,
-                ..
+            AgentError::LocalResourceLimit {
+                kind: LocalResourceLimitKind::BufferedModelStreamChunks,
+                observed: 2,
+                limit: 1,
             }
         ));
         assert!(
             sink.take().is_err(),
             "a transport that ignores the sink refusal cannot publish the bounded prefix"
+        );
+    }
+
+    #[tokio::test]
+    async fn buffered_sink_preserves_text_chunks_and_the_raw_chunk_limit() {
+        const LIMIT: usize = 1_024;
+        let sink = BufferedSink::with_limits(LIMIT, usize::MAX);
+        for _ in 0..LIMIT {
+            sink.on_chunk(ModelChunk::TextDelta { delta: "x".into() })
+                .await
+                .unwrap();
+        }
+
+        let error = sink
+            .on_chunk(ModelChunk::TextDelta { delta: "x".into() })
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            AgentError::LocalResourceLimit {
+                kind: LocalResourceLimitKind::BufferedModelStreamChunks,
+                observed: 1_025,
+                limit: 1_024,
+            }
+        ));
+        assert!(
+            sink.take().is_err(),
+            "the raw ingress limit remains sticky after overflow"
+        );
+
+        let within_limit = BufferedSink::with_limits(LIMIT, usize::MAX);
+        for _ in 0..LIMIT {
+            within_limit
+                .on_chunk(ModelChunk::TextDelta { delta: "x".into() })
+                .await
+                .unwrap();
+        }
+        let chunks = within_limit.take().unwrap();
+        assert_eq!(chunks.len(), LIMIT);
+        assert!(
+            chunks
+                .iter()
+                .all(|chunk| chunk == &ModelChunk::TextDelta { delta: "x".into() })
         );
     }
 
@@ -1865,12 +1933,36 @@ mod tests {
             .unwrap_err();
         assert!(matches!(
             error,
+            AgentError::LocalResourceLimit {
+                kind: LocalResourceLimitKind::BufferedModelStreamBytes,
+                ..
+            }
+        ));
+        assert!(error.to_string().contains("bytes"));
+    }
+
+    #[test]
+    fn local_buffer_exhaustion_and_malformed_wire_events_stay_distinct() {
+        let local = buffer_limit_error(BufferedLimitError {
+            kind: LocalResourceLimitKind::BufferedModelStreamChunks,
+            observed: 2,
+            limit: 1,
+        });
+        let malformed = AgentError::ModelProtocol {
+            kind: ModelProtocolErrorKind::MalformedEvent,
+            message: "damaged SSE JSON".into(),
+        };
+
+        assert!(matches!(&local, AgentError::LocalResourceLimit { .. }));
+        assert!(matches!(
+            &malformed,
             AgentError::ModelProtocol {
                 kind: ModelProtocolErrorKind::MalformedEvent,
                 ..
             }
         ));
-        assert!(error.to_string().contains("bytes"));
+        assert!(!retryable(&local));
+        assert!(!retryable(&malformed));
     }
 
     #[tokio::test]

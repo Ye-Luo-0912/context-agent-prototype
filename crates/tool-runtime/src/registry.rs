@@ -32,7 +32,7 @@ use crate::tools::{
     ProcessRunTool, ProcessSessionTool, SearchGrepTool, SessionRegistry, SessionSlot,
     ShellExecTool, TaskCompleteTool, TaskManageTool, Tool, VerificationRunTool,
 };
-use crate::{VERIFY_RUN_TOOL_NAME, VerificationRecipes};
+use crate::{VERIFY_RUN_TOOL_NAME, VerificationDiscoveryError, VerificationRecipes};
 
 /// Control tools are now defined by the unified catalog contract.
 pub use agent_contracts::{CAPABILITY_MANAGE, ToolLifecycle};
@@ -161,18 +161,23 @@ impl BuiltinToolDispatcher {
         name == VERIFY_RUN_TOOL_NAME || self.config.always_loaded.iter().any(|core| core == name)
     }
 
-    pub fn new(workspace: Workspace) -> Self {
-        let recipes = VerificationRecipes::discover(&workspace);
-        Self::with_config_and_verification_recipes(
+    pub fn new(workspace: Workspace) -> Result<Self, VerificationDiscoveryError> {
+        let recipes = VerificationRecipes::discover(&workspace)?;
+        Ok(Self::with_config_and_verification_recipes(
             workspace,
             ToolLifecycleConfig::default(),
             recipes,
-        )
+        ))
     }
 
-    pub fn with_config(workspace: Workspace, config: ToolLifecycleConfig) -> Self {
-        let recipes = VerificationRecipes::discover(&workspace);
-        Self::with_config_and_verification_recipes(workspace, config, recipes)
+    pub fn with_config(
+        workspace: Workspace,
+        config: ToolLifecycleConfig,
+    ) -> Result<Self, VerificationDiscoveryError> {
+        let recipes = VerificationRecipes::discover(&workspace)?;
+        Ok(Self::with_config_and_verification_recipes(
+            workspace, config, recipes,
+        ))
     }
 
     pub fn with_config_and_verification_recipes(
@@ -1117,7 +1122,7 @@ mod tests {
     async fn dispatcher() -> TestDispatcher {
         let (workspace, dir) = open_workspace().await;
         TestDispatcher {
-            inner: BuiltinToolDispatcher::new(workspace),
+            inner: BuiltinToolDispatcher::new(workspace).unwrap(),
             _dir: dir,
         }
     }
@@ -1483,7 +1488,7 @@ mod tests {
         std::fs::create_dir(dir.path().join("src")).unwrap();
         std::fs::write(dir.path().join("src/lib.rs"), "fn value() -> u8 { 1 }\n").unwrap();
         let workspace = Workspace::open(dir.path()).await.unwrap();
-        let dispatcher = BuiltinToolDispatcher::new(workspace);
+        let dispatcher = BuiltinToolDispatcher::new(workspace).unwrap();
         assert!(surface(&dispatcher).contains(&VERIFY_RUN_TOOL_NAME.to_string()));
 
         let call = ToolCall {
@@ -1567,7 +1572,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join("Cargo.toml"), "[workspace]\nmembers=[]\n").unwrap();
         let workspace = Workspace::open(dir.path()).await.unwrap();
-        let dispatcher = BuiltinToolDispatcher::new(workspace);
+        let dispatcher = BuiltinToolDispatcher::new(workspace).unwrap();
         let attribution = dispatcher.execution_attribution(&ToolCall {
             id: "verify-cargo".into(),
             name: VERIFY_RUN_TOOL_NAME.into(),
@@ -2048,7 +2053,8 @@ mod tests {
                 surface_soft_high_bytes: 0,
                 surface_low_watermark_bytes: 0,
             },
-        );
+        )
+        .unwrap();
         dispatcher.load_for_lease("fs.write").unwrap();
         assert!(surface(&dispatcher).contains(&"fs.write".to_string()));
         // specs() is pure: reading the surface must not age the lifecycle.
@@ -2082,7 +2088,8 @@ mod tests {
                 surface_soft_high_bytes: 1_000_000,
                 surface_low_watermark_bytes: 500_000,
             },
-        );
+        )
+        .unwrap();
         dispatcher.load_for_lease("fs.write").unwrap();
         for _ in 0..10 {
             dispatcher.gc(&[]);
@@ -2107,7 +2114,8 @@ mod tests {
                 surface_soft_high_bytes: 1_000_000,
                 surface_low_watermark_bytes: 500_000,
             },
-        );
+        )
+        .unwrap();
         dispatcher.load_for_lease("fs.write").unwrap();
         dispatcher.load_for_lease("git.status").unwrap();
 
@@ -2149,7 +2157,8 @@ mod tests {
                 surface_soft_high_bytes: 0,
                 surface_low_watermark_bytes: 0,
             },
-        );
+        )
+        .unwrap();
         ToolDispatcher::load_tool(&dispatcher, "git.status").unwrap();
         dispatcher.load_for_lease("fs.write").unwrap();
 
@@ -2192,6 +2201,7 @@ mod tests {
                     surface_low_watermark_bytes: 0,
                 },
             )
+            .unwrap()
         };
         // 先量出 gc 所见的全部已加载条目（不含 meta 控制工具）的 schema
         // 总量，再把高水位压到总量之下：恰好必须冷却一个，低水位等于
@@ -2217,7 +2227,8 @@ mod tests {
                 surface_soft_high_bytes: watermark,
                 surface_low_watermark_bytes: watermark,
             },
-        );
+        )
+        .unwrap();
         dispatcher.load_for_lease("fs.write").unwrap();
         dispatcher.load_for_lease("git.status").unwrap();
         for _ in 0..4 {
@@ -2253,7 +2264,8 @@ mod tests {
                 surface_soft_high_bytes: 0,
                 surface_low_watermark_bytes: 0,
             },
-        );
+        )
+        .unwrap();
         dispatcher.load_for_lease("fs.write").unwrap();
         dispatcher.load_for_lease("git.status").unwrap();
         assert!(surface(&dispatcher).contains(&"git.status".to_string()));
@@ -2703,7 +2715,7 @@ mod tests {
     #[tokio::test]
     async fn dispatcher_drop_kills_live_session_trees() {
         let (workspace, dir) = open_workspace().await;
-        let dispatcher = BuiltinToolDispatcher::new(workspace);
+        let dispatcher = BuiltinToolDispatcher::new(workspace).unwrap();
         let (argv, child_pidfile, heir_pidfile) =
             crate::tools::test_procs::tree_pidfile_argv(dir.path());
         let arguments = json!({"action": "start", "argv": argv});

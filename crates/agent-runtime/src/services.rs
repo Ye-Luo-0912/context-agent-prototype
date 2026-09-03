@@ -14,10 +14,10 @@ use agent_contracts::{
     AgentError, AgentResult, ApprovalGate, ContextEngine, ContextGcReport, ContextIngress,
     ContextItemSummary, ContextMaintenanceReport, ContextMaintenanceTrigger, ContextQuery,
     ContextStateTransition, EffectReconciler, EventJournal, FocusState, FsRereadClass,
-    MaterializedContext, ModelCapabilities, ModelEventSink, ModelOutput, ModelRequest,
-    ModelTransport, ScopeId, ScopeKind, StorageGcReport, StoreReconcileReport, TaskId, ToolCall,
-    ToolCatalogEntry, ToolDispatcher, ToolExecutionAttribution, ToolLeaseReconcileReport, ToolSpec,
-    ToolSurfaceSnapshot, VerificationCoverageDeclaration,
+    MaterializedContext, ModelCapabilities, ModelTransport, ScopeId, ScopeKind, StorageGcReport,
+    StoreReconcileReport, TaskId, ToolCall, ToolCatalogEntry, ToolDispatcher,
+    ToolExecutionAttribution, ToolLeaseReconcileReport, ToolSpec, ToolSurfaceSnapshot,
+    VerificationCoverageDeclaration,
 };
 use agent_core::{CoreAuthorityConfig, CorePort, build_core_port, try_build_core_port};
 use agent_workspace::Workspace;
@@ -417,15 +417,12 @@ impl RuntimeServices {
         self.model.capabilities()
     }
 
-    /// One model round: stream the request to the provider. The result is a
-    /// value for the actor to validate and commit — nothing is committed
-    /// here.
-    pub(crate) async fn run_model_round(
-        &self,
-        request: ModelRequest,
-        sink: &dyn ModelEventSink,
-    ) -> AgentResult<ModelOutput> {
-        self.model.complete_stream(request, sink).await
+    /// Clone only the model scheduling lane for a detached request. A
+    /// provider may take time to observe cancellation, so the detached task
+    /// must not retain the complete service bundle (and, through it, tool or
+    /// workspace authority) after the actor has shut down.
+    pub(crate) fn model_transport(&self) -> Arc<dyn ModelTransport> {
+        self.model.clone()
     }
 
     // --- context scheduling (moved out of the kernel) ---
@@ -698,7 +695,8 @@ impl RuntimeServices {
 mod tests {
     use super::*;
     use agent_contracts::{
-        ContextDiagnostics, ModelCapabilities, ToolExecutionRequest, ToolOutcome,
+        ContextDiagnostics, ModelCapabilities, ModelOutput, ModelRequest, ToolExecutionRequest,
+        ToolOutcome,
     };
     use agent_core::PolicyApprovalGate;
 

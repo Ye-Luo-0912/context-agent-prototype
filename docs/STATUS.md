@@ -1650,6 +1650,48 @@ boundaries and relative sizes are recorded in
 and the supporting hermetic gate-runner defect is
 `EVAL-PREFLIGHT-01` in [`AUDIT_TODO.md`](AUDIT_TODO.md).
 
+**Successor-source reliability repairs (2026-09-03; user-authorized after the
+estimate above):** implementation proceeded as independent, reviewable slices
+without changing or rerunning any formal M15 evidence.
+
+- Re-reading the immutable `retry_policy_dev normal r2` stream corrected the
+  latest diagnosis: the failed `cargo fmt --all -- --check` row was retired by
+  its same-tool, same-`argument_digest` PASS. The surviving completion debt was
+  the earlier speculative `fs.read src/job.rs` miss. Trusted unrooted
+  `Observe/Search + PathNotFound` results now remain revision-bound negative
+  facts without entering `failed_commands`; rooted, unattributed,
+  target-mismatched and other failures remain fail-closed debt.
+- Detached model calls capture only `ModelTransport`, not the whole
+  `RuntimeServices`. A cancellation-lag regression proves actor shutdown can
+  reopen the same workspace and acquire its exclusive effect-journal lock
+  while the stale provider future is still alive.
+- Eval parsing is complete before `eval.env` loads or any action starts:
+  unknown/conflicting actions, duplicate selectors, missing/empty or
+  option-shaped values, and trailing positionals fail without side effects.
+- Python-backed tests and verification share one semantic resolver. Explicit
+  configuration, `py -3`, `python3`, then `python` are probed with bounded
+  time/output; Windows Store aliases fail as typed setup errors instead of exit
+  9009. The resolved absolute invocation path preserves virtual-environment
+  symlinks. The context-service integration suite is owned by its binary crate
+  and uses Cargo's exact `CARGO_BIN_EXE`, eliminating stale-helper mtimes and
+  build/touch workarounds.
+- Buffered retry keeps the independent 16,384-chunk and byte limits unchanged,
+  reports local capacity as typed non-retryable `LocalResourceLimit` rather
+  than malformed provider data, and retains chunks linearly without quadratic
+  coalescing.
+- Final local validation used the repository's one-command doctor on the
+  pre-recording source tree digest `73155555cc8e20cd…`: Python and the
+  Cargo-owned helper passed;
+  format, all-target/all-feature check, strict Clippy, build, and the complete
+  all-target workspace test suite all passed. The Provider data-plane step was
+  deliberately run without a key and skipped (pass/non-required), so this is
+  a deterministic local gate, not a serving preflight.
+
+The corrected diagnosis is appended to
+[`m15-diagnosis-completion-gate/REPORT.md`](../crates/agent-eval/evidence/m15-diagnosis-completion-gate/REPORT.md).
+These repairs are not a new M15 verdict: M15 remains open, the seven valid v4
+FAIL windows remain immutable, and no formal preflight/window was run.
+
 A valid formal failure rejects its exact candidate; only a typed `NOT_RUN`
 permits rerunning that frozen window. Candidate selection is a user decision.
 

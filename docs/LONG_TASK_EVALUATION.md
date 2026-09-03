@@ -1133,6 +1133,22 @@ the runner must never chain them automatically. Any readiness receipt is a
 derived check over the existing content-addressed manifests and digests, not a
 second source of evidence authority.
 
+Implementation follow-up (2026-09-03): after this estimate, the operator
+authorized the bounded reliability repairs. The CLI, Python/helper ownership,
+buffer-cap taxonomy, speculative-negative completion disposition, and
+cancellation-lag workspace-lock slices were implemented and tested
+independently; they were not collapsed into a new authority or credited as a
+formal M15 result. The implementation re-audit also corrected the latest
+window's execution-debt attribution: the exact successful formatting rerun had
+already retired its failed row, while an unrooted `src/job.rs` observation was
+the persistent row. The immutable window stays FAIL 10/12 and no preflight or
+formal cell was rerun. The final local doctor gate passed Python/helper,
+format, all-target/all-feature check, strict Clippy, build, and the complete
+all-target workspace suite on pre-recording source-tree digest
+`73155555cc8e20cd…`; its
+Provider step was intentionally skipped without a key and is not preflight
+evidence.
+
 No step expands the transcript, adds a second ResumePoint, introduces a
 TaskGraph/learned planner, auto-completes, fixes a task-specific round count or
 retunes Context/GC/retrieval/packing. Executable defect exits are centralized in

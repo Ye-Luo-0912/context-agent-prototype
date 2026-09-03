@@ -356,6 +356,12 @@ fn parse_global_options(argv: &[String]) -> anyhow::Result<(GlobalOptions, Vec<S
                 let Some(value) = argv.get(index + 1) else {
                     anyhow::bail!("{} needs a value", $name);
                 };
+                if value.trim().is_empty() {
+                    anyhow::bail!("{} needs a non-empty value", $name);
+                }
+                if value.starts_with('-') {
+                    anyhow::bail!("{} needs a value before {}", $name, value);
+                }
                 index += 1;
                 value.clone()
             }};
@@ -412,15 +418,155 @@ fn parse_global_options(argv: &[String]) -> anyhow::Result<(GlobalOptions, Vec<S
     Ok((options, rest))
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum PositionalArity {
+    None,
+    Optional,
+    Required,
+}
+
+/// Return the positional shape of one action. Keeping this table separate
+/// from dispatch lets the whole command line be rejected before loading the
+/// environment or starting any evaluator work.
+fn action_arity(action: &str) -> Option<PositionalArity> {
+    match action {
+        "--swebench-gold"
+        | "--tool-edit-run"
+        | "--context-bench-run"
+        | "--context-mech-run"
+        | "--longflow-run"
+        | "--opportunity-gate"
+        | "--recovery-surface-gate"
+        | "--conv-gate"
+        | "--long-task-live"
+        | "--diag-smoke" => Some(PositionalArity::Optional),
+        "--fixture" | "--fixture-live" | "--show-evidence" | "--pilot-calibrate"
+        | "--analyze-evidence" | "--compare-live" | "--compare-arm" | "--metrics"
+        | "--m15-report" => Some(PositionalArity::Required),
+        "--fixtures"
+        | "--suite"
+        | "--suite-check"
+        | "--preregister"
+        | "--acceptance"
+        | "--pilot"
+        | "--pilot-run"
+        | "--compare-live-all"
+        | "--compare-live-reasonable"
+        | "--retrieval"
+        | "--retrieval-complex"
+        | "--context-hygiene"
+        | "--tool-edit"
+        | "--context-bench"
+        | "--context-bench-ablation"
+        | "--context-mech"
+        | "--convergence-bench"
+        | "--platform-closure-m12"
+        | "--platform-closure-m13"
+        | "--verify-route-gate"
+        | "--long-task-gate"
+        | "--conv-tail"
+        | "--doctor"
+        | "--m15-preflight"
+        | "--m15-window" => Some(PositionalArity::None),
+        _ => None,
+    }
+}
+
+/// Validate every non-global token without reading files, mutating the
+/// environment, or starting a command. Dispatch still consumes the original
+/// tokens so valid invocations retain their existing behavior.
+fn validate_command_line(args: &[String]) -> anyhow::Result<()> {
+    let mut action: Option<&str> = None;
+    let mut has_engine_selector = false;
+    let mut index = 0;
+
+    while index < args.len() {
+        let arg = args[index].as_str();
+        match arg {
+            "--all" => {
+                if let Some(selected) = action {
+                    anyhow::bail!("--all conflicts with action {selected}");
+                }
+                if has_engine_selector {
+                    anyhow::bail!("--all conflicts with an existing engine selector");
+                }
+                has_engine_selector = true;
+                index += 1;
+            }
+            "--engine" => {
+                if let Some(selected) = action {
+                    anyhow::bail!("--engine conflicts with action {selected}");
+                }
+                if has_engine_selector {
+                    anyhow::bail!("--engine conflicts with an existing engine selector");
+                }
+                let value = args
+                    .get(index + 1)
+                    .ok_or_else(|| anyhow::anyhow!("--engine needs a value"))?;
+                if value.starts_with('-') {
+                    anyhow::bail!("--engine needs a value before {value}");
+                }
+                match value.as_str() {
+                    "append" | "rolling" | "dynamic" => {}
+                    other => anyhow::bail!("unknown engine: {other}"),
+                }
+                has_engine_selector = true;
+                index += 2;
+            }
+            _ => {
+                let Some(arity) = action_arity(arg) else {
+                    if arg.starts_with('-') {
+                        anyhow::bail!("unknown argument: {arg}");
+                    }
+                    anyhow::bail!("unexpected positional argument: {arg}");
+                };
+                if has_engine_selector {
+                    anyhow::bail!("action {arg} conflicts with an engine selector");
+                }
+                if let Some(selected) = action {
+                    anyhow::bail!("action {arg} conflicts with action {selected}");
+                }
+                action = Some(arg);
+                index += 1;
+
+                match arity {
+                    PositionalArity::None => {}
+                    PositionalArity::Optional => {
+                        if args.get(index).is_some_and(|value| !value.starts_with('-')) {
+                            index += 1;
+                        }
+                    }
+                    PositionalArity::Required => {
+                        let value = args
+                            .get(index)
+                            .ok_or_else(|| anyhow::anyhow!("{arg} needs a value"))?;
+                        if value.starts_with('-') {
+                            anyhow::bail!("{arg} needs a value before {value}");
+                        }
+                        index += 1;
+                    }
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+fn parse_cli(argv: &[String]) -> anyhow::Result<(GlobalOptions, Vec<String>)> {
+    let (options, rest) = parse_global_options(argv)?;
+    validate_command_line(&rest)?;
+    Ok((options, rest))
+}
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
+    let argv: Vec<String> = std::env::args().skip(1).collect();
+    let (options, rest) = parse_cli(&argv)?;
     if let Some(path) = envfile::load()? {
         eprintln!("{}", envfile::status_line(&path));
     }
     // Evidence identity gate: live evidence runs refuse a dirty tree unless
     // the operator explicitly accepts a source_tree_digest diagnostic.
-    let argv: Vec<String> = std::env::args().skip(1).collect();
-    let (options, rest) = parse_global_options(&argv)?;
     let GlobalOptions {
         repeats,
         repeats_set,
@@ -2396,7 +2542,7 @@ async fn tool_edit_model_spec() -> anyhow::Result<agent_contracts::ToolSpec> {
 
     let dir = tempfile::tempdir()?;
     let workspace = agent_workspace::Workspace::open(dir.path()).await?;
-    let dispatcher = tool_runtime::BuiltinToolDispatcher::new(workspace);
+    let dispatcher = tool_runtime::BuiltinToolDispatcher::new(workspace)?;
     dispatcher
         .specs()
         .into_iter()
@@ -3114,6 +3260,70 @@ mod tool_edit_main_tests {
         // Unknown tokens pass through untouched for the subcommand loop.
         let (_, rest) = parse_global_options(&argv(&["--bogus", "x"])).unwrap();
         assert_eq!(rest, argv(&["--bogus", "x"]));
+    }
+
+    #[test]
+    fn complete_cli_parse_keeps_global_options_position_independent() {
+        let (options, rest) = parse_cli(&argv(&[
+            "--m15-preflight",
+            "--evidence-dir",
+            "out/after-action",
+        ]))
+        .unwrap();
+        assert_eq!(
+            options.evidence_dir,
+            Some(std::path::PathBuf::from("out/after-action"))
+        );
+        assert_eq!(rest, argv(&["--m15-preflight"]));
+
+        let (options, rest) = parse_cli(&argv(&[
+            "--evidence-dir",
+            "out/before-action",
+            "--m15-preflight",
+        ]))
+        .unwrap();
+        assert_eq!(
+            options.evidence_dir,
+            Some(std::path::PathBuf::from("out/before-action"))
+        );
+        assert_eq!(rest, argv(&["--m15-preflight"]));
+    }
+
+    #[test]
+    fn complete_cli_parse_rejects_unknown_arguments_anywhere() {
+        assert!(parse_cli(&argv(&["--bogus", "--m15-preflight"])).is_err());
+        assert!(parse_cli(&argv(&["--m15-preflight", "--bogus"])).is_err());
+        assert!(parse_cli(&argv(&["--engine", "unknown"])).is_err());
+    }
+
+    #[test]
+    fn complete_cli_parse_rejects_conflicting_actions_and_engine_modes() {
+        assert!(parse_cli(&argv(&["--fixtures", "--fixtures"])).is_err());
+        assert!(parse_cli(&argv(&["--fixtures", "--suite"])).is_err());
+        assert!(parse_cli(&argv(&["--m15-preflight", "--doctor"])).is_err());
+        assert!(parse_cli(&argv(&["--engine", "dynamic", "--fixtures"])).is_err());
+        assert!(parse_cli(&argv(&["--all", "--m15-preflight"])).is_err());
+    }
+
+    #[test]
+    fn complete_cli_parse_rejects_missing_and_trailing_positionals() {
+        assert!(parse_cli(&argv(&["--metrics"])).is_err());
+        assert!(parse_cli(&argv(&["--metrics", "trace.jsonl", "extra"])).is_err());
+        assert!(parse_cli(&argv(&["--fixtures", "extra"])).is_err());
+        assert!(parse_cli(&argv(&["--m15-window", "retry_policy_dev"])).is_err());
+        assert!(parse_cli(&argv(&["--metrics", "trace.jsonl", "--suite"])).is_err());
+
+        assert!(parse_cli(&argv(&["--metrics", "trace.jsonl"])).is_ok());
+        assert!(parse_cli(&argv(&["--diag-smoke", "resume"])).is_ok());
+        assert!(parse_cli(&argv(&["--engine", "append", "--engine", "dynamic"])).is_err());
+        assert!(parse_cli(&argv(&["--engine", "append", "--all"])).is_err());
+        assert!(parse_cli(&argv(&["--all", "--engine", "dynamic"])).is_err());
+        assert!(parse_cli(&argv(&["--all", "--all"])).is_err());
+        assert!(parse_cli(&argv(&["--evidence-dir", "--m15-preflight"])).is_err());
+        assert!(parse_cli(&argv(&["--pilot-id", "--doctor"])).is_err());
+        assert!(parse_cli(&argv(&["--repeats", "--suite"])).is_err());
+        assert!(parse_cli(&argv(&["--evidence-dir", ""])).is_err());
+        assert!(parse_cli(&argv(&["--pilot-id", "   "])).is_err());
     }
 
     #[test]

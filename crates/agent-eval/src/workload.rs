@@ -587,7 +587,18 @@ pub struct HiddenCommandResult {
     pub stdout_truncated: bool,
     #[serde(default)]
     pub stderr_truncated: bool,
+    /// Setup failed before a child process was started. This remains
+    /// separate from a command exit so missing infrastructure cannot be
+    /// mistaken for a test failure such as Windows exit 9009.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub setup_failure: Option<HiddenCommandSetupFailure>,
     pub passed: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum HiddenCommandSetupFailure {
+    PythonInterpreterUnavailable,
 }
 
 /// Self-check the evaluation inputs: every fixture's seed must be writable

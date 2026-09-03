@@ -151,29 +151,34 @@ pub fn instance_id_from_suite_id(suite_id: &str) -> Option<&str> {
     suite_id.strip_prefix("swebench-")
 }
 
-pub(crate) fn python_bin() -> String {
-    static PYTHON: OnceLock<String> = OnceLock::new();
-    PYTHON
-        .get_or_init(|| {
-            if let Ok(value) = std::env::var("AGENT_EVAL_PYTHON") {
-                return value;
+fn python_resolution()
+-> &'static Result<tool_runtime::PythonInterpreter, tool_runtime::PythonInterpreterError> {
+    static PYTHON: OnceLock<
+        Result<tool_runtime::PythonInterpreter, tool_runtime::PythonInterpreterError>,
+    > = OnceLock::new();
+    PYTHON.get_or_init(|| {
+        for variable in ["AGENT_EVAL_PYTHON", tool_runtime::PYTHON_EXECUTABLE_ENV] {
+            if let Some(configured) = crate::envfile::get(variable) {
+                return tool_runtime::resolve_python_interpreter_value(variable, configured.into());
             }
-            for candidate in ["python", "python3"] {
-                if Command::new(candidate)
-                    .arg("-c")
-                    .arg("import sys")
-                    .stdout(Stdio::null())
-                    .stderr(Stdio::null())
-                    .status()
-                    .map(|status| status.success())
-                    .unwrap_or(false)
-                {
-                    return candidate.to_string();
-                }
-            }
-            "python".to_string()
-        })
-        .clone()
+        }
+        tool_runtime::resolve_python_interpreter(&[
+            "AGENT_EVAL_PYTHON",
+            tool_runtime::PYTHON_EXECUTABLE_ENV,
+        ])
+    })
+}
+
+pub(crate) fn python_interpreter() -> anyhow::Result<&'static tool_runtime::PythonInterpreter> {
+    match python_resolution() {
+        Ok(interpreter) => Ok(interpreter),
+        Err(error) => Err(anyhow::Error::new(error.clone())),
+    }
+}
+
+pub(crate) fn resolved_python_interpreter()
+-> Result<tool_runtime::PythonInterpreter, tool_runtime::PythonInterpreterError> {
+    python_resolution().clone()
 }
 
 fn gold_launcher() -> PathBuf {
@@ -188,31 +193,51 @@ fn namespace() -> Option<String> {
     }
 }
 
-pub fn gold_eval_argv(instance_id: &str) -> Vec<String> {
-    harness_eval_argv(
+pub fn gold_eval_argv(instance_id: &str) -> anyhow::Result<Vec<String>> {
+    Ok(harness_eval_argv_with_program(
+        python_interpreter()?.executable(),
         instance_id,
         "gold",
         &format!("agent-eval-gold-{instance_id}"),
-    )
+    ))
 }
 
-pub fn harness_eval_argv(instance_id: &str, predictions_path: &str, run_id: &str) -> Vec<String> {
-    let mut argv = vec![
-        python_bin(),
-        gold_launcher().to_string_lossy().into_owned(),
-        "--dataset_name".into(),
-        DATASET.into(),
-        "--predictions_path".into(),
-        predictions_path.into(),
-        "--max_workers".into(),
-        "1".into(),
-        "--instance_ids".into(),
-        instance_id.into(),
-        "--run_id".into(),
-        run_id.into(),
-        "--cache_level".into(),
-        "env".into(),
-    ];
+pub fn harness_eval_argv(
+    instance_id: &str,
+    predictions_path: &str,
+    run_id: &str,
+) -> anyhow::Result<Vec<String>> {
+    Ok(harness_eval_argv_with_program(
+        python_interpreter()?.executable(),
+        instance_id,
+        predictions_path,
+        run_id,
+    ))
+}
+
+fn harness_eval_argv_with_program(
+    python_program: &str,
+    instance_id: &str,
+    predictions_path: &str,
+    run_id: &str,
+) -> Vec<String> {
+    let mut argv = std::iter::once(python_program.to_string())
+        .chain([
+            gold_launcher().to_string_lossy().into_owned(),
+            "--dataset_name".into(),
+            DATASET.into(),
+            "--predictions_path".into(),
+            predictions_path.into(),
+            "--max_workers".into(),
+            "1".into(),
+            "--instance_ids".into(),
+            instance_id.into(),
+            "--run_id".into(),
+            run_id.into(),
+            "--cache_level".into(),
+            "env".into(),
+        ])
+        .collect::<Vec<_>>();
     if let Some(ns) = namespace() {
         argv.push("--namespace".into());
         argv.push(ns);
@@ -231,7 +256,7 @@ pub fn run_gold_eval(instance_id: &str) -> anyhow::Result<HiddenCommandResult> {
     std::fs::create_dir_all(&work)?;
     let run_id = format!("agent-eval-gold-{instance_id}");
     clear_eval_logs(&work, &run_id);
-    run_harness(&work, &gold_eval_argv(instance_id), instance_id)
+    run_harness(&work, &gold_eval_argv(instance_id)?, instance_id)
 }
 
 /// 用模型产出的 git diff 跑官方 harness。默认关闭；单元测试不得调用。
@@ -263,7 +288,7 @@ pub fn run_prediction_eval(
     clear_eval_logs(&work, run_id);
     run_harness(
         &work,
-        &harness_eval_argv(instance_id, &pred_path.to_string_lossy(), run_id),
+        &harness_eval_argv(instance_id, &pred_path.to_string_lossy(), run_id)?,
         instance_id,
     )
 }
@@ -658,7 +683,13 @@ mod tests {
 
     #[test]
     fn gold_eval_argv_is_official_harness_gold() {
-        let argv = gold_eval_argv(GOLD_SMOKE_INSTANCE);
+        let argv = harness_eval_argv_with_program(
+            "/resolved/python",
+            GOLD_SMOKE_INSTANCE,
+            "gold",
+            &format!("agent-eval-gold-{GOLD_SMOKE_INSTANCE}"),
+        );
+        assert_eq!(argv[0], "/resolved/python");
         assert!(argv.iter().any(|row| row.ends_with("run_swebench_gold.py")));
         assert!(argv.contains(&"gold".into()));
         assert!(argv.contains(&DATASET.into()));
@@ -667,11 +698,13 @@ mod tests {
 
     #[test]
     fn prediction_argv_points_at_a_jsonl_not_gold() {
-        let argv = harness_eval_argv(
+        let argv = harness_eval_argv_with_program(
+            "/resolved/python",
             GOLD_SMOKE_INSTANCE,
             "pred.jsonl",
             "agent-eval-pred-flask-append-1",
         );
+        assert_eq!(argv[0], "/resolved/python");
         assert!(argv.contains(&"pred.jsonl".into()));
         assert!(!argv.contains(&"gold".into()));
         assert!(argv.contains(&"agent-eval-pred-flask-append-1".into()));

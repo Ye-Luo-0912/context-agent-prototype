@@ -9,7 +9,8 @@ use super::*;
 use agent_contracts::{
     MAX_TASK_ANCHOR_ITEM_CHARS, NegativeFactEventKind, ResourceFreshness, ResourceVersionOracle,
     SettlementLabel, ToolExecutionAttribution, ToolExecutionFacts, ToolExecutionPurpose,
-    ToolFailureDomain, ToolOutput, ToolResultDisposition, TurnFrame, VerificationReuse,
+    ToolFailureClass, ToolFailureDomain, ToolOutput, ToolResultDisposition, TurnFrame,
+    VerificationReuse,
 };
 use serde_json::json;
 
@@ -46,6 +47,77 @@ fn failed_file_observation_is_not_checked() {
     assert!(resume.checked_files.is_empty());
     assert_eq!(resume.failed_commands.len(), 1);
     assert_eq!(resume.failed_commands[0].target, "src/auth.rs");
+}
+
+#[test]
+fn attributed_exploratory_missing_read_is_evidence_not_completion_debt() {
+    let mut resume = ExecutionState::default();
+    let miss = failed_read("src/speculative.rs", "path_not_found");
+    let attribution = RuntimeExecutionAttribution {
+        host: ToolExecutionAttribution::bounded(
+            ToolExecutionPurpose::Observe,
+            ["src/speculative.rs".to_string()],
+            VerificationReuse::None,
+        ),
+        rooted_targets: Vec::new(),
+    };
+
+    resume.observe_tool_attributed(&miss, 1, 2, "speculative-read", &attribution);
+
+    assert!(resume.checked_files.is_empty());
+    assert!(resume.failed_commands.is_empty());
+    assert!(resume.obligations.is_empty());
+    assert!(resume.negative_facts.iter().any(|fact| {
+        fact.target == "src/speculative.rs" && fact.failure == ToolFailureClass::PathNotFound
+    }));
+}
+
+#[test]
+fn attributed_task_rooted_missing_read_remains_completion_debt() {
+    let mut resume = ExecutionState::default();
+    let miss = failed_read("src/required.rs", "path_not_found");
+    let attribution = RuntimeExecutionAttribution {
+        host: ToolExecutionAttribution::bounded(
+            ToolExecutionPurpose::Observe,
+            ["src/required.rs".to_string()],
+            VerificationReuse::None,
+        ),
+        rooted_targets: vec!["src/required.rs".into()],
+    };
+
+    resume.observe_tool_attributed(&miss, 1, 2, "required-read", &attribution);
+
+    assert_eq!(resume.failed_commands.len(), 1);
+    assert_eq!(resume.failed_commands[0].target, "src/required.rs");
+    assert_eq!(resume.unresolved_failed_command_count(), 1);
+}
+
+#[test]
+fn unrooted_read_failure_needs_exact_speculative_negative_attribution() {
+    for (failure_class, attributed_target) in [
+        ("io", "src/denied.rs"),
+        ("path_not_found", "src/different.rs"),
+    ] {
+        let mut resume = ExecutionState::default();
+        let failure = failed_read("src/denied.rs", failure_class);
+        let attribution = RuntimeExecutionAttribution {
+            host: ToolExecutionAttribution::bounded(
+                ToolExecutionPurpose::Observe,
+                [attributed_target.to_string()],
+                VerificationReuse::None,
+            ),
+            rooted_targets: Vec::new(),
+        };
+
+        resume.observe_tool_attributed(&failure, 1, 2, "unadmitted-read", &attribution);
+
+        assert_eq!(
+            resume.failed_commands.len(),
+            1,
+            "{failure_class} with target {attributed_target} must remain conservative"
+        );
+        assert!(resume.negative_facts.is_empty());
+    }
 }
 
 /// A refused mutation observed the file it refused to write: the trusted

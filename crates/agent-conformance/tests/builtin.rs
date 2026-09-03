@@ -144,7 +144,7 @@ async fn builtin_catalog_passes_the_conformance_harness() {
     let dir = tempfile::tempdir().unwrap();
     seed(dir.path());
     let workspace = Workspace::open(dir.path()).await.unwrap();
-    let dispatcher = BuiltinToolDispatcher::new(workspace.clone());
+    let dispatcher = BuiltinToolDispatcher::new(workspace.clone()).unwrap();
     let broker = WorkspaceOutputBroker::new(Arc::new(workspace));
 
     // 1. Schema contract for every known tool (catalog rows + meta specs).
@@ -205,7 +205,7 @@ async fn builtin_catalog_passes_the_conformance_harness() {
 async fn every_catalog_spec_has_a_bounded_schema() {
     let dir = tempfile::tempdir().unwrap();
     let workspace = Workspace::open(dir.path()).await.unwrap();
-    let dispatcher = BuiltinToolDispatcher::new(workspace);
+    let dispatcher = BuiltinToolDispatcher::new(workspace).unwrap();
 
     let mut violations = Vec::new();
     for entry in dispatcher.catalog() {
@@ -225,7 +225,7 @@ async fn every_catalog_spec_has_a_bounded_schema() {
 async fn control_tools_execute_and_stay_within_the_envelope() {
     let dir = tempfile::tempdir().unwrap();
     let workspace = Workspace::open(dir.path()).await.unwrap();
-    let dispatcher = BuiltinToolDispatcher::new(workspace.clone());
+    let dispatcher = BuiltinToolDispatcher::new(workspace.clone()).unwrap();
     let broker = WorkspaceOutputBroker::new(Arc::new(workspace));
 
     // capability.manage search/inspect/load/unload must all return bounded
@@ -254,7 +254,7 @@ async fn control_tools_execute_and_stay_within_the_envelope() {
 async fn artifact_read_is_bounded_confined_and_references_real_artifacts() {
     let dir = tempfile::tempdir().unwrap();
     let workspace = Workspace::open(dir.path()).await.unwrap();
-    let dispatcher = BuiltinToolDispatcher::new(workspace.clone());
+    let dispatcher = BuiltinToolDispatcher::new(workspace.clone()).unwrap();
     let broker = WorkspaceOutputBroker::new(Arc::new(workspace.clone()));
 
     // A genuine artifact reference reads back through the trusted broker
@@ -318,7 +318,7 @@ async fn shipped_inventory_matches_the_production_surface_and_reports_a_digest()
     let dir = tempfile::tempdir().unwrap();
     seed(dir.path());
     let workspace = Workspace::open(dir.path()).await.unwrap();
-    let dispatcher = BuiltinToolDispatcher::new(workspace);
+    let dispatcher = BuiltinToolDispatcher::new(workspace).unwrap();
 
     let (violations, digest) = agent_conformance::check_inventory_parity(&dispatcher, &inventory);
     assert!(

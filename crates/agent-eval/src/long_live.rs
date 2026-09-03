@@ -1989,6 +1989,7 @@ pub async fn run_pack_cell(
             stderr: format!("oracle setup failed: {e}"),
             stdout_truncated: false,
             stderr_truncated: false,
+            setup_failure: None,
             passed: false,
         },
         Ok(()) => match std::fs::write(&oracle_path, oracle_source) {
@@ -2006,6 +2007,7 @@ pub async fn run_pack_cell(
                 stderr: format!("oracle injection failed: {e}"),
                 stdout_truncated: false,
                 stderr_truncated: false,
+                setup_failure: None,
                 passed: false,
             },
             Ok(()) => run_cargo_test(root, &["--test", oracle_name]).await,
@@ -2413,6 +2415,7 @@ fn build_hidden_report(
             stderr: "oracle not run".into(),
             stdout_truncated: false,
             stderr_truncated: false,
+            setup_failure: None,
             passed: false,
         }),
     }
@@ -2472,6 +2475,7 @@ async fn run_tree_bounded(root: &Path, argv: &[String], timeout: Duration) -> Hi
         stderr: String::new(),
         stdout_truncated: false,
         stderr_truncated: false,
+        setup_failure: None,
         passed: false,
     };
     if argv.is_empty() {

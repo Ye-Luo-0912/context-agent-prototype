@@ -242,14 +242,21 @@ impl ExecutionState {
                 // nothing. It stays visible in the result and the
                 // negative-fact table but is an attempt incident, not
                 // completion debt: retry churn must not compound the
-                // completion-gate blocker set. A failed read keeps its row —
-                // the file may be required, and a read that saw nothing is
-                // not proof the requirement vanished.
+                // completion-gate blocker set. A failed read keeps its row
+                // when the target is task-rooted (or when legacy callers do
+                // not provide attribution). An attributed exploratory miss
+                // remains a negative fact, but it is not unfinished task
+                // work: otherwise one speculative path can permanently
+                // prevent an unrelated, completed task from closing.
                 let proven_no_effect = output.may_mutate_workspace()
                     && output
                         .failure_class()
                         .is_some_and(|class| class.proves_no_effect());
-                if !proven_no_effect {
+                let unrooted_exploratory_read = !output.may_mutate_workspace()
+                    && attribution.is_some_and(|attribution| {
+                        attribution.speculative_negative_target(output).is_some()
+                    });
+                if !proven_no_effect && !unrooted_exploratory_read {
                     self.push_failure(
                         output,
                         &identity,

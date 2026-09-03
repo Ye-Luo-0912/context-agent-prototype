@@ -102,6 +102,16 @@ then credited with one aggregate result.
   ([`evidence/m15-diagnosis-completion-gate/REPORT.md`](../crates/agent-eval/evidence/m15-diagnosis-completion-gate/REPORT.md)).
   Step 3 above is therefore open again: select one materially new product/serving
   candidate before changing formal evidence.
+- A user-authorized successor repair set now has deterministic coverage for
+  the two latest infrastructure/runtime causes plus the recurring local test
+  failures: the surviving debt is correctly attributed to an unrooted
+  speculative missing read (the same-digest formatting PASS had already
+  cleared its row); cancellation-lag model futures no longer retain workspace
+  locks; eval CLI/Python/sidecar startup is parse-first and semantically
+  probed; and buffered capacity is typed without changing its limits. This is
+  successor-source implementation, not a retroactive window repair or a new
+  formal verdict. It must still satisfy step 4 and, if selected for M15, the
+  fresh step-6 sequence.
 - `EVAL-PREFLIGHT-01` may improve the developer/evaluation gate independently,
   but it neither repairs a valid cell FAIL nor authorizes a formal window.
 - A Runtime candidate must reuse the sole `CompletionReadiness` and the existing

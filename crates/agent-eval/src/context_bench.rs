@@ -381,20 +381,7 @@ pub fn pack_digest(pack: &BenchPack) -> String {
 }
 
 pub fn require_python() -> anyhow::Result<()> {
-    let bin = crate::harvest::python_bin();
-    match std::process::Command::new(&bin)
-        .arg("-c")
-        .arg("import sys")
-        .status()
-    {
-        Ok(status) if status.success() => Ok(()),
-        Ok(status) => {
-            anyhow::bail!("context-bench verifier preflight failed: {bin} exited {status}")
-        }
-        Err(error) => {
-            anyhow::bail!("context-bench verifier preflight failed: {bin} missing ({error})")
-        }
-    }
+    crate::harvest::python_interpreter().map(|_| ())
 }
 
 pub fn check_pack(pack: &BenchPack) -> anyhow::Result<String> {

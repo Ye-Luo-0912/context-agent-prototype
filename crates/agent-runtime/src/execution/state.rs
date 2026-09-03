@@ -530,6 +530,31 @@ impl RuntimeExecutionAttribution {
         self.rooted_targets.iter().any(|rooted| rooted == &target)
     }
 
+    /// Return the exact host-attributed path for an observation/search
+    /// result. This is the shared admission seam for speculative negative
+    /// facts and their completion-debt disposition; the two ledgers must not
+    /// classify the same output from different predicates.
+    pub(super) fn observation_target(&self, output: &ToolOutput) -> Option<String> {
+        if !matches!(
+            self.host.purpose,
+            ToolExecutionPurpose::Observe | ToolExecutionPurpose::Search
+        ) {
+            return None;
+        }
+        output
+            .file_path()
+            .map(agent_contracts::normalize_resource_path)
+            .filter(|target| self.host.targets.iter().any(|known| known == target))
+    }
+
+    pub(super) fn speculative_negative_target(&self, output: &ToolOutput) -> Option<String> {
+        if output.ok || output.failure_class() != Some(ToolFailureClass::PathNotFound) {
+            return None;
+        }
+        self.observation_target(output)
+            .filter(|target| !self.target_is_rooted(target))
+    }
+
     pub fn reusable_verification(&self) -> bool {
         self.host.reusable_verification()
     }
@@ -1496,17 +1521,7 @@ impl ExecutionState {
         let Some(attribution) = attribution else {
             return (false, Vec::new());
         };
-        if !matches!(
-            attribution.host.purpose,
-            ToolExecutionPurpose::Observe | ToolExecutionPurpose::Search
-        ) {
-            return (false, Vec::new());
-        }
-        let Some(target) = output
-            .file_path()
-            .map(agent_contracts::normalize_resource_path)
-            .filter(|target| attribution.host.targets.iter().any(|known| known == target))
-        else {
+        let Some(target) = attribution.observation_target(output) else {
             return (false, Vec::new());
         };
         let mut transitions = Vec::new();

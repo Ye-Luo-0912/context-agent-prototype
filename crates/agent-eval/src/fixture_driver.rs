@@ -1083,7 +1083,10 @@ async fn run_workspace_session_harness_ops(
 
     let workspace = agent_workspace::Workspace::open(workspace_root).await?;
     let fixture_workspace = workspace.clone();
-    let verification_recipes = tool_runtime::VerificationRecipes::discover(&workspace);
+    let verification_recipes =
+        tool_runtime::VerificationRecipes::discover_with_python_resolver(&workspace, || {
+            crate::harvest::resolved_python_interpreter()
+        })?;
     let tools: Arc<dyn ToolDispatcher> = Arc::new(
         tool_runtime::BuiltinToolDispatcher::with_config_and_verification_recipes(
             workspace.clone(),

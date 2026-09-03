@@ -18,3 +18,8 @@ context-contextcore.workspace = true
 context-simple.workspace = true
 serde_json.workspace = true
 tokio.workspace = true
+
+[dev-dependencies]
+agent-core.workspace = true
+agent-runtime.workspace = true
+async-trait.workspace = true

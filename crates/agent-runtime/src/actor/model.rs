@@ -1281,7 +1281,11 @@ impl RuntimeActor {
         self.record_context_requirement_observation(materialized.required_misses.total());
 
         let core = self.core.clone();
-        let services = self.services.clone();
+        // A provider that is slow to observe cancellation may outlive this
+        // actor. Capture only the transport lane so a stale model future
+        // cannot keep tool dispatchers or workspace locks alive across
+        // shutdown/recomposition.
+        let model = self.services.model_transport();
         let sink = LiveSink::new(
             core.event_sender(),
             core.event_sequence(),
@@ -1303,8 +1307,8 @@ impl RuntimeActor {
             settlement_projection_audit,
         );
         tokio::spawn(async move {
-            let outcome = match services
-                .run_model_round(
+            let outcome = match model
+                .complete_stream(
                     ModelRequest {
                         messages: input.into_messages(),
                         tools: input.tool_schemas.clone(),
@@ -2004,6 +2008,15 @@ mod failure_class_tests {
                 message: "invalid event".into(),
             }),
             (RuntimeFailureClass::Model, false)
+        );
+        assert_eq!(
+            RuntimeActor::classify_model_failure(&AgentError::LocalResourceLimit {
+                kind: agent_contracts::LocalResourceLimitKind::BufferedModelStreamChunks,
+                observed: 16_385,
+                limit: 16_384,
+            }),
+            (RuntimeFailureClass::Runtime, false),
+            "local buffering pressure is neither provider damage nor retryable"
         );
     }
 }

@@ -226,12 +226,17 @@ duplicate or missing values fail before files are created or processes
 started; the ignored trailing `--evidence-dir` class is closed with direct
 regressions.
 
-Landed slice (2026-09-03): the dev-only `agent-eval --doctor` gate runner
+Landed slice (2026-09-03), with successor hardening later the same day: the
+dev-only `agent-eval --doctor` gate runner
 covers the remaining scope in one bounded command. It probes the exact
-git/cargo/rustc executables, resolves `python` from PATH the way the tests
-do (the Windows Store stub is diagnosed here instead of surfacing as an
-unexplained exit 9009), builds and freshness-touches the context-service
-helper under the CI rule, sends one tiny request through the exact pinned
+git/cargo/rustc executables and resolves Python through the same bounded
+semantic probe as hidden commands and verification discovery. Explicit
+`AGENT_EVAL_PYTHON` / `AGENT_PYTHON` values (including values loaded from
+`eval.env`) take precedence, followed by `py -3`, `python3`, and `python`;
+the Windows Store stub becomes a typed setup failure instead of exit 9009,
+and virtual-environment symlinks remain intact. The service-owned integration
+target uses Cargo's exact `CARGO_BIN_EXE` helper, with no freshness timestamp
+or manual build/touch rule. Doctor sends one tiny request through the exact pinned
 model/protocol data plane instead of treating `/models` as serving proof
 (skipped, never failed, when no key is configured), then runs the same
 format/check/Clippy/build/test list CI runs, and writes one bounded
@@ -251,8 +256,9 @@ on worker threads while exit is polled, the captured tail survives a
 timeout, and the final verification run completes the full local gate chain
 in about ten minutes with every step green.
 
-Exit tests cover option-order equivalence, the Windows Store Python alias ahead
-of a real interpreter, no usable interpreter, stale/missing helper binaries,
+Exit tests cover complete option/action parsing before side effects, the
+Windows Store Python alias ahead of a real interpreter, no usable interpreter,
+bounded probe output/time and Cargo-owned helper identity,
 `/models` healthy with the actual Responses data plane unavailable, exact
 evidence-directory selection, collision refusal, bounded logs, manifest-digest
 mismatch and proof that the runner does not start a formal window. This work may
@@ -718,6 +724,13 @@ invisible to `kill(-pid)` and survives), part 2 explicitly builds
 `agent-context-service` binary (whose mtime freshness guard is tripped by
 warm-cache restore in a fresh checkout), and both those jobs rebuild and
 stamp the service binary accordingly.
+
+Current successor note (2026-09-03): the context-service-specific workaround
+above describes the recorded 2026-08-30 source and is no longer the live test
+contract. The real process-boundary suite is now an integration target owned
+by `agent-context-service` and executes Cargo's exact `CARGO_BIN_EXE` binary;
+no mtime guard, explicit service build, or timestamp touch remains. The scoped
+`agent-process` fixture build is still required for its own sibling binaries.
 
 ### P0 — one completion authority
 
@@ -1282,6 +1295,24 @@ exhaustion) and a harness storage lock-contention failure at resume restore.
 Both are uncovered by the terminal escalation; the candidate is rejected and
 M15 stays open. The next bounded M15 candidate is an operator decision bounded
 by the frozen route.
+
+Successor-source correction and repair (2026-09-03; no formal rerun): the
+immutable stream shows that the same-`argument_digest` successful formatting
+check retired its earlier failure. The persistent row was the unrooted
+`fs.read src/job.rs` `PathNotFound` observation. Negative-fact admission and
+failed-command disposition now share one trusted predicate, so only an exact
+unrooted Observe/Search miss avoids completion debt; all rooted/mismatched/
+unattributed cases stay conservative. The resume lock was traced to a detached
+model future retaining the full service bundle after cancellation; that task
+now captures only `ModelTransport`, with a regression that reacquires the same
+workspace-effect journal before releasing the lagging future. Supporting
+repairs make CLI validation side-effect-free, Python/helper discovery typed and
+Cargo-owned, and local buffered capacity distinct from malformed provider
+data. The successor local doctor gate is green (pre-recording source-tree digest
+`73155555cc8e20cd…`: Python/helper, format, all-target/all-feature check,
+strict Clippy, build, complete all-target workspace tests); the Provider probe
+was intentionally skipped without a key. These changes do not alter the
+rejected source or authorize another window.
 
 The settlement candidate gate, if it is run again after deterministic fixes,
 is `normal/resume × off/on × at least two explicitly joined repeats`; only
@@ -2872,7 +2903,7 @@ Full text: git history of this file.
 | TOOL-02 | `search.grep` `path` accepts a file target (file-or-directory), removing a class of `path_not_found` tool failures (2026-08-21) |
 | EVAL identity | Live evidence runs refuse a dirty workspace by default (`--allow-dirty` opt-in); the manifest records `source_tree_digest` over HEAD tree + tracked diff + untracked `crates/` sources (2026-08-21) |
 | EVAL-04 | Source-identity self-pollution: a live run's own untracked evidence output made every cell after the first report `git_dirty=true` (the `context-mech-convergence` manifests record this). Identity scans now exclude `crates/agent-eval/evidence` — run outputs are not tested sources (2026-08-21) |
-| CTX-12 | Not a code divergence: the parity tests had spawned a 9-day-stale `target/debug/agent-context-service.exe` (cargo test never refreshes that artifact; `serde(default)` hid the wire drift). Fixed with a test freshness guard that fails closed with a rebuild hint (2026-08-21). Scoped test runs need `cargo build -p agent-context-service` first. |
+| CTX-12 | Not a code divergence: the parity tests had spawned a 9-day-stale `target/debug/agent-context-service.exe` (`serde(default)` hid the wire drift). The interim mtime guard/rebuild hint from 2026-08-21 is superseded: the integration target is now owned by `agent-context-service` and uses Cargo's exact `CARGO_BIN_EXE` binary, so scoped runs need no manual service build/touch. |
 | PROV-01 | `provider-openai` loopback wire test failed through machine-wide proxies (Clash/V2Ray WinINET interception → gateway 502). Fixed with `OpenAiProvider::with_client` + a `no_proxy` test client (2026-08-21); production `new` keeps auto system proxy. |
 | CONV-01 | Execution Evidence Frontier: ExecutionEvidence + FrontierDelta + ConvergenceState + `ExecutionFrontier` events + eval metrics; replay rebuild + conformance serde contracts (2026-08-23) |
 | CONV-02 | Cross-tool convergence debt: FailureClass/FailureDomain split, RetryDomain::ExecutableResolution with host-trusted launch facts, no K-strikes decision recorded (2026-08-23) |

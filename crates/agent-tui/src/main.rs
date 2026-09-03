@@ -82,7 +82,7 @@ async fn main() -> anyhow::Result<()> {
     }
     // 授权映射是组合根的决定：一份内置注册表同时交给审批门、能力
     // 分发器与内核租约路径。
-    let verification_recipes = Arc::new(VerificationRecipes::discover(&workspace));
+    let verification_recipes = Arc::new(VerificationRecipes::discover(&workspace)?);
     let host_policies = Arc::new(
         HostToolPolicyRegistry::with_builtins_and_verification(&verification_recipes)
             .map_err(anyhow::Error::msg)?,

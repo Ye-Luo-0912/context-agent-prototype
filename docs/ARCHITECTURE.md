@@ -2162,11 +2162,11 @@ in-process engine and the service boundary, and asserts the normalized
 outcomes are identical.
 The checklist lives in one `contract_snapshot` helper: a new trait method
 must be added there, and the parity test then verifies the wire op, the
-service handling and the adapter override automatically. The service is a
-dev-dependency of the adapter crate for compile-time contract coverage. The
-standalone executable must also be rebuilt before the process test when its
-wire changes (`cargo build -p agent-context-service`); an old executable is
-rejected by the process test rather than treated as parity evidence.
+service handling and the adapter override automatically. The integration
+target is owned by the `agent-context-service` package and uses Cargo's
+`CARGO_BIN_EXE_agent-context-service` path, so Cargo rebuilds the exact binary
+whose wire contract the test drives. The old adapter dev-dependency cycle,
+mtime freshness heuristic and manual build/touch workaround are gone.
 
 **Trusted Core direction.** Core is not headed toward retirement by
 merging into the runtime. Its turn-stateless primitives — permission/approval,

@@ -109,7 +109,10 @@ async fn run_session(
 ) -> anyhow::Result<Vec<RuntimeEventEnvelope>> {
     let approval: Arc<dyn ApprovalGate> = Arc::new(AllowAllGate);
     let workspace = agent_workspace::Workspace::open(workspace_root).await?;
-    let verification_recipes = tool_runtime::VerificationRecipes::discover(&workspace);
+    let verification_recipes =
+        tool_runtime::VerificationRecipes::discover_with_python_resolver(&workspace, || {
+            crate::harvest::resolved_python_interpreter()
+        })?;
     // 收敛基准需要显式运行 process.run；默认表面不含它。
     let lifecycle = tool_runtime::ToolLifecycleConfig {
         always_loaded: vec![

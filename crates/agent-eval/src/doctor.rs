@@ -147,82 +147,48 @@ fn version_probe(name: &'static str, args: &[&str]) -> DoctorStep {
     }
 }
 
-/// The Python probe resolves `python` from PATH exactly as the tests do, so
-/// the Windows Store stub (exit 9009 or a redirect) is diagnosed as a
-/// finding here instead of surfacing later as an unexplained test failure.
+/// Use the same semantic resolver as verification discovery and hidden
+/// commands. A Windows Store alias is rejected by its failed probe, and the
+/// successful row records the probed absolute invocation path without
+/// escaping a virtual-environment symlink.
 fn python_probe() -> DoctorStep {
     let started = Instant::now();
     let name = "python";
-    let mut command = Command::new(if cfg!(windows) { "python" } else { "python3" });
-    command.args([
-        "-c",
-        "import sys; print(sys.executable, sys.version.split()[0])",
-    ]);
-    match run_captured(command, gate_timeout("toolchain")) {
-        Ok((true, out)) => DoctorStep {
+    match crate::harvest::python_interpreter() {
+        Ok(interpreter) => DoctorStep {
             name,
             passed: true,
             required: true,
-            detail: out.lines().next().unwrap_or("").trim().to_string(),
-            duration_ms: started.elapsed().as_millis(),
-        },
-        Ok((false, out)) => DoctorStep {
-            name,
-            passed: false,
-            required: true,
-            detail: format!(
-                "the resolved interpreter is not usable (a Windows Store stub exits 9009): {out}"
-            ),
+            detail: interpreter.executable().to_string(),
             duration_ms: started.elapsed().as_millis(),
         },
         Err(error) => DoctorStep {
             name,
             passed: false,
             required: true,
-            detail: format!("not runnable: {error}"),
+            detail: error.to_string(),
             duration_ms: started.elapsed().as_millis(),
         },
     }
 }
 
-/// Owned helper binaries: build them explicitly and refresh their mtimes,
-/// the same freshness rule CI applies (the context-service binary is the
-/// helper downstream tests spawn) so a warm-cache restore cannot leave a
-/// stale helper behind.
+/// Compile the service-owned integration target. Referencing Cargo's
+/// `CARGO_BIN_EXE_agent-context-service` makes Cargo rebuild the exact helper
+/// used by the test, so timestamps are neither inspected nor modified.
 fn helpers_probe() -> DoctorStep {
     let started = Instant::now();
     let name = "helper-binaries";
     let mut build = Command::new("cargo");
-    build.args(["build", "-p", "agent-context-service"]);
+    build.args([
+        "test",
+        "-p",
+        "agent-context-service",
+        "--test",
+        "service",
+        "--no-run",
+    ]);
     let (passed, detail) = match run_captured(build, gate_timeout("helpers")) {
-        Ok((true, _)) => {
-            let binary_name = if cfg!(windows) {
-                "agent-context-service.exe"
-            } else {
-                "agent-context-service"
-            };
-            let path = std::path::Path::new("target")
-                .join("debug")
-                .join(binary_name);
-            match std::fs::OpenOptions::new().append(true).open(&path) {
-                Ok(file) => {
-                    let times = std::fs::FileTimes::new()
-                        .set_modified(SystemTime::now())
-                        .set_accessed(SystemTime::now());
-                    match file.set_times(times) {
-                        Ok(()) => (true, format!("built and fresh: {}", path.display())),
-                        Err(error) => (false, format!("helper freshness failed: {error}")),
-                    }
-                }
-                Err(_) => (
-                    false,
-                    format!(
-                        "helper freshness failed: {} missing after build",
-                        path.display()
-                    ),
-                ),
-            }
-        }
+        Ok((true, _)) => (true, "Cargo-owned service integration target built".into()),
         Ok((false, out)) => (false, out),
         Err(error) => (false, format!("not runnable: {error}")),
     };
@@ -328,6 +294,12 @@ fn gate_step(name: &'static str, args: &[&str]) -> DoctorStep {
     let started = Instant::now();
     let mut command = Command::new("cargo");
     command.args(args);
+    if let Ok(interpreter) = crate::harvest::python_interpreter() {
+        command.env(
+            tool_runtime::PYTHON_EXECUTABLE_ENV,
+            interpreter.executable(),
+        );
+    }
     let (passed, detail) = match run_captured(command, gate_timeout(name)) {
         Ok((true, out)) => (true, out.lines().last().unwrap_or("ok").trim().to_string()),
         Ok((false, out)) => (false, out),

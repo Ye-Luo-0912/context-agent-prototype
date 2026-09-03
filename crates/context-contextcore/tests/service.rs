@@ -1,7 +1,8 @@
 //! End-to-end tests for the context-service adapter.
 //!
-//! Cargo sets `CARGO_BIN_EXE_agent-context-service` for integration tests, so
-//! these tests spawn the real service process and drive the full
+//! The `agent-context-service` package owns this integration-test target, so
+//! Cargo builds the exact binary exposed by `CARGO_BIN_EXE_agent-context-service`.
+//! The tests spawn that real service process and drive the full
 //! `ContextEngine` contract across the process boundary — including plugging
 //! the adapter into a real `CoreAuthority` (the acceptance criterion: a
 //! composition-root change, nothing else).
@@ -21,8 +22,8 @@ use context_contextcore::{ContextServiceAdapter, ContextServiceConfig, ServiceEn
 use serde_json::json;
 
 async fn connect() -> Arc<dyn ContextEngine> {
-    require_fresh_service_binary();
     let adapter = ContextServiceAdapter::connect(&ContextServiceConfig {
+        program: Some(service_program()),
         engine: ServiceEngine::Dynamic,
         ..ContextServiceConfig::default()
     })
@@ -31,83 +32,8 @@ async fn connect() -> Arc<dyn ContextEngine> {
     Arc::new(adapter)
 }
 
-/// Stale-service guard: a stale service binary must fail loudly, never
-/// silently.
-///
-/// `cargo test` compiles dev-dependency *libraries* only — it never
-/// refreshes the plain `target/<profile>/agent-context-service.exe`
-/// artifact that [`agent_process::resolve_program`] finds next to the test
-/// binary. A scoped test run after a wire/engine change would therefore
-/// spawn a service built from older sources: the old binary serializes
-/// DTOs without the new fields (`#[serde(default)]` hides the drift by
-/// filling in zeros) and runs older engine behavior, so the parity tests
-/// fail with confusing divergences instead of naming the real problem
-/// (observed 2026-08-21: a 9-day-old binary produced
-/// `resident_bytes: 0 != 78`, `marked_roots: 6 != 3` and
-/// `anchored_item_count: 3 != 1`). Refuse to run against a binary older
-/// than any source file whose observable behavior crosses the wire.
-fn require_fresh_service_binary() {
-    use std::time::SystemTime;
-    let name = if cfg!(windows) {
-        "agent-context-service.exe"
-    } else {
-        "agent-context-service"
-    };
-    let program = agent_process::resolve_program(Some("CARGO_BIN_EXE_agent-context-service"), name);
-    let Ok(metadata) = std::fs::metadata(&program) else {
-        // No resolvable binary: let the spawn produce its own clear error.
-        return;
-    };
-    let Ok(binary_mtime) = metadata.modified() else {
-        return;
-    };
-    let workspace = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-        .parent()
-        .and_then(|crates| crates.parent())
-        .expect("crates/context-contextcore sits two levels under the workspace root");
-    // Everything the service binary compiles that can change observable
-    // behavior across the pipe: wire DTOs, framing/host, the engines, the
-    // wire protocol and the service itself.
-    const BEHAVIOR_CRATES: &[&str] = &[
-        "agent-contracts",
-        "agent-platform-protocol",
-        "agent-process",
-        "context-simple",
-        "context-baselines",
-        "context-contextcore",
-        "agent-context-service",
-    ];
-    fn newest_source(dir: &std::path::Path) -> Option<SystemTime> {
-        let mut newest = None;
-        let mut stack = vec![dir.to_path_buf()];
-        while let Some(current) = stack.pop() {
-            let Ok(entries) = std::fs::read_dir(&current) else {
-                continue;
-            };
-            for entry in entries.flatten() {
-                let path = entry.path();
-                if path.is_dir() {
-                    stack.push(path);
-                } else if let Ok(modified) = entry.metadata().and_then(|m| m.modified()) {
-                    newest = Some(newest.map_or(modified, |best: SystemTime| best.max(modified)));
-                }
-            }
-        }
-        newest
-    }
-    for crate_name in BEHAVIOR_CRATES {
-        let sources = workspace.join("crates").join(crate_name).join("src");
-        if let Some(newest) = newest_source(&sources)
-            && newest > binary_mtime
-        {
-            panic!(
-                "the context-service binary at {program} predates the newest source in \
-                 crates/{crate_name}: `cargo test` never rebuilds that artifact, so these \
-                 tests would silently run a stale service whose wire/engine contract has \
-                 drifted. Rebuild it first: `cargo build -p agent-context-service`"
-            );
-        }
-    }
+fn service_program() -> String {
+    env!("CARGO_BIN_EXE_agent-context-service").to_string()
 }
 
 #[tokio::test]
@@ -239,6 +165,7 @@ async fn full_contract_round_trip_across_the_process_boundary() {
     // Checkpoint/restore round-trip across the boundary.
     let checkpoint = engine.checkpoint().await.unwrap();
     let adapter2 = ContextServiceAdapter::connect(&ContextServiceConfig {
+        program: Some(service_program()),
         engine: ServiceEngine::Dynamic,
         ..ContextServiceConfig::default()
     })
@@ -486,17 +413,7 @@ async fn oversized_request_frames_end_the_session_with_a_bounded_error() {
     // and the session must end — the half-consumed line cannot be trusted,
     // and a client that cannot speak the framing must not keep the service
     // alive.
-    require_fresh_service_binary();
-    let current = std::env::current_exe().unwrap();
-    let program = agent_process::probe_siblings(
-        &current,
-        if cfg!(windows) {
-            "agent-context-service.exe"
-        } else {
-            "agent-context-service"
-        },
-    )
-    .expect("agent-context-service built next to the test profile");
+    let program = service_program();
     let mut child = tokio::process::Command::new(&program)
         .args(["--engine", "append", "--max-frame-bytes", "4096"])
         .stdin(std::process::Stdio::piped())
@@ -575,8 +492,8 @@ async fn adapter_frame_cap_is_enforced_by_the_service_on_responses() {
     // checkpoint is not. This proves the adapter passes its configured cap
     // into the service process, which must replace the response instead of
     // serializing an unbounded line.
-    require_fresh_service_binary();
     let adapter = ContextServiceAdapter::connect(&ContextServiceConfig {
+        program: Some(service_program()),
         engine: ServiceEngine::Append,
         max_frame_bytes: 1024,
         ..ContextServiceConfig::default()
@@ -982,9 +899,9 @@ async fn full_contract_parity_across_the_process_boundary() {
     // for *every* contract method at once. A wire op dropped in the
     // service, or an adapter method left to its default no-op, diverges
     // here.
-    require_fresh_service_binary();
     let service_store = IsolatedStore::new("service-parity");
     let service = ContextServiceAdapter::connect(&ContextServiceConfig {
+        program: Some(service_program()),
         engine: ServiceEngine::Dynamic,
         store_dir: Some(service_store.path().to_path_buf()),
         ..ContextServiceConfig::default()
@@ -1138,9 +1055,9 @@ async fn reconcile_store_parity_between_in_process_and_service_boundary() {
     // here. Both engines get the identical crash-injected store, so the
     // reports — rebuilt / deleted-stale / quarantined / temp-cleaned —
     // must match exactly.
-    require_fresh_service_binary();
     let service_store = IsolatedStore::new("reconcile-service");
     let service = ContextServiceAdapter::connect(&ContextServiceConfig {
+        program: Some(service_program()),
         engine: ServiceEngine::Dynamic,
         store_dir: Some(service_store.path().to_path_buf()),
         ..ContextServiceConfig::default()
@@ -1253,17 +1170,7 @@ struct SpawnedService {
     stdout: tokio::process::ChildStdout,
 }
 
-fn service_program() -> String {
-    let name = if cfg!(windows) {
-        "agent-context-service.exe"
-    } else {
-        "agent-context-service"
-    };
-    agent_process::resolve_program(Some("CARGO_BIN_EXE_agent-context-service"), name)
-}
-
 async fn spawn_raw_service() -> SpawnedService {
-    require_fresh_service_binary();
     let mut child = tokio::process::Command::new(service_program())
         .args(["--engine", "append"])
         .stdin(std::process::Stdio::piped())

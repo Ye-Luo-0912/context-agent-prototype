@@ -17,6 +17,8 @@ use agent_workspace::Workspace;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
+use crate::{PYTHON_EXECUTABLE_ENV, PythonInterpreterError, resolve_python_interpreter};
+
 pub const VERIFY_RUN_TOOL_NAME: &str = "verify.run";
 pub const MAX_VERIFICATION_RECIPES: usize = 16;
 const MAX_RECIPE_ID_BYTES: usize = 96;
@@ -240,6 +242,28 @@ pub struct VerificationRecipes {
     declarations: Vec<VerificationCoverageDeclaration>,
 }
 
+/// Discovery can fail before any model-visible recipe is published. In
+/// particular, a Python project never receives a recipe backed by an
+/// unresolved command name or the Windows Store launcher stub.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum VerificationDiscoveryError {
+    PythonInterpreter(PythonInterpreterError),
+    InvalidCatalog(String),
+}
+
+impl std::fmt::Display for VerificationDiscoveryError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::PythonInterpreter(error) => error.fmt(formatter),
+            Self::InvalidCatalog(error) => {
+                write!(formatter, "verification_recipe_discovery_failed: {error}")
+            }
+        }
+    }
+}
+
+impl std::error::Error for VerificationDiscoveryError {}
+
 const MAX_COVERAGE_DOMAINS: usize = 8;
 const MAX_CLASS_MEMBERS: usize = 8;
 
@@ -421,7 +445,35 @@ impl VerificationRecipes {
         })
     }
 
-    pub fn discover(workspace: &Workspace) -> Self {
+    pub fn discover(workspace: &Workspace) -> Result<Self, VerificationDiscoveryError> {
+        Self::discover_with_python_envs(workspace, &[PYTHON_EXECUTABLE_ENV])
+    }
+
+    /// Caller-configured discovery without weakening the probe. This exists
+    /// for hosts with a legacy, more specific override name; the first set
+    /// variable remains authoritative and every value still has to resolve
+    /// to a probed absolute Python 3 invocation path. Virtual-environment
+    /// symlinks remain intact.
+    pub fn discover_with_python_envs(
+        workspace: &Workspace,
+        explicit_env_vars: &[&str],
+    ) -> Result<Self, VerificationDiscoveryError> {
+        Self::discover_with_python_resolver(workspace, || {
+            resolve_python_interpreter(explicit_env_vars)
+        })
+    }
+
+    /// Discover recipes while delegating Python resolution to the host. The
+    /// closure is called only for a workspace with a Python project marker,
+    /// so a Rust-only workspace never acquires an unrelated interpreter
+    /// prerequisite.
+    pub fn discover_with_python_resolver<F>(
+        workspace: &Workspace,
+        resolve_python: F,
+    ) -> Result<Self, VerificationDiscoveryError>
+    where
+        F: FnOnce() -> Result<crate::PythonInterpreter, PythonInterpreterError>,
+    {
         let root = workspace.root();
         let mut recipes = Vec::new();
         if root.join("Cargo.toml").is_file() {
@@ -473,14 +525,15 @@ impl VerificationRecipes {
             || root.join("pytest.ini").is_file()
             || root.join("setup.cfg").is_file()
         {
-            let python = if cfg!(windows) { "python" } else { "python3" };
-            push_recipe(
-                &mut recipes,
+            let python = resolve_python().map_err(VerificationDiscoveryError::PythonInterpreter)?;
+            if let Ok(recipe) = VerificationRecipe::new(
                 "python.pytest",
                 "Run the Python test suite with pytest",
-                "python-pytest-v1",
-                [python, "-m", "pytest"],
-            );
+                "python-pytest-v2",
+                python.command_argv(["-m", "pytest"]),
+            ) {
+                recipes.push(recipe);
+            }
         }
         if root.join("CMakeLists.txt").is_file() {
             push_recipe(
@@ -491,7 +544,7 @@ impl VerificationRecipes {
                 ["ctest", "--test-dir", "build", "--output-on-failure"],
             );
         }
-        Self::new(recipes).unwrap_or_default()
+        Self::new(recipes).map_err(VerificationDiscoveryError::InvalidCatalog)
     }
 
     pub fn as_slice(&self) -> &[VerificationRecipe] {
@@ -965,7 +1018,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join("Cargo.toml"), "[workspace]\nmembers=[]\n").unwrap();
         let workspace = Workspace::open(dir.path()).await.unwrap();
-        let recipes = VerificationRecipes::discover(&workspace);
+        let recipes = VerificationRecipes::discover(&workspace).unwrap();
         assert_eq!(recipes.as_slice().len(), 1);
         assert_eq!(recipes.as_slice()[0].id, "rust.workspace");
         let policy = recipes.host_policy().unwrap();
@@ -980,12 +1033,58 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn python_project_discovery_fails_typed_before_publishing_a_placeholder() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("pyproject.toml"),
+            "[project]\nname='demo'\n",
+        )
+        .unwrap();
+        let workspace = Workspace::open(dir.path()).await.unwrap();
+        let error = VerificationRecipes::discover_with_python_resolver(&workspace, || {
+            Err(PythonInterpreterError::Unavailable {
+                attempts: vec!["py -3: unavailable".into()],
+            })
+        })
+        .unwrap_err();
+        assert!(matches!(
+            error,
+            VerificationDiscoveryError::PythonInterpreter(
+                PythonInterpreterError::Unavailable { .. }
+            )
+        ));
+    }
+
+    #[tokio::test]
+    async fn python_recipe_uses_only_the_probed_absolute_interpreter() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("pyproject.toml"),
+            "[project]\nname='demo'\n",
+        )
+        .unwrap();
+        let workspace = Workspace::open(dir.path()).await.unwrap();
+        let executable = std::fs::canonicalize(std::env::current_exe().unwrap())
+            .unwrap()
+            .to_string_lossy()
+            .into_owned();
+        let recipes = VerificationRecipes::discover_with_python_resolver(&workspace, || {
+            Ok(crate::PythonInterpreter::from_probed_executable(executable.clone()).unwrap())
+        })
+        .unwrap();
+        let recipe = recipes.get("python.pytest").unwrap();
+        assert_eq!(recipe.revision, "python-pytest-v2");
+        assert_eq!(recipe.argv, [executable, "-m".into(), "pytest".into()]);
+        assert!(Path::new(&recipe.argv[0]).is_absolute());
+    }
+
+    #[tokio::test]
     async fn standalone_rust_recipe_is_generic_and_writes_only_runtime_state() {
         let dir = tempfile::tempdir().unwrap();
         std::fs::create_dir(dir.path().join("src")).unwrap();
         std::fs::write(dir.path().join("src/protocol.rs"), "fn main() {}\n").unwrap();
         let workspace = Workspace::open(dir.path()).await.unwrap();
-        let recipes = VerificationRecipes::discover(&workspace);
+        let recipes = VerificationRecipes::discover(&workspace).unwrap();
         let recipe = recipes.get("rust.compile-tests:src/protocol.rs").unwrap();
         assert_eq!(&recipe.argv[..3], ["rustc", "--test", "src/protocol.rs"]);
         assert!(recipe.argv[4].starts_with(".focus-agent/verify-"));
@@ -1007,7 +1106,7 @@ mod tests {
         )
         .unwrap();
         let workspace = Workspace::open(dir.path()).await.unwrap();
-        let recipes = VerificationRecipes::discover(&workspace);
+        let recipes = VerificationRecipes::discover(&workspace).unwrap();
         let recipe = recipes.get("rust.compile-tests:src/protocol.rs").unwrap();
         let facts = workspace.runtime_facts();
         let first = recipes
