@@ -35,9 +35,11 @@ not a new planner, TaskGraph, database or multi-Agent layer.
   part-1 tests then exposed a separate racy assertion: after `ChildRules` had
   closed an fd, another parallel test reused the same numeric descriptor, so
   `F_GETFD == -1` was not a valid proof. The current tree compares the original
-  `fstat` identity when reuse wins and still requires EBADF otherwise. This is
-  not a recorded clean-source exit until the new test and the complete
-  Windows/Linux CI pass.
+  `fstat` identity when reuse wins and still requires EBADF otherwise.
+- **Clean-source exit recorded 2026-09-03 on `0668002`**: run `33785349225`
+  is green across both fmt/clippy/build jobs, Ubuntu test parts 1+2, and the
+  Windows full suite — the new reuse-tolerant test and the reaped probe
+  descendant both pass on both platforms. Directive step 1 is closed.
 - Formal M15 remains open. Seven v4 valid FAIL windows are banked; the latest
   mechanical report is 10/12 with 0 NOT_RUN. Its resume failure is classified
   in `dimensions.json` as `runtime_error_class=runtime`: it is a Runtime
