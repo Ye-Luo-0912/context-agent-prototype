@@ -1595,9 +1595,13 @@ order is:
   when the basis moves. Matched gates: deterministic matrix (landed,
   `operator_only_refusals_escalate_to_a_terminal_surface`), and the full
   local gate plus recorded clean source with dual-platform CI is banked on
-  `cc60194` (dual-platform CI run `33740918365` green, 2026-09-03). Next are
-  at most one fresh exact-source preflight and at most one predeclared
-  12-cell window (operator-reviewed).
+  `cc60194` (dual-platform CI run `33740918365` green, 2026-09-03). The new
+  exact-source/product preflight **passed 2026-09-03** on clean HEAD `2adad31`
+  (one `retry_policy_dev` normal cell, product surface, pinned PinAI tuple,
+  explicit protocol; evidence at
+  [`evidence/m15-preflight/`](../crates/agent-eval/evidence/m15-preflight/),
+  source tree digest `ba2ec74c...`, verdict PASS). Next is at most one
+  predeclared 12-cell window (operator-reviewed).
 
 **Workload disposition (2026-09-03; documentation only):** the proposed
 "one-stop reliability" umbrella is a **large, multi-slice effort**, not one
