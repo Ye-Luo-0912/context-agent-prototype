@@ -264,26 +264,7 @@ pub async fn check_catalog(dispatcher: &dyn ToolDispatcher) -> ConformanceReport
 /// digest detects any surface drift — a tool added, removed, or with a
 /// changed input schema.
 pub fn surface_digest(specs: &[ToolSpec]) -> String {
-    use sha2::{Digest, Sha256};
-    let mut pairs: Vec<(&str, String)> = specs
-        .iter()
-        .map(|spec| {
-            (
-                spec.name.as_str(),
-                serde_json::to_string(&spec.input_schema)
-                    .expect("a ToolSpec input schema always serializes"),
-            )
-        })
-        .collect();
-    pairs.sort_unstable();
-    let mut hasher = Sha256::new();
-    for (name, schema) in pairs {
-        hasher.update(name.as_bytes());
-        hasher.update(b"\0");
-        hasher.update(schema.as_bytes());
-        hasher.update(b"\0");
-    }
-    format!("{:x}", hasher.finalize())
+    agent_contracts::tool::surface_digest(specs)
 }
 
 /// Check the machine-readable inventory (`docs/TOOL_INVENTORY.json`,

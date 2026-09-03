@@ -1636,6 +1636,7 @@ pub async fn run_pack_cell(
     // this exact immutable projection rather than independently rebuilding
     // lookalike declarations.
     let (verification_recipes, acceptance_authority) = pack_verification_projection(pack);
+    let surface_digest = evaluated_surface_digest(&verification_recipes).await;
     let identity = CellEvidenceIdentity::capture(
         pack,
         pair,
@@ -1664,14 +1665,32 @@ pub async fn run_pack_cell(
 
     if let Err(e) = (pack.seed)(root) {
         let outcome = failed(CellFailure::harness_setup(format!("seeding failed: {e:#}")));
-        write_evidence(pair, root, &collector, pack, &outcome, None, None)?;
+        write_evidence(
+            pair,
+            root,
+            &collector,
+            pack,
+            &outcome,
+            None,
+            None,
+            surface_digest.as_deref(),
+        )?;
         return Ok(outcome);
     }
     if let Err(e) = crate::suite::ensure_workspace_git(root) {
         let outcome = failed(CellFailure::harness_setup(format!(
             "workspace git init failed: {e:#}"
         )));
-        write_evidence(pair, root, &collector, pack, &outcome, None, None)?;
+        write_evidence(
+            pair,
+            root,
+            &collector,
+            pack,
+            &outcome,
+            None,
+            None,
+            surface_digest.as_deref(),
+        )?;
         return Ok(outcome);
     }
 
@@ -2150,6 +2169,7 @@ pub async fn run_pack_cell(
         &outcome,
         Some(&oracle_record),
         Some(&self_check_record),
+        surface_digest.as_deref(),
     )?;
     Ok(outcome)
 }
@@ -2278,9 +2298,27 @@ fn workspace_has_tests(root: &Path) -> bool {
     })
 }
 
+/// Digest of the production dispatcher surface this pilot evaluates: the
+/// builtin catalog composed with the cell's frozen verification recipes,
+/// hashed through the contracts derivation so surface drift between runs
+/// is detectable from the evidence alone.
+async fn evaluated_surface_digest(
+    verification_recipes: &tool_runtime::VerificationRecipes,
+) -> Option<String> {
+    let root = tempfile::tempdir().ok()?;
+    let workspace = agent_workspace::Workspace::open(root.path()).await.ok()?;
+    let dispatcher = tool_runtime::BuiltinToolDispatcher::with_config_and_verification_recipes(
+        workspace,
+        tool_runtime::ToolLifecycleConfig::default(),
+        (*verification_recipes).clone(),
+    );
+    Some(agent_contracts::tool::surface_digest(&dispatcher.specs()))
+}
+
 /// Serialize the cell into the claimed pair directory using the shared
 /// evidence conventions (manifest + events.jsonl + hidden report) plus
 /// this pilot's per-dimension record.
+#[allow(clippy::too_many_arguments)]
 fn write_evidence(
     pair: &PairSink,
     root: &Path,
@@ -2289,6 +2327,7 @@ fn write_evidence(
     outcome: &CellOutcome,
     oracle: Option<&HiddenCommandResult>,
     self_check: Option<&HiddenCommandResult>,
+    surface_digest: Option<&str>,
 ) -> anyhow::Result<()> {
     let report = build_hidden_report(outcome, root, pack, oracle, self_check);
     let metrics = crate::metrics::aggregate_metrics(&collector.events);
@@ -2308,6 +2347,7 @@ fn write_evidence(
         collector.lagged,
         0,
         Some("production"),
+        surface_digest,
         &report,
     )?;
     let dimensions = serde_json::json!({

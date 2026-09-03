@@ -1098,6 +1098,7 @@ mod tests {
             repeats: 2,
             live: true,
             tool_surface: Some("production".into()),
+            surface_digest: None,
             fixture_sha256: expected_identity.fixture_sha256.clone(),
             git_head: Some("head".into()),
             git_dirty: Some(false),

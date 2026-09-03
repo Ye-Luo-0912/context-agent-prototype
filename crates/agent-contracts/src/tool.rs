@@ -1076,6 +1076,35 @@ pub enum ToolFailureClass {
     Io,
 }
 
+/// Stable evaluated-surface digest: SHA-256 over the sorted
+/// `(name, canonical input schema)` pairs of a dispatcher's current model
+/// surface. Order-independent and schema-shape-sensitive, so a persisted
+/// digest detects any surface drift — a tool added, removed, or with a
+/// changed input schema. Lives in contracts so every composition root
+/// (conformance checks, eval manifests) shares one derivation.
+pub fn surface_digest(specs: &[ToolSpec]) -> String {
+    use sha2::{Digest, Sha256};
+    let mut pairs: Vec<(&str, String)> = specs
+        .iter()
+        .map(|spec| {
+            (
+                spec.name.as_str(),
+                serde_json::to_string(&spec.input_schema)
+                    .expect("a ToolSpec input schema always serializes"),
+            )
+        })
+        .collect();
+    pairs.sort_unstable();
+    let mut hasher = Sha256::new();
+    for (name, schema) in pairs {
+        hasher.update(name.as_bytes());
+        hasher.update(b" ");
+        hasher.update(schema.as_bytes());
+        hasher.update(b" ");
+    }
+    format!("{:x}", hasher.finalize())
+}
+
 impl ToolFailureClass {
     /// True when the typed refusal proves that the model's instruction was
     /// defective and the target resource is untouched: the trusted handler

@@ -94,6 +94,11 @@ pub struct CellManifest {
     /// surface from trajectories.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tool_surface: Option<String>,
+    /// Stable digest over the evaluated dispatcher's model surface
+    /// (agent_contracts::tool::surface_digest). Persisted per cell so
+    /// surface drift between runs is detectable from the evidence alone.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub surface_digest: Option<String>,
     pub fixture_sha256: String,
     pub git_head: Option<String>,
     pub git_dirty: Option<bool>,
@@ -182,6 +187,7 @@ pub fn write_cell(
         broadcast_lagged,
         model_deltas_omitted,
         None,
+        None,
         &report,
     )
 }
@@ -230,6 +236,7 @@ pub fn write_suite_cell(
         broadcast_lagged,
         model_deltas_omitted,
         None,
+        None,
         &report,
     )
 }
@@ -250,6 +257,7 @@ pub(crate) fn write_cell_parts(
     broadcast_lagged: u64,
     model_deltas_omitted: u64,
     tool_surface: Option<&str>,
+    surface_digest: Option<&str>,
     report: &HiddenReport,
 ) -> anyhow::Result<()> {
     fs::create_dir_all(dir)?;
@@ -261,6 +269,7 @@ pub(crate) fn write_cell_parts(
         repeats: pair.repeats,
         live: pair.live,
         tool_surface: tool_surface.map(str::to_string),
+        surface_digest: surface_digest.map(str::to_string),
         fixture_sha256: fixture_sha256.to_string(),
         git_head: git_head(),
         git_dirty: git_dirty(),
@@ -1115,6 +1124,42 @@ mod tests {
     use super::*;
     use agent_contracts::{ToolCall, ToolOutput};
     use serde_json::json;
+
+    #[test]
+    fn cell_manifest_persists_the_evaluated_surface_digest() {
+        // headline: the evaluated tool-surface identity rides in every
+        // manifest, so surface drift between runs is detectable from the
+        // evidence alone (no trajectory inference).
+        let dir = tempfile::tempdir().unwrap();
+        let pair = PairSink::claim(dir.path().to_path_buf(), "f".into(), 1, 1, false);
+        let events: Vec<RuntimeEventEnvelope> = Vec::new();
+        let report = workload::evaluate_hidden(&workload::FIXTURES[0], std::path::Path::new("."));
+        let ws = tempfile::tempdir().unwrap();
+        write_cell_parts(
+            &pair.cell_dir("dynamic"),
+            "fixture",
+            "sha",
+            "dynamic",
+            &pair,
+            &events,
+            &RunMetrics::default(),
+            true,
+            10,
+            None,
+            ws.path(),
+            0,
+            0,
+            Some("production"),
+            Some("abc123"),
+            &report,
+        )
+        .unwrap();
+        let value: serde_json::Value = serde_json::from_str(
+            &std::fs::read_to_string(pair.cell_dir("dynamic").join("manifest.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(value["surface_digest"], "abc123");
+    }
 
     fn envelope(seq: u64, event: RuntimeEvent) -> RuntimeEventEnvelope {
         RuntimeEventEnvelope {

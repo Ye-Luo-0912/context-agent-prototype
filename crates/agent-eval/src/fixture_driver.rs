@@ -434,6 +434,7 @@ pub async fn run_tool_edit_live(
             session.lagged,
             session.deltas_omitted,
             Some(EvalToolSurface::Production.id()),
+            None,
             &hidden,
         )?;
         let sidecar = serde_json::json!({
@@ -1694,6 +1695,7 @@ async fn run_bench_with_engine(
             session.lagged,
             session.deltas_omitted,
             Some(tool_surface.id()),
+            None,
             &report,
         )?;
     }
