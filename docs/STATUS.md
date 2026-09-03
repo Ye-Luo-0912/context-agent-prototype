@@ -1469,10 +1469,28 @@ candidate**, not another prompt tweak or an immediate rerun. The repaired-source
    confirms three distinct model-quality surfaces with no shared cause and
    no harness/transport/oracle defect;
 3. select one bounded candidate from those facts. Do not retune Context/GC,
-   weaken protocol bounds, add a fixed round stop or introduce TaskGraph;
+   weaken protocol bounds, add a fixed round stop or introduce TaskGraph —
+   **selected 2026-09-03 by operator direction** ("fix the documented
+   problems"): the workload-split slice "general `AttemptIncident` versus
+   completion-debt admission", narrowed to its diagnosis-supported core and
+   landed on `e897c5c`. A typed refusal that only judges instruction
+   quality (`NoExactMatch` / `AmbiguousMatch` / `HiddenPath`; `NoSearchMatch`
+   is read-only by construction) proves the trusted handler left the target
+   resource untouched, so it stays visible in the result and the bounded
+   negative-fact table but never opens a failed-command row. Refusals that
+   signal a real resource reconciliation (moved revision → the
+   refusal-lineage machinery; missing path → the debt row plus the typed
+   directory-recovery surface) and unknown-effect failures (process exit,
+   I/O) keep their debt semantics unchanged, so no debt is auto-cleared and
+   the 2026-08-31 P1 guarantees keep their original tests;
 4. pass the candidate's deterministic failure matrix, the applicable open P1
    exits (or exact out-of-path proof), and a newly recorded clean local /
-   dual-platform CI source;
+   dual-platform CI source — the deterministic matrix is green (admission,
+   negative controls, lineage/retention guarantees re-exercised on
+   debt-opening rows, checkpoint round trip, contract enum coverage; full
+   all-target workspace suite and strict Clippy pass), and `EVAL-PREFLIGHT-01`
+   closed the same day with `agent-eval --doctor` green end-to-end; the
+   recorded clean source plus dual-platform CI is the remaining half;
 5. run the same-checkpoint causal fork only if settlement projection changes,
    then one fresh exact-source product preflight and at most one freshly
    predeclared M15 window.
