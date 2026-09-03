@@ -1600,8 +1600,23 @@ order is:
   (one `retry_policy_dev` normal cell, product surface, pinned PinAI tuple,
   explicit protocol; evidence at
   [`evidence/m15-preflight/`](../crates/agent-eval/evidence/m15-preflight/),
-  source tree digest `ba2ec74c...`, verdict PASS). Next is at most one
-  predeclared 12-cell window (operator-reviewed).
+  source tree digest `ba2ec74c...`, verdict PASS). Next was at most one
+  predeclared 12-cell window.
+
+**Completion-gate admission candidate window (2026-09-03; predeclared clean
+source recorded at launch, preflight PASS in the evidence commit, declaration
+recorded before its run):**
+
+- The 12-cell v4 window on the completion-gate convergence candidate + PinAI
+  tuple is **predeclared 2026-09-03 before its run** (M15_ACCEPTANCE §7 item
+  8): 3 fixtures × normal/resume × 2 repeats, the product surface (TaskProgress
+  on, settlement and advisory candidates off, no counterfactual second
+  request), the pinned serving tuple above (explicit `responses` protocol), one
+  uninterrupted `agent-eval --m15-window` run whose cell directories land under
+  `crates/agent-eval/evidence/m15-window/_windows/1788435938195/`. The exact
+  clean source identity is recorded at launch; no source change happens during
+  the run, the frozen-window rules of M15_ACCEPTANCE §5 apply, and the
+  mechanically regenerated report is the only accepted verdict.
 
 **Workload disposition (2026-09-03; documentation only):** the proposed
 "one-stop reliability" umbrella is a **large, multi-slice effort**, not one
