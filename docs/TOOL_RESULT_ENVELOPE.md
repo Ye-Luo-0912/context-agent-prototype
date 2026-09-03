@@ -204,7 +204,8 @@ make the model-facing result larger.
 | `MAX_TOOL_METADATA_BYTES` | 8 000 | serialized `metadata` bytes | broker `bound_metadata` |
 | `MAX_TOOL_OUTPUT_TOTAL_CHARS` | 24 000 | `summary + model_content + metadata` decoded chars | broker |
 | `MAX_PROVIDER_ERROR_CHARS` | 4 000 | provider/model error text | runtime `bound_error_message` |
-| `CONTEXT_SEARCH_MAX_LIMIT` | 50 | `context.search` limit (execution clamp) | kernel `resolve_engine_query` |
+| `CONTEXT_SEARCH_MAX_LIMIT` | 50 | `context.search` limit (execution clamp) | `ContextSearchQuery::normalized` in Core / engine / process adapter |
+| `CONTEXT_SEARCH_MAX_QUERY_CHARS` | 256 | `context.search` free text and label filter | `ContextSearchQuery::normalized` in Core / engine / process adapter |
 | `MAX_TOOL_SURFACE_TOKENS` | 4 096 | per-round tool schema tokens | runtime round packing |
 | `MAX_TOOL_SURFACE_REPORT_WIRE_BYTES` | 18 432 | one round-surface report event | event construction |
 | `MAX_TOOL_SURFACE_REPORT_{SELECTED,OMITTED,BLOCKED}` | 32 | rows per report section | event construction |

@@ -64,12 +64,24 @@ not a new planner, TaskGraph, database or multi-Agent layer.
   "Service temporarily unavailable". Per the frozen rule a censored window
   is not a verdict and produced no decision-grade sample, so the whole
   frozen window is rerun unchanged (same source `1651354`, same serving).
-- Formal M15 remains open. Seven v4 valid FAIL windows are banked; the latest
-  mechanical report is 10/12 with 0 NOT_RUN. Its resume failure is classified
-  in `dimensions.json` as `runtime_error_class=runtime`: it is a Runtime
-  restore/storage lifecycle failure, not the `harness_setup` or
-  `harness_watchdog` class that would produce `NOT_RUN`. The successor repairs
-  do not create a new formal verdict.
+- The authorized whole-window rerun completed the same day from the same
+  frozen worktree at `1651354` and is a **valid FAIL: 6/12 pass, 0 NOT_RUN**
+  (mechanical report `_windows/1788466134988`): migrate 4/4, diag 1/4 — the
+  overflow edge recurred stochastically in 3 cells, consistent with the
+  frozen cross-window diagnosis — and policy 1/4, where `normal r1`, `normal
+  r2` and `resume r1` all exhausted the 48-round tool budget with
+  behavior/diff passing (`task.complete` refused; the completion-gate tail
+  loop) and `resume r2` closed in 39 rounds. Behavior pass 9/12; provider
+  healthy in every cell. Per M15_ACCEPTANCE §5 the valid FAIL **rejects the
+  successor candidate**; the window is not rerun. M15 remains open.
+- Formal M15 remains open. Nine v4 windows are banked (seven valid FAILs
+  plus the censored eighth and its failed rerun); the latest mechanical
+  report is the rerun's 6/12 with 0 NOT_RUN, where the policy
+  completion-gate tail loop is the dominant recurring failure surface
+  (3 of 4 policy cells) and the diag overflow edge remains stochastic
+  (1/4). The successor repairs did not change that outcome: the loop is
+  model task-execution behavior on this serving, not the infrastructure
+  lock contention the seventh window hit.
 - Product scope is now fixed to dynamic in-process Context, builtin tools, one
   workspace, one checked OpenAI-compatible provider profile and an interactive
   TUI. Service Context and dynamic extensions remain experimental unless their
@@ -79,7 +91,7 @@ not a new planner, TaskGraph, database or multi-Agent layer.
 | --- | --- | --- |
 | Contracts / Core / process / storage | Trusted mechanisms are substantial: bounded contracts, approval/effect authority, journals, recovery evidence and process control are implemented. | Persist and reconcile unresolved effect-ack debt end to end; retain fail-closed recovery. |
 | Runtime / task / checkpoint | Sole `RuntimeActor`, TaskAnchor/ExecutionState, completion readiness, safe points and cross-plane checkpoint/restore exist. | Expose a verified product save/list/resume path and bounded status projection; never add a second orchestrator. |
-| Dynamic Context | Working-set lifecycle, external store, recall and explainability are implemented; the materialize/restore transaction, catalog-dirty residual and Stored semantic full-text verification closed on 2026-09-04. | Keep GC/scoring frozen through M15; carry only measured post-M15 performance work, not new retrieval heuristics. |
+| Dynamic Context | Working-set lifecycle, external store, recall and explainability are implemented; the unified plan/I/O mutation lane, catalog-dirty repair, exact-token Stored semantic verification and bounded fragment-aware short/CJK residual closed on 2026-09-04. | Keep GC/scoring frozen through M15; carry only measured post-M15 performance work, not new retrieval heuristics. |
 | Tools / workspace | A broad bounded coding surface, artifact spill, revision-aware edits, verification recipes and approvals exist. | Persist the evaluated surface identity and make actual effects, failures and grants understandable in the product host. |
 | Provider / composition | OpenAI-compatible Chat/Responses streaming and one trusted composition path exist. | Checked configuration, explicit mock mode, visible serving identity, strict startup errors and the optional-service type residual. |
 | TUI / product entry | The event-driven TUI can run tasks, approve calls, inspect Context and manually checkpoint/restore. | Strict help/config parsing, bounded visible command errors, safe checkpoint-store integration, resume discovery, usable grant revoke and packaged startup smoke. |

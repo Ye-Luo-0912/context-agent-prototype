@@ -491,19 +491,20 @@ generates candidates from
 those indexes across Resident/Warm/Stored; a live working-set file is a
 catalog hit (heap projection), not an empty miss. Since the shared search
 kernel (`agent-contracts::search`) landed, candidates also come from an
-incrementally maintained inverted index over entities/labels/path identity
-and a bounded body prefix (stored entries: summary) — multi-word needles
-match by token coverage, rare tokens outrank common ones, and unique-prefix
-extensions count as weaker hits; the whole-needle key-substring scan is
-kept as the second union layer, and only a needle matching nothing anywhere
-falls back to the residual scan over summaries/uris/bodies. Verification
-mirrors that split: a whole-needle substring hit ranks first, and a
-multi-word needle verifies when *every* token (shared `tokenize` rule)
-appears in the entry's matchable text — candidate recall is not discarded
-at the verification gate. Candidate completeness is now explicit
+incrementally maintained inverted index over entities, labels, path identity
+and a bounded semantic-body prefix (stored entries: summary); a full stable
+`context://run/<uuid>` ref bypasses common-token postings and resolves by id.
+Multi-word candidates rank by token coverage and rarity; unique-prefix
+extension remains a weaker candidate-generation aid. Final semantic-body
+verification is stricter: every normalized ASCII word token must occur as an
+exact body token, so an arbitrary mid-token fragment is not a body query.
+Entity/label/path identities retain explicit substring lookup. Short fragments
+and CJK queries, whose word boundaries the index cannot represent soundly,
+carry an explicit bounded residual: short ASCII runs remain exact tokens; CJK
+runs use substring verification. Candidate completeness is now explicit
 (AUDIT_TODO SCHED-02, landed 2026-08-23): the catalog reports
 `SearchCandidates { ids, incomplete }`, and an incomplete reason
-(saturated posting, truncated indexed text) triggers a bounded residual
+(saturated posting, truncated indexed text, unindexed query shape) triggers a bounded residual
 verification over non-candidates against full stored bodies — deep-body
 keywords surface even though the index only saw their 512-char prefix.
 The reread-motive note stands: measured long-flow rereads were
@@ -1076,6 +1077,32 @@ and the exact content returns in the tool result — while the prompt's
 external section carries only the bounded ref preview (content truncated
 at externalization), never the full externalized content.
 
+Semantic context bodies remain searchable by exact tokens beyond the bounded
+catalog prefix; short/CJK queries use the explicit fragment-aware residual described
+above. The catalog tracks incompleteness per item (body-window/token truncation,
+or a Stored descriptor that cannot prove its unseen body) and applies the
+query's kind/scope/task/label filters before widening. When a query is
+incomplete, the dynamic engine snapshots only eligible semantic Stored owners,
+performs owner-checked reads outside the state lock with at most 8 concurrent
+reads, and refuses explicitly when more than 256 bodies would be required.
+Each authority-bearing async blob read/write is capped at 1 MiB. Current
+entries verify the captured checksum; legacy pre-checksum entries still require
+a valid blob shape, matching item id and the same semantic kind advertised by
+the owner. The engine keeps only verified hit ids/ownership stamps, then
+rechecks current live ownership, kind and checksum before the unchanged bounded
+top-K ranking. Missing/corrupt/unreadable planned bodies fail explicitly;
+oversized blobs are classified as corrupt instead of becoming false no-match
+results. Bodies are never
+returned by search.
+`ToolObservation` / `FileObservation` bodies are excluded from the
+catalog text, residual plan and final verifier; their identity is searchable
+only through the explicit stamped path/revision (raw body-derived entity
+signatures are prevented during construction/legacy backfill and sanitized at
+catalog/projection boundaries),
+and Fetch/Admit remains the only body recovery path. The engine itself clamps
+direct/sidecar free text and label filters to 256 characters and results to 50,
+the same bounds as Core; `limit=0` retains the 16-result engine default.
+
 The engine-level fetch is still a read and does not reactivate the stored
 record. Since CTX-03, the runtime also no longer persists retrieval results
 as fresh observations: every `TurnFrameStep::ToolResult` carries a
@@ -1158,13 +1185,17 @@ overflow counts/digests (`CONTEXT-RESOURCE-BOUND-01`, repaired in `cfc17a3`).
 This is resource hardening, not permission to tune GC thresholds or
 reactivation scoring.
 
-Because the state lock is released between the phases, the multi-phase
-operations (GC, storage GC, store reconcile, checkpoint, restore) are
-serialized by an engine-level operation gate: a plan computed against one
-state can never be committed against a state a concurrent restore or
-storage GC replaced in between. Single-phase operations (ingest, maintain,
-materialize, ...) remain atomic under the state lock alone and never take
-the gate — lock order is always gate, then state.
+Because the state lock is released between phases, the engine uses one
+operation/mutation gate around every state-changing API: ingest (including
+optional distill), maintenance, scope mutation, consumption ACK, access-stamping
+search/inspect/fetch, ledger export, GC/storage GC/reconcile, materialization,
+checkpoint and restore. A plan therefore cannot commit against lifecycle or
+ownership changed inside its lock-free I/O window, and two paths cannot
+recall/admit the same owner concurrently. Read-only diagnostics/catalog views
+still need only the state lock. Lock order is always gate, then state; disk I/O
+still runs without the state lock. Restore also preserves the process-lifetime
+maximum materialization revision before replacing state, so a rollback cannot
+reuse a preview id and accept a delayed pre-restore ACK (ABA).
 
 Storage GC is the only place information is permanently deleted, and it is
 now a *strong-edge reachability closure* rather than a single

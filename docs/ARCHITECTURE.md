@@ -996,8 +996,9 @@ cap (`summary` 2 000 chars, `model_content` 16 000 chars, serialized
 reference, so a producer that did not spill no longer loses the truncated
 middle. The same broker bounds `context.fetch` results after the engine
 answers, provider/model error text is capped before it enters the event
-stream, and `context.search` limits are clamped in execution
-(`CONTEXT_SEARCH_MAX_LIMIT`), not only in the JSON schema. The actor's
+stream, and `context.search` limits are clamped in both Core and the Context
+engine (`CONTEXT_SEARCH_MAX_LIMIT`), so direct/sidecar callers cannot bypass
+the execution bound advertised by the JSON schema. The actor's
 last-line guard (`agent-runtime::output`) stays as a second, cheaper
 defense for producers that bypass the broker.
 
@@ -2319,8 +2320,23 @@ extra scoring coefficient:
   (task / scope / kind / entity / label / residency / attention) serve
   both GC hot-entity recall and `context.search` candidate generation.
   Authority metadata stays on the body; checkpoints serialize the three
-  stores and rebuild the directory. A free-text needle that hits no
-  entity/label key still residual-scans summaries/uris. `label` is a real
+  stores and rebuild the directory. A full stable URI resolves directly by id;
+  path identity participates in the bounded candidate scan;
+  entity/label/path use substring lookup, while summaries/semantic bodies use
+  exact ASCII word tokens. Short/CJK shapes explicitly residual-check without
+  dropping fragments (short ASCII stays exact; CJK uses substring). The bounded text index reports per-query incompleteness when a
+  posting/token/body window or unindexed query shape can hide a hit.
+  Resident/Warm residuals verify their in-memory semantic body; eligible
+  Stored semantic residuals are owner-checked outside the state lock with
+  fixed concurrency, a 256-read/query ceiling and a 1 MiB/blob async I/O cap,
+  then revalidate live ownership, kind and checksum before the unchanged top-K
+  ranking. Present checksums are enforced; legacy entries still require a
+  valid blob, matching item id and matching semantic kind.
+  Missing/corrupt/unreadable bodies and the read ceiling are explicit errors;
+  oversized blobs fail as corrupt, never as partial results. Raw Tool/File
+  bodies and body-derived entity strings remain Fetch-only; raw search cards
+  retain only explicit stamped path/revision identity.
+  Free text and `label` are both normalized to 256 chars; `label` is a real
   `ContextSearchQuery` dimension.
 - **Retrieval access is graded (`CTX-GC-11`).** Search-hit, inspect, fetch,
   admit, and consumption ack are explicit ranks on the stored body

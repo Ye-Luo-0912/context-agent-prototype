@@ -1,0 +1,144 @@
+{
+  "schema": "m15-window.v2",
+  "created_ms": 1788466134988,
+  "expected_repeats": 2,
+  "expected_packs": [
+    "retry_diag_dev",
+    "retry_migrate_dev",
+    "retry_policy_dev"
+  ],
+  "cells": [
+    {
+      "path": "../../m15-retry_diag_dev-normal/r1-attempt15/dynamic",
+      "digests": {
+        "dimensions.json": "a9a1fbfa3a5f9f723dbb5d44f9dc32d5e3f91c6154db47d86b6357b755de2f22",
+        "events.jsonl": "7d6bdd06e0188abf7b7ce6c09e173ba6830334ca9a9431a77b7478b3557a0888",
+        "manifest.json": "b2592519b76cadee82c59a79fb568903efcc25701010f7d7ce50b3f8f52ab74a",
+        "summary.json": "e4c60a220e90b660bde3f1a65d1dc4b9fda5ad8bb6d0ba483a48652fc40a6c1e",
+        "verify.json": "2ce7ab29d1ec0d19e98782219b600d76e80af5ba3f8af63d151057476c268b41",
+        "workspace.json": "ee2003102a64290acf997b8ea5ff2f2d9107b831bf8fac844395f1cf465e959c"
+      }
+    },
+    {
+      "path": "../../m15-retry_diag_dev-resume/r1-attempt15/dynamic",
+      "digests": {
+        "dimensions.json": "9bb6e8a09d1efac7dc50f41eddcd53aefd6f0f4b8a9869ce37037e491109fa86",
+        "events.jsonl": "963e0376e83c5eb6dc159b3968020c7ac079bb394cfd1dd2543874fad459bca0",
+        "manifest.json": "b2592519b76cadee82c59a79fb568903efcc25701010f7d7ce50b3f8f52ab74a",
+        "summary.json": "92f8cc9a4ae230d267a425ec6f52a9cbf581e12c948dd5b0ea1f471f7479a896",
+        "verify.json": "812a8b42964c40645382a8323764d85eabbf4732ab55bfb8894a0f2ec71cd7d6",
+        "workspace.json": "4d03cbfcbec6ef23403920ab217f17ffbd0702e25bb5b36abaa490835b11b691"
+      }
+    },
+    {
+      "path": "../../m15-retry_diag_dev-normal/r2-attempt15/dynamic",
+      "digests": {
+        "dimensions.json": "6327a9dcb50609930d9a8c093c633b3a7fa48d4c64df04d4f378d4aec16f3dc7",
+        "events.jsonl": "4935c4b45e005fd5816c7e6971e0ad37e94c306206097c390d3b5a76c18a54de",
+        "manifest.json": "c8b76afdcae0bdbc9f6d0421e5b378db72fca0f80afe403cfdb770c78f108ec8",
+        "summary.json": "392e81082b5f89a035b710eb705436221b83376b874ad438ddad5063015b8af5",
+        "verify.json": "c5b6f50ac1f6ba1ce63ec3cc0134663cc1678cf0253376ffb78ba765bba3319c",
+        "workspace.json": "0f4f1632ba8ee04d5bc92b3ed969e4ae2243bbf978e009f6275db851f0cd73ef"
+      }
+    },
+    {
+      "path": "../../m15-retry_diag_dev-resume/r2-attempt15/dynamic",
+      "digests": {
+        "dimensions.json": "3263cd988d36644831305f7a86b5c7b07d6b618931e0f7aedb5ec4afc7574f00",
+        "events.jsonl": "28345a6545641ad68989d0530503cf6f3254e251720e556282a9b92b8a683e4f",
+        "manifest.json": "c8b76afdcae0bdbc9f6d0421e5b378db72fca0f80afe403cfdb770c78f108ec8",
+        "summary.json": "0831c2e20d306dbca7adb4d923b85aa8dccd2b680be12f8fa45f28c2bae75a70",
+        "verify.json": "c72b49144350b16ad6327ec1ce608d8170b1fa9cd167ad25102633d53bc54ef3",
+        "workspace.json": "475d36486d1ab5bb611d533513ae62f7aeea28a0f9d7786460dfaeee8076f8a9"
+      }
+    },
+    {
+      "path": "../../m15-retry_migrate_dev-normal/r1-attempt15/dynamic",
+      "digests": {
+        "dimensions.json": "e77699881a0137b2142ddc07d200b53966cb4a2f56f49ec8d90e3e99f2e4ee04",
+        "events.jsonl": "0776994c1ac544640dd0085f0bc628e0fe4e8b2995420d5f66b316c6d018786d",
+        "manifest.json": "eab17b26934f276c9ac806bd2ca445b8091fc09808ddda27a4ac46cfb6bb4dc6",
+        "summary.json": "0528458a1842047672c28be5ff634849eb343437805710b45c84f7cf4f2ed327",
+        "verify.json": "50a26ede9dea22d5a904e4e5c60bd6a50390c56e25c5d2d2019e489875991a0e",
+        "workspace.json": "0ba649cbe95f6142bc0975e1d72b4e5c8b27db19c98dc2e8f6b001953d9cefac"
+      }
+    },
+    {
+      "path": "../../m15-retry_migrate_dev-resume/r1-attempt15/dynamic",
+      "digests": {
+        "dimensions.json": "c07e71f8596515d36afa14c10d4ae2ce613132f2ce2fb4f46d5dbdbcdbc5381a",
+        "events.jsonl": "3816e3e2735fb5a581570ac6b4f474fe3988cb65f031a5a0940ebb427ae3185c",
+        "manifest.json": "eab17b26934f276c9ac806bd2ca445b8091fc09808ddda27a4ac46cfb6bb4dc6",
+        "summary.json": "ca1f2def5de46beab25dbd5e3ff1da39d0a8330357e64105f6c30d10efb1e050",
+        "verify.json": "52ee30f536fcab0fa82a5f20565f22e056f2cee2c5f06ee47be5f77b295a13da",
+        "workspace.json": "8ef676883edfa1b3da038c36de4cf3881875db46655daa54995da9a433884540"
+      }
+    },
+    {
+      "path": "../../m15-retry_migrate_dev-normal/r2-attempt15/dynamic",
+      "digests": {
+        "dimensions.json": "04d71b200594ced30da129d31d575c080f09928cac47688bc1d7f9947dee1442",
+        "events.jsonl": "21b8b42eea4132b415dc99c31e63c2814453435f1b158a8eca808f97ce39d02f",
+        "manifest.json": "2cedece6ac9e684171aa1c7ccc6011e322c2dcf5459b545f1dd040e57947d03a",
+        "summary.json": "688f487d72f7ea756444e0f204b249e18140eea4f7c6b9c3b71159fcc497a2e5",
+        "verify.json": "7605c17c3baf201e9497ae3111625ec1772e060587e3fba4cec19047b9a71276",
+        "workspace.json": "0ba649cbe95f6142bc0975e1d72b4e5c8b27db19c98dc2e8f6b001953d9cefac"
+      }
+    },
+    {
+      "path": "../../m15-retry_migrate_dev-resume/r2-attempt15/dynamic",
+      "digests": {
+        "dimensions.json": "41371cd7dc4ea97ec44ae58cb5268c3eb5ba44b9f4b68334621c9b2a34b81cac",
+        "events.jsonl": "fb5473f250cbd9a80ac373241793689f4e1b1098fe6437fccf32b64f0e43d08c",
+        "manifest.json": "2cedece6ac9e684171aa1c7ccc6011e322c2dcf5459b545f1dd040e57947d03a",
+        "summary.json": "e0af5cb942666dbfd2d17806f1c71f4ccb72623a7dcdda13cf7cf0fb53b56bc7",
+        "verify.json": "9cc7b9c4f9c5bbe4cf76c737538892273e18bdef37bbfcacb7ac62d4bd13ebda",
+        "workspace.json": "1ffc4b2152d55a3c5ae327d3b71bb7dbef930e3773c0de811b2de098adeef030"
+      }
+    },
+    {
+      "path": "../../m15-retry_policy_dev-normal/r1-attempt15/dynamic",
+      "digests": {
+        "dimensions.json": "39cf8b4d23a00fd59d8621c7a43c3c62a90eba07f5f3d0611216f560ffd3939a",
+        "events.jsonl": "29d93e4340ae1f92958683ed5106c948190d14d83f433455252dfae4b026d0fa",
+        "manifest.json": "d132f73d57af949341bec011b81b2a803c967fce421f7819d698e534c91bb212",
+        "summary.json": "b5843f5b25674290ecb0dd6ab4094ddfbb3219be92024def24278522d997538c",
+        "verify.json": "123c521b7da2d0a0bf046accc2ab1b9cc0608318669a5eddd176c7421d990637",
+        "workspace.json": "6ed92d95ad03d4e0a1ee757407763522acd90c66536e3c4c7b420ed13ac94184"
+      }
+    },
+    {
+      "path": "../../m15-retry_policy_dev-resume/r1-attempt15/dynamic",
+      "digests": {
+        "dimensions.json": "6977875033a2c1968b2b579b7c1d012bce9bf66769e771cff3372b241b2ffdcf",
+        "events.jsonl": "a1d6516c0d0b798c00d3d6786f2e2c182c838aa9ed4aebb844e4b0ac7b75d3a4",
+        "manifest.json": "d132f73d57af949341bec011b81b2a803c967fce421f7819d698e534c91bb212",
+        "summary.json": "6cfddc8f9f5a0f56c39b1b2a287638c14dbaaf85f75970c926c4531b5cfe312a",
+        "verify.json": "d83a1e0b08bf1c14b7f6a9d4a77e8466274cf52732bc4c787788444847c5973d",
+        "workspace.json": "460eb23d4b8412e203063356315b6df3248c2a572c4fca8c5412e607cb7478fc"
+      }
+    },
+    {
+      "path": "../../m15-retry_policy_dev-normal/r2-attempt15/dynamic",
+      "digests": {
+        "dimensions.json": "28609b21051b0377be91a7b42ac70be35ecc537169ba4e36b2c463d380260c4d",
+        "events.jsonl": "c8344a9fc61ffd4b956e7fbc4fd1f10509318a4295d729be77b66015035eef47",
+        "manifest.json": "8f7090eae26e9fca23af94168494a4274c257da6aa54d574985388062d5ae0c6",
+        "summary.json": "a9469220a7d81662ab1474c4d3649ab2b59656d014ed4badc3d54452d50d399b",
+        "verify.json": "d52f785d4ea13b915c9bef23d69c08b5a0ffcc2ecbea9ac60e55540c7c89cb6f",
+        "workspace.json": "07e7d40b28ab4226c003c1f0cdfd99512879c84265a80e0d18dd7dbcd1b4f259"
+      }
+    },
+    {
+      "path": "../../m15-retry_policy_dev-resume/r2-attempt15/dynamic",
+      "digests": {
+        "dimensions.json": "1ab14a8900d26ac202229a25aaeac29d7137d4a5a665904f6c14e09a8dfbce70",
+        "events.jsonl": "c3deae7db25746bbe35effd484390554972388877c83b22a7989e9d297dd0df8",
+        "manifest.json": "8f7090eae26e9fca23af94168494a4274c257da6aa54d574985388062d5ae0c6",
+        "summary.json": "85c984d3c2906b082dca4eef84493763db2b4b4a5f7e0eb3e0b7d4b7d26c4309",
+        "verify.json": "bbdf31db595a627dad6a950e56ef0c702de3ea284e377311703002523ce67511",
+        "workspace.json": "87b561765735afac9f2b78e2b5220e74a4809d572f7dc0aa2fa4d6cf3ae848e8"
+      }
+    }
+  ]
+}

@@ -1,0 +1,14 @@
+{
+  "file_set_sha256": "24afc4f1c8ebc78c91f8245374eed65bb254cfcb06b41efd8809b91e3b093f24",
+  "files": 7,
+  "listed": [
+    "Cargo.toml",
+    "DIAGNOSIS.md",
+    "README.md",
+    "src/backoff.rs",
+    "src/config.rs",
+    "src/lib.rs",
+    "src/sleeper.rs"
+  ],
+  "sha256": "5597868ae0a0b12b9d39eb7bfea552c08d0f04e9dfe197f0a523de02a3ec47e3"
+}

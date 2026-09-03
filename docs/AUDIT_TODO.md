@@ -26,7 +26,7 @@ is not closed.
 
 | When | Items | Disposition |
 | --- | --- | --- |
-| Before the Reliable Local Agent alpha | `COMPOSE-LIFECYCLE-01`, `CONTEXT-IO-01`, `EFFECT-ACK-01` | Close the remaining startup type error, Context plan/I/O/commit race and durable ACK-debt lifecycle. These are correctness/safety exits, not product polish. |
+| Before the Reliable Local Agent alpha | `COMPOSE-LIFECYCLE-01`, `EFFECT-ACK-01` | Close the remaining startup type error and durable ACK-debt lifecycle. These are correctness/safety exits, not product polish. `CONTEXT-IO-01` closed on 2026-09-04. |
 | Before the next formal M15 candidate | ~~TOOL-MANIFEST-01~~ (closed on `9e00299`: the evaluated surface digest persists on every cell manifest; CI `33789350980` green) | ~~Record one clean local/Windows/Linux source and persist the evaluated tool-surface identity~~ — done: clean source `0668002`/`fe6a743`, CI `33785349225`/`33789350980`. A valid historical FAIL is never repaired in place. |
 | Only if service Context ships as V1 | `SIDECAR-ERROR-01` | Otherwise keep `--context=service` explicitly experimental and out of the supported product profile. |
 | Before long-horizon breadth, if measured | `FAILURE-SPILL-01`, `TOOL-CONTRACT-01` live acceptance | Activate spill work only if the bounded hot set overflows; use paired task evidence for tool-contract convergence. |
@@ -1137,7 +1137,7 @@ absent optional service. Preserve absence as optional, but return an error for a
 present wrong type. Exit adds both positive absence and negative wrong-type
 tests without weakening the existing startup rollback matrix.
 
-#### CONTEXT-IO-01 — remove lock-across-I/O and loss-on-export (**open — admit/export slice landed on `c7ed011`; materialization/catalog transaction residual remains**)
+#### CONTEXT-IO-01 — remove lock-across-I/O and loss-on-export (**closed 2026-09-04**)
 
 `c7ed011` plans external `Admit` under the state lock, performs the checked
 store read outside it, revalidates on commit, and merges bounded lifecycle rows
@@ -1146,14 +1146,20 @@ prove those two original failures. GC, storage GC and store reconcile already
 use the engine operation gate around plan/I/O/commit, and restore validates a
 scratch replacement before committing it.
 
-Two transactional seams remain. `materialize()` plans foreground/required store
-reads, releases the state lock for I/O, then commits without the operation gate
-or a captured-revision check; a concurrent whole-state replacement can therefore
-make the realized plan stale. External scope promotion also mutates catalog-
-relevant descriptor fields without marking the external catalog dirty. Exit
-requires a concurrent restore/GC regression that cannot publish a stale
-materialization, plus a search/inspect regression for external promotion. Keep
-Context selection and GC scoring frozen.
+The residual is closed without changing Context selection or GC scoring.
+Stored-body materialization now holds the existing operation gate across
+plan/I/O/preview commit; a controlled restore race proves restore waits, clears
+the prior pending preview, and rejects its stale acknowledgement. Restore keeps
+the process-lifetime maximum materialization revision, preventing preview-id
+ABA after rollback. Every state-changing engine API now shares the gate,
+including ingest/maintenance/scope changes, access-stamping retrieval, ledger
+export, Admit/Fetch and the existing GC/reconcile/checkpoint/restore paths; no
+lifecycle mutation can cross another operation's unlocked I/O window. Scope
+promotion marks one catalog rebuild for the whole external batch, while
+supersession/verification mark their changed ids; seeded search/inspect
+regressions prove new scope/label/live/attention keys and removal of the old
+buckets. Focused lifecycle/search/GC regressions cover these boundaries without
+changing policy thresholds or scores.
 
 #### EFFECT-ACK-01 — persist unresolved ACK debt (**open — typed debt/event/fence landed on `245b2a6`; durable lifecycle residual remains**)
 
@@ -2306,17 +2312,35 @@ lifecycle-closure triggers always run. Bounded dirty batches
 (`MaintenanceDebt`) remain the later step before touching scan width.
 CPU/lock/event work — no extra-round causality claimed.
 
-### SCHED-02 — search candidate completeness contract (fixed 2026-08-23)
+### SCHED-02 — search candidate completeness contract (**closed 2026-09-04; contract introduced 2026-08-23**)
 
 The shared index bounds tokens/doc (64), postings/token (4096) and body
 text to its first 512 chars, while candidate hits suppress the residual
 scan — deep-body keyword recall was not guaranteed end-to-end. Landed:
 catalog search returns `SearchCandidates { ids, incomplete }` with
-`SearchIncompleteReason::{SaturatedPosting, TruncatedIndexedText}`;
-an incomplete set triggers one bounded residual verification of the
-non-candidates against full stored bodies (lazy projection keeps memory
-at O(limit)). Search is GC's safety net; recall completeness is now
-explicit, not implied.
+`SearchIncompleteReason::{SaturatedPosting, TruncatedIndexedText,
+UnindexedQueryShape}`;
+the 2026-09-04 closure replaces the global sticky truncation bit with
+per-item/filter-aware state and connects it to real body verification.
+Resident/Warm bodies verify in memory; eligible Stored semantic bodies use a
+fixed-concurrency owner-checked read phase outside the state lock, retain only
+verified ids/ownership stamps, and revalidate the current live owner before the
+unchanged O(limit) top-K ranking. Semantic bodies use exact ASCII tokens;
+short/CJK query shapes use fragment-aware residuals, retaining short ASCII
+tokens exactly and checking CJK substrings. A full URI resolves
+directly by id, and entity/label/path substring candidates remain complete. Present checksums are
+enforced; legacy rows still require valid shape/id/kind, and every missing,
+corrupt or I/O failure is explicit (oversize is corrupt). Async store blobs are capped at
+1 MiB, at most eight reads are active, and a query refuses rather than exceeding
+256 Stored reads; the
+metadata plan is O(eligible Stored descriptors), not falsely described as
+O(limit). Tool/File raw bodies and body-derived entity strings are Fetch-only;
+only stamped path/revision identity enters search. Direct engine and
+sidecar queries enforce the same 256-character text/label and 50-result bounds
+as Core. Query tokenization does not discard tokens 65+ within that char bound,
+and unique-prefix saturation propagates the same incomplete signal as exact
+postings.
+Search completeness is explicit and implemented, not implied.
 
 ### SCHED-03 — convergence failure-cluster escalation (fixed 2026-08-23)
 

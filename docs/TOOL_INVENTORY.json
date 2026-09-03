@@ -19,6 +19,7 @@
     "MAX_TOOL_SURFACE_REPORT_BLOCKED": 32,
     "MAX_TOOL_SURFACE_REPORT_NAME_BYTES": 64,
     "CONTEXT_SEARCH_MAX_LIMIT": 50,
+    "CONTEXT_SEARCH_MAX_QUERY_CHARS": 256,
     "CONTEXT_MAP_VIEW_CAP": 32,
     "MAX_CHANGE_RECORD_BYTES": 2097152
   },
@@ -280,11 +281,13 @@
         "limit": {"type": "integer", "minimum": 1, "maximum": 64, "default": 16},
         "kind": {"type": "string"},
         "scope": {"type": "string"},
-        "task_id": {"type": "string"}
+        "task_id": {"type": "string"},
+        "label": {"type": "string"}
       },
       "limits": {
         "search_execution_cap": 50,
-        "note": "schema advertises maximum 64 for search limit, execution clamps to CONTEXT_SEARCH_MAX_LIMIT=50 (execution is authoritative); keep_alive/lease quotas live in the context engine (max_keep_alive_items, max_lease_turns, max_leased_items/tokens per task, max_admits/max_derived per turn)"
+        "search_text_and_label_chars": 256,
+        "note": "schema advertises maximum 64 for search limit; execution normalizes free text and label to CONTEXT_SEARCH_MAX_QUERY_CHARS=256 and clamps results to CONTEXT_SEARCH_MAX_LIMIT=50 (execution is authoritative); keep_alive/lease quotas live in the context engine (max_keep_alive_items, max_lease_turns, max_leased_items/tokens per task, max_admits/max_derived per turn)"
       },
       "effects": ["context:directive", "context:read"],
       "context_disposition": {
