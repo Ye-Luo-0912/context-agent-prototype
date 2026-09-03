@@ -27,7 +27,7 @@ is not closed.
 | When | Items | Disposition |
 | --- | --- | --- |
 | Before the Reliable Local Agent alpha | `COMPOSE-LIFECYCLE-01`, `CONTEXT-IO-01`, `EFFECT-ACK-01` | Close the remaining startup type error, Context plan/I/O/commit race and durable ACK-debt lifecycle. These are correctness/safety exits, not product polish. |
-| Before the next formal M15 candidate | Applicable rows above plus `TOOL-MANIFEST-01`, or an exact selected-path exclusion | Record one clean local/Windows/Linux source and persist the evaluated tool-surface identity. A valid historical FAIL is never repaired in place. |
+| Before the next formal M15 candidate | ~~TOOL-MANIFEST-01~~ (closed on `9e00299`: the evaluated surface digest persists on every cell manifest; CI `33789350980` green) | ~~Record one clean local/Windows/Linux source and persist the evaluated tool-surface identity~~ — done: clean source `0668002`/`fe6a743`, CI `33785349225`/`33789350980`. A valid historical FAIL is never repaired in place. |
 | Only if service Context ships as V1 | `SIDECAR-ERROR-01` | Otherwise keep `--context=service` explicitly experimental and out of the supported product profile. |
 | Before long-horizon breadth, if measured | `FAILURE-SPILL-01`, `TOOL-CONTRACT-01` live acceptance | Activate spill work only if the bounded hot set overflows; use paired task evidence for tool-contract convergence. |
 | Before extension promotion or Self-Iteration | `CAP-OBS-01` residual | Retire legacy producer metadata only through the existing typed-facts migration; dynamic producers never mint trusted execution facts. |
