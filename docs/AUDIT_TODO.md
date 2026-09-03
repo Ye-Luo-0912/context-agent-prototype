@@ -1268,8 +1268,20 @@ direction; the explicit recommendation of the diagnosis)
       normal cell, task_progress product surface, PinAI tuple, explicit
       protocol; evidence crates/agent-eval/evidence/m15-preflight/]
   -> at most one freshly predeclared formal 12-cell M15 window
-     [pending, operator-reviewed]
+     [DONE 2026-09-03: valid FAIL 10/12, 0 NOT_RUN, _windows/1788438275930,
+      predeclared clean source a6dc33e]
+  -> candidate REJECTED; preserve the window and return to bounded diagnosis
+     (m15-diagnosis-completion-gate/REPORT.md)
 ```
+
+The completion-gate candidate closed the diag tail (diag 4/4) but the two
+residual `retry_policy_dev` failures are a distinct execution-debt tail (a
+resolvable-looking `failed_commands` blocker on which the ordinary-final
+terminal stage is deliberately not offered, ending in 48-round budget
+exhaustion) and a harness storage lock-contention failure at resume restore.
+Both are uncovered by the terminal escalation; the candidate is rejected and
+M15 stays open. The next bounded M15 candidate is an operator decision bounded
+by the frozen route.
 
 The settlement candidate gate, if it is run again after deterministic fixes,
 is `normal/resume × off/on × at least two explicitly joined repeats`; only

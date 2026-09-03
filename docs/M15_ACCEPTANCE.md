@@ -253,6 +253,29 @@ debt). Per §5 the valid FAIL rejects the candidate and returns to diagnosis;
 the window is not rerun and M15 remains open. Post-window diagnosis at
 [`evidence/m15-diagnosis-attempt-incident/REPORT.md`](../crates/agent-eval/evidence/m15-diagnosis-attempt-incident/REPORT.md).
 
+The **completion-gate convergence candidate** (operator-selected 2026-09-03 as
+the explicit recommendation of that diagnosis; landed on `cc60194` with the
+deterministic terminal-surface matrix, local gate and dual-platform CI green on
+`cc60194`/`33740918365`, and an exact-source PASS preflight on clean `2adad31`)
+then ran its own predeclared 12-cell v4 window on the same PinAI tuple at the
+predeclared clean source `a6dc33e` (source tree digest `3e2a212d...`) and is a
+**valid FAIL: 10/12 pass, 0 NOT_RUN**, mechanically reported at
+`evidence/m15-window/_windows/1788438275930/`. Migrate 4/4; diag 4/4 (all
+`active` — the candidate closed the prior operator-only diag loop); policy 2/4;
+behavior and allowed-diff pass 12/12; provider healthy in every cell. The two
+failures are both `retry_policy_dev` and are **two distinct uncovered
+mechanisms**: (1) `normal r2` exhausted the 48-round phase-one budget with
+`task.complete` refused 6/6 over a resolvable-looking `execution_debt`
+(`failed_commands remaining: 1`) plus a `task_progress`/`next_action_pending`
+tail — the ordinary-final terminal stage is deliberately not offered for such a
+model-resolvable blocker, so no `terminal_surface` fired and the model churned
+against persistent debt; and (2) `resume r1` failed at checkpoint restore from
+a storage lock-contention error on `workspace-effects.jsonl` (contested 20
+retries) — an infrastructure failure, not model behavior. Per §5 the valid FAIL
+rejects the candidate and returns to diagnosis; the window is not rerun and M15
+remains open. Post-window diagnosis at
+[`evidence/m15-diagnosis-completion-gate/REPORT.md`](../crates/agent-eval/evidence/m15-diagnosis-completion-gate/REPORT.md).
+
 ## 1. V1 candidate composition
 
 | plane | evidence | status |
@@ -297,7 +320,8 @@ independent acceptance-domain revision/source identity and bounded
 model-request causal-audit fields. It does not reinterpret v3 verdicts.
 Five formal v4 windows are banked as valid FAILs (9/12 on `d1936d4`,
 10/12 on `a25a8a5`, 9/12 on `ab4534a`, 10/12 on `784d7aa`, and 6/12 on
-`43e1033`); a sixth valid FAIL (10/12 on `38d458e`) is recorded in §0; no
+`43e1033`); a sixth valid FAIL (10/12 on `38d458e`) and a seventh valid FAIL
+(10/12 on `a6dc33e`) are recorded in §0; no
 v4 window has passed. Each
 immutable cell directory
 contains the manifest, full event stream, `dimensions.json`, hidden oracle
@@ -420,11 +444,11 @@ surface, reject a serving or close M15.
 
 ## 7. Next execution gate
 
-Before spending another 12-cell window, preserve all six valid v4 FAILs (the
-latest 10/12 on `38d458e`) and
-the three valid v3 FAILs; do not rerun the rejected `43e1033` or `38d458e`
-source/serving candidates. A materially new candidate must first diagnose the
-latest immutable cells, then:
+Before spending another 12-cell window, preserve all seven valid v4 FAILs (the
+latest two 10/12 on `38d458e` and `a6dc33e`) and
+the three valid v3 FAILs; do not rerun the rejected `43e1033`, `38d458e` or
+`a6dc33e` source/serving candidates. A materially new candidate must first
+diagnose the latest immutable cells, then:
 
 1. pass deterministic attempt-incident versus task-obligation tests, including
    off-surface canonical/wire-name calls which remain visible but create no

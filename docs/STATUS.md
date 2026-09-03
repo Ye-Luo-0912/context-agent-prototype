@@ -1604,19 +1604,38 @@ order is:
   predeclared 12-cell window.
 
 **Completion-gate admission candidate window (2026-09-03; predeclared clean
-source recorded at launch, preflight PASS in the evidence commit, declaration
-recorded before its run):**
+source `a6dc33e`, preflight PASS in the evidence commit, declaration recorded
+before its run):**
 
 - The 12-cell v4 window on the completion-gate convergence candidate + PinAI
-  tuple is **predeclared 2026-09-03 before its run** (M15_ACCEPTANCE §7 item
+  tuple was **predeclared 2026-09-03 before its run** (M15_ACCEPTANCE §7 item
   8): 3 fixtures × normal/resume × 2 repeats, the product surface (TaskProgress
   on, settlement and advisory candidates off, no counterfactual second
   request), the pinned serving tuple above (explicit `responses` protocol), one
-  uninterrupted `agent-eval --m15-window` run whose cell directories land under
-  `crates/agent-eval/evidence/m15-window/_windows/1788435938195/`. The exact
-  clean source identity is recorded at launch; no source change happens during
-  the run, the frozen-window rules of M15_ACCEPTANCE §5 apply, and the
-  mechanically regenerated report is the only accepted verdict.
+  uninterrupted `agent-eval --m15-window` run whose cell directories landed
+  under `crates/agent-eval/evidence/m15-window/_windows/1788438275930/`. The
+  exact clean source identity was recorded at launch (`a6dc33e`); no source
+  change happened during the run, the frozen-window rules of M15_ACCEPTANCE §5
+  apply, and the mechanically regenerated report is the only accepted verdict.
+- The window is a **valid FAIL: 10/12 pass, 0 NOT_RUN** — the mechanical
+  report at
+  `crates/agent-eval/evidence/m15-window/_windows/1788438275930/`. Behavior
+  and allowed-diff pass 12/12; provider healthy in every cell; closures 2/12.
+  Migrate 4/4 (7–11 rounds, clean continuation everywhere resumed); diag 4/4
+  (all `active`, the completion-gate convergence closed the prior operator-only
+  loop). The two failures are both `retry_policy_dev`: (1) `normal r2`
+  exhausted the 48-round phase-one budget with `task.complete` refused 6/6 over
+  a resolvable-looking `execution_debt` (`failed_commands remaining: 1`) plus a
+  `task_progress`/`next_action_pending` tail — the ordinary-final terminal
+  stage is deliberately not offered for such a model-resolvable blocker, so no
+  `terminal_surface` fired and the model churned against persistent debt; and
+  (2) `resume r1` failed at checkpoint restore with a storage lock-contention
+  error (`lock workspace effects journal …workspace-effects.jsonl exclusively:
+  … contested after 20 retries`) — an infrastructure failure, not model
+  behavior. Post-window diagnosis at
+  [`evidence/m15-diagnosis-completion-gate/REPORT.md`](../crates/agent-eval/evidence/m15-diagnosis-completion-gate/REPORT.md).
+  Per M15_ACCEPTANCE §5 the valid FAIL rejects the candidate; the window is not
+  rerun. M15 remains open; candidate selection is a user decision.
 
 **Workload disposition (2026-09-03; documentation only):** the proposed
 "one-stop reliability" umbrella is a **large, multi-slice effort**, not one
