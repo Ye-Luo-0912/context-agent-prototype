@@ -1592,11 +1592,12 @@ order is:
   re-proposing `task.complete` and ends with an ordinary final answer once
   the work is done. The escalated stage is durable (basis-stamped
   `CompletionRepairRecord`), visible to the next model decision, and resets
-  when the basis moves. Matched pending gates: deterministic matrix
-  (landed, `operator_only_refusals_escalate_to_a_terminal_surface`), full
-  local gate + recorded clean source + dual-platform CI, then at most one
-  fresh exact-source preflight and at most one predeclared 12-cell window
-  (operator-reviewed).
+  when the basis moves. Matched gates: deterministic matrix (landed,
+  `operator_only_refusals_escalate_to_a_terminal_surface`), and the full
+  local gate plus recorded clean source with dual-platform CI is banked on
+  `cc60194` (dual-platform CI run `33740918365` green, 2026-09-03). Next are
+  at most one fresh exact-source preflight and at most one predeclared
+  12-cell window (operator-reviewed).
 
 **Workload disposition (2026-09-03; documentation only):** the proposed
 "one-stop reliability" umbrella is a **large, multi-slice effort**, not one

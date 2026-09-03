@@ -1261,7 +1261,8 @@ direction; the explicit recommendation of the diagnosis)
      [DONE: COMPLETION_REPAIR_TERMINAL_REFUSALS + terminal surface plan;
       completion::operator_only_refusals_escalate_to_a_terminal_surface]
   -> full local gate + recorded clean source + Ubuntu/Windows CI
-     [pending]
+     [DONE 2026-09-03: local gate green on cc60194 (fmt/build/clippy/full
+      suite); dual-platform CI run 33740918365 green]
   -> new exact-source/product M15 preflight
      [pending]
   -> at most one freshly predeclared formal 12-cell M15 window
