@@ -137,14 +137,50 @@ pub async fn build_context_engine(
 /// - `OPENAI_MODEL` (default `gpt-4o-mini`)
 /// - `OPENAI_API_PROTOCOL` (`auto` by default; also `responses` or `chat`)
 /// - `OPENAI_CONTEXT_WINDOW` (default 128000 declared send window)
-pub fn model_from_env() -> Arc<dyn ModelTransport> {
-    let Ok(api_key) = std::env::var("OPENAI_API_KEY") else {
-        return Arc::new(MockModelTransport);
-    };
-    if api_key.trim().is_empty() {
-        return Arc::new(MockModelTransport);
-    }
+///
+/// The model a composition root selected from the process environment.
+/// Demo mode is explicit (`AGENT_DEMO=1`); a missing provider key is a
+/// configuration error, never a silent mock.
+pub enum ModelSelection {
+    /// The explicit demo transport (`AGENT_DEMO=1`).
+    Mock(Arc<dyn ModelTransport>),
+    /// A configured OpenAI-compatible provider transport.
+    Provider(Arc<dyn ModelTransport>),
+}
 
+impl std::fmt::Debug for ModelSelection {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            // The transport itself does not implement Debug; never print a
+            // key or configuration detail.
+            Self::Mock(_) => f.write_str("Mock"),
+            Self::Provider(_) => f.write_str("Provider"),
+        }
+    }
+}
+
+/// Checked model configuration: `AGENT_DEMO=1` selects the demo mock
+/// explicitly; otherwise `OPENAI_API_KEY` must be present and non-empty or
+/// this is a startup error. The historical silent fallback to the mock on
+/// a missing key hid unreproducible runs behind a fake model.
+pub fn try_model_from_env() -> anyhow::Result<ModelSelection> {
+    let demo = std::env::var("AGENT_DEMO")
+        .map(|value| value == "1" || value.eq_ignore_ascii_case("true"))
+        .unwrap_or(false);
+    let api_key = std::env::var("OPENAI_API_KEY")
+        .ok()
+        .filter(|key| !key.trim().is_empty());
+    match (demo, api_key) {
+        (true, _) => Ok(ModelSelection::Mock(Arc::new(MockModelTransport))),
+        (false, None) => Err(anyhow::anyhow!(
+            "no model configured: set OPENAI_API_KEY (plus OPENAI_BASE_URL / OPENAI_MODEL /              OPENAI_API_PROTOCOL as needed), or set AGENT_DEMO=1 for the explicit demo transport"
+        )),
+        (false, Some(api_key)) => Ok(ModelSelection::Provider(model_from_key(api_key))),
+    }
+}
+
+/// Build the retrying provider transport for an already-checked key.
+fn model_from_key(api_key: String) -> Arc<dyn ModelTransport> {
     let base_url = std::env::var("OPENAI_BASE_URL")
         .unwrap_or_else(|_| "https://api.openai.com/v1".to_string());
     let model = std::env::var("OPENAI_MODEL").unwrap_or_else(|_| "gpt-4o-mini".to_string());
@@ -663,5 +699,74 @@ mod tests {
             Err(error) => error,
         };
         assert!(!error.to_string().is_empty());
+    }
+}
+
+#[cfg(test)]
+mod model_selection_tests {
+    use super::*;
+
+    /// Env mutations are process-global; serialize every selection test.
+    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    struct EnvGuard {
+        saved: Vec<(&'static str, Option<String>)>,
+    }
+
+    impl EnvGuard {
+        fn new(keys: &[&'static str]) -> Self {
+            let saved = keys
+                .iter()
+                .map(|key| (*key, std::env::var(key).ok()))
+                .collect();
+            for key in keys {
+                // Test-only, serialized under ENV_LOCK: the process is
+                // single-threaded with respect to these keys.
+                unsafe { std::env::remove_var(key) };
+            }
+            EnvGuard { saved }
+        }
+    }
+
+    impl Drop for EnvGuard {
+        fn drop(&mut self) {
+            for (key, value) in self.saved.drain(..) {
+                match value {
+                    Some(value) => unsafe { std::env::set_var(key, value) },
+                    None => unsafe { std::env::remove_var(key) },
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn a_missing_key_without_explicit_demo_is_a_configuration_error() {
+        let _env = ENV_LOCK.lock().unwrap();
+        let _guard = EnvGuard::new(&["OPENAI_API_KEY", "AGENT_DEMO"]);
+        let error = try_model_from_env().unwrap_err().to_string();
+        assert!(error.contains("no model configured"), "{error}");
+        assert!(error.contains("AGENT_DEMO=1"), "{error}");
+    }
+
+    #[test]
+    fn demo_mode_is_explicit_and_wins_over_an_absent_key() {
+        let _env = ENV_LOCK.lock().unwrap();
+        let _guard = EnvGuard::new(&["OPENAI_API_KEY", "AGENT_DEMO"]);
+        unsafe { std::env::set_var("AGENT_DEMO", "1") };
+        assert!(matches!(
+            try_model_from_env().unwrap(),
+            ModelSelection::Mock(_)
+        ));
+    }
+
+    #[test]
+    fn a_present_key_selects_the_provider_transport() {
+        let _env = ENV_LOCK.lock().unwrap();
+        let _guard = EnvGuard::new(&["OPENAI_API_KEY", "AGENT_DEMO"]);
+        unsafe { std::env::set_var("OPENAI_API_KEY", "sk-test") };
+        assert!(matches!(
+            try_model_from_env().unwrap(),
+            ModelSelection::Provider(_)
+        ));
     }
 }

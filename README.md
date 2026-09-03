@@ -81,10 +81,11 @@ cargo run -p agent-tui -- .
 ```
 
 The included `MockModelTransport` keeps the architecture runnable without a
-model vendor. **Current prototype behavior:** if `OPENAI_API_KEY` is absent,
-startup silently selects that mock transport. Do not use a no-key run as real
-Agent evidence; checked configuration and explicit demo mode are product work
-in the roadmap. To use a real model, set `OPENAI_API_KEY` and, when needed,
+model vendor. **Configuration is checked at startup:** without
+`OPENAI_API_KEY` the TUI refuses to start with a visible configuration
+error, and `AGENT_DEMO=1` selects the mock transport explicitly. A no-key
+run is a demo, never real Agent evidence. To use a real model, set
+`OPENAI_API_KEY` and, when needed,
 `OPENAI_BASE_URL`, `OPENAI_MODEL`, `OPENAI_API_PROTOCOL` and
 `OPENAI_CONTEXT_WINDOW`:
 

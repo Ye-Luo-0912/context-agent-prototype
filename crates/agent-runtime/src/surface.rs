@@ -414,9 +414,11 @@ impl RoundSurfacePlan {
 
         let mut omitted = self.omissions.clone();
         omitted.sort_by(|a, b| {
-            b.demand
-                .rank()
-                .cmp(&a.demand.rank())
+            let a_final = a.reason == ToolSurfaceOmissionReason::CompletionFinalization;
+            let b_final = b.reason == ToolSurfaceOmissionReason::CompletionFinalization;
+            b_final
+                .cmp(&a_final)
+                .then_with(|| b.demand.rank().cmp(&a.demand.rank()))
                 .then_with(|| a.reason.cmp(&b.reason))
                 .then_with(|| a.tool_name.cmp(&b.tool_name))
         });
@@ -668,6 +670,17 @@ mod tests {
         assert!(plan.specs().is_empty());
         assert_eq!(plan.omitted_total, MAX_SNAPSHOT_OMISSIONS + 1);
         assert!(plan.omissions.iter().any(|row| {
+            row.reason == ToolSurfaceOmissionReason::CompletionFinalization
+                && row.tool_name == "task.complete"
+        }));
+        let report = plan.ready_report(SurfaceReportContext {
+            turn_id: TurnId::new(),
+            model_round: 1,
+            surface_revision: 1,
+            estimated_input_tokens: 0,
+            input_budget_tokens: 0,
+        });
+        assert!(report.omitted.iter().any(|row| {
             row.reason == ToolSurfaceOmissionReason::CompletionFinalization
                 && row.tool_name == "task.complete"
         }));

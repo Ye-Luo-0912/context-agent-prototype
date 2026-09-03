@@ -10,7 +10,7 @@ use std::{
 
 use agent_compose::{
     ComposeConfig, ContextPolicy, HostToolPolicyRegistry, build_context_engine, compose,
-    model_from_env,
+    try_model_from_env,
 };
 use agent_contracts::{ApprovalDecision, StandingGrant};
 use agent_core::{ApprovalBroker, InteractiveApprovalGate, PolicyApprovalGate, TaskApprovalGate};
@@ -74,7 +74,13 @@ async fn main() -> anyhow::Result<()> {
     // against any `ContextEngine` implementation (the A/B/C baselines, and
     // the process-boundary adapter). Rolling/dynamic 与 live eval 共用同一
     // 有界压缩器，避免 TUI 仍走占位折叠。
-    let model = model_from_env();
+    let model = match try_model_from_env()? {
+        agent_compose::ModelSelection::Mock(mock) => {
+            eprintln!("demo mode: AGENT_DEMO=1 selected the explicit mock transport");
+            mock
+        }
+        agent_compose::ModelSelection::Provider(provider) => provider,
+    };
     let context_engine =
         build_context_engine(policy, workspace.state_dir(), Some(model.clone())).await?;
     if read_only && !grant_args.is_empty() {

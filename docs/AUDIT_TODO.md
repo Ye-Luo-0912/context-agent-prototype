@@ -266,7 +266,7 @@ Remaining protocol exits before another live window:
 - `7e02488` completes the observer wiring: the JSONL observer moved into
   `provider-openai`, so the formal eval paths (which build their transport
   through the eval driver) and the product composition root
-  (`agent-compose::model_from_env`) share one bounded implementation; the
+  (`agent-compose` provider transport) share one bounded implementation; the
   eval driver keeps resolving `OPENAI_RETRY_METRICS_FILE` through eval.env.
 
 The formal long-live/M15 provider path therefore persists typed
