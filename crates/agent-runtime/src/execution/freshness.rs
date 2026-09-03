@@ -236,12 +236,27 @@ impl ExecutionState {
                 }
             }
             if let Some(touch) = output.resource_touches().first() {
-                self.push_failure(
-                    output,
-                    &identity,
-                    format!("failed observation {}", touch.path),
-                    turn,
-                );
+                // A typed precondition refusal on a mutating call (no exact
+                // anchor, ambiguous anchor, stale revision, path boundary)
+                // proves the trusted handler applied nothing and spawned
+                // nothing. It stays visible in the result and the
+                // negative-fact table but is an attempt incident, not
+                // completion debt: retry churn must not compound the
+                // completion-gate blocker set. A failed read keeps its row —
+                // the file may be required, and a read that saw nothing is
+                // not proof the requirement vanished.
+                let proven_no_effect = output.may_mutate_workspace()
+                    && output
+                        .failure_class()
+                        .is_some_and(|class| class.proves_no_effect());
+                if !proven_no_effect {
+                    self.push_failure(
+                        output,
+                        &identity,
+                        format!("failed observation {}", touch.path),
+                        turn,
+                    );
+                }
             } else if is_command_tool(&output.tool_name) {
                 self.push_failure(output, &identity, output.summary.clone(), turn);
             }

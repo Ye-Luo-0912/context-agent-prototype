@@ -80,8 +80,67 @@ fn refused_mutation_stamps_the_observed_fact_without_bumping_the_world() {
     );
     // The mutation did not apply: the world revision must not advance.
     assert_eq!(resume.workspace_revision, 0);
-    // The failure itself is still recorded.
+    // The failure itself is still recorded: a moved revision owes a
+    // reconciliation, tracked by the refusal-lineage machinery.
     assert_eq!(resume.failed_commands.len(), 1);
+    assert_eq!(resume.unresolved_failed_command_count(), 1);
+}
+
+#[test]
+fn typed_locator_refusals_are_incidents_but_resource_debt_stays_debt() {
+    // headline: a refusal that only judges the instruction (missing or
+    // ambiguous anchor, hidden boundary) proves the resource is untouched,
+    // so it may not block the completion gate; a refusal that signals a
+    // real resource state to reconcile (moved revision, missing path) and
+    // a process exit keep their debt rows.
+    for class in ["no_exact_match", "ambiguous_match", "hidden_path"] {
+        let mut resume = ExecutionState::default();
+        resume.observe_tool(&refused_edit("src/auth.rs", "abc123", class), 1, 2);
+        assert_eq!(
+            resume.failed_commands.len(),
+            0,
+            "{class} refusal must not open a failed-command row"
+        );
+        assert_eq!(resume.unresolved_failed_command_count(), 0);
+        assert_eq!(resume.workspace_revision, 0);
+    }
+
+    let mut resume = ExecutionState::default();
+    resume.observe_tool(
+        &refused_edit("src/auth.rs", "rCURRENT", "stale_revision"),
+        1,
+        1,
+    );
+    assert_eq!(
+        resume.unresolved_failed_command_count(),
+        1,
+        "a moved revision owes a reconciliation and keeps its debt row"
+    );
+
+    let mut resume = ExecutionState::default();
+    let mut failed = output("shell.exec", false, "exit 1");
+    failed.metadata = json!({"command": "cargo test", "failure_class": "process_exit"});
+    resume.observe_tool(&failed, 1, 1);
+    assert_eq!(
+        resume.unresolved_failed_command_count(),
+        1,
+        "a process exit has unknown effects and stays completion debt"
+    );
+}
+
+#[test]
+fn attempt_incidents_survive_a_checkpoint_round_trip_as_absence() {
+    let mut resume = ExecutionState::default();
+    resume.observe_tool(
+        &refused_edit("src/auth.rs", "abc123", "ambiguous_match"),
+        1,
+        2,
+    );
+    let serialized = serde_json::to_value(&resume).unwrap();
+    let restored: ExecutionState = serde_json::from_value(serialized).unwrap();
+    assert_eq!(restored, resume);
+    assert_eq!(restored.failed_commands.len(), 0);
+    assert_eq!(restored.unresolved_failed_command_count(), 0);
 }
 
 #[test]

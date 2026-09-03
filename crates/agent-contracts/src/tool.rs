@@ -1029,15 +1029,33 @@ pub enum ToolFailureClass {
     ShellDialectMismatch,
     CommandUnavailable,
     MissingProjectMarker,
+    /// The trusted handler refused the mutation at a revision
+    /// compare-and-swap. The resource moved since the model read it, so a
+    /// real reconciliation (fresh read, then re-edit) is still owed; the
+    /// failure keeps its completion-debt semantics and lineage.
     StaleRevision,
+    /// The trusted handler refused because no unique exact anchor matched.
+    /// An attempt incident: the instruction was malformed, the target
+    /// resource is untouched and needs no reconciliation.
     NoExactMatch,
+    /// The trusted handler refused because the anchor matched more than one
+    /// location. An attempt incident: the instruction was ambiguous, the
+    /// target resource is untouched.
     AmbiguousMatch,
+    /// A search tool found no match. Read-only by construction.
     NoSearchMatch,
     ProcessExit,
     VerificationFailure,
     Timeout,
     Cancellation,
+    /// The trusted handler refused because the path resolves inside a hidden
+    /// boundary. An attempt incident: nothing was read or written, and the
+    /// boundary itself is not task work.
     HiddenPath,
+    /// A path precondition failed. A missing parent or a missing required
+    /// read target is a real resource reconciliation, so the failure keeps
+    /// its completion-debt semantics (recoverable through the typed
+    /// directory-recovery surface for writes).
     PathNotFound,
     /// Core rejected the call against the immutable model surface before
     /// approval or dispatch. It is an attempt incident, not evidence that task
@@ -1057,6 +1075,22 @@ pub enum ToolFailureClass {
 }
 
 impl ToolFailureClass {
+    /// True when the typed refusal proves that the model's instruction was
+    /// defective and the target resource is untouched: the trusted handler
+    /// refused on instruction quality (a missing or ambiguous anchor, a
+    /// hidden boundary) before any effect, and no resource reconciliation
+    /// is owed. Such a refusal is an attempt incident — visible in the
+    /// model-visible result and the bounded negative-fact table — and never
+    /// opens completion debt. Refusals that signal a real resource state to
+    /// reconcile (a moved revision, a missing path) and classes that spawn
+    /// a process or end in an unknown state keep their debt semantics.
+    pub const fn proves_no_effect(self) -> bool {
+        matches!(
+            self,
+            Self::NoExactMatch | Self::AmbiguousMatch | Self::NoSearchMatch | Self::HiddenPath
+        )
+    }
+
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::ShellDialectMismatch => "shell_dialect_mismatch",
@@ -2755,6 +2789,54 @@ pub trait ToolDispatcher: Send + Sync {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn proves_no_effect_covers_exactly_the_instruction_quality_refusals() {
+        for class in [
+            ToolFailureClass::NoExactMatch,
+            ToolFailureClass::AmbiguousMatch,
+            ToolFailureClass::NoSearchMatch,
+            ToolFailureClass::HiddenPath,
+        ] {
+            assert!(
+                class.proves_no_effect(),
+                "{:?} judges instruction quality only",
+                class
+            );
+        }
+        for class in [
+            ToolFailureClass::StaleRevision,
+            ToolFailureClass::PathNotFound,
+            ToolFailureClass::ProcessExit,
+            ToolFailureClass::VerificationFailure,
+            ToolFailureClass::Timeout,
+            ToolFailureClass::Cancellation,
+            ToolFailureClass::Io,
+            ToolFailureClass::InvalidRequest,
+            ToolFailureClass::ShellDialectMismatch,
+            ToolFailureClass::CommandUnavailable,
+            ToolFailureClass::MissingProjectMarker,
+            ToolFailureClass::SurfaceUnavailable,
+            ToolFailureClass::SchemaMismatch,
+            ToolFailureClass::DuplicateNoProgress,
+        ] {
+            assert!(
+                !class.proves_no_effect(),
+                "{:?} owes a reconciliation or has unknown effects",
+                class
+            );
+        }
+        // The admitted set stays parseable end to end.
+        for class in [
+            ToolFailureClass::NoExactMatch,
+            ToolFailureClass::AmbiguousMatch,
+            ToolFailureClass::NoSearchMatch,
+            ToolFailureClass::HiddenPath,
+        ] {
+            assert_eq!(ToolFailureClass::parse(class.as_str()), Some(class));
+        }
+    }
+
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
