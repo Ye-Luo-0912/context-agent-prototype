@@ -1821,8 +1821,10 @@ impl RuntimeActor {
                 ..TaskProgressView::default()
             });
         }
-        progress.as_mut().expect("repair projection exists").completion_repair =
-            Some(bounded_preview(&rendered, COMPLETION_REPAIR_VIEW_CHARS));
+        progress
+            .as_mut()
+            .expect("repair projection exists")
+            .completion_repair = Some(bounded_preview(&rendered, COMPLETION_REPAIR_VIEW_CHARS));
     }
 }
 
