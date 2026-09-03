@@ -26,8 +26,8 @@ is not closed.
 
 | When | Items | Disposition |
 | --- | --- | --- |
-| Before the Reliable Local Agent alpha | `COMPOSE-LIFECYCLE-01`, `EFFECT-ACK-01` | Close the remaining startup type error and durable ACK-debt lifecycle. These are correctness/safety exits, not product polish. `CONTEXT-IO-01` closed on 2026-09-04. |
-| Before the next formal M15 candidate | `COMPLETION-LIVENESS-01`; ~~TOOL-MANIFEST-01~~ (closed on `9e00299`) | Semantic convergence candidate and its focused deterministic matrix are green in the working tree. It still needs strict Clippy, the complete workspace/CI/source/preflight route before any formal window. A valid historical FAIL is never repaired in place. |
+| ~~Before the Reliable Local Agent alpha~~ | ~~`COMPOSE-LIFECYCLE-01`, `EFFECT-ACK-01`~~ — both closed in the 2026-09-04 tranche (typed optional lookup; checkpointed ACK-debt lifecycle with typed resolution) | ~~Correctness/safety exits before the alpha.~~ Done: clean source `1c4b0e0`, Windows/Linux CI run `33809422347` green; `CONTEXT-IO-01` closed on `c7ed011`. |
+| Before the next formal M15 candidate | `COMPLETION-LIVENESS-01`; ~~TOOL-MANIFEST-01~~ (closed on `9e00299`) | Semantic convergence candidate, focused deterministic matrix and selected-package strict Clippy are green in the working tree. It still needs the complete workspace/CI/source/preflight route before any formal window. A valid historical FAIL is never repaired in place. |
 | Only if service Context ships as V1 | `SIDECAR-ERROR-01` | Otherwise keep `--context=service` explicitly experimental and out of the supported product profile. |
 | Before long-horizon breadth, if measured | `FAILURE-SPILL-01`, `TOOL-CONTRACT-01` live acceptance | Activate spill work only if the bounded hot set overflows; use paired task evidence for tool-contract convergence. |
 | Before extension promotion or Self-Iteration | `CAP-OBS-01` residual | Retire legacy producer metadata only through the existing typed-facts migration; dynamic producers never mint trusted execution facts. |

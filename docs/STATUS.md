@@ -102,12 +102,12 @@ not a new planner, TaskGraph, database or multi-Agent layer.
   repair stalls. The handoff ends only the turn; the task remains active and no
   completion blocker is cleared automatically.
 - This is candidate implementation, not formal evidence. Format and the
-  selected package check pass; `agent-runtime` library tests are 339/339,
-  Runtime turn integration tests 110/110, and `tool-runtime` library tests 214
-  pass with 1 ignored. Strict Clippy, the complete workspace gate,
-  dual-platform CI, a new exact-source preflight and a formal window remain
-  separate exits. Historical v1 windows and their 6/12 verdict are unchanged.
-  M15 remains open.
+  selected package check/strict Clippy pass; `agent-runtime` library tests are
+  340/340, Runtime turn integration tests 111/111, `tool-runtime` library tests
+  214 pass with 1 ignored, and `agent-compose` library tests are 19/19. The
+  complete workspace gate, dual-platform CI, a new exact-source preflight and a
+  formal window remain separate exits. Historical v1 windows and their 6/12
+  verdict are unchanged. M15 remains open.
 - Product scope is now fixed to dynamic in-process Context, builtin tools, one
   workspace, one checked OpenAI-compatible provider profile and an interactive
   TUI. Service Context and dynamic extensions remain experimental unless their
