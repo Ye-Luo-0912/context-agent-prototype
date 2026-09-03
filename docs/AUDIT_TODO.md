@@ -32,13 +32,7 @@ is not closed.
 | Before long-horizon breadth, if measured | `FAILURE-SPILL-01`, `TOOL-CONTRACT-01` live acceptance | Activate spill work only if the bounded hot set overflows; use paired task evidence for tool-contract convergence. |
 | Before extension promotion or Self-Iteration | `CAP-OBS-01` residual | Retire legacy producer metadata only through the existing typed-facts migration; dynamic producers never mint trusted execution facts. |
 
-The successor is not yet a clean-source exit. `b44ea44` exposed an unreaped
-probe descendant under Linux Clippy; `c84f85e` fixed that finding and passed
-both platform check jobs, then Ubuntu tests exposed an independent fd-number
-reuse race in `child_rules_drop_closes_every_fd`. The current assertion accepts
-numeric reuse only when `fstat` proves it no longer identifies the dropped
-write root. It still needs a complete green CI record. These harness
-corrections are not an M15 candidate and change no frozen window.
+The successor is a recorded clean-source exit now: `0668002` and the digest-wiring commit `fe6a743` pass the complete local gate and Windows/Linux CI — runs `33785349225` and `33789350980` — after the reaper and fd-reuse fixes.
 
 ## Continuation review verification — 2026-09-03 (`c823a1c`)
 
