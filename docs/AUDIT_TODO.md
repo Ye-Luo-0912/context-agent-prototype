@@ -311,6 +311,12 @@ recorded clean source with dual-platform CI, selected-path P1 spot-checks if
 the candidate changes, and the M15 gate sequence itself. Treat each item
 below as closed-on-source unless its heading says otherwise.
 
+The clean-source closure exit is now banked (2026-09-03): every open heading
+below closed on `97a7719` with the full local gate green (fmt, all-target
+build, strict all-feature Clippy, complete all-target workspace suite,
+`TEST_EXIT=0`) and seen green on dual-platform CI run `33709924715`. The
+remaining operational gates are the M15 gate sequence itself.
+
 This is the current route/status authority inside this file. It supersedes the
 2026-08-30 and post-window ordering where a newly confirmed P0/P1 changes the
 gate; it does not rewrite historical experiment verdicts.
@@ -715,7 +721,7 @@ stamp the service binary accordingly.
 
 ### P0 — one completion authority
 
-#### COMPLETE-AUTH-01 — derive one bounded `CompletionReadiness` (**open — locally green; clean-source/CI exit pending**)
+#### COMPLETE-AUTH-01 — derive one bounded `CompletionReadiness` (**closed 2026-09-03 on `97a7719`; local gate green, dual-platform CI run `33709924715` green**)
 
 Primary code: `crates/agent-runtime/src/task.rs`,
 `crates/agent-runtime/src/actor/{turn,model}.rs` and the bounded
@@ -769,7 +775,7 @@ failure, recovery fence, in-flight cleanup and hard required-context miss.
 Accepted completion remains one-shot, while ordinary final may end a turn
 without fabricating durable task closure.
 
-#### CONTINUATION-EPOCH-01 — continuation is not a new directive (**open — locally green; clean-source/CI exit pending**)
+#### CONTINUATION-EPOCH-01 — continuation is not a new directive (**closed 2026-09-03 on `97a7719`; local gate green, dual-platform CI run `33709924715` green**)
 
 Primary code: `crates/agent-runtime/src/actor/turn.rs`,
 `crates/agent-runtime/src/task.rs` and
@@ -789,7 +795,7 @@ change.
 Add tuple assertions for continuation, new instruction, continuation followed
 by mutation, and cold restore. Existing anchor-only assertions are insufficient.
 
-#### ACCEPT-RECEIPT-01 — criterion-addressed acceptance evidence (**open — locally green; clean-source/CI exit pending**)
+#### ACCEPT-RECEIPT-01 — criterion-addressed acceptance evidence (**closed 2026-09-03 on `97a7719`; local gate green, dual-platform CI run `33709924715` green**)
 
 Primary code: `crates/agent-runtime/src/actor/tools.rs`,
 `crates/agent-runtime/src/task.rs`, execution facts, events and checkpoint
@@ -842,7 +848,7 @@ a matching boundary-test/probe receipt, while a broad Cargo PASS alone is
 insufficient. Persist the declaration/source digest so this rule generalizes by
 semantic domain rather than fixture id.
 
-#### FAILURE-LIFECYCLE-01 — resolve failures by domain (**open — locally green; clean-source/CI exit pending**)
+#### FAILURE-LIFECYCLE-01 — resolve failures by domain (**closed 2026-09-03 on `97a7719`; local gate green, dual-platform CI run `33709924715` green**)
 
 Primary code: `crates/agent-runtime/src/execution/freshness.rs` and the
 bounded failure/obligation ledger.
@@ -853,7 +859,7 @@ identity/domain/resource/obligation. Unrelated failures must survive and keep
 completion blocked. This shares the typed coverage vocabulary with
 `ACCEPT-RECEIPT-01`; it must not become another string matcher.
 
-#### CONTEXT-REQUIRED-01 — required Context misses are completion-visible (**open — locally green; clean-source/CI exit pending**)
+#### CONTEXT-REQUIRED-01 — required Context misses are completion-visible (**closed 2026-09-03 on `97a7719`; local gate green, dual-platform CI run `33709924715` green**)
 
 Primary code: `crates/context-simple/src/{materializer,store}.rs`, bounded
 Context contracts and the Runtime readiness/event join.
@@ -917,7 +923,7 @@ durable Runtime checkpoint and one byte-identical workspace snapshot, preserve
 opaque runtime identities, and pin an explicit provider protocol. Do not
 alpha-normalize independently minted ids to manufacture equality.
 
-#### EVAL-EPISODE-PAIR-01 — bounded episodes and explicit pair joins (**open — locally green; clean-source/CI exit pending**)
+#### EVAL-EPISODE-PAIR-01 — bounded episodes and explicit pair joins (**closed 2026-09-03 on `97a7719`; local gate green, dual-platform CI run `33709924715` green**)
 
 Primary code: `crates/agent-eval/src/{metrics,long_live}.rs` and its report
 path.
@@ -946,7 +952,7 @@ trace.
 The old convergence bundle stays mechanically reproducible, but its settlement
 causal conclusion is superseded by this item.
 
-#### TERMINAL-COMMIT-01 — make task closure one recoverable transaction (**open — locally green; clean-source/CI exit pending**)
+#### TERMINAL-COMMIT-01 — make task closure one recoverable transaction (**closed 2026-09-03 on `97a7719`; local gate green, dual-platform CI run `33709924715` green**)
 
 Model `task.complete` first records `pending_terminal_commit`. Runtime prepares
 rollbackable post-completion Context, freezes the prospective terminal
@@ -958,7 +964,7 @@ Pre-checkpoint failure leaves the task active and records bounded
 `CompletionCommitFailed`; post-checkpoint audit failure keeps completion
 authoritative and recovery-fences the runtime.
 
-#### STARTUP-COMMIT-01 — enter service only after the run marker commits (**open — locally green; clean-source/CI exit pending**)
+#### STARTUP-COMMIT-01 — enter service only after the run marker commits (**closed 2026-09-03 on `97a7719`; local gate green, dual-platform CI run `33709924715` green**)
 
 The actor owns a one-shot `NotStarted | Serving | StartFailed` lifecycle. Only
 a successfully appended and flushed `RunStarted +
@@ -970,7 +976,7 @@ commit the forensic startup prefix. Read-only task/context/operation inspection
 remains available. Exit tests cover pre-start mutation, duplicate start,
 second-append failure, flush failure and shutdown after failed startup.
 
-#### REPLAY-COMMITTED-01 — rebuild Context from the committed prefix (**open — locally green; clean-source/CI exit pending**)
+#### REPLAY-COMMITTED-01 — rebuild Context from the committed prefix (**closed 2026-09-03 on `97a7719`; local gate green, dual-platform CI run `33709924715` green**)
 
 Primary code: `crates/agent-replay/src/recovery.rs` and
 `crates/agent-replay/src/lib.rs`.
@@ -1010,7 +1016,7 @@ event overflow, missing/duplicate/out-of-order sequence rows, and missing
 truncated bodies. Gap/interruption diagnostics remain visible, but any gap makes
 restore-consistency proof invalid.
 
-#### PROVIDER-PROTOCOL-01 — fail closed before new live evidence (**open — locally green; clean-source/CI exit pending**)
+#### PROVIDER-PROTOCOL-01 — fail closed before new live evidence (**closed 2026-09-03 on `97a7719`; local gate green, dual-platform CI run `33709924715` green**)
 
 Primary code: `crates/provider-openai/src/{lib,sse,responses,retry}.rs`.
 

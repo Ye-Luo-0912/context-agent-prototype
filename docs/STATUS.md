@@ -111,6 +111,13 @@ run `33624084700`, 2026-09-02):**
   recorded clean source with local plus dual-platform CI green (`4e56f69`
   code, run `33663057012`). The historical FAIL packs stay immutable and
   Context/GC/retrieval/packing remain frozen.
+- The clean-source P0-close exit is banked 2026-09-03 on `97a7719` (the
+  recorded attempt-incident candidate FAIL source): full local gate green —
+  fmt, all-target build, strict all-feature Clippy and the complete
+  all-target workspace suite (`TEST_EXIT=0`) — plus dual-platform CI run
+  `33709924715` green on the exact source. Every open P0 heading in
+  [`AUDIT_TODO.md`](AUDIT_TODO.md) closed on that source; the remaining
+  operational gate is the M15 sequence itself.
 - The 12-cell v4 window on the PinAI tuple was **predeclared 2026-09-03
   before its run** (M15_ACCEPTANCE §7 item 8): 3 fixtures × normal/resume ×
   2 repeats, the product surface (TaskProgress on, settlement and advisory
