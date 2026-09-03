@@ -74,6 +74,13 @@ not a new planner, TaskGraph, database or multi-Agent layer.
   loop) and `resume r2` closed in 39 rounds. Behavior pass 9/12; provider
   healthy in every cell. Per M15_ACCEPTANCE §5 the valid FAIL **rejects the
   successor candidate**; the window is not rerun. M15 remains open.
+- Serving availability (2026-09-03, recorded after the rerun): the PinAI
+  direct endpoint now answers every POST (Responses and Chat) with 403
+  "Access from this region requires trusted account access", and the
+  localhost relay closes every forwarded POST at connection level while its
+  GET `/models` still lists a larger catalog. No formal preflight or window
+  can run until a serving is secured; the post-rerun diagnosis is banked at
+  [`evidence/m15-diagnosis-successor-rerun/REPORT.md`](../crates/agent-eval/evidence/m15-diagnosis-successor-rerun/REPORT.md).
 - Formal M15 remains open. Nine v4 windows are banked (seven valid FAILs
   plus the censored eighth and its failed rerun); the latest mechanical
   report is the rerun's 6/12 with 0 NOT_RUN, where the policy
