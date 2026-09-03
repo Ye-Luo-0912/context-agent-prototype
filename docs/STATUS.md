@@ -21,6 +21,19 @@ and sandbox contracts live elsewhere. Experiment facts live in
 
 ### Decision snapshot — 2026-09-04
 
+**Operator update (2026-09-04):** with the M15 gate parked on serving
+availability (PinAI region block / relay upstream), the operator directed
+work to continue on the product route without waiting for M15. Phase 2
+(Reliable Local Agent alpha) has started with its first slice: the checked
+model configuration — `AGENT_DEMO=1` selects the demo mock explicitly, a
+missing `OPENAI_API_KEY` is a visible startup error instead of the silent
+mock fallback, and the TUI surfaces the checked selection before any
+workspace mutation (`32ea622`, CI run `33814149555` green). The frozen M15
+acceptance design is untouched; a serving restoration still gates any
+future preflight or window.
+
+
+
 The repository is a **substantial single-Agent runtime with a prototype product
 host**. It is not yet a complete local coding-Agent product. The shortest path
 is reliability and M15 first, then a deliberately small product shell; it is
