@@ -703,14 +703,15 @@ capture/mutation uses the surface gate, and the composite dispatcher holds
 that gate while taking one atomic base snapshot to form a common source cut
 without retry; concurrency tests cover catalog mutation during capture.
 
-Since V1-M9 the model can also steer the *context* surface through
-read-only meta-tools (`context.tag` / `context.lease`, always loaded with
-the core set; `gc_hint` and `collect` are not model-facing). They do no work
-themselves: each returns a `ToolOutcome::RuntimeDirective` carrying a typed
+The model can also steer the *context* surface through the catalog-optional
+`context.manage` tool. Its typed operations include `gc_hint`, `tag`, `lease`
+and `collect`; the surface loads through `capability.manage` or a Runtime
+preference when evidence requires it. The tool does no work itself: it returns
+a `ToolOutcome::RuntimeDirective` carrying a typed
 `ContextAction` (`Collect` runs the GC pass via `ContextEngine::gc`; the
 rest become a `ContextDirective` ingest) — tools still never touch the
-  engine or memory stores (invariant 3), and the Platform remains the only
-  scheduler of how a directive is applied through Core's authority checks. The model addresses items by the
+engine or memory stores (invariant 3), and the Platform remains the only
+scheduler of how a directive is applied through Core's authority checks. The model addresses items by the
 ids exposed in the materialized context frame (`id=<...>` per item), and
 the engine silently ignores directives whose target item is gone.
 

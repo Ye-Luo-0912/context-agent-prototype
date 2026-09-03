@@ -270,8 +270,11 @@ mechanisms**: (1) `normal r2` exhausted the 48-round phase-one budget with
 tail — the ordinary-final terminal stage is deliberately not offered for such a
 model-resolvable blocker, so no `terminal_surface` fired and the model churned
 against persistent debt; and (2) `resume r1` failed at checkpoint restore from
-a storage lock-contention error on `workspace-effects.jsonl` (contested 20
-retries) — an infrastructure failure, not model behavior. Per §5 the valid FAIL
+a Runtime storage-lifecycle lock-contention error on
+`workspace-effects.jsonl` (contested 20 retries) — an infrastructure failure,
+not model behavior. The cell records `runtime_error_class=runtime`; it is not
+the `harness_setup`/`harness_watchdog` class that §3 maps to NOT_RUN. Per §5
+the valid FAIL
 rejects the candidate and returns to diagnosis; the window is not rerun and M15
 remains open. Post-window diagnosis at
 [`evidence/m15-diagnosis-completion-gate/REPORT.md`](../crates/agent-eval/evidence/m15-diagnosis-completion-gate/REPORT.md).

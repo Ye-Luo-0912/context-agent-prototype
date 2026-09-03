@@ -1,11 +1,11 @@
 {
-  "generated": "2026-08-24",
+  "generated": "2026-09-04",
   "purpose": "TOOLS-01 machine-readable matrix: inventory of the current tool schemas, limits, context dispositions, effects and platform behavior as of this commit. The code remains authoritative; this file is the ACI specification input for TOOLS-02/03/04.",
   "surface": {
     "core": ["fs.list", "fs.read", "fs.write", "artifact.read", "search.grep", "edit.patch", "git.status", "git.diff", "task.complete"],
     "control": ["capability.manage"],
     "conditional_required": ["verify.run when the host discovers at least one bounded recipe"],
-    "catalog_optional": ["edit.replace", "shell.exec", "process.run", "process.session", "code.symbols", "code.diagnostics", "context.manage", "task.manage"]
+    "catalog_optional": ["fs.mkdir", "edit.replace", "shell.exec", "process.run", "process.session", "code.symbols", "code.diagnostics", "context.manage", "task.manage"]
   },
   "global_limits": {
     "MAX_TOOL_MODEL_CONTENT_CHARS": 16000,
@@ -107,6 +107,19 @@
         "content": {"type": "string", "required": true}
       },
       "limits": {"max_file_bytes": 4194304, "note": "content above the real-byte cap is refused before staging; the parent directory must already exist and directory topology is never created implicitly; state dir (.focus-agent) is rejected via resolve_mutation; same-Workspace same-path writers hold one canonical path lease from begin through settlement; the prepared effect compares the target snapshot again before replace, detecting external drift already visible at that check without claiming filesystem atomic CAS"},
+      "effects": ["write:workspace", "journal:changes.jsonl", "journal:authority/workspace-effects.jsonl"],
+      "context_disposition": "PersistObservation",
+      "platform": {}
+    },
+    "fs.mkdir": {
+      "risk": "WorkspaceWrite",
+      "surface_class": "catalog_optional",
+      "schema": {
+        "path": {"type": "string", "required": true, "note": "workspace-relative directory path"}
+      },
+      "limits": {
+        "note": "creates exactly one directory component; the immediate parent must already exist; an existing directory succeeds without mutation; recursive mkdir is intentionally not exposed"
+      },
       "effects": ["write:workspace", "journal:changes.jsonl", "journal:authority/workspace-effects.jsonl"],
       "context_disposition": "PersistObservation",
       "platform": {}

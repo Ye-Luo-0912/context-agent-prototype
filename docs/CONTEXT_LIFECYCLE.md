@@ -14,28 +14,18 @@ The lifecycle runs after meaningful events even when there is abundant model con
 ## 2. State model
 
 ```text
-                   relevant / accessed
-              ┌─────────────────────────┐
-              │                         │
-              v                         │
-          ┌────────┐                ┌─────────┐
-new ----> │ Active │  decay ------> │ Cooling │
-          └───┬────┘                └────┬────┘
-              │                          │
-              │ low relevance            │ low relevance
-              v                          v
-          ┌──────────┐  renewed      ┌──────────┐
-          │ Archived │ ------------> │ Active   │
-          └────┬─────┘               └──────────┘
-               │
-               │ ephemeral/obsolete/TTL
-               v
-          ┌─────────┐
-          │ Dropped │
-          └─────────┘
+attention: Active <-> Cooling <-> Archived
+semantic:  Live -> Superseded | VerifiedFixed | Tombstoned
+residency: Resident <-> Warm <-> Cold <-> External
 ```
 
-`Dropped` means removed from the online working set. Raw artifacts and the runtime event journal are separate concerns.
+These axes are independent. Attention says whether an item should compete for
+the next frame; semantic state says whether it is still current truth;
+residency says where its body lives. Semantic terminal states never reactivate.
+Context GC changes attention/residency and externalizes before bounded buffers
+overflow; it does not destroy information. Only conservative Storage GC may
+delete an unreferenced, expired, non-audit, non-pinned record. Raw artifacts
+and the Runtime event journal remain separate concerns.
 
 ## 3. Retention and scope are separate
 
@@ -496,7 +486,8 @@ body currently sits (Resident / Warm / Stored):
 The catalog directory is a single `item_id -> location` record per id
 (Resident / Warm / Stored) with shared query indexes (id / task / scope /
 kind / entity / label / residency / attention). Authority metadata stays
-on the body; GC moves location. `context.search` generates candidates from
+on the body; GC moves location. The `search` operation of `context.manage`
+generates candidates from
 those indexes across Resident/Warm/Stored; a live working-set file is a
 catalog hit (heap projection), not an empty miss. Since the shared search
 kernel (`agent-contracts::search`) landed, candidates also come from an
@@ -878,9 +869,9 @@ attach a searchable tag, lease an item for a bounded number of turns, or run
 a full GC pass — without ever touching the engine (invariant 3: tools return
 `ToolOutput`; the kernel routes the directive).
 
-Four read-only meta-tools (`context.gc_hint` / `context.tag` /
-`context.lease` / `context.collect`, always loaded with the core tool set)
-return a `ToolOutcome::RuntimeDirective` carrying a typed `ContextAction`
+The catalog-optional `context.manage` tool exposes typed `gc_hint`, `tag`,
+`lease` and `collect` operations. It returns a
+`ToolOutcome::RuntimeDirective` carrying a typed `ContextAction`
 (invariant 3 still holds — tools return `ToolOutput`-shaped results and
 never touch the engine; the kernel routes the directive). The actor
 executes the directive at **operation-commit time**, inside the same
@@ -1061,11 +1052,12 @@ Externalized is not deleted, and since V1-M9 it is also *findable again*:
 `inspect_external(item_id)` and `fetch_external(item_id)` (default no-ops,
 so engines without a store remain compatible). The process service/wire
 forwards all three operations, and parity tests force real externalization so
-a missing override cannot pass by returning the trait default. Three
-always-loaded
-read-only meta-tools (`context.search` / `context.inspect` /
-`context.fetch`) produce an `EngineQuery` the kernel resolves against the
-engine (invariant 3 — tools still never touch the engine). As of
+a missing override cannot pass by returning the trait default. The
+catalog-optional `context.manage` tool's `search`, `inspect` and `fetch`
+operations produce an `EngineQuery` the kernel resolves against the engine
+(invariant 3 — tools still never touch the engine). Runtime may prefer this
+surface when external evidence exists; otherwise it is loaded through
+`capability.manage`. As of
 2026-08-15, search/inspect cover the live catalog (Resident/Warm
 projections plus Stored), so a file still in SELECTED WORKING CONTEXT is
 a hit with `residency=` as data, not an empty miss. Search/inspect
@@ -1427,7 +1419,7 @@ append-only trace used for learning/replay.
 
 ## 12. Turn Frame vs Context Frame (V1)
 
-Since V1-M1 the model input is assembled in five layers, and tool
+The model input is assembled from separately budgeted Runtime-owned layers, and tool
 observations flow in two distinct phases:
 
 - **During a turn** tool results live in the runtime-owned `TurnFrame` (the
@@ -1455,8 +1447,9 @@ Consequences:
 
 - no mid-turn duplication: the model sees each result once, in protocol
   form, and the context frame does not re-render the same observation;
-- long-term memory still accumulates every observation (errors, verified
-  fixes, decisions) — as a batch at turn end, so the error/supersession
+- only results whose disposition is `PersistObservation` enter long-term
+  Context at turn end; `TransientNoPersist` and `AccessEventOnly` results stay
+  out, while typed errors/fixes/decisions that do persist are batched so the
   lifecycle observes the whole turn together;
 - `AfterTool` maintenance now runs once per turn (at persist time) instead
   of once per tool call. The replay/A/B/C harnesses drive the engines

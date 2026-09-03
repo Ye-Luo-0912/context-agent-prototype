@@ -167,7 +167,7 @@ verification effort, not calendar promises.
 
 | Phase | Outcome | Exit | Size |
 | --- | --- | --- | --- |
-| 0. Record a trustworthy successor | Finish the current reliability tranche without changing frozen evidence. The `b44ea44` local doctor passed, but GitHub Actions run `33781625618` failed Linux Clippy on the probe fixture's unreaped child; Windows check passed and test jobs were skipped. | Reap the fixture child, rerun the complete local gate, obtain green Windows/Linux CI on one clean source, and record which open P1 items apply to the next M15 path. No preflight or formal window is chained automatically. | S–M |
+| 0. Record a trustworthy successor | Finish the current reliability tranche without changing frozen evidence. The `b44ea44` local doctor passed. Source `c84f85e` then passed Windows/Linux format, Clippy and build, but Ubuntu tests exposed a separate fd-number reuse race in a Landlock drop assertion. | Make the assertion verify the original fd identity rather than numeric availability, rerun the complete local gate, obtain green Windows/Linux CI on one clean source, and record which open P1 items apply to the next M15 path. No preflight or formal window is chained automatically. | S–M |
 | 1. Close M15 | Select one materially new candidate from the immutable diagnosis and run the frozen sequence exactly once. | Deterministic regressions, applicable P1 exits or exact exclusions, clean dual-platform source, one product preflight, one predeclared 12-cell window, 12/12 mechanical PASS. | M, plus external serving time |
 | 2. Reliable Local Agent alpha | Turn the existing runtime into a coherent product path: checked CLI/provider configuration, explicit demo mode, visible bounded command errors, understandable approvals/grants, verified checkpoint save/list/resume, and user-visible task/verification/recovery status. Default scope is dynamic in-process Context, builtin tools, one workspace and an interactive TUI. | One clean-machine flow completes read → edit → verify → review → complete; kill/restart resumes a compatible safe point without duplicate effects; invalid config/checkpoint/debt fails before mutation. Close `COMPOSE-LIFECYCLE-01`, `CONTEXT-IO-01` and `EFFECT-ACK-01` for this path. Keep service Context experimental unless `SIDECAR-ERROR-01` closes. | L |
 | 3. Local Agent V1 release | Package the alpha for Windows/Linux and test representative task breadth rather than adding orchestration concepts. Reuse `LT-EVAL-06` normal/cold-resume twins and record the actual product round/tool limits. | Versioned binaries and checksums, install/upgrade notes, packaged-binary and TUI smoke tests, bounded diagnostic export, and all three `LT-EVAL-06` task families passing their predeclared behavior/diff/verification/closure/runtime/restore gates. | M–L |
@@ -201,16 +201,17 @@ drive effect commit or recovery, and cannot invent `StepRecord` identities
 before a separately accepted typed-step contract. Raw traces remain filesystem
 artifacts; no database is accepted merely to make querying convenient.
 
-TaskGraph remains conditional on Chronicle evidence and starts serially if
-accepted. Worker parallelism, multi-Agent delegation and recursive improvement
-stay later because they add workspace conflicts, leases, consistent-cut
-checkpointing and promotion authority. M12/M13 claims remain suspended as
-recorded above, and Self-Iteration remains blocked by the governing gates.
+TaskGraph remains conditional on recurring breadth evidence and starts
+serially if accepted; a Chronicle is not automatically required. Worker
+parallelism, multi-Agent delegation and recursive improvement stay later
+because they add workspace conflicts, leases, consistent-cut checkpointing and
+promotion authority. M12/M13 claims remain suspended as recorded above, and
+Self-Iteration remains blocked by the governing gates.
 
 ## Historical implementation notes (non-ordering)
 
 The following dated items retain evidence and rationale only. Their original
-numbers do not extend or reorder the seven-step route above.
+numbers do not extend or reorder the six-step immediate M15 route above.
 
 7. Execution Convergence V1 candidate gate (revised 2026-08-23 second
    review; lineage metrics added after the obligation-run evidence):

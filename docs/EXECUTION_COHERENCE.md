@@ -1,22 +1,16 @@
 # Execution Coherence V1
 
-**Freeze candidate** (2026-08-23). Code: `crates/agent-runtime/src/execution/`.
-The 2026-08-21 blockers — MOD-OBS-01 (refusal-as-observation),
-MOD-PROG-01 (progress / stall), turn checkpointing — landed, and the
-clean post-outage A/C longflow pass (n=2, all four arm-runs hidden-pass)
-held the machinery: Warm=Stored rereads stayed 0 and capability churn
-stayed gone. A 2026-08-24 diagnostic tested a model-visible cross-turn
-task-change provenance projection and rejected it: a refinement amplified
-constraint turns to 127 rounds / 174 tool calls in C. That field is not part of
-this contract. A generic current-workspace-authority standing prompt was also
-rejected after two repeats amplified unrelated completion/verification turns.
-Do not otherwise retune or extend this layer as product work.
+**Freeze candidate.** Code: `crates/agent-runtime/src/execution/`. This file
+defines the current execution-state and completion/continuation invariants; it
+does not own milestone status, product phases or experiment chronology. Those
+live in [`STATUS.md`](STATUS.md), [`ROADMAP.md`](ROADMAP.md) and the evidence
+reports. Product work should expose this state through bounded status/resume
+paths, not retune it, add prompt pressure or introduce a second planner.
 Checkpoint field is still `resume` on `TaskRecord` so old snapshots load.
 Do not add a second task table and do not reimplement `ResumePoint`.
 
 Context packing, GC, and retrieval live in
-[`CONTEXT_LIFECYCLE.md`](CONTEXT_LIFECYCLE.md). Current freeze / P0 live in
-[`STATUS.md`](STATUS.md).
+[`CONTEXT_LIFECYCLE.md`](CONTEXT_LIFECYCLE.md).
 
 ## Invariants
 

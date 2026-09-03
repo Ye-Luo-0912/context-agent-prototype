@@ -6,6 +6,13 @@ A small Rust coding-agent runtime built to test one hypothesis first:
 
 This repository intentionally does **not** include vectors, RAG, knowledge graphs, multi-agent orchestration, or learned context ranking in v0.1.
 
+The concrete product target is a reliable **single-user local coding Agent**:
+one workspace, one explicit provider profile, bounded builtin tools,
+human-approved effects, verifiable completion and cold resume. The runtime
+substrate is substantial; installation, checked configuration, product-grade
+resume/status and the formal M15 reliability gate are still open. The ordered
+delivery plan is in [`docs/ROADMAP.md`](docs/ROADMAP.md#route-to-a-usable-local-agent).
+
 ## Architecture
 
 ```text
@@ -73,7 +80,13 @@ The code is designed for modern stable Rust with the 2024 edition.
 cargo run -p agent-tui -- .
 ```
 
-The included `MockModelTransport` keeps the initial architecture runnable without binding the kernel to a model vendor. To use a real model, set `OPENAI_API_KEY` (and optionally `OPENAI_BASE_URL` / `OPENAI_MODEL`):
+The included `MockModelTransport` keeps the architecture runnable without a
+model vendor. **Current prototype behavior:** if `OPENAI_API_KEY` is absent,
+startup silently selects that mock transport. Do not use a no-key run as real
+Agent evidence; checked configuration and explicit demo mode are product work
+in the roadmap. To use a real model, set `OPENAI_API_KEY` and, when needed,
+`OPENAI_BASE_URL`, `OPENAI_MODEL`, `OPENAI_API_PROTOCOL` and
+`OPENAI_CONTEXT_WINDOW`:
 
 ```bash
 # DeepSeek example
@@ -83,7 +96,24 @@ $env:OPENAI_MODEL = "deepseek-chat"
 cargo run -p agent-tui -- .
 ```
 
-Any OpenAI-compatible endpoint works (OpenAI, DeepSeek, Qwen/DashScope, Moonshot/Kimi, GLM, ...). Output streams into the TUI; `/cancel` aborts the in-flight turn.
+The provider implements OpenAI-style Chat Completions and Responses streaming,
+but endpoint capabilities differ. Treat a provider/model/protocol tuple as
+supported only after its tool-calling and streaming preflight succeeds. Output
+streams into the TUI; `/cancel` aborts the in-flight turn. The prototype TUI
+currently inherits Core's 16-tool-round default, while formal M15 cells use a
+separate 48-round cap; the product route requires an explicit checked cap and
+tests against the value it actually ships.
+
+For contributor/source readiness, the repository has one deterministic gate
+runner:
+
+```bash
+cargo run -p agent-eval -- --doctor
+```
+
+It checks the source/toolchain/test environment and may optionally probe the
+configured Provider. It is not yet an installed product `doctor`, and it never
+starts a formal M15 preflight or window.
 
 ### Tool approval
 
@@ -106,21 +136,18 @@ cargo run -p agent-tui -- --read-only .
 
 ### Builtin tool set
 
-The builtin dispatcher provides eight repository tools plus two merged
-runtime-control surfaces:
+The production-default model surface contains `fs.list`, `fs.read`,
+`fs.write`, `artifact.read`, `search.grep`, `edit.patch`, `git.status`,
+`git.diff`, `task.complete` and `capability.manage`. When the host discovers a
+bounded verification recipe, `verify.run` is also required.
 
-- `fs.list` / `fs.read` / `fs.write` — file browsing with bounded content;
-- `search.grep` — regex search, ignores build artifacts/vendor dirs
-  (`.git`, `target`, `node_modules`, ...), bounded hits;
-- `edit.replace` — exact old→new patch (optionally `occurrence`/`replace_all`),
-  records old content to the change journal;
-- `git.status` / `git.diff` — workspace git state, bounded tail;
-- `shell.exec` — streaming process execution: full log to an artifact,
-  bounded ring-buffer tail to the model, `timeout_ms` and `/cancel` kill the
-  child.
-- `context.manage` — bounded GC hints/tags/leases/collect and external
-  search/inspect/fetch/admit/derive requests routed by the runtime;
-- `capability.manage` — paged catalog search/inspect/load/unload.
+`fs.mkdir`, `edit.replace`, `shell.exec`, `process.run`, `process.session`,
+`code.symbols`, `code.diagnostics`, `context.manage` and `task.manage` are
+catalog-optional and load through `capability.manage`; they do not all occupy
+every model round. Tool visibility never grants effect authority. Detailed
+schemas, limits, effects and disposition are recorded in the reviewed
+[`docs/TOOL_INVENTORY.json`](docs/TOOL_INVENTORY.json); the Rust registry
+remains authoritative until the generated-manifest residual closes.
 
 Every mutating tool also appends a `WorkspaceChange` record (tool, path,
 action, old content when small) to `.focus-agent/changes.jsonl` — the
@@ -130,10 +157,17 @@ review/revert substrate for anything the agent changes.
 
 - Type a message and press Enter.
 - `/focus <text>` explicitly changes the current focus.
+- `/tasks` lists known tasks; `/task <id>` activates one.
+- `/suspend` suspends the active task.
 - `/pin <text>` inserts a pinned context item.
 - `/done <summary>` archives the active task working set and retains the summary.
 - `/context` prints current context diagnostics into the event stream.
-- `/checkpoint` exports the context engine state to `.focus-agent/checkpoints/`.
+- `/checkpoint` exports a cross-plane runtime checkpoint to
+  `.focus-agent/checkpoints/`.
+- `/restore <path>` restores a runtime checkpoint in the current prototype.
+  This path-based command is not yet the verified `resume latest` product flow.
+- `/grants` lists active standing grants. Startup grants currently use
+  `--grant=<JSON>`; a usable revoke flow is still product work.
 - `/cancel` aborts the in-flight model turn.
 - `Tab` toggles the context inspect panel (selected items + lifecycle transitions).
 - `/quit` exits.
@@ -190,13 +224,20 @@ ACI, and extension ecosystem design queue), and `docs/ROADMAP.md`.
 ## Current status
 
 The dynamic-context and round-surface baselines are substantial, but this is
-still a research prototype. Runtime transactions, external recall, exact
-model-consumption acknowledgement, store-backed GC, cross-plane checkpoints,
-canonical context ownership, TaskAnchor/completion semantics, process effect
-brokering, typed effect settlements, bounded process authority and real
-filesystem isolation are implemented; their exit evidence and remaining gates
-are tracked in the docs below. Standing unattended-task policy and real
-coding non-inferiority (formal M15) remain open.
+still a source-built research prototype. Runtime transactions, external
+recall, model-consumption acknowledgement, store-backed GC, cross-plane
+checkpoints, TaskAnchor/completion semantics, process effect brokering, typed
+settlements and bounded process authority are implemented. The main gaps are
+now the product entry/configuration, verified workspace resume, visible
+recovery/status UX, a few correctness residuals and real coding
+non-inferiority.
+
+Formal M15 remains open: seven v4 valid FAIL windows are retained and the
+latest is 10/12. Successor reliability commit `b44ea44` passed the complete
+local doctor. Follow-up `c84f85e` passed both platform check jobs but exposed a
+parallel fd-reuse race in one Ubuntu assertion; the current identity-aware test
+fix still needs a clean CI record. See the current snapshot before interpreting
+any historical chronology.
 `docs/STATUS.md` owns Now/freeze status, `docs/ROADMAP.md` owns milestone
 gates/order, `docs/AUDIT_TODO.md` owns confirmed defects and acceptance
 tests, and `docs/M15_ACCEPTANCE.md` owns the formal-window design.

@@ -464,17 +464,32 @@ mod tests {
     }
 
     #[test]
-    fn child_rules_drop_closes_every_fd() {
+    fn child_rules_drop_releases_every_original_fd() {
         let dir = tempfile::tempdir().unwrap();
         let rules = ChildRules::open(&[dir.path().to_path_buf()]).unwrap();
         assert_eq!(rules.write_root_fds.len(), 1);
         let fd = rules.write_root_fds[0];
+        let mut before = std::mem::MaybeUninit::<libc::stat>::zeroed();
+        assert_eq!(unsafe { libc::fstat(fd, before.as_mut_ptr()) }, 0);
+        let before = unsafe { before.assume_init() };
         drop(rules);
-        // The fd must be closed after drop: fcntl(F_GETFD) fails with
-        // EBADF.
-        let ret = unsafe { libc::fcntl(fd, libc::F_GETFD) };
-        assert_eq!(ret, -1);
-        assert_eq!(io::Error::last_os_error().raw_os_error(), Some(libc::EBADF));
+        // Descriptor numbers are process-global and another parallel test can
+        // reuse this number immediately. EBADF is the common case; if reuse
+        // won the race, it must no longer identify the directory opened by
+        // ChildRules.
+        let mut after = std::mem::MaybeUninit::<libc::stat>::zeroed();
+        let ret = unsafe { libc::fstat(fd, after.as_mut_ptr()) };
+        if ret == -1 {
+            assert_eq!(io::Error::last_os_error().raw_os_error(), Some(libc::EBADF));
+        } else {
+            assert_eq!(ret, 0);
+            let after = unsafe { after.assume_init() };
+            assert_ne!(
+                (after.st_dev, after.st_ino),
+                (before.st_dev, before.st_ino),
+                "a reused descriptor must not retain the dropped write-root identity"
+            );
+        }
     }
 
     #[test]

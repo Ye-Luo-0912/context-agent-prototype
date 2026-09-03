@@ -32,12 +32,13 @@ is not closed.
 | Before long-horizon breadth, if measured | `FAILURE-SPILL-01`, `TOOL-CONTRACT-01` live acceptance | Activate spill work only if the bounded hot set overflows; use paired task evidence for tool-contract convergence. |
 | Before extension promotion or Self-Iteration | `CAP-OBS-01` residual | Retire legacy producer metadata only through the existing typed-facts migration; dynamic producers never mint trusted execution facts. |
 
-The current `b44ea44` GitHub run is also not a clean-source exit: Linux Clippy
-reported an unreaped descendant in the ignored Python probe fixture and skipped
-dependent tests. The bounded reaper correction is small, but it must pass the
-complete gate and new CI before it is recorded as closed baseline work. This
-test-harness correction is not an M15 candidate and does not change any frozen
-window.
+The successor is not yet a clean-source exit. `b44ea44` exposed an unreaped
+probe descendant under Linux Clippy; `c84f85e` fixed that finding and passed
+both platform check jobs, then Ubuntu tests exposed an independent fd-number
+reuse race in `child_rules_drop_closes_every_fd`. The current assertion accepts
+numeric reuse only when `fstat` proves it no longer identifies the dropped
+write root. It still needs a complete green CI record. These harness
+corrections are not an M15 candidate and change no frozen window.
 
 ## Continuation review verification — 2026-09-03 (`c823a1c`)
 
@@ -1314,7 +1315,9 @@ The completion-gate candidate closed the diag tail (diag 4/4) but the two
 residual `retry_policy_dev` failures are a distinct execution-debt tail (a
 resolvable-looking `failed_commands` blocker on which the ordinary-final
 terminal stage is deliberately not offered, ending in 48-round budget
-exhaustion) and a harness storage lock-contention failure at resume restore.
+exhaustion) and a Runtime restore/storage lifecycle lock-contention failure.
+The latter cell is mechanically classified `runtime`, not as an M15
+`harness_setup`/`harness_watchdog` NOT_RUN.
 Both are uncovered by the terminal escalation; the candidate is rejected and
 M15 stays open. The next bounded M15 candidate is an operator decision bounded
 by the frozen route.

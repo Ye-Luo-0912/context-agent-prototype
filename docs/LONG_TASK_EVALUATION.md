@@ -1,9 +1,35 @@
 # Long-Task Runtime and Development Evaluation
 
-This document defines the next development diagnostic after the retained
-longflow r8-r10 result. [`ROADMAP.md`](ROADMAP.md) remains milestone authority;
+This document defines the retained long-task Runtime model and its next
+post-M15 development diagnostic. [`ROADMAP.md`](ROADMAP.md) remains milestone authority;
 [`EXECUTION_COHERENCE.md`](EXECUTION_COHERENCE.md) remains the runtime-state
 contract. This plan does not reorder M12/M13, retune Context, or close M15.
+
+This document owns long-task diagnostics only. It is not the product roadmap,
+the open-defect queue or a historical window ledger. Product phases live in
+[`ROADMAP.md`](ROADMAP.md#route-to-a-usable-local-agent), current facts in
+[`STATUS.md`](STATUS.md), and formal verdicts in the immutable window reports.
+
+## Current disposition — 2026-09-04
+
+- Formal M15 is still the active evaluation gate. Seven v4 valid FAIL windows
+  are banked; the latest (`_windows/1788438275930`, source `a6dc33e`) is 10/12
+  with 0 NOT_RUN. Its two failures are an execution-debt convergence tail and
+  a Runtime restore/storage lifecycle failure. The resume cell records
+  `runtime_error_class=runtime`, so it is not an M15 harness-class NOT_RUN.
+- The `b44ea44` successor repairs have deterministic local evidence only and
+  no new formal verdict. Follow-up `c84f85e` passed both platform check jobs
+  after reaping the ignored-fixture descendant, then Ubuntu tests exposed a
+  separate fd-number reuse race in a Landlock drop assertion. The identity-
+  aware assertion and a clean dual-platform source must be recorded before
+  candidate selection.
+- `LT-EVAL-06` remains parked until M15 closes. Product entry/config/resume
+  work must reuse the current TaskAnchor, ExecutionState, checkpoint store and
+  event projections; it does not authorize a TaskGraph or Context retune.
+- A Run Catalog/Chronicle is conditional post-M15 work. Begin with the
+  smallest bounded run/task status projection required by the product. Only
+  recurring evidence across independent task families can justify stable
+  step identity or a serial TaskGraph.
 
 ## Why the current longflow is not the next benchmark
 
@@ -1081,7 +1107,15 @@ closes it as an ordinary turn. Deterministic coverage uses that order.
 
 ### Current delivery order
 
-The latest formal window (`_windows/1788402676712`, 2026-09-03) is a valid
+The authoritative current order is the four-point disposition above plus the
+M15 route in [`ROADMAP.md`](ROADMAP.md#immediate-m15-route). The following
+dated text is retained as the decision record that led to the seventh window
+and successor repair; it is not a second active queue.
+
+#### Historical 2026-09-03 route record
+
+At that point, the then-latest formal window (`_windows/1788402676712`,
+2026-09-03) was a valid
 FAIL 10/12 with 0 NOT_RUN on clean source `38d458e` (attempt-incident
 admission candidate, `e897c5c`) and the PinAI/Luna tuple. Migrate passed 4/4;
 diag passed 3/4; policy passed 3/4; behavior/diff pass 12/12 with provider

@@ -15,6 +15,7 @@ and sandbox contracts live elsewhere. Experiment facts live in
 | [`ROADMAP.md`](ROADMAP.md) | Milestone gates and ordered route |
 | [`LONG_TASK_EVALUATION.md`](LONG_TASK_EVALUATION.md) | Long-task Runtime gaps and development diagnostic |
 | [`AUDIT_TODO.md`](AUDIT_TODO.md) | Confirmed defect queue |
+| [`M15_ACCEPTANCE.md`](M15_ACCEPTANCE.md) | Frozen formal-window semantics |
 
 ## Now
 
@@ -29,12 +30,14 @@ not a new planner, TaskGraph, database or multi-Agent layer.
   `agent-eval --doctor` run passed Python/helper probes, format, all-target /
   all-feature check, strict Clippy, build and the complete workspace test
   suite; Provider was intentionally skipped without a key.
-- The exact-source GitHub Actions run `33781625618` is **not green**: Windows
-  format/Clippy/build passed, while Linux Clippy rejected an ignored probe
-  fixture because its spawned descendant was not reaped; dependent test jobs
-  were skipped. The current planning tree contains the bounded detached-reaper
-  fix, but this is not a recorded clean-source exit until local gates and
-  Windows/Linux CI pass again.
+- Follow-up source `c84f85e` fixed the Linux Clippy finding and both Windows
+  and Linux format/Clippy/build jobs passed in run `33782774359`. Its Ubuntu
+  part-1 tests then exposed a separate racy assertion: after `ChildRules` had
+  closed an fd, another parallel test reused the same numeric descriptor, so
+  `F_GETFD == -1` was not a valid proof. The current tree compares the original
+  `fstat` identity when reuse wins and still requires EBADF otherwise. This is
+  not a recorded clean-source exit until the new test and the complete
+  Windows/Linux CI pass.
 - Formal M15 remains open. Seven v4 valid FAIL windows are banked; the latest
   mechanical report is 10/12 with 0 NOT_RUN. Its resume failure is classified
   in `dimensions.json` as `runtime_error_class=runtime`: it is a Runtime
