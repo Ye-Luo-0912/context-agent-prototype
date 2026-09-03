@@ -1201,14 +1201,18 @@ decision as their in-process forms. Exit injects those categories through both
 adapters and proves identical typed decisions; bounded diagnostic text remains
 non-authoritative.
 
-#### TOOL-MANIFEST-01 — align the actual model surface (**open — v5 parity landed on `23abe1c`; evaluated-identity persistence remains**)
+#### TOOL-MANIFEST-01 — align the actual model surface (**closed: v5 parity `23abe1c`; evaluated-identity persistence wired on `9e00299`**)
 
 `23abe1c` aligned `TOOL_INVENTORY.json` with the actual v5 production surface,
 made unknown/uninspectable rows and default-surface drift fail closed, and
-computes a stable surface/schema digest. The digest is currently returned only
-to the caller/test; it is not assigned to the conformance report or persisted
-with the evaluated run/evidence identity. Wire that existing digest into the
-real report/evidence path before closing the item.
+computes a stable surface/schema digest. `9e00299` completed the persistence
+residual: the derivation moved to `agent_contracts::tool::surface_digest`
+(shared by the conformance checks and the evidence writers), and the formal
+long-live path records the digest of the exact builtin dispatcher +
+frozen-verification-recipes composition it evaluates on every cell
+`manifest.json` (`surface_digest`), with a regression proving the manifest
+carries it. Surface drift between runs is now detectable from the evidence
+alone.
 
 A single host-owned generated manifest may be evaluated later as a separate
 post-M15 simplification. It is not required to prove current parity and must not
