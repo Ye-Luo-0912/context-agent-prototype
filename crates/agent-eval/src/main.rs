@@ -17,6 +17,7 @@ mod bundle;
 mod context_bench;
 mod context_mech;
 mod convergence_bench;
+mod doctor;
 mod driver;
 mod envfile;
 mod fixture_driver;
@@ -114,6 +115,7 @@ fn usage() -> ! {
          usage: agent-eval --conv-tail [--evidence-dir <dir>]\n\
          usage: agent-eval --m15-preflight [--evidence-dir <dir>]\n\
          usage: agent-eval --m15-window\n\
+         usage: agent-eval --doctor
          usage: agent-eval --m15-report <window-dir>\n\
 \n\
          Bounded one-cell exact-source/product preflight before the single\n\
@@ -805,6 +807,19 @@ async fn main() -> anyhow::Result<()> {
             }
             "--conv-tail" => {
                 run_conv_tail(evidence_dir).await?;
+                return Ok(());
+            }
+            "--doctor" => {
+                let output_root = evidence_dir
+                    .unwrap_or_else(|| std::path::PathBuf::from("target").join("doctor"));
+                let steps = doctor::run_doctor(&output_root).await?;
+                if steps
+                    .iter()
+                    .filter(|step| step.required)
+                    .any(|step| !step.passed)
+                {
+                    anyhow::bail!("doctor: at least one required gate or probe failed");
+                }
                 return Ok(());
             }
             "--m15-preflight" => {
