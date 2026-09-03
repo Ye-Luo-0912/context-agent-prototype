@@ -40,6 +40,20 @@ not a new planner, TaskGraph, database or multi-Agent layer.
   is green across both fmt/clippy/build jobs, Ubuntu test parts 1+2, and the
   Windows full suite — the new reuse-tolerant test and the reaped probe
   descendant both pass on both platforms. Directive step 1 is closed.
+- By operator direction ("continue"), the **successor source is selected as
+  the eighth M15 candidate**: its cancellation-lag and storage slices target
+  the seventh window's diagnosed `runtime`-class restore failure directly.
+  The exact-source preflight **PASSED** 2026-09-03 on the clean detached-HEAD
+  worktree at `1651354` (source tree digest `21cb4095...`, serving recorded
+  in the attempt manifest): `retry_policy_dev` normal, product surface,
+  behavior/diff pass, closure completed, provider healthy, 40 model rounds,
+  hidden oracle green.
+- The 12-cell v4 window on the successor candidate + PinAI tuple is
+  **predeclared 2026-09-03 before its run** (M15_ACCEPTANCE §7 item 8):
+  3 fixtures × normal/resume × 2 repeats, the product surface, the pinned
+  serving tuple, one uninterrupted `agent-eval --m15-window` run from the
+  same clean worktree at `1651354`. Valid FAIL rejects the candidate; only
+  a typed NOT_RUN permits a whole-window rerun.
 - Formal M15 remains open. Seven v4 valid FAIL windows are banked; the latest
   mechanical report is 10/12 with 0 NOT_RUN. Its resume failure is classified
   in `dimensions.json` as `runtime_error_class=runtime`: it is a Runtime
