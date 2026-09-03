@@ -18,6 +18,49 @@ and sandbox contracts live elsewhere. Experiment facts live in
 
 ## Now
 
+### Decision snapshot — 2026-09-04
+
+The repository is a **substantial single-Agent runtime with a prototype product
+host**. It is not yet a complete local coding-Agent product. The shortest path
+is reliability and M15 first, then a deliberately small product shell; it is
+not a new planner, TaskGraph, database or multi-Agent layer.
+
+- Planning baseline: successor reliability commit `b44ea44`. Its local
+  `agent-eval --doctor` run passed Python/helper probes, format, all-target /
+  all-feature check, strict Clippy, build and the complete workspace test
+  suite; Provider was intentionally skipped without a key.
+- The exact-source GitHub Actions run `33781625618` is **not green**: Windows
+  format/Clippy/build passed, while Linux Clippy rejected an ignored probe
+  fixture because its spawned descendant was not reaped; dependent test jobs
+  were skipped. The current planning tree contains the bounded detached-reaper
+  fix, but this is not a recorded clean-source exit until local gates and
+  Windows/Linux CI pass again.
+- Formal M15 remains open. Seven v4 valid FAIL windows are banked; the latest
+  mechanical report is 10/12 with 0 NOT_RUN. Its resume failure is classified
+  in `dimensions.json` as `runtime_error_class=runtime`: it is a Runtime
+  restore/storage lifecycle failure, not the `harness_setup` or
+  `harness_watchdog` class that would produce `NOT_RUN`. The successor repairs
+  do not create a new formal verdict.
+- Product scope is now fixed to dynamic in-process Context, builtin tools, one
+  workspace, one checked OpenAI-compatible provider profile and an interactive
+  TUI. Service Context and dynamic extensions remain experimental unless their
+  own typed-error and trust exits close.
+
+| Module group | Current maturity | Product exit still required |
+| --- | --- | --- |
+| Contracts / Core / process / storage | Trusted mechanisms are substantial: bounded contracts, approval/effect authority, journals, recovery evidence and process control are implemented. | Persist and reconcile unresolved effect-ack debt end to end; retain fail-closed recovery. |
+| Runtime / task / checkpoint | Sole `RuntimeActor`, TaskAnchor/ExecutionState, completion readiness, safe points and cross-plane checkpoint/restore exist. | Expose a verified product save/list/resume path and bounded status projection; never add a second orchestrator. |
+| Dynamic Context | Working-set lifecycle, external store, recall and explainability are implemented and frozen for M15. | Close the materialize/restore transaction and external-catalog dirty residual; do not retune GC/scoring. |
+| Tools / workspace | A broad bounded coding surface, artifact spill, revision-aware edits, verification recipes and approvals exist. | Persist the evaluated surface identity and make actual effects, failures and grants understandable in the product host. |
+| Provider / composition | OpenAI-compatible Chat/Responses streaming and one trusted composition path exist. | Checked configuration, explicit mock mode, visible serving identity, strict startup errors and the optional-service type residual. |
+| TUI / product entry | The event-driven TUI can run tasks, approve calls, inspect Context and manually checkpoint/restore. | Strict help/config parsing, bounded visible command errors, safe checkpoint-store integration, resume discovery, usable grant revoke and packaged startup smoke. |
+| Eval / replay | Deterministic gates, doctor, replay and immutable formal evidence are stronger than the product shell. | Green clean-source CI, one materially new M15 candidate, then `LT-EVAL-06` breadth on the actual product limits. |
+| Sidecars / extensions / multi-Agent | Protocol and supervision substrate exists; production isolation is incomplete. | Not in V1. Keep disabled/experimental; promote only through a separate measured gate. |
+
+The product definition and phase exits live only in
+[`ROADMAP.md`](ROADMAP.md#route-to-a-usable-local-agent). Open defect details
+live only in [`AUDIT_TODO.md`](AUDIT_TODO.md#live-execution-queue--2026-09-04).
+
 **Continuation-review verification (2026-09-03; audited source
 `c823a1c2641099ccd42517c4ec96c6ebbe2ca953` against
 `ea8deefc873abee13106de92bbbb3ddbaeb2d423`):**
@@ -1499,6 +1542,20 @@ task-aware, its tail metric does not stop when work reopens, and its live runner
 
 ## Next milestone
 
+The current directive is concise:
+
+1. finish the Linux probe-reaping correction and record one clean source with
+   the complete local gate and Windows/Linux CI green;
+2. reconcile the applicable open P1 exits or selected-path exclusions; do not
+   start product features that change the formal surface;
+3. select a materially new M15 candidate from the immutable diagnosis, then
+   use one fresh preflight and at most one predeclared 12-cell window;
+4. only after M15 closes, execute the Reliable Local Agent alpha and V1 route
+   in [`ROADMAP.md`](ROADMAP.md#route-to-a-usable-local-agent).
+
+The candidate chronology below is retained for audit context. It does not
+override the four steps above.
+
 The next milestone is a **materially new, mechanically convergent execution
 candidate**, not another prompt tweak or an immediate rerun. The repaired-source
 + PinAI/Luna candidate was rejected by the valid 6/12 window at
@@ -1629,10 +1686,13 @@ before its run):**
   `task_progress`/`next_action_pending` tail — the ordinary-final terminal
   stage is deliberately not offered for such a model-resolvable blocker, so no
   `terminal_surface` fired and the model churned against persistent debt; and
-  (2) `resume r1` failed at checkpoint restore with a storage lock-contention
-  error (`lock workspace effects journal …workspace-effects.jsonl exclusively:
-  … contested after 20 retries`) — an infrastructure failure, not model
-  behavior. Post-window diagnosis at
+  (2) `resume r1` failed at checkpoint restore with a Runtime
+  storage-lifecycle lock-contention error (`lock workspace effects journal
+  …workspace-effects.jsonl exclusively: … contested after 20 retries`) — an
+  infrastructure failure, not model behavior. The cell records
+  `runtime_error_class=runtime`; references to the evaluation harness in the
+  diagnosis describe where the product restore was exercised, not an M15
+  `harness_setup`/`harness_watchdog` classification. Post-window diagnosis at
   [`evidence/m15-diagnosis-completion-gate/REPORT.md`](../crates/agent-eval/evidence/m15-diagnosis-completion-gate/REPORT.md).
   Per M15_ACCEPTANCE §5 the valid FAIL rejects the candidate; the window is not
   rerun. M15 remains open; candidate selection is a user decision.

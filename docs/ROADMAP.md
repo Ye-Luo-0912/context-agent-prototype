@@ -16,6 +16,34 @@ Defects: [`AUDIT_TODO.md`](AUDIT_TODO.md).
 Historical P0–M11 landing notes are in git history of this file. Do not
 copy them back.
 
+## Product destination
+
+The repository is aiming at a **reliable single-user local coding Agent**, not
+at a general planner or a distributed Agent platform. V1 is complete when a
+user can install one versioned build, point it at one workspace, give it one
+repository-level task, approve bounded effects, inspect the result, and resume
+after interruption without replaying an uncommitted suffix or duplicating an
+effect.
+
+That outcome requires six user-visible properties:
+
+1. startup validates the workspace, provider profile and helper processes
+   before entering the interactive UI; mock mode is explicit;
+2. the Agent can inspect, edit and run host-owned verification through the
+   existing bounded tool and approval paths;
+3. task status exposes the current goal, next action, blockers, latest trusted
+   verification and recovery debt without making the UI a new authority;
+4. checkpoints use the existing verified checkpoint store and a fresh process
+   can explicitly resume the latest compatible safe point;
+5. completion produces a bounded review summary with changed files,
+   verification and unresolved limitations; and
+6. the packaged Windows and Linux binaries pass startup, one representative
+   coding flow, cancellation and cold-resume smoke tests.
+
+Vectors, a learned planner, TaskGraph, background workers, multi-Agent
+delegation and Self-Iteration are not V1 requirements. They remain
+evidence-triggered candidates after the simpler product has passed its gates.
+
 ## Current gates
 
 | Milestone | Status | Gate |
@@ -25,7 +53,7 @@ copy them back.
 | M12 Effect Runtime | 🧾 closure-audit evidence banked; recovery P0 repaired, claims suspended | The clean-tree evidence table remains immutable. `EFFECT-ACK-CLASS-01` (typed settlements, journal v2, no-strengthening recovery) and `PROCESS-COORDINATOR-01` (bounded coordinator wire) are repaired in `6112ffd`/`43eb87b`. No new closure claim until the recorded 2026-09-03 doc tranche and the M15-facing exits land. Details: [`PLATFORM_SECURITY.md`](PLATFORM_SECURITY.md). |
 | M13 Extension Sandbox | 🧾 closure-audit evidence banked; attestation P0 repaired, claims suspended | The clean-tree audit remains immutable. `SANDBOX-ATTEST-TRUNCATE-01` is repaired in `e5e712f` (write-floor attestation only at enforcing ABIs). Universal native `UntrustedGenerated` availability is not V1 and WASI remains V2. No new closure claim until the recorded 2026-09-03 doc tranche and the M15-facing exits land. Details: [`PLATFORM_SECURITY.md`](PLATFORM_SECURITY.md). |
 | M14 Resource Policy | ✅ | Schema/context quotas, standing grants, output broker, authority leases. Further typed policy is not a reopen of this gate. |
-| M15 Real Evaluation | 🛑 open; seven v4 valid FAILs banked, latest 10/12; returns to diagnosis | Seven valid v4 FAIL windows and three valid v3 windows remain immutable diagnostics. The latest window (2026-09-03, completion-gate convergence candidate source `a6dc33e`, PinAI `gpt-5.6-luna` tuple) is 10/12 — migrate 4/4, diag 4/4, policy 2/4, behavior/diff pass 12/12 with provider healthy everywhere; the two failures are an uncovered execution-debt tail and a harness storage lock-contention failure at resume restore. Per M15_ACCEPTANCE §5 the candidate is rejected and the window is not rerun; a new candidate needs diagnosis, deterministic gates, a fresh preflight and a fresh predeclared window. Formal M15 remains 3 fixtures × normal/resume × 2 repeats, never settlement off/on. See [`M15_ACCEPTANCE.md`](M15_ACCEPTANCE.md). |
+| M15 Real Evaluation | 🛑 open; seven v4 valid FAILs banked, latest 10/12; returns to diagnosis | Seven valid v4 FAIL windows and three valid v3 windows remain immutable diagnostics. The latest window (2026-09-03, completion-gate convergence candidate source `a6dc33e`, PinAI `gpt-5.6-luna` tuple) is 10/12 — migrate 4/4, diag 4/4, policy 2/4, behavior/diff pass 12/12 with provider healthy everywhere; the two failures are an uncovered execution-debt tail and a Runtime restore/storage lifecycle failure. The latter is recorded by the cell as `runtime_error_class=runtime`, not as the `harness_setup`/`harness_watchdog` class that would make a cell `NOT_RUN`. Per M15_ACCEPTANCE §5 the candidate is rejected and the window is not rerun; a new candidate needs diagnosis, deterministic gates, a fresh preflight and a fresh predeclared window. Formal M15 remains 3 fixtures × normal/resume × 2 repeats, never settlement off/on. See [`M15_ACCEPTANCE.md`](M15_ACCEPTANCE.md). |
 | V2 Self-Iteration | 🔒 blocked | Until the governing M12/M13 status is reconciled and M15 closes. The agent may grow capabilities, never evaluation or permission Core authority. |
 
 Open gate order (post-repair, updated 2026-09-03): ~~M10 fault-gate re-audit
@@ -52,7 +80,7 @@ candidate decision. The platform audit
 evidence stays banked, M14 is not reopened, and Context/GC/retrieval/packing
 remain frozen.
 
-## Ordered route
+## Immediate M15 route
 
 1. Preserve the valid 6/12 FAIL at
    `evidence/m15-window/_windows/1788385151733/`, the valid 10/12 FAIL at
@@ -97,7 +125,7 @@ then credited with one aggregate result.
   diagnosis as its explicit recommendation, closed the diag tail (diag 4/4),
   and has now run its own predeclared window: valid FAIL 10/12 on `a6dc33e`
   (`_windows/1788438275930`). Its two residual `retry_policy_dev` failures are
-  an uncovered execution-debt tail and a harness storage lock-contention
+  an uncovered execution-debt tail and a Runtime restore/storage lifecycle
   failure at resume restore
   ([`evidence/m15-diagnosis-completion-gate/REPORT.md`](../crates/agent-eval/evidence/m15-diagnosis-completion-gate/REPORT.md)).
   Step 3 above is therefore open again: select one materially new product/serving
@@ -130,30 +158,48 @@ Detailed slice sizes and gates are in
 [`LONG_TASK_EVALUATION.md`](LONG_TASK_EVALUATION.md#2026-09-03-workload-split).
 The frozen M15 acceptance text is unchanged.
 
-## Post-M15 candidate order (proposal)
+## Route to a usable local Agent
 
-This is a directional proposal extracted from the verified 2026-09-03
-continuation review. It does not add a milestone, change the current gate, or
-authorize work before M15 closes:
+This is the only product delivery order. Defect details stay in
+[`AUDIT_TODO.md`](AUDIT_TODO.md); formal evaluation semantics stay in
+[`M15_ACCEPTANCE.md`](M15_ACCEPTANCE.md). Sizes are relative implementation and
+verification effort, not calendar promises.
+
+| Phase | Outcome | Exit | Size |
+| --- | --- | --- | --- |
+| 0. Record a trustworthy successor | Finish the current reliability tranche without changing frozen evidence. The `b44ea44` local doctor passed, but GitHub Actions run `33781625618` failed Linux Clippy on the probe fixture's unreaped child; Windows check passed and test jobs were skipped. | Reap the fixture child, rerun the complete local gate, obtain green Windows/Linux CI on one clean source, and record which open P1 items apply to the next M15 path. No preflight or formal window is chained automatically. | S–M |
+| 1. Close M15 | Select one materially new candidate from the immutable diagnosis and run the frozen sequence exactly once. | Deterministic regressions, applicable P1 exits or exact exclusions, clean dual-platform source, one product preflight, one predeclared 12-cell window, 12/12 mechanical PASS. | M, plus external serving time |
+| 2. Reliable Local Agent alpha | Turn the existing runtime into a coherent product path: checked CLI/provider configuration, explicit demo mode, visible bounded command errors, understandable approvals/grants, verified checkpoint save/list/resume, and user-visible task/verification/recovery status. Default scope is dynamic in-process Context, builtin tools, one workspace and an interactive TUI. | One clean-machine flow completes read → edit → verify → review → complete; kill/restart resumes a compatible safe point without duplicate effects; invalid config/checkpoint/debt fails before mutation. Close `COMPOSE-LIFECYCLE-01`, `CONTEXT-IO-01` and `EFFECT-ACK-01` for this path. Keep service Context experimental unless `SIDECAR-ERROR-01` closes. | L |
+| 3. Local Agent V1 release | Package the alpha for Windows/Linux and test representative task breadth rather than adding orchestration concepts. Reuse `LT-EVAL-06` normal/cold-resume twins and record the actual product round/tool limits. | Versioned binaries and checksums, install/upgrade notes, packaged-binary and TUI smoke tests, bounded diagnostic export, and all three `LT-EVAL-06` task families passing their predeclared behavior/diff/verification/closure/runtime/restore gates. | M–L |
+| Later, only from evidence | Add the smallest rebuildable run/task projection needed by real status queries. A persistent Chronicle, serial TaskGraph, worker or extension SDK is considered only after repeated task-family evidence shows the simpler `TaskAnchor + ExecutionState` substrate is insufficient. | Separate proposal and acceptance for each capability; no second `TaskManager`, orchestrator, authority log or trace database. | Conditional |
+
+Phase 2 should extend the existing product host and checkpoint/event projections;
+it should not begin with a daemon, web UI, database, plugin marketplace or a
+new planner. Product configuration may expose a checked execution-round cap,
+but the current TUI default and the formal M15 cap must be recorded separately;
+the frozen M15 design is not rewritten to match a UI choice.
+
+## Post-M15 candidate order
+
+This order is conditional on M15 closing and is summarized here so architecture
+research cannot outrun the product:
 
 ```text
 M15
-  -> LT-EVAL-06 / Reliable Local Agent breadth
-  -> rebuildable Run Catalog / Execution Chronicle
-  -> conditional serial TaskGraph
-  -> worker / multi-Agent capability execution
-  -> Self-Iteration
+  -> Reliable Local Agent alpha
+  -> LT-EVAL-06 + packaged V1 release gate
+  -> smallest rebuildable Run/Task status projection, if needed
+  -> conditional serial TaskGraph, only if breadth evidence requires it
+  -> worker / multi-Agent execution, only after an accepted protocol gate
+  -> Self-Iteration, still separately blocked
 ```
 
-The Chronicle candidate is a disposable, rebuildable projection over domain
-journals, the committed Runtime-event prefix and validated checkpoints. It must
-reuse the event-driven `RunStateAggregator` direction, cannot become a second
-`TaskManager`, and cannot drive effect commit or recovery authority. A first
-projection may index Run, Task, Turn/episode, Operation, Effect, Checkpoint,
-Completion and recovery debt. The current authority plane has no stable
-step identity, so it must not invent `StepRecord` rows before a separately
-accepted TaskGraph/typed-step contract. Raw traces remain filesystem artifacts;
-no database or storage choice is accepted by this proposal.
+The first product status view should be a bounded read model over current
+Runtime events, task state, validated checkpoints and recovery debt. A broader
+Chronicle is optional. If selected, it is disposable and rebuildable, cannot
+drive effect commit or recovery, and cannot invent `StepRecord` identities
+before a separately accepted typed-step contract. Raw traces remain filesystem
+artifacts; no database is accepted merely to make querying convenient.
 
 TaskGraph remains conditional on Chronicle evidence and starts serially if
 accepted. Worker parallelism, multi-Agent delegation and recursive improvement

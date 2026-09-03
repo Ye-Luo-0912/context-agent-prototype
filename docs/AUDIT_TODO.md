@@ -16,6 +16,29 @@ M12/M13 must close before Self-Iteration. Do not add a database, vector
 search, or learned ranking. Do not claim a milestone complete because
 happy-path tests pass.
 
+## Live execution queue — 2026-09-04
+
+This index is the operational entry point. The detailed records below remain
+the source for root cause and exit tests; old sections named “Open P0/P1” are
+historical headings and do not override this table. There is no confirmed open
+P0 on the selected default product path, but the following P1/conditional work
+is not closed.
+
+| When | Items | Disposition |
+| --- | --- | --- |
+| Before the Reliable Local Agent alpha | `COMPOSE-LIFECYCLE-01`, `CONTEXT-IO-01`, `EFFECT-ACK-01` | Close the remaining startup type error, Context plan/I/O/commit race and durable ACK-debt lifecycle. These are correctness/safety exits, not product polish. |
+| Before the next formal M15 candidate | Applicable rows above plus `TOOL-MANIFEST-01`, or an exact selected-path exclusion | Record one clean local/Windows/Linux source and persist the evaluated tool-surface identity. A valid historical FAIL is never repaired in place. |
+| Only if service Context ships as V1 | `SIDECAR-ERROR-01` | Otherwise keep `--context=service` explicitly experimental and out of the supported product profile. |
+| Before long-horizon breadth, if measured | `FAILURE-SPILL-01`, `TOOL-CONTRACT-01` live acceptance | Activate spill work only if the bounded hot set overflows; use paired task evidence for tool-contract convergence. |
+| Before extension promotion or Self-Iteration | `CAP-OBS-01` residual | Retire legacy producer metadata only through the existing typed-facts migration; dynamic producers never mint trusted execution facts. |
+
+The current `b44ea44` GitHub run is also not a clean-source exit: Linux Clippy
+reported an unreaped descendant in the ignored Python probe fixture and skipped
+dependent tests. The bounded reaper correction is small, but it must pass the
+complete gate and new CI before it is recorded as closed baseline work. This
+test-harness correction is not an M15 candidate and does not change any frozen
+window.
+
 ## Continuation review verification — 2026-09-03 (`c823a1c`)
 
 The supplied continuation-review synopsis was independently checked against
@@ -216,7 +239,7 @@ artifact; without it the stderr retry line stays the human channel. The
 channel remains a best-effort diagnostic artifact, not durable formal
 evidence: a cell verdict never depends on it.
 
-### EVAL-PREFLIGHT-01 — one hermetic developer/evaluation gate runner (**closed on `1c94c31`: parse-first CLI `131c82f` + the `--doctor` gate runner, verified end-to-end 2026-09-03**)
+### EVAL-PREFLIGHT-01 — one hermetic developer/evaluation gate runner (**closed in two steps: base doctor on `1c94c31`; complete parse-first CLI and semantic Python/helper probes on `b44ea44`, with the current Linux fixture-reaper CI correction still awaiting a clean-source record**)
 
 Landed slice (2026-09-03, `131c82f`): `agent-eval` now parses and validates
 every global option (`--repeats`, `--evidence-dir`, `--include-swebench`,
@@ -2367,7 +2390,7 @@ All three landed in Execution Convergence V1 (see
 the second-round section below and to the closed archive. The remaining,
 narrower residuals are CAP-OBS-01 and CONV-03 there.
 
-### LONGTASK-03 — acknowledged checkpoints are not uniformly cold-restorable (reopened 2026-08-27)
+### LONGTASK-03 — acknowledged checkpoints are cold-restorable (closed 2026-08-28; historical record)
 
 Landed toward this fix 2026-08-27: automatic safe points, instance
 checkpoints and terminal completion share one assembler with the bounded
@@ -2403,7 +2426,7 @@ including the final artifact; stress `configured_retention_limit + 2`
 checkpoints and the byte ceiling without deleting the latest required, pinned
 or referenced recovery artifact.
 
-### LONGTASK-04 — resume durability watermark is not a snapshot fence (reopened 2026-08-27)
+### LONGTASK-04 — resume durability uses a snapshot fence (closed 2026-08-28; historical record)
 
 Landed toward this fix 2026-08-27: actor-owned monotonic snapshot sequences
 replace the anchor-aliased watermarks (`agent-runtime/src/actor/safepoint.rs`),

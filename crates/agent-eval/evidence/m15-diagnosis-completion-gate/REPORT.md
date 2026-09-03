@@ -43,6 +43,16 @@ had emitted `RunCompleted`. The successor implementation captures only the
 model future alive, shuts down the actor, and successfully reopens the same
 workspace (and its exclusive journal lock) before releasing the model.
 
+Classification clarification: the immutable cell's `dimensions.json` records
+`runtime_error_class: "runtime"`, `verdict: "fail"` and 0 NOT_RUN for the
+window. The phrases “harness storage coordination” and “harness failure” in
+the original interpretation below describe that the eval host exercised a
+fresh Runtime restore; they do **not** denote the frozen
+`harness_setup`/`harness_watchdog` class. The failure occurred inside the
+product Runtime/workspace lifecycle and therefore remains consistent with the
+mechanical valid-FAIL verdict. This clarification changes no cell artifact or
+window report.
+
 These are successor-source repairs only. No formal preflight or live cell was
 run, no historical artifact was regenerated, and this valid FAIL remains the
 decision for source `a6dc33e`. The original post-window interpretation is kept

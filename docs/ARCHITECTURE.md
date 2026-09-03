@@ -18,6 +18,59 @@ Primary hypothesis:
 
 The first version therefore prioritizes runtime/context boundaries over model features.
 
+## 1a. V1 product boundary
+
+The first shippable product is a **local, single-user coding Agent for one
+workspace**. “Agent OS” describes the long-term separation of authority and
+evolvable policy; it is not permission to make V1 a daemon, distributed
+scheduler, plugin marketplace or general planning system.
+
+The supported V1 flow is deliberately small:
+
+```text
+start
+  -> parse and validate product config
+  -> open workspace + journals
+  -> prepare and commit one trusted composition
+  -> start the sole RuntimeActor
+
+work
+  -> accept one user goal
+  -> materialize Context and freeze the round surface
+  -> model decision -> bounded tool/effect approval -> settlement
+  -> trusted verification -> explicit completion gate
+
+recover
+  -> discover a workspace-owned checkpoint artifact
+  -> load, checksum and compatibility validation
+  -> authority/effect reconciliation
+  -> explicit restore with no automatic model request
+
+inspect
+  -> bounded read model from Runtime events, task state, checkpoints and debt
+  -> TUI now; another host later only if a product need justifies it
+```
+
+No product host may bypass composition, call Context or tools as an authority,
+or reconstruct completion from display text. A status/read model is disposable
+and rebuildable; the TaskManager, journals and validated checkpoints remain the
+truth. A persistent Execution Chronicle is optional future work, not a V1
+precondition and never a second orchestrator.
+
+| Module group | Product responsibility |
+| --- | --- |
+| `agent-tui` | Human input, approval interaction and event-derived views. It owns no task/effect truth. |
+| `agent-compose` | Checked configuration and transactional construction/shutdown of one trusted runtime. It is a bootloader, not a scheduler. |
+| `agent-runtime` | The only task/turn loop, prompt assembly, tool-surface planning, safe points, completion and recovery coordination. |
+| `agent-core`, `agent-process`, `agent-workspace`, `agent-storage` | Approval/effect authority, process and path confinement, durable journals, output/artifact bounds and recovery fences. |
+| `context-simple` through `ContextEngine` | Replaceable bounded working set, externalization and recall. Selection and GC stay independent from product UI policy. |
+| `tool-runtime`, `provider-openai` | Bounded coding actions and one checked model transport profile; neither owns task or context lifecycle. |
+| `agent-replay`, `agent-eval` | Offline explanation and acceptance evidence. They observe the product; they never become production authority. |
+
+The supported profile and delivery exits live in
+[`ROADMAP.md`](ROADMAP.md#route-to-a-usable-local-agent). This architecture
+document defines ownership and boundaries only.
+
 ## 2. Layering
 
 The diagram combines the **landed PLAT-01 CorePort boundary**, **landed
@@ -550,7 +603,8 @@ Since V1-M9 the lifecycle contract is unified for builtin tools and dynamic
 capabilities under one catalog:
 
 - `catalog()` — every known tool (builtin + capability) with lifecycle state
-  and owner, for `capability.search` / `capability.inspect`;
+  and owner, exposed through the `search` / `inspect` operations of the merged
+  `capability.manage` control tool;
 - `load_tool(name)` / `unload_tool(name)` — host/operator persistent source:
   move exactly one tool on/off the model surface until explicit unload;
   loading one capability tool never surfaces its siblings and never grants
@@ -573,8 +627,8 @@ capabilities under one catalog:
   lifecycle shared by both planes: registered-but-not-loaded capability
   tools are `Available` and do not grow the prompt, the builtin catalog
   cools `Loaded -> Warm -> Unloaded` on idle ticks, and the unified control
-  tools (`capability.search/inspect/load/unload`, always visible) drive the
-  active set.
+  tool (`capability.manage`, always visible) drives search, inspection, load
+  and unload of the active set.
 
 #### TaskToolRequirements, typed roots and round surfaces
 
@@ -867,10 +921,10 @@ loaded/active tools appear in `specs()`. `specs()` is pure: the actor runs
 (start of the round, before the budget), so budget, prompt assembly and
 tool-call validation all observe one stable surface per round — a tool
 cannot age out from under the model between seeing its schema and calling
-it. The always-visible control
-tools `capability.search` / `capability.load` / `capability.unload` let
-the model discover and drive the lifecycle (load `git.status` when the
-task needs git). Execution of a catalog tool is always permitted — the
+it. The always-visible `capability.manage` control tool lets the model
+discover and drive the lifecycle through typed search, inspect, load and
+unload operations (for example, load `git.status` when the task needs git).
+Execution of a catalog tool is always permitted — the
 lifecycle gates the model surface, and the approval gate protects side
 effects.
 
@@ -1786,9 +1840,10 @@ Do not move Agent Kernel, tools, approvals, TUI, or provider code into ContextCo
 
 M12/M13 first cuts, HostToolPolicy, HostLifecycle, and the per-OS
 attestation matrix live in [`PLATFORM_SECURITY.md`](PLATFORM_SECURITY.md);
-both closed 2026-08-27 on clean-tree closure-audit evidence (see
-[`STATUS.md`](STATUS.md) and [`ROADMAP.md`](ROADMAP.md)). Do not reopen them
-from this section without new authority evidence.
+their mechanism evidence is banked, while closure claims remain suspended by
+the governing status (see [`STATUS.md`](STATUS.md) and
+[`ROADMAP.md`](ROADMAP.md)). This section defines the boundary only and does
+not close either milestone.
 
 A process capability is not sandboxed by *telling* the child what it may
 do — the manifest's `permissions` array is informational, not
@@ -2308,8 +2363,8 @@ extra scoring coefficient:
   `catalog_version` changes (register / activation / load / unload /
   active-marks / restore) — distinct from the audit `generation`, so a
   tool executing mid-round cannot churn the snapshot's audit identity. An
-  unchanged catalog answers `capability.search` without re-reading the
-  registry and re-cloning every tool description.
+  unchanged catalog answers a `capability.manage { op: "search" }` request
+  without re-reading the registry and re-cloning every tool description.
 
 ## 9h. Performance P2: scope tree index, top-K selection, typed edges, batched IO
 

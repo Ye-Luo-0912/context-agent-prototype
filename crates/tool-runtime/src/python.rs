@@ -565,7 +565,7 @@ mod tests {
                 // handler, so the child is reaped on a detached thread.
                 use std::os::unix::process::CommandExt;
                 descendant.process_group(0);
-                let child = descendant.spawn().unwrap();
+                let mut child = descendant.spawn().unwrap();
                 std::thread::spawn(move || {
                     let _ = child.wait();
                 });
