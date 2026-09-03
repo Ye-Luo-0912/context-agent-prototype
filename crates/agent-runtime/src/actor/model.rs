@@ -1701,7 +1701,9 @@ impl RuntimeActor {
                 .unwrap_or_else(|| {
                     // A durable stage whose basis drifted is stale; derive
                     // the current stage from readiness for this decision.
-                    let (_, rendered) = self.completion_repair_plan(&readiness);
+                    // A drifted basis is a fresh stage, so the refusal count
+                    // starts at zero.
+                    let (_, rendered) = self.completion_repair_plan(&readiness, 0);
                     rendered
                 });
             progress.completion_repair =

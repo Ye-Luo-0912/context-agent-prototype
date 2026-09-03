@@ -1252,6 +1252,20 @@ attempt-incident admission candidate (e897c5c)
      [DONE 2026-09-03: valid FAIL 10/12, 0 NOT_RUN, _windows/1788402676712]
   -> both candidates rejected; preserve the windows and return to bounded
      diagnosis (m15-diagnosis-attempt-incident/REPORT.md)
+completion-gate convergence candidate (selected 2026-09-03 by operator
+direction; the explicit recommendation of the diagnosis)
+  -> deterministic terminal-surface matrix: operator-only / no-resolver
+     refusals escalate to an explicit ordinary-final terminal stage after
+     consecutive identical-basis refusals, with deferred safe-point refusal
+     visible to the next model decision
+     [DONE: COMPLETION_REPAIR_TERMINAL_REFUSALS + terminal surface plan;
+      completion::operator_only_refusals_escalate_to_a_terminal_surface]
+  -> full local gate + recorded clean source + Ubuntu/Windows CI
+     [pending]
+  -> new exact-source/product M15 preflight
+     [pending]
+  -> at most one freshly predeclared formal 12-cell M15 window
+     [pending, operator-reviewed]
 ```
 
 The settlement candidate gate, if it is run again after deterministic fixes,

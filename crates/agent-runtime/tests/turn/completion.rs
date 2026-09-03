@@ -2269,6 +2269,160 @@ async fn consecutive_refusals_against_the_same_basis_accrue_durably() {
     instance.shutdown().await.unwrap();
 }
 
+/// Proposes completion four times in one turn against the unchanged
+/// operator-only task. Rounds 0-3 call `task.complete`; round 4 stops. The
+/// captured requests let the test prove the escalated terminal stage reaches
+/// the next model decision (deferred safe-point refusal visibility).
+#[derive(Debug)]
+struct TerminalRefusalModel {
+    rounds: AtomicUsize,
+    requests: Arc<std::sync::Mutex<Vec<String>>>,
+}
+
+#[async_trait::async_trait]
+impl ModelTransport for TerminalRefusalModel {
+    fn capabilities(&self) -> ModelCapabilities {
+        ModelCapabilities::default()
+    }
+
+    async fn complete(&self, request: ModelRequest) -> AgentResult<ModelOutput> {
+        self.requests.lock().unwrap().push(
+            request
+                .messages
+                .iter()
+                .map(|message| message.content.as_str())
+                .collect::<Vec<_>>()
+                .join("\n"),
+        );
+        let round = self.rounds.fetch_add(1, Ordering::SeqCst);
+        Ok(if round <= 3 {
+            ModelOutput {
+                content: String::new(),
+                tool_calls: vec![ToolCall {
+                    id: format!("completion-refusal-{round}"),
+                    name: "task.complete".into(),
+                    arguments: json!({"summary": "optimistic completion", "artifacts": []}),
+                }],
+                usage: Default::default(),
+            }
+        } else {
+            ModelOutput {
+                content: "continuing after the terminal refusal".into(),
+                tool_calls: Vec::new(),
+                usage: Default::default(),
+            }
+        })
+    }
+}
+
+#[tokio::test]
+async fn operator_only_refusals_escalate_to_a_terminal_surface() {
+    let requests = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let model = Arc::new(TerminalRefusalModel {
+        rounds: AtomicUsize::new(0),
+        requests: requests.clone(),
+    });
+    let services = RuntimeServices::new(
+        CoreAuthorityConfig::default(),
+        Arc::new(TestContextEngine),
+        model,
+        Arc::new(WithCompletionVerificationTools {
+            inner: CompletionToolDispatcher { workspace: None },
+        }),
+        Arc::new(PolicyApprovalGate::read_only()),
+        None,
+    );
+    let mut host = ModuleHost::new();
+    host.start().await.expect("test module host starts");
+    let instance = RuntimeInstance::spawn(host, services);
+    let handle = instance.handle();
+    let mut events = handle.subscribe();
+    handle.start().await.unwrap();
+    // No acceptance declaration: the task stays OperatorClosureOnly with no
+    // declared criteria, the exact shape of the diag fixture that previously
+    // looped on repeated task.complete refusals.
+    handle.user_message("try to finish".into()).await.unwrap();
+
+    let mut refusals = Vec::new();
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    while tokio::time::Instant::now() < deadline && refusals.len() < 4 {
+        if let Ok(Ok(envelope)) =
+            tokio::time::timeout(Duration::from_millis(50), events.recv()).await
+        {
+            match envelope.event {
+                RuntimeEvent::ToolFinished { output, .. }
+                    if output.tool_name == "task.complete" =>
+                {
+                    assert!(!output.ok, "the gate must refuse every proposal");
+                    refusals.push(output);
+                }
+                RuntimeEvent::TaskCompleted { .. } => {
+                    panic!("a refused completion proposal must not complete the task")
+                }
+                _ => {}
+            }
+        }
+    }
+    assert_eq!(
+        refusals.len(),
+        4,
+        "all four explicit completion proposals must be refused"
+    );
+
+    // The first two refusals stay on the ordinary operator-only stage.
+    for output in &refusals[..2] {
+        let step = &output.metadata["repair_plan"]["steps"][0];
+        assert_eq!(step["kind"], "operator_required");
+        assert_ne!(
+            step["terminal"], true,
+            "the first refusals are not terminal"
+        );
+    }
+    // The third and fourth cross the threshold and state the closure boundary
+    // explicitly: durable closure is not offered and the end is an ordinary
+    // final answer, not another task.complete proposal.
+    for output in &refusals[2..] {
+        let step = &output.metadata["repair_plan"]["steps"][0];
+        assert_eq!(step["kind"], "operator_required");
+        assert_eq!(step["terminal"], true);
+        assert_eq!(
+            step["terminal_surface"], "ordinary_final",
+            "durable closure is not offered; the correct end is an ordinary final answer"
+        );
+    }
+
+    // The durable record persists the fourth refusal with the escalated plan.
+    let checkpoint = instance.checkpoint().await.unwrap();
+    let active = checkpoint.tasks.active.expect("task stays active");
+    let record = checkpoint
+        .tasks
+        .tasks
+        .iter()
+        .find(|task| task.id == active)
+        .and_then(|task| task.resume.completion_repair.as_ref())
+        .expect("a refused completion must persist its repair stage");
+    assert_eq!(
+        record.refusal_count, 4,
+        "the fourth refusal must accrue on the same basis"
+    );
+    assert_eq!(record.plan["steps"][0]["terminal"], true);
+    assert_eq!(
+        record.plan["steps"][0]["terminal_surface"],
+        "ordinary_final"
+    );
+
+    // Deferred safe-point refusal visibility: the escalated stage reaches the
+    // next model decision in TASK PROGRESS, not only the tool metadata.
+    let captured = requests.lock().unwrap().clone();
+    assert!(
+        captured
+            .iter()
+            .any(|text| text.contains("operator_required/terminal")),
+        "the terminal stage must be visible to a following model decision"
+    );
+    instance.shutdown().await.unwrap();
+}
+
 // ---------------------------------------------------------------------------
 // Runtime-owned proof-refresh transaction: a task whose only remaining
 // completion blockers are proof-shaped (`VerificationNotCurrent` /

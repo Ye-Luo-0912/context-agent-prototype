@@ -1,7 +1,10 @@
 use super::*;
 
 use crate::execution::CompletionRepairRecord;
-use crate::task::{COMPLETION_REPAIR_VIEW_CHARS, MAX_COMPLETION_REPAIR_REFUSALS};
+use crate::task::{
+    COMPLETION_REPAIR_TERMINAL_REFUSALS, COMPLETION_REPAIR_VIEW_CHARS,
+    MAX_COMPLETION_REPAIR_REFUSALS,
+};
 
 impl RuntimeActor {
     /// Commit the turn start: user message into the long-term context, then
@@ -616,10 +619,37 @@ impl RuntimeActor {
                 .filter(|readiness| !readiness.allows_completion())
                 .map(CompletionReadiness::applicable_blockers)
                 .unwrap_or_default();
+            // Count only refusals recorded against exactly this basis; a
+            // drifted stage resets the count so a moved world never inherits
+            // terminal escalation it did not accumulate.
+            let prior_refusals = readiness
+                .as_ref()
+                .filter(|readiness| !readiness.allows_completion())
+                .and_then(|readiness| {
+                    let anchor_revision = readiness
+                        .task_state_basis
+                        .map(|basis| basis.anchor_revision);
+                    let verification = readiness.verification_basis;
+                    self.state
+                        .turn
+                        .as_ref()
+                        .and_then(|turn| turn.execution.completion_repair.as_ref())
+                        .filter(|record| {
+                            record.basis_anchor_revision == anchor_revision
+                                && record.basis_verification_revision
+                                    == verification.map(|basis| basis.verification_revision)
+                                && record.basis_directive_revision
+                                    == verification.map(|basis| basis.directive_revision)
+                                && record.basis_workspace_revision
+                                    == verification.map(|basis| basis.workspace_revision)
+                        })
+                        .map(|record| record.refusal_count)
+                })
+                .unwrap_or(0);
             let repair = readiness
                 .as_ref()
                 .filter(|readiness| !readiness.allows_completion())
-                .map(|readiness| self.completion_repair_plan(readiness));
+                .map(|readiness| self.completion_repair_plan(readiness, prior_refusals));
             // A gate refusal is durable: it must survive a checkpointed
             // safe point and a restart so the next decision resumes the same
             // basis-stamped stage instead of re-deriving it from scratch.
@@ -918,8 +948,16 @@ impl RuntimeActor {
     pub(super) fn completion_repair_plan(
         &self,
         readiness: &CompletionReadiness,
+        prior_refusals: u32,
     ) -> (serde_json::Value, String) {
         let blockers = readiness.applicable_blockers();
+        // Consecutive identical refusals against the same basis prove the
+        // model cannot resolve the stage; once the threshold is crossed the
+        // operator-only / no-resolver stage states the closure boundary
+        // explicitly instead of letting it be inferred from repeated
+        // identical refusals.
+        let terminal_refusal =
+            prior_refusals.saturating_add(1) >= COMPLETION_REPAIR_TERMINAL_REFUSALS;
         let basis = serde_json::json!({
             "task_anchor_revision": readiness
                 .task_state_basis
@@ -987,24 +1025,46 @@ impl RuntimeActor {
                 .any(|entry| entry.name == "task.manage");
 
         let (step, instruction) = if !operator_blockers.is_empty() {
-            (
-                serde_json::json!({
-                    "kind": "operator_required",
-                    "blockers": operator_blockers,
-                }),
-                "operator_required: Runtime/authority state has no safe model-owned resolver; do not retry task.complete unchanged."
-                    .into(),
-            )
+            let mut step = serde_json::json!({
+                "kind": "operator_required",
+                "blockers": operator_blockers,
+            });
+            if terminal_refusal {
+                step["terminal"] = serde_json::json!(true);
+                step["terminal_surface"] = serde_json::json!("ordinary_final");
+                (
+                    step,
+                    "operator_required/terminal: durable closure is not offered on this model surface and Runtime has no safe model-owned resolver for the current blockers. Do not call task.complete again: repeated proposals are refused and cannot converge. If the requested work is done, end the turn with an ordinary final answer; otherwise finish the remaining work and then end with an ordinary final answer."
+                        .into(),
+                )
+            } else {
+                (
+                    step,
+                    "operator_required: Runtime/authority state has no safe model-owned resolver; do not retry task.complete unchanged."
+                        .into(),
+                )
+            }
         } else if progress_blocked && !task_manage_available {
-            (
-                serde_json::json!({
-                    "kind": "operator_required",
-                    "reason": "task_progress_resolver_unavailable",
-                    "blockers": blockers,
-                }),
-                "operator_required: task progress blocks completion but task.manage is not present in the current host catalog."
-                    .into(),
-            )
+            let mut step = serde_json::json!({
+                "kind": "operator_required",
+                "reason": "task_progress_resolver_unavailable",
+                "blockers": blockers,
+            });
+            if terminal_refusal {
+                step["terminal"] = serde_json::json!(true);
+                step["terminal_surface"] = serde_json::json!("ordinary_final");
+                (
+                    step,
+                    "operator_required/terminal: durable closure is not offered on this model surface and task.manage is not present in the current host catalog. Do not call task.complete again; end the turn with an ordinary final answer once the work is done."
+                        .into(),
+                )
+            } else {
+                (
+                    step,
+                    "operator_required: task progress blocks completion but task.manage is not present in the current host catalog."
+                        .into(),
+                )
+            }
         } else if progress_blocked {
             let anchor_revision = readiness
                 .task_state_basis
@@ -1073,16 +1133,27 @@ impl RuntimeActor {
                     ),
                 )
             } else {
-                (
-                    serde_json::json!({
-                        "kind": "operator_required",
-                        "reason": "no_current_exact_verification_route",
-                        "blockers": blockers,
-                        "criterion_details": criterion_details,
-                    }),
-                    "operator_required: Runtime cannot prove a current exact recipe_id for the uncovered verification domain; do not invent coverage_domain as a verify.run argument."
-                        .into(),
-                )
+                let mut step = serde_json::json!({
+                    "kind": "operator_required",
+                    "reason": "no_current_exact_verification_route",
+                    "blockers": blockers,
+                    "criterion_details": criterion_details,
+                });
+                if terminal_refusal {
+                    step["terminal"] = serde_json::json!(true);
+                    step["terminal_surface"] = serde_json::json!("ordinary_final");
+                    (
+                        step,
+                        "operator_required/terminal: durable closure is not offered on this model surface and Runtime cannot prove a current exact recipe_id for the uncovered verification domain. Do not call task.complete again; do not invent coverage_domain as a verify.run argument. End the turn with an ordinary final answer once the work is done."
+                            .into(),
+                    )
+                } else {
+                    (
+                        step,
+                        "operator_required: Runtime cannot prove a current exact recipe_id for the uncovered verification domain; do not invent coverage_domain as a verify.run argument."
+                            .into(),
+                    )
+                }
             }
         } else {
             (

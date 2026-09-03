@@ -1577,6 +1577,26 @@ order is:
   returns to diagnosis; the window is not rerun. Post-window diagnosis at
   [`crates/agent-eval/evidence/m15-diagnosis-attempt-incident/REPORT.md`](../crates/agent-eval/evidence/m15-diagnosis-attempt-incident/REPORT.md).
   M15 remains open; candidate selection is a user decision.
+- The next bounded candidate, **completion-gate convergence**, was selected
+  2026-09-03 by operator direction as the explicit recommendation of that
+  diagnosis: both failing cells were completion-gate compliance tails on
+  functionally-correct workspaces, and the diagnosis names how the model
+  converts the basis-stamped repair stage into a converging tail. Core
+  change (deterministic, no completion semantics change): a refused
+  `task.complete` whose repair stage has no safe model-owned resolver
+  (`operator_required`, including the operator-only diag fixture shape)
+  escalates to an explicit **terminal** stage after
+  `COMPLETION_REPAIR_TERMINAL_REFUSALS` consecutive refusals against the
+  same basis — structured `terminal: true` /
+  `terminal_surface: "ordinary_final"` plus a bounded instruction that stops
+  re-proposing `task.complete` and ends with an ordinary final answer once
+  the work is done. The escalated stage is durable (basis-stamped
+  `CompletionRepairRecord`), visible to the next model decision, and resets
+  when the basis moves. Matched pending gates: deterministic matrix
+  (landed, `operator_only_refusals_escalate_to_a_terminal_surface`), full
+  local gate + recorded clean source + dual-platform CI, then at most one
+  fresh exact-source preflight and at most one predeclared 12-cell window
+  (operator-reviewed).
 
 **Workload disposition (2026-09-03; documentation only):** the proposed
 "one-stop reliability" umbrella is a **large, multi-slice effort**, not one

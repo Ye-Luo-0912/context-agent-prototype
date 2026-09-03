@@ -687,6 +687,14 @@ pub(crate) const COMPLETION_REPAIR_VIEW_CHARS: usize = 768;
 /// Cap on consecutive refusals recorded against one repair basis.
 pub(crate) const MAX_COMPLETION_REPAIR_REFUSALS: u32 = 64;
 
+/// Consecutive refusals against one basis after which an operator-only /
+/// no-resolver repair stage turns terminal: durable closure is not offered
+/// to the model surface and the correct end is an ordinary final answer.
+/// This is a mechanism boundary, not a prompt pressure: it only states the
+/// already-derived closure capability instead of letting the model infer it
+/// from repeated identical refusals.
+pub(crate) const COMPLETION_REPAIR_TERMINAL_REFUSALS: u32 = 3;
+
 impl CompletionReadiness {
     pub fn allows_completion(&self) -> bool {
         self.commit_safe
