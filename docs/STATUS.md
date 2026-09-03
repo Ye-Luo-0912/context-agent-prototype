@@ -1490,7 +1490,8 @@ candidate**, not another prompt tweak or an immediate rerun. The repaired-source
    debt-opening rows, checkpoint round trip, contract enum coverage; full
    all-target workspace suite and strict Clippy pass), and `EVAL-PREFLIGHT-01`
    closed the same day with `agent-eval --doctor` green end-to-end; the
-   recorded clean source plus dual-platform CI is the remaining half;
+   recorded clean source is `03bc6d5` with dual-platform CI green
+   (run `33703472111`, 2026-09-03);
 5. run the same-checkpoint causal fork only if settlement projection changes,
    then one fresh exact-source product preflight and at most one freshly
    predeclared M15 window.
