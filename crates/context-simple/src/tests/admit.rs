@@ -784,8 +784,10 @@ async fn reconcile_store_converges_a_crash_injected_directory() {
 /// The operation gate serializes the multi-phase/whole-state operations.
 /// While the gate is held — exactly as when a sibling operation is
 /// mid-flight between its plan and its commit — a GC, storage GC, store
-/// reconcile, checkpoint or restore must block. Releasing the gate lets
-/// every one of them run to completion. Without the gate a restore could
+/// reconcile, materialization, state-changing retrieval, ingress,
+/// maintenance, scope mutation, ledger export, checkpoint or restore must
+/// block. Releasing the gate lets every one of them run to completion.
+/// Without the gate a restore could
 /// replace the whole state between a GC's plan and its commit, and the
 /// stale plan would land on top of the restored state.
 #[tokio::test]
@@ -814,6 +816,74 @@ async fn multi_phase_operations_are_serialized_by_the_operation_gate() {
         let engine = Arc::clone(&engine);
         tokio::spawn(async move { engine.reconcile_store().await })
     };
+    let materialize = {
+        let engine = Arc::clone(&engine);
+        tokio::spawn(async move {
+            engine
+                .materialize(ContextQuery {
+                    current_input: "operation gate regression".into(),
+                    budget_tokens: 1_000,
+                    hints: ContextHints::default(),
+                })
+                .await
+        })
+    };
+    let admit = {
+        let engine = Arc::clone(&engine);
+        tokio::spawn(async move {
+            engine
+                .ingest(ContextIngress::ContextDirective {
+                    action: ContextAction::Admit {
+                        item_id: ContextItemId::new(),
+                        reason: "operation gate regression".into(),
+                    },
+                })
+                .await
+        })
+    };
+    let ingest = {
+        let engine = Arc::clone(&engine);
+        tokio::spawn(async move {
+            engine
+                .ingest(ContextIngress::AssistantMessage {
+                    content: "operation gate regression".into(),
+                })
+                .await
+        })
+    };
+    let maintain = {
+        let engine = Arc::clone(&engine);
+        tokio::spawn(async move { engine.maintain(ContextMaintenanceTrigger::AfterModel).await })
+    };
+    let fetch = {
+        let engine = Arc::clone(&engine);
+        tokio::spawn(async move { engine.fetch_external(ContextItemId::new()).await })
+    };
+    let search = {
+        let engine = Arc::clone(&engine);
+        tokio::spawn(async move {
+            engine
+                .search_external(ContextSearchQuery::new(String::new(), 1))
+                .await
+        })
+    };
+    let inspect = {
+        let engine = Arc::clone(&engine);
+        tokio::spawn(async move { engine.inspect_external(ContextItemId::new()).await })
+    };
+    let open_scope = {
+        let engine = Arc::clone(&engine);
+        tokio::spawn(async move { engine.open_scope(ScopeKind::Tool, None).await })
+    };
+    let close_scope = {
+        let engine = Arc::clone(&engine);
+        tokio::spawn(async move { engine.close_scope(ScopeId::new()).await })
+    };
+    let export = {
+        let engine = Arc::clone(&engine);
+        let path = dir.path().join("operation-gate-ledger.jsonl");
+        tokio::spawn(async move { engine.export_ledger(&path).await })
+    };
     let checkpoint = {
         let engine = Arc::clone(&engine);
         tokio::spawn(async move { engine.checkpoint().await })
@@ -824,7 +894,7 @@ async fn multi_phase_operations_are_serialized_by_the_operation_gate() {
         tokio::spawn(async move { engine.restore(checkpoint).await })
     };
 
-    // None of the five may complete while the gate is held.
+    // None may complete while the gate is held.
     tokio::time::sleep(std::time::Duration::from_millis(100)).await;
     assert!(!gc.is_finished(), "gc must wait for the operation gate");
     assert!(
@@ -834,6 +904,46 @@ async fn multi_phase_operations_are_serialized_by_the_operation_gate() {
     assert!(
         !reconcile.is_finished(),
         "store reconcile must wait for the operation gate"
+    );
+    assert!(
+        !materialize.is_finished(),
+        "materialize must wait for the operation gate"
+    );
+    assert!(
+        !admit.is_finished(),
+        "Admit must wait for the operation gate"
+    );
+    assert!(
+        !ingest.is_finished(),
+        "ingest must wait for the operation gate"
+    );
+    assert!(
+        !maintain.is_finished(),
+        "maintenance must wait for the operation gate"
+    );
+    assert!(
+        !fetch.is_finished(),
+        "Fetch must wait for the operation gate"
+    );
+    assert!(
+        !search.is_finished(),
+        "search must wait for the operation gate"
+    );
+    assert!(
+        !inspect.is_finished(),
+        "state-changing inspect must wait for the operation gate"
+    );
+    assert!(
+        !open_scope.is_finished(),
+        "scope open must wait for the operation gate"
+    );
+    assert!(
+        !close_scope.is_finished(),
+        "scope close must wait for the operation gate"
+    );
+    assert!(
+        !export.is_finished(),
+        "ledger export must wait for the operation gate"
     );
     assert!(
         !checkpoint.is_finished(),
@@ -848,8 +958,79 @@ async fn multi_phase_operations_are_serialized_by_the_operation_gate() {
     gc.await.unwrap().unwrap();
     storage_gc.await.unwrap().unwrap();
     reconcile.await.unwrap().unwrap();
+    materialize.await.unwrap().unwrap();
+    admit.await.unwrap().unwrap();
+    ingest.await.unwrap().unwrap();
+    maintain.await.unwrap().unwrap();
+    fetch.await.unwrap().unwrap();
+    search.await.unwrap().unwrap();
+    inspect.await.unwrap().unwrap();
+    open_scope.await.unwrap().unwrap();
+    close_scope.await.unwrap().unwrap();
+    export.await.unwrap().unwrap();
     checkpoint.await.unwrap().unwrap();
     restore.await.unwrap().unwrap();
+}
+
+#[tokio::test]
+async fn concurrent_gc_and_external_admit_keep_exactly_one_owner() {
+    let dir = tempfile::tempdir().unwrap();
+    let engine = Arc::new(SimpleContextEngine::new(SimpleContextConfig {
+        context_store_dir: Some(dir.path().to_path_buf()),
+        ..SimpleContextConfig::default()
+    }));
+    let item_id = {
+        let mut state = engine.state.lock().await;
+        let mut item = crate::item::make_item(
+            &state,
+            &engine.config,
+            "ConcurrentOwner.rs durable outcome".into(),
+            ContextKind::Decision,
+            ContextScope::Task,
+            ContextRetention::Durable,
+            0.8,
+            None,
+        );
+        item.entities = crate::index::entity::extract_entities(&item.content);
+        let reference = crate::store::externalize(dir.path(), &item).unwrap();
+        state.external.push(crate::store::to_external_entry(
+            &item, reference, 1, 1, None,
+        ));
+        item.id
+    };
+
+    let gate = engine.op_gate.lock().await;
+    let admit = {
+        let engine = Arc::clone(&engine);
+        tokio::spawn(async move {
+            engine
+                .ingest(ContextIngress::ContextDirective {
+                    action: ContextAction::Admit {
+                        item_id,
+                        reason: "concurrent owner regression".into(),
+                    },
+                })
+                .await
+        })
+    };
+    let gc = {
+        let engine = Arc::clone(&engine);
+        tokio::spawn(async move { engine.gc().await })
+    };
+    tokio::task::yield_now().await;
+    assert!(!admit.is_finished() && !gc.is_finished());
+    drop(gate);
+    admit.await.unwrap().unwrap();
+    gc.await.unwrap().unwrap();
+
+    let state = engine.state.lock().await;
+    let owners = usize::from(state.items.iter().any(|item| item.id == item_id))
+        + usize::from(state.eviction_buffer.iter().any(|item| item.id == item_id))
+        + usize::from(state.external.get(item_id).is_some());
+    assert_eq!(
+        owners, 1,
+        "GC recall and Admit must never duplicate or lose one context identity"
+    );
 }
 
 /// A checkpoint that violates the structural invariants must be refused on

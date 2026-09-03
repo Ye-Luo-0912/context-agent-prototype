@@ -14,10 +14,11 @@ use std::sync::Arc;
 use agent_contracts::{
     AgentError, AgentResult, ApprovalGate, ArgumentDigest, AuthorityCheckpointMarker,
     AuthorityLease, AuthorityRecoveryStatus, CancellationToken, ContextConsumptionAck,
-    ContextEngine, Effect, EffectAckDebt, EffectId, EffectReceipt, EffectReconciler, EngineQuery,
-    EventJournal, OperationId, OperationQueryResult, OperationSnapshot, OperationState,
-    OperationTerminal, RunId, RuntimeEvent, RuntimeEventEnvelope, TaskId, ToolCall, ToolDispatcher,
-    ToolOperationIdentity, ToolOutcome, ToolOutput, ToolSpec, ToolSurfaceSnapshot, TurnId,
+    ContextEngine, Effect, EffectAckDebt, EffectId, EffectReceipt, EffectReconciler,
+    EffectReconciliation, EngineQuery, EventJournal, OperationId, OperationQueryResult,
+    OperationSnapshot, OperationState, OperationTerminal, RunId, RuntimeEvent,
+    RuntimeEventEnvelope, TaskId, ToolCall, ToolDispatcher, ToolOperationIdentity, ToolOutcome,
+    ToolOutput, ToolSpec, ToolSurfaceSnapshot, TurnId,
 };
 use async_trait::async_trait;
 use tokio::sync::broadcast;
@@ -263,6 +264,16 @@ pub trait EffectBroker: Send + Sync {
     ) -> AgentResult<Option<agent_contracts::EffectReconciliation>> {
         Ok(None)
     }
+
+    /// 按效果身份直接分类持久预留，供运行时恢复持久化的 ACK 债务。
+    /// 调用方（恢复出的债务）只携带效果身份，没有派发时快照，因此
+    /// 实现不做快照漂移检查；None = 本经纪没有该效果的预留记录。
+    fn reconcile_effect_id(
+        &self,
+        _effect_id: &EffectId,
+    ) -> AgentResult<Option<agent_contracts::EffectReconciliation>> {
+        Ok(None)
+    }
 }
 
 /// The default in-process broker: reserve derives a bounded id from the
@@ -396,6 +407,16 @@ pub trait CorePort: Send + Sync {
 
     fn recovery_status(&self) -> AuthorityRecoveryStatus;
 
+    /// Reconcile one persisted effect-ack debt against the broker's durable
+    /// reservation record, classified by the debt's effect identity.
+    /// `None` means no composition-side reservation surface could answer
+    /// (the default in-process composition); the caller keeps the debt
+    /// unresolved and stays fenced.
+    fn reconcile_effect(&self, _debt: &EffectAckDebt) -> AgentResult<Option<EffectReconciliation>> {
+        let _ = _debt;
+        Ok(None)
+    }
+
     /// Read-only reference to the current durable Core authority truth.
     /// `None` means this composition has no persistent operation journal.
     fn authority_checkpoint_marker(&self) -> AgentResult<Option<AuthorityCheckpointMarker>>;
@@ -517,6 +538,10 @@ impl CorePort for CoreAuthority {
 
     fn recovery_status(&self) -> AuthorityRecoveryStatus {
         CoreAuthority::recovery_status(self)
+    }
+
+    fn reconcile_effect(&self, debt: &EffectAckDebt) -> AgentResult<Option<EffectReconciliation>> {
+        CoreAuthority::reconcile_effect(self, debt)
     }
 
     fn authority_checkpoint_marker(&self) -> AgentResult<Option<AuthorityCheckpointMarker>> {

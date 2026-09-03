@@ -1189,7 +1189,7 @@ async fn open_loop_blocks_candidate_even_with_full_coverage() {
 }
 
 #[tokio::test]
-async fn next_action_blocks_candidate_even_with_full_coverage() {
+async fn next_action_is_advisory_when_authority_and_evidence_are_complete() {
     let dir = tempfile::tempdir().unwrap();
     let (instance, collector) = settlement_instance(
         dir.path(),
@@ -1216,8 +1216,8 @@ async fn next_action_blocks_candidate_even_with_full_coverage() {
     let events = user_turn(&instance, collector).await;
     let labels = settlement_labels(&events);
     assert!(
-        !labels.contains(&SettlementLabel::SettledCandidate),
-        "a non-empty next action must block the candidate: {labels:?}"
+        labels.contains(&SettlementLabel::SettledCandidate),
+        "model-owned next-action guidance must not self-deadlock a fully covered task: {labels:?}"
     );
     instance.shutdown().await.unwrap();
 }

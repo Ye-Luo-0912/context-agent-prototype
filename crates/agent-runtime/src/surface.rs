@@ -247,6 +247,48 @@ impl RoundSurfacePlan {
         }
     }
 
+    /// Convert this decision into a text-only completion finalization round.
+    /// This is not budget degradation and does not unload any tool: Runtime
+    /// has closed the bounded repair episode and is asking for an ordinary
+    /// final answer. Every removed schema remains visible in the audit report
+    /// with its original demand and authority origin.
+    pub(crate) fn force_completion_finalization(&mut self) {
+        let specs = std::mem::take(&mut self.specs);
+        // The omission sample may already be full from earlier budget
+        // decisions. Reserve one diagnostic slot so a text-only surface can
+        // never lose the reason it became text-only; exact totals are kept
+        // independently and remain unchanged by replacing a sample row.
+        if !specs.is_empty() && self.omissions.len() >= MAX_SNAPSHOT_OMISSIONS {
+            self.omissions.pop();
+        }
+        for spec in specs {
+            let approx_tokens = approx_layer_tokens(&spec);
+            let demand = self
+                .demands
+                .get(&spec.name)
+                .copied()
+                .unwrap_or(ToolSurfaceDemand::PreferSurface);
+            let origin = self
+                .origins
+                .get(&spec.name)
+                .copied()
+                .unwrap_or(ToolSurfaceOrigin::Unknown);
+            push_omission(
+                &mut self.omissions,
+                &mut self.omitted_total,
+                ToolSurfaceOmission {
+                    tool_name: spec.name,
+                    demand,
+                    origin,
+                    reason: ToolSurfaceOmissionReason::CompletionFinalization,
+                    approx_tokens,
+                },
+            );
+        }
+        self.mandatory.clear();
+        self.task_preferred.clear();
+    }
+
     /// Final provider-window degradation: remove only a non-mandatory entry
     /// from this local plan. Catalog lifecycle and generation are unreachable.
     pub(crate) fn omit_largest_for_provider_budget(&mut self) -> Option<ToolSpec> {
@@ -296,6 +338,12 @@ impl RoundSurfacePlan {
             .iter()
             .filter(|spec| self.mandatory.contains(&spec.name))
             .collect();
+        // A text-only plan carries no schema cost at all: the empty-vector
+        // JSON wrapper is an artifact of the approximation, not a token the
+        // provider will bill for mandatory schemas.
+        if specs.is_empty() {
+            return 0;
+        }
         approx_layer_tokens(&specs)
     }
 
@@ -573,6 +621,56 @@ mod tests {
         assert_eq!(second.name, "a.optional");
         assert!(plan.omit_largest_for_provider_budget().is_none());
         assert_eq!(plan.specs()[0].name, "must");
+    }
+
+    #[test]
+    fn completion_finalization_is_a_text_only_audited_surface() {
+        let candidates = ToolSurfaceSnapshot {
+            specs: vec![spec("task.complete", 10), spec("edit.patch", 10)],
+            ..Default::default()
+        };
+        let requirements = vec![requirement("task.complete", ToolSurfaceDemand::MustSurface)];
+        let mut plan = RoundSurfacePlan::build(candidates, &requirements, |_| false);
+        plan.force_completion_finalization();
+
+        assert!(plan.specs().is_empty());
+        assert_eq!(plan.omitted_total, 2);
+        assert!(
+            plan.omissions
+                .iter()
+                .all(|row| { row.reason == ToolSurfaceOmissionReason::CompletionFinalization })
+        );
+        assert!(plan.omissions.iter().any(|row| {
+            row.tool_name == "task.complete" && row.demand == ToolSurfaceDemand::MustSurface
+        }));
+    }
+
+    #[test]
+    fn completion_finalization_keeps_a_reason_when_the_sample_is_full() {
+        let candidates = ToolSurfaceSnapshot {
+            specs: vec![spec("task.complete", 10)],
+            omissions: (0..MAX_SNAPSHOT_OMISSIONS)
+                .map(|index| ToolSurfaceOmission {
+                    tool_name: format!("old.{index}"),
+                    demand: ToolSurfaceDemand::PreferSurface,
+                    origin: ToolSurfaceOrigin::CatalogLoadedOptional,
+                    reason: ToolSurfaceOmissionReason::SchemaBudget,
+                    approx_tokens: 10,
+                })
+                .collect(),
+            omitted_total: MAX_SNAPSHOT_OMISSIONS,
+            ..Default::default()
+        };
+        let requirements = vec![requirement("task.complete", ToolSurfaceDemand::MustSurface)];
+        let mut plan = RoundSurfacePlan::build(candidates, &requirements, |_| false);
+        plan.force_completion_finalization();
+
+        assert!(plan.specs().is_empty());
+        assert_eq!(plan.omitted_total, MAX_SNAPSHOT_OMISSIONS + 1);
+        assert!(plan.omissions.iter().any(|row| {
+            row.reason == ToolSurfaceOmissionReason::CompletionFinalization
+                && row.tool_name == "task.complete"
+        }));
     }
 
     #[test]

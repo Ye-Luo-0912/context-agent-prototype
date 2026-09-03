@@ -405,6 +405,59 @@ impl ToolDispatcher for CompletionToolDispatcher {
     }
 }
 
+#[derive(Debug)]
+struct CompletionProgressDispatcher {
+    inner: CompletionToolDispatcher,
+}
+
+#[async_trait::async_trait]
+impl ToolDispatcher for CompletionProgressDispatcher {
+    fn specs(&self) -> Vec<ToolSpec> {
+        let mut specs = self.inner.specs();
+        specs.push(ToolSpec {
+            name: "task.manage".into(),
+            description: "update task progress".into(),
+            input_schema: json!({"type": "object"}),
+            risk: ToolRisk::ReadOnly,
+            output_budget: None,
+            roles: Vec::new(),
+        });
+        specs
+    }
+
+    async fn execute(&self, request: ToolExecutionRequest) -> AgentResult<ToolOutcome> {
+        if request.call.name != "task.manage" {
+            return self.inner.execute(request).await;
+        }
+        let base_anchor_revision = request.call.arguments["base_anchor_revision"]
+            .as_u64()
+            .unwrap_or_default();
+        let current_interpretation = request.call.arguments["current_interpretation"]
+            .as_str()
+            .map(str::to_string);
+        Ok(ToolOutcome::RuntimeDirective {
+            output: ToolOutput {
+                call_id: request.call.id,
+                tool_name: request.call.name,
+                ok: true,
+                summary: "progress proposed".into(),
+                model_content: String::new(),
+                artifact_ref: None,
+                metadata: json!({}),
+            },
+            directive: agent_contracts::RuntimeDirective::UpdateTaskProgress(
+                agent_contracts::TaskProgressProposal {
+                    base_anchor_revision,
+                    current_interpretation,
+                    plan_progress: None,
+                    open_loops: None,
+                    next_action: None,
+                },
+            ),
+        })
+    }
+}
+
 async fn run_model_visible_completion_refusal(
     declare_evidence_policy: bool,
 ) -> (
@@ -617,10 +670,10 @@ async fn task_complete_without_evidence_policy_returns_a_model_visible_refusal()
             .contains("acceptance_undeclared")
     );
     assert!(output.model_content.contains("was not accepted by Runtime"));
-    assert!(output.model_content.contains("completion_repair/v1"));
+    assert!(output.model_content.contains("completion_repair/v2"));
     assert_eq!(
         output.metadata["repair_plan"]["schema"],
-        "completion-repair.v1"
+        "completion-repair.v2"
     );
     assert_eq!(
         output.metadata["repair_plan"]["steps"][0]["kind"],
@@ -634,7 +687,7 @@ async fn task_complete_without_evidence_policy_returns_a_model_visible_refusal()
     );
     assert!(
         requests.get(1).is_some_and(|request| {
-            request.contains("completion_repair/v1 basis")
+            request.contains("completion_repair/v2 basis")
                 && request.contains("TASK PROGRESS")
                 && request.contains("operator_required")
         }),
@@ -2144,7 +2197,7 @@ async fn refusal_persists_a_durable_repair_record_with_criterion_details() {
         .expect("a refused completion must persist its repair stage");
     assert_eq!(record.refusal_count, 1);
     assert!(record.basis_anchor_revision.is_some());
-    assert_eq!(record.plan["schema"], "completion-repair.v1");
+    assert_eq!(record.plan["schema"], "completion-repair.v2");
     assert_eq!(record.plan["steps"][0]["kind"], "operator_required");
     assert_eq!(
         record.plan["steps"][0]["criterion_details"][0]["coverage_domain"],
@@ -2265,14 +2318,13 @@ async fn consecutive_refusals_against_the_same_basis_accrue_durably() {
         record.refusal_count, 2,
         "consecutive refusals against the same basis must accrue"
     );
-    assert_eq!(record.plan["schema"], "completion-repair.v1");
+    assert_eq!(record.plan["schema"], "completion-repair.v2");
     instance.shutdown().await.unwrap();
 }
 
-/// Proposes completion four times in one turn against the unchanged
-/// operator-only task. Rounds 0-3 call `task.complete`; round 4 stops. The
-/// captured requests let the test prove the escalated terminal stage reaches
-/// the next model decision (deferred safe-point refusal visibility).
+/// Repeats completion until Runtime moves the repair episode onto its
+/// text-only terminal phase. The model follows the captured schema surface:
+/// an empty tool list produces an ordinary final answer.
 #[derive(Debug)]
 struct TerminalRefusalModel {
     rounds: AtomicUsize,
@@ -2286,6 +2338,7 @@ impl ModelTransport for TerminalRefusalModel {
     }
 
     async fn complete(&self, request: ModelRequest) -> AgentResult<ModelOutput> {
+        let text_only = request.tools.is_empty();
         self.requests.lock().unwrap().push(
             request
                 .messages
@@ -2295,7 +2348,13 @@ impl ModelTransport for TerminalRefusalModel {
                 .join("\n"),
         );
         let round = self.rounds.fetch_add(1, Ordering::SeqCst);
-        Ok(if round <= 3 {
+        Ok(if text_only {
+            ModelOutput {
+                content: "completion remains operator-owned; ending this turn".into(),
+                tool_calls: Vec::new(),
+                usage: Default::default(),
+            }
+        } else if matches!(round, 0 | 2 | 4) {
             ModelOutput {
                 content: String::new(),
                 tool_calls: vec![ToolCall {
@@ -2305,9 +2364,23 @@ impl ModelTransport for TerminalRefusalModel {
                 }],
                 usage: Default::default(),
             }
+        } else if matches!(round, 1 | 3) {
+            let base_anchor_revision = if round == 1 { 0 } else { 1 };
+            ModelOutput {
+                content: String::new(),
+                tool_calls: vec![ToolCall {
+                    id: format!("progress-churn-{round}"),
+                    name: "task.manage".into(),
+                    arguments: json!({
+                        "base_anchor_revision": base_anchor_revision,
+                        "current_interpretation": format!("same unfinished authority, wording {round}"),
+                    }),
+                }],
+                usage: Default::default(),
+            }
         } else {
             ModelOutput {
-                content: "continuing after the terminal refusal".into(),
+                content: "unexpected non-terminal continuation".into(),
                 tool_calls: Vec::new(),
                 usage: Default::default(),
             }
@@ -2327,7 +2400,9 @@ async fn operator_only_refusals_escalate_to_a_terminal_surface() {
         Arc::new(TestContextEngine),
         model,
         Arc::new(WithCompletionVerificationTools {
-            inner: CompletionToolDispatcher { workspace: None },
+            inner: CompletionProgressDispatcher {
+                inner: CompletionToolDispatcher { workspace: None },
+            },
         }),
         Arc::new(PolicyApprovalGate::read_only()),
         None,
@@ -2341,11 +2416,18 @@ async fn operator_only_refusals_escalate_to_a_terminal_surface() {
     // No acceptance declaration: the task stays OperatorClosureOnly with no
     // declared criteria, the exact shape of the diag fixture that previously
     // looped on repeated task.complete refusals.
+    handle
+        .set_focus("operator-owned completion".into())
+        .await
+        .unwrap();
     handle.user_message("try to finish".into()).await.unwrap();
 
     let mut refusals = Vec::new();
+    let mut assistant_final = None;
+    let mut turn_completed = false;
+    let mut task_completed = false;
     let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
-    while tokio::time::Instant::now() < deadline && refusals.len() < 4 {
+    while tokio::time::Instant::now() < deadline && !turn_completed {
         if let Ok(Ok(envelope)) =
             tokio::time::timeout(Duration::from_millis(50), events.recv()).await
         {
@@ -2357,16 +2439,18 @@ async fn operator_only_refusals_escalate_to_a_terminal_surface() {
                     refusals.push(output);
                 }
                 RuntimeEvent::TaskCompleted { .. } => {
-                    panic!("a refused completion proposal must not complete the task")
+                    task_completed = true;
                 }
+                RuntimeEvent::AssistantMessage { content } => assistant_final = Some(content),
+                RuntimeEvent::TurnCompleted => turn_completed = true,
                 _ => {}
             }
         }
     }
     assert_eq!(
         refusals.len(),
-        4,
-        "all four explicit completion proposals must be refused"
+        3,
+        "the third unchanged refusal must enter finalization before another tool call"
     );
 
     // The first two refusals stay on the ordinary operator-only stage.
@@ -2378,20 +2462,21 @@ async fn operator_only_refusals_escalate_to_a_terminal_surface() {
             "the first refusals are not terminal"
         );
     }
-    // The third and fourth cross the threshold and state the closure boundary
-    // explicitly: durable closure is not offered and the end is an ordinary
-    // final answer, not another task.complete proposal.
-    for output in &refusals[2..] {
-        let step = &output.metadata["repair_plan"]["steps"][0];
-        assert_eq!(step["kind"], "operator_required");
-        assert_eq!(step["terminal"], true);
-        assert_eq!(
-            step["terminal_surface"], "ordinary_final",
-            "durable closure is not offered; the correct end is an ordinary final answer"
-        );
-    }
+    // The third refusal closes the semantic repair episode. The following
+    // model request receives no tools and therefore cannot repeat the call.
+    let step = &refusals[2].metadata["repair_plan"]["steps"][0];
+    assert_eq!(step["kind"], "repair_stalled");
+    assert_eq!(step["terminal"], true);
+    assert_eq!(step["terminal_surface"], "ordinary_final");
+    assert!(turn_completed);
+    assert!(!task_completed, "ordinary final must not complete the task");
+    assert_eq!(
+        assistant_final.as_deref(),
+        Some("completion remains operator-owned; ending this turn")
+    );
 
-    // The durable record persists the fourth refusal with the escalated plan.
+    // The durable record persists the terminal episode while the task remains
+    // active for an operator or a later user directive.
     let checkpoint = instance.checkpoint().await.unwrap();
     let active = checkpoint.tasks.active.expect("task stays active");
     let record = checkpoint
@@ -2402,9 +2487,10 @@ async fn operator_only_refusals_escalate_to_a_terminal_surface() {
         .and_then(|task| task.resume.completion_repair.as_ref())
         .expect("a refused completion must persist its repair stage");
     assert_eq!(
-        record.refusal_count, 4,
-        "the fourth refusal must accrue on the same basis"
+        record.refusal_count, 3,
+        "the terminal refusal must accrue on the semantic episode"
     );
+    assert!(record.terminal);
     assert_eq!(record.plan["steps"][0]["terminal"], true);
     assert_eq!(
         record.plan["steps"][0]["terminal_surface"],
@@ -2417,9 +2503,137 @@ async fn operator_only_refusals_escalate_to_a_terminal_surface() {
     assert!(
         captured
             .iter()
-            .any(|text| text.contains("operator_required/terminal")),
+            .any(|text| text.contains("repair_stalled/terminal")),
         "the terminal stage must be visible to a following model decision"
     );
+    assert_eq!(checkpoint.tasks.completed.len(), 0);
+    assert_eq!(checkpoint.tasks.active, Some(active));
+    instance.shutdown().await.unwrap();
+}
+
+/// After one refused completion, repeatedly edits only advisory progress text
+/// and never proposes completion again. Runtime must still observe that the
+/// typed blocker frontier is unchanged and close the repair action surface.
+#[derive(Debug)]
+struct ToolOnlyRepairLoopModel {
+    rounds: AtomicUsize,
+}
+
+#[async_trait::async_trait]
+impl ModelTransport for ToolOnlyRepairLoopModel {
+    fn capabilities(&self) -> ModelCapabilities {
+        ModelCapabilities::default()
+    }
+
+    async fn complete(&self, request: ModelRequest) -> AgentResult<ModelOutput> {
+        let round = self.rounds.fetch_add(1, Ordering::SeqCst);
+        if request.tools.is_empty() {
+            return Ok(ModelOutput {
+                content: "repair stalled; operator authority is still required".into(),
+                tool_calls: Vec::new(),
+                usage: Default::default(),
+            });
+        }
+        if round == 0 {
+            return Ok(ModelOutput {
+                content: String::new(),
+                tool_calls: vec![ToolCall {
+                    id: "initial-completion".into(),
+                    name: "task.complete".into(),
+                    arguments: json!({"summary": "premature", "artifacts": []}),
+                }],
+                usage: Default::default(),
+            });
+        }
+        Ok(ModelOutput {
+            content: String::new(),
+            tool_calls: vec![ToolCall {
+                id: format!("cosmetic-progress-{round}"),
+                name: "task.manage".into(),
+                arguments: json!({
+                    "base_anchor_revision": round - 1,
+                    "current_interpretation": format!("same operator-owned task, wording {round}"),
+                }),
+            }],
+            usage: Default::default(),
+        })
+    }
+}
+
+#[tokio::test]
+async fn repair_actions_without_typed_progress_cannot_loop_forever() {
+    let model = Arc::new(ToolOnlyRepairLoopModel {
+        rounds: AtomicUsize::new(0),
+    });
+    let services = RuntimeServices::new(
+        CoreAuthorityConfig::default(),
+        Arc::new(TestContextEngine),
+        model,
+        Arc::new(WithCompletionVerificationTools {
+            inner: CompletionProgressDispatcher {
+                inner: CompletionToolDispatcher { workspace: None },
+            },
+        }),
+        Arc::new(PolicyApprovalGate::read_only()),
+        None,
+    );
+    let mut host = ModuleHost::new();
+    host.start().await.expect("test module host starts");
+    let instance = RuntimeInstance::spawn(host, services);
+    let handle = instance.handle();
+    let mut events = handle.subscribe();
+    handle.start().await.unwrap();
+    handle
+        .set_focus("operator-owned completion".into())
+        .await
+        .unwrap();
+    handle.user_message("try to finish".into()).await.unwrap();
+
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    let mut turn_completed = false;
+    let mut task_completed = false;
+    let mut progress_calls = 0usize;
+    while tokio::time::Instant::now() < deadline && !turn_completed {
+        if let Ok(Ok(envelope)) =
+            tokio::time::timeout(Duration::from_millis(50), events.recv()).await
+        {
+            match envelope.event {
+                RuntimeEvent::ToolFinished { output, .. } if output.tool_name == "task.manage" => {
+                    progress_calls += 1;
+                }
+                RuntimeEvent::TaskCompleted { .. } => task_completed = true,
+                RuntimeEvent::TurnCompleted => turn_completed = true,
+                _ => {}
+            }
+        }
+    }
+
+    assert!(
+        turn_completed,
+        "semantic repair must end before the round cap"
+    );
+    assert!(!task_completed);
+    assert_eq!(
+        progress_calls, 5,
+        "five no-progress actions reach the six-step episode bound after the initial refusal"
+    );
+    let checkpoint = instance.checkpoint().await.unwrap();
+    let record = checkpoint
+        .tasks
+        .active
+        .and_then(|task_id| {
+            checkpoint
+                .tasks
+                .tasks
+                .iter()
+                .find(|task| task.id == task_id)
+        })
+        .and_then(|task| task.resume.completion_repair.as_ref())
+        .expect("the terminal semantic episode remains durable");
+    assert_eq!(record.refusal_count, 1);
+    assert_eq!(record.no_progress_steps, 6);
+    assert!(record.terminal);
+    assert!(checkpoint.tasks.completed.is_empty());
     instance.shutdown().await.unwrap();
 }
 
@@ -2557,6 +2771,14 @@ impl ScriptedProofVerifier {
 
 #[async_trait::async_trait]
 impl agent_runtime::ProofVerifier for ScriptedProofVerifier {
+    fn exact_recipe_for_domain(
+        &self,
+        declaration: &agent_contracts::VerificationCoverageDeclaration,
+    ) -> Option<String> {
+        (declaration == &completion_acceptance_declaration())
+            .then(|| "completion-fixture-recipe".into())
+    }
+
     async fn verify_exact(
         &self,
         request: agent_runtime::ProofVerifierRequest,
@@ -2705,6 +2927,281 @@ async fn run_proof_refresh_scenario(
     let checkpoint = instance.checkpoint().await.unwrap();
     instance.shutdown().await.unwrap();
     (output, verifier.requests(), checkpoint)
+}
+
+#[tokio::test]
+async fn proof_refresh_resolves_the_exact_recipe_without_model_history() {
+    let verifier = Arc::new(ScriptedProofVerifier::new(vec![Ok(
+        agent_runtime::ProofVerifierOutcome {
+            ok: true,
+            summary: "fixture verified from the host declaration".into(),
+            verification_identity: completion_verifier_identity(),
+        },
+    )]));
+    let model = Arc::new(CompletionProposalModel {
+        summary: "cold proof route completed",
+        rounds: AtomicUsize::new(0),
+    });
+    let services = RuntimeServices::new(
+        CoreAuthorityConfig::default(),
+        Arc::new(TestContextEngine),
+        model,
+        Arc::new(ProofRefreshDispatcher),
+        Arc::new(PolicyApprovalGate::permissive()),
+        None,
+    )
+    .with_proof_verifier(verifier.clone())
+    .with_project_proof_refresh(true);
+    let mut host = ModuleHost::new();
+    host.start().await.expect("test module host starts");
+    let instance = RuntimeInstance::spawn(host, services);
+    let handle = instance.handle();
+    let mut events = handle.subscribe();
+    handle.start().await.unwrap();
+    handle
+        .set_focus("finish from a declared proof domain".into())
+        .await
+        .unwrap();
+    let task_id = handle.list_tasks().await.unwrap()[0].id;
+    handle
+        .patch_task_anchor(
+            task_id,
+            0,
+            agent_runtime::AnchorPatch {
+                completion_policy: Some(
+                    agent_runtime::task::TaskCompletionPolicy::EvidenceRequired,
+                ),
+                acceptance_criteria: Some(vec![
+                    agent_runtime::task::AcceptanceCriterion::declared(
+                        "trusted completion fixture passes",
+                        &completion_acceptance_declaration(),
+                    ),
+                ]),
+                ..agent_runtime::AnchorPatch::default()
+            },
+        )
+        .await
+        .unwrap();
+
+    handle
+        .user_message("finish without a prior verify.run call".into())
+        .await
+        .unwrap();
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+    let mut completed = false;
+    while tokio::time::Instant::now() < deadline && !completed {
+        if let Ok(Ok(envelope)) =
+            tokio::time::timeout(Duration::from_millis(50), events.recv()).await
+            && matches!(envelope.event, RuntimeEvent::TaskCompleted { .. })
+        {
+            completed = true;
+        }
+    }
+
+    assert!(
+        completed,
+        "the host-declared cold route must admit completion"
+    );
+    assert_eq!(verifier.call_count(), 1);
+    assert_eq!(
+        verifier.requests()[0].recipe_id,
+        "completion-fixture-recipe"
+    );
+    let checkpoint = instance.checkpoint().await.unwrap();
+    assert!(checkpoint.tasks.active.is_none());
+    assert_eq!(checkpoint.tasks.completed.len(), 1);
+    instance.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn cold_proof_repair_names_the_exact_recipe_when_auto_refresh_is_off() {
+    let requests = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let verifier = Arc::new(ScriptedProofVerifier::new(Vec::new()));
+    let services = RuntimeServices::new(
+        CoreAuthorityConfig::default(),
+        Arc::new(TestContextEngine),
+        Arc::new(CompletionRefusalModel {
+            rounds: AtomicUsize::new(0),
+            requests: requests.clone(),
+        }),
+        Arc::new(ProofRefreshDispatcher),
+        Arc::new(PolicyApprovalGate::permissive()),
+        None,
+    )
+    .with_proof_verifier(verifier.clone());
+    let mut host = ModuleHost::new();
+    host.start().await.expect("test module host starts");
+    let instance = RuntimeInstance::spawn(host, services);
+    let handle = instance.handle();
+    let mut events = handle.subscribe();
+    handle.start().await.unwrap();
+    handle.set_focus("cold proof repair".into()).await.unwrap();
+    let task_id = handle.list_tasks().await.unwrap()[0].id;
+    handle
+        .patch_task_anchor(
+            task_id,
+            0,
+            agent_runtime::AnchorPatch {
+                completion_policy: Some(
+                    agent_runtime::task::TaskCompletionPolicy::EvidenceRequired,
+                ),
+                acceptance_criteria: Some(vec![
+                    agent_runtime::task::AcceptanceCriterion::declared(
+                        "trusted completion fixture passes",
+                        &completion_acceptance_declaration(),
+                    ),
+                ]),
+                ..agent_runtime::AnchorPatch::default()
+            },
+        )
+        .await
+        .unwrap();
+    handle.user_message("finish".into()).await.unwrap();
+
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+    let mut refused = None;
+    let mut turn_completed = false;
+    while tokio::time::Instant::now() < deadline && !turn_completed {
+        if let Ok(Ok(envelope)) =
+            tokio::time::timeout(Duration::from_millis(50), events.recv()).await
+        {
+            match envelope.event {
+                RuntimeEvent::ToolFinished { output, .. }
+                    if output.tool_name == "task.complete" =>
+                {
+                    refused = Some(output);
+                }
+                RuntimeEvent::TurnCompleted => turn_completed = true,
+                _ => {}
+            }
+        }
+    }
+    let refused = refused.expect("completion refusal must remain model-visible");
+    assert_eq!(
+        refused.metadata["repair_plan"]["steps"][0]["kind"],
+        "proof_refresh"
+    );
+    assert_eq!(
+        refused.metadata["repair_plan"]["steps"][0]["recipe_id"],
+        "completion-fixture-recipe"
+    );
+    assert_eq!(verifier.call_count(), 0, "automatic execution is still off");
+    assert!(requests.lock().unwrap().iter().any(|request| {
+        request.contains("proof_refresh") && request.contains("recipe_id=completion-fixture-recipe")
+    }));
+    instance.shutdown().await.unwrap();
+}
+
+#[derive(Debug)]
+struct RepeatedCompletionAfterProofFailureModel {
+    rounds: AtomicUsize,
+}
+
+#[async_trait::async_trait]
+impl ModelTransport for RepeatedCompletionAfterProofFailureModel {
+    fn capabilities(&self) -> ModelCapabilities {
+        ModelCapabilities::default()
+    }
+
+    async fn complete(&self, request: ModelRequest) -> AgentResult<ModelOutput> {
+        let round = self.rounds.fetch_add(1, Ordering::SeqCst);
+        Ok(if request.tools.is_empty() {
+            ModelOutput {
+                content: "the exact proof remains failed".into(),
+                tool_calls: Vec::new(),
+                usage: Default::default(),
+            }
+        } else {
+            ModelOutput {
+                content: String::new(),
+                tool_calls: vec![ToolCall {
+                    id: format!("repeat-completion-{round}"),
+                    name: "task.complete".into(),
+                    arguments: json!({"summary": "still premature", "artifacts": []}),
+                }],
+                usage: Default::default(),
+            }
+        })
+    }
+}
+
+#[tokio::test]
+async fn failed_host_proof_is_not_reexecuted_on_the_same_basis() {
+    let verifier = Arc::new(ScriptedProofVerifier::new(vec![Ok(
+        agent_runtime::ProofVerifierOutcome {
+            ok: false,
+            summary: "fixture fails".into(),
+            verification_identity: String::new(),
+        },
+    )]));
+    let services = RuntimeServices::new(
+        CoreAuthorityConfig::default(),
+        Arc::new(TestContextEngine),
+        Arc::new(RepeatedCompletionAfterProofFailureModel {
+            rounds: AtomicUsize::new(0),
+        }),
+        Arc::new(ProofRefreshDispatcher),
+        Arc::new(PolicyApprovalGate::permissive()),
+        None,
+    )
+    .with_proof_verifier(verifier.clone())
+    .with_project_proof_refresh(true);
+    let mut host = ModuleHost::new();
+    host.start().await.expect("test module host starts");
+    let instance = RuntimeInstance::spawn(host, services);
+    let handle = instance.handle();
+    let mut events = handle.subscribe();
+    handle.start().await.unwrap();
+    handle.set_focus("proof must pass".into()).await.unwrap();
+    let task_id = handle.list_tasks().await.unwrap()[0].id;
+    handle
+        .patch_task_anchor(
+            task_id,
+            0,
+            agent_runtime::AnchorPatch {
+                completion_policy: Some(
+                    agent_runtime::task::TaskCompletionPolicy::EvidenceRequired,
+                ),
+                acceptance_criteria: Some(vec![
+                    agent_runtime::task::AcceptanceCriterion::declared(
+                        "trusted completion fixture passes",
+                        &completion_acceptance_declaration(),
+                    ),
+                ]),
+                ..agent_runtime::AnchorPatch::default()
+            },
+        )
+        .await
+        .unwrap();
+    handle.user_message("finish".into()).await.unwrap();
+
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    let mut turn_completed = false;
+    while tokio::time::Instant::now() < deadline && !turn_completed {
+        if let Ok(Ok(envelope)) =
+            tokio::time::timeout(Duration::from_millis(50), events.recv()).await
+            && matches!(envelope.event, RuntimeEvent::TurnCompleted)
+        {
+            turn_completed = true;
+        }
+    }
+    assert!(turn_completed);
+    assert_eq!(
+        verifier.call_count(),
+        1,
+        "the current-basis failed proof is a negative lease, not a retry invitation"
+    );
+    let checkpoint = instance.checkpoint().await.unwrap();
+    assert!(checkpoint.tasks.completed.is_empty());
+    assert!(
+        checkpoint
+            .tasks
+            .active
+            .and_then(|active| checkpoint.tasks.tasks.iter().find(|task| task.id == active))
+            .and_then(|task| task.resume.completion_repair.as_ref())
+            .is_some_and(|record| record.terminal)
+    );
+    instance.shutdown().await.unwrap();
 }
 
 #[tokio::test]

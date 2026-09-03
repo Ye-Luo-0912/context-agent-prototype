@@ -654,6 +654,54 @@ fn default_timeout_ms() -> u64 {
     30_000
 }
 
+/// Canonical identity of the effective process invocation for reconciling a
+/// later success with an earlier failure. Scheduling controls such as timeout
+/// are intentionally excluded: changing how long Runtime waits does not
+/// change which command/cwd/environment produced the result. Raw arguments
+/// remain independently bound by `ArgumentDigest` for approval and audit.
+pub(crate) fn outcome_equivalence_material(arguments: &Value) -> Option<String> {
+    let args: ProcessArgs = serde_json::from_value(arguments.clone()).ok()?;
+    let cwd = effective_cwd_identity(args.cwd.as_deref())?;
+    let env: std::collections::BTreeMap<_, _> = args.env.into_iter().collect();
+    agent_contracts::jcs_serialize(&json!({
+        "schema": "process-outcome-equivalence/v1",
+        "argv": args.argv,
+        "cwd": cwd,
+        "env": env,
+    }))
+    .ok()
+}
+
+/// Mirror the path components that `Workspace::resolve_relative` will use,
+/// without doing I/O in the synchronous attribution hook. This intentionally
+/// avoids the display-oriented resource normalizer because that function is
+/// length-capped; truncation must never make two distinct operations share an
+/// identity. Invalid absolute/parent paths receive no semantic key and fall
+/// back to exact raw-argument matching.
+fn effective_cwd_identity(cwd: Option<&str>) -> Option<String> {
+    let cwd = cwd.unwrap_or_default();
+    if cwd.is_empty() {
+        return Some(".".into());
+    }
+    let mut components = Vec::new();
+    for component in std::path::Path::new(cwd).components() {
+        match component {
+            std::path::Component::CurDir => {}
+            std::path::Component::Normal(value) => {
+                components.push(value.to_string_lossy().into_owned())
+            }
+            std::path::Component::ParentDir
+            | std::path::Component::RootDir
+            | std::path::Component::Prefix(_) => return None,
+        }
+    }
+    Some(if components.is_empty() {
+        ".".into()
+    } else {
+        components.join("/")
+    })
+}
+
 #[async_trait]
 impl Tool for ProcessRunTool {
     fn spec(&self) -> ToolSpec {
@@ -1183,6 +1231,67 @@ mod tests {
 
     fn ctx(run_id: RunId, arguments: &Value) -> agent_contracts::OperationEffectContext {
         crate::tools::test_process_effect_context(run_id, "c", "process.run", arguments)
+    }
+
+    #[test]
+    fn outcome_identity_normalizes_defaults_but_fences_semantics() {
+        let omitted = json!({"argv": ["cargo", "fmt", "--", "--check"]});
+        let explicit = json!({
+            "argv": ["cargo", "fmt", "--", "--check"],
+            "cwd": "",
+            "env": {},
+            "timeout_ms": 120_000
+        });
+        let dotted = json!({
+            "argv": ["cargo", "fmt", "--", "--check"],
+            "cwd": ".",
+            "timeout_ms": 100
+        });
+        assert_ne!(
+            agent_contracts::ArgumentDigest::from_json(&omitted),
+            agent_contracts::ArgumentDigest::from_json(&explicit),
+            "authority identity must continue to bind exact submitted JSON"
+        );
+        let expected = outcome_equivalence_material(&omitted).unwrap();
+        assert_eq!(outcome_equivalence_material(&explicit).unwrap(), expected);
+        assert_eq!(outcome_equivalence_material(&dotted).unwrap(), expected);
+        assert_eq!(
+            outcome_equivalence_material(&json!({
+                "argv": ["cargo", "fmt", "--", "--check"],
+                "cwd": "./"
+            }))
+            .unwrap(),
+            expected
+        );
+
+        for different in [
+            json!({"argv": ["cargo", "test"]}),
+            json!({"argv": ["cargo", "fmt", "--", "--check"], "cwd": "src"}),
+            json!({"argv": ["cargo", "fmt", "--", "--check"], "env": {"RUSTFLAGS": "-Dwarnings"}}),
+        ] {
+            assert_ne!(
+                outcome_equivalence_material(&different).unwrap(),
+                expected,
+                "argv, effective cwd and environment remain semantic fences"
+            );
+        }
+        assert!(
+            outcome_equivalence_material(&json!({
+                "argv": ["cargo", "fmt"],
+                "cwd": "../outside"
+            }))
+            .is_none(),
+            "invalid cwd values must fail closed to raw argument identity"
+        );
+        assert_ne!(
+            outcome_equivalence_material(&json!({
+                "argv": ["cargo", "fmt", "--", "--check"],
+                "cwd": " "
+            }))
+            .unwrap(),
+            expected,
+            "whitespace is a legal path component and must not collapse to workspace root"
+        );
     }
 
     /// TOOL-PROC-01 回归：cwd 里真实存在的可执行文件，`.\` / `./` /

@@ -20,8 +20,8 @@ use agent_contracts::{
     ContextMaintenanceTrigger, ContextMaterializationIdentity, ContextMaterializationMiss,
     ContextMaterializationMissReason, ContextQuery, ContextRetention,
     DISCOVERY_IDENTICAL_QUERY_BUDGET, DISCOVERY_MAX_QUERIES_PER_TURN, DiscoveryBudgetExhausted,
-    DiscoveryTurnBudget, Effect, EffectDurability, EffectId, EffectReceipt, FocusState,
-    FsRereadClass, InputAuthority, InputKind, InputLifecycle, InputSource,
+    DiscoveryTurnBudget, Effect, EffectAckDebt, EffectDurability, EffectId, EffectReceipt,
+    FocusState, FsRereadClass, InputAuthority, InputKind, InputLifecycle, InputSource,
     MAX_COMPLETION_ARTIFACTS, MAX_MODEL_TOOL_CALLS_PER_ROUND, MAX_PINNED_CONTENT_CHARS,
     MAX_TASK_ANCHOR_TEXT_CHARS, MaterializedContext, MaterializedItem, ModelCompletionValidity,
     ModelInput, ModelRequest, OperationId, OperationOutcome, OperationQueryResult, OperationResult,
@@ -1307,6 +1307,11 @@ struct ActorState {
     /// No later command mutation is accepted until the process is recovered
     /// from a known-good RuntimeCheckpoint.
     recovery_required: bool,
+    /// Persisted effect-acknowledgement debts restored from the checkpoint
+    /// (or recorded live). Each entry re-fences mutation until it is
+    /// reconciled against the broker journal's durable truth; a checkpoint
+    /// capture refuses more than `MAX_CHECKPOINT_ACK_DEBTS` entries.
+    unresolved_ack_debts: Vec<EffectAckDebt>,
     /// A full restore whose actor-owned planes are installed but whose host
     /// capability plane and durable commit record are not yet finalized.
     pending_restore: Option<PendingRestore>,

@@ -27,6 +27,10 @@ pub(super) const STALL_CLUSTER_DISTINCT_TARGETS: u32 = 2;
 pub(super) const FRONTIER_ADVISORY_THRESHOLD: u32 = 5;
 /// 前沿证据行数上限（最新在前）。
 const MAX_EVIDENCE_ROWS: usize = 16;
+/// The typed plan may carry eight bounded criterion descriptions. Character
+/// caps are not byte caps, so reserve the legal four-byte UTF-8 envelope plus
+/// JSON/provenance overhead while keeping checkpoint growth strictly bounded.
+const MAX_COMPLETION_REPAIR_PLAN_BYTES: usize = 16 * 1024;
 /// recent_deltas 环形缓冲长度上限。
 const MAX_RECENT_DELTAS: usize = 8;
 /// 单条证据 outcome / 参数摘要的字符上限。
@@ -240,16 +244,16 @@ pub struct ExecutionState {
     #[serde(default)]
     pub last_offered_opportunity: Option<String>,
     /// Durable completion-gate repair state for a refused `task.complete`.
-    /// Survives checkpoints and deferred safe-point refusals so the next
-    /// decision can resume the exact stage against the same basis instead of
-    /// re-deriving from scratch; a basis divergence makes it stale and the
-    /// next refusal replaces it.
+    /// Survives checkpoints and deferred safe-point refusals. Volatile anchor
+    /// and workspace revisions remain recorded for audit/freshness, but they
+    /// do not reset semantic no-progress accounting; a new user directive or
+    /// verification-authority revision starts a fresh episode.
     #[serde(default)]
     pub completion_repair: Option<CompletionRepairRecord>,
 }
 
 /// The last refused `task.complete` repair stage, persisted with the basis
-/// it was derived against. `plan` is the bounded `completion-repair.v1`
+/// it was derived against. `plan` is the bounded `completion-repair.v2`
 /// stage; `text` is the bounded rendered instruction for the model view.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -261,15 +265,60 @@ pub struct CompletionRepairRecord {
     pub plan: serde_json::Value,
     pub text: String,
     pub refused_at_ms: u64,
-    /// Consecutive refusals against the same basis; resets when the basis
-    /// changes.
+    /// Total refusals in the current semantic repair episode. Anchor/world
+    /// revisions do not reset it; a new directive or verification-authority
+    /// revision does.
     pub refusal_count: u32,
+    /// Canonical digest of the current typed blocker shape, deliberately
+    /// excluding volatile basis revisions and free-form prompt text.
+    #[serde(default)]
+    pub blocker_fingerprint: String,
+    /// Consecutive refusals with the same semantic blocker fingerprint.
+    #[serde(default)]
+    pub same_blocker_refusals: u32,
+    /// Completion proposals or subsequent repair actions since the episode
+    /// last reached a strictly better completion potential. Lateral blocker
+    /// replacement, repeated calls and revision churn do not reset it.
+    #[serde(default, alias = "no_progress_refusals")]
+    pub no_progress_steps: u32,
+    /// Best (lowest) typed blocker potential reached in this episode.
+    #[serde(default)]
+    pub best_potential: Option<CompletionRepairPotential>,
+    /// Sticky finalization state for this episode. It ends only the current
+    /// turn; it never authorizes or records durable task completion.
+    #[serde(default)]
+    pub terminal: bool,
+}
+
+/// Lexicographic completion distance. Earlier fields are prerequisites of
+/// later ones: operator/safety, task progress, execution debt, then proof.
+/// A lower value is a provable improvement; arbitrary revision or prose
+/// changes are absent by construction.
+#[derive(
+    Debug,
+    Clone,
+    Copy,
+    PartialEq,
+    Eq,
+    PartialOrd,
+    Ord,
+    Default,
+    serde::Serialize,
+    serde::Deserialize,
+)]
+#[serde(rename_all = "snake_case")]
+pub struct CompletionRepairPotential {
+    pub operator: u32,
+    pub progress: u32,
+    pub execution: u32,
+    pub proof: u32,
 }
 
 impl CompletionRepairRecord {
-    /// Whether this record was derived against exactly the basis the
-    /// readiness decision currently holds. A mismatched record is stale and
-    /// must be replaced by a freshly derived stage.
+    /// Whether this record was derived against the exact safety/freshness
+    /// basis the readiness decision currently holds. This is useful for
+    /// diagnostics; liveness uses [`Self::matches_episode`] instead.
+    #[cfg(test)]
     pub(crate) fn matches_basis(&self, readiness: &crate::task::CompletionReadiness) -> bool {
         let task_basis = readiness
             .task_state_basis
@@ -282,6 +331,29 @@ impl CompletionRepairRecord {
                 == verification_basis.map(|basis| basis.directive_revision)
             && self.basis_workspace_revision
                 == verification_basis.map(|basis| basis.workspace_revision)
+    }
+
+    /// Semantic episode identity. Progress-only anchor changes and workspace
+    /// mutations remain inside the episode; new user intent or changed
+    /// completion authority starts a fresh one.
+    pub(crate) fn matches_episode(&self, readiness: &crate::task::CompletionReadiness) -> bool {
+        let verification_basis = readiness.verification_basis;
+        self.basis_verification_revision
+            == verification_basis.map(|basis| basis.verification_revision)
+            && self.basis_directive_revision
+                == verification_basis.map(|basis| basis.directive_revision)
+    }
+
+    /// A terminal record applies only while the same semantic episode has not
+    /// reached a strictly better typed frontier. This lets a sibling action or
+    /// externally repaired condition reopen the decision without discarding
+    /// the durable history.
+    pub(crate) fn terminal_applies(&self, readiness: &crate::task::CompletionReadiness) -> bool {
+        self.terminal
+            && self.matches_episode(readiness)
+            && self
+                .best_potential
+                .is_none_or(|best| readiness.repair_potential() >= best)
     }
 }
 
@@ -478,6 +550,13 @@ pub struct FailedCommandFact {
     /// comparing display command text.
     #[serde(default)]
     pub argument_digest: String,
+    /// Host-trusted digest of the effective operation after semantic defaults
+    /// are applied. A later success may reconcile this row when this key
+    /// matches even if its exact submitted JSON (and therefore
+    /// `argument_digest`) differs. Empty legacy rows retain fail-closed raw
+    /// argument matching.
+    #[serde(default)]
+    pub outcome_equivalence_key: String,
     /// Typed retry domain and blocker identity captured from trusted output
     /// facts. These fields mirror the obligation ledger so both views use
     /// one resolution predicate. Legacy rows default to NonDeterministic and
@@ -594,6 +673,7 @@ pub(super) struct OperationIdentity {
     pub tool_name: String,
     pub target: String,
     pub argument_digest: String,
+    pub outcome_equivalence_key: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -641,6 +721,10 @@ impl ExecutionState {
     /// [`Self::verification_due_now`].
     pub fn on_user_turn(&mut self, message: &str) {
         self.directive_revision = self.directive_revision.saturating_add(1);
+        // A fresh user directive is a new liveness episode. TaskContinuation
+        // deliberately bypasses this method and therefore preserves an
+        // in-flight repair across checkpoint/restore.
+        self.completion_repair = None;
         self.directive_has_rooted_evidence = self.checked_files.iter().any(|row| {
             row.freshness == ResourceFreshness::Fresh
                 && path_exactly_in_directive(message, &row.path)
@@ -995,6 +1079,34 @@ impl ExecutionState {
             .rev()
             .find(|fact| {
                 fact.ok
+                    && fact.anchor_revision == verification_revision
+                    && fact.directive_revision == self.directive_revision
+                    && fact.workspace_revision == self.workspace_revision
+                    && fact.source_tool_name == tool_name
+                    && fact.argument_digest == argument_digest
+                    && fact.verification_identity == verification_identity
+            })
+            .cloned()
+    }
+
+    /// Return a failed exact-verifier attempt for this precise authority and
+    /// world basis. Runtime uses this as a negative lease for its internal
+    /// completion proof lane: repeating the same expensive recipe cannot
+    /// produce new information until the directive, workspace or host recipe
+    /// identity changes.
+    pub fn current_exact_verification_failure(
+        &self,
+        tool_name: &str,
+        argument_digest: &str,
+        verification_revision: u64,
+        attribution: &RuntimeExecutionAttribution,
+    ) -> Option<VerificationFact> {
+        let verification_identity = attribution.exact_verification_identity()?;
+        self.verifications
+            .iter()
+            .rev()
+            .find(|fact| {
+                !fact.ok
                     && fact.anchor_revision == verification_revision
                     && fact.directive_revision == self.directive_revision
                     && fact.workspace_revision == self.workspace_revision
@@ -2011,6 +2123,7 @@ impl ExecutionState {
             tool_name: bound_item(&identity.tool_name),
             target: bound_item(&identity.target),
             argument_digest: bound_item(&identity.argument_digest),
+            outcome_equivalence_key: bound_item(&identity.outcome_equivalence_key),
             domain: blocker.domain,
             scope_key: blocker.scope_key,
             precondition: blocker.precondition,
@@ -2255,18 +2368,34 @@ fn same_failure_slot(
     }) || blocker.is_none() && same_operation(row, operation)
 }
 
-pub(super) fn operation_identity(output: &ToolOutput, argument_digest: &str) -> OperationIdentity {
+pub(super) fn operation_identity(
+    output: &ToolOutput,
+    argument_digest: &str,
+    attribution: Option<&RuntimeExecutionAttribution>,
+) -> OperationIdentity {
     let target = output.operation_target().unwrap_or("").to_string();
     OperationIdentity {
         tool_name: output.tool_name.clone(),
         target,
         argument_digest: argument_digest.to_string(),
+        outcome_equivalence_key: attribution
+            .and_then(|attribution| attribution.host.outcome_equivalence_key())
+            .unwrap_or_default()
+            .to_string(),
     }
 }
 
 pub(super) fn same_operation(row: &FailedCommandFact, identity: &OperationIdentity) -> bool {
-    row.tool_name == identity.tool_name
-        && !row.argument_digest.is_empty()
+    if row.tool_name != identity.tool_name {
+        return false;
+    }
+    if !row.outcome_equivalence_key.is_empty() && !identity.outcome_equivalence_key.is_empty() {
+        return row.outcome_equivalence_key == identity.outcome_equivalence_key;
+    }
+    // Legacy/restored rows predate host semantic keys. Exact raw JSON remains
+    // a safe compatibility identity when either side lacks a key; display
+    // command text is never consulted.
+    !row.argument_digest.is_empty()
         && !identity.argument_digest.is_empty()
         && row.argument_digest == identity.argument_digest
 }
@@ -2288,6 +2417,31 @@ pub(crate) fn validate_execution_state(state: &ExecutionState) -> Result<(), Str
         })
     {
         return Err("completion commit failure is invalid or exceeds its text bound".into());
+    }
+    if let Some(repair) = state.completion_repair.as_ref() {
+        let plan_bytes = serde_json::to_vec(&repair.plan)
+            .map_err(|_| "completion repair plan is not serializable")?
+            .len();
+        let fingerprint_invalid = !repair.blocker_fingerprint.is_empty()
+            && repair
+                .blocker_fingerprint
+                .parse::<agent_contracts::ContentDigest>()
+                .is_err();
+        let counters_invalid = repair.refusal_count == 0
+            || repair.refusal_count > crate::task::MAX_COMPLETION_REPAIR_REFUSALS
+            || repair.same_blocker_refusals > repair.refusal_count
+            || repair.no_progress_steps > crate::task::MAX_COMPLETION_REPAIR_STEPS;
+        let terminal_unproved = repair.terminal
+            && repair.same_blocker_refusals < crate::task::COMPLETION_REPAIR_TERMINAL_REFUSALS
+            && repair.no_progress_steps < crate::task::COMPLETION_REPAIR_NO_PROGRESS_STEPS;
+        if plan_bytes > MAX_COMPLETION_REPAIR_PLAN_BYTES
+            || repair.text.chars().count() > crate::task::COMPLETION_REPAIR_VIEW_CHARS
+            || fingerprint_invalid
+            || counters_invalid
+            || terminal_unproved
+        {
+            return Err("completion repair state is invalid or exceeds its bound".into());
+        }
     }
     if state.failure_overflow.is_empty() {
         if state.failure_overflow.directive_revision != 0 {
@@ -2336,6 +2490,12 @@ pub(crate) fn validate_execution_state(state: &ExecutionState) -> Result<(), Str
         if row.tool_name.chars().count() > MAX_TASK_ANCHOR_ITEM_CHARS
             || row.target.chars().count() > MAX_TASK_ANCHOR_ITEM_CHARS
             || row.argument_digest.chars().count() > MAX_TASK_ANCHOR_ITEM_CHARS
+            || row.outcome_equivalence_key.chars().count() > MAX_TASK_ANCHOR_ITEM_CHARS
+            || !row.outcome_equivalence_key.is_empty()
+                && row
+                    .outcome_equivalence_key
+                    .parse::<agent_contracts::ContentDigest>()
+                    .is_err()
             || row.scope_key.chars().count() > MAX_TASK_ANCHOR_ITEM_CHARS
             || row.precondition.chars().count() > MAX_TASK_ANCHOR_ITEM_CHARS
             || row.summary.chars().count() > MAX_TASK_ANCHOR_ITEM_CHARS

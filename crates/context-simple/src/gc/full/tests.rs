@@ -1091,6 +1091,40 @@ fn dependency_edges_resolve_across_heap_buffer_and_store() {
     assert!(dependency_edges(&state, ContextItemId::new()).is_none());
 }
 
+#[test]
+fn dependency_marking_handles_a_large_root_set_without_edges() {
+    use std::collections::HashSet;
+
+    // Every pinned item is a root, but none expands to another item. This is
+    // the worst shape for the dependency walk: it must inspect every root
+    // before it can conclude that there is no continuation edge. Resident
+    // lookup therefore has to use the heap's id index; a linear lookup per
+    // root turns this otherwise linear pass into quadratic work.
+    const ROOTS: usize = 10_000;
+    let config = SimpleContextConfig::default();
+    let mut state = State::default();
+    for index in 0..ROOTS {
+        let mut item = crate::item::make_item(
+            &state,
+            &config,
+            format!("pinned root {index}"),
+            ContextKind::Note,
+            ContextScope::Pinned,
+            ContextRetention::Pinned,
+            0.8,
+            None,
+        );
+        item.dependencies.clear();
+        state.items.push(item);
+    }
+
+    let latest_file_bodies = HashSet::new();
+    let (marked, anchor_roots_protected) =
+        mark_roots(&state, &config, None, &[], &latest_file_bodies);
+    assert_eq!(marked.len(), ROOTS, "every pinned root remains marked");
+    assert_eq!(anchor_roots_protected, 0);
+}
+
 #[tokio::test]
 async fn hot_reactivation_requires_exact_entity_identity() {
     let engine = SimpleContextEngine::new(SimpleContextConfig {

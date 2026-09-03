@@ -1349,6 +1349,7 @@ mod tests {
         };
         let checkpoint = RuntimeCheckpoint {
             version: agent_runtime::RUNTIME_CHECKPOINT_VERSION,
+            unresolved_ack_debts: Vec::new(),
             run_metadata: RunMetadata {
                 run_id: run,
                 created_at_ms: 1,

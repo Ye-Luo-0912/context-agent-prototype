@@ -6,9 +6,9 @@
 //! *structural* mutation (push, retain, wholesale replace, restore) goes
 //! through a method that updates the indexes in the same step, so a stale
 //! index is a type error instead of a runtime heuristic. Non-indexed field
-//! mutations (residency aging, access stamps, tags) remain reachable
-//! through `get_mut` / `&mut` iteration, which cannot affect any index
-//! bucket.
+//! mutations (residency aging and access stamps) remain reachable through
+//! `get_mut` / `&mut` iteration. Callers that change catalog dimensions such
+//! as scope, attention or tags must also dirty the engine-owned catalog.
 //!
 //! The id index turns the model-driven retrieval loop
 //! (`inspect_external` / `fetch_external`, called per item from the

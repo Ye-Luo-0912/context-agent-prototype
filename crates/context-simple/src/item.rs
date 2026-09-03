@@ -22,7 +22,11 @@ pub(crate) fn make_item(
     source: Option<String>,
 ) -> ContextItem {
     let content = truncate_chars(content, config.max_item_chars);
-    let entities = extract_entities(&content);
+    let entities = if is_raw_evidence_kind(kind) {
+        Vec::new()
+    } else {
+        extract_entities(&content)
+    };
     ContextItem {
         id: ContextItemId::new(),
         task_id: state.focus.as_ref().map(|f| f.task_id),
@@ -73,4 +77,35 @@ pub(crate) fn truncate_chars(mut text: String, max_chars: usize) -> String {
 
 pub(crate) fn short_id(id: &ContextItemId) -> String {
     id.to_string().chars().take(8).collect()
+}
+
+/// Search/prompt identity for raw evidence. Its body stays Fetch-only; every
+/// surface uses this same path@revision card so the catalog and final verifier
+/// cannot drift apart.
+pub(crate) fn raw_evidence_identity(
+    kind: ContextKind,
+    file_path: Option<&str>,
+    file_revision: Option<&str>,
+) -> Option<String> {
+    if !is_raw_evidence_kind(kind) {
+        return None;
+    }
+    let path = file_path.map(str::trim).filter(|path| !path.is_empty());
+    Some(match path {
+        Some(path) => match file_revision
+            .map(str::trim)
+            .filter(|revision| !revision.is_empty())
+        {
+            Some(revision) => format!("{path}@{revision}"),
+            None => path.to_string(),
+        },
+        None => kind.as_str().to_string(),
+    })
+}
+
+pub(crate) fn is_raw_evidence_kind(kind: ContextKind) -> bool {
+    matches!(
+        kind,
+        ContextKind::ToolObservation | ContextKind::FileObservation
+    )
 }

@@ -1,7 +1,8 @@
 use agent_contracts::{
     AttentionState, ContextEngine, ContextHints, ContextIngress, ContextItem, ContextItemId,
     ContextKind, ContextMaintenanceTrigger, ContextQuery, ContextRetention, ContextScope,
-    FocusState, LifecycleLabel, ScopeKind, ScopeState, SemanticState, TaskId, ToolOutput,
+    ContextSearchQuery, FocusState, LifecycleLabel, ScopeKind, ScopeState, SemanticState, TaskId,
+    ToolOutput,
 };
 
 use crate::engine::{SimpleContextConfig, SimpleContextEngine};
@@ -728,6 +729,115 @@ async fn task_close_promotes_archived_durable_outcomes_and_resyncs_scope_id() {
         .find(|scope| scope.kind == ScopeKind::Task)
         .expect("task scope");
     assert_eq!(task_scope.state, ScopeState::Closed);
+}
+
+#[tokio::test]
+async fn external_promotion_refreshes_catalog_scope_and_label_indexes() {
+    let dir = tempfile::tempdir().unwrap();
+    let engine = SimpleContextEngine::new(SimpleContextConfig {
+        context_store_dir: Some(dir.path().to_path_buf()),
+        ..SimpleContextConfig::default()
+    });
+    let task_id = open_focus(&engine, "preserve AuthDecision.rs").await;
+    let item_id = {
+        let mut state = engine.state.lock().await;
+        let focus_scope = state
+            .scopes
+            .iter()
+            .find(|scope| scope.kind == ScopeKind::Focus)
+            .expect("focus scope")
+            .id;
+        let mut item = crate::item::make_item(
+            &state,
+            &engine.config,
+            "AuthDecision.rs durable external outcome".into(),
+            ContextKind::Decision,
+            ContextScope::Task,
+            ContextRetention::Durable,
+            0.8,
+            None,
+        );
+        item.task_id = Some(task_id);
+        item.scope_id = Some(focus_scope);
+        item.entities = crate::index::entity::extract_entities(&item.content);
+        let reference = crate::store::externalize(dir.path(), &item).unwrap();
+        state.external.push(crate::store::to_external_entry(
+            &item, reference, 1, 1, None,
+        ));
+        item.id
+    };
+
+    // Seed the catalog before promotion. The regression is a same-length
+    // descriptor edit, so a catalog first built after the close would hide
+    // the missing dirty notification.
+    let before = engine
+        .search_external(ContextSearchQuery {
+            query: "AuthDecision".into(),
+            scope: Some(ContextScope::Task),
+            limit: 8,
+            ..ContextSearchQuery::default()
+        })
+        .await
+        .unwrap();
+    assert_eq!(
+        before.iter().map(|hit| hit.item_id).collect::<Vec<_>>(),
+        vec![item_id]
+    );
+
+    engine
+        .ingest(ContextIngress::TaskCompleted {
+            task_id: Some(task_id),
+            summary: "auth decision preserved".into(),
+        })
+        .await
+        .unwrap();
+    engine
+        .maintain(ContextMaintenanceTrigger::TaskCompleted)
+        .await
+        .unwrap();
+
+    let inspected = engine
+        .inspect_external(item_id)
+        .await
+        .unwrap()
+        .expect("promoted external descriptor remains inspectable");
+    assert_eq!(inspected.scope, ContextScope::Session);
+    assert!(
+        inspected
+            .tags
+            .iter()
+            .any(|tag| tag.is_lifecycle(LifecycleLabel::Promoted)),
+        "inspect must expose the promoted lifecycle"
+    );
+
+    let promoted = engine
+        .search_external(ContextSearchQuery {
+            query: "AuthDecision".into(),
+            scope: Some(ContextScope::Session),
+            label: Some("promoted".into()),
+            limit: 8,
+            ..ContextSearchQuery::default()
+        })
+        .await
+        .unwrap();
+    assert_eq!(
+        promoted.iter().map(|hit| hit.item_id).collect::<Vec<_>>(),
+        vec![item_id],
+        "search must use the promoted scope and label, not stale catalog keys"
+    );
+    let stale_task_hits = engine
+        .search_external(ContextSearchQuery {
+            query: "AuthDecision".into(),
+            scope: Some(ContextScope::Task),
+            limit: 8,
+            ..ContextSearchQuery::default()
+        })
+        .await
+        .unwrap();
+    assert!(
+        stale_task_hits.iter().all(|hit| hit.item_id != item_id),
+        "the old task-scope catalog bucket must be removed"
+    );
 }
 
 #[tokio::test]

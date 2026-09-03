@@ -301,17 +301,26 @@ impl RuntimeActor {
             .filter(|intent| !intent.is_empty());
         let completion_requested =
             turn_intent.is_some_and(crate::execution::ExecutionState::turn_requests_complete);
-        let completion_repair_due = self
-            .state
-            .turn
-            .as_ref()
-            .is_some_and(|turn| latest_completion_gate_was_refused(&turn.turn_frame));
+        let completion_repair_due = self.state.turn.as_ref().is_some_and(|turn| {
+            latest_completion_gate_was_refused(&turn.turn_frame)
+                || turn.execution.completion_repair.is_some()
+        });
         let completion_repair_readiness = completion_repair_due
             .then(|| self.completion_readiness(CompletionIntent::ModelProposal, None));
         let completion_repair_blockers = completion_repair_readiness
             .as_ref()
             .map(CompletionReadiness::applicable_blockers)
             .unwrap_or_default();
+        let completion_repair_terminal = completion_repair_readiness
+            .as_ref()
+            .and_then(|readiness| {
+                self.state
+                    .turn
+                    .as_ref()
+                    .and_then(|turn| turn.execution.completion_repair.as_ref())
+                    .filter(|record| record.terminal_applies(readiness))
+            })
+            .is_some();
         let has_failures = snapshot
             .as_ref()
             .map(|snap| snap.needs.unresolved_failure)
@@ -340,6 +349,7 @@ impl RuntimeActor {
         // current stage every decision and prefer only its resolver; a repair
         // helper may never abort the round if loading or packing it fails.
         if completion_repair_due
+            && !completion_repair_terminal
             && !completion_repair_blockers
                 .iter()
                 .any(|blocker| blocker.requires_operator_repair())
@@ -375,7 +385,11 @@ impl RuntimeActor {
             } else if proof_blocked
                 && completion_repair_readiness
                     .as_ref()
-                    .and_then(|readiness| self.current_completion_proof_route(readiness))
+                    // Surface planning must use the host-owned route: asking
+                    // the model-surface resolver whether verify.run was on the
+                    // previous captured surface creates a cold-start cycle in
+                    // which the tool can never be loaded.
+                    .and_then(|readiness| self.runtime_completion_proof_route(readiness))
                     .is_some()
             {
                 Some((
@@ -556,6 +570,9 @@ impl RuntimeActor {
         if let Some(turn) = self.state.turn.as_mut() {
             turn.recovery_surface_request = None;
         }
+        if completion_repair_terminal {
+            surface_plan.force_completion_finalization();
+        }
         surface_plan
             .source_revisions_mut()
             .task_requirement_revision = task_requirement_revision;
@@ -570,7 +587,7 @@ impl RuntimeActor {
             surface_plan.add_unavailable(requirement);
         }
 
-        if !unavailable_must.is_empty() {
+        if !completion_repair_terminal && !unavailable_must.is_empty() {
             let surface_revision = match self.issue_surface_revision() {
                 Ok(revision) => revision,
                 Err(error) => {
@@ -680,8 +697,13 @@ impl RuntimeActor {
         } else {
             DEFAULT_OUTPUT_RESERVE
         };
-        let (runtime_focus, task_view, base_progress_view, settlement_candidate) =
-            self.runtime_prompt_focus(&turn_frame).await;
+        let proof_surface_available = surface_plan
+            .specs()
+            .iter()
+            .any(|spec| spec.name == "verify.run");
+        let (runtime_focus, task_view, mut base_progress_view, settlement_candidate) = self
+            .runtime_prompt_focus(&turn_frame, proof_surface_available)
+            .await;
         let project_settlement = self.services.project_settlement();
         let settlement_projection_diagnostics = self.services.settlement_projection_diagnostics();
         // Product requests are budgeted against the arm they actually send.
@@ -924,6 +946,27 @@ impl RuntimeActor {
         while packed_total(&input, &packing_input) > max_input_budget {
             if surface_plan.omit_largest_for_provider_budget().is_none() {
                 break;
+            }
+            let final_proof_surface_available = surface_plan
+                .specs()
+                .iter()
+                .any(|spec| spec.name == "verify.run");
+            if final_proof_surface_available != proof_surface_available {
+                self.project_completion_repair(
+                    &mut base_progress_view,
+                    final_proof_surface_available,
+                );
+                (treatment_progress_view, progress_view) = settlement_progress_views(
+                    &base_progress_view,
+                    settlement_candidate,
+                    project_settlement,
+                    settlement_projection_diagnostics,
+                );
+                packing_progress_view = if settlement_projection_diagnostics {
+                    treatment_progress_view.clone()
+                } else {
+                    progress_view.clone()
+                };
             }
             (input, body_cache_stats) = self.assemble_model_input(
                 runtime_focus.as_ref(),
@@ -1661,6 +1704,7 @@ impl RuntimeActor {
     async fn runtime_prompt_focus(
         &self,
         turn_frame: &TurnFrame,
+        proof_surface_available: bool,
     ) -> (
         Option<FocusState>,
         Option<TaskAnchorView>,
@@ -1688,31 +1732,7 @@ impl RuntimeActor {
         } else {
             None
         };
-        if let Some(progress) = progress.as_mut().filter(|_| {
-            self.state.turn.as_ref().is_some_and(|turn| {
-                latest_completion_gate_was_refused(&turn.turn_frame)
-                    || turn.execution.completion_repair.is_some()
-            })
-        }) {
-            let readiness = self.completion_readiness(CompletionIntent::ModelProposal, None);
-            let rendered = self
-                .state
-                .turn
-                .as_ref()
-                .and_then(|turn| turn.execution.completion_repair.as_ref())
-                .filter(|record| record.matches_basis(&readiness))
-                .map(|record| record.text.clone())
-                .unwrap_or_else(|| {
-                    // A durable stage whose basis drifted is stale; derive
-                    // the current stage from readiness for this decision.
-                    // A drifted basis is a fresh stage, so the refusal count
-                    // starts at zero.
-                    let (_, rendered) = self.completion_repair_plan(&readiness, 0);
-                    rendered
-                });
-            progress.completion_repair =
-                Some(bounded_preview(&rendered, COMPLETION_REPAIR_VIEW_CHARS));
-        }
+        self.project_completion_repair(&mut progress, proof_surface_available);
         // Advisory completion-opportunity (default off): project the bounded
         // closure statement only while the one-decision lease is live.
         if let Some(progress) = progress.as_mut().filter(|_| {
@@ -1744,6 +1764,65 @@ impl RuntimeActor {
             progress,
             settlement_candidate,
         )
+    }
+
+    /// Completion repair is a Runtime liveness layer, not the optional
+    /// TaskProgress experiment. It therefore creates a minimal bounded frame
+    /// when needed and always renders against the tool surface that will
+    /// actually reach the provider.
+    fn project_completion_repair(
+        &self,
+        progress: &mut Option<TaskProgressView>,
+        proof_surface_available: bool,
+    ) {
+        let due = self.state.turn.as_ref().is_some_and(|turn| {
+            latest_completion_gate_was_refused(&turn.turn_frame)
+                || turn.execution.completion_repair.is_some()
+        });
+        if !due {
+            return;
+        }
+        let readiness = self.completion_readiness(CompletionIntent::ModelProposal, None);
+        let episode = self
+            .state
+            .turn
+            .as_ref()
+            .and_then(|turn| turn.execution.completion_repair.as_ref())
+            .filter(|record| record.matches_episode(&readiness));
+        // Persist only typed episode facts as authority. Plan/text in old
+        // checkpoints are diagnostic compatibility fields and are never
+        // injected into the prompt.
+        let (_, rendered) = self.completion_repair_plan(
+            &readiness,
+            episode.map(|record| record.refusal_count).unwrap_or(0),
+            episode.map(|record| record.no_progress_steps).unwrap_or(0),
+            episode.is_some_and(|record| record.terminal_applies(&readiness)),
+            proof_surface_available,
+        );
+        if progress.is_none() {
+            let source = self
+                .state
+                .turn
+                .as_ref()
+                .map(|turn| turn.execution.view())
+                .or_else(|| {
+                    self.state
+                        .task_id
+                        .and_then(|task_id| self.state.tasks.get(task_id))
+                        .map(|task| task.resume.view())
+                })
+                .unwrap_or_default();
+            *progress = Some(TaskProgressView {
+                anchor_revision: source.anchor_revision,
+                workspace_revision: source.workspace_revision,
+                failed_commands: source.failed_commands,
+                unresolved_blockers: source.unresolved_blockers,
+                completion_commit_failure: source.completion_commit_failure,
+                ..TaskProgressView::default()
+            });
+        }
+        progress.as_mut().expect("repair projection exists").completion_repair =
+            Some(bounded_preview(&rendered, COMPLETION_REPAIR_VIEW_CHARS));
     }
 }
 

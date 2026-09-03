@@ -575,10 +575,66 @@ impl JournaledEffectBroker {
     ) -> AgentResult<Option<EffectReconciliation>> {
         self.journal.reconcile(context)
     }
+
+    /// 按效果身份直接分类持久预留，供运行时恢复持久化的 ACK 债务。
+    /// 身份即效果 id 本身：调用方（恢复出的债务）不携带派发时快照，
+    /// 因此这里不做 `matches` 漂移检查。None = 日志从未管理过该效果。
+    pub fn reconcile_effect_id(
+        &self,
+        effect_id: &EffectId,
+    ) -> AgentResult<Option<EffectReconciliation>> {
+        let state = self.journal.state.lock().expect("broker journal poisoned");
+        if let Some(error) = &state.failed {
+            return Err(AgentError::Storage(error.clone()));
+        }
+        let Some(entry) = state.recovery.by_effect.get(effect_id) else {
+            return Ok(None);
+        };
+        Ok(Some(match (entry.dispatched, &entry.acked_settlement) {
+            (false, _) => EffectReconciliation::NotApplied {
+                evidence: Some("broker reservation was never dispatched".into()),
+            },
+            (true, None) => EffectReconciliation::Ambiguous {
+                reason: format!(
+                    "broker reservation {} was dispatched without a durable acknowledgement",
+                    entry.record.reservation_id
+                ),
+            },
+            (true, Some(agent_contracts::EffectAckSettlement::Applied { durability })) => {
+                EffectReconciliation::Applied {
+                    durability: durability.clone(),
+                    evidence: Some(format!(
+                        "broker:{}:acked-applied",
+                        entry.record.reservation_id
+                    )),
+                }
+            }
+            (true, Some(agent_contracts::EffectAckSettlement::NotApplied)) => {
+                EffectReconciliation::NotApplied {
+                    evidence: Some("broker acknowledged the dispatch as not applied".into()),
+                }
+            }
+            (true, Some(agent_contracts::EffectAckSettlement::Unknown)) => {
+                EffectReconciliation::Ambiguous {
+                    reason: format!(
+                        "broker reservation {} acknowledged the outcome as unknown",
+                        entry.record.reservation_id
+                    ),
+                }
+            }
+        }))
+    }
 }
 
 #[async_trait::async_trait]
 impl EffectBroker for JournaledEffectBroker {
+    fn reconcile_effect_id(
+        &self,
+        effect_id: &EffectId,
+    ) -> AgentResult<Option<EffectReconciliation>> {
+        JournaledEffectBroker::reconcile_effect_id(self, effect_id)
+    }
+
     async fn reserve(&self, reservation: EffectReservation) -> AgentResult<String> {
         let reservation_id = self.inner.reserve(reservation.clone()).await?;
         self.journal.record_reserved(
@@ -1595,6 +1651,86 @@ mod tests {
         assert!(
             reopened
                 .reconcile(&context_of(&identity, EffectId::new()))
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    /// 恢复出的 ACK 债务只携带效果身份：按身份分类同样跨重开成立，
+    /// 且未知效果返回 None（调用方保持债务未解除并维持恢复围栏）。
+    #[tokio::test]
+    async fn effect_id_classification_survives_a_reopen() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("r.jsonl");
+        let identity = identity();
+        let pending = EffectId::new();
+        let applied = EffectId::new();
+        let refused = EffectId::new();
+        let inflight = EffectId::new();
+
+        {
+            let broker = journaled(&dir).await;
+            broker
+                .reserve(reservation_for(&identity, pending, None))
+                .await
+                .unwrap();
+            broker
+                .reserve(reservation_for(&identity, applied, None))
+                .await
+                .unwrap();
+            dispatch_as(&broker, &identity, applied, true).await;
+            broker
+                .ack(EffectAck {
+                    reservation_id: format!("pass/{applied}"),
+                    operation_id: identity.operation_id,
+                    settlement: agent_contracts::EffectAckSettlement::Applied {
+                        durability: agent_contracts::EffectDurability::Durable,
+                    },
+                    receipt_summary: "fixture".into(),
+                })
+                .await
+                .unwrap();
+            broker
+                .reserve(reservation_for(&identity, refused, None))
+                .await
+                .unwrap();
+            dispatch_as(&broker, &identity, refused, false).await;
+            broker
+                .ack(EffectAck {
+                    reservation_id: format!("pass/{refused}"),
+                    operation_id: identity.operation_id,
+                    settlement: agent_contracts::EffectAckSettlement::NotApplied,
+                    receipt_summary: "fixture".into(),
+                })
+                .await
+                .unwrap();
+            broker
+                .reserve(reservation_for(&identity, inflight, None))
+                .await
+                .unwrap();
+            dispatch_as(&broker, &identity, inflight, true).await;
+        }
+
+        let reopened = JournaledEffectBroker::open(Arc::new(PassThroughBroker), &path).unwrap();
+        assert!(matches!(
+            reopened.reconcile_effect_id(&pending).unwrap(),
+            Some(EffectReconciliation::NotApplied { .. })
+        ));
+        assert!(matches!(
+            reopened.reconcile_effect_id(&applied).unwrap(),
+            Some(EffectReconciliation::Applied { .. })
+        ));
+        assert!(matches!(
+            reopened.reconcile_effect_id(&refused).unwrap(),
+            Some(EffectReconciliation::NotApplied { .. })
+        ));
+        assert!(matches!(
+            reopened.reconcile_effect_id(&inflight).unwrap(),
+            Some(EffectReconciliation::Ambiguous { .. })
+        ));
+        assert!(
+            reopened
+                .reconcile_effect_id(&EffectId::new())
                 .unwrap()
                 .is_none()
         );

@@ -18,8 +18,9 @@ use std::collections::{BinaryHeap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
 use agent_contracts::{
-    AccessSignal, ContextItem, ContextItemId, ContextKind, ContextRef, ContextResidency,
-    ContextRetention, ExternalizedContext, StorageGcReport, StoreReconcileReport,
+    AccessSignal, AgentError, AgentResult, ContextItem, ContextItemId, ContextKind, ContextRef,
+    ContextResidency, ContextRetention, ContextSearchQuery, ExternalizedContext,
+    SearchIncompleteReason, StorageGcReport, StoreReconcileReport,
 };
 
 use crate::engine::{SimpleContextConfig, State};
@@ -33,6 +34,26 @@ const SUMMARY_CHARS: usize = 120;
 /// would trade one problem for another (fd/thread pressure on a store with
 /// tens of thousands of blobs).
 pub(crate) const MAX_STORE_IO_CONCURRENCY: usize = 8;
+/// Maximum Stored semantic bodies one explicit search may read. Crossing the
+/// bound is an explicit, refinable error rather than a silently partial result
+/// or an unbounded disk scan.
+pub(crate) const MAX_STORED_SEARCH_READS: usize = 256;
+/// Byte ceiling for one formal Context body on authority-bearing async read
+/// and write paths. Normal items are capped at 16,000 characters plus small
+/// bounded metadata; the headroom keeps legacy valid blobs readable while a
+/// replaced/corrupt file cannot multiply memory by the eight-read search fanout.
+pub(crate) const MAX_CONTEXT_STORE_BLOB_BYTES: usize = 1_048_576;
+
+/// One checked blob read needed to close an explicitly incomplete catalog
+/// query. The descriptor text is captured with the owner/checksum so the
+/// lock-free phase can verify a body match without retaining every body in
+/// memory. The final commit rechecks the current owner and checksum.
+pub(crate) struct StoredSearchRead {
+    item_id: ContextItemId,
+    expected_checksum: Option<String>,
+    expected_kind: ContextKind,
+    descriptor_text: String,
+}
 
 /// FNV-1a 64-bit checksum of a blob, hex-encoded. Not cryptographic: it is
 /// a corruption/bit-rot detector for reconcile, which compares the blob
@@ -113,6 +134,15 @@ pub(crate) async fn externalize_async(
     item_id: ContextItemId,
     bytes: &[u8],
 ) -> std::io::Result<String> {
+    if bytes.len() > MAX_CONTEXT_STORE_BLOB_BYTES {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!(
+                "context store blob is {} bytes; maximum is {MAX_CONTEXT_STORE_BLOB_BYTES}",
+                bytes.len()
+            ),
+        ));
+    }
     tokio::fs::create_dir_all(dir).await?;
     let path = file_path(dir, item_id);
     let tmp = dir.join(format!("{item_id}.tmp"));
@@ -163,10 +193,45 @@ pub(crate) async fn read_item_checked_async(
     item_id: ContextItemId,
     expected_checksum: Option<&str>,
 ) -> Result<ContextItem, StoreReadFailure> {
-    let bytes = tokio::fs::read(file_path(dir, item_id))
+    let bytes = read_bounded_blob(&file_path(dir, item_id))
         .await
-        .map_err(classify_read_io)?;
+        .map_err(|error| {
+            if error.kind() == std::io::ErrorKind::InvalidData {
+                StoreReadFailure::Corrupt
+            } else {
+                classify_read_io(error)
+            }
+        })?;
     decode_item(item_id, &bytes, expected_checksum)
+}
+
+/// Read through one opened handle with both a metadata fast refusal and a
+/// `take(cap + 1)` guard, so growth/replacement around the metadata check
+/// cannot turn a Context read into an unbounded allocation.
+async fn read_bounded_blob(path: &Path) -> std::io::Result<Vec<u8>> {
+    use tokio::io::AsyncReadExt;
+
+    let file = tokio::fs::File::open(path).await?;
+    let metadata = file.metadata().await?;
+    if metadata.len() > MAX_CONTEXT_STORE_BLOB_BYTES as u64 {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!(
+                "context store blob is {} bytes; maximum is {MAX_CONTEXT_STORE_BLOB_BYTES}",
+                metadata.len()
+            ),
+        ));
+    }
+    let mut bytes = Vec::with_capacity(metadata.len() as usize);
+    let mut limited = file.take(MAX_CONTEXT_STORE_BLOB_BYTES as u64 + 1);
+    limited.read_to_end(&mut bytes).await?;
+    if bytes.len() > MAX_CONTEXT_STORE_BLOB_BYTES {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("context store blob exceeds the {MAX_CONTEXT_STORE_BLOB_BYTES}-byte maximum"),
+        ));
+    }
+    Ok(bytes)
 }
 
 fn classify_read_io(error: std::io::Error) -> StoreReadFailure {
@@ -194,15 +259,27 @@ fn decode_item(
 
 /// Deterministic catalog search — no vectors. Candidate generation prefers
 /// the catalog indexes (kind/scope/task/label/entity keys) across Resident,
-/// Warm, and Stored. A free-text needle that hits none of those keys
-/// residual-scans summaries/uris. Raw ToolObservation / FileObservation
-/// summaries are identity (`path@rev`) on this surface, so file text is
-/// not a search needle. Ranking is unchanged: entity
+/// Warm, and Stored. An explicitly incomplete candidate set residual-checks
+/// full semantic bodies; Stored checks happen in a preceding lock-free IO
+/// phase. Raw ToolObservation / FileObservation summaries are identity
+/// (`path@rev`) on this surface, so file text is not a search needle. Ranking is unchanged: entity
 /// matches first, then recency, bounded to `limit`. Resident/Warm hits are
 /// projected descriptors (no store read) so a live file is not an empty miss.
 pub(crate) fn search_catalog(
     state: &State,
     query: &agent_contracts::ContextSearchQuery,
+) -> Vec<ExternalizedContext> {
+    search_catalog_with_verified_bodies(state, query, &HashMap::new())
+}
+
+/// Search with exact Stored-body matches proven during a preceding checked
+/// IO phase. The map value is the owner's captured checksum (or `None` for a
+/// legacy parse/id-validated owner) plus its kind; a hit is accepted only
+/// while the same live external owner still carries both stamps.
+pub(crate) fn search_catalog_with_verified_bodies(
+    state: &State,
+    query: &ContextSearchQuery,
+    verified_bodies: &HashMap<ContextItemId, (Option<String>, ContextKind)>,
 ) -> Vec<ExternalizedContext> {
     match state.catalog.search_candidates(query) {
         Some(candidates) => {
@@ -212,20 +289,173 @@ pub(crate) fn search_catalog(
                 .ids
                 .into_iter()
                 .filter_map(|id| project_search_hit(state, id));
-            if candidates.incomplete.is_some() {
+            let body_of = |id: ContextItemId| {
+                catalog_body(state, id)
+                    .filter(|item| crate::index::catalog::kind_has_searchable_body(item.kind))
+                    .map(|item| item.content)
+            };
+            if let Some(incomplete) = candidates.incomplete {
                 // 完备性保证：索引可能没看全，非候选走同一个有界堆——
-                // 惰性投影把内存保持在 O(limit)，正文闭包让深正文关键
-                // 词对真实内容校验，而不是只对有界的投影摘要。
-                let residual = residual_live_candidates(state)
-                    .filter(move |entry| !seen.contains(&entry.item_id));
-                let body_of = |id: ContextItemId| catalog_body(state, id).map(|item| item.content);
-                search_entries_with(primary.chain(residual), query, Some(&body_of))
+                // 截断只复核真正不完整且满足结构过滤的条目；posting 饱和
+                // 才需要覆盖全部非候选。一个无关长正文不会再扩大整份目录。
+                let residual = residual_live_candidates(state).filter(move |entry| {
+                    !seen.contains(&entry.item_id)
+                        && match incomplete {
+                            SearchIncompleteReason::TruncatedIndexedText => state
+                                .catalog
+                                .is_truncated_search_candidate(entry.item_id, query),
+                            SearchIncompleteReason::SaturatedPosting => true,
+                            SearchIncompleteReason::UnindexedQueryShape => {
+                                state.catalog.is_search_candidate(entry.item_id, query)
+                            }
+                        }
+                });
+                let verified_body = |id: ContextItemId| {
+                    let Some((expected_checksum, expected_kind)) = verified_bodies.get(&id) else {
+                        return false;
+                    };
+                    state.external.get(id).is_some_and(|entry| {
+                        externally_retrievable(entry)
+                            && crate::index::catalog::kind_has_searchable_body(entry.kind)
+                            && entry.kind == *expected_kind
+                            && entry.blob_checksum == *expected_checksum
+                    })
+                };
+                search_entries_with(
+                    primary.chain(residual),
+                    query,
+                    Some(&body_of),
+                    Some(&verified_body),
+                )
             } else {
-                search_entries(primary, query)
+                // Resident/Warm catalog text is indexed up to 512 chars,
+                // while its descriptor summary is only 120. Verify against
+                // the in-memory body so a legitimate indexed-prefix hit is
+                // not discarded after candidate generation.
+                search_entries_with(primary, query, Some(&body_of), None)
             }
         }
         None => search_entries(residual_live_candidates(state), query),
     }
+}
+
+/// Plan exactly the Stored bodies that can close this query's catalog
+/// incompleteness. Raw Tool/File observations are deliberately absent: their
+/// body is Fetch-only and only their path/revision descriptor is searchable.
+pub(crate) fn plan_stored_search_reads(
+    state: &State,
+    query: &ContextSearchQuery,
+) -> AgentResult<Vec<StoredSearchRead>> {
+    let needle = query.query.trim().to_lowercase();
+    let needle_tokens = agent_contracts::tokenize_query_fragments(&needle);
+    let query_needs_residual = agent_contracts::query_needs_text_residual(&needle);
+    let mut reads = Vec::new();
+    for entry in state.external.iter().filter(|entry| {
+        crate::index::catalog::kind_has_searchable_body(entry.kind)
+            && state
+                .catalog
+                .is_truncated_search_candidate(entry.item_id, query)
+    }) {
+        // Raw evidence was excluded by the catalog predicate, so the stored
+        // semantic descriptor can be read in place without cloning
+        // dependencies/tags for every residual candidate.
+        let descriptor_text = searchable_descriptor_text(entry);
+        if searchable_text_matches(
+            &descriptor_text,
+            None,
+            &needle,
+            &needle_tokens,
+            query_needs_residual,
+        ) {
+            continue;
+        }
+        if reads.len() >= MAX_STORED_SEARCH_READS {
+            return Err(AgentError::InvalidRequest(format!(
+                "context search requires more than {MAX_STORED_SEARCH_READS} Stored body reads; refine kind/task/label or use a more specific query"
+            )));
+        }
+        reads.push(StoredSearchRead {
+            item_id: entry.item_id,
+            expected_checksum: entry.blob_checksum.clone(),
+            expected_kind: entry.kind,
+            descriptor_text,
+        });
+    }
+    Ok(reads)
+}
+
+/// Read a Stored residual with fixed concurrency and retain only ids whose
+/// complete body actually satisfies the query. Bodies are released as each
+/// read completes; memory is O(plan descriptors + verified ids), never
+/// O(history × body size). A missing, corrupt or unreadable planned blob is
+/// explicit rather than being misreported as a complete no-match result.
+pub(crate) async fn verify_stored_search_reads(
+    dir: &Path,
+    plan: Vec<StoredSearchRead>,
+    query: &ContextSearchQuery,
+) -> AgentResult<HashMap<ContextItemId, (Option<String>, ContextKind)>> {
+    let needle = query.query.trim().to_lowercase();
+    let needle_tokens = agent_contracts::tokenize_query_fragments(&needle);
+    let query_needs_residual = agent_contracts::query_needs_text_residual(&needle);
+    let mut pending = plan.into_iter();
+    let mut reads = tokio::task::JoinSet::new();
+    for _ in 0..MAX_STORE_IO_CONCURRENCY {
+        let Some(read) = pending.next() else {
+            break;
+        };
+        spawn_stored_search_read(&mut reads, dir.to_path_buf(), read);
+    }
+
+    let mut verified = HashMap::new();
+    while let Some(joined) = reads.join_next().await {
+        let (read, result) = joined.map_err(|error| {
+            AgentError::Context(format!("context store search read task failed: {error}"))
+        })?;
+        match result {
+            Ok(item) => {
+                if item.kind != read.expected_kind
+                    || !crate::index::catalog::kind_has_searchable_body(item.kind)
+                {
+                    return Err(AgentError::Context(format!(
+                        "context store search read for {} is corrupt: descriptor kind {:?} does not match searchable body kind {:?}",
+                        read.item_id, read.expected_kind, item.kind
+                    )));
+                }
+                if searchable_text_matches(
+                    &read.descriptor_text,
+                    Some(&item.content),
+                    &needle,
+                    &needle_tokens,
+                    query_needs_residual,
+                ) {
+                    verified.insert(read.item_id, (read.expected_checksum, read.expected_kind));
+                }
+            }
+            Err(failure) => {
+                return Err(AgentError::Context(format!(
+                    "context store search read for {} failed: {}",
+                    read.item_id,
+                    read_failure_name(failure)
+                )));
+            }
+        }
+        if let Some(read) = pending.next() {
+            spawn_stored_search_read(&mut reads, dir.to_path_buf(), read);
+        }
+    }
+    Ok(verified)
+}
+
+fn spawn_stored_search_read(
+    reads: &mut tokio::task::JoinSet<(StoredSearchRead, Result<ContextItem, StoreReadFailure>)>,
+    dir: PathBuf,
+    read: StoredSearchRead,
+) {
+    reads.spawn(async move {
+        let result =
+            read_item_checked_async(&dir, read.item_id, read.expected_checksum.as_deref()).await;
+        (read, result)
+    });
 }
 
 /// Lazy residual scan for a free-text needle that hit no catalog index
@@ -328,50 +558,37 @@ fn project_item(item: &ContextItem) -> ExternalizedContext {
 /// retrieval cards do not dump stdout or file text. The store map still
 /// keeps the 120-char residual for GC classification of unsourced replay.
 pub(crate) fn prompt_evidence_descriptor(mut entry: ExternalizedContext) -> ExternalizedContext {
-    if let Some(summary) = evidence_ref_identity(&entry) {
+    if let Some(summary) = crate::item::raw_evidence_identity(
+        entry.kind,
+        entry.file_path.as_deref(),
+        entry.file_revision.as_deref(),
+    ) {
+        entry.entities = entry
+            .file_path
+            .as_deref()
+            .map(str::trim)
+            .filter(|path| !path.is_empty())
+            .map(|path| vec![path.to_string()])
+            .unwrap_or_default();
         entry.context_ref.summary = summary;
     }
     entry
-}
-
-fn evidence_ref_identity(entry: &ExternalizedContext) -> Option<String> {
-    match entry.kind {
-        ContextKind::ToolObservation | ContextKind::FileObservation => {
-            let path = entry
-                .file_path
-                .as_deref()
-                .map(str::trim)
-                .filter(|path| !path.is_empty());
-            Some(match path {
-                Some(path) => match entry
-                    .file_revision
-                    .as_deref()
-                    .map(str::trim)
-                    .filter(|revision| !revision.is_empty())
-                {
-                    Some(revision) => format!("{path}@{revision}"),
-                    None => path.to_string(),
-                },
-                None => entry.kind.as_str().to_string(),
-            })
-        }
-        _ => None,
-    }
 }
 
 /// Rank and cap owned candidate projections. Memory stays O(limit): the
 /// heap holds at most `limit` rows and every non-surviving candidate is
 /// dropped as soon as it loses.
 ///
-/// A needle verifies against an entry by whole substring first; multi-word
-/// needles fall back to requiring *every* token (shared `tokenize` rule)
-/// to appear in that entry's matchable text, so catalog token recall
-/// survives verification without loosening precision to any-word matches.
+/// Entity/label/path identity keeps case-insensitive substring matching.
+/// Bounded summaries and semantic bodies require every exact query
+/// token; short/CJK shapes use explicit fragment-aware residual verification. Thus
+/// candidate recall survives verification without making arbitrary ASCII
+/// mid-token fragments part of semantic-body search.
 pub(crate) fn search_entries(
     entries: impl IntoIterator<Item = ExternalizedContext>,
     query: &agent_contracts::ContextSearchQuery,
 ) -> Vec<ExternalizedContext> {
-    search_entries_with(entries, query, None)
+    search_entries_with(entries, query, None, None)
 }
 
 /// 与 [`search_entries`] 相同的排序与校验，另带一个可选的全文读取，
@@ -381,17 +598,19 @@ pub(crate) fn search_entries_with(
     entries: impl IntoIterator<Item = ExternalizedContext>,
     query: &agent_contracts::ContextSearchQuery,
     body_of: Option<&dyn Fn(ContextItemId) -> Option<String>>,
+    verified_body: Option<&dyn Fn(ContextItemId) -> bool>,
 ) -> Vec<ExternalizedContext> {
-    let needle = query.query.to_lowercase();
+    let needle = query.query.trim().to_lowercase();
     let limit = if query.limit == 0 { 16 } else { query.limit };
     if limit == 0 {
         return Vec::new();
     }
 
-    // 多词 needle 的覆盖校验输入：共享 tokenize 规则，去重保序。单
-    // token 时兜底退化为整段子串本身，直接关闭；复用缓冲避免逐条分配。
-    let needle_tokens = agent_contracts::tokenize(&needle);
-    let token_verify = needle_tokens.len() > 1;
+    // Query tokens are not clipped to the document-index budget: final AND
+    // verification must include every token admitted by the 256-char boundary.
+    let needle_tokens = agent_contracts::tokenize_query_fragments(&needle);
+    let query_needs_residual = agent_contracts::query_needs_text_residual(&needle);
+    let exact_ref = ContextItemId::parse_ref(query.query.trim()).ok();
     let mut haystack = String::new();
 
     // A max-heap of the `limit` *best* matches so far: the peek is the
@@ -439,41 +658,33 @@ pub(crate) fn search_entries_with(
             .file_path
             .as_deref()
             .is_some_and(|path| path.to_lowercase().contains(&needle));
-        if !needle.is_empty()
-            && !entity_match
-            && !path_match
-            && !entry.context_ref.summary.to_lowercase().contains(&needle)
-            && !entry.context_ref.uri.to_lowercase().contains(&needle)
-        {
-            // 整段未命中时的确定性兜底：候选层已按 token 召回多词查询，
-            // 校验若仍要求整段子串会把它们全部拒掉。改为要求 needle 的
-            // 每个 token（共享 tokenize 规则，≥2 字符）都出现在本条目的
-            // 可匹配文本里——AND 语义，不放宽为任意单词命中。带正文闭包
-            // 的残差通道对单 token 同样生效：深正文关键词只有正文里有。
-            if !token_verify && body_of.is_none() {
-                continue;
-            }
-            haystack.clear();
-            for entity in &entry.entities {
-                haystack.push_str(entity);
-                haystack.push(' ');
-            }
-            if let Some(path) = entry.file_path.as_deref() {
-                haystack.push_str(path);
-                haystack.push(' ');
-            }
-            haystack.push_str(&entry.context_ref.summary);
-            haystack.push(' ');
-            haystack.push_str(&entry.context_ref.uri);
-            if let Some(body_of) = body_of
-                && let Some(body) = body_of(entry.item_id)
-            {
-                haystack.push(' ');
-                haystack.push_str(&body);
-            }
-            let lowered = haystack.to_lowercase();
-            if !needle_tokens.iter().all(|t| lowered.contains(t.as_str())) {
-                continue;
+        let label_match = entry
+            .tags
+            .iter()
+            .any(|tag| tag.as_str().to_lowercase().contains(&needle));
+        let ref_match = exact_ref == Some(entry.item_id);
+        if !needle.is_empty() && !entity_match && !path_match && !label_match && !ref_match {
+            // Identity fields keep their explicit substring semantics above.
+            // Summary/semantic bodies use exact word tokens; short/CJK
+            // shapes take the explicit bounded substring-residual path.
+            let stored_body_verified = verified_body.is_some_and(|matches| matches(entry.item_id));
+            if !stored_body_verified {
+                haystack.clear();
+                append_searchable_descriptor(&mut haystack, &entry);
+                let body = if crate::index::catalog::kind_has_searchable_body(entry.kind) {
+                    body_of.and_then(|body_of| body_of(entry.item_id))
+                } else {
+                    None
+                };
+                if !searchable_text_matches(
+                    &haystack,
+                    body.as_deref(),
+                    &needle,
+                    &needle_tokens,
+                    query_needs_residual,
+                ) {
+                    continue;
+                }
             }
         }
         let candidate = SearchEntry {
@@ -493,6 +704,111 @@ pub(crate) fn search_entries_with(
     let mut rows: Vec<SearchEntry> = top.into_vec();
     rows.sort();
     rows.into_iter().map(|row| row.entry).collect()
+}
+
+fn searchable_descriptor_text(entry: &ExternalizedContext) -> String {
+    let mut text = String::new();
+    append_searchable_descriptor(&mut text, entry);
+    text
+}
+
+fn append_searchable_descriptor(text: &mut String, entry: &ExternalizedContext) {
+    for entity in &entry.entities {
+        text.push_str(entity);
+        text.push(' ');
+    }
+    if let Some(path) = entry.file_path.as_deref() {
+        text.push_str(path);
+        text.push(' ');
+    }
+    for tag in &entry.tags {
+        text.push_str(tag.as_str());
+        text.push(' ');
+    }
+    text.push_str(&entry.context_ref.summary);
+}
+
+/// Match exact word tokens across bounded descriptors and semantic bodies.
+/// Queries whose word boundaries cannot be indexed use bounded residuals:
+/// short ASCII fragments remain exact tokens and CJK fragments use substring. Entity/label/path substring matching
+/// happens before this helper. `body` is present only for semantic context
+/// kinds; raw Tool/File evidence never reaches this helper as a body.
+fn searchable_text_matches(
+    descriptor: &str,
+    body: Option<&str>,
+    needle: &str,
+    needle_tokens: &[String],
+    query_needs_residual: bool,
+) -> bool {
+    let descriptor = descriptor.to_lowercase();
+    let body = body.map(str::to_lowercase);
+    if query_needs_residual
+        && (descriptor.contains(needle)
+            || body.as_deref().is_some_and(|body| body.contains(needle)))
+    {
+        return true;
+    }
+    let mut text = String::with_capacity(
+        descriptor
+            .len()
+            .saturating_add(body.as_deref().map(str::len).unwrap_or_default())
+            .saturating_add(1),
+    );
+    text.push_str(&descriptor);
+    if let Some(body) = body {
+        text.push(' ');
+        text.push_str(&body);
+    }
+    all_query_fragments_match(&text, needle_tokens)
+}
+
+/// Stream document tokens without the inverted index's 64-token cap. This
+/// avoids allocating an O(body tokens) vector. ASCII fragments, including a
+/// one-character residual fragment, require an exact document token; non-ASCII
+/// fragments use substring matching because this tokenizer has no sound CJK
+/// word boundary model.
+fn all_query_fragments_match(text: &str, query_tokens: &[String]) -> bool {
+    if query_tokens.is_empty() {
+        return false;
+    }
+    let substring_mode: Vec<bool> = query_tokens
+        .iter()
+        .map(|query| agent_contracts::query_fragment_uses_substring(query))
+        .collect();
+    let mut matched: Vec<bool> = query_tokens
+        .iter()
+        .zip(&substring_mode)
+        .map(|(query, substring)| *substring && text.contains(query))
+        .collect();
+    let mut remaining = matched.iter().filter(|matched| !**matched).count();
+    if remaining == 0 {
+        return true;
+    }
+    let mut current = String::new();
+    let check = |token: &str, matched: &mut [bool], remaining: &mut usize| {
+        if token.is_empty() {
+            return;
+        }
+        for (index, query) in query_tokens.iter().enumerate() {
+            if !matched[index] && !substring_mode[index] && token == query {
+                matched[index] = true;
+                *remaining -= 1;
+            }
+        }
+    };
+    for ch in text.chars() {
+        if ch.is_alphanumeric() {
+            current.extend(ch.to_lowercase());
+        } else if !current.is_empty() {
+            check(&current, &mut matched, &mut remaining);
+            if remaining == 0 {
+                return true;
+            }
+            current.clear();
+        }
+    }
+    check(&current, &mut matched, &mut remaining);
+    remaining == 0
 }
 
 /// One search hit under its ranking key, so the bounded heap can order by
@@ -1042,8 +1358,22 @@ pub(crate) async fn run_reconcile_io(
             .await;
             continue;
         };
-        let bytes = match tokio::fs::read(&path).await {
+        let bytes = match read_bounded_blob(&path).await {
             Ok(bytes) => bytes,
+            Err(e) if e.kind() == std::io::ErrorKind::InvalidData => {
+                quarantine(
+                    &quarantine_dir,
+                    &path,
+                    &name,
+                    &mut io,
+                    &format!("oversized blob: {e}"),
+                )
+                .await;
+                if map_checksums.contains_key(&item_id) {
+                    io.owner_quarantined_ids.push(item_id);
+                }
+                continue;
+            }
             Err(e) => {
                 io.io_errors += 1;
                 io.reasons.push(format!("unreadable blob {name}: {e}"));
@@ -1316,6 +1646,8 @@ mod tests {
     #[test]
     fn external_entries_carry_the_entity_signature_and_dependencies() {
         let mut item = test_item(ContextItemId::new(), "fix AuthService.rs");
+        item.file_path = Some("AuthService.rs".into());
+        item.entities.push("AuthService.rs".into());
         item.dependencies
             .push(DependencyEdge::shares(ContextItemId::new()));
         let reference = ContextRef {
@@ -2018,6 +2350,41 @@ mod tests {
             "the tampered evidence is preserved for inspection"
         );
         assert_eq!(state.external.len(), 0, "no entry survives the retire");
+    }
+
+    #[tokio::test]
+    async fn reconcile_quarantines_an_oversized_owned_blob_without_loading_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut state = State::default();
+        let id = ContextItemId::new();
+        let item = test_item(id, "owned descriptor");
+        state.external.push(to_external_entry(
+            &item,
+            make_context_ref(&item),
+            1,
+            1,
+            None,
+        ));
+        std::fs::write(
+            dir.path().join(format!("{id}.json")),
+            vec![b'x'; MAX_CONTEXT_STORE_BLOB_BYTES + 1],
+        )
+        .unwrap();
+
+        let owned: HashMap<_, _> = [(id, None)].into_iter().collect();
+        let io = run_reconcile_io(dir.path(), &owned, &HashSet::new()).await;
+        let report = commit_reconcile(&mut state, io, 1, 1);
+
+        assert_eq!(report.quarantined, 1);
+        assert_eq!(report.owner_quarantined, 1);
+        assert!(state.external.get(id).is_none());
+        assert!(
+            report
+                .reasons
+                .iter()
+                .any(|reason| reason.contains("oversized blob")),
+            "the report must preserve the byte-bound reason: {report:?}"
+        );
     }
 
     /// The ownership invariant after a full externalize → recall → reconcile

@@ -702,8 +702,8 @@ fn collect_residency_protections(state: &State) -> Vec<agent_contracts::AnchorRo
 /// that was demoted out of the heap would otherwise be marked, but never
 /// found when reactivation looks for it.
 fn dependency_edges(state: &State, id: ContextItemId) -> Option<&[DependencyEdge]> {
-    if let Some(item) = state.items.iter().find(|item| item.id == id) {
-        return Some(&item.dependencies);
+    if let Some(index) = state.items.indexes().get(id) {
+        return Some(&state.items[index].dependencies);
     }
     if let Some(item) = state.eviction_buffer.iter().find(|item| item.id == id) {
         return Some(&item.dependencies);

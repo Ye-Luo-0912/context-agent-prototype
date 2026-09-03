@@ -692,10 +692,16 @@ spill index may make repaired overflow auto-resolvable without increasing the
 prompt/checkpoint hot set. Until then only a new task boundary or explicit
 operator closure can leave it behind. TASK PROGRESS renders at most two bounded UNRESOLVED BLOCKER
 lines beside the global advisory, and every ledger transition is
-event-visible (`ExecutionObligation`). Evidence argument identity uses
-the Runtime-computed `ArgumentDigest` (not producer strings), so
-same-argv/different-env and same-path/different-cursor calls no longer
-collide on evidence identity.
+event-visible (`ExecutionObligation`). Two identities are intentionally kept
+separate. Runtime's `ArgumentDigest` binds the exact submitted JSON for
+authority, approval and audit. Builtin `process.run` and `shell.exec` also carry
+a host-trusted `outcome_equivalence_key` for failure reconciliation after
+semantic defaults are applied. Process identity binds exact argv, effective cwd
+and sorted explicit environment; shell identity binds exact command plus the
+host dialect/version. Timeout and omitted/default spelling do not manufacture a
+different operation. Both observations must carry the same valid host key;
+producer metadata cannot mint one, and an absent/invalid key falls back
+conservatively to exact `ArgumentDigest` matching.
 
 Pre-dispatch attempt incidents are not task obligations. A call rejected
 against the immutable round surface is typed `SurfaceUnavailable`; it remains
@@ -743,21 +749,38 @@ in-flight/cancel cleanup, unresolved effect transaction, or recovery fence,
 and its immutable completion record is marked `OperatorOverride` with the
 bounded unmet reasons. A normal assistant final still closes only the turn.
 
-A refused model completion also derives a bounded `completion-repair.v1`
-projection from that exact readiness result. Its basis records task,
-verification, directive and workspace revisions; it exposes exactly one
-current stage: `operator_required`, task-progress repair, execution debt,
-proof refresh, or completion retry. Proof refresh names only a recipe currently
-revalidated by trusted host attribution. The refusal carries typed stage
-metadata and terse model content; the actor re-derives the bounded current
-model-visible record in `TASK PROGRESS` each decision. This is a resolver
-protocol, not a planner: Runtime chooses no edit or command. The actor
-`PreferSurface`s only its helper, so an unavailable helper cannot abort the
-round. The standing `task.complete` control remains visible for an explicit
-stage refresh. The refusal ToolResult stays in the current turn but is
-`TransientNoPersist`; cross-round Context receives no stale repair prose. Any
-later basis change replaces the derived record and leaves the old refusal as
-descriptive turn history rather than authority.
+`TaskAnchor.open_loops` is authoritative unfinished work and blocks completion.
+`TaskAnchor.next_action` is replaceable model guidance only: it is neither task
+authority nor evidence and does not participate in readiness. Otherwise the
+model can write “complete the task” as its next action and make completion
+self-blocking.
+
+A refused model completion derives a bounded `completion-repair.v2` stage from
+that exact readiness result and persists a Runtime-owned semantic repair
+episode. The safety basis still records task, verification, directive and
+workspace revisions, but anchor/workspace churn and rewritten prose do not
+reset liveness within the same directive and verification authority. The
+episode fingerprints typed blockers and keeps the best lexicographic potential
+(`operator/safety -> task progress -> execution debt -> proof`); only a strict
+decrease is progress. Each projected stage names one resolver and its typed
+postcondition: `operator_required`, task-progress repair, execution debt, proof
+refresh, or completion retry. Proof refresh resolves an exact recipe directly
+from the current trusted host declaration and cross-checks dispatcher
+attribution, so cold start does not depend on a prior `VerificationFact`.
+Installing the host recipe table enables this read-only route lookup even when
+automatic proof execution is off. If automatic execution is enabled, a failed
+exact recipe is recorded on its directive/workspace/host-identity basis and is
+not executed again until that basis changes.
+
+Repeated unchanged blockers, including A -> B -> A cycles without a better
+potential, enter `repair_stalled`. The following model decision has an audited
+text-only tool surface. A provider-emitted tool call is refused without
+dispatch and cannot start another repair loop; the ordinary final ends only the
+turn and leaves the durable task active. A new user directive clears the
+episode, while continuation and checkpoint/restore preserve it. This is a
+semantic liveness fail-safe, not a raw round cap, prompt trick, automatic debt
+clear or automatic task completion. Stored plan/prose is diagnostic only;
+Runtime always re-renders from current typed readiness.
 
 Task completion authority is explicit. `OperatorClosureOnly` is the default
 when no host/user criteria exist, so autonomous model closure fails closed.
@@ -769,8 +792,8 @@ verification identity. Runtime reprojects the bounded current host declaration
 table at readiness and requires the criterion, receipt and verification fact to
 match it. A failed verifier, unrelated/currently replaced domain, legacy string
 criterion, or pre-dispatch attribution mints nothing. Receipt CAS advances task
-  state but not the verification basis; `task.manage` cannot author completion or
-  declaration authority. The deterministic verify-route gate
+state but not the verification basis; `task.manage` cannot author completion or
+declaration authority. The deterministic verify-route gate
   (evidence under `crates/agent-eval/evidence/verify-route/`) covers routing:
   a task-scoped PASS never mints, the first exact PASS satisfies and identical
   repeats reuse it, and an unrelated failed command survives the exact PASS and

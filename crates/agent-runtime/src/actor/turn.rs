@@ -2,8 +2,8 @@ use super::*;
 
 use crate::execution::CompletionRepairRecord;
 use crate::task::{
-    COMPLETION_REPAIR_TERMINAL_REFUSALS, COMPLETION_REPAIR_VIEW_CHARS,
-    MAX_COMPLETION_REPAIR_REFUSALS,
+    COMPLETION_REPAIR_NO_PROGRESS_STEPS, COMPLETION_REPAIR_TERMINAL_REFUSALS,
+    COMPLETION_REPAIR_VIEW_CHARS, MAX_COMPLETION_REPAIR_REFUSALS, MAX_COMPLETION_REPAIR_STEPS,
 };
 
 impl RuntimeActor {
@@ -506,12 +506,37 @@ impl RuntimeActor {
         if readiness.allows_completion() || !proof_is_sole_blocker(&readiness) {
             return;
         }
-        let Some((_, _, recipe_id)) = self.current_completion_proof_route(&readiness) else {
+        let Some((_, _, recipe_id)) = self.runtime_completion_proof_route(&readiness) else {
             return;
         };
         let Some(basis) = readiness.verification_basis else {
             return;
         };
+        let call = ToolCall {
+            id: format!("proof-refresh-{}", now_ms()),
+            name: "verify.run".into(),
+            arguments: serde_json::json!({ "recipe_id": recipe_id.clone() }),
+        };
+        let attribution = self.runtime_execution_attribution(&call);
+        if attribution.exact_verification_identity().is_none() {
+            return;
+        }
+        let argument_digest = ArgumentDigest::from_json(&call.arguments).to_string();
+        if turn
+            .execution
+            .current_exact_verification_failure(
+                &call.name,
+                &argument_digest,
+                basis.verification_revision,
+                &attribution,
+            )
+            .is_some()
+        {
+            // The exact recipe already failed on this directive/world/host
+            // identity. Re-running it cannot add evidence; a changed basis or
+            // recipe identity naturally invalidates this negative lease.
+            return;
+        }
         let request = crate::verification::ProofVerifierRequest {
             run_id: self.core.run_id(),
             task_id: basis.task_id,
@@ -520,9 +545,7 @@ impl RuntimeActor {
             directive_revision: basis.directive_revision,
             workspace_revision: basis.workspace_revision,
         };
-        let Ok(outcome) = verifier.verify_exact(request).await else {
-            return;
-        };
+        let outcome = verifier.verify_exact(request).await;
         // Fence post: the same world must still hold. A moved world forgets
         // the run instead of trusting a stale check.
         let Some(turn) = self.state.turn.as_ref() else {
@@ -534,43 +557,44 @@ impl RuntimeActor {
         {
             return;
         }
-        if !outcome.ok || outcome.verification_identity.is_empty() {
-            return;
-        }
-        // The host executor and the gate's attribution must agree on the
-        // exact identity for the recipe; a mismatch fails closed.
-        let call = ToolCall {
-            id: format!("proof-refresh-{}", now_ms()),
-            name: "verify.run".into(),
-            arguments: serde_json::json!({ "recipe_id": recipe_id.clone() }),
+        let (reported_ok, mut summary, reported_identity) = match outcome {
+            Ok(outcome) => (outcome.ok, outcome.summary, outcome.verification_identity),
+            Err(error) => (
+                false,
+                format!("host proof refresh failed: {error}"),
+                String::new(),
+            ),
         };
-        let attribution = self.runtime_execution_attribution(&call);
-        if attribution.exact_verification_identity() != Some(outcome.verification_identity.as_str())
-        {
-            return;
+        // The host executor and dispatcher attribution must agree. A failed,
+        // errored or identity-mismatched attempt is still recorded as a typed
+        // current-basis negative lease, so another task.complete cannot launch
+        // the same expensive verifier again without a semantic change.
+        let identity_matches = reported_ok
+            && !reported_identity.is_empty()
+            && attribution.exact_verification_identity() == Some(reported_identity.as_str());
+        if reported_ok && !identity_matches {
+            summary = "host proof refresh identity did not match dispatcher attribution".into();
         }
-        let argument_digest = agent_contracts::ContentDigest::sha256_bytes(
-            serde_json::to_vec(&call.arguments)
-                .as_deref()
-                .unwrap_or_default(),
-        )
-        .to_string();
-        // Record the PASS through the same trusted observation lane as a
-        // `verify.run` result: exact-current-world verification with a
-        // bounded mutation bound, attributed to the same host recipe.
         let mut output = ToolOutput {
             call_id: call.id,
             tool_name: call.name,
-            ok: true,
-            summary: bounded_preview(&outcome.summary, agent_contracts::MAX_TOOL_SUMMARY_CHARS),
+            ok: identity_matches,
+            summary: bounded_preview(&summary, agent_contracts::MAX_TOOL_SUMMARY_CHARS),
             model_content: String::new(),
             artifact_ref: None,
-            metadata: serde_json::json!({ "verification": true }),
+            metadata: serde_json::json!({
+                "verification": true,
+                "proof_refresh": true,
+                "recipe_id": recipe_id,
+            }),
         };
         output.set_native_execution_facts(
             agent_contracts::ToolExecutionFacts::empty()
                 .with_verification(true)
-                .with_mutation_bound(true),
+                // Coverage-domain exact recipes are validated source-read-
+                // only by the host table. Mirror normal verify.run semantics
+                // instead of inventing an unknown workspace mutation.
+                .with_mutation_bound(false),
         );
         let facts = self.services.tools().execution_facts(&output);
         let observation = self.observe_persistable_tool(
@@ -583,6 +607,7 @@ impl RuntimeActor {
         if let Some(observation) = observation {
             let _ = self.report_frontier(Some(observation)).await;
         }
+        self.accrue_checkpoint_debt(crate::checkpoint::CheckpointDebtReason::VerificationChanged);
     }
 
     /// Apply a structured completion proposal and replace the tool's
@@ -619,42 +644,92 @@ impl RuntimeActor {
                 .filter(|readiness| !readiness.allows_completion())
                 .map(CompletionReadiness::applicable_blockers)
                 .unwrap_or_default();
-            // Count only refusals recorded against exactly this basis; a
-            // drifted stage resets the count so a moved world never inherits
-            // terminal escalation it did not accumulate.
-            let prior_refusals = readiness
+            // Completion liveness is tracked by semantic episode, not by the
+            // volatile CAS/world basis. A model cannot make a repeated repair
+            // look new by editing progress text, re-running evidence, or
+            // moving the workspace revision. Only a strictly lower typed
+            // completion potential resets the no-progress counter.
+            let repair_update = readiness
                 .as_ref()
                 .filter(|readiness| !readiness.allows_completion())
-                .and_then(|readiness| {
-                    let anchor_revision = readiness
-                        .task_state_basis
-                        .map(|basis| basis.anchor_revision);
-                    let verification = readiness.verification_basis;
-                    self.state
+                .map(|readiness| {
+                    let potential = readiness.repair_potential();
+                    let blocker_fingerprint = readiness.blocker_fingerprint();
+                    let previous = self
+                        .state
                         .turn
                         .as_ref()
                         .and_then(|turn| turn.execution.completion_repair.as_ref())
-                        .filter(|record| {
-                            record.basis_anchor_revision == anchor_revision
-                                && record.basis_verification_revision
-                                    == verification.map(|basis| basis.verification_revision)
-                                && record.basis_directive_revision
-                                    == verification.map(|basis| basis.directive_revision)
-                                && record.basis_workspace_revision
-                                    == verification.map(|basis| basis.workspace_revision)
-                        })
-                        .map(|record| record.refusal_count)
-                })
-                .unwrap_or(0);
-            let repair = readiness
-                .as_ref()
-                .filter(|readiness| !readiness.allows_completion())
-                .map(|readiness| self.completion_repair_plan(readiness, prior_refusals));
+                        .filter(|record| record.matches_episode(readiness));
+                    let refusal_count = previous
+                        .map(|record| record.refusal_count.saturating_add(1))
+                        .unwrap_or(1)
+                        .min(MAX_COMPLETION_REPAIR_REFUSALS);
+                    let improved = previous
+                        .and_then(|record| record.best_potential)
+                        .is_none_or(|best| potential < best);
+                    let best_potential = previous
+                        .and_then(|record| record.best_potential)
+                        .map_or(potential, |best| best.min(potential));
+                    let no_progress_steps = if improved {
+                        1
+                    } else {
+                        previous
+                            .map(|record| record.no_progress_steps.saturating_add(1))
+                            .unwrap_or(1)
+                    }
+                    .min(MAX_COMPLETION_REPAIR_STEPS);
+                    let same_blocker_refusals = if previous
+                        .is_some_and(|record| record.blocker_fingerprint == blocker_fingerprint)
+                    {
+                        previous
+                            .map(|record| record.same_blocker_refusals.saturating_add(1))
+                            .unwrap_or(1)
+                    } else {
+                        1
+                    }
+                    .min(MAX_COMPLETION_REPAIR_REFUSALS);
+                    let terminal = previous
+                        .is_some_and(|record| record.terminal_applies(readiness))
+                        || same_blocker_refusals >= COMPLETION_REPAIR_TERMINAL_REFUSALS
+                        || no_progress_steps >= COMPLETION_REPAIR_NO_PROGRESS_STEPS;
+                    let repair = self.completion_repair_plan(
+                        readiness,
+                        refusal_count,
+                        no_progress_steps,
+                        terminal,
+                        self.state
+                            .turn
+                            .as_ref()
+                            .and_then(|turn| turn.tool_surface.as_ref())
+                            .is_some_and(|surface| {
+                                surface.specs.iter().any(|spec| spec.name == "verify.run")
+                            }),
+                    );
+                    (
+                        repair,
+                        blocker_fingerprint,
+                        refusal_count,
+                        same_blocker_refusals,
+                        no_progress_steps,
+                        best_potential,
+                        terminal,
+                    )
+                });
+            let repair = repair_update.as_ref().map(|update| &update.0);
             // A gate refusal is durable: it must survive a checkpointed
             // safe point and a restart so the next decision resumes the same
             // basis-stamped stage instead of re-deriving it from scratch.
             if refusal_class == "completion_gate"
-                && let Some((plan, text)) = repair.as_ref()
+                && let Some((
+                    (plan, text),
+                    blocker_fingerprint,
+                    refusal_count,
+                    same_blocker_refusals,
+                    no_progress_steps,
+                    best_potential,
+                    terminal,
+                )) = repair_update.as_ref()
             {
                 let basis = readiness
                     .as_ref()
@@ -664,16 +739,6 @@ impl RuntimeActor {
                     .and_then(|readiness| readiness.task_state_basis)
                     .map(|basis| basis.anchor_revision);
                 if let Some(turn) = self.state.turn.as_mut() {
-                    let previous = turn.execution.completion_repair.take();
-                    let same_basis = previous.as_ref().is_some_and(|record| {
-                        record.basis_anchor_revision == anchor_revision
-                            && record.basis_verification_revision
-                                == basis.map(|basis| basis.verification_revision)
-                            && record.basis_directive_revision
-                                == basis.map(|basis| basis.directive_revision)
-                            && record.basis_workspace_revision
-                                == basis.map(|basis| basis.workspace_revision)
-                    });
                     turn.execution.completion_repair = Some(CompletionRepairRecord {
                         basis_anchor_revision: anchor_revision,
                         basis_verification_revision: basis.map(|basis| basis.verification_revision),
@@ -682,13 +747,12 @@ impl RuntimeActor {
                         plan: plan.clone(),
                         text: bounded_preview(text, COMPLETION_REPAIR_VIEW_CHARS),
                         refused_at_ms: now_ms(),
-                        refusal_count: if same_basis {
-                            previous
-                                .map_or(1, |record| record.refusal_count.saturating_add(1))
-                                .min(MAX_COMPLETION_REPAIR_REFUSALS)
-                        } else {
-                            1
-                        },
+                        refusal_count: *refusal_count,
+                        blocker_fingerprint: blocker_fingerprint.clone(),
+                        same_blocker_refusals: *same_blocker_refusals,
+                        no_progress_steps: *no_progress_steps,
+                        best_potential: Some(*best_potential),
+                        terminal: *terminal,
                     });
                     self.accrue_checkpoint_debt(
                         crate::checkpoint::CheckpointDebtReason::CompletionRepairChanged,
@@ -706,7 +770,7 @@ impl RuntimeActor {
             );
             output.model_content = bounded_preview(
                 &format!(
-                    "task.complete was not accepted by Runtime ({refusal_class}): {reason}. Runtime re-derives the current completion_repair/v1 stage in TASK PROGRESS."
+                    "task.complete was not accepted by Runtime ({refusal_class}): {reason}. Runtime re-derives the current completion_repair/v2 stage in TASK PROGRESS."
                 ),
                 agent_contracts::MAX_TOOL_MODEL_CONTENT_CHARS,
             );
@@ -714,7 +778,13 @@ impl RuntimeActor {
                 "accepted": false,
                 "refused": refusal_class,
                 "blockers": blockers,
-                "repair_plan": repair.as_ref().map(|(plan, _)| plan),
+                "repair_plan": repair.map(|(plan, _)| plan),
+                "repair_episode": repair_update.as_ref().map(|update| serde_json::json!({
+                    "refusals": update.2,
+                    "same_blocker_refusals": update.3,
+                    "no_progress_steps": update.4,
+                    "terminal": update.6,
+                })),
             });
             let _ = self
                 .core
@@ -948,16 +1018,13 @@ impl RuntimeActor {
     pub(super) fn completion_repair_plan(
         &self,
         readiness: &CompletionReadiness,
-        prior_refusals: u32,
+        refusal_count: u32,
+        no_progress_steps: u32,
+        terminal: bool,
+        proof_surface_available: bool,
     ) -> (serde_json::Value, String) {
         let blockers = readiness.applicable_blockers();
-        // Consecutive identical refusals against the same basis prove the
-        // model cannot resolve the stage; once the threshold is crossed the
-        // operator-only / no-resolver stage states the closure boundary
-        // explicitly instead of letting it be inferred from repeated
-        // identical refusals.
-        let terminal_refusal =
-            prior_refusals.saturating_add(1) >= COMPLETION_REPAIR_TERMINAL_REFUSALS;
+        let potential = readiness.repair_potential();
         let basis = serde_json::json!({
             "task_anchor_revision": readiness
                 .task_state_basis
@@ -1023,48 +1090,54 @@ impl RuntimeActor {
                 .tool_catalog()
                 .iter()
                 .any(|entry| entry.name == "task.manage");
+        let execution_details = self
+            .state
+            .turn
+            .as_ref()
+            .map(|turn| turn.execution.view())
+            .map(|view| {
+                view.failed_commands
+                    .into_iter()
+                    .chain(view.unresolved_blockers)
+                    .take(4)
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
 
-        let (step, instruction) = if !operator_blockers.is_empty() {
-            let mut step = serde_json::json!({
+        let (step, instruction) = if terminal {
+            (
+                serde_json::json!({
+                    "kind": "repair_stalled",
+                    "terminal": true,
+                    "terminal_surface": "ordinary_final",
+                    "task_remains_active": true,
+                    "blockers": blockers,
+                    "potential": potential,
+                }),
+                "repair_stalled/terminal: Runtime observed repeated repair actions or completion proposals without a strictly better blocker frontier. This repair episode is closed: do not call tools or task.complete again in this turn. Give an ordinary final answer that states the work completed and the exact remaining blockers. The durable task remains active; this does not claim successful completion."
+                    .into(),
+            )
+        } else if !operator_blockers.is_empty() {
+            let step = serde_json::json!({
                 "kind": "operator_required",
                 "blockers": operator_blockers,
             });
-            if terminal_refusal {
-                step["terminal"] = serde_json::json!(true);
-                step["terminal_surface"] = serde_json::json!("ordinary_final");
-                (
-                    step,
-                    "operator_required/terminal: durable closure is not offered on this model surface and Runtime has no safe model-owned resolver for the current blockers. Do not call task.complete again: repeated proposals are refused and cannot converge. If the requested work is done, end the turn with an ordinary final answer; otherwise finish the remaining work and then end with an ordinary final answer."
-                        .into(),
-                )
-            } else {
-                (
-                    step,
-                    "operator_required: Runtime/authority state has no safe model-owned resolver; do not retry task.complete unchanged."
-                        .into(),
-                )
-            }
+            (
+                step,
+                "operator_required: Runtime/authority state has no safe model-owned resolver; do not retry task.complete unchanged."
+                    .into(),
+            )
         } else if progress_blocked && !task_manage_available {
-            let mut step = serde_json::json!({
+            let step = serde_json::json!({
                 "kind": "operator_required",
                 "reason": "task_progress_resolver_unavailable",
                 "blockers": blockers,
             });
-            if terminal_refusal {
-                step["terminal"] = serde_json::json!(true);
-                step["terminal_surface"] = serde_json::json!("ordinary_final");
-                (
-                    step,
-                    "operator_required/terminal: durable closure is not offered on this model surface and task.manage is not present in the current host catalog. Do not call task.complete again; end the turn with an ordinary final answer once the work is done."
-                        .into(),
-                )
-            } else {
-                (
-                    step,
-                    "operator_required: task progress blocks completion but task.manage is not present in the current host catalog."
-                        .into(),
-                )
-            }
+            (
+                step,
+                "operator_required: task progress blocks completion but task.manage is not present in the current host catalog."
+                    .into(),
+            )
         } else if progress_blocked {
             let anchor_revision = readiness
                 .task_state_basis
@@ -1089,8 +1162,9 @@ impl RuntimeActor {
                     "tool": "task.manage",
                     "base_anchor_revision": anchor_revision,
                     "clears": clears,
+                    "postcondition": {"open_loops_remaining": 0},
                 }),
-                "task_progress: after the listed work is actually resolved, call task.manage using the current TASK PROGRESS anchor_rev as base_anchor_revision; then re-propose completion for a freshly derived stage."
+                "task_progress: resolve the listed work, then call task.manage once with the current TASK PROGRESS anchor_rev and replace open_loops with only genuinely unresolved entries (use [] when none remain). Do not encode 'complete the task' as remaining work. Re-propose completion only after this postcondition is true."
                     .into(),
             )
         } else if execution_blocked {
@@ -1099,8 +1173,13 @@ impl RuntimeActor {
                     "kind": "execution_debt",
                     "source": "TASK PROGRESS",
                     "clears": ["execution_obligations", "failed_commands"],
+                    "details": execution_details.clone(),
+                    "postcondition": {
+                        "execution_obligations_remaining": 0,
+                        "failed_commands_remaining": 0,
+                    },
                 }),
-                "execution_debt: resolve the exact task-rooted blocker shown in TASK PROGRESS; unrelated successful commands cannot clear it; then re-propose completion."
+                "execution_debt: resolve each exact task-rooted row named here/TASK PROGRESS with its matching operation or typed resolver. Runtime compares effective operation identity, so changing timeout/default spelling does not manufacture progress; unrelated successes do not clear debt. Re-propose completion only after both debt counts are zero."
                     .into(),
             )
         } else if proof_blocked {
@@ -1115,8 +1194,9 @@ impl RuntimeActor {
                     })
                 })
                 .collect();
-            if let Some((criterion_index, domain, recipe_id)) =
-                self.current_completion_proof_route(readiness)
+            if let Some((criterion_index, domain, recipe_id)) = proof_surface_available
+                .then(|| self.runtime_completion_proof_route(readiness))
+                .flatten()
             {
                 (
                     serde_json::json!({
@@ -1127,74 +1207,183 @@ impl RuntimeActor {
                         "recipe_id": recipe_id,
                         "criterion_details": criterion_details,
                         "must_be_after_workspace_calls": true,
+                        "postcondition": {
+                            "verification_current": true,
+                            "acceptance_uncovered": 0,
+                        },
                     }),
                     format!(
                         "proof_refresh: after every edit/shell/process call, run verify.run with recipe_id={recipe_id}; do not run another workspace-changing command afterward; then re-propose completion."
                     ),
                 )
             } else {
-                let mut step = serde_json::json!({
+                let step = serde_json::json!({
                     "kind": "operator_required",
                     "reason": "no_current_exact_verification_route",
                     "blockers": blockers,
                     "criterion_details": criterion_details,
                 });
-                if terminal_refusal {
-                    step["terminal"] = serde_json::json!(true);
-                    step["terminal_surface"] = serde_json::json!("ordinary_final");
-                    (
-                        step,
-                        "operator_required/terminal: durable closure is not offered on this model surface and Runtime cannot prove a current exact recipe_id for the uncovered verification domain. Do not call task.complete again; do not invent coverage_domain as a verify.run argument. End the turn with an ordinary final answer once the work is done."
-                            .into(),
-                    )
-                } else {
-                    (
-                        step,
-                        "operator_required: Runtime cannot prove a current exact recipe_id for the uncovered verification domain; do not invent coverage_domain as a verify.run argument."
-                            .into(),
-                    )
-                }
+                (
+                    step,
+                    "operator_required: Runtime cannot prove a current exact recipe_id for the uncovered verification domain; do not invent coverage_domain as a verify.run argument."
+                        .into(),
+                )
             }
         } else {
             (
                 serde_json::json!({
                     "kind": "retry_completion",
                     "tool": "task.complete",
+                    "postcondition": {"completion_blockers": 0},
                 }),
                 "retry_completion: no model-resolvable blocker remains; call task.complete once."
                     .into(),
             )
         };
         let plan = serde_json::json!({
-            "schema": "completion-repair.v1",
+            "schema": "completion-repair.v2",
             "basis": basis,
+            "episode": {
+                "refusals": refusal_count,
+                "no_progress_steps": no_progress_steps,
+                "terminal": terminal,
+            },
             "steps": [step],
         });
+        let blocker_summary = bounded_preview(
+            &blockers
+                .iter()
+                .copied()
+                .map(CompletionBlocker::summary)
+                .collect::<Vec<_>>()
+                .join("; "),
+            320,
+        );
+        let debt_summary = if execution_details.is_empty() {
+            String::new()
+        } else {
+            format!(
+                "\nExecution debt sample: {}",
+                bounded_preview(&execution_details.join(" | "), 224)
+            )
+        };
         let text = format!(
-            "completion_repair/v1 {basis_text}\n1. {instruction}\nThis is a one-stage snapshot; after any state-changing result, use current TASK PROGRESS and re-propose completion instead of reusing stale arguments."
+            "completion_repair/v2 {basis_text} episode_refusals={refusal_count} no_progress_steps={no_progress_steps}\nCurrent typed blockers: {blocker_summary}.{debt_summary}\n1. {instruction}\nThis is a one-stage snapshot. Only a smaller typed blocker frontier is progress; changing revisions, repeating evidence, or rewriting progress text does not reset the episode."
         );
         (plan, text)
     }
 
-    /// Resolve one current exact verifier from trusted host attribution. The
-    /// first uncovered criterion wins; a missing route fails closed instead
-    /// of turning a coverage-domain label into a tool argument.
-    pub(super) fn current_completion_proof_route(
-        &self,
-        readiness: &CompletionReadiness,
-    ) -> Option<(Option<u32>, String, String)> {
-        // Resolver availability binds to the captured round surface, not
-        // catalog-name presence: a proof_refresh instruction is actionable
-        // only for a verify.run the model can actually call on that surface.
-        if !self
+    /// Observe one post-refusal repair action after its authoritative result
+    /// has been folded into task/execution state. This closes the liveness gap
+    /// where a model could stop proposing completion and repeat tools forever:
+    /// only a strictly lower typed blocker potential resets the episode.
+    pub(super) fn observe_completion_repair_action(&mut self, output: &ToolOutput) {
+        if output.tool_name == "task.complete"
+            && output
+                .metadata
+                .get("refused")
+                .and_then(|value| value.as_str())
+                == Some("completion_gate")
+        {
+            // The refusal path already accounts for this proposal exactly
+            // once, after re-deriving readiness.
+            return;
+        }
+        let readiness = self.completion_readiness(CompletionIntent::ModelProposal, None);
+        let previous = self
+            .state
+            .turn
+            .as_ref()
+            .and_then(|turn| turn.execution.completion_repair.as_ref())
+            .cloned();
+        let Some(previous) = previous else {
+            return;
+        };
+        if !previous.matches_episode(&readiness) {
+            if let Some(turn) = self.state.turn.as_mut() {
+                turn.execution.completion_repair = None;
+            }
+            self.accrue_checkpoint_debt(
+                crate::checkpoint::CheckpointDebtReason::CompletionRepairChanged,
+            );
+            return;
+        }
+
+        let potential = readiness.repair_potential();
+        let improved = previous.best_potential.is_none_or(|best| potential < best);
+        let best_potential = previous
+            .best_potential
+            .map_or(potential, |best| best.min(potential));
+        let blocker_fingerprint = readiness.blocker_fingerprint();
+        let same_blocker_refusals = if previous.blocker_fingerprint == blocker_fingerprint {
+            previous.same_blocker_refusals
+        } else {
+            0
+        };
+        let no_progress_steps = if improved {
+            0
+        } else {
+            previous.no_progress_steps.saturating_add(1)
+        }
+        .min(MAX_COMPLETION_REPAIR_STEPS);
+        let terminal = !improved
+            && (previous.terminal
+                || same_blocker_refusals >= COMPLETION_REPAIR_TERMINAL_REFUSALS
+                || no_progress_steps >= COMPLETION_REPAIR_NO_PROGRESS_STEPS);
+        let proof_surface_available = self
             .state
             .turn
             .as_ref()
             .and_then(|turn| turn.tool_surface.as_ref())
-            .is_some_and(|surface| surface.specs.iter().any(|spec| spec.name == "verify.run"))
-        {
-            return None;
+            .is_some_and(|surface| surface.specs.iter().any(|spec| spec.name == "verify.run"));
+        let (plan, text) = self.completion_repair_plan(
+            &readiness,
+            previous.refusal_count,
+            no_progress_steps,
+            terminal,
+            proof_surface_available,
+        );
+        let basis = readiness.verification_basis;
+        let anchor_revision = readiness
+            .task_state_basis
+            .map(|basis| basis.anchor_revision);
+        if let Some(turn) = self.state.turn.as_mut() {
+            turn.execution.completion_repair = Some(CompletionRepairRecord {
+                basis_anchor_revision: anchor_revision,
+                basis_verification_revision: basis.map(|basis| basis.verification_revision),
+                basis_directive_revision: basis.map(|basis| basis.directive_revision),
+                basis_workspace_revision: basis.map(|basis| basis.workspace_revision),
+                plan,
+                text: bounded_preview(&text, COMPLETION_REPAIR_VIEW_CHARS),
+                refused_at_ms: previous.refused_at_ms,
+                refusal_count: previous.refusal_count,
+                blocker_fingerprint,
+                same_blocker_refusals,
+                no_progress_steps,
+                best_potential: Some(best_potential),
+                terminal,
+            });
         }
+        self.accrue_checkpoint_debt(
+            crate::checkpoint::CheckpointDebtReason::CompletionRepairChanged,
+        );
+    }
+
+    /// Host-owned proof refresh does not depend on whether `verify.run` is on
+    /// the model's current schema surface. It still resolves only through the
+    /// same current host declaration and is cross-checked against dispatcher
+    /// attribution before a PASS can enter readiness.
+    pub(super) fn runtime_completion_proof_route(
+        &self,
+        readiness: &CompletionReadiness,
+    ) -> Option<(Option<u32>, String, String)> {
+        self.completion_proof_route(readiness)
+    }
+
+    fn completion_proof_route(
+        &self,
+        readiness: &CompletionReadiness,
+    ) -> Option<(Option<u32>, String, String)> {
         let task = self
             .state
             .task_id
@@ -1213,6 +1402,27 @@ impl RuntimeActor {
             });
             if covered {
                 continue;
+            }
+            let declaration = agent_contracts::VerificationCoverageDeclaration {
+                domain_id: criterion.coverage_domain.clone(),
+                declaration_revision: criterion.domain_declaration_revision,
+                source_digest: criterion.domain_source_digest.clone(),
+            };
+            if let Some(recipe_id) = self
+                .services
+                .proof_verifier()
+                .and_then(|verifier| verifier.exact_recipe_for_domain(&declaration))
+                && let Some(current) = self.current_host_recipe_provenance(&recipe_id)
+                && current.coverage_domain.as_deref() == Some(criterion.coverage_domain.as_str())
+                && current.domain_declaration_revision
+                    == Some(criterion.domain_declaration_revision)
+                && current.domain_source_digest == criterion.domain_source_digest
+            {
+                return Some((
+                    Some(index.min(u32::MAX as usize) as u32),
+                    criterion.coverage_domain.clone(),
+                    current.recipe_id,
+                ));
             }
             let route = turn.execution.verifications.iter().rev().find_map(|fact| {
                 if fact.source_tool_name != "verify.run" {

@@ -61,10 +61,11 @@ pub use needs::{
 pub use snapshot::RoundExecutionSnapshot;
 pub use snapshot::VerificationProjection;
 pub use state::{
-    CompletionRepairRecord, ExecutionState, FrontierObservation, NegativeExecutionFact,
-    NegativeFactTransition, ResourceFact, ResourceProvenance, RuntimeExecutionAttribution,
-    UnresolvedFailureOverflow, VerificationCause, VerificationCoverage, VerificationFact,
-    VerificationPassTransition, VerificationSourceLease, VerificationState,
+    CompletionRepairPotential, CompletionRepairRecord, ExecutionState, FrontierObservation,
+    NegativeExecutionFact, NegativeFactTransition, ResourceFact, ResourceProvenance,
+    RuntimeExecutionAttribution, UnresolvedFailureOverflow, VerificationCause,
+    VerificationCoverage, VerificationFact, VerificationPassTransition, VerificationSourceLease,
+    VerificationState,
 };
 /// Test-only: unit tests construct typed obligations/facts directly.
 #[cfg(test)]

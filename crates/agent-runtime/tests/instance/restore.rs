@@ -366,6 +366,7 @@ async fn concurrent_full_restores_are_serialized_across_all_state_planes() {
     instance.start().await.unwrap();
     let checkpoint_a = agent_runtime::RuntimeCheckpoint {
         version: agent_runtime::RUNTIME_CHECKPOINT_VERSION,
+        unresolved_ack_debts: Vec::new(),
         run_metadata: agent_runtime::RunMetadata {
             run_id: instance.handle().run_id(),
             created_at_ms: 0,

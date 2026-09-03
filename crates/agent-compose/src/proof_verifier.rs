@@ -21,6 +21,13 @@ impl HostProofVerifier {
 
 #[async_trait::async_trait]
 impl ProofVerifier for HostProofVerifier {
+    fn exact_recipe_for_domain(
+        &self,
+        declaration: &agent_contracts::VerificationCoverageDeclaration,
+    ) -> Option<String> {
+        self.runner.exact_recipe_for_domain(declaration)
+    }
+
     async fn verify_exact(
         &self,
         request: ProofVerifierRequest,

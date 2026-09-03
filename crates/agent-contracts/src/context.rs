@@ -2515,18 +2515,25 @@ impl<'de> Deserialize<'de> for ContextMapView {
 }
 
 /// Deterministic search over the catalog — no vectors.
-/// Implemented dimensions: free-text over entity signatures, summary and
-/// uri; kind/scope/task/label filters; recency-aware ranking. Hits may be
-/// Resident, Warm, Cold, or External. Candidate generation uses the
-/// engine's `ContextCatalog` indexes (not a full-history scan) when a
+/// Implemented dimensions: identity substring search over entity/label/path;
+/// exact-token search over summaries and semantic context bodies; direct
+/// resolution of a full context ref; and
+/// residual verification for short/CJK queries whose word boundaries the index
+/// cannot represent (short ASCII runs stay exact; CJK runs use substring).
+/// Kind/scope/task/label filters and recency-aware ranking
+/// are supported. Raw Tool/File observation bodies are intentionally Fetch-only.
+/// Hits may be Resident, Warm, Cold, or External. Candidate generation uses
+/// the engine's `ContextCatalog` indexes (not a full-history scan) when a
 /// filter or an entity/label key can bound the set.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct ContextSearchQuery {
-    /// Free-text query matched (case-insensitively) against entity
-    /// signatures, the entry summary and the ref uri. Multi-word queries
-    /// verify when every token (shared `tokenize` rule) appears in one
-    /// entry's matchable text; the whole-needle substring stays the
-    /// primary, ranking-privileged match.
+    /// Free-text query matched case-insensitively. Entity/label/path identity
+    /// supports substring lookup. Summaries and semantic bodies require every
+    /// exact word token; a full context ref resolves directly. Short fragments
+    /// and CJK text use an explicit bounded residual because the word-token
+    /// index cannot soundly bound them: short ASCII runs remain exact tokens,
+    /// while CJK runs use substring verification. Tool/File observation bodies are excluded; their
+    /// path/revision identity remains searchable and Fetch recovers the body.
     pub query: String,
     /// Optional kind filter.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -2539,7 +2546,8 @@ pub struct ContextSearchQuery {
     pub task_id: Option<TaskId>,
     /// Optional label filter, matched case-insensitively against
     /// `ExternalizedContext::tags` (`Label::as_str`). This is a real
-    /// catalog index dimension, not a residual scan predicate.
+    /// catalog index dimension, not a residual scan predicate. Normalization
+    /// applies the same character ceiling as the free-text query.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub label: Option<String>,
     /// Cap on returned refs. `0` means the engine default (16).
@@ -2556,6 +2564,25 @@ impl ContextSearchQuery {
             label: None,
             limit,
         }
+    }
+
+    /// Apply the authoritative execution bounds shared by Core, in-process
+    /// engines and process adapters. `limit=0` remains the engine-default
+    /// sentinel; every non-zero value is capped.
+    pub fn normalized(mut self) -> Self {
+        self.query = self
+            .query
+            .chars()
+            .take(crate::CONTEXT_SEARCH_MAX_QUERY_CHARS)
+            .collect();
+        self.label = self.label.map(|label| {
+            label
+                .chars()
+                .take(crate::CONTEXT_SEARCH_MAX_QUERY_CHARS)
+                .collect()
+        });
+        self.limit = self.limit.min(crate::CONTEXT_SEARCH_MAX_LIMIT);
+        self
     }
 }
 
@@ -2749,9 +2776,10 @@ pub trait ContextEngine: Send + Sync {
     async fn inspect(&self, limit: usize) -> AgentResult<Vec<ContextItemSummary>>;
 
     /// Deterministic catalog search: matches the query against entity
-    /// signatures, kind/scope/task/label filters and recency, capped at
-    /// `query.limit`. Hits may be Resident, Warm, Cold, or External so a
-    /// live catalog file is not an empty miss. Catalog residency is not the
+    /// signatures, semantic bodies, kind/scope/task/label filters and
+    /// recency, capped at `query.limit`. Raw Tool/File bodies remain
+    /// Fetch-only. Hits may be Resident, Warm, Cold, or External so a live
+    /// catalog file is not an empty miss. Catalog residency is not the
     /// selected working set. The
     /// default implementation returns nothing, so engines without a catalog
     /// (baselines) keep working unchanged.
@@ -2793,6 +2821,28 @@ pub trait ContextEngine: Send + Sync {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn context_search_normalization_preserves_default_and_caps_direct_calls() {
+        let default = ContextSearchQuery::new("query", 0).normalized();
+        assert_eq!(default.limit, 0);
+
+        let mut input = ContextSearchQuery::new(
+            "x".repeat(crate::CONTEXT_SEARCH_MAX_QUERY_CHARS + 10),
+            usize::MAX,
+        );
+        input.label = Some("y".repeat(crate::CONTEXT_SEARCH_MAX_QUERY_CHARS + 10));
+        let bounded = input.normalized();
+        assert_eq!(
+            bounded.query.chars().count(),
+            crate::CONTEXT_SEARCH_MAX_QUERY_CHARS
+        );
+        assert_eq!(
+            bounded.label.as_deref().unwrap().chars().count(),
+            crate::CONTEXT_SEARCH_MAX_QUERY_CHARS
+        );
+        assert_eq!(bounded.limit, crate::CONTEXT_SEARCH_MAX_LIMIT);
+    }
 
     #[test]
     fn anchor_root_strengths_are_independent_protections() {

@@ -1,9 +1,12 @@
 use agent_contracts::{
-    ContextEngine, ContextHints, ContextIngress, ContextKind, ContextQuery, ContextRetention,
-    ContextScope, MAX_FOREGROUND_RESOURCES, MAX_FOREGROUND_TOKENS, ResourceKey, ToolOutput, tokens,
+    ContextConsumptionAck, ContextEngine, ContextHints, ContextIngress, ContextKind, ContextQuery,
+    ContextRetention, ContextScope, MAX_FOREGROUND_RESOURCES, MAX_FOREGROUND_TOKENS, OperationId,
+    ResourceKey, ToolOutput, TurnId, tokens,
 };
+use std::sync::Arc;
+use tokio::sync::Notify;
 
-use crate::engine::{SimpleContextConfig, SimpleContextEngine};
+use crate::engine::{MaterializeIoPause, SimpleContextConfig, SimpleContextEngine};
 
 use super::harness::*;
 
@@ -273,6 +276,163 @@ async fn stored_body_is_projected_without_admit() {
             .items
             .iter()
             .all(|item| item.file_path.as_deref() != Some("src/scratch.md"))
+    );
+}
+
+#[tokio::test]
+async fn concurrent_restore_waits_for_stored_materialization_and_clears_its_preview() {
+    let dir = tempfile::tempdir().unwrap();
+    let config = SimpleContextConfig {
+        context_store_dir: Some(dir.path().to_path_buf()),
+        ..SimpleContextConfig::default()
+    };
+    let engine = Arc::new(SimpleContextEngine::new(config.clone()));
+    open_focus(&engine, "append notes").await;
+    engine
+        .ingest(ContextIngress::ToolObservation {
+            facts: None,
+            output: fs_read("1", "src/stale.md"),
+            scope_id: None,
+        })
+        .await
+        .unwrap();
+    let old_id = {
+        let mut state = engine.state.lock().await;
+        let mut items = state.items.take_all();
+        let position = items
+            .iter()
+            .position(|item| item.file_path.as_deref() == Some("src/stale.md"))
+            .expect("the file body is resident");
+        let item = items.remove(position);
+        let item_id = item.id;
+        state.items.replace_all(items);
+        let context_ref = crate::store::externalize(dir.path(), &item).unwrap();
+        state.external.push(crate::store::to_external_entry(
+            &item,
+            context_ref,
+            0,
+            0,
+            None,
+        ));
+        item_id
+    };
+
+    // The replacement has no ownership of the old body. Its checkpoint is
+    // made before the in-flight preview, as a real rollback/cold restore can
+    // be, and pending previews are intentionally not serialized.
+    let replacement = SimpleContextEngine::new(config);
+    let replacement_checkpoint = replacement.checkpoint().await.unwrap();
+
+    let planned = Arc::new(Notify::new());
+    let release = Arc::new(Notify::new());
+    *engine
+        .materialize_io_pause
+        .lock()
+        .expect("materialize test pause mutex poisoned") = Some(MaterializeIoPause {
+        planned: Arc::clone(&planned),
+        release: Arc::clone(&release),
+    });
+
+    let materialize = {
+        let engine = Arc::clone(&engine);
+        tokio::spawn(async move {
+            engine
+                .materialize(ContextQuery {
+                    current_input: "append src/stale.md".into(),
+                    budget_tokens: 10_000,
+                    hints: ContextHints {
+                        foreground_resources: vec![ResourceKey {
+                            path: "src/stale.md".into(),
+                            revision: None,
+                        }],
+                        ..ContextHints::default()
+                    },
+                })
+                .await
+        })
+    };
+    tokio::time::timeout(std::time::Duration::from_secs(2), planned.notified())
+        .await
+        .expect("materialize reached the plan/I/O boundary");
+
+    let restore = {
+        let engine = Arc::clone(&engine);
+        tokio::spawn(async move { engine.restore(replacement_checkpoint).await })
+    };
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    assert!(
+        !restore.is_finished(),
+        "restore must not replace state while a stored-body plan is in flight"
+    );
+
+    release.notify_one();
+    let preview = materialize.await.unwrap().unwrap();
+    assert_eq!(
+        preview
+            .foreground
+            .iter()
+            .map(|item| item.item_id)
+            .collect::<Vec<_>>(),
+        vec![old_id],
+        "the preview is wholly from the pre-restore state"
+    );
+    restore.await.unwrap().unwrap();
+
+    {
+        let state = engine.state.lock().await;
+        assert!(state.items.iter().all(|item| item.id != old_id));
+        assert!(state.eviction_buffer.iter().all(|item| item.id != old_id));
+        assert!(state.external.iter().all(|entry| entry.item_id != old_id));
+        assert!(
+            state.pending_materialization.is_none(),
+            "restore must not retain the old preview as pending in the replacement state"
+        );
+    }
+    let stale_ack = ContextConsumptionAck {
+        turn_id: TurnId::new(),
+        operation_id: OperationId::new(),
+        model_round: 1,
+        materialization_id: preview.materialization_id,
+        item_ids: preview.items.iter().map(|item| item.item_id).collect(),
+        external_item_ids: preview.external.iter().map(|entry| entry.item_id).collect(),
+        foreground_item_ids: preview.foreground.iter().map(|item| item.item_id).collect(),
+    };
+    assert!(
+        engine.acknowledge_consumption(stale_ack).await.is_err(),
+        "a pre-restore preview cannot be acknowledged against the replacement state"
+    );
+}
+
+#[tokio::test]
+async fn restore_never_reuses_a_materialization_id_for_a_delayed_ack() {
+    let engine = SimpleContextEngine::new(SimpleContextConfig::default());
+    let checkpoint = engine.checkpoint().await.unwrap();
+    let query = ContextQuery {
+        current_input: "empty preview".into(),
+        budget_tokens: 1_000,
+        hints: ContextHints::default(),
+    };
+    let old_preview = engine.materialize(query.clone()).await.unwrap();
+
+    engine.restore(checkpoint).await.unwrap();
+    let new_preview = engine.materialize(query).await.unwrap();
+    assert!(
+        new_preview.materialization_id > old_preview.materialization_id,
+        "restore must preserve the process-lifetime materialization nonce"
+    );
+
+    let stale_ack = ContextConsumptionAck {
+        turn_id: TurnId::new(),
+        operation_id: OperationId::new(),
+        model_round: 1,
+        materialization_id: old_preview.materialization_id,
+        item_ids: Vec::new(),
+        external_item_ids: Vec::new(),
+        foreground_item_ids: Vec::new(),
+    };
+    assert!(
+        engine.acknowledge_consumption(stale_ack).await.is_err(),
+        "an old empty preview must not alias the new empty preview after restore"
     );
 }
 

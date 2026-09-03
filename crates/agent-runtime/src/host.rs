@@ -91,15 +91,18 @@ impl ServiceRegistry {
         id: CapabilityId,
         what: &str,
     ) -> AgentResult<Arc<T>> {
-        self.services
-            .get(&id)
-            .and_then(|boxed| boxed.downcast_ref::<Arc<T>>())
-            .cloned()
-            .ok_or_else(|| {
-                AgentError::InvalidRequest(format!(
-                    "capability {id:?} ({what}) not available; is its module registered?"
-                ))
-            })
+        let Some(boxed) = self.services.get(&id) else {
+            return Err(AgentError::InvalidRequest(format!(
+                "capability {id:?} ({what}) not available; is its module registered?"
+            )));
+        };
+        if let Some(service) = boxed.downcast_ref::<Arc<T>>() {
+            return Ok(service.clone());
+        }
+        let claimed_by = self.claims.get(&id).map(String::as_str).unwrap_or("?");
+        Err(AgentError::InvalidRequest(format!(
+            "capability {id:?} ({what}) is registered by module '{claimed_by}' but its value              does not implement the requested type"
+        )))
     }
 
     pub fn context_service(&self) -> AgentResult<Arc<dyn ContextEngine>> {
@@ -118,14 +121,22 @@ impl ServiceRegistry {
         self.get(APPROVAL_POLICY, "approval policy")
     }
 
-    /// The event journal is optional in the prototype.
+    /// The event journal is optional in the prototype: absence is `None`,
+    /// while a registered value that is not an event journal is an error.
     pub fn event_store(&self) -> AgentResult<Option<Arc<dyn EventJournal>>> {
-        Ok(self.get(EVENT_STORE, "event store").ok())
+        if !self.services.contains_key(&EVENT_STORE) {
+            return Ok(None);
+        }
+        Ok(Some(self.get(EVENT_STORE, "event store")?))
     }
 
-    /// The artifact store is optional in the prototype.
+    /// The artifact store is optional in the prototype: absence is `None`,
+    /// while a registered value that is not a workspace is an error.
     pub fn artifact_store(&self) -> AgentResult<Option<Arc<Workspace>>> {
-        Ok(self.get(ARTIFACT_STORE, "artifact store").ok())
+        if !self.services.contains_key(&ARTIFACT_STORE) {
+            return Ok(None);
+        }
+        Ok(Some(self.get(ARTIFACT_STORE, "artifact store")?))
     }
 }
 
@@ -274,4 +285,84 @@ fn aggregate_errors(errors: Vec<AgentError>) -> AgentError {
         .collect::<Vec<_>>()
         .join("; ");
     AgentError::Internal(message)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    struct FakeJournal;
+
+    #[async_trait::async_trait]
+    impl EventJournal for FakeJournal {
+        async fn append(
+            &self,
+            _envelope: &agent_contracts::RuntimeEventEnvelope,
+        ) -> AgentResult<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn optional_accessors_treat_absence_as_none() {
+        let registry = ServiceRegistry::new();
+        assert!(registry.event_store().unwrap().is_none());
+        assert!(registry.artifact_store().unwrap().is_none());
+    }
+
+    #[test]
+    fn optional_accessors_return_the_registered_service() {
+        let mut registry = ServiceRegistry::new();
+        registry
+            .register(
+                EVENT_STORE,
+                "test",
+                Arc::new(FakeJournal) as Arc<dyn EventJournal>,
+            )
+            .unwrap();
+        assert!(
+            registry
+                .event_store()
+                .unwrap()
+                .as_ref()
+                .map(|journal| Arc::clone(journal) as Arc<dyn EventJournal>)
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn optional_accessors_error_on_a_registered_wrong_type() {
+        let mut registry = ServiceRegistry::new();
+        registry
+            .register(EVENT_STORE, "wrong-module", Arc::new(7_u32))
+            .unwrap();
+        registry
+            .register(ARTIFACT_STORE, "wrong-module", Arc::new(9_i64))
+            .unwrap();
+
+        fn wrong_type_error(result: AgentResult<()>) -> String {
+            match result {
+                Err(error) => error.to_string(),
+                Ok(()) => panic!("a present wrong type must be an error, not a silent success"),
+            }
+        }
+        let error = wrong_type_error(registry.event_store().map(|_| ()));
+        assert!(
+            error.contains("does not implement") && error.contains("wrong-module"),
+            "a present wrong type must be a typed error, not a silent None: {error}"
+        );
+        let error = wrong_type_error(registry.artifact_store().map(|_| ()));
+        assert!(
+            error.contains("does not implement"),
+            "artifact wrong type must surface: {error}"
+        );
+
+        // The typed get path reports the same distinction for direct lookups.
+        let error = wrong_type_error(
+            registry
+                .get::<dyn EventJournal>(EVENT_STORE, "event store")
+                .map(|_| ()),
+        );
+        assert!(error.contains("does not implement"), "{error}");
+    }
 }

@@ -254,6 +254,7 @@ fn checkpoint(run_id: RunId) -> RuntimeCheckpoint {
         authority: None,
         snapshot_sequence: 0,
         capability_generation: 0,
+        unresolved_ack_debts: Vec::new(),
         event_cover_seq: 0,
         terminal_commit: false,
     }

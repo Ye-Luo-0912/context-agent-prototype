@@ -254,6 +254,7 @@ impl RuntimeActor {
                     &facts,
                     None,
                 );
+                self.observe_completion_repair_action(&output);
                 self.report_frontier(frontier).await;
             }
             self.spawn_next_model_or_end(op_tx).await;
@@ -281,6 +282,7 @@ impl RuntimeActor {
                     ActionDispatch::Refused,
                     None,
                 );
+                self.observe_completion_repair_action(&output);
                 if let Some(turn) = self.state.turn.as_mut() {
                     let facts = self.services.tools().execution_facts(&output);
                     turn.turn_frame.push_tool_result_with(
@@ -993,6 +995,42 @@ impl RuntimeActor {
                     self.drain_queued_user_input(op_tx).await;
                     return;
                 }
+                let completion_finalization = {
+                    let readiness =
+                        self.completion_readiness(CompletionIntent::ModelProposal, None);
+                    self.state
+                        .turn
+                        .as_ref()
+                        .and_then(|turn| turn.execution.completion_repair.as_ref())
+                        .is_some_and(|record| record.terminal_applies(&readiness))
+                };
+                if completion_finalization && !tool_calls.is_empty() {
+                    // A terminal repair decision is an actual text-only
+                    // protocol phase, not another advisory prompt. Never
+                    // execute a provider-emitted action against the empty
+                    // captured surface, and never turn that violation into
+                    // another model/tool retry cycle.
+                    let _ = self
+                        .core
+                        .emit_event(RuntimeEvent::Error {
+                            message: format!(
+                                "completion repair finalization returned {} tool call(s); actions were refused and the repair turn was ended",
+                                tool_calls.len()
+                            ),
+                        })
+                        .await;
+                    self.emit_input_consumed().await;
+                    if let Err(error) = self.reconcile_model_decision_leases(&[]).await {
+                        self.fail_round_preparation("tool_leases_reconciled_event", error)
+                            .await;
+                    } else if content.trim().is_empty() {
+                        self.settle_aborted_turn().await;
+                    } else {
+                        self.finalize_turn(content).await;
+                    }
+                    self.drain_queued_user_input(op_tx).await;
+                    return;
+                }
                 if tool_calls.len() > MAX_MODEL_TOOL_CALLS_PER_ROUND {
                     if let Some(turn) = self.state.turn.as_mut() {
                         turn.action_batch = Some(TurnActionBatch::refused_before_dispatch(
@@ -1093,6 +1131,7 @@ impl RuntimeActor {
                                 .core
                                 .emit_event(RuntimeEvent::EffectAckDebt { debt: debt.clone() })
                                 .await;
+                            self.record_ack_debt(debt.clone());
                             match &receipt {
                                 EffectReceipt::NotApplied { error } => unsettled_effect_output(
                                     output,
@@ -1372,6 +1411,7 @@ impl RuntimeActor {
                     &facts,
                     settled_attribution.as_ref(),
                 );
+                self.observe_completion_repair_action(&output);
                 // remember deterministic edit refusals so an
                 // identical retry can be refused without dispatch.
                 if let Some(digest) = completion.argument_digest
@@ -1990,6 +2030,7 @@ impl RuntimeActor {
                     )
                 })
             });
+        self.observe_completion_repair_action(&output);
         self.report_frontier(frontier).await;
     }
 
@@ -2026,6 +2067,7 @@ impl RuntimeActor {
             &facts,
             attribution,
         );
+        self.observe_completion_repair_action(&output);
         self.report_frontier(frontier).await;
     }
 
@@ -2035,6 +2077,18 @@ impl RuntimeActor {
     /// or event append cannot accidentally leave mutation enabled. The
     /// active turn is deliberately not aborted: it must carry the truthful
     /// receipt back to the model/user and durably record that outcome.
+    /// Retain a live effect-ack debt so the next checkpoint capture
+    /// persists it. Bounded newest-window: the fence makes later mutation
+    /// impossible while any debt is unresolved, so overflow drops the
+    /// oldest instead of growing without bound.
+    pub(super) fn record_ack_debt(&mut self, debt: EffectAckDebt) {
+        const MAX_LIVE_ACK_DEBTS: usize = crate::checkpoint::MAX_CHECKPOINT_ACK_DEBTS;
+        if self.state.unresolved_ack_debts.len() >= MAX_LIVE_ACK_DEBTS {
+            self.state.unresolved_ack_debts.remove(0);
+        }
+        self.state.unresolved_ack_debts.push(debt);
+    }
+
     pub(super) async fn require_effect_recovery(&mut self, warning: String) {
         let warning = crate::output::bound_error_message(warning);
         let newly_required = !self.state.recovery_required;

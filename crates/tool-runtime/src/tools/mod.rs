@@ -23,12 +23,16 @@ pub(crate) use fs::{FsListTool, FsMkdirTool, FsReadTool, FsWriteTool};
 pub(crate) use git::{GitDiffTool, GitStatusTool};
 pub(crate) use patch::EditPatchTool;
 pub(crate) use process::{
-    ProcessArgs, ProcessInvocation, ProcessRunTool, verification_executable_identity,
+    ProcessArgs, ProcessInvocation, ProcessRunTool,
+    outcome_equivalence_material as process_outcome_equivalence_material,
+    verification_executable_identity,
 };
 pub(crate) use search::SearchGrepTool;
 pub(crate) use session::{ProcessSessionTool, SessionRegistry, SessionSlot, drain_sessions};
-pub(crate) use shell::ShellExecTool;
 pub use shell::{ShellDialect, ShellKind};
+pub(crate) use shell::{
+    ShellExecTool, outcome_equivalence_material as shell_outcome_equivalence_material,
+};
 pub(crate) use task::TaskCompleteTool;
 pub(crate) use task_manage::TaskManageTool;
 pub(crate) use verify::VerificationRunTool;

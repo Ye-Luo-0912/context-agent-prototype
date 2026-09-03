@@ -41,9 +41,13 @@ impl RuntimeActor {
             version,
             snapshot_sequence: restored_snapshot_sequence,
             capability_generation: _,
+            unresolved_ack_debts: restored_ack_debts,
             event_cover_seq: _,
             terminal_commit: _,
         } = checkpoint;
+        // Install the debts immediately: any restore failure path fences
+        // mutation anyway, and finalization runs the reconciliation pass.
+        self.state.unresolved_ack_debts = restored_ack_debts;
 
         let mut restored_requirement_high_water = self.state.task_requirement_high_water.clone();
         for task in self.state.tasks.list_records() {
@@ -199,6 +203,13 @@ impl RuntimeActor {
                     self.core.recovery_status(),
                     agent_contracts::AuthorityRecoveryStatus::RecoveryRequired { .. }
                 );
+                // Persisted ACK debts re-fence mutation until each one is
+                // reconciled against the broker journal's durable truth.
+                if !self.state.unresolved_ack_debts.is_empty() {
+                    self.state.recovery_required = true;
+                    let _ = self.core.emit_event(RuntimeEvent::RecoveryRequired).await;
+                    self.reconcile_restored_ack_debts().await;
+                }
                 // The restore transaction is committed. Converge the store
                 // with the restored checkpoint's external map before the
                 // runtime serves again — reconcile is the crash-recovery
@@ -224,6 +235,54 @@ impl RuntimeActor {
                 let _ = self.core.emit_event(RuntimeEvent::RecoveryRequired).await;
                 Err(error)
             }
+        }
+    }
+
+    /// Reconcile the ACK debts restored with the checkpoint against the
+    /// broker journal's durable reservation records. Applied/NotApplied
+    /// resolutions retire the debt (the typed settlement is now durable
+    /// truth); Ambiguous resolutions keep the debt and the mutation fence.
+    /// The fence clears only when every debt resolved and Core reports no
+    /// other recovery requirement.
+    pub(super) async fn reconcile_restored_ack_debts(&mut self) {
+        let debts = std::mem::take(&mut self.state.unresolved_ack_debts);
+        let mut unresolved = Vec::new();
+        for debt in debts {
+            match self.core.reconcile_effect(&debt) {
+                Ok(Some(resolution)) => {
+                    let resolved = !matches!(
+                        resolution,
+                        agent_contracts::EffectReconciliation::Ambiguous { .. }
+                    );
+                    let _ = self
+                        .core
+                        .emit_event(RuntimeEvent::EffectAckDebtResolved {
+                            debt: debt.clone(),
+                            resolution,
+                        })
+                        .await;
+                    if !resolved {
+                        unresolved.push(debt);
+                    }
+                }
+                // No broker reservation surface, or a reconciliation error:
+                // the debt's truth is unknowable, so it stays and the
+                // mutation fence holds.
+                _ => unresolved.push(debt),
+            }
+        }
+        if unresolved.is_empty() {
+            // The restore-time fence was entered for these debts alone; it
+            // may clear only while Core itself reports no other recovery
+            // requirement.
+            if matches!(
+                self.core.recovery_status(),
+                agent_contracts::AuthorityRecoveryStatus::Ready
+            ) {
+                self.state.recovery_required = false;
+            }
+        } else {
+            self.state.unresolved_ack_debts = unresolved;
         }
     }
 }

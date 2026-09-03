@@ -699,6 +699,21 @@ impl AppState {
                     debt.error
                 ));
             }
+            RuntimeEvent::EffectAckDebtResolved { debt, resolution } => {
+                let kind = match &resolution {
+                    agent_contracts::EffectReconciliation::NotManaged => "not managed",
+                    agent_contracts::EffectReconciliation::NotApplied { .. } => "not applied",
+                    agent_contracts::EffectReconciliation::Applied { .. } => "applied",
+                    agent_contracts::EffectReconciliation::CompletedValue { .. } => {
+                        "completed value"
+                    }
+                    agent_contracts::EffectReconciliation::Ambiguous { .. } => "ambiguous",
+                };
+                self.push_system(format!(
+                    "effect {} ack debt reconciled as {}: reservation {}",
+                    debt.effect_id, kind, debt.reservation_id
+                ));
+            }
             RuntimeEvent::Failure {
                 class,
                 retryable,

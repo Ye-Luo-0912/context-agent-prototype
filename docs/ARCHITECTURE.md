@@ -2111,6 +2111,26 @@ and projects one bounded typed failure into its resume state. An audit failure
 after the terminal checkpoint is a committed completion plus a recovery fence,
 not a retryable pending proposal.
 
+Completion safety and completion liveness are both Runtime responsibilities.
+`TaskAnchor.next_action` is replaceable model guidance, not authority, evidence
+or a completion blocker; real unfinished work is expressed by open loops,
+acceptance gaps and typed execution/effect/recovery debt. A refused
+`task.complete` starts a durable semantic repair episode. Within the same user
+directive and verification authority, progress-only anchor CAS changes,
+workspace revisions and rewritten prose cannot make the episode new. Runtime
+derives one typed blocker stage with a postcondition and counts progress only
+when its ordered blocker potential strictly improves.
+
+When the same blocker repeats or stages cycle without semantic progress,
+Runtime enters an audited text-only finalization decision. It dispatches no
+provider-emitted tool call in that phase; an ordinary final ends the current
+turn while the task remains active. New user input starts a new episode;
+continuation and checkpoint/restore retain the current one. This bounded
+handoff is not automatic completion and never weakens `CompletionReadiness`.
+For proof-only blockers, Runtime may resolve the exact recipe from the current
+host coverage declaration without relying on model call history, then rechecks
+the resulting identity against dispatcher attribution before admitting PASS.
+
 The default always-loaded model surface is `fs.list`, `fs.read`, `fs.write`,
 `search.grep`, `artifact.read`, `edit.patch`, `git.status`, `git.diff`,
 `task.complete`, and `capability.manage`. `edit.patch` is the single canonical

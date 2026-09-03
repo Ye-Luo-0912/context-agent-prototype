@@ -17,7 +17,7 @@ use std::hash::Hash;
 use agent_contracts::{
     AttentionState, ContextItem, ContextItemId, ContextKind, ContextResidency, ContextScope,
     ContextSearchQuery, ExternalizedContext, SearchCandidates, SearchIncompleteReason, TaskId,
-    TextIndex, tokenize,
+    TextIndex, query_needs_text_residual, tokenize,
 };
 
 /// Where the item's body currently lives. Exactly one location per id.
@@ -49,10 +49,14 @@ struct CatalogKeys {
     live: bool,
     /// Path identity, when the item carries one (`path@rev` sources).
     file_path: Option<String>,
-    /// Bounded body text for the shared inverted index: a content prefix
-    /// for resident/warm items, the stored summary for externalized ones.
-    /// Never a full 16 KiB body — the kernel caps tokens per document.
+    /// Bounded text for the shared inverted index: a semantic content prefix
+    /// for resident/warm items, a stored semantic summary, or the path@rev
+    /// identity of raw evidence. Never a full 16 KiB body.
     body_text: String,
+    /// This entry has matchable body text outside `body_text` (or outside
+    /// the shared kernel's per-document token budget). Kept per entry so
+    /// one long document cannot make every query residual-scan the catalog.
+    body_truncated: bool,
 }
 
 /// 正文进倒排的前缀上限：命中靠前导 token，全文召回走 fetch/admit。
@@ -60,11 +64,14 @@ const INDEX_BODY_PREFIX_CHARS: usize = 512;
 
 impl CatalogKeys {
     fn from_item(item: &ContextItem) -> Self {
+        let searchable_body = kind_has_searchable_body(item.kind);
+        let body_truncated =
+            searchable_body && item.content.chars().count() > INDEX_BODY_PREFIX_CHARS;
         Self {
             task_id: item.task_id,
             scope: item.scope,
             kind: item.kind,
-            entities: item.entities.clone(),
+            entities: catalog_entities(item.kind, &item.entities, item.file_path.as_deref()),
             labels: item
                 .tags
                 .iter()
@@ -74,7 +81,17 @@ impl CatalogKeys {
             attention: item.attention,
             live: item.semantic.is_live(),
             file_path: item.file_path.clone(),
-            body_text: item.content.chars().take(INDEX_BODY_PREFIX_CHARS).collect(),
+            body_text: if searchable_body {
+                item.content.chars().take(INDEX_BODY_PREFIX_CHARS).collect()
+            } else {
+                crate::item::raw_evidence_identity(
+                    item.kind,
+                    item.file_path.as_deref(),
+                    item.file_revision.as_deref(),
+                )
+                .expect("raw evidence kind has an identity")
+            },
+            body_truncated,
         }
     }
 
@@ -83,7 +100,7 @@ impl CatalogKeys {
             task_id: entry.task_id,
             scope: entry.scope,
             kind: entry.kind,
-            entities: entry.entities.clone(),
+            entities: catalog_entities(entry.kind, &entry.entities, entry.file_path.as_deref()),
             labels: entry
                 .tags
                 .iter()
@@ -93,7 +110,20 @@ impl CatalogKeys {
             attention: entry.attention,
             live: entry.semantic.is_live(),
             file_path: entry.file_path.clone(),
-            body_text: entry.context_ref.summary.clone(),
+            body_text: if kind_has_searchable_body(entry.kind) {
+                entry.context_ref.summary.clone()
+            } else {
+                crate::item::raw_evidence_identity(
+                    entry.kind,
+                    entry.file_path.as_deref(),
+                    entry.file_revision.as_deref(),
+                )
+                .expect("raw evidence kind has an identity")
+            },
+            // A stored descriptor never proves that its summary is the full
+            // semantic body. Raw tool/file bodies are intentionally excluded:
+            // their path@revision identity is searchable, their body is Fetch-only.
+            body_truncated: kind_has_searchable_body(entry.kind),
         }
     }
 }
@@ -156,10 +186,10 @@ pub(crate) struct ContextCatalog {
     /// never collide within a generation).
     text_ids: HashMap<ContextItemId, u32>,
     text_docs: Vec<ContextItemId>,
-    /// 一旦有已索引文档的正文在索引前缀处被截断就置位：深处的关键词
-    /// 索引看不见，词检索必须如实报告召回不完整。只置位不清除——它
-    /// 触发的残差校验有界且安全。
-    any_body_truncated: bool,
+    /// Documents whose matchable text is not fully represented by the
+    /// inverted index. Unlike the former global sticky bit, ids leave this
+    /// set on removal/reindex and structured filters can narrow it.
+    truncated_text_ids: HashSet<ContextItemId>,
     fingerprint: CatalogFingerprint,
     #[cfg(test)]
     last_sync_rebuilt: bool,
@@ -296,6 +326,15 @@ impl ContextCatalog {
         let done = |ids: Vec<ContextItemId>, incomplete: Option<SearchIncompleteReason>| {
             Some(SearchCandidates { ids, incomplete })
         };
+        let needle = query.query.trim();
+        if let Ok(item_id) = ContextItemId::parse_ref(needle) {
+            let ids = self
+                .matches_structured_filters(item_id, query)
+                .then_some(item_id)
+                .into_iter()
+                .collect();
+            return done(ids, None);
+        }
         let mut candidates: Option<HashSet<ContextItemId>> = None;
         let mut intersect = |bucket: &[ContextItemId]| {
             let incoming: HashSet<ContextItemId> = bucket.iter().copied().collect();
@@ -334,7 +373,6 @@ impl ContextCatalog {
             intersect(&ids);
         }
 
-        let needle = query.query.trim();
         if !needle.is_empty() {
             // 命中率优先的候选并集，两层各补对方的盲区：
             // 1) 共享倒排核 —— 多词覆盖、稀有度分层、唯一前缀扩展；
@@ -349,13 +387,11 @@ impl ContextCatalog {
             // 候选集平方级的线性 contains。
             let mut seen: HashSet<ContextItemId> = HashSet::new();
             let mut saw_candidate = false;
-            let mut text_live_hits = false;
             for matched in self.text.search(needle) {
                 saw_candidate = true;
                 let id = self.text_docs[matched.doc as usize];
                 if self.live.contains(&id) && seen.insert(id) {
                     ids.push(id);
-                    text_live_hits = true;
                 }
             }
             for id in self.text_key_ids(needle) {
@@ -368,9 +404,7 @@ impl ContextCatalog {
                 if let Some(set) = candidates.as_ref() {
                     ids.retain(|id| set.contains(id));
                 }
-                let incomplete = text_live_hits
-                    .then(|| self.index_incomplete_reason(needle))
-                    .flatten();
+                let incomplete = self.index_incomplete_reason(needle, candidates.as_ref());
                 return done(ids, incomplete);
             }
             if saw_candidate {
@@ -384,18 +418,27 @@ impl ContextCatalog {
                         .collect(),
                     None => Vec::new(),
                 };
-                return done(ids, self.index_incomplete_reason(needle));
+                return done(
+                    ids,
+                    self.index_incomplete_reason(needle, candidates.as_ref()),
+                );
             }
             // 真正无文本候选：有过滤时过滤桶本身就是候选集（旧行为）；
-            // 无过滤时交给调用方残差扫描。
-            let set = candidates.as_ref()?;
-            return done(
-                set.iter()
-                    .copied()
-                    .filter(|id| self.live.contains(id))
-                    .collect(),
-                None,
-            );
+            // 无过滤且没有不完整正文时交给调用方的普通残差扫描。
+            // 若有截断正文，空候选也必须携带 incomplete，否则 Stored
+            // 中部/尾部的唯一命中永远没有机会进入锁外校验。
+            let incomplete = self.index_incomplete_reason(needle, candidates.as_ref());
+            return match candidates.as_ref() {
+                Some(set) => done(
+                    set.iter()
+                        .copied()
+                        .filter(|id| self.live.contains(id))
+                        .collect(),
+                    incomplete,
+                ),
+                None if incomplete.is_some() => done(Vec::new(), incomplete),
+                None => None,
+            };
         }
 
         let ids = match candidates {
@@ -424,15 +467,81 @@ impl ContextCatalog {
     }
 
     /// 文本索引为何可能漏掉该词的命中：仅在文本层已被查询过时有意义。
-    fn index_incomplete_reason(&self, needle: &str) -> Option<SearchIncompleteReason> {
-        let tokens = tokenize(needle);
-        if self.text.has_saturated_token(&tokens) {
+    fn index_incomplete_reason(
+        &self,
+        needle: &str,
+        filtered_ids: Option<&HashSet<ContextItemId>>,
+    ) -> Option<SearchIncompleteReason> {
+        if query_needs_text_residual(needle) {
+            let has_live_candidate = match filtered_ids {
+                Some(ids) => ids.iter().any(|id| self.live.contains(id)),
+                None => !self.live.is_empty(),
+            };
+            return has_live_candidate.then_some(SearchIncompleteReason::UnindexedQueryShape);
+        }
+        if self.text.query_has_saturated_match(needle) {
             return Some(SearchIncompleteReason::SaturatedPosting);
         }
-        if self.any_body_truncated {
+        let truncated_in_filter = match filtered_ids {
+            Some(ids) if ids.len() <= self.truncated_text_ids.len() => {
+                ids.iter().any(|id| self.truncated_text_ids.contains(id))
+            }
+            Some(ids) => self.truncated_text_ids.iter().any(|id| ids.contains(id)),
+            None => !self.truncated_text_ids.is_empty(),
+        };
+        if truncated_in_filter {
             return Some(SearchIncompleteReason::TruncatedIndexedText);
         }
         None
+    }
+
+    /// Whether this document's own indexed text is incomplete and it
+    /// satisfies the query's structured filters. Callers can apply this
+    /// predicate while streaming catalog rows, without allocating an
+    /// O(history) id list for the truncated-text residual path.
+    #[allow(dead_code)] // Wired by the lock-free stored-body search phase.
+    pub(crate) fn is_truncated_search_candidate(
+        &self,
+        id: ContextItemId,
+        query: &ContextSearchQuery,
+    ) -> bool {
+        self.truncated_text_ids.contains(&id) && self.matches_structured_filters(id, query)
+    }
+
+    /// Whether an id is live and satisfies the query's non-text filters.
+    /// Used only when the text index cannot represent the query shape.
+    pub(crate) fn is_search_candidate(
+        &self,
+        id: ContextItemId,
+        query: &ContextSearchQuery,
+    ) -> bool {
+        self.matches_structured_filters(id, query)
+    }
+
+    fn matches_structured_filters(&self, id: ContextItemId, query: &ContextSearchQuery) -> bool {
+        let Some(keys) = self.records.get(&id) else {
+            return false;
+        };
+        if !keys.live {
+            return false;
+        }
+        if query.kind.is_some_and(|kind| keys.kind != kind)
+            || query.scope.is_some_and(|scope| keys.scope != scope)
+            || query.task_id.is_some_and(|task| keys.task_id != Some(task))
+        {
+            return false;
+        }
+        if let Some(label) = query.label.as_deref() {
+            let label = label.to_lowercase();
+            if !keys
+                .labels
+                .iter()
+                .any(|candidate| candidate.to_lowercase() == label)
+            {
+                return false;
+            }
+        }
+        true
     }
 
     /// Stored (Cold/External) candidate ids for store-only ranking tests.
@@ -476,6 +585,15 @@ impl ContextCatalog {
         for (key, bucket) in &self.by_label {
             if key.to_lowercase().contains(&needle) {
                 ids.extend_from_slice(bucket);
+            }
+        }
+        for (id, keys) in &self.records {
+            if keys
+                .file_path
+                .as_deref()
+                .is_some_and(|path| path.to_lowercase().contains(&needle))
+            {
+                ids.push(*id);
             }
         }
         ids
@@ -551,7 +669,7 @@ impl ContextCatalog {
         self.text.clear();
         self.text_ids.clear();
         self.text_docs.clear();
-        self.any_body_truncated = false;
+        self.truncated_text_ids.clear();
     }
 
     fn insert_item(&mut self, item: &ContextItem, location: CatalogLocation) {
@@ -593,6 +711,7 @@ impl ContextCatalog {
         if let Some(doc) = self.text_ids.remove(&id) {
             self.text.remove(doc);
         }
+        self.truncated_text_ids.remove(&id);
         self.by_id.remove(&id);
     }
 
@@ -607,12 +726,6 @@ impl ContextCatalog {
     /// hit may legitimately match — entities, labels, path identity, and a
     /// bounded body prefix / stored summary.
     fn index_text(&mut self, id: ContextItemId, keys: &CatalogKeys) {
-        if keys.body_text.chars().count() >= INDEX_BODY_PREFIX_CHARS {
-            // This doc's body was cut at the index bound: deep-body
-            // keywords cannot match. One flag is enough — the residual
-            // verification it triggers is bounded and recall-safe.
-            self.any_body_truncated = true;
-        }
         let doc = self.text_docs.len() as u32;
         let mut fields: Vec<&str> = Vec::with_capacity(4 + keys.entities.len() + keys.labels.len());
         for entity in &keys.entities {
@@ -625,6 +738,9 @@ impl ContextCatalog {
             fields.push(path);
         }
         fields.push(keys.body_text.as_str());
+        if keys.live && (keys.body_truncated || fields_exceed_text_token_budget(&fields)) {
+            self.truncated_text_ids.insert(id);
+        }
         if self.text.insert(doc, &fields) {
             self.text_ids.insert(id, doc);
             self.text_docs.push(id);
@@ -672,6 +788,54 @@ impl ContextCatalog {
         remove_from_bucket(&mut self.by_attention, keys.attention, id);
         self.live.remove(&id);
     }
+}
+
+/// Raw tool/file evidence is searchable only by its descriptor identity
+/// (path, revision, entities and labels). Reading its body is always an
+/// explicit Fetch and must never become a full-text search side channel.
+pub(crate) fn kind_has_searchable_body(kind: ContextKind) -> bool {
+    !crate::item::is_raw_evidence_kind(kind)
+}
+
+/// Raw bodies may contain path-looking or CamelCase text, so their cached
+/// entity extraction is not a trustworthy search descriptor. Preserve only
+/// the explicit stamped path; semantic kinds keep their normal signatures.
+fn catalog_entities(
+    kind: ContextKind,
+    entities: &[String],
+    file_path: Option<&str>,
+) -> Vec<String> {
+    if !crate::item::is_raw_evidence_kind(kind) {
+        return entities.to_vec();
+    }
+    file_path
+        .map(str::trim)
+        .filter(|path| !path.is_empty())
+        .map(|path| vec![path.to_string()])
+        .unwrap_or_default()
+}
+
+/// Mirror the shared kernel's per-document token bound so catalog
+/// completeness includes token-budget truncation as well as character-window
+/// truncation. The set stops at `MAX + 1`, keeping this check bounded.
+fn fields_exceed_text_token_budget(fields: &[&str]) -> bool {
+    let mut unique = HashSet::new();
+    for field in fields {
+        let tokens = tokenize(field);
+        let field_reached_cap = tokens.len() >= agent_contracts::search::MAX_TOKENS_PER_DOC;
+        for token in tokens {
+            unique.insert(token);
+            if unique.len() > agent_contracts::search::MAX_TOKENS_PER_DOC {
+                return true;
+            }
+        }
+        // `tokenize` itself caps at MAX. Equality is conservatively treated
+        // as incomplete because the field may contain a dropped next token.
+        if field_reached_cap {
+            return true;
+        }
+    }
+    false
 }
 
 fn remove_from_bucket<K: Eq + Hash>(
@@ -840,11 +1004,14 @@ mod tests {
             .expect("entity keys bound the set");
         assert_eq!(by_entity, vec![decision_id]);
 
-        assert!(
-            catalog
-                .stored_search_ids(&ContextSearchQuery::new("not-an-entity", 8))
-                .is_none(),
-            "a needle matching nothing anywhere must residual-scan"
+        let unmatched = ContextSearchQuery::new("not-an-entity", 8);
+        let candidates = catalog
+            .search_candidates(&unmatched)
+            .expect("stored summaries cannot prove their full bodies do not match");
+        assert!(candidates.ids.is_empty());
+        assert_eq!(
+            candidates.incomplete,
+            Some(SearchIncompleteReason::TruncatedIndexedText)
         );
     }
 
@@ -875,6 +1042,260 @@ mod tests {
             .search_candidates(&ContextSearchQuery::new("zebra", 8))
             .expect("candidate");
         assert_eq!(complete.incomplete, None, "no truncation: complete");
+    }
+
+    #[test]
+    fn truncation_metadata_is_per_item_filter_aware_and_terminal_safe() {
+        let task_a = TaskId::new();
+        let task_b = TaskId::new();
+        let mut long_note = item(ContextItemId::new(), "", None);
+        long_note.content = format!("{} hidden tail", "x".repeat(600));
+        long_note.entities.clear();
+        long_note.task_id = Some(task_a);
+        long_note.kind = ContextKind::Note;
+
+        let mut decision = item(ContextItemId::new(), "zebra decision", None);
+        decision.task_id = Some(task_b);
+        decision.kind = ContextKind::Decision;
+
+        let mut dead_long = long_note.clone();
+        dead_long.id = ContextItemId::new();
+        dead_long.semantic = SemanticState::Tombstoned;
+
+        let mut catalog = ContextCatalog::default();
+        catalog.rebuild(
+            &[long_note.clone(), decision.clone(), dead_long.clone()],
+            &[],
+            &[],
+        );
+
+        let decision_query = ContextSearchQuery {
+            query: "zebra".into(),
+            kind: Some(ContextKind::Decision),
+            task_id: Some(task_b),
+            limit: 8,
+            ..ContextSearchQuery::default()
+        };
+        let candidates = catalog
+            .search_candidates(&decision_query)
+            .expect("the decision text is indexed");
+        assert_eq!(candidates.ids, vec![decision.id]);
+        assert_eq!(
+            candidates.incomplete, None,
+            "a truncated note outside the structured filters cannot widen the decision query"
+        );
+        assert!(!catalog.is_truncated_search_candidate(long_note.id, &decision_query));
+
+        let note_query = ContextSearchQuery {
+            query: "zebra".into(),
+            kind: Some(ContextKind::Note),
+            task_id: Some(task_a),
+            limit: 8,
+            ..ContextSearchQuery::default()
+        };
+        assert!(catalog.is_truncated_search_candidate(long_note.id, &note_query));
+        assert!(
+            !catalog.is_truncated_search_candidate(dead_long.id, &note_query),
+            "terminal semantics never enter a residual retrieval plan"
+        );
+    }
+
+    #[test]
+    fn stored_descriptors_are_explicitly_potentially_truncated() {
+        let stored_item = item(ContextItemId::new(), "short stored summary", None);
+        let marker = item(ContextItemId::new(), "zebra marker", None);
+        let stored = stored(&stored_item);
+        let mut catalog = ContextCatalog::default();
+        catalog.rebuild(
+            std::slice::from_ref(&marker),
+            &[],
+            std::slice::from_ref(&stored),
+        );
+
+        let query = ContextSearchQuery::new("zebra", 8);
+        let candidates = catalog
+            .search_candidates(&query)
+            .expect("the resident marker is indexed");
+        assert_eq!(candidates.ids, vec![marker.id]);
+        assert_eq!(
+            candidates.incomplete,
+            Some(SearchIncompleteReason::TruncatedIndexedText),
+            "a stored summary cannot prove its unseen blob body lacks the query"
+        );
+        assert!(catalog.is_truncated_search_candidate(stored_item.id, &query));
+    }
+
+    #[test]
+    fn unindexed_short_query_reports_an_explicit_residual_reason() {
+        let mut note = item(
+            ContextItemId::new(),
+            "semantic body ends with 你好世界",
+            None,
+        );
+        note.entities.clear();
+        let mut catalog = ContextCatalog::default();
+        catalog.rebuild(std::slice::from_ref(&note), &[], &[]);
+
+        let candidates = catalog
+            .search_candidates(&ContextSearchQuery::new("界", 8))
+            .expect("an unindexable non-empty query must not become a complete miss");
+        assert!(candidates.ids.is_empty());
+        assert_eq!(
+            candidates.incomplete,
+            Some(SearchIncompleteReason::UnindexedQueryShape)
+        );
+        assert!(catalog.is_search_candidate(note.id, &ContextSearchQuery::new("界", 8)));
+
+        let cjk_candidates = catalog
+            .search_candidates(&ContextSearchQuery::new("世界", 8))
+            .expect("CJK word boundaries also require residual verification");
+        assert_eq!(
+            cjk_candidates.incomplete,
+            Some(SearchIncompleteReason::UnindexedQueryShape)
+        );
+    }
+
+    #[test]
+    fn exact_context_ref_bypasses_saturated_common_tokens() {
+        let mut items = Vec::with_capacity(agent_contracts::search::MAX_POSTINGS_PER_TOKEN + 1);
+        for _ in 0..=agent_contracts::search::MAX_POSTINGS_PER_TOKEN {
+            items.push(item(ContextItemId::new(), "context common", None));
+        }
+        let target = items.last().unwrap().id;
+        let mut catalog = ContextCatalog::default();
+        catalog.rebuild(&items, &[], &[]);
+
+        let candidates = catalog
+            .search_candidates(&ContextSearchQuery::new(
+                format!("context://run/{target}"),
+                8,
+            ))
+            .expect("an exact ref resolves directly");
+        assert_eq!(candidates.ids, vec![target]);
+        assert_eq!(
+            candidates.incomplete, None,
+            "common-token saturation must not widen an exact id lookup"
+        );
+    }
+
+    #[test]
+    fn legacy_key_substring_hit_still_reports_other_incomplete_bodies() {
+        let keyed = item(ContextItemId::new(), "AuthService.rs", None);
+        let mut long = item(ContextItemId::new(), "", None);
+        long.content = format!("{} hService hidden in the tail", "x".repeat(600));
+        long.entities.clear();
+        let mut catalog = ContextCatalog::default();
+        catalog.rebuild(&[keyed.clone(), long], &[], &[]);
+
+        let candidates = catalog
+            .search_candidates(&ContextSearchQuery::new("hService", 8))
+            .expect("legacy entity-key substring is a candidate");
+        assert_eq!(candidates.ids, vec![keyed.id]);
+        assert_eq!(
+            candidates.incomplete,
+            Some(SearchIncompleteReason::TruncatedIndexedText),
+            "legacy-only candidates must not suppress another document's incomplete body"
+        );
+    }
+
+    #[test]
+    fn raw_evidence_body_is_fetch_only_even_when_long_or_stored() {
+        let mut raw = item(ContextItemId::new(), "", None);
+        raw.kind = ContextKind::FileObservation;
+        raw.content = format!("{} secret_tail_token", "x".repeat(600));
+        raw.entities.clear();
+        raw.file_path = Some("src/auth.rs".into());
+        raw.file_revision = Some("rev-9".into());
+
+        let marker = item(ContextItemId::new(), "secret_tail_token marker", None);
+        let mut stored_raw_item = raw.clone();
+        stored_raw_item.id = ContextItemId::new();
+        let mut stored_raw = stored(&stored_raw_item);
+        stored_raw.context_ref.summary = "x".repeat(120);
+        let mut catalog = ContextCatalog::default();
+        catalog.rebuild(
+            &[raw.clone(), marker.clone()],
+            &[],
+            std::slice::from_ref(&stored_raw),
+        );
+
+        let body_query = ContextSearchQuery::new("secret_tail_token", 8);
+        let candidates = catalog
+            .search_candidates(&body_query)
+            .expect("the semantic marker is indexed");
+        assert_eq!(candidates.ids, vec![marker.id]);
+        assert_eq!(
+            candidates.incomplete, None,
+            "raw evidence bodies must not schedule full-text residual reads"
+        );
+        assert!(!catalog.is_truncated_search_candidate(raw.id, &body_query));
+        assert!(!catalog.is_truncated_search_candidate(stored_raw_item.id, &body_query));
+
+        let path_query = ContextSearchQuery::new("src/auth.rs@rev-9", 8);
+        let path_hits = catalog
+            .search_candidates(&path_query)
+            .expect("path identity remains searchable");
+        assert!(path_hits.ids.contains(&raw.id));
+    }
+
+    #[test]
+    fn incremental_reindex_removes_stale_truncation_metadata() {
+        let long_id = ContextItemId::new();
+        let mut long = item(long_id, "", None);
+        long.content = "word ".repeat(120);
+        long.entities.clear();
+        let marker = item(ContextItemId::new(), "zebra marker", None);
+        let mut heap = vec![long, marker.clone()];
+        let mut catalog = ContextCatalog::default();
+        catalog.sync(&heap, &[], &[], 1, CatalogDirty::default());
+
+        let query = ContextSearchQuery::new("zebra", 8);
+        assert_eq!(
+            catalog
+                .search_candidates(&query)
+                .expect("marker candidate")
+                .incomplete,
+            Some(SearchIncompleteReason::TruncatedIndexedText)
+        );
+
+        heap[0].content = "short and fully indexed".into();
+        let mut dirty = CatalogDirty::default();
+        dirty.mark(long_id);
+        catalog.sync(&heap, &[], &[], 2, dirty);
+
+        assert_eq!(
+            catalog
+                .search_candidates(&query)
+                .expect("marker candidate")
+                .incomplete,
+            None,
+            "reindexing a now-short document clears its old incomplete bit"
+        );
+        assert!(!catalog.is_truncated_search_candidate(long_id, &query));
+    }
+
+    #[test]
+    fn shared_kernel_token_budget_is_part_of_per_item_completeness() {
+        let mut many_tokens = item(ContextItemId::new(), "", None);
+        many_tokens.content = (0..70).map(|i| format!("t{i:02} ")).collect();
+        many_tokens.entities.clear();
+        assert!(
+            many_tokens.content.chars().count() < INDEX_BODY_PREFIX_CHARS,
+            "fixture must exercise token truncation, not the character window"
+        );
+        let marker = item(ContextItemId::new(), "zebra marker", None);
+        let mut catalog = ContextCatalog::default();
+        catalog.rebuild(&[many_tokens.clone(), marker], &[], &[]);
+
+        let query = ContextSearchQuery::new("zebra", 8);
+        assert_eq!(
+            catalog
+                .search_candidates(&query)
+                .expect("marker candidate")
+                .incomplete,
+            Some(SearchIncompleteReason::TruncatedIndexedText)
+        );
+        assert!(catalog.is_truncated_search_candidate(many_tokens.id, &query));
     }
 
     #[test]

@@ -406,6 +406,14 @@ pub struct ToolExecutionAttribution {
     pub purpose: ToolExecutionPurpose,
     #[serde(default)]
     pub targets: Vec<String>,
+    /// Host-trusted identity of the effective operation whose successful
+    /// outcome may reconcile an earlier failure. This is deliberately
+    /// separate from `ArgumentDigest`: the latter binds the exact submitted
+    /// JSON for authority/audit, while this digest is computed after the host
+    /// applies semantic defaults (for example an omitted process cwd).
+    /// Empty is fail-closed and preserves exact raw-argument matching.
+    #[serde(default)]
+    pub outcome_equivalence_key: String,
     #[serde(default)]
     pub verification_reuse: VerificationReuse,
     /// SHA-256 identity of host-owned verification recipe material plus every
@@ -508,6 +516,7 @@ impl ToolExecutionAttribution {
         Self {
             purpose,
             targets,
+            outcome_equivalence_key: String::new(),
             verification_reuse: if purpose == ToolExecutionPurpose::Verify {
                 verification_reuse
             } else {
@@ -516,6 +525,27 @@ impl ToolExecutionAttribution {
             verification_identity: String::new(),
             verification_recipe: None,
         }
+    }
+
+    /// Attach a semantic outcome-equivalence identity derived inside the
+    /// trusted host from parsed/effective call inputs. Runtime receives only
+    /// the digest, never the raw canonical material.
+    pub fn with_outcome_equivalence_material(mut self, material: &str) -> Self {
+        let material = material.trim();
+        if !material.is_empty() {
+            self.outcome_equivalence_key =
+                crate::ContentDigest::sha256_bytes(material.as_bytes()).to_string();
+        }
+        self
+    }
+
+    /// A syntactically valid host-stamped equivalence key. Invalid restored
+    /// values fail closed instead of participating in failure reconciliation.
+    pub fn outcome_equivalence_key(&self) -> Option<&str> {
+        self.outcome_equivalence_key
+            .parse::<crate::ContentDigest>()
+            .ok()
+            .map(|_| self.outcome_equivalence_key.as_str())
     }
 
     /// Attach host-resolved recipe provenance. It sticks only for exact
@@ -2339,6 +2369,9 @@ pub enum ToolSurfaceOmissionReason {
     SchemaBudget,
     ProviderInputBudget,
     Unavailable,
+    /// Runtime entered a bounded completion-repair finalization decision.
+    /// This is a text-only model round, so no action schema is offered.
+    CompletionFinalization,
 }
 
 impl ToolSurfaceOmissionReason {
@@ -2348,6 +2381,7 @@ impl ToolSurfaceOmissionReason {
             Self::SchemaBudget => "round schema budget",
             Self::ProviderInputBudget => "provider input budget",
             Self::Unavailable => "not available at the safe point",
+            Self::CompletionFinalization => "completion repair finalization",
         }
     }
 }

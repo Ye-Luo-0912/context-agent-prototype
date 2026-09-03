@@ -22,6 +22,9 @@ pub enum SearchIncompleteReason {
     SaturatedPosting,
     /// 部分已索引文档的正文在索引前缀处截断，深处的关键词索引看不见。
     TruncatedIndexedText,
+    /// 查询含被索引丢弃的短 token，或 tokenizer 无法表达稳定词界
+    /// （例如中文）；候选索引无法证明无命中。
+    UnindexedQueryShape,
 }
 
 /// 候选 id 加显式完备性说明。检索是 GC 的兜底网：`incomplete` 非空时，
@@ -39,6 +42,11 @@ pub const MIN_TOKEN_CHARS: usize = 2;
 /// bodies simply stop feeding the index past the cap; they stay reachable
 /// through their leading tokens.
 pub const MAX_TOKENS_PER_DOC: usize = 64;
+/// Query tokenization is separately bounded. A normalized 256-character
+/// query can contain at most 85 distinct two-character tokens separated by
+/// delimiters, so this cap does not discard any token accepted at the public
+/// search boundary.
+pub const MAX_QUERY_TOKENS: usize = 128;
 /// Postings per token are hard-capped so one ubiquitous token cannot grow
 /// the index without bound. Beyond the cap the token keeps matching its
 /// earliest documents only; `stats()` surfaces saturation.
@@ -91,24 +99,75 @@ pub struct ScoredMatch {
 /// characters, drop short fragments, dedupe, cap per call. Order is
 /// first-appearance so downstream iteration is reproducible.
 pub fn tokenize(text: &str) -> Vec<String> {
+    tokenize_with_limit(text, MAX_TOKENS_PER_DOC, MIN_TOKEN_CHARS)
+}
+
+/// Tokenize a search query without applying the smaller per-document index
+/// budget. This keeps final AND verification honest for normalized queries
+/// containing more than 64 distinct tokens while remaining independently
+/// bounded for direct callers.
+pub fn tokenize_query(text: &str) -> Vec<String> {
+    tokenize_with_limit(text, MAX_QUERY_TOKENS, MIN_TOKEN_CHARS)
+}
+
+/// Tokenize every alphanumeric query run, including one-character fragments.
+/// Candidate indexes intentionally omit those fragments, but residual/final
+/// verification must retain them so a mixed query cannot silently weaken.
+pub fn tokenize_query_fragments(text: &str) -> Vec<String> {
+    tokenize_with_limit(text, MAX_QUERY_TOKENS, 1)
+}
+
+/// Whether the word-token index cannot soundly bound this non-empty query.
+/// Single-character fragments are dropped by design, while non-ASCII
+/// alphanumeric runs do not provide reliable word boundaries for languages
+/// such as Chinese. Callers must use a bounded residual path for both.
+pub fn query_needs_text_residual(text: &str) -> bool {
+    let text = text.trim();
+    let indexed = tokenize_query(text);
+    let fragments = tokenize_query_fragments(text);
+    !text.is_empty()
+        && (indexed.is_empty()
+            || indexed.len() != fragments.len()
+            || query_fragment_uses_substring(text))
+}
+
+/// Whether a query fragment uses a script for which this simple tokenizer has
+/// no sound word-boundary model. Other Unicode alphabets (for example
+/// Cyrillic and accented Latin) retain exact-token verification.
+pub fn query_fragment_uses_substring(fragment: &str) -> bool {
+    fragment.chars().any(|ch| {
+        matches!(
+            ch as u32,
+            0x3400..=0x4DBF
+                | 0x4E00..=0x9FFF
+                | 0xF900..=0xFAFF
+                | 0x20000..=0x2FA1F
+                | 0x3040..=0x30FF
+                | 0x31F0..=0x31FF
+                | 0xAC00..=0xD7AF
+        )
+    })
+}
+
+fn tokenize_with_limit(text: &str, limit: usize, min_chars: usize) -> Vec<String> {
     let mut tokens: Vec<String> = Vec::new();
     let mut current = String::new();
     for ch in text.chars() {
         if ch.is_alphanumeric() {
             current.extend(ch.to_lowercase());
         } else if !current.is_empty() {
-            push_token(&mut tokens, &current);
+            push_token(&mut tokens, &current, limit, min_chars);
             current.clear();
         }
     }
     if !current.is_empty() {
-        push_token(&mut tokens, &current);
+        push_token(&mut tokens, &current, limit, min_chars);
     }
     tokens
 }
 
-fn push_token(tokens: &mut Vec<String>, token: &str) {
-    if token.chars().count() < MIN_TOKEN_CHARS || tokens.len() >= MAX_TOKENS_PER_DOC {
+fn push_token(tokens: &mut Vec<String>, token: &str, limit: usize, min_chars: usize) {
+    if token.chars().count() < min_chars || tokens.len() >= limit {
         return;
     }
     if !tokens.iter().any(|existing| existing == token) {
@@ -220,6 +279,24 @@ impl TextIndex {
         tokens.iter().any(|token| self.saturated.contains(token))
     }
 
+    /// Whether candidate generation for this query follows either an exact
+    /// or unique-prefix posting list that saturated during insertion. This
+    /// must resolve prefixes exactly like [`Self::search`]; checking only the
+    /// literal query token would falsely call a capped extended posting
+    /// complete.
+    pub fn query_has_saturated_match(&self, query: &str) -> bool {
+        tokenize_query(query).iter().any(|token| {
+            if self.saturated.contains(token) {
+                return true;
+            }
+            if self.postings.contains_key(token) {
+                return false;
+            }
+            self.unique_prefix_key(token)
+                .is_some_and(|extended| self.saturated.contains(extended))
+        })
+    }
+
     /// Score every document matching the query tokens and return the
     /// candidates in deterministic order: coverage descending, rarity sum
     /// descending, doc handle ascending. An empty query matches nothing —
@@ -234,7 +311,7 @@ impl TextIndex {
     /// vocabulary size, not corpus size; callers indexing large corpora
     /// should keep queries token-shaped so the exact-hit path dominates.
     pub fn search(&self, query: &str) -> Vec<ScoredMatch> {
-        let query_tokens = tokenize(query);
+        let query_tokens = tokenize_query(query);
         if query_tokens.is_empty() {
             return Vec::new();
         }
@@ -311,16 +388,26 @@ impl TextIndex {
 
     /// The one dictionary token uniquely extended by `needle`, if any.
     fn unique_prefix_extension(&self, needle: &str) -> Option<(&str, &Vec<u32>)> {
+        let key = self.unique_prefix_key(needle)?;
+        self.postings
+            .get_key_value(key)
+            .map(|(key, rows)| (key.as_str(), rows))
+    }
+
+    /// Resolve a unique prefix over both current postings and sticky saturated
+    /// vocabulary. A saturated token remains evidence of rejected documents
+    /// even if removal later empties its accepted posting list.
+    fn unique_prefix_key(&self, needle: &str) -> Option<&str> {
         if needle.chars().count() < MIN_TOKEN_CHARS {
             return None;
         }
-        let mut found: Option<(&str, &Vec<u32>)> = None;
-        for (key, posting) in &self.postings {
+        let mut found: Option<&str> = None;
+        for key in self.postings.keys().chain(self.saturated.iter()) {
             if key.starts_with(needle) {
-                if found.is_some() {
+                if found.is_some_and(|existing| existing != key) {
                     return None;
                 }
-                found = Some((key.as_str(), posting));
+                found = Some(key.as_str());
             }
         }
         found
@@ -356,6 +443,43 @@ mod tests {
     fn tokenize_caps_per_document() {
         let body: String = (0..200).map(|i| format!("tok{i} ")).collect();
         assert_eq!(tokenize(&body).len(), MAX_TOKENS_PER_DOC);
+    }
+
+    #[test]
+    fn query_tokenization_keeps_every_token_within_the_public_char_bound() {
+        let query = (0..80)
+            .map(|i| format!("{i:02x}"))
+            .collect::<Vec<_>>()
+            .join(" ");
+        assert!(query.chars().count() <= 256);
+        assert_eq!(tokenize(&query).len(), MAX_TOKENS_PER_DOC);
+        assert_eq!(tokenize_query(&query).len(), 80);
+
+        let mut index = TextIndex::new();
+        index.insert(7, &["4f"]);
+        assert_eq!(
+            index
+                .search(&query)
+                .into_iter()
+                .map(|hit| hit.doc)
+                .collect::<Vec<_>>(),
+            vec![7],
+            "candidate generation must not discard the query's token after position 64"
+        );
+    }
+
+    #[test]
+    fn query_shape_marks_short_fragments_and_cjk_for_residual_verification() {
+        assert!(query_needs_text_residual("界"));
+        assert!(query_needs_text_residual("世界"));
+        assert!(query_needs_text_residual("a zebra"));
+        assert!(query_needs_text_residual("界 zebra"));
+        assert!(query_needs_text_residual("_"));
+        assert_eq!(tokenize_query_fragments("a zebra"), ["a", "zebra"]);
+        assert!(!query_needs_text_residual("кот"));
+        assert!(!query_needs_text_residual("café"));
+        assert!(!query_needs_text_residual("authservice"));
+        assert!(!query_needs_text_residual("auth service"));
     }
 
     #[test]
@@ -463,5 +587,23 @@ mod tests {
         );
         let hits = index.search("ubiquitous");
         assert_eq!(hits.len(), MAX_POSTINGS_PER_TOKEN);
+        assert!(index.query_has_saturated_match("ubiquitous"));
+        assert!(
+            index.query_has_saturated_match("ubiq"),
+            "the same unique-prefix resolution must carry saturation"
+        );
+
+        for doc in 0..MAX_POSTINGS_PER_TOKEN {
+            index.remove(doc as u32);
+        }
+        assert!(index.search("ubiquitous").is_empty());
+        assert!(
+            index.query_has_saturated_match("ubiquitous"),
+            "sticky saturation survives removal of every accepted posting"
+        );
+        assert!(
+            index.query_has_saturated_match("ubiq"),
+            "the saturated vocabulary also preserves prefix incompleteness"
+        );
     }
 }

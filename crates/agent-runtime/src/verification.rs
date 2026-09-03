@@ -8,7 +8,7 @@
 //! PASS is only trusted when the host attribution for the same recipe
 //! agrees on the exact verification identity.
 
-use agent_contracts::{AgentResult, RunId, TaskId};
+use agent_contracts::{AgentResult, RunId, TaskId, VerificationCoverageDeclaration};
 
 /// One bounded request to run the host-declared exact verifier for a
 /// recipe. The fence pre-state is included so the executor and Runtime
@@ -43,6 +43,17 @@ pub struct ProofVerifierOutcome {
 /// proof-refresh transaction. `None` in services disables the transaction.
 #[async_trait::async_trait]
 pub trait ProofVerifier: Send + Sync {
+    /// Resolve one deterministic exact recipe directly from the current
+    /// host-owned coverage declaration. The default is fail-closed: hosts
+    /// without an authoritative domain table cannot invent a route. Runtime
+    /// rechecks the returned id against dispatcher attribution before use.
+    fn exact_recipe_for_domain(
+        &self,
+        _declaration: &VerificationCoverageDeclaration,
+    ) -> Option<String> {
+        None
+    }
+
     async fn verify_exact(
         &self,
         request: ProofVerifierRequest,

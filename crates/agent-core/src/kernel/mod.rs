@@ -5,13 +5,12 @@ use std::sync::{
 
 use agent_contracts::{
     AgentError, AgentResult, ArgumentDigest, AuthorityLease, AuthorityRecoveryStatus,
-    CONTEXT_SEARCH_MAX_LIMIT, CONTEXT_SEARCH_MAX_QUERY_CHARS, CancellationToken,
-    ContextConsumptionAck, ContextEngine, ContextItemId, ContextResidency, ContextSearchQuery,
-    DiscoveryMiss, EffectDurability, EffectId, EffectReconciler, EffectReconciliation, EngineQuery,
-    OperationEffectContext, OperationId, OperationQueryResult, OperationSnapshot, OperationState,
-    OperationTerminal, OutputBroker, ResourceDescriptor, RunId, RuntimeEvent, TaskId, ToolCall,
-    ToolDispatcher, ToolExecutionRequest, ToolOperationIdentity, ToolOutcome, ToolOutput, ToolRisk,
-    ToolSurfaceSnapshot,
+    CancellationToken, ContextConsumptionAck, ContextEngine, ContextItemId, ContextResidency,
+    ContextSearchQuery, DiscoveryMiss, EffectAckDebt, EffectDurability, EffectId, EffectReconciler,
+    EffectReconciliation, EngineQuery, OperationEffectContext, OperationId, OperationQueryResult,
+    OperationSnapshot, OperationState, OperationTerminal, OutputBroker, ResourceDescriptor, RunId,
+    RuntimeEvent, TaskId, ToolCall, ToolDispatcher, ToolExecutionRequest, ToolOperationIdentity,
+    ToolOutcome, ToolOutput, ToolRisk, ToolSurfaceSnapshot,
 };
 
 use crate::authority::{
@@ -218,6 +217,18 @@ impl CoreAuthority {
 
     pub(crate) fn recovery_status(&self) -> AuthorityRecoveryStatus {
         self.operations.recovery_status()
+    }
+
+    /// Reconcile one persisted effect-ack debt against the broker's durable
+    /// reservation record, classified by the debt's effect identity. The
+    /// caller owns the fence: Applied/NotApplied resolutions retire the
+    /// debt, an Ambiguous resolution keeps it (and the fence) until an
+    /// operator resolves the disagreement.
+    pub(crate) fn reconcile_effect(
+        &self,
+        debt: &EffectAckDebt,
+    ) -> AgentResult<Option<EffectReconciliation>> {
+        self.broker.reconcile_effect_id(&debt.effect_id)
     }
 
     pub(crate) fn authority_checkpoint_marker(
@@ -585,13 +596,6 @@ impl CoreAuthority {
                 label,
                 limit,
             } => {
-                // 查询上限在执行期强制，而不只依赖 JSON schema：恶意或过期的
-                // limit 在到达引擎前就被钳制，模型永远无法要求无界命中集。
-                // 0 表示保持引擎默认值。
-                let limit = limit.min(CONTEXT_SEARCH_MAX_LIMIT);
-                // 自由文本查询同样有硬上限：超长查询在到达引擎前按字符截断，
-                // 避免模型用巨型查询字符串冲刷检索路径。
-                let query: String = query.chars().take(CONTEXT_SEARCH_MAX_QUERY_CHARS).collect();
                 // 空结果区分无过滤与带过滤，方便换条件；不在这里写工作集说明书。
                 let has_filter =
                     kind.is_some() || scope.is_some() || task_id.is_some() || label.is_some();
@@ -602,7 +606,8 @@ impl CoreAuthority {
                     task_id,
                     label,
                     limit,
-                };
+                }
+                .normalized();
                 match self.context.search_external(search).await {
                     Ok(hits) if hits.is_empty() => {
                         output.ok = true;

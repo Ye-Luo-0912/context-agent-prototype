@@ -48,7 +48,9 @@ pub use runtime::*;
 pub use runtime_facts::*;
 pub use schema_profile::*;
 pub use search::{
-    ScoredMatch, SearchCandidates, SearchIncompleteReason, TextIndex, TokenRarity, tokenize,
+    ScoredMatch, SearchCandidates, SearchIncompleteReason, TextIndex, TokenRarity,
+    query_fragment_uses_substring, query_needs_text_residual, tokenize, tokenize_query,
+    tokenize_query_fragments,
 };
 pub use tokens::*;
 pub use tool::*;

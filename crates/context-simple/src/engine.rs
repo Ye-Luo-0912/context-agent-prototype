@@ -557,6 +557,10 @@ impl State {
         self.catalog_dirty.mark(id);
     }
 
+    pub(crate) fn mark_catalog_rebuild(&mut self) {
+        self.catalog_dirty.mark_rebuild();
+    }
+
     fn expire_tool_hot(&mut self) {
         self.tool_hot
             .retain(|entry| entry.expires_at_turn > self.turn);
@@ -645,6 +649,13 @@ impl State {
     }
 }
 
+#[cfg(test)]
+#[derive(Clone)]
+pub(crate) struct MaterializeIoPause {
+    pub(crate) planned: Arc<tokio::sync::Notify>,
+    pub(crate) release: Arc<tokio::sync::Notify>,
+}
+
 pub struct SimpleContextEngine {
     pub(crate) config: SimpleContextConfig,
     pub(crate) state: Mutex<State>,
@@ -653,10 +664,16 @@ pub struct SimpleContextEngine {
     /// lock acquisitions (deliberately releasing the state lock across disk
     /// IO); the gate keeps them from interleaving, so a plan computed
     /// against one state can never be committed against a state another
-    /// operation replaced in between. Single-phase operations (ingest,
-    /// maintain, materialize, ...) are atomic under the state lock alone
-    /// and never take the gate — lock order is always gate, then state.
+    /// operation replaced in between. Materialization, incomplete Stored
+    /// search, external Admit and Fetch also take the gate because they
+    /// snapshot store ownership, read without the lock, then commit or return
+    /// that result. Ingest and maintenance share this mutation lane so they
+    /// cannot terminalize or move an owner inside another operation's unlocked
+    /// I/O window. Lock order is always gate, then state.
     pub(crate) op_gate: Mutex<()>,
+    /// Deterministic plan/I/O boundary used only by concurrency regressions.
+    #[cfg(test)]
+    pub(crate) materialize_io_pause: std::sync::Mutex<Option<MaterializeIoPause>>,
     /// 与 B 共用的有界压缩器。缺省为 None：任务摘要仍用 runtime 给的原文。
     /// 注入后，任务完成和 episode 旋转会蒸馏成带 `DerivedFrom` 的派生摘要，
     /// 原文条目保留。
@@ -675,6 +692,8 @@ impl SimpleContextEngine {
             config,
             state: Mutex::new(state),
             op_gate: Mutex::new(()),
+            #[cfg(test)]
+            materialize_io_pause: std::sync::Mutex::new(None),
             compactor: None,
         }
     }
@@ -738,6 +757,10 @@ impl SimpleContextEngine {
     /// is an explicit, off-hot-path operation; a crashed export never
     /// truncates the previous artifact (temp file + rename).
     pub async fn export_ledger(&self, path: &std::path::Path) -> AgentResult<usize> {
+        // Taking and later restoring rows is one mutation even though the
+        // artifact write runs without the state lock. Serialize it with
+        // restore and every other state-changing operation.
+        let _gate = self.op_gate.lock().await;
         let rows: Vec<agent_contracts::ContextLifecycleRecord> = {
             let mut state = self.state.lock().await;
             std::mem::take(&mut state.ledger)
@@ -797,6 +820,11 @@ fn stamp_consumed(
 #[async_trait::async_trait]
 impl ContextEngine for SimpleContextEngine {
     async fn ingest(&self, ingress: ContextIngress) -> AgentResult<()> {
+        // All lifecycle mutation enters the same lane as multi-phase reads.
+        // Most ingress is still one state-lock section; the gate matters when
+        // another operation temporarily releases that lock for store I/O, and
+        // it also covers the optional distill plan/await/commit span below.
+        let _gate = self.op_gate.lock().await;
         let mut distill: Option<DistillJob> = None;
         // The only lock boundary inside one ingest: a directive may read an
         // externalized blob with the state lock released. `(action, store id
@@ -1277,6 +1305,10 @@ impl ContextEngine for SimpleContextEngine {
         &self,
         trigger: ContextMaintenanceTrigger,
     ) -> AgentResult<ContextMaintenanceReport> {
+        // Maintenance may terminalize, archive, or move a body. Serialize it
+        // with plans whose store I/O runs outside the state lock so a stale
+        // body cannot be published after the lifecycle transition.
+        let _gate = self.op_gate.lock().await;
         let mut state = self.state.lock().await;
         // 维护债务门：无变化时 BeforeModel 是真正的空操作——不扫描、
         // 不消耗序列。生命周期关闭类触发始终执行，它们携带的语义超出
@@ -1375,6 +1407,11 @@ impl ContextEngine for SimpleContextEngine {
     }
 
     async fn materialize(&self, query: ContextQuery) -> AgentResult<MaterializedContext> {
+        // Foreground and required bodies are planned from the current
+        // catalog, read without the state lock, then committed as one
+        // preview. Serialize that span with GC and whole-state restore so
+        // neither operation can replace the stores underneath the plan.
+        let _gate = self.op_gate.lock().await;
         let mut state = self.state.lock().await;
         // A preview is a read: it must not advance the event-sequence clock,
         // so merely materializing never ages TTLs or recency scores.
@@ -1389,6 +1426,18 @@ impl ContextEngine for SimpleContextEngine {
         let foreground_plan = materializer::plan_foreground(&state, &query, &[]);
         let required_plan = materializer::plan_required(&state, &query);
         drop(state);
+        #[cfg(test)]
+        {
+            let pause = self
+                .materialize_io_pause
+                .lock()
+                .expect("materialize test pause mutex poisoned")
+                .clone();
+            if let Some(pause) = pause {
+                pause.planned.notify_one();
+                pause.release.notified().await;
+            }
+        }
         let dir = crate::store::store_dir(&self.config);
         let (foreground_result, required_result) = tokio::join!(
             materializer::realize_foreground(foreground_plan, &dir),
@@ -1470,6 +1519,7 @@ impl ContextEngine for SimpleContextEngine {
 
     async fn acknowledge_consumption(&self, ack: ContextConsumptionAck) -> AgentResult<()> {
         ack.validate()?;
+        let _gate = self.op_gate.lock().await;
         let mut state = self.state.lock().await;
         let pending = state.pending_materialization.as_ref().ok_or_else(|| {
             AgentError::InvalidRequest(
@@ -1589,12 +1639,14 @@ impl ContextEngine for SimpleContextEngine {
     }
 
     async fn open_scope(&self, kind: ScopeKind, parent: Option<ScopeId>) -> AgentResult<ScopeId> {
+        let _gate = self.op_gate.lock().await;
         let mut state = self.state.lock().await;
         state.event_seq += 1;
         Ok(scope::open_scope(&mut state, kind, parent))
     }
 
     async fn close_scope(&self, scope_id: ScopeId) -> AgentResult<Vec<ContextStateTransition>> {
+        let _gate = self.op_gate.lock().await;
         let mut state = self.state.lock().await;
         // Only a real close consumes sequence space: a repeated close is a
         // true no-op — `event_seq` counts state changes, not attempts.
@@ -1646,9 +1698,39 @@ impl ContextEngine for SimpleContextEngine {
         &self,
         query: agent_contracts::ContextSearchQuery,
     ) -> AgentResult<Vec<agent_contracts::ExternalizedContext>> {
+        // Enforce the semantic boundary here as well as in Core. Direct
+        // engine and sidecar callers must not bypass the same output/query
+        // bounds the model-facing path uses; zero keeps the engine default.
+        let query = query.normalized();
+        // Search stamps access state even when no body read is needed, so the
+        // whole operation shares the mutation lane. An incomplete catalog may
+        // additionally release the state lock for checked Stored-body reads.
+        let _gate = self.op_gate.lock().await;
+        let read_plan = {
+            let mut state = self.state.lock().await;
+            state.sync_catalog();
+            let incomplete = state
+                .catalog
+                .search_candidates(&query)
+                .and_then(|candidates| candidates.incomplete);
+            if incomplete.is_none() {
+                let hits = crate::store::search_catalog(&state, &query);
+                crate::access::reinforce_search_hits(&mut state, &hits, &query);
+                return Ok(hits);
+            }
+            let read_plan = crate::store::plan_stored_search_reads(&state, &query)?;
+            if read_plan.is_empty() {
+                let hits = crate::store::search_catalog(&state, &query);
+                crate::access::reinforce_search_hits(&mut state, &hits, &query);
+                return Ok(hits);
+            }
+            read_plan
+        };
+        let dir = crate::store::store_dir(&self.config);
+        let verified = crate::store::verify_stored_search_reads(&dir, read_plan, &query).await?;
         let mut state = self.state.lock().await;
         state.sync_catalog();
-        let hits = crate::store::search_catalog(&state, &query);
+        let hits = crate::store::search_catalog_with_verified_bodies(&state, &query, &verified);
         // search 命中是最弱信号：相同查询本回合只强化一次，单条目同一
         // event_seq 冷却，饱和后不再推迟 Cold 老化。terminal 命中已被
         // externally_retrievable 过滤；search 从不覆盖终态语义或 GC 根。
@@ -1660,6 +1742,9 @@ impl ContextEngine for SimpleContextEngine {
         &self,
         item_id: ContextItemId,
     ) -> AgentResult<Option<agent_contracts::ExternalizedContext>> {
+        // Inspect stamps access state and therefore shares the same mutation
+        // lane as GC/materialization even though it performs no store I/O.
+        let _gate = self.op_gate.lock().await;
         let mut state = self.state.lock().await;
         state.sync_catalog();
         // 目录级 inspect：Resident/Warm 投影 heap，Stored 用 map 描述符。
@@ -1672,6 +1757,10 @@ impl ContextEngine for SimpleContextEngine {
     }
 
     async fn fetch_external(&self, item_id: ContextItemId) -> AgentResult<Option<ContextItem>> {
+        // A stored fetch snapshots its owner/checksum, reads without the
+        // state lock, then stamps that same owner. Serialize the span with
+        // GC and restore so it cannot return bytes from a replaced owner.
+        let _gate = self.op_gate.lock().await;
         // Catalog bodies (Resident / Warm) are returned from heap/buffer.
         // Catalog residency is not the selected working set; this is a
         // stamped read, not a reactivation. Stored bodies still come from
@@ -1749,8 +1838,15 @@ impl ContextEngine for SimpleContextEngine {
         // Deserialize and structurally validate the replacement before it
         // becomes live: a corrupt or hostile checkpoint must not clobber the
         // running state. Only a valid snapshot is committed into the lock.
-        let next = checkpoint::deserialize(data)?;
+        let mut next = checkpoint::deserialize(data)?;
         checkpoint::validate(&next)?;
+        // The revision is a process-lifetime nonce, not rollbackable task
+        // state. Keeping the larger live value prevents restore from reusing
+        // a preview id and accepting a delayed pre-restore acknowledgement
+        // against a newly materialized frame (ABA).
+        next.materialization_revision = next
+            .materialization_revision
+            .max(state.materialization_revision);
         *state = next;
         state.sync_catalog();
         crate::reactivation::clear_segment(&mut state);
@@ -1763,7 +1859,9 @@ impl ContextEngine for SimpleContextEngine {
             .items_mut()
             .iter_mut()
             .enumerate()
-            .filter(|(_, item)| item.entities.is_empty())
+            .filter(|(_, item)| {
+                item.entities.is_empty() && !crate::item::is_raw_evidence_kind(item.kind)
+            })
             .map(|(index, item)| (index, entity::extract_entities(&item.content)))
             .collect();
         for (index, entities) in backfills {

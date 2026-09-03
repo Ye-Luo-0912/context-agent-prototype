@@ -16,7 +16,7 @@ use std::sync::Arc;
 
 use agent_contracts::{
     AgentError, AgentResult, CancellationToken, ContentDigest, RunId, ToolOutcome,
-    VerificationReuse,
+    VerificationCoverageDeclaration, VerificationReuse,
 };
 use agent_workspace::Workspace;
 use serde_json::json;
@@ -67,6 +67,33 @@ impl RecipeProofRunner {
         let recipe = self.recipes.get(recipe_id)?;
         let identity = recipe_exact_identity(&self.recipes, recipe, &self.workspace)?;
         Some(ContentDigest::sha256_bytes(identity.material.trim().as_bytes()).to_string())
+    }
+
+    /// Resolve the canonical exact member of a host coverage declaration.
+    /// Both revision and source digest must match the current table; a stale
+    /// or recomposed declaration therefore has no route. Domain members are
+    /// validated and sorted at construction, making the first member a
+    /// deterministic bounded choice rather than a model-history dependency.
+    pub fn exact_recipe_for_domain(
+        &self,
+        declaration: &VerificationCoverageDeclaration,
+    ) -> Option<String> {
+        let current = self.recipes.coverage_declaration(&declaration.domain_id)?;
+        if current != declaration {
+            return None;
+        }
+        let domain = self
+            .recipes
+            .domains()
+            .iter()
+            .find(|domain| domain.domain_id == declaration.domain_id)?;
+        domain.members.iter().find_map(|recipe_id| {
+            let recipe = self.recipes.get(recipe_id)?;
+            (recipe.reuse == VerificationReuse::ExactCurrentWorld
+                && recipe.coverage_domain.as_deref() == Some(declaration.domain_id.as_str())
+                && recipe_exact_identity(&self.recipes, recipe, &self.workspace).is_some())
+            .then(|| recipe.id.clone())
+        })
     }
 
     /// Execute one exact current-world recipe synchronously. Non-exact
@@ -198,6 +225,63 @@ mod tests {
         let recipes = Arc::new(VerificationRecipes::new(recipes).unwrap());
         let runner = RecipeProofRunner::new(workspace, recipes).unwrap();
         (runner, dir)
+    }
+
+    #[tokio::test]
+    async fn coverage_declaration_resolves_without_prior_model_history() {
+        let dir = tempfile::tempdir().unwrap();
+        let workspace = Workspace::open(dir.path()).await.unwrap();
+        let recipe = echo_recipe()
+            .with_coverage_domain("workspace-tests")
+            .unwrap();
+        let recipes = VerificationRecipes::new(vec![recipe])
+            .unwrap()
+            .with_domains(vec![crate::VerificationCoverageDomain {
+                domain_id: "workspace-tests".into(),
+                declaration_revision: 1,
+                members: vec!["echo.trusted".into()],
+            }])
+            .unwrap();
+        let declaration = recipes.coverage_declarations()[0].clone();
+        let runner = RecipeProofRunner::new(workspace, Arc::new(recipes)).unwrap();
+        assert_eq!(
+            runner.exact_recipe_for_domain(&declaration).as_deref(),
+            Some("echo.trusted")
+        );
+
+        let mut stale = declaration;
+        stale.declaration_revision += 1;
+        assert!(runner.exact_recipe_for_domain(&stale).is_none());
+    }
+
+    #[tokio::test]
+    async fn coverage_route_skips_a_member_without_a_current_exact_identity() {
+        let dir = tempfile::tempdir().unwrap();
+        let workspace = Workspace::open(dir.path()).await.unwrap();
+        let mut unavailable = echo_recipe()
+            .with_coverage_domain("workspace-tests")
+            .unwrap();
+        unavailable.id = "a.unavailable".into();
+        unavailable.exact_inputs = vec!["missing-input.rs".into()];
+        let mut available = echo_recipe()
+            .with_coverage_domain("workspace-tests")
+            .unwrap();
+        available.id = "b.available".into();
+        let recipes = VerificationRecipes::new(vec![unavailable, available])
+            .unwrap()
+            .with_domains(vec![crate::VerificationCoverageDomain {
+                domain_id: "workspace-tests".into(),
+                declaration_revision: 1,
+                members: vec!["a.unavailable".into(), "b.available".into()],
+            }])
+            .unwrap();
+        let declaration = recipes.coverage_declarations()[0].clone();
+        let runner = RecipeProofRunner::new(workspace, Arc::new(recipes)).unwrap();
+
+        assert_eq!(
+            runner.exact_recipe_for_domain(&declaration).as_deref(),
+            Some("b.available")
+        );
     }
 
     /// A PASS mints a bounded summary and the identity the dispatcher

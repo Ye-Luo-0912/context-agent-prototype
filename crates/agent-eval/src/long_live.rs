@@ -1474,8 +1474,8 @@ async fn compose_cell(
             .map_err(anyhow::Error::msg)?,
         )),
         effect_reservation_journal: None,
-        verification_recipes: None,
-        project_proof_refresh: false,
+        verification_recipes: Some(Arc::new((*verification_recipes).clone())),
+        project_proof_refresh: true,
     })
     .await?;
     composed.instance.start().await?;

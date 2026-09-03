@@ -121,6 +121,7 @@ impl RuntimeActor {
                     authority,
                     snapshot_sequence: self.state.snapshot_sequence,
                     capability_generation,
+                    unresolved_ack_debts: self.state.unresolved_ack_debts.clone(),
                     event_cover_seq: self.core.event_sequence(),
                     terminal_commit: terminal_override.is_some(),
                 });

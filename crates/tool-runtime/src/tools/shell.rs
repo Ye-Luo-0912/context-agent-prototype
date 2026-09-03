@@ -220,10 +220,6 @@ pub struct ShellExecTool {
 }
 
 impl ShellExecTool {
-    pub fn new(workspace: Workspace) -> Self {
-        Self::with_dialect(workspace, ShellDialect::detect())
-    }
-
     pub fn with_dialect(workspace: Workspace, dialect: ShellDialect) -> Self {
         Self { workspace, dialect }
     }
@@ -238,6 +234,23 @@ struct ShellArgs {
 
 fn default_timeout_ms() -> u64 {
     30_000
+}
+
+/// Canonical outcome identity for the raw shell escape hatch. Timeout is a
+/// Runtime scheduling control, not shell-program meaning; the fixed dialect
+/// and exact command text are the semantic inputs.
+pub(crate) fn outcome_equivalence_material(
+    arguments: &Value,
+    dialect: &ShellDialect,
+) -> Option<String> {
+    let args: ShellArgs = serde_json::from_value(arguments.clone()).ok()?;
+    agent_contracts::jcs_serialize(&json!({
+        "schema": "shell-outcome-equivalence/v1",
+        "dialect": dialect.kind.program(),
+        "dialect_version": dialect.version,
+        "command": args.command,
+    }))
+    .ok()
 }
 
 #[async_trait]
@@ -523,6 +536,35 @@ mod tests {
         {
             "for i in $(seq 1 1000); do echo line $i; done".to_string()
         }
+    }
+
+    #[test]
+    fn outcome_identity_uses_the_bound_dialect_and_ignores_timeout() {
+        let dialect = ShellDialect {
+            kind: ShellKind::Cmd,
+            version: "host-v1".into(),
+        };
+        let short = outcome_equivalence_material(
+            &json!({"command": "cargo test", "timeout_ms": 100}),
+            &dialect,
+        )
+        .unwrap();
+        let long = outcome_equivalence_material(
+            &json!({"command": "cargo test", "timeout_ms": 120_000}),
+            &dialect,
+        )
+        .unwrap();
+        assert_eq!(short, long);
+
+        let changed = ShellDialect {
+            kind: ShellKind::Cmd,
+            version: "host-v2".into(),
+        };
+        assert_ne!(
+            outcome_equivalence_material(&json!({"command": "cargo test"}), &changed).unwrap(),
+            short,
+            "the key must describe the dialect held by the executing tool"
+        );
     }
 
     #[tokio::test]

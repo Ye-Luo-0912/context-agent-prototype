@@ -28,7 +28,7 @@ impl ExecutionState {
     ) -> super::state::FrontierObservation {
         self.anchor_revision = anchor_revision;
         self.last_turn = turn;
-        let identity = operation_identity(output, "");
+        let identity = operation_identity(output, "", None);
         let delta = FrontierDelta::RedundantEvidence;
         self.update_convergence(&identity, None, delta);
         self.refresh_validity();
@@ -158,7 +158,7 @@ impl ExecutionState {
         if matches!(footprint, MutationFootprint::Unknown) {
             self.mark_facts_needs_revalidation();
         }
-        let identity = operation_identity(output, argument_digest);
+        let identity = operation_identity(output, argument_digest, attribution);
         // Unknown mutation 的 PASS-stale 标记以观察前的验证史为准
         // （本输出若自带验证结果，不得把自己标成待复核）。
         let had_prior_verification_evidence = self.last_evidence().is_some();

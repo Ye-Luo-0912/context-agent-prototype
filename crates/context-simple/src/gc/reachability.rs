@@ -345,6 +345,7 @@ fn apply_terminal_semantic(
         item.attention = AttentionState::Archived;
         item.relevance = 0.0;
         item.semantic = terminal;
+        state.mark_catalog(item_id);
         return Some(transition);
     }
     // Warm reversible buffer.
@@ -368,6 +369,7 @@ fn apply_terminal_semantic(
         item.attention = AttentionState::Archived;
         item.relevance = 0.0;
         item.semantic = terminal;
+        state.mark_catalog(item_id);
         return Some(transition);
     }
     // Stored (Cold / External): metadata only — the entry keeps its terminal
@@ -387,6 +389,7 @@ fn apply_terminal_semantic(
         };
         entry.attention = AttentionState::Archived;
         entry.semantic = terminal;
+        state.mark_catalog(item_id);
         return Some(transition);
     }
     None

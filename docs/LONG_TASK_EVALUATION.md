@@ -1020,7 +1020,7 @@ VerifiedReady =
   EvidenceReady
   AND AcceptanceReady
   AND open_loops is empty
-  AND next_action is empty
+  # next_action is advisory model guidance, not readiness authority
 
 CompletionDecision(ModelProposal) = CommitSafe AND VerifiedReady
 CompletionDecision(ExplicitOperator) = CommitSafe
@@ -1235,7 +1235,7 @@ TaskReady
   = ExecutionReady
     AND current user/task epoch still matches
     AND open_loops is empty
-    AND next_action is empty
+    # next_action is advisory and does not participate in the join
     AND every bounded acceptance criterion has current explicit evidence
 
 Working | VerificationDue | VerifiedCurrent | SettledCandidate

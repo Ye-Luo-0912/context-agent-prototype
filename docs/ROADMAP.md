@@ -53,7 +53,7 @@ evidence-triggered candidates after the simpler product has passed its gates.
 | M12 Effect Runtime | 🧾 closure-audit evidence banked; recovery P0 repaired, claims suspended | The clean-tree evidence table remains immutable. `EFFECT-ACK-CLASS-01` (typed settlements, journal v2, no-strengthening recovery) and `PROCESS-COORDINATOR-01` (bounded coordinator wire) are repaired in `6112ffd`/`43eb87b`. No new closure claim until the recorded 2026-09-03 doc tranche and the M15-facing exits land. Details: [`PLATFORM_SECURITY.md`](PLATFORM_SECURITY.md). |
 | M13 Extension Sandbox | 🧾 closure-audit evidence banked; attestation P0 repaired, claims suspended | The clean-tree audit remains immutable. `SANDBOX-ATTEST-TRUNCATE-01` is repaired in `e5e712f` (write-floor attestation only at enforcing ABIs). Universal native `UntrustedGenerated` availability is not V1 and WASI remains V2. No new closure claim until the recorded 2026-09-03 doc tranche and the M15-facing exits land. Details: [`PLATFORM_SECURITY.md`](PLATFORM_SECURITY.md). |
 | M14 Resource Policy | ✅ | Schema/context quotas, standing grants, output broker, authority leases. Further typed policy is not a reopen of this gate. |
-| M15 Real Evaluation | 🛑 open; eight v4 valid FAILs + one censored banked, latest rerun 6/12; returns to diagnosis | Windows remain immutable diagnostics. The eighth window (2026-09-03, successor source `1651354`, PinAI `gpt-5.6-luna` tuple) was CENSORED at 10/12 with 2 policy cells NOT_RUN on upstream HTTP 503, so the whole frozen window was rerun unchanged; the rerun is a valid FAIL 6/12 — migrate 4/4, diag 1/4 (overflow edge, stochastic), policy 1/4 (three 48-round completion-gate tails, `resume r2` closed in 39 rounds). Per M15_ACCEPTANCE §5 the successor candidate is rejected and the window is not rerun; a new candidate needs diagnosis, deterministic gates, a fresh preflight and a fresh predeclared window. Formal M15 remains 3 fixtures × normal/resume × 2 repeats, never settlement off/on. See [`M15_ACCEPTANCE.md`](M15_ACCEPTANCE.md). |
+| M15 Real Evaluation | 🛑 open; eight v4 valid FAILs + one censored banked, latest rerun 6/12; semantic-liveness focused matrix green | Windows remain immutable diagnostics. The eighth window (2026-09-03, successor source `1651354`, PinAI `gpt-5.6-luna` tuple) was CENSORED at 10/12 with 2 policy cells NOT_RUN on upstream HTTP 503, so the whole frozen window was rerun unchanged; `_windows/1788466134988` is a valid FAIL 6/12 — migrate 4/4, diag 1/4, policy 1/4 with three 48-round completion-gate tails. The rejected source is not rerun. The 2026-09-04 candidate targets semantic completion liveness; focused deterministic tests are green, but it has no formal status until full local/CI/preflight exits and a fresh predeclared window. Formal M15 remains 3 fixtures × normal/resume × 2 repeats, never settlement off/on. See [`M15_ACCEPTANCE.md`](M15_ACCEPTANCE.md). |
 | V2 Self-Iteration | 🔒 blocked | Until the governing M12/M13 status is reconciled and M15 closes. The agent may grow capabilities, never evaluation or permission Core authority. |
 
 Open gate order (post-repair, updated 2026-09-03): ~~M10 fault-gate re-audit
@@ -74,39 +74,38 @@ predeclared window~~ (ran 2026-09-03 on `38d458e`: valid FAIL 10/12,
 `_windows/1788402676712`) → ~~completion-gate convergence candidate selected
 2026-09-03, deterministic matrix + clean source + dual-platform CI green,
 exact-source preflight PASS on `2adad31`, at most one freshly predeclared
-window~~ (ran 2026-09-03 on `a6dc33e`: valid FAIL 10/12,
-`_windows/1788438275930`) → the route returns to diagnosis and a new
-candidate decision. The platform audit
+   window~~ (ran 2026-09-03 on `a6dc33e`: valid FAIL 10/12,
+   `_windows/1788438275930`) → ~~successor reliability candidate selected,
+   exact-source preflight PASS on `1651354`, censored 10/12 window retained,
+   authorized unchanged rerun~~ (valid FAIL 6/12,
+   `_windows/1788466134988`) → semantic completion-liveness candidate selected
+   and implemented in the 2026-09-04 working tree; its focused deterministic
+   matrix is green and the full gate/CI route remains open. The platform audit
 evidence stays banked, M14 is not reopened, and Context/GC/retrieval/packing
 remain frozen.
 
 ## Immediate M15 route
 
-1. Preserve the valid 6/12 FAIL at
-   `evidence/m15-window/_windows/1788385151733/`, the valid 10/12 FAIL at
-   `evidence/m15-window/_windows/1788402676712/` and the valid 10/12 FAIL at
-   `evidence/m15-window/_windows/1788438275930/` plus every earlier valid FAIL.
-   Do not rerun the repaired-source + PinAI/Luna candidate, the
-   attempt-incident admission candidate or the completion-gate convergence
-   candidate.
-2. Reconstruct a bounded diagnosis from the immutable cells. Keep the diag
-   overflow-edge failures, policy completion-gate tails and the one bounded-
-   framer malformed-event separate until typed evidence establishes a common
-   cause. The attempt-incident window (10/12) is now its own valid FAIL with
-   its own post-window diagnosis at
-   `evidence/m15-diagnosis-attempt-incident/REPORT.md`.
-3. Select one materially new candidate from that diagnosis. Do not retune
-   Context/GC/retrieval/packing, weaken resource/protocol bounds, add prompt
-   pressure or introduce a TaskGraph to repair this gate.
-4. Pass the candidate's deterministic regressions, applicable open P1 exits
-   (or exact selected-path exclusion), then record one clean source with the
-   complete local gate and Ubuntu/Windows CI.
-5. If—and only if—the candidate enables settlement projection, complete the
-   same-checkpoint `EVAL-CAUSAL-01` fork. A settlement-off candidate skips it.
-6. Freeze source, surface, acceptance identity and serving; pass one bounded
-   exact-source product preflight, then predeclare and run at most one 12-cell
-   v4 window. A valid FAIL rejects that candidate; only typed `NOT_RUN` permits
-   rerunning the whole frozen window.
+1. Preserve every valid FAIL, the censored successor window at
+   `_windows/1788463526600`, and its authorized valid-FAIL rerun at
+   `_windows/1788466134988`. Do not rerun a rejected source/serving candidate.
+2. Use the immutable cells and
+   `evidence/m15-diagnosis-successor-rerun/REPORT.md` as the diagnosis basis.
+   Keep the stochastic diag overflow edge separate from the recurrent policy
+   completion tail unless typed evidence proves a shared cause.
+3. The materially new candidate is selected: semantic completion liveness
+   (`COMPLETION-LIVENESS-01`). It must not retune Context/GC/retrieval/packing,
+   weaken completion/effect/recovery gates, add prompt pressure or introduce a
+   second planner/orchestrator.
+4. Pass its deterministic regressions, applicable open P1 exits (or exact
+   selected-path exclusion), then record one clean source with the complete
+   local gate and Ubuntu/Windows CI. Basic tests are not this exit.
+5. This candidate does not enable settlement projection, so it skips the
+   same-checkpoint `EVAL-CAUSAL-01` fork.
+6. Once a supported serving is available, freeze source, surface, acceptance
+   identity and serving; pass one bounded exact-source product preflight, then
+   predeclare and run at most one 12-cell v4 window. A valid FAIL rejects the
+   candidate; only typed `NOT_RUN` permits rerunning the whole frozen window.
 
 ### Workload disposition after the 6/12 FAIL
 
@@ -142,10 +141,11 @@ then credited with one aggregate result.
   fresh step-6 sequence.
 - `EVAL-PREFLIGHT-01` may improve the developer/evaluation gate independently,
   but it neither repairs a valid cell FAIL nor authorizes a formal window.
-- A Runtime candidate must reuse the sole `CompletionReadiness` and the existing
-  basis-fenced proof-refresh/terminal transactions. It may not add another
-  completion coordinator, infer debt resolution from prose, auto-clear blockers
-  or auto-complete.
+- A Runtime candidate must reuse the sole `CompletionReadiness`. Repair is a
+  durable semantic episode with typed postconditions and an ordered blocker
+  potential; prose or volatile revision churn is never progress. It may not add
+  another completion coordinator, infer debt resolution from prose/raw round
+  count, auto-clear blockers or auto-complete.
 - A buffered-stream change must preserve independent byte, chunk and wire
   bounds and fail closed. Raising or deriving away the 16,384-chunk bound is not
   accepted without deterministic evidence that normalization preserves the
@@ -413,8 +413,13 @@ numbers do not extend or reorder the six-step immediate M15 route above.
 
     The frozen retained-C `CompletionOpportunity` off/on normal/resume gate ran
     after deterministic exit and failed promotion. That mechanism has ended
-    default-off and must not be rerun or repackaged as Completion Convergence
-    V1. No Context/GC retune, fixed round-cap trick, provider-specific policy or
-    standing “stop earlier” instruction is allowed. Detailed contract:
-    [`LONG_TASK_EVALUATION.md`](LONG_TASK_EVALUATION.md).
+default-off and must not be rerun or repackaged as Completion Convergence
+V1. No Context/GC retune, fixed round-cap trick, provider-specific policy or
+standing “stop earlier” instruction is allowed. Detailed contract:
+[`LONG_TASK_EVALUATION.md`](LONG_TASK_EVALUATION.md).
+
+The current completion-liveness candidate does not contradict that rule. Its
+terminalization is driven by a durable semantic episode that observes no
+strictly better typed blocker potential; it stops further actions in the turn
+without claiming completion. It is not a global model-round cap.
 12. V2 Self-Iteration last.

@@ -1,7 +1,8 @@
 use agent_contracts::{
-    AccessSignal, ContextEngine, ContextHints, ContextIngress, ContextItemId, ContextKind,
-    ContextQuery, ContextResidency, ContextRetention, ContextScope, ContextSearchQuery, CoreLabel,
-    Label, SemanticState, TaskId, ToolOutput,
+    AccessSignal, AttentionState, CONTEXT_SEARCH_MAX_LIMIT, CONTEXT_SEARCH_MAX_QUERY_CHARS,
+    ContextEngine, ContextHints, ContextIngress, ContextItemId, ContextKind,
+    ContextMaintenanceTrigger, ContextQuery, ContextResidency, ContextRetention, ContextScope,
+    ContextSearchQuery, CoreLabel, Label, SemanticState, TaskId, ToolOutput,
 };
 
 use crate::engine::{SimpleContextConfig, SimpleContextEngine};
@@ -215,6 +216,64 @@ async fn catalog_search_surfaces_resident_hits_instead_of_empty() {
         "Resident fetch must return the heap body, not claim it is already in the working set"
     );
     assert_eq!(fetched.residency, ContextResidency::Resident);
+}
+
+#[tokio::test]
+async fn exact_context_uri_and_path_substrings_survive_unrelated_text_candidates() {
+    let engine = SimpleContextEngine::new(SimpleContextConfig::default());
+    let target_id = {
+        let mut state = engine.state.lock().await;
+        let mut target = crate::item::make_item(
+            &state,
+            &engine.config,
+            "unrelated target body".into(),
+            ContextKind::FileObservation,
+            ContextScope::Task,
+            ContextRetention::Working,
+            0.4,
+            None,
+        );
+        target.entities.clear();
+        target.file_path = Some("src/oauth_handler.rs".into());
+        target.file_revision = Some("rev-1".into());
+        let target_id = target.id;
+        state.items.push(target);
+
+        let mut distractor = crate::item::make_item(
+            &state,
+            &engine.config,
+            "context auth noise".into(),
+            ContextKind::Note,
+            ContextScope::Task,
+            ContextRetention::Working,
+            0.4,
+            None,
+        );
+        distractor.entities.clear();
+        state.items.push(distractor);
+        target_id
+    };
+
+    let uri = format!("context://run/{target_id}");
+    let uri_hits = engine
+        .search_external(ContextSearchQuery::new(uri, 8))
+        .await
+        .unwrap();
+    assert_eq!(
+        uri_hits.iter().map(|hit| hit.item_id).collect::<Vec<_>>(),
+        vec![target_id],
+        "the stable URI must be indexed even when another text candidate exists"
+    );
+
+    let path_hits = engine
+        .search_external(ContextSearchQuery::new("auth_hand", 8))
+        .await
+        .unwrap();
+    assert_eq!(
+        path_hits.iter().map(|hit| hit.item_id).collect::<Vec<_>>(),
+        vec![target_id],
+        "path substring lookup must not depend on a duplicate entity signature"
+    );
 }
 
 #[tokio::test]
@@ -852,6 +911,790 @@ async fn terminal_external_entries_are_hidden_from_every_retrieval_surface() {
             "fetch must refuse terminal ref {item_id:?}"
         );
     }
+}
+
+#[tokio::test]
+async fn external_terminal_transitions_refresh_catalog_live_and_attention_indexes() {
+    let dir = tempfile::tempdir().unwrap();
+    let engine = SimpleContextEngine::new(SimpleContextConfig {
+        context_store_dir: Some(dir.path().to_path_buf()),
+        ..SimpleContextConfig::default()
+    });
+    let (decision_id, error_id) = {
+        let mut state = engine.state.lock().await;
+        let mut ids = Vec::new();
+        for (kind, content) in [
+            (ContextKind::Decision, "TerminalCatalog.rs old decision"),
+            (ContextKind::Error, "TerminalError.rs fixed failure"),
+        ] {
+            let mut item = crate::item::make_item(
+                &state,
+                &engine.config,
+                content.into(),
+                kind,
+                ContextScope::Task,
+                ContextRetention::Working,
+                0.5,
+                None,
+            );
+            item.entities = crate::index::entity::extract_entities(&item.content);
+            let reference = crate::store::externalize(dir.path(), &item).unwrap();
+            state.external.push(crate::store::to_external_entry(
+                &item, reference, 1, 1, None,
+            ));
+            ids.push(item.id);
+        }
+        (ids[0], ids[1])
+    };
+
+    let query = ContextSearchQuery::new("Terminal", 8);
+    let before = engine.search_external(query.clone()).await.unwrap();
+    assert_eq!(before.len(), 2, "seed the live catalog before mutation");
+
+    {
+        let mut state = engine.state.lock().await;
+        state.pending_supersessions.push((
+            decision_id,
+            ContextItemId::new(),
+            "newer decision".into(),
+        ));
+        state.pending_verifications.push((
+            error_id,
+            ContextItemId::new(),
+            "successful verifier".into(),
+        ));
+    }
+    engine
+        .maintain(ContextMaintenanceTrigger::AfterModel)
+        .await
+        .unwrap();
+
+    let after = engine.search_external(query.clone()).await.unwrap();
+    assert!(after.is_empty(), "terminal entries must leave live search");
+    let mut state = engine.state.lock().await;
+    state.sync_catalog();
+    let candidates = state
+        .catalog
+        .search_candidates(&query)
+        .expect("indexed terminal text yields a bounded empty candidate set");
+    assert!(
+        candidates.ids.is_empty(),
+        "the catalog live set must not retain terminal ids"
+    );
+    for id in [decision_id, error_id] {
+        assert!(
+            state
+                .catalog
+                .ids_for_attention(AttentionState::Archived)
+                .contains(&id),
+            "terminal transition must move {id} into the archived bucket"
+        );
+    }
+}
+
+#[tokio::test]
+async fn stored_semantic_search_verifies_keywords_beyond_the_descriptor_summary() {
+    let dir = tempfile::tempdir().unwrap();
+    let engine = std::sync::Arc::new(SimpleContextEngine::new(SimpleContextConfig {
+        context_store_dir: Some(dir.path().to_path_buf()),
+        ..SimpleContextConfig::default()
+    }));
+    let item_id = {
+        let mut state = engine.state.lock().await;
+        let content = format!(
+            "{} deep_middle_decision_token {}",
+            "prefix ".repeat(100),
+            "suffix ".repeat(100)
+        );
+        let mut item = crate::item::make_item(
+            &state,
+            &engine.config,
+            content,
+            ContextKind::Decision,
+            ContextScope::Task,
+            ContextRetention::Durable,
+            0.8,
+            None,
+        );
+        item.entities.clear();
+        let reference = crate::store::externalize(dir.path(), &item).unwrap();
+        assert!(
+            !reference.summary.contains("deep_middle_decision_token"),
+            "the fixture must hide the needle beyond the stored descriptor"
+        );
+        state.external.push(crate::store::to_external_entry(
+            &item, reference, 1, 1, None,
+        ));
+        item.id
+    };
+
+    let gate = engine.op_gate.lock().await;
+    let search = {
+        let engine = std::sync::Arc::clone(&engine);
+        tokio::spawn(async move {
+            engine
+                .search_external(ContextSearchQuery::new("deep_middle_decision_token", 8))
+                .await
+        })
+    };
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    assert!(
+        !search.is_finished(),
+        "a Stored full-text read must wait for the operation gate"
+    );
+    drop(gate);
+    let hits = search.await.unwrap().unwrap();
+    assert_eq!(
+        hits.iter().map(|hit| hit.item_id).collect::<Vec<_>>(),
+        vec![item_id],
+        "an explicit search must checked-read an incomplete Stored semantic body"
+    );
+    let state = engine.state.lock().await;
+    assert!(state.external.get(item_id).is_some());
+    assert!(state.items.iter().all(|item| item.id != item_id));
+}
+
+#[tokio::test]
+async fn stored_semantic_search_rejects_a_checksum_mismatched_body() {
+    let dir = tempfile::tempdir().unwrap();
+    let engine = SimpleContextEngine::new(SimpleContextConfig {
+        context_store_dir: Some(dir.path().to_path_buf()),
+        ..SimpleContextConfig::default()
+    });
+    {
+        let mut state = engine.state.lock().await;
+        let mut item = crate::item::make_item(
+            &state,
+            &engine.config,
+            format!("{} checksum_search_token", "prefix ".repeat(100)),
+            ContextKind::Decision,
+            ContextScope::Task,
+            ContextRetention::Durable,
+            0.8,
+            None,
+        );
+        item.entities.clear();
+        let reference = crate::store::externalize(dir.path(), &item).unwrap();
+        state.external.push(crate::store::to_external_entry(
+            &item,
+            reference,
+            1,
+            1,
+            Some("not-the-blob-checksum".into()),
+        ));
+    }
+
+    let error = engine
+        .search_external(ContextSearchQuery::new("checksum_search_token", 8))
+        .await
+        .expect_err("an unowned/tampered body must never satisfy search");
+    assert!(
+        error.to_string().contains("corrupt"),
+        "checksum failure must remain typed in the search error: {error}"
+    );
+}
+
+#[tokio::test]
+async fn stored_search_rejects_an_oversized_replaced_blob_before_decoding() {
+    let dir = tempfile::tempdir().unwrap();
+    let engine = SimpleContextEngine::new(SimpleContextConfig {
+        context_store_dir: Some(dir.path().to_path_buf()),
+        ..SimpleContextConfig::default()
+    });
+    let item_id = {
+        let mut state = engine.state.lock().await;
+        let mut item = crate::item::make_item(
+            &state,
+            &engine.config,
+            "bounded stored descriptor".into(),
+            ContextKind::Decision,
+            ContextScope::Task,
+            ContextRetention::Durable,
+            0.8,
+            None,
+        );
+        item.entities.clear();
+        let reference = crate::store::make_context_ref(&item);
+        state.external.push(crate::store::to_external_entry(
+            &item, reference, 1, 1, None,
+        ));
+        item.id
+    };
+    std::fs::write(
+        dir.path().join(format!("{item_id}.json")),
+        vec![b'x'; crate::store::MAX_CONTEXT_STORE_BLOB_BYTES + 1],
+    )
+    .unwrap();
+
+    let error = engine
+        .search_external(ContextSearchQuery::new("absent_deep_token", 8))
+        .await
+        .expect_err("an oversized substituted body must fail before decode");
+    assert!(
+        error.to_string().contains("corrupt"),
+        "the byte ceiling must surface as an integrity failure: {error}"
+    );
+}
+
+#[tokio::test]
+async fn stored_semantic_search_reports_a_missing_planned_body() {
+    let dir = tempfile::tempdir().unwrap();
+    let engine = SimpleContextEngine::new(SimpleContextConfig {
+        context_store_dir: Some(dir.path().to_path_buf()),
+        ..SimpleContextConfig::default()
+    });
+    {
+        let mut state = engine.state.lock().await;
+        let mut item = crate::item::make_item(
+            &state,
+            &engine.config,
+            format!("{} missing_search_token", "prefix ".repeat(100)),
+            ContextKind::Decision,
+            ContextScope::Task,
+            ContextRetention::Durable,
+            0.8,
+            None,
+        );
+        item.entities.clear();
+        let reference = crate::store::make_context_ref(&item);
+        state.external.push(crate::store::to_external_entry(
+            &item, reference, 1, 1, None,
+        ));
+    }
+
+    let error = engine
+        .search_external(ContextSearchQuery::new("missing_search_token", 8))
+        .await
+        .expect_err("an unreadable planned body cannot become a complete miss");
+    assert!(
+        error.to_string().contains("missing"),
+        "the search error must preserve the missing-body class: {error}"
+    );
+}
+
+#[tokio::test]
+async fn stored_search_rejects_a_semantic_descriptor_with_a_raw_body() {
+    let dir = tempfile::tempdir().unwrap();
+    let engine = SimpleContextEngine::new(SimpleContextConfig {
+        context_store_dir: Some(dir.path().to_path_buf()),
+        ..SimpleContextConfig::default()
+    });
+    let item_id = {
+        let mut state = engine.state.lock().await;
+        let mut owner = crate::item::make_item(
+            &state,
+            &engine.config,
+            "semantic descriptor filler ".repeat(40),
+            ContextKind::Decision,
+            ContextScope::Task,
+            ContextRetention::Durable,
+            0.8,
+            None,
+        );
+        owner.entities.clear();
+        let reference = crate::store::externalize(dir.path(), &owner).unwrap();
+        state.external.push(crate::store::to_external_entry(
+            &owner, reference, 1, 1, None,
+        ));
+
+        let mut substituted = owner.clone();
+        substituted.kind = ContextKind::ToolObservation;
+        substituted.content = "raw_kind_bypass_token".into();
+        substituted.file_path = Some("src/substituted.rs".into());
+        substituted.file_revision = Some("rev-1".into());
+        std::fs::write(
+            dir.path().join(format!("{}.json", owner.id)),
+            serde_json::to_vec(&substituted).unwrap(),
+        )
+        .unwrap();
+        owner.id
+    };
+
+    let error = engine
+        .search_external(ContextSearchQuery::new("raw_kind_bypass_token", 8))
+        .await
+        .expect_err("descriptor/body kind drift must fail closed");
+    let message = error.to_string();
+    assert!(
+        message.contains("corrupt") && message.contains("kind"),
+        "the mismatch must remain explicit for {item_id}: {message}"
+    );
+}
+
+#[tokio::test]
+async fn unindexed_short_and_cjk_queries_check_resident_and_stored_semantic_bodies() {
+    let dir = tempfile::tempdir().unwrap();
+    let engine = SimpleContextEngine::new(SimpleContextConfig {
+        context_store_dir: Some(dir.path().to_path_buf()),
+        ..SimpleContextConfig::default()
+    });
+    let (resident_id, stored_id) = {
+        let mut state = engine.state.lock().await;
+        let mut resident = crate::item::make_item(
+            &state,
+            &engine.config,
+            format!("{}你好世界", "resident prefix ".repeat(12)),
+            ContextKind::Note,
+            ContextScope::Task,
+            ContextRetention::Working,
+            0.4,
+            None,
+        );
+        resident.entities.clear();
+        let resident_id = resident.id;
+        state.items.push(resident);
+
+        let mut stored = crate::item::make_item(
+            &state,
+            &engine.config,
+            format!("{}你好世界", "stored prefix ".repeat(12)),
+            ContextKind::Decision,
+            ContextScope::Task,
+            ContextRetention::Durable,
+            0.8,
+            None,
+        );
+        stored.entities.clear();
+        let stored_id = stored.id;
+        let reference = crate::store::externalize(dir.path(), &stored).unwrap();
+        assert!(!reference.summary.contains('界'));
+        state.external.push(crate::store::to_external_entry(
+            &stored, reference, 1, 1, None,
+        ));
+        (resident_id, stored_id)
+    };
+
+    for query in ["界", "世界"] {
+        let hits = engine
+            .search_external(ContextSearchQuery::new(query, 8))
+            .await
+            .unwrap();
+        let ids: std::collections::HashSet<_> = hits.iter().map(|hit| hit.item_id).collect();
+        assert_eq!(
+            ids,
+            [resident_id, stored_id].into_iter().collect(),
+            "query {query:?} must not change meaning when a body moves to Stored"
+        );
+    }
+}
+
+#[tokio::test]
+async fn ascii_infix_body_query_has_the_same_token_semantics_in_every_residency() {
+    let dir = tempfile::tempdir().unwrap();
+    let engine = SimpleContextEngine::new(SimpleContextConfig {
+        context_store_dir: Some(dir.path().to_path_buf()),
+        ..SimpleContextConfig::default()
+    });
+    {
+        let mut state = engine.state.lock().await;
+        let mut resident = crate::item::make_item(
+            &state,
+            &engine.config,
+            format!("{}AuthService", "resident prefix ".repeat(12)),
+            ContextKind::Note,
+            ContextScope::Task,
+            ContextRetention::Working,
+            0.4,
+            None,
+        );
+        resident.entities.clear();
+        state.items.push(resident);
+
+        let mut stored = crate::item::make_item(
+            &state,
+            &engine.config,
+            format!("{}AuthService", "stored prefix ".repeat(12)),
+            ContextKind::Decision,
+            ContextScope::Task,
+            ContextRetention::Durable,
+            0.8,
+            None,
+        );
+        stored.entities.clear();
+        let reference = crate::store::externalize(dir.path(), &stored).unwrap();
+        assert!(!reference.summary.to_lowercase().contains("ervice"));
+        state.external.push(crate::store::to_external_entry(
+            &stored, reference, 1, 1, None,
+        ));
+    }
+
+    let hits = engine
+        .search_external(ContextSearchQuery::new("ervice", 8))
+        .await
+        .unwrap();
+    assert!(
+        hits.is_empty(),
+        "semantic bodies use exact-token matching, not arbitrary ASCII token infixes"
+    );
+}
+
+#[tokio::test]
+async fn ambiguous_ascii_prefix_is_not_a_body_match_in_any_residency() {
+    let dir = tempfile::tempdir().unwrap();
+    let engine = SimpleContextEngine::new(SimpleContextConfig {
+        context_store_dir: Some(dir.path().to_path_buf()),
+        ..SimpleContextConfig::default()
+    });
+    {
+        let mut state = engine.state.lock().await;
+        let mut resident = crate::item::make_item(
+            &state,
+            &engine.config,
+            format!("{} authentication", "semantic prefix ".repeat(12)),
+            ContextKind::Note,
+            ContextScope::Task,
+            ContextRetention::Working,
+            0.4,
+            None,
+        );
+        resident.entities.clear();
+        state.items.push(resident);
+
+        let mut stored = crate::item::make_item(
+            &state,
+            &engine.config,
+            format!("{} author", "stored prefix ".repeat(12)),
+            ContextKind::Decision,
+            ContextScope::Task,
+            ContextRetention::Durable,
+            0.8,
+            None,
+        );
+        stored.entities.clear();
+        let reference = crate::store::externalize(dir.path(), &stored).unwrap();
+        state.external.push(crate::store::to_external_entry(
+            &stored, reference, 1, 1, None,
+        ));
+    }
+
+    let hits = engine
+        .search_external(ContextSearchQuery::new("auth", 8))
+        .await
+        .unwrap();
+    assert!(
+        hits.is_empty(),
+        "ambiguous prefixes are descriptor candidates, not exact semantic-body tokens"
+    );
+}
+
+#[tokio::test]
+async fn query_tokens_after_the_document_budget_are_required_at_verification() {
+    let engine = SimpleContextEngine::new(SimpleContextConfig::default());
+    let tokens = (0..65).map(|i| format!("{i:02x}")).collect::<Vec<_>>();
+    let query = tokens.join(" ");
+    assert!(query.chars().count() <= CONTEXT_SEARCH_MAX_QUERY_CHARS);
+    let expected_id = {
+        let mut state = engine.state.lock().await;
+        for body in [tokens[..64].join(" "), query.clone()] {
+            let mut item = crate::item::make_item(
+                &state,
+                &engine.config,
+                body,
+                ContextKind::Note,
+                ContextScope::Task,
+                ContextRetention::Working,
+                0.4,
+                None,
+            );
+            item.entities.clear();
+            state.items.push(item);
+        }
+        state.items[1].id
+    };
+
+    let hits = engine
+        .search_external(ContextSearchQuery::new(query, 8))
+        .await
+        .unwrap();
+    assert_eq!(
+        hits.iter().map(|hit| hit.item_id).collect::<Vec<_>>(),
+        vec![expected_id],
+        "a body missing query token 65 must not pass the final AND check"
+    );
+}
+
+#[tokio::test]
+async fn mixed_short_and_cjk_query_fragments_are_not_silently_dropped() {
+    let engine = SimpleContextEngine::new(SimpleContextConfig::default());
+    let (ascii_target, cjk_target, cyrillic_target) = {
+        let mut state = engine.state.lock().await;
+        let mut ids = Vec::new();
+        for content in ["a zebra", "界 zebra", "zebra", "кот", "скот"] {
+            let mut item = crate::item::make_item(
+                &state,
+                &engine.config,
+                content.into(),
+                ContextKind::Note,
+                ContextScope::Task,
+                ContextRetention::Working,
+                0.4,
+                None,
+            );
+            item.entities.clear();
+            ids.push(item.id);
+            state.items.push(item);
+        }
+        (ids[0], ids[1], ids[3])
+    };
+
+    let ascii = engine
+        .search_external(ContextSearchQuery::new("a zebra", 8))
+        .await
+        .unwrap();
+    assert_eq!(
+        ascii.iter().map(|hit| hit.item_id).collect::<Vec<_>>(),
+        vec![ascii_target],
+        "the one-character ASCII token must remain part of final verification"
+    );
+
+    let cjk = engine
+        .search_external(ContextSearchQuery::new("界 zebra", 8))
+        .await
+        .unwrap();
+    assert_eq!(
+        cjk.iter().map(|hit| hit.item_id).collect::<Vec<_>>(),
+        vec![cjk_target],
+        "the CJK fragment and the ASCII token must both be present"
+    );
+
+    let cyrillic = engine
+        .search_external(ContextSearchQuery::new("кот", 8))
+        .await
+        .unwrap();
+    assert_eq!(
+        cyrillic.iter().map(|hit| hit.item_id).collect::<Vec<_>>(),
+        vec![cyrillic_target],
+        "Unicode alphabets with stable token boundaries remain exact"
+    );
+}
+
+#[tokio::test]
+async fn stored_raw_evidence_body_is_fetch_only_even_during_full_text_residuals() {
+    let dir = tempfile::tempdir().unwrap();
+    let engine = SimpleContextEngine::new(SimpleContextConfig {
+        context_store_dir: Some(dir.path().to_path_buf()),
+        ..SimpleContextConfig::default()
+    });
+    let raw_id = {
+        let mut state = engine.state.lock().await;
+        let mut raw = crate::item::make_item(
+            &state,
+            &engine.config,
+            format!("{} fetch_only_raw_secret", "raw ".repeat(150)),
+            ContextKind::ToolObservation,
+            ContextScope::Turn,
+            ContextRetention::Working,
+            0.4,
+            Some("tool:fs.read".into()),
+        );
+        raw.entities.clear();
+        raw.file_path = Some("src/raw-evidence.rs".into());
+        raw.file_revision = Some("rev-1".into());
+        let raw_ref = crate::store::externalize(dir.path(), &raw).unwrap();
+        state
+            .external
+            .push(crate::store::to_external_entry(&raw, raw_ref, 1, 1, None));
+
+        // A semantic Stored body makes this query explicitly incomplete and
+        // forces the residual IO path. It does not contain the raw secret.
+        let mut semantic = crate::item::make_item(
+            &state,
+            &engine.config,
+            "semantic filler ".repeat(100),
+            ContextKind::Note,
+            ContextScope::Task,
+            ContextRetention::Working,
+            0.4,
+            None,
+        );
+        semantic.entities.clear();
+        let semantic_ref = crate::store::externalize(dir.path(), &semantic).unwrap();
+        state.external.push(crate::store::to_external_entry(
+            &semantic,
+            semantic_ref,
+            2,
+            1,
+            None,
+        ));
+        raw.id
+    };
+    // If search ever reads the raw evidence blob, its corruption becomes a
+    // hard error. The successful empty result therefore proves the raw body
+    // was excluded from the residual read plan as well as final matching.
+    std::fs::write(dir.path().join(format!("{raw_id}.json")), b"corrupt").unwrap();
+
+    let hidden = engine
+        .search_external(ContextSearchQuery::new("fetch_only_raw_secret", 8))
+        .await
+        .unwrap();
+    assert!(
+        hidden.is_empty(),
+        "raw tool body must not be a search needle"
+    );
+
+    let identity = engine
+        .search_external(ContextSearchQuery::new("src/raw-evidence.rs@rev-1", 8))
+        .await
+        .unwrap();
+    assert_eq!(
+        identity.iter().map(|hit| hit.item_id).collect::<Vec<_>>(),
+        vec![raw_id],
+        "path@revision identity remains searchable without reading the raw blob"
+    );
+}
+
+#[tokio::test]
+async fn pinned_raw_body_entities_stay_unsearchable_after_checkpoint_restore() {
+    let engine = SimpleContextEngine::new(SimpleContextConfig::default());
+    engine
+        .ingest(ContextIngress::Pin {
+            content: "fetch_only_secret.rs SecretBodyToken".into(),
+            kind: ContextKind::ToolObservation,
+        })
+        .await
+        .unwrap();
+    let raw_id = {
+        let state = engine.state.lock().await;
+        let raw = state
+            .items
+            .iter()
+            .find(|item| item.kind == ContextKind::ToolObservation)
+            .expect("the explicit raw pin exists");
+        assert!(
+            raw.entities.is_empty(),
+            "raw construction must not derive search entities from its body"
+        );
+        raw.id
+    };
+
+    let checkpoint = engine.checkpoint().await.unwrap();
+    engine.restore(checkpoint).await.unwrap();
+    {
+        let state = engine.state.lock().await;
+        let raw = state.items.iter().find(|item| item.id == raw_id).unwrap();
+        assert!(
+            raw.entities.is_empty(),
+            "legacy entity backfill must not reinterpret a raw body as descriptor metadata"
+        );
+    }
+    // Simulate an older checkpoint that already persisted body-derived raw
+    // entities. Catalog construction and final projection must sanitize those
+    // too; merely skipping the empty-entity backfill is not enough.
+    {
+        let mut state = engine.state.lock().await;
+        let index = state.items.indexes().get(raw_id).unwrap();
+        state.items.update_entities(
+            index,
+            vec!["fetch_only_secret.rs".into(), "SecretBodyToken".into()],
+        );
+    }
+    let legacy_checkpoint = engine.checkpoint().await.unwrap();
+    engine.restore(legacy_checkpoint).await.unwrap();
+    for query in ["fetch_only_secret.rs", "SecretBodyToken"] {
+        let hits = engine
+            .search_external(ContextSearchQuery::new(query, 8))
+            .await
+            .unwrap();
+        assert!(
+            hits.iter().all(|hit| hit.item_id != raw_id),
+            "raw body-derived entity {query:?} must stay Fetch-only"
+        );
+    }
+}
+
+#[tokio::test]
+async fn direct_engine_search_enforces_query_and_result_bounds() {
+    let engine = SimpleContextEngine::new(SimpleContextConfig::default());
+    let long_query_target = {
+        let mut state = engine.state.lock().await;
+        for index in 0..(CONTEXT_SEARCH_MAX_LIMIT + 10) {
+            let mut item = crate::item::make_item(
+                &state,
+                &engine.config,
+                format!("bounded_result_token row {index}"),
+                ContextKind::Note,
+                ContextScope::Task,
+                ContextRetention::Working,
+                0.4,
+                None,
+            );
+            item.entities.clear();
+            state.items.push(item);
+        }
+        let mut target = crate::item::make_item(
+            &state,
+            &engine.config,
+            "q".repeat(CONTEXT_SEARCH_MAX_QUERY_CHARS),
+            ContextKind::Note,
+            ContextScope::Task,
+            ContextRetention::Working,
+            0.4,
+            None,
+        );
+        target.entities.clear();
+        let id = target.id;
+        state.items.push(target);
+        id
+    };
+
+    let bounded = engine
+        .search_external(ContextSearchQuery::new("bounded_result_token", usize::MAX))
+        .await
+        .unwrap();
+    assert_eq!(
+        bounded.len(),
+        CONTEXT_SEARCH_MAX_LIMIT,
+        "direct engine callers cannot request an unbounded result set"
+    );
+
+    let truncated = engine
+        .search_external(ContextSearchQuery::new(
+            "q".repeat(CONTEXT_SEARCH_MAX_QUERY_CHARS + 40),
+            1,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(
+        truncated.iter().map(|hit| hit.item_id).collect::<Vec<_>>(),
+        vec![long_query_target],
+        "direct engine queries use the same character cap as the Core path"
+    );
+}
+
+#[tokio::test]
+async fn stored_full_text_search_refuses_an_unbounded_body_scan() {
+    let engine = SimpleContextEngine::new(SimpleContextConfig::default());
+    {
+        let mut state = engine.state.lock().await;
+        for index in 0..=crate::store::MAX_STORED_SEARCH_READS {
+            let mut item = crate::item::make_item(
+                &state,
+                &engine.config,
+                format!("stored semantic filler {index}"),
+                ContextKind::Note,
+                ContextScope::Task,
+                ContextRetention::Working,
+                0.4,
+                None,
+            );
+            item.entities.clear();
+            let reference = crate::store::make_context_ref(&item);
+            state.external.push(crate::store::to_external_entry(
+                &item, reference, 1, 1, None,
+            ));
+        }
+    }
+
+    let error = engine
+        .search_external(ContextSearchQuery::new("absent_deep_needle", 8))
+        .await
+        .expect_err("a broad disk scan must fail explicitly at its work bound");
+    assert!(
+        error
+            .to_string()
+            .contains(&crate::store::MAX_STORED_SEARCH_READS.to_string()),
+        "the refinable error must name the Stored read cap: {error}"
+    );
 }
 
 #[tokio::test]

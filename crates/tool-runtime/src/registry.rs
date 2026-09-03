@@ -31,6 +31,7 @@ use crate::tools::{
     EditReplaceTool, FsListTool, FsMkdirTool, FsReadTool, FsWriteTool, GitDiffTool, GitStatusTool,
     ProcessRunTool, ProcessSessionTool, SearchGrepTool, SessionRegistry, SessionSlot,
     ShellExecTool, TaskCompleteTool, TaskManageTool, Tool, VerificationRunTool,
+    process_outcome_equivalence_material, shell_outcome_equivalence_material,
 };
 use crate::{VERIFY_RUN_TOOL_NAME, VerificationDiscoveryError, VerificationRecipes};
 
@@ -137,6 +138,9 @@ pub struct BuiltinToolDispatcher {
     /// Immutable host recipe table. The matching host-effect policy is
     /// derived from this same value by the composition root.
     verification_recipes: Arc<VerificationRecipes>,
+    /// The exact dialect held by the `shell.exec` instance. Attribution must
+    /// never redetect a different shell after construction.
+    shell_dialect: crate::tools::ShellDialect,
 }
 
 impl Drop for BuiltinToolDispatcher {
@@ -190,6 +194,7 @@ impl BuiltinToolDispatcher {
         // `process.session` tool instance and kept by the dispatcher for
         // module-shutdown draining.
         let sessions = SessionRegistry::default();
+        let shell_dialect = crate::tools::ShellDialect::detect();
         let mut tools: Vec<Arc<dyn Tool>> = vec![
             Arc::new(FsListTool::new(workspace.clone())),
             Arc::new(FsReadTool::new(workspace.clone())),
@@ -201,7 +206,10 @@ impl BuiltinToolDispatcher {
             Arc::new(EditPatchTool::new(workspace.clone())),
             Arc::new(GitStatusTool::new(workspace.clone())),
             Arc::new(GitDiffTool::new(workspace.clone())),
-            Arc::new(ShellExecTool::new(workspace.clone())),
+            Arc::new(ShellExecTool::with_dialect(
+                workspace.clone(),
+                shell_dialect.clone(),
+            )),
             Arc::new(ProcessRunTool::new(workspace.clone())),
             Arc::new(ProcessSessionTool::new(workspace.clone(), sessions.clone())),
             // Local symbol/diagnostic navigation: catalog-optional
@@ -254,6 +262,7 @@ impl BuiltinToolDispatcher {
             tick: AtomicU64::new(0),
             generation: AtomicU64::new(0),
             verification_recipes,
+            shell_dialect,
         }
     }
 
@@ -858,7 +867,19 @@ impl BuiltinToolDispatcher {
                     .map(str::to_owned)
             }));
         }
-        ToolExecutionAttribution::bounded(purpose, targets, VerificationReuse::None)
+        let attribution =
+            ToolExecutionAttribution::bounded(purpose, targets, VerificationReuse::None);
+        let material = match call.name.as_str() {
+            "process.run" => process_outcome_equivalence_material(&call.arguments),
+            "shell.exec" => {
+                shell_outcome_equivalence_material(&call.arguments, &self.shell_dialect)
+            }
+            _ => None,
+        };
+        match material {
+            Some(material) => attribution.with_outcome_equivalence_material(&material),
+            None => attribution,
+        }
     }
 }
 
@@ -1524,6 +1545,10 @@ mod tests {
         });
         assert_eq!(opaque.purpose, ToolExecutionPurpose::Opaque);
         assert_eq!(opaque.verification_reuse, VerificationReuse::None);
+        assert!(
+            opaque.outcome_equivalence_key().is_some(),
+            "the trusted builtin host must stamp effective process identity before dispatch"
+        );
     }
 
     #[tokio::test]

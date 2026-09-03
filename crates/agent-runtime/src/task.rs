@@ -285,7 +285,9 @@ pub struct TaskAnchor {
     pub open_loops: Vec<String>,
     /// The single replaceable next-action guidance proposed through
     /// `task.manage`. Replaceable guidance, not a planner: the model still
-    /// decides every call and may revise it after new evidence.
+    /// decides every call and may revise it after new evidence. It is not a
+    /// completion blocker; open loops and typed readiness facts carry real
+    /// remaining-work state.
     #[serde(default)]
     pub next_action: String,
     /// Typed root claims that must stay resident (or recallable) while this
@@ -686,14 +688,16 @@ pub(crate) const COMPLETION_REPAIR_VIEW_CHARS: usize = 768;
 
 /// Cap on consecutive refusals recorded against one repair basis.
 pub(crate) const MAX_COMPLETION_REPAIR_REFUSALS: u32 = 64;
+/// Bounded completion proposals plus repair actions retained by one semantic
+/// episode. This is a storage/saturation cap, not a model-round policy.
+pub(crate) const MAX_COMPLETION_REPAIR_STEPS: u32 = 64;
 
-/// Consecutive refusals against one basis after which an operator-only /
-/// no-resolver repair stage turns terminal: durable closure is not offered
-/// to the model surface and the correct end is an ordinary final answer.
-/// This is a mechanism boundary, not a prompt pressure: it only states the
-/// already-derived closure capability instead of letting the model infer it
-/// from repeated identical refusals.
+/// Consecutive refusals with one semantic blocker shape after which repair
+/// enters finalization. Revision churn cannot reset this bound.
 pub(crate) const COMPLETION_REPAIR_TERMINAL_REFUSALS: u32 = 3;
+/// Episode-wide refusals without a new best completion potential. This catches
+/// A -> B -> A cycles whose individual blocker fingerprints keep changing.
+pub(crate) const COMPLETION_REPAIR_NO_PROGRESS_STEPS: u32 = 6;
 
 impl CompletionReadiness {
     pub fn allows_completion(&self) -> bool {
@@ -717,6 +721,45 @@ impl CompletionReadiness {
                 self.intent == CompletionIntent::ModelProposal || blocker.blocks_commit()
             })
             .collect()
+    }
+
+    /// Typed, revision-independent liveness measure for completion repair.
+    /// Lower is better in dependency order: operator/safety, task progress,
+    /// execution debt, then proof (which mutations may legitimately stale).
+    pub(crate) fn repair_potential(&self) -> crate::execution::CompletionRepairPotential {
+        let mut potential = crate::execution::CompletionRepairPotential::default();
+        for blocker in self.applicable_blockers() {
+            let add = |slot: &mut u32, units: u32| *slot = slot.saturating_add(units.max(1));
+            if blocker.requires_operator_repair() {
+                add(&mut potential.operator, blocker.remaining_units());
+                continue;
+            }
+            match blocker {
+                CompletionBlocker::OpenLoops { .. } | CompletionBlocker::NextActionPending => {
+                    add(&mut potential.progress, blocker.remaining_units())
+                }
+                CompletionBlocker::ExecutionObligations { .. }
+                | CompletionBlocker::FailedCommands { .. } => {
+                    add(&mut potential.execution, blocker.remaining_units())
+                }
+                CompletionBlocker::VerificationNotCurrent
+                | CompletionBlocker::AcceptanceUncovered { .. } => {
+                    add(&mut potential.proof, blocker.remaining_units())
+                }
+                _ => add(&mut potential.operator, blocker.remaining_units()),
+            }
+        }
+        potential
+    }
+
+    /// Stable semantic blocker identity for repeated-refusal accounting. It
+    /// contains only typed blockers; basis revisions and model prose are
+    /// intentionally absent so cosmetic churn cannot manufacture a new
+    /// repair episode.
+    pub(crate) fn blocker_fingerprint(&self) -> String {
+        let value = serde_json::to_value(self.applicable_blockers()).unwrap_or_default();
+        let canonical = agent_contracts::jcs_serialize(&value).unwrap_or_default();
+        agent_contracts::ContentDigest::sha256_bytes(canonical.as_bytes()).to_string()
     }
 
     pub fn refusal(&self) -> AgentError {
@@ -753,6 +796,20 @@ impl CompletionReadiness {
             .copied()
             .filter(|blocker| !blocker.blocks_commit())
             .collect()
+    }
+}
+
+impl CompletionBlocker {
+    fn remaining_units(self) -> u32 {
+        match self {
+            Self::AcceptanceDeclarationStale { remaining }
+            | Self::AcceptanceUncovered { remaining }
+            | Self::OpenLoops { remaining }
+            | Self::RequiredContextUnavailable { remaining }
+            | Self::ExecutionObligations { remaining }
+            | Self::FailedCommands { remaining } => remaining,
+            _ => 1,
+        }
     }
 }
 
@@ -964,9 +1021,12 @@ pub(crate) fn derive_completion_readiness(
                     remaining: task.anchor.open_loops.len().min(u32::MAX as usize) as u32,
                 });
             }
-            if !task.anchor.next_action.trim().is_empty() {
-                push(CompletionBlocker::NextActionPending);
-            }
+            // `next_action` is model-owned replaceable guidance, not task
+            // authority or evidence. Treating it as a hard gate lets a model
+            // deadlock itself by writing "complete the task" as its next
+            // action and then proposing completion. Real remaining work is
+            // represented by open loops, acceptance gaps and typed execution
+            // debt; those continue to block strictly.
             let obligations = execution.open_obligation_count();
             if obligations > 0 {
                 push(CompletionBlocker::ExecutionObligations {
@@ -3982,7 +4042,7 @@ mod tests {
     }
 
     #[test]
-    fn completion_readiness_rejects_open_loops_and_next_action() {
+    fn completion_readiness_rejects_open_loops_but_not_advisory_next_action() {
         let (execution, _) = settled_execution();
         let mut anchor = settled_anchor(1);
         anchor.open_loops.push("verify edge cases".into());
@@ -3996,15 +4056,79 @@ mod tests {
             .allows_completion()
         );
         anchor.open_loops.clear();
-        anchor.next_action = "write the missing test".into();
+        anchor.next_action = "close the task after the completed work".into();
         assert!(
-            !readiness(
+            readiness(
                 CompletionIntent::ModelProposal,
                 anchor,
                 execution,
                 CompletionSafety::default(),
             )
-            .allows_completion()
+            .allows_completion(),
+            "model-owned next-action guidance must not create completion debt"
+        );
+    }
+
+    #[test]
+    fn completion_repair_identity_ignores_anchor_and_world_churn() {
+        let task_id = TaskId::new();
+        let first = CompletionReadiness {
+            intent: CompletionIntent::ModelProposal,
+            task_state_basis: Some(TaskStateBasis {
+                task_id,
+                anchor_revision: 3,
+            }),
+            verification_basis: Some(VerificationBasis {
+                task_id,
+                verification_revision: 2,
+                directive_revision: 7,
+                workspace_revision: 11,
+            }),
+            task_state_current: true,
+            commit_safe: true,
+            verified_ready: false,
+            blockers: vec![CompletionBlocker::FailedCommands { remaining: 1 }],
+            uncovered_criteria: Vec::new(),
+        };
+        let mut moved = first.clone();
+        moved.task_state_basis.as_mut().unwrap().anchor_revision = 9;
+        moved
+            .verification_basis
+            .as_mut()
+            .unwrap()
+            .workspace_revision = 18;
+
+        let record = crate::execution::CompletionRepairRecord {
+            basis_anchor_revision: Some(3),
+            basis_verification_revision: Some(2),
+            basis_directive_revision: Some(7),
+            basis_workspace_revision: Some(11),
+            plan: serde_json::json!({"schema": "completion-repair.v2"}),
+            text: String::new(),
+            refused_at_ms: 1,
+            refusal_count: 1,
+            blocker_fingerprint: first.blocker_fingerprint(),
+            same_blocker_refusals: 1,
+            no_progress_steps: 1,
+            best_potential: Some(first.repair_potential()),
+            terminal: false,
+        };
+        assert_eq!(first.blocker_fingerprint(), moved.blocker_fingerprint());
+        assert_eq!(first.repair_potential(), moved.repair_potential());
+        assert!(record.matches_episode(&moved));
+        assert!(
+            !record.matches_basis(&moved),
+            "volatile safety/CAS revisions still remain visible as a freshness fence"
+        );
+
+        moved
+            .verification_basis
+            .as_mut()
+            .unwrap()
+            .directive_revision += 1;
+        assert!(
+            !record.matches_episode(&moved),
+            "a new user directive starts a new semantic repair episode"
         );
     }
 

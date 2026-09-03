@@ -7,10 +7,10 @@ use super::state::{
 };
 use super::*;
 use agent_contracts::{
-    MAX_TASK_ANCHOR_ITEM_CHARS, NegativeFactEventKind, ResourceFreshness, ResourceVersionOracle,
-    SettlementLabel, ToolExecutionAttribution, ToolExecutionFacts, ToolExecutionPurpose,
-    ToolFailureClass, ToolFailureDomain, ToolOutput, ToolResultDisposition, TurnFrame,
-    VerificationReuse,
+    FrontierDelta, MAX_TASK_ANCHOR_ITEM_CHARS, NegativeFactEventKind, ResourceFreshness,
+    ResourceVersionOracle, SettlementLabel, ToolExecutionAttribution, ToolExecutionFacts,
+    ToolExecutionPurpose, ToolFailureClass, ToolFailureDomain, ToolOutput, ToolResultDisposition,
+    TurnFrame, VerificationReuse,
 };
 use serde_json::json;
 
@@ -477,6 +477,136 @@ fn runtime_argument_digest_not_command_text_controls_exact_failure_resolution() 
     assert!(
         resume.failed_commands.is_empty(),
         "the exact runtime argument identity resolves its own blocker"
+    );
+}
+
+fn outcome_equivalence_attribution(material: &str) -> RuntimeExecutionAttribution {
+    RuntimeExecutionAttribution {
+        host: ToolExecutionAttribution::bounded(
+            ToolExecutionPurpose::Opaque,
+            Vec::<String>::new(),
+            VerificationReuse::None,
+        )
+        .with_outcome_equivalence_material(material),
+        rooted_targets: Vec::new(),
+    }
+}
+
+#[test]
+fn trusted_equivalent_success_retires_nondeterministic_debt() {
+    let equivalent = outcome_equivalence_attribution("process.run/cargo-fmt/defaults-normalized");
+    let different = outcome_equivalence_attribution("process.run/cargo-test");
+    let mut state = ExecutionState::default();
+    let mut failure = output("process.run", false, "exit 1");
+    failure.metadata = json!({"command": "cargo fmt -- --check"});
+    state.observe_tool_attributed(&failure, 1, 1, "raw-with-defaults", &equivalent);
+    assert_eq!(state.failed_commands.len(), 1);
+    assert_ne!(
+        state.failed_commands[0].argument_digest,
+        "raw-without-defaults"
+    );
+
+    let mut success = output("process.run", true, "exit 0");
+    success.metadata = json!({"command": "cargo fmt -- --check"});
+    state.observe_tool_attributed(&success, 1, 2, "other-raw-json", &different);
+    assert_eq!(
+        state.failed_commands.len(),
+        1,
+        "a different effective operation must not clear the debt"
+    );
+    let observation =
+        state.observe_tool_attributed(&success, 1, 3, "raw-without-defaults", &equivalent);
+    assert!(state.failed_commands.is_empty());
+    assert_eq!(observation.delta, FrontierDelta::WorldInvalidatedUnknown);
+}
+
+#[test]
+fn producer_metadata_cannot_forge_outcome_equivalence() {
+    let equivalent = outcome_equivalence_attribution("trusted-effective-operation");
+    let mut state = ExecutionState::default();
+    let failure = failed_shell("cargo test");
+    state.observe_tool_attributed(&failure, 1, 1, "raw-a", &equivalent);
+
+    let mut forged = output("shell.exec", true, "exit 0");
+    forged.metadata = json!({
+        "command": "cargo test",
+        "outcome_equivalence_key": equivalent.host.outcome_equivalence_key,
+    });
+    state.observe_tool_with_digest(&forged, 1, 2, "raw-b");
+    assert_eq!(
+        state.failed_commands.len(),
+        1,
+        "producer metadata is not host attribution and cannot settle debt"
+    );
+}
+
+#[test]
+fn legacy_failure_can_be_reconciled_by_exact_raw_identity() {
+    let mut state = ExecutionState::default();
+    let failure = failed_shell("cargo test");
+    state.observe_tool_with_digest(&failure, 1, 1, "same-raw-json");
+    assert!(state.failed_commands[0].outcome_equivalence_key.is_empty());
+
+    let attributed = outcome_equivalence_attribution("trusted-effective-operation");
+    let mut success = output("shell.exec", true, "exit 0");
+    success.metadata = json!({"command": "cargo test"});
+    state.observe_tool_attributed(&success, 1, 2, "same-raw-json", &attributed);
+    assert!(
+        state.failed_commands.is_empty(),
+        "an upgraded host may settle a legacy row only when the exact raw digest still matches"
+    );
+}
+
+#[test]
+fn completion_repair_checkpoint_round_trips_legal_multibyte_criteria() {
+    let mut state = ExecutionState::default();
+    let criterion = "🧪".repeat(MAX_TASK_ANCHOR_ITEM_CHARS);
+    let details = (0..8)
+        .map(|index| {
+            json!({
+                "criterion_index": index,
+                "coverage_domain": "workspace-tests",
+                "criterion_text": criterion,
+            })
+        })
+        .collect::<Vec<_>>();
+    state.completion_repair = Some(CompletionRepairRecord {
+        basis_anchor_revision: Some(1),
+        basis_verification_revision: Some(1),
+        basis_directive_revision: Some(1),
+        basis_workspace_revision: Some(1),
+        plan: json!({
+            "schema": "completion-repair.v2",
+            "steps": [{"kind": "proof_refresh", "criterion_details": details}],
+        }),
+        text: String::new(),
+        refused_at_ms: 1,
+        refusal_count: 1,
+        blocker_fingerprint: agent_contracts::ContentDigest::sha256_bytes(b"proof-blocker")
+            .to_string(),
+        same_blocker_refusals: 1,
+        no_progress_steps: 1,
+        best_potential: Some(CompletionRepairPotential {
+            proof: 1,
+            ..Default::default()
+        }),
+        terminal: false,
+    });
+    super::validate_resume(&state)
+        .expect("Runtime-generated character-bounded Unicode plans must remain checkpointable");
+    let encoded = serde_json::to_vec(&state).unwrap();
+    let mut restored: ExecutionState = serde_json::from_slice(&encoded).unwrap();
+    let repair = restored
+        .completion_repair
+        .as_ref()
+        .expect("checkpoint round-trip preserves the repair episode");
+    assert_eq!(repair.no_progress_steps, 1);
+    assert_eq!(repair.best_potential.unwrap().proof, 1);
+
+    restored.on_user_turn("a genuinely new directive");
+    assert!(
+        restored.completion_repair.is_none(),
+        "only new user input, not serialization/continuation, resets the episode"
     );
 }
 

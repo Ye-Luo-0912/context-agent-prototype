@@ -89,6 +89,25 @@ not a new planner, TaskGraph, database or multi-Agent layer.
   (1/4). The successor repairs did not change that outcome: the loop is
   model task-execution behavior on this serving, not the infrastructure
   lock contention the seventh window hit.
+- The successor-rerun diagnosis now identifies a Runtime-level convergence
+  defect beneath that model behavior: raw call JSON was reused as result
+  identity, advisory `next_action` could self-lock completion, volatile
+  anchor/world revisions reset repair accounting, and the exact proof route
+  could depend on prior model history. Repeated calls were therefore treated
+  as fresh attempts even when the typed blocker frontier did not improve.
+- A 2026-09-04 working-tree candidate implements semantic completion liveness:
+  host-trusted effective-operation reconciliation, advisory-only `next_action`,
+  `completion-repair.v2` episodes with typed progress/postconditions, a cold
+  host declaration-to-exact-recipe route, and an audited text-only handoff when
+  repair stalls. The handoff ends only the turn; the task remains active and no
+  completion blocker is cleared automatically.
+- This is candidate implementation, not formal evidence. Format and the
+  selected package check pass; `agent-runtime` library tests are 339/339,
+  Runtime turn integration tests 110/110, and `tool-runtime` library tests 214
+  pass with 1 ignored. Strict Clippy, the complete workspace gate,
+  dual-platform CI, a new exact-source preflight and a formal window remain
+  separate exits. Historical v1 windows and their 6/12 verdict are unchanged.
+  M15 remains open.
 - Product scope is now fixed to dynamic in-process Context, builtin tools, one
   workspace, one checked OpenAI-compatible provider profile and an interactive
   TUI. Service Context and dynamic extensions remain experimental unless their
@@ -587,6 +606,8 @@ tranche above):**
   model-visible, so an explicit re-proposal can also refresh the stage.
   This directly targets the two 48-round policy-normal loops without changing
   Context/GC, adding a round TTL or reducing model autonomy.
+  This paragraph is retained as the v1 historical record; the current
+  semantic-episode contract is `completion-repair.v2` above.
 - JSON recovery is now a protocol mechanism rather than standing prompt text:
   the global JSON sentence is removed, Runtime's live sink declares tool-call
   deltas internal until text is published, and malformed tool arguments receive
@@ -1592,14 +1613,15 @@ task-aware, its tail metric does not stop when work reopens, and its live runner
 
 The current directive is concise:
 
-1. finish the Linux probe-reaping correction and record one clean source with
-   the complete local gate and Windows/Linux CI green;
-2. reconcile the applicable open P1 exits or selected-path exclusions; do not
-   start product features that change the formal surface;
-3. select a materially new M15 candidate from the immutable diagnosis, then
-   use one fresh preflight and at most one predeclared 12-cell window;
-4. only after M15 closes, execute the Reliable Local Agent alpha and V1 route
-   in [`ROADMAP.md`](ROADMAP.md#route-to-a-usable-local-agent).
+1. finish and record the semantic completion-liveness deterministic
+   regressions without weakening any completion/effect/recovery gate;
+2. run the complete local gate, reconcile applicable P1 exits or exact
+   selected-path exclusions, and record Windows/Linux CI on one clean source;
+3. when a supported serving is available, run one fresh exact-source preflight
+   and at most one freshly predeclared 12-cell window;
+4. close M15 only on a valid 12/12 formal result; then execute the Reliable
+   Local Agent alpha and V1 route in
+   [`ROADMAP.md`](ROADMAP.md#route-to-a-usable-local-agent).
 
 The candidate chronology below is retained for audit context. It does not
 override the four steps above.

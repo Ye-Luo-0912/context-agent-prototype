@@ -28,6 +28,7 @@
 
 use std::collections::HashSet;
 
+use agent_contracts::EffectAckDebt;
 use agent_contracts::{
     AgentError, AgentResult, AuthorityCheckpointMarker, MAX_COMPLETION_ARTIFACTS,
     MAX_COMPLETION_REF_CHARS, MAX_COMPLETION_SUMMARY_CHARS, RunId, TaskId,
@@ -343,6 +344,12 @@ fn sha256_hex(bytes: &[u8]) -> String {
 /// Bump when the checkpoint shape changes; restore rejects mismatches.
 pub const RUNTIME_CHECKPOINT_VERSION: u32 = 4;
 
+/// Bounded set of unresolved effect-acknowledgement debts a checkpoint may
+/// carry. The recovery fence makes later mutation impossible while any
+/// debt is unresolved, so a bounded newest-window cannot silently drop a
+/// growing backlog: overflow refuses the checkpoint capture instead.
+pub const MAX_CHECKPOINT_ACK_DEBTS: usize = 8;
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RuntimeCheckpoint {
     pub version: u32,
@@ -384,6 +391,14 @@ pub struct RuntimeCheckpoint {
     /// under (handshake-verified stable). Zero without a registry.
     #[serde(default)]
     pub capability_generation: u64,
+    /// Unresolved effect-acknowledgement debts captured with the run. A
+    /// restored runtime re-fences mutation until each debt is reconciled
+    /// against the broker journal's durable truth; Applied/NotApplied
+    /// resolutions leave the set, an Ambiguous resolution keeps it and the
+    /// fence. Serde-defaulted so older payloads still load. Bounded: the
+    /// validator refuses more than `MAX_CHECKPOINT_ACK_DEBTS` entries.
+    #[serde(default)]
+    pub unresolved_ack_debts: Vec<EffectAckDebt>,
     /// Last event-journal sequence already reflected by the captured
     /// runtime/context planes. Recovery replays strictly after this cursor;
     /// old v4 payloads default to zero and retain legacy behavior.
@@ -472,6 +487,21 @@ impl RuntimeCheckpoint {
             marker.validate().map_err(|error| {
                 AgentError::InvalidRequest(format!(
                     "checkpoint has an invalid authority marker: {error}"
+                ))
+            })?;
+        }
+
+        if self.unresolved_ack_debts.len() > MAX_CHECKPOINT_ACK_DEBTS {
+            return Err(AgentError::InvalidRequest(format!(
+                "checkpoint carries {} unresolved ack debts, above the {} cap",
+                self.unresolved_ack_debts.len(),
+                MAX_CHECKPOINT_ACK_DEBTS
+            )));
+        }
+        for debt in &self.unresolved_ack_debts {
+            debt.validate().map_err(|error| {
+                AgentError::InvalidRequest(format!(
+                    "checkpoint carries an invalid ack debt: {error}"
                 ))
             })?;
         }
@@ -855,6 +885,7 @@ mod tests {
             authority: None,
             snapshot_sequence: 7,
             capability_generation: 0,
+            unresolved_ack_debts: Vec::new(),
             event_cover_seq: 0,
             terminal_commit: false,
         }
@@ -995,6 +1026,48 @@ mod tests {
                 .contains(&crate::task::CompletionBlocker::OperatorClosureOnly),
             "legacy weak coverage must remain inert after restore"
         );
+    }
+
+    #[test]
+    fn checkpoint_refuses_more_than_the_bounded_ack_debt_set() {
+        let debt = || EffectAckDebt {
+            operation_id: agent_contracts::OperationId::new(),
+            effect_id: agent_contracts::EffectId::new(),
+            reservation_id: "pass/1".into(),
+            settlement: agent_contracts::EffectAckSettlement::Applied {
+                durability: agent_contracts::EffectDurability::Durable,
+            },
+            error: "ack lost".into(),
+        };
+        let tasks = TaskManager::new();
+        let base = || RuntimeCheckpoint {
+            version: RUNTIME_CHECKPOINT_VERSION,
+            run_metadata: RunMetadata {
+                run_id: RunId::new(),
+                created_at_ms: 0,
+            },
+            tasks: TaskManagerSnapshot::from_manager(&tasks),
+            current_task_id: tasks.active(),
+            focus_revision: 0,
+            last_surface_revision: 0,
+            context: serde_json::json!({}),
+            capabilities: Vec::new(),
+            authority: None,
+            snapshot_sequence: 0,
+            capability_generation: 0,
+            unresolved_ack_debts: (0..MAX_CHECKPOINT_ACK_DEBTS).map(|_| debt()).collect(),
+            event_cover_seq: 0,
+            terminal_commit: false,
+        };
+        let ok = base();
+        ok.validate().unwrap();
+        let json = serde_json::to_value(&ok).unwrap();
+        let round: RuntimeCheckpoint = serde_json::from_value(json).unwrap();
+        assert_eq!(round.unresolved_ack_debts.len(), MAX_CHECKPOINT_ACK_DEBTS);
+
+        let mut over = base();
+        over.unresolved_ack_debts.push(debt());
+        assert!(over.validate().is_err());
     }
 
     #[test]

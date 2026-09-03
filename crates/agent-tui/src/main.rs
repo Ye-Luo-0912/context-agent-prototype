@@ -153,7 +153,7 @@ async fn main() -> anyhow::Result<()> {
         host_policies: Some(host_policies),
         effect_reservation_journal: Some(reservation_journal),
         verification_recipes: Some(verification_recipes),
-        project_proof_refresh: false,
+        project_proof_refresh: true,
     })
     .await?;
     let mut runtime_events = composed.subscribe();

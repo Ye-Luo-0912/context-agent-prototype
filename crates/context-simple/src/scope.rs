@@ -412,6 +412,7 @@ fn close_members(
     // materializer). Legacy entries without a scope stamp fall back to the
     // task id. Non-durable bodies stay where they are; terminal semantics
     // never resurrect, even as identity.
+    let mut external_catalog_changed = false;
     for entry in &mut state.external {
         if !belongs_to_external(&state.scopes, entry, scope) {
             continue;
@@ -438,6 +439,7 @@ fn close_members(
             entry.retention = ContextRetention::Durable;
         }
         entry.tags.push(Label::lifecycle(LifecycleLabel::Promoted));
+        external_catalog_changed = true;
         if entry.attention != AttentionState::Active {
             entry.attention = AttentionState::Active;
             transitions.push(ContextStateTransition {
@@ -453,6 +455,13 @@ fn close_members(
                 ),
             });
         }
+    }
+    // Scope, lifecycle labels and attention are catalog search/ranking
+    // dimensions. A scope close may update many durable outcomes, so one
+    // rebuild keeps the batch O(N); per-id upserts would search all stores
+    // K times.
+    if external_catalog_changed {
+        state.mark_catalog_rebuild();
     }
     transitions
 }

@@ -240,7 +240,14 @@ impl ContextEngine for ContextServiceAdapter {
         &self,
         query: ContextSearchQuery,
     ) -> AgentResult<Vec<ExternalizedContext>> {
-        let value = self.call(ServiceOp::SearchExternal { query }).await?;
+        // Keep direct process-adapter callers on the same semantic bounds as
+        // Core and the in-process engine. The service validates again at its
+        // own engine boundary; this also bounds the outgoing wire request.
+        let value = self
+            .call(ServiceOp::SearchExternal {
+                query: query.normalized(),
+            })
+            .await?;
         serde_json::from_value(value)
             .map_err(|e| AgentError::Context(format!("decode external context search: {e}")))
     }

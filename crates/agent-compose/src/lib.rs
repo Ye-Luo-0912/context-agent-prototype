@@ -386,17 +386,25 @@ pub async fn compose(config: ComposeConfig) -> anyhow::Result<ComposedRuntime> {
     services = services.with_settlement_projection_diagnostics(settlement_projection_diagnostics);
     services = services.with_project_completion_opportunity(project_completion_opportunity);
     services = services.with_recovery_surface(recovery_surface);
-    // 宿主 exact 证明刷新（默认关）：开启后 completion gate 在仅剩
-    // proof blocker 时自动重跑宿主注册的 exact recipe。要求 recipe 表
-    // 在场，否则整次组合失败关闭——开关被打开却静默失效比拒绝更危险。
-    if project_proof_refresh {
-        let recipes = verification_recipes.ok_or_else(|| {
-            anyhow::anyhow!("project proof refresh requires host verification recipes")
-        })?;
-        let runner = tool_runtime::RecipeProofRunner::new(workspace.clone(), recipes)
-            .ok_or_else(|| anyhow::anyhow!("verification recipes register no host policy"))?;
-        services = services.with_proof_verifier(Arc::new(HostProofVerifier::new(runner)));
-        services = services.with_project_proof_refresh(true);
+    // A recipe table always installs the read-only domain resolver so a
+    // model-facing repair can name an exact recipe on cold start. The switch
+    // controls only Runtime's optional automatic execution of that recipe.
+    // Enabling execution without a table remains a fail-closed boot error.
+    match verification_recipes {
+        Some(recipes) => {
+            let runner = tool_runtime::RecipeProofRunner::new(workspace.clone(), recipes)
+                .ok_or_else(|| anyhow::anyhow!("verification recipes register no host policy"))?;
+            services = services.with_proof_verifier(Arc::new(HostProofVerifier::new(runner)));
+            if project_proof_refresh {
+                services = services.with_project_proof_refresh(true);
+            }
+        }
+        None if project_proof_refresh => {
+            return Err(anyhow::anyhow!(
+                "project proof refresh requires host verification recipes"
+            ));
+        }
+        None => {}
     }
 
     // Everything fallible is constructed; only the module start transaction
@@ -513,8 +521,18 @@ mod tests {
         );
     }
 
+    /// A recipe table injects the route resolver even with automatic refresh
+    /// disabled; enabling refresh changes execution policy, not discovery.
+    #[tokio::test]
+    async fn disabled_refresh_with_recipes_still_composes_the_route_resolver() {
+        let dir = tempfile::tempdir().unwrap();
+        let workspace = Workspace::open(dir.path()).await.unwrap();
+        let recipes = Arc::new(VerificationRecipes::new(vec![host_echo_recipe()]).unwrap());
+        run_smoke(compose_config(workspace, Some(recipes), false)).await;
+    }
+
     /// With the recipe table present the enabled composition boots and
-    /// injects the host verifier; the model tool surface is unchanged.
+    /// injects the host executor; the model tool surface is unchanged.
     #[tokio::test]
     async fn enabled_refresh_with_recipes_composes() {
         let dir = tempfile::tempdir().unwrap();

@@ -4,9 +4,10 @@ use serde::{Deserialize, Serialize};
 use crate::{
     AgentResult, CompactionReason, ContextConsumptionAck, ContextDiagnostics, ContextGcReport,
     ContextMaintenanceReport, ContextMaintenanceTrigger, ContextMaterializationMisses,
-    ContextSelection, ContextStateTransition, EffectAckDebt, OperationId, OperationSnapshot, RunId,
-    RuntimeFailureClass, RuntimeInputEnvelope, ScopeId, StorageGcReport, TaskId, ToolCall,
-    ToolLeaseReconcileReport, ToolOutput, ToolSurfacePlanReport, ToolSurfaceRequirement, TurnId,
+    ContextSelection, ContextStateTransition, EffectAckDebt, EffectReconciliation, OperationId,
+    OperationSnapshot, RunId, RuntimeFailureClass, RuntimeInputEnvelope, ScopeId, StorageGcReport,
+    TaskId, ToolCall, ToolLeaseReconcileReport, ToolOutput, ToolSurfacePlanReport,
+    ToolSurfaceRequirement, TurnId,
 };
 
 /// Cap on `RuntimeEvent::Pinned` content: a pinned constraint is model-facing
@@ -647,6 +648,15 @@ pub enum RuntimeEvent {
     /// be reconciled before later mutation or completion proceeds.
     EffectAckDebt {
         debt: EffectAckDebt,
+    },
+    /// A persisted ACK debt was reconciled against the broker journal's
+    /// durable truth. The typed resolution (Applied / NotApplied /
+    /// Ambiguous) is the audit record: resolved debts leave the runtime's
+    /// bounded checkpoint set, while an Ambiguous resolution keeps the
+    /// recovery fence until an operator resolves the disagreement.
+    EffectAckDebtResolved {
+        debt: EffectAckDebt,
+        resolution: EffectReconciliation,
     },
     /// A restore committed: context + task authority were transactionally
     /// restored, and the host re-applied the checkpoint's capability flags.

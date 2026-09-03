@@ -27,7 +27,7 @@ is not closed.
 | When | Items | Disposition |
 | --- | --- | --- |
 | Before the Reliable Local Agent alpha | `COMPOSE-LIFECYCLE-01`, `EFFECT-ACK-01` | Close the remaining startup type error and durable ACK-debt lifecycle. These are correctness/safety exits, not product polish. `CONTEXT-IO-01` closed on 2026-09-04. |
-| Before the next formal M15 candidate | ~~TOOL-MANIFEST-01~~ (closed on `9e00299`: the evaluated surface digest persists on every cell manifest; CI `33789350980` green) | ~~Record one clean local/Windows/Linux source and persist the evaluated tool-surface identity~~ — done: clean source `0668002`/`fe6a743`, CI `33785349225`/`33789350980`. A valid historical FAIL is never repaired in place. |
+| Before the next formal M15 candidate | `COMPLETION-LIVENESS-01`; ~~TOOL-MANIFEST-01~~ (closed on `9e00299`) | Semantic convergence candidate and its focused deterministic matrix are green in the working tree. It still needs strict Clippy, the complete workspace/CI/source/preflight route before any formal window. A valid historical FAIL is never repaired in place. |
 | Only if service Context ships as V1 | `SIDECAR-ERROR-01` | Otherwise keep `--context=service` explicitly experimental and out of the supported product profile. |
 | Before long-horizon breadth, if measured | `FAILURE-SPILL-01`, `TOOL-CONTRACT-01` live acceptance | Activate spill work only if the bounded hot set overflows; use paired task evidence for tool-contract convergence. |
 | Before extension promotion or Self-Iteration | `CAP-OBS-01` residual | Retire legacy producer metadata only through the existing typed-facts migration; dynamic producers never mint trusted execution facts. |
@@ -193,6 +193,47 @@ Clippy, all-target build and the complete local all-target workspace suite
 after rebuilding the freshness-guarded context service binary. That validates
 the first slice locally; it does not replace the remaining deterministic
 matrix, a recorded clean source or dual-platform CI.
+
+### COMPLETION-LIVENESS-01 — make completion repair semantically convergent (**open; working-tree candidate + focused deterministic matrix green, full gate/CI/preflight pending**)
+
+The latest valid M15 rerun shows that `completion-repair.v1` remained a
+model-coordinated compensation loop rather than a Runtime-owned liveness
+mechanism. Four concrete causes compose the recurrent tail: raw submitted JSON
+identity was also used for result reconciliation, advisory `next_action` could
+self-block completion, anchor/workspace revision churn reset repeated-refusal
+accounting, and cold proof routing depended on the model having previously run
+the correct exact recipe.
+
+The candidate keeps `ArgumentDigest` for authority/audit and adds a separate
+host-trusted effective-operation key for builtin process/shell result
+reconciliation. `next_action` is advisory; open loops and typed debt remain
+strict blockers. `completion-repair.v2` persists a semantic episode across
+anchor/world churn, fingerprints typed blockers, accepts only a strictly lower
+ordered blocker potential as progress, and derives one resolver plus a typed
+postcondition. The host verifier can resolve the current domain's exact recipe
+without prior model history and still must agree with dispatcher attribution.
+Repeated unchanged/cycling blockers enter an audited text-only ordinary-final
+handoff; no tool is dispatched and the task remains active. New user input
+resets the episode, while continuation and checkpoint/restore preserve it.
+
+Exit requires deterministic positives and negatives for default-parameter
+equivalence versus changed argv/cwd/env, producer metadata non-authority,
+anchor/workspace churn and cross-stage cycling, real blocker reduction, new-user
+reset and restore preservation, cold exact-recipe routing and stale-declaration
+rejection, plus a terminal text-only turn with no `TaskCompleted`. Basic tests
+do not close the item: the complete local gate, applicable P1 disposition,
+dual-platform CI, clean-source preflight and a freshly predeclared formal window
+remain separate exits. M15 stays open.
+
+Scope and larger follow-up: the guarantee starts when a completion-gate
+refusal opens the repair episode. Arbitrary search/read/process repetition
+before any completion proposal still uses the existing frontier advisory and
+global safety budget; a general action-convergence policy needs separate
+evidence and must not treat diverse legitimate work as a loop. Automatic host
+proof execution is now basis-deduplicated and timeout-bounded, but it is still
+awaited inside the actor with its own cancellation token. Before the Reliable
+Local Agent alpha, move that lane into the cancellable operation lifecycle and
+state its host/read-only approval policy explicitly.
 
 ### JSON-RECOVERY-01 — make format recovery product-equivalent (**closed on source: `1768914`/`f528a92`/`328ec5d`; shared formal-path/product observer wired in `7e02488`**)
 
@@ -776,7 +817,7 @@ result returns bounded typed refusal reasons and includes:
 current trusted verification PASS satisfies the task-declared identity strength
 (ExactCurrentWorld where that profile requires it)
 + criterion-addressed current acceptance receipts
-+ no open loop or next action
++ no open loop (`next_action` is advisory only)
 + no in-flight/cancel cleanup
 + no actor recovery fence
 + no unresolved failure or execution obligation
@@ -801,8 +842,10 @@ only bounded view is not silently dropped.
 
 Exit tests must show the settlement predicate and `task.complete` decision are
 identical for positive and negative matrices: missing acceptance, mismatched
-coverage, stale verification, new directive, open loop, next action, unrelated
-failure, recovery fence, in-flight cleanup and hard required-context miss.
+coverage, stale verification, new directive, open loop, unrelated failure,
+recovery fence, in-flight cleanup and hard required-context miss. A non-empty
+advisory `next_action` is a positive case when every authoritative blocker is
+clear.
 Accepted completion remains one-shot, while ordinary final may end a turn
 without fabricating durable task closure.
 
@@ -1121,7 +1164,7 @@ local source gate and dual-platform CI run `33663057012` are recorded in
 [`STATUS.md`](STATUS.md). An **open** heading now names only its explicit
 residual; it does not mean the landed slice is absent.
 
-#### COMPOSE-LIFECYCLE-01 — make startup transactional (**open — transaction body landed on `e566615`; optional-service type residual remains**)
+#### COMPOSE-LIFECYCLE-01 — make startup transactional (**closed: transaction body `e566615`; typed optional lookup landed with the 2026-09-04 tranche**)
 
 `e566615` moved fallible journal/authority/service preparation before
 `host.start()`, rolls the sole post-start reconcile seam back, rejects duplicate
@@ -1130,12 +1173,12 @@ The failure and lifecycle tests cover locked preparation, post-start rollback,
 module-start rollback, duplicate start and the serving assertion; narrowed eval
 compositions are labelled non-product-equivalent.
 
-The remaining defect is typed optional lookup. `ServiceRegistry::event_store()`
-and `artifact_store()` currently turn every `get()` error into `None`, so a
-registered capability with the wrong concrete type is indistinguishable from an
-absent optional service. Preserve absence as optional, but return an error for a
-present wrong type. Exit adds both positive absence and negative wrong-type
-tests without weakening the existing startup rollback matrix.
+The remaining defect is typed optional lookup. `ServiceRegistry::get` now
+distinguishes absence ("not available") from a registered value that does not
+implement the requested type (a typed error naming the claiming module), and
+`event_store()` / `artifact_store()` keep absence as `None` while surfacing a
+present wrong type. Regressions cover both directions without weakening the
+startup rollback matrix.
 
 #### CONTEXT-IO-01 — remove lock-across-I/O and loss-on-export (**closed 2026-09-04**)
 
@@ -1161,7 +1204,7 @@ regressions prove new scope/label/live/attention keys and removal of the old
 buckets. Focused lifecycle/search/GC regressions cover these boundaries without
 changing policy thresholds or scores.
 
-#### EFFECT-ACK-01 — persist unresolved ACK debt (**open — typed debt/event/fence landed on `245b2a6`; durable lifecycle residual remains**)
+#### EFFECT-ACK-01 — persist unresolved ACK debt (**closed: typed debt/event/fence `245b2a6`; checkpointed lifecycle landed with the 2026-09-04 tranche**)
 
 `245b2a6` preserves the real typed receipt when broker acknowledgement fails,
 emits bounded `EffectAckDebt`, enters the Runtime recovery fence and refuses
@@ -1169,12 +1212,16 @@ later mutation. Existing tests cover the truthful Applied debt, event and live
 fence, while the broker journal truthfully reopens dispatched-without-ACK as
 ambiguous rather than strengthening it.
 
-The debt itself is not yet a checkpointed lifecycle: `RuntimeCheckpoint` carries
-no unresolved ACK-debt set, there is no typed resolved event/operation, and the
-restart matrix does not resolve Applied/NotApplied/Ambiguous debts end to end.
-Add the bounded checkpoint/run-status projection and explicit reconciliation
-path before closing this item. Never pretend an already-applied effect rolled
-back, and never serialize the typed settlement as a boolean.
+The checkpointed lifecycle is now closed. `RuntimeCheckpoint` carries a
+bounded (`MAX_CHECKPOINT_ACK_DEBTS`) unresolved-debt set that restore
+re-installs and re-fences; the broker journal classifies a debt's effect
+identity into the typed `EffectReconciliation` classes across a reopen
+(`reconcile_effect_id`); a resolved reconciliation emits the typed
+`EffectAckDebtResolved` event, Applied/NotApplied retire the debt, Ambiguous
+keeps the debt and the fence, and the fence clears only when the set empties
+while Core reports no other recovery requirement. Never pretend an
+already-applied effect rolled back, and never serialize the typed settlement
+as a boolean.
 
 #### DURABLE-FACTS-01 — make typed execution facts replayable (**closed on `c0c1c5c`**)
 
@@ -1907,6 +1954,11 @@ Progress (2026-08-29):
   cover unmet acceptance, open loop, next action, failed command, new
   directive, boundary change, in-flight cleanup, mutation-after-verify and
   cold restore.
+- **2026-09-04 contract correction:** the preceding paragraph is retained as
+  historical implementation evidence, but `next_action` is no longer part of
+  current readiness. It is model-owned advisory text and created a self-lock
+  when the suggested next step was “complete the task”. Open loops, acceptance
+  and typed debt remain authoritative blockers; see `COMPLETION-LIVENESS-01`.
 - Two live-cell prerequisites landed: trusted verification PASS clears
   identity-exact `failed_commands` bound to the current basis/directive/
   workspace tuple (a fresh failure re-records and re-blocks), and provider
