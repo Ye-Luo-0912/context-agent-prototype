@@ -1,6 +1,6 @@
 {
   "cell": {
-    "dir": "crates/agent-eval/evidence/m15-preflight\\retry_policy_dev-normal\\r1-attempt6\\dynamic",
+    "dir": "crates/agent-eval/evidence/m15-preflight\\retry_policy_dev-normal\\r1-attempt7\\dynamic",
     "mode": "normal",
     "pack_id": "retry_policy_dev",
     "repeat": 1,
@@ -8,19 +8,19 @@
   },
   "outcome": {
     "behavior": "pass",
-    "closure": "completed",
+    "closure": "active",
     "continuation": "n/a",
     "diff": "pass",
     "error": null,
-    "model_rounds": 27,
+    "model_rounds": 20,
     "observed_behavior": "pass",
     "passed": true,
     "provider_health": "healthy",
     "self_check": "pass",
-    "task_completed": true,
+    "task_completed": false,
     "turn_completed": true,
     "verdict": "pass",
-    "wall_ms": 268915
+    "wall_ms": 219827
   },
   "schema": "m15-preflight.v1",
   "serving": {
@@ -30,7 +30,7 @@
   },
   "source": {
     "clean": true,
-    "source_tree_digest": "7afea5644127512ab7607e8b35a65c7841c45023bb76a8c4ed259f5d6af96cd8"
+    "source_tree_digest": "ba2ec74cd02000a462d24d4f15f2f5db849ec89313a3e183767278d14205c163"
   },
   "switches": {
     "opportunity": false,

@@ -1264,7 +1264,9 @@ direction; the explicit recommendation of the diagnosis)
      [DONE 2026-09-03: local gate green on cc60194 (fmt/build/clippy/full
       suite); dual-platform CI run 33740918365 green]
   -> new exact-source/product M15 preflight
-     [pending]
+     [DONE 2026-09-03: PASS on clean HEAD 2adad31, one `retry_policy_dev`
+      normal cell, task_progress product surface, PinAI tuple, explicit
+      protocol; evidence crates/agent-eval/evidence/m15-preflight/]
   -> at most one freshly predeclared formal 12-cell M15 window
      [pending, operator-reviewed]
 ```
