@@ -54,6 +54,16 @@ not a new planner, TaskGraph, database or multi-Agent layer.
   serving tuple, one uninterrupted `agent-eval --m15-window` run from the
   same clean worktree at `1651354`. Valid FAIL rejects the candidate; only
   a typed NOT_RUN permits a whole-window rerun.
+- The eighth window ran from the same clean worktree at `1651354` and came
+  back **CENSORED: 10/12 pass, 2 NOT_RUN** (mechanical report
+  `_windows/1788463526600`): diag 4/4 — the overflow edge passed every cell
+  for the first time on this serving — and migrate 4/4 all clean;
+  `policy normal r1` completed in 44 rounds (the completion-gate loop did not
+  recur) and `policy resume r2` passed, while `policy normal r2` and
+  `policy resume r1` are typed NOT_RUN on upstream HTTP 503
+  "Service temporarily unavailable". Per the frozen rule a censored window
+  is not a verdict and produced no decision-grade sample, so the whole
+  frozen window is rerun unchanged (same source `1651354`, same serving).
 - Formal M15 remains open. Seven v4 valid FAIL windows are banked; the latest
   mechanical report is 10/12 with 0 NOT_RUN. Its resume failure is classified
   in `dimensions.json` as `runtime_error_class=runtime`: it is a Runtime
@@ -69,7 +79,7 @@ not a new planner, TaskGraph, database or multi-Agent layer.
 | --- | --- | --- |
 | Contracts / Core / process / storage | Trusted mechanisms are substantial: bounded contracts, approval/effect authority, journals, recovery evidence and process control are implemented. | Persist and reconcile unresolved effect-ack debt end to end; retain fail-closed recovery. |
 | Runtime / task / checkpoint | Sole `RuntimeActor`, TaskAnchor/ExecutionState, completion readiness, safe points and cross-plane checkpoint/restore exist. | Expose a verified product save/list/resume path and bounded status projection; never add a second orchestrator. |
-| Dynamic Context | Working-set lifecycle, external store, recall and explainability are implemented and frozen for M15. | Close the materialize/restore transaction and external-catalog dirty residual; do not retune GC/scoring. |
+| Dynamic Context | Working-set lifecycle, external store, recall and explainability are implemented; the materialize/restore transaction, catalog-dirty residual and Stored semantic full-text verification closed on 2026-09-04. | Keep GC/scoring frozen through M15; carry only measured post-M15 performance work, not new retrieval heuristics. |
 | Tools / workspace | A broad bounded coding surface, artifact spill, revision-aware edits, verification recipes and approvals exist. | Persist the evaluated surface identity and make actual effects, failures and grants understandable in the product host. |
 | Provider / composition | OpenAI-compatible Chat/Responses streaming and one trusted composition path exist. | Checked configuration, explicit mock mode, visible serving identity, strict startup errors and the optional-service type residual. |
 | TUI / product entry | The event-driven TUI can run tasks, approve calls, inspect Context and manually checkpoint/restore. | Strict help/config parsing, bounded visible command errors, safe checkpoint-store integration, resume discovery, usable grant revoke and packaged startup smoke. |
