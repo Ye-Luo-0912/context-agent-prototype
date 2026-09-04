@@ -94,6 +94,23 @@ not a new planner, TaskGraph, database or multi-Agent layer.
   GET `/models` still lists a larger catalog. No formal preflight or window
   can run until a serving is secured; the post-rerun diagnosis is banked at
   [`evidence/m15-diagnosis-successor-rerun/REPORT.md`](../crates/agent-eval/evidence/m15-diagnosis-successor-rerun/REPORT.md).
+- Serving restored 2026-09-04: the PinAI endpoint answers `/v1/responses`
+  again (HTTP 200; the earlier 403 region block and the relay outage both
+  lifted for the direct endpoint; the localhost relay stays broken and
+  unused). By operator direction the M15 gate resumed on the current
+  source: the exact-source product preflight **PASSED** on the clean tree
+  `bf52490` (attempt `r1-attempt8` under `evidence/m15-preflight/`, source
+  tree digest `86e36a2a...`): `retry_policy_dev` normal, product surface,
+  behavior/diff pass, closure active (report-only), provider healthy,
+  46 model rounds / 20 durable checkpoints, wall 496,317 ms.
+- The ninth 12-cell v4 window on the bf52490 source + PinAI tuple is
+  **predeclared 2026-09-04 before its run** (M15_ACCEPTANCE §7 item 8):
+  3 fixtures × normal/resume × 2 repeats, the product surface, the pinned
+  serving tuple (`gpt-5.6-luna`, Responses, 128,000-token context,
+  4,096 max output tokens), one uninterrupted `agent-eval --m15-window`
+  run. The mechanically regenerated report is the only accepted verdict;
+  valid FAIL rejects the bf52490 candidate, and only a typed NOT_RUN
+  permits a whole-window rerun.
 - Formal M15 remains open. Nine v4 windows are banked (seven valid FAILs
   plus the censored eighth and its failed rerun); the latest mechanical
   report is the rerun's 6/12 with 0 NOT_RUN, where the policy
