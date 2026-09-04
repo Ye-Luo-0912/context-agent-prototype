@@ -2,7 +2,7 @@
   "schema": "project-state.v1",
   "updated": "2026-09-05",
   "maintained_by": "hand until the CI document-consistency gate lands; README.md and docs/CURRENT.md current-status text must be verified against this file",
-  "head_commit": "9f159fafbe598500ebb1a4992231c8d1665cafce",
+  "head_commit": "(set below)",
   "code_commit": "050aa8e68f59c49d42b95e2a4d38fa37234a1e78",
   "ci": {
     "head_commit": "green",
@@ -49,7 +49,9 @@
     "CRASH-RESUME-01 (partial): real child-process kill points at checkpoint-after-temp-write and turn-before-commit-barrier with crash/resume acceptance (5f94dc7)",
     "PRODUCT-PROFILE-01: strict provider env parsing, SamplingPolicy operating point, ProviderProfile + provider_profile_digest in the startup banner (d21b686)",
     "TUI transcript bounded at 400 rows through a single push path (ca6db07)",
-    "CRASH-RESUME-01 completed: all four kill points (effect prepare, effect apply-before-ack, checkpoint temp-write, turn barrier) with a real child-process crash matrix (9f159fa)"
+    "CRASH-RESUME-01 completed: all four kill points (effect prepare, effect apply-before-ack, checkpoint temp-write, turn barrier) with a real child-process crash matrix (9f159fa)",
+    "TUI approval detail (risk + per-argument breakdown) and visible Lagged-event warnings (dc15079)",
+    "PACKAGE-01 base: dist.sh/dist.ps1 release packaging with SHA256SUMS, Windows path validated by a real run (072b185)"
   ],
   "default_context": "dynamic-in-process",
   "experimental": [

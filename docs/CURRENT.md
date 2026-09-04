@@ -40,12 +40,16 @@ Formal verdicts live only in the immutable
   + profile digest (`PRODUCT-PROFILE-01`, `d21b686`); bounded TUI
   transcript (`ca6db07`). Checked model configuration landed earlier
   (`32ea622`).
+- Landed later 2026-09-05: approval prompts name the risk and each
+  argument; broadcast Lagged events surface a visible warning;
+  `scripts/dist.{sh,ps1}` package the release binary with SHA256SUMS
+  (Windows path validated by a real run).
 - Next product queue (order per [`ROADMAP.md`](ROADMAP.md#route-to-a-usable-local-agent)
   and the 2026-09-05 code review, [`reviews/2026-09-05-code-review.md`](reviews/2026-09-05-code-review.md)):
-  approval detail in the TUI prompt + Lagged resync via the status
-  projection; proof refresh as a cancellable operation (actor
-  completion-path surgery, own session); packaging and clean-machine
-  doctor. The crash kill matrix is complete at all four boundaries.
+  proof refresh as a cancellable operation (the one open alpha item;
+  split points recorded in [`AUDIT_TODO.md`](AUDIT_TODO.md)); Linux
+  dist validation, install notes, packaged-binary CI smoke and the
+  clean-machine doctor at the V1 gate.
 - Default context is dynamic in-process. `context-service`,
   completion-opportunity, settlement-projection and recovery-surface remain
   experimental.
