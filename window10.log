@@ -1,0 +1,241 @@
+eval env: eval.env model=gpt-5.6-luna base=https://api.pinaic.com/v1 protocol=responses key=present
+evidence dir: crates/agent-eval/evidence/m15-window
+== m15 retry_diag_dev normal repeat 1/2 ==
+retry_diag_dev normal PASS profile=m15_v1 behavior=pass diff=pass closure=active continuation=n/a provider=healthy rounds=17+0 resumes=7 durables=7 trigger=fs.write opp=off recovery=off task_progress=on settlement_projection=off settled=none
+  dynamic  outcome=passed passed=true wall_ms=206500 rounds=17 tools=24 search=0/0 empty=0 p50_ms=0 lagged=0 usage_incomplete=false tokens_lower_bound=false
+           forgotten=21 recovered=0 search=0 reactivate=0 reread=2 failed=5 compact=0/0
+           hidden kind=retry_pilot_oracle passed=true replay_complete=true asserts=5/6
+           diagnostic marker MISS src/backoff.rs shift corrected and overflow-safe []
+           tool edit.patch calls=6 failed=2
+           tool fs.list calls=1 failed=0
+           tool fs.read calls=4 failed=0
+           tool fs.write calls=1 failed=0
+           tool git.diff calls=3 failed=0
+           tool git.status calls=4 failed=0
+           tool search.grep calls=1 failed=0
+           tool task.complete calls=1 failed=1
+           tool verify.run calls=3 failed=2
+
+== m15 retry_diag_dev resume repeat 1/2 ==
+retry_diag_dev resume PASS profile=m15_v1 behavior=pass diff=pass closure=active continuation=restored_and_continued provider=healthy rounds=5+8 resumes=4 durables=4 trigger=edit.patch opp=off recovery=off task_progress=on settlement_projection=off settled=none
+  dynamic  outcome=passed passed=true wall_ms=149911 rounds=13 tools=26 search=0/0 empty=0 p50_ms=0 lagged=0 usage_incomplete=true tokens_lower_bound=true
+           forgotten=12 recovered=0 search=0 reactivate=0 reread=4 failed=0 compact=0/0
+           hidden kind=retry_pilot_oracle passed=true replay_complete=true asserts=5/6
+           diagnostic marker MISS src/backoff.rs shift corrected and overflow-safe []
+           tool edit.patch calls=3 failed=0
+           tool fs.list calls=2 failed=0
+           tool fs.read calls=10 failed=0
+           tool fs.write calls=1 failed=0
+           tool git.diff calls=3 failed=0
+           tool git.status calls=3 failed=0
+           tool search.grep calls=2 failed=0
+           tool verify.run calls=2 failed=0
+
+== m15 retry_diag_dev normal repeat 2/2 ==
+retry_diag_dev normal PASS profile=m15_v1 behavior=pass diff=pass closure=active continuation=n/a provider=healthy rounds=7+0 resumes=2 durables=2 trigger=edit.patch opp=off recovery=off task_progress=on settlement_projection=off settled=none
+  dynamic  outcome=passed passed=true wall_ms=209564 rounds=7 tools=11 search=0/0 empty=0 p50_ms=0 lagged=0 usage_incomplete=false tokens_lower_bound=false
+           forgotten=7 recovered=0 search=0 reactivate=0 reread=0 failed=0 compact=0/0
+           hidden kind=retry_pilot_oracle passed=true replay_complete=true asserts=5/6
+           diagnostic marker MISS src/backoff.rs shift corrected and overflow-safe []
+           tool edit.patch calls=1 failed=0
+           tool fs.read calls=4 failed=0
+           tool fs.write calls=1 failed=0
+           tool git.diff calls=1 failed=0
+           tool git.status calls=2 failed=0
+           tool search.grep calls=1 failed=0
+           tool verify.run calls=1 failed=0
+
+== m15 retry_diag_dev resume repeat 2/2 ==
+retry_diag_dev resume PASS profile=m15_v1 behavior=pass diff=pass closure=active continuation=restored_and_continued provider=healthy rounds=4+13 resumes=7 durables=7 trigger=edit.patch opp=off recovery=off task_progress=on settlement_projection=off settled=none
+  dynamic  outcome=passed passed=true wall_ms=382008 rounds=17 tools=30 search=0/0 empty=0 p50_ms=0 lagged=0 usage_incomplete=false tokens_lower_bound=false
+           forgotten=14 recovered=0 search=0 reactivate=0 reread=6 failed=2 compact=0/0
+           hidden kind=retry_pilot_oracle passed=true replay_complete=true asserts=5/6
+           diagnostic marker MISS src/backoff.rs shift corrected and overflow-safe []
+           tool capability.manage calls=2 failed=0
+           tool edit.patch calls=5 failed=1
+           tool fs.list calls=1 failed=0
+           tool fs.read calls=10 failed=0
+           tool fs.write calls=1 failed=0
+           tool git.diff calls=3 failed=0
+           tool git.status calls=3 failed=0
+           tool search.grep calls=2 failed=0
+           tool task.complete calls=1 failed=1
+           tool task.manage calls=1 failed=0
+           tool verify.run calls=1 failed=0
+
+== m15 retry_migrate_dev normal repeat 1/2 ==
+retry_migrate_dev normal PASS profile=m15_v1 behavior=pass diff=pass closure=active continuation=n/a provider=healthy rounds=8+0 resumes=4 durables=4 trigger=fs.write opp=off recovery=off task_progress=on settlement_projection=off settled=none
+  dynamic  outcome=passed passed=true wall_ms=220242 rounds=8 tools=20 search=0/0 empty=0 p50_ms=0 lagged=0 usage_incomplete=false tokens_lower_bound=false
+           forgotten=13 recovered=0 search=0 reactivate=0 reread=4 failed=2 compact=0/0
+           hidden kind=retry_pilot_oracle passed=true replay_complete=true asserts=8/8
+           hidden CMD FAIL ["cargo", "test", "--quiet"]
+           tool edit.patch calls=2 failed=1
+           tool fs.list calls=1 failed=0
+           tool fs.read calls=10 failed=0
+           tool fs.write calls=1 failed=0
+           tool git.diff calls=1 failed=0
+           tool git.status calls=2 failed=0
+           tool search.grep calls=1 failed=0
+           tool task.complete calls=1 failed=1
+           tool verify.run calls=1 failed=0
+
+== m15 retry_migrate_dev resume repeat 1/2 ==
+retry_migrate_dev resume PASS profile=m15_v1 behavior=pass diff=pass closure=active continuation=restored_and_continued provider=healthy rounds=4+12 resumes=7 durables=7 trigger=fs.write opp=off recovery=off task_progress=on settlement_projection=off settled=none
+  dynamic  outcome=passed passed=true wall_ms=433062 rounds=16 tools=34 search=0/0 empty=0 p50_ms=0 lagged=0 usage_incomplete=false tokens_lower_bound=false
+           forgotten=16 recovered=0 search=0 reactivate=0 reread=8 failed=3 compact=0/0
+           hidden kind=retry_pilot_oracle passed=true replay_complete=true asserts=8/8
+           hidden CMD FAIL ["cargo", "test", "--quiet"]
+           tool capability.manage calls=2 failed=0
+           tool edit.patch calls=4 failed=2
+           tool fs.list calls=2 failed=0
+           tool fs.read calls=14 failed=0
+           tool fs.write calls=1 failed=0
+           tool git.diff calls=2 failed=0
+           tool git.status calls=2 failed=0
+           tool search.grep calls=4 failed=0
+           tool task.complete calls=1 failed=1
+           tool task.manage calls=1 failed=0
+           tool verify.run calls=1 failed=0
+
+== m15 retry_migrate_dev normal repeat 2/2 ==
+retry_migrate_dev normal PASS profile=m15_v1 behavior=pass diff=pass closure=active continuation=n/a provider=healthy rounds=7+0 resumes=3 durables=3 trigger=fs.write opp=off recovery=off task_progress=on settlement_projection=off settled=none
+  dynamic  outcome=passed passed=true wall_ms=118369 rounds=7 tools=14 search=0/0 empty=0 p50_ms=0 lagged=0 usage_incomplete=false tokens_lower_bound=false
+           forgotten=8 recovered=0 search=0 reactivate=0 reread=0 failed=1 compact=0/0
+           hidden kind=retry_pilot_oracle passed=true replay_complete=true asserts=8/8
+           hidden CMD FAIL ["cargo", "test", "--quiet"]
+           tool edit.patch calls=1 failed=0
+           tool fs.list calls=1 failed=0
+           tool fs.read calls=5 failed=0
+           tool fs.write calls=1 failed=0
+           tool git.diff calls=1 failed=0
+           tool git.status calls=2 failed=0
+           tool search.grep calls=1 failed=0
+           tool task.complete calls=1 failed=1
+           tool verify.run calls=1 failed=0
+
+== m15 retry_migrate_dev resume repeat 2/2 ==
+retry_migrate_dev resume PASS profile=m15_v1 behavior=pass diff=pass closure=active continuation=restored_and_continued provider=healthy rounds=5+7 resumes=5 durables=5 trigger=fs.write opp=off recovery=off task_progress=on settlement_projection=off settled=none
+  dynamic  outcome=passed passed=true wall_ms=165815 rounds=12 tools=27 search=0/0 empty=0 p50_ms=0 lagged=0 usage_incomplete=true tokens_lower_bound=true
+           forgotten=10 recovered=0 search=0 reactivate=0 reread=6 failed=1 compact=0/0
+           hidden kind=retry_pilot_oracle passed=true replay_complete=true asserts=8/8
+           hidden CMD FAIL ["cargo", "test", "--quiet"]
+           tool edit.patch calls=2 failed=0
+           tool fs.list calls=1 failed=0
+           tool fs.read calls=12 failed=0
+           tool fs.write calls=1 failed=0
+           tool git.diff calls=2 failed=0
+           tool git.status calls=3 failed=0
+           tool search.grep calls=3 failed=0
+           tool task.complete calls=1 failed=1
+           tool verify.run calls=2 failed=0
+
+== m15 retry_policy_dev normal repeat 1/2 ==
+retry_policy_dev normal PASS profile=m15_v1 behavior=pass diff=pass closure=completed continuation=n/a provider=healthy rounds=33+0 resumes=11 durables=12 trigger=edit.patch opp=off recovery=off task_progress=on settlement_projection=off settled=seen episodes=1 episode_rounds=1 episode_calls=1 episode_failures=0
+  dynamic  outcome=passed passed=true wall_ms=562563 rounds=33 tools=62 search=1/0 empty=1 p50_ms=12 lagged=0 usage_incomplete=false tokens_lower_bound=false
+           forgotten=61 recovered=0 search=0 reactivate=0 reread=12 failed=6 compact=0/0
+           hidden kind=retry_pilot_oracle passed=true replay_complete=true asserts=3/6
+           diagnostic marker MISS src/error.rs transient classification implemented []
+           diagnostic marker MISS src/lib.rs retry loop bounds on max_attempts []
+           diagnostic marker MISS src/lib.rs delay growth saturates at max_delay_ms []
+           tool capability.manage calls=7 failed=0
+           tool edit.patch calls=9 failed=6
+           tool fs.list calls=4 failed=0
+           tool fs.mkdir calls=2 failed=0
+           tool fs.read calls=19 failed=0
+           tool fs.write calls=3 failed=0
+           tool git.diff calls=4 failed=0
+           tool git.status calls=5 failed=0
+           tool search.grep calls=1 failed=0
+           tool shell.exec calls=4 failed=0
+           tool task.complete calls=1 failed=0
+           tool verify.run calls=3 failed=0
+
+== m15 retry_policy_dev resume repeat 1/2 ==
+retry_policy_dev resume PASS profile=m15_v1 behavior=pass diff=pass closure=completed continuation=restored_and_continued provider=healthy rounds=4+30 resumes=13 durables=14 trigger=edit.patch opp=off recovery=off task_progress=on settlement_projection=off settled=seen episodes=2 episode_rounds=2 episode_calls=2 episode_failures=0
+  dynamic  outcome=passed passed=true wall_ms=458460 rounds=34 tools=75 search=2/6 empty=0 p50_ms=5 lagged=0 usage_incomplete=false tokens_lower_bound=false
+           forgotten=62 recovered=0 search=0 reactivate=0 reread=20 failed=5 compact=0/0
+           hidden kind=retry_pilot_oracle passed=true replay_complete=true asserts=3/6
+           diagnostic marker MISS src/error.rs transient classification implemented []
+           diagnostic marker MISS src/lib.rs retry loop bounds on max_attempts []
+           diagnostic marker MISS src/lib.rs delay growth saturates at max_delay_ms []
+           tool capability.manage calls=6 failed=0
+           tool edit.patch calls=11 failed=4
+           tool fs.list calls=3 failed=0
+           tool fs.mkdir calls=1 failed=0
+           tool fs.read calls=28 failed=0
+           tool fs.write calls=1 failed=0
+           tool git.diff calls=6 failed=0
+           tool git.status calls=7 failed=0
+           tool search.grep calls=1 failed=0
+           tool shell.exec calls=5 failed=1
+           tool task.complete calls=1 failed=0
+           tool verify.run calls=5 failed=0
+
+== m15 retry_policy_dev normal repeat 2/2 ==
+retry_policy_dev normal PASS profile=m15_v1 behavior=pass diff=pass closure=completed continuation=n/a provider=healthy rounds=20+0 resumes=9 durables=10 trigger=edit.patch opp=off recovery=off task_progress=on settlement_projection=off settled=seen episodes=1 episode_rounds=0 episode_calls=0 episode_failures=0
+  dynamic  outcome=passed passed=true wall_ms=250329 rounds=20 tools=40 search=0/0 empty=0 p50_ms=0 lagged=0 usage_incomplete=false tokens_lower_bound=false
+           forgotten=42 recovered=0 search=0 reactivate=0 reread=8 failed=3 compact=0/0
+           hidden kind=retry_pilot_oracle passed=true replay_complete=true asserts=3/6
+           diagnostic marker MISS src/error.rs transient classification implemented []
+           diagnostic marker MISS src/lib.rs retry loop bounds on max_attempts []
+           diagnostic marker MISS src/lib.rs delay growth saturates at max_delay_ms []
+           tool capability.manage calls=1 failed=0
+           tool edit.patch calls=3 failed=2
+           tool fs.list calls=3 failed=0
+           tool fs.mkdir calls=1 failed=0
+           tool fs.read calls=14 failed=0
+           tool fs.write calls=5 failed=0
+           tool git.diff calls=3 failed=0
+           tool git.status calls=4 failed=0
+           tool search.grep calls=2 failed=0
+           tool task.complete calls=1 failed=0
+           tool verify.run calls=3 failed=1
+
+== m15 retry_policy_dev resume repeat 2/2 ==
+retry_policy_dev resume PASS profile=m15_v1 behavior=pass diff=pass closure=active continuation=restored_and_continued provider=healthy rounds=6+22 resumes=12 durables=12 trigger=edit.patch opp=off recovery=off task_progress=on settlement_projection=off settled=none
+  dynamic  outcome=passed passed=true wall_ms=417801 rounds=28 tools=62 search=2/2 empty=0 p50_ms=3 lagged=0 usage_incomplete=true tokens_lower_bound=true
+           forgotten=40 recovered=0 search=0 reactivate=0 reread=12 failed=3 compact=0/0
+           hidden kind=retry_pilot_oracle passed=true replay_complete=true asserts=3/6
+           diagnostic marker MISS src/error.rs transient classification implemented []
+           diagnostic marker MISS src/lib.rs retry loop bounds on max_attempts []
+           diagnostic marker MISS src/lib.rs delay growth saturates at max_delay_ms []
+           tool capability.manage calls=6 failed=0
+           tool edit.patch calls=5 failed=1
+           tool edit.replace calls=1 failed=0
+           tool fs.list calls=4 failed=0
+           tool fs.mkdir calls=1 failed=0
+           tool fs.read calls=19 failed=0
+           tool fs.write calls=1 failed=0
+           tool git.diff calls=6 failed=0
+           tool git.status calls=5 failed=0
+           tool process.run calls=3 failed=1
+           tool search.grep calls=3 failed=0
+           tool task.complete calls=1 failed=1
+           tool task.manage calls=1 failed=0
+           tool verify.run calls=6 failed=0
+
+# M15 development window — PASS
+
+Schema `m15-window.v2`. Generated mechanically from content-addressed cell bundles.
+
+| cell | behavior | diff | closure | continuation | provider | rounds | tools | wall ms | verdict |
+| --- | --- | --- | --- | --- | --- | ---: | ---: | ---: | --- |
+| retry_diag_dev normal r1 | pass | pass | active | n/a | healthy | 17 | 24 | 206500 | pass |
+| retry_diag_dev normal r2 | pass | pass | active | n/a | healthy | 7 | 11 | 209564 | pass |
+| retry_diag_dev resume r1 | pass | pass | active | restored_and_continued | healthy | 13 | 26 | 149911 | pass |
+| retry_diag_dev resume r2 | pass | pass | active | restored_and_continued | healthy | 17 | 30 | 382008 | pass |
+| retry_migrate_dev normal r1 | pass | pass | active | n/a | healthy | 8 | 20 | 220242 | pass |
+| retry_migrate_dev normal r2 | pass | pass | active | n/a | healthy | 7 | 14 | 118369 | pass |
+| retry_migrate_dev resume r1 | pass | pass | active | restored_and_continued | healthy | 16 | 34 | 433062 | pass |
+| retry_migrate_dev resume r2 | pass | pass | active | restored_and_continued | healthy | 12 | 27 | 165815 | pass |
+| retry_policy_dev normal r1 | pass | pass | completed | n/a | healthy | 33 | 62 | 562563 | pass |
+| retry_policy_dev normal r2 | pass | pass | completed | n/a | healthy | 20 | 40 | 250329 | pass |
+| retry_policy_dev resume r1 | pass | pass | completed | restored_and_continued | healthy | 34 | 75 | 458460 | pass |
+| retry_policy_dev resume r2 | pass | pass | active | restored_and_continued | healthy | 28 | 62 | 417801 | pass |
+
+Summary: pass 12/12; NOT_RUN 0/12; behavior pass 12/12; closures 3/12.
+
+Efficiency facts: rounds total/max 212/34; tool calls total/max 425/75; wall max 562563 ms; provider input/output tokens 2178893/81209 (cached input 112640); schema tokens 224112. Token totals remain lower bounds when a cell's summary marks provider usage incomplete.
+window evidence: crates/agent-eval/evidence/m15-window\_windows\1788539149184
+mechanical window verdict: PASS
+EXIT=0

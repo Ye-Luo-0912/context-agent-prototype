@@ -126,9 +126,20 @@ not a new planner, TaskGraph, database or multi-Agent layer.
   mechanically regenerated report is the only accepted verdict; valid
   FAIL rejects the candidate, and only a typed NOT_RUN permits a
   whole-window rerun.
-- Formal M15 remains open. Ten v4 windows are banked (eight valid FAILs,
-  one censored, one authorized rerun); the latest mechanical report is the
-  ninth window's 11/12 with 0 NOT_RUN — policy 4/4 for the first time and
+- **M15 closed at its frozen gate 2026-09-04.** The tenth v4 window ran
+  from the clean worktree at `a882789` and returned the mechanical verdict
+  **PASS: 12/12, 0 NOT_RUN** (report `_windows/1788539149184`, committed):
+  diag 4/4, migrate 4/4, policy 4/4 with three closure=completed cells,
+  provider healthy everywhere, 212 rounds / max 34, wall max 562,563 ms.
+  M15_ACCEPTANCE §4 closure conditions: every banked plane remains valid,
+  the development plane passes, the bundles and generated report are
+  committed, and no acceptance-path defect remains unresolved. All nine
+  prior FAIL/censored windows stay immutable diagnostics. The post-M15
+  order is `LT-EVAL-06` + the packaged V1 release gate, then the product
+  phases in [`ROADMAP.md`](ROADMAP.md#route-to-a-usable-local-agent).
+- Historical: ten v4 windows are banked (eight valid FAILs,
+  one censored, one authorized rerun); the ninth window's 11/12 with 0
+  NOT_RUN — policy 4/4 for the first time and
   a single stochastic diag overflow-edge miss. The two stochastic surfaces
   (diag `checked_shl` trap, policy completion-gate tail) have each passed
   4/4 in some window but never simultaneously; every infrastructure cause

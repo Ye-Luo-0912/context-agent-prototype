@@ -67,9 +67,11 @@ Do not duplicate those lists here. Do not treat
    core is a freeze candidate: do not retune GC thresholds or reactivation
    scoring; do not add a learned router. M12/M13 mechanism substrate is
    implemented with clean-tree closure-audit evidence banked (2026-08-27);
-   the 2026-08-31 audit defects are repaired on `615b5ed..6fdb4f0`, but the
-   closure claims stay suspended until the M15-facing exits in
-   `docs/STATUS.md` are recorded. Do not claim M15 or V2 closed.
+   the 2026-08-31 audit defects are repaired on `615b5ed..6fdb4f0`, and the
+   M15-facing exits are recorded in `docs/STATUS.md`. M15 closed at its
+   frozen gate on the tenth v4 window (12/12, `a882789`+`050aa8e` lineage;
+   see `docs/STATUS.md`); V2 Self-Iteration remains a separately gated
+   phase, not an open invitation.
 
 ## Architecture and dependencies
 
@@ -187,9 +189,9 @@ error/fix state.
 ## Delivery order
 
 See [`docs/ROADMAP.md`](docs/ROADMAP.md) and [`docs/STATUS.md`](docs/STATUS.md).
-M12/M13 evidence stays banked with closure claims suspended (see
-`GOV-STATUS-01` in [`docs/AUDIT_TODO.md`](docs/AUDIT_TODO.md)); Self-Iteration
-remains blocked behind M15. Context live `context-mech.v2` (12 cells) evidence is
+M12/M13 evidence stays banked (closure claims restored when the
+M15-facing exits closed); Self-Iteration remains a separately gated phase
+per `docs/ROADMAP.md`. Context live `context-mech.v2` (12 cells) evidence is
 under `crates/agent-eval/evidence/context-mech/`; do not retune GC from
 it. `add_test` is Tool Surface, not Context.
 

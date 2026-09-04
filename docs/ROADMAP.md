@@ -53,8 +53,8 @@ evidence-triggered candidates after the simpler product has passed its gates.
 | M12 Effect Runtime | 🧾 closure-audit evidence banked; recovery P0 repaired, claims suspended | The clean-tree evidence table remains immutable. `EFFECT-ACK-CLASS-01` (typed settlements, journal v2, no-strengthening recovery) and `PROCESS-COORDINATOR-01` (bounded coordinator wire) are repaired in `6112ffd`/`43eb87b`. No new closure claim until the recorded 2026-09-03 doc tranche and the M15-facing exits land. Details: [`PLATFORM_SECURITY.md`](PLATFORM_SECURITY.md). |
 | M13 Extension Sandbox | 🧾 closure-audit evidence banked; attestation P0 repaired, claims suspended | The clean-tree audit remains immutable. `SANDBOX-ATTEST-TRUNCATE-01` is repaired in `e5e712f` (write-floor attestation only at enforcing ABIs). Universal native `UntrustedGenerated` availability is not V1 and WASI remains V2. No new closure claim until the recorded 2026-09-03 doc tranche and the M15-facing exits land. Details: [`PLATFORM_SECURITY.md`](PLATFORM_SECURITY.md). |
 | M14 Resource Policy | ✅ | Schema/context quotas, standing grants, output broker, authority leases. Further typed policy is not a reopen of this gate. |
-| M15 Real Evaluation | 🛑 open; nine v4 valid FAILs + one censored banked, latest 11/12 (best yet) | Windows remain immutable diagnostics. The ninth window (2026-09-04, source `6bf651b`, PinAI `gpt-5.6-luna` tuple, after the serving outage lifted) is a valid FAIL 11/12, 0 NOT_RUN — diag 3/4 (one stochastic overflow-edge miss), migrate 4/4, and policy 4/4 for the first time including two completed closures. Per M15_ACCEPTANCE §5 the bf52490 candidate is rejected and the window is not rerun. The two stochastic model-behavior surfaces have each swept 4/4 in some window but never simultaneously; all infrastructure causes are repaired and exonerated. A new candidate needs diagnosis, deterministic gates, a fresh preflight and a fresh predeclared window. Formal M15 remains 3 fixtures × normal/resume × 2 repeats, never settlement off/on. See [`M15_ACCEPTANCE.md`](M15_ACCEPTANCE.md). |
-| V2 Self-Iteration | 🔒 blocked | Until the governing M12/M13 status is reconciled and M15 closes. The agent may grow capabilities, never evaluation or permission Core authority. |
+| M15 Real Evaluation | ✅ closed at the frozen gate (2026-09-04) | The tenth v4 window (source `a882789` lineage, PinAI `gpt-5.6-luna` tuple) passed 12/12 with 0 NOT_RUN — diag 4/4, migrate 4/4, policy 4/4 with three completed closures — after its exact-source preflight passed on the CI-green clean source. All banked planes remain valid, the bundles and generated report are committed, and no acceptance-path defect remains unresolved (M15_ACCEPTANCE §4). All nine prior FAIL/censored windows stay immutable diagnostics. Next: `LT-EVAL-06` + the packaged V1 release gate. |
+| V2 Self-Iteration | 🔒 separately gated | M15 closed 2026-09-04; Self-Iteration is no longer blocked by it, but remains a separately proposed and accepted phase (never evaluation or permission Core authority). |
 
 Open gate order (post-repair, updated 2026-09-03): ~~M10 fault-gate re-audit
 record~~ (recorded) → ~~wire the typed retry observer into the formal
@@ -205,8 +205,9 @@ TaskGraph remains conditional on recurring breadth evidence and starts
 serially if accepted; a Chronicle is not automatically required. Worker
 parallelism, multi-Agent delegation and recursive improvement stay later
 because they add workspace conflicts, leases, consistent-cut checkpointing and
-promotion authority. M12/M13 claims remain suspended as recorded above, and
-Self-Iteration remains blocked by the governing gates.
+promotion authority. M12/M13 closure claims are restored as recorded above,
+and Self-Iteration is unblocked by M15 but remains a separately proposed and
+accepted phase.
 
 ## Historical implementation notes (non-ordering)
 
