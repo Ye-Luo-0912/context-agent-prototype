@@ -1,6 +1,6 @@
 use agent_contracts::{
     ContextDiagnostics, ContextSelection, ContextStateTransition, OperationId, RunId, RuntimeEvent,
-    RuntimeEventEnvelope, RuntimeInputId, ToolSurfaceBlockReason, ToolSurfaceDemand,
+    RuntimeEventEnvelope, RuntimeInputId, TaskId, ToolSurfaceBlockReason, ToolSurfaceDemand,
     ToolSurfacePlanReport, ToolSurfacePlanStatus, TurnId,
 };
 use agent_core::ApprovalRequest;
@@ -176,6 +176,12 @@ pub struct AppState {
     current_op: Option<(TurnId, OperationId, u64)>,
     /// Queued 然后 Applied 共用 input_id，避免用户气泡重复。
     last_shown_input_id: Option<RuntimeInputId>,
+    /// Bounded event-derived status projection: the task the runtime
+    /// currently anchors, and how many effect-ack debts remain unresolved.
+    /// `/status` renders these; nothing here drives effects.
+    pub current_task: Option<(TaskId, u64)>,
+    pub unresolved_ack_debts: usize,
+    pub last_checkpoint: Option<String>,
 }
 
 impl AppState {
@@ -185,7 +191,7 @@ impl AppState {
             input: String::new(),
             messages: vec![UiMessage {
                 role: UiRole::System,
-                content: "Prototype ready. /focus, /pin, /done, /context, /checkpoint, /cancel, /quit. Tab: context inspect. Try `demo: list files`.".into(),
+                content: "Prototype ready. /focus, /pin, /done, /context, /checkpoint, /checkpoints, /restore, /status, /cancel, /quit. Tab: context inspect. Try `demo: list files`.".into(),
             }],
             context: ContextDiagnostics::default(),
             context_selected: Vec::new(),
@@ -201,7 +207,35 @@ impl AppState {
             output_tokens: 0,
             current_op: None,
             last_shown_input_id: None,
+            current_task: None,
+            unresolved_ack_debts: 0,
+            last_checkpoint: None,
         }
+    }
+
+    /// The bounded `/status` read model: an event-derived snapshot of run,
+    /// task anchor, recovery debts and the last saved checkpoint. It never
+    /// drives effects and rebuilds from the same events on restart.
+    pub fn render_status(&self) -> Vec<String> {
+        let mut lines = vec![format!(
+            "run {} | status: {} | tokens in {} / out {}",
+            self.run_id, self.status, self.input_tokens, self.output_tokens
+        )];
+        match &self.current_task {
+            Some((task_id, revision)) => {
+                lines.push(format!("current task: {task_id} (anchor r{revision})"))
+            }
+            None => lines.push("current task: none".into()),
+        }
+        lines.push(format!(
+            "unresolved effect-ack debts: {}",
+            self.unresolved_ack_debts
+        ));
+        match &self.last_checkpoint {
+            Some(path) => lines.push(format!("last checkpoint: {path}")),
+            None => lines.push("last checkpoint: none this session".into()),
+        }
+        lines
     }
 
     pub fn push_system(&mut self, content: String) {
@@ -298,6 +332,7 @@ impl AppState {
                 changed_fields,
                 patch_kind,
             } => {
+                self.current_task = Some((task_id, revision));
                 // Bounded audit row: the event names the moved fields and
                 // the authority split (autonomous vs boundary), never the
                 // anchor content (which lives in the checkpoint).
@@ -316,6 +351,7 @@ impl AppState {
                 // task.manage 的确定性结果：拒绝时状态未变，reason 说明
                 // 类别（如过期基准修订），便于从事件流核对 CAS 结果。
                 if accepted {
+                    self.current_task = Some((task_id, anchor_revision));
                     if changed_fields.is_empty() {
                         self.push_system(format!(
                             "task {task_id} progress already current at r{anchor_revision}"
@@ -637,6 +673,7 @@ impl AppState {
                 anchor_revision,
                 summary,
             } => {
+                self.current_task = None;
                 self.push_system(format!(
                     "task {task_id} completed (anchor r{anchor_revision}): {summary}"
                 ));
@@ -692,6 +729,7 @@ impl AppState {
             RuntimeEvent::EffectAckDebt { debt } => {
                 self.busy = false;
                 self.status = "recovery_required".into();
+                self.unresolved_ack_debts = self.unresolved_ack_debts.saturating_add(1);
                 self.push_system(format!(
                     "effect {} acknowledged as {} but its acknowledgement is unresolved: {}",
                     debt.effect_id,
@@ -700,6 +738,7 @@ impl AppState {
                 ));
             }
             RuntimeEvent::EffectAckDebtResolved { debt, resolution } => {
+                self.unresolved_ack_debts = self.unresolved_ack_debts.saturating_sub(1);
                 let kind = match &resolution {
                     agent_contracts::EffectReconciliation::NotManaged => "not managed",
                     agent_contracts::EffectReconciliation::NotApplied { .. } => "not applied",
@@ -1130,5 +1169,79 @@ mod tests {
         assert_eq!(user_bubbles.len(), 1);
         assert_eq!(user_bubbles[0].content, "later");
         assert!(app.busy);
+    }
+}
+
+#[cfg(test)]
+mod status_projection_tests {
+    use super::*;
+    use agent_contracts::EffectReconciliation;
+
+    #[test]
+    fn status_projection_tracks_task_debts_and_checkpoint() {
+        let run_id = RunId::new();
+        let mut app = AppState::new(run_id);
+        assert!(app.current_task.is_none());
+        assert_eq!(app.unresolved_ack_debts, 0);
+
+        app.apply_runtime_event(envelope(
+            1,
+            RuntimeEvent::TaskAnchorChanged {
+                task_id: TaskId::new(),
+                revision: 3,
+                changed_fields: vec!["plan_progress".into()],
+                patch_kind: agent_contracts::AnchorPatchKind::Autonomous,
+            },
+        ));
+        assert!(app.current_task.is_some());
+
+        app.apply_runtime_event(envelope(
+            2,
+            RuntimeEvent::EffectAckDebt {
+                debt: serde_json::from_value(serde_json::json!({
+                    "operation_id": agent_contracts::OperationId::new(),
+                    "effect_id": agent_contracts::EffectId::new(),
+                    "reservation_id": "pass/1",
+                    "settlement": { "kind": "applied", "durability": "Durable" },
+                    "error": "ack lost",
+                }))
+                .unwrap(),
+            },
+        ));
+        assert_eq!(app.unresolved_ack_debts, 1);
+
+        app.apply_runtime_event(envelope(
+            3,
+            RuntimeEvent::EffectAckDebtResolved {
+                debt: serde_json::from_value(serde_json::json!({
+                    "operation_id": agent_contracts::OperationId::new(),
+                    "effect_id": agent_contracts::EffectId::new(),
+                    "reservation_id": "pass/1",
+                    "settlement": { "kind": "applied", "durability": "Durable" },
+                    "error": "ack lost",
+                }))
+                .unwrap(),
+                resolution: EffectReconciliation::NotApplied {
+                    evidence: Some("never dispatched".into()),
+                },
+            },
+        ));
+        assert_eq!(app.unresolved_ack_debts, 0);
+
+        app.last_checkpoint = Some("cp.json".into());
+        let lines = app.render_status();
+        let joined = lines.join("\n");
+        assert!(joined.contains("current task:") && !joined.contains("none"));
+        assert!(joined.contains("unresolved effect-ack debts: 0"));
+        assert!(joined.contains("last checkpoint: cp.json"));
+    }
+
+    fn envelope(seq: u64, event: RuntimeEvent) -> RuntimeEventEnvelope {
+        RuntimeEventEnvelope {
+            run_id: RunId::new(),
+            seq,
+            timestamp_ms: seq,
+            event,
+        }
     }
 }

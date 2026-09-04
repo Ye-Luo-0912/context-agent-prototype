@@ -434,6 +434,12 @@ async fn run_ui(
                         });
                         continue;
                     }
+                    if trimmed == "/status" {
+                        for line in app.render_status() {
+                            app.push_system(line);
+                        }
+                        continue;
+                    }
                     if trimmed == "/checkpoints" {
                         // Bounded newest-first listing of the checkpoint
                         // store, so save/list/resume is discoverable from
@@ -486,11 +492,14 @@ async fn run_ui(
                                     continue;
                                 }
                                 match tokio::fs::write(&path, bytes).await {
-                                    Ok(()) => app.push_system(format!(
-                                        "checkpoint saved ({} tasks): {}",
-                                        checkpoint.tasks.tasks.len(),
-                                        path.display()
-                                    )),
+                                    Ok(()) => {
+                                        app.last_checkpoint = Some(path.display().to_string());
+                                        app.push_system(format!(
+                                            "checkpoint saved ({} tasks): {}",
+                                            checkpoint.tasks.tasks.len(),
+                                            path.display()
+                                        ))
+                                    }
                                     Err(error) => {
                                         app.push_system(format!("checkpoint write failed: {error}"))
                                     }
