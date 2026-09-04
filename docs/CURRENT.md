@@ -42,9 +42,10 @@ Formal verdicts live only in the immutable
   (`32ea622`).
 - Next product queue (order per [`ROADMAP.md`](ROADMAP.md#route-to-a-usable-local-agent)
   and the 2026-09-05 code review, [`reviews/2026-09-05-code-review.md`](reviews/2026-09-05-code-review.md)):
-  Runtime-owned status snapshot (digest persistence rides it); proof
-  refresh as a cancellable operation; effect-broker crash failpoints;
-  approval detail + Lagged resync; packaging and clean-machine doctor.
+  approval detail in the TUI prompt + Lagged resync via the status
+  projection; proof refresh as a cancellable operation (actor
+  completion-path surgery, own session); packaging and clean-machine
+  doctor. The crash kill matrix is complete at all four boundaries.
 - Default context is dynamic in-process. `context-service`,
   completion-opportunity, settlement-projection and recovery-surface remain
   experimental.
