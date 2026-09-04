@@ -94,6 +94,35 @@ pub struct OpenAiConfig {
     /// both send and pack. Live eval/TUI should set this so a tool-loop
     /// turn is sendable while C still packs to the kernel working-set cap.
     pub context_window: Option<usize>,
+    /// Sampling operating point sent on every request. The default keeps
+    /// the wire free of sampling fields (the historical behavior: the
+    /// server-side default decided, unrecorded); a pinned temperature is
+    /// declared in the profile identity and sent on every request.
+    pub sampling: SamplingPolicy,
+}
+
+/// Explicit sampling operating point for the wire request.
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub enum SamplingPolicy {
+    /// Send no sampling fields; the provider-side default decides. This is
+    /// a declared operating point, not an accident: profiles that choose it
+    /// say so in their digest.
+    #[default]
+    ProviderDefault,
+    /// Pin `temperature` on every request (the OpenAI-compatible 0.0..=2.0
+    /// range). Endpoints that reject the field fail the request visibly
+    /// instead of being silently misconfigured.
+    Temperature(f32),
+}
+
+impl SamplingPolicy {
+    /// Human-readable identity used in profile banners and digests.
+    pub fn description(self) -> String {
+        match self {
+            Self::ProviderDefault => "provider-default".into(),
+            Self::Temperature(temperature) => format!("temperature={temperature}"),
+        }
+    }
 }
 
 /// Cap on the provider error body carried in the error string, so a huge
@@ -723,6 +752,9 @@ fn build_chat_wire_request(
     if config.send_max_tokens {
         wire["max_tokens"] = json!(config.max_output_tokens);
     }
+    if let SamplingPolicy::Temperature(temperature) = config.sampling {
+        wire["temperature"] = json!(temperature);
+    }
     wire
 }
 
@@ -789,6 +821,9 @@ fn build_responses_wire_request(
     if config.send_max_tokens {
         wire["max_output_tokens"] = json!(config.max_output_tokens);
     }
+    if let SamplingPolicy::Temperature(temperature) = config.sampling {
+        wire["temperature"] = json!(temperature);
+    }
     wire
 }
 
@@ -853,10 +888,21 @@ mod tests {
             send_max_tokens: true,
             max_stream_bytes: DEFAULT_MAX_STREAM_BYTES,
             context_window: None,
+            sampling: SamplingPolicy::default(),
         };
         let codec = ToolNameCodec::from_request(&request).expect("no name collision");
         let wire = build_chat_wire_request(&request, &config, &codec);
         assert_eq!(wire["model"], "deepseek-chat");
+        // ProviderDefault keeps the wire free of sampling fields.
+        assert!(wire.get("temperature").is_none());
+        let pinned = OpenAiConfig {
+            sampling: SamplingPolicy::Temperature(0.3),
+            ..config
+        };
+        let wire = build_chat_wire_request(&request, &pinned, &codec);
+        assert_eq!(wire["temperature"], 0.3);
+        let responses_wire = build_responses_wire_request(&request, &pinned, &codec);
+        assert_eq!(responses_wire["temperature"], 0.3);
         assert_eq!(wire["stream"], true);
         assert_eq!(wire["stream_options"]["include_usage"], true);
         assert_eq!(wire["messages"][0]["role"], "system");
@@ -947,6 +993,7 @@ mod tests {
             send_max_tokens: false,
             max_stream_bytes: DEFAULT_MAX_STREAM_BYTES,
             context_window: None,
+            sampling: SamplingPolicy::default(),
         };
         let codec = ToolNameCodec::from_request(&request).expect("no name collision");
         let wire = build_chat_wire_request(&request, &config, &codec);
@@ -973,6 +1020,7 @@ mod tests {
             send_max_tokens: false,
             max_stream_bytes: DEFAULT_MAX_STREAM_BYTES,
             context_window: None,
+            sampling: SamplingPolicy::default(),
         }
     }
 
@@ -1599,6 +1647,7 @@ mod tests {
             send_max_tokens: true,
             max_stream_bytes: 512, // deliberately tiny cap
             context_window: None,
+            sampling: SamplingPolicy::default(),
         };
         let provider = OpenAiProvider::new(config);
         let request = ModelRequest {
@@ -1645,6 +1694,7 @@ mod tests {
             send_max_tokens: true,
             max_stream_bytes: 512,
             context_window: None,
+            sampling: SamplingPolicy::default(),
         };
         let provider = OpenAiProvider::new(config);
         let request = ModelRequest {

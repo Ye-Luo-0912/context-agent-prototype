@@ -99,7 +99,10 @@ async fn main() -> anyhow::Result<()> {
             eprintln!("demo mode: AGENT_DEMO=1 selected the explicit mock transport");
             mock
         }
-        agent_compose::ModelSelection::Provider(provider) => provider,
+        agent_compose::ModelSelection::Provider(provider, profile) => {
+            eprintln!("{}", profile.banner());
+            provider
+        }
     };
     let context_engine =
         build_context_engine(policy, workspace.state_dir(), Some(model.clone())).await?;
