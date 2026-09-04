@@ -82,9 +82,13 @@ the committed write appears exactly once (`changes.jsonl` + content), the
 torn temp residue is never listed as a checkpoint, the store stays
 usable, the uncommitted turn never resurrects on restart, and a
 post-recovery durable checkpoint verifies through `load_verified`. The
-child uses the product-real persistent reservation journal. **Residual:**
-the two effect-broker kill points (after effect prepare; after apply /
-before ACK) still need instrumenting inside the Core effect path.
+child uses the product-real persistent reservation journal. **Completed 2026-09-05 (same slice):**
+the two effect-broker kill points are instrumented in the journaled
+effect broker (`agent-core/src/broker.rs`, crate-local failpoint helper);
+the acceptance covers all four boundaries: Applied reconciles without
+re-execution, prepared-not-dispatched reconciles NotApplied across
+repeated restarts, torn checkpoint residue never lists, uncommitted turn
+never resurrects.
 
 Original finding, retained for the record:
 

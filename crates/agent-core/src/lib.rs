@@ -3,6 +3,7 @@ mod authority;
 mod broker;
 mod capability_admission;
 mod capability_state;
+mod crash;
 mod kernel;
 mod operation;
 mod plugin_admission;

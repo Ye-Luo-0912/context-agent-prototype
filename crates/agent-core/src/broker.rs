@@ -645,6 +645,9 @@ impl EffectBroker for JournaledEffectBroker {
     }
 
     async fn dispatch(&self, reserved: ReservedEffect) -> EffectReceipt {
+        // Durability acceptance kill point: staged and reserved, never
+        // dispatched.
+        crate::crash::failpoint("effect-after-prepare");
         let effect_id = reserved.reservation.effect_id;
         if let Err(error) = self.journal.record_dispatched(effect_id) {
             // 日志拒绝即不派发：先回滚已暂存效果，再如实报告未应用。
@@ -682,6 +685,9 @@ impl EffectBroker for JournaledEffectBroker {
                 ack.reservation_id
             )));
         };
+        // Durability acceptance kill point: the effect was applied, its
+        // durable acknowledgement is not yet recorded.
+        crate::crash::failpoint("effect-applied-before-ack");
         self.journal
             .record_acked(effect_id, ack.settlement.clone())?;
         self.inner.ack(ack).await

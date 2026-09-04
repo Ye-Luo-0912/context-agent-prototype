@@ -6,6 +6,12 @@
 //! write appears exactly once and the uncommitted suffix never resurrects.
 //!
 //! Covered kill points:
+//! - `effect-applied-before-ack`: the effect is on disk, its durable
+//!   acknowledgement is not — startup reconciliation must resolve Applied
+//!   without re-executing;
+//! - `effect-after-prepare`: staged and durably reserved but never
+//!   dispatched — reconciliation resolves NotApplied and nothing may
+//!   resurrect, on any number of restarts;
 //! - `checkpoint-after-temp-write`: the durable checkpoint write is torn
 //!   between the synced temp file and the atomic rename;
 //! - `turn-before-commit-barrier`: the finished turn is durable nowhere.
@@ -168,6 +174,75 @@ async fn wait_for(
             "the restarted runtime never {what}"
         );
         tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn crash_after_effect_apply_leaves_a_reconcilable_debt_not_a_duplicate() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path().to_path_buf();
+
+    run_crashing_child(&root, "effect-applied-before-ack").await;
+
+    // The effect was applied before the crash: the write is on disk with
+    // exactly one committed change row, and the broker journal holds the
+    // dispatched-but-unacked reservation for startup reconciliation.
+    assert_eq!(
+        std::fs::read_to_string(root.join("hello.txt")).unwrap(),
+        "hello from the crash flow"
+    );
+    assert_eq!(hello_change_rows(&root), 1);
+
+    // Restart: startup reconciliation resolves the pending reservation
+    // from the broker journal (Applied), so nothing re-executes.
+    let composed = compose(compose_config(&root).await.unwrap()).await.unwrap();
+    composed.instance.start().await.unwrap();
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    assert_eq!(
+        hello_change_rows(&root),
+        1,
+        "reconciliation must not re-run an applied effect"
+    );
+    assert_eq!(
+        std::fs::read_to_string(root.join("hello.txt")).unwrap(),
+        "hello from the crash flow"
+    );
+    composed.shutdown().await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn crash_after_prepare_reconciles_not_applied_without_resurrecting() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path().to_path_buf();
+
+    run_crashing_child(&root, "effect-after-prepare").await;
+
+    // The effect was staged and durably reserved but never dispatched:
+    // the file never lands, while the change journal already carries the
+    // attempt row written at preparation time.
+    assert!(
+        !root.join("hello.txt").exists(),
+        "an undispatched effect must not be applied before the crash"
+    );
+    assert_eq!(hello_change_rows(&root), 1);
+
+    // Restart: a reserved-but-never-dispatched effect reconciles to
+    // NotApplied — the runtime starts clean, nothing executes, the
+    // attempt row stays, and no later restart resurrects it.
+    for restart in 1..=2 {
+        let composed = compose(compose_config(&root).await.unwrap()).await.unwrap();
+        composed.instance.start().await.unwrap();
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        assert!(
+            !root.join("hello.txt").exists(),
+            "restart {restart} must not apply the undispatched effect"
+        );
+        assert_eq!(
+            hello_change_rows(&root),
+            1,
+            "restart {restart} must not re-execute or duplicate the attempt"
+        );
+        composed.shutdown().await.unwrap();
     }
 }
 
