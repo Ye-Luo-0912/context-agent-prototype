@@ -255,6 +255,7 @@ async fn provider_probe() -> DoctorStep {
         send_max_tokens: true,
         max_stream_bytes: provider_openai::DEFAULT_MAX_STREAM_BYTES,
         context_window: Some(context_window),
+        sampling: provider_openai::SamplingPolicy::default(),
     });
     let request = agent_contracts::ModelRequest {
         messages: vec![agent_contracts::ModelMessage {

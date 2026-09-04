@@ -109,6 +109,23 @@ commit barrier).
 
 ### P2-BLK-3 — Provider configuration silent fallbacks
 
+**Closed on source, 2026-09-05 (`PRODUCT-PROFILE-01`):** every provider
+variable now parses strictly — invalid `OPENAI_API_PROTOCOL`,
+`OPENAI_CONTEXT_WINDOW`, `OPENAI_MAX_OUTPUT_TOKENS` or `OPENAI_TEMPERATURE`
+is a startup error with the variable name, never a silent default
+(`max_output_tokens` is no longer hardcoded; default 4096, overridable).
+`SamplingPolicy` (provider-openai) makes the sampling operating point an
+explicit, digest-carried choice: `ProviderDefault` sends no sampling
+fields; `Temperature(t)` pins the field on every wire request under both
+protocols. `ProviderProfile` (agent-compose) is the checked key-free
+serving identity; its `provider_profile_digest` (SHA-256 over canonical
+identity JSON) is printed in the startup banner. **Residual:** burning the
+digest into RunStarted/checkpoints lands with the status-snapshot slice;
+profile-level retry/timeout knobs stay env-based until the full
+`ProductProfileV1`.
+
+Original finding, retained for the record:
+
 `crates/agent-compose/src/lib.rs` (`model_from_key` and helpers):
 
 - `OPENAI_API_PROTOCOL`: `.ok().and_then(|v| OpenAiProtocol::parse(&v).ok()).unwrap_or_default()`

@@ -900,9 +900,9 @@ mod tests {
             ..config
         };
         let wire = build_chat_wire_request(&request, &pinned, &codec);
-        assert_eq!(wire["temperature"], 0.3);
+        assert!((wire["temperature"].as_f64().unwrap() - 0.3).abs() < 1e-6);
         let responses_wire = build_responses_wire_request(&request, &pinned, &codec);
-        assert_eq!(responses_wire["temperature"], 0.3);
+        assert!((responses_wire["temperature"].as_f64().unwrap() - 0.3).abs() < 1e-6);
         assert_eq!(wire["stream"], true);
         assert_eq!(wire["stream_options"]["include_usage"], true);
         assert_eq!(wire["messages"][0]["role"], "system");

@@ -128,6 +128,7 @@ fn build_model_with_timeout(timeout: Duration) -> anyhow::Result<Arc<dyn ModelTr
         send_max_tokens: true,
         max_stream_bytes: provider_openai::DEFAULT_MAX_STREAM_BYTES,
         context_window: Some(context_window),
+        sampling: provider_openai::SamplingPolicy::default(),
     });
     // Harness runs measure outcomes, not live deltas: buffer each attempt
     // so a retryable mid-stream transport failure replays from scratch

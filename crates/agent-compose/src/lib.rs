@@ -144,8 +144,9 @@ pub async fn build_context_engine(
 pub enum ModelSelection {
     /// The explicit demo transport (`AGENT_DEMO=1`).
     Mock(Arc<dyn ModelTransport>),
-    /// A configured OpenAI-compatible provider transport.
-    Provider(Arc<dyn ModelTransport>),
+    /// A configured OpenAI-compatible provider transport, carrying the
+    /// checked key-free serving identity.
+    Provider(Arc<dyn ModelTransport>, ProviderProfile),
 }
 
 impl std::fmt::Debug for ModelSelection {
@@ -154,15 +155,83 @@ impl std::fmt::Debug for ModelSelection {
             // The transport itself does not implement Debug; never print a
             // key or configuration detail.
             Self::Mock(_) => f.write_str("Mock"),
-            Self::Provider(_) => f.write_str("Provider"),
+            Self::Provider(_, _) => f.write_str("Provider"),
         }
+    }
+}
+
+/// The checked, key-free identity of the configured serving: exactly the
+/// fields that change model behavior. The digest is stable across runs,
+/// never contains the API key, and is safe to print, log, or persist.
+#[derive(Debug, Clone)]
+pub struct ProviderProfile {
+    pub base_url: String,
+    pub model: String,
+    pub protocol: &'static str,
+    pub context_window: usize,
+    pub max_output_tokens: usize,
+    pub sampling: provider_openai::SamplingPolicy,
+}
+
+impl ProviderProfile {
+    /// SHA-256 over the canonical identity JSON. Two runs compare their
+    /// operating points by comparing this string.
+    pub fn digest(&self) -> String {
+        use sha2::{Digest as _, Sha256};
+        let identity = serde_json::json!({
+            "schema": "provider-profile.v1",
+            "base_url": self.base_url,
+            "model": self.model,
+            "protocol": self.protocol,
+            "context_window": self.context_window,
+            "max_output_tokens": self.max_output_tokens,
+            "sampling": match self.sampling {
+                provider_openai::SamplingPolicy::ProviderDefault => {
+                    serde_json::json!("provider-default")
+                }
+                provider_openai::SamplingPolicy::Temperature(temperature) => {
+                    serde_json::json!({ "temperature": temperature })
+                }
+            },
+        });
+        let digest = Sha256::digest(identity.to_string().as_bytes());
+        let mut hex = String::with_capacity(digest.len() * 2);
+        for byte in digest {
+            hex.push_str(&format!("{byte:02x}"));
+        }
+        hex
+    }
+
+    /// One-line serving identity for a startup banner.
+    pub fn banner(&self) -> String {
+        let digest = self.digest();
+        format!(
+            "provider profile: {} @ {} protocol={} context_window={} max_output_tokens={} sampling={} digest={}",
+            self.model,
+            self.base_url,
+            self.protocol,
+            self.context_window,
+            self.max_output_tokens,
+            self.sampling.description(),
+            &digest[..16],
+        )
+    }
+}
+
+fn protocol_name(protocol: OpenAiProtocol) -> &'static str {
+    match protocol {
+        OpenAiProtocol::Auto => "auto",
+        OpenAiProtocol::Responses => "responses",
+        OpenAiProtocol::ChatCompletions => "chat",
     }
 }
 
 /// Checked model configuration: `AGENT_DEMO=1` selects the demo mock
 /// explicitly; otherwise `OPENAI_API_KEY` must be present and non-empty or
 /// this is a startup error. The historical silent fallback to the mock on
-/// a missing key hid unreproducible runs behind a fake model.
+/// a missing key hid unreproducible runs behind a fake model. Every other
+/// provider variable is parsed strictly: an invalid value is a startup
+/// error, never a silent default.
 pub fn try_model_from_env() -> anyhow::Result<ModelSelection> {
     let demo = std::env::var("AGENT_DEMO")
         .map(|value| value == "1" || value.eq_ignore_ascii_case("true"))
@@ -175,49 +244,109 @@ pub fn try_model_from_env() -> anyhow::Result<ModelSelection> {
         (false, None) => Err(anyhow::anyhow!(
             "no model configured: set OPENAI_API_KEY (plus OPENAI_BASE_URL / OPENAI_MODEL /              OPENAI_API_PROTOCOL as needed), or set AGENT_DEMO=1 for the explicit demo transport"
         )),
-        (false, Some(api_key)) => Ok(ModelSelection::Provider(model_from_key(api_key))),
+        (false, Some(api_key)) => {
+            let (transport, profile) = provider_from_env(api_key)?;
+            Ok(ModelSelection::Provider(transport, profile))
+        }
     }
 }
 
-/// Build the retrying provider transport for an already-checked key.
-fn model_from_key(api_key: String) -> Arc<dyn ModelTransport> {
+/// One optional environment string that must parse when present.
+fn env_checked<T>(
+    name: &str,
+    parse: impl Fn(&str) -> Result<T, String>,
+) -> anyhow::Result<Option<T>> {
+    match std::env::var(name) {
+        Err(_) => Ok(None),
+        Ok(raw) if raw.trim().is_empty() => Err(anyhow::anyhow!(
+            "{name} is set but empty; remove it or give it a value"
+        )),
+        Ok(raw) => parse(raw.trim())
+            .map(Some)
+            .map_err(|error| anyhow::anyhow!("{name}: {error}")),
+    }
+}
+
+fn env_usize(name: &str, default: usize, min: usize) -> anyhow::Result<usize> {
+    Ok(env_checked(name, |raw| {
+        raw.parse::<usize>()
+            .map_err(|_| format!("must be an integer >= {min}, got '{raw}'"))
+    })?
+    .map(|value| {
+        if value < min {
+            Err(anyhow::anyhow!(
+                "{name}: must be an integer >= {min}, got {value}"
+            ))
+        } else {
+            Ok(value)
+        }
+    })
+    .transpose()?
+    .unwrap_or(default))
+}
+
+/// Build the retrying provider transport plus its checked identity for an
+/// already-checked key. Invalid configuration fails here, before any
+/// workspace or runtime state exists.
+fn provider_from_env(
+    api_key: String,
+) -> anyhow::Result<(Arc<dyn ModelTransport>, ProviderProfile)> {
     let base_url = std::env::var("OPENAI_BASE_URL")
-        .unwrap_or_else(|_| "https://api.openai.com/v1".to_string());
-    let model = std::env::var("OPENAI_MODEL").unwrap_or_else(|_| "gpt-4o-mini".to_string());
-    let protocol = std::env::var("OPENAI_API_PROTOCOL")
         .ok()
-        .and_then(|value| OpenAiProtocol::parse(&value).ok())
-        .unwrap_or_default();
-    let context_window = env_declared_context_window();
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or_else(|| "https://api.openai.com/v1".to_string());
+    let model = std::env::var("OPENAI_MODEL")
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or_else(|| "gpt-4o-mini".to_string());
+    let protocol = env_checked("OPENAI_API_PROTOCOL", OpenAiProtocol::parse)?.unwrap_or_default();
+    let context_window = env_usize(
+        "OPENAI_CONTEXT_WINDOW",
+        provider_openai::DEFAULT_DECLARED_CONTEXT_WINDOW,
+        1024,
+    )?;
+    let max_output_tokens = env_usize("OPENAI_MAX_OUTPUT_TOKENS", 4096, 1)?;
+    let sampling = env_checked("OPENAI_TEMPERATURE", |raw| {
+        let temperature: f32 = raw
+            .parse()
+            .map_err(|_| format!("must be a number between 0.0 and 2.0, got '{raw}'"))?;
+        if !(0.0..=2.0).contains(&temperature) {
+            return Err(format!(
+                "must be a number between 0.0 and 2.0, got {temperature}"
+            ));
+        }
+        Ok(provider_openai::SamplingPolicy::Temperature(temperature))
+    })?
+    .unwrap_or_default();
+    let profile = ProviderProfile {
+        base_url: base_url.clone(),
+        model: model.clone(),
+        protocol: protocol_name(protocol),
+        context_window,
+        max_output_tokens,
+        sampling,
+    };
     let provider = OpenAiProvider::new(OpenAiConfig {
         api_key,
         base_url,
         model,
         protocol,
-        max_output_tokens: 4096,
+        max_output_tokens: profile.max_output_tokens,
         timeout: std::time::Duration::from_secs(120),
         send_stream_options: true,
         send_max_tokens: true,
         max_stream_bytes: provider_openai::DEFAULT_MAX_STREAM_BYTES,
         context_window: Some(context_window),
+        sampling: profile.sampling,
     });
-    Arc::new(
+    let transport = Arc::new(
         RetryingTransport::new(provider, 3, std::time::Duration::from_millis(500))
             // Same retry-observability contract as the evaluation harness: set
             // `OPENAI_RETRY_METRICS_FILE` to persist typed incident/stage
             // records; without it the stderr retry line stays the only channel.
             .with_observer(Arc::new(JsonlRetryObserver::from_env())),
-    )
-}
-
-fn env_declared_context_window() -> usize {
-    match std::env::var("OPENAI_CONTEXT_WINDOW") {
-        Ok(raw) if !raw.trim().is_empty() => raw
-            .trim()
-            .parse()
-            .unwrap_or(provider_openai::DEFAULT_DECLARED_CONTEXT_WINDOW),
-        _ => provider_openai::DEFAULT_DECLARED_CONTEXT_WINDOW,
-    }
+    );
+    Ok((transport, profile))
 }
 
 /// Everything a composed run differs on. The composition root (TUI/CLI/
@@ -766,7 +895,71 @@ mod model_selection_tests {
         unsafe { std::env::set_var("OPENAI_API_KEY", "sk-test") };
         assert!(matches!(
             try_model_from_env().unwrap(),
-            ModelSelection::Provider(_)
+            ModelSelection::Provider(_, _)
         ));
+    }
+
+    #[test]
+    fn invalid_provider_values_are_startup_errors_never_silent_defaults() {
+        let _env = ENV_LOCK.lock().unwrap();
+        let keys = [
+            "OPENAI_API_KEY",
+            "AGENT_DEMO",
+            "OPENAI_API_PROTOCOL",
+            "OPENAI_CONTEXT_WINDOW",
+            "OPENAI_MAX_OUTPUT_TOKENS",
+            "OPENAI_TEMPERATURE",
+        ];
+        // Protocol: the historical silent path turned any garbage into Auto.
+        let _guard = EnvGuard::new(&keys);
+        unsafe { std::env::set_var("OPENAI_API_KEY", "sk-test") };
+        unsafe { std::env::set_var("OPENAI_API_PROTOCOL", "grapefruit") };
+        let error = try_model_from_env().unwrap_err().to_string();
+        assert!(error.contains("OPENAI_API_PROTOCOL"), "{error}");
+
+        // Context window: no silent 128k fallback on a typo.
+        unsafe { std::env::remove_var("OPENAI_API_PROTOCOL") };
+        unsafe { std::env::set_var("OPENAI_CONTEXT_WINDOW", "12o800") };
+        let error = try_model_from_env().unwrap_err().to_string();
+        assert!(error.contains("OPENAI_CONTEXT_WINDOW"), "{error}");
+
+        // Temperature: out of range is refused, in range is pinned.
+        unsafe { std::env::remove_var("OPENAI_CONTEXT_WINDOW") };
+        unsafe { std::env::set_var("OPENAI_TEMPERATURE", "9.5") };
+        let error = try_model_from_env().unwrap_err().to_string();
+        assert!(error.contains("OPENAI_TEMPERATURE"), "{error}");
+        unsafe { std::env::set_var("OPENAI_TEMPERATURE", "0.2") };
+        match try_model_from_env().unwrap() {
+            ModelSelection::Provider(_, profile) => {
+                assert_eq!(
+                    profile.sampling,
+                    provider_openai::SamplingPolicy::Temperature(0.2)
+                );
+                assert!(profile.banner().contains("temperature=0.2"));
+                assert!(profile.banner().contains("digest="));
+            }
+            other => panic!("expected a provider selection, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn the_profile_digest_separates_sampling_operating_points() {
+        let base = ProviderProfile {
+            base_url: "https://example.com/v1".into(),
+            model: "m".into(),
+            protocol: "responses",
+            context_window: 128_000,
+            max_output_tokens: 4096,
+            sampling: provider_openai::SamplingPolicy::ProviderDefault,
+        };
+        let pinned = ProviderProfile {
+            sampling: provider_openai::SamplingPolicy::Temperature(0.0),
+            ..base.clone()
+        };
+        assert_ne!(base.digest(), pinned.digest());
+        assert_eq!(base.digest(), base.clone().digest());
+        // The digest never carries the key material because the profile
+        // struct has no key field.
+        assert!(!base.digest().is_empty());
     }
 }
