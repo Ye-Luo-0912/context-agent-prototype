@@ -80,7 +80,7 @@ async fn main() -> anyhow::Result<()> {
     let policy = ContextPolicy::from_str_checked(&context_policy)?;
     let root = root_arg.unwrap_or(std::env::current_dir().context("current directory")?);
     let workspace = Workspace::open(&root).await?;
-    let mut restore_checkpoint = if restore_latest {
+    let restore_checkpoint = if restore_latest {
         let resolved = resolve_latest_checkpoint(&workspace.state_dir().join("checkpoints"))?;
         let checkpoint = load_runtime_checkpoint(&resolved)?;
         Some((resolved, checkpoint))
