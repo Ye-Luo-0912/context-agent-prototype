@@ -1599,7 +1599,7 @@ impl RuntimeActor {
                 }
                 resumed = proof_rx.recv() => {
                     match resumed {
-                        Some(resumed) => self.on_proof_refresh_completed(resumed).await,
+                        Some(resumed) => self.on_proof_refresh_completed(resumed, &op_tx).await,
                         None => {
                             let _ = self
                                 .shutdown(&mut op_rx, &op_tx, proof_tx.clone())

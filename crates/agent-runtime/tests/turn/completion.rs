@@ -2956,21 +2956,16 @@ async fn deferred_refresh_converges_whether_the_resume_lands_early_or_late() {
         "the background refresh ran exactly once"
     );
     assert_eq!(requests.len(), 1);
-    // The resume races the turn end, and both outcomes converge:
-    // - landed while the turn was live: the completion is accepted and the
-    //   durable record is committed;
-    // - landed after: the intent is dropped with a visible warning, the
-    //   refreshed proof stays recorded, and the next task.complete is
-    //   admitted inline without another verifier run.
-    let committed = !checkpoint.tasks.completed.is_empty();
-    if committed {
-        assert!(checkpoint.current_task_id.is_none());
-    } else {
-        assert!(
-            checkpoint.current_task_id.is_some(),
-            "the task stays active"
-        );
-    }
+    // The held turn finalizes from the resume: the completion is accepted
+    // and the durable record is committed deterministically, exactly like
+    // the inline path.
+    assert!(
+        checkpoint.tasks.completed.iter().any(|record| {
+            record.summary == "the fixture is verified" && record.anchor_revision >= 1
+        }),
+        "the deferred completion must commit a durable CompletionRecord"
+    );
+    assert!(checkpoint.current_task_id.is_none());
 }
 
 #[tokio::test]

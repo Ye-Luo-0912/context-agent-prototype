@@ -185,6 +185,7 @@ dependencies = [
  "agent-workspace",
  "async-trait",
  "context-simple",
+ "futures-util",
  "serde",
  "serde_json",
  "sha2",

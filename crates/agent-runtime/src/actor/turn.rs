@@ -385,6 +385,12 @@ impl RuntimeActor {
         &mut self,
         op_tx: &mpsc::Sender<OperationCompletion>,
     ) {
+        // A deferred proof refresh owns the turn edge: the parked proposal
+        // resumes over the proof channel, and the turn finalizes from that
+        // resume instead of racing it with a new model round.
+        if self.state.pending_proof_refresh.is_some() {
+            return;
+        }
         // A model request consumes only a fully terminalized tool batch.
         // Settle the body-free ledger first; the round-budget refusal path
         // must report the batch too rather than dropping its accounting.
@@ -611,7 +617,15 @@ impl RuntimeActor {
         let proof_tx = proof_tx.clone();
         let request = plan.request.clone();
         let task = tokio::spawn(async move {
-            let outcome = verifier.verify_exact(request).await;
+            let verify = std::panic::AssertUnwindSafe(verifier.verify_exact(request));
+            let outcome = {
+                use futures_util::FutureExt as _;
+                verify.catch_unwind().await
+            };
+            let outcome = match outcome {
+                Ok(outcome) => outcome,
+                Err(_) => Err(AgentError::Internal("proof verifier panicked".to_string())),
+            };
             let proposal = proposal_owned
                 .take()
                 .unwrap_or_else(|| unreachable!("begin_deferred_proof_refresh parked no proposal"));
@@ -718,7 +732,22 @@ impl RuntimeActor {
     /// acceptance/refusal path an inline proposal takes. A refusal is
     /// surfaced as a bounded warning the model can read next round — the
     /// refreshed verification itself is already in context.
-    pub(super) async fn on_proof_refresh_completed(&mut self, resumed: DeferredProofRefresh) {
+    pub(super) fn on_proof_refresh_completed<'a>(
+        &'a mut self,
+        resumed: DeferredProofRefresh,
+        op_tx: &'a mpsc::Sender<OperationCompletion>,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + 'a>> {
+        // Same reason as `finalize_terminal_completion`: the resume chain
+        // (apply, gate, terminal transaction, advance) is far too large a
+        // future to poll inline on Windows' small thread stacks.
+        Box::pin(self.on_proof_refresh_completed_inner(resumed, op_tx))
+    }
+
+    async fn on_proof_refresh_completed_inner(
+        &mut self,
+        resumed: DeferredProofRefresh,
+        op_tx: &mpsc::Sender<OperationCompletion>,
+    ) {
         let live = self
             .state
             .turn
@@ -759,16 +788,25 @@ impl RuntimeActor {
         };
         self.finalize_completion_proposal(&mut scratch, proposal)
             .await;
-        if !scratch.ok {
-            let _ = self
-                .core
-                .emit_event(RuntimeEvent::Warning {
-                    message: crate::output::bound_error_message(format!(
-                        "deferred completion refused after proof refresh: {}",
-                        scratch.summary
-                    )),
-                })
-                .await;
+        // The held turn finalizes exactly like the inline tool tail: an
+        // accepted completion takes the terminal transaction; a refusal
+        // hands the decision back to a model round with the refreshed
+        // verification already in context.
+        if let Some(summary) = self.terminal_completion_summary() {
+            self.finalize_terminal_completion(summary).await;
+        } else {
+            if !scratch.ok {
+                let _ = self
+                    .core
+                    .emit_event(RuntimeEvent::Warning {
+                        message: crate::output::bound_error_message(format!(
+                            "deferred completion refused after proof refresh: {}",
+                            scratch.summary
+                        )),
+                    })
+                    .await;
+            }
+            self.advance_turn(op_tx).await;
         }
     }
 

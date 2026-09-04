@@ -203,6 +203,19 @@ broadcast.
 
 ### P2-BLK-5 — Proof refresh blocks the actor
 
+**Closed on source, 2026-09-05 (`PROOF-OPERATION-01`):** the refresh
+splits into a sync plan phase and a fenced apply phase. With the
+opt-in `defer_proof_refresh` flag, the host verifier runs on its own
+task outside the actor loop over a dedicated fenced channel; the turn
+edge yields while a refresh is parked (turn-holding), and the resume
+applies the outcome, takes the terminal transaction on acceptance (or
+hands a refusal to a model round), then finalizes — a slow verify
+script can no longer delay status, cancel, shutdown or new input.
+Default remains the frozen inline path. Verifier panics convert to
+typed errors so a held turn cannot wedge.
+
+Original finding, retained for the record:
+
 `crates/agent-runtime/src/actor/turn.rs:548`
 (`verifier.verify_exact(request).await` inside
 `refresh_proof_before_completion`, L495-611, `&mut self` held across the
