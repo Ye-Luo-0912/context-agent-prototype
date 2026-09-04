@@ -2,7 +2,7 @@
   "schema": "project-state.v1",
   "updated": "2026-09-05",
   "maintained_by": "hand until the CI document-consistency gate lands; README.md and docs/CURRENT.md current-status text must be verified against this file",
-  "head_commit": "33081b40debd4a022691b3a7ae70d67977d5e677",
+  "head_commit": "ca6db07a93a6f7d6c57bcbad27c9b407e403877d",
   "code_commit": "050aa8e68f59c49d42b95e2a4d38fa37234a1e78",
   "ci": {
     "head_commit": "green",
@@ -44,7 +44,11 @@
   "product_phase": "phase-2-reliable-local-agent-alpha",
   "phase_2_started": "2026-09-04",
   "phase_2_slices_landed": [
-    "checked model configuration: AGENT_DEMO=1 selects the mock explicitly, a missing OPENAI_API_KEY is a visible startup error (32ea622)"
+    "checked model configuration: AGENT_DEMO=1 selects the mock explicitly, a missing OPENAI_API_KEY is a visible startup error (32ea622)",
+    "CHECKPOINT-PRODUCT-01: manual and automatic checkpoints share the runtime envelope store; retention scoped to real artifacts; fail-closed legacy decoder (e8e5fff)",
+    "CRASH-RESUME-01 (partial): real child-process kill points at checkpoint-after-temp-write and turn-before-commit-barrier with crash/resume acceptance (5f94dc7)",
+    "PRODUCT-PROFILE-01: strict provider env parsing, SamplingPolicy operating point, ProviderProfile + provider_profile_digest in the startup banner (d21b686)",
+    "TUI transcript bounded at 400 rows through a single push path (ca6db07)"
   ],
   "default_context": "dynamic-in-process",
   "experimental": [

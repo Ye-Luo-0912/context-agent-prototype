@@ -33,16 +33,18 @@ Formal verdicts live only in the immutable
 ## Product stage
 
 - **Pre-alpha.** Phase 2 (Reliable Local Agent alpha) started 2026-09-04.
-  Landed: checked model configuration (`32ea622`); unified manual/automatic
-  checkpoints on the Runtime `CheckpointStore` envelope, with retention
-  scoped to real store artifacts and a fail-closed legacy decoder
-  (`CHECKPOINT-PRODUCT-01`, 2026-09-05, uncommitted at write time).
+  Landed 2026-09-05, in order: unified manual/automatic checkpoints
+  (`CHECKPOINT-PRODUCT-01`, `e8e5fff`); real child-process kill points +
+  crash/resume acceptance (`CRASH-RESUME-01` partial, `5f94dc7`; effect-
+  broker kill points residual); strict provider config + `SamplingPolicy`
+  + profile digest (`PRODUCT-PROFILE-01`, `d21b686`); bounded TUI
+  transcript (`ca6db07`). Checked model configuration landed earlier
+  (`32ea622`).
 - Next product queue (order per [`ROADMAP.md`](ROADMAP.md#route-to-a-usable-local-agent)
   and the 2026-09-05 code review, [`reviews/2026-09-05-code-review.md`](reviews/2026-09-05-code-review.md)):
-  a real kill/restart acceptance matrix; strict `ProviderProfile`/
-  `ProductProfile` with digests and an explicit `SamplingPolicy`; a
-  Runtime-owned status snapshot; proof refresh as a cancellable operation;
-  a bounded TUI transcript; packaging and clean-machine doctor.
+  Runtime-owned status snapshot (digest persistence rides it); proof
+  refresh as a cancellable operation; effect-broker crash failpoints;
+  approval detail + Lagged resync; packaging and clean-machine doctor.
 - Default context is dynamic in-process. `context-service`,
   completion-opportunity, settlement-projection and recovery-surface remain
   experimental.
