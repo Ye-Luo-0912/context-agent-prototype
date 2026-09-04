@@ -111,6 +111,21 @@ not a new planner, TaskGraph, database or multi-Agent layer.
   run. The mechanically regenerated report is the only accepted verdict;
   valid FAIL rejects the bf52490 candidate, and only a typed NOT_RUN
   permits a whole-window rerun.
+- The semantic-completion-liveness candidate (committed with the ninth-
+  window evidence at `050aa8e`) completed its pre-window exits: the
+  complete workspace suite is green, Windows/Linux CI is green on
+  `050aa8e`, and its exact-source preflight **PASSED** (attempt
+  `r1-attempt9` under `evidence/m15-preflight/`, source tree digest
+  `d6e7bfdd...`): `retry_policy_dev` normal, product surface,
+  behavior/diff pass, closure active (report-only), provider healthy,
+  11 model rounds, wall 348,355 ms.
+- The tenth 12-cell v4 window on the `050aa8e` candidate + PinAI tuple is
+  **predeclared 2026-09-04 before its run** (M15_ACCEPTANCE §7 item 8):
+  3 fixtures × normal/resume × 2 repeats, the product surface, the pinned
+  serving tuple, one uninterrupted `agent-eval --m15-window` run. The
+  mechanically regenerated report is the only accepted verdict; valid
+  FAIL rejects the candidate, and only a typed NOT_RUN permits a
+  whole-window rerun.
 - Formal M15 remains open. Ten v4 windows are banked (eight valid FAILs,
   one censored, one authorized rerun); the latest mechanical report is the
   ninth window's 11/12 with 0 NOT_RUN — policy 4/4 for the first time and
