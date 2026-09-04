@@ -77,6 +77,7 @@ async fn compose_config(
     );
     Ok(ComposeConfig {
         provider_profile_digest: None,
+        defer_proof_refresh: false,
         workspace: workspace.clone(),
         context_engine: Arc::new(SimpleContextEngine::new(SimpleContextConfig::default())),
         model,

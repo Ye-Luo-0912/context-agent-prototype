@@ -829,14 +829,16 @@ impl RuntimeActor {
         &'a mut self,
         completion: OperationCompletion,
         op_tx: &'a mpsc::Sender<OperationCompletion>,
+        proof_tx: &'a mpsc::Sender<turn::DeferredProofRefresh>,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + 'a>> {
-        Box::pin(self.on_operation_completed_inner(completion, op_tx))
+        Box::pin(self.on_operation_completed_inner(completion, op_tx, proof_tx))
     }
 
     async fn on_operation_completed_inner(
         &mut self,
         completion: OperationCompletion,
         op_tx: &mpsc::Sender<OperationCompletion>,
+        proof_tx: &mpsc::Sender<turn::DeferredProofRefresh>,
     ) {
         let execution_recovery = completion.recovery_required.clone();
         if let Some(reason) = execution_recovery.clone() {
@@ -1343,7 +1345,8 @@ impl RuntimeActor {
                                 .await;
                         }
                         RuntimeDirective::CompleteTask(proposal) => {
-                            self.apply_completion_proposal(&mut output, proposal).await;
+                            self.apply_completion_proposal(&mut output, proposal, proof_tx)
+                                .await;
                         }
                         other => self.execute_directive(other).await,
                     }

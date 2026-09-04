@@ -87,6 +87,7 @@ async fn compose_config(root: &std::path::Path) -> anyhow::Result<ComposeConfig>
     );
     Ok(ComposeConfig {
         provider_profile_digest: None,
+        defer_proof_refresh: false,
         workspace: workspace.clone(),
         context_engine: Arc::new(context_simple::SimpleContextEngine::new(
             context_simple::SimpleContextConfig::default(),

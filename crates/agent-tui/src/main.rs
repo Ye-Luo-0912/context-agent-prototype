@@ -165,6 +165,7 @@ async fn main() -> anyhow::Result<()> {
     });
     let composed = compose(ComposeConfig {
         provider_profile_digest,
+        defer_proof_refresh: false,
         workspace,
         context_engine,
         model,

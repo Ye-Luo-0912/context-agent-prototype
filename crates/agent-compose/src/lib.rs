@@ -359,6 +359,11 @@ pub struct ComposeConfig {
     /// into every checkpoint's run metadata. `None` for demo/mock or
     /// harness compositions that record the tuple in their own manifests.
     pub provider_profile_digest: Option<String>,
+    /// Opt-in: run the completion-time host proof refresh outside the
+    /// actor loop and resume the parked completion when it finishes.
+    /// `false` (default) keeps the historical inline refresh with its
+    /// same-round authoritative gate result.
+    pub defer_proof_refresh: bool,
     /// The context engine, already selected by the caller.
     pub context_engine: Arc<dyn ContextEngine>,
     /// The model transport, already selected by the caller.
@@ -458,6 +463,7 @@ impl ComposedRuntime {
 pub async fn compose(config: ComposeConfig) -> anyhow::Result<ComposedRuntime> {
     let ComposeConfig {
         provider_profile_digest: provider_profile_digest_in,
+        defer_proof_refresh,
         workspace,
         context_engine,
         model,
@@ -559,6 +565,7 @@ pub async fn compose(config: ComposeConfig) -> anyhow::Result<ComposedRuntime> {
     if let Some(digest) = provider_profile_digest_in {
         services.set_provider_profile_digest(digest);
     }
+    services = services.with_defer_proof_refresh(defer_proof_refresh);
     // A recipe table always installs the read-only domain resolver so a
     // model-facing repair can name an exact recipe on cold start. The switch
     // controls only Runtime's optional automatic execution of that recipe.
@@ -642,6 +649,7 @@ mod tests {
             Arc::new(BuiltinToolDispatcher::new(workspace.clone()).unwrap());
         ComposeConfig {
             provider_profile_digest: None,
+            defer_proof_refresh: false,
             workspace,
             context_engine: engine,
             model,

@@ -732,6 +732,7 @@ async fn operation_cancel_losing_to_a_core_terminal_returns_truth_without_fencin
     let mut actor = RuntimeActor::new(core.clone(), services);
     mark_actor_serving(&mut actor);
     let (op_tx, mut op_rx) = mpsc::channel(1);
+    let (proof_tx, _proof_rx) = mpsc::channel(8);
 
     let (focus_tx, focus_rx) = oneshot::channel();
     actor
@@ -756,7 +757,7 @@ async fn operation_cancel_losing_to_a_core_terminal_returns_truth_without_fencin
         .await;
     message_rx.await.unwrap().unwrap();
     actor
-        .on_operation_completed(op_rx.recv().await.unwrap(), &op_tx)
+        .on_operation_completed(op_rx.recv().await.unwrap(), &op_tx, &proof_tx)
         .await;
     tokio::time::timeout(Duration::from_secs(2), entered.notified())
         .await
@@ -800,7 +801,9 @@ async fn operation_cancel_losing_to_a_core_terminal_returns_truth_without_fencin
     assert!(!actor.state.recovery_required);
     assert!(actor.state.turn.is_some());
 
-    actor.on_operation_completed(completion, &op_tx).await;
+    actor
+        .on_operation_completed(completion, &op_tx, &proof_tx)
+        .await;
 }
 
 #[tokio::test]
@@ -836,6 +839,7 @@ async fn partial_atomic_cancel_wal_failure_fences_actor_and_stays_queryable() {
     let mut actor = RuntimeActor::new(core.clone(), services);
     mark_actor_serving(&mut actor);
     let (op_tx, mut op_rx) = mpsc::channel(1);
+    let (proof_tx, _proof_rx) = mpsc::channel(8);
 
     let (focus_tx, focus_rx) = oneshot::channel();
     actor
@@ -860,7 +864,7 @@ async fn partial_atomic_cancel_wal_failure_fences_actor_and_stays_queryable() {
         .await;
     message_rx.await.unwrap().unwrap();
     actor
-        .on_operation_completed(op_rx.recv().await.unwrap(), &op_tx)
+        .on_operation_completed(op_rx.recv().await.unwrap(), &op_tx, &proof_tx)
         .await;
     tokio::time::timeout(Duration::from_secs(2), entered.notified())
         .await
@@ -919,5 +923,7 @@ async fn partial_atomic_cancel_wal_failure_fences_actor_and_stays_queryable() {
         .await
         .expect("late tool completion timed out")
         .expect("late tool completion channel closed");
-    actor.on_operation_completed(completion, &op_tx).await;
+    actor
+        .on_operation_completed(completion, &op_tx, &proof_tx)
+        .await;
 }

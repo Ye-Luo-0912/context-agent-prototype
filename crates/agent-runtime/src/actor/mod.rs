@@ -1277,6 +1277,10 @@ mod context_requirement_observation_tests {
 /// touch it: everything goes through `RuntimeCommand`.
 #[derive(Default)]
 struct ActorState {
+    /// One deferred completion awaiting its background host proof refresh.
+    /// Cancelled with the turn, aborted on shutdown, and re-fenced against
+    /// turn identity + generation when the verifier finishes.
+    pending_proof_refresh: Option<turn::PendingProofRefresh>,
     /// Process-local startup gate. A durable startup marker must commit before
     /// any command can create task/context/model state. Startup failure is
     /// terminal for this actor: retrying in place could let a later marker
@@ -1559,13 +1563,15 @@ impl RuntimeActor {
         mut rx: mpsc::Receiver<RuntimeCommand>,
         op_tx: mpsc::Sender<OperationCompletion>,
         mut op_rx: mpsc::Receiver<OperationCompletion>,
+        proof_tx: mpsc::Sender<turn::DeferredProofRefresh>,
+        mut proof_rx: mpsc::Receiver<turn::DeferredProofRefresh>,
     ) {
         loop {
             tokio::select! {
                 command = rx.recv() => {
                     match command {
                         Some(RuntimeCommand::Stop { reply }) => {
-                            let result = self.shutdown(&mut op_rx, &op_tx).await;
+                            let result = self.shutdown(&mut op_rx, &op_tx, proof_tx.clone()).await;
                             let _ = reply.send(result);
                             return;
                         }
@@ -1574,16 +1580,30 @@ impl RuntimeActor {
                         // shut down cleanly (cancel, flush, RunCompleted)
                         // instead of silently returning.
                         None => {
-                            let _ = self.shutdown(&mut op_rx, &op_tx).await;
+                            let _ = self.shutdown(&mut op_rx, &op_tx, proof_tx.clone()).await;
                             return;
                         }
                     }
                 }
                 completed = op_rx.recv() => {
                     match completed {
-                        Some(completion) => self.on_operation_completed(completion, &op_tx).await,
+                        Some(completion) => {
+                            self.on_operation_completed(completion, &op_tx, &proof_tx)
+                                .await
+                        }
                         None => {
-                            let _ = self.shutdown(&mut op_rx, &op_tx).await;
+                            let _ = self.shutdown(&mut op_rx, &op_tx, proof_tx.clone()).await;
+                            return;
+                        }
+                    }
+                }
+                resumed = proof_rx.recv() => {
+                    match resumed {
+                        Some(resumed) => self.on_proof_refresh_completed(resumed).await,
+                        None => {
+                            let _ = self
+                                .shutdown(&mut op_rx, &op_tx, proof_tx.clone())
+                                .await;
                             return;
                         }
                     }
@@ -1599,12 +1619,16 @@ impl RuntimeActor {
         &mut self,
         op_rx: &mut mpsc::Receiver<OperationCompletion>,
         op_tx: &mpsc::Sender<OperationCompletion>,
+        proof_tx: mpsc::Sender<turn::DeferredProofRefresh>,
     ) -> AgentResult<()> {
         // A run that never crossed its startup marker has no lifecycle to
         // complete. In particular, after a partial startup append/flush
         // failure, calling Core::stop would append `RunCompleted` and retry a
         // flush across the uncommitted startup prefix. Leave that prefix
         // forensic and terminate this actor without further journal writes.
+        if let Some(pending) = self.state.pending_proof_refresh.take() {
+            pending.task.abort();
+        }
         if self.state.lifecycle != ActorLifecycle::Serving {
             self.state.pending_user_input = None;
             return Ok(());
@@ -1613,7 +1637,9 @@ impl RuntimeActor {
             .cancel_turn(TurnCancellationReason::Shutdown, None)
             .await;
         self.state.pending_user_input = None;
-        let cleanup = self.drain_cancelled_tool_cleanup(op_rx, op_tx).await;
+        let cleanup = self
+            .drain_cancelled_tool_cleanup(op_rx, op_tx, &proof_tx)
+            .await;
         let stop = self.core.stop().await;
         let mut errors = Vec::new();
         if let Err(error) = cancel {
@@ -1636,6 +1662,7 @@ impl RuntimeActor {
         &mut self,
         op_rx: &mut mpsc::Receiver<OperationCompletion>,
         op_tx: &mpsc::Sender<OperationCompletion>,
+        proof_tx: &mpsc::Sender<turn::DeferredProofRefresh>,
     ) -> AgentResult<()> {
         let Some(target) = self.state.pending_tool_cleanup else {
             return Ok(());
@@ -1647,7 +1674,10 @@ impl RuntimeActor {
                 break;
             }
             match tokio::time::timeout(remaining, op_rx.recv()).await {
-                Ok(Some(completion)) => self.on_operation_completed(completion, op_tx).await,
+                Ok(Some(completion)) => {
+                    self.on_operation_completed(completion, op_tx, proof_tx)
+                        .await
+                }
                 Ok(None) | Err(_) => break,
             }
         }
@@ -1677,8 +1707,9 @@ pub fn spawn_runtime(services: Arc<RuntimeServices>) -> (RuntimeHandle, JoinHand
     let core = services.core_port();
     let (tx, rx) = mpsc::channel(64);
     let (op_tx, op_rx) = mpsc::channel(16);
+    let (proof_tx, proof_rx) = mpsc::channel(8);
     let actor = RuntimeActor::new(core.clone(), services);
     let handle = RuntimeHandle::new(tx, core.event_sender(), core.run_id());
-    let task = tokio::spawn(actor.run(rx, op_tx, op_rx));
+    let task = tokio::spawn(actor.run(rx, op_tx, op_rx, proof_tx, proof_rx));
     (handle, task)
 }

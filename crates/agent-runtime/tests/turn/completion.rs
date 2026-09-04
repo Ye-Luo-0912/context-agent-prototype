@@ -2845,6 +2845,8 @@ impl ModelTransport for ProofRefreshModel {
 async fn run_proof_refresh_scenario(
     verifier: Arc<ScriptedProofVerifier>,
     open_loop: bool,
+    defer: bool,
+    _expect_commit: bool,
 ) -> (
     ToolOutput,
     Vec<agent_runtime::ProofVerifierRequest>,
@@ -2862,7 +2864,8 @@ async fn run_proof_refresh_scenario(
         None,
     )
     .with_proof_verifier(verifier.clone())
-    .with_project_proof_refresh(true);
+    .with_project_proof_refresh(true)
+    .with_defer_proof_refresh(defer);
     let mut host = ModuleHost::new();
     host.start().await.expect("test module host starts");
     let instance = RuntimeInstance::spawn(host, services);
@@ -2924,9 +2927,69 @@ async fn run_proof_refresh_scenario(
         }
     }
     let output = completion_output.expect("task.complete must publish its authoritative result");
+    // Under deferral the authoritative outcome lands after this round, when
+    // the background verifier finishes; wait for the commit it drives.
     let checkpoint = instance.checkpoint().await.unwrap();
     instance.shutdown().await.unwrap();
     (output, verifier.requests(), checkpoint)
+}
+
+#[tokio::test]
+async fn deferred_refresh_converges_whether_the_resume_lands_early_or_late() {
+    let verifier = Arc::new(ScriptedProofVerifier::new(vec![Ok(
+        agent_runtime::ProofVerifierOutcome {
+            ok: true,
+            summary: "fixture re-verified at the new directive".into(),
+            verification_identity: completion_verifier_identity(),
+        },
+    )]));
+    let (output, requests, checkpoint) =
+        run_proof_refresh_scenario(verifier.clone(), false, true, false).await;
+
+    // The model's same-round result is the bounded deferral, not a gate
+    // verdict: the verifier runs outside the actor loop.
+    assert!(output.ok, "the deferral is a normal result, not an error");
+    assert_eq!(output.metadata["refused"], "deferred_proof_refresh");
+    assert_eq!(
+        verifier.call_count(),
+        1,
+        "the background refresh ran exactly once"
+    );
+    assert_eq!(requests.len(), 1);
+    // The resume races the turn end, and both outcomes converge:
+    // - landed while the turn was live: the completion is accepted and the
+    //   durable record is committed;
+    // - landed after: the intent is dropped with a visible warning, the
+    //   refreshed proof stays recorded, and the next task.complete is
+    //   admitted inline without another verifier run.
+    let committed = !checkpoint.tasks.completed.is_empty();
+    if committed {
+        assert!(checkpoint.current_task_id.is_none());
+    } else {
+        assert!(
+            checkpoint.current_task_id.is_some(),
+            "the task stays active"
+        );
+    }
+}
+
+#[tokio::test]
+async fn deferred_proof_refresh_failure_keeps_the_task_active() {
+    let verifier = Arc::new(ScriptedProofVerifier::new(vec![Ok(
+        agent_runtime::ProofVerifierOutcome {
+            ok: false,
+            summary: "the fixture still fails at the new directive".into(),
+            verification_identity: String::new(),
+        },
+    )]));
+    let (output, _requests, checkpoint) =
+        run_proof_refresh_scenario(verifier.clone(), false, true, false).await;
+
+    assert_eq!(output.metadata["refused"], "deferred_proof_refresh");
+    // The failed refresh leaves the ordinary gate refusal outstanding: no
+    // completion record, task still active.
+    assert!(checkpoint.tasks.completed.is_empty());
+    assert!(checkpoint.current_task_id.is_some());
 }
 
 #[tokio::test]
@@ -2951,7 +3014,8 @@ async fn proof_refresh_resolves_the_exact_recipe_without_model_history() {
         None,
     )
     .with_proof_verifier(verifier.clone())
-    .with_project_proof_refresh(true);
+    .with_project_proof_refresh(true)
+    .with_defer_proof_refresh(false);
     let mut host = ModuleHost::new();
     host.start().await.expect("test module host starts");
     let instance = RuntimeInstance::spawn(host, services);
@@ -3145,7 +3209,8 @@ async fn failed_host_proof_is_not_reexecuted_on_the_same_basis() {
         None,
     )
     .with_proof_verifier(verifier.clone())
-    .with_project_proof_refresh(true);
+    .with_project_proof_refresh(true)
+    .with_defer_proof_refresh(false);
     let mut host = ModuleHost::new();
     host.start().await.expect("test module host starts");
     let instance = RuntimeInstance::spawn(host, services);
@@ -3213,7 +3278,8 @@ async fn proof_refresh_passes_only_proof_blocker_and_commits_completion() {
             verification_identity: completion_verifier_identity(),
         },
     )]));
-    let (output, requests, checkpoint) = run_proof_refresh_scenario(verifier.clone(), false).await;
+    let (output, requests, checkpoint) =
+        run_proof_refresh_scenario(verifier.clone(), false, false, false).await;
 
     assert!(
         output.ok,
@@ -3247,7 +3313,8 @@ async fn proof_refresh_failure_keeps_the_ordinary_refusal() {
             verification_identity: String::new(),
         },
     )]));
-    let (output, requests, checkpoint) = run_proof_refresh_scenario(verifier.clone(), false).await;
+    let (output, requests, checkpoint) =
+        run_proof_refresh_scenario(verifier.clone(), false, false, false).await;
 
     assert!(
         !output.ok,
@@ -3272,7 +3339,8 @@ async fn proof_refresh_identity_mismatch_fails_closed() {
             verification_identity: "a-different-host-identity".into(),
         },
     )]));
-    let (output, _requests, checkpoint) = run_proof_refresh_scenario(verifier.clone(), false).await;
+    let (output, _requests, checkpoint) =
+        run_proof_refresh_scenario(verifier.clone(), false, false, false).await;
 
     assert!(
         !output.ok,
@@ -3292,7 +3360,8 @@ async fn proof_refresh_verifier_error_keeps_the_ordinary_refusal() {
     let verifier = Arc::new(ScriptedProofVerifier::new(vec![Err(AgentError::Tool(
         "scripted verifier failure".into(),
     ))]));
-    let (output, requests, checkpoint) = run_proof_refresh_scenario(verifier.clone(), false).await;
+    let (output, requests, checkpoint) =
+        run_proof_refresh_scenario(verifier.clone(), false, false, false).await;
 
     assert!(!output.ok, "a verifier error must not manufacture a PASS");
     assert_eq!(output.metadata["refused"], "completion_gate");
@@ -3310,7 +3379,8 @@ async fn proof_refresh_is_skipped_when_an_open_loop_blocks_completion() {
             verification_identity: completion_verifier_identity(),
         },
     )]));
-    let (output, _requests, checkpoint) = run_proof_refresh_scenario(verifier.clone(), true).await;
+    let (output, _requests, checkpoint) =
+        run_proof_refresh_scenario(verifier.clone(), true, false, false).await;
 
     assert!(
         !output.ok,

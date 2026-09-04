@@ -6,6 +6,37 @@ use crate::task::{
     COMPLETION_REPAIR_VIEW_CHARS, MAX_COMPLETION_REPAIR_REFUSALS, MAX_COMPLETION_REPAIR_STEPS,
 };
 
+/// Everything the sync plan phase of a completion proof refresh decided,
+/// owned so the host verifier can run outside the actor loop and the apply
+/// phase can re-fence against exactly this basis.
+pub(super) struct ProofRefreshPlan {
+    request: crate::verification::ProofVerifierRequest,
+    verification_revision: u64,
+    directive_revision: u64,
+    workspace_revision: u64,
+    attribution: RuntimeExecutionAttribution,
+    argument_digest: String,
+    call: ToolCall,
+    recipe_id: String,
+}
+
+/// One deferred completion: the parked proposal plus the refreshed-proof
+/// plan, delivered back to the actor loop when the host verifier finishes.
+pub(crate) struct DeferredProofRefresh {
+    plan: ProofRefreshPlan,
+    proposal: CompletionProposal,
+    turn_id: TurnId,
+    generation: u64,
+    outcome: AgentResult<crate::verification::ProofVerifierOutcome>,
+}
+
+/// Watchdog handle for one in-flight deferred proof refresh. Turn
+/// cancellation and shutdown abort the task, so a killed verify can never
+/// deliver a stale proposal back into a moved world.
+pub(super) struct PendingProofRefresh {
+    pub(super) task: tokio::task::JoinHandle<()>,
+}
+
 impl RuntimeActor {
     /// Commit the turn start: user message into the long-term context, then
     /// spawn the first model operation.
@@ -492,35 +523,25 @@ impl RuntimeActor {
     /// minted against the same basis. The transaction never bypasses open
     /// loops, effect debt, recovery or approval — any such blocker makes
     /// it ineligible — and every failure keeps the ordinary refusal.
-    pub(super) async fn refresh_proof_before_completion(&mut self) {
+    fn plan_proof_refresh(&mut self) -> Option<ProofRefreshPlan> {
         if !self.services.project_proof_refresh() {
-            return;
+            return None;
         }
-        let Some(verifier) = self.services.proof_verifier().cloned() else {
-            return;
-        };
-        let Some(turn) = self.state.turn.as_ref() else {
-            return;
-        };
+
+        let turn = self.state.turn.as_ref()?;
         let readiness = self.completion_proposal_readiness(Some(&turn.execution));
         if readiness.allows_completion() || !proof_is_sole_blocker(&readiness) {
-            return;
+            return None;
         }
-        let Some((_, _, recipe_id)) = self.runtime_completion_proof_route(&readiness) else {
-            return;
-        };
-        let Some(basis) = readiness.verification_basis else {
-            return;
-        };
+        let (_, _, recipe_id) = self.runtime_completion_proof_route(&readiness)?;
+        let basis = readiness.verification_basis?;
         let call = ToolCall {
             id: format!("proof-refresh-{}", now_ms()),
             name: "verify.run".into(),
             arguments: serde_json::json!({ "recipe_id": recipe_id.clone() }),
         };
         let attribution = self.runtime_execution_attribution(&call);
-        if attribution.exact_verification_identity().is_none() {
-            return;
-        }
+        attribution.exact_verification_identity()?;
         let argument_digest = ArgumentDigest::from_json(&call.arguments).to_string();
         if turn
             .execution
@@ -535,7 +556,7 @@ impl RuntimeActor {
             // The exact recipe already failed on this directive/world/host
             // identity. Re-running it cannot add evidence; a changed basis or
             // recipe identity naturally invalidates this negative lease.
-            return;
+            return None;
         }
         let request = crate::verification::ProofVerifierRequest {
             run_id: self.core.run_id(),
@@ -545,15 +566,96 @@ impl RuntimeActor {
             directive_revision: basis.directive_revision,
             workspace_revision: basis.workspace_revision,
         };
-        let outcome = verifier.verify_exact(request).await;
+        Some(ProofRefreshPlan {
+            request,
+            verification_revision: basis.verification_revision,
+            directive_revision: basis.directive_revision,
+            workspace_revision: basis.workspace_revision,
+            attribution,
+            argument_digest,
+            call,
+            recipe_id,
+        })
+    }
+
+    /// Launch a deferred proof refresh: run the host verifier outside the
+    /// actor loop, park the completion proposal, and rewrite the
+    /// `task.complete` result the model sees this round. Returns `false`
+    /// when there is nothing to defer (no plan or no verifier); the caller
+    /// then finishes the proposal inline.
+    pub(super) async fn begin_deferred_proof_refresh(
+        &mut self,
+        output: &mut ToolOutput,
+        proposal: &mut Option<CompletionProposal>,
+        proof_tx: &tokio::sync::mpsc::Sender<DeferredProofRefresh>,
+    ) -> bool {
+        // Default is the historical inline refresh: the model sees the
+        // authoritative gate result in the same round. Deferral is an
+        // explicit composition-root choice.
+        if !self.services.defer_proof_refresh() {
+            return false;
+        }
+        let Some(plan) = self.plan_proof_refresh() else {
+            return false;
+        };
+        let Some(verifier) = self.services.proof_verifier().cloned() else {
+            return false;
+        };
+        let Some(turn) = self.state.turn.as_ref() else {
+            return false;
+        };
+        let turn_id = turn.turn_id;
+        let generation = self.state.generation;
+        let recipe_id = plan.recipe_id.clone();
+        let mut proposal_owned = proposal.take();
+        let proof_tx = proof_tx.clone();
+        let request = plan.request.clone();
+        let task = tokio::spawn(async move {
+            let outcome = verifier.verify_exact(request).await;
+            let proposal = proposal_owned
+                .take()
+                .unwrap_or_else(|| unreachable!("begin_deferred_proof_refresh parked no proposal"));
+            let _ = proof_tx
+                .send(DeferredProofRefresh {
+                    plan,
+                    proposal,
+                    turn_id,
+                    generation,
+                    outcome,
+                })
+                .await;
+        });
+        self.state.pending_proof_refresh = Some(PendingProofRefresh { task });
+        // Keep the model's round moving: the runtime now owns this
+        // completion intent and reports the authoritative outcome through
+        // its own observation and events.
+        output.ok = true;
+        output.summary =
+            "task completion deferred: trusted proof refresh is running in the background".into();
+        output.model_content = "task completion deferred: the runtime is refreshing the trusted proof and will finish this completion".into();
+        output.metadata = serde_json::json!({
+            "refused": "deferred_proof_refresh",
+            "recipe_id": recipe_id,
+        });
+        true
+    }
+
+    /// Apply a finished proof refresh against its recorded basis. The same
+    /// fence as the historical inline path: a moved world forgets the run
+    /// instead of trusting a stale check.
+    pub(super) async fn apply_proof_refresh_outcome(
+        &mut self,
+        plan: ProofRefreshPlan,
+        outcome: AgentResult<crate::verification::ProofVerifierOutcome>,
+    ) {
         // Fence post: the same world must still hold. A moved world forgets
         // the run instead of trusting a stale check.
         let Some(turn) = self.state.turn.as_ref() else {
             return;
         };
-        if turn.execution.verification.spec_revision != basis.verification_revision
-            || turn.execution.directive_revision != basis.directive_revision
-            || turn.execution.workspace_revision != basis.workspace_revision
+        if turn.execution.verification.spec_revision != plan.verification_revision
+            || turn.execution.directive_revision != plan.directive_revision
+            || turn.execution.workspace_revision != plan.workspace_revision
         {
             return;
         }
@@ -571,13 +673,13 @@ impl RuntimeActor {
         // the same expensive verifier again without a semantic change.
         let identity_matches = reported_ok
             && !reported_identity.is_empty()
-            && attribution.exact_verification_identity() == Some(reported_identity.as_str());
+            && plan.attribution.exact_verification_identity() == Some(reported_identity.as_str());
         if reported_ok && !identity_matches {
             summary = "host proof refresh identity did not match dispatcher attribution".into();
         }
         let mut output = ToolOutput {
-            call_id: call.id,
-            tool_name: call.name,
+            call_id: plan.call.id,
+            tool_name: plan.call.name,
             ok: identity_matches,
             summary: bounded_preview(&summary, agent_contracts::MAX_TOOL_SUMMARY_CHARS),
             model_content: String::new(),
@@ -585,7 +687,7 @@ impl RuntimeActor {
             metadata: serde_json::json!({
                 "verification": true,
                 "proof_refresh": true,
-                "recipe_id": recipe_id,
+                "recipe_id": plan.recipe_id,
             }),
         };
         output.set_native_execution_facts(
@@ -600,9 +702,9 @@ impl RuntimeActor {
         let observation = self.observe_persistable_tool(
             &output,
             ToolResultDisposition::PersistObservation,
-            &argument_digest,
+            &plan.argument_digest,
             &facts,
-            Some(&attribution),
+            Some(&plan.attribution),
         );
         if let Some(observation) = observation {
             let _ = self.report_frontier(Some(observation)).await;
@@ -610,21 +712,112 @@ impl RuntimeActor {
         self.accrue_checkpoint_debt(crate::checkpoint::CheckpointDebtReason::VerificationChanged);
     }
 
+    /// A deferred proof refresh finished. Resume only if the same turn is
+    /// still live under the same generation; apply the outcome against the
+    /// recorded basis; then finish the parked completion through the same
+    /// acceptance/refusal path an inline proposal takes. A refusal is
+    /// surfaced as a bounded warning the model can read next round — the
+    /// refreshed verification itself is already in context.
+    pub(super) async fn on_proof_refresh_completed(&mut self, resumed: DeferredProofRefresh) {
+        let live = self
+            .state
+            .turn
+            .as_ref()
+            .is_some_and(|turn| turn.turn_id == resumed.turn_id)
+            && self.state.generation == resumed.generation;
+        self.state.pending_proof_refresh = None;
+        if !live {
+            // The turn moved on while the verifier ran. Nothing is lost:
+            // the refreshed verification observation is already durable in
+            // the context, so the model's next `task.complete` proposal is
+            // admitted inline without another verifier run. Name the drop.
+            let _ = self
+                .core
+                .emit_event(RuntimeEvent::Warning {
+                    message: crate::output::bound_error_message(
+                        "deferred completion dropped: its turn finished first; the refreshed proof is recorded, so the next task.complete is admitted directly".to_string(),
+                    ),
+                })
+                .await;
+            return;
+        }
+        let DeferredProofRefresh {
+            plan,
+            proposal,
+            outcome,
+            ..
+        } = resumed;
+        self.apply_proof_refresh_outcome(plan, outcome).await;
+        let mut scratch = ToolOutput {
+            call_id: format!("deferred-complete-{}", now_ms()),
+            tool_name: "task.complete".into(),
+            ok: false,
+            summary: String::new(),
+            model_content: String::new(),
+            artifact_ref: None,
+            metadata: serde_json::json!({ "deferred_completion": true }),
+        };
+        self.finalize_completion_proposal(&mut scratch, proposal)
+            .await;
+        if !scratch.ok {
+            let _ = self
+                .core
+                .emit_event(RuntimeEvent::Warning {
+                    message: crate::output::bound_error_message(format!(
+                        "deferred completion refused after proof refresh: {}",
+                        scratch.summary
+                    )),
+                })
+                .await;
+        }
+    }
+
     /// Apply a structured completion proposal and replace the tool's
     /// optimistic submission text with Runtime's authoritative gate result.
     /// A refusal is a normal, bounded tool failure visible to the next model
-    /// decision; it never installs `pending_completion`.
+    /// decision; it never installs `pending_completion`. When proof is the
+    /// sole blocker, the host verifier is launched outside the actor loop
+    /// and the proposal is resumed when it finishes.
     pub(super) async fn apply_completion_proposal(
         &mut self,
         output: &mut ToolOutput,
         proposal: CompletionProposal,
+        proof_tx: &tokio::sync::mpsc::Sender<DeferredProofRefresh>,
     ) {
-        // Runtime-owned proof-refresh transaction: before accepting, one
-        // explicit completion intent may refresh a stale proof itself. A
-        // PASS only lands when proof is the sole blocker and the host
-        // verifier agrees with the gate's attribution; everything else
-        // falls through to the ordinary refusal below.
-        self.refresh_proof_before_completion().await;
+        let mut parked = Some(proposal);
+        if self
+            .begin_deferred_proof_refresh(output, &mut parked, proof_tx)
+            .await
+        {
+            return;
+        }
+        let proposal = parked.take().unwrap_or_else(|| {
+            unreachable!(
+                "begin_deferred_proof_refresh returned false without consuming the proposal"
+            )
+        });
+        // Historical inline refresh: the model sees the authoritative gate
+        // result in this same round. The await holds the actor loop — the
+        // opt-in deferred path above is what removes that stall.
+        if let (Some(plan), Some(verifier)) = (
+            self.plan_proof_refresh(),
+            self.services.proof_verifier().cloned(),
+        ) {
+            let request = plan.request.clone();
+            let outcome = verifier.verify_exact(request).await;
+            self.apply_proof_refresh_outcome(plan, outcome).await;
+        }
+        self.finalize_completion_proposal(output, proposal).await;
+    }
+
+    /// Acceptance and refusal bookkeeping for one completion proposal,
+    /// writing Runtime's authoritative gate result into `output`. Shared by
+    /// the inline path and the deferred proof-refresh resume.
+    async fn finalize_completion_proposal(
+        &mut self,
+        output: &mut ToolOutput,
+        proposal: CompletionProposal,
+    ) {
         if let Err(error) = self.accept_completion_proposal(proposal) {
             let readiness = self
                 .state
@@ -2408,6 +2601,12 @@ impl RuntimeActor {
             .and_then(|operation| operation.tool_identity.clone());
         if let Some(operation) = self.state.turn.as_ref().and_then(|turn| turn.op.as_ref()) {
             operation.cancel.cancel();
+        }
+        // A deferred proof refresh belongs to the dying turn: abort the
+        // host verifier and drop the parked proposal before the fence can
+        // ever be crossed by a stale resume.
+        if let Some(pending) = self.state.pending_proof_refresh.take() {
+            pending.task.abort();
         }
         if let Some(identity) = tool_identity
             && let Err(error) = self.core.cancel_operation(identity)

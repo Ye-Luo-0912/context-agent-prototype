@@ -50,6 +50,11 @@ pub struct RuntimeServices {
     /// every checkpoint's run metadata. Absent when the composition did
     /// not provide one.
     provider_profile_digest: Option<String>,
+    /// When false (the default), a completion-time proof refresh runs
+    /// inline in the actor, preserving the historical same-round gate
+    /// result. When true, the host verifier runs outside the actor loop
+    /// and the parked completion resumes when it finishes.
+    defer_proof_refresh: bool,
     /// Ablation: when false, PromptAssembler omits TaskProgress. Default true.
     project_task_progress: bool,
     /// Ablation: when true, a settled-candidate fact is projected into the
@@ -191,6 +196,7 @@ impl RuntimeServices {
             verification_coverage_declarations,
             artifact_workspace: None,
             provider_profile_digest: None,
+            defer_proof_refresh: false,
             project_task_progress: true,
             project_settlement: false,
             settlement_projection_diagnostics: false,
@@ -234,6 +240,7 @@ impl RuntimeServices {
             verification_coverage_declarations,
             artifact_workspace: None,
             provider_profile_digest: None,
+            defer_proof_refresh: false,
             project_task_progress: true,
             project_settlement: false,
             settlement_projection_diagnostics: false,
@@ -307,6 +314,17 @@ impl RuntimeServices {
 
     pub fn provider_profile_digest(&self) -> Option<&str> {
         self.provider_profile_digest.as_deref()
+    }
+
+    /// Opt-in deferral of completion-time proof refresh (see the field
+    /// doc).
+    pub fn defer_proof_refresh(&self) -> bool {
+        self.defer_proof_refresh
+    }
+
+    pub fn with_defer_proof_refresh(mut self, defer: bool) -> Self {
+        self.defer_proof_refresh = defer;
+        self
     }
 
     pub fn with_project_task_progress(mut self, project: bool) -> Self {

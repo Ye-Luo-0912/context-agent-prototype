@@ -133,6 +133,7 @@ async fn run_session(
         Arc::new(SimpleContextEngine::new(SimpleContextConfig::default()));
     let composed = compose(ComposeConfig {
         provider_profile_digest: None,
+        defer_proof_refresh: false,
         workspace,
         context_engine,
         model,
