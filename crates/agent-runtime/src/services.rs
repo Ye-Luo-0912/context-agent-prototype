@@ -55,6 +55,9 @@ pub struct RuntimeServices {
     /// result. When true, the host verifier runs outside the actor loop
     /// and the parked completion resumes when it finishes.
     defer_proof_refresh: bool,
+    /// Compile the shadow Context Frame manifest and emit it as
+    /// `ContextFrameShadow` diagnostics. Never changes model input.
+    shadow_context_frame: bool,
     /// Ablation: when false, PromptAssembler omits TaskProgress. Default true.
     project_task_progress: bool,
     /// Ablation: when true, a settled-candidate fact is projected into the
@@ -197,6 +200,7 @@ impl RuntimeServices {
             artifact_workspace: None,
             provider_profile_digest: None,
             defer_proof_refresh: false,
+            shadow_context_frame: false,
             project_task_progress: true,
             project_settlement: false,
             settlement_projection_diagnostics: false,
@@ -241,6 +245,7 @@ impl RuntimeServices {
             artifact_workspace: None,
             provider_profile_digest: None,
             defer_proof_refresh: false,
+            shadow_context_frame: false,
             project_task_progress: true,
             project_settlement: false,
             settlement_projection_diagnostics: false,
@@ -324,6 +329,16 @@ impl RuntimeServices {
 
     pub fn with_defer_proof_refresh(mut self, defer: bool) -> Self {
         self.defer_proof_refresh = defer;
+        self
+    }
+
+    /// Opt-in shadow Context Frame manifest emission (see the field doc).
+    pub fn shadow_context_frame(&self) -> bool {
+        self.shadow_context_frame
+    }
+
+    pub fn with_shadow_context_frame(mut self, shadow: bool) -> Self {
+        self.shadow_context_frame = shadow;
         self
     }
 

@@ -296,10 +296,16 @@ Any split should follow transaction boundaries, not line counts.
 7. `TUI-ALPHA-01` — P2-BLK-6 + approval detail + Lagged resync.
 8. `PACKAGE-01` — Windows/Linux binaries, checksums, clean-machine doctor
    (Phase 3, together with `LT-EVAL-06`).
-9. Structured Context Frame (`ContextFrameCompiler`) may start as
-   shadow/audit only after the Phase 2 shell is coherent; it must not
-   precede items 2–7 and must not modify formal-prompt semantics outside
-   its own gate.
+9. `CONTEXT-FRAME-SHADOW-01` — **Frame-0 landed 2026-09-05**: the shadow
+   `ContextFrameCompiler` (`agent-runtime::frame`) compiles the same state
+   the prompt assembler consumes into a zoned, classified `FrameManifest`
+   (`context-frame-shadow/v1`), emitted as `RuntimeEvent::ContextFrameShadow`
+   behind the opt-in `shadow_context_frame` compose flag. Model input is
+   byte-identical with the flag on or off; the product-flow acceptance
+   asserts the manifest reaches the event stream. Frame-1 (offline replay
+   cost comparison) and Frame-2 (scripted gate) remain.
+   Structured Context Frame (`ContextFrameCompiler`) was sequenced as
+   shadow/audit only after the Phase 2 shell is coherent.
 
 Out of scope for now (per ROADMAP "Later, only from evidence"): run/task
 database projection beyond the bounded read model, serial TaskGraph,

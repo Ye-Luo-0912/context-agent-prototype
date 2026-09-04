@@ -789,6 +789,26 @@ impl RuntimeActor {
                 .await;
             return;
         }
+        // Shadow Context Frame: compile the same state into the structured
+        // frame manifest and emit it for measurement. This never touches
+        // the model input — the assembled request below is byte-identical
+        // whether or not the shadow compiler runs.
+        if self.services.shadow_context_frame() {
+            let manifest = crate::frame::compile_shadow_frame(&crate::frame::ShadowFrameInputs {
+                run_id: self.core.run_id(),
+                task_id: self.state.tasks.active(),
+                anchor: task_view.as_ref(),
+                materialized: &materialized,
+                unresolved_ack_debts: self.state.unresolved_ack_debts.len(),
+            });
+            let bounded = crate::output::bound_error_message(
+                serde_json::to_string(&manifest).unwrap_or_default(),
+            );
+            let _ = self
+                .core
+                .emit_event(RuntimeEvent::ContextFrameShadow { manifest: bounded })
+                .await;
+        }
         let materialize_ms = materialize_started.elapsed().as_millis() as u64;
         // Runtime final guard: the engine priced the working-set content,
         // but the assembler's rendering overhead (section headers, per-item

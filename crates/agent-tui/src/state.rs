@@ -874,6 +874,24 @@ impl AppState {
                 self.busy = false;
                 self.status = "stopped".into();
             }
+            RuntimeEvent::ContextFrameShadow { manifest } => {
+                // Shadow measurement: surface a compact line only; the
+                // full manifest lives in the event journal for the gates.
+                if let Ok(value) = serde_json::from_str::<serde_json::Value>(&manifest) {
+                    let digest = value["frame_digest"]
+                        .as_str()
+                        .and_then(|digest| digest.get(..12))
+                        .unwrap_or("?")
+                        .to_string();
+                    self.push_system(format!(
+                        "shadow frame: digest {} tokens {} misses {} dups {}",
+                        digest,
+                        value["approx_tokens_total"].as_u64().unwrap_or(0),
+                        value["required_misses"].as_u64().unwrap_or(0),
+                        value["duplicates_removed"].as_u64().unwrap_or(0),
+                    ));
+                }
+            }
         }
     }
 }

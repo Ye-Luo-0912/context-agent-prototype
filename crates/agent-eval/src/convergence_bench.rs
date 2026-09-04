@@ -134,6 +134,7 @@ async fn run_session(
     let composed = compose(ComposeConfig {
         provider_profile_digest: None,
         defer_proof_refresh: false,
+        shadow_context_frame: false,
         workspace,
         context_engine,
         model,

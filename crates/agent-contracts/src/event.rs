@@ -713,6 +713,13 @@ pub enum RuntimeEvent {
         legacy_allowed: bool,
         shadow: crate::approval::ShadowVerdict,
     },
+    /// Shadow Context Frame manifest (bounded JSON), emitted only when the
+    /// composition root enables the shadow frame compiler. Never an input
+    /// to the model: it is the measurement record of what the structured
+    /// frame would have contained, for cost/coverage comparison.
+    ContextFrameShadow {
+        manifest: String,
+    },
     /// A short-lived authority lease was minted for one side-effecting
     /// tool call (ACI v2 §6): the legacy path allowed the call, and the
     /// runtime now holds a bounded commit-time authorization for its

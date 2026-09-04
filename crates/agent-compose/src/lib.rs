@@ -364,6 +364,10 @@ pub struct ComposeConfig {
     /// `false` (default) keeps the historical inline refresh with its
     /// same-round authoritative gate result.
     pub defer_proof_refresh: bool,
+    /// Opt-in: compile the shadow Context Frame manifest each round and
+    /// emit it as `ContextFrameShadow` diagnostics. Never changes model
+    /// input; measurement only.
+    pub shadow_context_frame: bool,
     /// The context engine, already selected by the caller.
     pub context_engine: Arc<dyn ContextEngine>,
     /// The model transport, already selected by the caller.
@@ -464,6 +468,7 @@ pub async fn compose(config: ComposeConfig) -> anyhow::Result<ComposedRuntime> {
     let ComposeConfig {
         provider_profile_digest: provider_profile_digest_in,
         defer_proof_refresh,
+        shadow_context_frame,
         workspace,
         context_engine,
         model,
@@ -566,6 +571,7 @@ pub async fn compose(config: ComposeConfig) -> anyhow::Result<ComposedRuntime> {
         services.set_provider_profile_digest(digest);
     }
     services = services.with_defer_proof_refresh(defer_proof_refresh);
+    services = services.with_shadow_context_frame(shadow_context_frame);
     // A recipe table always installs the read-only domain resolver so a
     // model-facing repair can name an exact recipe on cold start. The switch
     // controls only Runtime's optional automatic execution of that recipe.
@@ -650,6 +656,7 @@ mod tests {
         ComposeConfig {
             provider_profile_digest: None,
             defer_proof_refresh: false,
+            shadow_context_frame: false,
             workspace,
             context_engine: engine,
             model,

@@ -78,6 +78,9 @@ async fn compose_config(
     Ok(ComposeConfig {
         provider_profile_digest: None,
         defer_proof_refresh: false,
+        // The shadow frame compiler runs for real in this acceptance flow:
+        // one manifest per model round must reach the event stream.
+        shadow_context_frame: true,
         workspace: workspace.clone(),
         context_engine: Arc::new(SimpleContextEngine::new(SimpleContextConfig::default())),
         model,
@@ -140,12 +143,29 @@ async fn save_restart_resume_writes_exactly_once() {
         .user_message("demo: write hello".into())
         .await
         .unwrap();
-    wait_for(
-        &mut events,
-        |event| matches!(event, RuntimeEvent::TurnCompleted),
-        "finish the scripted turn",
-    )
-    .await;
+    // The turn finishes through two model rounds; the shadow Context Frame
+    // manifest is emitted during each round's preparation, so track it in
+    // the same drain instead of after the turn event.
+    let mut shadow_manifest_seen = false;
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
+    loop {
+        if let Ok(envelope) = events.try_recv() {
+            match envelope.event {
+                RuntimeEvent::ContextFrameShadow { .. } => shadow_manifest_seen = true,
+                RuntimeEvent::TurnCompleted => break,
+                _ => {}
+            }
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the runtime never finished the scripted turn"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert!(
+        shadow_manifest_seen,
+        "the shadow frame manifest must reach the event stream"
+    );
     assert_eq!(
         std::fs::read_to_string(root.join("hello.txt")).unwrap(),
         "hello from the product flow"
