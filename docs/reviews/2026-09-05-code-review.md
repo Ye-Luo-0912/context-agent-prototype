@@ -199,6 +199,13 @@ operations (`InFlightOp { kind: OpKind::Model|Tool, cancel }`,
 
 ### P2-BLK-6 — Unbounded TUI transcript
 
+**Closed on source, 2026-09-05:** every transcript write in
+`agent-tui/src/state.rs` now goes through one bounded `push_message`
+(`MAX_RENDERED_MESSAGES = 400`, oldest rows drained); the durable
+transcript remains the runtime event journal.
+
+Original finding, retained for the record:
+
 `crates/agent-tui/src/state.rs:157` — `pub messages: Vec<UiMessage>` with
 no cap or drain (push sites L242, 295, 576/586, 604), while
 `context_transitions` is bounded at 100 (`MAX_PANEL_TRANSITIONS`, L30,

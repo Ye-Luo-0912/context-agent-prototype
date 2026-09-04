@@ -28,6 +28,10 @@ pub struct PendingApproval {
 }
 
 const MAX_PANEL_TRANSITIONS: usize = 100;
+/// Hard cap on rendered transcript rows. The durable transcript is the
+/// runtime event journal; the UI only keeps a bounded window so a long
+/// session cannot grow TUI memory without bound.
+const MAX_RENDERED_MESSAGES: usize = 400;
 const MAX_TOOL_SURFACE_PREVIEW_ROWS_PER_KIND: usize = 3;
 const MAX_TOOL_SURFACE_PREVIEW_NAME_CHARS: usize = 48;
 const MAX_TOOL_SURFACE_MESSAGE_CHARS: usize = 640;
@@ -239,10 +243,18 @@ impl AppState {
     }
 
     pub fn push_system(&mut self, content: String) {
-        self.messages.push(UiMessage {
-            role: UiRole::System,
-            content,
-        });
+        self.push_message(UiRole::System, content);
+    }
+
+    /// Append one transcript row, draining the oldest rows beyond the
+    /// render cap. Every transcript write goes through here so no caller
+    /// can reintroduce an unbounded list.
+    fn push_message(&mut self, role: UiRole, content: String) {
+        self.messages.push(UiMessage { role, content });
+        let overflow = self.messages.len().saturating_sub(MAX_RENDERED_MESSAGES);
+        if overflow > 0 {
+            self.messages.drain(..overflow);
+        }
     }
 
     pub fn begin_approval(&mut self, request: ApprovalRequest) {
@@ -292,10 +304,7 @@ impl AppState {
                         if let Some(id) = input.input_id {
                             self.last_shown_input_id = Some(id);
                         }
-                        self.messages.push(UiMessage {
-                            role: UiRole::User,
-                            content: input.preview.clone(),
-                        });
+                        self.push_message(UiRole::User, input.preview.clone());
                     }
                     if input.is_applied() {
                         self.busy = true;
@@ -573,20 +582,14 @@ impl AppState {
                 self.status = "model (streaming)".into();
                 match self.messages.last_mut() {
                     Some(last) if last.role == UiRole::Assistant => last.content.push_str(&delta),
-                    _ => self.messages.push(UiMessage {
-                        role: UiRole::Assistant,
-                        content: delta,
-                    }),
+                    _ => self.push_message(UiRole::Assistant, delta),
                 }
             }
             RuntimeEvent::AssistantMessage { content } => {
                 self.streaming = false;
                 match self.messages.last_mut() {
                     Some(last) if last.role == UiRole::Assistant => last.content = content,
-                    _ => self.messages.push(UiMessage {
-                        role: UiRole::Assistant,
-                        content,
-                    }),
+                    _ => self.push_message(UiRole::Assistant, content),
                 }
             }
             RuntimeEvent::OperationAccepted { .. } => {
@@ -601,14 +604,14 @@ impl AppState {
             }
             RuntimeEvent::ToolFinished { output, .. } => {
                 self.tool_status = format!("{}: {}", output.tool_name, output.summary);
-                self.messages.push(UiMessage {
-                    role: UiRole::Tool,
-                    content: format!(
+                self.push_message(
+                    UiRole::Tool,
+                    format!(
                         "{}\n{}",
                         output.summary,
                         output.artifact_ref.unwrap_or_default()
                     ),
-                });
+                );
             }
             RuntimeEvent::ToolScopeClosed {
                 scope_id,
@@ -867,6 +870,20 @@ impl AppState {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_transcript_window_stays_bounded_and_keeps_the_newest() {
+        let mut app = AppState::new(RunId::new());
+        for index in 0..(MAX_RENDERED_MESSAGES + 50) {
+            app.push_system(format!("row-{index}"));
+        }
+        assert_eq!(app.messages.len(), MAX_RENDERED_MESSAGES);
+        assert!(app.messages[0].content.ends_with(&format!("row-{}", 50)));
+        assert_eq!(
+            app.messages.last().unwrap().content,
+            format!("row-{}", MAX_RENDERED_MESSAGES + 49)
+        );
+    }
     use agent_contracts::{
         RuntimeEventEnvelope, ToolSurfaceBlock, ToolSurfaceOmission, ToolSurfaceOmissionReason,
         ToolSurfaceSelection, ToolSurfaceSourceRevisions,
