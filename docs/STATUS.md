@@ -3,7 +3,8 @@
 This file answers four questions only. Architecture, lifecycle, execution,
 and sandbox contracts live elsewhere. Experiment facts live in
 `crates/agent-eval/evidence/*/REPORT.md`. Do not treat
-`docs/CONTEXT_RUNTIME_TODO.md` as live contract.
+`docs/archive/CONTEXT_RUNTIME_TODO.md` (historical design queue) as live
+contract.
 
 | Doc | Role |
 | --- | --- |
@@ -16,6 +17,7 @@ and sandbox contracts live elsewhere. Experiment facts live in
 | [`LONG_TASK_EVALUATION.md`](LONG_TASK_EVALUATION.md) | Long-task Runtime gaps and development diagnostic |
 | [`AUDIT_TODO.md`](AUDIT_TODO.md) | Confirmed defect queue |
 | [`M15_ACCEPTANCE.md`](M15_ACCEPTANCE.md) | Frozen formal-window semantics |
+| [`CURRENT.md`](CURRENT.md) + [`state.json`](state.json) | Live state snapshot and the machine-readable source of current numbers |
 
 ## Now
 
@@ -35,9 +37,10 @@ future preflight or window.
 
 
 The repository is a **substantial single-Agent runtime with a prototype product
-host**. It is not yet a complete local coding-Agent product. The shortest path
-is reliability and M15 first, then a deliberately small product shell; it is
-not a new planner, TaskGraph, database or multi-Agent layer.
+host**. It is not yet a complete local coding-Agent product. M15 is now
+closed (tenth-window bullet below); the shortest path is a deliberately
+small, durable product shell plus the `LT-EVAL-06` breadth — it is not a new
+planner, TaskGraph, database or multi-Agent layer.
 
 - Planning baseline: successor reliability commit `b44ea44`. Its local
   `agent-eval --doctor` run passed Python/helper probes, format, all-target /
@@ -150,7 +153,9 @@ not a new planner, TaskGraph, database or multi-Agent layer.
   anchor/world revisions reset repair accounting, and the exact proof route
   could depend on prior model history. Repeated calls were therefore treated
   as fresh attempts even when the typed blocker frontier did not improve.
-- A 2026-09-04 working-tree candidate implements semantic completion liveness:
+- The 2026-09-04 semantic-completion-liveness candidate (landed at `050aa8e`
+  with the ninth-window evidence; no longer a working-tree-only state)
+  implements:
   host-trusted effective-operation reconciliation, advisory-only `next_action`,
   `completion-repair.v2` episodes with typed progress/postconditions, a cold
   host declaration-to-exact-recipe route, and an audited text-only handoff when
@@ -159,10 +164,12 @@ not a new planner, TaskGraph, database or multi-Agent layer.
 - This is candidate implementation, not formal evidence. Format and the
   selected package check/strict Clippy pass; `agent-runtime` library tests are
   340/340, Runtime turn integration tests 111/111, `tool-runtime` library tests
-  214 pass with 1 ignored, and `agent-compose` library tests are 19/19. The
-  complete workspace gate, dual-platform CI, a new exact-source preflight and a
-  formal window remain separate exits. Historical v1 windows and their 6/12
-  verdict are unchanged. M15 remains open.
+  214 pass with 1 ignored, and `agent-compose` library tests are 19/19. Those
+  deterministic gates, the dual-platform CI on `050aa8e`/`a882789` (run
+  `33889267845`), the exact-source preflight PASS (`r1-attempt9`) and the
+  tenth formal window's mechanical 12/12 PASS each closed in order, and the
+  evidence commit `d004836` then recorded the M15 closure (bullet above).
+  Historical v1 windows and their 6/12 verdict are unchanged.
 - Product scope is now fixed to dynamic in-process Context, builtin tools, one
   workspace, one checked OpenAI-compatible provider profile and an interactive
   TUI. Service Context and dynamic extensions remain experimental unless their

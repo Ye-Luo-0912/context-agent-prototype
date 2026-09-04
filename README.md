@@ -226,7 +226,7 @@ lifecycle transitions / dependency edges and covered in
 `docs/CONTEXT_LIFECYCLE.md` §9b–9c.
 
 See `docs/ARCHITECTURE.md`, `docs/CONTEXT_LIFECYCLE.md`,
-`docs/CONTEXT_RUNTIME_TODO.md` (historical design queue; not a live
+`docs/archive/CONTEXT_RUNTIME_TODO.md` (historical design queue; not a live
 authority), `docs/TOOL_ECOSYSTEM_TODO.md` (modular trust boundaries, builtin
 ACI, and extension ecosystem design queue), and `docs/ROADMAP.md`.
 
@@ -241,12 +241,14 @@ now the product entry/configuration, verified workspace resume, visible
 recovery/status UX, a few correctness residuals and real coding
 non-inferiority.
 
-Formal M15 remains open: seven v4 valid FAIL windows are retained and the
-latest is 10/12. Successor reliability commit `b44ea44` passed the complete
-local doctor. Follow-up `c84f85e` passed both platform check jobs but exposed a
-parallel fd-reuse race in one Ubuntu assertion; the current identity-aware test
-fix still needs a clean CI record. See the current snapshot before interpreting
-any historical chronology.
+Formal M15 is closed (2026-09-04, commit `d004836`): the tenth predeclared
+12-cell v4 window returned the mechanical verdict **PASS 12/12 with 0
+NOT_RUN** (`_windows/1788539149184`; diag 4/4, migrate 4/4 and policy 4/4
+for the first time in one window), and all prior FAIL/censored windows stay
+immutable diagnostics. Current numbers live in the machine-readable
+[`docs/state.json`](docs/state.json) and the snapshot
+[`docs/CURRENT.md`](docs/CURRENT.md) — consult those before interpreting any
+historical chronology.
 `docs/STATUS.md` owns Now/freeze status, `docs/ROADMAP.md` owns milestone
 gates/order, `docs/AUDIT_TODO.md` owns confirmed defects and acceptance
 tests, and `docs/M15_ACCEPTANCE.md` owns the formal-window design.

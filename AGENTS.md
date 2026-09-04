@@ -7,6 +7,7 @@ changing architecture.
 | Doc | Role |
 | --- | --- |
 | [`docs/STATUS.md`](docs/STATUS.md) | Now / freeze / P0–P1 / next milestone |
+| [`docs/CURRENT.md`](docs/CURRENT.md) + [`docs/state.json`](docs/state.json) | Live state snapshot; machine-readable source of current numbers |
 | [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) | Stable architecture |
 | [`docs/CONTEXT_LIFECYCLE.md`](docs/CONTEXT_LIFECYCLE.md) | Context / GC / evidence / retrieval |
 | [`docs/EXECUTION_COHERENCE.md`](docs/EXECUTION_COHERENCE.md) | Execution Coherence V1 |
@@ -18,7 +19,8 @@ changing architecture.
 | `crates/agent-eval/evidence/*/REPORT.md` | Experiment facts |
 
 Do not duplicate those lists here. Do not treat
-`docs/CONTEXT_RUNTIME_TODO.md` as live contract.
+`docs/archive/CONTEXT_RUNTIME_TODO.md` (historical design queue) as live
+contract.
 
 ## Working rules
 

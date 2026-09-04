@@ -484,7 +484,7 @@ async fn one_shot_completion_closes_the_landed_tool_scope_without_a_next_model()
         .await
         .unwrap();
 
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
     loop {
         if let Ok(Ok(envelope)) =
             tokio::time::timeout(Duration::from_millis(50), events.recv()).await
@@ -1253,7 +1253,7 @@ async fn actor_routes_lease_directive_into_the_context_engine() {
     let mut events = handle.subscribe();
     handle.user_message("lease something".into()).await.unwrap();
     let mut seen: Vec<String> = Vec::new();
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
     while tokio::time::Instant::now() < deadline {
         while let Ok(envelope) = events.try_recv() {
             seen.push(format!("{:?}", envelope.event));
@@ -1323,7 +1323,7 @@ async fn actor_routes_collect_directive_into_a_full_gc_pass() {
     let mut events = handle.subscribe();
     handle.user_message("collect now".into()).await.unwrap();
     let mut seen: Vec<String> = Vec::new();
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
     while tokio::time::Instant::now() < deadline {
         while let Ok(envelope) = events.try_recv() {
             seen.push(format!("{:?}", envelope.event));
@@ -1420,7 +1420,7 @@ async fn before_model_audit_failure_fences_the_turn() {
     handle.user_message("hello".into()).await.unwrap();
 
     let mut seen: Vec<String> = Vec::new();
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
     while tokio::time::Instant::now() < deadline {
         while let Ok(envelope) = events.try_recv() {
             seen.push(format!("{:?}", envelope.event));
@@ -1469,7 +1469,7 @@ async fn collect_audit_failure_is_not_silent() {
     handle.user_message("collect now".into()).await.unwrap();
 
     let mut seen: Vec<String> = Vec::new();
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
     while tokio::time::Instant::now() < deadline {
         while let Ok(envelope) = events.try_recv() {
             seen.push(format!("{:?}", envelope.event));

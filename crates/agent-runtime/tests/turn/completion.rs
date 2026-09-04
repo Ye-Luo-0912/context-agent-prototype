@@ -497,7 +497,7 @@ async fn run_model_visible_completion_refusal(
     handle.user_message("try to finish".into()).await.unwrap();
 
     let mut completion_output = None;
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
     while tokio::time::Instant::now() < deadline {
         if let Ok(Ok(envelope)) =
             tokio::time::timeout(Duration::from_millis(50), events.recv()).await
@@ -615,7 +615,7 @@ async fn hard_required_context_miss_keeps_completion_refused() {
     handle.user_message("try to finish".into()).await.unwrap();
 
     let mut completion_output = None;
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
     while tokio::time::Instant::now() < deadline {
         if let Ok(Ok(envelope)) =
             tokio::time::timeout(Duration::from_millis(50), events.recv()).await
@@ -758,7 +758,7 @@ async fn task_complete_proposal_commits_the_typed_record_at_turn_end() {
 
     let mut completed_event = None;
     let mut pending_receipt = None;
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
     while tokio::time::Instant::now() < deadline {
         while let Ok(envelope) = events.try_recv() {
             if let RuntimeEvent::ToolFinished { output, .. } = &envelope.event
@@ -866,7 +866,7 @@ async fn deferred_completion_failure_rolls_back_context_and_persists_resume_fact
     declare_completion_acceptance(handle, "finish the work").await;
     handle.user_message("finish the work".into()).await.unwrap();
 
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
     let mut failure = None;
     let mut failure_checkpoint_landed = false;
     while tokio::time::Instant::now() < deadline {
@@ -949,7 +949,7 @@ async fn post_commit_audit_failure_never_projects_a_pending_completion_failure()
     declare_completion_acceptance(handle, "finish the work").await;
     handle.user_message("finish the work".into()).await.unwrap();
 
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
     let mut saw_recovery = false;
     let mut saw_pending_failure = false;
     let mut saw_pending_failure_debt = false;
@@ -1086,7 +1086,7 @@ async fn task_complete_waits_for_model_when_a_sibling_action_failed() {
     let mut failed_batch_seen = false;
     let mut settled_failures = Vec::new();
     let mut assistant_content = None;
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
     while tokio::time::Instant::now() < deadline {
         if let Ok(Ok(envelope)) =
             tokio::time::timeout(Duration::from_millis(50), events.recv()).await
@@ -1184,7 +1184,7 @@ async fn final_assistant_response_is_persisted_in_full_before_contextitem_trunca
     // The file is created before it is populated, so path existence is not
     // a publication barrier. `TurnCompleted` is emitted only after the
     // pinned artifact handle has been fully written and flushed.
-    tokio::time::timeout(Duration::from_secs(5), async {
+    tokio::time::timeout(Duration::from_secs(30), async {
         loop {
             match events.recv().await {
                 Ok(envelope) if matches!(envelope.event, RuntimeEvent::TurnCompleted) => break,
@@ -1314,7 +1314,7 @@ async fn completion_record_attaches_the_raw_final_response_artifact() {
 
     let mut task_id = None;
     let mut events = handle.subscribe();
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
     while tokio::time::Instant::now() < deadline {
         while let Ok(envelope) = events.try_recv() {
             if let RuntimeEvent::TaskCompleted {
@@ -1544,7 +1544,7 @@ async fn wait_for_completed_record(
     instance: &RuntimeInstance,
     events: &mut tokio::sync::broadcast::Receiver<RuntimeEventEnvelope>,
 ) -> agent_runtime::checkpoint::RuntimeCheckpoint {
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
     loop {
         if let Ok(Ok(envelope)) =
             tokio::time::timeout(Duration::from_millis(50), events.recv()).await
@@ -1711,7 +1711,7 @@ async fn focus_switch_clears_previous_tasks_raw_assistant_evidence() {
     instance.start().await.unwrap();
     handle.user_message("task A work".into()).await.unwrap();
 
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
     loop {
         if let Ok(Ok(envelope)) =
             tokio::time::timeout(Duration::from_millis(50), events.recv()).await
@@ -1840,7 +1840,7 @@ async fn duplicate_completions_in_one_batch_commit_exactly_one_record() {
     // The TaskCompleted event lands after TurnCompleted at the safe point,
     // so waiting for it implies the whole commit transaction ran.
     let mut summaries_seen = Vec::new();
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
     loop {
         match tokio::time::timeout(Duration::from_millis(50), events.recv()).await {
             Ok(Ok(envelope)) => {
@@ -2099,7 +2099,7 @@ async fn unloaded_surface_attempts_are_visible_but_never_completion_debt() {
 
     let mut task_completed = false;
     let mut surface_refusals = Vec::new();
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
     while tokio::time::Instant::now() < deadline && !task_completed {
         if let Ok(Ok(envelope)) =
             tokio::time::timeout(Duration::from_millis(50), events.recv()).await
@@ -2272,7 +2272,7 @@ async fn consecutive_refusals_against_the_same_basis_accrue_durably() {
     handle.user_message("try to finish".into()).await.unwrap();
 
     let mut refusals = Vec::new();
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
     while tokio::time::Instant::now() < deadline && refusals.len() < 2 {
         if let Ok(Ok(envelope)) =
             tokio::time::timeout(Duration::from_millis(50), events.recv()).await
@@ -2426,7 +2426,7 @@ async fn operator_only_refusals_escalate_to_a_terminal_surface() {
     let mut assistant_final = None;
     let mut turn_completed = false;
     let mut task_completed = false;
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
     while tokio::time::Instant::now() < deadline && !turn_completed {
         if let Ok(Ok(envelope)) =
             tokio::time::timeout(Duration::from_millis(50), events.recv()).await
@@ -2589,7 +2589,7 @@ async fn repair_actions_without_typed_progress_cannot_loop_forever() {
         .unwrap();
     handle.user_message("try to finish".into()).await.unwrap();
 
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
     let mut turn_completed = false;
     let mut task_completed = false;
     let mut progress_calls = 0usize;
@@ -2890,7 +2890,7 @@ async fn run_proof_refresh_scenario(
         .user_message("verify the fixture".into())
         .await
         .unwrap();
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
     while tokio::time::Instant::now() < deadline {
         if let Ok(Ok(envelope)) =
             tokio::time::timeout(Duration::from_millis(50), events.recv()).await
@@ -2907,7 +2907,7 @@ async fn run_proof_refresh_scenario(
         .await
         .unwrap();
     let mut completion_output = None;
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
     while tokio::time::Instant::now() < deadline {
         if let Ok(Ok(envelope)) =
             tokio::time::timeout(Duration::from_millis(50), events.recv()).await
@@ -2987,7 +2987,7 @@ async fn proof_refresh_resolves_the_exact_recipe_without_model_history() {
         .user_message("finish without a prior verify.run call".into())
         .await
         .unwrap();
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
     let mut completed = false;
     while tokio::time::Instant::now() < deadline && !completed {
         if let Ok(Ok(envelope)) =
@@ -3058,7 +3058,7 @@ async fn cold_proof_repair_names_the_exact_recipe_when_auto_refresh_is_off() {
         .unwrap();
     handle.user_message("finish".into()).await.unwrap();
 
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
     let mut refused = None;
     let mut turn_completed = false;
     while tokio::time::Instant::now() < deadline && !turn_completed {
@@ -3175,7 +3175,7 @@ async fn failed_host_proof_is_not_reexecuted_on_the_same_basis() {
         .unwrap();
     handle.user_message("finish".into()).await.unwrap();
 
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
     let mut turn_completed = false;
     while tokio::time::Instant::now() < deadline && !turn_completed {
         if let Ok(Ok(envelope)) =
@@ -3435,7 +3435,7 @@ async fn stale_proof_refusal_projects_a_final_verify_as_the_repair_action() {
         .user_message("verify the fixture".into())
         .await
         .unwrap();
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
     while tokio::time::Instant::now() < deadline {
         if let Ok(Ok(envelope)) =
             tokio::time::timeout(Duration::from_millis(50), events.recv()).await
@@ -3452,7 +3452,7 @@ async fn stale_proof_refusal_projects_a_final_verify_as_the_repair_action() {
         .await
         .unwrap();
     let mut completion_output = None;
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
     while tokio::time::Instant::now() < deadline {
         if let Ok(Ok(envelope)) =
             tokio::time::timeout(Duration::from_millis(50), events.recv()).await

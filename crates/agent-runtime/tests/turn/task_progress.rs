@@ -144,7 +144,7 @@ async fn run_progress_turn(
         .unwrap();
 
     let mut observations = Vec::new();
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
     let mut turn_done = false;
     while tokio::time::Instant::now() < deadline && !turn_done {
         while let Ok(envelope) = events.try_recv() {

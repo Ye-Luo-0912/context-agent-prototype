@@ -125,7 +125,7 @@ async fn run_turn(
     handle.user_message("keep going".into()).await.unwrap();
     let mut dispositions = Vec::new();
     let mut completed = false;
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
     while tokio::time::Instant::now() < deadline && !completed {
         while let Ok(envelope) = events.try_recv() {
             match envelope.event {

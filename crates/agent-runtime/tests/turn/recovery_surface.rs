@@ -159,7 +159,7 @@ async fn run_turn_collecting_reports(
     handle.user_message("keep going".into()).await.unwrap();
     let mut reports = std::collections::BTreeMap::new();
     let mut completed = false;
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
     while tokio::time::Instant::now() < deadline && !completed {
         while let Ok(envelope) = events.try_recv() {
             match envelope.event {

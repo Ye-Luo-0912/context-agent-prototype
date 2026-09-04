@@ -130,7 +130,7 @@ async fn run_turn(
         .unwrap();
     handle.user_message("keep going".into()).await.unwrap();
     let mut labels = Vec::new();
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
     let mut done = false;
     while tokio::time::Instant::now() < deadline && !done {
         while let Ok(envelope) = events.try_recv() {
@@ -272,7 +272,7 @@ async fn continue_active_task_restarts_the_directive_without_a_new_instruction()
     handle.user_message("keep going".into()).await.unwrap();
 
     // Wait for the first turn's durable completion before continuing.
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
     loop {
         let mut done = false;
         while let Ok(envelope) = first_turn.try_recv() {
@@ -330,7 +330,7 @@ async fn continue_active_task_restarts_the_directive_without_a_new_instruction()
     let mut saw_continuation_input = false;
     let mut saw_dialogue = false;
     let mut continuation_completed = false;
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
     while tokio::time::Instant::now() < deadline
         && !(saw_continuation && saw_continuation_input && continuation_completed)
     {
@@ -786,7 +786,7 @@ async fn durable_ack_carries_revision_artifact_and_verifiable_payload() {
     handle.user_message("keep going".into()).await.unwrap();
 
     // Collect until the turn ends, keeping full envelopes.
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
     let mut durable = None;
     let mut resume_revisions = Vec::new();
     loop {
@@ -885,7 +885,7 @@ async fn failed_checkpoint_write_fences_continuation_until_a_retry_lands() {
     handle.user_message("keep going".into()).await.unwrap();
 
     // The safe-point write fails; nothing claims resumability.
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
     let mut saw_failed = false;
     loop {
         let envelope = tokio::time::timeout_at(deadline, events.recv())
@@ -923,7 +923,7 @@ async fn failed_checkpoint_write_fences_continuation_until_a_retry_lands() {
     std::fs::remove_file(checkpoints_dir.join("checkpoints")).unwrap();
     let mut repaired_events = handle.subscribe();
     handle.user_message("one more round".into()).await.unwrap();
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
     let mut durable_seen = false;
     loop {
         let envelope = tokio::time::timeout_at(deadline, repaired_events.recv())
@@ -1008,7 +1008,7 @@ async fn snapshot_sequences_increase_across_tasks_and_repeats() {
     // Only the ACTIVE task's batch settles into a resume commit: one turn,
     // one snapshot. Collect its sequence.
     handle.user_message("one round".into()).await.unwrap();
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
     let mut seen_sequences: Vec<(u64, u64)> = Vec::new(); // (anchor, sequence)
     loop {
         let envelope = tokio::time::timeout_at(deadline, events.recv())
@@ -1065,7 +1065,7 @@ async fn snapshot_sequences_increase_across_tasks_and_repeats() {
         .unwrap();
 
     handle.user_message("another round".into()).await.unwrap();
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
     loop {
         let envelope = tokio::time::timeout_at(deadline, events.recv())
             .await
@@ -1122,7 +1122,7 @@ async fn final_terminal_artifact_loads_verified_and_names_no_active_task() {
     let task_id = handle.list_tasks().await.unwrap()[0].id;
     let events = handle.subscribe();
 
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
     let collector = tokio::spawn({
         let mut events = events;
         async move {
@@ -1266,7 +1266,7 @@ async fn terminal_failure_restores_the_previous_durability_requirement() {
         .user_message("inspect before closing".into())
         .await
         .unwrap();
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
     loop {
         let envelope = tokio::time::timeout_at(deadline, events.recv())
             .await

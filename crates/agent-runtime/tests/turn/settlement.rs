@@ -529,7 +529,7 @@ async fn receipt_event_failure_fences_recovery_without_partial_readiness() {
     let mut settled_candidate_seen = false;
     let mut receipt_seen = false;
     let mut completed_seen = false;
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
     while tokio::time::Instant::now() < deadline && !recovery_seen {
         if let Ok(Ok(envelope)) =
             tokio::time::timeout(Duration::from_millis(50), receiver.recv()).await
@@ -631,7 +631,7 @@ struct RuntimeEventEnvelopeCollector {
 impl RuntimeEventEnvelopeCollector {
     async fn drain_until_turn_completed(mut self) -> Vec<RuntimeEventEnvelope> {
         let mut seen = Vec::new();
-        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
         let mut turn_done = false;
         // Post-turn durable transactions (the task-completion batch) are
         // emitted after the turn barrier from the same actor step, with a

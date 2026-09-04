@@ -6,7 +6,8 @@ This document records the proposed modular boundary, builtin coding-agent
 interface, extension taxonomy, and evaluation plan. It is deliberately
 separate from the context work queue:
 
-- `CONTEXT_RUNTIME_TODO.md` owns TaskAnchor, Episode, Focus, recall, and GC;
+- `archive/CONTEXT_RUNTIME_TODO.md` (archived historical design queue)
+  originally owned TaskAnchor, Episode, Focus, recall, and GC;
 - `AUDIT_TODO.md` owns confirmed correctness/security defects;
 - `ROADMAP.md` owns approved milestone order;
 - this document is a design proposal until its decision gates are accepted.
@@ -965,7 +966,7 @@ User input follows the same event/fence/consumption machinery but is not a
 `ToolOutput`. It has user authority to steer, interrupt, constrain, or cancel
 the active task. A tool or child-agent result is evidence/advice and may only
 propose a state patch. The detailed event contract lives in
-`CONTEXT_RUNTIME_TODO.md` (`CTX-EVENT-01..03`).
+`archive/CONTEXT_RUNTIME_TODO.md` (`CTX-EVENT-01..03`).
 
 ### Keep lifecycle axes separate
 

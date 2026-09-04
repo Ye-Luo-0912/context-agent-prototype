@@ -3,7 +3,8 @@
 This document defines the retained long-task Runtime model and its next
 post-M15 development diagnostic. [`ROADMAP.md`](ROADMAP.md) remains milestone authority;
 [`EXECUTION_COHERENCE.md`](EXECUTION_COHERENCE.md) remains the runtime-state
-contract. This plan does not reorder M12/M13, retune Context, or close M15.
+contract. This plan does not reorder M12/M13, retune Context, or reinterpret
+the closed M15 verdict.
 
 This document owns long-task diagnostics only. It is not the product roadmap,
 the open-defect queue or a historical window ledger. Product phases live in
@@ -12,18 +13,20 @@ the open-defect queue or a historical window ledger. Product phases live in
 
 ## Current disposition — 2026-09-04
 
-- Formal M15 is still the active evaluation gate. Seven v4 valid FAIL windows
-  are banked; the latest (`_windows/1788438275930`, source `a6dc33e`) is 10/12
-  with 0 NOT_RUN. Its two failures are an execution-debt convergence tail and
-  a Runtime restore/storage lifecycle failure. The resume cell records
-  `runtime_error_class=runtime`, so it is not an M15 harness-class NOT_RUN.
+- Formal M15 closed at its frozen gate 2026-09-04 (`d004836`): the tenth
+  predeclared v4 window returned **PASS 12/12 with 0 NOT_RUN**
+  (`_windows/1788539149184`; diag 4/4, migrate 4/4, policy 4/4 with three
+  completed closures). Ten earlier v4 runs (eight valid FAILs, one censored,
+  one authorized rerun) stay immutable diagnostics; the best pre-closure run
+  was the ninth window's 11/12 (`_windows/1788533384841`).
 - The `b44ea44` successor repairs have deterministic local evidence only and
   no new formal verdict. Follow-up `c84f85e` passed both platform check jobs
   after reaping the ignored-fixture descendant, then Ubuntu tests exposed a
   separate fd-number reuse race in a Landlock drop assertion. The identity-
   aware assertion and a clean dual-platform source must be recorded before
   candidate selection.
-- `LT-EVAL-06` remains parked until M15 closes. Product entry/config/resume
+- `LT-EVAL-06` is unparked by the M15 closure (2026-09-04) and is the next
+  ordered evaluation breadth. Product entry/config/resume
   work must reuse the current TaskAnchor, ExecutionState, checkpoint store and
   event projections; it does not authorize a TaskGraph or Context retune.
 - A Run Catalog/Chronicle is conditional post-M15 work. Begin with the
@@ -893,7 +896,8 @@ harness failures are failure-monotone (`M15-HARNESS-BOUNDARY-01`, `f57a118`).
 Historical FAIL bundles remain immutable diagnostics; the pre-window
 implementation exits (formal-path retry observer `7e02488`, M10 re-audit
 record, `GOV-STATUS-01` on `bba1c76`), the PinAI product preflight and the
-latest 10/12 valid FAIL are recorded in [`STATUS.md`](STATUS.md).
+M15 closure itself (tenth v4 window PASS 12/12, `d004836`) are recorded in
+[`STATUS.md`](STATUS.md).
 
 Serving preflight status 2026-08-28: a source-bound dirty-tree diagnostic
 `retry_policy_dev` normal cell passed the stricter closure-required profile on

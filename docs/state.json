@@ -1,0 +1,57 @@
+{
+  "schema": "project-state.v1",
+  "updated": "2026-09-05",
+  "maintained_by": "hand until the CI document-consistency gate lands; README.md and docs/CURRENT.md current-status text must be verified against this file",
+  "head_commit": "d004836d4e638d2774f8c6d704b9f50e0f591173",
+  "code_commit": "050aa8e68f59c49d42b95e2a4d38fa37234a1e78",
+  "ci": {
+    "head_commit": "in_progress",
+    "head_run_id": 33895590479,
+    "last_green_commit": "a882789486a49204569c084289f3a6c4cf697916",
+    "code_commit": "green"
+  },
+  "milestone_gates": {
+    "m15_real_evaluation": "closed",
+    "next_ordered": [
+      "LT-EVAL-06 evaluation breadth",
+      "packaged V1 release gate"
+    ]
+  },
+  "m15": {
+    "status": "closed",
+    "closed_utc": "2026-09-04",
+    "closure_commit": "d004836d4e638d2774f8c6d704b9f50e0f591173",
+    "closing_window": {
+      "ordinal": 10,
+      "candidate_code_commit": "050aa8e68f59c49d42b95e2a4d38fa37234a1e78",
+      "manifest_created_utc": "2026-09-04T16:25:28Z",
+      "verdict": "pass",
+      "passed_cells": 12,
+      "total_cells": 12,
+      "not_run_cells": 0,
+      "report": "crates/agent-eval/evidence/m15-window/_windows/1788539149184/REPORT.md",
+      "run_log": "window10.log"
+    },
+    "pre_closure_runs_committed": 10,
+    "best_pre_closure_window": {
+      "ordinal": 9,
+      "verdict": "valid_fail",
+      "passed_cells": 11,
+      "report": "crates/agent-eval/evidence/m15-window/_windows/1788533384841/REPORT.md"
+    }
+  },
+  "product_stage": "pre-alpha",
+  "product_phase": "phase-2-reliable-local-agent-alpha",
+  "phase_2_started": "2026-09-04",
+  "phase_2_slices_landed": [
+    "checked model configuration: AGENT_DEMO=1 selects the mock explicitly, a missing OPENAI_API_KEY is a visible startup error (32ea622)"
+  ],
+  "default_context": "dynamic-in-process",
+  "experimental": [
+    "context-service",
+    "completion-opportunity",
+    "settlement-projection",
+    "recovery-surface"
+  ],
+  "branch_protection": false
+}
