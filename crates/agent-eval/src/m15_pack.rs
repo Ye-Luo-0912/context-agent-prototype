@@ -1304,6 +1304,7 @@ pub fn discounted(amount_cents: i64, percent: u32) -> i64 {
 }
 "#;
 
+#[cfg_attr(not(test), allow(dead_code))] // fixture self-tests apply the scripted fix
 const LTEV_DIAGFIX_ROUNDING_FIXED: &str = r#"//! Half-cent rounding. Contract: half-cents round AWAY FROM ZERO
 //! (1 half -> 1 cent, 3 halves -> 2 cents, -3 halves -> -2 cents).
 
@@ -1340,6 +1341,7 @@ fn even_half_cent_products_round_exactly() {
 }
 "#;
 
+#[cfg_attr(not(test), allow(dead_code))] // fixture self-tests apply the scripted fix
 const LTEV_DIAGFIX_TESTS_FIXED: &str = r#"//! Model-visible coverage for the pricing contract.
 use receiptkit::{discounted, round_half_cent};
 
@@ -1366,6 +1368,7 @@ const LTEV_DIAGFIX_README: &str = "receiptkit (diagnosis fixture)\n\n\
 Pricing contract: discounts are computed in half-cents and half-cents round \
 AWAY FROM ZERO (1 half -> 1 cent, 3 halves -> 2 cents, -3 halves -> -2 cents).\n";
 
+#[cfg_attr(not(test), allow(dead_code))] // fixture self-tests apply the scripted fix
 const LTEV_DIAGFIX_DIAGNOSIS_SOLVED: &str = "DIAGNOSIS\n\nThe defect is in src/rounding.rs, \
 function round_half_cent: `halves / 2` uses integer division, which truncates \
 TOWARD ZERO, so an odd number of half-cents loses its half. The contract requires \
