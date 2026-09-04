@@ -51,6 +51,7 @@ pub const FIXTURES: &[M15Fixture] = &[
     RETRY_MIGRATE_DEV,
     RETRY_MAINT_DEV,
     LTEV_DIAGFIX_DEV,
+    LTEV_MIGRATE_DEV,
 ];
 
 /// Canonical identity of every frozen input that can change a pack's task or
@@ -1480,7 +1481,7 @@ mod ltev_diagfix_tests {
     #[test]
     fn registered_in_the_fixture_registry() {
         assert!(fixture(LTEV_DIAGFIX).is_some());
-        assert_eq!(FIXTURES.len(), 4);
+        assert_eq!(FIXTURES.len(), 5);
     }
 
     /// Frozen at introduction (LT-EVAL-06 task 1, 2026-09-05).
@@ -1551,6 +1552,372 @@ mod ltev_diagfix_tests {
         assert!(
             oracle_passes(dir.path(), LTEV_DIAGFIX_ORACLE_NAME).await,
             "the oracle must accept the scripted minimal fix"
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// ltev_migrate — bounded multi-file API migration (LT-EVAL-06 task 2)
+// ---------------------------------------------------------------------------
+//
+// The `taskqueue` crate keeps a legacy String-based queue API
+// (`push_job` / `run_next`) with call sites spread across three files
+// (worker.rs, scheduler.rs, metrics.rs). The directive migrates every
+// call site to the typed `Job` API (`submit` / `drain`), removes the
+// legacy methods, and keeps FIFO behavior; README.md is the untouched
+// contract. The allowed-diff intent is enforced per file: the legacy
+// names must vanish everywhere and the typed API must appear at every
+// call site.
+
+pub const LTEV_MIGRATE: &str = "ltev_migrate";
+
+const LTEV_MIGRATE_DIRECTIVE: &str = "The legacy String-based queue API is replaced by the typed Job API. \
+     Migrate every call site in src/ (worker.rs, scheduler.rs, metrics.rs) and tests/queue.rs to \
+     `Queue::submit(Job::new(name, priority))` and `Queue::drain() -> Vec<Job>` (FIFO), and remove \
+     `push_job` / `run_next` from the crate entirely. Keep `Queue::len` and FIFO behavior; keep the \
+     README contract untouched. Run the project checks and report the result.";
+
+const LTEV_MIGRATE_CARGO: &str = r#"[package]
+name = "taskqueue"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+path = "src/lib.rs"
+
+[dependencies]
+"#;
+
+const LTEV_MIGRATE_LIB_SEED: &str = r#"//! A small FIFO job queue (legacy String API).
+pub mod metrics;
+pub mod scheduler;
+pub mod worker;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Queue {
+    jobs: Vec<String>,
+}
+
+impl Queue {
+    pub fn new() -> Self {
+        Self { jobs: Vec::new() }
+    }
+
+    /// Legacy: enqueue by name.
+    pub fn push_job(&mut self, name: String) {
+        self.jobs.push(name);
+    }
+
+    /// Legacy: dequeue the oldest job.
+    pub fn run_next(&mut self) -> Option<String> {
+        if self.jobs.is_empty() {
+            None
+        } else {
+            Some(self.jobs.remove(0))
+        }
+    }
+
+    pub fn len(&self) -> usize {
+        self.jobs.len()
+    }
+}
+"#;
+
+#[cfg_attr(not(test), allow(dead_code))] // fixture self-tests apply the scripted migration
+const LTEV_MIGRATE_LIB_FIXED: &str = r#"//! A small FIFO job queue (typed Job API).
+pub mod metrics;
+pub mod scheduler;
+pub mod worker;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Job {
+    pub name: String,
+    pub priority: u8,
+}
+
+impl Job {
+    pub fn new(name: &str, priority: u8) -> Self {
+        Self {
+            name: name.to_string(),
+            priority,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct Queue {
+    jobs: Vec<Job>,
+}
+
+impl Queue {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Enqueue one typed job.
+    pub fn submit(&mut self, job: Job) {
+        self.jobs.push(job);
+    }
+
+    /// Drain every queued job, FIFO.
+    pub fn drain(&mut self) -> Vec<Job> {
+        std::mem::take(&mut self.jobs)
+    }
+
+    pub fn len(&self) -> usize {
+        self.jobs.len()
+    }
+}
+"#;
+
+const LTEV_MIGRATE_WORKER_SEED: &str = r#"//! Warmup + processing worker over the legacy API.
+use crate::Queue;
+
+pub fn process_all(queue: &mut Queue) -> Vec<String> {
+    queue.push_job("warmup".into());
+    let mut ran = Vec::new();
+    while let Some(name) = queue.run_next() {
+        ran.push(name);
+    }
+    ran
+}
+"#;
+
+#[cfg_attr(not(test), allow(dead_code))] // fixture self-tests apply the scripted migration
+const LTEV_MIGRATE_WORKER_FIXED: &str = r#"//! Warmup + processing worker over the typed Job API.
+use crate::{Job, Queue};
+
+pub fn process_all(queue: &mut Queue) -> Vec<String> {
+    queue.submit(Job::new("warmup", 9));
+    queue
+        .drain()
+        .iter()
+        .map(|job| job.name.clone())
+        .collect()
+}
+"#;
+
+const LTEV_MIGRATE_SCHEDULER_SEED: &str = r#"//! Batch scheduling over the legacy API.
+use crate::Queue;
+
+pub fn enqueue_batch(queue: &mut Queue, names: &[&str]) {
+    for name in names {
+        queue.push_job((*name).to_string());
+    }
+}
+"#;
+
+#[cfg_attr(not(test), allow(dead_code))] // fixture self-tests apply the scripted migration
+const LTEV_MIGRATE_SCHEDULER_FIXED: &str = r#"//! Batch scheduling over the typed Job API.
+use crate::{Job, Queue};
+
+pub fn enqueue_batch(queue: &mut Queue, names: &[&str]) {
+    for (priority, name) in names.iter().enumerate() {
+        queue.submit(Job::new(name, priority as u8));
+    }
+}
+"#;
+
+const LTEV_MIGRATE_METRICS_SEED: &str = r#"//! Queue metrics over the legacy API.
+use crate::Queue;
+
+pub fn pending(queue: &Queue) -> usize {
+    queue.len()
+}
+"#;
+
+#[cfg_attr(not(test), allow(dead_code))] // fixture self-tests apply the scripted migration
+const LTEV_MIGRATE_METRICS_FIXED: &str = r#"//! Queue metrics over the typed Job API.
+use crate::Queue;
+
+pub fn pending(queue: &Queue) -> usize {
+    queue.len()
+}
+"#;
+
+const LTEV_MIGRATE_TESTS_SEED: &str = r#"//! Model-visible coverage for the legacy queue contract.
+use taskqueue::Queue;
+
+#[test]
+fn fifo_order_is_preserved() {
+    let mut queue = Queue::new();
+    queue.push_job("a".into());
+    queue.push_job("b".into());
+    assert_eq!(queue.run_next(), Some("a".into()));
+    assert_eq!(queue.run_next(), Some("b".into()));
+    assert_eq!(queue.run_next(), None);
+    assert_eq!(queue.len(), 0);
+}
+"#;
+
+#[cfg_attr(not(test), allow(dead_code))] // fixture self-tests apply the scripted migration
+const LTEV_MIGRATE_TESTS_FIXED: &str = r#"//! Model-visible coverage for the typed queue contract.
+use taskqueue::{Job, Queue};
+
+#[test]
+fn fifo_order_is_preserved() {
+    let mut queue = Queue::new();
+    queue.submit(Job::new("a", 0));
+    queue.submit(Job::new("b", 1));
+    let drained = queue.drain();
+    assert_eq!(drained.len(), 2);
+    assert_eq!(drained[0].name, "a");
+    assert_eq!(drained[1].name, "b");
+    assert_eq!(queue.len(), 0);
+    assert!(queue.drain().is_empty());
+}
+"#;
+
+const LTEV_MIGRATE_README: &str = "taskqueue (migration fixture)\n\n\
+Queue contract: FIFO. The typed Job API (`submit` / `drain`) replaces the \
+legacy String methods; `len` reports the pending count.\n";
+
+const LTEV_MIGRATE_FILES_SEED: &[(&str, &str)] = &[
+    ("Cargo.toml", LTEV_MIGRATE_CARGO),
+    ("src/lib.rs", LTEV_MIGRATE_LIB_SEED),
+    ("src/worker.rs", LTEV_MIGRATE_WORKER_SEED),
+    ("src/scheduler.rs", LTEV_MIGRATE_SCHEDULER_SEED),
+    ("src/metrics.rs", LTEV_MIGRATE_METRICS_SEED),
+    ("tests/queue.rs", LTEV_MIGRATE_TESTS_SEED),
+    ("README.md", LTEV_MIGRATE_README),
+];
+
+const LTEV_MIGRATE_ORACLE_NAME: &str = "ltev_migrate_oracle";
+const LTEV_MIGRATE_ORACLE_SOURCE: &str = r#"//! Harness-owned behavioral oracle; copied in by the evaluation harness
+//! after the run. Not authored by the evaluated agent.
+
+use taskqueue::{Job, Queue};
+
+#[test]
+fn typed_queue_drains_fifo_and_empties() {
+    let mut queue = Queue::new();
+    queue.submit(Job::new("a", 0));
+    queue.submit(Job::new("b", 2));
+    queue.submit(Job::new("c", 1));
+    assert_eq!(queue.len(), 3);
+    let drained = queue.drain();
+    assert_eq!(drained.len(), 3);
+    assert_eq!(drained[0].name, "a");
+    assert_eq!(drained[1].name, "b");
+    assert_eq!(drained[2].name, "c");
+    assert!(queue.drain().is_empty());
+    assert_eq!(queue.len(), 0);
+}
+"#;
+
+const LTEV_MIGRATE_CHECKS: &[PackCheck] = &[
+    PackCheck {
+        path: "src/lib.rs",
+        name: "typed Job API defined; legacy methods removed",
+        accept: |body| {
+            body.contains("pub fn submit")
+                && body.contains("pub fn drain")
+                && body.contains("pub struct Job")
+                && !body.contains("push_job")
+                && !body.contains("run_next")
+        },
+    },
+    PackCheck {
+        path: "src/worker.rs",
+        name: "worker migrated to the typed API",
+        accept: |body| {
+            body.contains("submit(")
+                && body.contains("drain(")
+                && !body.contains("push_job")
+                && !body.contains("run_next")
+        },
+    },
+    PackCheck {
+        path: "src/scheduler.rs",
+        name: "scheduler migrated to the typed API",
+        accept: |body| {
+            body.contains("Job::new") && !body.contains("push_job") && !body.contains("run_next")
+        },
+    },
+    PackCheck {
+        path: "src/metrics.rs",
+        name: "metrics free of legacy references",
+        accept: |body| !body.contains("push_job") && !body.contains("run_next"),
+    },
+    PackCheck {
+        path: "tests/queue.rs",
+        name: "tests migrated to the typed API",
+        accept: |body| {
+            body.contains("submit(")
+                && body.contains("drain(")
+                && !body.contains("push_job")
+                && !body.contains("run_next")
+        },
+    },
+    PackCheck {
+        path: "README.md",
+        name: "documented contract untouched",
+        accept: |body| body == LTEV_MIGRATE_README,
+    },
+];
+
+const LTEV_MIGRATE_DEV: M15Fixture = M15Fixture {
+    id: LTEV_MIGRATE,
+    directive: LTEV_MIGRATE_DIRECTIVE,
+    files: LTEV_MIGRATE_FILES_SEED,
+    checks: LTEV_MIGRATE_CHECKS,
+    oracle_name: LTEV_MIGRATE_ORACLE_NAME,
+    oracle_source: LTEV_MIGRATE_ORACLE_SOURCE,
+};
+
+#[cfg(test)]
+mod ltev_migrate_tests {
+    use super::*;
+
+    #[test]
+    fn registered_in_the_fixture_registry() {
+        assert!(fixture(LTEV_MIGRATE).is_some());
+        assert_eq!(FIXTURES.len(), 5);
+    }
+
+    #[test]
+    fn seed_keeps_legacy_names_and_fails_the_migration_checks() {
+        let dir = tempfile::tempdir().unwrap();
+        seed(dir.path(), LTEV_MIGRATE).unwrap();
+        let seeded = hidden_check_results(dir.path(), LTEV_MIGRATE)
+            .into_iter()
+            .map(|(_, _, passed)| passed)
+            .collect::<Vec<_>>();
+        assert!(
+            seeded.iter().any(|passed| !passed),
+            "the legacy API must fail the migration checks: {seeded:?}"
+        );
+    }
+
+    #[test]
+    fn scripted_migration_passes_every_check() {
+        let dir = tempfile::tempdir().unwrap();
+        seed(dir.path(), LTEV_MIGRATE).unwrap();
+        for (relative, body) in [
+            ("src/lib.rs", LTEV_MIGRATE_LIB_FIXED),
+            ("src/worker.rs", LTEV_MIGRATE_WORKER_FIXED),
+            ("src/scheduler.rs", LTEV_MIGRATE_SCHEDULER_FIXED),
+            ("src/metrics.rs", LTEV_MIGRATE_METRICS_FIXED),
+            ("tests/queue.rs", LTEV_MIGRATE_TESTS_FIXED),
+        ] {
+            std::fs::write(dir.path().join(relative), body).unwrap();
+        }
+        let solved = hidden_check_results(dir.path(), LTEV_MIGRATE)
+            .into_iter()
+            .map(|(_, _, passed)| passed)
+            .collect::<Vec<_>>();
+        assert!(
+            solved.iter().all(|passed| *passed),
+            "the scripted migration must pass every check: {solved:?}"
+        );
+    }
+
+    /// Frozen at introduction (LT-EVAL-06 task 2, 2026-09-05).
+    #[test]
+    fn digest_is_frozen() {
+        assert_eq!(
+            spec_sha256(LTEV_MIGRATE),
+            "0fcd039ea04159f35f16bd17c52f572dd7b9b1c7bf4e7992c03477485d2dbb02"
         );
     }
 }
