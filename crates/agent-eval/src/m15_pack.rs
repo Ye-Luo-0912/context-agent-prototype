@@ -1233,7 +1233,7 @@ mod tests {
 
     #[test]
     fn registry_resolves_all_and_oracles_are_frozen_constants() {
-        assert_eq!(FIXTURES.len(), 3);
+        assert_eq!(FIXTURES.len(), 4);
         for entry in FIXTURES {
             assert!(fixture(entry.id).is_some());
             assert!(!entry.directive.is_empty());
