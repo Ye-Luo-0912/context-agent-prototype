@@ -355,6 +355,10 @@ fn provider_from_env(
 pub struct ComposeConfig {
     /// Opened workspace (owns the state dir and artifact confinement).
     pub workspace: Workspace,
+    /// Key-free serving identity (`ProviderProfile::digest`) persisted
+    /// into every checkpoint's run metadata. `None` for demo/mock or
+    /// harness compositions that record the tuple in their own manifests.
+    pub provider_profile_digest: Option<String>,
     /// The context engine, already selected by the caller.
     pub context_engine: Arc<dyn ContextEngine>,
     /// The model transport, already selected by the caller.
@@ -453,6 +457,7 @@ impl ComposedRuntime {
 /// subscribe to events before `start`.
 pub async fn compose(config: ComposeConfig) -> anyhow::Result<ComposedRuntime> {
     let ComposeConfig {
+        provider_profile_digest: provider_profile_digest_in,
         workspace,
         context_engine,
         model,
@@ -551,6 +556,9 @@ pub async fn compose(config: ComposeConfig) -> anyhow::Result<ComposedRuntime> {
     services = services.with_settlement_projection_diagnostics(settlement_projection_diagnostics);
     services = services.with_project_completion_opportunity(project_completion_opportunity);
     services = services.with_recovery_surface(recovery_surface);
+    if let Some(digest) = provider_profile_digest_in {
+        services.set_provider_profile_digest(digest);
+    }
     // A recipe table always installs the read-only domain resolver so a
     // model-facing repair can name an exact recipe on cold start. The switch
     // controls only Runtime's optional automatic execution of that recipe.
@@ -633,6 +641,7 @@ mod tests {
         let base_tools: Arc<dyn ToolDispatcher> =
             Arc::new(BuiltinToolDispatcher::new(workspace.clone()).unwrap());
         ComposeConfig {
+            provider_profile_digest: None,
             workspace,
             context_engine: engine,
             model,

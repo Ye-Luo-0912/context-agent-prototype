@@ -9,6 +9,7 @@ pub mod checkpoint;
 mod command;
 pub mod crash;
 mod execution;
+pub mod status;
 // 定向再导出：类型已随 `TaskRecord::resume` 公开，replay/审计需要直接
 // 驱动同一投影以重建证据前沿；execution 模块本身保持私有。
 pub use execution::{

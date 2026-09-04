@@ -240,6 +240,7 @@ fn checkpoint(run_id: RunId) -> RuntimeCheckpoint {
         run_metadata: RunMetadata {
             run_id,
             created_at_ms: 0,
+            provider_profile_digest: String::new(),
         },
         tasks: TaskManagerSnapshot {
             tasks: Vec::new(),

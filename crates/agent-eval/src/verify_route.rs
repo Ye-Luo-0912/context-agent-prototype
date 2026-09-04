@@ -196,6 +196,7 @@ async fn drive_cell(
     let context_engine: Arc<dyn ContextEngine> =
         Arc::new(SimpleContextEngine::new(SimpleContextConfig::default()));
     let composed = compose(ComposeConfig {
+        provider_profile_digest: None,
         workspace,
         context_engine,
         model,

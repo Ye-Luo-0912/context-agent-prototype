@@ -76,6 +76,7 @@ async fn compose_config(
             .map_err(anyhow::Error::msg)?,
     );
     Ok(ComposeConfig {
+        provider_profile_digest: None,
         workspace: workspace.clone(),
         context_engine: Arc::new(SimpleContextEngine::new(SimpleContextConfig::default())),
         model,

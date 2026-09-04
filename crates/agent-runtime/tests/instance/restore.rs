@@ -370,6 +370,7 @@ async fn concurrent_full_restores_are_serialized_across_all_state_planes() {
         run_metadata: agent_runtime::RunMetadata {
             run_id: instance.handle().run_id(),
             created_at_ms: 0,
+            provider_profile_digest: String::new(),
         },
         tasks: agent_runtime::TaskManagerSnapshot {
             tasks: Vec::new(),

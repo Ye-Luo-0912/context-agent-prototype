@@ -111,6 +111,11 @@ impl RuntimeActor {
                     run_metadata: crate::checkpoint::RunMetadata {
                         run_id: self.core.run_id(),
                         created_at_ms: now_ms(),
+                        provider_profile_digest: self
+                            .services
+                            .provider_profile_digest()
+                            .unwrap_or_default()
+                            .to_string(),
                     },
                     tasks: tasks_snapshot,
                     current_task_id,

@@ -1449,6 +1449,7 @@ async fn compose_cell(
         ),
     );
     let composed = agent_compose::compose(agent_compose::ComposeConfig {
+        provider_profile_digest: None,
         workspace: workspace.clone(),
         context_engine: engine,
         model,

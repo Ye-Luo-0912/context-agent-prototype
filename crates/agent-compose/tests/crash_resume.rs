@@ -80,6 +80,7 @@ async fn compose_config(root: &std::path::Path) -> anyhow::Result<ComposeConfig>
             .map_err(anyhow::Error::msg)?,
     );
     Ok(ComposeConfig {
+        provider_profile_digest: None,
         workspace: workspace.clone(),
         context_engine: Arc::new(context_simple::SimpleContextEngine::new(
             context_simple::SimpleContextConfig::default(),

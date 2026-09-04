@@ -174,6 +174,19 @@ point.
 
 ### P2-BLK-4 — `/status` shows four field groups, not agent state
 
+**Closed on source, 2026-09-05 (`STATUS-SNAPSHOT-01`):**
+`agent-runtime::status::StatusProjection` is the bounded event-fold read
+model (lifecycle, turns/rounds, tokens, in-flight operation, task +
+anchor revision + goal, effect-ack debts, last durable checkpoint,
+required-context misses, restored-from, bounded recent warnings); the
+TUI folds every event into it and `/status` renders it, so the same
+truth is available to any host and a lagging UI can rebuild by replay.
+The provider profile digest now also rides every checkpoint's
+`RunMetadata` (serde-defaulted), wired from the composition root
+through `RuntimeServices`.
+
+Original finding, retained for the record:
+
 `crates/agent-tui/src/state.rs:219-239` renders exactly: run id + status +
 token totals; current task id + anchor revision; unresolved effect-ack
 debt count; last checkpoint path. It does not show task goal/directive/

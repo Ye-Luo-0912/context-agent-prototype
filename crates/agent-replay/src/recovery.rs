@@ -1353,6 +1353,7 @@ mod tests {
             run_metadata: RunMetadata {
                 run_id: run,
                 created_at_ms: 1,
+                provider_profile_digest: String::new(),
             },
             tasks: TaskManagerSnapshot {
                 tasks: vec![TaskRecordSnapshot {

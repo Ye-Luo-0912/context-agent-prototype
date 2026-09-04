@@ -556,6 +556,13 @@ pub struct RuntimeCheckpoint {
 pub struct RunMetadata {
     pub run_id: RunId,
     pub created_at_ms: u64,
+    /// Key-free identity of the serving this run was captured under
+    /// (`provider_profile_digest` from the composition root). Empty when
+    /// the composition did not provide one (demo/mock or eval harnesses
+    /// that record the tuple in their own manifests). Serde-defaulted so
+    /// older v4 payloads still load.
+    #[serde(default)]
+    pub provider_profile_digest: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1058,6 +1065,7 @@ mod tests {
             run_metadata: RunMetadata {
                 run_id: RunId::new(),
                 created_at_ms: 1,
+                provider_profile_digest: String::new(),
             },
             tasks: TaskManagerSnapshot::from_manager(tasks),
             current_task_id: tasks.active(),
@@ -1228,6 +1236,7 @@ mod tests {
             run_metadata: RunMetadata {
                 run_id: RunId::new(),
                 created_at_ms: 0,
+                provider_profile_digest: String::new(),
             },
             tasks: TaskManagerSnapshot::from_manager(&tasks),
             current_task_id: tasks.active(),

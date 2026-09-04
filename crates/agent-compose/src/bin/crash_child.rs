@@ -78,6 +78,7 @@ async fn main() -> anyhow::Result<()> {
             .map_err(anyhow::Error::msg)?,
     );
     let composed = compose(ComposeConfig {
+        provider_profile_digest: None,
         workspace: workspace.clone(),
         context_engine: Arc::new(context_simple::SimpleContextEngine::new(
             context_simple::SimpleContextConfig::default(),

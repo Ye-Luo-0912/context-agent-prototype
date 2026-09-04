@@ -159,6 +159,8 @@ pub struct AppState {
     pub run_id: RunId,
     pub input: String,
     pub messages: Vec<UiMessage>,
+    /// Event-derived status read model (runtime-owned projection).
+    pub status_projection: agent_runtime::status::StatusProjection,
     pub context: ContextDiagnostics,
     pub context_selected: Vec<ContextSelection>,
     pub context_transitions: Vec<ContextStateTransition>,
@@ -214,6 +216,7 @@ impl AppState {
             current_task: None,
             unresolved_ack_debts: 0,
             last_checkpoint: None,
+            status_projection: agent_runtime::status::StatusProjection::default(),
         }
     }
 
@@ -221,23 +224,15 @@ impl AppState {
     /// task anchor, recovery debts and the last saved checkpoint. It never
     /// drives effects and rebuilds from the same events on restart.
     pub fn render_status(&self) -> Vec<String> {
-        let mut lines = vec![format!(
-            "run {} | status: {} | tokens in {} / out {}",
-            self.run_id, self.status, self.input_tokens, self.output_tokens
-        )];
-        match &self.current_task {
-            Some((task_id, revision)) => {
-                lines.push(format!("current task: {task_id} (anchor r{revision})"))
-            }
-            None => lines.push("current task: none".into()),
-        }
-        lines.push(format!(
-            "unresolved effect-ack debts: {}",
-            self.unresolved_ack_debts
-        ));
+        // The projection is folded from the same public event stream every
+        // host consumes; the lines below are UI-local additions only.
+        let mut lines = self.status_projection.lines();
         match &self.last_checkpoint {
-            Some(path) => lines.push(format!("last checkpoint: {path}")),
-            None => lines.push("last checkpoint: none this session".into()),
+            Some(path) => lines.push(format!("last manual checkpoint: {path}")),
+            None => lines.push("last manual checkpoint: none this session".into()),
+        }
+        if let Some(approval) = &self.pending_approval {
+            lines.push(format!("pending approval: {}", approval.tool_name));
         }
         lines
     }
@@ -293,6 +288,7 @@ impl AppState {
     }
 
     pub fn apply_runtime_event(&mut self, envelope: RuntimeEventEnvelope) {
+        self.status_projection.fold(&envelope.event);
         match envelope.event {
             RuntimeEvent::RunStarted => self.status = "ready".into(),
             RuntimeEvent::UserMessageAccepted { input } => {
@@ -1248,9 +1244,11 @@ mod status_projection_tests {
         app.last_checkpoint = Some("cp.json".into());
         let lines = app.render_status();
         let joined = lines.join("\n");
-        assert!(joined.contains("current task:") && !joined.contains("none"));
-        assert!(joined.contains("unresolved effect-ack debts: 0"));
-        assert!(joined.contains("last checkpoint: cp.json"));
+        // The projection renders task/debt truth; the manual checkpoint is
+        // the UI-local extra.
+        assert!(joined.contains("task:") && !joined.contains("task: none"));
+        assert!(joined.contains("ack_debts=0"));
+        assert!(joined.contains("last manual checkpoint: cp.json"));
     }
 
     fn envelope(seq: u64, event: RuntimeEvent) -> RuntimeEventEnvelope {

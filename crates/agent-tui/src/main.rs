@@ -94,14 +94,14 @@ async fn main() -> anyhow::Result<()> {
     // against any `ContextEngine` implementation (the A/B/C baselines, and
     // the process-boundary adapter). Rolling/dynamic 与 live eval 共用同一
     // 有界压缩器，避免 TUI 仍走占位折叠。
-    let model = match try_model_from_env()? {
+    let (model, provider_profile_digest) = match try_model_from_env()? {
         agent_compose::ModelSelection::Mock(mock) => {
             eprintln!("demo mode: AGENT_DEMO=1 selected the explicit mock transport");
-            mock
+            (mock, None)
         }
         agent_compose::ModelSelection::Provider(provider, profile) => {
             eprintln!("{}", profile.banner());
-            provider
+            (provider, Some(profile.digest()))
         }
     };
     let context_engine =
@@ -164,6 +164,7 @@ async fn main() -> anyhow::Result<()> {
             .join("broker-reservations.jsonl")
     });
     let composed = compose(ComposeConfig {
+        provider_profile_digest,
         workspace,
         context_engine,
         model,

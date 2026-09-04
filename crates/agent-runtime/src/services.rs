@@ -46,6 +46,10 @@ pub struct RuntimeServices {
     /// truncation (raw-evidence retention). `None` skips the persistence
     /// (tests and bare compositions).
     artifact_workspace: Option<Arc<Workspace>>,
+    /// Key-free serving identity from the composition root, persisted into
+    /// every checkpoint's run metadata. Absent when the composition did
+    /// not provide one.
+    provider_profile_digest: Option<String>,
     /// Ablation: when false, PromptAssembler omits TaskProgress. Default true.
     project_task_progress: bool,
     /// Ablation: when true, a settled-candidate fact is projected into the
@@ -186,6 +190,7 @@ impl RuntimeServices {
             tools,
             verification_coverage_declarations,
             artifact_workspace: None,
+            provider_profile_digest: None,
             project_task_progress: true,
             project_settlement: false,
             settlement_projection_diagnostics: false,
@@ -228,6 +233,7 @@ impl RuntimeServices {
             tools,
             verification_coverage_declarations,
             artifact_workspace: None,
+            provider_profile_digest: None,
             project_task_progress: true,
             project_settlement: false,
             settlement_projection_diagnostics: false,
@@ -291,6 +297,16 @@ impl RuntimeServices {
     pub fn with_artifact_workspace(mut self, workspace: Arc<Workspace>) -> Self {
         self.artifact_workspace = Some(workspace);
         self
+    }
+
+    /// Composition-root-provided key-free serving identity, persisted with
+    /// every checkpoint's run metadata.
+    pub fn set_provider_profile_digest(&mut self, digest: String) {
+        self.provider_profile_digest = Some(digest);
+    }
+
+    pub fn provider_profile_digest(&self) -> Option<&str> {
+        self.provider_profile_digest.as_deref()
     }
 
     pub fn with_project_task_progress(mut self, project: bool) -> Self {
