@@ -1457,7 +1457,6 @@ mod ltev_diagfix_tests {
     use super::*;
     use std::process::Stdio;
     use std::time::Duration;
-    use std::time::Duration;
 
     const CARGO_TEST_TIMEOUT: Duration = Duration::from_secs(600);
 
