@@ -44,14 +44,14 @@ Formal verdicts live only in the immutable
   argument; broadcast Lagged events surface a visible warning;
   `scripts/dist.{sh,ps1}` package the release binary with SHA256SUMS
   (Windows path validated by a real run).
-- Landed 2026-09-05 (late): proof refresh operation-lifecycle behind an
-  opt-in `defer_proof_refresh` flag — frozen inline semantics default;
-  the cross-turn accepted commit (turn-holding) remains open.
+- Landed 2026-09-05 (late): proof refresh operation-lifecycle closed —
+  opt-in `defer_proof_refresh` with turn-holding makes the deferred
+  accepted commit deterministic; frozen inline semantics default.
 - Next product queue (order per [`ROADMAP.md`](ROADMAP.md#route-to-a-usable-local-agent)
   and the 2026-09-05 code review, [`reviews/2026-09-05-code-review.md`](reviews/2026-09-05-code-review.md)):
-  finish PROOF-OPERATION-01 (turn-holding for cross-turn accepted
-  commits); Linux dist validation, install notes, packaged-binary CI
-  smoke and the clean-machine doctor at the V1 gate.
+  Linux dist validation, install notes, packaged-binary CI smoke and
+  the clean-machine doctor at the V1 gate. All six Phase 2 alpha
+  hardening blockers from the 2026-09-05 review are closed on source.
 - Default context is dynamic in-process. `context-service`,
   completion-opportunity, settlement-projection and recovery-surface remain
   experimental.

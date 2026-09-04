@@ -52,7 +52,8 @@
     "CRASH-RESUME-01 completed: all four kill points (effect prepare, effect apply-before-ack, checkpoint temp-write, turn barrier) with a real child-process crash matrix (9f159fa)",
     "TUI approval detail (risk + per-argument breakdown) and visible Lagged-event warnings (dc15079)",
     "PACKAGE-01 base: dist.sh/dist.ps1 release packaging with SHA256SUMS, Windows path validated by a real run (072b185)",
-    "PROOF-OPERATION-01 (mostly closed): host verifier runs outside the actor loop behind an opt-in defer_proof_refresh switch, with fenced resume; frozen inline semantics default; cross-turn acceptance (turn-holding) remains (6d851ab)"
+    "PROOF-OPERATION-01 (mostly closed): host verifier runs outside the actor loop behind an opt-in defer_proof_refresh switch, with fenced resume; frozen inline semantics default; cross-turn acceptance (turn-holding) remains (6d851ab)",
+    "PROOF-OPERATION-01 closed: turn-holding makes the deferred accepted commit deterministic; verifier runs outside the actor loop behind the opt-in defer_proof_refresh flag"
   ],
   "default_context": "dynamic-in-process",
   "experimental": [
