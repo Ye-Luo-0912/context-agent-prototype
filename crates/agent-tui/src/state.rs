@@ -191,7 +191,7 @@ impl AppState {
             input: String::new(),
             messages: vec![UiMessage {
                 role: UiRole::System,
-                content: "Prototype ready. /focus, /pin, /done, /context, /checkpoint, /checkpoints, /restore, /status, /grants, /revoke <id>, /cancel, /quit. Tab: context inspect. Try `demo: list files`.".into(),
+                content: "Prototype ready. /focus, /pin, /done, /context, /checkpoint, /checkpoints, /restore, /status, /grants, /revoke <id>, /cancel, /quit. Tab: context inspect. Try `demo: list files` and `demo: write hello`.".into(),
             }],
             context: ContextDiagnostics::default(),
             context_selected: Vec::new(),
