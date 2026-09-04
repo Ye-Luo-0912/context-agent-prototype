@@ -104,7 +104,8 @@ streams into the TUI; `/cancel` aborts the in-flight turn. The product
 slash commands are `/checkpoint` (save a runtime checkpoint),
 `/checkpoints` (bounded newest-first listing of the checkpoint store) and
 `/restore <path>` (validate and restore one checkpoint before any further
-mutation). A killed session resumes from the shell with
+mutation), `/grants` (list standing grants) and `/revoke <grant-id>`
+(revoke one by id, with a visible answer either way). A killed session resumes from the shell with
 `--restore=<checkpoint-path>`: the checkpoint is read, parsed and validated
 before the workspace or runtime is touched, and restore failures exit with a
 visible error before any mutation. The prototype TUI

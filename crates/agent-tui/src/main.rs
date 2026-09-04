@@ -396,6 +396,31 @@ async fn run_ui(
                         });
                         continue;
                     }
+                    if let Some(id) = trimmed.strip_prefix("/revoke ") {
+                        let Some(handle) = &interactive else {
+                            app.push_system(
+                                "grant revoke needs an interactive (non read-only) session"
+                                    .to_string(),
+                            );
+                            continue;
+                        };
+                        let id = id.trim();
+                        if id.is_empty() {
+                            app.push_system("usage: /revoke <grant-id>".to_string());
+                            continue;
+                        }
+                        let task_grants = handle.task_grants.clone();
+                        let notice_tx = notice_tx.clone();
+                        let id = id.to_string();
+                        tokio::spawn(async move {
+                            if task_grants.revoke(&id).await {
+                                let _ = notice_tx.try_send(format!("grant {id} revoked"));
+                            } else {
+                                let _ = notice_tx.try_send(format!("no live grant with id {id}"));
+                            }
+                        });
+                        continue;
+                    }
                     if trimmed == "/suspend" {
                         let handle = handle.clone();
                         tokio::spawn(async move {
