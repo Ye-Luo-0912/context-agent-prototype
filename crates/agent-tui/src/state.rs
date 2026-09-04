@@ -263,7 +263,22 @@ impl AppState {
         });
         self.busy = true;
         self.status = "awaiting approval".into();
-        self.push_system(format!("approval required: {tool_name}"));
+        self.push_system(format!(
+            "approval required: {tool_name} (risk: {:?})",
+            request.spec.risk
+        ));
+        // Bounded per-argument breakdown so the operator approves what the
+        // call actually names, not a truncated JSON blob.
+        if let Some(map) = request.call.arguments.as_object() {
+            for (key, value) in map.iter().take(8) {
+                let rendered = serde_json::to_string(value).unwrap_or_default();
+                let rendered: String = rendered.chars().take(120).collect();
+                self.push_system(format!("  {key}: {rendered}"));
+            }
+            if map.len() > 8 {
+                self.push_system(format!("  …and {} more arguments", map.len() - 8));
+            }
+        }
     }
 
     pub fn clear_approval(&mut self) {
@@ -1249,6 +1264,44 @@ mod status_projection_tests {
         assert!(joined.contains("task:") && !joined.contains("task: none"));
         assert!(joined.contains("ack_debts=0"));
         assert!(joined.contains("last manual checkpoint: cp.json"));
+    }
+
+    #[test]
+    fn the_approval_prompt_names_the_risk_and_each_argument() {
+        let mut app = AppState::new(RunId::new());
+        let request = agent_core::ApprovalRequest {
+            request_id: "req-1".into(),
+            call: agent_contracts::ToolCall {
+                id: "call-1".into(),
+                name: "fs.write".into(),
+                arguments: serde_json::json!({
+                    "path": "src/lib.rs",
+                    "content": "the new contents"
+                }),
+            },
+            spec: agent_contracts::ToolSpec {
+                name: "fs.write".into(),
+                description: "write a file".into(),
+                input_schema: serde_json::json!({}),
+                risk: agent_contracts::ToolRisk::WorkspaceWrite,
+                roles: Vec::new(),
+                output_budget: None,
+            },
+        };
+        app.begin_approval(request);
+        let joined = app
+            .messages
+            .iter()
+            .map(|m| m.content.as_str())
+            .collect::<Vec<_>>()
+            .join(
+                "
+",
+            );
+        assert!(joined.contains("approval required: fs.write"), "{joined}");
+        assert!(joined.contains("WorkspaceWrite"), "{joined}");
+        assert!(joined.contains("  path: \"src/lib.rs\""), "{joined}");
+        assert!(joined.contains("  content:"), "{joined}");
     }
 
     fn envelope(seq: u64, event: RuntimeEvent) -> RuntimeEventEnvelope {

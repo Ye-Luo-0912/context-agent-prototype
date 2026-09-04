@@ -261,8 +261,20 @@ async fn run_ui(
     let (notice_tx, mut notice_rx) = tokio::sync::mpsc::channel::<String>(NOTICE_CHANNEL_CAP);
 
     loop {
-        while let Ok(event) = runtime_events.try_recv() {
-            app.apply_runtime_event(event);
+        loop {
+            match runtime_events.try_recv() {
+                Ok(event) => app.apply_runtime_event(event),
+                Err(tokio::sync::broadcast::error::TryRecvError::Lagged(skipped)) => {
+                    // A Lagged receiver dropped events it never saw. Hide
+                    // nothing: name the loss visibly, and note that the
+                    // folded projection below is also missing exactly
+                    // these events.
+                    app.push_system(format!(
+                        "warning: the UI fell behind and dropped {skipped} runtime events; subsequent events continue below and /status does not include them"
+                    ));
+                }
+                Err(_) => break,
+            }
         }
         if let Some(rx) = &mut approval_rx {
             while let Ok(request) = rx.try_recv() {
