@@ -170,8 +170,8 @@ async fn main() -> anyhow::Result<()> {
         recovery_surface: false,
         host_policies: Some(host_policies),
         effect_reservation_journal: Some(reservation_journal),
-        verification_recipes: Some(verification_recipes),
-        project_proof_refresh: true,
+        verification_recipes: Some(verification_recipes.clone()),
+        project_proof_refresh: !verification_recipes.as_ref().is_empty(),
     })
     .await?;
     let mut runtime_events = composed.subscribe();
