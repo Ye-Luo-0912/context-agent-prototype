@@ -46,7 +46,12 @@ pub fn fixture(id: &str) -> Option<&'static M15Fixture> {
     FIXTURES.iter().find(|fixture| fixture.id == id)
 }
 
-pub const FIXTURES: &[M15Fixture] = &[RETRY_DIAG_DEV, RETRY_MIGRATE_DEV, RETRY_MAINT_DEV];
+pub const FIXTURES: &[M15Fixture] = &[
+    RETRY_DIAG_DEV,
+    RETRY_MIGRATE_DEV,
+    RETRY_MAINT_DEV,
+    LTEV_DIAGFIX_DEV,
+];
 
 /// Canonical identity of every frozen input that can change a pack's task or
 /// verdict. Function pointers are represented by their stable check names;
@@ -1241,5 +1246,225 @@ mod tests {
                     .all(|(path, body)| !path.is_empty() && !body.is_empty())
             );
         }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// ltev_diagfix — diagnosis-and-fix, defect location NOT named (LT-EVAL-06
+// task 1)
+// ---------------------------------------------------------------------------
+//
+// The pricing crate computes discounts in half-cents and the documented
+// contract rounds half-cents AWAY FROM ZERO. The seeded defect
+// (`halves / 2` integer truncation) hides in `src/rounding.rs` while the
+// symptom surfaces in `src/receipt.rs`; the directive names neither. The
+// seeded tests only exercise even half-cent products, so they are all
+// green — exactly the unnamed-location diagnosis pressure LT-EVAL-06
+// task 1 measures.
+
+pub const LTEV_DIAGFIX: &str = "ltev_diagfix";
+
+const LTEV_DIAGFIX_DIRECTIVE: &str = "Customers report that discounted totals are one cent low. \
+     The pricing contract says discounts are computed in half-cents and half-cents round AWAY FROM ZERO; \
+     every check in the repo is green. Find the defect somewhere in this crate, write DIAGNOSIS.md at the \
+     workspace root naming the responsible file, function and precise mechanism, then apply the minimal fix \
+     and extend tests/totals.rs with a regression case for an odd number of half-cents (positive and negative). \
+     Keep the public signatures unchanged; run the project checks and report the result.";
+
+const LTEV_DIAGFIX_CARGO: &str = r#"[package]
+name = "receiptkit"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+path = "src/lib.rs"
+
+[dependencies]
+"#;
+
+const LTEV_DIAGFIX_LIB: &str = r#"//! Receipt pricing with documented half-cent rounding.
+pub mod receipt;
+pub mod rounding;
+
+pub use rounding::{discounted, round_half_cent};
+"#;
+
+const LTEV_DIAGFIX_ROUNDING_SEED: &str = r#"//! Half-cent rounding. Contract: half-cents round AWAY FROM ZERO
+//! (1 half -> 1 cent, 3 halves -> 2 cents, -3 halves -> -2 cents).
+
+/// Round a half-cent value to whole cents; half away from zero.
+pub fn round_half_cent(halves: i64) -> i64 {
+    halves / 2
+}
+
+/// Discounted total in whole cents. The pricing engine computes the
+/// discounted amount in half-cents, so the rounding contract applies.
+pub fn discounted(amount_cents: i64, percent: u32) -> i64 {
+    round_half_cent(amount_cents * (100 - percent as i64))
+}
+"#;
+
+const LTEV_DIAGFIX_ROUNDING_FIXED: &str = r#"//! Half-cent rounding. Contract: half-cents round AWAY FROM ZERO
+//! (1 half -> 1 cent, 3 halves -> 2 cents, -3 halves -> -2 cents).
+
+/// Round a half-cent value to whole cents; half away from zero.
+pub fn round_half_cent(halves: i64) -> i64 {
+    (halves + halves.signum()) / 2
+}
+
+/// Discounted total in whole cents. The pricing engine computes the
+/// discounted amount in half-cents, so the rounding contract applies.
+pub fn discounted(amount_cents: i64, percent: u32) -> i64 {
+    round_half_cent(amount_cents * (100 - percent as i64))
+}
+"#;
+
+const LTEV_DIAGFIX_RECEIPT: &str = r#"//! Receipt rendering: the surface where the one-cent-low totals show up.
+use crate::rounding::discounted;
+
+/// One discounted receipt line.
+pub fn line(amount_cents: i64, percent: u32) -> String {
+    format!("total {}c", discounted(amount_cents, percent))
+}
+"#;
+
+const LTEV_DIAGFIX_TESTS_SEED: &str = r#"//! Model-visible coverage for the pricing contract.
+use receiptkit::{discounted, round_half_cent};
+
+#[test]
+fn even_half_cent_products_round_exactly() {
+    assert_eq!(round_half_cent(4), 2);
+    assert_eq!(round_half_cent(0), 0);
+    assert_eq!(discounted(200, 50), 5000);
+    assert_eq!(discounted(-200, 50), -5000);
+}
+"#;
+
+const LTEV_DIAGFIX_TESTS_FIXED: &str = r#"//! Model-visible coverage for the pricing contract.
+use receiptkit::{discounted, round_half_cent};
+
+#[test]
+fn even_half_cent_products_round_exactly() {
+    assert_eq!(round_half_cent(4), 2);
+    assert_eq!(round_half_cent(0), 0);
+    assert_eq!(discounted(200, 50), 5000);
+    assert_eq!(discounted(-200, 50), -5000);
+}
+
+#[test]
+fn odd_half_cent_counts_round_away_from_zero() {
+    // regression: an odd number of half-cents truncated toward zero
+    assert_eq!(round_half_cent(1), 1);
+    assert_eq!(round_half_cent(3), 2);
+    assert_eq!(round_half_cent(-3), -2);
+    assert_eq!(discounted(101, 33), 3384);
+    assert_eq!(discounted(-101, 33), -3384);
+}
+"#;
+
+const LTEV_DIAGFIX_README: &str = "receiptkit (diagnosis fixture)\n\n\
+Pricing contract: discounts are computed in half-cents and half-cents round \
+AWAY FROM ZERO (1 half -> 1 cent, 3 halves -> 2 cents, -3 halves -> -2 cents).\n";
+
+const LTEV_DIAGFIX_DIAGNOSIS_SOLVED: &str = "DIAGNOSIS\n\nThe defect is in src/rounding.rs, \
+function round_half_cent: `halves / 2` uses integer division, which truncates \
+TOWARD ZERO, so an odd number of half-cents loses its half. The contract requires \
+half away from zero. Fixed by adding the sign before halving.\n";
+
+const LTEV_DIAGFIX_FILES_SEED: &[(&str, &str)] = &[
+    ("Cargo.toml", LTEV_DIAGFIX_CARGO),
+    ("src/lib.rs", LTEV_DIAGFIX_LIB),
+    ("src/rounding.rs", LTEV_DIAGFIX_ROUNDING_SEED),
+    ("src/receipt.rs", LTEV_DIAGFIX_RECEIPT),
+    ("tests/totals.rs", LTEV_DIAGFIX_TESTS_SEED),
+    ("README.md", LTEV_DIAGFIX_README),
+];
+
+const LTEV_DIAGFIX_ORACLE_NAME: &str = "ltev_diagfix_oracle";
+const LTEV_DIAGFIX_ORACLE_SOURCE: &str = r#"//! Harness-owned behavioral oracle; copied in by the evaluation harness
+//! after the run. Not authored by the evaluated agent.
+
+use receiptkit::{discounted, round_half_cent};
+
+#[test]
+fn half_cent_rounding_is_away_from_zero() {
+    assert_eq!(round_half_cent(0), 0);
+    assert_eq!(round_half_cent(1), 1);
+    assert_eq!(round_half_cent(3), 2);
+    assert_eq!(round_half_cent(5), 3);
+    assert_eq!(round_half_cent(-1), -1);
+    assert_eq!(round_half_cent(-3), -2);
+    assert_eq!(round_half_cent(4), 2);
+}
+
+#[test]
+fn discounted_totals_recover_the_lost_half() {
+    assert_eq!(discounted(101, 33), 3384);
+    assert_eq!(discounted(-101, 33), -3384);
+    assert_eq!(discounted(200, 50), 5000);
+}
+"#;
+
+const LTEV_DIAGFIX_CHECKS: &[PackCheck] = &[
+    PackCheck {
+        path: "DIAGNOSIS.md",
+        name: "report names rounding.rs, round_half_cent and the truncation mechanism",
+        accept: |body| {
+            body.contains("round_half_cent")
+                && body.contains("rounding.rs")
+                && (body.contains("truncat") || body.contains("toward zero"))
+        },
+    },
+    PackCheck {
+        path: "src/rounding.rs",
+        name: "seed truncation is gone and the public signatures are unchanged",
+        accept: |body| {
+            !body.contains("halves / 2")
+                && body.contains("pub fn round_half_cent(halves: i64) -> i64")
+                && body.contains("pub fn discounted(amount_cents: i64, percent: u32) -> i64")
+        },
+    },
+    PackCheck {
+        path: "tests/totals.rs",
+        name: "regression coverage for odd half-cent counts, positive and negative",
+        accept: |body| {
+            body.contains("round_half_cent(1)")
+                && body.contains("round_half_cent(3)")
+                && body.contains("round_half_cent(-3)")
+        },
+    },
+    PackCheck {
+        path: "README.md",
+        name: "documented contract untouched",
+        accept: |body| body == LTEV_DIAGFIX_README,
+    },
+];
+
+const LTEV_DIAGFIX_DEV: M15Fixture = M15Fixture {
+    id: LTEV_DIAGFIX,
+    directive: LTEV_DIAGFIX_DIRECTIVE,
+    files: LTEV_DIAGFIX_FILES_SEED,
+    checks: LTEV_DIAGFIX_CHECKS,
+    oracle_name: LTEV_DIAGFIX_ORACLE_NAME,
+    oracle_source: LTEV_DIAGFIX_ORACLE_SOURCE,
+};
+
+#[cfg(test)]
+mod ltev_diagfix_tests {
+    use super::*;
+
+    #[test]
+    fn registered_in_the_fixture_registry() {
+        assert!(fixture(LTEV_DIAGFIX).is_some());
+        assert_eq!(FIXTURES.len(), 4);
+    }
+
+    /// Frozen at introduction (LT-EVAL-06 task 1, 2026-09-05).
+    #[test]
+    fn digest_is_frozen() {
+        assert_eq!(
+            spec_sha256(LTEV_DIAGFIX),
+            "f867a1c5a10b65557bc520af8290e376b7839af664f635b6662e22139435b0bd"
+        );
     }
 }
