@@ -72,6 +72,22 @@ closed on unknown formats.
 
 ### P2-BLK-2 — Restart durability is only proven for orderly shutdown
 
+**Partially closed on source, 2026-09-05 (`CRASH-RESUME-01`):** a
+`crash.rs` env-gated failpoint mechanism (hard `exit(9)`, no cleanup) plus
+a spawned `crash_child` binary now exercise **real process death** at two
+durability boundaries: `checkpoint-after-temp-write` (torn checkpoint
+write) and `turn-before-commit-barrier` (uncommitted turn suffix). The
+`agent-compose/tests/crash_resume.rs` acceptance asserts, per scenario:
+the committed write appears exactly once (`changes.jsonl` + content), the
+torn temp residue is never listed as a checkpoint, the store stays
+usable, the uncommitted turn never resurrects on restart, and a
+post-recovery durable checkpoint verifies through `load_verified`. The
+child uses the product-real persistent reservation journal. **Residual:**
+the two effect-broker kill points (after effect prepare; after apply /
+before ACK) still need instrumenting inside the Core effect path.
+
+Original finding, retained for the record:
+
 `crates/agent-compose/tests/product_flow.rs` (landed in `bf52490`):
 
 - `composed.shutdown().await.unwrap()` at L154 and L184 — graceful ordered

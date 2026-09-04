@@ -219,6 +219,9 @@ impl CheckpointStore {
         write_and_sync(&temp, &stored).await.map_err(|error| {
             AgentError::InvalidRequest(format!("checkpoint write failed: {error}"))
         })?;
+        // Durability acceptance kill point: the temp file is synced but the
+        // atomic rename never happens, leaving a torn write on disk.
+        crate::crash::failpoint("checkpoint-after-temp-write");
         tokio::fs::rename(&temp, &final_path)
             .await
             .map_err(|error| {

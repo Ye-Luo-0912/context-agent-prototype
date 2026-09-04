@@ -2137,6 +2137,10 @@ impl RuntimeActor {
         // durable batch. Replay keys off the marker, while subscribers see
         // neither member until all mandatory writes and both events have
         // crossed the same flush barrier.
+        //
+        // Durability acceptance kill point: die before the batch is durable
+        // so the finished turn is an uncommitted suffix on disk.
+        crate::crash::failpoint("turn-before-commit-barrier");
         if let Err(error) = self
             .core
             .emit_events_durable(vec![

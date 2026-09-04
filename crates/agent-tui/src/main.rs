@@ -703,7 +703,6 @@ mod tests {
         );
     }
 
-
     #[test]
     fn resume_discovery_picks_the_newest_json_checkpoint() {
         use std::fs::FileTimes;
@@ -724,7 +723,9 @@ mod tests {
         assert_eq!(resolved, newer);
 
         let empty = tempfile::tempdir().unwrap();
-        let error = resolve_latest_checkpoint(empty.path()).unwrap_err().to_string();
+        let error = resolve_latest_checkpoint(empty.path())
+            .unwrap_err()
+            .to_string();
         assert!(error.contains("no checkpoint found"), "{error}");
     }
 
