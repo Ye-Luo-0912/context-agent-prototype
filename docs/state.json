@@ -2,7 +2,7 @@
   "schema": "project-state.v1",
   "updated": "2026-09-05",
   "maintained_by": "hand until the CI document-consistency gate lands; README.md and docs/CURRENT.md current-status text must be verified against this file",
-  "head_commit": "(set below)",
+  "head_commit": "(refresh after doc commit)",
   "code_commit": "050aa8e68f59c49d42b95e2a4d38fa37234a1e78",
   "ci": {
     "head_commit": "green",
@@ -51,7 +51,8 @@
     "TUI transcript bounded at 400 rows through a single push path (ca6db07)",
     "CRASH-RESUME-01 completed: all four kill points (effect prepare, effect apply-before-ack, checkpoint temp-write, turn barrier) with a real child-process crash matrix (9f159fa)",
     "TUI approval detail (risk + per-argument breakdown) and visible Lagged-event warnings (dc15079)",
-    "PACKAGE-01 base: dist.sh/dist.ps1 release packaging with SHA256SUMS, Windows path validated by a real run (072b185)"
+    "PACKAGE-01 base: dist.sh/dist.ps1 release packaging with SHA256SUMS, Windows path validated by a real run (072b185)",
+    "PROOF-OPERATION-01 (mostly closed): host verifier runs outside the actor loop behind an opt-in defer_proof_refresh switch, with fenced resume; frozen inline semantics default; cross-turn acceptance (turn-holding) remains (6d851ab)"
   ],
   "default_context": "dynamic-in-process",
   "experimental": [
