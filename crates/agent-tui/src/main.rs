@@ -14,7 +14,7 @@ use agent_compose::{
 };
 use agent_contracts::{ApprovalDecision, StandingGrant};
 use agent_core::{ApprovalBroker, InteractiveApprovalGate, PolicyApprovalGate, TaskApprovalGate};
-use agent_runtime::{RuntimeHandle, RuntimeInstance};
+use agent_runtime::{RuntimeCheckpoint, RuntimeHandle, RuntimeInstance};
 use agent_storage::FileEventJournal;
 use agent_workspace::{Workspace, WorkspaceOutputBroker};
 use anyhow::Context;
@@ -51,6 +51,7 @@ async fn main() -> anyhow::Result<()> {
     let mut root_arg: Option<PathBuf> = None;
     let mut grant_args: Vec<String> = Vec::new();
     let mut effect_reservation_journal: Option<PathBuf> = None;
+    let mut restore_arg: Option<PathBuf> = None;
     for arg in std::env::args().skip(1) {
         if arg == "--read-only" {
             read_only = true;
@@ -60,10 +61,21 @@ async fn main() -> anyhow::Result<()> {
             grant_args.push(value.to_string());
         } else if let Some(value) = arg.strip_prefix("--effect-reservation-journal=") {
             effect_reservation_journal = Some(PathBuf::from(value));
+        } else if let Some(value) = arg.strip_prefix("--restore=") {
+            restore_arg = Some(PathBuf::from(value));
         } else if root_arg.is_none() {
             root_arg = Some(PathBuf::from(arg));
         }
     }
+    if read_only && restore_arg.is_some() {
+        anyhow::bail!("--restore cannot be combined with --read-only");
+    }
+    // An invalid checkpoint must fail before the workspace, host or any
+    // state is touched: read, parse and validate it up front.
+    let restore_checkpoint = match &restore_arg {
+        Some(path) => Some(load_runtime_checkpoint(path)?),
+        None => None,
+    };
     let policy = ContextPolicy::from_str_checked(&context_policy)?;
     let root = root_arg.unwrap_or(std::env::current_dir().context("current directory")?);
     let workspace = Workspace::open(&root).await?;
@@ -164,6 +176,19 @@ async fn main() -> anyhow::Result<()> {
     .await?;
     let mut runtime_events = composed.subscribe();
     composed.instance.start().await?;
+    if let Some(checkpoint) = restore_checkpoint {
+        let path = restore_arg.clone().unwrap_or_default();
+        composed
+            .instance
+            .restore(checkpoint)
+            .await
+            .map_err(|error| {
+                anyhow::Error::new(error).context(format!(
+                    "startup restore from {} failed; the runtime refused the checkpoint before any mutation",
+                    path.display()
+                ))
+            })?;
+    }
 
     enable_raw_mode().context("enable raw mode")?;
     let mut stdout = io::stdout();
@@ -541,6 +566,23 @@ fn now_ms() -> u64 {
         .unwrap_or_default()
 }
 
+/// Read, parse and validate a runtime checkpoint file. Every failure mode
+/// is a visible configuration-style error; nothing has been started or
+/// mutated when this runs.
+fn load_runtime_checkpoint(path: &std::path::Path) -> anyhow::Result<RuntimeCheckpoint> {
+    let bytes =
+        std::fs::read(path).with_context(|| format!("read checkpoint {}", path.display()))?;
+    let checkpoint: RuntimeCheckpoint = serde_json::from_slice(&bytes)
+        .with_context(|| format!("parse {}: is this a runtime checkpoint?", path.display()))?;
+    checkpoint.validate().map_err(|error| {
+        anyhow::Error::new(error).context(format!(
+            "invalid checkpoint {}: the runtime refuses it before any mutation",
+            path.display()
+        ))
+    })?;
+    Ok(checkpoint)
+}
+
 /// Bounded number of checkpoint rows the `/checkpoints` listing renders.
 const CHECKPOINT_LIST_LIMIT: usize = 20;
 
@@ -592,5 +634,18 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let missing = dir.path().join("nope");
         assert!(list_checkpoint_rows(&missing).await.is_err());
+    }
+
+    #[test]
+    fn load_runtime_checkpoint_reports_readable_failures() {
+        let dir = tempfile::tempdir().unwrap();
+        let missing = dir.path().join("missing.json");
+        let error = load_runtime_checkpoint(&missing).unwrap_err().to_string();
+        assert!(error.contains("read checkpoint"), "{error}");
+
+        let garbage = dir.path().join("garbage.json");
+        std::fs::write(&garbage, b"not json").unwrap();
+        let error = load_runtime_checkpoint(&garbage).unwrap_err().to_string();
+        assert!(error.contains("is this a runtime checkpoint?"), "{error}");
     }
 }
