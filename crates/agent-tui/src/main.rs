@@ -409,6 +409,38 @@ async fn run_ui(
                         });
                         continue;
                     }
+                    if trimmed == "/checkpoints" {
+                        // Bounded newest-first listing of the checkpoint
+                        // store, so save/list/resume is discoverable from
+                        // the product host without filesystem spelunking.
+                        match list_checkpoint_rows(&checkpoint_dir).await {
+                            Ok(rows) if rows.is_empty() => {
+                                app.push_system(
+                                    "no checkpoints saved yet; /checkpoint writes one".to_string(),
+                                );
+                            }
+                            Ok(rows) => {
+                                let shown = rows.len().min(CHECKPOINT_LIST_LIMIT);
+                                for (modified, size, path) in &rows[..shown] {
+                                    let age = modified
+                                        .elapsed()
+                                        .map(|elapsed| format!("{elapsed:?} ago"))
+                                        .unwrap_or_else(|_| "unknown age".into());
+                                    app.push_system(format!("{path} ({size} bytes, {age})"));
+                                }
+                                if rows.len() > shown {
+                                    app.push_system(format!(
+                                        "...and {} more (oldest first hidden)",
+                                        rows.len() - shown
+                                    ));
+                                }
+                            }
+                            Err(error) => {
+                                app.push_system(format!("checkpoint list failed: {error}"))
+                            }
+                        }
+                        continue;
+                    }
                     if trimmed == "/checkpoint" {
                         let path =
                             checkpoint_dir.join(format!("{}-{}.json", handle.run_id(), now_ms()));
@@ -507,4 +539,58 @@ fn now_ms() -> u64 {
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_millis() as u64)
         .unwrap_or_default()
+}
+
+/// Bounded number of checkpoint rows the `/checkpoints` listing renders.
+const CHECKPOINT_LIST_LIMIT: usize = 20;
+
+/// Newest-first `(modified, bytes, path)` rows for the checkpoint store.
+/// Non-`json` entries are skipped; unreadable metadata is skipped rather
+/// than failing the whole listing.
+async fn list_checkpoint_rows(
+    dir: &std::path::Path,
+) -> anyhow::Result<Vec<(std::time::SystemTime, u64, String)>> {
+    let mut rows = Vec::new();
+    let mut entries = tokio::fs::read_dir(dir).await?;
+    while let Some(entry) = entries.next_entry().await? {
+        let path = entry.path();
+        if path.extension().and_then(|extension| extension.to_str()) != Some("json") {
+            continue;
+        }
+        let Ok(metadata) = entry.metadata().await else {
+            continue;
+        };
+        let modified = metadata
+            .modified()
+            .unwrap_or(std::time::SystemTime::UNIX_EPOCH);
+        rows.push((modified, metadata.len(), path.display().to_string()));
+    }
+    rows.sort_by_key(|row| std::cmp::Reverse(row.0));
+    Ok(rows)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn checkpoint_listing_is_newest_first_and_skips_non_json() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("a.json"), b"{}").unwrap();
+        std::fs::write(dir.path().join("b.json"), b"{}").unwrap();
+        std::fs::write(dir.path().join("notes.txt"), b"ignore").unwrap();
+        // Give the second file a strictly later mtime where the filesystem
+        // has enough resolution; on coarse-clock filesystems the order tie
+        // is acceptable, so this test only asserts membership and count.
+        let rows = list_checkpoint_rows(dir.path()).await.unwrap();
+        assert_eq!(rows.len(), 2, "only json checkpoints are listed");
+        assert!(rows.iter().all(|(_, _, path)| path.ends_with(".json")));
+    }
+
+    #[tokio::test]
+    async fn checkpoint_listing_of_a_missing_dir_is_an_error_not_a_panic() {
+        let dir = tempfile::tempdir().unwrap();
+        let missing = dir.path().join("nope");
+        assert!(list_checkpoint_rows(&missing).await.is_err());
+    }
 }

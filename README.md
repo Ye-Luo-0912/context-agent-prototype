@@ -100,7 +100,11 @@ cargo run -p agent-tui -- .
 The provider implements OpenAI-style Chat Completions and Responses streaming,
 but endpoint capabilities differ. Treat a provider/model/protocol tuple as
 supported only after its tool-calling and streaming preflight succeeds. Output
-streams into the TUI; `/cancel` aborts the in-flight turn. The prototype TUI
+streams into the TUI; `/cancel` aborts the in-flight turn. The product
+slash commands are `/checkpoint` (save a runtime checkpoint),
+`/checkpoints` (bounded newest-first listing of the checkpoint store) and
+`/restore <path>` (validate and restore one checkpoint before any further
+mutation). The prototype TUI
 currently inherits Core's 16-tool-round default, while formal M15 cells use a
 separate 48-round cap; the product route requires an explicit checked cap and
 tests against the value it actually ships.
