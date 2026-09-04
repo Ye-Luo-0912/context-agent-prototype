@@ -10,3 +10,4 @@
 eval.env
 .env
 .env.local
+dist/
