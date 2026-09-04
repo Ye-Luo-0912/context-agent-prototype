@@ -108,9 +108,10 @@ store) and `/restore <path-or-artifact>` (validate — envelope checksum or
 legacy raw JSON — and restore one checkpoint before any further
 mutation), `/grants` (list standing grants) and `/revoke <grant-id>`
 (revoke one by id, with a visible answer either way). A killed session resumes from the shell with
-`--restore=<checkpoint-path>`: the checkpoint is read, parsed and validated
-before the workspace or runtime is touched, and restore failures exit with a
-visible error before any mutation. The prototype TUI
+`--restore=<checkpoint-path>`, or resume discovery with
+`--restore=latest` (the newest saved checkpoint). The checkpoint is read,
+parsed and validated before the workspace or runtime is touched, and
+restore failures exit with a visible error before any mutation. The prototype TUI
 currently inherits Core's 16-tool-round default, while formal M15 cells use a
 separate 48-round cap; the product route requires an explicit checked cap and
 tests against the value it actually ships.

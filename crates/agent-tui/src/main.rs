@@ -69,14 +69,24 @@ async fn main() -> anyhow::Result<()> {
         anyhow::bail!("--restore cannot be combined with --read-only");
     }
     // An invalid checkpoint must fail before the workspace, host or any
-    // state is touched: read, parse and validate it up front.
-    let restore_checkpoint = match &restore_arg {
-        Some(path) => Some(load_runtime_checkpoint(path)?),
-        None => None,
+    // state is touched: read, parse and validate an explicit path up
+    // front. `--restore=latest` resolves after the workspace opens, then
+    // validates the same way before anything starts.
+    let restore_latest = matches!(&restore_arg, Some(path) if path.as_os_str() == "latest");
+    let restore_checkpoint = match (&restore_arg, restore_latest) {
+        (Some(path), false) => Some(load_runtime_checkpoint(path)?),
+        _ => None,
     };
     let policy = ContextPolicy::from_str_checked(&context_policy)?;
     let root = root_arg.unwrap_or(std::env::current_dir().context("current directory")?);
     let workspace = Workspace::open(&root).await?;
+    let mut restore_checkpoint = if restore_latest {
+        let resolved = resolve_latest_checkpoint(&workspace.state_dir().join("checkpoints"))?;
+        let checkpoint = load_runtime_checkpoint(&resolved)?;
+        Some((resolved, checkpoint))
+    } else {
+        restore_checkpoint.map(|checkpoint| (restore_arg.clone().unwrap_or_default(), checkpoint))
+    };
     let journal = Arc::new(FileEventJournal::open(workspace.state_dir().join("traces")).await?);
 
     // The context engine and the model are composition-root choices shared
@@ -174,8 +184,7 @@ async fn main() -> anyhow::Result<()> {
     .await?;
     let mut runtime_events = composed.subscribe();
     composed.instance.start().await?;
-    if let Some(checkpoint) = restore_checkpoint {
-        let path = restore_arg.clone().unwrap_or_default();
+    if let Some((path, checkpoint)) = restore_checkpoint {
         composed
             .instance
             .restore(checkpoint)
@@ -556,6 +565,18 @@ async fn run_ui(
                         continue;
                     }
 
+                    if trimmed == "/help" {
+                        for line in HELP_LINES {
+                            app.push_system((*line).to_string());
+                        }
+                        continue;
+                    }
+                    if trimmed.starts_with('/') {
+                        app.push_system(format!(
+                            "unknown command {trimmed}; /help lists the product commands,                              and non-command input needs no leading slash"
+                        ));
+                        continue;
+                    }
                     if app.busy {
                         app.push_system(
                             "Agent is busy; wait for the current turn to finish.".into(),
@@ -591,6 +612,54 @@ fn load_runtime_checkpoint(path: &std::path::Path) -> anyhow::Result<RuntimeChec
             "invalid checkpoint {}: the runtime refuses it before any mutation",
             path.display()
         ))
+    })
+}
+
+/// The product command list `/help` renders. Kept in one place so the
+/// welcome hint and the help output cannot drift apart.
+const HELP_LINES: [&str; 14] = [
+    "/focus <directive> - point the runtime at a task directive",
+    "/pin <note> - pin a durable note into the working set",
+    "/done <summary> - close the current task with a summary",
+    "/context - inspect the selected working context",
+    "/status - run, task anchor, recovery debts, last checkpoint",
+    "/tasks - list the run's tasks",
+    "/checkpoint - save a runtime checkpoint now",
+    "/checkpoints - list saved checkpoints (newest first)",
+    "/restore <path> - restore one checkpoint in this session",
+    "/grants - list standing effect grants",
+    "/revoke <grant-id> - revoke one standing grant",
+    "/suspend - suspend the active task at a safe point",
+    "/cancel - cancel the in-flight turn",
+    "/quit - leave the TUI",
+];
+
+/// Resume discovery: the newest saved checkpoint in the store. A missing
+/// or empty store is a configuration error with the fix in the message.
+fn resolve_latest_checkpoint(dir: &std::path::Path) -> anyhow::Result<std::path::PathBuf> {
+    let mut newest: Option<(std::time::SystemTime, std::path::PathBuf)> = None;
+    for entry in std::fs::read_dir(dir)?.flatten() {
+        let path = entry.path();
+        if path.extension().and_then(|extension| extension.to_str()) != Some("json") {
+            continue;
+        }
+        let modified = entry
+            .metadata()
+            .and_then(|metadata| metadata.modified())
+            .unwrap_or(std::time::SystemTime::UNIX_EPOCH);
+        let replaces = match &newest {
+            None => true,
+            Some((newest_at, _)) => modified > *newest_at,
+        };
+        if replaces {
+            newest = Some((modified, path));
+        }
+    }
+    newest.map(|(_, path)| path).ok_or_else(|| {
+        anyhow::anyhow!(
+            "no checkpoint found in {}: /checkpoint saves one, or pass --restore=<file>              for an explicit path",
+            dir.display()
+        )
     })
 }
 
@@ -632,6 +701,31 @@ mod tests {
             resolve_restore_target(dir, "cp.json"),
             std::path::PathBuf::from("cp.json")
         );
+    }
+
+
+    #[test]
+    fn resume_discovery_picks_the_newest_json_checkpoint() {
+        use std::fs::FileTimes;
+
+        let dir = tempfile::tempdir().unwrap();
+        let older = dir.path().join("older.json");
+        let newer = dir.path().join("newer.json");
+        std::fs::write(&older, b"{}").unwrap();
+        std::fs::write(&newer, b"{}").unwrap();
+        let set_modified = |path: &std::path::Path, at: std::time::SystemTime| {
+            let file = std::fs::OpenOptions::new().append(true).open(path).unwrap();
+            file.set_times(FileTimes::new().set_modified(at)).unwrap();
+        };
+        set_modified(&older, std::time::SystemTime::UNIX_EPOCH);
+        set_modified(&newer, std::time::SystemTime::now());
+
+        let resolved = resolve_latest_checkpoint(dir.path()).unwrap();
+        assert_eq!(resolved, newer);
+
+        let empty = tempfile::tempdir().unwrap();
+        let error = resolve_latest_checkpoint(empty.path()).unwrap_err().to_string();
+        assert!(error.contains("no checkpoint found"), "{error}");
     }
 
     #[test]
