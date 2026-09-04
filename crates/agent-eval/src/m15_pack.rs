@@ -1455,6 +1455,28 @@ const LTEV_DIAGFIX_DEV: M15Fixture = M15Fixture {
 #[cfg(test)]
 mod ltev_diagfix_tests {
     use super::*;
+    use std::process::Stdio;
+    use std::time::Duration;
+    use std::time::Duration;
+
+    const CARGO_TEST_TIMEOUT: Duration = Duration::from_secs(600);
+
+    /// Local copy of the sibling runner: run the harness-owned oracle the
+    /// same way the live harness does and report compile-and-pass.
+    async fn oracle_passes(root: &Path, oracle_name: &str) -> bool {
+        let mut command = tokio::process::Command::new("cargo");
+        command
+            .arg("test")
+            .arg("--test")
+            .arg(oracle_name)
+            .current_dir(root)
+            .env("CARGO_TERM_COLOR", "never")
+            .stdin(Stdio::null());
+        match tokio::time::timeout(CARGO_TEST_TIMEOUT, command.output()).await {
+            Ok(Ok(output)) => output.status.success(),
+            _ => false,
+        }
+    }
 
     #[test]
     fn registered_in_the_fixture_registry() {
@@ -1468,6 +1490,68 @@ mod ltev_diagfix_tests {
         assert_eq!(
             spec_sha256(LTEV_DIAGFIX),
             "f867a1c5a10b65557bc520af8290e376b7839af664f635b6662e22139435b0bd"
+        );
+    }
+
+    #[test]
+    fn seed_fails_checks_and_minimal_fix_passes_all() {
+        let dir = tempfile::tempdir().unwrap();
+        seed(dir.path(), LTEV_DIAGFIX).unwrap();
+        let seeded = hidden_check_results(dir.path(), LTEV_DIAGFIX)
+            .into_iter()
+            .map(|(_, _, passed)| passed)
+            .collect::<Vec<_>>();
+        assert!(
+            seeded.iter().any(|passed| !passed),
+            "the seeded truncation must fail the contract checks: {seeded:?}"
+        );
+
+        std::fs::write(
+            dir.path().join("src/rounding.rs"),
+            LTEV_DIAGFIX_ROUNDING_FIXED,
+        )
+        .unwrap();
+        std::fs::write(dir.path().join("tests/totals.rs"), LTEV_DIAGFIX_TESTS_FIXED).unwrap();
+        std::fs::write(
+            dir.path().join("DIAGNOSIS.md"),
+            LTEV_DIAGFIX_DIAGNOSIS_SOLVED,
+        )
+        .unwrap();
+        let solved = hidden_check_results(dir.path(), LTEV_DIAGFIX)
+            .into_iter()
+            .map(|(_, _, passed)| passed)
+            .collect::<Vec<_>>();
+        assert!(
+            solved.iter().all(|passed| *passed),
+            "the minimal fix must pass every check: {solved:?}"
+        );
+    }
+
+    /// The harness oracle must reject the untouched seed and accept the
+    /// scripted minimal fix (real cargo runs, as in the live harness).
+    #[tokio::test]
+    async fn oracle_rejects_seed_and_accepts_the_fix() {
+        let dir = tempfile::tempdir().unwrap();
+        seed(dir.path(), LTEV_DIAGFIX).unwrap();
+        let tests = dir.path().join("tests");
+        std::fs::create_dir_all(&tests).unwrap();
+        std::fs::write(
+            tests.join(format!("{}.rs", LTEV_DIAGFIX_ORACLE_NAME)),
+            LTEV_DIAGFIX_ORACLE_SOURCE,
+        )
+        .unwrap();
+        assert!(
+            !oracle_passes(dir.path(), LTEV_DIAGFIX_ORACLE_NAME).await,
+            "the oracle must reject the untouched seed"
+        );
+        std::fs::write(
+            dir.path().join("src/rounding.rs"),
+            LTEV_DIAGFIX_ROUNDING_FIXED,
+        )
+        .unwrap();
+        assert!(
+            oracle_passes(dir.path(), LTEV_DIAGFIX_ORACLE_NAME).await,
+            "the oracle must accept the scripted minimal fix"
         );
     }
 }
