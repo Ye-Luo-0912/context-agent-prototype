@@ -111,14 +111,13 @@ not a new planner, TaskGraph, database or multi-Agent layer.
   run. The mechanically regenerated report is the only accepted verdict;
   valid FAIL rejects the bf52490 candidate, and only a typed NOT_RUN
   permits a whole-window rerun.
-- Formal M15 remains open. Nine v4 windows are banked (seven valid FAILs
-  plus the censored eighth and its failed rerun); the latest mechanical
-  report is the rerun's 6/12 with 0 NOT_RUN, where the policy
-  completion-gate tail loop is the dominant recurring failure surface
-  (3 of 4 policy cells) and the diag overflow edge remains stochastic
-  (1/4). The successor repairs did not change that outcome: the loop is
-  model task-execution behavior on this serving, not the infrastructure
-  lock contention the seventh window hit.
+- Formal M15 remains open. Ten v4 windows are banked (eight valid FAILs,
+  one censored, one authorized rerun); the latest mechanical report is the
+  ninth window's 11/12 with 0 NOT_RUN — policy 4/4 for the first time and
+  a single stochastic diag overflow-edge miss. The two stochastic surfaces
+  (diag `checked_shl` trap, policy completion-gate tail) have each passed
+  4/4 in some window but never simultaneously; every infrastructure cause
+  has been repaired and exonerated by the evidence.
 - The successor-rerun diagnosis now identifies a Runtime-level convergence
   defect beneath that model behavior: raw call JSON was reused as result
   identity, advisory `next_action` could self-lock completion, volatile
