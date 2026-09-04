@@ -30,6 +30,18 @@ Context: M15 closed 2026-09-04 during this review (tenth v4 window PASS
 
 ### P2-BLK-1 — Checkpoint format split and retention hazard
 
+**Closed on source, 2026-09-05 (`CHECKPOINT-PRODUCT-01`):** the TUI's
+`/checkpoint`, `/restore` and startup `--restore` now go through the
+Runtime `CheckpointStore`; the store gained a bounded envelope-verified
+`list`; retention counts only real `checkpoint-*.json` envelopes so
+foreign files can neither be deleted nor evict artifacts; and
+`decode_checkpoint_file` reads envelope or legacy raw JSON, failing closed
+otherwise. `/restore` additionally accepts a bare artifact name from the
+listing. Remaining from the original finding: a dedicated exports
+directory for user-portable copies (no product command needs it yet).
+
+Original finding, retained for the record:
+
 Two writers share `.focus-agent/checkpoints/`:
 
 - TUI `/checkpoint` writes raw pretty JSON with no envelope, checksum, sync
@@ -96,6 +108,36 @@ commit barrier).
   `ProviderProfile`/`ProductProfile` (returning
   `Result<_, ConfigurationErrors>` and digesting itself into events and
   checkpoints) would replace.
+
+**Root cause added 2026-09-05 — missing sampling identity.** The request
+path never carries `temperature`/`top_p`/`seed` (verified: zero occurrences
+in non-test source of `provider-openai`, `agent-runtime`, `agent-compose`,
+`agent-eval`; the only historical `git log -S temperature` hit is unrelated
+SWE-bench data). Wire bodies carry only `{model, messages/input, tools,
+stream, [stream_options], [max_tokens|max_output_tokens]}`
+(`provider-openai/src/lib.rs:712-724`, `779-790`) and the contract
+`ModelRequest` has no sampling channel at all
+(`agent-contracts/src/model.rs:622`). Sampling is therefore an
+**unrecorded server-side default**: an operating-point decision fixed by
+absence, not by choice. Consequences:
+
+- the M15 "serving tuple" (endpoint/model/protocol/context-window,
+  `M15_ACCEPTANCE.md:36-37`) is an incomplete identity — a server-side
+  default change silently changes the measured object with no trace in the
+  evidence chain;
+- the per-cell stochastic surfaces (see appendix) are fed by this noise:
+  multi-round tool loops chaotically amplify token-level divergence.
+
+Fix direction (fold into `PRODUCT-PROFILE-01`): `ProviderProfile` gains an
+explicit `SamplingPolicy` — *declared provider-default* / *pinned
+temperature* / *pinned temperature+seed* — using the existing
+`send_stream_options`/`send_max_tokens` capability-flag pattern; the
+effective policy is burned into `provider_profile_digest` and persisted in
+RunStarted, checkpoints and eval manifests. Do not retrofit the closed M15
+windows (all eleven ran on the same provider-default operating point, so
+they are internally consistent); instead require future comparative gates
+(`LT-EVAL-06`, Context-Frame A/B) to predeclare their sampling operating
+point.
 
 ### P2-BLK-4 — `/status` shows four field groups, not agent state
 
@@ -176,7 +218,9 @@ Any split should follow transaction boundaries, not line counts.
    drift fixes, `archive/CONTEXT_RUNTIME_TODO.md` (this tranche).
 2. `CHECKPOINT-PRODUCT-01` — P2-BLK-1.
 3. `CRASH-RESUME-01` — P2-BLK-2, the four kill points.
-4. `PRODUCT-PROFILE-01` — P2-BLK-3, digests into events/checkpoints.
+4. `PRODUCT-PROFILE-01` — P2-BLK-3 incl. the explicit `SamplingPolicy`
+   (declared default or pinned), digested into events/checkpoints and eval
+   manifests.
 5. `STATUS-SNAPSHOT-01` — P2-BLK-4.
 6. `PROOF-OPERATION-01` — P2-BLK-5.
 7. `TUI-ALPHA-01` — P2-BLK-6 + approval detail + Lagged resync.
@@ -190,3 +234,56 @@ Any split should follow transaction boundaries, not line counts.
 Out of scope for now (per ROADMAP "Later, only from evidence"): run/task
 database projection beyond the bounded read model, serial TaskGraph,
 workers/multi-Agent, Self-Iteration (separately gated).
+
+## Appendix — stochastic-surface causal analysis (2026-09-05)
+
+Post-closure diagnosis of why the two M15 "stochastic surfaces" varied
+1/4..4/4 on identical source and serving, based on the immutable cell
+streams.
+
+**Physical noise source.** No sampling parameters are ever sent (see
+P2-BLK-3): provider-default sampling makes identical prompt prefixes
+diverge, and multi-round tool loops chaotically amplify token-level
+differences into different execution trajectories.
+
+**Diag surface mechanism — the trap shape survives when the model's own
+tests cannot discriminate it.** The fixture bug (1-based shift) has an
+"obvious" wrong fix (`base.checked_shl(shift)`: validates the shift count,
+not bit loss — `base = 1<<63`, shift 1 silently yields 0) and a correct fix
+(`base.checked_mul(1 << shift)` with a `shift >= 64` guard). The seed's
+contract test passes under both. Round-by-round reconstruction:
+
+- Ninth window FAIL cell (`m15-retry_diag_dev-resume/r2-attempt16`,
+  `dynamic/events.jsonl`): wrote `checked_shl` + guard at round 3; its own
+  large-attempt test used `base=100, max=1000` (passes under the trap);
+  `verify.run` green (exit 0); model declared the "minimal backoff fix"
+  done; the hidden oracle's gating assert "shift corrected and
+  overflow-safe" failed the cell.
+- Tenth window PASS cell (`m15-retry_diag_dev-normal/r1-attempt17`):
+  **also wrote `checked_shl` first** (round 2, without even the guard), but
+  its self-written test used `base = 1<<63` — cargo failed with
+  `left: 0, right: 9223372036854775808` (exit 101) — and the visible
+  feedback forced iteration to `checked_mul` by round 6; final verify green.
+
+So pass/fail hinges on whether the sampled trajectory happens to author a
+discriminating test or reason about the *product* overflow up front — a
+per-cell coin flip (empirically 12/16 ≈ 75% over the last four windows:
+4/4, 1/4, 3/4, 4/4), with resume cells adding context-composition variance
+at the restore point.
+
+**Policy surface mechanism — was runtime-amplified noise, now absorbed.**
+Pre-`8dee7be`, the completion gate's compound refusals plus the runtime's
+inability to recognize repair progress (raw call-JSON identity, advisory
+`next_action` self-lock, volatile revision resets, history-dependent proof
+route) made escape within the 48-round budget sampling-dependent (1/4..4/4).
+After semantic completion liveness, the surface became "variance in rounds,
+not in outcome": the tenth window's four policy cells converged in
+33/20/34/28 rounds, all passing, three with completed closures.
+
+**Implication.** The architecture's proven answer is a deterministic
+scaffold around a stochastic core (typed blocker frontiers, host-trusted
+reconciliation, visible verification feedback), not noise elimination.
+Future gates should measure non-inferiority with declared sampling
+operating points instead of promising token-level reproducibility; the
+diag trap itself is the fixture's diagnostic value and must not be defused
+by seeding a discriminating test.

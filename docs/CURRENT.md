@@ -8,9 +8,12 @@ Formal verdicts live only in the immutable
 
 ## Basis
 
-- Head `d004836` — the M15-closure commit (evidence + record). Runtime code
-  is unchanged from `050aa8e`. CI: green through `a882789`; the `d004836`
-  run (`33895590479`) was in progress when this snapshot was written.
+- Head `33081b4` — M15 closure (`d004836`) plus the docs-state tranche and
+  CI-load-tolerant turn-integration test deadlines. Runtime code is
+  unchanged from `050aa8e`. CI is green on the head (`33898496334`); the
+  earlier `d004836` run had failed its Windows full suite on test wait
+  deadlines under CI load (closure conditions are unaffected — they pinned
+  the candidate source `050aa8e`/`a882789`, which stayed green).
 - `main` has no branch protection yet.
 
 ## M15 — closed at the frozen gate
@@ -29,16 +32,17 @@ Formal verdicts live only in the immutable
 
 ## Product stage
 
-- **Pre-alpha.** Phase 2 (Reliable Local Agent alpha) started 2026-09-04;
-  first slice landed: checked model configuration (`AGENT_DEMO=1` explicit
-  mock, missing `OPENAI_API_KEY` is a visible startup error, `32ea622`).
+- **Pre-alpha.** Phase 2 (Reliable Local Agent alpha) started 2026-09-04.
+  Landed: checked model configuration (`32ea622`); unified manual/automatic
+  checkpoints on the Runtime `CheckpointStore` envelope, with retention
+  scoped to real store artifacts and a fail-closed legacy decoder
+  (`CHECKPOINT-PRODUCT-01`, 2026-09-05, uncommitted at write time).
 - Next product queue (order per [`ROADMAP.md`](ROADMAP.md#route-to-a-usable-local-agent)
   and the 2026-09-05 code review, [`reviews/2026-09-05-code-review.md`](reviews/2026-09-05-code-review.md)):
-  unify manual/automatic checkpoints on the Runtime `CheckpointStore`;
   a real kill/restart acceptance matrix; strict `ProviderProfile`/
-  `ProductProfile` with digests; a Runtime-owned status snapshot; proof
-  refresh as a cancellable operation; a bounded TUI transcript; packaging
-  and clean-machine doctor.
+  `ProductProfile` with digests and an explicit `SamplingPolicy`; a
+  Runtime-owned status snapshot; proof refresh as a cancellable operation;
+  a bounded TUI transcript; packaging and clean-machine doctor.
 - Default context is dynamic in-process. `context-service`,
   completion-opportunity, settlement-projection and recovery-surface remain
   experimental.

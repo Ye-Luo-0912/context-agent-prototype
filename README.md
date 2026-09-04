@@ -101,9 +101,11 @@ The provider implements OpenAI-style Chat Completions and Responses streaming,
 but endpoint capabilities differ. Treat a provider/model/protocol tuple as
 supported only after its tool-calling and streaming preflight succeeds. Output
 streams into the TUI; `/cancel` aborts the in-flight turn. The product
-slash commands are `/checkpoint` (save a runtime checkpoint),
-`/checkpoints` (bounded newest-first listing of the checkpoint store) and
-`/restore <path>` (validate and restore one checkpoint before any further
+slash commands are `/checkpoint` (save a runtime checkpoint through the
+same atomic, checksum-verified envelope store the automatic safe points
+use), `/checkpoints` (bounded newest-first listing of the checkpoint
+store) and `/restore <path-or-artifact>` (validate — envelope checksum or
+legacy raw JSON — and restore one checkpoint before any further
 mutation), `/grants` (list standing grants) and `/revoke <grant-id>`
 (revoke one by id, with a visible answer either way). A killed session resumes from the shell with
 `--restore=<checkpoint-path>`: the checkpoint is read, parsed and validated

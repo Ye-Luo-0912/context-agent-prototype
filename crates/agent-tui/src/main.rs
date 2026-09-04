@@ -1,12 +1,7 @@
 mod state;
 mod ui;
 
-use std::{
-    io,
-    path::PathBuf,
-    sync::Arc,
-    time::{Duration, SystemTime, UNIX_EPOCH},
-};
+use std::{io, path::PathBuf, sync::Arc, time::Duration};
 
 use agent_compose::{
     ComposeConfig, ContextPolicy, HostToolPolicyRegistry, build_context_engine, compose,
@@ -14,7 +9,10 @@ use agent_compose::{
 };
 use agent_contracts::{ApprovalDecision, StandingGrant};
 use agent_core::{ApprovalBroker, InteractiveApprovalGate, PolicyApprovalGate, TaskApprovalGate};
-use agent_runtime::{RuntimeCheckpoint, RuntimeHandle, RuntimeInstance};
+use agent_runtime::{
+    CheckpointStore, RuntimeCheckpoint, RuntimeHandle, RuntimeInstance, decode_checkpoint_bytes,
+    decode_checkpoint_file,
+};
 use agent_storage::FileEventJournal;
 use agent_workspace::{Workspace, WorkspaceOutputBroker};
 use anyhow::Context;
@@ -466,28 +464,27 @@ async fn run_ui(
                         continue;
                     }
                     if trimmed == "/checkpoints" {
-                        // Bounded newest-first listing of the checkpoint
-                        // store, so save/list/resume is discoverable from
-                        // the product host without filesystem spelunking.
-                        match list_checkpoint_rows(&checkpoint_dir).await {
+                        // Bounded newest-first listing straight from the
+                        // runtime checkpoint store, so save/list/resume is
+                        // discoverable from the product host without
+                        // filesystem spelunking.
+                        let store = CheckpointStore::new(checkpoint_dir.clone());
+                        match store.list(CHECKPOINT_LIST_LIMIT).await {
                             Ok(rows) if rows.is_empty() => {
                                 app.push_system(
                                     "no checkpoints saved yet; /checkpoint writes one".to_string(),
                                 );
                             }
                             Ok(rows) => {
-                                let shown = rows.len().min(CHECKPOINT_LIST_LIMIT);
-                                for (modified, size, path) in &rows[..shown] {
-                                    let age = modified
+                                for row in &rows {
+                                    let age = row
+                                        .modified
                                         .elapsed()
                                         .map(|elapsed| format!("{elapsed:?} ago"))
                                         .unwrap_or_else(|_| "unknown age".into());
-                                    app.push_system(format!("{path} ({size} bytes, {age})"));
-                                }
-                                if rows.len() > shown {
                                     app.push_system(format!(
-                                        "...and {} more (oldest first hidden)",
-                                        rows.len() - shown
+                                        "{} ({} bytes, {})",
+                                        row.artifact, row.payload_bytes, age
                                     ));
                                 }
                             }
@@ -498,11 +495,14 @@ async fn run_ui(
                         continue;
                     }
                     if trimmed == "/checkpoint" {
-                        let path =
-                            checkpoint_dir.join(format!("{}-{}.json", handle.run_id(), now_ms()));
+                        // The manual save rides the same atomic envelope
+                        // store as the automatic safe points: one format,
+                        // one retention domain, checksum verified on load.
+                        let store = CheckpointStore::new(checkpoint_dir.clone());
                         match runtime.checkpoint().await {
                             Ok(checkpoint) => {
-                                let bytes = match serde_json::to_vec_pretty(&checkpoint) {
+                                let tasks = checkpoint.tasks.tasks.len();
+                                let bytes = match serde_json::to_vec(&checkpoint) {
                                     Ok(bytes) => bytes,
                                     Err(error) => {
                                         app.push_system(format!(
@@ -511,19 +511,13 @@ async fn run_ui(
                                         continue;
                                     }
                                 };
-                                if let Err(error) = tokio::fs::create_dir_all(&checkpoint_dir).await
-                                {
-                                    app.push_system(format!("checkpoint dir failed: {error}"));
-                                    continue;
-                                }
-                                match tokio::fs::write(&path, bytes).await {
-                                    Ok(()) => {
-                                        app.last_checkpoint = Some(path.display().to_string());
+                                match store.write_atomic(&bytes).await {
+                                    Ok(stored) => {
+                                        app.last_checkpoint = Some(stored.artifact.clone());
                                         app.push_system(format!(
-                                            "checkpoint saved ({} tasks): {}",
-                                            checkpoint.tasks.tasks.len(),
-                                            path.display()
-                                        ))
+                                            "checkpoint saved ({tasks} tasks): {}",
+                                            stored.artifact
+                                        ));
                                     }
                                     Err(error) => {
                                         app.push_system(format!("checkpoint write failed: {error}"))
@@ -534,19 +528,15 @@ async fn run_ui(
                         }
                         continue;
                     }
-                    if let Some(restore_path) = trimmed.strip_prefix("/restore ") {
-                        let path = std::path::PathBuf::from(restore_path.trim());
+                    if let Some(restore_target) = trimmed.strip_prefix("/restore ") {
                         let result = async {
+                            let path =
+                                resolve_restore_target(&checkpoint_dir, restore_target.trim());
                             let bytes = tokio::fs::read(&path).await.map_err(|error| {
                                 anyhow::anyhow!("read {}: {error}", path.display())
                             })?;
-                            let checkpoint: agent_runtime::RuntimeCheckpoint =
-                                serde_json::from_slice(&bytes).map_err(|error| {
-                                    anyhow::anyhow!(
-                                        "parse {}: {error} (is this a runtime checkpoint?)",
-                                        path.display()
-                                    )
-                                })?;
+                            let checkpoint = decode_checkpoint_bytes(&bytes)
+                                .map_err(|error| anyhow::anyhow!("{}: {error}", path.display()))?;
                             runtime
                                 .restore(checkpoint)
                                 .await
@@ -554,9 +544,7 @@ async fn run_ui(
                         }
                         .await;
                         match result {
-                            Ok(()) => {
-                                app.push_system(format!("runtime restored from {}", path.display()))
-                            }
+                            Ok(()) => app.push_system("runtime restored".to_string()),
                             Err(error) => app.push_system(format!("restore failed: {error}")),
                         }
                         continue;
@@ -593,93 +581,72 @@ async fn run_ui(
     Ok(())
 }
 
-fn now_ms() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_millis() as u64)
-        .unwrap_or_default()
-}
-
-/// Read, parse and validate a runtime checkpoint file. Every failure mode
-/// is a visible configuration-style error; nothing has been started or
-/// mutated when this runs.
+/// Read, parse and validate a runtime checkpoint file in any product
+/// format (envelope artifact or legacy raw JSON). Every failure mode is a
+/// visible configuration-style error; nothing has been started or mutated
+/// when this runs.
 fn load_runtime_checkpoint(path: &std::path::Path) -> anyhow::Result<RuntimeCheckpoint> {
-    let bytes =
-        std::fs::read(path).with_context(|| format!("read checkpoint {}", path.display()))?;
-    let checkpoint: RuntimeCheckpoint = serde_json::from_slice(&bytes)
-        .with_context(|| format!("parse {}: is this a runtime checkpoint?", path.display()))?;
-    checkpoint.validate().map_err(|error| {
+    decode_checkpoint_file(path).map_err(|error| {
         anyhow::Error::new(error).context(format!(
             "invalid checkpoint {}: the runtime refuses it before any mutation",
             path.display()
         ))
-    })?;
-    Ok(checkpoint)
+    })
 }
 
 /// Bounded number of checkpoint rows the `/checkpoints` listing renders.
 const CHECKPOINT_LIST_LIMIT: usize = 20;
 
-/// Newest-first `(modified, bytes, path)` rows for the checkpoint store.
-/// Non-`json` entries are skipped; unreadable metadata is skipped rather
-/// than failing the whole listing.
-async fn list_checkpoint_rows(
-    dir: &std::path::Path,
-) -> anyhow::Result<Vec<(std::time::SystemTime, u64, String)>> {
-    let mut rows = Vec::new();
-    let mut entries = tokio::fs::read_dir(dir).await?;
-    while let Some(entry) = entries.next_entry().await? {
-        let path = entry.path();
-        if path.extension().and_then(|extension| extension.to_str()) != Some("json") {
-            continue;
-        }
-        let Ok(metadata) = entry.metadata().await else {
-            continue;
-        };
-        let modified = metadata
-            .modified()
-            .unwrap_or(std::time::SystemTime::UNIX_EPOCH);
-        rows.push((modified, metadata.len(), path.display().to_string()));
+/// A bare store artifact name (`checkpoint-*.json`, no path separators)
+/// resolves inside the checkpoint directory; anything else is an explicit
+/// filesystem path the user typed.
+fn resolve_restore_target(checkpoint_dir: &std::path::Path, target: &str) -> std::path::PathBuf {
+    let is_plain_artifact_name = !target.contains('/')
+        && !target.contains('\\')
+        && target.starts_with("checkpoint-")
+        && target.ends_with(".json");
+    if is_plain_artifact_name {
+        checkpoint_dir.join(target)
+    } else {
+        std::path::PathBuf::from(target)
     }
-    rows.sort_by_key(|row| std::cmp::Reverse(row.0));
-    Ok(rows)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    #[tokio::test]
-    async fn checkpoint_listing_is_newest_first_and_skips_non_json() {
-        let dir = tempfile::tempdir().unwrap();
-        std::fs::write(dir.path().join("a.json"), b"{}").unwrap();
-        std::fs::write(dir.path().join("b.json"), b"{}").unwrap();
-        std::fs::write(dir.path().join("notes.txt"), b"ignore").unwrap();
-        // Give the second file a strictly later mtime where the filesystem
-        // has enough resolution; on coarse-clock filesystems the order tie
-        // is acceptable, so this test only asserts membership and count.
-        let rows = list_checkpoint_rows(dir.path()).await.unwrap();
-        assert_eq!(rows.len(), 2, "only json checkpoints are listed");
-        assert!(rows.iter().all(|(_, _, path)| path.ends_with(".json")));
-    }
-
-    #[tokio::test]
-    async fn checkpoint_listing_of_a_missing_dir_is_an_error_not_a_panic() {
-        let dir = tempfile::tempdir().unwrap();
-        let missing = dir.path().join("nope");
-        assert!(list_checkpoint_rows(&missing).await.is_err());
+    #[test]
+    fn plain_artifact_names_resolve_inside_the_checkpoint_dir() {
+        let dir = std::path::Path::new("C:\\state\\checkpoints");
+        assert_eq!(
+            resolve_restore_target(dir, "checkpoint-123-abc.json"),
+            dir.join("checkpoint-123-abc.json")
+        );
+        // Paths — including relative ones — stay as typed.
+        assert_eq!(
+            resolve_restore_target(dir, "exports/cp.json"),
+            std::path::PathBuf::from("exports/cp.json")
+        );
+        assert_eq!(
+            resolve_restore_target(dir, "cp.json"),
+            std::path::PathBuf::from("cp.json")
+        );
     }
 
     #[test]
     fn load_runtime_checkpoint_reports_readable_failures() {
         let dir = tempfile::tempdir().unwrap();
         let missing = dir.path().join("missing.json");
-        let error = load_runtime_checkpoint(&missing).unwrap_err().to_string();
-        assert!(error.contains("read checkpoint"), "{error}");
+        let error = load_runtime_checkpoint(&missing).unwrap_err();
+        assert!(format!("{error:#}").contains("unreadable"), "{error:#}");
 
         let garbage = dir.path().join("garbage.json");
         std::fs::write(&garbage, b"not json").unwrap();
-        let error = load_runtime_checkpoint(&garbage).unwrap_err().to_string();
-        assert!(error.contains("is this a runtime checkpoint?"), "{error}");
+        let error = load_runtime_checkpoint(&garbage).unwrap_err();
+        assert!(
+            format!("{error:#}").contains("not a runtime checkpoint"),
+            "{error:#}"
+        );
     }
 }

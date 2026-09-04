@@ -102,6 +102,44 @@ pub const DEFAULT_MAX_RETAINED_CHECKPOINTS: usize = 32;
 /// window: once the surviving artifacts exceed it, the oldest are pruned
 /// until they fit (the newest always survives).
 pub const DEFAULT_MAX_RETAINED_CHECKPOINT_BYTES: u64 = 64 * 1024 * 1024;
+/// Hard row cap for `CheckpointStore::list`; callers may ask for fewer.
+pub const MAX_CHECKPOINT_LIST_ROWS: usize = 64;
+
+/// A store artifact is exactly what the store itself wrote: the
+/// `checkpoint-` naming convention. Foreign `.json` files (manual exports,
+/// editor scratch) sharing the directory are never store state.
+fn is_store_artifact_name(name: &str) -> bool {
+    name.starts_with("checkpoint-") && name.ends_with(".json")
+}
+
+/// One parsed envelope header line. `payload_bytes` is the declared
+/// payload length; the checksum is verified only by
+/// [`CheckpointStore::load_verified`], not by listing or retention.
+#[derive(Debug, Clone)]
+struct EnvelopeHeader {
+    payload_bytes: u64,
+}
+
+/// Read and parse the envelope header of one candidate artifact file.
+/// `None` for anything that is not a store artifact (missing header,
+/// non-envelope JSON, unreadable) — callers skip those instead of failing.
+async fn read_envelope_header(path: &std::path::Path) -> Option<EnvelopeHeader> {
+    use tokio::io::AsyncReadExt as _;
+    let file = tokio::fs::File::open(path).await.ok()?;
+    let mut buf = Vec::new();
+    file.take(MAX_CHECKPOINT_HEADER_BYTES as u64)
+        .read_to_end(&mut buf)
+        .await
+        .ok()?;
+    let split = buf.iter().position(|byte| *byte == b'\n')?;
+    let header: serde_json::Value = serde_json::from_slice(&buf[..split]).ok()?;
+    if header["format"].as_str()? != CHECKPOINT_ENVELOPE_FORMAT {
+        return None;
+    }
+    Some(EnvelopeHeader {
+        payload_bytes: header["payload_bytes"].as_u64()?,
+    })
+}
 
 /// Actor-owned atomic checkpoint artifact store under the workspace state
 /// directory. A write lands as a unique temp file renamed onto its final
@@ -209,7 +247,14 @@ impl CheckpointStore {
             let Ok(metadata) = entry.metadata().await else {
                 continue;
             };
-            if !metadata.is_file() || !entry.file_name().to_string_lossy().ends_with(".json") {
+            let name = entry.file_name().to_string_lossy().into_owned();
+            if !metadata.is_file() || !is_store_artifact_name(&name) {
+                continue;
+            }
+            // Only artifacts this store actually wrote compete for the
+            // retention window; a foreign or corrupt file must neither be
+            // deleted by, nor evict a real artifact from, retention.
+            if read_envelope_header(&entry.path()).await.is_none() {
                 continue;
             }
             entries.push((
@@ -256,60 +301,153 @@ impl CheckpointStore {
                 "checkpoint artifact {artifact} unreadable: {error}"
             ))
         })?;
-        let split = stored
-            .iter()
-            .position(|byte| *byte == b'\n')
-            .ok_or_else(|| {
-                AgentError::InvalidRequest(format!("checkpoint artifact {artifact} has no header"))
-            })?;
-        if split > MAX_CHECKPOINT_HEADER_BYTES {
-            return Err(AgentError::InvalidRequest(format!(
-                "checkpoint artifact {artifact} header exceeds its byte bound"
-            )));
-        }
-        let header: serde_json::Value =
-            serde_json::from_slice(&stored[..split]).map_err(|error| {
-                AgentError::InvalidRequest(format!(
-                    "checkpoint artifact {artifact} header malformed: {error}"
-                ))
-            })?;
-        if header["format"] != CHECKPOINT_ENVELOPE_FORMAT {
-            return Err(AgentError::InvalidRequest(format!(
-                "checkpoint artifact {artifact} is not a {} envelope",
-                CHECKPOINT_ENVELOPE_FORMAT
-            )));
-        }
-        let expected_checksum = header["checksum"].as_str().ok_or_else(|| {
-            AgentError::InvalidRequest(format!(
-                "checkpoint artifact {artifact} header has no checksum"
-            ))
-        })?;
-        let payload_bytes = header["payload_bytes"].as_u64().ok_or_else(|| {
-            AgentError::InvalidRequest(format!(
-                "checkpoint artifact {artifact} header has no payload length"
-            ))
-        })? as usize;
-        if payload_bytes > MAX_CHECKPOINT_PAYLOAD_BYTES
-            || stored.len() > MAX_CHECKPOINT_ARTIFACT_BYTES
-        {
-            return Err(AgentError::InvalidRequest(format!(
-                "checkpoint artifact {artifact} exceeds its byte bounds"
-            )));
-        }
-        let payload = &stored[split + 1..];
-        if payload.len() != payload_bytes {
-            return Err(AgentError::InvalidRequest(format!(
-                "checkpoint artifact {artifact} is truncated: {} of {payload_bytes} bytes",
-                payload.len()
-            )));
-        }
-        if sha256_hex(payload) != expected_checksum {
-            return Err(AgentError::InvalidRequest(format!(
-                "checkpoint artifact {artifact} fails its checksum"
-            )));
-        }
-        Ok(payload.to_vec())
+        verify_envelope_bytes(artifact, &stored)
     }
+
+    /// Bounded newest-first listing of verified store artifacts. Foreign
+    /// files and envelope-less lookalikes are skipped rather than surfaced
+    /// or failed upon: the listing is discovery, not validation.
+    pub async fn list(&self, limit: usize) -> AgentResult<Vec<ListedCheckpoint>> {
+        let limit = limit.min(MAX_CHECKPOINT_LIST_ROWS);
+        let mut rows: Vec<ListedCheckpoint> = Vec::new();
+        let mut reader = tokio::fs::read_dir(&self.dir).await.map_err(|error| {
+            AgentError::InvalidRequest(format!("checkpoint dir unavailable: {error}"))
+        })?;
+        while let Some(entry) = reader.next_entry().await.map_err(|error| {
+            AgentError::InvalidRequest(format!("checkpoint dir read failed: {error}"))
+        })? {
+            let Ok(metadata) = entry.metadata().await else {
+                continue;
+            };
+            if !metadata.is_file() {
+                continue;
+            }
+            let name = entry.file_name().to_string_lossy().into_owned();
+            if !is_store_artifact_name(&name) {
+                continue;
+            }
+            let Some(header) = read_envelope_header(&entry.path()).await else {
+                continue;
+            };
+            rows.push(ListedCheckpoint {
+                artifact: name,
+                payload_bytes: header.payload_bytes,
+                modified: metadata
+                    .modified()
+                    .unwrap_or(std::time::SystemTime::UNIX_EPOCH),
+            });
+        }
+        rows.sort_by_key(|row| std::cmp::Reverse(row.modified));
+        rows.truncate(limit);
+        Ok(rows)
+    }
+}
+
+/// One discovered store artifact. `payload_bytes` is the envelope-declared
+/// checkpoint size (not the on-disk envelope size).
+#[derive(Debug, Clone)]
+pub struct ListedCheckpoint {
+    /// File name inside the store directory; restore accepts it back.
+    pub artifact: String,
+    pub payload_bytes: u64,
+    pub modified: std::time::SystemTime,
+}
+
+/// Verify a stored envelope artifact (header line + payload) and return
+/// the payload bytes. Shared by store loads and product-file decoding.
+fn verify_envelope_bytes(artifact: &str, stored: &[u8]) -> AgentResult<Vec<u8>> {
+    let split = stored
+        .iter()
+        .position(|byte| *byte == b'\n')
+        .ok_or_else(|| {
+            AgentError::InvalidRequest(format!("checkpoint artifact {artifact} has no header"))
+        })?;
+    if split > MAX_CHECKPOINT_HEADER_BYTES {
+        return Err(AgentError::InvalidRequest(format!(
+            "checkpoint artifact {artifact} header exceeds its byte bound"
+        )));
+    }
+    let header: serde_json::Value = serde_json::from_slice(&stored[..split]).map_err(|error| {
+        AgentError::InvalidRequest(format!(
+            "checkpoint artifact {artifact} header malformed: {error}"
+        ))
+    })?;
+    if header["format"] != CHECKPOINT_ENVELOPE_FORMAT {
+        return Err(AgentError::InvalidRequest(format!(
+            "checkpoint artifact {artifact} is not a {} envelope",
+            CHECKPOINT_ENVELOPE_FORMAT
+        )));
+    }
+    let expected_checksum = header["checksum"].as_str().ok_or_else(|| {
+        AgentError::InvalidRequest(format!(
+            "checkpoint artifact {artifact} header has no checksum"
+        ))
+    })?;
+    let payload_bytes = header["payload_bytes"].as_u64().ok_or_else(|| {
+        AgentError::InvalidRequest(format!(
+            "checkpoint artifact {artifact} header has no payload length"
+        ))
+    })? as usize;
+    if payload_bytes > MAX_CHECKPOINT_PAYLOAD_BYTES || stored.len() > MAX_CHECKPOINT_ARTIFACT_BYTES
+    {
+        return Err(AgentError::InvalidRequest(format!(
+            "checkpoint artifact {artifact} exceeds its byte bounds"
+        )));
+    }
+    let payload = &stored[split + 1..];
+    if payload.len() != payload_bytes {
+        return Err(AgentError::InvalidRequest(format!(
+            "checkpoint artifact {artifact} is truncated: {} of {payload_bytes} bytes",
+            payload.len()
+        )));
+    }
+    if sha256_hex(payload) != expected_checksum {
+        return Err(AgentError::InvalidRequest(format!(
+            "checkpoint artifact {artifact} fails its checksum"
+        )));
+    }
+    Ok(payload.to_vec())
+}
+
+/// Decode one checkpoint file in any format a product host may have
+/// written: an envelope artifact (checksum-verified, the authoritative
+/// store form) or the legacy raw pretty JSON the first TUI releases saved
+/// by hand. Anything else — truncated envelopes, foreign JSON, other
+/// formats — fails closed with a typed error before any restore can start.
+pub fn decode_checkpoint_file(path: &std::path::Path) -> AgentResult<RuntimeCheckpoint> {
+    let label = path.display().to_string();
+    let stored = std::fs::read(path).map_err(|error| {
+        AgentError::InvalidRequest(format!("checkpoint file {label} unreadable: {error}"))
+    })?;
+    decode_checkpoint_bytes(&stored).map_err(|error| {
+        AgentError::InvalidRequest(format!(
+            "checkpoint file {label} refused before any mutation: {error}"
+        ))
+    })
+}
+
+/// The in-memory core of [`decode_checkpoint_file`]: envelope first (its
+/// errors stay fatal — an envelope-looking file is never reinterpreted),
+/// then the legacy raw `RuntimeCheckpoint` JSON with full validation.
+pub fn decode_checkpoint_bytes(stored: &[u8]) -> AgentResult<RuntimeCheckpoint> {
+    if let Some(split) = stored.iter().position(|byte| *byte == b'\n')
+        && let Ok(header) = serde_json::from_slice::<serde_json::Value>(&stored[..split])
+        && header["format"].as_str() == Some(CHECKPOINT_ENVELOPE_FORMAT)
+    {
+        let payload = verify_envelope_bytes("file", stored)?;
+        let checkpoint: RuntimeCheckpoint = serde_json::from_slice(&payload).map_err(|error| {
+            AgentError::InvalidRequest(format!("checkpoint payload parse failed: {error}"))
+        })?;
+        checkpoint.validate()?;
+        return Ok(checkpoint);
+    }
+    let checkpoint: RuntimeCheckpoint = serde_json::from_slice(stored).map_err(|error| {
+        AgentError::InvalidRequest(format!(
+            "not a runtime checkpoint (tried envelope v1 and legacy raw JSON): {error}"
+        ))
+    })?;
+    checkpoint.validate()?;
+    Ok(checkpoint)
 }
 
 async fn write_and_sync(path: &std::path::Path, bytes: &[u8]) -> std::io::Result<()> {
@@ -808,6 +946,48 @@ mod store_tests {
     }
 
     #[tokio::test]
+    async fn retention_and_listing_ignore_foreign_json_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = CheckpointStore::new(dir.path());
+        // The store's oldest artifact.
+        let oldest = store.write_atomic_bounded(b"body-old", 32).await.unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        // A foreign file the first manual TUI export shape would drop in the
+        // same directory: newest mtime, no envelope.
+        std::fs::write(dir.path().join("manual-export.json"), b"{}").unwrap();
+        // A foreign file that forges the store's naming convention but has
+        // no envelope header either.
+        std::fs::write(dir.path().join("checkpoint-forged.json"), b"{}").unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        // Trigger retention with a window of two.
+        let newest = store.write_atomic_bounded(b"body-new", 2).await.unwrap();
+
+        // Foreign files are neither counted nor deleted: both survive, and
+        // the retention window fits the two real artifacts.
+        assert!(
+            dir.path().join("manual-export.json").exists(),
+            "retention must not delete foreign files"
+        );
+        assert!(
+            dir.path().join("checkpoint-forged.json").exists(),
+            "retention must not delete envelope-less lookalikes"
+        );
+        assert!(
+            dir.path().join(&oldest.artifact).exists(),
+            "retention must count only real store artifacts"
+        );
+        assert!(dir.path().join(&newest.artifact).exists());
+
+        // Listing exposes only verified store artifacts, newest first.
+        let listed = store.list(10).await.unwrap();
+        let names: Vec<&str> = listed.iter().map(|row| row.artifact.as_str()).collect();
+        assert_eq!(
+            names,
+            vec![newest.artifact.as_str(), oldest.artifact.as_str()]
+        );
+    }
+
+    #[tokio::test]
     async fn retention_prunes_the_oldest_and_keeps_the_newest() {
         let dir = tempfile::tempdir().unwrap();
         let store = CheckpointStore::new(dir.path());
@@ -1126,5 +1306,39 @@ mod tests {
             zero_with_entries.validate(),
             Err(AgentError::InvalidRequest(_))
         ));
+    }
+
+    #[tokio::test]
+    async fn decode_accepts_envelope_and_legacy_json_and_fails_closed_otherwise() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = CheckpointStore::new(dir.path());
+        let value = checkpoint(&task_manager_with_requirements());
+        let payload = serde_json::to_vec(&value).unwrap();
+        let stored = store.write_atomic(&payload).await.unwrap();
+        let artifact_path = dir.path().join(&stored.artifact);
+
+        // Envelope path: checksum verified, then validated.
+        let decoded = decode_checkpoint_file(&artifact_path);
+        assert!(decoded.is_ok(), "envelope decode failed: {decoded:?}");
+
+        // Legacy raw JSON (the first manual TUI export shape): pretty JSON
+        // of a bare RuntimeCheckpoint, no envelope.
+        let legacy_path = dir.path().join("manual-export.json");
+        std::fs::write(&legacy_path, serde_json::to_vec_pretty(&value).unwrap()).unwrap();
+        assert!(decode_checkpoint_file(&legacy_path).is_ok());
+
+        // Unknown format fails closed.
+        let foreign = dir.path().join("foreign.json");
+        std::fs::write(&foreign, br#"{"hello":"world"}"#).unwrap();
+        let error = decode_checkpoint_file(&foreign).unwrap_err();
+        assert!(error.to_string().contains("not a runtime checkpoint"));
+
+        // A truncated envelope stays fatal (never reinterpreted as legacy):
+        // the envelope header is present, so the length guard fires first.
+        let truncated_path = dir.path().join("truncated.json");
+        let full = std::fs::read(&artifact_path).unwrap();
+        std::fs::write(&truncated_path, &full[..full.len() - 8]).unwrap();
+        let error = decode_checkpoint_file(&truncated_path).unwrap_err();
+        assert!(error.to_string().contains("is truncated"));
     }
 }

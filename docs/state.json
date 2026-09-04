@@ -2,12 +2,12 @@
   "schema": "project-state.v1",
   "updated": "2026-09-05",
   "maintained_by": "hand until the CI document-consistency gate lands; README.md and docs/CURRENT.md current-status text must be verified against this file",
-  "head_commit": "d004836d4e638d2774f8c6d704b9f50e0f591173",
+  "head_commit": "33081b40debd4a022691b3a7ae70d67977d5e677",
   "code_commit": "050aa8e68f59c49d42b95e2a4d38fa37234a1e78",
   "ci": {
-    "head_commit": "in_progress",
-    "head_run_id": 33895590479,
-    "last_green_commit": "a882789486a49204569c084289f3a6c4cf697916",
+    "head_commit": "green",
+    "head_run_id": 33898496334,
+    "last_green_commit": "33081b40debd4a022691b3a7ae70d67977d5e677",
     "code_commit": "green"
   },
   "milestone_gates": {

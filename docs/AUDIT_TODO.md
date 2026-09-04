@@ -27,7 +27,8 @@ is not closed.
 | When | Items | Disposition |
 | --- | --- | --- |
 | ~~Before the Reliable Local Agent alpha~~ | ~~`COMPOSE-LIFECYCLE-01`, `EFFECT-ACK-01`~~ — both closed in the 2026-09-04 tranche (typed optional lookup; checkpointed ACK-debt lifecycle with typed resolution) | ~~Correctness/safety exits before the alpha.~~ Done: clean source `1c4b0e0`, Windows/Linux CI run `33809422347` green; `CONTEXT-IO-01` closed on `c7ed011`. |
-| Before the next formal M15 candidate | `COMPLETION-LIVENESS-01`; ~~TOOL-MANIFEST-01~~ (closed on `9e00299`) | Semantic convergence candidate, focused deterministic matrix and selected-package strict Clippy are green in the working tree. It still needs the complete workspace/CI/source/preflight route before any formal window. A valid historical FAIL is never repaired in place. |
+| ~~Before the next formal M15 candidate~~ | ~~`COMPLETION-LIVENESS-01`~~; ~~TOOL-MANIFEST-01~~ (closed on `9e00299`) | ~~Semantic convergence candidate…~~ Done: landed in the `8dee7be` tranche (`bf52490` lineage), preflight `r1-attempt9` PASS, tenth v4 window PASS 12/12, M15 closed at `d004836` (2026-09-04). |
+| Phase 2 alpha hardening | `CHECKPOINT-PRODUCT-01` — closed on source, 2026-09-05 | Manual `/checkpoint`/`/restore` and startup `--restore` now ride the runtime `CheckpointStore` envelope (atomic rename, fsync, SHA-256) instead of raw pretty JSON; the store gained a bounded verified `list`, retention counts only real `checkpoint-*.json` envelopes (foreign or envelope-less files can no longer be deleted by — or evict artifacts from — the retention window), and `decode_checkpoint_file` accepts envelope or legacy raw JSON and fails closed otherwise. Covered by store + TUI unit tests and the compose product-flow test. |
 | Only if service Context ships as V1 | `SIDECAR-ERROR-01` | Otherwise keep `--context=service` explicitly experimental and out of the supported product profile. |
 | Before long-horizon breadth, if measured | `FAILURE-SPILL-01`, `TOOL-CONTRACT-01` live acceptance | Activate spill work only if the bounded hot set overflows; use paired task evidence for tool-contract convergence. |
 | Before extension promotion or Self-Iteration | `CAP-OBS-01` residual | Retire legacy producer metadata only through the existing typed-facts migration; dynamic producers never mint trusted execution facts. |
@@ -194,7 +195,7 @@ after rebuilding the freshness-guarded context service binary. That validates
 the first slice locally; it does not replace the remaining deterministic
 matrix, a recorded clean source or dual-platform CI.
 
-### COMPLETION-LIVENESS-01 — make completion repair semantically convergent (**open; working-tree candidate + focused deterministic matrix green, full gate/CI/preflight pending**)
+### COMPLETION-LIVENESS-01 — make completion repair semantically convergent (**closed: candidate landed in the `8dee7be` tranche (`bf52490` lineage); exact-source preflight `r1-attempt9` PASS; tenth v4 formal window PASS 12/12 — M15 closed at `d004836`, 2026-09-04**)
 
 The latest valid M15 rerun shows that `completion-repair.v1` remained a
 model-coordinated compensation loop rather than a Runtime-owned liveness
@@ -223,7 +224,10 @@ reset and restore preservation, cold exact-recipe routing and stale-declaration
 rejection, plus a terminal text-only turn with no `TaskCompleted`. Basic tests
 do not close the item: the complete local gate, applicable P1 disposition,
 dual-platform CI, clean-source preflight and a freshly predeclared formal window
-remain separate exits. M15 stays open.
+are separate exits. Each closed in order — dual-platform CI green on
+`050aa8e`/`a882789`, preflight `r1-attempt9` PASS, and the tenth v4 formal
+window PASS 12/12 with 0 NOT_RUN (`_windows/1788539149184`) — and M15
+closed at `d004836` (2026-09-04).
 
 Scope and larger follow-up: the guarantee starts when a completion-gate
 refusal opens the repair episode. Arbitrary search/read/process repetition

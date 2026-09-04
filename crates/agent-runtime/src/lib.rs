@@ -38,8 +38,9 @@ pub use capability::{
     CapabilityAwareDispatcher, CapabilityCatalogEntry, CapabilityRegistry, CapabilityRunState,
 };
 pub use checkpoint::{
-    CapabilitySnapshot, CheckpointStore, RUNTIME_CHECKPOINT_VERSION, RunMetadata,
-    RuntimeCheckpoint, TaskManagerSnapshot, TaskRecordSnapshot,
+    CapabilitySnapshot, CheckpointStore, ListedCheckpoint, RUNTIME_CHECKPOINT_VERSION, RunMetadata,
+    RuntimeCheckpoint, TaskManagerSnapshot, TaskRecordSnapshot, decode_checkpoint_bytes,
+    decode_checkpoint_file,
 };
 pub use command::RuntimeHandle;
 pub use host::{
