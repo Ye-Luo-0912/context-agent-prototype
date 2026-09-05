@@ -15,7 +15,13 @@
     "next_ordered": [
       "LT-EVAL-06 evaluation breadth",
       "packaged V1 release gate"
-    ]
+    ],
+    "lt_eval_06": {
+      "status": "evidence banked 2026-09-05",
+      "first_breadth_run": "12/12 PASS, 0 NOT_RUN (ltev_diagfix 4/4, ltev_migrate 4/4, harness_maint_dev 4/4; exact-tuple restore-and-continue on resume arms)",
+      "evidence": "crates/agent-eval/evidence/lt-eval-06/",
+      "contract_outcome": "TaskAnchor + ExecutionState substrate validated across three task families; no TaskGraph opened"
+    }
   },
   "m15": {
     "status": "closed",
@@ -67,5 +73,9 @@
     "settlement-projection",
     "recovery-surface"
   ],
-  "branch_protection": false
+  "branch_protection": false,
+  "next_ordered": [
+    "packaged V1 release gate (package workflow 33983799960 dispatched)",
+    "V1 freeze: version/tag/release notes"
+  ]
 }
