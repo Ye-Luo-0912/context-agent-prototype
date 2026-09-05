@@ -131,10 +131,22 @@
     ],
     "F1_status": "code + targeted tests landed 2026-09-06 (/continue, busy-input queue visibility, notice-channel command errors, release consumption stamp, PromptRequired dedup); manual walkthrough pending",
     "F2_status": "code + targeted tests landed 2026-09-06 (/work composes set_focus + empty-requirement task.manage PreferSurface + one user-message; /plan reads the new read-only TaskPlanView command; checkpoint roundtrip preserves checklist and TaskId); manual walkthrough pending",
-    "F3_status": "code + targeted tests landed 2026-09-06 (--max-rounds=<N> strict model-round budget into ComposeConfig, typed RoundBudget stop hint naming /continue + /plan + /checkpoint, --defer-proof opt-in with inline default preserved until a real slow-verification walkthrough); manual walkthrough pending",
-    "F4_status": "code + targeted tests landed 2026-09-06 (/review bounded event-derived result card: tool-stamped changed files, real check outcomes, unresolved failures, durable completion; persisted to artifacts/result-card-latest.json at task completion; user's pre-existing modifications not attributed); two-workspace walkthrough pending",
-    "F5_status": "code + targeted tests landed 2026-09-06 (conservative provable file-body supersession: stale revision boundary or proven same-revision containment, disjoint windows coexist; errors verified only by verify.run success; search.grep PARTIAL coverage statement + scan_incomplete metadata); cross-file task walkthrough pending",
+    "F3_status": "code + targeted tests landed 2026-09-06 (--max-rounds=<N> strict model-round budget into ComposeConfig, typed RoundBudget stop hint naming /continue + /plan + /checkpoint, --defer-proof opt-in with inline default preserved until a real slow-verification walkthrough); manual walkthrough pending; continued-review additions open: 6a output-EOF wait bypass, 6b verifier cancellation bridge",
+    "F4_status": "code + targeted tests landed 2026-09-06 (/review bounded event-derived result card: tool-stamped changed files, real check outcomes, unresolved failures, durable completion; persisted to artifacts/result-card-latest.json at task completion; user's pre-existing modifications not attributed); two-workspace walkthrough pending; continued-review additions open: resync_projection (oldest-16/run filter/watermark/bounded read), run_summary required-misses undercount, shadow-frame accounting fix",
+    "F5_status": "code + targeted tests landed 2026-09-06 (conservative provable file-body supersession: stale revision boundary or proven same-revision containment, disjoint windows coexist; errors verified only by verify.run success; search.grep PARTIAL coverage statement + scan_incomplete metadata); cross-file task walkthrough pending; fs.list coverage annotation still open (earlier status overclaimed it)",
     "F6_status": "NOT_RUN 2026-09-06: live walkthroughs need an operator-interactive TUI session with a real provider; deterministic F1-F5 results are banked and the walkthrough checklist is in CURRENT.md",
-    "headless_acceptance": "agent-compose/tests/route_flow.rs: real composition + scripted model covers /work composition, task.manage plan, round-budget stop with durable safe point, /continue incl. cross-checkpoint restore; landed 2026-09-06 with two wiring fixes (compose now wires the artifact store into runtime checkpoint services; the round-budget refusal drains the in-flight write and lands its own safe point)"
+    "headless_acceptance": "agent-compose/tests/route_flow.rs: real composition + scripted model covers /work composition, task.manage plan, round-budget stop with durable safe point, /continue incl. cross-checkpoint restore; landed 2026-09-06 with two wiring fixes (compose now wires the artifact store into runtime checkpoint services; the round-budget refusal drains the in-flight write and lands its own safe point)",
+    "continued_review_2026_09_06": {
+      "baseline": "12c86283b8d5991e9f17a07f14871dcf39d65066",
+      "report": "docs/reviews/2026-09-06-continued-audit/REVIEW.md",
+      "new_findings_verified_on_branch": [
+        "F3-6a: process.rs/shell.rs output-EOF arm waits child.wait() outside the timeout/cancel select (a process that closes stdout/stderr but keeps running bypasses the bounds)",
+        "F3-6b: HostProofVerifier mints an independent cancellation token instead of bridging the actor cancellation signal",
+        "F4 batch: AppState::resync_projection takes the 16 OLDEST files (ascending mtime + truncate), no current-run filter, no replay watermark, unbounded read before the 32 MiB check; agent-replay run_summary reads a nonexistent required_misses.total field and undercounts required-context misses offline",
+        "observation: shadow frame counts zone-cap omissions into duplicates_removed (frame.rs) — research-track accounting fix, not a prompt flip"
+      ],
+      "old_findings_already_fixed": "consumption stamping + PromptRequired dedup fixed in c6fbbab",
+      "correction": "F5 PARTIAL coverage annotation covers search.grep only; fs.list is still open"
+    }
   }
 }

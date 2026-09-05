@@ -70,6 +70,28 @@ F6 记 NOT_RUN（2026-09-06）：三类真实任务（修 bug、加小功能、�
 安全点，写入在飞时留下的债务永远无人捕获，/continue 被 fence。两处均已
 修复并由该测试判别覆盖。
 
+2026-09-06 续审合并（同一源码基线 `12c8628` 的第二轮审查，报告与证据在
+[`reviews/2026-09-06-continued-audit/`](reviews/2026-09-06-continued-audit/REVIEW.md)）。
+四项新发现已在本分支逐条核实仍存在，归入既有工单，不新增前置阶段：
+
+1. **F3-6a**：`tool-runtime` 的 process.rs/shell.rs 在输出 EOF 且进程未退出时
+   于分支内直接 `child.wait().await`，绕过原 timeout/cancel 选择——子进程
+   关闭输出后仍运行即触发（OS 探针已验证触发前提）。
+2. **F3-6b**：`HostProofVerifier` 给 runner 新建独立取消 token，未接 Actor
+   取消信号；需要“取消 → 现有进程清理 → 回收 → 可见确认 → 迟到结果拒绝”。
+3. **F4 同批**：`AppState::resync_projection` 按 mtime 升序取 16 实为最旧文件、
+   不按当前 run 过滤、无重放水位、整文件读入后才检查 32 MiB；
+   `agent-replay` 的 run_summary 读取不存在的 `required_misses.total` 字段，
+   必需上下文缺失在离线汇总漏计（Runtime 完成门禁不受影响）。
+4. **观测口径（研究轨，随 F4）**：shadow frame 把 zone 上限截断与重复省略
+   混计入 `duplicates_removed`，且非完整请求镜像；只修观测，不翻正式 prompt。
+
+续审复核的两处旧问题（消费盖章在 `debug_assert!` 内、PromptRequired 判重）
+在 `c6fbbab` 已修复。另更正一处过报：F5 的 PARTIAL 覆盖标注目前只覆盖
+search.grep，fs.list 未做。研究轨候选（片段身份/曝光账目、短工作焦点、
+装配边际收益、遮罩基线、SIEVE/TinyLFU 定位、词法特征贯通最终排序）已并入
+NEXT_TASKS，均不阻塞 F1–F4。
+
 ## 不在本轮
 
 新 GC/排序算法、Frame-3 正式输入翻转、向量检索、通用 Planner、Chronicle 数据库、TaskGraph、并行 worker、插件平台和自动自修改。
