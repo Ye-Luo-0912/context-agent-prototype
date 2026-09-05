@@ -281,7 +281,10 @@ fn big_log(prefix: &str, lines: usize) -> String {
 
 fn test_log(failing: bool, lines: usize) -> ToolOutput {
     let body = big_log(if failing { "FAIL " } else { "PASS " }, lines);
-    tool("shell.exec", !failing, &body)
+    // The green round runs through the trusted verification recipe: under
+    // the error-verification contract only a verify.run success proves an
+    // error fixed.
+    tool("verify.run", !failing, &body)
 }
 
 // ---------------------------------------------------------------------------
