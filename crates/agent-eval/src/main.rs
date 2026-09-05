@@ -439,7 +439,8 @@ fn action_arity(action: &str) -> Option<PositionalArity> {
         | "--recovery-surface-gate"
         | "--conv-gate"
         | "--long-task-live"
-        | "--diag-smoke" => Some(PositionalArity::Optional),
+        | "--diag-smoke"
+        | "--lt-eval-06" => Some(PositionalArity::Optional),
         "--fixture" | "--fixture-live" | "--show-evidence" | "--pilot-calibrate"
         | "--analyze-evidence" | "--compare-live" | "--compare-arm" | "--metrics"
         | "--m15-report" => Some(PositionalArity::Required),
