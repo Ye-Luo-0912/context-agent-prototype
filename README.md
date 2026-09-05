@@ -186,6 +186,10 @@ review/revert substrate for anything the agent changes.
 - `/plan` shows the active task's checklist, next action and open loops as
   the model maintains them through `task.manage` (`[x]` is reported
   progress, not verification PASS).
+- `/review` shows the latest result card: files this session's tools
+  changed, checks that actually ran (with outcomes and artifact refs),
+  unresolved failures, and whether the task durably completed. Pre-existing
+  workspace modifications are not attributed.
 - `/continue` re-runs the active task's stored directive in a fresh turn
   without minting a new instruction.
 - `/focus <text>` explicitly changes the current focus.

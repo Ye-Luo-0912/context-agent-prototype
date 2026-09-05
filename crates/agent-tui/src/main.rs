@@ -287,6 +287,7 @@ async fn run_ui(
             "deferred proof refresh: enabled (--defer-proof); default stays inline".into(),
         );
     }
+    app.state_dir = checkpoint_dir.parent().map(std::path::Path::to_path_buf);
 
     // Requests that arrived before this loop started (e.g. during startup).
     if let Some(handle) = &interactive {
@@ -532,6 +533,47 @@ async fn run_ui(
                                 }
                             }
                         });
+                        continue;
+                    }
+                    if trimmed == "/review" {
+                        // Render the latest result card: freshest is the
+                        // in-session event-derived card; otherwise fall back
+                        // to the persisted artifact from a previous task.
+                        // Display only — no model call, no write.
+                        if !app.result_card.is_empty() {
+                            for line in state::format_result_lines(&app.result_card) {
+                                app.push_system(line);
+                            }
+                        } else {
+                            let notice_tx = notice_tx.clone();
+                            let state_dir = app.state_dir.clone();
+                            tokio::spawn(async move {
+                                let Some(state_dir) = state_dir else {
+                                    let _ = notice_tx.try_send("no result material yet".into());
+                                    return;
+                                };
+                                let path =
+                                    state_dir.join("artifacts").join("result-card-latest.json");
+                                match tokio::fs::read(&path).await {
+                                    Ok(bytes) => {
+                                        match serde_json::from_slice::<state::ResultCard>(&bytes) {
+                                            Ok(card) if !card.is_empty() => {
+                                                for line in state::format_result_lines(&card) {
+                                                    let _ = notice_tx.try_send(line);
+                                                }
+                                            }
+                                            _ => {
+                                                let _ = notice_tx
+                                                    .try_send("no result material yet".into());
+                                            }
+                                        }
+                                    }
+                                    Err(_) => {
+                                        let _ = notice_tx.try_send("no result material yet".into());
+                                    }
+                                }
+                            });
+                        }
                         continue;
                     }
                     if trimmed == "/grants" {
@@ -823,10 +865,11 @@ fn load_runtime_checkpoint(path: &std::path::Path) -> anyhow::Result<RuntimeChec
 
 /// The product command list `/help` renders. Kept in one place so the
 /// welcome hint and the help output cannot drift apart.
-const HELP_LINES: [&str; 18] = [
+const HELP_LINES: [&str; 19] = [
     "/focus <directive> - point the runtime at a task directive",
     "/work <goal> - start (or resume) a long task with task.manage available",
     "/plan - show the active task's checklist, next action and open loops",
+    "/review - show what changed, what was checked, what remains",
     "/pin <note> - pin a durable note into the working set",
     "/done <summary> - close the current task with a summary",
     "/context - inspect the selected working context",

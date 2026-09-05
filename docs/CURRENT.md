@@ -42,6 +42,12 @@ ComposeConfig；预算耗尽（类型化 `Failure{RoundBudget}`）时 TUI 显示
 真实慢验证走查确认取消与清理后才改产品默认。deferred 取消/清理由既有
 turn 套件（113）覆盖。下一步进入 F4（修改审阅与结果交付）。
 
+F4 代码同日落地：`/review` 渲染事件派生的有界结果卡（变更文件取自工具
+盖章的结构化路径、检查取自 verify.run/shell.exec/process.run 的真实结果、
+失败与持久完成状态），任务完成时写入 artifacts/result-card-latest.json
+供重启后查看；结果卡明确不归属用户原有修改，UI 不调用工具制造权威。
+下一步进入 F5（多文件上下文与搜索实用化）。
+
 ## 不在本轮
 
 新 GC/排序算法、Frame-3 正式输入翻转、向量检索、通用 Planner、Chronicle 数据库、TaskGraph、并行 worker、插件平台和自动自修改。

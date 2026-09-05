@@ -222,6 +222,7 @@ dependencies = [
  "async-trait",
  "crossterm",
  "ratatui",
+ "serde",
  "serde_json",
  "tempfile",
  "tokio",
