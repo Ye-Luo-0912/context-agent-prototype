@@ -46,7 +46,7 @@
       "report": "crates/agent-eval/evidence/m15-window/_windows/1788533384841/REPORT.md"
     }
   },
-  "product_stage": "pre-alpha",
+  "product_stage": "alpha",
   "product_phase": "phase-2-reliable-local-agent-alpha",
   "phase_2_started": "2026-09-04",
   "phase_2_slices_landed": [
@@ -77,5 +77,11 @@
   "next_ordered": [
     "packaged V1 release gate (package workflow 33983799960 dispatched)",
     "V1 freeze: version/tag/release notes"
-  ]
+  ],
+  "release": {
+    "version": "0.1.0",
+    "tag": "v0.1.0",
+    "notes": "first packaged release: M15 + LT-EVAL-06 gates closed, alpha hardening tranche (checkpoints unified, crash matrix, strict config + sampling identity, status projection, doctor, diagnostics export), Context Frame shadow measurement",
+    "artifacts": "package workflow run on the tag (dist-ubuntu-latest / dist-windows-latest + SHA256SUMS)"
+  }
 }

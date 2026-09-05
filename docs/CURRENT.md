@@ -32,7 +32,7 @@ Formal verdicts live only in the immutable
 
 ## Product stage
 
-- **Pre-alpha.** Phase 2 (Reliable Local Agent alpha) started 2026-09-04.
+- **Alpha (`v0.1.0` tagged 2026-09-05).** Phase 2 (Reliable Local Agent alpha) started 2026-09-04.
   Landed 2026-09-05, in order: unified manual/automatic checkpoints
   (`CHECKPOINT-PRODUCT-01`, `e8e5fff`); real child-process kill points +
   crash/resume acceptance (`CRASH-RESUME-01` partial, `5f94dc7`; effect-
