@@ -55,7 +55,8 @@
     "PROOF-OPERATION-01 (mostly closed): host verifier runs outside the actor loop behind an opt-in defer_proof_refresh switch, with fenced resume; frozen inline semantics default; cross-turn acceptance (turn-holding) remains (6d851ab)",
     "PROOF-OPERATION-01 closed: turn-holding makes the deferred accepted commit deterministic; verifier runs outside the actor loop behind the opt-in defer_proof_refresh flag",
     "CONTEXT-FRAME-SHADOW-01 (Frame-0): shadow ContextFrameCompiler emits a zoned, classified FrameManifest per model round behind the opt-in shadow_context_frame flag; model input unchanged",
-    "Frame-1: agent-replay --frame-report folds shadow manifests vs prompt-layer costs from flag-enabled traces (offline comparison)"
+    "Frame-1: agent-replay --frame-report folds shadow manifests vs prompt-layer costs from flag-enabled traces (offline comparison)",
+    "Frame-2: scripted gate over compiled and recorded manifests (unit matrix + agent-replay --frame-gate for CI captures)"
   ],
   "default_context": "dynamic-in-process",
   "experimental": [

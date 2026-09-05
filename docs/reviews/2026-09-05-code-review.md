@@ -307,7 +307,10 @@ Any split should follow transaction boundaries, not line counts.
    `ContextFrameShadow` manifests against `ModelStarted` prompt-layer
    costs from flag-enabled captures and prints the per-round
    context-layer vs structured-frame table with dedup/miss totals and
-   zone breakdown. Frame-2 (scripted gate) remains.
+   zone breakdown. Frame-2 (scripted gate) landed too: `gate_shadow_frame`/
+`gate_manifest_invariants` enforce the full review matrix as unit tests,
+and `agent-replay --frame-gate` enforces the intrinsic rules over
+manifests recorded in traces, exiting non-zero for CI captures.
    Structured Context Frame (`ContextFrameCompiler`) was sequenced as
    shadow/audit only after the Phase 2 shell is coherent.
 

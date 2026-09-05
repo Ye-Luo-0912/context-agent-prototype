@@ -52,6 +52,10 @@ Formal verdicts live only in the immutable
   `shadow_context_frame` flag (measurement only; model input unchanged).
   Frame-1 landed: `agent-replay --frame-report` compares the structured
   frame against actual context-layer costs from flag-enabled traces.
+  Frame-2 landed: the scripted gate matrix (constraints/debts/misses
+  mandatory, dedup, boundedness, external descriptors, zone consistency,
+  engine-agnostic) as unit tests plus `agent-replay --frame-gate` over
+  recorded traces.
 - Next product queue (order per [`ROADMAP.md`](ROADMAP.md#route-to-a-usable-local-agent)
   and the 2026-09-05 code review, [`reviews/2026-09-05-code-review.md`](reviews/2026-09-05-code-review.md)):
   Linux dist validation, install notes, packaged-binary CI smoke and
