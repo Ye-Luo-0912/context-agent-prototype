@@ -4,7 +4,7 @@ Everything is environment-variable driven and checked at startup: an
 invalid value is a visible error naming the variable, never a silent
 default. The checked, key-free identity (provider profile digest) is
 printed at startup and persisted into every checkpoint. The quickstart
-lives in [`INSTALL.md`](INSTALL.md); this is the full reference.
+lives in [`INSTALL.md`](../INSTALL.md); this is the full reference.
 
 ## Model selection
 

@@ -19,6 +19,7 @@ contract.
 | [`M15_ACCEPTANCE.md`](M15_ACCEPTANCE.md) | Frozen formal-window semantics |
 | [`CURRENT.md`](CURRENT.md) + [`state.json`](state.json) | Live state snapshot and the machine-readable source of current numbers |
 | [`COMPATIBILITY.md`](COMPATIBILITY.md) | Cross-version compatibility statement (checkpoints, events, wire profile) |
+| [`EXECUTION_MODEL.md`](EXECUTION_MODEL.md) | Run/Task/Turn/Operation/Effect lifecycle summary |
 | [`RECOVERY_RUNBOOK.md`](RECOVERY_RUNBOOK.md) | Operator procedures: cold resume, debts/fences, lagged UI, diagnostics |
 | [`CONFIGURATION.md`](CONFIGURATION.md) | Full environment-variable and flag reference |
 | [`CONTEXT_FRAME_V1.md`](CONTEXT_FRAME_V1.md) | Shadow Context Frame spec (zones, invariants, gates) |
