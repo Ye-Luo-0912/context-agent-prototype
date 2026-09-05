@@ -142,7 +142,7 @@ pub async fn run_doctor_checks(
                         None => CheckReport::ok("checkpoints", detail),
                     });
                 }
-                Err(error) if checkpoints_dir_missing => reports.push(CheckReport::ok(
+                Err(_error) if checkpoints_dir_missing => reports.push(CheckReport::ok(
                     "checkpoints",
                     "none yet (the store directory is created on first save)".into(),
                 )),
