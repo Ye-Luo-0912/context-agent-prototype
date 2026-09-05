@@ -350,6 +350,54 @@ fn m15_pack_results(id: &'static str) -> impl Fn(&Path) -> Vec<(&'static str, &'
     move |root: &Path| m15_pack::hidden_check_results(root, id)
 }
 
+/// The LT-EVAL-06 breadth packs: the three development-twin fixtures
+/// (diagnosis-and-fix, multi-file API migration, harness maintenance) as
+/// live-run pack specs. This is post-M15 breadth evaluation, never an M15
+/// window pack.
+pub(crate) fn lt_eval06_packs() -> Vec<PackSpec> {
+    [
+        m15_pack::LTEV_DIAGFIX,
+        m15_pack::LTEV_MIGRATE,
+        m15_pack::RETRY_MAINT,
+    ]
+    .iter()
+    .map(|id| {
+        let id = *id;
+        PackSpec {
+            id,
+            identity_sha256: Box::new(move || m15_pack::spec_sha256(id)),
+            seed: Box::new(move |root| m15_pack::seed(root, id)),
+            directive: Box::new(move || m15_pack::fixture(id).unwrap().directive),
+            seed_files: Box::new(move || {
+                m15_pack::fixture(id)
+                    .unwrap()
+                    .files
+                    .iter()
+                    .map(|(relative, _)| *relative)
+                    .collect()
+            }),
+            hidden_violations: Box::new(m15_pack_violations(id)),
+            hidden_results: Box::new(m15_pack_results(id)),
+            oracle: Box::new(move || {
+                let fixture = m15_pack::fixture(id).unwrap();
+                (fixture.oracle_name, fixture.oracle_source)
+            }),
+            exact_recipe_inputs: Box::new(Vec::new),
+            // The diag-fix and maintenance directives mandate a root-level
+            // report (DIAGNOSIS.md / REPORT.md); the migration fixture
+            // stays on the standard allowed diff.
+            allowed_diff: Box::new(|relative| {
+                standard_allowed_diff(relative)
+                    || relative == "DIAGNOSIS.md"
+                    || relative == "REPORT.md"
+            }),
+            acceptance_declaration: None,
+            acceptance_domain: None,
+        }
+    })
+    .collect()
+}
+
 pub(crate) fn m15_diag_pack() -> PackSpec {
     let id = m15_pack::RETRY_DIAG;
     PackSpec {

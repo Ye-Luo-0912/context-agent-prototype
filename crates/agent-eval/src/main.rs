@@ -955,8 +955,62 @@ async fn main() -> anyhow::Result<()> {
                 run_conv_tail(evidence_dir).await?;
                 return Ok(());
             }
+            "--lt-eval-06" => {
+                bundle::require_clean_tree(allow_dirty)?;
+                let pack_filter = args.next().filter(|value| !value.starts_with('-'));
+                let mode_filter = args.next().filter(|value| !value.starts_with('-'));
+                let modes = long_live::PilotMode::parse(mode_filter.as_deref())?;
+                let repeats = if repeats_set { repeats } else { 2 };
+                anyhow::ensure!((1..=4).contains(&repeats), "repeats must be 1..=4");
+                let model = driver::build_live_coding_model()?;
+                let evidence_root = evidence_dir.clone().unwrap_or_else(|| {
+                    std::path::PathBuf::from("crates/agent-eval/evidence/lt-eval-06")
+                });
+                std::fs::create_dir_all(&evidence_root)?;
+                eprintln!("evidence dir: {}", evidence_root.display());
+                let packs: Vec<_> = long_live::lt_eval06_packs()
+                    .into_iter()
+                    .filter(|pack| pack_filter.is_none() || Some(pack.id) == pack_filter.as_deref())
+                    .collect();
+                if packs.is_empty() {
+                    anyhow::bail!("no LT-EVAL-06 pack matches {pack_filter:?}");
+                }
+                for pack in &packs {
+                    for repeat in 1..=repeats {
+                        for mode in &modes {
+                            let mode = *mode;
+                            eprintln!(
+                                "== lt06 {} {} repeat {repeat}/{repeats} ==",
+                                pack.id,
+                                mode.id(),
+                            );
+                            let dir = tempfile::tempdir()?;
+                            let pair = bundle::PairSink::claim(
+                                evidence_root.clone(),
+                                format!("lt06-{}-{}", pack.id, mode.id()),
+                                repeat,
+                                repeats,
+                                true,
+                            );
+                            let outcome = long_live::run_pack_cell(
+                                pack,
+                                mode,
+                                &pair,
+                                model.clone(),
+                                dir.path(),
+                                long_live::CellSwitches::default(),
+                                long_live::AcceptanceProfile::M15V1,
+                            )
+                            .await?;
+                            println!("{}", outcome.render_line());
+                        }
+                    }
+                }
+                continue;
+            }
             "--doctor" => {
                 let output_root = evidence_dir
+                    .clone()
                     .unwrap_or_else(|| std::path::PathBuf::from("target").join("doctor"));
                 let steps = doctor::run_doctor(&output_root).await?;
                 if steps
