@@ -80,11 +80,13 @@ this file, drift fixes in `README.md` / `STATUS.md` /
 `LONG_TASK_EVALUATION.md`, and `CONTEXT_RUNTIME_TODO.md` moved to
 [`archive/`](archive/) (historical design queue, never live contract).
 
-Still pending (target structure agreed 2026-09-05): CI document-consistency
-gate (README/STATUS vs `state.json`, window counts vs `_windows/` manifests,
-doc links, tool inventory vs generated manifest, Cargo `rust-version` vs CI
-toolchain); split `EXECUTION_MODEL.md`, `PRODUCT_ALPHA.md`,
-`RECOVERY_RUNBOOK.md`, `CONFIGURATION.md`, `COMPATIBILITY.md`,
-`CONTEXT_FRAME_V1.md` out of the oversized combined docs; move closed
-audit/history sections to `archive/`; protect `main` with the existing
-cross-platform CI as required check.
+Landed since (2026-09-05): `RECOVERY_RUNBOOK.md`, `CONFIGURATION.md`,
+`CONTEXT_FRAME_V1.md` and `COMPATIBILITY.md` now exist as focused
+documents (see the [`STATUS.md`](STATUS.md) doc table); `INSTALL.md`
+owns install/upgrade. Still pending (target structure agreed
+2026-09-05): CI document-consistency gate (README/STATUS vs
+`state.json`, window counts vs `_windows/` manifests, doc links, tool
+inventory vs generated manifest, Cargo `rust-version` vs CI toolchain);
+`EXECUTION_MODEL.md` / `PRODUCT_ALPHA.md` extraction from the oversized
+combined docs; move closed audit/history sections to `archive/`;
+protect `main` with the existing cross-platform CI as required check.
