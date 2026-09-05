@@ -76,13 +76,48 @@ async fn successful_observation_is_ephemeral_but_failure_persists_until_verified
         "a failed observation must persist until verified"
     );
 
-    // Round 2: success on the same entity verifies the fix.
+    // Round 2: a successful read of an error-related file is NOT proof the
+    // error is fixed — entity overlap alone must not verify anything.
     engine
         .ingest(ContextIngress::ToolObservation {
             facts: None,
             output: ToolOutput {
                 call_id: "2".into(),
-                tool_name: "shell.exec".into(),
+                tool_name: "fs.read".into(),
+                ok: true,
+                summary: "read".into(),
+                model_content: "tests passed in AuthService.rs".into(),
+                artifact_ref: None,
+                metadata: serde_json::Value::Null,
+            },
+            scope_id: None,
+        })
+        .await
+        .unwrap();
+    let report = engine
+        .maintain(ContextMaintenanceTrigger::AfterTool)
+        .await
+        .unwrap();
+    assert!(
+        !report
+            .transitions
+            .iter()
+            .any(|t| t.reason.contains("verified fixed")),
+        "a successful read must not verify an error, got: {:?}",
+        report
+            .transitions
+            .iter()
+            .map(|t| &t.reason)
+            .collect::<Vec<_>>()
+    );
+
+    // Round 3: only the trusted verification recipe verifies the fix.
+    engine
+        .ingest(ContextIngress::ToolObservation {
+            facts: None,
+            output: ToolOutput {
+                call_id: "3".into(),
+                tool_name: "verify.run".into(),
                 ok: true,
                 summary: "tests passed".into(),
                 model_content: "tests passed in AuthService.rs".into(),

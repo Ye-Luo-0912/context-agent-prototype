@@ -136,6 +136,14 @@ impl RuntimeActor {
             RuntimeCommand::ListTasks { reply } => {
                 let _ = reply.send(Ok(self.state.tasks.list()));
             }
+            RuntimeCommand::TaskPlanView { reply } => {
+                let view = self
+                    .state
+                    .task_id
+                    .and_then(|task_id| self.state.tasks.get(task_id))
+                    .map(|task| crate::task::task_anchor_view(&task.anchor));
+                let _ = reply.send(Ok(view));
+            }
             RuntimeCommand::ReplaceTaskToolRequirements {
                 task_id,
                 base_revision,

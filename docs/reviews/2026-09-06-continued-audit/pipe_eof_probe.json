@@ -1,0 +1,9 @@
+{
+  "fixture": "sh -c \"exec 1>&- 2>&-; sleep 30\"",
+  "stdout_eof": true,
+  "stderr_eof": true,
+  "child_still_running_at_eof": true,
+  "eof_elapsed_ms": 3.817,
+  "scope": "OS precondition reproduced only; repository Rust code NOT executed",
+  "fixture_process_group_cleaned": true
+}

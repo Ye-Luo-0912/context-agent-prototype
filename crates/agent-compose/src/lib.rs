@@ -523,6 +523,12 @@ pub async fn compose(config: ComposeConfig) -> anyhow::Result<ComposedRuntime> {
     if let Some(journal) = journal {
         host.add_module(Arc::new(EventModule::new(journal)))?;
     }
+    // Keep a handle for the runtime services: an artifact store means the
+    // runtime's automatic safe-point writes have a real envelope store.
+    // Without it the actor-side checkpoint writes fail "no checkpoint store
+    // configured", durable resume checkpoints never land, and continuation
+    // is fenced after every mutating turn.
+    let artifact_store_for_services = artifact_store.clone();
     if let Some(artifact_store) = artifact_store {
         host.add_module(Arc::new(ArtifactModule::new(artifact_store)))?;
     }
@@ -572,6 +578,9 @@ pub async fn compose(config: ComposeConfig) -> anyhow::Result<ComposedRuntime> {
     }
     services = services.with_defer_proof_refresh(defer_proof_refresh);
     services = services.with_shadow_context_frame(shadow_context_frame);
+    if let Some(artifact_store) = artifact_store_for_services {
+        services = services.with_artifact_workspace(artifact_store);
+    }
     // A recipe table always installs the read-only domain resolver so a
     // model-facing repair can name an exact recipe on cold start. The switch
     // controls only Runtime's optional automatic execution of that recipe.

@@ -35,6 +35,79 @@ const MAX_RENDERED_MESSAGES: usize = 400;
 const MAX_TOOL_SURFACE_PREVIEW_ROWS_PER_KIND: usize = 3;
 const MAX_TOOL_SURFACE_PREVIEW_NAME_CHARS: usize = 48;
 const MAX_TOOL_SURFACE_MESSAGE_CHARS: usize = 640;
+/// Bounded result-card buckets (`/review`). The card is event-derived
+/// display material; the durable change ledger stays in
+/// `.focus-agent/changes.jsonl` and the completion record in the journal.
+const MAX_CARD_FILES: usize = 32;
+const MAX_CARD_CHECKS: usize = 32;
+const MAX_CARD_FAILURES: usize = 8;
+const MAX_CARD_LINE_CHARS: usize = 160;
+
+/// One file a mutating tool wrote this session, identified by the
+/// structured `metadata.path` the tool stamped — never parsed from prose.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct CardChangedFile {
+    pub path: String,
+    pub tool: String,
+    pub ok: bool,
+}
+
+/// One trusted verification-class run this session (verify.run,
+/// shell.exec, process.run) with its real outcome.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct CardCheck {
+    pub tool: String,
+    pub ok: bool,
+    pub summary: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub artifact: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct CardCompletion {
+    pub task_id: TaskId,
+    pub anchor_revision: u64,
+    pub summary: String,
+}
+
+/// The bounded, event-derived result card `/review` renders. It lists only
+/// what this session's own tool calls prove; pre-existing workspace
+/// modifications are deliberately not attributed.
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct ResultCard {
+    pub changed_files: Vec<CardChangedFile>,
+    pub checks: Vec<CardCheck>,
+    pub completion: Option<CardCompletion>,
+    pub failures: Vec<String>,
+}
+
+impl ResultCard {
+    pub fn is_empty(&self) -> bool {
+        self.changed_files.is_empty()
+            && self.checks.is_empty()
+            && self.completion.is_none()
+            && self.failures.is_empty()
+    }
+}
+
+fn is_verification_tool(tool_name: &str) -> bool {
+    matches!(tool_name, "verify.run" | "shell.exec" | "process.run")
+}
+
+fn is_mutating_tool(tool_name: &str) -> bool {
+    matches!(
+        tool_name,
+        "fs.write" | "edit.patch" | "edit.replace" | "fs.mkdir"
+    )
+}
+
+fn bounded_card_line(text: &str) -> String {
+    let mut bounded: String = text.chars().take(MAX_CARD_LINE_CHARS).collect();
+    if text.chars().count() > MAX_CARD_LINE_CHARS {
+        bounded.push('…');
+    }
+    bounded
+}
 
 fn demand_label(demand: ToolSurfaceDemand) -> &'static str {
     match demand {
@@ -182,12 +255,26 @@ pub struct AppState {
     current_op: Option<(TurnId, OperationId, u64)>,
     /// Queued 然后 Applied 共用 input_id，避免用户气泡重复。
     last_shown_input_id: Option<RuntimeInputId>,
+    /// The input id currently sitting in the runtime's single dialogue
+    /// queue slot, so its later `Applied` record can be named as the
+    /// queued input running rather than a silent status flip.
+    queued_input_id: Option<RuntimeInputId>,
     /// Bounded event-derived status projection: the task the runtime
     /// currently anchors, and how many effect-ack debts remain unresolved.
     /// `/status` renders these; nothing here drives effects.
     pub current_task: Option<(TaskId, u64)>,
     pub unresolved_ack_debts: usize,
     pub last_checkpoint: Option<String>,
+    /// The explicit per-turn model-round budget (`--max-rounds`). `None`
+    /// means the runtime default applies; the value is only a display
+    /// fact for `/status`, never an authority.
+    pub execution_budget: Option<usize>,
+    /// Bounded event-derived review material for `/review`. The UI only
+    /// displays it; nothing here drives effects.
+    pub result_card: ResultCard,
+    /// Workspace state dir (`.focus-agent`), used to persist the latest
+    /// result card as a small JSON artifact at task completion.
+    pub state_dir: Option<std::path::PathBuf>,
 }
 
 impl AppState {
@@ -213,9 +300,13 @@ impl AppState {
             output_tokens: 0,
             current_op: None,
             last_shown_input_id: None,
+            queued_input_id: None,
             current_task: None,
             unresolved_ack_debts: 0,
             last_checkpoint: None,
+            execution_budget: None,
+            result_card: ResultCard::default(),
+            state_dir: None,
             status_projection: agent_runtime::status::StatusProjection::default(),
         }
     }
@@ -227,6 +318,9 @@ impl AppState {
         // The projection is folded from the same public event stream every
         // host consumes; the lines below are UI-local additions only.
         let mut lines = self.status_projection.lines();
+        if let Some(rounds) = self.execution_budget {
+            lines.push(format!("execution budget: {rounds} model rounds per turn"));
+        }
         match &self.last_checkpoint {
             Some(path) => lines.push(format!("last manual checkpoint: {path}")),
             None => lines.push("last manual checkpoint: none this session".into()),
@@ -235,6 +329,25 @@ impl AppState {
             lines.push(format!("pending approval: {}", approval.tool_name));
         }
         lines
+    }
+
+    /// Persist the latest result card as one small JSON artifact under the
+    /// workspace state dir, so `/review` survives a restart. Fire-and-forget
+    /// display material: a write failure is not a runtime fault.
+    fn persist_result_card(&self) {
+        let Some(state_dir) = &self.state_dir else {
+            return;
+        };
+        let Ok(bytes) = serde_json::to_vec(&self.result_card) else {
+            return;
+        };
+        let path = state_dir.join("artifacts").join("result-card-latest.json");
+        tokio::spawn(async move {
+            if let Some(parent) = path.parent() {
+                let _ = tokio::fs::create_dir_all(parent).await;
+            }
+            let _ = tokio::fs::write(&path, bytes).await;
+        });
     }
 
     /// Rebuild the status projection from the durable trace journal after
@@ -365,10 +478,28 @@ impl AppState {
                         self.push_message(UiRole::User, input.preview.clone());
                     }
                     if input.is_applied() {
+                        // The queued slot reaching the applied state is a
+                        // visible disposition change, not just a status flip.
+                        if input
+                            .input_id
+                            .is_some_and(|id| self.queued_input_id == Some(id))
+                        {
+                            self.queued_input_id = None;
+                            self.push_system("queued input applied; running now".into());
+                        }
                         self.busy = true;
                         self.status = "working".into();
                         self.scroll = 0;
                     } else {
+                        if let Some(id) = input.input_id
+                            && self.queued_input_id != Some(id)
+                        {
+                            self.queued_input_id = Some(id);
+                            self.push_system(
+                                "input queued; it runs after the current turn (/cancel stops the turn)"
+                                    .into(),
+                            );
+                        }
                         self.status = "queued".into();
                     }
                 } else if input.lifecycle == agent_contracts::InputLifecycle::Rejected {
@@ -662,6 +793,42 @@ impl AppState {
             }
             RuntimeEvent::ToolFinished { output, .. } => {
                 self.tool_status = format!("{}: {}", output.tool_name, output.summary);
+                // Result-card folding: mutating tools are identified by the
+                // structured path they stamped; verification-class tools
+                // record their real outcome. Display material only — the
+                // durable ledger stays in changes.jsonl and the journal.
+                if is_mutating_tool(&output.tool_name)
+                    && let Some(path) = output.file_path()
+                {
+                    let entry = CardChangedFile {
+                        path: bounded_card_line(path),
+                        tool: output.tool_name.clone(),
+                        ok: output.ok,
+                    };
+                    let slot = self
+                        .result_card
+                        .changed_files
+                        .iter()
+                        .position(|file| file.path == entry.path && file.tool == entry.tool);
+                    match slot {
+                        Some(index) => self.result_card.changed_files[index] = entry,
+                        None => {
+                            if self.result_card.changed_files.len() < MAX_CARD_FILES {
+                                self.result_card.changed_files.push(entry);
+                            }
+                        }
+                    }
+                }
+                if is_verification_tool(&output.tool_name)
+                    && self.result_card.checks.len() < MAX_CARD_CHECKS
+                {
+                    self.result_card.checks.push(CardCheck {
+                        tool: output.tool_name.clone(),
+                        ok: output.ok,
+                        summary: bounded_card_line(&output.summary),
+                        artifact: output.artifact_ref.clone(),
+                    });
+                }
                 self.push_message(
                     UiRole::Tool,
                     format!(
@@ -735,9 +902,15 @@ impl AppState {
                 summary,
             } => {
                 self.current_task = None;
+                self.result_card.completion = Some(CardCompletion {
+                    task_id,
+                    anchor_revision,
+                    summary: bounded_card_line(&summary),
+                });
                 self.push_system(format!(
                     "task {task_id} completed (anchor r{anchor_revision}): {summary}"
                 ));
+                self.persist_result_card();
             }
             RuntimeEvent::CompletionCommitFailed {
                 task_id,
@@ -829,6 +1002,23 @@ impl AppState {
                     "execution failed ({class:?}{}): {message}",
                     if retryable { ", retryable" } else { "" }
                 ));
+                if class == agent_contracts::RuntimeFailureClass::RoundBudget {
+                    // The runtime settled the turn as a deliberate refusal,
+                    // not a fault: name the recovery path instead of leaving
+                    // a bare "budget" dead-end. /continue starts a new
+                    // segment; cold resume needs a saved checkpoint.
+                    self.push_system(
+                        "stopped at the round budget; /continue starts a new segment, /plan shows \
+                         remaining work — run /checkpoint first if you may need to restart the \
+                         process"
+                            .into(),
+                    );
+                }
+                if !retryable && self.result_card.failures.len() < MAX_CARD_FAILURES {
+                    self.result_card
+                        .failures
+                        .push(bounded_card_line(&format!("({class:?}) {message}")));
+                }
             }
             RuntimeEvent::ModelRetrying {
                 attempt, delay_ms, ..
@@ -941,6 +1131,92 @@ impl AppState {
             }
         }
     }
+}
+
+/// Bounded display of the latest result card for `/review`. It names what
+/// changed (from the session's own tool calls), what was actually checked
+/// and with what outcome, what failed, and whether the task durably
+/// completed. Pre-existing workspace modifications are explicitly NOT
+/// attributed; nothing here triggers a model call or a write.
+pub fn format_result_lines(card: &ResultCard) -> Vec<String> {
+    if card.is_empty() {
+        return vec![
+            "no result material yet — complete a task (or run tools) and /review will show \
+             what changed, what was checked and what remains"
+                .into(),
+        ];
+    }
+    let mut lines = Vec::new();
+    match &card.completion {
+        Some(completion) => {
+            lines.push(format!(
+                "review: task {} durably completed at anchor r{}: {}",
+                completion.task_id, completion.anchor_revision, completion.summary
+            ));
+        }
+        None => {
+            lines.push(
+                "review: no durable task completion this session; below is what this \
+                 session's tools did so far"
+                    .into(),
+            );
+        }
+    }
+    if card.changed_files.is_empty() {
+        lines.push("  changed files: none recorded from this session's tool calls".into());
+    } else {
+        lines.push("  changed files (this session's tools only):".into());
+        for file in card.changed_files.iter().take(MAX_CARD_FILES) {
+            lines.push(format!(
+                "    {} {} [{}]",
+                file.tool,
+                bounded_card_line(&file.path),
+                if file.ok { "ok" } else { "FAILED" }
+            ));
+        }
+        let overflow = card.changed_files.len().saturating_sub(MAX_CARD_FILES);
+        if overflow > 0 {
+            lines.push(format!("    …and {overflow} more files"));
+        }
+    }
+    if card.checks.is_empty() {
+        lines.push(
+            "  checks: none recorded — a green transcript is not verification; run \
+             verify.run or an equivalent check"
+                .into(),
+        );
+    } else {
+        lines.push("  checks run:".into());
+        for check in card.checks.iter().take(MAX_CARD_CHECKS) {
+            let artifact = check
+                .artifact
+                .as_deref()
+                .map(|artifact| format!(" -> {artifact}"))
+                .unwrap_or_default();
+            lines.push(format!(
+                "    {} [{}] {}{artifact}",
+                check.tool,
+                if check.ok { "ok" } else { "FAILED" },
+                check.summary
+            ));
+        }
+        let overflow = card.checks.len().saturating_sub(MAX_CARD_CHECKS);
+        if overflow > 0 {
+            lines.push(format!("    …and {overflow} more checks"));
+        }
+    }
+    if !card.failures.is_empty() {
+        lines.push("  unresolved failures this session:".into());
+        for failure in card.failures.iter().take(MAX_CARD_FAILURES) {
+            lines.push(format!("    {failure}"));
+        }
+    }
+    lines.push(
+        "  not attributed: pre-existing workspace modifications; /plan shows remaining \
+         work — [x]-style progress is the model's report, not verification"
+            .into(),
+    );
+    lines
 }
 
 #[cfg(test)]
@@ -1221,6 +1497,38 @@ mod tests {
     }
 
     #[test]
+    fn round_budget_failure_names_the_continuation_path() {
+        let mut app = AppState::new(RunId::new());
+        app.apply_runtime_event(envelope(RuntimeEvent::Failure {
+            class: agent_contracts::RuntimeFailureClass::RoundBudget,
+            retryable: false,
+            message: "tool round budget exhausted after 16 rounds".into(),
+        }));
+        assert!(!app.busy);
+        let joined = app
+            .messages
+            .iter()
+            .map(|message| message.content.as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(joined.contains("RoundBudget"), "{joined}");
+        assert!(
+            joined.contains("/continue starts a new segment"),
+            "{joined}"
+        );
+        assert!(joined.contains("/plan shows remaining work"), "{joined}");
+        assert!(joined.contains("/checkpoint"), "{joined}");
+        // The budget shown in /status is the CLI-declared one, in the same
+        // unit the runtime enforces.
+        app.execution_budget = Some(48);
+        let status = app.render_status().join("\n");
+        assert!(
+            status.contains("execution budget: 48 model rounds"),
+            "{status}"
+        );
+    }
+
+    #[test]
     fn rejected_user_input_is_system_notice_not_a_turn() {
         let mut app = AppState::new(RunId::new());
         let input = agent_contracts::RuntimeInputEnvelope::from_preview("second")
@@ -1262,6 +1570,194 @@ mod tests {
         assert_eq!(user_bubbles.len(), 1);
         assert_eq!(user_bubbles[0].content, "later");
         assert!(app.busy);
+    }
+
+    fn tool_output(
+        name: &str,
+        ok: bool,
+        summary: &str,
+        path: Option<&str>,
+    ) -> agent_contracts::ToolOutput {
+        let mut metadata = serde_json::Value::Null;
+        if let Some(path) = path {
+            metadata = serde_json::json!({ "path": path });
+        }
+        agent_contracts::ToolOutput {
+            call_id: "call-1".into(),
+            tool_name: name.into(),
+            ok,
+            summary: summary.into(),
+            model_content: String::new(),
+            artifact_ref: None,
+            metadata,
+        }
+    }
+
+    #[test]
+    fn result_card_folds_mutations_checks_failures_and_completion() {
+        let mut app = AppState::new(RunId::new());
+        app.apply_runtime_event(envelope(RuntimeEvent::ToolFinished {
+            output: tool_output("fs.write", true, "wrote 12 lines", Some("src/lib.rs")),
+            facts: None,
+        }));
+        // Same tool + path updates in place instead of duplicating a row.
+        app.apply_runtime_event(envelope(RuntimeEvent::ToolFinished {
+            output: tool_output("fs.write", true, "wrote 30 lines", Some("src/lib.rs")),
+            facts: None,
+        }));
+        app.apply_runtime_event(envelope(RuntimeEvent::ToolFinished {
+            output: tool_output("edit.patch", true, "patched", Some("src/other.rs")),
+            facts: None,
+        }));
+        // Reads and failures of read-shaped tools do not enter changed files.
+        app.apply_runtime_event(envelope(RuntimeEvent::ToolFinished {
+            output: tool_output("fs.read", true, "120 lines", Some("src/lib.rs")),
+            facts: None,
+        }));
+        app.apply_runtime_event(envelope(RuntimeEvent::ToolFinished {
+            output: tool_output("verify.run", true, "15 tests pass", None),
+            facts: None,
+        }));
+        let mut failed_check = tool_output("shell.exec", false, "cargo test exit 1", None);
+        failed_check.artifact_ref = Some("artifacts/shell-9.log".into());
+        app.apply_runtime_event(envelope(RuntimeEvent::ToolFinished {
+            output: failed_check,
+            facts: None,
+        }));
+        app.apply_runtime_event(envelope(RuntimeEvent::Failure {
+            class: agent_contracts::RuntimeFailureClass::Model,
+            retryable: false,
+            message: "provider refused the completion".into(),
+        }));
+        app.apply_runtime_event(envelope(RuntimeEvent::TaskCompleted {
+            task_id: TaskId::new(),
+            anchor_revision: 4,
+            summary: "migration landed".into(),
+        }));
+
+        let card = &app.result_card;
+        assert_eq!(
+            card.changed_files.len(),
+            2,
+            "read tools never count as changes"
+        );
+        assert_eq!(card.changed_files[0].path, "src/lib.rs");
+        assert_eq!(card.checks.len(), 2);
+        assert!(card.checks[1].artifact.is_some());
+        assert_eq!(card.failures.len(), 1);
+        assert!(card.completion.is_some());
+
+        let lines = format_result_lines(card).join(
+            "
+",
+        );
+        assert!(lines.contains("durably completed at anchor r4"), "{lines}");
+        assert!(lines.contains("fs.write src/lib.rs [ok]"), "{lines}");
+        assert!(lines.contains("verify.run [ok] 15 tests pass"), "{lines}");
+        assert!(lines.contains("shell.exec [FAILED]"), "{lines}");
+        assert!(lines.contains("artifacts/shell-9.log"), "{lines}");
+        assert!(lines.contains("unresolved failures"), "{lines}");
+        assert!(lines.contains("not attributed"), "{lines}");
+        assert!(lines.contains("not verification"), "{lines}");
+    }
+
+    #[test]
+    fn result_card_buckets_stay_bounded() {
+        let mut app = AppState::new(RunId::new());
+        for index in 0..(MAX_CARD_FILES + 10) {
+            app.apply_runtime_event(envelope(RuntimeEvent::ToolFinished {
+                output: tool_output("fs.write", true, "w", Some(&format!("f/{index}.rs"))),
+                facts: None,
+            }));
+        }
+        assert_eq!(app.result_card.changed_files.len(), MAX_CARD_FILES);
+        for _ in 0..(MAX_CARD_CHECKS + 5) {
+            app.apply_runtime_event(envelope(RuntimeEvent::ToolFinished {
+                output: tool_output("verify.run", true, "ok", None),
+                facts: None,
+            }));
+        }
+        assert_eq!(app.result_card.checks.len(), MAX_CARD_CHECKS);
+    }
+
+    #[test]
+    fn empty_card_reviews_as_no_material() {
+        let app = AppState::new(RunId::new());
+        let lines = format_result_lines(&app.result_card);
+        assert_eq!(lines.len(), 1);
+        assert!(lines[0].contains("no result material yet"));
+    }
+
+    #[tokio::test]
+    async fn completed_task_persists_the_result_card_artifact() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = AppState::new(RunId::new());
+        app.state_dir = Some(dir.path().to_path_buf());
+        app.apply_runtime_event(envelope(RuntimeEvent::ToolFinished {
+            output: tool_output("fs.write", true, "wrote", Some("src/lib.rs")),
+            facts: None,
+        }));
+        app.apply_runtime_event(envelope(RuntimeEvent::TaskCompleted {
+            task_id: TaskId::new(),
+            anchor_revision: 2,
+            summary: "done".into(),
+        }));
+        let mut bytes = None;
+        for _ in 0..200 {
+            match tokio::fs::read(dir.path().join("artifacts/result-card-latest.json")).await {
+                Ok(data) => {
+                    bytes = Some(data);
+                    break;
+                }
+                Err(_) => tokio::time::sleep(std::time::Duration::from_millis(10)).await,
+            }
+        }
+        let bytes = bytes.expect("result card artifact must be written");
+        let card: ResultCard = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(card.changed_files.len(), 1);
+        assert!(card.completion.is_some());
+    }
+
+    #[test]
+    fn queued_input_transitions_render_explicit_disposition_lines() {
+        let mut app = AppState::new(RunId::new());
+        let id = RuntimeInputId::new();
+        let mut queued = agent_contracts::RuntimeInputEnvelope::from_preview("later");
+        queued.input_id = Some(id);
+        queued.lifecycle = agent_contracts::InputLifecycle::Queued;
+        app.apply_runtime_event(envelope(RuntimeEvent::UserMessageAccepted {
+            input: queued.clone(),
+        }));
+        assert_eq!(app.status, "queued");
+        assert!(
+            app.messages
+                .iter()
+                .any(|message| message.content.contains("input queued;")),
+            "queueing must be visible"
+        );
+
+        let mut applied = queued;
+        applied.lifecycle = agent_contracts::InputLifecycle::Applied;
+        app.apply_runtime_event(envelope(RuntimeEvent::UserMessageAccepted {
+            input: applied,
+        }));
+        assert!(app.busy);
+        assert_eq!(app.status, "working");
+        assert!(
+            app.messages
+                .iter()
+                .any(|message| message.content.contains("queued input applied")),
+            "the queued slot reaching the applied state must be named"
+        );
+        // Exactly one disposition line per transition: a re-Queued replay of
+        // the same id must not stack duplicate notices.
+        assert_eq!(
+            app.messages
+                .iter()
+                .filter(|message| message.content.contains("input queued;"))
+                .count(),
+            1
+        );
     }
 }
 

@@ -52,6 +52,8 @@ async fn main() -> anyhow::Result<()> {
     let mut effect_reservation_journal: Option<PathBuf> = None;
     let mut restore_arg: Option<PathBuf> = None;
     let mut doctor_mode = false;
+    let mut max_rounds: Option<usize> = None;
+    let mut defer_proof = false;
     for arg in std::env::args().skip(1) {
         if arg == "--doctor" {
             doctor_mode = true;
@@ -65,6 +67,10 @@ async fn main() -> anyhow::Result<()> {
             effect_reservation_journal = Some(PathBuf::from(value));
         } else if let Some(value) = arg.strip_prefix("--restore=") {
             restore_arg = Some(PathBuf::from(value));
+        } else if let Some(value) = arg.strip_prefix("--max-rounds=") {
+            max_rounds = Some(parse_max_rounds(value)?);
+        } else if arg == "--defer-proof" {
+            defer_proof = true;
         } else if root_arg.is_none() {
             root_arg = Some(PathBuf::from(arg));
         }
@@ -179,7 +185,7 @@ async fn main() -> anyhow::Result<()> {
     });
     let composed = compose(ComposeConfig {
         provider_profile_digest,
-        defer_proof_refresh: false,
+        defer_proof_refresh: defer_proof,
         shadow_context_frame: false,
         workspace,
         context_engine,
@@ -190,7 +196,7 @@ async fn main() -> anyhow::Result<()> {
         journal: Some(journal),
         artifact_store: Some(artifact_store),
         output_broker: Some(output_broker),
-        max_tool_rounds: None,
+        max_tool_rounds: max_rounds,
         project_task_progress: true,
         project_settlement: false,
         settlement_projection_diagnostics: false,
@@ -233,6 +239,8 @@ async fn main() -> anyhow::Result<()> {
         policy.as_str(),
         checkpoint_dir,
         serving_banner,
+        max_rounds,
+        defer_proof,
     )
     .await;
 
@@ -262,10 +270,24 @@ async fn run_ui(
     context_policy: &str,
     checkpoint_dir: PathBuf,
     serving_banner: String,
+    max_rounds: Option<usize>,
+    defer_proof: bool,
 ) -> anyhow::Result<()> {
     let mut app = AppState::new(handle.run_id());
     app.push_system(format!("context policy: {context_policy}"));
     app.push_system(serving_banner);
+    if let Some(rounds) = max_rounds {
+        app.execution_budget = Some(rounds);
+        app.push_system(format!(
+            "execution budget: {rounds} model rounds per turn (--max-rounds)"
+        ));
+    }
+    if defer_proof {
+        app.push_system(
+            "deferred proof refresh: enabled (--defer-proof); default stays inline".into(),
+        );
+    }
+    app.state_dir = checkpoint_dir.parent().map(std::path::Path::to_path_buf);
 
     // Requests that arrived before this loop started (e.g. during startup).
     if let Some(handle) = &interactive {
@@ -367,28 +389,31 @@ async fn run_ui(
                     }
                     if let Some(goal) = trimmed.strip_prefix("/focus ") {
                         let handle = handle.clone();
+                        let notice_tx = notice_tx.clone();
                         let goal = goal.trim().to_string();
                         tokio::spawn(async move {
                             if let Err(error) = handle.set_focus(goal).await {
-                                tracing::error!(%error, "set focus failed");
+                                let _ = notice_tx.try_send(format!("focus failed: {error}"));
                             }
                         });
                         continue;
                     }
                     if let Some(id_text) = trimmed.strip_prefix("/task ") {
                         // Activate an existing task by id (resume its
-                        // scopes). Task ids come from `/tasks`.
+                        // scopes). Task ids come from `/tasks`; activation
+                        // alone does not start a turn — `/continue` does.
                         match id_text.trim().parse::<agent_contracts::TaskId>() {
                             Ok(task_id) => {
                                 let handle = handle.clone();
+                                let notice_tx = notice_tx.clone();
                                 tokio::spawn(async move {
                                     if let Err(error) = handle.activate_task(task_id).await {
-                                        tracing::error!(%error, "activate task failed");
+                                        let _ = notice_tx.try_send(format!("task failed: {error}"));
                                     }
                                 });
                             }
                             Err(error) => {
-                                tracing::error!(%error, "invalid task id: {id_text}");
+                                app.push_system(format!("invalid task id: {error}"));
                             }
                         }
                         continue;
@@ -410,9 +435,145 @@ async fn run_ui(
                                         ));
                                     }
                                 }
-                                Err(error) => tracing::error!(%error, "list tasks failed"),
+                                Err(error) => {
+                                    let _ = notice_tx.try_send(format!("tasks failed: {error}"));
+                                }
                             }
                         });
+                        continue;
+                    }
+                    if let Some(goal_text) = trimmed.strip_prefix("/work ") {
+                        let goal = goal_text.trim().to_string();
+                        if goal.is_empty() {
+                            app.push_system("usage: /work <goal>".to_string());
+                            continue;
+                        }
+                        // Explicit long-task entry, composed from the
+                        // existing actor paths: set_focus creates (or
+                        // resumes) the task while idle, an empty tool
+                        // requirement set gains a PreferSurface demand for
+                        // task.manage, and the goal is delivered once
+                        // through the normal user-message path (busy →
+                        // the runtime's own queue). No second orchestrator.
+                        let handle = handle.clone();
+                        let notice_tx = notice_tx.clone();
+                        tokio::spawn(async move {
+                            if let Err(error) = handle.set_focus(goal.clone()).await {
+                                let _ = notice_tx.try_send(format!("work failed: {error}"));
+                                return;
+                            }
+                            let tasks = match handle.list_tasks().await {
+                                Ok(tasks) => tasks,
+                                Err(error) => {
+                                    let _ = notice_tx.try_send(format!("work failed: {error}"));
+                                    return;
+                                }
+                            };
+                            // Match by goal: set_focus just created or
+                            // resumed exactly this task; a blind first-Active
+                            // pick could hit an older open task.
+                            let task = tasks
+                                .iter()
+                                .find(|task| {
+                                    task.goal == goal
+                                        && matches!(task.status, agent_runtime::TaskStatus::Active)
+                                })
+                                .or_else(|| {
+                                    tasks.iter().find(|task| {
+                                        matches!(task.status, agent_runtime::TaskStatus::Active)
+                                    })
+                                });
+                            if let Some(task) = task
+                                && task.tool_requirement_count == 0
+                            {
+                                // Fill only an empty requirement set: a
+                                // blind whole-set replace would drop
+                                // someone else's entries. task.manage stays
+                                // capability.manage-loadable either way.
+                                if let Err(error) = handle
+                                    .replace_task_tool_requirements(
+                                        task.id,
+                                        task.tool_requirement_revision,
+                                        vec![agent_contracts::ToolSurfaceRequirement {
+                                            tool_name: "task.manage".into(),
+                                            demand:
+                                                agent_contracts::ToolSurfaceDemand::PreferSurface,
+                                            reason: "long-task checklist".into(),
+                                        }],
+                                    )
+                                    .await
+                                {
+                                    let _ = notice_tx.try_send(format!(
+                                        "work: task.manage not attached: {error}"
+                                    ));
+                                }
+                            }
+                            if let Err(error) = handle.user_message(goal).await {
+                                let _ = notice_tx.try_send(format!("work failed: {error}"));
+                            }
+                        });
+                        continue;
+                    }
+                    if trimmed == "/plan" {
+                        let handle = handle.clone();
+                        let notice_tx = notice_tx.clone();
+                        tokio::spawn(async move {
+                            match handle.task_plan_view().await {
+                                Ok(Some(view)) => {
+                                    for line in format_plan_lines(&view) {
+                                        let _ = notice_tx.try_send(line);
+                                    }
+                                }
+                                Ok(None) => {
+                                    let _ = notice_tx
+                                        .try_send("no active task; /work <goal> starts one".into());
+                                }
+                                Err(error) => {
+                                    let _ = notice_tx.try_send(format!("plan failed: {error}"));
+                                }
+                            }
+                        });
+                        continue;
+                    }
+                    if trimmed == "/review" {
+                        // Render the latest result card: freshest is the
+                        // in-session event-derived card; otherwise fall back
+                        // to the persisted artifact from a previous task.
+                        // Display only — no model call, no write.
+                        if !app.result_card.is_empty() {
+                            for line in state::format_result_lines(&app.result_card) {
+                                app.push_system(line);
+                            }
+                        } else {
+                            let notice_tx = notice_tx.clone();
+                            let state_dir = app.state_dir.clone();
+                            tokio::spawn(async move {
+                                let Some(state_dir) = state_dir else {
+                                    let _ = notice_tx.try_send("no result material yet".into());
+                                    return;
+                                };
+                                let path =
+                                    state_dir.join("artifacts").join("result-card-latest.json");
+                                match tokio::fs::read(&path).await {
+                                    Ok(bytes) => {
+                                        match serde_json::from_slice::<state::ResultCard>(&bytes) {
+                                            Ok(card) if !card.is_empty() => {
+                                                for line in state::format_result_lines(&card) {
+                                                    let _ = notice_tx.try_send(line);
+                                                }
+                                            }
+                                            _ => {
+                                                let _ = notice_tx
+                                                    .try_send("no result material yet".into());
+                                            }
+                                        }
+                                    }
+                                    Err(_) => {
+                                        let _ = notice_tx.try_send("no result material yet".into());
+                                    }
+                                }
+                            });
+                        }
                         continue;
                     }
                     if trimmed == "/grants" {
@@ -470,38 +631,43 @@ async fn run_ui(
                     }
                     if trimmed == "/suspend" {
                         let handle = handle.clone();
+                        let notice_tx = notice_tx.clone();
                         tokio::spawn(async move {
                             if let Err(error) = handle.suspend_task().await {
-                                tracing::error!(%error, "suspend task failed");
+                                let _ = notice_tx.try_send(format!("suspend failed: {error}"));
                             }
                         });
                         continue;
                     }
                     if let Some(content) = trimmed.strip_prefix("/pin ") {
                         let handle = handle.clone();
+                        let notice_tx = notice_tx.clone();
                         let content = content.trim().to_string();
                         tokio::spawn(async move {
                             if let Err(error) = handle.pin(content).await {
-                                tracing::error!(%error, "pin failed");
+                                let _ = notice_tx.try_send(format!("pin failed: {error}"));
                             }
                         });
                         continue;
                     }
                     if let Some(summary) = trimmed.strip_prefix("/done ") {
                         let handle = handle.clone();
+                        let notice_tx = notice_tx.clone();
                         let summary = summary.trim().to_string();
                         tokio::spawn(async move {
                             if let Err(error) = handle.complete_current_task(summary).await {
-                                tracing::error!(%error, "complete task failed");
+                                let _ = notice_tx.try_send(format!("done failed: {error}"));
                             }
                         });
                         continue;
                     }
                     if trimmed == "/context" {
                         let handle = handle.clone();
+                        let notice_tx = notice_tx.clone();
                         tokio::spawn(async move {
                             if let Err(error) = handle.emit_diagnostics().await {
-                                tracing::error!(%error, "context diagnostics failed");
+                                let _ = notice_tx
+                                    .try_send(format!("context diagnostics failed: {error}"));
                             }
                         });
                         continue;
@@ -616,7 +782,9 @@ async fn run_ui(
                         }
                         .await;
                         match result {
-                            Ok(()) => app.push_system("runtime restored".to_string()),
+                            Ok(()) => app.push_system(
+                                "runtime restored; /continue resumes the active task".to_string(),
+                            ),
                             Err(error) => app.push_system(format!("restore failed: {error}")),
                         }
                         continue;
@@ -625,6 +793,22 @@ async fn run_ui(
                         if let Err(error) = handle.cancel_turn().await {
                             app.push_system(format!("cancel failed: {error}"));
                         }
+                        continue;
+                    }
+                    if trimmed == "/continue" {
+                        // Re-run the active task's stored directive in a
+                        // fresh turn: no new instruction identity is minted
+                        // and the stored directive is not re-ingested.
+                        // Refusals (no active task, busy runtime, recovery
+                        // required) surface here; the started turn itself
+                        // is event-driven (`TaskContinuationStarted`).
+                        let handle = handle.clone();
+                        let notice_tx = notice_tx.clone();
+                        tokio::spawn(async move {
+                            if let Err(error) = handle.continue_active_task().await {
+                                let _ = notice_tx.try_send(format!("continue failed: {error}"));
+                            }
+                        });
                         continue;
                     }
 
@@ -640,16 +824,17 @@ async fn run_ui(
                         ));
                         continue;
                     }
-                    if app.busy {
-                        app.push_system(
-                            "Agent is busy; wait for the current turn to finish.".into(),
-                        );
-                        continue;
-                    }
+                    // Normal input always goes to the runtime: an idle
+                    // runtime starts a turn, a busy one queues it in the
+                    // existing single dialogue slot. The command reply plus
+                    // the `UserInput` lifecycle events own the visible
+                    // disposition (queued / applied / rejected) — the UI no
+                    // longer drops input on its own busy guess.
                     let handle = handle.clone();
+                    let notice_tx = notice_tx.clone();
                     tokio::spawn(async move {
                         if let Err(error) = handle.user_message(input).await {
-                            tracing::error!(%error, "agent turn failed");
+                            let _ = notice_tx.try_send(format!("input not accepted: {error}"));
                         }
                     });
                 }
@@ -680,13 +865,18 @@ fn load_runtime_checkpoint(path: &std::path::Path) -> anyhow::Result<RuntimeChec
 
 /// The product command list `/help` renders. Kept in one place so the
 /// welcome hint and the help output cannot drift apart.
-const HELP_LINES: [&str; 14] = [
+const HELP_LINES: [&str; 19] = [
     "/focus <directive> - point the runtime at a task directive",
+    "/work <goal> - start (or resume) a long task with task.manage available",
+    "/plan - show the active task's checklist, next action and open loops",
+    "/review - show what changed, what was checked, what remains",
     "/pin <note> - pin a durable note into the working set",
     "/done <summary> - close the current task with a summary",
     "/context - inspect the selected working context",
     "/status - run, task anchor, recovery debts, last checkpoint",
     "/tasks - list the run's tasks",
+    "/task <id> - activate one task (no turn starts)",
+    "/continue - continue the active task's stored directive",
     "/checkpoint - save a runtime checkpoint now",
     "/checkpoints - list saved checkpoints (newest first)",
     "/restore <path> - restore one checkpoint in this session",
@@ -694,8 +884,81 @@ const HELP_LINES: [&str; 14] = [
     "/revoke <grant-id> - revoke one standing grant",
     "/suspend - suspend the active task at a safe point",
     "/cancel - cancel the in-flight turn",
-    "/quit - leave the TUI",
+    "/quit - leave the TUI (Esc clears the input, Ctrl-C quits)",
 ];
+
+/// Bounded number of checklist rows `/plan` renders per view.
+const PLAN_ROW_LIMIT: usize = 12;
+/// Char cap for one rendered plan row or loop entry.
+const PLAN_LINE_CHARS: usize = 160;
+
+fn bounded_plan_line(text: &str) -> String {
+    let mut bounded: String = text.chars().take(PLAN_LINE_CHARS).collect();
+    if text.chars().count() > PLAN_LINE_CHARS {
+        bounded.push('…');
+    }
+    bounded
+}
+
+/// Bounded display of the active task's plan view. `[x]`/`[-]`/`[ ]` are a
+/// display convention the model writes through `task.manage`; rows without
+/// a prefix pass through as-is. `[x]` is the model's reported progress,
+/// never a verification PASS — task completion stays with the existing
+/// completion gate.
+fn format_plan_lines(view: &agent_contracts::TaskAnchorView) -> Vec<String> {
+    let mut lines = vec![format!(
+        "plan: {} (anchor r{})",
+        bounded_plan_line(&view.original_goal),
+        view.revision
+    )];
+    if view.plan_progress.is_empty() {
+        lines.push("  no checklist yet; the model maintains one via task.manage".into());
+    } else {
+        for row in view.plan_progress.iter().take(PLAN_ROW_LIMIT) {
+            lines.push(format!("  {}", bounded_plan_line(row)));
+        }
+        let overflow = view.plan_progress.len().saturating_sub(PLAN_ROW_LIMIT);
+        if overflow > 0 {
+            lines.push(format!("  …and {overflow} more rows"));
+        }
+        lines.push("  ([x] is reported progress, not verification PASS)".into());
+    }
+    if !view.next_action.is_empty() {
+        lines.push(format!("  next: {}", bounded_plan_line(&view.next_action)));
+    }
+    if !view.open_loops.is_empty() {
+        let shown = view.open_loops.len().min(8);
+        let loops: Vec<String> = view.open_loops[..shown]
+            .iter()
+            .map(|loop_text| bounded_plan_line(loop_text))
+            .collect();
+        let overflow = view.open_loops.len() - shown;
+        let more = if overflow > 0 {
+            format!(" …and {overflow} more")
+        } else {
+            String::new()
+        };
+        lines.push(format!("  open loops: {}{more}", loops.join("; ")));
+    }
+    lines
+}
+
+/// Strict `--max-rounds` parsing. The budget counts MODEL rounds — the
+/// same unit the runtime enforces (`Failure { RoundBudget }`) and the
+/// status banner renders — never tool calls. Zero or garbage is a
+/// startup error before any workspace mutation; there is no infinite
+/// value: a long task gets an explicitly larger finite budget.
+fn parse_max_rounds(value: &str) -> anyhow::Result<usize> {
+    let rounds: usize = value.trim().parse().map_err(|_| {
+        anyhow::anyhow!(
+            "invalid --max-rounds {value:?}: expected a positive integer (model rounds)"
+        )
+    })?;
+    if rounds == 0 {
+        anyhow::bail!("invalid --max-rounds 0: the budget must be at least 1 model round");
+    }
+    Ok(rounds)
+}
 
 /// Resume discovery: the newest saved checkpoint in the store. A missing
 /// or empty store is a configuration error with the fix in the message.
@@ -745,8 +1008,87 @@ fn resolve_restore_target(checkpoint_dir: &std::path::Path, target: &str) -> std
 }
 
 #[cfg(test)]
+mod plan_format_tests {
+    use super::*;
+
+    fn view() -> agent_contracts::TaskAnchorView {
+        agent_contracts::TaskAnchorView {
+            revision: 7,
+            original_goal: "migrate the config module".into(),
+            current_interpretation: String::new(),
+            constraints: Vec::new(),
+            acceptance_criteria: Vec::new(),
+            plan_progress: vec![
+                "[x] locate the config reader".into(),
+                "[-] add the target key".into(),
+                "[ ] run related checks".into(),
+                "unprefixed historical row".into(),
+            ],
+            open_loops: vec!["confirm old default behavior".into()],
+            next_action: "edit the parser and add a regression".into(),
+        }
+    }
+
+    #[test]
+    fn plan_lines_render_rows_next_and_loops_with_the_progress_disclaimer() {
+        let lines = format_plan_lines(&view());
+        let joined = lines.join("\n");
+        assert!(lines[0].contains("migrate the config module"), "{joined}");
+        assert!(lines[0].contains("r7"), "{joined}");
+        assert!(joined.contains("[x] locate the config reader"));
+        // Unprefixed rows pass through as-is, without a fabricated prefix.
+        assert!(joined.contains("unprefixed historical row"));
+        assert!(joined.contains("next: edit the parser"));
+        assert!(joined.contains("open loops: confirm old default behavior"));
+        // The checklist is progress reporting, not verification truth.
+        assert!(joined.contains("not verification PASS"));
+    }
+
+    #[test]
+    fn plan_lines_stay_bounded_and_name_the_empty_case() {
+        let mut big = view();
+        big.plan_progress = (0..30).map(|i| format!("row {i}")).collect();
+        big.open_loops = (0..20).map(|i| format!("loop {i}")).collect();
+        let lines = format_plan_lines(&big);
+        assert!(lines.iter().any(|line| line.contains("…and 18 more rows")));
+        assert!(lines.iter().any(|line| line.contains("…and 12 more")));
+        assert!(lines.len() < 30, "render stays bounded: {:?}", lines.len());
+
+        let mut empty = view();
+        empty.plan_progress.clear();
+        empty.next_action.clear();
+        empty.open_loops.clear();
+        let lines = format_plan_lines(&empty);
+        assert!(lines.iter().any(|line| line.contains("no checklist yet")));
+        assert!(
+            !lines
+                .iter()
+                .any(|line| line.contains("not verification PASS"))
+        );
+
+        let mut long = view();
+        long.plan_progress = vec!["x".repeat(500)];
+        let lines = format_plan_lines(&long);
+        // Two-space indent + the bounded row + its ellipsis.
+        assert!(lines[1].chars().count() <= PLAN_LINE_CHARS + 3);
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn max_rounds_parses_strictly_in_model_rounds() {
+        assert_eq!(parse_max_rounds("24").unwrap(), 24);
+        assert_eq!(parse_max_rounds(" 64 ").unwrap(), 64);
+        for bad in ["0", "-4", "abc", "", "2.5", "99999999999999999999"] {
+            let error = parse_max_rounds(bad).unwrap_err().to_string();
+            assert!(error.contains("--max-rounds"), "{bad}: {error}");
+        }
+        let zero = parse_max_rounds("0").unwrap_err().to_string();
+        assert!(zero.contains("at least 1"), "{zero}");
+    }
 
     #[test]
     fn plain_artifact_names_resolve_inside_the_checkpoint_dir() {

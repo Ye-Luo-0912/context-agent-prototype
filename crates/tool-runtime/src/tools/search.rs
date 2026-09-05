@@ -163,11 +163,13 @@ impl Tool for SearchGrepTool {
         // a directory recursively. (A file handed to the directory walker
         // used to surface as a confusing `directory invalid` failure.)
         let mut files = Vec::new();
+        let mut walk_budget_reached = false;
         match fs::metadata(&root).await {
             Ok(metadata) if metadata.is_file() => files.push(root),
             Ok(_) => {
                 let mut budget = MAX_FILES_SCANNED;
                 walk_files(&root, &mut files, &mut budget, Some(&cancel)).await?;
+                walk_budget_reached = budget == 0;
             }
             Err(_) => {
                 return Ok(ToolOutcome::Value(
@@ -192,6 +194,9 @@ impl Tool for SearchGrepTool {
         let limit = args.limit;
         let mut hits: Vec<String> = Vec::new();
         let mut scanned_files = 0usize;
+        // Files the scan could not read. A bounded coverage statement must
+        // name them: partial no-hit is not repo-wide absence.
+        let mut skipped_files = 0usize;
 
         'files: for file in files {
             if cancel.is_cancelled() {
@@ -204,13 +209,19 @@ impl Tool for SearchGrepTool {
             }
             let metadata = match fs::metadata(&file).await {
                 Ok(metadata) => metadata,
-                Err(_) => continue,
+                Err(_) => {
+                    skipped_files += 1;
+                    continue;
+                }
             };
             if metadata.len() > MAX_BYTES_PER_FILE {
+                skipped_files += 1;
                 continue;
             }
             scanned_files += 1;
             let Ok(text) = fs::read_to_string(&file).await else {
+                skipped_files += 1;
+                scanned_files -= 1;
                 continue;
             };
             let relative = display_relative(&self.workspace, &file);
@@ -278,6 +289,31 @@ impl Tool for SearchGrepTool {
             "next_start_line": has_more.then_some(model_hits.len() + 1),
             "cursor": cursor,
         });
+        // Coverage truth: the scan is incomplete when the hit limit stopped
+        // it early, the file budget truncated the candidate list, or files
+        // had to be skipped (unreadable, binary, oversized). A partial
+        // no-hit must never read as repo-wide absence.
+        let limit_reached = hits.len() >= limit;
+        let scan_incomplete = limit_reached || walk_budget_reached || skipped_files > 0;
+        let mut coverage_note = String::new();
+        if scan_incomplete {
+            let mut reasons: Vec<&str> = Vec::new();
+            if limit_reached {
+                reasons.push("hit limit reached");
+            }
+            if walk_budget_reached {
+                reasons.push("file budget reached");
+            }
+            if skipped_files > 0 {
+                reasons.push("some files unreadable/oversized and skipped");
+            }
+            coverage_note = format!(
+                " (PARTIAL scan: {}; do not treat this as the complete set of matches)",
+                reasons.join(", ")
+            );
+            metadata["skipped_files"] = json!(skipped_files);
+        }
+        metadata["scan_incomplete"] = json!(scan_incomplete);
         if hits.is_empty() {
             attach_failure_class(&mut metadata, ToolFailureClass::NoSearchMatch);
         }
@@ -288,13 +324,20 @@ impl Tool for SearchGrepTool {
                 tool_name: "search.grep".into(),
                 ok: true,
                 summary: format!(
-                    "{} hits for /{}/ across {} files",
+                    "{} hits for /{}/ across {} files{}",
                     hits.len(),
                     args.pattern,
-                    scanned_files
+                    scanned_files,
+                    coverage_note
                 ),
                 model_content: if model_hits.is_empty() {
-                    "no matches".to_string()
+                    if scan_incomplete {
+                        "no matches in the scanned files; the scan is incomplete, so this is \
+                         not a repo-wide absence"
+                            .to_string()
+                    } else {
+                        "no matches".to_string()
+                    }
                 } else {
                     format!("{}{}", model_hits.join("\n"), truncated_note)
                 },
@@ -656,5 +699,83 @@ mod tests {
             "summary must name cancellation: {}",
             output.summary
         );
+    }
+    #[tokio::test]
+    async fn grep_reports_partial_scan_when_the_hit_limit_stops_it() {
+        // A hit limit that stops the walk early is a bounded coverage fact:
+        // the result must not read as repo-wide absence or a complete set.
+        let (workspace, _dir) = temp_workspace().await;
+        let root = workspace.root().to_path_buf();
+        write(
+            &root,
+            "src/a_first.rs",
+            "needle
+needle
+",
+        )
+        .await;
+        write(
+            &root,
+            "src/z_last.rs",
+            "needle
+",
+        )
+        .await;
+
+        let tool = SearchGrepTool::new(workspace);
+        let output = tool
+            .execute(
+                RunId::new(),
+                "c",
+                json!({"pattern": "needle", "limit": 1}),
+                None,
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+        let output = value(output);
+        assert!(output.ok);
+        assert_eq!(
+            output.metadata["scan_incomplete"],
+            json!(true),
+            "{:?}",
+            output.metadata
+        );
+        assert!(
+            output.summary.contains("PARTIAL scan"),
+            "summary must name the partial scan: {}",
+            output.summary
+        );
+        assert!(output.summary.contains("hit limit reached"));
+    }
+
+    #[tokio::test]
+    async fn grep_complete_scan_without_hits_claims_absence_plainly() {
+        let (workspace, _dir) = temp_workspace().await;
+        let root = workspace.root().to_path_buf();
+        write(
+            &root,
+            "src/plain.rs",
+            "nothing special here
+",
+        )
+        .await;
+
+        let tool = SearchGrepTool::new(workspace);
+        let output = tool
+            .execute(
+                RunId::new(),
+                "c",
+                json!({"pattern": "definitely-absent-token"}),
+                None,
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+        let output = value(output);
+        assert!(output.ok);
+        assert_eq!(output.metadata["scan_incomplete"], json!(false));
+        assert!(!output.summary.contains("PARTIAL"), "{}", output.summary);
+        assert_eq!(output.model_content, "no matches");
     }
 }

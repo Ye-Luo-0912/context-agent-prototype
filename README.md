@@ -8,10 +8,13 @@ This repository intentionally does **not** include vectors, RAG, knowledge graph
 
 The concrete product target is a reliable **single-user local coding Agent**:
 one workspace, one explicit provider profile, bounded builtin tools,
-human-approved effects, verifiable completion and cold resume. The runtime
-substrate is substantial; installation, checked configuration, product-grade
-resume/status and the formal M15 reliability gate are still open. The ordered
-delivery plan is in [`docs/ROADMAP.md`](docs/ROADMAP.md#route-to-a-usable-local-agent).
+human-approved effects, verifiable completion and cold resume. The alpha
+(`v0.1.0`: packaged Windows/Linux binaries, install notes, checked
+configuration, checkpoints/status/doctor) is released, and the formal M15
+reliability gate is closed. The current stage wires existing runtime
+capability into the daily workflow; the ordered feature route is in
+[`docs/ROADMAP.md`](docs/ROADMAP.md#route-to-a-usable-local-agent) and the
+active task queue in [`docs/NEXT_TASKS.md`](docs/NEXT_TASKS.md).
 
 ## Architecture
 
@@ -124,8 +127,9 @@ cargo run -p agent-eval -- --doctor
 ```
 
 It checks the source/toolchain/test environment and may optionally probe the
-configured Provider. It is not yet an installed product `doctor`, and it never
-starts a formal M15 preflight or window.
+configured Provider. The installed product self-check is
+`agent-tui --doctor`; the source gate never starts a formal M15 preflight or
+window.
 
 ### Tool approval
 
@@ -145,6 +149,14 @@ minutes) so a turn can never hang. For fully automatic policy, start with
 ```bash
 cargo run -p agent-tui -- --read-only .
 ```
+
+Two more flags shape long tasks: `--max-rounds=<N>` raises the per-turn
+execution budget to an explicit, finite number of MODEL rounds (the same unit
+the runtime enforces and `/status` renders; the runtime default stays in
+place without the flag), and `--defer-proof` opts into deferred proof
+refresh — the host verifier runs outside the actor loop while the turn
+holds — which stays opt-in until a real slow-verification walkthrough
+confirms cancellation and cleanup.
 
 ### Builtin tool set
 
@@ -167,7 +179,19 @@ review/revert substrate for anything the agent changes.
 
 ## Useful commands in the TUI
 
-- Type a message and press Enter.
+- Type a message and press Enter. During a busy turn a message is queued
+  (one slot) and its queued/applied/rejected disposition is shown.
+- `/work <goal>` explicitly starts (or resumes) a long task and makes
+  `task.manage` available on its tool surface.
+- `/plan` shows the active task's checklist, next action and open loops as
+  the model maintains them through `task.manage` (`[x]` is reported
+  progress, not verification PASS).
+- `/review` shows the latest result card: files this session's tools
+  changed, checks that actually ran (with outcomes and artifact refs),
+  unresolved failures, and whether the task durably completed. Pre-existing
+  workspace modifications are not attributed.
+- `/continue` re-runs the active task's stored directive in a fresh turn
+  without minting a new instruction.
 - `/focus <text>` explicitly changes the current focus.
 - `/tasks` lists known tasks; `/task <id>` activates one.
 - `/suspend` suspends the active task.
@@ -235,23 +259,15 @@ ACI, and extension ecosystem design queue), and `docs/ROADMAP.md`.
 
 ## Current status
 
-The dynamic-context and round-surface baselines are substantial, but this is
-still a source-built research prototype. Runtime transactions, external
-recall, model-consumption acknowledgement, store-backed GC, cross-plane
-checkpoints, TaskAnchor/completion semantics, process effect brokering, typed
-settlements and bounded process authority are implemented. The main gaps are
-now the product entry/configuration, verified workspace resume, visible
-recovery/status UX, a few correctness residuals and real coding
-non-inferiority.
-
-Formal M15 is closed (2026-09-04, commit `d004836`): the tenth predeclared
-12-cell v4 window returned the mechanical verdict **PASS 12/12 with 0
-NOT_RUN** (`_windows/1788539149184`; diag 4/4, migrate 4/4 and policy 4/4
-for the first time in one window), and all prior FAIL/censored windows stay
-immutable diagnostics. Current numbers live in the machine-readable
-[`docs/state.json`](docs/state.json) and the snapshot
+Alpha (`v0.1.0`) is packaged and released; the formal M15 reliability gate is
+closed (2026-09-04: the tenth predeclared 12-cell v4 window returned the
+mechanical verdict **PASS 12/12 with 0 NOT_RUN**, with all prior
+FAIL/censored windows kept as immutable diagnostics) and the LT-EVAL-06
+breadth evidence is banked. Current facts and the current decision live in
+the machine-readable [`docs/state.json`](docs/state.json) and the snapshot
 [`docs/CURRENT.md`](docs/CURRENT.md) — consult those before interpreting any
-historical chronology.
-`docs/STATUS.md` owns Now/freeze status, `docs/ROADMAP.md` owns milestone
-gates/order, `docs/AUDIT_TODO.md` owns confirmed defects and acceptance
-tests, and `docs/M15_ACCEPTANCE.md` owns the formal-window design.
+historical chronology. The active feature queue is
+[`docs/NEXT_TASKS.md`](docs/NEXT_TASKS.md), delivery order is owned by
+[`docs/ROADMAP.md`](docs/ROADMAP.md), confirmed defects are triaged in
+[`docs/AUDIT_TODO.md`](docs/AUDIT_TODO.md), and the frozen formal-window
+design stays in [`docs/M15_ACCEPTANCE.md`](docs/M15_ACCEPTANCE.md).

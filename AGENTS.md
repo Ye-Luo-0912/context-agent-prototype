@@ -1,210 +1,32 @@
-# Agent Development Contract
+# Coding Agent 开发约定
 
-This repository is an experimental coding-agent runtime focused on
-**continuous context lifecycle management**. Preserve this contract before
-changing architecture.
+当前目标：把已有 Runtime 变成日常可用的单用户、本地、单工作区 Coding Agent。
+先接通功能，不继续把通用平台、研究评测和边角加固排在所有功能之前。
 
-| Doc | Role |
-| --- | --- |
-| [`docs/STATUS.md`](docs/STATUS.md) | Now / freeze / P0–P1 / next milestone |
-| [`docs/CURRENT.md`](docs/CURRENT.md) + [`docs/state.json`](docs/state.json) | Live state snapshot; machine-readable source of current numbers |
-| [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) | Stable architecture |
-| [`docs/CONTEXT_LIFECYCLE.md`](docs/CONTEXT_LIFECYCLE.md) | Context / GC / evidence / retrieval |
-| [`docs/EXECUTION_COHERENCE.md`](docs/EXECUTION_COHERENCE.md) | Execution Coherence V1 |
-| [`docs/PLATFORM_SECURITY.md`](docs/PLATFORM_SECURITY.md) | EffectIntent / sandbox attestation |
-| [`docs/ROADMAP.md`](docs/ROADMAP.md) | Milestone gates and ordered route |
-| [`docs/LONG_TASK_EVALUATION.md`](docs/LONG_TASK_EVALUATION.md) | Long-task Runtime gaps and one-directive development diagnostic |
-| [`docs/AUDIT_TODO.md`](docs/AUDIT_TODO.md) | Confirmed defect queue |
-| [`docs/M15_ACCEPTANCE.md`](docs/M15_ACCEPTANCE.md) | Frozen M15 acceptance design (V1) |
-| `crates/agent-eval/evidence/*/REPORT.md` | Experiment facts |
+## 从哪里开始
 
-Do not duplicate those lists here. Do not treat
-`docs/archive/CONTEXT_RUNTIME_TODO.md` (historical design queue) as live
-contract.
+默认只读 `docs/CURRENT.md` 与 `docs/NEXT_TASKS.md` 的当前任务。
+`docs/ROADMAP.md` 决定交付顺序；`docs/AUDIT_TODO.md` 只做缺陷分流，不是全仓清零前置门。
+实现时再读相关模块、调用方、现有测试和对应契约文档。
+历史报告、`docs/archive/`、旧 M15 窗口和旧 TODO 不生成新任务。
 
-## Working rules
+## 必须保留
 
-1. **Understand before editing.** Read the module, callers, and tests; state
-   what behavior stays and what changes. Do not edit semantics you cannot
-   explain.
-2. **Reuse before adding.** Prefer existing abstractions and small composable
-   primitives. Keep public APIs minimal, documented, and caller-agnostic.
-3. **Keep performance bounded and measured.** Keep expensive work off hot
-   paths and large values out of clones. Optimize only measured hotspots; do
-   not trade boundedness or latency for cleverness.
-4. **Keep code maintainable.** Use single-purpose functions, clear names, and
-   comments that explain *why*. Tests and failures should be understandable
-   without reverse-engineering the system.
-5. **Keep tracking numbers out of code comments.** Milestone, defect and
-   slice ids (`M12`, `MOD-AUTH-02`, `LT-RUN-04`, ...) are tracking
-   vocabulary for `docs/*` only. Code comments state facts and constraints
-   in plain language and never carry them.
+- RuntimeActor 是唯一编排者；沿用 TaskAnchor、ExecutionState、Checkpoint 和 RuntimeHandle。
+- Core 继续负责审批、权限、effect 身份、提交与恢复；不能为减少回合绕过它们。
+- ContextEngine 可替换；工作集与原始历史分开，工具结果与正文保持有界；工具不私读 ContextEngine/记忆存储。
+- 保持现有 crate 依赖方向和 conformance；ToolSpec/模型生成字段不是权限，外部正文不提升为 system 指令。
+- GC 的可逆外置不等于删除；只有既有 Storage GC 按保留与引用规则删除，语义终态不能被热度或 lease 复活。
+- 不覆盖用户已有修改；不假报验证、完成、恢复、CI 或实验结果。
+- 计划勾选不是可信验证；恢复记录不是重放副作用的授权。
+- 不新增 trace 数据库、通用 Planner、TaskGraph、并行 worker 或第二套状态权威。
+- 默认保持现有 GC/打分策略。修复已确认错误不等于开启算法研究。
 
-## Non-negotiable invariants
+## 交付规则
 
-1. **The transcript is not the source of model context.** Rebuild model input
-   through `ContextEngine::materialize(ContextQuery) -> MaterializedContext`,
-   then render it with the runtime-owned `PromptAssembler`. Never add an
-   authoritative global `messages: Vec<_>` to `CoreAuthority`.
-2. **Token pressure does not trigger forgetting.** Maintenance is driven by
-   `UserInput`, `BeforeModel`, `AfterModel`, `AfterTool`, `FocusChanged`,
-   `TaskCompleted`, and `Checkpoint`; budgeting is final packing only.
-3. **Tools cannot access context engines or memory stores.** Tools return
-   `ToolOutput`; kernel/context policy decides what enters context.
-   `tool-runtime` may depend only on contracts plus narrow workspace/process
-   facilities; it must not depend on a protocol host, runtime or context
-   implementation.
-4. **Raw tool output is not prompt history.** Store large output once under
-   `.focus-agent/artifacts/...`; keep `ToolOutput::model_content` bounded.
-5. **Context implementations are replaceable.** `agent-core` depends only
-   on `ContextEngine`; ContextCore must arrive as an adapter/implementation,
-   never a kernel rewrite or a `context-simple` import.
-6. **UI is event-driven.** UI code consumes runtime events, not mutable
-   kernel/context internals. Evolve `AppState` toward a reusable
-   `RunStateAggregator`/view model.
-7. **Raw traces are filesystem artifacts.** Use JSONL/artifact files; do not
-   add a database merely to store traces or learning data.
-8. **Keep v0 non-vector.** No embeddings, vector DB, graph retrieval, or RAG
-   until the dynamic working-set baseline is measured. Context operational
-   core is a freeze candidate: do not retune GC thresholds or reactivation
-   scoring; do not add a learned router. M12/M13 mechanism substrate is
-   implemented with clean-tree closure-audit evidence banked (2026-08-27);
-   the 2026-08-31 audit defects are repaired on `615b5ed..6fdb4f0`, and the
-   M15-facing exits are recorded in `docs/STATUS.md`. M15 closed at its
-   frozen gate on the tenth v4 window (12/12, `a882789`+`050aa8e` lineage;
-   see `docs/STATUS.md`); V2 Self-Iteration remains a separately gated
-   phase, not an open invitation.
-
-## Architecture and dependencies
-
-Allowed high-level direction:
-
-```text
-agent-contracts
- ^
- +-- agent-platform-protocol (bounded semantic wire DTOs + parse-time JSON budgets; no transport/runtime)
- +-- context-simple
- +-- agent-workspace
- +-- tool-runtime (also -> agent-workspace + narrow agent-process control)
- +-- agent-storage
- +-- agent-process (framed IPC, child lifecycle, sandbox hooks; decode budgets via protocol)
- +-- agent-core
-
-agent-capability-process -> agent-process (+ agent-contracts + agent-platform-protocol)
-context-contextcore -> agent-process (+ agent-contracts)
-agent-runtime -> agent-platform-protocol + agent-core + agent-workspace
-agent-tui -> composition of implementations
-```
-
-- `agent-core` is the **turn-stateless Core facade**: contracts, budgets,
-  approval, events/audit/durability, and model/tool/context wiring through
-  traits. It owns no task, turn, or prompt-frame state; minimal authority
-  registries may remain stateful.
-- `agent-runtime` is the **only orchestrator**. It owns `RuntimeActor`, task
-  and scope lifecycle, prompt assembly, capability registry, module host, and
-  adaptive policy. Never put turn state back in the core or add a second
-  orchestrator.
-- Concrete context engines (`context-simple`, `context-baselines`) and tool
-  dispatchers (`tool-runtime`) are wired only by trusted composition roots
-  (`agent-compose`, with `agent-tui` as one product host); runtime remains
-  implementation-agnostic.
-- **Runtime evolves; Core stays trusted.** PLAT-01's narrow in-process
-  `CorePort` is the only Core facade held by `RuntimeServices`. Current V1
-  still runs Core and Runtime as operator-trusted code in one address space.
-- Generic `shell.exec` / `process.run` / `process.session` stay a
-  non-transactional exception: Core identity before spawn, kill-then-reap
-  on cancel, no rollback of child mutations. Do not invent `MOD-18` from
-  residual syscalls or from multiplexing / Named Pipe/UDS. Untrusted
-  generated code fails closed unless the host can attest the required
-  sandbox floor; WASI is a V2 candidate, not a v0 slice.
-- ToolSpec is model-visible schema, not authority. Trusted
-  `HostToolPolicy` binds builtin args to `EffectIntent`. A plugin cannot
-  self-authorize via `ToolRisk` plus parameter names.
-- Process-connection state is `HostLifecycle` (`NeverStarted` / `Serving` /
-  `Quarantined` / `Stopped`). First connect is not a restart. A failed
-  replacement stays quarantined and must consume `RestartCircuit`.
-
-Forbidden dependencies:
-
-```text
-agent-core -> agent-runtime | context-simple | agent-tui
-agent-runtime -> context-simple | tool-runtime
-tool-runtime -> context-simple | ContextEngine
-context-simple -> tool-runtime
-agent-contracts -> any concrete crate
-agent-platform-protocol -> any crate except agent-contracts
-isolated/adapted Platform clients -> agent-core | agent-runtime
-```
-
-`agent-conformance` enforces the production/build graph transitively; test-only
-composition dependencies do not weaken these shipped-library rules.
-
-## Context and GC policy
-
-Improve observability before making selection smarter. Every policy change
-must eventually explain:
-
-```text
-item entered because ...
-item selected because ...
-item cooled/archived/dropped because ...
-item evicted because ...
-item reactivated because ...
-model turn N consumed it
-```
-
-Keep lifecycle dimensions orthogonal:
-
-- `attention`: `Active | Cooling | Archived`;
-- `semantic`: `Live | Superseded | VerifiedFixed | Tombstoned` (terminal
-  states never resurrect);
-- `residency`: `Resident | Warm | Cold | External`;
-- generation/retention/access metadata remains separate from all three.
-
-`ContextEngine::gc()` is mark/roots + sweep + reversible eviction and must
-report reasons. Context GC never destroys information: buffer overflow writes
-the oldest eviction to `ContextStore` as `ExternalizedContext`/`ContextRef`.
-Only conservative Storage GC may delete data, and only when it has no live
-references, retention has expired, and it is neither audit nor
-pinned/durable.
-
-Foreground evidence packs first and charges **actual** tokens against the
-frame budget; Runtime must not worst-case-reserve `MAX_FOREGROUND_TOKENS`.
-GC-induced reread is `Warm` + `Stored` only.
-
-Prefer explicit, explainable features before learned/opaque scoring:
-task/focus affinity, scope, retention, recency, access reinforcement,
-file/symbol/entity affinity, typed dependencies/supersession, and verified
-error/fix state.
-
-## Performance rules
-
-- Keep database/network work out of context hot paths unless measurement
-  proves it necessary.
-- Bound channels, decoded frames, model-facing output, events, and previews.
-- Store large tool results once; do not clone them into events/context.
-- Use bounded/ring buffers for streaming process output.
-- Keep event persistence buffered and off the runtime hot path while
-  preserving required durability barriers.
-- Do not use `unsafe` without a profiled hotspot and explicit justification.
-
-## Delivery order
-
-See [`docs/ROADMAP.md`](docs/ROADMAP.md) and [`docs/STATUS.md`](docs/STATUS.md).
-M12/M13 evidence stays banked (closure claims restored when the
-M15-facing exits closed); Self-Iteration remains a separately gated phase
-per `docs/ROADMAP.md`. Context live `context-mech.v2` (12 cells) evidence is
-under `crates/agent-eval/evidence/context-mech/`; do not retune GC from
-it. `add_test` is Tool Surface, not Context.
-
-## Definition of done for architectural changes
-
-An architectural change is incomplete unless:
-
-- dependency direction still satisfies this contract;
-- output/work is bounded where it crosses a runtime boundary;
-- runtime events make the behavior explainable;
-- tests cover the new context/tool lifecycle and relevant failure path;
-- `docs/ARCHITECTURE.md`, `docs/CONTEXT_LIFECYCLE.md`,
-  `docs/EXECUTION_COHERENCE.md`, or `docs/PLATFORM_SECURITY.md` is updated
-  when that contract changes.
+一次只交付一个功能切片。先写清用户能做什么，再改相关代码，补能防止该功能回归的必要测试。
+文档任务只跑现有文档检查；功能开发先做定向检查，合并沿用现有 CI，不另起全仓反复验收循环。
+真实的权限绕过、数据破坏、重复副作用和当前路径崩溃必须处理；无关边角问题记入 backlog，不接管主线。
+冻结实验只在明确选择研究任务时重跑，不为普通产品改动重新开启 M15/LT-EVAL。
+任务达到验收即停止扩展，报告实际执行命令、结果、限制和下一任务。
+除明确要求外，不新建 release/tag，不改冻结证据，不只提交测试和文档冒充功能完成。

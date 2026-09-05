@@ -45,6 +45,7 @@ LIVE_DOCS = [
     "docs/CURRENT.md",
     "docs/STATUS.md",
     "docs/ROADMAP.md",
+    "docs/NEXT_TASKS.md",
     "docs/CONFIGURATION.md",
     "docs/RECOVERY_RUNBOOK.md",
     "docs/COMPATIBILITY.md",

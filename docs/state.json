@@ -1,20 +1,27 @@
 {
   "schema": "project-state.v1",
-  "updated": "2026-09-05",
-  "maintained_by": "hand until the CI document-consistency gate lands; README.md and docs/CURRENT.md current-status text must be verified against this file",
-  "head_commit": "(refresh after doc commit)",
-  "code_commit": "050aa8e68f59c49d42b95e2a4d38fa37234a1e78",
+  "updated": "2026-09-06",
+  "maintained_by": "CURRENT.md and NEXT_TASKS.md record the active product route; the existing document-consistency script checks structure/links, not semantic equivalence or future CI success",
+  "head_commit": "12c86283b8d5991e9f17a07f14871dcf39d65066",
+  "code_commit": "12c86283b8d5991e9f17a07f14871dcf39d65066",
   "ci": {
     "head_commit": "green",
-    "head_run_id": 33898496334,
-    "last_green_commit": "33081b40debd4a022691b3a7ae70d67977d5e677",
-    "code_commit": "green"
+    "head_run_id": 33986702977,
+    "last_green_commit": "12c86283b8d5991e9f17a07f14871dcf39d65066",
+    "code_commit": "green",
+    "verified_source_commit": "12c86283b8d5991e9f17a07f14871dcf39d65066",
+    "observation": "GitHub Actions run completed/success; all six jobs succeeded",
+    "scope": "remote CI on the named source only; not local validation or future commits"
   },
   "milestone_gates": {
     "m15_real_evaluation": "closed",
     "next_ordered": [
-      "LT-EVAL-06 evaluation breadth",
-      "packaged V1 release gate"
+      "F1 continuation and visible queued input",
+      "F2 practical task checklist",
+      "F3 bounded long tasks and cancellable verification",
+      "F4 change review and delivery summary",
+      "F5 practical multi-file context and search",
+      "F6 three real product walkthroughs"
     ],
     "lt_eval_06": {
       "status": "evidence banked 2026-09-05",
@@ -47,7 +54,7 @@
     }
   },
   "product_stage": "alpha",
-  "product_phase": "phase-2-reliable-local-agent-alpha",
+  "product_phase": "daily-coding-workflow",
   "phase_2_started": "2026-09-04",
   "phase_2_slices_landed": [
     "checked model configuration: AGENT_DEMO=1 selects the mock explicitly, a missing OPENAI_API_KEY is a visible startup error (32ea622)",
@@ -75,8 +82,12 @@
   ],
   "branch_protection": false,
   "next_ordered": [
-    "packaged V1 release gate (package workflow 33983799960 dispatched)",
-    "V1 freeze: version/tag/release notes"
+    "F1 continuation and visible queued input",
+    "F2 practical task checklist",
+    "F3 bounded long tasks and cancellable verification",
+    "F4 change review and delivery summary",
+    "F5 practical multi-file context and search",
+    "F6 three real product walkthroughs"
   ],
   "release": {
     "version": "0.1.0",
@@ -88,5 +99,54 @@
       "agent-tui-v0.1.0-linux.zip",
       "agent-tui-v0.1.0-windows.zip"
     ]
+  },
+  "previous_status_snapshot": {
+    "head_commit": "(refresh after doc commit)",
+    "code_commit": "050aa8e68f59c49d42b95e2a4d38fa37234a1e78",
+    "ci": {
+      "head_commit": "green",
+      "head_run_id": 33898496334,
+      "last_green_commit": "33081b40debd4a022691b3a7ae70d67977d5e677",
+      "code_commit": "green"
+    },
+    "next_ordered": [
+      "packaged V1 release gate (package workflow 33983799960 dispatched)",
+      "V1 freeze: version/tag/release notes"
+    ]
+  },
+  "reviewed_source_commit": "12c86283b8d5991e9f17a07f14871dcf39d65066",
+  "source_scope_note": "Fixed reviewed source, not the SHA of the later documentation commit. Repository-wide architecture/delta review; not an exhaustive per-file safety audit. No local Rust build or test was run in this review.",
+  "active_task": "F1",
+  "route_reset": {
+    "task_document": "docs/NEXT_TASKS.md",
+    "archive": "docs/archive/route-reset-12c8628",
+    "feature_status": "F1-F5 code+targeted tests landed; F6 NOT_RUN (live); manual walkthroughs pending",
+    "D0_remaining": "done 2026-09-06: README route links updated, NEXT_TASKS added to LIVE_DOCS, doc-consistency gate green",
+    "research_not_a_product_prerequisite": [
+      "M15 rerun",
+      "Frame-3",
+      "Chronicle",
+      "TaskGraph",
+      "new GC/ranking algorithms"
+    ],
+    "F1_status": "code + targeted tests landed 2026-09-06 (/continue, busy-input queue visibility, notice-channel command errors, release consumption stamp, PromptRequired dedup); manual walkthrough pending",
+    "F2_status": "code + targeted tests landed 2026-09-06 (/work composes set_focus + empty-requirement task.manage PreferSurface + one user-message; /plan reads the new read-only TaskPlanView command; checkpoint roundtrip preserves checklist and TaskId); manual walkthrough pending",
+    "F3_status": "code + targeted tests landed 2026-09-06 (--max-rounds=<N> strict model-round budget into ComposeConfig, typed RoundBudget stop hint naming /continue + /plan + /checkpoint, --defer-proof opt-in with inline default preserved until a real slow-verification walkthrough); manual walkthrough pending; continued-review additions open: 6a output-EOF wait bypass, 6b verifier cancellation bridge",
+    "F4_status": "code + targeted tests landed 2026-09-06 (/review bounded event-derived result card: tool-stamped changed files, real check outcomes, unresolved failures, durable completion; persisted to artifacts/result-card-latest.json at task completion; user's pre-existing modifications not attributed); two-workspace walkthrough pending; continued-review additions open: resync_projection (oldest-16/run filter/watermark/bounded read), run_summary required-misses undercount, shadow-frame accounting fix",
+    "F5_status": "code + targeted tests landed 2026-09-06 (conservative provable file-body supersession: stale revision boundary or proven same-revision containment, disjoint windows coexist; errors verified only by verify.run success; search.grep PARTIAL coverage statement + scan_incomplete metadata); cross-file task walkthrough pending; fs.list coverage annotation still open (earlier status overclaimed it)",
+    "F6_status": "NOT_RUN 2026-09-06: live walkthroughs need an operator-interactive TUI session with a real provider; deterministic F1-F5 results are banked and the walkthrough checklist is in CURRENT.md",
+    "headless_acceptance": "agent-compose/tests/route_flow.rs: real composition + scripted model covers /work composition, task.manage plan, round-budget stop with durable safe point, /continue incl. cross-checkpoint restore; landed 2026-09-06 with two wiring fixes (compose now wires the artifact store into runtime checkpoint services; the round-budget refusal drains the in-flight write and lands its own safe point)",
+    "continued_review_2026_09_06": {
+      "baseline": "12c86283b8d5991e9f17a07f14871dcf39d65066",
+      "report": "docs/reviews/2026-09-06-continued-audit/REVIEW.md",
+      "new_findings_verified_on_branch": [
+        "F3-6a: process.rs/shell.rs output-EOF arm waits child.wait() outside the timeout/cancel select (a process that closes stdout/stderr but keeps running bypasses the bounds)",
+        "F3-6b: HostProofVerifier mints an independent cancellation token instead of bridging the actor cancellation signal",
+        "F4 batch: AppState::resync_projection takes the 16 OLDEST files (ascending mtime + truncate), no current-run filter, no replay watermark, unbounded read before the 32 MiB check; agent-replay run_summary reads a nonexistent required_misses.total field and undercounts required-context misses offline",
+        "observation: shadow frame counts zone-cap omissions into duplicates_removed (frame.rs) — research-track accounting fix, not a prompt flip"
+      ],
+      "old_findings_already_fixed": "consumption stamping + PromptRequired dedup fixed in c6fbbab",
+      "correction": "F5 PARTIAL coverage annotation covers search.grep only; fs.list is still open"
+    }
   }
 }

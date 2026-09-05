@@ -821,8 +821,27 @@ async fn verification_reaches_warm_errors() {
         );
     }
 
-    // A successful result on the same entities verifies the Warm error.
-    tool_observation(&engine, "3", "fixed AuthService.rs").await;
+    // Only a trusted verify.run result verifies the Warm error; an
+    // ordinary successful observation on the same entities must not.
+    tool_observation(&engine, "3a", "read AuthService.rs").await;
+    engine
+        .maintain(ContextMaintenanceTrigger::AfterModel)
+        .await
+        .unwrap();
+    {
+        let state = engine.state.lock().await;
+        let error = state
+            .eviction_buffer
+            .iter()
+            .find(|item| item.id == error_id)
+            .expect("warm error");
+        assert!(
+            !error.semantic.is_dead(),
+            "a plain successful observation must not verify the error, got {:?}",
+            error.semantic
+        );
+    }
+    verify_observation(&engine, "3", "fixed AuthService.rs").await;
     engine
         .maintain(ContextMaintenanceTrigger::AfterModel)
         .await

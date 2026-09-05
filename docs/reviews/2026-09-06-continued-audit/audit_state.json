@@ -1,0 +1,43 @@
+{
+  "schema": "continued-audit-record.v1",
+  "review_date_jst": "2026-09-06",
+  "repository": "Ye-Luo-0912/context-agent-prototype",
+  "source_sha": "12c86283b8d5991e9f17a07f14871dcf39d65066",
+  "tree_sha": "77ec0dd995949f4667f05c4182eb6259a8c9ea7d",
+  "main_rechecked_same_sha": true,
+  "remote_ci": {
+    "run_id": 33986702977,
+    "status": "completed",
+    "conclusion": "success",
+    "source": "GitHub connector"
+  },
+  "coverage": {
+    "workspace_crates_identified": 19,
+    "fresh_source_paths_in_read_coverage": 20,
+    "whole_repository_line_by_line_review": false,
+    "complete_recursive_file_inventory": false,
+    "local_source_checkout_obtained": false,
+    "description": "Architecture/chain coverage with prior same-SHA source context and fresh targeted deep source reads; CSV is not the full repository inventory."
+  },
+  "execution": {
+    "cargo_or_rustc_available": false,
+    "local_rust_build_or_tests_run": false,
+    "live_provider_coding_task_run": false,
+    "os_eof_before_exit_probe_run": true,
+    "probe_is_repository_regression_test": false,
+    "fixture_process_group_cleaned": true
+  },
+  "repository_changes": {
+    "pushed": false,
+    "code_modified": false,
+    "documentation_modified_remotely": false
+  },
+  "draft_task_queue": "same D0/F1-F6 as prior delivery, with F3/F4 additions",
+  "research_algorithms_measured_in_repository": false,
+  "historical_attachment_execution_claims_inherited": false,
+  "missing_path_observation": {
+    "path": "docs/NEXT_TASKS.md",
+    "at_sha": "12c86283b8d5991e9f17a07f14871dcf39d65066",
+    "status": 404
+  }
+}

@@ -1,0 +1,92 @@
+{
+  "schema": "project-state.v1",
+  "updated": "2026-09-05",
+  "maintained_by": "hand until the CI document-consistency gate lands; README.md and docs/CURRENT.md current-status text must be verified against this file",
+  "head_commit": "(refresh after doc commit)",
+  "code_commit": "050aa8e68f59c49d42b95e2a4d38fa37234a1e78",
+  "ci": {
+    "head_commit": "green",
+    "head_run_id": 33898496334,
+    "last_green_commit": "33081b40debd4a022691b3a7ae70d67977d5e677",
+    "code_commit": "green"
+  },
+  "milestone_gates": {
+    "m15_real_evaluation": "closed",
+    "next_ordered": [
+      "LT-EVAL-06 evaluation breadth",
+      "packaged V1 release gate"
+    ],
+    "lt_eval_06": {
+      "status": "evidence banked 2026-09-05",
+      "first_breadth_run": "12/12 PASS, 0 NOT_RUN (ltev_diagfix 4/4, ltev_migrate 4/4, harness_maint_dev 4/4; exact-tuple restore-and-continue on resume arms)",
+      "evidence": "crates/agent-eval/evidence/lt-eval-06/",
+      "contract_outcome": "TaskAnchor + ExecutionState substrate validated across three task families; no TaskGraph opened"
+    }
+  },
+  "m15": {
+    "status": "closed",
+    "closed_utc": "2026-09-04",
+    "closure_commit": "d004836d4e638d2774f8c6d704b9f50e0f591173",
+    "closing_window": {
+      "ordinal": 10,
+      "candidate_code_commit": "050aa8e68f59c49d42b95e2a4d38fa37234a1e78",
+      "manifest_created_utc": "2026-09-04T16:25:28Z",
+      "verdict": "pass",
+      "passed_cells": 12,
+      "total_cells": 12,
+      "not_run_cells": 0,
+      "report": "crates/agent-eval/evidence/m15-window/_windows/1788539149184/REPORT.md",
+      "run_log": "window10.log"
+    },
+    "pre_closure_runs_committed": 10,
+    "best_pre_closure_window": {
+      "ordinal": 9,
+      "verdict": "valid_fail",
+      "passed_cells": 11,
+      "report": "crates/agent-eval/evidence/m15-window/_windows/1788533384841/REPORT.md"
+    }
+  },
+  "product_stage": "alpha",
+  "product_phase": "phase-2-reliable-local-agent-alpha",
+  "phase_2_started": "2026-09-04",
+  "phase_2_slices_landed": [
+    "checked model configuration: AGENT_DEMO=1 selects the mock explicitly, a missing OPENAI_API_KEY is a visible startup error (32ea622)",
+    "CHECKPOINT-PRODUCT-01: manual and automatic checkpoints share the runtime envelope store; retention scoped to real artifacts; fail-closed legacy decoder (e8e5fff)",
+    "CRASH-RESUME-01 (partial): real child-process kill points at checkpoint-after-temp-write and turn-before-commit-barrier with crash/resume acceptance (5f94dc7)",
+    "PRODUCT-PROFILE-01: strict provider env parsing, SamplingPolicy operating point, ProviderProfile + provider_profile_digest in the startup banner (d21b686)",
+    "TUI transcript bounded at 400 rows through a single push path (ca6db07)",
+    "CRASH-RESUME-01 completed: all four kill points (effect prepare, effect apply-before-ack, checkpoint temp-write, turn barrier) with a real child-process crash matrix (9f159fa)",
+    "TUI approval detail (risk + per-argument breakdown) and visible Lagged-event warnings (dc15079)",
+    "PACKAGE-01 base: dist.sh/dist.ps1 release packaging with SHA256SUMS, Windows path validated by a real run (072b185)",
+    "PROOF-OPERATION-01 (mostly closed): host verifier runs outside the actor loop behind an opt-in defer_proof_refresh switch, with fenced resume; frozen inline semantics default; cross-turn acceptance (turn-holding) remains (6d851ab)",
+    "PROOF-OPERATION-01 closed: turn-holding makes the deferred accepted commit deterministic; verifier runs outside the actor loop behind the opt-in defer_proof_refresh flag",
+    "CONTEXT-FRAME-SHADOW-01 (Frame-0): shadow ContextFrameCompiler emits a zoned, classified FrameManifest per model round behind the opt-in shadow_context_frame flag; model input unchanged",
+    "Frame-1: agent-replay --frame-report folds shadow manifests vs prompt-layer costs from flag-enabled traces (offline comparison)",
+    "Frame-2: scripted gate over compiled and recorded manifests (unit matrix + agent-replay --frame-gate for CI captures)",
+    "PACKAGE-01 closed: agent-tui --doctor product self-check, dual-platform CI packaging smoke with artifacts, INSTALL.md install/config/upgrade notes",
+    "RUN-PROJECTION-01: agent-replay --run-summary rebuilds lifecycle/tasks/checkpoints/debts/costs from traces; docs/COMPATIBILITY.md declares the V1 cross-version contract"
+  ],
+  "default_context": "dynamic-in-process",
+  "experimental": [
+    "context-service",
+    "completion-opportunity",
+    "settlement-projection",
+    "recovery-surface"
+  ],
+  "branch_protection": false,
+  "next_ordered": [
+    "packaged V1 release gate (package workflow 33983799960 dispatched)",
+    "V1 freeze: version/tag/release notes"
+  ],
+  "release": {
+    "version": "0.1.0",
+    "tag": "v0.1.0",
+    "notes": "first packaged release: M15 + LT-EVAL-06 gates closed, alpha hardening tranche (checkpoints unified, crash matrix, strict config + sampling identity, status projection, doctor, diagnostics export), Context Frame shadow measurement",
+    "artifacts": "package workflow run on the tag (dist-ubuntu-latest / dist-windows-latest + SHA256SUMS)",
+    "github_release": "https://github.com/Ye-Luo-0912/context-agent-prototype/releases/tag/v0.1.0",
+    "assets": [
+      "agent-tui-v0.1.0-linux.zip",
+      "agent-tui-v0.1.0-windows.zip"
+    ]
+  }
+}
