@@ -120,7 +120,7 @@
   "route_reset": {
     "task_document": "docs/NEXT_TASKS.md",
     "archive": "docs/archive/route-reset-12c8628",
-    "feature_status": "F1-F6 pending; applying documentation implements no product feature",
+    "feature_status": "F1-F5 code+targeted tests landed; F6 NOT_RUN (live); manual walkthroughs pending",
     "D0_remaining": "done 2026-09-06: README route links updated, NEXT_TASKS added to LIVE_DOCS, doc-consistency gate green",
     "research_not_a_product_prerequisite": [
       "M15 rerun",
@@ -133,6 +133,7 @@
     "F2_status": "code + targeted tests landed 2026-09-06 (/work composes set_focus + empty-requirement task.manage PreferSurface + one user-message; /plan reads the new read-only TaskPlanView command; checkpoint roundtrip preserves checklist and TaskId); manual walkthrough pending",
     "F3_status": "code + targeted tests landed 2026-09-06 (--max-rounds=<N> strict model-round budget into ComposeConfig, typed RoundBudget stop hint naming /continue + /plan + /checkpoint, --defer-proof opt-in with inline default preserved until a real slow-verification walkthrough); manual walkthrough pending",
     "F4_status": "code + targeted tests landed 2026-09-06 (/review bounded event-derived result card: tool-stamped changed files, real check outcomes, unresolved failures, durable completion; persisted to artifacts/result-card-latest.json at task completion; user's pre-existing modifications not attributed); two-workspace walkthrough pending",
-    "F5_status": "code + targeted tests landed 2026-09-06 (conservative provable file-body supersession: stale revision boundary or proven same-revision containment, disjoint windows coexist; errors verified only by verify.run success; search.grep PARTIAL coverage statement + scan_incomplete metadata); cross-file task walkthrough pending"
+    "F5_status": "code + targeted tests landed 2026-09-06 (conservative provable file-body supersession: stale revision boundary or proven same-revision containment, disjoint windows coexist; errors verified only by verify.run success; search.grep PARTIAL coverage statement + scan_incomplete metadata); cross-file task walkthrough pending",
+    "F6_status": "NOT_RUN 2026-09-06: live walkthroughs need an operator-interactive TUI session with a real provider; deterministic F1-F5 results are banked and the walkthrough checklist is in CURRENT.md"
   }
 }
