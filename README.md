@@ -150,6 +150,14 @@ minutes) so a turn can never hang. For fully automatic policy, start with
 cargo run -p agent-tui -- --read-only .
 ```
 
+Two more flags shape long tasks: `--max-rounds=<N>` raises the per-turn
+execution budget to an explicit, finite number of MODEL rounds (the same unit
+the runtime enforces and `/status` renders; the runtime default stays in
+place without the flag), and `--defer-proof` opts into deferred proof
+refresh — the host verifier runs outside the actor loop while the turn
+holds — which stays opt-in until a real slow-verification walkthrough
+confirms cancellation and cleanup.
+
 ### Builtin tool set
 
 The production-default model surface contains `fs.list`, `fs.read`,

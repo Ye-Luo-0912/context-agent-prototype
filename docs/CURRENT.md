@@ -33,8 +33,14 @@ runtime actor 59 + turn 113、agent-tui 18、release consumption 8）。
 
 F2 代码同日落地（`/work` 组合 set_focus + 空 requirement 集补 task.manage
 PreferSurface + 一次 user-message；`/plan` 读新增的只读 `TaskPlanView`
-查询；清单/TaskId 检查点往返保留有回归覆盖）。手工走查仍待做；
-下一步进入 F3（有界长任务与可取消验证）。
+查询；清单/TaskId 检查点往返保留有回归覆盖）。手工走查仍待做。
+
+F3 代码同日落地：`--max-rounds=<N>` 以模型轮为单位严格解析并传入
+ComposeConfig；预算耗尽（类型化 `Failure{RoundBudget}`）时 TUI 显示
+`/continue` 续段、`/plan` 剩余清单与 `/checkpoint` 冷恢复前提；
+`--defer-proof` 选择加入 deferred proof refresh，默认 inline 保持，
+真实慢验证走查确认取消与清理后才改产品默认。deferred 取消/清理由既有
+turn 套件（113）覆盖。下一步进入 F4（修改审阅与结果交付）。
 
 ## 不在本轮
 

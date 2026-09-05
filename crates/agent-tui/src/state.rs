@@ -192,6 +192,10 @@ pub struct AppState {
     pub current_task: Option<(TaskId, u64)>,
     pub unresolved_ack_debts: usize,
     pub last_checkpoint: Option<String>,
+    /// The explicit per-turn model-round budget (`--max-rounds`). `None`
+    /// means the runtime default applies; the value is only a display
+    /// fact for `/status`, never an authority.
+    pub execution_budget: Option<usize>,
 }
 
 impl AppState {
@@ -221,6 +225,7 @@ impl AppState {
             current_task: None,
             unresolved_ack_debts: 0,
             last_checkpoint: None,
+            execution_budget: None,
             status_projection: agent_runtime::status::StatusProjection::default(),
         }
     }
@@ -232,6 +237,9 @@ impl AppState {
         // The projection is folded from the same public event stream every
         // host consumes; the lines below are UI-local additions only.
         let mut lines = self.status_projection.lines();
+        if let Some(rounds) = self.execution_budget {
+            lines.push(format!("execution budget: {rounds} model rounds per turn"));
+        }
         match &self.last_checkpoint {
             Some(path) => lines.push(format!("last manual checkpoint: {path}")),
             None => lines.push("last manual checkpoint: none this session".into()),
@@ -852,6 +860,18 @@ impl AppState {
                     "execution failed ({class:?}{}): {message}",
                     if retryable { ", retryable" } else { "" }
                 ));
+                if class == agent_contracts::RuntimeFailureClass::RoundBudget {
+                    // The runtime settled the turn as a deliberate refusal,
+                    // not a fault: name the recovery path instead of leaving
+                    // a bare "budget" dead-end. /continue starts a new
+                    // segment; cold resume needs a saved checkpoint.
+                    self.push_system(
+                        "stopped at the round budget; /continue starts a new segment, /plan shows \
+                         remaining work — run /checkpoint first if you may need to restart the \
+                         process"
+                            .into(),
+                    );
+                }
             }
             RuntimeEvent::ModelRetrying {
                 attempt, delay_ms, ..
@@ -1240,6 +1260,38 @@ mod tests {
                 .expect("failure notice")
                 .content
                 .contains("execution failed (ProviderTransport): window closed")
+        );
+    }
+
+    #[test]
+    fn round_budget_failure_names_the_continuation_path() {
+        let mut app = AppState::new(RunId::new());
+        app.apply_runtime_event(envelope(RuntimeEvent::Failure {
+            class: agent_contracts::RuntimeFailureClass::RoundBudget,
+            retryable: false,
+            message: "tool round budget exhausted after 16 rounds".into(),
+        }));
+        assert!(!app.busy);
+        let joined = app
+            .messages
+            .iter()
+            .map(|message| message.content.as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(joined.contains("RoundBudget"), "{joined}");
+        assert!(
+            joined.contains("/continue starts a new segment"),
+            "{joined}"
+        );
+        assert!(joined.contains("/plan shows remaining work"), "{joined}");
+        assert!(joined.contains("/checkpoint"), "{joined}");
+        // The budget shown in /status is the CLI-declared one, in the same
+        // unit the runtime enforces.
+        app.execution_budget = Some(48);
+        let status = app.render_status().join("\n");
+        assert!(
+            status.contains("execution budget: 48 model rounds"),
+            "{status}"
         );
     }
 

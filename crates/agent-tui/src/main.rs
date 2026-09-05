@@ -52,6 +52,8 @@ async fn main() -> anyhow::Result<()> {
     let mut effect_reservation_journal: Option<PathBuf> = None;
     let mut restore_arg: Option<PathBuf> = None;
     let mut doctor_mode = false;
+    let mut max_rounds: Option<usize> = None;
+    let mut defer_proof = false;
     for arg in std::env::args().skip(1) {
         if arg == "--doctor" {
             doctor_mode = true;
@@ -65,6 +67,10 @@ async fn main() -> anyhow::Result<()> {
             effect_reservation_journal = Some(PathBuf::from(value));
         } else if let Some(value) = arg.strip_prefix("--restore=") {
             restore_arg = Some(PathBuf::from(value));
+        } else if let Some(value) = arg.strip_prefix("--max-rounds=") {
+            max_rounds = Some(parse_max_rounds(value)?);
+        } else if arg == "--defer-proof" {
+            defer_proof = true;
         } else if root_arg.is_none() {
             root_arg = Some(PathBuf::from(arg));
         }
@@ -179,7 +185,7 @@ async fn main() -> anyhow::Result<()> {
     });
     let composed = compose(ComposeConfig {
         provider_profile_digest,
-        defer_proof_refresh: false,
+        defer_proof_refresh: defer_proof,
         shadow_context_frame: false,
         workspace,
         context_engine,
@@ -190,7 +196,7 @@ async fn main() -> anyhow::Result<()> {
         journal: Some(journal),
         artifact_store: Some(artifact_store),
         output_broker: Some(output_broker),
-        max_tool_rounds: None,
+        max_tool_rounds: max_rounds,
         project_task_progress: true,
         project_settlement: false,
         settlement_projection_diagnostics: false,
@@ -233,6 +239,8 @@ async fn main() -> anyhow::Result<()> {
         policy.as_str(),
         checkpoint_dir,
         serving_banner,
+        max_rounds,
+        defer_proof,
     )
     .await;
 
@@ -262,10 +270,23 @@ async fn run_ui(
     context_policy: &str,
     checkpoint_dir: PathBuf,
     serving_banner: String,
+    max_rounds: Option<usize>,
+    defer_proof: bool,
 ) -> anyhow::Result<()> {
     let mut app = AppState::new(handle.run_id());
     app.push_system(format!("context policy: {context_policy}"));
     app.push_system(serving_banner);
+    if let Some(rounds) = max_rounds {
+        app.execution_budget = Some(rounds);
+        app.push_system(format!(
+            "execution budget: {rounds} model rounds per turn (--max-rounds)"
+        ));
+    }
+    if defer_proof {
+        app.push_system(
+            "deferred proof refresh: enabled (--defer-proof); default stays inline".into(),
+        );
+    }
 
     // Requests that arrived before this loop started (e.g. during startup).
     if let Some(handle) = &interactive {
@@ -879,6 +900,23 @@ fn format_plan_lines(view: &agent_contracts::TaskAnchorView) -> Vec<String> {
     lines
 }
 
+/// Strict `--max-rounds` parsing. The budget counts MODEL rounds — the
+/// same unit the runtime enforces (`Failure { RoundBudget }`) and the
+/// status banner renders — never tool calls. Zero or garbage is a
+/// startup error before any workspace mutation; there is no infinite
+/// value: a long task gets an explicitly larger finite budget.
+fn parse_max_rounds(value: &str) -> anyhow::Result<usize> {
+    let rounds: usize = value.trim().parse().map_err(|_| {
+        anyhow::anyhow!(
+            "invalid --max-rounds {value:?}: expected a positive integer (model rounds)"
+        )
+    })?;
+    if rounds == 0 {
+        anyhow::bail!("invalid --max-rounds 0: the budget must be at least 1 model round");
+    }
+    Ok(rounds)
+}
+
 /// Resume discovery: the newest saved checkpoint in the store. A missing
 /// or empty store is a configuration error with the fix in the message.
 fn resolve_latest_checkpoint(dir: &std::path::Path) -> anyhow::Result<std::path::PathBuf> {
@@ -996,6 +1034,18 @@ mod plan_format_tests {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn max_rounds_parses_strictly_in_model_rounds() {
+        assert_eq!(parse_max_rounds("24").unwrap(), 24);
+        assert_eq!(parse_max_rounds(" 64 ").unwrap(), 64);
+        for bad in ["0", "-4", "abc", "", "2.5", "99999999999999999999"] {
+            let error = parse_max_rounds(bad).unwrap_err().to_string();
+            assert!(error.contains("--max-rounds"), "{bad}: {error}");
+        }
+        let zero = parse_max_rounds("0").unwrap_err().to_string();
+        assert!(zero.contains("at least 1"), "{zero}");
+    }
 
     #[test]
     fn plain_artifact_names_resolve_inside_the_checkpoint_dir() {
