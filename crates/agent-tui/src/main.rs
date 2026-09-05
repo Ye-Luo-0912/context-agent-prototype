@@ -420,6 +420,99 @@ async fn run_ui(
                         });
                         continue;
                     }
+                    if let Some(goal_text) = trimmed.strip_prefix("/work ") {
+                        let goal = goal_text.trim().to_string();
+                        if goal.is_empty() {
+                            app.push_system("usage: /work <goal>".to_string());
+                            continue;
+                        }
+                        // Explicit long-task entry, composed from the
+                        // existing actor paths: set_focus creates (or
+                        // resumes) the task while idle, an empty tool
+                        // requirement set gains a PreferSurface demand for
+                        // task.manage, and the goal is delivered once
+                        // through the normal user-message path (busy →
+                        // the runtime's own queue). No second orchestrator.
+                        let handle = handle.clone();
+                        let notice_tx = notice_tx.clone();
+                        tokio::spawn(async move {
+                            if let Err(error) = handle.set_focus(goal.clone()).await {
+                                let _ = notice_tx.try_send(format!("work failed: {error}"));
+                                return;
+                            }
+                            let tasks = match handle.list_tasks().await {
+                                Ok(tasks) => tasks,
+                                Err(error) => {
+                                    let _ = notice_tx.try_send(format!("work failed: {error}"));
+                                    return;
+                                }
+                            };
+                            // Match by goal: set_focus just created or
+                            // resumed exactly this task; a blind first-Active
+                            // pick could hit an older open task.
+                            let task = tasks
+                                .iter()
+                                .find(|task| {
+                                    task.goal == goal
+                                        && matches!(task.status, agent_runtime::TaskStatus::Active)
+                                })
+                                .or_else(|| {
+                                    tasks.iter().find(|task| {
+                                        matches!(task.status, agent_runtime::TaskStatus::Active)
+                                    })
+                                });
+                            if let Some(task) = task
+                                && task.tool_requirement_count == 0
+                            {
+                                // Fill only an empty requirement set: a
+                                // blind whole-set replace would drop
+                                // someone else's entries. task.manage stays
+                                // capability.manage-loadable either way.
+                                if let Err(error) = handle
+                                    .replace_task_tool_requirements(
+                                        task.id,
+                                        task.tool_requirement_revision,
+                                        vec![agent_contracts::ToolSurfaceRequirement {
+                                            tool_name: "task.manage".into(),
+                                            demand:
+                                                agent_contracts::ToolSurfaceDemand::PreferSurface,
+                                            reason: "long-task checklist".into(),
+                                        }],
+                                    )
+                                    .await
+                                {
+                                    let _ = notice_tx.try_send(format!(
+                                        "work: task.manage not attached: {error}"
+                                    ));
+                                }
+                            }
+                            if let Err(error) = handle.user_message(goal).await {
+                                let _ = notice_tx.try_send(format!("work failed: {error}"));
+                            }
+                        });
+                        continue;
+                    }
+                    if trimmed == "/plan" {
+                        let handle = handle.clone();
+                        let notice_tx = notice_tx.clone();
+                        tokio::spawn(async move {
+                            match handle.task_plan_view().await {
+                                Ok(Some(view)) => {
+                                    for line in format_plan_lines(&view) {
+                                        let _ = notice_tx.try_send(line);
+                                    }
+                                }
+                                Ok(None) => {
+                                    let _ = notice_tx
+                                        .try_send("no active task; /work <goal> starts one".into());
+                                }
+                                Err(error) => {
+                                    let _ = notice_tx.try_send(format!("plan failed: {error}"));
+                                }
+                            }
+                        });
+                        continue;
+                    }
                     if trimmed == "/grants" {
                         let Some(handle) = &interactive else {
                             continue;
@@ -709,8 +802,10 @@ fn load_runtime_checkpoint(path: &std::path::Path) -> anyhow::Result<RuntimeChec
 
 /// The product command list `/help` renders. Kept in one place so the
 /// welcome hint and the help output cannot drift apart.
-const HELP_LINES: [&str; 16] = [
+const HELP_LINES: [&str; 18] = [
     "/focus <directive> - point the runtime at a task directive",
+    "/work <goal> - start (or resume) a long task with task.manage available",
+    "/plan - show the active task's checklist, next action and open loops",
     "/pin <note> - pin a durable note into the working set",
     "/done <summary> - close the current task with a summary",
     "/context - inspect the selected working context",
@@ -727,6 +822,62 @@ const HELP_LINES: [&str; 16] = [
     "/cancel - cancel the in-flight turn",
     "/quit - leave the TUI (Esc clears the input, Ctrl-C quits)",
 ];
+
+/// Bounded number of checklist rows `/plan` renders per view.
+const PLAN_ROW_LIMIT: usize = 12;
+/// Char cap for one rendered plan row or loop entry.
+const PLAN_LINE_CHARS: usize = 160;
+
+fn bounded_plan_line(text: &str) -> String {
+    let mut bounded: String = text.chars().take(PLAN_LINE_CHARS).collect();
+    if text.chars().count() > PLAN_LINE_CHARS {
+        bounded.push('…');
+    }
+    bounded
+}
+
+/// Bounded display of the active task's plan view. `[x]`/`[-]`/`[ ]` are a
+/// display convention the model writes through `task.manage`; rows without
+/// a prefix pass through as-is. `[x]` is the model's reported progress,
+/// never a verification PASS — task completion stays with the existing
+/// completion gate.
+fn format_plan_lines(view: &agent_contracts::TaskAnchorView) -> Vec<String> {
+    let mut lines = vec![format!(
+        "plan: {} (anchor r{})",
+        bounded_plan_line(&view.original_goal),
+        view.revision
+    )];
+    if view.plan_progress.is_empty() {
+        lines.push("  no checklist yet; the model maintains one via task.manage".into());
+    } else {
+        for row in view.plan_progress.iter().take(PLAN_ROW_LIMIT) {
+            lines.push(format!("  {}", bounded_plan_line(row)));
+        }
+        let overflow = view.plan_progress.len().saturating_sub(PLAN_ROW_LIMIT);
+        if overflow > 0 {
+            lines.push(format!("  …and {overflow} more rows"));
+        }
+        lines.push("  ([x] is reported progress, not verification PASS)".into());
+    }
+    if !view.next_action.is_empty() {
+        lines.push(format!("  next: {}", bounded_plan_line(&view.next_action)));
+    }
+    if !view.open_loops.is_empty() {
+        let shown = view.open_loops.len().min(8);
+        let loops: Vec<String> = view.open_loops[..shown]
+            .iter()
+            .map(|loop_text| bounded_plan_line(loop_text))
+            .collect();
+        let overflow = view.open_loops.len() - shown;
+        let more = if overflow > 0 {
+            format!(" …and {overflow} more")
+        } else {
+            String::new()
+        };
+        lines.push(format!("  open loops: {}{more}", loops.join("; ")));
+    }
+    lines
+}
 
 /// Resume discovery: the newest saved checkpoint in the store. A missing
 /// or empty store is a configuration error with the fix in the message.
@@ -772,6 +923,73 @@ fn resolve_restore_target(checkpoint_dir: &std::path::Path, target: &str) -> std
         checkpoint_dir.join(target)
     } else {
         std::path::PathBuf::from(target)
+    }
+}
+
+#[cfg(test)]
+mod plan_format_tests {
+    use super::*;
+
+    fn view() -> agent_contracts::TaskAnchorView {
+        agent_contracts::TaskAnchorView {
+            revision: 7,
+            original_goal: "migrate the config module".into(),
+            current_interpretation: String::new(),
+            constraints: Vec::new(),
+            acceptance_criteria: Vec::new(),
+            plan_progress: vec![
+                "[x] locate the config reader".into(),
+                "[-] add the target key".into(),
+                "[ ] run related checks".into(),
+                "unprefixed historical row".into(),
+            ],
+            open_loops: vec!["confirm old default behavior".into()],
+            next_action: "edit the parser and add a regression".into(),
+        }
+    }
+
+    #[test]
+    fn plan_lines_render_rows_next_and_loops_with_the_progress_disclaimer() {
+        let lines = format_plan_lines(&view());
+        let joined = lines.join("\n");
+        assert!(lines[0].contains("migrate the config module"), "{joined}");
+        assert!(lines[0].contains("r7"), "{joined}");
+        assert!(joined.contains("[x] locate the config reader"));
+        // Unprefixed rows pass through as-is, without a fabricated prefix.
+        assert!(joined.contains("unprefixed historical row"));
+        assert!(joined.contains("next: edit the parser"));
+        assert!(joined.contains("open loops: confirm old default behavior"));
+        // The checklist is progress reporting, not verification truth.
+        assert!(joined.contains("not verification PASS"));
+    }
+
+    #[test]
+    fn plan_lines_stay_bounded_and_name_the_empty_case() {
+        let mut big = view();
+        big.plan_progress = (0..30).map(|i| format!("row {i}")).collect();
+        big.open_loops = (0..20).map(|i| format!("loop {i}")).collect();
+        let lines = format_plan_lines(&big);
+        assert!(lines.iter().any(|line| line.contains("…and 18 more rows")));
+        assert!(lines.iter().any(|line| line.contains("…and 12 more")));
+        assert!(lines.len() < 30, "render stays bounded: {:?}", lines.len());
+
+        let mut empty = view();
+        empty.plan_progress.clear();
+        empty.next_action.clear();
+        empty.open_loops.clear();
+        let lines = format_plan_lines(&empty);
+        assert!(lines.iter().any(|line| line.contains("no checklist yet")));
+        assert!(
+            !lines
+                .iter()
+                .any(|line| line.contains("not verification PASS"))
+        );
+
+        let mut long = view();
+        long.plan_progress = vec!["x".repeat(500)];
+        let lines = format_plan_lines(&long);
+        // Two-space indent + the bounded row + its ellipsis.
+        assert!(lines[1].chars().count() <= PLAN_LINE_CHARS + 3);
     }
 }
 

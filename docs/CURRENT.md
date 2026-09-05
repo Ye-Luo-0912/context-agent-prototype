@@ -31,6 +31,11 @@ PromptRequired 非 Pinned 条目重复选入。定向测试全绿（context-simp
 runtime actor 59 + turn 113、agent-tui 18、release consumption 8）。
 手工走查（恢复一个未完成任务后 `/continue`、忙时排队处置）待做，完成后进入 F2。
 
+F2 代码同日落地（`/work` 组合 set_focus + 空 requirement 集补 task.manage
+PreferSurface + 一次 user-message；`/plan` 读新增的只读 `TaskPlanView`
+查询；清单/TaskId 检查点往返保留有回归覆盖）。手工走查仍待做；
+下一步进入 F3（有界长任务与可取消验证）。
+
 ## 不在本轮
 
 新 GC/排序算法、Frame-3 正式输入翻转、向量检索、通用 Planner、Chronicle 数据库、TaskGraph、并行 worker、插件平台和自动自修改。

@@ -171,7 +171,15 @@ review/revert substrate for anything the agent changes.
 
 ## Useful commands in the TUI
 
-- Type a message and press Enter.
+- Type a message and press Enter. During a busy turn a message is queued
+  (one slot) and its queued/applied/rejected disposition is shown.
+- `/work <goal>` explicitly starts (or resumes) a long task and makes
+  `task.manage` available on its tool surface.
+- `/plan` shows the active task's checklist, next action and open loops as
+  the model maintains them through `task.manage` (`[x]` is reported
+  progress, not verification PASS).
+- `/continue` re-runs the active task's stored directive in a fresh turn
+  without minting a new instruction.
 - `/focus <text>` explicitly changes the current focus.
 - `/tasks` lists known tasks; `/task <id>` activates one.
 - `/suspend` suspends the active task.
