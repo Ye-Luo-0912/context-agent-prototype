@@ -82,6 +82,11 @@
     "version": "0.1.0",
     "tag": "v0.1.0",
     "notes": "first packaged release: M15 + LT-EVAL-06 gates closed, alpha hardening tranche (checkpoints unified, crash matrix, strict config + sampling identity, status projection, doctor, diagnostics export), Context Frame shadow measurement",
-    "artifacts": "package workflow run on the tag (dist-ubuntu-latest / dist-windows-latest + SHA256SUMS)"
+    "artifacts": "package workflow run on the tag (dist-ubuntu-latest / dist-windows-latest + SHA256SUMS)",
+    "github_release": "https://github.com/Ye-Luo-0912/context-agent-prototype/releases/tag/v0.1.0",
+    "assets": [
+      "agent-tui-v0.1.0-linux.zip",
+      "agent-tui-v0.1.0-windows.zip"
+    ]
   }
 }
