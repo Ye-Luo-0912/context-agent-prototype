@@ -44,7 +44,7 @@ pub use facts::{
 };
 pub use frame_report::{
     FrameComparisonReport, FrameRoundComparison, fold_frame_trace, frame_report_from_files,
-    render_frame_report,
+    gate_frame_traces, render_frame_report,
 };
 pub use frontier::{FrontierRebuild, rebuild_frontier};
 pub use recovery::{

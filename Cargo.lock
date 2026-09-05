@@ -169,6 +169,7 @@ dependencies = [
  "anyhow",
  "context-baselines",
  "context-simple",
+ "serde",
  "serde_json",
  "tempfile",
  "tokio",

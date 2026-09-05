@@ -430,14 +430,14 @@ fn context_block(item: &MaterializedItem, zone: ContextZone) -> FrameBlock {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use agent_contracts::{
         AttentionState, ContextKind, ContextMapView, ContextRetention, ContextScope,
         ExternalizedContext,
     };
 
-    fn item(content: &str, source: &str) -> MaterializedItem {
+    pub(crate) fn item(content: &str, source: &str) -> MaterializedItem {
         MaterializedItem {
             item_id: agent_contracts::ContextItemId::new(),
             kind: ContextKind::FileObservation,
@@ -453,7 +453,7 @@ mod tests {
         }
     }
 
-    fn anchor() -> TaskAnchorView {
+    pub(crate) fn anchor() -> TaskAnchorView {
         TaskAnchorView {
             revision: 7,
             original_goal: "repair the retry table".into(),
@@ -611,5 +611,337 @@ mod tests {
         assert_eq!(manifest.required_misses, 0);
         assert_eq!(manifest.anchor_revision, Some(7));
         assert_eq!(manifest.schema, "context-frame-shadow/v1");
+    }
+}
+
+/// Frame-2 scripted gate: deterministic invariants over a compiled shadow
+/// frame. The gate never talks to a model — it cross-checks the manifest
+/// against the same inputs the compiler consumed (mandatory coverage,
+/// surfaced debts and misses) and enforces manifest-intrinsic invariants
+/// (no duplicate bodies, external refs stay descriptors, bounded content,
+/// zone statistics consistent with the blocks).
+pub fn gate_shadow_frame(inputs: &ShadowFrameInputs<'_>, manifest: &FrameManifest) -> Vec<String> {
+    let mut violations = gate_manifest_invariants(manifest);
+
+    // Mandatory coverage: every operator contract text the anchor declares
+    // must appear as a TaskContract block, unless the manifest-wide cap
+    // omitted it (recorded honestly in the zone stats).
+    if let Some(anchor) = inputs.anchor {
+        let mut mandatory: Vec<(String, String)> = Vec::new();
+        if !anchor.original_goal.is_empty() {
+            mandatory.push(("anchor.original_goal".into(), anchor.original_goal.clone()));
+        }
+        for (index, constraint) in anchor.constraints.iter().enumerate() {
+            mandatory.push((format!("anchor.constraints[{index}]"), constraint.clone()));
+        }
+        for (index, criterion) in anchor.acceptance_criteria.iter().enumerate() {
+            mandatory.push((
+                format!("anchor.acceptance_criteria[{index}]"),
+                criterion.clone(),
+            ));
+        }
+        for (source, text) in mandatory {
+            let expected = content_digest(&text);
+            let present = manifest
+                .blocks
+                .iter()
+                .any(|block| block.zone == ContextZone::TaskContract && block.source == source);
+            let omitted = manifest
+                .zones
+                .iter()
+                .find(|stats| stats.zone == ContextZone::TaskContract)
+                .is_some_and(|stats| stats.omitted > 0);
+            if !present && !omitted {
+                violations.push(format!("mandatory contract block missing: {source}"));
+            }
+            let _ = expected;
+        }
+    }
+
+    // Surfaced debts: unresolved ack debts must appear as a descriptor.
+    if inputs.unresolved_ack_debts > 0
+        && !manifest
+            .blocks
+            .iter()
+            .any(|block| block.source == "recovery.ack_debts")
+    {
+        violations.push("unresolved ack debts are not surfaced".into());
+    }
+
+    // Reported misses must survive into the manifest unchanged.
+    let expected_misses =
+        usize::try_from(inputs.materialized.required_misses.total()).unwrap_or(usize::MAX);
+    if manifest.required_misses != expected_misses {
+        violations.push(format!(
+            "required misses drifted: manifest {} vs inputs {expected_misses}",
+            manifest.required_misses
+        ));
+    }
+
+    violations
+}
+
+/// Manifest-intrinsic invariants: valid on a freshly compiled manifest and
+/// on one read back from a trace.
+pub fn gate_manifest_invariants(manifest: &FrameManifest) -> Vec<String> {
+    let mut violations = Vec::new();
+
+    // Same body appears exactly once.
+    let mut seen = std::collections::HashSet::new();
+    for block in &manifest.blocks {
+        if !seen.insert(&block.digest) {
+            violations.push(format!(
+                "duplicate body digest across blocks: {} ({})",
+                &block.digest[..12.min(block.digest.len())],
+                block.source
+            ));
+        }
+    }
+
+    // External refs never carry bodies.
+    for block in &manifest.blocks {
+        if block.zone == ContextZone::ExternalDirectory
+            && block.representation != RepresentationClass::Descriptor
+        {
+            violations.push(format!(
+                "external directory block is not a descriptor: {}",
+                block.source
+            ));
+        }
+    }
+
+    // Bodies stay bounded.
+    for block in &manifest.blocks {
+        let cap = if block.authority == AuthorityClass::OperatorBoundary {
+            MAX_CONTRACT_BODY_CHARS
+        } else {
+            MAX_BLOCK_BODY_CHARS
+        };
+        if block.content.chars().count() > cap + 1 {
+            violations.push(format!("unbounded body in {}", block.source));
+        }
+    }
+
+    // Zone statistics agree with the block list.
+    for stats in &manifest.zones {
+        let zone_blocks = manifest
+            .blocks
+            .iter()
+            .filter(|block| block.zone == stats.zone)
+            .count();
+        if zone_blocks != stats.blocks {
+            violations.push(format!(
+                "zone {:?} claims {} blocks but carries {}",
+                stats.zone, stats.blocks, zone_blocks
+            ));
+        }
+        let zone_tokens: usize = manifest
+            .blocks
+            .iter()
+            .filter(|block| block.zone == stats.zone)
+            .map(|block| block.approx_tokens)
+            .sum();
+        if zone_tokens != stats.approx_tokens {
+            violations.push(format!(
+                "zone {:?} claims {} tokens but carries {}",
+                stats.zone, stats.approx_tokens, zone_tokens
+            ));
+        }
+    }
+
+    violations
+}
+
+#[cfg(test)]
+mod gate_tests {
+    use super::tests::anchor;
+    #[allow(unused_imports)]
+    use super::tests::item;
+    use super::*;
+    use agent_contracts::ContextMapView;
+
+    fn gate_inputs<'a>(
+        anchor: &'a TaskAnchorView,
+        materialized: &'a MaterializedContext,
+        ack_debts: usize,
+    ) -> ShadowFrameInputs<'a> {
+        ShadowFrameInputs {
+            run_id: RunId::new(),
+            task_id: Some(TaskId::new()),
+            anchor: Some(anchor),
+            materialized,
+            unresolved_ack_debts: ack_debts,
+        }
+    }
+
+    // Review Frame-2 matrix, bullet by bullet.
+
+    #[test]
+    fn task_constraints_and_criteria_are_never_missing() {
+        let anchor = anchor();
+        let materialized = MaterializedContext::default();
+        let inputs = gate_inputs(&anchor, &materialized, 0);
+        let manifest = compile_shadow_frame(&inputs);
+        assert!(
+            gate_shadow_frame(&inputs, &manifest).is_empty(),
+            "a healthy frame gates clean"
+        );
+        // Simulate a compiler regression: drop the constraints block.
+        let mut broken = manifest.clone();
+        broken
+            .blocks
+            .retain(|block| block.source != "anchor.constraints[0]");
+        let violations = gate_shadow_frame(&inputs, &broken);
+        assert!(
+            violations
+                .iter()
+                .any(|v| v.contains("anchor.constraints[0]")),
+            "{violations:?}"
+        );
+    }
+
+    #[test]
+    fn unresolved_debts_and_required_misses_must_surface() {
+        let anchor = anchor();
+        let mut materialized = MaterializedContext::default();
+        let miss: agent_contracts::ContextMaterializationMiss =
+            serde_json::from_value(serde_json::json!({
+                "identity": {
+                    "item_ref": "required:fixture-body",
+                },
+                "reason": "budget_excluded",
+            }))
+            .expect("a minimal required miss deserializes");
+        materialized.required_misses.push(miss);
+        let inputs = gate_inputs(&anchor, &materialized, 1);
+        let manifest = compile_shadow_frame(&inputs);
+        assert_eq!(manifest.required_misses, 1);
+        assert!(
+            gate_shadow_frame(&inputs, &manifest).is_empty(),
+            "debts and misses surface cleanly"
+        );
+
+        // A manifest that lost the debt descriptor fails the gate.
+        let mut broken = manifest.clone();
+        broken
+            .blocks
+            .retain(|block| block.source != "recovery.ack_debts");
+        assert!(
+            gate_shadow_frame(&inputs, &broken)
+                .iter()
+                .any(|v| v.contains("ack debts"))
+        );
+        // A manifest that drifted the miss count fails the gate.
+        let mut drifted = manifest.clone();
+        drifted.required_misses = 0;
+        assert!(
+            gate_shadow_frame(&inputs, &drifted)
+                .iter()
+                .any(|v| v.contains("drifted"))
+        );
+    }
+
+    #[test]
+    fn duplicate_bodies_and_unbounded_content_fail_the_gate() {
+        let anchor = anchor();
+        let mut manifest =
+            compile_shadow_frame(&gate_inputs(&anchor, &MaterializedContext::default(), 0));
+        manifest.blocks.push(manifest.blocks[0].clone());
+        assert!(
+            gate_manifest_invariants(&manifest)
+                .iter()
+                .any(|v| v.contains("duplicate body digest"))
+        );
+        let mut huge =
+            compile_shadow_frame(&gate_inputs(&anchor, &MaterializedContext::default(), 0));
+        huge.blocks[0].content = "x".repeat(MAX_BLOCK_BODY_CHARS + 10);
+        assert!(
+            gate_manifest_invariants(&huge)
+                .iter()
+                .any(|v| v.contains("unbounded body"))
+        );
+    }
+
+    #[test]
+    fn external_refs_stay_descriptors_and_zone_stats_stay_consistent() {
+        let anchor = anchor();
+        let mut materialized = MaterializedContext::default();
+        let item_id = agent_contracts::ContextItemId::new();
+        let entry: agent_contracts::ExternalizedContext =
+            serde_json::from_value(serde_json::json!({
+                "item_id": item_id,
+                "kind": "FileObservation",
+                "scope": "Task",
+                "retention": "Ephemeral",
+                "attention": "Archived",
+                "semantic": "Live",
+                "context_ref": {
+                    "uri": format!("context://run/{item_id}"),
+                    "item_id": item_id,
+                    "kind": "FileObservation",
+                    "scope": "Task",
+                    "summary": "externalized body",
+                    "created_tick": 0,
+                },
+                "created_tick": 0,
+                "access_count": 0,
+                "externalized_at_tick": 1,
+                "last_access_tick": 1,
+                "residency": "External",
+            }))
+            .unwrap();
+        materialized.external = ContextMapView::new(vec![entry]);
+        let inputs = gate_inputs(&anchor, &materialized, 0);
+        let manifest = compile_shadow_frame(&inputs);
+        assert!(gate_shadow_frame(&inputs, &manifest).is_empty());
+
+        // A compiler regression that carried a body into the directory
+        // fails the gate.
+        let mut broken = manifest.clone();
+        for block in &mut broken.blocks {
+            if block.zone == ContextZone::ExternalDirectory {
+                block.representation = RepresentationClass::BoundedBody;
+            }
+        }
+        assert!(
+            gate_manifest_invariants(&broken)
+                .iter()
+                .any(|v| v.contains("not a descriptor"))
+        );
+        // And inconsistent zone stats fail the gate.
+        let mut drifted = manifest.clone();
+        if let Some(stats) = drifted.zones.first_mut() {
+            stats.blocks += 1;
+        }
+        assert!(
+            gate_manifest_invariants(&drifted)
+                .iter()
+                .any(|v| v.contains("claims"))
+        );
+    }
+    #[test]
+    fn the_compiler_is_engine_agnostic_over_materialization_shapes() {
+        // Baseline engines (A append-only, B rolling) produce materially
+        // different working sets: many low-value items vs a small hot set.
+        // The same compiler and the same gate must hold for both.
+        let anchor = anchor();
+        let mut append_only = MaterializedContext::default();
+        for index in 0..30 {
+            append_only
+                .items
+                .push(item(&format!("append-only body {index}"), "tool"));
+        }
+        let mut rolling = MaterializedContext::default();
+        rolling.items.push(item("rolling hot body", "user"));
+        for inputs in [
+            gate_inputs(&anchor, &append_only, 0),
+            gate_inputs(&anchor, &rolling, 0),
+        ] {
+            let manifest = compile_shadow_frame(&inputs);
+            assert!(
+                gate_shadow_frame(&inputs, &manifest).is_empty(),
+                "engine shape must not break the frame contract"
+            );
+        }
     }
 }

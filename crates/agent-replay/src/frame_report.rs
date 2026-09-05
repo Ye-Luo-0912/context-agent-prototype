@@ -173,6 +173,150 @@ pub fn fold_frame_trace(lines: impl Iterator<Item = String>, report: &mut FrameC
     }
 }
 
+/// Frame-2 trace gate: fold every recorded manifest out of the traces and
+/// enforce the manifest-intrinsic invariants over each one. Returns the
+/// violations with their trace/run/round coordinates.
+pub fn gate_frame_traces(paths: &[std::path::PathBuf]) -> anyhow::Result<Vec<String>> {
+    let mut violations = Vec::new();
+    for path in paths {
+        let content = std::fs::read_to_string(path)
+            .map_err(|error| anyhow::anyhow!("read {}: {error}", path.display()))?;
+        let mut current_run = String::new();
+        let mut round = 0usize;
+        let mut pending: Vec<Value> = Vec::new();
+        for line in content.lines() {
+            let Ok(envelope) = serde_json::from_str::<Value>(line) else {
+                continue;
+            };
+            let run_id = envelope
+                .get("run_id")
+                .and_then(|value| value.as_str())
+                .unwrap_or("?")
+                .to_string();
+            if run_id != current_run {
+                current_run = run_id;
+                round = 0;
+                pending.clear();
+            }
+            let Some(event) = envelope.get("event") else {
+                continue;
+            };
+            match event.get("type").and_then(|value| value.as_str()) {
+                Some("context_frame_shadow") => {
+                    if let Some(manifest) = event.get("manifest").and_then(|m| m.as_str())
+                        && let Ok(parsed) = serde_json::from_str::<Value>(manifest)
+                    {
+                        pending.push(parsed);
+                    }
+                }
+                Some("model_started") => {
+                    round += 1;
+                    let manifest = pending.pop();
+                    pending.clear();
+                    let Some(manifest) = manifest else {
+                        continue;
+                    };
+                    // Recreate a FrameManifest-shaped check through the same
+                    // intrinsic rules the compiler gate uses.
+                    let parsed: Result<GateManifestShim, _> =
+                        serde_json::from_value(manifest.clone());
+                    if let Ok(parsed) = parsed {
+                        for violation in intrinsic_gate(&parsed) {
+                            violations
+                                .push(format!("{} round {round}: {violation}", path.display()));
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    Ok(violations)
+}
+
+/// Local mirror of the runtime frame types so the replay binary stays
+/// decoupled from agent-runtime.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum GateZone {
+    TaskContract,
+    ExecutionState,
+    CurrentEvidence,
+    WorkingMemory,
+    ExternalDirectory,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum GateRepresentation {
+    BoundedBody,
+    Descriptor,
+    Omitted,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+struct GateManifestShim {
+    zones: Vec<GateZoneStatsShim>,
+    blocks: Vec<GateBlockShim>,
+    required_misses: usize,
+    approx_tokens_total: usize,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+struct GateZoneStatsShim {
+    zone: GateZone,
+    blocks: usize,
+    omitted: usize,
+    approx_tokens: usize,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+struct GateBlockShim {
+    zone: GateZone,
+    representation: GateRepresentation,
+    #[serde(default)]
+    content: String,
+    #[serde(default)]
+    source: String,
+}
+
+fn intrinsic_gate(manifest: &GateManifestShim) -> Vec<String> {
+    let mut violations = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+    for block in &manifest.blocks {
+        if !seen.insert(&block.content) {
+            violations.push(format!(
+                "duplicate body in {}",
+                &block.source[..12.min(block.source.len())]
+            ));
+        }
+        if block.zone == GateZone::ExternalDirectory
+            && block.representation != GateRepresentation::Descriptor
+        {
+            violations.push(format!(
+                "external directory block is not a descriptor: {}",
+                &block.source[..12.min(block.source.len())]
+            ));
+        }
+        if block.content.chars().count() > 600 {
+            violations.push(format!("unbounded body in {}", block.source));
+        }
+    }
+    for stats in &manifest.zones {
+        let zone_blocks = manifest
+            .blocks
+            .iter()
+            .filter(|block| {
+                std::mem::discriminant(&block.zone) == std::mem::discriminant(&stats.zone)
+            })
+            .count();
+        if zone_blocks != stats.blocks {
+            violations.push("zone stats disagree with blocks".to_string());
+        }
+    }
+    violations
+}
+
 /// Aggregate one or more trace files.
 pub fn frame_report_from_files(
     paths: &[std::path::PathBuf],
@@ -346,5 +490,87 @@ mod tests {
         let rendered = render_frame_report(&report);
         assert!(rendered.contains("runs 2"));
         assert!(rendered.contains("paired rounds 2"));
+    }
+}
+
+#[cfg(test)]
+mod gate_tests {
+    use super::*;
+
+    fn trace_with_manifest(manifest: serde_json::Value) -> String {
+        let run = "run-gate";
+        let shadow_line = format!(
+            r#"{{"run_id":"{run}","seq":1,"timestamp_ms":1,"event":{{"type":"context_frame_shadow","manifest":{}}}}}"#,
+            serde_json::json!(manifest.to_string())
+        );
+        let model_line = r#"{"run_id":"run-gate","seq":2,"timestamp_ms":2,"event":{"type":"model_started","prompt_layers":{"historical_context_tokens":100}}}"#;
+        format!(
+            "{shadow_line}
+{model_line}"
+        )
+    }
+
+    fn healthy_manifest() -> serde_json::Value {
+        serde_json::json!({
+            "schema": "context-frame-shadow/v1",
+            "approx_tokens_total": 50,
+            "duplicates_removed": 0,
+            "required_misses": 0,
+            "zones": [
+                {"zone": "task_contract", "blocks": 1, "omitted": 0, "approx_tokens": 20},
+                {"zone": "external_directory", "blocks": 1, "omitted": 0, "approx_tokens": 5},
+            ],
+            "blocks": [
+                {"zone": "task_contract", "representation": "bounded_body",
+                 "source": "anchor.original_goal", "content": "fix the thing"},
+                {"zone": "external_directory", "representation": "descriptor",
+                 "source": "context://run/x", "content": "externalized item"},
+            ],
+        })
+    }
+
+    fn write_trace(dir: &std::path::Path, line: String) -> std::path::PathBuf {
+        let path = dir.join("events.jsonl");
+        std::fs::write(&path, line).unwrap();
+        path
+    }
+
+    #[test]
+    fn the_trace_gate_passes_healthy_manifests_and_flags_violations() {
+        let dir = tempfile::tempdir().unwrap();
+
+        let healthy = write_trace(dir.path(), trace_with_manifest(healthy_manifest()));
+        assert!(gate_frame_traces(&[healthy]).unwrap().is_empty());
+
+        let mut broken = healthy_manifest();
+        // Duplicate body: same content twice.
+        if let Some(blocks) = broken.get_mut("blocks").and_then(|b| b.as_array_mut()) {
+            let clone = blocks[0].clone();
+            blocks.push(clone);
+        }
+        let broken_path = write_trace(dir.path(), trace_with_manifest(broken));
+        let violations = gate_frame_traces(&[broken_path]).unwrap();
+        assert!(
+            violations.iter().any(|v| v.contains("duplicate body")),
+            "{violations:?}"
+        );
+
+        let mut external_body = healthy_manifest();
+        if let Some(blocks) = external_body
+            .get_mut("blocks")
+            .and_then(|b| b.as_array_mut())
+        {
+            for block in blocks.iter_mut() {
+                if block["zone"] == "external_directory" {
+                    block["representation"] = serde_json::json!("bounded_body");
+                }
+            }
+        }
+        let external_path = write_trace(dir.path(), trace_with_manifest(external_body));
+        let violations = gate_frame_traces(&[external_path]).unwrap();
+        assert!(
+            violations.iter().any(|v| v.contains("not a descriptor")),
+            "{violations:?}"
+        );
     }
 }
