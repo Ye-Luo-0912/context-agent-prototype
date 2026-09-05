@@ -56,11 +56,14 @@ Formal verdicts live only in the immutable
   mandatory, dedup, boundedness, external descriptors, zone consistency,
   engine-agnostic) as unit tests plus `agent-replay --frame-gate` over
   recorded traces.
-- Next product queue (order per [`ROADMAP.md`](ROADMAP.md#route-to-a-usable-local-agent)
-  and the 2026-09-05 code review, [`reviews/2026-09-05-code-review.md`](reviews/2026-09-05-code-review.md)):
-  Linux dist validation, install notes, packaged-binary CI smoke and
-  the clean-machine doctor at the V1 gate. All six Phase 2 alpha
-  hardening blockers from the 2026-09-05 review are closed on source.
+- Landed 2026-09-05 (last): `agent-tui --doctor` product self-check,
+  `INSTALL.md` install/config/upgrade notes, and the dual-platform
+  `package.yml` CI workflow (fail-closed-config + doctor smokes,
+  checksummed artifacts). All six Phase 2 alpha hardening blockers from
+  the 2026-09-05 review are closed on source; the Context Frame route is
+  at Frame-3-ready (live gate waits for `LT-EVAL-06` serving).
+- Next product queue: [`LT-EVAL-06`] breadth on the product limits, then
+  the V1 release gate rides the package workflow.
 - Default context is dynamic in-process. `context-service`,
   completion-opportunity, settlement-projection and recovery-surface remain
   experimental.

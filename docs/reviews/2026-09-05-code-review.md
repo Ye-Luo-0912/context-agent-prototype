@@ -294,8 +294,14 @@ Any split should follow transaction boundaries, not line counts.
 5. `STATUS-SNAPSHOT-01` — P2-BLK-4.
 6. `PROOF-OPERATION-01` — P2-BLK-5.
 7. `TUI-ALPHA-01` — P2-BLK-6 + approval detail + Lagged resync.
-8. `PACKAGE-01` — Windows/Linux binaries, checksums, clean-machine doctor
-   (Phase 3, together with `LT-EVAL-06`).
+8. `PACKAGE-01` — **landed 2026-09-05**: `scripts/dist.{sh,ps1}` package
+   with SHA256SUMS (Windows run-validated); `agent-tui --doctor` is the
+   product self-check (workspace writability, checkpoint store verify,
+   checked provider config; corrupt/foreign checkpoint-like files surface
+   as warnings); `.github/workflows/package.yml` builds both platforms,
+   runs the fail-closed-config and doctor smokes headlessly and uploads
+   artifacts — that CI run is the Linux dist validation. INSTALL.md owns
+   install/config/upgrade notes. (Phase 3, together with `LT-EVAL-06`.)
 9. `CONTEXT-FRAME-SHADOW-01` — **Frame-0 landed 2026-09-05**: the shadow
    `ContextFrameCompiler` (`agent-runtime::frame`) compiles the same state
    the prompt assembler consumes into a zoned, classified `FrameManifest`

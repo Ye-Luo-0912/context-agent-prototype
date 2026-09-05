@@ -56,7 +56,8 @@
     "PROOF-OPERATION-01 closed: turn-holding makes the deferred accepted commit deterministic; verifier runs outside the actor loop behind the opt-in defer_proof_refresh flag",
     "CONTEXT-FRAME-SHADOW-01 (Frame-0): shadow ContextFrameCompiler emits a zoned, classified FrameManifest per model round behind the opt-in shadow_context_frame flag; model input unchanged",
     "Frame-1: agent-replay --frame-report folds shadow manifests vs prompt-layer costs from flag-enabled traces (offline comparison)",
-    "Frame-2: scripted gate over compiled and recorded manifests (unit matrix + agent-replay --frame-gate for CI captures)"
+    "Frame-2: scripted gate over compiled and recorded manifests (unit matrix + agent-replay --frame-gate for CI captures)",
+    "PACKAGE-01 closed: agent-tui --doctor product self-check, dual-platform CI packaging smoke with artifacts, INSTALL.md install/config/upgrade notes"
   ],
   "default_context": "dynamic-in-process",
   "experimental": [

@@ -1,3 +1,4 @@
+mod doctor;
 mod state;
 mod ui;
 
@@ -50,8 +51,11 @@ async fn main() -> anyhow::Result<()> {
     let mut grant_args: Vec<String> = Vec::new();
     let mut effect_reservation_journal: Option<PathBuf> = None;
     let mut restore_arg: Option<PathBuf> = None;
+    let mut doctor_mode = false;
     for arg in std::env::args().skip(1) {
-        if arg == "--read-only" {
+        if arg == "--doctor" {
+            doctor_mode = true;
+        } else if arg == "--read-only" {
             read_only = true;
         } else if let Some(value) = arg.strip_prefix("--context=") {
             context_policy = value.to_string();
@@ -79,6 +83,10 @@ async fn main() -> anyhow::Result<()> {
     };
     let policy = ContextPolicy::from_str_checked(&context_policy)?;
     let root = root_arg.unwrap_or(std::env::current_dir().context("current directory")?);
+    if doctor_mode {
+        let code = doctor::run_doctor(root).await;
+        std::process::exit(code);
+    }
     let workspace = Workspace::open(&root).await?;
     let restore_checkpoint = if restore_latest {
         let resolved = resolve_latest_checkpoint(&workspace.state_dir().join("checkpoints"))?;

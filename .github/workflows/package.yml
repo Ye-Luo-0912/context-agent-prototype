@@ -1,0 +1,67 @@
+# Packaged-binary smoke: build the release agent-tui on both platforms,
+# fail-closed config check, product doctor in demo mode, package with
+# checksums, upload the artifacts. This is the V1-gate packaging smoke;
+# Linux validation of scripts/dist.sh runs here too.
+name: package
+
+on:
+  workflow_dispatch:
+  push:
+    tags: ["v*"]
+
+jobs:
+  package:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            script: bash scripts/dist.sh
+          - os: windows-latest
+            script: powershell -ExecutionPolicy Bypass -File scripts/dist.ps1
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.97.1
+
+      - name: Build release binary
+        run: cargo build --release --bin agent-tui
+
+      - name: Smoke — missing key fails closed before any mutation
+        shell: bash
+        env:
+          OPENAI_API_KEY: ""
+        run: |
+          set +e
+          if [ "${{ matrix.os }}" = "windows-latest" ]; then
+            out=$(./target/release/agent-tui.exe . 2>&1)
+          else
+            out=$(./target/release/agent-tui . 2>&1)
+          fi
+          code=$?
+          set -e
+          echo "$out"
+          test "$code" -ne 0
+          echo "$out" | grep -q "no model configured"
+
+      - name: Smoke — product doctor passes in demo mode
+        shell: bash
+        env:
+          AGENT_DEMO: "1"
+        run: |
+          if [ "${{ matrix.os }}" = "windows-latest" ]; then
+            ./target/release/agent-tui.exe --doctor .
+          else
+            ./target/release/agent-tui --doctor .
+          fi
+
+      - name: Package with checksums
+        run: ${{ matrix.script }}
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dist-${{ matrix.os }}
+          path: dist/
