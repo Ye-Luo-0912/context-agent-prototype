@@ -425,7 +425,22 @@ impl RuntimeActor {
                 })
                 .await;
             // Deliberate refusal (round budget), not a fault: settle the
-            // applied input and drop the turn without fencing.
+            // applied input and drop the turn without fencing. The stop is
+            // a RECOVERABLE stop, so first drain any in-flight safe-point
+            // write and then land the debt this turn accrued as one more
+            // durable safe point BEFORE the turn is dropped — otherwise a
+            // debt accrued while a write was in flight stays uncaptured
+            // forever and continuation stays fenced with nothing left to
+            // clear it. A failed safe-point write is a real durability
+            // failure: fence the runtime instead of pretending the stop is
+            // recoverable.
+            if let Err(error) = self.await_pending_checkpoint().await {
+                self.require_effect_recovery(format!(
+                    "safe-point write failed at the round-budget stop: {error}"
+                ))
+                .await;
+            }
+            self.safe_point_resume_commit().await;
             self.settle_aborted_turn().await;
             return;
         }
