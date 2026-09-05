@@ -3682,6 +3682,61 @@ async fn prompt_required_anchor_roots_force_selection() {
 }
 
 #[tokio::test]
+async fn prompt_required_item_is_packed_once_when_also_scored() {
+    let dir = tempfile::tempdir().unwrap();
+    let engine = SimpleContextEngine::new(SimpleContextConfig {
+        context_store_dir: Some(dir.path().to_path_buf()),
+        ..SimpleContextConfig::default()
+    });
+    // Session-scope Active 条目本来就是打分候选；再叠加 PromptRequired
+    // 声明时，优先轮已选入，普通候选轮不得重复选入或重复扣预算。
+    let target_id = {
+        let mut state = engine.state.lock().await;
+        let mut item = crate::item::make_item(
+            &state,
+            &engine.config,
+            "active scored note the anchor also requires".into(),
+            ContextKind::Note,
+            ContextScope::Session,
+            ContextRetention::Working,
+            0.8,
+            None,
+        );
+        item.id = ContextItemId::new();
+        item.attention = AttentionState::Active;
+        let id = item.id;
+        state.items.push(item);
+        id
+    };
+    let materialized = engine
+        .materialize(agent_contracts::ContextQuery {
+            current_input: "continue".into(),
+            budget_tokens: 4096,
+            hints: agent_contracts::ContextHints {
+                max_selected_items: None,
+                anchor_roots: vec![agent_contracts::AnchorRootClaim {
+                    item_ref: target_id.to_string(),
+                    strength: agent_contracts::AnchorRootStrength::PromptRequired,
+                    source_field_id: "constraints".into(),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            },
+        })
+        .await
+        .unwrap();
+    let occurrences = materialized
+        .items
+        .iter()
+        .filter(|m| m.item_id == target_id)
+        .count();
+    assert_eq!(
+        occurrences, 1,
+        "PromptRequired 非 Pinned 条目只能被装帧一次（优先轮选入后普通轮跳过）"
+    );
+}
+
+#[tokio::test]
 async fn storage_required_anchor_roots_protect_the_store() {
     let dir = tempfile::tempdir().unwrap();
     let engine = SimpleContextEngine::new(SimpleContextConfig {

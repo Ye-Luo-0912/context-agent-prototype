@@ -121,13 +121,14 @@
     "task_document": "docs/NEXT_TASKS.md",
     "archive": "docs/archive/route-reset-12c8628",
     "feature_status": "F1-F6 pending; applying documentation implements no product feature",
-    "D0_remaining": "update README route links, add NEXT_TASKS to existing LIVE_DOCS, run doc checks",
+    "D0_remaining": "done 2026-09-06: README route links updated, NEXT_TASKS added to LIVE_DOCS, doc-consistency gate green",
     "research_not_a_product_prerequisite": [
       "M15 rerun",
       "Frame-3",
       "Chronicle",
       "TaskGraph",
       "new GC/ranking algorithms"
-    ]
+    ],
+    "F1_status": "code + targeted tests landed 2026-09-06 (/continue, busy-input queue visibility, notice-channel command errors, release consumption stamp, PromptRequired dedup); manual walkthrough pending"
   }
 }

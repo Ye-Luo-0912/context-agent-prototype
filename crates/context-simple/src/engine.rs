@@ -1589,14 +1589,11 @@ impl ContextEngine for SimpleContextEngine {
         for item_id in ack.item_ids.iter().chain(&ack.external_item_ids) {
             // Ownership was validated above while holding the same lock, so
             // stamping is infallible and the acknowledgement commits as one
-            // mutation rather than partially reinforcing a prefix.
-            debug_assert!(stamp_consumed(
-                &mut state,
-                *item_id,
-                now_event_seq,
-                turn,
-                gc_epoch
-            ));
+            // mutation rather than partially reinforcing a prefix. The stamp
+            // itself must run in release builds too: consumption is the only
+            // record that the model actually saw the final packed frame.
+            let stamped = stamp_consumed(&mut state, *item_id, now_event_seq, turn, gc_epoch);
+            debug_assert!(stamped);
         }
         // Foreground bodies were seen by the model but never changed
         // residency: they are recorded as a weak observational signal only

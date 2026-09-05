@@ -367,28 +367,31 @@ async fn run_ui(
                     }
                     if let Some(goal) = trimmed.strip_prefix("/focus ") {
                         let handle = handle.clone();
+                        let notice_tx = notice_tx.clone();
                         let goal = goal.trim().to_string();
                         tokio::spawn(async move {
                             if let Err(error) = handle.set_focus(goal).await {
-                                tracing::error!(%error, "set focus failed");
+                                let _ = notice_tx.try_send(format!("focus failed: {error}"));
                             }
                         });
                         continue;
                     }
                     if let Some(id_text) = trimmed.strip_prefix("/task ") {
                         // Activate an existing task by id (resume its
-                        // scopes). Task ids come from `/tasks`.
+                        // scopes). Task ids come from `/tasks`; activation
+                        // alone does not start a turn — `/continue` does.
                         match id_text.trim().parse::<agent_contracts::TaskId>() {
                             Ok(task_id) => {
                                 let handle = handle.clone();
+                                let notice_tx = notice_tx.clone();
                                 tokio::spawn(async move {
                                     if let Err(error) = handle.activate_task(task_id).await {
-                                        tracing::error!(%error, "activate task failed");
+                                        let _ = notice_tx.try_send(format!("task failed: {error}"));
                                     }
                                 });
                             }
                             Err(error) => {
-                                tracing::error!(%error, "invalid task id: {id_text}");
+                                app.push_system(format!("invalid task id: {error}"));
                             }
                         }
                         continue;
@@ -410,7 +413,9 @@ async fn run_ui(
                                         ));
                                     }
                                 }
-                                Err(error) => tracing::error!(%error, "list tasks failed"),
+                                Err(error) => {
+                                    let _ = notice_tx.try_send(format!("tasks failed: {error}"));
+                                }
                             }
                         });
                         continue;
@@ -470,38 +475,43 @@ async fn run_ui(
                     }
                     if trimmed == "/suspend" {
                         let handle = handle.clone();
+                        let notice_tx = notice_tx.clone();
                         tokio::spawn(async move {
                             if let Err(error) = handle.suspend_task().await {
-                                tracing::error!(%error, "suspend task failed");
+                                let _ = notice_tx.try_send(format!("suspend failed: {error}"));
                             }
                         });
                         continue;
                     }
                     if let Some(content) = trimmed.strip_prefix("/pin ") {
                         let handle = handle.clone();
+                        let notice_tx = notice_tx.clone();
                         let content = content.trim().to_string();
                         tokio::spawn(async move {
                             if let Err(error) = handle.pin(content).await {
-                                tracing::error!(%error, "pin failed");
+                                let _ = notice_tx.try_send(format!("pin failed: {error}"));
                             }
                         });
                         continue;
                     }
                     if let Some(summary) = trimmed.strip_prefix("/done ") {
                         let handle = handle.clone();
+                        let notice_tx = notice_tx.clone();
                         let summary = summary.trim().to_string();
                         tokio::spawn(async move {
                             if let Err(error) = handle.complete_current_task(summary).await {
-                                tracing::error!(%error, "complete task failed");
+                                let _ = notice_tx.try_send(format!("done failed: {error}"));
                             }
                         });
                         continue;
                     }
                     if trimmed == "/context" {
                         let handle = handle.clone();
+                        let notice_tx = notice_tx.clone();
                         tokio::spawn(async move {
                             if let Err(error) = handle.emit_diagnostics().await {
-                                tracing::error!(%error, "context diagnostics failed");
+                                let _ = notice_tx
+                                    .try_send(format!("context diagnostics failed: {error}"));
                             }
                         });
                         continue;
@@ -616,7 +626,9 @@ async fn run_ui(
                         }
                         .await;
                         match result {
-                            Ok(()) => app.push_system("runtime restored".to_string()),
+                            Ok(()) => app.push_system(
+                                "runtime restored; /continue resumes the active task".to_string(),
+                            ),
                             Err(error) => app.push_system(format!("restore failed: {error}")),
                         }
                         continue;
@@ -625,6 +637,22 @@ async fn run_ui(
                         if let Err(error) = handle.cancel_turn().await {
                             app.push_system(format!("cancel failed: {error}"));
                         }
+                        continue;
+                    }
+                    if trimmed == "/continue" {
+                        // Re-run the active task's stored directive in a
+                        // fresh turn: no new instruction identity is minted
+                        // and the stored directive is not re-ingested.
+                        // Refusals (no active task, busy runtime, recovery
+                        // required) surface here; the started turn itself
+                        // is event-driven (`TaskContinuationStarted`).
+                        let handle = handle.clone();
+                        let notice_tx = notice_tx.clone();
+                        tokio::spawn(async move {
+                            if let Err(error) = handle.continue_active_task().await {
+                                let _ = notice_tx.try_send(format!("continue failed: {error}"));
+                            }
+                        });
                         continue;
                     }
 
@@ -640,16 +668,17 @@ async fn run_ui(
                         ));
                         continue;
                     }
-                    if app.busy {
-                        app.push_system(
-                            "Agent is busy; wait for the current turn to finish.".into(),
-                        );
-                        continue;
-                    }
+                    // Normal input always goes to the runtime: an idle
+                    // runtime starts a turn, a busy one queues it in the
+                    // existing single dialogue slot. The command reply plus
+                    // the `UserInput` lifecycle events own the visible
+                    // disposition (queued / applied / rejected) — the UI no
+                    // longer drops input on its own busy guess.
                     let handle = handle.clone();
+                    let notice_tx = notice_tx.clone();
                     tokio::spawn(async move {
                         if let Err(error) = handle.user_message(input).await {
-                            tracing::error!(%error, "agent turn failed");
+                            let _ = notice_tx.try_send(format!("input not accepted: {error}"));
                         }
                     });
                 }
@@ -680,13 +709,15 @@ fn load_runtime_checkpoint(path: &std::path::Path) -> anyhow::Result<RuntimeChec
 
 /// The product command list `/help` renders. Kept in one place so the
 /// welcome hint and the help output cannot drift apart.
-const HELP_LINES: [&str; 14] = [
+const HELP_LINES: [&str; 16] = [
     "/focus <directive> - point the runtime at a task directive",
     "/pin <note> - pin a durable note into the working set",
     "/done <summary> - close the current task with a summary",
     "/context - inspect the selected working context",
     "/status - run, task anchor, recovery debts, last checkpoint",
     "/tasks - list the run's tasks",
+    "/task <id> - activate one task (no turn starts)",
+    "/continue - continue the active task's stored directive",
     "/checkpoint - save a runtime checkpoint now",
     "/checkpoints - list saved checkpoints (newest first)",
     "/restore <path> - restore one checkpoint in this session",
@@ -694,7 +725,7 @@ const HELP_LINES: [&str; 14] = [
     "/revoke <grant-id> - revoke one standing grant",
     "/suspend - suspend the active task at a safe point",
     "/cancel - cancel the in-flight turn",
-    "/quit - leave the TUI",
+    "/quit - leave the TUI (Esc clears the input, Ctrl-C quits)",
 ];
 
 /// Resume discovery: the newest saved checkpoint in the store. A missing

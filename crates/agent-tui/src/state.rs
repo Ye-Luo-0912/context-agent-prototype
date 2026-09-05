@@ -182,6 +182,10 @@ pub struct AppState {
     current_op: Option<(TurnId, OperationId, u64)>,
     /// Queued 然后 Applied 共用 input_id，避免用户气泡重复。
     last_shown_input_id: Option<RuntimeInputId>,
+    /// The input id currently sitting in the runtime's single dialogue
+    /// queue slot, so its later `Applied` record can be named as the
+    /// queued input running rather than a silent status flip.
+    queued_input_id: Option<RuntimeInputId>,
     /// Bounded event-derived status projection: the task the runtime
     /// currently anchors, and how many effect-ack debts remain unresolved.
     /// `/status` renders these; nothing here drives effects.
@@ -213,6 +217,7 @@ impl AppState {
             output_tokens: 0,
             current_op: None,
             last_shown_input_id: None,
+            queued_input_id: None,
             current_task: None,
             unresolved_ack_debts: 0,
             last_checkpoint: None,
@@ -365,10 +370,28 @@ impl AppState {
                         self.push_message(UiRole::User, input.preview.clone());
                     }
                     if input.is_applied() {
+                        // The queued slot reaching the applied state is a
+                        // visible disposition change, not just a status flip.
+                        if input
+                            .input_id
+                            .is_some_and(|id| self.queued_input_id == Some(id))
+                        {
+                            self.queued_input_id = None;
+                            self.push_system("queued input applied; running now".into());
+                        }
                         self.busy = true;
                         self.status = "working".into();
                         self.scroll = 0;
                     } else {
+                        if let Some(id) = input.input_id
+                            && self.queued_input_id != Some(id)
+                        {
+                            self.queued_input_id = Some(id);
+                            self.push_system(
+                                "input queued; it runs after the current turn (/cancel stops the turn)"
+                                    .into(),
+                            );
+                        }
                         self.status = "queued".into();
                     }
                 } else if input.lifecycle == agent_contracts::InputLifecycle::Rejected {
@@ -1262,6 +1285,48 @@ mod tests {
         assert_eq!(user_bubbles.len(), 1);
         assert_eq!(user_bubbles[0].content, "later");
         assert!(app.busy);
+    }
+
+    #[test]
+    fn queued_input_transitions_render_explicit_disposition_lines() {
+        let mut app = AppState::new(RunId::new());
+        let id = RuntimeInputId::new();
+        let mut queued = agent_contracts::RuntimeInputEnvelope::from_preview("later");
+        queued.input_id = Some(id);
+        queued.lifecycle = agent_contracts::InputLifecycle::Queued;
+        app.apply_runtime_event(envelope(RuntimeEvent::UserMessageAccepted {
+            input: queued.clone(),
+        }));
+        assert_eq!(app.status, "queued");
+        assert!(
+            app.messages
+                .iter()
+                .any(|message| message.content.contains("input queued;")),
+            "queueing must be visible"
+        );
+
+        let mut applied = queued;
+        applied.lifecycle = agent_contracts::InputLifecycle::Applied;
+        app.apply_runtime_event(envelope(RuntimeEvent::UserMessageAccepted {
+            input: applied,
+        }));
+        assert!(app.busy);
+        assert_eq!(app.status, "working");
+        assert!(
+            app.messages
+                .iter()
+                .any(|message| message.content.contains("queued input applied")),
+            "the queued slot reaching the applied state must be named"
+        );
+        // Exactly one disposition line per transition: a re-Queued replay of
+        // the same id must not stack duplicate notices.
+        assert_eq!(
+            app.messages
+                .iter()
+                .filter(|message| message.content.contains("input queued;"))
+                .count(),
+            1
+        );
     }
 }
 
