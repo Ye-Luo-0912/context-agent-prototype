@@ -1,27 +1,20 @@
 {
   "schema": "project-state.v1",
-  "updated": "2026-09-06",
-  "maintained_by": "CURRENT.md and NEXT_TASKS.md record the active product route; the existing document-consistency script checks structure/links, not semantic equivalence or future CI success",
-  "head_commit": "12c86283b8d5991e9f17a07f14871dcf39d65066",
-  "code_commit": "12c86283b8d5991e9f17a07f14871dcf39d65066",
+  "updated": "2026-09-05",
+  "maintained_by": "hand until the CI document-consistency gate lands; README.md and docs/CURRENT.md current-status text must be verified against this file",
+  "head_commit": "(refresh after doc commit)",
+  "code_commit": "050aa8e68f59c49d42b95e2a4d38fa37234a1e78",
   "ci": {
     "head_commit": "green",
-    "head_run_id": 33986702977,
-    "last_green_commit": "12c86283b8d5991e9f17a07f14871dcf39d65066",
-    "code_commit": "green",
-    "verified_source_commit": "12c86283b8d5991e9f17a07f14871dcf39d65066",
-    "observation": "GitHub Actions run completed/success; all six jobs succeeded",
-    "scope": "remote CI on the named source only; not local validation or future commits"
+    "head_run_id": 33898496334,
+    "last_green_commit": "33081b40debd4a022691b3a7ae70d67977d5e677",
+    "code_commit": "green"
   },
   "milestone_gates": {
     "m15_real_evaluation": "closed",
     "next_ordered": [
-      "F1 continuation and visible queued input",
-      "F2 practical task checklist",
-      "F3 bounded long tasks and cancellable verification",
-      "F4 change review and delivery summary",
-      "F5 practical multi-file context and search",
-      "F6 three real product walkthroughs"
+      "LT-EVAL-06 evaluation breadth",
+      "packaged V1 release gate"
     ],
     "lt_eval_06": {
       "status": "evidence banked 2026-09-05",
@@ -54,7 +47,7 @@
     }
   },
   "product_stage": "alpha",
-  "product_phase": "daily-coding-workflow",
+  "product_phase": "phase-2-reliable-local-agent-alpha",
   "phase_2_started": "2026-09-04",
   "phase_2_slices_landed": [
     "checked model configuration: AGENT_DEMO=1 selects the mock explicitly, a missing OPENAI_API_KEY is a visible startup error (32ea622)",
@@ -82,12 +75,8 @@
   ],
   "branch_protection": false,
   "next_ordered": [
-    "F1 continuation and visible queued input",
-    "F2 practical task checklist",
-    "F3 bounded long tasks and cancellable verification",
-    "F4 change review and delivery summary",
-    "F5 practical multi-file context and search",
-    "F6 three real product walkthroughs"
+    "packaged V1 release gate (package workflow 33983799960 dispatched)",
+    "V1 freeze: version/tag/release notes"
   ],
   "release": {
     "version": "0.1.0",
@@ -98,36 +87,6 @@
     "assets": [
       "agent-tui-v0.1.0-linux.zip",
       "agent-tui-v0.1.0-windows.zip"
-    ]
-  },
-  "previous_status_snapshot": {
-    "head_commit": "(refresh after doc commit)",
-    "code_commit": "050aa8e68f59c49d42b95e2a4d38fa37234a1e78",
-    "ci": {
-      "head_commit": "green",
-      "head_run_id": 33898496334,
-      "last_green_commit": "33081b40debd4a022691b3a7ae70d67977d5e677",
-      "code_commit": "green"
-    },
-    "next_ordered": [
-      "packaged V1 release gate (package workflow 33983799960 dispatched)",
-      "V1 freeze: version/tag/release notes"
-    ]
-  },
-  "reviewed_source_commit": "12c86283b8d5991e9f17a07f14871dcf39d65066",
-  "source_scope_note": "Fixed reviewed source, not the SHA of the later documentation commit. Repository-wide architecture/delta review; not an exhaustive per-file safety audit. No local Rust build or test was run in this review.",
-  "active_task": "F1",
-  "route_reset": {
-    "task_document": "docs/NEXT_TASKS.md",
-    "archive": "docs/archive/route-reset-12c8628",
-    "feature_status": "F1-F6 pending; applying documentation implements no product feature",
-    "D0_remaining": "update README route links, add NEXT_TASKS to existing LIVE_DOCS, run doc checks",
-    "research_not_a_product_prerequisite": [
-      "M15 rerun",
-      "Frame-3",
-      "Chronicle",
-      "TaskGraph",
-      "new GC/ranking algorithms"
     ]
   }
 }
