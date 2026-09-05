@@ -31,6 +31,10 @@ fn usage() -> ! {
          forbidden (stale) facts leaked. The completion-quality proxy that\n\
          needs no model.\n\
          \n\
+         usage: agent-replay --run-summary <trace.jsonl> [more.jsonl...]         
+         RUN-PROJECTION: fold each trace into the smallest rebuildable         run/task projection - lifecycle, per-task goals and outcomes,         checkpoint index, recovery debts and costs. Read-only and         disposable; never a second authority.         
+         usage: agent-replay --frame-gate <trace.jsonl> [more.jsonl...]         
+         Frame-2 scripted gate: enforce the manifest invariants (no         duplicate bodies, external refs stay descriptors, bounded content,         zone stats consistent) over every recorded ContextFrameShadow         manifest in the traces. Exits non-zero on any violation.         
          usage: agent-replay --frame-report <trace.jsonl> [more.jsonl...]         
          Frame-1 offline comparison: fold ContextFrameShadow manifests and         ModelStarted prompt-layer costs out of traces captured with the         shadow_context_frame flag on, and print the per-round context-layer         vs structured-frame cost table, dedup and required-miss totals.         
          usage: agent-replay --recover <trace.jsonl> [--engine dynamic|append|rolling]\n\
@@ -133,6 +137,49 @@ async fn main() -> anyhow::Result<()> {
         let report = recovery_replay_file(Path::new(&path), &config, engine_kind).await?;
         print!("{}", render_recovery_report(&report));
         return Ok(());
+    }
+
+    if first == "--run-summary" {
+        let mut paths: Vec<std::path::PathBuf> = Vec::new();
+        for arg in args.by_ref() {
+            if arg.starts_with('-') {
+                eprintln!("unknown argument: {arg}");
+                usage();
+            }
+            paths.push(std::path::PathBuf::from(arg));
+        }
+        if paths.is_empty() {
+            eprintln!("--run-summary needs at least one trace file");
+            usage();
+        }
+        for summary in agent_replay::run_summaries_from_files(&paths)? {
+            print!("{}", agent_replay::render_run_summary(&summary));
+        }
+        return Ok(());
+    }
+
+    if first == "--frame-gate" {
+        let mut paths: Vec<std::path::PathBuf> = Vec::new();
+        for arg in args.by_ref() {
+            if arg.starts_with('-') {
+                eprintln!("unknown argument: {arg}");
+                usage();
+            }
+            paths.push(std::path::PathBuf::from(arg));
+        }
+        if paths.is_empty() {
+            eprintln!("--frame-gate needs at least one trace file");
+            usage();
+        }
+        let violations = agent_replay::gate_frame_traces(&paths)?;
+        if violations.is_empty() {
+            println!("frame gate: all recorded manifests uphold the invariants");
+            return Ok(());
+        }
+        for violation in &violations {
+            eprintln!("frame gate violation: {violation}");
+        }
+        anyhow::bail!("frame gate failed with {} violation(s)", violations.len());
     }
 
     if first == "--frame-report" {

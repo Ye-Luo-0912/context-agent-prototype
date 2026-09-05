@@ -18,6 +18,7 @@ contract.
 | [`AUDIT_TODO.md`](AUDIT_TODO.md) | Confirmed defect queue |
 | [`M15_ACCEPTANCE.md`](M15_ACCEPTANCE.md) | Frozen formal-window semantics |
 | [`CURRENT.md`](CURRENT.md) + [`state.json`](state.json) | Live state snapshot and the machine-readable source of current numbers |
+| [`COMPATIBILITY.md`](COMPATIBILITY.md) | Cross-version compatibility statement (checkpoints, events, wire profile) |
 
 ## Now
 

@@ -21,6 +21,7 @@ mod facts;
 mod frame_report;
 mod frontier;
 mod recovery;
+mod run_summary;
 mod scenarios;
 
 use std::{
@@ -53,6 +54,9 @@ pub use recovery::{
     analyze_barrier, analyze_batch_interruptions, first_seq_gap, rebuild_engine_state,
     recovery_replay, recovery_replay_file, render_recovery_report, verify_restore_consistency,
     verify_runtime_restore_consistency,
+};
+pub use run_summary::{
+    RunTaskSummary, TaskSummaryRow, fold_run_summary, render_run_summary, run_summaries_from_files,
 };
 pub use scenarios::{
     Scenario, all_scenarios, compare_config, compare_scenario, engine_variants, render_comparison,

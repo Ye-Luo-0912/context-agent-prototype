@@ -1,0 +1,15 @@
+eval env: eval.env model=gpt-5.6-luna base=https://api.pinaic.com/v1 protocol=responses key=present
+evidence dir: crates/agent-eval/evidence/lt-eval-06
+== lt06 ltev_diagfix normal repeat 1/2 ==
+ltev_diagfix normal PASS profile=m15_v1 behavior=pass diff=pass closure=active continuation=n/a provider=healthy rounds=16+0 resumes=5 durables=5 trigger=edit.replace opp=off recovery=off task_progress=on settlement_projection=off settled=none
+== lt06 ltev_diagfix resume repeat 1/2 ==
+ltev_diagfix resume PASS profile=m15_v1 behavior=pass diff=pass closure=active continuation=restored_and_continued provider=healthy rounds=5+6 resumes=5 durables=5 trigger=edit.patch opp=off recovery=off task_progress=on settlement_projection=off settled=none
+== lt06 ltev_diagfix normal repeat 2/2 ==
+ltev_diagfix normal PASS profile=m15_v1 behavior=pass diff=pass closure=active continuation=n/a provider=healthy rounds=8+0 resumes=2 durables=2 trigger=edit.patch opp=off recovery=off task_progress=on settlement_projection=off settled=none
+== lt06 ltev_diagfix resume repeat 2/2 ==
+ltev_diagfix resume PASS profile=m15_v1 behavior=pass diff=pass closure=active continuation=restored_and_continued provider=healthy rounds=7+11 resumes=5 durables=5 trigger=fs.write opp=off recovery=off task_progress=on settlement_projection=off settled=none
+== lt06 ltev_migrate normal repeat 1/2 ==
+ltev_migrate normal PASS profile=m15_v1 behavior=pass diff=pass closure=active continuation=n/a provider=healthy rounds=7+0 resumes=3 durables=3 trigger=edit.patch opp=off recovery=off task_progress=on settlement_projection=off settled=none
+== lt06 ltev_migrate resume repeat 1/2 ==
+ltev_migrate resume PASS profile=m15_v1 behavior=pass diff=pass closure=active continuation=restored_and_continued provider=healthy rounds=6+6 resumes=4 durables=4 trigger=edit.patch opp=off recovery=off task_progress=on settlement_projection=off settled=none
+== lt06 ltev_migrate normal repeat 2/2 ==

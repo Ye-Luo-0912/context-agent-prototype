@@ -62,6 +62,11 @@ Formal verdicts live only in the immutable
   checksummed artifacts). All six Phase 2 alpha hardening blockers from
   the 2026-09-05 review are closed on source; the Context Frame route is
   at Frame-3-ready (live gate waits for `LT-EVAL-06` serving).
+  RUN-PROJECTION landed: `agent-replay --run-summary` folds a trace into
+  the smallest rebuildable run/task projection (lifecycle, tasks,
+  checkpoints, recovery debts, costs). [`COMPATIBILITY.md`](COMPATIBILITY.md)
+  declares the V1 cross-version contract (checkpoints, events, wire
+  profile, shadow frame).
 - Next product queue: [`LT-EVAL-06`] breadth on the product limits, then
   the V1 release gate rides the package workflow.
 - Default context is dynamic in-process. `context-service`,
