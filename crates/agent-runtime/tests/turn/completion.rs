@@ -3566,3 +3566,146 @@ async fn stale_proof_refusal_projects_a_final_verify_as_the_repair_action() {
     );
     instance.shutdown().await.unwrap();
 }
+
+/// A verifier whose first call returns the scripted PASS and whose later
+/// calls hang until their request token is armed: models a long host
+/// verification so the test can prove the actor bridges turn cancellation
+/// into the runner's token instead of only aborting the future.
+#[derive(Debug)]
+struct BridgeVerifier {
+    cancelled: Arc<std::sync::atomic::AtomicBool>,
+}
+
+#[async_trait::async_trait]
+impl agent_runtime::ProofVerifier for BridgeVerifier {
+    fn exact_recipe_for_domain(
+        &self,
+        declaration: &agent_contracts::VerificationCoverageDeclaration,
+    ) -> Option<String> {
+        (declaration == &completion_acceptance_declaration())
+            .then(|| "completion-fixture-recipe".into())
+    }
+
+    /// Models a long host verification: only an armed request token ends
+    /// the run, so the test proves the actor bridges turn cancellation into
+    /// the verifier instead of leaving it pending forever.
+    async fn verify_exact(
+        &self,
+        request: agent_runtime::ProofVerifierRequest,
+    ) -> AgentResult<agent_runtime::ProofVerifierOutcome> {
+        request.cancel.cancelled().await;
+        self.cancelled
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        Err(AgentError::Tool(
+            "host verification cancelled by the dying turn".into(),
+        ))
+    }
+}
+
+/// Cancelling the turn while a deferred refresh runs must arm the
+/// verifier's cancellation token (the runner kills and reaps its process
+/// through it) and must never commit the parked proposal.
+#[tokio::test]
+async fn turn_cancellation_arms_the_deferred_verifier_token() {
+    let verifier = Arc::new(BridgeVerifier {
+        cancelled: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+    });
+    let model = Arc::new(ProofRefreshModel {
+        rounds: AtomicUsize::new(0),
+    });
+    let services = RuntimeServices::new(
+        CoreAuthorityConfig::default(),
+        Arc::new(TestContextEngine),
+        model,
+        Arc::new(ProofRefreshDispatcher),
+        Arc::new(PolicyApprovalGate::permissive()),
+        None,
+    )
+    .with_proof_verifier(verifier.clone())
+    .with_project_proof_refresh(true)
+    .with_defer_proof_refresh(true);
+    let mut host = ModuleHost::new();
+    host.start().await.expect("test module host starts");
+    let instance = RuntimeInstance::spawn(host, services);
+    let handle = instance.handle();
+    let mut events = handle.subscribe();
+    handle.start().await.unwrap();
+    handle
+        .set_focus("finish only with evidence".into())
+        .await
+        .unwrap();
+    let task_id = handle.list_tasks().await.unwrap()[0].id;
+    let patch = agent_runtime::AnchorPatch {
+        completion_policy: Some(agent_runtime::task::TaskCompletionPolicy::EvidenceRequired),
+        acceptance_criteria: Some(vec![agent_runtime::task::AcceptanceCriterion::declared(
+            "trusted completion fixture passes",
+            &completion_acceptance_declaration(),
+        )]),
+        ..agent_runtime::AnchorPatch::default()
+    };
+    handle.patch_task_anchor(task_id, 0, patch).await.unwrap();
+
+    // Turn 1: the model verifies the fixture (scripted PASS, receipt).
+    handle
+        .user_message("verify the fixture".into())
+        .await
+        .unwrap();
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+    while tokio::time::Instant::now() < deadline {
+        if let Ok(Ok(envelope)) =
+            tokio::time::timeout(Duration::from_millis(50), events.recv()).await
+            && matches!(envelope.event, RuntimeEvent::TurnCompleted)
+        {
+            break;
+        }
+    }
+
+    // Turn 2: the stale proof is the only blocker; the completion defers
+    // into the hanging background verifier.
+    handle
+        .user_message("now finish the task".into())
+        .await
+        .unwrap();
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+    loop {
+        let saw_deferral = {
+            if let Ok(Ok(envelope)) =
+                tokio::time::timeout(Duration::from_millis(50), events.recv()).await
+                && let RuntimeEvent::ToolFinished { output, .. } = envelope.event
+                && output.tool_name == "task.complete"
+                && output.metadata["refused"] == "deferred_proof_refresh"
+            {
+                true
+            } else {
+                false
+            }
+        };
+        if saw_deferral || tokio::time::Instant::now() > deadline {
+            assert!(
+                saw_deferral,
+                "the completion must defer while the verifier hangs"
+            );
+            break;
+        }
+    }
+
+    // Cancelling the dying turn must arm the verifier's token through the
+    // bridge, not merely abort the future.
+    handle.cancel_turn().await.unwrap();
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    while !verifier.cancelled.load(std::sync::atomic::Ordering::SeqCst) {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "turn cancellation never armed the deferred verifier's token"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+
+    let checkpoint = instance.checkpoint().await.unwrap();
+    assert!(
+        checkpoint.tasks.completed.is_empty(),
+        "a cancelled turn's parked completion must never commit"
+    );
+    assert!(checkpoint.current_task_id.is_some());
+    instance.shutdown().await.unwrap();
+}

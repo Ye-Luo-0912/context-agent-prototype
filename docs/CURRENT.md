@@ -92,6 +92,16 @@ search.grep，fs.list 未做。研究轨候选（片段身份/曝光账目、短
 装配边际收益、遮罩基线、SIEVE/TinyLFU 定位、词法特征贯通最终排序）已并入
 NEXT_TASKS，均不阻塞 F1–F4。
 
+续审四项发现已全部修复（2026-09-06，同日）：F3-6a 输出 EOF 后 select 继续
+守超时/取消（Unix+Windows 双平台测试带 watchdog）；F3-6b 验证 token 桥接
+Actor 取消——含 turn 让出后 parked 验证的 NoActiveTurn 路径——先武装再
+有界 join，不再裸 abort；F4 resync 最新优先/仅当前 run/重放水位/读取前
+限界，run_summary 按 entries+omitted 计数且混合 run 分段；shadow frame
+截断与去重分开计数。测试证据：tool-runtime 218（+3）、runtime actor 59 /
+turn 114（+1 桥接回归）/ instance 31 / lib 354（+1 frame 计数）、agent-tui
+26（resync 测试强化）、agent-replay 59（+2 真实事件测试）、agent-eval 221、
+agent-compose 31。
+
 ## 不在本轮
 
 新 GC/排序算法、Frame-3 正式输入翻转、向量检索、通用 Planner、Chronicle 数据库、TaskGraph、并行 worker、插件平台和自动自修改。

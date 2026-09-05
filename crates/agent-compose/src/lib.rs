@@ -756,6 +756,7 @@ mod tests {
                 verification_revision: 1,
                 directive_revision: 1,
                 workspace_revision: 1,
+                cancel: agent_contracts::CancellationToken::new(),
             })
             .await
             .unwrap();

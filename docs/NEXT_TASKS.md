@@ -30,8 +30,8 @@
 | D0 文档切换 | 已完成（2026-09-06，`a28a5b9`：包应用 + README 链接 + LIVE_DOCS + 文档检查绿） | 无 |
 | F1 继续执行与输入反馈 | 代码与定向测试已落地（2026-09-06，`c6fbbab`）；手工走查（恢复后 `/continue`、忙时排队处置）待做 | D0 |
 | F2 实用任务清单 | 代码与定向测试已落地（2026-09-06）：`/work`、`/plan`、`TaskPlanView` 只读查询、恢复保留清单回归；手工走查待做 | F1 |
-| F3 有界长任务与可取消验证 | 主体已落地（2026-09-06）：`--max-rounds=<N>`、预算停止安全点与 `/continue` 续段（`dee80fc`）、`--defer-proof` 选择加入；**续审新增待办：6a 输出 EOF 等待绕过超时/取消（process.rs/shell.rs）、6b 验证取消桥接（独立 token → Actor 取消信号）**；真实慢验证走查后改默认 | F1；与 F2 联调 |
-| F4 修改审阅与交付 | 主体已落地（2026-09-06）：`/review` 结果卡 + 持久化，原有用户修改不归属；**续审新增待办：resync_projection 取最旧 16 文件/不按 run 过滤/无重放水位/读取无界、run_summary 漏计 required misses**；双工作区走查待做 | F1；结合 F2/F3 |
+| F3 有界长任务与可取消验证 | 主体已落地（2026-09-06）：`--max-rounds=<N>`、预算停止安全点与 `/continue` 续段（`dee80fc`）、`--defer-proof` 选择加入；续审 6a/6b 已修（EOF 关闭后 select 仍守超时/取消；验证 token 桥接 Actor 取消，abort 前先杀树并回收）；真实慢验证走查后改默认 | F1；与 F2 联调 |
+| F4 修改审阅与交付 | 主体已落地（2026-09-06）：`/review` 结果卡 + 持久化，原有用户修改不归属；续审批次已修（resync 最新优先/仅当前 run/重放水位/读取前限界、run_summary 按 entries+omitted 计数并混 run 分段、shadow frame 截断与去重分开计数）；双工作区走查待做 | F1；结合 F2/F3 |
 | F5 多文件上下文与搜索 | 部分落地（2026-09-06）：保守可证明取代、错误仅 verify.run 清除、**search.grep** PARTIAL 覆盖标注（`fs.list` 的覆盖标注尚未做，前版状态过报已更正）；剩余：fs.read 区间事实贯通、fs.list 覆盖标注、冷读观测 | 已有可操作产品入口 |
 | F6 三类真实任务走查 | NOT_RUN（2026-09-06）：F1–F5 代码与确定性测试已落地，但走查需要操作者在真实 provider + 实际 TUI 的交互会话中完成，本执行环境无法替代；不假装 live 通过 | F1–F5 的所需路径 |
 
@@ -210,8 +210,8 @@ cargo check -p agent-tui
 4. `/continue` 开始新的执行段；不要自动循环绕过用户预算，不把普通 final 当成“必须继续到清单全部打钩”。**已落地，并有 `agent-compose/tests/route_flow.rs` 端到端验收。**
 5. 将已有 deferred proof 接入默认受支持 TUI 路径。先复用现有定向测试及一次真实慢验证，确认 turn-holding、取消与清理，之后才改变产品默认。**`--defer-proof` 选择加入已落地；默认改换仍等真实慢验证走查。**
 6. 重点核对：abort 一个 future 不等于子进程被杀死并回收。使用现有 ProcessSupervisor/取消/kill-then-reap 设施；迟到结果仍按 turn/generation/basis 拒绝。
-6a. **（续审新增，未做）输出 EOF 等待绕过超时/取消：** `tools/process.rs` 与 `tools/shell.rs` 在 `line_rx.recv() == None` 且进程未退出时，当前在分支内直接 `child.wait().await`，退出原 timeout/cancel 选择。子进程关闭 stdout/stderr 后仍运行即触发（探针见续审证据）。修法：置输出关闭标记并禁用 recv 分支，继续在原 select 等进程退出、超时或取消；不得对已关闭 receiver 反复轮询制造忙循环。用“关闭输出后继续运行”的有限测试覆盖 timeout/cancel，测试自带 watchdog。
-6b. **（续审新增，未做）验证取消桥接：** `HostProofVerifier` 当前给 runner 新建独立 CancellationToken；应把既有 Actor 取消信号接到 runner，清理完成后再报告完成。实际 `ProcessRunTool` 已有 ProcessTreeGuard，不重复造清理；也不把 JoinHandle.abort 等同于已回收。保持 turn/generation/证明 basis 检查。
+6a. **已修（2026-09-06）：** EOF 后置 `outputs_closed` 禁用 recv 分支，select 继续等进程退出/超时/取消；进程已回收时保留 EOF 快速返回。跨平台测试（Unix `exec 1>&-` 与 Windows kernel32 关句柄）覆盖 timeout 与 cancel，均带 watchdog。
+6b. **已修（2026-09-06）：** `ProofVerifierRequest` 携带 `cancel` token，`HostProofVerifier` 透传给 runner 的进程 select（kill-then-reap 复用现有路径）；turn 取消与 shutdown 先 arm token 再有界 join（5s），不再裸 abort——包括 turn 让出后的 parked 验证（`NoActiveTurn` 路径也会武装）。回归：取消挂起的 deferred 验证武装 token 且 parked 完成永不提交。
 7. 旧 inline 组合只在冻结实验/兼容需要时保留，不为了保持实验输入不变让普通产品永久停在旧实现。实验调用方显式保留原 flag。
 8. 暂停/取消不自动清空 open_loops、失败或 effect debt；计划和限制应真实可见。
 
@@ -245,12 +245,12 @@ cargo check -p agent-tui
 6. 非 Git 工作区也能显示已知修改文件；无法证明的归属或差异标为未知，不自动 git init。
 7. `StatusProjection` 继续是读模型。只修本功能需要的“当前/历史”字段区别，不重建 Chronicle。
 
-### 同批修复当前状态与离线汇总（续审新增，未做；不建新记录平台）
+### 同批修复当前状态与离线汇总（续审新增，已修 2026-09-06；不建新记录平台）
 
-- `AppState::resync_projection`（`crates/agent-tui/src/state.rs`）仅折叠当前 run 的日志：当前按 mtime 升序再 truncate(16) 实际取到**最旧** 16 个文件，应改为当前 run 精确路径或正确的有界最新候选；读取在分配前设限，不能先整文件读入再检查 32 MiB。
-- 对持久事件维护当前 run 的重放水位，避免磁盘重放后 broadcast 中相同事件再被重复折叠；保留 live-only delta 的既有语义，不粗暴过滤所有相同序列流片段；失败或截断明确显示 partial，不假称完全同步。
-- `agent-replay/src/run_summary.rs` 的 `required_misses` 读取不存在的 `total` JSON 字段后默认为零，标准事件的必需上下文缺失因此漏计；应按真实 `entries.len() + omitted` 计算或改用类型化 RuntimeEvent 解析。测试材料用真实 RuntimeEvent 序列化产物，覆盖两条 run、重复事件与有界读取。
-- Shadow Frame 观测口径（研究轨，随 F4 修不阻塞产品）：`crates/agent-runtime/src/frame.rs` 把 zone 上限截断与重复省略混计入 `duplicates_removed`；应分开计数重复、数量省略、预览截断，原文/预览/实际请求成本分开。不把它翻为正式 prompt，不阻塞 F1–F4。
+- `AppState::resync_projection`：已改为最新优先（降序取 16）、仅折叠当前 run 的日志、读取前用 `take` 限界（32 MiB，截断时只保留完整行并标 partial）。
+- 重放水位：resync 后记录已折叠的最大持久 seq，broadcast 重放同 seq 事件不再重复计入投影；live-only 的转录渲染语义保持不变；partial 在 Lagged 提示中如实标注。
+- `agent-replay/src/run_summary.rs`：`required_misses` 按 `entries.len() + omitted` 计算；混合 run 在 fold 内分段（id 变更即开新 summary，不并入第一条）。回归使用真实 `RuntimeEvent::ContextDegraded` 序列化产物（断言 wire 无 `total` 字段）与两条 run 分段。
+- Shadow Frame 观测口径已修：`duplicates_removed` 只计真实跨 zone 重复，zone 上限截断留在 zone stats 的 `omitted`，二者不再混计（回归：纯 cap 溢出时 duplicates=0）。不把它翻为正式 prompt，不阻塞 F1–F4。
 
 ### 验收
 

@@ -313,10 +313,11 @@ async fn run_ui(
                 Err(tokio::sync::broadcast::error::TryRecvError::Lagged(skipped)) => {
                     // A Lagged receiver dropped events it never saw. Hide
                     // nothing: name the loss, rebuild the projection from
-                    // the durable journal, and continue.
-                    let folded = app.resync_projection(&traces_dir).await;
+                    // the durable journal (current run only), and continue.
+                    let (folded, partial) = app.resync_projection(&traces_dir).await;
                     app.push_system(format!(
-                        "warning: the UI fell behind and dropped {skipped} runtime events; the status projection was resynced from the journal ({folded} events folded)"
+                        "warning: the UI fell behind and dropped {skipped} runtime events; the status projection was resynced from the journal ({folded} events folded){}",
+                        if partial { " — PARTIAL: a journal file was unreadable or truncated" } else { "" }
                     ));
                 }
                 Err(_) => break,

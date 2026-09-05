@@ -138,6 +138,10 @@ fn approx_tokens(text: &str) -> usize {
 struct ZoneAccumulator {
     blocks: Vec<FrameBlock>,
     omitted: usize,
+    /// True cross-zone duplicate suppressions — a body already retained
+    /// elsewhere in the manifest. Deliberately separate from `omitted`
+    /// (zone-cap overflow), so a full zone never reads as dedup gain.
+    duplicates: usize,
 }
 
 impl ZoneAccumulator {
@@ -150,6 +154,13 @@ impl ZoneAccumulator {
         }
         *total_blocks += 1;
         self.blocks.push(block);
+    }
+
+    /// Record a true cross-zone duplicate: the same body already retained
+    /// elsewhere in the manifest, so this block is suppressed as a
+    /// duplicate — never as a cap limit.
+    fn count_duplicate(&mut self) {
+        self.duplicates += 1;
     }
 
     fn stats(&self, zone: ContextZone) -> FrameZoneStats {
@@ -331,12 +342,12 @@ pub fn compile_shadow_frame(inputs: &ShadowFrameInputs<'_>) -> FrameManifest {
                 &mut total_blocks,
             );
         } else {
-            evidence.omitted += 1;
+            evidence.count_duplicate();
         }
     }
     for item in &inputs.materialized.items {
         if !seen.insert(content_digest(&item.content)) {
-            memory.omitted += 1;
+            memory.count_duplicate();
             continue;
         }
         memory.push(
@@ -364,7 +375,7 @@ pub fn compile_shadow_frame(inputs: &ShadowFrameInputs<'_>) -> FrameManifest {
     }
     external.omitted += entries.len().saturating_sub(MAX_BLOCKS_PER_ZONE);
 
-    let duplicates_removed = evidence.omitted + memory.omitted;
+    let duplicates_removed = evidence.duplicates + memory.duplicates;
     let zone_stats = [
         contract.stats(ContextZone::TaskContract),
         execution.stats(ContextZone::ExecutionState),
@@ -531,6 +542,35 @@ pub(crate) mod tests {
         assert!(first.blocks.iter().any(|b| b.source == "recovery.ack_debts"
             && b.representation == RepresentationClass::Descriptor));
         assert_eq!(first.frame_digest.len(), 64);
+    }
+
+    /// Zone-cap overflow is a capacity fact, not a dedup gain: a full
+    /// zone's omitted blocks must not inflate `duplicates_removed`.
+    #[test]
+    fn cap_omissions_are_not_counted_as_duplicates() {
+        let anchor = anchor();
+        let mut materialized = MaterializedContext::default();
+        for index in 0..12 {
+            materialized.foreground.push(item(
+                &format!("distinct evidence body {index}"),
+                "tool:fs.read",
+            ));
+        }
+        let manifest = compile_shadow_frame(&inputs(&anchor, &materialized));
+        assert_eq!(
+            manifest.duplicates_removed, 0,
+            "cap omissions are not duplicates"
+        );
+        let evidence_omitted = manifest
+            .zones
+            .iter()
+            .find(|stats| stats.zone == ContextZone::CurrentEvidence)
+            .expect("evidence zone stats")
+            .omitted;
+        assert!(
+            evidence_omitted >= 4,
+            "the zone cap must visibly omit the overflow: {evidence_omitted}"
+        );
     }
 
     #[test]

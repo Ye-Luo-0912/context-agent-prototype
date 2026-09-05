@@ -1019,6 +1019,12 @@ impl ProcessRunTool {
         let mut exited: Option<std::process::ExitStatus> = None;
         let mut grace_started = false;
         let mut outcome: &str = "completed";
+        // Set once both pipe readers ended: the recv arm is then disabled
+        // (a closed receiver would win every select poll) and the loop
+        // keeps waiting on exit, cancel or timeout. A process that closes
+        // stdout/stderr and keeps running must stay bounded by the same
+        // deadline and cancellation as every other run.
+        let mut outputs_closed = false;
 
         loop {
             tokio::select! {
@@ -1039,19 +1045,26 @@ impl ProcessRunTool {
                 }
                 status = child.wait(), if exited.is_none() => {
                     exited = Some(status.map_err(|e| AgentError::Tool(format!("wait: {e}")))?);
+                    if outputs_closed {
+                        // Output fully drained and the process reaped:
+                        // nothing left to wait for, skip the grace window.
+                        break;
+                    }
                     grace_started = true;
                 }
                 _ = &mut grace, if grace_started => break,
-                line = line_rx.recv() => {
+                line = line_rx.recv(), if !outputs_closed => {
                     match line {
                         Some(line) => {
                             capture.record(line, &mut artifact).await?;
                         }
                         None => {
-                            if exited.is_none() {
-                                exited = Some(child.wait().await.map_err(|e| AgentError::Tool(format!("wait: {e}")))?);
+                            if exited.is_some() {
+                                // Output drained and the process is
+                                // already reaped: the old fast path.
+                                break;
                             }
-                            break;
+                            outputs_closed = true;
                         }
                     }
                 }
@@ -2055,5 +2068,112 @@ mod tests {
             | EffectReconciliation::Ambiguous { .. }
             | EffectReconciliation::Applied { .. } => {}
         }
+    }
+
+    /// EOF-before-exit argv: the child closes stdout/stderr and keeps
+    /// running for 30 seconds. Windows closes the real std handles via
+    /// kernel32 (argv is passed without a shell, so the quoting is safe);
+    /// Unix uses the classic `exec 1>&-` fd close.
+    fn eof_before_exit_argv() -> Vec<String> {
+        #[cfg(windows)]
+        {
+            vec![
+                "powershell".into(),
+                "-NoProfile".into(),
+                "-Command".into(),
+                "$k=Add-Type -MemberDefinition '[DllImport(\"kernel32.dll\")] public static extern IntPtr GetStdHandle(int nStdHandle); [DllImport(\"kernel32.dll\")] public static extern bool CloseHandle(IntPtr hObject);' -Name K -Namespace W -PassThru; [void]$k::CloseHandle($k::GetStdHandle(-11)); [void]$k::CloseHandle($k::GetStdHandle(-12)); Start-Sleep 30".into(),
+            ]
+        }
+        #[cfg(not(windows))]
+        {
+            vec!["sh".into(), "-c".into(), "exec 1>&- 2>&-; sleep 30".into()]
+        }
+    }
+
+    #[tokio::test]
+    async fn process_run_output_eof_before_exit_still_times_out() {
+        let dir = tempfile::tempdir().unwrap();
+        let workspace = Workspace::open(dir.path()).await.unwrap();
+        let tool = ProcessRunTool::new(workspace.clone());
+        let run_id = RunId::new();
+        let arguments = json!({"argv": eof_before_exit_argv(), "timeout_ms": 8000});
+        let context = ctx(run_id, &arguments);
+        let started = std::time::Instant::now();
+        // Watchdog: the old code waited `child.wait()` inside the EOF arm,
+        // which would run the full 30s child and trip this bound.
+        let output = value(
+            tokio::time::timeout(
+                Duration::from_secs(20),
+                tool.execute(
+                    run_id,
+                    "c",
+                    arguments,
+                    Some(context),
+                    CancellationToken::new(),
+                ),
+            )
+            .await
+            .expect("EOF-before-exit must stay bounded by the timeout (watchdog tripped)")
+            .unwrap(),
+        );
+        let elapsed = started.elapsed();
+        assert!(
+            !output.ok,
+            "a timed-out process must report failure: {}",
+            output.summary
+        );
+        assert!(
+            output.summary.to_ascii_lowercase().contains("timed out"),
+            "the deadline arm must fire after output EOF: {}",
+            output.summary
+        );
+        assert!(
+            elapsed >= Duration::from_secs(6),
+            "the run must hold its budget: {elapsed:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn process_run_output_eof_before_exit_still_honors_cancellation() {
+        let dir = tempfile::tempdir().unwrap();
+        let workspace = Workspace::open(dir.path()).await.unwrap();
+        let tool = ProcessRunTool::new(workspace.clone());
+
+        let cancel = CancellationToken::new();
+        let cancel_for_task = cancel.clone();
+        let run_id = RunId::new();
+        let arguments = json!({"argv": eof_before_exit_argv(), "timeout_ms": 60000});
+        let context = ctx(run_id, &arguments);
+        let handle = tokio::spawn(async move {
+            let started = std::time::Instant::now();
+            let output = tool
+                .execute(run_id, "c", arguments, Some(context), cancel_for_task)
+                .await
+                .unwrap();
+            (output, started.elapsed())
+        });
+
+        // Give the child time to reach the handle-close (PowerShell's
+        // Add-Type cold start dominates); a cancel that lands earlier still
+        // passes through the same select, it just exercises the open-output
+        // path the existing cancellation test already covers.
+        tokio::time::sleep(Duration::from_secs(8)).await;
+        cancel.cancel();
+
+        let (output, elapsed) = tokio::time::timeout(Duration::from_secs(20), handle)
+            .await
+            .expect("tool did not stop after cancellation (watchdog tripped)")
+            .unwrap();
+        let output = value(output);
+        assert!(!output.ok, "cancelled process must report failure");
+        assert!(
+            output.summary.contains("cancel"),
+            "summary should mention cancellation: {}",
+            output.summary
+        );
+        assert!(
+            elapsed <= Duration::from_secs(12),
+            "EOF-before-exit must not delay cancellation: {elapsed:?}"
+        );
     }
 }

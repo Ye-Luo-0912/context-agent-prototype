@@ -42,6 +42,9 @@ const MAX_CARD_FILES: usize = 32;
 const MAX_CARD_CHECKS: usize = 32;
 const MAX_CARD_FAILURES: usize = 8;
 const MAX_CARD_LINE_CHARS: usize = 160;
+/// Per-file read cap for a projection resync (32 MiB), enforced by the
+/// reader before allocation.
+const RESYNC_FILE_BYTES: usize = 32 * 1024 * 1024;
 
 /// One file a mutating tool wrote this session, identified by the
 /// structured `metadata.path` the tool stamped — never parsed from prose.
@@ -275,6 +278,10 @@ pub struct AppState {
     /// Workspace state dir (`.focus-agent`), used to persist the latest
     /// result card as a small JSON artifact at task completion.
     pub state_dir: Option<std::path::PathBuf>,
+    /// Highest durable sequence of this run already folded from the
+    /// journal by a resync. Live events at or below it are skipped by the
+    /// projection fold so a post-resync replay never double-counts.
+    resynced_through_seq: Option<u64>,
 }
 
 impl AppState {
@@ -307,6 +314,7 @@ impl AppState {
             execution_budget: None,
             result_card: ResultCard::default(),
             state_dir: None,
+            resynced_through_seq: None,
             status_projection: agent_runtime::status::StatusProjection::default(),
         }
     }
@@ -352,11 +360,16 @@ impl AppState {
 
     /// Rebuild the status projection from the durable trace journal after
     /// a broadcast Lagged: the folded projection is replaced with one
-    /// replayed from disk, so the view recovers instead of drifting.
-    /// Bounded: at most 16 newest journal files, 32 MiB each.
-    pub async fn resync_projection(&mut self, traces_dir: &std::path::Path) -> usize {
+    /// replayed from disk for THIS run only, so the view recovers instead
+    /// of drifting or blending other runs' state. Bounded: at most 16
+    /// NEWEST journal files, each read capped at 32 MiB before allocation.
+    /// Returns (folded count, partial) — partial means a candidate file
+    /// could not be read or was truncated at the cap, so the rebuilt
+    /// projection may be incomplete and must say so.
+    pub async fn resync_projection(&mut self, traces_dir: &std::path::Path) -> (usize, bool) {
+        use tokio::io::AsyncReadExt as _;
         let Ok(mut entries) = tokio::fs::read_dir(traces_dir).await else {
-            return 0;
+            return (0, false);
         };
         let mut files: Vec<(std::time::SystemTime, std::path::PathBuf)> = Vec::new();
         while let Ok(Some(entry)) = entries.next_entry().await {
@@ -374,27 +387,62 @@ impl AppState {
                 path,
             ));
         }
-        files.sort_by_key(|(modified, _)| *modified);
+        // Newest first: a resync wants THIS run's freshest journals, not a
+        // museum of the oldest ones.
+        files.sort_by_key(|(modified, _)| std::cmp::Reverse(*modified));
         files.truncate(16);
         self.status_projection = agent_runtime::status::StatusProjection::default();
         let mut folded = 0usize;
+        let mut max_seq: Option<u64> = None;
+        let mut partial = false;
         for (_, path) in &files {
-            let Ok(bytes) = tokio::fs::read(path).await else {
+            let Ok(file) = tokio::fs::File::open(path).await else {
+                partial = true;
                 continue;
             };
-            if bytes.len() > 32 * 1024 * 1024 {
+            // The size cap is enforced by the reader, before any
+            // allocation: a huge journal cannot blow up the UI's memory.
+            let mut bytes = Vec::new();
+            if file
+                .take(RESYNC_FILE_BYTES as u64 + 1)
+                .read_to_end(&mut bytes)
+                .await
+                .is_err()
+            {
+                partial = true;
                 continue;
             }
-            for line in String::from_utf8_lossy(&bytes).lines() {
-                if let Ok(envelope) =
-                    serde_json::from_str::<agent_contracts::RuntimeEventEnvelope>(line)
-                {
-                    self.status_projection.fold(&envelope.event);
-                    folded += 1;
+            if bytes.len() > RESYNC_FILE_BYTES {
+                partial = true;
+                bytes.truncate(RESYNC_FILE_BYTES);
+                // Keep only complete lines from the truncated prefix.
+                if let Some(pos) = bytes.iter().rposition(|byte| *byte == b'\n') {
+                    bytes.truncate(pos + 1);
+                } else {
+                    bytes.clear();
                 }
             }
+            for line in String::from_utf8_lossy(&bytes).lines() {
+                let Ok(envelope) =
+                    serde_json::from_str::<agent_contracts::RuntimeEventEnvelope>(line)
+                else {
+                    continue;
+                };
+                // Current run only: other runs' tasks, consumptions and
+                // completions must never blend into this run's status.
+                if envelope.run_id != self.run_id {
+                    continue;
+                }
+                self.status_projection.fold(&envelope.event);
+                folded += 1;
+                max_seq = max_seq.max(Some(envelope.seq));
+            }
         }
-        folded
+        // Replay watermark: durable events of this run at or below the
+        // folded sequence were just counted from disk; the live broadcast
+        // may still deliver them, and re-folding would double-count.
+        self.resynced_through_seq = max_seq;
+        (folded, partial)
     }
 
     pub fn push_system(&mut self, content: String) {
@@ -463,7 +511,18 @@ impl AppState {
     }
 
     pub fn apply_runtime_event(&mut self, envelope: RuntimeEventEnvelope) {
-        self.status_projection.fold(&envelope.event);
+        // Post-resync dedup: durable events at or below the resync
+        // watermark were already folded from the journal; re-folding the
+        // live replay of the same events would double-count the status
+        // projection. (Transcript rendering below is unaffected — only the
+        // fold is skipped.)
+        let already_folded = envelope.run_id == self.run_id
+            && self
+                .resynced_through_seq
+                .is_some_and(|watermark| envelope.seq <= watermark);
+        if !already_folded {
+            self.status_projection.fold(&envelope.event);
+        }
         match envelope.event {
             RuntimeEvent::RunStarted => self.status = "ready".into(),
             RuntimeEvent::UserMessageAccepted { input } => {
@@ -1879,21 +1938,14 @@ mod status_projection_tests {
 mod resync_tests {
     use super::*;
 
-    fn envelope(seq: u64, event: RuntimeEvent) -> RuntimeEventEnvelope {
-        RuntimeEventEnvelope {
-            run_id: RunId::new(),
-            seq,
-            timestamp_ms: seq,
-            event,
-        }
-    }
-
     #[tokio::test]
     async fn resync_rebuilds_the_projection_from_the_journal() {
         let dir = tempfile::tempdir().unwrap();
         let traces = dir.path().join("traces");
         std::fs::create_dir_all(&traces).unwrap();
-        // One journal file with a full folded history.
+        let mut app = AppState::new(RunId::new());
+        // One journal file with a full folded history for THIS run, plus a
+        // foreign-run file whose events must never blend in.
         let mut lines = Vec::new();
         for (seq, event) in [
             (1u64, RuntimeEvent::RunStarted),
@@ -1909,27 +1961,64 @@ mod resync_tests {
                 RuntimeEvent::ModelUsed {
                     input_tokens: 700,
                     output_tokens: 20,
-                    cached_input_tokens: 0,
                     attempts: 1,
                     retries: 0,
+                    cached_input_tokens: 0,
                 },
             ),
             (4u64, RuntimeEvent::TurnCompleted),
         ] {
-            lines.push(serde_json::to_string(&envelope(seq, event)).unwrap());
+            lines.push(
+                serde_json::to_string(&RuntimeEventEnvelope {
+                    run_id: app.run_id,
+                    seq,
+                    timestamp_ms: seq,
+                    event,
+                })
+                .unwrap(),
+            );
         }
         std::fs::write(traces.join("run.jsonl"), lines.join("\n")).unwrap();
-
-        let mut app = AppState::new(RunId::new());
-        let folded = app.resync_projection(&traces).await;
-        assert_eq!(folded, 4);
+        let foreign = RuntimeEventEnvelope {
+            run_id: RunId::new(),
+            seq: 1,
+            timestamp_ms: 1,
+            event: RuntimeEvent::FocusChanged {
+                task_id: TaskId::new(),
+                goal: "another run's goal".into(),
+            },
+        };
+        std::fs::write(
+            traces.join("newer-other-run.jsonl"),
+            serde_json::to_string(&foreign).unwrap(),
+        )
+        .unwrap();
+        let (folded, partial) = app.resync_projection(&traces).await;
+        assert!(!partial);
+        assert_eq!(folded, 4, "only the current run's events fold");
         let rendered = app.status_projection.lines().join("\n");
         assert!(rendered.contains("resynced goal"), "{rendered}");
         assert!(rendered.contains("turns=1"));
         assert!(rendered.contains("tokens: in=700"));
+        assert!(
+            !rendered.contains("another run's goal"),
+            "foreign-run state must not blend in: {rendered}"
+        );
+        // The replay watermark is now armed: re-delivering a folded event
+        // (same run, same seq) must not double-count the projection.
+        app.apply_runtime_event(RuntimeEventEnvelope {
+            run_id: app.run_id,
+            seq: 1,
+            timestamp_ms: 1,
+            event: RuntimeEvent::RunStarted,
+        });
+        let after = app.status_projection.lines().join("\n");
+        assert_eq!(after, rendered, "watermarked events are not re-folded");
+
         // An empty journal dir resets the projection to a blank fold.
         let empty = tempfile::tempdir().unwrap();
-        let folded = app.resync_projection(empty.path()).await;
+        let (folded, partial) = app.resync_projection(empty.path()).await;
+        assert!(!partial);
         assert_eq!(folded, 0);
         assert!(app.status_projection.lines()[0].contains("not started"));
     }

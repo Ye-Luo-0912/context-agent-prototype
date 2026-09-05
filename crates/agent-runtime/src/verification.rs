@@ -8,12 +8,14 @@
 //! PASS is only trusted when the host attribution for the same recipe
 //! agrees on the exact verification identity.
 
-use agent_contracts::{AgentResult, RunId, TaskId, VerificationCoverageDeclaration};
+use agent_contracts::{
+    AgentResult, CancellationToken, RunId, TaskId, VerificationCoverageDeclaration,
+};
 
 /// One bounded request to run the host-declared exact verifier for a
 /// recipe. The fence pre-state is included so the executor and Runtime
 /// agree on what world the check ran against.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone)]
 pub struct ProofVerifierRequest {
     pub run_id: RunId,
     pub task_id: TaskId,
@@ -24,6 +26,12 @@ pub struct ProofVerifierRequest {
     pub verification_revision: u64,
     pub directive_revision: u64,
     pub workspace_revision: u64,
+    /// Cancels the host verifier's process. The deferred refresh arms this
+    /// token so a dying turn kills and reaps the verification process tree
+    /// through the runner's own bounded loop instead of orphaning it; the
+    /// inline path runs inside the actor loop where it cannot be cancelled
+    /// and passes a token that is never fired.
+    pub cancel: CancellationToken,
 }
 
 /// Result of one host-side exact verification run.
