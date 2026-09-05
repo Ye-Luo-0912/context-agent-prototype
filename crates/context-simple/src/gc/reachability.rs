@@ -148,10 +148,12 @@ pub(crate) fn queue_error_verifications(
 }
 
 /// 同一文件路径的更新 **文件正文**（`fs.read` / unsourced replay header）
-/// 覆盖旧正文：语义死亡，热实体也不能把过期文件内容召回工作集。带
-/// `metadata.path` 的 `shell.exec` 只把路径写入身份索引，不是文件正文，
-/// 不得互相 supersede。按结构化路径精确匹配，回退到正文首行；不用实体
-/// 子串（`Session::start` 会把三个文件缠在一起）。
+/// 只有在能证明覆盖时才覆盖旧正文：内容修订不同（明确的过期边界），或
+/// 同一修订下新正文完整包含旧正文（新窗口覆盖旧窗口/全文重读）。同版本
+/// 的非重叠片段是互补证据，不得仅因路径相同被 supersede；缺修订或无法
+/// 证明覆盖时保守保留。带 `metadata.path` 的 `shell.exec` 只把路径写入
+/// 身份索引，不是文件正文，不得互相 supersede。按结构化路径精确匹配，
+/// 回退到正文首行；不用实体子串（`Session::start` 会把三个文件缠在一起）。
 pub(crate) fn queue_file_body_supersessions(state: &mut State, new_item: &ContextItem) {
     if !is_file_body_observation(new_item) {
         return;
@@ -160,7 +162,6 @@ pub(crate) fn queue_file_body_supersessions(state: &mut State, new_item: &Contex
         return;
     };
     let by_id = new_item.id;
-    let reason = format!("superseded by a newer observation of {path}");
     let is_same_file = |item: &ContextItem| -> bool {
         item.id != by_id
             && item.kind == ContextKind::ToolObservation
@@ -169,18 +170,24 @@ pub(crate) fn queue_file_body_supersessions(state: &mut State, new_item: &Contex
             && is_file_body_observation(item)
             && observation_file_path(item) == Some(path.as_str())
     };
+    let supersedes = |item: &ContextItem| -> bool { supersedes_file_body(new_item, item) };
+    let reason_for = |item: &ContextItem| -> String {
+        if supersedes_stale_revision(new_item, item) {
+            format!("superseded by a newer revision of {path}")
+        } else {
+            format!("superseded by a covering re-read of {path}")
+        }
+    };
     for item in &mut state.items {
-        if is_same_file(item) {
-            state
-                .pending_supersessions
-                .push((item.id, by_id, reason.clone()));
+        if is_same_file(item) && supersedes(item) {
+            let reason = reason_for(item);
+            state.pending_supersessions.push((item.id, by_id, reason));
         }
     }
     for item in &mut state.eviction_buffer {
-        if is_same_file(item) {
-            state
-                .pending_supersessions
-                .push((item.id, by_id, reason.clone()));
+        if is_same_file(item) && supersedes(item) {
+            let reason = reason_for(item);
+            state.pending_supersessions.push((item.id, by_id, reason));
         }
     }
     for entry in &state.external {
@@ -194,10 +201,39 @@ pub(crate) fn queue_file_body_supersessions(state: &mut State, new_item: &Contex
         if entry.file_path.as_deref() == Some(path.as_str())
             || entry.entities.iter().any(|entity| entity == &path)
         {
-            state
-                .pending_supersessions
-                .push((entry.item_id, by_id, reason.clone()));
+            // Stored entries carry no content revision, so staleness cannot
+            // be proven and the blob body is not loaded for a containment
+            // check: conservatively keep the stored fragment. It stays
+            // retrievable; a same-revision stored body is still valid, and
+            // an admitted one is compared like any resident body.
         }
+    }
+}
+
+/// A newer read supersedes an older body of the same file only when it
+/// proves coverage: a different content revision (explicit stale boundary)
+/// or a same-revision body that fully contains the older fragment's body.
+fn supersedes_file_body(new_item: &ContextItem, old: &ContextItem) -> bool {
+    supersedes_stale_revision(new_item, old) || supersedes_same_revision_body(new_item, old)
+}
+
+fn supersedes_stale_revision(new_item: &ContextItem, old: &ContextItem) -> bool {
+    match (&old.file_revision, &new_item.file_revision) {
+        (Some(old_rev), Some(new_rev)) => old_rev != new_rev,
+        _ => false,
+    }
+}
+
+/// Same content revision: the newer body supersedes the older one only when
+/// it literally contains it (a window covering the older window, or an
+/// identical re-read). Disjoint windows of one version coexist; unknown
+/// bodies are never proven and are kept.
+fn supersedes_same_revision_body(new_item: &ContextItem, old: &ContextItem) -> bool {
+    match (&old.file_revision, &new_item.file_revision) {
+        (Some(old_rev), Some(new_rev)) if old_rev == new_rev => {
+            !old.content.is_empty() && new_item.content.contains(&old.content)
+        }
+        _ => false,
     }
 }
 

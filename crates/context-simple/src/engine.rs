@@ -1028,7 +1028,12 @@ impl ContextEngine for SimpleContextEngine {
                             observation_id,
                         );
                     }
-                    if self.config.error_verification && ok {
+                    // Only the trusted verification recipe proves an error
+                    // fixed. A successful read or grep of an error-related
+                    // file is evidence the file exists, not that the error
+                    // is gone; entity overlap alone must never clear an
+                    // error into its terminal VerifiedFixed state.
+                    if self.config.error_verification && ok && output.tool_name == "verify.run" {
                         reachability::queue_error_verifications(
                             &mut state,
                             &content,
