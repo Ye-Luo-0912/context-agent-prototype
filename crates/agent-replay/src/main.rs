@@ -31,6 +31,8 @@ fn usage() -> ! {
          forbidden (stale) facts leaked. The completion-quality proxy that\n\
          needs no model.\n\
          \n\
+         usage: agent-replay --frame-report <trace.jsonl> [more.jsonl...]         
+         Frame-1 offline comparison: fold ContextFrameShadow manifests and         ModelStarted prompt-layer costs out of traces captured with the         shadow_context_frame flag on, and print the per-round context-layer         vs structured-frame cost table, dedup and required-miss totals.         
          usage: agent-replay --recover <trace.jsonl> [--engine dynamic|append|rolling]\n\
          \n\
          Crash-recovery replay (CORE-02): re-read the trace to locate the\n\
@@ -130,6 +132,24 @@ async fn main() -> anyhow::Result<()> {
         }
         let report = recovery_replay_file(Path::new(&path), &config, engine_kind).await?;
         print!("{}", render_recovery_report(&report));
+        return Ok(());
+    }
+
+    if first == "--frame-report" {
+        let mut paths: Vec<std::path::PathBuf> = Vec::new();
+        for arg in args.by_ref() {
+            if arg.starts_with('-') {
+                eprintln!("unknown argument: {arg}");
+                usage();
+            }
+            paths.push(std::path::PathBuf::from(arg));
+        }
+        if paths.is_empty() {
+            eprintln!("--frame-report needs at least one trace file");
+            usage();
+        }
+        let report = agent_replay::frame_report_from_files(&paths)?;
+        print!("{}", agent_replay::render_frame_report(&report));
         return Ok(());
     }
 

@@ -50,6 +50,8 @@ Formal verdicts live only in the immutable
   Shadow Context Frame Frame-0 landed: `agent-runtime::frame` compiles a
   zoned, classified manifest per model round behind the opt-in
   `shadow_context_frame` flag (measurement only; model input unchanged).
+  Frame-1 landed: `agent-replay --frame-report` compares the structured
+  frame against actual context-layer costs from flag-enabled traces.
 - Next product queue (order per [`ROADMAP.md`](ROADMAP.md#route-to-a-usable-local-agent)
   and the 2026-09-05 code review, [`reviews/2026-09-05-code-review.md`](reviews/2026-09-05-code-review.md)):
   Linux dist validation, install notes, packaged-binary CI smoke and

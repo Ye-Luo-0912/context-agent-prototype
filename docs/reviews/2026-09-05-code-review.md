@@ -302,8 +302,12 @@ Any split should follow transaction boundaries, not line counts.
    (`context-frame-shadow/v1`), emitted as `RuntimeEvent::ContextFrameShadow`
    behind the opt-in `shadow_context_frame` compose flag. Model input is
    byte-identical with the flag on or off; the product-flow acceptance
-   asserts the manifest reaches the event stream. Frame-1 (offline replay
-   cost comparison) and Frame-2 (scripted gate) remain.
+   asserts the manifest reaches the event stream. **Frame-1 landed the
+   same day**: `agent-replay --frame-report <traces...>` folds
+   `ContextFrameShadow` manifests against `ModelStarted` prompt-layer
+   costs from flag-enabled captures and prints the per-round
+   context-layer vs structured-frame table with dedup/miss totals and
+   zone breakdown. Frame-2 (scripted gate) remains.
    Structured Context Frame (`ContextFrameCompiler`) was sequenced as
    shadow/audit only after the Phase 2 shell is coherent.
 
