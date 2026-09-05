@@ -13,3 +13,21 @@ ltev_migrate normal PASS profile=m15_v1 behavior=pass diff=pass closure=active c
 == lt06 ltev_migrate resume repeat 1/2 ==
 ltev_migrate resume PASS profile=m15_v1 behavior=pass diff=pass closure=active continuation=restored_and_continued provider=healthy rounds=6+6 resumes=4 durables=4 trigger=edit.patch opp=off recovery=off task_progress=on settlement_projection=off settled=none
 == lt06 ltev_migrate normal repeat 2/2 ==
+ltev_migrate normal PASS profile=m15_v1 behavior=pass diff=pass closure=active continuation=n/a provider=healthy rounds=8+0 resumes=5 durables=5 trigger=edit.patch opp=off recovery=off task_progress=on settlement_projection=off settled=none
+== lt06 ltev_migrate resume repeat 2/2 ==
+ltev_migrate resume PASS profile=m15_v1 behavior=pass diff=pass closure=active continuation=restored_and_continued provider=healthy rounds=6+5 resumes=3 durables=3 trigger=edit.patch opp=off recovery=off task_progress=on settlement_projection=off settled=none
+== lt06 harness_maint_dev normal repeat 1/2 ==
+harness_maint_dev normal PASS profile=m15_v1 behavior=pass diff=pass closure=active continuation=n/a provider=healthy rounds=12+0 resumes=3 durables=3 trigger=fs.write opp=off recovery=off task_progress=on settlement_projection=off settled=none
+== lt06 harness_maint_dev resume repeat 1/2 ==
+harness_maint_dev resume PASS profile=m15_v1 behavior=pass diff=pass closure=active continuation=restored_and_continued provider=healthy rounds=7+6 resumes=4 durables=4 trigger=edit.patch opp=off recovery=off task_progress=on settlement_projection=off settled=none
+== lt06 harness_maint_dev normal repeat 2/2 ==
+harness_maint_dev normal PASS profile=m15_v1 behavior=pass diff=pass closure=active continuation=n/a provider=healthy rounds=10+0 resumes=5 durables=5 trigger=edit.patch opp=off recovery=off task_progress=on settlement_projection=off settled=none
+== lt06 harness_maint_dev resume repeat 2/2 ==
+harness_maint_dev resume PASS profile=m15_v1 behavior=pass diff=pass closure=active continuation=restored_and_continued provider=healthy rounds=7+6 resumes=4 durables=4 trigger=edit.patch opp=off recovery=off task_progress=on settlement_projection=off settled=none
+== running engine: dynamic ==
+  engine               input_tok  output_tok user_turns  passed  note
+  dynamic                 123159         627         20     yes  
+    final: Q1: 至少 24 个字符  
+Q2: PostgreSQL
+    (non-product-equivalent harness composition)
+EXIT=0

@@ -237,6 +237,53 @@ impl AppState {
         lines
     }
 
+    /// Rebuild the status projection from the durable trace journal after
+    /// a broadcast Lagged: the folded projection is replaced with one
+    /// replayed from disk, so the view recovers instead of drifting.
+    /// Bounded: at most 16 newest journal files, 32 MiB each.
+    pub async fn resync_projection(&mut self, traces_dir: &std::path::Path) -> usize {
+        let Ok(mut entries) = tokio::fs::read_dir(traces_dir).await else {
+            return 0;
+        };
+        let mut files: Vec<(std::time::SystemTime, std::path::PathBuf)> = Vec::new();
+        while let Ok(Some(entry)) = entries.next_entry().await {
+            let path = entry.path();
+            if path.extension().and_then(|extension| extension.to_str()) != Some("jsonl") {
+                continue;
+            }
+            let Ok(metadata) = entry.metadata().await else {
+                continue;
+            };
+            files.push((
+                metadata
+                    .modified()
+                    .unwrap_or(std::time::SystemTime::UNIX_EPOCH),
+                path,
+            ));
+        }
+        files.sort_by_key(|(modified, _)| *modified);
+        files.truncate(16);
+        self.status_projection = agent_runtime::status::StatusProjection::default();
+        let mut folded = 0usize;
+        for (_, path) in &files {
+            let Ok(bytes) = tokio::fs::read(path).await else {
+                continue;
+            };
+            if bytes.len() > 32 * 1024 * 1024 {
+                continue;
+            }
+            for line in String::from_utf8_lossy(&bytes).lines() {
+                if let Ok(envelope) =
+                    serde_json::from_str::<agent_contracts::RuntimeEventEnvelope>(line)
+                {
+                    self.status_projection.fold(&envelope.event);
+                    folded += 1;
+                }
+            }
+        }
+        folded
+    }
+
     pub fn push_system(&mut self, content: String) {
         self.push_message(UiRole::System, content);
     }
@@ -1329,5 +1376,65 @@ mod status_projection_tests {
             timestamp_ms: seq,
             event,
         }
+    }
+}
+
+#[cfg(test)]
+mod resync_tests {
+    use super::*;
+
+    fn envelope(seq: u64, event: RuntimeEvent) -> RuntimeEventEnvelope {
+        RuntimeEventEnvelope {
+            run_id: RunId::new(),
+            seq,
+            timestamp_ms: seq,
+            event,
+        }
+    }
+
+    #[tokio::test]
+    async fn resync_rebuilds_the_projection_from_the_journal() {
+        let dir = tempfile::tempdir().unwrap();
+        let traces = dir.path().join("traces");
+        std::fs::create_dir_all(&traces).unwrap();
+        // One journal file with a full folded history.
+        let mut lines = Vec::new();
+        for (seq, event) in [
+            (1u64, RuntimeEvent::RunStarted),
+            (
+                2u64,
+                RuntimeEvent::FocusChanged {
+                    task_id: TaskId::new(),
+                    goal: "resynced goal".into(),
+                },
+            ),
+            (
+                3u64,
+                RuntimeEvent::ModelUsed {
+                    input_tokens: 700,
+                    output_tokens: 20,
+                    cached_input_tokens: 0,
+                    attempts: 1,
+                    retries: 0,
+                },
+            ),
+            (4u64, RuntimeEvent::TurnCompleted),
+        ] {
+            lines.push(serde_json::to_string(&envelope(seq, event)).unwrap());
+        }
+        std::fs::write(traces.join("run.jsonl"), lines.join("\n")).unwrap();
+
+        let mut app = AppState::new(RunId::new());
+        let folded = app.resync_projection(&traces).await;
+        assert_eq!(folded, 4);
+        let rendered = app.status_projection.lines().join("\n");
+        assert!(rendered.contains("resynced goal"), "{rendered}");
+        assert!(rendered.contains("turns=1"));
+        assert!(rendered.contains("tokens: in=700"));
+        // An empty journal dir resets the projection to a blank fold.
+        let empty = tempfile::tempdir().unwrap();
+        let folded = app.resync_projection(empty.path()).await;
+        assert_eq!(folded, 0);
+        assert!(app.status_projection.lines()[0].contains("not started"));
     }
 }

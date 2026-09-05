@@ -1,0 +1,19 @@
+{
+  "schema": "agent-eval.cell.v1",
+  "fixture_id": "ltev_diagfix",
+  "engine": "dynamic",
+  "repeat": 1,
+  "repeats": 2,
+  "live": true,
+  "tool_surface": "production",
+  "surface_digest": "9181b7ae9b3f0b5677bad8879cbb9ccf00babef107bf98c0ff040b5e1b7f41ba",
+  "fixture_sha256": "f867a1c5a10b65557bc520af8290e376b7839af664f635b6662e22139435b0bd",
+  "git_head": "721c981db6a6a93ae921aaba5b8fb68ce1ba7724",
+  "git_dirty": false,
+  "git_dirty_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+  "source_tree_digest": "993ee6d19f9199cc48c3456b21f2491a54906d726e1e7f52cde3fd80d129c354",
+  "openai_model": "gpt-5.6-luna",
+  "openai_base_url": "https://api.pinaic.com/v1",
+  "openai_protocol": "responses",
+  "openai_context_window": "128000"
+}

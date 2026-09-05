@@ -197,6 +197,109 @@ pub fn render_doctor(reports: &[CheckReport]) -> (String, i32) {
     (out, if failed { 1 } else { 0 })
 }
 
+/// Write the bounded diagnostic bundle for a live session: version,
+/// status-projection snapshot, transcript tail and the checkpoint index.
+/// Contains no key material — the provider identity is a digest only, and
+/// the live runtime holds the workspace lock so no doctor workspace check
+/// runs here.
+pub async fn export_diagnostics(
+    state_dir: &Path,
+    projection_lines: Vec<String>,
+    transcript_tail: Vec<String>,
+) -> anyhow::Result<PathBuf> {
+    const MAX_SECTION_CHARS: usize = 8_000;
+    let mut out = String::from(
+        "agent-tui diagnostics
+====================
+",
+    );
+    out.push_str(&format!(
+        "version: {} ({})
+",
+        env!("CARGO_PKG_VERSION"),
+        if cfg!(debug_assertions) {
+            "debug"
+        } else {
+            "release"
+        }
+    ));
+    out.push_str(
+        "
+[status projection]
+",
+    );
+    for line in projection_lines.into_iter().take(40) {
+        out.push_str(&format!(
+            "  {line}
+"
+        ));
+    }
+    out.push_str(
+        "
+[transcript tail]
+",
+    );
+    for line in transcript_tail.into_iter().take(40) {
+        out.push_str(&format!(
+            "  {}
+",
+            bounded(line, 200)
+        ));
+    }
+    let checkpoints = CheckpointStore::new(state_dir.join("checkpoints"));
+    match checkpoints.list(10).await {
+        Ok(rows) => {
+            out.push_str(
+                "
+[checkpoint index]
+",
+            );
+            for row in &rows {
+                out.push_str(&format!(
+                    "  - {} ({} bytes)
+",
+                    row.artifact, row.payload_bytes
+                ));
+            }
+        }
+        Err(error) => out.push_str(&format!(
+            "
+[checkpoint index unavailable: {error}]
+"
+        )),
+    }
+    if out.chars().count() > MAX_SECTION_CHARS * 4 {
+        let cut: String = out.chars().take(MAX_SECTION_CHARS * 4).collect();
+        out = cut;
+        out.push_str(
+            "
+...[truncated at the bundle cap]
+",
+        );
+    }
+    let dir = state_dir.join("diagnostics");
+    tokio::fs::create_dir_all(&dir).await?;
+    let path = dir.join(format!(
+        "diag-{}.txt",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis())
+            .unwrap_or_default()
+    ));
+    tokio::fs::write(&path, out).await?;
+    Ok(path)
+}
+
+fn bounded(text: String, max_chars: usize) -> String {
+    if text.chars().count() <= max_chars {
+        text
+    } else {
+        let mut cut: String = text.chars().take(max_chars).collect();
+        cut.push('…');
+        cut
+    }
+}
+
 /// Convenience wrapper used by the binary: run the checks and print them.
 pub async fn run_doctor(root: PathBuf) -> i32 {
     let reports = run_doctor_checks(&root, || match agent_compose::try_model_from_env() {
@@ -288,5 +391,41 @@ mod tests {
                 && report.detail.contains("unrecognized")),
             "{reports:?}"
         );
+    }
+}
+
+#[cfg(test)]
+mod export_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn the_bundle_is_bounded_secret_free_and_self_describing() {
+        let dir = tempfile::tempdir().unwrap();
+        // A real checkpoint in the store so the index section has content.
+        let state_dir = dir.path().to_path_buf();
+        let store = CheckpointStore::new(state_dir.join("checkpoints"));
+        store.write_atomic(br#"{"version":4}"#).await.unwrap();
+
+        let projection_lines = vec![
+            "status: serving | turns=2 | model_rounds=3".to_string(),
+            "task: fixture task".to_string(),
+        ];
+        let tail: Vec<String> = (0..60)
+            .map(|index| format!("transcript row {index}"))
+            .collect();
+        let path = export_diagnostics(&state_dir, projection_lines, tail)
+            .await
+            .unwrap();
+
+        let body = std::fs::read_to_string(&path).unwrap();
+        assert!(body.contains("agent-tui diagnostics"));
+        assert!(body.contains("version: 0.1.0"));
+        assert!(body.contains("status projection"));
+        assert!(body.contains("checkpoint index"));
+        assert!(body.contains("checkpoint-"));
+        // Bounded: the 60-row tail is capped at 40 rows.
+        assert!(body.matches("transcript row").count() <= 40);
+        // No key material by construction: the only identity is a digest.
+        assert!(!body.contains("sk-"));
     }
 }

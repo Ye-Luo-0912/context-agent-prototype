@@ -271,16 +271,20 @@ async fn run_ui(
     let (notice_tx, mut notice_rx) = tokio::sync::mpsc::channel::<String>(NOTICE_CHANNEL_CAP);
 
     loop {
+        let traces_dir = checkpoint_dir
+            .parent()
+            .map(|state_dir| state_dir.join("traces"))
+            .unwrap_or_else(|| checkpoint_dir.clone());
         loop {
             match runtime_events.try_recv() {
                 Ok(event) => app.apply_runtime_event(event),
                 Err(tokio::sync::broadcast::error::TryRecvError::Lagged(skipped)) => {
                     // A Lagged receiver dropped events it never saw. Hide
-                    // nothing: name the loss visibly, and note that the
-                    // folded projection below is also missing exactly
-                    // these events.
+                    // nothing: name the loss, rebuild the projection from
+                    // the durable journal, and continue.
+                    let folded = app.resync_projection(&traces_dir).await;
                     app.push_system(format!(
-                        "warning: the UI fell behind and dropped {skipped} runtime events; subsequent events continue below and /status does not include them"
+                        "warning: the UI fell behind and dropped {skipped} runtime events; the status projection was resynced from the journal ({folded} events folded)"
                     ));
                 }
                 Err(_) => break,
@@ -495,6 +499,29 @@ async fn run_ui(
                     if trimmed == "/status" {
                         for line in app.render_status() {
                             app.push_system(line);
+                        }
+                        continue;
+                    }
+                    if trimmed == "/diag-export" {
+                        let state_dir = checkpoint_dir
+                            .parent()
+                            .map(std::path::Path::to_path_buf)
+                            .unwrap_or_else(|| checkpoint_dir.clone());
+                        let projection_lines = app.status_projection.lines();
+                        let tail: Vec<String> = app
+                            .messages
+                            .iter()
+                            .rev()
+                            .take(40)
+                            .map(|message| message.content.clone())
+                            .collect();
+                        match doctor::export_diagnostics(&state_dir, projection_lines, tail).await {
+                            Ok(path) => {
+                                app.push_system(format!("diagnostics written: {}", path.display()))
+                            }
+                            Err(error) => {
+                                app.push_system(format!("diagnostics export failed: {error}"))
+                            }
                         }
                         continue;
                     }

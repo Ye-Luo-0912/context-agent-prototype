@@ -24,6 +24,21 @@ contract.
 
 ### Decision snapshot — 2026-09-04
 
+**LT-EVAL-06 breadth evidence (2026-09-05):** the first breadth run of the
+three development-twin fixtures completed **12/12 PASS, 0 NOT_RUN**
+(`evidence/lt-eval-06/`, clean worktree at `721c981`, PinAI
+`gpt-5.6-luna` serving, provider healthy in every cell): `ltev_diagfix`
+(unnamed-location diagnosis-and-fix) 4/4, `ltev_migrate` (multi-file
+API migration) 4/4, `harness_maint_dev` (harness maintenance) 4/4, all
+with exact-tuple restore-and-continue on the resume arms. Per the
+LT-EVAL-06 contract this validates keeping the simpler
+TaskAnchor + ExecutionState substrate across three independent task
+families; no TaskGraph or planning slice is opened. Evidence dirs are
+committed; normal and cold-resume twins were run fresh (not paired
+against a shared run).
+
+
+
 **Operator update (2026-09-04):** with the M15 gate parked on serving
 availability (PinAI region block / relay upstream), the operator directed
 work to continue on the product route without waiting for M15. Phase 2

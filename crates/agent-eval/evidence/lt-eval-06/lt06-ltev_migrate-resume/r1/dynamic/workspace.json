@@ -1,0 +1,14 @@
+{
+  "file_set_sha256": "97fdfce076092c431ffe7ae55ea41e781553cca3392dc5624990213bb4229410",
+  "files": 7,
+  "listed": [
+    "Cargo.toml",
+    "README.md",
+    "src/lib.rs",
+    "src/metrics.rs",
+    "src/scheduler.rs",
+    "src/worker.rs",
+    "tests/queue.rs"
+  ],
+  "sha256": "4bda5cd5778896ce89642fbb642e061f7c0d59a695a625d96be29742a483a410"
+}

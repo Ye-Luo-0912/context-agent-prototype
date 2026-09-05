@@ -1,0 +1,106 @@
+{
+  "schema": "retry-pilot-cell-v4",
+  "kind": "retry_pilot_oracle",
+  "fixture_id": "harness_maint_dev-normal",
+  "expected_edit": "",
+  "passed": true,
+  "replay_complete": true,
+  "assertions": [
+    {
+      "path": "REPORT.md",
+      "pred": "report names summarize_results and the not_run misclassification",
+      "needles": [],
+      "passed": true,
+      "file_exists": true
+    },
+    {
+      "path": "src/lib.rs",
+      "pred": "failed counts only Failed rows; NotRun has its own arm",
+      "needles": [],
+      "passed": true,
+      "file_exists": true
+    },
+    {
+      "path": "tests/report.rs",
+      "pred": "regression test locks the not_run classification",
+      "needles": [],
+      "passed": true,
+      "file_exists": true
+    }
+  ],
+  "files": [
+    {
+      "path": "Cargo.toml",
+      "exists": true,
+      "sha256": "f03e376b2636f45766acd7a2115456a3a4cbd4df5a6fa2e566c6ee88957b59dd",
+      "bytes": 105,
+      "truncated": false,
+      "body": "[package]\nname = \"evalkit\"\nversion = \"0.1.0\"\nedition = \"2021\"\n\n[lib]\npath = \"src/lib.rs\"\n\n[dependencies]\n"
+    },
+    {
+      "path": "src/lib.rs",
+      "exists": true,
+      "sha256": "86ab251fc01b6a9d32c35e4f64a9f3cd073e3ac4e872f818f65ab9969689f623",
+      "bytes": 2553,
+      "truncated": false,
+      "body": "//! Evaluation-harness regression summary.\n//!\n//! Documented contract: `summarize_results` classifies every row into\n//! `passed`, `failed` or `not_run`; `total` is the sum of the three, and a\n//! `not_run` row (a censored or unexecuted case) must never be counted as\n//! a failure.\n\n/// Outcome of one evaluated case.\n#[derive(Debug, Clone, Copy, PartialEq, Eq)]\npub enum CaseStatus {\n    /// Check passed.\n    Passed,\n    /// Check ran and failed.\n    Failed,\n    /// Check was never executed (censored/transport/unexecuted).\n    NotRun,\n}\n\n/// One evaluated case with its classification and a bounded detail line.\n#[derive(Debug, Clone, PartialEq, Eq)]\npub struct TestResult {\n    pub id: String,\n    pub status: CaseStatus,\n    pub detail: String,\n}\n\n/// Mechanical summary of a batch.\n#[derive(Debug, Clone, Copy, PartialEq, Eq)]\npub struct Summary {\n    pub total: usize,\n    pub passed: usize,\n    pub failed: usize,\n    pub not_run: usize,\n}\n\n/// Summarize a batch. `total` must equal `passed + failed + not_run`.\npub fn summarize_results(results: &[TestResult]) -> Summary {\n    let mut passed = 0;\n    let mut failed = 0;\n    let mut not_run = 0;\n    for result in results {\n        match result.status {\n            CaseStatus::Passed => passed += 1,\n            CaseStatus::Failed => failed += 1,\n            CaseStatus::NotRun => not_run += 1,\n        }\n    }\n    Summary {\n        total: results.len(),\n        passed,\n        failed,\n        not_run,\n    }\n}\n\n#[cfg(test)]\nmod tests {\n    use super::*;\n\n    fn row(id: &str, status: CaseStatus) -> TestResult {\n        TestResult {\n            id: id.to_string(),\n            status,\n            detail: String::new(),\n        }\n    }\n\n    #[test]\n    fn summarizes_passed_and_failed_rows() {\n        let summary = summarize_results(&[\n            row(\"a\", CaseStatus::Passed),\n            row(\"b\", CaseStatus::Failed),\n            row(\"c\", CaseStatus::Passed),\n        ]);\n        assert_eq!(summary.total, 3);\n        assert_eq!(summary.passed, 2);\n        assert_eq!(summary.failed, 1);\n        assert_eq!(summary.not_run, 0);\n    }\n\n    #[test]\n    fn preserves_not_run_classification_and_total_invariant() {\n        let summary = summarize_results(&[\n            row(\"passed\", CaseStatus::Passed),\n            row(\"failed\", CaseStatus::Failed),\n            row(\"not-run\", CaseStatus::NotRun),\n        ]);\n\n        assert_eq!((summary.passed, summary.failed, summary.not_run), (1, 1, 1));\n        assert_eq!(summary.total, summary.passed + summary.failed + summary.not_run);\n    }\n}\n"
+    },
+    {
+      "path": "tests/report.rs",
+      "exists": true,
+      "sha256": "f51ee4ea683c5ea0c3ed75a68b69a20673dcc005755fd385d252da937734f2e5",
+      "bytes": 985,
+      "truncated": false,
+      "body": "//! Model-visible integration coverage for the regression summary.\nuse evalkit::{summarize_results, CaseStatus, TestResult};\n\nfn row(id: &str, status: CaseStatus) -> TestResult {\n    TestResult {\n        id: id.to_string(),\n        status,\n        detail: String::new(),\n    }\n}\n\n#[test]\nfn batch_without_not_run_rows_adds_up() {\n    let summary = summarize_results(&[\n        row(\"a\", CaseStatus::Passed),\n        row(\"b\", CaseStatus::Failed),\n        row(\"c\", CaseStatus::Passed),\n    ]);\n    assert_eq!((summary.passed, summary.failed, summary.not_run), (2, 1, 0));\n}\n\n#[test]\nfn mixed_batch_keeps_not_run_out_of_failed_and_total_adds_up() {\n    let summary = summarize_results(&[\n        row(\"passed\", CaseStatus::Passed),\n        row(\"failed\", CaseStatus::Failed),\n        row(\"not-run\", CaseStatus::NotRun),\n    ]);\n\n    assert_eq!((summary.passed, summary.failed, summary.not_run), (1, 1, 1));\n    assert_eq!(summary.total, summary.passed + summary.failed + summary.not_run);\n}\n"
+    },
+    {
+      "path": "README.md",
+      "exists": true,
+      "sha256": "d5229514151c1ed5a826c8fd8deeb4b8b4d9d5084b05b014dcb4b4bb112071c5",
+      "bytes": 185,
+      "truncated": false,
+      "body": "# evalkit (maintenance fixture)\n\nEvaluation-harness regression summary: `summarize_results` classifies rows as `passed`, `failed` or `not_run`; `total` is the sum of the three classes.\n"
+    },
+    {
+      "path": "tests/report.rs",
+      "exists": true,
+      "sha256": "f51ee4ea683c5ea0c3ed75a68b69a20673dcc005755fd385d252da937734f2e5",
+      "bytes": 985,
+      "truncated": false,
+      "body": "//! Model-visible integration coverage for the regression summary.\nuse evalkit::{summarize_results, CaseStatus, TestResult};\n\nfn row(id: &str, status: CaseStatus) -> TestResult {\n    TestResult {\n        id: id.to_string(),\n        status,\n        detail: String::new(),\n    }\n}\n\n#[test]\nfn batch_without_not_run_rows_adds_up() {\n    let summary = summarize_results(&[\n        row(\"a\", CaseStatus::Passed),\n        row(\"b\", CaseStatus::Failed),\n        row(\"c\", CaseStatus::Passed),\n    ]);\n    assert_eq!((summary.passed, summary.failed, summary.not_run), (2, 1, 0));\n}\n\n#[test]\nfn mixed_batch_keeps_not_run_out_of_failed_and_total_adds_up() {\n    let summary = summarize_results(&[\n        row(\"passed\", CaseStatus::Passed),\n        row(\"failed\", CaseStatus::Failed),\n        row(\"not-run\", CaseStatus::NotRun),\n    ]);\n\n    assert_eq!((summary.passed, summary.failed, summary.not_run), (1, 1, 1));\n    assert_eq!(summary.total, summary.passed + summary.failed + summary.not_run);\n}\n"
+    }
+  ],
+  "commands": [
+    {
+      "argv": [
+        "cargo",
+        "test",
+        "--test",
+        "harness_maint_oracle"
+      ],
+      "expect_exit": 0,
+      "exit": 0,
+      "timed_out": false,
+      "stdout": "\nrunning 1 test\ntest not_run_is_separate_from_failed ... ok\n\ntest result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s\n\n",
+      "stderr": "   Compiling evalkit v0.1.0 (C:\\Users\\Ye_Luo\\AppData\\Local\\Temp\\.tmpKayZCj)\n    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.43s\n     Running tests\\harness_maint_oracle.rs (target\\debug\\deps\\harness_maint_oracle-62d9ba3945b660d7.exe)\n",
+      "stdout_truncated": false,
+      "stderr_truncated": false,
+      "passed": true
+    },
+    {
+      "argv": [
+        "cargo",
+        "test",
+        "--quiet"
+      ],
+      "expect_exit": 0,
+      "exit": 0,
+      "timed_out": false,
+      "stdout": "\nrunning 2 tests\n..\ntest result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s\n\n\nrunning 2 tests\n..\ntest result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s\n\n\nrunning 0 tests\n\ntest result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s\n\n",
+      "stderr": "\n(self-check over agent-authored tests; informational)",
+      "stdout_truncated": false,
+      "stderr_truncated": false,
+      "passed": true
+    }
+  ]
+}

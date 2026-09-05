@@ -1,0 +1,151 @@
+{
+  "schema": "retry-pilot-cell-v4",
+  "kind": "retry_pilot_oracle",
+  "fixture_id": "ltev_migrate-resume",
+  "expected_edit": "",
+  "passed": true,
+  "replay_complete": true,
+  "assertions": [
+    {
+      "path": "src/lib.rs",
+      "pred": "typed Job API defined; legacy methods removed",
+      "needles": [],
+      "passed": true,
+      "file_exists": true
+    },
+    {
+      "path": "src/worker.rs",
+      "pred": "worker migrated to the typed API",
+      "needles": [],
+      "passed": true,
+      "file_exists": true
+    },
+    {
+      "path": "src/scheduler.rs",
+      "pred": "scheduler migrated to the typed API",
+      "needles": [],
+      "passed": true,
+      "file_exists": true
+    },
+    {
+      "path": "src/metrics.rs",
+      "pred": "metrics free of legacy references",
+      "needles": [],
+      "passed": true,
+      "file_exists": true
+    },
+    {
+      "path": "tests/queue.rs",
+      "pred": "tests migrated to the typed API",
+      "needles": [],
+      "passed": true,
+      "file_exists": true
+    },
+    {
+      "path": "README.md",
+      "pred": "documented contract untouched",
+      "needles": [],
+      "passed": true,
+      "file_exists": true
+    }
+  ],
+  "files": [
+    {
+      "path": "Cargo.toml",
+      "exists": true,
+      "sha256": "adac7fa3065c8f1d8ed474053359eb451fb7ff624d73b0b534840c01c456d110",
+      "bytes": 107,
+      "truncated": false,
+      "body": "[package]\nname = \"taskqueue\"\nversion = \"0.1.0\"\nedition = \"2021\"\n\n[lib]\npath = \"src/lib.rs\"\n\n[dependencies]\n"
+    },
+    {
+      "path": "src/lib.rs",
+      "exists": true,
+      "sha256": "b6c23bb0c11128f94f181ac98627d3b6c97006ac3fc2bf2f6f99f8bcb4dd259a",
+      "bytes": 705,
+      "truncated": false,
+      "body": "//! A small FIFO job queue.\npub mod metrics;\npub mod scheduler;\npub mod worker;\n\n#[derive(Debug, Clone, PartialEq, Eq)]\npub struct Job {\n    pub name: String,\n    pub priority: u8,\n}\n\nimpl Job {\n    pub fn new(name: impl Into<String>, priority: u8) -> Self {\n        Self { name: name.into(), priority }\n    }\n}\n\n#[derive(Debug, Clone, PartialEq, Eq)]\npub struct Queue {\n    jobs: Vec<Job>,\n}\n\nimpl Queue {\n    pub fn new() -> Self {\n        Self { jobs: Vec::new() }\n    }\n\n    pub fn submit(&mut self, job: Job) {\n        self.jobs.push(job);\n    }\n\n    pub fn drain(&mut self) -> Vec<Job> {\n        std::mem::take(&mut self.jobs)\n    }\n\n    pub fn len(&self) -> usize {\n        self.jobs.len()\n    }\n}\n"
+    },
+    {
+      "path": "src/worker.rs",
+      "exists": true,
+      "sha256": "d4d545dfb0e4ac4118898f19165efd360fac06a25b0cb9950dc7706bc404f94e",
+      "bytes": 171,
+      "truncated": false,
+      "body": "//! Warmup + processing worker.\nuse crate::{Job, Queue};\n\npub fn process_all(queue: &mut Queue) -> Vec<Job> {\n    queue.submit(Job::new(\"warmup\", 0));\n    queue.drain()\n}\n"
+    },
+    {
+      "path": "src/scheduler.rs",
+      "exists": true,
+      "sha256": "754f96e301fd93b12e0383bd7492f5466391b727885771513d24030a59c45b98",
+      "bytes": 180,
+      "truncated": false,
+      "body": "//! Batch scheduling.\nuse crate::{Job, Queue};\n\npub fn enqueue_batch(queue: &mut Queue, names: &[&str]) {\n    for name in names {\n        queue.submit(Job::new(*name, 0));\n    }\n}\n"
+    },
+    {
+      "path": "src/metrics.rs",
+      "exists": true,
+      "sha256": "aa60b507fe924b6e7441fdf902db986524516c7ff8a732dbea5913168ca79109",
+      "bytes": 97,
+      "truncated": false,
+      "body": "//! Queue metrics.\nuse crate::Queue;\n\npub fn pending(queue: &Queue) -> usize {\n    queue.len()\n}\n"
+    },
+    {
+      "path": "tests/queue.rs",
+      "exists": true,
+      "sha256": "99911e1a7876516bf75c0f52f68d39520cc3a33dd46daca550e115ac2f9587aa",
+      "bytes": 356,
+      "truncated": false,
+      "body": "//! Typed FIFO queue coverage.\nuse taskqueue::{Job, Queue};\n\n#[test]\nfn fifo_order_is_preserved() {\n    let mut queue = Queue::new();\n    queue.submit(Job::new(\"a\", 1));\n    queue.submit(Job::new(\"b\", 2));\n    assert_eq!(queue.drain(), vec![Job::new(\"a\", 1), Job::new(\"b\", 2)]);\n    assert_eq!(queue.drain(), Vec::new());\n    assert_eq!(queue.len(), 0);\n}\n"
+    },
+    {
+      "path": "README.md",
+      "exists": true,
+      "sha256": "0968c182a57105c8708d21094c3b7a838d594873b7d75d36bbb26789cc6e30f8",
+      "bytes": 161,
+      "truncated": false,
+      "body": "taskqueue (migration fixture)\n\nQueue contract: FIFO. The typed Job API (`submit` / `drain`) replaces the legacy String methods; `len` reports the pending count.\n"
+    },
+    {
+      "path": "tests/queue.rs",
+      "exists": true,
+      "sha256": "99911e1a7876516bf75c0f52f68d39520cc3a33dd46daca550e115ac2f9587aa",
+      "bytes": 356,
+      "truncated": false,
+      "body": "//! Typed FIFO queue coverage.\nuse taskqueue::{Job, Queue};\n\n#[test]\nfn fifo_order_is_preserved() {\n    let mut queue = Queue::new();\n    queue.submit(Job::new(\"a\", 1));\n    queue.submit(Job::new(\"b\", 2));\n    assert_eq!(queue.drain(), vec![Job::new(\"a\", 1), Job::new(\"b\", 2)]);\n    assert_eq!(queue.drain(), Vec::new());\n    assert_eq!(queue.len(), 0);\n}\n"
+    }
+  ],
+  "commands": [
+    {
+      "argv": [
+        "cargo",
+        "test",
+        "--test",
+        "ltev_migrate_oracle"
+      ],
+      "expect_exit": 0,
+      "exit": 0,
+      "timed_out": false,
+      "stdout": "\nrunning 1 test\ntest typed_queue_drains_fifo_and_empties ... ok\n\ntest result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s\n\n",
+      "stderr": "   Compiling taskqueue v0.1.0 (C:\\Users\\Ye_Luo\\AppData\\Local\\Temp\\.tmpMrdGdV)\n    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.49s\n     Running tests\\ltev_migrate_oracle.rs (target\\debug\\deps\\ltev_migrate_oracle-eaca813dd1eaa906.exe)\n",
+      "stdout_truncated": false,
+      "stderr_truncated": false,
+      "passed": true
+    },
+    {
+      "argv": [
+        "cargo",
+        "test",
+        "--quiet"
+      ],
+      "expect_exit": 0,
+      "exit": 0,
+      "timed_out": false,
+      "stdout": "\nrunning 0 tests\n\ntest result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s\n\n\nrunning 1 test\n.\ntest result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s\n\n\nrunning 0 tests\n\ntest result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s\n\n",
+      "stderr": "\n(self-check over agent-authored tests; informational)",
+      "stdout_truncated": false,
+      "stderr_truncated": false,
+      "passed": true
+    }
+  ]
+}

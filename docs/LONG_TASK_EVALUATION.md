@@ -1318,6 +1318,15 @@ model autonomy.
 
 ## Post-M15 next phase task: `LT-EVAL-06` — representative development twins
 
+**First breadth run (2026-09-05):** 12/12 PASS, 0 NOT_RUN across all
+three task families on the PinAI `gpt-5.6-luna` serving
+(`evidence/lt-eval-06/`): every normal and cold-resume twin completed
+with behavior pass, allowed-diff pass, provider healthy and
+exact-tuple restore-and-continue. Rounds stayed bounded (single
+digits to low tens per cell). Per the contract above, this retains
+the simpler substrate: no TaskGraph, CPL or planning slice is opened
+by this evidence.
+
 Do not add another planner first. After formal M15, evaluate the frozen
 `LT-RUN-05` Runtime on longer but still oracle-checkable development work:
 

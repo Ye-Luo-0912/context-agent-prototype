@@ -1,0 +1,129 @@
+{
+  "schema": "retry-pilot-cell-v4",
+  "kind": "retry_pilot_oracle",
+  "fixture_id": "ltev_diagfix-normal",
+  "expected_edit": "",
+  "passed": true,
+  "replay_complete": true,
+  "assertions": [
+    {
+      "path": "DIAGNOSIS.md",
+      "pred": "report names rounding.rs, round_half_cent and the truncation mechanism",
+      "needles": [],
+      "passed": true,
+      "file_exists": true
+    },
+    {
+      "path": "src/rounding.rs",
+      "pred": "seed truncation is gone and the public signatures are unchanged",
+      "needles": [],
+      "passed": false,
+      "file_exists": true
+    },
+    {
+      "path": "tests/totals.rs",
+      "pred": "regression coverage for odd half-cent counts, positive and negative",
+      "needles": [],
+      "passed": false,
+      "file_exists": true
+    },
+    {
+      "path": "README.md",
+      "pred": "documented contract untouched",
+      "needles": [],
+      "passed": true,
+      "file_exists": true
+    }
+  ],
+  "files": [
+    {
+      "path": "Cargo.toml",
+      "exists": true,
+      "sha256": "f1f5c452b095c24f75b761f64c6c24cb4c76ac7f82393478db6b32999cf1e765",
+      "bytes": 108,
+      "truncated": false,
+      "body": "[package]\nname = \"receiptkit\"\nversion = \"0.1.0\"\nedition = \"2021\"\n\n[lib]\npath = \"src/lib.rs\"\n\n[dependencies]\n"
+    },
+    {
+      "path": "src/lib.rs",
+      "exists": true,
+      "sha256": "5a16990c2423d7f8d04b7826719cdec1417b0f0cf0cb0648607e90daef0568c3",
+      "bytes": 141,
+      "truncated": false,
+      "body": "//! Receipt pricing with documented half-cent rounding.\npub mod receipt;\npub mod rounding;\n\npub use rounding::{discounted, round_half_cent};\n"
+    },
+    {
+      "path": "src/rounding.rs",
+      "exists": true,
+      "sha256": "a81289cc7e1f2dab3a07df0cfb8b5e8858f10dc6ca450053bf98b5efd7216898",
+      "bytes": 658,
+      "truncated": false,
+      "body": "//! Half-cent rounding. Contract: half-cents round AWAY FROM ZERO\n//! (1 half -> 1 cent, 3 halves -> 2 cents, -3 halves -> -2 cents).\n\n/// Round a half-cent value to whole cents; half away from zero.\npub fn round_half_cent(halves: i64) -> i64 {\n    let whole = halves / 2;\n    if halves % 2 == 0 {\n        whole\n    } else if halves > 0 {\n        whole + 1\n    } else {\n        whole - 1\n    }\n}\n\n/// Discounted total in whole cents. The pricing engine computes the\n/// discounted amount in half-cents, so the rounding contract applies.\npub fn discounted(amount_cents: i64, percent: u32) -> i64 {\n    round_half_cent(amount_cents * (100 - percent as i64))\n}\n"
+    },
+    {
+      "path": "src/receipt.rs",
+      "exists": true,
+      "sha256": "5ff0d42e500c31504c96098052d46d600b630bfbd103b1ad1a1af9d46ad85849",
+      "bytes": 260,
+      "truncated": false,
+      "body": "//! Receipt rendering: the surface where the one-cent-low totals show up.\nuse crate::rounding::discounted;\n\n/// One discounted receipt line.\npub fn line(amount_cents: i64, percent: u32) -> String {\n    format!(\"total {}c\", discounted(amount_cents, percent))\n}\n"
+    },
+    {
+      "path": "tests/totals.rs",
+      "exists": true,
+      "sha256": "1efd8aa92cd0c64dcaf006c0ac5801c2c6ec31d73a5aac4536670eecf16a0216",
+      "bytes": 544,
+      "truncated": false,
+      "body": "//! Model-visible coverage for the pricing contract.\nuse receiptkit::{discounted, round_half_cent};\n\n#[test]\nfn even_half_cent_products_round_exactly() {\n    assert_eq!(round_half_cent(4), 2);\n    assert_eq!(round_half_cent(0), 0);\n    assert_eq!(discounted(200, 50), 5000);\n    assert_eq!(discounted(-200, 50), -5000);\n}\n\n#[test]\nfn odd_half_cent_products_round_away_from_zero() {\n    assert_eq!(round_half_cent(3), 2);\n    assert_eq!(round_half_cent(-3), -2);\n    assert_eq!(discounted(1, 49), 26);\n    assert_eq!(discounted(-1, 49), -26);\n}\n"
+    },
+    {
+      "path": "README.md",
+      "exists": true,
+      "sha256": "682ca3c958d9cce5b3f6cb3fa2f6690a7a9c46fb14ee229d08429201da3ee7b8",
+      "bytes": 187,
+      "truncated": false,
+      "body": "receiptkit (diagnosis fixture)\n\nPricing contract: discounts are computed in half-cents and half-cents round AWAY FROM ZERO (1 half -> 1 cent, 3 halves -> 2 cents, -3 halves -> -2 cents).\n"
+    },
+    {
+      "path": "tests/totals.rs",
+      "exists": true,
+      "sha256": "1efd8aa92cd0c64dcaf006c0ac5801c2c6ec31d73a5aac4536670eecf16a0216",
+      "bytes": 544,
+      "truncated": false,
+      "body": "//! Model-visible coverage for the pricing contract.\nuse receiptkit::{discounted, round_half_cent};\n\n#[test]\nfn even_half_cent_products_round_exactly() {\n    assert_eq!(round_half_cent(4), 2);\n    assert_eq!(round_half_cent(0), 0);\n    assert_eq!(discounted(200, 50), 5000);\n    assert_eq!(discounted(-200, 50), -5000);\n}\n\n#[test]\nfn odd_half_cent_products_round_away_from_zero() {\n    assert_eq!(round_half_cent(3), 2);\n    assert_eq!(round_half_cent(-3), -2);\n    assert_eq!(discounted(1, 49), 26);\n    assert_eq!(discounted(-1, 49), -26);\n}\n"
+    }
+  ],
+  "commands": [
+    {
+      "argv": [
+        "cargo",
+        "test",
+        "--test",
+        "ltev_diagfix_oracle"
+      ],
+      "expect_exit": 0,
+      "exit": 0,
+      "timed_out": false,
+      "stdout": "\nrunning 2 tests\ntest discounted_totals_recover_the_lost_half ... ok\ntest half_cent_rounding_is_away_from_zero ... ok\n\ntest result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s\n\n",
+      "stderr": "   Compiling receiptkit v0.1.0 (C:\\Users\\Ye_Luo\\AppData\\Local\\Temp\\.tmplBC3xG)\n    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.38s\n     Running tests\\ltev_diagfix_oracle.rs (target\\debug\\deps\\ltev_diagfix_oracle-fbe39d7b2c7fa84d.exe)\n",
+      "stdout_truncated": false,
+      "stderr_truncated": false,
+      "passed": true
+    },
+    {
+      "argv": [
+        "cargo",
+        "test",
+        "--quiet"
+      ],
+      "expect_exit": 0,
+      "exit": 0,
+      "timed_out": false,
+      "stdout": "\nrunning 0 tests\n\ntest result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s\n\n\nrunning 2 tests\n..\ntest result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s\n\n\nrunning 0 tests\n\ntest result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s\n\n",
+      "stderr": "\n(self-check over agent-authored tests; informational)",
+      "stdout_truncated": false,
+      "stderr_truncated": false,
+      "passed": true
+    }
+  ]
+}

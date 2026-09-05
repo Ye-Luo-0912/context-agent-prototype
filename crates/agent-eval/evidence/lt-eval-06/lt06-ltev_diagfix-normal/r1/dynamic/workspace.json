@@ -1,0 +1,14 @@
+{
+  "file_set_sha256": "2e6106edaee1150b06f609d8d479134157bb380622df51094ebfa7fbc9a5aac6",
+  "files": 7,
+  "listed": [
+    "Cargo.toml",
+    "DIAGNOSIS.md",
+    "README.md",
+    "src/lib.rs",
+    "src/receipt.rs",
+    "src/rounding.rs",
+    "tests/totals.rs"
+  ],
+  "sha256": "b8b4957adc7e11e18ac13618c50151dd0dd7064ec6d5ac180703e5767bdb0784"
+}
