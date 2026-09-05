@@ -102,14 +102,20 @@ async fn main() -> anyhow::Result<()> {
     // against any `ContextEngine` implementation (the A/B/C baselines, and
     // the process-boundary adapter). Rolling/dynamic 与 live eval 共用同一
     // 有界压缩器，避免 TUI 仍走占位折叠。
-    let (model, provider_profile_digest) = match try_model_from_env()? {
+    let (model, serving_banner, provider_profile_digest) = match try_model_from_env()? {
         agent_compose::ModelSelection::Mock(mock) => {
             eprintln!("demo mode: AGENT_DEMO=1 selected the explicit mock transport");
-            (mock, None)
+            (
+                mock,
+                "serving: demo mock transport (AGENT_DEMO=1)".to_string(),
+                None,
+            )
         }
         agent_compose::ModelSelection::Provider(provider, profile) => {
             eprintln!("{}", profile.banner());
-            (provider, Some(profile.digest()))
+            let digest = profile.digest();
+            let banner = format!("serving: {} | profile digest {digest}", profile.banner());
+            (provider, banner, Some(digest))
         }
     };
     let context_engine =
@@ -226,6 +232,7 @@ async fn main() -> anyhow::Result<()> {
         interactive,
         policy.as_str(),
         checkpoint_dir,
+        serving_banner,
     )
     .await;
 
@@ -245,6 +252,7 @@ async fn main() -> anyhow::Result<()> {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn run_ui(
     terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
     handle: RuntimeHandle,
@@ -253,9 +261,11 @@ async fn run_ui(
     interactive: Option<InteractiveHandle>,
     context_policy: &str,
     checkpoint_dir: PathBuf,
+    serving_banner: String,
 ) -> anyhow::Result<()> {
     let mut app = AppState::new(handle.run_id());
     app.push_system(format!("context policy: {context_policy}"));
+    app.push_system(serving_banner);
 
     // Requests that arrived before this loop started (e.g. during startup).
     if let Some(handle) = &interactive {
