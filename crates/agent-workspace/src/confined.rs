@@ -561,13 +561,16 @@ impl ConfinedDir {
             // SAFETY: `cname` is NUL-terminated; `stat` is the out-param;
             // AT_SYMLINK_NOFOLLOW answers the name itself, no follow.
             unsafe {
+                // libc does not expose the S_ISREG/S_ISDIR macros as
+                // functions: mask the mode with S_IFMT and compare.
                 libc::fstatat(
                     self.fd.as_raw_fd(),
                     cname.as_ptr(),
                     &mut stat,
                     libc::AT_SYMLINK_NOFOLLOW,
                 ) == 0
-                    && (libc::S_ISREG(stat.st_mode) || libc::S_ISDIR(stat.st_mode))
+                    && (stat.st_mode & libc::S_IFMT == libc::S_IFREG
+                        || stat.st_mode & libc::S_IFMT == libc::S_IFDIR)
             }
         }
         #[cfg(windows)]
