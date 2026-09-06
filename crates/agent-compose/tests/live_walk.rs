@@ -177,7 +177,7 @@ async fn product_compose(
         .state_dir()
         .join("authority")
         .join("broker-reservations.jsonl");
-    Ok(compose(ComposeConfig {
+    compose(ComposeConfig {
         provider_profile_digest: None,
         defer_proof_refresh: false,
         shadow_context_frame: false,
@@ -201,7 +201,7 @@ async fn product_compose(
         verification_recipes: Some(recipes),
         project_proof_refresh: has_recipes,
     })
-    .await?)
+    .await
 }
 
 async fn start_work(handle: &RuntimeHandle, goal: &str) -> anyhow::Result<()> {
