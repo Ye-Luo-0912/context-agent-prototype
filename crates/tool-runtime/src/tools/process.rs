@@ -2230,19 +2230,22 @@ mod tests {
     #[tokio::test]
     async fn parent_death_signal_is_registered_on_spawned_children() {
         if std::env::var("PDEATHSIG_PROBE_CHILD").is_ok() {
+            let marker = std::env::var("PDEATHSIG_PROBE_MARKER").unwrap_or_default();
+            let hook_marker = std::fs::read_to_string(format!("{marker}.hook"))
+                .unwrap_or_else(|_| "hook-never-ran".into());
             let mut signal: libc::c_int = 0;
             let rc =
                 unsafe { libc::prctl(libc::PR_GET_PDEATHSIG, &mut signal as *mut libc::c_int) };
             let ppid = unsafe { libc::getppid() };
             // Self-set/get: distinguishes "prctl is blocked on this
             // runner" (self-set fails or still reads 0) from "the pre_exec
-            // hook never ran" (the parent was supposed to arm it).
+            // hook never ran" (the hook's marker file stays absent).
             let set_rc = unsafe { libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL) };
             let mut after: libc::c_int = 0;
             let get_rc =
                 unsafe { libc::prctl(libc::PR_GET_PDEATHSIG, &mut after as *mut libc::c_int) };
             println!(
-                "PROBE rc={rc} sig={signal} getppid={ppid} host={} selfset={set_rc} after={after} getrc={get_rc}",
+                "PROBE rc={rc} sig={signal} getppid={ppid} host={} selfset={set_rc} after={after} getrc={get_rc} hook={hook_marker}",
                 std::env::var("PDEATHSIG_PROBE_HOST").unwrap_or_default()
             );
             std::process::exit(0);
@@ -2285,11 +2288,27 @@ mod tests {
             "--nocapture",
         ]);
         command.env("PDEATHSIG_PROBE_CHILD", "1");
+        let marker_path = dir.path().join("pdeathsig-probe-marker");
         command.env("PDEATHSIG_PROBE_HOST", std::process::id().to_string());
+        command.env("PDEATHSIG_PROBE_MARKER", marker_path.display().to_string());
+        {
+            let marker = marker_path.clone();
+            let host_pid = std::process::id() as libc::pid_t;
+            unsafe {
+                command.as_std_mut().pre_exec(move || {
+                    let set_rc = libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL);
+                    let _ = std::fs::write(&marker, format!("set_rc={set_rc}"));
+                    Ok(())
+                });
+            }
+        }
         apply_parent_death_signal(&mut command);
         let output = command.output().await.expect("probe child runs");
         let tokio_text = String::from_utf8_lossy(&output.stdout).into_owned();
-        println!("TOKIO PROBE: {tokio_text}");
+        let hook_marker =
+            std::fs::read_to_string(&marker_path).unwrap_or_else(|_| "marker-absent".into());
+        println!("HOOK MARKER: {hook_marker}");
+        println!("STDERR: {}", String::from_utf8_lossy(&output.stderr));
         assert!(
             std_probe.contains("sig=9"),
             "std pre_exec must register the parent-death signal: {std_probe}"
