@@ -32,6 +32,31 @@ mutates, and nothing here can make a half-committed state worse.
    never listed as checkpoints, and a prepared-but-undispatched effect
    reconciles NotApplied on any number of restarts.
 
+## A child process outlives a crashed host (PROCESS-01)
+
+Two layers keep a SIGKILLed or aborted host from leaving an unsupervised
+child mutating the workspace:
+
+1. **Immediate containment.** The product TUI arms host-death containment
+   for every spawned process child. Windows: a `KILL_ON_JOB_CLOSE` job
+   object — the kernel kills the tree when the host's handle dies. Unix: a
+   pipe-EOF watchdog re-entered from the same executable holds one end of
+   a socket pair; when the host dies the pipe closes and the watchdog
+   kills the child's process group (only if the group leader still
+   answers, so a normal shutdown never signals).
+2. **Startup reconciliation.** Every host-spawned child is recorded in
+   `.focus-agent/authority/host-children.jsonl`; the entry is released
+   when the child is confirmed reaped. A crash cannot release it, so the
+   next `agent-tui` start (TUI or headless) reconciles before the
+   workspace is reused: leftover live trees are killed and the ledger is
+   cleared. A stale row for an already-dead pid is cleared too, so a
+   reused pid is never targeted.
+
+Operator rule: after a host crash, start the agent once (any mode)
+**before** reusing the workspace for anything else — that is what runs
+the reconciliation. If you must intervene manually, look for the purpose
+field in the ledger rows to identify what the leftover process was.
+
 ## A `task.complete` will not go through
 
 The completion gate refuses with the blocker list (verification currency,

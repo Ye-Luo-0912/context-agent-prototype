@@ -1,7 +1,7 @@
 # Coding Agent 开发约定
 
 当前目标：M16——把已有 Runtime 收成可日常使用的本地单用户、单工作区 Coding Agent。
-当前执行：先按 `docs/NEXT_TASKS.md` 前列关闭 2026-09-06 深入续审仍开放项（STORAGE-02 已关闭，当前 PROCESS-01），再继续 M16 产品剩余。
+当前执行：深入续审工程项与 M16-00–07 已全部关闭（2026-09-07）。剩余为条件项：PROCESS-01 的 Linux CI 实证、真实 provider live 记录（无凭据写 `NOT_RUN`）、下次实际发布时的 PACKAGE-01、默认启用 MCP 后的 MCP-01。
 不把 Chronicle、TaskGraph、通用调度或「全仓审计清零」排成新阶段。
 
 ## 从哪里开始
