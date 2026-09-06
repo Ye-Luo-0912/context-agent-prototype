@@ -251,8 +251,15 @@ mod tests {
         let child = command.spawn().unwrap();
         let pid = child.id().unwrap_or(0);
         let supervisor = ProcessSupervisor::from_child(child, pid);
+        // Hold the child lock across the kill: reap escalates to
+        // kill_tree while holding that lock, so the fallback must work
+        // without taking it.
+        let held = supervisor.child.lock().await;
         supervisor.kill_tree();
-        tokio::time::sleep(Duration::from_millis(300)).await;
+        drop(held);
+        // A SIGKILLed child is a zombie until its parent waits on it, so
+        // the death assertion is only meaningful after the reap.
+        supervisor.reap().await;
         assert!(
             !crate::lifecycle::process_is_running(pid),
             "the direct-child fallback must kill a non-group-leader child"
