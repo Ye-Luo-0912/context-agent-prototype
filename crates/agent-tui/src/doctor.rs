@@ -210,7 +210,10 @@ pub async fn export_diagnostics(
     const MAX_SECTION_CHARS: usize = 8_000;
     let mut out = String::from(
         "agent-tui diagnostics
-====================
+=====================
+NOTE: this bundle may contain workspace file contents and model
+transcript text. Common credential shapes are masked defensively, but
+that is not a guarantee — review the file before sharing it.
 ",
     );
     out.push_str(&format!(
@@ -230,8 +233,9 @@ pub async fn export_diagnostics(
     );
     for line in projection_lines.into_iter().take(40) {
         out.push_str(&format!(
-            "  {line}
-"
+            "  {}
+",
+            bounded(mask_common_credentials(&line), 200)
         ));
     }
     out.push_str(
@@ -243,7 +247,7 @@ pub async fn export_diagnostics(
         out.push_str(&format!(
             "  {}
 ",
-            bounded(line, 200)
+            bounded(mask_common_credentials(&line), 200)
         ));
     }
     let checkpoints = CheckpointStore::new(state_dir.join("checkpoints"));
@@ -298,6 +302,40 @@ fn bounded(text: String, max_chars: usize) -> String {
         cut.push('…');
         cut
     }
+}
+
+/// Defensive masking of common credential shapes in exported diagnostics.
+/// This is best-effort obfuscation, not redaction: the bundle may still
+/// contain workspace source and model transcript text, so the export also
+/// carries an explicit review-before-sharing note (M16-05).
+fn mask_common_credentials(line: &str) -> String {
+    const MASK: &str = "***";
+    fn is_token_char(c: char) -> bool {
+        c.is_ascii_alphanumeric() || c == '-' || c == '_' || c == '.'
+    }
+    /// Replace every `prefix` + run of token chars (at least `min` chars)
+    /// with `prefix` + MASK.
+    fn mask_after(haystack: &str, prefix: &str, min: usize) -> String {
+        let mut out = String::with_capacity(haystack.len());
+        let mut rest = haystack;
+        while let Some(at) = rest.find(prefix) {
+            let after = &rest[at + prefix.len()..];
+            let token_len = after.chars().take_while(|c| is_token_char(*c)).count();
+            if token_len >= min {
+                out.push_str(&rest[..at + prefix.len()]);
+                out.push_str(MASK);
+                rest = &after[token_len..];
+            } else {
+                out.push_str(&rest[..at + prefix.len()]);
+                rest = after;
+            }
+        }
+        out.push_str(rest);
+        out
+    }
+    let line = mask_after(line, "sk-", 12);
+    let line = mask_after(&line, "Bearer ", 8);
+    mask_after(&line, "OPENAI_API_KEY=", 4)
 }
 
 /// Convenience wrapper used by the binary: run the checks and print them.
@@ -427,5 +465,51 @@ mod export_tests {
         assert!(body.matches("transcript row").count() <= 40);
         // No key material by construction: the only identity is a digest.
         assert!(!body.contains("sk-"));
+    }
+
+    /// Common credential shapes are masked defensively before export; the
+    /// bundle names the review-before-sharing obligation. Masking is
+    /// best-effort and must not silently swallow ordinary text.
+    #[test]
+    fn export_masks_common_credential_shapes_and_names_the_review_duty() {
+        assert_eq!(
+            mask_common_credentials("key was sk-proj-abcd1234EFGH5678ijkl"),
+            "key was sk-***"
+        );
+        assert_eq!(
+            mask_common_credentials("Authorization: Bearer eyJa9-bbb.cccDDD"),
+            "Authorization: Bearer ***"
+        );
+        assert_eq!(
+            mask_common_credentials("env OPENAI_API_KEY=verysecret123 set"),
+            "env OPENAI_API_KEY=*** set"
+        );
+        // Short look-alikes and ordinary words survive untouched.
+        assert_eq!(mask_common_credentials("sk-isk task"), "sk-isk task");
+        assert_eq!(
+            mask_common_credentials("risk- avoided Bearerly"),
+            "risk- avoided Bearerly"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_export_header_names_the_review_before_sharing_duty() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = export_diagnostics(
+            dir.path(),
+            vec!["task: none [awaiting operator review]".into()],
+            vec!["assistant: fixed sk-proj-SECRETSECRET999 in calc.py".into()],
+        )
+        .await
+        .unwrap();
+        let body = std::fs::read_to_string(&path).unwrap();
+        assert!(body.contains("review the file before sharing"), "{body}");
+        assert!(
+            !body.contains("SECRETSECRET"),
+            "the transcript credential must be masked: {body}"
+        );
+        assert!(body.contains("sk-***"), "{body}");
+        // Ordinary content is not mangled by the masking.
+        assert!(body.contains("calc.py"), "{body}");
     }
 }
