@@ -74,8 +74,25 @@ fn watch_stream_to_eof_then_kill<R: std::io::Read>(stream: &mut R, leader: i32) 
 /// the disarm path.
 #[cfg(unix)]
 pub struct HostDeathWatchdog {
-    // Open for the watchdog's whole life: EOF here is the host's death.
-    _write_half: std::os::unix::net::UnixStream,
+    /// Write half of the pipe; `None` after [`Drop`] closes it so the
+    /// watchdog observes EOF before we reap it.
+    write_half: Option<std::os::unix::net::UnixStream>,
+    /// Kept so a normal disarm does not leave a zombie watchdog. Must not
+    /// use `kill_on_drop`: the watchdog has to outlive a SIGKILLed host.
+    child: Option<std::process::Child>,
+}
+
+#[cfg(unix)]
+impl Drop for HostDeathWatchdog {
+    fn drop(&mut self) {
+        // Close the write end first (host "still alive" → "gone"), then
+        // reap the watchdog so it cannot linger as a zombie for the rest
+        // of the product process's life.
+        drop(self.write_half.take());
+        if let Some(mut child) = self.child.take() {
+            let _ = child.wait();
+        }
+    }
 }
 
 #[cfg(unix)]
@@ -85,9 +102,15 @@ impl HostDeathWatchdog {
     /// watchdog executable is this process's own executable re-entered
     /// through [`WATCHDOG_ENV`] — only product binaries whose `main`
     /// dispatches on the marker may arm this. `Ok(None)` means no
-    /// executable identity was available; the caller degrades to no
-    /// containment, same as a refused Windows job assignment.
+    /// executable identity was available, or `leader` was zero; the
+    /// caller degrades to no containment, same as a refused Windows job
+    /// assignment.
     pub fn arm(leader: u32) -> std::io::Result<Option<Self>> {
+        if leader == 0 {
+            // pid 0 would make `kill(0, …)` / `kill(-0, …)` target the
+            // caller's process group — refuse rather than arm.
+            return Ok(None);
+        }
         match std::env::current_exe() {
             Ok(exe) => Self::arm_with(&exe, leader).map(Some),
             Err(_) => Ok(None),
@@ -99,8 +122,16 @@ impl HostDeathWatchdog {
     pub fn arm_with(exe: &std::path::Path, leader: u32) -> std::io::Result<Self> {
         use std::os::unix::process::CommandExt;
         use std::process::{Command, Stdio};
+        if leader == 0 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "host-death watchdog refuses leader pid 0",
+            ));
+        }
         let (read_half, write_half) = std::os::unix::net::UnixStream::pair()?;
-        Command::new(exe)
+        // Do not set kill_on_drop: dropping the Child must not SIGKILL the
+        // watchdog — Drop closes the write half and waits instead.
+        let child = Command::new(exe)
             .env(WATCHDOG_ENV, leader.to_string())
             // The read half becomes the watchdog's stdin: EOF there is the
             // host's death. The write half never leaves this process (both
@@ -114,8 +145,15 @@ impl HostDeathWatchdog {
             .process_group(0)
             .spawn()?;
         Ok(Self {
-            _write_half: write_half,
+            write_half: Some(write_half),
+            child: Some(child),
         })
+    }
+
+    /// Test hook: the watchdog child's pid while the handle is live.
+    #[cfg(test)]
+    fn child_id(&self) -> Option<u32> {
+        self.child.as_ref().map(std::process::Child::id)
     }
 }
 
@@ -203,12 +241,39 @@ mod tests {
         let _ = child.wait();
     }
 
-    fn child_status(child: &mut std::process::Child) -> Option<std::process::ExitStatus> {
-        use std::io::ErrorKind;
-        match child.try_wait() {
-            Ok(status) => status,
-            Err(error) if error.kind() == ErrorKind::WouldBlock => None,
-            Err(error) => panic!("try_wait: {error}"),
-        }
+    #[test]
+    fn arm_refuses_leader_pid_zero() {
+        let armed = HostDeathWatchdog::arm(0).expect("arm(0) degrades with Ok(None)");
+        assert!(armed.is_none(), "pid 0 must not arm containment");
+    }
+
+    #[test]
+    fn arm_with_rejects_leader_pid_zero() {
+        let error = HostDeathWatchdog::arm_with(std::path::Path::new("/bin/true"), 0)
+            .expect_err("arm_with must reject leader pid 0");
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
+    }
+
+    #[test]
+    fn dropping_the_handle_reaps_the_watchdog_child() {
+        // /bin/cat reads stdin to EOF and exits — same pipe contract as the
+        // product watchdog, without re-entering this test binary's main.
+        // Leader pid is never signalled: cat exits on EOF before any kill
+        // path runs.
+        let armed = HostDeathWatchdog::arm_with(std::path::Path::new("/bin/cat"), 1)
+            .expect("arm a cat stand-in as the watchdog");
+        let pid = armed.child_id().expect("armed handle keeps the Child");
+        assert!(
+            unsafe { libc::kill(pid as i32, 0) == 0 },
+            "watchdog child must be alive before Drop"
+        );
+        drop(armed);
+        // kill(pid, 0) still succeeds for a zombie. Passing this wait means
+        // Drop closed the write half and wait()'d — not merely orphaned the
+        // Child handle.
+        wait_for(
+            || unsafe { libc::kill(pid as i32, 0) != 0 },
+            "the watchdog child to be fully reaped (not left as a zombie)",
+        );
     }
 }

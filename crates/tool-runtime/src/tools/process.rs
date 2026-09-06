@@ -998,13 +998,6 @@ impl ProcessRunTool {
         // not just the direct child (`kill_on_drop` kills only the child
         // itself). The guard is disarmed only after the child is reaped.
         let mut tree_guard = super::ProcessTreeGuard::new(child.id().unwrap_or(0));
-        // PROCESS-01: persist the supervision identity while the child
-        // runs, so a crashed host's startup reconciliation can kill the
-        // leftover tree before the workspace is reused.
-        let child_pid = child.id().unwrap_or(0);
-        if let Some(state_dir) = self.workspace.state_dir().to_str() {
-            crate::supervision::record_child(std::path::Path::new(state_dir), child_pid, tool_name);
-        }
         // Unix host-death containment (PROCESS-01): a watchdog re-entered
         // from this executable holds our read half; a SIGKILLed or aborted
         // host closes it and the watchdog kills the group. Dropping the
