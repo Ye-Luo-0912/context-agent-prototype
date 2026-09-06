@@ -2288,7 +2288,6 @@ mod tests {
         command.env("PDEATHSIG_PROBE_HOST", std::process::id().to_string());
         apply_parent_death_signal(&mut command);
         let output = command.output().await.expect("probe child runs");
-        let text = String::from_utf8_lossy(&output.stdout);
         let tokio_text = String::from_utf8_lossy(&output.stdout).into_owned();
         println!("TOKIO PROBE: {tokio_text}");
         assert!(
