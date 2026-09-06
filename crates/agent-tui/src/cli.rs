@@ -783,14 +783,16 @@ mod tests {
             }
         }
 
-        let grants = vec![serde_json::json!({
-            "id": "fix-service",
-            "risk": "WorkspaceWrite",
-            "target": { "workspace_path_prefix": "service.txt" },
-            "constraint": {},
-            "expires_at_ms": u64::MAX
-        })
-        .to_string()];
+        let grants = vec![
+            serde_json::json!({
+                "id": "fix-service",
+                "risk": "WorkspaceWrite",
+                "target": { "workspace_path_prefix": "service.txt" },
+                "constraint": {},
+                "expires_at_ms": u64::MAX
+            })
+            .to_string(),
+        ];
         let composed = product_compose(&root, &grants, Arc::new(FixModel), None)
             .await
             .unwrap();
@@ -883,8 +885,9 @@ mod tests {
             }
         }
 
-        let composed =
-            product_compose(&root, &[], Arc::new(PlanModel), None).await.unwrap();
+        let composed = product_compose(&root, &[], Arc::new(PlanModel), None)
+            .await
+            .unwrap();
         let mut events = composed.subscribe();
         composed.instance.start().await.unwrap();
         let mut jsonl = Vec::new();
@@ -937,7 +940,11 @@ mod tests {
             }
             async fn complete(&self, _request: ModelRequest) -> AgentResult<ModelOutput> {
                 let step = self.step.fetch_add(1, Ordering::SeqCst);
-                let path = if step == 0 { "file_a.txt" } else { "file_b.txt" };
+                let path = if step == 0 {
+                    "file_a.txt"
+                } else {
+                    "file_b.txt"
+                };
                 let content = format!("segment {} content", step + 1);
                 Ok(ModelOutput {
                     content: String::new(),
@@ -972,8 +979,9 @@ mod tests {
             })
             .to_string(),
         ];
-        let composed =
-            product_compose(&root, &grants, model.clone(), Some(1)).await.unwrap();
+        let composed = product_compose(&root, &grants, model.clone(), Some(1))
+            .await
+            .unwrap();
         let mut events = composed.subscribe();
         composed.instance.start().await.unwrap();
         let mut jsonl = Vec::new();
