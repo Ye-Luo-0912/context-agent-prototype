@@ -1566,4 +1566,162 @@ mod tui_e2e {
             "/continue after /restore must land the next segment"
         );
     }
+
+    /// The dual-workspace review walkthrough on the interactive path: a
+    /// workspace holds the user's own file and a planted bug; the agent
+    /// fixes only the bug; /review renders the result card attributing
+    /// the agent's write and never claiming the user's file. Replaces the
+    /// manual M16-05 dual-workspace walkthrough (the headless variant
+    /// lives in the cli.rs tests).
+    #[tokio::test]
+    async fn tui_e2e_review_attributes_the_agents_change_not_the_users() {
+        struct FixModel;
+        #[async_trait::async_trait]
+        impl ModelTransport for FixModel {
+            fn capabilities(&self) -> ModelCapabilities {
+                ModelCapabilities {
+                    streaming: true,
+                    tool_calls: true,
+                    max_output_tokens: 4096,
+                    context_window: None,
+                }
+            }
+            async fn complete(&self, request: ModelRequest) -> AgentResult<ModelOutput> {
+                let has_tool_result = request
+                    .messages
+                    .iter()
+                    .any(|message| message.role == ModelRole::Tool);
+                if !has_tool_result {
+                    return Ok(ModelOutput {
+                        content: String::new(),
+                        tool_calls: vec![ToolCall {
+                            id: "fix-read".into(),
+                            name: "fs.read".into(),
+                            arguments: serde_json::json!({ "path": "service.txt" }),
+                        }],
+                        usage: Default::default(),
+                    });
+                }
+                let read_the_file = request.messages.iter().any(|message| {
+                    message.role == ModelRole::Tool && message.content.contains("mode=broken")
+                });
+                if read_the_file {
+                    return Ok(ModelOutput {
+                        content: String::new(),
+                        tool_calls: vec![ToolCall {
+                            id: "fix-write".into(),
+                            name: "fs.write".into(),
+                            arguments: serde_json::json!({
+                                "path": "service.txt",
+                                "content": "mode=fixed\n",
+                            }),
+                        }],
+                        usage: Default::default(),
+                    });
+                }
+                Ok(ModelOutput {
+                    content: "[scripted] fix delivered".into(),
+                    tool_calls: Vec::new(),
+                    usage: Default::default(),
+                })
+            }
+        }
+
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().to_path_buf();
+        std::fs::write(root.join("config.txt"), "user_setting=keep\n").unwrap();
+        std::fs::write(root.join("service.txt"), "mode=broken\n").unwrap();
+        let grants = [write_grant("service.txt")];
+        let (composed, interactive, checkpoint_dir) =
+            tui_compose(&root, &grants, Arc::new(FixModel), None)
+                .await
+                .unwrap();
+        let mut ui_events = composed.subscribe();
+        let mut orch_events = composed.subscribe();
+        composed.instance.start().await.unwrap();
+
+        let (key_tx, key_rx) = tokio::sync::mpsc::channel::<KeyEvent>(256);
+        let captured: Captured = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let sink = CaptureSink {
+            captured: captured.clone(),
+        };
+        let orch_captured = captured.clone();
+        let orch = tokio::spawn(async move {
+            send_line(&key_tx, "/work fix the mode bug in service.txt").await;
+            wait_for_event(&mut orch_events, "the fix turn's TurnCompleted", |event| {
+                matches!(event, RuntimeEvent::TurnCompleted)
+            })
+            .await;
+            send_line(&key_tx, "/review").await;
+            // The card must attribute the agent's write...
+            wait_for_line(
+                &orch_captured,
+                "changed files (this session's tools only):",
+                "/review card",
+            )
+            .await;
+            wait_for_line(
+                &orch_captured,
+                "service.txt",
+                "the agent's write in the card",
+            )
+            .await;
+            quit(&key_tx);
+        });
+
+        let mut source = KeySource {
+            rx: key_rx,
+            disconnected: false,
+        };
+        let mut sink = sink;
+        let session = tokio::time::timeout(
+            Duration::from_secs(90),
+            run_session(
+                &mut source,
+                &mut sink,
+                composed.handle().clone(),
+                &composed.instance,
+                &mut ui_events,
+                Some(interactive),
+                "dynamic",
+                checkpoint_dir,
+                "serving: scripted e2e model".to_string(),
+                None,
+                false,
+            ),
+        )
+        .await;
+        assert!(session.is_ok(), "the session hung: {session:?}");
+        session.expect("timeout").expect("session error");
+        orch.await.expect("orchestrator task");
+        composed.shutdown().await.unwrap();
+
+        assert_eq!(
+            std::fs::read_to_string(root.join("service.txt")).unwrap(),
+            "mode=fixed\n",
+            "the fix must land"
+        );
+        assert_eq!(
+            std::fs::read_to_string(root.join("config.txt")).unwrap(),
+            "user_setting=keep\n",
+            "the user's own file must not be touched"
+        );
+        // The card renders the awaiting-review state and scopes its change
+        // list to this session's tools: the user's own file is not claimed.
+        let seen = transcript(&captured);
+        let card_start = seen.find("review:").expect("the review header");
+        let card = &seen[card_start..];
+        assert!(
+            card.contains("awaiting operator review"),
+            "the card names the closure state: {card}"
+        );
+        assert!(
+            card.contains("service.txt"),
+            "the agent's change is attributed: {card}"
+        );
+        assert!(
+            !card.contains("config.txt"),
+            "the user's own file must not be claimed by the card: {card}"
+        );
+    }
 }
