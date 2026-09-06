@@ -1,6 +1,9 @@
+mod args;
+mod cli;
 mod doctor;
 mod state;
 mod ui;
+mod work;
 
 use std::{io, path::PathBuf, sync::Arc, time::Duration};
 
@@ -45,39 +48,20 @@ struct InteractiveHandle {
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    let mut read_only = false;
-    let mut context_policy = "dynamic".to_string();
-    let mut root_arg: Option<PathBuf> = None;
-    let mut grant_args: Vec<String> = Vec::new();
-    let mut effect_reservation_journal: Option<PathBuf> = None;
-    let mut restore_arg: Option<PathBuf> = None;
-    let mut doctor_mode = false;
-    let mut max_rounds: Option<usize> = None;
-    let mut defer_proof = false;
-    for arg in std::env::args().skip(1) {
-        if arg == "--doctor" {
-            doctor_mode = true;
-        } else if arg == "--read-only" {
-            read_only = true;
-        } else if let Some(value) = arg.strip_prefix("--context=") {
-            context_policy = value.to_string();
-        } else if let Some(value) = arg.strip_prefix("--grant=") {
-            grant_args.push(value.to_string());
-        } else if let Some(value) = arg.strip_prefix("--effect-reservation-journal=") {
-            effect_reservation_journal = Some(PathBuf::from(value));
-        } else if let Some(value) = arg.strip_prefix("--restore=") {
-            restore_arg = Some(PathBuf::from(value));
-        } else if let Some(value) = arg.strip_prefix("--max-rounds=") {
-            max_rounds = Some(parse_max_rounds(value)?);
-        } else if arg == "--defer-proof" {
-            defer_proof = true;
-        } else if root_arg.is_none() {
-            root_arg = Some(PathBuf::from(arg));
-        }
+    let mut args = args::parse_args(std::env::args().skip(1))?;
+    if args.help {
+        args::print_usage();
+        return Ok(());
     }
-    if read_only && restore_arg.is_some() {
-        anyhow::bail!("--restore cannot be combined with --read-only");
+    if let Some(raw) = args.prompt.take() {
+        args.prompt = Some(cli::resolve_prompt(&raw)?);
     }
+    let read_only = args.read_only;
+    let restore_arg = args.restore_arg.clone();
+    let grant_args = args.grant_args.clone();
+    let max_rounds = args.max_rounds;
+    let defer_proof = args.defer_proof;
+    let effect_reservation_journal = args.effect_reservation_journal.clone();
     // An invalid checkpoint must fail before the workspace, host or any
     // state is touched: read, parse and validate an explicit path up
     // front. `--restore=latest` resolves after the workspace opens, then
@@ -87,9 +71,12 @@ async fn main() -> anyhow::Result<()> {
         (Some(path), false) => Some(load_runtime_checkpoint(path)?),
         _ => None,
     };
-    let policy = ContextPolicy::from_str_checked(&context_policy)?;
-    let root = root_arg.unwrap_or(std::env::current_dir().context("current directory")?);
-    if doctor_mode {
+    let policy = ContextPolicy::from_str_checked(&args.context_policy)?;
+    let root = args
+        .root
+        .clone()
+        .unwrap_or(std::env::current_dir().context("current directory")?);
+    if args.doctor_mode {
         let code = doctor::run_doctor(root).await;
         std::process::exit(code);
     }
@@ -126,9 +113,6 @@ async fn main() -> anyhow::Result<()> {
     };
     let context_engine =
         build_context_engine(policy, workspace.state_dir(), Some(model.clone())).await?;
-    if read_only && !grant_args.is_empty() {
-        anyhow::bail!("--grant cannot be combined with --read-only");
-    }
     // 授权映射是组合根的决定：一份内置注册表同时交给审批门、能力
     // 分发器与内核租约路径。
     let verification_recipes = Arc::new(VerificationRecipes::discover(&workspace)?);
@@ -139,6 +123,11 @@ async fn main() -> anyhow::Result<()> {
     let (approval, interactive) = if read_only {
         (
             Arc::new(PolicyApprovalGate::read_only()) as Arc<dyn agent_contracts::ApprovalGate>,
+            None,
+        )
+    } else if args.is_headless() {
+        (
+            cli::headless_approval(false, &grant_args, host_policies.clone()).await?,
             None,
         )
     } else {
@@ -221,6 +210,38 @@ async fn main() -> anyhow::Result<()> {
                     path.display()
                 ))
             })?;
+    }
+
+    if args.is_headless() {
+        eprintln!("{serving_banner}");
+        let action = if args.continue_task {
+            cli::HeadlessAction::Continue
+        } else {
+            cli::HeadlessAction::Prompt {
+                text: args
+                    .prompt
+                    .clone()
+                    .ok_or_else(|| anyhow::anyhow!("--prompt is required for a headless run"))?,
+                work: args.work,
+            }
+        };
+        let mut jsonl = io::stdout();
+        let run = cli::run_headless(
+            composed.handle().clone(),
+            &mut runtime_events,
+            action,
+            args.headless_timeout(),
+            &mut jsonl,
+        )
+        .await;
+        let shutdown_result = composed.shutdown().await;
+        return match (run, shutdown_result) {
+            (Err(run_error), _) => Err(run_error),
+            (Ok(_), Err(shutdown_error)) => {
+                Err(anyhow::Error::new(shutdown_error).context("runtime shutdown failed"))
+            }
+            (Ok(outcome), Ok(())) => std::process::exit(outcome.exit),
+        };
     }
 
     enable_raw_mode().context("enable raw mode")?;
@@ -459,58 +480,14 @@ async fn run_ui(
                         let handle = handle.clone();
                         let notice_tx = notice_tx.clone();
                         tokio::spawn(async move {
-                            if let Err(error) = handle.set_focus(goal.clone()).await {
-                                let _ = notice_tx.try_send(format!("work failed: {error}"));
-                                return;
-                            }
-                            let tasks = match handle.list_tasks().await {
-                                Ok(tasks) => tasks,
+                            match work::start_long_task(&handle, goal).await {
+                                Ok(Some(warning)) => {
+                                    let _ = notice_tx.try_send(warning);
+                                }
+                                Ok(None) => {}
                                 Err(error) => {
                                     let _ = notice_tx.try_send(format!("work failed: {error}"));
-                                    return;
                                 }
-                            };
-                            // Match by goal: set_focus just created or
-                            // resumed exactly this task; a blind first-Active
-                            // pick could hit an older open task.
-                            let task = tasks
-                                .iter()
-                                .find(|task| {
-                                    task.goal == goal
-                                        && matches!(task.status, agent_runtime::TaskStatus::Active)
-                                })
-                                .or_else(|| {
-                                    tasks.iter().find(|task| {
-                                        matches!(task.status, agent_runtime::TaskStatus::Active)
-                                    })
-                                });
-                            if let Some(task) = task
-                                && task.tool_requirement_count == 0
-                            {
-                                // Fill only an empty requirement set: a
-                                // blind whole-set replace would drop
-                                // someone else's entries. task.manage stays
-                                // capability.manage-loadable either way.
-                                if let Err(error) = handle
-                                    .replace_task_tool_requirements(
-                                        task.id,
-                                        task.tool_requirement_revision,
-                                        vec![agent_contracts::ToolSurfaceRequirement {
-                                            tool_name: "task.manage".into(),
-                                            demand:
-                                                agent_contracts::ToolSurfaceDemand::PreferSurface,
-                                            reason: "long-task checklist".into(),
-                                        }],
-                                    )
-                                    .await
-                                {
-                                    let _ = notice_tx.try_send(format!(
-                                        "work: task.manage not attached: {error}"
-                                    ));
-                                }
-                            }
-                            if let Err(error) = handle.user_message(goal).await {
-                                let _ = notice_tx.try_send(format!("work failed: {error}"));
                             }
                         });
                         continue;
@@ -944,23 +921,6 @@ fn format_plan_lines(view: &agent_contracts::TaskAnchorView) -> Vec<String> {
     lines
 }
 
-/// Strict `--max-rounds` parsing. The budget counts MODEL rounds — the
-/// same unit the runtime enforces (`Failure { RoundBudget }`) and the
-/// status banner renders — never tool calls. Zero or garbage is a
-/// startup error before any workspace mutation; there is no infinite
-/// value: a long task gets an explicitly larger finite budget.
-fn parse_max_rounds(value: &str) -> anyhow::Result<usize> {
-    let rounds: usize = value.trim().parse().map_err(|_| {
-        anyhow::anyhow!(
-            "invalid --max-rounds {value:?}: expected a positive integer (model rounds)"
-        )
-    })?;
-    if rounds == 0 {
-        anyhow::bail!("invalid --max-rounds 0: the budget must be at least 1 model round");
-    }
-    Ok(rounds)
-}
-
 /// Resume discovery: the newest saved checkpoint in the store. A missing
 /// or empty store is a configuration error with the fix in the message.
 fn resolve_latest_checkpoint(dir: &std::path::Path) -> anyhow::Result<std::path::PathBuf> {
@@ -1078,18 +1038,6 @@ mod plan_format_tests {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn max_rounds_parses_strictly_in_model_rounds() {
-        assert_eq!(parse_max_rounds("24").unwrap(), 24);
-        assert_eq!(parse_max_rounds(" 64 ").unwrap(), 64);
-        for bad in ["0", "-4", "abc", "", "2.5", "99999999999999999999"] {
-            let error = parse_max_rounds(bad).unwrap_err().to_string();
-            assert!(error.contains("--max-rounds"), "{bad}: {error}");
-        }
-        let zero = parse_max_rounds("0").unwrap_err().to_string();
-        assert!(zero.contains("at least 1"), "{zero}");
-    }
 
     #[test]
     fn plain_artifact_names_resolve_inside_the_checkpoint_dir() {

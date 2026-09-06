@@ -120,7 +120,7 @@
   "route_reset": {
     "task_document": "docs/NEXT_TASKS.md",
     "archive": "docs/archive/route-reset-12c8628",
-    "feature_status": "F1-F5 code+targeted tests landed; F6 headless live walked 2026-09-06 (TUI interactive remaining)",
+    "feature_status": "F1-F5 code+targeted tests landed; F6 headless live walked 2026-09-06 (TUI interactive remaining); N1 headless product CLI landed 2026-09-06",
     "D0_remaining": "done 2026-09-06: README route links updated, NEXT_TASKS added to LIVE_DOCS, doc-consistency gate green",
     "research_not_a_product_prerequisite": [
       "M15 rerun",
@@ -135,6 +135,7 @@
     "F4_status": "landed 2026-09-06 incl. continued-review batch: resync_projection newest-first/current-run/watermark/bounded-read, run_summary entries+omitted counting with real-event tests and mid-file run split, shadow-frame dedup-vs-cap accounting; two-workspace walkthrough pending",
     "F5_status": "landed 2026-09-06: provable file-body supersession, verify-only error clearing, search.grep and fs.list PARTIAL coverage, fs.read range facts through ingest/supersession, confined bounded reads for grep/symbols, context-search cold-read observation; F6 headless live covered a cross-file task",
     "F6_status": "headless live 2026-09-06: real provider gpt-5.6-luna via product compose/RuntimeHandle; three disposable workspaces passed harness file checks (bugfix, feature, interrupt/restore/continue); empty verification recipe table no longer fails compose; TUI interactive walkthroughs still pending; record in docs/walkthroughs/2026-09-06-f6.md",
+    "N1_status": "landed 2026-09-06: agent-tui --prompt/--work/--continue headless JSONL on the product compose/RuntimeHandle path; ungranted writes denied (no --yes/--allow-all); exit 0/2/3/1; targeted agent-tui tests cover deny/grant/work/round-budget",
     "headless_acceptance": "agent-compose/tests/route_flow.rs: real composition + scripted model covers /work composition, task.manage plan, round-budget stop with durable safe point, /continue incl. cross-checkpoint restore; landed 2026-09-06 with two wiring fixes (compose now wires the artifact store into runtime checkpoint services; the round-budget refusal drains the in-flight write and lands its own safe point)",
     "continued_review_2026_09_06": {
       "baseline": "12c86283b8d5991e9f17a07f14871dcf39d65066",

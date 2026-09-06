@@ -73,7 +73,7 @@ agent-core CorePort (stateless trusted facade)
 - `agent-eval`: evaluation harness including the M15 formal-window runner.
 - `provider-openai`: OpenAI-compatible streaming model provider (also DeepSeek/Qwen/Moonshot/GLM).
 - `agent-compose`: trusted composition root that wires implementations and spawns the sole RuntimeActor.
-- `agent-tui`: minimal TUI; one product host built on the composition root.
+- `agent-tui`: product host (interactive TUI and headless JSONL) on the composition root.
 
 ## Run
 
@@ -81,6 +81,8 @@ The code is designed for modern stable Rust with the 2024 edition.
 
 ```bash
 cargo run -p agent-tui -- .
+# headless (JSONL on stdout; ungranted writes are denied)
+AGENT_DEMO=1 cargo run -p agent-tui -- --prompt="demo: list files" .
 ```
 
 The included `MockModelTransport` keeps the architecture runnable without a

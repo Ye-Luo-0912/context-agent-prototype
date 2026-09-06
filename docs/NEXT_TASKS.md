@@ -34,6 +34,7 @@
 | F4 修改审阅与交付 | 主体已落地（2026-09-06）：`/review` 结果卡 + 持久化，原有用户修改不归属；续审批次已修（resync 最新优先/仅当前 run/重放水位/读取前限界、run_summary 按 entries+omitted 计数并混 run 分段、shadow frame 截断与去重分开计数）；双工作区走查待做 | F1；结合 F2/F3 |
 | F5 多文件上下文与搜索 | 代码与定向测试已落地（2026-09-06）：保守可证明取代、错误仅 verify.run 清除、search.grep 与 **fs.list** PARTIAL 覆盖标注、fs.read 区间事实贯通、grep/symbols 走 confined 有界读、context search 冷读观测；跨文件 live 走查随 F6 | 已有可操作产品入口 |
 | F6 三类真实任务走查 | 无头 live 已跑（2026-09-06）：真实 provider + 产品组合根，三类工作区均改到目标文件，记录 `docs/walkthroughs/2026-09-06-f6.md`；空 recipe 表启动失败已修；TUI 交互走查仍待做 | F1–F5 的所需路径 |
+| N1 非交互产品入口 | 代码与定向测试已落地（2026-09-06）：`--prompt`/`--work`/`--continue`、JSONL、诚实退出码；无人审批时拒绝写入，无全局允许 | F6 指出的下一项；不替代 TUI |
 
 状态由执行者按真实结果更新。本文没有宣布任何待实现功能通过验收。每个工单完成后即可独立演示/合并；F6 不作为 F1–F5 交付前的新增总门禁。
 
@@ -319,7 +320,36 @@ cargo check -p agent-tui
 
 三类流程各有一份可检查的真实记录，失败透明且主要产品入口可操作。它们是产品走查，不是模型成功率/算法优越性的统计证明，不替代既有安全回归。
 
-下一项从真实失败或用户需求选择。优先候选是复用现有 Compose/RuntimeHandle 的非交互入口，然后才是编辑器接入；不自动跳到多 Agent。
+下一项从真实失败或用户需求选择。N1 非交互入口已落地（同一 `agent-tui` + Compose/RuntimeHandle）。再之后才是编辑器接入；不自动跳到多 Agent。
+
+---
+
+## N1：非交互产品入口（脚本 / 编辑器调用）
+
+### 用户结果
+
+同一产品组合可从脚本调用：一条 prompt 或 stdin、有限轮次预算、JSONL 事件、诚实退出码。无人可点审批时写入被拒绝，而不是暗中全允许。
+
+### 已落地（2026-09-06）
+
+- `agent-tui --prompt=<text>`（`--prompt=-` 读 stdin）跑一条 user-message。
+- `--work` 复用 TUI `/work` 组合（`set_focus` + 空需求集上的 `task.manage` PreferSurface + 一次 user-message）。
+- `--restore=... --continue` 续跑已恢复任务的存储指令，不与 `--prompt` 混用。
+- 审批：`TaskApprovalGate` 包 `PolicyApprovalGate::read_only()`；匹配的 `--grant=<JSON>` 才放行写入/进程。`--yes` / `--allow-all` / `-y` 是启动错误。
+- stdout：runtime 事件 JSONL（跳过 live-only `ModelDelta`/`ModelRetrying`）+ 最后一行 `agent.headless.v1` `session_end`。stderr：banner。
+- 退出码：`0` 完成且无被拒变异，`2` RoundBudget，`3` 审批拒绝，`1` 错误/超时/取消。
+
+### 检查
+
+```bash
+cargo test -p agent-tui
+```
+
+覆盖：无 grant 的 demo 写入不落盘且 exit 3；匹配 grant 写入成功；`--work` 发出 focus + user-message；轮次预算 exit 2；解析拒绝全局允许。
+
+### 禁止扩展
+
+不新增 daemon、第二套编排器、评测 pack，不把 live_walk 的 permissive 审批拷进产品 CLI。
 
 ---
 

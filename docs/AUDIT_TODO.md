@@ -24,6 +24,7 @@
 | grep/list 的分页和扫描完整性混淆、读取有界性 | F5（已落地 2026-09-06） | grep/list 分清分页与扫描截断；grep/symbols 走 confined 有界读 |
 | 状态投影信息不足或旧数据误显示 | F1/F2/F4 | 只修展示所需字段，投影不成为权威 |
 | 无 Cargo.toml/pyproject 时组合根因空 recipe 表启动失败 | F6（已落地 2026-09-06） | 空表且未开 proof refresh 时按无 recipe 启动，与 TUI 发现结果一致 |
+| 无头 live 用了 permissive 审批 | N1（已落地 2026-09-06） | 产品 CLI 用 grant + read-only 内层；禁止 --yes/--allow-all |
 | 发布脚本旧 target 目录/旧产物问题 | 下次实际发布时 | 不再次让整个功能队列等待打包工程 |
 
 ## 什么可以打断主线

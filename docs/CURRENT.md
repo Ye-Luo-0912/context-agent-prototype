@@ -71,6 +71,12 @@ TUI 交互走查仍待做（2026-09-06）：忙时排队/拒绝；`/plan` 清单
 `--defer-proof` 真实慢验证（确认取消与子进程清理后才改产品默认）；
 `/review` 双工作区（干净 + 含用户旧修改）区分归属。无头 live 不替代这些。
 
+N1 非交互入口同日落地：同一 `agent-tui` 二进制在 `--prompt` / `--work` /
+`--continue` 下走产品组合根与 `RuntimeHandle`，事件 JSONL 写 stdout，
+banner 写 stderr。无人可审批时写入/进程调用立即拒绝，没有 `--yes` /
+`--allow-all`；未匹配的 `--grant` 也不能扩大权限。退出码：0 完成、
+2 轮次预算、3 审批拒绝、1 错误/超时。TUI 交互审批路径未改。
+
 2026-09-06 补充（无头验收 + 两处接线修复）：新增
 `agent-compose/tests/route_flow.rs`，用真实组合根 + 脚本化模型端到端验证
 /work 组合、task.manage 计划、预算停止与 /continue（含跨检查点恢复）。

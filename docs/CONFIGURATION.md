@@ -47,10 +47,14 @@ material. See [`COMPATIBILITY.md`](COMPATIBILITY.md) for the schema.
 | --- | --- | --- |
 | `--read-only` | off | Every write/process call is denied by policy; cannot combine with `--grant` or `--restore`. |
 | `--grant=<JSON>` | none | Standing grants for write/process tools; revoke with `/revoke <grant-id>`. |
+| `--prompt=<text>` | unset | Headless: one user message (`-` reads stdin). JSONL events on stdout. |
+| `--work` | off | Headless long-task entry (same composition as TUI `/work`). Requires `--prompt`. |
+| `--continue` | off | Headless: continue the restored/active task's stored directive. Cannot combine with `--prompt`. |
+| `--max-rounds=<N>` | runtime default (16) | Finite model-round budget for one execution segment (TUI and headless). |
 | `--restore=<path>` | none | Cold resume; validates the checkpoint before any mutation. Accepts envelope artifacts and legacy raw JSON; bare artifact names resolve inside `checkpoints/`. |
 | `--effect-reservation-journal=<path>` | `<state>/authority/broker-reservations.jsonl` | Persistent reservation barrier for crash reconciliation. |
 | `--context=dynamic\|append\|rolling\|service` | `dynamic` | Context engine selection. `service` spawns the sidecar and stays experimental. |
-| `defer_proof_refresh` / `shadow_context_frame` (compose flags) | off | Deferred host-verifier execution / shadow Context Frame manifest emission. Runtime flags, not CLI flags yet. |
+| `defer_proof_refresh` / `shadow_context_frame` (compose flags) | off | Deferred host-verifier execution / shadow Context Frame manifest emission. `--defer-proof` opts the product path in; shadow Frame is still compose-only. |
 
 ## Context policy (engine)
 
