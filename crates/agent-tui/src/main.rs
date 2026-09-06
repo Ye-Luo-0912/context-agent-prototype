@@ -72,21 +72,10 @@ async fn real_main() -> anyhow::Result<()> {
         let code = doctor::run_doctor(root).await;
         std::process::exit(code);
     }
-    let workspace = Workspace::open(&root).await?;
-    let restore_checkpoint = if restore_latest {
-        let resolved = resolve_latest_checkpoint(&workspace.state_dir().join("checkpoints"))?;
-        let checkpoint = load_runtime_checkpoint(&resolved)?;
-        Some((resolved, checkpoint))
-    } else {
-        restore_checkpoint.map(|checkpoint| (restore_arg.clone().unwrap_or_default(), checkpoint))
-    };
-    let journal = Arc::new(FileEventJournal::open(workspace.state_dir().join("traces")).await?);
-
-    // The context engine and the model are composition-root choices shared
-    // with CLI/eval (agent-compose): the same kernel, tools and UI run
-    // against any `ContextEngine` implementation (the A/B/C baselines, and
-    // the process-boundary adapter). Rolling/dynamic 与 live eval 共用同一
-    // 有界压缩器，避免 TUI 仍走占位折叠。
+    // Model configuration is a pure preflight: validate the provider env
+    // BEFORE the workspace or journal exists, so a bad key or profile is a
+    // configuration error that leaves no runtime state behind (M16-01).
+    // Doctor above deliberately runs keyless and stays before this.
     let (model, serving_banner, provider_profile_digest) = match try_model_from_env()? {
         agent_compose::ModelSelection::Mock(mock) => {
             eprintln!("demo mode: AGENT_DEMO=1 selected the explicit mock transport");
@@ -103,6 +92,21 @@ async fn real_main() -> anyhow::Result<()> {
             (provider, banner, Some(digest))
         }
     };
+    let workspace = Workspace::open(&root).await?;
+    let restore_checkpoint = if restore_latest {
+        let resolved = resolve_latest_checkpoint(&workspace.state_dir().join("checkpoints"))?;
+        let checkpoint = load_runtime_checkpoint(&resolved)?;
+        Some((resolved, checkpoint))
+    } else {
+        restore_checkpoint.map(|checkpoint| (restore_arg.clone().unwrap_or_default(), checkpoint))
+    };
+    let journal = Arc::new(FileEventJournal::open(workspace.state_dir().join("traces")).await?);
+
+    // The context engine and the model are composition-root choices shared
+    // with CLI/eval (agent-compose): the same kernel, tools and UI run
+    // against any `ContextEngine` implementation (the A/B/C baselines, and
+    // the process-boundary adapter). Rolling/dynamic 与 live eval 共用同一
+    // 有界压缩器，避免 TUI 仍走占位折叠。
     let context_engine =
         build_context_engine(policy, workspace.state_dir(), Some(model.clone())).await?;
     // 授权映射是组合根的决定：一份内置注册表同时交给审批门、能力
