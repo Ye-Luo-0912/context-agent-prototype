@@ -1,6 +1,6 @@
 # 可执行任务队列
 
-> 状态：**当前工单是 PROCESS-01 Unix 剩余**（审查其余代码项已关闭；M16-02 已于 2026-09-07 关闭；PACKAGE-01、MCP-01 按条件）。
+> 状态：**无工程开放项**（2026-09-07：M16-00–07 与深入续审工程项全部关闭；PROCESS-01 已在真 Linux 验证）。剩余全是条件项：真实 provider live（无凭据写 `NOT_RUN`）、下次实际发布的 PACKAGE-01、默认启用 MCP 后的 MCP-01。
 > 审查剩余排在 M16 产品剩余之前；不是第二套队列，也不是把 13 项清零当成新阶段。
 > 审查/提案基线：`12c86283b8d5991e9f17a07f14871dcf39d65066`。本工作树 HEAD：`4464640`。
 > 分流原文：[reviews/2026-09-06-deep-audit/REVIEW.md](reviews/2026-09-06-deep-audit/REVIEW.md)。建议回归：[reviews/2026-09-06-deep-audit/TEST_MATRIX.md](reviews/2026-09-06-deep-audit/TEST_MATRIX.md)。
@@ -19,7 +19,7 @@
 | 顺序 | 工单 | 交付物 | 状态 |
 |---|---|---|---|
 | 1 | ~~STORAGE-02~~ | 压缩已发布后失败则隔离旧 writer | 已关闭（2026-09-06） |
-| 2 | PROCESS-01 | 宿主验证硬崩溃监督 | 部分关闭：Windows 围栏已落地；Unix pre_exec 在 GH runner 上静默不执行（探针实证），需持久监督身份设计 |
+| 2 | ~~PROCESS-01~~ | 宿主验证硬崩溃监督 | 已关闭（2026-09-07）：Windows Job 围栏 + Unix 管道 EOF 看门狗 + 监督台账，全部在真 Linux（WSL2）验证 |
 | 3 | ~~PROCESS-02~~ | reap 未确认退出不清 pid | 已关闭（2026-09-06） |
 | 4 | ~~WORKSPACE-01~~ | 普通 open 不阻塞 FIFO | 已关闭（2026-09-06） |
 | 5 | ~~WORKSPACE-02~~ | Windows 拒绝路径立即接管 HANDLE | 已关闭（2026-09-06） |
