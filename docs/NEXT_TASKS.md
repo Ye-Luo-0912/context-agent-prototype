@@ -57,7 +57,7 @@ M16-00/01/02/05/07 与大部分 03/06 已落地，细节见下方 M16 表。
 
 **用户结果：** 开启宿主验证时，宿主进程被 SIGKILL/abort 后，不留下可继续改工作区的无监督子进程。
 
-**Unix 进展（2026-09-07，`a954314`）：** 管道 EOF 看门狗落地——宿主 re-enter 自身可执行文件作为看门狗（main 顶部 env 分发），持 socketpair 读端；宿主任何方式死亡 → EOF → 确认组长仍活 → `kill(-pgid)`；正常 reap 后 drop 写端为解除路径，组长已死则不发信号。产品 TUI 经新 dispatcher 构造器启用；eval 默认关闭。**限制：** cfg(unix) 测试（EOF 杀活组/reaped leader 不杀/管道接线）本机 Windows 未执行，已通过 `x86_64-unknown-linux-gnu` 交叉 check；真实 GH runner 执行等下一次 Linux CI。启动时对账台账（持久监督身份的另一半）进行中。
+**已落地（2026-09-07）：** ① Windows KILL_ON_JOB_CLOSE 围栏（`7c72df3`）；② Unix 管道 EOF 看门狗（`a954314`：re-enter 宿主可执行文件 + socketpair，宿主死亡 → EOF → 确认组长仍活 → `kill(-pgid)`；正常 reap 后 drop 写端解除）；③ 监督台账（`995a457`：execute_invocation 经 ChildLease 记录每个子进程，正常路径释放、崩溃路径留行，compose 启动时对账清理后才复用工作区；pid 精确匹配、死条目清除防复用误杀）。**剩余：** cfg(unix) 看门狗测试等下一次 Linux CI 实证（已交叉 check）。
 
 **入口：** `crates/tool-runtime/src/proof_runner.rs`、`crates/tool-runtime/src/tools/process.rs`。Linux 探针已证 OS 机制（父死子存），不是 Agent 集成测试。
 
@@ -282,7 +282,7 @@ M16-00/01/02/05/07 与大部分 03/06 已落地，细节见下方 M16 表。
 
 **已落地：** fs.read 区间事实；同修订窗口覆盖才取代；grep/list PARTIAL；confined 有界读；错误仅 verify.run 可清。
 
-**CONTEXT-01 / WORKSPACE-01 / WORKSPACE-02 走前列。** 最终曝光 ACK 与片段身份的剩余一致性按现有契约小修，不重写 Frame 编译器。
+**已全部落地（2026-09-07 复核收口）。** CONTEXT-01/WORKSPACE-01/02 已关闭；「最终曝光 ACK 与片段身份一致性」经复核已由落地提交覆盖——`7a8a663`（消费台账改由最终渲染帧重建：最终请求中被裁掉的正文不再计为已选中）、`c5f2ab7`（保守片段身份）、消费 stamping 在 release 构建同样执行（engine.rs stamping 无条件、debug_assert 仅验返回值）。不重写 Frame 编译器。
 
 **不要：** 向量库、BM25 新服务、SIEVE/TinyLFU、learned router 作为本阶段必需。
 
