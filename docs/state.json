@@ -16,7 +16,6 @@
   "milestone_gates": {
     "m15_real_evaluation": "closed",
     "next_ordered": [
-      "M16-04 product-config cold-restore walkthrough (agent-compose/tests/m16_restore.rs, in progress)",
       "PROCESS-01 Unix: Linux CI execution of the cfg(unix) watchdog tests",
       "M16-08 closure: real-provider live records (NOT_RUN if unavailable) + PACKAGE-01 at the next actual release",
       "MCP-01 only if default product enables MCP writes"
@@ -80,7 +79,6 @@
   ],
   "branch_protection": false,
   "next_ordered": [
-    "M16-04 product-config cold-restore walkthrough (agent-compose/tests/m16_restore.rs, in progress)",
     "PROCESS-01 Unix: Linux CI execution of the cfg(unix) watchdog tests",
     "M16-08 closure: real-provider live records (NOT_RUN if unavailable) + PACKAGE-01 at the next actual release",
     "MCP-01 only if default product enables MCP writes"
@@ -125,7 +123,7 @@
       "TaskGraph",
       "new GC/ranking algorithms"
     ],
-    "F1_status": "closed 2026-09-07: /continue, busy-input queue visibility, notice-channel command errors, release consumption stamp, PromptRequired dedup; the manual walkthroughs became automated session-loop E2E (tui_e2e_busy_input_is_queued_named_and_applied, tui_e2e_budget_checkpoint_restore_continue_lands_the_next_segment in agent-tui session.rs)",
+    "F1_status": "closed 2026-09-07 incl. the last preflight gap: model-config validation moved before Workspace::open (fa2b6d1), guarded by the real-binary integration test real_binary_startup.rs (bad key fails with no .focus-agent left; AGENT_DEMO headless run completes with awaiting_operator_review in the JSONL)",
     "F2_status": "closed 2026-09-07: /work, /plan, checkpoint roundtrip, plus closure-semantics display (awaiting operator review vs durably completed) verified by the automated session-loop E2E (tui_e2e_work_status_names_awaiting_review_then_done_closes_durably)",
     "F3_status": "landed 2026-09-06 incl. continued-review 6a (EOF-wait bounds) and 6b (verifier cancellation bridge armed on turn cancel and shutdown before bounded join); inline default until a real slow-verification walkthrough",
     "F4_status": "closed 2026-09-07: resync_projection newest-first/current-run/watermark/bounded-read, run_summary entries+omitted counting, shadow-frame dedup-vs-cap accounting; the dual-workspace walkthrough became automated E2E — headless (e2e_bug_fix_preserves_user_modifications) and interactive TUI (tui_e2e_review_attributes_the_agents_change_not_the_users: the card attributes the agent's write and never claims the user's file)",
@@ -159,7 +157,8 @@
       "note": "M16 replaces D0/F1-F6 as the stage order. Remaining 2026-09-06 deep-audit items currently lead the same queue. The proposal marked every task unimplemented against 12c8628; this working tree maps landed product work onto M16-00..08.",
       "M16_00": "done 2026-09-06: live CURRENT/ROADMAP/NEXT_TASKS/AGENTS point at M16; proposal stored under reviews/",
       "M16_02": "closed 2026-09-07 (9a6e988): StatusProjection task line distinguishes [awaiting operator review] vs [durably completed (operator accepted)]; the TUI names the state at turn end; headless session_end gains task_state (operator_accepted / awaiting_operator_review / none); /done keeps the existing operator acceptance path",
-      "current_ticket": "PROCESS-01 Unix remainder; next product item is M16-08 closure"
+      "current_ticket": "PROCESS-01 Unix remainder; next product item is M16-08 closure",
+      "M16_04": "closed 2026-09-07 (e6795ed): agent-compose/tests/m16_restore.rs — product-config save, shutdown, restore into a fresh composition (validate + RuntimeRestored), /continue lands segment two; read-only-base + standing-grants approval, capability-aware dispatcher, persisted reservation journal, startup ledger reconciliation"
     }
   },
   "deep_audit_queue": {

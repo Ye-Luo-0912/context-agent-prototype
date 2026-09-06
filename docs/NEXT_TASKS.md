@@ -191,7 +191,7 @@ M16-00/01/02/05/07 与大部分 03/06 已落地，细节见下方 M16 表。
 | M16-01 | 继续、忙时补充、启动预检 | 已关闭（2026-09-07）：走查转为自动化 TUI E2E | F1 |
 | M16-02 | `/work` `/plan` 与完成语义 | 已落地（2026-09-07：待审阅/持久完成显式区分） | F2 |
 | M16-03 | 有限模型轮与可确认取消 | 主体已落地；PROCESS/PROVIDER 见上列 | F3 |
-| M16-04 | 可信冷恢复 | STORAGE-01/02 已落地；产品配置恢复走查待做 | 恢复路径 |
+| M16-04 | 可信冷恢复 | 已关闭（2026-09-07）：产品配置冷恢复走查落地（`e6795ed`） | 恢复路径 |
 | M16-05 | `/review` 与状态区分 | 已关闭（2026-09-07）：双工作区走查转为无头 + TUI E2E | F4 |
 | M16-06 | 上下文/搜索正确性 | 主体已落地；CONTEXT/WORKSPACE 见上列 | F5 |
 | M16-07 | 单进程非交互入口 | N1/N2 已落地 | 原 F6 之后项 |
@@ -213,7 +213,7 @@ M16-00/01/02/05/07 与大部分 03/06 已落地，细节见下方 M16 表。
 
 **已落地：** `/continue` → `continue_active_task()`；忙时单槽队列；命令错误走 notice；未知 flag 拒绝；release 消费盖章与 PromptRequired 判重（`c6fbbab`）。参数解析在打开 workspace 之前。
 
-**已全部落地（2026-09-07）。** 原手工走查转为会话循环自动化 E2E（`tui_e2e_*`）：恢复后 /continue（预算让出 → /checkpoint → /restore → /continue 落下一段）、忙时第二条输入可见排队并在下一 turn 应用。模型 key 校验仍在 workspace 打开之后——若再动启动顺序，只前移纯配置错误，不抽 CompositionPlan。
+**已全部落地（2026-09-07，含预检收口 `fa2b6d1`）。** 原手工走查转为会话循环自动化 E2E（`tui_e2e_*`）：恢复后 /continue、忙时第二条输入可见排队并在下一 turn 应用。模型配置校验已前移到 workspace 创建之前（doctor 保持无需 key、先于其退出），参数解析、冲突检查、grant 校验、模型校验现在全部是纯预检；守卫是真实二进制测试 `real_binary_startup.rs`（坏 key 报错且不留 `.focus-agent`；AGENT_DEMO 真实二进制 headless 跑通，session_end 带待审阅语义）。不抽 CompositionPlan。
 
 **不要：** 用 `user_message("继续")` 代替 continue；无界输入队列；后台服务。
 
@@ -252,13 +252,11 @@ M16-00/01/02/05/07 与大部分 03/06 已落地，细节见下方 M16 表。
 
 ---
 
-## M16-04：可信冷恢复与最小历史入口
+## M16-04：可信冷恢复与最小历史入口（已关闭 2026-09-07）
 
 **用户结果：** 关掉进程后能选经过验证的检查点，恢复同一任务并继续；缺失 metadata 不能当成新工程。
 
-**已落地：** STORAGE-01；`RuntimeInstance::restore`；`--restore=latest`；`route_flow.rs` 含跨检查点 continue。
-
-**存储围栏已落地（STORAGE-01/02）。** 之后在产品配置（capability-aware + broker + 非 permissive 审批）下补一条「保存 → 结束进程 → 恢复 → continue」，复用 `crash_resume.rs`，不建第三套评测。
+**已全部落地：** STORAGE-01/02；`RuntimeInstance::restore` 完整 prepare/finalize 事务；`--restore=latest`；产品配置「保存 → 结束组合 → 新组合 restore → continue」走查落地为 `agent-compose/tests/m16_restore.rs`（只读基策略 + standing grants 非 permissive 审批、capability-aware、持久预留 journal 跨重启、启动对账台账；两段各写一次、互不冒认）。`crash_resume.rs` 保留真实子进程崩溃矩阵。
 
 **不要：** Chronicle / RunCatalog 数据库。
 

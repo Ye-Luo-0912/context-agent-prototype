@@ -2,7 +2,7 @@
 
 ## 现在做什么
 
-**当前工单：M16-04 产品配置恢复走查**（`agent-compose/tests/m16_restore.rs` 进行中）。PROCESS-01 的看门狗与台账均已落地（`a954314`、`995a457`），仅剩 cfg(unix) 测试的 Linux CI 实证；M16-06 复核确认无剩余缺口（2026-09-07）。PACKAGE-01、MCP-01 按各自条件；M16-08 收尾在其后。
+**当前工单：无工程开放项。** M16-00–07 的代码与自动化走查已全部关闭（M16-04 冷恢复 `e6795ed`、M16-01 预检收口 `fa2b6d1`）；PROCESS-01 仅剩 cfg(unix) 看门狗测试的 Linux CI 实证。剩余全是条件项：M16-08 真实 provider live 记录（不可用写 `NOT_RUN`）、PACKAGE-01 绑下次实际发布、MCP-01 绑默认启用 MCP。
 
 先按审查剩余队列逐项修代码里还在的缺口，再回到 M16-02 的完成语义展示。
 这不是新的前置阶段，也不是全仓审查完成。一次一项；除 PROCESS-01 外的审查代码项已全部关闭（2026-09-06）。
@@ -42,7 +42,7 @@ Windows 在 metadata 替换中途杀进程仍未注入，记为 STORAGE-01 测�
 ## M16 仍在，但排在审查剩余之后
 
 活动大阶段仍是 **M16：可持续交付的本地单 Agent**。不建 Chronicle、TaskGraph、通用调度或第二套编排器。
-M16-00 文档已切换。M16-01/02/05/07 与大部分 03/06 已落地；M16-01/05 的手工走查已转为会话循环自动化 E2E（2026-09-07）。审查剩余仅 PROCESS-01 Unix 剩余开放。下一产品项是 M16-08 发布收尾（PACKAGE-01 绑下次实际发布；真实 provider live 不可用则 `NOT_RUN`）。
+M16-00 至 M16-07 的代码与自动化走查已全部落地（2026-09-07）；手工走查已全部转为端到端测试。审查 13 项仅 PROCESS-01 的 Linux CI 实证待跑。M16-08 收尾在条件项满足时进行：真实 provider live 记录（不可用则 `NOT_RUN`）、PACKAGE-01 绑下次实际发布。
 
 对照表与限制见 [ROADMAP.md](ROADMAP.md)。缺陷细节：[AUDIT_TODO.md](AUDIT_TODO.md)。
 无头 live：[walkthroughs/2026-09-06-f6.md](walkthroughs/2026-09-06-f6.md)。
