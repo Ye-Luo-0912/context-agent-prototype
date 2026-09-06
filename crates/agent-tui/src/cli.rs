@@ -2,6 +2,7 @@
 //! exit codes. Approval never waits for a human. Ungranted writes refuse.
 
 use std::io::{self, Write};
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -77,6 +78,119 @@ pub fn resolve_prompt(raw: &str) -> anyhow::Result<String> {
         anyhow::bail!("--prompt is empty");
     }
     Ok(trimmed.to_string())
+}
+
+const MAX_GRANT_FILE_BYTES: u64 = 64 * 1024;
+const MAX_STANDING_GRANTS: usize = 16;
+
+/// Load standing grants from a JSON object or array. Bounded and fail-closed
+/// so an editor task cannot smuggle an unbounded policy blob.
+pub fn load_grant_file(path: &Path) -> anyhow::Result<Vec<String>> {
+    let metadata = std::fs::metadata(path)
+        .map_err(|error| anyhow::anyhow!("unreadable --grant-file {}: {error}", path.display()))?;
+    if !metadata.is_file() {
+        anyhow::bail!("--grant-file {} is not a regular file", path.display());
+    }
+    if metadata.len() > MAX_GRANT_FILE_BYTES {
+        anyhow::bail!(
+            "--grant-file {} is {} bytes; the cap is {MAX_GRANT_FILE_BYTES}",
+            path.display(),
+            metadata.len()
+        );
+    }
+    let bytes = std::fs::read(path)
+        .map_err(|error| anyhow::anyhow!("unreadable --grant-file {}: {error}", path.display()))?;
+    if bytes.len() as u64 > MAX_GRANT_FILE_BYTES {
+        anyhow::bail!(
+            "--grant-file {} is {} bytes; the cap is {MAX_GRANT_FILE_BYTES}",
+            path.display(),
+            bytes.len()
+        );
+    }
+    let value: serde_json::Value = serde_json::from_slice(&bytes)
+        .map_err(|error| anyhow::anyhow!("invalid --grant-file {}: {error}", path.display()))?;
+    let items = match value {
+        serde_json::Value::Array(items) => items,
+        serde_json::Value::Object(_) => vec![value],
+        _ => anyhow::bail!(
+            "--grant-file {} must be a JSON object or an array of standing grants",
+            path.display()
+        ),
+    };
+    if items.is_empty() {
+        anyhow::bail!("--grant-file {} contains no grants", path.display());
+    }
+    if items.len() > MAX_STANDING_GRANTS {
+        anyhow::bail!(
+            "--grant-file {} has {} grants; the cap is {MAX_STANDING_GRANTS}",
+            path.display(),
+            items.len()
+        );
+    }
+    let mut grants = Vec::with_capacity(items.len());
+    for (index, item) in items.into_iter().enumerate() {
+        serde_json::from_value::<StandingGrant>(item.clone()).map_err(|error| {
+            anyhow::anyhow!(
+                "invalid standing grant at {index} in --grant-file {}: {error}",
+                path.display()
+            )
+        })?;
+        grants.push(serde_json::to_string(&item)?);
+    }
+    Ok(grants)
+}
+
+/// Files first, then `--grant=` so a one-off CLI grant can replace a file
+/// entry with the same id. The combined set stays bounded.
+pub fn collect_grants(files: &[PathBuf], cli_json: &[String]) -> anyhow::Result<Vec<String>> {
+    let mut grants = Vec::new();
+    for path in files {
+        grants.extend(load_grant_file(path)?);
+    }
+    grants.extend(cli_json.iter().cloned());
+    if grants.len() > MAX_STANDING_GRANTS {
+        anyhow::bail!(
+            "at most {MAX_STANDING_GRANTS} standing grants (--grant-file and --grant combined)"
+        );
+    }
+    Ok(grants)
+}
+
+/// Headless JSONL sink: stdout by default, or a file for editor/task capture.
+#[derive(Debug)]
+pub enum JsonlWriter {
+    Stdout(io::Stdout),
+    File(std::fs::File),
+}
+
+impl JsonlWriter {
+    pub fn open(path: Option<&Path>) -> anyhow::Result<Self> {
+        match path {
+            None => Ok(Self::Stdout(io::stdout())),
+            Some(path) => {
+                let file = std::fs::File::create(path).map_err(|error| {
+                    anyhow::anyhow!("cannot create --jsonl-out {}: {error}", path.display())
+                })?;
+                Ok(Self::File(file))
+            }
+        }
+    }
+}
+
+impl Write for JsonlWriter {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        match self {
+            Self::Stdout(stdout) => stdout.write(buf),
+            Self::File(file) => file.write(buf),
+        }
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        match self {
+            Self::Stdout(stdout) => stdout.flush(),
+            Self::File(file) => file.flush(),
+        }
+    }
 }
 
 pub async fn run_headless(
@@ -418,6 +532,98 @@ mod tests {
         assert!(!approval_denied(&other));
     }
 
+    fn hello_grant_value() -> serde_json::Value {
+        json!({
+            "id": "hello",
+            "risk": "WorkspaceWrite",
+            "target": { "workspace_path_prefix": "hello.txt" },
+            "constraint": {},
+            "expires_at_ms": u64::MAX
+        })
+    }
+
+    #[test]
+    fn grant_file_loads_an_object_or_array_and_rejects_garbage() {
+        let dir = tempfile::tempdir().unwrap();
+        let object = dir.path().join("one.json");
+        std::fs::write(&object, hello_grant_value().to_string()).unwrap();
+        let loaded = load_grant_file(&object).unwrap();
+        assert_eq!(loaded.len(), 1);
+        let grant: StandingGrant = serde_json::from_str(&loaded[0]).unwrap();
+        assert_eq!(grant.id, "hello");
+
+        let array = dir.path().join("many.json");
+        std::fs::write(
+            &array,
+            serde_json::Value::Array(vec![hello_grant_value()]).to_string(),
+        )
+        .unwrap();
+        assert_eq!(load_grant_file(&array).unwrap().len(), 1);
+
+        let missing = load_grant_file(&dir.path().join("nope.json"))
+            .unwrap_err()
+            .to_string();
+        assert!(missing.contains("unreadable"), "{missing}");
+
+        let garbage = dir.path().join("bad.json");
+        std::fs::write(&garbage, "not json").unwrap();
+        let invalid = load_grant_file(&garbage).unwrap_err().to_string();
+        assert!(invalid.contains("invalid --grant-file"), "{invalid}");
+
+        let empty = dir.path().join("empty.json");
+        std::fs::write(&empty, "[]").unwrap();
+        let none = load_grant_file(&empty).unwrap_err().to_string();
+        assert!(none.contains("no grants"), "{none}");
+    }
+
+    #[test]
+    fn grant_file_then_cli_grants_stay_bounded_and_cli_appends() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("g.json");
+        std::fs::write(&file, hello_grant_value().to_string()).unwrap();
+        let combined = collect_grants(&[file], &[hello_grant().replace("hello", "other")]).unwrap();
+        assert_eq!(combined.len(), 2);
+    }
+
+    #[test]
+    fn jsonl_writer_creates_the_editor_capture_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("last.jsonl");
+        let mut writer = JsonlWriter::open(Some(&path)).unwrap();
+        writer.write_all(b"{\"ok\":true}\n").unwrap();
+        writer.flush().unwrap();
+        drop(writer);
+        let body = std::fs::read_to_string(&path).unwrap();
+        assert!(body.contains("ok"), "{body}");
+
+        let missing_parent = dir.path().join("no-such-dir").join("out.jsonl");
+        let error = JsonlWriter::open(Some(&missing_parent))
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("cannot create --jsonl-out"), "{error}");
+    }
+
+    #[test]
+    fn collect_grants_rejects_more_than_the_combined_cap() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("many.json");
+        let items: Vec<serde_json::Value> = (0..16)
+            .map(|index| {
+                json!({
+                    "id": format!("g{index}"),
+                    "risk": "WorkspaceWrite",
+                    "target": { "workspace_path_prefix": format!("f{index}.txt") },
+                    "constraint": {},
+                    "expires_at_ms": u64::MAX
+                })
+            })
+            .collect();
+        std::fs::write(&file, serde_json::Value::Array(items).to_string()).unwrap();
+        let extra = hello_grant();
+        let error = collect_grants(&[file], &[extra]).unwrap_err().to_string();
+        assert!(error.contains("at most 16"), "{error}");
+    }
+
     #[tokio::test]
     async fn headless_write_without_a_grant_refuses_and_does_not_imply_allow_all() {
         let temp = tempfile::tempdir().unwrap();
@@ -486,6 +692,37 @@ mod tests {
         let end = session_end(&String::from_utf8(jsonl).unwrap());
         assert_eq!(end["exit"], 0);
         assert_eq!(end["approval_denied"], false);
+    }
+
+    #[tokio::test]
+    async fn headless_write_with_a_grant_file_lands() {
+        let temp = tempfile::tempdir().unwrap();
+        let grant_path = temp.path().join("grants.json");
+        std::fs::write(&grant_path, hello_grant_value().to_string()).unwrap();
+        let grants = load_grant_file(&grant_path).unwrap();
+        let root = temp.path();
+        let composed = product_compose(root, &grants, Arc::new(MockModelTransport), Some(4))
+            .await
+            .unwrap();
+        let mut events = composed.subscribe();
+        composed.instance.start().await.unwrap();
+        let mut jsonl = Vec::new();
+        let outcome = run_headless(
+            composed.handle().clone(),
+            &mut events,
+            HeadlessAction::Prompt {
+                text: "demo: write hello".into(),
+                work: false,
+            },
+            Duration::from_secs(30),
+            &mut jsonl,
+        )
+        .await
+        .unwrap();
+        composed.shutdown().await.unwrap();
+        assert_eq!(outcome.exit, EXIT_OK, "{outcome:?}");
+        let written = std::fs::read_to_string(root.join("hello.txt")).unwrap();
+        assert!(written.contains("hello from the demo agent"), "{written}");
     }
 
     struct TwoRoundThenText;

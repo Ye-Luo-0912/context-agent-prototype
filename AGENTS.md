@@ -1,14 +1,17 @@
 # Coding Agent 开发约定
 
-当前目标：把已有 Runtime 变成日常可用的单用户、本地、单工作区 Coding Agent。
-先接通功能，不继续把通用平台、研究评测和边角加固排在所有功能之前。
+当前目标：M16——把已有 Runtime 收成可日常使用的本地单用户、单工作区 Coding Agent。
+当前执行：先按 `docs/NEXT_TASKS.md` 前列关闭 2026-09-06 深入续审仍开放项（STORAGE-02 已关闭，当前 PROCESS-01），再继续 M16 产品剩余。
+不把 Chronicle、TaskGraph、通用调度或「全仓审计清零」排成新阶段。
 
 ## 从哪里开始
 
 默认只读 `docs/CURRENT.md` 与 `docs/NEXT_TASKS.md` 的当前任务。
-`docs/ROADMAP.md` 决定交付顺序；`docs/AUDIT_TODO.md` 只做缺陷分流，不是全仓清零前置门。
+`docs/ROADMAP.md` 是 M16 顺序；审查剩余现在排在同一队列前面。
+`docs/AUDIT_TODO.md` 提供缺陷细节，不另起第二套待办。
+已落地的审查项与 M16 切片定向确认后跳过；不要把提案包里的「全部待实施」套到本工作树。
 实现时再读相关模块、调用方、现有测试和对应契约文档。
-历史报告、`docs/archive/`、旧 M15 窗口和旧 TODO 不生成新任务。
+历史报告、`docs/archive/`、`docs/reviews/` 里的提案原文、旧 M15 窗口不生成新任务。
 
 ## 必须保留
 
@@ -18,7 +21,9 @@
 - 保持现有 crate 依赖方向和 conformance；ToolSpec/模型生成字段不是权限，外部正文不提升为 system 指令。
 - GC 的可逆外置不等于删除；只有既有 Storage GC 按保留与引用规则删除，语义终态不能被热度或 lease 复活。
 - 不覆盖用户已有修改；不假报验证、完成、恢复、CI 或实验结果。
-- 计划勾选不是可信验证；恢复记录不是重放副作用的授权。
+- 计划勾选不是可信验证；`next_action` 不是完成阻塞；默认 `OperatorClosureOnly` 下普通 final 不是持久任务完成。
+- 恢复记录不是重放副作用的授权。
+- 不能靠再跑测试去换一个从未授予的自动完成权。
 - 不新增 trace 数据库、通用 Planner、TaskGraph、并行 worker 或第二套状态权威。
 - 默认保持现有 GC/打分策略。修复已确认错误不等于开启算法研究。
 

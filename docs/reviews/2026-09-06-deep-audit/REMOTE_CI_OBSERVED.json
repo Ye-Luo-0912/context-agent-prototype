@@ -1,0 +1,41 @@
+{
+  "kind": "CURATED_OBSERVATION_OF_GITHUB_API_NOT_LOCAL_TEST_LOG",
+  "run_id": 33986702977,
+  "head_sha": "12c86283b8d5991e9f17a07f14871dcf39d65066",
+  "conclusion": "success",
+  "source_url": "https://github.com/Ye-Luo-0912/context-agent-prototype/actions/runs/33986702977",
+  "jobs": [
+    {
+      "id": 101361491440,
+      "name": "Ubuntu fmt/clippy/build",
+      "conclusion": "success"
+    },
+    {
+      "id": 101361491545,
+      "name": "Document consistency",
+      "conclusion": "success"
+    },
+    {
+      "id": 101361491598,
+      "name": "Windows fmt/clippy/build",
+      "conclusion": "success"
+    },
+    {
+      "id": 101361927404,
+      "name": "Ubuntu tests part 1",
+      "conclusion": "success"
+    },
+    {
+      "id": 101361927448,
+      "name": "Ubuntu tests part 2",
+      "conclusion": "success"
+    },
+    {
+      "id": 101361927455,
+      "name": "Windows tests full",
+      "conclusion": "success"
+    }
+  ],
+  "package_workflow_current_run_not_verified": true,
+  "local_test_result": false
+}

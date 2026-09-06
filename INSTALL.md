@@ -87,6 +87,40 @@ rejected. Exit codes: `0` completed without a denied mutation, `2` round
 budget (use `--continue`), `3` approval denied, `1` error/timeout/cancel.
 The last JSONL row is `{"schema":"agent.headless.v1","kind":"session_end",...}`.
 
+## Editor / task invoke
+
+No daemon. An editor task is the same headless binary: a prompt, a grant
+file (so Windows/task JSON does not have to quote a grant on argv), and
+optional JSONL capture.
+
+`grants.json` (object or array; matching standing grants only — this is
+not allow-all):
+
+```json
+{
+  "id": "src-writes",
+  "risk": "WorkspaceWrite",
+  "target": { "workspace_path_prefix": "src" },
+  "constraint": {},
+  "expires_at_ms": 4102444800000
+}
+```
+
+```bash
+agent-tui --work --prompt="fix the parser" \
+  --grant-file=grants.json \
+  --jsonl-out=.focus-agent/last-headless.jsonl \
+  --max-rounds=24 \
+  .
+```
+
+A VS Code / Cursor task can call that command with `${workspaceFolder}` as
+the workspace argument and as the process working directory so relative
+`--grant-file` / `--jsonl-out` paths resolve there. Banners stay on stderr;
+events go to `--jsonl-out` (or stdout if omitted). `--grant-file` is also
+valid for the interactive TUI. The parent directory of `--jsonl-out` must
+already exist (`.focus-agent/` is created when the workspace opens).
+
 ## Checkpoints and cold resume
 
 - `/checkpoint` writes the same atomic, checksum-verified envelope the

@@ -56,6 +56,7 @@ async fn main() -> anyhow::Result<()> {
     if let Some(raw) = args.prompt.take() {
         args.prompt = Some(cli::resolve_prompt(&raw)?);
     }
+    args.grant_args = cli::collect_grants(&args.grant_files, &args.grant_args)?;
     let read_only = args.read_only;
     let restore_arg = args.restore_arg.clone();
     let grant_args = args.grant_args.clone();
@@ -172,6 +173,16 @@ async fn main() -> anyhow::Result<()> {
             .join("authority")
             .join("broker-reservations.jsonl")
     });
+    // After the workspace exists (so `.focus-agent/...` paths work) and
+    // before the actor starts, so a missing parent directory fails closed.
+    let mut jsonl_sink = if args.is_headless() {
+        if let Some(path) = args.jsonl_out.as_deref() {
+            eprintln!("jsonl: {}", path.display());
+        }
+        Some(cli::JsonlWriter::open(args.jsonl_out.as_deref())?)
+    } else {
+        None
+    };
     let composed = compose(ComposeConfig {
         provider_profile_digest,
         defer_proof_refresh: defer_proof,
@@ -225,7 +236,9 @@ async fn main() -> anyhow::Result<()> {
                 work: args.work,
             }
         };
-        let mut jsonl = io::stdout();
+        let mut jsonl = jsonl_sink
+            .take()
+            .ok_or_else(|| anyhow::anyhow!("headless JSONL sink was not opened"))?;
         let run = cli::run_headless(
             composed.handle().clone(),
             &mut runtime_events,
@@ -243,6 +256,7 @@ async fn main() -> anyhow::Result<()> {
             (Ok(outcome), Ok(())) => std::process::exit(outcome.exit),
         };
     }
+    debug_assert!(jsonl_sink.is_none());
 
     enable_raw_mode().context("enable raw mode")?;
     let mut stdout = io::stdout();

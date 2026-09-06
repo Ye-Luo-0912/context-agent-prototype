@@ -52,6 +52,7 @@ LIVE_DOCS = [
     "docs/CONTEXT_FRAME_V1.md",
     "docs/EXECUTION_MODEL.md",
     "docs/reviews/2026-09-05-code-review.md",
+    "docs/reviews/2026-09-06-deep-audit/REVIEW.md",
 ]
 
 

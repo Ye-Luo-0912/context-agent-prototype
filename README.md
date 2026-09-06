@@ -11,10 +11,13 @@ one workspace, one explicit provider profile, bounded builtin tools,
 human-approved effects, verifiable completion and cold resume. The alpha
 (`v0.1.0`: packaged Windows/Linux binaries, install notes, checked
 configuration, checkpoints/status/doctor) is released, and the formal M15
-reliability gate is closed. The current stage wires existing runtime
-capability into the daily workflow; the ordered feature route is in
-[`docs/ROADMAP.md`](docs/ROADMAP.md#route-to-a-usable-local-agent) and the
-active task queue in [`docs/NEXT_TASKS.md`](docs/NEXT_TASKS.md).
+reliability gate is closed. The current stage is **M16**. The live queue
+currently leads with remaining 2026-09-06 deep-audit items (now
+**STORAGE-02**), then returns to M16 product leftovers. The ordered route is
+[`docs/ROADMAP.md`](docs/ROADMAP.md#route-to-a-usable-local-agent); the
+active task queue is [`docs/NEXT_TASKS.md`](docs/NEXT_TASKS.md). M16
+replaces the earlier D0/F1–F6 queue. It does not add Chronicle, TaskGraph,
+or a second orchestrator.
 
 ## Architecture
 
@@ -81,7 +84,7 @@ The code is designed for modern stable Rust with the 2024 edition.
 
 ```bash
 cargo run -p agent-tui -- .
-# headless (JSONL on stdout; ungranted writes are denied)
+# headless (JSONL on stdout or --jsonl-out; ungranted writes are denied)
 AGENT_DEMO=1 cargo run -p agent-tui -- --prompt="demo: list files" .
 ```
 
@@ -204,8 +207,8 @@ review/revert substrate for anything the agent changes.
   `.focus-agent/checkpoints/`.
 - `/restore <path>` restores a runtime checkpoint in the current prototype.
   This path-based command is not yet the verified `resume latest` product flow.
-- `/grants` lists active standing grants. Startup grants currently use
-  `--grant=<JSON>`; a usable revoke flow is still product work.
+- `/grants` lists active standing grants. Startup grants use `--grant=<JSON>`
+  or `--grant-file`; `/revoke <grant-id>` removes one.
 - `/cancel` aborts the in-flight model turn.
 - `Tab` toggles the context inspect panel (selected items + lifecycle transitions).
 - `/quit` exits.

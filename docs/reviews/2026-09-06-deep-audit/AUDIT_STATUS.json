@@ -1,0 +1,52 @@
+{
+  "repository": "Ye-Luo-0912/context-agent-prototype",
+  "source_sha": "12c86283b8d5991e9f17a07f14871dcf39d65066",
+  "tree_sha": "77ec0dd995949f4667f05c4182eb6259a8c9ea7d",
+  "date": "2026-09-06",
+  "status": "PARTIAL_SOURCE_REVIEW_WITH_TARGETED_EXECUTION",
+  "requested_scope": "complete repository",
+  "clone_success": false,
+  "entire_tree_enumerated": false,
+  "all_files_reviewed": false,
+  "local_cargo_available": false,
+  "local_rust_tests_executed": false,
+  "new_unique_body_paths": 29,
+  "full_body_paths_in_this_ledger": 18,
+  "partial_body_paths": 11,
+  "source_crates_with_body_reads": [
+    "agent-capability-process",
+    "agent-core",
+    "agent-process",
+    "agent-storage",
+    "agent-workspace",
+    "context-simple",
+    "provider-openai",
+    "tool-runtime"
+  ],
+  "source_crates_not_body_read_this_round": [
+    "agent-compose",
+    "agent-conformance",
+    "agent-context-service",
+    "agent-contracts",
+    "agent-eval",
+    "agent-platform-protocol",
+    "agent-replay",
+    "agent-runtime",
+    "agent-tui",
+    "context-baselines",
+    "context-contextcore"
+  ],
+  "cumulative_unique_paths_from_two_available_ledgers": 46,
+  "cumulative_ledger_is_full_repository_inventory": false,
+  "new_findings": 13,
+  "prior_findings_not_counted_as_new": true,
+  "remote_modifications": false,
+  "actual_tests": [
+    "exact dist.sh with stub cargo (3 cases)",
+    "POSIX FIFO open mechanism",
+    "Linux supervisor SIGKILL orphan mechanism"
+  ],
+  "final_main_sha_observed": "12c86283b8d5991e9f17a07f14871dcf39d65066",
+  "final_head_response": "turn206",
+  "head_changed_during_review": false
+}

@@ -45,9 +45,11 @@ material. See [`COMPATIBILITY.md`](COMPATIBILITY.md) for the schema.
 
 | Flag | Default | Effect |
 | --- | --- | --- |
-| `--read-only` | off | Every write/process call is denied by policy; cannot combine with `--grant` or `--restore`. |
+| `--read-only` | off | Every write/process call is denied by policy; cannot combine with `--grant` / `--grant-file` or `--restore`. |
 | `--grant=<JSON>` | none | Standing grants for write/process tools; revoke with `/revoke <grant-id>`. |
-| `--prompt=<text>` | unset | Headless: one user message (`-` reads stdin). JSONL events on stdout. |
+| `--grant-file=<path>` | none | Same grants from a JSON object or array (repeatable; combined cap 16). Fail-closed if missing/invalid. Also valid for the TUI. |
+| `--jsonl-out=<path>` | stdout | Headless: write JSONL to a file instead of stdout. Requires `--prompt` or `--continue`. |
+| `--prompt=<text>` | unset | Headless: one user message (`-` reads stdin). JSONL events on stdout unless `--jsonl-out` is set. |
 | `--work` | off | Headless long-task entry (same composition as TUI `/work`). Requires `--prompt`. |
 | `--continue` | off | Headless: continue the restored/active task's stored directive. Cannot combine with `--prompt`. |
 | `--max-rounds=<N>` | runtime default (16) | Finite model-round budget for one execution segment (TUI and headless). |

@@ -1,0 +1,13 @@
+{
+  "command": [
+    "git",
+    "clone",
+    "--no-checkout",
+    "https://github.com/Ye-Luo-0912/context-agent-prototype.git",
+    "/mnt/data/context-agent-prototype"
+  ],
+  "returncode": 128,
+  "stdout": "",
+  "stderr": "Cloning into '/mnt/data/context-agent-prototype'...\nfatal: unable to access 'https://github.com/Ye-Luo-0912/context-agent-prototype.git/': Could not resolve host: github.com\n",
+  "timed_out": false
+}

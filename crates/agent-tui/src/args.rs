@@ -14,6 +14,8 @@ pub struct ProductArgs {
     pub context_policy: String,
     pub root: Option<PathBuf>,
     pub grant_args: Vec<String>,
+    pub grant_files: Vec<PathBuf>,
+    pub jsonl_out: Option<PathBuf>,
     pub effect_reservation_journal: Option<PathBuf>,
     pub restore_arg: Option<PathBuf>,
     pub doctor_mode: bool,
@@ -48,6 +50,8 @@ where
         context_policy: "dynamic".to_string(),
         root: None,
         grant_args: Vec::new(),
+        grant_files: Vec::new(),
+        jsonl_out: None,
         effect_reservation_journal: None,
         restore_arg: None,
         doctor_mode: false,
@@ -82,6 +86,21 @@ where
             parsed.context_policy = value.to_string();
         } else if let Some(value) = arg.strip_prefix("--grant=") {
             parsed.grant_args.push(value.to_string());
+        } else if let Some(value) = arg.strip_prefix("--grant-file=") {
+            if value.trim().is_empty() {
+                anyhow::bail!("--grant-file needs a path");
+            }
+            parsed.grant_files.push(PathBuf::from(value));
+        } else if let Some(value) = arg.strip_prefix("--jsonl-out=") {
+            if parsed.jsonl_out.is_some() {
+                anyhow::bail!("--jsonl-out may be given only once");
+            }
+            if value.trim().is_empty() || value == "-" {
+                anyhow::bail!(
+                    "invalid --jsonl-out {value:?}: pass a file path (omit the flag to use stdout)"
+                );
+            }
+            parsed.jsonl_out = Some(PathBuf::from(value));
         } else if let Some(value) = arg.strip_prefix("--effect-reservation-journal=") {
             parsed.effect_reservation_journal = Some(PathBuf::from(value));
         } else if let Some(value) = arg.strip_prefix("--restore=") {
@@ -117,17 +136,19 @@ impl ProductArgs {
         if self.read_only && self.restore_arg.is_some() {
             anyhow::bail!("--restore cannot be combined with --read-only");
         }
-        if self.read_only && !self.grant_args.is_empty() {
+        if self.read_only && (!self.grant_args.is_empty() || !self.grant_files.is_empty()) {
             anyhow::bail!("--grant cannot be combined with --read-only");
         }
         if self.doctor_mode
             && (self.prompt.is_some()
                 || self.continue_task
                 || self.work
-                || self.timeout_secs.is_some())
+                || self.timeout_secs.is_some()
+                || self.jsonl_out.is_some()
+                || !self.grant_files.is_empty())
         {
             anyhow::bail!(
-                "--doctor cannot combine with --prompt, --work, --continue, or --timeout-secs"
+                "--doctor cannot combine with --prompt, --work, --continue, --timeout-secs, --grant-file, or --jsonl-out"
             );
         }
         if self.work && self.prompt.is_none() {
@@ -140,6 +161,9 @@ impl ProductArgs {
         }
         if self.timeout_secs.is_some() && !self.is_headless() {
             anyhow::bail!("--timeout-secs requires --prompt or --continue");
+        }
+        if self.jsonl_out.is_some() && !self.is_headless() {
+            anyhow::bail!("--jsonl-out requires --prompt or --continue");
         }
         Ok(())
     }
@@ -179,19 +203,21 @@ agent-tui — local coding agent (interactive TUI or headless JSONL)
 
 Usage:
   agent-tui [options] [workspace]
-  agent-tui --prompt=<text> [--work] [--grant=<JSON>] [options] [workspace]
+  agent-tui --prompt=<text> [--work] [--grant-file=<path>] [options] [workspace]
   agent-tui --restore=<path|latest> --continue [options] [workspace]
   agent-tui --doctor [workspace]
 
-Headless sessions write runtime events as JSONL on stdout and banners on
-stderr. They never prompt for approval. Ungranted writes and process calls
-are denied immediately. There is no --yes / --allow-all.
+Headless sessions write runtime events as JSONL on stdout (or --jsonl-out)
+and banners on stderr. They never prompt for approval. Ungranted writes and
+process calls are denied immediately. There is no --yes / --allow-all.
 
 Options:
   --prompt=<text>     one user message (\"-\" reads stdin); implies headless
   --work              compose like /work (set_focus + task.manage + the prompt)
   --continue          continue the restored/active task's stored directive
   --grant=<JSON>      standing write/process grant (repeatable)
+  --grant-file=<path> standing grants from a JSON object or array (repeatable)
+  --jsonl-out=<path>  write headless JSONL to a file instead of stdout
   --read-only         deny every write/process call
   --max-rounds=<N>    finite model-round budget for this execution segment
   --timeout-secs=<N>  headless wait cap (default 900, max 86400)
@@ -296,5 +322,38 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(grant.contains("--grant cannot"), "{grant}");
+        let grant_file = parse_args(["--read-only", "--grant-file=grants.json"])
+            .unwrap_err()
+            .to_string();
+        assert!(grant_file.contains("--grant cannot"), "{grant_file}");
+    }
+
+    #[test]
+    fn grant_file_and_jsonl_out_parse_for_headless_sessions() {
+        let args = parse_args([
+            "--prompt=fix it",
+            "--grant-file=grants.json",
+            "--jsonl-out=.focus-agent/last.jsonl",
+            ".",
+        ])
+        .unwrap();
+        assert_eq!(args.grant_files, vec![PathBuf::from("grants.json")]);
+        assert_eq!(
+            args.jsonl_out.as_deref(),
+            Some(std::path::Path::new(".focus-agent/last.jsonl"))
+        );
+
+        let interactive = parse_args(["--jsonl-out=out.jsonl"])
+            .unwrap_err()
+            .to_string();
+        assert!(
+            interactive.contains("--jsonl-out requires"),
+            "{interactive}"
+        );
+
+        let empty = parse_args(["--prompt=hi", "--jsonl-out="])
+            .unwrap_err()
+            .to_string();
+        assert!(empty.contains("--jsonl-out"), "{empty}");
     }
 }

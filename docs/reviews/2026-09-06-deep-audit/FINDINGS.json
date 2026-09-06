@@ -1,0 +1,224 @@
+[
+  {
+    "id": "STORAGE-01",
+    "priority": "P1",
+    "title": "Windows 元数据删除窗口可把既有 journal 当成新建",
+    "source_sha": "12c86283b8d5991e9f17a07f14871dcf39d65066",
+    "files": [
+      "crates/agent-storage/src/lib.rs"
+    ],
+    "functions": "FileOperationJournal::open; replace_file; compact_locked",
+    "evidence_level": "STATIC_CONFIRMED",
+    "trigger": "Windows crash after removing metadata and before rename, after an earlier successful compaction",
+    "recommended_repair": "Detect orphan generations and fail closed; atomic replacement without pre-unlink; verified recovery only",
+    "test_status": "Windows crash/fault test required; not executed",
+    "repository_rust_reproduced": false,
+    "status": "OPEN_AUDIT_FINDING_NOT_PATCHED"
+  },
+  {
+    "id": "STORAGE-02",
+    "priority": "P1",
+    "title": "压缩元数据已发布后失败，旧 writer 未被隔离",
+    "source_sha": "12c86283b8d5991e9f17a07f14871dcf39d65066",
+    "files": [
+      "crates/agent-storage/src/lib.rs",
+      "crates/agent-core/src/operation.rs",
+      "crates/agent-core/src/kernel/mod.rs"
+    ],
+    "functions": "persist_authority_metadata; compact_locked; compact_authority_journal",
+    "evidence_level": "STATIC_CONFIRMED_CONDITIONAL_PATH",
+    "trigger": "Successful metadata rename followed by directory-sync/seek failure through explicit compaction",
+    "recommended_repair": "Fence post-publication uncertainty; prevent old-generation writes; reconcile durable published generation",
+    "test_status": "Fault injection required; ordinary append errors already fence in Core",
+    "repository_rust_reproduced": false,
+    "status": "OPEN_AUDIT_FINDING_NOT_PATCHED"
+  },
+  {
+    "id": "PROCESS-01",
+    "priority": "P1",
+    "title": "宿主验证进程跳过恢复登记，宿主硬崩溃后的监督责任缺失",
+    "source_sha": "12c86283b8d5991e9f17a07f14871dcf39d65066",
+    "files": [
+      "crates/tool-runtime/src/tools/process.rs",
+      "crates/tool-runtime/src/proof_runner.rs"
+    ],
+    "functions": "ProcessRunTool::execute_invocation; RecipeProofRunner::verify_exact",
+    "evidence_level": "STATIC_PLUS_OS_MECHANISM",
+    "trigger": "Enabled host proof and supervisor SIGKILL/abort; silent separately grouped child",
+    "recommended_repair": "Persist host supervision identity or enforce OS lifetime containment; cleanup acknowledgement before reusing workspace",
+    "test_status": "Linux OS mechanism probe executed; Agent crash/resume test NOT executed",
+    "repository_rust_reproduced": false,
+    "status": "OPEN_AUDIT_FINDING_NOT_PATCHED"
+  },
+  {
+    "id": "WORKSPACE-01",
+    "priority": "P1",
+    "title": "普通 confined open 可阻塞在 FIFO",
+    "source_sha": "12c86283b8d5991e9f17a07f14871dcf39d65066",
+    "files": [
+      "crates/agent-workspace/src/confined.rs",
+      "crates/agent-workspace/src/runtime_facts.rs"
+    ],
+    "functions": "ConfinedDir::open_existing; open_staged_for_cleanup; project_markers",
+    "evidence_level": "STATIC_PLUS_OS_MECHANISM",
+    "trigger": "FIFO named a probed project marker, with no writer",
+    "recommended_repair": "Use metadata-only marker probes; nonblocking same-handle regular-file validation for body reads",
+    "test_status": "Linux FIFO mechanism probe executed; Rust integration NOT executed",
+    "repository_rust_reproduced": false,
+    "status": "OPEN_AUDIT_FINDING_NOT_PATCHED"
+  },
+  {
+    "id": "PACKAGE-01",
+    "priority": "P1",
+    "title": "构建输出、打包输入和旧发布目录未绑定",
+    "source_sha": "12c86283b8d5991e9f17a07f14871dcf39d65066",
+    "files": [
+      "scripts/dist.sh",
+      "scripts/dist.ps1",
+      ".github/workflows/package.yml"
+    ],
+    "functions": "packaging scripts",
+    "evidence_level": "EXACT_SCRIPT_WITH_STUB_BUILDER",
+    "trigger": "Custom target directory differs from cargo target; reused dist version directory; PowerShell native build failure",
+    "recommended_repair": "One explicit target dir, locked builds, clean staging, explicit helper choice, native exit checks, artifact manifest",
+    "test_status": "Two Bash failure scenarios plus one passing fail-fast control executed; no real cargo/Windows run",
+    "repository_rust_reproduced": false,
+    "status": "OPEN_AUDIT_FINDING_NOT_PATCHED"
+  },
+  {
+    "id": "PROVIDER-01",
+    "priority": "P1",
+    "title": "非成功 HTTP 响应先完整读取，绕过流式字节上限",
+    "source_sha": "12c86283b8d5991e9f17a07f14871dcf39d65066",
+    "files": [
+      "crates/provider-openai/src/lib.rs"
+    ],
+    "functions": "complete_chat_stream; complete_responses_stream",
+    "evidence_level": "STATIC_CONFIRMED",
+    "trigger": "Oversized or indefinitely streaming non-2xx response body",
+    "recommended_repair": "Bounded chunk read before text decoding, deadline/cancellation, explicit truncation metadata",
+    "test_status": "No HTTP/Rust resource exhaustion test executed",
+    "repository_rust_reproduced": false,
+    "status": "OPEN_AUDIT_FINDING_NOT_PATCHED"
+  },
+  {
+    "id": "WORKSPACE-02",
+    "priority": "P2",
+    "title": "Windows 拒绝路径先检查后接管 raw HANDLE",
+    "source_sha": "12c86283b8d5991e9f17a07f14871dcf39d65066",
+    "files": [
+      "crates/agent-workspace/src/confined.rs"
+    ],
+    "functions": "open_root_handle; open_child_dir; open_existing; open_staged_for_cleanup; open_or_create_regular_file",
+    "evidence_level": "STATIC_CONFIRMED",
+    "trigger": "check_not_reparse fails before OwnedHandle/File construction",
+    "recommended_repair": "Own the handle immediately; reuse the already-correct recovery helper pattern",
+    "test_status": "Windows handle-count/fault tests not executed; rejection is not a path escape",
+    "repository_rust_reproduced": false,
+    "status": "OPEN_AUDIT_FINDING_NOT_PATCHED"
+  },
+  {
+    "id": "PROVIDER-02",
+    "priority": "P2",
+    "title": "Chat length 终止未映射为输出上限结果",
+    "source_sha": "12c86283b8d5991e9f17a07f14871dcf39d65066",
+    "files": [
+      "crates/provider-openai/src/sse.rs",
+      "crates/provider-openai/src/lib.rs",
+      "crates/provider-openai/src/responses.rs"
+    ],
+    "functions": "StreamAccumulator::apply/finalize; provider protocol branches",
+    "evidence_level": "STATIC_CONFIRMED",
+    "trigger": "Chat stream has finish_reason=length then DONE; accumulated output parses",
+    "recommended_repair": "Normalize terminal reason through provider-neutral outcome; no blind replay after exposure",
+    "test_status": "Paired protocol fixtures proposed, not executed",
+    "repository_rust_reproduced": false,
+    "status": "OPEN_AUDIT_FINDING_NOT_PATCHED"
+  },
+  {
+    "id": "PROVIDER-03",
+    "priority": "P2",
+    "title": "Responses EOF 尾帧绕过 event/data 路由一致性检查",
+    "source_sha": "12c86283b8d5991e9f17a07f14871dcf39d65066",
+    "files": [
+      "crates/provider-openai/src/lib.rs",
+      "crates/provider-openai/src/sse.rs"
+    ],
+    "functions": "complete_responses_stream residual framer.finish path",
+    "evidence_level": "STATIC_CONFIRMED",
+    "trigger": "Contradictory SSE event name and JSON type in the final unblank-terminated event",
+    "recommended_repair": "Use one validated frame handler for normal dispatch and EOF flush",
+    "test_status": "Termination-variation fixture proposed, not executed",
+    "repository_rust_reproduced": false,
+    "status": "OPEN_AUDIT_FINDING_NOT_PATCHED"
+  },
+  {
+    "id": "MCP-01",
+    "priority": "P2",
+    "title": "取消没有覆盖请求写阶段，写错误返回前未确认 reap",
+    "source_sha": "12c86283b8d5991e9f17a07f14871dcf39d65066",
+    "files": [
+      "crates/agent-capability-process/src/mcp.rs"
+    ],
+    "functions": "request_with_cancel; send_frame; McpCapabilityAdapter::invoke",
+    "evidence_level": "STATIC_CONFIRMED_WITH_UPPER_LAYER_LIMIT",
+    "trigger": "Peer stops reading while request write is blocked; cancellation occurs after initial check",
+    "recommended_repair": "Make write/connect/read bounded and cancellation-aware; partial write poisons session; await cleanup result",
+    "test_status": "Adapter/client boundary confirmed; whole Runtime responsiveness not reproduced",
+    "repository_rust_reproduced": false,
+    "status": "OPEN_AUDIT_FINDING_NOT_PATCHED"
+  },
+  {
+    "id": "PROCESS-02",
+    "priority": "P2",
+    "title": "reap 在未确认退出时仍清空 pid",
+    "source_sha": "12c86283b8d5991e9f17a07f14871dcf39d65066",
+    "files": [
+      "crates/agent-process/src/supervisor.rs",
+      "crates/agent-process/src/host.rs"
+    ],
+    "functions": "ProcessSupervisor::reap; kill_tree",
+    "evidence_level": "STATIC_CONFIRMED_CONDITIONAL_PATH",
+    "trigger": "wait error or both bounded waits fail; direct-child fallback tries a held lock",
+    "recommended_repair": "Return typed cleanup outcome; only clear identity after confirmed terminal; retain owned cleanup responsibility",
+    "test_status": "Production Unix group leaders mitigate ordinary path; fault/non-group test required",
+    "repository_rust_reproduced": false,
+    "status": "OPEN_AUDIT_FINDING_NOT_PATCHED"
+  },
+  {
+    "id": "CONTEXT-01",
+    "priority": "P2",
+    "title": "依赖候选先截旧前缀再排序，违背 newest-first",
+    "source_sha": "12c86283b8d5991e9f17a07f14871dcf39d65066",
+    "files": [
+      "crates/context-simple/src/index/dependency.rs",
+      "crates/context-simple/src/index/indexes.rs",
+      "crates/context-simple/src/materializer.rs"
+    ],
+    "functions": "push_linked; ids_for_entity; update_entities",
+    "evidence_level": "STATIC_CONFIRMED_ALGORITHM",
+    "trigger": "More than 64 live creation-ordered items in one entity bucket",
+    "recommended_repair": "Order/select by creation before cap; preserve order across index mutations; separate scan budget from candidate quota",
+    "test_status": "Arithmetic counterexample provided; no Rust test executed; affinity edges are not mandatory prompt bodies",
+    "repository_rust_reproduced": false,
+    "status": "OPEN_AUDIT_FINDING_NOT_PATCHED"
+  },
+  {
+    "id": "DOC-01",
+    "priority": "P3",
+    "title": "CURRENT 待办断言与已落地文件矛盾，检查只验证子集",
+    "source_sha": "12c86283b8d5991e9f17a07f14871dcf39d65066",
+    "files": [
+      "docs/CURRENT.md",
+      "scripts/doc_consistency.py",
+      "docs/EXECUTION_MODEL.md"
+    ],
+    "functions": "Current state and document-consistency gate",
+    "evidence_level": "STATIC_CONFIRMED",
+    "trigger": "CURRENT still calls document CI and EXECUTION_MODEL extraction pending",
+    "recommended_repair": "Correct current statements, label historical basis, tighten only relevant current assertions",
+    "test_status": "No whole-checkout document gate executed; not a reason to build a new governance platform",
+    "repository_rust_reproduced": false,
+    "status": "OPEN_AUDIT_FINDING_NOT_PATCHED"
+  }
+]

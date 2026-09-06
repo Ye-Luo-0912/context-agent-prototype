@@ -1,0 +1,13 @@
+{
+  "repository": "Ye-Luo-0912/context-agent-prototype",
+  "source_sha": "12c86283b8d5991e9f17a07f14871dcf39d65066",
+  "local_clone_present": false,
+  "git": "/usr/bin/git",
+  "cargo": null,
+  "rustc": null,
+  "python": "3.13.5 (main, Jul 15 2026, 20:25:40) [GCC 14.2.0]",
+  "platform": "Linux-6.18.35-x86_64-with-glibc2.41",
+  "local_cargo_checks": "NOT_RUN: no checkout and no cargo/rustc",
+  "source_acquisition": "GitHub connector, selected pinned files; not a complete clone",
+  "historical_report_tests_inherited": false
+}
