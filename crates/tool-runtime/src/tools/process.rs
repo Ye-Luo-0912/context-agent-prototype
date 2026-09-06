@@ -2234,15 +2234,15 @@ mod tests {
             let rc =
                 unsafe { libc::prctl(libc::PR_GET_PDEATHSIG, &mut signal as *mut libc::c_int) };
             let ppid = unsafe { libc::getppid() };
-            let mut status = std::fs::read_to_string("/proc/self/status").unwrap_or_default();
-            let ppid_line = status
-                .lines()
-                .find(|line| line.starts_with("PPid:"))
-                .unwrap_or("PPid:?")
-                .to_string();
-            status.clear();
+            // Self-set/get: distinguishes "prctl is blocked on this
+            // runner" (self-set fails or still reads 0) from "the pre_exec
+            // hook never ran" (the parent was supposed to arm it).
+            let set_rc = unsafe { libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL) };
+            let mut after: libc::c_int = 0;
+            let get_rc =
+                unsafe { libc::prctl(libc::PR_GET_PDEATHSIG, &mut after as *mut libc::c_int) };
             println!(
-                "PROBE rc={rc} sig={signal} getppid={ppid} {ppid_line} host={}",
+                "PROBE rc={rc} sig={signal} getppid={ppid} host={} selfset={set_rc} after={after} getrc={get_rc}",
                 std::env::var("PDEATHSIG_PROBE_HOST").unwrap_or_default()
             );
             std::process::exit(0);
