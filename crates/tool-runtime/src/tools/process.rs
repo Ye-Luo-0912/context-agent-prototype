@@ -2238,10 +2238,11 @@ mod tests {
         }
         let mut command = Command::new(std::env::current_exe().unwrap());
         // --nocapture: the probe child exits itself, so libtest must not
-        // buffer (and lose) its report.
+        // buffer (and lose) its report. The bare-name filter matches the
+        // full test path as a substring (--exact would need the whole
+        // module path).
         command.args([
             "parent_death_signal_is_registered_on_spawned_children",
-            "--exact",
             "--nocapture",
         ]);
         command.env("PDEATHSIG_PROBE_CHILD", "1");
