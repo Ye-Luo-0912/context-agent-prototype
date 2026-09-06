@@ -24,6 +24,15 @@ use crate::host::JobObject;
 /// bounded wait is the last boundary a stuck child can cross.
 const REAP_GRACE: std::time::Duration = std::time::Duration::from_secs(5);
 
+/// Whether a reap observed the child's exit. `Unconfirmed` means every
+/// wait failed or timed out even after a tree kill: the pid stays armed so
+/// Drop keeps trying, and the caller must not treat the cleanup as done.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProcessReapOutcome {
+    Confirmed,
+    Unconfirmed,
+}
+
 /// Owns one spawned child and its containment.
 ///
 /// Kill is synchronous so timeout/cancel paths can fence the tree without
@@ -91,12 +100,15 @@ impl ProcessSupervisor {
         #[cfg(not(windows))]
         kill_process_tree(pid);
         #[cfg(unix)]
-        {
-            if pid != 0
-                && unsafe { libc::kill(-(pid as i32), libc::SIGKILL) } != 0
-                && let Ok(mut child) = self.child.try_lock()
-            {
-                let _ = child.start_kill();
+        if pid != 0 {
+            // Production children are process-group leaders, so the
+            // negative-pid kill reaches the whole tree. When it fails
+            // (not a group leader), fall back to a direct kill WITHOUT
+            // the child lock: `reap` escalates to `kill_tree` while it
+            // holds that lock, so a `try_lock` here would silently skip
+            // the direct child (PROCESS-02).
+            if unsafe { libc::kill(-(pid as i32), libc::SIGKILL) } != 0 {
+                let _ = unsafe { libc::kill(pid as libc::pid_t, libc::SIGKILL) };
             }
         }
         #[cfg(not(any(unix, windows)))]
@@ -111,19 +123,37 @@ impl ProcessSupervisor {
     /// [`Self::kill_tree`] or a graceful shutdown; a second wait on an
     /// already-reaped child returns immediately. A child that ignores the
     /// graceful shutdown escalates to a tree kill and gets one more bounded
-    /// wait, so teardown can never hang on a stuck child. Clears the pid
-    /// afterwards so Drop cannot `kill_process_tree` a numeric pid the OS
-    /// has already reused.
-    pub async fn reap(&self) {
+    /// wait, so teardown can never hang on a stuck child.
+    ///
+    /// The pid is cleared only after a CONFIRMED exit: a wait error or a
+    /// second wait that still times out leaves the identity in place so
+    /// Drop keeps kill responsibility for a child this process could not
+    /// confirm dead (PROCESS-02). The confirmation is returned so callers
+    /// can surface an unconfirmed cleanup instead of assuming success.
+    pub async fn reap(&self) -> ProcessReapOutcome {
         let mut child = self.child.lock().await;
-        if tokio::time::timeout(REAP_GRACE, child.wait())
-            .await
-            .is_err()
-        {
+        let mut confirmed = matches!(
+            tokio::time::timeout(REAP_GRACE, child.wait()).await,
+            Ok(Ok(_))
+        );
+        if !confirmed {
             self.kill_tree();
-            let _ = tokio::time::timeout(REAP_GRACE, child.wait()).await;
+            confirmed = matches!(
+                tokio::time::timeout(REAP_GRACE, child.wait()).await,
+                Ok(Ok(_))
+            );
         }
-        self.pid.store(0, Ordering::Relaxed);
+        if confirmed {
+            // Drop must never `kill_process_tree` a numeric pid the OS has
+            // already reused — clearing is safe exactly because the exit
+            // was observed.
+            self.pid.store(0, Ordering::Relaxed);
+        }
+        if confirmed {
+            ProcessReapOutcome::Confirmed
+        } else {
+            ProcessReapOutcome::Unconfirmed
+        }
     }
 
     /// Non-blocking exit probe: true once the child has been reaped as
@@ -135,9 +165,9 @@ impl ProcessSupervisor {
 
     /// Kill the tree then await reap. Error/cancel/timeout paths use this
     /// before returning.
-    pub async fn terminate(&self) {
+    pub async fn terminate(&self) -> ProcessReapOutcome {
         self.kill_tree();
-        self.reap().await;
+        self.reap().await
     }
 
     pub async fn stderr_tail(&self) -> String {
@@ -201,6 +231,31 @@ mod tests {
         assert!(
             child.try_wait().unwrap().is_some(),
             "terminate must reap so the child is not left running"
+        );
+    }
+
+    /// A child that was never made a process-group leader must still die
+    /// when the group kill fails and the child lock is already held —
+    /// reap escalates to kill_tree while holding that lock, so the old
+    /// try_lock fallback silently skipped the direct child (PROCESS-02).
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn kill_tree_falls_back_to_a_direct_kill_without_the_child_lock() {
+        let mut command = tokio::process::Command::new("sleep");
+        command
+            .arg("20")
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        // No process_group(0): the negative-pid group kill will fail with
+        // ESRCH and the fallback must take over.
+        let child = command.spawn().unwrap();
+        let pid = child.id().unwrap_or(0);
+        let supervisor = ProcessSupervisor::from_child(child, pid);
+        supervisor.kill_tree();
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert!(
+            !crate::lifecycle::process_is_running(pid),
+            "the direct-child fallback must kill a non-group-leader child"
         );
     }
 

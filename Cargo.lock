@@ -2475,12 +2475,14 @@ dependencies = [
  "agent-process",
  "agent-workspace",
  "async-trait",
+ "libc",
  "regex",
  "serde",
  "serde_json",
  "sha2",
  "tempfile",
  "tokio",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]

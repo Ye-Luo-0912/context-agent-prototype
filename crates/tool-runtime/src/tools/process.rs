@@ -930,6 +930,18 @@ impl ProcessRunTool {
         #[cfg(unix)]
         command.process_group(0);
 
+        // Host-death containment (PROCESS-01): if the host process is
+        // SIGKILLed or crashes, the kernel kills this child instead of
+        // leaving an unsupervised verifier behind. The getppid check
+        // closes the classic race where the host died between spawn and
+        // prctl. Windows uses the host-death job assigned right after
+        // spawn (see below).
+        #[cfg(unix)]
+        apply_parent_death_signal(&mut command);
+
+        #[cfg(windows)]
+        let host_death_job = host_death_job::HostDeathJob::create();
+
         let mut child = match command.spawn() {
             Ok(child) => child,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
@@ -967,6 +979,28 @@ impl ProcessRunTool {
         // not just the direct child (`kill_on_drop` kills only the child
         // itself). The guard is disarmed only after the child is reaped.
         let mut tree_guard = super::ProcessTreeGuard::new(child.id().unwrap_or(0));
+        // Assign the host-death job once the pid exists; the handle stays
+        // alive for the whole run, so a host crash closes it and the
+        // kernel kills the tree. A refused assignment (outer job on CI
+        // runners) degrades to no containment, matching the
+        // capability-process host.
+        #[cfg(windows)]
+        let host_death_job = match host_death_job {
+            Some(job) => {
+                if !job.assign(child.id().unwrap_or(0)) {
+                    eprintln!(
+                        "host-death job assign skipped: process {} is already confined by an outer job",
+                        child.id().unwrap_or(0)
+                    );
+                    None
+                } else {
+                    Some(job)
+                }
+            }
+            None => None,
+        };
+        #[cfg(windows)]
+        let _host_death_job = host_death_job;
         // The host-owned proof lane is a synchronous short transaction: the
         // composition root has no Core identity to persist, and cancel or
         // timeout kill the whole tree before the run returns. Crash recovery
@@ -1195,6 +1229,103 @@ pub(crate) fn bounded_cwd_listing(dir: &std::path::Path) -> Vec<String> {
     names.sort();
     names.truncate(20);
     names
+}
+
+/// Host-death containment for Windows: a Job-Object with
+/// `KILL_ON_JOB_CLOSE`, created before spawn and assigned right after, so
+/// a crashed or SIGKILLed host closes the handle and the kernel kills the
+/// whole assigned tree (PROCESS-01). RAII close mirrors the
+/// capability-process host's JobObject.
+#[cfg(windows)]
+pub(crate) mod host_death_job {
+    use windows_sys::Win32::Foundation::{CloseHandle, HANDLE, INVALID_HANDLE_VALUE};
+    use windows_sys::Win32::System::JobObjects::{
+        AssignProcessToJobObject, CreateJobObjectW, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
+        SetInformationJobObject,
+    };
+    use windows_sys::Win32::System::Threading::{
+        OpenProcess, PROCESS_SET_QUOTA, PROCESS_TERMINATE,
+    };
+
+    pub struct HostDeathJob(HANDLE);
+
+    // A kernel handle is shareable behind a lock; CloseHandle is
+    // thread-safe (same reasoning as the capability-process JobObject).
+    unsafe impl Send for HostDeathJob {}
+    unsafe impl Sync for HostDeathJob {}
+
+    impl HostDeathJob {
+        /// Create the job with kill-on-close. `None` means creation was
+        /// refused by the OS: the run loses containment but stays usable,
+        /// matching the capability-process host's degradation.
+        pub fn create() -> Option<Self> {
+            unsafe {
+                let job = CreateJobObjectW(std::ptr::null(), std::ptr::null());
+                if job == INVALID_HANDLE_VALUE || job.is_null() {
+                    return None;
+                }
+                let mut info: windows_sys::Win32::System::JobObjects::JOBOBJECT_EXTENDED_LIMIT_INFORMATION =
+                    std::mem::zeroed();
+                info.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+                let ok = SetInformationJobObject(
+                    job,
+                    windows_sys::Win32::System::JobObjects::JobObjectExtendedLimitInformation,
+                    &info as *const _ as *const core::ffi::c_void,
+                    std::mem::size_of::<
+                        windows_sys::Win32::System::JobObjects::JOBOBJECT_EXTENDED_LIMIT_INFORMATION,
+                    >() as u32,
+                );
+                if ok == 0 {
+                    let _ = CloseHandle(job);
+                    return None;
+                }
+                Some(Self(job))
+            }
+        }
+
+        /// Assign one process (by pid). `false` = kernel refused (outer
+        /// job confinement), the same accepted degradation as the
+        /// capability-process host.
+        pub fn assign(&self, pid: u32) -> bool {
+            unsafe {
+                let process = OpenProcess(PROCESS_SET_QUOTA | PROCESS_TERMINATE, 0, pid);
+                if process.is_null() {
+                    return false;
+                }
+                let assigned = AssignProcessToJobObject(self.0, process);
+                let _ = CloseHandle(process);
+                assigned != 0
+            }
+        }
+    }
+
+    impl Drop for HostDeathJob {
+        fn drop(&mut self) {
+            unsafe {
+                let _ = CloseHandle(self.0);
+            }
+        }
+    }
+}
+
+/// Register `PR_SET_PDEATHSIG = SIGKILL` on the child (PROCESS-01): the
+/// kernel kills it when the host process dies, so a crashed or SIGKILLed
+/// host cannot leave an unsupervised verifier running. The getppid check
+/// closes the race where the host died between spawn and prctl.
+#[cfg(unix)]
+pub(crate) fn apply_parent_death_signal(command: &mut Command) {
+    use std::os::unix::process::CommandExt as _;
+    let host_pid = std::process::id() as libc::pid_t;
+    unsafe {
+        command.as_std_mut().pre_exec(move || {
+            if libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL) == 0
+                && libc::getppid() != host_pid
+            {
+                libc::kill(libc::getpid(), libc::SIGKILL);
+            }
+            Ok(())
+        });
+    }
 }
 
 #[cfg(test)]
@@ -2088,6 +2219,39 @@ mod tests {
         {
             vec!["sh".into(), "-c".into(), "exec 1>&- 2>&-; sleep 30".into()]
         }
+    }
+
+    /// PROCESS-01 behavioral probe (Unix): a child spawned through the
+    /// production containment helper has `PR_SET_PDEATHSIG` registered as
+    /// SIGKILL, so the kernel kills it when the host dies. The child mode
+    /// re-runs this same test binary under an env flag and reports what
+    /// the kernel holds.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn parent_death_signal_is_registered_on_spawned_children() {
+        if std::env::var("PDEATHSIG_PROBE_CHILD").is_ok() {
+            let mut signal: libc::c_int = 0;
+            let rc =
+                unsafe { libc::prctl(libc::PR_GET_PDEATHSIG, &mut signal as *mut libc::c_int) };
+            println!("PDEATHSIG rc={rc} signal={signal}");
+            std::process::exit(0);
+        }
+        let mut command = Command::new(std::env::current_exe().unwrap());
+        // --nocapture: the probe child exits itself, so libtest must not
+        // buffer (and lose) its report.
+        command.args([
+            "parent_death_signal_is_registered_on_spawned_children",
+            "--exact",
+            "--nocapture",
+        ]);
+        command.env("PDEATHSIG_PROBE_CHILD", "1");
+        apply_parent_death_signal(&mut command);
+        let output = command.output().await.expect("probe child runs");
+        let text = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            text.contains("PDEATHSIG rc=0 signal=9"),
+            "the spawned child must carry PR_SET_PDEATHSIG=SIGKILL: {text}"
+        );
     }
 
     #[tokio::test]
