@@ -288,9 +288,13 @@ mod tests {
         let markers = rx
             .recv_timeout(std::time::Duration::from_secs(10))
             .expect("the marker scan must not block on a writerless FIFO");
-        // The FIFO answers the probe as a file, so it counts; the point is
-        // that the scan returned at all.
-        assert!(markers.contains(&"Cargo.toml".to_string()));
+        // The scan returned (the watchdog above is the regression point)
+        // and the FIFO is rejected by the regular-file/directory check: a
+        // pipe named like a manifest is not a manifest.
+        assert!(
+            !markers.contains(&"Cargo.toml".to_string()),
+            "a FIFO must not count as a manifest marker: {markers:?}"
+        );
         assert!(markers.contains(&"README.md".to_string()));
     }
 }
