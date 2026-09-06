@@ -73,6 +73,7 @@ fn watch_stream_to_eof_then_kill<R: std::io::Read>(stream: &mut R, leader: i32) 
 /// The host-side handle. Held for the whole watched run; dropping it is
 /// the disarm path.
 #[cfg(unix)]
+#[derive(Debug)]
 pub struct HostDeathWatchdog {
     /// Write half of the pipe; `None` after [`Drop`] closes it so the
     /// watchdog observes EOF before we reap it.
@@ -161,6 +162,7 @@ impl HostDeathWatchdog {
 mod tests {
     use super::*;
     use std::os::unix::net::UnixStream;
+    use std::os::unix::process::CommandExt;
     use std::process::{Command, Stdio};
     use std::time::{Duration, Instant};
 
@@ -178,7 +180,7 @@ mod tests {
         unsafe { libc::kill(leader, 0) == 0 }
     }
 
-    fn wait_for(condition: impl Fn() -> bool, what: &str) {
+    fn wait_for(mut condition: impl FnMut() -> bool, what: &str) {
         let deadline = Instant::now() + Duration::from_secs(10);
         while !condition() {
             assert!(Instant::now() < deadline, "timed out waiting for {what}");
@@ -195,8 +197,13 @@ mod tests {
         });
         // Host "dies": the write end closes, the watchdog sees EOF.
         drop(write_half);
-        wait_for(|| !leader_alive(leader), "the watched group to die");
-        let _ = child.wait();
+        // Observe the kill through try_wait, not kill(leader, 0): a
+        // SIGKILLed child stays a zombie answering kill(pid, 0) until THIS
+        // test reaps it, so the liveness probe can never flip on its own.
+        wait_for(
+            || child.try_wait().ok().flatten().is_some(),
+            "the watched group to die",
+        );
         watchdog.join().unwrap();
     }
 
