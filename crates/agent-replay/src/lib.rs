@@ -809,9 +809,23 @@ mod tests {
     }
 
     fn tool_output_at(ok: bool, model_content: &str, path: Option<&str>) -> ToolOutput {
+        tool_output_named(
+            if ok { "verify.run" } else { "shell.exec" },
+            ok,
+            model_content,
+            path,
+        )
+    }
+
+    fn tool_output_named(
+        tool_name: &str,
+        ok: bool,
+        model_content: &str,
+        path: Option<&str>,
+    ) -> ToolOutput {
         ToolOutput {
             call_id: "call-1".into(),
-            tool_name: "shell.exec".into(),
+            tool_name: tool_name.into(),
             ok,
             summary: if ok { "ok" } else { "failed" }.into(),
             model_content: model_content.into(),

@@ -1,0 +1,16 @@
+{
+  "test_kind": "OS_MECHANISM_ONLY_NOT_REPOSITORY_TEST",
+  "source_sha": "12c86283b8d5991e9f17a07f14871dcf39d65066",
+  "source_path": "crates/tool-runtime/src/tools/process.rs",
+  "simulated_spawn_attribute": "process_group(0), no parent-death containment",
+  "supervisor_exit_code": -9,
+  "silent_child_survived_supervisor_sigkill": true,
+  "child_state_after_supervisor_death": "State:\tR (running)",
+  "child_reparented_to_probe_subreaper": true,
+  "supervisor_reaped": true,
+  "child_killed_and_reaped": true,
+  "child_wait_status": 9,
+  "parent_stderr": "",
+  "repository_binary_executed": false,
+  "rust_tests_executed": false
+}

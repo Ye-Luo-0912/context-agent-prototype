@@ -610,6 +610,7 @@ impl CoreAuthority {
                 .normalized();
                 match self.context.search_external(search).await {
                     Ok(hits) if hits.is_empty() => {
+                        let observation = self.context.last_search_observation();
                         output.ok = true;
                         output.summary = "no catalog items match".into();
                         output.model_content = if has_filter {
@@ -621,9 +622,13 @@ impl CoreAuthority {
                             "op": "search",
                             "kind": "context",
                             "descriptors": [],
+                            "cold_reads": observation.cold_reads,
+                            "cold_read_bytes": observation.cold_read_bytes,
+                            "cold_read_ms": observation.cold_read_ms,
                         });
                     }
                     Ok(hits) => {
+                        let observation = self.context.last_search_observation();
                         output.ok = true;
                         output.summary = format!("{} catalog hit(s)", hits.len());
                         // 命中行只报事实：source / residency。下一步由 residency
@@ -674,6 +679,9 @@ impl CoreAuthority {
                                 .iter()
                                 .map(ResourceDescriptor::from_context)
                                 .collect::<Vec<_>>(),
+                            "cold_reads": observation.cold_reads,
+                            "cold_read_bytes": observation.cold_read_bytes,
+                            "cold_read_ms": observation.cold_read_ms,
                         });
                     }
                     Err(error) => {

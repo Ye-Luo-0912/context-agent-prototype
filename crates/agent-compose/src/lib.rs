@@ -523,6 +523,12 @@ pub async fn compose(config: ComposeConfig) -> anyhow::Result<ComposedRuntime> {
     if let Some(journal) = journal {
         host.add_module(Arc::new(EventModule::new(journal)))?;
     }
+    // Keep a handle for the runtime services: an artifact store means the
+    // runtime's automatic safe-point writes have a real envelope store.
+    // Without it the actor-side checkpoint writes fail "no checkpoint store
+    // configured", durable resume checkpoints never land, and continuation
+    // is fenced after every mutating turn.
+    let artifact_store_for_services = artifact_store.clone();
     if let Some(artifact_store) = artifact_store {
         host.add_module(Arc::new(ArtifactModule::new(artifact_store)))?;
     }
@@ -572,12 +578,15 @@ pub async fn compose(config: ComposeConfig) -> anyhow::Result<ComposedRuntime> {
     }
     services = services.with_defer_proof_refresh(defer_proof_refresh);
     services = services.with_shadow_context_frame(shadow_context_frame);
+    if let Some(artifact_store) = artifact_store_for_services {
+        services = services.with_artifact_workspace(artifact_store);
+    }
     // A recipe table always installs the read-only domain resolver so a
     // model-facing repair can name an exact recipe on cold start. The switch
     // controls only Runtime's optional automatic execution of that recipe.
     // Enabling execution without a table remains a fail-closed boot error.
     match verification_recipes {
-        Some(recipes) => {
+        Some(recipes) if !recipes.is_empty() => {
             let runner = tool_runtime::RecipeProofRunner::new(workspace.clone(), recipes)
                 .ok_or_else(|| anyhow::anyhow!("verification recipes register no host policy"))?;
             services = services.with_proof_verifier(Arc::new(HostProofVerifier::new(runner)));
@@ -585,12 +594,12 @@ pub async fn compose(config: ComposeConfig) -> anyhow::Result<ComposedRuntime> {
                 services = services.with_project_proof_refresh(true);
             }
         }
-        None if project_proof_refresh => {
+        Some(_) | None if project_proof_refresh => {
             return Err(anyhow::anyhow!(
                 "project proof refresh requires host verification recipes"
             ));
         }
-        None => {}
+        _ => {}
     }
 
     // Everything fallible is constructed; only the module start transaction
@@ -710,6 +719,29 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn empty_recipe_table_without_refresh_composes() {
+        let dir = tempfile::tempdir().unwrap();
+        let workspace = Workspace::open(dir.path()).await.unwrap();
+        let recipes = Arc::new(VerificationRecipes::new(Vec::new()).unwrap());
+        run_smoke(compose_config(workspace, Some(recipes), false)).await;
+    }
+
+    #[tokio::test]
+    async fn empty_recipe_table_with_refresh_fails_closed() {
+        let dir = tempfile::tempdir().unwrap();
+        let workspace = Workspace::open(dir.path()).await.unwrap();
+        let recipes = Arc::new(VerificationRecipes::new(Vec::new()).unwrap());
+        let error = match compose(compose_config(workspace, Some(recipes), true)).await {
+            Ok(_) => panic!("empty recipe table must not enable proof refresh"),
+            Err(error) => error,
+        };
+        assert!(
+            error.to_string().contains("verification recipes"),
+            "{error}"
+        );
+    }
+
     /// A recipe table injects the route resolver even with automatic refresh
     /// disabled; enabling refresh changes execution policy, not discovery.
     #[tokio::test]
@@ -747,6 +779,7 @@ mod tests {
                 verification_revision: 1,
                 directive_revision: 1,
                 workspace_revision: 1,
+                cancel: agent_contracts::CancellationToken::new(),
             })
             .await
             .unwrap();

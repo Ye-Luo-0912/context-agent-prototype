@@ -311,10 +311,12 @@ pub(crate) fn materialize(
         ));
     }
 
-    // Then the scored candidates fill the rest of the frame.
+    // Then the scored candidates fill the rest of the frame. An item the
+    // prompt-required pass already selected (a non-Pinned anchor claim) must
+    // not be picked — and budget-charged — a second time here.
     for (index, breakdown, tokens) in candidates {
         let item = &state.items[index];
-        if item.retention == ContextRetention::Pinned {
+        if item.retention == ContextRetention::Pinned || selected_indices.contains(&index) {
             continue;
         }
         if let Some(max) = query.hints.max_selected_items

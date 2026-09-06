@@ -1,20 +1,33 @@
 {
   "schema": "project-state.v1",
-  "updated": "2026-09-05",
-  "maintained_by": "hand until the CI document-consistency gate lands; README.md and docs/CURRENT.md current-status text must be verified against this file",
-  "head_commit": "(refresh after doc commit)",
-  "code_commit": "050aa8e68f59c49d42b95e2a4d38fa37234a1e78",
+  "updated": "2026-09-06",
+  "maintained_by": "CURRENT.md and NEXT_TASKS.md record the active product route; the existing document-consistency script checks structure/links, not semantic equivalence or future CI success",
+  "head_commit": "12c86283b8d5991e9f17a07f14871dcf39d65066",
+  "code_commit": "12c86283b8d5991e9f17a07f14871dcf39d65066",
   "ci": {
     "head_commit": "green",
-    "head_run_id": 33898496334,
-    "last_green_commit": "33081b40debd4a022691b3a7ae70d67977d5e677",
-    "code_commit": "green"
+    "head_run_id": 33986702977,
+    "last_green_commit": "12c86283b8d5991e9f17a07f14871dcf39d65066",
+    "code_commit": "green",
+    "verified_source_commit": "12c86283b8d5991e9f17a07f14871dcf39d65066",
+    "observation": "GitHub Actions run completed/success; all six jobs succeeded",
+    "scope": "remote CI on the named source only; not local validation or future commits"
   },
   "milestone_gates": {
     "m15_real_evaluation": "closed",
     "next_ordered": [
-      "LT-EVAL-06 evaluation breadth",
-      "packaged V1 release gate"
+      "STORAGE-02 post-publish journal writer fence",
+      "PROCESS-01 host-proof crash supervision",
+      "PROCESS-02 reap without confirmed exit",
+      "WORKSPACE-01 FIFO nonblocking open",
+      "WORKSPACE-02 Windows handle RAII on reject",
+      "PROVIDER-01 bounded error body",
+      "PROVIDER-02 Chat length termination",
+      "PROVIDER-03 Responses EOF frame check",
+      "CONTEXT-01 newest-first dependency candidates",
+      "PACKAGE-01 package source binding (next release)",
+      "MCP-01 only if default product enables MCP writes",
+      "M16-02 remaining: OperatorClosureOnly vs durable completion display"
     ],
     "lt_eval_06": {
       "status": "evidence banked 2026-09-05",
@@ -47,7 +60,7 @@
     }
   },
   "product_stage": "alpha",
-  "product_phase": "phase-2-reliable-local-agent-alpha",
+  "product_phase": "daily-coding-workflow",
   "phase_2_started": "2026-09-04",
   "phase_2_slices_landed": [
     "checked model configuration: AGENT_DEMO=1 selects the mock explicitly, a missing OPENAI_API_KEY is a visible startup error (32ea622)",
@@ -75,8 +88,18 @@
   ],
   "branch_protection": false,
   "next_ordered": [
-    "packaged V1 release gate (package workflow 33983799960 dispatched)",
-    "V1 freeze: version/tag/release notes"
+    "STORAGE-02 post-publish journal writer fence",
+    "PROCESS-01 host-proof crash supervision",
+    "PROCESS-02 reap without confirmed exit",
+    "WORKSPACE-01 FIFO nonblocking open",
+    "WORKSPACE-02 Windows handle RAII on reject",
+    "PROVIDER-01 bounded error body",
+    "PROVIDER-02 Chat length termination",
+    "PROVIDER-03 Responses EOF frame check",
+    "CONTEXT-01 newest-first dependency candidates",
+    "PACKAGE-01 package source binding (next release)",
+    "MCP-01 only if default product enables MCP writes",
+    "M16-02 remaining: OperatorClosureOnly vs durable completion display"
   ],
   "release": {
     "version": "0.1.0",
@@ -88,5 +111,74 @@
       "agent-tui-v0.1.0-linux.zip",
       "agent-tui-v0.1.0-windows.zip"
     ]
+  },
+  "previous_status_snapshot": {
+    "head_commit": "(refresh after doc commit)",
+    "code_commit": "050aa8e68f59c49d42b95e2a4d38fa37234a1e78",
+    "ci": {
+      "head_commit": "green",
+      "head_run_id": 33898496334,
+      "last_green_commit": "33081b40debd4a022691b3a7ae70d67977d5e677",
+      "code_commit": "green"
+    },
+    "next_ordered": [
+      "packaged V1 release gate (package workflow 33983799960 dispatched)",
+      "V1 freeze: version/tag/release notes"
+    ]
+  },
+  "reviewed_source_commit": "12c86283b8d5991e9f17a07f14871dcf39d65066",
+  "source_scope_note": "Fixed reviewed source, not the SHA of later documentation or product commits. 2026-09-06 deep review was a partial-source pass (clone failed; 29 paths, not a full-repo inventory; no local Rust). Remaining open findings now lead NEXT_TASKS; M16-02 waits until they close.",
+  "active_task": "STORAGE-02",
+  "route_reset": {
+    "task_document": "docs/NEXT_TASKS.md",
+    "archive": "docs/archive/route-reset-12c8628",
+    "feature_status": "M16-00 switched; remaining 2026-09-06 deep-audit items now lead the live queue (current STORAGE-02); M16-02 completion display waits; M16-01/05/07 and most of 02/03/06 already landed",
+    "D0_remaining": "done 2026-09-06: README route links updated, NEXT_TASKS added to LIVE_DOCS, doc-consistency gate green",
+    "research_not_a_product_prerequisite": [
+      "M15 rerun",
+      "Frame-3",
+      "Chronicle",
+      "TaskGraph",
+      "new GC/ranking algorithms"
+    ],
+    "F1_status": "code + targeted tests landed 2026-09-06 (/continue, busy-input queue visibility, notice-channel command errors, release consumption stamp, PromptRequired dedup); manual walkthrough pending",
+    "F2_status": "code + targeted tests landed 2026-09-06 (/work composes set_focus + empty-requirement task.manage PreferSurface + one user-message; /plan reads the new read-only TaskPlanView command; checkpoint roundtrip preserves checklist and TaskId); manual walkthrough pending",
+    "F3_status": "landed 2026-09-06 incl. continued-review 6a (EOF-wait bounds) and 6b (verifier cancellation bridge armed on turn cancel and shutdown before bounded join); inline default until a real slow-verification walkthrough",
+    "F4_status": "landed 2026-09-06 incl. continued-review batch: resync_projection newest-first/current-run/watermark/bounded-read, run_summary entries+omitted counting with real-event tests and mid-file run split, shadow-frame dedup-vs-cap accounting; two-workspace walkthrough pending",
+    "F5_status": "landed 2026-09-06: provable file-body supersession, verify-only error clearing, search.grep and fs.list PARTIAL coverage, fs.read range facts through ingest/supersession, confined bounded reads for grep/symbols, context-search cold-read observation; F6 headless live covered a cross-file task",
+    "F6_status": "headless live 2026-09-06: real provider gpt-5.6-luna via product compose/RuntimeHandle; three disposable workspaces passed harness file checks (bugfix, feature, interrupt/restore/continue); empty verification recipe table no longer fails compose; TUI interactive walkthroughs still pending; record in docs/walkthroughs/2026-09-06-f6.md",
+    "N1_status": "landed 2026-09-06: agent-tui --prompt/--work/--continue headless JSONL on the product compose/RuntimeHandle path; ungranted writes denied (no --yes/--allow-all); exit 0/2/3/1; targeted agent-tui tests cover deny/grant/work/round-budget",
+    "N2_status": "landed 2026-09-06: --grant-file JSON object/array (bounded, fail-closed) and --jsonl-out file capture for editor/task invoke; no daemon",
+    "headless_acceptance": "agent-compose/tests/route_flow.rs: real composition + scripted model covers /work composition, task.manage plan, round-budget stop with durable safe point, /continue incl. cross-checkpoint restore; landed 2026-09-06 with two wiring fixes (compose now wires the artifact store into runtime checkpoint services; the round-budget refusal drains the in-flight write and lands its own safe point)",
+    "continued_review_2026_09_06": {
+      "baseline": "12c86283b8d5991e9f17a07f14871dcf39d65066",
+      "report": "docs/reviews/2026-09-06-continued-audit/REVIEW.md",
+      "status": "all four findings fixed 2026-09-06: EOF wait stays inside the timeout/cancel select (cross-platform tests with watchdogs), verifier cancellation token bridges actor cancel incl. the parked NoActiveTurn path (arm then bounded join, no bare abort), resync_projection newest-first/current-run/watermark/bounded-read, run_summary counts entries+omitted with real-event tests and mid-file run split, shadow-frame duplicates vs cap omissions separated; regression tests added per fix",
+      "old_findings_already_fixed": "consumption stamping + PromptRequired dedup fixed in c6fbbab",
+      "correction": "F5 remaining (fs.read range facts, fs.list PARTIAL, confined bounded reads, search cold-read observation) landed 2026-09-06"
+    },
+    "deep_review_2026_09_06": {
+      "baseline": "12c86283b8d5991e9f17a07f14871dcf39d65066",
+      "report": "docs/reviews/2026-09-06-deep-audit/REVIEW.md",
+      "status": "partial source review; remaining open findings lead NEXT_TASKS (current STORAGE-02). STORAGE-01 and DOC-01 closed on this branch; prior-round EOF-wait/ACK/resync already fixed. Not a full-repo audit; clone failed on DNS; no local Rust in the review.",
+      "new_findings": 13,
+      "executed_probes": [
+        "dist.sh stub cargo (stale binary and leftover helper packaged; build-fail exits 17)",
+        "POSIX FIFO open without O_NONBLOCK blocks",
+        "Linux SIGKILL parent leaves grouped child alive"
+      ],
+      "STORAGE_01_status": "landed 2026-09-06: Windows MoveFileEx replace without pre-unlink; open refuses empty generation-1 init when metadata is missing and WAL generations remain; does not auto-pick max .gN; agent-storage tests cover remnant WAL and post-compact .g2+.g3; Windows in-replace process crash not injected"
+    },
+    "m16": {
+      "proposal": "docs/reviews/2026-09-06-m16-proposal/TRIAGE.md",
+      "basis": "12c86283b8d5991e9f17a07f14871dcf39d65066",
+      "note": "M16 replaces D0/F1-F6 as the stage order. Remaining 2026-09-06 deep-audit items currently lead the same queue. The proposal marked every task unimplemented against 12c8628; this working tree maps landed product work onto M16-00..08.",
+      "M16_00": "done 2026-09-06: live CURRENT/ROADMAP/NEXT_TASKS/AGENTS point at M16; proposal stored under reviews/",
+      "current_ticket": "STORAGE-02; M16-02 remaining waits until deep-audit leftovers close"
+    }
+  },
+  "deep_audit_queue": {
+    "STORAGE-02": "closed 2026-09-06: compact_locked runs every fallible step (new-WAL seek, next_seq overflow check, recovery rebuild) before the metadata publish; post-publish is in-memory swap + best-effort old-WAL removal only, so the writer can never keep appending to the old generation after a failed compact. Tests: pre-publish new-WAL failure keeps old gen appendable and metadata untouched; crash between publish and old-WAL removal reopens on the published generation (agent-storage 21/21).",
+    "current": "PROCESS-01"
   }
 }

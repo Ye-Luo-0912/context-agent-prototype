@@ -413,14 +413,10 @@ impl Tool for CodeSymbolsTool {
         let mut scanned_files = 0usize;
 
         'files: for file in files {
-            let metadata = match tokio::fs::metadata(&file).await {
-                Ok(metadata) => metadata,
-                Err(_) => continue,
-            };
-            if metadata.len() > MAX_BYTES_PER_FILE {
-                continue;
-            }
-            let Ok(text) = tokio::fs::read_to_string(&file).await else {
+            let relative = display_relative(&self.workspace, &file);
+            let Some(text) =
+                super::read_confined_utf8(&self.workspace, &relative, MAX_BYTES_PER_FILE).await?
+            else {
                 continue;
             };
             let Some(extension) = extension_of(&file) else {
@@ -430,7 +426,6 @@ impl Tool for CodeSymbolsTool {
                 continue;
             };
             scanned_files += 1;
-            let relative = display_relative(&self.workspace, &file);
             for (index, line) in text.lines().enumerate() {
                 let Some((name, kind, column)) = scan_line(line, lang) else {
                     continue;

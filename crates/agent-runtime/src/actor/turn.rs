@@ -31,10 +31,12 @@ pub(crate) struct DeferredProofRefresh {
 }
 
 /// Watchdog handle for one in-flight deferred proof refresh. Turn
-/// cancellation and shutdown abort the task, so a killed verify can never
-/// deliver a stale proposal back into a moved world.
+/// cancellation and shutdown arm the token first — the runner's bounded
+/// loop then kills and reaps the verification process tree — and abort
+/// the task only afterwards, so a dying turn cannot orphan the child.
 pub(super) struct PendingProofRefresh {
     pub(super) task: tokio::task::JoinHandle<()>,
+    pub(super) cancel: agent_contracts::CancellationToken,
 }
 
 impl RuntimeActor {
@@ -425,7 +427,22 @@ impl RuntimeActor {
                 })
                 .await;
             // Deliberate refusal (round budget), not a fault: settle the
-            // applied input and drop the turn without fencing.
+            // applied input and drop the turn without fencing. The stop is
+            // a RECOVERABLE stop, so first drain any in-flight safe-point
+            // write and then land the debt this turn accrued as one more
+            // durable safe point BEFORE the turn is dropped — otherwise a
+            // debt accrued while a write was in flight stays uncaptured
+            // forever and continuation stays fenced with nothing left to
+            // clear it. A failed safe-point write is a real durability
+            // failure: fence the runtime instead of pretending the stop is
+            // recoverable.
+            if let Err(error) = self.await_pending_checkpoint().await {
+                self.require_effect_recovery(format!(
+                    "safe-point write failed at the round-budget stop: {error}"
+                ))
+                .await;
+            }
+            self.safe_point_resume_commit().await;
             self.settle_aborted_turn().await;
             return;
         }
@@ -571,6 +588,9 @@ impl RuntimeActor {
             verification_revision: basis.verification_revision,
             directive_revision: basis.directive_revision,
             workspace_revision: basis.workspace_revision,
+            // Armed when the owning turn is cancelled so the runner's
+            // bounded loop kills and reaps the verification process tree.
+            cancel: agent_contracts::CancellationToken::new(),
         };
         Some(ProofRefreshPlan {
             request,
@@ -616,6 +636,7 @@ impl RuntimeActor {
         let mut proposal_owned = proposal.take();
         let proof_tx = proof_tx.clone();
         let request = plan.request.clone();
+        let proof_cancel = request.cancel.clone();
         let task = tokio::spawn(async move {
             let verify = std::panic::AssertUnwindSafe(verifier.verify_exact(request));
             let outcome = {
@@ -639,7 +660,10 @@ impl RuntimeActor {
                 })
                 .await;
         });
-        self.state.pending_proof_refresh = Some(PendingProofRefresh { task });
+        self.state.pending_proof_refresh = Some(PendingProofRefresh {
+            task,
+            cancel: proof_cancel,
+        });
         // Keep the model's round moving: the runtime now owns this
         // completion intent and reports the authoritative outcome through
         // its own observation and events.
@@ -2617,6 +2641,17 @@ impl RuntimeActor {
         reason: TurnCancellationReason,
         operation_id_override: Option<OperationId>,
     ) -> AgentResult<TurnCancelAck> {
+        // A deferred proof refresh has already taken the turn edge:
+        // `state.turn` is None while the host verifier runs, so its
+        // cancellation must be armed before the NoActiveTurn early return —
+        // otherwise a hung verifier could never be stopped. Cancelling the
+        // token makes the runner's bounded loop kill and reap the
+        // verification process tree; the abandoned resume is then dropped
+        // by the apply fence (no turn to refresh).
+        if let Some(pending) = self.state.pending_proof_refresh.take() {
+            pending.cancel.cancel();
+            let _ = tokio::time::timeout(Duration::from_secs(5), pending.task).await;
+        }
         let Some(turn) = self.state.turn.as_ref() else {
             return Ok(TurnCancelAck::NoActiveTurn);
         };
@@ -2640,11 +2675,14 @@ impl RuntimeActor {
         if let Some(operation) = self.state.turn.as_ref().and_then(|turn| turn.op.as_ref()) {
             operation.cancel.cancel();
         }
-        // A deferred proof refresh belongs to the dying turn: abort the
-        // host verifier and drop the parked proposal before the fence can
-        // ever be crossed by a stale resume.
+        // A deferred proof refresh belongs to the dying turn: arm its
+        // cancellation so the runner's own loop kills and reaps the host
+        // verifier process, wait (bounded) for that cleanup, and only then
+        // drop the parked proposal — abort alone would orphan the child
+        // before the fence can ever be crossed by a stale resume.
         if let Some(pending) = self.state.pending_proof_refresh.take() {
-            pending.task.abort();
+            pending.cancel.cancel();
+            let _ = tokio::time::timeout(Duration::from_secs(5), pending.task).await;
         }
         if let Some(identity) = tool_identity
             && let Err(error) = self.core.cancel_operation(identity)

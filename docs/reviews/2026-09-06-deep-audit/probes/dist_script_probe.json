@@ -1,0 +1,63 @@
+{
+  "test_kind": "EXACT_REPOSITORY_SCRIPT_WITH_STUB_BUILDER",
+  "source_git_blob_sha1": "b3a3f9a6326df15054cd55e430387c3aeec75008",
+  "real_rust_compilation": false,
+  "tests_executed": 3,
+  "cases": [
+    {
+      "case": "custom_target_copies_stale_binary",
+      "exit_code": 0,
+      "cargo_calls": [
+        [
+          "build",
+          "--release",
+          "--bin",
+          "agent-tui"
+        ]
+      ],
+      "output_files": {
+        "SHA256SUMS": "001a785677120e9bcb4d0d0ac0c56fda8ef20a5367b9d2f56bd00a16280067fd  ./agent-tui\n",
+        "agent-tui": "STALE agent-tui\n"
+      },
+      "stdout": "dist ready: dist/0.1.0\n001a785677120e9bcb4d0d0ac0c56fda8ef20a5367b9d2f56bd00a16280067fd  ./agent-tui\n",
+      "stderr": "",
+      "real_cargo_invoked": false
+    },
+    {
+      "case": "previous_dist_files_survive",
+      "exit_code": 0,
+      "cargo_calls": [
+        [
+          "build",
+          "--release",
+          "--bin",
+          "agent-tui"
+        ]
+      ],
+      "output_files": {
+        "SHA256SUMS": "e2605e045eca647940a4307f586ed21ae46f3bbb4e950130ce143b7520678cfd  ./agent-tui\n435803f6f10b13fc099e9d9495e799fe4b90ac2a25735310caf39f2ad80d53cf  ./agent-context-service\n",
+        "agent-tui": "FRESH agent-tui\n",
+        "agent-context-service": "STALE helper\n"
+      },
+      "stdout": "dist ready: dist/0.1.0\ne2605e045eca647940a4307f586ed21ae46f3bbb4e950130ce143b7520678cfd  ./agent-tui\n435803f6f10b13fc099e9d9495e799fe4b90ac2a25735310caf39f2ad80d53cf  ./agent-context-service\n",
+      "stderr": "",
+      "real_cargo_invoked": false
+    },
+    {
+      "case": "bash_build_failure_stops_packaging",
+      "exit_code": 17,
+      "cargo_calls": [
+        [
+          "build",
+          "--release",
+          "--bin",
+          "agent-tui"
+        ]
+      ],
+      "output_files": {},
+      "stdout": "",
+      "stderr": "",
+      "real_cargo_invoked": false
+    }
+  ]
+}

@@ -816,8 +816,11 @@ durable task constraints, hot entities, explicit references, and the
 **latest successful observation of each recent file path in the active
 task** (capped at 8 paths; identified by a path-only first line as in
 `fs.read`, not by a log that merely mentions a file). Same-path rereads
-supersede the previous body (semantic death, so hot-entity recall cannot
-bring stale file text back). A stamped `metadata.path` on `shell.exec` is
+supersede an earlier body only at a different content revision, or when a
+same-revision window is proven to cover the earlier fragment (trusted
+`fs.read` line range, or an unclipped body that contains it). Disjoint
+windows of one revision coexist; missing range is unknown, never "the
+whole file was visible". A stamped `metadata.path` on `shell.exec` is
 not a file body and does not enter this supersession. A completed or switched-away task drops those
 file-body roots, so pagination detail does not contaminate a later CSV
 task. Plus a bounded `+8` transitive slice of their dependency edges.

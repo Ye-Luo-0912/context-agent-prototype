@@ -1627,7 +1627,8 @@ impl RuntimeActor {
         // flush across the uncommitted startup prefix. Leave that prefix
         // forensic and terminate this actor without further journal writes.
         if let Some(pending) = self.state.pending_proof_refresh.take() {
-            pending.task.abort();
+            pending.cancel.cancel();
+            let _ = tokio::time::timeout(Duration::from_secs(5), pending.task).await;
         }
         if self.state.lifecycle != ActorLifecycle::Serving {
             self.state.pending_user_input = None;

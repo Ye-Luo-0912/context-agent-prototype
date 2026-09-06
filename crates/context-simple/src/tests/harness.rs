@@ -77,6 +77,39 @@ pub(crate) fn observation_touching(
     }
 }
 
+pub(crate) fn fs_read_with_revision(
+    id: &str,
+    path: &str,
+    body: &str,
+    revision: &str,
+) -> ToolOutput {
+    fs_read_window(id, path, body, revision, None)
+}
+
+pub(crate) fn fs_read_window(
+    id: &str,
+    path: &str,
+    body: &str,
+    revision: &str,
+    range: Option<(u32, u32)>,
+) -> ToolOutput {
+    let mut metadata = serde_json::json!({ "path": path, "revision": revision });
+    if let Some((start_line, end_line)) = range {
+        metadata["start_line"] = serde_json::json!(start_line);
+        metadata["end_line"] = serde_json::json!(end_line);
+        metadata["covers_file"] = serde_json::json!(false);
+    }
+    ToolOutput {
+        call_id: id.into(),
+        tool_name: "fs.read".into(),
+        ok: true,
+        summary: "read".into(),
+        model_content: body.into(),
+        artifact_ref: None,
+        metadata,
+    }
+}
+
 pub(crate) fn fs_read_touching(id: &str, path: &str, body: &str) -> ToolOutput {
     ToolOutput {
         call_id: id.into(),
@@ -177,6 +210,27 @@ pub(crate) async fn tool_observation(engine: &SimpleContextEngine, call_id: &str
             output: ToolOutput {
                 call_id: call_id.into(),
                 tool_name: "shell.exec".into(),
+                ok: true,
+                summary: "ok".into(),
+                model_content: content.into(),
+                artifact_ref: None,
+                metadata: serde_json::Value::Null,
+            },
+            scope_id: None,
+        })
+        .await
+        .unwrap();
+}
+
+/// Build a successful trusted-verification observation (`verify.run`) —
+/// the only tool result whose success verifies an error as fixed.
+pub(crate) async fn verify_observation(engine: &SimpleContextEngine, call_id: &str, content: &str) {
+    engine
+        .ingest(ContextIngress::ToolObservation {
+            facts: None,
+            output: ToolOutput {
+                call_id: call_id.into(),
+                tool_name: "verify.run".into(),
                 ok: true,
                 summary: "ok".into(),
                 model_content: content.into(),

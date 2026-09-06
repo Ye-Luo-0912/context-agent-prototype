@@ -59,18 +59,28 @@ fn as_str(value: Option<&Value>) -> &str {
     value.and_then(|value| value.as_str()).unwrap_or("")
 }
 
-/// Fold one trace JSONL stream into a per-run summary.
+/// Fold one trace JSONL stream into a per-run summary. A run id change
+/// inside the stream starts the summary over: one folded summary describes
+/// exactly one run, never a blend of the first run with later ones.
 pub fn fold_run_summary(lines: impl Iterator<Item = String>, summary: &mut RunTaskSummary) {
     for line in lines {
         let Ok(envelope) = serde_json::from_str::<Value>(&line) else {
             continue;
         };
+        let envelope_run = envelope
+            .get("run_id")
+            .and_then(|value| value.as_str())
+            .unwrap_or_default();
         if summary.run_id.is_empty() {
-            summary.run_id = envelope
-                .get("run_id")
-                .and_then(|value| value.as_str())
-                .unwrap_or_default()
-                .to_string();
+            summary.run_id = envelope_run.to_string();
+        } else if !envelope_run.is_empty() && envelope_run != summary.run_id {
+            // Mixed-run stream: this fold keeps only the new run. Callers
+            // that need every run in one file split by id before folding
+            // (or fold once per run id).
+            *summary = RunTaskSummary {
+                run_id: envelope_run.to_string(),
+                ..Default::default()
+            };
         }
         let Some(event) = envelope.get("event") else {
             continue;
@@ -127,11 +137,21 @@ pub fn fold_run_summary(lines: impl Iterator<Item = String>, summary: &mut RunTa
             }
             "recovery_required" => summary.recovery_required = true,
             "context_degraded" => {
+                // The wire shape of `ContextMaterializationMisses` is
+                // `{entries: [...], omitted: N}` — there is no `total`
+                // field on the wire, so the count is the entries plus the
+                // saturating omission counter.
                 let items = event
                     .get("required_misses")
-                    .and_then(|misses| misses.get("total"))
-                    .and_then(|value| value.as_u64())
-                    .unwrap_or(0) as usize;
+                    .map(|misses| {
+                        misses
+                            .get("entries")
+                            .and_then(|entries| entries.as_array())
+                            .map(|entries| entries.len())
+                            .unwrap_or(0)
+                            + as_u64(misses.get("omitted")) as usize
+                    })
+                    .unwrap_or(0);
                 if items > 0 {
                     summary.required_miss_events += 1;
                     summary.required_miss_items += items;
@@ -297,22 +317,87 @@ mod tests {
                 r#", "debt": {"operation_id": "o", "effect_id": "e", "reservation_id": "r", "settlement": {"kind":"applied","durability":"Durable"}, "error": "lost"}"#,
             ),
             line("run-2", "recovery_required", ""),
-            line(
-                "run-2",
-                "context_degraded",
-                r#", "required_misses": {"total": 2, "entries": [], "omitted": 0}"#,
-            ),
         ];
         let mut summary = RunTaskSummary::default();
         fold_run_summary(lines.into_iter(), &mut summary);
         assert!(!summary.completed);
         assert_eq!(summary.unresolved_ack_debts, 1);
         assert!(summary.recovery_required);
-        assert_eq!(summary.required_miss_events, 1);
-        assert_eq!(summary.required_miss_items, 2);
         let rendered = render_run_summary(&summary);
         assert!(rendered.contains("ack debts 1"));
         assert!(rendered.contains("recovery required true"));
         assert!(rendered.contains("still working"));
+    }
+
+    /// The degraded-round misses must be counted from a REAL serialized
+    /// `RuntimeEvent::ContextDegraded` — the wire shape of
+    /// `ContextMaterializationMisses` is `{entries, omitted}` with no
+    /// `total` field, so a hand-written `{total}` fixture cannot prove the
+    /// projection reads the events the runtime actually publishes.
+    #[test]
+    fn required_misses_are_counted_from_real_serialized_events() {
+        use agent_contracts::{
+            ContextMaterializationIdentity, ContextMaterializationMiss,
+            ContextMaterializationMissReason, ContextMaterializationMisses,
+        };
+
+        let mut misses = ContextMaterializationMisses::default();
+        for index in 0..3 {
+            misses.push(ContextMaterializationMiss {
+                identity: ContextMaterializationIdentity {
+                    item_ref: format!("item-{index}"),
+                    item_id: None,
+                    source_field_id: "constraints".into(),
+                    anchor_revision: 0,
+                },
+                reason: ContextMaterializationMissReason::BudgetExcluded,
+            });
+        }
+        let event = agent_contracts::RuntimeEvent::ContextDegraded {
+            turn_id: agent_contracts::TurnId::new(),
+            model_round: 1,
+            materialization_id: 0,
+            required_misses: misses,
+            optional_misses: ContextMaterializationMisses::default(),
+        };
+        let envelope = agent_contracts::RuntimeEventEnvelope {
+            run_id: agent_contracts::RunId::new(),
+            seq: 7,
+            timestamp_ms: 7,
+            event,
+        };
+        let line = serde_json::to_string(&envelope).unwrap();
+        assert!(
+            !line.contains("\"total\""),
+            "the wire must not carry a total field: {line}"
+        );
+
+        let mut summary = RunTaskSummary::default();
+        fold_run_summary(std::iter::once(line), &mut summary);
+        assert_eq!(summary.required_miss_events, 1);
+        assert_eq!(
+            summary.required_miss_items, 3,
+            "entries.len() + omitted must equal the real miss count"
+        );
+        let rendered = render_run_summary(&summary);
+        assert!(rendered.contains("required context misses: 3 item(s)"));
+    }
+
+    /// A mid-file run id change restarts the fold: one folded summary
+    /// describes exactly one run, never a blend of run-a with run-b.
+    #[test]
+    fn two_runs_in_one_file_produce_two_summaries() {
+        let lines = vec![
+            line("run-a", "run_started", ""),
+            line("run-a", "user_message_accepted", ""),
+            line("run-b", "run_started", ""),
+            line("run-b", "user_message_accepted", ""),
+            line("run-b", "user_message_accepted", ""),
+        ];
+        let mut summary = RunTaskSummary::default();
+        fold_run_summary(lines.into_iter(), &mut summary);
+        assert_eq!(summary.run_id, "run-b");
+        assert_eq!(summary.user_messages, 2, "only run-b's events are counted");
+        assert!(summary.started, "run-b's own start is part of its summary");
     }
 }

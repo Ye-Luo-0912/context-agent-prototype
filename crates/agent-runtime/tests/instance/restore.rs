@@ -4,7 +4,7 @@ use std::time::Duration;
 use agent_contracts::{CapabilityActivation, RuntimeEvent, ToolLifecycle};
 use agent_core::{CoreAuthorityConfig, PolicyApprovalGate};
 use agent_runtime::{
-    ContextRootClaim, ModuleHost, RootClaimRole, RootClaimStrength, RuntimeInstance,
+    AnchorPatch, ContextRootClaim, ModuleHost, RootClaimRole, RootClaimStrength, RuntimeInstance,
     RuntimeServices, TaskAnchor,
 };
 
@@ -681,4 +681,83 @@ async fn restore_rejects_completed_task_without_a_completion_record() {
         "a completed task must own exactly one outcome: {error}"
     );
     instance.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn task_plan_view_survives_a_checkpoint_roundtrip() {
+    let temp = tempfile::tempdir().unwrap();
+    let journal_path = temp.path().join("authority").join("operations.jsonl");
+    let (instance, _context) = durable_simple_instance(&journal_path).await;
+
+    instance
+        .handle()
+        .set_focus("migrate the config module".into())
+        .await
+        .unwrap();
+    let task_id = instance.handle().list_tasks().await.unwrap()[0].id;
+
+    // The view exists before any plan is written and reads back empty.
+    let view = instance.handle().task_plan_view().await.unwrap().unwrap();
+    assert_eq!(view.original_goal, "migrate the config module");
+    assert!(
+        view.plan_progress.is_empty() && view.open_loops.is_empty() && view.next_action.is_empty()
+    );
+
+    // The same autonomous CAS lane `task.manage` uses; a stale base
+    // revision is refused with the existing feedback and loses nothing.
+    let revision = instance
+        .handle()
+        .patch_task_anchor(
+            task_id,
+            0,
+            AnchorPatch {
+                plan_progress: Some(vec!["[x] locate the reader".into()]),
+                next_action: Some("add the target key".into()),
+                ..AnchorPatch::default()
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(revision, 1);
+    let refused = instance
+        .handle()
+        .patch_task_anchor(
+            task_id,
+            0,
+            AnchorPatch {
+                plan_progress: Some(vec!["stale write".into()]),
+                ..AnchorPatch::default()
+            },
+        )
+        .await;
+    assert!(refused.is_err(), "a stale base revision must be refused");
+
+    let view = instance.handle().task_plan_view().await.unwrap().unwrap();
+    assert_eq!(
+        view.plan_progress,
+        vec!["[x] locate the reader".to_string()]
+    );
+    assert_eq!(view.next_action, "add the target key");
+
+    // Save and restore into a fresh runtime: the checklist, the next
+    // action and the TaskId all come back.
+    let checkpoint = instance.checkpoint().await.unwrap();
+    instance.shutdown().await.unwrap();
+    let (fresh, _context) = durable_simple_instance(&journal_path).await;
+    fresh.restore(checkpoint).await.unwrap();
+    let tasks = fresh.handle().list_tasks().await.unwrap();
+    let restored = tasks.iter().find(|task| task.id == task_id);
+    assert_eq!(
+        restored.map(|task| task.status),
+        Some(agent_runtime::TaskStatus::Active),
+        "the checklist's task must survive with its identity"
+    );
+    let view = fresh.handle().task_plan_view().await.unwrap().unwrap();
+    assert_eq!(
+        view.plan_progress,
+        vec!["[x] locate the reader".to_string()]
+    );
+    assert_eq!(view.next_action, "add the target key");
+    assert_eq!(view.revision, 1);
+    fresh.shutdown().await.unwrap();
 }

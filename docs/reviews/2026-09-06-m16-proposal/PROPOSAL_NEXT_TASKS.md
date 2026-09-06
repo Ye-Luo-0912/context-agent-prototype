@@ -1,0 +1,475 @@
+# M16：可持续交付的本地单 Agent — 可执行任务队列
+
+> 状态：**提案/待合并替换稿**。基线 `12c86283b8d5991e9f17a07f14871dcf39d65066`，日期 2026-09-06。M16 和 v0.2 是本包建议名称，不是当前仓库已经接受或已发布的版本。
+> 本文替换此前 D0/F1–F6 的活动顺序，不叠加另一套队列；不取代 Core、Effect、Workspace、恢复与输出边界契约。
+> 本轮未取得完整 checkout，未完成所有文件逐行审查，未运行 Rust 测试。源码依据和读取范围见包内 CODE_BASIS.md。
+
+## 阶段目标
+
+用户给一个仓库级任务，Agent 能建立短计划、查读修改、响应补充、有限执行、明确停止、冷恢复续跑、给出可信审阅结果，并可在非 TUI 模式以同一 Runtime 执行。
+
+默认范围：单用户、单工作区、单任务焦点、一个 RuntimeActor、动态进程内 Context。**不是通用 Agent OS/分布式平台，也不是把任意自然语言需求自动证明正确。**
+
+## 开始执行
+
+只读 CURRENT 和本表当前工单，然后读该工单的实现、调用者和测试。已有新提交时先核对相关差异；已完成的功能定向确认后跳过，不回退到本文基线，不每轮重启全仓审计。
+
+每次完成一个可演示的纵向切片。进程内交互和计划可以先合并；可靠冷恢复、可取消宿主验证和发布包分别在其实际风险修好后再对外声明。代码存在、测试通过、默认启用、真实任务跑通是四个不同事实，回执分别填写。
+
+## 当前队列（全部是待实施，不是完成声明）
+
+| 工单 | 交付物 | 前置 | 旧工单映射 |
+|---|---|---|---|
+| M16-00 | 切换活动路线，确认本地源码边界 | 无 | D0 |
+| M16-01 | 接通交互控制与可信启动 | M16-00 | F1 |
+| M16-02 | 任务工作模式、短计划与完成语义 | M16-01 | F2（补齐完成模式） |
+| M16-03 | 有限执行段与可确认的进程取消 | M16-01 | F3 |
+| M16-04 | 可信冷恢复与最小历史入口 | M16-01 | F3/F4 的恢复部分 |
+| M16-05 | 结果审阅与统一状态展示 | M16-02 | F4 |
+| M16-06 | 上下文、GC 与搜索的实际编码闭环 | M16-01 | F5 |
+| M16-07 | 可脚本调用的单进程运行入口 | M16-02, M16-03, M16-04, M16-05 | 上一版F6之后的首选功能，纳入本大阶段 |
+| M16-08 | 发布可日常试用的版本并结束本阶段 | M16-03, M16-04, M16-05, M16-06, M16-07 | F6 + 发布修复 |
+
+M16-03/04/06 可在 M16-01 后按受影响文件分开推进；M16-05 随 M16-02 推进。M16-07 只在前述控制/结果链可复用时接入。M16-08 是整个大阶段的收口，不阻止之前切片独立试用。
+
+## M16-00：切换活动路线，确认本地源码边界
+
+**用户结果：** 开发者进入仓库后看到一个当前工单；不会重新进入旧 M15 候选选择、全部文档整治或历史审计循环。
+
+**修改入口：**
+
+- `AGENTS.md`
+- `docs/CURRENT.md`
+- `docs/ROADMAP.md`
+- `docs/NEXT_TASKS.md`
+- `docs/state.json`
+- `README.md`
+- `scripts/doc_consistency.py`
+
+### 实施步骤
+
+1. 先在真实 checkout 记录 git rev-parse HEAD、git status --short、git ls-files。存在用户修改则保留，禁止 reset/clean/stash。实际 HEAD 不同只做受影响文件差异核对，不为了匹配本文回退源码。
+2. 可使用包外的 inventory_checkout.py 建立HEAD 中全部 tracked 条目及工作树状态清单。它只盘点，不把任何文件标成已语义审查。用仓库真实文件定位未读模块；涉及本工单的实现、调用者和测试必须读完整。
+3. 把本 NEXT_TASKS 作为唯一活动任务队列；上一版 D0/F1–F6 映射到本表，不保留两套独立待办。CURRENT 只保留当前源码、已验证事实、当前工单和短限制。
+4. ROADMAP 改为 M16 产品闭环与证据触发的后续方向；AGENTS 保留单 Actor、Core authority、恢复、输出边界等约束，但移出已关闭 M15 的命令式流程。
+5. 将旧路线正文原样存档或保留于 git 历史，修默认入口链接。原始 evidence、既有测试、权限和提交契约不删不改。不要逐份清洗整个 archive。
+6. 区分 basis/source SHA 与 tested SHA，未知测试状态写 NOT_RUN，不把之前的 green 搬到新源码；更新现有 doc_consistency 的相关链接/活动文件即可。
+7. 文档变化检查完成即交付，并进入 M16-01；不在这里新建全仓审计、治理、数据仓库或通用验收工具。
+
+### 退出条件
+
+- CURRENT 与 NEXT_TASKS 只有一个活动顺序；旧报告不会生成新工单。
+- 没有功能或测试被误标为本次已完成；用户改动未被清除。
+- 文档链接及格式检查有实际记录。
+
+### 必要检查
+
+- python scripts/doc_consistency.py
+- git diff --check
+- git diff --stat
+
+**承接上一轮缺陷：** DOC-01。其证据等级仍沿用旧报告；未在本轮执行的 Rust/平台测试不能写成已复现。
+
+**做到这里就停：** 当前入口能指向 M16-01 就停止整理。纯文档任务不要求重跑 Rust 全工作区。
+
+---
+
+## M16-01：接通交互控制与可信启动
+
+**用户结果：** 能继续原任务、切换已有任务、提交忙时补充并看到实际受理结果；错误参数或配置不会被当成工作区继续启动。
+
+**修改入口：**
+
+- `crates/agent-tui/src/main.rs`
+- `crates/agent-tui/src/state.rs`
+- `crates/agent-runtime/src/command.rs`
+- `crates/agent-runtime/src/actor/commands.rs`
+- `crates/agent-runtime/src/actor/turn.rs`
+- `crates/agent-compose/src/lib.rs`
+- `crates/context-simple/src/engine.rs`
+- `crates/context-simple/src/materializer.rs`
+
+### 实施步骤
+
+1. 增加 /continue，直接调用 continue_active_task；不得用 user_message("继续")、重新 ingest 原目标或 UI 拼接历史代替。activate_task 只激活，restore 只恢复；开始执行应是明确动作。
+2. 移除 TUI 对 busy 普通输入的一刀切拒绝，调用现有单槽 Runtime 输入路径。提交、排队、应用、拒绝/替换按实际 ACK 与事件显示；不承诺每条消息都获接受，不增加无界队列。
+3. 所有控制命令失败通过现有 notice 路径进入界面，不只写 tracing。对无任务、已完成任务、忙时 continue 等情况给出可操作反馈。
+4. 将 CLI 参数解析和冲突检查、模型配置校验、grant JSON 校验前移到会创建 workspace/journal 或启动模块之前；未知参数、重复/多余位置参数显式拒绝。无需抽出 CompositionPlan 等四套新类型。
+5. 运行态/任务详情不足时只加一个有界只读 Actor 查询，包含 task id、anchor revision、计划/open loops、完成模式与必要状态。读取不得通过创建 checkpoint 实现，不开放 TaskManager 可变引用。
+6. 修同一基线已定位的 release ACK 副作用放在 debug_assert 内、PromptRequired 重复扣预算两个小问题；若本地新 HEAD 已修，核对后跳过。不要借机改所有评分与断言。
+
+### 退出条件
+
+- 继续后保持同一 TaskId 和 directive identity，未重复受理原始用户输入。
+- 忙时第二条输入的实际处置可见；/cancel 的反馈由 Runtime 确认而非 UI 自行清空 busy。
+- 未知 flag 和无效 key/grant 的纯配置错误，在预检前后工作区没有额外 runtime 状态变更。
+- 同一消费回执在 release/debug 下都有实际更新；PromptRequired 只选择和扣费一次。
+
+### 必要检查
+
+- cargo fmt --all -- --check
+- cargo check -p agent-tui
+- cargo test -p agent-tui
+- cargo test -p context-simple -- --list
+- 选择实际存在的消费/物化用例，至少执行一次 release 定向回归，并确认测试数非零
+
+**做到这里就停：** 一次演示 /continue 和一次忙时补充成功、边界反馈可见即提交。不新增后台服务、事件数据库或整套输入协议。
+
+---
+
+## M16-02：任务工作模式、短计划与完成语义
+
+**用户结果：** 一个真实开发目标有短清单、当前动作和阻塞；用户知道现在是做完待审、证据完成还是仅执行段结束。
+
+**修改入口：**
+
+- `crates/agent-runtime/src/task.rs`
+- `crates/agent-runtime/src/command.rs`
+- `crates/agent-runtime/src/actor/commands.rs`
+- `crates/agent-runtime/src/actor/tools.rs`
+- `crates/agent-runtime/src/prompt.rs`
+- `crates/tool-runtime/src/tools/task_manage.rs`
+- `crates/agent-tui/src/main.rs`
+- `crates/agent-tui/src/state.rs`
+
+### 实施步骤
+
+1. 新增 /work <目标> 和 /plan。工作入口复用 Actor 的 prepare/commit 任务路径、工具需求集和 user-message 入口；明确同目标复用/新任务语义，避免 UI 私自组合出两次输入或切错活动任务。确需原子复合动作时只增加一个窄 Actor 命令。
+2. 只在工作模式用现有 task tool requirements 使 catalog-cold 的 task.manage 可用。工具进入表面不等于 effect 授权；普通短问答不强制计划。
+3. plan_progress 首版通常 3–8 条字符串，状态前缀仅用于展示；通过既有 base_anchor_revision CAS 更新。保留 open_loops 与 next_action，无须 StepId、DAG、节点持久化或逐步验收引擎。
+4. /plan 读取有界任务视图，不创建检查点，不私读历史 trace 来覆盖任务权威；旧无前缀计划按普通文本显示。
+5. 把默认 OperatorClosureOnly 明确显示为“待操作员审阅关闭”。普通 final 结束 turn，不自动完成 Task；/done 走既有 ExplicitOperator/commit-safe 分支，记录操作员接受或 override，不伪造验证 PASS。
+6. EvidenceRequired 仅用于宿主/用户明确确认的 criteria 与有效 host coverage declarations；模型不能从 task.manage 注入完成策略、准则或 receipts。普通 cargo test 或 npm test 默认 TaskScoped，不能因为名字像测试就升级 ExactCurrentWorld/source_read_only。
+7. 若当前工作区没有满足契约的可信 proof domain，就交付人工审阅模式；不为让演示完成而生成一个通用“所有功能正确”验证器。确需证据完成时只接现有 host 表的窄配置入口。
+8. next_action 保留建议性质，不新增“必须清空才能完成”的条件；计划勾选也不是证据。任务状态、操作状态与展示状态分开，不新增第二份状态机。
+
+### 退出条件
+
+- 两至三文件任务能生成、更新、查看计划；暂停恢复后 task/plan/constraints 保留。
+- 过期 CAS 拒绝时能看见当前 revision，未修改的 sibling 字段保留。
+- 没有验收域时展示待审阅，不能把普通 final 当成可信 TaskCompleted。
+- 模型不能改 completion_policy/criteria/receipts；操作员关闭也不越过 commit-safe 约束。
+
+### 必要检查
+
+- cargo test -p tool-runtime task_manage
+- cargo test -p agent-runtime -- --list
+- 从现有 task/anchor/instance completion 用例中选择有关 CAS、OperatorClosureOnly、EvidenceRequired 的定向回归
+- cargo check -p agent-tui
+
+**做到这里就停：** 清单、查看和人工/证据完成语义准确即可；不把全自动验收任意业务需求作为本阶段条件。
+
+---
+
+## M16-03：有限执行段与可确认的进程取消
+
+**用户结果：** 较长任务可以在有限模型轮数后安全让出并显式续跑；慢命令/验证不会让控制入口永久失去响应。
+
+**修改入口：**
+
+- `crates/agent-tui/src/main.rs`
+- `crates/agent-compose/src/lib.rs`
+- `crates/agent-compose/src/proof_verifier.rs`
+- `crates/agent-runtime/src/actor/turn.rs`
+- `crates/agent-runtime/src/actor/lifecycle.rs`
+- `crates/tool-runtime/src/tools/process.rs`
+- `crates/tool-runtime/src/tools/shell.rs`
+- `crates/tool-runtime/src/proof_runner.rs`
+- `crates/agent-process/src/supervisor.rs`
+- `crates/provider-openai/src/lib.rs`
+- `crates/provider-openai/src/sse.rs`
+
+### 实施步骤
+
+1. 严格解析 --max-rounds=N，传入现有 ComposeConfig。该字段虽然叫 max_tool_rounds，当前执行判断使用 turn.model_round；帮助/结果统一标为模型决策轮数，单轮多工具不得重复计为多轮。
+2. 原默认保持，不把提高全部预算当作算法修复；用户可显式选较大的有限值。RoundBudget 继续先 settle action batch，再沿既有 settle_aborted_turn 让出，保留限制和剩余工作。
+3. continue 开始一个新的有限段，不由 UI/CLI 自动无限循环；一个进程级总预算只在实际需要时增设，不能靠连续创建 turn 绕过用户上限。
+4. 修 stdout/stderr EOF 分支内直接 await child.wait 导致离开 cancel/timeout 竞争的问题。输出通道关闭后禁用 recv 分支，仍在同一 select 内等待进程终结；防止关闭通道的忙循环。
+5. 将已有 deferred proof 接进受支持产品路径前，串起取消传递、kill、reap/join、迟到证明隔离。ProcessSupervisor 不能在未确认退出时把监督责任写成已清空。
+6. 宿主可信验证也必须有硬退出后的生命周期处置：复用监督登记/OS 包含机制，不能只依赖父进程 Drop，也不伪造 Core effect identity。故障残留不清楚时保留 recovery 限制。
+7. Provider 错误响应在读入阶段限制字节，正常与 EOF 帧走相同验证；Chat length/Responses output limit 的结果语义对齐。不得在已暴露输出后悄悄重放整个请求。
+8. MCP 写阶段取消等非默认扩展问题单列支持面限制；接进本阶段实际产品声明的扩展才完成其写/连接/读/清理链。默认 in-process 的功能不等待整个 MCP 生态重做。
+
+### 退出条件
+
+- 低预算任务出现真实 RoundBudget 让出，不被显示为完成；续跑保持原任务。
+- 子进程关闭双输出后仍睡眠，超时与取消仍能结束等待并回收。
+- 慢验证取消和宿主硬退出后没有被误当完成的证明，清理结果可核对。
+- 异常大 HTTP 错误体在读入上限处结束，而不先全量分配。
+
+### 必要检查
+
+- cargo test -p agent-process -- --list
+- cargo test -p tool-runtime -- --list
+- cargo test -p provider-openai
+- 复用现有 Runtime deferred/turn-cancel 回归，增加 EOF 与实际进程清理的定向用例
+- 平台相关路径在 Linux/Windows 上分别记录，未跑的平台不写通过
+
+**承接上一轮缺陷：** PROCESS-01、PROCESS-02、PROVIDER-01、PROVIDER-02、PROVIDER-03、MCP-01（仅启用支持面）。其证据等级仍沿用旧报告；未在本轮执行的 Rust/平台测试不能写成已复现。
+
+**做到这里就停：** 一条长任务能让出续跑、一条慢验证能真实取消即交付；不增加独立 Scheduler、worker pool 或后台调度。
+
+---
+
+## M16-04：可信冷恢复与最小历史入口
+
+**用户结果：** 关掉进程后能选择经过验证的最近检查点，恢复同一任务并继续；不把缺失/损坏的日志当成新工程。
+
+**修改入口：**
+
+- `crates/agent-storage/src/lib.rs`
+- `crates/agent-core/src/operation.rs`
+- `crates/agent-core/src/kernel/mod.rs`
+- `crates/agent-runtime/src/instance.rs`
+- `crates/agent-runtime/src/checkpoint.rs`
+- `crates/agent-runtime/src/actor/restore.rs`
+- `crates/agent-tui/src/main.rs`
+- `crates/agent-compose/tests/product_flow.rs`
+- `crates/agent-compose/tests/crash_resume.rs`
+
+### 实施步骤
+
+1. 修 Windows metadata 先 remove 再 rename 的缺失窗口；metadata 缺失但存在代际 WAL 残留时不允许空初始化，也不能盲选最大的 .gN。
+2. 区分压缩发布前失败与发布后不确定。新 metadata 已发布而后续 sync/seek 失败时，不允许旧 writer 健康地继续追加；复用现有 RecoveryRequired 围栏和代际校验。
+3. 恢复入口复用 RuntimeInstance::restore 完整 prepare/capability/finalize 事务，禁止外部只调用 actor 半套恢复；检查点通过已有 envelope/store 解码和兼容验证。
+4. latest 选的是可验证、兼容的检查点，不只看任意 .json 的 mtime。没有可用项时给出原因，不删除不认识的文件。
+5. 展示恢复来源 run 与当前 run 的关联，不合并成同一个 run。任务列表来自现有 task/checkpoint/events 的只读投影，首版无需长期 RunCatalog 数据库。
+6. 扩展一条现有产品流程，使它真正调用 continuation 并继续完成下一步；验证用户原有修改、TaskId/plan/constraints、以及非重复 effect。采用 change journal/identity 计数，不能只用同名文件仍只有一个来证明不重复执行。
+7. 保持 committed prefix 与 forensic suffix 区分；不能从 raw trace 尾部重新 ingest 未提交输入或把 Ambiguous 自动当可重试。
+8. 受影响路径修复与测试是“可靠冷恢复”声明的条件，但不挡 M16-01 的进程内交互先交付。
+
+### 退出条件
+
+- 经实际产品配置保存、结束进程、恢复、continue 后能执行下一步；不仅是文件仍存在。
+- metadata 空缺/发布后错误不会建立新的空权威历史或继续旧代写入。
+- 未知 effect 保留围栏；准备未 dispatch 与已 Applied 的处理沿现有分类。
+- 非本任务旧改动保留，恢复版本/能力兼容失败可见。
+
+### 必要检查
+
+- cargo test -p agent-storage
+- cargo test -p agent-compose --test product_flow
+- cargo test -p agent-compose --test crash_resume
+- 选择现有 checkpoint/restore/authority-marker 定向回归；仅在代际发布切点补必要故障注入
+
+**承接上一轮缺陷：** STORAGE-01、STORAGE-02。其证据等级仍沿用旧报告；未在本轮执行的 Rust/平台测试不能写成已复现。
+
+**做到这里就停：** 现有检查点/历史事实足以支持一个可信恢复入口后停止；不建 Chronicle schema、SQL 数据库或完整 task timeline 平台。
+
+---
+
+## M16-05：结果审阅与统一状态展示
+
+**用户结果：** 用户能知道改了什么、哪些检查真正执行、哪些未验证，并在 /review 中回看；正常结束、待审阅、预算让出与故障不会混淆。
+
+**修改入口：**
+
+- `crates/agent-runtime/src/status.rs`
+- `crates/agent-runtime/src/task.rs`
+- `crates/agent-runtime/src/command.rs`
+- `crates/agent-replay/src/run_summary.rs`
+- `crates/agent-tui/src/state.rs`
+- `crates/agent-tui/src/ui.rs`
+- `crates/agent-tui/src/main.rs`
+- `crates/agent-workspace/src/lib.rs`
+- `crates/tool-runtime/src/tools/git.rs`
+
+### 实施步骤
+
+1. 定义一份有界只读结果视图，复用 Task/CompletionRecord、ExecutionState/typed readiness、effect/change journals 和 artifact refs。它是投影，不是新的完成 authority。
+2. 至少区分：已持久关闭、已产出待审阅、预算让出、等待审批、取消、执行失败、恢复受阻。不得仅凭 RunCompleted 或 TurnCompleted 推断业务完成；RunCompleted 也会在正常 shutdown 产生。
+3. 开始任务时记录有界基线/已有修改身份；结束时展示已知 Agent 变更与无法确定归属的变更。并发修改同一文件时标冲突/未知，不能把 git diff HEAD 全部据为 Agent 成果，也不能 reset/stash 用户改动。
+4. 检查项列实际命令或 recipe、结果、是否仍 current、未跑原因；测试通过不等于满足所有自然语言要求。操作员关闭单独显示。
+5. 增加 /review，以有界摘要和分页工件显示结果；查看不触发新模型请求，不由 UI 直接绕过 Core 执行 git/shell。
+6. 修 TUI 重放 run 过滤、持久水位去重、有界读入；未提交 suffix 只作诊断。修 run_summary 对 required_misses.entries/omitted 的读取，不读取不存在的 JSON total。
+7. 跨任务切换重置或按任务保存 anchor revision；历史累计风险与当前未解 debt 分开展示，不能用一个永久最大值表示当前。
+8. 诊断导出可能含用户源码/输出，不因没有显式 API-key 字段就称其天然无敏感内容；限制内容并说明分享前审阅，常见凭据可做防御性遮蔽但不保证完全脱敏。
+
+### 退出条件
+
+- 已有用户改动和新 Agent 改动并存时，结果归属不夸大。
+- 普通 final 显示待审阅或执行段结束，而不是 verified complete。
+- 一次 dropped-event 重建不引入其他 run、不重复累计，也不超界读入。
+- required-context miss 通过实际 RuntimeEvent 序列化后在汇总中计数正确。
+
+### 必要检查
+
+- cargo test -p agent-replay
+- cargo test -p agent-tui
+- 复用 Runtime status/完成记录测试，补真实事件序列化夹具；不再手写不存在字段的 JSON
+- 在有用户未提交修改的临时工作区演示 /review
+
+**做到这里就停：** 一份可信结果卡和查询入口即可；不做全功能 diff 编辑器、自动全仓回滚或 Chronicle 平台。
+
+---
+
+## M16-06：上下文、GC 与搜索的实际编码闭环
+
+**用户结果：** 三文件任务切换时能找回正确版本的正确片段；当前任务约束不漂移，搜索不完整不会冒充全仓无命中。
+
+**修改入口：**
+
+- `crates/agent-contracts/src/context.rs`
+- `crates/agent-contracts/src/search.rs`
+- `crates/context-simple/src/engine.rs`
+- `crates/context-simple/src/materializer.rs`
+- `crates/context-simple/src/gc/reachability.rs`
+- `crates/context-simple/src/gc/minor.rs`
+- `crates/context-simple/src/residency.rs`
+- `crates/context-simple/src/index/dependency.rs`
+- `crates/context-simple/src/index/indexes.rs`
+- `crates/context-simple/src/store.rs`
+- `crates/agent-runtime/src/prompt.rs`
+- `crates/agent-runtime/src/execution/body_cache.rs`
+- `crates/tool-runtime/src/tools/fs.rs`
+- `crates/tool-runtime/src/tools/search.rs`
+- `crates/agent-workspace/src/confined.rs`
+
+### 实施步骤
+
+1. 先修不安全的省略，再加最小片段元数据：整文件 revision 用于 CAS；实际 range/content digest/representation/truncated 用于正文覆盖与去重。旧记录缺区间按 Unknown，不默认为全文件。
+2. 同版本互补片段不因 path 相同而语义终结；新版本旧材料可不作为 current，但历史来源和显式保留权利不混淆。最终 renderer 输出真实曝光集合，消费 ACK 只确认最终请求保留的内容。
+3. 一个材料被选中、正文被展示、仅描述符可见分别计数；不把描述符当 PromptRequired 正文满足。不满足时沿现有 required miss 分类与完成门禁处理。
+4. 成功读/grep 同一实体不能将旧 Error 标记为 VerifiedFixed；使用已有可信验证关联，无法证明则保留 Live 或降低 attention。Resident/Warm 的有效 lease、keep_alive 与 TTL 规则一致；语义终态不能被租约复活。
+5. 修实体依赖候选“先取旧前缀64再逆序”的顺序；考虑 update_entities 的 swap_remove。保持 SharesEntities 与必须正文依赖的区分，别让弱关联变成全图保留。
+6. search.grep 明确 result pagination 与 scan completeness；文件/命中/字节上限、二进制/权限/IO 跳过分别有界报告。复用 confined 句柄与读取字节界，正文读取拒绝 FIFO/特殊文件阻塞；Windows 先 RAII 接管 HANDLE 后验证。
+7. 搜索、inspect、fetch、admit 不合并：候选高分不自动变 prompt root；读取不自动长期驻留。保持现有语义目录/文件全文搜索两类边界。
+8. 候选扩展预留只计实际需要的依赖，未用预算允许回填；先在现有选择器中局部修复，不重写整个 Frame 编译器。
+9. 当前子目标投影可复用 next_action/open loops/可信资源触达作为可选材料相关性；不得让模型建议改变硬约束/验证身份。若该策略有行为变化，与其余正确性修复拆开一次小对照；无收益就保留旧默认。
+
+### 退出条件
+
+- 同文件1–100和201–300行在相同 revision 下互不冒充覆盖，截断/旧元数据也不冒充全文。
+- 三文件任务经一次工作集降级和精确恢复后，仍保持目标、约束、计划和未解问题。
+- 成功读错误相关文件不会宣告已验证修复；有效租约在不同 tier 的语义一致。
+- 有限 grep 显式说明未覆盖部分；128条同实体候选不会只从最旧64条中选所谓最新。
+- 最终曝光、消费记录和实际发送请求的包含关系可定向核对。
+
+### 必要检查
+
+- cargo test -p context-simple -- --list
+- cargo test -p tool-runtime -- --list
+- cargo test -p agent-workspace -- --list
+- 选择片段覆盖、materialize、lease、file/search 的实际定向用例；release ACK 修复只复核不重新立项
+- 复用一个真实三文件任务对照，不新增全局评测服务
+
+**承接上一轮缺陷：** CONTEXT-01、WORKSPACE-01、WORKSPACE-02。其证据等级仍沿用旧报告；未在本轮执行的 Rust/平台测试不能写成已复现。
+
+**做到这里就停：** 闭合 read/search/fetch/admit/pack/ack 的正确性与一个三文件流程即结束；不把向量、BM25 服务、SIEVE/TinyLFU、正式 Frame 翻转或 learned router 列成本阶段必需项。
+
+---
+
+## M16-07：可脚本调用的单进程运行入口
+
+**用户结果：** 不用 TUI 也能运行一个有边界的任务，得到结构化结果并恢复；编辑器或脚本可调用，但不引入守护进程。
+
+**修改入口：**
+
+- `crates/agent-tui/src/main.rs`
+- `crates/agent-compose/src/lib.rs`
+- `crates/agent-runtime/src/command.rs`
+- `crates/agent-runtime/src/instance.rs`
+- `crates/agent-runtime/src/status.rs`
+- `crates/agent-core/src/（现有审批门入口，先按实际布局定位）`
+- `docs/CONFIGURATION.md`
+- `INSTALL.md`
+
+### 实施步骤
+
+1. 优先在现有产品包增加 headless 模式或同包 bin；保持 compose -> instance -> handle。输入/事件输出的 host pump 不得变成手写 model/tool 循环。新 crate、HTTP server、daemon 均不是必要条件。
+2. 建议参数为 --task <文本> 或 --task-file <文件>、--max-rounds N、--jsonl 和已有 restore 概念；最终拼写统一后写入帮助。它们在本基线尚不存在，本文示例不是现有用法。
+3. 默认非交互不自动授权。复用已有站立授权/策略门；需要未授予权限时输出 needs_approval 并在安全边界停止，而不是无限等待没人回答的提示或自动同意。输入的授权配置仍来自可信宿主，不由待审工作区内容自行扩大。
+4. JSONL stdout 只输出机器事件；日志/警告到 stderr；schema 有版本、run_id、task_id 和稳定结果类别。避免把 token 文本、TurnCompleted 或 RunCompleted 直接当任务成功。
+5. 定义清楚退出语义：参数错误、等待审批、待人工审阅、预算让出、取消、运行故障、RecoveryRequired 与 durable completion 分开。代码0只能表达明确声明的成功条件；不把普通 final 假写为 verified task completion。
+6. 结果仍读 M16-05 视图；恢复仍调用 RuntimeInstance::restore；结束始终 shutdown/join。stdout 断开、输入EOF与Ctrl-C纳入同一清理责任，不能 process::exit 跳过已运行模块的关闭。
+7. 真实完整任务依然受用户给定预算限制，无自动新turn循环绕过；不支持跨进程控制一个运行中的run就明确不支持，不借CLI之名暗建控制服务。
+
+### 退出条件
+
+- 非TTY环境运行无 raw-mode/alternate-screen要求，JSONL 可逐行解析。
+- 无授权的写操作产生 needs_approval，不造成目标文件修改；不会无限挂起。
+- 同一任务通过 TUI/headless 共享产品配置和完成语义，没有第二套执行状态。
+- 恢复可继续、所有结束路径释放锁/进程；输出/结果仍保留待审阅与未验证。
+
+### 必要检查
+
+- cargo check -p agent-tui
+- cargo test -p agent-tui
+- 在临时工作区执行实际 headless 二进制：成功/待审阅、无授权、低轮数、取消、恢复等路径
+- 复用已有产品集成 fixture；这不是另建一套 Agent harness
+
+**做到这里就停：** 一个可调用的有限单进程入口与稳定结果即可；不做远端运行管理、全局任务队列、后台worker或编辑器插件。
+
+---
+
+## M16-08：发布可日常试用的版本并结束本阶段
+
+**用户结果：** 用户拿到对应源码的 Linux/Windows 版本，能做bug修复、小功能、跨文件中断续跑，并看到可信结果与限制。
+
+**修改入口：**
+
+- `scripts/dist.sh`
+- `scripts/dist.ps1`
+- `.github/workflows/package.yml`
+- `.github/workflows/ci.yml`
+- `INSTALL.md`
+- `docs/CONFIGURATION.md`
+- `docs/COMPATIBILITY.md`
+- `docs/RECOVERY_RUNBOOK.md`
+- `docs/CURRENT.md`
+- `docs/NEXT_TASKS.md`
+
+### 实施步骤
+
+1. 构建与复制绑定同一显式 target-dir，使用锁定依赖；干净 staging 后再发布，不沿用 dist/<version> 的陈旧文件。helper 是否包含是明确产品选项，不取决于目录恰好有旧二进制。
+2. PowerShell 显式检查 native cargo exit code。checksums 随当前产物生成；记录源码 SHA、构建配置、平台和工具链身份，不能用 checksum 代替构建来源。
+3. 包内实际二进制运行启动、正常小任务、取消与恢复检查。mock/脚本模型保证确定性接线，真实 provider 走用户已授权的有限预算；没有key或serving不可用如实 NOT_RUN。
+4. 复用已有证据/trace/artifact，运行三个日常任务：真实小bug；两三文件小功能；跨文件重构并中断续跑。至少一条在已有用户修改的工作区运行。失败透明，不为了凑PASS重复抽样或放宽标准。
+5. 记录任务目标、源码/产品配置、修改结果、真实检查、未验证限制、停止原因、最终状态和恢复点。它们验证产品闭环，不声称三个样本证明普遍成功率或算法优越性。
+6. 使用现有跨平台 CI 作集成保障，补默认 release 消费路径及实际包smoke。没有源码变更或明确环境原因不重复相同全量测试。
+7. 更新安装/恢复说明和受支持范围。默认动态进程内先交付；MCP/service/Shadow仍实验的就如实列限制，不暗示所有扩展同等验收。
+8. 当本表退出条件满足即完成 M16。新发现若不影响声明支持面，进入独立候选，不扩展本阶段完成条件；影响默认权限/持久性/资源边界的问题必须修或诚实缩小该支持声明。
+
+### 退出条件
+
+- 包内每个二进制都来自本次构建，custom target和dirty dist场景不夹旧文件。
+- 现有支持平台上的默认路径CI/包检查有对应源码记录；失败没有被隐藏。
+- 三个日常任务有实际可审阅记录；未跑的 live 部分单列，不宣称完整产品走查通过。
+- 无新增Chronicle数据库、TaskGraph/worker或未需要的编排层，本阶段可以明确结束。
+
+### 必要检查
+
+- bash scripts/dist.sh <实际使用的目标目录>（修改后再按帮助验证）
+- powershell -File scripts/dist.ps1 <实际使用的目标目录>（修改后验证退出码）
+- 沿用现有 CI 的 fmt/clippy/build/test；不复制第二套全工作区门禁
+- 包内二进制执行产品smoke和已批准预算内的真实任务
+
+**承接上一轮缺陷：** PACKAGE-01。其证据等级仍沿用旧报告；未在本轮执行的 Rust/平台测试不能写成已复现。
+
+**做到这里就停：** 可试用包、准确使用说明和三类产品记录完成后结束。若真实服务缺失，标记“实现就绪/真实走查未完成”，不假绿也不回头扩建基础设施。
+
+---
+
+## 统一交付回执
+
+```text
+工单 / 实际源码 SHA：
+新增的用户动作：
+复用的已有实现：
+修改的源码与契约：
+实现状态 / 默认启用状态：
+实际执行的命令、退出码、有效测试数：
+真实任务是否执行（或 NOT_RUN 原因）：
+恢复、权限、资源边界的已知限制：
+下一工单：
+```
+
+不要给过滤后运行0个用例的命令记PASS。纯文档不跑全Rust测试；功能开发跑相关用例，集成沿用现有CI。不能删冻结用例、改oracle、放宽安全条件制造进度；也不能因无关边角问题不断扩大当前退出条件。
+
+## 明确延期
+
+Chronicle/RunCatalog 数据库、TaskGraph/通用Planner、并行worker、多Agent、远端broker、WASI普遍支持、向量库、学习排序、正式Frame翻转、自动递归改进均不在M16必需范围。
+
+这些不是永久禁止。M16之后从真实数据只选一个：搜索质量不足就研究字段化BM25，正文缓存恢复太贵再比较SIEVE/准入，依赖装配浪费预算再试边际收益选择。没有对应问题时不做算法升级。
+
+完整源码可见性仍需补齐。包内清单脚本只帮助定位未读文件，不会把遍历、哈希或代码路径表当作语义审查完成证明。

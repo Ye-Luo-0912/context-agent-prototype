@@ -220,6 +220,8 @@ mod tests {
             entities: entities.iter().map(|s| s.to_string()).collect(),
             file_path: None,
             file_revision: None,
+            file_start_line: None,
+            file_end_line: None,
         }
     }
 

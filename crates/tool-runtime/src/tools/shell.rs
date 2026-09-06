@@ -356,6 +356,12 @@ impl Tool for ShellExecTool {
         let mut exited: Option<std::process::ExitStatus> = None;
         let mut grace_started = false;
         let mut outcome: &str = "completed";
+        // Set once both pipe readers ended: the recv arm is then disabled
+        // (a closed receiver would win every select poll) and the loop
+        // keeps waiting on exit, cancel or timeout. A shell that closes
+        // stdout/stderr and keeps running must stay bounded by the same
+        // deadline and cancellation as every other run.
+        let mut outputs_closed = false;
 
         loop {
             tokio::select! {
@@ -376,21 +382,26 @@ impl Tool for ShellExecTool {
                 }
                 status = child.wait(), if exited.is_none() => {
                     exited = Some(status.map_err(|e| AgentError::Tool(format!("wait: {e}")))?);
+                    if outputs_closed {
+                        // Output fully drained and the shell reaped:
+                        // nothing left to wait for, skip the grace window.
+                        break;
+                    }
                     grace_started = true;
                 }
                 _ = &mut grace, if grace_started => break,
-                line = line_rx.recv() => {
+                line = line_rx.recv(), if !outputs_closed => {
                     match line {
                         Some(line) => {
                             capture.record(line, &mut artifact).await?;
                         }
                         None => {
-                            // All output drained; the process may still be
-                            // exiting, so reap it before reporting a status.
-                            if exited.is_none() {
-                                exited = Some(child.wait().await.map_err(|e| AgentError::Tool(format!("wait: {e}")))?);
+                            if exited.is_some() {
+                                // Output drained and the process is
+                                // already reaped: the old fast path.
+                                break;
                             }
-                            break;
+                            outputs_closed = true;
                         }
                     }
                 }
@@ -939,5 +950,54 @@ mod tests {
             | EffectReconciliation::Ambiguous { .. }
             | EffectReconciliation::Applied { .. } => {}
         }
+    }
+
+    /// Regression for the output-EOF wait bypass: a shell that closes
+    /// stdout/stderr and keeps running must stay bounded by the timeout and
+    /// cancellation instead of being reaped unbounded inside the EOF arm.
+    /// The Windows variant needs cmd to forward a PowerShell handle-close
+    /// script (unreliable quoting through the dialect), so this one runs on
+    /// Unix; Windows keeps the existing cancellation/timeout coverage over
+    /// the same restructured select loop.
+    #[cfg(not(windows))]
+    #[tokio::test]
+    async fn shell_exec_output_eof_before_exit_still_times_out() {
+        let dir = tempfile::tempdir().unwrap();
+        let workspace = Workspace::open(dir.path()).await.unwrap();
+        let tool = ShellExecTool::with_dialect(workspace.clone(), test_dialect());
+        let run_id = RunId::new();
+        let arguments = json!({
+            "command": "exec 1>&- 2>&-; sleep 30",
+            "timeout_ms": 8000,
+        });
+        let context = ctx(run_id, &arguments);
+        let started = std::time::Instant::now();
+        let output = value(
+            tokio::time::timeout(
+                Duration::from_secs(20),
+                tool.execute(
+                    run_id,
+                    "c",
+                    arguments,
+                    Some(context),
+                    CancellationToken::new(),
+                ),
+            )
+            .await
+            .expect("EOF-before-exit must stay bounded by the timeout (watchdog tripped)")
+            .unwrap(),
+        );
+        let elapsed = started.elapsed();
+        assert!(
+            !output.ok,
+            "a timed-out shell must report failure: {}",
+            output.summary
+        );
+        assert!(
+            output.summary.to_ascii_lowercase().contains("timed out"),
+            "the deadline arm must fire after output EOF: {}",
+            output.summary
+        );
+        assert!(elapsed >= Duration::from_secs(6), "{elapsed:?}");
     }
 }

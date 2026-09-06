@@ -206,6 +206,7 @@ dependencies = [
  "sha2",
  "tempfile",
  "tokio",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
@@ -222,6 +223,7 @@ dependencies = [
  "async-trait",
  "crossterm",
  "ratatui",
+ "serde",
  "serde_json",
  "tempfile",
  "tokio",

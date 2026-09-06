@@ -44,6 +44,12 @@ pub enum RuntimeCommand {
     ListTasks {
         reply: Reply<AgentResult<Vec<TaskInfo>>>,
     },
+    /// Read-only projection of the active task's anchor (plan progress,
+    /// open loops, next action). Reading never mutates state and never
+    /// writes a checkpoint; `None` when no task is active.
+    TaskPlanView {
+        reply: Reply<AgentResult<Option<agent_contracts::TaskAnchorView>>>,
+    },
     /// Atomically replace one task's complete tool-demand set when
     /// `base_revision` still matches.
     ReplaceTaskToolRequirements {
@@ -197,6 +203,15 @@ impl RuntimeHandle {
     /// Snapshot of the tasks the runtime knows.
     pub async fn list_tasks(&self) -> AgentResult<Vec<TaskInfo>> {
         self.call(|reply| RuntimeCommand::ListTasks { reply }).await
+    }
+
+    /// Bounded read-only view of the active task's anchor: the checklist
+    /// (`plan_progress`), open loops and next action the model maintains
+    /// through `task.manage`. `None` when no task is active. Reading does
+    /// not write state and does not create a checkpoint.
+    pub async fn task_plan_view(&self) -> AgentResult<Option<agent_contracts::TaskAnchorView>> {
+        self.call(|reply| RuntimeCommand::TaskPlanView { reply })
+            .await
     }
 
     /// Replace a task's bounded tool-demand set through whole-set CAS and

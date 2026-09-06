@@ -3707,18 +3707,26 @@ mod tests {
         ];
         let started = std::time::Instant::now();
         // PowerShell cold-start takes longer than `sh`, so Windows needs a
-        // longer window for the descendant to write its pid file; both stay
-        // far below the 300-second descendant lifetime being killed.
+        // longer window for the descendant to write its pid file — and a
+        // loaded CI runner can exceed even that before the outer script
+        // reaches Start-Process, which would kill the tree before the pid
+        // file ever exists. 20s keeps real headroom while staying far below
+        // the 300-second descendant lifetime being killed.
         let timeout = if cfg!(windows) {
-            Duration::from_secs(10)
+            Duration::from_secs(20)
         } else {
             Duration::from_millis(300)
+        };
+        let return_bound = if cfg!(windows) {
+            Duration::from_secs(45)
+        } else {
+            Duration::from_secs(30)
         };
         let record = run_tree_bounded(&root, &argv, timeout).await;
         assert!(record.timed_out, "{record:?}");
         assert!(record.exit.is_none());
         assert!(
-            started.elapsed() < Duration::from_secs(30),
+            started.elapsed() < return_bound,
             "timed-out run must return bounded"
         );
         assert!(

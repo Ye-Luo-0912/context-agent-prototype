@@ -1,92 +1,54 @@
-# Current state
+# 当前工作
 
-Snapshot: **2026-09-05**. Machine source of truth:
-[`docs/state.json`](state.json) — the current-status text in `README.md` and
-this file must agree with it. Full decision record: [`STATUS.md`](STATUS.md).
-Formal verdicts live only in the immutable
-`crates/agent-eval/evidence/m15-window/_windows/<id>/REPORT.md` reports.
+## 现在做什么
 
-## Basis
+**当前工单：PROCESS-01**（STORAGE-02 已于 2026-09-06 关闭：compact 的可失败步骤全部前移到元数据发布之前，发布后仅剩内存交换；定向测试覆盖发布前失败与发布后崩溃窗口）。
 
-- Head `33081b4` — M15 closure (`d004836`) plus the docs-state tranche and
-  CI-load-tolerant turn-integration test deadlines. Runtime code is
-  unchanged from `050aa8e`. CI is green on the head (`33898496334`); the
-  earlier `d004836` run had failed its Windows full suite on test wait
-  deadlines under CI load (closure conditions are unaffected — they pinned
-  the candidate source `050aa8e`/`a882789`, which stayed green).
-- `main` has no branch protection yet.
+先按审查剩余队列逐项修代码里还在的缺口，再回到 M16-02 的完成语义展示。
+这不是新的前置阶段，也不是全仓审查完成。一次一项；STORAGE-01 与 DOC-01 已关闭。
 
-## M15 — closed at the frozen gate
+原文与探针：[reviews/2026-09-06-deep-audit/REVIEW.md](reviews/2026-09-06-deep-audit/REVIEW.md)。
+可执行步骤：[NEXT_TASKS.md](NEXT_TASKS.md)。
 
-- M15 closed **2026-09-04** (commit `d004836`): the tenth predeclared
-  12-cell v4 window returned the mechanical verdict **PASS 12/12, 0 NOT_RUN**
-  (`_windows/1788539149184`, run log `window10.log`): diag 4/4, migrate 4/4
-  and policy 4/4 — the two stochastic surfaces green in one window for the
-  first time — with three completed closures (report-only dimension).
-- Ten earlier v4 runs (eight valid FAILs, one censored, one authorized
-  rerun) stay immutable diagnostics; the best pre-closure run was the ninth
-  window's 11/12 (`_windows/1788533384841`).
-- Next ordered gates per [`ROADMAP.md`](ROADMAP.md): `LT-EVAL-06` evaluation
-  breadth and the packaged V1 release gate. V2 Self-Iteration is unblocked
-  by M15 but remains a separately proposed and accepted phase.
+## 审查剩余（排在 M16 产品剩余之前）
 
-## Product stage
+基线仍是 `12c86283b8d5991e9f17a07f14871dcf39d65066`（审查固定 SHA，不是本工作树 HEAD）。
+本工作树 HEAD：`2e825d0`。工作区另有未提交改动（N2、STORAGE-01、审查入库、M16 文档）；不得 reset/stash。
 
-- **Alpha (`v0.1.0` tagged 2026-09-05).** Phase 2 (Reliable Local Agent alpha) started 2026-09-04.
-  Landed 2026-09-05, in order: unified manual/automatic checkpoints
-  (`CHECKPOINT-PRODUCT-01`, `e8e5fff`); real child-process kill points +
-  crash/resume acceptance (`CRASH-RESUME-01` partial, `5f94dc7`; effect-
-  broker kill points residual); strict provider config + `SamplingPolicy`
-  + profile digest (`PRODUCT-PROFILE-01`, `d21b686`); bounded TUI
-  transcript (`ca6db07`). Checked model configuration landed earlier
-  (`32ea622`).
-- Landed later 2026-09-05: approval prompts name the risk and each
-  argument; broadcast Lagged events surface a visible warning;
-  `scripts/dist.{sh,ps1}` package the release binary with SHA256SUMS
-  (Windows path validated by a real run).
-- Landed 2026-09-05 (late): proof refresh operation-lifecycle closed —
-  opt-in `defer_proof_refresh` with turn-holding makes the deferred
-  accepted commit deterministic; frozen inline semantics default.
-  Shadow Context Frame Frame-0 landed: `agent-runtime::frame` compiles a
-  zoned, classified manifest per model round behind the opt-in
-  `shadow_context_frame` flag (measurement only; model input unchanged).
-  Frame-1 landed: `agent-replay --frame-report` compares the structured
-  frame against actual context-layer costs from flag-enabled traces.
-  Frame-2 landed: the scripted gate matrix (constraints/debts/misses
-  mandatory, dedup, boundedness, external descriptors, zone consistency,
-  engine-agnostic) as unit tests plus `agent-replay --frame-gate` over
-  recorded traces.
-- Landed 2026-09-05 (last): `agent-tui --doctor` product self-check,
-  `INSTALL.md` install/config/upgrade notes, and the dual-platform
-  `package.yml` CI workflow (fail-closed-config + doctor smokes,
-  checksummed artifacts). All six Phase 2 alpha hardening blockers from
-  the 2026-09-05 review are closed on source; the Context Frame route is
-  at Frame-3-ready (live gate waits for `LT-EVAL-06` serving).
-  RUN-PROJECTION landed: `agent-replay --run-summary` folds a trace into
-  the smallest rebuildable run/task projection (lifecycle, tasks,
-  checkpoints, recovery debts, costs). [`COMPATIBILITY.md`](COMPATIBILITY.md)
-  declares the V1 cross-version contract (checkpoints, events, wire
-  profile, shadow frame).
-- Next product queue: [`LT-EVAL-06`] breadth on the product limits, then
-  the V1 release gate rides the package workflow.
-- Default context is dynamic in-process. `context-service`,
-  completion-opportunity, settlement-projection and recovery-surface remain
-  experimental.
+| 顺序 | 工单 | 用户/系统得到什么 | 状态 |
+|---|---|---|---|
+| 1 | STORAGE-02 | 压缩元数据已发布后若后续失败，不能继续往旧代写 | 已关闭（2026-09-06） |
+| 2 | **PROCESS-01** | 宿主验证硬崩溃后不留下无监督子进程 | **当前** |
+| 3 | PROCESS-02 | reap 未确认退出不清 pid | 开放 |
+| 4 | WORKSPACE-01 | 普通 confined open 不阻塞 FIFO | 开放 |
+| 5 | WORKSPACE-02 | Windows 拒绝路径立即接管 HANDLE | 开放 |
+| 6 | PROVIDER-01 | 非 2xx 错误 body 有界读取 | 开放 |
+| 7 | PROVIDER-02 | Chat `length` 终止不丢成正常完成 | 开放 |
+| 8 | PROVIDER-03 | Responses EOF 尾帧与正常帧同一套校验 | 开放 |
+| 9 | CONTEXT-01 | 依赖候选按 newest-first，不先截旧前缀 | 开放 |
+| 10 | PACKAGE-01 | 构建输出与打包复制源绑定 | 下次实际发布时 |
+| 11 | MCP-01 | 写/连接/读都可取消 | 仅默认产品启用 MCP 时 |
 
-## Document organization (2026-09-05)
+本分支已关闭、不重复立项：STORAGE-01、DOC-01；上轮 EOF wait、消费 ACK、PromptRequired 判重、resync / run_summary。
+Windows 在 metadata 替换中途杀进程仍未注入，记为 STORAGE-01 测试缺口，不是新工单。
 
-Done in this pass: `docs/state.json` (machine-readable single source),
-this file, drift fixes in `README.md` / `STATUS.md` /
-`LONG_TASK_EVALUATION.md`, and `CONTEXT_RUNTIME_TODO.md` moved to
-[`archive/`](archive/) (historical design queue, never live contract).
+## 已核对的事实
 
-Landed since (2026-09-05): `RECOVERY_RUNBOOK.md`, `CONFIGURATION.md`,
-`CONTEXT_FRAME_V1.md` and `COMPATIBILITY.md` now exist as focused
-documents (see the [`STATUS.md`](STATUS.md) doc table); `INSTALL.md`
-owns install/upgrade. Still pending (target structure agreed
-2026-09-05): CI document-consistency gate (README/STATUS vs
-`state.json`, window counts vs `_windows/` manifests, doc links, tool
-inventory vs generated manifest, Cargo `rust-version` vs CI toolchain);
-`EXECUTION_MODEL.md` / `PRODUCT_ALPHA.md` extraction from the oversized
-combined docs; move closed audit/history sections to `archive/`;
-protect `main` with the existing cross-platform CI as required check.
+- v0.1.0 alpha 已发布；M15 / LT-EVAL-06 证据保留，不重开、不改写。
+- 任务/计划/继续/恢复的基础已在 Runtime。默认 `OperatorClosureOnly`：普通 final 结束执行段，不是模型自行持久关闭任务。
+- `--max-rounds` 计量模型决策轮（`turn.model_round`）。
+- 远端 CI run `33986702977` 在基线 SHA 上六个 job success；不是本工作树、也不是全仓审查完成。
+
+## M16 仍在，但排在审查剩余之后
+
+活动大阶段仍是 **M16：可持续交付的本地单 Agent**。不建 Chronicle、TaskGraph、通用调度或第二套编排器。
+M16-00 文档已切换。M16-01/05/07 与大部分 02/03/06 已落地。审查剩余关闭后，下一产品项是 **M16-02 剩余：待审阅 ≠ 持久完成**。
+
+对照表与限制见 [ROADMAP.md](ROADMAP.md)。缺陷细节：[AUDIT_TODO.md](AUDIT_TODO.md)。
+无头 live：[walkthroughs/2026-09-06-f6.md](walkthroughs/2026-09-06-f6.md)。
+提案原文不进默认必读：[reviews/2026-09-06-m16-proposal/TRIAGE.md](reviews/2026-09-06-m16-proposal/TRIAGE.md)。
+
+## 不在本轮
+
+Chronicle 数据库、TaskGraph、并行 worker、向量检索、Frame-3 正式翻转、SIEVE/TinyLFU 调参、新评测总门禁。
+不能用“再跑一些测试”去换一个从未授予的自动完成权。

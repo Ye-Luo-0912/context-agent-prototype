@@ -78,6 +78,20 @@ impl FileOperationJournal {
         } else {
             None
         };
+        // Missing metadata is only a first-time create when the directory
+        // has no WAL generations. Leftover `.gN` (or a gen-1 WAL) means a
+        // published journal already existed; minting generation 1 and a new
+        // journal id would hide that history. Do not pick the highest `.gN`
+        // either: it may be an unpublished, partial compaction.
+        if existing_metadata.is_none() {
+            let remnants = list_authority_wal_generations(&path)?;
+            if !remnants.is_empty() {
+                return Err(AgentError::RecoveryRequired(format!(
+                    "authority journal metadata {} is missing, but WAL generation(s) {remnants:?} still exist; refusing empty initialization",
+                    metadata_path.display()
+                )));
+            }
+        };
         let generation = existing_metadata
             .as_ref()
             .map(|metadata| metadata.generation)
@@ -188,6 +202,68 @@ fn authority_wal_path(base: &Path, generation: u64) -> PathBuf {
     }
 }
 
+fn authority_wal_file_name(base: &Path) -> String {
+    base.file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "operations.jsonl".into())
+}
+
+fn authority_wal_generation_of(file_name: &str, journal_name: &str) -> Option<u64> {
+    if file_name == journal_name {
+        return Some(1);
+    }
+    let rest = file_name.strip_prefix(journal_name)?.strip_prefix(".g")?;
+    if rest.is_empty() || !rest.bytes().all(|byte| byte.is_ascii_digit()) {
+        return None;
+    }
+    rest.parse().ok().filter(|&generation| generation >= 1)
+}
+
+fn list_authority_wal_generations(base: &Path) -> AgentResult<Vec<u64>> {
+    let Some(parent) = base.parent() else {
+        return Ok(Vec::new());
+    };
+    if !parent.exists() {
+        return Ok(Vec::new());
+    }
+    let journal_name = authority_wal_file_name(base);
+    let mut generations = Vec::new();
+    let entries = fs::read_dir(parent).map_err(|error| {
+        AgentError::Storage(format!(
+            "list authority journal directory {}: {error}",
+            parent.display()
+        ))
+    })?;
+    for entry in entries {
+        let entry = entry.map_err(|error| {
+            AgentError::Storage(format!(
+                "read authority journal directory {}: {error}",
+                parent.display()
+            ))
+        })?;
+        let file_type = entry.file_type().map_err(|error| {
+            AgentError::Storage(format!(
+                "stat {} in {}: {error}",
+                entry.path().display(),
+                parent.display()
+            ))
+        })?;
+        if !file_type.is_file() {
+            continue;
+        }
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else {
+            continue;
+        };
+        if let Some(generation) = authority_wal_generation_of(name, &journal_name) {
+            generations.push(generation);
+        }
+    }
+    generations.sort_unstable();
+    generations.dedup();
+    Ok(generations)
+}
+
 fn validate_recovered_generation(
     metadata: &AuthorityJournalMetadata,
     recovery: &OperationJournalRecovery,
@@ -223,6 +299,8 @@ fn load_or_create_authority_metadata(path: &Path) -> AgentResult<AuthorityJourna
         return read_authority_metadata(path);
     }
 
+    // Caller (`FileOperationJournal::open`) has already refused this path
+    // when any WAL generation is present without metadata.
     let metadata = AuthorityJournalMetadata {
         version: AUTHORITY_JOURNAL_METADATA_VERSION,
         journal_id: AuthorityJournalId::new(),
@@ -288,10 +366,45 @@ fn persist_authority_metadata(path: &Path, metadata: &AuthorityJournalMetadata) 
 
 fn replace_file(from: &Path, to: &Path) -> std::io::Result<()> {
     #[cfg(windows)]
-    if to.exists() {
-        fs::remove_file(to)?;
+    {
+        // Replace in one MoveFileEx call. Deleting `to` first would leave a
+        // window where metadata is absent and open() could mint an empty
+        // generation-1 journal.
+        use std::os::windows::ffi::OsStrExt;
+        use windows_sys::Win32::Storage::FileSystem::{
+            MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH, MoveFileExW,
+        };
+        fn wide_path(path: &Path) -> std::io::Result<Vec<u16>> {
+            let mut wide: Vec<u16> = path.as_os_str().encode_wide().collect();
+            if wide.contains(&0) {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "path contains interior NUL",
+                ));
+            }
+            wide.push(0);
+            Ok(wide)
+        }
+        let from_wide = wide_path(from)?;
+        let to_wide = wide_path(to)?;
+        // SAFETY: both buffers are NUL-terminated UTF-16 paths.
+        let ok = unsafe {
+            MoveFileExW(
+                from_wide.as_ptr(),
+                to_wide.as_ptr(),
+                MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH,
+            )
+        };
+        if ok == 0 {
+            Err(std::io::Error::last_os_error())
+        } else {
+            Ok(())
+        }
     }
-    fs::rename(from, to)
+    #[cfg(not(windows))]
+    {
+        fs::rename(from, to)
+    }
 }
 
 fn read_authority_metadata(path: &Path) -> AgentResult<AuthorityJournalMetadata> {
@@ -556,8 +669,19 @@ fn compact_locked(
         generation: next_generation,
         ancestors,
     };
-    persist_authority_metadata(&base_path.with_extension("meta.json"), &new_metadata)?;
-
+    // Every remaining fallible step runs BEFORE the metadata publish. The
+    // publish is the point of no return: once the new generation is durable
+    // on disk, this process must never keep appending to the old one, so a
+    // failure after it would have to fence the old writer. Reordering makes
+    // that fence structural: after the publish only in-memory swaps and a
+    // best-effort removal of the old WAL remain, none of which can strand
+    // the writer on the old generation.
+    new_file.seek(SeekFrom::End(0)).map_err(|error| {
+        AgentError::Storage(format!(
+            "seek compacted operation journal {}: {error}",
+            new_path.display()
+        ))
+    })?;
     let last_seq = records.last().map(|record| record.seq).unwrap_or(1);
     let next_seq = last_seq.checked_add(1).ok_or_else(|| {
         AgentError::RecoveryRequired("operation journal sequence exhausted".into())
@@ -572,12 +696,8 @@ fn compact_locked(
         .enumerate()
         .map(|(index, snapshot)| (snapshot.identity.operation_id, index))
         .collect();
-    new_file.seek(SeekFrom::End(0)).map_err(|error| {
-        AgentError::Storage(format!(
-            "seek compacted operation journal {}: {error}",
-            new_path.display()
-        ))
-    })?;
+
+    persist_authority_metadata(&base_path.with_extension("meta.json"), &new_metadata)?;
 
     let old_wal = authority_wal_path(base_path, writer.metadata.generation);
     writer.file = new_file;
@@ -1464,6 +1584,109 @@ mod tests {
     }
 
     #[test]
+    fn wal_generation_names_are_exact_and_do_not_treat_suffixes_as_generations() {
+        assert_eq!(
+            authority_wal_generation_of("operations.jsonl", "operations.jsonl"),
+            Some(1)
+        );
+        assert_eq!(
+            authority_wal_generation_of("operations.jsonl.g2", "operations.jsonl"),
+            Some(2)
+        );
+        assert_eq!(
+            authority_wal_generation_of("operations.jsonl.g2.bak", "operations.jsonl"),
+            None
+        );
+        assert_eq!(
+            authority_wal_generation_of("other.jsonl", "operations.jsonl"),
+            None
+        );
+    }
+
+    #[test]
+    fn missing_metadata_with_an_existing_wal_refuses_empty_initialization() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("operations.jsonl");
+        let (journal, _) = FileOperationJournal::open(&path).unwrap();
+        journal
+            .append_and_sync(&upsert(operation_snapshot(
+                OperationId::new(),
+                OperationState::Accepted,
+            )))
+            .unwrap();
+        drop(journal);
+        let wal_len = fs::metadata(&path).unwrap().len();
+        let meta_path = path.with_extension("meta.json");
+        fs::remove_file(&meta_path).unwrap();
+
+        let error = match FileOperationJournal::open(&path) {
+            Err(error) => error,
+            Ok(_) => panic!("expected RecoveryRequired, opened a new journal"),
+        };
+        assert!(
+            matches!(error, AgentError::RecoveryRequired(ref message) if message.contains("refusing empty initialization")),
+            "{error:?}"
+        );
+        assert_eq!(fs::metadata(&path).unwrap().len(), wal_len);
+        assert!(!meta_path.exists(), "must not mint a new journal identity");
+    }
+
+    #[test]
+    fn missing_metadata_after_compaction_does_not_mint_generation_one() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("operations.jsonl");
+        let (journal, _) = FileOperationJournal::open(&path).unwrap();
+        journal
+            .append_and_sync(&upsert(operation_snapshot(
+                OperationId::new(),
+                OperationState::Accepted,
+            )))
+            .unwrap();
+        journal.compact().unwrap();
+        drop(journal);
+
+        let gen2 = path.with_file_name("operations.jsonl.g2");
+        assert!(gen2.exists());
+        assert!(!path.exists(), "generation-1 WAL is removed after compact");
+        let meta_path = path.with_extension("meta.json");
+        fs::remove_file(&meta_path).unwrap();
+        // An unpublished next generation must not become the recovery source.
+        fs::copy(&gen2, path.with_file_name("operations.jsonl.g3")).unwrap();
+
+        let error = match FileOperationJournal::open(&path) {
+            Err(error) => error,
+            Ok(_) => panic!("expected RecoveryRequired, opened a new journal"),
+        };
+        assert!(
+            matches!(error, AgentError::RecoveryRequired(ref message) if message.contains("refusing empty initialization")),
+            "{error:?}"
+        );
+        assert!(
+            !path.exists(),
+            "must not create an empty generation-1 WAL over compacted remnants"
+        );
+        assert!(!meta_path.exists(), "must not mint a new journal identity");
+        assert!(gen2.exists());
+    }
+
+    #[test]
+    fn replace_file_overwrites_without_leaving_the_destination_absent() {
+        let dir = tempfile::tempdir().unwrap();
+        let dest = dir.path().join("target.txt");
+        let first = dir.path().join("first.txt");
+        let second = dir.path().join("second.txt");
+        fs::write(&dest, b"old").unwrap();
+        fs::write(&first, b"one").unwrap();
+        replace_file(&first, &dest).unwrap();
+        assert_eq!(fs::read(&dest).unwrap(), b"one");
+        assert!(!first.exists());
+        fs::write(&second, b"two").unwrap();
+        replace_file(&second, &dest).unwrap();
+        assert_eq!(fs::read(&dest).unwrap(), b"two");
+        assert!(dest.exists());
+    }
+
+    #[test]
     fn operation_journal_repairs_only_a_torn_final_frame() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("operations.jsonl");
@@ -1568,6 +1791,109 @@ mod tests {
             Err(AgentError::RecoveryRequired(_))
         ));
         assert_eq!(fs::metadata(&path).unwrap().len(), before);
+    }
+
+    /// STORAGE-02: a compaction whose new-WAL creation fails (before the
+    /// metadata publish) keeps the writer on the old generation — appends
+    /// stay consistent with what the published metadata describes. The
+    /// directory squat makes the generation-2 WAL open fail.
+    #[test]
+    fn compaction_new_wal_failure_keeps_the_old_generation_appendable() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("operations.jsonl");
+        let (journal, _) = FileOperationJournal::open(&path).unwrap();
+        journal
+            .append_and_sync(&upsert(operation_snapshot(
+                OperationId::new(),
+                OperationState::Accepted,
+            )))
+            .unwrap();
+        let meta_before = fs::read(path.with_extension("meta.json")).unwrap();
+
+        let new_wal = path.with_file_name("operations.jsonl.g2");
+        fs::create_dir(&new_wal).unwrap();
+        assert!(
+            matches!(journal.compact(), Err(AgentError::Storage(_))),
+            "a failed new-WAL creation must surface as a storage error"
+        );
+
+        // Nothing was published and the writer never switched: the old
+        // generation stays authoritative and remains appendable, exactly
+        // like the refused-compaction and metadata-failure paths.
+        assert_eq!(
+            fs::read(path.with_extension("meta.json")).unwrap(),
+            meta_before,
+            "a pre-publish failure must not touch the published metadata"
+        );
+        assert_eq!(journal.authority_checkpoint_marker().unwrap().generation, 1);
+        journal
+            .append_and_sync(&upsert(operation_snapshot(
+                OperationId::new(),
+                OperationState::Accepted,
+            )))
+            .unwrap();
+        assert_eq!(journal.recover().unwrap().last_seq, 2);
+
+        fs::remove_dir(&new_wal).unwrap();
+        drop(journal);
+        let (_, recovery) = FileOperationJournal::open(&path).unwrap();
+        assert_eq!(recovery.last_seq, 2);
+        assert_eq!(recovery.operations.len(), 2);
+    }
+
+    /// STORAGE-02 crash window: the metadata publish landed for generation
+    /// 2 but the process died before the old WAL was removed. Reopening
+    /// follows the published metadata (generation 2), appends go there,
+    /// and the leftover generation-1 file is never appended through again.
+    #[test]
+    fn published_generation_survives_a_crash_before_old_wal_removal() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("operations.jsonl");
+        let (journal, _) = FileOperationJournal::open(&path).unwrap();
+        journal
+            .append_and_sync(&upsert(operation_snapshot(
+                OperationId::new(),
+                OperationState::Accepted,
+            )))
+            .unwrap();
+        // Snapshot the generation-1 WAL (the journal holds an exclusive
+        // OS lock, so read after dropping it), compact normally (publishes
+        // generation 2), then recreate the leftover by hand to model the
+        // crash between publish and old-WAL removal.
+        drop(journal);
+        let g1_bytes = fs::read(&path).unwrap();
+        let (journal, _) = FileOperationJournal::open(&path).unwrap();
+        journal.compact().unwrap();
+        drop(journal);
+        fs::write(&path, &g1_bytes).unwrap();
+
+        let (reopened, recovery) = FileOperationJournal::open(&path).unwrap();
+        assert_eq!(
+            reopened.authority_checkpoint_marker().unwrap().generation,
+            2,
+            "the published metadata must win over the leftover old WAL"
+        );
+        assert_eq!(recovery.operations.len(), 1);
+        reopened
+            .append_and_sync(&upsert(operation_snapshot(
+                OperationId::new(),
+                OperationState::Accepted,
+            )))
+            .unwrap();
+        // The journal holds an exclusive OS lock on its WAL; read the
+        // files only after dropping it.
+        drop(reopened);
+        let g2_path = path.with_file_name("operations.jsonl.g2");
+        let g2_bytes = fs::read(&g2_path).unwrap();
+        assert!(
+            g2_bytes.len() > fs::read(&path).unwrap().len(),
+            "the append must land in the published generation, not the leftover"
+        );
+        let (_, final_recovery) = FileOperationJournal::open(&path).unwrap();
+        // The compacted WAL's baseline is seq 2 (Compacted + one upsert);
+        // the append made through the leftover crash state is seq 3.
+        assert_eq!(final_recovery.last_seq, 3);
+        assert_eq!(final_recovery.operations.len(), 2);
     }
 
     #[test]

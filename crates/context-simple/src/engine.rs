@@ -3,9 +3,9 @@ use agent_contracts::{
     ContextCompaction, ContextConsumptionAck, ContextDiagnostics, ContextEngine, ContextGcReport,
     ContextIngress, ContextItem, ContextItemId, ContextItemSummary, ContextKind,
     ContextMaintenanceReport, ContextMaintenanceTrigger, ContextQuery, ContextRetention,
-    ContextScope, ContextStateTransition, CoreLabel, FocusState, FsRereadClass, Label,
-    MAX_RESOURCE_TOUCHES, MaterializedContext, ScopeId, ScopeKind, ScopeState,
-    StoreReconcileReport, bound_compaction_output, normalize_resource_path,
+    ContextScope, ContextSearchObservation, ContextStateTransition, CoreLabel, FocusState,
+    FsRereadClass, Label, MAX_RESOURCE_TOUCHES, MaterializedContext, ScopeId, ScopeKind,
+    ScopeState, StoreReconcileReport, bound_compaction_output, normalize_resource_path,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -678,6 +678,8 @@ pub struct SimpleContextEngine {
     /// 注入后，任务完成和 episode 旋转会蒸馏成带 `DerivedFrom` 的派生摘要，
     /// 原文条目保留。
     compactor: Option<Arc<dyn BoundedCompactor>>,
+    /// Last catalog search's Stored-body I/O. Not checkpointed.
+    search_observation: std::sync::Mutex<ContextSearchObservation>,
 }
 
 impl SimpleContextEngine {
@@ -695,12 +697,20 @@ impl SimpleContextEngine {
             #[cfg(test)]
             materialize_io_pause: std::sync::Mutex::new(None),
             compactor: None,
+            search_observation: std::sync::Mutex::new(ContextSearchObservation::default()),
         }
     }
 
     pub fn with_compactor(mut self, compactor: Arc<dyn BoundedCompactor>) -> Self {
         self.compactor = Some(compactor);
         self
+    }
+
+    fn record_search_observation(&self, observation: ContextSearchObservation) {
+        match self.search_observation.lock() {
+            Ok(mut slot) => *slot = observation,
+            Err(poisoned) => *poisoned.into_inner() = observation,
+        }
     }
 
     /// Engine-owned focused task. Restore alignment and tests read this;
@@ -963,6 +973,7 @@ impl ContextEngine for SimpleContextEngine {
                         let class = classify_fs_read(&state, path);
                         state.record_fs_reread(class);
                     }
+                    let file_range = output.file_line_range();
                     let mut content = output.model_content;
                     if let Some(artifact_ref) = output.artifact_ref {
                         content.push_str("\nartifact: ");
@@ -1008,6 +1019,10 @@ impl ContextEngine for SimpleContextEngine {
                     if let Some(revision) = file_revision {
                         item.file_revision = Some(revision);
                     }
+                    if let Some((start, end)) = file_range {
+                        item.file_start_line = Some(start);
+                        item.file_end_line = Some(end);
+                    }
                     // The runtime opened the tool scope at tool start; the
                     // observation is tagged with that frame even though it is
                     // persisted at turn end.
@@ -1028,7 +1043,12 @@ impl ContextEngine for SimpleContextEngine {
                             observation_id,
                         );
                     }
-                    if self.config.error_verification && ok {
+                    // Only the trusted verification recipe proves an error
+                    // fixed. A successful read or grep of an error-related
+                    // file is evidence the file exists, not that the error
+                    // is gone; entity overlap alone must never clear an
+                    // error into its terminal VerifiedFixed state.
+                    if self.config.error_verification && ok && output.tool_name == "verify.run" {
                         reachability::queue_error_verifications(
                             &mut state,
                             &content,
@@ -1589,14 +1609,11 @@ impl ContextEngine for SimpleContextEngine {
         for item_id in ack.item_ids.iter().chain(&ack.external_item_ids) {
             // Ownership was validated above while holding the same lock, so
             // stamping is infallible and the acknowledgement commits as one
-            // mutation rather than partially reinforcing a prefix.
-            debug_assert!(stamp_consumed(
-                &mut state,
-                *item_id,
-                now_event_seq,
-                turn,
-                gc_epoch
-            ));
+            // mutation rather than partially reinforcing a prefix. The stamp
+            // itself must run in release builds too: consumption is the only
+            // record that the model actually saw the final packed frame.
+            let stamped = stamp_consumed(&mut state, *item_id, now_event_seq, turn, gc_epoch);
+            debug_assert!(stamped);
         }
         // Foreground bodies were seen by the model but never changed
         // residency: they are recorded as a weak observational signal only
@@ -1716,26 +1733,50 @@ impl ContextEngine for SimpleContextEngine {
             if incomplete.is_none() {
                 let hits = crate::store::search_catalog(&state, &query);
                 crate::access::reinforce_search_hits(&mut state, &hits, &query);
+                drop(state);
+                self.record_search_observation(ContextSearchObservation::default());
                 return Ok(hits);
             }
             let read_plan = crate::store::plan_stored_search_reads(&state, &query)?;
             if read_plan.is_empty() {
                 let hits = crate::store::search_catalog(&state, &query);
                 crate::access::reinforce_search_hits(&mut state, &hits, &query);
+                drop(state);
+                self.record_search_observation(ContextSearchObservation::default());
                 return Ok(hits);
             }
             read_plan
         };
         let dir = crate::store::store_dir(&self.config);
-        let verified = crate::store::verify_stored_search_reads(&dir, read_plan, &query).await?;
+        let started = std::time::Instant::now();
+        let verification =
+            crate::store::verify_stored_search_reads(&dir, read_plan, &query).await?;
+        let observation = ContextSearchObservation {
+            cold_reads: verification.read_count,
+            cold_read_bytes: verification.read_bytes,
+            cold_read_ms: started.elapsed().as_millis() as u64,
+        };
         let mut state = self.state.lock().await;
         state.sync_catalog();
-        let hits = crate::store::search_catalog_with_verified_bodies(&state, &query, &verified);
+        let hits = crate::store::search_catalog_with_verified_bodies(
+            &state,
+            &query,
+            &verification.matched,
+        );
         // search 命中是最弱信号：相同查询本回合只强化一次，单条目同一
         // event_seq 冷却，饱和后不再推迟 Cold 老化。terminal 命中已被
         // externally_retrievable 过滤；search 从不覆盖终态语义或 GC 根。
         crate::access::reinforce_search_hits(&mut state, &hits, &query);
+        drop(state);
+        self.record_search_observation(observation);
         Ok(hits)
+    }
+
+    fn last_search_observation(&self) -> ContextSearchObservation {
+        match self.search_observation.lock() {
+            Ok(slot) => *slot,
+            Err(poisoned) => *poisoned.into_inner(),
+        }
     }
 
     async fn inspect_external(

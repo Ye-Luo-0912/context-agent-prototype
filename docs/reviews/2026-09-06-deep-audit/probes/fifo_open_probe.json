@@ -1,0 +1,19 @@
+{
+  "test_kind": "OS_MECHANISM_ONLY_NOT_REPOSITORY_TEST",
+  "source_sha": "12c86283b8d5991e9f17a07f14871dcf39d65066",
+  "source_path": "crates/agent-workspace/src/confined.rs",
+  "source_function": "ConfinedDir::open_existing (Unix)",
+  "named_entry": "Cargo.toml (FIFO, no writer)",
+  "child_ready_marker": "entering_openat",
+  "observed_blocked_without_nonblock": true,
+  "watchdog_observation_ms": 304.254,
+  "child_reaped": true,
+  "child_returncode": -9,
+  "stdout_after_ready": "",
+  "stderr": "",
+  "nonblocking_open_ms": 0.019,
+  "same_handle_is_fifo": true,
+  "same_handle_is_regular": false,
+  "repository_binary_executed": false,
+  "rust_tests_executed": false
+}

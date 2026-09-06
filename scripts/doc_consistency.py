@@ -45,12 +45,14 @@ LIVE_DOCS = [
     "docs/CURRENT.md",
     "docs/STATUS.md",
     "docs/ROADMAP.md",
+    "docs/NEXT_TASKS.md",
     "docs/CONFIGURATION.md",
     "docs/RECOVERY_RUNBOOK.md",
     "docs/COMPATIBILITY.md",
     "docs/CONTEXT_FRAME_V1.md",
     "docs/EXECUTION_MODEL.md",
     "docs/reviews/2026-09-05-code-review.md",
+    "docs/reviews/2026-09-06-deep-audit/REVIEW.md",
 ]
 
 

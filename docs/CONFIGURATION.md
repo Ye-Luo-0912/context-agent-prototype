@@ -45,12 +45,18 @@ material. See [`COMPATIBILITY.md`](COMPATIBILITY.md) for the schema.
 
 | Flag | Default | Effect |
 | --- | --- | --- |
-| `--read-only` | off | Every write/process call is denied by policy; cannot combine with `--grant` or `--restore`. |
+| `--read-only` | off | Every write/process call is denied by policy; cannot combine with `--grant` / `--grant-file` or `--restore`. |
 | `--grant=<JSON>` | none | Standing grants for write/process tools; revoke with `/revoke <grant-id>`. |
+| `--grant-file=<path>` | none | Same grants from a JSON object or array (repeatable; combined cap 16). Fail-closed if missing/invalid. Also valid for the TUI. |
+| `--jsonl-out=<path>` | stdout | Headless: write JSONL to a file instead of stdout. Requires `--prompt` or `--continue`. |
+| `--prompt=<text>` | unset | Headless: one user message (`-` reads stdin). JSONL events on stdout unless `--jsonl-out` is set. |
+| `--work` | off | Headless long-task entry (same composition as TUI `/work`). Requires `--prompt`. |
+| `--continue` | off | Headless: continue the restored/active task's stored directive. Cannot combine with `--prompt`. |
+| `--max-rounds=<N>` | runtime default (16) | Finite model-round budget for one execution segment (TUI and headless). |
 | `--restore=<path>` | none | Cold resume; validates the checkpoint before any mutation. Accepts envelope artifacts and legacy raw JSON; bare artifact names resolve inside `checkpoints/`. |
 | `--effect-reservation-journal=<path>` | `<state>/authority/broker-reservations.jsonl` | Persistent reservation barrier for crash reconciliation. |
 | `--context=dynamic\|append\|rolling\|service` | `dynamic` | Context engine selection. `service` spawns the sidecar and stays experimental. |
-| `defer_proof_refresh` / `shadow_context_frame` (compose flags) | off | Deferred host-verifier execution / shadow Context Frame manifest emission. Runtime flags, not CLI flags yet. |
+| `defer_proof_refresh` / `shadow_context_frame` (compose flags) | off | Deferred host-verifier execution / shadow Context Frame manifest emission. `--defer-proof` opts the product path in; shadow Frame is still compose-only. |
 
 ## Context policy (engine)
 

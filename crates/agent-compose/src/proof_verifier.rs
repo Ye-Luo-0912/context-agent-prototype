@@ -4,7 +4,7 @@
 //! recipe 的宿主归因一致时才会被 completion gate 信任（fail closed 由
 //! gate 侧的 fence 负责，这里只忠实映射一次宿主运行）。
 
-use agent_contracts::{AgentResult, CancellationToken};
+use agent_contracts::AgentResult;
 use agent_runtime::{ProofVerifier, ProofVerifierOutcome, ProofVerifierRequest};
 use tool_runtime::RecipeProofRunner;
 
@@ -34,7 +34,7 @@ impl ProofVerifier for HostProofVerifier {
     ) -> AgentResult<ProofVerifierOutcome> {
         let run = self
             .runner
-            .verify_exact(request.run_id, &request.recipe_id, CancellationToken::new())
+            .verify_exact(request.run_id, &request.recipe_id, request.cancel)
             .await?;
         Ok(ProofVerifierOutcome {
             ok: run.ok,
