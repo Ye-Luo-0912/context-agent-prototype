@@ -21,6 +21,7 @@ mod host;
 mod lifecycle;
 mod session;
 mod supervisor;
+pub mod watchdog;
 
 #[cfg(windows)]
 pub mod integrity;

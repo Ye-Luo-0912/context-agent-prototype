@@ -27,8 +27,18 @@ use session::{
 };
 use tool_runtime::{BuiltinToolDispatcher, VerificationRecipes};
 
+fn main() -> anyhow::Result<()> {
+    // The re-entered host-death watchdog (PROCESS-01) must not run normal
+    // startup: it lives only to outlive a crashed host and kill the
+    // watched process group.
+    if agent_process::watchdog::run_if_armed_and_exit() {
+        return Ok(());
+    }
+    real_main()
+}
+
 #[tokio::main]
-async fn main() -> anyhow::Result<()> {
+async fn real_main() -> anyhow::Result<()> {
     let mut args = args::parse_args(std::env::args().skip(1))?;
     if args.help {
         args::print_usage();
@@ -138,11 +148,16 @@ async fn main() -> anyhow::Result<()> {
     // actor is spawned but not started yet — subscribe first so
     // `RunStarted` is observable.
     let checkpoint_dir = workspace.state_dir().join("checkpoints");
-    let base_tools = Arc::new(BuiltinToolDispatcher::with_config_and_verification_recipes(
-        workspace.clone(),
-        Default::default(),
-        (*verification_recipes).clone(),
-    ));
+    // Unix host-death containment is armed here: this binary's main
+    // dispatches on the watchdog marker, so re-entering it is safe.
+    let base_tools = Arc::new(
+        BuiltinToolDispatcher::with_config_recipes_and_host_death_watchdog(
+            workspace.clone(),
+            Default::default(),
+            (*verification_recipes).clone(),
+            true,
+        ),
+    );
     let artifact_store = Arc::new(workspace.clone());
     let output_broker = Arc::new(WorkspaceOutputBroker::new(workspace.clone().into()));
     // 交互运行默认启用持久预留屏障：路径落在状态目录的权威层，

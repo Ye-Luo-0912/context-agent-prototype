@@ -189,6 +189,24 @@ impl BuiltinToolDispatcher {
         config: ToolLifecycleConfig,
         verification_recipes: VerificationRecipes,
     ) -> Self {
+        Self::with_config_recipes_and_host_death_watchdog(
+            workspace,
+            config,
+            verification_recipes,
+            false,
+        )
+    }
+
+    /// Dispatcher variant with Unix host-death containment armed for
+    /// spawned process children (PROCESS-01). Only a host whose executable
+    /// dispatches on `agent_process::watchdog::WATCHDOG_ENV` in its `main`
+    /// may enable this — the watchdog re-enters that executable.
+    pub fn with_config_recipes_and_host_death_watchdog(
+        workspace: Workspace,
+        config: ToolLifecycleConfig,
+        verification_recipes: VerificationRecipes,
+        host_death_watchdog: bool,
+    ) -> Self {
         let verification_recipes = Arc::new(verification_recipes);
         // One session registry per dispatcher, shared by every
         // `process.session` tool instance and kept by the dispatcher for
@@ -210,7 +228,10 @@ impl BuiltinToolDispatcher {
                 workspace.clone(),
                 shell_dialect.clone(),
             )),
-            Arc::new(ProcessRunTool::new(workspace.clone())),
+            Arc::new(
+                ProcessRunTool::new(workspace.clone())
+                    .with_host_death_watchdog(host_death_watchdog),
+            ),
             Arc::new(ProcessSessionTool::new(workspace.clone(), sessions.clone())),
             // Local symbol/diagnostic navigation: catalog-optional
             // first-party tools loaded on demand when a task needs precise

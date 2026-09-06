@@ -216,6 +216,7 @@ dependencies = [
  "agent-compose",
  "agent-contracts",
  "agent-core",
+ "agent-process",
  "agent-runtime",
  "agent-storage",
  "agent-workspace",

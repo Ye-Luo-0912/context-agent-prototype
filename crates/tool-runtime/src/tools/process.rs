@@ -608,11 +608,27 @@ pub(crate) fn verification_executable_identity(
 
 pub struct ProcessRunTool {
     workspace: Workspace,
+    /// Arm the Unix host-death watchdog (PROCESS-01) for spawned children.
+    /// Off by default: containment re-enters the product executable as the
+    /// watchdog, so only a binary whose `main` dispatches on
+    /// [`agent_process::watchdog::WATCHDOG_ENV`] may enable it. Windows
+    /// containment is the job-object fence and does not consult this.
+    host_death_watchdog: bool,
 }
 
 impl ProcessRunTool {
     pub fn new(workspace: Workspace) -> Self {
-        Self { workspace }
+        Self {
+            workspace,
+            host_death_watchdog: false,
+        }
+    }
+
+    /// Enable Unix host-death containment. Composition-root choice: the
+    /// product TUI enables it; eval harnesses keep it off.
+    pub fn with_host_death_watchdog(mut self, enabled: bool) -> Self {
+        self.host_death_watchdog = enabled;
+        self
     }
 }
 
@@ -970,6 +986,40 @@ impl ProcessRunTool {
         // not just the direct child (`kill_on_drop` kills only the child
         // itself). The guard is disarmed only after the child is reaped.
         let mut tree_guard = super::ProcessTreeGuard::new(child.id().unwrap_or(0));
+        // PROCESS-01: persist the supervision identity while the child
+        // runs, so a crashed host's startup reconciliation can kill the
+        // leftover tree before the workspace is reused.
+        let child_pid = child.id().unwrap_or(0);
+        if let Some(state_dir) = self.workspace.state_dir().to_str() {
+            crate::supervision::record_child(
+                std::path::Path::new(state_dir),
+                child_pid,
+                tool_name,
+            );
+        }
+        // Unix host-death containment (PROCESS-01): a watchdog re-entered
+        // from this executable holds our read half; a SIGKILLed or aborted
+        // host closes it and the watchdog kills the group. Dropping the
+        // handle after the child is reaped is the disarm path — the
+        // watchdog sees EOF, finds the leader gone, and exits without
+        // signalling. A failed arm degrades to no containment, matching
+        // the Windows outer-job refusal.
+        #[cfg(unix)]
+        let _host_death_watchdog = if self.host_death_watchdog {
+            match agent_process::watchdog::HostDeathWatchdog::arm(child.id().unwrap_or(0)) {
+                Ok(armed) => armed,
+                Err(error) => {
+                    eprintln!(
+                        "host-death watchdog arm failed for process {}: {error}; \
+                         continuing without Unix host-death containment",
+                        child.id().unwrap_or(0)
+                    );
+                    None
+                }
+            }
+        } else {
+            None
+        };
         // Assign the host-death job once the pid exists; the handle stays
         // alive for the whole run, so a host crash closes it and the
         // kernel kills the tree. A refused assignment (outer job on CI

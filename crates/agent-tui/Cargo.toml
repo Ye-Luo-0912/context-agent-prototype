@@ -8,6 +8,7 @@ license.workspace = true
 agent-contracts.workspace = true
 agent-compose.workspace = true
 agent-core.workspace = true
+agent-process.workspace = true
 agent-runtime.workspace = true
 agent-storage.workspace = true
 agent-workspace.workspace = true
