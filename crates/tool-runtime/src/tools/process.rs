@@ -930,15 +930,6 @@ impl ProcessRunTool {
         #[cfg(unix)]
         command.process_group(0);
 
-        // Host-death containment (PROCESS-01): if the host process is
-        // SIGKILLed or crashes, the kernel kills this child instead of
-        // leaving an unsupervised verifier behind. The getppid check
-        // closes the classic race where the host died between spawn and
-        // prctl. Windows uses the host-death job assigned right after
-        // spawn (see below).
-        #[cfg(unix)]
-        apply_parent_death_signal(&mut command);
-
         #[cfg(windows)]
         let host_death_job = host_death_job::HostDeathJob::create();
 
@@ -1305,31 +1296,6 @@ pub(crate) mod host_death_job {
                 let _ = CloseHandle(self.0);
             }
         }
-    }
-}
-
-/// Register `PR_SET_PDEATHSIG = SIGKILL` on the child (PROCESS-01): the
-/// kernel kills it when the host process dies, so a crashed or SIGKILLed
-/// host cannot leave an unsupervised verifier running. The getppid check
-/// closes the race where the host died between spawn and prctl.
-#[cfg(unix)]
-pub(crate) fn apply_parent_death_signal(command: &mut Command) {
-    let marker = std::env::var("PDEATHSIG_PROBE_MARKER").ok();
-    let host_pid = std::process::id() as libc::pid_t;
-    // SAFETY: `pre_exec` runs the closure in the forked child before exec;
-    // `prctl` there registers the parent-death signal and the getppid
-    // check kills the child if the host already died before the hook.
-    unsafe {
-        command.pre_exec(move || {
-            let set_rc = libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL);
-            if let Some(marker) = &marker {
-                let _ = std::fs::write(marker, format!("set_rc={set_rc}"));
-            }
-            if set_rc == 0 && libc::getppid() != host_pid {
-                libc::kill(libc::getpid(), libc::SIGKILL);
-            }
-            Ok(())
-        });
     }
 }
 
@@ -2224,95 +2190,6 @@ mod tests {
         {
             vec!["sh".into(), "-c".into(), "exec 1>&- 2>&-; sleep 30".into()]
         }
-    }
-
-    /// PROCESS-01 behavioral probe (Unix): a child spawned through the
-    /// production containment helper has `PR_SET_PDEATHSIG` registered as
-    /// SIGKILL, so the kernel kills it when the host dies. The child mode
-    /// re-runs this same test binary under an env flag and reports what
-    /// the kernel holds.
-    #[cfg(unix)]
-    #[tokio::test]
-    async fn parent_death_signal_is_registered_on_spawned_children() {
-        if std::env::var("PDEATHSIG_PROBE_CHILD").is_ok() {
-            let marker = std::env::var("PDEATHSIG_PROBE_MARKER").unwrap_or_default();
-            let hook_marker = std::fs::read_to_string(format!("{marker}.hook"))
-                .unwrap_or_else(|_| "hook-never-ran".into());
-            let mut signal: libc::c_int = 0;
-            let rc =
-                unsafe { libc::prctl(libc::PR_GET_PDEATHSIG, &mut signal as *mut libc::c_int) };
-            let ppid = unsafe { libc::getppid() };
-            // Self-set/get: distinguishes "prctl is blocked on this
-            // runner" (self-set fails or still reads 0) from "the pre_exec
-            // hook never ran" (the hook's marker file stays absent).
-            let set_rc = unsafe { libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL) };
-            let mut after: libc::c_int = 0;
-            let get_rc =
-                unsafe { libc::prctl(libc::PR_GET_PDEATHSIG, &mut after as *mut libc::c_int) };
-            println!(
-                "PROBE rc={rc} sig={signal} getppid={ppid} host={} selfset={set_rc} after={after} getrc={get_rc} hook={hook_marker}",
-                std::env::var("PDEATHSIG_PROBE_HOST").unwrap_or_default()
-            );
-            std::process::exit(0);
-        }
-
-        // --- Experiment A: a plain std Command with the same hook. ---
-        let std_probe = {
-            use std::os::unix::process::CommandExt as _;
-            use std::process::Command as StdCommand;
-            let mut command = StdCommand::new(std::env::current_exe().unwrap());
-            command
-                .args([
-                    "parent_death_signal_is_registered_on_spawned_children",
-                    "--nocapture",
-                ])
-                .env("PDEATHSIG_PROBE_CHILD", "1")
-                .env("PDEATHSIG_PROBE_HOST", std::process::id().to_string())
-                .stdout(Stdio::piped())
-                .stderr(Stdio::null());
-            let host_pid = std::process::id() as libc::pid_t;
-            unsafe {
-                command.pre_exec(move || {
-                    let set_rc = libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL);
-                    eprintln!("PRE_EXEC std: set_rc={set_rc}");
-                    if set_rc == 0 && libc::getppid() != host_pid {
-                        libc::kill(libc::getpid(), libc::SIGKILL);
-                    }
-                    Ok(())
-                });
-            }
-            let output = command.output().expect("std probe child runs");
-            String::from_utf8_lossy(&output.stdout).into_owned()
-        };
-        println!("STD PROBE: {std_probe}");
-
-        // --- Experiment B: the tokio path the production code uses. ---
-        let mut command = Command::new(std::env::current_exe().unwrap());
-        command.args([
-            "parent_death_signal_is_registered_on_spawned_children",
-            "--nocapture",
-        ]);
-        command.env("PDEATHSIG_PROBE_CHILD", "1");
-        let marker_path =
-            std::env::temp_dir().join(format!("pdeathsig-marker-{}", std::process::id()));
-        let _ = std::fs::remove_file(&marker_path);
-        command.env("PDEATHSIG_PROBE_HOST", std::process::id().to_string());
-        command.env("PDEATHSIG_PROBE_MARKER", marker_path.display().to_string());
-        apply_parent_death_signal(&mut command);
-        let output = command.output().await.expect("probe child runs");
-        let tokio_text = String::from_utf8_lossy(&output.stdout).into_owned();
-        let hook_marker =
-            std::fs::read_to_string(&marker_path).unwrap_or_else(|_| "marker-absent".into());
-        println!("HOOK MARKER: {hook_marker}");
-        println!("STDERR: {}", String::from_utf8_lossy(&output.stderr));
-        assert!(
-            std_probe.contains("sig=9"),
-            "std pre_exec must register the parent-death signal: {std_probe}"
-        );
-        assert!(
-            tokio_text.contains("sig=9"),
-            "the tokio path must register it too: {tokio_text}"
-        );
     }
 
     #[tokio::test]

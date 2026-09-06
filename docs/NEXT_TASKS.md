@@ -19,7 +19,7 @@
 | 顺序 | 工单 | 交付物 | 状态 |
 |---|---|---|---|
 | 1 | ~~STORAGE-02~~ | 压缩已发布后失败则隔离旧 writer | 已关闭（2026-09-06） |
-| 2 | **PROCESS-01** | 宿主验证硬崩溃监督 | **当前** |
+| 2 | PROCESS-01 | 宿主验证硬崩溃监督 | 部分关闭：Windows 围栏已落地；Unix pre_exec 在 GH runner 上静默不执行（探针实证），需持久监督身份设计 |
 | 3 | PROCESS-02 | reap 未确认退出不清 pid | 开放 |
 | 4 | WORKSPACE-01 | 普通 open 不阻塞 FIFO | 开放 |
 | 5 | WORKSPACE-02 | Windows 拒绝路径立即接管 HANDLE | 开放 |
