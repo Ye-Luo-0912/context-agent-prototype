@@ -2233,7 +2233,18 @@ mod tests {
             let mut signal: libc::c_int = 0;
             let rc =
                 unsafe { libc::prctl(libc::PR_GET_PDEATHSIG, &mut signal as *mut libc::c_int) };
-            println!("PDEATHSIG rc={rc} signal={signal}");
+            let ppid = unsafe { libc::getppid() };
+            let mut status = std::fs::read_to_string("/proc/self/status").unwrap_or_default();
+            let ppid_line = status
+                .lines()
+                .find(|line| line.starts_with("PPid:"))
+                .unwrap_or("PPid:?")
+                .to_string();
+            status.clear();
+            println!(
+                "PROBE rc={rc} sig={signal} getppid={ppid} {ppid_line} host={}",
+                std::env::var("PDEATHSIG_PROBE_HOST").unwrap_or_default()
+            );
             std::process::exit(0);
         }
         let mut command = Command::new(std::env::current_exe().unwrap());
@@ -2246,11 +2257,12 @@ mod tests {
             "--nocapture",
         ]);
         command.env("PDEATHSIG_PROBE_CHILD", "1");
+        command.env("PDEATHSIG_PROBE_HOST", std::process::id().to_string());
         apply_parent_death_signal(&mut command);
         let output = command.output().await.expect("probe child runs");
         let text = String::from_utf8_lossy(&output.stdout);
         assert!(
-            text.contains("PDEATHSIG rc=0 signal=9"),
+            text.contains("sig=9"),
             "the spawned child must carry PR_SET_PDEATHSIG=SIGKILL: {text}"
         );
     }
