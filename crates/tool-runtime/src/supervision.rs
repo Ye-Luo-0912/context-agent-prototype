@@ -147,7 +147,7 @@ mod tests {
             command
         };
         command.stdout(Stdio::null()).stderr(Stdio::null());
-        let mut child = command.spawn().unwrap();
+        let child = command.spawn().unwrap();
         let pid = child.id();
         (child, pid)
     }
