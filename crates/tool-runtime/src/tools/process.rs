@@ -982,6 +982,18 @@ impl ProcessRunTool {
             }
             Err(e) => return Err(AgentError::Tool(format!("spawn {}: {e}", args.argv[0]))),
         };
+        // PROCESS-01 supervision ledger: record the child so a crashed
+        // host leaves a durable trace that the next startup reconciles.
+        // The lease releases the entry on every normal exit path; being
+        // declared before the tree guard, it drops after the guard has
+        // reaped the child (reverse drop order).
+        let _child_lease = (child.id().unwrap_or(0) != 0).then(|| {
+            crate::supervision::lease(
+                self.workspace.state_dir(),
+                child.id().unwrap_or(0),
+                tool_name,
+            )
+        });
         // Every early return after this point must kill the whole tree,
         // not just the direct child (`kill_on_drop` kills only the child
         // itself). The guard is disarmed only after the child is reaped.
@@ -991,11 +1003,7 @@ impl ProcessRunTool {
         // leftover tree before the workspace is reused.
         let child_pid = child.id().unwrap_or(0);
         if let Some(state_dir) = self.workspace.state_dir().to_str() {
-            crate::supervision::record_child(
-                std::path::Path::new(state_dir),
-                child_pid,
-                tool_name,
-            );
+            crate::supervision::record_child(std::path::Path::new(state_dir), child_pid, tool_name);
         }
         // Unix host-death containment (PROCESS-01): a watchdog re-entered
         // from this executable holds our read half; a SIGKILLed or aborted

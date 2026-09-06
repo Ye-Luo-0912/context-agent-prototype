@@ -496,6 +496,10 @@ pub async fn compose(config: ComposeConfig) -> anyhow::Result<ComposedRuntime> {
         host_policies.unwrap_or_else(|| Arc::new(HostToolPolicyRegistry::with_builtins()));
 
     let mut host = ModuleHost::new();
+    // PROCESS-01: before anything starts, reconcile the host-child
+    // supervision ledger — a crashed prior run may have left a verifier or
+    // command process alive; kill it before the workspace is reused.
+    tool_runtime::supervision::reconcile_children(workspace.state_dir());
     host.add_module(Arc::new(ContextModule::new(context_engine)))?;
     host.add_module(Arc::new(ModelModule::new(model)))?;
     // The capability registry is the host's: capabilities registered against

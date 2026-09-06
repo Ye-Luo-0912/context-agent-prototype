@@ -2,6 +2,7 @@ mod host_policies;
 mod proof_runner;
 mod python;
 mod registry;
+pub mod supervision;
 pub mod tools;
 mod verification;
 
