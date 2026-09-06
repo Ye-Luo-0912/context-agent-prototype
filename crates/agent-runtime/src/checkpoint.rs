@@ -58,6 +58,12 @@ pub enum CheckpointDebtReason {
     /// A completion-gate refusal wrote a durable repair stage that must
     /// survive the deferred safe-point and restart.
     CompletionRepairChanged,
+    /// A deliberate round-budget yield with an active task must leave a
+    /// resumable snapshot even when the final round was read-only: the
+    /// task and its stored directive live only in the runtime planes, so
+    /// without a snapshot a later `--restore=latest` finds nothing and the
+    /// task cannot be continued across processes.
+    BudgetStopYield,
 }
 
 impl CheckpointDebtReason {
@@ -69,6 +75,7 @@ impl CheckpointDebtReason {
             Self::OpportunityOffered => "opportunity_offered",
             Self::CompletionCommitFailed => "completion_commit_failed",
             Self::CompletionRepairChanged => "completion_repair_changed",
+            Self::BudgetStopYield => "budget_stop_yield",
         }
     }
 }

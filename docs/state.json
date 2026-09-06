@@ -16,8 +16,9 @@
   "milestone_gates": {
     "m15_real_evaluation": "closed",
     "next_ordered": [
-      "PROCESS-01 Unix: Linux CI execution of the cfg(unix) watchdog tests",
-      "M16-08 closure: real-provider live records (NOT_RUN if unavailable) + PACKAGE-01 at the next actual release",
+      "M16-08 live walkthrough: DONE 2026-09-07 (docs/walkthroughs/2026-09-07-live-binary.md) — three real tasks through the real binary; two defects found and fixed (BudgetStopYield resumable checkpoint, shutdown awaits in-flight safe-point writes)",
+      "PROCESS-01 Unix: CI re-runs the cfg(unix) watchdog tests as regression (validated on WSL2 Ubuntu)",
+      "PACKAGE-01 package source binding at the next actual release",
       "MCP-01 only if default product enables MCP writes"
     ],
     "lt_eval_06": {
@@ -79,8 +80,9 @@
   ],
   "branch_protection": false,
   "next_ordered": [
-    "PROCESS-01 Unix: Linux CI execution of the cfg(unix) watchdog tests",
-    "M16-08 closure: real-provider live records (NOT_RUN if unavailable) + PACKAGE-01 at the next actual release",
+    "M16-08 live walkthrough: DONE 2026-09-07 (docs/walkthroughs/2026-09-07-live-binary.md) — three real tasks through the real binary; two defects found and fixed (BudgetStopYield resumable checkpoint, shutdown awaits in-flight safe-point writes)",
+    "PROCESS-01 Unix: CI re-runs the cfg(unix) watchdog tests as regression (validated on WSL2 Ubuntu)",
+    "PACKAGE-01 package source binding at the next actual release",
     "MCP-01 only if default product enables MCP writes"
   ],
   "release": {

@@ -442,6 +442,16 @@ impl RuntimeActor {
                 ))
                 .await;
             }
+            // A deliberate yield owes a resumable snapshot even when the
+            // final round was read-only: the active task and its stored
+            // directive live only in the runtime planes, so without a
+            // snapshot --restore=latest finds nothing and the task cannot
+            // be continued across processes.
+            if self.state.tasks.active().is_some() {
+                self.accrue_checkpoint_debt(
+                    crate::checkpoint::CheckpointDebtReason::BudgetStopYield,
+                );
+            }
             self.safe_point_resume_commit().await;
             self.settle_aborted_turn().await;
             return;

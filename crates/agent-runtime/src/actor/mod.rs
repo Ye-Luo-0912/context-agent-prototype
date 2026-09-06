@@ -1641,6 +1641,11 @@ impl RuntimeActor {
         let cleanup = self
             .drain_cancelled_tool_cleanup(op_rx, op_tx, &proof_tx)
             .await;
+        // An in-flight safe-point write must land before the kernel stops:
+        // killing it mid-write leaves a `.tmp` remnant in the store and the
+        // run without its resumable checkpoint. Awaiting here also keeps the
+        // `CheckpointDurable` audit event inside this journal flush.
+        let final_checkpoint = self.await_pending_checkpoint().await;
         let stop = self.core.stop().await;
         let mut errors = Vec::new();
         if let Err(error) = cancel {
@@ -1648,6 +1653,9 @@ impl RuntimeActor {
         }
         if let Err(error) = cleanup {
             errors.push(format!("cancelled operation cleanup failed: {error}"));
+        }
+        if let Err(error) = final_checkpoint {
+            errors.push(format!("final safe-point write failed: {error}"));
         }
         if let Err(error) = stop {
             errors.push(format!("runtime stop failed: {error}"));

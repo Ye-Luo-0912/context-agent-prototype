@@ -271,3 +271,157 @@ async fn product_save_restore_continue_across_two_segments() -> anyhow::Result<(
     composed.shutdown().await?;
     Ok(())
 }
+
+/// A read-only final round must still leave a resumable snapshot at the
+/// budget stop: the active task and its stored directive live only in the
+/// runtime planes, so without a snapshot `--restore=latest` finds nothing
+/// and the task cannot be continued across processes. Found by the
+/// 2026-09-07 real-binary live walkthrough.
+#[tokio::test]
+async fn product_budget_stop_after_a_read_only_round_still_lands_a_resumable_checkpoint()
+-> anyhow::Result<()> {
+    struct ReadThenWriteModel {
+        step: AtomicUsize,
+    }
+    #[async_trait::async_trait]
+    impl ModelTransport for ReadThenWriteModel {
+        fn capabilities(&self) -> ModelCapabilities {
+            ModelCapabilities {
+                streaming: true,
+                tool_calls: true,
+                max_output_tokens: 4096,
+                context_window: None,
+            }
+        }
+        async fn complete(&self, _request: ModelRequest) -> AgentResult<ModelOutput> {
+            let step = self.step.fetch_add(1, Ordering::SeqCst);
+            match step {
+                0 => Ok(ModelOutput {
+                    content: String::new(),
+                    tool_calls: vec![ToolCall {
+                        id: "read-0".into(),
+                        name: "fs.read".into(),
+                        arguments: json!({"path": "notes.txt"}),
+                    }],
+                    usage: Default::default(),
+                }),
+                1 => Ok(ModelOutput {
+                    content: String::new(),
+                    tool_calls: vec![ToolCall {
+                        id: "write-1".into(),
+                        name: "fs.write".into(),
+                        arguments: json!({
+                            "path": "file_b.txt",
+                            "content": "resumed content",
+                        }),
+                    }],
+                    usage: Default::default(),
+                }),
+                _ => Ok(ModelOutput {
+                    content: "[scripted] segment delivered".into(),
+                    tool_calls: Vec::new(),
+                    usage: Default::default(),
+                }),
+            }
+        }
+    }
+
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path().to_path_buf();
+    std::fs::write(
+        root.join("notes.txt"),
+        "sections: intro
+",
+    )
+    .unwrap();
+    let checkpoint_dir = root.join(".focus-agent").join("checkpoints");
+
+    // ---- Session 1: one read-only round, then the budget stop. ----
+    let config = product_config(
+        &root,
+        Arc::new(ReadThenWriteModel {
+            step: AtomicUsize::new(0),
+        }),
+        Some(1),
+    )
+    .await?;
+    let composed = compose(config).await?;
+    let mut events = composed.subscribe();
+    let handle = composed.handle().clone();
+    handle.start().await?;
+    handle.set_focus("read then write".into()).await?;
+    handle.user_message("read then write".into()).await?;
+    wait_for(
+        &mut events,
+        |event| {
+            matches!(
+                event,
+                RuntimeEvent::Failure {
+                    class: RuntimeFailureClass::RoundBudget,
+                    ..
+                }
+            )
+        },
+        "stop at the round budget",
+    )
+    .await;
+    assert!(
+        !root.join("file_b.txt").exists(),
+        "the read-only round must not have written anything"
+    );
+    // The BudgetStopYield debt forces a resumable snapshot even though
+    // nothing was mutated.
+    let store = agent_runtime::CheckpointStore::new(checkpoint_dir.clone());
+    let rows = store.list(5).await?;
+    assert!(
+        !rows.is_empty(),
+        "the budget stop must land a resumable checkpoint"
+    );
+    composed.shutdown().await?;
+
+    // ---- Session 2: restore the snapshot, continue, and the write lands. ----
+    let config = product_config(
+        &root,
+        Arc::new(ReadThenWriteModel {
+            step: AtomicUsize::new(1),
+        }),
+        None,
+    )
+    .await?;
+    let composed = compose(config).await?;
+    let mut events = composed.subscribe();
+    composed.instance.start().await?;
+    let stored = rows.first().unwrap();
+    let bytes = std::fs::read(checkpoint_dir.join(&stored.artifact))?;
+    // Store artifacts are envelope-wrapped: decode through the product
+    // decoder, not a raw serde round-trip.
+    let checkpoint = agent_runtime::decode_checkpoint_bytes(&bytes)?;
+    checkpoint.validate()?;
+    composed.instance.restore(checkpoint).await?;
+    wait_for(
+        &mut events,
+        |event| matches!(event, RuntimeEvent::RuntimeRestored { .. }),
+        "commit the restore",
+    )
+    .await;
+
+    composed.handle().continue_active_task().await?;
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+    loop {
+        if root.join("file_b.txt").exists() {
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "/continue never wrote file B"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert_eq!(
+        std::fs::read_to_string(root.join("file_b.txt"))?,
+        "resumed content",
+        "the continued segment must land its write"
+    );
+    composed.shutdown().await?;
+    Ok(())
+}
