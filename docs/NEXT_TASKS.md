@@ -57,7 +57,7 @@ M16-00/01/02/05/07 与大部分 03/06 已落地，细节见下方 M16 表。
 
 **用户结果：** 开启宿主验证时，宿主进程被 SIGKILL/abort 后，不留下可继续改工作区的无监督子进程。
 
-**已落地（2026-09-07）：** ① Windows KILL_ON_JOB_CLOSE 围栏（`7c72df3`）；② Unix 管道 EOF 看门狗（`a954314`：re-enter 宿主可执行文件 + socketpair，宿主死亡 → EOF → 确认组长仍活 → `kill(-pgid)`；正常 reap 后 drop 写端解除）；③ 监督台账（`995a457`：execute_invocation 经 ChildLease 记录每个子进程，正常路径释放、崩溃路径留行，compose 启动时对账清理后才复用工作区；pid 精确匹配、死条目清除防复用误杀）。**剩余：** cfg(unix) 看门狗测试等下一次 Linux CI 实证（已交叉 check）。
+**已落地（2026-09-07）：** ① Windows KILL_ON_JOB_CLOSE 围栏（`7c72df3`）；② Unix 管道 EOF 看门狗（`a954314`：re-enter 宿主可执行文件 + socketpair，宿主死亡 → EOF → 确认组长仍活 → `kill(-pgid)`；正常 reap 后 drop 写端解除）；③ 监督台账（`995a457`：execute_invocation 经 ChildLease 记录每个子进程，正常路径释放、崩溃路径留行，compose 启动时对账清理后才复用工作区；pid 精确匹配、死条目清除防复用误杀）。**已验证（2026-09-07）：** 全部 cfg(unix) 测试在真实 Linux（WSL2 Ubuntu，真内核）执行通过——agent-process 40/40（含看门狗 6 项：EOF 杀活组、reaped leader 不杀、pid-0 拒绝、Drop 收割看门狗、管道接线）、agent-workspace 132 项（WORKSPACE-01 FIFO、WORKSPACE-02 句柄路径）、tool-runtime 229 项（台账对账杀 abandoned 子进程）。CI 重跑转为回归确认。
 
 **入口：** `crates/tool-runtime/src/proof_runner.rs`、`crates/tool-runtime/src/tools/process.rs`。Linux 探针已证 OS 机制（父死子存），不是 Agent 集成测试。
 

@@ -130,20 +130,24 @@ mod tests {
     use std::time::Duration;
 
     fn spawn_sleeper() -> (std::process::Child, u32) {
+        // Spawned as a process-group leader on Unix, matching the
+        // production spawn contract that kill_process_tree's group kill
+        // depends on.
+        #[cfg(unix)]
+        let mut command = {
+            use std::os::unix::process::CommandExt;
+            let mut command = Command::new("sleep");
+            command.arg("30").process_group(0);
+            command
+        };
         #[cfg(windows)]
-        let mut child = Command::new("ping")
-            .args(["-n", "30", "127.0.0.1"])
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .spawn()
-            .unwrap();
-        #[cfg(not(windows))]
-        let mut child = Command::new("sleep")
-            .arg("30")
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .spawn()
-            .unwrap();
+        let mut command = {
+            let mut command = Command::new("ping");
+            command.args(["-n", "30", "127.0.0.1"]);
+            command
+        };
+        command.stdout(Stdio::null()).stderr(Stdio::null());
+        let mut child = command.spawn().unwrap();
         let pid = child.id();
         (child, pid)
     }
@@ -262,28 +266,21 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let state_dir = dir.path().join("state");
         std::fs::create_dir_all(&state_dir).unwrap();
-        let mut child = Command::new("ping")
-            .args(["-n", "30", "127.0.0.1"])
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .spawn()
-            .unwrap();
-        #[cfg(not(windows))]
-        {
-            let _ = &mut child;
-        }
-        #[allow(unused_mut)]
-        {
-            let pid = child.id();
-            record_child(&state_dir, pid, "process.run");
-            // Deliberately do NOT wait on `child` — the host "crashed".
-            let killed = reconcile_children(&state_dir);
-            assert!(killed.contains(&pid));
-            std::thread::sleep(Duration::from_millis(300));
+        let (mut child, pid) = spawn_sleeper();
+        record_child(&state_dir, pid, "process.run");
+        // Deliberately do NOT wait on `child` — the host "crashed".
+        let killed = reconcile_children(&state_dir);
+        assert!(killed.contains(&pid));
+        // The killed child is now a zombie owned by this test, and a
+        // zombie answers kill(pid, 0) — so the kill is observed by
+        // reaping it, not by a liveness probe.
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while child.try_wait().ok().flatten().is_none() {
             assert!(
-                !process_is_running(pid),
-                "the abandoned child must be dead after reconcile"
+                std::time::Instant::now() < deadline,
+                "the abandoned child must die after reconcile"
             );
+            std::thread::sleep(Duration::from_millis(20));
         }
     }
 }
