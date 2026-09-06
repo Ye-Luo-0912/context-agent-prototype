@@ -220,6 +220,7 @@ pub async fn run_headless(
         commit_failed: false,
         recovery_required: false,
         task_completed: false,
+        task_active: false,
         round_budget: false,
         approval_denied: false,
         other_failure: None,
@@ -258,13 +259,25 @@ pub async fn run_headless(
         }
     }
 
+    let task_was_active = outcome.task_active;
     let result = outcome.finish();
+    // Closure semantics for scripts: `operator_accepted` = durable
+    // TaskCompleted; `awaiting_operator_review` = work produced but the
+    // task stays active (/done closes it); `none` = no active task.
+    let task_state = if result.task_completed {
+        "operator_accepted"
+    } else if task_was_active {
+        "awaiting_operator_review"
+    } else {
+        "none"
+    };
     let session = serde_json::json!({
         "schema": "agent.headless.v1",
         "kind": "session_end",
         "status": result.status,
         "exit": result.exit,
         "stop": result.stop,
+        "task_state": task_state,
         "task_completed": result.task_completed,
         "round_budget": result.round_budget,
         "approval_denied": result.approval_denied,
@@ -296,6 +309,7 @@ struct Drain {
     commit_failed: bool,
     recovery_required: bool,
     task_completed: bool,
+    task_active: bool,
     round_budget: bool,
     approval_denied: bool,
     other_failure: Option<String>,
@@ -318,7 +332,14 @@ impl Drain {
             RuntimeEvent::TurnCancelled { .. } => self.turn_cancelled = true,
             RuntimeEvent::TurnCommitFailed { .. } => self.commit_failed = true,
             RuntimeEvent::RecoveryRequired => self.recovery_required = true,
-            RuntimeEvent::TaskCompleted { .. } => self.task_completed = true,
+            RuntimeEvent::TaskCompleted { .. } => {
+                self.task_completed = true;
+                self.task_active = false;
+            }
+            RuntimeEvent::FocusChanged { .. } | RuntimeEvent::TaskAnchorChanged { .. } => {
+                self.task_active = true;
+            }
+            RuntimeEvent::FocusCleared => self.task_active = false,
             RuntimeEvent::Failure {
                 class,
                 retryable,
@@ -692,6 +713,9 @@ mod tests {
         let end = session_end(&String::from_utf8(jsonl).unwrap());
         assert_eq!(end["exit"], 0);
         assert_eq!(end["approval_denied"], false);
+        // MockModelTransport ends the turn without a durable completion:
+        // the produced result is explicitly awaiting operator review.
+        assert_eq!(end["task_state"], "awaiting_operator_review");
     }
 
     #[tokio::test]

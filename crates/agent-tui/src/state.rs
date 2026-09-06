@@ -994,6 +994,15 @@ impl AppState {
                 self.streaming = false;
                 self.status = "idle".into();
                 self.tool_status = "none".into();
+                // Under OperatorClosureOnly a normal final ends the turn,
+                // not the task: name the state so a produced result is
+                // visibly awaiting review instead of reading as done.
+                if self.current_task.is_some() {
+                    self.push_system(
+                        "turn ended; the task stays active awaiting operator review (=/done closes durably)"
+                            .into(),
+                    );
+                }
             }
             RuntimeEvent::TurnCancelled { reason, .. } => {
                 self.current_op = None;
@@ -1215,7 +1224,7 @@ pub fn format_result_lines(card: &ResultCard) -> Vec<String> {
         }
         None => {
             lines.push(
-                "review: no durable task completion this session; below is what this \
+                "review: no durable task completion this session — awaiting operator review (/done closes durably); below is what this \
                  session's tools did so far"
                     .into(),
             );

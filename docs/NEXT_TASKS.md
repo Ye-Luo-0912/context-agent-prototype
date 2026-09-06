@@ -29,7 +29,7 @@
 | 9 | ~~CONTEXT-01~~ | 依赖候选 newest-first | 已关闭（2026-09-06） |
 | 10 | PACKAGE-01 | 打包来源绑定 | 下次实际发布 |
 | 11 | MCP-01 | MCP 写/连接/读可取消 | 仅默认启用 MCP 时 |
-| 12 | M16-02 剩余 | 待审阅 ≠ 持久完成 | 审查剩余之后 |
+| 12 | ~~M16-02 剩余~~ | 待审阅 ≠ 持久完成 | 已关闭（2026-09-07） |
 
 已关闭、跳过：STORAGE-01、DOC-01；EOF wait、消费 ACK、PromptRequired、resync。
 M16-00/01/05/07 与大部分 02/03/06 已落地，细节见下方 M16 表。
@@ -218,12 +218,12 @@ M16-00/01/05/07 与大部分 02/03/06 已落地，细节见下方 M16 表。
 
 **已落地：** `/work`（focus + 空需求集上 `task.manage` PreferSurface + 一次 user-message）；`/plan` 读只读 `TaskPlanView`；清单随检查点往返。
 
-**本切片剩余：**
+**本切片剩余：已全部落地（2026-09-07）。**
 
-1. 默认 `OperatorClosureOnly` 在 TUI / 无头结果里明确显示为待操作员审阅关闭。普通 final 结束 turn，不显示为持久 `TaskCompleted`。
-2. `/done` 走既有操作员接受路径，不伪造验证 PASS。
-3. `EvidenceRequired` 仅在宿主已声明准则与 coverage 时使用；普通 `cargo test` / `npm test` 保持 `TaskScoped`。
-4. `next_action` 仍是建议；不增加“必须为空才能完成”。计划 `[x]` 不是证据。
+1. 默认 `OperatorClosureOnly` 在 TUI / 无头结果里明确显示为待操作员审阅关闭。普通 final 结束 turn，不显示为持久 `TaskCompleted`。**已落地：StatusProjection 任务行带 [awaiting operator review] / [durably completed (operator accepted)]；TUI turn 结束时对活动任务显式提示；无头 session_end 增 `task_state` 字段（operator_accepted / awaiting_operator_review / none）。**
+2. `/done` 走既有操作员接受路径，不伪造验证 PASS。**既有路径未动。**
+3. `EvidenceRequired` 仅在宿主已声明准则与 coverage 时使用；普通 `cargo test` / `npm test` 保持 `TaskScoped`。**既有语义未动。**
+4. `next_action` 仍是建议；不增加“必须为空才能完成”。计划 `[x]` 不是证据。**未变。**
 
 没有可信验收域时，把结果交给用户审阅就是完整产品行为，不要为此新建通用验证器。
 

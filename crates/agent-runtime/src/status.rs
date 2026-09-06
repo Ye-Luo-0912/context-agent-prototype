@@ -34,6 +34,11 @@ pub struct StatusProjection {
     cached_input_tokens: u64,
     in_flight: Option<InFlight>,
     current_task: Option<TaskId>,
+    /// Whether the CURRENT task durably completed (`TaskCompleted`). Under
+    /// `OperatorClosureOnly` a normal final ends only the turn — an active
+    /// task without this flag is awaiting operator review, not done.
+    task_durably_completed: bool,
+    task_completion_summary: String,
     focus_goal: String,
     anchor_revision: u64,
     unresolved_ack_debts: usize,
@@ -78,18 +83,32 @@ impl StatusProjection {
                 let _ = output;
             }
             RuntimeEvent::FocusChanged { task_id, goal } => {
+                if self.current_task != Some(*task_id) {
+                    self.task_durably_completed = false;
+                }
                 self.current_task = Some(*task_id);
                 self.focus_goal = goal.clone();
             }
             RuntimeEvent::FocusCleared => {
                 self.current_task = None;
+                self.task_durably_completed = false;
                 self.focus_goal.clear();
             }
             RuntimeEvent::TaskAnchorChanged {
                 task_id, revision, ..
             } => {
+                if self.current_task != Some(*task_id) {
+                    self.task_durably_completed = false;
+                }
                 self.current_task = Some(*task_id);
                 self.anchor_revision = self.anchor_revision.max(*revision);
+            }
+            RuntimeEvent::TaskCompleted {
+                task_id, summary, ..
+            } => {
+                self.current_task = Some(*task_id);
+                self.task_durably_completed = true;
+                self.task_completion_summary = ellipsize(summary, 120);
             }
             RuntimeEvent::EffectAckDebt { .. } => {
                 self.unresolved_ack_debts = self.unresolved_ack_debts.saturating_add(1);
@@ -171,10 +190,20 @@ impl StatusProjection {
             self.input_tokens, self.output_tokens, self.cached_input_tokens
         ));
         match (&self.current_task, self.anchor_revision) {
-            (Some(task_id), revision) => lines.push(format!(
-                "task: {task_id} anchor_revision={revision} goal={}",
-                ellipsize(&self.focus_goal, 120)
-            )),
+            (Some(task_id), revision) => {
+                let closure = if self.task_durably_completed {
+                    format!(
+                        "durably completed (operator accepted): {}",
+                        self.task_completion_summary
+                    )
+                } else {
+                    "awaiting operator review (=/done closes durably)".to_string()
+                };
+                lines.push(format!(
+                    "task: {task_id} anchor_revision={revision} goal={} [{closure}]",
+                    ellipsize(&self.focus_goal, 120)
+                ));
+            }
             (None, _) => lines.push("task: none".into()),
         }
         lines.push(format!(
@@ -224,6 +253,70 @@ mod tests {
             projection.fold(event);
         }
         projection
+    }
+
+    /// M16-02: an active task without a durable completion is displayed
+    /// as awaiting operator review; a TaskCompleted event flips it to the
+    /// operator-accepted state.
+    #[test]
+    fn the_task_line_names_the_closure_state() {
+        let task_id = TaskId::new();
+        let active = fold_all(&[RuntimeEvent::FocusChanged {
+            task_id,
+            goal: "migrate config".into(),
+        }]);
+        let lines = active.lines();
+        let line = lines
+            .iter()
+            .find(|line| line.starts_with("task:"))
+            .expect("task line");
+        assert!(
+            line.contains("awaiting operator review"),
+            "active task reads as awaiting review: {line}"
+        );
+
+        let completed = fold_all(&[
+            RuntimeEvent::FocusChanged {
+                task_id,
+                goal: "migrate config".into(),
+            },
+            RuntimeEvent::TaskCompleted {
+                task_id,
+                anchor_revision: 3,
+                summary: "migration landed".into(),
+            },
+        ]);
+        let lines = completed.lines();
+        let line = lines
+            .iter()
+            .find(|line| line.starts_with("task:"))
+            .expect("task line");
+        assert!(
+            line.contains("durably completed (operator accepted): migration landed"),
+            "{line}"
+        );
+
+        // Switching to a different task resets the closure state.
+        let switched = fold_all(&[
+            RuntimeEvent::TaskCompleted {
+                task_id,
+                anchor_revision: 3,
+                summary: "done".into(),
+            },
+            RuntimeEvent::FocusChanged {
+                task_id: TaskId::new(),
+                goal: "new goal".into(),
+            },
+        ]);
+        let lines = switched.lines();
+        let line = lines
+            .iter()
+            .find(|line| line.starts_with("task:"))
+            .expect("task line");
+        assert!(
+            line.contains("awaiting operator review"),
+            "a new task starts un-closed: {line}"
+        );
     }
 
     #[test]
