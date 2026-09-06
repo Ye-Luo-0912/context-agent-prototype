@@ -718,6 +718,300 @@ mod tests {
         assert_eq!(end["task_state"], "awaiting_operator_review");
     }
 
+    /// F6 walkthrough E2E (bug fix): a workspace with the user's own file
+    /// and a planted bug; the scripted agent reads the bug, writes the fix.
+    /// Asserts the fix landed, the user's own file is untouched, and the
+    /// JSONL carries the read/write boundary rows.
+    #[tokio::test]
+    async fn e2e_bug_fix_preserves_user_modifications() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().to_path_buf();
+        std::fs::write(root.join("config.txt"), "user_setting=keep\n").unwrap();
+        std::fs::write(root.join("service.txt"), "mode=broken\n").unwrap();
+
+        #[derive(Debug)]
+        struct FixModel;
+        #[async_trait::async_trait]
+        impl ModelTransport for FixModel {
+            fn capabilities(&self) -> ModelCapabilities {
+                ModelCapabilities {
+                    streaming: true,
+                    tool_calls: true,
+                    max_output_tokens: 4096,
+                    context_window: None,
+                }
+            }
+            async fn complete(&self, request: ModelRequest) -> AgentResult<ModelOutput> {
+                let has_tool_result = request
+                    .messages
+                    .iter()
+                    .any(|message| message.role == agent_contracts::ModelRole::Tool);
+                if !has_tool_result {
+                    return Ok(ModelOutput {
+                        content: String::new(),
+                        tool_calls: vec![ToolCall {
+                            id: "fix-read".into(),
+                            name: "fs.read".into(),
+                            arguments: json!({"path": "service.txt"}),
+                        }],
+                        usage: Default::default(),
+                    });
+                }
+                let read_the_file = request.messages.iter().any(|message| {
+                    message.role == agent_contracts::ModelRole::Tool
+                        && message.content.contains("mode=broken")
+                });
+                if read_the_file {
+                    return Ok(ModelOutput {
+                        content: String::new(),
+                        tool_calls: vec![ToolCall {
+                            id: "fix-write".into(),
+                            name: "fs.write".into(),
+                            arguments: json!({
+                                "path": "service.txt",
+                                "content": "mode=fixed\n",
+                            }),
+                        }],
+                        usage: Default::default(),
+                    });
+                }
+                Ok(ModelOutput {
+                    content: "[scripted] fix delivered".into(),
+                    tool_calls: Vec::new(),
+                    usage: Default::default(),
+                })
+            }
+        }
+
+        let grants = vec![serde_json::json!({
+            "id": "fix-service",
+            "risk": "WorkspaceWrite",
+            "target": { "workspace_path_prefix": "service.txt" },
+            "constraint": {},
+            "expires_at_ms": u64::MAX
+        })
+        .to_string()];
+        let composed = product_compose(&root, &grants, Arc::new(FixModel), None)
+            .await
+            .unwrap();
+        let mut events = composed.subscribe();
+        composed.instance.start().await.unwrap();
+        let mut jsonl = Vec::new();
+        let outcome = run_headless(
+            composed.handle().clone(),
+            &mut events,
+            HeadlessAction::Prompt {
+                text: "fix the mode bug in service.txt".into(),
+                work: false,
+            },
+            Duration::from_secs(30),
+            &mut jsonl,
+        )
+        .await
+        .unwrap();
+        composed.shutdown().await.unwrap();
+
+        assert_eq!(outcome.exit, EXIT_OK, "{outcome:?}");
+        assert_eq!(
+            std::fs::read_to_string(root.join("service.txt")).unwrap(),
+            "mode=fixed\n",
+            "the fix must land"
+        );
+        assert_eq!(
+            std::fs::read_to_string(root.join("config.txt")).unwrap(),
+            "user_setting=keep\n",
+            "the user's own file must not be touched"
+        );
+        // No durable completion without operator acceptance: the fix is
+        // explicitly awaiting operator review.
+        assert!(!outcome.task_completed);
+        let text = String::from_utf8(jsonl).unwrap();
+        let end = session_end(&text);
+        assert_eq!(end["task_state"], "awaiting_operator_review");
+        assert!(text.contains("\"name\":\"fs.read\""), "read row missing");
+        assert!(text.contains("\"name\":\"fs.write\""), "write row missing");
+    }
+
+    /// F6 walkthrough E2E (small feature with /work): the long-task entry
+    /// attaches task.manage, the model records the plan through the real
+    /// tool, and the session ends awaiting operator review.
+    #[tokio::test]
+    async fn e2e_work_records_plan_and_session_ends_awaiting_review() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().to_path_buf();
+
+        #[derive(Debug)]
+        struct PlanModel;
+        #[async_trait::async_trait]
+        impl ModelTransport for PlanModel {
+            fn capabilities(&self) -> ModelCapabilities {
+                ModelCapabilities {
+                    streaming: true,
+                    tool_calls: true,
+                    max_output_tokens: 4096,
+                    context_window: None,
+                }
+            }
+            async fn complete(&self, request: ModelRequest) -> AgentResult<ModelOutput> {
+                let has_tool_result = request
+                    .messages
+                    .iter()
+                    .any(|message| message.role == agent_contracts::ModelRole::Tool);
+                if has_tool_result {
+                    return Ok(ModelOutput {
+                        content: "[scripted] plan recorded".into(),
+                        tool_calls: Vec::new(),
+                        usage: Default::default(),
+                    });
+                }
+                Ok(ModelOutput {
+                    content: String::new(),
+                    tool_calls: vec![ToolCall {
+                        id: "plan-1".into(),
+                        name: "task.manage".into(),
+                        arguments: json!({
+                            "base_anchor_revision": 0,
+                            "plan_progress": [
+                                "[x] read the module",
+                                "[ ] add the feature"
+                            ],
+                            "next_action": "add the feature",
+                        }),
+                    }],
+                    usage: Default::default(),
+                })
+            }
+        }
+
+        let composed =
+            product_compose(&root, &[], Arc::new(PlanModel), None).await.unwrap();
+        let mut events = composed.subscribe();
+        composed.instance.start().await.unwrap();
+        let mut jsonl = Vec::new();
+        let outcome = run_headless(
+            composed.handle().clone(),
+            &mut events,
+            HeadlessAction::Prompt {
+                text: "add the feature".into(),
+                work: true,
+            },
+            Duration::from_secs(30),
+            &mut jsonl,
+        )
+        .await
+        .unwrap();
+        composed.shutdown().await.unwrap();
+
+        assert_eq!(outcome.exit, EXIT_OK, "{outcome:?}");
+        assert!(!outcome.task_completed);
+        let text = String::from_utf8(jsonl).unwrap();
+        let end = session_end(&text);
+        assert_eq!(end["task_state"], "awaiting_operator_review");
+        assert!(
+            text.contains("task_progress_updated"),
+            "the task.manage proposal must be accepted: {text}"
+        );
+    }
+
+    /// F6 walkthrough E2E (cross-file work with interrupt + continue): the
+    /// first segment writes file A and stops at the round budget; /continue
+    /// runs the second segment which writes file B.
+    #[tokio::test]
+    async fn e2e_budget_stop_then_continue_writes_across_segments() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().to_path_buf();
+
+        #[derive(Debug)]
+        struct TwoFileModel {
+            step: AtomicUsize,
+        }
+        #[async_trait::async_trait]
+        impl ModelTransport for TwoFileModel {
+            fn capabilities(&self) -> ModelCapabilities {
+                ModelCapabilities {
+                    streaming: true,
+                    tool_calls: true,
+                    max_output_tokens: 4096,
+                    context_window: None,
+                }
+            }
+            async fn complete(&self, _request: ModelRequest) -> AgentResult<ModelOutput> {
+                let step = self.step.fetch_add(1, Ordering::SeqCst);
+                let path = if step == 0 { "file_a.txt" } else { "file_b.txt" };
+                let content = format!("segment {} content", step + 1);
+                Ok(ModelOutput {
+                    content: String::new(),
+                    tool_calls: vec![ToolCall {
+                        id: format!("write-{step}"),
+                        name: "fs.write".into(),
+                        arguments: json!({"path": path, "content": content}),
+                    }],
+                    usage: Default::default(),
+                })
+            }
+        }
+
+        let model = Arc::new(TwoFileModel {
+            step: AtomicUsize::new(0),
+        });
+        let grants = vec![
+            serde_json::json!({
+                "id": "write-a",
+                "risk": "WorkspaceWrite",
+                "target": { "workspace_path_prefix": "file_a.txt" },
+                "constraint": {},
+                "expires_at_ms": u64::MAX
+            })
+            .to_string(),
+            serde_json::json!({
+                "id": "write-b",
+                "risk": "WorkspaceWrite",
+                "target": { "workspace_path_prefix": "file_b.txt" },
+                "constraint": {},
+                "expires_at_ms": u64::MAX
+            })
+            .to_string(),
+        ];
+        let composed =
+            product_compose(&root, &grants, model.clone(), Some(1)).await.unwrap();
+        let mut events = composed.subscribe();
+        composed.instance.start().await.unwrap();
+        let mut jsonl = Vec::new();
+        let outcome = run_headless(
+            composed.handle().clone(),
+            &mut events,
+            HeadlessAction::Prompt {
+                text: "write both files".into(),
+                work: false,
+            },
+            Duration::from_secs(30),
+            &mut jsonl,
+        )
+        .await
+        .unwrap();
+        assert_eq!(outcome.exit, EXIT_ROUND_BUDGET, "{outcome:?}");
+        assert!(root.join("file_a.txt").exists(), "segment 1 must land");
+
+        // /continue: the second segment writes the other file.
+        let outcome = run_headless(
+            composed.handle().clone(),
+            &mut events,
+            HeadlessAction::Continue,
+            Duration::from_secs(30),
+            &mut jsonl,
+        )
+        .await
+        .unwrap();
+        composed.shutdown().await.unwrap();
+
+        assert_eq!(
+            std::fs::read_to_string(root.join("file_b.txt")).unwrap(),
+            "segment 2 content",
+            "/continue must run the next segment"
+        );
+        assert_eq!(outcome.exit, EXIT_ROUND_BUDGET);
+    }
+
     #[tokio::test]
     async fn headless_write_with_a_grant_file_lands() {
         let temp = tempfile::tempdir().unwrap();
