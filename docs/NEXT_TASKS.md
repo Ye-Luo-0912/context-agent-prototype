@@ -57,6 +57,8 @@ M16-00/01/02/05/07 与大部分 03/06 已落地，细节见下方 M16 表。
 
 **用户结果：** 开启宿主验证时，宿主进程被 SIGKILL/abort 后，不留下可继续改工作区的无监督子进程。
 
+**Unix 进展（2026-09-07，`a954314`）：** 管道 EOF 看门狗落地——宿主 re-enter 自身可执行文件作为看门狗（main 顶部 env 分发），持 socketpair 读端；宿主任何方式死亡 → EOF → 确认组长仍活 → `kill(-pgid)`；正常 reap 后 drop 写端为解除路径，组长已死则不发信号。产品 TUI 经新 dispatcher 构造器启用；eval 默认关闭。**限制：** cfg(unix) 测试（EOF 杀活组/reaped leader 不杀/管道接线）本机 Windows 未执行，已通过 `x86_64-unknown-linux-gnu` 交叉 check；真实 GH runner 执行等下一次 Linux CI。启动时对账台账（持久监督身份的另一半）进行中。
+
 **入口：** `crates/tool-runtime/src/proof_runner.rs`、`crates/tool-runtime/src/tools/process.rs`。Linux 探针已证 OS 机制（父死子存），不是 Agent 集成测试。
 
 **检查：** 定向 `tool-runtime` / 现有 crash fixture；监督身份与权限身份分开。不否定已落地的取消桥接（F3-6b）。
@@ -186,14 +188,14 @@ M16-00/01/02/05/07 与大部分 03/06 已落地，细节见下方 M16 表。
 | 工单 | 交付物 | 本分支状态 | 旧映射 |
 |---|---|---|---|
 | M16-00 | 切换活动路线 | 已切换 | D0 |
-| M16-01 | 继续、忙时补充、启动预检 | 代码已落地；TUI 走查待做 | F1 |
+| M16-01 | 继续、忙时补充、启动预检 | 已关闭（2026-09-07）：走查转为自动化 TUI E2E | F1 |
 | M16-02 | `/work` `/plan` 与完成语义 | 已落地（2026-09-07：待审阅/持久完成显式区分） | F2 |
 | M16-03 | 有限模型轮与可确认取消 | 主体已落地；PROCESS/PROVIDER 见上列 | F3 |
 | M16-04 | 可信冷恢复 | STORAGE-01/02 已落地；产品配置恢复走查待做 | 恢复路径 |
-| M16-05 | `/review` 与状态区分 | 结果卡已落地；双工作区走查待做 | F4 |
+| M16-05 | `/review` 与状态区分 | 已关闭（2026-09-07）：双工作区走查转为无头 + TUI E2E | F4 |
 | M16-06 | 上下文/搜索正确性 | 主体已落地；CONTEXT/WORKSPACE 见上列 | F5 |
 | M16-07 | 单进程非交互入口 | N1/N2 已落地 | 原 F6 之后项 |
-| M16-08 | 试用包与三类走查收口 | 无头 live 已有；PACKAGE-01 见上列 | F6 + 发布 |
+| M16-08 | 试用包与三类走查收口 | 无头 live 已有；TUI 交互走查已自动化（E2E）；PACKAGE-01 见上列 | F6 + 发布 |
 
 ---
 
@@ -211,7 +213,7 @@ M16-00/01/02/05/07 与大部分 03/06 已落地，细节见下方 M16 表。
 
 **已落地：** `/continue` → `continue_active_task()`；忙时单槽队列；命令错误走 notice；未知 flag 拒绝；release 消费盖章与 PromptRequired 判重（`c6fbbab`）。参数解析在打开 workspace 之前。
 
-**仍待做：** TUI 手工走查（恢复后 continue、忙时第二条输入）。模型 key 校验仍在 workspace 打开之后——若再动启动顺序，只前移纯配置错误，不抽 CompositionPlan。
+**已全部落地（2026-09-07）。** 原手工走查转为会话循环自动化 E2E（`tui_e2e_*`）：恢复后 /continue（预算让出 → /checkpoint → /restore → /continue 落下一段）、忙时第二条输入可见排队并在下一 turn 应用。模型 key 校验仍在 workspace 打开之后——若再动启动顺序，只前移纯配置错误，不抽 CompositionPlan。
 
 **不要：** 用 `user_message("继续")` 代替 continue；无界输入队列；后台服务。
 
@@ -268,7 +270,7 @@ M16-00/01/02/05/07 与大部分 03/06 已落地，细节见下方 M16 表。
 
 **已落地：** 事件派生结果卡；不归属用户原有修改；resync 最新优先/当前 run/水位/有界读；run_summary 按 entries+omitted。
 
-**仍待做：** 双工作区走查（干净 + 含用户旧修改）；展示上继续分清待审阅 / 预算让出 / 持久完成 / 恢复受阻，不能只凭 `TurnCompleted` 或 `RunCompleted` 推断业务完成。
+**已全部落地（2026-09-07）。** 双工作区走查转为自动化 E2E：无头变体（`e2e_bug_fix_preserves_user_modifications`）+ TUI 交互变体（`tui_e2e_review_attributes_the_agents_change_not_the_users`，结果卡只归属本会话工具写入、不认领用户文件）。展示继续分清待审阅 / 预算让出 / 持久完成 / 恢复受阻，不能只凭 `TurnCompleted` 或 `RunCompleted` 推断业务完成。
 
 **不要：** 全仓 `git diff HEAD` 据为 Agent 成果；diff 编辑器；自动 rollback。
 
@@ -302,7 +304,7 @@ M16-00/01/02/05/07 与大部分 03/06 已落地，细节见下方 M16 表。
 
 **已有：** 无头 live 三类工作区记录；空 recipe 表启动失败已修。
 
-**PACKAGE-01 走前列（下次实际发布）。** TUI 交互走查；至少一条带用户原有修改。真实 provider 不可用则 live 写 `NOT_RUN`。
+**PACKAGE-01 走前列（下次实际发布）。** TUI 交互走查已由 `tui_e2e_*` 覆盖（含一条带用户原有修改）；真实 provider 的 live 记录不可用则写 `NOT_RUN`。
 
 **不要：** 为凑 PASS 放宽标准或扩建评测框架。M16 结束不等于 v0.2 已发布，除非另有明确发布动作。
 
@@ -311,6 +313,7 @@ M16-00/01/02/05/07 与大部分 03/06 已落地，细节见下方 M16 表。
 ## 防止再卡在测试/文档循环
 
 - 每个工单先给出一个用户动作；测试或文档单独增加不算功能完成。
+- 人工走查默认转为不依赖人的端到端测试：交互路径走会话循环 `tui_e2e_*`（脚本按键 + 帧捕获 + 真实 compose），无头路径走 `run_headless` E2E；真实 provider 的 live 记录是另一回事，不可用则 `NOT_RUN`。
 - 开发跑相关回归；集成沿用现有 CI。
 - 回执写清：实现了什么、是否默认产品路径、实际检查、是否真实任务、限制、下一工单。
 - 安全与持久性不能靠“快点落地”绕过；真问题修当前路径。

@@ -16,8 +16,8 @@
   "milestone_gates": {
     "m15_real_evaluation": "closed",
     "next_ordered": [
-      "PROCESS-01 host-proof crash supervision (Unix persistent supervision identity; Windows fence landed)",
-      "M16-08 closure: TUI walkthroughs (M16-01 continue/busy-input, M16-05 dual-workspace) + PACKAGE-01 at the next actual release",
+      "PROCESS-01 Unix remainder: Linux CI execution of the pipe-EOF watchdog tests + startup reconciliation ledger",
+      "M16-08 closure: real-provider live records (NOT_RUN if unavailable) + PACKAGE-01 at the next actual release",
       "MCP-01 only if default product enables MCP writes"
     ],
     "lt_eval_06": {
@@ -79,8 +79,8 @@
   ],
   "branch_protection": false,
   "next_ordered": [
-    "PROCESS-01 host-proof crash supervision (Unix persistent supervision identity; Windows fence landed)",
-    "M16-08 closure: TUI walkthroughs (M16-01 continue/busy-input, M16-05 dual-workspace) + PACKAGE-01 at the next actual release",
+    "PROCESS-01 Unix remainder: Linux CI execution of the pipe-EOF watchdog tests + startup reconciliation ledger",
+    "M16-08 closure: real-provider live records (NOT_RUN if unavailable) + PACKAGE-01 at the next actual release",
     "MCP-01 only if default product enables MCP writes"
   ],
   "release": {
@@ -123,10 +123,10 @@
       "TaskGraph",
       "new GC/ranking algorithms"
     ],
-    "F1_status": "code + targeted tests landed 2026-09-06 (/continue, busy-input queue visibility, notice-channel command errors, release consumption stamp, PromptRequired dedup); manual walkthrough pending",
-    "F2_status": "code + targeted tests landed 2026-09-06 (/work composes set_focus + empty-requirement task.manage PreferSurface + one user-message; /plan reads the new read-only TaskPlanView command; checkpoint roundtrip preserves checklist and TaskId); manual walkthrough pending",
+    "F1_status": "closed 2026-09-07: /continue, busy-input queue visibility, notice-channel command errors, release consumption stamp, PromptRequired dedup; the manual walkthroughs became automated session-loop E2E (tui_e2e_busy_input_is_queued_named_and_applied, tui_e2e_budget_checkpoint_restore_continue_lands_the_next_segment in agent-tui session.rs)",
+    "F2_status": "closed 2026-09-07: /work, /plan, checkpoint roundtrip, plus closure-semantics display (awaiting operator review vs durably completed) verified by the automated session-loop E2E (tui_e2e_work_status_names_awaiting_review_then_done_closes_durably)",
     "F3_status": "landed 2026-09-06 incl. continued-review 6a (EOF-wait bounds) and 6b (verifier cancellation bridge armed on turn cancel and shutdown before bounded join); inline default until a real slow-verification walkthrough",
-    "F4_status": "landed 2026-09-06 incl. continued-review batch: resync_projection newest-first/current-run/watermark/bounded-read, run_summary entries+omitted counting with real-event tests and mid-file run split, shadow-frame dedup-vs-cap accounting; two-workspace walkthrough pending",
+    "F4_status": "closed 2026-09-07: resync_projection newest-first/current-run/watermark/bounded-read, run_summary entries+omitted counting, shadow-frame dedup-vs-cap accounting; the dual-workspace walkthrough became automated E2E — headless (e2e_bug_fix_preserves_user_modifications) and interactive TUI (tui_e2e_review_attributes_the_agents_change_not_the_users: the card attributes the agent's write and never claims the user's file)",
     "F5_status": "landed 2026-09-06: provable file-body supersession, verify-only error clearing, search.grep and fs.list PARTIAL coverage, fs.read range facts through ingest/supersession, confined bounded reads for grep/symbols, context-search cold-read observation; F6 headless live covered a cross-file task",
     "F6_status": "headless live 2026-09-06: real provider gpt-5.6-luna via product compose/RuntimeHandle; three disposable workspaces passed harness file checks (bugfix, feature, interrupt/restore/continue); empty verification recipe table no longer fails compose; TUI interactive walkthroughs still pending; record in docs/walkthroughs/2026-09-06-f6.md",
     "N1_status": "landed 2026-09-06: agent-tui --prompt/--work/--continue headless JSONL on the product compose/RuntimeHandle path; ungranted writes denied (no --yes/--allow-all); exit 0/2/3/1; targeted agent-tui tests cover deny/grant/work/round-budget",
@@ -167,7 +167,7 @@
     "PROVIDER-02": "closed 2026-09-06: Chat finish_reason=length arms StreamAccumulator::take_output_limit and maps to AgentError::ModelOutputLimit instead of replaying the truncated accumulation as a normal completion",
     "PROVIDER-03": "closed 2026-09-06: the EOF-flushed residual Responses frame passes validate_sse_event_routing like every blank-line terminated frame; regression: contradictory event name on the residual frame fails malformed-event",
     "CONTEXT-01": "closed 2026-09-06: dependency ingest scans each entity bucket newest-first so the 64-candidate budget is spent on the freshest priors (old head-truncation linked the oldest 64), and entity bucket removal is order-preserving (no swap_remove) to keep slot order = creation order; regression: a 70-item bucket links the new item to items 62..=69",
-    "PROCESS-01": "partially closed 2026-09-06: Windows KILL_ON_JOB_CLOSE containment landed and covered; Unix PR_SET_PDEATHSIG via std/tokio pre_exec does NOT execute on GitHub Ubuntu runners — marker-file probe evidence: hook never ran while in-process prctl self-set/get works (selfset=0 after=9). Unix needs the persisted-supervision-identity design (review's alternative); pre_exec approach removed from production spawn as a silent no-op.",
+    "PROCESS-01": "Windows KILL_ON_JOB_CLOSE containment landed (7c72df3). Unix pre_exec hooks never execute on GH runners (probe evidence) and were removed (5eaf3fb). 2026-09-07: pipe-EOF watchdog landed (a954314) — the host re-enters its own executable as a watchdog (env marker dispatched at the top of main, before tokio) holding the read half of a UnixStream pair; host death closes the pipe and the watchdog kills the watched group only if the leader still answers, so the normal-shutdown disarm never signals. Armed only by the product TUI (new dispatcher constructor); eval hosts stay off. cfg(unix) tests (EOF kills a live group / reaped leader untouched / pipe wiring) are cross-checked on x86_64-unknown-linux-gnu but await real Linux CI execution; the startup-reconciliation ledger is in progress.",
     "PROCESS-02": "closed 2026-09-06: reap clears the pid only after a confirmed exit (typed ProcessReapOutcome) and kill_tree's direct-child fallback no longer depends on the child lock (direct pid kill); regression: a non-group-leader child dies through the fallback while the lock is held",
     "WORKSPACE-01": "closed 2026-09-06: ordinary confined opens carry O_NONBLOCK with the same-handle stat accepting only regular files/directories (staged targets require a regular file); project_markers is a metadata-only probe (fstatat AT_SYMLINK_NOFOLLOW) so the root scan never opens an entry; regression: a writerless FIFO at Cargo.toml no longer blocks the scan (17c5ded; agent-workspace 98+5+3)",
     "WORKSPACE-02": "closed 2026-09-06: all six raw-HANDLE sites take ownership (from_raw_handle / File::from_raw_handle) before check_not_reparse, matching the recovery-helper pattern; existing reparse rejection tests cover behavior; handle-count fault injection not performed (17c5ded)"

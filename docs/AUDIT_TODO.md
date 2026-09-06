@@ -13,7 +13,7 @@
 
 | 工单 | 已核对位置 | 要修什么 | 不要做什么 |
 |---|---|---|---|
-| **PROCESS-01（当前）** | proof lane spawn：Windows KILL_ON_JOB_CLOSE 围栏已落地（`7c72df3`）；Unix pre_exec 钩子在 GH runner 静默不执行（marker 探针实证），已从生产 spawn 移除（`5eaf3fb`） | Unix 持久监督身份设计；清理确认后再复用工作区。宿主可信免除审批，不免除生存期 | 不否定已落地的取消桥接；探针是 OS 机制，不是 Agent 集成测试 |
+| **PROCESS-01（当前）** | proof lane spawn：Windows KILL_ON_JOB_CLOSE 围栏已落地（`7c72df3`）；Unix pre_exec 在 runner 静默不执行已移除（`5eaf3fb`）；管道 EOF 看门狗已落地（`a954314`：re-enter 宿主可执行文件 + socketpair + EOF 杀组，正常 reap 解除不发信号） | 剩余：cfg(unix) 看门狗测试等 Linux CI 实证；启动时对账台账进行中。宿主可信免除审批，不免除生存期 | 不否定已落地的取消桥接；探针是 OS 机制，不是 Agent 集成测试 |
 | PACKAGE-01 | `dist.sh` / `dist.ps1` 接受 target 但不传 `--target-dir`；复用 `dist/<version>`。Bash 桩测：旧产物可被成功打包 | 下次实际发布：构建输出与复制源同一身份；干净 staging；PowerShell 原生退出码 | 不宣称当前已发布 ZIP 已错 |
 | MCP-01 | 写请求阶段只有 deadline，取消在读阶段 | 仅当默认产品启用 MCP 写路径时：写/连接/读都可取消；半帧毒化 session；await reap | 不启用第二调度器；未启用则跳过 |
 
