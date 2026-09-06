@@ -1314,18 +1314,18 @@ pub(crate) mod host_death_job {
 /// closes the race where the host died between spawn and prctl.
 #[cfg(unix)]
 pub(crate) fn apply_parent_death_signal(command: &mut Command) {
-    use std::os::unix::process::CommandExt as _;
+    let marker = std::env::var("PDEATHSIG_PROBE_MARKER").ok();
     let host_pid = std::process::id() as libc::pid_t;
-    unsafe {
-        command.as_std_mut().pre_exec(move || {
-            if libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL) == 0
-                && libc::getppid() != host_pid
-            {
-                libc::kill(libc::getpid(), libc::SIGKILL);
-            }
-            Ok(())
-        });
-    }
+    command.pre_exec(move || {
+        let set_rc = libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL);
+        if let Some(marker) = &marker {
+            let _ = std::fs::write(marker, format!("set_rc={set_rc}"));
+        }
+        if set_rc == 0 && libc::getppid() != host_pid {
+            libc::kill(libc::getpid(), libc::SIGKILL);
+        }
+        Ok(())
+    });
 }
 
 #[cfg(test)]
@@ -2291,17 +2291,6 @@ mod tests {
         let marker_path = dir.path().join("pdeathsig-probe-marker");
         command.env("PDEATHSIG_PROBE_HOST", std::process::id().to_string());
         command.env("PDEATHSIG_PROBE_MARKER", marker_path.display().to_string());
-        {
-            let marker = marker_path.clone();
-            let host_pid = std::process::id() as libc::pid_t;
-            unsafe {
-                command.as_std_mut().pre_exec(move || {
-                    let set_rc = libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL);
-                    let _ = std::fs::write(&marker, format!("set_rc={set_rc}"));
-                    Ok(())
-                });
-            }
-        }
         apply_parent_death_signal(&mut command);
         let output = command.output().await.expect("probe child runs");
         let tokio_text = String::from_utf8_lossy(&output.stdout).into_owned();
