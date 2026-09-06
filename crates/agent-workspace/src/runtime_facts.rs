@@ -272,12 +272,8 @@ mod tests {
         let path = fifo.as_os_str().as_encoded_bytes().to_vec();
         let rc = unsafe { libc::mkfifo(path.as_ptr() as *const libc::c_char, 0o600) };
         assert_eq!(rc, 0, "mkfifo fixture");
-        std::fs::write(
-            dir.path().join("README.md"),
-            "x
-",
-        )
-        .unwrap();
+        // Positive control: a real marker directory from PROJECT_MARKERS.
+        std::fs::create_dir(dir.path().join("src")).unwrap();
         let workspace = Workspace::open(dir.path()).await.unwrap();
 
         let (tx, rx) = std::sync::mpsc::channel();
@@ -295,6 +291,7 @@ mod tests {
             !markers.contains(&"Cargo.toml".to_string()),
             "a FIFO must not count as a manifest marker: {markers:?}"
         );
-        assert!(markers.contains(&"README.md".to_string()));
+        // Positive control: a real marker directory is still found.
+        assert!(markers.contains(&"src".to_string()), "{markers:?}");
     }
 }
