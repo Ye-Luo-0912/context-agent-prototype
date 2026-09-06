@@ -2247,11 +2247,38 @@ mod tests {
             );
             std::process::exit(0);
         }
+
+        // --- Experiment A: a plain std Command with the same hook. ---
+        let std_probe = {
+            use std::process::Command as StdCommand;
+            let mut command = StdCommand::new(std::env::current_exe().unwrap());
+            command
+                .args([
+                    "parent_death_signal_is_registered_on_spawned_children",
+                    "--nocapture",
+                ])
+                .env("PDEATHSIG_PROBE_CHILD", "1")
+                .env("PDEATHSIG_PROBE_HOST", std::process::id().to_string())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::null());
+            let host_pid = std::process::id() as libc::pid_t;
+            unsafe {
+                command.pre_exec(move || {
+                    let set_rc = libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL);
+                    eprintln!("PRE_EXEC std: set_rc={set_rc}");
+                    if set_rc == 0 && libc::getppid() != host_pid {
+                        libc::kill(libc::getpid(), libc::SIGKILL);
+                    }
+                    Ok(())
+                });
+            }
+            let output = command.output().expect("std probe child runs");
+            String::from_utf8_lossy(&output.stdout).into_owned()
+        };
+        println!("STD PROBE: {std_probe}");
+
+        // --- Experiment B: the tokio path the production code uses. ---
         let mut command = Command::new(std::env::current_exe().unwrap());
-        // --nocapture: the probe child exits itself, so libtest must not
-        // buffer (and lose) its report. The bare-name filter matches the
-        // full test path as a substring (--exact would need the whole
-        // module path).
         command.args([
             "parent_death_signal_is_registered_on_spawned_children",
             "--nocapture",
@@ -2261,9 +2288,15 @@ mod tests {
         apply_parent_death_signal(&mut command);
         let output = command.output().await.expect("probe child runs");
         let text = String::from_utf8_lossy(&output.stdout);
+        let tokio_text = String::from_utf8_lossy(&output.stdout).into_owned();
+        println!("TOKIO PROBE: {tokio_text}");
         assert!(
-            text.contains("sig=9"),
-            "the spawned child must carry PR_SET_PDEATHSIG=SIGKILL: {text}"
+            std_probe.contains("sig=9"),
+            "std pre_exec must register the parent-death signal: {std_probe}"
+        );
+        assert!(
+            tokio_text.contains("sig=9"),
+            "the tokio path must register it too: {tokio_text}"
         );
     }
 
