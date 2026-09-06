@@ -206,10 +206,12 @@ impl ConfinedDir {
                 FILE_OPEN,
                 FILE_DIRECTORY_FILE | FILE_OPEN_REPARSE_POINT,
             )?;
-            check_not_reparse(handle, &child_display)?;
+            // Own the handle before the tag check (WORKSPACE-02).
             // SAFETY: `handle` is a fresh kernel handle with no other owner.
+            let owned = unsafe { std::os::windows::io::OwnedHandle::from_raw_handle(handle) };
+            check_not_reparse(owned.as_raw_handle(), &child_display)?;
             Ok(Self {
-                handle: unsafe { std::os::windows::io::OwnedHandle::from_raw_handle(handle) },
+                handle: owned,
                 display: child_display,
             })
         }
@@ -477,18 +479,29 @@ impl ConfinedDir {
         {
             let cname = to_cstring(name)?;
             // SAFETY: `cname` is NUL-terminated; O_NOFOLLOW refuses links.
+            // O_NONBLOCK keeps a planted FIFO from blocking the open; the
+            // same-handle stat then refuses anything that is neither a
+            // regular file nor a directory (PROCESS-01).
             let fd = unsafe {
                 libc::openat(
                     self.fd.as_raw_fd(),
                     cname.as_ptr(),
-                    libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+                    libc::O_RDONLY | libc::O_NONBLOCK | libc::O_NOFOLLOW | libc::O_CLOEXEC,
                 )
             };
             if fd < 0 {
                 return Err(io::Error::last_os_error());
             }
             // SAFETY: `fd` is a fresh descriptor with no other owner.
-            Ok(unsafe { std::fs::File::from_raw_fd(fd) })
+            let file = unsafe { std::fs::File::from_raw_fd(fd) };
+            let meta = file.metadata()?;
+            if !(meta.is_file() || meta.is_dir()) {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "workspace entry is not a regular file or directory",
+                ));
+            }
+            Ok(file)
         }
         #[cfg(windows)]
         {
@@ -499,10 +512,13 @@ impl ConfinedDir {
                 FILE_OPEN,
                 FILE_OPEN_REPARSE_POINT,
             ) {
+                // Own the handle before the tag check so a rejected reparse
+                // point cannot leak it (WORKSPACE-02).
                 Ok(handle) => {
-                    check_not_reparse(handle, &child_display)?;
                     // SAFETY: `handle` is a fresh kernel handle.
-                    Ok(unsafe { std::fs::File::from_raw_handle(handle) })
+                    let file = unsafe { std::fs::File::from_raw_handle(handle) };
+                    check_not_reparse(file.as_raw_handle(), &child_display)?;
+                    Ok(file)
                 }
                 // A directory needs the FILE_DIRECTORY_FILE option; retry so
                 // mutation bookkeeping can measure a directory target.
@@ -514,9 +530,11 @@ impl ConfinedDir {
                         FILE_OPEN,
                         FILE_DIRECTORY_FILE | FILE_OPEN_REPARSE_POINT,
                     )?;
-                    check_not_reparse(handle, &child_display)?;
+                    // Own the handle before the tag check (WORKSPACE-02).
                     // SAFETY: `handle` is a fresh kernel handle.
-                    Ok(unsafe { std::fs::File::from_raw_handle(handle) })
+                    let file = unsafe { std::fs::File::from_raw_handle(handle) };
+                    check_not_reparse(file.as_raw_handle(), &child_display)?;
+                    Ok(file)
                 }
                 Err(e) => Err(e),
             }
@@ -524,6 +542,53 @@ impl ConfinedDir {
         #[cfg(not(any(unix, windows)))]
         {
             std::fs::File::open(self.display.join(name))
+        }
+    }
+
+    /// Metadata-only existence probe for known project markers
+    /// (PROCESS-01): never opens the entry, so a planted FIFO with no
+    /// writer cannot block the root scan. Unix answers from
+    /// `fstatat(AT_SYMLINK_NOFOLLOW)` and requires a regular file or a
+    /// directory; Windows opens the name with reparse interception, owns
+    /// the handle first (WORKSPACE-02) and rejects reparse points.
+    pub(crate) fn probe_exists(&self, name: &OsStr) -> bool {
+        #[cfg(unix)]
+        {
+            let Ok(cname) = to_cstring(name) else {
+                return false;
+            };
+            let mut stat: libc::stat = unsafe { std::mem::zeroed() };
+            // SAFETY: `cname` is NUL-terminated; `stat` is the out-param;
+            // AT_SYMLINK_NOFOLLOW answers the name itself, no follow.
+            unsafe {
+                libc::fstatat(
+                    self.fd.as_raw_fd(),
+                    cname.as_ptr(),
+                    &mut stat,
+                    libc::AT_SYMLINK_NOFOLLOW,
+                ) == 0
+                    && (libc::S_ISREG(stat.st_mode) || libc::S_ISDIR(stat.st_mode))
+            }
+        }
+        #[cfg(windows)]
+        {
+            let handle = nt_open_relative(
+                self.handle.as_raw_handle(),
+                name,
+                GENERIC_READ | SYNCHRONIZE,
+                FILE_OPEN,
+                FILE_OPEN_REPARSE_POINT,
+            );
+            let Ok(handle) = handle else {
+                return false;
+            };
+            // SAFETY: `handle` is a fresh kernel handle with no other owner.
+            let file = unsafe { std::fs::File::from_raw_handle(handle) };
+            check_not_reparse(file.as_raw_handle(), &self.display.join(name)).is_ok()
+        }
+        #[cfg(not(any(unix, windows)))]
+        {
+            self.display.join(name).exists()
         }
     }
 
@@ -601,18 +666,27 @@ impl ConfinedDir {
         {
             let cname = to_cstring(name)?;
             // SAFETY: `cname` is NUL-terminated; O_NOFOLLOW refuses links.
+            // O_NONBLOCK keeps a planted FIFO from blocking the open; the
+            // staged target must be a regular file (PROCESS-01).
             let fd = unsafe {
                 libc::openat(
                     self.fd.as_raw_fd(),
                     cname.as_ptr(),
-                    libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+                    libc::O_RDONLY | libc::O_NONBLOCK | libc::O_NOFOLLOW | libc::O_CLOEXEC,
                 )
             };
             if fd < 0 {
                 return Err(io::Error::last_os_error());
             }
             // SAFETY: `fd` is a fresh descriptor with no other owner.
-            Ok(unsafe { std::fs::File::from_raw_fd(fd) })
+            let file = unsafe { std::fs::File::from_raw_fd(fd) };
+            if !file.metadata()?.is_file() {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "workspace staged target is not a regular file",
+                ));
+            }
+            Ok(file)
         }
         #[cfg(windows)]
         {
@@ -625,9 +699,11 @@ impl ConfinedDir {
                 FILE_NON_DIRECTORY_FILE | FILE_OPEN_REPARSE_POINT,
                 FILE_SHARE_READ,
             )?;
-            check_not_reparse(handle, &child_display)?;
+            // Own the handle before the tag check (WORKSPACE-02).
             // SAFETY: `handle` is a fresh kernel handle.
-            Ok(unsafe { std::fs::File::from_raw_handle(handle) })
+            let file = unsafe { std::fs::File::from_raw_handle(handle) };
+            check_not_reparse(file.as_raw_handle(), &child_display)?;
+            Ok(file)
         }
         #[cfg(not(any(unix, windows)))]
         {
@@ -766,9 +842,11 @@ impl ConfinedDir {
                 FILE_OPEN_IF,
                 FILE_NON_DIRECTORY_FILE | FILE_OPEN_REPARSE_POINT,
             )?;
-            check_not_reparse(handle, &self.display.join(name))?;
+            // Own the handle before the tag check (WORKSPACE-02).
             // SAFETY: `handle` is a fresh kernel handle with no other owner.
-            Ok(unsafe { std::fs::File::from_raw_handle(handle) })
+            let file = unsafe { std::fs::File::from_raw_handle(handle) };
+            check_not_reparse(file.as_raw_handle(), &self.display.join(name))?;
+            Ok(file)
         }
         #[cfg(not(any(unix, windows)))]
         {
@@ -1036,9 +1114,11 @@ fn open_root_handle(path: &Path) -> io::Result<std::os::windows::io::OwnedHandle
     if handle == INVALID_HANDLE_VALUE {
         return Err(io::Error::last_os_error());
     }
-    check_not_reparse(handle, path)?;
+    // Own the handle before the tag check (WORKSPACE-02).
     // SAFETY: `handle` is a fresh kernel handle with no other owner.
-    Ok(unsafe { std::os::windows::io::OwnedHandle::from_raw_handle(handle) })
+    let owned = unsafe { std::os::windows::io::OwnedHandle::from_raw_handle(handle) };
+    check_not_reparse(owned.as_raw_handle(), path)?;
+    Ok(owned)
 }
 
 /// Relative open through a parent directory handle. `FILE_OPEN_REPARSE_POINT`

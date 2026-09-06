@@ -58,7 +58,9 @@ impl Workspace {
             if found.len() >= RUNTIME_FACTS_MAX_MARKERS {
                 break;
             }
-            if root.open_existing(OsStr::new(name)).is_ok() {
+            // Metadata-only probe: never opens the entry, so a planted
+            // FIFO with no writer cannot block the root scan (PROCESS-01).
+            if root.probe_exists(OsStr::new(name)) {
                 let marker = bound_marker(name);
                 if !marker.is_empty() {
                     found.push(marker);
@@ -197,6 +199,7 @@ fn macos_product() -> String {
 
 #[cfg(test)]
 mod tests {
+
     use super::*;
 
     #[test]
@@ -254,5 +257,40 @@ mod tests {
                 .render()
                 .contains(dir.path().to_string_lossy().as_ref())
         );
+    }
+
+    /// PROCESS-01: a FIFO planted at a marker name must not block the
+    /// root scan. The probe runs on a thread with a watchdog; a regression
+    /// fails the test instead of hanging the suite.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn project_markers_do_not_block_on_a_writerless_fifo() {
+        use libc;
+        let dir = tempfile::tempdir().unwrap();
+        // Plant the FIFO under a real marker name so the scan must probe it.
+        let fifo = dir.path().join("Cargo.toml");
+        let path = fifo.as_os_str().as_encoded_bytes().to_vec();
+        let rc = unsafe { libc::mkfifo(path.as_ptr() as *const libc::c_char, 0o600) };
+        assert_eq!(rc, 0, "mkfifo fixture");
+        std::fs::write(
+            dir.path().join("README.md"),
+            "x
+",
+        )
+        .unwrap();
+        let workspace = Workspace::open(dir.path()).await.unwrap();
+
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let markers = workspace.project_markers();
+            let _ = tx.send(markers);
+        });
+        let markers = rx
+            .recv_timeout(std::time::Duration::from_secs(10))
+            .expect("the marker scan must not block on a writerless FIFO");
+        // The FIFO answers the probe as a file, so it counts; the point is
+        // that the scan returned at all.
+        assert!(markers.contains(&"Cargo.toml".to_string()));
+        assert!(markers.contains(&"README.md".to_string()));
     }
 }
