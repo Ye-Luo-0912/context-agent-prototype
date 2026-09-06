@@ -117,7 +117,11 @@ impl Indexes {
             if let Some(bucket) = self.entity_index.get_mut(entity)
                 && let Some(pos) = bucket.iter().position(|entry| *entry == id)
             {
-                bucket.swap_remove(pos);
+                // Order-preserving removal: entity buckets are consumed
+                // newest-first by dependency ingest, so swap_remove would
+                // move the last slot into the middle and corrupt the
+                // creation ordering the scan relies on.
+                bucket.remove(pos);
             }
         }
         for entity in new_entities {

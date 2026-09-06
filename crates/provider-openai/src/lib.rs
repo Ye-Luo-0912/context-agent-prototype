@@ -166,6 +166,57 @@ fn responses_endpoint_unsupported(code: u16, body: &str) -> bool {
         || body.contains("responses api is not supported")
 }
 
+/// Read at most `MAX_ERROR_BODY_BYTES` of a non-2xx body before any text
+/// decoding, with a per-chunk deadline. An oversized or indefinitely
+/// streaming error body is truncated and marked instead of exhausting
+/// memory or hanging the turn (PROVIDER-01).
+async fn bounded_error_body(response: reqwest::Response, read_timeout: Duration) -> String {
+    use futures_util::StreamExt as _;
+    const MAX_ERROR_BODY_BYTES: usize = 8 * 1024;
+    let mut stream = response.bytes_stream();
+    let mut body: Vec<u8> = Vec::new();
+    loop {
+        match tokio::time::timeout(read_timeout, stream.next()).await {
+            Err(_) => {
+                body.extend_from_slice(
+                    b"
+[... error body truncated: stalled]",
+                );
+                break;
+            }
+            Ok(None) => break,
+            Ok(Some(Err(_))) => {
+                body.extend_from_slice(
+                    b"
+[... error body truncated: read failed]",
+                );
+                break;
+            }
+            Ok(Some(Ok(chunk))) => {
+                if body.len() + chunk.len() > MAX_ERROR_BODY_BYTES {
+                    let remaining = MAX_ERROR_BODY_BYTES.saturating_sub(body.len());
+                    body.extend_from_slice(&chunk[..remaining]);
+                    body.extend_from_slice(
+                        b"
+[... error body truncated: oversized]",
+                    );
+                    break;
+                }
+                body.extend_from_slice(&chunk);
+                if body.len() >= MAX_ERROR_BODY_BYTES {
+                    body.truncate(MAX_ERROR_BODY_BYTES);
+                    body.extend_from_slice(
+                        b"
+[... error body truncated: oversized]",
+                    );
+                    break;
+                }
+            }
+        }
+    }
+    String::from_utf8_lossy(&body).into_owned()
+}
+
 fn truncate_error_body(body: &str) -> String {
     let trimmed = body.trim();
     let total = trimmed.chars().count();
@@ -384,7 +435,7 @@ impl OpenAiProvider {
             let code = status.as_u16();
             let retry_after =
                 parse_retry_after(response.headers().get(RETRY_AFTER), SystemTime::now());
-            let body = response.text().await.unwrap_or_default();
+            let body = bounded_error_body(response, self.config.timeout).await;
             return Err(ProtocolError::http_transport(
                 http_status_retryable(code, &body),
                 retry_after,
@@ -503,6 +554,15 @@ impl OpenAiProvider {
             }
         }
 
+        // finish_reason = length means the model hit its output cap: the
+        // accumulated text is a truncated prefix, not a complete answer
+        // (PROVIDER-02).
+        if accumulator.take_output_limit() {
+            return Err(ProtocolError::from(AgentError::ModelOutputLimit {
+                reason: "Chat Completions stream ended with finish_reason=length;                          the model output was truncated"
+                    .into(),
+            }));
+        }
         if let Some(message) = accumulator.take_terminal_error() {
             return Err(ProtocolError::transport(true, message));
         }
@@ -548,7 +608,7 @@ impl OpenAiProvider {
             let code = status.as_u16();
             let retry_after =
                 parse_retry_after(response.headers().get(RETRY_AFTER), SystemTime::now());
-            let body = response.text().await.unwrap_or_default();
+            let body = bounded_error_body(response, self.config.timeout).await;
             if responses_endpoint_unsupported(code, &body) {
                 return Err(ProtocolError::unsupported(code, &body));
             }
@@ -630,9 +690,20 @@ impl OpenAiProvider {
                         None => {
                             // Stream closed without a trailing blank line;
                             // flush a residual event per the SSE spec.
-                            if let Some(event) = framer.finish() && event.data != "[DONE]" {
-                                let event = parse_responses_event(&event.data)
+                            if let Some(frame) = framer.finish()
+                                && frame.data != "[DONE]"
+                            {
+                                let event = parse_responses_event(&frame.data)
                                     .map_err(ProtocolError::from)?;
+                                // The EOF-flushed residual frame goes
+                                // through the same event/data routing
+                                // consistency check as every blank-line
+                                // terminated frame (PROVIDER-03).
+                                crate::sse::validate_sse_event_routing(
+                                    frame.event.as_deref(),
+                                    &event,
+                                )
+                                .map_err(ProtocolError::from)?;
                                 for chunk in accumulator.apply(&event).map_err(ProtocolError::from)? {
                                     sink.on_chunk(codec.remap_chunk(chunk)).await.map_err(ProtocolError::from)?;
                                 }
@@ -1102,6 +1173,122 @@ mod tests {
             socket.write_all(response.as_bytes()).await.unwrap();
         });
         addr
+    }
+
+    /// PROVIDER-01: a non-2xx error body larger than the read cap (or one
+    /// that stalls forever) must be truncated and marked, not read
+    /// unbounded. The regression would previously hang until the peer
+    /// closed (or exhaust memory), so the whole test is watchdogged.
+    #[tokio::test]
+    async fn non_2xx_error_bodies_are_read_with_a_bound() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut buf = [0u8; 16 * 1024];
+            let _ = socket.read(&mut buf).await;
+            // Declare a huge body, write past the 8 KiB cap, then hold the
+            // connection open: the client must return truncated instead of
+            // reading everything.
+            let head = "HTTP/1.1 500 Internal Server Error
+Content-Length: 1048576
+Connection: close
+
+"
+            .to_string();
+            socket.write_all(head.as_bytes()).await.unwrap();
+            let chunk = vec![b'x'; 4096];
+            for _ in 0..4 {
+                let _ = socket.write_all(&chunk).await;
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+            loop {
+                tokio::time::sleep(Duration::from_secs(3600)).await;
+            }
+        });
+
+        let provider = OpenAiProvider::with_client(
+            dummy_config(format!("http://{addr}/v1")),
+            Client::builder().no_proxy().build().unwrap(),
+        );
+        let sink = RecordingSink::default();
+        let started = std::time::Instant::now();
+        let result = tokio::time::timeout(
+            Duration::from_secs(4),
+            provider.complete_stream(fs_list_request(), &sink),
+        )
+        .await
+        .expect("the bounded error-body read must return (watchdog tripped)");
+        let elapsed = started.elapsed();
+        let error = result.unwrap_err();
+        let text = error.to_string();
+        // The body was read to its 8 KiB cap and stopped: the display
+        // truncation must name the unbounded total, and the whole call
+        // must have returned long before a full 1 MiB read would finish.
+        assert!(
+            text.contains("8230 chars total"),
+            "the truncation must be explicit about the unbounded total: {text}"
+        );
+        assert!(
+            elapsed < Duration::from_secs(4),
+            "the error body read must be bounded: {elapsed:?}"
+        );
+    }
+
+    /// PROVIDER-02: `finish_reason = length` means the model hit its
+    /// output cap; the accumulated text is a truncated prefix and must
+    /// surface as an output-limit failure instead of a normal completion.
+    #[tokio::test]
+    async fn chat_length_finish_reason_maps_to_output_limit() {
+        let addr = serve_sse_once(concat!(
+            "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"trun\"},\"finish_reason\":\"length\"}]}
+
+",
+            "data: [DONE]
+
+",
+        ))
+        .await;
+        let provider = OpenAiProvider::with_client(
+            dummy_config(format!("http://{addr}/v1")),
+            Client::builder().no_proxy().build().unwrap(),
+        );
+        let sink = RecordingSink::default();
+        let error = provider
+            .complete_stream(fs_list_request(), &sink)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(&error, AgentError::ModelOutputLimit { .. }),
+            "length must map to an output-limit failure: {error}"
+        );
+    }
+
+    /// PROVIDER-03: an EOF-flushed residual frame goes through the same
+    /// event/data routing consistency check as a blank-line terminated
+    /// frame — a contradicting `event:` name must fail closed.
+    #[tokio::test]
+    async fn responses_residual_eof_frame_passes_the_routing_check() {
+        // No trailing blank line: the delta frame is flushed by
+        // framer.finish() when the stream closes.
+        let sse = concat!(
+            "event: response.completed\r\n",
+            "data: {\"type\":\"response.output_text.delta\",\"output_index\":0,\"delta\":\"x\"}",
+        );
+        let addr = serve_sse_once(sse).await;
+        let mut config = dummy_config(format!("http://{addr}/v1"));
+        config.protocol = OpenAiProtocol::Responses;
+        let provider =
+            OpenAiProvider::with_client(config, Client::builder().no_proxy().build().unwrap());
+        let sink = RecordingSink::default();
+        let error = provider
+            .complete_stream(fs_list_request(), &sink)
+            .await
+            .unwrap_err();
+        assert!(
+            error.to_string().contains("contradicts the payload type"),
+            "the residual frame must fail the routing check: {error}"
+        );
     }
 
     #[tokio::test]

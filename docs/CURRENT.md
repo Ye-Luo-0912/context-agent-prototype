@@ -22,10 +22,10 @@
 | 3 | PROCESS-02 | reap 未确认退出不清 pid | 开放 |
 | 4 | WORKSPACE-01 | 普通 confined open 不阻塞 FIFO | 开放 |
 | 5 | WORKSPACE-02 | Windows 拒绝路径立即接管 HANDLE | 开放 |
-| 6 | PROVIDER-01 | 非 2xx 错误 body 有界读取 | 开放 |
-| 7 | PROVIDER-02 | Chat `length` 终止不丢成正常完成 | 开放 |
-| 8 | PROVIDER-03 | Responses EOF 尾帧与正常帧同一套校验 | 开放 |
-| 9 | CONTEXT-01 | 依赖候选按 newest-first，不先截旧前缀 | 开放 |
+| 6 | PROVIDER-01 | 非 2xx 错误 body 有界读取 | 已关闭（2026-09-06） |
+| 7 | PROVIDER-02 | Chat `length` 终止不丢成正常完成 | 已关闭（2026-09-06） |
+| 8 | PROVIDER-03 | Responses EOF 尾帧与正常帧同一套校验 | 已关闭（2026-09-06） |
+| 9 | CONTEXT-01 | 依赖候选按 newest-first，不先截旧前缀 | 已关闭（2026-09-06） |
 | 10 | PACKAGE-01 | 构建输出与打包复制源绑定 | 下次实际发布时 |
 | 11 | MCP-01 | 写/连接/读都可取消 | 仅默认产品启用 MCP 时 |
 

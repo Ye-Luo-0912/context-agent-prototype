@@ -240,6 +240,11 @@ pub struct StreamAccumulator {
     pub usage: Option<ModelUsage>,
     terminal_error: Option<String>,
     sealed: bool,
+    /// The stream terminated with `finish_reason = length`: the model hit
+    /// its output cap. The accumulated text is a truncated prefix, not a
+    /// complete answer, and must surface as an output-limit failure
+    /// instead of parsing as a normal completion (PROCESS-02).
+    output_limit: bool,
 }
 
 impl StreamAccumulator {
@@ -371,6 +376,13 @@ impl StreamAccumulator {
                 .any(|choice| choice.finish_reason.is_some())
         {
             self.sealed = true;
+            if chunk
+                .choices
+                .iter()
+                .any(|choice| choice.finish_reason.as_deref() == Some("length"))
+            {
+                self.output_limit = true;
+            }
         }
 
         Ok(events)
@@ -378,6 +390,13 @@ impl StreamAccumulator {
 
     pub fn take_terminal_error(&mut self) -> Option<String> {
         self.terminal_error.take()
+    }
+
+    /// True when the stream terminated with `finish_reason = length`; the
+    /// caller must map this to an output-limit failure rather than
+    /// replaying the truncated accumulation as a normal completion.
+    pub fn take_output_limit(&mut self) -> bool {
+        std::mem::take(&mut self.output_limit)
     }
 
     /// Finalize into `(content, tool_calls)` and fail closed when a streamed
@@ -743,5 +762,17 @@ mod tests {
                 .contains("is bound to index 0 and index 1"),
             "{error}"
         );
+    }
+
+    #[test]
+    fn chat_length_finish_reason_arms_the_output_limit_flag() {
+        let mut acc = StreamAccumulator::default();
+        let chunk =
+            parse_wire_chunk(r#"{"choices":[{"index":0,"delta":{},"finish_reason":"length"}]}"#)
+                .unwrap()
+                .unwrap();
+        acc.apply(&chunk).unwrap();
+        assert!(acc.take_output_limit());
+        assert!(!acc.take_output_limit(), "the flag is take-once");
     }
 }

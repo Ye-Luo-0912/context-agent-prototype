@@ -30,7 +30,12 @@ pub(crate) fn push_linked(
             let mut candidates: Vec<ContextItemId> = Vec::new();
             for entity in &entities {
                 let mut added = 0usize;
-                for id in state.items.indexes().ids_for_entity(entity) {
+                // The bucket is slot-ordered (creation order); scan it
+                // NEWEST first so the per-entity candidate budget is spent
+                // on the freshest priors. Taking the head would cap to the
+                // OLDEST 64 whenever a bucket outgrows the budget
+                // (PROCESS-01/CONTEXT-01 newest-first contract).
+                for id in state.items.indexes().ids_for_entity(entity).iter().rev() {
                     if seen.insert(*id) {
                         candidates.push(*id);
                         added += 1;
@@ -75,6 +80,82 @@ mod tests {
     use crate::engine::SimpleContextEngine;
     use agent_contracts::{ContextEngine, ContextIngress, ContextKind, ToolOutput};
     use serde_json::json;
+
+    /// CONTEXT-01: when one entity bucket outgrows the per-entity scan
+    /// budget, the budget must be spent on the NEWEST priors. The old
+    /// head-truncation linked the freshest item to the oldest 64 instead.
+    #[tokio::test]
+    async fn dependency_candidates_are_newest_first_when_a_bucket_outgrows_the_budget() {
+        let engine = SimpleContextEngine::new(SimpleContextConfig::default());
+        engine
+            .ingest(ContextIngress::UserMessage {
+                content: "work on AuthService.rs".into(),
+            })
+            .await
+            .unwrap();
+        let mut ids = Vec::new();
+        // 70 observations touching the same path: the bucket for
+        // "AuthService.rs" outgrows the 64-candidate budget.
+        for i in 0..70 {
+            engine
+                .ingest(ContextIngress::ToolObservation {
+                    facts: None,
+                    output: ToolOutput {
+                        call_id: format!("call-{i}"),
+                        tool_name: "fs.read".into(),
+                        ok: true,
+                        summary: "ok".into(),
+                        model_content: format!("reading AuthService.rs pass {i}"),
+                        artifact_ref: None,
+                        metadata: json!({"path": "AuthService.rs"}),
+                    },
+                    scope_id: None,
+                })
+                .await
+                .unwrap();
+            let summaries = engine.inspect(usize::MAX).await.unwrap();
+            // Inspect is slot-ordered (creation order); the new
+            // observation is the last ToolObservation not yet tracked.
+            ids.push(
+                summaries
+                    .iter()
+                    .filter(|item| item.kind == ContextKind::ToolObservation)
+                    .map(|item| item.id)
+                    .find(|id| !ids.contains(id))
+                    .expect("the new observation item"),
+            );
+        }
+
+        // The 71st item links to the 8 NEWEST priors (items 62..=69), not
+        // to the oldest head of the bucket.
+        engine
+            .ingest(ContextIngress::ToolObservation {
+                facts: None,
+                output: ToolOutput {
+                    call_id: "call-latest".into(),
+                    tool_name: "fs.read".into(),
+                    ok: true,
+                    summary: "ok".into(),
+                    model_content: "reading AuthService.rs final pass".into(),
+                    artifact_ref: None,
+                    metadata: json!({"path": "AuthService.rs"}),
+                },
+                scope_id: None,
+            })
+            .await
+            .unwrap();
+        let summaries = engine.inspect(usize::MAX).await.unwrap();
+        let latest = summaries
+            .iter()
+            .rfind(|item| item.kind == ContextKind::ToolObservation)
+            .expect("the latest observation");
+        let expected: std::collections::HashSet<_> = ids[62..70].iter().copied().collect();
+        let linked: std::collections::HashSet<_> = latest.dependencies.iter().copied().collect();
+        assert_eq!(
+            linked, expected,
+            "the 8 edges must go to the newest priors: {linked:?} vs {expected:?}"
+        );
+    }
 
     #[tokio::test]
     async fn ingest_links_items_sharing_entities() {

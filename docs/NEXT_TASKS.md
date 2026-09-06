@@ -23,10 +23,10 @@
 | 3 | PROCESS-02 | reap 未确认退出不清 pid | 开放 |
 | 4 | WORKSPACE-01 | 普通 open 不阻塞 FIFO | 开放 |
 | 5 | WORKSPACE-02 | Windows 拒绝路径立即接管 HANDLE | 开放 |
-| 6 | PROVIDER-01 | 错误 HTTP body 有界读取 | 开放 |
-| 7 | PROVIDER-02 | Chat `length` 终止语义 | 开放 |
-| 8 | PROVIDER-03 | Responses EOF 尾帧校验 | 开放 |
-| 9 | CONTEXT-01 | 依赖候选 newest-first | 开放 |
+| 6 | ~~PROVIDER-01~~ | 错误 HTTP body 有界读取 | 已关闭（2026-09-06） |
+| 7 | ~~PROVIDER-02~~ | Chat `length` 终止语义 | 已关闭（2026-09-06） |
+| 8 | ~~PROVIDER-03~~ | Responses EOF 尾帧校验 | 已关闭（2026-09-06） |
+| 9 | ~~CONTEXT-01~~ | 依赖候选 newest-first | 已关闭（2026-09-06） |
 | 10 | PACKAGE-01 | 打包来源绑定 | 下次实际发布 |
 | 11 | MCP-01 | MCP 写/连接/读可取消 | 仅默认启用 MCP 时 |
 | 12 | M16-02 剩余 | 待审阅 ≠ 持久完成 | 审查剩余之后 |
