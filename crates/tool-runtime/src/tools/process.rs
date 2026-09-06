@@ -2250,6 +2250,7 @@ mod tests {
 
         // --- Experiment A: a plain std Command with the same hook. ---
         let std_probe = {
+            use std::os::unix::process::CommandExt as _;
             use std::process::Command as StdCommand;
             let mut command = StdCommand::new(std::env::current_exe().unwrap());
             command
