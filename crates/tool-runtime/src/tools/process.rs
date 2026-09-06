@@ -1316,16 +1316,21 @@ pub(crate) mod host_death_job {
 pub(crate) fn apply_parent_death_signal(command: &mut Command) {
     let marker = std::env::var("PDEATHSIG_PROBE_MARKER").ok();
     let host_pid = std::process::id() as libc::pid_t;
-    command.pre_exec(move || {
-        let set_rc = libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL);
-        if let Some(marker) = &marker {
-            let _ = std::fs::write(marker, format!("set_rc={set_rc}"));
-        }
-        if set_rc == 0 && libc::getppid() != host_pid {
-            libc::kill(libc::getpid(), libc::SIGKILL);
-        }
-        Ok(())
-    });
+    // SAFETY: `pre_exec` runs the closure in the forked child before exec;
+    // `prctl` there registers the parent-death signal and the getppid
+    // check kills the child if the host already died before the hook.
+    unsafe {
+        command.pre_exec(move || {
+            let set_rc = libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL);
+            if let Some(marker) = &marker {
+                let _ = std::fs::write(marker, format!("set_rc={set_rc}"));
+            }
+            if set_rc == 0 && libc::getppid() != host_pid {
+                libc::kill(libc::getpid(), libc::SIGKILL);
+            }
+            Ok(())
+        });
+    }
 }
 
 #[cfg(test)]
@@ -2288,7 +2293,9 @@ mod tests {
             "--nocapture",
         ]);
         command.env("PDEATHSIG_PROBE_CHILD", "1");
-        let marker_path = dir.path().join("pdeathsig-probe-marker");
+        let marker_path =
+            std::env::temp_dir().join(format!("pdeathsig-marker-{}", std::process::id()));
+        let _ = std::fs::remove_file(&marker_path);
         command.env("PDEATHSIG_PROBE_HOST", std::process::id().to_string());
         command.env("PDEATHSIG_PROBE_MARKER", marker_path.display().to_string());
         apply_parent_death_signal(&mut command);
