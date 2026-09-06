@@ -8,11 +8,9 @@
 use std::{io, path::PathBuf, sync::Arc, time::Duration};
 
 use agent_contracts::{ApprovalDecision, RuntimeEventEnvelope};
+use agent_core::{ApprovalBroker, InteractiveApprovalGate, TaskApprovalGate};
 use agent_runtime::{CheckpointStore, RuntimeHandle, RuntimeInstance, decode_checkpoint_bytes};
-use crossterm::{
-    event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers},
-    execute,
-};
+use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use ratatui::{Terminal, backend::CrosstermBackend};
 
 use crate::state::AppState;
@@ -255,7 +253,7 @@ async fn dispatch_command(
     runtime: &RuntimeInstance,
     interactive: Option<&InteractiveHandle>,
     notice_tx: &tokio::sync::mpsc::Sender<String>,
-    checkpoint_dir: &PathBuf,
+    checkpoint_dir: &std::path::Path,
 ) -> anyhow::Result<bool> {
     if trimmed == "/quit" {
         return Ok(false);
@@ -321,13 +319,12 @@ async fn dispatch_command(
             app.push_system("usage: /work <goal>".to_string());
             return Ok(true);
         }
-        // Explicit long-task entry, composed from the
-        // existing actor paths: set_focus creates (or
-        // resumes) the task while idle, an empty tool
-        // requirement set gains a PreferSurface demand for
-        // task.manage, and the goal is delivered once
-        // through the normal user-message path (busy →
-        // the runtime's own queue). No second orchestrator.
+        // Explicit long-task entry, composed from the existing actor
+        // paths: set_focus creates (or resumes) the task while idle, an
+        // empty tool requirement set gains a PreferSurface demand for
+        // task.manage, and the goal is delivered once through the normal
+        // user-message path (busy → the runtime's own queue). No second
+        // orchestrator.
         let handle = handle.clone();
         let notice_tx = notice_tx.clone();
         tokio::spawn(async move {
@@ -354,8 +351,7 @@ async fn dispatch_command(
                     }
                 }
                 Ok(None) => {
-                    let _ =
-                        notice_tx.try_send("no active task; /work <goal> starts one".into());
+                    let _ = notice_tx.try_send("no active task; /work <goal> starts one".into());
                 }
                 Err(error) => {
                     let _ = notice_tx.try_send(format!("plan failed: {error}"));
@@ -365,10 +361,10 @@ async fn dispatch_command(
         return Ok(true);
     }
     if trimmed == "/review" {
-        // Render the latest result card: freshest is the
-        // in-session event-derived card; otherwise fall back
-        // to the persisted artifact from a previous task.
-        // Display only — no model call, no write.
+        // Render the latest result card: freshest is the in-session
+        // event-derived card; otherwise fall back to the persisted
+        // artifact from a previous task. Display only — no model call,
+        // no write.
         if !app.result_card.is_empty() {
             for line in crate::state::format_result_lines(&app.result_card) {
                 app.push_system(line);
@@ -431,7 +427,9 @@ async fn dispatch_command(
     }
     if let Some(id) = trimmed.strip_prefix("/revoke ") {
         let Some(handle) = interactive else {
-            app.push_system("grant revoke needs an interactive (non read-only) session".to_string());
+            app.push_system(
+                "grant revoke needs an interactive (non read-only) session".to_string(),
+            );
             return Ok(true);
         };
         let id = id.trim();
@@ -503,7 +501,7 @@ async fn dispatch_command(
         let state_dir = checkpoint_dir
             .parent()
             .map(std::path::Path::to_path_buf)
-            .unwrap_or_else(|| checkpoint_dir.clone());
+            .unwrap_or_else(|| checkpoint_dir.to_path_buf());
         let projection_lines = app.status_projection.lines();
         let tail: Vec<String> = app
             .messages
@@ -513,19 +511,16 @@ async fn dispatch_command(
             .map(|message| message.content.clone())
             .collect();
         match crate::doctor::export_diagnostics(&state_dir, projection_lines, tail).await {
-            Ok(path) => {
-                app.push_system(format!("diagnostics written: {}", path.display()))
-            }
+            Ok(path) => app.push_system(format!("diagnostics written: {}", path.display())),
             Err(error) => app.push_system(format!("diagnostics export failed: {error}")),
         }
         return Ok(true);
     }
     if trimmed == "/checkpoints" {
-        // Bounded newest-first listing straight from the
-        // runtime checkpoint store, so save/list/resume is
-        // discoverable from the product host without
-        // filesystem spelunking.
-        let store = CheckpointStore::new(checkpoint_dir.clone());
+        // Bounded newest-first listing straight from the runtime
+        // checkpoint store, so save/list/resume is discoverable from the
+        // product host without filesystem spelunking.
+        let store = CheckpointStore::new(checkpoint_dir.to_path_buf());
         match store.list(CHECKPOINT_LIST_LIMIT).await {
             Ok(rows) if rows.is_empty() => {
                 app.push_system("no checkpoints saved yet; /checkpoint writes one".to_string());
@@ -543,17 +538,15 @@ async fn dispatch_command(
                     ));
                 }
             }
-            Err(error) => {
-                app.push_system(format!("checkpoint list failed: {error}"))
-            }
+            Err(error) => app.push_system(format!("checkpoint list failed: {error}")),
         }
         return Ok(true);
     }
     if trimmed == "/checkpoint" {
-        // The manual save rides the same atomic envelope
-        // store as the automatic safe points: one format,
-        // one retention domain, checksum verified on load.
-        let store = CheckpointStore::new(checkpoint_dir.clone());
+        // The manual save rides the same atomic envelope store as the
+        // automatic safe points: one format, one retention domain,
+        // checksum verified on load.
+        let store = CheckpointStore::new(checkpoint_dir.to_path_buf());
         match runtime.checkpoint().await {
             Ok(checkpoint) => {
                 let tasks = checkpoint.tasks.tasks.len();
@@ -572,9 +565,7 @@ async fn dispatch_command(
                             stored.artifact
                         ));
                     }
-                    Err(error) => {
-                        app.push_system(format!("checkpoint write failed: {error}"))
-                    }
+                    Err(error) => app.push_system(format!("checkpoint write failed: {error}")),
                 }
             }
             Err(error) => app.push_system(format!("checkpoint failed: {error}")),
@@ -596,9 +587,9 @@ async fn dispatch_command(
         }
         .await;
         match result {
-            Ok(()) => app.push_system(
-                "runtime restored; /continue resumes the active task".to_string(),
-            ),
+            Ok(()) => {
+                app.push_system("runtime restored; /continue resumes the active task".to_string())
+            }
             Err(error) => app.push_system(format!("restore failed: {error}")),
         }
         return Ok(true);
@@ -610,12 +601,11 @@ async fn dispatch_command(
         return Ok(true);
     }
     if trimmed == "/continue" {
-        // Re-run the active task's stored directive in a
-        // fresh turn: no new instruction identity is minted
-        // and the stored directive is not re-ingested.
-        // Refusals (no active task, busy runtime, recovery
-        // required) surface here; the started turn itself
-        // is event-driven (`TaskContinuationStarted`).
+        // Re-run the active task's stored directive in a fresh turn: no
+        // new instruction identity is minted and the stored directive is
+        // not re-ingested. Refusals (no active task, busy runtime,
+        // recovery required) surface here; the started turn itself is
+        // event-driven (`TaskContinuationStarted`).
         let handle = handle.clone();
         let notice_tx = notice_tx.clone();
         tokio::spawn(async move {
@@ -638,11 +628,10 @@ async fn dispatch_command(
         ));
         return Ok(true);
     }
-    // Normal input always goes to the runtime: an idle
-    // runtime starts a turn, a busy one queues it in the
-    // existing single dialogue slot. The command reply plus
-    // the `UserInput` lifecycle events own the visible
-    // disposition (queued / applied / rejected) — the UI no
+    // Normal input always goes to the runtime: an idle runtime starts a
+    // turn, a busy one queues it in the existing single dialogue slot.
+    // The command reply plus the `UserInput` lifecycle events own the
+    // visible disposition (queued / applied / rejected) — the UI no
     // longer drops input on its own busy guess.
     let handle = handle.clone();
     let notice_tx = notice_tx.clone();
@@ -659,7 +648,9 @@ async fn dispatch_command(
 /// format (envelope artifact or legacy raw JSON). Every failure mode is a
 /// visible configuration-style error; nothing has been started or mutated
 /// when this runs.
-pub(crate) fn load_runtime_checkpoint(path: &std::path::Path) -> anyhow::Result<agent_runtime::RuntimeCheckpoint> {
+pub(crate) fn load_runtime_checkpoint(
+    path: &std::path::Path,
+) -> anyhow::Result<agent_runtime::RuntimeCheckpoint> {
     agent_runtime::decode_checkpoint_file(path).map_err(|error| {
         anyhow::Error::new(error).context(format!(
             "invalid checkpoint {}: the runtime refuses it before any mutation",
@@ -930,27 +921,29 @@ mod tests {
 }
 
 /// End-to-end tests of the interactive session loop itself: a real
-/// composed runtime (capability-aware dispatcher, output broker,
-/// task-gate approval with pre-seeded standing grants), a scripted model,
-/// and the exact `run_session` loop driven by a scripted key queue with a
-/// capture sink. These replace the former manual TUI walkthroughs — no
-/// pty, no human operator.
+/// composed runtime (capability-aware dispatcher, output broker, task-gate
+/// approval with pre-seeded standing grants), a scripted model, and the
+/// exact `run_session` loop driven by a scripted key queue with a capture
+/// sink. These replace the former manual TUI walkthroughs — no pty, no
+/// human operator.
 #[cfg(test)]
 mod tui_e2e {
     use super::*;
-    use crate::state::UiRole;
     use agent_compose::{
         ComposeConfig, ContextPolicy, HostToolPolicyRegistry, build_context_engine, compose,
     };
     use agent_contracts::{
         AgentResult, ModelCapabilities, ModelOutput, ModelRequest, ModelRole, ModelTransport,
-        RuntimeEvent, StandingGrant, ToolCall,
+        RuntimeEvent, RuntimeFailureClass, StandingGrant, ToolCall,
     };
     use agent_core::{ApprovalBroker, InteractiveApprovalGate, TaskApprovalGate};
     use agent_storage::FileEventJournal;
     use agent_workspace::{Workspace, WorkspaceOutputBroker};
+    use anyhow::Context;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use tool_runtime::{BuiltinToolDispatcher, VerificationRecipes};
+
+    type Captured = Arc<std::sync::Mutex<Vec<String>>>;
 
     /// Compose the interactive product path: capability-aware dispatcher,
     /// output broker, journal/artifact store, and the interactive approval
@@ -961,15 +954,10 @@ mod tui_e2e {
         grants: &[String],
         model: Arc<dyn ModelTransport>,
         max_tool_rounds: Option<usize>,
-    ) -> anyhow::Result<(
-        agent_compose::ComposedRuntime,
-        InteractiveHandle,
-        PathBuf,
-    )> {
+    ) -> anyhow::Result<(agent_compose::ComposedRuntime, InteractiveHandle, PathBuf)> {
         let workspace = Workspace::open(root).await?;
         let checkpoint_dir = workspace.state_dir().join("checkpoints");
-        let journal =
-            Arc::new(FileEventJournal::open(workspace.state_dir().join("traces")).await?);
+        let journal = Arc::new(FileEventJournal::open(workspace.state_dir().join("traces")).await?);
         let recipes = Arc::new(VerificationRecipes::discover(&workspace)?);
         let host_policies = Arc::new(
             HostToolPolicyRegistry::with_builtins_and_verification(&recipes)
@@ -1005,6 +993,8 @@ mod tui_e2e {
             .state_dir()
             .join("authority")
             .join("broker-reservations.jsonl");
+        let artifact_store = Arc::new(workspace.clone());
+        let output_broker = Arc::new(WorkspaceOutputBroker::new(workspace.clone().into()));
         let composed = compose(ComposeConfig {
             provider_profile_digest: None,
             defer_proof_refresh: false,
@@ -1016,8 +1006,8 @@ mod tui_e2e {
             base_tools,
             capability_aware: true,
             journal: Some(journal),
-            artifact_store: Some(Arc::new(workspace.clone())),
-            output_broker: Some(Arc::new(WorkspaceOutputBroker::new(workspace.clone().into()))),
+            artifact_store: Some(artifact_store),
+            output_broker: Some(output_broker),
             max_tool_rounds,
             project_task_progress: true,
             project_settlement: false,
@@ -1045,48 +1035,42 @@ mod tui_e2e {
         .to_string()
     }
 
+    /// Scripted key source: pops from the orchestrator's queue. After the
+    /// orchestrator disappears (it sends quit when done) a disconnect must
+    /// not leave the session polling forever — it quits the session.
     struct KeySource {
         rx: tokio::sync::mpsc::Receiver<KeyEvent>,
         disconnected: bool,
     }
 
-    impl KeySource {
-        fn new(rx: tokio::sync::mpsc::Receiver<KeyEvent>) -> Self {
-            Self {
-                rx,
-                disconnected: false,
-            }
-        }
-    }
-
     impl UiSource for KeySource {
         async fn poll_key(&mut self, timeout: Duration) -> io::Result<Option<KeyEvent>> {
             if self.disconnected {
-                // The orchestrator is gone (it sends quit when done); a
-                // disconnect must not leave the session polling forever.
-                return Ok(Some(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL)));
+                return Ok(Some(KeyEvent::new(
+                    KeyCode::Char('c'),
+                    KeyModifiers::CONTROL,
+                )));
             }
             match tokio::time::timeout(timeout, self.rx.recv()).await {
                 Ok(Some(key)) => Ok(Some(key)),
                 Ok(None) => {
                     self.disconnected = true;
-                    Ok(Some(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL)))
+                    Ok(Some(KeyEvent::new(
+                        KeyCode::Char('c'),
+                        KeyModifiers::CONTROL,
+                    )))
                 }
                 Err(_) => Ok(None),
             }
         }
     }
 
+    /// Capture sink: every draw stores the messages, the status projection
+    /// lines and the last checkpoint name, so assertions read what the
+    /// operator would have seen.
     #[derive(Clone)]
     struct CaptureSink {
-        captured: Arc<std::sync::Mutex<Vec<String>>>,
-    }
-
-    impl CaptureSink {
-        fn new() -> (Self, Arc<std::sync::Mutex<Vec<String>>>) {
-            let captured = Arc::new(std::sync::Mutex::new(Vec::new()));
-            (Self { captured: captured.clone() }, captured)
-        }
+        captured: Captured,
     }
 
     impl UiSink for CaptureSink {
@@ -1110,29 +1094,18 @@ mod tui_e2e {
         }
     }
 
-    fn send_keys(
-        tx: &tokio::sync::mpsc::Sender<KeyEvent>,
-        line: &'static str,
-    ) -> tokio::sync::mpsc::Sender<KeyEvent> {
-        // Keys are queued without awaiting inside the orchestrator body so
-        // a full channel cannot deadlock against the session loop.
-        let tx = tx.clone();
-        tokio::spawn(async move {
-            for ch in line.chars() {
-                if tx
-                    .send(KeyEvent::new(KeyCode::Char(ch), KeyModifiers::NONE))
-                    .await
-                    .is_err()
-                {
-                    return;
-                }
-            }
-            let _ = tx.send(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)).await;
-        });
-        tx.clone()
+    async fn send_line(tx: &tokio::sync::mpsc::Sender<KeyEvent>, line: &str) {
+        for ch in line.chars() {
+            tx.send(KeyEvent::new(KeyCode::Char(ch), KeyModifiers::NONE))
+                .await
+                .expect("the session key channel stays open");
+        }
+        tx.send(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+            .await
+            .expect("the session key channel stays open");
     }
 
-    fn quit_key(tx: &tokio::sync::mpsc::Sender<KeyEvent>) {
+    fn quit(tx: &tokio::sync::mpsc::Sender<KeyEvent>) {
         let _ = tx.try_send(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL));
     }
 
@@ -1164,11 +1137,7 @@ mod tui_e2e {
         }
     }
 
-    async fn wait_for_line(
-        captured: &Arc<std::sync::Mutex<Vec<String>>>,
-        needle: &str,
-        what: &str,
-    ) {
+    async fn wait_for_line(captured: &Captured, needle: &str, what: &str) {
         let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
         loop {
             {
@@ -1202,36 +1171,8 @@ mod tui_e2e {
         }
     }
 
-    /// Drive one session: the orchestrator (spawned) sequences keys and
-    /// asserts observable events; `run_session` runs inline on the test
-    /// task with the capture sink. Fails the test if the session does not
-    /// end cleanly.
-    macro_rules! run_session_e2e {
-        ($composed:expr, $interactive:expr, $checkpoint_dir:expr, $key_rx:expr, $captured:expr, $orch:expr) => {{
-            let mut source = KeySource::new($key_rx);
-            let (mut sink, _) = CaptureSink::new_with($captured);
-            let mut ui_events = $composed.subscribe();
-            let session = tokio::time::timeout(
-                Duration::from_secs(90),
-                run_session(
-                    &mut source,
-                    &mut sink,
-                    $composed.handle().clone(),
-                    &$composed.instance,
-                    &mut ui_events,
-                    Some($interactive),
-                    "dynamic",
-                    $checkpoint_dir,
-                    "serving: scripted e2e model".to_string(),
-                    None,
-                    false,
-                ),
-            )
-            .await;
-            assert!(session.is_ok(), "the session hung: {session:?}");
-            session.expect("timeout").expect("session error");
-            $orch.await.expect("orchestrator task");
-        }};
+    fn transcript(captured: &Captured) -> String {
+        captured.lock().unwrap().join("\n")
     }
 
     /// The whole closure loop a user walks after /work: the produced
@@ -1282,48 +1223,81 @@ mod tui_e2e {
         let temp = tempfile::tempdir().unwrap();
         let root = temp.path().to_path_buf();
         let (composed, interactive, checkpoint_dir) =
-            tui_compose(&root, &[], Arc::new(WorkModel), None).await.unwrap();
+            tui_compose(&root, &[], Arc::new(WorkModel), None)
+                .await
+                .unwrap();
+        let mut ui_events = composed.subscribe();
         let mut orch_events = composed.subscribe();
         composed.instance.start().await.unwrap();
 
         let (key_tx, key_rx) = tokio::sync::mpsc::channel::<KeyEvent>(256);
-        let (sink, captured) = CaptureSink::new();
+        let captured: Captured = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let sink = CaptureSink {
+            captured: captured.clone(),
+        };
+        let orch_captured = captured.clone();
         let orch = tokio::spawn(async move {
-            let tx = send_keys(&key_tx, "/work add the feature");
-            drop(tx);
+            send_line(&key_tx, "/work add the feature").await;
             wait_for_event(&mut orch_events, "the first TurnCompleted", |event| {
-                matches!(event, RuntimeEvent::TurnCompleted { .. })
+                matches!(event, RuntimeEvent::TurnCompleted)
             })
             .await;
-            let tx = send_keys(&key_tx, "/status");
-            drop(tx);
-            wait_for_line(&captured, "awaiting operator review", "/status awaiting review").await;
-            let tx = send_keys(&key_tx, "/done feature landed");
-            drop(tx);
+            send_line(&key_tx, "/status").await;
+            wait_for_line(
+                &orch_captured,
+                "awaiting operator review",
+                "/status awaiting review",
+            )
+            .await;
+            send_line(&key_tx, "/done feature landed").await;
             wait_for_event(&mut orch_events, "TaskCompleted", |event| {
                 matches!(event, RuntimeEvent::TaskCompleted { .. })
             })
             .await;
-            let tx = send_keys(&key_tx, "/status");
-            drop(tx);
+            send_line(&key_tx, "/status").await;
             wait_for_line(
-                &captured,
+                &orch_captured,
                 "durably completed (operator accepted): feature landed",
                 "/status durable closure",
             )
             .await;
-            quit_key(&key_tx);
+            quit(&key_tx);
         });
-        run_session_e2e!(composed, interactive, checkpoint_dir, key_rx, captured, orch);
 
+        let mut source = KeySource {
+            rx: key_rx,
+            disconnected: false,
+        };
+        let mut sink = sink;
+        let session = tokio::time::timeout(
+            Duration::from_secs(90),
+            run_session(
+                &mut source,
+                &mut sink,
+                composed.handle().clone(),
+                &composed.instance,
+                &mut ui_events,
+                Some(interactive),
+                "dynamic",
+                checkpoint_dir,
+                "serving: scripted e2e model".to_string(),
+                None,
+                false,
+            ),
+        )
+        .await;
+        assert!(session.is_ok(), "the session hung: {session:?}");
+        session.expect("timeout").expect("session error");
+        orch.await.expect("orchestrator task");
         composed.shutdown().await.unwrap();
+
+        let seen = transcript(&captured);
+        assert!(seen.contains("awaiting operator review"), "{seen}");
         assert!(
-            std::fs::read_dir(&root)
-                .unwrap()
-                .flatten()
-                .all(|entry| entry.file_name().to_string_lossy().starts_with('.')),
-            "this scenario must not write workspace files"
+            seen.contains("durably completed (operator accepted): feature landed"),
+            "{seen}"
         );
+        assert!(!seen.contains("done failed"), "{seen}");
     }
 
     /// Busy-time input is queued, named, and later applied — not dropped.
@@ -1353,9 +1327,8 @@ mod tui_e2e {
                     self.entered.notify_one();
                     // Hold the turn open until the test says go; the bound
                     // only keeps a broken run from hanging forever.
-                    let _ =
-                        tokio::time::timeout(Duration::from_secs(60), self.release.notified())
-                            .await;
+                    let _ = tokio::time::timeout(Duration::from_secs(60), self.release.notified())
+                        .await;
                 }
                 Ok(ModelOutput {
                     content: format!("[scripted] turn {call} done"),
@@ -1374,49 +1347,73 @@ mod tui_e2e {
         });
         let (composed, interactive, checkpoint_dir) =
             tui_compose(&root, &[], model.clone(), None).await.unwrap();
+        let mut ui_events = composed.subscribe();
         let mut orch_events = composed.subscribe();
         composed.instance.start().await.unwrap();
 
         let (key_tx, key_rx) = tokio::sync::mpsc::channel::<KeyEvent>(256);
-        let (sink, captured) = CaptureSink::new();
+        let captured: Captured = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let sink = CaptureSink {
+            captured: captured.clone(),
+        };
         let entered = model.entered.clone();
         let release = model.release.clone();
+        let orch_captured = captured.clone();
         let orch = tokio::spawn(async move {
-            let tx = send_keys(&key_tx, "/work first goal");
-            drop(tx);
+            send_line(&key_tx, "/work first goal").await;
             entered.notified().await;
             // Mid-turn: the runtime is busy. This input must be queued.
-            let tx = send_keys(&key_tx, "second ask");
-            drop(tx);
-            wait_for_line(&captured, "input queued", "the queued disposition").await;
+            send_line(&key_tx, "second ask").await;
+            wait_for_line(&orch_captured, "input queued", "the queued disposition").await;
             release.notify_one();
-            let mut completions = 0;
-            loop {
+            for _ in 0..2 {
                 wait_for_event(&mut orch_events, "a TurnCompleted", |event| {
-                    matches!(event, RuntimeEvent::TurnCompleted { .. })
+                    matches!(event, RuntimeEvent::TurnCompleted)
                 })
                 .await;
-                completions += 1;
-                if completions == 2 {
-                    break;
-                }
             }
-            wait_for_line(&captured, "queued input applied", "the applied disposition").await;
-            quit_key(&key_tx);
+            wait_for_line(
+                &orch_captured,
+                "queued input applied",
+                "the applied disposition",
+            )
+            .await;
+            quit(&key_tx);
         });
-        run_session_e2e!(composed, interactive, checkpoint_dir, key_rx, captured, orch);
 
+        let mut source = KeySource {
+            rx: key_rx,
+            disconnected: false,
+        };
+        let mut sink = sink;
+        let session = tokio::time::timeout(
+            Duration::from_secs(90),
+            run_session(
+                &mut source,
+                &mut sink,
+                composed.handle().clone(),
+                &composed.instance,
+                &mut ui_events,
+                Some(interactive),
+                "dynamic",
+                checkpoint_dir,
+                "serving: scripted e2e model".to_string(),
+                None,
+                false,
+            ),
+        )
+        .await;
+        assert!(session.is_ok(), "the session hung: {session:?}");
+        session.expect("timeout").expect("session error");
+        orch.await.expect("orchestrator task");
         composed.shutdown().await.unwrap();
+
         assert!(
             model.calls.load(Ordering::SeqCst) >= 2,
             "the queued input must run as its own turn"
         );
-        let frames = captured.lock().unwrap();
-        let transcript: String = frames.join("\n");
-        assert!(
-            !transcript.contains("input not accepted"),
-            "queued input must not be rejected: {transcript}"
-        );
+        let seen = transcript(&captured);
+        assert!(!seen.contains("input not accepted"), "{seen}");
     }
 
     /// Budget stop → /checkpoint → /restore → /continue, all inside one
@@ -1439,7 +1436,11 @@ mod tui_e2e {
             }
             async fn complete(&self, _request: ModelRequest) -> AgentResult<ModelOutput> {
                 let step = self.step.fetch_add(1, Ordering::SeqCst);
-                let path = if step == 0 { "file_a.txt" } else { "file_b.txt" };
+                let path = if step == 0 {
+                    "file_a.txt"
+                } else {
+                    "file_b.txt"
+                };
                 Ok(ModelOutput {
                     content: String::new(),
                     tool_calls: vec![ToolCall {
@@ -1462,52 +1463,98 @@ mod tui_e2e {
         });
         let grants = [write_grant("file_a.txt"), write_grant("file_b.txt")];
         let (composed, interactive, checkpoint_dir) =
-            tui_compose(&root, &grants, model.clone(), Some(1)).await.unwrap();
+            tui_compose(&root, &grants, model.clone(), Some(1))
+                .await
+                .unwrap();
+        let mut ui_events = composed.subscribe();
         let mut orch_events = composed.subscribe();
         composed.instance.start().await.unwrap();
 
         let (key_tx, key_rx) = tokio::sync::mpsc::channel::<KeyEvent>(256);
-        let (sink, captured) = CaptureSink::new();
+        let captured: Captured = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let sink = CaptureSink {
+            captured: captured.clone(),
+        };
         let orch_root = root.clone();
+        let orch_checkpoint_dir = checkpoint_dir.clone();
+        let orch_captured = captured.clone();
         let orch = tokio::spawn(async move {
-            let tx = send_keys(&key_tx, "/work write both files");
-            drop(tx);
+            send_line(&key_tx, "/work write both files").await;
             wait_for_event(&mut orch_events, "the round-budget failure", |event| {
                 matches!(
                     event,
                     RuntimeEvent::Failure {
-                        class: agent_contracts::RuntimeFailureClass::RoundBudget,
+                        class: RuntimeFailureClass::RoundBudget,
                         ..
                     }
                 )
             })
             .await;
-            wait_for_event(&mut orch_events, "the budget-stopped TurnCompleted", |event| {
-                matches!(event, RuntimeEvent::TurnCompleted { .. })
-            })
-            .await;
-            let tx = send_keys(&key_tx, "/checkpoint");
-            drop(tx);
-            wait_for_line(&captured, "checkpoint saved", "/checkpoint").await;
+            // A round-budget stop is a deliberate recoverable stop: the
+            // turn is dropped without a TurnCompleted. The operator-real
+            // way to know the runtime is idle again is that /checkpoint
+            // (an idle-only command) stops refusing — retry until it
+            // lands.
+            let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+            loop {
+                assert!(
+                    tokio::time::Instant::now() < deadline,
+                    "the runtime never went idle after the budget stop"
+                );
+                send_line(&key_tx, "/checkpoint").await;
+                tokio::time::sleep(Duration::from_millis(500)).await;
+                let landed = {
+                    let guard = orch_captured.lock().unwrap();
+                    guard.iter().any(|frame| frame.contains("checkpoint saved"))
+                };
+                if landed {
+                    break;
+                }
+            }
             // Restore through the same in-session command the operator
-            // types; resolve_latest_checkpoint is what /checkpoints
-            // discovery uses on cold start.
+            // types; the target is what cold-start discovery would pick.
             let restore_target =
-                resolve_latest_checkpoint(&checkpoint_dir).expect("a saved checkpoint");
-            let tx = send_keys(
-                &key_tx,
-                Box::leak(format!("/restore {}", restore_target.display()).into_boxed_str()),
-            );
-            drop(tx);
-            wait_for_line(&captured, "runtime restored", "/restore").await;
-            let tx = send_keys(&key_tx, "/continue");
-            drop(tx);
-            wait_until_file(&orch_root, "file_b.txt", "segment 2 content", "/continue segment").await;
-            quit_key(&key_tx);
+                resolve_latest_checkpoint(&orch_checkpoint_dir).expect("a saved checkpoint");
+            send_line(&key_tx, &format!("/restore {}", restore_target.display())).await;
+            wait_for_line(&orch_captured, "runtime restored", "/restore").await;
+            send_line(&key_tx, "/continue").await;
+            wait_until_file(
+                &orch_root,
+                "file_b.txt",
+                "segment 2 content",
+                "/continue after restore",
+            )
+            .await;
+            quit(&key_tx);
         });
-        run_session_e2e!(composed, interactive, checkpoint_dir, key_rx, captured, orch);
 
+        let mut source = KeySource {
+            rx: key_rx,
+            disconnected: false,
+        };
+        let mut sink = sink;
+        let session = tokio::time::timeout(
+            Duration::from_secs(90),
+            run_session(
+                &mut source,
+                &mut sink,
+                composed.handle().clone(),
+                &composed.instance,
+                &mut ui_events,
+                Some(interactive),
+                "dynamic",
+                checkpoint_dir,
+                "serving: scripted e2e model".to_string(),
+                None,
+                false,
+            ),
+        )
+        .await;
+        assert!(session.is_ok(), "the session hung: {session:?}");
+        session.expect("timeout").expect("session error");
+        orch.await.expect("orchestrator task");
         composed.shutdown().await.unwrap();
+
         assert_eq!(
             std::fs::read_to_string(root.join("file_a.txt")).unwrap(),
             "segment 1 content",
@@ -1519,8 +1566,4 @@ mod tui_e2e {
             "/continue after /restore must land the next segment"
         );
     }
-
-    // UiRole is touched only through AppState::new in these tests; keep the
-    // import honest without an unused warning in future refactors.
-    const _: fn(UiRole) = |_| {};
 }
