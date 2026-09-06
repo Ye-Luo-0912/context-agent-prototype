@@ -389,14 +389,21 @@ pub(crate) fn plan_stored_search_reads(
 /// read completes; memory is O(plan descriptors + verified ids), never
 /// O(history × body size). A missing, corrupt or unreadable planned blob is
 /// explicit rather than being misreported as a complete no-match result.
+pub(crate) struct StoredSearchVerification {
+    pub matched: HashMap<ContextItemId, (Option<String>, ContextKind)>,
+    pub read_count: u32,
+    pub read_bytes: u64,
+}
+
 pub(crate) async fn verify_stored_search_reads(
     dir: &Path,
     plan: Vec<StoredSearchRead>,
     query: &ContextSearchQuery,
-) -> AgentResult<HashMap<ContextItemId, (Option<String>, ContextKind)>> {
+) -> AgentResult<StoredSearchVerification> {
     let needle = query.query.trim().to_lowercase();
     let needle_tokens = agent_contracts::tokenize_query_fragments(&needle);
     let query_needs_residual = agent_contracts::query_needs_text_residual(&needle);
+    let read_count = plan.len() as u32;
     let mut pending = plan.into_iter();
     let mut reads = tokio::task::JoinSet::new();
     for _ in 0..MAX_STORE_IO_CONCURRENCY {
@@ -407,12 +414,14 @@ pub(crate) async fn verify_stored_search_reads(
     }
 
     let mut verified = HashMap::new();
+    let mut read_bytes = 0_u64;
     while let Some(joined) = reads.join_next().await {
         let (read, result) = joined.map_err(|error| {
             AgentError::Context(format!("context store search read task failed: {error}"))
         })?;
         match result {
             Ok(item) => {
+                read_bytes = read_bytes.saturating_add(item.content.len() as u64);
                 if item.kind != read.expected_kind
                     || !crate::index::catalog::kind_has_searchable_body(item.kind)
                 {
@@ -443,7 +452,11 @@ pub(crate) async fn verify_stored_search_reads(
             spawn_stored_search_read(&mut reads, dir.to_path_buf(), read);
         }
     }
-    Ok(verified)
+    Ok(StoredSearchVerification {
+        matched: verified,
+        read_count,
+        read_bytes,
+    })
 }
 
 fn spawn_stored_search_read(
@@ -549,6 +562,8 @@ fn project_item(item: &ContextItem) -> ExternalizedContext {
         evicted_at_tick: item.evicted_at_tick,
         file_path: item.file_path.clone(),
         file_revision: item.file_revision.clone(),
+        file_start_line: item.file_start_line,
+        file_end_line: item.file_end_line,
     };
     prompt_evidence_descriptor(entry)
 }
@@ -910,6 +925,8 @@ pub(crate) fn to_external_entry(
         evicted_at_tick: item.evicted_at_tick,
         file_path: item.file_path.clone(),
         file_revision: item.file_revision.clone(),
+        file_start_line: item.file_start_line,
+        file_end_line: item.file_end_line,
     }
 }
 

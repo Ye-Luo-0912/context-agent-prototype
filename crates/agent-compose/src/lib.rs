@@ -586,7 +586,7 @@ pub async fn compose(config: ComposeConfig) -> anyhow::Result<ComposedRuntime> {
     // controls only Runtime's optional automatic execution of that recipe.
     // Enabling execution without a table remains a fail-closed boot error.
     match verification_recipes {
-        Some(recipes) => {
+        Some(recipes) if !recipes.is_empty() => {
             let runner = tool_runtime::RecipeProofRunner::new(workspace.clone(), recipes)
                 .ok_or_else(|| anyhow::anyhow!("verification recipes register no host policy"))?;
             services = services.with_proof_verifier(Arc::new(HostProofVerifier::new(runner)));
@@ -594,12 +594,12 @@ pub async fn compose(config: ComposeConfig) -> anyhow::Result<ComposedRuntime> {
                 services = services.with_project_proof_refresh(true);
             }
         }
-        None if project_proof_refresh => {
+        Some(_) | None if project_proof_refresh => {
             return Err(anyhow::anyhow!(
                 "project proof refresh requires host verification recipes"
             ));
         }
-        None => {}
+        _ => {}
     }
 
     // Everything fallible is constructed; only the module start transaction
@@ -711,6 +711,29 @@ mod tests {
         let workspace = Workspace::open(dir.path()).await.unwrap();
         let error = match compose(compose_config(workspace, None, true)).await {
             Ok(_) => panic!("composition with refresh but no recipes must fail closed"),
+            Err(error) => error,
+        };
+        assert!(
+            error.to_string().contains("verification recipes"),
+            "{error}"
+        );
+    }
+
+    #[tokio::test]
+    async fn empty_recipe_table_without_refresh_composes() {
+        let dir = tempfile::tempdir().unwrap();
+        let workspace = Workspace::open(dir.path()).await.unwrap();
+        let recipes = Arc::new(VerificationRecipes::new(Vec::new()).unwrap());
+        run_smoke(compose_config(workspace, Some(recipes), false)).await;
+    }
+
+    #[tokio::test]
+    async fn empty_recipe_table_with_refresh_fails_closed() {
+        let dir = tempfile::tempdir().unwrap();
+        let workspace = Workspace::open(dir.path()).await.unwrap();
+        let recipes = Arc::new(VerificationRecipes::new(Vec::new()).unwrap());
+        let error = match compose(compose_config(workspace, Some(recipes), true)).await {
+            Ok(_) => panic!("empty recipe table must not enable proof refresh"),
             Err(error) => error,
         };
         assert!(

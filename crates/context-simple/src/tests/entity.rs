@@ -6,7 +6,7 @@ use agent_contracts::{
 
 use crate::engine::{SimpleContextConfig, SimpleContextEngine};
 
-use super::harness::{fs_read_with_revision, open_focus};
+use super::harness::{fs_read_window, fs_read_with_revision, open_focus};
 
 #[tokio::test]
 async fn hot_entities_follow_user_then_tool_then_reset() {
@@ -338,6 +338,8 @@ async fn dependency_expansion_pulls_in_dependencies_within_reserved_budget() {
             entities: Vec::new(),
             file_path: None,
             file_revision: None,
+            file_start_line: None,
+            file_end_line: None,
         };
         let dep = ContextItem {
             id: dep_id,
@@ -368,6 +370,8 @@ async fn dependency_expansion_pulls_in_dependencies_within_reserved_budget() {
             entities: Vec::new(),
             file_path: None,
             file_revision: None,
+            file_start_line: None,
+            file_end_line: None,
         };
         state.items.push(hub);
         state.items.push(dep);
@@ -437,6 +441,8 @@ async fn primary_selection_keeps_full_budget_without_continuation() {
             entities: Vec::new(),
             file_path: None,
             file_revision: None,
+            file_start_line: None,
+            file_end_line: None,
         };
         state.items.push(item);
     }
@@ -495,6 +501,8 @@ async fn dependency_expansion_can_be_disabled() {
             entities: Vec::new(),
             file_path: None,
             file_revision: None,
+            file_start_line: None,
+            file_end_line: None,
         };
         let dep = ContextItem {
             id: dep_id,
@@ -525,6 +533,8 @@ async fn dependency_expansion_can_be_disabled() {
             entities: Vec::new(),
             file_path: None,
             file_revision: None,
+            file_start_line: None,
+            file_end_line: None,
         };
         state.items.push(hub);
         state.items.push(dep);
@@ -587,6 +597,8 @@ async fn archived_dependency_below_threshold_stays_out() {
             entities: Vec::new(),
             file_path: None,
             file_revision: None,
+            file_start_line: None,
+            file_end_line: None,
         };
         let dep = ContextItem {
             id: dep_id,
@@ -617,6 +629,8 @@ async fn archived_dependency_below_threshold_stays_out() {
             entities: Vec::new(),
             file_path: None,
             file_revision: None,
+            file_start_line: None,
+            file_end_line: None,
         };
         state.items.push(hub);
         state.items.push(dep);
@@ -759,6 +773,8 @@ fn hub_and_dep(
         entities: Vec::new(),
         file_path: None,
         file_revision: None,
+        file_start_line: None,
+        file_end_line: None,
     };
     let dep = ContextItem {
         id: dep_id,
@@ -789,6 +805,8 @@ fn hub_and_dep(
         entities: Vec::new(),
         file_path: None,
         file_revision: None,
+        file_start_line: None,
+        file_end_line: None,
     };
     (hub, dep)
 }
@@ -1672,4 +1690,90 @@ async fn newer_revision_supersedes_the_stale_body() {
     let bodies = live_file_bodies(&engine, "src/big.rs").await;
     assert_eq!(bodies.len(), 1, "stale revision must die: {bodies:?}");
     assert!(bodies[0].contains("new_window"));
+}
+
+#[tokio::test]
+async fn same_revision_range_coverage_supersedes_without_body_containment() {
+    let engine = SimpleContextEngine::new(SimpleContextConfig::default());
+    open_focus(&engine, "multi read").await;
+    engine
+        .ingest(ContextIngress::ToolObservation {
+            facts: None,
+            output: fs_read_window(
+                "w1",
+                "src/big.rs",
+                "    10 | old_only_token",
+                "rev-1",
+                Some((10, 12)),
+            ),
+            scope_id: None,
+        })
+        .await
+        .unwrap();
+    engine
+        .ingest(ContextIngress::ToolObservation {
+            facts: None,
+            output: fs_read_window(
+                "w2",
+                "src/big.rs",
+                "     1 | cover_token",
+                "rev-1",
+                Some((1, 20)),
+            ),
+            scope_id: None,
+        })
+        .await
+        .unwrap();
+    engine
+        .maintain(ContextMaintenanceTrigger::AfterTool)
+        .await
+        .unwrap();
+    let bodies = live_file_bodies(&engine, "src/big.rs").await;
+    assert_eq!(
+        bodies.len(),
+        1,
+        "a covering line window must supersede without stdout containment: {bodies:?}"
+    );
+    assert!(bodies[0].contains("cover_token"));
+    assert!(!bodies[0].contains("old_only_token"));
+}
+
+#[tokio::test]
+async fn same_revision_disjoint_ranges_coexist_despite_substring_overlap() {
+    let engine = SimpleContextEngine::new(SimpleContextConfig::default());
+    open_focus(&engine, "multi read").await;
+    engine
+        .ingest(ContextIngress::ToolObservation {
+            facts: None,
+            output: fs_read_window("w1", "src/big.rs", "fn helper", "rev-1", Some((201, 201))),
+            scope_id: None,
+        })
+        .await
+        .unwrap();
+    // The later 1-100 window's body contains the earlier fragment text, but
+    // its stamped range does not cover lines 201-201.
+    engine
+        .ingest(ContextIngress::ToolObservation {
+            facts: None,
+            output: fs_read_window(
+                "w2",
+                "src/big.rs",
+                "fn helper\nfn main",
+                "rev-1",
+                Some((1, 100)),
+            ),
+            scope_id: None,
+        })
+        .await
+        .unwrap();
+    engine
+        .maintain(ContextMaintenanceTrigger::AfterTool)
+        .await
+        .unwrap();
+    let bodies = live_file_bodies(&engine, "src/big.rs").await;
+    assert_eq!(
+        bodies.len(),
+        2,
+        "disjoint stamped windows must coexist even when stdout overlaps: {bodies:?}"
+    );
 }

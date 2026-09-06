@@ -212,7 +212,7 @@ pub(crate) fn queue_file_body_supersessions(state: &mut State, new_item: &Contex
 
 /// A newer read supersedes an older body of the same file only when it
 /// proves coverage: a different content revision (explicit stale boundary)
-/// or a same-revision body that fully contains the older fragment's body.
+/// or a same-revision window that covers the older fragment.
 fn supersedes_file_body(new_item: &ContextItem, old: &ContextItem) -> bool {
     supersedes_stale_revision(new_item, old) || supersedes_same_revision_body(new_item, old)
 }
@@ -225,16 +225,33 @@ fn supersedes_stale_revision(new_item: &ContextItem, old: &ContextItem) -> bool 
 }
 
 /// Same content revision: the newer body supersedes the older one only when
-/// it literally contains it (a window covering the older window, or an
-/// identical re-read). Disjoint windows of one version coexist; unknown
+/// it proves coverage. A trusted line window that contains the older window
+/// is enough. If either side lacks a range, only a literal body containment
+/// of unclipped text is proof. Disjoint windows coexist; unknown or clipped
 /// bodies are never proven and are kept.
 fn supersedes_same_revision_body(new_item: &ContextItem, old: &ContextItem) -> bool {
     match (&old.file_revision, &new_item.file_revision) {
         (Some(old_rev), Some(new_rev)) if old_rev == new_rev => {
+            if let (Some((new_start, new_end)), Some((old_start, old_end))) =
+                (file_line_range(new_item), file_line_range(old))
+            {
+                return new_start <= old_start && new_end >= old_end;
+            }
+            if crate::item::content_was_clipped(&old.content)
+                || crate::item::content_was_clipped(&new_item.content)
+            {
+                return false;
+            }
             !old.content.is_empty() && new_item.content.contains(&old.content)
         }
         _ => false,
     }
+}
+
+fn file_line_range(item: &ContextItem) -> Option<(u32, u32)> {
+    let start = item.file_start_line?;
+    let end = item.file_end_line?;
+    (start >= 1 && end >= start).then_some((start, end))
 }
 
 /// Queue recurrence-supersession for every live error item that shares an

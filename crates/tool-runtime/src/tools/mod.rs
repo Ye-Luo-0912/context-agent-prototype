@@ -173,6 +173,42 @@ pub(crate) fn display_relative(workspace: &Workspace, path: &Path) -> String {
         .replace('\\', "/")
 }
 
+/// Read a workspace-relative UTF-8 file through the same confined handle
+/// and byte ceiling `fs.read` uses. Oversized, unreadable, or non-UTF-8
+/// files return `None` so callers can record a skip instead of treating
+/// later OutputBroker clipping as a memory bound.
+pub(crate) async fn read_confined_utf8(
+    workspace: &Workspace,
+    relative: &str,
+    max_bytes: u64,
+) -> AgentResult<Option<String>> {
+    let confined = match workspace.confined_open_read(relative).await {
+        Ok(confined) => confined,
+        Err(_) => return Ok(None),
+    };
+    let metadata = match confined.metadata() {
+        Ok(metadata) => metadata,
+        Err(_) => return Ok(None),
+    };
+    if metadata.len() > max_bytes {
+        return Ok(None);
+    }
+    let mut bytes = Vec::new();
+    if confined
+        .into_tokio()
+        .take(max_bytes.saturating_add(1))
+        .read_to_end(&mut bytes)
+        .await
+        .is_err()
+    {
+        return Ok(None);
+    }
+    if bytes.len() as u64 > max_bytes {
+        return Ok(None);
+    }
+    Ok(String::from_utf8(bytes).ok())
+}
+
 /// Quote untrusted workspace text before placing it in a line-oriented model
 /// protocol. Workspace paths can contain spaces and, on Unix, newlines; JSON
 /// string syntax keeps them from forging adjacent `revision=` fields.

@@ -721,6 +721,13 @@ pub struct ContextItem {
     /// 同一次读取的内容摘要（`fs.read` 的 SHA-256 hex revision）。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub file_revision: Option<String>,
+    /// Inclusive 1-indexed window actually returned by `fs.read`. Whole-file
+    /// `file_revision` still serves edit CAS; missing range is unknown, never
+    /// treated as "the whole file was visible".
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub file_start_line: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub file_end_line: Option<u32>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -2416,6 +2423,11 @@ pub struct ExternalizedContext {
     pub file_path: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub file_revision: Option<String>,
+    /// Inclusive 1-indexed `fs.read` window, when known. Old store maps omit it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub file_start_line: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub file_end_line: Option<u32>,
 }
 
 /// Cap on the external refs surfaced in one materialized context. The
@@ -2552,6 +2564,16 @@ pub struct ContextSearchQuery {
     pub label: Option<String>,
     /// Cap on returned refs. `0` means the engine default (16).
     pub limit: usize,
+}
+
+/// Store-body I/O spent on the most recent catalog search. Zeros mean the
+/// catalog answered without a cold read. Observation only: it never changes
+/// completeness, ranking, or residency.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ContextSearchObservation {
+    pub cold_reads: u32,
+    pub cold_read_bytes: u64,
+    pub cold_read_ms: u64,
 }
 
 impl ContextSearchQuery {
@@ -2791,6 +2813,13 @@ pub trait ContextEngine: Send + Sync {
         Ok(Vec::new())
     }
 
+    /// Store-body I/O from the most recent `search_external` on this engine.
+    /// Call immediately after that search. Engines that never cold-read keep
+    /// the zero default.
+    fn last_search_observation(&self) -> ContextSearchObservation {
+        ContextSearchObservation::default()
+    }
+
     /// One catalog entry's metadata by item id. Resident/Warm projections
     /// need no store read; stored entries use the map descriptor. Default
     /// returns nothing.
@@ -2905,6 +2934,8 @@ mod tests {
             evicted_at_tick: None,
             file_path: None,
             file_revision: None,
+            file_start_line: None,
+            file_end_line: None,
         }
     }
 

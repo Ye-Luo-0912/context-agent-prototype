@@ -894,6 +894,8 @@ mod tests {
             entities: vec![entity.to_string()],
             file_path: None,
             file_revision: None,
+            file_start_line: None,
+            file_end_line: None,
         }
     }
 
@@ -939,6 +941,8 @@ mod tests {
             evicted_at_tick: None,
             file_path: item.file_path.clone(),
             file_revision: item.file_revision.clone(),
+            file_start_line: item.file_start_line,
+            file_end_line: item.file_end_line,
         }
     }
 

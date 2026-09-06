@@ -56,6 +56,8 @@ pub(crate) fn make_item(
         entities,
         file_path: None,
         file_revision: None,
+        file_start_line: None,
+        file_end_line: None,
     }
 }
 
@@ -71,8 +73,16 @@ pub(crate) fn truncate_chars(mut text: String, max_chars: usize) -> String {
         return text;
     }
     text = text.chars().take(max_chars).collect();
-    text.push_str("\n...[truncated by context engine]");
+    text.push_str(ENGINE_CLIP_MARK);
     text
+}
+
+/// Marker appended when the engine clips an item body to `max_item_chars`.
+/// A clipped body cannot prove same-revision coverage by substring.
+pub(crate) const ENGINE_CLIP_MARK: &str = "\n...[truncated by context engine]";
+
+pub(crate) fn content_was_clipped(content: &str) -> bool {
+    content.contains(ENGINE_CLIP_MARK)
 }
 
 pub(crate) fn short_id(id: &ContextItemId) -> String {

@@ -196,6 +196,11 @@ async fn catalog_search_surfaces_resident_hits_instead_of_empty() {
                 && hit.entities.iter().any(|e| e.contains("AuthService"))),
         "a live working-set file must be a catalog hit, not an empty miss: {hits:?}"
     );
+    assert_eq!(
+        engine.last_search_observation(),
+        agent_contracts::ContextSearchObservation::default(),
+        "a complete catalog answer must not report a cold read"
+    );
     let resident = hits
         .iter()
         .find(|hit| hit.residency == ContextResidency::Resident)
@@ -1048,6 +1053,12 @@ async fn stored_semantic_search_verifies_keywords_beyond_the_descriptor_summary(
         hits.iter().map(|hit| hit.item_id).collect::<Vec<_>>(),
         vec![item_id],
         "an explicit search must checked-read an incomplete Stored semantic body"
+    );
+    let observation = engine.last_search_observation();
+    assert_eq!(observation.cold_reads, 1, "{observation:?}");
+    assert!(
+        observation.cold_read_bytes > 0,
+        "a Stored body read must charge bytes: {observation:?}"
     );
     let state = engine.state.lock().await;
     assert!(state.external.get(item_id).is_some());

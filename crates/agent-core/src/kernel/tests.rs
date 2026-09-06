@@ -4,9 +4,9 @@ use agent_contracts::{
     CONTEXT_SEARCH_MAX_QUERY_CHARS, ContextDiagnostics, ContextIngress, ContextItem, ContextItemId,
     ContextItemSummary, ContextKind, ContextMaintenanceReport, ContextMaintenanceTrigger,
     ContextQuery, ContextRef, ContextResidency, ContextRetention, ContextScope,
-    ContextStateTransition, ExternalizedContext, MaterializedContext, ScopeId, ScopeKind,
-    SemanticState, ToolRisk, ToolSemanticRole, ToolSpec, ToolSurfaceDemand, ToolSurfaceOmission,
-    ToolSurfaceOmissionReason, TurnId,
+    ContextSearchObservation, ContextStateTransition, ExternalizedContext, MaterializedContext,
+    ScopeId, ScopeKind, SemanticState, ToolRisk, ToolSemanticRole, ToolSpec, ToolSurfaceDemand,
+    ToolSurfaceOmission, ToolSurfaceOmissionReason, TurnId,
 };
 fn call(name: &str) -> ToolCall {
     ToolCall {
@@ -204,6 +204,13 @@ impl ContextEngine for RecordingEngine {
             .push(query.query.clone());
         Ok(self.search_hits.lock().unwrap().clone())
     }
+    fn last_search_observation(&self) -> ContextSearchObservation {
+        ContextSearchObservation {
+            cold_reads: 3,
+            cold_read_bytes: 12,
+            cold_read_ms: 7,
+        }
+    }
     async fn inspect_external(
         &self,
         _item_id: ContextItemId,
@@ -251,6 +258,8 @@ fn test_item(content: String) -> ContextItem {
         entities: Vec::new(),
         file_path: None,
         file_revision: None,
+        file_start_line: None,
+        file_end_line: None,
     }
 }
 
@@ -316,6 +325,8 @@ fn external_entry(source: Option<&str>) -> ExternalizedContext {
         evicted_at_tick: None,
         file_path: None,
         file_revision: None,
+        file_start_line: None,
+        file_end_line: None,
     }
 }
 
@@ -720,6 +731,7 @@ async fn empty_search_distinguishes_no_evidence_from_filter_miss() {
         no_filter.model_content.contains("no catalog items match"),
         "no filter must report that there is genuinely no catalog evidence"
     );
+    assert_search_cold_read_observation(&no_filter);
     let filtered = kernel
         .resolve_engine_query(
             placeholder,
@@ -738,6 +750,7 @@ async fn empty_search_distinguishes_no_evidence_from_filter_miss() {
         "a filter miss must name the filter, not absent evidence: {}",
         filtered.model_content
     );
+    assert_search_cold_read_observation(&filtered);
 }
 
 #[tokio::test]
@@ -818,6 +831,13 @@ async fn search_hits_render_the_source_authority() {
         Some(2),
         "search hits must carry bounded ResourceDescriptors"
     );
+    assert_search_cold_read_observation(&output);
+}
+
+fn assert_search_cold_read_observation(output: &ToolOutput) {
+    assert_eq!(output.metadata["cold_reads"].as_u64(), Some(3));
+    assert_eq!(output.metadata["cold_read_bytes"].as_u64(), Some(12));
+    assert_eq!(output.metadata["cold_read_ms"].as_u64(), Some(7));
 }
 
 #[tokio::test]

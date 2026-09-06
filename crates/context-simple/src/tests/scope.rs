@@ -551,6 +551,8 @@ async fn pinned_items_get_priority_but_never_break_the_budget() {
             entities: Vec::new(),
             file_path: None,
             file_revision: None,
+            file_start_line: None,
+            file_end_line: None,
         };
         let oversized_pin = ContextItem {
             id: ContextItemId::new(),
@@ -581,6 +583,8 @@ async fn pinned_items_get_priority_but_never_break_the_budget() {
             entities: Vec::new(),
             file_path: None,
             file_revision: None,
+            file_start_line: None,
+            file_end_line: None,
         };
         state.items.push(small_pin);
         state.items.push(oversized_pin);

@@ -120,7 +120,7 @@
   "route_reset": {
     "task_document": "docs/NEXT_TASKS.md",
     "archive": "docs/archive/route-reset-12c8628",
-    "feature_status": "F1-F5 code+targeted tests landed; F6 NOT_RUN (live); manual walkthroughs pending",
+    "feature_status": "F1-F5 code+targeted tests landed; F6 headless live walked 2026-09-06 (TUI interactive remaining)",
     "D0_remaining": "done 2026-09-06: README route links updated, NEXT_TASKS added to LIVE_DOCS, doc-consistency gate green",
     "research_not_a_product_prerequisite": [
       "M15 rerun",
@@ -133,15 +133,15 @@
     "F2_status": "code + targeted tests landed 2026-09-06 (/work composes set_focus + empty-requirement task.manage PreferSurface + one user-message; /plan reads the new read-only TaskPlanView command; checkpoint roundtrip preserves checklist and TaskId); manual walkthrough pending",
     "F3_status": "landed 2026-09-06 incl. continued-review 6a (EOF-wait bounds) and 6b (verifier cancellation bridge armed on turn cancel and shutdown before bounded join); inline default until a real slow-verification walkthrough",
     "F4_status": "landed 2026-09-06 incl. continued-review batch: resync_projection newest-first/current-run/watermark/bounded-read, run_summary entries+omitted counting with real-event tests and mid-file run split, shadow-frame dedup-vs-cap accounting; two-workspace walkthrough pending",
-    "F5_status": "landed 2026-09-06: provable file-body supersession, verify-only error clearing, search.grep PARTIAL coverage; fs.list coverage annotation still open",
-    "F6_status": "NOT_RUN 2026-09-06: live walkthroughs need an operator-interactive TUI session with a real provider; deterministic F1-F5 results are banked and the walkthrough checklist is in CURRENT.md",
+    "F5_status": "landed 2026-09-06: provable file-body supersession, verify-only error clearing, search.grep and fs.list PARTIAL coverage, fs.read range facts through ingest/supersession, confined bounded reads for grep/symbols, context-search cold-read observation; F6 headless live covered a cross-file task",
+    "F6_status": "headless live 2026-09-06: real provider gpt-5.6-luna via product compose/RuntimeHandle; three disposable workspaces passed harness file checks (bugfix, feature, interrupt/restore/continue); empty verification recipe table no longer fails compose; TUI interactive walkthroughs still pending; record in docs/walkthroughs/2026-09-06-f6.md",
     "headless_acceptance": "agent-compose/tests/route_flow.rs: real composition + scripted model covers /work composition, task.manage plan, round-budget stop with durable safe point, /continue incl. cross-checkpoint restore; landed 2026-09-06 with two wiring fixes (compose now wires the artifact store into runtime checkpoint services; the round-budget refusal drains the in-flight write and lands its own safe point)",
     "continued_review_2026_09_06": {
       "baseline": "12c86283b8d5991e9f17a07f14871dcf39d65066",
       "report": "docs/reviews/2026-09-06-continued-audit/REVIEW.md",
       "status": "all four findings fixed 2026-09-06: EOF wait stays inside the timeout/cancel select (cross-platform tests with watchdogs), verifier cancellation token bridges actor cancel incl. the parked NoActiveTurn path (arm then bounded join, no bare abort), resync_projection newest-first/current-run/watermark/bounded-read, run_summary counts entries+omitted with real-event tests and mid-file run split, shadow-frame duplicates vs cap omissions separated; regression tests added per fix",
       "old_findings_already_fixed": "consumption stamping + PromptRequired dedup fixed in c6fbbab",
-      "correction": "F5 PARTIAL coverage annotation covers search.grep only; fs.list is still open"
+      "correction": "F5 remaining (fs.read range facts, fs.list PARTIAL, confined bounded reads, search cold-read observation) landed 2026-09-06"
     }
   }
 }

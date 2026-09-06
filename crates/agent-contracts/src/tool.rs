@@ -779,6 +779,14 @@ impl ToolOutput {
             .filter(|revision| !revision.is_empty())
     }
 
+    /// Inclusive 1-indexed window actually returned by a ranged read.
+    /// Missing, zero, or inverted bounds are unknown — never "the whole file".
+    pub fn file_line_range(&self) -> Option<(u32, u32)> {
+        let start = positive_u32_metadata(&self.metadata, "start_line")?;
+        let end = positive_u32_metadata(&self.metadata, "end_line")?;
+        (end >= start).then_some((start, end))
+    }
+
     /// Command or argv the producer stamped, used to identity a failed
     /// operation without collapsing every `shell.exec` into one slot.
     pub fn operation_target(&self) -> Option<&str> {
@@ -1483,6 +1491,14 @@ fn strip_reserved_runtime_metadata(metadata: &mut Value) {
     strip_metadata_keys(metadata, RESERVED_RUNTIME_METADATA_KEYS);
 }
 
+fn positive_u32_metadata(metadata: &Value, key: &str) -> Option<u32> {
+    metadata
+        .get(key)
+        .and_then(Value::as_u64)
+        .filter(|value| *value >= 1 && *value <= u64::from(u32::MAX))
+        .map(|value| value as u32)
+}
+
 fn strip_metadata_keys(metadata: &mut Value, keys: &[&str]) {
     let Some(object) = metadata.as_object_mut() else {
         return;
@@ -1493,10 +1509,10 @@ fn strip_metadata_keys(metadata: &mut Value, keys: &[&str]) {
 }
 
 /// Producer-stamped metadata 键：一旦保留，就会经由 [`ToolOutput`] 的
-/// 访问器（`file_path` / `file_revision` / `resource_touches` /
-/// `is_verification` / `may_mutate_workspace`）变成受信 Runtime 事实
-/// （ResourceFact、Verification、WorkingSetSignal、mutation 上界）。
-/// 只有 operator-trusted 的 builtin host 允许盖章这些键。
+/// 访问器（`file_path` / `file_revision` / `file_line_range` /
+/// `resource_touches` / `is_verification` / `may_mutate_workspace`）变成受信
+/// Runtime 事实（ResourceFact、read window、Verification、WorkingSetSignal、
+/// mutation 上界）。只有 operator-trusted 的 builtin host 允许盖章这些键。
 pub const PRODUCER_AUTHORITY_METADATA_KEYS: &[&str] = &[
     "path",
     "revision",
@@ -1504,6 +1520,9 @@ pub const PRODUCER_AUTHORITY_METADATA_KEYS: &[&str] = &[
     "verification",
     "intent",
     "mutates_workspace",
+    "start_line",
+    "end_line",
+    "covers_file",
 ];
 
 /// 动态 Capability 输出的统一净化（fail-closed）：先剥
@@ -2854,6 +2873,35 @@ pub trait ToolDispatcher: Send + Sync {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn file_line_range_rejects_missing_zero_and_inverted_bounds() {
+        let output = |metadata: serde_json::Value| ToolOutput {
+            call_id: "c".into(),
+            tool_name: "fs.read".into(),
+            ok: true,
+            summary: "ok".into(),
+            model_content: String::new(),
+            artifact_ref: None,
+            metadata,
+        };
+        assert_eq!(
+            output(serde_json::json!({"start_line": 1, "end_line": 100})).file_line_range(),
+            Some((1, 100))
+        );
+        assert_eq!(
+            output(serde_json::json!({"start_line": 1})).file_line_range(),
+            None
+        );
+        assert_eq!(
+            output(serde_json::json!({"start_line": 0, "end_line": 10})).file_line_range(),
+            None
+        );
+        assert_eq!(
+            output(serde_json::json!({"start_line": 20, "end_line": 10})).file_line_range(),
+            None
+        );
+    }
 
     #[test]
     fn proves_no_effect_covers_exactly_the_instruction_quality_refusals() {

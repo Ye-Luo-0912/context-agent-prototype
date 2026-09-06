@@ -207,24 +207,14 @@ impl Tool for SearchGrepTool {
                     scanned_files,
                 ));
             }
-            let metadata = match fs::metadata(&file).await {
-                Ok(metadata) => metadata,
-                Err(_) => {
-                    skipped_files += 1;
-                    continue;
-                }
-            };
-            if metadata.len() > MAX_BYTES_PER_FILE {
-                skipped_files += 1;
-                continue;
-            }
-            scanned_files += 1;
-            let Ok(text) = fs::read_to_string(&file).await else {
-                skipped_files += 1;
-                scanned_files -= 1;
-                continue;
-            };
             let relative = display_relative(&self.workspace, &file);
+            let Some(text) =
+                super::read_confined_utf8(&self.workspace, &relative, MAX_BYTES_PER_FILE).await?
+            else {
+                skipped_files += 1;
+                continue;
+            };
+            scanned_files += 1;
             for (index, line) in text.lines().enumerate() {
                 // 先扫一段再查 token：刚读完的文件至少能留下已匹配行。
                 if index > 0 && index % CANCEL_CHECK_LINES == 0 {
@@ -777,5 +767,43 @@ needle
         assert_eq!(output.metadata["scan_incomplete"], json!(false));
         assert!(!output.summary.contains("PARTIAL"), "{}", output.summary);
         assert_eq!(output.model_content, "no matches");
+    }
+
+    #[tokio::test]
+    async fn grep_skips_oversized_files_through_the_confined_read_and_marks_partial() {
+        let (workspace, _dir) = temp_workspace().await;
+        let root = workspace.root().to_path_buf();
+        write(&root, "src/small.rs", "needle here\n").await;
+        std::fs::write(
+            root.join("src/huge.rs"),
+            vec![b'x'; (MAX_BYTES_PER_FILE as usize) + 1],
+        )
+        .unwrap();
+
+        let tool = SearchGrepTool::new(workspace);
+        let output = tool
+            .execute(
+                RunId::new(),
+                "c",
+                json!({"pattern": "needle"}),
+                None,
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+        let output = value(output);
+        assert!(output.ok);
+        assert!(
+            output.model_content.contains("src/small.rs"),
+            "{}",
+            output.model_content
+        );
+        assert_eq!(output.metadata["scan_incomplete"], json!(true));
+        assert_eq!(output.metadata["skipped_files"], json!(1));
+        assert!(
+            output.summary.contains("PARTIAL scan"),
+            "{}",
+            output.summary
+        );
     }
 }

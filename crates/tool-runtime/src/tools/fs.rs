@@ -118,6 +118,7 @@ impl Tool for FsListTool {
         };
 
         let mut entries = Vec::new();
+        let mut scan_incomplete = false;
         while let Some(entry) = reader
             .next_entry()
             .await
@@ -128,6 +129,7 @@ impl Tool for FsListTool {
                 continue;
             }
             if entries.len() >= MAX_LIST_ENTRIES {
+                scan_incomplete = true;
                 break;
             }
             let metadata = entry.metadata().await.ok();
@@ -172,6 +174,11 @@ impl Tool for FsListTool {
                 )
             })
             .unwrap_or_default();
+        let coverage_note = if scan_incomplete {
+            " (PARTIAL scan: directory entry budget reached; do not treat this as the complete directory)"
+        } else {
+            ""
+        };
 
         // 目录身份戳：path@digest 让重复列举能被证据前沿识别为同版本
         // 冗余，而不是无身份的纯 stdout。根目录的相对路径是空串，用
@@ -188,11 +195,15 @@ impl Tool for FsListTool {
             tool_name: "fs.list".into(),
             ok: true,
             summary: format!(
-                "listed {} entries in {}",
+                "listed {} entries in {}{coverage_note}",
                 entries.len(),
                 display_relative(&self.workspace, &path)
             ),
-            model_content: format!("{}{}", visible.join("\n"), truncated_note),
+            model_content: if entries.is_empty() && scan_incomplete {
+                "no entries in the scanned prefix; the scan is incomplete, so this is not an empty directory".to_string()
+            } else {
+                format!("{}{}", visible.join("\n"), truncated_note)
+            },
             artifact_ref,
             metadata: json!({
                 // digest 对完整 listing 计算：visible 只是分页窗口，
@@ -204,6 +215,7 @@ impl Tool for FsListTool {
                 "has_more": has_more,
                 "next_start_line": has_more.then_some(visible.len() + 1),
                 "cursor": cursor,
+                "scan_incomplete": scan_incomplete,
             }),
         };
         output.set_native_execution_facts(
@@ -268,6 +280,7 @@ impl FsListTool {
                 "returned": page.len(),
                 "has_more": has_more,
                 "cursor": next_cursor,
+                "scan_incomplete": false,
             }),
         };
         // Snapshot pages describe no fresh directory identity; the stamp
@@ -443,6 +456,12 @@ impl Tool for FsReadTool {
         }
         let start = requested_start.min(line_count);
         let end = requested_end.min(line_count);
+        let returned_start = (!selected.is_empty()).then_some((requested_start + 1) as u64);
+        let returned_end = (!selected.is_empty()).then_some(end as u64);
+        let covers_file = match line_count {
+            0 => true,
+            _ => !selected.is_empty() && requested_start == 0 && end == line_count,
+        };
 
         let relative = display_relative(&self.workspace, &display_path);
         let quoted_relative = model_json_string(&relative);
@@ -459,6 +478,11 @@ impl Tool for FsReadTool {
             let tokens = mixed_eol_tokens(&text, requested_start, requested_end);
             model_content.push_str(" eol_tokens(C=CRLF,L=LF,N=none)=");
             model_content.push_str(&tokens);
+        }
+        if let (Some(start_line), Some(end_line)) = (returned_start, returned_end) {
+            model_content.push_str(&format!(" lines={start_line}-{end_line}/{line_count}"));
+        } else if line_count == 0 {
+            model_content.push_str(" lines=0-0/0");
         }
         if !selected.is_empty() {
             model_content.push('\n');
@@ -481,6 +505,9 @@ impl Tool for FsReadTool {
                 // bytes, changes with any edit — the patch tool's
                 // `base_revision` precondition is checked against this.
                 "revision": revision,
+                "start_line": returned_start,
+                "end_line": returned_end,
+                "covers_file": covers_file,
             }),
         };
         output.set_native_execution_facts(
@@ -1028,7 +1055,7 @@ mod tests {
                 .model_content
                 .starts_with("file=\"windows.txt\" revision=")
         );
-        assert!(output.model_content.contains(" line_ending=crlf\n"));
+        assert!(output.model_content.contains(" line_ending=crlf"));
         assert_eq!(
             output.metadata["revision"],
             content_digest(b"one\r\ntwo\r\n")
@@ -1115,6 +1142,51 @@ mod tests {
             output.model_content.len() < 8 * 1024,
             "a newline-dense file must produce output proportional to the requested window"
         );
+    }
+
+    #[tokio::test]
+    async fn fs_read_stamps_the_returned_window_and_keeps_the_whole_file_revision() {
+        let dir = tempfile::tempdir().unwrap();
+        let body = (1..=30)
+            .map(|n| format!("line-{n}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        std::fs::write(dir.path().join("window.rs"), &body).unwrap();
+        let workspace = Workspace::open(dir.path()).await.unwrap();
+        let tool = FsReadTool::new(workspace);
+        let outcome = tool
+            .execute(
+                RunId::new(),
+                "c",
+                json!({
+                    "path": "window.rs",
+                    "start_line": 10,
+                    "end_line": 12,
+                }),
+                None,
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+        let ToolOutcome::Value(output) = outcome else {
+            panic!("fs.read returns a value");
+        };
+
+        assert_eq!(output.metadata["start_line"], 10);
+        assert_eq!(output.metadata["end_line"], 12);
+        assert_eq!(output.metadata["line_count"], 30);
+        assert_eq!(output.metadata["covers_file"], false);
+        assert_eq!(
+            output.metadata["revision"].as_str().unwrap(),
+            content_digest(body.as_bytes()),
+            "edit CAS still uses the whole-file digest"
+        );
+        assert!(output.model_content.contains("lines=10-12/30"));
+        assert!(output.model_content.contains("    10 | line-10"));
+        assert!(output.model_content.contains("    12 | line-12"));
+        assert!(!output.model_content.contains("     9 | line-9"));
+        assert!(!output.model_content.contains("    13 | line-13"));
+        assert_eq!(output.file_line_range(), Some((10, 12)));
     }
 
     #[tokio::test]
@@ -1227,6 +1299,7 @@ mod tests {
         assert_eq!(output.metadata["entry_count"], 10);
         assert_eq!(output.metadata["returned"], 4);
         assert_eq!(output.metadata["has_more"], true);
+        assert_eq!(output.metadata["scan_incomplete"], false);
         assert!(
             output.artifact_ref.is_some(),
             "an overflowing listing must spill a snapshot"
@@ -1276,6 +1349,45 @@ mod tests {
         let bad = format!("{}#9999", output.artifact_ref.as_deref().unwrap());
         let result = list(json!({"path": "d", "limit": 4, "cursor": bad})).await;
         assert!(result.is_err(), "a cursor past the snapshot must error");
+    }
+
+    #[tokio::test]
+    async fn fs_list_marks_partial_when_the_entry_budget_stops_the_scan() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir(dir.path().join("many")).unwrap();
+        for i in 0..=MAX_LIST_ENTRIES {
+            std::fs::write(dir.path().join("many").join(format!("f-{i:04}.txt")), "x").unwrap();
+        }
+        let workspace = Workspace::open(dir.path()).await.unwrap();
+        let tool = FsListTool::new(workspace);
+        let outcome = tool
+            .execute(
+                RunId::new(),
+                "c",
+                json!({"path": "many", "limit": 8}),
+                None,
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+        let ToolOutcome::Value(output) = outcome else {
+            panic!("fs.list returns a value");
+        };
+        assert_eq!(output.metadata["scan_incomplete"], true);
+        assert_eq!(output.metadata["has_more"], true);
+        assert_eq!(output.metadata["entry_count"], MAX_LIST_ENTRIES);
+        assert!(
+            output.summary.contains("PARTIAL scan"),
+            "a capped directory walk must not look complete: {}",
+            output.summary
+        );
+        assert!(
+            output
+                .summary
+                .contains("do not treat this as the complete directory"),
+            "{}",
+            output.summary
+        );
     }
 
     #[tokio::test]

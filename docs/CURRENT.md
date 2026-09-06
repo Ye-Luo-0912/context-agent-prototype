@@ -48,19 +48,28 @@ F4 代码同日落地：`/review` 渲染事件派生的有界结果卡（变更�
 供重启后查看；结果卡明确不归属用户原有修改，UI 不调用工具制造权威。
 下一步进入 F5（多文件上下文与搜索实用化）。
 
-F5 代码同日落地：文件体取代改为保守可证明规则（不同内容修订=过期边界；
-同修订仅当新正文完整包含旧正文才取代，非重叠片段共存）；错误条目只被
-verify.run 成功结果验证修复，读文件/grep 不再凭实体重叠清错；search.grep
-在命中限额、文件预算或跳过文件时输出 PARTIAL 覆盖陈述与 scan_incomplete
-元数据。GC/评分策略未动。下一步进入 F6（三类真实任务走查）。
+F5 剩余项同日落地：`fs.read` 整文件 revision 仍服务编辑 CAS，并盖章实际
+返回行区间与 `covers_file`；ingest 把区间写入条目，同修订取代优先用可信
+窗口覆盖，缺区间才回退正文包含，引擎裁剪正文不再冒充覆盖；`fs.list` 在
+目录条目预算截断时输出 PARTIAL（与分页 `has_more` 分开）；`search.grep` /
+`code.symbols` 经 `fs.read` 同款受限句柄与字节上限读文件；context search
+记录冷读次数/字节/延迟并出现在 `context.manage` search 元数据。GC/评分
+未动。下一步是 F6 三类真实任务走查。
 
-F6 记 NOT_RUN（2026-09-06）：三类真实任务（修 bug、加小功能、跨文件重构
-并中断续跑）必须由操作者在真实 provider 与实际 TUI 的交互会话中执行，
-本执行环境无法替代，也不假装 live 通过。待操作者完成的走查清单：
-恢复未完成任务后 /continue；忙时排队/拒绝处置；/work + /plan + 清单随
-恢复保留；--max-rounds 预算停止与 /continue 续段；--defer-proof 真实慢
-验证（确认取消与子进程清理后才改产品默认）；/review 双工作区（干净 +
-含用户旧修改）区分归属；跨文件任务的片段共存与搜索覆盖陈述。
+F6 无头 live 已跑（2026-09-06）：真实 provider `gpt-5.6-luna` @ pinaic
+`responses`，产品组合根 + `RuntimeHandle`（`/work` 序列），TUI 按约定
+后置。三类可丢弃工作区均改到目标文件：修 `calc.add`、跨 `config.py`/
+`app.py` 加 `timeout_ms`、跨三文件抽出 `normalize` 并在 `--max-rounds=2`
+RoundBudget 后 restore + `/continue`。记录见
+[walkthroughs/2026-09-06-f6.md](walkthroughs/2026-09-06-f6.md)。
+途中修复：空 verification recipe 表（无 Cargo.toml/pyproject 的工作区）
+不应让组合根启动失败，否则 TUI 同样起不来。走查用 permissive 审批，
+不是 TUI 交互门。TUI 手工项仍待做：忙时排队、`/plan` 可见性、`/review`
+双工作区、`--defer-proof` 慢验证。
+
+TUI 交互走查仍待做（2026-09-06）：忙时排队/拒绝；`/plan` 清单可见性；
+`--defer-proof` 真实慢验证（确认取消与子进程清理后才改产品默认）；
+`/review` 双工作区（干净 + 含用户旧修改）区分归属。无头 live 不替代这些。
 
 2026-09-06 补充（无头验收 + 两处接线修复）：新增
 `agent-compose/tests/route_flow.rs`，用真实组合根 + 脚本化模型端到端验证
@@ -87,8 +96,8 @@ F6 记 NOT_RUN（2026-09-06）：三类真实任务（修 bug、加小功能、�
    混计入 `duplicates_removed`，且非完整请求镜像；只修观测，不翻正式 prompt。
 
 续审复核的两处旧问题（消费盖章在 `debug_assert!` 内、PromptRequired 判重）
-在 `c6fbbab` 已修复。另更正一处过报：F5 的 PARTIAL 覆盖标注目前只覆盖
-search.grep，fs.list 未做。研究轨候选（片段身份/曝光账目、短工作焦点、
+在 `c6fbbab` 已修复。当时更正一处过报：PARTIAL 覆盖标注当时只覆盖
+search.grep，fs.list 未做；现已随 F5 剩余项落地。研究轨候选（片段身份/曝光账目、短工作焦点、
 装配边际收益、遮罩基线、SIEVE/TinyLFU 定位、词法特征贯通最终排序）已并入
 NEXT_TASKS，均不阻塞 F1–F4。
 
