@@ -1,6 +1,6 @@
 {
   "schema": "project-state.v1",
-  "updated": "2026-09-06",
+  "updated": "2026-09-07",
   "maintained_by": "CURRENT.md and NEXT_TASKS.md record the active product route; the existing document-consistency script checks structure/links, not semantic equivalence or future CI success",
   "head_commit": "12c86283b8d5991e9f17a07f14871dcf39d65066",
   "code_commit": "12c86283b8d5991e9f17a07f14871dcf39d65066",
@@ -16,18 +16,9 @@
   "milestone_gates": {
     "m15_real_evaluation": "closed",
     "next_ordered": [
-      "STORAGE-02 post-publish journal writer fence",
-      "PROCESS-01 host-proof crash supervision",
-      "PROCESS-02 reap without confirmed exit",
-      "WORKSPACE-01 FIFO nonblocking open",
-      "WORKSPACE-02 Windows handle RAII on reject",
-      "PROVIDER-01 bounded error body",
-      "PROVIDER-02 Chat length termination",
-      "PROVIDER-03 Responses EOF frame check",
-      "CONTEXT-01 newest-first dependency candidates",
-      "PACKAGE-01 package source binding (next release)",
-      "MCP-01 only if default product enables MCP writes",
-      "M16-02 remaining: OperatorClosureOnly vs durable completion display"
+      "PROCESS-01 host-proof crash supervision (Unix persistent supervision identity; Windows fence landed)",
+      "M16-08 closure: TUI walkthroughs (M16-01 continue/busy-input, M16-05 dual-workspace) + PACKAGE-01 at the next actual release",
+      "MCP-01 only if default product enables MCP writes"
     ],
     "lt_eval_06": {
       "status": "evidence banked 2026-09-05",
@@ -88,18 +79,9 @@
   ],
   "branch_protection": false,
   "next_ordered": [
-    "STORAGE-02 post-publish journal writer fence",
-    "PROCESS-01 host-proof crash supervision",
-    "PROCESS-02 reap without confirmed exit",
-    "WORKSPACE-01 FIFO nonblocking open",
-    "WORKSPACE-02 Windows handle RAII on reject",
-    "PROVIDER-01 bounded error body",
-    "PROVIDER-02 Chat length termination",
-    "PROVIDER-03 Responses EOF frame check",
-    "CONTEXT-01 newest-first dependency candidates",
-    "PACKAGE-01 package source binding (next release)",
-    "MCP-01 only if default product enables MCP writes",
-    "M16-02 remaining: OperatorClosureOnly vs durable completion display"
+    "PROCESS-01 host-proof crash supervision (Unix persistent supervision identity; Windows fence landed)",
+    "M16-08 closure: TUI walkthroughs (M16-01 continue/busy-input, M16-05 dual-workspace) + PACKAGE-01 at the next actual release",
+    "MCP-01 only if default product enables MCP writes"
   ],
   "release": {
     "version": "0.1.0",
@@ -127,12 +109,12 @@
     ]
   },
   "reviewed_source_commit": "12c86283b8d5991e9f17a07f14871dcf39d65066",
-  "source_scope_note": "Fixed reviewed source, not the SHA of later documentation or product commits. 2026-09-06 deep review was a partial-source pass (clone failed; 29 paths, not a full-repo inventory; no local Rust). Remaining open findings now lead NEXT_TASKS; M16-02 waits until they close.",
-  "active_task": "STORAGE-02",
+  "source_scope_note": "Fixed reviewed source, not the SHA of later documentation or product commits. 2026-09-06 deep review was a partial-source pass (clone failed; 29 paths, not a full-repo inventory; no local Rust). Only PROCESS-01 (Unix supervision identity) remains open from its findings and leads NEXT_TASKS; M16-02 closed 2026-09-07.",
+  "active_task": "PROCESS-01",
   "route_reset": {
     "task_document": "docs/NEXT_TASKS.md",
     "archive": "docs/archive/route-reset-12c8628",
-    "feature_status": "M16-00 switched; remaining 2026-09-06 deep-audit items now lead the live queue (current STORAGE-02); M16-02 completion display waits; M16-01/05/07 and most of 02/03/06 already landed",
+    "feature_status": "M16-00 switched and M16-02 closed (2026-09-07); the live queue leads with the PROCESS-01 Unix remainder (all other deep-audit code items closed 2026-09-06); M16-01/05/07 and most of 03/06 already landed",
     "D0_remaining": "done 2026-09-06: README route links updated, NEXT_TASKS added to LIVE_DOCS, doc-consistency gate green",
     "research_not_a_product_prerequisite": [
       "M15 rerun",
@@ -160,7 +142,7 @@
     "deep_review_2026_09_06": {
       "baseline": "12c86283b8d5991e9f17a07f14871dcf39d65066",
       "report": "docs/reviews/2026-09-06-deep-audit/REVIEW.md",
-      "status": "partial source review; remaining open findings lead NEXT_TASKS (current STORAGE-02). STORAGE-01 and DOC-01 closed on this branch; prior-round EOF-wait/ACK/resync already fixed. Not a full-repo audit; clone failed on DNS; no local Rust in the review.",
+      "status": "partial source review; remaining open findings lead NEXT_TASKS (current PROCESS-01 Unix remainder). STORAGE-01/02, PROCESS-02, WORKSPACE-01/02, PROVIDER-01/02/03, CONTEXT-01 and DOC-01 closed on this branch 2026-09-06; prior-round EOF-wait/ACK/resync already fixed. Not a full-repo audit; clone failed on DNS; no local Rust in the review.",
       "new_findings": 13,
       "executed_probes": [
         "dist.sh stub cargo (stale binary and leftover helper packaged; build-fail exits 17)",
@@ -174,17 +156,20 @@
       "basis": "12c86283b8d5991e9f17a07f14871dcf39d65066",
       "note": "M16 replaces D0/F1-F6 as the stage order. Remaining 2026-09-06 deep-audit items currently lead the same queue. The proposal marked every task unimplemented against 12c8628; this working tree maps landed product work onto M16-00..08.",
       "M16_00": "done 2026-09-06: live CURRENT/ROADMAP/NEXT_TASKS/AGENTS point at M16; proposal stored under reviews/",
-      "current_ticket": "STORAGE-02; M16-02 remaining waits until deep-audit leftovers close"
+      "M16_02": "closed 2026-09-07 (9a6e988): StatusProjection task line distinguishes [awaiting operator review] vs [durably completed (operator accepted)]; the TUI names the state at turn end; headless session_end gains task_state (operator_accepted / awaiting_operator_review / none); /done keeps the existing operator acceptance path",
+      "current_ticket": "PROCESS-01 Unix remainder; next product item is M16-08 closure"
     }
   },
   "deep_audit_queue": {
     "STORAGE-02": "closed 2026-09-06: compact_locked runs every fallible step (new-WAL seek, next_seq overflow check, recovery rebuild) before the metadata publish; post-publish is in-memory swap + best-effort old-WAL removal only, so the writer can never keep appending to the old generation after a failed compact. Tests: pre-publish new-WAL failure keeps old gen appendable and metadata untouched; crash between publish and old-WAL removal reopens on the published generation (agent-storage 21/21).",
-    "current": "PROCESS-01 Unix 剩余（持久监督身份设计）或 M16-02 剩余，按 CURRENT 排序",
+    "current": "PROCESS-01 Unix 剩余（持久监督身份设计）；其余代码项已全部关闭，M16-02 亦已关闭（2026-09-07）",
     "PROVIDER-01": "closed 2026-09-06: non-2xx bodies read through bounded_error_body (8 KiB cap via bytes_stream take + per-chunk deadline, truncation marked in the message) instead of unbounded response.text(); watchdog regression proves the call returns against a 1 MiB declared body written past the cap",
     "PROVIDER-02": "closed 2026-09-06: Chat finish_reason=length arms StreamAccumulator::take_output_limit and maps to AgentError::ModelOutputLimit instead of replaying the truncated accumulation as a normal completion",
     "PROVIDER-03": "closed 2026-09-06: the EOF-flushed residual Responses frame passes validate_sse_event_routing like every blank-line terminated frame; regression: contradictory event name on the residual frame fails malformed-event",
     "CONTEXT-01": "closed 2026-09-06: dependency ingest scans each entity bucket newest-first so the 64-candidate budget is spent on the freshest priors (old head-truncation linked the oldest 64), and entity bucket removal is order-preserving (no swap_remove) to keep slot order = creation order; regression: a 70-item bucket links the new item to items 62..=69",
     "PROCESS-01": "partially closed 2026-09-06: Windows KILL_ON_JOB_CLOSE containment landed and covered; Unix PR_SET_PDEATHSIG via std/tokio pre_exec does NOT execute on GitHub Ubuntu runners — marker-file probe evidence: hook never ran while in-process prctl self-set/get works (selfset=0 after=9). Unix needs the persisted-supervision-identity design (review's alternative); pre_exec approach removed from production spawn as a silent no-op.",
-    "PROCESS-02": "closed 2026-09-06: reap clears the pid only after a confirmed exit (typed ProcessReapOutcome) and kill_tree's direct-child fallback no longer depends on the child lock (direct pid kill); regression: a non-group-leader child dies through the fallback while the lock is held"
+    "PROCESS-02": "closed 2026-09-06: reap clears the pid only after a confirmed exit (typed ProcessReapOutcome) and kill_tree's direct-child fallback no longer depends on the child lock (direct pid kill); regression: a non-group-leader child dies through the fallback while the lock is held",
+    "WORKSPACE-01": "closed 2026-09-06: ordinary confined opens carry O_NONBLOCK with the same-handle stat accepting only regular files/directories (staged targets require a regular file); project_markers is a metadata-only probe (fstatat AT_SYMLINK_NOFOLLOW) so the root scan never opens an entry; regression: a writerless FIFO at Cargo.toml no longer blocks the scan (17c5ded; agent-workspace 98+5+3)",
+    "WORKSPACE-02": "closed 2026-09-06: all six raw-HANDLE sites take ownership (from_raw_handle / File::from_raw_handle) before check_not_reparse, matching the recovery-helper pattern; existing reparse rejection tests cover behavior; handle-count fault injection not performed (17c5ded)"
   }
 }

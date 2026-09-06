@@ -12,8 +12,9 @@ human-approved effects, verifiable completion and cold resume. The alpha
 (`v0.1.0`: packaged Windows/Linux binaries, install notes, checked
 configuration, checkpoints/status/doctor) is released, and the formal M15
 reliability gate is closed. The current stage is **M16**. The live queue
-currently leads with remaining 2026-09-06 deep-audit items (now
-**STORAGE-02**), then returns to M16 product leftovers. The ordered route is
+currently leads with the last 2026-09-06 deep-audit item (**PROCESS-01**,
+Unix supervision identity; the other code findings are closed), then
+returns to M16 product leftovers. The ordered route is
 [`docs/ROADMAP.md`](docs/ROADMAP.md#route-to-a-usable-local-agent); the
 active task queue is [`docs/NEXT_TASKS.md`](docs/NEXT_TASKS.md). M16
 replaces the earlier D0/F1–F6 queue. It does not add Chronicle, TaskGraph,

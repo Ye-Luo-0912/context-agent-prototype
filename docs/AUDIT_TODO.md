@@ -1,7 +1,7 @@
 # 缺陷分流
 
-当前执行顺序由 [NEXT_TASKS.md](NEXT_TASKS.md) 前列决定：先关闭 2026-09-06 深入续审仍开放项（当前 **STORAGE-02**），再回到 M16-02。
-不把 13 项清零设成新阶段，不要求全部关闭才允许以后交付功能；但本工作树现在把仍开放项排在产品剩余之前。
+当前执行顺序由 [NEXT_TASKS.md](NEXT_TASKS.md) 前列决定：深入续审代码项除 **PROCESS-01 Unix 剩余**外已全部关闭；M16-02 完成语义展示已于 2026-09-07 关闭。
+不把 13 项清零设成新阶段，不要求全部关闭才允许以后交付功能。
 
 原报告与探针：[reviews/2026-09-06-deep-audit/REVIEW.md](reviews/2026-09-06-deep-audit/REVIEW.md)。
 建议回归按 [TEST_MATRIX.md](reviews/2026-09-06-deep-audit/TEST_MATRIX.md) 补进现有 crate，不新建总门禁。
@@ -9,19 +9,11 @@
 
 ## 仍开放（活动队列前列）
 
-审查在 `12c8628` 上静态确认；本分支对照后仍在。均未在本机用真实 Windows 崩溃、HTTP 压力或 Agent crash-resume 重跑。P1 是修复优先级，不是已发生数据损坏的事故结论。
+审查在 `12c8628` 上静态确认。除下列开放项外，其余发现已于 2026-09-06 在本分支关闭（见下表）；关闭判定来自实现提交的定向测试记录（`f9852ea`、`7c72df3`、`17c5ded`、`3e0128a`），未在本机重跑真实 Windows 崩溃、HTTP 压力或 Agent crash-resume。P1 是修复优先级，不是已发生数据损坏的事故结论。
 
 | 工单 | 已核对位置 | 要修什么 | 不要做什么 |
 |---|---|---|---|
-| **STORAGE-02（当前）** | `crates/agent-storage/src/lib.rs` `compact_locked`；`persist_authority_metadata` 成功后仍可能在 seek/切 writer 前返回 Err。`agent-core` `compact_authority_journal` 只转发错误，没有普通 WAL 追加那套 `failed` 围栏 | 发布后不确定则隔离旧 writer；再次打开与对账一致。保留普通 `append_transition` 围栏 | 不选最大 `.gN` 当恢复源；不弱化普通追加；未注入 Windows 崩溃不宣称硬崩溃已测 |
-| PROCESS-01 | `RecipeProofRunner` `host_trusted: true` 跳过 spawn 恢复登记；注释假定硬崩溃后无需回收。Linux 探针：父进程 SIGKILL 后独立进程组子进程可存活 | 宿主验证监督身份或 OS 生存期约束；清理确认后再复用工作区。宿主可信免除审批，不免除生存期 | 不否定已落地的协作取消桥接；Linux 探针是 OS 机制，不是 Agent 集成测试 |
-| PROCESS-02 | `ProcessSupervisor::reap` 第二次有界 wait 结果忽略后无条件 `pid=0` | 未确认终态不清监督身份；返回类型化清理结果 | Unix group leader 是缓解不是证明 |
-| WORKSPACE-01 | 普通 Unix confined open 无 `O_NONBLOCK`；recovery 路径已有。`project_markers` 会同步打开 | 标记探测有界；复用 recovery 打开。FIFO 名为 `Cargo.toml` 才卡住 | `.git` 等目录标记不能一律当普通文件 |
-| WORKSPACE-02 | 多处先 raw HANDLE，`check_not_reparse` 失败时尚未 RAII 接管 | 立刻接管句柄；复用已有 recovery helper | 拒绝仍发生，不是路径逃逸 |
-| PROVIDER-01 | Chat/Responses 非 2xx 先 `response.text().await` 再截短 | 读入阶段限额，取消/超时保持正确 | 不改模型协议权威；无 HTTP 压力测试则不写已压测 |
-| PROVIDER-02 | Chat `finish_reason=length` 无独立映射 | 保留不完整终止信息；已暴露输出不透明重放 | 不无条件重试 |
-| PROVIDER-03 | `framer.finish()` EOF 尾帧跳过 event 名与 JSON type 一致性检查 | 与正常 SSE 共用校验 | |
-| CONTEXT-01 | `push_linked` 每实体先取桶前 64 再 newest-first；`update_entities` 用 `swap_remove` | 先按创建/新旧选择再 cap；扫描预算与候选配额分开 | 关联边不是强制正文；不宣称 GC 已误删必需上下文 |
+| **PROCESS-01（当前）** | proof lane spawn：Windows KILL_ON_JOB_CLOSE 围栏已落地（`7c72df3`）；Unix pre_exec 钩子在 GH runner 静默不执行（marker 探针实证），已从生产 spawn 移除（`5eaf3fb`） | Unix 持久监督身份设计；清理确认后再复用工作区。宿主可信免除审批，不免除生存期 | 不否定已落地的取消桥接；探针是 OS 机制，不是 Agent 集成测试 |
 | PACKAGE-01 | `dist.sh` / `dist.ps1` 接受 target 但不传 `--target-dir`；复用 `dist/<version>`。Bash 桩测：旧产物可被成功打包 | 下次实际发布：构建输出与复制源同一身份；干净 staging；PowerShell 原生退出码 | 不宣称当前已发布 ZIP 已错 |
 | MCP-01 | 写请求阶段只有 deadline，取消在读阶段 | 仅当默认产品启用 MCP 写路径时：写/连接/读都可取消；半帧毒化 session；await reap | 不启用第二调度器；未启用则跳过 |
 
@@ -29,6 +21,14 @@
 
 | 项目 | 处理 |
 |---|---|
+| STORAGE-02 | 已落地（`f9852ea`）：`compact_locked` 全部可失败步骤前移到 metadata 发布点之前，发布后仅内存 writer 交换与尽力删除旧 WAL；agent-storage 21/21 |
+| PROCESS-02 | 已落地（`7c72df3`）：`reap` 仅在确认退出后清 pid（类型化 `ProcessReapOutcome`）；`kill_tree` fallback 无锁 direct kill；agent-process 30 |
+| WORKSPACE-01 | 已落地（`17c5ded`）：普通 open 带 `O_NONBLOCK`；`project_markers` 仅元数据探测（`fstatat NOFOLLOW`）；FIFO watchdog 回归；agent-workspace 98+5+3 |
+| WORKSPACE-02 | 已落地（`17c5ded`）：六处 raw HANDLE 先 `from_raw_handle` 接管再 reparse 检查；句柄计数故障注入未做 |
+| PROVIDER-01 | 已落地（`3e0128a`）：非 2xx 走 `bounded_error_body`（8 KiB 上限 + 每块 deadline，截断显式标注）；provider-openai 107 |
+| PROVIDER-02 | 已落地（`3e0128a`）：Chat `length` 映射 `ModelOutputLimit`，不把截断前缀重放为正常完成 |
+| PROVIDER-03 | 已落地（`3e0128a`）：EOF 尾帧过 `validate_sse_event_routing`，矛盾帧拒绝 |
+| CONTEXT-01 | 已落地（`3e0128a`）：依赖扫描 newest-first，桶内删除改序保持（`remove` 不 `swap_remove`）；context-simple 287 |
 | STORAGE-01 | 已落地：Windows `MoveFileEx` 替换 metadata，不再先删；缺 metadata 且有 WAL 代际则 `RecoveryRequired`，不铸空 g1、不选最大 `.gN`。`cargo test -p agent-storage` 覆盖残留代际与覆盖写。Windows 在替换中途杀进程仍未注入 |
 | DOC-01 | 活动 CURRENT 与已落地文件的矛盾已随 D0/M16-00 关闭。检查脚本仍只验结构/链接，不是全部状态断言的语义一致性 |
 | 输出 EOF 后在 `select!` 外 `child.wait()` | F3-6a：`outputs_closed` 后继续守超时/取消 |

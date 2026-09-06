@@ -1,8 +1,8 @@
 # 可执行任务队列
 
-> 状态：**当前工单是 PROCESS-01**（STORAGE-02 已于 2026-09-06 关闭）。
+> 状态：**当前工单是 PROCESS-01 Unix 剩余**（审查其余代码项已关闭；M16-02 已于 2026-09-07 关闭；PACKAGE-01、MCP-01 按条件）。
 > 审查剩余排在 M16 产品剩余之前；不是第二套队列，也不是把 13 项清零当成新阶段。
-> 审查/提案基线：`12c86283b8d5991e9f17a07f14871dcf39d65066`。本工作树 HEAD：`2e825d0`，另有未提交产品改动。
+> 审查/提案基线：`12c86283b8d5991e9f17a07f14871dcf39d65066`。本工作树 HEAD：`4464640`。
 > 分流原文：[reviews/2026-09-06-deep-audit/REVIEW.md](reviews/2026-09-06-deep-audit/REVIEW.md)。建议回归：[reviews/2026-09-06-deep-audit/TEST_MATRIX.md](reviews/2026-09-06-deep-audit/TEST_MATRIX.md)。
 > 不替代 Core、Effect、Workspace、恢复与输出边界契约；不改写历史评测结论。
 
@@ -20,9 +20,9 @@
 |---|---|---|---|
 | 1 | ~~STORAGE-02~~ | 压缩已发布后失败则隔离旧 writer | 已关闭（2026-09-06） |
 | 2 | PROCESS-01 | 宿主验证硬崩溃监督 | 部分关闭：Windows 围栏已落地；Unix pre_exec 在 GH runner 上静默不执行（探针实证），需持久监督身份设计 |
-| 3 | PROCESS-02 | reap 未确认退出不清 pid | 开放 |
-| 4 | WORKSPACE-01 | 普通 open 不阻塞 FIFO | 开放 |
-| 5 | WORKSPACE-02 | Windows 拒绝路径立即接管 HANDLE | 开放 |
+| 3 | ~~PROCESS-02~~ | reap 未确认退出不清 pid | 已关闭（2026-09-06） |
+| 4 | ~~WORKSPACE-01~~ | 普通 open 不阻塞 FIFO | 已关闭（2026-09-06） |
+| 5 | ~~WORKSPACE-02~~ | Windows 拒绝路径立即接管 HANDLE | 已关闭（2026-09-06） |
 | 6 | ~~PROVIDER-01~~ | 错误 HTTP body 有界读取 | 已关闭（2026-09-06） |
 | 7 | ~~PROVIDER-02~~ | Chat `length` 终止语义 | 已关闭（2026-09-06） |
 | 8 | ~~PROVIDER-03~~ | Responses EOF 尾帧校验 | 已关闭（2026-09-06） |
@@ -32,7 +32,8 @@
 | 12 | ~~M16-02 剩余~~ | 待审阅 ≠ 持久完成 | 已关闭（2026-09-07） |
 
 已关闭、跳过：STORAGE-01、DOC-01；EOF wait、消费 ACK、PromptRequired、resync。
-M16-00/01/05/07 与大部分 02/03/06 已落地，细节见下方 M16 表。
+关闭证据：STORAGE-02 `f9852ea`、PROCESS-01/02 `7c72df3`、WORKSPACE-01/02 `17c5ded`、PROVIDER-01/02/03 与 CONTEXT-01 `3e0128a`（定向测试计数见各提交说明）。
+M16-00/01/02/05/07 与大部分 03/06 已落地，细节见下方 M16 表。
 
 ---
 
@@ -64,7 +65,9 @@ M16-00/01/05/07 与大部分 02/03/06 已落地，细节见下方 M16 表。
 
 ---
 
-## PROCESS-02：未确认退出不清 pid
+## PROCESS-02：未确认退出不清 pid（已关闭 2026-09-06）
+
+**实现：** `reap` 返回类型化 `ProcessReapOutcome`，仅在确认退出后清 pid，未确认终态由 Drop 保留击杀责任；`kill_tree` 直接子进程 fallback 改为无锁 direct pid kill（原 `try_lock` 在 reap 持锁时必失败）。回归：持锁期间非 group-leader 子进程经 fallback 终止（`7c72df3`；agent-process 30）。
 
 **用户结果：** `reap` 在 wait 失败或两次有界等待都超时时，不能报告清理成功并丢掉监督身份。
 
@@ -76,7 +79,9 @@ M16-00/01/05/07 与大部分 02/03/06 已落地，细节见下方 M16 表。
 
 ---
 
-## WORKSPACE-01：普通 confined open 不阻塞 FIFO
+## WORKSPACE-01：普通 confined open 不阻塞 FIFO（已关闭 2026-09-06）
+
+**实现：** 普通 open 带 `O_NONBLOCK`（普通文件/目录 I/O 不受影响），同句柄 stat 拒绝非普通文件/目录，staged 目标要求普通文件；`project_markers` 改为仅元数据探测（`fstatat AT_SYMLINK_NOFOLLOW`），根扫描不再打开任何条目。回归：无写端 FIFO 位于 `Cargo.toml` 不再卡住扫描（watchdog 测试；`17c5ded`，agent-workspace 98+5+3）。
 
 **用户结果：** 项目标记探测遇到无写端 FIFO 时有界失败，不在同步 `open` 上卡死。
 
@@ -88,7 +93,9 @@ M16-00/01/05/07 与大部分 02/03/06 已落地，细节见下方 M16 表。
 
 ---
 
-## WORKSPACE-02：Windows 拒绝路径立刻接管 HANDLE
+## WORKSPACE-02：Windows 拒绝路径立刻接管 HANDLE（已关闭 2026-09-06）
+
+**实现：** 六处 raw HANDLE 调用点（`open_root_handle`、`open_child_dir`、`open_existing` 两臂、`open_staged_for_cleanup`、`open_or_create_regular_file`）全部先 `from_raw_handle` 接管再 `check_not_reparse`，对齐 recovery helper 模式。既有 reparse 拒绝测试覆盖行为；句柄计数故障注入未做（`17c5ded`）。
 
 **用户结果：** `check_not_reparse` 失败时句柄仍被拥有并关闭，拒绝仍然发生。
 
@@ -164,7 +171,7 @@ M16-00/01/05/07 与大部分 02/03/06 已落地，细节见下方 M16 表。
 
 **入口：** `crates/agent-capability-process/src/mcp.rs`（`request_with_cancel`）。
 
-**何时做：** 仅当默认产品声明启用 MCP 写路径。当前未启用则跳过，不算阻塞 STORAGE-02 之后的代码项。
+**何时做：** 仅当默认产品声明启用 MCP 写路径。当前未启用则跳过，不算阻塞队列里的代码项。
 
 **不要：** 第二调度器。
 
@@ -182,7 +189,7 @@ M16-00/01/05/07 与大部分 02/03/06 已落地，细节见下方 M16 表。
 | M16-01 | 继续、忙时补充、启动预检 | 代码已落地；TUI 走查待做 | F1 |
 | M16-02 | `/work` `/plan` 与完成语义 | 已落地（2026-09-07：待审阅/持久完成显式区分） | F2 |
 | M16-03 | 有限模型轮与可确认取消 | 主体已落地；PROCESS/PROVIDER 见上列 | F3 |
-| M16-04 | 可信冷恢复 | STORAGE-01 已落地；STORAGE-02 见上列 | 恢复路径 |
+| M16-04 | 可信冷恢复 | STORAGE-01/02 已落地；产品配置恢复走查待做 | 恢复路径 |
 | M16-05 | `/review` 与状态区分 | 结果卡已落地；双工作区走查待做 | F4 |
 | M16-06 | 上下文/搜索正确性 | 主体已落地；CONTEXT/WORKSPACE 见上列 | F5 |
 | M16-07 | 单进程非交互入口 | N1/N2 已落地 | 原 F6 之后项 |
@@ -210,9 +217,9 @@ M16-00/01/05/07 与大部分 02/03/06 已落地，细节见下方 M16 表。
 
 ---
 
-## M16-02：任务工作模式、短计划与完成语义
+## M16-02：任务工作模式、短计划与完成语义（已关闭 2026-09-07）
 
-**排在审查剩余之后。** 入口已落地；剩余是完成展示。
+**已全部落地。** 入口（`/work`、`/plan`）与完成语义展示均已关闭；细节见下。
 
 **用户结果：** 一个开发目标有短清单；用户能区分「已产出待审阅」「本段结束」「证据完成」「操作员接受」。
 
@@ -249,7 +256,7 @@ M16-00/01/05/07 与大部分 02/03/06 已落地，细节见下方 M16 表。
 
 **已落地：** STORAGE-01；`RuntimeInstance::restore`；`--restore=latest`；`route_flow.rs` 含跨检查点 continue。
 
-**STORAGE-02 走前列。** 之后在产品配置（capability-aware + broker + 非 permissive 审批）下补一条「保存 → 结束进程 → 恢复 → continue」，复用 `crash_resume.rs`，不建第三套评测。
+**存储围栏已落地（STORAGE-01/02）。** 之后在产品配置（capability-aware + broker + 非 permissive 审批）下补一条「保存 → 结束进程 → 恢复 → continue」，复用 `crash_resume.rs`，不建第三套评测。
 
 **不要：** Chronicle / RunCatalog 数据库。
 

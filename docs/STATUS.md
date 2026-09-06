@@ -1,7 +1,7 @@
 # 状态入口
 
 当前事实在 [CURRENT.md](CURRENT.md) 与 [state.json](state.json)。
-当前功能队列在 [NEXT_TASKS.md](NEXT_TASKS.md)：前列是 2026-09-06 深入续审仍开放项（当前 **STORAGE-02**），之后才是 M16 产品剩余。顺序由 [ROADMAP.md](ROADMAP.md) 决定。
+当前功能队列在 [NEXT_TASKS.md](NEXT_TASKS.md)：前列是 2026-09-06 深入续审剩余（当前 **PROCESS-01 Unix 剩余**，其余代码项已关闭），之后是 M16 产品剩余。顺序由 [ROADMAP.md](ROADMAP.md) 决定。
 缺陷细节在 [AUDIT_TODO.md](AUDIT_TODO.md)。同一基线的审查与提案：
 [2026-09-05](reviews/2026-09-05-code-review.md)、
 [续审](reviews/2026-09-06-continued-audit/REVIEW.md)、
