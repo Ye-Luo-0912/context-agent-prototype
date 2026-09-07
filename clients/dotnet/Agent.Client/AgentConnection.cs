@@ -14,8 +14,10 @@ public sealed record AgentConnectionOptions
     public ushort ProtocolMinor { get; init; } = 0;
 
     /// <summary>Hex digest binding the negotiated session contract surface.
-    /// The host and every client must agree on this value.</summary>
-    public string SchemaDigest { get; init; } = new('0', 64);
+    /// Defaults to the seed the Rust host negotiates; both sides refuse
+    /// drift.</summary>
+    public string SchemaDigest { get; init; } =
+        "79eda3b0421ca507b2d9eaca68471dcaba350e3a971eda26efaeb691d60678cf";
 
     /// <summary>Per-request bound; a request that outlives it fails the wait
     /// but never fabricates a response.</summary>
@@ -38,12 +40,18 @@ public sealed record AgentConnectionOptions
 /// </summary>
 public sealed class AgentConnection : IAgentConnection
 {
+    /// <summary>
+    /// The profile the Rust host (<c>agent-host</c>) negotiates. The schema
+    /// digest is SHA-256 of the host's session-contract seed
+    /// ("focus-agent.platform.work.v1|run-scoped"); both sides hard-code the
+    /// same pairing and refuse any drift.
+    /// </summary>
     public static ProtocolIdentity DefaultProtocolIdentity { get; } = new()
     {
         Name = "focus-agent.platform",
         Version = new ProtocolVersion { Major = 1, Minor = 0 },
         ActiveFeatures = new ActiveFeatures(),
-        SchemaDigest = new string('0', 64),
+        SchemaDigest = "79eda3b0421ca507b2d9eaca68471dcaba350e3a971eda26efaeb691d60678cf",
     };
 
     private readonly ProtocolIdentity _identity;

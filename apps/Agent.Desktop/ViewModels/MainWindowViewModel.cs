@@ -26,7 +26,7 @@ public sealed class TaskItemViewModel
     {
         TaskSnapshotStatus.Active => "活动",
         TaskSnapshotStatus.Suspended => "已挂起",
-        TaskSnapshotStatus.Completed => "已完成",
+        TaskSnapshotStatus.Completed => "已完成（操作员接受语义随 P2 类型化字段区分）",
         _ => status.ToString(),
     };
 }
@@ -56,7 +56,12 @@ public sealed class MainWindowViewModel : ObservableObject
         "Unix Socket",
     };
 
-    private IAgentConnection? _connection;
+    /// <summary>G3: bounded retained data — the list never grows past this.</summary>
+    private const int MaxRenderedTasks = 200;
+    private const int MaxOutputLines = 400;
+
+    private ResumableSession? _session;
+    private FixtureAgentConnection? _fixture;
     private readonly DispatcherTimer? _refreshTimer;
     private string _connectionLabel = "未连接";
     private bool _isConnected;
@@ -66,6 +71,7 @@ public sealed class MainWindowViewModel : ObservableObject
     private ulong _watermark;
     private string _focusText = "—";
     private string _planText = "计划随平台快照的锚点字段接入（P2）后显示。";
+    private string _bannerText = string.Empty;
     private string _outputText = string.Empty;
     private bool _autoRefresh = true;
 
@@ -95,16 +101,17 @@ public sealed class MainWindowViewModel : ObservableObject
             () => RefreshSnapshotAsync(),
             () => IsConnected,
             error => AppendOutput($"刷新失败：{error.Message}"));
+
         if (Dispatcher.UIThread is { } ui)
         {
             _refreshTimer = new DispatcherTimer { Interval = TimeSpan.FromSeconds(3) };
             _refreshTimer.Tick += async (_, _) =>
             {
-                if (AutoRefresh && IsConnected && _connection is not null)
+                if (AutoRefresh && IsConnected)
                 {
                     try
                     {
-                        await RefreshSnapshotCoreAsync(_connection);
+                        await RefreshSnapshotCoreAsync();
                     }
                     catch
                     {
@@ -125,6 +132,7 @@ public sealed class MainWindowViewModel : ObservableObject
     public ICommand ContinueCommand { get; }
     public ICommand CancelCommand { get; }
     public ICommand RefreshCommand { get; }
+
     public ObservableCollection<TaskItemViewModel> Tasks { get; } = [];
     public ObservableCollection<ApprovalItemViewModel> Approvals { get; } = [];
 
@@ -170,7 +178,7 @@ public sealed class MainWindowViewModel : ObservableObject
         {
             if (Set(ref _isConnected, value))
             {
-                ConnectionLabel = value ? _connection?.IsConnected == true ? "已连接" : "已连接" : "未连接";
+                ConnectionLabel = value ? "已连接" : "未连接";
                 AsyncCommands.RaiseCanExecute();
             }
         }
@@ -184,123 +192,156 @@ public sealed class MainWindowViewModel : ObservableObject
 
     public string PlanText { get => _planText; private set => Set(ref _planText, value); }
 
+    /// <summary>G2 banner: resync / connection-loss state, never silently hidden.</summary>
+    public string BannerText { get => _bannerText; private set => Set(ref _bannerText, value); }
+
     public string OutputText { get => _outputText; private set => Set(ref _outputText, value); }
 
     private void AppendOutput(string line)
     {
-        // Bounded console output: keep the tail, drop the head past 400 lines.
         var builder = new StringBuilder(OutputText);
         builder.AppendLine(line);
         var lines = builder.ToString().Split('\n');
-        if (lines.Length > 400)
+        if (lines.Length > MaxOutputLines)
         {
-            builder = new StringBuilder(string.Join('\n', lines[^400..]));
+            builder = new StringBuilder(string.Join('\n', lines[^MaxOutputLines..]));
         }
         OutputText = builder.ToString();
     }
 
+    private IAgentTransport BuildTransport() => (TransportKind)TransportIndex switch
+    {
+        TransportKind.WindowsNamedPipe => new NamedPipeTransport(Endpoint),
+        _ => new UnixDomainSocketTransport(Endpoint),
+    };
+
     private async Task ConnectAsync()
     {
         await DisconnectAsync();
-        IAgentConnection connection;
         if ((TransportKind)TransportIndex == TransportKind.FixtureLayout)
         {
-            connection = new FixtureAgentConnection();
+            _fixture = new FixtureAgentConnection();
+            _session = null;
+            IsConnected = true;
+            ConnectionLabel = "已连接（布局夹具）";
+            BannerText = "布局夹具：仅驱动界面布局，不是执行器，不代表任何真实任务状态。";
+            ApplySnapshot(await _fixture.SnapshotAsync());
+            return;
         }
-        else
+        var session = new ResumableSession(
+            () => BuildTransport().ConnectAsync(CancellationToken.None));
+        session.Resynced += snapshot => Dispatcher.UIThread.Post(() =>
         {
-            IAgentTransport transport = (TransportKind)TransportIndex switch
-            {
-                TransportKind.WindowsNamedPipe => (IAgentTransport)new NamedPipeTransport(Endpoint),
-                _ => new UnixDomainSocketTransport(Endpoint),
-            };
-            var stream = await transport.ConnectAsync(CancellationToken.None);
-            connection = new AgentConnection(stream);
-        }
-        _connection = connection;
+            BannerText = "已从快照重建（重连）。挂起的审批以服务器快照为准，不会自动通过。";
+            ApplySnapshot(snapshot);
+        });
+        session.ConnectionLost += failure => Dispatcher.UIThread.Post(() =>
+        {
+            BannerText = "连接丢失。挂起的审批不会自动通过；正在重连并从快照重建。";
+            AppendOutput($"连接丢失：{failure.Message}");
+        });
+        _session = session;
         IsConnected = true;
         AppendOutput($"已连接：{TransportLabels[TransportIndex]} / {Endpoint}");
-        await RefreshSnapshotCoreAsync(connection);
+        ApplySnapshot(await session.SnapshotAsync());
     }
 
     private async Task DisconnectAsync()
     {
-        if (_connection is not null)
+        _fixture = null;
+        if (_session is not null)
         {
-            await _connection.DisposeAsync();
-            _connection = null;
-            IsConnected = false;
-            Tasks.ReplaceWith([]);
-            Approvals.ReplaceWith([]);
-            AppendOutput("已断开。");
+            await _session.DisposeAsync();
+            _session = null;
         }
+        IsConnected = false;
+        BannerText = string.Empty;
+        Tasks.ReplaceWith([]);
+        Approvals.ReplaceWith([]);
     }
 
     private async Task SubmitAsync()
     {
-        if (_connection is null)
+        if (_session is null)
         {
+            if (_fixture is not null)
+            {
+                var fixtureReceipt = await _fixture.SubmitWorkAsync(GoalInput.Trim(), ClientRequestIds.Next());
+                AppendOutput($"夹具受理：task {fixtureReceipt.TaskId}。仅布局，不执行。");
+                GoalInput = string.Empty;
+                await RefreshSnapshotCoreAsync();
+            }
             return;
         }
-        var receipt = await _connection.SubmitWorkAsync(GoalInput.Trim(), ClientRequestIds.Next());
+        var receipt = await _session.SubmitWorkAsync(GoalInput.Trim(), ClientRequestIds.Next());
         AppendOutput($"已受理：task {receipt.TaskId}（{receipt.Disposition}）。受理 ≠ 完成，完成以快照与事件为准。");
         GoalInput = string.Empty;
-        await RefreshSnapshotCoreAsync(_connection);
+        await RefreshSnapshotCoreAsync();
     }
 
     private async Task ContinueAsync()
     {
-        if (_connection is null)
+        if (_session is null)
         {
+            if (_fixture is not null)
+            {
+                AppendOutput("夹具模式不模拟继续；连接真实宿主后可用。");
+            }
             return;
         }
-        var receipt = await _connection.ContinueAsync();
+        var receipt = await _session.ContinueAsync();
         AppendOutput($"已继续活动任务 {receipt.TaskId}。");
-        await RefreshSnapshotCoreAsync(_connection);
+        await RefreshSnapshotCoreAsync();
     }
 
     private async Task CancelAsync()
     {
-        if (_connection is null)
+        if (_session is null)
         {
             return;
         }
-        var receipt = await _connection.CancelCurrentTurnAsync();
+        var receipt = await _session.CancelCurrentTurnAsync();
         AppendOutput(receipt.Ack.Status switch
         {
             TurnCancelAckStatus.Cancelled => $"取消已过屏障：generation {receipt.Ack.CancelledGeneration} → {receipt.Ack.EffectiveGeneration}。",
             _ => "当前没有活动轮次（这是事实，不是失败）。",
         });
-        await RefreshSnapshotCoreAsync(_connection);
-    }
-
-    private async Task RespondApprovalAsync(string requestId, ApprovalDecision decision)
-    {
-        if (_connection is null)
-        {
-            return;
-        }
-        var outcome = await _connection.RespondApprovalAsync(requestId, decision);
-        AppendOutput(outcome.Outcome == ApprovalRespondOutcome.Delivered
-            ? $"审批 {requestId} 已送达：{decision}。"
-            : $"审批 {requestId} 已不在待决（迟到或重复），当前事实被返回。");
-        await RefreshSnapshotCoreAsync(_connection);
+        await RefreshSnapshotCoreAsync();
     }
 
     private Task RefreshSnapshotAsync()
     {
-        if (_connection is null)
+        if (_session is null)
         {
             return Task.CompletedTask;
         }
-        return RefreshSnapshotCoreAsync(_connection);
+        return RefreshSnapshotCoreAsync();
     }
 
-    private async Task RefreshSnapshotCoreAsync(IAgentConnection connection)
+    private async Task RefreshSnapshotCoreAsync()
     {
-        var snapshot = await connection.SnapshotAsync();
+        switch (_session, _fixture)
+        {
+            case (not null, _):
+                ApplySnapshot(await _session.SnapshotAsync());
+                break;
+            case (_, not null):
+                ApplySnapshot(await _fixture.SnapshotAsync());
+                break;
+        }
+    }
+
+    private void ApplySnapshot(WorkSnapshotResponse snapshot)
+    {
         var focusId = snapshot.Focus?.TaskId;
-        Tasks.ReplaceWith(snapshot.Tasks.Select(entry => TaskItemViewModel.From(entry, entry.TaskId == focusId)));
+        Tasks.ReplaceWith(
+            snapshot.Tasks
+                .Take(MaxRenderedTasks)
+                .Select(entry => TaskItemViewModel.From(entry, entry.TaskId == focusId)));
+        if (snapshot.Tasks.Count > MaxRenderedTasks)
+        {
+            AppendOutput($"任务列表超过 {MaxRenderedTasks} 条，界面只保留前 {MaxRenderedTasks} 条（有界保留）。");
+        }
         Approvals.ReplaceWith(snapshot.PendingApprovals.Select(entry => new ApprovalItemViewModel
         {
             RequestId = entry.RequestId,
@@ -316,7 +357,29 @@ public sealed class MainWindowViewModel : ObservableObject
         FocusText = snapshot.Focus is null
             ? "无焦点任务"
             : $"{snapshot.Focus.Goal}（anchor r{snapshot.Focus.AnchorRevision}）";
-        PlanText = "计划随平台快照的锚点字段接入（P2）后显示。";
+        if (snapshot.ResyncRequired)
+        {
+            BannerText = "事件流出现缺口（resync_required）：显示状态已由本快照整体重建。";
+        }
         AsyncCommands.RaiseCanExecute();
+    }
+
+    private async Task RespondApprovalAsync(string requestId, ApprovalDecision decision)
+    {
+        if (_session is null)
+        {
+            if (_fixture is not null)
+            {
+                await _fixture.RespondApprovalAsync(requestId, decision);
+                AppendOutput($"夹具审批 {requestId}：{decision}。仅布局。");
+                await RefreshSnapshotCoreAsync();
+            }
+            return;
+        }
+        var outcome = await _session.RespondApprovalAsync(requestId, decision);
+        AppendOutput(outcome.Outcome == ApprovalRespondOutcome.Delivered
+            ? $"审批 {requestId} 已送达：{decision}。"
+            : $"审批 {requestId} 已不在待决（迟到或重复），当前事实被返回。");
+        await RefreshSnapshotCoreAsync();
     }
 }

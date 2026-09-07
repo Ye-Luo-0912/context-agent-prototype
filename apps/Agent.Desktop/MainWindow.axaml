@@ -7,7 +7,7 @@
         Width="1180" Height="760"
         WindowStartupLocation="CenterScreen">
 
-  <Grid Margin="12" RowDefinitions="Auto,*,Auto" ColumnDefinitions="*">
+  <Grid Margin="12" RowDefinitions="Auto,Auto,*,Auto" ColumnDefinitions="*">
 
     <!-- 连接栏 -->
     <StackPanel Grid.Row="0" Orientation="Horizontal" Spacing="8" Margin="0,0,0,10">
@@ -19,8 +19,14 @@
       <TextBlock Text="{Binding ConnectionLabel}" VerticalAlignment="Center" FontWeight="SemiBold" />
     </StackPanel>
 
+    <!-- G2 状态横幅：重连/resync/夹具提示，绝不静默 -->
+    <Border Grid.Row="1" Background="#22d0a000" CornerRadius="4" Padding="8,4" Margin="0,0,0,8"
+            IsVisible="{Binding BannerText, Converter={x:Static StringConverters.IsNotNullOrEmpty}}">
+      <TextBlock Text="{Binding BannerText}" TextWrapping="Wrap" />
+    </Border>
+
     <!-- 主体：左任务列表 / 右工作区 -->
-    <Grid Grid.Row="1" ColumnDefinitions="340,*">
+    <Grid Grid.Row="2" ColumnDefinitions="340,*">
 
       <Border Grid.Column="0" BorderBrush="#33808080" BorderThickness="1" CornerRadius="6" Padding="8" Margin="0,0,10,0">
         <DockPanel>
@@ -84,7 +90,7 @@
       </Grid>
     </Grid>
 
-    <TextBlock Grid.Row="2" Margin="0,10,0,0" Foreground="#99808080"
+    <TextBlock Grid.Row="3" Margin="0,10,0,0" Foreground="#99808080"
                Text="C0 会话契约 · 受理 ≠ 应用 ≠ 任务完成 ≠ 清理确认；审批等待服务端回执，不本地宣布授权。" />
   </Grid>
 </Window>
