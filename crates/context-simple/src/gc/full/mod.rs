@@ -14,6 +14,7 @@ use crate::index::entity::{
     observation_file_path_entry,
 };
 use crate::policy::score_item_with_breakdown;
+use crate::residency::protected_from_expiry;
 use crate::store;
 
 /// Cap on transitive dependency expansion during the mark phase: the root
@@ -163,11 +164,9 @@ pub(crate) fn plan_full_gc(
         // is for the working set, not for spent turn observations — they
         // leave the heap and stay recallable from the buffer. An explicit
         // model directive (`context.gc_hint` / `context.lease`) overrides
-        // that heuristic: the model asked for the item to stay.
-        let model_directed = item.keep_alive
-            || item
-                .lease_until_turn
-                .is_some_and(|until| state.turn <= until);
+        // that heuristic: the model asked for the item to stay. Same
+        // predicate as the residency/warm expiry protection (F16).
+        let model_directed = protected_from_expiry(&item, state.turn);
         let latest_file_body = latest_file_bodies.contains(&item.id);
         let consumed_ephemeral = item.attention == AttentionState::Archived
             && item.retention == ContextRetention::Ephemeral
@@ -596,11 +595,9 @@ fn mark_roots(
         // `context.lease`): the model asked for this item to stay, so GC
         // treats it as a root until the hint is cleared or the lease runs
         // out. Explainable like every other root: "kept because the model
-        // leased it until turn N / set keep_alive".
-        let model_directed_root = item.keep_alive
-            || item
-                .lease_until_turn
-                .is_some_and(|until| state.turn <= until);
+        // leased it until turn N / set keep_alive". Same predicate as the
+        // residency/warm expiry protection (F16).
+        let model_directed_root = protected_from_expiry(item, state.turn);
         // TaskAnchor 投影的根声明（runtime 推送）：ResidentRequired /
         // PromptRequired 的声明指向的条目是根。任务权威在 TaskManager，
         // 这里只消费投影；semantic 死亡是终态，sweep 的 alive_root 仍
@@ -754,8 +751,7 @@ fn aged_ordinary_dialogue(
 ) -> bool {
     item.retention == ContextRetention::Working
         && !crate::scope::retention_or_tag_promotable(item.retention, &item.tags)
-        && !item.keep_alive
-        && !item.lease_until_turn.is_some_and(|until| turn <= until)
+        && !protected_from_expiry(item, turn)
         && !hot
         && turn.saturating_sub(item.created_turn) > config.turn_ttl_ticks * 4
 }
