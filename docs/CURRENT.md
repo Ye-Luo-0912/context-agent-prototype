@@ -27,13 +27,14 @@ M16-00–07 已全部关闭；M16-08 走查已落地（2026-09-07，见 [walkthr
 | F08 | `queue_error_verifications` 以输出实体匹配所有 live Error，无故障/任务/覆盖域/版本关联 | B3（主体已关闭 2026-09-07：同配方 recipe_id 关联终结；recipe 版本/覆盖身份与任务级关联仍开放） |
 | F09 | `--prompt=-` 先 `read_to_string` 全量读入；grant 文件 stat 后整体读取；headless 同步写 stdout/文件不受事件等待超时约束 | B3（主体已关闭 2026-09-07：读入时计费＋有界输出 sink；无期限 stdin 读取期限仍开放） |
 
-不在以上范围、同样成立的事实：平台认证 adapter 目前只处理 operation query/cancel；Named Pipe／UDS 仍为后续工作；headless JSONL 过滤实时 delta。它们是 P3/P2 的输入，不是新缺陷结论。
+不在以上范围、同样成立的事实：平台认证 adapter 目前只处理 operation query/cancel（work/approval 路由已由 P1/P2 与 `crates/agent-host` 补齐，2026-09-07）；headless JSONL 过滤实时 delta。事件 wire 契约仍是 P2 的输入，不是新缺陷结论。
 
 ## 三线并行的执行原则
 
 - GUI 的布局、客户端库、只读状态与任务输入可与基础修复同时开始（G1 等 C0）。
 - 涉及宿主执行、可靠清理与冷恢复的**正式支持声明**，等待 B1/B2 对应验收（G2 依赖如此）。
 - 无关的研究性优化（评分、缓存、GC 调参）不阻塞平台与 GUI，也不在本阶段默认开启。
+- G 线已落地事实（2026-09-07）：G1（.NET 客户端＋Avalonia 外壳＋双语 C0 fixtures 一致性）、P3（`crates/agent-host` 命名管道宿主＋互操作冒烟）；G2/G3 的客户端与宿主链路落地，差异审阅与 Context 面板等各自平台路由；详见 NEXT_TASKS 对应行。
 - 共享契约、`command.rs`、compose 入口单一维护者；三线不各自扩充一套 DTO 或任务状态。
 
 ## 已核对的事实

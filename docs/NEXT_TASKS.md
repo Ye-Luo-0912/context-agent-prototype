@@ -33,10 +33,10 @@
 | 4 | B3 | 基础 | Context 验证关联＋stdin/grant/输出接入边界 | 主体已关闭（2026-09-07）：同配方关联终结、stdin/grant 读取时计费、有界输出 sink；扩展范围（recipe 版本/覆盖身份关联、无期限 stdin 读取期限）见剩余表 | 可开始 |
 | 5 | P1 | 平台 | 与 TUI 无关的原子工作提交与受理回执 | **已关闭（2026-09-07）**：`StartWork` 原子命令＋有界受理台账（同 id 同内容幂等、异内容拒绝）；TUI/无头共用 `agent_runtime::work`；F07 交叉投递 5 项验收测试全绿 | — |
 | 6 | P2 | 平台 | 类型化快照、增量事件、审批与结果、重同步 | **主体已关闭（2026-09-07）**：runtime＋TUI 投影 revision 归属修复；`ToolFailureClass::ApprovalDenied` 类型化拒绝替代文字推断；`StatusSnapshot`＋watermark；`WorkControlRouter`（submit/continue/cancel/snapshot/subscribe/approval.respond＋会话授权）；事件重放窗口仍为 resync-only | — |
-| 7 | P3 | 平台 | 正式 Rust 宿主＋Named Pipe/UDS 双向通信 | 进行中（2026-09-07）：`crates/agent-host`（4-byte LE 帧＋1 MiB 帽、同用户 peer 校验、会话授权、work/approval/operation 路由）已编译；e2e 挂起问题与入口接线待收口 | C0, P1, P2 |
-| 8 | G1 | GUI | .NET 客户端库＋正式 Avalonia 外壳 | 提案（路径拟新增） | C0 |
-| 9 | G2 | GUI | 审批/取消/审阅/冷恢复完整链路 | 提案 | G1, P2, P3, B1, B2 |
-| 10 | G3 | GUI | 长会话低开销工作台＋只读 Context 检查 | 提案 | G1, P2, B3 |
+| 7 | P3 | 平台 | 正式 Rust 宿主＋Named Pipe/UDS 双向通信 | 已落地（2026-09-07）：`crates/agent-host` 编译＋命名管道 E2E 绿＋.NET 客户端互操作冒烟 exit 0；事件 wire 契约与 UDS 真机验证见 P3 节 | C0, P1, P2 |
+| 8 | G1 | GUI | .NET 客户端库＋正式 Avalonia 外壳 | 已落地（2026-09-07）：`clients/dotnet/Agent.Client`＋`apps/Agent.Desktop`＋`global.json`(SDK 10.0.301)；C0 fixtures Rust/C# 双语一致测试绿；build/测试/启动冒烟通过 | C0 |
+| 9 | G2 | GUI | 审批/取消/审阅/冷恢复完整链路 | 客户端与宿主链路已落地（2026-09-07）：重连不自动应答审批、断线/resync 横幅、宿主端审批经真实 gate 回执（E2E 绿）；差异按需读取与 GUI 端到端真实工具走查未做（等差异路由与真实 provider） | G1, P2, P3, B1, B2 |
+| 10 | G3 | GUI | 长会话低开销工作台＋只读 Context 检查 | 客户端侧已落地（2026-09-07）：列表虚拟化＋有界保留（200 任务/400 行输出）、DeltaCoalescer、MetricsSession（未测写 NOT_RUN）、只读 Context 面板占位；首采样见 walkthroughs/2026-09-07-g3-desktop-metrics.md | G1, P2, B3 |
 | 11 | E1 | 扩展 | 一个真实外围能力＋按需 Skill 最小闭环 | 已关闭（2026-09-07）：MCP 写/连接/读取消全贯通、compose 配置缝、真实 mock server 闭环集成测试、Skill 按需有界读取；Windows＋WSL2 验证 | P3, G1（闭环已先行落地） |
 | 12 | R1 | 联合 | Rust＋.NET 来源绑定打包与正式使用收口 | 提案 | B1–B3, P3, G2, G3 |
 | 13 | PACKAGE-01 | 条件 | 打包来源绑定 | 下次实际发布 | — |
@@ -148,7 +148,13 @@
 
 **做到这里停止：** 只建可重建投影；不建 Chronicle 数据库；投影不反向提交 effect。
 
-## P3 — 正式 Rust 宿主与本地双向 RPC
+## P3 — 正式 Rust 宿主与本地双向 RPC（已落地 2026-09-07）
+
+**已落地：** `crates/agent-host`（成员已入 workspace）。薄宿主二进制镜像 TUI 组合根（同一 kernel/tools/approval/context 选择），`--pipe`/`--socket`/`--read-only`/`--restore-latest`，`host.lock` workdir 单实例（进程身份核对陈旧锁接管）。Windows 命名管道：`PIPE_REJECT_REMOTE_CLIENTS`＋仅当前用户 DACL＋逐连接客户端令牌 SID 校验；Linux UDS：SO_PEERCRED；无法验证的对端在首帧前丢弃（fail closed）。每连接服务端安装 WorkControlGrant（operator/read-only）＋独立绑定 authorizer，wire 字符串不自报授权。帧＝4-byte LE＋JSON、1 MiB 帽（与 .NET 客户端一致）＋协议 crate DOM 预算；畸形帧关连接；未知路由回 `route.unsupported`。事件通知 wire 契约随 P2 类型化事件落地，客户端先以快照重建（诚实不丢）。
+
+**已验证：** `cargo test -p agent-host` E2E（命名管道）：提交受理/幂等重试 AlreadyAccepted/同 id 异 goal 结构化拒绝 `work.rejected`/快照焦点绑定/真实 gate.authorize 注入审批→快照可见→服务端绑定 id 应答 Delivered→挂起决策解析为 Allow/cancel 诚实 ack/未知路由拒绝。互操作冒烟：真实 .NET Agent.Client 连真实宿主默认管道——连接、快照、提交、焦点、取消 `NoActiveTurn`、干净退出（exit 0）。发现并修复 C# 转换器 HashSet 预置 "status" 导致合法字段被拒的 bug。
+
+**未验证/限制：** UDS 路径仅代码＋编译，真 Linux 运行待 CI（Windows 开发机无 UDS）；事件 wire 契约未定义（订阅回 watermark，通知接收方为后续）；UDS 读期限有（120s），命名管道阻塞读依赖本地可信对端＋有界帧，未做读写期限。
 
 **用户结果：** 原生 GUI 与其它入口连接同一工作区宿主，不各自打开一份可写运行状态。
 
@@ -160,7 +166,13 @@
 
 **做到这里停止：** 不做系统级常驻服务、不默认公网监听、不复制 codec 和 authority；不同时做 HTTP/TCP/gRPC。
 
-## G1 — .NET 客户端库与正式 Avalonia 外壳
+## G1 — .NET 客户端库与正式 Avalonia 外壳（已落地 2026-09-07）
+
+**已落地：** `clients/dotnet/Agent.Client`（net10.0 类库，零 Avalonia 依赖、零 P/Invoke）：run-scoped DTO 逐字节镜像 Rust `work.rs` wire 形状（snake_case、deny-unknown、serde 变体名原样 Only "Allow"/"Deny"），有界帧（4-byte LE、1 MiB），request-id 关联，本地等待取消与显式 `work.cancel` 命令分离，Named Pipe/UDS 传输，ResumableSession 重连策略。`clients/dotnet/Agent.Client.Tests`（24 项）与 `crates/agent-platform-protocol/tests/work_fixtures.rs`（9 项）读同一批 `tests/fixtures/work/*.json`：解码＋验证＋重编码逐字节一致（C0 双语一致性验收）。`apps/Agent.Desktop`（Avalonia 11.3.20）：任务列表/目标提交/继续/取消/审批卡/快照驱动状态条，异步 IO 不占 UI 线程，PerMonitorV2 manifest，无 WebView。`global.json` 锁 SDK 10.0.301。布局夹具模式明确标注"非执行器"。
+
+**已验证：** `dotnet build` 两项目 0 警告 0 错误；`dotnet test` 24/24；`cargo test -p agent-platform-protocol` 35＋9 绿；GUI 6 秒真实启动冒烟；互操作冒烟（见 P3）。
+
+**未验证/限制：** 事件流消费等待 P2 wire 契约（客户端订阅已实现，通知流为空）；中文输入法/DPI/大文本未做专项实测；plan/Context 面板等平台字段。
 
 **用户结果：** 第一版就是正式原生客户端；通信层可被其它 .NET 应用复用。
 
@@ -172,7 +184,13 @@
 
 **做到这里停止：** 不先做 IDE、插件 UI SDK 或全量自绘控件库；不用第二个"验证 GUI"替代。
 
-## G2 — 审批、取消、审阅与恢复完整操作链
+## G2 — 审批、取消、审阅与恢复完整操作链（客户端＋宿主链路已落地 2026-09-07）
+
+**已落地：** 桌面审批卡走平台绑定 id 并等真实回执（宿主 E2E 证明 Delivered/NoLongerPending 语义）；ResumableSession 断线后重连强制快照重建，`RespondApprovalAsync` 不自动重试（丢失的 Allow 可能已送达也可能没有，重发即伪造同意），重连横幅显式声明"挂起审批不会自动通过"；取消走 `work.cancel` 并如实区分 Cancelled/NoActiveTurn；冷恢复在宿主侧走完整 `RuntimeInstance::restore` 事务（`--restore-latest`），窗口重开即快照同步。
+
+**已验证：** 宿主命名管道 E2E（审批全链路）＋ .NET 互操作冒烟；`dotnet test` 24/24 含"断线不自动应答审批"专项。
+
+**未验证/限制：** GUI→真实工具→差异审阅端到端待差异/工件读取路由与真实 provider（不可用写 NOT_RUN）；预算让出/证据完成/操作员接受/恢复受阻的细分展示待 P2 类型化任务字段（快照目前只有 active/suspended/completed）；含用户预存修改的冷恢复 GUI 走查未跑。
 
 **用户结果：** 用户能执行真实开发任务，并知道改动、检查、未验证状态与可恢复点。
 
@@ -184,7 +202,9 @@
 
 **做到这里停止：** 不加第二执行器；不做全量通用代码编辑器；不因 GUI 增加绕过 Core 的文件写入口。
 
-## G3 — 低资源使用的正式工作台与只读 Context 检查
+## G3 — 低资源使用的正式工作台与只读 Context 检查（客户端侧已落地 2026-09-07）
+
+**已落地：** 列表虚拟化（Avalonia ListBox 默认虚拟化栈）＋底层保留上限（任务 200 条、输出尾部 400 行、通知队列 1024）；DeltaCoalescer 小窗口合并流式文字（不丢字符，事件契约落地后接线）；只读 Context 面板占位（平台路由前不显示推断内容）；MetricsSession 有界测量记录器（全进程树工作集采样，未测指标写 null=NOT_RUN）。首采样：[walkthroughs/2026-09-07-g3-desktop-metrics.md](walkthroughs/2026-09-07-g3-desktop-metrics.md)（空闲工作集 222–232 MB，单环境调试构建，不构成性能结论；长会话斜率/输出 CPU/大 diff 均 NOT_RUN）。
 
 **用户结果：** 长会话、大 diff 和上下文查看不导致全历史反复传输、解析和渲染。
 

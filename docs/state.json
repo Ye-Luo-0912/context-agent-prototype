@@ -82,6 +82,7 @@
   "next_ordered": [
     "M16-08 live walkthrough: DONE 2026-09-07 (docs/walkthroughs/2026-09-07-live-binary.md) — three real tasks through the real binary; two defects found and fixed (BudgetStopYield resumable checkpoint, shutdown awaits in-flight safe-point writes)",
     "M17 progression 2026-09-07: B1/B2/B3 implemented and verified; E1 closed (MCP write/connect/read cancellation complete, compose mcp_servers/plugins seams, real-server closed-loop test, bounded on-demand skill reads); P1/P2 in flight; G1/G2 client commits landed",
+    "M17 G-line 2026-09-07: P3 landed (crates/agent-host: named-pipe E2E green, real .NET client interop smoke exit 0, UDS compiled pending Linux CI), G1 landed (Agent.Client + Avalonia Desktop + shared C0 fixtures byte-identical both languages), G2 client+host chain landed (reconnect never auto-answers approvals; diff review awaits artifact routes), G3 client side landed (virtualization + bounded retention + DeltaCoalescer + MetricsSession; first desktop metrics sample in docs/walkthroughs/2026-09-07-g3-desktop-metrics.md)",
     "PACKAGE-01 package source binding at the next actual release (folded into R1)",
     "MCP-01 cancellation gates are now satisfied for the declared MCP lane (E1); further lanes follow the same rule"
   ],
@@ -112,7 +113,7 @@
   },
   "reviewed_source_commit": "12c86283b8d5991e9f17a07f14871dcf39d65066",
   "source_scope_note": "Fixed reviewed source, not the SHA of later documentation or product commits. 2026-09-06 deep review was a partial-source pass (clone failed; 29 paths, not a full-repo inventory; no local Rust); its code items all closed. 2026-09-07 platform-native re-audit (baseline b299c6a, 19 paths, 4 full) is likewise partial-source; its residuals lead the M17 queue (B1-B3, P1, P2) — see docs/reviews/2026-09-07-platform-native-audit/.",
-  "active_task": "M17 C0 (docs/stage switch landed 2026-09-07; protocol DTO remaining), then B1/B2 in parallel",
+  "active_task": "M17: C0 DTO landed (work.rs + shared fixtures); B1 landed; B2/B3/P1/P2 in flight; G1/P3 landed, G2/G3 client+host chain landed",
   "route_reset": {
     "task_document": "docs/NEXT_TASKS.md",
     "archive": "docs/archive/route-reset-12c8628",
