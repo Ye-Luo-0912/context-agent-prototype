@@ -56,6 +56,9 @@ const ROLES: &[(&str, &[&str])] = &[
             "agent-eval",
             "agent-replay",
             "agent-context-service",
+            // The deployable local platform host: composes the runtime and
+            // the work-control surface behind named-pipe/UDS transports.
+            "agent-host",
         ],
     ),
 ];
