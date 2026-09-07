@@ -183,14 +183,22 @@ where
     /// the protocol version in the response, then send the
     /// `notifications/initialized` notification.
     pub async fn initialize(&mut self) -> AgentResult<()> {
+        self.initialize_with_cancel(&CancellationToken::new()).await
+    }
+
+    /// `initialize` that also aborts when `cancel` fires (E1/MCP-01: the
+    /// connect path of a declared-supported MCP lane is cancellable like
+    /// every other phase, not only deadline-bounded).
+    pub async fn initialize_with_cancel(&mut self, cancel: &CancellationToken) -> AgentResult<()> {
         let result = self
-            .request(
+            .request_with_cancel(
                 "initialize",
                 json!({
                     "protocolVersion": MCP_PROTOCOL_VERSION,
                     "capabilities": {},
                     "clientInfo": {"name": "context-agent", "version": "0.1.0"}
                 }),
+                cancel,
             )
             .await?;
         let server_version = result
@@ -208,7 +216,17 @@ where
 
     /// `tools/list`: the server's declared tools and schemas.
     pub async fn list_tools(&mut self) -> AgentResult<Vec<McpTool>> {
-        let result = self.request("tools/list", json!({})).await?;
+        self.list_tools_with_cancel(&CancellationToken::new()).await
+    }
+
+    /// `tools/list` that also aborts when `cancel` fires.
+    pub async fn list_tools_with_cancel(
+        &mut self,
+        cancel: &CancellationToken,
+    ) -> AgentResult<Vec<McpTool>> {
+        let result = self
+            .request_with_cancel("tools/list", json!({}), cancel)
+            .await?;
         let tools = result
             .get("tools")
             .and_then(Value::as_array)
@@ -270,15 +288,6 @@ where
         Ok(McpCallResult { text, is_error })
     }
 
-    /// Send one request and read the matching response, enforcing the
-    /// request timeout and the frame bound. Notifications (no `id`) from
-    /// the server are skipped until the matching id arrives; a flood of
-    /// skipped frames poisons the connection.
-    async fn request(&mut self, method: &str, params: Value) -> AgentResult<Value> {
-        let cancel = CancellationToken::new();
-        self.request_with_cancel(method, params, &cancel).await
-    }
-
     /// Send one request and read the matching response, also aborting when
     /// `cancel` fires. Every failure path — timeout, cancellation, framing
     /// violation, flood — poisons the connection and kills the owned server
@@ -309,21 +318,34 @@ where
 
         // The request write shares the request deadline with the response
         // read (one budget per exchange): a peer that stopped reading must
-        // not stall the call past its own deadline.
+        // not stall the call past its own deadline. E1/MCP-01: the write is
+        // also select-composed with cancellation — a runtime cancel lands
+        // here immediately instead of only after the deadline, and because
+        // a cancelled write may have flushed a partial frame, the same
+        // settlement as a read-phase cancel applies (poison + kill-then-reap).
         let deadline = std::time::Instant::now() + self.request_timeout;
-        match tokio::time::timeout_at(deadline.into(), self.send_frame(&request)).await {
-            Err(_) => {
-                let error = self.poison(format!(
-                    "request '{method}' write timed out after {:?}",
-                    self.request_timeout
-                ));
+        let write = tokio::time::timeout_at(deadline.into(), self.send_frame(&request));
+        tokio::select! {
+            biased;
+            _ = cancel.cancelled() => {
+                self.poison(format!("request '{method}' cancelled during write"));
                 self.reap().await;
-                return Err(error);
+                return Err(AgentError::Cancelled);
             }
-            // A write error (`Ok(Err(_))`) already poisons the connection
-            // when bytes may have been written; the outbound over-cap
-            // rejection deliberately keeps the connection usable.
-            Ok(result) => result?,
+            write_result = write => match write_result {
+                Err(_) => {
+                    let error = self.poison(format!(
+                        "request '{method}' write timed out after {:?}",
+                        self.request_timeout
+                    ));
+                    self.reap().await;
+                    return Err(error);
+                }
+                // A write error (`Ok(Err(_))`) already poisons the connection
+                // when bytes may have been written; the outbound over-cap
+                // rejection deliberately keeps the connection usable.
+                Ok(result) => result?,
+            }
         }
 
         tokio::select! {
@@ -510,6 +532,29 @@ impl McpClient<tokio::process::ChildStdout, tokio::process::ChildStdin> {
         request_timeout: Duration,
         max_frame_bytes: u64,
     ) -> AgentResult<Self> {
+        Self::connect_stdio_with_cancel(
+            decl,
+            request_timeout,
+            max_frame_bytes,
+            &CancellationToken::new(),
+        )
+        .await
+    }
+
+    /// [`Self::connect_stdio`] that also aborts when `cancel` fires: the
+    /// spawn is followed by a cancellation check and the `initialize`
+    /// handshake is select-composed with the token, so a runtime cancel
+    /// during connect settles promptly (kill-then-reap) instead of waiting
+    /// out the request deadline (E1/MCP-01).
+    pub async fn connect_stdio_with_cancel(
+        decl: &McpServerDecl,
+        request_timeout: Duration,
+        max_frame_bytes: u64,
+        cancel: &CancellationToken,
+    ) -> AgentResult<Self> {
+        if cancel.is_cancelled() {
+            return Err(AgentError::Cancelled);
+        }
         validate_capability_id(&decl.id).map_err(AgentError::InvalidRequest)?;
         let private = tempfile::tempdir()
             .map_err(|e| AgentError::Tool(format!("create MCP private cwd: {e}")))?;
@@ -646,7 +691,13 @@ impl McpClient<tokio::process::ChildStdout, tokio::process::ChildStdin> {
         };
         let mut client = Self::new(stdout, stdin, request_timeout, max_frame_bytes);
         client.supervisor = Some(ProcessSupervisor::from_child(child, pid));
-        if let Err(error) = client.initialize().await {
+        if let Err(error) = client.initialize_with_cancel(cancel).await {
+            // A cancellation owns the settlement: the request path already
+            // poisoned and reaped the tree, so surface Cancelled instead of
+            // masking it as a handshake/exit failure.
+            if cancel.is_cancelled() {
+                return Err(AgentError::Cancelled);
+            }
             // The handshake failed: the spawned server must not be left
             // running. Kill and reap it before surfacing the error. When
             // the child already exited (a missing executable or a server
@@ -839,10 +890,18 @@ impl Capability for McpCapabilityAdapter {
                     stale.reap().await;
                 }
             }
-            match McpClient::connect_stdio(&self.decl, self.request_timeout, self.max_frame_bytes)
-                .await
+            match McpClient::connect_stdio_with_cancel(
+                &self.decl,
+                self.request_timeout,
+                self.max_frame_bytes,
+                &ctx.cancel,
+            )
+            .await
             {
                 Ok(client) => *guard = HostLifecycle::Serving(client),
+                // A runtime cancellation is not a server fault: it must not
+                // feed the restart circuit.
+                Err(AgentError::Cancelled) => return Err(AgentError::Cancelled),
                 Err(error) => {
                     guard.record_connect_failure(error.to_string());
                     return Err(error);
@@ -1076,6 +1135,252 @@ mod tests {
             .expect("cancel notification observed")
             .expect("oneshot");
         assert_eq!(method, MCP_CANCEL_NOTIFICATION);
+    }
+
+    /// A direct client kill settles a live server tree: the poison + reap
+    /// path must actually terminate the server's threads, observed through the
+    /// heartbeat ticker a successful invoke started.
+    #[tokio::test]
+    async fn a_confirmed_client_reap_stops_the_server_tree() {
+        let temp = tempfile::tempdir().unwrap();
+        let heartbeat = temp.path().join("hb.txt");
+        let decl = {
+            let mut decl = mock_decl();
+            decl.extra_write_roots = vec![temp.path().to_path_buf()];
+            decl
+        };
+        let mut client = McpClient::connect_stdio(&decl, Duration::from_secs(10), 1024 * 1024)
+            .await
+            .expect("connect");
+        client
+            .call_tool(
+                "mock.echo",
+                json!({"text": "go", "heartbeat": heartbeat.to_string_lossy()}),
+            )
+            .await
+            .expect("echo works");
+        client.poison("probe done".into());
+        client.reap().await;
+        let read = || -> Option<u64> {
+            std::fs::read_to_string(&heartbeat)
+                .ok()?
+                .trim()
+                .parse()
+                .ok()
+        };
+        let mut before = None;
+        for _ in 0..40 {
+            if let Some(value) = read() {
+                before = Some(value);
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert_eq!(
+            before,
+            read(),
+            "the client kill must stop the ticker (before={before:?}, after={:?})",
+            read()
+        );
+    }
+
+    /// Adapter stop settles a started (lazy-connected) server tree: teardown
+    /// after a real invoke is observable, never assumed — this is the
+    /// contract `stop_all` relies on at host shutdown.
+    #[tokio::test]
+    async fn adapter_stop_stops_a_started_server_tree() {
+        let temp = tempfile::tempdir().unwrap();
+        let heartbeat = temp.path().join("hb.txt");
+        let adapter = McpCapabilityAdapter::connect(
+            {
+                let mut decl = mock_decl();
+                decl.extra_write_roots = vec![temp.path().to_path_buf()];
+                decl
+            },
+            ToolRisk::ReadOnly,
+            Duration::from_secs(10),
+            1024 * 1024,
+        )
+        .await
+        .expect("connect");
+        let outcome = adapter
+            .invoke(
+                ToolCall {
+                    id: "probe".into(),
+                    name: "mock.echo".into(),
+                    arguments: json!({"text": "go", "heartbeat": heartbeat.to_string_lossy()}),
+                },
+                CapabilityInvocationContext {
+                    granted_permissions: Vec::new(),
+                    workspace: None,
+                    artifacts: None,
+                    approved_intent: None,
+                    cancel: agent_contracts::CancellationToken::new(),
+                },
+            )
+            .await
+            .expect("invoke works");
+        assert!(
+            matches!(outcome, CapabilityOutcome::Value(_)),
+            "invoke must succeed"
+        );
+        adapter.stop().await.expect("stop succeeds");
+        let read = || -> Option<u64> {
+            std::fs::read_to_string(&heartbeat)
+                .ok()?
+                .trim()
+                .parse()
+                .ok()
+        };
+        let mut before = None;
+        for _ in 0..40 {
+            if let Some(value) = read() {
+                before = Some(value);
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert_eq!(
+            before,
+            read(),
+            "adapter stop must stop the ticker (before={before:?}, after={:?})",
+            read()
+        );
+    }
+
+    /// E1/MCP-01: a runtime cancel that lands DURING the request write must
+    /// end the call promptly (poison + settlement) instead of only being
+    /// observed after the write deadline.
+    #[tokio::test]
+    async fn cancel_during_write_aborts_without_waiting_for_the_deadline() {
+        // A server that answers the handshake and then never reads again:
+        // the client's next request write fills the small duplex buffer and
+        // blocks there until the cancel fires.
+        let (client_read, mut server_write) = duplex(64 * 1024);
+        let (mut server_read, client_write) = duplex(64);
+        tokio::spawn(async move {
+            for _ in 0..2 {
+                let mut line = Vec::new();
+                let Ok(read_count) = read_line(&mut server_read, &mut line).await else {
+                    return;
+                };
+                if read_count == 0 {
+                    return;
+                }
+                let Ok(request) = serde_json::from_slice::<Value>(&line) else {
+                    return;
+                };
+                let Some(id) = request.get("id").cloned() else {
+                    continue; // notifications/initialized has no id
+                };
+                let response = json!({
+                    "jsonrpc": "2.0", "id": id,
+                    "result": {
+                        "protocolVersion": MCP_PROTOCOL_VERSION,
+                        "capabilities": {},
+                        "serverInfo": {"name": "mock", "version": "0.1.0"}
+                    }
+                });
+                let mut frame = serde_json::to_string(&response).unwrap();
+                frame.push('\n');
+                if server_write.write_all(frame.as_bytes()).await.is_err() {
+                    return;
+                }
+            }
+            // Never read again: the next client write blocks on the pipe.
+            std::future::pending::<()>().await;
+        });
+        let mut client = McpClient::new(
+            client_read,
+            client_write,
+            Duration::from_secs(30),
+            1024 * 1024,
+        );
+        client.initialize().await.expect("handshake succeeds");
+        let cancel = CancellationToken::new();
+        let fire = cancel.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            fire.cancel();
+        });
+        let large = "x".repeat(8 * 1024);
+        let start = std::time::Instant::now();
+        let error = client
+            .call_tool_with_cancel("mock.echo", json!({"text": large}), &cancel)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(error, AgentError::Cancelled),
+            "a cancel during write must surface as Cancelled: {error}"
+        );
+        assert!(
+            start.elapsed() < Duration::from_secs(10),
+            "the write-phase cancel must not wait out the {:?} deadline",
+            Duration::from_secs(30)
+        );
+        assert!(
+            client.is_poisoned(),
+            "a cancelled write may be partial: the connection is settled"
+        );
+    }
+
+    /// A program that never speaks MCP and never writes stdout: the
+    /// handshake cannot complete, so connect can only end through
+    /// cancellation or the deadline.
+    fn stall_server_decl(id: &str) -> McpServerDecl {
+        #[cfg(windows)]
+        let (program, args) = (
+            "cmd",
+            vec!["/C".to_string(), "ping -n 60 127.0.0.1 > NUL".to_string()],
+        );
+        #[cfg(not(windows))]
+        let (program, args) = ("sleep", vec!["60".to_string()]);
+        McpServerDecl {
+            id: id.into(),
+            version: "1.0.0".into(),
+            name: "stall server".into(),
+            summary: "never answers the handshake".into(),
+            program: program.into(),
+            args,
+            permissions: vec![],
+            extra_write_roots: Vec::new(),
+        }
+    }
+
+    /// E1/MCP-01: the connect path (spawn + initialize) is cancellable —
+    /// a runtime cancel during the handshake settles promptly with
+    /// `Cancelled` and the spawned server tree is killed and reaped by the
+    /// settlement, instead of the call waiting out the request deadline.
+    #[tokio::test]
+    async fn cancel_during_connect_settles_promptly_and_reaps() {
+        let decl = stall_server_decl("mock-stall");
+        let cancel = CancellationToken::new();
+        let fire = cancel.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(150)).await;
+            fire.cancel();
+        });
+        let start = std::time::Instant::now();
+        let Err(error) = McpClient::connect_stdio_with_cancel(
+            &decl,
+            Duration::from_secs(30),
+            1024 * 1024,
+            &cancel,
+        )
+        .await
+        else {
+            panic!("connect must not succeed against a server that never speaks");
+        };
+        assert!(
+            matches!(error, AgentError::Cancelled),
+            "a cancel during connect must surface as Cancelled: {error}"
+        );
+        assert!(
+            start.elapsed() < Duration::from_secs(10),
+            "the connect-phase cancel must not wait out the request deadline"
+        );
     }
 
     #[tokio::test]

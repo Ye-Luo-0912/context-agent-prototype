@@ -56,6 +56,8 @@ const EXIT_DRAIN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(1
 /// the channel; `poll` drains them into the bounded tail and the artifact.
 pub(crate) struct ProcessSession {
     child: tokio::process::Child,
+    #[cfg(windows)]
+    host_death_job: Option<super::process::host_death_job::HostDeathJob>,
     pub(crate) pid: u32,
     rx: mpsc::Receiver<StreamChunk>,
     capture: StreamCapture,
@@ -136,6 +138,8 @@ pub(crate) type SessionRegistry = Arc<tokio::sync::Mutex<HashMap<String, Session
 struct SpawnedChildGuard {
     child: Option<tokio::process::Child>,
     pid: u32,
+    #[cfg(windows)]
+    host_death_job: Option<super::process::host_death_job::HostDeathJob>,
 }
 
 impl SpawnedChildGuard {
@@ -147,12 +151,17 @@ impl SpawnedChildGuard {
 
     /// Kill the whole tree and reap the direct child within a bounded
     /// wait, so a failed start cannot leave a child or descendant behind.
-    async fn abandon(mut self) {
+    async fn abandon(mut self) -> AgentResult<()> {
+        // Closing the owned job catches children created while the tree
+        // helper would be enumerating. Do this before reaping the leader.
+        #[cfg(windows)]
+        drop(self.host_death_job.take());
         kill_process_tree(self.pid);
         if let Some(child) = self.child.as_mut() {
-            let _ = child.kill().await;
-            let _ = tokio::time::timeout(EXIT_DRAIN_TIMEOUT, child.wait()).await;
+            let _ = child.start_kill();
+            reap_session_child(child).await?;
         }
+        Ok(())
     }
 
     fn keep(mut self) -> tokio::process::Child {
@@ -413,6 +422,9 @@ impl ProcessSessionTool {
         #[cfg(unix)]
         command.process_group(0);
 
+        #[cfg(windows)]
+        let host_death_job = super::process::host_death_job::HostDeathJob::create();
+
         let mut child = command
             .spawn()
             .map_err(|error| AgentError::Tool(format!("spawn {}: {error}", args.argv[0])))?;
@@ -421,9 +433,14 @@ impl ProcessSessionTool {
             .ok_or_else(|| AgentError::Tool("spawned process has no pid".into()))?;
         let stdout = child.stdout.take();
         let stderr = child.stderr.take();
-        let guard = SpawnedChildGuard {
+        #[cfg(windows)]
+        let host_death_job = host_death_job.filter(|job| job.assign(pid));
+        #[allow(unused_mut)]
+        let mut guard = SpawnedChildGuard {
             child: Some(child),
             pid,
+            #[cfg(windows)]
+            host_death_job,
         };
         if let Err(error) = super::persist_spawned_process(
             &self.workspace,
@@ -431,8 +448,9 @@ impl ProcessSessionTool {
             guard.child_ref(),
             "process.session",
         ) {
-            guard.abandon().await;
+            let cleanup = guard.abandon().await;
             self.sessions.lock().await.remove(&session_id);
+            cleanup?;
             return Err(error);
         }
 
@@ -442,8 +460,9 @@ impl ProcessSessionTool {
         let (artifact_ref, line_rx, draft) = tokio::select! {
             biased;
             _ = cancel.cancelled() => {
-                guard.abandon().await;
+                let cleanup = guard.abandon().await;
                 self.sessions.lock().await.remove(&session_id);
+                cleanup?;
                 return Ok(cancelled_start_output(call_id, "during start"));
             }
             phase = async {
@@ -465,19 +484,24 @@ impl ProcessSessionTool {
             } => match phase {
                 Ok(phase) => phase,
                 Err(error) => {
-                    guard.abandon().await;
+                    let cleanup = guard.abandon().await;
                     self.sessions.lock().await.remove(&session_id);
+                    cleanup?;
                     return Err(error);
                 }
             },
         };
 
         let pid = guard.pid;
+        #[cfg(windows)]
+        let host_death_job = guard.host_death_job.take();
         let child = guard.keep();
         self.sessions.lock().await.insert(
             session_id.clone(),
             SessionSlot::Running(Box::new(ProcessSession {
                 child,
+                #[cfg(windows)]
+                host_death_job,
                 pid,
                 rx: line_rx,
                 capture: StreamCapture::new(),
@@ -682,15 +706,39 @@ async fn teardown_session(
     workspace: &Workspace,
     mut session: ProcessSession,
 ) -> AgentResult<String> {
+    #[cfg(windows)]
+    drop(session.host_death_job.take());
     kill_process_tree(session.pid);
-    let _ = session.child.kill().await;
-    let exit_code = tokio::time::timeout(EXIT_DRAIN_TIMEOUT, session.child.wait())
-        .await
-        .ok()
-        .and_then(Result::ok)
-        .and_then(|status| status.code());
-    super::persist_process_exit(workspace, session.pid, exit_code)?;
+    let _ = session.child.start_kill();
+    let exit_status = reap_session_child(&mut session.child).await?;
+    super::persist_process_exit(workspace, session.pid, exit_status.code())?;
     workspace.seal_buffered_artifact(session.artifact).await
+}
+
+#[cfg(test)]
+thread_local! {
+    static SIMULATE_UNCONFIRMED_REAP: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+async fn reap_session_child(
+    child: &mut tokio::process::Child,
+) -> AgentResult<std::process::ExitStatus> {
+    #[cfg(test)]
+    if SIMULATE_UNCONFIRMED_REAP.with(|flag| flag.replace(false)) {
+        return Err(AgentError::RecoveryRequired(
+            "injected missing session exit observation".into(),
+        ));
+    }
+    tokio::time::timeout(EXIT_DRAIN_TIMEOUT, child.wait())
+        .await
+        .map_err(|_| {
+            AgentError::RecoveryRequired(
+                "session exit was not confirmed before the cleanup deadline".into(),
+            )
+        })?
+        .map_err(|error| {
+            AgentError::RecoveryRequired(format!("session exit could not be observed: {error}"))
+        })
 }
 
 /// Module shutdown: stop every live session with the same teardown as
@@ -1397,6 +1445,48 @@ mod tests {
         if !tracked.is_empty() {
             super::super::test_procs::wait_for_all_dead(&tracked, "the failed start's tree");
         }
+    }
+
+    #[tokio::test]
+    async fn unconfirmed_stop_never_persists_a_completed_process_receipt() {
+        let dir = tempfile::tempdir().unwrap();
+        let workspace = Workspace::open(dir.path()).await.unwrap();
+        let sessions = SessionRegistry::default();
+        let tool = ProcessSessionTool::new(workspace.clone(), sessions.clone());
+        let run_id = RunId::new();
+        let arguments = json!({"action": "start", "argv": long_argv()});
+        let context = start_ctx(run_id, &arguments);
+        let started = value(
+            tool.execute(
+                run_id,
+                "start",
+                arguments,
+                Some(context.clone()),
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap(),
+        );
+        let session_id = started.metadata["session_id"].as_str().unwrap();
+        SIMULATE_UNCONFIRMED_REAP.with(|flag| flag.set(true));
+        let result = tool
+            .execute(
+                run_id,
+                "stop",
+                json!({"action": "stop", "session_id": session_id}),
+                None,
+                CancellationToken::new(),
+            )
+            .await;
+        assert!(matches!(result, Err(AgentError::RecoveryRequired(_))));
+        assert!(sessions.lock().await.is_empty());
+        assert!(
+            matches!(
+                workspace.reconcile(&context).unwrap(),
+                EffectReconciliation::Ambiguous { .. }
+            ),
+            "a missing wait receipt cannot become durable completion"
+        );
     }
 
     #[tokio::test]

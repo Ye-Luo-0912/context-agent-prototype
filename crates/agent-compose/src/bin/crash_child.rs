@@ -61,13 +61,33 @@ impl ModelTransport for ScriptedWriteModel {
     }
 }
 
-#[tokio::main]
-async fn main() -> anyhow::Result<()> {
+fn main() -> anyhow::Result<()> {
+    // Dispatch before starting Tokio: the watchdog owns only a pipe and
+    // its pinned process group, and must also survive this test host.
+    if agent_process::watchdog::run_if_armed_and_exit() {
+        return Ok(());
+    }
+    let args: Vec<String> = std::env::args().collect();
+    if let [_, root, mode] = args.as_slice()
+        && matches!(mode.as_str(), "--proof-worker" | "--proof-member")
+    {
+        return proof_worker(std::path::Path::new(root), mode == "--proof-member");
+    }
+    tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()?
+        .block_on(run())
+}
+
+async fn run() -> anyhow::Result<()> {
     let mut args = std::env::args().skip(1);
     let root = std::path::PathBuf::from(args.next().expect("workspace root required"));
     let prompt = args.next().expect("user message required");
 
     let workspace = Workspace::open(&root).await?;
+    if prompt == "--proof-supervision" {
+        return run_proof_supervision(workspace).await;
+    }
     let journal = Arc::new(
         agent_storage::FileEventJournal::open(workspace.state_dir().join("traces")).await?,
     );
@@ -110,6 +130,12 @@ async fn main() -> anyhow::Result<()> {
         ),
         verification_recipes: if has_recipes { Some(recipes) } else { None },
         project_proof_refresh: has_recipes,
+        // Harness compositions never arm Unix host-death containment (no
+        // watchdog dispatch in this executable).
+        host_death_watchdog: false,
+        // Harness/eval compositions register no external capabilities by default.
+        mcp_servers: Vec::new(),
+        plugins: None,
     })
     .await?;
     let mut events = composed.subscribe();
@@ -143,5 +169,74 @@ async fn main() -> anyhow::Result<()> {
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
     composed.shutdown().await?;
+    Ok(())
+}
+
+/// A real Rust host runs the same exact-proof executor used by compose;
+/// the parent acceptance test kills this host without running any Drop.
+async fn run_proof_supervision(workspace: Workspace) -> anyhow::Result<()> {
+    let recipe = tool_runtime::VerificationRecipe::new(
+        "supervision.probe",
+        "Bounded host-death acceptance probe",
+        "v1",
+        vec![
+            std::env::current_exe()?.to_string_lossy().into_owned(),
+            workspace.root().to_string_lossy().into_owned(),
+            "--proof-worker".into(),
+        ],
+    )
+    .map_err(anyhow::Error::msg)?
+    .with_exact_current_world_reuse();
+    let recipes =
+        Arc::new(tool_runtime::VerificationRecipes::new(vec![recipe]).map_err(anyhow::Error::msg)?);
+    let runner = tool_runtime::RecipeProofRunner::new(workspace.clone(), recipes)
+        .ok_or_else(|| anyhow::anyhow!("probe recipe must have a host policy"))?
+        .with_host_death_watchdog(true);
+    let result = runner
+        .verify_exact(
+            agent_contracts::RunId::new(),
+            "supervision.probe",
+            agent_contracts::CancellationToken::new(),
+        )
+        .await?;
+    std::fs::write(
+        workspace.state_dir().join("proof-supervision/result"),
+        result.summary,
+    )?;
+    Ok(())
+}
+
+/// Test-owned workers only write under runtime state, consistent with the
+/// exact recipe's source-read-only assertion. They expire on their own
+/// even if the acceptance test fails before it can terminate the host.
+fn proof_worker(root: &std::path::Path, member: bool) -> anyhow::Result<()> {
+    let state = root.join(".focus-agent/proof-supervision");
+    std::fs::create_dir_all(&state)?;
+    let _descendant = if member {
+        None
+    } else {
+        Some(
+            std::process::Command::new(std::env::current_exe()?)
+                .arg(root)
+                .arg("--proof-member")
+                .stdin(std::process::Stdio::null())
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .spawn()?,
+        )
+    };
+    std::fs::write(
+        state.join(if member { "member.pid" } else { "leader.pid" }),
+        std::process::id().to_string(),
+    )?;
+    let deadline = std::time::Instant::now() + Duration::from_secs(30);
+    let mut tick = 0_u64;
+    while std::time::Instant::now() < deadline {
+        if member {
+            std::fs::write(state.join("heartbeat"), tick.to_string())?;
+            tick += 1;
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
     Ok(())
 }

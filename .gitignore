@@ -21,3 +21,4 @@ apps/**/obj/
 
 # IDE
 .idea/
+/target-host

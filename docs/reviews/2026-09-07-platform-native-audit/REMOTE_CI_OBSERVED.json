@@ -1,0 +1,47 @@
+{
+  "kind": "CONNECTOR_OBSERVATION_NOT_LOCAL_EXECUTION",
+  "head_sha": "b299c6a08fdb055a0148a24dea65053861df6ff1",
+  "run_id": 34065966817,
+  "status": "completed",
+  "conclusion": "success",
+  "run_updated_at": "2026-09-06T23:27:29Z",
+  "source_reference": "turn308file0",
+  "jobs": [
+    {
+      "id": 101574649777,
+      "name": "fmt / clippy / build (windows-latest)",
+      "status": "completed",
+      "conclusion": "success"
+    },
+    {
+      "id": 101574649884,
+      "name": "document consistency",
+      "status": "completed",
+      "conclusion": "success"
+    },
+    {
+      "id": 101574649913,
+      "name": "fmt / clippy / build (ubuntu-latest)",
+      "status": "completed",
+      "conclusion": "success"
+    },
+    {
+      "id": 101575111277,
+      "name": "test (windows-latest, part full)",
+      "status": "completed",
+      "conclusion": "success"
+    },
+    {
+      "id": 101575111287,
+      "name": "test (ubuntu-latest, part 1)",
+      "status": "completed",
+      "conclusion": "success"
+    },
+    {
+      "id": 101575111313,
+      "name": "test (ubuntu-latest, part 2)",
+      "status": "completed",
+      "conclusion": "success"
+    }
+  ]
+}

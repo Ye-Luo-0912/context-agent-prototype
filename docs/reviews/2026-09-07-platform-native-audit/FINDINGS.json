@@ -1,0 +1,146 @@
+[
+  {
+    "id": "F01",
+    "priority": "P1",
+    "title": "新监督台账以 PID 冒充进程身份",
+    "evidence": "STATIC_CONFIRMED",
+    "sources": [
+      "S03",
+      "S12",
+      "S04"
+    ],
+    "trigger": "崩溃残留记录中的 PID 已被其它进程复用，再启动对账；或记录身份无法确认。",
+    "consequence": "可能向无关进程组发信号。记录只有 pid/purpose，未使用现有创建身份令牌。",
+    "repair": "复用 ProcessIdentity 与身份校验；无法确认身份时不得发信号，并保留可见未决状态。",
+    "scope_note": "未执行真实 PID 复用误杀；不得为演示而针对无关进程。已有 Workspace journal 锁不等于身份校验，也不能据此宣称所有双进程启动都能进入此路径。"
+  },
+  {
+    "id": "F02",
+    "priority": "P1",
+    "title": "监督记录与清理确认并不耐久、也不 fail-closed",
+    "evidence": "STATIC_CONFIRMED",
+    "sources": [
+      "S03",
+      "S04"
+    ],
+    "trigger": "写入/读取/重写台账失败、坏行、kill 未确认退出，或 lease 在子进程仍活时被 drop。",
+    "consequence": "错误被忽略；发出 kill 后直接清除记录；Drop 无条件释放记录，启动不能据此证明清理成功。",
+    "repair": "有界、串行、可返回错误的记录；显式确认结束后释放；未确认、损坏及读失败留账并阻止受影响工作区继续修改。",
+    "scope_note": "记录、身份、退出确认与权限身份不同；修复应复用现有存储/监督原语，避免新建第二套 effect 权威。"
+  },
+  {
+    "id": "F03",
+    "priority": "P1",
+    "title": "宿主 proof lane 未启用 Unix watchdog",
+    "evidence": "STATIC_CALL_CHAIN_CONFIRMED",
+    "sources": [
+      "S15",
+      "S16",
+      "S04"
+    ],
+    "trigger": "配置宿主 exact proof，宿主进程硬退出；RecipeProofRunner 另行构建默认 watchdog=false 的 ProcessRunTool。",
+    "consequence": "TUI 给 builtin dispatcher 的开启配置未贯通到宿主验证执行器；下一次启动清理不等于死亡时立即包含。",
+    "repair": "由可信组合根向普通执行与宿主验证传入同一监督配置/句柄；以真实宿主路径验证，而不只测工具或看门狗 helper。",
+    "scope_note": "此结论针对 Unix 宿主证明车道。Windows Job 路径独立；普通任务未必配置 exact proof。"
+  },
+  {
+    "id": "F04",
+    "priority": "P1",
+    "title": "watchdog 的组长存活判定不足，Drop 等待无界",
+    "evidence": "STATIC_PLUS_OS_MECHANISM_PROBE",
+    "sources": [
+      "S02",
+      "S16"
+    ],
+    "trigger": "组长已 reap、组内成员仍活；PID 被复用；或看门狗自身卡住/未执行预期入口。",
+    "consequence": "kill(leader,0) 不能证明创建身份，也不能证明整个组已退出；Drop 中同步 wait 无 deadline。",
+    "repair": "监督对象与身份、正常解除、整组清理分别定义；有界确认及未决责任保留；新宿主显式支持 watcher 入口。",
+    "scope_note": "probe_group_lifetime.json 仅证明 Linux 机制，不是仓库集成测试。通用命令若允许后台后代，要与必须被包含的宿主验证语义分开。"
+  },
+  {
+    "id": "F05",
+    "priority": "P1",
+    "title": "STORAGE-02 残余：rename 成功、目录 sync 失败仍留旧 writer",
+    "evidence": "STATIC_CONDITIONAL_PATH_CONFIRMED",
+    "sources": [
+      "S06",
+      "S07"
+    ],
+    "trigger": "Unix persist_authority_metadata 内 replace_file 成功，随后 sync_directory 返回错误。",
+    "consequence": "compact_locked 提前返回，没有交换 writer；显式 compact 路径也未设置同等恢复围栏。",
+    "repair": "携带发布阶段的错误或在可能已发布时隔离 writer；保留目录同步，不得靠删同步调用消除报错。",
+    "scope_note": "移动 seek 的修复有效，但没有覆盖 helper 内部发布后失败。普通 append_transition 的上层失败围栏仍是既有保护。未本地故障注入。"
+  },
+  {
+    "id": "F06",
+    "priority": "P2",
+    "title": "状态投影与 headless 结果仍混用展示文字和权威状态",
+    "evidence": "STATIC_CONFIRMED",
+    "sources": [
+      "S09",
+      "S05"
+    ],
+    "trigger": "从高 revision 任务切换到低 revision 任务；成功工具正文包含 denied by approval policy；事件缺口或不同完成来源。",
+    "consequence": "anchor_revision 跨任务取 max；普通内容可误报审批拒绝；所有 TaskCompleted 被标 operator_accepted；缺口只写 stderr 继续。",
+    "repair": "按任务绑定 revision；使用类型化审批/终态事实；连接、turn、task、closure cause 分开；缺口显式标 partial 并同步。",
+    "scope_note": "这是 read model/退出结果错误，不等同于 Core 审批或持久完成被绕过。"
+  },
+  {
+    "id": "F07",
+    "priority": "P1_BEFORE_MULTI_CLIENT_WRITES",
+    "title": "公共 work 流程由多次命令组成，不能作为原子多客户端入口",
+    "evidence": "STATIC_INTERLEAVING_RISK",
+    "sources": [
+      "S10",
+      "S18"
+    ],
+    "trigger": "A 的 set_focus/list/requirements/user_message 之间，另一个控制客户端改变活动任务。",
+    "consequence": "无目标任务身份的 user_message 可能落到另一任务；Actor 单条命令串行不保证整段客户端流程原子。",
+    "repair": "加入绑定任务/预期版本的提交或原子 start_work 入口；受理回执、有限幂等和未知结果处理由公共层统一。",
+    "scope_note": "当前单 UI 串行使用可缓解；未声称已在当前 TUI 复现。GUI/TUI 同时控制前必须解决。"
+  },
+  {
+    "id": "F08",
+    "priority": "P2",
+    "title": "上下文错误终结只加了 verify.run 名称门，仍以实体匹配覆盖",
+    "evidence": "STATIC_SEMANTIC_RISK_CONFIRMED",
+    "sources": [
+      "S13",
+      "S14"
+    ],
+    "trigger": "某个成功 verify.run 输出与另一条未解决故障共享实体，但没有证明同一故障/域/版本。",
+    "consequence": "queue_error_verifications 可把无关错误排入 VerifiedFixed，影响以后普通召回。",
+    "repair": "由可信验证事实关联故障/任务/覆盖域/资源版本；不足以建立关联时仅保留弱相关，不授予终态。",
+    "scope_note": "成功 fs.read 已不再触发，此旧问题不能原样重报；Runtime 的完成 gate 与 Context 语义终态不是一层。"
+  },
+  {
+    "id": "F09",
+    "priority": "P2",
+    "title": "输入/输出桥存在边界外读入和阻塞",
+    "evidence": "STATIC_CONFIRMED",
+    "sources": [
+      "S05",
+      "S17"
+    ],
+    "trigger": "--prompt=- 输入无限/极大；grant 文件在 stat 后增长；stdout 或 JSONL sink 卡住。",
+    "consequence": "Runtime 的输入 cap 不限制此前 read_to_string 分配；同步 Write 不受事件接收 select 的超时保护。",
+    "repair": "接入时按字节限额读取；输出从执行循环隔离为有界队列/写超时，慢消费者断开或报告缺口；不复制给 GUI。",
+    "scope_note": "未执行内存耗尽或堵塞生产输出的压力测试。不要把合法小消息 JSON 编码优化当成主要问题。"
+  },
+  {
+    "id": "F10",
+    "priority": "P2_DELIVERY_GAP",
+    "title": "完整平台客户端接口尚未落地；文档的关闭范围过宽",
+    "evidence": "SOURCE_SCOPE_AND_DOCUMENT_MISMATCH",
+    "sources": [
+      "S01",
+      "S11",
+      "S19",
+      "S10"
+    ],
+    "trigger": "把 operation query/cancel adapter 或 headless JSONL 当成完整 GUI API。",
+    "consequence": "缺任务提交、审批、快照衔接、正文读取等闭环；无工程开放项不足以概括上述残余。",
+    "repair": "以正式 GUI 为消费者补最小公共应用服务和本地通道；活动文档标注具体已验范围与残余，不再全面声称清零。",
+    "scope_note": "不是要求推翻现有平台协议；Named Pipe/UDS 在当前源码中明确仍是后续后端。"
+  }
+]

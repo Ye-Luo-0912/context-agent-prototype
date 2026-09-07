@@ -589,7 +589,16 @@ impl AppState {
                 changed_fields,
                 patch_kind,
             } => {
-                self.current_task = Some((task_id, revision));
+                // An anchor revision belongs to its own task (F06): a
+                // background anchor change on one task must never steal the
+                // focused-task slot of another. The audit row below still
+                // records every event.
+                if self
+                    .current_task
+                    .is_none_or(|(current, _)| current == task_id)
+                {
+                    self.current_task = Some((task_id, revision));
+                }
                 // Bounded audit row: the event names the moved fields and
                 // the authority split (autonomous vs boundary), never the
                 // anchor content (which lives in the checkpoint).
@@ -608,7 +617,12 @@ impl AppState {
                 // task.manage 的确定性结果：拒绝时状态未变，reason 说明
                 // 类别（如过期基准修订），便于从事件流核对 CAS 结果。
                 if accepted {
-                    self.current_task = Some((task_id, anchor_revision));
+                    if self
+                        .current_task
+                        .is_none_or(|(current, _)| current == task_id)
+                    {
+                        self.current_task = Some((task_id, anchor_revision));
+                    }
                     if changed_fields.is_empty() {
                         self.push_system(format!(
                             "task {task_id} progress already current at r{anchor_revision}"
@@ -1841,16 +1855,39 @@ mod status_projection_tests {
         assert!(app.current_task.is_none());
         assert_eq!(app.unresolved_ack_debts, 0);
 
+        // Real event order: the task becomes focused before its anchor
+        // moves. F06: the anchor event belongs to its own task — it may
+        // refresh the focused task but never invent a focused task.
+        let focused = TaskId::new();
         app.apply_runtime_event(envelope(
             1,
+            RuntimeEvent::FocusChanged {
+                task_id: focused,
+                goal: "focused goal".into(),
+            },
+        ));
+        app.apply_runtime_event(envelope(
+            2,
             RuntimeEvent::TaskAnchorChanged {
-                task_id: TaskId::new(),
+                task_id: focused,
                 revision: 3,
                 changed_fields: vec!["plan_progress".into()],
                 patch_kind: agent_contracts::AnchorPatchKind::Autonomous,
             },
         ));
-        assert!(app.current_task.is_some());
+        assert_eq!(app.current_task, Some((focused, 3)));
+
+        // An anchor bump on an unrelated task must not steal the slot.
+        app.apply_runtime_event(envelope(
+            3,
+            RuntimeEvent::TaskAnchorChanged {
+                task_id: TaskId::new(),
+                revision: 9,
+                changed_fields: Vec::new(),
+                patch_kind: agent_contracts::AnchorPatchKind::Autonomous,
+            },
+        ));
+        assert_eq!(app.current_task, Some((focused, 3)));
 
         app.apply_runtime_event(envelope(
             2,

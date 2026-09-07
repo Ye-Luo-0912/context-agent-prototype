@@ -610,6 +610,19 @@ impl<P> PlatformEnvelope<P> {
                 "the liveness route is reserved for ping/pong",
             ));
         }
+        // Run-scoped routes (work submission, snapshot, subscription,
+        // approval response) bind identity to the authenticated session and
+        // must not carry a tool-operation work identity; every other
+        // non-liveness route still requires one (fail closed).
+        if self.route.is_run_scoped() {
+            if self.work.is_some() {
+                return Err(ValidationError::new(
+                    "envelope.work",
+                    "run-scoped routes must not carry tool-operation work identity",
+                ));
+            }
+            return Ok(());
+        }
         let work = self.work.as_ref().ok_or_else(|| {
             ValidationError::new("envelope.work", "is required for a work message")
         })?;
@@ -666,10 +679,22 @@ pub fn validate_response_pair<RequestPayload, ResponsePayload>(
         ));
     }
     validate_common_pair(request, response)?;
+    response.payload.validate()?;
+    // Run-scoped routes carry no work identity; their pairing is physical
+    // only (profile, route, request id, causality). Deadline forwarding and
+    // attempt preservation are work-message facts.
+    if request.route.is_run_scoped() {
+        if request.work.is_some() || response.work.is_some() {
+            return Err(ValidationError::new(
+                "envelope.work",
+                "run-scoped routes must not carry tool-operation work identity",
+            ));
+        }
+        return Ok(());
+    }
     let request_work = request.work.as_ref().expect("validated work request");
     let response_work = response.work.as_ref().expect("validated work response");
     validate_same_attempt(request_work, response_work)?;
-    response.payload.validate()?;
     if let PlatformResponse::Error { error } = &response.payload
         && let Some(retry_after) = error.retry_after_ms
         && retry_after > response_work.deadline_remaining_ms

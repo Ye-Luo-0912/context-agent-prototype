@@ -216,6 +216,7 @@ mod tests {
             keep_alive: false,
             lease_until_turn: None,
             source: None,
+            verify_recipe: None,
             residency: agent_contracts::ContextResidency::Resident,
             gc_generation: 0,
             evicted_at_tick: None,

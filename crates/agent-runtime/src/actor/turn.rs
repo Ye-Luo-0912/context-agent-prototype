@@ -101,6 +101,127 @@ impl RuntimeActor {
         let _ = reply.send(self.begin_applied_turn(content, input, op_tx).await);
     }
 
+    /// Atomic long-task submission shared by every entry (P1, fixes the F07
+    /// misdelivery race): task create/resume focus, the long-task checklist
+    /// attach and the first user message run inside this one serialized
+    /// actor command, so another client's SetFocus/Submit can never interleave
+    /// between focus and message. A repeated `client_request_id` with the
+    /// same goal returns the original admission without a second execution;
+    /// the same id with a different goal is rejected instead of being
+    /// re-executed under a foreign identity.
+    pub(super) async fn start_work(
+        &mut self,
+        goal: String,
+        client_request_id: String,
+        op_tx: &mpsc::Sender<OperationCompletion>,
+    ) -> AgentResult<crate::work::WorkSubmission> {
+        use crate::work::{
+            MAX_PENDING_WORK_SUBMISSIONS, WorkSubmission, WorkSubmissionDisposition,
+            WorkSubmissionRecord,
+        };
+
+        if goal.trim().is_empty() {
+            return Err(AgentError::InvalidRequest(
+                "work goal must not be empty".into(),
+            ));
+        }
+        if goal.len() > USER_INPUT_MAX_BYTES {
+            return Err(AgentError::InvalidRequest(format!(
+                "work goal is {} bytes, above the {USER_INPUT_MAX_BYTES} byte cap",
+                goal.len()
+            )));
+        }
+        if client_request_id.is_empty()
+            || client_request_id.len() > crate::work::MAX_CLIENT_REQUEST_ID_BYTES
+        {
+            return Err(AgentError::InvalidRequest(format!(
+                "client request id must be 1..={} bytes",
+                crate::work::MAX_CLIENT_REQUEST_ID_BYTES
+            )));
+        }
+        // Idempotent-retry ledger: process-lifetime, bounded, oldest evicted.
+        // Nothing here is durable and no cross-restart exactly-once exists;
+        // an id that fell out of the window (or a restart) is simply unknown.
+        if let Some(existing) = self
+            .state
+            .work_submissions
+            .iter()
+            .find(|record| record.client_request_id == client_request_id)
+        {
+            if existing.goal == goal {
+                return Ok(WorkSubmission {
+                    disposition: WorkSubmissionDisposition::AlreadyAccepted,
+                    task_id: existing.task_id,
+                    task_manage_notice: None,
+                });
+            }
+            return Err(AgentError::InvalidRequest(
+                "client request id was already admitted for a different goal; \
+                 query the task list instead of reusing the id"
+                    .into(),
+            ));
+        }
+
+        // Looking up an existing receipt is read-only and must work while
+        // its original turn is still running. Only a new admission needs idle.
+        self.ensure_idle()?;
+
+        // Focus create/resume and the message application are one command.
+        // If the message half fails after focus applied, no receipt is
+        // recorded: the caller's retry with the same id re-runs safely
+        // because `prepare_create` resumes the same-goal task.
+        let task_id = self.apply_focus(goal.clone()).await?;
+
+        // Attach the long-task checklist surface only onto an empty
+        // requirement set; a blind whole-set replace would drop someone
+        // else's entries. A failed attach still applies the goal.
+        let mut task_manage_notice = None;
+        if let Some(task) = self.state.tasks.get(task_id)
+            && task.tool_requirements.entries.is_empty()
+        {
+            if let Err(error) = self
+                .set_task_tool_requirements(
+                    task_id,
+                    task.tool_requirements.revision,
+                    vec![ToolSurfaceRequirement {
+                        tool_name: "task.manage".into(),
+                        demand: ToolSurfaceDemand::PreferSurface,
+                        reason: "long-task checklist".into(),
+                    }],
+                )
+                .await
+            {
+                task_manage_notice = Some(format!("task.manage not attached: {error}"));
+            }
+        }
+
+        let input_id = RuntimeInputId::new();
+        let persist = self.persist_user_input_body(&goal).await?;
+        let input = RuntimeInputEnvelope::user_dialogue(
+            goal.clone(),
+            Some(input_id),
+            self.state.task_id,
+            None,
+            persist.0,
+            persist.1,
+        );
+        self.begin_applied_turn(goal.clone(), input, op_tx).await?;
+
+        self.state.work_submissions.push_back(WorkSubmissionRecord {
+            client_request_id,
+            goal,
+            task_id,
+        });
+        while self.state.work_submissions.len() > MAX_PENDING_WORK_SUBMISSIONS {
+            self.state.work_submissions.pop_front();
+        }
+        Ok(WorkSubmission {
+            disposition: WorkSubmissionDisposition::Accepted,
+            task_id,
+            task_manage_notice,
+        })
+    }
+
     pub(super) async fn begin_applied_turn(
         &mut self,
         content: String,
@@ -256,7 +377,7 @@ impl RuntimeActor {
     pub(super) async fn continue_active_task_turn(
         &mut self,
         op_tx: &mpsc::Sender<OperationCompletion>,
-    ) -> AgentResult<()> {
+    ) -> AgentResult<TaskId> {
         if self.state.recovery_required {
             return Err(AgentError::RecoveryRequired(
                 "runtime recovery is required before normal mutation may continue".into(),
@@ -293,7 +414,8 @@ impl RuntimeActor {
         // never landed, instead of starting a turn on an unfenced gap.
         self.continuation_durability_gate().await?;
         let input = RuntimeInputEnvelope::task_continuation(task_id, directive.clone());
-        self.begin_applied_turn(directive, input, op_tx).await
+        self.begin_applied_turn(directive, input, op_tx).await?;
+        Ok(task_id)
     }
 
     /// Spawn the next operation the turn state says should run: a pending

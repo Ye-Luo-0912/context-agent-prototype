@@ -1151,6 +1151,60 @@ async fn expect_restore_rejected(state: &crate::engine::State, needle: &str) {
     );
 }
 
+#[tokio::test]
+async fn restore_rejects_scope_cycles_and_duplicates_without_replacing_live_state() {
+    let engine = SimpleContextEngine::new(SimpleContextConfig::default());
+    engine
+        .ingest(ContextIngress::UserMessage {
+            content: "keep this live state".into(),
+        })
+        .await
+        .unwrap();
+    let original = engine.checkpoint().await.unwrap();
+    for corruption in ["self", "two-node", "duplicate"] {
+        let mut state = crate::checkpoint::deserialize(original.clone()).unwrap();
+        let first = agent_contracts::Scope {
+            id: ScopeId::new(),
+            parent: None,
+            kind: ScopeKind::Task,
+            state: ScopeState::Active,
+            task_id: None,
+            goal: None,
+            opened_tick: 1,
+            last_active_tick: 1,
+            closed_tick: None,
+        };
+        let mut second = first.clone();
+        second.id = ScopeId::new();
+        let mut first = first;
+        match corruption {
+            "self" => first.parent = Some(first.id),
+            "two-node" => {
+                first.parent = Some(second.id);
+                second.parent = Some(first.id);
+            }
+            "duplicate" => second.id = first.id,
+            _ => unreachable!(),
+        }
+        state.scopes.push(first);
+        state.scopes.push(second);
+        let error = engine
+            .restore(crate::checkpoint::serialize(&state).unwrap())
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains(if corruption == "duplicate" {
+            "more than once"
+        } else {
+            "cycle"
+        }));
+        assert_eq!(
+            engine.checkpoint().await.unwrap(),
+            original,
+            "failed restore must be transactional"
+        );
+    }
+}
+
 /// A refused restore must leave the running state untouched: structural
 /// validation runs on a scratch copy before any replacement, so a corrupt
 /// or hostile checkpoint cannot clobber live items. Regression: the live

@@ -14,51 +14,22 @@ impl RuntimeActor {
                 self.start_turn(content, reply, op_tx).await;
             }
             RuntimeCommand::SetFocus { goal, reply } => {
-                let result = match self.ensure_idle().and_then(|_| self.next_focus_revision()) {
-                    Ok(next_focus_revision) => {
-                        // A task is the long-lived entity; focus is the
-                        // attention inside it. `prepare_create` resumes a
-                        // non-completed task with the same goal, so
-                        // re-focusing returns to the same task id. The
-                        // TaskManager transition is committed only after
-                        // the engine's focus change succeeded, so the two
-                        // can never diverge. An oversized goal or a
-                        // saturated catalog fails closed here, before any
-                        // engine or event mutation.
-                        match self.state.tasks.prepare_create(&goal) {
-                            Err(error) => Err(error),
-                            Ok((txn, task_id)) => {
-                                let event_goal = goal.clone();
-                                match self.bump_generation() {
-                                    Err(error) => Err(error),
-                                    Ok(_) => match self.services.set_focus(task_id, goal).await {
-                                        Ok(report) => {
-                                            self.state.tasks.commit(txn);
-                                            self.state.task_id = Some(task_id);
-                                            self.state.last_assistant_artifact = None;
-                                            self.state
-                                                .task_requirement_high_water
-                                                .entry(task_id)
-                                                .or_insert(0);
-                                            self.state.focus_revision = next_focus_revision;
-                                            self.publish_context_transition(
-                                                RuntimeEvent::FocusChanged {
-                                                    task_id,
-                                                    goal: event_goal,
-                                                },
-                                                ContextMaintenanceTrigger::FocusChanged,
-                                                report,
-                                            )
-                                            .await
-                                        }
-                                        Err(error) => Err(self.context_transition_failed(error)),
-                                    },
-                                }
-                            }
-                        }
-                    }
+                // A task is the long-lived entity; focus is the attention
+                // inside it. The shared `apply_focus` transition keeps the
+                // TaskManager commit sequenced after the engine's focus
+                // change so the two can never diverge.
+                let result = match self.ensure_idle() {
                     Err(error) => Err(error),
+                    Ok(()) => self.apply_focus(goal).await.map(|_| ()),
                 };
+                let _ = reply.send(result);
+            }
+            RuntimeCommand::StartWork {
+                goal,
+                client_request_id,
+                reply,
+            } => {
+                let result = self.start_work(goal, client_request_id, op_tx).await;
                 let _ = reply.send(result);
             }
             RuntimeCommand::ActivateTask { task_id, reply } => {
@@ -152,51 +123,10 @@ impl RuntimeActor {
             } => {
                 let result = match self.ensure_idle() {
                     Err(error) => Err(error),
-                    Ok(()) => match normalize_tool_requirements(entries) {
-                        Err(error) => Err(error),
-                        Ok(entries) => {
-                            match self.state.tasks.prepare_replace_tool_requirements(
-                                task_id,
-                                base_revision,
-                                entries.clone(),
-                            ) {
-                                Err(error) => Err(error),
-                                Ok((txn, revision)) => {
-                                    let changed = revision != base_revision;
-                                    if changed {
-                                        match self.bump_generation() {
-                                            Err(error) => Err(error),
-                                            Ok(_) => {
-                                                match self
-                                                    .core
-                                                    .emit_event(
-                                                        RuntimeEvent::TaskToolRequirementsChanged {
-                                                            task_id,
-                                                            revision,
-                                                            requirements: entries,
-                                                        },
-                                                    )
-                                                    .await
-                                                {
-                                                    Err(error) => Err(error),
-                                                    Ok(()) => {
-                                                        self.state.tasks.commit(txn);
-                                                        self.state
-                                                            .task_requirement_high_water
-                                                            .insert(task_id, revision);
-                                                        Ok(revision)
-                                                    }
-                                                }
-                                            }
-                                        }
-                                    } else {
-                                        self.state.tasks.commit(txn);
-                                        Ok(revision)
-                                    }
-                                }
-                            }
-                        }
-                    },
+                    Ok(()) => {
+                        self.set_task_tool_requirements(task_id, base_revision, entries)
+                            .await
+                    }
                 };
                 let _ = reply.send(result);
             }
@@ -370,6 +300,23 @@ impl RuntimeActor {
                     Err(error) => Err(error),
                 };
                 let _ = reply.send(result);
+            }
+            RuntimeCommand::StatusSnapshot { reply } => {
+                // Read-only, like ListTasks: no lifecycle or busy fence, so
+                // recovery tooling and slow clients can always observe the
+                // exact current truth.
+                let focus = self.state.task_id;
+                let focused = focus.and_then(|task_id| self.state.tasks.get(task_id));
+                let snapshot = crate::work::RuntimeStatusSnapshot {
+                    run_id: self.core.run_id(),
+                    serving: self.state.lifecycle == ActorLifecycle::Serving,
+                    watermark: self.core.event_sequence(),
+                    focus_task_id: focus,
+                    focus_goal: focused.map(|task| task.goal.clone()).unwrap_or_default(),
+                    focus_anchor_revision: focused.map(|task| task.anchor.revision).unwrap_or(0),
+                    tasks: self.state.tasks.list(),
+                };
+                let _ = reply.send(Ok(snapshot));
             }
             RuntimeCommand::PrepareRestore { checkpoint, reply } => {
                 let result = match self.ensure_serving() {

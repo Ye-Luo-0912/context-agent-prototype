@@ -223,11 +223,40 @@ pub(crate) async fn tool_observation(engine: &SimpleContextEngine, call_id: &str
 }
 
 /// Build a successful trusted-verification observation (`verify.run`) —
-/// the only tool result whose success verifies an error as fixed.
+/// the only tool result whose success verifies an error as fixed, and only
+/// for errors recorded by the SAME recipe (M17-B3/F08): the success stamps
+/// `metadata.recipe_id`.
+pub(crate) fn verification_facts(
+    recipe_id: &str,
+    revision: &str,
+    digest: &str,
+) -> agent_contracts::ToolExecutionFacts {
+    agent_contracts::ToolExecutionFacts::empty().with_verification_probe(
+        agent_contracts::VerificationProbe {
+            recipe_id: recipe_id.into(),
+            recipe_revision: revision.into(),
+            definition_digest: digest.into(),
+        },
+    )
+}
+
 pub(crate) async fn verify_observation(engine: &SimpleContextEngine, call_id: &str, content: &str) {
+    verify_observation_for_recipe(engine, call_id, content, "auth.tests").await;
+}
+
+pub(crate) async fn verify_observation_for_recipe(
+    engine: &SimpleContextEngine,
+    call_id: &str,
+    content: &str,
+    recipe_id: &str,
+) {
     engine
         .ingest(ContextIngress::ToolObservation {
-            facts: None,
+            facts: Some(Box::new(verification_facts(
+                recipe_id,
+                "v1",
+                "definition-v1",
+            ))),
             output: ToolOutput {
                 call_id: call_id.into(),
                 tool_name: "verify.run".into(),
@@ -235,7 +264,38 @@ pub(crate) async fn verify_observation(engine: &SimpleContextEngine, call_id: &s
                 summary: "ok".into(),
                 model_content: content.into(),
                 artifact_ref: None,
-                metadata: serde_json::Value::Null,
+                metadata: serde_json::json!({ "recipe_id": recipe_id }),
+            },
+            scope_id: None,
+        })
+        .await
+        .unwrap();
+}
+
+/// Build a failing trusted-verification observation: the error it records
+/// carries the recipe identity, so a later success of the same recipe can
+/// finalize it.
+pub(crate) async fn verify_failure_observation(
+    engine: &SimpleContextEngine,
+    call_id: &str,
+    content: &str,
+    recipe_id: &str,
+) {
+    engine
+        .ingest(ContextIngress::ToolObservation {
+            facts: Some(Box::new(verification_facts(
+                recipe_id,
+                "v1",
+                "definition-v1",
+            ))),
+            output: ToolOutput {
+                call_id: call_id.into(),
+                tool_name: "verify.run".into(),
+                ok: false,
+                summary: "tests failed".into(),
+                model_content: content.into(),
+                artifact_ref: None,
+                metadata: serde_json::json!({ "recipe_id": recipe_id }),
             },
             scope_id: None,
         })

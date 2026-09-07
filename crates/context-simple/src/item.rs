@@ -50,6 +50,7 @@ pub(crate) fn make_item(
         keep_alive: false,
         lease_until_turn: None,
         source,
+        verify_recipe: None,
         residency: ContextResidency::Resident,
         gc_generation: 0,
         evicted_at_tick: None,

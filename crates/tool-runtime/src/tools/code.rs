@@ -34,6 +34,7 @@ use super::{Tool, display_relative, hidden_path_output, ordinary_view_blocked, w
 const MAX_FILES_SCANNED: usize = 5_000;
 const MAX_BYTES_PER_FILE: u64 = 2 * 1024 * 1024;
 const MODEL_SYMBOLS: usize = 100;
+const MAX_SYMBOL_NAME_CHARS: usize = 256;
 
 /// One lexical symbol rule: a per-line regex plus how to read the result.
 /// `Fixed(kind)` means capture group 1 is the symbol name; `FromGroups`
@@ -386,7 +387,7 @@ impl Tool for CodeSymbolsTool {
         call_id: &str,
         arguments: Value,
         _effect_context: Option<agent_contracts::OperationEffectContext>,
-        _cancel: CancellationToken,
+        cancel: CancellationToken,
     ) -> AgentResult<ToolOutcome> {
         let args: SymbolsArgs = serde_json::from_value(arguments)
             .map_err(|e| AgentError::InvalidRequest(format!("code.symbols args: {e}")))?;
@@ -405,14 +406,18 @@ impl Tool for CodeSymbolsTool {
 
         let mut files = Vec::new();
         let mut budget = MAX_FILES_SCANNED;
-        walk_files(&root, &mut files, &mut budget, None).await?;
+        let walk_incomplete = walk_files(&root, &mut files, &mut budget, Some(&cancel)).await?;
         files.sort();
 
         let query = args.query;
         let mut symbols: Vec<(String, usize, usize, String, String)> = Vec::new();
         let mut scanned_files = 0usize;
+        let mut clipped_names = 0usize;
 
         'files: for file in files {
+            if cancel.is_cancelled() {
+                return Err(AgentError::Cancelled);
+            }
             let relative = display_relative(&self.workspace, &file);
             let Some(text) =
                 super::read_confined_utf8(&self.workspace, &relative, MAX_BYTES_PER_FILE).await?
@@ -433,11 +438,23 @@ impl Tool for CodeSymbolsTool {
                 if !query.is_empty() && !name.contains(&query) {
                     continue;
                 }
+                let name = if name.chars().count() > MAX_SYMBOL_NAME_CHARS {
+                    clipped_names += 1;
+                    format!(
+                        "{}... [name clipped]",
+                        name.chars().take(MAX_SYMBOL_NAME_CHARS).collect::<String>()
+                    )
+                } else {
+                    name
+                };
                 symbols.push((relative.clone(), index + 1, column, kind, name));
                 if symbols.len() >= limit {
                     break 'files;
                 }
             }
+        }
+        if cancel.is_cancelled() {
+            return Err(AgentError::Cancelled);
         }
         symbols.sort();
 
@@ -499,6 +516,8 @@ impl Tool for CodeSymbolsTool {
                 metadata: json!({
                     "symbols": symbols.len(),
                     "files_scanned": scanned_files,
+                    "clipped_names": clipped_names,
+                    "scan_incomplete": walk_incomplete || symbols.len() >= limit,
                     "returned": model_rows.len(),
                     "has_more": has_more,
                     "next_start_line": has_more.then_some(model_rows.len() + 1),
@@ -794,10 +813,13 @@ async fn read_file_lines(workspace: &Workspace, file: &str) -> Result<Vec<String
         ));
     }
     let mut text = String::new();
-    let mut file = confined.into_tokio();
+    let mut file = confined.into_tokio().take(MAX_DIAG_FILE_BYTES + 1);
     file.read_to_string(&mut text)
         .await
         .map_err(|e| e.to_string())?;
+    if text.len() as u64 > MAX_DIAG_FILE_BYTES {
+        return Err("file grew beyond the diagnostic expand byte cap".into());
+    }
     Ok(text.lines().map(String::from).collect())
 }
 
@@ -819,6 +841,30 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let workspace = Workspace::open(dir.path()).await.unwrap();
         (workspace, dir)
+    }
+
+    #[tokio::test]
+    async fn oversized_symbol_names_are_clipped_before_accumulation() {
+        let (workspace, dir) = temp_workspace().await;
+        std::fs::write(
+            dir.path().join("long.rs"),
+            format!("fn {}() {{}}", "a".repeat(100_000)),
+        )
+        .unwrap();
+        let tool = CodeSymbolsTool::new(workspace);
+        let output = value(
+            tool.execute(
+                RunId::new(),
+                "long",
+                json!({}),
+                None,
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap(),
+        );
+        assert_eq!(output.metadata["clipped_names"], 1);
+        assert!(output.model_content.len() < MAX_SYMBOL_NAME_CHARS + 300);
     }
 
     async fn write(root: &Path, relative: &str, content: &str) {

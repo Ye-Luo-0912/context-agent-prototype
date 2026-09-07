@@ -192,6 +192,12 @@ public sealed class MainWindowViewModel : ObservableObject
 
     public string PlanText { get => _planText; private set => Set(ref _planText, value); }
 
+    private string _contextPanelText =
+        "只读 Context 面板等待平台路由（来源/表示类型/实际曝光/片段范围/恢复状态）。"
+        + "在路由落地前不显示任何推断内容，也不显示不存在的“模型内部注意力”。";
+
+    public string ContextPanelText { get => _contextPanelText; private set => Set(ref _contextPanelText, value); }
+
     /// <summary>G2 banner: resync / connection-loss state, never silently hidden.</summary>
     public string BannerText { get => _bannerText; private set => Set(ref _bannerText, value); }
 

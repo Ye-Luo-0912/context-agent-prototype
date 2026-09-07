@@ -9,7 +9,7 @@ use std::time::Duration;
 use agent_compose::HostToolPolicyRegistry;
 use agent_contracts::{
     ApprovalGate, RuntimeEvent, RuntimeEventEnvelope, RuntimeFailureClass, StandingGrant,
-    ToolOutput,
+    ToolFailureClass, ToolOutput,
 };
 use agent_core::{PolicyApprovalGate, TaskApprovalGate};
 use agent_runtime::RuntimeHandle;
@@ -62,17 +62,38 @@ pub async fn headless_approval(
     Ok(gate as Arc<dyn ApprovalGate>)
 }
 
+/// M17-B3/F09: stdin is charged AT READ TIME — the same cap the Runtime
+/// applies to user input bounds the read itself, so an oversized or
+/// never-ending stream is refused without ever holding the full payload.
+const MAX_STDIN_PROMPT_BYTES: usize = agent_contracts::input::USER_INPUT_REPLAY_MAX_BYTES;
+
 pub fn resolve_prompt(raw: &str) -> anyhow::Result<String> {
-    let text = if raw == "-" {
-        use std::io::Read;
-        let mut buf = String::new();
-        io::stdin()
-            .read_to_string(&mut buf)
-            .map_err(|error| anyhow::anyhow!("failed to read --prompt=- from stdin: {error}"))?;
-        buf
+    if raw == "-" {
+        resolve_prompt_from_reader(io::stdin().lock())
     } else {
-        raw.to_string()
-    };
+        let trimmed = raw.trim();
+        if trimmed.is_empty() {
+            anyhow::bail!("--prompt is empty");
+        }
+        Ok(trimmed.to_string())
+    }
+}
+
+/// The stdin path is charged AT READ TIME (`take`), so an oversized or
+/// never-ending stream is refused without ever holding the full payload;
+/// the buffer never grows past the cap the Runtime itself applies.
+fn resolve_prompt_from_reader<R: io::Read>(reader: R) -> anyhow::Result<String> {
+    use std::io::Read;
+    let mut buf = Vec::new();
+    reader
+        .take(MAX_STDIN_PROMPT_BYTES as u64 + 1)
+        .read_to_end(&mut buf)
+        .map_err(|error| anyhow::anyhow!("failed to read --prompt=- from stdin: {error}"))?;
+    if buf.len() > MAX_STDIN_PROMPT_BYTES {
+        anyhow::bail!("--prompt=- exceeds the {MAX_STDIN_PROMPT_BYTES} byte input cap");
+    }
+    let text = String::from_utf8(buf)
+        .map_err(|error| anyhow::anyhow!("--prompt=- is not valid UTF-8: {error}"))?;
     let trimmed = text.trim();
     if trimmed.is_empty() {
         anyhow::bail!("--prompt is empty");
@@ -98,13 +119,26 @@ pub fn load_grant_file(path: &Path) -> anyhow::Result<Vec<String>> {
             metadata.len()
         );
     }
-    let bytes = std::fs::read(path)
-        .map_err(|error| anyhow::anyhow!("unreadable --grant-file {}: {error}", path.display()))?;
+    let bytes = {
+        // M17-B3/F09: the read is capped itself (`take`), not just checked
+        // against a size observed before it — a file that grows between the
+        // stat and the read can no longer grow the allocation.
+        use std::io::Read;
+        let file = std::fs::File::open(path).map_err(|error| {
+            anyhow::anyhow!("unreadable --grant-file {}: {error}", path.display())
+        })?;
+        let mut buf = Vec::new();
+        file.take(MAX_GRANT_FILE_BYTES + 1)
+            .read_to_end(&mut buf)
+            .map_err(|error| {
+                anyhow::anyhow!("unreadable --grant-file {}: {error}", path.display())
+            })?;
+        buf
+    };
     if bytes.len() as u64 > MAX_GRANT_FILE_BYTES {
         anyhow::bail!(
-            "--grant-file {} is {} bytes; the cap is {MAX_GRANT_FILE_BYTES}",
-            path.display(),
-            bytes.len()
+            "--grant-file {} exceeds the {MAX_GRANT_FILE_BYTES} byte cap",
+            path.display()
         );
     }
     let value: serde_json::Value = serde_json::from_slice(&bytes)
@@ -193,16 +227,115 @@ impl Write for JsonlWriter {
     }
 }
 
-pub async fn run_headless(
+/// M17-B3/F09: bounded headless output sink. A dedicated writer thread
+/// owns the JSONL IO, so a slow or wedged consumer can never stall the
+/// event loop's timeout/cancel path (the old inline writes ran outside
+/// every deadline). Backpressure is explicit: a full bounded queue (slow
+/// consumer) or a dead writer (disconnected pipe) ends the run with a
+/// typed failure that is reported through the outcome and stderr — events
+/// are never silently dropped or buffered without bound.
+struct BoundedJsonlSink<W: Write> {
+    tx: Option<std::sync::mpsc::SyncSender<Vec<u8>>>,
+    done: std::sync::mpsc::Receiver<(W, io::Result<()>)>,
+}
+
+impl<W: Write + Send + 'static> BoundedJsonlSink<W> {
+    /// Bounded queue capacity: the most a slow consumer can fall behind
+    /// before the run ends.
+    const QUEUE_CAPACITY: usize = 64;
+    /// Bounded wait for the writer to drain its queue at close.
+    const CLOSE_TIMEOUT: Duration = Duration::from_secs(10);
+
+    fn spawn(writer: W) -> Self {
+        let (tx, rx) = std::sync::mpsc::sync_channel::<Vec<u8>>(Self::QUEUE_CAPACITY);
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let mut writer = writer;
+            let mut result = Ok(());
+            for line in rx.iter() {
+                if let Err(error) = writer.write_all(&line).and_then(|_| writer.flush()) {
+                    result = Err(error);
+                    break;
+                }
+            }
+            if result.is_ok() {
+                result = writer.flush();
+            }
+            let _ = done_tx.send((writer, result));
+        });
+        Self {
+            tx: Some(tx),
+            done: done_rx,
+        }
+    }
+
+    /// Queue one complete line. Errors explicitly when the consumer fell
+    /// behind the bounded queue or the writer disconnected.
+    fn write_line(&mut self, line: &[u8]) -> anyhow::Result<()> {
+        let Some(tx) = self.tx.as_ref() else {
+            anyhow::bail!("jsonl output already ended with a failure");
+        };
+        let mut payload = Vec::with_capacity(line.len() + 1);
+        payload.extend_from_slice(line);
+        payload.push(b'\n');
+        match tx.try_send(payload) {
+            Ok(()) => Ok(()),
+            Err(std::sync::mpsc::TrySendError::Full(_)) => {
+                self.tx.take();
+                anyhow::bail!(
+                    "jsonl output stalled: the consumer fell behind the {}-event bounded queue; \
+                     ending the run instead of blocking the event loop or buffering without bound",
+                    Self::QUEUE_CAPACITY
+                );
+            }
+            Err(std::sync::mpsc::TrySendError::Disconnected(_)) => {
+                self.tx.take();
+                anyhow::bail!(
+                    "jsonl output failed: the output consumer disconnected (broken pipe or closed sink)"
+                );
+            }
+        }
+    }
+
+    /// Close the queue and wait a bounded time for the writer to drain.
+    /// Returns the writer and its final flush result. A wedged consumer
+    /// past the close timeout is an explicit error — the run never waits
+    /// forever on its own output.
+    fn finish(mut self) -> anyhow::Result<(W, io::Result<()>)> {
+        drop(self.tx.take());
+        let deadline = Instant::now() + Self::CLOSE_TIMEOUT;
+        loop {
+            match self.done.try_recv() {
+                Ok(pair) => return Ok(pair),
+                Err(std::sync::mpsc::TryRecvError::Empty) if Instant::now() < deadline => {
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                Err(std::sync::mpsc::TryRecvError::Empty) => {
+                    anyhow::bail!(
+                        "jsonl output sink did not close within {:?}; the consumer is wedged and \
+                         up to {} buffered events may be unwritten",
+                        Self::CLOSE_TIMEOUT,
+                        Self::QUEUE_CAPACITY
+                    );
+                }
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                    anyhow::bail!("jsonl output writer thread ended unexpectedly");
+                }
+            }
+        }
+    }
+}
+
+pub async fn run_headless<W: Write + Send + 'static>(
     handle: RuntimeHandle,
     events: &mut broadcast::Receiver<RuntimeEventEnvelope>,
     action: HeadlessAction,
     timeout: Duration,
-    jsonl: &mut impl Write,
-) -> anyhow::Result<HeadlessOutcome> {
+    jsonl: W,
+) -> anyhow::Result<(HeadlessOutcome, W)> {
     match action {
         HeadlessAction::Prompt { text, work: true } => {
-            if let Some(warning) = start_long_task(&handle, text).await? {
+            if let Some(warning) = start_long_task(&handle, text).await?.task_manage_notice {
                 eprintln!("{warning}");
             }
         }
@@ -226,6 +359,8 @@ pub async fn run_headless(
         other_failure: None,
         timed_out: false,
     };
+    let mut sink = BoundedJsonlSink::spawn(jsonl);
+    let mut sink_failure: Option<String> = None;
     let deadline = Instant::now() + timeout;
     loop {
         if outcome.is_terminal() {
@@ -254,13 +389,21 @@ pub async fn run_headless(
         };
         outcome.observe(&envelope.event);
         if emit_jsonl_event(&envelope) {
-            serde_json::to_writer(&mut *jsonl, &envelope)?;
-            jsonl.write_all(b"\n")?;
+            let mut line = serde_json::to_vec(&envelope)?;
+            line.push(b'\n');
+            if let Err(error) = sink.write_line(&line) {
+                // Slow consumer or disconnect: stop the drain with an
+                // explicit typed failure. The failure surfaces through the
+                // outcome (exit code) and stderr — the stream is never
+                // silently truncated and the loop never blocks on IO.
+                sink_failure = Some(error.to_string());
+                break;
+            }
         }
     }
 
     let task_was_active = outcome.task_active;
-    let result = outcome.finish();
+    let mut result = outcome.finish();
     // Closure semantics for scripts: `operator_accepted` = durable
     // TaskCompleted; `awaiting_operator_review` = work produced but the
     // task stays active (/done closes it); `none` = no active task.
@@ -271,21 +414,51 @@ pub async fn run_headless(
     } else {
         "none"
     };
-    let session = serde_json::json!({
-        "schema": "agent.headless.v1",
-        "kind": "session_end",
-        "status": result.status,
-        "exit": result.exit,
-        "stop": result.stop,
-        "task_state": task_state,
-        "task_completed": result.task_completed,
-        "round_budget": result.round_budget,
-        "approval_denied": result.approval_denied,
-    });
-    serde_json::to_writer(&mut *jsonl, &session)?;
-    jsonl.write_all(b"\n")?;
+    if sink_failure.is_none() {
+        let session = serde_json::json!({
+            "schema": "agent.headless.v1",
+            "kind": "session_end",
+            "status": result.status,
+            "exit": result.exit,
+            "stop": result.stop,
+            "task_state": task_state,
+            "task_completed": result.task_completed,
+            "round_budget": result.round_budget,
+            "approval_denied": result.approval_denied,
+        });
+        let mut line = serde_json::to_vec(&session)?;
+        line.push(b'\n');
+        if let Err(error) = sink.write_line(&line) {
+            sink_failure = Some(error.to_string());
+        }
+    }
+    let (mut jsonl, flush_result) = sink.finish()?;
+    if let Err(error) = flush_result {
+        // The writer's own IO error is usually the disconnect cause the
+        // sink already reported; surface it without discarding the typed
+        // outcome.
+        eprintln!("jsonl flush: {error}");
+        if sink_failure.is_none() {
+            sink_failure = Some(format!("jsonl output flush failed: {error}"));
+        }
+    }
+    if let Some(message) = sink_failure {
+        eprintln!("jsonl: {message}");
+        // The JSONL stream ended early: a truncated stream is never
+        // reported as success.
+        if result.exit == EXIT_OK {
+            result = HeadlessOutcome {
+                exit: EXIT_ERROR,
+                status: "failed",
+                stop: "output_failure".into(),
+                task_completed: result.task_completed,
+                round_budget: result.round_budget,
+                approval_denied: result.approval_denied,
+            };
+        }
+    }
     jsonl.flush()?;
-    Ok(result)
+    Ok((result, jsonl))
 }
 
 fn emit_jsonl_event(envelope: &RuntimeEventEnvelope) -> bool {
@@ -297,9 +470,10 @@ fn emit_jsonl_event(envelope: &RuntimeEventEnvelope) -> bool {
     )
 }
 
+/// P2: the approval truth is the kernel's typed failure class on the
+/// refusal output, never a phrase match over arbitrary tool prose.
 fn approval_denied(output: &ToolOutput) -> bool {
-    output.summary.contains("denied by approval policy")
-        || output.model_content.contains("denied by approval policy")
+    output.failure_class() == Some(ToolFailureClass::ApprovalDenied)
 }
 
 #[derive(Default)]
@@ -516,6 +690,11 @@ mod tests {
             effect_reservation_journal: Some(reservation),
             verification_recipes: Some(recipes.clone()),
             project_proof_refresh: !recipes.is_empty(),
+            // Headless CLI shares the product binary's watchdog dispatch.
+            host_death_watchdog: true,
+            // Harness/eval compositions register no external capabilities by default.
+            mcp_servers: Vec::new(),
+            plugins: None,
         })
         .await
     }
@@ -530,7 +709,9 @@ mod tests {
     }
 
     #[test]
-    fn approval_denied_matches_kernel_refusal_text() {
+    fn approval_denied_reads_the_typed_kernel_class_not_prose() {
+        // The kernel's real refusal shape: failure_class stamped into the
+        // metadata by the trusted tool-error builder.
         let denied = ToolOutput {
             call_id: "1".into(),
             tool_name: "fs.write".into(),
@@ -538,10 +719,26 @@ mod tests {
             summary: "tool denied by approval policy: fs.write".into(),
             model_content: "tool error: tool denied by approval policy: fs.write".into(),
             artifact_ref: None,
-            metadata: json!({}),
+            metadata: json!({"failure_class": "approval_denied"}),
         };
         assert!(approval_denied(&denied));
-        let other = ToolOutput {
+
+        // A tool whose unrelated output merely contains the refusal phrase
+        // must never be read as an approval denial.
+        let phrase_in_prose = ToolOutput {
+            call_id: "3".into(),
+            tool_name: "verify.run".into(),
+            ok: true,
+            summary: "suite passed".into(),
+            model_content: "log line: tool denied by approval policy: fs.write".into(),
+            artifact_ref: None,
+            metadata: json!({}),
+        };
+        assert!(!approval_denied(&phrase_in_prose));
+
+        // A legacy/foreign refusal-shaped output without the typed class is
+        // not an approval denial either; the class is the only authority.
+        let untyped = ToolOutput {
             call_id: "2".into(),
             tool_name: "fs.write".into(),
             ok: false,
@@ -550,7 +747,7 @@ mod tests {
             artifact_ref: None,
             metadata: json!({}),
         };
-        assert!(!approval_denied(&other));
+        assert!(!approval_denied(&untyped));
     }
 
     fn hello_grant_value() -> serde_json::Value {
@@ -561,6 +758,33 @@ mod tests {
             "constraint": {},
             "expires_at_ms": u64::MAX
         })
+    }
+
+    /// M17-B3/F09: the stdin prompt is charged at read time — a payload
+    /// over the cap is refused by the bounded read itself, never after a
+    /// full unbounded allocation.
+    #[test]
+    fn stdin_prompt_is_charged_at_read_time() {
+        let oversized = vec![b'x'; MAX_STDIN_PROMPT_BYTES + 1];
+        let error = resolve_prompt_from_reader(&oversized[..]).unwrap_err();
+        assert!(error.to_string().contains("byte input cap"), "{error}");
+        let at_cap = vec![b'x'; MAX_STDIN_PROMPT_BYTES];
+        assert_eq!(
+            resolve_prompt_from_reader(&at_cap[..]).unwrap().len(),
+            MAX_STDIN_PROMPT_BYTES
+        );
+    }
+
+    /// M17-B3/F09: a grant file over the cap is refused by the bounded
+    /// read, not only by the pre-read stat.
+    #[test]
+    fn grant_file_over_the_cap_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("huge.json");
+        std::fs::write(&path, vec![b' '; (MAX_GRANT_FILE_BYTES + 4096) as usize]).unwrap();
+        let error = load_grant_file(&path).unwrap_err().to_string();
+        // Either bound may fire — the pre-read stat or the capped read.
+        assert!(error.contains("cap"), "{error}");
     }
 
     #[test]
@@ -645,6 +869,46 @@ mod tests {
         assert!(error.contains("at most 16"), "{error}");
     }
 
+    /// A writer whose IO always fails (a disconnected pipe): the headless
+    /// run must end with an explicit typed failure — never a hang, silent
+    /// truncation reported as success, or unbounded buffering (M17-B3/F09).
+    struct BrokenPipeWriter;
+
+    impl Write for BrokenPipeWriter {
+        fn write(&mut self, _: &[u8]) -> io::Result<usize> {
+            Err(io::Error::new(io::ErrorKind::BrokenPipe, "consumer gone"))
+        }
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn headless_output_disconnect_ends_the_run_with_a_typed_failure() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path();
+        let composed = product_compose(root, &[], Arc::new(MockModelTransport), Some(4))
+            .await
+            .unwrap();
+        let mut events = composed.subscribe();
+        composed.instance.start().await.unwrap();
+        let (outcome, _jsonl) = run_headless(
+            composed.handle().clone(),
+            &mut events,
+            HeadlessAction::Prompt {
+                text: "demo: idle".into(),
+                work: false,
+            },
+            Duration::from_secs(30),
+            BrokenPipeWriter,
+        )
+        .await
+        .unwrap();
+        composed.shutdown().await.unwrap();
+        assert_eq!(outcome.exit, EXIT_ERROR, "{outcome:?}");
+        assert_eq!(outcome.status, "failed", "{outcome:?}");
+    }
+
     #[tokio::test]
     async fn headless_write_without_a_grant_refuses_and_does_not_imply_allow_all() {
         let temp = tempfile::tempdir().unwrap();
@@ -654,8 +918,8 @@ mod tests {
             .unwrap();
         let mut events = composed.subscribe();
         composed.instance.start().await.unwrap();
-        let mut jsonl = Vec::new();
-        let outcome = run_headless(
+        let jsonl = Vec::new();
+        let (outcome, jsonl) = run_headless(
             composed.handle().clone(),
             &mut events,
             HeadlessAction::Prompt {
@@ -663,7 +927,7 @@ mod tests {
                 work: false,
             },
             Duration::from_secs(30),
-            &mut jsonl,
+            jsonl,
         )
         .await
         .unwrap();
@@ -692,8 +956,8 @@ mod tests {
         .unwrap();
         let mut events = composed.subscribe();
         composed.instance.start().await.unwrap();
-        let mut jsonl = Vec::new();
-        let outcome = run_headless(
+        let jsonl = Vec::new();
+        let (outcome, jsonl) = run_headless(
             composed.handle().clone(),
             &mut events,
             HeadlessAction::Prompt {
@@ -701,7 +965,7 @@ mod tests {
                 work: false,
             },
             Duration::from_secs(30),
-            &mut jsonl,
+            jsonl,
         )
         .await
         .unwrap();
@@ -798,8 +1062,8 @@ mod tests {
             .unwrap();
         let mut events = composed.subscribe();
         composed.instance.start().await.unwrap();
-        let mut jsonl = Vec::new();
-        let outcome = run_headless(
+        let jsonl = Vec::new();
+        let (outcome, jsonl) = run_headless(
             composed.handle().clone(),
             &mut events,
             HeadlessAction::Prompt {
@@ -807,7 +1071,7 @@ mod tests {
                 work: false,
             },
             Duration::from_secs(30),
-            &mut jsonl,
+            jsonl,
         )
         .await
         .unwrap();
@@ -890,8 +1154,8 @@ mod tests {
             .unwrap();
         let mut events = composed.subscribe();
         composed.instance.start().await.unwrap();
-        let mut jsonl = Vec::new();
-        let outcome = run_headless(
+        let jsonl = Vec::new();
+        let (outcome, jsonl) = run_headless(
             composed.handle().clone(),
             &mut events,
             HeadlessAction::Prompt {
@@ -899,7 +1163,7 @@ mod tests {
                 work: true,
             },
             Duration::from_secs(30),
-            &mut jsonl,
+            jsonl,
         )
         .await
         .unwrap();
@@ -984,8 +1248,8 @@ mod tests {
             .unwrap();
         let mut events = composed.subscribe();
         composed.instance.start().await.unwrap();
-        let mut jsonl = Vec::new();
-        let outcome = run_headless(
+        let jsonl = Vec::new();
+        let (outcome, jsonl) = run_headless(
             composed.handle().clone(),
             &mut events,
             HeadlessAction::Prompt {
@@ -993,7 +1257,7 @@ mod tests {
                 work: false,
             },
             Duration::from_secs(30),
-            &mut jsonl,
+            jsonl,
         )
         .await
         .unwrap();
@@ -1001,12 +1265,12 @@ mod tests {
         assert!(root.join("file_a.txt").exists(), "segment 1 must land");
 
         // /continue: the second segment writes the other file.
-        let outcome = run_headless(
+        let (outcome, _jsonl) = run_headless(
             composed.handle().clone(),
             &mut events,
             HeadlessAction::Continue,
             Duration::from_secs(30),
-            &mut jsonl,
+            jsonl,
         )
         .await
         .unwrap();
@@ -1032,8 +1296,8 @@ mod tests {
             .unwrap();
         let mut events = composed.subscribe();
         composed.instance.start().await.unwrap();
-        let mut jsonl = Vec::new();
-        let outcome = run_headless(
+        let jsonl = Vec::new();
+        let (outcome, _jsonl) = run_headless(
             composed.handle().clone(),
             &mut events,
             HeadlessAction::Prompt {
@@ -1041,7 +1305,7 @@ mod tests {
                 work: false,
             },
             Duration::from_secs(30),
-            &mut jsonl,
+            jsonl,
         )
         .await
         .unwrap();
@@ -1085,8 +1349,8 @@ mod tests {
             .unwrap();
         let mut events = composed.subscribe();
         composed.instance.start().await.unwrap();
-        let mut jsonl = Vec::new();
-        let outcome = run_headless(
+        let jsonl = Vec::new();
+        let (outcome, jsonl) = run_headless(
             composed.handle().clone(),
             &mut events,
             HeadlessAction::Prompt {
@@ -1094,7 +1358,7 @@ mod tests {
                 work: false,
             },
             Duration::from_secs(30),
-            &mut jsonl,
+            jsonl,
         )
         .await
         .unwrap();
@@ -1160,8 +1424,8 @@ mod tests {
         .unwrap();
         let mut events = composed.subscribe();
         composed.instance.start().await.unwrap();
-        let mut jsonl = Vec::new();
-        let outcome = run_headless(
+        let jsonl = Vec::new();
+        let (outcome, jsonl) = run_headless(
             composed.handle().clone(),
             &mut events,
             HeadlessAction::Prompt {
@@ -1169,7 +1433,7 @@ mod tests {
                 work: true,
             },
             Duration::from_secs(30),
-            &mut jsonl,
+            jsonl,
         )
         .await
         .unwrap();

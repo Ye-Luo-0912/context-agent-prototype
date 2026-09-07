@@ -20,7 +20,7 @@ use agent_contracts::{
     is_non_transactional_process_tool,
 };
 use agent_process::{
-    capture_process_identity, kill_matching_process_tree, process_identity_matches,
+    ProcessCleanupOutcome, capture_process_identity, terminate_matching_process_tree,
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
@@ -201,13 +201,17 @@ impl ProcessEffectJournal {
                 .collect()
         };
         for (pid, token) in open {
-            if !process_identity_matches(pid, &token) {
-                continue;
-            }
-            if !kill_matching_process_tree(pid, &token) && process_identity_matches(pid, &token) {
-                return Err(AgentError::RecoveryRequired(format!(
-                    "could not terminate leftover process {pid}"
-                )));
+            match terminate_matching_process_tree(pid, &token) {
+                Ok(
+                    ProcessCleanupOutcome::AlreadyExited
+                    | ProcessCleanupOutcome::IdentityMismatch
+                    | ProcessCleanupOutcome::ExitConfirmed,
+                ) => {}
+                Ok(ProcessCleanupOutcome::Unconfirmed { reason }) | Err(reason) => {
+                    return Err(AgentError::RecoveryRequired(bounded_reason(format!(
+                        "could not terminate leftover process {pid} with verified exit: {reason}"
+                    ))));
+                }
             }
         }
         Ok(())
@@ -247,19 +251,26 @@ impl ProcessEffectJournal {
                 ))),
             });
         }
-        if process_identity_matches(evidence.pid, &evidence.identity_token) {
-            let _ = kill_matching_process_tree(evidence.pid, &evidence.identity_token);
-            return Ok(EffectReconciliation::Ambiguous {
-                reason: bounded_reason(format!(
-                    "process {} was still running; leftover tree was signalled and mutations may have landed",
-                    evidence.pid
-                )),
-            });
-        }
+        let cleanup = match terminate_matching_process_tree(evidence.pid, &evidence.identity_token)
+        {
+            Ok(ProcessCleanupOutcome::AlreadyExited) => {
+                "exited without a durable wait record".into()
+            }
+            Ok(ProcessCleanupOutcome::IdentityMismatch) => {
+                "PID belongs to another process; no signal sent".into()
+            }
+            Ok(ProcessCleanupOutcome::ExitConfirmed) => {
+                "leftover exit confirmed after signalling".into()
+            }
+            Ok(ProcessCleanupOutcome::Unconfirmed { reason }) => {
+                format!("cleanup unconfirmed: {reason}")
+            }
+            Err(reason) => format!("cleanup could not be verified: {reason}"),
+        };
         Ok(EffectReconciliation::Ambiguous {
             reason: bounded_reason(format!(
-                "process {} exited without a durable wait record; mutations may have landed",
-                evidence.pid
+                "process {} {cleanup}; mutations may have landed",
+                evidence.pid,
             )),
         })
     }
@@ -576,6 +587,73 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let workspace = crate::Workspace::open(directory.path()).await.unwrap();
         (workspace, directory)
+    }
+
+    #[tokio::test]
+    async fn live_orphan_without_creation_identity_blocks_recovery_and_is_not_killed() {
+        let (workspace, directory) = workspace().await;
+        let context = process_context("process.run");
+        let mut child = spawn_sleeper();
+        let pid = child.id();
+        workspace
+            .process_journal
+            .append(JournalTransition::Spawned {
+                context: Box::new(context.clone()),
+                pid,
+                identity_token: String::new(),
+            })
+            .unwrap();
+        drop(workspace);
+        let reopened = crate::Workspace::open(directory.path()).await.unwrap();
+        let result = EffectReconciler::recover_orphans(&reopened);
+        let alive = child.try_wait().unwrap().is_none();
+        // Always reclaim the test-owned child, even if the assertion fails.
+        let _ = child.kill();
+        let _ = child.wait();
+        assert!(alive, "identity-less recovery must not signal the process");
+        assert!(
+            matches!(result, Err(AgentError::RecoveryRequired(_))),
+            "unknown identity must fence recovery: {result:?}"
+        );
+        assert!(
+            matches!(
+                reopened.reconcile(&context).unwrap(),
+                EffectReconciliation::Ambiguous { .. }
+            ),
+            "OS exit without a durable wait record is still ambiguous"
+        );
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn inaccessible_orphan_cannot_be_reported_exited_or_recovered() {
+        let (workspace, directory) = workspace().await;
+        let context = process_context("process.run");
+        // Read-only probe of the protected System process. The explicitly
+        // empty recorded token prevents signals even on an elevated host.
+        workspace
+            .process_journal
+            .append(JournalTransition::Spawned {
+                context: Box::new(context.clone()),
+                pid: 4,
+                identity_token: String::new(),
+            })
+            .unwrap();
+        drop(workspace);
+        let reopened = crate::Workspace::open(directory.path()).await.unwrap();
+        assert!(matches!(
+            EffectReconciler::recover_orphans(&reopened),
+            Err(AgentError::RecoveryRequired(_))
+        ));
+        let EffectReconciliation::Ambiguous { reason } = reopened.reconcile(&context).unwrap()
+        else {
+            panic!("no completion receipt exists");
+        };
+        assert!(reason.contains("could not be verified"), "{reason}");
+        assert!(
+            !reason.contains("exited without"),
+            "a failed probe cannot claim exit: {reason}"
+        );
     }
 
     fn spawn_quick() -> std::process::Child {

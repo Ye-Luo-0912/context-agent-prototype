@@ -1089,7 +1089,14 @@ impl CoreAuthority {
                         error.to_string(),
                     )));
                 }
-                return refused(ToolOutcome::Value(tool_error_output(&call, message)));
+                return refused(ToolOutcome::Value(agent_contracts::tool_failure_output(
+                    call.id.clone(),
+                    call.name.clone(),
+                    agent_contracts::ToolFailureClass::ApprovalDenied,
+                    message.clone(),
+                    format!("tool error: {message}"),
+                    serde_json::json!({"executed": false}),
+                )));
             }
         }
 

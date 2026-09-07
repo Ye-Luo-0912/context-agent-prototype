@@ -206,6 +206,13 @@ async fn real_main() -> anyhow::Result<()> {
         effect_reservation_journal: Some(reservation_journal),
         verification_recipes: Some(verification_recipes.clone()),
         project_proof_refresh: !verification_recipes.as_ref().is_empty(),
+        // One supervision decision for both process lanes: this binary's
+        // main dispatches on the watchdog marker, so the host proof lane
+        // receives the same containment the dispatcher got above (M17-B1).
+        host_death_watchdog: true,
+        // Harness/eval compositions register no external capabilities by default.
+        mcp_servers: Vec::new(),
+        plugins: None,
     })
     .await?;
     let mut runtime_events = composed.subscribe();
@@ -236,7 +243,7 @@ async fn real_main() -> anyhow::Result<()> {
                 work: args.work,
             }
         };
-        let mut jsonl = jsonl_sink
+        let jsonl = jsonl_sink
             .take()
             .ok_or_else(|| anyhow::anyhow!("headless JSONL sink was not opened"))?;
         let run = cli::run_headless(
@@ -244,7 +251,7 @@ async fn real_main() -> anyhow::Result<()> {
             &mut runtime_events,
             action,
             args.headless_timeout(),
-            &mut jsonl,
+            jsonl,
         )
         .await;
         let shutdown_result = composed.shutdown().await;
@@ -253,7 +260,7 @@ async fn real_main() -> anyhow::Result<()> {
             (Ok(_), Err(shutdown_error)) => {
                 Err(anyhow::Error::new(shutdown_error).context("runtime shutdown failed"))
             }
-            (Ok(outcome), Ok(())) => std::process::exit(outcome.exit),
+            (Ok((outcome, _sink)), Ok(())) => std::process::exit(outcome.exit),
         };
     }
     debug_assert!(jsonl_sink.is_none());

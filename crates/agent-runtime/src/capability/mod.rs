@@ -1452,6 +1452,10 @@ pub struct CapabilityAwareDispatcher {
     /// 路径相同的来源；缺省时退回按声明风险的空意图，未准入插件无法
     /// 借此扩权。
     host_policies: Option<std::sync::Arc<dyn HostToolPolicies>>,
+    /// Installed plugin packages (E1): the source of on-demand skill body
+    /// reads through `capability.manage` `read_skill`. `None` means the
+    /// composition configured no plugin catalog and skill reads refuse.
+    plugins: Option<Arc<crate::PluginRegistry>>,
 }
 
 impl CapabilityAwareDispatcher {
@@ -1479,6 +1483,7 @@ impl CapabilityAwareDispatcher {
             capabilities,
             workspace,
             host_policies: None,
+            plugins: None,
         }
     }
 
@@ -1488,17 +1493,25 @@ impl CapabilityAwareDispatcher {
         self
     }
 
+    /// Wire the installed-plugin catalog (E1): `capability.manage`
+    /// `read_skill` serves on-demand, bounded skill bodies from it. Without
+    /// a catalog, skill reads refuse — they never silently return empty.
+    pub fn with_plugin_registry(mut self, plugins: Arc<crate::PluginRegistry>) -> Self {
+        self.plugins = Some(plugins);
+        self
+    }
+
     /// The unified control tool schemas (always visible).
     fn control_specs() -> Vec<ToolSpec> {
         vec![
-            ToolSpec {
-                name: CAPABILITY_MANAGE.into(),
-                description: "Catalog ops: search, inspect, load, unload. Search by query and/or role=mutate|verify|read_resource|search|inspect_diff|escape_hatch. Load by exact name from the TOOL CATALOG index.".into(),
-                input_schema: json!({
-                    "type": "object",
-                    "required": ["op"],
-                    "properties": {
-                        "op": {"type": "string", "enum": ["search", "inspect", "load", "unload"]},
+                ToolSpec {
+                    name: CAPABILITY_MANAGE.into(),
+                    description: "Catalog ops: search, inspect, load, unload, read_skill. Search by query and/or role=mutate|verify|read_resource|search|inspect_diff|escape_hatch. Load by exact name from the TOOL CATALOG index. read_skill fetches an ACTIVE skill's bounded body on demand (never preloaded).".into(),
+                    input_schema: json!({
+                        "type": "object",
+                        "required": ["op"],
+                        "properties": {
+                            "op": {"type": "string", "enum": ["search", "inspect", "load", "unload", "read_skill"]},
                         "name": {"type": "string", "description": "Exact tool name for inspect/load/unload"},
                         "query": {"type": "string", "description": "search: token match over name/description/owner/state/risk"},
                         "role": {
@@ -2238,6 +2251,78 @@ impl CapabilityAwareDispatcher {
         })
     }
 
+    /// E1: on-demand skill body read. The body is served from the
+    /// installed plugin catalog only — bounded, provenance-stamped, and
+    /// only for an active package with an active skill. It enters the
+    /// model surface as ordinary tool output at the moment it is asked
+    /// for: never injected wholesale into a request, never System
+    /// authority, and the skill's own scripts still run (or refuse)
+    /// through the existing tools and their approval gates.
+    fn run_read_skill(
+        &self,
+        request: ToolExecutionRequest,
+        name: String,
+    ) -> AgentResult<ToolOutput> {
+        let refused = |summary: String| ToolOutput {
+            call_id: request.call.id.clone(),
+            tool_name: CAPABILITY_MANAGE.into(),
+            ok: false,
+            summary: summary.clone(),
+            model_content: summary,
+            artifact_ref: None,
+            metadata: json!({"op": "read_skill"}),
+        };
+        let Some(plugins) = self.plugins.as_ref() else {
+            return Ok(refused(
+                "no plugin catalog is configured in this composition; skill bodies are unavailable"
+                    .into(),
+            ));
+        };
+        // Resolve the skill id across packages: a unique match reads; an
+        // ambiguous or unknown id is reported with the candidates.
+        let mut matches: Vec<(String, crate::SkillView)> = Vec::new();
+        for package in plugins.list() {
+            if let Some(skills) = plugins.skills(&package.id)
+                && let Some(skill) = skills.iter().find(|skill| skill.id == name)
+            {
+                matches.push((package.id.clone(), skill.clone()));
+            }
+        }
+        match matches.as_slice() {
+            [] => Ok(refused(format!("unknown skill: {name}"))),
+            [(_, _)] => match plugins.skill_read(&matches[0].0, &name) {
+                Ok(body) => {
+                    let body_bytes = body.body.len();
+                    Ok(ToolOutput {
+                        call_id: request.call.id.clone(),
+                        tool_name: CAPABILITY_MANAGE.into(),
+                        ok: true,
+                        summary: format!(
+                            "skill {} v{} from package {} ({:?})",
+                            body.skill, body.version, body.package, body.provenance
+                        ),
+                        model_content: body.body,
+                        artifact_ref: None,
+                        metadata: json!({
+                            "op": "read_skill",
+                            "package": body.package,
+                            "skill": body.skill,
+                            "version": body.version,
+                            "provenance": body.provenance,
+                            "reference": body.reference,
+                            "body_bytes": body_bytes,
+                        }),
+                    })
+                }
+                Err(error) => Ok(refused(error.to_string())),
+            },
+            _ => Ok(refused(format!(
+                "ambiguous skill id '{name}': declared by {} packages",
+                matches.len()
+            ))),
+        }
+    }
+
     async fn run_unload(
         &self,
         request: ToolExecutionRequest,
@@ -2286,6 +2371,14 @@ impl CapabilityAwareDispatcher {
                     AgentError::InvalidRequest("capability.manage unload: missing 'name'".into())
                 })?;
                 self.run_unload(request, name).await
+            }
+            "read_skill" => {
+                let name = args.name.ok_or_else(|| {
+                    AgentError::InvalidRequest(
+                        "capability.manage read_skill: missing 'name' (the skill id)".into(),
+                    )
+                })?;
+                self.run_read_skill(request, name)
             }
             other => Err(AgentError::InvalidRequest(format!(
                 "capability.manage: unknown op '{other}' (expected search/inspect/load/unload)"

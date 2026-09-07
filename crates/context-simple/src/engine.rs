@@ -83,7 +83,7 @@ pub struct SimpleContextConfig {
     /// Detect superseding decisions and archive the superseded ones.
     pub supersession: bool,
     /// Error -> fix -> verified lifecycle (errors persist until a
-    /// successful result on the same entities verifies the fix).
+    /// successful host probe in the same task verifies the fix).
     pub error_verification: bool,
     /// Reward items whose entity signature is hot (last user message +
     /// recent tool observations).
@@ -954,6 +954,12 @@ impl ContextEngine for SimpleContextEngine {
                     // touches fall back to the legacy metadata derivation,
                     // which yields identical values for every producer class
                     // today.
+                    let native_facts = output.native_execution_facts();
+                    let verify_recipe = facts
+                        .as_deref()
+                        .or(native_facts.as_ref())
+                        .and_then(|facts| facts.verification_probe())
+                        .cloned();
                     let facts = facts
                         .as_deref()
                         .filter(|f| !f.resource_touches().is_empty());
@@ -1006,7 +1012,7 @@ impl ContextEngine for SimpleContextEngine {
                     );
                     // Successful tool identity is the stamped resource,
                     // never tokens mined from stdout. Failed Error items
-                    // keep content entities so verification can match.
+                    // keep content entities for search and relevance, never proof.
                     if ok {
                         item.entities.clear();
                     }
@@ -1023,6 +1029,9 @@ impl ContextEngine for SimpleContextEngine {
                         item.file_start_line = Some(start);
                         item.file_end_line = Some(end);
                     }
+                    // The captured host probe is separate from model-facing
+                    // metadata; incomplete legacy associations stay unknown.
+                    item.verify_recipe = verify_recipe.clone();
                     // The runtime opened the tool scope at tool start; the
                     // observation is tagged with that frame even though it is
                     // persisted at turn end.
@@ -1036,26 +1045,19 @@ impl ContextEngine for SimpleContextEngine {
                     // heap only after queueing so intents never see it.
                     let observation_id = item.id;
                     if self.config.error_verification && !ok {
-                        reachability::queue_error_recurrence(
-                            &mut state,
-                            &content,
-                            round,
-                            observation_id,
-                        );
+                        reachability::queue_error_recurrence(&mut state, &item, round);
                     }
-                    // Only the trusted verification recipe proves an error
-                    // fixed. A successful read or grep of an error-related
-                    // file is evidence the file exists, not that the error
-                    // is gone; entity overlap alone must never clear an
-                    // error into its terminal VerifiedFixed state.
+                    // Only the same task and host check definition can
+                    // verify an earlier fault. Text/entity overlap is not proof.
                     if self.config.error_verification && ok && output.tool_name == "verify.run" {
                         reachability::queue_error_verifications(
                             &mut state,
-                            &content,
                             &format!(
-                                "error verified fixed by successful tool result (round {round})"
+                                "error verified fixed by the same task and probe (round {round})"
                             ),
                             observation_id,
+                            item.task_id,
+                            verify_recipe.as_ref(),
                         );
                     }
                     if ok {

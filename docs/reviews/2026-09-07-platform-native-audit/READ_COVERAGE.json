@@ -1,0 +1,331 @@
+[
+  {
+    "id": "S01",
+    "path": "docs/NEXT_TASKS.md",
+    "ref": "b299c6a08fdb055a0148a24dea65053861df6ff1",
+    "requested_ranges": [
+      [
+        1,
+        220
+      ]
+    ],
+    "coverage": "partial_response_truncated",
+    "source_references": [
+      "turn271file0"
+    ],
+    "url": "https://github.com/Ye-Luo-0912/context-agent-prototype/blob/b299c6a08fdb055a0148a24dea65053861df6ff1/docs/NEXT_TASKS.md"
+  },
+  {
+    "id": "S02",
+    "path": "crates/agent-process/src/watchdog.rs",
+    "ref": "b299c6a08fdb055a0148a24dea65053861df6ff1",
+    "requested_ranges": [
+      [
+        1,
+        330
+      ]
+    ],
+    "coverage": "full_body_returned",
+    "source_references": [
+      "turn273file0"
+    ],
+    "url": "https://github.com/Ye-Luo-0912/context-agent-prototype/blob/b299c6a08fdb055a0148a24dea65053861df6ff1/crates/agent-process/src/watchdog.rs"
+  },
+  {
+    "id": "S03",
+    "path": "crates/tool-runtime/src/supervision.rs",
+    "ref": "b299c6a08fdb055a0148a24dea65053861df6ff1",
+    "requested_ranges": [
+      [
+        1,
+        380
+      ]
+    ],
+    "coverage": "full_body_returned",
+    "source_references": [
+      "turn275file0"
+    ],
+    "url": "https://github.com/Ye-Luo-0912/context-agent-prototype/blob/b299c6a08fdb055a0148a24dea65053861df6ff1/crates/tool-runtime/src/supervision.rs"
+  },
+  {
+    "id": "S04",
+    "path": "crates/agent-compose/src/lib.rs",
+    "ref": "b299c6a08fdb055a0148a24dea65053861df6ff1",
+    "requested_ranges": [
+      [
+        435,
+        515
+      ],
+      [
+        510,
+        800
+      ]
+    ],
+    "coverage": "ranges_only",
+    "source_references": [
+      "turn278file0",
+      "turn277file0"
+    ],
+    "url": "https://github.com/Ye-Luo-0912/context-agent-prototype/blob/b299c6a08fdb055a0148a24dea65053861df6ff1/crates/agent-compose/src/lib.rs"
+  },
+  {
+    "id": "S05",
+    "path": "crates/agent-tui/src/cli.rs",
+    "ref": "b299c6a08fdb055a0148a24dea65053861df6ff1",
+    "requested_ranges": [
+      [
+        1,
+        400
+      ]
+    ],
+    "coverage": "ranges_only",
+    "source_references": [
+      "turn279file0"
+    ],
+    "url": "https://github.com/Ye-Luo-0912/context-agent-prototype/blob/b299c6a08fdb055a0148a24dea65053861df6ff1/crates/agent-tui/src/cli.rs"
+  },
+  {
+    "id": "S06",
+    "path": "crates/agent-storage/src/lib.rs",
+    "ref": "b299c6a08fdb055a0148a24dea65053861df6ff1",
+    "requested_ranges": [
+      [
+        305,
+        500
+      ],
+      [
+        670,
+        965
+      ]
+    ],
+    "coverage": "ranges_only",
+    "source_references": [
+      "turn282file0",
+      "turn281file0"
+    ],
+    "url": "https://github.com/Ye-Luo-0912/context-agent-prototype/blob/b299c6a08fdb055a0148a24dea65053861df6ff1/crates/agent-storage/src/lib.rs"
+  },
+  {
+    "id": "S07",
+    "path": "crates/agent-core/src/operation.rs",
+    "ref": "b299c6a08fdb055a0148a24dea65053861df6ff1",
+    "requested_ranges": [
+      [
+        255,
+        305
+      ]
+    ],
+    "coverage": "ranges_only",
+    "source_references": [
+      "turn283file0"
+    ],
+    "url": "https://github.com/Ye-Luo-0912/context-agent-prototype/blob/b299c6a08fdb055a0148a24dea65053861df6ff1/crates/agent-core/src/operation.rs"
+  },
+  {
+    "id": "S08",
+    "path": "crates/agent-workspace/src/lib.rs",
+    "ref": "b299c6a08fdb055a0148a24dea65053861df6ff1",
+    "requested_ranges": [
+      [
+        1,
+        300
+      ],
+      [
+        325,
+        525
+      ]
+    ],
+    "coverage": "ranges_only",
+    "source_references": [
+      "turn284file0",
+      "turn285file0"
+    ],
+    "url": "https://github.com/Ye-Luo-0912/context-agent-prototype/blob/b299c6a08fdb055a0148a24dea65053861df6ff1/crates/agent-workspace/src/lib.rs"
+  },
+  {
+    "id": "S09",
+    "path": "crates/agent-runtime/src/status.rs",
+    "ref": "b299c6a08fdb055a0148a24dea65053861df6ff1",
+    "requested_ranges": [
+      [
+        1,
+        245
+      ]
+    ],
+    "coverage": "production_body_returned_tests_not_reviewed",
+    "source_references": [
+      "turn286file0"
+    ],
+    "url": "https://github.com/Ye-Luo-0912/context-agent-prototype/blob/b299c6a08fdb055a0148a24dea65053861df6ff1/crates/agent-runtime/src/status.rs"
+  },
+  {
+    "id": "S10",
+    "path": "crates/agent-tui/src/work.rs",
+    "ref": "b299c6a08fdb055a0148a24dea65053861df6ff1",
+    "requested_ranges": [],
+    "coverage": "full_body_returned",
+    "source_references": [
+      "turn287file0"
+    ],
+    "url": "https://github.com/Ye-Luo-0912/context-agent-prototype/blob/b299c6a08fdb055a0148a24dea65053861df6ff1/crates/agent-tui/src/work.rs"
+  },
+  {
+    "id": "S11",
+    "path": "crates/agent-runtime/src/platform/session.rs",
+    "ref": "b299c6a08fdb055a0148a24dea65053861df6ff1",
+    "requested_ranges": [
+      [
+        145,
+        310
+      ]
+    ],
+    "coverage": "ranges_only",
+    "source_references": [
+      "turn288file0"
+    ],
+    "url": "https://github.com/Ye-Luo-0912/context-agent-prototype/blob/b299c6a08fdb055a0148a24dea65053861df6ff1/crates/agent-runtime/src/platform/session.rs"
+  },
+  {
+    "id": "S12",
+    "path": "crates/agent-process/src/lifecycle.rs",
+    "ref": "b299c6a08fdb055a0148a24dea65053861df6ff1",
+    "requested_ranges": [],
+    "coverage": "full_body_returned",
+    "source_references": [
+      "turn289file0"
+    ],
+    "url": "https://github.com/Ye-Luo-0912/context-agent-prototype/blob/b299c6a08fdb055a0148a24dea65053861df6ff1/crates/agent-process/src/lifecycle.rs"
+  },
+  {
+    "id": "S13",
+    "path": "crates/context-simple/src/gc/reachability.rs",
+    "ref": "b299c6a08fdb055a0148a24dea65053861df6ff1",
+    "requested_ranges": [
+      [
+        1,
+        250
+      ]
+    ],
+    "coverage": "ranges_only",
+    "source_references": [
+      "turn290file0"
+    ],
+    "url": "https://github.com/Ye-Luo-0912/context-agent-prototype/blob/b299c6a08fdb055a0148a24dea65053861df6ff1/crates/context-simple/src/gc/reachability.rs"
+  },
+  {
+    "id": "S14",
+    "path": "crates/context-simple/src/engine.rs",
+    "ref": "b299c6a08fdb055a0148a24dea65053861df6ff1",
+    "requested_ranges": [
+      [
+        930,
+        1070
+      ],
+      [
+        1535,
+        1655
+      ]
+    ],
+    "coverage": "ranges_only",
+    "source_references": [
+      "turn291file0",
+      "turn300file0"
+    ],
+    "url": "https://github.com/Ye-Luo-0912/context-agent-prototype/blob/b299c6a08fdb055a0148a24dea65053861df6ff1/crates/context-simple/src/engine.rs"
+  },
+  {
+    "id": "S15",
+    "path": "crates/tool-runtime/src/proof_runner.rs",
+    "ref": "b299c6a08fdb055a0148a24dea65053861df6ff1",
+    "requested_ranges": [
+      [
+        1,
+        150
+      ]
+    ],
+    "coverage": "ranges_only",
+    "source_references": [
+      "turn293file0"
+    ],
+    "url": "https://github.com/Ye-Luo-0912/context-agent-prototype/blob/b299c6a08fdb055a0148a24dea65053861df6ff1/crates/tool-runtime/src/proof_runner.rs"
+  },
+  {
+    "id": "S16",
+    "path": "crates/tool-runtime/src/tools/process.rs",
+    "ref": "b299c6a08fdb055a0148a24dea65053861df6ff1",
+    "requested_ranges": [
+      [
+        1,
+        180
+      ],
+      [
+        595,
+        660
+      ],
+      [
+        665,
+        895
+      ],
+      [
+        985,
+        1170
+      ]
+    ],
+    "coverage": "ranges_only",
+    "source_references": [
+      "turn294file0",
+      "turn298file0",
+      "turn297file0",
+      "turn299file0"
+    ],
+    "url": "https://github.com/Ye-Luo-0912/context-agent-prototype/blob/b299c6a08fdb055a0148a24dea65053861df6ff1/crates/tool-runtime/src/tools/process.rs"
+  },
+  {
+    "id": "S17",
+    "path": "crates/agent-contracts/src/input.rs",
+    "ref": "b299c6a08fdb055a0148a24dea65053861df6ff1",
+    "requested_ranges": [
+      [
+        1,
+        175
+      ]
+    ],
+    "coverage": "ranges_only",
+    "source_references": [
+      "turn303file0"
+    ],
+    "url": "https://github.com/Ye-Luo-0912/context-agent-prototype/blob/b299c6a08fdb055a0148a24dea65053861df6ff1/crates/agent-contracts/src/input.rs"
+  },
+  {
+    "id": "S18",
+    "path": "crates/agent-runtime/src/command.rs",
+    "ref": "b299c6a08fdb055a0148a24dea65053861df6ff1",
+    "requested_ranges": [
+      [
+        1,
+        240
+      ]
+    ],
+    "coverage": "ranges_only",
+    "source_references": [
+      "turn304file0"
+    ],
+    "url": "https://github.com/Ye-Luo-0912/context-agent-prototype/blob/b299c6a08fdb055a0148a24dea65053861df6ff1/crates/agent-runtime/src/command.rs"
+  },
+  {
+    "id": "S19",
+    "path": "crates/agent-process/src/session.rs",
+    "ref": "b299c6a08fdb055a0148a24dea65053861df6ff1",
+    "requested_ranges": [
+      [
+        1,
+        85
+      ]
+    ],
+    "coverage": "ranges_only",
+    "source_references": [
+      "turn305file0"
+    ],
+    "url": "https://github.com/Ye-Luo-0912/context-agent-prototype/blob/b299c6a08fdb055a0148a24dea65053861df6ff1/crates/agent-process/src/session.rs"
+  }
+]

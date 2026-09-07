@@ -776,15 +776,17 @@ async fn verification_reaches_warm_errors() {
         gc_max_generation: 0,
         ..SimpleContextConfig::default()
     });
-    open_focus(&engine, "auth work").await;
-    // A failing tool result persists as a Working Error in task A.
+    let original_task = open_focus(&engine, "auth work").await;
+    // A failing tool result persists as a Working Error in task A. The
+    // trusted recipe that failed records the error with its identity
+    // (M17-B3/F08), so a later success of the SAME recipe can verify it.
     engine
         .ingest(ContextIngress::UserMessage {
             content: "debug the auth failure".into(),
         })
         .await
         .unwrap();
-    failed_observation(&engine, "1", "error in AuthService.rs:42").await;
+    verify_failure_observation(&engine, "1", "error in AuthService.rs:42", "auth.tests").await;
     engine
         .maintain(ContextMaintenanceTrigger::AfterModel)
         .await
@@ -846,6 +848,30 @@ async fn verification_reaches_warm_errors() {
         .maintain(ContextMaintenanceTrigger::AfterModel)
         .await
         .unwrap();
+    assert!(
+        !engine
+            .state
+            .lock()
+            .await
+            .eviction_buffer
+            .iter()
+            .find(|item| item.id == error_id)
+            .unwrap()
+            .semantic
+            .is_dead(),
+        "another task must not finalize this fault"
+    );
+    engine
+        .ingest(ContextIngress::FocusChanged {
+            focus: agent_contracts::FocusState::for_task(original_task, "auth work"),
+        })
+        .await
+        .unwrap();
+    verify_observation(&engine, "4", "fixed AuthService.rs").await;
+    engine
+        .maintain(ContextMaintenanceTrigger::AfterModel)
+        .await
+        .unwrap();
 
     let state = engine.state.lock().await;
     let error = state
@@ -868,7 +894,7 @@ async fn recurrence_supersedes_warm_errors() {
         gc_max_generation: 0,
         ..SimpleContextConfig::default()
     });
-    open_focus(&engine, "auth work").await;
+    let original_task = open_focus(&engine, "auth work").await;
     engine
         .ingest(ContextIngress::UserMessage {
             content: "debug the auth failure".into(),
@@ -916,6 +942,30 @@ async fn recurrence_supersedes_warm_errors() {
     // (including the line number) identical, as a real recurring failure
     // on the same site would.
     failed_observation(&engine, "3", "error in AuthService.rs:42").await;
+    engine
+        .maintain(ContextMaintenanceTrigger::AfterModel)
+        .await
+        .unwrap();
+    assert!(
+        !engine
+            .state
+            .lock()
+            .await
+            .eviction_buffer
+            .iter()
+            .find(|item| item.id == error_id)
+            .unwrap()
+            .semantic
+            .is_dead(),
+        "another task must not finalize this fault"
+    );
+    engine
+        .ingest(ContextIngress::FocusChanged {
+            focus: agent_contracts::FocusState::for_task(original_task, "auth work"),
+        })
+        .await
+        .unwrap();
+    failed_observation(&engine, "4", "error in AuthService.rs:42").await;
     engine
         .maintain(ContextMaintenanceTrigger::AfterModel)
         .await

@@ -6,10 +6,9 @@
 //! executable re-entered through [`WATCHDOG_ENV`] — that holds the read
 //! half of a `UnixStream::pair()`. The host holds the write half for the
 //! whole child run. If the host dies in any way, the write end closes and
-//! the watchdog reads EOF, then kills the watched process group — but
-//! only if the group leader still answers, so a normal shutdown (child
-//! already reaped, watchdog disarmed by dropping the write end) exits
-//! without touching a possibly reused pid.
+//! the watchdog reads EOF, then kills its own watched process group.
+//! Joining that group before exec pins the group identity for the whole
+//! run, including after the original leader has exited and been reaped.
 //!
 //! The watched child is a process-group leader (`process_group(0)`, same
 //! as the cancellation path), so `kill(-pgid)` covers its tree.
@@ -42,32 +41,29 @@ pub fn run_if_armed_and_exit() -> bool {
     }
 }
 
-/// Read `stream` to EOF (the host's death), then kill the group led by
-/// `leader` if that leader still answers. Split out from stdin so tests
-/// can drive the exact watchdog logic over a socket pair.
+/// Read `stream` to EOF (the host's death), then kill the group this
+/// watchdog joined at spawn. A marker alone cannot select another group.
 #[cfg(unix)]
 fn watch_stream_to_eof_then_kill<R: std::io::Read>(stream: &mut R, leader: i32) {
+    if leader <= 1 || unsafe { libc::getpgrp() } != leader {
+        return;
+    }
     let mut buf = [0u8; 512];
     loop {
         match stream.read(&mut buf) {
             Ok(0) => break,
             Ok(_) => continue,
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
             // A read error other than EOF is treated the same as EOF: the
             // host is unreachable either way and the watched child is
             // better off dead than unsupervised.
             Err(_) => break,
         }
     }
-    // A zombie still answers kill(pid, 0), so this check passes while the
-    // host is between child exit and reap — killing an all-zombie group
-    // is harmless (ESRCH on every member). By the time the host drops the
-    // write end on a normal shutdown the child is fully reaped, the
-    // check fails, and no signal is sent at all.
-    unsafe {
-        if libc::kill(leader, 0) == 0 {
-            let _ = libc::kill(-leader, libc::SIGKILL);
-        }
-    }
+    // Our own membership keeps this group allocated. No /proc scan or
+    // recycled numeric PID is consulted at cleanup time. SIGKILL includes
+    // the watchdog itself; the parent reaps it on an ordinary shutdown.
+    let _ = unsafe { libc::kill(0, libc::SIGKILL) };
 }
 
 /// The host-side handle. Held for the whole watched run; dropping it is
@@ -88,10 +84,44 @@ impl Drop for HostDeathWatchdog {
     fn drop(&mut self) {
         // Close the write end first (host "still alive" → "gone"), then
         // reap the watchdog so it cannot linger as a zombie for the rest
-        // of the product process's life.
+        // of the product process's life. The reap is bounded: a watchdog
+        // that fails to exit after EOF (wedged, or spawned from an
+        // executable that ignores the marker) must not hold teardown
+        // forever. The un-reaped Child handle reserves the pid, so a
+        // direct signal to it can never hit a reused pid.
         drop(self.write_half.take());
+        const WATCHDOG_REAP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
         if let Some(mut child) = self.child.take() {
-            let _ = child.wait();
+            let deadline = std::time::Instant::now() + WATCHDOG_REAP_TIMEOUT;
+            loop {
+                match child.try_wait() {
+                    Ok(Some(_)) => break,
+                    Ok(None) if std::time::Instant::now() < deadline => {
+                        std::thread::sleep(std::time::Duration::from_millis(25));
+                    }
+                    Ok(None) | Err(_) => {
+                        // Bounded wait exhausted: stop the watchdog
+                        // process and reap it. If even this reap cannot be
+                        // observed, the zombie dies with us — never block
+                        // shutdown on the watchdog.
+                        #[cfg(unix)]
+                        unsafe {
+                            libc::kill(child.id() as libc::pid_t, libc::SIGKILL);
+                        }
+                        let kill_deadline = std::time::Instant::now() + WATCHDOG_REAP_TIMEOUT;
+                        loop {
+                            match child.try_wait() {
+                                Ok(Some(_)) | Err(_) => break,
+                                Ok(None) if std::time::Instant::now() < kill_deadline => {
+                                    std::thread::sleep(std::time::Duration::from_millis(25));
+                                }
+                                Ok(None) => break,
+                            }
+                        }
+                        break;
+                    }
+                }
+            }
         }
     }
 }
@@ -103,13 +133,11 @@ impl HostDeathWatchdog {
     /// watchdog executable is this process's own executable re-entered
     /// through [`WATCHDOG_ENV`] — only product binaries whose `main`
     /// dispatches on the marker may arm this. `Ok(None)` means no
-    /// executable identity was available, or `leader` was zero; the
+    /// executable identity was available, or `leader` was invalid; the
     /// caller degrades to no containment, same as a refused Windows job
     /// assignment.
     pub fn arm(leader: u32) -> std::io::Result<Option<Self>> {
-        if leader == 0 {
-            // pid 0 would make `kill(0, …)` / `kill(-0, …)` target the
-            // caller's process group — refuse rather than arm.
+        if leader <= 1 || leader > i32::MAX as u32 {
             return Ok(None);
         }
         match std::env::current_exe() {
@@ -123,10 +151,20 @@ impl HostDeathWatchdog {
     pub fn arm_with(exe: &std::path::Path, leader: u32) -> std::io::Result<Self> {
         use std::os::unix::process::CommandExt;
         use std::process::{Command, Stdio};
-        if leader == 0 {
+        if leader <= 1 || leader > i32::MAX as u32 {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidInput,
-                "host-death watchdog refuses leader pid 0",
+                "host-death watchdog requires a positive managed group leader",
+            ));
+        }
+        // This API is called while the host still owns the unreaped child.
+        // Refuse its own group, and join only an existing child-led group.
+        if unsafe { libc::getpgrp() } == leader as i32
+            || unsafe { libc::getpgid(leader as i32) } != leader as i32
+        {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "host-death watchdog requires a separate child process group",
             ));
         }
         let (read_half, write_half) = std::os::unix::net::UnixStream::pair()?;
@@ -141,9 +179,10 @@ impl HostDeathWatchdog {
             .stdin(Stdio::from(std::os::fd::OwnedFd::from(read_half)))
             .stdout(Stdio::null())
             .stderr(Stdio::null())
-            // The watchdog must survive group-wide signals aimed at the
-            // dying host (Ctrl-C on a TUI foreground group included).
-            .process_group(0)
+            // Join before exec, while the child identity is still owned.
+            // The watched group is separate from the host's foreground
+            // group, so host-only signals do not stop this watchdog.
+            .process_group(leader as i32)
             .spawn()?;
         Ok(Self {
             write_half: Some(write_half),
@@ -176,10 +215,6 @@ mod tests {
         (child, leader)
     }
 
-    fn leader_alive(leader: i32) -> bool {
-        unsafe { libc::kill(leader, 0) == 0 }
-    }
-
     fn wait_for(mut condition: impl FnMut() -> bool, what: &str) {
         let deadline = Instant::now() + Duration::from_secs(10);
         while !condition() {
@@ -188,40 +223,41 @@ mod tests {
         }
     }
 
+    /// M17-B1: a watchdog process that never exits on EOF must not hold
+    /// teardown — Drop bounds the reap and kills the wedged stand-in.
     #[test]
-    fn the_watchdog_kills_the_group_when_the_host_disappears() {
-        let (mut child, leader) = spawn_group_leader();
-        let (mut read_half, write_half) = UnixStream::pair().unwrap();
-        let watchdog = std::thread::spawn(move || {
-            watch_stream_to_eof_then_kill(&mut read_half, leader);
-        });
-        // Host "dies": the write end closes, the watchdog sees EOF.
-        drop(write_half);
-        // Observe the kill through try_wait, not kill(leader, 0): a
-        // SIGKILLed child stays a zombie answering kill(pid, 0) until THIS
-        // test reaps it, so the liveness probe can never flip on its own.
-        wait_for(
-            || child.try_wait().ok().flatten().is_some(),
-            "the watched group to die",
+    fn dropping_the_handle_bounds_the_reap_of_a_wedged_watchdog() {
+        // `sleep` never reads stdin, so it stays alive after the write
+        // half is dropped; the old Drop blocked in child.wait() for its
+        // whole runtime.
+        let (read_half, write_half) = UnixStream::pair().unwrap();
+        let mut command = Command::new("/bin/sleep");
+        command
+            .arg("30")
+            .stdin(Stdio::from(std::os::fd::OwnedFd::from(read_half)))
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .process_group(0);
+        let child = command.spawn().expect("spawn the wedged watchdog stand-in");
+        let pid = child.id();
+        let armed = HostDeathWatchdog {
+            write_half: Some(write_half),
+            child: Some(child),
+        };
+        let start = Instant::now();
+        drop(armed);
+        // The bounded reap spends its own 5s deadline before killing; the
+        // assertion is that Drop is bounded at all, not that it is
+        // instantaneous — the failure shape it prevents is waiting out the
+        // stand-in's full 30s runtime.
+        assert!(
+            start.elapsed() < Duration::from_secs(10),
+            "Drop must not wait out the watchdog's full runtime"
         );
-        watchdog.join().unwrap();
-    }
-
-    #[test]
-    fn a_reaped_leader_is_left_alone() {
-        let (mut child, leader) = spawn_group_leader();
-        // Fully reap the child first: the normal-shutdown disarm path.
-        child.wait().unwrap();
-        assert!(!leader_alive(leader), "a reaped zombie must not answer");
-        let (mut read_half, write_half) = UnixStream::pair().unwrap();
-        let watchdog = std::thread::spawn(move || {
-            watch_stream_to_eof_then_kill(&mut read_half, leader);
-        });
-        drop(write_half);
-        watchdog.join().unwrap();
-        // No assertion beyond "returns without signalling": the killed pid
-        // would only be observable through a reused pid, which the
-        // leader-alive check exists to prevent.
+        wait_for(
+            || unsafe { libc::kill(pid as i32, 0) != 0 },
+            "the wedged watchdog to be killed and reaped",
+        );
     }
 
     #[test]
@@ -267,8 +303,10 @@ mod tests {
         // product watchdog, without re-entering this test binary's main.
         // Leader pid is never signalled: cat exits on EOF before any kill
         // path runs.
-        let armed = HostDeathWatchdog::arm_with(std::path::Path::new("/bin/cat"), 1)
-            .expect("arm a cat stand-in as the watchdog");
+        let (mut leader, leader_pid) = spawn_group_leader();
+        let armed =
+            HostDeathWatchdog::arm_with(std::path::Path::new("/bin/cat"), leader_pid as u32)
+                .expect("arm a cat stand-in as the watchdog");
         let pid = armed.child_id().expect("armed handle keeps the Child");
         assert!(
             unsafe { libc::kill(pid as i32, 0) == 0 },
@@ -281,6 +319,25 @@ mod tests {
         wait_for(
             || unsafe { libc::kill(pid as i32, 0) != 0 },
             "the watchdog child to be fully reaped (not left as a zombie)",
+        );
+        crate::kill_process_tree(leader_pid as u32);
+        leader.wait().unwrap();
+    }
+
+    #[test]
+    fn arm_refuses_invalid_or_host_group_ids() {
+        for invalid in [1, u32::MAX] {
+            assert!(HostDeathWatchdog::arm(invalid).unwrap().is_none());
+            assert!(
+                HostDeathWatchdog::arm_with(std::path::Path::new("/bin/cat"), invalid).is_err()
+            );
+        }
+        assert!(
+            HostDeathWatchdog::arm_with(
+                std::path::Path::new("/bin/cat"),
+                unsafe { libc::getpgrp() } as u32,
+            )
+            .is_err()
         );
     }
 }

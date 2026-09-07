@@ -102,33 +102,43 @@ pub(crate) fn queue_decision_supersessions(
     }
 }
 
-/// Queue verification for every live, unverified error item that shares an
-/// entity with a successful observation. `by_id` is the successful
-/// observation that verified the error. Also covers the warm buffer and the
-/// external map: an error that left Resident is still the same error and
-/// still gets verified by a later success.
+/// Queue verification for live, unverified error items recorded by the
+/// same task and immutable host probe that now succeeded. The probe binds
+/// the complete recipe definition, revision and declared coverage. M17-B3/F08: entity
+/// overlap alone is correlation, not proof — a successful run of one
+/// recipe (or of any plain tool) must never finalize errors it did not
+/// probe, so errors without a matching recipe association stay live.
+/// Also covers the warm buffer and the external map: an error that left
+/// Resident is still the same error and still gets verified by a later
+/// success of its own recipe.
 pub(crate) fn queue_error_verifications(
     state: &mut State,
-    content: &str,
     reason: &str,
     by_id: ContextItemId,
+    task_id: Option<agent_contracts::TaskId>,
+    probe: Option<&agent_contracts::VerificationProbe>,
 ) {
-    let entities = extract_entities(content);
-    if entities.is_empty() {
+    let (Some(task_id), Some(probe)) = (task_id, probe) else {
+        // A success without a recipe identity cannot prove anything about
+        // any recorded fault.
         return;
-    }
+    };
     let matches = |item: &ContextItem| -> bool {
-        item.kind == ContextKind::Error && !item.semantic.is_dead() && !is_excluded(item)
+        item.kind == ContextKind::Error
+            && !item.semantic.is_dead()
+            && !is_excluded(item)
+            && item.task_id == Some(task_id)
+            && item.verify_recipe.as_ref() == Some(probe)
     };
     for item in &mut state.items {
-        if matches(item) && entities_match(&entities, &item.entities) {
+        if matches(item) {
             state
                 .pending_verifications
                 .push((item.id, by_id, reason.to_string()));
         }
     }
     for item in &mut state.eviction_buffer {
-        if matches(item) && entities_match(&entities, &item.entities) {
+        if matches(item) {
             state
                 .pending_verifications
                 .push((item.id, by_id, reason.to_string()));
@@ -138,7 +148,8 @@ pub(crate) fn queue_error_verifications(
         if entry.kind == ContextKind::Error
             && entry.item_id != by_id
             && entry.semantic.is_live()
-            && entities_match(&entities, &entry.entities)
+            && entry.task_id == Some(task_id)
+            && entry.verify_recipe.as_ref() == Some(probe)
         {
             state
                 .pending_verifications
@@ -254,72 +265,36 @@ fn file_line_range(item: &ContextItem) -> Option<(u32, u32)> {
     (start >= 1 && end >= start).then_some((start, end))
 }
 
-/// Queue recurrence-supersession for every live error item that shares an
-/// entity with a new failure: one live error per failure site, the latest
-/// one. `by_id` is the new failure that supersedes the earlier one.
-///
-/// The scan covers every body location with a retained entity signature:
-/// the resident heap, the warm reversible buffer, and the external map.
-/// A recurring failure supersedes an earlier error wherever that error's
-/// body currently sits.
-pub(crate) fn queue_error_recurrence(
-    state: &mut State,
-    content: &str,
-    round: u64,
-    by_id: ContextItemId,
-) {
-    let entities = extract_entities(content);
-    if entities.is_empty() {
-        return;
-    }
-    let reason = |round: u64| {
-        format!("recurring failure supersedes earlier error (round {round}, same entities)")
+/// Coalesce identical failures within one task and producer/check identity.
+/// Resident and warm bodies can prove exact equality. Lossy external
+/// descriptors cannot; their faults remain live until verified or closed.
+pub(crate) fn queue_error_recurrence(state: &mut State, new_item: &ContextItem, round: u64) {
+    // Same-file entity overlap is not a fault identity. Deduplicate only
+    // an identical observation from the same task, producer and check.
+    let matches = |item: &ContextItem| {
+        item.id != new_item.id
+            && item.kind == ContextKind::Error
+            && !item.semantic.is_dead()
+            && !is_excluded(item)
+            && item.task_id == new_item.task_id
+            && item.source == new_item.source
+            && item.verify_recipe == new_item.verify_recipe
+            && item.content == new_item.content
     };
-    for item in &mut state.items {
-        if item.kind != ContextKind::Error || item.semantic.is_dead() {
-            continue;
-        }
-        if item.id == by_id {
-            continue;
-        }
-        if is_excluded(item) {
-            continue;
-        }
-        if entities_match(&entities, &item.entities) {
-            state
-                .pending_supersessions
-                .push((item.id, by_id, reason(round)));
-        }
+    for item in state
+        .items
+        .iter()
+        .chain(state.eviction_buffer.iter())
+        .filter(|item| matches(item))
+    {
+        state.pending_supersessions.push((
+            item.id,
+            new_item.id,
+            format!("recurring failure supersedes earlier error (round {round}, identical fault)"),
+        ));
     }
-    for item in &mut state.eviction_buffer {
-        if item.kind != ContextKind::Error || item.semantic.is_dead() {
-            continue;
-        }
-        if item.id == by_id {
-            continue;
-        }
-        if is_excluded(item) {
-            continue;
-        }
-        if entities_match(&entities, &item.entities) {
-            state
-                .pending_supersessions
-                .push((item.id, by_id, reason(round)));
-        }
-    }
-    for entry in &state.external {
-        if entry.kind != ContextKind::Error || entry.semantic.is_dead() {
-            continue;
-        }
-        if entry.item_id == by_id {
-            continue;
-        }
-        if entities_match(&entities, &entry.entities) {
-            state
-                .pending_supersessions
-                .push((entry.item_id, by_id, reason(round)));
-        }
-    }
+    // External summaries are lossy. They cannot prove identical fault
+    // content; keep them until a matching trusted probe or explicit closure.
 }
 
 /// Apply queued supersession intents as observable state changes: the older
@@ -356,6 +331,11 @@ pub(crate) fn drain_verifications(state: &mut State, turn: u64) -> Vec<ContextSt
     let mut transitions = Vec::new();
     let verifications = std::mem::take(&mut state.pending_verifications);
     for (item_id, by_id, reason) in verifications {
+        // Queues are checkpointed too. Old or corrupted pending intents must
+        // not bypass the new probe checks when resumed after an upgrade.
+        if !has_matching_verification_evidence(state, item_id, by_id) {
+            continue;
+        }
         if let Some(transition) = apply_terminal_semantic(
             state,
             item_id,
@@ -367,6 +347,40 @@ pub(crate) fn drain_verifications(state: &mut State, turn: u64) -> Vec<ContextSt
         }
     }
     transitions
+}
+
+fn has_matching_verification_evidence(
+    state: &State,
+    target: ContextItemId,
+    by: ContextItemId,
+) -> bool {
+    fn identity(
+        state: &State,
+        id: ContextItemId,
+    ) -> Option<(
+        agent_contracts::TaskId,
+        &agent_contracts::VerificationProbe,
+        ContextKind,
+    )> {
+        if let Some(item) = state
+            .items
+            .indexes()
+            .get(id)
+            .and_then(|slot| state.items.get(slot))
+            .or_else(|| state.eviction_buffer.iter().find(|item| item.id == id))
+        {
+            return Some((item.task_id?, item.verify_recipe.as_ref()?, item.kind));
+        }
+        let entry = state.external.get(id)?;
+        Some((entry.task_id?, entry.verify_recipe.as_ref()?, entry.kind))
+    }
+    match (identity(state, target), identity(state, by)) {
+        (
+            Some((task, probe, ContextKind::Error)),
+            Some((by_task, by_probe, ContextKind::ToolObservation)),
+        ) => task == by_task && probe == by_probe,
+        _ => false,
+    }
 }
 
 /// Apply one terminal semantic transition to an item in whatever body

@@ -12,6 +12,13 @@
 //! 只吃已经读完的一帧正文，不拥有 pipe/socket。
 
 mod session;
+mod work;
+
+pub use work::{
+    BoundWorkSessionAuthorizer, MAX_WORK_CONTROL_SESSIONS, WorkControlAction,
+    WorkControlAuthorization, WorkControlAuthorizationRequest, WorkControlAuthorizer,
+    WorkControlGrant, WorkControlRouter, WorkControlSessionRegistry,
+};
 
 use std::{sync::Arc, time::Instant};
 

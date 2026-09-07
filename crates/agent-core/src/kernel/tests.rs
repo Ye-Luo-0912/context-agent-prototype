@@ -141,6 +141,56 @@ impl ToolDispatcher for EchoDispatcher {
 
 struct AllowAllApproval;
 
+#[tokio::test]
+async fn actual_approval_refusal_stamps_a_typed_no_dispatch_result() {
+    struct Deny;
+    #[async_trait::async_trait]
+    impl ApprovalGate for Deny {
+        async fn authorize(
+            &self,
+            _: &ToolCall,
+            _: &ToolSpec,
+            _: &CancellationToken,
+        ) -> AgentResult<ApprovalDecision> {
+            Ok(ApprovalDecision::Deny)
+        }
+    }
+    let kernel = CoreAuthority::new(
+        CoreAuthorityConfig::default(),
+        Arc::new(RecordingEngine::default()),
+        Arc::new(BigOutputDispatcher {
+            output: tool_error_output(&call("big.tool"), "must not dispatch".into()),
+        }),
+        Arc::new(Deny),
+        None,
+        None,
+    );
+    let surface = ToolSurfaceSnapshot {
+        specs: kernel.tools.specs(),
+        ..ToolSurfaceSnapshot::default()
+    };
+    let tool_call = call("big.tool");
+    let epoch = kernel.current_authority_epoch();
+    let execution = kernel
+        .execute_tool(
+            operation_identity(&kernel, &tool_call, epoch),
+            tool_call,
+            CancellationToken::new(),
+            &surface,
+            epoch,
+        )
+        .await;
+    assert!(execution.lease.is_none());
+    let ToolOutcome::Value(output) = execution.outcome else {
+        panic!("value refusal");
+    };
+    assert_eq!(
+        output.failure_class(),
+        Some(agent_contracts::ToolFailureClass::ApprovalDenied)
+    );
+    assert_eq!(output.metadata["executed"], false);
+}
+
 #[async_trait::async_trait]
 impl ApprovalGate for AllowAllApproval {
     async fn authorize(
@@ -252,6 +302,7 @@ fn test_item(content: String) -> ContextItem {
         keep_alive: false,
         lease_until_turn: None,
         source: None,
+        verify_recipe: None,
         residency: ContextResidency::Resident,
         gc_generation: 0,
         evicted_at_tick: None,
@@ -312,6 +363,7 @@ fn external_entry(source: Option<&str>) -> ExternalizedContext {
         last_access_gc_epoch: Some(0),
         blob_checksum: None,
         source: source.map(|s| s.to_string()),
+        verify_recipe: None,
         importance: 0.0,
         relevance: 0.0,
         created_tick: 0,

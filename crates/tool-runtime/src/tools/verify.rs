@@ -24,12 +24,16 @@ pub(crate) struct VerificationRunTool {
 }
 
 impl VerificationRunTool {
-    pub(crate) fn new(workspace: Workspace, recipes: Arc<VerificationRecipes>) -> Option<Self> {
+    pub(crate) fn new(
+        workspace: Workspace,
+        recipes: Arc<VerificationRecipes>,
+        host_death_watchdog: bool,
+    ) -> Option<Self> {
         let authority_policy = recipes.host_policy()?;
         Some(Self {
             recipes,
             authority_policy,
-            process: ProcessRunTool::new(workspace),
+            process: ProcessRunTool::new(workspace).with_host_death_watchdog(host_death_watchdog),
         })
     }
 }
@@ -154,7 +158,7 @@ impl Tool for VerificationRunTool {
                 // the typed channel and the legacy keys cannot disagree.
                 output.set_native_execution_facts(
                     ToolExecutionFacts::empty()
-                        .with_verification(true)
+                        .with_verification_probe(self.recipes.fault_probe(recipe))
                         .with_mutation_bound(!recipe.source_read_only),
                 );
                 ToolOutcome::Value(output)
@@ -188,7 +192,9 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let workspace = Workspace::open(dir.path()).await.unwrap();
         let recipes = Arc::new(VerificationRecipes::new(vec![echo_recipe()]).unwrap());
-        let spec = VerificationRunTool::new(workspace, recipes).unwrap().spec();
+        let spec = VerificationRunTool::new(workspace, recipes, false)
+            .unwrap()
+            .spec();
         assert!(spec.description.contains("not tool names"));
         assert!(
             spec.description
@@ -228,7 +234,7 @@ mod tests {
         .with_coverage_domain("saturation-boundary")
         .unwrap();
         let recipes = VerificationRecipes::new(vec![broad, boundary]).unwrap();
-        let spec = VerificationRunTool::new(workspace, Arc::new(recipes))
+        let spec = VerificationRunTool::new(workspace, Arc::new(recipes), false)
             .unwrap()
             .spec();
         assert!(
@@ -257,7 +263,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let workspace = Workspace::open(dir.path()).await.unwrap();
         let recipes = Arc::new(VerificationRecipes::new(vec![echo_recipe()]).unwrap());
-        let tool = VerificationRunTool::new(workspace, recipes).unwrap();
+        let tool = VerificationRunTool::new(workspace, recipes, false).unwrap();
         let run_id = RunId::new();
         let arguments = json!({"recipe_id": "echo.trusted"});
         let context = crate::tools::test_process_effect_context(
@@ -280,7 +286,21 @@ mod tests {
             panic!("verify.run is a non-transactional process tool")
         };
         assert!(output.ok, "{}", output.model_content);
-        crate::tools::assert_native_facts_match_derivation(&output);
+        let native = output.native_execution_facts().unwrap();
+        let derived = crate::BuiltinToolDispatcher::translate_stamped_execution_facts(&output);
+        assert_eq!(native.is_verification(), derived.is_verification());
+        assert_eq!(
+            native.may_mutate_workspace(),
+            derived.may_mutate_workspace()
+        );
+        assert_eq!(
+            native.verification_probe().unwrap().recipe_id,
+            "echo.trusted"
+        );
+        assert!(
+            derived.verification_probe().is_none(),
+            "legacy text metadata must not mint a fault probe"
+        );
     }
 
     #[tokio::test]
@@ -288,7 +308,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let workspace = Workspace::open(dir.path()).await.unwrap();
         let recipes = Arc::new(VerificationRecipes::new(vec![echo_recipe()]).unwrap());
-        let tool = VerificationRunTool::new(workspace, recipes).unwrap();
+        let tool = VerificationRunTool::new(workspace, recipes, false).unwrap();
         let run_id = RunId::new();
         let arguments = json!({
             "recipe_id": "echo.trusted",
@@ -325,7 +345,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let workspace = Workspace::open(dir.path()).await.unwrap();
         let recipes = Arc::new(VerificationRecipes::new(vec![echo_recipe()]).unwrap());
-        let tool = VerificationRunTool::new(workspace, recipes).unwrap();
+        let tool = VerificationRunTool::new(workspace, recipes, false).unwrap();
         let run_id = RunId::new();
         let arguments = json!({"recipe_id": "missing"});
         let context = crate::tools::test_process_effect_context(

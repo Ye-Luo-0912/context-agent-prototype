@@ -24,6 +24,39 @@ use crate::context::{MutationFootprint, ResourceTouch};
 use crate::tool::RuntimeDiagnosis;
 use serde::{Deserialize, Serialize};
 
+/// Stable identity of the check that observed a fault. It covers the host
+/// recipe definition and declared coverage, not the changing source inputs:
+/// a fix must be allowed to change those inputs. It is not a PASS receipt or
+/// authority to complete a task.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct VerificationProbe {
+    pub recipe_id: String,
+    pub recipe_revision: String,
+    pub definition_digest: String,
+}
+
+/// Old checkpoints stored only a recipe id. Preserve their loadability but
+/// do not upgrade that incomplete association into proof of a fixed fault.
+pub(crate) fn deserialize_verification_probe<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Option<VerificationProbe>, D::Error> {
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum Wire {
+        Current(VerificationProbe),
+        Legacy(String),
+    }
+    Ok(
+        Option::<Wire>::deserialize(deserializer)?.and_then(|wire| match wire {
+            Wire::Current(probe) => Some(probe),
+            Wire::Legacy(id) => {
+                let _ = id;
+                None
+            }
+        }),
+    )
+}
+
 /// Trusted execution facts for one tool result. Every field is what a
 /// trusted producer asserts about its own execution — never parsed back
 /// from model-facing payload.
@@ -44,6 +77,8 @@ pub struct ToolExecutionFacts {
     resources: Vec<ResourceTouch>,
     may_mutate_workspace: Option<bool>,
     verification: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    verification_probe: Option<VerificationProbe>,
     failure: Option<RuntimeDiagnosis>,
 }
 
@@ -130,6 +165,16 @@ impl ToolExecutionFacts {
     pub fn with_verification(mut self, is_verification: bool) -> Self {
         self.verification = Some(is_verification);
         self
+    }
+
+    pub fn with_verification_probe(mut self, probe: VerificationProbe) -> Self {
+        self.verification_probe = Some(probe);
+        self.verification = Some(true);
+        self
+    }
+
+    pub fn verification_probe(&self) -> Option<&VerificationProbe> {
+        self.verification_probe.as_ref()
     }
 
     /// Attach the runtime-owned failure diagnosis. A producer cannot

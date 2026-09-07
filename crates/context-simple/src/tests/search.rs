@@ -925,6 +925,7 @@ async fn external_terminal_transitions_refresh_catalog_live_and_attention_indexe
         context_store_dir: Some(dir.path().to_path_buf()),
         ..SimpleContextConfig::default()
     });
+    super::harness::open_focus(&engine, "catalog verification").await;
     let (decision_id, error_id) = {
         let mut state = engine.state.lock().await;
         let mut ids = Vec::new();
@@ -943,6 +944,12 @@ async fn external_terminal_transitions_refresh_catalog_live_and_attention_indexe
                 None,
             );
             item.entities = crate::index::entity::extract_entities(&item.content);
+            if kind == ContextKind::Error {
+                item.verify_recipe =
+                    super::harness::verification_facts("catalog.tests", "v1", "catalog-v1")
+                        .verification_probe()
+                        .cloned();
+            }
             let reference = crate::store::externalize(dir.path(), &item).unwrap();
             state.external.push(crate::store::to_external_entry(
                 &item, reference, 1, 1, None,
@@ -963,12 +970,27 @@ async fn external_terminal_transitions_refresh_catalog_live_and_attention_indexe
             ContextItemId::new(),
             "newer decision".into(),
         ));
-        state.pending_verifications.push((
-            error_id,
-            ContextItemId::new(),
-            "successful verifier".into(),
-        ));
     }
+    engine
+        .ingest(ContextIngress::ToolObservation {
+            output: agent_contracts::ToolOutput {
+                call_id: "catalog-pass".into(),
+                tool_name: "verify.run".into(),
+                ok: true,
+                summary: "pass".into(),
+                model_content: "pass".into(),
+                artifact_ref: None,
+                metadata: serde_json::json!({}),
+            },
+            facts: Some(Box::new(super::harness::verification_facts(
+                "catalog.tests",
+                "v1",
+                "catalog-v1",
+            ))),
+            scope_id: None,
+        })
+        .await
+        .unwrap();
     engine
         .maintain(ContextMaintenanceTrigger::AfterModel)
         .await

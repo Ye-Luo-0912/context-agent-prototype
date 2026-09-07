@@ -59,6 +59,16 @@ impl RecipeProofRunner {
         })
     }
 
+    /// M17-B1: give the host proof lane the same Unix host-death
+    /// containment the caller armed on the tool dispatcher. A composition
+    /// root that arms containment must inject it here too — an unwired
+    /// proof runner silently downgrades host verification to no
+    /// containment (F03).
+    pub fn with_host_death_watchdog(mut self, enabled: bool) -> Self {
+        self.process = self.process.with_host_death_watchdog(enabled);
+        self
+    }
+
     /// The exact identity for one recipe without executing it — the digest
     /// the dispatcher attribution stamps in this world. `None` for unknown
     /// recipes, non-exact reuse, or a world where exact equivalence cannot

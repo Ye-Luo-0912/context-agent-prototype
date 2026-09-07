@@ -103,6 +103,8 @@ pub(crate) fn is_ignored_dir(name: &str) -> bool {
 
 /// 每处理这么多目录项就协作让出一次，让 `search.grep` 的取消能打断 walk。
 const WALK_YIELD_EVERY: u32 = 32;
+const MAX_WALK_ENTRIES: usize = 50_000;
+const MAX_WALK_PATH_BYTES: usize = 8 * 1024 * 1024;
 
 /// Depth-first walk collecting regular files under `root`, honoring
 /// `IGNORED_DIRS` and stopping once `budget` files have been collected.
@@ -114,15 +116,36 @@ pub(crate) async fn walk_files(
     out: &mut Vec<std::path::PathBuf>,
     budget: &mut usize,
     cancel: Option<&CancellationToken>,
-) -> AgentResult<()> {
+) -> AgentResult<bool> {
+    walk_files_bounded(
+        root,
+        out,
+        budget,
+        cancel,
+        MAX_WALK_ENTRIES,
+        MAX_WALK_PATH_BYTES,
+    )
+    .await
+}
+
+// Returns true if traversal stopped at a resource cap. Empty directories,
+// ignored entries and long path names all consume bounded scan resources.
+async fn walk_files_bounded(
+    root: &Path,
+    out: &mut Vec<std::path::PathBuf>,
+    budget: &mut usize,
+    cancel: Option<&CancellationToken>,
+    mut entries_left: usize,
+    mut path_bytes_left: usize,
+) -> AgentResult<bool> {
     let mut stack: Vec<std::path::PathBuf> = vec![root.to_path_buf()];
     let mut entries_since_yield = 0u32;
     while let Some(dir) = stack.pop() {
         if *budget == 0 {
-            return Ok(());
+            return Ok(true);
         }
         if cancel.is_some_and(CancellationToken::is_cancelled) {
-            return Ok(());
+            return Ok(false);
         }
         let mut reader = tokio_fs::read_dir(&dir)
             .await
@@ -133,11 +156,15 @@ pub(crate) async fn walk_files(
             .map_err(|e| AgentError::Io(format!("read dir entry: {e}")))?
         {
             if *budget == 0 {
-                return Ok(());
+                return Ok(true);
             }
+            if entries_left == 0 {
+                return Ok(true);
+            }
+            entries_left -= 1;
             if let Some(token) = cancel {
                 if token.is_cancelled() {
-                    return Ok(());
+                    return Ok(false);
                 }
                 entries_since_yield += 1;
                 if entries_since_yield >= WALK_YIELD_EVERY {
@@ -146,6 +173,12 @@ pub(crate) async fn walk_files(
                 }
             }
             let name = entry.file_name().to_string_lossy().into_owned();
+            let path = entry.path();
+            let path_bytes = path.as_os_str().as_encoded_bytes().len();
+            if path_bytes > path_bytes_left {
+                return Ok(true);
+            }
+            path_bytes_left -= path_bytes;
             let file_type = entry
                 .file_type()
                 .await
@@ -154,14 +187,14 @@ pub(crate) async fn walk_files(
                 if is_ignored_dir(&name) {
                     continue;
                 }
-                stack.push(entry.path());
+                stack.push(path);
             } else if file_type.is_file() {
                 *budget = budget.saturating_sub(1);
-                out.push(entry.path());
+                out.push(path);
             }
         }
     }
-    Ok(())
+    Ok(false)
 }
 
 /// Render a path relative to the workspace with forward slashes, so tool
@@ -1460,6 +1493,39 @@ mod persist_tests {
 #[cfg(test)]
 mod echo_tests {
     use super::*;
+
+    #[tokio::test]
+    async fn empty_directory_fanout_cannot_bypass_the_walk_budget() {
+        let dir = tempfile::tempdir().unwrap();
+        for index in 0..16 {
+            std::fs::create_dir(dir.path().join(format!("empty-{index}"))).unwrap();
+        }
+        let mut files = Vec::new();
+        let mut budget = 100;
+        assert!(
+            walk_files_bounded(
+                dir.path(),
+                &mut files,
+                &mut budget,
+                None,
+                8,
+                MAX_WALK_PATH_BYTES
+            )
+            .await
+            .unwrap()
+        );
+        assert!(files.is_empty());
+        assert_eq!(
+            budget, 100,
+            "directory entries must be bounded even without regular files"
+        );
+        assert!(
+            walk_files_bounded(dir.path(), &mut files, &mut budget, None, 100, 1)
+                .await
+                .unwrap(),
+            "path allocations also have an independent bound"
+        );
+    }
 
     #[test]
     fn model_protocol_strings_escape_header_breaks() {

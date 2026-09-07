@@ -359,7 +359,20 @@ fn persist_authority_metadata(path: &Path, metadata: &AuthorityJournalMetadata) 
         )));
     }
     if let Some(parent) = path.parent() {
-        sync_directory(parent)?;
+        // M17-B2: the rename has already published the new metadata — the
+        // point of no return. A directory-sync failure here leaves the
+        // publish's durability uncertain, so the error must be typed as
+        // RecoveryRequired ("a mutation may have partially landed; stop
+        // ordinary mutation and reconcile"), not as a plain storage error
+        // that callers could treat as "nothing happened". compact_locked
+        // fences the writer on exactly this variant.
+        sync_directory(parent).map_err(|error| {
+            AgentError::RecoveryRequired(format!(
+                "authority journal metadata {} was published, but the directory sync failed: {error}; \
+                 whether the new generation is durable is uncertain",
+                path.display()
+            ))
+        })?;
     }
     Ok(())
 }
@@ -453,6 +466,7 @@ fn read_authority_metadata(path: &Path) -> AgentResult<AuthorityJournalMetadata>
 
 #[cfg(unix)]
 fn sync_directory(path: &Path) -> AgentResult<()> {
+    injected_sync_directory_failure()?;
     File::open(path)
         .and_then(|directory| directory.sync_all())
         .map_err(|error| {
@@ -470,7 +484,31 @@ fn sync_directory(_path: &Path) -> AgentResult<()> {
     // before Core can publish authority state; the remaining parent-directory
     // power-loss window is documented as a platform limitation rather than
     // turning every first startup into ERROR_ACCESS_DENIED.
+    injected_sync_directory_failure()?;
     Ok(())
+}
+
+/// M17-B2 test injection: the single fault point whose failure lands AFTER
+/// the metadata publish, driving the writer-fence path deterministically.
+/// Thread-local so parallel tests never observe each other's fault window.
+#[cfg(test)]
+fn injected_sync_directory_failure() -> AgentResult<()> {
+    if SYNC_DIRECTORY_FAULT.with(std::cell::Cell::get) {
+        return Err(AgentError::Storage(
+            "injected directory sync failure".into(),
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(not(test))]
+fn injected_sync_directory_failure() -> AgentResult<()> {
+    Ok(())
+}
+
+#[cfg(test)]
+thread_local! {
+    static SYNC_DIRECTORY_FAULT: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
 #[cfg(not(any(unix, windows)))]
@@ -697,7 +735,21 @@ fn compact_locked(
         .map(|(index, snapshot)| (snapshot.identity.operation_id, index))
         .collect();
 
-    persist_authority_metadata(&base_path.with_extension("meta.json"), &new_metadata)?;
+    if let Err(error) =
+        persist_authority_metadata(&base_path.with_extension("meta.json"), &new_metadata)
+    {
+        // M17-B2: a failure AFTER the metadata rename may already have
+        // published the new generation on disk. This writer must never
+        // stay healthy on the old generation — fence it exactly like a
+        // failed append, so neither the append-triggered nor the explicit
+        // compact path can keep committing into a generation the published
+        // metadata no longer describes. The next open follows the
+        // published metadata.
+        if matches!(error, AgentError::RecoveryRequired(_)) {
+            writer.failed = Some(error.to_string());
+        }
+        return Err(error);
+    }
 
     let old_wal = authority_wal_path(base_path, writer.metadata.generation);
     writer.file = new_file;
@@ -1995,6 +2047,84 @@ mod tests {
             )))
             .unwrap();
         assert_eq!(reopened.recover().unwrap().last_seq, 2);
+    }
+
+    /// M17-B2: the metadata rename landed but the directory sync failed —
+    /// the publish is durably uncertain, so the compaction surfaces
+    /// RecoveryRequired and FENCES the writer (no further appends through
+    /// the old generation). A fresh open follows the published generation
+    /// and keeps appending there; the last readable generation is never
+    /// silently abandoned by in-memory state.
+    #[test]
+    fn compaction_publish_uncertain_failure_fences_the_writer() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("operations.jsonl");
+        let (journal, _) = FileOperationJournal::open(&path).unwrap();
+        journal
+            .append_and_sync(&upsert(operation_snapshot(
+                OperationId::new(),
+                OperationState::Accepted,
+            )))
+            .unwrap();
+
+        let _fault = InjectedSyncDirectoryFault::enable();
+        let error = journal.compact().unwrap_err();
+        assert!(
+            matches!(error, AgentError::RecoveryRequired(_)),
+            "a post-publish sync failure must be typed as an uncertain publish: {error}"
+        );
+        drop(_fault);
+
+        // The writer is fenced: an append after the uncertain publish is
+        // refused instead of quietly continuing on the old generation.
+        assert!(matches!(
+            journal.append_and_sync(&upsert(operation_snapshot(
+                OperationId::new(),
+                OperationState::Accepted,
+            ))),
+            Err(AgentError::Storage(_))
+        ));
+
+        // The published metadata is the durable truth: a fresh open follows
+        // the new generation and appends there.
+        drop(journal);
+        let (reopened, recovery) = FileOperationJournal::open(&path).unwrap();
+        assert_eq!(
+            reopened.authority_checkpoint_marker().unwrap().generation,
+            2,
+            "the published generation must win"
+        );
+        assert_eq!(recovery.operations.len(), 1);
+        reopened
+            .append_and_sync(&upsert(operation_snapshot(
+                OperationId::new(),
+                OperationState::Accepted,
+            )))
+            .unwrap();
+        assert_eq!(reopened.recover().unwrap().last_seq, 3);
+        drop(reopened);
+        let g2 = path.with_file_name("operations.jsonl.g2");
+        assert!(
+            fs::metadata(&g2)
+                .map(|metadata| metadata.len() > 0)
+                .unwrap_or(false),
+            "the post-recovery append must land in the published generation"
+        );
+    }
+
+    /// Test-scoped fault for the directory-sync cut point (the only failure
+    /// that lands after the metadata publish).
+    struct InjectedSyncDirectoryFault;
+    impl InjectedSyncDirectoryFault {
+        fn enable() -> Self {
+            SYNC_DIRECTORY_FAULT.with(|cell| cell.set(true));
+            Self
+        }
+    }
+    impl Drop for InjectedSyncDirectoryFault {
+        fn drop(&mut self) {
+            SYNC_DIRECTORY_FAULT.with(|cell| cell.set(false));
+        }
     }
 
     #[test]

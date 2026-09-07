@@ -8,6 +8,7 @@ use tokio::sync::{broadcast, mpsc, oneshot};
 
 use crate::checkpoint::RuntimeCheckpoint;
 use crate::task::{AnchorPatch, TaskAnchor, TaskInfo};
+use crate::work::{RuntimeStatusSnapshot, WorkSubmission};
 
 /// Reply channel back to the caller of a command.
 pub type Reply<T> = oneshot::Sender<T>;
@@ -30,6 +31,18 @@ pub enum RuntimeCommand {
     SetFocus {
         goal: String,
         reply: Reply<AgentResult<()>>,
+    },
+    /// Atomic long-task submission shared by every client (P1): the actor
+    /// creates/resumes the task, attaches the `task.manage` surface when the
+    /// set is empty and applies the goal as the first input — all inside this
+    /// one serialized command, so another client's SetFocus/Submit can never
+    /// interleave between them. `client_request_id` is the caller's logical
+    /// submission key: same id + same goal is an idempotent retry returning
+    /// the original admission; same id + a different goal is rejected.
+    StartWork {
+        goal: String,
+        client_request_id: String,
+        reply: Reply<AgentResult<WorkSubmission>>,
     },
     /// Activate an existing task by id (resuming its scopes in the engine).
     ActivateTask {
@@ -90,9 +103,17 @@ pub enum RuntimeCommand {
     },
     /// Continue the active task's current directive in a fresh turn after
     /// a stop/restore. No new user instruction is minted and the stored
-    /// directive identity does not change.
+    /// directive identity does not change. Returns the task the directive
+    /// was continued under, so a receipt never has to be inferred from a
+    /// second, racy query.
     ContinueActiveTask {
-        reply: Reply<AgentResult<()>>,
+        reply: Reply<AgentResult<TaskId>>,
+    },
+    /// Read-only, one-shot typed status snapshot (P2): focus, per-task
+    /// revisions and the durable event watermark, read atomically inside
+    /// the serialized actor loop. Reading never mutates state.
+    StatusSnapshot {
+        reply: Reply<AgentResult<RuntimeStatusSnapshot>>,
     },
     /// Prepare a full restore: transactionally install context + task
     /// authority, then leave the actor fenced until the host has applied
@@ -186,6 +207,22 @@ impl RuntimeHandle {
     pub async fn set_focus(&self, goal: String) -> AgentResult<()> {
         self.call(|reply| RuntimeCommand::SetFocus { goal, reply })
             .await
+    }
+
+    /// Atomic long-task submission (P1). Returns a stable acceptance
+    /// receipt. Idempotent for the same `client_request_id` + goal; rejects
+    /// the same id with different content instead of re-executing.
+    pub async fn start_work(
+        &self,
+        goal: String,
+        client_request_id: String,
+    ) -> AgentResult<WorkSubmission> {
+        self.call(|reply| RuntimeCommand::StartWork {
+            goal,
+            client_request_id,
+            reply,
+        })
+        .await
     }
 
     /// Activate an existing task, resuming its scopes in the context engine.
@@ -290,9 +327,19 @@ impl RuntimeHandle {
     }
 
     /// Continue the active task's stored current directive in a fresh
-    /// turn. Public: stop/restore twins are a host-driven flow.
-    pub async fn continue_active_task(&self) -> AgentResult<()> {
+    /// turn. Public: stop/restore twins are a host-driven flow. Returns the
+    /// task the directive continues under.
+    pub async fn continue_active_task(&self) -> AgentResult<TaskId> {
         self.call(|reply| RuntimeCommand::ContinueActiveTask { reply })
+            .await
+    }
+
+    /// One consistent typed status snapshot (P2). Read-only; the actor
+    /// assembles focus, per-task revisions and the durable event watermark
+    /// in one serialized step, so a concurrent focus change can never tear
+    /// it.
+    pub async fn status_snapshot(&self) -> AgentResult<RuntimeStatusSnapshot> {
+        self.call(|reply| RuntimeCommand::StatusSnapshot { reply })
             .await
     }
 

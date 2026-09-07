@@ -245,9 +245,11 @@ impl BuiltinToolDispatcher {
             // catalog instead of paying its schema every round.
             Arc::new(TaskManageTool::new()),
         ];
-        if let Some(tool) =
-            VerificationRunTool::new(workspace.clone(), verification_recipes.clone())
-        {
+        if let Some(tool) = VerificationRunTool::new(
+            workspace.clone(),
+            verification_recipes.clone(),
+            host_death_watchdog,
+        ) {
             tools.push(Arc::new(tool));
         }
         let catalog = tools
@@ -1446,6 +1448,12 @@ mod tests {
     #[tokio::test]
     async fn execution_facts_native_stamps_match_derivation_across_builtin_families() {
         let tools = dispatcher().await;
+        let initialized = std::process::Command::new("git")
+            .args(["init", "--quiet"])
+            .current_dir(tools.workspace.root())
+            .output()
+            .unwrap();
+        assert!(initialized.status.success());
         let mut checked = 0usize;
 
         for outcome in [

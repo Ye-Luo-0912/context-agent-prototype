@@ -35,6 +35,12 @@ The decoded total is the honest model-facing cost: `summary` +
 `model_content` first, then `summary`; metadata overflow is replaced by a
 bounded marker object (see §6).
 
+Approval refusal is stamped as `ApprovalDenied` directly by Core's approval
+verdict branch; error prose cannot mint it. `ToolExecutionFacts.verification_probe`
+is host-owned and binds recipe id, revision and definition/coverage digest.
+Context error finalization also requires the same task. The probe does not
+replace Runtime's current-world PASS receipts or grant task completion.
+
 ### 1.1 Trust: producer metadata ≠ trusted runtime metadata (CAP-OBS-01)
 
 `metadata` began as structured side data, but the Runtime now derives
@@ -230,7 +236,11 @@ matrix with schemas lives in [`docs/TOOL_INVENTORY.json`](TOOL_INVENTORY.json).
 | | `MODEL_OUTPUT_CHARS` (tail) | 12 000 chars |
 | | `MAX_LINE_CHARS` | 4 000 chars per line |
 | | ring-buffer tail lines | 200 |
-| `git.status` / `git.diff` | `MODEL_OUTPUT_CHARS` (tail) | 12 000 chars (overflow → artifact) |
+| `git.status` / `git.diff` | model tail of captured prefix | 12 000 chars (overflow → artifact) |
+| | pipe/artifact capture | 4 MiB per pipe, 8 MiB combined artifact; keep draining after cap |
+| `search.grep` / `code.symbols` | traversal entries / path bytes | 50 000 / 8 MiB; partial coverage is explicit |
+| `search.grep` | hit line excerpt | 1 024 bytes plus clipping marker, centered near first match |
+| `code.symbols` | symbol name | 256 chars plus clipping marker |
 | `search.grep` | `MAX_FILES_SCANNED` | 5 000 |
 | | `MAX_BYTES_PER_FILE` | 2 MiB |
 | | `MODEL_HITS` | 100 (overflow → artifact) |

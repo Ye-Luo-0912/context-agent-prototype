@@ -92,8 +92,11 @@
       },
       "limits": {
         "max_files_scanned": 5000,
+        "max_walk_entries": 50000,
+        "max_walk_path_bytes": 8388608,
         "max_bytes_per_file": 2097152,
         "model_hits": 100,
+        "max_hit_line_bytes": 1024,
         "note": "hit sets above model_hits spill to an artifact and return a cursor; later pages are served from the immutable snapshot, so file changes between pages cannot cause duplicates or gaps; ignored dirs: .git, .focus-agent, target, node_modules, vendor, dist, build"
       },
       "effects": ["read:workspace"],
@@ -170,7 +173,9 @@
       "limits": {
         "model_output_chars": 12000,
         "timeout_ms": 20000,
-        "note": "tail bounded; larger output spills to an artifact"
+        "max_captured_output_bytes": 8388608,
+        "max_pipe_capture_bytes": 4194304,
+        "note": "private Git config view; repository helpers, filters and submodule recursion disabled; pipes drained concurrently; bounded captured prefix spills to artifact with explicit truncation"
       },
       "effects": ["read:git"],
       "context_disposition": "PersistObservation",
@@ -186,7 +191,9 @@
       "limits": {
         "model_output_chars": 12000,
         "timeout_ms": 20000,
-        "note": "tail bounded; larger output spills to an artifact"
+        "max_captured_output_bytes": 8388608,
+        "max_pipe_capture_bytes": 4194304,
+        "note": "private Git config view; repository helpers, filters and submodule recursion disabled; pipes drained concurrently; bounded captured prefix spills to artifact with explicit truncation"
       },
       "effects": ["read:git"],
       "context_disposition": "PersistObservation",
@@ -353,8 +360,11 @@
       },
       "limits": {
         "max_files_scanned": 5000,
+        "max_walk_entries": 50000,
+        "max_walk_path_bytes": 8388608,
         "max_bytes_per_file": 2097152,
         "model_symbols": 100,
+        "max_symbol_name_chars": 256,
         "note": "pure local lexical scan (no language server, no index, no embeddings/vector storage); per-language declaration rules for rs/py/js/jsx/mjs/cjs/ts/tsx/go/c/h/cpp/hpp/cc/hh/cxx/hxx/java/cs/kt/kts/scala/swift/zig; comments, ignored dirs and inline comments skipped; C-like function detection is a documented heuristic; rows are file:line:col  kind name with snapshot-backed cursor paging"
       },
       "effects": ["read:workspace"],

@@ -1,12 +1,13 @@
 # 产品功能路线
 
-> 状态：M16 产品闭环。**当前执行插入：** 2026-09-06 深入续审仅剩 PROCESS-01 Unix（管道 EOF 看门狗已落地 `a954314`，等 Linux CI 实证）；M16-02 已于 2026-09-07 关闭；原手工走查已转为自动化 E2E。
-> 旧报告中的“先全部可靠性收口、再 Chronicle/TaskGraph、再开发功能”不是当前执行顺序。
+> 状态：**M17——多入口平台与正式原生工作台**（2026-09-07 切换）。M16 已收口（M16-00–07 关闭、M16-08 走查落地；条件项：真实 provider live、PACKAGE-01、MCP-01）。2026-09-06 深入续审代码项保持关闭；2026-09-07 续审（`b299c6a`，部分源码）残余并入 M17 前列（B1/B2/B3）。
+> 旧报告中的"先全部可靠性收口、再 Chronicle/TaskGraph、再开发功能"不是当前执行顺序；Chronicle→TaskGraph→worker 也不是正式 GUI、公共应用接口或只读工具子 Agent 的技术前置。
 > 不改变 Core 安全边界，不改写历史实验结果，不取消现有 CI。
 
 ## 目标与边界
 
-用户给出一个仓库级任务，Agent 能维护短计划、查读修改、响应补充、有限执行、停止后续跑、冷恢复，并交付可审阅结果；同一套能力可通过非交互入口被脚本调用。
+长期目标：**可复用的本地 Runtime／Platform**；Coding Agent 与原生 GUI 是它的产品客户端。
+用户给出一个仓库级任务，Agent 能维护短计划、查读修改、响应补充、有限执行、停止后续跑、冷恢复，并交付可审阅结果；同一套能力可通过非交互入口与正式桌面客户端使用。
 
 默认范围：单用户、单工作区、一个活动任务焦点、一个 RuntimeActor、动态进程内 Context。
 不是通用 Agent OS，也不是把任意自然语言需求自动证明正确。
@@ -14,15 +15,36 @@
 已经发布的 v0.1.0、已有 M15/LT-EVAL 记录、doctor、检查点是基础，不再作为待重做事项。
 **实现存在、测试通过、默认启用、真实任务跑通**分别记录。
 
-## 当前插入：深入续审剩余
-
-按 NEXT_TASKS 前列处理仍开放的审查缺口：当前 **PROCESS-01**（Windows 围栏已落地；Unix 待持久监督身份设计）；PACKAGE-01 留到下次实际发布；MCP-01 仅默认启用 MCP 时。
-
-STORAGE-01/02、PROCESS-02、WORKSPACE-01/02、PROVIDER-01/02/03、CONTEXT-01 与 DOC-01 已关闭（2026-09-06）。不重开 M15，不把 13 项清零当成新阶段，不新建总门禁。
-
 <a id="route-to-a-usable-local-agent"></a>
 
-## M16 顺序
+## M17：多入口平台与正式原生工作台（当前阶段）
+
+三条工作线并行，按功能依赖控制交付，不用"基础全部清零"阻塞 GUI，也不让 GUI 自拼命令形成第二套业务逻辑：
+
+```text
+                 最小公共契约（C0）
+                 /          \
+      基础正确性修复        平台应用服务
+      （B1/B2/B3）         （P1/P2/P3）
+                                  │
+                           正式原生 GUI
+                           （G1/G2/G3）
+                                  │
+                       实际使用暴露接口缺口
+                       （E1 扩展、R1 收口）
+```
+
+两个不同的"能开始"与"能声明完成"：GUI 布局、客户端库、只读状态、任务输入可与基础修复同时开始；涉及宿主执行、可靠清理、冷恢复的**正式支持声明**等待 B1/B2 对应验收。研究性优化不阻塞任何一条线。
+
+首批开工：**B1、B2 直接开始；C0 文档切换已落地，DTO 约定完成后 P1、G1 同时推进。** 共享契约/`command.rs`/compose 入口单一维护者。
+
+桌面端选型（2026-09-07 决定）：**.NET 10 LTS＋Avalonia＋独立 Rust 宿主＋本地 IPC（Windows Named Pipe／Linux UDS）**。边界：这是平台覆盖与工程交付取舍，不是已测出的资源占用最优；Avalonia 非 WebView 但也非逐控件原生包装；Linux 原生 Wayland 后端仍为实验 opt-in，发布时须明确发行版/显示后端/架构范围；SDK patch 实施时锁定。Windows-only 立场出现时才改选 WinUI 3。FFI 嵌入（Rust 编 DLL 交 C# 调）不采用：进程边界更贴合多入口与可替换 GUI，watchdog 的 `current_exe` re-entry 协议要求宿主是明确支持它的 Rust 可执行文件。
+
+平台首组能力（不是导出全部 `RuntimeCommand`）：提交任务/追加输入/继续、取消/审批响应、快照/订阅、结果与差异按需读取、完整检查点恢复。状态接口第一版即解决衔接：一致快照＋游标→其后事件→缺口 `resync_required`；实时文字与耐久事件分开。对外提交带稳定逻辑提交键与受理回执；RPC 请求 ID 不自动等于跨重连/重启幂等。
+
+完整工单与依赖见 [NEXT_TASKS.md](NEXT_TASKS.md)；阶段提案原文：[reviews/2026-09-07-platform-native-audit/REPORT.md](reviews/2026-09-07-platform-native-audit/REPORT.md)。
+
+## M16 顺序（已收口）
 
 M16 替换此前 D0/F1–F6 活动队列。审查剩余是同一队列的前列，不是第二套待办。可执行步骤见 [NEXT_TASKS.md](NEXT_TASKS.md)。
 
@@ -61,11 +83,12 @@ M16-00–07 全部关闭（2026-09-07），走查均为自动化 E2E；PROCESS-0
 
 ## 不进入本阶段
 
-Chronicle 数据库、结构化 TaskGraph、多 Agent、worker、MCP/插件生态扩展、递归自修改。
-需要这些时先指出现有简单路径解决不了的具体用户任务。
+Chronicle 数据库、结构化 TaskGraph、多 Agent、并行 worker、递归自修改、插件市场规模的生态扩展。
+E1 只是**一个**受控真实能力与按需 Skill 的最小闭环，不是 MCP/插件生态建设。
+需要更大规模时先指出现有简单路径解决不了的具体用户任务。
 
 ## 参考文档
 
 [CURRENT.md](CURRENT.md) 记录事实；[AUDIT_TODO.md](AUDIT_TODO.md) 分流缺陷。
 架构、执行、恢复和权限修改分别参考 [ARCHITECTURE.md](ARCHITECTURE.md)、[EXECUTION_MODEL.md](EXECUTION_MODEL.md)、[RECOVERY_RUNBOOK.md](RECOVERY_RUNBOOK.md)、[PLATFORM_SECURITY.md](PLATFORM_SECURITY.md)。
-提案原文：[reviews/2026-09-06-m16-proposal/](reviews/2026-09-06-m16-proposal/TRIAGE.md)。
+M16 提案原文：[reviews/2026-09-06-m16-proposal/](reviews/2026-09-06-m16-proposal/TRIAGE.md)；M17 续审原文：[reviews/2026-09-07-platform-native-audit/](reviews/2026-09-07-platform-native-audit/REPORT.md)。

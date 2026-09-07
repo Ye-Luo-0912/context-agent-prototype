@@ -11,6 +11,7 @@
 //! test command during a turn.
 
 use std::collections::HashMap;
+use std::path::{Path, PathBuf};
 use std::sync::RwLock;
 use std::time::Duration;
 
@@ -41,6 +42,27 @@ struct PackageEntry {
     /// Monotonic install sequence, so cross-package hook ordering has a
     /// deterministic tie-break.
     installed_at: u64,
+    /// Where the package's skill bodies live, when the operator installed
+    /// it from a directory. `None` for manifest-only installs: their skill
+    /// bodies are simply unavailable, never guessed at.
+    root: Option<PathBuf>,
+}
+
+/// Bound on one skill body read (E1). Skill text enters context as
+/// ordinary, non-System-authority tool output; a body over this bound is
+/// refused outright — a truncated half-procedure is worse than none.
+pub const MAX_SKILL_BODY_BYTES: usize = 64 * 1024;
+
+/// The bounded result of one on-demand skill body read: the body plus the
+/// provenance/version trail that says where it came from.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SkillBody {
+    pub package: String,
+    pub skill: String,
+    pub version: String,
+    pub provenance: SkillSource,
+    pub reference: String,
+    pub body: String,
 }
 
 /// The runtime's plugin package catalog and lifecycle flows.
@@ -61,6 +83,32 @@ impl PluginRegistry {
     /// then register it in the `Installed` (inert) state. Duplicate ids are
     /// refused. Installing never activates anything.
     pub fn install(&self, manifest: PluginPackageManifest) -> AgentResult<()> {
+        self.install_inner(manifest, None)
+    }
+
+    /// Install a package from an on-disk root (E1): the declared skill
+    /// references resolve inside this directory only, and their bodies are
+    /// readable only while the package and the skill are active. Installing
+    /// from a root still never activates anything.
+    pub fn install_from_root(
+        &self,
+        manifest: PluginPackageManifest,
+        root: PathBuf,
+    ) -> AgentResult<()> {
+        if !root.is_dir() {
+            return Err(AgentError::InvalidRequest(format!(
+                "plugin package root {} is not a directory",
+                root.display()
+            )));
+        }
+        self.install_inner(manifest, Some(root))
+    }
+
+    fn install_inner(
+        &self,
+        manifest: PluginPackageManifest,
+        root: Option<PathBuf>,
+    ) -> AgentResult<()> {
         // Admission already returns an AgentError; propagate it as-is.
         PluginPackageAdmission::validate_static(&manifest)?;
         let id = manifest.id.clone();
@@ -78,6 +126,7 @@ impl PluginRegistry {
             PackageEntry {
                 manifest,
                 installed_at,
+                root,
             },
         );
         self.state.install(&id);
@@ -284,6 +333,107 @@ impl PluginRegistry {
     /// Deactivate a declared skill (metadata intent only).
     pub fn deactivate_skill(&self, package: &str, skill_id: &str) -> AgentResult<()> {
         self.set_skill_activation(package, skill_id, SkillActivation::Inactive)
+    }
+
+    /// On-demand skill body read (E1). Every gate is explicit:
+    ///
+    /// * the package must be installed AND active,
+    /// * the skill itself must be active (the operator offered it),
+    /// * the reference resolves confined under the package root — an
+    ///   absolute path, a parent component or any prefix/root component
+    ///   escapes the package and is refused,
+    /// * the body is bounded: an over-cap read is refused, never
+    ///   truncated.
+    ///
+    /// The returned body enters context as ordinary (non-System-authority)
+    /// tool output with its provenance and version attached. Nothing here
+    /// injects the body into a request on its own, and reading never
+    /// grants authority — the skill's scripts still run (or refuse) through
+    /// the existing tools and their approval gates.
+    pub fn skill_read(&self, package: &str, skill_id: &str) -> AgentResult<SkillBody> {
+        let (root, reference, version, provenance, activation) = {
+            let packages = self.packages.read().expect("plugin catalog poisoned");
+            let entry = packages.get(package).ok_or_else(|| {
+                AgentError::InvalidRequest(format!("package '{package}' is not installed"))
+            })?;
+            let skill = entry
+                .manifest
+                .skills
+                .iter()
+                .find(|skill| skill.id == skill_id)
+                .ok_or_else(|| {
+                    AgentError::InvalidRequest(format!(
+                        "package '{package}' declares no skill '{skill_id}'"
+                    ))
+                })?;
+            (
+                entry.root.clone(),
+                skill.reference.clone(),
+                skill.version.clone(),
+                skill.provenance,
+                skill.activation,
+            )
+        };
+        if self.activation(package) != Some(PluginActivation::Active) {
+            return Err(AgentError::InvalidRequest(format!(
+                "package '{package}' is not active; enable it before reading its skills"
+            )));
+        }
+        if activation != SkillActivation::Active {
+            return Err(AgentError::InvalidRequest(format!(
+                "skill '{package}:{skill_id}' is not active; activate it before reading it"
+            )));
+        }
+        let Some(root) = root else {
+            return Err(AgentError::InvalidRequest(format!(
+                "package '{package}' was installed without a root; its skill bodies are unavailable"
+            )));
+        };
+        let relative = Path::new(&reference);
+        let confined = !relative.is_absolute()
+            && relative.components().all(|component| {
+                matches!(
+                    component,
+                    std::path::Component::Normal(_) | std::path::Component::CurDir
+                )
+            });
+        if !confined {
+            return Err(AgentError::InvalidRequest(format!(
+                "skill reference '{reference}' escapes its package root"
+            )));
+        }
+        let path = root.join(relative);
+        let mut bytes = Vec::new();
+        {
+            use std::io::Read as _;
+            std::fs::File::open(&path)
+                .map_err(|error| {
+                    AgentError::Tool(format!("read skill '{package}:{skill_id}': {error}"))
+                })?
+                .take(MAX_SKILL_BODY_BYTES as u64 + 1)
+                .read_to_end(&mut bytes)
+                .map_err(|error| {
+                    AgentError::Tool(format!("read skill '{package}:{skill_id}': {error}"))
+                })?;
+        }
+        if bytes.len() > MAX_SKILL_BODY_BYTES {
+            return Err(AgentError::Tool(format!(
+                "skill '{package}:{skill_id}' body exceeds the {MAX_SKILL_BODY_BYTES} byte cap; refused (never truncated)"
+            )));
+        }
+        let body = String::from_utf8(bytes).map_err(|_| {
+            AgentError::Tool(format!(
+                "skill '{package}:{skill_id}' body is not valid UTF-8"
+            ))
+        })?;
+        Ok(SkillBody {
+            package: package.to_owned(),
+            skill: skill_id.to_owned(),
+            version,
+            provenance,
+            reference,
+            body,
+        })
     }
 
     fn set_skill_activation(
@@ -1189,5 +1339,145 @@ mod tests {
             tail.contains("CWD="),
             "the private cwd must be reported: {tail}"
         );
+    }
+
+    fn skill_declaration(skill_id: &str, reference: &str) -> SkillDeclaration {
+        SkillDeclaration {
+            id: skill_id.into(),
+            version: "1.2.0".into(),
+            summary: "test skill".into(),
+            reference: reference.into(),
+            provenance: SkillSource::Package,
+            activation: SkillActivation::Inactive,
+        }
+    }
+
+    /// E1: an active skill's body is readable from its package root, with
+    /// its provenance and version attached.
+    #[test]
+    fn skill_read_serves_an_active_skill_from_its_package_root() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("howto.md"), "# howto\nstep one").unwrap();
+        let registry = PluginRegistry::new();
+        registry
+            .install_from_root(
+                package_with_skill("pack", skill_declaration("howto", "howto.md"), Vec::new()),
+                dir.path().to_path_buf(),
+            )
+            .expect("install from root succeeds");
+        registry.enable("pack").unwrap();
+        registry.activate_skill("pack", "howto").unwrap();
+
+        let body = registry.skill_read("pack", "howto").expect("read succeeds");
+        assert_eq!(body.body, "# howto\nstep one");
+        assert_eq!(body.package, "pack");
+        assert_eq!(body.version, "1.2.0");
+        assert_eq!(body.provenance, SkillSource::Package);
+        assert_eq!(body.reference, "howto.md");
+    }
+
+    /// Both activation gates hold: an inactive package refuses, an active
+    /// package with an inactive skill refuses, and only the fully offered
+    /// skill reads.
+    #[test]
+    fn skill_read_requires_an_active_package_and_an_active_skill() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("s.md"), "body").unwrap();
+        let registry = PluginRegistry::new();
+        registry
+            .install_from_root(
+                package_with_skill("pack", skill_declaration("s", "s.md"), Vec::new()),
+                dir.path().to_path_buf(),
+            )
+            .unwrap();
+
+        let error = registry.skill_read("pack", "s").unwrap_err();
+        assert!(error.to_string().contains("not active"), "{error}");
+
+        registry.enable("pack").unwrap();
+        let error = registry.skill_read("pack", "s").unwrap_err();
+        assert!(
+            error.to_string().contains("not active"),
+            "an inactive skill must refuse: {error}"
+        );
+
+        registry.activate_skill("pack", "s").unwrap();
+        assert!(registry.skill_read("pack", "s").is_ok());
+    }
+
+    /// A manifest-only install has no root: its bodies are unavailable,
+    /// never guessed at. A reference escaping the root (parent components
+    /// or an absolute path) is refused at read time.
+    #[test]
+    fn skill_read_refuses_manifest_only_installs_and_path_escapes() {
+        let registry = PluginRegistry::new();
+        registry
+            .install(package_with_skill(
+                "pack",
+                skill_declaration("s", "s.md"),
+                Vec::new(),
+            ))
+            .unwrap();
+        registry.enable("pack").unwrap();
+        registry.activate_skill("pack", "s").unwrap();
+        let error = registry.skill_read("pack", "s").unwrap_err();
+        assert!(error.to_string().contains("without a root"), "{error}");
+
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("s.md"), "body").unwrap();
+        std::fs::write(dir.path().parent().unwrap().join("secret.txt"), "s3cr3t").unwrap();
+        // Escape attempts are refused at ADMISSION, before any root exists —
+        // `skill_read`'s own confinement check is the second line of
+        // defense behind it.
+        let registry = PluginRegistry::new();
+        let error = registry
+            .install_from_root(
+                package_with_skill(
+                    "escape",
+                    skill_declaration("s", "../secret.txt"),
+                    Vec::new(),
+                ),
+                dir.path().to_path_buf(),
+            )
+            .unwrap_err();
+        assert!(
+            error.to_string().contains("package-relative"),
+            "an escaping reference must be refused at admission: {error}"
+        );
+
+        let absolute = if cfg!(windows) { "C:\\x.md" } else { "/x.md" };
+        let error = registry
+            .install_from_root(
+                package_with_skill("absolute", skill_declaration("s", absolute), Vec::new()),
+                dir.path().to_path_buf(),
+            )
+            .unwrap_err();
+        assert!(
+            error.to_string().contains("package-relative"),
+            "an absolute reference must be refused at admission: {error}"
+        );
+    }
+
+    /// An over-cap body is refused outright — a truncated half-procedure
+    /// is worse than none.
+    #[test]
+    fn skill_read_refuses_an_oversized_body_instead_of_truncating() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("big.md"),
+            vec![b'a'; MAX_SKILL_BODY_BYTES + 1],
+        )
+        .unwrap();
+        let registry = PluginRegistry::new();
+        registry
+            .install_from_root(
+                package_with_skill("pack", skill_declaration("big", "big.md"), Vec::new()),
+                dir.path().to_path_buf(),
+            )
+            .unwrap();
+        registry.enable("pack").unwrap();
+        registry.activate_skill("pack", "big").unwrap();
+        let error = registry.skill_read("pack", "big").unwrap_err();
+        assert!(error.to_string().contains("exceeds"), "{error}");
     }
 }

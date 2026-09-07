@@ -24,6 +24,29 @@ use super::{
 const MAX_FILES_SCANNED: usize = 5_000;
 const MAX_BYTES_PER_FILE: u64 = 2 * 1024 * 1024;
 const MODEL_HITS: usize = 100;
+const MAX_HIT_LINE_BYTES: usize = 1024;
+
+fn hit_excerpt(line: &str, match_start: usize) -> (String, bool) {
+    if line.len() <= MAX_HIT_LINE_BYTES {
+        return (line.trim_end().to_owned(), false);
+    }
+    let mut start = match_start.saturating_sub(MAX_HIT_LINE_BYTES / 4);
+    while !line.is_char_boundary(start) {
+        start -= 1;
+    }
+    let mut end = (start + MAX_HIT_LINE_BYTES).min(line.len());
+    while !line.is_char_boundary(end) {
+        end -= 1;
+    }
+    (
+        format!(
+            "{}{} [line clipped; use fs.read]",
+            if start == 0 { "" } else { "... " },
+            &line[start..end]
+        ),
+        true,
+    )
+}
 /// 大文件内每隔这么多行检查一次取消，避免整份 2 MiB 扫完才停。
 const CANCEL_CHECK_LINES: usize = 256;
 
@@ -168,8 +191,8 @@ impl Tool for SearchGrepTool {
             Ok(metadata) if metadata.is_file() => files.push(root),
             Ok(_) => {
                 let mut budget = MAX_FILES_SCANNED;
-                walk_files(&root, &mut files, &mut budget, Some(&cancel)).await?;
-                walk_budget_reached = budget == 0;
+                walk_budget_reached =
+                    walk_files(&root, &mut files, &mut budget, Some(&cancel)).await?;
             }
             Err(_) => {
                 return Ok(ToolOutcome::Value(
@@ -197,6 +220,7 @@ impl Tool for SearchGrepTool {
         // Files the scan could not read. A bounded coverage statement must
         // name them: partial no-hit is not repo-wide absence.
         let mut skipped_files = 0usize;
+        let mut clipped_hit_lines = 0usize;
 
         'files: for file in files {
             if cancel.is_cancelled() {
@@ -236,8 +260,10 @@ impl Tool for SearchGrepTool {
                         ));
                     }
                 }
-                if regex.is_match(line) {
-                    hits.push(format!("{relative}:{}: {}", index + 1, line.trim_end()));
+                if let Some(found) = regex.find(line) {
+                    let (excerpt, clipped) = hit_excerpt(line, found.start());
+                    clipped_hit_lines += usize::from(clipped);
+                    hits.push(format!("{relative}:{}: {excerpt}", index + 1));
                     if hits.len() >= limit {
                         break 'files;
                     }
@@ -278,6 +304,8 @@ impl Tool for SearchGrepTool {
             "has_more": has_more,
             "next_start_line": has_more.then_some(model_hits.len() + 1),
             "cursor": cursor,
+            "clipped_hit_lines": clipped_hit_lines,
+            "walk_budget_reached": walk_budget_reached,
         });
         // Coverage truth: the scan is incomplete when the hit limit stopped
         // it early, the file budget truncated the candidate list, or files
@@ -420,6 +448,29 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let workspace = Workspace::open(dir.path()).await.unwrap();
         (workspace, dir)
+    }
+
+    #[tokio::test]
+    async fn huge_matching_lines_return_bounded_excerpts_around_the_match() {
+        let (workspace, dir) = temp_workspace().await;
+        let line = format!("{}needle{}", "界".repeat(100_000), "x".repeat(100_000));
+        std::fs::write(dir.path().join("large.txt"), &line).unwrap();
+        let tool = SearchGrepTool::new(workspace);
+        let output = value(
+            tool.execute(
+                RunId::new(),
+                "long",
+                json!({"pattern":"needle"}),
+                None,
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap(),
+        );
+        assert!(output.ok);
+        assert!(output.model_content.contains("needle"));
+        assert!(output.model_content.len() < MAX_HIT_LINE_BYTES + 200);
+        assert_eq!(output.metadata["clipped_hit_lines"], 1);
     }
 
     async fn write(root: &Path, relative: &str, content: &str) {

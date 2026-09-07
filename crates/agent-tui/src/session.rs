@@ -319,20 +319,21 @@ async fn dispatch_command(
             app.push_system("usage: /work <goal>".to_string());
             return Ok(true);
         }
-        // Explicit long-task entry, composed from the existing actor
-        // paths: set_focus creates (or resumes) the task while idle, an
-        // empty tool requirement set gains a PreferSurface demand for
-        // task.manage, and the goal is delivered once through the normal
-        // user-message path (busy → the runtime's own queue). No second
+        // Explicit long-task entry through the shared atomic `start_work`
+        // command (P1): the actor creates (or resumes) the task while idle,
+        // attaches the PreferSurface demand for task.manage onto an empty
+        // requirement set, and delivers the goal once through the normal
+        // user-message path inside one serialized command. No second
         // orchestrator.
         let handle = handle.clone();
         let notice_tx = notice_tx.clone();
         tokio::spawn(async move {
             match crate::work::start_long_task(&handle, goal).await {
-                Ok(Some(warning)) => {
-                    let _ = notice_tx.try_send(warning);
+                Ok(submission) => {
+                    if let Some(warning) = submission.task_manage_notice {
+                        let _ = notice_tx.try_send(warning);
+                    }
                 }
-                Ok(None) => {}
                 Err(error) => {
                     let _ = notice_tx.try_send(format!("work failed: {error}"));
                 }
@@ -1018,6 +1019,11 @@ mod tui_e2e {
             effect_reservation_journal: Some(reservation),
             verification_recipes: Some(recipes.clone()),
             project_proof_refresh: !recipes.is_empty(),
+            // Session-loop E2E shares the product binary's dispatch.
+            host_death_watchdog: true,
+            // Harness/eval compositions register no external capabilities by default.
+            mcp_servers: Vec::new(),
+            plugins: None,
         })
         .await?;
         Ok((composed, interactive, checkpoint_dir))

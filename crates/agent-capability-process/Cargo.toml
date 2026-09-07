@@ -16,3 +16,9 @@ tempfile = "3"
 tokio.workspace = true
 
 [dev-dependencies]
+agent-compose.workspace = true
+agent-core.workspace = true
+agent-storage.workspace = true
+agent-workspace.workspace = true
+context-simple.workspace = true
+tool-runtime.workspace = true

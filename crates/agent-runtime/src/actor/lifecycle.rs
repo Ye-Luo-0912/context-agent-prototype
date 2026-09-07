@@ -142,6 +142,76 @@ impl RuntimeActor {
         }
     }
 
+    /// Shared focus transition for `SetFocus` and `StartWork` (P1): create
+    /// or resume the task for `goal`, switch the engine's focus, and commit
+    /// the TaskManager transition only after the engine succeeded, so the two
+    /// planes can never diverge. An oversized goal or a saturated catalog
+    /// fails closed here, before any engine or event mutation.
+    pub(super) async fn apply_focus(&mut self, goal: String) -> AgentResult<TaskId> {
+        let next_focus_revision = self.next_focus_revision()?;
+        let (txn, task_id) = self.state.tasks.prepare_create(&goal)?;
+        let event_goal = goal.clone();
+        self.bump_generation()?;
+        match self.services.set_focus(task_id, goal).await {
+            Ok(report) => {
+                self.state.tasks.commit(txn);
+                self.state.task_id = Some(task_id);
+                self.state.last_assistant_artifact = None;
+                self.state
+                    .task_requirement_high_water
+                    .entry(task_id)
+                    .or_insert(0);
+                self.state.focus_revision = next_focus_revision;
+                self.publish_context_transition(
+                    RuntimeEvent::FocusChanged {
+                        task_id,
+                        goal: event_goal,
+                    },
+                    ContextMaintenanceTrigger::FocusChanged,
+                    report,
+                )
+                .await?;
+                Ok(task_id)
+            }
+            Err(error) => Err(self.context_transition_failed(error)),
+        }
+    }
+
+    /// Shared whole-set tool-requirement replace behind the CAS boundary,
+    /// used by the `ReplaceTaskToolRequirements` command and by `StartWork`'s
+    /// long-task checklist attach. The caller owns the idle check.
+    pub(super) async fn set_task_tool_requirements(
+        &mut self,
+        task_id: TaskId,
+        base_revision: u64,
+        entries: Vec<ToolSurfaceRequirement>,
+    ) -> AgentResult<u64> {
+        let entries = crate::task::normalize_tool_requirements(entries)?;
+        let (txn, revision) = self.state.tasks.prepare_replace_tool_requirements(
+            task_id,
+            base_revision,
+            entries.clone(),
+        )?;
+        let changed = revision != base_revision;
+        if changed {
+            self.bump_generation()?;
+            self.core
+                .emit_event(RuntimeEvent::TaskToolRequirementsChanged {
+                    task_id,
+                    revision,
+                    requirements: entries,
+                })
+                .await?;
+            self.state.tasks.commit(txn);
+            self.state
+                .task_requirement_high_water
+                .insert(task_id, revision);
+        } else {
+            self.state.tasks.commit(txn);
+        }
+        Ok(revision)
+    }
+
     pub(super) fn context_transition_failed(&mut self, error: AgentError) -> AgentError {
         if matches!(&error, AgentError::RecoveryRequired(_)) {
             self.state.recovery_required = true;

@@ -1,0 +1,70 @@
+{
+  "repository": "Ye-Luo-0912/context-agent-prototype",
+  "review_date": "2026-09-07",
+  "pinned_commit": "b299c6a08fdb055a0148a24dea65053861df6ff1",
+  "tree": "1c4a4d28378b882d52dfbdf9e9fdeb63271419aa",
+  "head_unchanged_at_final_check": true,
+  "full_repository_audit_completed": false,
+  "complete_checkout": false,
+  "clone_attempted": true,
+  "clone_failure": "Could not resolve host: github.com",
+  "archive_obtained": false,
+  "inventory_scope": "complete root and immediate crates listing only; NOT recursive file coverage",
+  "workspace_crates_enumerated": 19,
+  "body_paths_read": 19,
+  "full_body_returned_paths": 4,
+  "coverage_note": "Requested ranges record connector calls, not an assertion that every request returned all lines. NEXT_TASKS was response-truncated. Only 4 small files returned complete bodies; code reasoning focused on the listed paths.",
+  "local_rust_build_test": "NOT_RUN: no checkout and no cargo/rustc",
+  "local_dotnet_build_test": "NOT_RUN: no dotnet and no GUI implementation",
+  "remote_ci": {
+    "kind": "CONNECTOR_OBSERVATION_NOT_LOCAL_EXECUTION",
+    "head_sha": "b299c6a08fdb055a0148a24dea65053861df6ff1",
+    "run_id": 34065966817,
+    "status": "completed",
+    "conclusion": "success",
+    "run_updated_at": "2026-09-06T23:27:29Z",
+    "source_reference": "turn308file0",
+    "jobs": [
+      {
+        "id": 101574649777,
+        "name": "fmt / clippy / build (windows-latest)",
+        "status": "completed",
+        "conclusion": "success"
+      },
+      {
+        "id": 101574649884,
+        "name": "document consistency",
+        "status": "completed",
+        "conclusion": "success"
+      },
+      {
+        "id": 101574649913,
+        "name": "fmt / clippy / build (ubuntu-latest)",
+        "status": "completed",
+        "conclusion": "success"
+      },
+      {
+        "id": 101575111277,
+        "name": "test (windows-latest, part full)",
+        "status": "completed",
+        "conclusion": "success"
+      },
+      {
+        "id": 101575111287,
+        "name": "test (ubuntu-latest, part 1)",
+        "status": "completed",
+        "conclusion": "success"
+      },
+      {
+        "id": 101575111313,
+        "name": "test (ubuntu-latest, part 2)",
+        "status": "completed",
+        "conclusion": "success"
+      }
+    ]
+  },
+  "executed_probe": "probe_group_lifetime.json (Linux mechanism only; not repository code execution)",
+  "repository_changed": false,
+  "github_writes": false,
+  "artifact_contents": "review and proposed task documents; NOT repository source archive or implementation patch"
+}

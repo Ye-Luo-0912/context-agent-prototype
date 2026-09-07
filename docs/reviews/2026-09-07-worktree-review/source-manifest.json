@@ -1,0 +1,173 @@
+{
+  "captured_at_utc": "2026-09-07T06:03:39.778886+00:00",
+  "repository": "D:\\Users\\Ye_Luo\\APP\\context-agent-prototype",
+  "head": "92f8d92af93f7478ca1a5c1de11c38519e46c6a5",
+  "scope": "HEAD plus pre-existing tracked and untracked worktree changes; source hashes captured at review delivery, not an atomic repository snapshot",
+  "source_and_probe_files": [
+    {
+      "path": "crates/tool-runtime/src/tools/git.rs",
+      "bytes": 13602,
+      "sha256": "923408d27dec9b3bb24a3cb4711416d17fe23457031c48d8ba5aa91a28dfb34e"
+    },
+    {
+      "path": "crates/tool-runtime/src/tools/verify.rs",
+      "bytes": 13484,
+      "sha256": "c9b74e28f69ef975b91a7a35410459b18abe93db4a8e226e6bebacc5f1aa4e47"
+    },
+    {
+      "path": "crates/tool-runtime/src/tools/process.rs",
+      "bytes": 93046,
+      "sha256": "987e140d4dd64b734aa23fd838499b4ab8b2d447e3a71267384215d071068642"
+    },
+    {
+      "path": "crates/tool-runtime/src/registry.rs",
+      "bytes": 113573,
+      "sha256": "b7b8975a1e2150c07063814c67c85fa12f2bc01b51644f80336fa245ca7d2bed"
+    },
+    {
+      "path": "crates/tool-runtime/src/proof_runner.rs",
+      "bytes": 15325,
+      "sha256": "9f514a6102543ddb3984086976c90feccd8d44f74ce1aea906e0d69213432aa3"
+    },
+    {
+      "path": "crates/tool-runtime/src/supervision.rs",
+      "bytes": 33259,
+      "sha256": "7e77ad0ff3d0f3aceb311a3a6567ee2d1eee89cc155a220968029cf2711e94e2"
+    },
+    {
+      "path": "crates/agent-process/src/watchdog.rs",
+      "bytes": 17983,
+      "sha256": "d958d3fee7773ccf556a090648ca13376b2b62f7289ab86a83cf71a6a6333832"
+    },
+    {
+      "path": "crates/agent-contracts/src/context.rs",
+      "bytes": 140380,
+      "sha256": "56b7ae2cb775d7640080104006209c86f4f9c1b63cdcc4569b37a0afac009830"
+    },
+    {
+      "path": "crates/agent-contracts/src/tool.rs",
+      "bytes": 178155,
+      "sha256": "1fb81edffb64a23087206e0e3420c1ae8e61dc1487bc403ded7e92366a91dea7"
+    },
+    {
+      "path": "crates/agent-core/src/authority.rs",
+      "bytes": 28207,
+      "sha256": "441e6a30c406a5e0754981945eff28200666a560db0655d4e81f529fccdcc3e7"
+    },
+    {
+      "path": "crates/agent-core/src/kernel/tests.rs",
+      "bytes": 61229,
+      "sha256": "123fabd8082f700cb893ddec6816d5c6d6c143083534533cfcef382c6e5929d0"
+    },
+    {
+      "path": "crates/agent-runtime/src/actor/turn.rs",
+      "bytes": 136677,
+      "sha256": "966ec704f5bf43925841413a07f8e274867c1f77664aadf8a81dcbf8e86924bd"
+    },
+    {
+      "path": "crates/agent-runtime/src/platform/work.rs",
+      "bytes": 27388,
+      "sha256": "e3109dfe750dc7fde6d8819e3b758d431ea243f9436fb8e53cab5e87eb671bb9"
+    },
+    {
+      "path": "crates/agent-runtime/tests/actor/work_control.rs",
+      "bytes": 12460,
+      "sha256": "f4eba6c9890b717d9bf4024eb4cf100b320762df889501b8528b3c860daff806"
+    },
+    {
+      "path": "crates/agent-runtime/src/status.rs",
+      "bytes": 20620,
+      "sha256": "76a1d342933e43fb3936ab00e026ee03b6ae611e82c8b33980a4fd41fedc28ee"
+    },
+    {
+      "path": "crates/agent-storage/src/lib.rs",
+      "bytes": 90437,
+      "sha256": "00270e047bb39e1cb162a719f101c3db420272ebdc2b280b6a6361c5abacd80f"
+    },
+    {
+      "path": "crates/agent-tui/src/cli.rs",
+      "bytes": 44502,
+      "sha256": "a7bd4776e98996b8234f4ed19d82ee365a0a30a60d49776bd8118df8e6916e85"
+    },
+    {
+      "path": "crates/context-simple/src/engine.rs",
+      "bytes": 103223,
+      "sha256": "1ef0b6d5fc4ad4b7bb89f247a82e1067b13010dcb2e63cf7990fe9bc1f08bd86"
+    },
+    {
+      "path": "crates/context-simple/src/gc/reachability.rs",
+      "bytes": 17058,
+      "sha256": "c8b7fd0996cfeee6553a883dcae1c829c8a3881a3cb58ce59d9f64cb35801041"
+    },
+    {
+      "path": "crates/context-simple/src/checkpoint.rs",
+      "bytes": 4166,
+      "sha256": "028214683f9f612ac4237254a398f3247f4f5ca549ddee29867c73f72307404c"
+    },
+    {
+      "path": "crates/context-simple/src/scope.rs",
+      "bytes": 24567,
+      "sha256": "f467113d2ddb4983a5efb1c340400b6ca94e6e7c47af31a5caf0b193dbdf9816"
+    },
+    {
+      "path": "clients/dotnet/Agent.Client/AgentConnection.cs",
+      "bytes": 10621,
+      "sha256": "ced680c0b30cf87e2601c27358ee37b2d14dd58ed8fff77cd4f34db13ad9e85a"
+    },
+    {
+      "path": "clients/dotnet/Agent.Client/ResumableSession.cs",
+      "bytes": 5978,
+      "sha256": "695685ab10563a30c1d60728085ad866d424a7f7b3c7fe1665aaf8930d99946e"
+    },
+    {
+      "path": "clients/dotnet/Agent.Client/Envelope.cs",
+      "bytes": 15726,
+      "sha256": "d7176787c8bf588816ec1a880ea28f1319a44f97d6b809ac6f1a34c30fb0af79"
+    },
+    {
+      "path": "clients/dotnet/Agent.Client/WorkDto.cs",
+      "bytes": 12444,
+      "sha256": "65ca6fa0f7fe8bb9f4c7be6cda65547a1f51badfa0f00ce62c162a8223b9b296"
+    },
+    {
+      "path": "clients/dotnet/Agent.Client/DeltaCoalescer.cs",
+      "bytes": 1855,
+      "sha256": "3b3721a0e3b4936f789c309f23746ec93f59924715886d3e59a7b53ce626110b"
+    },
+    {
+      "path": "clients/dotnet/Agent.Client.Tests/ResilienceTests.cs",
+      "bytes": 8251,
+      "sha256": "7fda074831e3451567baafb284fc5004b11c2e4055fe07feae9f3574da846c34"
+    },
+    {
+      "path": "apps/Agent.Desktop/ViewModels/MainWindowViewModel.cs",
+      "bytes": 14056,
+      "sha256": "80783638578e8f81a473088849a231c0c714d1a66c6678a63a670d81f2cadd7b"
+    },
+    {
+      "path": "apps/Agent.Desktop/Infrastructure/ObservableObject.cs",
+      "bytes": 2730,
+      "sha256": "846c0b2aa411db94777c81ab9ddf6a3666458b35a9a752d98108320cc9a1d91d"
+    },
+    {
+      "path": "target/review-probes/rust/src/main.rs",
+      "bytes": 9977,
+      "sha256": "f56d4e34972c7faae0face45d2c7c34aad2457d5447b35424789d6e414a308e0"
+    },
+    {
+      "path": "target/review-probes/rust/Cargo.toml",
+      "bytes": 657,
+      "sha256": "7e66998ff353700a247607bf53887ab09737bd6789883fec2e1664cd44c762a8"
+    },
+    {
+      "path": "target/review-probes/dotnet/Program.cs",
+      "bytes": 7687,
+      "sha256": "53eb9c4a7c8861114281f5b6ce2c65b65ed9b48dabf0635504620c6fb99b9eb6"
+    },
+    {
+      "path": "target/review-probes/dotnet/ReviewProbes.csproj",
+      "bytes": 359,
+      "sha256": "c1370df436e3167e1dfe58d14e206a14c947ccc5b16aa05ac280177da0ea05e2"
+    }
+  ]
+}

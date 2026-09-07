@@ -982,18 +982,33 @@ impl ProcessRunTool {
             }
             Err(e) => return Err(AgentError::Tool(format!("spawn {}: {e}", args.argv[0]))),
         };
-        // PROCESS-01 supervision ledger: record the child so a crashed
-        // host leaves a durable trace that the next startup reconciles.
-        // The lease releases the entry on every normal exit path; being
-        // declared before the tree guard, it drops after the guard has
-        // reaped the child (reverse drop order).
-        let _child_lease = (child.id().unwrap_or(0) != 0).then(|| {
-            crate::supervision::lease(
-                self.workspace.state_dir(),
-                child.id().unwrap_or(0),
-                tool_name,
-            )
-        });
+        // PROCESS-01 supervision ledger: record the child (with its OS
+        // creation identity) so a crashed host leaves a durable trace that
+        // the next startup reconciles. A ledger that cannot guarantee the
+        // record fails the spawn closed: an unsupervisable child is
+        // refused, never silently left unrecorded. The lease ends through
+        // the explicit `confirm_reaped` receipt after the child is reaped;
+        // a receipt-less drop keeps a live child's row for the next
+        // startup instead of faking a release.
+        let mut child_lease = match child.id() {
+            Some(pid) if pid != 0 => {
+                match crate::supervision::lease(self.workspace.state_dir(), pid, tool_name) {
+                    Ok(lease) => Some(lease),
+                    Err(error) => {
+                        kill_process_tree(pid);
+                        let _ = child.start_kill();
+                        tokio::time::timeout(Duration::from_secs(5), child.wait())
+                            .await
+                            .map_err(|_| AgentError::RecoveryRequired(format!("supervision ledger unavailable ({error}); cleanup of pid {pid} was not confirmed")))?
+                            .map_err(|wait_error| AgentError::RecoveryRequired(format!("supervision ledger unavailable ({error}); cleanup of pid {pid} could not be observed: {wait_error}")))?;
+                        return Err(AgentError::Tool(format!(
+                            "supervision ledger unavailable, refused to run an unsupervisable child (pid {pid}): {error}"
+                        )));
+                    }
+                }
+            }
+            _ => None,
+        };
         // Every early return after this point must kill the whole tree,
         // not just the direct child (`kill_on_drop` kills only the child
         // itself). The guard is disarmed only after the child is reaped.
@@ -1001,9 +1016,10 @@ impl ProcessRunTool {
         // Unix host-death containment (PROCESS-01): a watchdog re-entered
         // from this executable holds our read half; a SIGKILLed or aborted
         // host closes it and the watchdog kills the group. Dropping the
-        // handle after the child is reaped is the disarm path — the
-        // watchdog sees EOF, finds the leader gone, and exits without
-        // signalling. A failed arm degrades to no containment, matching
+        // handle after the child is reaped also cleans leftover group
+        // members. The watchdog joined the child's group before exec, so
+        // its membership pins that group even after leader reap.
+        // A failed arm degrades to no containment, matching
         // the Windows outer-job refusal.
         #[cfg(unix)]
         let _host_death_watchdog = if self.host_death_watchdog {
@@ -1060,7 +1076,7 @@ impl ProcessRunTool {
                 Ok(pid) => Some(pid),
                 Err(error) => {
                     super::abandon_spawned_process(&mut child);
-                    let _ = child.kill().await;
+                    let _ = child.start_kill();
                     return Err(error);
                 }
             }
@@ -1109,18 +1125,18 @@ impl ProcessRunTool {
                     // child: a descendant that outlives the cancel is an
                     // avoidable stale mutation.
                     kill_process_tree(child.id().unwrap_or(0));
-                    let _ = child.kill().await;
+                    let _ = child.start_kill();
                     outcome = "cancelled";
                     break;
                 }
                 _ = &mut deadline => {
                     kill_process_tree(child.id().unwrap_or(0));
-                    let _ = child.kill().await;
+                    let _ = child.start_kill();
                     outcome = "timed out";
                     break;
                 }
                 status = child.wait(), if exited.is_none() => {
-                    exited = Some(status.map_err(|e| AgentError::Tool(format!("wait: {e}")))?);
+                    exited = Some(status.map_err(|e| AgentError::RecoveryRequired(format!("process exit could not be observed: {e}")))?);
                     if outputs_closed {
                         // Output fully drained and the process reaped:
                         // nothing left to wait for, skip the grace window.
@@ -1148,10 +1164,18 @@ impl ProcessRunTool {
         }
         if exited.is_none() {
             exited = Some(
-                child
-                    .wait()
+                tokio::time::timeout(Duration::from_secs(5), child.wait())
                     .await
-                    .map_err(|e| AgentError::Tool(format!("wait: {e}")))?,
+                    .map_err(|_| {
+                        AgentError::RecoveryRequired(
+                            "process exit was not confirmed before the cleanup deadline".into(),
+                        )
+                    })?
+                    .map_err(|e| {
+                        AgentError::RecoveryRequired(format!(
+                            "process exit could not be observed: {e}"
+                        ))
+                    })?,
             );
         }
         // The direct child is reaped here; background descendants that
@@ -1159,6 +1183,18 @@ impl ProcessRunTool {
         // completions. From this point an early return cannot leak a
         // live process.
         tree_guard.disarm();
+        // Confirmed-reaped receipt: the child was observed exited, so its
+        // supervision row is released. A failed release keeps the row —
+        // conservative, the next startup's reconcile clears it.
+        if let Some(lease) = child_lease.as_mut()
+            && let Err(error) = lease.confirm_reaped()
+        {
+            eprintln!(
+                "supervision ledger release failed after reaping pid {}: {error}; \
+                 the row is kept and reconciled at the next startup",
+                child.id().unwrap_or(0)
+            );
+        }
         if let Some(pid) = pid {
             super::persist_process_exit(
                 &self.workspace,

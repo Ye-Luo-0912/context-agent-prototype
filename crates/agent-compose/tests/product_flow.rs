@@ -100,6 +100,12 @@ async fn compose_config(
         effect_reservation_journal: None,
         verification_recipes: if has_recipes { Some(recipes) } else { None },
         project_proof_refresh: has_recipes,
+        // Harness compositions never arm Unix host-death containment (no
+        // watchdog dispatch in this executable).
+        host_death_watchdog: false,
+        // Harness/eval compositions register no external capabilities by default.
+        mcp_servers: Vec::new(),
+        plugins: None,
     })
 }
 

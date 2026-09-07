@@ -38,6 +38,7 @@ async fn diagnostics_report_resident_heap_bytes() {
 #[tokio::test]
 async fn successful_observation_is_ephemeral_but_failure_persists_until_verified() {
     let engine = SimpleContextEngine::new(SimpleContextConfig::default());
+    open_focus(&engine, "auth task").await;
     engine
         .ingest(ContextIngress::UserMessage {
             content: "fix AuthService.rs".into(),
@@ -46,22 +47,9 @@ async fn successful_observation_is_ephemeral_but_failure_persists_until_verified
         .unwrap();
 
     // Round 1: failure — persists (Working) so a later fix can be verified.
-    engine
-        .ingest(ContextIngress::ToolObservation {
-            facts: None,
-            output: ToolOutput {
-                call_id: "1".into(),
-                tool_name: "shell.exec".into(),
-                ok: false,
-                summary: "test failed".into(),
-                model_content: "error in AuthService.rs:42".into(),
-                artifact_ref: Some("artifact://run/test.log".into()),
-                metadata: serde_json::Value::Null,
-            },
-            scope_id: None,
-        })
-        .await
-        .unwrap();
+    // The trusted recipe whose gate failed records the error with its own
+    // identity (M17-B3/F08).
+    verify_failure_observation(&engine, "1", "error in AuthService.rs:42", "auth.tests").await;
     engine
         .maintain(ContextMaintenanceTrigger::AfterTool)
         .await
@@ -111,23 +99,8 @@ async fn successful_observation_is_ephemeral_but_failure_persists_until_verified
             .collect::<Vec<_>>()
     );
 
-    // Round 3: only the trusted verification recipe verifies the fix.
-    engine
-        .ingest(ContextIngress::ToolObservation {
-            facts: None,
-            output: ToolOutput {
-                call_id: "3".into(),
-                tool_name: "verify.run".into(),
-                ok: true,
-                summary: "tests passed".into(),
-                model_content: "tests passed in AuthService.rs".into(),
-                artifact_ref: None,
-                metadata: serde_json::Value::Null,
-            },
-            scope_id: None,
-        })
-        .await
-        .unwrap();
+    // The same host probe in the same task verifies the fault.
+    verify_observation(&engine, "3", "tests passed in AuthService.rs").await;
     let report = engine
         .maintain(ContextMaintenanceTrigger::AfterTool)
         .await
@@ -160,6 +133,274 @@ async fn successful_observation_is_ephemeral_but_failure_persists_until_verified
     assert_eq!(
         after.tombstoned_items, 0,
         "consumption is attention loss, not semantic death"
+    );
+}
+
+/// M17-B3/F08 acceptance: a successful run of a DIFFERENT recipe, or of a
+/// plain tool whose output mentions the same file, must never finalize an
+/// error it did not probe — the error stays live.
+#[tokio::test]
+async fn unrelated_successes_never_finalize_an_error() {
+    let engine = SimpleContextEngine::new(SimpleContextConfig::default());
+    open_focus(&engine, "auth task").await;
+    engine
+        .ingest(ContextIngress::UserMessage {
+            content: "fix AuthService.rs".into(),
+        })
+        .await
+        .unwrap();
+    verify_failure_observation(&engine, "1", "error in AuthService.rs:42", "auth.tests").await;
+
+    // A DIFFERENT recipe succeeds and even mentions the same file.
+    verify_observation_for_recipe(
+        &engine,
+        "2",
+        "auth.tests v2 passed in AuthService.rs",
+        "auth.tests.v2",
+    )
+    .await;
+    engine
+        .maintain(ContextMaintenanceTrigger::AfterTool)
+        .await
+        .unwrap();
+    {
+        let state = engine.state.lock().await;
+        let error = state
+            .items
+            .iter()
+            .find(|item| item.kind == ContextKind::Error)
+            .expect("the error item");
+        assert!(
+            !error.semantic.is_dead(),
+            "another recipe's success must not finalize the error, got {:?}",
+            error.semantic
+        );
+    }
+
+    // A successful plain tool result on the same file is also only
+    // correlation.
+    tool_observation(&engine, "3", "read AuthService.rs: no problems seen").await;
+    engine
+        .maintain(ContextMaintenanceTrigger::AfterTool)
+        .await
+        .unwrap();
+    {
+        let state = engine.state.lock().await;
+        let error = state
+            .items
+            .iter()
+            .find(|item| item.kind == ContextKind::Error)
+            .expect("the error item");
+        assert!(
+            !error.semantic.is_dead(),
+            "a plain tool success must not finalize the error, got {:?}",
+            error.semantic
+        );
+    }
+
+    // The SAME recipe succeeding is the one proof that finalizes.
+    verify_observation_for_recipe(&engine, "4", "tests passed in AuthService.rs", "auth.tests")
+        .await;
+    engine
+        .maintain(ContextMaintenanceTrigger::AfterTool)
+        .await
+        .unwrap();
+    {
+        let state = engine.state.lock().await;
+        let error = state
+            .items
+            .iter()
+            .find(|item| item.kind == ContextKind::Error);
+        assert!(
+            error.is_none_or(|item| item.semantic.is_dead()),
+            "the same recipe's success must finalize the error"
+        );
+    }
+}
+
+#[tokio::test]
+async fn verification_requires_the_same_task_revision_and_definition_across_restore_and_tiers() {
+    for tier in ["resident", "warm", "external"] {
+        let dir = tempfile::tempdir().unwrap();
+        let engine = SimpleContextEngine::new(SimpleContextConfig {
+            context_store_dir: Some(dir.path().to_owned()),
+            ..SimpleContextConfig::default()
+        });
+        let task = open_focus(&engine, "task A").await;
+        verify_failure_observation(
+            &engine,
+            "failed",
+            "failure in AuthService.rs:42",
+            "auth.tests",
+        )
+        .await;
+        let id = {
+            let mut state = engine.state.lock().await;
+            let item = state
+                .items
+                .iter()
+                .find(|item| item.kind == ContextKind::Error)
+                .unwrap()
+                .clone();
+            if tier != "resident" {
+                let kept = state
+                    .items
+                    .iter()
+                    .filter(|row| row.id != item.id)
+                    .cloned()
+                    .collect();
+                state.items.replace_all(kept);
+                if tier == "warm" {
+                    state.eviction_buffer.push(item.clone());
+                } else {
+                    let reference = crate::store::externalize(dir.path(), &item).unwrap();
+                    state.external.push(crate::store::to_external_entry(
+                        &item, reference, 1, 1, None,
+                    ));
+                }
+            }
+            item.id
+        };
+        engine
+            .restore(engine.checkpoint().await.unwrap())
+            .await
+            .unwrap();
+        for (revision, digest, other_task) in [
+            ("v2", "definition-v1", false),
+            ("v1", "narrower-coverage", false),
+            ("v1", "definition-v1", true),
+        ] {
+            if other_task {
+                open_focus(&engine, "task B").await;
+            }
+            engine
+                .ingest(ContextIngress::ToolObservation {
+                    facts: Some(Box::new(verification_facts("auth.tests", revision, digest))),
+                    output: ToolOutput {
+                        call_id: "pass".into(),
+                        tool_name: "verify.run".into(),
+                        ok: true,
+                        summary: "pass".into(),
+                        model_content: "pass".into(),
+                        artifact_ref: None,
+                        metadata: serde_json::json!({"recipe_id": "auth.tests"}),
+                    },
+                    scope_id: None,
+                })
+                .await
+                .unwrap();
+            assert!(
+                !engine
+                    .state
+                    .lock()
+                    .await
+                    .pending_verifications
+                    .iter()
+                    .any(|row| row.0 == id),
+                "{tier}: unrelated PASS queued a terminal transition"
+            );
+        }
+        engine
+            .ingest(ContextIngress::FocusChanged {
+                focus: agent_contracts::FocusState::for_task(task, "task A"),
+            })
+            .await
+            .unwrap();
+        verify_observation(&engine, "valid-pass", "fixed").await;
+        assert!(
+            engine
+                .state
+                .lock()
+                .await
+                .pending_verifications
+                .iter()
+                .any(|row| row.0 == id),
+            "{tier}: matching PASS must reach the original fault"
+        );
+        engine
+            .restore(engine.checkpoint().await.unwrap())
+            .await
+            .unwrap();
+        assert!(
+            engine
+                .maintain(ContextMaintenanceTrigger::AfterTool)
+                .await
+                .unwrap()
+                .transitions
+                .iter()
+                .any(|row| row.item_id == id && row.reason.contains("verified fixed")),
+            "{tier}: valid queued evidence must survive restore"
+        );
+    }
+}
+
+#[tokio::test]
+async fn legacy_pending_verification_cannot_bypass_probe_validation_after_restore() {
+    let engine = SimpleContextEngine::new(SimpleContextConfig::default());
+    open_focus(&engine, "legacy task").await;
+    verify_failure_observation(&engine, "failed", "failure", "auth.tests").await;
+    tool_observation(&engine, "unrelated", "apparently passed").await;
+    let id = {
+        let mut state = engine.state.lock().await;
+        let id = state
+            .items
+            .iter()
+            .find(|item| item.kind == ContextKind::Error)
+            .unwrap()
+            .id;
+        let by = state
+            .items
+            .iter()
+            .find(|item| item.kind == ContextKind::ToolObservation)
+            .unwrap()
+            .id;
+        state
+            .pending_verifications
+            .push((id, by, "legacy broad match".into()));
+        id
+    };
+    engine
+        .restore(engine.checkpoint().await.unwrap())
+        .await
+        .unwrap();
+    engine
+        .maintain(ContextMaintenanceTrigger::AfterTool)
+        .await
+        .unwrap();
+    assert!(
+        !engine
+            .state
+            .lock()
+            .await
+            .items
+            .iter()
+            .find(|item| item.id == id)
+            .unwrap()
+            .semantic
+            .is_dead()
+    );
+}
+
+#[tokio::test]
+async fn overlapping_error_text_is_not_a_recurrence_identity() {
+    let engine = SimpleContextEngine::new(SimpleContextConfig::default());
+    open_focus(&engine, "fix auth").await;
+    failed_observation(
+        &engine,
+        "one",
+        "error in AuthService.rs:42: missing password",
+    )
+    .await;
+    failed_observation(&engine, "two", "error in AuthService.rs:42: invalid token").await;
+    let state = engine.state.lock().await;
+    assert!(state.pending_supersessions.is_empty());
+    assert_eq!(
+        state
+            .items
+            .iter()
+            .filter(|item| item.kind == ContextKind::Error && !item.semantic.is_dead())
+            .count(),
+        2
     );
 }
 

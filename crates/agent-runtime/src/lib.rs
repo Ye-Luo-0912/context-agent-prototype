@@ -31,6 +31,7 @@ mod sink;
 mod surface;
 pub mod task;
 mod verification;
+pub mod work;
 
 pub use actor::spawn_runtime;
 pub use budget::{
@@ -55,15 +56,18 @@ pub use modules::{
     ApprovalModule, ArtifactModule, ContextModule, EventModule, ModelModule, ToolModule,
 };
 pub use platform::{
-    AuthenticatedOperationControlAdapter, BoundSessionAuthorizer,
+    AuthenticatedOperationControlAdapter, BoundSessionAuthorizer, BoundWorkSessionAuthorizer,
     MAX_OPERATION_CONTROL_ENVELOPE_BYTES, MAX_OPERATION_CONTROL_SESSIONS,
-    OperationAcceptedSubscription, OperationControlAction, OperationControlAuthorization,
-    OperationControlAuthorizationRequest, OperationControlAuthorizer, OperationControlGrant,
-    OperationControlRouter, OperationControlSessionRegistry,
+    MAX_WORK_CONTROL_SESSIONS, OperationAcceptedSubscription, OperationControlAction,
+    OperationControlAuthorization, OperationControlAuthorizationRequest,
+    OperationControlAuthorizer, OperationControlGrant, OperationControlRouter,
+    OperationControlSessionRegistry, WorkControlAction, WorkControlAuthorization,
+    WorkControlAuthorizationRequest, WorkControlAuthorizer, WorkControlGrant, WorkControlRouter,
+    WorkControlSessionRegistry,
 };
 pub use plugin::{
-    HookRef, HookView, PLUGIN_TEST_OUTPUT_TAIL_CHARS, PLUGIN_TEST_TIMEOUT, PluginPackageView,
-    PluginRegistry, PluginTestReport, PluginTestResult, SkillView,
+    HookRef, HookView, MAX_SKILL_BODY_BYTES, PLUGIN_TEST_OUTPUT_TAIL_CHARS, PLUGIN_TEST_TIMEOUT,
+    PluginPackageView, PluginRegistry, PluginTestReport, PluginTestResult, SkillBody, SkillView,
 };
 pub use prompt::{
     PromptAssembler, SettlementProjectionPreflight, compare_settlement_projection,
@@ -76,3 +80,4 @@ pub use task::{
     TaskStatus, TaskToolRequirementSet, anchor_root_claims, task_anchor_view,
 };
 pub use verification::{ProofVerifier, ProofVerifierOutcome, ProofVerifierRequest};
+pub use work::{RuntimeStatusSnapshot, WorkSubmission, WorkSubmissionDisposition};

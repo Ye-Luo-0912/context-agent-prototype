@@ -1,0 +1,10 @@
+{
+  "artifact_validation_only": true,
+  "task_count": 12,
+  "findings_count": 10,
+  "source_path_count": 19,
+  "task_dependency_graph": "acyclic",
+  "source_ids": "resolved",
+  "json_files": "parsed",
+  "repository_tests": "NOT_RUN"
+}

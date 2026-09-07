@@ -1527,6 +1527,12 @@ async fn compose_cell(
         effect_reservation_journal: None,
         verification_recipes: Some(Arc::new((*verification_recipes).clone())),
         project_proof_refresh: true,
+        // Harness compositions never arm Unix host-death containment (no
+        // watchdog dispatch in this executable).
+        host_death_watchdog: false,
+        // Harness/eval compositions register no external capabilities by default.
+        mcp_servers: Vec::new(),
+        plugins: None,
     })
     .await?;
     composed.instance.start().await?;

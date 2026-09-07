@@ -1,0 +1,20 @@
+﻿id,path,ref,requested_ranges,coverage,source_references
+S01,docs/NEXT_TASKS.md,b299c6a08fdb055a0148a24dea65053861df6ff1,"[[1, 220]]",partial_response_truncated,turn271file0
+S02,crates/agent-process/src/watchdog.rs,b299c6a08fdb055a0148a24dea65053861df6ff1,"[[1, 330]]",full_body_returned,turn273file0
+S03,crates/tool-runtime/src/supervision.rs,b299c6a08fdb055a0148a24dea65053861df6ff1,"[[1, 380]]",full_body_returned,turn275file0
+S04,crates/agent-compose/src/lib.rs,b299c6a08fdb055a0148a24dea65053861df6ff1,"[[435, 515], [510, 800]]",ranges_only,turn278file0;turn277file0
+S05,crates/agent-tui/src/cli.rs,b299c6a08fdb055a0148a24dea65053861df6ff1,"[[1, 400]]",ranges_only,turn279file0
+S06,crates/agent-storage/src/lib.rs,b299c6a08fdb055a0148a24dea65053861df6ff1,"[[305, 500], [670, 965]]",ranges_only,turn282file0;turn281file0
+S07,crates/agent-core/src/operation.rs,b299c6a08fdb055a0148a24dea65053861df6ff1,"[[255, 305]]",ranges_only,turn283file0
+S08,crates/agent-workspace/src/lib.rs,b299c6a08fdb055a0148a24dea65053861df6ff1,"[[1, 300], [325, 525]]",ranges_only,turn284file0;turn285file0
+S09,crates/agent-runtime/src/status.rs,b299c6a08fdb055a0148a24dea65053861df6ff1,"[[1, 245]]",production_body_returned_tests_not_reviewed,turn286file0
+S10,crates/agent-tui/src/work.rs,b299c6a08fdb055a0148a24dea65053861df6ff1,[],full_body_returned,turn287file0
+S11,crates/agent-runtime/src/platform/session.rs,b299c6a08fdb055a0148a24dea65053861df6ff1,"[[145, 310]]",ranges_only,turn288file0
+S12,crates/agent-process/src/lifecycle.rs,b299c6a08fdb055a0148a24dea65053861df6ff1,[],full_body_returned,turn289file0
+S13,crates/context-simple/src/gc/reachability.rs,b299c6a08fdb055a0148a24dea65053861df6ff1,"[[1, 250]]",ranges_only,turn290file0
+S14,crates/context-simple/src/engine.rs,b299c6a08fdb055a0148a24dea65053861df6ff1,"[[930, 1070], [1535, 1655]]",ranges_only,turn291file0;turn300file0
+S15,crates/tool-runtime/src/proof_runner.rs,b299c6a08fdb055a0148a24dea65053861df6ff1,"[[1, 150]]",ranges_only,turn293file0
+S16,crates/tool-runtime/src/tools/process.rs,b299c6a08fdb055a0148a24dea65053861df6ff1,"[[1, 180], [595, 660], [665, 895], [985, 1170]]",ranges_only,turn294file0;turn298file0;turn297file0;turn299file0
+S17,crates/agent-contracts/src/input.rs,b299c6a08fdb055a0148a24dea65053861df6ff1,"[[1, 175]]",ranges_only,turn303file0
+S18,crates/agent-runtime/src/command.rs,b299c6a08fdb055a0148a24dea65053861df6ff1,"[[1, 240]]",ranges_only,turn304file0
+S19,crates/agent-process/src/session.rs,b299c6a08fdb055a0148a24dea65053861df6ff1,"[[1, 85]]",ranges_only,turn305file0

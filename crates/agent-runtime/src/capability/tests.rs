@@ -1,8 +1,9 @@
 use super::*;
 use agent_contracts::{
     ArgumentDigest, CancellationToken, CapabilityKind, ContextAction, EffectId, EffectReconciler,
-    EffectReconciliation, OperationId, RunId, RuntimeDirective, ToolCall, ToolOperationIdentity,
-    ToolOutput, ToolRisk, TurnId, WORKSPACE_WRITE,
+    EffectReconciliation, OperationId, PluginPackageManifest, RunId, RuntimeDirective,
+    SkillActivation, SkillDeclaration, SkillSource, ToolCall, ToolOperationIdentity, ToolOutput,
+    ToolRisk, TurnId, VersionRange, WORKSPACE_WRITE,
 };
 use std::{
     sync::{Mutex, mpsc},
@@ -1198,4 +1199,86 @@ fn unrelated_loads_never_cool_sibling_tools() {
         Some(agent_contracts::ToolLifecycle::Loaded),
         "unrelated load churn must not cool an idle sibling"
     );
+}
+
+/// E1: `capability.manage read_skill` serves an ACTIVE skill's bounded
+/// body from the wired plugin catalog, and refuses (not empty-returns)
+/// when no catalog is configured.
+#[tokio::test]
+async fn read_skill_serves_an_active_body_and_refuses_without_a_catalog() {
+    let manage = |id: &str, name: &str| ToolExecutionRequest {
+        run_id: RunId::new(),
+        call: ToolCall {
+            id: format!("call-{id}"),
+            name: "capability.manage".into(),
+            arguments: json!({"op": "read_skill", "name": name}),
+        },
+        effect_context: None,
+        cancel: CancellationToken::new(),
+    };
+    let outcome_output = |outcome: AgentResult<ToolOutcome>| -> ToolOutput {
+        match outcome.expect("execute succeeds") {
+            ToolOutcome::Value(output) => output,
+            other => panic!("expected a value outcome, got {other:?}"),
+        }
+    };
+
+    // No catalog wired: an explicit refusal, never an empty success.
+    let bare =
+        CapabilityAwareDispatcher::new(Arc::new(EmptyBase), Arc::new(CapabilityRegistry::new()));
+    let output = outcome_output(bare.execute(manage("bare", "howto")).await);
+    assert!(!output.ok, "{output:?}");
+    assert!(output.summary.contains("no plugin catalog"), "{output:?}");
+
+    // A wired catalog with one active skill on disk.
+    let directory = tempfile::tempdir().unwrap();
+    std::fs::write(
+        directory.path().join("howto.md"),
+        "# howto\nuse fs.read first",
+    )
+    .unwrap();
+    let plugins = Arc::new(crate::PluginRegistry::new());
+    plugins
+        .install_from_root(
+            PluginPackageManifest {
+                id: "pack".into(),
+                version: "1.0.0".into(),
+                name: "pack".into(),
+                summary: "test package".into(),
+                api: VersionRange("0.1".into()),
+                tools: Vec::new(),
+                skills: vec![SkillDeclaration {
+                    id: "howto".into(),
+                    version: "1.0.0".into(),
+                    summary: "how-to".into(),
+                    reference: "howto.md".into(),
+                    provenance: SkillSource::Package,
+                    activation: SkillActivation::Inactive,
+                }],
+                hooks: Vec::new(),
+                adapters: Vec::new(),
+                dependencies: Vec::new(),
+                permissions: vec!["workspace:read".into()],
+                tests: Vec::new(),
+            },
+            directory.path().to_path_buf(),
+        )
+        .expect("install succeeds");
+    plugins.enable("pack").unwrap();
+    plugins.activate_skill("pack", "howto").unwrap();
+
+    let dispatcher =
+        CapabilityAwareDispatcher::new(Arc::new(EmptyBase), Arc::new(CapabilityRegistry::new()))
+            .with_plugin_registry(plugins.clone());
+    let output = outcome_output(dispatcher.execute(manage("ok", "howto")).await);
+    assert!(output.ok, "{output:?}");
+    assert_eq!(output.model_content, "# howto\nuse fs.read first");
+    assert_eq!(output.metadata["package"], "pack");
+    assert_eq!(output.metadata["provenance"], "package");
+    assert_eq!(output.metadata["body_bytes"], 25);
+
+    // An unknown skill is a typed refusal, not an empty body.
+    let output = outcome_output(dispatcher.execute(manage("missing", "nope")).await);
+    assert!(!output.ok, "{output:?}");
+    assert!(output.summary.contains("unknown skill"), "{output:?}");
 }

@@ -692,6 +692,17 @@ pub struct ContextItem {
     pub lease_until_turn: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub source: Option<String>,
+    /// The host-stamped check whose FAILED run recorded this error. Only a
+    /// success in the same task with the same recipe definition and coverage
+    /// can finalize it. Source inputs may change during the fix. Legacy
+    /// checkpoints carrying only a recipe name load without this association
+    /// and remain live; output text cannot recreate the missing proof.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "crate::execution_facts::deserialize_verification_probe"
+    )]
+    pub verify_recipe: Option<crate::VerificationProbe>,
     /// GC dimension: whether the item is in the model-visible heap or in the
     /// reversible eviction buffer. Set by the GC pass, not by the semantic
     /// residency machine.
@@ -2385,6 +2396,17 @@ pub struct ExternalizedContext {
     /// existed.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub source: Option<String>,
+    /// The trusted verification recipe association captured at externalize
+    /// time (see [`ContextItem::verify_recipe`]). Kept on the entry so an
+    /// externalized error can still be finalized only by a later success
+    /// of its own recipe (M17-B3/F08). `None` for entries externalized
+    /// before the field existed.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "crate::execution_facts::deserialize_verification_probe"
+    )]
+    pub verify_recipe: Option<crate::VerificationProbe>,
     /// 外部化时的打分权重（importance/relevance），随条目保留：inspect
     /// 能如实反映外部条目的候选价值，而不是固定 0.0。这是 ContextCatalog
     /// 统一权威元数据的前置——外部化不得把权威降级。
@@ -2921,6 +2943,7 @@ mod tests {
             last_access_gc_epoch: Some(0),
             blob_checksum: None,
             source: None,
+            verify_recipe: None,
             importance: 0.0,
             relevance: 0.0,
             created_tick: 0,
@@ -2937,6 +2960,14 @@ mod tests {
             file_start_line: None,
             file_end_line: None,
         }
+    }
+
+    #[test]
+    fn legacy_recipe_id_loads_without_becoming_a_verification_probe() {
+        let mut legacy = serde_json::to_value(ref_entry()).unwrap();
+        legacy["verify_recipe"] = serde_json::json!("auth.tests");
+        let entry: ExternalizedContext = serde_json::from_value(legacy).unwrap();
+        assert!(entry.verify_recipe.is_none());
     }
 
     #[test]

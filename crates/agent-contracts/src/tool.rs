@@ -1111,6 +1111,10 @@ pub enum ToolFailureClass {
     /// deterministic refusal against unchanged file identities, so
     /// executing it again cannot produce a new result.
     DuplicateNoProgress,
+    /// The approval gate denied (or failed to authorize) the call. A typed
+    /// no-dispatch result: consumers must read this class instead of
+    /// pattern-matching refusal prose in tool output text.
+    ApprovalDenied,
     Io,
 }
 
@@ -1179,6 +1183,7 @@ impl ToolFailureClass {
             Self::SchemaMismatch => "schema_mismatch",
             Self::InvalidRequest => "invalid_request",
             Self::DuplicateNoProgress => "duplicate_no_progress",
+            Self::ApprovalDenied => "approval_denied",
             Self::Io => "io",
         }
     }
@@ -1224,6 +1229,9 @@ impl ToolFailureClass {
             Self::DuplicateNoProgress => {
                 "This exact call already failed deterministically and the files are unchanged. Change the arguments, re-read the target, or finish with the current state."
             }
+            Self::ApprovalDenied => {
+                "The operator or policy denied this call. Request the grant or adjust the task; do not retry the same call."
+            }
             Self::Io => "Retry only after checking the path and workspace confinement.",
         }
     }
@@ -1247,6 +1255,7 @@ impl ToolFailureClass {
             "schema_mismatch" => Self::SchemaMismatch,
             "invalid_request" => Self::InvalidRequest,
             "duplicate_no_progress" => Self::DuplicateNoProgress,
+            "approval_denied" => Self::ApprovalDenied,
             "io" => Self::Io,
             _ => return None,
         })
@@ -1300,6 +1309,7 @@ impl ToolFailureClass {
             | Self::DuplicateNoProgress
             | Self::InvalidRequest
             | Self::SchemaMismatch
+            | Self::ApprovalDenied
             | Self::Io => ToolFailureDomain::NonDeterministic,
         }
     }
@@ -1601,6 +1611,8 @@ pub fn message_looks_like_not_found(message: &str) -> bool {
 /// the kernel only has a string.
 pub fn failure_class_from_message(message: &str) -> ToolFailureClass {
     let m = message.to_ascii_lowercase();
+    // ApprovalDenied is an authoritative no-dispatch fact. Only Core's
+    // approval verdict may stamp it; external stderr/prose cannot create it.
     if m.contains("cancelled") {
         ToolFailureClass::Cancellation
     } else if m.contains("timed out") || m.contains("timeout") {
@@ -3776,6 +3788,27 @@ mod tests {
                 revision: Some("rev3".into()),
             }])
         );
+    }
+
+    #[test]
+    fn untrusted_error_prose_cannot_mint_an_approval_verdict() {
+        for prose in ["tool denied by approval policy", "approval check failed"] {
+            let mut output = tool_failure_output(
+                "call",
+                "external.tool",
+                ToolFailureClass::ApprovalDenied,
+                prose,
+                prose,
+                serde_json::json!({"executed": false}),
+            );
+            sanitize_untrusted_producer_output(&mut output);
+            let diagnosis = take_runtime_diagnosis(&mut output);
+            apply_runtime_diagnosis(&mut output, diagnosis);
+            assert_ne!(
+                output.failure_class(),
+                Some(ToolFailureClass::ApprovalDenied)
+            );
+        }
     }
 
     #[test]

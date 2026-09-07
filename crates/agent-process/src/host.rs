@@ -1299,6 +1299,9 @@ pub fn kill_process_tree(pid: u32) {
     }
     #[cfg(unix)]
     {
+        if pid > i32::MAX as u32 {
+            return;
+        }
         // Negative pid = the process group. Production children are spawned
         // as group leaders (`process_group(0)`), so their pgid == their pid
         // and SIGKILL to -pid reaches the whole tree. ESRCH means the child
@@ -1309,25 +1312,7 @@ pub fn kill_process_tree(pid: u32) {
     }
     #[cfg(windows)]
     {
-        // `taskkill /T` walks the tree from the pid; `/F` force-kills.
-        let _ = std::process::Command::new("taskkill")
-            .args(["/PID", &pid.to_string(), "/T", "/F"])
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .status();
-        // taskkill 可能被沙箱挡住或不在 PATH 里；根 PID 再用
-        // TerminateProcess 钉死，避免恢复路径把仍存活的孩子当成成功。
-        unsafe {
-            use windows_sys::Win32::Foundation::CloseHandle;
-            use windows_sys::Win32::System::Threading::{
-                OpenProcess, PROCESS_TERMINATE, TerminateProcess,
-            };
-            let handle = OpenProcess(PROCESS_TERMINATE, 0, pid);
-            if !handle.is_null() {
-                let _ = TerminateProcess(handle, 1);
-                let _ = CloseHandle(handle);
-            }
-        }
+        crate::lifecycle::windows_kill_process_tree(pid);
     }
     #[cfg(not(any(unix, windows)))]
     {}

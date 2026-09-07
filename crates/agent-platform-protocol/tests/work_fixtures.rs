@@ -10,19 +10,17 @@
 use std::path::PathBuf;
 
 use agent_platform_protocol::{
-    ApprovalRespondOutcome, ApprovalRespondRequest, ApprovalRespondResponse, Attempt, DeadlineRemainingMs, EnvelopeKind, MessageId, NegotiatedContractProfile,
-    PlatformEnvelope, PlatformResponse, ProtocolIdentity, ProtocolVersion, RequestId, Route,
-    SchemaDigest, TaskSnapshotStatus, WorkSnapshotRequest,
-    WorkSnapshotResponse, WorkSubscribeRequest, WorkSubscribeResponse, WorkSubmitDisposition,
-    WorkSubmitRequest, WorkSubmitResponse, WorkContinueRequest, WorkContinueResponse,
-    WorkCancelRequest, WorkCancelResponse,
-    validate_approval_respond_request,
-    validate_approval_respond_response, validate_work_cancel_request,
-    validate_work_cancel_response, validate_work_continue_request,
+    ApprovalRespondOutcome, ApprovalRespondRequest, ApprovalRespondResponse, Attempt,
+    DeadlineRemainingMs, EnvelopeKind, MessageId, NegotiatedContractProfile, PlatformEnvelope,
+    PlatformResponse, ProtocolIdentity, ProtocolVersion, RequestId, Route, SchemaDigest,
+    TaskSnapshotStatus, WorkCancelRequest, WorkCancelResponse, WorkContinueRequest,
+    WorkContinueResponse, WorkSnapshotRequest, WorkSnapshotResponse, WorkSubmitDisposition,
+    WorkSubmitRequest, WorkSubmitResponse, WorkSubscribeRequest, WorkSubscribeResponse,
+    validate_approval_respond_request, validate_approval_respond_response,
+    validate_work_cancel_request, validate_work_cancel_response, validate_work_continue_request,
     validate_work_continue_response, validate_work_snapshot_request,
-    validate_work_snapshot_response, validate_work_subscribe_request,
-    validate_work_subscribe_response, validate_work_submit_request,
-    validate_work_submit_response,
+    validate_work_snapshot_response, validate_work_submit_request, validate_work_submit_response,
+    validate_work_subscribe_request, validate_work_subscribe_response,
 };
 use std::str::FromStr;
 
@@ -56,8 +54,10 @@ fn profile() -> NegotiatedContractProfile {
 
 /// Re-encoding must be byte-identical: field order, skipping, and enum
 /// casing are all wire contract, not implementation detail.
-fn assert_round_trip_is_byte_identical<T: DeserializeOwned + serde::Serialize>(text: &str, name: &str)
-where
+fn assert_round_trip_is_byte_identical<T: DeserializeOwned + serde::Serialize>(
+    text: &str,
+    name: &str,
+) where
     T: PartialEq + std::fmt::Debug,
 {
     let decoded: T = serde_json::from_str(text)
@@ -74,7 +74,10 @@ where
 fn request_pair<TRequest, TResponse>(
     request_name: &str,
     response_name: &str,
-    validate_request: fn(&NegotiatedContractProfile, &PlatformEnvelope<TRequest>) -> agent_platform_protocol::ValidationResult<()>,
+    validate_request: fn(
+        &NegotiatedContractProfile,
+        &PlatformEnvelope<TRequest>,
+    ) -> agent_platform_protocol::ValidationResult<()>,
     validate_response: fn(
         &NegotiatedContractProfile,
         &PlatformEnvelope<TRequest>,
@@ -133,7 +136,10 @@ fn error_fixture_carries_the_structured_conflict_fact() {
         panic!("error_response.json must carry an error body");
     };
     assert_eq!(error.code, "work.goal_conflict");
-    assert_eq!(error.retry, agent_platform_protocol::RetryDisposition::Never);
+    assert_eq!(
+        error.retry,
+        agent_platform_protocol::RetryDisposition::Never
+    );
     error.validate().unwrap();
 }
 

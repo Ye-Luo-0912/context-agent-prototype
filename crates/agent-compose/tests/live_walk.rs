@@ -200,6 +200,12 @@ async fn product_compose(
         effect_reservation_journal: Some(reservation_journal),
         verification_recipes: Some(recipes),
         project_proof_refresh: has_recipes,
+        // Harness compositions never arm Unix host-death containment (no
+        // watchdog dispatch in this executable).
+        host_death_watchdog: false,
+        // Harness/eval compositions register no external capabilities by default.
+        mcp_servers: Vec::new(),
+        plugins: None,
     })
     .await
 }
@@ -306,7 +312,7 @@ async fn continue_when_idle(handle: &RuntimeHandle) -> anyhow::Result<()> {
     let deadline = Instant::now() + Duration::from_secs(30);
     loop {
         match handle.continue_active_task().await {
-            Ok(()) => return Ok(()),
+            Ok(_) => return Ok(()),
             Err(error) => {
                 if Instant::now() >= deadline {
                     anyhow::bail!("continue_active_task never accepted: {error}");

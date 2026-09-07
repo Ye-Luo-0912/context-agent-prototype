@@ -549,6 +549,7 @@ fn project_item(item: &ContextItem) -> ExternalizedContext {
         last_access_gc_epoch: None,
         blob_checksum: None,
         source: item.source.clone(),
+        verify_recipe: item.verify_recipe.clone(),
         importance: item.importance,
         relevance: item.relevance,
         created_tick: item.created_tick,
@@ -908,6 +909,8 @@ pub(crate) fn to_external_entry(
         // 来源权威随条目一起外部化：检索/审查能看到条目来自哪里，
         // 无需读 store 文件；admit/fetch 的权威校验以此为前提。
         source: item.source.clone(),
+        // 验证配方关联随条目外部化：外置错误仍只能被同配方成功终结。
+        verify_recipe: item.verify_recipe.clone(),
         // 完整保留打分/时钟/世代权威元数据：外部化只搬运 body 到 store，
         // 权威元数据不得降级（inspect 如实投影，recall 后从原值继续）。
         importance: item.importance,
@@ -1031,21 +1034,28 @@ pub(crate) fn plan_storage_gc(
                 .map(|edge| edge.target)
         })
         .collect();
-    loop {
-        let mut grew = false;
-        for entry in &state.external {
-            let contributes = referenced.contains(&entry.item_id) || non_deletable(entry);
-            if !contributes {
-                continue;
-            }
-            for edge in &entry.dependencies {
-                if edge.kind.protects_storage() && referenced.insert(edge.target) {
-                    grew = true;
-                }
-            }
+    // Root the retained record itself before walking its citations. In
+    // particular, a dead record kept by StorageRequired still owns evidence.
+    // A worklist visits each edge once; repeated whole-map scans are quadratic
+    // on a reverse-ordered chain of historical records.
+    for entry in &state.external {
+        let anchor_required = state.anchor_roots.iter().any(|claim| {
+            claim.strength.requires_storage()
+                && crate::engine::anchor_claim_matches_entry(claim, entry)
+        });
+        if non_deletable(entry) || anchor_required {
+            referenced.insert(entry.item_id);
         }
-        if !grew {
-            break;
+    }
+    let mut frontier: Vec<_> = referenced.iter().copied().collect();
+    while let Some(id) = frontier.pop() {
+        let Some(entry) = state.external.get(id) else {
+            continue;
+        };
+        for edge in &entry.dependencies {
+            if edge.kind.protects_storage() && referenced.insert(edge.target) {
+                frontier.push(edge.target);
+            }
         }
     }
 
@@ -2004,6 +2014,53 @@ mod tests {
     /// root: it cannot be deleted, and its strong edges must keep its
     /// evidence targets alive. The weak-edge counterpart is covered by
     /// `weak_shares_edges_never_protect...`.
+    #[test]
+    fn storage_required_anchor_protects_its_transitive_evidence() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = store_config(dir.path());
+        let mut state = State::default();
+        let mut root = test_item(ContextItemId::new(), "retired but still required receipt");
+        let mut middle = test_item(ContextItemId::new(), "retired intermediate evidence");
+        let mut leaf = test_item(ContextItemId::new(), "retired source evidence");
+        let mut weak = test_item(ContextItemId::new(), "unreferenced affinity");
+        root.dependencies.push(DependencyEdge {
+            target: middle.id,
+            kind: agent_contracts::DependencyKind::EvidenceFor,
+        });
+        middle.dependencies.push(DependencyEdge {
+            target: leaf.id,
+            kind: agent_contracts::DependencyKind::DerivedFrom,
+        });
+        root.dependencies.push(DependencyEdge::shares(weak.id));
+        for item in [&mut root, &mut middle, &mut leaf, &mut weak] {
+            item.semantic = SemanticState::Tombstoned;
+            let reference = externalize(dir.path(), item).unwrap();
+            state
+                .external
+                .push(to_external_entry(item, reference, 1, 1, None));
+        }
+        state.anchor_roots.push(agent_contracts::AnchorRootClaim {
+            item_ref: root.id.to_string(),
+            strength: agent_contracts::AnchorRootStrength::StorageRequired,
+            source_field_id: "evidence_refs".into(),
+            anchor_revision: 2,
+            reason: agent_contracts::RootReason::CompletionEvidence,
+        });
+        let report = run_storage_gc(&mut state, &config, 100);
+        assert_eq!(
+            report.deleted, 1,
+            "only weak affinity may be deleted: {report:?}"
+        );
+        for id in [root.id, middle.id, leaf.id] {
+            assert!(file_path(dir.path(), id).is_file());
+            assert!(
+                state.external.get(id).unwrap().semantic.is_dead(),
+                "storage protection cannot revive semantics"
+            );
+        }
+        assert!(!file_path(dir.path(), weak.id).exists());
+    }
+
     #[test]
     fn storage_gc_roots_live_stored_records_through_strong_edges() {
         let dir = tempfile::tempdir().unwrap();

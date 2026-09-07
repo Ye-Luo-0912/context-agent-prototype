@@ -23,6 +23,9 @@
 //! is `RESULT:PASS` or `RESULT:FAIL`.
 
 fn main() {
+    if agent_process::watchdog::run_if_armed_and_exit() {
+        return;
+    }
     let args: Vec<String> = std::env::args().collect();
     match args.as_slice() {
         [_, cmd, path, bytes] if cmd == "fsize" => fsize_main(path, bytes),

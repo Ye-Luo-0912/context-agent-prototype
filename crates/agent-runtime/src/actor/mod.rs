@@ -57,8 +57,7 @@ use crate::sink::LiveSink;
 use crate::surface::{RoundSurfacePlan, SurfaceReportContext};
 use crate::task::{
     AnchorPatch, CompletionBlocker, CompletionIntent, CompletionReadiness, CompletionSafety,
-    TaskManager, changed_fields_kind, derive_completion_readiness, normalize_tool_requirements,
-    validate_completion_proposal,
+    TaskManager, changed_fields_kind, derive_completion_readiness, validate_completion_proposal,
 };
 
 mod commands;
@@ -1345,6 +1344,11 @@ struct ActorState {
     discovery_budget: DiscoveryTurnBudget,
     /// 周转中最多一条待处理对话（CTX-EVENT-02）。进程内有效，不进 checkpoint。
     pending_user_input: Option<QueuedUserDialogue>,
+    /// Bounded process-lifetime work-submission ledger backing the P1
+    /// idempotent-retry receipts. Deliberately not checkpoint authority: a
+    /// restarted runtime treats old client request ids as unknown, and the
+    /// caller must query instead of assuming exactly-once.
+    work_submissions: VecDeque<crate::work::WorkSubmissionRecord>,
     /// Coalesced reasons the next settled batch owes a durable resume
     /// checkpoint. Read-only exploration leaves this empty.
     checkpoint_debt: Vec<crate::checkpoint::CheckpointDebtReason>,

@@ -423,6 +423,24 @@ pub struct ComposeConfig {
     /// false). Requires `verification_recipes`: a true flag without the table
     /// fails the composition closed instead of silently disabling.
     pub project_proof_refresh: bool,
+    /// M17-B1: the caller's Unix host-death containment decision. The
+    /// composition root injects the SAME policy into the host proof lane
+    /// that the caller gave the tool dispatcher, so a plain dispatcher with
+    /// containment armed never coexists with an unwired proof runner
+    /// (F03). Only a binary whose `main` dispatches on
+    /// `agent_process::watchdog::WATCHDOG_ENV` may set this.
+    pub host_death_watchdog: bool,
+    /// E1: MCP stdio servers to connect, discover and register as
+    /// capabilities before the modules start. Each declaration is
+    /// discovered once at startup (fail-closed: a server that cannot be
+    /// reached fails the composition); its tools enter the on-demand
+    /// capability catalog and are loaded per task like any other
+    /// capability — never injected wholesale into a request.
+    pub mcp_servers: Vec<agent_capability_process::McpServerDecl>,
+    /// E1: the installed plugin catalog. Wired into the capability
+    /// dispatcher so `capability.manage read_skill` can serve on-demand,
+    /// bounded skill bodies. `None` (default) leaves skill reads refused.
+    pub plugins: Option<Arc<agent_runtime::PluginRegistry>>,
 }
 
 /// A composed runtime. Owns the workspace and the spawned `RuntimeInstance`
@@ -488,6 +506,9 @@ pub async fn compose(config: ComposeConfig) -> anyhow::Result<ComposedRuntime> {
         effect_reservation_journal,
         verification_recipes,
         project_proof_refresh,
+        host_death_watchdog,
+        mcp_servers,
+        plugins,
     } = config;
 
     // 授权映射是组合根的决定：内置表加运维准入的插件绑定，内核与
@@ -496,10 +517,32 @@ pub async fn compose(config: ComposeConfig) -> anyhow::Result<ComposedRuntime> {
         host_policies.unwrap_or_else(|| Arc::new(HostToolPolicyRegistry::with_builtins()));
 
     let mut host = ModuleHost::new();
-    // PROCESS-01: before anything starts, reconcile the host-child
+    // PROCESS-01 / M17-B1: before anything starts, reconcile the host-child
     // supervision ledger — a crashed prior run may have left a verifier or
-    // command process alive; kill it before the workspace is reused.
-    tool_runtime::supervision::reconcile_children(workspace.state_dir());
+    // command process alive. The reconciliation is typed: an unreadable or
+    // corrupt ledger, a row without a usable identity, or a kill whose exit
+    // could not be confirmed all refuse startup instead of being conflated
+    // with "no pending children". The host decides the blocked-recovery
+    // posture; cleanup success is only ever reported after confirmation.
+    let supervision_outcome = tool_runtime::supervision::reconcile_children(workspace.state_dir())
+        .map_err(|error| {
+            anyhow::anyhow!(
+                "supervision ledger at {} could not be reconciled: {error}; \
+                 cannot prove no host child was left behind, refusing to reuse this workspace \
+                 (resolve the ledger manually before starting)",
+                tool_runtime::supervision::ledger_path(workspace.state_dir()).display()
+            )
+        })?;
+    if !supervision_outcome.is_clean() {
+        return Err(anyhow::anyhow!(
+            "supervision ledger holds unresolved host-child records \
+             (unverified: {:?}, unconfirmed: {:?}); resolve these processes manually, then \
+             clear their rows from {} before reusing this workspace",
+            supervision_outcome.unverified,
+            supervision_outcome.unconfirmed,
+            tool_runtime::supervision::ledger_path(workspace.state_dir()).display()
+        ));
+    }
     host.add_module(Arc::new(ContextModule::new(context_engine)))?;
     host.add_module(Arc::new(ModelModule::new(model)))?;
     // The capability registry is the host's: capabilities registered against
@@ -507,18 +550,62 @@ pub async fn compose(config: ComposeConfig) -> anyhow::Result<ComposedRuntime> {
     // model request. The dispatcher must see it before the ToolModule is
     // added.
     let capability_registry = host.capability_registry();
-    let tools: Arc<dyn ToolDispatcher> = if capability_aware {
-        Arc::new(
-            CapabilityAwareDispatcher::with_workspace(
-                base_tools,
-                capability_registry,
-                // Capabilities that declare workspace/artifact permissions
-                // receive confined handles into the same workspace the builtin
-                // tools use.
-                Some(Arc::new(workspace.clone())),
-            )
-            .with_host_policies(host_policies.clone()),
+    // E1: connect, discover and register every configured MCP server before
+    // any module starts — a server that cannot be reached fails the
+    // composition (the operator explicitly configured it), and discovery
+    // only establishes the static manifest: the server child is reaped and
+    // re-spawned lazily on first invoke. Tools enter the on-demand catalog
+    // (loaded per task, never injected wholesale); risk derives from the
+    // DECLARED permissions, never from the server's self-description.
+    for decl in &mcp_servers {
+        let risk = if decl
+            .permissions
+            .iter()
+            .any(|p| p == agent_contracts::WORKSPACE_WRITE)
+        {
+            agent_contracts::ToolRisk::WorkspaceWrite
+        } else {
+            agent_contracts::ToolRisk::ReadOnly
+        };
+        let adapter = agent_capability_process::McpCapabilityAdapter::connect(
+            decl.clone(),
+            risk,
+            agent_capability_process::DEFAULT_MCP_REQUEST_TIMEOUT,
+            agent_capability_process::DEFAULT_MCP_MAX_FRAME_BYTES,
         )
+        .await
+        .map_err(|error| anyhow::anyhow!("MCP server '{}' discovery failed: {error}", decl.id))?;
+        capability_registry
+            .register(Arc::new(adapter))
+            .map_err(|error| {
+                anyhow::anyhow!("MCP capability '{}' registration failed: {error}", decl.id)
+            })?;
+        // The operator's explicit configuration IS the enabling act:
+        // experimental-status capabilities register disabled (fail-closed),
+        // and a configured server must be usable without a second manual
+        // step.
+        capability_registry
+            .set_activation(&decl.id, agent_contracts::CapabilityActivation::Enabled)
+            .await
+            .map_err(|error| {
+                anyhow::anyhow!("MCP capability '{}' could not be enabled: {error}", decl.id)
+            })?;
+    }
+    let tools: Arc<dyn ToolDispatcher> = if capability_aware {
+        let mut dispatcher = CapabilityAwareDispatcher::with_workspace(
+            base_tools,
+            capability_registry,
+            // Capabilities that declare workspace/artifact permissions
+            // receive confined handles into the same workspace the builtin
+            // tools use.
+            Some(Arc::new(workspace.clone())),
+        )
+        .with_host_policies(host_policies.clone());
+        // E1: the plugin catalog backs on-demand skill body reads.
+        if let Some(plugins) = plugins.as_ref() {
+            dispatcher = dispatcher.with_plugin_registry(plugins.clone());
+        }
+        Arc::new(dispatcher)
     } else {
         base_tools
     };
@@ -591,8 +678,12 @@ pub async fn compose(config: ComposeConfig) -> anyhow::Result<ComposedRuntime> {
     // Enabling execution without a table remains a fail-closed boot error.
     match verification_recipes {
         Some(recipes) if !recipes.is_empty() => {
+            // M17-B1: the host proof lane receives the same supervision
+            // policy the caller gave the tool dispatcher — one decision,
+            // both process lanes (F03).
             let runner = tool_runtime::RecipeProofRunner::new(workspace.clone(), recipes)
-                .ok_or_else(|| anyhow::anyhow!("verification recipes register no host policy"))?;
+                .ok_or_else(|| anyhow::anyhow!("verification recipes register no host policy"))?
+                .with_host_death_watchdog(host_death_watchdog);
             services = services.with_proof_verifier(Arc::new(HostProofVerifier::new(runner)));
             if project_proof_refresh {
                 services = services.with_project_proof_refresh(true);
@@ -689,6 +780,11 @@ mod tests {
             effect_reservation_journal: None,
             verification_recipes: recipes,
             project_proof_refresh: refresh,
+            // Test composition: no watchdog dispatch in this executable.
+            host_death_watchdog: false,
+            // Harness/eval compositions register no external capabilities by default.
+            mcp_servers: Vec::new(),
+            plugins: None,
         }
     }
 

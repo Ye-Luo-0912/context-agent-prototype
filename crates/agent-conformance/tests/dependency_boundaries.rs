@@ -121,8 +121,8 @@ const WORKSPACE_PROCESS_EDGE_FILE: &str = "process_journal.rs";
 /// The only `agent-process` symbols the process-journal edge may use.
 const WORKSPACE_PROCESS_SYMBOLS: &[&str] = &[
     "capture_process_identity",
-    "kill_matching_process_tree",
-    "process_identity_matches",
+    "terminate_matching_process_tree",
+    "ProcessCleanupOutcome",
     "ProcessIdentity",
 ];
 

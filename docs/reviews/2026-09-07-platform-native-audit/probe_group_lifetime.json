@@ -1,0 +1,12 @@
+{
+  "kind": "OS_MECHANISM_PROBE_NOT_REPOSITORY_TEST",
+  "platform": "Linux",
+  "child_cleanup_confirmed": true,
+  "leader_pid": 535,
+  "member_pid": 536,
+  "group_id": 535,
+  "leader_reaped": true,
+  "group_member_alive_after_leader_reaped": true,
+  "current_watchdog_leader_alive_predicate": false,
+  "consequence": "the current leader-exists condition would skip signaling this surviving group"
+}

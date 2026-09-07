@@ -733,6 +733,7 @@ mod tests {
             last_access_gc_epoch: Some(1),
             blob_checksum: None,
             source: None,
+            verify_recipe: None,
             importance: 0.0,
             relevance: 0.0,
             created_tick: 0,

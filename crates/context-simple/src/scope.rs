@@ -233,11 +233,20 @@ pub(crate) fn queue_task_scope_close(state: &mut State, task_id: TaskId) {
     // the task and must close with it, or it keeps pointing at scopes that
     // are already closed.
     let mut frontier = vec![task_scope];
+    let mut children = std::collections::HashMap::<ScopeId, Vec<ScopeId>>::new();
+    for scope in &state.scopes {
+        if scope.state != ScopeState::Closed
+            && let Some(parent) = scope.parent
+        {
+            children.entry(parent).or_default().push(scope.id);
+        }
+    }
+    let mut visited = std::collections::HashSet::from([task_scope]);
     while let Some(parent) = frontier.pop() {
-        for scope in &state.scopes {
-            if scope.parent == Some(parent) && scope.state != ScopeState::Closed {
-                state.pending_closed_scopes.push(scope.id);
-                frontier.push(scope.id);
+        for &child in children.get(&parent).into_iter().flatten() {
+            if visited.insert(child) {
+                state.pending_closed_scopes.push(child);
+                frontier.push(child);
             }
         }
     }
@@ -275,7 +284,12 @@ pub(crate) fn drain_closed_scopes(state: &mut State, turn: u64) -> Vec<ContextSt
 /// a closing scope (a focus child of a closing task promotes to the session).
 fn nearest_open_parent(state: &State, scope: &Scope) -> Option<ScopeId> {
     let mut current = scope.parent;
+    let mut remaining = state.scopes.len();
     while let Some(id) = current {
+        if remaining == 0 {
+            return None;
+        }
+        remaining -= 1;
         let closed = state
             .scopes
             .by_id(id)
@@ -495,7 +509,12 @@ fn scope_id_in_subtree(
         return item_scope_id == scope.id;
     }
     let mut current = Some(item_scope_id);
+    let mut remaining = scopes.len();
     while let Some(sid) = current {
+        if remaining == 0 {
+            return false;
+        }
+        remaining -= 1;
         if sid == scope.id {
             return true;
         }

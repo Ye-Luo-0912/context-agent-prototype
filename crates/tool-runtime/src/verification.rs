@@ -368,6 +368,24 @@ impl VerificationRecipes {
         &self.domains
     }
 
+    pub(crate) fn fault_probe(
+        &self,
+        recipe: &VerificationRecipe,
+    ) -> agent_contracts::VerificationProbe {
+        let domain = recipe
+            .coverage_domain
+            .as_deref()
+            .and_then(|id| self.coverage_declaration(id));
+        let value = serde_json::json!({"schema": "verification-fault-probe/v1", "recipe": recipe, "coverage": domain});
+        let canonical = agent_contracts::jcs_serialize(&value)
+            .expect("validated recipe contains canonical JSON values");
+        agent_contracts::VerificationProbe {
+            recipe_id: recipe.id.clone(),
+            recipe_revision: recipe.revision.clone(),
+            definition_digest: format!("sha256-{:x}", Sha256::digest(canonical.as_bytes())),
+        }
+    }
+
     /// Bounded semantic projection consumed by Runtime's completion gate.
     /// The digest covers the canonical domain row and every complete member
     /// recipe, so reusing a revision while changing composition fails closed.
@@ -990,6 +1008,17 @@ mod tests {
         VerificationRecipe::new(id, "desc", revision, vec!["cargo".into(), "test".into()])
             .unwrap()
             .with_exact_current_world_reuse()
+    }
+
+    #[test]
+    fn fault_probe_changes_when_same_revision_recipe_changes_coverage() {
+        let broad = exact_recipe("tests", "v1");
+        let mut narrow = broad.clone();
+        narrow.argv.push("one_test_only".into());
+        let table = VerificationRecipes::new(vec![broad.clone()]).unwrap();
+        assert_ne!(table.fault_probe(&broad), table.fault_probe(&narrow));
+        narrow = broad.clone().with_cwd("subproject").unwrap();
+        assert_ne!(table.fault_probe(&broad), table.fault_probe(&narrow));
     }
 
     fn class_table() -> VerificationRecipes {

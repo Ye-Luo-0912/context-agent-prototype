@@ -1,9 +1,10 @@
 # 可执行任务队列
 
-> 状态：**无工程开放项**（2026-09-07：M16-00–07 与深入续审工程项全部关闭；PROCESS-01 已在真 Linux 验证）。剩余全是条件项：真实 provider live（无凭据写 `NOT_RUN`）、下次实际发布的 PACKAGE-01、默认启用 MCP 后的 MCP-01。
-> 审查剩余排在 M16 产品剩余之前；不是第二套队列，也不是把 13 项清零当成新阶段。
-> 审查/提案基线：`12c86283b8d5991e9f17a07f14871dcf39d65066`。本工作树 HEAD：`4464640`。
-> 分流原文：[reviews/2026-09-06-deep-audit/REVIEW.md](reviews/2026-09-06-deep-audit/REVIEW.md)。建议回归：[reviews/2026-09-06-deep-audit/TEST_MATRIX.md](reviews/2026-09-06-deep-audit/TEST_MATRIX.md)。
+> 状态：**M17——多入口平台与正式原生工作台**（2026-09-07 切换）。上一阶段的具体已验范围：M16-00–07 关闭、M16-08 走查落地；2026-09-06 深入续审 13 项代码项全部关闭（PROCESS-01 含真 Linux 验证）。**「无工程开放项」的说法作废**：2026-09-07 外部续审（基线 `b299c6a`，部分源码静态审查）发现监督身份/清理确认、metadata 发布窗口、状态投影、多客户端提交等残余，已并入本队列前列。
+> 剩余条件项不变：真实 provider live（无凭据写 `NOT_RUN`）、下次实际发布的 PACKAGE-01、默认启用 MCP 后的 MCP-01。
+> 基线：旧审查 `12c86283…`；本阶段续审 `b299c6a08fdb055a0148a24dea65053861df6ff1`（部分源码）。本工作树 HEAD：`7c3236d`。
+> 续审原文：[reviews/2026-09-07-platform-native-audit/REPORT.md](reviews/2026-09-07-platform-native-audit/REPORT.md)；工单全文：[reviews/2026-09-07-platform-native-audit/NEXT_STAGE_TASKS.md](reviews/2026-09-07-platform-native-audit/NEXT_STAGE_TASKS.md)。
+> 旧分流原文：[reviews/2026-09-06-deep-audit/REVIEW.md](reviews/2026-09-06-deep-audit/REVIEW.md)。建议回归：[reviews/2026-09-06-deep-audit/TEST_MATRIX.md](reviews/2026-09-06-deep-audit/TEST_MATRIX.md)。
 > 不替代 Core、Effect、Workspace、恢复与输出边界契约；不改写历史评测结论。
 
 ## 开始执行
@@ -13,27 +14,217 @@
 代码存在、测试通过、默认启用、真实任务跑通是四个不同事实。
 
 不要把 Chronicle、TaskGraph、数据库、worker、向量或新全量评测框架当作前置。
+执行任何 M17 工单前先 `git status --short` / `git rev-parse HEAD`；本轮续审未读过的模块现场补读，不宣称全仓已审。
 
-## 当前队列
+## M17 并行规则
 
-| 顺序 | 工单 | 交付物 | 状态 |
-|---|---|---|---|
-| 1 | ~~STORAGE-02~~ | 压缩已发布后失败则隔离旧 writer | 已关闭（2026-09-06） |
-| 2 | ~~PROCESS-01~~ | 宿主验证硬崩溃监督 | 已关闭（2026-09-07）：Windows Job 围栏 + Unix 管道 EOF 看门狗 + 监督台账，全部在真 Linux（WSL2）验证 |
-| 3 | ~~PROCESS-02~~ | reap 未确认退出不清 pid | 已关闭（2026-09-06） |
-| 4 | ~~WORKSPACE-01~~ | 普通 open 不阻塞 FIFO | 已关闭（2026-09-06） |
-| 5 | ~~WORKSPACE-02~~ | Windows 拒绝路径立即接管 HANDLE | 已关闭（2026-09-06） |
-| 6 | ~~PROVIDER-01~~ | 错误 HTTP body 有界读取 | 已关闭（2026-09-06） |
-| 7 | ~~PROVIDER-02~~ | Chat `length` 终止语义 | 已关闭（2026-09-06） |
-| 8 | ~~PROVIDER-03~~ | Responses EOF 尾帧校验 | 已关闭（2026-09-06） |
-| 9 | ~~CONTEXT-01~~ | 依赖候选 newest-first | 已关闭（2026-09-06） |
-| 10 | PACKAGE-01 | 打包来源绑定 | 下次实际发布 |
-| 11 | MCP-01 | MCP 写/连接/读可取消 | 仅默认启用 MCP 时 |
-| 12 | ~~M16-02 剩余~~ | 待审阅 ≠ 持久完成 | 已关闭（2026-09-07） |
+- B1、B2 直接开始；C0 文档切换已落地（2026-09-07），DTO 契约完成后 P1、G1 同时推进。
+- G2 等待 B1/B2 对应验收；P3/G3 按各自依赖；E1 不阻塞第一个 GUI 发布。
+- 共享契约、`command.rs`、compose 入口单一维护者；三线提交小接口需求，不在同一文件上互相覆盖。
+- 涉及宿主执行、可靠清理、冷恢复的正式支持声明，不得先于 B1/B2 验收作出。
+
+## 当前队列（M17）
+
+| 顺序 | 工单 | 线 | 交付物 | 状态 | 依赖 |
+|---|---|---|---|---|---|
+| 1 | C0 | 契约 | 阶段切换＋submit/continue/cancel/snapshot/subscribe/approval 最小 DTO 与语义 | **DTO 已落地（2026-09-07）**：`agent-platform-protocol/src/work.rs` 六条 run-scoped 路由＋事件通知 DTO＋金样序列测试；.NET 客户端同形镜像 | C0, P1 可开始 |
+| 2 | B1 | 基础 | 监督身份、可靠台账、清理确认、宿主 proof 监督接线、watchdog 边界 | 主体已关闭（2026-09-07）：身份化台账/类型化对账门/清理回执/proof 接线/watchdog 组扫描，Windows＋WSL2 验证；扩展验收项随 P3 收口 | 可开始 |
+| 3 | B2 | 基础 | metadata 发布不确定时的 writer 围栏 | 已关闭（2026-09-07）：`RecoveryRequired` 发布不确定＋compact 围栏＋注入测试；续审确认通过 | 可开始 |
+| 4 | B3 | 基础 | Context 验证关联＋stdin/grant/输出接入边界 | 主体已关闭（2026-09-07）：同配方关联终结、stdin/grant 读取时计费、有界输出 sink；扩展范围（recipe 版本/覆盖身份关联、无期限 stdin 读取期限）见剩余表 | 可开始 |
+| 5 | P1 | 平台 | 与 TUI 无关的原子工作提交与受理回执 | **已关闭（2026-09-07）**：`StartWork` 原子命令＋有界受理台账（同 id 同内容幂等、异内容拒绝）；TUI/无头共用 `agent_runtime::work`；F07 交叉投递 5 项验收测试全绿 | — |
+| 6 | P2 | 平台 | 类型化快照、增量事件、审批与结果、重同步 | **主体已关闭（2026-09-07）**：runtime＋TUI 投影 revision 归属修复；`ToolFailureClass::ApprovalDenied` 类型化拒绝替代文字推断；`StatusSnapshot`＋watermark；`WorkControlRouter`（submit/continue/cancel/snapshot/subscribe/approval.respond＋会话授权）；事件重放窗口仍为 resync-only | — |
+| 7 | P3 | 平台 | 正式 Rust 宿主＋Named Pipe/UDS 双向通信 | 进行中（2026-09-07）：`crates/agent-host`（4-byte LE 帧＋1 MiB 帽、同用户 peer 校验、会话授权、work/approval/operation 路由）已编译；e2e 挂起问题与入口接线待收口 | C0, P1, P2 |
+| 8 | G1 | GUI | .NET 客户端库＋正式 Avalonia 外壳 | 提案（路径拟新增） | C0 |
+| 9 | G2 | GUI | 审批/取消/审阅/冷恢复完整链路 | 提案 | G1, P2, P3, B1, B2 |
+| 10 | G3 | GUI | 长会话低开销工作台＋只读 Context 检查 | 提案 | G1, P2, B3 |
+| 11 | E1 | 扩展 | 一个真实外围能力＋按需 Skill 最小闭环 | 已关闭（2026-09-07）：MCP 写/连接/读取消全贯通、compose 配置缝、真实 mock server 闭环集成测试、Skill 按需有界读取；Windows＋WSL2 验证 | P3, G1（闭环已先行落地） |
+| 12 | R1 | 联合 | Rust＋.NET 来源绑定打包与正式使用收口 | 提案 | B1–B3, P3, G2, G3 |
+| 13 | PACKAGE-01 | 条件 | 打包来源绑定 | 下次实际发布 | — |
+| 14 | MCP-01 | 条件 | MCP 写/连接/读可取消 | 仅默认启用 MCP 时 | — |
+
+阶段后候选（不作为本阶段前置）：只读工具子 Agent（独立状态、有限预算、无递归）；Context/GC/搜索算法研究按真实瓶颈单独立项。
+
+## 上一阶段队列（已关闭，2026-09-06/07）
+
+| 工单 | 交付物 | 状态 |
+|---|---|---|
+| ~~STORAGE-02~~ | 压缩已发布后失败则隔离旧 writer | 已关闭（2026-09-06）；2026-09-07 续审指出 helper 内 rename→目录同步残余 → B2 |
+| ~~PROCESS-01~~ | 宿主验证硬崩溃监督 | 已关闭（2026-09-07）：Windows Job 围栏 + Unix 管道 EOF 看门狗 + 监督台账，全部在真 Linux（WSL2）验证；续审指出台账身份/确认残余 → B1 |
+| ~~PROCESS-02~~ | reap 未确认退出不清 pid | 已关闭（2026-09-06） |
+| ~~WORKSPACE-01~~ | 普通 open 不阻塞 FIFO | 已关闭（2026-09-06） |
+| ~~WORKSPACE-02~~ | Windows 拒绝路径立即接管 HANDLE | 已关闭（2026-09-06） |
+| ~~PROVIDER-01~~ | 错误 HTTP body 有界读取 | 已关闭（2026-09-06） |
+| ~~PROVIDER-02~~ | Chat `length` 终止语义 | 已关闭（2026-09-06） |
+| ~~PROVIDER-03~~ | Responses EOF 尾帧校验 | 已关闭（2026-09-06） |
+| ~~CONTEXT-01~~ | 依赖候选 newest-first | 已关闭（2026-09-06） |
+| ~~M16-02 剩余~~ | 待审阅 ≠ 持久完成 | 已关闭（2026-09-07） |
 
 已关闭、跳过：STORAGE-01、DOC-01；EOF wait、消费 ACK、PromptRequired、resync。
 关闭证据：STORAGE-02 `f9852ea`、PROCESS-01/02 `7c72df3`、WORKSPACE-01/02 `17c5ded`、PROVIDER-01/02/03 与 CONTEXT-01 `3e0128a`（定向测试计数见各提交说明）。
-M16-00/01/02/05/07 与大部分 03/06 已落地，细节见下方 M16 表。
+续审明确不再原样重报的旧问题：release 消费 ACK stamp、process.run 输出 EOF、Windows metadata 不再先 unlink、普通读取不再清错误、片段 supersession 覆盖判断——见 REPORT.md 第 4 节。
+
+---
+
+## C0 — 阶段契约（进行中：文档部分已落地）
+
+**用户结果：** 不同入口使用同一操作、身份和快照语义；GUI 可直接进入长期实现。
+
+**入口／拟新增路径：** `AGENTS.md`；`docs/CURRENT.md`、`docs/ROADMAP.md`、本文件（本次已改）；`crates/agent-platform-protocol/src/`（拟新增）。
+
+**剩余步骤：**
+1. 约定 submit/continue/cancel/snapshot/subscribe/approval response 的有限 DTO、身份、错误与大小上限；受理、应用、任务完成、清理确认分开。
+2. 列清 supported/unsupported，不预定义全部未来 namespace。
+3. 同一契约示例供 Rust/C# 使用；共享字段修改由单一负责人合入。
+
+**检查：** `python scripts/doc_consistency.py`（本次已跑）；DTO 落地后加对示例的双语言含义一致测试。
+
+**做到这里停止：** 不新建文档治理框架；不把"全部平台协议设计完"作为后续工单的开始条件。
+
+## B1 — 监督身份、台账、宿主验证接线与有界清理
+
+**用户结果：** 不凭旧 PID 误杀其它进程；未确认清理不丢监督记录；真实宿主 proof 路径应用与普通工具相同的监督策略。
+
+**入口：** `crates/tool-runtime/src/supervision.rs`、`crates/tool-runtime/src/proof_runner.rs`、`crates/tool-runtime/src/tools/process.rs`、`crates/agent-process/src/watchdog.rs`、`crates/agent-process/src/lifecycle.rs`、`crates/agent-compose/src/lib.rs`。
+
+**步骤：**
+1. 复用 `lifecycle.rs` 的 `ProcessIdentity`、`inspect_process` 与 `terminate_matching_process_tree`；区分退出、身份不符、清理已确认与无法确认，观测错误不得成为退出证明；旧的无身份记录默认不得 kill（对齐 F01/F02）。
+2. 台账记录/读取/结束返回 `Result`；限制大小与行数、串行化修改、必要耐久；读失败与损坏不得混同于"无未决进程"。
+3. 以明确 finished/reaped 回执释放记录；`ChildLease::Drop` 只做保守清理，不伪造确认。
+4. 监督配置由宿主统一注入普通 dispatcher 与 `RecipeProofRunner`（修 F03 的 `ProcessRunTool::new` 默认关闭）；re-exec marker 不隐式依赖传播到任意客户端可执行文件。
+5. 明确组长/成员/正常解除语义：watchdog 在 exec 前加入孩子的独立进程组，持续保住组身份；Drop、终止 helper 与清理后的 wait 均有界，无法确认则保留责任。Windows session 沿用既有 Job 围栏，未确认退出不得生成耐久完成回执。
+
+**已执行的定向检查（2026-09-07，当前工作树）：** Windows 进程库 38、工具库 246（另有 1 项原有 ignored；新增未知退出用例后 session 单独复验 14）、process_journal 8、依赖边界 3、compose 硬退出/监督门禁/恢复 6 项通过；上下文与 GC 23、Core 审批 1、Actor 工作入口 18 项定向复核通过。WSL Linux 的 watchdog 单元 6 / 真实子进程 4、监督台账 17、进程日志 7、session 14、process.run 19、exact-proof 宿主硬退出 1 项通过。相关 crate 的 all-targets 检查通过。完整命令与实现证据见 [核心边界与宿主清理报告](reviews/2026-09-07-worktree-review/CORE_BOUNDARIES_AND_HOST_CLEANUP.md)。
+
+**剩余验收：** 正式 P3 宿主的同等接线与硬退出路径；spawn 到 Job/watchdog 就绪的窗口、OS 拒绝容器/监督启用、子进程主动脱离进程组，以及遗留无容器孤儿的冷恢复。当前 Windows 根句柄与 Unix watchdog 组身份保证各有明确范围，不能外推为所有后代遍历和冷恢复 PID 竞态均已消除；B1 尚未全部验收完成。
+
+**做到这里停止：** 不新建通用 Scheduler；受支持的执行/恢复声明不得先于本工单验收。
+
+## B2 — metadata 已发布但目录同步失败的围栏（已关闭 2026-09-07）
+
+**用户结果：** 一次压缩返回不确定错误后，本进程不会继续健康地向旧代写入。
+
+**已落地：** `persist_authority_metadata` 在 rename 发布之后才可能失败的目录同步改为 `AgentError::RecoveryRequired`（"可能已部分落地"语义）；`compact_locked` 对该变体设置 `writer.failed` 围栏——显式 `compact_authority_journal` 与追加触发压缩同走此路径，不能留下健康的旧代 writer。故障注入为 thread-local 的 `SYNC_DIRECTORY_FAULT` 切点（唯一发布后失败点），不触碰真实目录同步屏障。
+
+**检查：** `cargo test -p agent-storage` 22/22（Windows，并行 ×3 稳定；WSL2 同过），含新增 `compaction_publish_uncertain_failure_fences_the_writer`：发布不确定错误 → 后续 append 被拒 → 重开承认已发布 g2 并继续追加（seq 3）。`cargo test -p agent-core` 全绿。续审确认"已有实质修复……本轮通过"（reviews/2026-09-07-worktree-review/REVIEW.md）。
+
+**做到这里停止：** 只修发布语义；不删目录同步换测试绿；不新增数据库/Chronicle/第二套日志协议。
+
+## B3 — Context 验证关联与运行边界
+
+**用户结果：** 错误不被同实体的无关验证终结；外部输入/输出不在进入 Runtime 前后绕过限额。
+
+**已落地（2026-09-07，F08＋F09 主体）：**
+1. **验证关联（F08）：** `ContextItem`/`ExternalizedContext` 新增 `verify_recipe`（serde default，兼容旧检查点）；verify.run 失败把 `metadata.recipe_id` 盖到错误上，成功只有携带**同一 recipe_id** 才排队终结；`queue_error_verifications` 不再按实体重叠匹配，无关联的成功一律保持 live。
+2. **读入计费（F09）：** `resolve_prompt` 的 stdin 路径 `take(USER_INPUT_REPLAY_MAX_BYTES+1)` 有界读入（读入阶段即拒，不做全量分配）；`load_grant_file` 改为 take 上限读取，stat 仅为 regular-file 检查。
+3. **有界输出 sink（F09）：** `run_headless` 改为移交 writer 所有权，专用写线程＋64 行有界队列；事件循环不再被慢 stdout/文件阻塞（超时/取消保持有效）；慢消费者/断线以类型化失败结束（截断流绝不报 exit 0），关闭等待有界（10s）。
+
+**检查（已执行，2026-09-07）：** `cargo test -p context-simple` 288 全绿（含新增 `unrelated_successes_never_finalize_an_error`：不同配方成功、普通工具成功均不终结，同配方成功终结）；lifecycle/residency fixture 更新为同配方契约。`cargo test -p agent-tui` cli 16 项全绿（含 `stdin_prompt_is_charged_at_read_time`、`grant_file_over_the_cap_is_refused`、`headless_output_disconnect_ends_the_run_with_a_typed_failure`）。
+
+**剩余范围（续审指明，随 B3 后续/P2 收口）：** 可信 recipe 的版本/覆盖身份及任务、故障级关联保存与核对；无期限且未达 cap 的 stdin 读取期限；终端 IO helper 不当成正式 GUI 客户端实现。
+
+**做到这里停止：** 不重调 GC 阈值，不同时引入 BM25/向量/缓存算法。
+
+## P1 — 与 TUI 无关的原子工作提交与受理回执
+
+**用户结果：** TUI、GUI、SDK 不能把指令误投给另一客户端刚切换的任务（修 F07）。
+
+**入口：** `crates/agent-tui/src/work.rs`（现共享工作流）；`crates/agent-runtime/src/command.rs`、`crates/agent-runtime/src/actor/commands.rs`；`crates/agent-compose/src/lib.rs`。
+
+**步骤：** 共享工作入口移入公共应用层；实现原子 start_work 或显式 task/expected revision 提交，复用既有 TaskManager prepare/commit；返回稳定受理身份，同 client request id＋相同内容有界去重、异内容拒绝；无可靠回执返回 unknown/要求查询，不自动换 ID 重放副作用。
+
+**检查（建议，未执行）：** `cargo test -p agent-runtime`；`cargo test -p agent-tui`。验收：两客户端交错 SetFocus/Submit 不跨任务投递；重复请求不偷偷再执行；单客户端任务身份不变。
+
+**做到这里停止：** 不远程导出整个 `RuntimeCommand`；不公开恢复半事务或 `CorePort`；不建第二个 TaskManager。
+
+## P2 — 类型化快照、增量事件、审批与结果
+
+**用户结果：** 新客户端接入、重连、慢消费后显示正确状态，不解析终端文字（修 F06）。
+
+**入口：** `crates/agent-runtime/src/status.rs`（`anchor_revision` 跨任务 `max`）；`crates/agent-contracts/src/event.rs`；`crates/agent-core/src/approval.rs`；`crates/agent-tui/src/cli.rs`（文字推断审批）；`crates/agent-runtime/src/platform/`。
+
+**步骤：** 修 revision 归属；移除从任意 ToolOutput 文本推断审批拒绝；一致快照＋watermark＋其后事件、有限重放窗口与 `resync_required`；实时文字流偏移与耐久事件序列分开；审批响应绑定 request/run/operation 与会话，重连可查 pending；慢消费者有界队列，不静默抹掉审批/终态、不阻塞 Actor。
+
+**检查（建议，未执行）：** `cargo test -p agent-runtime`；`cargo test -p agent-tui`。验收：A revision9→B revision1 展示与 API 均为 B=1；工具正文含拒绝短语不改变真实审批状态；缺口被明确报告。
+
+**做到这里停止：** 只建可重建投影；不建 Chronicle 数据库；投影不反向提交 effect。
+
+## P3 — 正式 Rust 宿主与本地双向 RPC
+
+**用户结果：** 原生 GUI 与其它入口连接同一工作区宿主，不各自打开一份可写运行状态。
+
+**入口／拟新增路径：** `crates/agent-runtime/src/platform/session.rs`；`crates/agent-process/src/session.rs`；`crates/agent-platform-protocol/src/`；`crates/agent-compose/src/lib.rs`；`proposed: crates/agent-host/`。
+
+**步骤：** 薄宿主可执行文件（生命周期、workdir 单实例、watchdog marker 在 Rust 宿主负责）；Windows Named Pipe／Linux UDS 同一有界 framing，OS 后端隔离；连接 ACL/peer 身份在服务端落实，客户端不得自报提权；帧与 decoded DOM 上限、并发/队列/读写期限；接收循环不等整个任务结束才读 cancel；关闭窗口、断线、宿主退出、task cancel 区分，提供显式后台继续或停止策略。
+
+**检查（建议，未执行）：** `cargo test -p agent-platform-protocol`；`cargo test -p agent-process`；`cargo test -p agent-runtime`。验收：半帧/粘帧/超大帧/无权会话正确处理；第二客户端附着既有宿主；B1/B2 未完成时可开发只读连接，但不开放相关可靠执行/恢复承诺。
+
+**做到这里停止：** 不做系统级常驻服务、不默认公网监听、不复制 codec 和 authority；不同时做 HTTP/TCP/gRPC。
+
+## G1 — .NET 客户端库与正式 Avalonia 外壳
+
+**用户结果：** 第一版就是正式原生客户端；通信层可被其它 .NET 应用复用。
+
+**拟新增路径：** `clients/dotnet/Agent.Client/`、`apps/Agent.Desktop/`、`global.json`（均拟新增，锁定实施时确认的 .NET 10 SDK 版本）。
+
+**步骤：** class library 与 Avalonia app；Agent.Client 不依赖 Avalonia、不 P/Invoke Runtime；DTO 用 C0 共同规范与跨语言样例；请求关联、取消等待与显式取消命令区分、事件流与帧上限；先用同 DTO 有限 fixture 驱动布局，P1/P2 可用后连真实宿主（fixture 不是模拟执行器）；正式窗口含任务选择、输入/输出、计划、状态，异步读写不占 UI 线程。
+
+**检查（建议，未执行）：** `dotnet build clients/dotnet/Agent.Client/Agent.Client.csproj`；`dotnet build apps/Agent.Desktop/Agent.Desktop.csproj`。验收：client library 可在无 GUI 测试程序使用；正式 GUI 连真实 Runtime 取快照并提交/继续；主界面不依赖 WebView。
+
+**做到这里停止：** 不先做 IDE、插件 UI SDK 或全量自绘控件库；不用第二个"验证 GUI"替代。
+
+## G2 — 审批、取消、审阅与恢复完整操作链
+
+**用户结果：** 用户能执行真实开发任务，并知道改动、检查、未验证状态与可恢复点。
+
+**拟新增路径：** `apps/Agent.Desktop/`、`clients/dotnet/Agent.Client/`；`crates/agent-runtime/src/instance.rs`。
+
+**步骤：** 审批卡显示平台返回的绑定操作/范围，点击等真实回执；区分运行/预算让出/待审阅/证据完成/操作员接受/恢复受阻；差异与工件按需授权读取，保留用户已有修改；重开走快照/事件同步，冷恢复走完整 `RuntimeInstance` 事务；中文输入法、复制、键盘、DPI、大文本正常。
+
+**检查（建议，未执行）：** `dotnet test clients/dotnet/Agent.Client.Tests/Agent.Client.Tests.csproj`；`cargo test -p agent-compose`。验收：GUI→任务→真实工具/审批→取消/续跑→差异审阅端到端；丢连接不自动通过 pending 审批；含用户预存修改的冷恢复不重复副作用。
+
+**做到这里停止：** 不加第二执行器；不做全量通用代码编辑器；不因 GUI 增加绕过 Core 的文件写入口。
+
+## G3 — 低资源使用的正式工作台与只读 Context 检查
+
+**用户结果：** 长会话、大 diff 和上下文查看不导致全历史反复传输、解析和渲染。
+
+**拟新增路径：** `apps/Agent.Desktop/`；`crates/agent-runtime/src/platform/`。
+
+**步骤：** 列表虚拟化同时限制底层保留数据；流式文字按小窗口合并；大正文只传 locator/元数据/分页片段，视图关闭释放缓存；Context 面板只读显示来源、表示类型、实际曝光、片段范围、恢复状态（不显示不存在的模型内部注意力）；记录全进程树空闲内存、长会话斜率、输出时 CPU/分配、大 diff 响应，无测量写 `NOT_RUN`；AOT/裁剪单独做兼容性核查，不作首窗前置。
+
+**检查（建议，未执行）：** `dotnet build apps/Agent.Desktop/Agent.Desktop.csproj -c Release`。验收：固定大型会话/差异 retained data 有界；工具/审批/终态事件不为流畅显示静默丢失。
+
+**做到这里停止：** 不建遥测平台；不写零分配通用 UI；不以研究性 GC 算法胜出当 GUI 完成标准。
+
+## E1 — 一个真实外部能力与按需 Skill 的最小闭环（已关闭 2026-09-07）
+
+**用户结果：** 正式客户端能使用一个实际外围能力；Skill 不常驻所有上下文。
+
+**已落地（2026-09-07）：**
+1. **真实外部能力选型：MCP stdio server**（复用既有 `McpCapabilityAdapter`/`McpClient` 沙箱栈：scrubbed env、私有 cwd、landlock/integrity、supervisor 树杀）。
+2. **MCP 取消贯通（MCP-01 范围，不以"默认未开启"豁免）：** `request_with_cancel` 的写阶段改为与 cancel select 组合（取消即时生效，部分帧按既有 poison+kill-then-reap 收尾）；新增 `initialize_with_cancel`/`list_tools_with_cancel`/`connect_stdio_with_cancel`——连接（spawn+握手）阶段可取消，取消不被重启熔断记为服务器故障。测试：写阶段取消（对端停读时 50ms 内 Cancelled，不等 30s deadline）、连接阶段取消（静默服务器 150ms 取消即收尾并树杀）。
+3. **compose 配置缝：** `ComposeConfig` 新增 `mcp_servers`（配置→发现→注册→显式 enable；发现失败组合失败 fail-closed）与 `plugins`（注入 dispatcher）；风险从声明权限推导，从不信服务器自述。
+4. **Skill 按需读取：** `PluginRegistry::install_from_root`/`skill_read`——双激活门（包 Active＋Skill Active）、引用路径围栏（准入拒绝逃逸 + 读取时二次防御）、64 KiB 有界读（超限拒绝不截断）；`capability.manage` 新增 `read_skill` op，正文作为普通工具输出带 provenance/version 返回，从不自动注入、从不成为 system 权威。
+5. **闭环集成测试**（`tests/e1_mcp_loop.rs`，真实 mock server 进程）：配置→发现→注册→search（未加载工具不在模型表面）→load（进入表面）→invoke（有界回显＋心跳）→shutdown（心跳停跳＝进程树确死，清理可观测而非假设）。
+
+**检查（已执行，2026-09-07）：** `cargo test -p agent-capability-process` 24 lib＋26 capability_host＋1 闭环（Windows 与 WSL2 双侧全绿）；`cargo test -p agent-runtime --lib plugin:: capability::tests::read_skill` 9 项全绿（含 read_skill 双门、逃逸拒绝、超限拒绝、无目录拒绝）。验收对照：新增能力零 RuntimeActor 特判（注册即被统一目录/加载/调用面消化）；未加载能力 schema 不注入（search 轮断言 mock.echo 不在表面）；停机清理可观测（心跳停跳断言）。
+
+**做到这里停止：** 不建插件市场；不要求子 Agent/DAG/递归才完成本切片。
+
+## R1 — Rust＋.NET 来源绑定发布及正式使用收口
+
+**用户结果：** 安装包里的客户端/宿主确属本次构建，版本匹配，真实使用与验证范围明确。
+
+**入口：** `scripts/dist.sh`、`scripts/dist.ps1`、`.github/workflows/package.yml`；拟新增桌面打包；`docs/CURRENT.md`、`docs/COMPATIBILITY.md`。
+
+**步骤：** 修自定义 target 未传 Cargo、陈旧 dist 混入、PowerShell 退出码（即 PACKAGE-01 范围，届时一并关闭）；记录 Rust 源码 SHA、.NET/协议版本、构建配置与 checksum；现有跨平台 CI 加最小 C# 构建/协议相容项；正式 GUI 完成小 bug、多文件功能、断线/冷恢复续跑（真实 provider 不可用写 `NOT_RUN`）；实现/定向测试/默认启用/真实使用四类状态分别更新。
+
+**检查（建议，未执行）：** `cargo fmt --check`；`cargo clippy --workspace --all-targets -- -D warnings`；`cargo test --workspace`；`dotnet build apps/Agent.Desktop/Agent.Desktop.csproj -c Release`。这些是集成/发布检查，不是每次改文档都执行。
+
+**做到这里停止：** 不要求所有未来扩展实现才发布当前正式 GUI；失败构建不输出成功包。
+
+---
+
 
 ---
 

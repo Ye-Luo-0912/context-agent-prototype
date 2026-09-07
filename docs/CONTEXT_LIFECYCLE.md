@@ -398,7 +398,7 @@ retention = Ephemeral
 They remain available for the immediate model continuation, then are eligible for hard removal after `AfterModel`.
 
 Failed observations follow the P4 error lifecycle instead (§9b): they persist
-as `Working` until a later successful result on the same entities verifies
+as `Working` until the same task and trusted verification probe establish
 the fix, then are archived with an explainable transition.
 
 ## 9b. P4: supersession and the error lifecycle
@@ -425,22 +425,18 @@ This fixes the P3-measured regression on the `superseded_decisions` scenario
 
 ### Error -> fix -> verified
 
-A failed tool observation is an `Error` item with `Working` retention: it
-survives the model turn so a later attempt can confirm the fix.
-
-- a new failure sharing entities with a live error supersedes it
-  (`recurring failure supersedes earlier error (round N, same entities)`) —
-  one live error per failure site, always the latest;
-- a successful result sharing entities verifies the fix
-  (`error verified fixed by successful tool result (round N)`) and archives
-  the error;
-- superseded/verified errors never re-enter a model request.
-
-```text
-round 1: tests failed (AuthService.rs:42)  -> Error item E1 (live)
-round 2: tests failed (AuthService.rs:41)  -> E1 archived (recurring), E2 live
-round 3: tests passed (AuthService.rs)     -> E2 archived (verified fixed)
-```
+- A failed observation stays live as an Error.
+- Recurrence coalesces only identical retained bodies from the same task,
+  producer and verification probe. Entity overlap alone cannot kill a fault;
+  a lossy external summary cannot prove recurrence.
+- `verify.run` stamps a typed host probe containing recipe id, revision and
+  the digest of its complete definition and declared coverage. Only success
+  of that probe in the same task can finalize the fault as `VerifiedFixed`.
+  Source bytes may change during a fix; this is distinct from PASS reuse.
+- Probe identity survives Resident/Warm/external moves and checkpoints.
+  Old recipe-name-only associations load conservatively without a probe.
+  Pending verification intents are rechecked when drained after restore.
+- Superseded/verified errors never re-enter a model request.
 
 Trade-off, measured: keeping errors visible until verified costs a little
 more input than dropping them after one turn (they stay in the working set),
@@ -581,7 +577,8 @@ A successful `ToolObservation`'s entity signature is the stamped
 `ResourceTouch` path only. Stdout tokens are not identity: they do not
 heat, do not mint `SharesEntities` edges, and do not auto-reactivate a
 body. Failed `Error` items still extract entities from their text so
-verification can match. Search that misses the entity index residual-scans
+search and relevance can match; verification uses the typed host probe.
+Search that misses the entity index residual-scans
 summaries. File-body supersession stays `fs.read` / unsourced replay
 headers only; a stamped path on `shell.exec` is identity, not a new file
 body.
@@ -901,7 +898,8 @@ engine only ever sees a bounded projection, never the anchor. Semantics by
 strength: `PromptRequired` forces the target into the model frame;
 `ResidentRequired` protects (or recalls) the target in the working set —
 GC marks it a root and reactivates it from the warm buffer or the cold
-store; `StorageRequired` keeps the target's store entry out of Storage GC.
+store; `StorageRequired` protects the target and its transitive strong
+evidence references from Storage GC, without changing semantic state.
 Claims resolve by item id, `context://run/<id>` uri, or exact entity
 signature, and semantic death is terminal — a claim never resurrects a
 superseded/verified-fixed/tombstoned item. The three strengths are
@@ -1208,7 +1206,8 @@ distinguishes deliberate citations from weak affinity: `SharesEntities`
 permanent-delete guard, while `EvidenceFor | DerivedFrom | VerifiedBy |
 ArtifactOf | Continuation` are strong edges that keep their targets alive.
 Roots are the strong-edge targets of resident/warm items **and every
-non-deletable stored record itself** — a Live, Pinned or Durable record is
+non-deletable stored record itself**, including `StorageRequired` anchor
+roots even when semantically terminal — a Live, Pinned or Durable record is
 never a candidate, and its strong edges must keep its evidence targets
 alive even when nothing resident references the record. From any
 referenced record the closure traverses strong edges only, so

@@ -21,6 +21,7 @@ mod ids;
 mod json;
 mod operation;
 mod validation;
+mod work;
 
 pub use agent_contracts::{
     ArgumentDigest, ArtifactLocator, ContentDigest, EffectId, OperationQueryResult, jcs_serialize,
@@ -37,3 +38,4 @@ pub use json::{
 };
 pub use operation::*;
 pub use validation::{ValidationError, ValidationResult};
+pub use work::*;

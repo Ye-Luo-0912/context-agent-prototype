@@ -28,21 +28,30 @@
     <!-- 主体：左任务列表 / 右工作区 -->
     <Grid Grid.Row="2" ColumnDefinitions="340,*">
 
-      <Border Grid.Column="0" BorderBrush="#33808080" BorderThickness="1" CornerRadius="6" Padding="8" Margin="0,0,10,0">
-        <DockPanel>
-          <TextBlock DockPanel.Dock="Top" Text="任务" FontWeight="Bold" Margin="0,0,0,6" />
-          <ListBox ItemsSource="{Binding Tasks}">
-            <ListBox.ItemTemplate>
-              <DataTemplate x:DataType="vm:TaskItemViewModel">
-                <StackPanel Margin="2">
-                  <TextBlock Text="{Binding Goal}" TextWrapping="Wrap" FontWeight="SemiBold" />
-                  <TextBlock Text="{Binding StatusLine}" Foreground="#99808080" TextWrapping="Wrap" />
-                </StackPanel>
-              </DataTemplate>
-            </ListBox.ItemTemplate>
-          </ListBox>
-        </DockPanel>
-      </Border>
+      <Grid Grid.Column="0" RowDefinitions="*,Auto" Margin="0,0,10,0">
+        <Border Grid.Row="0" BorderBrush="#33808080" BorderThickness="1" CornerRadius="6" Padding="8">
+          <DockPanel>
+            <TextBlock DockPanel.Dock="Top" Text="任务" FontWeight="Bold" Margin="0,0,0,6" />
+            <!-- ListBox 自带虚拟化：只实例化视口内的行（G3） -->
+            <ListBox ItemsSource="{Binding Tasks}">
+              <ListBox.ItemTemplate>
+                <DataTemplate x:DataType="vm:TaskItemViewModel">
+                  <StackPanel Margin="2">
+                    <TextBlock Text="{Binding Goal}" TextWrapping="Wrap" FontWeight="SemiBold" />
+                    <TextBlock Text="{Binding StatusLine}" Foreground="#99808080" TextWrapping="Wrap" />
+                  </StackPanel>
+                </DataTemplate>
+              </ListBox.ItemTemplate>
+            </ListBox>
+          </DockPanel>
+        </Border>
+        <Border Grid.Row="1" BorderBrush="#33808080" BorderThickness="1" CornerRadius="6" Padding="8" Margin="0,10,0,0">
+          <StackPanel Spacing="4">
+            <TextBlock Text="Context（只读）" FontWeight="Bold" />
+            <TextBlock Text="{Binding ContextPanelText}" TextWrapping="Wrap" Foreground="#99808080" />
+          </StackPanel>
+        </Border>
+      </Grid>
 
       <Grid Grid.Column="1" RowDefinitions="Auto,Auto,Auto,*,Auto">
 

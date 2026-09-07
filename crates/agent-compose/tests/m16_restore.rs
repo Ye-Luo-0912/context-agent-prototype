@@ -151,6 +151,11 @@ async fn product_config(
         effect_reservation_journal: Some(reservation),
         verification_recipes: Some(recipes.clone()),
         project_proof_refresh: !recipes.is_empty(),
+        // Harness composition: no watchdog dispatch in this executable.
+        host_death_watchdog: false,
+        // Harness/eval compositions register no external capabilities by default.
+        mcp_servers: Vec::new(),
+        plugins: None,
     })
 }
 

@@ -41,8 +41,9 @@ pub use host::{
 #[cfg(unix)]
 pub use host::{apply_unix_rlimits, close_inherited_fds};
 pub use lifecycle::{
-    ProcessIdentity, capture_process_identity, kill_matching_process_tree,
-    process_identity_matches, process_is_running,
+    ProcessCleanupOutcome, ProcessIdentity, ProcessState, capture_process_identity,
+    inspect_process, kill_matching_process_tree, process_identity_matches, process_is_running,
+    terminate_matching_process_tree,
 };
 pub use session::{DuplexTransport, FramedProtocolSession, StdioDuplexTransport};
 pub use supervisor::ProcessSupervisor;

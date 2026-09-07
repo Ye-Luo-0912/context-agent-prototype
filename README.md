@@ -11,14 +11,19 @@ one workspace, one explicit provider profile, bounded builtin tools,
 human-approved effects, verifiable completion and cold resume. The alpha
 (`v0.1.0`: packaged Windows/Linux binaries, install notes, checked
 configuration, checkpoints/status/doctor) is released, and the formal M15
-reliability gate is closed. The current stage is **M16**. The live queue
-currently leads with the last 2026-09-06 deep-audit item (**PROCESS-01**,
-Unix supervision identity; the other code findings are closed), then
-returns to M16 product leftovers. The ordered route is
+reliability gate is closed. M16 (daily-usable local agent) is closed with
+its walkthroughs automated. The current stage is **M17 — multi-entry
+platform and the formal native workbench**: three parallel lines
+(foundation correctness B1–B3, platform application service P1–P3, formal
+.NET 10 + Avalonia GUI G1–G3 over a dedicated Rust host with local IPC),
+leading with C0/B1/B2. A 2026-09-07 partial-source re-audit (`b299c6a`)
+found residuals in the supervision ledger identity/confirmation, the
+metadata publish window, status projection, and multi-client submission;
+they lead the queue instead of reopening M16. The ordered route is
 [`docs/ROADMAP.md`](docs/ROADMAP.md#route-to-a-usable-local-agent); the
-active task queue is [`docs/NEXT_TASKS.md`](docs/NEXT_TASKS.md). M16
-replaces the earlier D0/F1–F6 queue. It does not add Chronicle, TaskGraph,
-or a second orchestrator.
+active task queue is [`docs/NEXT_TASKS.md`](docs/NEXT_TASKS.md). M17 does
+not add Chronicle, TaskGraph, a second orchestrator, or a second task
+state authority.
 
 ## Architecture
 

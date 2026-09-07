@@ -8,10 +8,16 @@
 //! one truth, and a UI that falls behind its broadcast can rebuild the
 //! snapshot by replaying events instead of trusting a stale projection.
 
+use std::collections::HashMap;
+
 use agent_contracts::{RunId, RuntimeEvent, TaskId};
 
 /// Bounded number of recent warning texts retained for the snapshot.
 const MAX_RETAINED_WARNINGS: usize = 3;
+/// Bounded per-task anchor-revision table. Revisions belong to one task;
+/// the table never compares or maxes across tasks and evicts arbitrarily
+/// beyond the runtime's own task-record cap (the focused entry is kept).
+const MAX_TRACKED_ANCHOR_REVISIONS: usize = 256;
 
 /// What the runtime is doing right now, as far as events can say.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -40,7 +46,10 @@ pub struct StatusProjection {
     task_durably_completed: bool,
     task_completion_summary: String,
     focus_goal: String,
-    anchor_revision: u64,
+    /// Each task's own latest anchor revision (F06: revisions are per-task;
+    /// a background anchor change on one task must never leak into another
+    /// task's display through a cross-task `max`).
+    anchor_revisions: HashMap<TaskId, u64>,
     unresolved_ack_debts: usize,
     last_checkpoint: Option<(String, u64)>,
     required_miss_events: u32,
@@ -97,11 +106,23 @@ impl StatusProjection {
             RuntimeEvent::TaskAnchorChanged {
                 task_id, revision, ..
             } => {
-                if self.current_task != Some(*task_id) {
-                    self.task_durably_completed = false;
+                // An anchor change belongs to its own task. It never steals
+                // focus and never resets the focused task's closure state —
+                // only FocusChanged/FocusCleared/TaskCompleted own those
+                // transitions.
+                if self.anchor_revisions.len() >= MAX_TRACKED_ANCHOR_REVISIONS
+                    && !self.anchor_revisions.contains_key(task_id)
+                {
+                    if let Some(evict) = self
+                        .anchor_revisions
+                        .keys()
+                        .find(|key| Some(**key) != self.current_task)
+                        .copied()
+                    {
+                        self.anchor_revisions.remove(&evict);
+                    }
                 }
-                self.current_task = Some(*task_id);
-                self.anchor_revision = self.anchor_revision.max(*revision);
+                self.anchor_revisions.insert(*task_id, *revision);
             }
             RuntimeEvent::TaskCompleted {
                 task_id, summary, ..
@@ -189,7 +210,12 @@ impl StatusProjection {
             "tokens: in={} out={} (cached_in={})",
             self.input_tokens, self.output_tokens, self.cached_input_tokens
         ));
-        match (&self.current_task, self.anchor_revision) {
+        let anchor_revision = self
+            .current_task
+            .and_then(|task_id| self.anchor_revisions.get(&task_id))
+            .copied()
+            .unwrap_or(0);
+        match (&self.current_task, anchor_revision) {
             (Some(task_id), revision) => {
                 let closure = if self.task_durably_completed {
                     format!(
@@ -317,6 +343,79 @@ mod tests {
             line.contains("awaiting operator review"),
             "a new task starts un-closed: {line}"
         );
+    }
+
+    /// F06 acceptance: task A climbs to anchor revision 9, then the run
+    /// switches to fresh task B at revision 1. Display and the API truth
+    /// must both read B=1 — a background anchor event on A (or any other
+    /// task) may never max into B's revision or steal the focus line.
+    #[test]
+    fn anchor_revisions_belong_to_their_own_task() {
+        let task_a = TaskId::new();
+        let task_b = TaskId::new();
+        let task_c = TaskId::new();
+
+        let switched = fold_all(&[
+            RuntimeEvent::FocusChanged {
+                task_id: task_a,
+                goal: "goal a".into(),
+            },
+            RuntimeEvent::TaskAnchorChanged {
+                task_id: task_a,
+                revision: 9,
+                changed_fields: Vec::new(),
+                patch_kind: agent_contracts::AnchorPatchKind::Autonomous,
+            },
+            RuntimeEvent::FocusChanged {
+                task_id: task_b,
+                goal: "goal b".into(),
+            },
+            RuntimeEvent::TaskAnchorChanged {
+                task_id: task_b,
+                revision: 1,
+                changed_fields: Vec::new(),
+                patch_kind: agent_contracts::AnchorPatchKind::Autonomous,
+            },
+        ]);
+        let line = switched
+            .lines()
+            .into_iter()
+            .find(|line| line.starts_with("task:"))
+            .expect("task line");
+        assert!(
+            line.contains("anchor_revision=1") && line.contains("goal b"),
+            "display must read B=1, not a cross-task max: {line}"
+        );
+
+        // A revision bump on an unrelated third task changes nothing about
+        // the focused task's line.
+        let mut after_noise = switched;
+        after_noise.fold(&RuntimeEvent::TaskAnchorChanged {
+            task_id: task_c,
+            revision: 5,
+            changed_fields: Vec::new(),
+            patch_kind: agent_contracts::AnchorPatchKind::Autonomous,
+        });
+        assert_eq!(after_noise.current_task, Some(task_b));
+        let line = after_noise
+            .lines()
+            .into_iter()
+            .find(|line| line.starts_with("task:"))
+            .expect("task line");
+        assert!(line.contains("anchor_revision=1"), "{line}");
+
+        // Returning to A shows A's own revision again.
+        let mut back_to_a = after_noise;
+        back_to_a.fold(&RuntimeEvent::FocusChanged {
+            task_id: task_a,
+            goal: "goal a".into(),
+        });
+        let line = back_to_a
+            .lines()
+            .into_iter()
+            .find(|line| line.starts_with("task:"))
+            .expect("task line");
+        assert!(line.contains("anchor_revision=9"), "{line}");
     }
 
     #[test]

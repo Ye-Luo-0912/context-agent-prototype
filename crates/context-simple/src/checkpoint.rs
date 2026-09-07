@@ -62,6 +62,17 @@ pub(crate) fn validate(state: &State) -> AgentResult<()> {
         }
     }
 
+    // Build from the raw sequence: ScopeTree's index deliberately cannot
+    // prove uniqueness (a duplicate would otherwise be hidden by last-wins).
+    let mut parents = std::collections::HashMap::new();
+    for scope in state.scopes.iter() {
+        if parents.insert(scope.id, scope.parent).is_some() {
+            return Err(violation(format!(
+                "scope {} appears more than once",
+                scope.id
+            )));
+        }
+    }
     for scope in state.scopes.iter() {
         if let Some(parent) = scope.parent
             && state.scopes.by_id(parent).is_none()
@@ -71,6 +82,38 @@ pub(crate) fn validate(state: &State) -> AgentResult<()> {
                 scope.id
             )));
         }
+    }
+
+    // Iterative three-colour traversal: O(scopes), no recursive stack and no
+    // quadratic ancestor walk for deep trees. Every parent chain must end.
+    let mut colours = std::collections::HashMap::new();
+    for scope in state.scopes.iter() {
+        let mut path = Vec::new();
+        let mut current = Some(scope.id);
+        while let Some(id) = current {
+            match colours.get(&id) {
+                Some(2) => break,
+                Some(1) => {
+                    return Err(violation(format!(
+                        "scope ancestry contains a cycle at {id}"
+                    )));
+                }
+                _ => {}
+            }
+            colours.insert(id, 1_u8);
+            path.push(id);
+            current = parents.get(&id).copied().flatten();
+        }
+        for id in path {
+            colours.insert(id, 2);
+        }
+    }
+    if let Some(active) = state.active_scope_id
+        && !parents.contains_key(&active)
+    {
+        return Err(violation(format!(
+            "active scope references missing scope {active}"
+        )));
     }
 
     for item in state.items.iter().chain(state.eviction_buffer.iter()) {
