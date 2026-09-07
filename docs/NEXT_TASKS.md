@@ -1,7 +1,7 @@
 # 可执行任务队列
 
 > 状态：**M17 收尾——可恢复的多入口工作台（N 系列，2026-09-08 切换）。** 上一队列（M17 三线）的代码主体已落地：B1–B3、C0、P1、P2 主体、P3 宿主、G1–G3 客户端侧、E1 全部关闭或落地（见下方 M17 队列表）。2026-09-08 外部闭环审查（基线 `11afdd747d6cbbb58ef0d7371841e8e365c4f8db`，55 路径正文、新 GUI/客户端/宿主三子树全文）指出：**组件存在 ≠ 链路接通**——事件订阅 receiver 被丢弃、重连自动重发修改操作、宿主恢复绕过正式信封解码、多连接/会话释放/停机缺口等 20 项（F01–F20），进入本队列。
-> **当前 CI 是红的**：run `34148921895`（`11afdd7`）与 run `34148640847`（`1be2e77`）均在 `cargo fmt --check` 失败（Ubuntu/Windows），后续 clippy/build/test 被跳过——fmt 违规集中在 `crates/agent-host`。N0 第一项就是恢复构建与验证入口。
+> **CI 已恢复全绿**（2026-09-08，run `34163939549` 在 `96e4605` 七 job 全过：含新增的 .NET job 与 agent-host Linux 检查）。此前 `34148921895`/`34148640847` 两轮红在 fmt（违规集中在 agent-host），修复过程顺带消掉了 conformance 角色准入、protocol 夹具 lint、agent-replay 探针夹具、supervision 锁退避四个被遮蔽的问题。
 > 本队列接续 M17 未闭环项；不重做已落地的 B1/B2/C0/P1/G1/E1，也不新增 Chronicle/TaskGraph/第二套状态权威。
 > 剩余条件项不变：真实 provider live（无凭据写 `NOT_RUN`）、下次实际发布的 PACKAGE-01（并入 N8）、默认启用 MCP 后的 MCP-01（E1 已覆盖声明车道的取消贯通）。
 > 审查原文：[reviews/2026-09-08-closure-audit-11afdd7/REPORT.md](reviews/2026-09-08-closure-audit-11afdd7/REPORT.md)；工单全文：[reviews/2026-09-08-closure-audit-11afdd7/NEXT_STAGE_TASKS.md](reviews/2026-09-08-closure-audit-11afdd7/NEXT_STAGE_TASKS.md)。
@@ -29,13 +29,13 @@
 
 | 顺序 | 工单 | 线 | 交付物 | 状态 | 依赖 |
 |---|---|---|---|---|---|
-| 1 | N0 | 集成 | fmt/cfg 修复＋宿主 Linux 构建＋.NET 入 CI＋测试修准 | **当前工单**；CI 红（fmt）即其直接事实 | 无 |
-| 2 | N1 | 平台 | 宿主多连接、会话释放、端点所有权、可靠停机 | 提案（F02–F05 已在 HEAD 静态复核） | N0 |
-| 3 | N2 | 客户端 | 未知修改不重发、连接终态不复活、single-flight | 提案（F07–F09、F19） | N0 |
+| 1 | ~~N0~~ | 集成 | fmt/cfg 修复＋宿主 Linux 构建＋.NET 入 CI＋测试修准 | 已关闭（2026-09-08）：CI run `34163939549` 七 job 全绿；另修 conformance 角色准入、protocol 夹具 lint、replay 探针夹具、supervision 锁退避 | 无 |
+| 2 | N1 | 平台 | 宿主多连接、会话释放、端点所有权、可靠停机 | **进行中**（代理实现已提交 2 commits：连接归属 grant＋有界停机＋fail-closed UDS） | N0 ✓ |
+| 3 | N2 | 客户端 | 未知修改不重发、连接终态不复活、single-flight | **进行中**（代理实现已提交 3 commits：F07/F08+F09/F19） | N0 ✓ |
 | 4 | N3 | 契约 | 事件 receiver 保留到连接、notification 验证、多行正文 | 提案（F06/F11；F06 已在 HEAD 复核：`work.subscribe` 丢弃 `_receiver`） | N1, N2 |
 | 5 | N4 | GUI | 计划/输出/知情审批/取消/继续/真实状态 | 提案（F12/F13） | N3 |
 | 6 | N5 | 平台/GUI | 正式信封恢复＋结果/差异/工件按需读取 | 提案（F10 已复核：宿主裸 JSON 反序列化） | N2, N3 |
-| 7 | N6 | 基础 | 决策不误终结、lease 跨层一致、Skill 受限句柄、catalog 有界 | 提案（F15–F18；F16/F18 已复核） | N0 |
+| 7 | N6 | 基础 | 决策不误终结、lease 跨层一致、Skill 受限句柄、catalog 有界 | **进行中**（代理实现已提交 4 commits：F15/F16/F17/F18） | N0 ✓ |
 | 8 | N7 | GUI/测量 | 对象与文本保留有界、指标覆盖如实 | 提案（F13/F14） | N4 |
 | 9 | N8 | 扩展/交付 | MCP/Plugin 可配置使用＋Rust/.NET 来源绑定发布（并入 PACKAGE-01、原 R1） | 提案（F20） | N1–N6 |
 | 10 | PACKAGE-01 | 条件 | 打包来源绑定 | 并入 N8 执行 | — |

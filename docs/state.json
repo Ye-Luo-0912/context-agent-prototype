@@ -6,11 +6,8 @@
   "code_commit": "12c86283b8d5991e9f17a07f14871dcf39d65066",
   "ci": {
     "head_commit": "green",
-    "head_run_id": 33986702977,
-    "last_green_commit": "12c86283b8d5991e9f17a07f14871dcf39d65066",
-    "code_commit": "green",
-    "verified_source_commit": "12c86283b8d5991e9f17a07f14871dcf39d65066",
-    "observation": "GitHub Actions run completed/success; all six jobs succeeded",
+    "head_run_id": 34163939549,
+    "observation": "CI all-green at 96e4605 (seven jobs incl. the new .NET job and agent-host Linux check); N0 closed 2026-09-08",
     "scope": "remote CI on the named source only; not local validation or future commits"
   },
   "milestone_gates": {
@@ -111,7 +108,7 @@
   },
   "reviewed_source_commit": "12c86283b8d5991e9f17a07f14871dcf39d65066",
   "source_scope_note": "Fixed reviewed source, not the SHA of later documentation or product commits. 2026-09-06 deep review was a partial-source pass (clone failed; 29 paths, not a full-repo inventory; no local Rust); its code items all closed. 2026-09-07 platform-native re-audit (baseline b299c6a, 19 paths, 4 full) is likewise partial-source; its residuals lead the M17 queue (B1-B3, P1, P2) — see docs/reviews/2026-09-07-platform-native-audit/.",
-  "active_task": "N0 (restore build & CI entry: fmt + host Linux cfg + .NET in CI + test accuracy); then N1/N2/N6 in parallel",
+  "active_task": "M17 closure N-series: N0 closed (CI run 34163939549 all-green on 96e4605); N1/N2/N6 in flight via parallel implementation agents (branches n1-host-service / n2-client-safety / n6-core-semantics), integration A->B->C with targeted verification, then N3->N4",
   "route_reset": {
     "task_document": "docs/NEXT_TASKS.md",
     "archive": "docs/archive/route-reset-12c8628",

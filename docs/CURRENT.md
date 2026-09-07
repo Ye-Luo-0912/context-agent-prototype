@@ -4,7 +4,7 @@
 
 **当前阶段：M17 收尾——可恢复的多入口工作台（N 系列，2026-09-08 切换）。** M17 三线的代码主体已落地（B1–B3、C0、P1、P2 主体、P3 宿主、G1–G3 客户端侧、E1；对照见 [NEXT_TASKS.md](NEXT_TASKS.md) 的 M17 队列表）。本轮的判断变了：**主要缺口不是缺组件，而是端到端链路断着**——订阅成功但事件 receiver 被丢弃、重连自动重发修改操作、宿主恢复绕过正式信封解码、多连接/会话释放/停机缺口。2026-09-08 外部闭环审查（基线 `11afdd747d6cbbb58ef0d7371841e8e365c4f8db`）的 20 项发现（F01–F20）映射为 N0–N8。
 
-**当前工单：N0——恢复构建与验证入口。** 直接事实：CI run `34148921895`（`11afdd7`）与 `34148640847`（`1be2e77`）均在 `cargo fmt --check` 失败（Ubuntu/Windows），fmt 违规集中在 `crates/agent-host`，后续 clippy/build/test 被跳过；另 `HostServer::serve` 的 NamedPipe 分支无条件引用 `#[cfg(windows)]` 的 `winpipe` 模块，Linux 宿主构建有静态缺口。N0 完成后第一批并行：N1（宿主长期服务）、N2（客户端操作安全）、N6（核心语义与读取边界）。
+**N0 已关闭（2026-09-08）：CI run `34163939549` 七 job 全绿**——fmt 修复、宿主 Linux cfg＋UDS e2e、.NET job 入 CI、F20 测试修准；修复链顺带消掉了 conformance 角色准入、protocol 夹具 lint、agent-replay 探针夹具（契约演进被 fmt 红遮蔽四轮的实证）、supervision 锁退避（两进程同 workspace 启动的真实生产问题）。第一批并行 **N1/N2/N6 进行中**（三线代理已提交实现，收线集成按 A→B→C）。
 
 审查原文：[reviews/2026-09-08-closure-audit-11afdd7/REPORT.md](reviews/2026-09-08-closure-audit-11afdd7/REPORT.md)；
 工单全文：[reviews/2026-09-08-closure-audit-11afdd7/NEXT_STAGE_TASKS.md](reviews/2026-09-08-closure-audit-11afdd7/NEXT_STAGE_TASKS.md)。
