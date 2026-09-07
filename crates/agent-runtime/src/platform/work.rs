@@ -168,6 +168,17 @@ impl WorkControlSessionRegistry {
         Ok(())
     }
 
+    /// How many session grants are installed right now. Supervision/test
+    /// observation of the table, not an authority surface: a long-lived host
+    /// must return to its baseline once connections disconnect, and this is
+    /// the fact that proves it.
+    pub fn live_sessions(&self) -> usize {
+        self.sessions
+            .lock()
+            .expect("session registry poisoned")
+            .len()
+    }
+
     pub fn bind(self: &Arc<Self>, session_id: &str) -> AgentResult<BoundWorkSessionAuthorizer> {
         if session_id.is_empty() || session_id.len() > MAX_WORK_SESSION_ID_BYTES {
             return Err(AgentError::InvalidRequest(
@@ -787,5 +798,18 @@ mod tests {
         assert_eq!(recovered.code, "work.recovery_required");
         let _ = WorkSubmissionDisposition::Accepted;
         let _ = Route::work_submit();
+    }
+
+    #[test]
+    fn session_registry_count_reflects_install_and_revoke() {
+        let registry = WorkControlSessionRegistry::new(RunId::new());
+        assert_eq!(registry.live_sessions(), 0);
+        let first = registry.install(WorkControlGrant::operator()).unwrap();
+        let second = registry.install(WorkControlGrant::read_only()).unwrap();
+        assert_eq!(registry.live_sessions(), 2);
+        assert!(registry.revoke(&first).is_ok());
+        assert_eq!(registry.live_sessions(), 1);
+        assert!(registry.revoke(&second).is_ok());
+        assert_eq!(registry.live_sessions(), 0);
     }
 }
