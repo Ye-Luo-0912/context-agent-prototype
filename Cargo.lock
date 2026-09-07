@@ -6,22 +6,30 @@ version = 4
 name = "agent-capability-process"
 version = "0.1.0"
 dependencies = [
+ "agent-compose",
  "agent-contracts",
+ "agent-core",
  "agent-platform-protocol",
  "agent-process",
+ "agent-storage",
+ "agent-workspace",
  "async-trait",
  "base64",
+ "context-simple",
  "serde_json",
  "tempfile",
  "tokio",
+ "tool-runtime",
 ]
 
 [[package]]
 name = "agent-compose"
 version = "0.1.0"
 dependencies = [
+ "agent-capability-process",
  "agent-contracts",
  "agent-core",
+ "agent-process",
  "agent-runtime",
  "agent-storage",
  "agent-workspace",
@@ -131,6 +139,30 @@ dependencies = [
  "tempfile",
  "tokio",
  "tool-runtime",
+]
+
+[[package]]
+name = "agent-host"
+version = "0.1.0"
+dependencies = [
+ "agent-compose",
+ "agent-contracts",
+ "agent-core",
+ "agent-platform-protocol",
+ "agent-process",
+ "agent-runtime",
+ "agent-storage",
+ "agent-workspace",
+ "anyhow",
+ "context-simple",
+ "libc",
+ "serde",
+ "serde_json",
+ "sha2",
+ "tempfile",
+ "tokio",
+ "tool-runtime",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]

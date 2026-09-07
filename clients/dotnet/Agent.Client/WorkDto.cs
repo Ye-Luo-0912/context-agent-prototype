@@ -113,13 +113,13 @@ internal sealed class TurnCancelAckConverter : JsonConverter<TurnCancelAck>
         {
             throw new JsonException("turn cancel ack must be a status-tagged object");
         }
-        var known = new HashSet<string> { "status" };
         var statusText = status.GetString();
         if (statusText == "no_active_turn")
         {
-            if (root.EnumerateObject().Any(p => !known.Add(p.Name)))
+            if (root.EnumerateObject().Any(p => p.Name != "status"))
             {
-                throw new JsonException("no_active_turn ack carries unknown fields");
+                throw new JsonException(
+                    $"no_active_turn ack carries unknown fields: {root.GetRawText()}");
             }
             return new TurnCancelAck { Status = TurnCancelAckStatus.NoActiveTurn };
         }
@@ -130,7 +130,8 @@ internal sealed class TurnCancelAckConverter : JsonConverter<TurnCancelAck>
                 if (property.Name is not ("status" or "turn_id" or "task_id" or "operation_id"
                     or "cancelled_generation" or "effective_generation"))
                 {
-                    throw new JsonException($"cancelled ack carries unknown field '{property.Name}'");
+                    throw new JsonException(
+                        $"cancelled ack carries unknown field '{property.Name}': {root.GetRawText()}");
                 }
             }
             return new TurnCancelAck
