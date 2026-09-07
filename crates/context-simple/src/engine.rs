@@ -1689,27 +1689,32 @@ impl ContextEngine for SimpleContextEngine {
     }
 
     async fn inspect(&self, limit: usize) -> AgentResult<Vec<ContextItemSummary>> {
-        let state = self.state.lock().await;
         // The logical catalog, not just the resident share: the heap, the
         // reversible warm buffer and the external store entries are all
         // known items. External entries project from their descriptor,
         // which carries the authoritative creation clock captured at
         // externalize time.
         //
-        // Bounded by construction: `bounded_catalog` keeps only the
-        // `limit` smallest created_tick summaries while streaming, so the
-        // call's memory stays O(limit) no matter how large the external
-        // store grows — a model-driven catalog call must not cost
-        // proportional to logical history size (resource policy). The
-        // stream order (heap slot, buffer order, externalization order)
-        // makes equal ticks deterministic, exactly like the previous
-        // stable sort + truncate.
-        let summaries = crate::heap::to_summaries(&state.items);
+        // Bounded by construction (F18): `limit == 0` returns before any
+        // projection happens, and otherwise the summaries are generated
+        // lazily while `bounded_catalog` keeps only the `limit` smallest
+        // created_tick rows, so the call's memory stays O(limit) no matter
+        // how large the heap or the external store grows — a model-driven
+        // catalog call must not cost proportional to logical history size
+        // (resource policy). The stream order (heap slot, buffer order,
+        // externalization order) makes equal ticks deterministic, exactly
+        // like the previous stable sort + truncate.
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
+        let state = self.state.lock().await;
         let summaries = crate::heap::bounded_catalog(
             limit,
-            summaries
-                .into_iter()
-                .chain(crate::heap::to_summaries(&state.eviction_buffer))
+            state
+                .items
+                .iter()
+                .map(crate::heap::summary_of)
+                .chain(state.eviction_buffer.iter().map(crate::heap::summary_of))
                 .chain(state.external.iter().map(external_summary)),
         );
         Ok(summaries)

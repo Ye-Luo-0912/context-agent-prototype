@@ -813,6 +813,88 @@ async fn inspect_is_bounded_and_oldest_first() {
     assert_eq!(summaries[2].created_turn, 3);
 }
 
+/// F18: `inspect(0)` takes the early-exit path — an empty catalog with no
+/// projection work at all, whatever the heap, the warm buffer and the
+/// store hold.
+#[tokio::test]
+async fn inspect_zero_limit_projects_nothing() {
+    let engine = SimpleContextEngine::new(SimpleContextConfig::default());
+    for i in 0..5 {
+        engine
+            .ingest(ContextIngress::UserMessage {
+                content: format!("message {i}"),
+            })
+            .await
+            .unwrap();
+    }
+    assert!(engine.inspect(0).await.unwrap().is_empty());
+}
+
+/// F18: the bounded catalog is a lazy projection over heap, warm buffer
+/// and store, with the pre-refactor order preserved: `inspect(limit)`
+/// returns exactly the `limit` smallest created_ticks across *all* body
+/// locations, ascending — the result equals a stable sort of the full
+/// catalog truncated to `limit`.
+#[tokio::test]
+async fn inspect_small_limit_matches_the_sorted_full_catalog_across_locations() {
+    let store = tempfile::tempdir().unwrap();
+    let engine = SimpleContextEngine::new(SimpleContextConfig {
+        // The tiny buffer overflows on the first GC pass, so the catalog
+        // spans Resident, Warm and Stored rows.
+        gc_buffer_capacity: 2,
+        gc_max_generation: 0,
+        context_store_dir: Some(store.path().to_path_buf()),
+        ..SimpleContextConfig::default()
+    });
+    open_focus(&engine, "catalog work").await;
+    for i in 0..6 {
+        engine
+            .ingest(ContextIngress::UserMessage {
+                content: format!("catalog row {i} Ticket{i}.rs"),
+            })
+            .await
+            .unwrap();
+    }
+    engine
+        .maintain(ContextMaintenanceTrigger::AfterModel)
+        .await
+        .unwrap();
+    // Leave the episode: the old rows cool out of the working set and the
+    // first GC pass evicts them, overflowing the tiny buffer to the store.
+    open_focus(&engine, "other work").await;
+    engine
+        .ingest(ContextIngress::UserMessage {
+            content: "something else entirely".into(),
+        })
+        .await
+        .unwrap();
+    engine
+        .maintain(ContextMaintenanceTrigger::AfterModel)
+        .await
+        .unwrap();
+    engine.gc().await.unwrap();
+    {
+        let state = engine.state.lock().await;
+        assert!(
+            !state.eviction_buffer.is_empty() || !state.external.is_empty(),
+            "the catalog must span more than the heap for this test to bite"
+        );
+    }
+
+    let full = engine.inspect(usize::MAX).await.unwrap();
+    assert!(full.len() >= 4, "a real catalog: {}", full.len());
+    let mut expected: Vec<u64> = full.iter().map(|s| s.created_tick).collect();
+    expected.sort();
+
+    let limited = engine.inspect(4).await.unwrap();
+    let got: Vec<u64> = limited.iter().map(|s| s.created_tick).collect();
+    assert_eq!(
+        got,
+        expected[..4],
+        "the limit picks the oldest rows ascending"
+    );
+}
+
 #[tokio::test]
 async fn completed_task_working_set_is_archived_and_stays_out() {
     let engine = SimpleContextEngine::new(SimpleContextConfig::default());

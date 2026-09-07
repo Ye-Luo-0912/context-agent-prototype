@@ -2,32 +2,32 @@ use std::cmp::Ordering;
 
 use agent_contracts::{ContextItem, ContextItemSummary, ExternalizedContext};
 
-/// Project items into bounded UI/replay summaries.
-pub(crate) fn to_summaries(items: &[ContextItem]) -> Vec<ContextItemSummary> {
-    items
-        .iter()
-        .map(|item| ContextItemSummary {
-            id: item.id,
-            kind: item.kind,
-            scope: item.scope,
-            scope_id: item.scope_id,
-            attention: item.attention,
-            semantic: item.semantic,
-            importance: item.importance,
-            relevance: item.relevance,
-            created_tick: item.created_tick,
-            created_turn: item.created_turn,
-            last_access_turn: item.last_access_turn,
-            last_selected_turn: item.last_selected_turn,
-            access_count: item.access_count,
-            // The summary is a projection: it exposes the dependency target
-            // ids, not the edge kinds (the typed graph lives on the item).
-            dependencies: item.dependencies.iter().map(|edge| edge.target).collect(),
-            keep_alive: item.keep_alive,
-            lease_until_turn: item.lease_until_turn,
-            source: item.source.clone(),
-        })
-        .collect()
+/// Project one item into a bounded UI/replay summary. `inspect` maps this
+/// over its sources lazily (iterator chain into `bounded_catalog`), so a
+/// catalog call allocates only for the rows it keeps — never one summary
+/// per resident/buffer item (F18).
+pub(crate) fn summary_of(item: &ContextItem) -> ContextItemSummary {
+    ContextItemSummary {
+        id: item.id,
+        kind: item.kind,
+        scope: item.scope,
+        scope_id: item.scope_id,
+        attention: item.attention,
+        semantic: item.semantic,
+        importance: item.importance,
+        relevance: item.relevance,
+        created_tick: item.created_tick,
+        created_turn: item.created_turn,
+        last_access_turn: item.last_access_turn,
+        last_selected_turn: item.last_selected_turn,
+        access_count: item.access_count,
+        // The summary is a projection: it exposes the dependency target
+        // ids, not the edge kinds (the typed graph lives on the item).
+        dependencies: item.dependencies.iter().map(|edge| edge.target).collect(),
+        keep_alive: item.keep_alive,
+        lease_until_turn: item.lease_until_turn,
+        source: item.source.clone(),
+    }
 }
 
 /// Project an external store entry into a summary so `inspect` covers the
