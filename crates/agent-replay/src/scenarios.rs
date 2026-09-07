@@ -172,9 +172,31 @@ impl Script {
         });
         for output in tools {
             self.prepare();
+            // Mirror the runtime's verification facts capture: a trusted
+            // verify.run observation carries its recipe identity as typed
+            // facts (M17-B3/F08) — that identity is what lets a later green
+            // round archive the errors the failing rounds recorded.
+            let facts = if output.tool_name == "verify.run" {
+                output
+                    .metadata
+                    .get("recipe_id")
+                    .and_then(serde_json::Value::as_str)
+                    .map(|recipe_id| {
+                        agent_contracts::ExecutionFactsEnvelope::new(
+                            agent_contracts::ToolExecutionFacts::empty()
+                                .with_verification_probe(agent_contracts::VerificationProbe {
+                                    recipe_id: recipe_id.to_owned(),
+                                    recipe_revision: "1".into(),
+                                    definition_digest: recipe_id.to_owned(),
+                                }),
+                        )
+                    })
+            } else {
+                None
+            };
             self.push(RuntimeEvent::ToolFinished {
                 output: output.clone(),
-                facts: None,
+                facts,
             });
             self.push(RuntimeEvent::ContextMaintained {
                 trigger: ContextMaintenanceTrigger::AfterTool,
@@ -282,9 +304,14 @@ fn big_log(prefix: &str, lines: usize) -> String {
 fn test_log(failing: bool, lines: usize) -> ToolOutput {
     let body = big_log(if failing { "FAIL " } else { "PASS " }, lines);
     // The green round runs through the trusted verification recipe: under
-    // the error-verification contract only a verify.run success proves an
-    // error fixed.
-    tool("verify.run", !failing, &body)
+    // the error-verification contract (M17-B3/F08) a failing gate records
+    // the recipe id on the error, and only the SAME recipe's success proves
+    // the error fixed — every round is that gate, so each carries the id.
+    let mut output = tool("verify.run", !failing, &body);
+    if let Some(metadata) = output.metadata.as_object_mut() {
+        metadata.insert("recipe_id".into(), serde_json::json!("integration.tests"));
+    }
+    output
 }
 
 // ---------------------------------------------------------------------------

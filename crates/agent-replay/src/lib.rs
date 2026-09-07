@@ -809,12 +809,28 @@ mod tests {
     }
 
     fn tool_output_at(ok: bool, model_content: &str, path: Option<&str>) -> ToolOutput {
-        tool_output_named(
-            if ok { "verify.run" } else { "shell.exec" },
-            ok,
-            model_content,
-            path,
-        )
+        // The trusted verification flow (M17-B3/F08): the failing gate
+        // records the error with its recipe id, and only the SAME recipe's
+        // success is proof enough to archive it.
+        let mut output = tool_output_named("verify.run", ok, model_content, path);
+        if let Some(metadata) = output.metadata.as_object_mut() {
+            metadata.insert("recipe_id".into(), json!("replay.tests"));
+        }
+        output
+    }
+
+    /// Typed verification facts matching `tool_output_at`'s recipe — the
+    /// channel the runtime uses instead of raw metadata.
+    fn verification_facts() -> Option<agent_contracts::ExecutionFactsEnvelope> {
+        Some(agent_contracts::ExecutionFactsEnvelope::new(
+            agent_contracts::ToolExecutionFacts::empty().with_verification_probe(
+                agent_contracts::VerificationProbe {
+                    recipe_id: "replay.tests".into(),
+                    recipe_revision: "1".into(),
+                    definition_digest: "replay.tests".into(),
+                },
+            ),
+        ))
     }
 
     fn tool_output_named(
@@ -1383,7 +1399,11 @@ mod tests {
     #[tokio::test]
     async fn replay_persists_error_until_verified_then_archives() {
         let run = RunId::new();
+        // The runtime establishes task focus before the work: the task id is
+        // part of the verification association (same task + same probe).
+        let task_id = TaskId::new();
         let events = vec![
+            envelope(run, 0, RuntimeEvent::FocusChanged { task_id, goal: "fix the failing tests".into() }),
             // Turn 1: first attempt fails.
             envelope(run, 1, RuntimeEvent::user_message_accepted("run tests")),
             envelope(
@@ -1420,7 +1440,7 @@ mod tests {
                         "tests failed: AuthService.rs:42",
                         Some("AuthService.rs"),
                     ),
-                    facts: None,
+                    facts: verification_facts(),
                 },
             ),
             envelope(
@@ -1485,7 +1505,7 @@ mod tests {
                         "tests passed in AuthService.rs",
                         Some("AuthService.rs"),
                     ),
-                    facts: None,
+                    facts: verification_facts(),
                 },
             ),
             envelope(
