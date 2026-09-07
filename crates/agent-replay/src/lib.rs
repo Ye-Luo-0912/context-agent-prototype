@@ -1403,7 +1403,14 @@ mod tests {
         // part of the verification association (same task + same probe).
         let task_id = TaskId::new();
         let events = vec![
-            envelope(run, 0, RuntimeEvent::FocusChanged { task_id, goal: "fix the failing tests".into() }),
+            envelope(
+                run,
+                0,
+                RuntimeEvent::FocusChanged {
+                    task_id,
+                    goal: "fix the failing tests".into(),
+                },
+            ),
             // Turn 1: first attempt fails.
             envelope(run, 1, RuntimeEvent::user_message_accepted("run tests")),
             envelope(

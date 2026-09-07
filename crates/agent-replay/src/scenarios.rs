@@ -183,12 +183,13 @@ impl Script {
                     .and_then(serde_json::Value::as_str)
                     .map(|recipe_id| {
                         agent_contracts::ExecutionFactsEnvelope::new(
-                            agent_contracts::ToolExecutionFacts::empty()
-                                .with_verification_probe(agent_contracts::VerificationProbe {
+                            agent_contracts::ToolExecutionFacts::empty().with_verification_probe(
+                                agent_contracts::VerificationProbe {
                                     recipe_id: recipe_id.to_owned(),
                                     recipe_revision: "1".into(),
                                     definition_digest: recipe_id.to_owned(),
-                                }),
+                                },
+                            ),
                         )
                     })
             } else {
