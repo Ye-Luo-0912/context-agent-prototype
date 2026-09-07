@@ -1,0 +1,90 @@
+<Window xmlns="https://github.com/avaloniaui"
+        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        xmlns:vm="using:FocusAgent.Desktop.ViewModels"
+        x:Class="FocusAgent.Desktop.MainWindow"
+        x:DataType="vm:MainWindowViewModel"
+        Title="Focus Agent 工作台"
+        Width="1180" Height="760"
+        WindowStartupLocation="CenterScreen">
+
+  <Grid Margin="12" RowDefinitions="Auto,*,Auto" ColumnDefinitions="*">
+
+    <!-- 连接栏 -->
+    <StackPanel Grid.Row="0" Orientation="Horizontal" Spacing="8" Margin="0,0,0,10">
+      <ComboBox ItemsSource="{Binding Transports}" SelectedIndex="{Binding TransportIndex}" MinWidth="190" />
+      <TextBox Text="{Binding Endpoint}" MinWidth="260" />
+      <Button Content="连接" Command="{Binding ConnectCommand}" />
+      <Button Content="断开" Command="{Binding DisconnectCommand}" />
+      <CheckBox Content="自动刷新" IsChecked="{Binding AutoRefresh}" VerticalAlignment="Center" />
+      <TextBlock Text="{Binding ConnectionLabel}" VerticalAlignment="Center" FontWeight="SemiBold" />
+    </StackPanel>
+
+    <!-- 主体：左任务列表 / 右工作区 -->
+    <Grid Grid.Row="1" ColumnDefinitions="340,*">
+
+      <Border Grid.Column="0" BorderBrush="#33808080" BorderThickness="1" CornerRadius="6" Padding="8" Margin="0,0,10,0">
+        <DockPanel>
+          <TextBlock DockPanel.Dock="Top" Text="任务" FontWeight="Bold" Margin="0,0,0,6" />
+          <ListBox ItemsSource="{Binding Tasks}">
+            <ListBox.ItemTemplate>
+              <DataTemplate x:DataType="vm:TaskItemViewModel">
+                <StackPanel Margin="2">
+                  <TextBlock Text="{Binding Goal}" TextWrapping="Wrap" FontWeight="SemiBold" />
+                  <TextBlock Text="{Binding StatusLine}" Foreground="#99808080" TextWrapping="Wrap" />
+                </StackPanel>
+              </DataTemplate>
+            </ListBox.ItemTemplate>
+          </ListBox>
+        </DockPanel>
+      </Border>
+
+      <Grid Grid.Column="1" RowDefinitions="Auto,Auto,Auto,*,Auto">
+
+        <!-- 输入区 -->
+        <TextBox Grid.Row="0" Text="{Binding GoalInput}" Watermark="描述一个新的工作目标（提交后原子建立任务并排队首轮输入）…"
+                 AcceptsReturn="True" MinHeight="64" TextWrapping="Wrap" />
+
+        <StackPanel Grid.Row="1" Orientation="Horizontal" Spacing="8" Margin="0,8">
+          <Button Content="提交新工作" Command="{Binding SubmitCommand}" />
+          <Button Content="继续" Command="{Binding ContinueCommand}" />
+          <Button Content="取消当前轮" Command="{Binding CancelCommand}" />
+          <Button Content="刷新快照" Command="{Binding RefreshCommand}" />
+        </StackPanel>
+
+        <!-- 待审批 -->
+        <StackPanel Grid.Row="2" Spacing="4" Margin="0,4">
+          <TextBlock Text="待审批（服务端绑定，等待真实回执）" FontWeight="Bold" />
+          <ItemsControl ItemsSource="{Binding Approvals}">
+            <ItemsControl.ItemTemplate>
+              <DataTemplate x:DataType="vm:ApprovalItemViewModel">
+                <Border BorderBrush="#33808080" BorderThickness="1" CornerRadius="4" Padding="6" Margin="0,2">
+                  <StackPanel Orientation="Horizontal" Spacing="8">
+                    <TextBlock Text="{Binding Title}" VerticalAlignment="Center" />
+                    <Button Content="允许" Command="{Binding AllowCommand}" />
+                    <Button Content="拒绝" Command="{Binding DenyCommand}" />
+                  </StackPanel>
+                </Border>
+              </DataTemplate>
+            </ItemsControl.ItemTemplate>
+          </ItemsControl>
+        </StackPanel>
+
+        <!-- 输出 -->
+        <TextBox Grid.Row="3" Text="{Binding OutputText}" IsReadOnly="True" TextWrapping="Wrap"
+                 FontFamily="Consolas,monospace" Margin="0,8,0,0" />
+
+        <!-- 状态条 -->
+        <Border Grid.Row="4" BorderBrush="#33808080" BorderThickness="0,1,0,0" Padding="0,8,0,0" Margin="0,8,0,0">
+          <StackPanel Orientation="Horizontal" Spacing="16">
+            <TextBlock><Run Text="watermark: " /><Run Text="{Binding Watermark}" /></TextBlock>
+            <TextBlock Text="{Binding FocusText}" TextWrapping="Wrap" MaxWidth="460" />
+            <TextBlock Text="{Binding PlanText}" Foreground="#99808080" TextWrapping="Wrap" MaxWidth="420" />
+          </StackPanel>
+        </Border>
+      </Grid>
+    </Grid>
+
+    <TextBlock Grid.Row="2" Margin="0,10,0,0" Foreground="#99808080"
+               Text="C0 会话契约 · 受理 ≠ 应用 ≠ 任务完成 ≠ 清理确认；审批等待服务端回执，不本地宣布授权。" />
+  </Grid>
+</Window>

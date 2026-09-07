@@ -1,0 +1,14 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <TargetFramework>net10.0</TargetFramework>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+    <LangVersion>latest</LangVersion>
+    <TreatWarningsAsErrors>true</TreatWarningsAsErrors>
+    <RootNamespace>FocusAgent.Client</RootNamespace>
+    <AssemblyName>Agent.Client</AssemblyName>
+    <Description>FocusAgent platform client library: C0 session contract DTOs, bounded framing, and local RPC transports. No Avalonia dependency; usable from any .NET host.</Description>
+  </PropertyGroup>
+
+</Project>

@@ -11,3 +11,10 @@ eval.env
 .env
 .env.local
 dist/
+
+# .NET build artifacts
+clients/dotnet/**/bin/
+clients/dotnet/**/obj/
+apps/**/bin/
+apps/**/obj/
+*.user
