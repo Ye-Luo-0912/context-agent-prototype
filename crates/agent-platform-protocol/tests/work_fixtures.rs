@@ -12,10 +12,8 @@ use std::path::PathBuf;
 use agent_platform_protocol::{
     ApprovalRespondOutcome, ApprovalRespondRequest, ApprovalRespondResponse, Attempt,
     DeadlineRemainingMs, EnvelopeKind, MessageId, NegotiatedContractProfile, PlatformEnvelope,
-    PlatformResponse, ProtocolIdentity, ProtocolVersion, RequestId, Route, SchemaDigest,
-    TaskSnapshotStatus, WorkCancelRequest, WorkCancelResponse, WorkContinueRequest,
-    WorkContinueResponse, WorkSnapshotRequest, WorkSnapshotResponse, WorkSubmitDisposition,
-    WorkSubmitRequest, WorkSubmitResponse, WorkSubscribeRequest, WorkSubscribeResponse,
+    PlatformResponse, ProtocolIdentity, ProtocolVersion, RequestId, SchemaDigest,
+    TaskSnapshotStatus, WorkSubmitDisposition, WorkSubmitRequest, WorkSubmitResponse,
     validate_approval_respond_request, validate_approval_respond_response,
     validate_work_cancel_request, validate_work_cancel_response, validate_work_continue_request,
     validate_work_continue_response, validate_work_snapshot_request,
@@ -26,6 +24,13 @@ use std::str::FromStr;
 
 use agent_contracts::{ApprovalDecision, TurnCancelAck};
 use serde::de::DeserializeOwned;
+
+/// The route validator shape shared by every request/response fixture pair.
+type FixtureValidator<TRequest, TResponse> = fn(
+    &NegotiatedContractProfile,
+    &PlatformEnvelope<TRequest>,
+    &PlatformEnvelope<PlatformResponse<TResponse>>,
+) -> agent_platform_protocol::ValidationResult<()>;
 
 fn fixtures_dir() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/work")
@@ -54,11 +59,9 @@ fn profile() -> NegotiatedContractProfile {
 
 /// Re-encoding must be byte-identical: field order, skipping, and enum
 /// casing are all wire contract, not implementation detail.
-fn assert_round_trip_is_byte_identical<T: DeserializeOwned + serde::Serialize>(
-    text: &str,
-    name: &str,
-) where
-    T: PartialEq + std::fmt::Debug,
+fn assert_round_trip_is_byte_identical<T>(text: &str, name: &str)
+where
+    T: DeserializeOwned + serde::Serialize + PartialEq + std::fmt::Debug,
 {
     let decoded: T = serde_json::from_str(text)
         .unwrap_or_else(|error| panic!("fixture {name} must decode: {error}"));
@@ -78,11 +81,7 @@ fn request_pair<TRequest, TResponse>(
         &NegotiatedContractProfile,
         &PlatformEnvelope<TRequest>,
     ) -> agent_platform_protocol::ValidationResult<()>,
-    validate_response: fn(
-        &NegotiatedContractProfile,
-        &PlatformEnvelope<TRequest>,
-        &PlatformEnvelope<PlatformResponse<TResponse>>,
-    ) -> agent_platform_protocol::ValidationResult<()>,
+    validate_response: FixtureValidator<TRequest, TResponse>,
 ) -> (PlatformEnvelope<TRequest>, TResponse)
 where
     TRequest: DeserializeOwned + serde::Serialize + PartialEq + std::fmt::Debug,
