@@ -65,28 +65,29 @@ fn parse_args() -> anyhow::Result<Args> {
     Ok(args)
 }
 
-fn resolve_endpoint(args: &Args) -> LocalEndpoint {
+fn resolve_endpoint(args: &Args, workspace_root: &std::path::Path) -> LocalEndpoint {
     match (&args.pipe, &args.socket) {
         (Some(name), _) => LocalEndpoint::NamedPipe(name.clone()),
         (None, Some(path)) => LocalEndpoint::UnixSocket(path.clone()),
-        (None, None) => {
-            if cfg!(windows) {
-                LocalEndpoint::NamedPipe(agent_compose_endpoint_default())
-            } else {
-                LocalEndpoint::UnixSocket(default_socket_path())
-            }
-        }
+        (None, None) => default_endpoint(workspace_root),
     }
 }
 
-fn agent_compose_endpoint_default() -> String {
-    // Matches the .NET client's AgentTransports.DefaultPipeName.
-    "focus-agent.platform.v1".to_string()
+#[cfg(windows)]
+fn default_endpoint(_workspace_root: &std::path::Path) -> LocalEndpoint {
+    // Matches the .NET client's AgentTransports.DefaultPipeName; the pipe
+    // name space is additionally guarded by the current-user DACL and the
+    // per-connection token check, and FILE_FLAG_FIRST_PIPE_INSTANCE
+    // refuses takeover of a live pipe.
+    LocalEndpoint::NamedPipe("focus-agent.platform.v1".to_string())
 }
 
-fn default_socket_path() -> std::path::PathBuf {
-    // Matches the .NET client's AgentTransports.DefaultSocketPath.
-    std::path::PathBuf::from("/tmp/focus-agent-platform-v1.sock")
+#[cfg(unix)]
+fn default_endpoint(workspace_root: &std::path::Path) -> LocalEndpoint {
+    // Never a fixed global /tmp name: the endpoint is user-private and
+    // workspace-scoped. Clients that rely on the old fixed default must
+    // pass --socket (or derive the same workspace-scoped path) explicitly.
+    LocalEndpoint::UnixSocket(agent_host::default_socket_path_for(workspace_root))
 }
 
 #[tokio::main]
@@ -234,7 +235,7 @@ async fn real_main() -> anyhow::Result<()> {
         registry,
     };
     let stop = Arc::new(AtomicBool::new(false));
-    let endpoint = resolve_endpoint(&args);
+    let endpoint = resolve_endpoint(&args, &root);
     let server = HostServer {
         endpoint: endpoint.clone(),
         read_only: args.read_only,
