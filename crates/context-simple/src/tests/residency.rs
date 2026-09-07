@@ -652,7 +652,10 @@ async fn warm_working_item_is_tombstoned_by_staleness() {
 /// A terminal semantic transition (supersession) must reach the target
 /// wherever its body currently sits. A decision externalized to the store
 /// (Cold) and one sitting in the warm buffer are still the same decisions:
-/// a later decision on the same entities supersedes them.
+/// a later decision of the SAME task that provably replaces them (explicit
+/// replacement cue + the same semantic key) supersedes them (F15: the
+/// earlier version of this scan superseded on entity overlap alone, which
+/// let a different task's decision kill these records).
 #[tokio::test]
 async fn supersession_reaches_warm_and_stored_decisions() {
     let store = tempfile::tempdir().unwrap();
@@ -664,7 +667,7 @@ async fn supersession_reaches_warm_and_stored_decisions() {
         context_store_dir: Some(store.path().to_path_buf()),
         ..SimpleContextConfig::default()
     });
-    open_focus(&engine, "auth work").await;
+    let task_a = open_focus(&engine, "auth work").await;
     // A1 (AuthService.rs) is the oldest decision: it overflows to Cold.
     // A3 (CacheStore.rs) is newer: it stays Warm in the buffer.
     engine
@@ -729,17 +732,58 @@ async fn supersession_reaches_warm_and_stored_decisions() {
         );
     }
 
-    // A later decision on the same entities supersedes each, wherever it
-    // sits. The maintain pass applies the queued terminal transitions.
+    // A decision from task B on the same entities must NOT finalize A's
+    // records (F15: cross-task overlap is not proof), even with an
+    // explicit replacement cue.
     engine
         .ingest(ContextIngress::UserMessage {
-            content: "use AuthService.rs for the cache layer".into(),
+            content: "drop AuthService.rs from the plan".into(),
+        })
+        .await
+        .unwrap();
+    engine
+        .maintain(ContextMaintenanceTrigger::AfterModel)
+        .await
+        .unwrap();
+    {
+        let state = engine.state.lock().await;
+        assert!(
+            state.external.get(a1_id).unwrap().semantic.is_live(),
+            "another task's decision must not supersede the stored one"
+        );
+        assert!(
+            state
+                .eviction_buffer
+                .iter()
+                .any(|item| item.id == a3_id && item.semantic.is_live()),
+            "another task's decision must not supersede the warm one"
+        );
+    }
+
+    // Back in task A (the runtime re-opens the same task id), a later
+    // decision that provably replaces each line supersedes it, wherever it
+    // sits. The reopen goal matches the first message so the episode does
+    // not rotate (a scope close would promote the warm decision back into
+    // the heap before the supersession can reach it in the buffer). The
+    // maintain pass applies the queued terminal transitions.
+    engine
+        .ingest(ContextIngress::FocusChanged {
+            focus: agent_contracts::FocusState::for_task(
+                task_a,
+                "drop AuthService.rs for the cache layer",
+            ),
         })
         .await
         .unwrap();
     engine
         .ingest(ContextIngress::UserMessage {
-            content: "use CacheStore.rs for the read path".into(),
+            content: "drop AuthService.rs for the cache layer".into(),
+        })
+        .await
+        .unwrap();
+    engine
+        .ingest(ContextIngress::UserMessage {
+            content: "drop CacheStore.rs for the read path".into(),
         })
         .await
         .unwrap();

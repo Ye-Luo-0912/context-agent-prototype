@@ -937,6 +937,137 @@ async fn later_decision_supersedes_earlier_decision() {
     );
 }
 
+/// F15: two compatible decisions about the same file share the semantic key
+/// but withdraw nothing — "use X with a timeout" and "use X with logging"
+/// must coexist. Entity overlap alone is a relevance signal, never proof,
+/// and plain "use" carries no replacement cue.
+#[tokio::test]
+async fn compatible_decisions_about_one_file_coexist() {
+    let engine = SimpleContextEngine::new(SimpleContextConfig::default());
+    engine
+        .ingest(ContextIngress::UserMessage {
+            content: "use AuthService.rs with a 5-second timeout".into(),
+        })
+        .await
+        .unwrap();
+    engine
+        .ingest(ContextIngress::UserMessage {
+            content: "use AuthService.rs with structured logging".into(),
+        })
+        .await
+        .unwrap();
+    let report = engine
+        .maintain(ContextMaintenanceTrigger::UserInput)
+        .await
+        .unwrap();
+    assert!(
+        report
+            .transitions
+            .iter()
+            .all(|t| !t.reason.contains("superseded by decision")),
+        "compatible decisions must not supersede each other: {:?}",
+        report
+            .transitions
+            .iter()
+            .map(|t| &t.reason)
+            .collect::<Vec<_>>()
+    );
+    let state = engine.state.lock().await;
+    let decisions: Vec<_> = state
+        .items
+        .iter()
+        .filter(|item| item.content.contains("AuthService.rs"))
+        .collect();
+    assert_eq!(decisions.len(), 2, "both decisions exist");
+    assert!(
+        decisions.iter().all(|item| item.semantic.is_live()),
+        "neither decision may be finalized: {:?}",
+        decisions
+            .iter()
+            .map(|item| item.semantic)
+            .collect::<Vec<_>>()
+    );
+}
+
+/// F15: a decision from another task never finalizes this task's decision,
+/// even when the message names the same file and carries an explicit
+/// replacement cue. Only the same task context can prove a replacement.
+#[tokio::test]
+async fn cross_task_entity_overlap_does_not_supersede_decisions() {
+    let engine = SimpleContextEngine::new(SimpleContextConfig::default());
+    let task_a = open_focus(&engine, "auth work").await;
+    engine
+        .ingest(ContextIngress::UserMessage {
+            content: "use AuthService.rs for login".into(),
+        })
+        .await
+        .unwrap();
+    let _task_b = open_focus(&engine, "billing work").await;
+    engine
+        .ingest(ContextIngress::UserMessage {
+            content: "drop AuthService.rs from the plan".into(),
+        })
+        .await
+        .unwrap();
+    engine
+        .maintain(ContextMaintenanceTrigger::UserInput)
+        .await
+        .unwrap();
+    let state = engine.state.lock().await;
+    let login_decision = state
+        .items
+        .iter()
+        .find(|item| item.task_id == Some(task_a) && item.content.contains("use AuthService.rs"))
+        .expect("task A's decision exists");
+    assert!(
+        login_decision.semantic.is_live(),
+        "another task's decision must not finalize task A's decision, got {:?}",
+        login_decision.semantic
+    );
+}
+
+/// F15: an explicit replacement ("switch to Y instead of X") of the same
+/// task supersedes the older line, and the Superseded state names the
+/// replacing decision (`by`).
+#[tokio::test]
+async fn explicit_replacement_supersedes_and_names_the_replacement() {
+    let engine = SimpleContextEngine::new(SimpleContextConfig::default());
+    engine
+        .ingest(ContextIngress::UserMessage {
+            content: "use TOML for config".into(),
+        })
+        .await
+        .unwrap();
+    engine
+        .ingest(ContextIngress::UserMessage {
+            content: "switch to YAML instead of TOML".into(),
+        })
+        .await
+        .unwrap();
+    engine
+        .maintain(ContextMaintenanceTrigger::UserInput)
+        .await
+        .unwrap();
+    let state = engine.state.lock().await;
+    let old = state
+        .items
+        .iter()
+        .find(|item| item.content == "use TOML for config")
+        .expect("the replaced decision stays addressable");
+    let new = state
+        .items
+        .iter()
+        .find(|item| item.content == "switch to YAML instead of TOML")
+        .expect("the replacing decision exists");
+    assert_eq!(
+        old.semantic,
+        agent_contracts::SemanticState::Superseded { by: Some(new.id) },
+        "the old decision must be superseded by the new one, got {:?}",
+        old.semantic
+    );
+    assert!(new.semantic.is_live(), "the replacement stays live");
+}
+
 #[tokio::test]
 async fn recurring_failure_supersedes_prior_error() {
     let engine = SimpleContextEngine::new(SimpleContextConfig::default());

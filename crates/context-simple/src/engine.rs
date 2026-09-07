@@ -922,11 +922,13 @@ impl ContextEngine for SimpleContextEngine {
                     if self.config.supersession && reachability::classify_decision(&content) {
                         let snippet: String = content.chars().take(60).collect();
                         let turn = state.turn;
+                        let task_id = state.focus.as_ref().map(|focus| focus.task_id);
                         reachability::queue_decision_supersessions(
                             &mut state,
                             &content,
                             &format!("superseded by decision at turn {turn}: '{snippet}'"),
                             item_id,
+                            task_id,
                         );
                     }
                 }
