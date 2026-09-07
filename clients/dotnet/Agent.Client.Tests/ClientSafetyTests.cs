@@ -229,6 +229,19 @@ public class ClientSafetyTests
         return client.GetStream();
     }
 
+    private static async Task WaitUntilAsync(Func<bool> condition)
+    {
+        foreach (var _ in Enumerable.Range(0, 500))
+        {
+            if (condition())
+            {
+                return;
+            }
+            await Task.Delay(10);
+        }
+        Assert.True(condition(), "condition not met within the polling budget");
+    }
+
     [Fact]
     public async Task Faulted_connection_leaves_submit_unknown_and_never_re_sends()
     {
@@ -288,5 +301,253 @@ public class ClientSafetyTests
             await session.DisposeAsync();
             await host.DisposeAsync();
         }
+    }
+
+    [Fact]
+    public async Task Fault_fails_pending_waiters_and_refuses_new_requests_without_sending()
+    {
+        await using var host = new CountingLoopHost();
+        host.PlanFor = _ => new CountingLoopHost.ConnectionPlan
+        {
+            Submit = CountingLoopHost.SubmitAnswer.DropWithoutAnswer,
+        };
+
+        await using var connection = new AgentConnection(await ConnectAsync(host.Port));
+
+        // The submit is fully sent; the host reads the frame and drops the
+        // socket without answering. The terminal fault completes the waiter
+        // with the fault reason — it never hangs and never invents a reply.
+        var failure = await Assert.ThrowsAsync<AgentContractViolationException>(
+            () => connection.SubmitWorkAsync("n2: waiter drill", "req-waiter").WaitAsync(TimeSpan.FromSeconds(10)));
+        Assert.Contains("host closed the stream", failure.Message, StringComparison.Ordinal);
+        Assert.False(connection.IsConnected);
+
+        // New requests are refused without a single further byte on the wire.
+        await Assert.ThrowsAsync<AgentConnectionFaultedException>(
+            () => connection.SubmitWorkAsync("n2: refused", "req-refused").WaitAsync(TimeSpan.FromSeconds(10)));
+        Assert.Equal(1, host.SubmitFrames);
+    }
+
+    [Fact]
+    public async Task Short_write_poisons_the_connection_and_fails_every_waiter()
+    {
+        var stream = new FaultInjectionStream();
+        await using var connection = new AgentConnection(stream);
+
+        // A holds the write lock inside its stalled payload write; B queues
+        // behind it with its waiter already registered.
+        var taskA = connection.SnapshotAsync();
+        await stream.PayloadWriteStalled.WaitAsync(TimeSpan.FromSeconds(10));
+        var taskB = connection.SnapshotAsync();
+        await Task.Delay(100); // let B register and queue on the write lock
+
+        // Half a frame lands on the "wire", then the write explodes: the
+        // frame boundary is lost, so the connection must be poisoned.
+        stream.ReleasePayloadWrite();
+
+        await Assert.ThrowsAsync<IOException>(() => taskA.WaitAsync(TimeSpan.FromSeconds(10)));
+        await Assert.ThrowsAnyAsync<Exception>(() => taskB.WaitAsync(TimeSpan.FromSeconds(10)));
+        Assert.False(connection.IsConnected);
+
+        // The poisoned connection writes no further bytes and refuses new work.
+        var writesAtFault = stream.WriteCalls;
+        var bytesAtFault = stream.BytesWritten;
+        await Assert.ThrowsAsync<AgentConnectionFaultedException>(
+            () => connection.SnapshotAsync().WaitAsync(TimeSpan.FromSeconds(10)));
+        Assert.Equal(writesAtFault, stream.WriteCalls);
+        Assert.Equal(bytesAtFault, stream.BytesWritten);
+    }
+
+    [Fact]
+    public async Task Ten_concurrent_operations_share_one_connection()
+    {
+        await using var host = new CountingLoopHost(); // answers everything
+        var connectCalls = 0;
+        var session = new ResumableSession(() =>
+        {
+            Interlocked.Increment(ref connectCalls);
+            return ConnectAsync(host.Port);
+        });
+        try
+        {
+            var tasks = Enumerable.Range(0, 10).Select(_ => session.SnapshotAsync()).ToArray();
+            var snapshots = await Task.WhenAll(tasks).WaitAsync(TimeSpan.FromSeconds(15));
+            Assert.All(snapshots, snapshot => Assert.Equal(41ul, snapshot.Watermark));
+            Assert.Equal(1, Volatile.Read(ref connectCalls)); // single-flight: one attempt backs all ten callers
+            Assert.Equal(1, host.ConnectionsAccepted);
+            Assert.Equal(11, host.SnapshotFrames);            // one handshake + ten operations, one connection
+        }
+        finally
+        {
+            await session.DisposeAsync();
+            await host.DisposeAsync();
+        }
+    }
+
+    [Fact]
+    public async Task Concurrent_callers_share_one_failed_connect_attempt()
+    {
+        var connectCalls = 0;
+        var release = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var session = new ResumableSession(async () =>
+        {
+            Interlocked.Increment(ref connectCalls);
+            await release.Task.WaitAsync(TimeSpan.FromSeconds(10));
+            var client = new TcpClient();
+            await client.ConnectAsync(IPAddress.Loopback, 1); // port 1: refused fast
+            return client.GetStream();
+        });
+        try
+        {
+            // Mutations never retry a failed attempt (nothing was sent, and
+            // the query-retry rule does not apply), so the attempt count is
+            // deterministic: all ten callers await the SAME refused attempt.
+            var tasks = Enumerable.Range(0, 10)
+                .Select(_ => session.SubmitWorkAsync("n2: shared refused attempt", ClientRequestIds.Next()))
+                .ToArray();
+            await WaitUntilAsync(() => Volatile.Read(ref connectCalls) == 1);
+            await Task.Delay(100); // let every caller pile onto the single in-flight attempt
+            release.TrySetResult();
+
+            await Task.WhenAll(tasks.Select(task => Assert.ThrowsAnyAsync<Exception>(() => task)))
+                .WaitAsync(TimeSpan.FromSeconds(15));
+            Assert.Equal(1, Volatile.Read(ref connectCalls));
+        }
+        finally
+        {
+            await session.DisposeAsync();
+        }
+    }
+
+    [Fact]
+    public async Task A_connect_arriving_after_dispose_is_discarded_not_installed()
+    {
+        await using var host = new CountingLoopHost(); // would answer the handshake
+        var connectCalls = 0;
+        var gate = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var session = new ResumableSession(async () =>
+        {
+            Interlocked.Increment(ref connectCalls);
+            await gate.Task.WaitAsync(TimeSpan.FromSeconds(10)); // park the attempt mid-flight
+            return await ConnectAsync(host.Port);
+        });
+
+        var operation = session.SnapshotAsync();
+        await WaitUntilAsync(() => Volatile.Read(ref connectCalls) == 1);
+
+        // Dispose while the connect is parked, THEN let the connect arrive:
+        // the session is dead and must stay dead.
+        await session.DisposeAsync();
+        gate.TrySetResult();
+
+        await Assert.ThrowsAsync<ObjectDisposedException>(() => operation.WaitAsync(TimeSpan.FromSeconds(10)));
+        Assert.Equal(1, Volatile.Read(ref connectCalls)); // no revival: the factory never runs again
+        Assert.False(session.IsConnected);
+        await Assert.ThrowsAsync<ObjectDisposedException>(() => session.SnapshotAsync());
+    }
+}
+
+/// <summary>
+/// A stream whose never-answered reads park until dispose and whose writes
+/// are scripted: full header, then a stalled payload write that ends in a
+/// short write plus IOException — the half-frame poison drill.
+/// </summary>
+internal sealed class FaultInjectionStream : Stream
+{
+    private readonly object _gate = new();
+    private readonly TaskCompletionSource _payloadStallEntered = new(TaskCreationOptions.RunContinuationsAsynchronously);
+    private readonly TaskCompletionSource _payloadStallRelease = new(TaskCreationOptions.RunContinuationsAsynchronously);
+    private readonly TaskCompletionSource _readParking = new(TaskCreationOptions.RunContinuationsAsynchronously);
+    private int _writeCalls;
+    private int _bytesWritten;
+    private bool _disposed;
+
+    public int WriteCalls
+    {
+        get { lock (_gate) { return _writeCalls; } }
+    }
+
+    public int BytesWritten
+    {
+        get { lock (_gate) { return _bytesWritten; } }
+    }
+
+    /// <summary>Completes when the payload write has reached the stall point.</summary>
+    public Task PayloadWriteStalled => _payloadStallEntered.Task;
+
+    public void ReleasePayloadWrite() => _payloadStallRelease.TrySetResult();
+
+    public override bool CanRead => true;
+    public override bool CanSeek => false;
+    public override bool CanWrite => true;
+
+    public override async ValueTask WriteAsync(ReadOnlyMemory<byte> buffer, CancellationToken cancellationToken = default)
+    {
+        int call;
+        lock (_gate)
+        {
+            if (_disposed)
+            {
+                throw new ObjectDisposedException(nameof(FaultInjectionStream));
+            }
+            call = ++_writeCalls;
+        }
+        if (call == 2)
+        {
+            _payloadStallEntered.TrySetResult();
+            await _payloadStallRelease.Task.WaitAsync(cancellationToken).ConfigureAwait(false);
+            lock (_gate)
+            {
+                _bytesWritten += buffer.Length / 2;
+            }
+            throw new IOException("injected short payload write");
+        }
+        if (call > 2)
+        {
+            throw new IOException("a poisoned connection must never write again");
+        }
+        lock (_gate)
+        {
+            _bytesWritten += buffer.Length;
+        }
+    }
+
+    public override async ValueTask<int> ReadAsync(Memory<byte> buffer, CancellationToken cancellationToken = default)
+    {
+        // The fake host never answers: park until the stream is disposed.
+        await _readParking.Task.WaitAsync(cancellationToken).ConfigureAwait(false);
+        throw new IOException("fault-injection stream disposed");
+    }
+
+    public override ValueTask DisposeAsync()
+    {
+        lock (_gate)
+        {
+            _disposed = true;
+        }
+        _payloadStallEntered.TrySetResult();
+        _payloadStallRelease.TrySetResult();
+        _readParking.TrySetResult();
+        return ValueTask.CompletedTask;
+    }
+
+    public override void Flush()
+    {
+    }
+
+    public override int Read(byte[] buffer, int offset, int count) => throw new NotSupportedException();
+
+    public override long Seek(long offset, SeekOrigin origin) => throw new NotSupportedException();
+
+    public override void SetLength(long value) => throw new NotSupportedException();
+
+    public override void Write(byte[] buffer, int offset, int count) => throw new NotSupportedException();
+
+    public override long Length => throw new NotSupportedException();
+
+    public override long Position
+    {
+        get => throw new NotSupportedException();
+        set => throw new NotSupportedException();
     }
 }

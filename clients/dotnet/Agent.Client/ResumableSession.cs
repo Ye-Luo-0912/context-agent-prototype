@@ -47,6 +47,14 @@ public sealed class ResumableSession : IAsyncDisposable
     private readonly object _gate = new();
     private AgentConnection? _connection;
 
+    // F09: at most one connect attempt in flight per session (single-flight);
+    // a generation counter plus the disposed flag veto stale installs, so a
+    // late connect can never open a parallel connection or revive a disposed
+    // session.
+    private Task<AgentConnection>? _connecting;
+    private long _generation;
+    private bool _disposed;
+
     public ResumableSession(Func<Task<Stream>> connect, AgentConnectionOptions? options = null)
     {
         _connect = connect;
@@ -71,33 +79,106 @@ public sealed class ResumableSession : IAsyncDisposable
         }
     }
 
+    /// <summary>
+    /// F09: the single-flight gate. At most one connect attempt exists per
+    /// session at any moment — concurrent callers await the SAME attempt, so
+    /// no parallel connection is ever opened. A finished attempt is never
+    /// reused: either it installed (and that connection no longer qualifies
+    /// as live) or it failed.
+    /// </summary>
     private async Task<AgentConnection> LiveAsync(CancellationToken cancellationToken)
     {
+        AgentConnection? stale = null;
+        Task<AgentConnection> connecting;
         lock (_gate)
         {
+            if (_disposed)
+            {
+                throw new ObjectDisposedException(nameof(ResumableSession));
+            }
             if (_connection?.IsConnected == true)
             {
                 return _connection;
             }
+            if (_connecting is { IsCompleted: true })
+            {
+                _connecting = null;
+            }
+            if (_connecting is null)
+            {
+                stale = _connection;
+                if (stale is not null)
+                {
+                    // Discarding the dead connection advances the generation:
+                    // anything still connecting against the old generation
+                    // must not install.
+                    _connection = null;
+                    _generation++;
+                }
+                var generation = _generation;
+                _connecting = ConnectAsyncCore(generation);
+            }
+            connecting = _connecting;
         }
-        var stale = Interlocked.Exchange(ref _connection, null);
         if (stale is not null)
         {
             await stale.DisposeAsync().ConfigureAwait(false);
         }
+        // Every concurrent caller awaits the same shared attempt; nobody else
+        // reaches the transport factory while this one is in flight.
+        return await connecting.WaitAsync(cancellationToken).ConfigureAwait(false);
+    }
+
+    /// <summary>
+    /// One shared connect attempt, bound to the session generation it was
+    /// started for. The handshake runs before the install check: only a
+    /// still-current, live session adopts the new connection — otherwise it
+    /// is discarded and released, never installed.
+    /// </summary>
+    private async Task<AgentConnection> ConnectAsyncCore(long generation)
+    {
         var stream = await _connect().ConfigureAwait(false);
         var fresh = new AgentConnection(stream, _options);
-        Interlocked.Exchange(ref _connection, fresh);
-        // A reconnect rebuilds from a snapshot; the subscribe handshake is
-        // issued so the host starts the stream at the current watermark.
-        var snapshot = await fresh.SnapshotAsync(cancellationToken).ConfigureAwait(false);
+        WorkSnapshotResponse snapshot;
         try
         {
-            await fresh.SubscribeAsync(cancellationToken: cancellationToken).ConfigureAwait(false);
+            // A reconnect rebuilds from a snapshot; the subscribe handshake is
+            // issued so the host starts the stream at the current watermark.
+            // The shared attempt must not inherit one waiter's cancellation
+            // token, and each request stays bounded by its own timeout.
+            snapshot = await fresh.SnapshotAsync(CancellationToken.None).ConfigureAwait(false);
+            try
+            {
+                await fresh.SubscribeAsync(cancellationToken: CancellationToken.None).ConfigureAwait(false);
+            }
+            catch (AgentProtocolException)
+            {
+                // Subscribe refusal never blocks the snapshot path.
+            }
         }
-        catch (AgentProtocolException)
+        catch
         {
-            // Subscribe refusal never blocks the snapshot path.
+            await fresh.DisposeAsync().ConfigureAwait(false);
+            throw;
+        }
+
+        bool install;
+        lock (_gate)
+        {
+            install = !_disposed && generation == _generation;
+            if (install)
+            {
+                _connection = fresh;
+            }
+        }
+        if (!install)
+        {
+            // F09: the session moved on while this attempt was in flight
+            // (disposed, or a newer generation took over). The new connection
+            // is dropped and released — a late connect never changes session
+            // state and never revives a disposed session.
+            await fresh.DisposeAsync().ConfigureAwait(false);
+            throw new ObjectDisposedException(nameof(ResumableSession));
         }
         Resynced?.Invoke(snapshot);
         return fresh;
@@ -207,10 +288,24 @@ public sealed class ResumableSession : IAsyncDisposable
 
     public async ValueTask DisposeAsync()
     {
-        var connection = Interlocked.Exchange(ref _connection, null);
+        AgentConnection? connection;
+        lock (_gate)
+        {
+            if (_disposed)
+            {
+                return;
+            }
+            _disposed = true;
+            _generation++;
+            connection = _connection;
+            _connection = null;
+        }
         if (connection is not null)
         {
             await connection.DisposeAsync().ConfigureAwait(false);
         }
+        // An in-flight connect attempt is deliberately not awaited here
+        // (disposal must not hang on a stalled transport): its install check
+        // refuses the disposed generation and releases the connection itself.
     }
 }
