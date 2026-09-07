@@ -27,6 +27,18 @@ public sealed class AgentContractViolationException : Exception
     }
 }
 
+/// <summary>
+/// F19: every request and response payload carries its own bounded-contract
+/// validator. The typed client APIs run the request validator before any
+/// byte is written and the response validator once the answer is accepted; a
+/// validation failure is a protocol fault (terminal connection state), never
+/// a silent pass and never a client-side re-send.
+/// </summary>
+public interface IProtocolPayload
+{
+    void Validate();
+}
+
 public enum ProtocolErrorClass
 {
     Protocol,

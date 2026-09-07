@@ -28,6 +28,16 @@ public class ClientSafetyTests
             /// <summary>The submit frame is read and counted, then the socket
             /// is dropped without an answer: the mutation-outcome drill.</summary>
             DropWithoutAnswer,
+            /// <summary>Answered "accepted" but with a malformed task_id
+            /// (not a canonical UUID): the response-validation drill.</summary>
+            InvalidTaskId,
+            /// <summary>Answered "accepted" with an empty task_id — what a
+            /// response missing the field decodes to: the response-validation
+            /// drill.</summary>
+            MissingTaskId,
+            /// <summary>Answered with a disposition value outside the
+            /// contract enum: the response-decode drill.</summary>
+            UnknownEnumValue,
         }
 
         public sealed class ConnectionPlan
@@ -39,6 +49,10 @@ public class ClientSafetyTests
             /// and counted, then the socket is dropped: the mid-query loss
             /// drill for the single reconnect-retry.</summary>
             public bool DropOnSecondSnapshot { get; init; }
+
+            /// <summary>Snapshot answers carry this many task entries — set
+            /// above the contract bound for the response-bound drill.</summary>
+            public int SnapshotTaskCount { get; init; }
         }
 
         private const string SampleTaskId = "00000000-0000-4000-8000-000000000001";
@@ -134,6 +148,17 @@ public class ClientSafetyTests
                             // mid-query connection loss.
                             return;
                         }
+                        var tasks = Enumerable.Range(0, plan.SnapshotTaskCount)
+                            .Select(i => new
+                            {
+                                task_id = $"00000000-0000-4000-8000-{i:D12}",
+                                goal = $"drill task {i}",
+                                status = "active",
+                                anchor_revision = 1ul,
+                                tool_requirement_revision = 0ul,
+                                tool_requirement_count = 0u,
+                            })
+                            .ToArray();
                         await WriteResponseAsync(stream, root, new
                         {
                             status = "success",
@@ -142,7 +167,8 @@ public class ClientSafetyTests
                                 run_started = true,
                                 run_completed = false,
                                 watermark = 41ul,
-                                tasks = Array.Empty<object>(),
+                                focus = (object?)null,
+                                tasks,
                                 pending_approvals = Array.Empty<object>(),
                                 resync_required = false,
                             },
@@ -165,10 +191,33 @@ public class ClientSafetyTests
                             // Read and counted, never answered.
                             return;
                         }
+                        var submitValue = plan.Submit switch
+                        {
+                            SubmitAnswer.InvalidTaskId => (object)new
+                            {
+                                disposition = "accepted",
+                                task_id = "not-a-canonical-uuid",
+                            },
+                            SubmitAnswer.MissingTaskId => new
+                            {
+                                disposition = "accepted",
+                                task_id = string.Empty, // what a missing field decodes to
+                            },
+                            SubmitAnswer.UnknownEnumValue => new
+                            {
+                                disposition = "totally-bogus",
+                                task_id = SampleTaskId,
+                            },
+                            _ => new
+                            {
+                                disposition = "accepted",
+                                task_id = SampleTaskId,
+                            },
+                        };
                         await WriteResponseAsync(stream, root, new
                         {
                             status = "success",
-                            value = new { disposition = "accepted", task_id = SampleTaskId },
+                            value = submitValue,
                         }, cancellationToken);
                         continue;
                     }
@@ -444,6 +493,135 @@ public class ClientSafetyTests
         Assert.Equal(1, Volatile.Read(ref connectCalls)); // no revival: the factory never runs again
         Assert.False(session.IsConnected);
         await Assert.ThrowsAsync<ObjectDisposedException>(() => session.SnapshotAsync());
+    }
+
+    private static async Task AssertRejectedBeforeAnyWireBytes(Func<AgentConnection, Task> send)
+    {
+        var stream = new FaultInjectionStream();
+        await using var connection = new AgentConnection(stream);
+
+        await Assert.ThrowsAsync<AgentContractViolationException>(
+            () => send(connection).WaitAsync(TimeSpan.FromSeconds(10)));
+        Assert.Equal(0, stream.WriteCalls);   // rejected before a single byte hit the wire
+        Assert.False(connection.IsConnected); // F19: validation failure is a protocol fault
+
+        // The terminal path refuses everything afterwards, still byte-silent.
+        await Assert.ThrowsAsync<AgentConnectionFaultedException>(
+            () => connection.SnapshotAsync().WaitAsync(TimeSpan.FromSeconds(10)));
+        Assert.Equal(0, stream.WriteCalls);
+    }
+
+    [Fact]
+    public async Task Invalid_requests_are_rejected_before_any_wire_bytes()
+    {
+        // Missing identifiers, over-bound text, control characters, empty
+        // ids: every bounded request validator rides the same pre-send path.
+        await AssertRejectedBeforeAnyWireBytes(c => c.SubmitWorkAsync("", "req-1")); // missing goal
+        await AssertRejectedBeforeAnyWireBytes(c => c.SubmitWorkAsync(new string('x', WorkSubmitRequest.MaxGoalChars + 1), "req-1"));
+        await AssertRejectedBeforeAnyWireBytes(c => c.SubmitWorkAsync("a goal", "")); // missing client_request_id
+        await AssertRejectedBeforeAnyWireBytes(c => c.SubmitWorkAsync("bad\ncontrol", "req-1"));
+        await AssertRejectedBeforeAnyWireBytes(c => c.RespondApprovalAsync("", ApprovalDecision.Allow)); // missing request_id
+    }
+
+    [Fact]
+    public async Task Invalid_response_payload_faults_the_connection_and_is_not_re_sent()
+    {
+        foreach (var submitAnswer in new[]
+                 {
+                     CountingLoopHost.SubmitAnswer.InvalidTaskId, // illegal UUID form
+                     CountingLoopHost.SubmitAnswer.MissingTaskId, // missing task_id
+                 })
+        {
+            await using var host = new CountingLoopHost();
+            var firstConnection = true;
+            host.PlanFor = _ => new CountingLoopHost.ConnectionPlan
+            {
+                Submit = Interlocked.Exchange(ref firstConnection, false)
+                    ? submitAnswer
+                    : CountingLoopHost.SubmitAnswer.Accept,
+            };
+
+            var session = new ResumableSession(() => ConnectAsync(host.Port));
+            try
+            {
+                var unknown = await Assert.ThrowsAsync<AgentUnknownOutcomeException>(
+                    () => session.SubmitWorkAsync("n2: response validation", ClientRequestIds.Next())
+                        .WaitAsync(TimeSpan.FromSeconds(10)));
+                Assert.IsType<AgentContractViolationException>(unknown.Failure);
+                Assert.False(session.IsConnected);  // the fault is terminal on the receiving side too
+                Assert.Equal(1, host.SubmitFrames); // sent exactly once; the client never re-sends
+
+                // An explicit, later query operation reconnects and rebuilds;
+                // the mutation stays sent-exactly-once.
+                var snapshot = await session.SnapshotAsync().WaitAsync(TimeSpan.FromSeconds(10));
+                Assert.Equal(41ul, snapshot.Watermark);
+                Assert.Equal(1, host.SubmitFrames);
+            }
+            finally
+            {
+                await session.DisposeAsync();
+                await host.DisposeAsync();
+            }
+        }
+    }
+
+    [Fact]
+    public async Task Unknown_enum_value_in_a_response_faults_the_connection_and_is_not_re_sent()
+    {
+        await using var host = new CountingLoopHost();
+        var firstConnection = true;
+        host.PlanFor = _ => new CountingLoopHost.ConnectionPlan
+        {
+            Submit = Interlocked.Exchange(ref firstConnection, false)
+                ? CountingLoopHost.SubmitAnswer.UnknownEnumValue
+                : CountingLoopHost.SubmitAnswer.Accept,
+        };
+
+        var session = new ResumableSession(() => ConnectAsync(host.Port));
+        try
+        {
+            var unknown = await Assert.ThrowsAsync<AgentUnknownOutcomeException>(
+                () => session.SubmitWorkAsync("n2: enum drill", ClientRequestIds.Next())
+                    .WaitAsync(TimeSpan.FromSeconds(10)));
+            Assert.IsType<JsonException>(unknown.Failure);
+            Assert.False(session.IsConnected);
+            Assert.Equal(1, host.SubmitFrames); // decode failure: one frame, no re-send
+        }
+        finally
+        {
+            await session.DisposeAsync();
+            await host.DisposeAsync();
+        }
+    }
+
+    [Fact]
+    public async Task Over_limit_snapshot_response_faults_the_connection_after_the_single_query_retry()
+    {
+        await using var host = new CountingLoopHost();
+        host.PlanFor = _ => new CountingLoopHost.ConnectionPlan
+        {
+            SnapshotTaskCount = WorkSnapshotResponse.MaxTasks + 1, // 257 entries: above the bound
+        };
+
+        var losses = new List<Exception>();
+        var session = new ResumableSession(() => ConnectAsync(host.Port));
+        session.ConnectionLost += failure => losses.Add(failure);
+        try
+        {
+            // Even the query path never accepts an over-bound snapshot: the
+            // retry runs once (existing semantics), fails the same way, and
+            // the honest contract violation surfaces.
+            await Assert.ThrowsAsync<AgentContractViolationException>(
+                () => session.SnapshotAsync().WaitAsync(TimeSpan.FromSeconds(10)));
+            Assert.Equal(2, host.ConnectionsAccepted); // exactly one reconnect-retry, as before
+            Assert.False(session.IsConnected);         // both attempts ended in the terminal fault
+            Assert.Single(losses);                     // the loss is reported once; the retry failure surfaces as the exception
+        }
+        finally
+        {
+            await session.DisposeAsync();
+            await host.DisposeAsync();
+        }
     }
 }
 

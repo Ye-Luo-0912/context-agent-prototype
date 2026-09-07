@@ -65,6 +65,12 @@ public sealed class AgentConnectionFaultedException : Exception
 /// distinction: a local wait cancellation or timeout after a fully sent
 /// frame says nothing about the server side, so it abandons only the wait
 /// and does not fault the connection.
+///
+/// F19: every typed API validates its request payload before any byte is
+/// written and its response payload once the answer is accepted. A
+/// validation failure is a protocol fault — it takes the same terminal path,
+/// so a contract-violating request never reaches the wire and nothing is
+/// re-sent for it.
 /// </summary>
 public sealed class AgentConnection : IAgentConnection
 {
@@ -134,8 +140,8 @@ public sealed class AgentConnection : IAgentConnection
 
     public async Task<TResponse> SendAsync<TRequest, TResponse>(
         Route route, TRequest payload, CancellationToken cancellationToken = default)
-        where TRequest : notnull
-        where TResponse : notnull
+        where TRequest : notnull, IProtocolPayload
+        where TResponse : notnull, IProtocolPayload
     {
         ObjectDisposedException.ThrowIf(_disposed.IsCancellationRequested, this);
         if (Interlocked.Read(ref _faulted) != 0)
@@ -145,7 +151,6 @@ public sealed class AgentConnection : IAgentConnection
             throw new AgentConnectionFaultedException(_faultReason);
         }
         var request = SessionEnvelope.Request(route, payload);
-        request.Validate(_identity);
 
         var requestId = request.RequestId!;
         var completion = new TaskCompletionSource<JsonElement>(TaskCreationOptions.RunContinuationsAsynchronously);
@@ -158,47 +163,60 @@ public sealed class AgentConnection : IAgentConnection
                 // fail without writing instead of queueing onto a dead pipe.
                 throw new AgentConnectionFaultedException(_faultReason);
             }
-            var encoded = JsonSerializer.SerializeToUtf8Bytes(request, AgentJson.Options);
-            using var timeout = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken, _disposed.Token);
-            timeout.CancelAfter(_options.RequestTimeout);
-            await _writeLock.WaitAsync(timeout.Token).ConfigureAwait(false);
             try
             {
+                // F19: the typed request payload validator runs before any
+                // byte is written; a violation is a protocol fault, so a
+                // malformed request can never reach the wire (and a mutation
+                // is never re-sent for it).
+                payload.Validate();
+                request.Validate(_identity);
+
+                var encoded = JsonSerializer.SerializeToUtf8Bytes(request, AgentJson.Options);
+                using var timeout = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken, _disposed.Token);
+                timeout.CancelAfter(_options.RequestTimeout);
+                await _writeLock.WaitAsync(timeout.Token).ConfigureAwait(false);
                 try
                 {
-                    await FrameCodec.WriteFrameAsync(_stream, encoded, _options.MaxFrameBytes, timeout.Token)
-                        .ConfigureAwait(false);
+                    try
+                    {
+                        await FrameCodec.WriteFrameAsync(_stream, encoded, _options.MaxFrameBytes, timeout.Token)
+                            .ConfigureAwait(false);
+                    }
+                    catch (Exception writeFailure)
+                    {
+                        // F08: a failed, timed-out, or cancelled write may have
+                        // left a partial frame on the wire — the frame boundary
+                        // is lost, so the connection is poisoned and never
+                        // reused.
+                        Fault(writeFailure);
+                        throw;
+                    }
                 }
-                catch (Exception writeFailure)
+                finally
                 {
-                    // F08: a failed, timed-out, or cancelled write may have
-                    // left a partial frame on the wire — the frame boundary
-                    // is lost, so the connection is poisoned and never
-                    // reused.
-                    Fault(writeFailure);
-                    throw;
+                    _writeLock.Release();
                 }
-            }
-            finally
-            {
-                _writeLock.Release();
-            }
 
-            var responseElement = await completion.Task.WaitAsync(timeout.Token).ConfigureAwait(false);
-            try
-            {
+                var responseElement = await completion.Task.WaitAsync(timeout.Token).ConfigureAwait(false);
                 var response = JsonSerializer.Deserialize<PlatformEnvelope<PlatformResponse<TResponse>>>(
                         responseElement.GetRawText(), AgentJson.Options)
                     ?? throw new AgentContractViolationException("envelope.decode", "response envelope was empty");
                 response.ValidateAnswer(request, _identity);
                 var body = response.Payload;
                 body.Validate();
-                return body.ExpectValue();
+                var value = body.ExpectValue();
+                // F19: the response payload validator runs once the answer is
+                // accepted; a contract-violating payload is a protocol fault.
+                value.Validate();
+                return value;
             }
             catch (Exception failure) when (failure is AgentContractViolationException or JsonException)
             {
-                // A response that violates the negotiated bounded contract is
-                // a connection fault: the peer is not speaking the profile.
+                // F19: a contract-violating request composition or response is
+                // a protocol fault (F08 terminal path) — the peer is not
+                // speaking the bounded profile, and the client never re-sends
+                // the request for it.
                 Fault(failure);
                 throw;
             }
