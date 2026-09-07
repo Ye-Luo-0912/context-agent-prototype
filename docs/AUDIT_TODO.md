@@ -1,11 +1,41 @@
 # 缺陷分流
 
-当前执行顺序由 [NEXT_TASKS.md](NEXT_TASKS.md) 前列决定：**M17 三线首批（C0/B1/B2）**。2026-09-06 深入续审代码项与 M16-00–07 保持关闭；2026-09-07 外部续审（基线 `b299c6a`，部分源码静态审查）的残余见下方新表，映射为 B1/B2/B3/P1/P2，不重开已关闭项。
+当前执行顺序由 [NEXT_TASKS.md](NEXT_TASKS.md) 前列决定：**M17 收尾 N 系列，N0 当前**。M16 与 2026-09-06/07 两轮审查的代码项保持关闭；2026-09-08 外部闭环审查（基线 `11afdd7`）的 F01–F20 见下方新表，映射 N0–N8，不重开已关闭项。
 
+2026-09-08 审查原文：[reviews/2026-09-08-closure-audit-11afdd7/REPORT.md](reviews/2026-09-08-closure-audit-11afdd7/REPORT.md)（FINDINGS.json/LOCAL_PROBES.json 同目录）。
 原报告与探针：[reviews/2026-09-06-deep-audit/REVIEW.md](reviews/2026-09-06-deep-audit/REVIEW.md)。
-2026-09-07 续审原文：[reviews/2026-09-07-platform-native-audit/REPORT.md](reviews/2026-09-07-platform-native-audit/REPORT.md)（问题/触发条件/证据等级见同目录 FINDINGS.json）。
+2026-09-07 续审原文：[reviews/2026-09-07-platform-native-audit/REPORT.md](reviews/2026-09-07-platform-native-audit/REPORT.md)。
 建议回归按 [TEST_MATRIX.md](reviews/2026-09-06-deep-audit/TEST_MATRIX.md) 补进现有 crate，不新建总门禁。
 旧审计正文：`docs/archive/route-reset-12c8628/docs/AUDIT_TODO.md`。
+
+## 2026-09-08 闭环审查（基线 `11afdd7` → N 系列）
+
+部分源码静态审查（55 路径；新 GUI/客户端/宿主三子树全文；无本地工具链）＋远端 CI 观察（run `34148921895` 在 fmt 失败，构建/测试被跳过）＋隔离 OS 探针（UDS unlink/rebind、包内 symlink 读取、半帧字节解码）。标注「已复核」的行已于 2026-09-08 在本工作树 HEAD `11afdd7` 静态确认；其余为审查报告结论，实施前按工单要求现场复核。
+
+| 发现 | 已核对位置 | 要修什么 | 不要做什么 |
+|---|---|---|---|
+| **F01（→N0，已复核）** | `agent-host/src/lib.rs:234` 无条件引用 `winpipe::serve`，`:503` `mod winpipe` 仅 `#[cfg(windows)]`；host_e2e 的 Unix 辅助无真实 UDS | 两平台明确 cfg 分支/受支持声明；agent-host 入 Linux CI，.NET build/test 入 CI | 不把 CI fmt 失败伪称编译失败或通过 |
+| **F02（→N1，已复核）** | `agent-host/src/winpipe.rs:186` 每个实例创建都带 `FILE_FLAG_FIRST_PIPE_INSTANCE` | 首实例独占仅用于名称占用检查，后续实例正常模式；RAII 句柄，拒绝分支不手动二次 CloseHandle | 不删除当前用户 DACL/客户端令牌检查/远程拒绝 |
+| **F03（→N1，已复核）** | 连接接入 install session，退出只 drop router 不 revoke；64 上限 `.expect` | session grant 归属连接 guard，全部退出路径 revoke；install 错误受控拒绝不 panic | 不用并发连接上限证明会话表不会耗尽 |
+| **F04（→N1）** | accept 循环无停止通道；Ctrl-C 后 join 服务线程可能永久阻塞 | 显式停止信号＋连接集合关闭＋服务失败回执，有界 join | 不建第二调度器；沿用 RuntimeInstance.shutdown |
+| **F05（→N1，已复核）** | `lib.rs:187/251` bind 前无条件 `remove_file`；默认 `/tmp` 固定名 | 用户私有、按工作区区分的端点；检查类型/所有者；只清理可证明属于自己的 | 不删除 SO_PEERCRED/chmod 与 Workspace 独占日志等既有缓解 |
+| **F06（→N3，已复核）** | `lib.rs:425` `work.subscribe` 握手后 `Ok((response, _receiver))` 丢弃事件 receiver；客户端 Dispatch 分型前要求 `request_id` | 宿主持有订阅到连接关闭，单一有界 writer；notification 按 kind 验证；GUI 消费类型化事件 | 不新建事件平台；DTO 已存在（WorkEventNotification/work/event） |
+| **F07（→N2，已复核）** | `ResumableSession.RunAsync` 连接异常后重连并重试 operation；submit/continue/cancel 全走它 | 查询/修改重试分离；未知修改返回 Unknown＋查询重同步；修改绑定 task/turn/generation＋宿主 incarnation | 审批答复不自动重试的既有行为保留；不建通用幂等数据库 |
+| **F08（→N2）** | `Fault()` 只失败 pending 不关流不标终态；半帧写入失败不毒化 | 单一终态故障路径：标 Faulted、拒新请求、结清 waiter、关闭传输；半帧写入失败毒化连接 | 完整写完后的本地等待取消不冒充服务端取消 |
+| **F09（→N2/N3）** | `LiveAsync` 连接/握手在锁外；快照完成前发布 fresh；Snapshot 后 Subscribe(null) 忽略回执；Dispose 无代际约束 | single-flight connect；安装前校验 generation/disposed；快照与订阅同一 run/host 身份衔接 | router 已有 barrier/resync-only，不承诺无限历史重放 |
+| **F10（→N5，已复核）** | `agent-host/src/main.rs:207-213` `--restore-latest` 按文件名枚举后直接 `serde_json::from_str::<RuntimeCheckpoint>` | 统一用 CheckpointStore `decode_checkpoint_file/bytes`＋完整 `RuntimeInstance.restore` | 不改检查点格式；raw JSON 兼容入口不替代正式产物路径 |
+| **F11（→N3，已复核）** | `work.rs:465` `validate_text` 拒绝一切控制字符（含 LF/TAB）；GUI AcceptsReturn=true | 短标题与有界完整正文分离；正文允许合法换行/制表；身份/路径仍严格 | 不删除全部输入验证；跨语言按契约统一标量/字节口径 |
+| **F12（→N4/N5）** | 待审批快照只有 request_id＋call_name；快照缺计划/结果/工件引用 | 审批经既有 gate 提供受限详情＋绑定有效性；补 GUI 实际使用的计划/执行状态/结果投影 | 权限决定仍归 Core/gate；不从通用文字反推 |
+| **F13（→N4/N7，已复核）** | 每 3s 刷新重建审批行，命令加入长寿命 `AsyncCommandGroup` 不移除（推导 1h≈2400 引用） | 按 request_id 复用稳定行/命令，移除时撤销注册；刷新 single-flight＋代际；关闭释放 | 不换 GUI 框架；对象生命周期先于框架更换 |
+| **F14（→N7）** | MetricsSession Windows 无 parent 仍报 whole-tree；Linux 提前标 seen 可能漏孙进程；末样本标 idle；`_samples` 无限追加 | 覆盖范围 root_only/full_tree/unknown；一次快照建父子关系＋去重；有界采样环 | 不否定独立人工测量；不填假全树值 |
+| **F15（→N6，已复核）** | 决策 supersession 按实体/子串重合排队 `Superseded`；无同任务/决策键/显式替代约束 | 实体匹配降为相关性；仅明确替代目标＋正确任务范围进终态；否则保留两条按 attention 冷却 | 不重开已修好的同任务同 probe 验证关联；Runtime 用户约束权威未被删除 |
+| **F16（→N6，已复核）** | `residency.rs:315-316` Warm 路径查 keep_alive/lease；Resident TTL 路径（`gc/minor.rs`）无此检查 | 跨层共用到期保护；lease/keep_alive 范围明确；终态不可复活 | 不重调 GC 参数；不引入新淘汰算法 |
+| **F17（→N6，已复核）** | `plugin.rs` `skill_read` 词法相对检查后普通 `File::open`；symlink/junction 可指包外（探针证机制）；FIFO 可在 take 前阻塞 | 复用既有 ConfinedDir/受限普通文件句柄；拒绝链接/非普通文件 | 前提是操作者安装启用的包树存在此类文件；保留双激活门/64KiB/来源版本 |
+| **F18（→N6，已复核）** | `engine.rs:1705/1710` `to_summaries` 先全量投影再 `bounded_catalog`（limit=0 也投影） | limit0 早退；惰性投影或选中 ID 后复制；保持既有稳定顺序 | 惰性投影不自动把扫描 CPU 降为 O(limit)；不接数据库 |
+| **F19（→N2/N3）** | `SendAsync` 只验 envelope，不调用具体 payload.Validate；反序列化缺字段用默认值 | 每个类型化 API 发送前/接受后运行 validator；两语言口径一致 | 不建反射式通用验证框架 |
+| **F20（→N0/N8）** | 半帧样本 `00000009`（LE=150994944，先触发超长帧拒绝）；交错测试是两条连接；interop retry 用新 key；host 线程 join 错误被忽略 | 修准现有用例：合法长度半帧、单连接乱序、原 key 重试、执行后丢 ACK、服务线程结果必须检查 | 不建第三套 harness；测试全绿≠路径已验证 |
+
+审查同时确认**不再原样重报**的已修复项：监督身份化台账/类型化对账/确认式清理、proof 监督接线、metadata 发布围栏、原子 StartWork、同任务同 VerificationProbe 验证关联、skill_read＋MCP/Plugin 配置缝（见 CURRENT「已修好」段与 2026-09-07 表的关闭记录）。
 
 ## 2026-09-07 续审残余（基线 `b299c6a` → M17）
 

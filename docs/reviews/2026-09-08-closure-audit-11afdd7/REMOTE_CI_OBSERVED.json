@@ -1,0 +1,38 @@
+{
+  "source_commit": "11afdd747d6cbbb58ef0d7371841e8e365c4f8db",
+  "run_id": 34148921895,
+  "run_url": "https://github.com/Ye-Luo-0912/context-agent-prototype/actions/runs/34148921895",
+  "status": "completed",
+  "conclusion": "failure",
+  "source": "GitHub REST connection, observed during this review",
+  "jobs": [
+    {
+      "id": 101826825301,
+      "name": "fmt / clippy / build (ubuntu-latest)",
+      "conclusion": "failure",
+      "fmt": "failure",
+      "clippy": "skipped",
+      "build": "skipped"
+    },
+    {
+      "id": 101826825540,
+      "name": "fmt / clippy / build (windows-latest)",
+      "conclusion": "failure",
+      "fmt": "failure",
+      "clippy": "skipped",
+      "build": "skipped"
+    },
+    {
+      "id": 101826825611,
+      "name": "document consistency",
+      "conclusion": "success"
+    },
+    {
+      "id": 101827014588,
+      "name": "test matrix",
+      "conclusion": "skipped"
+    }
+  ],
+  "local_rerun": false,
+  "note": "No build/test pass for this SHA can be inferred from this run. Author-reported local results are separate evidence."
+}

@@ -12,18 +12,21 @@ human-approved effects, verifiable completion and cold resume. The alpha
 (`v0.1.0`: packaged Windows/Linux binaries, install notes, checked
 configuration, checkpoints/status/doctor) is released, and the formal M15
 reliability gate is closed. M16 (daily-usable local agent) is closed with
-its walkthroughs automated. The current stage is **M17 — multi-entry
-platform and the formal native workbench**: three parallel lines
-(foundation correctness B1–B3, platform application service P1–P3, formal
-.NET 10 + Avalonia GUI G1–G3 over a dedicated Rust host with local IPC),
-leading with C0/B1/B2. A 2026-09-07 partial-source re-audit (`b299c6a`)
-found residuals in the supervision ledger identity/confirmation, the
-metadata publish window, status projection, and multi-client submission;
-they lead the queue instead of reopening M16. The ordered route is
+its walkthroughs automated. M17's three lines (foundation correctness
+B1–B3, platform service P1–P3, .NET 10 + Avalonia GUI G1–G3 over a
+dedicated Rust host) have landed their code; the current stage is the
+**M17 closure pass — the resumable multi-entry workbench (N0–N8)**: a
+2026-09-08 partial-source re-audit (`11afdd7`) found the remaining gaps
+are broken end-to-end links, not missing components — the event
+subscription drops its receiver, reconnects auto-retry mutations, the
+host restore bypasses the checkpoint envelope, and long-lived serving
+has session/shutdown gaps. N0 (current) restores the build and CI entry:
+CI run 34148921895 currently fails at `cargo fmt --check`
+(violations in agent-host). The ordered route is
 [`docs/ROADMAP.md`](docs/ROADMAP.md#route-to-a-usable-local-agent); the
-active task queue is [`docs/NEXT_TASKS.md`](docs/NEXT_TASKS.md). M17 does
-not add Chronicle, TaskGraph, a second orchestrator, or a second task
-state authority.
+active task queue is [`docs/NEXT_TASKS.md`](docs/NEXT_TASKS.md). No
+Chronicle, TaskGraph, second orchestrator, or second task state
+authority.
 
 ## Architecture
 

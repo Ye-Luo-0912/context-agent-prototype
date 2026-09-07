@@ -10,7 +10,7 @@ Stable architecture: authority, runtime, tools, context. Sibling contracts:
 
 ## 1. Purpose
 
-This prototype is not intended to become a second ContextCore. It is a small, real agent runtime used to validate the runtime behavior that ContextCore will eventually power.
+This project is an independent, standalone coding-agent platform, not a second ContextCore and not a ContextCore validation harness: the reusable Rust Runtime/Platform is the long-lived asset, and the TUI, .NET SDK and the native desktop client are product clients over it. ContextCore remains a separate project; no behavior here depends on it.
 
 Primary hypothesis:
 
@@ -48,7 +48,8 @@ recover
 
 inspect
   -> bounded read model from Runtime events, task state, checkpoints and debt
-  -> TUI now; another host later only if a product need justifies it
+  -> consumed by the TUI, the agent-host local platform surface and the
+     native desktop client (N-series closure wires the live event path)
 ```
 
 No product host may bypass composition, call Context or tools as an authority,

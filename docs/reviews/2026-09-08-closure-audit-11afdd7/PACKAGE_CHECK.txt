@@ -1,0 +1,7 @@
+Artifact validation: PASS
+JSON parse: PASS
+55 unique body paths: PASS
+34 new-subtree full-text records: PASS
+20 findings / 9 tasks references: PASS
+Relative Markdown links: PASS
+This validates report packaging only; it is not repository test execution.

@@ -178,8 +178,7 @@ impl RuntimeActor {
         let mut task_manage_notice = None;
         if let Some(task) = self.state.tasks.get(task_id)
             && task.tool_requirements.entries.is_empty()
-        {
-            if let Err(error) = self
+            && let Err(error) = self
                 .set_task_tool_requirements(
                     task_id,
                     task.tool_requirements.revision,
@@ -190,9 +189,8 @@ impl RuntimeActor {
                     }],
                 )
                 .await
-            {
-                task_manage_notice = Some(format!("task.manage not attached: {error}"));
-            }
+        {
+            task_manage_notice = Some(format!("task.manage not attached: {error}"));
         }
 
         let input_id = RuntimeInputId::new();

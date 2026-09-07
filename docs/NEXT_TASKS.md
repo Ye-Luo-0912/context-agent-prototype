@@ -1,29 +1,159 @@
 # 可执行任务队列
 
-> 状态：**M17——多入口平台与正式原生工作台**（2026-09-07 切换）。上一阶段的具体已验范围：M16-00–07 关闭、M16-08 走查落地；2026-09-06 深入续审 13 项代码项全部关闭（PROCESS-01 含真 Linux 验证）。**「无工程开放项」的说法作废**：2026-09-07 外部续审（基线 `b299c6a`，部分源码静态审查）发现监督身份/清理确认、metadata 发布窗口、状态投影、多客户端提交等残余，已并入本队列前列。
-> 剩余条件项不变：真实 provider live（无凭据写 `NOT_RUN`）、下次实际发布的 PACKAGE-01、默认启用 MCP 后的 MCP-01。
-> 基线：旧审查 `12c86283…`；本阶段续审 `b299c6a08fdb055a0148a24dea65053861df6ff1`（部分源码）。本工作树 HEAD：`7c3236d`。
-> 续审原文：[reviews/2026-09-07-platform-native-audit/REPORT.md](reviews/2026-09-07-platform-native-audit/REPORT.md)；工单全文：[reviews/2026-09-07-platform-native-audit/NEXT_STAGE_TASKS.md](reviews/2026-09-07-platform-native-audit/NEXT_STAGE_TASKS.md)。
-> 旧分流原文：[reviews/2026-09-06-deep-audit/REVIEW.md](reviews/2026-09-06-deep-audit/REVIEW.md)。建议回归：[reviews/2026-09-06-deep-audit/TEST_MATRIX.md](reviews/2026-09-06-deep-audit/TEST_MATRIX.md)。
+> 状态：**M17 收尾——可恢复的多入口工作台（N 系列，2026-09-08 切换）。** 上一队列（M17 三线）的代码主体已落地：B1–B3、C0、P1、P2 主体、P3 宿主、G1–G3 客户端侧、E1 全部关闭或落地（见下方 M17 队列表）。2026-09-08 外部闭环审查（基线 `11afdd747d6cbbb58ef0d7371841e8e365c4f8db`，55 路径正文、新 GUI/客户端/宿主三子树全文）指出：**组件存在 ≠ 链路接通**——事件订阅 receiver 被丢弃、重连自动重发修改操作、宿主恢复绕过正式信封解码、多连接/会话释放/停机缺口等 20 项（F01–F20），进入本队列。
+> **当前 CI 是红的**：run `34148921895`（`11afdd7`）与 run `34148640847`（`1be2e77`）均在 `cargo fmt --check` 失败（Ubuntu/Windows），后续 clippy/build/test 被跳过——fmt 违规集中在 `crates/agent-host`。N0 第一项就是恢复构建与验证入口。
+> 本队列接续 M17 未闭环项；不重做已落地的 B1/B2/C0/P1/G1/E1，也不新增 Chronicle/TaskGraph/第二套状态权威。
+> 剩余条件项不变：真实 provider live（无凭据写 `NOT_RUN`）、下次实际发布的 PACKAGE-01（并入 N8）、默认启用 MCP 后的 MCP-01（E1 已覆盖声明车道的取消贯通）。
+> 审查原文：[reviews/2026-09-08-closure-audit-11afdd7/REPORT.md](reviews/2026-09-08-closure-audit-11afdd7/REPORT.md)；工单全文：[reviews/2026-09-08-closure-audit-11afdd7/NEXT_STAGE_TASKS.md](reviews/2026-09-08-closure-audit-11afdd7/NEXT_STAGE_TASKS.md)。
+> 上一轮（2026-09-07 platform-native）原文：[reviews/2026-09-07-platform-native-audit/REPORT.md](reviews/2026-09-07-platform-native-audit/REPORT.md)。
 > 不替代 Core、Effect、Workspace、恢复与输出边界契约；不改写历史评测结论。
 
 ## 开始执行
 
 只读 [CURRENT.md](CURRENT.md) 和本表当前工单，然后读该工单的实现、调用者和测试。
 已完成的项定向确认后跳过。一次只做一个工单。
-代码存在、测试通过、默认启用、真实任务跑通是四个不同事实。
+**四个不同事实**：代码存在、已接真实传输/产品入口、检查实际执行、真实用户场景跑通——分别记录，不互相冒充。
+执行任何工单前先 `git status --short` / `git rev-parse HEAD`；审查未读过的模块现场补读，不宣称全仓已审。
 
-不要把 Chronicle、TaskGraph、数据库、worker、向量或新全量评测框架当作前置。
-执行任何 M17 工单前先 `git status --short` / `git rev-parse HEAD`；本轮续审未读过的模块现场补读，不宣称全仓已审。
+## 并行与进入顺序
 
-## M17 并行规则
+| 批次 | 工单 | 约束 |
+|---|---|---|
+| 第一批 | **N0 构建与验证入口**（立即）；N1 宿主长期服务、N2 客户端操作安全、N6 核心语义与读取边界 | 互不阻塞；N0 的集成检查期间即可并行开工 |
+| 第二批 | N3 真实事件与完整输入 → N4 正式 GUI 操作链；N5 恢复与结果审阅 | N3 最小契约固定后 GUI 接真实数据 |
+| 第三批 | N7 长会话低占用；N8 能力配置与联合交付（含 PACKAGE-01） | 高风险恢复/执行声明等对应修复通过 |
 
-- B1、B2 直接开始；C0 文档切换已落地（2026-09-07），DTO 契约完成后 P1、G1 同时推进。
-- G2 等待 B1/B2 对应验收；P3/G3 按各自依赖；E1 不阻塞第一个 GUI 发布。
-- 共享契约、`command.rs`、compose 入口单一维护者；三线提交小接口需求，不在同一文件上互相覆盖。
-- 涉及宿主执行、可靠清理、冷恢复的正式支持声明，不得先于 B1/B2 验收作出。
+共享协议、`RuntimeCommand`、compose 入口单一维护者；修改结果未知时不重发（返回 Unknown/要求重同步）；快照与事件以同一 run/host 身份衔接；客户端不从显示文字制造完成、审批或恢复事实。
 
-## 当前队列（M17）
+## 当前队列（M17 收尾：N 系列）
+
+| 顺序 | 工单 | 线 | 交付物 | 状态 | 依赖 |
+|---|---|---|---|---|---|
+| 1 | N0 | 集成 | fmt/cfg 修复＋宿主 Linux 构建＋.NET 入 CI＋测试修准 | **当前工单**；CI 红（fmt）即其直接事实 | 无 |
+| 2 | N1 | 平台 | 宿主多连接、会话释放、端点所有权、可靠停机 | 提案（F02–F05 已在 HEAD 静态复核） | N0 |
+| 3 | N2 | 客户端 | 未知修改不重发、连接终态不复活、single-flight | 提案（F07–F09、F19） | N0 |
+| 4 | N3 | 契约 | 事件 receiver 保留到连接、notification 验证、多行正文 | 提案（F06/F11；F06 已在 HEAD 复核：`work.subscribe` 丢弃 `_receiver`） | N1, N2 |
+| 5 | N4 | GUI | 计划/输出/知情审批/取消/继续/真实状态 | 提案（F12/F13） | N3 |
+| 6 | N5 | 平台/GUI | 正式信封恢复＋结果/差异/工件按需读取 | 提案（F10 已复核：宿主裸 JSON 反序列化） | N2, N3 |
+| 7 | N6 | 基础 | 决策不误终结、lease 跨层一致、Skill 受限句柄、catalog 有界 | 提案（F15–F18；F16/F18 已复核） | N0 |
+| 8 | N7 | GUI/测量 | 对象与文本保留有界、指标覆盖如实 | 提案（F13/F14） | N4 |
+| 9 | N8 | 扩展/交付 | MCP/Plugin 可配置使用＋Rust/.NET 来源绑定发布（并入 PACKAGE-01、原 R1） | 提案（F20） | N1–N6 |
+| 10 | PACKAGE-01 | 条件 | 打包来源绑定 | 并入 N8 执行 | — |
+| 11 | MCP-01 | 条件 | MCP 写/连接/读可取消 | E1 已覆盖声明车道；新声明路径触发时补 | — |
+
+阶段后候选（不作为本阶段前置）：只读工具子 Agent（独立状态、有限预算、无递归）；Context/GC/搜索算法研究按真实瓶颈单独立项。
+
+---
+
+## N0 — 恢复构建与验证入口（当前工单）
+
+**用户结果：** 支持平台（Linux/Windows）的宿主与客户端重新可被 CI 真实验证；测试名与实际验证路径一致。
+
+**事实：** CI run `34148921895` 在两个平台均停于 `cargo fmt --check`（违规集中在 `crates/agent-host`）；`HostServer::serve` 的 NamedPipe 分支无条件引用 `#[cfg(windows)]` 的 `winpipe` 模块（`lib.rs:234` vs `:503`），Linux 宿主构建存在静态缺口；host_e2e 的 Unix 连接辅助无真实 UDS。
+
+**步骤：** `cargo fmt --all`（仅必要范围）；为两个平台提供明确 cfg 分支或受支持/不支持实现；现有 CI 增补 agent-host Linux 分片与 .NET build/test；修准 F20 列出的现有测试（半帧样本应为合法长度前缀、同连接乱序、原 key 重试、服务线程错误必须检查）。
+
+**检查：** `cargo fmt --all -- --check`；`cargo check -p agent-host --all-targets --locked`（Linux＋Windows）；`dotnet build apps/Agent.Desktop/Agent.Desktop.csproj`；`dotnet test clients/dotnet/Agent.Client.Tests/Agent.Client.Tests.csproj`。
+
+**做到这里停止：** 不新建评测框架；不等全仓人工复测完成才开 N1/N2/N6。
+
+## N1 — 宿主可长期接入、可安全关闭
+
+**用户结果：** 第二个客户端能连入；反复重连不耗尽会话表；Ctrl-C 有界退出；端点不被误删/误抢。
+
+**已复核事实：** `winpipe.rs:186` 每个管道实例都带 `FILE_FLAG_FIRST_PIPE_INSTANCE`（第二实例创建失败→accept 退出）；连接退出只 drop router 不 revoke session（64 上限 `.expect`，第 65 次顺序连接 panic）；accept 循环无停止通道（Ctrl-C 后 join 可能永久阻塞）；`lib.rs:187/251` bind 前无条件 `remove_file`（可删普通文件/解除他人 listener；默认 `/tmp` 固定名跨工作区冲突）。
+
+**步骤：** 首实例独占语义仅用于名称占用检查，后续实例正常模式＋RAII 句柄；session grant 归属连接 guard，全部退出路径 revoke，install 错误受控拒绝；显式停止信号＋连接集合关闭＋服务失败回执，有界 join；UDS 用户私有、按工作区区分的端点，只清理可证明属于自己的。
+
+**检查（建议，未执行）：** `cargo test -p agent-host --test host_e2e`；两并行客户端＋≥65 次顺序重连授权表回落；无客户端/半帧/慢读客户端下有界停机；普通文件占端点拒绝且不删除。
+
+**做到这里停止：** 不做公网 TCP/HTTP、系统服务安装器、多工作区调度。
+
+## N2 — 未知修改结果不重发，连接状态不复活
+
+**用户结果：** continue 已被接受但回复丢失时不会自动续跑第二段；坏连接不被复用；并发连接请求只建一条连接。
+
+**已复核事实：** `ResumableSession.RunAsync` 捕获连接异常后重连并重试 operation，submit/continue/cancel 全走它（审批答复已正确排除）；continue/cancel 正文不绑定预期 task/turn/generation；`Fault()` 只失败 pending 不关流不标终态；半帧写入失败不毒化连接；`LiveAsync` 连接/握手在锁外、无 single-flight 与代际约束。
+
+**步骤：** 查询与修改重试策略分离，未知修改结果返回 Unknown 并要求查询/重同步；修改携带预期 task/turn/generation＋宿主 incarnation；single-flight connect＋handshake 成功才安装＋Dispose 防迟到复活；Fault 单一终态路径（关流、拒新请求、结清 waiter）；每个类型化 API 在实际发送/接受路径运行 payload 验证（F19）。
+
+**检查（建议，未执行）：** `dotnet test …Agent.Client.Tests.csproj --filter "ConnectionTests|ResumableSessionTests"`；`cargo test -p agent-platform-protocol work`。
+
+**做到这里停止：** 不建通用持久幂等数据库；无法证明时返回 Unknown，不猜测。
+
+## N3 — 同一连接上的事件、快照和完整输入
+
+**用户结果：** 订阅后真实收到受理/工具/助手/终态事件；多行开发要求可提交。
+
+**已复核事实：** `agent-host/src/lib.rs:425` `work.subscribe` 握手成功后 `Ok((response, _receiver))` 丢弃事件 receiver；客户端 `Dispatch` 在分型前要求 `request_id`（合法 notification 被拒）；`work.rs:465` `validate_text` 拒绝一切控制字符（含 LF/TAB）而 GUI 文本框 AcceptsReturn=true。
+
+**步骤：** 宿主保留 receiver 到连接关闭，响应/通知共用单一有界 writer；客户端按 kind 验证（notification 无需 request_id）；snapshot+subscribe 一致切点（沿用 barrier/resync-only，缺口返回 resync_required）；短标题与有界完整正文分离，正文允许合法换行/制表，身份/路径仍严格。
+
+**检查（建议，未执行）：** `cargo test -p agent-host --test host_e2e`；`cargo test -p agent-platform-protocol work`；`dotnet test …Agent.Client.Tests.csproj`；中文多行/emoji 提交、慢消费者触发明确 gap/resync。
+
+**做到这里停止：** 不新建 Chronicle；不为跨语言更换长度前缀传输。
+
+## N4 — 从按钮和快照变成真正的任务操作面
+
+**用户结果：** 提交→工具/输出→知情审批→让出/取消→继续→产出待审是一条正式链；待审批反复刷新不积累命令对象。
+
+**事实：** 待审批快照只有 request_id＋call_name（无路径/argv/参数/风险）；每 3 秒刷新重建审批行、每行两个命令加入长寿命 `AsyncCommandGroup` 不移除（推导：1 小时≈2400 引用，非实测）；桌面默认 FixtureLayout。
+
+**步骤：** 审批经既有 gate 提供受限详情绑定 request 身份与有效性；按 request_id/task_id 复用稳定行 ViewModel、移除时撤销注册、刷新 single-flight＋连接代际；真实短计划/open loops/执行状态/结果卡；fixture 降为显式预览开关，正式默认接真实宿主。
+
+**检查（建议，未执行）：** `dotnet build apps/Agent.Desktop/Agent.Desktop.csproj`；`dotnet test …Agent.Client.Tests.csproj`。
+
+**做到这里停止：** 不做 IDE/编辑器；GUI 不保存第二份任务/权限/完成真相。
+
+## N5 — 正式检查点恢复与可审阅工件
+
+**用户结果：** 同一正式宿主保存→关闭→重启→恢复原任务并显式继续；结果/差异/工件按需可读。
+
+**已复核事实：** `agent-host/src/main.rs:207-213` `--restore-latest` 按文件名枚举 JSON 后直接 `serde_json::from_str::<RuntimeCheckpoint>`，绕过 CheckpointStore 的版本/checksum 信封（`decode_checkpoint_file/bytes` 已存在未用）。
+
+**步骤：** 统一走 CheckpointStore 受限验证解码＋完整 `RuntimeInstance.restore`；profile 来源与身份显示明确；变更/工件经现有事实读取，只读调用不新建模型回合；GUI 区分断开窗口/取消任务/停止宿主/恢复继续。
+
+**检查（建议，未执行）：** `cargo test -p agent-host --test host_e2e`；`cargo test -p agent-compose`；`dotnet build apps/Agent.Desktop/Agent.Desktop.csproj`。
+
+**做到这里停止：** 不改检查点格式、不建第二恢复引擎。
+
+## N6 — 修准语义保留、只读成本与 Skill 路径
+
+**用户结果：** 同文件两条兼容决策共存；有效 lease 不因正文位置改变终态；Skill 读取不能经 symlink/FIFO 越出包外；catalog limit=0 不做全量投影。
+
+**已复核事实：** 决策 supersession 仍按实体/子串重合排队 `Superseded`（无同任务/决策键/显式替代约束）；`residency.rs:315-316` 的 Warm 路径检查 keep_alive/lease 而 Resident TTL 路径（`gc/minor.rs`）无此检查；`plugin.rs` `skill_read` 词法相对检查后普通 `File::open`（包内 symlink 可指向包外，探针已证机制；FIFO 可在 take 生效前阻塞）；`engine.rs:1705/1710` `to_summaries` 先全量投影再 `bounded_catalog`。
+
+**步骤：** 实体匹配降为相关性，仅明确替代目标＋正确任务范围才进终态；提取跨层共用到期保护（lease/keep_alive 范围明确，终态不可复活）；catalog 早退 limit0＋惰性投影/选中后复制；Skill 复用既有 ConfinedDir/受限普通文件句柄。拆小 PR。
+
+**检查（建议，未执行）：** `cargo test -p context-simple`；`cargo test -p agent-runtime --lib plugin::`。
+
+**做到这里停止：** 不加向量/学习排序/新 GC 策略；可与 N1/N2 并行。
+
+## N7 — 长会话有界而且指标可解释
+
+**用户结果：** 长会话命令、pending、事件、文本、采样缓存有界回落；指标覆盖范围如实标注。
+
+**事实：** MetricsSession Windows 无法枚举 parent 仍报 whole-tree、Linux 遍历提前标记 seen 可能漏孙进程、末样本直接标 idle、`_samples` 无限追加；DeltaCoalescer 仅 Append 时检查时间；输出 400 行限制不等于字节界限。
+
+**步骤：** 输出按 chars/bytes/rows 共同限额、增量显示；采样覆盖标 root_only/full_tree/unknown、有界环；关闭时挂接 ViewModel 异步清理。
+
+**检查（建议，未执行）：** `dotnet test …Agent.Client.Tests.csproj --filter "MetricsSessionTests|DeltaCoalescerTests"`；`dotnet build … -c Release`。
+
+**做到这里停止：** 不把 AOT/零拷贝列为发布前置；不新增指标数据库。
+
+## N8 — 把现有能力接入产品并完成来源绑定发布
+
+**用户结果：** 安装后连接真实宿主而非 fixture；MCP/Skill 经目录与权限边界可配置使用；包来源可追溯。
+
+**步骤：** 宿主暴露受限 MCP/Plugin 配置路径与 supported/unsupported；补 .NET→Rust host→Runtime→Tool→Event→GUI 真实用例（scripted model）；打包含宿主/桌面/依赖，干净 staging＋来源身份（即 PACKAGE-01/原 R1 范围，届时一并关闭）；三类真实任务记录，未执行写 NOT_RUN。
+
+**检查（建议，未执行）：** `cargo test -p agent-host --test host_e2e`；`cargo test -p agent-capability-process`；`dotnet build … -c Release`。
+
+**做到这里停止：** 不新建 release/tag 除非明确要求；本切片验收前不写 M17 已完成。
+
+---
+
+## M17 队列（主体落地，2026-09-07；闭环残余由上方 N 系列接手）
 
 | 顺序 | 工单 | 线 | 交付物 | 状态 | 依赖 |
 |---|---|---|---|---|---|
@@ -42,7 +172,6 @@
 | 13 | PACKAGE-01 | 条件 | 打包来源绑定 | 下次实际发布 | — |
 | 14 | MCP-01 | 条件 | MCP 写/连接/读可取消 | 仅默认启用 MCP 时 | — |
 
-阶段后候选（不作为本阶段前置）：只读工具子 Agent（独立状态、有限预算、无递归）；Context/GC/搜索算法研究按真实瓶颈单独立项。
 
 ## 上一阶段队列（已关闭，2026-09-06/07）
 

@@ -1,0 +1,571 @@
+[
+  {
+    "id": "F01",
+    "priority": "P1",
+    "title": "Unix 分支引用了仅在 Windows 定义的 winpipe 模块",
+    "status": "OPEN_AT_REVIEWED_SHA",
+    "evidence": "STATIC_SOURCE; REMOTE_CI_STOPS_AT_FMT",
+    "source_commit": "11afdd747d6cbbb58ef0d7371841e8e365c4f8db",
+    "files": [
+      "crates/agent-host/src/lib.rs",
+      "crates/agent-host/tests/host_e2e.rs",
+      ".github/workflows/ci.yml"
+    ],
+    "trigger": "在非 Windows 目标编译 agent-host：serve 的 NamedPipe 分支无条件引用 winpipe::serve，模块声明却只有 #[cfg(windows)]。",
+    "impact": "Linux 宿主构建有明确的名字解析缺口；当前 CI 停在 fmt，尚未由该 run 验证后续构建。host_e2e 的 Unix 连接辅助函数也没有真实 UDS 实现。",
+    "repair": "对两个平台提供明确 cfg 分支或受支持/不支持实现；修真实 UDS 测试连接。把 agent-host 纳入 Linux 分片及 .NET build/test 纳入现有 CI。",
+    "regressions": [
+      "Linux/Windows cargo check -p agent-host --all-targets",
+      "host_e2e 真正运行 UDS 与 Named Pipe，不丢弃服务线程错误",
+      "现有 .NET 客户端测试和桌面 build 在 CI 执行"
+    ],
+    "qualification": "本轮没有 Rust 编译器。当前 CI 的实际失败是格式，不把静态编译发现伪称 CI 编译日志。",
+    "task": "N0",
+    "sources": [
+      "https://github.com/Ye-Luo-0912/context-agent-prototype/blob/11afdd747d6cbbb58ef0d7371841e8e365c4f8db/crates/agent-host/src/lib.rs",
+      "https://github.com/Ye-Luo-0912/context-agent-prototype/blob/11afdd747d6cbbb58ef0d7371841e8e365c4f8db/crates/agent-host/tests/host_e2e.rs",
+      "https://github.com/Ye-Luo-0912/context-agent-prototype/blob/11afdd747d6cbbb58ef0d7371841e8e365c4f8db/.github/workflows/ci.yml"
+    ]
+  },
+  {
+    "id": "F02",
+    "priority": "P1",
+    "title": "Named Pipe 每个实例都使用 FIRST_PIPE_INSTANCE",
+    "status": "OPEN_AT_REVIEWED_SHA",
+    "evidence": "STATIC_SOURCE; OFFICIAL_WIN32_CONTRACT",
+    "source_commit": "11afdd747d6cbbb58ef0d7371841e8e365c4f8db",
+    "files": [
+      "crates/agent-host/src/winpipe.rs"
+    ],
+    "trigger": "第一条管道实例仍存在时，accept 循环再次用 FILE_FLAG_FIRST_PIPE_INSTANCE 调 CreateNamedPipeW。",
+    "impact": "第二个实例创建失败，accept 循环退出；已有首条连接可能继续工作，单连接冒烟不能证明可多客户端或可重连。部分拒绝分支还在 OwnedHandle 存活时直接 CloseHandle(raw)。",
+    "repair": "仅首次占用名称时使用相应独占语义，后续实例采用正常实例模式；统一 RAII 句柄所有权，拒绝分支不要手动二次关闭已拥有的句柄。",
+    "regressions": [
+      "同时两个客户端分别查询",
+      "首客户端保持连接时再接入、断开、重连",
+      "拒绝/容量上限路径不双重 CloseHandle"
+    ],
+    "qualification": "保留已存在的当前用户 DACL、客户端令牌检查和拒绝远程客户端；本轮未在 Windows 执行。",
+    "task": "N1",
+    "sources": [
+      "https://github.com/Ye-Luo-0912/context-agent-prototype/blob/11afdd747d6cbbb58ef0d7371841e8e365c4f8db/crates/agent-host/src/winpipe.rs"
+    ]
+  },
+  {
+    "id": "F03",
+    "priority": "P1",
+    "title": "连接结束未撤销会话 grant，累计连接达到上限后 panic",
+    "status": "OPEN_AT_REVIEWED_SHA",
+    "evidence": "STATIC_SOURCE",
+    "source_commit": "11afdd747d6cbbb58ef0d7371841e8e365c4f8db",
+    "files": [
+      "crates/agent-host/src/lib.rs",
+      "crates/agent-runtime/src/platform/work.rs"
+    ],
+    "trigger": "build_connection_plane 每次 install 一个新 session；连接退出只 drop router，没有 revoke；累计达到会话表 64 上限。",
+    "impact": "live connection 数量回落并不会清空授权表；在没有其他预置 grant 的条件下，第 65 次顺序连接会使 install 的 expect panic。",
+    "repair": "用连接生命周期 guard 在所有退出路径撤销该会话；install 错误作为受控拒绝，不让 accept 线程 panic。",
+    "regressions": [
+      "连续至少 65 次连接/断开后授权表和句柄回到基线",
+      "坏帧、超时、鉴权失败和关闭期间同样释放",
+      "同时连接上限仍生效"
+    ],
+    "qualification": "64 是会话表上限，不是并发连接上限；不能用后者证明前者不会耗尽。",
+    "task": "N1",
+    "sources": [
+      "https://github.com/Ye-Luo-0912/context-agent-prototype/blob/11afdd747d6cbbb58ef0d7371841e8e365c4f8db/crates/agent-host/src/lib.rs",
+      "https://github.com/Ye-Luo-0912/context-agent-prototype/blob/11afdd747d6cbbb58ef0d7371841e8e365c4f8db/crates/agent-runtime/src/platform/work.rs"
+    ]
+  },
+  {
+    "id": "F04",
+    "priority": "P1",
+    "title": "宿主没有可停止的 accept 生命周期，关闭可能无限 join",
+    "status": "OPEN_AT_REVIEWED_SHA",
+    "evidence": "STATIC_SOURCE",
+    "source_commit": "11afdd747d6cbbb58ef0d7371841e8e365c4f8db",
+    "files": [
+      "crates/agent-host/src/main.rs",
+      "crates/agent-host/src/lib.rs",
+      "crates/agent-host/src/winpipe.rs"
+    ],
+    "trigger": "主线程收到 Ctrl-C 后关闭 Runtime，再 join 阻塞的服务线程；accept 循环没有停止通道。服务线程提前失败时，主逻辑也不主动收敛。",
+    "impact": "空闲 Unix listener 可使正常退出永久停在 join；Windows 同步 Connect/Read 也需要可中断策略。宿主线程死亡可能留下仍运行而不可连接的 Runtime。",
+    "repair": "引入明确服务器停止信号和连接集合关闭；主逻辑同时观察信号与服务结果，停止新请求、结算活动操作、撤销会话、关闭传输后有界 join。",
+    "regressions": [
+      "无客户端 Ctrl-C 有界退出",
+      "半帧/不读响应/待审批连接存在时仍可停机",
+      "accept 失败不静默运行到下一次 Ctrl-C"
+    ],
+    "qualification": "复用现有 RuntimeInstance.shutdown，增加的是传输生命周期，不是第二个任务调度器。",
+    "task": "N1",
+    "sources": [
+      "https://github.com/Ye-Luo-0912/context-agent-prototype/blob/11afdd747d6cbbb58ef0d7371841e8e365c4f8db/crates/agent-host/src/main.rs",
+      "https://github.com/Ye-Luo-0912/context-agent-prototype/blob/11afdd747d6cbbb58ef0d7371841e8e365c4f8db/crates/agent-host/src/lib.rs",
+      "https://github.com/Ye-Luo-0912/context-agent-prototype/blob/11afdd747d6cbbb58ef0d7371841e8e365c4f8db/crates/agent-host/src/winpipe.rs"
+    ]
+  },
+  {
+    "id": "F05",
+    "priority": "P1",
+    "title": "UDS 启动无条件 unlink 路径，端点所有权不成立",
+    "status": "OPEN_AT_REVIEWED_SHA",
+    "evidence": "STATIC_SOURCE; ISOLATED_OS_PROBE",
+    "source_commit": "11afdd747d6cbbb58ef0d7371841e8e365c4f8db",
+    "files": [
+      "crates/agent-host/src/lib.rs",
+      "clients/dotnet/Agent.Client/Transports.cs"
+    ],
+    "trigger": "serve_unix 在 bind 之前对配置的 socket path 无条件 remove_file；默认名称位于全局 /tmp 固定路径。",
+    "impact": "可删除占位的普通文件；也可解除另一个活跃 listener 的名称，新客户端转向新 listener 而旧连接仍活。两个工作区使用相同默认名称易冲突。PID 文本锁本身也不是原子持有的 OS 锁。",
+    "repair": "采用用户私有、按 workspace/host 标识分开的端点；检查类型、所有者及活跃状态；只删除能证明属于本实例的端点；工作区单实例使用持有期 OS 锁。",
+    "regressions": [
+      "普通文件占据端点时拒绝且不删除",
+      "旧 listener 活跃时拒绝接管",
+      "两个工作区的默认端点不同",
+      "同实例关闭只清理自身端点"
+    ],
+    "qualification": "隔离探针只验证 unlink/bind 的 OS 行为。现有 SO_PEERCRED/chmod 及 Workspace 独占日志是缓解，未证明两个生产 Runtime 已同时写入。",
+    "task": "N1",
+    "sources": [
+      "https://github.com/Ye-Luo-0912/context-agent-prototype/blob/11afdd747d6cbbb58ef0d7371841e8e365c4f8db/crates/agent-host/src/lib.rs",
+      "https://github.com/Ye-Luo-0912/context-agent-prototype/blob/11afdd747d6cbbb58ef0d7371841e8e365c4f8db/clients/dotnet/Agent.Client/Transports.cs"
+    ]
+  },
+  {
+    "id": "F06",
+    "priority": "P1",
+    "title": "订阅成功但 receiver 被丢弃，GUI 收不到实际事件流",
+    "status": "OPEN_AT_REVIEWED_SHA",
+    "evidence": "STATIC_END_TO_END_TRACE",
+    "source_commit": "11afdd747d6cbbb58ef0d7371841e8e365c4f8db",
+    "files": [
+      "crates/agent-host/src/lib.rs",
+      "crates/agent-runtime/src/platform/work.rs",
+      "crates/agent-platform-protocol/src/work.rs",
+      "clients/dotnet/Agent.Client/AgentConnection.cs",
+      "apps/Agent.Desktop/ViewModels/MainWindowViewModel.cs"
+    ],
+    "trigger": "work.subscribe 返回成功后丢弃 _receiver；客户端 Dispatch 又在处理 notification 前要求 request_id；GUI 不消费运行事件流。",
+    "impact": "接入存在但“模型/工具输出到桌面”的主链未闭环。现有快照不携带完整输出、结果和计划，三秒轮询不能补齐缺失的数据。",
+    "repair": "保留现有 WorkEventNotification 与 PlatformEnvelope；宿主持有订阅，用单一有界 writer 复用响应与事件；客户端按 kind 验证可无 request_id 的 notification；桌面消费类型化事件并有界合并刷新。",
+    "regressions": [
+      "同一真实连接收到受理、至少一个工具事件、助手结果、终态",
+      "合法 notification 不带 request_id 仍被接受",
+      "慢消费者触发明确 gap/resync 而不无限缓冲",
+      "审批/取消不被长输出阻塞"
+    ],
+    "qualification": "DTO 已存在，不需从零设计事件协议。轮询可以作为显式降级能力，但不能对外宣称已建立 live subscription。",
+    "task": "N3",
+    "sources": [
+      "https://github.com/Ye-Luo-0912/context-agent-prototype/blob/11afdd747d6cbbb58ef0d7371841e8e365c4f8db/crates/agent-host/src/lib.rs",
+      "https://github.com/Ye-Luo-0912/context-agent-prototype/blob/11afdd747d6cbbb58ef0d7371841e8e365c4f8db/crates/agent-runtime/src/platform/work.rs",
+      "https://github.com/Ye-Luo-0912/context-agent-prototype/blob/11afdd747d6cbbb58ef0d7371841e8e365c4f8db/crates/agent-platform-protocol/src/work.rs",
+      "https://github.com/Ye-Luo-0912/context-agent-prototype/blob/11afdd747d6cbbb58ef0d7371841e8e365c4f8db/clients/dotnet/Agent.Client/AgentConnection.cs",
+      "https://github.com/Ye-Luo-0912/context-agent-prototype/blob/11afdd747d6cbbb58ef0d7371841e8e365c4f8db/apps/Agent.Desktop/ViewModels/MainWindowViewModel.cs"
+    ]
+  },
+  {
+    "id": "F07",
+    "priority": "P1",
+    "title": "重连包装器自动重发 submit/continue/cancel",
+    "status": "OPEN_AT_REVIEWED_SHA",
+    "evidence": "STATIC_SOURCE",
+    "source_commit": "11afdd747d6cbbb58ef0d7371841e8e365c4f8db",
+    "files": [
+      "clients/dotnet/Agent.Client/ResumableSession.cs",
+      "crates/agent-platform-protocol/src/work.rs",
+      "crates/agent-runtime/src/actor/turn.rs"
+    ],
+    "trigger": "RunAsync 捕获非取消、非 AgentProtocolException 后重试 operation；Submit/Continue/Cancel 全使用它。Continue/Cancel body 为空；submit 去重仅在当前宿主进程内。",
+    "impact": "请求已被执行但回复丢失时，可续跑第二段或取消新的当前 turn；宿主重启后复用同 submission key 也不能保证幂等。协议违例异常也可能触发此重试。",
+    "repair": "查询与修改采用不同重试策略；未知修改结果显式返回 Unknown，先查询/重同步。修改绑定预期 task/turn/generation 与宿主 incarnation；同一实例内的已证明重复请求方可复用原回执。",
+    "regressions": [
+      "continue 已执行后丢响应，不再开启第二段",
+      "cancel 丢回复且焦点变化，不取消新 turn",
+      "宿主重启后 submission 不透明重发",
+      "协议错帧不触发修改重试"
+    ],
+    "qualification": "审批答复已明确不自动重试，应保留；当前 API 没有跨崩溃 exactly-once 保证，不要求新建通用幂等数据库才能先关闭危险重发。",
+    "task": "N2",
+    "sources": [
+      "https://github.com/Ye-Luo-0912/context-agent-prototype/blob/11afdd747d6cbbb58ef0d7371841e8e365c4f8db/clients/dotnet/Agent.Client/ResumableSession.cs",
+      "https://github.com/Ye-Luo-0912/context-agent-prototype/blob/11afdd747d6cbbb58ef0d7371841e8e365c4f8db/crates/agent-platform-protocol/src/work.rs",
+      "https://github.com/Ye-Luo-0912/context-agent-prototype/blob/11afdd747d6cbbb58ef0d7371841e8e365c4f8db/crates/agent-runtime/src/actor/turn.rs"
+    ]
+  },
+  {
+    "id": "F08",
+    "priority": "P1",
+    "title": "客户端半帧写入和 Fault 状态没有关闭连接",
+    "status": "OPEN_AT_REVIEWED_SHA",
+    "evidence": "STATIC_SOURCE",
+    "source_commit": "11afdd747d6cbbb58ef0d7371841e8e365c4f8db",
+    "files": [
+      "clients/dotnet/Agent.Client/AgentConnection.cs",
+      "clients/dotnet/Agent.Client/Framing.cs"
+    ],
+    "trigger": "WriteFrameAsync 已部分写入后超时/取消；SendAsync finally 只移除 pending。Dispatch 内部 Fault 只失败 pending，不标终态、不停止 reader、不关闭 stream。",
+    "impact": "下一帧可能接在上一半帧后，协议失步；某些已 Fault 的连接仍报告 IsConnected，后续调用继续等待或发送。",
+    "repair": "引入单一终态故障路径：原子标 Faulted、拒绝后续请求、结束通知和 pending、关闭传输以解除读；半帧写入失败必须毒化连接；仅未发送的取消和已完整发送后的等待放弃可分别处理。",
+    "regressions": [
+      "短写后注入异常，后续请求不写任何字节",
+      "坏 envelope 触发 IsConnected=false 且所有 waiter 结束",
+      "请求完整写完后的本地等待取消不伪造服务端取消"
+    ],
+    "qualification": "真实 read loop 抛异常结束时本来会使 IsConnected 变 false；缺口是内部 Fault 返回和写失败路径，不笼统否定所有错误处理。",
+    "task": "N2",
+    "sources": [
+      "https://github.com/Ye-Luo-0912/context-agent-prototype/blob/11afdd747d6cbbb58ef0d7371841e8e365c4f8db/clients/dotnet/Agent.Client/AgentConnection.cs",
+      "https://github.com/Ye-Luo-0912/context-agent-prototype/blob/11afdd747d6cbbb58ef0d7371841e8e365c4f8db/clients/dotnet/Agent.Client/Framing.cs"
+    ]
+  },
+  {
+    "id": "F09",
+    "priority": "P1",
+    "title": "连接建立/重同步没有 single-flight、代际和一致切点",
+    "status": "OPEN_AT_REVIEWED_SHA",
+    "evidence": "STATIC_SOURCE",
+    "source_commit": "11afdd747d6cbbb58ef0d7371841e8e365c4f8db",
+    "files": [
+      "clients/dotnet/Agent.Client/ResumableSession.cs",
+      "clients/dotnet/Agent.Client/Transports.cs",
+      "crates/agent-runtime/src/platform/work.rs"
+    ],
+    "trigger": "LiveAsync 锁只保护检查，connect/handshake 在锁外；fresh 在快照完成前发布。Snapshot 后 Subscribe(null)，忽略订阅回执的切点/重同步结果；Dispose 没有禁止迟到 connect 重新安装连接。",
+    "impact": "并发按钮/轮询可能建立并覆盖多条连接；迟到响应污染新界面；快照与事件之间存在空档；连接到另一宿主实例后无法从当前 DTO 确认同一运行世代。",
+    "repair": "每会话只允许一个连接任务；安装时校验 generation 和 disposed；快照与订阅以同一 run/host-incarnation 和有效游标衔接，缺口重新取快照，不自行拼接；失败 connect 释放资源。",
+    "regressions": [
+      "并发十次 query 只进行一次 connect",
+      "connect 中 Dispose 不复活连接",
+      "切点之间产生事件，不丢不双计",
+      "重连到新宿主显示身份变化而非沿用旧状态"
+    ],
+    "qualification": "服务端 router 已有 actor barrier 和 resync-only 语义；缺口主要在 transport/client 的贯彻，不要求无限事件重放。",
+    "task": "N2;N3",
+    "sources": [
+      "https://github.com/Ye-Luo-0912/context-agent-prototype/blob/11afdd747d6cbbb58ef0d7371841e8e365c4f8db/clients/dotnet/Agent.Client/ResumableSession.cs",
+      "https://github.com/Ye-Luo-0912/context-agent-prototype/blob/11afdd747d6cbbb58ef0d7371841e8e365c4f8db/clients/dotnet/Agent.Client/Transports.cs",
+      "https://github.com/Ye-Luo-0912/context-agent-prototype/blob/11afdd747d6cbbb58ef0d7371841e8e365c4f8db/crates/agent-runtime/src/platform/work.rs"
+    ]
+  },
+  {
+    "id": "F10",
+    "priority": "P1",
+    "title": "正式宿主恢复按原始 RuntimeCheckpoint JSON 读取实际信封文件",
+    "status": "OPEN_AT_REVIEWED_SHA",
+    "evidence": "STATIC_SOURCE",
+    "source_commit": "11afdd747d6cbbb58ef0d7371841e8e365c4f8db",
+    "files": [
+      "crates/agent-host/src/main.rs",
+      "crates/agent-runtime/src/checkpoint.rs",
+      "crates/agent-runtime/src/lib.rs"
+    ],
+    "trigger": "--restore-latest 枚举 JSON，按文件名选择，然后全量读入并直接 serde_json::from_str::<RuntimeCheckpoint>。CheckpointStore 实际产物是带版本/checksum 的 header + payload 信封。",
+    "impact": "正常保存的当前格式不能被这个原始 JSON 路径正确消费；最新文件名也不等于最近可验证检查点。不能以支持旧 raw fixture 证明真实恢复。",
+    "repair": "统一使用现有 CheckpointStore 和 decode_checkpoint_file/bytes；限制读取、验证信封及身份，从可验证记录选择 latest，再调用完整 RuntimeInstance.restore。",
+    "regressions": [
+      "真实宿主保存文件后关闭、重新启动并继续原 Task",
+      "损坏/过大/不兼容信封在模型请求前明确失败",
+      "最新候选损坏时策略明确，不猜测旧格式或静默跳过"
+    ],
+    "qualification": "原始旧 JSON 可能在兼容入口仍有意义，但不能替代正式产物路径；不改写 checkpoint 格式。",
+    "task": "N5",
+    "sources": [
+      "https://github.com/Ye-Luo-0912/context-agent-prototype/blob/11afdd747d6cbbb58ef0d7371841e8e365c4f8db/crates/agent-host/src/main.rs",
+      "https://github.com/Ye-Luo-0912/context-agent-prototype/blob/11afdd747d6cbbb58ef0d7371841e8e365c4f8db/crates/agent-runtime/src/checkpoint.rs",
+      "https://github.com/Ye-Luo-0912/context-agent-prototype/blob/11afdd747d6cbbb58ef0d7371841e8e365c4f8db/crates/agent-runtime/src/lib.rs"
+    ]
+  },
+  {
+    "id": "F11",
+    "priority": "P2",
+    "title": "多行 GUI 输入与工作协议的控制字符规则冲突",
+    "status": "OPEN_AT_REVIEWED_SHA",
+    "evidence": "STATIC_SOURCE",
+    "source_commit": "11afdd747d6cbbb58ef0d7371841e8e365c4f8db",
+    "files": [
+      "apps/Agent.Desktop/MainWindow.axaml",
+      "crates/agent-platform-protocol/src/work.rs",
+      "clients/dotnet/Agent.Client/WorkDto.cs",
+      "clients/dotnet/Agent.Client/Envelope.cs"
+    ],
+    "trigger": "GUI AcceptsReturn=true，用户粘贴多行要求或代码；work.submit 的 validate_text 拒绝所有 char::is_control，包括 LF/CR/TAB。",
+    "impact": "常见输入被拒；2000 字符 goal 同时充当标题与完整指令，不符合长开发任务的输入需求。Rust scalar、C# UTF-16 length、UTF-8 byte 也存在边界口径差异。",
+    "repair": "区分短目标/显示标题与有界完整正文，复用现有用户 artifact/ref 机制；正文允许合法换行和制表，身份/路径仍严格；跨语言按契约使用标量数或 UTF-8 字节数。",
+    "regressions": [
+      "中文多行要求、emoji、代码片段正常提交",
+      "正文 byte cap 在分配/持久化前检查",
+      "非法身份控制字符仍拒绝",
+      "两语言临界长度样本一致"
+    ],
+    "qualification": "不是通过删除全部输入验证来修复，也不让 GUI 自行摘要用户指令后取代原文。",
+    "task": "N3",
+    "sources": [
+      "https://github.com/Ye-Luo-0912/context-agent-prototype/blob/11afdd747d6cbbb58ef0d7371841e8e365c4f8db/apps/Agent.Desktop/MainWindow.axaml",
+      "https://github.com/Ye-Luo-0912/context-agent-prototype/blob/11afdd747d6cbbb58ef0d7371841e8e365c4f8db/crates/agent-platform-protocol/src/work.rs",
+      "https://github.com/Ye-Luo-0912/context-agent-prototype/blob/11afdd747d6cbbb58ef0d7371841e8e365c4f8db/clients/dotnet/Agent.Client/WorkDto.cs",
+      "https://github.com/Ye-Luo-0912/context-agent-prototype/blob/11afdd747d6cbbb58ef0d7371841e8e365c4f8db/clients/dotnet/Agent.Client/Envelope.cs"
+    ]
+  },
+  {
+    "id": "F12",
+    "priority": "P1",
+    "title": "审批与产品快照不足以支撑知情操作和结果交付",
+    "status": "OPEN_AT_REVIEWED_SHA",
+    "evidence": "STATIC_PRODUCT_GAP",
+    "source_commit": "11afdd747d6cbbb58ef0d7371841e8e365c4f8db",
+    "files": [
+      "crates/agent-platform-protocol/src/work.rs",
+      "clients/dotnet/Agent.Client/WorkDto.cs",
+      "apps/Agent.Desktop/ViewModels/MainWindowViewModel.cs",
+      "apps/Agent.Desktop/MainWindow.axaml"
+    ],
+    "trigger": "待审批项只有 request_id 与 call_name；界面提供允许/拒绝，没有显示具体路径、argv、参数和风险。快照缺当前计划、完整结果/工件引用等关键数据。",
+    "impact": "用户可以操作按钮却无法在桌面确认将批准什么；执行/完成/待审阅显示缺充分事实；仅补 GUI 控件无法补出后端未提供的信息。桌面默认选择 FixtureLayout，虽然明确标注非执行器，启动窗口仍不等于进入真实工作流。",
+    "repair": "从现有审批请求提供受限详情，绑定请求身份和当前有效性；增加 GUI 实际使用的计划、执行状态、结果与工件读取投影；权限决定仍由 Core/gate 完成。",
+    "regressions": [
+      "文件写入审批可看到准确路径和受限差异/参数",
+      "过期审批按钮不能授权新请求",
+      "普通 final、可信完成、取消、预算让出显示不同",
+      "结果可追溯至实际操作/工件"
+    ],
+    "qualification": "现有审批权威没有被绕过；这是支持安全使用的界面信息缺口，不宣称所有调用是免审批执行。",
+    "task": "N4;N5",
+    "sources": [
+      "https://github.com/Ye-Luo-0912/context-agent-prototype/blob/11afdd747d6cbbb58ef0d7371841e8e365c4f8db/crates/agent-platform-protocol/src/work.rs",
+      "https://github.com/Ye-Luo-0912/context-agent-prototype/blob/11afdd747d6cbbb58ef0d7371841e8e365c4f8db/clients/dotnet/Agent.Client/WorkDto.cs",
+      "https://github.com/Ye-Luo-0912/context-agent-prototype/blob/11afdd747d6cbbb58ef0d7371841e8e365c4f8db/apps/Agent.Desktop/ViewModels/MainWindowViewModel.cs",
+      "https://github.com/Ye-Luo-0912/context-agent-prototype/blob/11afdd747d6cbbb58ef0d7371841e8e365c4f8db/apps/Agent.Desktop/MainWindow.axaml"
+    ]
+  },
+  {
+    "id": "F13",
+    "priority": "P2",
+    "title": "桌面轮询不断保留新的审批命令对象",
+    "status": "OPEN_AT_REVIEWED_SHA",
+    "evidence": "STATIC_SOURCE; ARITHMETIC_NOT_BENCHMARK",
+    "source_commit": "11afdd747d6cbbb58ef0d7371841e8e365c4f8db",
+    "files": [
+      "apps/Agent.Desktop/ViewModels/MainWindowViewModel.cs",
+      "apps/Agent.Desktop/Infrastructure/ObservableObject.cs",
+      "apps/Agent.Desktop/App.axaml.cs",
+      "apps/Agent.Desktop/MainWindow.axaml.cs"
+    ],
+    "trigger": "每次三秒刷新清空并重建审批行；每行两个命令添加进 AsyncCommandGroup 的长寿命列表但不移除。异步 timer 也未统一做 refresh single-flight/连接代际丢弃。",
+    "impact": "待审批持续一小时且刷新成功时，约新增 2400 个命令对象引用；Clear 可视集合不释放命令组中的引用。关闭/断开过程还没有完整挂接 ViewModel 的异步清理。",
+    "repair": "按 request_id 更新稳定行对象/命令；移除时撤销注册；刷新 single-flight、应用结果前检查连接代际；窗口退出统一取消 timer、等待任务和释放 session。输出按 bytes/chars 及行数共同限额。",
+    "regressions": [
+      "同一审批刷新 1200 次后命令注册数保持有界",
+      "关闭期间慢响应不会再改 ViewModel",
+      "连续连接/断开不增加活动 timer/reader",
+      "单行大输出也受保留界限约束"
+    ],
+    "qualification": "2400 是 2×3600/3 的路径推导，不是实测堆字节或性能报告。",
+    "task": "N4;N7",
+    "sources": [
+      "https://github.com/Ye-Luo-0912/context-agent-prototype/blob/11afdd747d6cbbb58ef0d7371841e8e365c4f8db/apps/Agent.Desktop/ViewModels/MainWindowViewModel.cs",
+      "https://github.com/Ye-Luo-0912/context-agent-prototype/blob/11afdd747d6cbbb58ef0d7371841e8e365c4f8db/apps/Agent.Desktop/Infrastructure/ObservableObject.cs",
+      "https://github.com/Ye-Luo-0912/context-agent-prototype/blob/11afdd747d6cbbb58ef0d7371841e8e365c4f8db/apps/Agent.Desktop/App.axaml.cs",
+      "https://github.com/Ye-Luo-0912/context-agent-prototype/blob/11afdd747d6cbbb58ef0d7371841e8e365c4f8db/apps/Agent.Desktop/MainWindow.axaml.cs"
+    ]
+  },
+  {
+    "id": "F14",
+    "priority": "P2",
+    "title": "MetricsSession 的 whole-tree 与 idle 指标名不对应实际采样",
+    "status": "OPEN_AT_REVIEWED_SHA",
+    "evidence": "STATIC_SOURCE",
+    "source_commit": "11afdd747d6cbbb58ef0d7371841e8e365c4f8db",
+    "files": [
+      "clients/dotnet/Agent.Client/MetricsSession.cs",
+      "clients/dotnet/Agent.Client/DeltaCoalescer.cs"
+    ],
+    "trigger": "Windows Parent() 返回 null；Linux 遍历在确认 parent 前把所有 pid 加入 seen；报告仍写 TreeWorkingSet。最后一个样本直接标为 Idle；_samples 长期追加。",
+    "impact": "Windows 实为根进程值，Linux 可能漏掉孙进程；多个根还可能重复计数。非 idle 样本被标 idle；测量器自身持续增长。DeltaCoalescer 只有 Append 时检查时间，不保证无新输入时自动准时刷新。",
+    "repair": "覆盖范围用显式 root_only/full_tree/unknown；有界一次进程快照构建父子关系并全局去重；未实现平台返回不可用；idle 由场景标记；流式累计 count/max/last，必要诊断只存固定环。",
+    "regressions": [
+      "根/子/孙进程 fixture 的覆盖完整性",
+      "Windows 未实现 parent 时不填假 whole_tree",
+      "长时间采样器保留空间固定",
+      "一次短 delta 后不再输入也按既定策略刷新"
+    ],
+    "qualification": "不据此否定其他独立人工采样，也不声称 Avalonia 比其他框架性能更差。",
+    "task": "N7",
+    "sources": [
+      "https://github.com/Ye-Luo-0912/context-agent-prototype/blob/11afdd747d6cbbb58ef0d7371841e8e365c4f8db/clients/dotnet/Agent.Client/MetricsSession.cs",
+      "https://github.com/Ye-Luo-0912/context-agent-prototype/blob/11afdd747d6cbbb58ef0d7371841e8e365c4f8db/clients/dotnet/Agent.Client/DeltaCoalescer.cs"
+    ]
+  },
+  {
+    "id": "F15",
+    "priority": "P1",
+    "title": "实体相关性被用作决策不可逆替代的证明",
+    "status": "OPEN_AT_REVIEWED_SHA",
+    "evidence": "STATIC_SOURCE",
+    "source_commit": "11afdd747d6cbbb58ef0d7371841e8e365c4f8db",
+    "files": [
+      "crates/context-simple/src/gc/reachability.rs",
+      "crates/context-simple/src/engine.rs",
+      "crates/context-simple/src/index/entity.rs"
+    ],
+    "trigger": "supersession 默认开启；带 use/switch 等词的消息被标决策，同实体/子串匹配的旧 Decision 直接排队 Superseded，未约束同 task、决策键或显式替代。",
+    "impact": "同一文件的两条兼容约束会互相覆盖；跨任务也可能发生。大写普通词如 Use 会被 entity 提取，进一步扩大误匹配。语义终态会使普通召回排除旧材料。",
+    "repair": "实体匹配只保留为相关性；只有明确替代目标、相同语义键及正确任务范围的事实才进入终态。无法证明时保留两条，按 attention 冷却，不把关键词分类升级为删除依据。",
+    "regressions": [
+      "同文件 timeout 与 logging 两条兼容决策共存",
+      "不同任务同实体不互终结",
+      "仅共同 Use 不建立替代",
+      "明确替代保留来源 by_id 和范围"
+    ],
+    "qualification": "这是 Context 决策记忆问题，不直接等于 Runtime 的原始用户约束权威被删除；旧错误验证问题已另行修复。",
+    "task": "N6",
+    "sources": [
+      "https://github.com/Ye-Luo-0912/context-agent-prototype/blob/11afdd747d6cbbb58ef0d7371841e8e365c4f8db/crates/context-simple/src/gc/reachability.rs",
+      "https://github.com/Ye-Luo-0912/context-agent-prototype/blob/11afdd747d6cbbb58ef0d7371841e8e365c4f8db/crates/context-simple/src/engine.rs",
+      "https://github.com/Ye-Luo-0912/context-agent-prototype/blob/11afdd747d6cbbb58ef0d7371841e8e365c4f8db/crates/context-simple/src/index/entity.rs"
+    ]
+  },
+  {
+    "id": "F16",
+    "priority": "P1",
+    "title": "同一有效 lease 在 Resident 与 Warm 的 TTL 结果不一致",
+    "status": "OPEN_AT_REVIEWED_SHA",
+    "evidence": "STATIC_SOURCE",
+    "source_commit": "11afdd747d6cbbb58ef0d7371841e8e365c4f8db",
+    "files": [
+      "crates/context-simple/src/residency.rs",
+      "crates/context-simple/src/gc/minor.rs"
+    ],
+    "trigger": "非 Pinned、非 latest-file 的 Ephemeral 条目，age=6、TTL=5、lease_until=10，在 turn=6 的非 AfterModel 路径：Resident TTL 直接 Tombstoned，Warm aging 先检查 lease 而跳过。",
+    "impact": "正文物理位置改变了语义保留义务；keep_alive 也存在同类差异，违背生命周期与驻留正交的目标。",
+    "repair": "统一跨层语义到期保护函数；单独计算 attention 和 residency。有效 lease 阻止其约定范围内的 TTL 终结，但绝不复活 Superseded/VerifiedFixed 等已证明终态。",
+    "regressions": [
+      "同一合法条目跨 Resident/Warm/Stored 的 lease、keep_alive 到期矩阵",
+      "过期 lease 正常维护",
+      "已有语义终态不被 pin/lease 复活"
+    ],
+    "qualification": "需要确认 Stored 当前保留规则后复用同一策略；本轮已逐段确认 Resident 与 Warm，未跑三层完整测试。",
+    "task": "N6",
+    "sources": [
+      "https://github.com/Ye-Luo-0912/context-agent-prototype/blob/11afdd747d6cbbb58ef0d7371841e8e365c4f8db/crates/context-simple/src/residency.rs",
+      "https://github.com/Ye-Luo-0912/context-agent-prototype/blob/11afdd747d6cbbb58ef0d7371841e8e365c4f8db/crates/context-simple/src/gc/minor.rs"
+    ]
+  },
+  {
+    "id": "F17",
+    "priority": "P1",
+    "title": "Skill 读取只有词法路径检查，不能限制符号链接和特殊文件",
+    "status": "OPEN_AT_REVIEWED_SHA",
+    "evidence": "STATIC_SOURCE; ISOLATED_OS_PROBE",
+    "source_commit": "11afdd747d6cbbb58ef0d7371841e8e365c4f8db",
+    "files": [
+      "crates/agent-runtime/src/plugin.rs"
+    ],
+    "trigger": "已安装、已激活包中的相对 reference 指向 symlink/junction；skill_read 用 root.join 后普通 File::open。FIFO 在 bytes.take 生效前就可能阻塞。",
+    "impact": "读取可以跨出声称的包目录，或在普通文件读入口阻塞；64 KiB byte cap 不限制 open 等待与目标类型。",
+    "repair": "复用现有 ConfinedDir/受限句柄打开，固定根和句柄、拒绝不支持的链接/非普通文件，按需受限读取；结果发布前关联正确包版本/激活状态。",
+    "regressions": [
+      "包内指向包外的 symlink/junction 拒绝",
+      "FIFO 命名 skill 文件时有界拒绝",
+      "合法 UTF-8/body cap/双激活门保持",
+      "更新/停用与读取交错不返回错误归属"
+    ],
+    "qualification": "前提是操作者安装启用的包树存在相关文件；不是未经认证远程任意文件读取。隔离探针只读自建临时文件。",
+    "task": "N6",
+    "sources": [
+      "https://github.com/Ye-Luo-0912/context-agent-prototype/blob/11afdd747d6cbbb58ef0d7371841e8e365c4f8db/crates/agent-runtime/src/plugin.rs"
+    ]
+  },
+  {
+    "id": "F18",
+    "priority": "P2",
+    "title": "有界 catalog 在截断前仍全量构造 Resident/Warm summaries",
+    "status": "OPEN_AT_REVIEWED_SHA",
+    "evidence": "STATIC_COMPLEXITY_ANALYSIS",
+    "source_commit": "11afdd747d6cbbb58ef0d7371841e8e365c4f8db",
+    "files": [
+      "crates/context-simple/src/engine.rs",
+      "crates/context-simple/src/heap.rs"
+    ],
+    "trigger": "catalog 先调用返回 Vec 的 to_summaries(heap/warm)，再喂给 bounded_catalog；即使 limit=0 也先执行投影。",
+    "impact": "最终结果 O(limit)，但临时分配及 source/dependency 克隆是 O(Resident+Warm)；不能把 top-k 的界限宣传为整个查询的 O(limit) 额外空间。",
+    "repair": "limit=0 早退；按迭代器惰性构建或先挑 ID 再克隆胜者，保留已有稳定排序；若规模仍大，再测是否需要游标/索引。",
+    "regressions": [
+      "limit=0 不创建逐条 summary",
+      "大量 Resident/Warm、小 limit 的分配计数受控",
+      "相同输入顺序和 tie-break 结果不变"
+    ],
+    "qualification": "惰性投影不自动把扫描 CPU 降为 O(limit)；外部目录本来已经流式，不能说全部历史都已全量复制。",
+    "task": "N6",
+    "sources": [
+      "https://github.com/Ye-Luo-0912/context-agent-prototype/blob/11afdd747d6cbbb58ef0d7371841e8e365c4f8db/crates/context-simple/src/engine.rs",
+      "https://github.com/Ye-Luo-0912/context-agent-prototype/blob/11afdd747d6cbbb58ef0d7371841e8e365c4f8db/crates/context-simple/src/heap.rs"
+    ]
+  },
+  {
+    "id": "F19",
+    "priority": "P2",
+    "title": "C# 的具体 payload 验证没有进入实际 SendAsync",
+    "status": "OPEN_AT_REVIEWED_SHA",
+    "evidence": "STATIC_SOURCE",
+    "source_commit": "11afdd747d6cbbb58ef0d7371841e8e365c4f8db",
+    "files": [
+      "clients/dotnet/Agent.Client/AgentConnection.cs",
+      "clients/dotnet/Agent.Client/Envelope.cs",
+      "clients/dotnet/Agent.Client/ProtocolDto.cs",
+      "clients/dotnet/Agent.Client/WorkDto.cs",
+      "clients/dotnet/Agent.Client/JsonOptions.cs"
+    ],
+    "trigger": "SendAsync 验证 envelope 与 response carrier，但未调用 WorkSubmit/WorkSnapshot 等具体 payload.Validate；多数字段反序列化缺失会用默认值；成功 fixture 不覆盖这些情况。",
+    "impact": "声明的任务数、文本长度、task UUID 等校验与实际入口脱节；异常快照可被当作有效数据。序列化枚举默认容许数字等细节也需按既有契约审查，而非仅比较正常 ASCII 样本。",
+    "repair": "每个类型化 API 在发送前和接受响应后运行对应 validator；保持未知字段/必需字段/合法枚举/UTF-8 bytes 与 scalar 规则一致。避免反射式通用框架或为了字节顺序重写 JSON 标准。",
+    "regressions": [
+      "缺 task_id、超过任务数、非法 UUID、非法 enum 分别被实际 API 拒绝",
+      "中英文/emoji 临界值两语言一致",
+      "坏响应导致协议故障且不重发修改"
+    ],
+    "qualification": "服务端有边界和同用户认证是缓解；本项不等于无限网络匿名攻击，也不否定已存在 envelope pairing。",
+    "task": "N2;N3",
+    "sources": [
+      "https://github.com/Ye-Luo-0912/context-agent-prototype/blob/11afdd747d6cbbb58ef0d7371841e8e365c4f8db/clients/dotnet/Agent.Client/AgentConnection.cs",
+      "https://github.com/Ye-Luo-0912/context-agent-prototype/blob/11afdd747d6cbbb58ef0d7371841e8e365c4f8db/clients/dotnet/Agent.Client/Envelope.cs",
+      "https://github.com/Ye-Luo-0912/context-agent-prototype/blob/11afdd747d6cbbb58ef0d7371841e8e365c4f8db/clients/dotnet/Agent.Client/ProtocolDto.cs",
+      "https://github.com/Ye-Luo-0912/context-agent-prototype/blob/11afdd747d6cbbb58ef0d7371841e8e365c4f8db/clients/dotnet/Agent.Client/WorkDto.cs",
+      "https://github.com/Ye-Luo-0912/context-agent-prototype/blob/11afdd747d6cbbb58ef0d7371841e8e365c4f8db/clients/dotnet/Agent.Client/JsonOptions.cs"
+    ]
+  },
+  {
+    "id": "F20",
+    "priority": "P2",
+    "title": "部分回归名称与真正执行的路径不对应",
+    "status": "OPEN_AT_REVIEWED_SHA",
+    "evidence": "STATIC_TEST_REVIEW; MECHANICAL_PROBE",
+    "source_commit": "11afdd747d6cbbb58ef0d7371841e8e365c4f8db",
+    "files": [
+      "clients/dotnet/Agent.Client.Tests/FramingAndConnectionTests.cs",
+      "clients/dotnet/Agent.Client.Tests/ResilienceTests.cs",
+      "clients/dotnet/Agent.Client.Tests/FixtureConformanceTests.cs",
+      "clients/dotnet/InteropSmoke/Program.cs",
+      "crates/agent-host/tests/host_e2e.rs"
+    ],
+    "trigger": "半帧样本 00000009 被 LE 解释为 150994944，直接走 over-cap；交错请求测试是两条连接各一个请求；interop 的 retry 使用新 key；host 线程 join 错误被忽略。",
+    "impact": "相关测试可能全绿却没有验证其名称暗示的半帧、同连接乱序、同 key 幂等或宿主长时间服务。",
+    "repair": "修改现有用例，不造第三套 harness：真实合法长度的半帧、单连接乱序响应、原 key 重试、执行后丢 ACK、断开重连、服务线程结果必须检查。",
+    "regressions": [
+      "正确半帧应写 09000000 然后仅两字节 payload",
+      "同连接至少两个并行请求且响应逆序",
+      "同 submission key 同正文仍返回原回执",
+      "测试 server 异常使测试失败"
+    ],
+    "qualification": "实际只运行了字节解码机械探针；没有运行这些 .NET/Rust 用例。测试问题不证明所有既有测试无价值。",
+    "task": "N0;N8",
+    "sources": [
+      "https://github.com/Ye-Luo-0912/context-agent-prototype/blob/11afdd747d6cbbb58ef0d7371841e8e365c4f8db/clients/dotnet/Agent.Client.Tests/FramingAndConnectionTests.cs",
+      "https://github.com/Ye-Luo-0912/context-agent-prototype/blob/11afdd747d6cbbb58ef0d7371841e8e365c4f8db/clients/dotnet/Agent.Client.Tests/ResilienceTests.cs",
+      "https://github.com/Ye-Luo-0912/context-agent-prototype/blob/11afdd747d6cbbb58ef0d7371841e8e365c4f8db/clients/dotnet/Agent.Client.Tests/FixtureConformanceTests.cs",
+      "https://github.com/Ye-Luo-0912/context-agent-prototype/blob/11afdd747d6cbbb58ef0d7371841e8e365c4f8db/clients/dotnet/InteropSmoke/Program.cs",
+      "https://github.com/Ye-Luo-0912/context-agent-prototype/blob/11afdd747d6cbbb58ef0d7371841e8e365c4f8db/crates/agent-host/tests/host_e2e.rs"
+    ]
+  }
+]

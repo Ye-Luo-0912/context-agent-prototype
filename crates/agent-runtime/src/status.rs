@@ -112,15 +112,13 @@ impl StatusProjection {
                 // transitions.
                 if self.anchor_revisions.len() >= MAX_TRACKED_ANCHOR_REVISIONS
                     && !self.anchor_revisions.contains_key(task_id)
-                {
-                    if let Some(evict) = self
+                    && let Some(evict) = self
                         .anchor_revisions
                         .keys()
                         .find(|key| Some(**key) != self.current_task)
                         .copied()
-                    {
-                        self.anchor_revisions.remove(&evict);
-                    }
+                {
+                    self.anchor_revisions.remove(&evict);
                 }
                 self.anchor_revisions.insert(*task_id, *revision);
             }

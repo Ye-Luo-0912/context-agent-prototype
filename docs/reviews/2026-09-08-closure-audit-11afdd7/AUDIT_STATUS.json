@@ -1,0 +1,81 @@
+{
+  "schema": "review-coverage.v1",
+  "repository": "Ye-Luo-0912/context-agent-prototype",
+  "source_commit": "11afdd747d6cbbb58ef0d7371841e8e365c4f8db",
+  "base_for_diff": "b299c6a08fdb055a0148a24dea65053861df6ff1",
+  "base_to_head_commits": 6,
+  "branch_verified_same_at_start_and_end": true,
+  "review_date": "2026-09-08",
+  "code_commit_date_utc": "2026-09-07T17:43:02Z",
+  "full_checkout_obtained": false,
+  "full_repository_line_review_complete": false,
+  "full_repository_test_complete": false,
+  "clone_attempted": true,
+  "clone_result": "exit 128: Could not resolve host: github.com",
+  "rustc_available": false,
+  "cargo_available": false,
+  "dotnet_available": false,
+  "rust_tests_executed": false,
+  "dotnet_tests_executed": false,
+  "body_paths_read": 55,
+  "coverage_modes": {
+    "FULL_TEXT": 40,
+    "PARTIAL": 10,
+    "PARTIAL_TRUNCATED": 2,
+    "RANGE_RETURNED": 3
+  },
+  "complete_current_subtrees": {
+    "apps/Agent.Desktop": 10,
+    "clients/dotnet": 19,
+    "crates/agent-host": 5
+  },
+  "complete_subtrees_total_files": 34,
+  "rust_workspace_members_enumerated": 20,
+  "local_probes": "LOCAL_PROBES.json; isolated OS/mechanical probes only",
+  "findings_count": 20,
+  "findings_by_priority": {
+    "P1": 14,
+    "P2": 6
+  },
+  "unchanged_or_unread_modules": "Not all pre-existing Rust implementation/test/evidence/script files were read. Metadata listing and commit comparison do not count as source review.",
+  "remote_ci": {
+    "source_commit": "11afdd747d6cbbb58ef0d7371841e8e365c4f8db",
+    "run_id": 34148921895,
+    "run_url": "https://github.com/Ye-Luo-0912/context-agent-prototype/actions/runs/34148921895",
+    "status": "completed",
+    "conclusion": "failure",
+    "source": "GitHub REST connection, observed during this review",
+    "jobs": [
+      {
+        "id": 101826825301,
+        "name": "fmt / clippy / build (ubuntu-latest)",
+        "conclusion": "failure",
+        "fmt": "failure",
+        "clippy": "skipped",
+        "build": "skipped"
+      },
+      {
+        "id": 101826825540,
+        "name": "fmt / clippy / build (windows-latest)",
+        "conclusion": "failure",
+        "fmt": "failure",
+        "clippy": "skipped",
+        "build": "skipped"
+      },
+      {
+        "id": 101826825611,
+        "name": "document consistency",
+        "conclusion": "success"
+      },
+      {
+        "id": 101827014588,
+        "name": "test matrix",
+        "conclusion": "skipped"
+      }
+    ],
+    "local_rerun": false,
+    "note": "No build/test pass for this SHA can be inferred from this run. Author-reported local results are separate evidence."
+  },
+  "repo_writes": false,
+  "generated_artifacts_are_proposals": true
+}

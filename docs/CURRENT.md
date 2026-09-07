@@ -2,34 +2,25 @@
 
 ## 现在做什么
 
-**当前阶段：M17——多入口平台与正式原生工作台（2026-09-07 切换）。** 三条工作线并行：基础正确性修复、平台应用服务、正式原生 GUI（.NET 10 LTS＋Avalonia＋独立 Rust 宿主＋本地 IPC）。首批开工：**B1、B2 直接开始；C0 的文档切换由本次更新落地，C0 剩余的协议 DTO 约定完成后 P1 与 G1 同时推进。**
+**当前阶段：M17 收尾——可恢复的多入口工作台（N 系列，2026-09-08 切换）。** M17 三线的代码主体已落地（B1–B3、C0、P1、P2 主体、P3 宿主、G1–G3 客户端侧、E1；对照见 [NEXT_TASKS.md](NEXT_TASKS.md) 的 M17 队列表）。本轮的判断变了：**主要缺口不是缺组件，而是端到端链路断着**——订阅成功但事件 receiver 被丢弃、重连自动重发修改操作、宿主恢复绕过正式信封解码、多连接/会话释放/停机缺口。2026-09-08 外部闭环审查（基线 `11afdd747d6cbbb58ef0d7371841e8e365c4f8db`）的 20 项发现（F01–F20）映射为 N0–N8。
 
-M16-00–07 已全部关闭；M16-08 走查已落地（2026-09-07，见 [walkthroughs/2026-09-07-live-binary.md](walkthroughs/2026-09-07-live-binary.md)）。剩余条件项不变：真实 provider live 记录（不可用写 `NOT_RUN`）、下次实际发布的 PACKAGE-01、默认启用 MCP 后的 MCP-01。
+**当前工单：N0——恢复构建与验证入口。** 直接事实：CI run `34148921895`（`11afdd7`）与 `34148640847`（`1be2e77`）均在 `cargo fmt --check` 失败（Ubuntu/Windows），fmt 违规集中在 `crates/agent-host`，后续 clippy/build/test 被跳过；另 `HostServer::serve` 的 NamedPipe 分支无条件引用 `#[cfg(windows)]` 的 `winpipe` 模块，Linux 宿主构建有静态缺口。N0 完成后第一批并行：N1（宿主长期服务）、N2（客户端操作安全）、N6（核心语义与读取边界）。
 
-2026-09-06 深入续审的代码项保持关闭；但 2026-09-07 外部续审（基线 `b299c6a`，部分源码静态审查）指出其中两块的**关闭范围只覆盖已落地实现，不覆盖整个保证**：监督台账（PROCESS-01 引入）缺进程创建身份与清理确认；STORAGE-02 的修复没有消除 helper 内部 rename 之后的目录同步失败窗口。这些残余按证据等级进入 M17 前列，不重开 M16，也不推翻已落地的 Windows 围栏、Unix 看门狗与台账本身。
-
-原文与任务包：[reviews/2026-09-07-platform-native-audit/REPORT.md](reviews/2026-09-07-platform-native-audit/REPORT.md)；
-可执行工单全文：[reviews/2026-09-07-platform-native-audit/NEXT_STAGE_TASKS.md](reviews/2026-09-07-platform-native-audit/NEXT_STAGE_TASKS.md)。
+审查原文：[reviews/2026-09-08-closure-audit-11afdd7/REPORT.md](reviews/2026-09-08-closure-audit-11afdd7/REPORT.md)；
+工单全文：[reviews/2026-09-08-closure-audit-11afdd7/NEXT_STAGE_TASKS.md](reviews/2026-09-08-closure-audit-11afdd7/NEXT_STAGE_TASKS.md)。
 执行队列：[NEXT_TASKS.md](NEXT_TASKS.md)。
 
-## 2026-09-07 续审残余（M17 前列）
+## 2026-09-08 闭环审查（F01–F20 → N 系列）
 
-审查固定 `b299c6a08fdb055a0148a24dea65053861df6ff1`（部分源码：19 路径正文读取、4 个完整返回；无本地工具链，未运行构建/测试；远端 CI 六 job 成功是远端事实）。F01–F09 的关键代码定位（台账字段、`ProcessRunTool::new` 默认值、watchdog 判活与 `Drop`、metadata rename 后同步、`anchor_revision` 跨任务 `max`、headless 文字推断审批、`work.rs` 提交序列、`--prompt=-` 全量读入）已于 2026-09-07 在本工作树 HEAD `7c3236d` 静态复核成立。全部为静态/条件性结论，未做真实 PID 复用误杀、故障注入或 GUI 实测。
+审查为部分源码静态审查（55 路径正文；apps/Agent.Desktop 10 文件、clients/dotnet 19 文件、agent-host 5 文件全文；克隆仍因 DNS 失败，无本地工具链，未运行构建/测试）。F 系列关键定位（subscribe 丢弃 receiver、FIRST_PIPE_INSTANCE、无条件 remove_file、会话不 revoke、裸 JSON 恢复、validate_text 拒换行、AsyncCommandGroup 积累、Resident/Warm lease 差异、to_summaries 全量投影）已于 2026-09-08 在本工作树 HEAD `11afdd7` 静态复核成立。逐条细节与不要做什么见 [AUDIT_TODO.md](AUDIT_TODO.md)。
 
-| 发现 | 一句话事实 | 归属工单 |
-|---|---|---|
-| F01/F02 | 监督台账只存 `pid+purpose`；`process_is_running` 后直接杀；写失败忽略、读失败当空、kill 后未确认即删记录；`ChildLease::Drop` 无条件释放。`lifecycle.rs` 已有 `ProcessIdentity` 未被复用 | B1（主体已关闭 2026-09-07：身份化台账、类型化对账门、清理回执；扩展验收项随 P3） |
-| F03 | `RecipeProofRunner::new` 自建 `ProcessRunTool::new`（默认 `host_death_watchdog=false`）；compose 未把普通 dispatcher 的监督配置贯通到宿主 proof 路径 | B1（已关闭：compose `host_death_watchdog` 统一注入两条车道） |
-| F04 | watchdog 以 `kill(leader,0)` 判活，组长被 reap 后同组成员可能漏杀（OS 探针已证机制）；`Drop` 中同步 `child.wait()` 无期限 | B1（已关闭：组内成员扫描＋有界 Drop reap，真 Linux 验证） |
-| F05 | `persist_authority_metadata` 在 rename 发布之后 `sync_directory(parent)?` 失败仍返回 Err；`compact_locked` 在换 writer 前被 `?` 中断，可能磁盘新代、内存旧代 | B2（已关闭 2026-09-07：RecoveryRequired＋writer 围栏＋注入测试） |
-| F06 | `StatusProjection` 切换任务不重置 `anchor_revision` 后又跨任务 `max`；headless 用输出文字包含 `denied by approval policy` 判审批拒绝；终态区分不足 | P2（revision-per-task 修复已在工作树进行中） |
-| F07 | `work.rs` 的 set_focus→list_tasks→replace→user_message 是多次独立 await，`UserMessage` 不绑定任务身份，多客户端交错可误投 | P1（工作树实现中） |
-| F08 | `queue_error_verifications` 以输出实体匹配所有 live Error，无故障/任务/覆盖域/版本关联 | B3（主体已关闭 2026-09-07：同配方 recipe_id 关联终结；recipe 版本/覆盖身份与任务级关联仍开放） |
-| F09 | `--prompt=-` 先 `read_to_string` 全量读入；grant 文件 stat 后整体读取；headless 同步写 stdout/文件不受事件等待超时约束 | B3（主体已关闭 2026-09-07：读入时计费＋有界输出 sink；无期限 stdin 读取期限仍开放） |
+**先确认已修好的旧问题（不原地重做）**：监督台账身份/类型化对账/确认式清理；proof runner 监督接线；metadata 发布不确定围栏；原子 `StartWork`＋进程内受理台账；同任务同 `VerificationProbe` 验证关联；`skill_read`＋MCP/Plugin 配置缝。均为定向静态确认，不升级为全平台运行验收。
 
-不在以上范围、同样成立的事实：平台认证 adapter 目前只处理 operation query/cancel（work/approval 路由已由 P1/P2 与 `crates/agent-host` 补齐，2026-09-07）；headless JSONL 过滤实时 delta。事件 wire 契约仍是 P2 的输入，不是新缺陷结论。
+**链路断点按 N 归属**：事件转发断（F06/F11→N3）；宿主长期服务断（F02–F05→N1）；修改重发与连接终态（F07–F09/F19→N2）；正式信封恢复（F10→N5）；知情审批与对象生命周期（F12/F13→N4/N7）；决策误终结/lease 跨层/Skill 句柄/catalog 投影（F15–F18→N6）；测试名与路径不符（F20→N0/N8）。
 
-## 三线并行的执行原则
+上一轮（2026-09-07，基线 `b299c6a`）的 F01–F09 残余表已由 M17 工单消化：B1/B2 关闭，B3/P1/P2 主体关闭（recipe 版本/覆盖身份关联、无期限 stdin 读取期限两项残余随 N6/N3 收口）。原文：[reviews/2026-09-07-platform-native-audit/REPORT.md](reviews/2026-09-07-platform-native-audit/REPORT.md)。
+
+## 执行原则（M17 收尾）
 
 - GUI 的布局、客户端库、只读状态与任务输入可与基础修复同时开始（G1 等 C0）。
 - 涉及宿主执行、可靠清理与冷恢复的**正式支持声明**，等待 B1/B2 对应验收（G2 依赖如此）。

@@ -1,0 +1,31 @@
+{
+  "scope": "OS/mechanical probes only; no Rust/.NET repository code executed",
+  "uds_unlink_active_listener": {
+    "old_connection_still_operational": true,
+    "new_connections_reach_second_listener": true,
+    "production_host_executed": false
+  },
+  "unlink_regular_file": {
+    "probe_owned_file_removed": true
+  },
+  "skill_relative_symlink_probe": {
+    "reference": "steps.md",
+    "lexically_relative": true,
+    "resolved_outside_package": true,
+    "normal_file_open_read_outside_package": true,
+    "production_plugin_executed": false,
+    "note": "OS mechanism only; all content was probe-owned; temporary directory is removed."
+  },
+  "csharp_half_frame_fixture": {
+    "header_hex": "00000009",
+    "little_endian_length": 150994944,
+    "frame_cap": 1048576,
+    "actually_hits_oversize_branch": true,
+    "correct_header_for_nine_bytes": "09000000"
+  },
+  "schema_seed": {
+    "matches_current_csharp_constant": true,
+    "note": "matching constants are not an end-to-end contract proof"
+  },
+  "cleanup": "All sockets closed; temporary directory removed. No repository/user files modified."
+}

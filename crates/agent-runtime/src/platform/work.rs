@@ -232,6 +232,12 @@ pub struct WorkControlRouter {
     authorizer: Arc<dyn WorkControlAuthorizer>,
 }
 
+type ResponseValidator<RequestPayload, ResponsePayload> = fn(
+    &NegotiatedContractProfile,
+    &PlatformEnvelope<RequestPayload>,
+    &PlatformEnvelope<PlatformResponse<ResponsePayload>>,
+) -> ValidationResult<()>;
+
 impl WorkControlRouter {
     pub fn new(
         profile: NegotiatedContractProfile,
@@ -690,11 +696,7 @@ impl WorkControlRouter {
         request: &PlatformEnvelope<RequestPayload>,
         _started: Instant,
         payload: PlatformResponse<ResponsePayload>,
-        validate: fn(
-            &NegotiatedContractProfile,
-            &PlatformEnvelope<RequestPayload>,
-            &PlatformEnvelope<PlatformResponse<ResponsePayload>>,
-        ) -> ValidationResult<()>,
+        validate: ResponseValidator<RequestPayload, ResponsePayload>,
     ) -> AgentResult<PlatformEnvelope<PlatformResponse<ResponsePayload>>> {
         let response = run_scoped_response_envelope(request, payload);
         validate(&self.profile, request, &response)

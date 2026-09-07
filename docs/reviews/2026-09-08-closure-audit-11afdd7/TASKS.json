@@ -1,0 +1,368 @@
+[
+  {
+    "id": "N0",
+    "line": "集成/契约",
+    "title": "恢复当前支持平台构建与准确验证入口",
+    "depends_on": [],
+    "status": "PROPOSED_NOT_IMPLEMENTED",
+    "paths": [
+      "crates/agent-host/src/lib.rs",
+      "crates/agent-host/tests/host_e2e.rs",
+      ".github/workflows/ci.yml",
+      "docs/CURRENT.md",
+      "docs/NEXT_TASKS.md"
+    ],
+    "steps": [
+      "先 git status/rev-parse；工作树已改过则按源码定向复核，不覆盖用户修改或回退到审查 SHA。",
+      "修 cfg 路径和 Unix 连接辅助函数；现有 CI 增补 agent-host Linux 与 .NET 客户端/桌面检查；只做必要 fmt。",
+      "修现有半帧、同连接乱序、同 key 重试测试；服务线程错误必须传给用例。",
+      "活动队列切到本文的实际动作，已实现部分保留；只改相关文档，不清洗整个 archive。"
+    ],
+    "acceptance": [
+      "支持的 Linux/Windows 目标均编译宿主；.NET build/test 真正被 CI 运行。",
+      "任何未执行用例明确 NOT_RUN，测试名称与实际故障切点一致。"
+    ],
+    "commands_to_run": [
+      "git status --short",
+      "git rev-parse HEAD",
+      "git diff --check",
+      "cargo fmt --all -- --check",
+      "cargo check -p agent-host --all-targets --locked",
+      "dotnet build apps/Agent.Desktop/Agent.Desktop.csproj",
+      "dotnet test clients/dotnet/Agent.Client.Tests/Agent.Client.Tests.csproj"
+    ],
+    "commands_executed_in_review": false,
+    "stop_boundary": "不新建评测框架；不等所有历史 Rust/eval 用例人工重复跑完才开 N1/N2/N6。",
+    "findings": [
+      "F01",
+      "F20"
+    ]
+  },
+  {
+    "id": "N1",
+    "line": "平台",
+    "title": "宿主可长期接入、可安全关闭",
+    "depends_on": [
+      "N0"
+    ],
+    "status": "PROPOSED_NOT_IMPLEMENTED",
+    "paths": [
+      "crates/agent-host/src/main.rs",
+      "crates/agent-host/src/lib.rs",
+      "crates/agent-host/src/winpipe.rs",
+      "crates/agent-runtime/src/platform/work.rs"
+    ],
+    "steps": [
+      "修 Named Pipe 首实例策略与句柄唯一所有权；在一个活跃实例存在时仍能接下一客户端。",
+      "将 session grant 归属连接 guard，断线/坏帧/超时统一 revoke；用错误替代 expect panic。",
+      "明确服务停止信号、当前连接集合和服务失败回执；停止接收与 Runtime 关闭有明确顺序，有界 join。",
+      "UDS 使用用户私有、按工作区区分的端点；预存普通文件/他人 listener 拒绝覆盖；只清理本实例拥有的端点。",
+      "保留本地认证和权限限制；传输回路不是 Task 调度器。"
+    ],
+    "acceptance": [
+      "两个并行客户端及至少 65 次顺序重连，授权表/连接数回落。",
+      "无客户端、半帧客户端、慢读客户端存在时均可有界停止。",
+      "端点占用与服务线程失败被调用方明确看到。"
+    ],
+    "commands_to_run": [
+      "cargo test -p agent-host --test host_e2e",
+      "cargo test -p agent-runtime work_control"
+    ],
+    "commands_executed_in_review": false,
+    "stop_boundary": "不做公网 TCP/HTTP、系统服务安装器、多工作区调度；测试过滤必须报告实际匹配数，零个不算通过。",
+    "findings": [
+      "F02",
+      "F03",
+      "F04",
+      "F05"
+    ]
+  },
+  {
+    "id": "N2",
+    "line": "客户端/共享操作语义",
+    "title": "未知修改结果不重发，连接状态不复活",
+    "depends_on": [
+      "N0"
+    ],
+    "status": "PROPOSED_NOT_IMPLEMENTED",
+    "paths": [
+      "clients/dotnet/Agent.Client/AgentConnection.cs",
+      "clients/dotnet/Agent.Client/ResumableSession.cs",
+      "clients/dotnet/Agent.Client/Transports.cs",
+      "clients/dotnet/Agent.Client/Envelope.cs",
+      "clients/dotnet/Agent.Client/WorkDto.cs",
+      "crates/agent-runtime/src/platform/work.rs",
+      "crates/agent-platform-protocol/src/work.rs"
+    ],
+    "steps": [
+      "把查询重试与修改未知结果分开：立即停止透明重发 continue/cancel/跨宿主 submit。",
+      "修改携带预期 task/turn/generation 与 host incarnation，回执返回关联身份；沿用现有进程内 receipt，不谎称跨崩溃 exactly-once。",
+      "single-flight connect，handshake 成功后才安装连接；连接代际/Dispose 防止迟到任务复活旧连接。",
+      "将 Fault 实现为真正终态；部分写入失败关闭连接，拒绝新请求，完成所有 waiters；同一坏连接不重用。",
+      "每个公开 API 在实际发送/接受路径运行 payload 验证；限定 pending 数与通知累计字节。"
+    ],
+    "acceptance": [
+      "真实修改执行后丢响应，不产生第二次操作；查询可按声明安全重试。",
+      "并发连接请求只有一条新连接；Dispose 中的迟到连接释放。",
+      "坏帧/短写后 IsConnected 为 false；异常类型不触发修改重放。"
+    ],
+    "commands_to_run": [
+      "dotnet test clients/dotnet/Agent.Client.Tests/Agent.Client.Tests.csproj --filter \"FullyQualifiedName~ConnectionTests|FullyQualifiedName~ResumableSessionTests\"",
+      "cargo test -p agent-platform-protocol work"
+    ],
+    "commands_executed_in_review": false,
+    "stop_boundary": "不增加通用持久 RPC 数据库；在无法证明时返回 Unknown/需重同步，不为了退出成功而猜测。",
+    "findings": [
+      "F07",
+      "F08",
+      "F09",
+      "F19"
+    ]
+  },
+  {
+    "id": "N3",
+    "line": "平台/客户端契约",
+    "title": "同一连接上的事件、快照和完整输入",
+    "depends_on": [
+      "N1",
+      "N2"
+    ],
+    "status": "PROPOSED_NOT_IMPLEMENTED",
+    "paths": [
+      "crates/agent-host/src/lib.rs",
+      "crates/agent-runtime/src/platform/work.rs",
+      "crates/agent-platform-protocol/src/work.rs",
+      "clients/dotnet/Agent.Client/AgentConnection.cs",
+      "clients/dotnet/Agent.Client/IAgentConnection.cs",
+      "clients/dotnet/Agent.Client/ResumableSession.cs"
+    ],
+    "steps": [
+      "复用现有 WorkEventNotification，保持 receiver 到连接关闭；响应和通知共用单一有界 writer，不互相交错字节。",
+      "按 kind 分开验证 request/response/notification；notification 不要求 request_id。事件需要 run 身份、游标及 live-only 的明确定义。",
+      "固定 snapshot+subscribe 的一致切点；使用现有 barrier/resync-only，缺口返回 resync_required。先不承诺持久重放；禁止 Snapshot 后忽略 Subscribe 回执。",
+      "把工作短标题与完整用户正文区分；复用已有有界正文/artifact，引入该客户端真正需要的多行输入与追加入口，控制字符规则按字段定义。",
+      "协议修改更新受支持 profile/fixture，不为跨语言更换整套现有长度前缀 transport。"
+    ],
+    "acceptance": [
+      "真实 Rust 宿主 → .NET 客户端：受理、工具、助手内容和终态均可接收。",
+      "切点期间产生事件不丢不双计；重连至新宿主不能沿用旧游标。",
+      "多行代码/中文/emoji 在合法边界接受，超过 cap 在读入时拒绝。"
+    ],
+    "commands_to_run": [
+      "cargo test -p agent-host --test host_e2e",
+      "cargo test -p agent-platform-protocol work",
+      "dotnet test clients/dotnet/Agent.Client.Tests/Agent.Client.Tests.csproj"
+    ],
+    "commands_executed_in_review": false,
+    "stop_boundary": "不新建 Chronicle；不将每个 native 同进程调用序列化；不要求 MCP server 改说内部 PlatformEnvelope。",
+    "findings": [
+      "F06",
+      "F09",
+      "F11",
+      "F19"
+    ]
+  },
+  {
+    "id": "N4",
+    "line": "正式 GUI",
+    "title": "从按钮和快照变成真正的任务操作面",
+    "depends_on": [
+      "N3"
+    ],
+    "status": "PROPOSED_NOT_IMPLEMENTED",
+    "paths": [
+      "apps/Agent.Desktop/ViewModels/MainWindowViewModel.cs",
+      "apps/Agent.Desktop/Infrastructure/ObservableObject.cs",
+      "apps/Agent.Desktop/MainWindow.axaml",
+      "apps/Agent.Desktop/App.axaml.cs",
+      "clients/dotnet/Agent.Client/IAgentConnection.cs",
+      "crates/agent-platform-protocol/src/work.rs"
+    ],
+    "steps": [
+      "连接/加载/断开状态以真实握手结果为准；后台单消费者读事件，UI 线程合并显示；慢请求有明确 busy 与取消等待表现。",
+      "审批由既有 gate 提供 request_id、路径/argv、风险与有界参数详情；根据真实 Delivered/NoLongerPending 更新，不本地制造允许事实。",
+      "按 request_id/task_id 复用稳定行 ViewModel；刷新 single-flight；移除审批时解除命令注册；窗口关闭按生命周期释放资源。",
+      "提供真实短计划、open loops、当前执行状态与结果卡；缺路由则明示 unavailable，不从通用文字反推。",
+      "当前默认 FixtureLayout；保留 fixture 只作显式布局预览开关，正式默认通道改为真实宿主或明确的连接配置，不把安装后的首次体验留在演示数据；不再另建验证 GUI。"
+    ],
+    "acceptance": [
+      "提交 → 工具/输出 → 审批 → 让出/取消 → 继续 → 产出待审是一条正式链。",
+      "一项待审批反复刷新后注册命令数量不增长。",
+      "旧连接慢响应不污染新连接/新任务；窗口关闭不残留轮询。"
+    ],
+    "commands_to_run": [
+      "dotnet build apps/Agent.Desktop/Agent.Desktop.csproj",
+      "dotnet test clients/dotnet/Agent.Client.Tests/Agent.Client.Tests.csproj"
+    ],
+    "commands_executed_in_review": false,
+    "stop_boundary": "不做 IDE/编辑器平台；不在 GUI 保存另一份任务、权限或完成真相。必要 GUI 生命周期用现有测试方式新增定向用例。",
+    "findings": [
+      "F06",
+      "F12",
+      "F13"
+    ]
+  },
+  {
+    "id": "N5",
+    "line": "平台/正式 GUI",
+    "title": "正式检查点恢复与可审阅工件",
+    "depends_on": [
+      "N2",
+      "N3"
+    ],
+    "status": "PROPOSED_NOT_IMPLEMENTED",
+    "paths": [
+      "crates/agent-host/src/main.rs",
+      "crates/agent-runtime/src/checkpoint.rs",
+      "crates/agent-runtime/src/lib.rs",
+      "apps/Agent.Desktop/ViewModels/MainWindowViewModel.cs",
+      "crates/agent-platform-protocol/src/work.rs"
+    ],
+    "steps": [
+      "恢复统一使用 CheckpointStore 的受限验证解码与完整 RuntimeInstance.restore，不再按 raw JSON 或文件名字典序猜测。",
+      "宿主与 TUI 的 model/context/监督/approval profile 来源明确且显示身份；允许不同策略，但不把 Rolling 宿主视为已验证 Dynamic 产品的等价替身。",
+      "用现有变更/工件事实提供结果、差异与检查读取；只读调用不新建模型回合，不把整个 git diff 归为 Agent 修改。",
+      "GUI 明确区分断开窗口、取消任务、停止宿主、恢复后继续；默认生命周期在文档和代码一致。"
+    ],
+    "acceptance": [
+      "同一正式宿主生成的信封重启后恢复原 task，并显式继续。",
+      "损坏/过大/错误 profile 在任何新执行前被拒；未知效果继续围栏。",
+      "结果展示已知 Agent 改动、用户原有改动/未知归属、真实执行检查与未测项。"
+    ],
+    "commands_to_run": [
+      "cargo test -p agent-host --test host_e2e",
+      "cargo test -p agent-compose",
+      "dotnet build apps/Agent.Desktop/Agent.Desktop.csproj"
+    ],
+    "commands_executed_in_review": false,
+    "stop_boundary": "不改变旧检查点格式或创建新的恢复引擎；不承诺所有 GUI 关闭形式都会后台持续运行。",
+    "findings": [
+      "F10",
+      "F12"
+    ]
+  },
+  {
+    "id": "N6",
+    "line": "基础核心/扩展边界",
+    "title": "修准语义保留、只读成本与 Skill 路径",
+    "depends_on": [
+      "N0"
+    ],
+    "status": "PROPOSED_NOT_IMPLEMENTED",
+    "paths": [
+      "crates/context-simple/src/gc/reachability.rs",
+      "crates/context-simple/src/engine.rs",
+      "crates/context-simple/src/residency.rs",
+      "crates/context-simple/src/gc/minor.rs",
+      "crates/context-simple/src/heap.rs",
+      "crates/agent-runtime/src/plugin.rs"
+    ],
+    "steps": [
+      "取消仅实体重合就不可逆终结旧 Decision 的规则；复用显式替代/正确任务范围；不误改已经修好的 VerificationProbe 链。",
+      "提取 Resident/Warm/Stored 共用的到期保护判断，明确 lease/keep_alive 的保护范围与终态不可复活。",
+      "catalog 早退 limit0，按 lazy projection 或选中 ID 后复制，保持顺序语义；只读 GUI inspect 不应被当成模型消费。",
+      "Skill 使用现有 ConfinedDir/受限普通文件句柄、根路径固定和有界读取，覆盖 symlink/junction/FIFO；保留版本、来源、双激活门。",
+      "拆成数个相关小 PR，不把这四处修复扩成整个 ContextEngine 重写。"
+    ],
+    "acceptance": [
+      "同文件两条兼容决策、跨任务相同实体均可保留。",
+      "有效租约在不同 residency 中不产生不同语义终态。",
+      "limit0 不分配全部 summary；合法排序回归保持。",
+      "包外链接/特殊文件拒绝，合法 Skill 可通过现有工具读取。"
+    ],
+    "commands_to_run": [
+      "cargo test -p context-simple",
+      "cargo test -p agent-runtime --lib plugin::"
+    ],
+    "commands_executed_in_review": false,
+    "stop_boundary": "不增加向量、学习排序、TaskGraph 或新 GC 策略；本组可与 N1/N2/GUI 展示并行，不接管全部任务。",
+    "findings": [
+      "F15",
+      "F16",
+      "F17",
+      "F18"
+    ]
+  },
+  {
+    "id": "N7",
+    "line": "GUI/测量",
+    "title": "长会话有界而且指标可解释",
+    "depends_on": [
+      "N4"
+    ],
+    "status": "PROPOSED_NOT_IMPLEMENTED",
+    "paths": [
+      "clients/dotnet/Agent.Client/MetricsSession.cs",
+      "clients/dotnet/Agent.Client/DeltaCoalescer.cs",
+      "apps/Agent.Desktop/ViewModels/MainWindowViewModel.cs",
+      "apps/Agent.Desktop/MainWindow.axaml"
+    ],
+    "steps": [
+      "输出缓存同时按 chars/bytes/rows 限制；流式显示增量而非持续重建全部历史；需要的长工件从宿主按需读取。",
+      "DeltaCoalescer 由真实消费循环驱动有界 timer/末尾 flush，回调不在不必要的大锁内执行；不将 UI 节流用于延迟控制请求。",
+      "MetricsSession 按覆盖范围报告 root_only/full_tree/unknown，修 Linux parent 遍历，Windows未实现不写假全树值；去重多个root。",
+      "只维护有界采样环或流式 max/count/last；明确 idle 场景；关闭时等待 sampler 并释放句柄。"
+    ],
+    "acceptance": [
+      "长会话命令、pending、事件、文本、采样缓存均回落或保持固定界限。",
+      "采样未覆盖的部分标 Unknown/NOT_RUN，不填零、不改名当全树。",
+      "真实 GUI 的 CJK IME/DPI/复制/大差异响应逐项记录，不制造普遍性能结论。"
+    ],
+    "commands_to_run": [
+      "dotnet test clients/dotnet/Agent.Client.Tests/Agent.Client.Tests.csproj --filter \"FullyQualifiedName~MetricsSessionTests|FullyQualifiedName~DeltaCoalescerTests\"",
+      "dotnet build apps/Agent.Desktop/Agent.Desktop.csproj -c Release"
+    ],
+    "commands_executed_in_review": false,
+    "stop_boundary": "不把 Native AOT、零拷贝或共享内存列为首次发布前置；不新增资源指标数据库。",
+    "findings": [
+      "F13",
+      "F14"
+    ]
+  },
+  {
+    "id": "N8",
+    "line": "扩展/联合交付",
+    "title": "把现有能力接入产品并完成来源绑定发布",
+    "depends_on": [
+      "N1",
+      "N2",
+      "N3",
+      "N4",
+      "N5",
+      "N6"
+    ],
+    "status": "PROPOSED_NOT_IMPLEMENTED",
+    "paths": [
+      "crates/agent-compose/src/lib.rs",
+      "crates/agent-host/src/main.rs",
+      "crates/agent-runtime/src/plugin.rs",
+      "crates/agent-capability-process/src/mcp.rs",
+      "scripts/dist.sh",
+      "scripts/dist.ps1",
+      ".github/workflows/package.yml"
+    ],
+    "steps": [
+      "实施前补读本轮未展开的 MCP、发布脚本及调用方。已有 E1 配置/目录/Skill读取复用，不再写另一套 registry。",
+      "给正式宿主暴露受限的明确 MCP/Plugin 配置路径和 supported/unsupported 信息；启用来源是可信操作者配置，不把安装当授权；模型输出不能设置权限。",
+      "既有跨语言夹具补成真正 .NET → Rust host → Runtime → Tool → Event → GUI 的用例；使用现有 scripted model 验证确定性动作，真实 provider 走查单列。",
+      "构建并打包当前 Rust 宿主、桌面与必要依赖，干净 staging 和一致 source/config 身份；发布脚本旧问题如仍存在在本次打包时修。",
+      "三类真实任务：小 bug、两三文件功能、跨文件修改后中断恢复；保留用户原有修改；未执行的 live 项写 NOT_RUN。"
+    ],
+    "acceptance": [
+      "安装后连接真实宿主而非 fixture；已有 MCP/Skill 通过目录和权限边界使用。",
+      "支持平台上的包来自同一源码与明确 profile；宿主与客户端互操作证据同包可定位。",
+      "三个任务记录有产物/检查/未验证范围，不据此宣称通用成功率。"
+    ],
+    "commands_to_run": [
+      "cargo test -p agent-host --test host_e2e",
+      "cargo test -p agent-capability-process",
+      "dotnet test clients/dotnet/Agent.Client.Tests/Agent.Client.Tests.csproj",
+      "dotnet build apps/Agent.Desktop/Agent.Desktop.csproj -c Release"
+    ],
+    "commands_executed_in_review": false,
+    "stop_boundary": "不创建新 release/tag，除非用户明确要求；不做插件市场、递归自修改或并行写入子 Agent。本切片完整验收前不写整个 M17 已完成。",
+    "findings": [
+      "F20"
+    ]
+  }
+]

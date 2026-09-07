@@ -1,0 +1,497 @@
+[
+  {
+    "path": "apps/Agent.Desktop/Agent.Desktop.csproj",
+    "coverage": "FULL_TEXT",
+    "read_ranges": "1–EOF",
+    "source_reference": "turn336file0",
+    "source_commit": "11afdd747d6cbbb58ef0d7371841e8e365c4f8db",
+    "note": "",
+    "url": "https://github.com/Ye-Luo-0912/context-agent-prototype/blob/11afdd747d6cbbb58ef0d7371841e8e365c4f8db/apps/Agent.Desktop/Agent.Desktop.csproj"
+  },
+  {
+    "path": "apps/Agent.Desktop/App.axaml",
+    "coverage": "FULL_TEXT",
+    "read_ranges": "1–EOF",
+    "source_reference": "turn337file0",
+    "source_commit": "11afdd747d6cbbb58ef0d7371841e8e365c4f8db",
+    "note": "",
+    "url": "https://github.com/Ye-Luo-0912/context-agent-prototype/blob/11afdd747d6cbbb58ef0d7371841e8e365c4f8db/apps/Agent.Desktop/App.axaml"
+  },
+  {
+    "path": "apps/Agent.Desktop/App.axaml.cs",
+    "coverage": "FULL_TEXT",
+    "read_ranges": "1–EOF",
+    "source_reference": "turn322file0",
+    "source_commit": "11afdd747d6cbbb58ef0d7371841e8e365c4f8db",
+    "note": "",
+    "url": "https://github.com/Ye-Luo-0912/context-agent-prototype/blob/11afdd747d6cbbb58ef0d7371841e8e365c4f8db/apps/Agent.Desktop/App.axaml.cs"
+  },
+  {
+    "path": "apps/Agent.Desktop/Fixture/FixtureAgentConnection.cs",
+    "coverage": "FULL_TEXT",
+    "read_ranges": "1–EOF",
+    "source_reference": "turn332file0",
+    "source_commit": "11afdd747d6cbbb58ef0d7371841e8e365c4f8db",
+    "note": "",
+    "url": "https://github.com/Ye-Luo-0912/context-agent-prototype/blob/11afdd747d6cbbb58ef0d7371841e8e365c4f8db/apps/Agent.Desktop/Fixture/FixtureAgentConnection.cs"
+  },
+  {
+    "path": "apps/Agent.Desktop/Infrastructure/ObservableObject.cs",
+    "coverage": "FULL_TEXT",
+    "read_ranges": "1–EOF",
+    "source_reference": "turn287file0",
+    "source_commit": "11afdd747d6cbbb58ef0d7371841e8e365c4f8db",
+    "note": "",
+    "url": "https://github.com/Ye-Luo-0912/context-agent-prototype/blob/11afdd747d6cbbb58ef0d7371841e8e365c4f8db/apps/Agent.Desktop/Infrastructure/ObservableObject.cs"
+  },
+  {
+    "path": "apps/Agent.Desktop/MainWindow.axaml",
+    "coverage": "FULL_TEXT",
+    "read_ranges": "1–EOF",
+    "source_reference": "turn309file0",
+    "source_commit": "11afdd747d6cbbb58ef0d7371841e8e365c4f8db",
+    "note": "",
+    "url": "https://github.com/Ye-Luo-0912/context-agent-prototype/blob/11afdd747d6cbbb58ef0d7371841e8e365c4f8db/apps/Agent.Desktop/MainWindow.axaml"
+  },
+  {
+    "path": "apps/Agent.Desktop/MainWindow.axaml.cs",
+    "coverage": "FULL_TEXT",
+    "read_ranges": "1–EOF",
+    "source_reference": "turn323file0",
+    "source_commit": "11afdd747d6cbbb58ef0d7371841e8e365c4f8db",
+    "note": "",
+    "url": "https://github.com/Ye-Luo-0912/context-agent-prototype/blob/11afdd747d6cbbb58ef0d7371841e8e365c4f8db/apps/Agent.Desktop/MainWindow.axaml.cs"
+  },
+  {
+    "path": "apps/Agent.Desktop/Program.cs",
+    "coverage": "FULL_TEXT",
+    "read_ranges": "1–EOF",
+    "source_reference": "turn338file0",
+    "source_commit": "11afdd747d6cbbb58ef0d7371841e8e365c4f8db",
+    "note": "",
+    "url": "https://github.com/Ye-Luo-0912/context-agent-prototype/blob/11afdd747d6cbbb58ef0d7371841e8e365c4f8db/apps/Agent.Desktop/Program.cs"
+  },
+  {
+    "path": "apps/Agent.Desktop/ViewModels/MainWindowViewModel.cs",
+    "coverage": "FULL_TEXT",
+    "read_ranges": "1–EOF",
+    "source_reference": "turn278file0;turn357file0",
+    "source_commit": "11afdd747d6cbbb58ef0d7371841e8e365c4f8db",
+    "note": "",
+    "url": "https://github.com/Ye-Luo-0912/context-agent-prototype/blob/11afdd747d6cbbb58ef0d7371841e8e365c4f8db/apps/Agent.Desktop/ViewModels/MainWindowViewModel.cs"
+  },
+  {
+    "path": "apps/Agent.Desktop/app.manifest",
+    "coverage": "FULL_TEXT",
+    "read_ranges": "1–EOF",
+    "source_reference": "turn339file0",
+    "source_commit": "11afdd747d6cbbb58ef0d7371841e8e365c4f8db",
+    "note": "",
+    "url": "https://github.com/Ye-Luo-0912/context-agent-prototype/blob/11afdd747d6cbbb58ef0d7371841e8e365c4f8db/apps/Agent.Desktop/app.manifest"
+  },
+  {
+    "path": "clients/dotnet/Agent.Client/Agent.Client.csproj",
+    "coverage": "FULL_TEXT",
+    "read_ranges": "1–EOF",
+    "source_reference": "turn340file0",
+    "source_commit": "11afdd747d6cbbb58ef0d7371841e8e365c4f8db",
+    "note": "",
+    "url": "https://github.com/Ye-Luo-0912/context-agent-prototype/blob/11afdd747d6cbbb58ef0d7371841e8e365c4f8db/clients/dotnet/Agent.Client/Agent.Client.csproj"
+  },
+  {
+    "path": "clients/dotnet/Agent.Client/AgentConnection.cs",
+    "coverage": "FULL_TEXT",
+    "read_ranges": "1–EOF",
+    "source_reference": "turn345file0",
+    "source_commit": "11afdd747d6cbbb58ef0d7371841e8e365c4f8db",
+    "note": "",
+    "url": "https://github.com/Ye-Luo-0912/context-agent-prototype/blob/11afdd747d6cbbb58ef0d7371841e8e365c4f8db/clients/dotnet/Agent.Client/AgentConnection.cs"
+  },
+  {
+    "path": "clients/dotnet/Agent.Client/DeltaCoalescer.cs",
+    "coverage": "FULL_TEXT",
+    "read_ranges": "1–EOF",
+    "source_reference": "turn319file0",
+    "source_commit": "11afdd747d6cbbb58ef0d7371841e8e365c4f8db",
+    "note": "",
+    "url": "https://github.com/Ye-Luo-0912/context-agent-prototype/blob/11afdd747d6cbbb58ef0d7371841e8e365c4f8db/clients/dotnet/Agent.Client/DeltaCoalescer.cs"
+  },
+  {
+    "path": "clients/dotnet/Agent.Client/Envelope.cs",
+    "coverage": "FULL_TEXT",
+    "read_ranges": "1–EOF",
+    "source_reference": "turn288file0;turn306file0",
+    "source_commit": "11afdd747d6cbbb58ef0d7371841e8e365c4f8db",
+    "note": "",
+    "url": "https://github.com/Ye-Luo-0912/context-agent-prototype/blob/11afdd747d6cbbb58ef0d7371841e8e365c4f8db/clients/dotnet/Agent.Client/Envelope.cs"
+  },
+  {
+    "path": "clients/dotnet/Agent.Client/Framing.cs",
+    "coverage": "FULL_TEXT",
+    "read_ranges": "1–EOF",
+    "source_reference": "turn289file0",
+    "source_commit": "11afdd747d6cbbb58ef0d7371841e8e365c4f8db",
+    "note": "",
+    "url": "https://github.com/Ye-Luo-0912/context-agent-prototype/blob/11afdd747d6cbbb58ef0d7371841e8e365c4f8db/clients/dotnet/Agent.Client/Framing.cs"
+  },
+  {
+    "path": "clients/dotnet/Agent.Client/IAgentConnection.cs",
+    "coverage": "FULL_TEXT",
+    "read_ranges": "1–EOF",
+    "source_reference": "turn321file0",
+    "source_commit": "11afdd747d6cbbb58ef0d7371841e8e365c4f8db",
+    "note": "",
+    "url": "https://github.com/Ye-Luo-0912/context-agent-prototype/blob/11afdd747d6cbbb58ef0d7371841e8e365c4f8db/clients/dotnet/Agent.Client/IAgentConnection.cs"
+  },
+  {
+    "path": "clients/dotnet/Agent.Client/JsonOptions.cs",
+    "coverage": "FULL_TEXT",
+    "read_ranges": "1–EOF",
+    "source_reference": "turn304file0",
+    "source_commit": "11afdd747d6cbbb58ef0d7371841e8e365c4f8db",
+    "note": "",
+    "url": "https://github.com/Ye-Luo-0912/context-agent-prototype/blob/11afdd747d6cbbb58ef0d7371841e8e365c4f8db/clients/dotnet/Agent.Client/JsonOptions.cs"
+  },
+  {
+    "path": "clients/dotnet/Agent.Client/MetricsSession.cs",
+    "coverage": "FULL_TEXT",
+    "read_ranges": "1–EOF",
+    "source_reference": "turn320file0",
+    "source_commit": "11afdd747d6cbbb58ef0d7371841e8e365c4f8db",
+    "note": "",
+    "url": "https://github.com/Ye-Luo-0912/context-agent-prototype/blob/11afdd747d6cbbb58ef0d7371841e8e365c4f8db/clients/dotnet/Agent.Client/MetricsSession.cs"
+  },
+  {
+    "path": "clients/dotnet/Agent.Client/ProtocolDto.cs",
+    "coverage": "FULL_TEXT",
+    "read_ranges": "1–EOF",
+    "source_reference": "turn305file0",
+    "source_commit": "11afdd747d6cbbb58ef0d7371841e8e365c4f8db",
+    "note": "",
+    "url": "https://github.com/Ye-Luo-0912/context-agent-prototype/blob/11afdd747d6cbbb58ef0d7371841e8e365c4f8db/clients/dotnet/Agent.Client/ProtocolDto.cs"
+  },
+  {
+    "path": "clients/dotnet/Agent.Client/ResumableSession.cs",
+    "coverage": "FULL_TEXT",
+    "read_ranges": "1–EOF",
+    "source_reference": "turn346file0",
+    "source_commit": "11afdd747d6cbbb58ef0d7371841e8e365c4f8db",
+    "note": "",
+    "url": "https://github.com/Ye-Luo-0912/context-agent-prototype/blob/11afdd747d6cbbb58ef0d7371841e8e365c4f8db/clients/dotnet/Agent.Client/ResumableSession.cs"
+  },
+  {
+    "path": "clients/dotnet/Agent.Client/Transports.cs",
+    "coverage": "FULL_TEXT",
+    "read_ranges": "1–EOF",
+    "source_reference": "turn307file0",
+    "source_commit": "11afdd747d6cbbb58ef0d7371841e8e365c4f8db",
+    "note": "",
+    "url": "https://github.com/Ye-Luo-0912/context-agent-prototype/blob/11afdd747d6cbbb58ef0d7371841e8e365c4f8db/clients/dotnet/Agent.Client/Transports.cs"
+  },
+  {
+    "path": "clients/dotnet/Agent.Client/WorkDto.cs",
+    "coverage": "FULL_TEXT",
+    "read_ranges": "1–EOF",
+    "source_reference": "turn301file0",
+    "source_commit": "11afdd747d6cbbb58ef0d7371841e8e365c4f8db",
+    "note": "",
+    "url": "https://github.com/Ye-Luo-0912/context-agent-prototype/blob/11afdd747d6cbbb58ef0d7371841e8e365c4f8db/clients/dotnet/Agent.Client/WorkDto.cs"
+  },
+  {
+    "path": "clients/dotnet/Agent.Client.Tests/Agent.Client.Tests.csproj",
+    "coverage": "FULL_TEXT",
+    "read_ranges": "1–EOF",
+    "source_reference": "turn341file0",
+    "source_commit": "11afdd747d6cbbb58ef0d7371841e8e365c4f8db",
+    "note": "",
+    "url": "https://github.com/Ye-Luo-0912/context-agent-prototype/blob/11afdd747d6cbbb58ef0d7371841e8e365c4f8db/clients/dotnet/Agent.Client.Tests/Agent.Client.Tests.csproj"
+  },
+  {
+    "path": "clients/dotnet/Agent.Client.Tests/ContractFixtures.cs",
+    "coverage": "FULL_TEXT",
+    "read_ranges": "1–EOF",
+    "source_reference": "turn342file0",
+    "source_commit": "11afdd747d6cbbb58ef0d7371841e8e365c4f8db",
+    "note": "",
+    "url": "https://github.com/Ye-Luo-0912/context-agent-prototype/blob/11afdd747d6cbbb58ef0d7371841e8e365c4f8db/clients/dotnet/Agent.Client.Tests/ContractFixtures.cs"
+  },
+  {
+    "path": "clients/dotnet/Agent.Client.Tests/FixtureConformanceTests.cs",
+    "coverage": "FULL_TEXT",
+    "read_ranges": "1–EOF",
+    "source_reference": "turn347file0",
+    "source_commit": "11afdd747d6cbbb58ef0d7371841e8e365c4f8db",
+    "note": "",
+    "url": "https://github.com/Ye-Luo-0912/context-agent-prototype/blob/11afdd747d6cbbb58ef0d7371841e8e365c4f8db/clients/dotnet/Agent.Client.Tests/FixtureConformanceTests.cs"
+  },
+  {
+    "path": "clients/dotnet/Agent.Client.Tests/FramingAndConnectionTests.cs",
+    "coverage": "FULL_TEXT",
+    "read_ranges": "1–EOF",
+    "source_reference": "turn315file0",
+    "source_commit": "11afdd747d6cbbb58ef0d7371841e8e365c4f8db",
+    "note": "",
+    "url": "https://github.com/Ye-Luo-0912/context-agent-prototype/blob/11afdd747d6cbbb58ef0d7371841e8e365c4f8db/clients/dotnet/Agent.Client.Tests/FramingAndConnectionTests.cs"
+  },
+  {
+    "path": "clients/dotnet/Agent.Client.Tests/ResilienceTests.cs",
+    "coverage": "FULL_TEXT",
+    "read_ranges": "1–EOF",
+    "source_reference": "turn316file0",
+    "source_commit": "11afdd747d6cbbb58ef0d7371841e8e365c4f8db",
+    "note": "",
+    "url": "https://github.com/Ye-Luo-0912/context-agent-prototype/blob/11afdd747d6cbbb58ef0d7371841e8e365c4f8db/clients/dotnet/Agent.Client.Tests/ResilienceTests.cs"
+  },
+  {
+    "path": "clients/dotnet/InteropSmoke/Program.cs",
+    "coverage": "FULL_TEXT",
+    "read_ranges": "1–EOF",
+    "source_reference": "turn324file0",
+    "source_commit": "11afdd747d6cbbb58ef0d7371841e8e365c4f8db",
+    "note": "",
+    "url": "https://github.com/Ye-Luo-0912/context-agent-prototype/blob/11afdd747d6cbbb58ef0d7371841e8e365c4f8db/clients/dotnet/InteropSmoke/Program.cs"
+  },
+  {
+    "path": "clients/dotnet/InteropSmoke/InteropSmoke.csproj",
+    "coverage": "FULL_TEXT",
+    "read_ranges": "1–EOF",
+    "source_reference": "turn348file0",
+    "source_commit": "11afdd747d6cbbb58ef0d7371841e8e365c4f8db",
+    "note": "",
+    "url": "https://github.com/Ye-Luo-0912/context-agent-prototype/blob/11afdd747d6cbbb58ef0d7371841e8e365c4f8db/clients/dotnet/InteropSmoke/InteropSmoke.csproj"
+  },
+  {
+    "path": "crates/agent-host/Cargo.toml",
+    "coverage": "FULL_TEXT",
+    "read_ranges": "1–EOF",
+    "source_reference": "turn291file0",
+    "source_commit": "11afdd747d6cbbb58ef0d7371841e8e365c4f8db",
+    "note": "",
+    "url": "https://github.com/Ye-Luo-0912/context-agent-prototype/blob/11afdd747d6cbbb58ef0d7371841e8e365c4f8db/crates/agent-host/Cargo.toml"
+  },
+  {
+    "path": "crates/agent-host/src/main.rs",
+    "coverage": "FULL_TEXT",
+    "read_ranges": "1–EOF",
+    "source_reference": "turn275file0",
+    "source_commit": "11afdd747d6cbbb58ef0d7371841e8e365c4f8db",
+    "note": "",
+    "url": "https://github.com/Ye-Luo-0912/context-agent-prototype/blob/11afdd747d6cbbb58ef0d7371841e8e365c4f8db/crates/agent-host/src/main.rs"
+  },
+  {
+    "path": "crates/agent-host/src/lib.rs",
+    "coverage": "FULL_TEXT",
+    "read_ranges": "1–EOF",
+    "source_reference": "turn276file0;turn277file0;turn333file0;turn334file0;turn335file0",
+    "source_commit": "11afdd747d6cbbb58ef0d7371841e8e365c4f8db",
+    "note": "",
+    "url": "https://github.com/Ye-Luo-0912/context-agent-prototype/blob/11afdd747d6cbbb58ef0d7371841e8e365c4f8db/crates/agent-host/src/lib.rs"
+  },
+  {
+    "path": "crates/agent-host/src/winpipe.rs",
+    "coverage": "FULL_TEXT",
+    "read_ranges": "1–EOF",
+    "source_reference": "turn290file0",
+    "source_commit": "11afdd747d6cbbb58ef0d7371841e8e365c4f8db",
+    "note": "",
+    "url": "https://github.com/Ye-Luo-0912/context-agent-prototype/blob/11afdd747d6cbbb58ef0d7371841e8e365c4f8db/crates/agent-host/src/winpipe.rs"
+  },
+  {
+    "path": "crates/agent-host/tests/host_e2e.rs",
+    "coverage": "FULL_TEXT",
+    "read_ranges": "1–EOF",
+    "source_reference": "turn295file0",
+    "source_commit": "11afdd747d6cbbb58ef0d7371841e8e365c4f8db",
+    "note": "",
+    "url": "https://github.com/Ye-Luo-0912/context-agent-prototype/blob/11afdd747d6cbbb58ef0d7371841e8e365c4f8db/crates/agent-host/tests/host_e2e.rs"
+  },
+  {
+    "path": "Cargo.toml",
+    "coverage": "FULL_TEXT",
+    "read_ranges": "1–EOF",
+    "source_reference": "turn292file0",
+    "source_commit": "11afdd747d6cbbb58ef0d7371841e8e365c4f8db",
+    "note": "",
+    "url": "https://github.com/Ye-Luo-0912/context-agent-prototype/blob/11afdd747d6cbbb58ef0d7371841e8e365c4f8db/Cargo.toml"
+  },
+  {
+    "path": ".github/workflows/ci.yml",
+    "coverage": "FULL_TEXT",
+    "read_ranges": "1–EOF",
+    "source_reference": "turn308file0",
+    "source_commit": "11afdd747d6cbbb58ef0d7371841e8e365c4f8db",
+    "note": "",
+    "url": "https://github.com/Ye-Luo-0912/context-agent-prototype/blob/11afdd747d6cbbb58ef0d7371841e8e365c4f8db/.github/workflows/ci.yml"
+  },
+  {
+    "path": "crates/agent-runtime/src/platform/work.rs",
+    "coverage": "FULL_TEXT",
+    "read_ranges": "1–390;390–EOF",
+    "source_reference": "turn283file0;turn284file0",
+    "source_commit": "11afdd747d6cbbb58ef0d7371841e8e365c4f8db",
+    "note": "",
+    "url": "https://github.com/Ye-Luo-0912/context-agent-prototype/blob/11afdd747d6cbbb58ef0d7371841e8e365c4f8db/crates/agent-runtime/src/platform/work.rs"
+  },
+  {
+    "path": "crates/agent-runtime/src/actor/turn.rs",
+    "coverage": "PARTIAL",
+    "read_ranges": "1–325",
+    "source_reference": "turn297file0",
+    "source_commit": "11afdd747d6cbbb58ef0d7371841e8e365c4f8db",
+    "note": "",
+    "url": "https://github.com/Ye-Luo-0912/context-agent-prototype/blob/11afdd747d6cbbb58ef0d7371841e8e365c4f8db/crates/agent-runtime/src/actor/turn.rs"
+  },
+  {
+    "path": "crates/agent-runtime/src/lib.rs",
+    "coverage": "FULL_TEXT",
+    "read_ranges": "1–EOF",
+    "source_reference": "turn298file0",
+    "source_commit": "11afdd747d6cbbb58ef0d7371841e8e365c4f8db",
+    "note": "",
+    "url": "https://github.com/Ye-Luo-0912/context-agent-prototype/blob/11afdd747d6cbbb58ef0d7371841e8e365c4f8db/crates/agent-runtime/src/lib.rs"
+  },
+  {
+    "path": "crates/agent-runtime/src/checkpoint.rs",
+    "coverage": "PARTIAL",
+    "read_ranges": "1–300",
+    "source_reference": "turn300file0",
+    "source_commit": "11afdd747d6cbbb58ef0d7371841e8e365c4f8db",
+    "note": "",
+    "url": "https://github.com/Ye-Luo-0912/context-agent-prototype/blob/11afdd747d6cbbb58ef0d7371841e8e365c4f8db/crates/agent-runtime/src/checkpoint.rs"
+  },
+  {
+    "path": "crates/tool-runtime/src/supervision.rs",
+    "coverage": "PARTIAL",
+    "read_ranges": "1–610",
+    "source_reference": "turn293file0;turn294file0",
+    "source_commit": "11afdd747d6cbbb58ef0d7371841e8e365c4f8db",
+    "note": "",
+    "url": "https://github.com/Ye-Luo-0912/context-agent-prototype/blob/11afdd747d6cbbb58ef0d7371841e8e365c4f8db/crates/tool-runtime/src/supervision.rs"
+  },
+  {
+    "path": "crates/agent-storage/src/lib.rs",
+    "coverage": "PARTIAL",
+    "read_ranges": "290–385;650–770",
+    "source_reference": "turn303file0;turn353file0",
+    "source_commit": "11afdd747d6cbbb58ef0d7371841e8e365c4f8db",
+    "note": "",
+    "url": "https://github.com/Ye-Luo-0912/context-agent-prototype/blob/11afdd747d6cbbb58ef0d7371841e8e365c4f8db/crates/agent-storage/src/lib.rs"
+  },
+  {
+    "path": "docs/CURRENT.md",
+    "coverage": "FULL_TEXT",
+    "read_ranges": "1–EOF",
+    "source_reference": "turn310file0",
+    "source_commit": "11afdd747d6cbbb58ef0d7371841e8e365c4f8db",
+    "note": "",
+    "url": "https://github.com/Ye-Luo-0912/context-agent-prototype/blob/11afdd747d6cbbb58ef0d7371841e8e365c4f8db/docs/CURRENT.md"
+  },
+  {
+    "path": "crates/context-simple/src/gc/reachability.rs",
+    "coverage": "PARTIAL_TRUNCATED",
+    "read_ranges": "full-file request; response truncated after production functions",
+    "source_reference": "turn312file0",
+    "source_commit": "11afdd747d6cbbb58ef0d7371841e8e365c4f8db",
+    "note": "The end of the file was not returned. Do not count as a full-file review.",
+    "url": "https://github.com/Ye-Luo-0912/context-agent-prototype/blob/11afdd747d6cbbb58ef0d7371841e8e365c4f8db/crates/context-simple/src/gc/reachability.rs"
+  },
+  {
+    "path": "crates/context-simple/src/engine.rs",
+    "coverage": "PARTIAL",
+    "read_ranges": "1–230;810–1065;1690–2040",
+    "source_reference": "turn314file0;turn326file0;turn328file0",
+    "source_commit": "11afdd747d6cbbb58ef0d7371841e8e365c4f8db",
+    "note": "",
+    "url": "https://github.com/Ye-Luo-0912/context-agent-prototype/blob/11afdd747d6cbbb58ef0d7371841e8e365c4f8db/crates/context-simple/src/engine.rs"
+  },
+  {
+    "path": "crates/agent-platform-protocol/src/work.rs",
+    "coverage": "PARTIAL",
+    "read_ranges": "1–715",
+    "source_reference": "turn317file0;turn318file0",
+    "source_commit": "11afdd747d6cbbb58ef0d7371841e8e365c4f8db",
+    "note": "",
+    "url": "https://github.com/Ye-Luo-0912/context-agent-prototype/blob/11afdd747d6cbbb58ef0d7371841e8e365c4f8db/crates/agent-platform-protocol/src/work.rs"
+  },
+  {
+    "path": "crates/context-simple/src/lib.rs",
+    "coverage": "FULL_TEXT",
+    "read_ranges": "1–EOF",
+    "source_reference": "turn325file0",
+    "source_commit": "11afdd747d6cbbb58ef0d7371841e8e365c4f8db",
+    "note": "",
+    "url": "https://github.com/Ye-Luo-0912/context-agent-prototype/blob/11afdd747d6cbbb58ef0d7371841e8e365c4f8db/crates/context-simple/src/lib.rs"
+  },
+  {
+    "path": "crates/context-simple/src/index/entity.rs",
+    "coverage": "PARTIAL",
+    "read_ranges": "1–240",
+    "source_reference": "turn327file0",
+    "source_commit": "11afdd747d6cbbb58ef0d7371841e8e365c4f8db",
+    "note": "",
+    "url": "https://github.com/Ye-Luo-0912/context-agent-prototype/blob/11afdd747d6cbbb58ef0d7371841e8e365c4f8db/crates/context-simple/src/index/entity.rs"
+  },
+  {
+    "path": "crates/context-simple/src/heap.rs",
+    "coverage": "RANGE_RETURNED",
+    "read_ranges": "1–210 requested; closing module returned",
+    "source_reference": "turn329file0",
+    "source_commit": "11afdd747d6cbbb58ef0d7371841e8e365c4f8db",
+    "note": "Conservatively kept separate from FULL_TEXT accounting.",
+    "url": "https://github.com/Ye-Luo-0912/context-agent-prototype/blob/11afdd747d6cbbb58ef0d7371841e8e365c4f8db/crates/context-simple/src/heap.rs"
+  },
+  {
+    "path": "crates/context-simple/src/residency.rs",
+    "coverage": "RANGE_RETURNED",
+    "read_ranges": "1–225 requested; closing function returned",
+    "source_reference": "turn330file0",
+    "source_commit": "11afdd747d6cbbb58ef0d7371841e8e365c4f8db",
+    "note": "Conservatively kept separate from FULL_TEXT accounting.",
+    "url": "https://github.com/Ye-Luo-0912/context-agent-prototype/blob/11afdd747d6cbbb58ef0d7371841e8e365c4f8db/crates/context-simple/src/residency.rs"
+  },
+  {
+    "path": "crates/context-simple/src/gc/minor.rs",
+    "coverage": "RANGE_RETURNED",
+    "read_ranges": "1–370 requested; closing function returned",
+    "source_reference": "turn331file0",
+    "source_commit": "11afdd747d6cbbb58ef0d7371841e8e365c4f8db",
+    "note": "Conservatively kept separate from FULL_TEXT accounting.",
+    "url": "https://github.com/Ye-Luo-0912/context-agent-prototype/blob/11afdd747d6cbbb58ef0d7371841e8e365c4f8db/crates/context-simple/src/gc/minor.rs"
+  },
+  {
+    "path": "docs/ARCHITECTURE.md",
+    "coverage": "PARTIAL",
+    "read_ranges": "1–88",
+    "source_reference": "turn343file0",
+    "source_commit": "11afdd747d6cbbb58ef0d7371841e8e365c4f8db",
+    "note": "",
+    "url": "https://github.com/Ye-Luo-0912/context-agent-prototype/blob/11afdd747d6cbbb58ef0d7371841e8e365c4f8db/docs/ARCHITECTURE.md"
+  },
+  {
+    "path": "docs/NEXT_TASKS.md",
+    "coverage": "PARTIAL_TRUNCATED",
+    "read_ranges": "1–215 requested; response truncated",
+    "source_reference": "turn344file0",
+    "source_commit": "11afdd747d6cbbb58ef0d7371841e8e365c4f8db",
+    "note": "",
+    "url": "https://github.com/Ye-Luo-0912/context-agent-prototype/blob/11afdd747d6cbbb58ef0d7371841e8e365c4f8db/docs/NEXT_TASKS.md"
+  },
+  {
+    "path": "crates/agent-runtime/src/plugin.rs",
+    "coverage": "PARTIAL",
+    "read_ranges": "45–235;350–505",
+    "source_reference": "turn350file0;turn351file0",
+    "source_commit": "11afdd747d6cbbb58ef0d7371841e8e365c4f8db",
+    "note": "",
+    "url": "https://github.com/Ye-Luo-0912/context-agent-prototype/blob/11afdd747d6cbbb58ef0d7371841e8e365c4f8db/crates/agent-runtime/src/plugin.rs"
+  },
+  {
+    "path": "crates/agent-compose/src/lib.rs",
+    "coverage": "PARTIAL",
+    "read_ranges": "470–745",
+    "source_reference": "turn352file0",
+    "source_commit": "11afdd747d6cbbb58ef0d7371841e8e365c4f8db",
+    "note": "",
+    "url": "https://github.com/Ye-Luo-0912/context-agent-prototype/blob/11afdd747d6cbbb58ef0d7371841e8e365c4f8db/crates/agent-compose/src/lib.rs"
+  }
+]
