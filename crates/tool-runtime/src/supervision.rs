@@ -71,10 +71,33 @@ fn lock_ledger(state_dir: &Path) -> LedgerResult<LedgerLock> {
             action: "lock",
             source,
         })?;
-    file.try_lock().map_err(|error| LedgerError::Io {
-        action: "lock",
-        source: std::io::Error::other(error),
-    })?;
+    // `try_lock` is non-blocking: a second process (two compositions started
+    // against the same workspace) or a same-process flock quirk surfaces as
+    // WouldBlock. Retry with backoff instead of failing the operation — the
+    // lock is IO coordination, and a bounded wait is what makes the
+    // serialization actually usable across processes.
+    let mut wait_ms = 25u64;
+    loop {
+        match file.try_lock() {
+            Ok(()) => break,
+            Err(std::fs::TryLockError::WouldBlock) => {
+                if wait_ms > 2_000 {
+                    return Err(LedgerError::Io {
+                        action: "lock",
+                        source: std::io::Error::other(std::fs::TryLockError::WouldBlock),
+                    });
+                }
+                std::thread::sleep(std::time::Duration::from_millis(wait_ms));
+                wait_ms = (wait_ms * 2).min(250);
+            }
+            Err(std::fs::TryLockError::Error(error)) => {
+                return Err(LedgerError::Io {
+                    action: "lock",
+                    source: error,
+                });
+            }
+        }
+    }
     Ok(LedgerLock {
         _file: file,
         _thread: thread,
