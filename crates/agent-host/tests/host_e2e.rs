@@ -9,23 +9,22 @@
 
 use std::io::{Read, Write};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use agent_compose::{
-    build_context_engine, compose, ComposeConfig, ContextPolicy, HostToolPolicyRegistry,
-};
-use agent_core::{ApprovalBroker, InteractiveApprovalGate, TaskApprovalGate};
-use agent_host::{
-    negotiated_profile, session_schema_digest, HostPlane, HostServer, LocalEndpoint,
-    SingleInstance,
-};
-use agent_platform_protocol::{
-    ApprovalRespondRequest, ApprovalRespondResponse, ApprovalRespondOutcome, Causality,
-    ActiveFeatures, EnvelopeKind, MessageId, PlatformEnvelope, PlatformResponse, ProtocolIdentity,
-    ProtocolVersion, RequestId, Route, WorkCancelRequest, WorkCancelResponse,
-    WorkSnapshotRequest, WorkSnapshotResponse, WorkSubmitDisposition, WorkSubmitRequest,
-    WorkSubmitResponse,
+    ComposeConfig, ContextPolicy, HostToolPolicyRegistry, build_context_engine, compose,
 };
 use agent_contracts::ApprovalGate as _;
+use agent_core::{ApprovalBroker, InteractiveApprovalGate, TaskApprovalGate};
+use agent_host::{
+    HostPlane, HostServer, LocalEndpoint, SingleInstance, negotiated_profile, session_schema_digest,
+};
+use agent_platform_protocol::{
+    ActiveFeatures, ApprovalRespondOutcome, ApprovalRespondRequest, ApprovalRespondResponse,
+    Causality, EnvelopeKind, MessageId, PlatformEnvelope, PlatformResponse, ProtocolIdentity,
+    ProtocolVersion, RequestId, Route, WorkCancelRequest, WorkCancelResponse, WorkSnapshotRequest,
+    WorkSnapshotResponse, WorkSubmitDisposition, WorkSubmitRequest, WorkSubmitResponse,
+};
 use agent_runtime::{RuntimeHandle, WorkControlSessionRegistry};
 use serde_json::json;
 
@@ -38,12 +37,15 @@ struct Composed {
 
 async fn compose_workspace(root: &std::path::Path) -> anyhow::Result<Composed> {
     let workspace = agent_workspace::Workspace::open(root).await?;
-    let lock = SingleInstance::acquire(&workspace.state_dir())?;
+    let lock = SingleInstance::acquire(workspace.state_dir())?;
     let model: Arc<dyn agent_contracts::ModelTransport> =
         Arc::new(agent_compose::MockModelTransport);
-    let context_engine =
-        build_context_engine(ContextPolicy::Rolling, workspace.state_dir(), Some(model.clone()))
-            .await?;
+    let context_engine = build_context_engine(
+        ContextPolicy::Rolling,
+        workspace.state_dir(),
+        Some(model.clone()),
+    )
+    .await?;
     let verification_recipes = Arc::new(tool_runtime::VerificationRecipes::discover(&workspace)?);
     let host_policies = Arc::new(
         HostToolPolicyRegistry::with_builtins_and_verification(&verification_recipes)
@@ -132,11 +134,17 @@ fn exchange<S: Read + Write, P: serde::Serialize, R: serde::de::DeserializeOwned
     let frame = agent_host::read_frame(stream)?
         .ok_or_else(|| anyhow::anyhow!("connection closed before response"))?;
     let envelope = serde_json::from_slice::<PlatformEnvelope<PlatformResponse<R>>>(&frame)?;
-    assert_eq!(envelope.request_id, request.request_id, "correlated response");
+    assert_eq!(
+        envelope.request_id, request.request_id,
+        "correlated response"
+    );
     assert_eq!(envelope.kind, EnvelopeKind::Response);
     Ok(envelope.payload)
 }
 
+/// One full work-plane drill over the given local endpoint. The stream type
+/// comes from the per-platform [`connect`] helper, so the Windows named-pipe
+/// and the Unix UDS backends run the identical flow.
 async fn run_e2e(endpoint: LocalEndpoint, label: &str) -> anyhow::Result<()> {
     let dir = tempfile::tempdir()?;
     let fixture = compose_workspace(dir.path()).await?;
@@ -152,9 +160,11 @@ async fn run_e2e(endpoint: LocalEndpoint, label: &str) -> anyhow::Result<()> {
 
     fixture.composed.instance.start().await?;
 
+    let stop = Arc::new(AtomicBool::new(false));
     let server = HostServer {
         endpoint: endpoint.clone(),
         read_only: false,
+        stop: Arc::clone(&stop),
     };
     let runtime = tokio::runtime::Handle::current();
     let serve_thread = std::thread::spawn(move || server.serve(plane, runtime));
@@ -269,7 +279,10 @@ async fn run_e2e(endpoint: LocalEndpoint, label: &str) -> anyhow::Result<()> {
         ),
     )?);
     assert_eq!(answered.outcome, ApprovalRespondOutcome::Delivered);
-    let gate_decision = authorize.await.expect("authorize task").expect("gate result");
+    let gate_decision = authorize
+        .await
+        .expect("authorize task")
+        .expect("gate result");
     assert_eq!(gate_decision, agent_contracts::ApprovalDecision::Allow);
 
     // 6. cancel: either truth is honest (no turn was started by submit).
@@ -294,23 +307,52 @@ async fn run_e2e(endpoint: LocalEndpoint, label: &str) -> anyhow::Result<()> {
 
     drop(stream);
     fixture.composed.shutdown().await?;
-    let _ = serve_thread.join();
+    // Honest teardown: the serve loop must still be alive here, so its joined
+    // result is a real assertion, not a discarded one. Set the stop flag,
+    // wake the parked accept with one throwaway connection, then require the
+    // thread to have exited `Ok` — a serve loop that died mid-test (masked
+    // accept-loop failures included) fails this check.
+    stop.store(true, Ordering::SeqCst);
+    let _ = connect(&endpoint).await;
+    let serve_result = serve_thread
+        .join()
+        .map_err(|_| anyhow::anyhow!("serve thread panicked"))?;
+    serve_result?;
     eprintln!("e2e[{label}]: done");
     Ok(())
 }
 
+#[cfg(windows)]
 async fn connect(endpoint: &LocalEndpoint) -> std::fs::File {
     let LocalEndpoint::NamedPipe(name) = endpoint else {
         unreachable!("windows test uses the named pipe transport")
     };
     let path = format!(r"\\.\pipe\{name}");
     for _ in 0..50 {
-        if let Ok(file) = std::fs::OpenOptions::new().read(true).write(true).open(&path) {
+        if let Ok(file) = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&path)
+        {
             return file;
         }
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
     }
     panic!("named pipe {path} never became connectable");
+}
+
+#[cfg(unix)]
+async fn connect(endpoint: &LocalEndpoint) -> std::os::unix::net::UnixStream {
+    let LocalEndpoint::UnixSocket(path) = endpoint else {
+        unreachable!("unix test uses the UDS transport")
+    };
+    for _ in 0..50 {
+        if let Ok(stream) = std::os::unix::net::UnixStream::connect(path) {
+            return stream;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+    panic!("uds socket {} never became connectable", path.display());
 }
 
 // multi_thread on purpose: the client side of this drill uses blocking
@@ -329,7 +371,9 @@ async fn named_pipe_end_to_end_work_plane() {
 #[tokio::test(flavor = "multi_thread")]
 async fn unix_socket_end_to_end_work_plane() {
     let path = std::env::temp_dir().join(format!("focus-agent-e2e-{}.sock", uuid_like()));
-    run_e2e(LocalEndpoint::UnixSocket(path), "uds").await.unwrap();
+    run_e2e(LocalEndpoint::UnixSocket(path), "uds")
+        .await
+        .unwrap();
 }
 
 #[cfg(not(any(windows, unix)))]

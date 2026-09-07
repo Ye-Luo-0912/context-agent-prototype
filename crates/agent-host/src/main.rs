@@ -6,15 +6,16 @@
 //! detach freely. `--read-only` serves snapshot/subscribe-only sessions.
 
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use agent_compose::{
-    build_context_engine, compose, try_model_from_env, ComposeConfig, ContextPolicy,
-    HostToolPolicyRegistry, ModelSelection,
+    ComposeConfig, ContextPolicy, HostToolPolicyRegistry, ModelSelection, build_context_engine,
+    compose, try_model_from_env,
 };
 use agent_core::{ApprovalBroker, InteractiveApprovalGate, PolicyApprovalGate, TaskApprovalGate};
 use agent_host::{
-    negotiated_profile, session_schema_digest_hex, HostPlane, HostServer, LocalEndpoint,
-    SingleInstance,
+    HostPlane, HostServer, LocalEndpoint, SingleInstance, negotiated_profile,
+    session_schema_digest_hex,
 };
 use agent_runtime::WorkControlSessionRegistry;
 use agent_storage::FileEventJournal;
@@ -53,7 +54,9 @@ fn parse_args() -> anyhow::Result<Args> {
             "--context-policy" => {
                 args.context_policy = Some(iter.next().context("--context-policy needs a value")?)
             }
-            other => anyhow::bail!("unknown argument {other:?}; see --help in the TUI for the full CLI story"),
+            other => anyhow::bail!(
+                "unknown argument {other:?}; see --help in the TUI for the full CLI story"
+            ),
         }
     }
     if args.pipe.is_some() && args.socket.is_some() {
@@ -121,7 +124,7 @@ async fn real_main() -> anyhow::Result<()> {
     };
 
     let workspace = Workspace::open(&root).await?;
-    let single = SingleInstance::acquire(&workspace.state_dir())?;
+    let single = SingleInstance::acquire(workspace.state_dir())?;
     eprintln!("host: workspace {}", root.display());
 
     let journal = Arc::new(FileEventJournal::open(workspace.state_dir().join("traces")).await?);
@@ -157,12 +160,14 @@ async fn real_main() -> anyhow::Result<()> {
         )
     };
 
-    let base_tools = Arc::new(BuiltinToolDispatcher::with_config_recipes_and_host_death_watchdog(
-        workspace.clone(),
-        Default::default(),
-        (*verification_recipes).clone(),
-        true,
-    ));
+    let base_tools = Arc::new(
+        BuiltinToolDispatcher::with_config_recipes_and_host_death_watchdog(
+            workspace.clone(),
+            Default::default(),
+            (*verification_recipes).clone(),
+            true,
+        ),
+    );
     let artifact_store = Arc::new(workspace.clone());
     let output_broker = Arc::new(WorkspaceOutputBroker::new(workspace.clone().into()));
 
@@ -228,22 +233,49 @@ async fn real_main() -> anyhow::Result<()> {
         gate,
         registry,
     };
+    let stop = Arc::new(AtomicBool::new(false));
+    let endpoint = resolve_endpoint(&args);
     let server = HostServer {
-        endpoint: resolve_endpoint(&args),
+        endpoint: endpoint.clone(),
         read_only: args.read_only,
+        stop: Arc::clone(&stop),
     };
 
-    // The accept loop blocks this thread; ctrl-c tears the runtime down in
-    // the standard ordered path and releases the single-instance lock.
+    // The accept loop blocks this thread; ctrl-c stops it through the
+    // server's cooperative stop switch and releases the single-instance lock.
     let runtime_handle = tokio::runtime::Handle::current();
     let serve_thread = std::thread::spawn(move || server.serve(plane, runtime_handle));
 
     let _ = tokio::signal::ctrl_c().await;
     eprintln!("host: shutting down");
     composed.shutdown().await?;
-    let _ = serve_thread.join();
+    // Set the stop flag, then poke the endpoint once so the parked accept
+    // loop wakes, observes the flag, and exits `Ok` on its own.
+    stop.store(true, Ordering::SeqCst);
+    wake_endpoint(&endpoint);
+    let serve_result = serve_thread
+        .join()
+        .map_err(|_| anyhow::anyhow!("host serve thread panicked"))?;
+    serve_result?;
     drop(single);
     Ok(())
+}
+
+/// Opens one throwaway local connection so a parked accept loop can wake up
+/// and observe the stop flag. Best effort: if the endpoint is already gone,
+/// the serve thread has exited and the join above reports its result.
+#[cfg(windows)]
+fn wake_endpoint(endpoint: &LocalEndpoint) {
+    if let LocalEndpoint::NamedPipe(name) = endpoint {
+        let _ = std::fs::File::open(format!(r"\\.\pipe\{name}"));
+    }
+}
+
+#[cfg(unix)]
+fn wake_endpoint(endpoint: &LocalEndpoint) {
+    if let LocalEndpoint::UnixSocket(path) = endpoint {
+        let _ = std::os::unix::net::UnixStream::connect(path);
+    }
 }
 
 fn resolve_latest_checkpoint(dir: &std::path::Path) -> anyhow::Result<std::path::PathBuf> {

@@ -50,6 +50,13 @@ jobs:
       - name: cargo clippy --workspace --all-targets -- -D warnings
         run: cargo clippy --workspace --all-targets -- -D warnings
 
+      # The host's named-pipe backend is cfg(windows)-gated; this scoped
+      # Linux check keeps that cfg surface (and the UDS path) compiling so a
+      # Windows-only regression cannot hide behind the fmt/clippy ordering.
+      - name: cargo check -p agent-host --all-targets
+        if: matrix.os == 'ubuntu-latest'
+        run: cargo check -p agent-host --all-targets
+
       # The context-service package owns its process-boundary integration
       # target and Cargo supplies the exact freshly-built binary through
       # CARGO_BIN_EXE; the workspace build also covers the shipped service.
@@ -115,3 +122,21 @@ jobs:
 
       - name: cargo test (${{ matrix.part }})
         run: cargo test -j 2 ${{ matrix.cargo_pkgs }} -- --test-threads 2
+
+  dotnet:
+    name: dotnet (desktop build, client tests)
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install .NET SDK (10.0.301, matching global.json)
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: 10.0.301
+
+      - name: dotnet build (Agent.Desktop)
+        run: dotnet build apps/Agent.Desktop/Agent.Desktop.csproj
+
+      - name: dotnet test (Agent.Client.Tests)
+        run: dotnet test clients/dotnet/Agent.Client.Tests/Agent.Client.Tests.csproj

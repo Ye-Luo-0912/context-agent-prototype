@@ -12,21 +12,19 @@
 //! UDS backend ([`super`]).
 
 use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, OnceLock};
 
 use windows_sys::Win32::Foundation::{
     CloseHandle, ERROR_PIPE_CONNECTED, HANDLE, INVALID_HANDLE_VALUE, LocalFree,
 };
-use windows_sys::Win32::Security::{
-    EqualSid, GetTokenInformation, TokenUser, PSID, SECURITY_ATTRIBUTES, TOKEN_QUERY, TOKEN_USER,
-};
 use windows_sys::Win32::Security::Authorization::{
     ConvertSidToStringSidW, ConvertStringSecurityDescriptorToSecurityDescriptorW,
 };
-use windows_sys::Win32::Storage::FileSystem::{
-    FILE_FLAG_FIRST_PIPE_INSTANCE, PIPE_ACCESS_DUPLEX,
+use windows_sys::Win32::Security::{
+    EqualSid, GetTokenInformation, PSID, SECURITY_ATTRIBUTES, TOKEN_QUERY, TOKEN_USER, TokenUser,
 };
+use windows_sys::Win32::Storage::FileSystem::{FILE_FLAG_FIRST_PIPE_INSTANCE, PIPE_ACCESS_DUPLEX};
 use windows_sys::Win32::System::Pipes::{
     ConnectNamedPipe, CreateNamedPipeW, DisconnectNamedPipe, GetNamedPipeClientProcessId,
     PIPE_READMODE_BYTE, PIPE_REJECT_REMOTE_CLIENTS, PIPE_TYPE_BYTE, PIPE_UNLIMITED_INSTANCES,
@@ -36,7 +34,7 @@ use windows_sys::Win32::System::Threading::{
     GetCurrentProcess, OpenProcess, OpenProcessToken, PROCESS_QUERY_LIMITED_INFORMATION,
 };
 
-use super::{build_connection_plane, process_connection, HostPlane, MAX_CONNECTIONS};
+use super::{HostPlane, MAX_CONNECTIONS, build_connection_plane, process_connection};
 
 fn wide(s: &str) -> Vec<u16> {
     s.encode_utf16().chain(std::iter::once(0)).collect()
@@ -101,9 +99,9 @@ fn host_token_user() -> std::io::Result<&'static TokenUserBuffer> {
     static HOST: OnceLock<std::io::Result<TokenUserBuffer>> = OnceLock::new();
     // OnceLock of Result: a failed query is cached as Err and re-raised.
     let cell = HOST.get_or_init(|| {
-            let token = open_own_token()?;
-            TokenUserBuffer::query(token.as_raw_handle() as _)
-        });
+        let token = open_own_token()?;
+        TokenUserBuffer::query(token.as_raw_handle() as _)
+    });
     match cell {
         Ok(buffer) => {
             // SAFETY of the 'static: the buffer lives in the process-lifetime OnceLock.
@@ -178,12 +176,26 @@ impl Drop for UserOnlySecurity {
     }
 }
 
-fn create_pipe_instance(name: &[u16], security: &UserOnlySecurity) -> std::io::Result<OwnedHandle> {
+fn create_pipe_instance(
+    name: &[u16],
+    security: &UserOnlySecurity,
+    first_instance: bool,
+) -> std::io::Result<OwnedHandle> {
     let attributes = security.attributes();
+    // FILE_FLAG_FIRST_PIPE_INSTANCE belongs only on the very first instance:
+    // it fails creation while any other instance of the pipe name is still
+    // open, which is exactly the state of every later accept-loop iteration
+    // (the previous instance lives in its connection worker). The name
+    // reservation is established by the first create and then persists.
+    let open_flags = if first_instance {
+        PIPE_ACCESS_DUPLEX | FILE_FLAG_FIRST_PIPE_INSTANCE
+    } else {
+        PIPE_ACCESS_DUPLEX
+    };
     let handle = unsafe {
         CreateNamedPipeW(
             name.as_ptr(),
-            PIPE_ACCESS_DUPLEX | FILE_FLAG_FIRST_PIPE_INSTANCE,
+            open_flags,
             PIPE_TYPE_BYTE | PIPE_READMODE_BYTE | PIPE_WAIT | PIPE_REJECT_REMOTE_CLIENTS,
             PIPE_UNLIMITED_INSTANCES,
             super::MAX_FRAME_BYTES,
@@ -244,6 +256,7 @@ pub(super) fn serve(
     read_only: bool,
     plane: HostPlane,
     runtime: tokio::runtime::Handle,
+    stop: &AtomicBool,
 ) -> anyhow::Result<()> {
     // Warm the host token/SID before the first client can connect: a host
     // that cannot verify itself must not serve at all.
@@ -256,8 +269,10 @@ pub(super) fn serve(
     eprintln!("host: serving named pipe {full_name}");
 
     let live = Arc::new(AtomicUsize::new(0));
+    let mut first_instance = true;
     loop {
-        let instance = create_pipe_instance(&wide_name, &security)?;
+        let instance = create_pipe_instance(&wide_name, &security, first_instance)?;
+        first_instance = false;
         let raw = instance.as_raw_handle() as HANDLE;
         let connected = unsafe { ConnectNamedPipe(raw, std::ptr::null_mut()) };
         if connected == 0 {
@@ -265,6 +280,12 @@ pub(super) fn serve(
             if error.raw_os_error() != Some(ERROR_PIPE_CONNECTED as i32) {
                 anyhow::bail!("ConnectNamedPipe failed: {error}");
             }
+        }
+        if stop.load(Ordering::SeqCst) {
+            // The stop poke woke the parked instance; stop cleanly instead
+            // of serving the throwaway wake connection.
+            drop(instance);
+            return Ok(());
         }
         if !verify_pipe_peer(raw) {
             eprintln!("host: rejected unverifiable pipe peer");

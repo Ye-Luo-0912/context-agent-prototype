@@ -67,10 +67,17 @@ public class FramingTests
     [Fact]
     public async Task Half_frame_at_eof_is_a_contract_violation()
     {
-        var stream = new MemoryStream(new byte[] { 0, 0, 0, 9, 1, 2 });
+        // A legal 9-byte little-endian length prefix followed by only 2 of
+        // the 9 announced payload bytes: EOF lands mid-payload, the
+        // half-frame path. A wrong-endian prefix (0,0,0,9) would decode as
+        // ~151M and trip the oversize rejection instead, passing this test
+        // for the wrong reason — the message asserts prove which path ran.
+        var stream = new MemoryStream(new byte[] { 9, 0, 0, 0, 1, 2 });
         stream.Position = 0;
-        await Assert.ThrowsAsync<AgentContractViolationException>(() =>
+        var failure = await Assert.ThrowsAsync<AgentContractViolationException>(() =>
             FrameCodec.ReadFrameAsync(stream, FrameCodec.DefaultMaxFrameBytes, CancellationToken.None));
+        Assert.Contains("stream ended after 2 of 9", failure.Message);
+        Assert.DoesNotContain("above the", failure.Message);
     }
 
     [Fact]
@@ -102,6 +109,38 @@ public class ConnectionTests
                 using var document = JsonDocument.Parse(request);
                 var response = BuildResponse(document.RootElement);
                 await FrameCodec.WriteFrameAsync(stream, response, FrameCodec.DefaultMaxFrameBytes, cancellationToken);
+            }
+        }
+
+        /// <summary>
+        /// Reads all requests first, then answers them in reverse arrival
+        /// order on the single connection: a client that pairs responses by
+        /// position instead of request id delivers the wrong payload.
+        /// </summary>
+        public async Task ServeReversedAsync(int turns, CancellationToken cancellationToken)
+        {
+            var stream = Client.GetStream();
+            var requests = new List<JsonDocument>(turns);
+            try
+            {
+                for (var i = 0; i < turns; i++)
+                {
+                    var request = await FrameCodec.ReadFrameAsync(stream, FrameCodec.DefaultMaxFrameBytes, cancellationToken)
+                        ?? throw new InvalidOperationException("client closed early");
+                    requests.Add(JsonDocument.Parse(request));
+                }
+                for (var i = turns - 1; i >= 0; i--)
+                {
+                    var response = BuildResponse(requests[i].RootElement);
+                    await FrameCodec.WriteFrameAsync(stream, response, FrameCodec.DefaultMaxFrameBytes, cancellationToken);
+                }
+            }
+            finally
+            {
+                foreach (var document in requests)
+                {
+                    document.Dispose();
+                }
             }
         }
 
@@ -160,24 +199,25 @@ public class ConnectionTests
         listener.Start();
         var port = ((IPEndPoint)listener.LocalEndpoint).Port;
 
-        using var clientA = new TcpClient();
-        using var clientB = new TcpClient();
-        var connectA = clientA.ConnectAsync(IPAddress.Loopback, port);
-        var connectB = clientB.ConnectAsync(IPAddress.Loopback, port);
-        await Task.WhenAll(connectA, connectB);
+        using var client = new TcpClient();
+        var connect = client.ConnectAsync(IPAddress.Loopback, port);
+        var server = new ScriptedServer(await listener.AcceptTcpClientAsync(CancellationToken.None));
+        await connect;
+        _ = server.ServeReversedAsync(2, CancellationToken.None);
 
-        var serverA = new ScriptedServer(await listener.AcceptTcpClientAsync(CancellationToken.None));
-        var serverB = new ScriptedServer(await listener.AcceptTcpClientAsync(CancellationToken.None));
-        _ = serverA.ServeAsync(1, CancellationToken.None);
-        _ = serverB.ServeAsync(1, CancellationToken.None);
+        await using var connection = new AgentConnection(client.GetStream());
 
-        await using var connectionA = new AgentConnection(clientA.GetStream());
-        await using var connectionB = new AgentConnection(clientB.GetStream());
-
-        var snapshotA = connectionA.SnapshotAsync();
-        var snapshotB = connectionB.SnapshotAsync();
-        var results = await Task.WhenAll(snapshotA, snapshotB);
-        Assert.All(results, snapshot => Assert.Equal(41ul, snapshot.Watermark));
+        // Two different requests in flight on ONE connection; the scripted
+        // host answers them in reverse arrival order, so only request-id
+        // correlation can deliver each response to its own waiter. A swap
+        // would fail pairing validation or the payload asserts below.
+        var submitTask = connection.SubmitWorkAsync("interleave probe", "interleave-1");
+        var snapshotTask = connection.SnapshotAsync();
+        var submit = await submitTask;
+        var snapshot = await snapshotTask;
+        Assert.Equal(WorkSubmitDisposition.Accepted, submit.Disposition);
+        Assert.Equal("00000000-0000-4000-8000-000000000022", submit.TaskId);
+        Assert.Equal(41ul, snapshot.Watermark);
     }
 
     [Fact]

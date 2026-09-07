@@ -22,22 +22,25 @@
 
 use std::io::{Read, Write};
 use std::path::PathBuf;
+use std::sync::Arc;
+use std::sync::atomic::AtomicBool;
 #[cfg(unix)]
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::Arc;
 use std::time::Duration;
 
 use agent_core::{ApprovalBroker, InteractiveApprovalGate};
 use agent_platform_protocol::{
-    ApprovalRespondRequest, Causality, EffectStateDisposition,
-    EnvelopeKind, JsonDecodeBudget, MAX_JSON_CONTROL_ARRAY_LEN, MAX_JSON_CONTROL_DEPTH,
-    MAX_JSON_CONTROL_NODES, MAX_JSON_CONTROL_OBJECT_KEYS, MAX_JSON_CONTROL_STRING_BYTES,
+    ApprovalRespondRequest, Causality, EffectStateDisposition, EnvelopeKind, JsonDecodeBudget,
+    MAX_JSON_CONTROL_ARRAY_LEN, MAX_JSON_CONTROL_DEPTH, MAX_JSON_CONTROL_NODES,
+    MAX_JSON_CONTROL_OBJECT_KEYS, MAX_JSON_CONTROL_STRING_BYTES,
     MAX_JSON_CONTROL_TOTAL_STRING_BYTES, MessageId, NegotiatedContractProfile, PlatformEnvelope,
     PlatformError, PlatformErrorClass, PlatformResponse, RetryDisposition, SchemaDigest,
-    WorkCancelRequest, WorkContinueRequest, WorkSnapshotRequest, WorkSubscribeRequest,
-    WorkSubmitRequest,
+    WorkCancelRequest, WorkContinueRequest, WorkSnapshotRequest, WorkSubmitRequest,
+    WorkSubscribeRequest,
 };
-use agent_runtime::{RuntimeHandle, WorkControlGrant, WorkControlRouter, WorkControlSessionRegistry};
+use agent_runtime::{
+    RuntimeHandle, WorkControlGrant, WorkControlRouter, WorkControlSessionRegistry,
+};
 
 /// Structured error code for any route outside the negotiated session set.
 pub const ERROR_ROUTE_UNSUPPORTED: &str = "route.unsupported";
@@ -216,22 +219,26 @@ pub struct HostServer {
     pub endpoint: LocalEndpoint,
     /// Serve `read_only` grants (snapshot/subscribe only) instead of operator.
     pub read_only: bool,
+    /// Cooperative stop switch. The owner sets it, then opens one throwaway
+    /// local connection to wake the parked accept loop; the loop then exits
+    /// `Ok` instead of serving further connections. The flag is only checked
+    /// at accept boundaries, so in-flight connections always finish.
+    pub stop: Arc<AtomicBool>,
 }
 
 impl HostServer {
-    /// Blocks serving until the accept loop fails. Runs on the caller's
-    /// thread; per-request work blocks on `runtime` — the tokio runtime
-    /// that owns the actor handle, passed explicitly so the accept loop can
-    /// live on any thread.
-    pub fn serve(
-        self,
-        plane: HostPlane,
-        runtime: tokio::runtime::Handle,
-    ) -> anyhow::Result<()> {
+    /// Blocks serving until the accept loop fails or [`HostServer::stop`] is
+    /// set and the loop is poked. Runs on the caller's thread; per-request
+    /// work blocks on `runtime` — the tokio runtime that owns the actor
+    /// handle, passed explicitly so the accept loop can live on any thread.
+    pub fn serve(self, plane: HostPlane, runtime: tokio::runtime::Handle) -> anyhow::Result<()> {
         let read_only = self.read_only;
+        let stop = Arc::clone(&self.stop);
         match self.endpoint {
-            LocalEndpoint::UnixSocket(path) => serve_unix(path, read_only, plane, runtime),
-            LocalEndpoint::NamedPipe(name) => winpipe::serve(name, read_only, plane, runtime),
+            LocalEndpoint::UnixSocket(path) => serve_unix(path, read_only, plane, runtime, &stop),
+            LocalEndpoint::NamedPipe(name) => {
+                winpipe::serve(name, read_only, plane, runtime, &stop)
+            }
         }
     }
 }
@@ -242,6 +249,7 @@ fn serve_unix(
     read_only: bool,
     plane: HostPlane,
     runtime: tokio::runtime::Handle,
+    stop: &AtomicBool,
 ) -> anyhow::Result<()> {
     use std::os::unix::fs::PermissionsExt;
     use std::os::unix::net::UnixListener;
@@ -249,12 +257,16 @@ fn serve_unix(
         std::fs::create_dir_all(parent)?;
     }
     let _ = std::fs::remove_file(&path);
-    let listener = UnixListener::bind(&path)
-        .with_context(|| format!("binding {}", path.display()))?;
+    let listener =
+        UnixListener::bind(&path).with_context(|| format!("binding {}", path.display()))?;
     std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))?;
     eprintln!("host: serving UDS {}", path.display());
     let live = Arc::new(AtomicUsize::new(0));
     for stream in listener.incoming() {
+        if stop.load(Ordering::SeqCst) {
+            // Woken by the stop poke; the waker connection is unserved.
+            return Ok(());
+        }
         let mut stream = match stream {
             Ok(stream) => stream,
             Err(error) => {
@@ -292,6 +304,7 @@ fn serve_unix(
     _read_only: bool,
     _plane: HostPlane,
     _runtime: tokio::runtime::Handle,
+    _stop: &AtomicBool,
 ) -> anyhow::Result<()> {
     anyhow::bail!("UDS transport requires a Unix host")
 }
@@ -501,3 +514,27 @@ fn protocol_error_response<P>(request: &PlatformEnvelope<P>, message: &str) -> s
 
 #[cfg(windows)]
 mod winpipe;
+
+/// Non-Windows stand-in for the named-pipe backend: the transport only
+/// exists on Windows, so a misconfigured [`LocalEndpoint::NamedPipe`] fails
+/// closed with a typed error here instead of not compiling at all. The Unix
+/// endpoint on this platform is [`LocalEndpoint::UnixSocket`], whose serving
+/// path is implemented in [`serve_unix`].
+#[cfg(not(windows))]
+mod winpipe {
+    use std::sync::atomic::AtomicBool;
+
+    use super::HostPlane;
+
+    pub(super) fn serve(
+        _name: String,
+        _read_only: bool,
+        _plane: HostPlane,
+        _runtime: tokio::runtime::Handle,
+        _stop: &AtomicBool,
+    ) -> anyhow::Result<()> {
+        anyhow::bail!(
+            "named-pipe transport is Windows-only; use the UnixSocket endpoint on Unix hosts"
+        )
+    }
+}
