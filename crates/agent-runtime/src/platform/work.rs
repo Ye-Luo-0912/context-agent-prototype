@@ -11,10 +11,10 @@ use std::future::Future;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use agent_contracts::{AgentError, AgentResult, RunId, RuntimeEventEnvelope};
+use agent_contracts::{AgentError, AgentResult, RunId, RuntimeEventEnvelope, ToolRisk};
 use agent_core::{ApprovalBroker, InteractiveApprovalGate};
 use agent_platform_protocol::{
-    ApprovalRespondOutcome, ApprovalRespondRequest, ApprovalRespondResponse,
+    ApprovalRespondOutcome, ApprovalRespondRequest, ApprovalRespondResponse, ApprovalRisk,
     EffectStateDisposition, EnvelopeKind, FocusSnapshot, MAX_SNAPSHOT_PENDING_APPROVALS,
     MAX_SNAPSHOT_TASKS, MessageId, NegotiatedContractProfile, PendingApprovalSnapshot,
     PlatformEnvelope, PlatformError, PlatformErrorClass, PlatformResponse, RetryDisposition,
@@ -484,7 +484,9 @@ impl WorkControlRouter {
             .take(MAX_SNAPSHOT_PENDING_APPROVALS)
             .map(|pending| PendingApprovalSnapshot {
                 request_id: pending.request_id,
-                call_name: pending.call.name,
+                call_name: pending.call.name.clone(),
+                risk: approval_risk(pending.spec.risk),
+                target_summary: approval_target_summary(&pending.call.arguments),
             })
             .collect();
         let value = WorkSnapshotResponse {
@@ -716,6 +718,102 @@ impl WorkControlRouter {
     }
 }
 
+/// F12: the gate's own declared risk, mirrored into the protocol's tag.
+fn approval_risk(risk: ToolRisk) -> ApprovalRisk {
+    match risk {
+        ToolRisk::ReadOnly => ApprovalRisk::ReadOnly,
+        ToolRisk::WorkspaceWrite => ApprovalRisk::WorkspaceWrite,
+        ToolRisk::ProcessExecution => ApprovalRisk::ProcessExecution,
+    }
+}
+
+/// F12: a bounded operator-facing summary of what one pending approval
+/// targets (workspace path or argv/command). This is a DISPLAY projection of
+/// the call's own structured arguments, read from the same well-known keys
+/// the host policy table binds; it is never parsed from tool prose, never an
+/// authority surface, and the approval gate's own intent matching stays the
+/// sole authority. `None` when the arguments carry none of the keys — the
+/// UI then shows "unavailable" instead of guessing.
+fn approval_target_summary(arguments: &serde_json::Value) -> Option<String> {
+    let mut paths: Vec<&str> = Vec::new();
+    if let Some(path) = string_argument(arguments, "path") {
+        paths.push(path);
+    }
+    if let Some(files) = arguments.get("files").and_then(serde_json::Value::as_array) {
+        for file in files {
+            if let Some(path) = file.get("path").and_then(serde_json::Value::as_str) {
+                let path = path.trim();
+                if !path.is_empty() {
+                    paths.push(path);
+                }
+            }
+        }
+    }
+    if !paths.is_empty() {
+        return bounded_display_summary(join_bounded(&paths, " → "));
+    }
+    if let Some(command) = string_argument(arguments, "command") {
+        return bounded_display_summary(command.to_owned());
+    }
+    if let Some(argv) = arguments.get("argv").and_then(serde_json::Value::as_array) {
+        let tokens: Vec<&str> = argv
+            .iter()
+            .filter_map(serde_json::Value::as_str)
+            .filter(|token| !token.trim().is_empty())
+            .collect();
+        if !tokens.is_empty() {
+            return bounded_display_summary(join_bounded(&tokens, " "));
+        }
+    }
+    None
+}
+
+fn string_argument<'a>(arguments: &'a serde_json::Value, key: &str) -> Option<&'a str> {
+    arguments
+        .get(key)
+        .and_then(serde_json::Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+}
+
+/// At most three entries survive; the rest stay counted, not hidden.
+fn join_bounded(entries: &[&str], separator: &str) -> String {
+    const MAX_ENTRIES: usize = 3;
+    match entries.len() {
+        0 => String::new(),
+        1..=MAX_ENTRIES => entries.join(separator),
+        _ => format!(
+            "{}{separator}+{} more",
+            entries[..MAX_ENTRIES].join(separator),
+            entries.len() - MAX_ENTRIES
+        ),
+    }
+}
+
+/// Sanitize, bound, and only then expose: control characters become spaces
+/// (a display line, not a transcript), the char bound holds with an honest
+/// truncation marker inside it, and an empty result means "not available"
+/// instead of an empty claim.
+fn bounded_display_summary(summary: String) -> Option<String> {
+    let max = agent_platform_protocol::MAX_SNAPSHOT_APPROVAL_TARGET_CHARS;
+    let mut bounded = summary.trim().to_owned();
+    if bounded.chars().any(char::is_control) {
+        bounded = bounded
+            .chars()
+            .map(|c| if c.is_control() { ' ' } else { c })
+            .collect();
+    }
+    if bounded.chars().count() > max {
+        bounded = bounded.chars().take(max - 1).collect();
+        bounded.push('…');
+    }
+    let bounded = bounded.trim().to_owned();
+    if bounded.is_empty() {
+        return None;
+    }
+    Some(bounded)
+}
+
 fn run_scoped_response_envelope<RequestPayload, ResponsePayload>(
     request: &PlatformEnvelope<RequestPayload>,
     payload: PlatformResponse<ResponsePayload>,
@@ -811,5 +909,100 @@ mod tests {
         assert_eq!(registry.live_sessions(), 1);
         assert!(registry.revoke(&second).is_ok());
         assert_eq!(registry.live_sessions(), 0);
+    }
+
+    /// F12: the target summary is a bounded display projection of the call's
+    /// own structured arguments, in the gate's key vocabulary — never parsed
+    /// from prose, never authority.
+    #[test]
+    fn approval_target_summary_projects_the_well_known_argument_keys() {
+        // Workspace write: the path argument.
+        assert_eq!(
+            approval_target_summary(&serde_json::json!({
+                "path": "docs/plan.md",
+                "content": "…"
+            }))
+            .as_deref(),
+            Some("docs/plan.md")
+        );
+
+        // Multi-file patch: every target stays visible, bounded to three
+        // entries plus an honest "+n more".
+        assert_eq!(
+            approval_target_summary(&serde_json::json!({
+                "files": [
+                    {"path": "a.rs", "hunks": []},
+                    {"path": "b.rs", "hunks": []},
+                    {"path": "c.rs", "hunks": []},
+                    {"path": "d.rs", "hunks": []}
+                ]
+            }))
+            .as_deref(),
+            Some("a.rs → b.rs → c.rs → +1 more")
+        );
+
+        // Shell command.
+        assert_eq!(
+            approval_target_summary(&serde_json::json!({
+                "command": "cargo test --workspace",
+                "dialect": "sh"
+            }))
+            .as_deref(),
+            Some("cargo test --workspace")
+        );
+
+        // Process argv.
+        assert_eq!(
+            approval_target_summary(&serde_json::json!({
+                "argv": ["cargo", "build", "--release"]
+            }))
+            .as_deref(),
+            Some("cargo build --release")
+        );
+
+        // None of the well-known keys: honestly unavailable, not guessed.
+        assert_eq!(
+            approval_target_summary(&serde_json::json!({
+                "question": "what should I run?"
+            })),
+            None
+        );
+        assert_eq!(approval_target_summary(&serde_json::json!({})), None);
+    }
+
+    #[test]
+    fn approval_target_summary_is_sanitized_and_bounded() {
+        // Control characters never reach the wire as controls.
+        assert_eq!(
+            approval_target_summary(&serde_json::json!({
+                "path": "bad\u{1}path"
+            }))
+            .as_deref(),
+            Some("bad path")
+        );
+
+        // An overlong target stays inside the protocol bound (the truncation
+        // marker included) and still validates as snapshot text.
+        let long_path =
+            "d".repeat(agent_platform_protocol::MAX_SNAPSHOT_APPROVAL_TARGET_CHARS + 64);
+        let summary = approval_target_summary(&serde_json::json!({ "path": long_path }))
+            .expect("overlong path still produces a bounded summary");
+        assert!(
+            summary.chars().count() <= agent_platform_protocol::MAX_SNAPSHOT_APPROVAL_TARGET_CHARS
+        );
+        assert!(summary.ends_with('…'));
+    }
+
+    #[test]
+    fn approval_risk_mirrors_the_gate_declaration() {
+        assert_eq!(approval_risk(ToolRisk::ReadOnly), ApprovalRisk::ReadOnly);
+        assert_eq!(
+            approval_risk(ToolRisk::WorkspaceWrite),
+            ApprovalRisk::WorkspaceWrite
+        );
+        assert_eq!(
+            approval_risk(ToolRisk::ProcessExecution),
+            ApprovalRisk::ProcessExecution
+        );
     }
 }

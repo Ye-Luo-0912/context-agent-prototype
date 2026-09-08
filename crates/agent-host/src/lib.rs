@@ -595,17 +595,16 @@ impl Drop for SocketEndpointGuard {
 /// SHA-256 over the canonical workspace path. One workspace always
 /// resolves to the same suffix, two workspaces never share a default
 /// endpoint, and no default is a fixed global name.
+///
+/// The digest rule itself lives in the platform protocol
+/// ([`agent_platform_protocol::workspace_endpoint_suffix`]) so the desktop
+/// client derives the same default endpoint from the same bytes (N4); the
+/// host-only part is the canonicalization before hashing.
 pub fn workspace_endpoint_suffix(workspace_root: &std::path::Path) -> String {
-    use sha2::{Digest, Sha256};
     let canonical = workspace_root
         .canonicalize()
         .unwrap_or_else(|_| workspace_root.to_path_buf());
-    let digest = Sha256::digest(canonical.as_os_str().as_encoded_bytes());
-    let mut suffix = String::with_capacity(16);
-    for byte in &digest[..8] {
-        suffix.push_str(&format!("{byte:02x}"));
-    }
-    suffix
+    agent_platform_protocol::workspace_endpoint_suffix(&canonical)
 }
 
 /// The default UDS endpoint for one workspace: the user's runtime directory

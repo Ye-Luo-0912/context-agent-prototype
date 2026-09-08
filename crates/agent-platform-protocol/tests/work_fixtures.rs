@@ -10,7 +10,7 @@
 use std::path::PathBuf;
 
 use agent_platform_protocol::{
-    ApprovalRespondOutcome, ApprovalRespondRequest, ApprovalRespondResponse, Attempt,
+    ApprovalRespondOutcome, ApprovalRespondRequest, ApprovalRespondResponse, ApprovalRisk, Attempt,
     DeadlineRemainingMs, EnvelopeKind, MessageId, NegotiatedContractProfile, PlatformEnvelope,
     PlatformResponse, ProtocolIdentity, ProtocolVersion, RequestId, SchemaDigest,
     TaskSnapshotStatus, WorkSubmitDisposition, WorkSubmitRequest, WorkSubmitResponse,
@@ -196,7 +196,31 @@ fn snapshot_fixture_pair_is_bounded_typed_and_watermarked() {
     assert_eq!(value.tasks[0].status, TaskSnapshotStatus::Active);
     assert_eq!(value.pending_approvals.len(), 1);
     assert_eq!(value.pending_approvals[0].call_name, "fs.write");
+    // F12: the snapshot carries the gate's own risk plus a bounded target
+    // summary — informed approval, not a bare request id.
+    assert_eq!(
+        value.pending_approvals[0].risk,
+        ApprovalRisk::WorkspaceWrite
+    );
+    assert_eq!(
+        value.pending_approvals[0].target_summary.as_deref(),
+        Some("docs/plan.md")
+    );
     assert!(!value.resync_required);
+}
+
+/// The endpoint suffix rule is pinned cross-language: the .NET desktop
+/// derives the same default endpoint from the same bytes.
+#[test]
+fn endpoint_derivation_fixture_pins_the_shared_suffix_rule() {
+    let value: serde_json::Value =
+        serde_json::from_str(&read_fixture("endpoint_derivation.json")).unwrap();
+    let root = value["workspace_root"].as_str().unwrap();
+    let expected = value["endpoint_suffix"].as_str().unwrap();
+    assert_eq!(
+        agent_platform_protocol::workspace_endpoint_suffix(std::path::Path::new(root)),
+        expected
+    );
 }
 
 #[test]

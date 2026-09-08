@@ -46,6 +46,10 @@ pub const MAX_SNAPSHOT_GOAL_CHARS: usize = MAX_WORK_GOAL_CHARS;
 /// an oversized goal is refused at validation instead of after admission.
 pub const MAX_WORK_GOAL_BYTES: usize = agent_contracts::input::USER_INPUT_REPLAY_MAX_BYTES;
 pub const MAX_SNAPSHOT_CALL_NAME_BYTES: usize = 128;
+/// Char bound on the operator-facing target summary of one pending
+/// approval (F12). It is a display projection of the call's own structured
+/// arguments, never an authority surface, so it stays small.
+pub const MAX_SNAPSHOT_APPROVAL_TARGET_CHARS: usize = 256;
 /// The most recent durable sequence a subscribe request may still ask to
 /// replay from; older cursors get `resync_required` instead of a replay.
 pub const MAX_REPLAY_WINDOW_EVENTS: u64 = 4_096;
@@ -285,13 +289,42 @@ pub struct FocusSnapshot {
     pub anchor_revision: u64,
 }
 
+/// The gate's declared risk for one pending approval (F12), mirrored from
+/// the matched `ToolSpec`'s own risk. It is the fact the interactive gate
+/// acted on, shown to the operator; it is not itself a permission and the
+/// gate's matching stays the sole authority.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ApprovalRisk {
+    ReadOnly,
+    WorkspaceWrite,
+    ProcessExecution,
+}
+
+impl ApprovalRisk {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::ReadOnly => "read_only",
+            Self::WorkspaceWrite => "workspace_write",
+            Self::ProcessExecution => "process_execution",
+        }
+    }
+}
+
 /// One approval awaiting a decision. `request_id` is the approval-gate key;
-/// responding is bound to the authenticated session server-side.
+/// responding is bound to the authenticated session server-side. `risk` is
+/// the gate's own declared risk; `target_summary` is a bounded operator
+/// display projection of the call's structured arguments (workspace path or
+/// argv/command), `None` when the arguments carry none of the well-known
+/// keys — a client then shows "unavailable" instead of guessing.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct PendingApprovalSnapshot {
     pub request_id: String,
     pub call_name: String,
+    pub risk: ApprovalRisk,
+    #[serde(default)]
+    pub target_summary: Option<String>,
 }
 
 /// One consistent typed snapshot. `watermark` is the durable event sequence
@@ -357,6 +390,13 @@ impl WorkSnapshotResponse {
                 &approval.call_name,
                 MAX_SNAPSHOT_CALL_NAME_BYTES,
             )?;
+            if let Some(target) = &approval.target_summary {
+                validate_text(
+                    "work.snapshot.approval.target_summary",
+                    target,
+                    MAX_SNAPSHOT_APPROVAL_TARGET_CHARS,
+                )?;
+            }
         }
         if let Some(focus) = &self.focus {
             validate_text(
@@ -462,6 +502,47 @@ impl WorkEventNotification {
     pub const fn validate(&self) -> ValidationResult<()> {
         Ok(())
     }
+}
+
+// ---------------------------------------------------------------------------
+// Shared default-endpoint derivation (N4).
+//
+// The host binds its local endpoint and local clients derive the same
+// default from ONE rule, so a client that did not watch the host's startup
+// log still knocks on the right door. The suffix is a pure digest over the
+// workspace path *as given* (no canonicalization here — the host may
+// canonicalize first, but the wire-facing rule must stay exactly
+// reproducible cross-language); the UDS default places it under the user's
+// runtime directory when the platform provides one, else the temp dir.
+// ---------------------------------------------------------------------------
+
+/// The per-workspace endpoint discriminator: 16 hex chars of the SHA-256
+/// digest over the workspace root's bytes as given. One workspace always
+/// resolves to the same suffix and two workspaces never share one; no
+/// default endpoint is a fixed global name.
+pub fn workspace_endpoint_suffix(workspace_root: &std::path::Path) -> String {
+    use sha2::{Digest, Sha256};
+    let digest = Sha256::digest(workspace_root.as_os_str().as_encoded_bytes());
+    let mut suffix = String::with_capacity(16);
+    for byte in &digest[..8] {
+        suffix.push_str(&format!("{byte:02x}"));
+    }
+    suffix
+}
+
+/// The default UDS endpoint for one workspace: the user's runtime directory
+/// when the platform provides one, else the temp dir — plus the workspace
+/// discriminator, so the path is user-private, workspace-scoped, and never
+/// a fixed global name in `/tmp`.
+#[cfg(unix)]
+pub fn default_socket_path_for(workspace_root: &std::path::Path) -> std::path::PathBuf {
+    let base = std::env::var_os("XDG_RUNTIME_DIR")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(std::env::temp_dir);
+    base.join(format!(
+        "focus-agent-platform-{}.sock",
+        workspace_endpoint_suffix(workspace_root)
+    ))
 }
 
 /// Free human-readable text (goals, task summaries). The runtime caps these
@@ -860,6 +941,8 @@ mod tests {
             pending_approvals: vec![PendingApprovalSnapshot {
                 request_id: "approval-1".into(),
                 call_name: "fs.write".into(),
+                risk: ApprovalRisk::WorkspaceWrite,
+                target_summary: Some("docs/plan.md".into()),
             }],
             resync_required: false,
         };
@@ -884,10 +967,52 @@ mod tests {
             PendingApprovalSnapshot {
                 request_id: "a".into(),
                 call_name: "fs.write".into(),
+                risk: ApprovalRisk::WorkspaceWrite,
+                target_summary: None,
             };
             MAX_SNAPSHOT_PENDING_APPROVALS + 1
         ];
         assert!(snapshot.validate().is_err());
+    }
+
+    /// F12: an approval's target summary is a bounded display projection.
+    /// Oversized or control-bearing summaries fail validation; the summary
+    /// travels on the wire exactly as encoded (snake_case risk).
+    #[test]
+    fn approval_target_summary_is_bounded_display_text() {
+        fn approval(target: Option<String>) -> PendingApprovalSnapshot {
+            PendingApprovalSnapshot {
+                request_id: "approval-1".into(),
+                call_name: "fs.write".into(),
+                risk: ApprovalRisk::WorkspaceWrite,
+                target_summary: target,
+            }
+        }
+
+        let mut snapshot = WorkSnapshotResponse {
+            run_started: true,
+            run_completed: false,
+            watermark: 1,
+            focus: None,
+            tasks: vec![],
+            pending_approvals: vec![approval(Some(
+                "x".repeat(MAX_SNAPSHOT_APPROVAL_TARGET_CHARS + 1),
+            ))],
+            resync_required: false,
+        };
+        assert!(snapshot.validate().is_err());
+
+        snapshot.pending_approvals = vec![approval(Some("bad\u{1}control".into()))];
+        assert!(snapshot.validate().is_err());
+
+        snapshot.pending_approvals = vec![approval(Some("src/main.rs".into()))];
+        snapshot.validate().unwrap();
+
+        // The risk tag is snake_case on the wire (mirrored by the .NET
+        // client's enum naming policy).
+        let encoded = serde_json::to_string(&approval(None)).unwrap();
+        assert!(encoded.contains("\"risk\":\"workspace_write\""));
+        assert!(encoded.contains("\"target_summary\":null"));
     }
 
     #[test]
