@@ -34,7 +34,7 @@
 | 3 | ~~N2~~ | 客户端 | 未知修改不重发、连接终态不复活、single-flight | 已关闭（2026-09-08）：修改只发一次（Unknown 语义）、终态故障路径＋半帧毒化、single-flight＋代际、双沿验证；dotnet 35/35 | N0 ✓ |
 | 4 | N3 | 契约 | 事件 receiver 保留到连接、notification 验证、多行正文 | 提案（F06/F11；F06 已在 HEAD 复核：`work.subscribe` 丢弃 `_receiver`） | N1, N2 |
 | 5 | N4 | GUI | 计划/输出/知情审批/取消/继续/真实状态 | 提案（F12/F13） | N3 |
-| 6 | N5 | 平台/GUI | 正式信封恢复＋结果/差异/工件按需读取 | 提案（F10 已复核：宿主裸 JSON 反序列化） | N2, N3 |
+| 6 | N5 | 平台/GUI | 正式信封恢复＋结果/差异/工件按需读取 | 恢复半已关闭（2026-09-08，提交 `808773c` 待 CI）：`--restore-latest` 走 CheckpointStore 信封解码＋完整 restore＋3 个 e2e；**backlog**：Rolling 引擎（宿主默认策略）不跟踪 focus，活动任务检查点 fail-closed 不可恢复（需动 context-baselines）；结果/差异/工件读取仍开放 | N2, N3 |
 | 7 | ~~N6~~ | 基础 | 决策不误终结、lease 跨层一致、Skill 受限句柄、catalog 有界 | 已关闭（2026-09-08）：F15 决策需证明、F16 跨层到期保护、F17 包内普通文件围栏、F18 惰性投影；context-simple 302/302 | N0 ✓ |
 | 8 | N7 | GUI/测量 | 对象与文本保留有界、指标覆盖如实 | 提案（F13/F14） | N4 |
 | 9 | N8 | 扩展/交付 | MCP/Plugin 可配置使用＋Rust/.NET 来源绑定发布（并入 PACKAGE-01、原 R1） | 提案（F20） | N1–N6 |
