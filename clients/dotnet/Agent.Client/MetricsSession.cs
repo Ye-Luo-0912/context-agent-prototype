@@ -4,30 +4,67 @@ using System.Text.Json.Serialization;
 
 namespace FocusAgent.Client;
 
+/// <summary>What a sample's process-tree walk actually covered. The report
+/// labels every measurement honestly: a platform that cannot enumerate
+/// parents measures the registered roots only and says so — never a fake
+/// whole-tree number.</summary>
+public enum TreeCoverage
+{
+    /// <summary>Only the registered root processes were measured; parent
+    /// enumeration is unavailable on this platform (Windows), so descendants
+    /// are not discoverable from this recorder.</summary>
+    RootOnly,
+
+    /// <summary>Every descendant reachable through the parent map was
+    /// measured exactly once (Linux /proc enumeration).</summary>
+    FullTree,
+
+    /// <summary>The walk could not be completed confidently; the totals are
+    /// a lower bound at best (a process vanished mid-enumeration).</summary>
+    Unknown,
+}
+
 /// <summary>
-/// G3 resource measurement recorder. Samples the whole process tree (the
+/// G3/N7 resource measurement recorder. Samples the process tree (the
 /// desktop app plus any host process the caller registers) while a scenario
 /// runs and writes one bounded JSON report. Metrics that were never sampled
 /// are recorded as NOT_RUN — the report never invents numbers.
+///
+/// N7/F14: each sample builds ONE parent map from a bounded process snapshot
+/// and walks it with a single global visit set, so shared descendants are
+/// counted exactly once across roots; the report labels its own coverage
+/// (root_only / full_tree / unknown); samples live in a bounded ring while
+/// count/max/last stay running aggregates; the idle reading is an explicit
+/// scenario mark, never a guess at the last sample.
 /// </summary>
 public sealed class MetricsSession : IAsyncDisposable
 {
     private readonly string _scenario;
     private readonly string _outputPath;
     private readonly List<int> _processIds = [];
-    private readonly List<(TimeSpan At, long WorkingSetBytes)> _samples = [];
+    private readonly SampleRing _samples;
+    private long _sampleCount;
+    private long _peak;
+    private (TimeSpan At, long WorkingSetBytes)? _last;
+    private long? _idle;
+    private TreeCoverage? _lastCoverage;
     private readonly Stopwatch _clock = Stopwatch.StartNew();
     private readonly CancellationTokenSource _cancelled = new();
     private Task? _sampler;
 
-    public MetricsSession(string scenario, string outputPath)
+    /// <summary>N7 test seam: injectable per-sample process snapshot. The
+    /// production path enumerates the OS.</summary>
+    internal Func<ProcessGraph>? SnapshotFactory;
+
+    public MetricsSession(string scenario, string outputPath, int maxRingSamples = 1024)
     {
         _scenario = scenario;
         _outputPath = outputPath;
+        _samples = new SampleRing(maxRingSamples > 0 ? maxRingSamples : 1);
     }
 
-    /// <summary>Registers a process (and its children, discovered per sample)
-    /// whose whole-tree resources are measured.</summary>
+    /// <summary>Registers a process (and its descendants, discovered per
+    /// sample) whose whole-tree resources are measured.</summary>
     public void TrackProcessTree(int rootProcessId)
     {
         lock (_processIds)
@@ -49,68 +86,87 @@ public sealed class MetricsSession : IAsyncDisposable
         });
     }
 
-    private void SampleOnce()
+    /// <summary>Explicitly marks the current moment as the scenario's idle
+    /// reading: the report's idle field is set ONLY by this call, never
+    /// inferred from the last sample (a last sample may be mid-scenario).</summary>
+    public void MarkIdle()
     {
-        long total = 0;
-        var roots = new List<int>();
+        var graph = (SnapshotFactory ?? SnapshotProcesses)();
+        long total;
         lock (_processIds)
         {
-            roots.AddRange(_processIds);
+            total = graph.TotalForRoots(_processIds);
         }
-        foreach (var root in roots)
+        _idle = total;
+    }
+
+    /// <summary>N7 drill observation: how many samples the bounded ring
+    /// currently holds (the report's count keeps growing regardless).</summary>
+    internal int RingCount
+    {
+        get
         {
-            try
+            lock (_samples)
             {
-                var rootProcess = Process.GetProcessById(root);
-                total += TreeWorkingSet(rootProcess);
+                return _samples.Count;
             }
-            catch (ArgumentException)
-            {
-                // A tracked process exited; later samples simply cover less.
-            }
-            catch (InvalidOperationException)
-            {
-            }
-        }
-        lock (_samples)
-        {
-            _samples.Add((_clock.Elapsed, total));
         }
     }
 
-    private static long TreeWorkingSet(Process root)
+    private void SampleOnce()
     {
-        long total = SafeWorkingSet(root);
-        var seen = new HashSet<int> { root.Id };
-        var frontier = new Queue<int>();
-        frontier.Enqueue(root.Id);
-        while (frontier.Count > 0)
+        var graph = (SnapshotFactory ?? SnapshotProcesses)();
+        long total;
+        lock (_processIds)
         {
-            var current = frontier.Dequeue();
-            foreach (var child in Process.GetProcesses())
+            total = graph.TotalForRoots(_processIds);
+        }
+        lock (_samples)
+        {
+            var sample = (_clock.Elapsed, total);
+            _samples.Add(sample);
+            _sampleCount++;
+            if (total > _peak)
             {
-                try
-                {
-                    if (child.Id == current || !seen.Add(child.Id))
-                    {
-                        continue;
-                    }
-                    if (child.Parent()?.Id == current)
-                    {
-                        total += SafeWorkingSet(child);
-                        frontier.Enqueue(child.Id);
-                    }
-                }
-                catch (InvalidOperationException)
-                {
-                }
-                finally
-                {
-                    child.Dispose();
-                }
+                _peak = total;
+            }
+            _last = sample;
+            _lastCoverage = graph.Coverage;
+        }
+    }
+
+    private static ProcessGraph SnapshotProcesses()
+    {
+        var workingSet = new Dictionary<int, long>();
+        var parents = new Dictionary<int, int?>();
+        var enumeratedParents = false;
+        var hadErrors = false;
+        foreach (var process in Process.GetProcesses())
+        {
+            try
+            {
+                workingSet[process.Id] = SafeWorkingSet(process);
+                var parent = process.Parent();
+                parents[process.Id] = parent?.Id;
+                enumeratedParents |= parent is not null;
+            }
+            catch (InvalidOperationException)
+            {
+                // A process vanished between enumeration and its property
+                // reads; its neighbors still produce a (lower-bound) total.
+                hadErrors = true;
+            }
+            finally
+            {
+                process.Dispose();
             }
         }
-        return total;
+        var coverage = !enumeratedParents
+            ? TreeCoverage.RootOnly
+            : hadErrors
+                ? TreeCoverage.Unknown
+                : TreeCoverage.FullTree;
+        return new ProcessGraph(workingSet, parents, coverage);
     }
 
     private static long SafeWorkingSet(Process process)
@@ -139,24 +195,26 @@ public sealed class MetricsSession : IAsyncDisposable
             {
             }
         }
-        long peak = 0;
+        MetricsReport report;
         lock (_samples)
         {
-            peak = _samples.Count > 0 ? _samples.Max(sample => sample.WorkingSetBytes) : 0;
+            report = new MetricsReport
+            {
+                Scenario = _scenario,
+                SampleCount = _sampleCount,
+                PeakTreeWorkingSetBytes = _sampleCount > 0 ? _peak : null,
+                FinalTreeWorkingSetBytes = _last?.WorkingSetBytes,
+                IdleTreeWorkingSetBytes = _idle,
+                DurationMs = (ulong)_clock.ElapsedMilliseconds,
+                Coverage = _lastCoverage,
+            };
         }
-        var report = new MetricsReport
-        {
-            Scenario = _scenario,
-            SampleCount = _samples.Count,
-            PeakTreeWorkingSetBytes = _samples.Count > 0 ? peak : null,
-            DurationMs = (ulong)_clock.ElapsedMilliseconds,
-            IdleTreeWorkingSetBytes = _samples.Count > 0 ? _samples[^1].WorkingSetBytes : null,
-        };
         var json = JsonSerializer.Serialize(report, new JsonSerializerOptions
         {
             WriteIndented = true,
             DefaultIgnoreCondition = JsonIgnoreCondition.WhenWritingNull,
             PropertyNamingPolicy = JsonNamingPolicy.SnakeCaseLower,
+            Converters = { new JsonStringEnumConverter(JsonNamingPolicy.SnakeCaseLower) },
         });
         await File.WriteAllTextAsync(_outputPath, json).ConfigureAwait(false);
         return report;
@@ -179,22 +237,142 @@ public sealed record MetricsReport
     public string Scenario { get; init; } = string.Empty;
 
     [JsonPropertyName("sample_count")]
-    public int SampleCount { get; init; }
+    public long SampleCount { get; init; }
 
     [JsonPropertyName("peak_tree_working_set_bytes")]
     public long? PeakTreeWorkingSetBytes { get; init; }
 
+    /// <summary>The LAST sample of the run, whatever phase it captured. Not
+    /// an idle measurement: the idle field is set only by an explicit
+    /// <see cref="MetricsSession.MarkIdle"/> mark.</summary>
+    [JsonPropertyName("final_tree_working_set_bytes")]
+    public long? FinalTreeWorkingSetBytes { get; init; }
+
+    /// <summary>Set only by an explicit <see cref="MetricsSession.MarkIdle"/>
+    /// call; null means the scenario never marked an idle reading.</summary>
     [JsonPropertyName("idle_tree_working_set_bytes")]
     public long? IdleTreeWorkingSetBytes { get; init; }
+
+    /// <summary>What the last sample's walk actually covered (root_only /
+    /// full_tree / unknown). Null when nothing was sampled.</summary>
+    [JsonPropertyName("tree_coverage")]
+    public TreeCoverage? Coverage { get; init; }
 
     [JsonPropertyName("duration_ms")]
     public ulong DurationMs { get; init; }
 }
 
+/// <summary>One per-sample process snapshot: id → working set, id → parent,
+/// and the honest coverage label derived from how much the platform could
+/// enumerate. Totals walk the children map with ONE local visit set per
+/// call, so a shared descendant is counted exactly once even when several
+/// roots reach it.</summary>
+internal sealed class ProcessGraph
+{
+    private readonly IReadOnlyDictionary<int, long> _workingSet;
+    private readonly IReadOnlyDictionary<int, List<int>> _children;
+
+    public ProcessGraph(
+        IReadOnlyDictionary<int, long> workingSet,
+        IReadOnlyDictionary<int, int?> parents,
+        TreeCoverage coverage)
+    {
+        _workingSet = workingSet;
+        Coverage = coverage;
+        var children = new Dictionary<int, List<int>>();
+        foreach (var (id, parent) in parents)
+        {
+            if (parent is { } parentId && parents.ContainsKey(parentId))
+            {
+                if (!children.TryGetValue(parentId, out var list))
+                {
+                    children[parentId] = list = [];
+                }
+                list.Add(id);
+            }
+        }
+        _children = children;
+    }
+
+    public TreeCoverage Coverage { get; }
+
+    public long TotalForRoots(IReadOnlyList<int> roots)
+    {
+        // One visit set shared across every root: a process reachable from
+        // two roots is counted once, never once per root.
+        var visited = new HashSet<int>();
+        long total = 0;
+        foreach (var root in roots)
+        {
+            if (!visited.Add(root))
+            {
+                continue;
+            }
+            total += _workingSet.GetValueOrDefault(root);
+            if (Coverage == TreeCoverage.RootOnly)
+            {
+                continue; // no parent map on this platform: descendants are not discoverable
+            }
+            var frontier = new Queue<int>();
+            frontier.Enqueue(root);
+            while (frontier.Count > 0)
+            {
+                var current = frontier.Dequeue();
+                if (!_children.TryGetValue(current, out var list))
+                {
+                    continue;
+                }
+                foreach (var child in list)
+                {
+                    if (visited.Add(child))
+                    {
+                        total += _workingSet.GetValueOrDefault(child);
+                        frontier.Enqueue(child);
+                    }
+                }
+            }
+        }
+        return total;
+    }
+}
+
+/// <summary>N7/F14: bounded ring of the most recent samples for diagnosis;
+/// the report's aggregates (count/max/last) are running, so trimming the
+/// ring never loses totals.</summary>
+internal sealed class SampleRing
+{
+    private readonly int _capacity;
+    private readonly (TimeSpan At, long WorkingSetBytes)[] _items;
+    private int _count;
+    private int _head; // index of the oldest live entry
+
+    public SampleRing(int capacity)
+    {
+        _capacity = capacity;
+        _items = new (TimeSpan At, long WorkingSetBytes)[capacity];
+    }
+
+    public int Count => _count;
+
+    public void Add((TimeSpan At, long WorkingSetBytes) sample)
+    {
+        if (_count < _capacity)
+        {
+            _items[(_head + _count) % _capacity] = sample;
+            _count++;
+        }
+        else
+        {
+            _items[_head] = sample;
+            _head = (_head + 1) % _capacity;
+        }
+    }
+}
+
 internal static class ProcessParentExtensions
 {
-    /// <summary>Parent pid via /proc (Unix) or toolhelp-less heuristic-free
-    /// Win32 path; returns null when the platform cannot answer.</summary>
+    /// <summary>Parent pid via /proc (Unix) or heuristic-free Win32 path;
+    /// returns null when the platform cannot answer.</summary>
     public static Process? Parent(this Process process)
     {
         if (OperatingSystem.IsLinux())
@@ -216,7 +394,7 @@ internal static class ProcessParentExtensions
         if (OperatingSystem.IsWindows())
         {
             // NtQueryInformationProcess would be the exact route; without it,
-            // the measurement report records tree metrics as NOT_RUN rather
+            // the measurement report records the coverage as root_only rather
             // than approximating the tree.
             return null;
         }

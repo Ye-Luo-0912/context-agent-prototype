@@ -11,4 +11,8 @@
     <Description>FocusAgent platform client library: C0 session contract DTOs, bounded framing, and local RPC transports. No Avalonia dependency; usable from any .NET host.</Description>
   </PropertyGroup>
 
+  <ItemGroup>
+    <InternalsVisibleTo Include="Agent.Client.Tests" />
+  </ItemGroup>
+
 </Project>

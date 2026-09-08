@@ -194,28 +194,52 @@ public class DeltaCoalescerTests
         Assert.Single(flushed);
         Assert.Equal(new string('x', 9), flushed[0]);
     }
+
+    [Fact]
+    public async Task Time_budget_flushes_without_new_input()
+    {
+        // N7/F14: a short delta followed by silence still flushes on time —
+        // the interval is honored without further Append calls.
+        var flushed = new List<string>();
+        using var coalescer = new DeltaCoalescer(
+            flushed.Add, flushCharBudget: 1_000, flushInterval: TimeSpan.FromMilliseconds(100));
+        coalescer.Append("short");
+        Assert.Empty(flushed);
+        var deadline = DateTimeOffset.UtcNow + TimeSpan.FromSeconds(5);
+        while (flushed.Count == 0 && DateTimeOffset.UtcNow < deadline)
+        {
+            await Task.Delay(20);
+        }
+        Assert.Equal("short", Assert.Single(flushed));
+    }
 }
 
-/// <summary>G3: unmeasured metrics stay NOT_RUN (null), never invented.</summary>
+/// <summary>G3/N7: unmeasured metrics stay NOT_RUN (null), never invented;
+/// the report labels its own coverage and the idle reading is explicit.</summary>
 public class MetricsSessionTests
 {
+    private static string NewPath() =>
+        System.IO.Path.Combine(System.IO.Path.GetTempPath(), $"metrics-{Guid.NewGuid():N}.json");
+
     [Fact]
     public async Task Unsampled_session_reports_null_metrics()
     {
-        var path = System.IO.Path.Combine(System.IO.Path.GetTempPath(), $"metrics-{Guid.NewGuid():N}.json");
+        var path = NewPath();
         var session = new MetricsSession("no-op", path);
         var report = await session.CompleteAsync();
         Assert.Null(report.PeakTreeWorkingSetBytes);
+        Assert.Null(report.FinalTreeWorkingSetBytes);
         Assert.Null(report.IdleTreeWorkingSetBytes);
+        Assert.Null(report.Coverage);
         Assert.Equal(0, report.SampleCount);
         var json = await File.ReadAllTextAsync(path);
         Assert.DoesNotContain("peak_tree_working_set_bytes", json); // null fields are absent, not zero
     }
 
     [Fact]
-    public async Task Tracked_process_produces_finite_samples()
+    public async Task Tracked_process_produces_finite_samples_with_honest_coverage()
     {
-        var path = System.IO.Path.Combine(System.IO.Path.GetTempPath(), $"metrics-{Guid.NewGuid():N}.json");
+        var path = NewPath();
         var session = new MetricsSession("self", path);
         session.TrackProcessTree(Environment.ProcessId);
         session.Start(TimeSpan.FromMilliseconds(50));
@@ -224,5 +248,85 @@ public class MetricsSessionTests
         Assert.True(report.SampleCount >= 1);
         Assert.True(report.PeakTreeWorkingSetBytes > 0);
         Assert.True(File.Exists(path));
+        if (OperatingSystem.IsWindows())
+        {
+            // Windows cannot enumerate parents from this recorder: the label
+            // says root_only — never a fake whole-tree number.
+            Assert.Equal(TreeCoverage.RootOnly, report.Coverage);
+        }
+        else
+        {
+            Assert.NotNull(report.Coverage);
+        }
+    }
+
+    [Fact]
+    public async Task Tree_walk_counts_a_shared_descendant_exactly_once()
+    {
+        // Roots 1 and 2, where 2 is itself a descendant of 1 (2's parent is
+        // 1) and 3 is 2's child. Walking each root independently would count
+        // 2 and 3 twice; the single global visit set counts them once.
+        var path = NewPath();
+        var session = new MetricsSession("tree", path);
+        session.SnapshotFactory = () => new ProcessGraph(
+            new Dictionary<int, long> { [1] = 100, [2] = 40, [3] = 20 },
+            new Dictionary<int, int?> { [1] = null, [2] = 1, [3] = 2 },
+            TreeCoverage.FullTree);
+        session.TrackProcessTree(1);
+        session.TrackProcessTree(2);
+        session.MarkIdle();
+        var report = await session.CompleteAsync();
+        Assert.Equal(160, report.IdleTreeWorkingSetBytes);
+    }
+
+    [Fact]
+    public async Task RootOnly_coverage_on_a_platform_without_parents_is_honest()
+    {
+        var path = NewPath();
+        var session = new MetricsSession("roots", path);
+        // No parent info at all (the Windows shape): descendants cannot be
+        // discovered, so the total is the roots only and the label says so.
+        session.SnapshotFactory = () => new ProcessGraph(
+            new Dictionary<int, long> { [1] = 100, [2] = 50 },
+            new Dictionary<int, int?> { [1] = null, [2] = null },
+            TreeCoverage.RootOnly);
+        session.TrackProcessTree(1);
+        session.MarkIdle();
+        var report = await session.CompleteAsync();
+        Assert.Equal(100, report.IdleTreeWorkingSetBytes); // 2 is not reachable
+    }
+
+    [Fact]
+    public async Task Idle_is_only_set_by_an_explicit_mark()
+    {
+        var path = NewPath();
+        var session = new MetricsSession("idle", path);
+        session.SnapshotFactory = () => new ProcessGraph(
+            new Dictionary<int, long> { [1] = 100 },
+            new Dictionary<int, int?> { [1] = null },
+            TreeCoverage.RootOnly);
+        session.TrackProcessTree(1);
+        session.Start(TimeSpan.FromMilliseconds(50));
+        await Task.Delay(150);
+        var report = await session.CompleteAsync();
+        Assert.NotNull(report.FinalTreeWorkingSetBytes);
+        Assert.Null(report.IdleTreeWorkingSetBytes); // no explicit idle mark
+    }
+
+    [Fact]
+    public async Task Ring_is_bounded_while_the_sample_count_keeps_growing()
+    {
+        var path = NewPath();
+        var session = new MetricsSession("ring", path, maxRingSamples: 4);
+        session.SnapshotFactory = () => new ProcessGraph(
+            new Dictionary<int, long> { [1] = 100 },
+            new Dictionary<int, int?> { [1] = null },
+            TreeCoverage.RootOnly);
+        session.TrackProcessTree(1);
+        session.Start(TimeSpan.FromMilliseconds(20));
+        await Task.Delay(400);
+        var report = await session.CompleteAsync();
+        Assert.True(report.SampleCount >= 6, $"expected >= 6 samples, got {report.SampleCount}");
+        Assert.True(session.RingCount <= 4, $"the ring must stay bounded, holds {session.RingCount}");
     }
 }

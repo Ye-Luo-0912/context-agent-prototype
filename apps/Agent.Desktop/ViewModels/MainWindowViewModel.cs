@@ -895,6 +895,7 @@ public sealed class MainWindowViewModel : ObservableObject, IAsyncDisposable
         var connection = _connection;
         _connection = null;
         _deltaCoalescer?.Flush();
+        _deltaCoalescer?.Dispose(); // stop the pending flush timer (N7)
         _deltaCoalescer = null;
         if (connection is not null)
         {
