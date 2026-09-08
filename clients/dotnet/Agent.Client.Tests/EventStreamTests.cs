@@ -802,4 +802,83 @@ public class BoundedEventQueuePolicyTests
             () => queue.Reader.WaitToReadAsync(CancellationToken.None).AsTask());
         Assert.Same(reason, failure);
     }
+
+    /// <summary>B2 QUEUE-COMPLETION: Reader.Completion is the channel
+    /// contract — pending on a live queue (empty or not, drained or not, as
+    /// long as writes are still possible), never already-complete.</summary>
+    [Fact]
+    public void Reader_completion_stays_pending_while_the_queue_is_live()
+    {
+        var queue = new BoundedEventQueue(4);
+        Assert.False(queue.Reader.Completion.IsCompleted); // empty, writable
+        queue.TryEnqueue(Terminal(1));
+        Assert.False(queue.Reader.Completion.IsCompleted); // readable, writable
+        Assert.True(queue.Reader.TryRead(out _));
+        Assert.False(queue.Reader.Completion.IsCompleted); // drained, writable
+    }
+
+    /// <summary>B2 QUEUE-COMPLETION: closing the write side defers the
+    /// completion task until the backlog is drained — it settles on the
+    /// LAST read, not on the close.</summary>
+    [Fact]
+    public void Reader_completion_settles_on_the_last_read_after_close()
+    {
+        var queue = new BoundedEventQueue(4);
+        queue.TryEnqueue(Terminal(1));
+        queue.TryEnqueue(Terminal(2));
+        Assert.True(queue.TryComplete());
+        Assert.False(queue.Reader.Completion.IsCompleted); // backlog remains
+        Assert.True(queue.Reader.TryRead(out _));
+        Assert.False(queue.Reader.Completion.IsCompleted); // one item remains
+        Assert.True(queue.Reader.TryRead(out _));
+        Assert.True(queue.Reader.Completion.IsCompleted); // drained: settled
+    }
+
+    /// <summary>B2 QUEUE-COMPLETION: a close that finds the queue empty
+    /// settles the completion task immediately — write side closed, no
+    /// backlog, nothing further to read.</summary>
+    [Fact]
+    public void Reader_completion_settles_immediately_when_close_finds_an_empty_queue()
+    {
+        var queue = new BoundedEventQueue(4);
+        Assert.True(queue.TryComplete());
+        Assert.True(queue.Reader.Completion.IsCompleted);
+    }
+
+    /// <summary>B2 QUEUE-COMPLETION: the completion task faults with the
+    /// queue's own error only after the backlog has been drained — the fault
+    /// is observed by a Completion waiter, not swallowed.</summary>
+    [Fact]
+    public async Task Reader_completion_faults_with_the_reason_after_drain()
+    {
+        var queue = new BoundedEventQueue(4);
+        queue.TryEnqueue(Terminal(1));
+        var reason = new AgentContractViolationException("drill", "terminal overflow");
+        queue.TryComplete(reason);
+        Assert.False(queue.Reader.Completion.IsCompleted); // backlog first
+        Assert.True(queue.Reader.TryRead(out _));
+        var failure = await Assert.ThrowsAsync<AgentContractViolationException>(
+            () => queue.Reader.Completion);
+        Assert.Same(reason, failure);
+    }
+
+    /// <summary>B2 QUEUE-COMPLETION on the B1 reset boundary: Clear drops
+    /// the backlog of a completed-but-undrained queue, which counts as
+    /// drained — the deferred completion settles. On a live queue Clear
+    /// leaves it pending (the stream stays open for the next connection).</summary>
+    [Fact]
+    public void Clear_settles_a_completed_queue_and_leaves_a_live_one_pending()
+    {
+        var completed = new BoundedEventQueue(4);
+        completed.TryEnqueue(Terminal(1));
+        Assert.True(completed.TryComplete());
+        Assert.False(completed.Reader.Completion.IsCompleted); // backlog remains
+        Assert.Equal(1, completed.Clear());
+        Assert.True(completed.Reader.Completion.IsCompleted); // dropped = drained
+
+        var live = new BoundedEventQueue(4);
+        live.TryEnqueue(Terminal(1));
+        Assert.Equal(1, live.Clear());
+        Assert.False(live.Reader.Completion.IsCompleted); // still writable
+    }
 }

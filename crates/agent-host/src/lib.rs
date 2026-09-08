@@ -1284,6 +1284,108 @@ mod tests {
         assert!(forward_against_watermark(&delta(0), 0));
     }
 
+    /// B2 RETYPED: the retype step must carry the ORIGINAL envelope's work
+    /// identity through to the router's validators — a run-scoped request
+    /// that arrived carrying a tool-operation work identity is rejected by
+    /// them (the validator's own contract), not silently cleaned into a
+    /// legal request by the retype.
+    #[test]
+    fn retyped_preserves_the_original_work_identity_for_validation() {
+        let message_id = MessageId::new();
+        let work = agent_platform_protocol::WorkIdentity {
+            run_id: agent_contracts::RunId::new(),
+            task_id: None,
+            turn_id: None,
+            scope_id: None,
+            operation_id: agent_contracts::OperationId::new(),
+            generation: 0,
+            attempt: agent_platform_protocol::Attempt::new(1).unwrap(),
+            call_id: None,
+            effect_id: None,
+            argument_digest: agent_platform_protocol::ArgumentDigest::from_bytes([0x22; 32]),
+            deadline_remaining_ms: agent_platform_protocol::DeadlineRemainingMs::new(30_000)
+                .unwrap(),
+            authority_ref: None,
+        };
+        let request = PlatformEnvelope {
+            protocol: ProtocolIdentity {
+                name: "focus-agent.platform".into(),
+                version: agent_platform_protocol::ProtocolVersion { major: 1, minor: 0 },
+                active_features: agent_platform_protocol::ActiveFeatures::default(),
+                schema_digest: session_schema_digest(),
+            },
+            message_id,
+            request_id: Some(agent_platform_protocol::RequestId::new()),
+            kind: EnvelopeKind::Request,
+            route: Route::work_submit(),
+            work: Some(work),
+            causality: Causality::root(message_id),
+            payload: serde_json::json!({
+                "goal": "retyped drill",
+                "client_request_id": "retyped-1",
+            }),
+        };
+
+        let retyped: PlatformEnvelope<WorkSubmitRequest> = retyped(&request).unwrap();
+        // The identity the client actually sent is what the validator sees.
+        assert_eq!(retyped.work, request.work);
+        let profile = negotiated_profile().unwrap();
+        assert!(
+            agent_platform_protocol::validate_work_submit_request(&profile, &retyped).is_err(),
+            "a run-scoped request carrying a work identity must be rejected by the validator"
+        );
+    }
+
+    /// B2 CANCEL-ALL: interrupting the connections must not empty the live
+    /// table — a stop request is not a worker exit. The hook fires, the
+    /// entry stays, and only the worker's own removal makes `wait_empty`
+    /// report completion; interrupting alone never does.
+    #[test]
+    fn cancel_all_keeps_the_registry_until_workers_remove_their_own_entries() {
+        let live = LiveStreams::new();
+        let interrupted = Arc::new(AtomicBool::new(false));
+        let seen = Arc::clone(&interrupted);
+        let id = live.insert(Arc::new(move || {
+            seen.store(true, Ordering::SeqCst);
+        }));
+        assert_eq!(live.len(), 1);
+
+        live.cancel_all();
+        assert!(
+            interrupted.load(Ordering::SeqCst),
+            "the connection's pending I/O was interrupted"
+        );
+        // The entry survives the interrupt: an emptied table would let
+        // wait_empty fake completion the moment the hooks fire.
+        assert_eq!(live.len(), 1);
+        assert!(
+            !live.wait_empty(Duration::from_millis(20)),
+            "an interrupted-but-unwound worker is not an exited one"
+        );
+
+        // The worker unwinds and removes its own entry: only now is the
+        // table empty.
+        live.remove(id);
+        assert!(live.wait_empty(Duration::from_millis(20)));
+    }
+
+    /// B2 CANCEL-ALL: a wedged worker keeps drain bounded and leaves the
+    /// unconfirmed entry visible in the table — the timeout reports an
+    /// explicit residue, it never empties the registry to fake completion.
+    #[test]
+    fn drain_leaves_a_wedged_worker_as_visible_residue() {
+        let live = LiveStreams::new();
+        live.insert(Arc::new(|| {}));
+        // The "worker" never unwinds: drain stays bounded (two tiny graces)
+        // and the residue stays countable.
+        live.drain(Duration::from_millis(20));
+        assert_eq!(
+            live.len(),
+            1,
+            "a wedged worker must stay visible as unconfirmed residue"
+        );
+    }
+
     #[test]
     fn workspace_endpoint_suffix_is_stable_and_discriminating() {
         let alpha = std::path::Path::new("/workspaces/alpha");

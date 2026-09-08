@@ -1124,6 +1124,81 @@ async fn slow_subscriber_never_blocks_service_or_stop(
     Ok(())
 }
 
+/// B2 RETYPED: a run-scoped request that arrives carrying a tool-operation
+/// work identity gets the structured protocol rejection — the retype step
+/// must hand the validator the envelope the client actually sent, not a
+/// cleaned copy. The rejection is a paired response on the same connection,
+/// which stays usable afterwards.
+async fn run_scoped_request_with_work_identity_is_rejected(
+    endpoint: LocalEndpoint,
+) -> anyhow::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let fixture = compose_workspace(dir.path()).await?;
+    fixture.composed.instance.start().await?;
+    let server = start_server(&fixture, endpoint, true).await?;
+
+    let mut stream = connect(&server.endpoint).await;
+    let mut carrying_work = request(
+        "work",
+        "submit",
+        WorkSubmitRequest {
+            goal: "host e2e: retyped envelope drill".into(),
+            client_request_id: "e2e-retyped-1".into(),
+        },
+    );
+    carrying_work.work = Some(agent_platform_protocol::WorkIdentity {
+        run_id: agent_contracts::RunId::new(),
+        task_id: None,
+        turn_id: None,
+        scope_id: None,
+        operation_id: agent_contracts::OperationId::new(),
+        generation: 0,
+        attempt: agent_platform_protocol::Attempt::new(1).unwrap(),
+        call_id: None,
+        effect_id: None,
+        argument_digest: agent_platform_protocol::ArgumentDigest::from_bytes([0x22; 32]),
+        deadline_remaining_ms: agent_platform_protocol::DeadlineRemainingMs::new(30_000).unwrap(),
+        authority_ref: None,
+    });
+
+    let rejected = exchange::<_, _, serde_json::Value>(&mut stream, &carrying_work)?;
+    match rejected {
+        PlatformResponse::Error { error } => {
+            assert_eq!(
+                error.class,
+                agent_platform_protocol::PlatformErrorClass::Protocol
+            );
+            assert_eq!(error.code, "protocol.request_invalid");
+            assert!(
+                error.message.contains("run-scoped"),
+                "the rejection must name the run-scoped work violation: {}",
+                error.message
+            );
+        }
+        PlatformResponse::Success { .. } => {
+            panic!("a run-scoped request carrying a work identity must be rejected")
+        }
+    }
+
+    // The structured rejection is not a teardown: the same connection keeps
+    // serving legal requests (and the rejected goal was never admitted).
+    let snapshot = expect_value(exchange::<_, _, WorkSnapshotResponse>(
+        &mut stream,
+        &request("work", "snapshot", WorkSnapshotRequest {}),
+    )?);
+    assert!(
+        snapshot.focus.is_none(),
+        "the rejected submission must not have created a focus"
+    );
+
+    drop(stream);
+    fixture.composed.shutdown().await?;
+    let (elapsed, registry) = stop_and_join_bounded(server, BOUNDED_STOP).await?;
+    eprintln!("stop after the retyped drill took {elapsed:?}");
+    assert_registry_drained(&registry).await;
+    Ok(())
+}
+
 // multi_thread on purpose: the client side of this drill uses blocking
 // std IO; on the default current_thread test runtime that would freeze the
 // whole runtime and deadlock the server-side block_on calls.
@@ -1353,6 +1428,27 @@ async fn named_pipe_slow_subscriber_never_blocks_service_or_stop() {
 async fn unix_socket_slow_subscriber_never_blocks_service_or_stop() {
     slow_subscriber_never_blocks_service_or_stop(LocalEndpoint::UnixSocket(
         std::env::temp_dir().join(format!("focus-agent-e2e-slow-{}.sock", uuid_like())),
+    ))
+    .await
+    .unwrap();
+}
+
+#[cfg(windows)]
+#[tokio::test(flavor = "multi_thread")]
+async fn named_pipe_run_scoped_request_with_work_identity_is_rejected() {
+    run_scoped_request_with_work_identity_is_rejected(LocalEndpoint::NamedPipe(format!(
+        "focus-agent-e2e-retyped-{}",
+        uuid_like()
+    )))
+    .await
+    .unwrap();
+}
+
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread")]
+async fn unix_socket_run_scoped_request_with_work_identity_is_rejected() {
+    run_scoped_request_with_work_identity_is_rejected(LocalEndpoint::UnixSocket(
+        std::env::temp_dir().join(format!("focus-agent-e2e-retyped-{}.sock", uuid_like())),
     ))
     .await
     .unwrap();
