@@ -813,6 +813,88 @@ async fn inspect_is_bounded_and_oldest_first() {
     assert_eq!(summaries[2].created_turn, 3);
 }
 
+/// F18: `inspect(0)` takes the early-exit path — an empty catalog with no
+/// projection work at all, whatever the heap, the warm buffer and the
+/// store hold.
+#[tokio::test]
+async fn inspect_zero_limit_projects_nothing() {
+    let engine = SimpleContextEngine::new(SimpleContextConfig::default());
+    for i in 0..5 {
+        engine
+            .ingest(ContextIngress::UserMessage {
+                content: format!("message {i}"),
+            })
+            .await
+            .unwrap();
+    }
+    assert!(engine.inspect(0).await.unwrap().is_empty());
+}
+
+/// F18: the bounded catalog is a lazy projection over heap, warm buffer
+/// and store, with the pre-refactor order preserved: `inspect(limit)`
+/// returns exactly the `limit` smallest created_ticks across *all* body
+/// locations, ascending — the result equals a stable sort of the full
+/// catalog truncated to `limit`.
+#[tokio::test]
+async fn inspect_small_limit_matches_the_sorted_full_catalog_across_locations() {
+    let store = tempfile::tempdir().unwrap();
+    let engine = SimpleContextEngine::new(SimpleContextConfig {
+        // The tiny buffer overflows on the first GC pass, so the catalog
+        // spans Resident, Warm and Stored rows.
+        gc_buffer_capacity: 2,
+        gc_max_generation: 0,
+        context_store_dir: Some(store.path().to_path_buf()),
+        ..SimpleContextConfig::default()
+    });
+    open_focus(&engine, "catalog work").await;
+    for i in 0..6 {
+        engine
+            .ingest(ContextIngress::UserMessage {
+                content: format!("catalog row {i} Ticket{i}.rs"),
+            })
+            .await
+            .unwrap();
+    }
+    engine
+        .maintain(ContextMaintenanceTrigger::AfterModel)
+        .await
+        .unwrap();
+    // Leave the episode: the old rows cool out of the working set and the
+    // first GC pass evicts them, overflowing the tiny buffer to the store.
+    open_focus(&engine, "other work").await;
+    engine
+        .ingest(ContextIngress::UserMessage {
+            content: "something else entirely".into(),
+        })
+        .await
+        .unwrap();
+    engine
+        .maintain(ContextMaintenanceTrigger::AfterModel)
+        .await
+        .unwrap();
+    engine.gc().await.unwrap();
+    {
+        let state = engine.state.lock().await;
+        assert!(
+            !state.eviction_buffer.is_empty() || !state.external.is_empty(),
+            "the catalog must span more than the heap for this test to bite"
+        );
+    }
+
+    let full = engine.inspect(usize::MAX).await.unwrap();
+    assert!(full.len() >= 4, "a real catalog: {}", full.len());
+    let mut expected: Vec<u64> = full.iter().map(|s| s.created_tick).collect();
+    expected.sort();
+
+    let limited = engine.inspect(4).await.unwrap();
+    let got: Vec<u64> = limited.iter().map(|s| s.created_tick).collect();
+    assert_eq!(
+        got,
+        expected[..4],
+        "the limit picks the oldest rows ascending"
+    );
+}
+
 #[tokio::test]
 async fn completed_task_working_set_is_archived_and_stays_out() {
     let engine = SimpleContextEngine::new(SimpleContextConfig::default());
@@ -935,6 +1017,137 @@ async fn later_decision_supersedes_earlier_decision() {
         !working.contains("use TOML for config"),
         "superseded decision leaked back into the working context"
     );
+}
+
+/// F15: two compatible decisions about the same file share the semantic key
+/// but withdraw nothing — "use X with a timeout" and "use X with logging"
+/// must coexist. Entity overlap alone is a relevance signal, never proof,
+/// and plain "use" carries no replacement cue.
+#[tokio::test]
+async fn compatible_decisions_about_one_file_coexist() {
+    let engine = SimpleContextEngine::new(SimpleContextConfig::default());
+    engine
+        .ingest(ContextIngress::UserMessage {
+            content: "use AuthService.rs with a 5-second timeout".into(),
+        })
+        .await
+        .unwrap();
+    engine
+        .ingest(ContextIngress::UserMessage {
+            content: "use AuthService.rs with structured logging".into(),
+        })
+        .await
+        .unwrap();
+    let report = engine
+        .maintain(ContextMaintenanceTrigger::UserInput)
+        .await
+        .unwrap();
+    assert!(
+        report
+            .transitions
+            .iter()
+            .all(|t| !t.reason.contains("superseded by decision")),
+        "compatible decisions must not supersede each other: {:?}",
+        report
+            .transitions
+            .iter()
+            .map(|t| &t.reason)
+            .collect::<Vec<_>>()
+    );
+    let state = engine.state.lock().await;
+    let decisions: Vec<_> = state
+        .items
+        .iter()
+        .filter(|item| item.content.contains("AuthService.rs"))
+        .collect();
+    assert_eq!(decisions.len(), 2, "both decisions exist");
+    assert!(
+        decisions.iter().all(|item| item.semantic.is_live()),
+        "neither decision may be finalized: {:?}",
+        decisions
+            .iter()
+            .map(|item| item.semantic)
+            .collect::<Vec<_>>()
+    );
+}
+
+/// F15: a decision from another task never finalizes this task's decision,
+/// even when the message names the same file and carries an explicit
+/// replacement cue. Only the same task context can prove a replacement.
+#[tokio::test]
+async fn cross_task_entity_overlap_does_not_supersede_decisions() {
+    let engine = SimpleContextEngine::new(SimpleContextConfig::default());
+    let task_a = open_focus(&engine, "auth work").await;
+    engine
+        .ingest(ContextIngress::UserMessage {
+            content: "use AuthService.rs for login".into(),
+        })
+        .await
+        .unwrap();
+    let _task_b = open_focus(&engine, "billing work").await;
+    engine
+        .ingest(ContextIngress::UserMessage {
+            content: "drop AuthService.rs from the plan".into(),
+        })
+        .await
+        .unwrap();
+    engine
+        .maintain(ContextMaintenanceTrigger::UserInput)
+        .await
+        .unwrap();
+    let state = engine.state.lock().await;
+    let login_decision = state
+        .items
+        .iter()
+        .find(|item| item.task_id == Some(task_a) && item.content.contains("use AuthService.rs"))
+        .expect("task A's decision exists");
+    assert!(
+        login_decision.semantic.is_live(),
+        "another task's decision must not finalize task A's decision, got {:?}",
+        login_decision.semantic
+    );
+}
+
+/// F15: an explicit replacement ("switch to Y instead of X") of the same
+/// task supersedes the older line, and the Superseded state names the
+/// replacing decision (`by`).
+#[tokio::test]
+async fn explicit_replacement_supersedes_and_names_the_replacement() {
+    let engine = SimpleContextEngine::new(SimpleContextConfig::default());
+    engine
+        .ingest(ContextIngress::UserMessage {
+            content: "use TOML for config".into(),
+        })
+        .await
+        .unwrap();
+    engine
+        .ingest(ContextIngress::UserMessage {
+            content: "switch to YAML instead of TOML".into(),
+        })
+        .await
+        .unwrap();
+    engine
+        .maintain(ContextMaintenanceTrigger::UserInput)
+        .await
+        .unwrap();
+    let state = engine.state.lock().await;
+    let old = state
+        .items
+        .iter()
+        .find(|item| item.content == "use TOML for config")
+        .expect("the replaced decision stays addressable");
+    let new = state
+        .items
+        .iter()
+        .find(|item| item.content == "switch to YAML instead of TOML")
+        .expect("the replacing decision exists");
+    assert_eq!(
+        old.semantic,
+        agent_contracts::SemanticState::Superseded { by: Some(new.id) },
+        "the old decision must be superseded by the new one, got {:?}",
+        old.semantic
+    );
+    assert!(new.semantic.is_live(), "the replacement stays live");
 }
 
 #[tokio::test]

@@ -5,7 +5,7 @@ use agent_contracts::{
 
 use crate::engine::State;
 use crate::index::entity::{
-    entities_match, extract_entities, is_file_body_entry, is_file_body_observation,
+    entities_match_exact, extract_entities, is_file_body_entry, is_file_body_observation,
     observation_file_path,
 };
 
@@ -30,6 +30,27 @@ pub(crate) fn classify_decision(text: &str) -> bool {
     KEYWORDS.iter().any(|keyword| lower.contains(keyword))
 }
 
+/// Cues that make the replacement of an earlier decision *explicit*. A
+/// plain "use X" / "prefer X" / "adopt X" adds a constraint next to the
+/// existing ones; these cues say the earlier line is being withdrawn
+/// ("switch to Y instead of X", "use Y instead", "drop the TOML decision",
+/// "actually, no, ..."). Keyword based and explainable, like
+/// `classify_decision`.
+fn has_replacement_cue(text: &str) -> bool {
+    const CUES: &[&str] = &[
+        "instead",
+        "replace",
+        "revert",
+        "switch",
+        "drop ",
+        "remove ",
+        "no, ",
+        "actually ",
+    ];
+    let lower = text.to_lowercase();
+    CUES.iter().any(|cue| lower.contains(cue))
+}
+
 /// True when the item is permanently excluded from model requests: a
 /// superseded decision or a verified-fixed error, whatever its score. The
 /// semantic state is authoritative; the legacy lifecycle labels are only
@@ -42,20 +63,35 @@ pub(crate) fn is_excluded(item: &ContextItem) -> bool {
         })
 }
 
-/// Queue supersession for every live decision item that shares an entity
-/// with the incoming decision. `by_id` is the new decision's id: it both
-/// excludes the new item itself and becomes the `by` of the Superseded
-/// semantic state. The scan covers the heap, the warm buffer and the
-/// external map, so an earlier decision is superseded wherever its body
-/// currently sits.
+/// Queue supersession of an earlier decision, but only when the incoming
+/// decision *proves* it replaces that specific line (F15): the same task
+/// context, an explicit replacement cue in the message, and the same
+/// semantic key — an exact path/symbol identity (`entities_match_exact`),
+/// not substring affinity. Entity overlap alone is a relevance signal, not
+/// proof: two compatible decisions about one file ("use AuthService.rs with
+/// a 5-second timeout", "use AuthService.rs with structured logging") share
+/// the key but withdraw nothing, so both stay live, and a decision from
+/// another task never finalizes one from this task even on a full key
+/// match. When no proof exists nothing is queued — the older decision keeps
+/// its state and decays through the ordinary relevance scorer; attention is
+/// deliberately not demoted here, because that would be a second unproven
+/// judgment.
+///
+/// `by_id` is the new decision's id: it excludes the new item itself and
+/// becomes the `by` of the Superseded semantic state. `task_id` is the new
+/// decision's task context (session-level messages carry `None`; two
+/// session-level decisions share that one context). The scan covers the
+/// heap, the warm buffer and the external map, so a proven replacement
+/// supersedes the earlier decision wherever its body currently sits.
 pub(crate) fn queue_decision_supersessions(
     state: &mut State,
     content: &str,
     reason_prefix: &str,
     by_id: ContextItemId,
+    task_id: Option<agent_contracts::TaskId>,
 ) {
     let entities = extract_entities(content);
-    if entities.is_empty() {
+    if entities.is_empty() || !has_replacement_cue(content) {
         return;
     }
     let is_decision = |item: &ContextItem| {
@@ -63,10 +99,15 @@ pub(crate) fn queue_decision_supersessions(
             || item.tags.iter().any(|tag| tag.is_core(CoreLabel::Decision))
     };
     let matches = |item: &ContextItem| -> bool {
-        item.id != by_id && is_decision(item) && !item.semantic.is_dead() && !is_excluded(item)
+        item.id != by_id
+            && is_decision(item)
+            && !item.semantic.is_dead()
+            && !is_excluded(item)
+            && item.task_id == task_id
+            && entities_match_exact(&entities, &item.entities)
     };
     for item in &mut state.items {
-        if !matches(item) || !entities_match(&entities, &item.entities) {
+        if !matches(item) {
             continue;
         }
         let snippet: String = item.content.chars().take(60).collect();
@@ -75,7 +116,7 @@ pub(crate) fn queue_decision_supersessions(
             .push((item.id, by_id, format!("{reason_prefix}: '{snippet}'")));
     }
     for item in &mut state.eviction_buffer {
-        if !matches(item) || !entities_match(&entities, &item.entities) {
+        if !matches(item) {
             continue;
         }
         let snippet: String = item.content.chars().take(60).collect();
@@ -89,16 +130,19 @@ pub(crate) fn queue_decision_supersessions(
                 .tags
                 .iter()
                 .any(|tag| tag.is_core(CoreLabel::Decision));
-        if entry.item_id == by_id || !decision || entry.semantic.is_dead() {
+        if entry.item_id == by_id
+            || !decision
+            || entry.semantic.is_dead()
+            || entry.task_id != task_id
+            || !entities_match_exact(&entities, &entry.entities)
+        {
             continue;
         }
-        if entities_match(&entities, &entry.entities) {
-            state.pending_supersessions.push((
-                entry.item_id,
-                by_id,
-                format!("{reason_prefix}: stored decision"),
-            ));
-        }
+        state.pending_supersessions.push((
+            entry.item_id,
+            by_id,
+            format!("{reason_prefix}: stored decision"),
+        ));
     }
 }
 

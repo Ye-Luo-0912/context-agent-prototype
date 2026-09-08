@@ -515,3 +515,354 @@ async fn keep_alive_quota_counts_warm_items() {
         "the warm item must consume the quota, got {refused}"
     );
 }
+
+/// F16: expiry protection is one predicate across body locations. A leased
+/// ephemeral observation (not pinned, not a file-body root) must survive
+/// the *resident* TTL path until the lease expires — the resident path used
+/// to skip the keep_alive/lease check the warm-buffer aging path applies to
+/// the same item. An expired lease protects nothing.
+#[tokio::test]
+async fn lease_defers_resident_ttl_death_until_it_expires() {
+    let engine = SimpleContextEngine::new(SimpleContextConfig::default());
+    let observation_id = consumed_observation_outside_focus(&engine).await;
+    // state.turn == 1; the lease covers turns 2..=9.
+    engine
+        .ingest(ContextIngress::ContextDirective {
+            action: ContextAction::Lease {
+                item_id: observation_id,
+                turns: 8,
+            },
+        })
+        .await
+        .unwrap();
+
+    // Walk past the ephemeral TTL (5 turns). The AfterTool trigger reaches
+    // the resident TTL branch directly (AfterModel only archives a consumed
+    // observation), so an unprotected item tombstones here.
+    for _ in 0..6 {
+        engine
+            .ingest(ContextIngress::UserMessage {
+                content: "unrelated turn".into(),
+            })
+            .await
+            .unwrap();
+        engine
+            .maintain(ContextMaintenanceTrigger::AfterTool)
+            .await
+            .unwrap();
+    }
+    {
+        let state = engine.state.lock().await;
+        let item = state
+            .items
+            .iter()
+            .find(|item| item.id == observation_id)
+            .expect("the leased observation stays resident");
+        assert!(
+            item.semantic.is_live(),
+            "a lease defers the resident TTL death, got {:?}",
+            item.semantic
+        );
+    }
+
+    // One turn past the lease, the item terminates normally.
+    for _ in 0..3 {
+        engine
+            .ingest(ContextIngress::UserMessage {
+                content: "one more turn".into(),
+            })
+            .await
+            .unwrap();
+        engine
+            .maintain(ContextMaintenanceTrigger::AfterTool)
+            .await
+            .unwrap();
+    }
+    let state = engine.state.lock().await;
+    let item = state
+        .items
+        .iter()
+        .find(|item| item.id == observation_id)
+        .expect("the item stays addressable");
+    assert!(
+        !item.semantic.is_live(),
+        "an expired lease protects nothing, got {:?}",
+        item.semantic
+    );
+}
+
+/// F16: the same predicate guards the resident staleness branch (ttl x 4).
+/// A leased Working item that scores below the archive floor survives past
+/// the staleness window while resident — it used to be tombstoned there
+/// while a copy sitting in the warm buffer survived the same trigger — and
+/// terminates once the lease expires.
+#[tokio::test]
+async fn lease_defers_resident_staleness_death_until_it_expires() {
+    let engine = SimpleContextEngine::new(SimpleContextConfig::default());
+    engine
+        .ingest(ContextIngress::UserMessage {
+            content: "fix the build".into(),
+        })
+        .await
+        .unwrap();
+    engine
+        .ingest(ContextIngress::AssistantMessage {
+            content: "looking into it".into(),
+        })
+        .await
+        .unwrap();
+    let failure_id = {
+        let state = engine.state.lock().await;
+        state
+            .items
+            .iter()
+            .find(|item| item.kind == ContextKind::AssistantMessage)
+            .expect("the assistant message")
+            .id
+    };
+    // state.turn == 1; the lease covers turns 2..=25 (past ttl x 4 = 20).
+    engine
+        .ingest(ContextIngress::ContextDirective {
+            action: ContextAction::Lease {
+                item_id: failure_id,
+                turns: 24,
+            },
+        })
+        .await
+        .unwrap();
+
+    // Walk to age 21 turns: past the staleness window, still inside the
+    // lease. The staleness branch must defer to the lease.
+    for _ in 0..21 {
+        engine
+            .ingest(ContextIngress::UserMessage {
+                content: "unrelated turn".into(),
+            })
+            .await
+            .unwrap();
+        engine
+            .maintain(ContextMaintenanceTrigger::AfterModel)
+            .await
+            .unwrap();
+    }
+    {
+        let state = engine.state.lock().await;
+        let item = state
+            .items
+            .iter()
+            .find(|item| item.id == failure_id)
+            .expect("the leased item stays resident");
+        assert!(
+            item.semantic.is_live(),
+            "a lease defers the resident staleness death, got {:?}",
+            item.semantic
+        );
+    }
+
+    // Past the lease (turn 26 > 25), the stale item terminates normally.
+    for _ in 0..4 {
+        engine
+            .ingest(ContextIngress::UserMessage {
+                content: "one more turn".into(),
+            })
+            .await
+            .unwrap();
+        engine
+            .maintain(ContextMaintenanceTrigger::AfterModel)
+            .await
+            .unwrap();
+    }
+    let state = engine.state.lock().await;
+    let item = state
+        .items
+        .iter()
+        .find(|item| item.id == failure_id)
+        .expect("the item stays addressable");
+    assert!(
+        !item.semantic.is_live(),
+        "an expired lease protects nothing, got {:?}",
+        item.semantic
+    );
+}
+
+/// F16: the warm-buffer aging path uses the same expiry protection as the
+/// resident path — a leased item in the reversible buffer survives past the
+/// TTL and terminates once the lease expires.
+#[tokio::test]
+async fn lease_defers_warm_aging_until_it_expires() {
+    let engine = SimpleContextEngine::new(SimpleContextConfig::default());
+    let observation_id = consumed_observation_outside_focus(&engine).await;
+    // No protection yet: the first GC pass evicts it into the buffer.
+    let report = engine.gc().await.unwrap();
+    assert!(report.evicted >= 1, "baseline: the observation evicts");
+
+    // Directives reach buffer items: the lease protects it there too.
+    engine
+        .ingest(ContextIngress::ContextDirective {
+            action: ContextAction::Lease {
+                item_id: observation_id,
+                turns: 8,
+            },
+        })
+        .await
+        .unwrap();
+
+    for _ in 0..7 {
+        engine
+            .ingest(ContextIngress::UserMessage {
+                content: "unrelated turn".into(),
+            })
+            .await
+            .unwrap();
+        engine
+            .maintain(ContextMaintenanceTrigger::AfterModel)
+            .await
+            .unwrap();
+    }
+    {
+        let state = engine.state.lock().await;
+        let item = state
+            .eviction_buffer
+            .iter()
+            .find(|item| item.id == observation_id)
+            .expect("the leased item stays in the warm buffer");
+        assert!(
+            item.semantic.is_live(),
+            "a lease defers warm aging, got {:?}",
+            item.semantic
+        );
+    }
+
+    engine
+        .ingest(ContextIngress::UserMessage {
+            content: "one more turn".into(),
+        })
+        .await
+        .unwrap();
+    engine
+        .ingest(ContextIngress::UserMessage {
+            content: "and another".into(),
+        })
+        .await
+        .unwrap();
+    engine
+        .maintain(ContextMaintenanceTrigger::AfterModel)
+        .await
+        .unwrap();
+    let state = engine.state.lock().await;
+    let item = state
+        .eviction_buffer
+        .iter()
+        .find(|item| item.id == observation_id)
+        .expect("the item stays addressable in the buffer");
+    assert!(
+        !item.semantic.is_live(),
+        "an expired lease protects nothing in the warm buffer, got {:?}",
+        item.semantic
+    );
+}
+
+/// F16: expiry protection is deferral, never resurrection. keep_alive and
+/// a lease on a superseded decision neither revive it (resident or warm)
+/// nor overwrite its terminal semantic state.
+#[tokio::test]
+async fn expiry_protection_never_revives_terminal_items() {
+    use agent_contracts::{AttentionState, SemanticState};
+
+    let engine = SimpleContextEngine::new(SimpleContextConfig::default());
+    engine
+        .ingest(ContextIngress::UserMessage {
+            content: "use TOML for config".into(),
+        })
+        .await
+        .unwrap();
+    engine
+        .ingest(ContextIngress::UserMessage {
+            content: "use YAML instead of TOML".into(),
+        })
+        .await
+        .unwrap();
+    engine
+        .maintain(ContextMaintenanceTrigger::UserInput)
+        .await
+        .unwrap();
+    let old_id = {
+        let state = engine.state.lock().await;
+        state
+            .items
+            .iter()
+            .find(|item| item.content == "use TOML for config")
+            .expect("the replaced decision")
+            .id
+    };
+
+    // Full model protection on the dead item while it is resident: the
+    // residency machine must not overwrite the terminal state.
+    for action in [
+        ContextAction::GcHint {
+            item_id: old_id,
+            keep_alive: true,
+        },
+        ContextAction::Lease {
+            item_id: old_id,
+            turns: 32,
+        },
+    ] {
+        engine
+            .ingest(ContextIngress::ContextDirective { action })
+            .await
+            .unwrap();
+    }
+    engine
+        .maintain(ContextMaintenanceTrigger::AfterModel)
+        .await
+        .unwrap();
+    {
+        let state = engine.state.lock().await;
+        let item = state
+            .items
+            .iter()
+            .find(|item| item.id == old_id)
+            .expect("the dead decision stays addressable");
+        assert_eq!(
+            item.semantic,
+            SemanticState::Superseded {
+                by: state
+                    .items
+                    .iter()
+                    .find(|item| item.content.contains("YAML"))
+                    .map(|item| item.id)
+            },
+            "protection must not overwrite a terminal semantic state"
+        );
+        assert_eq!(
+            item.attention,
+            AttentionState::Archived,
+            "a dead item stays archived whatever the model hinted"
+        );
+    }
+
+    // Semantic death evicts unconditionally, even with keep_alive set. In
+    // the buffer the hinted dead item must not be reactivated either.
+    let report = engine.gc().await.unwrap();
+    assert!(
+        report.evictions.iter().any(|e| e.item_id == old_id),
+        "semantic death evicts despite keep_alive: {report:?}"
+    );
+    let report = engine.gc().await.unwrap();
+    assert_eq!(
+        report.reactivated, 0,
+        "a hinted dead item must not be reactivated: {report:?}"
+    );
+    let state = engine.state.lock().await;
+    let item = state
+        .eviction_buffer
+        .iter()
+        .find(|item| item.id == old_id)
+        .expect("the dead item stays in the warm buffer");
+    assert!(
+        matches!(item.semantic, SemanticState::Superseded { .. }),
+        "the terminal state survives the warm buffer, got {:?}",
+        item.semantic
+    );
+}

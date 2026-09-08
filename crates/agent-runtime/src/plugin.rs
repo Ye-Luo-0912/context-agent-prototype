@@ -402,11 +402,10 @@ impl PluginRegistry {
                 "skill reference '{reference}' escapes its package root"
             )));
         }
-        let path = root.join(relative);
         let mut bytes = Vec::new();
         {
             use std::io::Read as _;
-            std::fs::File::open(&path)
+            confined_open_regular(&root, relative)
                 .map_err(|error| {
                     AgentError::Tool(format!("read skill '{package}:{skill_id}': {error}"))
                 })?
@@ -727,6 +726,148 @@ async fn kill_tree(child: &mut tokio::process::Child) -> bool {
             child.kill().await.is_ok()
         }
     }
+}
+
+/// `FILE_ATTRIBUTE_REPARSE_POINT`: symlinks, junctions / mount points and
+/// every other name surrogate carry it, so refusing the attribute refuses
+/// the whole family without depending on windows-specific crates.
+#[cfg(windows)]
+const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x0400;
+
+/// Open a skill body inside the package root for reading, refusing
+/// anything that is not a plain regular file reached without traversing a
+/// link (F17). The lexical confinement check in `skill_read` is only the
+/// second line of defense — a package can plant a symlink, junction or
+/// FIFO *inside* its root, so the open itself must not follow one:
+///
+/// * every component (the root, each intermediate directory and the final
+///   entry) is inspected with `symlink_metadata` — no component may be a
+///   link; on Windows that means any reparse point,
+/// * the final entry must be a regular file (FIFOs, devices, sockets and
+///   directories are refused before anything is opened, so a planted FIFO
+///   cannot stall the read),
+/// * the opened handle is re-verified; on unix its (dev, inode) identity
+///   must match the inspected entry, so an entry swapped between inspect
+///   and open is detected instead of followed.
+///
+/// This mirrors the workspace's confined-open helper (O_NOFOLLOW + fstat
+/// regular-file assertion on unix, reparse rejection on Windows), which is
+/// crate-private to `agent-workspace` and therefore re-implemented here on
+/// std primitives only. The lexical check stays a second line of defense.
+fn confined_open_regular(root: &Path, relative: &Path) -> std::io::Result<std::fs::File> {
+    let mut components = relative.components().peekable();
+    let mut walked = root.to_path_buf();
+    check_no_link_dir(&walked)?;
+    while let Some(component) = components.next() {
+        walked.push(component);
+        if components.peek().is_some() {
+            // Intermediate directory: must be a real directory, not a link.
+            check_no_link_dir(&walked)?;
+        }
+    }
+    // Final entry: reject links / special files before opening anything.
+    let inspected = std::fs::symlink_metadata(&walked)?;
+    assert_regular_file(&inspected, &walked)?;
+    let file = std::fs::File::open(&walked)?;
+    // Re-verify through the open handle: what was opened must still be the
+    // regular file that was inspected.
+    let opened = file.metadata()?;
+    assert_regular_file(&opened, &walked)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        if (opened.dev(), opened.ino()) != (inspected.dev(), inspected.ino()) {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                format!(
+                    "skill entry {} changed while being opened",
+                    walked.display()
+                ),
+            ));
+        }
+    }
+    Ok(file)
+}
+
+/// Intermediate path component: a real directory, never a link.
+fn check_no_link_dir(path: &Path) -> std::io::Result<()> {
+    let metadata = std::fs::symlink_metadata(path)?;
+    #[cfg(unix)]
+    if !metadata.file_type().is_dir() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!(
+                "skill path component {} is not a plain directory",
+                path.display()
+            ),
+        ));
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt;
+        if metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 || !metadata.is_dir() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!(
+                    "skill path component {} is not a plain directory",
+                    path.display()
+                ),
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Final entry: a plain regular file (no symlink / junction / reparse
+/// point, no FIFO, device, socket or directory).
+fn assert_regular_file(metadata: &std::fs::Metadata, path: &Path) -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        if metadata.file_type().is_symlink() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!("skill entry {} is a symbolic link", path.display()),
+            ));
+        }
+        if !metadata.file_type().is_file() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!(
+                    "skill entry {} is not a regular file (FIFOs, devices and directories are refused)",
+                    path.display()
+                ),
+            ));
+        }
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt;
+        if metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!(
+                    "skill entry {} is a link or reparse point (junctions and symlinks are refused)",
+                    path.display()
+                ),
+            ));
+        }
+        if !metadata.is_file() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!("skill entry {} is not a regular file", path.display()),
+            ));
+        }
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        if !metadata.is_file() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!("skill entry {} is not a regular file", path.display()),
+            ));
+        }
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -1479,5 +1620,176 @@ mod tests {
         registry.activate_skill("pack", "big").unwrap();
         let error = registry.skill_read("pack", "big").unwrap_err();
         assert!(error.to_string().contains("exceeds"), "{error}");
+    }
+
+    /// F17: a symlink planted inside the package must not redirect a skill
+    /// read to a file outside the package, even though the lexical
+    /// reference looks confined.
+    #[cfg(unix)]
+    #[test]
+    fn skill_read_refuses_an_in_package_symlink_to_an_outside_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        std::fs::write(outside.path().join("secret.txt"), "s3cr3t").unwrap();
+        std::os::unix::fs::symlink(
+            outside.path().join("secret.txt"),
+            dir.path().join("leak.md"),
+        )
+        .unwrap();
+        let registry = PluginRegistry::new();
+        registry
+            .install_from_root(
+                package_with_skill("pack", skill_declaration("leak", "leak.md"), Vec::new()),
+                dir.path().to_path_buf(),
+            )
+            .unwrap();
+        registry.enable("pack").unwrap();
+        registry.activate_skill("pack", "leak").unwrap();
+
+        let error = registry.skill_read("pack", "leak").unwrap_err();
+        let message = error.to_string();
+        assert!(
+            message.contains("symbolic link") || message.contains("regular file"),
+            "the link must be refused at open: {message}"
+        );
+        assert!(
+            !message.contains("s3cr3t"),
+            "the outside content must never surface: {message}"
+        );
+    }
+
+    /// F17: a symlinked *intermediate* directory (e.g. `skills -> /etc`)
+    /// must not pivot the read out of the package either.
+    #[cfg(unix)]
+    #[test]
+    fn skill_read_refuses_a_symlinked_intermediate_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        std::fs::write(outside.path().join("secret.txt"), "s3cr3t").unwrap();
+        std::os::unix::fs::symlink(outside.path(), dir.path().join("skills")).unwrap();
+        let registry = PluginRegistry::new();
+        registry
+            .install_from_root(
+                package_with_skill(
+                    "pack",
+                    skill_declaration("leak", "skills/secret.txt"),
+                    Vec::new(),
+                ),
+                dir.path().to_path_buf(),
+            )
+            .unwrap();
+        registry.enable("pack").unwrap();
+        registry.activate_skill("pack", "leak").unwrap();
+
+        let error = registry.skill_read("pack", "leak").unwrap_err();
+        assert!(
+            error.to_string().contains("plain directory"),
+            "the link must be refused at open: {error}"
+        );
+    }
+
+    /// F17: a planted FIFO must be refused before it is opened — the read
+    /// stays bounded instead of blocking on a writer that never comes.
+    #[cfg(unix)]
+    #[test]
+    fn skill_read_refuses_a_fifo_without_blocking() {
+        let dir = tempfile::tempdir().unwrap();
+        let fifo = dir.path().join("pipe.md");
+        let created = std::process::Command::new("mkfifo")
+            .arg(&fifo)
+            .status()
+            .expect("mkfifo must exist on unix");
+        assert!(created.success(), "mkfifo failed");
+
+        let registry = PluginRegistry::new();
+        registry
+            .install_from_root(
+                package_with_skill("pack", skill_declaration("pipe", "pipe.md"), Vec::new()),
+                dir.path().to_path_buf(),
+            )
+            .unwrap();
+        registry.enable("pack").unwrap();
+        registry.activate_skill("pack", "pipe").unwrap();
+
+        // Run the read on a worker with a hard bound: a regression that
+        // opens the FIFO first would hang forever, not just fail.
+        let (sender, receiver) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let result = registry.skill_read("pack", "pipe");
+            sender.send(result).ok();
+        });
+        let result = receiver
+            .recv_timeout(Duration::from_secs(10))
+            .expect("reading a planted FIFO must be refused before open, not block");
+        let error = result.expect_err("a FIFO is not a regular skill body");
+        assert!(
+            error.to_string().contains("regular file"),
+            "the FIFO must be refused as a non-regular file: {error}"
+        );
+    }
+
+    /// F17: a junction planted inside the package must not redirect a
+    /// skill read to a directory outside the package.
+    #[cfg(windows)]
+    #[test]
+    fn skill_read_refuses_an_in_package_junction_to_an_outside_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        std::fs::write(outside.path().join("secret.txt"), "s3cr3t").unwrap();
+        let status = std::process::Command::new("cmd")
+            .args(["/C", "mklink", "/J"])
+            .arg(dir.path().join("skills"))
+            .arg(outside.path())
+            .status()
+            .expect("mklink must be spawnable");
+        assert!(status.success(), "junction creation failed: {status:?}");
+
+        let registry = PluginRegistry::new();
+        registry
+            .install_from_root(
+                package_with_skill(
+                    "pack",
+                    skill_declaration("leak", "skills/secret.txt"),
+                    Vec::new(),
+                ),
+                dir.path().to_path_buf(),
+            )
+            .unwrap();
+        registry.enable("pack").unwrap();
+        registry.activate_skill("pack", "leak").unwrap();
+
+        let error = registry.skill_read("pack", "leak").unwrap_err();
+        assert!(
+            error.to_string().contains("reparse point")
+                || error.to_string().contains("plain directory"),
+            "the junction must be refused at open: {error}"
+        );
+    }
+
+    /// F17: the component walk must not reject legitimate nested bodies —
+    /// a real directory inside the package reads like a top-level file.
+    #[test]
+    fn skill_read_serves_a_nested_body_through_a_real_subdirectory() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("skills")).unwrap();
+        std::fs::write(dir.path().join("skills/nested.md"), "# nested howto").unwrap();
+        let registry = PluginRegistry::new();
+        registry
+            .install_from_root(
+                package_with_skill(
+                    "pack",
+                    skill_declaration("nested", "skills/nested.md"),
+                    Vec::new(),
+                ),
+                dir.path().to_path_buf(),
+            )
+            .unwrap();
+        registry.enable("pack").unwrap();
+        registry.activate_skill("pack", "nested").unwrap();
+
+        let body = registry
+            .skill_read("pack", "nested")
+            .expect("a nested regular file must read");
+        assert_eq!(body.body, "# nested howto");
     }
 }

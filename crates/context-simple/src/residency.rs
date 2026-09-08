@@ -21,6 +21,20 @@ pub(crate) struct ResidencyOutcome {
     pub relevance: f32,
 }
 
+/// Expiry protection shared by every body location's aging path (F16): a
+/// model `gc_hint` (`keep_alive`) or an unexpired lease defers the
+/// TTL/staleness decision. An expired lease protects nothing — the item
+/// terminates normally. The protection never resurrects: callers evaluate
+/// it only after semantic liveness is established (`is_excluded` /
+/// `is_live`), so a Superseded or VerifiedFixed item stays terminal no
+/// matter what the model hinted. Stored entries need no turn-based check:
+/// their aging is generation-based (Cold → External) and the full GC mark
+/// phase treats this same predicate as a root claim, so a protected item
+/// never reaches the store in the first place.
+pub(crate) fn protected_from_expiry(item: &ContextItem, turn: u64) -> bool {
+    item.keep_alive || item.lease_until_turn.is_some_and(|until| turn <= until)
+}
+
 /// Decide the next attention state for one item. This is the per-item state
 /// machine of the dynamic working set: pinned items stay active,
 /// semantically dead items stay archived forever (their death lives in
@@ -101,10 +115,15 @@ pub(crate) fn next_residency(
     // consumption, this is semantic death — GC will evict it and never
     // resurrect it; only Storage GC may delete the store file. TTL age is
     // measured in user turns: a preview or a burst of unrelated events must
-    // not age an ephemeral item toward death.
+    // not age an ephemeral item toward death. A keep_alive hint or an
+    // unexpired lease defers the death here exactly like the warm-buffer
+    // aging path does (F16: the resident path used to skip that check, so
+    // the same item could be tombstoned while Resident and survive while
+    // Warm).
     let turn_age = turn.saturating_sub(item.created_turn);
-    let ttl_expired =
-        item.retention == ContextRetention::Ephemeral && turn_age > config.turn_ttl_ticks;
+    let ttl_expired = item.retention == ContextRetention::Ephemeral
+        && turn_age > config.turn_ttl_ticks
+        && !protected_from_expiry(item, turn);
     if ttl_expired {
         return ResidencyOutcome {
             attention: AttentionState::Archived,
@@ -128,9 +147,11 @@ pub(crate) fn next_residency(
         AttentionState::Cooling
     } else if item.retention == ContextRetention::Durable {
         AttentionState::Archived
-    } else if turn_age > config.turn_ttl_ticks * 4 {
+    } else if turn_age > config.turn_ttl_ticks * 4 && !protected_from_expiry(item, turn) {
         // A working item that outlived every TTL by a wide margin is not
-        // coming back: its lifecycle ends here, terminally.
+        // coming back: its lifecycle ends here, terminally. Expiry
+        // protection (keep_alive / unexpired lease) defers the death exactly
+        // like the TTL above; attention still archives below.
         return ResidencyOutcome {
             attention: AttentionState::Archived,
             semantic: Some(SemanticState::Tombstoned),

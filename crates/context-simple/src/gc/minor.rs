@@ -6,7 +6,7 @@ use agent_contracts::{
 use crate::diagnostics;
 use crate::engine::{SimpleContextConfig, State};
 use crate::gc::reachability::{drain_supersessions, drain_verifications};
-use crate::residency::next_residency;
+use crate::residency::{next_residency, protected_from_expiry};
 use crate::scope;
 
 /// One maintenance pass over the whole heap: queued scope closes (task
@@ -311,10 +311,9 @@ fn apply_warm_aging(
     if !item.semantic.is_live() {
         return;
     }
-    if item.retention == ContextRetention::Pinned
-        || item.keep_alive
-        || item.lease_until_turn.is_some_and(|until| turn <= until)
-    {
+    // Same expiry protection as the resident path (F16): keep_alive or an
+    // unexpired lease defers the aging; an expired lease protects nothing.
+    if item.retention == ContextRetention::Pinned || protected_from_expiry(item, turn) {
         return;
     }
     let turn_age = turn.saturating_sub(item.created_turn);
