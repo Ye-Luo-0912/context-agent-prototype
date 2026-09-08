@@ -723,6 +723,130 @@ async fn admit_of_a_durable_item_keeps_its_retention() {
     );
 }
 
+/// ADMIT-LEASE：准入一条较老、仍 Live 的 Stored Ephemeral 条目时，创建
+/// 时钟保持原值，准入授予一条有界使用期租约（与模型 `context.lease`
+/// 同一 `max_lease_turns` 上限）：租约期内的完整 residency 机不得立即
+/// TTL 终结；租约到期后正常老化恢复。创建身份／最近访问／当前准入／
+/// 到期保护是四个不同的时钟，互不冒充。
+#[tokio::test]
+async fn admit_of_an_old_ephemeral_gets_a_bounded_admission_lease() {
+    let dir = tempfile::tempdir().unwrap();
+    let engine = SimpleContextEngine::new(SimpleContextConfig {
+        turn_ttl_ticks: 2,
+        max_lease_turns: 3,
+        context_store_dir: Some(dir.path().to_path_buf()),
+        ..SimpleContextConfig::default()
+    });
+    // 种入一条创建于 turn 1 的老 Ephemeral 外部条目：无租约、无
+    // keep_alive，TTL 早已越过（回种状态本身停在 turn 1）。
+    let mut state = crate::engine::State::default();
+    state.turn = 1;
+    let config = SimpleContextConfig::default();
+    let item = crate::item::make_item(
+        &state,
+        &config,
+        "old ephemeral observation from a past round".into(),
+        ContextKind::ToolObservation,
+        ContextScope::Task,
+        ContextRetention::Ephemeral,
+        0.6,
+        Some("seeded".to_string()),
+    );
+    let created_turn = item.created_turn;
+    let created_tick = item.created_tick;
+    let reference = crate::store::externalize(dir.path(), &item).unwrap();
+    state.external.push(crate::store::to_external_entry(
+        &item, reference, 1, 1, None,
+    ));
+    let value = crate::checkpoint::serialize(&state).unwrap();
+    engine.restore(value).await.unwrap();
+
+    // 三个用户回合后 turn = 4：age 3 > TTL 2，无保护时下次维护必然终结。
+    for _ in 0..3 {
+        engine
+            .ingest(ContextIngress::UserMessage {
+                content: "next topic please".into(),
+            })
+            .await
+            .unwrap();
+    }
+    let admit_turn = engine.state.lock().await.turn;
+    assert!(
+        admit_turn - created_turn > 2,
+        "the seeded item must already be past its TTL at admit time"
+    );
+
+    engine
+        .ingest(ContextIngress::ContextDirective {
+            action: ContextAction::Admit {
+                item_id: item.id,
+                reason: "the old observation is relevant again".into(),
+            },
+        })
+        .await
+        .unwrap();
+
+    {
+        let state = engine.state.lock().await;
+        let resident = state
+            .items
+            .iter()
+            .find(|i| i.id == item.id)
+            .expect("the admitted item is resident");
+        // 创建时钟保持原值：准入是位置移动，不是身份改写。
+        assert_eq!(resident.created_turn, created_turn);
+        assert_eq!(resident.created_tick, created_tick);
+        // 有界准入租约：state.turn + max_lease_turns。
+        assert_eq!(resident.lease_until_turn, Some(admit_turn + 3));
+        assert_eq!(resident.residency, ContextResidency::Resident);
+    }
+
+    // 租约期内（age 3 > TTL 2，turn 4 <= lease 7）：完整 residency 机
+    // 也不得 TTL 终结——准入是明确的新工作集成员资格。
+    engine
+        .maintain(ContextMaintenanceTrigger::AfterTool)
+        .await
+        .unwrap();
+    let protected = engine
+        .inspect(usize::MAX)
+        .await
+        .unwrap()
+        .into_iter()
+        .find(|s| s.id == item.id)
+        .expect("the admitted item stays in the catalog");
+    assert_eq!(
+        protected.semantic,
+        SemanticState::Live,
+        "the admission lease must defer the TTL termination"
+    );
+
+    // 租约到期后（turn 8 > lease 7）：正常老化恢复，TTL 终结。
+    for _ in 0..4 {
+        engine
+            .ingest(ContextIngress::UserMessage {
+                content: "next topic please".into(),
+            })
+            .await
+            .unwrap();
+        engine
+            .maintain(ContextMaintenanceTrigger::AfterTool)
+            .await
+            .unwrap();
+    }
+    let dead = engine
+        .inspect(usize::MAX)
+        .await
+        .unwrap()
+        .into_iter()
+        .find(|s| s.id == item.id)
+        .expect("the item stays in the catalog after termination");
+    assert_eq!(
+        dead.semantic,
+        SemanticState::Tombstoned,
+        "normal aging must resume once the admission lease expires"
+    );
+}
+
 /// blob is quarantined (evidence preserved), and an abandoned temp file is
 /// removed — with every action surfaced in the `StoreReconcileReport`.
 #[tokio::test]

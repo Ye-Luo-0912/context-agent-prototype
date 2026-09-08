@@ -233,3 +233,51 @@ async fn clipped_foreground_is_an_explicit_partial_body() {
         "partial bodies keep their identity for display"
     );
 }
+
+/// RANGE-PARTIAL: a selected body the engine clipped at ingest is an
+/// explicit partial too — the selected path embeds the stored body verbatim,
+/// so the exposure must not claim full-revision coverage for it.
+#[tokio::test]
+async fn ingest_clipped_selected_body_is_an_explicit_partial_body() {
+    let engine = SimpleContextEngine::new(SimpleContextConfig {
+        max_item_chars: 64,
+        ..SimpleContextConfig::default()
+    });
+    open_focus(&engine, "append notes").await;
+    {
+        let mut state = engine.state.lock().await;
+        let mut note = crate::item::make_item(
+            &state,
+            &engine.config,
+            format!("long decision record {}", "detail ".repeat(40)),
+            agent_contracts::ContextKind::Note,
+            agent_contracts::ContextScope::Session,
+            agent_contracts::ContextRetention::Working,
+            0.9,
+            Some("derived".into()),
+        );
+        note.scope_id = None;
+        assert!(
+            crate::item::content_was_clipped(&note.content),
+            "the stored body must be an ingest-time partial for this regression"
+        );
+        state.items.push(note);
+    }
+    let materialized = engine
+        .materialize(ContextQuery {
+            current_input: "continue".into(),
+            budget_tokens: 10_000,
+            hints: ContextHints::default(),
+        })
+        .await
+        .unwrap();
+    let exposure = materialized
+        .items
+        .iter()
+        .find(|item| crate::item::content_was_clipped(&item.content))
+        .expect("the clipped note is selected into the frame");
+    assert!(
+        exposure.partial_body,
+        "an ingest-clipped selected body must be marked partial"
+    );
+}

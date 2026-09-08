@@ -1036,6 +1036,11 @@ impl ContextEngine for SimpleContextEngine {
                         item.file_revision = Some(revision);
                     }
                     if let Some((start, end)) = file_range {
+                        // The declared range is the tool-reported interval,
+                        // kept as the observation's identity. It is not a
+                        // claim of retained coverage: the body above may
+                        // already be an engine-clipped partial, and the
+                        // supersession proof refuses clipped bodies.
                         item.file_start_line = Some(start);
                         item.file_end_line = Some(end);
                     }

@@ -229,6 +229,59 @@ async fn cold_required_body_is_read_without_changing_residency() {
     assert!(state.items.iter().all(|resident| resident.id != item.id));
 }
 
+/// RANGE-PARTIAL: a required body the engine clipped at ingest is all the
+/// engine ever retained — the exposure must say `partial_body` so the claim
+/// cannot be mistaken for full-revision coverage, and the selected copy must
+/// satisfy the claim without a duplicate overlay embed.
+#[tokio::test]
+async fn engine_clipped_required_body_is_an_honest_partial_without_duplicate() {
+    let engine = SimpleContextEngine::new(SimpleContextConfig {
+        max_item_chars: 64,
+        ..SimpleContextConfig::default()
+    });
+    let item_id = {
+        let mut state = engine.state.lock().await;
+        let mut pinned = required_item(
+            &state,
+            &engine.config,
+            &format!("pinned constraint {}", "detail ".repeat(30)),
+        );
+        pinned.retention = ContextRetention::Pinned;
+        let id = pinned.id;
+        assert!(
+            crate::item::content_was_clipped(&pinned.content),
+            "the stored body must be an ingest-time partial for this regression"
+        );
+        state.items.push(pinned);
+        id
+    };
+
+    let materialized = engine.materialize(query_for(item_id, 4_096)).await.unwrap();
+    assert!(materialized.required_misses.is_empty());
+    assert_eq!(materialized.required_item_ids, vec![item_id]);
+    let exposures: Vec<_> = materialized
+        .items
+        .iter()
+        .filter(|item| item.item_id == item_id)
+        .collect();
+    assert_eq!(
+        exposures.len(),
+        1,
+        "the clipped pinned body is exposed once, not duplicated by the overlay"
+    );
+    assert!(
+        exposures[0].partial_body,
+        "an ingest-clipped required body must be marked partial"
+    );
+    assert!(
+        crate::item::content_was_clipped(&exposures[0].content),
+        "the exposure is the clipped stored body, not a fabricated full one"
+    );
+    materialized
+        .validate_materialization()
+        .expect("the frame stays valid");
+}
+
 #[tokio::test]
 async fn required_miss_sample_is_bounded_and_reports_omissions() {
     let engine = SimpleContextEngine::new(SimpleContextConfig::default());

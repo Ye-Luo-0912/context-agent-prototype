@@ -64,9 +64,9 @@
 
 | 切片 | 交付 | 对应缺陷（AUDIT_TODO 2026-09-09 表） | 与 N 系列关系 |
 |---|---|---|---|
-| A1 | GC recall 不先删 blob（持久归属）、GC 外置取消安全、隔离失败不丢 owner、拒绝准入无副作用 | GC-DEL / GC-CANCEL / QUARANTINE / ADMIT-TERMINAL | 附带：admit 并发测试改确定性屏障（ADMIT-TEST；`7e026ee` 已改比例断言） |
-| A2 | 截断后行范围/partial/required 传播一致、最终曝光如实 | RANGE-PARTIAL | — |
-| A3 | Rolling 折叠输入包含旧摘要、默认 profile 恢复（focus 跟踪）、显式准入使用期 | ROLLING-PRIOR / ROLLING-FOCUS / ADMIT-LEASE | ROLLING-FOCUS 即 N5 backlog 项（Rolling 不跟踪 focus） |
+| A1 | **已落地（`6f47a90` 修复＋`df5b972` 测试，随 N4 批次合入）**：GC recall 不先删 blob（持久归属）、GC 外置取消安全、隔离失败不丢 owner、拒绝准入无副作用 | GC-DEL / GC-CANCEL / QUARANTINE / ADMIT-TERMINAL —— 均已落地 | 附带 ADMIT-TEST 确定性屏障同批落地（`6f47a90`，替代比例断言）；context-simple 全量绿 |
+| A2 | **已落地（2026-09-09）**：截断后行范围/partial/required 传播一致、最终曝光如实 | RANGE-PARTIAL —— 已落地 | — |
+| A3 | **已落地（2026-09-09）**：Rolling 折叠输入包含旧摘要、默认 profile 恢复（focus 跟踪）、显式准入使用期 | ROLLING-PRIOR / ROLLING-FOCUS / ADMIT-LEASE —— 均已落地 | ROLLING-FOCUS 即 N5 backlog 项（Rolling 不跟踪 focus）——代码缺口已关闭，正式冷恢复声明仍等 N5 验收 |
 | A4 | 查询预处理复用、候选相关性进最终排序、边际预算装配、维护成本预算 | 报告第七节设计建议，非缺陷 | 算法优化按真实瓶颈验收，不阻塞 B/C |
 
 **用户结果：**长期任务中的旧线索能找回；第二次压缩不会无意抹掉前次摘要；GC 不把 RAM 迁移误当持久保存。
@@ -95,7 +95,7 @@
 
 ### 首批与依赖
 
-- **立即并行：A1、B1**；C1/C2 主体已随 N4 落地，其剩余（真实计划/open-loops 投影，当前诚实显示「不可用」）依赖 B3 的快照字段；C3/C4 分别接 N5 结果半与 N7/N8。
+- **A1–A3 已落地**（A1：`6f47a90`＋`df5b972`，随 N4 批次合入；A2/A3：2026-09-09 本批提交，context-simple 311＋context-baselines 11 全绿，host_restore 在 A 提交树 3/3）；B1/B2 已关闭。A4 为报告第七节设计建议（非缺陷，按真实瓶颈验收，不阻塞 B/C）；C1/C2 主体已随 N4 落地，其剩余（真实计划/open-loops 投影，当前诚实显示「不可用」）依赖 B3 的快照字段；C3/C4 分别接 N5 结果半与 N7/N8。
 - C 的事件消费与对象生命周期不等 A 的算法实验；但**冷恢复、证据完整性等正式支持声明，必须等对应 A/B 回归通过**（沿用既有 B1/B2 声明门槛原则）。
 - 每个切片回执照旧：改了什么、接进哪个真实用户动作、实际跑了什么、还有什么没验证、下一步是什么。
 

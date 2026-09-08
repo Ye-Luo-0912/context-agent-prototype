@@ -106,7 +106,7 @@ pub(crate) fn apply_admit(
         }
         let mut item = state.eviction_buffer.remove(index);
         let from = item.attention;
-        reenter_working_set(&mut item, now_tick, state);
+        reenter_working_set(&mut item, now_tick, state, config);
         let transition = admit_transition(&item, from, turn, reason);
         crate::ledger::record(
             state,
@@ -140,7 +140,7 @@ pub(crate) fn apply_admit(
             return None;
         }
         let from = item.attention;
-        reenter_working_set(&mut item, now_tick, state);
+        reenter_working_set(&mut item, now_tick, state, config);
         let transition = admit_transition(&item, from, turn, reason);
         crate::ledger::record(
             state,
@@ -231,12 +231,18 @@ pub(crate) fn apply_derive(
 /// stamp into the current working scope so the materializer can select it
 /// without a hot-entity match. Identity (the item id) is preserved.
 ///
-/// The lifecycle timestamps are refreshed: an explicitly admitted item is a
-/// deliberate, fresh working-set member — its presence is new even though
-/// its content is old — so the ephemeral TTL does not tombstone it the
-/// moment it re-enters. Provenance of the *content* lives in the store; the
-/// timestamps here account for the item's presence in the heap.
-fn reenter_working_set(item: &mut ContextItem, now_tick: u64, state: &State) {
+/// ADMIT-LEASE：创建时钟保持原值（body 移动绝不改写 created_tick/
+/// created_turn），准入授予的是一条有界的*使用期*租约（与模型
+/// `context.lease` 同一 `max_lease_turns` 上限）：准入是明确的新工作集
+/// 成员资格，老 Ephemeral 条目不能在下次维护就被 TTL 终结；租约到期后
+/// 正常老化恢复。已有的更长未到期租约不被缩短。创建身份／最近访问／
+/// 当前准入／到期保护是四个不同的时钟，互不冒充。
+fn reenter_working_set(
+    item: &mut ContextItem,
+    now_tick: u64,
+    state: &State,
+    config: &SimpleContextConfig,
+) {
     item.attention = AttentionState::Active;
     item.relevance = item.relevance.max(0.5);
     item.residency = ContextResidency::Resident;
@@ -252,6 +258,14 @@ fn reenter_working_set(item: &mut ContextItem, now_tick: u64, state: &State) {
     if state.focus.is_some() {
         item.scope = ContextScope::Task;
     }
+    // 准入使用期：不改创建时钟，用一条有界租约把 TTL/staleness 死亡
+    // 推迟到 `state.turn + max_lease_turns`（residency 的两条终结路径
+    // 都已尊重 `protected_from_expiry`）。已存在的更长租约不缩短。
+    let admission_until = state.turn.saturating_add(config.max_lease_turns as u64);
+    item.lease_until_turn = Some(
+        item.lease_until_turn
+            .map_or(admission_until, |until| until.max(admission_until)),
+    );
 }
 
 /// The scope the working set currently lives in: the open task (or focus)

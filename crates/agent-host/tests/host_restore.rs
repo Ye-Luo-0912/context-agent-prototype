@@ -51,14 +51,13 @@ async fn host_config(
         TaskApprovalGate::new(Arc::new(PolicyApprovalGate::read_only()))
             .with_host_policies(host_policies.clone()),
     );
-    // Dynamic (SimpleContextEngine) is the restore-capable product policy:
-    // it tracks the focused task, which the kernel's restore-side focus
-    // authority check requires. The rolling baseline engine does not track
-    // focus, so an active-task checkpoint is (correctly, but irrecoverably)
-    // refused under `--context-policy rolling` — a known pre-existing gap
-    // outside this ticket's files.
+    // The host binary's default policy is Rolling, and it tracks the focused
+    // task (ROLLING-FOCUS): the kernel's restore-side focus authority check
+    // reads `diagnostics.focus_task_id`, so an active-task checkpoint
+    // restores under the default profile instead of being irrecoverably
+    // refused.
     let context_engine =
-        agent_compose::build_context_engine(ContextPolicy::Dynamic, workspace.state_dir(), None)
+        agent_compose::build_context_engine(ContextPolicy::Rolling, workspace.state_dir(), None)
             .await?;
     let base_tools = Arc::new(
         tool_runtime::BuiltinToolDispatcher::with_config_and_verification_recipes(

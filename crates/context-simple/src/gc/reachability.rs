@@ -281,16 +281,23 @@ fn supersedes_stale_revision(new_item: &ContextItem, old: &ContextItem) -> bool 
 
 /// Same content revision: the newer body supersedes the older one only when
 /// it proves coverage. A trusted line window that contains the older window
-/// is enough. If either side lacks a range, only a literal body containment
-/// of unclipped text is proof. Disjoint windows coexist; unknown or clipped
-/// bodies are never proven and are kept.
+/// is enough — but only from a body the engine did not clip: the declared
+/// range is the tool-reported interval, and a clipped body retains only a
+/// prefix of it, so its range is not a proof of retained coverage
+/// (RANGE-PARTIAL). If either side lacks a range, only a literal body
+/// containment of unclipped text is proof. Disjoint windows coexist; unknown
+/// or clipped bodies are never proven and are kept.
 fn supersedes_same_revision_body(new_item: &ContextItem, old: &ContextItem) -> bool {
     match (&old.file_revision, &new_item.file_revision) {
         (Some(old_rev), Some(new_rev)) if old_rev == new_rev => {
             if let (Some((new_start, new_end)), Some((old_start, old_end))) =
                 (file_line_range(new_item), file_line_range(old))
             {
-                return new_start <= old_start && new_end >= old_end;
+                if !crate::item::content_was_clipped(&new_item.content) {
+                    return new_start <= old_start && new_end >= old_end;
+                }
+                // A clipped new body falls through to the literal guards,
+                // which refuse clipped bodies: conservative coexistence.
             }
             if crate::item::content_was_clipped(&old.content)
                 || crate::item::content_was_clipped(&new_item.content)

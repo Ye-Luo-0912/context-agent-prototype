@@ -1747,6 +1747,63 @@ async fn same_revision_range_coverage_supersedes_without_body_containment() {
     assert!(!bodies[0].contains("old_only_token"));
 }
 
+/// RANGE-PARTIAL: a same-revision re-read whose declared window covers the
+/// older fragment, but whose body the engine clipped at ingest, retains only
+/// a prefix of that window — the declared range is the tool-reported
+/// interval, not a proof of retained coverage, so the older fragment must
+/// survive instead of dying to a truncated replacement.
+#[tokio::test]
+async fn clipped_rereads_declared_range_is_not_a_coverage_proof() {
+    let engine = SimpleContextEngine::new(SimpleContextConfig {
+        max_item_chars: 64,
+        ..SimpleContextConfig::default()
+    });
+    open_focus(&engine, "multi read").await;
+    engine
+        .ingest(ContextIngress::ToolObservation {
+            facts: None,
+            output: fs_read_window(
+                "w1",
+                "src/big.rs",
+                "    10 | old_only_token",
+                "rev-1",
+                Some((10, 12)),
+            ),
+            scope_id: None,
+        })
+        .await
+        .unwrap();
+    // The re-read declares a covering window [1, 20] of the same revision,
+    // but its body is long enough that the engine clips it at ingest.
+    let long_body = format!("     1 | cover_token\n{}", "pad line\n".repeat(20));
+    engine
+        .ingest(ContextIngress::ToolObservation {
+            facts: None,
+            output: fs_read_window("w2", "src/big.rs", &long_body, "rev-1", Some((1, 20))),
+            scope_id: None,
+        })
+        .await
+        .unwrap();
+    engine
+        .maintain(ContextMaintenanceTrigger::AfterTool)
+        .await
+        .unwrap();
+    let bodies = live_file_bodies(&engine, "src/big.rs").await;
+    assert_eq!(
+        bodies.len(),
+        2,
+        "a clipped re-read cannot prove coverage by its declared range: {bodies:?}"
+    );
+    assert!(
+        bodies.iter().any(|body| body.contains("old_only_token")),
+        "the older fragment survives the truncated covering re-read"
+    );
+    assert!(
+        bodies.iter().any(|body| body.contains("cover_token")),
+        "the newer clipped body is kept too — conservative coexistence"
+    );
+}
+
 #[tokio::test]
 async fn same_revision_disjoint_ranges_coexist_despite_substring_overlap() {
     let engine = SimpleContextEngine::new(SimpleContextConfig::default());

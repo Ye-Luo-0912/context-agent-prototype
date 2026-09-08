@@ -480,12 +480,13 @@ pub(crate) fn materialize(
         .iter()
         .map(|index| {
             let item = &state.items[*index];
-            let content =
-                if prices_as_file_body_descriptor(item, &query.hints.visible_body_identities) {
-                    file_body_descriptor_content(item)
-                } else {
-                    item.content.clone()
-                };
+            let descriptor =
+                prices_as_file_body_descriptor(item, &query.hints.visible_body_identities);
+            let content = if descriptor {
+                file_body_descriptor_content(item)
+            } else {
+                item.content.clone()
+            };
             MaterializedItem {
                 item_id: item.id,
                 kind: item.kind,
@@ -497,9 +498,14 @@ pub(crate) fn materialize(
                 source: item.source.clone(),
                 file_path: item.file_path.clone(),
                 file_revision: item.file_revision.clone(),
-                // Selected bodies are full (never preview-clipped);
-                // foreground clipping is the only partial projection.
-                partial_body: false,
+                // Selected bodies are never preview-clipped here, but the
+                // stored body itself may be an ingest-time partial (the
+                // engine clips at `max_item_chars`): the exposure must say
+                // partial so required claims and downstream ledgers cannot
+                // mistake it for the full revision (RANGE-PARTIAL). A
+                // descriptor is an identity card, not a body, and is never
+                // partial.
+                partial_body: !descriptor && crate::item::content_was_clipped(&item.content),
             }
         })
         .collect();
@@ -1003,10 +1009,12 @@ pub(crate) async fn realize_foreground(
             source: item.source.clone(),
             file_path: item.file_path.clone(),
             file_revision: item.file_revision.clone(),
-            // A clipped foreground body is an explicit partial projection:
-            // it keeps its identity for display but must never be treated
-            // as the full revision by required claims or downstream ledgers.
-            partial_body: clipped,
+            // A body clipped to this round's budget is an explicit partial
+            // projection, and so is a body the engine already clipped at
+            // ingest: either way it keeps its identity for display but must
+            // never be treated as the full revision by required claims or
+            // downstream ledgers (RANGE-PARTIAL).
+            partial_body: clipped || crate::item::content_was_clipped(&item.content),
         });
     }
     (out, misses)
@@ -1522,11 +1530,26 @@ pub(crate) fn apply_required(
             continue;
         }
 
+        // The overlay would embed exactly this content (the stored body, or
+        // a descriptor when the exact body is already visible by identity).
+        let descriptor =
+            prices_as_file_body_descriptor(&required.item, &query.hints.visible_body_identities);
+        let content = if descriptor {
+            file_body_descriptor_content(&required.item)
+        } else {
+            required.item.content.clone()
+        };
+        // A visible copy satisfies the claim when it is not a partial
+        // projection, or when it exposes exactly the content the overlay
+        // would embed — an ingest-clipped body is all the engine ever
+        // retained, so re-embedding it would only duplicate the exposure.
+        // A copy clipped to this round's budget exposes strictly less and
+        // does not satisfy the claim.
         let already_visible = materialized
             .items
             .iter()
             .chain(materialized.foreground.iter())
-            .any(|item| item.item_id == item_id && !item.partial_body);
+            .any(|item| item.item_id == item_id && (!item.partial_body || item.content == content));
         if already_visible {
             materialized.required_item_ids.push(item_id);
             remove_external_descriptor(materialized, item_id);
@@ -1548,13 +1571,6 @@ pub(crate) fn apply_required(
             drop_optional_item(materialized, item_id);
         }
 
-        let content =
-            if prices_as_file_body_descriptor(&required.item, &query.hints.visible_body_identities)
-            {
-                file_body_descriptor_content(&required.item)
-            } else {
-                required.item.content.clone()
-            };
         materialized.items.push(MaterializedItem {
             item_id,
             kind: required.item.kind,
@@ -1566,9 +1582,13 @@ pub(crate) fn apply_required(
             source: required.item.source.clone(),
             file_path: required.item.file_path.clone(),
             file_revision: required.item.file_revision.clone(),
-            // Required bodies are always embedded in full; a partial
-            // foreground copy was already rejected above.
-            partial_body: false,
+            // The overlay always embeds the full stored body (a partial
+            // foreground copy was already rejected above), but the stored
+            // body itself may be an ingest-time partial: the flag must
+            // propagate so the claim cannot be mistaken for full-revision
+            // coverage (RANGE-PARTIAL). A descriptor is an identity card,
+            // not a body, and is never partial.
+            partial_body: !descriptor && crate::item::content_was_clipped(&required.item.content),
         });
         materialized.selected.push(ContextSelection {
             item_id,

@@ -23,7 +23,7 @@ mod tests {
     use agent_contracts::{
         BoundedCompactor, CompactionOutput, CompactionRequest, ContextEngine, ContextHints,
         ContextIngress, ContextKind, ContextMaintenanceTrigger, ContextQuery, FocusState,
-        MaterializedContext, TaskId, ToolOutput,
+        MaterializedContext, MaterializedItem, TaskId, ToolOutput,
     };
     use serde_json::json;
     use std::sync::Arc;
@@ -360,6 +360,337 @@ mod tests {
             "empty compact output must fall back, got: {}",
             summary.content
         );
+    }
+
+    /// ROLLING-PRIOR：追加一批记录并触发一次维护折叠。
+    async fn feed_records(engine: &RollingSummaryEngine, prefix: &str, count: usize) {
+        for index in 0..count {
+            engine
+                .ingest(ContextIngress::AssistantMessage {
+                    content: format!("{prefix} {index}"),
+                })
+                .await
+                .unwrap();
+        }
+        engine
+            .maintain(ContextMaintenanceTrigger::AfterModel)
+            .await
+            .unwrap();
+    }
+
+    async fn summary_item(engine: &RollingSummaryEngine) -> MaterializedItem {
+        let materialized = engine
+            .materialize(ContextQuery {
+                current_input: "next".into(),
+                budget_tokens: 100_000,
+                hints: ContextHints::default(),
+            })
+            .await
+            .unwrap();
+        materialized
+            .items
+            .into_iter()
+            .find(|item| item.kind == ContextKind::Summary)
+            .expect("collapse must leave a summary marker")
+    }
+
+    #[tokio::test]
+    async fn later_folds_merge_the_prior_summary_into_the_next_input() {
+        // ROLLING-PRIOR：第二、三次折叠的压缩输入必须包含旧摘要，第一轮
+        // 独有事实不能在后续折叠中无声消失。EchoCompactor 回显输入，断言
+        // 只依赖输入连续性，不依赖摘要质量。
+        let engine = RollingSummaryEngine::with_config(RollingConfig {
+            summary_threshold_tokens: 30,
+            keep_most_recent_tokens: 4,
+        })
+        .with_compactor(Arc::new(EchoCompactor));
+
+        engine
+            .ingest(ContextIngress::AssistantMessage {
+                content: "R1_HEAD first-round-only fact".into(),
+            })
+            .await
+            .unwrap();
+        feed_records(&engine, "round one record", 6).await;
+        let first = summary_item(&engine).await;
+        assert!(
+            first.content.contains("R1_HEAD"),
+            "the first fold must carry the round-one fact: {}",
+            first.content
+        );
+        assert!(
+            !first
+                .source
+                .as_deref()
+                .unwrap_or("")
+                .contains("prior summary"),
+            "the first fold has no prior summary to merge: {:?}",
+            first.source
+        );
+
+        feed_records(&engine, "round two record", 8).await;
+        let second = summary_item(&engine).await;
+        assert!(
+            second.content.contains("R1_HEAD"),
+            "the second fold must merge the prior summary: {}",
+            second.content
+        );
+        assert!(
+            second
+                .source
+                .as_deref()
+                .unwrap_or("")
+                .contains("prior summary"),
+            "source coverage must record the merge: {:?}",
+            second.source
+        );
+
+        feed_records(&engine, "round three record", 8).await;
+        let third = summary_item(&engine).await;
+        assert!(
+            third.content.contains("R1_HEAD"),
+            "the third fold must still reach the first-round fact: {}",
+            third.content
+        );
+        assert!(
+            third
+                .source
+                .as_deref()
+                .unwrap_or("")
+                .contains("prior summary"),
+            "source coverage must record the merge: {:?}",
+            third.source
+        );
+    }
+
+    struct FailingCompactor;
+
+    #[async_trait::async_trait]
+    impl BoundedCompactor for FailingCompactor {
+        async fn compact(
+            &self,
+            _request: CompactionRequest,
+        ) -> agent_contracts::AgentResult<CompactionOutput> {
+            Err(agent_contracts::AgentError::Internal(
+                "compactor down".into(),
+            ))
+        }
+    }
+
+    #[tokio::test]
+    async fn failed_compaction_preserves_the_pre_fold_state() {
+        let engine = RollingSummaryEngine::with_config(RollingConfig {
+            summary_threshold_tokens: 30,
+            keep_most_recent_tokens: 4,
+        })
+        .with_compactor(Arc::new(FailingCompactor));
+        for index in 0..10 {
+            engine
+                .ingest(ContextIngress::AssistantMessage {
+                    content: format!("history record {index}"),
+                })
+                .await
+                .unwrap();
+        }
+        let before = engine.diagnostics().await.unwrap();
+        let report = engine
+            .maintain(ContextMaintenanceTrigger::AfterModel)
+            .await
+            .unwrap();
+        assert!(
+            report.transitions.is_empty() && report.archived == 0,
+            "a failed fold must not report collapses (archived={})",
+            report.archived
+        );
+        let after = engine.diagnostics().await.unwrap();
+        assert_eq!(
+            after.total_items, before.total_items,
+            "a failed fold must return the records to the working set"
+        );
+        assert_eq!(
+            after.tombstoned_items, before.tombstoned_items,
+            "a failed fold must roll back the collapsed count"
+        );
+        assert_eq!(
+            after.approx_active_tokens, before.approx_active_tokens,
+            "a failed fold must not change the retained volume"
+        );
+        let items = engine.inspect(usize::MAX).await.unwrap();
+        assert!(
+            items.iter().all(|item| item.kind != ContextKind::Summary),
+            "a failed fold must not mint a summary marker"
+        );
+    }
+
+    struct GatedCompactor {
+        entered: Arc<tokio::sync::Notify>,
+    }
+
+    #[async_trait::async_trait]
+    impl BoundedCompactor for GatedCompactor {
+        async fn compact(
+            &self,
+            _request: CompactionRequest,
+        ) -> agent_contracts::AgentResult<CompactionOutput> {
+            self.entered.notify_one();
+            // 永不返回：maintain future 只能在该 await 点被丢弃。
+            std::future::pending::<()>().await;
+            unreachable!("the gated compactor never returns")
+        }
+    }
+
+    #[tokio::test]
+    async fn dropped_maintain_future_returns_fold_candidates_to_the_working_set() {
+        let entered = Arc::new(tokio::sync::Notify::new());
+        let engine = RollingSummaryEngine::with_config(RollingConfig {
+            summary_threshold_tokens: 30,
+            keep_most_recent_tokens: 4,
+        })
+        .with_compactor(Arc::new(GatedCompactor {
+            entered: Arc::clone(&entered),
+        }));
+        for index in 0..10 {
+            engine
+                .ingest(ContextIngress::AssistantMessage {
+                    content: format!("history record {index}"),
+                })
+                .await
+                .unwrap();
+        }
+        let before = engine.diagnostics().await.unwrap();
+
+        {
+            let maintain = engine.maintain(ContextMaintenanceTrigger::AfterModel);
+            tokio::select! {
+                _ = maintain => panic!("maintain must block while the compactor is gated"),
+                _ = entered.notified() => {}
+            }
+        }
+
+        let after = engine.diagnostics().await.unwrap();
+        assert_eq!(
+            after.total_items, before.total_items,
+            "cancellation must return the removed records"
+        );
+        assert_eq!(
+            after.tombstoned_items, before.tombstoned_items,
+            "cancellation must roll back the collapsed count"
+        );
+        assert_eq!(
+            after.approx_active_tokens, before.approx_active_tokens,
+            "cancellation must not change the retained volume"
+        );
+
+        // 归还必须保持原始顺序与内容（守卫按原顺序插回队首）。
+        let materialized = engine
+            .materialize(ContextQuery {
+                current_input: "next".into(),
+                budget_tokens: 100_000,
+                hints: ContextHints::default(),
+            })
+            .await
+            .unwrap();
+        let bodies: Vec<&str> = materialized
+            .items
+            .iter()
+            .map(|item| item.content.as_str())
+            .collect();
+        let expected: Vec<String> = (0..10)
+            .map(|index| format!("history record {index}"))
+            .collect();
+        let expected: Vec<&str> = expected.iter().map(String::as_str).collect();
+        assert_eq!(
+            bodies, expected,
+            "restored records must keep their original order and content"
+        );
+        assert!(
+            materialized
+                .items
+                .iter()
+                .all(|item| item.kind != ContextKind::Summary),
+            "a cancelled fold must not mint a summary marker"
+        );
+    }
+
+    #[tokio::test]
+    async fn rolling_tracks_focus_for_the_restore_authority_check() {
+        // ROLLING-FOCUS：默认 profile（Rolling）的活动任务检查点恢复依赖
+        // diagnostics.focus_task_id 与 runtime 任务对齐（kernel 恢复侧的
+        // focus 权威校验）。
+        let engine = RollingSummaryEngine::new();
+        let task_a = TaskId::new();
+        engine
+            .ingest(ContextIngress::FocusChanged {
+                focus: FocusState::for_task(task_a, "refactor auth"),
+            })
+            .await
+            .unwrap();
+        let diagnostics = engine.diagnostics().await.unwrap();
+        assert_eq!(diagnostics.focus_task_id, Some(task_a));
+        assert_eq!(
+            diagnostics.focus_generation, 1,
+            "each focus change bumps the generation"
+        );
+        let materialized = engine
+            .materialize(ContextQuery {
+                current_input: "next".into(),
+                budget_tokens: 100_000,
+                hints: ContextHints::default(),
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            materialized.focus.as_ref().map(|focus| focus.task_id),
+            Some(task_a)
+        );
+
+        // 检查点往返保留聚焦身份：恢复校验在 restore 之后读 diagnostics。
+        let checkpoint = engine.checkpoint().await.unwrap();
+        let fresh = RollingSummaryEngine::new();
+        fresh.restore(checkpoint).await.unwrap();
+        assert_eq!(
+            fresh.diagnostics().await.unwrap().focus_task_id,
+            Some(task_a)
+        );
+
+        // 无关任务的完成不清除聚焦。
+        engine
+            .ingest(ContextIngress::TaskCompleted {
+                task_id: Some(TaskId::new()),
+                summary: "unrelated".into(),
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            engine.diagnostics().await.unwrap().focus_task_id,
+            Some(task_a),
+            "an unrelated completion must not clear the focus"
+        );
+
+        // 聚焦任务完成 → 清除。
+        engine
+            .ingest(ContextIngress::TaskCompleted {
+                task_id: Some(task_a),
+                summary: "done".into(),
+            })
+            .await
+            .unwrap();
+        assert_eq!(engine.diagnostics().await.unwrap().focus_task_id, None);
+
+        // 重新聚焦后挂起 → 清除。
+        let task_b = TaskId::new();
+        engine
+            .ingest(ContextIngress::FocusChanged {
+                focus: FocusState::for_task(task_b, "write docs"),
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            engine.diagnostics().await.unwrap().focus_task_id,
+            Some(task_b)
+        );
+        engine.ingest(ContextIngress::FocusCleared).await.unwrap();
+        assert_eq!(engine.diagnostics().await.unwrap().focus_task_id, None);
     }
 
     #[tokio::test]

@@ -17,7 +17,7 @@ use agent_contracts::{
     CompactionOutput, CompactionReason, CompactionRequest, ContextCompaction, ContextDiagnostics,
     ContextEngine, ContextIngress, ContextKind, ContextMaintenanceReport,
     ContextMaintenanceTrigger, ContextQuery, ContextScope, ContextSelection,
-    ContextStateTransition, MaterializedContext, ScopeId, ScopeKind, ScoreBreakdown,
+    ContextStateTransition, FocusState, MaterializedContext, ScopeId, ScopeKind, ScoreBreakdown,
     bound_compaction_output, bound_compaction_source,
 };
 use async_trait::async_trait;
@@ -58,6 +58,11 @@ struct RollingState {
     /// Total number of records folded into the marker.
     collapsed: usize,
     turn: u64,
+    /// ROLLING-FOCUS：runtime 经 FocusChanged 安装的聚焦任务。恢复侧的
+    /// focus 权威校验读 `diagnostics.focus_task_id`；不跟踪时默认 profile
+    /// （Rolling）的活动任务检查点会被不可恢复地拒绝。
+    #[serde(default)]
+    focus: Option<FocusState>,
     #[serde(default)]
     materialization_revision: u64,
     #[serde(default)]
@@ -85,6 +90,8 @@ impl RollingState {
             active_diagnostics(&self.records, self.summary.as_ref(), self.collapsed);
         diagnostics.compaction_input_tokens = self.compaction_input_tokens;
         diagnostics.compaction_output_tokens = self.compaction_output_tokens;
+        diagnostics.focus_generation = self.focus.as_ref().map_or(0, |focus| focus.generation);
+        diagnostics.focus_task_id = self.focus.as_ref().map(|focus| focus.task_id);
         diagnostics
     }
 }
@@ -92,7 +99,9 @@ impl RollingState {
 /// Baseline B context engine: append, then collapse the oldest history into a
 /// rolling summary once a token threshold is crossed.
 pub struct RollingSummaryEngine {
-    state: StdMutex<RollingState>,
+    /// `Arc` 共享给折叠取消守卫：压缩期间 maintain future 被丢弃时，守卫
+    /// 需要把移出的记录还回这里，而不是让它们随 future 一起消失。
+    state: Arc<StdMutex<RollingState>>,
     config: RollingConfig,
     /// 注入后每次折叠走有界压缩器；缺省仍用固定占位标记。
     compactor: Option<Arc<dyn BoundedCompactor>>,
@@ -105,7 +114,7 @@ impl RollingSummaryEngine {
 
     pub fn with_config(config: RollingConfig) -> Self {
         Self {
-            state: StdMutex::new(RollingState::default()),
+            state: Arc::new(StdMutex::new(RollingState::default())),
             config,
             compactor: None,
         }
@@ -133,7 +142,16 @@ impl RollingSummaryEngine {
         if fold_candidates == 0 {
             return None;
         }
+        // ROLLING-PRIOR：下次折叠输入 = 旧摘要（先入，保证在字符上限内
+        // 保留）＋ 本次移出的最旧记录。旧摘要是更早折叠的唯一残余，截掉
+        // 它等于无声丢弃已折叠历史；新记录超限截断与既有行为一致。
         let mut prior = String::new();
+        if let Some(summary) = &state.summary {
+            prior.push_str(&summary.content);
+            prior.push('\n');
+        }
+        let merged_prior_summary = state.summary.is_some();
+        let mut folded_records = Vec::with_capacity(fold_candidates);
         let mut transitions = Vec::new();
         for _ in 0..fold_candidates {
             let record = state.records.remove(0);
@@ -142,6 +160,7 @@ impl RollingSummaryEngine {
                 prior.push('\n');
             }
             state.collapsed += 1;
+            folded_records.push(record.clone());
             transitions.push(ContextStateTransition {
                 item_id: record.id,
                 kind: record.kind,
@@ -160,18 +179,26 @@ impl RollingSummaryEngine {
         Some(FoldJob {
             prior: bound_compaction_source(&prior),
             collapsed: state.collapsed,
+            folded_now: fold_candidates,
+            merged_prior_summary,
             summary_id,
             transitions,
+            restore: FoldRestore {
+                state: Arc::clone(&self.state),
+                records: folded_records,
+                collapsed_delta: fold_candidates,
+                armed: true,
+            },
         })
     }
 
-    async fn compact_fold(&self, job: &FoldJob) -> CompactionOutput {
+    async fn compact_fold(&self, job: &FoldJob) -> Option<CompactionOutput> {
         let fallback = fallback_marker(job.collapsed, &job.prior);
         let Some(compactor) = &self.compactor else {
-            return CompactionOutput {
+            return Some(CompactionOutput {
                 text: fallback,
                 ..CompactionOutput::default()
-            };
+            });
         };
         match compactor
             .compact(CompactionRequest {
@@ -185,12 +212,42 @@ impl RollingSummaryEngine {
                 if output.text.is_empty() {
                     output.text = fallback;
                 }
-                output
+                Some(output)
             }
-            Err(_) => CompactionOutput {
-                text: fallback,
-                ..CompactionOutput::default()
-            },
+            // 压缩失败：不写占位覆盖旧摘要。返回 None 让调用方丢弃 job，
+            // 守卫把移出的记录还回 working set，折叠前状态完整保留，
+            // 下一个维护触发再试。
+            Err(_) => None,
+        }
+    }
+}
+
+/// 一次折叠的取消守卫：job 未提交（压缩失败或 maintain future 在压缩
+/// await 点被丢弃）时，把移出的记录按原顺序还回 working set 并回退
+/// `collapsed` 计数；旧摘要只在提交时才被覆盖，因此折叠前状态不丢。
+struct FoldRestore {
+    state: Arc<StdMutex<RollingState>>,
+    /// 本次移出的记录（最旧优先），归还时插回队首。
+    records: Vec<Record>,
+    collapsed_delta: usize,
+    armed: bool,
+}
+
+impl FoldRestore {
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for FoldRestore {
+    fn drop(&mut self) {
+        if !self.armed || (self.records.is_empty() && self.collapsed_delta == 0) {
+            return;
+        }
+        // 锁中毒说明别的线程已在 panic 路径上；守卫不在 Drop 里二次 panic。
+        if let Ok(mut state) = self.state.lock() {
+            state.records.splice(0..0, self.records.drain(..));
+            state.collapsed = state.collapsed.saturating_sub(self.collapsed_delta);
         }
     }
 }
@@ -198,8 +255,21 @@ impl RollingSummaryEngine {
 struct FoldJob {
     prior: String,
     collapsed: usize,
+    /// 本次新移出的记录数（`collapsed` 是累计值）。
+    folded_now: usize,
+    merged_prior_summary: bool,
     summary_id: agent_contracts::ContextItemId,
     transitions: Vec<ContextStateTransition>,
+    restore: FoldRestore,
+}
+
+/// 摘要的来源覆盖记录：它合并了哪些输入（本次折叠记录＋是否有旧摘要）。
+fn summary_source(folded_now: usize, merged_prior_summary: bool) -> String {
+    if merged_prior_summary {
+        format!("rolling summary (covers {folded_now} folded records + prior summary)")
+    } else {
+        format!("rolling summary (covers {folded_now} folded records)")
+    }
 }
 
 fn fallback_marker(collapsed: usize, prior: &str) -> String {
@@ -221,6 +291,27 @@ impl ContextEngine for RollingSummaryEngine {
         if matches!(ingress, ContextIngress::UserMessage { .. }) {
             state.turn += 1;
         }
+        // ROLLING-FOCUS：只跟踪聚焦身份，不铸造 Goal 历史记录（当前轮
+        // 表示仍归 TurnFrame，见 shared::records_for_ingress 的注释）。
+        match &ingress {
+            ContextIngress::FocusChanged { focus } => {
+                let mut focus = focus.clone();
+                focus.generation += 1;
+                state.focus = Some(focus);
+            }
+            ContextIngress::FocusCleared => {
+                state.focus = None;
+            }
+            ContextIngress::TaskCompleted { task_id, .. } => {
+                let completed = task_id.or_else(|| state.focus.as_ref().map(|focus| focus.task_id));
+                if let Some(completed) = completed
+                    && state.focus.as_ref().map(|focus| focus.task_id) == Some(completed)
+                {
+                    state.focus = None;
+                }
+            }
+            _ => {}
+        }
         let records = records_for_ingress(&ingress, state.turn);
         state.records.extend(records);
         Ok(())
@@ -231,14 +322,19 @@ impl ContextEngine for RollingSummaryEngine {
         _trigger: ContextMaintenanceTrigger,
     ) -> AgentResult<ContextMaintenanceReport> {
         // 折叠从锁里取出源文本后必须放开锁再调压缩器：模型调用不能占着
-        // StdMutex。记录已在取 job 时移出 working set；压缩失败则写回
-        // 有界占位，B 仍然完成折叠而不是卡死回合。
+        // StdMutex。记录随 job 移出 working set，但由 FoldRestore 守卫持有：
+        // 压缩失败或 future 被丢弃时按原样归还；只有压缩结果写回后才撤防。
         let mut transitions: Vec<ContextStateTransition> = Vec::new();
         let mut pass_in = 0u64;
         let mut pass_out = 0u64;
         let mut compactions = Vec::new();
-        while let Some(job) = self.take_fold_job() {
-            let compacted = self.compact_fold(&job).await;
+        while let Some(mut job) = self.take_fold_job() {
+            let Some(compacted) = self.compact_fold(&job).await else {
+                // 压缩失败：job 在此丢弃，守卫归还记录、旧摘要未被触碰，
+                // 折叠前状态保留。本回合不再重试同一折叠，避免对失败
+                // 压缩器空转。
+                break;
+            };
             pass_in = pass_in.saturating_add(compacted.input_tokens);
             pass_out = pass_out.saturating_add(compacted.output_tokens);
             if compacted.input_tokens > 0 || compacted.output_tokens > 0 {
@@ -263,9 +359,11 @@ impl ContextEngine for RollingSummaryEngine {
                     scope: ContextScope::Task,
                     content: compacted.text,
                     created_turn: 0,
-                    source: Some("rolling summary".into()),
+                    source: Some(summary_source(job.folded_now, job.merged_prior_summary)),
                 });
             }
+            // 摘要已写回：撤防守卫，随后 job 丢弃不再归还记录。
+            job.restore.disarm();
             transitions.extend(job.transitions);
         }
 
@@ -333,7 +431,7 @@ impl ContextEngine for RollingSummaryEngine {
         }));
         Ok(MaterializedContext {
             materialization_id: state.materialization_revision,
-            focus: None,
+            focus: state.focus.clone(),
             task: None,
             items,
             external: agent_contracts::ContextMapView::default(),
