@@ -198,6 +198,72 @@ impl Drop for SingleInstance {
 }
 
 // ---------------------------------------------------------------------------
+// Startup restore (`--restore-latest`).
+// ---------------------------------------------------------------------------
+
+/// Resolve and decode the newest *verifiable* runtime checkpoint from the
+/// workspace checkpoint store, for `--restore-latest` startup.
+///
+/// Selection policy (external review F10): discovery, ordering and
+/// verification all go through the runtime's own [`agent_runtime::CheckpointStore`]
+/// and unified decode entry — never a raw directory scan.
+///
+/// * Candidates are only artifacts the store itself wrote
+///   (`checkpoint-*.json` with a well-formed envelope header), ordered
+///   newest-first by modification time — not by lexicographic file name.
+/// * "Latest" means the newest candidate that *verifies*: the envelope
+///   checksum, payload bounds and full checkpoint compatibility (version +
+///   structural validation) must all pass before a candidate is eligible.
+/// * A corrupt, truncated, oversized or version-incompatible candidate is
+///   skipped with a visible note, and startup fails closed when no
+///   candidate verifies. Restoring a guessed older state silently would be
+///   worse than refusing to start.
+///
+/// Returns the decoded checkpoint plus the artifact path it came from (for
+/// diagnostics); nothing has been started or mutated when this returns.
+pub async fn resolve_latest_verified_checkpoint(
+    checkpoint_dir: &std::path::Path,
+) -> anyhow::Result<(agent_runtime::RuntimeCheckpoint, PathBuf)> {
+    let store = agent_runtime::CheckpointStore::new(checkpoint_dir);
+    let listed = store
+        .list(agent_runtime::checkpoint::MAX_CHECKPOINT_LIST_ROWS)
+        .await
+        .map_err(|error| {
+            anyhow::Error::new(error).context(format!(
+                "listing checkpoint store {}",
+                checkpoint_dir.display()
+            ))
+        })?;
+    if listed.is_empty() {
+        anyhow::bail!(
+            "no verifiable checkpoints exist in {}; start without --restore-latest or save one first",
+            checkpoint_dir.display()
+        );
+    }
+    for row in &listed {
+        let path = checkpoint_dir.join(&row.artifact);
+        let decoded = match store.load_verified(&row.artifact).await {
+            Ok(payload) => agent_runtime::decode_checkpoint_bytes(&payload),
+            Err(error) => Err(error),
+        };
+        match decoded {
+            Ok(checkpoint) => return Ok((checkpoint, path)),
+            Err(error) => {
+                eprintln!(
+                    "host: skipping checkpoint {} (newest-first order): {error}",
+                    row.artifact
+                );
+            }
+        }
+    }
+    anyhow::bail!(
+        "all {} checkpoint(s) in {} failed verification; refusing to restore (fail closed)",
+        listed.len(),
+        checkpoint_dir.display()
+    )
+}
+
+// ---------------------------------------------------------------------------
 // Live connection table: the cap and the bounded-shutdown cancel target.
 // ---------------------------------------------------------------------------
 

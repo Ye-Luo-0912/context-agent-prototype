@@ -4,6 +4,8 @@
 //! choices) but replaces the terminal UI with the local IPC server. The
 //! process stays in the foreground owning its workspace; clients attach and
 //! detach freely. `--read-only` serves snapshot/subscribe-only sessions.
+//! `--restore-latest` resumes the newest verifiable checkpoint store
+//! artifact before the server accepts any client.
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -28,6 +30,10 @@ struct Args {
     pipe: Option<String>,
     socket: Option<std::path::PathBuf>,
     read_only: bool,
+    /// Resume from the newest *verifiable* checkpoint in the workspace
+    /// store (envelope checksum, bounds and compatibility verified through
+    /// the runtime's own store — never a file-name guess; a refused store
+    /// fails startup closed).
     restore_latest: bool,
     context_policy: Option<String>,
 }
@@ -211,11 +217,29 @@ async fn real_main() -> anyhow::Result<()> {
     composed.instance.start().await?;
 
     if args.restore_latest {
-        let resolved = resolve_latest_checkpoint(&workspace.state_dir().join("checkpoints"))?;
-        let checkpoint: agent_runtime::checkpoint::RuntimeCheckpoint =
-            serde_json::from_str(&std::fs::read_to_string(&resolved)?)
-                .with_context(|| format!("parsing {}", resolved.display()))?;
-        composed.instance.restore(checkpoint).await?;
+        // The same resolution the TUI's `--restore=latest` performs: the
+        // newest store artifact that fully verifies (envelope checksum,
+        // bounds, version/compat), skipping invalid candidates visibly and
+        // failing closed when none verifies.
+        let (checkpoint, resolved) = agent_host::resolve_latest_verified_checkpoint(
+            &workspace.state_dir().join("checkpoints"),
+        )
+        .await?;
+        // The full cross-plane restore transaction — the same semantics the
+        // TUI and every other composition root use. This runs before the
+        // IPC server accepts its first connection, so a refused checkpoint
+        // exits the host before any work submission or model request can
+        // happen; nothing is half-restored into a serving host.
+        composed
+            .instance
+            .restore(checkpoint)
+            .await
+            .map_err(|error| {
+                anyhow::Error::new(error).context(format!(
+                    "startup restore from {} failed; the runtime refused the checkpoint before any mutation",
+                    resolved.display()
+                ))
+            })?;
         eprintln!("host: restored {}", resolved.display());
     }
 
@@ -277,16 +301,4 @@ fn wake_endpoint(endpoint: &LocalEndpoint) {
     if let LocalEndpoint::UnixSocket(path) = endpoint {
         let _ = std::os::unix::net::UnixStream::connect(path);
     }
-}
-
-fn resolve_latest_checkpoint(dir: &std::path::Path) -> anyhow::Result<std::path::PathBuf> {
-    let mut candidates: Vec<std::path::PathBuf> = std::fs::read_dir(dir)
-        .with_context(|| format!("listing {}", dir.display()))?
-        .filter_map(|entry| entry.ok().map(|entry| entry.path()))
-        .filter(|path| path.extension().is_some_and(|ext| ext == "json"))
-        .collect();
-    candidates.sort();
-    candidates
-        .pop()
-        .context("no checkpoints exist to restore from")
 }
