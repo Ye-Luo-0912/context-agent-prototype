@@ -26,8 +26,10 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
+use agent_contracts::RuntimeEventEnvelope;
 use agent_core::{ApprovalBroker, InteractiveApprovalGate};
 use agent_platform_protocol::{
     ApprovalRespondRequest, Causality, EffectStateDisposition, EnvelopeKind, JsonDecodeBudget,
@@ -35,12 +37,13 @@ use agent_platform_protocol::{
     MAX_JSON_CONTROL_OBJECT_KEYS, MAX_JSON_CONTROL_STRING_BYTES,
     MAX_JSON_CONTROL_TOTAL_STRING_BYTES, MessageId, NegotiatedContractProfile, PlatformEnvelope,
     PlatformError, PlatformErrorClass, PlatformResponse, ProtocolIdentity, RetryDisposition, Route,
-    SchemaDigest, WorkCancelRequest, WorkContinueRequest, WorkSnapshotRequest, WorkSubmitRequest,
-    WorkSubscribeRequest,
+    SchemaDigest, WorkCancelRequest, WorkContinueRequest, WorkEventNotification,
+    WorkSnapshotRequest, WorkSubmitRequest, WorkSubscribeRequest,
 };
 use agent_runtime::{
     RuntimeHandle, WorkControlGrant, WorkControlRouter, WorkControlSessionRegistry,
 };
+use tokio::sync::broadcast;
 
 /// Structured error code for any route outside the negotiated session set.
 pub const ERROR_ROUTE_UNSUPPORTED: &str = "route.unsupported";
@@ -267,44 +270,52 @@ pub async fn resolve_latest_verified_checkpoint(
 // Live connection table: the cap and the bounded-shutdown cancel target.
 // ---------------------------------------------------------------------------
 
-/// Registry of the streams of the connections currently being served. It is
-/// the accept loop's concurrency cap and the shutdown wind-down's cancel
-/// target: after accept stops, [`LiveStreams::drain`] lets in-flight frames
-/// settle within [`SHUTDOWN_GRACE`], then interrupts the still-blocked
-/// reads/writes through a backend-supplied cancel hook (`CancelIoEx` on the
-/// Windows named pipe, `shutdown(2)` on the UDS), so shutdown cannot wait
+/// Registry of the connections currently being served. It is the accept
+/// loop's concurrency cap and the shutdown wind-down's cancel target: after
+/// accept stops, [`LiveStreams::drain`] lets in-flight frames settle within
+/// [`SHUTDOWN_GRACE`], then interrupts the still-blocked reads/writes through
+/// each connection's cancel hook (`shutdown(2)` on the UDS halves,
+/// `CancelIoEx` on the Windows named-pipe handles), so shutdown cannot wait
 /// on a silent or half-frame client past a bounded deadline.
-struct LiveStreams<S> {
+///
+/// Each entry is one connection's pending-I/O interrupt, covering both
+/// transport halves (the reader the request loop parks on and the writer the
+/// response path and the event forwarder share). The same hook also closes
+/// the connection when the event forwarder gives up on it, so a lagged
+/// subscriber is torn down through exactly the interrupt path shutdown uses.
+type CancelHook = Arc<dyn Fn() + Send + Sync + 'static>;
+
+struct LiveStreams {
     next_id: AtomicU64,
-    streams: Mutex<HashMap<u64, Arc<S>>>,
+    cancels: Mutex<HashMap<u64, CancelHook>>,
 }
 
-impl<S> LiveStreams<S> {
+impl LiveStreams {
     fn new() -> Self {
         Self {
             next_id: AtomicU64::new(1),
-            streams: Mutex::new(HashMap::new()),
+            cancels: Mutex::new(HashMap::new()),
         }
     }
 
-    fn insert(&self, stream: Arc<S>) -> u64 {
+    fn insert(&self, cancel: CancelHook) -> u64 {
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
-        self.streams
+        self.cancels
             .lock()
             .expect("live connection table poisoned")
-            .insert(id, stream);
+            .insert(id, cancel);
         id
     }
 
     fn remove(&self, id: u64) {
-        self.streams
+        self.cancels
             .lock()
             .expect("live connection table poisoned")
             .remove(&id);
     }
 
     fn len(&self) -> usize {
-        self.streams
+        self.cancels
             .lock()
             .expect("live connection table poisoned")
             .len()
@@ -315,12 +326,13 @@ impl<S> LiveStreams<S> {
     }
 
     /// Interrupts every still-registered connection's pending I/O and
-    /// empties the table. Called while every stream is provably alive: a
-    /// worker removes its entry only after its stream work is done.
-    fn cancel_all(&self, cancel: impl Fn(&S)) {
-        let mut streams = self.streams.lock().expect("live connection table poisoned");
-        for (_, stream) in streams.drain() {
-            cancel(&stream);
+    /// empties the table. Called while every connection is provably alive:
+    /// a worker removes its entry only after its request loop and its event
+    /// forwarder are done.
+    fn cancel_all(&self) {
+        let mut cancels = self.cancels.lock().expect("live connection table poisoned");
+        for (_, cancel) in cancels.drain() {
+            cancel();
         }
     }
 
@@ -342,11 +354,11 @@ impl<S> LiveStreams<S> {
     /// workers to unwind. In-request actor work is separately bounded by
     /// the router's per-request deadline, so the whole stop path has a hard
     /// upper bound.
-    fn drain(&self, grace: Duration, cancel: impl Fn(&S)) {
+    fn drain(&self, grace: Duration) {
         if self.wait_empty(grace) {
             return;
         }
-        self.cancel_all(cancel);
+        self.cancel_all();
         if !self.wait_empty(grace) {
             // Workers must unwind once their I/O is cancelled; if one is
             // still wedged past this second bound, shutdown stays bounded
@@ -432,7 +444,7 @@ fn serve_unix(
     let _own_endpoint = SocketEndpointGuard { path: path.clone() };
     std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))?;
     eprintln!("host: serving UDS {}", path.display());
-    let live: Arc<LiveStreams<UnixStream>> = Arc::new(LiveStreams::new());
+    let live: Arc<LiveStreams> = Arc::new(LiveStreams::new());
     for stream in listener.incoming() {
         if stop.load(Ordering::SeqCst) {
             // Woken by the stop poke; the waker connection is unserved.
@@ -467,22 +479,64 @@ fn serve_unix(
                 continue;
             }
         };
+        // Split the socket into a reader (owned by the request loop) and a
+        // duplicated writer shared by the response path and the event
+        // forwarder under one whole-frame lock. The cancel hook covers both
+        // halves, so shutdown and the forwarder's close path interrupt every
+        // pending I/O this connection can be parked in.
+        let write_half = match stream.try_clone() {
+            Ok(write_half) => write_half,
+            Err(error) => {
+                eprintln!("host: dropping connection; write half unavailable: {error}");
+                drop(guard);
+                continue;
+            }
+        };
+        let cancel_write = match stream.try_clone() {
+            Ok(cancel_write) => cancel_write,
+            Err(error) => {
+                eprintln!("host: dropping connection; cancel half unavailable: {error}");
+                drop(guard);
+                continue;
+            }
+        };
         let shared = Arc::new(stream);
-        let id = live.insert(Arc::clone(&shared));
+        let hang_up: CancelHook = {
+            let read = Arc::clone(&shared);
+            Arc::new(move || {
+                let _ = read.shutdown(std::net::Shutdown::Both);
+                let _ = cancel_write.shutdown(std::net::Shutdown::Both);
+            })
+        };
+        let events = ConnectionEvents::new(write_half, plane.profile.clone(), hang_up);
+        let id = live.insert(events.cancel_hook());
         let live_in_worker = Arc::clone(&live);
         let runtime = runtime.clone();
         std::thread::spawn(move || {
-            let mut stream: &UnixStream = shared.as_ref();
-            let _ = process_connection(&mut stream, &router, &runtime);
+            let mut events = events;
+            let mut reader: &UnixStream = shared.as_ref();
+            // Unix socket reads have no cross-dup serialization, so the
+            // request loop can simply block on the next frame; the socket's
+            // read deadline and the shutdown shutdown(2) bound the wait.
+            let read_next_frame = |reader: &mut &UnixStream, _may_block: bool| read_frame(reader);
+            let _ = process_connection(
+                &mut reader,
+                &mut events,
+                &router,
+                &runtime,
+                &read_next_frame,
+            );
+            // The connection is over: stop the event forwarder, interrupt
+            // anything still parked (a forwarder wedged writing to a silent
+            // consumer included), then release the grant and the live entry.
+            events.shutdown();
             drop(guard);
             live_in_worker.remove(id);
         });
     }
     // Bounded wind-down for the connections accepted before the stop:
     // settle in flight, then interrupt still-blocked reads/writes.
-    live.drain(SHUTDOWN_GRACE, |stream| {
-        let _ = stream.shutdown(std::net::Shutdown::Both);
-    });
+    live.drain(SHUTDOWN_GRACE);
     Ok(())
 }
 
@@ -709,16 +763,288 @@ fn session_unavailable_frame(profile: &NegotiatedContractProfile) -> Vec<u8> {
 }
 
 // ---------------------------------------------------------------------------
+// Per-connection output plane: single writer + event forwarding.
+// ---------------------------------------------------------------------------
+
+/// How long a parked event forwarder waits before re-checking its stop
+/// flags. This is the worst added latency for a notification on an otherwise
+/// quiet stream and the wind-down bound for a forwarder with nothing to do.
+const FORWARDER_TICK: Duration = Duration::from_millis(50);
+
+/// Upper bound for reaping a replaced or stopped forwarder. The forwarder
+/// re-checks its flags at least once per [`FORWARDER_TICK`], so the normal
+/// reap is immediate; a forwarder wedged inside a blocking write is left to
+/// the connection's cancel hook (which the worker invokes before waiting)
+/// and must never stall the subscribe handshake or the worker unwind past
+/// this bound.
+const FORWARDER_REAP: Duration = Duration::from_millis(200);
+
+/// The connection's single serialized writer: the duplicated write half
+/// every outbound frame goes through. Holding the lock across one whole
+/// [`write_frame`] call (header + payload + flush) is what keeps response
+/// frames and event-notification frames from interleaving bytes.
+struct SharedWriter<W> {
+    stream: Mutex<W>,
+}
+
+impl<W: Write> SharedWriter<W> {
+    fn new(stream: W) -> Self {
+        Self {
+            stream: Mutex::new(stream),
+        }
+    }
+
+    /// Writes one whole frame under the lock: responses and notifications
+    /// share this writer, and a frame is never split by a concurrent one.
+    fn write_frame(&self, payload: &[u8]) -> std::io::Result<()> {
+        let mut stream = self.stream.lock().expect("connection writer poisoned");
+        write_frame(&mut *stream, payload)
+    }
+}
+
+/// Handle for a running event forwarder, kept so a re-subscribe or a
+/// connection teardown can stop and reap it in bounded time.
+struct ForwarderHandle {
+    stop: Arc<AtomicBool>,
+    done: mpsc::Receiver<()>,
+}
+
+/// One connection's event plane: everything the subscribe route needs to
+/// turn the runtime broadcast receiver it is handed into typed
+/// [`WorkEventNotification`] frames on this connection, plus the teardown
+/// path shared with the transport.
+struct ConnectionEvents<W> {
+    writer: Arc<SharedWriter<W>>,
+    profile: NegotiatedContractProfile,
+    identity: ProtocolIdentity,
+    /// Set when the connection must stop serving and forwarding: by the
+    /// worker at teardown, or by the forwarder when it closes the
+    /// connection (stream dead or subscriber lag overflow).
+    closed: Arc<AtomicBool>,
+    /// Interrupts every pending I/O on both transport halves. Shared with
+    /// the live-connection table so shutdown uses the identical close path.
+    hang_up: CancelHook,
+    forwarder: Option<ForwarderHandle>,
+}
+
+impl<W: Write + Send + 'static> ConnectionEvents<W> {
+    fn new(stream: W, profile: NegotiatedContractProfile, hang_up: CancelHook) -> Self {
+        let identity = ProtocolIdentity {
+            name: profile.name.clone(),
+            version: profile.version,
+            active_features: profile.active_features.clone(),
+            schema_digest: profile.schema_digest,
+        };
+        Self {
+            writer: Arc::new(SharedWriter::new(stream)),
+            profile,
+            identity,
+            closed: Arc::new(AtomicBool::new(false)),
+            hang_up,
+            forwarder: None,
+        }
+    }
+
+    /// The registration form of this connection's cancel hook for the live
+    /// connection table.
+    fn cancel_hook(&self) -> CancelHook {
+        Arc::clone(&self.hang_up)
+    }
+
+    /// Whether a subscribed event stream is currently installed on this
+    /// connection. The request loop uses this to pick a wait that cannot
+    /// starve the forwarder (see the named-pipe backend).
+    fn is_forwarding(&self) -> bool {
+        self.forwarder.is_some()
+    }
+
+    /// Installs the subscribed event stream on this connection.
+    ///
+    /// Repeated subscribe on the same connection REPLACES the previous
+    /// stream rather than refusing. Rationale: a re-subscribe is a client
+    /// recovering its stream — after it observed a gap, a lag-driven close
+    /// hint on the wire, or its own UI restart — and the fresh handshake
+    /// watermark makes the new stream authoritative, so refusing would only
+    /// force a full reconnect without adding safety. The previous forwarder
+    /// is stopped and reaped (bounded) before the new one starts, so the
+    /// connection never carries two live streams; a forwarder wedged in a
+    /// blocking write is left to the cancel hook and may emit at most the
+    /// frames already in flight before it observes the stop flag.
+    fn register_event_stream(
+        &mut self,
+        receiver: broadcast::Receiver<RuntimeEventEnvelope>,
+        watermark: u64,
+        runtime: &tokio::runtime::Handle,
+    ) {
+        if let Some(previous) = self.forwarder.take() {
+            previous.stop.store(true, Ordering::Relaxed);
+            let _ = previous.done.recv_timeout(FORWARDER_REAP);
+        }
+        let (stop, done) = spawn_event_forwarder(receiver, watermark, self, runtime);
+        self.forwarder = Some(ForwarderHandle { stop, done });
+    }
+
+    /// Stops forwarding and tears the connection down. Called by the worker
+    /// once its request loop has ended.
+    fn shutdown(&mut self) {
+        self.closed.store(true, Ordering::Relaxed);
+        (self.hang_up)();
+        if let Some(forwarder) = self.forwarder.take() {
+            forwarder.stop.store(true, Ordering::Relaxed);
+            // Bounded reap; the cancel above unblocks a forwarder parked in
+            // a write, and a quiet forwarder exits at its next tick.
+            let _ = forwarder.done.recv_timeout(FORWARDER_REAP);
+        }
+    }
+}
+
+/// Builds the typed notification envelope for one runtime event: the
+/// kernel's own envelope forwarded verbatim on the `work/event` route,
+/// server-initiated (no request correlation, no work identity).
+fn event_notification_envelope(
+    identity: &ProtocolIdentity,
+    envelope: RuntimeEventEnvelope,
+) -> PlatformEnvelope<WorkEventNotification> {
+    let message_id = MessageId::new();
+    PlatformEnvelope {
+        protocol: identity.clone(),
+        message_id,
+        request_id: None,
+        kind: EnvelopeKind::Notification,
+        route: Route::work_event(),
+        work: None,
+        causality: Causality::root(message_id),
+        payload: WorkEventNotification { envelope },
+    }
+}
+
+/// Forwards one subscribed runtime event stream to one connection.
+///
+/// The bounded queue is the runtime's own broadcast channel (per-receiver,
+/// capacity fixed by the kernel): the forwarder buffers nothing beyond the
+/// frame it is currently writing, so a slow consumer first backs up into
+/// the kernel socket buffer and then into that channel. Overflow is
+/// therefore always explicit, never silent:
+///
+/// * `Lagged(skipped)` — this subscriber provably lost events and the host
+///   has no replay. Writing a resync frame to the very consumer that caused
+///   the lag would block on the same congested pipe, so the explicit resync
+///   is the connection close itself: the client reconnects and rebuilds
+///   from a fresh snapshot. This is the same recovery the subscribe
+///   handshake's `resync_required` points at.
+/// * a failed write — the consumer is gone or wedged past the shutdown
+///   cancel; the connection is torn down through the shared cancel hook.
+///
+/// Events at or below the handshake watermark are dropped on purpose:
+/// `WorkControlRouter::subscribe` registers the receiver *before* its
+/// snapshot barrier, so queued events at or below the watermark are already
+/// reflected in the snapshot the client holds; forwarding them would
+/// double-count them. (Live-only deltas repeat the preceding durable
+/// cursor, so the filter can drop an overlapping delta — the contract
+/// already defines them as superseded by turn/operation identity, not by
+/// this cursor.)
+fn spawn_event_forwarder<W: Write + Send + 'static>(
+    mut receiver: broadcast::Receiver<RuntimeEventEnvelope>,
+    watermark: u64,
+    events: &ConnectionEvents<W>,
+    runtime: &tokio::runtime::Handle,
+) -> (Arc<AtomicBool>, mpsc::Receiver<()>) {
+    let writer = Arc::clone(&events.writer);
+    let identity = events.identity.clone();
+    let profile = events.profile.clone();
+    let closed = Arc::clone(&events.closed);
+    let hang_up = Arc::clone(&events.hang_up);
+    let stop = Arc::new(AtomicBool::new(false));
+    let stop_flag = Arc::clone(&stop);
+    let (done_tx, done_rx) = mpsc::channel();
+    let runtime = runtime.clone();
+    std::thread::spawn(move || {
+        loop {
+            if stop_flag.load(Ordering::Relaxed) || closed.load(Ordering::Relaxed) {
+                break;
+            }
+            // Bounded wait: a quiet stream still observes the stop flags,
+            // so teardown never waits on an event that never comes.
+            let received = runtime
+                .block_on(async { tokio::time::timeout(FORWARDER_TICK, receiver.recv()).await });
+            match received {
+                Ok(Ok(envelope)) => {
+                    if envelope.seq <= watermark {
+                        continue;
+                    }
+                    let notification = event_notification_envelope(&identity, envelope);
+                    if notification.validate(&profile).is_err() {
+                        // Impossible by construction (the shape is fixed at
+                        // compile time), but a contract violation never gets
+                        // written to the wire: close instead.
+                        eprintln!("host: event notification failed validation; closing");
+                        closed.store(true, Ordering::Relaxed);
+                        (hang_up)();
+                        break;
+                    }
+                    let payload = match serde_json::to_vec(&notification) {
+                        Ok(payload) => payload,
+                        Err(error) => {
+                            eprintln!("host: serializing event notification failed: {error}");
+                            closed.store(true, Ordering::Relaxed);
+                            (hang_up)();
+                            break;
+                        }
+                    };
+                    if let Err(error) = writer.write_frame(&payload) {
+                        eprintln!("host: event forwarder write failed: {error}");
+                        closed.store(true, Ordering::Relaxed);
+                        (hang_up)();
+                        break;
+                    }
+                }
+                Ok(Err(broadcast::error::RecvError::Lagged(skipped))) => {
+                    eprintln!(
+                        "host: subscriber lagged {skipped} events; closing connection for resync"
+                    );
+                    closed.store(true, Ordering::Relaxed);
+                    (hang_up)();
+                    break;
+                }
+                Ok(Err(broadcast::error::RecvError::Closed)) => break,
+                Err(_tick) => continue,
+            }
+        }
+        let _ = done_tx.send(());
+    });
+    (stop, done_rx)
+}
+
+// ---------------------------------------------------------------------------
 // Per-connection request loop.
 // ---------------------------------------------------------------------------
 
-fn process_connection<S: Read + Write>(
-    stream: &mut S,
+/// The transport-supplied frame reader: fetches the next whole request
+/// frame, or `Ok(None)` on a clean disconnect. `may_block` is false while a
+/// subscription is live — the named-pipe backend explains why a pending
+/// read would starve the forwarder there.
+type NextFrameReader<S> = dyn Fn(&mut S, bool) -> std::io::Result<Option<Vec<u8>>>;
+
+fn process_connection<S: Read, W: Write + Send + 'static>(
+    reader: &mut S,
+    events: &mut ConnectionEvents<W>,
     router: &WorkControlRouter,
     runtime: &tokio::runtime::Handle,
+    read_next_frame: &NextFrameReader<S>,
 ) -> anyhow::Result<()> {
     loop {
-        let Some(frame) = read_frame(stream)? else {
+        if events.closed.load(Ordering::Relaxed) {
+            // The event forwarder closed the connection (dead stream or
+            // lag overflow): the session ends here and the client
+            // reconnects, rebuilding from a fresh snapshot.
+            return Ok(());
+        }
+        // The transport-supplied reader waits for the next frame. While a
+        // subscription is live it must not hold a pending I/O that would
+        // starve the forwarder (`may_block` is false); with nothing to
+        // starve, blocking reads are preferred for their prompt disconnect
+        // detection (the named-pipe backend explains both sides).
+        let Some(frame) = read_next_frame(reader, !events.is_forwarding())? else {
             return Ok(());
         };
         let request = match agent_platform_protocol::from_slice_bounded::<
@@ -728,15 +1054,16 @@ fn process_connection<S: Read + Write>(
             Ok(request) => request,
             Err(_) => anyhow::bail!("undecodable frame; closing connection"),
         };
-        let response = dispatch(request, router, runtime);
-        write_frame(stream, &serde_json::to_vec(&response)?)?;
+        let response = dispatch(request, router, runtime, events);
+        events.writer.write_frame(&serde_json::to_vec(&response)?)?;
     }
 }
 
-fn dispatch(
+fn dispatch<W: Write + Send + 'static>(
     request: PlatformEnvelope<serde_json::Value>,
     router: &WorkControlRouter,
     runtime: &tokio::runtime::Handle,
+    events: &mut ConnectionEvents<W>,
 ) -> serde_json::Value {
     let route = request.route.clone();
     macro_rules! run_route {
@@ -772,14 +1099,22 @@ fn dispatch(
             run_route!(WorkSnapshotRequest, snapshot)
         }
         ("work", "subscribe") => {
-            // The subscribe handshake returns the response; the event
-            // receiver is intentionally dropped: the durable event wire
-            // contract lands with the typed event projection, and until
-            // then clients rebuild from snapshots (honest, never lossy).
+            // The subscribe handshake returns its receipt and, on success,
+            // the live event stream: the receiver is registered on this
+            // connection's output plane and every subsequent runtime event
+            // above the receipt's watermark is forwarded as a typed
+            // WorkEventNotification frame. A failed handshake carries a
+            // closed placeholder receiver, which is dropped here — nothing
+            // is subscribed on an error receipt.
             match retyped::<WorkSubscribeRequest>(&request) {
                 Ok(typed) => match runtime.block_on(router.subscribe(typed)) {
-                    Ok((response, _receiver)) => serde_json::to_value(&response)
-                        .unwrap_or_else(|_| serde_json::json!({"status": "error"})),
+                    Ok((response, receiver)) => {
+                        if let PlatformResponse::Success { value } = &response.payload {
+                            events.register_event_stream(receiver, value.watermark, runtime);
+                        }
+                        serde_json::to_value(&response)
+                            .unwrap_or_else(|_| serde_json::json!({"status": "error"}))
+                    }
                     Err(error) => protocol_error_response(&request, &error.to_string()),
                 },
                 Err(_) => unsupported_route_response(&request),
