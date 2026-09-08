@@ -269,11 +269,31 @@ async fn real_main() -> anyhow::Result<()> {
     // The accept loop blocks this thread; ctrl-c stops it through the
     // server's cooperative stop switch and releases the single-instance lock.
     let runtime_handle = tokio::runtime::Handle::current();
-    let serve_thread = std::thread::spawn(move || server.serve(plane, runtime_handle));
+    // The serve thread announces its own exit through this channel, so an
+    // early failure (refused endpoint bind, takeover check, accept-loop
+    // error) is observed below instead of leaving the process parked on
+    // ctrl-c while it already stopped serving.
+    let (serve_done_tx, serve_done_rx) = tokio::sync::oneshot::channel::<()>();
+    let serve_thread = std::thread::spawn(move || {
+        let result = server.serve(plane, runtime_handle);
+        let _ = serve_done_tx.send(());
+        result
+    });
 
-    let _ = tokio::signal::ctrl_c().await;
+    // Either ctrl-c or the serve thread ending first ends this wait (B2
+    // CANCEL-ALL): a host whose serve loop already failed must converge
+    // through the same bounded shutdown, not wait for a signal that may
+    // never come.
+    let _ = tokio::select! {
+        _ = tokio::signal::ctrl_c() => {},
+        _ = serve_done_rx => {},
+    };
     eprintln!("host: shutting down");
-    composed.shutdown().await?;
+    // The runtime shutdown result is captured, not propagated inline: a
+    // failed shutdown must not skip the transport stop below — the accept
+    // loop and every live connection still get their bounded wind-down, and
+    // the failure is surfaced only after the transport has actually stopped.
+    let composed_shutdown = composed.shutdown().await;
     // Set the stop flag, then poke the endpoint once so the parked accept
     // loop wakes, observes the flag, and exits `Ok` on its own.
     stop.store(true, Ordering::SeqCst);
@@ -283,6 +303,7 @@ async fn real_main() -> anyhow::Result<()> {
         .map_err(|_| anyhow::anyhow!("host serve thread panicked"))?;
     serve_result?;
     drop(single);
+    composed_shutdown?;
     Ok(())
 }
 

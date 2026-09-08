@@ -75,7 +75,7 @@
 
 | 切片 | 交付 | 对应缺陷 | 与 N 系列关系 |
 |---|---|---|---|
-| B1 | 快照/订阅同一切点、live 与 durable 分流、重连代际/epoch 边界 | SNAP-GAP / LIVE-DELTA | N3 已接通链路，B1 修一致性残余 |
+| B1 | 快照/订阅同一切点、live 与 durable 分流、重连代际/epoch 边界 | SNAP-GAP / LIVE-DELTA（两项均**已落地 2026-09-09**，见 AUDIT_TODO 注记） | N3 已接通链路，B1 修一致性残余——**已关闭**（agent-host 单测＋e2e 7/7、agent-contracts 163、dotnet 客户端测试全绿；无 wire 变更） |
 | B2 | 队列 Completion 语义、宿主「取消全部」与「确认结束」分离、服务失败收口、retyped 原始信封验证 | QUEUE-COMPLETION / CANCEL-ALL / RETYPED | N1 可靠停机的收口延伸 |
 | B3 | GUI 所需真实任务/审批详情/结果/工件/只读 Context 接口 | — | 即 N5 结果半（结果/差异/工件按需读取） |
 | B4 | 同一正式宿主 profile 多入口复用、已有 MCP/Skill 配置接入 | — | 即 N8 |

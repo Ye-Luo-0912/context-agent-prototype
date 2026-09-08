@@ -28,6 +28,8 @@
 
 **执行方式（2026-09-09 起）：N 系列主顺序不变（N4 收尾验收 → N7 → N8），三线 A/B/C 与之并行、互不干扰**——A 拥有 `context-simple`/`context-baselines`，B 拥有宿主/协议/.NET 客户端库与共享 DTO（单一合入），C 拥有 Avalonia 界面；重叠切片一次执行、两边同时关闭。切片表与所有权规则见 [NEXT_TASKS.md](NEXT_TASKS.md)「并行三线」节；缺陷明细见 [AUDIT_TODO.md](AUDIT_TODO.md) 2026-09-09 表。
 
+**B1 已落地并关闭（2026-09-09，三线首切片）**：SNAP-GAP——`ResumableSession` 握手改为 subscribe→snapshot 次序（宿主订阅的 receiver 注册先于其快照屏障，此后事件不可能落在流与状态读取之间），事件泵按快照 watermark 对 durable 通知去重，重连安装即原子清空会话级事件队列（有序复位边界，旧连接未读事件不跨代存活）；LIVE-DELTA——契约新增 `RuntimeEvent::is_live_only`（`ModelDelta`/`ModelRetrying`），宿主转发器按 kind 分流：live-only 恒转发（其内容不入任何快照，游标重复不再被丢），durable 仍按切点去重，host e2e `assert_notification` 同步修准。无 wire 变更、不改 DTO 形状；`BoundedEventQueue.Clear()` 为新增方法（Completion 语义属 B2 的 QUEUE-COMPLETION，未动）。实际检查：`cargo fmt -p agent-host -p agent-contracts -- --check`、`cargo test -p agent-contracts --lib` 163、`cargo test -p agent-host`（含 named-pipe e2e 7/7；stop_bounded 首跑负载抖动、单独与整包重跑均绿）、`dotnet test clients/dotnet/Agent.Client.Tests` 全绿（62 项，含本切片新增切点去重/重连复位/队列 Clear 三测与既有 56 项；计数含并行线当日新增测试）、`dotnet build apps/Agent.Desktop` 0 错误。未验证：真实 provider 与多客户端交错场景照旧 NOT_RUN；下一步 B2（QUEUE-COMPLETION / CANCEL-ALL / RETYPED）。
+
 **CI 事实：** run `34271105841`（`bbf7f5d`）Windows 全测试失败于 `context-simple` admit 并发测试（其余 job 通过）；`7e026ee` 已改比例断言（确定性屏障仍为 A 线建议项）；N4 批次 run `34278244036`/`34278810636` 文档写作时进行中。CI 结论按 run 记录，不外推到任意 SHA。
 
 ## 执行原则（M17 收尾）

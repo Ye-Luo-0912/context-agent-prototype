@@ -162,12 +162,13 @@ public class EventStreamTests
 
     private static byte[] EncodeFrame(object frame) => JsonSerializer.SerializeToUtf8Bytes(frame, AgentJson.Options);
 
-    /// <summary>Answers the resumable handshake (snapshot, then subscribe) on
-    /// one scripted connection.</summary>
+    /// <summary>Answers the resumable handshake (subscribe first, then
+    /// snapshot — the B1 order the session issues them in) on one scripted
+    /// connection.</summary>
     private static async Task AnswerHandshakeAsync(Stream stream, CancellationToken cancellationToken)
     {
-        await AnswerOneRequestAsync(stream, SnapshotPayload, cancellationToken);
         await AnswerOneRequestAsync(stream, new { watermark = 41ul, resync_required = false }, cancellationToken);
+        await AnswerOneRequestAsync(stream, SnapshotPayload, cancellationToken);
     }
 
     /// <summary>Answers one request with a success-wrapped payload — the
@@ -499,6 +500,159 @@ public class EventStreamTests
             await session.DisposeAsync();
         }
     }
+
+    /// <summary>B1 SNAP-GAP: the connect handshake subscribes BEFORE it
+    /// snapshots, and the snapshot's watermark dedups the stream — a durable
+    /// event at or below it never reaches the session stream twice (it is
+    /// already reflected in the snapshot), while live-only progress at the
+    /// same cursor relays (no snapshot ever carried it).</summary>
+    [Fact]
+    public async Task Connect_subscribes_before_snapshot_and_dedupes_the_stream_at_the_snapshot_watermark()
+    {
+        await using var host = new ScriptedEventHost();
+        var handshakeOrder = new List<string>();
+        host.Script = async (_, stream, cancellationToken) =>
+        {
+            // First frame: the subscribe must be issued before the snapshot.
+            var first = await FrameCodec.ReadFrameAsync(
+                stream, FrameCodec.DefaultMaxFrameBytes, cancellationToken)
+                ?? throw new InvalidOperationException("client closed mid-handshake");
+            using (var document = JsonDocument.Parse(first))
+            {
+                var operation = document.RootElement.GetProperty("route").GetProperty("operation").GetString();
+                handshakeOrder.Add(operation!);
+                Assert.Equal("subscribe", operation);
+                await WriteFrameAsync(
+                    stream,
+                    ResponseFrame(document.RootElement, new { status = "success", value = new { watermark = 41ul, resync_required = false } }),
+                    cancellationToken);
+            }
+
+            // Second frame: the snapshot, taken at watermark 41.
+            var second = await FrameCodec.ReadFrameAsync(
+                stream, FrameCodec.DefaultMaxFrameBytes, cancellationToken)
+                ?? throw new InvalidOperationException("client closed mid-handshake");
+            using (var document = JsonDocument.Parse(second))
+            {
+                var operation = document.RootElement.GetProperty("route").GetProperty("operation").GetString();
+                handshakeOrder.Add(operation!);
+                Assert.Equal("snapshot", operation);
+                await WriteFrameAsync(
+                    stream,
+                    ResponseFrame(document.RootElement, new { status = "success", value = SnapshotPayload }),
+                    cancellationToken);
+            }
+
+            // Stream traffic at and around the snapshot cut: the durable
+            // fact at the cut is IN the snapshot (must not relay), the
+            // live-only delta repeating the cut's cursor is not (must
+            // relay), and the durable fact above the cut is stream-only
+            // (must relay).
+            await WriteFrameAsync(stream, NotificationFrame(41ul, "{\"type\":\"task_completed\"}"), cancellationToken);
+            await WriteFrameAsync(stream, NotificationFrame(41ul, "{\"type\":\"model_delta\"}"), cancellationToken);
+            await WriteFrameAsync(stream, NotificationFrame(42ul, "{\"type\":\"run_started\"}"), cancellationToken);
+            // The query that installed this connection re-issues its own
+            // snapshot on it — answer exactly that one, then park.
+            await AnswerOneRequestAsync(stream, SnapshotPayload, cancellationToken);
+            await Task.Delay(Timeout.Infinite, cancellationToken);
+        };
+
+        var session = new ResumableSession(() => ConnectAsync(host.Port));
+        try
+        {
+            var snapshot = await session.SnapshotAsync().WaitAsync(TimeSpan.FromSeconds(10));
+            Assert.Equal(41ul, snapshot.Watermark);
+            Assert.Equal(new[] { "subscribe", "snapshot" }, handshakeOrder);
+
+            var reader = session.Events;
+            var delta = await ReadEventAsync(reader, TimeSpan.FromSeconds(10));
+            Assert.Equal("model_delta", delta.EventType);
+            Assert.Equal(41ul, delta.Envelope.Seq);
+            Assert.True(delta.IsLiveOnlyProgress);
+
+            var above = await ReadEventAsync(reader, TimeSpan.FromSeconds(10));
+            Assert.Equal("run_started", above.EventType);
+            Assert.Equal(42ul, above.Envelope.Seq);
+
+            // The durable fact at the cut was dropped in the pump, and
+            // nothing else leaked: exactly the two expected notifications.
+            Assert.False(reader.TryRead(out _));
+        }
+        finally
+        {
+            await session.DisposeAsync();
+        }
+    }
+
+    /// <summary>B1 reset boundary: installing the reconnecting connection
+    /// clears the session stream's unread backlog — the fresh snapshot
+    /// rebuilds all durable state, so an old connection's unread durable
+    /// fact never resurfaces after the new snapshot.</summary>
+    [Fact]
+    public async Task Reconnect_resets_the_stream_and_old_unread_events_do_not_survive()
+    {
+        await using var host = new ScriptedEventHost();
+        var dropFirst = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        host.Script = async (ordinal, stream, cancellationToken) =>
+        {
+            await AnswerHandshakeAsync(stream, cancellationToken);
+            await WriteFrameAsync(
+                stream,
+                NotificationFrame(
+                    100ul + (ulong)ordinal,
+                    ordinal == 0 ? "{\"type\":\"turn_completed\"}" : "{\"type\":\"task_completed\"}"),
+                cancellationToken);
+            if (ordinal == 0)
+            {
+                // Answer the drill query that installed this connection, then
+                // park until the drill drops the socket.
+                await AnswerOneRequestAsync(stream, SnapshotPayload, cancellationToken);
+                await dropFirst.Task.WaitAsync(cancellationToken);
+            }
+            else
+            {
+                while (!cancellationToken.IsCancellationRequested)
+                {
+                    await AnswerOneRequestAsync(stream, SnapshotPayload, cancellationToken);
+                }
+            }
+        };
+
+        var losses = new List<Exception>();
+        var session = new ResumableSession(() => ConnectAsync(host.Port));
+        session.ConnectionLost += failure => losses.Add(failure);
+        try
+        {
+            var first = await session.SnapshotAsync().WaitAsync(TimeSpan.FromSeconds(10));
+
+            // The old connection's announcement reached the session stream,
+            // but the drill deliberately does NOT read it.
+            var reader = session.Events;
+            Assert.True(
+                await reader.WaitToReadAsync(new CancellationTokenSource(TimeSpan.FromSeconds(10)).Token),
+                "the old connection's notification never reached the session stream");
+            Assert.Equal(1, reader.Count);
+
+            // Deterministic mid-stream loss, then the reconnect.
+            dropFirst.TrySetResult();
+            var second = await session.SnapshotAsync().WaitAsync(TimeSpan.FromSeconds(10));
+            Assert.Equal(41ul, second.Watermark);
+
+            // The reset dropped the unread backlog: the next stream fact is
+            // the NEW connection's announcement, never the old one's.
+            var next = await ReadEventAsync(reader, TimeSpan.FromSeconds(10));
+            Assert.Equal("task_completed", next.EventType);
+            Assert.Equal(101ul, next.Envelope.Seq);
+            Assert.False(reader.TryRead(out _));
+            Assert.Single(losses);
+            Assert.Equal(2, host.ConnectionsAccepted);
+            Assert.True(session.IsConnected);
+        }
+        finally
+        {
+            await session.DisposeAsync();
+        }
+    }
 }
 
 /// <summary>The queue's class-aware overflow policy, drilled directly.</summary>
@@ -536,6 +690,29 @@ public class BoundedEventQueuePolicyTests
             Assert.True(queue.Reader.TryRead(out var notification));
             Assert.Equal(seq, notification.Envelope.Seq);
         }
+    }
+
+    /// <summary>B1 reset boundary: Clear drops the whole backlog atomically
+    /// and leaves the stream open — new arrivals flow and completion state
+    /// is untouched.</summary>
+    [Fact]
+    public void Clear_drops_the_backlog_and_keeps_the_stream_open()
+    {
+        var queue = new BoundedEventQueue(4);
+        queue.TryEnqueue(Terminal(1));
+        queue.TryEnqueue(Progress(1));
+        queue.TryEnqueue(Terminal(2));
+
+        Assert.Equal(3, queue.Clear());
+        Assert.Equal(0, queue.Reader.Count);
+
+        // The stream stays open: a new arrival is readable and the dropped
+        // backlog is gone for good. (Completion semantics are the B2
+        // QUEUE-COMPLETION slice, deliberately not asserted here.)
+        Assert.True(queue.TryEnqueue(Terminal(3)));
+        Assert.True(queue.Reader.TryRead(out var notification));
+        Assert.Equal(3ul, notification.Envelope.Seq);
+        Assert.Equal(0, queue.DroppedCount);
     }
 
     [Fact]

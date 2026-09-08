@@ -44,8 +44,13 @@ public sealed class AgentUnknownOutcomeException : Exception
 /// pumped into the session-level bounded queue (same class-aware overflow
 /// policy); once a connection stops being the live one, its notifications
 /// stop being relayed — a reconnect never interleaves an old connection's
-/// leftovers into the new stream. The subscribe handshake already restarts
-/// the host stream at the current watermark on every reconnect.
+/// leftovers into the new stream. B1: every (re)connect subscribes BEFORE
+/// snapshotting (the host registers the receiver before its snapshot
+/// barrier), so no durable change can fall between the stream and the
+/// state read; the snapshot's watermark dedups the stream (durable events
+/// at or below it are relayed no more than once), and installing a new
+/// connection resets the stream — the old connection's unread backlog is
+/// dropped with the snapshot rebuilding all durable state.
 ///
 /// N4: the session is an <see cref="IAgentConnection"/>, so a UI shell can
 /// hold one connection abstraction whether it talks through this resumable
@@ -74,7 +79,11 @@ public sealed class ResumableSession : IAgentConnection, IAsyncDisposable
         _events = new BoundedEventQueue(_options.NotificationCapacity);
     }
 
-    /// <summary>Raised after every (re)connect with the fresh snapshot.</summary>
+    /// <summary>Raised after every (re)connect with the fresh snapshot. The
+    /// snapshot's <see cref="WorkSnapshotResponse.Watermark"/> is the
+    /// consumer's dedup cursor (B1): durable stream events at or below it
+    /// are already reflected in this snapshot; live-only progress
+    /// supersedes by turn/operation identity.</summary>
     public event Action<WorkSnapshotResponse>? Resynced;
 
     /// <summary>Raised when the live connection faults; the session stays
@@ -155,11 +164,15 @@ public sealed class ResumableSession : IAgentConnection, IAsyncDisposable
         WorkSnapshotResponse snapshot;
         try
         {
-            // A reconnect rebuilds from a snapshot; the subscribe handshake is
-            // issued so the host starts the stream at the current watermark.
+            // B1 SNAP-GAP: subscribe FIRST, then snapshot. The host's
+            // subscribe registers this connection's event receiver BEFORE its
+            // own snapshot barrier, so from this point every subsequent
+            // runtime event is captured by this connection — nothing can
+            // fall between the stream and the state read that follows it.
+            // (Snapshot-first left every durable change between the two
+            // calls in neither the snapshot nor the stream.)
             // The shared attempt must not inherit one waiter's cancellation
             // token, and each request stays bounded by its own timeout.
-            snapshot = await fresh.SnapshotAsync(CancellationToken.None).ConfigureAwait(false);
             try
             {
                 await fresh.SubscribeAsync(cancellationToken: CancellationToken.None).ConfigureAwait(false);
@@ -168,6 +181,7 @@ public sealed class ResumableSession : IAgentConnection, IAsyncDisposable
             {
                 // Subscribe refusal never blocks the snapshot path.
             }
+            snapshot = await fresh.SnapshotAsync(CancellationToken.None).ConfigureAwait(false);
         }
         catch
         {
@@ -193,10 +207,18 @@ public sealed class ResumableSession : IAgentConnection, IAsyncDisposable
             await fresh.DisposeAsync().ConfigureAwait(false);
             throw new ObjectDisposedException(nameof(ResumableSession));
         }
+        // B1: ordered reset boundary. The fresh snapshot rebuilds all durable
+        // state, so the replaced connection's unread backlog is pre-reset
+        // stale — drop it before the new pump starts, and never let an
+        // old-generation durable fact resurface after <see cref="Resynced"/>.
+        _events.Clear();
         // N3: one pump per installed connection relays its typed events into
         // the session-level stream; the pump ends when the connection stops
-        // being the live one.
-        _ = PumpEventsAsync(fresh);
+        // being the live one. The snapshot's watermark is the dedup cursor:
+        // durable events at or below it are already reflected in the
+        // snapshot raised below (and in this reconnect's reset), so the pump
+        // relays them no more than once.
+        _ = PumpEventsAsync(fresh, snapshot.Watermark);
         Resynced?.Invoke(snapshot);
         return fresh;
     }
@@ -210,8 +232,16 @@ public sealed class ResumableSession : IAgentConnection, IAsyncDisposable
     /// into the new stream. Completion of the connection's queue (fault or
     /// dispose) simply ends the pump; the session-level stream stays open
     /// for the next connection.
+    ///
+    /// B1: <paramref name="durableCursor"/> is the handshake snapshot's
+    /// watermark. Durable notifications at or below it are already reflected
+    /// in that snapshot, so the pump drops them (no double-count); live-only
+    /// progress (<c>model_delta</c>/<c>model_retrying</c>) repeats the
+    /// preceding durable cursor and never enters any snapshot, so it always
+    /// relays — its supersession fence is turn/operation identity, the
+    /// consumer's concern.
     /// </summary>
-    private async Task PumpEventsAsync(AgentConnection connection)
+    private async Task PumpEventsAsync(AgentConnection connection, ulong durableCursor)
     {
         try
         {
@@ -228,6 +258,11 @@ public sealed class ResumableSession : IAgentConnection, IAsyncDisposable
                     if (!current)
                     {
                         return;
+                    }
+                    if (!notification.IsLiveOnlyProgress
+                        && notification.Envelope.Seq <= durableCursor)
+                    {
+                        continue; // already reflected in the handshake snapshot
                     }
                     if (!_events.TryEnqueue(notification))
                     {
@@ -361,10 +396,12 @@ public sealed class ResumableSession : IAgentConnection, IAsyncDisposable
     /// connection's work/event notifications are relayed here in host order,
     /// bounded by the same class-aware policy as the connection queue.
     /// Reconnects are seamless for the consumer: the old connection's
-    /// notifications stop at the switch, the new connection starts from its
-    /// subscribe watermark, and this reader never changes. The stream ends
-    /// (with the reason) only if the queue must refuse an approval/terminal
-    /// notification, or when the session is disposed.
+    /// notifications stop at the switch, its unread backlog is reset (B1 —
+    /// the fresh snapshot rebuilds all durable state), the new connection
+    /// starts from its subscribe watermark with the snapshot watermark
+    /// deduping durable replays, and this reader never changes. The stream
+    /// ends (with the reason) only if the queue must refuse an
+    /// approval/terminal notification, or when the session is disposed.
     /// </summary>
     public ChannelReader<WorkEventNotification> Events => _events.Reader;
 

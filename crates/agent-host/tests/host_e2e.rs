@@ -864,8 +864,10 @@ fn read_response_collecting<R: serde::de::DeserializeOwned>(
 }
 
 /// Checks one notification against the subscribe handshake's contract:
-/// typed envelope, this run, strictly above the snapshot watermark (no
-/// loss, no double-count against the snapshot), non-decreasing cursor.
+/// typed envelope, this run, non-decreasing cursor, and the B1 kind split —
+/// a durable fact is strictly above the snapshot watermark (no loss, no
+/// double-count against the snapshot), while live-only progress repeats the
+/// preceding durable cursor and may sit at or below it.
 fn assert_notification(
     notification: &PlatformEnvelope<WorkEventNotification>,
     run_id: agent_contracts::RunId,
@@ -878,8 +880,8 @@ fn assert_notification(
     let envelope = &notification.payload.envelope;
     assert_eq!(envelope.run_id, run_id, "events must carry this run's id");
     assert!(
-        envelope.seq > watermark,
-        "event seq {} must be above the handshake watermark {watermark}",
+        envelope.seq > watermark || envelope.event.is_live_only(),
+        "durable event seq {} must be above the handshake watermark {watermark}",
         envelope.seq
     );
     if let Some(previous_seq) = previous_seq {

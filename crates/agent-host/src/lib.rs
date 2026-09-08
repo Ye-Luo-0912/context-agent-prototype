@@ -325,13 +325,23 @@ impl LiveStreams {
         self.len() == 0
     }
 
-    /// Interrupts every still-registered connection's pending I/O and
-    /// empties the table. Called while every connection is provably alive:
-    /// a worker removes its entry only after its request loop and its event
-    /// forwarder are done.
+    /// Interrupts every still-registered connection's pending I/O. The table
+    /// is NOT emptied here (B2 CANCEL-ALL): a stop request is not a worker
+    /// exit, and an emptied table would make [`LiveStreams::wait_empty`]
+    /// report completion the moment the hooks fire — granting released and
+    /// connections unwound would have been inferred, never observed. Each
+    /// worker removes its own entry after its request loop and event
+    /// forwarder are done, so the post-cancel [`LiveStreams::wait_empty`]
+    /// observes the real unwinding and the drain timeout leaves an explicit
+    /// unconfirmed residue instead of a fake success.
     fn cancel_all(&self) {
-        let mut cancels = self.cancels.lock().expect("live connection table poisoned");
-        for (_, cancel) in cancels.drain() {
+        let hooks: Vec<CancelHook> = {
+            let cancels = self.cancels.lock().expect("live connection table poisoned");
+            cancels.values().cloned().collect()
+        };
+        // Hooks run outside the table lock: an interrupt path that touches
+        // the table must not deadlock against the shutdown drain.
+        for cancel in hooks {
             cancel();
         }
     }
@@ -1136,6 +1146,12 @@ fn dispatch<W: Write + Send + 'static>(
     }
 }
 
+/// Re-decodes the payload half of an already-parsed envelope. The `work`
+/// identity of the ORIGINAL envelope is carried over untouched (B2 RETYPED):
+/// the router's validators decide on the request the client actually sent —
+/// a run-scoped envelope that arrived carrying a tool-operation work
+/// identity must be rejected by them, not silently cleaned into a legal
+/// request by the retype step.
 fn retyped<P: DeserializeOwned>(
     request: &PlatformEnvelope<serde_json::Value>,
 ) -> Result<PlatformEnvelope<P>, serde_json::Error> {
@@ -1145,7 +1161,7 @@ fn retyped<P: DeserializeOwned>(
         request_id: request.request_id,
         kind: request.kind,
         route: request.route.clone(),
-        work: None,
+        work: request.work.clone(),
         causality: request.causality.clone(),
         payload: serde_json::from_value(request.payload.clone())?,
     })
@@ -1229,6 +1245,44 @@ mod winpipe {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// B1 LIVE-DELTA: the watermark fence applies to durable facts only.
+    /// Live-only progress repeats the preceding durable cursor and must pass
+    /// regardless of it — a raw comparison erases the streaming segment.
+    #[test]
+    fn watermark_fence_splits_durable_from_live_only() {
+        let delta = |seq| RuntimeEventEnvelope {
+            run_id: agent_contracts::RunId::new(),
+            seq,
+            timestamp_ms: 0,
+            event: agent_contracts::RuntimeEvent::ModelDelta {
+                turn_id: agent_contracts::TurnId::new(),
+                operation_id: agent_contracts::OperationId::new(),
+                generation: 0,
+                delta: "chunk".into(),
+            },
+        };
+        let durable = |seq| RuntimeEventEnvelope {
+            run_id: agent_contracts::RunId::new(),
+            seq,
+            timestamp_ms: 0,
+            event: agent_contracts::RuntimeEvent::RunCompleted,
+        };
+
+        let watermark = 5;
+        // Durable at/below the watermark is already in the snapshot: dropped.
+        assert!(!forward_against_watermark(&durable(5), watermark));
+        assert!(!forward_against_watermark(&durable(1), watermark));
+        // Durable above it is stream-only: forwarded.
+        assert!(forward_against_watermark(&durable(6), watermark));
+        // Live-only progress repeats any cursor — including exactly the
+        // watermark's — and is always forwarded: no snapshot ever carried it.
+        assert!(forward_against_watermark(&delta(5), watermark));
+        assert!(forward_against_watermark(&delta(1), watermark));
+        // A fresh subscribe (watermark 0) forwards every durable event too.
+        assert!(forward_against_watermark(&durable(1), 0));
+        assert!(forward_against_watermark(&delta(0), 0));
+    }
 
     #[test]
     fn workspace_endpoint_suffix_is_stable_and_discriminating() {

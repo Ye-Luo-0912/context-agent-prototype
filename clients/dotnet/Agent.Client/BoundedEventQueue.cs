@@ -35,7 +35,10 @@ namespace FocusAgent.Client;
 /// on the next arrival). A completed queue reads out its backlog first, then
 /// ends the stream — or throws the completion error once drained, so a
 /// terminal overflow (or a connection fault relayed through the queue) is
-/// observed by the consumer, never swallowed.
+/// observed by the consumer, never swallowed. <see cref="ChannelReader{T}.Completion"/>
+/// follows the channel contract (B2 QUEUE-COMPLETION): it stays pending on
+/// a live, writable queue and settles (or faults) only after the write side
+/// has closed and the backlog has been drained.
 /// </summary>
 public sealed class BoundedEventQueue
 {
@@ -51,7 +54,14 @@ public sealed class BoundedEventQueue
     private bool _completed;
     private Exception? _error;
     private long _dropped;
-    private TaskCompletionSource _completion = NewCompletion(null);
+    /// <summary>B2 QUEUE-COMPLETION: one task from construction, completed
+    /// only when the write side has closed AND the backlog is drained — the
+    /// <see cref="ChannelReader{T}.Completion"/> contract. Swapping in an
+    /// already-completed task (at construction or on close) made
+    /// <see cref="Reader"/>.Completion report a live, writable queue as
+    /// complete.</summary>
+    private readonly TaskCompletionSource _completion =
+        new(TaskCreationOptions.RunContinuationsAsynchronously);
 
     public BoundedEventQueue(int capacity)
     {
@@ -78,18 +88,22 @@ public sealed class BoundedEventQueue
     private static TaskCompletionSource<bool> NewLatch() =>
         new(TaskCreationOptions.RunContinuationsAsynchronously);
 
-    private static TaskCompletionSource NewCompletion(Exception? error)
+    /// <summary>Settles <see cref="_completion"/> once no further read is
+    /// possible: the write side has closed and there is nothing left to
+    /// read. Caller must hold <see cref="_gate"/> and only call this when
+    /// both conditions hold — <see cref="TryComplete"/> with an empty
+    /// backlog, the last <see cref="QueueReader.TryRead"/> of a completed
+    /// queue, and <see cref="Clear"/> on a completed queue.</summary>
+    private void SettleCompletionLocked()
     {
-        var completion = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
-        if (error is not null)
+        if (_error is not null)
         {
-            completion.SetException(error);
+            _completion.TrySetException(_error);
         }
         else
         {
-            completion.SetResult();
+            _completion.TrySetResult();
         }
-        return completion;
     }
 
     /// <summary>The overflow policy. Returns false only for the terminal
@@ -135,9 +149,36 @@ public sealed class BoundedEventQueue
         }
     }
 
+    /// <summary>Drops every queued notification atomically (against
+    /// <see cref="QueueReader.TryRead"/> and <see cref="TryEnqueue"/>, under
+    /// the same lock) and returns how many were dropped. This is the B1
+    /// reconnect reset boundary: the fresh snapshot rebuilds all durable
+    /// state, so the replaced connection's unread backlog is pre-reset stale
+    /// and must not survive into the new stream. Completion state is left
+    /// untouched — a completed queue stays completed; if it had not yet
+    /// settled (backlog was still waiting to be drained), the dropped
+    /// backlog counts as drained and <see cref="Reader"/>.Completion settles
+    /// now.</summary>
+    public int Clear()
+    {
+        lock (_gate)
+        {
+            int dropped = _items.Count;
+            _items.Clear();
+            if (dropped > 0 && _completed)
+            {
+                SettleCompletionLocked();
+            }
+            return dropped;
+        }
+    }
+
     /// <summary>Ends the stream: readers drain the backlog, then see the end
     /// (or the completion error, if one was given). Later enqueues are
-    /// refused.</summary>
+    /// refused. The completion task settles when the backlog has been
+    /// drained — immediately if the queue is already empty, otherwise on
+    /// the last read (B2 QUEUE-COMPLETION: <see cref="Reader"/>.Completion
+    /// on a live queue stays pending).</summary>
     public bool TryComplete(Exception? error = null)
     {
         lock (_gate)
@@ -148,7 +189,10 @@ public sealed class BoundedEventQueue
             }
             _completed = true;
             _error = error;
-            _completion = NewCompletion(error);
+            if (_items.Count == 0)
+            {
+                SettleCompletionLocked();
+            }
             var latch = _signalled;
             _signalled = NewLatch();
             latch.TrySetResult(false);
@@ -172,8 +216,11 @@ public sealed class BoundedEventQueue
             get { lock (queue._gate) { return queue._items.Count; } }
         }
 
-        /// <summary>Completion faults when the queue was completed with an
-        /// error (terminal overflow, connection fault), else completes.</summary>
+        /// <summary>Completion settles after the write side has closed and
+        /// the backlog has been drained: it stays pending on a live queue,
+        /// completes on the last read of a cleanly closed one, and faults
+        /// when the queue was completed with an error (terminal overflow,
+        /// connection fault).</summary>
         public override Task Completion => queue._completion.Task;
 
         public override bool TryRead(out WorkEventNotification item)
@@ -184,6 +231,13 @@ public sealed class BoundedEventQueue
                 {
                     item = queue._items[0];
                     queue._items.RemoveAt(0);
+                    // The last read of a completed queue settles the
+                    // completion task (B2 QUEUE-COMPLETION): write side
+                    // closed + backlog drained is the completion contract.
+                    if (queue._items.Count == 0 && queue._completed)
+                    {
+                        queue.SettleCompletionLocked();
+                    }
                     return true;
                 }
             }
