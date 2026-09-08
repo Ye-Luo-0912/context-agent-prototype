@@ -775,7 +775,7 @@ mod tests {
         let mut byte_oversized = submit_request();
         // CJK triples the UTF-8 cost: under the char bound, over the byte
         // backstop that mirrors the runtime's input cap (M17-N3/F11).
-        byte_oversized.payload.goal = "好".repeat(MAX_WORK_GOAL_BYTES / 3);
+        byte_oversized.payload.goal = "好".repeat(MAX_WORK_GOAL_BYTES / 3 + 1);
         assert!(byte_oversized.payload.validate().is_err());
 
         let mut long_id = submit_request();
@@ -794,11 +794,12 @@ mod tests {
     fn multi_line_goals_are_legal_but_other_controls_fail() {
         let mut multi_line = submit_request();
         multi_line.payload.goal =
-            "fix the retry table:\n- first repro\n\t- then patch\r\nand add a regression";
+            "fix the retry table:\n- first repro\n\t- then patch\r\nand add a regression"
+                .to_owned();
         assert!(multi_line.payload.validate().is_ok());
 
         let mut other_control = submit_request();
-        other_control.payload.goal = "bad\u{1}control";
+        other_control.payload.goal = "bad\u{1}control".to_owned();
         assert!(other_control.payload.validate().is_err());
     }
 
