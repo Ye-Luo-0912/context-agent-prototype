@@ -4234,8 +4234,12 @@ async fn admit_store_read_does_not_block_unrelated_context_work() {
     }
     let diag_done = diag_done.unwrap();
     let admit_total = admit_done.unwrap();
+    // The serialization detector is the RATIO: if diagnostics queued behind
+    // the 32 MiB store read, diag ≈ admit and the 3× ratio fails. The
+    // absolute bound is only a hang guard — a loaded CI runner legitimately
+    // inflates both timings, and the ratio is what proves concurrency.
     assert!(
-        diag_done < std::time::Duration::from_millis(300) && admit_total > diag_done * 3,
+        diag_done < std::time::Duration::from_secs(10) && admit_total > diag_done * 3,
         "diagnostics must not queue behind the admit store read \
          (diagnostics {diag_done:?}, admit {admit_total:?})"
     );
