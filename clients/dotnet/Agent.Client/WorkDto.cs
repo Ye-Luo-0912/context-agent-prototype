@@ -344,6 +344,99 @@ public sealed record WorkSubscribeResponse : IProtocolPayload
     }
 }
 
+/// <summary>
+/// One forwarded runtime event envelope, mirroring the kernel's
+/// <c>agent_contracts::RuntimeEventEnvelope</c> (N3/F06 client half):
+/// run id, the durable journal cursor and the event itself, forwarded
+/// verbatim — the host never rewrites events.
+/// </summary>
+/// <remarks>
+/// The event body is deliberately kept as a raw JSON element: the client
+/// routes and bounds events by their <c>type</c> tag (serde
+/// <c>tag = "type", rename_all = "snake_case"</c>), it does not interpret
+/// kernel payloads — the typed view of run state is the snapshot's job, not
+/// a second event algebra to keep in drift-sync. Unknown envelope FIELDS are
+/// tolerated exactly like the Rust side (the kernel's
+/// <c>RuntimeEventEnvelope</c> derives serde without
+/// <c>deny_unknown_fields</c>); the notification wrapper around it stays
+/// deny-strict.
+/// </remarks>
+[JsonUnmappedMemberHandling(JsonUnmappedMemberHandling.Skip)]
+public sealed record RuntimeEventEnvelope
+{
+    /// <summary>Canonical run id (Rust <c>RunId</c>: a bare UUID).</summary>
+    [JsonPropertyName("run_id")]
+    public string RunId { get; init; } = string.Empty;
+
+    /// <summary>Cursor in the durable event journal. Journaled events are
+    /// contiguous from 1; <c>model_delta</c> and <c>model_retrying</c> are
+    /// live-only and repeat the cursor of the preceding durable event.</summary>
+    [JsonPropertyName("seq")]
+    public ulong Seq { get; init; }
+
+    [JsonPropertyName("timestamp_ms")]
+    public ulong TimestampMs { get; init; }
+
+    /// <summary>The type-tagged event object, verbatim.</summary>
+    [JsonPropertyName("event")]
+    public JsonElement Event { get; init; }
+
+    /// <summary>The event's snake_case type tag (empty when the frame is
+    /// malformed; <see cref="Validate"/> refuses that shape).</summary>
+    public string EventType =>
+        Event.ValueKind == JsonValueKind.Object
+        && Event.TryGetProperty("type", out var tag)
+        && tag.ValueKind == JsonValueKind.String
+            ? tag.GetString() ?? string.Empty
+            : string.Empty;
+
+    /// <summary>
+    /// The two events the kernel documents as live-only
+    /// (<c>model_delta</c>, <c>model_retrying</c>): they advance nothing
+    /// durably and carry newest-wins progress. Every other event type —
+    /// including every approval-relevant and terminal lifecycle fact — is
+    /// durable by default (fail closed).
+    /// </summary>
+    public bool IsLiveOnlyProgress => EventType is "model_delta" or "model_retrying";
+
+    public void Validate()
+    {
+        ProtocolIds.ValidateCanonical("work.event.envelope.run_id", RunId);
+        if (Event.ValueKind != JsonValueKind.Object)
+        {
+            throw new AgentContractViolationException(
+                "work.event.envelope.event", "must be a type-tagged object");
+        }
+        if (EventType.Length == 0)
+        {
+            throw new AgentContractViolationException(
+                "work.event.envelope.event.type", "must be a non-empty string tag");
+        }
+    }
+}
+
+/// <summary>
+/// One durable event forwarded to a subscribed session (the work/event
+/// notification route), mirroring Rust
+/// <c>agent-platform-protocol::work::WorkEventNotification</c>:
+/// <c>{ "envelope": &lt;RuntimeEventEnvelope&gt; }</c>.
+/// </summary>
+public sealed record WorkEventNotification : IProtocolPayload
+{
+    [JsonPropertyName("envelope")]
+    public RuntimeEventEnvelope Envelope { get; init; } = new();
+
+    /// <summary>Queue-pressure classification derived from the event type:
+    /// live-only progress may be shed under load; durable facts may not.</summary>
+    public bool IsLiveOnlyProgress => Envelope.IsLiveOnlyProgress;
+
+    /// <summary>The event's snake_case type tag — the classification key for
+    /// queue shedding and the consumer's first-level dispatch key.</summary>
+    public string EventType => Envelope.EventType;
+
+    public void Validate() => Envelope.Validate();
+}
+
 /// <summary>Rust derives serde without rename_all: wire values are "Allow"/"Deny".</summary>
 [JsonConverter(typeof(ApprovalDecisionConverter))]
 public enum ApprovalDecision

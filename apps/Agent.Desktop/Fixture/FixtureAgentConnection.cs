@@ -1,3 +1,4 @@
+using System.Threading.Channels;
 using FocusAgent.Client;
 
 namespace FocusAgent.Desktop.Fixture;
@@ -38,6 +39,16 @@ public sealed class FixtureAgentConnection : IAgentConnection
     ];
 
     public bool IsConnected { get; private set; } = true;
+
+    /// <summary>布局夹具不产出事件：一条已完结的空流即可。</summary>
+    public ChannelReader<WorkEventNotification> Events { get; } = CreateEmptyEvents();
+
+    private static ChannelReader<WorkEventNotification> CreateEmptyEvents()
+    {
+        var channel = Channel.CreateBounded<WorkEventNotification>(1);
+        channel.Writer.TryComplete();
+        return channel.Reader;
+    }
 
     public Task<WorkSubmitResponse> SubmitWorkAsync(string goal, string clientRequestId, CancellationToken cancellationToken = default)
     {
