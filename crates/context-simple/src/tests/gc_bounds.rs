@@ -2,10 +2,17 @@
 //! counters, failed overflow writes spill into a retry list instead of
 //! growing the warm buffer past its cap, and the external view stops
 //! collecting once the 32-row limit is reached.
+//!
+//! Cancellation and durability of the externalize/recall pipeline live here
+//! too: a dropped IO phase never loses items (ownership stays in the retry
+//! list), and a recalled blob is not deleted until the reconcile reclaims
+//! it against the live state.
 
-use agent_contracts::{ContextEngine, ContextIngress, ContextQuery};
+use agent_contracts::{
+    ContextEngine, ContextIngress, ContextKind, ContextQuery, ContextScope, ContextRetention,
+};
 
-use crate::engine::{SimpleContextConfig, SimpleContextEngine, truncate_report_rows};
+use crate::engine::{SimpleContextConfig, SimpleContextEngine, State, truncate_report_rows};
 
 use super::harness::*;
 
@@ -101,6 +108,177 @@ async fn failed_externalization_spills_into_retry_not_into_the_buffer() {
             "the spill keeps every failed overflow item"
         );
     }
+}
+
+/// The externalize pipeline is cancellation-safe: the plan carries only
+/// ids and pre-serialized bytes, while the items stay in
+/// `pending_externalize_retry` until the commit applies a successful
+/// write. Dropping the IO phase (a cancelled future, a panicked join)
+/// abandons writes — never content.
+#[test]
+fn dropped_externalize_plan_keeps_items_owned_by_the_state() {
+    let config = SimpleContextConfig {
+        gc_enabled: true,
+        gc_buffer_capacity: 1,
+        ..SimpleContextConfig::default()
+    };
+    let mut state = State::default();
+    let working = |state: &State, content: &str| {
+        crate::item::make_item(
+            state,
+            &config,
+            content.into(),
+            ContextKind::ToolObservation,
+            ContextScope::Session,
+            ContextRetention::Working,
+            0.5,
+            Some("tool:shell.exec".into()),
+        )
+    };
+    let spill = working(&state, "spilled by the previous failed pass");
+    let overflow_a = working(&state, "overflow beyond the buffer cap: a");
+    let overflow_b = working(&state, "overflow beyond the buffer cap: b");
+    let spill_id = spill.id;
+    let overflow_a_id = overflow_a.id;
+    state.pending_externalize_retry.push(spill);
+    state.eviction_buffer.push(overflow_a);
+    state.eviction_buffer.push(overflow_b);
+
+    let mut plan = crate::gc::full::plan_full_gc(&mut state, &config, 1, 1)
+        .expect("a pass is due: the buffer holds content");
+    assert_eq!(plan.externalize.len(), 3, "spill + overflow are all planned");
+    assert_eq!(
+        state.eviction_buffer.len(),
+        1,
+        "the plan brings the buffer back to its cap"
+    );
+    assert_eq!(
+        state.pending_externalize_retry.len(),
+        3,
+        "ownership never leaves the state during the IO window"
+    );
+
+    // Cancelled mid-IO: the plan is dropped without store writes or commit.
+    drop(plan);
+    assert_eq!(
+        state.pending_externalize_retry.len(),
+        3,
+        "a dropped plan loses nothing"
+    );
+
+    // The next pass plans again; at commit, only the writes that actually
+    // landed leave the retry list.
+    let plan = crate::gc::full::plan_full_gc(&mut state, &config, 2, 2)
+        .expect("the retry list keeps the pass due");
+    let io = crate::gc::full::GcIoResult {
+        externalized: vec![(spill_id, "checksum".to_string())],
+        recalled: Vec::new(),
+    };
+    let report = crate::gc::full::commit_full_gc(&mut state, 2, plan, io);
+    assert_eq!(report.externalized, 1);
+    assert!(
+        state.external.get(spill_id).is_some(),
+        "the landed write joined the external map"
+    );
+    assert!(
+        state.external.get(overflow_a_id).is_none(),
+        "writes that did not land must not join the map"
+    );
+    assert_eq!(
+        state.pending_externalize_retry.len(),
+        2,
+        "the unwritten overflow stays for the next pass"
+    );
+}
+
+/// A recalled blob is not deleted at recall time: the in-memory commit is
+/// not a persistence barrier, and the newest durable checkpoint may still
+/// reference the blob through the external entry this pass just removed.
+/// The blob survives until the reconcile reclaims it as a stale duplicate
+/// against the live state.
+#[tokio::test]
+async fn recalled_blob_survives_until_the_reconcile_reclaims_it() {
+    let dir = tempfile::tempdir().unwrap();
+    let engine = SimpleContextEngine::new(SimpleContextConfig {
+        gc_reactivate_per_pass: 8,
+        context_store_dir: Some(dir.path().to_path_buf()),
+        ..SimpleContextConfig::default()
+    });
+    open_focus(&engine, "service layer").await;
+
+    // One cold entry with a hot entity, its blob actually on disk.
+    let item_id = {
+        let mut state = engine.state.lock().await;
+        let mut item = crate::item::make_item(
+            &state,
+            &engine.config,
+            "step 0: fix the AuthService token cache".into(),
+            ContextKind::ToolObservation,
+            ContextScope::Session,
+            ContextRetention::Working,
+            0.5,
+            Some("tool:shell.exec".into()),
+        );
+        item.entities = vec!["auth-cache".into()];
+        item.scope_id = None;
+        let context_ref = crate::store::externalize(dir.path(), &item).unwrap();
+        state.external.push(crate::store::to_external_entry(
+            &item,
+            context_ref,
+            1,
+            1,
+            None,
+        ));
+        state.user_hot_entities.push("auth-cache".into());
+        state.rebuild_hot_entities();
+        item.id
+    };
+
+    // The durable checkpoint that still references the blob.
+    let before_recall = engine.checkpoint().await.unwrap();
+
+    let report = engine.gc().await.unwrap();
+    assert!(
+        report.store_recalled_items >= 1,
+        "the hot entity must recall the cold entry: {report:?}"
+    );
+    assert!(
+        engine
+            .state
+            .lock()
+            .await
+            .items
+            .iter()
+            .any(|item| item.id == item_id),
+        "the recalled item must be resident again"
+    );
+    let blob = dir.path().join(format!("{item_id}.json"));
+    assert!(
+        blob.exists(),
+        "the recalled blob must survive the recall commit — the newest \
+         durable checkpoint may still reference it"
+    );
+
+    // Crash replay: restoring the pre-recall checkpoint must still find the
+    // blob readable through the restored external entry.
+    engine.restore(before_recall).await.unwrap();
+    assert!(
+        engine.fetch_external(item_id).await.unwrap().is_some(),
+        "the restored checkpoint's external entry must still be readable"
+    );
+
+    // Only the reconcile, running against the live state, reclaims the
+    // leftover duplicate.
+    let _ = engine.gc().await.unwrap();
+    let reconcile = engine.reconcile_store().await.unwrap();
+    assert!(
+        reconcile.deleted_stale >= 1,
+        "the reconcile reclaims the stale duplicate: {reconcile:?}"
+    );
+    assert!(
+        !blob.exists(),
+        "the stale blob is reclaimed once the live state no longer references it"
+    );
 }
 
 /// One hot entity with a huge bucket must not stage every descriptor before

@@ -4162,12 +4162,12 @@ async fn failed_ledger_export_merges_rows_back() {
 #[tokio::test]
 async fn admit_store_read_does_not_block_unrelated_context_work() {
     let dir = tempfile::tempdir().unwrap();
-    let engine = SimpleContextEngine::new(SimpleContextConfig {
+    let engine = Arc::new(SimpleContextEngine::new(SimpleContextConfig {
         gc_buffer_capacity: 1,
         gc_reactivate_per_pass: 8,
         context_store_dir: Some(dir.path().to_path_buf()),
         ..SimpleContextConfig::default()
-    });
+    }));
     open_focus(&engine, "service layer").await;
     engine
         .ingest(ContextIngress::UserMessage {
@@ -4175,15 +4175,16 @@ async fn admit_store_read_does_not_block_unrelated_context_work() {
         })
         .await
         .unwrap();
-    // One oversized observation feeds the eviction queue first, so the
-    // buffer overflow externalizes it and reading it back measurably
-    // outlives any lock section.
-    let large = format!(
-        "step 0: fix AuthService.rs {}",
-        "y".repeat(32 * 1024 * 1024)
-    );
+    // Observations feed the eviction queue; with a buffer capacity of one
+    // the overflow externalizes, so the admit below takes the store-read
+    // path (plan under the lock, read outside it).
     let observations = [
-        observation_touching("step-0", true, &large, Some("AuthService.rs")),
+        observation_touching(
+            "step-0",
+            true,
+            "step 0: fix AuthService.rs (token cache warmup path)",
+            Some("AuthService.rs"),
+        ),
         observation_touching("step-1", true, "step: read view", Some("CacheStore.rs")),
         observation_touching("step-2", true, "step: token cache", Some("TokenCache.rs")),
     ];
@@ -4208,39 +4209,69 @@ async fn admit_store_read_does_not_block_unrelated_context_work() {
     );
     let target = gc_report.externalized_ids[0];
 
-    let t0 = std::time::Instant::now();
-    let admit = engine.ingest(ContextIngress::ContextDirective {
-        action: ContextAction::Admit {
-            item_id: target,
-            reason: "the model needs this step again".into(),
-        },
+    // Deterministic barrier, no timing inference: park the admit exactly at
+    // its external-read boundary (state lock released), prove an unrelated
+    // read-only operation completes *while the read is parked*, then release
+    // and finish the admit. The timeouts are deadlock guards, not the
+    // assertion — the assertion is that diagnostics returns at all before
+    // the release fires.
+    let planned = Arc::new(tokio::sync::Notify::new());
+    let release = Arc::new(tokio::sync::Notify::new());
+    *engine
+        .admit_read_pause
+        .lock()
+        .expect("admit test pause mutex poisoned") = Some(crate::engine::IoBoundaryPause {
+        planned: Arc::clone(&planned),
+        release: Arc::clone(&release),
     });
-    let diag = engine.diagnostics();
-    tokio::pin!(admit);
-    tokio::pin!(diag);
-    let mut diag_done = None;
-    let mut admit_done = None;
-    while diag_done.is_none() || admit_done.is_none() {
-        tokio::select! {
-            outcome = &mut diag, if diag_done.is_none() => {
-                outcome.unwrap();
-                diag_done = Some(t0.elapsed());
-            }
-            outcome = &mut admit, if admit_done.is_none() => {
-                outcome.unwrap();
-                admit_done = Some(t0.elapsed());
-            }
-        }
+
+    let admit = {
+        let engine = Arc::clone(&engine);
+        tokio::spawn(async move {
+            engine
+                .ingest(ContextIngress::ContextDirective {
+                    action: ContextAction::Admit {
+                        item_id: target,
+                        reason: "the model needs this step again".into(),
+                    },
+                })
+                .await
+        })
+    };
+    tokio::time::timeout(std::time::Duration::from_secs(10), planned.notified())
+        .await
+        .expect("admit reached its external-read boundary");
+
+    // While the store read is parked, diagnostics (state lock only) must
+    // complete: if the read ever ran under the state lock, this await would
+    // hang into the timeout instead of racing the release.
+    let diagnostics = tokio::time::timeout(std::time::Duration::from_secs(10), {
+        let engine = Arc::clone(&engine);
+        async move { engine.diagnostics().await }
+    })
+    .await
+    .expect("diagnostics must not queue behind the admit store read")
+    .unwrap();
+
+    release.notify_one();
+    admit.await.unwrap().unwrap();
+
+    // The parked read still admitted the right item: the target is resident
+    // again and the external map no longer owns it.
+    {
+        let state = engine.state.lock().await;
+        assert!(
+            state.items.iter().any(|item| item.id == target),
+            "the admitted item must be resident again (diagnostics said {} items)",
+            diagnostics.total_items
+        );
+        assert!(
+            state.external.get(target).is_none(),
+            "the external map must not keep owning the admitted item"
+        );
     }
-    let diag_done = diag_done.unwrap();
-    let admit_total = admit_done.unwrap();
-    // The serialization detector is the RATIO: if diagnostics queued behind
-    // the 32 MiB store read, diag ≈ admit and the 3× ratio fails. The
-    // absolute bound is only a hang guard — a loaded CI runner legitimately
-    // inflates both timings, and the ratio is what proves concurrency.
-    assert!(
-        diag_done < std::time::Duration::from_secs(10) && admit_total > diag_done * 3,
-        "diagnostics must not queue behind the admit store read \
-         (diagnostics {diag_done:?}, admit {admit_total:?})"
-    );
+    *engine
+        .admit_read_pause
+        .lock()
+        .expect("admit test pause mutex poisoned") = None;
 }

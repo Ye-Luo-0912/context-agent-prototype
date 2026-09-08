@@ -934,14 +934,24 @@ fn event_notification_envelope(
 /// * a failed write — the consumer is gone or wedged past the shutdown
 ///   cancel; the connection is torn down through the shared cancel hook.
 ///
-/// Events at or below the handshake watermark are dropped on purpose:
-/// `WorkControlRouter::subscribe` registers the receiver *before* its
-/// snapshot barrier, so queued events at or below the watermark are already
-/// reflected in the snapshot the client holds; forwarding them would
-/// double-count them. (Live-only deltas repeat the preceding durable
-/// cursor, so the filter can drop an overlapping delta — the contract
-/// already defines them as superseded by turn/operation identity, not by
-/// this cursor.)
+/// Events are filtered against the handshake watermark by kind (B1
+/// LIVE-DELTA):
+///
+/// * a **durable** event at or below the watermark is dropped on purpose:
+///   `WorkControlRouter::subscribe` registers the receiver *before* its
+///   snapshot barrier, so every durable event at or below that watermark is
+///   already reflected in the snapshot the client holds; forwarding it would
+///   double-count it.
+/// * a **live-only** event (`ModelDelta`/`ModelRetrying`) is always
+///   forwarded: it repeats the preceding durable cursor instead of
+///   consuming one, and its content never enters any snapshot, so a raw
+///   cursor comparison would erase the whole streaming segment that follows
+///   the cursor event. Supersession is the consumer's job, by the
+///   turn/operation/generation identity the contract names as the fence —
+///   the durable truth still arrives later in the journal.
+fn forward_against_watermark(envelope: &RuntimeEventEnvelope, watermark: u64) -> bool {
+    envelope.seq > watermark || envelope.event.is_live_only()
+}
 fn spawn_event_forwarder<W: Write + Send + 'static>(
     mut receiver: broadcast::Receiver<RuntimeEventEnvelope>,
     watermark: u64,
@@ -968,7 +978,7 @@ fn spawn_event_forwarder<W: Write + Send + 'static>(
                 .block_on(async { tokio::time::timeout(FORWARDER_TICK, receiver.recv()).await });
             match received {
                 Ok(Ok(envelope)) => {
-                    if envelope.seq <= watermark {
+                    if !forward_against_watermark(&envelope, watermark) {
                         continue;
                     }
                     let notification = event_notification_envelope(&identity, envelope);

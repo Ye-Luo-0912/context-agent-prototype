@@ -6,7 +6,7 @@ use agent_contracts::{
 use std::sync::Arc;
 use tokio::sync::Notify;
 
-use crate::engine::{MaterializeIoPause, SimpleContextConfig, SimpleContextEngine};
+use crate::engine::{IoBoundaryPause, SimpleContextConfig, SimpleContextEngine};
 
 use super::harness::*;
 
@@ -328,7 +328,7 @@ async fn concurrent_restore_waits_for_stored_materialization_and_clears_its_prev
     *engine
         .materialize_io_pause
         .lock()
-        .expect("materialize test pause mutex poisoned") = Some(MaterializeIoPause {
+        .expect("materialize test pause mutex poisoned") = Some(IoBoundaryPause {
         planned: Arc::clone(&planned),
         release: Arc::clone(&release),
     });

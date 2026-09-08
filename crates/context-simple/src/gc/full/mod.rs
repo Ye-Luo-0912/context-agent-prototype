@@ -2,7 +2,7 @@ use std::collections::HashSet;
 
 use agent_contracts::{
     AttentionState, ContextEviction, ContextGcReport, ContextItem, ContextItemId, ContextKind,
-    ContextReactivation, ContextRef, ContextResidency, ContextRetention, ContextScope, CoreLabel,
+    ContextReactivation, ContextResidency, ContextRetention, ContextScope, CoreLabel,
     DependencyEdge, FocusState, Label, LifecycleAxis, ScopeId, ScopeKind, ScopeState, TaskId,
     checked_files_cover_path,
 };
@@ -28,11 +28,13 @@ const MAX_MARKED_DEPENDENCIES: usize = 8;
 /// reading back hot-entity recall candidates) which must not hold the
 /// lock, plus the commit that applies the IO results.
 pub(crate) struct GcPlan {
-    /// Buffer items whose store write is deferred to the IO phase (oldest
-    /// first; removed from the buffer by the plan). Each carries the bytes
-    /// serialized under the lock, so the IO phase never needs the state
-    /// lock to re-read the item.
-    pub(crate) externalize: Vec<(ContextItem, Vec<u8>)>,
+    /// Store writes planned for the IO phase (oldest first): the item id and
+    /// the bytes serialized under the lock. The *items themselves* stay in
+    /// `state.pending_externalize_retry` until the commit applies a
+    /// successful write — if this future is dropped mid-IO (cancellation,
+    /// panic), the state still owns every item and the next pass retries
+    /// them, exactly like a failed write.
+    pub(crate) externalize: Vec<(ContextItemId, Vec<u8>)>,
     /// Cold-store entry ids whose entities match the hot set; read back in
     /// the IO phase. Each carries the ownership checksum captured on the
     /// external entry so the read is a verified recall, never a silent
@@ -52,12 +54,11 @@ pub(crate) struct GcPlan {
 
 /// The store IO outcomes, applied by the commit under a fresh lock.
 pub(crate) struct GcIoResult {
-    /// (item, reference, checksum) successfully written to the store.
-    pub(crate) externalized: Vec<(ContextItem, ContextRef, String)>,
-    /// Items whose store write failed, oldest first; the commit reinserts
-    /// them at the front of the buffer so the overflow retries next pass
-    /// (the store-unavailable fallback, decided outside the lock).
-    pub(crate) externalize_failed: Vec<ContextItem>,
+    /// (item id, checksum) of the store writes that succeeded. The commit
+    /// phase removes each item from `pending_externalize_retry` and adds the
+    /// external entry; a write that did not succeed simply stays in the
+    /// retry list.
+    pub(crate) externalized: Vec<(ContextItemId, String)>,
     /// Recalled items with full content read back from the store.
     pub(crate) recalled: Vec<ContextItem>,
 }
@@ -274,18 +275,24 @@ pub(crate) fn plan_full_gc(
     // the writes happen in the IO phase so the lock is not held across
     // disk IO. Only Storage GC may delete store files.
     //
-    // Spilled writes from a failed pass retry first: they are the oldest
-    // overflow and are already out of the (bounded) warm buffer.
-    let spill = std::mem::take(&mut state.pending_externalize_retry);
-    plan.externalize.extend(spill.into_iter().map(|item| {
-        let bytes = serde_json::to_vec(&item).expect("context items serialize");
-        (item, bytes)
-    }));
+    // Ownership never leaves the state: spilled retries stay in
+    // `pending_externalize_retry`, and the fresh overflow moves there too
+    // (oldest first — existing retries are already the oldest). The plan
+    // carries only ids + pre-serialized bytes, so a dropped IO phase (a
+    // cancelled future, a panicked join) cannot lose items: the next pass
+    // retries them through the same list, exactly like a failed write.
     while state.eviction_buffer.len() > config.gc_buffer_capacity {
         let item = state.eviction_buffer.remove(0);
-        let bytes = serde_json::to_vec(&item).expect("context items serialize");
-        plan.externalize.push((item, bytes));
+        state.pending_externalize_retry.push(item);
     }
+    plan.externalize = state
+        .pending_externalize_retry
+        .iter()
+        .map(|item| {
+            let bytes = serde_json::to_vec(item).expect("context items serialize");
+            (item.id, bytes)
+        })
+        .collect();
 
     // Cold -> External aging: entries untouched for the configured number
     // of full GC generations become references only.
@@ -300,38 +307,34 @@ pub(crate) fn plan_full_gc(
 /// heap/buffer stay in their post-plan state during this window, so
 /// concurrent ingests see a consistent post-sweep heap.
 ///
+/// Cancellation-safe by construction: the items themselves never leave
+/// `state.pending_externalize_retry` (the plan carries only ids and
+/// pre-serialized bytes), so dropping this future mid-IO abandons at most
+/// some writes — never the items. A half-written blob never exists (the
+/// write is atomic via temp + rename), and an abandoned write that did
+/// land is re-owned or deleted by the startup reconcile.
+///
 /// IO concurrency is bounded (`store::MAX_STORE_IO_CONCURRENCY`): the
 /// phase holds no state lock, so parallelism shrinks the lock-free window
 /// to the slowest single op — but unbounded parallelism would pile up file
-/// descriptors on a store with many blobs. A `JoinError` (task panic) is
-/// unreachable in practice because every fallible step returns a `Result`,
-/// yet the source item is still recovered: items never move *into* the
-/// spawned tasks (only pre-serialized bytes do), so on any join failure the
-/// remaining pending items return to the buffer instead of being lost with
-/// their task.
+/// descriptors on a store with many blobs.
 pub(crate) async fn run_store_io(config: &SimpleContextConfig, plan: &mut GcPlan) -> GcIoResult {
     let dir = store::store_dir(config);
     let semaphore =
         std::sync::Arc::new(tokio::sync::Semaphore::new(store::MAX_STORE_IO_CONCURRENCY));
     let mut io = GcIoResult {
         externalized: Vec::new(),
-        externalize_failed: Vec::new(),
         recalled: Vec::new(),
     };
 
-    // Write overflow items concurrently. The item itself stays with the
-    // caller (id-keyed) so a join failure cannot lose it; the task receives
-    // only the pre-serialized bytes and writes them atomically.
+    // Write overflow items concurrently. Only the pre-serialized bytes
+    // cross into the task; the owning items stay in the state's retry
+    // list until the commit removes them on success.
     let pending = std::mem::take(&mut plan.externalize);
-    let mut pending_items: std::collections::HashMap<ContextItemId, (ContextItem, Vec<u8>)> =
-        pending
-            .into_iter()
-            .map(|(item, bytes)| (item.id, (item, bytes)))
-            .collect();
+    let pending_bytes: std::collections::HashMap<ContextItemId, Vec<u8>> =
+        pending.into_iter().collect();
     let mut writes = tokio::task::JoinSet::new();
-    for (id, (_, bytes)) in &pending_items {
-        // Only the pre-serialized bytes cross into the task; the map (and
-        // the full items it holds for error recovery) is never cloned.
+    for (id, bytes) in &pending_bytes {
         let id = *id;
         let bytes = bytes.clone();
         let dir = dir.clone();
@@ -345,33 +348,18 @@ pub(crate) async fn run_store_io(config: &SimpleContextConfig, plan: &mut GcPlan
     }
     while let Some(joined) = writes.join_next().await {
         match joined {
-            Ok((id, Ok(checksum))) => {
-                if let Some((item, _)) = pending_items.remove(&id) {
-                    let context_ref = store::make_context_ref(&item);
-                    io.externalized.push((item, context_ref, checksum));
-                }
-            }
+            Ok((id, Ok(checksum))) => io.externalized.push((id, checksum)),
             Ok((id, Err(_))) => {
-                if let Some((item, _)) = pending_items.remove(&id) {
-                    io.externalize_failed.push(item);
-                }
+                // The write failed; the item stays in the retry list and
+                // the next pass retries it. Nothing to recover here.
+                let _ = id;
             }
-            // A task panicked: its id is unknowable, so the conservative
-            // recovery returns *every* item that has not been consumed yet
-            // to the buffer (a partially written blob is re-owned or
-            // deleted by the startup reconcile). No item is lost with its
-            // task.
-            Err(_) => {
-                io.externalize_failed
-                    .extend(pending_items.drain().map(|(_, (item, _))| item));
-                break;
-            }
+            // A task panicked: the remaining writes are abandoned. The
+            // items are still owned by the state's retry list, so this is
+            // merely a partially completed pass, never a loss.
+            Err(_) => break,
         }
     }
-    // Any items whose tasks never completed (loop exited early) go back to
-    // the buffer too.
-    io.externalize_failed
-        .extend(pending_items.into_iter().map(|(_, (item, _))| item));
 
     // Recall reads: only entries whose entities matched are read; failed
     // reads leave the entry in the map for a later pass. Same bounded
@@ -399,41 +387,46 @@ pub(crate) async fn run_store_io(config: &SimpleContextConfig, plan: &mut GcPlan
 }
 
 /// One full GC pass, phase 3 (commit, under a fresh state lock): apply the
-/// IO results — externalized entries join the map, recalled items re-enter
-/// the heap, failed writes return to the buffer — and assemble the report.
+/// IO results — successful writes leave the retry list and join the
+/// external map as Cold entries, recalled items re-enter the heap, failed
+/// writes simply stay in the retry list — and assemble the report.
 ///
-/// Returns the report plus the ids of store blobs that must be deleted
-/// *after* the commit: successfully recalled content is resident again, so
-/// its blob is only removed once the commit landed (a crash between commit
-/// and delete leaves an orphan the startup reconcile re-owns).
+/// A recalled blob is deliberately NOT deleted here. This commit is an
+/// in-memory transition, not a persistence barrier: the newest durable
+/// checkpoint may still reference the blob through the external entry this
+/// pass just removed, and a crash before the next checkpoint would leave
+/// that restore pointing at a deleted file. The blob stays on disk and is
+/// reclaimed later by the startup reconcile's stale-duplicate rule, which
+/// runs against the state actually restored (session boundaries) — and by
+/// Storage GC, the only other place files are permanently deleted.
 pub(crate) fn commit_full_gc(
     state: &mut State,
     now_tick: u64,
     mut plan: GcPlan,
     io: GcIoResult,
-) -> (ContextGcReport, Vec<ContextItemId>) {
-    // Failed overflow writes spill into the retry list instead of growing
-    // the warm buffer past its cap: the hot buffer stays bounded, the
-    // content stays lossless, and the next pass retries the spill first
-    // (order preserved, oldest first).
-    state
-        .pending_externalize_retry
-        .extend(io.externalize_failed);
-
+) -> ContextGcReport {
     // The store map: successful writes become Cold entries (carrying the
-    // checksum captured at write time for the reconcile)...
+    // checksum captured at write time for the reconcile). Items that did
+    // not move out of the retry list this pass stay there and retry next
+    // pass, oldest first.
     let externalized_count = io.externalized.len();
     let externalized_ids: Vec<ContextItemId> =
-        io.externalized.iter().map(|(item, _, _)| item.id).collect();
-    // Store I/O accounting: the bodies written this pass, read back this
-    // pass, and how many items were recalled (baseline report, aggregated by
-    // the eval harness from the event stream).
-    let store_write_bytes = io
-        .externalized
-        .iter()
-        .map(|(item, _, _)| item.content.len() as u64)
-        .sum::<u64>();
-    for (item, context_ref, checksum) in io.externalized {
+        io.externalized.iter().map(|(id, _)| *id).collect();
+    let mut store_write_bytes = 0u64;
+    for (id, checksum) in io.externalized {
+        let Some(position) = state
+            .pending_externalize_retry
+            .iter()
+            .position(|item| item.id == id)
+        else {
+            // The gate serializes whole-state operations, so the item
+            // cannot have left the list between plan and commit; skip
+            // defensively rather than fabricate a second owner.
+            continue;
+        };
+        let item = state.pending_externalize_retry.remove(position);
+        store_write_bytes += item.content.len() as u64;
+        let context_ref = store::make_context_ref(&item);
         state.gc_externalized_total += 1;
         state.external.push(store::to_external_entry(
             &item,
@@ -526,7 +519,7 @@ pub(crate) fn commit_full_gc(
     let mut reactivations = plan.buffer_reactivations;
     reactivations.extend(recalled_reactivations);
     report.reactivations = reactivations;
-    (report, recalled_ids.into_iter().collect())
+    report
 }
 
 /// Mark the root set: pins, members of the active focus scope tree, durable

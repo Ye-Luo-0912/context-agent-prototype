@@ -1,6 +1,8 @@
 # 缺陷分流
 
-当前执行顺序由 [NEXT_TASKS.md](NEXT_TASKS.md) 前列决定：**M17 收尾 N 系列，N0 当前**。M16 与 2026-09-06/07 两轮审查的代码项保持关闭；2026-09-08 外部闭环审查（基线 `11afdd7`）的 F01–F20 见下方新表，映射 N0–N8，不重开已关闭项。
+当前执行顺序由 [NEXT_TASKS.md](NEXT_TASKS.md) 前列决定：**M17 收尾 N 系列（N4 主体落地、验收待 CI）＋并行三线 A/B/C（2026-09-09 开线）**。M16 与 2026-09-06/07/08 三轮审查的代码项保持关闭；2026-09-09 三线审查（基线 `bbf7f5d`）的新表见下方，映射 A/B/C 切片，不重开已关闭项。
+
+2026-09-09 审查原文：[reviews/2026-09-09-audit-bbf7f5d-three-tracks/REPORT.md](reviews/2026-09-09-audit-bbf7f5d-three-tracks/REPORT.md)。
 
 2026-09-08 审查原文：[reviews/2026-09-08-closure-audit-11afdd7/REPORT.md](reviews/2026-09-08-closure-audit-11afdd7/REPORT.md)（FINDINGS.json/LOCAL_PROBES.json 同目录）。
 原报告与探针：[reviews/2026-09-06-deep-audit/REVIEW.md](reviews/2026-09-06-deep-audit/REVIEW.md)。
@@ -36,6 +38,28 @@
 | **F20（→N0/N8）** | 半帧样本 `00000009`（LE=150994944，先触发超长帧拒绝）；交错测试是两条连接；interop retry 用新 key；host 线程 join 错误被忽略 | 修准现有用例：合法长度半帧、单连接乱序、原 key 重试、执行后丢 ACK、服务线程结果必须检查 | 不建第三套 harness；测试全绿≠路径已验证 |
 
 审查同时确认**不再原样重报**的已修复项：监督身份化台账/类型化对账/确认式清理、proof 监督接线、metadata 发布围栏、原子 StartWork、同任务同 VerificationProbe 验证关联、skill_read＋MCP/Plugin 配置缝（见 CURRENT「已修好」段与 2026-09-07 表的关闭记录）。
+
+## 2026-09-09 三线审查（基线 `bbf7f5d` → 并行三线 A/B/C）
+
+静态审查＋远端 CI 观察＋隔离 Python 探针（无完整 checkout——克隆仍败于 DNS、无 Rust/.NET 工具链、未运行仓库构建/测试；20 个 crate 目录树核对、28 路径重点阅读其中 14 全文；探针不是回归测试）。标注「已复核」的定位已于 2026-09-09 在本工作树 HEAD `7e026ee` 静态确认；其余为报告结论，实施前按工单现场复核。基线后 `9fb2030`/`433d21e`/`843803f`/`7e026ee` 四提交已处理 C 线三项与 admit 测试断言（随 N4 验收，不重开）。切片归属见 [NEXT_TASKS.md](NEXT_TASKS.md)「并行三线」节。
+
+| 发现 | 已核对位置 | 要修什么 | 不要做什么 |
+|---|---|---|---|
+| **GC-DEL（→A1）** | `context-simple/src/gc/full/mod.rs:409` `commit_full_gc` 返回 `blobs_to_delete`，`engine.rs:1385` 随后删 blob；注释里的「commit」实为内存提交，Runtime 回合的 durable barrier 在其后 | 驻留迁移与物理删除分离：正文可恢复保留，证明不再被当前/仍受支持检查点引用后才交 Storage GC；复用现有 checkpoint 保留窗口与 store | 不新建数据库；不把「内存里有一份」当旧恢复根可失效；本轮未跑崩溃恢复测试，不写成已实现保证 |
+| **GC-CANCEL（→A1）** | GC 外置计划取走 `pending_externalize_retry` 与 Warm 溢出条目后等待异步写入；future 被丢弃时正常错误分支与提交阶段都不执行，条目不归还运行状态 | 提交前源条目保持可追踪 owner，或窄范围 pending 事务/守卫 | 不把「没持锁跨 I/O」当「取消安全」；这是公开 ContextEngine future 的取消安全缺口，非已证明 `/cancel` 必达此调用 |
+| **QUARANTINE（→A1）** | `context-simple/src/store.rs` checksum 不符→quarantine rename 失败→相关 ID 仍进 owner 移除集合；下次扫描把原路径坏文件当无主可重建，建立新 checksum 基线 | 隔离返回明确结果；失败保留原 owner 或显式拒绝/隔离态；成功迁移/缺失/损坏/IO 失败分开处理 | 一次完整性拒绝不能因隔离失败变成下次更容易接受 |
+| **ADMIT-TERMINAL（→A1）** | `directive.rs` 准入终态 Warm 条目先从 buffer `remove` 再 semantic 拒绝 | 验证在迁移前；拒绝路径不改变记录、索引和归属 | — |
+| **ADMIT-LEASE（→A3）** | `residency.rs` 准入较老、仍 Live 的 Stored Ephemeral 条目保留旧创建时间且无新有限使用期，下次维护可能立即 TTL 终结 | 保留创建时钟＋明确准入租约/有限使用期；不支持时一开始就拒绝 | 不篡改原始创建时间让条目显新；创建身份/最近访问/当前准入/到期保护是不同时钟 |
+| **RANGE-PARTIAL（→A2）** | `context-simple/src/item.rs` 正文裁剪到 `max_item_chars` 后原始行范围保留；`gc/reachability.rs` 覆盖判断先行比较行范围包含；`materializer.rs` 的 `partial_body` 只反映本轮装配裁剪，required 路径存在直接标非 partial | 区分资源 revision／工具返回区间／当前保留正文与区间／表示类型（原文/摘要/描述符/partial）；先修覆盖证明与 partial/required 传播 | 不新建 Frame 系统；本轮未证实为权限绕过，是否影响完成门禁需端到端回归 |
+| **ROLLING-PRIOR（→A3，已复核）** | `context-baselines/src/rolling.rs` `take_fold_job` 的 `prior` 从空串起只收集本次移出 records；旧摘要只参与身份（`summary_id`），不进 `compact_fold` 的 `CompactionRequest.source`，压缩后覆盖 `state.summary` | 旧摘要＋本次折叠内容组成下次输入并记录来源覆盖；折叠失败/取消保留原状态；先用确定性 compactor 验证第二三次折叠仍可达第一轮独有约束 | 正式宿主默认 Rolling，不能当离线基线问题后置；先修输入连续性再谈摘要质量 |
+| **ROLLING-FOCUS（→A3）** | 既有未完成项：Rolling 不跟踪 focus，活动任务检查点恢复 fail-closed | 与默认产品配置一起解决（即 N5 backlog 行） | 信封解码已修 ≠ 默认 profile 冷恢复闭环 |
+| **SNAP-GAP（→B1）** | 客户端先快照后订阅：不带快照游标、不用订阅回执 watermark/resync；服务端订阅自建较晚切点并过滤不高于该切点的事件，中间段变化两头都不可见 | 同一切点的快照＋订阅，或先注册缓冲事件再取快照、按该切点去重 | 不承诺无限重放；不建 Chronicle；沿用 resync-only 边界 |
+| **LIVE-DELTA（→B1）** | live-only delta 重复前一 durable seq，不能以 durable watermark 一刀切过滤；跨重连停止旧 producer 不清队列中已存在的旧代事件 | live 与 durable 分流；有序 epoch/reset/snapshot 边界 | — |
+| **QUEUE-COMPLETION（→B2，已复核）** | `clients/dotnet/Agent.Client/BoundedEventQueue.cs:54` 字段初始化 `_completion = NewCompletion(null)` 立即 `SetResult()`——队列可继续写入时 `Reader.Completion` 已完成，关闭又换新任务 | 保留同一未完成 TCS；写端关闭且 backlog 排空后才完成/失败（对齐 `ChannelReader<T>.Completion` 语义） | 不为此重建客户端队列框架 |
+| **CANCEL-ALL（→B2，已复核）** | `agent-host/src/lib.rs:332` `cancel_all` 先清登记表再调取消 hook，`:339` `wait_empty` 用已清表判断结束；主程序主要等 Ctrl-C，服务线程提前失败不收敛；`composed.shutdown().await?` 失败可能跳过传输停止 | 停止请求 ≠ worker 退出 ≠ grant 释放 ≠ 宿主关闭完成；确认完成再删 owner；超时留明确未确认结果 | 不用清空登记表冒充完成；不提前删 owner |
+| **RETYPED（→B2）** | `retyped` 验证前把请求 `work` 字段清成 `None`，可能把应拒绝的 run-scoped 信封清洗成合法请求 | 验证原始信封，或保留字段交既有 validator | 非权限提升结论；会话授权仍由宿主安装 |
+| **GUI-EVENTS（→C1/C2，基线后已落地）** | 基线时点：主 ViewModel 未消费事件流、审批只有 request_id＋call_name、每 3s 重建审批行且命令积累、默认 FixtureLayout | `9fb2030`（F12 快照风险＋目标摘要）/`433d21e`（客户端镜像）/`843803f`（桌面真实事件＋稳定行＋诚实状态）已落地；随 N4 工单验收关闭 | 不重复立项；N3「事件到达客户端」≠N4「真实输出进入工作台」，验收按 N4 检查项 |
+| **ADMIT-TEST（→A1 附带）** | `tests::admit::admit_store_read_does_not_block_unrelated_context_work`：32 MiB 输入经默认正文裁剪不保证真有慢 I/O，再以「admit 耗时＞diagnostics 三倍」相对耗时推断无持锁；run `34271105841` Windows 全测试红（diagnostics 1.9ms vs admit 1.5ms） | 确定性屏障：确认 store read 进入→暂停→验证 diagnostics 可完成→放行→验证准入结果；超时仅死锁兜底。`7e026ee` 已改比例断言修准 load-flaky，屏障方案仍为 A 线建议 | 不放宽阈值；这次红不能证明生产持锁跨 I/O，偶然绿也不能证明没有 |
 
 ## 2026-09-07 续审残余（基线 `b299c6a` → M17）
 

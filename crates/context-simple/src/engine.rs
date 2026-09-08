@@ -651,7 +651,7 @@ impl State {
 
 #[cfg(test)]
 #[derive(Clone)]
-pub(crate) struct MaterializeIoPause {
+pub(crate) struct IoBoundaryPause {
     pub(crate) planned: Arc<tokio::sync::Notify>,
     pub(crate) release: Arc<tokio::sync::Notify>,
 }
@@ -673,7 +673,13 @@ pub struct SimpleContextEngine {
     pub(crate) op_gate: Mutex<()>,
     /// Deterministic plan/I/O boundary used only by concurrency regressions.
     #[cfg(test)]
-    pub(crate) materialize_io_pause: std::sync::Mutex<Option<MaterializeIoPause>>,
+    pub(crate) materialize_io_pause: std::sync::Mutex<Option<IoBoundaryPause>>,
+    /// Deterministic pause at the admit external-read boundary (same shape
+    /// as `materialize_io_pause`): the planned store read runs with the
+    /// state lock released, and regressions prove unrelated work completes
+    /// while the read is parked here — no timing inference.
+    #[cfg(test)]
+    pub(crate) admit_read_pause: std::sync::Mutex<Option<IoBoundaryPause>>,
     /// 与 B 共用的有界压缩器。缺省为 None：任务摘要仍用 runtime 给的原文。
     /// 注入后，任务完成和 episode 旋转会蒸馏成带 `DerivedFrom` 的派生摘要，
     /// 原文条目保留。
@@ -696,6 +702,8 @@ impl SimpleContextEngine {
             op_gate: Mutex::new(()),
             #[cfg(test)]
             materialize_io_pause: std::sync::Mutex::new(None),
+            #[cfg(test)]
+            admit_read_pause: std::sync::Mutex::new(None),
             compactor: None,
             search_observation: std::sync::Mutex::new(ContextSearchObservation::default()),
         }
@@ -1255,6 +1263,18 @@ impl ContextEngine for SimpleContextEngine {
 
         // Phase 2: the planned external read runs with the state lock
         // released, so a slow store read never blocks unrelated context work.
+        #[cfg(test)]
+        {
+            let pause = self
+                .admit_read_pause
+                .lock()
+                .expect("admit test pause mutex poisoned")
+                .clone();
+            if let Some(pause) = pause {
+                pause.planned.notify_one();
+                pause.release.notified().await;
+            }
+        }
         let external_read = match &pending_directive {
             Some((_, Some(item_id), expected_checksum)) => {
                 let dir = crate::store::store_dir(&self.config);
@@ -1361,13 +1381,20 @@ impl ContextEngine for SimpleContextEngine {
         // planned against, never one a concurrent restore/storage-GC
         // replaced in the meantime.
         let _gate = self.op_gate.lock().await;
-        // Four phases so the state lock is not held across disk IO:
+        // Three phases so the state lock is not held across disk IO:
         // 1. plan under the lock (mark/sweep/reactivate/age — in memory);
-        // 2. store writes and recall reads without the lock;
+        // 2. store writes and recall reads without the lock (only
+        //    pre-serialized bytes cross into the IO tasks, so a dropped
+        //    future abandons writes, never items — they stay in
+        //    `pending_externalize_retry` until the commit moves them);
         // 3. commit under a fresh lock (external entries, recalled items,
-        //    failed-write buffer returns, diagnostics);
-        // 4. delete recalled blobs after the commit, without the lock — a
-        //    blob is removed only once its content is resident again.
+        //    diagnostics).
+        //
+        // Recalled blobs are NOT deleted here: this commit is in-memory,
+        // not a persistence barrier, and the newest durable checkpoint may
+        // still reference the blob. The file stays; the startup reconcile
+        // reclaims it as a stale duplicate against the restored state, and
+        // Storage GC remains the only other deleter.
         let mut state = self.state.lock().await;
         state.event_seq += 1;
         let now_tick = state.event_seq;
@@ -1382,17 +1409,7 @@ impl ContextEngine for SimpleContextEngine {
         drop(state);
         let io = full::run_store_io(&self.config, &mut plan).await;
         let mut state = self.state.lock().await;
-        let (mut report, blobs_to_delete) = full::commit_full_gc(&mut state, now_tick, plan, io);
-        drop(state);
-        if !blobs_to_delete.is_empty() {
-            let dir = crate::store::store_dir(&self.config);
-            let outcomes = crate::store::delete_blobs_async(&dir, &blobs_to_delete).await;
-            report.store_blob_delete_errors = outcomes
-                .iter()
-                .filter(|(_, outcome)| outcome.is_err())
-                .count();
-        }
-        Ok(report)
+        Ok(full::commit_full_gc(&mut state, now_tick, plan, io))
     }
 
     async fn reconcile_store(&self) -> AgentResult<StoreReconcileReport> {
@@ -1416,6 +1433,11 @@ impl ContextEngine for SimpleContextEngine {
                 .items
                 .iter()
                 .chain(state.eviction_buffer.iter())
+                // Retry-list items are still live owners of their id: a
+                // blob for such an id is a stale artifact of an abandoned
+                // write, not an ownerless orphan to re-own (which would
+                // leave the same id owned twice once the retry lands).
+                .chain(state.pending_externalize_retry.iter())
                 .map(|item| item.id)
                 .collect();
             (map_checksums, resident_ids)

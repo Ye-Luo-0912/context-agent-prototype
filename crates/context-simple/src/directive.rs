@@ -36,7 +36,20 @@ pub(crate) fn plan_admit(state: &State, item_id: ContextItemId) -> AdmitPlan {
     if state.items.iter().any(|item| item.id == item_id) {
         return AdmitPlan::InMemory;
     }
-    if state.eviction_buffer.iter().any(|item| item.id == item_id) {
+    if let Some(item) = state
+        .eviction_buffer
+        .iter()
+        .find(|item| item.id == item_id)
+    {
+        // The liveness verdict is part of the plan, not just the apply: a
+        // terminal warm item must be refused without touching the buffer
+        // (refusal is not a migration).
+        if !item.semantic.is_live() {
+            return AdmitPlan::Refused(
+                "admit refused: the item's semantic lifecycle ended (terminal states never resurrect)"
+                    .to_string(),
+            );
+        }
         return AdmitPlan::InMemory;
     }
     match state.external.get(item_id) {
@@ -81,19 +94,21 @@ pub(crate) fn apply_admit(
         return None;
     }
 
-    // Warm buffer: move into the heap now (no IO).
+    // Warm buffer: move into the heap now (no IO). The liveness check runs
+    // *before* the removal — a refusal must not migrate the item out of the
+    // buffer (it would drop out of every container with no transition).
     if let Some(index) = state
         .eviction_buffer
         .iter()
         .position(|item| item.id == item_id)
     {
-        let mut item = state.eviction_buffer.remove(index);
-        if !item.semantic.is_live() {
+        if !state.eviction_buffer[index].semantic.is_live() {
             return Some(
                 "admit refused: the item's semantic lifecycle ended (terminal states never resurrect)"
                     .to_string(),
             );
         }
+        let mut item = state.eviction_buffer.remove(index);
         let from = item.attention;
         reenter_working_set(&mut item, now_tick, state);
         let transition = admit_transition(&item, from, turn, reason);

@@ -1259,42 +1259,6 @@ pub(crate) fn store_ready(config: &SimpleContextConfig) -> bool {
     store_dir(config).exists()
 }
 
-/// Delete the store blobs for the given ids. Used *after* a successful
-/// recall commit: only once the recalled content is resident again (and the
-/// entry left the map) is the blob removed, so a crash between commit and
-/// delete leaves an orphan the startup reconcile re-owns instead of losing
-/// content. Deletions run with bounded concurrency; real IO errors are
-/// surfaced per id (the reconcile pass converges on them later).
-pub(crate) async fn delete_blobs_async(
-    dir: &Path,
-    ids: &[ContextItemId],
-) -> Vec<(ContextItemId, Result<DeleteOutcome, std::io::Error>)> {
-    let semaphore = std::sync::Arc::new(tokio::sync::Semaphore::new(MAX_STORE_IO_CONCURRENCY));
-    let mut tasks = tokio::task::JoinSet::new();
-    for &item_id in ids {
-        let dir = dir.to_path_buf();
-        let semaphore = std::sync::Arc::clone(&semaphore);
-        let permit = semaphore.acquire_owned().await.expect("semaphore");
-        tasks.spawn(async move {
-            let _permit = permit;
-            let path = file_path(&dir, item_id);
-            let outcome = match tokio::fs::remove_file(&path).await {
-                Ok(()) => Ok(DeleteOutcome::Deleted),
-                Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(DeleteOutcome::NotFound),
-                Err(e) => Err(e),
-            };
-            (item_id, outcome)
-        });
-    }
-    let mut results = Vec::with_capacity(ids.len());
-    while let Some(joined) = tasks.join_next().await {
-        if let Ok(result) = joined {
-            results.push(result);
-        }
-    }
-    results
-}
-
 // ---------------------------------------------------------------------------
 // Startup reconcile: bring the on-disk blob directory back in line with the
 // external map after a crash or an interrupted IO phase. Every formal blob
@@ -1311,13 +1275,21 @@ pub(crate) struct ReconcileIo {
     pub(crate) scanned: usize,
     pub(crate) deleted_stale: usize,
     pub(crate) quarantined: usize,
-    /// External-map ids whose owned blob was quarantined. The commit phase
-    /// retires these owner entries so the map never advertises a blob that
-    /// no longer exists.
+    /// External-map ids whose owned blob was *successfully* moved to
+    /// quarantine. The commit phase retires these owner entries so the map
+    /// never advertises a blob that no longer exists. A quarantine that
+    /// failed (rename error) must NOT land here: the blob still sits on its
+    /// formal path, so retiring the owner would let the next scan re-own the
+    /// rejected file as a fresh baseline.
     pub(crate) owner_quarantined_ids: Vec<ContextItemId>,
     pub(crate) temp_cleaned: usize,
     pub(crate) io_errors: usize,
     pub(crate) reasons: Vec<String>,
+    /// Item ids seen as `.json` files this scan (whatever their fate:
+    /// kept, quarantined, or deleted as stale). Used to report map-owned
+    /// ids whose blob is missing — a dangling owner, surfaced as a reason
+    /// row instead of silence.
+    pub(crate) seen_ids: std::collections::HashSet<ContextItemId>,
 }
 
 /// Phase 2 of the reconcile (no lock held): scan the store directory, read
@@ -1385,10 +1357,11 @@ pub(crate) async fn run_reconcile_io(
             .await;
             continue;
         };
+        io.seen_ids.insert(item_id);
         let bytes = match read_bounded_blob(&path).await {
             Ok(bytes) => bytes,
             Err(e) if e.kind() == std::io::ErrorKind::InvalidData => {
-                quarantine(
+                let moved = quarantine(
                     &quarantine_dir,
                     &path,
                     &name,
@@ -1396,7 +1369,10 @@ pub(crate) async fn run_reconcile_io(
                     &format!("oversized blob: {e}"),
                 )
                 .await;
-                if map_checksums.contains_key(&item_id) {
+                // Retire the owner only when the blob actually moved; a
+                // failed quarantine keeps the owner so the next scan sees
+                // the same rejection instead of a re-ownable orphan.
+                if moved && map_checksums.contains_key(&item_id) {
                     io.owner_quarantined_ids.push(item_id);
                 }
                 continue;
@@ -1438,9 +1414,14 @@ pub(crate) async fn run_reconcile_io(
             // The map owns this blob: a checksum mismatch means the file
             // was corrupted or tampered with after the write. The blob is
             // quarantined and its owner entry is retired atomically in the
-            // commit phase, so the map never advertises the moved blob.
+            // commit phase, so the map never advertises the moved blob —
+            // but only when the move actually happened. A failed rename
+            // keeps both the owner and the rejected file in place, so the
+            // rejection stands on the next scan instead of dissolving
+            // into an ownerless blob the next pass would re-own under the
+            // tampered content's checksum.
             Some(Some(expected)) if *expected != checksum => {
-                quarantine(
+                let moved = quarantine(
                     &quarantine_dir,
                     &path,
                     &name,
@@ -1448,7 +1429,9 @@ pub(crate) async fn run_reconcile_io(
                     "checksum mismatch: blob changed since the owning entry captured it",
                 )
                 .await;
-                io.owner_quarantined_ids.push(item_id);
+                if moved {
+                    io.owner_quarantined_ids.push(item_id);
+                }
             }
             // Consistent owner (or a pre-checksum entry: parse + id match
             // is the best available signal).
@@ -1478,28 +1461,45 @@ pub(crate) async fn run_reconcile_io(
             }
         }
     }
+    // Dangling owners: the map references blobs that are not on disk. The
+    // reconcile cannot rebuild those (there is nothing to read), so they are
+    // surfaced as reason rows — the reads of such entries fail closed with a
+    // typed Missing failure. Report-only: no owner is dropped here.
+    for item_id in map_checksums.keys() {
+        if !io.seen_ids.contains(item_id) {
+            io.reasons.push(format!(
+                "owned blob {item_id}.json missing from the store (dangling owner)"
+            ));
+        }
+    }
     io
 }
 
 /// Move one unreadable/inconsistent blob to the quarantine subdirectory.
 /// The file is preserved (evidence), just no longer treated as a formal
-/// blob.
+/// blob. Returns whether the move actually happened: a failed rename
+/// leaves the file on its formal path, and callers must not treat that as
+/// a resolved rejection.
 async fn quarantine(
     quarantine_dir: &Path,
     path: &Path,
     name: &str,
     io: &mut ReconcileIo,
     reason: &str,
-) {
+) -> bool {
     let _ = tokio::fs::create_dir_all(quarantine_dir).await;
     match tokio::fs::rename(path, quarantine_dir.join(name)).await {
         Ok(()) => {
             io.quarantined += 1;
             io.reasons.push(format!("quarantined {name}: {reason}"));
+            true
         }
         Err(e) => {
             io.io_errors += 1;
-            io.reasons.push(format!("could not quarantine {name}: {e}"));
+            io.reasons.push(format!(
+                "could not quarantine {name} ({reason}): {e}"
+            ));
+            false
         }
     }
 }
@@ -1530,9 +1530,9 @@ pub(crate) fn commit_reconcile(
         state.gc_externalized_total += 1;
         rebuilt += 1;
     }
-    // Retire every owner whose blob was quarantined: the entry would
-    // otherwise keep advertising a moved blob, so the two are retired as
-    // one atomic act. The blob itself stays preserved in quarantine/ as
+    // Retire every owner whose blob was successfully quarantined: the entry
+    // would otherwise keep advertising a moved blob, so the two are retired
+    // as one atomic act. The blob itself stays preserved in quarantine/ as
     // evidence. A later GC pass may re-own a rebuilt file, never this one.
     let mut owner_quarantined = 0usize;
     if !io.owner_quarantined_ids.is_empty() {
@@ -3116,5 +3116,90 @@ mod search_ab {
         for (category, n, hit1, hit5) in categories {
             println!("AB,summary,{category},cases={n},hit1={hit1}/{n},hit5={hit5}/{n}");
         }
+    }
+
+    /// A quarantine that fails (rename error, quarantine dir unusable) must
+    /// not retire the owner: the rejected blob stays on its formal path, so
+    /// the next scan sees the same rejection. Retiring the owner anyway
+    /// would turn the still-present file into an ownerless blob the next
+    /// pass re-owns under the tampered content's checksum — one integrity
+    /// rejection dissolving into acceptance.
+    #[tokio::test]
+    async fn quarantine_failure_keeps_the_owner_and_the_rejection() {
+        let dir = tempfile::tempdir().unwrap();
+        let item = test_item(ContextItemId::new(), "owned content");
+        let context_ref = externalize(dir.path(), &item).unwrap();
+        let owned_checksum =
+            checksum_hex(&std::fs::read(file_path(dir.path(), item.id)).unwrap());
+        // Tamper the blob after the owning entry captured its checksum...
+        std::fs::write(file_path(dir.path(), item.id), b"tampered content").unwrap();
+        // ...and break quarantine: a regular file where the directory
+        // should be, so every rename into it fails while the rejected blob
+        // stays on its formal path.
+        std::fs::write(dir.path().join("quarantine"), b"not a directory").unwrap();
+
+        let mut map = HashMap::new();
+        map.insert(item.id, Some(owned_checksum));
+        let resident = HashSet::new();
+        let io = run_reconcile_io(dir.path(), &map, &resident).await;
+        assert!(io.io_errors >= 1, "the failed move must surface as an IO error");
+        assert_eq!(io.quarantined, 0);
+        assert!(
+            io.owner_quarantined_ids.is_empty(),
+            "a failed quarantine must not retire the owner"
+        );
+
+        let mut state = State::default();
+        state.external.push(to_external_entry(
+            &item,
+            context_ref,
+            0,
+            0,
+            map.get(&item.id).cloned().flatten(),
+        ));
+        let report = commit_reconcile(&mut state, io, 0, 0);
+        assert_eq!(report.owner_quarantined, 0);
+        assert!(
+            state.external.get(item.id).is_some(),
+            "the owner keeps owning (and rejecting) the blob"
+        );
+
+        // Second scan with the owner still in place: the tampered file is
+        // not re-owned as a fresh baseline — the rejection stands.
+        let map2: HashMap<_, _> = state
+            .external
+            .iter()
+            .map(|entry| (entry.item_id, entry.blob_checksum.clone()))
+            .collect();
+        let io2 = run_reconcile_io(dir.path(), &map2, &resident).await;
+        assert!(
+            io2.rebuilt_candidates.is_empty(),
+            "a once-rejected blob must not become an ownerless rebuild"
+        );
+        assert!(io2.owner_quarantined_ids.is_empty());
+        assert!(
+            io2.reasons.iter().any(|reason| reason.contains("could not quarantine")),
+            "the failed quarantine stays explainable: {:?}",
+            io2.reasons
+        );
+    }
+
+    /// An owner whose blob file is missing is a dangling reference: the
+    /// reconcile cannot rebuild it, so it is surfaced as a reason row
+    /// instead of silence (reads of that entry fail closed with Missing).
+    #[tokio::test]
+    async fn dangling_owner_is_reported_not_silently_ignored() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut map = HashMap::new();
+        map.insert(ContextItemId::new(), Some("deadbeef".to_string()));
+        let io = run_reconcile_io(dir.path(), &map, &HashSet::new()).await;
+        assert_eq!(io.scanned, 0);
+        assert!(
+            io.reasons
+                .iter()
+                .any(|reason| reason.contains("dangling owner")),
+            "the dangling owner must be reported: {:?}",
+            io.reasons
+        );
     }
 }

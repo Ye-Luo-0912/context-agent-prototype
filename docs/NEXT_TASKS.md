@@ -1,10 +1,11 @@
 # 可执行任务队列
 
 > 状态：**M17 收尾——可恢复的多入口工作台（N 系列，2026-09-08 切换）。** 上一队列（M17 三线）的代码主体已落地：B1–B3、C0、P1、P2 主体、P3 宿主、G1–G3 客户端侧、E1 全部关闭或落地（见下方 M17 队列表）。2026-09-08 外部闭环审查（基线 `11afdd747d6cbbb58ef0d7371841e8e365c4f8db`，55 路径正文、新 GUI/客户端/宿主三子树全文）指出：**组件存在 ≠ 链路接通**——事件订阅 receiver 被丢弃、重连自动重发修改操作、宿主恢复绕过正式信封解码、多连接/会话释放/停机缺口等 20 项（F01–F20），进入本队列。
-> **CI 已恢复全绿**（2026-09-08，run `34163939549` 在 `96e4605` 七 job 全过：含新增的 .NET job 与 agent-host Linux 检查）。此前 `34148921895`/`34148640847` 两轮红在 fmt（违规集中在 agent-host），修复过程顺带消掉了 conformance 角色准入、protocol 夹具 lint、agent-replay 探针夹具、supervision 锁退避四个被遮蔽的问题。
+> **CI 状态按 run 记录，不外推到任意 SHA**（2026-09-09 核对）：run `34163939549`（`96e4605`）与 `34268863699`（N3/N5 批次）七 job 全绿；run `34271105841`（`bbf7f5d`）Windows 全测试失败于 `context-simple` admit 并发测试（其余 job 通过），`7e026ee` 已改为比例断言修准 load-flaky（确定性屏障方案仍为 A 线建议项）；N4 批次 run `34278244036`/`34278810636` 文档写作时进行中。更早的 fmt 红与 conformance/protocol/replay/supervision 四个被遮蔽问题的修复记录见 git 历史。
 > 本队列接续 M17 未闭环项；不重做已落地的 B1/B2/C0/P1/G1/E1，也不新增 Chronicle/TaskGraph/第二套状态权威。
 > 剩余条件项不变：真实 provider live（无凭据写 `NOT_RUN`）、下次实际发布的 PACKAGE-01（并入 N8）、默认启用 MCP 后的 MCP-01（E1 已覆盖声明车道的取消贯通）。
 > 审查原文：[reviews/2026-09-08-closure-audit-11afdd7/REPORT.md](reviews/2026-09-08-closure-audit-11afdd7/REPORT.md)；工单全文：[reviews/2026-09-08-closure-audit-11afdd7/NEXT_STAGE_TASKS.md](reviews/2026-09-08-closure-audit-11afdd7/NEXT_STAGE_TASKS.md)。
+> 2026-09-09 三线审查（基线 `bbf7f5d`）：[reviews/2026-09-09-audit-bbf7f5d-three-tracks/REPORT.md](reviews/2026-09-09-audit-bbf7f5d-three-tracks/REPORT.md)；由此开出的并行三线（A/B/C）切片与不干扰规则见下方「并行三线」节——**N 系列主顺序不变，三线与之并行执行**。
 > 上一轮（2026-09-07 platform-native）原文：[reviews/2026-09-07-platform-native-audit/REPORT.md](reviews/2026-09-07-platform-native-audit/REPORT.md)。
 > 不替代 Core、Effect、Workspace、恢复与输出边界契约；不改写历史评测结论。
 
@@ -25,6 +26,8 @@
 
 共享协议、`RuntimeCommand`、compose 入口单一维护者；修改结果未知时不重发（返回 Unknown/要求重同步）；快照与事件以同一 run/host 身份衔接；客户端不从显示文字制造完成、审批或恢复事实。
 
+2026-09-09 起三线（A/B/C）与 N 系列同步执行、互不阻塞：**N 系列保持原顺序（N4 收尾验收 → N7 → N8），三线切片并行推进**；重叠切片一次执行、两边同时关闭。所有权与不干扰规则见下方「并行三线」节。
+
 ## 当前队列（M17 收尾：N 系列）
 
 | 顺序 | 工单 | 线 | 交付物 | 状态 | 依赖 |
@@ -33,7 +36,7 @@
 | 2 | ~~N1~~ | 平台 | 宿主多连接、会话释放、端点所有权、可靠停机 | 已关闭（2026-09-08）：连接归属 grant＋revoke、65 次重连回归、有界停机、fail-closed UDS；CI run `34173331100` 全绿 | N0 ✓ |
 | 3 | ~~N2~~ | 客户端 | 未知修改不重发、连接终态不复活、single-flight | 已关闭（2026-09-08）：修改只发一次（Unknown 语义）、终态故障路径＋半帧毒化、single-flight＋代际、双沿验证；dotnet 35/35 | N0 ✓ |
 | 4 | ~~N3~~ | 契约 | 事件 receiver 保留到连接、notification 验证、多行正文 | 已关闭（2026-09-08）：契约放行多行＋字节上限（`76ef359`）；宿主保留 receiver＋watermark 切点＋同步管道轮询修复（`43a198b`/`184ace4`）；客户端按 kind 分派＋有界事件流（C3 两提交）；CI run `34268863699` 全绿 | N1 ✓, N2 ✓ |
-| 5 | N4 | GUI | 计划/输出/知情审批/取消/继续/真实状态 | 提案（F12/F13） | N3 |
+| 5 | N4 | GUI | 计划/输出/知情审批/取消/继续/真实状态 | **主体已落地**（2026-09-09，`9fb2030`/`433d21e`/`843803f`）：知情审批快照（gate 风险＋有界目标摘要）＋桌面稳定行＋真实事件消费＋真实宿主默认传输；dotnet 56/56（提交记录）；**验收待 CI run `34278244036`/`34278810636` 确认后关闭**（=三线 C1/C2 主体） | N3 ✓ |
 | 6 | N5 | 平台/GUI | 正式信封恢复＋结果/差异/工件按需读取 | 恢复半已关闭（2026-09-08，`808773c`，CI `34268863699` 验证）：信封解码＋可验证 latest＋3 e2e；**backlog**：Rolling 引擎不跟踪 focus，活动任务检查点 fail-closed（需动 context-baselines）；结果/差异/工件读取仍开放 | N2 ✓, N3 ✓ |
 | 7 | ~~N6~~ | 基础 | 决策不误终结、lease 跨层一致、Skill 受限句柄、catalog 有界 | 已关闭（2026-09-08）：F15 决策需证明、F16 跨层到期保护、F17 包内普通文件围栏、F18 惰性投影；context-simple 302/302 | N0 ✓ |
 | 8 | N7 | GUI/测量 | 对象与文本保留有界、指标覆盖如实 | 提案（F13/F14） | N4 |
@@ -41,11 +44,64 @@
 | 10 | PACKAGE-01 | 条件 | 打包来源绑定 | 并入 N8 执行 | — |
 | 11 | MCP-01 | 条件 | MCP 写/连接/读可取消 | E1 已覆盖声明车道；新声明路径触发时补 | — |
 
-阶段后候选（不作为本阶段前置）：只读工具子 Agent（独立状态、有限预算、无递归）；Context/GC/搜索算法研究按真实瓶颈单独立项。
+阶段后候选（不作为本阶段前置）：只读工具子 Agent（独立状态、有限预算、无递归）；Context/GC/搜索的算法优化并入 A4，按真实瓶颈验收，不单独立项、不阻塞 B/C。
 
 ---
 
-## N0 — 恢复构建与验证入口（当前工单）
+## 并行三线（2026-09-09 审查 `bbf7f5d`；与 N 系列同步执行、互不干扰）
+
+来源：2026-09-09 外部三线审查（基线 `bbf7f5d3080747fe113a4a07469ac2fd4ccf2d35`；静态审查＋远端 CI 观察＋隔离探针，无完整 checkout、无工具链，20 crate 目录树核对、28 路径重点阅读）——[reviews/2026-09-09-audit-bbf7f5d-three-tracks/REPORT.md](reviews/2026-09-09-audit-bbf7f5d-three-tracks/REPORT.md)。缺陷明细与「不要做什么」见 [AUDIT_TODO.md](AUDIT_TODO.md) 的 2026-09-09 表；标注「已复核」的定位已于 2026-09-09 在本工作树 HEAD `7e026ee` 静态确认。
+
+**执行关系：N 系列主顺序不变（N4 收尾验收 → N7 → N8）；三线切片与之并行推进，互不阻塞。重叠切片一次执行、双方同时关闭，不重复立项、不拆第二套待办。**
+
+**所有权与不干扰规则：**
+- **A 线**拥有 `context-simple`、`context-baselines`；B/C 不改这两个 crate 的语义路径。
+- **B 线**拥有 `agent-host`、`agent-platform-protocol`、`clients/dotnet` 与共享 DTO；`agent-contracts`/`RuntimeCommand`/compose 入口仍单一维护者（B 线合入），A 提证据/恢复字段需求、C 提界面实际需求，不各自发明 DTO。
+- **C 线**拥有 `apps/Agent.Desktop` 界面与 ViewModel 生命周期。
+- 每线内部按切片串行（A1→A2→A3→A4 等）；三线不在同一文件上互相覆盖，跨线需求走接口请求。
+
+### A — 上下文、GC、搜索
+
+| 切片 | 交付 | 对应缺陷（AUDIT_TODO 2026-09-09 表） | 与 N 系列关系 |
+|---|---|---|---|
+| A1 | GC recall 不先删 blob（持久归属）、GC 外置取消安全、隔离失败不丢 owner、拒绝准入无副作用 | GC-DEL / GC-CANCEL / QUARANTINE / ADMIT-TERMINAL | 附带：admit 并发测试改确定性屏障（ADMIT-TEST；`7e026ee` 已改比例断言） |
+| A2 | 截断后行范围/partial/required 传播一致、最终曝光如实 | RANGE-PARTIAL | — |
+| A3 | Rolling 折叠输入包含旧摘要、默认 profile 恢复（focus 跟踪）、显式准入使用期 | ROLLING-PRIOR / ROLLING-FOCUS / ADMIT-LEASE | ROLLING-FOCUS 即 N5 backlog 项（Rolling 不跟踪 focus） |
+| A4 | 查询预处理复用、候选相关性进最终排序、边际预算装配、维护成本预算 | 报告第七节设计建议，非缺陷 | 算法优化按真实瓶颈验收，不阻塞 B/C |
+
+**用户结果：**长期任务中的旧线索能找回；第二次压缩不会无意抹掉前次摘要；GC 不把 RAM 迁移误当持久保存。
+
+### B — Runtime 与平台一致性
+
+| 切片 | 交付 | 对应缺陷 | 与 N 系列关系 |
+|---|---|---|---|
+| B1 | 快照/订阅同一切点、live 与 durable 分流、重连代际/epoch 边界 | SNAP-GAP / LIVE-DELTA | N3 已接通链路，B1 修一致性残余 |
+| B2 | 队列 Completion 语义、宿主「取消全部」与「确认结束」分离、服务失败收口、retyped 原始信封验证 | QUEUE-COMPLETION / CANCEL-ALL / RETYPED | N1 可靠停机的收口延伸 |
+| B3 | GUI 所需真实任务/审批详情/结果/工件/只读 Context 接口 | — | 即 N5 结果半（结果/差异/工件按需读取） |
+| B4 | 同一正式宿主 profile 多入口复用、已有 MCP/Skill 配置接入 | — | 即 N8 |
+
+**用户结果：**重连不漏中间状态；坏连接与退出有明确结局；多入口调用同一套应用行为。
+
+### C — 正式原生桌面与产品交付
+
+| 切片 | 交付 | 对应缺陷 | 与 N 系列关系 |
+|---|---|---|---|
+| C1 | 真实事件消费者、模型/工具输出、真实计划与状态 | GUI-EVENTS（基线时点；`843803f` 已落地，随 N4 验收） | 即 N4 主体 |
+| C2 | 知情审批、稳定行对象、单次刷新、连接代际与关闭清理 | F12/F13（`9fb2030`/`433d21e`/`843803f` 已落地，随 N4 验收） | 即 N4 主体＋N7 前半 |
+| C3 | 修改审阅、正式冷恢复走查、工件按需读取、只读 Context 检查 | — | 即 N5 结果半（GUI 侧）；冷恢复正式声明等 A3/B 对应验收 |
+| C4 | 长会话资源上界、准确测量、Rust＋.NET 来源绑定包 | F14 | 即 N7＋N8 |
+
+**用户结果：**正式客户端能提交、观察、审批、继续、恢复和审阅，不依赖布局夹具。
+
+### 首批与依赖
+
+- **立即并行：A1、B1**；C1/C2 主体已随 N4 落地，其剩余（真实计划/open-loops 投影，当前诚实显示「不可用」）依赖 B3 的快照字段；C3/C4 分别接 N5 结果半与 N7/N8。
+- C 的事件消费与对象生命周期不等 A 的算法实验；但**冷恢复、证据完整性等正式支持声明，必须等对应 A/B 回归通过**（沿用既有 B1/B2 声明门槛原则）。
+- 每个切片回执照旧：改了什么、接进哪个真实用户动作、实际跑了什么、还有什么没验证、下一步是什么。
+
+---
+
+## N0 — 恢复构建与验证入口（已关闭 2026-09-08，CI run `34163939549` 全绿）
 
 **用户结果：** 支持平台（Linux/Windows）的宿主与客户端重新可被 CI 真实验证；测试名与实际验证路径一致。
 
@@ -93,15 +149,17 @@
 
 **做到这里停止：** 不新建 Chronicle；不为跨语言更换长度前缀传输。
 
-## N4 — 从按钮和快照变成真正的任务操作面
+## N4 — 从按钮和快照变成真正的任务操作面（当前工单：主体已落地，验收待 CI）
 
 **用户结果：** 提交→工具/输出→知情审批→让出/取消→继续→产出待审是一条正式链；待审批反复刷新不积累命令对象。
 
-**事实：** 待审批快照只有 request_id＋call_name（无路径/argv/参数/风险）；每 3 秒刷新重建审批行、每行两个命令加入长寿命 `AsyncCommandGroup` 不移除（推导：1 小时≈2400 引用，非实测）；桌面默认 FixtureLayout。
+**事实（审查基线 `bbf7f5d` 时点）：** 待审批快照只有 request_id＋call_name（无路径/argv/参数/风险）；每 3 秒刷新重建审批行、每行两个命令加入长寿命 `AsyncCommandGroup` 不移除（推导：1 小时≈2400 引用，非实测）；桌面默认 FixtureLayout。
 
-**步骤：** 审批经既有 gate 提供受限详情绑定 request 身份与有效性；按 request_id/task_id 复用稳定行 ViewModel、移除时撤销注册、刷新 single-flight＋连接代际；真实短计划/open loops/执行状态/结果卡；fixture 降为显式预览开关，正式默认接真实宿主。
+**已落地（2026-09-09，`9fb2030`/`433d21e`/`843803f`，提交记录）：** ① 知情审批快照（F12）：`pending_approvals` 携带 gate 类型化风险（`ApprovalRisk`，wire snake_case）＋256 字符有界操作员目标摘要（投影自 path/files[].path/command/argv 等结构化参数，缺失为 None→UI 显示「不可用」，不从文字推断）；.NET 镜像 DTO fail-closed 解码（risk 缺失即拒收）＋共享端点推导 fixture。② 稳定行生命周期（F13）：审批行按 request_id 复用、移除撤销 `AsyncCommandGroup` 注册（200 次刷新演练计数恒定）、刷新 single-flight＋连接代际否决迟到结果、窗口关闭取消单一 lifetime。③ 真实事件消费（N3 API）：默认通道接真实宿主（fixture 降为显式「布局预览（非执行器）」）；单一后台消费者读 `IAgentConnection.Events`，UI 线程渲染类型化事实（模型增量过 DeltaCoalescer），3 秒轮询降为 10 秒兜底；输出 400 行＋64 KiB 双界限整行淘汰。④ 诚实状态：运行态仅由类型化快照布尔渲染；计划/open-loops 缺字段时显示「不可用」；未知提交结果保留 client_request_id 幂等重试，审批答复不自动重试。测试：WorkbenchLifecycleTests＋WorkbenchIntegrationTests（ScriptedEventHost 上 submit 回执→工具事件→审批详情→Delivered→终态），dotnet 56/56、桌面构建 0 错误（提交记录）。
 
-**检查（建议，未执行）：** `dotnet build apps/Agent.Desktop/Agent.Desktop.csproj`；`dotnet test …Agent.Client.Tests.csproj`。
+**验收待确认：** CI run `34278244036`/`34278810636`（文档写作时进行中）；真实计划/open-loops/结果卡投影等 B3 快照字段（当前诚实显示「不可用」）；真实 provider 场景照旧 `NOT_RUN`。
+
+**检查：** 已执行（提交记录）：`dotnet test clients/dotnet/Agent.Client.Tests/Agent.Client.Tests.csproj` 56/56；`dotnet build apps/Agent.Desktop/Agent.Desktop.csproj`。CI 全量确认后关闭本工单（同时关闭三线 C1/C2 主体）。
 
 **做到这里停止：** 不做 IDE/编辑器；GUI 不保存第二份任务/权限/完成真相。
 

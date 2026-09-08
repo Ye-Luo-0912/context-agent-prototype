@@ -744,6 +744,16 @@ impl RuntimeEvent {
             input: RuntimeInputEnvelope::from_preview(body),
         }
     }
+
+    /// The two live-only variants (see the `seq` contract on
+    /// [`RuntimeEventEnvelope`]): `ModelDelta` and `ModelRetrying` repeat the
+    /// preceding durable cursor, never consume a sequence number, and never
+    /// enter any snapshot. Delivery cursors must not filter them — the
+    /// supersession fence is turn/operation/generation identity, and the
+    /// durable truth arrives later in the journal (`AssistantMessage`).
+    pub fn is_live_only(&self) -> bool {
+        matches!(self, Self::ModelDelta { .. } | Self::ModelRetrying { .. })
+    }
 }
 
 /// Emit `ContextCompacted` rows then the `ContextMaintained` audit.
