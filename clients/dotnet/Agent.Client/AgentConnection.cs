@@ -198,12 +198,15 @@ public sealed class AgentConnection : IAgentConnection
                         // state with a different reason (a bad server frame
                         // racing this write), surface THAT instead of the raw
                         // write/disposal error — waiters see one honest
-                        // diagnosis, not an implementation detail.
+                        // diagnosis, not an implementation detail. A contract
+                        // violation is thrown as itself so callers can name
+                        // the exact guard that fired.
                         var standing = Volatile.Read(ref _faultReason);
-                        if (!ReferenceEquals(standing, writeFailure)
-                            && standing is not null)
+                        if (standing is not null && !ReferenceEquals(standing, writeFailure))
                         {
-                            throw new AgentConnectionFaultedException(standing);
+                            throw standing is AgentContractViolationException violation
+                                ? violation
+                                : new AgentConnectionFaultedException(standing);
                         }
                         throw;
                     }
