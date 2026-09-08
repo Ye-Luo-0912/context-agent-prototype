@@ -290,14 +290,14 @@ fn supersedes_stale_revision(new_item: &ContextItem, old: &ContextItem) -> bool 
 fn supersedes_same_revision_body(new_item: &ContextItem, old: &ContextItem) -> bool {
     match (&old.file_revision, &new_item.file_revision) {
         (Some(old_rev), Some(new_rev)) if old_rev == new_rev => {
+            // A clipped new body skips the range proof and falls through to
+            // the literal guards below, which refuse clipped bodies:
+            // conservative coexistence.
             if let (Some((new_start, new_end)), Some((old_start, old_end))) =
                 (file_line_range(new_item), file_line_range(old))
+                && !crate::item::content_was_clipped(&new_item.content)
             {
-                if !crate::item::content_was_clipped(&new_item.content) {
-                    return new_start <= old_start && new_end >= old_end;
-                }
-                // A clipped new body falls through to the literal guards,
-                // which refuse clipped bodies: conservative coexistence.
+                return new_start <= old_start && new_end >= old_end;
             }
             if crate::item::content_was_clipped(&old.content)
                 || crate::item::content_was_clipped(&new_item.content)

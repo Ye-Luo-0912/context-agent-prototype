@@ -283,8 +283,8 @@ async fn real_main() -> anyhow::Result<()> {
     // Either ctrl-c or the serve thread ending first ends this wait (B2
     // CANCEL-ALL): a host whose serve loop already failed must converge
     // through the same bounded shutdown, not wait for a signal that may
-    // never come.
-    let _ = tokio::select! {
+    // never come. Both arms are unit, so there is nothing to bind.
+    tokio::select! {
         _ = tokio::signal::ctrl_c() => {},
         _ = serve_done_rx => {},
     };

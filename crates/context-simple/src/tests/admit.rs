@@ -739,8 +739,10 @@ async fn admit_of_an_old_ephemeral_gets_a_bounded_admission_lease() {
     });
     // 种入一条创建于 turn 1 的老 Ephemeral 外部条目：无租约、无
     // keep_alive，TTL 早已越过（回种状态本身停在 turn 1）。
-    let mut state = crate::engine::State::default();
-    state.turn = 1;
+    let mut state = crate::engine::State {
+        turn: 1,
+        ..crate::engine::State::default()
+    };
     let config = SimpleContextConfig::default();
     let item = crate::item::make_item(
         &state,
