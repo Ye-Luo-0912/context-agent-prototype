@@ -410,8 +410,7 @@ pub(crate) fn commit_full_gc(
     // not move out of the retry list this pass stay there and retry next
     // pass, oldest first.
     let externalized_count = io.externalized.len();
-    let externalized_ids: Vec<ContextItemId> =
-        io.externalized.iter().map(|(id, _)| *id).collect();
+    let externalized_ids: Vec<ContextItemId> = io.externalized.iter().map(|(id, _)| *id).collect();
     let mut store_write_bytes = 0u64;
     for (id, checksum) in io.externalized {
         let Some(position) = state

@@ -320,6 +320,64 @@ async fn admit_refused_for_terminal_semantic_item() {
     );
 }
 
+/// Refusing a terminal warm-buffer item must not migrate it: the refusal
+/// path used to remove the item from the buffer before checking liveness,
+/// so the content left every container with no lifecycle transition at all.
+#[tokio::test]
+async fn admit_refusal_for_terminal_warm_item_keeps_it_in_the_buffer() {
+    let dir = tempfile::tempdir().unwrap();
+    let engine = SimpleContextEngine::new(SimpleContextConfig {
+        context_store_dir: Some(dir.path().to_path_buf()),
+        ..SimpleContextConfig::default()
+    });
+    open_focus(&engine, "service layer").await;
+    engine
+        .ingest(ContextIngress::UserMessage {
+            content: "work on AuthService.rs".into(),
+        })
+        .await
+        .unwrap();
+
+    // Demote one resident item into the warm buffer with a terminal
+    // semantic state: admitted it must not be, but neither may it vanish.
+    let target = {
+        let mut state = engine.state.lock().await;
+        let mut items = state.items.take_all();
+        let mut item = items
+            .pop()
+            .expect("a resident item to demote into the buffer");
+        item.semantic = SemanticState::Tombstoned;
+        let id = item.id;
+        state.items.replace_all(items);
+        state.eviction_buffer.push(item);
+        id
+    };
+
+    let refused = engine
+        .ingest(ContextIngress::ContextDirective {
+            action: ContextAction::Admit {
+                item_id: target,
+                reason: "should not resurrect".into(),
+            },
+        })
+        .await
+        .unwrap_err();
+    assert!(
+        refused.to_string().contains("terminal"),
+        "the refusal must be explainable, got {refused}"
+    );
+
+    let state = engine.state.lock().await;
+    assert!(
+        state.eviction_buffer.iter().any(|item| item.id == target),
+        "the refused item must still be owned by the warm buffer"
+    );
+    assert!(
+        !state.items.iter().any(|item| item.id == target),
+        "the refusal must not resurrect it into the heap"
+    );
+}
+
 /// Per-turn quotas bound admit and derive: the model cannot pull the whole
 /// external history into the working set in one turn.
 #[tokio::test]

@@ -36,11 +36,7 @@ pub(crate) fn plan_admit(state: &State, item_id: ContextItemId) -> AdmitPlan {
     if state.items.iter().any(|item| item.id == item_id) {
         return AdmitPlan::InMemory;
     }
-    if let Some(item) = state
-        .eviction_buffer
-        .iter()
-        .find(|item| item.id == item_id)
-    {
+    if let Some(item) = state.eviction_buffer.iter().find(|item| item.id == item_id) {
         // The liveness verdict is part of the plan, not just the apply: a
         // terminal warm item must be refused without touching the buffer
         // (refusal is not a migration).

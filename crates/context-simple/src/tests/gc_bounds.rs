@@ -9,7 +9,7 @@
 //! it against the live state.
 
 use agent_contracts::{
-    ContextEngine, ContextIngress, ContextKind, ContextQuery, ContextScope, ContextRetention,
+    ContextEngine, ContextIngress, ContextKind, ContextQuery, ContextRetention, ContextScope,
 };
 
 use crate::engine::{SimpleContextConfig, SimpleContextEngine, State, truncate_report_rows};
@@ -140,21 +140,34 @@ fn dropped_externalize_plan_keeps_items_owned_by_the_state() {
     let overflow_b = working(&state, "overflow beyond the buffer cap: b");
     let spill_id = spill.id;
     let overflow_a_id = overflow_a.id;
+    let overflow_b_id = overflow_b.id;
     state.pending_externalize_retry.push(spill);
     state.eviction_buffer.push(overflow_a);
     state.eviction_buffer.push(overflow_b);
 
-    let mut plan = crate::gc::full::plan_full_gc(&mut state, &config, 1, 1)
+    let plan = crate::gc::full::plan_full_gc(&mut state, &config, 1, 1)
         .expect("a pass is due: the buffer holds content");
-    assert_eq!(plan.externalize.len(), 3, "spill + overflow are all planned");
+    // Cap 1 with 2 buffered items: one overflows (the oldest), joining the
+    // prior spill — both are planned, both stay owned by the retry list.
+    assert_eq!(
+        plan.externalize.len(),
+        2,
+        "spill + one overflow are planned"
+    );
     assert_eq!(
         state.eviction_buffer.len(),
         1,
         "the plan brings the buffer back to its cap"
     );
+    assert!(
+        state
+            .eviction_buffer
+            .iter()
+            .any(|item| item.id == overflow_b_id)
+    );
     assert_eq!(
         state.pending_externalize_retry.len(),
-        3,
+        2,
         "ownership never leaves the state during the IO window"
     );
 
@@ -162,7 +175,7 @@ fn dropped_externalize_plan_keeps_items_owned_by_the_state() {
     drop(plan);
     assert_eq!(
         state.pending_externalize_retry.len(),
-        3,
+        2,
         "a dropped plan loses nothing"
     );
 
@@ -186,9 +199,10 @@ fn dropped_externalize_plan_keeps_items_owned_by_the_state() {
     );
     assert_eq!(
         state.pending_externalize_retry.len(),
-        2,
+        1,
         "the unwritten overflow stays for the next pass"
     );
+    assert!(state.pending_externalize_retry[0].id == overflow_a_id);
 }
 
 /// A recalled blob is not deleted at recall time: the in-memory commit is
@@ -206,18 +220,20 @@ async fn recalled_blob_survives_until_the_reconcile_reclaims_it() {
     });
     open_focus(&engine, "service layer").await;
 
-    // One cold entry with a hot entity, its blob actually on disk.
+    // One cold entry with a hot entity, its blob actually on disk. A Note
+    // (not raw evidence) so the recall is not subject to the raw-evidence
+    // reactivation guard.
     let item_id = {
         let mut state = engine.state.lock().await;
         let mut item = crate::item::make_item(
             &state,
             &engine.config,
-            "step 0: fix the AuthService token cache".into(),
-            ContextKind::ToolObservation,
+            "decision: cache the auth token behind AuthService".into(),
+            ContextKind::Note,
             ContextScope::Session,
             ContextRetention::Working,
             0.5,
-            Some("tool:shell.exec".into()),
+            Some("derived".into()),
         );
         item.entities = vec!["auth-cache".into()];
         item.scope_id = None;

@@ -79,15 +79,23 @@ async fn gc_externalizes_overflow_and_recalls_via_the_store() {
         "the recall must be explainable: {:?}",
         report.reactivations
     );
-    // Recalled content is resident again, so its blobs are deleted only
-    // *after* the commit landed — every formal blob has exactly one owner,
-    // and a crash between commit and delete leaves an orphan the startup
-    // reconcile re-owns. One owner, one file.
+    // Recalled content is resident again, but the blob file is NOT deleted
+    // at recall time: the in-memory commit is not a persistence barrier,
+    // and the newest durable checkpoint may still reference the blob. The
+    // file survives until the reconcile reclaims it as a stale duplicate
+    // against the live (post-recall) state.
     let stored = std::fs::read_dir(dir.path()).unwrap().count();
     assert_eq!(
-        stored, 0,
-        "recalled blobs must be removed once their content is resident"
+        stored, 1,
+        "the recalled blob must survive the recall commit"
     );
+    let reconcile = engine.reconcile_store().await.unwrap();
+    assert!(
+        reconcile.deleted_stale >= 1,
+        "the reconcile reclaims the stale duplicate: {reconcile:?}"
+    );
+    let stored = std::fs::read_dir(dir.path()).unwrap().count();
+    assert_eq!(stored, 0, "one owner, one file — after the reconcile");
 }
 
 /// A tampered store blob must never reach a consumer: `fetch` turns the
