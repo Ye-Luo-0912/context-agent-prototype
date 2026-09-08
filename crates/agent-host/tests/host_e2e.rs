@@ -333,7 +333,11 @@ async fn connect(endpoint: &LocalEndpoint) -> std::fs::File {
         unreachable!("windows test uses the named pipe transport")
     };
     let path = format!(r"\\.\pipe\{name}");
-    for _ in 0..50 {
+    // The serve thread composes a full workspace before creating the pipe;
+    // on a loaded CI runner that setup alone can outlast several seconds,
+    // so the budget is generous (30s) — this probes readiness, it measures
+    // nothing about the stop bound.
+    for _ in 0..150 {
         if let Ok(file) = std::fs::OpenOptions::new()
             .read(true)
             .write(true)
@@ -341,7 +345,7 @@ async fn connect(endpoint: &LocalEndpoint) -> std::fs::File {
         {
             return file;
         }
-        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
     }
     panic!("named pipe {path} never became connectable");
 }
@@ -351,13 +355,14 @@ async fn connect(endpoint: &LocalEndpoint) -> std::os::unix::net::UnixStream {
     let LocalEndpoint::UnixSocket(path) = endpoint else {
         unreachable!("unix test uses the UDS transport")
     };
-    for _ in 0..50 {
+    for _ in 0..150 {
         if let Ok(stream) = std::os::unix::net::UnixStream::connect(path) {
             return stream;
         }
-        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
     }
     panic!("uds socket {} never became connectable", path.display());
+}
 }
 
 // ---------------------------------------------------------------------------
