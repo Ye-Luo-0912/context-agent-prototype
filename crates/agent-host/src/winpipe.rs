@@ -14,9 +14,10 @@
 use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, OnceLock};
+use std::time::Duration;
 
 use windows_sys::Win32::Foundation::{
-    ERROR_PIPE_CONNECTED, HANDLE, INVALID_HANDLE_VALUE, LocalFree,
+    ERROR_BROKEN_PIPE, ERROR_NO_DATA, ERROR_PIPE_CONNECTED, HANDLE, INVALID_HANDLE_VALUE, LocalFree,
 };
 use windows_sys::Win32::Security::Authorization::{
     ConvertSidToStringSidW, ConvertStringSecurityDescriptorToSecurityDescriptorW,
@@ -29,20 +30,26 @@ use windows_sys::Win32::System::IO::CancelIoEx;
 use windows_sys::Win32::System::Pipes::{
     ConnectNamedPipe, CreateNamedPipeW, DisconnectNamedPipe, GetNamedPipeClientProcessId,
     PIPE_READMODE_BYTE, PIPE_REJECT_REMOTE_CLIENTS, PIPE_TYPE_BYTE, PIPE_UNLIMITED_INSTANCES,
-    PIPE_WAIT,
+    PIPE_WAIT, PeekNamedPipe,
 };
 use windows_sys::Win32::System::Threading::{
     GetCurrentProcess, OpenProcess, OpenProcessToken, PROCESS_QUERY_LIMITED_INFORMATION,
 };
 
 use super::{
-    HostPlane, LiveStreams, MAX_CONNECTIONS, SHUTDOWN_GRACE, open_connection_plane,
-    process_connection, session_unavailable_frame, write_frame,
+    CancelHook, ConnectionEvents, HostPlane, LiveStreams, MAX_CONNECTIONS, SHUTDOWN_GRACE,
+    open_connection_plane, process_connection, session_unavailable_frame, write_frame,
 };
 
 fn wide(s: &str) -> Vec<u16> {
     s.encode_utf16().chain(std::iter::once(0)).collect()
 }
+
+/// How long the request loop waits between pipe peeks while no request has
+/// arrived. Bounds both the added request latency and the wind-down time of
+/// an idle connection; the loop holds no pending I/O while sleeping, which
+/// is what keeps the event forwarder's writes unblocked.
+const REQUEST_POLL: Duration = Duration::from_millis(5);
 
 /// A TOKEN_USER query result: the raw buffer (which owns the SID) plus the
 /// SID pointer into it. The buffer must outlive every use of [`Self::sid`].
@@ -272,7 +279,7 @@ pub(super) fn serve(
     let wide_name = wide(&full_name);
     eprintln!("host: serving named pipe {full_name}");
 
-    let live: Arc<LiveStreams<std::fs::File>> = Arc::new(LiveStreams::new());
+    let live: Arc<LiveStreams> = Arc::new(LiveStreams::new());
     let mut first_instance = true;
     loop {
         let instance = create_pipe_instance(&wide_name, &security, first_instance)?;
@@ -323,13 +330,114 @@ pub(super) fn serve(
                 continue;
             }
         };
+        // Split the pipe into a reader (owned by the request loop) and a
+        // duplicated writer shared by the response path and the event
+        // forwarder under one whole-frame lock. The cancel hook covers both
+        // handle halves, so shutdown and the forwarder's close path
+        // interrupt every pending I/O this connection can be parked in.
+        let write_half = match stream.try_clone() {
+            Ok(write_half) => write_half,
+            Err(error) => {
+                eprintln!("host: dropping connection; write half unavailable: {error}");
+                drop(guard);
+                continue;
+            }
+        };
+        let cancel_write = match stream.try_clone() {
+            Ok(cancel_write) => cancel_write,
+            Err(error) => {
+                eprintln!("host: dropping connection; cancel half unavailable: {error}");
+                drop(guard);
+                continue;
+            }
+        };
         let shared = Arc::new(stream);
-        let id = live.insert(Arc::clone(&shared));
+        // The interrupt flag rides the cancel hook: every teardown path
+        // (worker exit, forwarder close, shutdown drain) goes through it, so
+        // the peek-poll request loop below always learns about teardown.
+        let reader_interrupt = Arc::new(AtomicBool::new(false));
+        let hook_interrupt = Arc::clone(&reader_interrupt);
+        let hang_up: CancelHook = {
+            let read = Arc::clone(&shared);
+            Arc::new(move || {
+                hook_interrupt.store(true, Ordering::Relaxed);
+                unsafe {
+                    CancelIoEx(read.as_raw_handle() as HANDLE, std::ptr::null());
+                    CancelIoEx(cancel_write.as_raw_handle() as HANDLE, std::ptr::null());
+                }
+            })
+        };
+        let events = ConnectionEvents::new(write_half, plane.profile.clone(), hang_up);
+        let id = live.insert(events.cancel_hook());
         let live_in_worker = Arc::clone(&live);
         let runtime = runtime.clone();
         std::thread::spawn(move || {
-            let mut stream: &std::fs::File = shared.as_ref();
-            let _ = process_connection(&mut stream, &router, &runtime);
+            let mut events = events;
+            let mut reader: &std::fs::File = shared.as_ref();
+            // Non-overlapped I/O on one named-pipe instance serializes across
+            // ALL handles of the file object (the duplicated write half
+            // included): a request loop parked in ReadFile blocks the event
+            // forwarder's notifications until the client happens to send
+            // another request. While a subscription is live the loop therefore
+            // polls PeekNamedPipe — no pending I/O while waiting — and only
+            // commits to a blocking read once bytes are actually there.
+            // Without a forwarder there is nothing to starve, so the loop
+            // uses the plain blocking read, whose prompt disconnect (EOF /
+            // ERROR_BROKEN_PIPE) releases the connection slot immediately.
+            let read_next_frame = move |reader: &mut &std::fs::File, may_block: bool| {
+                if may_block {
+                    return super::read_frame(reader);
+                }
+                loop {
+                    if reader_interrupt.load(Ordering::Relaxed) {
+                        // Teardown asked this loop to stand down.
+                        return Ok(None);
+                    }
+                    let mut available = 0u32;
+                    let peeked = unsafe {
+                        PeekNamedPipe(
+                            reader.as_raw_handle() as HANDLE,
+                            std::ptr::null_mut(),
+                            0,
+                            std::ptr::null_mut(),
+                            &mut available,
+                            std::ptr::null_mut(),
+                        )
+                    };
+                    if peeked == 0 {
+                        let error = std::io::Error::last_os_error();
+                        return match error.raw_os_error() {
+                            // The client is gone: a clean disconnect, not a
+                            // fault. The worker unwinds and revokes its grant.
+                            Some(code)
+                                if code == ERROR_BROKEN_PIPE as i32
+                                    || code == ERROR_NO_DATA as i32 =>
+                            {
+                                Ok(None)
+                            }
+                            _ => Err(error),
+                        };
+                    }
+                    if available > 0 {
+                        // Bytes are here; the frame read below can only park
+                        // for the remainder of an in-flight frame, never for
+                        // an idle connection.
+                        return super::read_frame(reader);
+                    }
+                    std::thread::sleep(REQUEST_POLL);
+                }
+            };
+            let _ = process_connection(
+                &mut reader,
+                &mut events,
+                &router,
+                &runtime,
+                &read_next_frame,
+            );
+            // The connection is over: stop the event forwarder, interrupt
+            // anything still parked (a forwarder wedged writing to a silent
+            // consumer included), then release the grant and the live entry.
+            events.shutdown();
             drop(guard);
             live_in_worker.remove(id);
         });
@@ -338,8 +446,6 @@ pub(super) fn serve(
     // interrupt the still-blocked synchronous reads/writes. CancelIoEx
     // cancels pending I/O on the handle regardless of the issuing thread,
     // which is the bounded interrupt for a synchronous Connect/Read here.
-    live.drain(SHUTDOWN_GRACE, |stream| unsafe {
-        CancelIoEx(stream.as_raw_handle() as HANDLE, std::ptr::null());
-    });
+    live.drain(SHUTDOWN_GRACE);
     Ok(())
 }

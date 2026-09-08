@@ -22,8 +22,10 @@ use agent_host::{
 use agent_platform_protocol::{
     ActiveFeatures, ApprovalRespondOutcome, ApprovalRespondRequest, ApprovalRespondResponse,
     Causality, EnvelopeKind, MessageId, PlatformEnvelope, PlatformResponse, ProtocolIdentity,
-    ProtocolVersion, RequestId, Route, WorkCancelRequest, WorkCancelResponse, WorkSnapshotRequest,
-    WorkSnapshotResponse, WorkSubmitDisposition, WorkSubmitRequest, WorkSubmitResponse,
+    ProtocolVersion, RequestId, Route, WorkCancelRequest, WorkCancelResponse, WorkContinueRequest,
+    WorkContinueResponse, WorkEventNotification, WorkSnapshotRequest, WorkSnapshotResponse,
+    WorkSubmitDisposition, WorkSubmitRequest, WorkSubmitResponse, WorkSubscribeRequest,
+    WorkSubscribeResponse,
 };
 use agent_runtime::{RuntimeHandle, WorkControlSessionRegistry};
 use serde_json::json;
@@ -360,6 +362,39 @@ async fn connect(endpoint: &LocalEndpoint) -> std::os::unix::net::UnixStream {
     panic!("uds socket {} never became connectable", path.display());
 }
 
+#[cfg(windows)]
+fn connect_blocking(endpoint: &LocalEndpoint) -> anyhow::Result<std::fs::File> {
+    let LocalEndpoint::NamedPipe(name) = endpoint else {
+        unreachable!("windows test uses the named pipe transport")
+    };
+    let path = format!(r"\\.\pipe\{name}");
+    for _ in 0..50 {
+        if let Ok(file) = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&path)
+        {
+            return Ok(file);
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+    anyhow::bail!("named pipe {path} never became connectable")
+}
+
+#[cfg(unix)]
+fn connect_blocking(endpoint: &LocalEndpoint) -> anyhow::Result<std::os::unix::net::UnixStream> {
+    let LocalEndpoint::UnixSocket(path) = endpoint else {
+        unreachable!("unix test uses the UDS transport")
+    };
+    for _ in 0..50 {
+        if let Ok(stream) = std::os::unix::net::UnixStream::connect(path) {
+            return Ok(stream);
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+    anyhow::bail!("uds socket {} never became connectable", path.display())
+}
+
 // ---------------------------------------------------------------------------
 // N1: long-lived host — bounded stop, grant revocation, endpoint safety.
 // ---------------------------------------------------------------------------
@@ -588,6 +623,431 @@ async fn stop_is_bounded_with_hostile_clients(endpoint: LocalEndpoint) -> anyhow
     Ok(())
 }
 
+// ---------------------------------------------------------------------------
+// N3: the subscribed event stream reaches the connection that asked for it.
+// ---------------------------------------------------------------------------
+
+/// One inbound frame, demultiplexed: server-initiated event notifications
+/// are decoded straight into the typed [`WorkEventNotification`] DTO, while
+/// responses keep their correlation id for the caller to match. Every frame
+/// is decoded strictly, so a single interleaved or corrupted byte fails the
+/// test instead of smuggling a wrong message through.
+enum Incoming {
+    Response {
+        request_id: Option<RequestId>,
+        payload: serde_json::Value,
+    },
+    Notification(Box<PlatformEnvelope<WorkEventNotification>>),
+}
+
+/// Upper bound for one parked read in the notification loops: a regression
+/// that stops event delivery must fail the test, not hang it.
+const NOTIFICATION_BOUND: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// The e2e stream types can each produce an independent handle to the same
+/// connection, which is how a parked read gets bounded from the side.
+trait TryCloneStream: Read + Write + Sized {
+    fn try_clone_stream(&self) -> anyhow::Result<Self>;
+
+    /// Bounds the NEXT read on this connection so a silent peer fails the
+    /// test instead of hanging it.
+    fn arm_read_deadline(&self, bound: std::time::Duration) -> anyhow::Result<()>;
+}
+
+#[cfg(windows)]
+impl TryCloneStream for std::fs::File {
+    fn try_clone_stream(&self) -> anyhow::Result<Self> {
+        Ok(self.try_clone()?)
+    }
+
+    fn arm_read_deadline(&self, _bound: std::time::Duration) -> anyhow::Result<()> {
+        // std has no pipe read deadline; the CancelIoEx watchdog in
+        // [`read_incoming_bounded`] provides the bound instead.
+        Ok(())
+    }
+}
+
+#[cfg(unix)]
+impl TryCloneStream for std::os::unix::net::UnixStream {
+    fn try_clone_stream(&self) -> anyhow::Result<Self> {
+        Ok(self.try_clone()?)
+    }
+
+    fn arm_read_deadline(&self, bound: std::time::Duration) -> anyhow::Result<()> {
+        self.set_read_timeout(Some(bound))?;
+        Ok(())
+    }
+}
+
+/// Reads one incoming frame with a bounded wait; `Ok(None)` when the bound
+/// expired without a frame. On Windows the read is interrupted with
+/// `CancelIoEx` through a duplicate of the pipe's file object (the same
+/// file-object rule the host's request loop works around); on Unix a read
+/// timeout is installed on the socket through the duplicate.
+#[cfg(windows)]
+fn read_incoming_bounded<S>(
+    stream: &mut S,
+    bound: std::time::Duration,
+) -> anyhow::Result<Option<Incoming>>
+where
+    S: TryCloneStream + std::os::windows::io::AsRawHandle + Send + 'static,
+{
+    stream.arm_read_deadline(bound)?;
+    let interrupt = stream.try_clone_stream()?;
+    std::thread::spawn(move || {
+        std::thread::sleep(bound);
+        unsafe {
+            windows_sys::Win32::System::IO::CancelIoEx(
+                interrupt.as_raw_handle() as windows_sys::Win32::Foundation::HANDLE,
+                std::ptr::null(),
+            );
+        }
+    });
+    match read_incoming(stream) {
+        Ok(incoming) => Ok(Some(incoming)),
+        Err(error) => {
+            let bounded = error.downcast_ref::<std::io::Error>().is_some_and(|io| {
+                io.raw_os_error()
+                    == Some(windows_sys::Win32::Foundation::ERROR_OPERATION_ABORTED as i32)
+            });
+            if bounded { Ok(None) } else { Err(error) }
+        }
+    }
+}
+
+#[cfg(unix)]
+fn read_incoming_bounded<S: TryCloneStream>(
+    stream: &mut S,
+    bound: std::time::Duration,
+) -> anyhow::Result<Option<Incoming>> {
+    stream.arm_read_deadline(bound)?;
+    match read_incoming(stream) {
+        Ok(incoming) => Ok(Some(incoming)),
+        Err(error) => {
+            let bounded = error.downcast_ref::<std::io::Error>().is_some_and(|io| {
+                matches!(
+                    io.kind(),
+                    std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                )
+            });
+            if bounded { Ok(None) } else { Err(error) }
+        }
+    }
+}
+
+fn read_incoming<S: Read + Write>(stream: &mut S) -> anyhow::Result<Incoming> {
+    let frame = agent_host::read_frame(stream)?
+        .ok_or_else(|| anyhow::anyhow!("connection closed before a frame"))?;
+    let envelope = serde_json::from_slice::<PlatformEnvelope<serde_json::Value>>(&frame)?;
+    if envelope.kind == EnvelopeKind::Notification {
+        assert_eq!(
+            (
+                envelope.route.namespace.as_str(),
+                envelope.route.operation.as_str()
+            ),
+            ("work", "event"),
+            "notifications must arrive on the work/event route"
+        );
+        assert!(
+            envelope.request_id.is_none(),
+            "a notification must not carry request correlation"
+        );
+        let typed = serde_json::from_slice::<PlatformEnvelope<WorkEventNotification>>(&frame)
+            .expect("notification frame must decode into the typed DTO");
+        return Ok(Incoming::Notification(Box::new(typed)));
+    }
+    assert_eq!(
+        envelope.kind,
+        EnvelopeKind::Response,
+        "unexpected frame kind"
+    );
+    Ok(Incoming::Response {
+        request_id: envelope.request_id,
+        payload: envelope.payload,
+    })
+}
+
+/// Reads frames until the response matching `request_id` arrives,
+/// collecting any event notifications seen along the way — the server may
+/// legitimately interleave notifications between a request and its answer.
+fn read_response_collecting<R: serde::de::DeserializeOwned>(
+    stream: &mut (impl Read + Write),
+    request_id: &Option<RequestId>,
+    notifications: &mut Vec<PlatformEnvelope<WorkEventNotification>>,
+) -> anyhow::Result<PlatformResponse<R>> {
+    loop {
+        match read_incoming(stream)? {
+            Incoming::Notification(notification) => notifications.push(*notification),
+            Incoming::Response {
+                request_id: got,
+                payload,
+            } => {
+                assert_eq!(&got, request_id, "correlated response");
+                return Ok(serde_json::from_value(payload)?);
+            }
+        }
+    }
+}
+
+/// Checks one notification against the subscribe handshake's contract:
+/// typed envelope, this run, strictly above the snapshot watermark (no
+/// loss, no double-count against the snapshot), non-decreasing cursor.
+fn assert_notification(
+    notification: &PlatformEnvelope<WorkEventNotification>,
+    run_id: agent_contracts::RunId,
+    watermark: u64,
+    previous_seq: Option<u64>,
+) {
+    assert_eq!(notification.kind, EnvelopeKind::Notification);
+    assert!(notification.route.is_work_event());
+    assert!(notification.request_id.is_none());
+    let envelope = &notification.payload.envelope;
+    assert_eq!(envelope.run_id, run_id, "events must carry this run's id");
+    assert!(
+        envelope.seq > watermark,
+        "event seq {} must be above the handshake watermark {watermark}",
+        envelope.seq
+    );
+    if let Some(previous_seq) = previous_seq {
+        assert!(
+            envelope.seq >= previous_seq,
+            "the forwarded stream must be cursor-ordered ({} after {previous_seq})",
+            envelope.seq
+        );
+    }
+}
+
+/// N3 criterion 1: subscribe on a live host, drive real work through the
+/// runtime, and receive typed runtime-event notifications on the same
+/// connection — responses and notifications interleaved on one wire without
+/// corrupting each other, including while the subscriber is completely idle.
+async fn subscribe_delivers_runtime_events(endpoint: LocalEndpoint) -> anyhow::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let fixture = compose_workspace(dir.path()).await?;
+    fixture.composed.instance.start().await?;
+    let run_id = fixture.composed.handle().run_id();
+    let server = start_server(&fixture, endpoint, true).await?;
+
+    let mut stream = connect(&server.endpoint).await;
+    let mut notifications: Vec<PlatformEnvelope<WorkEventNotification>> = Vec::new();
+
+    // Subscribe: the receipt carries the stream's starting watermark.
+    let subscribe = request(
+        "work",
+        "subscribe",
+        WorkSubscribeRequest {
+            replay_after_seq: None,
+        },
+    );
+    agent_host::write_frame(&mut stream, &serde_json::to_vec(&subscribe)?)?;
+    let subscribed = expect_value(read_response_collecting::<WorkSubscribeResponse>(
+        &mut stream,
+        &subscribe.request_id,
+        &mut notifications,
+    )?);
+    assert!(
+        !subscribed.resync_required,
+        "a fresh subscribe never needs resync"
+    );
+    let watermark = subscribed.watermark;
+
+    // Drive real work: the submit journals runtime events, which must reach
+    // this connection as typed notifications (possibly interleaved with the
+    // submit receipt itself).
+    let submit = request(
+        "work",
+        "submit",
+        WorkSubmitRequest {
+            goal: "host e2e: subscribe then submit".into(),
+            client_request_id: "n3-events-1".into(),
+        },
+    );
+    agent_host::write_frame(&mut stream, &serde_json::to_vec(&submit)?)?;
+    let submitted = expect_value(read_response_collecting::<WorkSubmitResponse>(
+        &mut stream,
+        &submit.request_id,
+        &mut notifications,
+    )?);
+    assert_eq!(submitted.disposition, WorkSubmitDisposition::Accepted);
+    let _ = submitted.task_id;
+
+    // Collect the first events with a bounded wait per frame, so a
+    // regression that stops event delivery fails instead of hanging.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+    while notifications.len() < 3 {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "expected runtime event notifications after submit"
+        );
+        match read_incoming_bounded(&mut stream, NOTIFICATION_BOUND)? {
+            Some(Incoming::Notification(notification)) => notifications.push(*notification),
+            Some(Incoming::Response { .. }) => {}
+            None => continue,
+        }
+    }
+    for (index, notification) in notifications.iter().enumerate() {
+        assert_notification(
+            notification,
+            run_id,
+            watermark,
+            if index == 0 {
+                None
+            } else {
+                Some(notifications[index - 1].payload.envelope.seq)
+            },
+        );
+    }
+
+    // Idle delivery: with this connection parked and sending nothing, a
+    // second client drives fresh work (continue starts a new turn); the
+    // subscriber must still receive the resulting events. This is the
+    // regression guard for the named-pipe file-object rule: non-overlapped
+    // I/O on one pipe instance serializes across handle duplicates, so a
+    // request loop parked in a plain read would starve the forwarder.
+    let before_idle = notifications.len();
+    let probe_endpoint = server.endpoint.clone();
+    let probe = std::thread::spawn(move || -> anyhow::Result<()> {
+        let mut probe_client = connect_blocking(&probe_endpoint)?;
+        let cont = request("work", "continue", WorkContinueRequest {});
+        agent_host::write_frame(&mut probe_client, &serde_json::to_vec(&cont)?)?;
+        let mut ignored = Vec::new();
+        let response = read_response_collecting::<WorkContinueResponse>(
+            &mut probe_client,
+            &cont.request_id,
+            &mut ignored,
+        )?;
+        expect_value(response);
+        Ok(())
+    });
+    let idle_deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+    while notifications.len() == before_idle {
+        assert!(
+            std::time::Instant::now() < idle_deadline,
+            "an idle subscriber received no event within the deadline; \
+             the forwarder is starved by the parked request loop"
+        );
+        match read_incoming_bounded(&mut stream, NOTIFICATION_BOUND)? {
+            Some(Incoming::Notification(notification)) => notifications.push(*notification),
+            Some(Incoming::Response { .. }) => {}
+            None => continue,
+        }
+    }
+    assert_notification(
+        notifications.last().expect("idle notification collected"),
+        run_id,
+        watermark,
+        None,
+    );
+    probe
+        .join()
+        .map_err(|_| anyhow::anyhow!("probe thread panicked"))??;
+
+    // And the wire is still a working response plane after the event burst.
+    let snapshot = request("work", "snapshot", WorkSnapshotRequest {});
+    agent_host::write_frame(&mut stream, &serde_json::to_vec(&snapshot)?)?;
+    let snapshot = expect_value(read_response_collecting::<WorkSnapshotResponse>(
+        &mut stream,
+        &snapshot.request_id,
+        &mut notifications,
+    )?);
+    assert!(snapshot.run_started);
+    assert!(
+        snapshot.watermark > watermark,
+        "the runtime's cursor must have advanced past the handshake watermark"
+    );
+
+    drop(stream);
+    assert_registry_drained(&server.registry).await;
+    fixture.composed.shutdown().await?;
+    stop_and_join_bounded(server, BOUNDED_STOP).await?;
+    Ok(())
+}
+
+/// N3 criterion 2: a subscriber that stops reading its socket must not
+/// block other clients or the bounded stop. The host's queue for it is the
+/// runtime's own bounded broadcast channel plus the kernel buffer — never
+/// unbounded host memory — and the wind-down cancels its forwarder through
+/// the same interrupt path as every other parked connection.
+async fn slow_subscriber_never_blocks_service_or_stop(
+    endpoint: LocalEndpoint,
+) -> anyhow::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let fixture = compose_workspace(dir.path()).await?;
+    fixture.composed.instance.start().await?;
+    let server = start_server(&fixture, endpoint, true).await?;
+
+    // The slow subscriber: completes the subscribe handshake, then never
+    // reads another byte and never goes away.
+    let mut slow = connect(&server.endpoint).await;
+    let subscribe = request(
+        "work",
+        "subscribe",
+        WorkSubscribeRequest {
+            replay_after_seq: None,
+        },
+    );
+    agent_host::write_frame(&mut slow, &serde_json::to_vec(&subscribe)?)?;
+    let mut ignored = Vec::new();
+    let subscribed: PlatformResponse<WorkSubscribeResponse> =
+        read_response_collecting(&mut slow, &subscribe.request_id, &mut ignored)?;
+    assert!(expect_value(subscribed).watermark > 0, "the run is live");
+    assert!(ignored.is_empty(), "nothing else flows on a quiet run");
+
+    // A healthy client is served while the silent subscriber exists.
+    let mut healthy = connect(&server.endpoint).await;
+    let before = expect_value(exchange::<_, _, WorkSnapshotResponse>(
+        &mut healthy,
+        &request("work", "snapshot", WorkSnapshotRequest {}),
+    )?);
+    let submitted = expect_value(exchange::<_, _, WorkSubmitResponse>(
+        &mut healthy,
+        &request(
+            "work",
+            "submit",
+            WorkSubmitRequest {
+                goal: "host e2e: events nobody reads".into(),
+                client_request_id: "n3-slow-1".into(),
+            },
+        ),
+    )?);
+    assert_eq!(submitted.disposition, WorkSubmitDisposition::Accepted);
+    // Real runtime events now flow into the slow subscriber's forwarder.
+    // The healthy client keeps getting prompt, correlated answers.
+    for _ in 0..3 {
+        let snapshot = expect_value(exchange::<_, _, WorkSnapshotResponse>(
+            &mut healthy,
+            &request("work", "snapshot", WorkSnapshotRequest {}),
+        )?);
+        assert!(snapshot.run_started);
+    }
+    let cancelled = expect_value(exchange::<_, _, WorkCancelResponse>(
+        &mut healthy,
+        &request("work", "cancel", WorkCancelRequest {}),
+    )?);
+    assert!(matches!(
+        cancelled.ack,
+        agent_contracts::TurnCancelAck::Cancelled { .. }
+            | agent_contracts::TurnCancelAck::NoActiveTurn
+    ));
+    let after = expect_value(exchange::<_, _, WorkSnapshotResponse>(
+        &mut healthy,
+        &request("work", "snapshot", WorkSnapshotRequest {}),
+    )?);
+    assert!(
+        after.watermark > before.watermark,
+        "real runtime events must have been emitted for the forwarder to consume"
+    );
+
+    // The healthy client leaves; the silent subscriber stays parked across
+    // the stop. Shutdown must remain bounded and every grant must revoke.
+    drop(healthy);
+    fixture.composed.shutdown().await?;
+    let (elapsed, registry) = stop_and_join_bounded(server, BOUNDED_STOP).await?;
+    eprintln!("stop with a silent subscriber took {elapsed:?}");
+    assert_registry_drained(&registry).await;
+    Ok(())
+}
+
 // multi_thread on purpose: the client side of this drill uses blocking
 // std IO; on the default current_thread test runtime that would freeze the
 // whole runtime and deadlock the server-side block_on calls.
@@ -778,6 +1238,48 @@ async fn unix_socket_refuses_a_live_listener_and_cleans_up_on_exit() {
         "the host must remove its own endpoint file on exit"
     );
     fixture.composed.shutdown().await.unwrap();
+}
+
+#[cfg(windows)]
+#[tokio::test(flavor = "multi_thread")]
+async fn named_pipe_subscribe_delivers_runtime_events() {
+    subscribe_delivers_runtime_events(LocalEndpoint::NamedPipe(format!(
+        "focus-agent-e2e-events-{}",
+        uuid_like()
+    )))
+    .await
+    .unwrap();
+}
+
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread")]
+async fn unix_socket_subscribe_delivers_runtime_events() {
+    subscribe_delivers_runtime_events(LocalEndpoint::UnixSocket(
+        std::env::temp_dir().join(format!("focus-agent-e2e-events-{}.sock", uuid_like())),
+    ))
+    .await
+    .unwrap();
+}
+
+#[cfg(windows)]
+#[tokio::test(flavor = "multi_thread")]
+async fn named_pipe_slow_subscriber_never_blocks_service_or_stop() {
+    slow_subscriber_never_blocks_service_or_stop(LocalEndpoint::NamedPipe(format!(
+        "focus-agent-e2e-slow-{}",
+        uuid_like()
+    )))
+    .await
+    .unwrap();
+}
+
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread")]
+async fn unix_socket_slow_subscriber_never_blocks_service_or_stop() {
+    slow_subscriber_never_blocks_service_or_stop(LocalEndpoint::UnixSocket(
+        std::env::temp_dir().join(format!("focus-agent-e2e-slow-{}.sock", uuid_like())),
+    ))
+    .await
+    .unwrap();
 }
 
 #[cfg(not(any(windows, unix)))]
