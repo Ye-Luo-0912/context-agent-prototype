@@ -24,7 +24,7 @@ public sealed record WorkSubmitRequest : IProtocolPayload
     [JsonPropertyName("client_request_id")]
     public string ClientRequestId { get; init; } = string.Empty;
 
-    public const int MaxGoalChars = 2_000;
+    public const int MaxGoalChars = 200_000;
     public const int MaxClientRequestIdBytes = 128;
 
     public void Validate()

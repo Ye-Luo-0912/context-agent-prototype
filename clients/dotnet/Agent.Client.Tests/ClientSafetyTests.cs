@@ -519,8 +519,31 @@ public class ClientSafetyTests
         await AssertRejectedBeforeAnyWireBytes(c => c.SubmitWorkAsync("", "req-1")); // missing goal
         await AssertRejectedBeforeAnyWireBytes(c => c.SubmitWorkAsync(new string('x', WorkSubmitRequest.MaxGoalChars + 1), "req-1"));
         await AssertRejectedBeforeAnyWireBytes(c => c.SubmitWorkAsync("a goal", "")); // missing client_request_id
-        await AssertRejectedBeforeAnyWireBytes(c => c.SubmitWorkAsync("bad\ncontrol", "req-1"));
+        // M17-N3/F11: LF/CR/TAB are legal in goal text (multi-line input);
+        // every other control character is still refused pre-send.
+        await AssertRejectedBeforeAnyWireBytes(c => c.SubmitWorkAsync("bad\u0001control", "req-1"));
         await AssertRejectedBeforeAnyWireBytes(c => c.RespondApprovalAsync("", ApprovalDecision.Allow)); // missing request_id
+    }
+
+    [Fact]
+    public void Multi_line_goals_pass_validation()
+    {
+        // A pasted multi-line development task must not be refused at the
+        // door: LF/CR/TAB pass validation; every other control character
+        // still fails it (M17-N3/F11).
+        var request = new WorkSubmitRequest
+        {
+            Goal = "fix the retry table:\n- first repro\n\t- then patch\r\nand add a regression",
+            ClientRequestId = "req-multi",
+        };
+        request.Validate(); // must not throw
+
+        var refused = new WorkSubmitRequest
+        {
+            Goal = "bad\u0001control",
+            ClientRequestId = "req-x",
+        };
+        Assert.Throws<AgentContractViolationException>(() => refused.Validate());
     }
 
     [Fact]

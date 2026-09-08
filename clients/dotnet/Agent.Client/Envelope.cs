@@ -361,6 +361,11 @@ internal static class ContractText
         }
     }
 
+    /// Byte backstop mirroring the Rust <c>MAX_WORK_GOAL_BYTES</c> (the
+    /// runtime's input cap) — the authoritative bound both languages agree
+    /// on, because UTF-8 byte counts are language-independent.
+    public const int MaxUserInputBytes = 262_144;
+
     public static void ValidateText(string field, string value, int maxChars)
     {
         if (value.Length == 0)
@@ -372,9 +377,17 @@ internal static class ContractText
             throw new AgentContractViolationException(
                 field, $"is {value.Length} chars, above the {maxChars} char bound");
         }
-        if (value.Any(char.IsControl))
+        if (System.Text.Encoding.UTF8.GetByteCount(value) > MaxUserInputBytes)
         {
-            throw new AgentContractViolationException(field, "must not contain control characters");
+            throw new AgentContractViolationException(
+                field,
+                $"is {System.Text.Encoding.UTF8.GetByteCount(value)} bytes, "
+                    + $"above the {MaxUserInputBytes} byte bound");
+        }
+        if (value.Any(c => char.IsControl(c) && c is not ('\n' or '\r' or '\t')))
+        {
+            throw new AgentContractViolationException(
+                field, "must not contain control characters (LF/CR/TAB are allowed)");
         }
     }
 

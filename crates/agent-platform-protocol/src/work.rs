@@ -32,13 +32,19 @@ pub const APPROVAL_NAMESPACE: &str = "approval";
 pub const APPROVAL_RESPOND: &str = "respond";
 
 /// Matches the runtime's task-anchor text cap so a legal goal never trips a
-/// protocol bound first.
-pub const MAX_WORK_GOAL_CHARS: usize = 2_000;
+/// protocol bound first. Multi-line development tasks are legal input
+/// (M17-N3/F11), so the cap is generous; the hard backstop is the byte
+/// bound mirroring the runtime's own input cap.
+pub const MAX_WORK_GOAL_CHARS: usize = 200_000;
 pub const MAX_CLIENT_REQUEST_ID_BYTES: usize = 128;
 /// Matches the runtime's resumable task-record cap.
 pub const MAX_SNAPSHOT_TASKS: usize = 256;
 pub const MAX_SNAPSHOT_PENDING_APPROVALS: usize = 16;
-pub const MAX_SNAPSHOT_GOAL_CHARS: usize = 2_000;
+pub const MAX_SNAPSHOT_GOAL_CHARS: usize = MAX_WORK_GOAL_CHARS;
+/// Byte backstop mirroring `agent_contracts::input::USER_INPUT_REPLAY_MAX_BYTES`:
+/// the same total budget the runtime applies to a submitted instruction, so
+/// an oversized goal is refused at validation instead of after admission.
+pub const MAX_WORK_GOAL_BYTES: usize = agent_contracts::input::USER_INPUT_REPLAY_MAX_BYTES;
 pub const MAX_SNAPSHOT_CALL_NAME_BYTES: usize = 128;
 /// The most recent durable sequence a subscribe request may still ask to
 /// replay from; older cursors get `resync_required` instead of a replay.
@@ -460,8 +466,11 @@ impl WorkEventNotification {
 
 /// Free human-readable text (goals, task summaries). The runtime caps these
 /// by character count, so the protocol bound is characters too — a legal
-/// 2 000-character CJK goal must not trip the protocol first — plus the
-/// usual control-character rejection.
+/// CJK goal must not trip the protocol first — with a byte backstop that
+/// mirrors the runtime's input cap. Control characters are rejected EXCEPT
+/// the three that multi-line development input legitimately contains
+/// (LF, CR, TAB — M17-N3/F11): a pasted multi-line task must not be
+/// refused at the door.
 fn validate_text(field: &'static str, value: &str, max_chars: usize) -> ValidationResult<()> {
     if value.is_empty() {
         return Err(ValidationError::new(field, "must not be empty"));
@@ -473,10 +482,22 @@ fn validate_text(field: &'static str, value: &str, max_chars: usize) -> Validati
             format!("is {chars} chars, above the {max_chars} char bound"),
         ));
     }
-    if value.chars().any(char::is_control) {
+    if value.len() > MAX_WORK_GOAL_BYTES {
         return Err(ValidationError::new(
             field,
-            "must not contain control characters",
+            format!(
+                "is {} bytes, above the {MAX_WORK_GOAL_BYTES} byte bound",
+                value.len()
+            ),
+        ));
+    }
+    if value
+        .chars()
+        .any(|c| c.is_control() && !matches!(c, '\n' | '\r' | '\t'))
+    {
+        return Err(ValidationError::new(
+            field,
+            "must not contain control characters (LF/CR/TAB are allowed)",
         ));
     }
     Ok(())
@@ -751,6 +772,12 @@ mod tests {
         oversized.payload.goal = "好".repeat(MAX_WORK_GOAL_CHARS + 1);
         assert!(oversized.payload.validate().is_err());
 
+        let mut byte_oversized = submit_request();
+        // CJK triples the UTF-8 cost: under the char bound, over the byte
+        // backstop that mirrors the runtime's input cap (M17-N3/F11).
+        byte_oversized.payload.goal = "好".repeat(MAX_WORK_GOAL_BYTES / 3);
+        assert!(byte_oversized.payload.validate().is_err());
+
         let mut long_id = submit_request();
         long_id.payload.client_request_id = "x".repeat(MAX_CLIENT_REQUEST_ID_BYTES + 1);
         assert!(long_id.payload.validate().is_err());
@@ -758,6 +785,21 @@ mod tests {
         let mut empty_id = submit_request();
         empty_id.payload.client_request_id.clear();
         assert!(empty_id.payload.validate().is_err());
+    }
+
+    /// M17-N3/F11: a pasted multi-line development task is legal input —
+    /// LF/CR/TAB pass validation while every other control character still
+    /// fails it.
+    #[test]
+    fn multi_line_goals_are_legal_but_other_controls_fail() {
+        let mut multi_line = submit_request();
+        multi_line.payload.goal =
+            "fix the retry table:\n- first repro\n\t- then patch\r\nand add a regression";
+        assert!(multi_line.payload.validate().is_ok());
+
+        let mut other_control = submit_request();
+        other_control.payload.goal = "bad\u{1}control";
+        assert!(other_control.payload.validate().is_err());
     }
 
     #[test]
