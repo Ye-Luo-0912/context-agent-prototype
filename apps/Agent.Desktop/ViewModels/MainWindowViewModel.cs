@@ -1,4 +1,5 @@
 using System.Collections.ObjectModel;
+using System.IO;
 using System.Text;
 using System.Windows.Input;
 using FocusAgent.Client;
@@ -142,9 +143,19 @@ public sealed class MainWindowViewModel : ObservableObject, IAsyncDisposable
     private readonly Dictionary<string, ApprovalItemViewModel> _approvalRows = new();
 
     /// <summary>A submit whose server-side outcome is unknown keeps its
-    /// client_request_id here so a retry of the same goal is idempotent.</summary>
+    /// client_request_id here so a retry of the same goal is idempotent.
+    /// The pair is resolved from snapshot FACTS the next time one is
+    /// applied — never replayed blindly: a host restart retires the
+    /// client_request_id, so a resubmission of the same goal would be a
+    /// NEW admission, not an idempotent re-read.</summary>
     private string? _outstandingSubmitId;
     private string? _outstandingSubmitGoal;
+
+    /// <summary>Connection-loss observations for the CURRENT connection
+    /// era (UI-thread confined). Zeroed on every successful rebuild and
+    /// on disconnect; the banner uses it to separate a transient drop
+    /// from a host that stays gone.</summary>
+    private int _reconnectFailures;
 
     private readonly StringBuilder _outputBuilder = new();
     private readonly DispatcherTimerHolder _fallbackTimer;
@@ -297,6 +308,10 @@ public sealed class MainWindowViewModel : ObservableObject, IAsyncDisposable
     /// live paths do, so row/command stability is observable deterministically.</summary>
     internal void ApplySnapshotForTests(WorkSnapshotResponse snapshot) => ApplySnapshot(snapshot);
 
+    /// <summary>Restore-walkthrough drill observation: connection-loss
+    /// observations counted for the current connection era.</summary>
+    internal int ReconnectFailuresForTests => _reconnectFailures;
+
     /// <summary>Lifecycle drill seam: runs the single-flight refresh path so
     /// a drill can hold a stub's answer open across a disconnect.</summary>
     internal Task RefreshOnceForTestsAsync() => RefreshSnapshotCoreAsync(silent: false);
@@ -315,6 +330,14 @@ public sealed class MainWindowViewModel : ObservableObject, IAsyncDisposable
         IsConnected = true;
         StartEventPump(connection);
     }
+
+    /// <summary>Restore-walkthrough drill seam: installs a REAL
+    /// <see cref="ResumableSession"/> wired exactly like the production
+    /// connect path (resync banner, loss counter, event pump), over a
+    /// caller-supplied transport factory — so reconnect/resync behavior is
+    /// drillable against scripted hosts.</summary>
+    internal Task ConnectSessionForTestsAsync(Func<Task<Stream>> connectFactory)
+        => ConnectResumableSessionAsync(connectFactory);
 
     /// <summary>Integration drill seam: the real submit path (typed request,
     /// receipt rendering, follow-up refresh).</summary>
@@ -376,14 +399,23 @@ public sealed class MainWindowViewModel : ObservableObject, IAsyncDisposable
             ApplySnapshot(await fixture.SnapshotAsync());
             return;
         }
-        var session = new ResumableSession(
-            () => BuildTransport().ConnectAsync(_lifetime.Token));
+        await ConnectResumableSessionAsync(() => BuildTransport().ConnectAsync(_lifetime.Token));
+    }
+
+    /// <summary>The real-host connection path, shared by production connect
+    /// and the restore-walkthrough drill seam: one resumable session whose
+    /// resync/loss facts drive the banner, the event pump, and the first
+    /// snapshot. A failed first snapshot leaves no task facts behind.</summary>
+    private async Task ConnectResumableSessionAsync(Func<Task<Stream>> connectFactory)
+    {
+        var session = new ResumableSession(connectFactory);
         session.Resynced += snapshot => _ui.Post(() =>
         {
             if (!ReferenceEquals(_connection, session))
             {
                 return; // the session was replaced or disconnected meanwhile
             }
+            _reconnectFailures = 0; // a successful rebuild ends the loss streak
             BannerText = "已从快照重建（重连）。挂起的审批以服务器快照为准，不会自动通过。";
             ApplySnapshot(snapshot);
         });
@@ -393,7 +425,11 @@ public sealed class MainWindowViewModel : ObservableObject, IAsyncDisposable
             {
                 return; // not the live connection anymore; nothing to announce
             }
-            BannerText = "连接丢失。挂起的审批不会自动通过；正在重连并从快照重建。";
+            _reconnectFailures++;
+            BannerText = _reconnectFailures == 1
+                ? "连接丢失。挂起的审批不会自动通过；正在重连并从快照重建。"
+                : $"连接丢失：已观测到 {_reconnectFailures} 次连接失败（最近：{BoundBannerDetail(failure.Message)}）。"
+                    + "宿主可能已停止；宿主恢复后将自动从快照重建。挂起的审批不会自动通过。";
             AppendOutput($"连接丢失：{failure.Message}");
         });
         _connection = session;
@@ -418,6 +454,14 @@ public sealed class MainWindowViewModel : ObservableObject, IAsyncDisposable
             return; // a newer connection era owns the view now
         }
         ApplySnapshot(first);
+    }
+
+    /// <summary>One bounded fact inside the banner: failures' own messages
+    /// are untrusted length-wise, so only a prefix is shown.</summary>
+    private static string BoundBannerDetail(string message)
+    {
+        message = message.ReplaceLineEndings(" ");
+        return message.Length <= 160 ? message : message[..160] + "…";
     }
 
     /// <summary>N4: one background consumer reads the typed event stream of
@@ -631,6 +675,7 @@ public sealed class MainWindowViewModel : ObservableObject, IAsyncDisposable
             _ => "运行状态：未启动。",
         };
         PlanText = "计划 / open loops：快照未提供（unavailable）——不从事件文字推断。";
+        ResolveOutstandingSubmitFromSnapshot(snapshot);
         if (snapshot.ResyncRequired)
         {
             BannerText = "事件流出现缺口（resync_required）：显示状态已由本快照整体重建。";
@@ -679,6 +724,31 @@ public sealed class MainWindowViewModel : ObservableObject, IAsyncDisposable
         Approvals.ReplaceWith(rows);
     }
 
+    /// <summary>Every applied snapshot resolves an outstanding UNKNOWN
+    /// submit from facts — the cold-restore honesty rule. The desktop never
+    /// claims idempotence across a rebuild: a host restart retires the
+    /// client_request_id, so whether the same goal reappears decides what a
+    /// resubmission WOULD mean (nothing is resent automatically).
+    ///
+    /// A goal longer than the snapshot's bounded goal field can never
+    /// appear verbatim, so it always takes the conservative branch: the
+    /// operator checks the task list themselves.</summary>
+    private void ResolveOutstandingSubmitFromSnapshot(WorkSnapshotResponse snapshot)
+    {
+        if (_outstandingSubmitId is null || _outstandingSubmitGoal is null)
+        {
+            return;
+        }
+        var goal = _outstandingSubmitGoal;
+        _outstandingSubmitId = null;
+        _outstandingSubmitGoal = null;
+        var visible = goal.Length <= WorkSnapshotResponse.MaxGoalChars
+            && snapshot.Tasks.Any(entry => entry.Goal == goal);
+        AppendOutput(visible
+            ? $"未知提交已核对：同名目标任务「{BoundBannerDetail(goal)}」在快照中可见，该未知以此事实解除（不自动重发）。"
+            : $"未知提交已核对：快照中没有同名目标任务「{BoundBannerDetail(goal)}」。旧提交的结果不可再核；再次提交同一目标将作为新任务执行。");
+    }
+
     private async Task SubmitAsync()
     {
         var connection = _connection;
@@ -710,10 +780,11 @@ public sealed class MainWindowViewModel : ObservableObject, IAsyncDisposable
         }
         catch (AgentUnknownOutcomeException unknown)
         {
-            // The id stays outstanding on purpose: the next submit of the
-            // SAME goal reuses it, and the host answers idempotently.
-            AppendOutput($"提交结果未知：连接在请求期间断开（{unknown.Failure.Message}）。"
-                + "重连后先看快照；重复同一目标会按同一 client_request_id 幂等重试。");
+            // The id stays outstanding ON PURPOSE, but the next snapshot —
+            // not a blind retry — resolves it: a host restart retires the
+            // client_request_id, so the same goal would be a NEW admission.
+            AppendOutput($"提交结果未知：连接在请求期间断开（{unknown.Failure.Message}）。不会自动重发；"
+                + "下一份快照按事实解除该未知（同名任务可见即受理成立，不可见则再次提交将是新任务）。");
             return;
         }
         catch (Exception failure)
@@ -829,6 +900,7 @@ public sealed class MainWindowViewModel : ObservableObject, IAsyncDisposable
         {
             await connection.DisposeAsync();
         }
+        _reconnectFailures = 0; // a new connection era counts its own losses
         IsConnected = false;
         BannerText = string.Empty;
         Tasks.ReplaceWith([]);
