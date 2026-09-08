@@ -718,6 +718,9 @@ const NOTIFICATION_BOUND: std::time::Duration = std::time::Duration::from_secs(5
 /// The e2e stream types can each produce an independent handle to the same
 /// connection, which is how a parked read gets bounded from the side.
 trait TryCloneStream: Read + Write + Sized {
+    // Windows-side event drills clone the stream; unix drills only need the
+    // read deadline, so on unix this method is intentionally uncalled.
+    #[allow(dead_code)]
     fn try_clone_stream(&self) -> anyhow::Result<Self>;
 
     /// Bounds the NEXT read on this connection so a silent peer fails the
