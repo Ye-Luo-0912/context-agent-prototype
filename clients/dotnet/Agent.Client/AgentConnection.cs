@@ -194,6 +194,17 @@ public sealed class AgentConnection : IAgentConnection
                         // is lost, so the connection is poisoned and never
                         // reused.
                         Fault(writeFailure);
+                        // If the reader pump had already taken the terminal
+                        // state with a different reason (a bad server frame
+                        // racing this write), surface THAT instead of the raw
+                        // write/disposal error — waiters see one honest
+                        // diagnosis, not an implementation detail.
+                        var standing = Volatile.Read(ref _faultReason);
+                        if (!ReferenceEquals(standing, writeFailure)
+                            && standing is not null)
+                        {
+                            throw new AgentConnectionFaultedException(standing);
+                        }
                         throw;
                     }
                 }
@@ -391,11 +402,14 @@ public sealed class AgentConnection : IAgentConnection
     /// </summary>
     private void Fault(Exception failure)
     {
-        Volatile.Write(ref _faultReason, failure);
+        // The first reason stands: a later Fault (a write racing the
+        // reader's terminal path) must not overwrite the diagnosis waiters
+        // and the event stream already carry.
         if (Interlocked.CompareExchange(ref _faulted, 1, 0) != 0)
         {
             return; // already terminal: the first reason stands
         }
+        Volatile.Write(ref _faultReason, failure);
         foreach (var entry in _pending)
         {
             if (_pending.TryRemove(entry.Key, out var completion))
