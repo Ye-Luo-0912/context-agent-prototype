@@ -9,7 +9,7 @@
 
 use std::io::{Read, Write};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use agent_compose::{
     ComposeConfig, ContextPolicy, HostToolPolicyRegistry, build_context_engine, compose,
@@ -335,7 +335,8 @@ async fn connect(endpoint: &LocalEndpoint) -> std::fs::File {
         unreachable!("windows test uses the named pipe transport")
     };
     let path = format!(r"\\.\pipe\{name}");
-    for _ in 0..50 {
+    let started = std::time::Instant::now();
+    while started.elapsed() < CONNECT_BUDGET {
         if let Ok(file) = std::fs::OpenOptions::new()
             .read(true)
             .write(true)
@@ -343,9 +344,12 @@ async fn connect(endpoint: &LocalEndpoint) -> std::fs::File {
         {
             return file;
         }
-        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
     }
-    panic!("named pipe {path} never became connectable");
+    panic!(
+        "named pipe {path} never became connectable after {:?}",
+        started.elapsed()
+    );
 }
 
 #[cfg(unix)]
@@ -353,13 +357,18 @@ async fn connect(endpoint: &LocalEndpoint) -> std::os::unix::net::UnixStream {
     let LocalEndpoint::UnixSocket(path) = endpoint else {
         unreachable!("unix test uses the UDS transport")
     };
-    for _ in 0..50 {
+    let started = std::time::Instant::now();
+    while started.elapsed() < CONNECT_BUDGET {
         if let Ok(stream) = std::os::unix::net::UnixStream::connect(path) {
             return stream;
         }
-        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
     }
-    panic!("uds socket {} never became connectable", path.display());
+    panic!(
+        "uds socket {} never became connectable after {:?}",
+        path.display(),
+        started.elapsed()
+    );
 }
 
 #[cfg(windows)]
@@ -434,17 +443,79 @@ async fn start_server(
     };
     let runtime = tokio::runtime::Handle::current();
     let serve = std::thread::spawn(move || server.serve(plane, runtime));
-    if probe {
-        // One throwaway connection proves the endpoint is bound before the
-        // test proceeds; it is served and closed like any client.
-        drop(connect(&endpoint).await);
-    }
-    Ok(TestServer {
+    let server = TestServer {
         endpoint,
         stop,
         registry,
         serve,
-    })
+    };
+    if probe {
+        // One throwaway connection proves the endpoint is bound before the
+        // test proceeds; it is served and closed like any client. If the
+        // serve loop died before binding (e.g. the endpoint could not be
+        // created), fail right now with its actual error instead of
+        // waiting out the full connect budget on a pipe that can never
+        // appear.
+        let started = std::time::Instant::now();
+        let mut connected = false;
+        while started.elapsed() < CONNECT_BUDGET {
+            if server.serve.is_finished() {
+                let error = match server.serve.join() {
+                    Ok(Ok(())) => "exited cleanly without ever binding".to_string(),
+                    Ok(Err(error)) => format!("failed: {error:#}"),
+                    Err(_) => "panicked".to_string(),
+                };
+                anyhow::bail!(
+                    "host serve loop died before the endpoint became connectable: {error}"
+                );
+            }
+            if try_connect_once(&server.endpoint) {
+                connected = true;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        }
+        assert!(
+            connected,
+            "endpoint {:?} never became connectable within {CONNECT_BUDGET:?} (waited {:?}); \
+             the serve thread is {}",
+            server.endpoint,
+            started.elapsed(),
+            if server.serve.is_finished() {
+                "dead (see earlier failure)"
+            } else {
+                "alive but never bound"
+            }
+        );
+    }
+    Ok(server)
+}
+
+/// The connect budget for the readiness probe: comfortably above any slow
+/// runner's scheduling jitter, so a real failure is never mistaken for
+/// slowness.
+const CONNECT_BUDGET: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// One immediate, allocation-free connection attempt; `false` when the
+/// endpoint is not (yet) accepting.
+#[cfg(windows)]
+fn try_connect_once(endpoint: &LocalEndpoint) -> bool {
+    let LocalEndpoint::NamedPipe(name) = endpoint else {
+        unreachable!("windows test uses the named pipe transport")
+    };
+    std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(format!(r"\\.\pipe\{name}"))
+        .is_ok()
+}
+
+#[cfg(unix)]
+fn try_connect_once(endpoint: &LocalEndpoint) -> bool {
+    let LocalEndpoint::UnixSocket(path) = endpoint else {
+        unreachable!("unix test uses the UDS transport")
+    };
+    std::os::unix::net::UnixStream::connect(path).is_ok()
 }
 
 /// The stop-path assertion: set the cooperative stop flag, poke the parked
@@ -1287,9 +1358,19 @@ compile_error!("the host e2e requires a local transport");
 
 fn uuid_like() -> String {
     use std::time::{SystemTime, UNIX_EPOCH};
+    // A per-process serial guards against endpoint-name collisions: CI
+    // runners have shown coarse clock granularity, and this test binary
+    // starts several hosts in parallel within one process — two tests
+    // sampling the same clock tick would derive the SAME pipe/socket name,
+    // and the second host's `FILE_FLAG_FIRST_PIPE_INSTANCE` (or `bind`)
+    // then fails instantly while its probe waits out the whole connect
+    // budget. The serial makes every call unique regardless of clock
+    // resolution.
+    static SERIAL: AtomicU64 = AtomicU64::new(0);
     let nanos = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap()
         .as_nanos();
-    format!("{:x}-{}", nanos, std::process::id())
+    let serial = SERIAL.fetch_add(1, Ordering::Relaxed);
+    format!("{nanos:x}-{serial}-{}", std::process::id())
 }
