@@ -1,4 +1,3 @@
-using System.Text.Json;
 using System.Threading.Channels;
 
 namespace FocusAgent.Client;
@@ -39,12 +38,21 @@ public sealed class AgentUnknownOutcomeException : Exception
 /// once: a connection failure surfaces as
 /// <see cref="AgentUnknownOutcomeException"/>, never as an automatic
 /// re-send.
+///
+/// N3: the session also owns ONE stable typed event stream
+/// (<see cref="Events"/>) across reconnects. Every installed connection is
+/// pumped into the session-level bounded queue (same class-aware overflow
+/// policy); once a connection stops being the live one, its notifications
+/// stop being relayed — a reconnect never interleaves an old connection's
+/// leftovers into the new stream. The subscribe handshake already restarts
+/// the host stream at the current watermark on every reconnect.
 /// </summary>
 public sealed class ResumableSession : IAsyncDisposable
 {
     private readonly AgentConnectionOptions _options;
     private readonly Func<Task<Stream>> _connect;
     private readonly object _gate = new();
+    private readonly BoundedEventQueue _events;
     private AgentConnection? _connection;
 
     // F09: at most one connect attempt in flight per session (single-flight);
@@ -59,6 +67,7 @@ public sealed class ResumableSession : IAsyncDisposable
     {
         _connect = connect;
         _options = options ?? new AgentConnectionOptions();
+        _events = new BoundedEventQueue(_options.NotificationCapacity);
     }
 
     /// <summary>Raised after every (re)connect with the fresh snapshot.</summary>
@@ -180,8 +189,68 @@ public sealed class ResumableSession : IAsyncDisposable
             await fresh.DisposeAsync().ConfigureAwait(false);
             throw new ObjectDisposedException(nameof(ResumableSession));
         }
+        // N3: one pump per installed connection relays its typed events into
+        // the session-level stream; the pump ends when the connection stops
+        // being the live one.
+        _ = PumpEventsAsync(fresh);
         Resynced?.Invoke(snapshot);
         return fresh;
+    }
+
+    /// <summary>
+    /// Relays one connection's typed notifications into the session-level
+    /// event stream while that connection is the installed one. The
+    /// staleness gate is checked per notification: once a reconnect installs
+    /// a different connection (or the session is disposed), this pump stops
+    /// mid-queue — an old connection's buffered notifications never leak
+    /// into the new stream. Completion of the connection's queue (fault or
+    /// dispose) simply ends the pump; the session-level stream stays open
+    /// for the next connection.
+    /// </summary>
+    private async Task PumpEventsAsync(AgentConnection connection)
+    {
+        try
+        {
+            var source = connection.Events;
+            while (await source.WaitToReadAsync(CancellationToken.None).ConfigureAwait(false))
+            {
+                while (source.TryRead(out var notification))
+                {
+                    bool current;
+                    lock (_gate)
+                    {
+                        current = !_disposed && _connection == connection;
+                    }
+                    if (!current)
+                    {
+                        return;
+                    }
+                    if (!_events.TryEnqueue(notification))
+                    {
+                        lock (_gate)
+                        {
+                            if (_disposed)
+                            {
+                                return;
+                            }
+                            // Terminal overflow at session level (the same
+                            // class-aware policy as the connection queue):
+                            // the event stream ends with the honest reason.
+                            _events.TryComplete(new AgentContractViolationException(
+                                "work.event.queue",
+                                "overflowed with undroppable approval/terminal notifications; rebuild from a snapshot"));
+                            return;
+                        }
+                    }
+                }
+            }
+        }
+        catch
+        {
+            // The connection's queue completed with its fault reason; the
+            // fault already took the connection's terminal path and the
+            // session's own state is untouched.
+        }
     }
 
     /// <summary>Runs one query; a faulted connection reconnects once and
@@ -283,8 +352,22 @@ public sealed class ResumableSession : IAsyncDisposable
                 new AgentContractViolationException("approval.respond", "no live connection; re-snapshot before answering"));
     }
 
-    /// <summary>The live connection's bounded notification stream, if any.</summary>
-    public ChannelReader<JsonElement>? Notifications => _connection?.Notifications;
+    /// <summary>
+    /// The session-level typed event stream (N3): every installed
+    /// connection's work/event notifications are relayed here in host order,
+    /// bounded by the same class-aware policy as the connection queue.
+    /// Reconnects are seamless for the consumer: the old connection's
+    /// notifications stop at the switch, the new connection starts from its
+    /// subscribe watermark, and this reader never changes. The stream ends
+    /// (with the reason) only if the queue must refuse an approval/terminal
+    /// notification, or when the session is disposed.
+    /// </summary>
+    public ChannelReader<WorkEventNotification> Events => _events.Reader;
+
+    /// <summary>True once the session-level queue had to shed live-only
+    /// progress notifications under pressure; re-snapshot rather than trust
+    /// the merged stream. Approval/terminal notifications are never shed.</summary>
+    public bool EventsDropped => _events.DroppedCount > 0;
 
     public async ValueTask DisposeAsync()
     {
@@ -304,6 +387,9 @@ public sealed class ResumableSession : IAsyncDisposable
         {
             await connection.DisposeAsync().ConfigureAwait(false);
         }
+        // The pump sees the staleness gate and stops; completing the queue
+        // wakes every event consumer with the end of the stream.
+        _events.TryComplete();
         // An in-flight connect attempt is deliberately not awaited here
         // (disposal must not hang on a stalled transport): its install check
         // refuses the disposed generation and releases the connection itself.

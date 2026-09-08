@@ -156,6 +156,7 @@ public sealed record Route
     public const string WorkCancel = "cancel";
     public const string WorkSnapshot = "snapshot";
     public const string WorkSubscribe = "subscribe";
+    public const string WorkEvent = "event";
     public const string ApprovalRespond = "respond";
 
     [JsonPropertyName("namespace")]
@@ -169,6 +170,7 @@ public sealed record Route
     public static Route WorkCancelRoute() => new() { Namespace = WorkNamespace, Operation = WorkCancel };
     public static Route WorkSnapshotRoute() => new() { Namespace = WorkNamespace, Operation = WorkSnapshot };
     public static Route WorkSubscribeRoute() => new() { Namespace = WorkNamespace, Operation = WorkSubscribe };
+    public static Route WorkEventRoute() => new() { Namespace = WorkNamespace, Operation = WorkEvent };
     public static Route ApprovalRespondRoute() => new() { Namespace = ApprovalNamespace, Operation = ApprovalRespond };
 
     /// <summary>Run-scoped routes carry session-bound identity and no work identity.</summary>

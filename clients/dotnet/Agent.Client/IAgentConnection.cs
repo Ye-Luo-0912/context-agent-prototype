@@ -1,3 +1,5 @@
+using System.Threading.Channels;
+
 namespace FocusAgent.Client;
 
 /// <summary>
@@ -9,6 +11,14 @@ namespace FocusAgent.Client;
 public interface IAgentConnection : IAsyncDisposable
 {
     bool IsConnected { get; }
+
+    /// <summary>The typed work/event notification stream: host event
+    /// notifications (kind=notification frames, no request id) decoded into
+    /// <see cref="WorkEventNotification"/>s and delivered in host order.
+    /// The stream is bounded — its overflow policy sheds live-only progress
+    /// first and never drops approval/terminal facts (see
+    /// <see cref="BoundedEventQueue"/>).</summary>
+    ChannelReader<WorkEventNotification> Events { get; }
 
     /// <summary>Submits a new long-task goal; returns the acceptance receipt
     /// (admission, not completion).</summary>

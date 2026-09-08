@@ -25,8 +25,12 @@ public sealed record AgentConnectionOptions
 
     public int MaxFrameBytes { get; init; } = FrameCodec.DefaultMaxFrameBytes;
 
-    /// <summary>Bounded notification queue. When full, new notifications set
-    /// <see cref="NotificationsDropped"/> instead of blocking the read loop.</summary>
+    /// <summary>Bounded work/event notification queue. When full the policy
+    /// in <see cref="BoundedEventQueue"/> applies: live-only progress
+    /// (<c>model_delta</c>/<c>model_retrying</c>) sheds oldest-first, while
+    /// approval/terminal notifications are never dropped — a queue that
+    /// cannot admit a durable fact without shedding anything faults the
+    /// connection instead.</summary>
     public int NotificationCapacity { get; init; } = 1_024;
 }
 
@@ -95,7 +99,7 @@ public sealed class AgentConnection : IAgentConnection
     private readonly ConcurrentDictionary<string, TaskCompletionSource<JsonElement>> _pending = new();
     private readonly CancellationTokenSource _disposed = new();
     private readonly Task _readLoop;
-    private long _notificationsDropped;
+    private readonly BoundedEventQueue _events;
 
     // F08: the single terminal fault state. 0 = live, 1 = faulted. The first
     // fault publishes its reason, then flips the flag; later faults are
@@ -114,11 +118,7 @@ public sealed class AgentConnection : IAgentConnection
             SchemaDigest = _options.SchemaDigest,
         };
         _stream = stream;
-        _notifications = Channel.CreateBounded<JsonElement>(new BoundedChannelOptions(_options.NotificationCapacity)
-        {
-            SingleReader = false,
-            SingleWriter = true,
-        });
+        _events = new BoundedEventQueue(_options.NotificationCapacity);
         _readLoop = Task.Run(() => ReadLoopAsync(_disposed.Token));
     }
 
@@ -129,14 +129,18 @@ public sealed class AgentConnection : IAgentConnection
         && !_disposed.IsCancellationRequested
         && Interlocked.Read(ref _faulted) == 0;
 
-    /// <summary>Notifications (future event stream) as raw JSON elements.</summary>
-    public ChannelReader<JsonElement> Notifications => _notifications.Reader;
+    /// <summary>The typed work/event notification stream (N3). Notifications
+    /// arrive in host order and are never paired with request/response
+    /// traffic; the queue bound and its overflow policy are documented on
+    /// <see cref="BoundedEventQueue"/>.</summary>
+    public ChannelReader<WorkEventNotification> Events => _events.Reader;
 
-    /// <summary>True once the bounded notification queue overflowed; the
-    /// caller must re-snapshot rather than trust the merged stream.</summary>
-    public bool NotificationsDropped => Interlocked.Read(ref _notificationsDropped) > 0;
-
-    private readonly Channel<JsonElement> _notifications;
+    /// <summary>True once the bounded event queue had to shed live-only
+    /// progress notifications under pressure; the caller must re-snapshot
+    /// rather than trust the merged stream. Approval/terminal notifications
+    /// are never shed — an unsheddable overflow faults the connection
+    /// instead.</summary>
+    public bool EventsDropped => _events.DroppedCount > 0;
 
     public async Task<TResponse> SendAsync<TRequest, TResponse>(
         Route route, TRequest payload, CancellationToken cancellationToken = default)
@@ -274,38 +278,106 @@ public sealed class AgentConnection : IAgentConnection
         }
     }
 
+    /// <summary>
+    /// N3/F06 (client half): frames are dispatched by their <c>kind</c>
+    /// BEFORE anything is required of <c>request_id</c>. Host event
+    /// notifications (<c>kind=notification</c>, route work/event) carry no
+    /// request id by contract and are consumed as typed
+    /// <see cref="WorkEventNotification"/>s; only request/response frames
+    /// take the pairing path, which requires a request id. Every bad frame —
+    /// missing kind, a request/response without request_id, a malformed
+    /// notification, a foreign route — hits the same terminal fault path as
+    /// any other contract violation (N2).
+    /// </summary>
     private void Dispatch(JsonDocument document)
     {
         using (document)
         {
             var root = document.RootElement.Clone();
-            if (!root.TryGetProperty("kind", out var kindElement)
-                || !root.TryGetProperty("request_id", out var requestIdElement))
+            if (root.ValueKind != JsonValueKind.Object || !root.TryGetProperty("kind", out var kindElement))
             {
-                Fault(new AgentContractViolationException("envelope", "frame is missing kind/request_id"));
+                Fault(new AgentContractViolationException("envelope", "frame is missing kind"));
                 return;
             }
-            var kind = kindElement.GetString();
-            var requestId = requestIdElement.GetString();
-            if (kind == EnvelopeKind.Response.ToString().ToLowerInvariant() && requestId is not null)
+            switch (kindElement.GetString())
             {
-                if (_pending.TryRemove(requestId, out var completion))
-                {
-                    completion.TrySetResult(root);
-                }
-                // A response whose request already timed out is dropped on
-                // purpose: the wait was abandoned, not the server-side work.
-                return;
+                case "response":
+                case "request":
+                    // Both paired kinds share the request-id pairing path; a
+                    // client connection solicits responses, never requests,
+                    // so a stray host->client request simply finds no waiter.
+                    DispatchPaired(root);
+                    return;
+                case "notification":
+                    DispatchNotification(root);
+                    return;
+                case null:
+                    Fault(new AgentContractViolationException("envelope.kind", "must be a string"));
+                    return;
+                default:
+                    Fault(new AgentContractViolationException(
+                        "envelope.kind", $"unexpected frame kind '{kindElement.GetString()}'"));
+                    return;
             }
-            if (kind == EnvelopeKind.Notification.ToString().ToLowerInvariant())
+        }
+    }
+
+    /// <summary>Paired frames (request/response) must carry a request id and
+    /// are matched to their waiter by it. A frame whose request already
+    /// timed out — or one the client never sent — has no waiter and is
+    /// dropped on purpose: the wait was abandoned, not the server-side
+    /// work.</summary>
+    private void DispatchPaired(JsonElement root)
+    {
+        if (!root.TryGetProperty("request_id", out var requestIdElement)
+            || requestIdElement.GetString() is not { Length: > 0 } requestId)
+        {
+            Fault(new AgentContractViolationException("envelope.request_id", "is required for a request/response"));
+            return;
+        }
+        if (_pending.TryRemove(requestId, out var completion))
+        {
+            completion.TrySetResult(root);
+        }
+    }
+
+    /// <summary>Notifications (kind=notification, no request id) are decoded
+    /// against the full envelope contract — protocol identity, route,
+    /// causality, request_id absence, and the work/event payload — and then
+    /// delivered as typed <see cref="WorkEventNotification"/>s. Any violation
+    /// is the same terminal fault as any other bad frame.</summary>
+    private void DispatchNotification(JsonElement root)
+    {
+        WorkEventNotification notification;
+        try
+        {
+            var envelope = JsonSerializer.Deserialize<PlatformEnvelope<WorkEventNotification>>(
+                    root.GetRawText(), AgentJson.Options)
+                ?? throw new AgentContractViolationException("envelope.decode", "notification envelope was empty");
+            envelope.Validate(_identity);
+            if (envelope.Route.Namespace != Route.WorkNamespace
+                || envelope.Route.Operation != Route.WorkEvent)
             {
-                if (!_notifications.Writer.TryWrite(root))
-                {
-                    Interlocked.Increment(ref _notificationsDropped);
-                }
-                return;
+                throw new AgentContractViolationException(
+                    "envelope.route", "notification must use the work/event route");
             }
-            Fault(new AgentContractViolationException("envelope.kind", $"unexpected frame kind '{kind}'"));
+            notification = envelope.Payload;
+            notification.Validate();
+        }
+        catch (Exception failure) when (failure is AgentContractViolationException or JsonException)
+        {
+            Fault(failure);
+            return;
+        }
+        if (!_events.TryEnqueue(notification))
+        {
+            // The queue refused a durable notification with nothing left to
+            // shed: the consumer stopped draining, and silently losing an
+            // approval/terminal fact is not an option. Terminal fault; the
+            // recovery is a fresh connection rebuilt from a snapshot.
+            Fault(new AgentContractViolationException(
+                "work.event.queue",
+                "overflowed with undroppable approval/terminal notifications; rebuild from a snapshot"));
         }
     }
 
@@ -331,7 +403,9 @@ public sealed class AgentConnection : IAgentConnection
                 completion.TrySetException(failure);
             }
         }
-        _notifications.Writer.TryComplete(failure);
+        // Completing the event queue (with the fault reason) wakes every
+        // event consumer: the stream ends in the connection's terminal state.
+        _events.TryComplete(failure);
         try
         {
             // Closing the stream unblocks a read parked on the socket.
