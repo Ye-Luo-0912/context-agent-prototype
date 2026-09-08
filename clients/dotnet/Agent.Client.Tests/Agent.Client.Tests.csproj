@@ -18,6 +18,9 @@
 
   <ItemGroup>
     <ProjectReference Include="..\Agent.Client\Agent.Client.csproj" />
+    <!-- The desktop workbench view model's lifecycle drills (N4/F13) run in
+         this suite too: one place, one runner, both assemblies covered. -->
+    <ProjectReference Include="..\..\..\apps\Agent.Desktop\Agent.Desktop.csproj" />
   </ItemGroup>
 
   <!-- The C0 shared contract fixtures live with the Rust protocol crate;

@@ -77,7 +77,7 @@ public class ResumableSessionTests
                         ? JsonSerializer.Deserialize<JsonElement>(
                             "{\"status\":\"success\",\"value\":{\"run_started\":true,\"run_completed\":false," +
                             "\"watermark\":7,\"tasks\":[],\"pending_approvals\":" +
-                            "[{\"request_id\":\"approval-live-1\",\"call_name\":\"fs.write\"}],\"resync_required\":false}}")
+                            "[{\"request_id\":\"approval-live-1\",\"call_name\":\"fs.write\",\"risk\":\"workspace_write\",\"target_summary\":\"docs/plan.md\"}],\"resync_required\":false}}")
                         : JsonSerializer.Deserialize<JsonElement>(
                             "{\"status\":\"success\",\"value\":{\"watermark\":7,\"resync_required\":false}}"),
                 };

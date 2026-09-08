@@ -46,8 +46,12 @@ public sealed class AgentUnknownOutcomeException : Exception
 /// stop being relayed — a reconnect never interleaves an old connection's
 /// leftovers into the new stream. The subscribe handshake already restarts
 /// the host stream at the current watermark on every reconnect.
+///
+/// N4: the session is an <see cref="IAgentConnection"/>, so a UI shell can
+/// hold one connection abstraction whether it talks through this resumable
+/// session or a single-shot connection.
 /// </summary>
-public sealed class ResumableSession : IAsyncDisposable
+public sealed class ResumableSession : IAgentConnection, IAsyncDisposable
 {
     private readonly AgentConnectionOptions _options;
     private readonly Func<Task<Stream>> _connect;

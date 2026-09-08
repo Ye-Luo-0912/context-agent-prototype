@@ -112,7 +112,50 @@ public class FixtureConformanceTests
         Assert.Equal(TaskSnapshotStatus.Active, snapshot.Tasks[0].Status);
         Assert.Single(snapshot.PendingApprovals);
         Assert.Equal("fs.write", snapshot.PendingApprovals[0].CallName);
+        // F12: the snapshot carries the gate's own risk plus a bounded
+        // target summary — informed approval, not a bare request id.
+        Assert.Equal(ApprovalRisk.WorkspaceWrite, snapshot.PendingApprovals[0].Risk);
+        Assert.Equal("docs/plan.md", snapshot.PendingApprovals[0].TargetSummary);
+        snapshot.PendingApprovals[0].Validate();
         Assert.False(snapshot.ResyncRequired);
+    }
+
+    /// <summary>The endpoint suffix rule is pinned cross-language: the host
+    /// binds by it and the desktop derives the same default endpoint from
+    /// the same bytes.</summary>
+    [Fact]
+    public void Endpoint_derivation_fixture_pins_the_shared_suffix_rule()
+    {
+        var value = JsonSerializer.Deserialize<JsonElement>(Read("endpoint_derivation.json"), AgentJson.Options);
+        var root = value.GetProperty("workspace_root").GetString()!;
+        var expected = value.GetProperty("endpoint_suffix").GetString()!;
+        Assert.Equal(expected, AgentTransports.WorkspaceEndpointSuffix(root));
+    }
+
+    /// <summary>F12: an approval's target summary is a bounded display
+    /// projection — oversized or control-bearing summaries fail validation,
+    /// and a snapshot whose approval omits the risk fact fails decode.</summary>
+    [Fact]
+    public void Approval_snapshot_details_fail_closed()
+    {
+        var responseText = Read("snapshot_response.json");
+        var response = JsonSerializer.Deserialize<PlatformEnvelope<PlatformResponse<WorkSnapshotResponse>>>(
+            responseText, AgentJson.Options)!;
+        var snapshot = response.Payload.ExpectValue();
+
+        var oversized = snapshot.PendingApprovals[0] with { TargetSummary = new string('x', PendingApprovalSnapshot.MaxTargetSummaryChars + 1) };
+        Assert.Throws<AgentContractViolationException>(() => oversized.Validate());
+
+        var control = snapshot.PendingApprovals[0] with { TargetSummary = "bad\u0001path" };
+        Assert.Throws<AgentContractViolationException>(() => control.Validate());
+
+        var missingRisk = responseText.Replace(
+            "\"risk\":\"workspace_write\",",
+            "",
+            StringComparison.Ordinal);
+        Assert.Throws<JsonException>(() =>
+            JsonSerializer.Deserialize<PlatformEnvelope<PlatformResponse<WorkSnapshotResponse>>>(
+                missingRisk, AgentJson.Options));
     }
 
     [Fact]

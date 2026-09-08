@@ -244,13 +244,54 @@ public sealed record FocusSnapshot
     public ulong AnchorRevision { get; init; }
 }
 
+/// <summary>Mirrors Rust <c>ApprovalRisk</c> (protocol): the gate's own
+/// declared risk for one pending approval — an operator-facing fact, not a
+/// permission.</summary>
+public enum ApprovalRisk
+{
+    ReadOnly,
+    WorkspaceWrite,
+    ProcessExecution,
+}
+
+/// <summary>
+/// One approval awaiting a decision. <see cref="Risk"/> is the gate's own
+/// declared risk; <see cref="TargetSummary"/> is a bounded operator display
+/// projection of the call's structured arguments, <c>null</c> when the
+/// arguments carry none of the well-known keys — the UI then shows
+/// "unavailable" instead of guessing.
+/// </summary>
 public sealed record PendingApprovalSnapshot
 {
+    public const int MaxTargetSummaryChars = 256;
+
     [JsonPropertyName("request_id")]
     public string RequestId { get; init; } = string.Empty;
 
     [JsonPropertyName("call_name")]
     public string CallName { get; init; } = string.Empty;
+
+    [JsonPropertyName("risk")]
+    [JsonRequired]
+    public ApprovalRisk Risk { get; init; }
+
+    [JsonPropertyName("target_summary")]
+    public string? TargetSummary { get; init; }
+
+    public void Validate()
+    {
+        ContractText.ValidateOpaque("work.snapshot.approval.request_id", RequestId, WorkSubmitRequest.MaxClientRequestIdBytes);
+        ContractText.ValidateIdentifier("work.snapshot.approval.call_name", CallName, WorkSnapshotResponse.MaxCallNameBytes);
+        if (!Enum.IsDefined(typeof(ApprovalRisk), Risk))
+        {
+            throw new AgentContractViolationException(
+                "work.snapshot.approval.risk", $"is not a defined approval risk: {Risk}");
+        }
+        if (TargetSummary is not null)
+        {
+            ContractText.ValidateText("work.snapshot.approval.target_summary", TargetSummary, MaxTargetSummaryChars);
+        }
+    }
 }
 
 /// <summary>
@@ -306,8 +347,7 @@ public sealed record WorkSnapshotResponse : IProtocolPayload
         }
         foreach (var approval in PendingApprovals)
         {
-            ContractText.ValidateOpaque("work.snapshot.approval.request_id", approval.RequestId, WorkSubmitRequest.MaxClientRequestIdBytes);
-            ContractText.ValidateIdentifier("work.snapshot.approval.call_name", approval.CallName, MaxCallNameBytes);
+            approval.Validate();
         }
         if (Focus is not null)
         {
