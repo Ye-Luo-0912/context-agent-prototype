@@ -39,9 +39,9 @@
 | 5 | N4 | GUI | 计划/输出/知情审批/取消/继续/真实状态 | **主体已落地**（2026-09-09，`9fb2030`/`433d21e`/`843803f`）：知情审批快照（gate 风险＋有界目标摘要）＋桌面稳定行＋真实事件消费＋真实宿主默认传输；dotnet 56/56（提交记录）；**已关闭（2026-09-08/09）：CI run `34278810636` 七 job 全绿**（=三线 C1/C2 主体） | N3 ✓ |
 | 6 | N5 | 平台/GUI | 正式信封恢复＋结果/差异/工件按需读取 | 恢复半已关闭（2026-09-08，`808773c`，CI `34268863699` 验证）：信封解码＋可验证 latest＋3 e2e；**backlog**：Rolling 引擎不跟踪 focus，活动任务检查点 fail-closed（需动 context-baselines）；结果/差异/工件读取仍开放 | N2 ✓, N3 ✓ |
 | 7 | ~~N6~~ | 基础 | 决策不误终结、lease 跨层一致、Skill 受限句柄、catalog 有界 | 已关闭（2026-09-08）：F15 决策需证明、F16 跨层到期保护、F17 包内普通文件围栏、F18 惰性投影；context-simple 302/302 | N0 ✓ |
-| 8 | N7 | GUI/测量 | 对象与文本保留有界、指标覆盖如实 | 提案（F13/F14） | N4 |
-| 9 | N8 | 扩展/交付 | MCP/Plugin 可配置使用＋Rust/.NET 来源绑定发布（并入 PACKAGE-01、原 R1） | 提案（F20） | N1–N6 |
-| 10 | PACKAGE-01 | 条件 | 打包来源绑定 | 并入 N8 执行 | — |
+| 8 | ~~N7~~ | GUI/测量 | 对象与文本保留有界、指标覆盖如实 | **已关闭（2026-09-09，`87850ae`＋C4 记录）**：MetricsSession 覆盖标注 root_only/full_tree/unknown（Windows 不冒充 whole-tree）＋有界采样环＋显式 idle 标记＋DeltaCoalescer 定时刷新（短 delta 后无输入也按间隔刷新）；输出行/字节双界（N4 已落）＋ViewModel 关闭释放 coalescer；MetricsSession/DeltaCoalescer 测试 9/9、dotnet 全量 72/72、桌面构建 0 错误 | N4 |
+| 9 | N8 | 扩展/交付 | MCP/Plugin 可配置使用＋Rust/.NET 来源绑定发布（并入 PACKAGE-01、原 R1） | **部分落地（2026-09-09）**：PACKAGE-01 来源绑定打包（`3352273`：--target-dir 构建与复制同身份、干净 staging、agent-host/desktop 入包、SOURCE.txt、递归 SHA256SUMS、PS 原生退出码；Windows 端到端验证通过）；.NET→宿主→Runtime→工具→事件→GUI 全链 e2e（`aeddfbd` HostChainTests，真实宿主二进制＋demo model，本机 1/1、CI dotnet job 已接宿主构建）；**B4 宿主受限 MCP/Plugin 配置路径由 B 线代理并行执行中**（config.rs 在途） | N1–N6 |
+| 10 | ~~PACKAGE-01~~ | 条件 | 打包来源绑定 | **已并入 N8 关闭（2026-09-09，`3352273`）**：Windows 端到端打包验证通过；Linux 侧由 CI package job 复核 | — |
 | 11 | MCP-01 | 条件 | MCP 写/连接/读可取消 | E1 已覆盖声明车道；新声明路径触发时补 | — |
 
 阶段后候选（不作为本阶段前置）：只读工具子 Agent（独立状态、有限预算、无递归）；Context/GC/搜索的算法优化并入 A4，按真实瓶颈验收，不单独立项、不阻塞 B/C。
