@@ -16,7 +16,7 @@ public enum WorkSubmitDisposition
 /// with a different goal is a conflict. The id is process-scoped and becomes
 /// unknown after a host restart.
 /// </summary>
-public sealed record WorkSubmitRequest
+public sealed record WorkSubmitRequest : IProtocolPayload
 {
     [JsonPropertyName("goal")]
     public string Goal { get; init; } = string.Empty;
@@ -34,7 +34,7 @@ public sealed record WorkSubmitRequest
     }
 }
 
-public sealed record WorkSubmitResponse
+public sealed record WorkSubmitResponse : IProtocolPayload
 {
     [JsonPropertyName("disposition")]
     public WorkSubmitDisposition Disposition { get; init; }
@@ -47,14 +47,14 @@ public sealed record WorkSubmitResponse
 }
 
 /// <summary>Continue the run's active task. Empty body by contract.</summary>
-public sealed record WorkContinueRequest
+public sealed record WorkContinueRequest : IProtocolPayload
 {
     public void Validate()
     {
     }
 }
 
-public sealed record WorkContinueResponse
+public sealed record WorkContinueResponse : IProtocolPayload
 {
     [JsonPropertyName("task_id")]
     public string TaskId { get; init; } = string.Empty;
@@ -64,7 +64,7 @@ public sealed record WorkContinueResponse
 }
 
 /// <summary>Cancel the run's current in-flight turn. Empty body by contract.</summary>
-public sealed record WorkCancelRequest
+public sealed record WorkCancelRequest : IProtocolPayload
 {
     public void Validate()
     {
@@ -185,7 +185,7 @@ internal sealed class TurnCancelAckConverter : JsonConverter<TurnCancelAck>
             : throw new JsonException($"cancelled ack requires u64 {name}");
 }
 
-public sealed record WorkCancelResponse
+public sealed record WorkCancelResponse : IProtocolPayload
 {
     [JsonPropertyName("ack")]
     [JsonConverter(typeof(TurnCancelAckConverter))]
@@ -196,7 +196,7 @@ public sealed record WorkCancelResponse
     }
 }
 
-public sealed record WorkSnapshotRequest
+public sealed record WorkSnapshotRequest : IProtocolPayload
 {
     public void Validate()
     {
@@ -258,7 +258,7 @@ public sealed record PendingApprovalSnapshot
 /// sequence it reflects; a client whose stream is behind must treat
 /// <see cref="ResyncRequired"/> as "rebuild from this snapshot", never splice.
 /// </summary>
-public sealed record WorkSnapshotResponse
+public sealed record WorkSnapshotResponse : IProtocolPayload
 {
     public const int MaxTasks = 256;
     public const int MaxPendingApprovals = 16;
@@ -317,7 +317,7 @@ public sealed record WorkSnapshotResponse
     }
 }
 
-public sealed record WorkSubscribeRequest
+public sealed record WorkSubscribeRequest : IProtocolPayload
 {
     /// <summary>The most recent durable sequence a subscribe may replay from;
     /// older cursors get <c>resync_required</c> instead of a replay.</summary>
@@ -331,7 +331,7 @@ public sealed record WorkSubscribeRequest
     }
 }
 
-public sealed record WorkSubscribeResponse
+public sealed record WorkSubscribeResponse : IProtocolPayload
 {
     [JsonPropertyName("watermark")]
     public ulong Watermark { get; init; }
@@ -352,7 +352,7 @@ public enum ApprovalDecision
     Deny,
 }
 
-public sealed record ApprovalRespondRequest
+public sealed record ApprovalRespondRequest : IProtocolPayload
 {
     [JsonPropertyName("request_id")]
     public string RequestId { get; init; } = string.Empty;
@@ -374,7 +374,7 @@ public enum ApprovalRespondOutcome
     NoLongerPending,
 }
 
-public sealed record ApprovalRespondResponse
+public sealed record ApprovalRespondResponse : IProtocolPayload
 {
     [JsonPropertyName("outcome")]
     public ApprovalRespondOutcome Outcome { get; init; }

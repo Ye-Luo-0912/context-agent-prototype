@@ -31,12 +31,46 @@ public sealed record AgentConnectionOptions
 }
 
 /// <summary>
+/// Raised when a request is refused because the connection has already
+/// reached its terminal fault state. The original fault reason travels
+/// along. The state is never revived: recover by opening a new connection.
+/// </summary>
+public sealed class AgentConnectionFaultedException : Exception
+{
+    public Exception? Reason { get; }
+
+    public AgentConnectionFaultedException(Exception? reason)
+        : base(reason is null
+            ? "connection is faulted; no further requests are accepted"
+            : $"connection is faulted; no further requests are accepted ({reason.Message})")
+    {
+        Reason = reason;
+    }
+}
+
+/// <summary>
 /// One live client session over a local transport. Request correlation is by
 /// request id; cancelling a request's wait never cancels the server-side
 /// operation — an explicit cancel goes through
-/// <see cref="CancelCurrentTurnAsync"/>. A read-loop failure or a frame that
-/// violates the contract faults the whole connection: every pending request
-/// fails with the fault reason and nothing is silently retried.
+/// <see cref="CancelCurrentTurnAsync"/>.
+///
+/// Faults are terminal (F08). A read-loop failure, a contract-violating
+/// frame, or a failed/interrupted frame write (the frame boundary is lost —
+/// half a frame may be on the wire) faults the whole connection exactly
+/// once: the first fault reason wins, every pending request — including
+/// requests still queued for the writer — fails with that reason, the
+/// stream is closed to release the read loop, later requests are refused,
+/// and <see cref="IsConnected"/> turns false. Nothing is silently retried
+/// here and a faulted connection is never revived. One deliberate
+/// distinction: a local wait cancellation or timeout after a fully sent
+/// frame says nothing about the server side, so it abandons only the wait
+/// and does not fault the connection.
+///
+/// F19: every typed API validates its request payload before any byte is
+/// written and its response payload once the answer is accepted. A
+/// validation failure is a protocol fault — it takes the same terminal path,
+/// so a contract-violating request never reaches the wire and nothing is
+/// re-sent for it.
 /// </summary>
 public sealed class AgentConnection : IAgentConnection
 {
@@ -63,6 +97,12 @@ public sealed class AgentConnection : IAgentConnection
     private readonly Task _readLoop;
     private long _notificationsDropped;
 
+    // F08: the single terminal fault state. 0 = live, 1 = faulted. The first
+    // fault publishes its reason, then flips the flag; later faults are
+    // no-ops and the state is never revived.
+    private long _faulted;
+    private Exception? _faultReason;
+
     public AgentConnection(Stream stream, AgentConnectionOptions? options = null)
     {
         _options = options ?? new AgentConnectionOptions();
@@ -84,7 +124,10 @@ public sealed class AgentConnection : IAgentConnection
 
     public ProtocolIdentity NegotiatedIdentity => _identity;
 
-    public bool IsConnected => !_readLoop.IsCompleted && !_disposed.IsCancellationRequested;
+    public bool IsConnected =>
+        !_readLoop.IsCompleted
+        && !_disposed.IsCancellationRequested
+        && Interlocked.Read(ref _faulted) == 0;
 
     /// <summary>Notifications (future event stream) as raw JSON elements.</summary>
     public ChannelReader<JsonElement> Notifications => _notifications.Reader;
@@ -97,40 +140,86 @@ public sealed class AgentConnection : IAgentConnection
 
     public async Task<TResponse> SendAsync<TRequest, TResponse>(
         Route route, TRequest payload, CancellationToken cancellationToken = default)
-        where TRequest : notnull
-        where TResponse : notnull
+        where TRequest : notnull, IProtocolPayload
+        where TResponse : notnull, IProtocolPayload
     {
         ObjectDisposedException.ThrowIf(_disposed.IsCancellationRequested, this);
+        if (Interlocked.Read(ref _faulted) != 0)
+        {
+            // F08: the fault state is terminal; every later request is
+            // refused, including ones the caller still believes queued.
+            throw new AgentConnectionFaultedException(_faultReason);
+        }
         var request = SessionEnvelope.Request(route, payload);
-        request.Validate(_identity);
 
         var requestId = request.RequestId!;
         var completion = new TaskCompletionSource<JsonElement>(TaskCreationOptions.RunContinuationsAsynchronously);
         _pending[requestId] = completion;
         try
         {
-            var encoded = JsonSerializer.SerializeToUtf8Bytes(request, AgentJson.Options);
-            using var timeout = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken, _disposed.Token);
-            timeout.CancelAfter(_options.RequestTimeout);
-            await _writeLock.WaitAsync(timeout.Token).ConfigureAwait(false);
+            if (Interlocked.Read(ref _faulted) != 0)
+            {
+                // The fault landed between the registration and the send:
+                // fail without writing instead of queueing onto a dead pipe.
+                throw new AgentConnectionFaultedException(_faultReason);
+            }
             try
             {
-                await FrameCodec.WriteFrameAsync(_stream, encoded, _options.MaxFrameBytes, timeout.Token)
-                    .ConfigureAwait(false);
-            }
-            finally
-            {
-                _writeLock.Release();
-            }
+                // F19: the typed request payload validator runs before any
+                // byte is written; a violation is a protocol fault, so a
+                // malformed request can never reach the wire (and a mutation
+                // is never re-sent for it).
+                payload.Validate();
+                request.Validate(_identity);
 
-            var responseElement = await completion.Task.WaitAsync(timeout.Token).ConfigureAwait(false);
-            var response = JsonSerializer.Deserialize<PlatformEnvelope<PlatformResponse<TResponse>>>(
-                    responseElement.GetRawText(), AgentJson.Options)
-                ?? throw new AgentContractViolationException("envelope.decode", "response envelope was empty");
-            response.ValidateAnswer(request, _identity);
-            var body = response.Payload;
-            body.Validate();
-            return body.ExpectValue();
+                var encoded = JsonSerializer.SerializeToUtf8Bytes(request, AgentJson.Options);
+                using var timeout = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken, _disposed.Token);
+                timeout.CancelAfter(_options.RequestTimeout);
+                await _writeLock.WaitAsync(timeout.Token).ConfigureAwait(false);
+                try
+                {
+                    try
+                    {
+                        await FrameCodec.WriteFrameAsync(_stream, encoded, _options.MaxFrameBytes, timeout.Token)
+                            .ConfigureAwait(false);
+                    }
+                    catch (Exception writeFailure)
+                    {
+                        // F08: a failed, timed-out, or cancelled write may have
+                        // left a partial frame on the wire — the frame boundary
+                        // is lost, so the connection is poisoned and never
+                        // reused.
+                        Fault(writeFailure);
+                        throw;
+                    }
+                }
+                finally
+                {
+                    _writeLock.Release();
+                }
+
+                var responseElement = await completion.Task.WaitAsync(timeout.Token).ConfigureAwait(false);
+                var response = JsonSerializer.Deserialize<PlatformEnvelope<PlatformResponse<TResponse>>>(
+                        responseElement.GetRawText(), AgentJson.Options)
+                    ?? throw new AgentContractViolationException("envelope.decode", "response envelope was empty");
+                response.ValidateAnswer(request, _identity);
+                var body = response.Payload;
+                body.Validate();
+                var value = body.ExpectValue();
+                // F19: the response payload validator runs once the answer is
+                // accepted; a contract-violating payload is a protocol fault.
+                value.Validate();
+                return value;
+            }
+            catch (Exception failure) when (failure is AgentContractViolationException or JsonException)
+            {
+                // F19: a contract-violating request composition or response is
+                // a protocol fault (F08 terminal path) — the peer is not
+                // speaking the bounded profile, and the client never re-sends
+                // the request for it.
+                Fault(failure);
+                throw;
+            }
         }
         finally
         {
@@ -220,8 +309,21 @@ public sealed class AgentConnection : IAgentConnection
         }
     }
 
+    /// <summary>
+    /// F08: the single terminal fault path. The first fault fixes the
+    /// reason, fails every pending waiter (including requests queued before
+    /// the fault), completes the bounded notification queue, and closes the
+    /// stream so the read loop wakes up and exits. Later faults are no-ops:
+    /// the state is terminal and never revived. Full resource cleanup stays
+    /// with <see cref="DisposeAsync"/>, which tolerates the double dispose.
+    /// </summary>
     private void Fault(Exception failure)
     {
+        Volatile.Write(ref _faultReason, failure);
+        if (Interlocked.CompareExchange(ref _faulted, 1, 0) != 0)
+        {
+            return; // already terminal: the first reason stands
+        }
         foreach (var entry in _pending)
         {
             if (_pending.TryRemove(entry.Key, out var completion))
@@ -230,6 +332,15 @@ public sealed class AgentConnection : IAgentConnection
             }
         }
         _notifications.Writer.TryComplete(failure);
+        try
+        {
+            // Closing the stream unblocks a read parked on the socket.
+            _stream.DisposeAsync().AsTask().GetAwaiter().GetResult();
+        }
+        catch
+        {
+            // The stream may already be gone; the fault reason is what counts.
+        }
     }
 
     public async ValueTask DisposeAsync()
