@@ -363,7 +363,6 @@ async fn connect(endpoint: &LocalEndpoint) -> std::os::unix::net::UnixStream {
     }
     panic!("uds socket {} never became connectable", path.display());
 }
-}
 
 // ---------------------------------------------------------------------------
 // N1: long-lived host — bounded stop, grant revocation, endpoint safety.
