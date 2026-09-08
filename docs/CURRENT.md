@@ -4,7 +4,7 @@
 
 **当前阶段：M17 收尾——可恢复的多入口工作台（N 系列，2026-09-08 切换）。** M17 三线的代码主体已落地（B1–B3、C0、P1、P2 主体、P3 宿主、G1–G3 客户端侧、E1；对照见 [NEXT_TASKS.md](NEXT_TASKS.md) 的 M17 队列表）。本轮的判断变了：**主要缺口不是缺组件，而是端到端链路断着**——订阅成功但事件 receiver 被丢弃、重连自动重发修改操作、宿主恢复绕过正式信封解码、多连接/会话释放/停机缺口。2026-09-08 外部闭环审查（基线 `11afdd747d6cbbb58ef0d7371841e8e365c4f8db`）的 20 项发现（F01–F20）映射为 N0–N8。
 
-**N0 已关闭（2026-09-08）：CI run `34163939549` 七 job 全绿**——fmt 修复、宿主 Linux cfg＋UDS e2e、.NET job 入 CI、F20 测试修准；修复链顺带消掉了 conformance 角色准入、protocol 夹具 lint、agent-replay 探针夹具（契约演进被 fmt 红遮蔽四轮的实证）、supervision 锁退避（两进程同 workspace 启动的真实生产问题）。第一批 **N1/N2/N6 已关闭并合入 main**（CI run `34173331100` 七 job 全绿）：宿主长期服务、客户端操作安全、核心语义边界三线由并行代理实现、主会话按 A→B→C 集成验证（host e2e 双平台 / dotnet 35 / context-simple 302 / workspace 全量零失败）。下一批：**N3 真实事件与完整输入**（契约维护者合入）→ N4 正式 GUI 接真实数据；N5 恢复与结果审阅并行。
+**N0 已关闭（2026-09-08）：CI run `34163939549` 七 job 全绿**——fmt 修复、宿主 Linux cfg＋UDS e2e、.NET job 入 CI、F20 测试修准；修复链顺带消掉了 conformance 角色准入、protocol 夹具 lint、agent-replay 探针夹具（契约演进被 fmt 红遮蔽四轮的实证）、supervision 锁退避（两进程同 workspace 启动的真实生产问题）。第一批 **N1/N2/N6 已关闭并合入 main**（CI run `34173331100` 七 job 全绿）：宿主长期服务、客户端操作安全、核心语义边界三线由并行代理实现、主会话按 A→B→C 集成验证（host e2e 双平台 / dotnet 35 / context-simple 302 / workspace 全量零失败）。第二批 **N3/N5 已关闭并合入 main**（CI run `34268863699` 七 job 全绿）：真实事件从 Runtime 经宿主到客户端全链贯通、多行输入合法、正式信封恢复。剩余：**N4 正式 GUI 操作面**（消费真实事件流＋知情审批＋稳定行生命周期）→ N7 长会话；N8 能力配置与来源绑定发布（含 PACKAGE-01）。
 
 审查原文：[reviews/2026-09-08-closure-audit-11afdd7/REPORT.md](reviews/2026-09-08-closure-audit-11afdd7/REPORT.md)；
 工单全文：[reviews/2026-09-08-closure-audit-11afdd7/NEXT_STAGE_TASKS.md](reviews/2026-09-08-closure-audit-11afdd7/NEXT_STAGE_TASKS.md)。
