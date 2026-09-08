@@ -516,3 +516,432 @@ public sealed record ApprovalRespondResponse : IProtocolPayload
     {
     }
 }
+
+// ---------------------------------------------------------------------------
+// B3 read-only routes: task detail / change journal / artifact bytes /
+// context summary. All four are run-scoped reads (Envelope.cs routes) — they
+// never start a model round, never mutate state and never consult Core's
+// approval gate. The Rust side mirrors the workspace journal; bytes travel
+// base64 because artifacts are binary-safe and the wire is JSON.
+// ---------------------------------------------------------------------------
+
+/// <summary>One task's full anchor card (B3).</summary>
+public sealed record WorkTaskDetailRequest : IProtocolPayload
+{
+    [JsonPropertyName("task_id")]
+    public string TaskId { get; init; } = string.Empty;
+
+    public void Validate() =>
+        ContractText.ValidateTaskId("work.task_detail.task_id", TaskId);
+}
+
+/// <summary>Rust <c>TaskAnchorView</c>: the bounded prompt projection of a
+/// task anchor (plan/acceptance/open loops). Not an authority surface.</summary>
+public sealed record TaskAnchorView
+{
+    [JsonPropertyName("revision")]
+    public ulong Revision { get; init; }
+
+    [JsonPropertyName("original_goal")]
+    public string OriginalGoal { get; init; } = string.Empty;
+
+    [JsonPropertyName("current_interpretation")]
+    public string CurrentInterpretation { get; init; } = string.Empty;
+
+    [JsonPropertyName("constraints")]
+    public IReadOnlyList<string> Constraints { get; init; } = [];
+
+    [JsonPropertyName("acceptance_criteria")]
+    public IReadOnlyList<string> AcceptanceCriteria { get; init; } = [];
+
+    [JsonPropertyName("plan_progress")]
+    public IReadOnlyList<string> PlanProgress { get; init; } = [];
+
+    [JsonPropertyName("open_loops")]
+    public IReadOnlyList<string> OpenLoops { get; init; } = [];
+
+    [JsonPropertyName("next_action")]
+    public string NextAction { get; init; } = string.Empty;
+}
+
+public sealed record WorkTaskDetailResponse : IProtocolPayload
+{
+    [JsonPropertyName("task_id")]
+    public string TaskId { get; init; } = string.Empty;
+
+    [JsonPropertyName("goal")]
+    public string Goal { get; init; } = string.Empty;
+
+    [JsonPropertyName("status")]
+    public TaskSnapshotStatus Status { get; init; }
+
+    [JsonPropertyName("anchor_revision")]
+    public ulong AnchorRevision { get; init; }
+
+    [JsonPropertyName("anchor")]
+    public TaskAnchorView Anchor { get; init; } = new();
+
+    public void Validate()
+    {
+        ContractText.ValidateTaskId("work.task_detail.task_id", TaskId);
+        ContractText.ValidateText("work.task_detail.goal", Goal, WorkSnapshotResponse.MaxGoalChars);
+    }
+}
+
+/// <summary>Wire mirror of the workspace change journal (B3). A single record
+/// carries one transaction's journaled phase; the journal's internal
+/// <c>old_content</c> capture never travels.</summary>
+public enum ChangeSummaryKind
+{
+    MutationPrepared,
+    MutationCommitted,
+    MutationRolledBack,
+    DirectoryPrepared,
+    DirectoryCommitted,
+    DirectoryRolledBack,
+}
+
+[JsonConverter(typeof(ChangeSummaryConverter))]
+public sealed record ChangeSummary
+{
+    public ChangeSummaryKind Kind { get; init; }
+
+    public string TxId { get; init; } = string.Empty;
+
+    public ulong TimestampMs { get; init; }
+
+    public string? Tool { get; init; }
+
+    public string? Path { get; init; }
+
+    public string? Action { get; init; }
+
+    public ulong BytesBefore { get; init; }
+
+    public ulong BytesAfter { get; init; }
+
+    public string? BeforeHash { get; init; }
+
+    public string? AfterHash { get; init; }
+
+    public string? Reason { get; init; }
+
+    public string? EntryIdentity { get; init; }
+}
+
+/// <summary>Rust serde <c>tag = "kind", rename_all = "snake_case"</c>: reads
+/// strictly (unknown fields on a variant are rejected), the internal
+/// <c>old_content</c> is never accepted from or written to the wire.</summary>
+internal sealed class ChangeSummaryConverter : JsonConverter<ChangeSummary>
+{
+    private static readonly string[] PreparedFields =
+        ["tx_id", "timestamp_ms", "tool", "path", "action", "bytes_before", "bytes_after", "before_hash", "after_hash"];
+    private static readonly string[] CommittedFields = ["tx_id", "timestamp_ms"];
+    private static readonly string[] RolledBackFields = ["tx_id", "timestamp_ms", "reason"];
+    private static readonly string[] DirectoryPreparedFields = ["tx_id", "timestamp_ms", "tool", "path"];
+    private static readonly string[] DirectoryCommittedFields = ["tx_id", "timestamp_ms", "entry_identity"];
+    private static readonly string[] DirectoryRolledBackFields = ["tx_id", "timestamp_ms", "reason"];
+
+    public override ChangeSummary Read(ref Utf8JsonReader reader, Type typeToConvert, JsonSerializerOptions options)
+    {
+        using var document = JsonDocument.ParseValue(ref reader);
+        var root = document.RootElement;
+        if (root.ValueKind != JsonValueKind.Object || !root.TryGetProperty("kind", out var kind))
+        {
+            throw new JsonException("change summary must be a kind-tagged object");
+        }
+        var (name, fields) = kind.GetString() switch
+        {
+            "mutation_prepared" => ("mutation_prepared", PreparedFields),
+            "mutation_committed" => ("mutation_committed", CommittedFields),
+            "mutation_rolled_back" => ("mutation_rolled_back", RolledBackFields),
+            "directory_prepared" => ("directory_prepared", DirectoryPreparedFields),
+            "directory_committed" => ("directory_committed", DirectoryCommittedFields),
+            "directory_rolled_back" => ("directory_rolled_back", DirectoryRolledBackFields),
+            var other => throw new JsonException($"unknown change summary kind '{other}'"),
+        };
+        foreach (var property in root.EnumerateObject())
+        {
+            if (property.Name != "kind" && !fields.Contains(property.Name))
+            {
+                throw new JsonException(
+                    $"change summary '{name}' carries unknown field '{property.Name}': {root.GetRawText()}");
+            }
+        }
+        string Required(string field) =>
+            root.TryGetProperty(field, out var element) && element.ValueKind == JsonValueKind.String
+                ? element.GetString()!
+                : throw new JsonException($"change summary '{name}' requires string {field}");
+        ulong RequiredU64(string field) =>
+            root.TryGetProperty(field, out var element) && element.TryGetUInt64(out var value)
+                ? value
+                : throw new JsonException($"change summary '{name}' requires u64 {field}");
+        var txId = Required("tx_id");
+        var timestampMs = RequiredU64("timestamp_ms");
+        return new ChangeSummary
+        {
+            Kind = name switch
+            {
+                "mutation_prepared" => ChangeSummaryKind.MutationPrepared,
+                "mutation_committed" => ChangeSummaryKind.MutationCommitted,
+                "mutation_rolled_back" => ChangeSummaryKind.MutationRolledBack,
+                "directory_prepared" => ChangeSummaryKind.DirectoryPrepared,
+                "directory_committed" => ChangeSummaryKind.DirectoryCommitted,
+                _ => ChangeSummaryKind.DirectoryRolledBack,
+            },
+            TxId = txId,
+            TimestampMs = timestampMs,
+            Tool = root.TryGetProperty("tool", out var tool) && tool.ValueKind == JsonValueKind.String ? tool.GetString() : null,
+            Path = root.TryGetProperty("path", out var path) && path.ValueKind == JsonValueKind.String ? path.GetString() : null,
+            Action = root.TryGetProperty("action", out var action) && action.ValueKind == JsonValueKind.String ? action.GetString() : null,
+            BytesBefore = root.TryGetProperty("bytes_before", out var bb) && bb.TryGetUInt64(out var bbv) ? bbv : 0,
+            BytesAfter = root.TryGetProperty("bytes_after", out var ba) && ba.TryGetUInt64(out var bav) ? bav : 0,
+            BeforeHash = root.TryGetProperty("before_hash", out var bh) && bh.ValueKind == JsonValueKind.String ? bh.GetString() : null,
+            AfterHash = root.TryGetProperty("after_hash", out var ah) && ah.ValueKind == JsonValueKind.String ? ah.GetString() : null,
+            Reason = root.TryGetProperty("reason", out var reason) && reason.ValueKind == JsonValueKind.String ? reason.GetString() : null,
+            EntryIdentity = root.TryGetProperty("entry_identity", out var identity) && identity.ValueKind == JsonValueKind.String ? identity.GetString() : null,
+        };
+    }
+
+    public override void Write(Utf8JsonWriter writer, ChangeSummary value, JsonSerializerOptions options)
+    {
+        writer.WriteStartObject();
+        writer.WriteString("kind", value.Kind switch
+        {
+            ChangeSummaryKind.MutationPrepared => "mutation_prepared",
+            ChangeSummaryKind.MutationCommitted => "mutation_committed",
+            ChangeSummaryKind.MutationRolledBack => "mutation_rolled_back",
+            ChangeSummaryKind.DirectoryPrepared => "directory_prepared",
+            ChangeSummaryKind.DirectoryCommitted => "directory_committed",
+            _ => "directory_rolled_back",
+        });
+        writer.WriteString("tx_id", value.TxId);
+        writer.WriteNumber("timestamp_ms", value.TimestampMs);
+        switch (value.Kind)
+        {
+            case ChangeSummaryKind.MutationPrepared:
+                writer.WriteString("tool", value.Tool);
+                writer.WriteString("path", value.Path);
+                writer.WriteString("action", value.Action);
+                writer.WriteNumber("bytes_before", value.BytesBefore);
+                writer.WriteNumber("bytes_after", value.BytesAfter);
+                writer.WriteString("before_hash", value.BeforeHash);
+                writer.WriteString("after_hash", value.AfterHash);
+                break;
+            case ChangeSummaryKind.MutationRolledBack:
+                writer.WriteString("reason", value.Reason);
+                break;
+            case ChangeSummaryKind.DirectoryPrepared:
+                writer.WriteString("tool", value.Tool);
+                writer.WriteString("path", value.Path);
+                break;
+            case ChangeSummaryKind.DirectoryCommitted:
+                writer.WriteString("entry_identity", value.EntryIdentity);
+                break;
+            case ChangeSummaryKind.DirectoryRolledBack:
+                writer.WriteString("reason", value.Reason);
+                break;
+            case ChangeSummaryKind.MutationCommitted:
+                break;
+        }
+        writer.WriteEndObject();
+    }
+}
+
+public sealed record WorkChangesRequest : IProtocolPayload
+{
+    public const int MaxChangesLimit = 256;
+    public const int MaxTxIdBytes = 64;
+
+    [JsonPropertyName("limit")]
+    public int? Limit { get; init; }
+
+    [JsonPropertyName("after_tx")]
+    public string? AfterTx { get; init; }
+
+    public void Validate()
+    {
+        if (Limit is { } limit && (limit is <= 0 or > MaxChangesLimit))
+        {
+            throw new AgentContractViolationException("work.changes.limit", $"must be in 1..={MaxChangesLimit}");
+        }
+        if (AfterTx is { } afterTx)
+        {
+            ContractText.ValidateOpaque("work.changes.after_tx", afterTx, MaxTxIdBytes);
+        }
+    }
+}
+
+public sealed record WorkChangesResponse : IProtocolPayload
+{
+    [JsonPropertyName("changes")]
+    public IReadOnlyList<ChangeSummary> Changes { get; init; } = [];
+
+    public void Validate()
+    {
+        if (Changes.Count > WorkChangesRequest.MaxChangesLimit)
+        {
+            throw new AgentContractViolationException(
+                "work.changes.changes",
+                $"contains {Changes.Count} entries, above the {WorkChangesRequest.MaxChangesLimit} entry bound");
+        }
+        if (Changes.Any(c => string.IsNullOrEmpty(c.TxId)))
+        {
+            throw new AgentContractViolationException("work.changes.tx_id", "must not be empty");
+        }
+    }
+}
+
+public sealed record WorkArtifactRequest : IProtocolPayload
+{
+    public const uint MaxArtifactReadBytes = 64 * 1024;
+
+    [JsonPropertyName("reference")]
+    public string Reference { get; init; } = string.Empty;
+
+    [JsonPropertyName("max_bytes")]
+    public uint? MaxBytes { get; init; }
+
+    public void Validate()
+    {
+        ContractText.ValidateOpaque("work.artifact.reference", Reference, 256);
+        if (MaxBytes is { } max && (max is 0 or > MaxArtifactReadBytes))
+        {
+            throw new AgentContractViolationException(
+                "work.artifact.max_bytes", $"must be in 1..={MaxArtifactReadBytes}");
+        }
+    }
+}
+
+public sealed record WorkArtifactResponse : IProtocolPayload
+{
+    [JsonPropertyName("reference")]
+    public string Reference { get; init; } = string.Empty;
+
+    [JsonPropertyName("size_bytes")]
+    public ulong SizeBytes { get; init; }
+
+    [JsonPropertyName("truncated")]
+    public bool Truncated { get; init; }
+
+    [JsonPropertyName("content_base64")]
+    public string ContentBase64 { get; init; } = string.Empty;
+
+    public void Validate()
+    {
+        ContractText.ValidateOpaque("work.artifact.reference", Reference, 256);
+        byte[] decoded;
+        try
+        {
+            decoded = Convert.FromBase64String(ContentBase64);
+        }
+        catch (FormatException)
+        {
+            throw new AgentContractViolationException("work.artifact.content_base64", "is not valid base64");
+        }
+        var consistent = Truncated
+            ? decoded.LongLength < (long)SizeBytes
+            : (ulong)decoded.LongLength == SizeBytes;
+        if (!consistent)
+        {
+            throw new AgentContractViolationException(
+                "work.artifact.size_bytes",
+                $"size {SizeBytes} and truncated {Truncated} disagree with {decoded.LongLength} decoded bytes");
+        }
+    }
+}
+
+public sealed record WorkContextRequest : IProtocolPayload
+{
+    public const int MaxContextItems = 512;
+
+    [JsonPropertyName("limit")]
+    public uint? Limit { get; init; }
+
+    public void Validate()
+    {
+        if (Limit is { } limit && (limit is 0 or > MaxContextItems))
+        {
+            throw new AgentContractViolationException("work.context.limit", $"must be in 1..={MaxContextItems}");
+        }
+    }
+}
+
+/// <summary>Mirror of <c>agent_contracts::ContextItemSummary</c>. The
+/// type-tagged dimensions (<c>kind</c>, <c>scope</c>, <c>attention</c>,
+/// <c>semantic</c>) stay raw JSON elements exactly like the runtime event
+/// body: the client routes and bounds context by what it already knows, it
+/// never re-interprets engine internals.</summary>
+public sealed record ContextItemSummary
+{
+    [JsonPropertyName("id")]
+    public string Id { get; init; } = string.Empty;
+
+    [JsonPropertyName("kind")]
+    public JsonElement Kind { get; init; }
+
+    [JsonPropertyName("scope")]
+    public JsonElement Scope { get; init; }
+
+    [JsonPropertyName("scope_id")]
+    public string? ScopeId { get; init; }
+
+    [JsonPropertyName("attention")]
+    public JsonElement Attention { get; init; }
+
+    [JsonPropertyName("semantic")]
+    public JsonElement Semantic { get; init; }
+
+    [JsonPropertyName("importance")]
+    public double Importance { get; init; }
+
+    [JsonPropertyName("relevance")]
+    public double Relevance { get; init; }
+
+    [JsonPropertyName("created_tick")]
+    public ulong CreatedTick { get; init; }
+
+    [JsonPropertyName("created_turn")]
+    public ulong CreatedTurn { get; init; }
+
+    [JsonPropertyName("last_access_turn")]
+    public ulong LastAccessTurn { get; init; }
+
+    [JsonPropertyName("last_selected_turn")]
+    public ulong? LastSelectedTurn { get; init; }
+
+    [JsonPropertyName("access_count")]
+    public uint AccessCount { get; init; }
+
+    [JsonPropertyName("dependencies")]
+    public IReadOnlyList<string> Dependencies { get; init; } = [];
+
+    [JsonPropertyName("keep_alive")]
+    public bool KeepAlive { get; init; }
+
+    [JsonPropertyName("lease_until_turn")]
+    public ulong? LeaseUntilTurn { get; init; }
+
+    [JsonPropertyName("source")]
+    public string? Source { get; init; }
+}
+
+public sealed record WorkContextResponse : IProtocolPayload
+{
+    [JsonPropertyName("items")]
+    public IReadOnlyList<ContextItemSummary> Items { get; init; } = [];
+
+    public void Validate()
+    {
+        if (Items.Count > WorkContextRequest.MaxContextItems)
+        {
+            throw new AgentContractViolationException(
+                "work.context.items",
+                $"contains {Items.Count} entries, above the {WorkContextRequest.MaxContextItems} entry bound");
+        }
+        if (Items.Any(item => string.IsNullOrEmpty(item.Id)))
+        {
+            throw new AgentContractViolationException("work.context.items.id", "must not be empty");
+        }
+    }
+}

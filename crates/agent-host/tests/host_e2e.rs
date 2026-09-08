@@ -8,6 +8,7 @@
 //! the point: OS backends are isolated, everything above them is not.
 
 use std::io::{Read, Write};
+use std::str::FromStr;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
@@ -22,10 +23,12 @@ use agent_host::{
 use agent_platform_protocol::{
     ActiveFeatures, ApprovalRespondOutcome, ApprovalRespondRequest, ApprovalRespondResponse,
     Causality, EnvelopeKind, MessageId, PlatformEnvelope, PlatformResponse, ProtocolIdentity,
-    ProtocolVersion, RequestId, Route, WorkCancelRequest, WorkCancelResponse, WorkContinueRequest,
-    WorkContinueResponse, WorkEventNotification, WorkSnapshotRequest, WorkSnapshotResponse,
-    WorkSubmitDisposition, WorkSubmitRequest, WorkSubmitResponse, WorkSubscribeRequest,
-    WorkSubscribeResponse,
+    ProtocolVersion, RequestId, Route, WorkArtifactRequest, WorkArtifactResponse,
+    WorkCancelRequest, WorkCancelResponse, WorkChangesRequest, WorkChangesResponse,
+    WorkContextRequest, WorkContextResponse, WorkContinueRequest, WorkContinueResponse,
+    WorkEventNotification, WorkSnapshotRequest, WorkSnapshotResponse, WorkSubmitDisposition,
+    WorkSubmitRequest, WorkSubmitResponse, WorkSubscribeRequest, WorkSubscribeResponse,
+    WorkTaskDetailRequest, WorkTaskDetailResponse,
 };
 use agent_runtime::{RuntimeHandle, WorkControlSessionRegistry};
 use serde_json::json;
@@ -163,6 +166,7 @@ async fn run_e2e(endpoint: LocalEndpoint, label: &str) -> anyhow::Result<()> {
         broker: Arc::clone(&fixture.broker),
         gate: Arc::clone(&fixture.gate),
         registry,
+        workspace: Arc::new(fixture.composed.workspace.clone()),
     };
 
     fixture.composed.instance.start().await?;
@@ -236,6 +240,164 @@ async fn run_e2e(endpoint: LocalEndpoint, label: &str) -> anyhow::Result<()> {
     assert!(snapshot.run_started);
     let focus = snapshot.focus.as_ref().expect("focus after submit");
     assert_eq!(focus.task_id.to_string(), task_id);
+
+    // B3 4a. task_detail: the full anchor card for the submitted task —
+    // the plan/acceptance surface the GUI renders, read on demand.
+    let detail = expect_value(exchange::<_, _, WorkTaskDetailResponse>(
+        &mut stream,
+        &request(
+            "work",
+            "task_detail",
+            WorkTaskDetailRequest {
+                task_id: agent_contracts::TaskId::from_str(&task_id).expect("task id"),
+            },
+        ),
+    )?);
+    assert_eq!(detail.task_id.to_string(), task_id);
+    assert_eq!(detail.goal, "host e2e: fix the flaky retry test");
+    assert_eq!(
+        detail.status,
+        agent_platform_protocol::TaskSnapshotStatus::Active
+    );
+    assert_eq!(
+        detail.anchor.original_goal, "host e2e: fix the flaky retry test",
+        "the anchor projection carries the submitted goal verbatim"
+    );
+    assert_eq!(
+        detail.anchor.revision, detail.anchor_revision,
+        "the response's anchor revision and the anchor view must agree"
+    );
+
+    // B3 4b. changes: seed the real journal through the workspace's own
+    // writer, then read it over the wire — newest first, bounded, cursor
+    // filtered.
+    let workspace = Arc::new(fixture.composed.workspace.clone());
+    let run_id = fixture.composed.handle().run_id();
+    for i in 0..3 {
+        workspace
+            .record_change(agent_workspace::ChangeRecord::MutationCommitted {
+                tx_id: format!("e2e-tx-{i}"),
+                timestamp_ms: 100 + i as u64,
+            })
+            .await?;
+    }
+    let listed = expect_value(exchange::<_, _, WorkChangesResponse>(
+        &mut stream,
+        &request(
+            "work",
+            "changes",
+            WorkChangesRequest {
+                limit: Some(10),
+                after_tx: None,
+            },
+        ),
+    )?);
+    let tx_ids: Vec<&str> = listed
+        .changes
+        .iter()
+        .map(|change| match change {
+            agent_platform_protocol::ChangeSummary::MutationCommitted { tx_id, .. } => {
+                tx_id.as_str()
+            }
+            other => panic!("unexpected change kind: {other:?}"),
+        })
+        .collect();
+    assert!(
+        tx_ids.windows(2).all(|pair| pair[0] > pair[1]),
+        "changes must be newest first: {tx_ids:?}"
+    );
+    let filtered = expect_value(exchange::<_, _, WorkChangesResponse>(
+        &mut stream,
+        &request(
+            "work",
+            "changes",
+            WorkChangesRequest {
+                limit: Some(10),
+                after_tx: Some("e2e-tx-1".into()),
+            },
+        ),
+    )?);
+    let filtered_ids: Vec<&str> = filtered
+        .changes
+        .iter()
+        .map(|change| match change {
+            agent_platform_protocol::ChangeSummary::MutationCommitted { tx_id, .. } => {
+                tx_id.as_str()
+            }
+            other => panic!("unexpected change kind: {other:?}"),
+        })
+        .collect();
+    assert!(
+        !filtered_ids.contains(&"e2e-tx-1"),
+        "the cursor's own record must be excluded"
+    );
+    assert!(
+        filtered_ids.iter().all(|tx| tx > &"e2e-tx-1"),
+        "only records newer than the cursor may be returned: {filtered_ids:?}"
+    );
+
+    // B3 4c. artifact: write a sealed artifact through the workspace store,
+    // then read its bounded body back over the wire (run-scoped, digest
+    // verified). A body that exceeds the route budget is honestly truncated.
+    let sealed = workspace
+        .write_artifact(run_id, "proof", "txt", b"b3 artifact body")
+        .await?;
+    let full = expect_value(exchange::<_, _, WorkArtifactResponse>(
+        &mut stream,
+        &request(
+            "work",
+            "artifact",
+            WorkArtifactRequest {
+                reference: sealed.clone(),
+                max_bytes: Some(4096),
+            },
+        ),
+    )?);
+    assert_eq!(full.size_bytes, "b3 artifact body".len() as u64);
+    assert!(!full.truncated);
+    use base64::Engine;
+    let decoded = base64::engine::general_purpose::STANDARD
+        .decode(&full.content_base64)
+        .expect("valid base64 body");
+    assert_eq!(decoded, b"b3 artifact body");
+    assert!(full.reference.contains("proof"), "canonical reference");
+
+    let tiny = expect_value(exchange::<_, _, WorkArtifactResponse>(
+        &mut stream,
+        &request(
+            "work",
+            "artifact",
+            WorkArtifactRequest {
+                reference: sealed.clone(),
+                max_bytes: Some(4),
+            },
+        ),
+    )?);
+    assert!(tiny.truncated);
+    assert_eq!(
+        tiny.size_bytes,
+        "b3 artifact body".len() as u64,
+        "size_bytes is the on-disk truth, not the returned prefix"
+    );
+    let truncated_bytes = base64::engine::general_purpose::STANDARD
+        .decode(&tiny.content_base64)
+        .expect("valid base64 body");
+    assert_eq!(truncated_bytes, b"b3 a", "exactly the requested budget");
+
+    // B3 4d. context: the engine's read-only item summary — the submitted
+    // goal reaches the engine, so the listing is non-empty and bounded.
+    let context = expect_value(exchange::<_, _, WorkContextResponse>(
+        &mut stream,
+        &request("work", "context", WorkContextRequest { limit: Some(4) }),
+    )?);
+    assert!(
+        !context.items.is_empty(),
+        "the submitted goal must be visible in the engine's summary"
+    );
+    assert!(
+        context.items.len() <= 4,
+        "context listing must honor the requested bound"
+    );
 
     // 5. approval flow: inject one pending request through the live broker,
     // see it in the snapshot, answer it, see the real delivery receipt.
@@ -434,6 +596,7 @@ async fn start_server(
         broker: Arc::clone(&fixture.broker),
         gate: Arc::clone(&fixture.gate),
         registry: Arc::clone(&registry),
+        workspace: Arc::new(fixture.composed.workspace.clone()),
     };
     let stop = Arc::new(AtomicBool::new(false));
     let server = HostServer {

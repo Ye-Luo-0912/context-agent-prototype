@@ -74,13 +74,22 @@ fn run_scoped_envelope<P>(route: Route, payload: P) -> PlatformEnvelope<P> {
     }
 }
 
-fn router_with(
+async fn router_with(
     handle: agent_runtime::RuntimeHandle,
     authorizer: Arc<dyn WorkControlAuthorizer>,
     broker: Arc<ApprovalBroker>,
     gate: Arc<InteractiveApprovalGate>,
-) -> WorkControlRouter {
-    WorkControlRouter::new(profile(), handle, broker, gate, authorizer).unwrap()
+) -> (WorkControlRouter, tempfile::TempDir) {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let workspace = Arc::new(
+        agent_workspace::Workspace::open(dir.path())
+            .await
+            .expect("open workspace"),
+    );
+    (
+        WorkControlRouter::new(profile(), handle, broker, gate, authorizer, workspace).unwrap(),
+        dir,
+    )
 }
 
 #[tokio::test]
@@ -88,12 +97,13 @@ async fn submit_route_returns_receipts_and_dedups() {
     let (handle, _task) = start(Arc::new(SilentModel)).await;
     let broker = ApprovalBroker::new();
     let gate = Arc::new(InteractiveApprovalGate::new(Arc::clone(&broker)));
-    let router = router_with(
+    let (router, _dir) = router_with(
         handle.clone(),
         Arc::new(AllowAll),
         Arc::clone(&broker),
         Arc::clone(&gate),
-    );
+    )
+    .await;
     let mut events = handle.subscribe();
 
     let first = router
@@ -153,12 +163,13 @@ async fn snapshot_is_consistent_and_subscribe_reports_stale_cursors() {
     let (handle, _task) = start(Arc::new(SilentModel)).await;
     let broker = ApprovalBroker::new();
     let gate = Arc::new(InteractiveApprovalGate::new(Arc::clone(&broker)));
-    let router = router_with(
+    let (router, _dir) = router_with(
         handle.clone(),
         Arc::new(AllowAll),
         Arc::clone(&broker),
         Arc::clone(&gate),
-    );
+    )
+    .await;
     let mut events = handle.subscribe();
 
     router
@@ -243,7 +254,7 @@ async fn denied_subscription_has_no_runtime_event_receiver() {
     let (handle, _task) = start(Arc::new(SilentModel)).await;
     let broker = ApprovalBroker::new();
     let gate = Arc::new(InteractiveApprovalGate::new(Arc::clone(&broker)));
-    let router = router_with(handle, Arc::new(DenySubscribe), broker, gate);
+    let (router, _dir) = router_with(handle, Arc::new(DenySubscribe), broker, gate).await;
     let (response, mut stream) = router
         .subscribe(run_scoped_envelope(
             Route::work_subscribe(),
@@ -265,7 +276,7 @@ async fn subscribe_cannot_fabricate_a_watermark_after_actor_failure() {
     let _ = task.await;
     let broker = ApprovalBroker::new();
     let gate = Arc::new(InteractiveApprovalGate::new(Arc::clone(&broker)));
-    let router = router_with(handle, Arc::new(AllowAll), broker, gate);
+    let (router, _dir) = router_with(handle, Arc::new(AllowAll), broker, gate).await;
     let (response, mut stream) = router
         .subscribe(run_scoped_envelope(
             Route::work_subscribe(),
@@ -285,12 +296,13 @@ async fn approval_respond_binds_to_the_pending_request_once() {
     let (handle, _task) = start(Arc::new(SilentModel)).await;
     let broker = ApprovalBroker::new();
     let gate = Arc::new(InteractiveApprovalGate::new(Arc::clone(&broker)));
-    let router = router_with(
+    let (router, _dir) = router_with(
         handle.clone(),
         Arc::new(AllowAll),
         Arc::clone(&broker),
         Arc::clone(&gate),
-    );
+    )
+    .await;
 
     // One authorization waiting on the approval plane (the kernel path in
     // production; here driven directly against the same gate the router
@@ -384,7 +396,7 @@ async fn sessions_without_mutation_grants_cannot_submit() {
     let (handle, _task) = start(Arc::new(SilentModel)).await;
     let broker = ApprovalBroker::new();
     let gate = Arc::new(InteractiveApprovalGate::new(Arc::clone(&broker)));
-    let router = router_with(handle.clone(), Arc::new(DenySubmit), broker, gate);
+    let (router, _dir) = router_with(handle.clone(), Arc::new(DenySubmit), broker, gate).await;
 
     let rejected = router
         .submit(run_scoped_envelope(

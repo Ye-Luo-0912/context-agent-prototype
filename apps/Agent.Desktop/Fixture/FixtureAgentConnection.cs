@@ -118,6 +118,46 @@ public sealed class FixtureAgentConnection : IAgentConnection
         return Task.FromResult(new ApprovalRespondResponse { Outcome = ApprovalRespondOutcome.Delivered });
     }
 
+    // -----------------------------------------------------------------------
+    // B3 read-only routes: the layout fixture has no real journal/artifact/
+    // context truths, so it only answers the task card from fixture tasks and
+    // empty listings; wired-up reads belong to the C line's real host hookup.
+    // -----------------------------------------------------------------------
+
+    public Task<WorkTaskDetailResponse> TaskDetailAsync(string taskId, CancellationToken cancellationToken = default)
+    {
+        var task = _tasks.FirstOrDefault(t => t.TaskId == taskId);
+        if (task is null)
+        {
+            return Task.FromException<WorkTaskDetailResponse>(
+                new AgentContractViolationException("work.task_detail.task_id", "task not found in fixture"));
+        }
+        return Task.FromResult(new WorkTaskDetailResponse
+        {
+            TaskId = task.TaskId,
+            Goal = task.Goal,
+            Status = task.Status,
+            AnchorRevision = task.AnchorRevision,
+            Anchor = new TaskAnchorView
+            {
+                Revision = task.AnchorRevision,
+                OriginalGoal = task.Goal,
+                CurrentInterpretation = task.Goal,
+                NextAction = string.Empty,
+            },
+        });
+    }
+
+    public Task<WorkChangesResponse> ReadChangesAsync(int? limit = null, string? afterTx = null, CancellationToken cancellationToken = default) =>
+        Task.FromResult(new WorkChangesResponse { Changes = [] });
+
+    public Task<WorkArtifactResponse> ReadArtifactAsync(string reference, uint? maxBytes = null, CancellationToken cancellationToken = default) =>
+        Task.FromException<WorkArtifactResponse>(
+            new AgentContractViolationException("work.artifact.reference", "fixture has no artifact store"));
+
+    public Task<WorkContextResponse> ReadContextAsync(uint? limit = null, CancellationToken cancellationToken = default) =>
+        Task.FromResult(new WorkContextResponse { Items = [] });
+
     public ValueTask DisposeAsync()
     {
         IsConnected = false;

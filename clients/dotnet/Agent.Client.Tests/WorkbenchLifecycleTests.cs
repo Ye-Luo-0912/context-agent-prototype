@@ -74,6 +74,18 @@ public class WorkbenchLifecycleTests
         public Task<ApprovalRespondResponse> RespondApprovalAsync(string requestId, ApprovalDecision decision, CancellationToken cancellationToken = default) =>
             throw new NotSupportedException("lifecycle drills do not answer approvals");
 
+        public Task<WorkTaskDetailResponse> TaskDetailAsync(string taskId, CancellationToken cancellationToken = default) =>
+            throw new NotSupportedException("lifecycle drills do not read task detail");
+
+        public Task<WorkChangesResponse> ReadChangesAsync(int? limit = null, string? afterTx = null, CancellationToken cancellationToken = default) =>
+            throw new NotSupportedException("lifecycle drills do not read changes");
+
+        public Task<WorkArtifactResponse> ReadArtifactAsync(string reference, uint? maxBytes = null, CancellationToken cancellationToken = default) =>
+            throw new NotSupportedException("lifecycle drills do not read artifacts");
+
+        public Task<WorkContextResponse> ReadContextAsync(uint? limit = null, CancellationToken cancellationToken = default) =>
+            throw new NotSupportedException("lifecycle drills do not read context");
+
         public ValueTask DisposeAsync()
         {
             IsConnected = false;

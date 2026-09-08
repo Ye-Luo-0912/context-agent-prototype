@@ -257,6 +257,7 @@ async fn real_main() -> anyhow::Result<()> {
         broker,
         gate,
         registry,
+        workspace: Arc::new(composed.workspace.clone()),
     };
     let stop = Arc::new(AtomicBool::new(false));
     let endpoint = resolve_endpoint(&args, &root);

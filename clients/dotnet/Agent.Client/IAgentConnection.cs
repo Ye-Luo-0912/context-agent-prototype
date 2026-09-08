@@ -42,6 +42,26 @@ public interface IAgentConnection : IAsyncDisposable
     /// request id; late/duplicate answers report the current fact.</summary>
     Task<ApprovalRespondResponse> RespondApprovalAsync(
         string requestId, ApprovalDecision decision, CancellationToken cancellationToken = default);
+
+    /// <summary>Reads one task's full anchor card (B3). Run-scoped read;
+    /// never starts a model round.</summary>
+    Task<WorkTaskDetailResponse> TaskDetailAsync(
+        string taskId, CancellationToken cancellationToken = default);
+
+    /// <summary>Reads the workspace change journal, newest first (B3).
+    /// Run-scoped read; never starts a model round.</summary>
+    Task<WorkChangesResponse> ReadChangesAsync(
+        int? limit = null, string? afterTx = null, CancellationToken cancellationToken = default);
+
+    /// <summary>Reads one run-scoped artifact's bounded body (B3). Run-scoped
+    /// read; never starts a model round.</summary>
+    Task<WorkArtifactResponse> ReadArtifactAsync(
+        string reference, uint? maxBytes = null, CancellationToken cancellationToken = default);
+
+    /// <summary>Reads the context engine's bounded item summary (B3).
+    /// Run-scoped read; never starts a model round.</summary>
+    Task<WorkContextResponse> ReadContextAsync(
+        uint? limit = null, CancellationToken cancellationToken = default);
 }
 
 /// <summary>

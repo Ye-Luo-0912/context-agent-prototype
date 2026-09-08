@@ -267,6 +267,32 @@ public sealed class AgentConnection : IAgentConnection
         SendAsync<ApprovalRespondRequest, ApprovalRespondResponse>(
             Route.ApprovalRespondRoute(), new ApprovalRespondRequest { RequestId = requestId, Decision = decision }, cancellationToken);
 
+    // -----------------------------------------------------------------------
+    // B3 read-only routes. All four never start a model round and never
+    // mutate state; the server enforces the run-scoped reads through the
+    // installed session grant.
+    // -----------------------------------------------------------------------
+
+    public Task<WorkTaskDetailResponse> TaskDetailAsync(
+        string taskId, CancellationToken cancellationToken = default) =>
+        SendAsync<WorkTaskDetailRequest, WorkTaskDetailResponse>(
+            Route.WorkTaskDetailRoute(), new WorkTaskDetailRequest { TaskId = taskId }, cancellationToken);
+
+    public Task<WorkChangesResponse> ReadChangesAsync(
+        int? limit = null, string? afterTx = null, CancellationToken cancellationToken = default) =>
+        SendAsync<WorkChangesRequest, WorkChangesResponse>(
+            Route.WorkChangesRoute(), new WorkChangesRequest { Limit = limit, AfterTx = afterTx }, cancellationToken);
+
+    public Task<WorkArtifactResponse> ReadArtifactAsync(
+        string reference, uint? maxBytes = null, CancellationToken cancellationToken = default) =>
+        SendAsync<WorkArtifactRequest, WorkArtifactResponse>(
+            Route.WorkArtifactRoute(), new WorkArtifactRequest { Reference = reference, MaxBytes = maxBytes }, cancellationToken);
+
+    public Task<WorkContextResponse> ReadContextAsync(
+        uint? limit = null, CancellationToken cancellationToken = default) =>
+        SendAsync<WorkContextRequest, WorkContextResponse>(
+            Route.WorkContextRoute(), new WorkContextRequest { Limit = limit }, cancellationToken);
+
     private async Task ReadLoopAsync(CancellationToken cancellationToken)
     {
         try

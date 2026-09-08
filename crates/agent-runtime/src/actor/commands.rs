@@ -351,6 +351,27 @@ impl RuntimeActor {
             RuntimeCommand::InspectContext { limit, reply } => {
                 let _ = reply.send(self.services.inspect_context(limit).await);
             }
+            RuntimeCommand::TaskDetail { task_id, reply } => {
+                // Read-only, like StatusSnapshot: no idle fence, no model
+                // round, no checkpoint. Unknown tasks are a typed error.
+                let result = match self.state.tasks.get(task_id) {
+                    Some(task) => Ok(crate::work::TaskDetailSnapshot {
+                        task: crate::task::TaskInfo {
+                            id: task.id,
+                            goal: task.goal.clone(),
+                            status: task.status,
+                            tool_requirement_revision: task.tool_requirements.revision,
+                            tool_requirement_count: task.tool_requirements.entries.len(),
+                            anchor_revision: task.anchor.revision,
+                        },
+                        anchor: crate::task::task_anchor_view(&task.anchor),
+                    }),
+                    None => Err(AgentError::InvalidRequest(format!(
+                        "task not found: {task_id}"
+                    ))),
+                };
+                let _ = reply.send(result);
+            }
             RuntimeCommand::QueryOperation {
                 operation_id,
                 reply,

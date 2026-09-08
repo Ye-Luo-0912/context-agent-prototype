@@ -6,7 +6,7 @@
 //! tasks (the F07 misdelivery race), and every admission returns a stable
 //! receipt keyed by the caller's `client_request_id`.
 
-use agent_contracts::{AgentResult, RunId, TaskId};
+use agent_contracts::{AgentResult, RunId, TaskAnchorView, TaskId};
 
 use crate::RuntimeHandle;
 use crate::task::TaskInfo;
@@ -76,4 +76,13 @@ pub struct RuntimeStatusSnapshot {
     pub focus_anchor_revision: u64,
     /// Every task the runtime knows, with per-task revisions.
     pub tasks: Vec<TaskInfo>,
+}
+
+/// One task's full read-only detail (B3): its identity facts plus the
+/// complete anchor projection the GUI renders as the task card. Assembled in
+/// one serialized actor step; reading never mutates state.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TaskDetailSnapshot {
+    pub task: TaskInfo,
+    pub anchor: TaskAnchorView,
 }

@@ -157,6 +157,11 @@ public sealed record Route
     public const string WorkSnapshot = "snapshot";
     public const string WorkSubscribe = "subscribe";
     public const string WorkEvent = "event";
+    // B3 read-only routes (run-scoped; never start a model round).
+    public const string WorkTaskDetail = "task_detail";
+    public const string WorkChanges = "changes";
+    public const string WorkArtifact = "artifact";
+    public const string WorkContext = "context";
     public const string ApprovalRespond = "respond";
 
     [JsonPropertyName("namespace")]
@@ -170,6 +175,10 @@ public sealed record Route
     public static Route WorkCancelRoute() => new() { Namespace = WorkNamespace, Operation = WorkCancel };
     public static Route WorkSnapshotRoute() => new() { Namespace = WorkNamespace, Operation = WorkSnapshot };
     public static Route WorkSubscribeRoute() => new() { Namespace = WorkNamespace, Operation = WorkSubscribe };
+    public static Route WorkTaskDetailRoute() => new() { Namespace = WorkNamespace, Operation = WorkTaskDetail };
+    public static Route WorkChangesRoute() => new() { Namespace = WorkNamespace, Operation = WorkChanges };
+    public static Route WorkArtifactRoute() => new() { Namespace = WorkNamespace, Operation = WorkArtifact };
+    public static Route WorkContextRoute() => new() { Namespace = WorkNamespace, Operation = WorkContext };
     public static Route WorkEventRoute() => new() { Namespace = WorkNamespace, Operation = WorkEvent };
     public static Route ApprovalRespondRoute() => new() { Namespace = ApprovalNamespace, Operation = ApprovalRespond };
 

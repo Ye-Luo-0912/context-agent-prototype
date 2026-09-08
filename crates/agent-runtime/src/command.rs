@@ -8,7 +8,7 @@ use tokio::sync::{broadcast, mpsc, oneshot};
 
 use crate::checkpoint::RuntimeCheckpoint;
 use crate::task::{AnchorPatch, TaskAnchor, TaskInfo};
-use crate::work::{RuntimeStatusSnapshot, WorkSubmission};
+use crate::work::{RuntimeStatusSnapshot, TaskDetailSnapshot, WorkSubmission};
 
 /// Reply channel back to the caller of a command.
 pub type Reply<T> = oneshot::Sender<T>;
@@ -136,6 +136,15 @@ pub enum RuntimeCommand {
     InspectContext {
         limit: usize,
         reply: Reply<AgentResult<Vec<ContextItemSummary>>>,
+    },
+    /// Read-only projection of ONE task's identity plus its full anchor
+    /// (plan progress, acceptance, open loops — the GUI's task detail card).
+    /// Reading never mutates state, never blocks on the model and never
+    /// writes a checkpoint. Unknown tasks are a typed `InvalidRequest`, not a
+    /// guess and not a success.
+    TaskDetail {
+        task_id: TaskId,
+        reply: Reply<AgentResult<TaskDetailSnapshot>>,
     },
     /// Read Core's bounded authority truth for one tool operation. This is
     /// diagnostic/control-plane state, not a request to redispatch work.
@@ -372,6 +381,14 @@ impl RuntimeHandle {
 
     pub async fn inspect_context(&self, limit: usize) -> AgentResult<Vec<ContextItemSummary>> {
         self.call(|reply| RuntimeCommand::InspectContext { limit, reply })
+            .await
+    }
+
+    /// Read-only full detail for one known task (B3): identity plus the
+    /// anchor projection (plan/acceptance/open loops). Unknown tasks are a
+    /// typed error; reading never mutates state.
+    pub async fn task_detail(&self, task_id: TaskId) -> AgentResult<TaskDetailSnapshot> {
+        self.call(|reply| RuntimeCommand::TaskDetail { task_id, reply })
             .await
     }
 

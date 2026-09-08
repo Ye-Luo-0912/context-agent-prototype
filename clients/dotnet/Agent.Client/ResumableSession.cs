@@ -391,6 +391,27 @@ public sealed class ResumableSession : IAgentConnection, IAsyncDisposable
                 new AgentContractViolationException("approval.respond", "no live connection; re-snapshot before answering"));
     }
 
+    // -----------------------------------------------------------------------
+    // B3 read-only routes. All four are queries (effect-free), so a faulted
+    // connection reconnects once and re-issues exactly as SnapshotAsync does.
+    // -----------------------------------------------------------------------
+
+    public Task<WorkTaskDetailResponse> TaskDetailAsync(
+        string taskId, CancellationToken cancellationToken = default) =>
+        RunQueryAsync((connection, token) => connection.TaskDetailAsync(taskId, token), cancellationToken);
+
+    public Task<WorkChangesResponse> ReadChangesAsync(
+        int? limit = null, string? afterTx = null, CancellationToken cancellationToken = default) =>
+        RunQueryAsync((connection, token) => connection.ReadChangesAsync(limit, afterTx, token), cancellationToken);
+
+    public Task<WorkArtifactResponse> ReadArtifactAsync(
+        string reference, uint? maxBytes = null, CancellationToken cancellationToken = default) =>
+        RunQueryAsync((connection, token) => connection.ReadArtifactAsync(reference, maxBytes, token), cancellationToken);
+
+    public Task<WorkContextResponse> ReadContextAsync(
+        uint? limit = null, CancellationToken cancellationToken = default) =>
+        RunQueryAsync((connection, token) => connection.ReadContextAsync(limit, token), cancellationToken);
+
     /// <summary>
     /// The session-level typed event stream (N3): every installed
     /// connection's work/event notifications are relayed here in host order,

@@ -154,6 +154,7 @@ dependencies = [
  "agent-storage",
  "agent-workspace",
  "anyhow",
+ "base64",
  "context-simple",
  "libc",
  "serde",
@@ -170,6 +171,7 @@ name = "agent-platform-protocol"
 version = "0.1.0"
 dependencies = [
  "agent-contracts",
+ "base64",
  "serde",
  "serde_json",
  "sha2",
@@ -217,6 +219,7 @@ dependencies = [
  "agent-storage",
  "agent-workspace",
  "async-trait",
+ "base64",
  "context-simple",
  "futures-util",
  "serde",

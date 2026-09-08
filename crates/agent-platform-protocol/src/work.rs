@@ -12,7 +12,9 @@
 //! operator-owned) and **cleanup confirmation** (supervision truth). A
 //! success response here proves the first two only.
 
-use agent_contracts::{ApprovalDecision, TaskId, TurnCancelAck};
+use agent_contracts::{
+    ApprovalDecision, ContextItemSummary, TaskAnchorView, TaskId, TurnCancelAck,
+};
 use serde::{Deserialize, Serialize};
 
 use crate::{
@@ -28,6 +30,11 @@ pub const WORK_CANCEL: &str = "cancel";
 pub const WORK_SNAPSHOT: &str = "snapshot";
 pub const WORK_SUBSCRIBE: &str = "subscribe";
 pub const WORK_EVENT: &str = "event";
+// B3 read-only operations (run-scoped; never start a model round).
+pub const WORK_TASK_DETAIL: &str = "task_detail";
+pub const WORK_CHANGES: &str = "changes";
+pub const WORK_ARTIFACT: &str = "artifact";
+pub const WORK_CONTEXT: &str = "context";
 pub const APPROVAL_NAMESPACE: &str = "approval";
 pub const APPROVAL_RESPOND: &str = "respond";
 
@@ -53,6 +60,28 @@ pub const MAX_SNAPSHOT_APPROVAL_TARGET_CHARS: usize = 256;
 /// The most recent durable sequence a subscribe request may still ask to
 /// replay from; older cursors get `resync_required` instead of a replay.
 pub const MAX_REPLAY_WINDOW_EVENTS: u64 = 4_096;
+
+// ---------------------------------------------------------------------------
+// B3 read-only routes: task detail / change journal / artifact bytes /
+// context summary. All four are run-scoped reads — they never start a model
+// round, never mutate state and never consult Core's approval gate.
+// ---------------------------------------------------------------------------
+
+/// Upper bound on one `work.changes` listing.
+pub const MAX_CHANGES_LIMIT: usize = 256;
+/// Opaque change-journal transaction id bound (mirrors the workspace
+/// journal's own opaque ids).
+pub const MAX_CHANGE_TX_ID_BYTES: usize = 64;
+/// Char bound on one display field of a change record (path/tool/action/
+/// reason/entry identity/hash). The journal caps bytes; this mirrors the
+/// same intent as characters so an oversized field fails closed.
+pub const MAX_CHANGE_FIELD_CHARS: usize = 512;
+/// Hard ceiling for one `work.artifact` body read.
+pub const MAX_ARTIFACT_READ_BYTES: u32 = 64 * 1024;
+/// Default body read when the caller does not ask for a specific bound.
+pub const DEFAULT_ARTIFACT_READ_BYTES: u32 = 32 * 1024;
+/// Upper bound on one `work.context` listing.
+pub const MAX_CONTEXT_ITEMS: usize = 512;
 
 impl Route {
     pub fn work_submit() -> Self {
@@ -115,6 +144,58 @@ impl Route {
 
     pub fn is_work_subscribe(&self) -> bool {
         self.namespace == WORK_NAMESPACE && self.operation == WORK_SUBSCRIBE
+    }
+
+    /// B3 read-only route: one task's full anchor (plan/acceptance/open
+    /// loops). Run-scoped and read-only.
+    pub fn work_task_detail() -> Self {
+        Self {
+            namespace: WORK_NAMESPACE.to_owned(),
+            operation: WORK_TASK_DETAIL.to_owned(),
+        }
+    }
+
+    pub fn is_work_task_detail(&self) -> bool {
+        self.namespace == WORK_NAMESPACE && self.operation == WORK_TASK_DETAIL
+    }
+
+    /// B3 read-only route: the workspace change journal (review surface).
+    /// Run-scoped and read-only.
+    pub fn work_changes() -> Self {
+        Self {
+            namespace: WORK_NAMESPACE.to_owned(),
+            operation: WORK_CHANGES.to_owned(),
+        }
+    }
+
+    pub fn is_work_changes(&self) -> bool {
+        self.namespace == WORK_NAMESPACE && self.operation == WORK_CHANGES
+    }
+
+    /// B3 read-only route: one run-scoped artifact's bounded body. Run-scoped
+    /// and read-only.
+    pub fn work_artifact() -> Self {
+        Self {
+            namespace: WORK_NAMESPACE.to_owned(),
+            operation: WORK_ARTIFACT.to_owned(),
+        }
+    }
+
+    pub fn is_work_artifact(&self) -> bool {
+        self.namespace == WORK_NAMESPACE && self.operation == WORK_ARTIFACT
+    }
+
+    /// B3 read-only route: the context engine's bounded item summary.
+    /// Run-scoped and read-only.
+    pub fn work_context() -> Self {
+        Self {
+            namespace: WORK_NAMESPACE.to_owned(),
+            operation: WORK_CONTEXT.to_owned(),
+        }
+    }
+
+    pub fn is_work_context(&self) -> bool {
+        self.namespace == WORK_NAMESPACE && self.operation == WORK_CONTEXT
     }
 
     pub fn work_event() -> Self {
@@ -505,6 +586,351 @@ impl WorkEventNotification {
 }
 
 // ---------------------------------------------------------------------------
+// B3 read-only DTOs: task detail (full anchor), change journal listing,
+// bounded artifact bytes and context-item summary.
+//
+// All four are run-scoped reads: they never start a model round, never
+// mutate state and never consult Core's approval gate. The workspace is the
+// trusted authority behind each; bytes travel base64 because artifacts are
+// binary-safe and the wire is JSON.
+// ---------------------------------------------------------------------------
+
+/// One task's full anchor, on demand (the snapshot keeps the bounded list,
+/// this route carries the plan/acceptance/open-loops projection the GUI
+/// actually renders).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WorkTaskDetailRequest {
+    pub task_id: TaskId,
+}
+
+impl WorkTaskDetailRequest {
+    pub fn validate(&self) -> ValidationResult<()> {
+        if self.task_id.0.is_nil() {
+            return Err(ValidationError::new(
+                "work.task_detail.task_id",
+                "must not be a nil UUID",
+            ));
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WorkTaskDetailResponse {
+    pub task_id: TaskId,
+    pub goal: String,
+    pub status: TaskSnapshotStatus,
+    /// This task's own anchor revision; never compared across tasks.
+    pub anchor_revision: u64,
+    /// The task's authoritative anchor projection (plan/acceptance/open
+    /// loops), verbatim from the runtime's own assembler.
+    pub anchor: TaskAnchorView,
+}
+
+impl WorkTaskDetailResponse {
+    pub fn validate(&self) -> ValidationResult<()> {
+        if self.task_id.0.is_nil() {
+            return Err(ValidationError::new(
+                "work.task_detail.task_id",
+                "must not be a nil UUID",
+            ));
+        }
+        validate_text("work.task_detail.goal", &self.goal, MAX_SNAPSHOT_GOAL_CHARS)?;
+        Ok(())
+    }
+}
+
+/// Bounded change-journal listing request. `after_tx` names an exclusive
+/// cursor: records are returned newest-first until the cursor, `limit`, or
+/// the journal head is reached.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WorkChangesRequest {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub limit: Option<usize>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub after_tx: Option<String>,
+}
+
+impl WorkChangesRequest {
+    pub fn validate(&self) -> ValidationResult<()> {
+        if let Some(limit) = self.limit {
+            if limit == 0 || limit > MAX_CHANGES_LIMIT {
+                return Err(ValidationError::new(
+                    "work.changes.limit",
+                    format!("must be in 1..={MAX_CHANGES_LIMIT}"),
+                ));
+            }
+        }
+        if let Some(after_tx) = &self.after_tx {
+            validate_opaque("work.changes.after_tx", after_tx, MAX_CHANGE_TX_ID_BYTES)?;
+        }
+        Ok(())
+    }
+}
+
+/// One mirrored workspace journal record. `old_content` never travels to the
+/// wire: the journal's old-content capture is an internal review aid, kept
+/// bounded inside the workspace and not duplicated as a protocol field.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum ChangeSummary {
+    MutationPrepared {
+        tx_id: String,
+        timestamp_ms: u64,
+        tool: String,
+        path: String,
+        action: String,
+        bytes_before: u64,
+        bytes_after: u64,
+        before_hash: String,
+        after_hash: String,
+    },
+    MutationCommitted {
+        tx_id: String,
+        timestamp_ms: u64,
+    },
+    MutationRolledBack {
+        tx_id: String,
+        timestamp_ms: u64,
+        reason: String,
+    },
+    DirectoryPrepared {
+        tx_id: String,
+        timestamp_ms: u64,
+        tool: String,
+        path: String,
+    },
+    DirectoryCommitted {
+        tx_id: String,
+        timestamp_ms: u64,
+        entry_identity: String,
+    },
+    DirectoryRolledBack {
+        tx_id: String,
+        timestamp_ms: u64,
+        reason: String,
+    },
+}
+
+impl ChangeSummary {
+    /// Validate one change's display fields against the shared bounded
+    /// budget. Byte counts and timestamps are facts, not text.
+    pub fn validate(&self) -> ValidationResult<()> {
+        let (tx_id, texts): (&str, Vec<(&'static str, &str)>) = match self {
+            Self::MutationPrepared {
+                tx_id,
+                tool,
+                path,
+                action,
+                before_hash,
+                after_hash,
+                ..
+            } => (
+                tx_id,
+                vec![
+                    ("work.changes.tool", tool),
+                    ("work.changes.path", path),
+                    ("work.changes.action", action),
+                    ("work.changes.before_hash", before_hash),
+                    ("work.changes.after_hash", after_hash),
+                ],
+            ),
+            Self::MutationCommitted { tx_id, .. } => (tx_id, Vec::new()),
+            Self::MutationRolledBack { tx_id, reason, .. } => {
+                (tx_id, vec![("work.changes.reason", reason)])
+            }
+            Self::DirectoryPrepared {
+                tx_id, tool, path, ..
+            } => (
+                tx_id,
+                vec![("work.changes.tool", tool), ("work.changes.path", path)],
+            ),
+            Self::DirectoryCommitted {
+                tx_id,
+                entry_identity,
+                ..
+            } => (tx_id, vec![("work.changes.entry_identity", entry_identity)]),
+            Self::DirectoryRolledBack { tx_id, reason, .. } => {
+                (tx_id, vec![("work.changes.reason", reason)])
+            }
+        };
+        validate_opaque("work.changes.tx_id", tx_id, MAX_CHANGE_TX_ID_BYTES)?;
+        for (field, text) in texts {
+            validate_text(field, text, MAX_CHANGE_FIELD_CHARS)?;
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WorkChangesResponse {
+    #[serde(default)]
+    pub changes: Vec<ChangeSummary>,
+}
+
+impl WorkChangesResponse {
+    pub fn validate(&self) -> ValidationResult<()> {
+        if self.changes.len() > MAX_CHANGES_LIMIT {
+            return Err(ValidationError::new(
+                "work.changes.changes",
+                format!(
+                    "contains {} entries, above the {MAX_CHANGES_LIMIT} entry bound",
+                    self.changes.len()
+                ),
+            ));
+        }
+        for change in &self.changes {
+            change.validate()?;
+        }
+        Ok(())
+    }
+}
+
+/// Read one run-scoped artifact reference with an explicit byte budget.
+/// `reference` is a sealed `artifact://` locator; the workspace verifies the
+/// run binding and (when the reference carries one) the content digest before
+/// the router reads anything.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WorkArtifactRequest {
+    pub reference: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_bytes: Option<u32>,
+}
+
+impl WorkArtifactRequest {
+    pub fn validate(&self) -> ValidationResult<()> {
+        validate_opaque(
+            "work.artifact.reference",
+            &self.reference,
+            agent_contracts::MAX_ARTIFACT_REFERENCE_BYTES,
+        )?;
+        if let Some(max) = self.max_bytes {
+            if max == 0 || max > MAX_ARTIFACT_READ_BYTES {
+                return Err(ValidationError::new(
+                    "work.artifact.max_bytes",
+                    format!("must be in 1..={MAX_ARTIFACT_READ_BYTES}"),
+                ));
+            }
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WorkArtifactResponse {
+    /// The canonical reference spelling (verify-sealed when the locator
+    /// carries a digest).
+    pub reference: String,
+    /// The artifact's on-disk byte length, before any route-side bound.
+    pub size_bytes: u64,
+    /// `true` only when the returned body is a prefix, cut at the requested
+    /// budget; a body that fits fully is never marked truncated.
+    pub truncated: bool,
+    /// The (possibly truncated) body, base64-encoded.
+    pub content_base64: String,
+}
+
+impl WorkArtifactResponse {
+    pub fn validate(&self) -> ValidationResult<()> {
+        validate_opaque(
+            "work.artifact.reference",
+            &self.reference,
+            agent_contracts::MAX_ARTIFACT_REFERENCE_BYTES,
+        )?;
+        let decoded_len = match base64_len(&self.content_base64) {
+            Some(len) => len,
+            None => {
+                return Err(ValidationError::new(
+                    "work.artifact.content_base64",
+                    "is not a valid base64 body",
+                ));
+            }
+        };
+        let truncated = self.truncated;
+        let consistent = if truncated {
+            decoded_len < self.size_bytes as usize
+        } else {
+            (decoded_len as u64) == self.size_bytes
+        };
+        if !consistent {
+            return Err(ValidationError::new(
+                "work.artifact.size_bytes",
+                format!(
+                    "size {size} and truncated {truncated} disagree with {decoded} decoded bytes",
+                    size = self.size_bytes,
+                    decoded = decoded_len
+                ),
+            ));
+        }
+        Ok(())
+    }
+}
+
+/// Bounded context-engine summary read (the GUI's read-only Context panel).
+/// Never starts a model round and never mutates the engine.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WorkContextRequest {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub limit: Option<u32>,
+}
+
+impl WorkContextRequest {
+    pub fn validate(&self) -> ValidationResult<()> {
+        if let Some(limit) = self.limit {
+            if limit == 0 || limit as usize > MAX_CONTEXT_ITEMS {
+                return Err(ValidationError::new(
+                    "work.context.limit",
+                    format!("must be in 1..={MAX_CONTEXT_ITEMS}"),
+                ));
+            }
+        }
+        Ok(())
+    }
+}
+
+// `ContextItemSummary` deliberately carries no `PartialEq` (it mirrors the
+// engine's own computation-heavy summary); the response itself only needs
+// the wire derives.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WorkContextResponse {
+    #[serde(default)]
+    pub items: Vec<ContextItemSummary>,
+}
+
+impl WorkContextResponse {
+    pub fn validate(&self) -> ValidationResult<()> {
+        if self.items.len() > MAX_CONTEXT_ITEMS {
+            return Err(ValidationError::new(
+                "work.context.items",
+                format!(
+                    "contains {} entries, above the {MAX_CONTEXT_ITEMS} entry bound",
+                    self.items.len()
+                ),
+            ));
+        }
+        Ok(())
+    }
+}
+
+/// Decoded length of standard (non-URL-safe) base64 text, `None` when the
+/// text is not valid padded base64.
+fn base64_len(text: &str) -> Option<usize> {
+    use base64::Engine;
+    match base64::engine::general_purpose::STANDARD.decode(text) {
+        Ok(bytes) => Some(bytes.len()),
+        Err(_) => None,
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Shared default-endpoint derivation (N4).
 //
 // The host binds its local endpoint and local clients derive the same
@@ -735,11 +1161,84 @@ pub fn validate_approval_respond_response(
     validate_run_scoped_response(profile, request, response, |payload| payload.validate())
 }
 
+pub fn validate_work_task_detail_request(
+    profile: &NegotiatedContractProfile,
+    request: &PlatformEnvelope<WorkTaskDetailRequest>,
+) -> ValidationResult<()> {
+    validate_run_scoped_request(profile, request, Route::is_work_task_detail, |payload| {
+        payload.validate()
+    })
+}
+
+pub fn validate_work_task_detail_response(
+    profile: &NegotiatedContractProfile,
+    request: &PlatformEnvelope<WorkTaskDetailRequest>,
+    response: &PlatformEnvelope<PlatformResponse<WorkTaskDetailResponse>>,
+) -> ValidationResult<()> {
+    validate_work_task_detail_request(profile, request)?;
+    validate_run_scoped_response(profile, request, response, |payload| payload.validate())
+}
+
+pub fn validate_work_changes_request(
+    profile: &NegotiatedContractProfile,
+    request: &PlatformEnvelope<WorkChangesRequest>,
+) -> ValidationResult<()> {
+    validate_run_scoped_request(profile, request, Route::is_work_changes, |payload| {
+        payload.validate()
+    })
+}
+
+pub fn validate_work_changes_response(
+    profile: &NegotiatedContractProfile,
+    request: &PlatformEnvelope<WorkChangesRequest>,
+    response: &PlatformEnvelope<PlatformResponse<WorkChangesResponse>>,
+) -> ValidationResult<()> {
+    validate_work_changes_request(profile, request)?;
+    validate_run_scoped_response(profile, request, response, |payload| payload.validate())
+}
+
+pub fn validate_work_artifact_request(
+    profile: &NegotiatedContractProfile,
+    request: &PlatformEnvelope<WorkArtifactRequest>,
+) -> ValidationResult<()> {
+    validate_run_scoped_request(profile, request, Route::is_work_artifact, |payload| {
+        payload.validate()
+    })
+}
+
+pub fn validate_work_artifact_response(
+    profile: &NegotiatedContractProfile,
+    request: &PlatformEnvelope<WorkArtifactRequest>,
+    response: &PlatformEnvelope<PlatformResponse<WorkArtifactResponse>>,
+) -> ValidationResult<()> {
+    validate_work_artifact_request(profile, request)?;
+    validate_run_scoped_response(profile, request, response, |payload| payload.validate())
+}
+
+pub fn validate_work_context_request(
+    profile: &NegotiatedContractProfile,
+    request: &PlatformEnvelope<WorkContextRequest>,
+) -> ValidationResult<()> {
+    validate_run_scoped_request(profile, request, Route::is_work_context, |payload| {
+        payload.validate()
+    })
+}
+
+pub fn validate_work_context_response(
+    profile: &NegotiatedContractProfile,
+    request: &PlatformEnvelope<WorkContextRequest>,
+    response: &PlatformEnvelope<PlatformResponse<WorkContextResponse>>,
+) -> ValidationResult<()> {
+    validate_work_context_request(profile, request)?;
+    validate_run_scoped_response(profile, request, response, |payload| payload.validate())
+}
+
 #[cfg(test)]
 mod tests {
     use std::str::FromStr;
 
     use agent_contracts::{RunId, TurnId};
+    use base64::Engine;
     use serde_json::json;
 
     use super::*;
@@ -1110,5 +1609,257 @@ mod tests {
             )
             .is_err()
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // B3 read-only routes.
+    // -----------------------------------------------------------------------
+
+    fn anchor() -> TaskAnchorView {
+        TaskAnchorView {
+            revision: 1,
+            original_goal: "migrate".into(),
+            current_interpretation: "interpreted".into(),
+            constraints: vec!["bounded".into()],
+            acceptance_criteria: vec!["green".into()],
+            plan_progress: vec!["step 1".into()],
+            open_loops: vec!["verify".into()],
+            next_action: "continue".into(),
+        }
+    }
+
+    #[test]
+    fn task_detail_golden_shape_round_trips() {
+        let request = run_scoped_request(
+            Route::work_task_detail(),
+            WorkTaskDetailRequest { task_id: task_id() },
+        );
+        validate_work_task_detail_request(&profile(), &request).unwrap();
+        let detail = response(
+            &request,
+            WorkTaskDetailResponse {
+                task_id: task_id(),
+                goal: "migrate".into(),
+                status: TaskSnapshotStatus::Active,
+                anchor_revision: 1,
+                anchor: anchor(),
+            },
+        );
+        validate_work_task_detail_response(&profile(), &request, &detail).unwrap();
+
+        let mut nil_task = request.clone();
+        nil_task.payload.task_id =
+            TaskId::from_str("00000000-0000-0000-0000-000000000000").unwrap();
+        assert!(nil_task.payload.validate().is_err());
+
+        // A task-detail response whose anchor is absent fails validation too:
+        // the anchor is the payload of this route, never optional.
+        let mut empty_goal = request;
+        empty_goal.payload.task_id = task_id();
+        let mut bad = detail.clone();
+        if let PlatformResponse::Success { value } = &mut bad.payload {
+            value.goal.clear();
+        }
+        assert!(validate_work_task_detail_response(&profile(), &empty_goal, &bad).is_err());
+    }
+
+    #[test]
+    fn changes_listing_round_trips_and_stays_bounded() {
+        let request = run_scoped_request(
+            Route::work_changes(),
+            WorkChangesRequest {
+                limit: Some(8),
+                after_tx: Some("tx-9".into()),
+            },
+        );
+        validate_work_changes_request(&profile(), &request).unwrap();
+        let listed = response(
+            &request,
+            WorkChangesResponse {
+                changes: vec![
+                    ChangeSummary::MutationPrepared {
+                        tx_id: "tx-3".into(),
+                        timestamp_ms: 30,
+                        tool: "fs.write".into(),
+                        path: "docs/plan.md".into(),
+                        action: "overwrite".into(),
+                        bytes_before: 10,
+                        bytes_after: 20,
+                        before_hash: "a1".into(),
+                        after_hash: "b2".into(),
+                    },
+                    ChangeSummary::MutationCommitted {
+                        tx_id: "tx-3".into(),
+                        timestamp_ms: 31,
+                    },
+                ],
+            },
+        );
+        validate_work_changes_response(&profile(), &request, &listed).unwrap();
+
+        let encoded = serde_json::to_string(&listed.payload).unwrap();
+        assert!(encoded.contains("\"kind\":\"mutation_prepared\""));
+        assert!(
+            !encoded.contains("old_content"),
+            "the journal's internal old-content capture must never reach the wire"
+        );
+
+        let mut over_limit = listed.clone();
+        if let PlatformResponse::Success { value } = &mut over_limit.payload {
+            value.changes = vec![
+                ChangeSummary::MutationCommitted {
+                    tx_id: "t".into(),
+                    timestamp_ms: 1,
+                };
+                MAX_CHANGES_LIMIT + 1
+            ];
+        }
+        assert!(validate_work_changes_response(&profile(), &request, &over_limit).is_err());
+
+        // Unknown fields on a change variant never leak to serialization (the
+        // wire mirror has no old_content member); serde itself is lenient
+        // when decoding internally-tagged variants, so the guard is: reading
+        // an old_content-bearing line must round-trip it AWAY.
+        let with_old_content: ChangeSummary = serde_json::from_value(json!({
+            "kind": "mutation_prepared",
+            "tx_id": "t",
+            "timestamp_ms": 1,
+            "tool": "fs.write",
+            "path": "a.txt",
+            "action": "overwrite",
+            "bytes_before": 0,
+            "bytes_after": 1,
+            "before_hash": "h",
+            "after_hash": "h2",
+            "old_content": "stale"
+        }))
+        .unwrap();
+        assert!(
+            !serde_json::to_string(&with_old_content)
+                .unwrap()
+                .contains("old_content"),
+            "the journal's internal old-content capture must never reach the wire"
+        );
+    }
+
+    #[test]
+    fn artifacts_validate_reference_and_truncation_truth() {
+        let request = run_scoped_request(
+            Route::work_artifact(),
+            WorkArtifactRequest {
+                reference: "artifact://.focus-agent/artifacts/r/proof/aa".into(),
+                max_bytes: Some(32),
+            },
+        );
+        validate_work_artifact_request(&profile(), &request).unwrap();
+
+        let mut big_request = request.clone();
+        big_request.payload.max_bytes = Some(MAX_ARTIFACT_READ_BYTES + 1);
+        assert!(big_request.payload.validate().is_err());
+
+        let mut long_ref = request.clone();
+        long_ref.payload.reference = "x".repeat(agent_contracts::MAX_ARTIFACT_REFERENCE_BYTES + 1);
+        assert!(long_ref.payload.validate().is_err());
+
+        // A truncated body must be strictly shorter than size_bytes; a full
+        // body must equal it. Both are validated, never assumed.
+        let full = response(
+            &request,
+            WorkArtifactResponse {
+                reference: "artifact://r".into(),
+                size_bytes: 5,
+                truncated: false,
+                content_base64: base64::engine::general_purpose::STANDARD.encode(b"hello"),
+            },
+        );
+        validate_work_artifact_response(&profile(), &request, &full).unwrap();
+
+        let truncated = response(
+            &request,
+            WorkArtifactResponse {
+                reference: "artifact://r".into(),
+                size_bytes: 100,
+                truncated: true,
+                content_base64: base64::engine::general_purpose::STANDARD.encode(b"hello"),
+            },
+        );
+        validate_work_artifact_response(&profile(), &request, &truncated).unwrap();
+
+        let lies = response(
+            &request,
+            WorkArtifactResponse {
+                reference: "artifact://r".into(),
+                size_bytes: 32,
+                truncated: false,
+                content_base64: base64::engine::general_purpose::STANDARD.encode(b"hello"),
+            },
+        );
+        assert!(validate_work_artifact_response(&profile(), &request, &lies).is_err());
+    }
+
+    #[test]
+    fn context_listing_round_trips_a_mirrored_item_summary() {
+        let request =
+            run_scoped_request(Route::work_context(), WorkContextRequest { limit: Some(4) });
+        validate_work_context_request(&profile(), &request).unwrap();
+        let item: ContextItemSummary = serde_json::from_value(json!({
+            "id": "9f823fc0-8ed4-4d18-a02d-2d75691f7f01",
+            "kind": "Goal",
+            "scope": "Task",
+            "attention": "Active",
+            "semantic": "Live",
+            "importance": 0.5,
+            "relevance": 0.3,
+            "created_tick": 1,
+            "created_turn": 1,
+            "last_access_turn": 1,
+            "access_count": 1,
+            "dependencies": [],
+            "keep_alive": false,
+        }))
+        .unwrap();
+        let listed = response(
+            &request,
+            WorkContextResponse {
+                items: vec![item.clone()],
+            },
+        );
+        validate_work_context_response(&profile(), &request, &listed).unwrap();
+
+        let mut bullet = request.clone();
+        bullet.payload.limit = Some((MAX_CONTEXT_ITEMS + 1) as u32);
+        assert!(bullet.payload.validate().is_err());
+        bullet.payload.limit = Some(0);
+        assert!(bullet.payload.validate().is_err());
+
+        let mut over = listed;
+        if let PlatformResponse::Success { value } = &mut over.payload {
+            value.items = vec![item; MAX_CONTEXT_ITEMS + 1];
+        }
+        assert!(validate_work_context_response(&profile(), &request, &over).is_err());
+    }
+
+    #[test]
+    fn read_only_routes_reject_work_identity_like_every_run_scoped_route() {
+        let mut request = run_scoped_request(
+            Route::work_task_detail(),
+            WorkTaskDetailRequest { task_id: task_id() },
+        );
+        request.work = Some(WorkIdentity {
+            run_id: RunId::from_str(RUN).unwrap(),
+            task_id: None,
+            turn_id: None,
+            scope_id: None,
+            operation_id: agent_contracts::OperationId::new(),
+            generation: 1,
+            attempt: crate::Attempt::new(1).unwrap(),
+            call_id: None,
+            effect_id: None,
+            argument_digest: agent_contracts::ArgumentDigest::from_bytes([0x22; 32]),
+            deadline_remaining_ms: crate::DeadlineRemainingMs::new(1_000).unwrap(),
+            authority_ref: None,
+        });
+        let error = validate_work_task_detail_request(&profile(), &request).unwrap_err();
+        assert_eq!(error.field(), "envelope.work");
     }
 }

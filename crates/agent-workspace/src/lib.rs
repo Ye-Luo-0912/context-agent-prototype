@@ -1,4 +1,4 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::io;
 use std::path::{Component, Path, PathBuf};
 use std::pin::Pin;
@@ -11,7 +11,7 @@ use agent_contracts::{
     message_looks_like_not_found,
 };
 use async_trait::async_trait;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use tokio::fs;
 use tokio::io::AsyncWrite;
@@ -44,7 +44,7 @@ pub use storage_faults::StorageFaultPlan;
 /// the stable identity of one committed final component. Kept bounded: old
 /// file content is captured only for small files so the journal stays
 /// reviewable without duplicating the whole repository.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum ChangeRecord {
     MutationPrepared {
@@ -85,6 +85,21 @@ pub enum ChangeRecord {
         timestamp_ms: u64,
         reason: String,
     },
+}
+
+impl ChangeRecord {
+    /// The journal transaction id shared by every variant — the stable
+    /// identity a `work.changes` cursor walks on.
+    pub fn tx_id(&self) -> &str {
+        match self {
+            Self::MutationPrepared { tx_id, .. }
+            | Self::MutationCommitted { tx_id, .. }
+            | Self::MutationRolledBack { tx_id, .. }
+            | Self::DirectoryPrepared { tx_id, .. }
+            | Self::DirectoryCommitted { tx_id, .. }
+            | Self::DirectoryRolledBack { tx_id, .. } => tx_id,
+        }
+    }
 }
 
 /// Old-content capture limit for `ChangeRecord::MutationPrepared` (bounded
@@ -1367,6 +1382,71 @@ impl Workspace {
         file.flush()
             .map_err(|e| AgentError::Storage(format!("flush change journal: {e}")))?;
         Ok(())
+    }
+
+    /// Read the change journal (B3): the newest records first, bounded by
+    /// `limit` and (when supplied) by the exclusive `after_tx` cursor — only
+    /// records *newer* than the cursor (written later in the append-only
+    /// journal) are returned, the cursor's own record never is, and records
+    /// older than it are skipped. A caller that keeps the oldest returned
+    /// `tx_id` and asks again with a LARGER limit walks strictly older
+    /// records deterministically.
+    ///
+    /// Reading is a single sequential pass over the journal with constant
+    /// memory: each line is parsed as one [`ChangeRecord`] and only the most
+    /// recent `limit` lines are retained. This is safe because
+    /// `record_change` writes one JSON line per record and the serializer
+    /// escapes embedded newlines, so no bare `\n` byte ever appears inside a
+    /// record. A line that fails to parse is a hard Storage error (fail
+    /// closed): the journal is owned by this process's own writer. Returns
+    /// records newest first, never exceeding `limit`.
+    pub async fn read_changes(
+        &self,
+        limit: usize,
+        after_tx: Option<&str>,
+    ) -> AgentResult<Vec<ChangeRecord>> {
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
+        // Same lock as record_change: a read never interleaves a half-appended
+        // record, and the whole read is one indivisible poll (no suspension
+        // point between lock and close).
+        let _journal_guard = self
+            .change_journal_lock
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let journal = self.state_dir.join("changes.jsonl");
+        let file = match std::fs::File::open(&journal) {
+            Ok(file) => file,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
+            Err(error) => return Err(AgentError::Storage(format!("open change journal: {error}"))),
+        };
+        // Newest-first ring: parsed newest at index 0, capped at `limit`.
+        // Until the cursor is reached (when one is given) everything is
+        // skipped; the cursor's own record is skipped too, and only records
+        // written after it are collected.
+        let mut newest: VecDeque<ChangeRecord> = VecDeque::with_capacity(limit);
+        let mut after_cursor = after_tx.is_none();
+        use std::io::BufRead;
+        for line in std::io::BufReader::new(file).lines() {
+            let line =
+                line.map_err(|e| AgentError::Storage(format!("read change journal: {e}")))?;
+            let record: ChangeRecord = serde_json::from_str(&line).map_err(|e| {
+                AgentError::Storage(format!("change journal line is not valid JSON: {e}"))
+            })?;
+            if !after_cursor {
+                if record.tx_id() == after_tx.expect("cursor checked above") {
+                    after_cursor = true;
+                }
+                continue;
+            }
+            newest.push_front(record);
+            if newest.len() > limit {
+                // Ring full: this record is older than everything retained.
+                newest.pop_back();
+            }
+        }
+        Ok(newest.into_iter().collect())
     }
 }
 
@@ -4283,5 +4363,119 @@ mod tests {
             .unwrap();
         let bytes = tokio::fs::read(file.display()).await.unwrap();
         assert_eq!(bytes, b"partial");
+    }
+
+    // -----------------------------------------------------------------------
+    // B3: change-journal reads.
+    // -----------------------------------------------------------------------
+
+    /// Seed `n` journal records with deterministic tx ids ("tx-0", ...).
+    async fn seed_changes(workspace: &Workspace, n: usize) {
+        for i in 0..n {
+            workspace
+                .record_change(ChangeRecord::MutationCommitted {
+                    tx_id: format!("tx-{i}"),
+                    timestamp_ms: i as u64,
+                })
+                .await
+                .unwrap();
+        }
+    }
+
+    /// A record whose display text contains an embedded newline — the
+    /// serializer escapes it, so a journal line never contains a raw LF byte.
+    fn record_with_newline(tx: &str) -> ChangeRecord {
+        ChangeRecord::MutationRolledBack {
+            tx_id: tx.into(),
+            timestamp_ms: 1,
+            reason: "line one\nline two\tand a tab".into(),
+        }
+    }
+
+    #[tokio::test]
+    async fn read_changes_returns_the_newest_bound_without_a_cursor() {
+        let dir = tempfile::tempdir().unwrap();
+        let workspace = Workspace::open(dir.path()).await.unwrap();
+        seed_changes(&workspace, 5).await;
+
+        let changes = workspace.read_changes(3, None).await.unwrap();
+        let ids: Vec<&str> = changes.iter().map(ChangeRecord::tx_id).collect();
+        assert_eq!(ids, vec!["tx-4", "tx-3", "tx-2"], "newest first, bounded");
+    }
+
+    #[tokio::test]
+    async fn read_changes_with_a_cursor_returns_only_newer_records() {
+        let dir = tempfile::tempdir().unwrap();
+        let workspace = Workspace::open(dir.path()).await.unwrap();
+        seed_changes(&workspace, 5).await;
+
+        let changes = workspace.read_changes(10, Some("tx-2")).await.unwrap();
+        let ids: Vec<&str> = changes.iter().map(ChangeRecord::tx_id).collect();
+        // Only records written after tx-2; the cursor itself is excluded.
+        assert_eq!(ids, vec!["tx-4", "tx-3"]);
+
+        // An unknown cursor fails closed to an empty page, never a guess.
+        let unknown = workspace.read_changes(10, Some("tx-99")).await.unwrap();
+        assert!(unknown.is_empty());
+
+        // A sane reading rule: no cursor + a larger limit walks older records.
+        let all = workspace.read_changes(10, None).await.unwrap();
+        assert_eq!(all.len(), 5);
+    }
+
+    #[tokio::test]
+    async fn read_changes_round_trips_records_with_escaped_newlines() {
+        let dir = tempfile::tempdir().unwrap();
+        let workspace = Workspace::open(dir.path()).await.unwrap();
+        workspace
+            .record_change(record_with_newline("tx-a"))
+            .await
+            .unwrap();
+        workspace
+            .record_change(ChangeRecord::MutationCommitted {
+                tx_id: "tx-b".into(),
+                timestamp_ms: 2,
+            })
+            .await
+            .unwrap();
+
+        let changes = workspace.read_changes(10, None).await.unwrap();
+        assert_eq!(changes.len(), 2);
+        let a = &changes[1]; // journal order preserved: tx-a is older
+        assert_eq!(a.tx_id(), "tx-a");
+        let ChangeRecord::MutationRolledBack { reason, .. } = a else {
+            panic!("expected the rolled-back record")
+        };
+        assert!(reason.contains('\n') && reason.contains('\t'));
+    }
+
+    #[tokio::test]
+    async fn read_changes_fails_closed_on_a_corrupt_line() {
+        let dir = tempfile::tempdir().unwrap();
+        let workspace = Workspace::open(dir.path()).await.unwrap();
+        seed_changes(&workspace, 2).await;
+        // Append a torn line to the healthy journal: a parse failure must be
+        // a hard Storage error, never a silently skipped record.
+        let mut journal = tokio::fs::OpenOptions::new()
+            .append(true)
+            .open(workspace.state_dir().join("changes.jsonl"))
+            .await
+            .unwrap();
+        use tokio::io::AsyncWriteExt;
+        journal.write_all(b"{ not json\n").await.unwrap();
+        journal.flush().await.unwrap();
+        let error = workspace.read_changes(10, None).await.unwrap_err();
+        assert!(
+            error.to_string().contains("not valid JSON"),
+            "a torn journal must fail closed, got: {error}"
+        );
+    }
+
+    #[tokio::test]
+    async fn read_changes_on_a_missing_journal_is_empty_not_an_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let workspace = Workspace::open(dir.path()).await.unwrap();
+        let changes = workspace.read_changes(10, None).await.unwrap();
+        assert!(changes.is_empty());
     }
 }

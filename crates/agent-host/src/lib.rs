@@ -37,8 +37,9 @@ use agent_platform_protocol::{
     MAX_JSON_CONTROL_OBJECT_KEYS, MAX_JSON_CONTROL_STRING_BYTES,
     MAX_JSON_CONTROL_TOTAL_STRING_BYTES, MessageId, NegotiatedContractProfile, PlatformEnvelope,
     PlatformError, PlatformErrorClass, PlatformResponse, ProtocolIdentity, RetryDisposition, Route,
-    SchemaDigest, WorkCancelRequest, WorkContinueRequest, WorkEventNotification,
-    WorkSnapshotRequest, WorkSubmitRequest, WorkSubscribeRequest,
+    SchemaDigest, WorkArtifactRequest, WorkCancelRequest, WorkChangesRequest, WorkContextRequest,
+    WorkContinueRequest, WorkEventNotification, WorkSnapshotRequest, WorkSubmitRequest,
+    WorkSubscribeRequest, WorkTaskDetailRequest,
 };
 use agent_runtime::{
     RuntimeHandle, WorkControlGrant, WorkControlRouter, WorkControlSessionRegistry,
@@ -400,6 +401,9 @@ pub struct HostPlane {
     pub broker: Arc<ApprovalBroker>,
     pub gate: Arc<InteractiveApprovalGate>,
     pub registry: Arc<WorkControlSessionRegistry>,
+    /// The run's workspace: B3 read-only routes (change journal, artifact
+    /// bytes) read through it. Shared and read-only at the router boundary.
+    pub workspace: Arc<agent_workspace::Workspace>,
 }
 
 pub struct HostServer {
@@ -728,6 +732,7 @@ fn open_connection_plane(
         Arc::clone(&base.broker),
         Arc::clone(&base.gate),
         Arc::new(authorizer),
+        Arc::clone(&base.workspace),
     )
     .map_err(|error| anyhow::anyhow!(error.to_string()))?;
     Ok((router, guard))
@@ -1116,6 +1121,18 @@ fn dispatch<W: Write + Send + 'static>(
         }
         ("work", "snapshot") => {
             run_route!(WorkSnapshotRequest, snapshot)
+        }
+        ("work", "task_detail") => {
+            run_route!(WorkTaskDetailRequest, task_detail)
+        }
+        ("work", "changes") => {
+            run_route!(WorkChangesRequest, changes)
+        }
+        ("work", "artifact") => {
+            run_route!(WorkArtifactRequest, artifact)
+        }
+        ("work", "context") => {
+            run_route!(WorkContextRequest, context)
         }
         ("work", "subscribe") => {
             // The subscribe handshake returns its receipt and, on success,
