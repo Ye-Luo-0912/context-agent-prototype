@@ -12,11 +12,11 @@
 //! UDS backend ([`super`]).
 
 use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, OnceLock};
 
 use windows_sys::Win32::Foundation::{
-    CloseHandle, ERROR_PIPE_CONNECTED, HANDLE, INVALID_HANDLE_VALUE, LocalFree,
+    ERROR_PIPE_CONNECTED, HANDLE, INVALID_HANDLE_VALUE, LocalFree,
 };
 use windows_sys::Win32::Security::Authorization::{
     ConvertSidToStringSidW, ConvertStringSecurityDescriptorToSecurityDescriptorW,
@@ -25,6 +25,7 @@ use windows_sys::Win32::Security::{
     EqualSid, GetTokenInformation, PSID, SECURITY_ATTRIBUTES, TOKEN_QUERY, TOKEN_USER, TokenUser,
 };
 use windows_sys::Win32::Storage::FileSystem::{FILE_FLAG_FIRST_PIPE_INSTANCE, PIPE_ACCESS_DUPLEX};
+use windows_sys::Win32::System::IO::CancelIoEx;
 use windows_sys::Win32::System::Pipes::{
     ConnectNamedPipe, CreateNamedPipeW, DisconnectNamedPipe, GetNamedPipeClientProcessId,
     PIPE_READMODE_BYTE, PIPE_REJECT_REMOTE_CLIENTS, PIPE_TYPE_BYTE, PIPE_UNLIMITED_INSTANCES,
@@ -34,7 +35,10 @@ use windows_sys::Win32::System::Threading::{
     GetCurrentProcess, OpenProcess, OpenProcessToken, PROCESS_QUERY_LIMITED_INFORMATION,
 };
 
-use super::{HostPlane, MAX_CONNECTIONS, build_connection_plane, process_connection};
+use super::{
+    HostPlane, LiveStreams, MAX_CONNECTIONS, SHUTDOWN_GRACE, open_connection_plane,
+    process_connection, session_unavailable_frame, write_frame,
+};
 
 fn wide(s: &str) -> Vec<u16> {
     s.encode_utf16().chain(std::iter::once(0)).collect()
@@ -268,7 +272,7 @@ pub(super) fn serve(
     let wide_name = wide(&full_name);
     eprintln!("host: serving named pipe {full_name}");
 
-    let live = Arc::new(AtomicUsize::new(0));
+    let live: Arc<LiveStreams<std::fs::File>> = Arc::new(LiveStreams::new());
     let mut first_instance = true;
     loop {
         let instance = create_pipe_instance(&wide_name, &security, first_instance)?;
@@ -278,6 +282,7 @@ pub(super) fn serve(
         if connected == 0 {
             let error = std::io::Error::last_os_error();
             if error.raw_os_error() != Some(ERROR_PIPE_CONNECTED as i32) {
+                // `instance` (OwnedHandle) closes itself on the way out.
                 anyhow::bail!("ConnectNamedPipe failed: {error}");
             }
         }
@@ -285,35 +290,56 @@ pub(super) fn serve(
             // The stop poke woke the parked instance; stop cleanly instead
             // of serving the throwaway wake connection.
             drop(instance);
-            return Ok(());
+            break;
         }
         if !verify_pipe_peer(raw) {
             eprintln!("host: rejected unverifiable pipe peer");
-            unsafe {
-                DisconnectNamedPipe(raw);
-                CloseHandle(raw);
-            }
+            // Disconnect is a borrowed use of the handle; the close itself
+            // happens exactly once, when the OwnedHandle drops. There is no
+            // raw CloseHandle anywhere on this path.
+            unsafe { DisconnectNamedPipe(raw) };
+            drop(instance);
             continue;
         }
-        if live.load(Ordering::SeqCst) >= MAX_CONNECTIONS {
+        if live.len() >= MAX_CONNECTIONS {
             eprintln!("host: connection cap reached; refusing");
-            unsafe {
-                DisconnectNamedPipe(raw);
-                CloseHandle(raw);
-            }
+            unsafe { DisconnectNamedPipe(raw) };
+            drop(instance);
             continue;
         }
-        live.fetch_add(1, Ordering::SeqCst);
         // Hand the pipe handle to std's Read+Write world for shared framing.
         let stream = std::fs::File::from(instance);
-        let plane = build_connection_plane(&plane, read_only);
+        let (router, guard) = match open_connection_plane(&plane, read_only) {
+            Ok(connection) => connection,
+            Err(error) => {
+                // Controlled refusal at the session cap: one structured
+                // error frame, then close. The accept loop lives on.
+                eprintln!("host: refusing connection; session grant unavailable: {error}");
+                let mut writer = &stream;
+                let _ = write_frame(&mut writer, &session_unavailable_frame(&plane.profile));
+                // Close (not DisconnectNamedPipe) so the client can read
+                // the refusal bytes before seeing EOF.
+                drop(stream);
+                continue;
+            }
+        };
+        let shared = Arc::new(stream);
+        let id = live.insert(Arc::clone(&shared));
+        let live_in_worker = Arc::clone(&live);
         let runtime = runtime.clone();
-        let live = Arc::clone(&live);
         std::thread::spawn(move || {
-            let mut stream = stream;
-            let _ = process_connection(&mut stream, &plane, &runtime);
-            drop(plane);
-            live.fetch_sub(1, Ordering::SeqCst);
+            let mut stream: &std::fs::File = shared.as_ref();
+            let _ = process_connection(&mut stream, &router, &runtime);
+            drop(guard);
+            live_in_worker.remove(id);
         });
     }
+    // Bounded wind-down: settle what is in flight within the grace, then
+    // interrupt the still-blocked synchronous reads/writes. CancelIoEx
+    // cancels pending I/O on the handle regardless of the issuing thread,
+    // which is the bounded interrupt for a synchronous Connect/Read here.
+    live.drain(SHUTDOWN_GRACE, |stream| unsafe {
+        CancelIoEx(stream.as_raw_handle() as HANDLE, std::ptr::null());
+    });
+    Ok(())
 }

@@ -20,13 +20,13 @@
 //! * a malformed frame is a contract violation: the connection closes,
 //!   it is never guessed through.
 
+use std::collections::HashMap;
 use std::io::{Read, Write};
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::sync::atomic::AtomicBool;
-#[cfg(unix)]
-use std::sync::atomic::{AtomicUsize, Ordering};
-use std::time::Duration;
+use std::sync::Mutex;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::time::{Duration, Instant};
 
 use agent_core::{ApprovalBroker, InteractiveApprovalGate};
 use agent_platform_protocol::{
@@ -34,8 +34,8 @@ use agent_platform_protocol::{
     MAX_JSON_CONTROL_ARRAY_LEN, MAX_JSON_CONTROL_DEPTH, MAX_JSON_CONTROL_NODES,
     MAX_JSON_CONTROL_OBJECT_KEYS, MAX_JSON_CONTROL_STRING_BYTES,
     MAX_JSON_CONTROL_TOTAL_STRING_BYTES, MessageId, NegotiatedContractProfile, PlatformEnvelope,
-    PlatformError, PlatformErrorClass, PlatformResponse, RetryDisposition, SchemaDigest,
-    WorkCancelRequest, WorkContinueRequest, WorkSnapshotRequest, WorkSubmitRequest,
+    PlatformError, PlatformErrorClass, PlatformResponse, ProtocolIdentity, RetryDisposition, Route,
+    SchemaDigest, WorkCancelRequest, WorkContinueRequest, WorkSnapshotRequest, WorkSubmitRequest,
     WorkSubscribeRequest,
 };
 use agent_runtime::{
@@ -53,6 +53,12 @@ pub const MAX_FRAME_BYTES: u32 = 1_024 * 1_024;
 pub const READ_DEADLINE: Duration = Duration::from_secs(120);
 /// Concurrent client cap; a local host never needs more.
 pub const MAX_CONNECTIONS: usize = 16;
+/// Bounded shutdown wind-down: after the stop flag is observed, the
+/// connections accepted so far get this long to settle their in-flight
+/// frames; anything still parked in a blocking read/write then has its
+/// pending I/O cancelled (backend-supplied hook), so a silent client can
+/// never hold the shutdown past a hard bound.
+pub const SHUTDOWN_GRACE: Duration = Duration::from_secs(2);
 
 /// Digest pairing the host and its clients on this session contract surface.
 /// The .NET client's `AgentConnectionOptions.SchemaDigest` default must stay
@@ -192,6 +198,99 @@ impl Drop for SingleInstance {
 }
 
 // ---------------------------------------------------------------------------
+// Live connection table: the cap and the bounded-shutdown cancel target.
+// ---------------------------------------------------------------------------
+
+/// Registry of the streams of the connections currently being served. It is
+/// the accept loop's concurrency cap and the shutdown wind-down's cancel
+/// target: after accept stops, [`LiveStreams::drain`] lets in-flight frames
+/// settle within [`SHUTDOWN_GRACE`], then interrupts the still-blocked
+/// reads/writes through a backend-supplied cancel hook (`CancelIoEx` on the
+/// Windows named pipe, `shutdown(2)` on the UDS), so shutdown cannot wait
+/// on a silent or half-frame client past a bounded deadline.
+struct LiveStreams<S> {
+    next_id: AtomicU64,
+    streams: Mutex<HashMap<u64, Arc<S>>>,
+}
+
+impl<S> LiveStreams<S> {
+    fn new() -> Self {
+        Self {
+            next_id: AtomicU64::new(1),
+            streams: Mutex::new(HashMap::new()),
+        }
+    }
+
+    fn insert(&self, stream: Arc<S>) -> u64 {
+        let id = self.next_id.fetch_add(1, Ordering::Relaxed);
+        self.streams
+            .lock()
+            .expect("live connection table poisoned")
+            .insert(id, stream);
+        id
+    }
+
+    fn remove(&self, id: u64) {
+        self.streams
+            .lock()
+            .expect("live connection table poisoned")
+            .remove(&id);
+    }
+
+    fn len(&self) -> usize {
+        self.streams
+            .lock()
+            .expect("live connection table poisoned")
+            .len()
+    }
+
+    fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    /// Interrupts every still-registered connection's pending I/O and
+    /// empties the table. Called while every stream is provably alive: a
+    /// worker removes its entry only after its stream work is done.
+    fn cancel_all(&self, cancel: impl Fn(&S)) {
+        let mut streams = self.streams.lock().expect("live connection table poisoned");
+        for (_, stream) in streams.drain() {
+            cancel(&stream);
+        }
+    }
+
+    fn wait_empty(&self, budget: Duration) -> bool {
+        let deadline = Instant::now() + budget;
+        loop {
+            if self.is_empty() {
+                return true;
+            }
+            if Instant::now() >= deadline {
+                return false;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    }
+
+    /// The bounded wind-down: settle what is in flight within `grace`,
+    /// cancel what is still parked, then wait one further bound for the
+    /// workers to unwind. In-request actor work is separately bounded by
+    /// the router's per-request deadline, so the whole stop path has a hard
+    /// upper bound.
+    fn drain(&self, grace: Duration, cancel: impl Fn(&S)) {
+        if self.wait_empty(grace) {
+            return;
+        }
+        self.cancel_all(cancel);
+        if !self.wait_empty(grace) {
+            // Workers must unwind once their I/O is cancelled; if one is
+            // still wedged past this second bound, shutdown stays bounded
+            // and the residue is reported, never hidden.
+            eprintln!("host: some connections did not wind down within the shutdown grace");
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Endpoint + serve loop.
 // ---------------------------------------------------------------------------
 
@@ -221,8 +320,11 @@ pub struct HostServer {
     pub read_only: bool,
     /// Cooperative stop switch. The owner sets it, then opens one throwaway
     /// local connection to wake the parked accept loop; the loop then exits
-    /// `Ok` instead of serving further connections. The flag is only checked
-    /// at accept boundaries, so in-flight connections always finish.
+    /// `Ok` instead of serving further connections. After accept stops, the
+    /// connections accepted so far get a bounded wind-down: they may settle
+    /// in-flight frames within [`SHUTDOWN_GRACE`], then any still-blocked
+    /// read/write is interrupted (transport-supplied cancel), so the stop
+    /// path always terminates within a hard bound.
     pub stop: Arc<AtomicBool>,
 }
 
@@ -252,22 +354,25 @@ fn serve_unix(
     stop: &AtomicBool,
 ) -> anyhow::Result<()> {
     use std::os::unix::fs::PermissionsExt;
-    use std::os::unix::net::UnixListener;
+    use std::os::unix::net::{UnixListener, UnixStream};
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
-    let _ = std::fs::remove_file(&path);
+    reconcile_socket_path(&path)?;
     let listener =
         UnixListener::bind(&path).with_context(|| format!("binding {}", path.display()))?;
+    // From here the endpoint file is provably the one this process bound:
+    // the exit path removes exactly that file, nothing else.
+    let _own_endpoint = SocketEndpointGuard { path: path.clone() };
     std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))?;
     eprintln!("host: serving UDS {}", path.display());
-    let live = Arc::new(AtomicUsize::new(0));
+    let live: Arc<LiveStreams<UnixStream>> = Arc::new(LiveStreams::new());
     for stream in listener.incoming() {
         if stop.load(Ordering::SeqCst) {
             // Woken by the stop poke; the waker connection is unserved.
-            return Ok(());
+            break;
         }
-        let mut stream = match stream {
+        let stream = match stream {
             Ok(stream) => stream,
             Err(error) => {
                 eprintln!("host: accept failed: {error}");
@@ -279,23 +384,123 @@ fn serve_unix(
             eprintln!("host: rejected unverifiable UDS peer");
             continue;
         }
-        if live.load(Ordering::SeqCst) >= MAX_CONNECTIONS {
+        if live.len() >= MAX_CONNECTIONS {
             eprintln!("host: connection cap reached; refusing");
             continue;
         }
-        live.fetch_add(1, Ordering::SeqCst);
         let _ = stream.set_read_timeout(Some(READ_DEADLINE));
         let _ = stream.set_write_timeout(Some(READ_DEADLINE));
-        let plane = build_connection_plane(&plane, read_only);
+        let (router, guard) = match open_connection_plane(&plane, read_only) {
+            Ok(connection) => connection,
+            Err(error) => {
+                // Controlled refusal at the session cap: one structured
+                // error frame, then close. The accept loop lives on.
+                eprintln!("host: refusing connection; session grant unavailable: {error}");
+                let mut writer = &stream;
+                let _ = write_frame(&mut writer, &session_unavailable_frame(&plane.profile));
+                continue;
+            }
+        };
+        let shared = Arc::new(stream);
+        let id = live.insert(Arc::clone(&shared));
+        let live_in_worker = Arc::clone(&live);
         let runtime = runtime.clone();
-        let live = Arc::clone(&live);
         std::thread::spawn(move || {
-            let _ = process_connection(&mut stream, &plane, &runtime);
-            drop(plane);
-            live.fetch_sub(1, Ordering::SeqCst);
+            let mut stream: &UnixStream = shared.as_ref();
+            let _ = process_connection(&mut stream, &router, &runtime);
+            drop(guard);
+            live_in_worker.remove(id);
         });
     }
+    // Bounded wind-down for the connections accepted before the stop:
+    // settle in flight, then interrupt still-blocked reads/writes.
+    live.drain(SHUTDOWN_GRACE, |stream| {
+        let _ = stream.shutdown(std::net::Shutdown::Both);
+    });
     Ok(())
+}
+
+/// Fail-closed endpoint takeover check: inspect whatever sits at `path`
+/// before touching it. A regular file (or anything that is not a socket)
+/// is somebody's data — refuse startup and leave it untouched. A socket
+/// owned by another local user is refused as well. A socket we own is
+/// probed: a live listener means another host already serves this endpoint
+/// (refuse), while a dead socket is ours to remove so this host can bind.
+#[cfg(unix)]
+fn reconcile_socket_path(path: &std::path::Path) -> anyhow::Result<()> {
+    use std::os::unix::fs::{FileTypeExt, MetadataExt};
+    use std::os::unix::net::UnixStream;
+    let Ok(metadata) = std::fs::symlink_metadata(path) else {
+        return Ok(());
+    };
+    if !metadata.file_type().is_socket() {
+        anyhow::bail!(
+            "refusing to start: {} exists and is not a socket; it was left untouched",
+            path.display()
+        );
+    }
+    if metadata.uid() != unsafe { libc::geteuid() } {
+        anyhow::bail!(
+            "refusing to start: existing socket {} belongs to another local user",
+            path.display()
+        );
+    }
+    if UnixStream::connect(path).is_ok() {
+        anyhow::bail!(
+            "refusing to start: {} is already served by a live listener",
+            path.display()
+        );
+    }
+    std::fs::remove_file(path)
+        .with_context(|| format!("removing stale socket {}", path.display()))?;
+    Ok(())
+}
+
+/// Owns the socket file this host bound: dropping it removes exactly that
+/// endpoint, so the host cleans up only what it provably created and
+/// never an endpoint it merely found on disk.
+#[cfg(unix)]
+struct SocketEndpointGuard {
+    path: PathBuf,
+}
+
+#[cfg(unix)]
+impl Drop for SocketEndpointGuard {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.path);
+    }
+}
+
+/// A stable per-workspace endpoint discriminator: 16 hex chars of the
+/// SHA-256 over the canonical workspace path. One workspace always
+/// resolves to the same suffix, two workspaces never share a default
+/// endpoint, and no default is a fixed global name.
+pub fn workspace_endpoint_suffix(workspace_root: &std::path::Path) -> String {
+    use sha2::{Digest, Sha256};
+    let canonical = workspace_root
+        .canonicalize()
+        .unwrap_or_else(|_| workspace_root.to_path_buf());
+    let digest = Sha256::digest(canonical.as_os_str().as_encoded_bytes());
+    let mut suffix = String::with_capacity(16);
+    for byte in &digest[..8] {
+        suffix.push_str(&format!("{byte:02x}"));
+    }
+    suffix
+}
+
+/// The default UDS endpoint for one workspace: the user's runtime directory
+/// when the platform provides one, else the temp dir — plus the workspace
+/// discriminator, so the path is user-private, workspace-scoped, and never
+/// a fixed global name in `/tmp`.
+#[cfg(unix)]
+pub fn default_socket_path_for(workspace_root: &std::path::Path) -> PathBuf {
+    let base = std::env::var_os("XDG_RUNTIME_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(std::env::temp_dir);
+    base.join(format!(
+        "focus-agent-platform-{}.sock",
+        workspace_endpoint_suffix(workspace_root)
+    ))
 }
 
 #[cfg(not(unix))]
@@ -339,9 +544,36 @@ fn verify_unix_peer(_stream: &std::os::unix::net::UnixStream) -> bool {
     false
 }
 
-/// Install this connection's session grant server-side and build its
-/// bound router. The client never sees the session id.
-fn build_connection_plane(base: &HostPlane, read_only: bool) -> WorkControlRouter {
+/// Owns one connection's installed session grant. Dropping it revokes the
+/// grant, so every connection exit path — clean disconnect, bad frame,
+/// read deadline, shutdown-driven I/O cancel — releases its registry slot
+/// and the slot count returns to its baseline. The connection worker drops
+/// it after the router is done; a refused/never-served connection never
+/// gets one.
+struct SessionGrantGuard {
+    registry: Arc<WorkControlSessionRegistry>,
+    session_id: String,
+}
+
+impl Drop for SessionGrantGuard {
+    fn drop(&mut self) {
+        // Best effort: a failed revoke would leak one slot until the host
+        // exits. It can never widen authority — revoke only.
+        if let Err(error) = self.registry.revoke(&self.session_id) {
+            eprintln!("host: revoking session grant failed: {error}");
+        }
+    }
+}
+
+/// Install this connection's session grant server-side and build its bound
+/// router plus the grant's ownership guard. The client never sees the
+/// session id. An exhausted registry is a controlled refusal, not a panic:
+/// the caller answers the structured error frame, closes the connection,
+/// and the accept loop keeps serving.
+fn open_connection_plane(
+    base: &HostPlane,
+    read_only: bool,
+) -> anyhow::Result<(WorkControlRouter, SessionGrantGuard)> {
     let grant = if read_only {
         WorkControlGrant::read_only()
     } else {
@@ -350,19 +582,64 @@ fn build_connection_plane(base: &HostPlane, read_only: bool) -> WorkControlRoute
     let session_id = base
         .registry
         .install(grant)
-        .expect("session registry install cannot fail below its cap");
+        .map_err(|error| anyhow::anyhow!(error.to_string()))?;
+    // The guard exists before bind, so a bind or router failure below still
+    // releases the just-installed slot.
+    let guard = SessionGrantGuard {
+        registry: Arc::clone(&base.registry),
+        session_id: session_id.clone(),
+    };
     let authorizer = base
         .registry
         .bind(&session_id)
-        .expect("just-installed session must bind");
-    WorkControlRouter::new(
+        .map_err(|error| anyhow::anyhow!(error.to_string()))?;
+    let router = WorkControlRouter::new(
         base.profile.clone(),
         base.handle.clone(),
         Arc::clone(&base.broker),
         Arc::clone(&base.gate),
         Arc::new(authorizer),
     )
-    .expect("fixed host profile validates")
+    .map_err(|error| anyhow::anyhow!(error.to_string()))?;
+    Ok((router, guard))
+}
+
+/// The framed structured refusal for a connection that cannot get its
+/// session grant. Sent once, then the connection closes: nothing was
+/// executed, nothing is ambiguous, and a blind retry would hit the same
+/// full table.
+fn session_unavailable_frame(profile: &NegotiatedContractProfile) -> Vec<u8> {
+    let message_id = MessageId::new();
+    let envelope: PlatformEnvelope<PlatformResponse<serde_json::Value>> = PlatformEnvelope {
+        protocol: ProtocolIdentity {
+            name: profile.name.clone(),
+            version: profile.version,
+            active_features: profile.active_features.clone(),
+            schema_digest: profile.schema_digest,
+        },
+        message_id,
+        request_id: None,
+        kind: EnvelopeKind::Response,
+        route: Route {
+            namespace: "work".into(),
+            operation: "session".into(),
+        },
+        work: None,
+        causality: Causality::root(message_id),
+        payload: PlatformResponse::Error {
+            error: PlatformError {
+                class: PlatformErrorClass::Domain,
+                code: "work.control_unavailable".into(),
+                message: "the host cannot install a session grant right now; reconnect later"
+                    .into(),
+                retry: RetryDisposition::Never,
+                effect_state: EffectStateDisposition::NotApplicable,
+                retry_after_ms: None,
+                diagnostic_ref: None,
+            },
+        },
+    };
+    serde_json::to_vec(&envelope).unwrap_or_else(|_| b"{\"status\":\"error\"}".to_vec())
 }
 
 // ---------------------------------------------------------------------------
@@ -536,5 +813,46 @@ mod winpipe {
         anyhow::bail!(
             "named-pipe transport is Windows-only; use the UnixSocket endpoint on Unix hosts"
         )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn workspace_endpoint_suffix_is_stable_and_discriminating() {
+        let alpha = std::path::Path::new("/workspaces/alpha");
+        let beta = std::path::Path::new("/workspaces/beta");
+        let suffix = workspace_endpoint_suffix(alpha);
+        assert_eq!(
+            suffix,
+            workspace_endpoint_suffix(alpha),
+            "one workspace always resolves to the same endpoint id"
+        );
+        assert_eq!(suffix.len(), 16);
+        assert!(suffix.chars().all(|c| c.is_ascii_hexdigit()));
+        assert_ne!(
+            suffix,
+            workspace_endpoint_suffix(beta),
+            "two workspaces must not share a default endpoint"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn default_socket_path_is_workspace_scoped_and_private() {
+        let alpha = std::path::Path::new("/workspaces/alpha");
+        let path = default_socket_path_for(alpha);
+        assert!(
+            path.to_string_lossy()
+                .contains(&workspace_endpoint_suffix(alpha)),
+            "the default path must carry the workspace discriminator"
+        );
+        assert_ne!(
+            path,
+            default_socket_path_for(std::path::Path::new("/workspaces/beta")),
+            "different workspaces must not share a default socket path"
+        );
     }
 }

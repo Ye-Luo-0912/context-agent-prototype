@@ -131,13 +131,18 @@ fn exchange<S: Read + Write, P: serde::Serialize, R: serde::de::DeserializeOwned
     request: &PlatformEnvelope<P>,
 ) -> anyhow::Result<PlatformResponse<R>> {
     agent_host::write_frame(stream, &serde_json::to_vec(request)?)?;
+    read_response(stream, &request.request_id)
+}
+
+/// Reads one framed response and checks it correlates with the request.
+fn read_response<S: Read + Write, R: serde::de::DeserializeOwned>(
+    stream: &mut S,
+    request_id: &Option<RequestId>,
+) -> anyhow::Result<PlatformResponse<R>> {
     let frame = agent_host::read_frame(stream)?
         .ok_or_else(|| anyhow::anyhow!("connection closed before response"))?;
     let envelope = serde_json::from_slice::<PlatformEnvelope<PlatformResponse<R>>>(&frame)?;
-    assert_eq!(
-        envelope.request_id, request.request_id,
-        "correlated response"
-    );
+    assert_eq!(&envelope.request_id, request_id, "correlated response");
     assert_eq!(envelope.kind, EnvelopeKind::Response);
     Ok(envelope.payload)
 }
@@ -355,6 +360,234 @@ async fn connect(endpoint: &LocalEndpoint) -> std::os::unix::net::UnixStream {
     panic!("uds socket {} never became connectable", path.display());
 }
 
+// ---------------------------------------------------------------------------
+// N1: long-lived host — bounded stop, grant revocation, endpoint safety.
+// ---------------------------------------------------------------------------
+
+/// Upper bound for a full stop: the host itself bounds the wind-down at
+/// 2 x SHUTDOWN_GRACE plus the router's per-request deadline; the assertion
+/// here just needs to be comfortably above that.
+const BOUNDED_STOP: std::time::Duration = std::time::Duration::from_secs(20);
+
+/// One host serving one endpoint on a live composed runtime.
+struct TestServer {
+    endpoint: LocalEndpoint,
+    stop: Arc<AtomicBool>,
+    registry: Arc<WorkControlSessionRegistry>,
+    serve: std::thread::JoinHandle<anyhow::Result<()>>,
+}
+
+async fn start_server(
+    fixture: &Composed,
+    endpoint: LocalEndpoint,
+    probe: bool,
+) -> anyhow::Result<TestServer> {
+    let handle: RuntimeHandle = fixture.composed.handle().clone();
+    let registry = WorkControlSessionRegistry::new(handle.run_id());
+    let plane = HostPlane {
+        profile: negotiated_profile()?,
+        handle,
+        broker: Arc::clone(&fixture.broker),
+        gate: Arc::clone(&fixture.gate),
+        registry: Arc::clone(&registry),
+    };
+    let stop = Arc::new(AtomicBool::new(false));
+    let server = HostServer {
+        endpoint: endpoint.clone(),
+        read_only: false,
+        stop: Arc::clone(&stop),
+    };
+    let runtime = tokio::runtime::Handle::current();
+    let serve = std::thread::spawn(move || server.serve(plane, runtime));
+    if probe {
+        // One throwaway connection proves the endpoint is bound before the
+        // test proceeds; it is served and closed like any client.
+        drop(connect(&endpoint).await);
+    }
+    Ok(TestServer {
+        endpoint,
+        stop,
+        registry,
+        serve,
+    })
+}
+
+/// The stop-path assertion: set the cooperative stop flag, poke the parked
+/// accept loop with one throwaway connection (the same stop/wake mechanism
+/// the real Ctrl-C path uses — msys cannot deliver CTRL_C), and require the
+/// serve thread to have exited `Ok` within `bound`. Returns the elapsed
+/// time and the registry so callers can assert post-shutdown facts.
+async fn stop_and_join_bounded(
+    server: TestServer,
+    bound: std::time::Duration,
+) -> anyhow::Result<(std::time::Duration, Arc<WorkControlSessionRegistry>)> {
+    let started = std::time::Instant::now();
+    server.stop.store(true, Ordering::SeqCst);
+    let _ = connect(&server.endpoint).await;
+    let (done_tx, done_rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let _ = done_tx.send(server.serve.join());
+    });
+    match done_rx.recv_timeout(bound) {
+        Ok(joined) => {
+            joined.map_err(|_| anyhow::anyhow!("serve thread panicked"))??;
+            Ok((started.elapsed(), server.registry))
+        }
+        Err(_) => Err(anyhow::anyhow!(
+            "serve loop did not exit within {bound:?} (still running after {:?})",
+            started.elapsed()
+        )),
+    }
+}
+
+/// Polls until every installed session grant has been revoked (the
+/// registry must return to its baseline) within the deadline.
+async fn assert_registry_drained(registry: &WorkControlSessionRegistry) {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while registry.live_sessions() > 0 {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "session grants did not revoke: {} still installed",
+            registry.live_sessions()
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+    assert_eq!(
+        registry.live_sessions(),
+        0,
+        "registry must return to baseline"
+    );
+}
+
+/// Criterion 1: two parallel clients are served concurrently, each
+/// connection getting its own correlated answer on its own wire regardless
+/// of order. The mutation goes through client A only — the runtime has a
+/// single actor, so a second concurrent submit would be refused by design
+/// ("a turn is already running"); B exercises the served read plane while
+/// A's submit is in flight.
+async fn two_clients_serve_independently(endpoint: LocalEndpoint) -> anyhow::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let fixture = compose_workspace(dir.path()).await?;
+    fixture.composed.instance.start().await?;
+    let server = start_server(&fixture, endpoint, true).await?;
+
+    let mut client_a = connect(&server.endpoint).await;
+    let mut client_b = connect(&server.endpoint).await;
+    let request_a = request(
+        "work",
+        "submit",
+        WorkSubmitRequest {
+            goal: "host e2e: client a".into(),
+            client_request_id: "two-a".into(),
+        },
+    );
+    let request_b = request("work", "snapshot", WorkSnapshotRequest {});
+    agent_host::write_frame(&mut client_a, &serde_json::to_vec(&request_a)?)?;
+    agent_host::write_frame(&mut client_b, &serde_json::to_vec(&request_b)?)?;
+    // Read B first: B's snapshot answer must arrive on B's wire with B's
+    // correlation even though A connected and wrote first — no cross-talk,
+    // no queueing behind the other connection.
+    let answered_b: PlatformResponse<WorkSnapshotResponse> =
+        read_response(&mut client_b, &request_b.request_id)?;
+    let answered_a: PlatformResponse<WorkSubmitResponse> =
+        read_response(&mut client_a, &request_a.request_id)?;
+    let snapshot_b = expect_value(answered_b);
+    let submitted_a = expect_value(answered_a);
+    assert_eq!(submitted_a.disposition, WorkSubmitDisposition::Accepted);
+    assert!(snapshot_b.run_started, "B is served on the live run");
+
+    // And in the other order: A's served read does not disturb B's wire.
+    let follow_up_a = request("work", "snapshot", WorkSnapshotRequest {});
+    let follow_up_b = request("work", "snapshot", WorkSnapshotRequest {});
+    agent_host::write_frame(&mut client_a, &serde_json::to_vec(&follow_up_a)?)?;
+    agent_host::write_frame(&mut client_b, &serde_json::to_vec(&follow_up_b)?)?;
+    let second_b: PlatformResponse<WorkSnapshotResponse> =
+        read_response(&mut client_b, &follow_up_b.request_id)?;
+    let second_a: PlatformResponse<WorkSnapshotResponse> =
+        read_response(&mut client_a, &follow_up_a.request_id)?;
+    assert!(expect_value(second_b).run_started);
+    assert!(expect_value(second_a).run_started);
+
+    drop(client_a);
+    drop(client_b);
+    fixture.composed.shutdown().await?;
+    stop_and_join_bounded(server, BOUNDED_STOP).await?;
+    Ok(())
+}
+
+/// Criterion 2: sequential connect/disconnect past the old 64-slot cap —
+/// every disconnect must revoke its session grant, so the registry returns
+/// to its baseline instead of the 65th install panicking the accept loop.
+async fn grants_revoke_on_disconnect(endpoint: LocalEndpoint) -> anyhow::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let fixture = compose_workspace(dir.path()).await?;
+    fixture.composed.instance.start().await?;
+    let server = start_server(&fixture, endpoint, true).await?;
+    assert_eq!(
+        server.registry.live_sessions(),
+        0,
+        "a fresh host starts at the baseline"
+    );
+
+    for _ in 0..70 {
+        let mut stream = connect(&server.endpoint).await;
+        let snapshot = expect_value(exchange::<_, _, WorkSnapshotResponse>(
+            &mut stream,
+            &request("work", "snapshot", WorkSnapshotRequest {}),
+        )?);
+        assert!(snapshot.run_started);
+        drop(stream);
+    }
+
+    assert_registry_drained(&server.registry).await;
+    fixture.composed.shutdown().await?;
+    stop_and_join_bounded(server, BOUNDED_STOP).await?;
+    Ok(())
+}
+
+/// Criterion 3a: with no client at all, the stop path exits in bounded time.
+async fn stop_is_bounded_with_no_client(endpoint: LocalEndpoint) -> anyhow::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let fixture = compose_workspace(dir.path()).await?;
+    fixture.composed.instance.start().await?;
+    let server = start_server(&fixture, endpoint, true).await?;
+    let (elapsed, registry) = stop_and_join_bounded(server, BOUNDED_STOP).await?;
+    eprintln!("stop with no client took {elapsed:?}");
+    assert_registry_drained(&registry).await;
+    fixture.composed.shutdown().await?;
+    Ok(())
+}
+
+/// Criterion 3b: a half-frame client (parked mid-header read) and a
+/// slow-read client (answered, then parked waiting for a frame that never
+/// comes) must not hold the stop path past its bound. Both connections stay
+/// open across the stop; the wind-down settles then cancels them.
+async fn stop_is_bounded_with_hostile_clients(endpoint: LocalEndpoint) -> anyhow::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let fixture = compose_workspace(dir.path()).await?;
+    fixture.composed.instance.start().await?;
+    let server = start_server(&fixture, endpoint, true).await?;
+
+    // Half-frame: two bytes of the four-byte header, then silence.
+    let mut half_frame = connect(&server.endpoint).await;
+    half_frame.write_all(&[0x00, 0x00])?;
+    // Slow reader: a full request whose response is never read.
+    let mut slow_reader = connect(&server.endpoint).await;
+    agent_host::write_frame(
+        &mut slow_reader,
+        &serde_json::to_vec(&request("work", "snapshot", WorkSnapshotRequest {}))?,
+    )?;
+    // Let both workers reach their parked reads.
+    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+
+    fixture.composed.shutdown().await?;
+    let (elapsed, registry) = stop_and_join_bounded(server, BOUNDED_STOP).await?;
+    eprintln!("stop with hostile clients took {elapsed:?}");
+    // The shutdown-driven cancel path must release both grants too.
+    assert_registry_drained(&registry).await;
+    Ok(())
+}
+
 // multi_thread on purpose: the client side of this drill uses blocking
 // std IO; on the default current_thread test runtime that would freeze the
 // whole runtime and deadlock the server-side block_on calls.
@@ -374,6 +607,177 @@ async fn unix_socket_end_to_end_work_plane() {
     run_e2e(LocalEndpoint::UnixSocket(path), "uds")
         .await
         .unwrap();
+}
+
+#[cfg(windows)]
+#[tokio::test(flavor = "multi_thread")]
+async fn named_pipe_serves_two_clients_concurrently() {
+    two_clients_serve_independently(LocalEndpoint::NamedPipe(format!(
+        "focus-agent-e2e-two-{}",
+        uuid_like()
+    )))
+    .await
+    .unwrap();
+}
+
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread")]
+async fn unix_socket_serves_two_clients_concurrently() {
+    two_clients_serve_independently(LocalEndpoint::UnixSocket(
+        std::env::temp_dir().join(format!("focus-agent-e2e-two-{}.sock", uuid_like())),
+    ))
+    .await
+    .unwrap();
+}
+
+#[cfg(windows)]
+#[tokio::test(flavor = "multi_thread")]
+async fn named_pipe_grants_revoke_on_disconnect() {
+    grants_revoke_on_disconnect(LocalEndpoint::NamedPipe(format!(
+        "focus-agent-e2e-revoke-{}",
+        uuid_like()
+    )))
+    .await
+    .unwrap();
+}
+
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread")]
+async fn unix_socket_grants_revoke_on_disconnect() {
+    grants_revoke_on_disconnect(LocalEndpoint::UnixSocket(
+        std::env::temp_dir().join(format!("focus-agent-e2e-revoke-{}.sock", uuid_like())),
+    ))
+    .await
+    .unwrap();
+}
+
+#[cfg(windows)]
+#[tokio::test(flavor = "multi_thread")]
+async fn named_pipe_stop_is_bounded_with_no_client() {
+    stop_is_bounded_with_no_client(LocalEndpoint::NamedPipe(format!(
+        "focus-agent-e2e-stop-idle-{}",
+        uuid_like()
+    )))
+    .await
+    .unwrap();
+}
+
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread")]
+async fn unix_socket_stop_is_bounded_with_no_client() {
+    stop_is_bounded_with_no_client(LocalEndpoint::UnixSocket(
+        std::env::temp_dir().join(format!("focus-agent-e2e-stop-idle-{}.sock", uuid_like())),
+    ))
+    .await
+    .unwrap();
+}
+
+#[cfg(windows)]
+#[tokio::test(flavor = "multi_thread")]
+async fn named_pipe_stop_is_bounded_with_hostile_clients() {
+    stop_is_bounded_with_hostile_clients(LocalEndpoint::NamedPipe(format!(
+        "focus-agent-e2e-stop-hostile-{}",
+        uuid_like()
+    )))
+    .await
+    .unwrap();
+}
+
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread")]
+async fn unix_socket_stop_is_bounded_with_hostile_clients() {
+    stop_is_bounded_with_hostile_clients(LocalEndpoint::UnixSocket(
+        std::env::temp_dir().join(format!("focus-agent-e2e-stop-hostile-{}.sock", uuid_like())),
+    ))
+    .await
+    .unwrap();
+}
+
+/// A regular file squatting the endpoint path must refuse startup and stay
+/// untouched — the host never deletes something it cannot prove it owns.
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread")]
+async fn unix_socket_refuses_a_regular_file_endpoint() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("occupied.sock");
+    std::fs::write(&path, b"precious user data").unwrap();
+    let fixture = compose_workspace(dir.path()).await.unwrap();
+    fixture.composed.instance.start().await.unwrap();
+    let server = start_server(&fixture, LocalEndpoint::UnixSocket(path.clone()), false)
+        .await
+        .unwrap();
+    let (done_tx, done_rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let _ = done_tx.send(server.serve.join());
+    });
+    let joined = done_rx
+        .recv_timeout(BOUNDED_STOP)
+        .expect("endpoint refusal must be immediate")
+        .map_err(|_| anyhow::anyhow!("serve thread panicked"))
+        .unwrap();
+    let error = joined.expect_err("a regular file at the endpoint must refuse startup");
+    assert!(
+        error.to_string().contains("not a socket"),
+        "unexpected refusal: {error}"
+    );
+    assert_eq!(
+        std::fs::read(&path).unwrap(),
+        b"precious user data",
+        "the occupying file must be left untouched"
+    );
+    fixture.composed.shutdown().await.unwrap();
+}
+
+/// A live listener on the endpoint must refuse takeover, keep serving, and
+/// remove its own endpoint file on exit — never one it did not bind.
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread")]
+async fn unix_socket_refuses_a_live_listener_and_cleans_up_on_exit() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("live.sock");
+    let fixture = compose_workspace(dir.path()).await.unwrap();
+    fixture.composed.instance.start().await.unwrap();
+    let server = start_server(&fixture, LocalEndpoint::UnixSocket(path.clone()), true)
+        .await
+        .unwrap();
+
+    let second = start_server(&fixture, LocalEndpoint::UnixSocket(path.clone()), false)
+        .await
+        .unwrap();
+    let (done_tx, done_rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let _ = done_tx.send(second.serve.join());
+    });
+    let joined = done_rx
+        .recv_timeout(BOUNDED_STOP)
+        .expect("takeover refusal must be immediate")
+        .map_err(|_| anyhow::anyhow!("serve thread panicked"))
+        .unwrap();
+    let error = joined.expect_err("a live listener must refuse takeover");
+    assert!(
+        error.to_string().contains("already served"),
+        "unexpected refusal: {error}"
+    );
+
+    // The first host is unharmed and still serves a full exchange.
+    let mut stream = connect(&server.endpoint).await;
+    let snapshot = expect_value(
+        exchange::<_, _, WorkSnapshotResponse>(
+            &mut stream,
+            &request("work", "snapshot", WorkSnapshotRequest {}),
+        )
+        .unwrap(),
+    );
+    assert!(snapshot.run_started);
+    drop(stream);
+
+    let (elapsed, _) = stop_and_join_bounded(server, BOUNDED_STOP).await.unwrap();
+    eprintln!("uds bounded stop took {elapsed:?}");
+    assert!(
+        !path.exists(),
+        "the host must remove its own endpoint file on exit"
+    );
+    fixture.composed.shutdown().await.unwrap();
 }
 
 #[cfg(not(any(windows, unix)))]
