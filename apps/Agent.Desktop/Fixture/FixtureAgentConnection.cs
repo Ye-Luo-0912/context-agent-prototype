@@ -35,7 +35,13 @@ public sealed class FixtureAgentConnection : IAgentConnection
 
     private readonly List<PendingApprovalSnapshot> _approvals =
     [
-        new() { RequestId = "approval-fixture-1", CallName = "fs.write" },
+        new()
+        {
+            RequestId = "approval-fixture-1",
+            CallName = "fs.write",
+            Risk = ApprovalRisk.WorkspaceWrite,
+            TargetSummary = "布局预览示例路径：docs/fixture.md（非真实任务事实）",
+        },
     ];
 
     public bool IsConnected { get; private set; } = true;

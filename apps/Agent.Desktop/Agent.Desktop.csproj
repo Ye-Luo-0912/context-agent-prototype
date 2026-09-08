@@ -14,6 +14,13 @@
     <AvaloniaUseCompiledBindingsByDefault>true</AvaloniaUseCompiledBindingsByDefault>
   </PropertyGroup>
 
+  <!-- Lifecycle drills for the workbench view model run in the shared
+       client test suite (N4/F13): internals expose the observation seams.
+       The suite's assembly name is Agent.Client.Tests. -->
+  <ItemGroup>
+    <InternalsVisibleTo Include="Agent.Client.Tests" />
+  </ItemGroup>
+
   <ItemGroup>
     <PackageReference Include="Avalonia" Version="11.3.20" />
     <PackageReference Include="Avalonia.Desktop" Version="11.3.20" />

@@ -73,10 +73,16 @@
             <ItemsControl.ItemTemplate>
               <DataTemplate x:DataType="vm:ApprovalItemViewModel">
                 <Border BorderBrush="#33808080" BorderThickness="1" CornerRadius="4" Padding="6" Margin="0,2">
-                  <StackPanel Orientation="Horizontal" Spacing="8">
-                    <TextBlock Text="{Binding Title}" VerticalAlignment="Center" />
-                    <Button Content="允许" Command="{Binding AllowCommand}" />
-                    <Button Content="拒绝" Command="{Binding DenyCommand}" />
+                  <StackPanel Orientation="Horizontal" Spacing="10">
+                    <StackPanel>
+                      <TextBlock Text="{Binding Title}" FontWeight="SemiBold" />
+                      <TextBlock Text="{Binding RiskLine}" FontSize="11" Foreground="#cc9a5a00" TextWrapping="Wrap" />
+                      <TextBlock Text="{Binding TargetLine}" FontSize="11" Foreground="#99808080" TextWrapping="Wrap" MaxWidth="560" />
+                    </StackPanel>
+                    <StackPanel Orientation="Horizontal" Spacing="8" VerticalAlignment="Center">
+                      <Button Content="允许" Command="{Binding AllowCommand}" />
+                      <Button Content="拒绝" Command="{Binding DenyCommand}" />
+                    </StackPanel>
                   </StackPanel>
                 </Border>
               </DataTemplate>
@@ -92,8 +98,9 @@
         <Border Grid.Row="4" BorderBrush="#33808080" BorderThickness="0,1,0,0" Padding="0,8,0,0" Margin="0,8,0,0">
           <StackPanel Orientation="Horizontal" Spacing="16">
             <TextBlock><Run Text="watermark: " /><Run Text="{Binding Watermark}" /></TextBlock>
-            <TextBlock Text="{Binding FocusText}" TextWrapping="Wrap" MaxWidth="460" />
-            <TextBlock Text="{Binding PlanText}" Foreground="#99808080" TextWrapping="Wrap" MaxWidth="420" />
+            <TextBlock Text="{Binding FocusText}" TextWrapping="Wrap" MaxWidth="380" />
+            <TextBlock Text="{Binding RunStateText}" TextWrapping="Wrap" MaxWidth="300" />
+            <TextBlock Text="{Binding PlanText}" Foreground="#99808080" TextWrapping="Wrap" MaxWidth="320" />
           </StackPanel>
         </Border>
       </Grid>

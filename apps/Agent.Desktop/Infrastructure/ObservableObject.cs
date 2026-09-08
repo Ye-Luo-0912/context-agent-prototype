@@ -66,6 +66,12 @@ public sealed class RelayCommand : ICommand
     public void RaiseCanExecute() => CanExecuteChanged?.Invoke(this, EventArgs.Empty);
 }
 
+/// <summary>
+/// N4/F13: a group of long-lived commands that can also RELEASE its members.
+/// Per-approval Allow/Deny commands register here once per approval row and
+/// are removed when the row goes away, so repeated snapshot refreshes can
+/// never accumulate stale registrations.
+/// </summary>
 public sealed class AsyncCommandGroup
 {
     private readonly List<RelayCommand> _commands = [];
@@ -77,11 +83,85 @@ public sealed class AsyncCommandGroup
         return command;
     }
 
+    /// <summary>Releases one command's registration. Idempotent.</summary>
+    public void Remove(RelayCommand command) => _commands.Remove(command);
+
+    /// <summary>How many commands are registered right now (lifecycle drill
+    /// and test observation).</summary>
+    public int Count
+    {
+        get
+        {
+            lock (_commands)
+            {
+                return _commands.Count;
+            }
+        }
+    }
+
     public void RaiseCanExecute()
     {
-        foreach (var command in _commands)
+        RelayCommand[] snapshot;
+        lock (_commands)
+        {
+            snapshot = [.. _commands];
+        }
+        foreach (var command in snapshot)
         {
             command.RaiseCanExecute();
+        }
+    }
+}
+
+/// <summary>
+/// N4/F13: the UI-thread seam of the workbench view model. Production wires
+/// the Avalonia dispatcher; lifecycle drills wire an inline dispatcher so
+/// refresh/generation behavior is deterministic without a running UI.
+/// </summary>
+public interface IUiDispatcher
+{
+    /// <summary>Runs <paramref name="action"/> on the UI thread.</summary>
+    void Post(Action action);
+
+    /// <summary>Starts a periodic fallback timer; disposing the handle stops
+    /// it. The view model treats it only as a safety net — the primary
+    /// refresh driver is the event stream.</summary>
+    IDisposable StartPeriodicTimer(TimeSpan interval, Action tick);
+}
+
+/// <summary>The production dispatcher: Avalonia's UI thread.</summary>
+public sealed class AvaloniaUiDispatcher : IUiDispatcher
+{
+    public static AvaloniaUiDispatcher Instance { get; } = new();
+
+    public void Post(Action action) => Avalonia.Threading.Dispatcher.UIThread.Post(action);
+
+    public IDisposable StartPeriodicTimer(TimeSpan interval, Action tick)
+    {
+        var timer = new Avalonia.Threading.DispatcherTimer { Interval = interval };
+        timer.Tick += (_, _) => tick();
+        timer.Start();
+        return new TimerHandle(timer);
+    }
+
+    private sealed class TimerHandle(Avalonia.Threading.DispatcherTimer timer) : IDisposable
+    {
+        public void Dispose() => timer.Stop();
+    }
+}
+
+/// <summary>Deterministic dispatcher for lifecycle drills: actions run
+/// inline, the fallback timer is inert.</summary>
+public sealed class InlineUiDispatcher : IUiDispatcher
+{
+    public void Post(Action action) => action();
+
+    public IDisposable StartPeriodicTimer(TimeSpan interval, Action tick) => new NullHandle();
+
+    private sealed class NullHandle : IDisposable
+    {
+        public void Dispose()
+        {
         }
     }
 }
