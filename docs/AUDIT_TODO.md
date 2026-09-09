@@ -1,6 +1,8 @@
 # 缺陷分流
 
-当前执行顺序由 [NEXT_TASKS.md](NEXT_TASKS.md) 前列决定：**M17 收尾 N 系列（N4 主体落地、验收待 CI）＋并行三线 A/B/C（2026-09-09 开线）**。M16 与 2026-09-06/07/08 三轮审查的代码项保持关闭；2026-09-09 三线审查（基线 `bbf7f5d`）的新表见下方，映射 A/B/C 切片，不重开已关闭项。
+当前执行顺序由 [NEXT_TASKS.md](NEXT_TASKS.md) 前列决定：**M17 收尾 N 系列（N4 主体落地、验收待 CI）＋并行三线 A/B/C（2026-09-09 开线）**。M16 与 2026-09-06/07/08 三轮审查的代码项保持关闭；2026-09-09 三线审查（基线 `bbf7f5d`）的新表见下方，映射 A/B/C 切片，不重开已关闭项；2026-09-09 核心续审（基线 `93c300d`，R01–R14）见下方 R 系列表，R01 已落地，其余按行归属独立切片执行。
+
+2026-09-09 核心续审原文：[reviews/2026-09-09-core-audit-93c300d/REPORT.md](reviews/2026-09-09-core-audit-93c300d/REPORT.md)。
 
 2026-09-09 审查原文：[reviews/2026-09-09-audit-bbf7f5d-three-tracks/REPORT.md](reviews/2026-09-09-audit-bbf7f5d-three-tracks/REPORT.md)。
 
@@ -60,6 +62,29 @@
 | **RETYPED（→B2，已复核＋已落地 2026-09-09）** | `retyped` 验证前把请求 `work` 字段清成 `None`，可能把应拒绝的 run-scoped 信封清洗成合法请求。**已落地：`retyped` 原样携带 `request.work` 交 router 既有验证器；单测验证保留字段＋validator 拒绝，e2e：携带 work 的 run-scoped 请求收到 `protocol.request_invalid` 结构化拒绝、连接保持可用、goal 未被受理（named-pipe 本地绿；unix 变体随 CI Linux job）** | 验证原始信封，或保留字段交既有 validator | 非权限提升结论；会话授权仍由宿主安装 |
 | **GUI-EVENTS（→C1/C2，基线后已落地）** | 基线时点：主 ViewModel 未消费事件流、审批只有 request_id＋call_name、每 3s 重建审批行且命令积累、默认 FixtureLayout | `9fb2030`（F12 快照风险＋目标摘要）/`433d21e`（客户端镜像）/`843803f`（桌面真实事件＋稳定行＋诚实状态）已落地；随 N4 工单验收关闭 | 不重复立项；N3「事件到达客户端」≠N4「真实输出进入工作台」，验收按 N4 检查项 |
 | **ADMIT-TEST（→A1 附带，已落地 `6f47a90`）** | 基线：`tests::admit::admit_store_read_does_not_block_unrelated_context_work`：32 MiB 输入经默认正文裁剪不保证真有慢 I/O，再以「admit 耗时＞diagnostics 三倍」相对耗时推断无持锁；run `34271105841` Windows 全测试红（diagnostics 1.9ms vs admit 1.5ms）。**已落地：确定性屏障 `IoBoundaryPause`——admit 停泊在外部读边界（state 锁已释放），断言 diagnostics 在停泊期间完成、放行后准入结果正确；超时仅死锁兜底，不再做相对耗时推断** | 确定性屏障：确认 store read 进入→暂停→验证 diagnostics 可完成→放行→验证准入结果；超时仅死锁兜底 | 不放宽阈值；这次红不能证明生产持锁跨 I/O，偶然绿也不能证明没有 |
+
+## 2026-09-09 核心续审（基线 `93c300d` → R 系列）
+
+全仓范围续审（20 crate 目录清点；核心状态、上下文与工程边界按风险深读；14 项：7 P1、7 P2，其中 13 项动态反例、1 项静态调用链确认；审查环境无本地工具链，反例在隔离复制源码上运行）。原文与证据：[reviews/2026-09-09-core-audit-93c300d/REPORT.md](reviews/2026-09-09-core-audit-93c300d/REPORT.md)。执行顺序按报告建议：R01 先行，随后 R02/R03（A 线 owner 与恢复根）、平台项 R06/R07/R13/R14 按既有 B/C 所有权；R04/R05/R11/R12（tool-runtime/workspace）随核心线排片。每个切片独立交付，不把「审查清零」设为新阶段。
+
+| 发现 | 已核对位置 | 要修什么 | 不要做什么 |
+|---|---|---|---|
+| **R01（P1，已落地 2026-09-09）** | 基线：`actor/safepoint.rs` `accrue_checkpoint_debt` 仅按枚举去重、两条 ACK 路径按原因集合做差，冻结后的同类修改被第一个 ACK 误清；`actor/turn.rs` 终结屏障只等待已有写入、无补捕获。**已落地：冻结批次与可积累欠账分离——safe point 冻结时 `mem::take` 把欠账移入 in-flight artifact 的 `captured_debt`，成功 ACK 只退休它冻结的集合，失败路径（settled/await/schedule 各错误分支）把冻结集并回活欠账；被冻结的 reason 可再积累，留给下一个快照。屏障（`finalize_turn`、`record_completion_commit_failure`）退出证明无未捕获欠账：await 成功且仍有欠账时最后一次捕获；失败写不内联重试，欠账恢复并 fence 给下一个 settled batch。回归 `same_reason_debt_accrued_during_background_save_survives_the_ack` 固定交错（两快照各自冻结、第二工件带新 anchor 内容、恢复后 revision=2、continuation gate 全程诚实）；既有 `failed_checkpoint_write_fences_continuation_until_a_retry_lands` 保持绿。报告未覆盖范围的两个静态候选已核：单飞行不变量＋单调 watermark 使旧 ACK 覆盖新欠账不可达；checkpoint 聚合字节上限按既有 oldest-first 裁剪（`aggregate_byte_budget_prunes_oldest_first` 在测）。实际检查：turn 115＋lib 368＋actor 72＋instance 31＋host_restore 3、`cargo fmt`、clippy（agent-runtime 无警告）全绿** | 持久化债务绑定产生它的快照身份（冻结集分离即实现）；两条 ACK 路径共用退休规则；barrier 退出证明无未捕获欠账而非仅 JoinHandle 结束 | 不建第二套代次数据库；沿用 RuntimeActor 编排与 Core 提交/恢复权威；屏障失败不自判可恢复 |
+| **R02（P1，待执行→A）** | `context-simple/store.rs:1026–1036`、`gc/full/mod.rs:91–99`：pending 外置记录漏入强引用根，其仍引用的证据被 Storage GC 删除；仅剩 pending 时还停止重试 | 根集合补齐 pending 所有者（`Delete ∩ Reach_strong(all_retained_roots) = ∅`）；IO 恢复后 pending 必须能进维护并取得进展 | 不反复全表扫描；已沿用的工作强边思路可继续 |
+| **R03（P1，待执行→A）** | `context-simple/store.rs:1439–1450`：reconcile 因新快照已有 Resident 副本删除 blob，破坏仍受支持的旧快照恢复（restore B → 清理 → restore A → fetch None） | 物理删除检查全部保留者（含仍支持恢复的 checkpoint）的强引用闭包；磁盘保留多份可恢复副本不是缺陷 | 不把「新快照有副本」当旧恢复根可失效 |
+| **R04（P1，待执行→核心线）** | `tool-runtime/supervision.rs:79–91`：锁把单次退避量当总等待量，超时条件永远不可达（两平台持锁 4 秒仍等待） | 区分单次退避与总等待预算 | 不新建监督框架 |
+| **R05（P1，待执行→核心线）** | `tool-runtime/tools/session.rs:81–88,555–561`：session 输出 EOF 被当成退出、poll 无期限等待活进程且不响应取消、持有全表锁 | EOF≠进程退出；poll 有界且响应取消；锁范围收窄 | 不重建 session 工具 |
+| **R06（P1，待执行→B/C）** | `Agent.Client/WorkDto.cs:306,587`：合法 2,001 字符 goal 不能被 .NET snapshot/task detail 接受（scripted wire submit 接受、两次 snapshot fault），后续握手持续失败 | 按共享 C0 契约统一长度口径；两语言验证同界 | 不在 GUI 侧二次截断 |
+| **R07（P1，待执行→B/C）** | `MainWindowViewModel.cs:736–749,790–795`：并发刷新或已发请求超时清掉未知提交的幂等键；同目标重试变新受理身份 | `Pending(k)→Unknown(k)` 仍保留 k；`Unknown(k)→已受理/已拒绝` 必须有对应 k 的证据 | 不建通用幂等数据库 |
+| **R08（P2，待执行→A）** | `context-baselines/rolling.rs:156–180`：Rolling 仅给压缩器 2,000 字符却移走整批旧记录并宣称覆盖，未读尾部也退出工作集 | 记录压缩器真实消费输入与可恢复残余（移出的正文 ⊆ 已消费输入 ∪ 可恢复残余）；诚实区分覆盖保证与摘要语义 | 摘要质量不在范围；不重开算法研究 |
+| **R09（P2，待执行→A）** | `prompt.rs:556–580`、`materializer.rs:836–850`：同版本不交叠 fs.read 窗口共享 path@revision，历史互补正文被误省略（100 行历史 body 从可见变为只有 descriptor） | 历史区间 ⊆ 同版本当前可见区间并集的集合包含证明 | 不引入向量库或新检索栈 |
+| **R10（P2，待执行→核心线）** | `actor/model.rs:1248–1255,1377`：Schema 过滤仅影响执行快照，实际请求仍向模型展示被移除工具（静态调用链确认，未动态探针） | Ready 声明与执行集合一致 | 不把 ToolSpec 字段当权限 |
+| **R11（P2，待执行→核心线）** | `tool-runtime/tools/session.rs:323,336–341`：session start 早退泄漏 Pending 槽，16 次失败后无进程也不能再启动 | 早退路径归还/释放 Pending 槽 | — |
+| **R12（P2，待执行→核心线）** | `agent-workspace/lib.rs:1437–1443`：after_tx 在同事务 Prepared 处越过游标又返回同 ID 的 Committed，增量读取不前进 | 游标推进以 Committed 可见为准 | — |
+| **R13（P2，待执行→B/C）** | `Agent.Client/ResumableSession.cs:267–281`：事件队列 overflow 后永久 completed；snapshot/底层重连成功也无法恢复新事件 | overflow 后队列可重置或显式重建，重连后新事件可达 | 不承诺无限重放 |
+| **R14（P2，待执行→B/C）** | `MainWindowViewModel.cs:483–494`：每事件 UI.Post 把有界源转成无界 dispatcher backlog，输出上限过晚生效 | 背压有界（丢弃/合并策略显式）；上限在源侧生效 | 不换 GUI 框架 |
+
+审查同时确认的网络完整性证据留在 IO 附录，网络安全不作为本轮深入方向（用户 2026-09-09 指示）；未覆盖范围（各 crate 深读边界、未跑的恢复解析器与平台分支）见报告「覆盖范围与未覆盖部分」节，实施前现场补读。
 
 ## 2026-09-07 续审残余（基线 `b299c6a` → M17）
 
