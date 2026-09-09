@@ -14,9 +14,9 @@ use std::{
 
 use agent_contracts::{
     AgentResult, ContextEngine, ContextKind, InputKind, ModelCapabilities, ModelOutput,
-    ModelRequest, ModelTransport, RuntimeEvent, RuntimeEventEnvelope, ToolCall, ToolDispatcher,
-    ToolExecutionAttribution, ToolExecutionPurpose, ToolExecutionRequest, ToolOutcome, ToolOutput,
-    ToolRisk, ToolSpec, VerificationReuse,
+    ModelRequest, ModelTransport, RuntimeDirective, RuntimeEvent, RuntimeEventEnvelope,
+    TaskProgressProposal, ToolCall, ToolDispatcher, ToolExecutionAttribution, ToolExecutionPurpose,
+    ToolExecutionRequest, ToolOutcome, ToolOutput, ToolRisk, ToolSpec, VerificationReuse,
 };
 use agent_core::{CoreAuthorityConfig, PolicyApprovalGate};
 use agent_runtime::{ModuleHost, RuntimeInstance, RuntimeServices};
@@ -1287,5 +1287,213 @@ async fn terminal_failure_restores_the_previous_durability_requirement() {
     );
     let tasks = handle.list_tasks().await.unwrap();
     assert!(matches!(tasks[0].status, agent_runtime::TaskStatus::Active));
+    instance.shutdown().await.unwrap();
+}
+
+/// Serves `task.manage` by attaching the typed progress directive, exactly
+/// like the real tool: the runtime applies it through the trusted anchor
+/// CAS at operation-commit time.
+#[derive(Debug)]
+struct ProgressDirectiveDispatcher;
+
+#[async_trait::async_trait]
+impl ToolDispatcher for ProgressDirectiveDispatcher {
+    fn specs(&self) -> Vec<ToolSpec> {
+        vec![ToolSpec {
+            name: "task.manage".into(),
+            description: "propose bounded task progress".into(),
+            input_schema: json!({"type": "object"}),
+            risk: ToolRisk::ReadOnly,
+            output_budget: None,
+            roles: Vec::new(),
+        }]
+    }
+    async fn execute(&self, request: ToolExecutionRequest) -> AgentResult<ToolOutcome> {
+        let arguments = request.call.arguments;
+        let proposal: TaskProgressProposal = serde_json::from_value(json!({
+            "base_anchor_revision": arguments["base_anchor_revision"],
+            "current_interpretation": arguments.get("current_interpretation"),
+            "plan_progress": arguments.get("plan_progress"),
+            "open_loops": arguments.get("open_loops"),
+            "next_action": arguments.get("next_action"),
+        }))
+        .unwrap();
+        Ok(ToolOutcome::RuntimeDirective {
+            output: ToolOutput {
+                call_id: request.call.id,
+                tool_name: "task.manage".into(),
+                ok: true,
+                summary: "progress proposed".into(),
+                model_content: String::new(),
+                artifact_ref: None,
+                metadata: json!({}),
+            },
+            directive: RuntimeDirective::UpdateTaskProgress(proposal),
+        })
+    }
+}
+
+/// Two consecutive `task.manage` rounds, then a plain finish. The second
+/// same-reason anchor mutation lands while the FIRST background save is
+/// still unacknowledged — the R01 interleaving.
+#[derive(Debug)]
+struct TwoStageProgressModel {
+    rounds: AtomicUsize,
+}
+
+#[async_trait::async_trait]
+impl ModelTransport for TwoStageProgressModel {
+    fn capabilities(&self) -> ModelCapabilities {
+        ModelCapabilities::default()
+    }
+    async fn complete(&self, _request: ModelRequest) -> AgentResult<ModelOutput> {
+        let round = self.rounds.fetch_add(1, Ordering::SeqCst);
+        if round < 2 {
+            Ok(ModelOutput {
+                content: String::new(),
+                tool_calls: vec![ToolCall {
+                    id: format!("call-{round}"),
+                    name: "task.manage".into(),
+                    arguments: json!({
+                        "base_anchor_revision": round,
+                        "next_action": if round == 0 {
+                            "stage one captured"
+                        } else {
+                            "stage two captured"
+                        },
+                    }),
+                }],
+                usage: Default::default(),
+            })
+        } else {
+            Ok(ModelOutput {
+                content: "done".into(),
+                tool_calls: Vec::new(),
+                usage: Default::default(),
+            })
+        }
+    }
+}
+
+/// R01: a same-reason mutation that happens while the previous snapshot's
+/// background write is still unacknowledged must survive that write's ACK.
+/// The acknowledgement may only retire the debt it froze; the newer debt
+/// owes its own snapshot, the second artifact must carry the newer anchor
+/// content, restoring from it must expose that state, and the
+/// continuation gate must stay honest throughout.
+#[tokio::test]
+async fn same_reason_debt_accrued_during_background_save_survives_the_ack() {
+    let dir = tempfile::tempdir().unwrap();
+    let workspace = agent_workspace::Workspace::open(dir.path()).await.unwrap();
+    let services = RuntimeServices::new(
+        CoreAuthorityConfig::default(),
+        Arc::new(TestContextEngine),
+        Arc::new(TwoStageProgressModel {
+            rounds: AtomicUsize::new(0),
+        }),
+        Arc::new(ProgressDirectiveDispatcher),
+        Arc::new(PolicyApprovalGate::read_only()),
+        None,
+    )
+    .with_artifact_workspace(Arc::new(workspace));
+    let mut host = ModuleHost::new();
+    host.start().await.expect("test module host starts");
+    let instance = RuntimeInstance::spawn(host, services);
+    let handle = instance.handle();
+    handle.start().await.unwrap();
+    let mut events = handle.subscribe();
+    handle
+        .set_focus("implement bounded retry".into())
+        .await
+        .unwrap();
+    handle.user_message("keep going".into()).await.unwrap();
+
+    // Collect through the first turn: every frozen snapshot's resume commit
+    // and every durable acknowledgement, with their identities.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+    let mut resumes: Vec<(u64, Vec<String>)> = Vec::new();
+    let mut durables: Vec<(u64, String)> = Vec::new();
+    loop {
+        let envelope = tokio::time::timeout_at(deadline, events.recv())
+            .await
+            .expect("turn finishes inside the deadline")
+            .expect("event stream stays open");
+        match envelope.event {
+            RuntimeEvent::TaskResumeCommitted { debt, sequence, .. } => {
+                resumes.push((sequence, debt));
+            }
+            RuntimeEvent::CheckpointDurable {
+                artifact, sequence, ..
+            } => {
+                durables.push((sequence, artifact));
+            }
+            RuntimeEvent::TurnCompleted => break,
+            _ => {}
+        }
+    }
+
+    // Two settled batches with same-reason debt each: the first ACK may
+    // not absorb the second mutation's debt, so a second snapshot must be
+    // frozen and durably acknowledged before TurnCompleted.
+    assert_eq!(
+        resumes,
+        vec![
+            (1, vec!["task_anchor_changed".to_string()]),
+            (2, vec!["task_anchor_changed".to_string()]),
+        ],
+        "each settled batch freezes its own snapshot; the first ACK retires only its frozen debt"
+    );
+    assert_eq!(
+        durables
+            .iter()
+            .map(|(sequence, _)| *sequence)
+            .collect::<Vec<_>>(),
+        vec![1, 2],
+        "both snapshots must land durably: {durables:?}"
+    );
+
+    // The SECOND artifact is the authoritative resume state: it loads
+    // checksum-verified and carries the mid-flight mutation's anchor
+    // content under its own snapshot sequence.
+    let store =
+        agent_runtime::CheckpointStore::new(dir.path().join(".focus-agent").join("checkpoints"));
+    let (_, last_artifact) = durables.last().expect("two durable acks").clone();
+    let payload = store.load_verified(&last_artifact).await.unwrap();
+    let checkpoint: agent_runtime::RuntimeCheckpoint = serde_json::from_slice(&payload).unwrap();
+    assert_eq!(
+        checkpoint.snapshot_sequence, 2,
+        "the latest artifact is the second snapshot"
+    );
+    let payload_text = String::from_utf8_lossy(&payload);
+    assert!(
+        payload_text.contains("stage two captured"),
+        "the second snapshot must capture the mid-flight same-reason mutation"
+    );
+
+    // Gate state: with both snapshots durable and no uncaptured debt left,
+    // continuation is allowed (and the continued turn itself finishes).
+    handle
+        .continue_active_task()
+        .await
+        .expect("fully captured debt must release the continuation gate");
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+    loop {
+        let envelope = tokio::time::timeout_at(deadline, events.recv())
+            .await
+            .expect("continuation finishes inside the deadline")
+            .expect("event stream stays open");
+        if matches!(envelope.event, RuntimeEvent::TurnCompleted) {
+            break;
+        }
+    }
+
+    // Post-recovery state check: restoring from the second artifact brings
+    // the runtime back to the mid-flight mutation's anchor revision.
+    instance.restore(checkpoint).await.unwrap();
+    let tasks = handle.list_tasks().await.unwrap();
+    assert_eq!(
+        tasks[0].anchor_revision, 2,
+        "the mid-flight mutation survives restore from the second artifact"
+    );
     instance.shutdown().await.unwrap();
 }

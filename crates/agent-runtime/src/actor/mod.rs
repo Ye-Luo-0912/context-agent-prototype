@@ -1350,12 +1350,17 @@ struct ActorState {
     /// caller must query instead of assuming exactly-once.
     work_submissions: VecDeque<crate::work::WorkSubmissionRecord>,
     /// Coalesced reasons the next settled batch owes a durable resume
-    /// checkpoint. Read-only exploration leaves this empty.
+    /// checkpoint. Read-only exploration leaves this empty. Freezing a
+    /// snapshot MOVES this set into the in-flight write; a reason frozen
+    /// there can accrue again (a same-type mutation after the freeze) and
+    /// stays in this live set until a LATER snapshot captures it — an
+    /// acknowledgement retires only the exact set it froze.
     checkpoint_debt: Vec<crate::checkpoint::CheckpointDebtReason>,
     /// In-flight background checkpoint write plus the snapshot identity it
-    /// was captured under and the exact debt set it froze, so a durable ack
-    /// retires only what the artifact actually covers and newer debt
-    /// survives for the following capture.
+    /// was captured under and the exact debt set it froze (moved out of
+    /// the live set at freeze time), so a durable ack retires only what
+    /// this artifact covers while debt accrued after the freeze survives
+    /// for the following capture; a failed write restores its frozen set.
     checkpoint_write: Option<self::safepoint::InFlightCheckpoint>,
     /// Last background write ended in `CheckpointWriteFailed` and has not
     /// been followed by a durable one yet.

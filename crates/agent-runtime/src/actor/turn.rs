@@ -2336,7 +2336,17 @@ impl RuntimeActor {
         // event, so the JSONL order proves resume-before-completion. A
         // failure is already published as CheckpointWriteFailed; the turn
         // still completes and nothing claims resumability from it.
-        let _ = self.await_pending_checkpoint().await;
+        if self.await_pending_checkpoint().await.is_ok() && !self.state.checkpoint_debt.is_empty() {
+            // Barrier exit must prove no uncaptured debt remains — not
+            // merely that the current JoinHandle ended. Debt accrued while
+            // the frozen write was in flight (the safe point above
+            // returned early without freezing) gets one final capture
+            // here. A failed barrier write keeps its debt restored and
+            // fenced for the next settled batch's retry; this re-capture
+            // deliberately does not inline-retry a failure.
+            self.safe_point_resume_commit().await;
+            let _ = self.await_pending_checkpoint().await;
+        }
         let assistant_evidence_identity = self
             .state
             .task_id
@@ -2647,7 +2657,17 @@ impl RuntimeActor {
             })
             .await;
         self.safe_point_resume_commit().await;
-        let _ = self.await_pending_checkpoint().await;
+        // Same barrier policy as turn finalization: the pending write must
+        // drain before this path ends. Debt frozen out from under that write
+        // — the CompletionCommitFailed reason itself when the safe point
+        // above returned early — gets one final capture so the barrier
+        // leaves nothing uncaptured. A failed write keeps its debt restored
+        // and fenced for the next settled batch's retry; this re-capture
+        // deliberately does not inline-retry a failure.
+        if self.await_pending_checkpoint().await.is_ok() && !self.state.checkpoint_debt.is_empty() {
+            self.safe_point_resume_commit().await;
+            let _ = self.await_pending_checkpoint().await;
+        }
         let _ = self
             .core
             .emit_warning(format!("completion proposal failed: {reason}"))

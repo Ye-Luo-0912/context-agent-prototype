@@ -9,14 +9,22 @@
 //! allocated independently of task-anchor revisions: two snapshots under
 //! the same anchor revision never alias, and a task switch cannot move
 //! ordering backwards. The write is acknowledged against that exact
-//! sequence; the durable watermark advances only for it, while debt
-//! accrued after capture stays alive for the next safe point.
+//! sequence; the durable watermark advances only for it. Freezing MOVES
+//! the accrued debt out of the live set into the in-flight artifact, so
+//! debt accrued after the capture — including a same-reason mutation —
+//! stays live for the next safe point: an acknowledgement retires only
+//! the exact generation it froze (ACK(S_v) clears only debt frozen into
+//! S_v). A failed write hands its frozen set back to the live debt, so
+//! nothing is ever silently cleared.
 
 use super::*;
 use crate::checkpoint::{CheckpointDebtReason, CheckpointStore, StoredCheckpoint};
 
 /// One background write in flight: its join handle, the snapshot sequence
-/// it acknowledges, and the exact debt set it froze.
+/// it acknowledges, and the exact debt set it froze (moved out of the
+/// live debt at freeze time). That frozen set is the ONLY thing this
+/// acknowledgement may retire; a failed or errored write hands it back
+/// to the live debt set.
 pub(super) struct InFlightCheckpoint {
     handle: tokio::task::JoinHandle<AgentResult<(u64, StoredCheckpoint)>>,
     /// The active task's anchor revision at freeze time, surfaced on the
@@ -46,10 +54,24 @@ impl RuntimeActor {
     }
 
     /// Record one coalesced reason the next settled batch owes a durable
-    /// checkpoint. Idempotent per reason.
+    /// checkpoint. Idempotent per reason among not-yet-frozen debt: a
+    /// reason currently frozen into an in-flight write can accrue again
+    /// and stays outstanding until a LATER snapshot captures it — the
+    /// in-flight acknowledgement retires only what it froze.
     pub(super) fn accrue_checkpoint_debt(&mut self, reason: CheckpointDebtReason) {
         if !self.state.checkpoint_debt.contains(&reason) {
             self.state.checkpoint_debt.push(reason);
+        }
+    }
+
+    /// Hand a failed write's frozen debt back to the live set, merging
+    /// without duplicates so a re-accrued reason stays a single entry.
+    /// Failure must keep every reason visible and retryable.
+    fn restore_checkpoint_debt(&mut self, reasons: &[CheckpointDebtReason]) {
+        for reason in reasons {
+            if !self.state.checkpoint_debt.contains(reason) {
+                self.state.checkpoint_debt.push(*reason);
+            }
         }
     }
 
@@ -159,11 +181,13 @@ impl RuntimeActor {
     }
 
     /// Drain one finished background write. A success advances the durable
-    /// sequence watermark to the acked snapshot, retires precisely its
-    /// captured debt reasons, and publishes `CheckpointDurable` carrying
-    /// the identity tuple. A failure keeps every reason — including ones
-    /// accrued mid-flight — and surfaces an error so barrier callers fail
-    /// closed.
+    /// sequence watermark to the acked snapshot and publishes
+    /// `CheckpointDurable` carrying the identity tuple; the frozen debt
+    /// set was already separated from the live set at freeze time, so
+    /// anything still accrued — including same-reason debt from mutations
+    /// that happened mid-flight — survives for the next safe point. A
+    /// failure restores the frozen set to the live debt and surfaces an
+    /// error so barrier callers fail closed.
     async fn take_settled_checkpoint_write(&mut self) -> AgentResult<()> {
         let finished = matches!(
             self.state.checkpoint_write.as_ref(),
@@ -182,12 +206,12 @@ impl RuntimeActor {
                 self.state.checkpoint_write_failed = false;
                 self.state.durable_sequence =
                     Some(self.state.durable_sequence.unwrap_or(0).max(sequence));
-                // Typed retirement: subtract only this artifact's frozen set.
+                // Typed retirement: the frozen set left the live debt at
+                // freeze time, so there is nothing to subtract here — debt
+                // accrued after that freeze was never this artifact's to
+                // clear.
                 let anchor_revision = in_flight.anchor_revision;
                 let capability_generation = in_flight.capability_generation;
-                self.state
-                    .checkpoint_debt
-                    .retain(|reason| !in_flight.captured_debt.contains(reason));
                 let _ = self
                     .core
                     .emit_event(RuntimeEvent::CheckpointDurable {
@@ -202,10 +226,12 @@ impl RuntimeActor {
                 Ok(())
             }
             Ok(Err(error)) => {
+                self.restore_checkpoint_debt(&in_flight.captured_debt);
                 self.emit_checkpoint_write_failed(error.to_string()).await;
                 Err(error)
             }
             Err(join_error) => {
+                self.restore_checkpoint_debt(&in_flight.captured_debt);
                 let error = AgentError::InvalidRequest(format!(
                     "checkpoint write task failed: {join_error}"
                 ));
@@ -229,9 +255,11 @@ impl RuntimeActor {
     /// settlement and nothing is in flight. Debt coalesces into one
     /// candidate snapshot; several mutations in one batch produce one
     /// resume install and one write. The newly allocated sequence becomes
-    /// continuation's required watermark. Debt accrued while another write
-    /// was in flight stays here unretired, so the very next settled batch
-    /// captures a further snapshot instead of silently assuming safety.
+    /// continuation's required watermark. Freezing moves the accrued debt
+    /// into the in-flight artifact, so debt accrued while that write is in
+    /// flight — including a re-accrued reason — stays in the live set for
+    /// the very next settled batch to capture as a further snapshot
+    /// instead of letting the first acknowledgement silently absorb it.
     pub(super) async fn safe_point_resume_commit(&mut self) {
         let _ = self.take_settled_checkpoint_write().await;
         if self.state.checkpoint_debt.is_empty() || self.state.checkpoint_write.is_some() {
@@ -287,16 +315,21 @@ impl RuntimeActor {
                 .await;
         }
 
-        let captured_debt = self.state.checkpoint_debt.clone();
+        // Freeze the batch's debt OUT of the live set: the in-flight
+        // acknowledgement owns exactly these reasons, while a same-reason
+        // mutation after this point accrues fresh debt that this ack can
+        // never clear (ACK(S_v) retires only debt frozen into S_v).
+        let captured_debt = std::mem::take(&mut self.state.checkpoint_debt);
         self.schedule_checkpoint_write(sequence, anchor_revision, captured_debt)
             .await;
     }
 
     /// Capture the current planes under the already-allocated sequence and
-    /// hand one atomic write to the background. Debt deliberately stays:
-    /// only the successful acknowledgement retires exactly what this
-    /// artifact froze; failures keep everything visible and retryable,
-    /// including an impossible-by-configuration store.
+    /// hand one atomic write to the background. The frozen debt moves with
+    /// the artifact: only a successful acknowledgement retires it
+    /// permanently; every failure path here hands the set back to the
+    /// live debt, keeping everything visible and retryable, including an
+    /// impossible-by-configuration store.
     async fn schedule_checkpoint_write(
         &mut self,
         sequence: u64,
@@ -310,6 +343,7 @@ impl RuntimeActor {
                 // validate before persisting so an internally inconsistent
                 // plane can never become a durable acknowledgement.
                 if let Err(error) = snapshot.validate() {
+                    self.restore_checkpoint_debt(&captured_debt);
                     self.emit_checkpoint_write_failed(format!(
                         "assembled checkpoint failed validation: {error}"
                     ))
@@ -319,6 +353,7 @@ impl RuntimeActor {
                 snapshot
             }
             Err(error) => {
+                self.restore_checkpoint_debt(&captured_debt);
                 self.emit_checkpoint_write_failed(error.to_string()).await;
                 return;
             }
@@ -327,6 +362,7 @@ impl RuntimeActor {
         let bytes = match serde_json::to_vec(&snapshot) {
             Ok(bytes) => bytes,
             Err(error) => {
+                self.restore_checkpoint_debt(&captured_debt);
                 self.emit_checkpoint_write_failed(format!(
                     "checkpoint serialization failed: {error}"
                 ))
@@ -335,6 +371,7 @@ impl RuntimeActor {
             }
         };
         let Some(store) = self.checkpoint_store() else {
+            self.restore_checkpoint_debt(&captured_debt);
             self.state.checkpoint_write_failed = true;
             let _ = self
                 .core
@@ -359,9 +396,11 @@ impl RuntimeActor {
 
     /// Barrier wait: explicit pause/suspend/completion/shutdown paths call
     /// this so they never report an outcome whose resume checkpoint is
-    /// still in flight. A durable ack advances the sequence watermark;
-    /// failure surfaces here with every debt reason retained and an error
-    /// return, so callers refuse to claim resumability.
+    /// still in flight. A durable ack advances the sequence watermark; the
+    /// frozen debt set was separated at freeze time, so debt accrued after
+    /// that freeze survives. A failure restores the frozen set with every
+    /// reason retained and an error return, so callers refuse to claim
+    /// resumability.
     pub(super) async fn await_pending_checkpoint(&mut self) -> AgentResult<()> {
         if self.state.checkpoint_write.is_none() {
             return Ok(());
@@ -376,11 +415,10 @@ impl RuntimeActor {
                 self.state.checkpoint_write_failed = false;
                 self.state.durable_sequence =
                     Some(self.state.durable_sequence.unwrap_or(0).max(sequence));
+                // Typed retirement: the frozen set left the live debt at
+                // freeze time; debt accrued after that freeze stays.
                 let anchor_revision = in_flight.anchor_revision;
                 let capability_generation = in_flight.capability_generation;
-                self.state
-                    .checkpoint_debt
-                    .retain(|reason| !in_flight.captured_debt.contains(reason));
                 let _ = self
                     .core
                     .emit_event(RuntimeEvent::CheckpointDurable {
@@ -395,10 +433,12 @@ impl RuntimeActor {
                 Ok(())
             }
             Ok(Err(error)) => {
+                self.restore_checkpoint_debt(&in_flight.captured_debt);
                 self.emit_checkpoint_write_failed(error.to_string()).await;
                 Err(error)
             }
             Err(join_error) => {
+                self.restore_checkpoint_debt(&in_flight.captured_debt);
                 let error = AgentError::InvalidRequest(format!(
                     "checkpoint write task failed: {join_error}"
                 ));
@@ -409,11 +449,12 @@ impl RuntimeActor {
     }
 
     /// Continuation across a segment is allowed only when durability is
-    /// fully accounted for: no outstanding typed debt, no write in flight,
-    /// no failed write without a subsequent durable one, and the required
-    /// snapshot sequence actually landed durably. A failed or missing
-    /// safe-point write fences `continue_active_task` before any model
-    /// request and stays fenced until a retry succeeds.
+    /// fully accounted for: no write in flight, no live debt that no
+    /// snapshot has captured yet, no failed write without a subsequent
+    /// durable one, and the required snapshot sequence actually landed
+    /// durably. A failed or missing safe-point write fences
+    /// `continue_active_task` before any model request and stays fenced
+    /// until a retry succeeds.
     pub(super) async fn continuation_durability_gate(&mut self) -> AgentResult<()> {
         self.await_pending_checkpoint().await?;
         if let Some(required) = self.state.required_sequence {
