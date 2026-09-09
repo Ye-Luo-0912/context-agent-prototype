@@ -1,6 +1,6 @@
 # 缺陷分流
 
-当前执行顺序由 [NEXT_TASKS.md](NEXT_TASKS.md) 前列决定：**M17 收尾 N 系列（N4 主体落地、验收待 CI）＋并行三线 A/B/C（2026-09-09 开线）**。M16 与 2026-09-06/07/08 三轮审查的代码项保持关闭；2026-09-09 三线审查（基线 `bbf7f5d`）的新表见下方，映射 A/B/C 切片，不重开已关闭项；2026-09-09 核心续审（基线 `93c300d`，R01–R14）见下方 R 系列表，R01/R02 已落地，其余按行归属独立切片执行。
+当前执行顺序由 [NEXT_TASKS.md](NEXT_TASKS.md) 前列决定：**M17 收尾 N 系列（N4 主体落地、验收待 CI）＋并行三线 A/B/C（2026-09-09 开线）**。M16 与 2026-09-06/07/08 三轮审查的代码项保持关闭；2026-09-09 三线审查（基线 `bbf7f5d`）的新表见下方，映射 A/B/C 切片，不重开已关闭项；2026-09-09 核心续审（基线 `93c300d`，R01–R14）见下方 R 系列表，R01/R02/R03/R06/R10/R12 已落地，其余（R04/R05/R07/R08/R09/R11/R13/R14）待执行，按行归属独立切片执行。
 
 2026-09-09 核心续审原文：[reviews/2026-09-09-core-audit-93c300d/REPORT.md](reviews/2026-09-09-core-audit-93c300d/REPORT.md)。
 
@@ -78,7 +78,7 @@
 | **R07（P1，待执行→B/C）** | `MainWindowViewModel.cs:736–749,790–795`：并发刷新或已发请求超时清掉未知提交的幂等键；同目标重试变新受理身份 | `Pending(k)→Unknown(k)` 仍保留 k；`Unknown(k)→已受理/已拒绝` 必须有对应 k 的证据 | 不建通用幂等数据库 |
 | **R08（P2，待执行→A）** | `context-baselines/rolling.rs:156–180`：Rolling 仅给压缩器 2,000 字符却移走整批旧记录并宣称覆盖，未读尾部也退出工作集 | 记录压缩器真实消费输入与可恢复残余（移出的正文 ⊆ 已消费输入 ∪ 可恢复残余）；诚实区分覆盖保证与摘要语义 | 摘要质量不在范围；不重开算法研究 |
 | **R09（P2，待执行→A）** | `prompt.rs:556–580`、`materializer.rs:836–850`：同版本不交叠 fs.read 窗口共享 path@revision，历史互补正文被误省略（100 行历史 body 从可见变为只有 descriptor） | 历史区间 ⊆ 同版本当前可见区间并集的集合包含证明 | 不引入向量库或新检索栈 |
-| **R10（P2，待执行→核心线）** | `actor/model.rs:1248–1255,1377`：Schema 过滤仅影响执行快照，实际请求仍向模型展示被移除工具（静态调用链确认，未动态探针） | Ready 声明与执行集合一致 | 不把 ToolSpec 字段当权限 |
+| **R10（P2，已落地 2026-09-09 `fe901b7`）** | 基线：`actor/model.rs:1248–1255,1377`：Schema 过滤仅影响执行快照，实际请求仍向模型展示被移除工具（静态调用链确认，未动态探针）。**已落地：schema profile 编译前移到输入装配/预算计算/Ready 报告之前——plan specs、report 选择与 request tools 命名同一最终集合；MustSurface 被拒为显式不可满足拒绝（命名的 Error 事件＋turn 无 fencing 收尾）而非静默丢弃工具；可选拒绝成为 Unavailable 省略行；provider 预算裁剪后丢弃过期 profile，使 snapshot profiles 与其 specs 精确一致。回归：3 单测＋2 actor e2e** | Ready 声明与执行集合一致 | 不把 ToolSpec 字段当权限 |
 | **R11（P2，待执行→核心线）** | `tool-runtime/tools/session.rs:323,336–341`：session start 早退泄漏 Pending 槽，16 次失败后无进程也不能再启动 | 早退路径归还/释放 Pending 槽 | — |
 | **R12（P2，已落地 2026-09-09 `b2badef`）** | 基线：`agent-workspace/lib.rs:1437–1443`：after_tx 在同事务 Prepared 处越过游标又返回同 ID 的 Committed，增量读取不前进。**已落地：read_changes 的 after_tx 游标按整事务命名——共享 tx_id 的每一阶段（Prepared/Committed）都排除，仅返回严格更新的记录；新增回归覆盖 cursor-by-newest-commit（返回空）与 cursor-by-Prepared（同事务 Committed 不泄漏）。实际检查：agent-workspace lib 106/106（100 既有＋R12 回归）** | 游标推进以 Committed 可见为准 | — |
 | **R13（P2，待执行→B/C）** | `Agent.Client/ResumableSession.cs:267–281`：事件队列 overflow 后永久 completed；snapshot/底层重连成功也无法恢复新事件 | overflow 后队列可重置或显式重建，重连后新事件可达 | 不承诺无限重放 |
