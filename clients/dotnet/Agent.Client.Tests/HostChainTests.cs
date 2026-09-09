@@ -207,4 +207,126 @@ public class HostChainTests
             }
         }
     }
+
+    /// <summary>
+    /// C3: the review surface against the REAL host — the four B3 read-only
+    /// routes (task detail / change journal / artifact bytes / read-only
+    /// context) driven through the REAL <see cref="ResumableSession"/> and the
+    /// desktop workbench, exactly like the production connect path. Everything
+    /// is observation: submits and approvals are never touched by this drill.
+    /// The task detail arrives over the wire (goal visible), the change
+    /// journal reflects whatever the demo run actually journaled (honest count,
+    /// possibly zero), a never-sealed artifact reference is refused by the
+    /// host (the panel says unavailable — fail-closed, never a guessed body),
+    /// and the engine's context summary is non-empty after the demo submit
+    /// (the goal reached the engine). Passes as NOT_RUN without the debug host.
+    /// </summary>
+    [Fact]
+    public async Task Real_host_review_routes_drive_the_review_surface()
+    {
+        var hostBinary = FindHostBinary();
+        if (hostBinary is null)
+        {
+            return; // NOT_RUN: this environment has no debug agent-host build
+        }
+
+        var workdir = Path.Combine(Path.GetTempPath(), $"n8-review-{Guid.NewGuid():N}");
+        Directory.CreateDirectory(workdir);
+        var pipeName = $"n8-review-{Guid.NewGuid():N}";
+        var socketPath = Path.Combine(workdir, "host.sock");
+        var args = OperatingSystem.IsWindows()
+            ? $"--workdir \"{workdir}\" --pipe {pipeName}"
+            : $"--workdir \"{workdir}\" --socket \"{socketPath}\"";
+
+        var start = new ProcessStartInfo
+        {
+            FileName = hostBinary,
+            Arguments = args,
+            UseShellExecute = false,
+            RedirectStandardOutput = true,
+            RedirectStandardError = true,
+        };
+        start.Environment["AGENT_DEMO"] = "1";
+        using var process = Process.Start(start)!;
+        await using var spawned = new SpawnedHost { Process = process, Workdir = workdir };
+        try
+        {
+            var ready = await WaitForEndpointAsync(
+                socketPath, pipeName, TimeSpan.FromSeconds(60));
+            Assert.True(
+                ready,
+                $"the host endpoint never became connectable;"
+                    + (process.HasExited
+                        ? $" stderr:\n{await process.StandardError.ReadToEndAsync()}"
+                        : " the host is still running (its stderr is only read after exit)"));
+
+            await using var viewModel = new MainWindowViewModel(new InlineUiDispatcher());
+            await viewModel.ConnectSessionForTestsAsync(() =>
+                OperatingSystem.IsWindows()
+                    ? new NamedPipeTransport(pipeName).ConnectAsync(CancellationToken.None)
+                    : new UnixDomainSocketTransport(socketPath).ConnectAsync(CancellationToken.None))
+                .WaitAsync(TimeSpan.FromSeconds(120));
+            Assert.True(
+                viewModel.IsConnected,
+                $"the workbench never connected; output:\n{viewModel.OutputText}");
+
+            // A real submit lands the task in the engine; the review reads
+            // below then observe the host's own facts (this drill performs no
+            // further mutation).
+            viewModel.GoalInput = "demo: list files";
+            await viewModel.SubmitForTestsAsync();
+            await WaitUntilAsync(
+                () => viewModel.Tasks.Any(task => task.Goal == "demo: list files"),
+                "the submitted task in the snapshot-driven list");
+
+            // 1. task_detail over the wire: the goal arrives verbatim from the
+            // host (B3 host e2e proves the same fact for the Rust side).
+            await viewModel.LoadTaskDetailForTestsAsync(viewModel.Tasks.First(t => t.Goal == "demo: list files").TaskId);
+            Assert.Contains("demo: list files", viewModel.TaskDetailText);
+
+            // 2. changes over the wire: the panel reflects whatever the demo
+            // run journaled. Host journal for a read-only demo tool is often
+            // empty; the panel must say so honestly (count, not prose).
+            await viewModel.RefreshChangesForTestsAsync();
+            Assert.Contains("条", viewModel.ChangesStatusText);
+            Assert.DoesNotContain("读取失败", viewModel.ChangesStatusText);
+
+            // 3. artifact over the wire: a reference that was never sealed is
+            // refused by the host (fail-closed) — the panel stays honest,
+            // never a guessed body.
+            await viewModel.ReadArtifactForTestsAsync("artifact://run/never-sealed");
+            Assert.Contains("unavailable", viewModel.ArtifactText);
+            Assert.DoesNotContain("（完整）", viewModel.ArtifactText);
+
+            // 4. context over the wire: the submitted goal reached the
+            // engine, so the read-only summary is non-empty (B3 host e2e
+            // proves the same for the Rust side).
+            await viewModel.RefreshContextForTestsAsync();
+            Assert.NotEmpty(viewModel.ContextItems);
+            Assert.DoesNotContain("读取失败", viewModel.ContextStatusText);
+        }
+        finally
+        {
+            try
+            {
+                if (!process.HasExited)
+                {
+                    process.Kill(entireProcessTree: true);
+                }
+            }
+            catch
+            {
+            }
+        }
+    }
+
+    private static async Task WaitUntilAsync(Func<bool> condition, string what)
+    {
+        var deadline = DateTimeOffset.UtcNow + TimeSpan.FromSeconds(90);
+        while (!condition())
+        {
+            Assert.True(DateTimeOffset.UtcNow < deadline, $"timed out waiting for {what}");
+            await Task.Delay(250);
+        }
+    }
 }
