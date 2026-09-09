@@ -49,6 +49,56 @@ struct LedgerLock {
     _thread: std::sync::MutexGuard<'static, ()>,
 }
 
+/// Total budget a waiter may spend trying to become the ledger lock holder
+/// before it gives up. Per-attempt backoff grows and caps independently; the
+/// *total* wait is bounded by this budget so a lock that stays held still
+/// expires the waiter at the budget instead of scaling with the backoff.
+const LOCK_WAIT_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(2_000);
+const LOCK_FIRST_BACKOFF_MS: u64 = 25;
+const LOCK_MAX_BACKOFF_MS: u64 = 250;
+
+/// Why a [`retry_flock`] wait ended without acquiring the lock.
+#[derive(Debug)]
+enum LockRetryError {
+    /// The total wait budget elapsed while the lock stayed contended.
+    TimedOut,
+    /// The flock call itself failed with a real IO error.
+    Hard(std::io::Error),
+}
+
+/// Retry a non-blocking flock until it succeeds, fails hard, or the total
+/// wait budget elapses. `backoff_ms` is the per-attempt pause (it grows and
+/// caps); the deadline is tracked separately in elapsed time, so a held lock
+/// correctly expires the waiter exactly at `budget` rather than scaling the
+/// wait with the growing backoff.
+fn retry_flock<F>(budget: std::time::Duration, mut try_lock: F) -> Result<(), LockRetryError>
+where
+    F: FnMut() -> Result<(), std::fs::TryLockError>,
+{
+    let deadline = std::time::Instant::now() + budget;
+    let mut backoff_ms = LOCK_FIRST_BACKOFF_MS;
+    loop {
+        match try_lock() {
+            Ok(()) => return Ok(()),
+            Err(std::fs::TryLockError::WouldBlock) => {
+                let now = std::time::Instant::now();
+                if now >= deadline {
+                    return Err(LockRetryError::TimedOut);
+                }
+                // Sleep for at most the remaining budget: a timeout must
+                // expire at the total budget even while the lock stays held.
+                let remaining = deadline.duration_since(now);
+                let sleep_ms = backoff_ms.min(remaining.as_millis() as u64);
+                std::thread::sleep(std::time::Duration::from_millis(sleep_ms));
+                backoff_ms = (backoff_ms * 2).min(LOCK_MAX_BACKOFF_MS);
+            }
+            Err(std::fs::TryLockError::Error(error)) => {
+                return Err(LockRetryError::Hard(error));
+            }
+        }
+    }
+}
+
 fn lock_ledger(state_dir: &Path) -> LedgerResult<LedgerLock> {
     let thread = LEDGER_MUTATION.lock().map_err(|_| LedgerError::Io {
         action: "lock",
@@ -73,31 +123,21 @@ fn lock_ledger(state_dir: &Path) -> LedgerResult<LedgerLock> {
         })?;
     // `try_lock` is non-blocking: a second process (two compositions started
     // against the same workspace) or a same-process flock quirk surfaces as
-    // WouldBlock. Retry with backoff instead of failing the operation — the
-    // lock is IO coordination, and a bounded wait is what makes the
-    // serialization actually usable across processes.
-    let mut wait_ms = 25u64;
-    loop {
-        match file.try_lock() {
-            Ok(()) => break,
-            Err(std::fs::TryLockError::WouldBlock) => {
-                if wait_ms > 2_000 {
-                    return Err(LedgerError::Io {
-                        action: "lock",
-                        source: std::io::Error::other(std::fs::TryLockError::WouldBlock),
-                    });
-                }
-                std::thread::sleep(std::time::Duration::from_millis(wait_ms));
-                wait_ms = (wait_ms * 2).min(250);
-            }
-            Err(std::fs::TryLockError::Error(error)) => {
-                return Err(LedgerError::Io {
-                    action: "lock",
-                    source: error,
-                });
-            }
+    // WouldBlock. Retry with per-attempt backoff instead of failing the
+    // operation — the lock is IO coordination, and a *bounded total* wait is
+    // what makes the serialization actually usable across processes. The
+    // total budget is tracked independently of the backoff so a lock that
+    // stays held expires the waiter at the budget rather than hanging.
+    retry_flock(LOCK_WAIT_TIMEOUT, || file.try_lock()).map_err(|retry_error| {
+        let source = match retry_error {
+            LockRetryError::TimedOut => std::io::Error::other(std::fs::TryLockError::WouldBlock),
+            LockRetryError::Hard(error) => error,
+        };
+        LedgerError::Io {
+            action: "lock",
+            source,
         }
-    }
+    })?;
     Ok(LedgerLock {
         _file: file,
         _thread: thread,
@@ -998,6 +1038,48 @@ mod tests {
         assert!(error.to_string().contains("failed"), "{error}");
         let _ = std::fs::remove_file(state_dir.join("authority"));
         let _child = _child;
+    }
+
+    /// R04: a waiter whose total budget elapses while the lock stays held
+    /// returns at the budget (the per-attempt backoff is never conflated with
+    /// the total wait budget). On the old behavior this looped forever and the
+    /// bounded assertion below failed; the new wait expires ~at the budget.
+    #[test]
+    fn lock_wait_expires_at_the_total_budget_even_while_held() {
+        let start = std::time::Instant::now();
+        let result = retry_flock(std::time::Duration::from_millis(150), || {
+            Err(std::fs::TryLockError::WouldBlock)
+        });
+        let elapsed = start.elapsed();
+        assert!(
+            matches!(result, Err(LockRetryError::TimedOut)),
+            "a lock that stays held must time out, got {result:?}"
+        );
+        assert!(
+            elapsed >= std::time::Duration::from_millis(120),
+            "the waiter must not return before its budget: {elapsed:?}"
+        );
+        assert!(
+            elapsed < std::time::Duration::from_secs(5),
+            "must expire at the budget, not hang: {elapsed:?}"
+        );
+    }
+
+    /// R04: a contended lock that frees within the budget is acquired; the
+    /// backoff and the budget are independent.
+    #[test]
+    fn lock_wait_succeeds_when_the_lock_frees_within_budget() {
+        let mut attempts = 0u32;
+        let result = retry_flock(std::time::Duration::from_secs(1), || {
+            attempts += 1;
+            if attempts <= 3 {
+                Err(std::fs::TryLockError::WouldBlock)
+            } else {
+                Ok(())
+            }
+        });
+        assert!(result.is_ok(), "{result:?}");
+        assert_eq!(attempts, 4);
     }
 
     /// The ledger is bounded: recording past the row cap is a typed error,
