@@ -1,0 +1,23 @@
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.21s
+     Running unittests src\lib.rs (target\debug\deps\agent_runtime-88605f2970c3c27d.exe)
+
+running 1 test
+test actor::model::failure_class_tests::final_pack_coverage_requires_candidate_identity_and_complete_body ... FAILED
+
+failures:
+
+---- actor::model::failure_class_tests::final_pack_coverage_requires_candidate_identity_and_complete_body stdout ----
+
+thread 'actor::model::failure_class_tests::final_pack_coverage_requires_candidate_identity_and_complete_body' (22672) panicked at crates\agent-runtime\src\actor\model.rs:2232:13:
+assertion `left == right` failed: different path
+  left: 0
+ right: 1
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+
+failures:
+    actor::model::failure_class_tests::final_pack_coverage_requires_candidate_identity_and_complete_body
+
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 376 filtered out; finished in 0.00s
+
+error: test failed, to rerun pass `-p agent-runtime --lib`

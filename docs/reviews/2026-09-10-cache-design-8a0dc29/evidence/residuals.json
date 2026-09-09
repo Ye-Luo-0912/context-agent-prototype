@@ -1,0 +1,33 @@
+{
+  "after_model_maintenance": {
+    "actor_cleanly_joined": true,
+    "cancel_answered_within_300ms": false,
+    "gate_entered": true
+  },
+  "artifact_capture": {
+    "capture_cap_bytes": 2097152,
+    "metadata": {
+      "_execution_facts": {
+        "failure": null,
+        "may_mutate_workspace": false,
+        "resources": [],
+        "verification": false
+      },
+      "bytes": 3146229,
+      "has_more": false,
+      "next_start_line": 101,
+      "returned": 100,
+      "total_lines": 101,
+      "total_lines_complete": true,
+      "window_truncated": true
+    },
+    "model_content_bytes": 2098551,
+    "source_bytes": 3146229
+  },
+  "maintenance_deferral": {
+    "compactor_budget": 0,
+    "deferred_folds": 0,
+    "records_remaining": 2
+  },
+  "real_provider_calls": 0
+}

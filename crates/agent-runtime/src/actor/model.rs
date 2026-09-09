@@ -49,35 +49,28 @@ fn final_pack_window_covers(candidate: &MaterializedItem, dropped: &Materialized
         // Without a revision there is no interval truth: no coverage proof.
         return false;
     };
-    // A clipped candidate proves nothing about what the request shows.
-    if candidate.partial_body {
+    // Check the candidate's own identity before interpreting its range.
+    // Copying the dropped identity onto an unrelated candidate would let
+    // the same line numbers in any file masquerade as coverage.
+    if candidate.partial_body
+        || candidate.file_path.as_deref().map(str::trim) != Some(path)
+        || candidate.file_revision.as_deref().map(str::trim) != Some(revision)
+    {
         return false;
     }
-    let window =
-        if let (Some(start), Some(end)) = (candidate.file_start_line, candidate.file_end_line) {
-            agent_contracts::FileBodyWindow {
-                path: path.to_string(),
-                revision: Some(revision.to_string()),
-                start_line: Some(start),
-                end_line: Some(end),
-                covers_file: false,
-            }
-        } else {
-            // No bounds on a non-clipped same-revision body: it carries the
-            // whole file content it ingested.
-            let same_identity = candidate.file_path.as_deref().map(str::trim) == Some(path)
-                && candidate.file_revision.as_deref().map(str::trim) == Some(revision);
-            if !same_identity {
-                return false;
-            }
-            agent_contracts::FileBodyWindow {
-                path: path.to_string(),
-                revision: Some(revision.to_string()),
-                start_line: None,
-                end_line: None,
-                covers_file: true,
-            }
-        };
+    let covers_file = match (candidate.file_start_line, candidate.file_end_line) {
+        (Some(_), Some(_)) => false,
+        (None, None) => true,
+        // An incomplete range cannot certify a whole-file body.
+        _ => return false,
+    };
+    let window = agent_contracts::FileBodyWindow {
+        path: path.to_string(),
+        revision: Some(revision.to_string()),
+        start_line: candidate.file_start_line,
+        end_line: candidate.file_end_line,
+        covers_file,
+    };
     agent_contracts::visible_body_windows_cover(
         &[window],
         path,
@@ -103,9 +96,16 @@ fn record_final_pack_drop(
         .iter()
         .chain(materialized.foreground.iter())
         .any(|item| {
-            item.item_id == dropped.item_id
-                // The exact same text is on the wire elsewhere in the frame.
-                || item.content == dropped.content
+            // The same source may have multiple, differently clipped
+            // projections. Only an exact complete projection is a copy;
+            // equal bytes from another source are not attributed evidence.
+            (item.item_id == dropped.item_id
+                && item.content == dropped.content
+                && item.file_path == dropped.file_path
+                && item.file_revision == dropped.file_revision
+                && item.file_start_line == dropped.file_start_line
+                && item.file_end_line == dropped.file_end_line
+                && !item.partial_body)
                 || final_pack_window_covers(item, dropped)
         });
     if still_visible {
@@ -2181,6 +2181,70 @@ mod failure_class_tests {
         item.file_start_line = start_line;
         item.file_end_line = end_line;
         item
+    }
+
+    #[test]
+    fn final_pack_coverage_requires_candidate_identity_and_complete_body() {
+        let required = windowed_body(
+            ContextRetention::Working,
+            &"required".repeat(50),
+            Some(10),
+            Some(20),
+        );
+        let mut covering = windowed_body(
+            ContextRetention::Working,
+            &"covering".repeat(60),
+            Some(1),
+            Some(30),
+        );
+        let mut cases = Vec::new();
+        covering.file_path = Some("src/other.rs".into());
+        cases.push(("different path", covering.clone()));
+        covering.file_path = required.file_path.clone();
+        covering.file_revision = Some("rev-2".into());
+        cases.push(("different revision", covering.clone()));
+        covering.file_revision = None;
+        cases.push(("unknown revision", covering.clone()));
+        covering.file_revision = required.file_revision.clone();
+        covering.file_end_line = None;
+        cases.push(("incomplete range", covering));
+        let mut clipped = required.clone();
+        clipped.content.truncate(8);
+        clipped.partial_body = true;
+        cases.push(("same id with clipped body", clipped));
+        let mut different_window = required.clone();
+        different_window.content = "another part of the same source".into();
+        different_window.file_start_line = Some(21);
+        different_window.file_end_line = Some(30);
+        cases.push(("same id with complementary range", different_window));
+        let mut coincidental_text = required.clone();
+        coincidental_text.item_id = agent_contracts::ContextItemId::new();
+        coincidental_text.file_path = Some("src/other.rs".into());
+        cases.push(("identical text from another file", coincidental_text));
+
+        for (case, candidate) in cases {
+            let mut materialized = MaterializedContext {
+                items: vec![candidate],
+                required_item_ids: vec![required.item_id],
+                ..Default::default()
+            };
+            record_final_pack_drop(&mut materialized, &required, 9);
+            assert_eq!(materialized.required_misses.total(), 1, "{case}");
+        }
+
+        let covering = windowed_body(
+            ContextRetention::Working,
+            "complete larger window of the same revision",
+            Some(1),
+            Some(30),
+        );
+        let mut materialized = MaterializedContext {
+            foreground: vec![covering],
+            required_item_ids: vec![required.item_id],
+            ..Default::default()
+        };
+        record_final_pack_drop(&mut materialized, &required, 9);
+        assert!(materialized.required_misses.is_empty());
     }
 
     #[test]

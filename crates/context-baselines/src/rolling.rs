@@ -273,6 +273,10 @@ impl RollingSummaryEngine {
             .as_ref()
             .map(|summary| summary.id)
             .unwrap_or_default();
+        // 守卫回退的计数必须覆盖 plan 阶段的全部自增：完整消费的每条
+        // ＋切分记录自己的那一条。漏掉切分增量会让折叠失败时 collapsed
+        // （诊断里的 tombstoned 总数）永久虚高 1。
+        let collapsed_delta = consumed + usize::from(partial.is_some());
         Some(FoldJob {
             prior: bound_compaction_source(&prior),
             collapsed: state.collapsed,
@@ -284,7 +288,7 @@ impl RollingSummaryEngine {
             restore: FoldRestore {
                 state: Arc::clone(&self.state),
                 records: folded_records,
-                collapsed_delta: consumed,
+                collapsed_delta,
                 armed: true,
             },
         })

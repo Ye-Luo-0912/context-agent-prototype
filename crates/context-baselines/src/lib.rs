@@ -660,6 +660,39 @@ mod tests {
         );
     }
 
+    /// R08 partial + 失败守卫：plan 阶段对切分记录也自增了 `collapsed`，
+    /// 失败回退必须把它一并撤销，否则诊断里的 tombstoned 总数永久虚高。
+    #[tokio::test]
+    async fn failed_partial_fold_rolls_back_the_collapsed_counter() {
+        let engine = RollingSummaryEngine::with_config(RollingConfig {
+            summary_threshold_tokens: 30,
+            keep_most_recent_tokens: 4,
+            ..Default::default()
+        })
+        .with_compactor(Arc::new(FailingCompactor));
+        // 700 字符记录：两条完整进入 2,000 字符压缩输入，第三条按容量
+        // 切分（R08 partial），折叠随后失败。
+        for _ in 0..4 {
+            engine
+                .ingest(ContextIngress::AssistantMessage {
+                    content: "x".repeat(700),
+                })
+                .await
+                .unwrap();
+        }
+        let before = engine.diagnostics().await.unwrap();
+        let report = engine
+            .maintain(ContextMaintenanceTrigger::AfterModel)
+            .await
+            .unwrap();
+        assert!(report.transitions.is_empty(), "the fold must fail");
+        let after = engine.diagnostics().await.unwrap();
+        assert_eq!(
+            after.tombstoned_items, before.tombstoned_items,
+            "a failed partial fold must roll back the split record's collapsed increment"
+        );
+    }
+
     /// W04：压缩器调用计数器——一次维护串行调用的次数必须有预算上限。
     struct CountingCompactor(std::sync::atomic::AtomicUsize);
 

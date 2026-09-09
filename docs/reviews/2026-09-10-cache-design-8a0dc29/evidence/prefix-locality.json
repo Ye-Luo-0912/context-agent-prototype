@@ -1,0 +1,149 @@
+{
+  "cases": [
+    {
+      "case": "identical_request_control",
+      "focus_at_tail_counterfactual": {
+        "after_bytes": 5576,
+        "before_bytes": 5576,
+        "common_prefix_bytes": 5576,
+        "same_leading_messages": 7
+      },
+      "production": {
+        "after_bytes": 5576,
+        "before_bytes": 5576,
+        "common_prefix_bytes": 5576,
+        "same_leading_messages": 7
+      },
+      "tools_equal": true
+    },
+    {
+      "case": "progress_only",
+      "focus_at_tail_counterfactual": {
+        "after_bytes": 5648,
+        "before_bytes": 5576,
+        "common_prefix_bytes": 5573,
+        "same_leading_messages": 6
+      },
+      "production": {
+        "after_bytes": 5648,
+        "before_bytes": 5576,
+        "common_prefix_bytes": 309,
+        "same_leading_messages": 2
+      },
+      "tools_equal": true
+    },
+    {
+      "case": "append_exchange_stable_other_layers",
+      "focus_at_tail_counterfactual": {
+        "after_bytes": 6436,
+        "before_bytes": 5576,
+        "common_prefix_bytes": 5512,
+        "same_leading_messages": 6
+      },
+      "production": {
+        "after_bytes": 6436,
+        "before_bytes": 5576,
+        "common_prefix_bytes": 5576,
+        "same_leading_messages": 7
+      },
+      "tools_equal": true
+    },
+    {
+      "case": "append_exchange_and_progress",
+      "focus_at_tail_counterfactual": {
+        "after_bytes": 6508,
+        "before_bytes": 5576,
+        "common_prefix_bytes": 5512,
+        "same_leading_messages": 6
+      },
+      "production": {
+        "after_bytes": 6508,
+        "before_bytes": 5576,
+        "common_prefix_bytes": 309,
+        "same_leading_messages": 2
+      },
+      "tools_equal": true
+    },
+    {
+      "case": "diagnostics_only_same_bodies",
+      "focus_at_tail_counterfactual": {
+        "after_bytes": 5576,
+        "before_bytes": 5576,
+        "common_prefix_bytes": 316,
+        "same_leading_messages": 2
+      },
+      "production": {
+        "after_bytes": 5576,
+        "before_bytes": 5576,
+        "common_prefix_bytes": 389,
+        "same_leading_messages": 3
+      },
+      "tools_equal": true
+    },
+    {
+      "case": "attention_only_same_bodies",
+      "focus_at_tail_counterfactual": {
+        "after_bytes": 5577,
+        "before_bytes": 5576,
+        "common_prefix_bytes": 413,
+        "same_leading_messages": 2
+      },
+      "production": {
+        "after_bytes": 5577,
+        "before_bytes": 5576,
+        "common_prefix_bytes": 486,
+        "same_leading_messages": 3
+      },
+      "tools_equal": true
+    },
+    {
+      "case": "selection_order_only_same_bodies",
+      "focus_at_tail_counterfactual": {
+        "after_bytes": 5576,
+        "before_bytes": 5576,
+        "common_prefix_bytes": 399,
+        "same_leading_messages": 2
+      },
+      "production": {
+        "after_bytes": 5576,
+        "before_bytes": 5576,
+        "common_prefix_bytes": 472,
+        "same_leading_messages": 3
+      },
+      "tools_equal": true
+    },
+    {
+      "case": "rolling_checkpoint_8_to_9",
+      "focus_at_tail_counterfactual": {
+        "after_bytes": 10334,
+        "before_bytes": 10298,
+        "common_prefix_bytes": 4686,
+        "same_leading_messages": 4
+      },
+      "production": {
+        "after_bytes": 10334,
+        "before_bytes": 10298,
+        "common_prefix_bytes": 4759,
+        "same_leading_messages": 5
+      },
+      "tools_equal": true
+    },
+    {
+      "case": "load_tool_changes_schema_and_catalog",
+      "focus_at_tail_counterfactual": {
+        "after_bytes": 5576,
+        "before_bytes": 5709,
+        "common_prefix_bytes": 248,
+        "same_leading_messages": 2
+      },
+      "production": {
+        "after_bytes": 5576,
+        "before_bytes": 5709,
+        "common_prefix_bytes": 267,
+        "same_leading_messages": 2
+      },
+      "tools_equal": false
+    }
+  ],
+  "method": "Production PromptAssembler + ModelInput::into_messages; delimited contract JSON byte LCP. NOT provider tokens, hidden prefix, hit-rate, cost, or behavior equivalence."
+}
