@@ -74,13 +74,13 @@
 | **R03（P1，待执行→A）** | `context-simple/store.rs:1439–1450`：reconcile 因新快照已有 Resident 副本删除 blob，破坏仍受支持的旧快照恢复（restore B → 清理 → restore A → fetch None） | 物理删除检查全部保留者（含仍支持恢复的 checkpoint）的强引用闭包；磁盘保留多份可恢复副本不是缺陷 | 不把「新快照有副本」当旧恢复根可失效 |
 | **R04（P1，待执行→核心线）** | `tool-runtime/supervision.rs:79–91`：锁把单次退避量当总等待量，超时条件永远不可达（两平台持锁 4 秒仍等待） | 区分单次退避与总等待预算 | 不新建监督框架 |
 | **R05（P1，待执行→核心线）** | `tool-runtime/tools/session.rs:81–88,555–561`：session 输出 EOF 被当成退出、poll 无期限等待活进程且不响应取消、持有全表锁 | EOF≠进程退出；poll 有界且响应取消；锁范围收窄 | 不重建 session 工具 |
-| **R06（P1，待执行→B/C）** | `Agent.Client/WorkDto.cs:306,587`：合法 2,001 字符 goal 不能被 .NET snapshot/task detail 接受（scripted wire submit 接受、两次 snapshot fault），后续握手持续失败 | 按共享 C0 契约统一长度口径；两语言验证同界 | 不在 GUI 侧二次截断 |
+| **R06（P1，已落地 2026-09-09 `b2badef`）** | 基线：`Agent.Client/WorkDto.cs:306,587`：合法 2,001 字符 goal 不能被 .NET snapshot/task detail 接受（scripted wire submit 接受、两次 snapshot fault），后续握手持续失败。**已落地：`WorkSnapshotResponse.MaxGoalChars` 从 2,000 对齐宿主 `MAX_SNAPSHOT_GOAL_CHARS` 的 200,000（与 `WorkSubmitRequest` 共享常量）；新增 conformance 测试证明 2,001 字符在 snapshot＋task detail 通过、200,001 仍拒绝。实际检查：dotnet client tests 88/88（含 R06 conformance）** | 按共享 C0 契约统一长度口径；两语言验证同界 | 不在 GUI 侧二次截断 |
 | **R07（P1，待执行→B/C）** | `MainWindowViewModel.cs:736–749,790–795`：并发刷新或已发请求超时清掉未知提交的幂等键；同目标重试变新受理身份 | `Pending(k)→Unknown(k)` 仍保留 k；`Unknown(k)→已受理/已拒绝` 必须有对应 k 的证据 | 不建通用幂等数据库 |
 | **R08（P2，待执行→A）** | `context-baselines/rolling.rs:156–180`：Rolling 仅给压缩器 2,000 字符却移走整批旧记录并宣称覆盖，未读尾部也退出工作集 | 记录压缩器真实消费输入与可恢复残余（移出的正文 ⊆ 已消费输入 ∪ 可恢复残余）；诚实区分覆盖保证与摘要语义 | 摘要质量不在范围；不重开算法研究 |
 | **R09（P2，待执行→A）** | `prompt.rs:556–580`、`materializer.rs:836–850`：同版本不交叠 fs.read 窗口共享 path@revision，历史互补正文被误省略（100 行历史 body 从可见变为只有 descriptor） | 历史区间 ⊆ 同版本当前可见区间并集的集合包含证明 | 不引入向量库或新检索栈 |
 | **R10（P2，待执行→核心线）** | `actor/model.rs:1248–1255,1377`：Schema 过滤仅影响执行快照，实际请求仍向模型展示被移除工具（静态调用链确认，未动态探针） | Ready 声明与执行集合一致 | 不把 ToolSpec 字段当权限 |
 | **R11（P2，待执行→核心线）** | `tool-runtime/tools/session.rs:323,336–341`：session start 早退泄漏 Pending 槽，16 次失败后无进程也不能再启动 | 早退路径归还/释放 Pending 槽 | — |
-| **R12（P2，待执行→核心线）** | `agent-workspace/lib.rs:1437–1443`：after_tx 在同事务 Prepared 处越过游标又返回同 ID 的 Committed，增量读取不前进 | 游标推进以 Committed 可见为准 | — |
+| **R12（P2，已落地 2026-09-09 `b2badef`）** | 基线：`agent-workspace/lib.rs:1437–1443`：after_tx 在同事务 Prepared 处越过游标又返回同 ID 的 Committed，增量读取不前进。**已落地：read_changes 的 after_tx 游标按整事务命名——共享 tx_id 的每一阶段（Prepared/Committed）都排除，仅返回严格更新的记录；新增回归覆盖 cursor-by-newest-commit（返回空）与 cursor-by-Prepared（同事务 Committed 不泄漏）。实际检查：agent-workspace lib 106/106（100 既有＋R12 回归）** | 游标推进以 Committed 可见为准 | — |
 | **R13（P2，待执行→B/C）** | `Agent.Client/ResumableSession.cs:267–281`：事件队列 overflow 后永久 completed；snapshot/底层重连成功也无法恢复新事件 | overflow 后队列可重置或显式重建，重连后新事件可达 | 不承诺无限重放 |
 | **R14（P2，待执行→B/C）** | `MainWindowViewModel.cs:483–494`：每事件 UI.Post 把有界源转成无界 dispatcher backlog，输出上限过晚生效 | 背压有界（丢弃/合并策略显式）；上限在源侧生效 | 不换 GUI 框架 |
 
