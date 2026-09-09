@@ -1376,7 +1376,7 @@ mod tests {
             ">nul 2>&1 ping -n 30 127.0.0.1".into(),
         ];
         #[cfg(not(windows))]
-        let argv = vec![
+        let argv: Vec<String> = vec![
             "sh".into(),
             "-c".into(),
             "exec >/dev/null 2>&1; sleep 30".into(),
