@@ -107,6 +107,14 @@ jobs:
       - name: Cache cargo artifacts
         uses: Swatinem/rust-cache@v2
 
+      # agent-eval fixture/bench tests probe a real Python 3 interpreter
+      # (py -3 / python3 / python) for their deterministic golden runs.
+      # Hosted windows runners can expose a Store alias that hangs the probe
+      # instead of a working interpreter, so install a known-good one.
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
       # A scoped test job selects only its part's crates, so integration
       # tests that spawn sibling binaries (mock_host / broker_host from
       # agent-process) must build them explicitly. The context-service
