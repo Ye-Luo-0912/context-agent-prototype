@@ -25,21 +25,66 @@ fn largest_final_pack_drop_index(
         .map(|(index, _)| index)
 }
 
-fn final_frame_body_key(item: &MaterializedItem) -> Option<String> {
-    let path = item
+fn final_pack_window_covers(candidate: &MaterializedItem, dropped: &MaterializedItem) -> bool {
+    // W02: a remaining copy proves the dropped body is still visible only
+    // under the R09 interval rule — same path and revision, and the
+    // candidate's window contains the dropped record's interval. The old
+    // `path@revision` string match also let two complementary windows of
+    // one revision hide each other (dropping L1–100 while L101–200 stayed
+    // was counted as "still visible").
+    let Some(path) = dropped
         .file_path
         .as_deref()
         .map(str::trim)
-        .filter(|p| !p.is_empty())?;
-    match item
+        .filter(|p| !p.is_empty())
+    else {
+        return false;
+    };
+    let Some(revision) = dropped
         .file_revision
         .as_deref()
         .map(str::trim)
         .filter(|r| !r.is_empty())
-    {
-        Some(revision) => Some(format!("{path}@{revision}")),
-        None => Some(path.to_string()),
+    else {
+        // Without a revision there is no interval truth: no coverage proof.
+        return false;
+    };
+    // A clipped candidate proves nothing about what the request shows.
+    if candidate.partial_body {
+        return false;
     }
+    let window =
+        if let (Some(start), Some(end)) = (candidate.file_start_line, candidate.file_end_line) {
+            agent_contracts::FileBodyWindow {
+                path: path.to_string(),
+                revision: Some(revision.to_string()),
+                start_line: Some(start),
+                end_line: Some(end),
+                covers_file: false,
+            }
+        } else {
+            // No bounds on a non-clipped same-revision body: it carries the
+            // whole file content it ingested.
+            let same_identity = candidate.file_path.as_deref().map(str::trim) == Some(path)
+                && candidate.file_revision.as_deref().map(str::trim) == Some(revision);
+            if !same_identity {
+                return false;
+            }
+            agent_contracts::FileBodyWindow {
+                path: path.to_string(),
+                revision: Some(revision.to_string()),
+                start_line: None,
+                end_line: None,
+                covers_file: true,
+            }
+        };
+    agent_contracts::visible_body_windows_cover(
+        &[window],
+        path,
+        Some(revision),
+        dropped.file_start_line,
+        dropped.file_end_line,
+    )
 }
 
 fn record_final_pack_drop(
@@ -53,14 +98,15 @@ fn record_final_pack_drop(
     // the same body stays in the final frame; recording a
     // `BudgetExcluded` entry for it would misclassify a body that remains
     // visible to the model.
-    let dropped_key = final_frame_body_key(dropped);
     let still_visible = materialized
         .items
         .iter()
         .chain(materialized.foreground.iter())
         .any(|item| {
             item.item_id == dropped.item_id
-                || (dropped_key.is_some() && final_frame_body_key(item) == dropped_key)
+                // The exact same text is on the wire elsewhere in the frame.
+                || item.content == dropped.content
+                || final_pack_window_covers(item, dropped)
         });
     if still_visible {
         return;
@@ -189,14 +235,94 @@ impl RuntimeActor {
                 .await;
         }
 
-        // Copy the immutable round inputs out of ActorState before awaiting.
-        // The actor is serialized, but short borrows also make it impossible
-        // to accidentally publish a partially packed surface into ActiveTurn.
-        let (turn_id, model_round, current_input, turn_frame) = {
+        // Advance the decision-round counter and take the turn id. The
+        // remaining round inputs are re-read by the maintenance continuation
+        // once the fence passes.
+        let turn_id = {
             let Some(turn) = self.state.turn.as_mut() else {
                 return;
             };
             turn.model_round += 1;
+            turn.turn_id
+        };
+
+        // W04: before-model maintenance is a spawned operation, not an
+        // inline await — a long bounded-maintenance pass must not keep the
+        // actor loop from processing cancel_turn. The completion resumes
+        // round preparation after the generation fence; cancellation aborts
+        // the future at its next await point (the engine's fold guard
+        // returns every moved record), and the turn finalizes cancelled.
+        let generation = self.state.generation;
+        let operation_id = OperationId::new();
+        let run_id = self.core.run_id();
+        let task_id = self.state.task_id;
+        let scope_id = self.state.scope_id;
+        {
+            let Some(turn) = self.state.turn.as_mut() else {
+                return;
+            };
+            turn.op = Some(InFlightOp {
+                operation_id,
+                turn_id,
+                generation,
+                kind: OpKind::Maintenance,
+                scope_id: None,
+                tool_identity: None,
+                cancel: CancellationToken::new(),
+                abort: None,
+            });
+        }
+        let context = self.services.context_engine();
+        let op_tx = op_tx.clone();
+        let spawned = tokio::spawn(async move {
+            let report = context
+                .maintain(ContextMaintenanceTrigger::BeforeModel)
+                .await;
+            let _ = op_tx
+                .send(OperationCompletion {
+                    operation: OperationResult {
+                        run_id,
+                        turn_id,
+                        task_id,
+                        scope_id,
+                        operation_id,
+                        generation,
+                        outcome: OperationOutcome::Completed,
+                    },
+                    kind: OpKind::Maintenance,
+                    effect: None,
+                    lease: None,
+                    effect_id: None,
+                    argument_digest: None,
+                    attribution: None,
+                    verification_call: None,
+                    tool_identity: None,
+                    value_completion_pending: false,
+                    recovery_required: None,
+                    directive: None,
+                    disposition: ToolResultDisposition::PersistObservation,
+                    context_ack: None,
+                    maintenance: Some(report),
+                })
+                .await;
+        });
+        if let Some(operation) = self.state.turn.as_mut().and_then(|turn| turn.op.as_mut()) {
+            operation.abort = Some(spawned.abort_handle());
+        }
+    }
+
+    /// Round preparation after before-model maintenance landed (W04): the
+    /// report is in hand, the generation fence has passed, and the tail
+    /// runs to the spawned model operation exactly as the inline path did.
+    pub(super) async fn continue_model_operation_after_maintenance(
+        &mut self,
+        op_tx: &mpsc::Sender<OperationCompletion>,
+        report: AgentResult<ContextMaintenanceReport>,
+    ) {
+        let (turn_id, model_round, current_input, turn_frame) = {
+            let Some(turn) = self.state.turn.as_ref() else {
+                return;
+            };
             (
                 turn.turn_id,
                 turn.model_round,
@@ -204,12 +330,7 @@ impl RuntimeActor {
                 turn.turn_frame.clone(),
             )
         };
-
-        let has_external_context = match self
-            .services
-            .context_maintain(ContextMaintenanceTrigger::BeforeModel)
-            .await
-        {
+        let has_external_context = match report {
             Ok(report) => {
                 let has_external_context =
                     crate::execution::catalog_has_external_context(&report.diagnostics);
@@ -1362,6 +1483,7 @@ impl RuntimeActor {
             scope_id: None,
             tool_identity: None,
             cancel: cancel.clone(),
+            abort: None,
         });
 
         if let Err(error) = self
@@ -1490,6 +1612,7 @@ impl RuntimeActor {
                     directive: None,
                     disposition: ToolResultDisposition::PersistObservation,
                     context_ack: Some(context_ack),
+                    maintenance: None,
                 })
                 .await;
         });
@@ -2043,6 +2166,141 @@ mod failure_class_tests {
             materialized.required_misses.total() + materialized.optional_misses.total(),
             0,
             "no miss entry may be recorded for a body that remains visible"
+        );
+    }
+
+    fn windowed_body(
+        retention: ContextRetention,
+        content: &str,
+        start_line: Option<u32>,
+        end_line: Option<u32>,
+    ) -> MaterializedItem {
+        let mut item = context_item(retention, content);
+        item.file_path = Some("src/main.rs".into());
+        item.file_revision = Some("rev-1".into());
+        item.file_start_line = start_line;
+        item.file_end_line = end_line;
+        item
+    }
+
+    #[test]
+    fn final_pack_complementary_windows_of_one_revision_record_the_required_miss() {
+        // W02 counter-example: two required bodies of one file/revision
+        // with complementary windows. Budget drops the larger (L1–100)
+        // while the smaller (L101–200) remains: the old `path@revision`
+        // string match counted the drop as still visible, so
+        // required_body_present=false coexisted with zero required misses.
+        let large = windowed_body(
+            ContextRetention::Working,
+            &"r".repeat(1_000),
+            Some(1),
+            Some(100),
+        );
+        let small = windowed_body(
+            ContextRetention::Working,
+            "s".repeat(120).as_str(),
+            Some(101),
+            Some(200),
+        );
+        let mut materialized = MaterializedContext {
+            items: vec![large.clone(), small.clone()],
+            required_item_ids: vec![large.item_id, small.item_id],
+            ..Default::default()
+        };
+        let dropped = materialized.items.remove(0);
+        record_final_pack_drop(&mut materialized, &dropped, 9);
+        assert_eq!(
+            materialized.required_misses.total(),
+            1,
+            "the L1–100 window is gone and L101–200 cannot cover it"
+        );
+        assert_eq!(
+            materialized.required_misses.as_slice()[0].identity.item_id,
+            Some(large.item_id)
+        );
+
+        // The mirror case stays correct: dropping the smaller window while
+        // the whole-body copy remains is not a miss.
+        let whole = windowed_body(
+            ContextRetention::Working,
+            "w".repeat(200).as_str(),
+            None,
+            None,
+        );
+        let tail = windowed_body(
+            ContextRetention::Working,
+            "s".repeat(120).as_str(),
+            Some(101),
+            Some(200),
+        );
+        let mut materialized = MaterializedContext {
+            items: vec![whole.clone(), tail],
+            required_item_ids: vec![whole.item_id],
+            ..Default::default()
+        };
+        let dropped = materialized.items.pop().unwrap();
+        record_final_pack_drop(&mut materialized, &dropped, 9);
+        assert_eq!(
+            materialized.required_misses.total(),
+            0,
+            "the whole-body copy of the same revision still covers L101–200"
+        );
+    }
+
+    #[test]
+    fn final_pack_partial_copy_does_not_cover_and_identical_text_does() {
+        // A clipped copy (partial_body) must not stand in for the dropped
+        // body even when its declared window is wide enough.
+        let real = windowed_body(
+            ContextRetention::Working,
+            &"r".repeat(500),
+            Some(1),
+            Some(100),
+        );
+        let mut clipped = windowed_body(
+            ContextRetention::Working,
+            &"r".repeat(80),
+            Some(1),
+            Some(100),
+        );
+        clipped.partial_body = true;
+        let mut materialized = MaterializedContext {
+            items: vec![real.clone(), clipped],
+            required_item_ids: vec![real.item_id],
+            ..Default::default()
+        };
+        let dropped = materialized.items.remove(0);
+        record_final_pack_drop(&mut materialized, &dropped, 9);
+        assert_eq!(
+            materialized.required_misses.total(),
+            1,
+            "a clipped copy is no coverage proof"
+        );
+
+        // Byte-identical text elsewhere in the frame is genuine visibility.
+        let body = windowed_body(
+            ContextRetention::Working,
+            &"r".repeat(500),
+            Some(1),
+            Some(100),
+        );
+        let twin = windowed_body(
+            ContextRetention::Working,
+            &"r".repeat(500),
+            Some(1),
+            Some(100),
+        );
+        let mut materialized = MaterializedContext {
+            items: vec![body.clone(), twin],
+            required_item_ids: vec![body.item_id],
+            ..Default::default()
+        };
+        let dropped = materialized.items.remove(0);
+        record_final_pack_drop(&mut materialized, &dropped, 9);
+        assert_eq!(
+            materialized.required_misses.total(),
+            0,
+            "an identical copy still shows the same text to the model"
         );
     }
 

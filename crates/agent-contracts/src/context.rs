@@ -2307,6 +2307,13 @@ pub struct ContextMaintenanceReport {
     /// Rows omitted from [`Self::compactions`] past the bounded budget.
     #[serde(default)]
     pub compactions_truncated: usize,
+    /// Records still awaiting a fold when this maintain stopped — the pass
+    /// budget was exhausted (or the fold was not possible this pass) while
+    /// the working set still exceeds its threshold. Zero means the pass
+    /// consumed every fold candidate it could form. Deferral is visible
+    /// state, not a silent shortfall: the next maintain continues.
+    #[serde(default)]
+    pub deferred_folds: usize,
 }
 
 /// Why a bounded compaction pass ran.
@@ -2923,6 +2930,36 @@ pub trait ContextEngine: Send + Sync {
         Ok(StorageGcReport::default())
     }
 
+    /// W03: Storage GC under the same retained-root invariant reconcile
+    /// already obeys: `Delete ∩ Reach_strong(CurrentRoots ∪
+    /// RetainedCheckpointRoots) = ∅` holds at every physical deletion
+    /// entry, not only at restore-time cleanup. `protected_recovery_roots`
+    /// are the item ids retained checkpoints still reference;
+    /// `roots_complete` is false when enumerating those checkpoints failed
+    /// (list/read/decode) — an incomplete root set cannot prove there is
+    /// no retained owner, so the pass must defer every deletion instead of
+    /// wrapping a read failure into an empty set. Default runs the plain
+    /// pass only when the root set is known complete and empty; otherwise
+    /// it defers (engines that cannot honor protection must not delete).
+    async fn storage_gc_protecting(
+        &self,
+        protected_recovery_roots: &[ContextItemId],
+        roots_complete: bool,
+    ) -> AgentResult<StorageGcReport> {
+        #[allow(unused_variables)]
+        if roots_complete && protected_recovery_roots.is_empty() {
+            self.storage_gc().await
+        } else {
+            let mut report = StorageGcReport::default();
+            report.reasons.push(
+                "deletion deferred: retained-checkpoint recovery roots are incomplete or \
+                 unprotected by this engine"
+                    .into(),
+            );
+            Ok(report)
+        }
+    }
+
     /// Bring the store back in line with the external map after a crash or
     /// an interrupted IO phase: every formal blob gets exactly one owner
     /// (rebuilt entry or deleted as a stale duplicate of resident content),
@@ -2938,15 +2975,30 @@ pub trait ContextEngine: Send + Sync {
     /// recovery roots that must never be deleted: blobs a still-retained,
     /// still-restorable checkpoint references survive even when the current
     /// view sees the same id as resident (a newer snapshot must not end the
-    /// older checkpoint's restore promise). Default forwards to
-    /// [`Self::reconcile_store`], so engines without recovery roots keep
-    /// working unchanged.
+    /// older checkpoint's restore promise). `roots_complete` is false when
+    /// the retained-checkpoint enumeration failed or was truncated — an
+    /// incomplete root set cannot prove there is no retained owner, so the
+    /// stale-duplicate deletion branch defers instead of treating a read
+    /// failure as "nothing is retained" (W03). Default forwards to
+    /// [`Self::reconcile_store`] only when the root set is known complete
+    /// and empty; otherwise it defers.
     #[allow(unused_variables)]
     async fn reconcile_store_protecting(
         &self,
         protected: &[ContextItemId],
+        roots_complete: bool,
     ) -> AgentResult<StoreReconcileReport> {
-        self.reconcile_store().await
+        if roots_complete && protected.is_empty() {
+            self.reconcile_store().await
+        } else {
+            let mut report = StoreReconcileReport::default();
+            report.reasons.push(
+                "deletion deferred: retained-checkpoint recovery roots are incomplete or \
+                 unprotected by this engine"
+                    .into(),
+            );
+            Ok(report)
+        }
     }
 
     /// The item ids a stored context checkpoint references as external

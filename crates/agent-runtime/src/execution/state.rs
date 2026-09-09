@@ -14,7 +14,13 @@ use agent_contracts::{ToolResultDisposition, TurnFrame, TurnFrameStep};
 
 pub(crate) const MAX_RESUME_FILES: usize = 32;
 pub(super) const MAX_RESUME_FAILURES: usize = 32;
-const MAX_VERIFICATION_FACTS: usize = 8;
+/// W05: a legal task may require one proof per coverage domain (the
+/// contract allows 16), and acceptance receipts resolve against the exact
+/// PASS facts still retained here. The cap therefore matches the contract
+/// maximum, and the eviction below keeps the latest proof per verifier
+/// identity instead of draining the oldest rows blindly.
+pub(super) const MAX_VERIFICATION_FACTS: usize =
+    agent_contracts::MAX_VERIFICATION_COVERAGE_DECLARATIONS;
 pub(super) const MAX_REVALIDATE_PER_ROUND: usize = 8;
 pub(super) const MAX_COVERAGE_PATHS: usize = 8;
 /// Consecutive identical no-progress rounds before the runtime tells the
@@ -2187,8 +2193,56 @@ impl ExecutionState {
             self.checked_files.drain(0..drop);
         }
         if self.verifications.len() > MAX_VERIFICATION_FACTS {
-            let drop = self.verifications.len() - MAX_VERIFICATION_FACTS;
-            self.verifications.drain(0..drop);
+            // W05: acceptance receipts resolve against the exact retained
+            // PASS fact they name (`acceptance_receipt_fact` looks it up by
+            // verifier identity). Draining the oldest rows first let a
+            // repeated same-domain verification evict another domain's
+            // only proof — a legal multi-domain task could then never
+            // cover its criteria. Keep the latest fact per distinct
+            // verifier identity, fill the remaining slots by recency, and
+            // stay at the same bounded cap.
+            let total = self.verifications.len();
+            let mut survivors = vec![false; total];
+            let mut kept = 0usize;
+            let mut seen_identities: Vec<&str> = Vec::new();
+            for (index, fact) in self.verifications.iter().enumerate().rev() {
+                if kept >= MAX_VERIFICATION_FACTS {
+                    break;
+                }
+                if fact.verification_identity.is_empty()
+                    || seen_identities.contains(&fact.verification_identity.as_str())
+                {
+                    continue;
+                }
+                seen_identities.push(&fact.verification_identity);
+                survivors[index] = true;
+                kept += 1;
+            }
+            for index in (0..total).rev() {
+                if kept >= MAX_VERIFICATION_FACTS {
+                    break;
+                }
+                if survivors[index] {
+                    continue;
+                }
+                // Recency fill skips rows whose identity is already kept:
+                // at most one retained proof per verifier identity.
+                let fact = &self.verifications[index];
+                if !fact.verification_identity.is_empty()
+                    && seen_identities.contains(&fact.verification_identity.as_str())
+                {
+                    continue;
+                }
+                survivors[index] = true;
+                kept += 1;
+            }
+            let mut next = Vec::with_capacity(kept);
+            for (index, fact) in self.verifications.drain(..).enumerate() {
+                if survivors[index] {
+                    next.push(fact);
+                }
+            }
+            self.verifications = next;
         }
         if self.failed_commands.len() > MAX_RESUME_FAILURES {
             let overflowed = self.failed_commands.split_off(MAX_RESUME_FAILURES);

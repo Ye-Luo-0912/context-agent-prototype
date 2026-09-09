@@ -222,10 +222,11 @@ impl RuntimeActor {
                 // restore to that older checkpoint may still fetch them.
                 // A failure is surfaced as an observable warning, never used
                 // to roll the committed restore back.
-                let recovery_roots = self.collect_checkpoint_recovery_roots().await;
+                let (recovery_roots, roots_complete) =
+                    self.collect_checkpoint_recovery_roots().await;
                 if let Err(error) = self
                     .services
-                    .context_reconcile_store_protecting(&recovery_roots)
+                    .context_reconcile_store_protecting(&recovery_roots, roots_complete)
                     .await
                 {
                     let _ = self
@@ -250,35 +251,47 @@ impl RuntimeActor {
 
     /// Union the external blobs every still-retained, still-restorable
     /// checkpoint references. These are strong recovery roots for the
-    /// post-restore store reconcile: a blob may back a checkpoint that is
-    /// older than the one just restored, and a later restore to it must
-    /// still fetch the body (R03). Each candidate envelope is decoded and
-    /// validated with the same function restore uses, so an unreadable or
-    /// invalid artifact contributes nothing and can never suppress
-    /// protection for the valid ones. Absent a checkpoint store — or a
-    /// directory error — the empty set is returned (a missing store dir
-    /// reconciles as empty, and there is nothing to protect).
-    async fn collect_checkpoint_recovery_roots(&self) -> Vec<ContextItemId> {
+    /// post-restore store reconcile (R03) and for Storage GC at completion
+    /// boundaries (W03): a blob may back a checkpoint that is older than
+    /// the one just restored, and a later restore to it must still fetch
+    /// the body. Each candidate envelope is decoded and validated with the
+    /// same function restore uses. The boolean reports whether the root
+    /// enumeration is **complete**: a list/read/decode failure, or a
+    /// listing truncated by the row cap, means an unknown owner may still
+    /// exist — callers must defer physical deletion rather than treat the
+    /// failure as "nothing is retained". Absent a checkpoint store the
+    /// empty complete set is returned (a missing store dir reconciles as
+    /// empty, and there is nothing to protect).
+    pub(super) async fn collect_checkpoint_recovery_roots(&self) -> (Vec<ContextItemId>, bool) {
         let Some(store) = self.checkpoint_store() else {
-            return Vec::new();
+            return (Vec::new(), true);
         };
         let Ok(listed) = store.list(MAX_CHECKPOINT_LIST_ROWS).await else {
-            return Vec::new();
+            return (Vec::new(), false);
         };
+        let mut complete = listed.len() < MAX_CHECKPOINT_LIST_ROWS;
         let mut roots: std::collections::HashSet<ContextItemId> = std::collections::HashSet::new();
         for row in listed {
-            let Ok(payload) = store.load_verified(&row.artifact).await else {
-                continue;
+            let payload = match store.load_verified(&row.artifact).await {
+                Ok(payload) => payload,
+                Err(_) => {
+                    complete = false;
+                    continue;
+                }
             };
-            let Ok(checkpoint) = crate::checkpoint::decode_checkpoint_bytes(&payload) else {
-                continue;
+            let checkpoint = match crate::checkpoint::decode_checkpoint_bytes(&payload) {
+                Ok(checkpoint) => checkpoint,
+                Err(_) => {
+                    complete = false;
+                    continue;
+                }
             };
             roots.extend(
                 self.services
                     .context_checkpoint_recovery_item_ids(&checkpoint.context),
             );
         }
-        roots.into_iter().collect()
+        (roots.into_iter().collect(), complete)
     }
 
     /// Reconcile the ACK debts restored with the checkpoint against the

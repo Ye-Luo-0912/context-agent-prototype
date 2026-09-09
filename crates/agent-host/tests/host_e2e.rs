@@ -1111,15 +1111,28 @@ async fn subscribe_delivers_runtime_events(endpoint: LocalEndpoint) -> anyhow::R
     let _ = submitted.task_id;
 
     // Collect the first events with a bounded wait per frame, so a
-    // regression that stops event delivery fails instead of hanging.
+    // regression that stops event delivery fails instead of hanging. The
+    // probe below continues the task, which requires the submitted turn to
+    // have actually ended — wait for its TurnCompleted instead of racing
+    // the turn tail on wall-clock luck (W04 made the in-turn window wider
+    // by moving before-model maintenance onto a spawned operation).
+    let mut saw_turn_completed = false;
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
-    while notifications.len() < 3 {
+    while notifications.len() < 3 || !saw_turn_completed {
         assert!(
             std::time::Instant::now() < deadline,
             "expected runtime event notifications after submit"
         );
         match read_incoming_bounded(&mut stream, NOTIFICATION_BOUND)? {
-            Some(Incoming::Notification(notification)) => notifications.push(*notification),
+            Some(Incoming::Notification(notification)) => {
+                if matches!(
+                    notification.payload.envelope.event,
+                    agent_contracts::RuntimeEvent::TurnCompleted
+                ) {
+                    saw_turn_completed = true;
+                }
+                notifications.push(*notification);
+            }
             Some(Incoming::Response { .. }) => {}
             None => continue,
         }

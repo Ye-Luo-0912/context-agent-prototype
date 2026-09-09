@@ -35,6 +35,12 @@ pub struct RollingConfig {
     /// The newest records covering up to this many tokens stay verbatim;
     /// anything older is a fold candidate.
     pub keep_most_recent_tokens: usize,
+    /// W04: compactor calls one maintain may make serially. Each call has a
+    /// hard-bounded input (`SUMMARIZER_PRIOR_CAP`) and output
+    /// (`COMPACTION_OUTPUT_CHARS`), so this bounds the whole pass; anything
+    /// the threshold still demands is reported as `deferred_folds` and
+    /// consumed by the next maintain instead of one unbounded serial run.
+    pub max_compactor_calls_per_maintain: usize,
 }
 
 impl Default for RollingConfig {
@@ -42,6 +48,7 @@ impl Default for RollingConfig {
         Self {
             summary_threshold_tokens: 9_000,
             keep_most_recent_tokens: 8_000,
+            max_compactor_calls_per_maintain: 4,
         }
     }
 }
@@ -124,6 +131,26 @@ impl RollingSummaryEngine {
     pub fn with_compactor(mut self, compactor: Arc<dyn BoundedCompactor>) -> Self {
         self.compactor = Some(compactor);
         self
+    }
+
+    /// Pure (non-mutating) count of records that a fold would remove from
+    /// the working set right now. Zero means the threshold is satisfied or
+    /// nothing older than the keep-window exists. W04 uses it to report
+    /// deferral when the per-maintain call budget stops the loop early.
+    fn fold_candidates_pending(&self) -> usize {
+        let state = self.state.lock().expect("rolling state poisoned");
+        if state.total_tokens() <= self.config.summary_threshold_tokens {
+            return 0;
+        }
+        let mut kept_tokens = 0usize;
+        let mut fold_candidates = 0usize;
+        for record in state.records.iter().rev() {
+            if kept_tokens >= self.config.keep_most_recent_tokens {
+                fold_candidates += 1;
+            }
+            kept_tokens += approx_tokens(&record.content);
+        }
+        fold_candidates
     }
 
     fn take_fold_job(&self) -> Option<FoldJob> {
@@ -421,13 +448,27 @@ impl ContextEngine for RollingSummaryEngine {
         let mut pass_in = 0u64;
         let mut pass_out = 0u64;
         let mut compactions = Vec::new();
+        // W04: 一次维护最多发起 budget 次压缩器调用。每次调用的输入/输出
+        // 都有硬上限，整个 pass 的模型开销因此有界；阈值仍未满足的残余
+        // 留在工作集，如实报告为 deferred_folds，由下一次维护继续消费。
+        let mut calls = 0usize;
+        let mut deferred_folds = 0usize;
         while let Some(mut job) = self.take_fold_job() {
+            if self.compactor.is_some() && calls >= self.config.max_compactor_calls_per_maintain {
+                deferred_folds = self.fold_candidates_pending();
+                // 预算耗尽：本回合不再发起新的压缩调用，job 丢弃，守卫把
+                // 移出的候选还回工作集（与失败路径同一守卫）。
+                break;
+            }
             let Some(compacted) = self.compact_fold(&job).await else {
                 // 压缩失败：job 在此丢弃，守卫归还记录、旧摘要未被触碰，
                 // 折叠前状态保留。本回合不再重试同一折叠，避免对失败
                 // 压缩器空转。
                 break;
             };
+            if self.compactor.is_some() {
+                calls += 1;
+            }
             pass_in = pass_in.saturating_add(compacted.input_tokens);
             pass_out = pass_out.saturating_add(compacted.output_tokens);
             if compacted.input_tokens > 0 || compacted.output_tokens > 0 {
@@ -481,6 +522,7 @@ impl ContextEngine for RollingSummaryEngine {
             compaction_input_tokens: pass_in,
             compaction_output_tokens: pass_out,
             compactions,
+            deferred_folds,
             ..ContextMaintenanceReport::default()
         })
     }

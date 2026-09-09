@@ -1431,12 +1431,13 @@ impl ContextEngine for SimpleContextEngine {
         // reconcile, so delegate to the protecting variant with an empty
         // set. Components that know the retained-checkpoint references
         // (the runtime after a restore) call `reconcile_store_protecting`.
-        self.reconcile_store_protecting(&[]).await
+        self.reconcile_store_protecting(&[], true).await
     }
 
     async fn reconcile_store_protecting(
         &self,
         protected: &[ContextItemId],
+        roots_complete: bool,
     ) -> AgentResult<StoreReconcileReport> {
         // Same plan/io/commit split as the GC: snapshot the map's owned
         // checksums and the resident ids under the lock, scan + classify
@@ -1480,6 +1481,7 @@ impl ContextEngine for SimpleContextEngine {
             &map_checksums,
             &resident_ids,
             protected,
+            roots_complete,
         )
         .await;
         let mut state = self.state.lock().await;
@@ -2022,6 +2024,17 @@ impl ContextEngine for SimpleContextEngine {
     }
 
     async fn storage_gc(&self) -> AgentResult<agent_contracts::StorageGcReport> {
+        self.storage_gc_protecting(&[], true).await
+    }
+
+    /// W03: the deletion entry honors the same retained-root invariant as
+    /// reconcile — protected recovery roots join the strong-reference set,
+    /// and an incomplete root enumeration defers all deletion.
+    async fn storage_gc_protecting(
+        &self,
+        protected_recovery_roots: &[agent_contracts::ContextItemId],
+        roots_complete: bool,
+    ) -> AgentResult<agent_contracts::StorageGcReport> {
         // Plan under the lock, delete outside it, commit under a fresh
         // lock — the state lock is never held across disk IO. The gate
         // serializes this with GC/reconcile/checkpoint/restore so the
@@ -2031,7 +2044,13 @@ impl ContextEngine for SimpleContextEngine {
             let mut state = self.state.lock().await;
             state.event_seq += 1;
             let now_tick = state.event_seq;
-            store::plan_storage_gc(&state, &self.config, now_tick)
+            store::plan_storage_gc(
+                &state,
+                &self.config,
+                now_tick,
+                protected_recovery_roots,
+                roots_complete,
+            )
         };
         let dir = store::store_dir(&self.config);
         let io = store::run_storage_io(&dir, &plan).await;

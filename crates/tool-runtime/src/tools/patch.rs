@@ -398,7 +398,7 @@ impl Tool for EditPatchTool {
             let mut updated = original.clone();
             let original_line_ending = LineEnding::detect(&original);
             let mut line_endings_normalized = false;
-            for hunk in &file.hunks {
+            for (hunk_index, hunk) in file.hunks.iter().enumerate() {
                 if hunk.old.is_empty() {
                     return Err(AgentError::InvalidRequest(
                         "edit.patch hunk `old` must not be empty".into(),
@@ -431,23 +431,29 @@ impl Tool for EditPatchTool {
                                 ToolFailureClass::AmbiguousMatch,
                                 count,
                                 format!(
-                                    "ambiguous_match: hunk `old` appears {count} times; include enough unchanged context to make the exact anchor unique"
+                                    "ambiguous_match: hunk {hunk_index} `old` appears {count} times; include enough unchanged context to make the exact anchor unique"
                                 ),
                             ),
                             ExactMatchError::NoMatch { count } => (
                                 ToolFailureClass::NoExactMatch,
                                 count,
                                 format!(
-                                    "no_exact_match: hunk `old` appears {count} times after target line-ending normalization. Matching stays exact."
+                                    "no_exact_match: hunk {hunk_index} `old` appears {count} times after target line-ending normalization. Matching stays exact."
                                 ),
                             ),
                         };
+                        // W07: the correction candidate must describe the
+                        // real on-disk revision. `updated` is a hypothetical
+                        // partial patch (earlier hunks applied, nothing
+                        // committed) — quoting it as current text made the
+                        // model quote strings the disk never held. Nothing
+                        // landed, so the original is the truth.
                         return Ok(ToolOutcome::Value(patch_refusal(
                             call_id,
                             class,
                             &relative,
                             current,
-                            &updated,
+                            &original,
                             old.as_ref(),
                             &message,
                             count,
@@ -1767,5 +1773,61 @@ mod tests {
             "revision manifest plus globally bounded echo stays small"
         );
         effect.rollback("test cleanup").await.unwrap();
+    }
+
+    /// W07: when a later hunk fails, the refusal's correction candidate
+    /// must describe the real on-disk revision. `updated` is a hypothetical
+    /// partial patch — nothing was committed — and quoting it as current
+    /// text made the model quote strings the disk never held.
+    #[tokio::test]
+    async fn failed_hunk_refusal_candidates_come_from_disk_not_the_partial_patch() {
+        let dir = tempfile::tempdir().unwrap();
+        let workspace = Workspace::open(dir.path()).await.unwrap();
+        let file = dir.path().join("f.txt");
+        tfs::write(&file, "first line\nsecond line\n")
+            .await
+            .unwrap();
+
+        let tool = EditPatchTool::new(workspace.clone());
+        let run_id = RunId::new();
+        // Hunk 0 applies (hypothetically); hunk 1 then fails to match.
+        let result = tool
+            .execute(
+                run_id,
+                "c",
+                request(
+                    run_id,
+                    json!({
+                        "path": "f.txt",
+                        "hunks": [
+                            {"old": "first line", "new": "NEVER_COMMITTED_VALUE"},
+                            {"old": "no such anchor", "new": "x"}
+                        ]
+                    }),
+                )
+                .call
+                .arguments,
+                None,
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+        let ToolOutcome::Value(output) = result else {
+            panic!("a failed hunk must be a typed refusal");
+        };
+        assert_eq!(output.failure_class(), Some(ToolFailureClass::NoExactMatch));
+        assert!(
+            !output.model_content.contains("NEVER_COMMITTED_VALUE"),
+            "the correction candidate must not quote the hypothetical partial patch: {}",
+            output.model_content
+        );
+        assert!(
+            output.model_content.contains("hunk 1"),
+            "the failing hunk index must be named: {}",
+            output.model_content
+        );
+        // The on-disk truth is unchanged.
+        let disk = std::fs::read_to_string(&file).unwrap();
+        assert_eq!(disk, "first line\nsecond line\n");
     }
 }

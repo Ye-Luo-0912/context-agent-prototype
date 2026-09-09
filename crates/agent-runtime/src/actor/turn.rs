@@ -2850,6 +2850,12 @@ impl RuntimeActor {
             .and_then(|operation| operation.tool_identity.clone());
         if let Some(operation) = self.state.turn.as_ref().and_then(|turn| turn.op.as_ref()) {
             operation.cancel.cancel();
+            // W04: a maintenance operation has no cooperative token inside
+            // the engine; aborting the spawned future is its documented
+            // safe failure — the fold guard returns every moved record.
+            if let Some(abort) = &operation.abort {
+                abort.abort();
+            }
         }
         // A deferred proof refresh belongs to the dying turn: arm its
         // cancellation so the runner's own loop kills and reaps the host

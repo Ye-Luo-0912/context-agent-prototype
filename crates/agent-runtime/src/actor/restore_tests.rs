@@ -16,6 +16,27 @@ use std::sync::{
 };
 use tokio::sync::{mpsc, oneshot};
 
+/// W04: a model round now starts with a spawned maintenance completion.
+/// Process those transparently until the round's real completion has been
+/// handled.
+async fn next_round_completion(
+    actor: &mut RuntimeActor,
+    op_rx: &mut mpsc::Receiver<OperationCompletion>,
+    op_tx: &mpsc::Sender<OperationCompletion>,
+    proof_tx: &mpsc::Sender<turn::DeferredProofRefresh>,
+) {
+    loop {
+        let completion = op_rx.recv().await.unwrap();
+        let maintenance = completion.kind == super::OpKind::Maintenance;
+        actor
+            .on_operation_completed(completion, op_tx, proof_tx)
+            .await;
+        if !maintenance {
+            return;
+        }
+    }
+}
+
 #[derive(Debug)]
 struct TestContext;
 
@@ -756,9 +777,7 @@ async fn operation_cancel_losing_to_a_core_terminal_returns_truth_without_fencin
         )
         .await;
     message_rx.await.unwrap().unwrap();
-    actor
-        .on_operation_completed(op_rx.recv().await.unwrap(), &op_tx, &proof_tx)
-        .await;
+    next_round_completion(&mut actor, &mut op_rx, &op_tx, &proof_tx).await;
     tokio::time::timeout(Duration::from_secs(2), entered.notified())
         .await
         .expect("tool did not enter execution");
@@ -863,9 +882,7 @@ async fn partial_atomic_cancel_wal_failure_fences_actor_and_stays_queryable() {
         )
         .await;
     message_rx.await.unwrap().unwrap();
-    actor
-        .on_operation_completed(op_rx.recv().await.unwrap(), &op_tx, &proof_tx)
-        .await;
+    next_round_completion(&mut actor, &mut op_rx, &op_tx, &proof_tx).await;
     tokio::time::timeout(Duration::from_secs(2), entered.notified())
         .await
         .expect("tool did not enter execution");

@@ -8,6 +8,7 @@ mod effects;
 mod focus;
 mod harness;
 mod input_bounds;
+mod maintenance;
 mod opportunity;
 mod policy;
 mod recovery_surface;

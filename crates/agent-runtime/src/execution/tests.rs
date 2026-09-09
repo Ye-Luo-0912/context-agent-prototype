@@ -2,8 +2,8 @@
 
 use super::state::{
     FRONTIER_ADVISORY_THRESHOLD, MAX_NEGATIVE_FACTS, MAX_OBLIGATIONS, MAX_RESUME_FAILURES,
-    MAX_RESUME_FILES, MAX_REVALIDATE_PER_ROUND, MAX_VERIFICATION_SOURCES, STALL_THRESHOLD,
-    StallState, VerificationCause, VerificationCoverage, VerificationState,
+    MAX_RESUME_FILES, MAX_REVALIDATE_PER_ROUND, MAX_VERIFICATION_FACTS, MAX_VERIFICATION_SOURCES,
+    STALL_THRESHOLD, StallState, VerificationCause, VerificationCoverage, VerificationState,
 };
 use super::*;
 use agent_contracts::{
@@ -2748,4 +2748,78 @@ fn view_stays_a_pure_read_and_never_consumes_the_ledger() {
     let pure = state.view();
     assert!(pure.stall_warning.is_some());
     assert!(!state.stall_advice_emitted);
+}
+
+/// W05: a legal task can require one proof per coverage domain (the
+/// contract allows 16), and acceptance receipts resolve against the exact
+/// retained PASS fact they name. The cap therefore matches the contract
+/// maximum and its eviction keeps the latest proof per verifier identity:
+/// a repeated same-domain verification must not evict another domain's
+/// only retained PASS.
+#[test]
+fn verification_cap_keeps_one_current_proof_per_domain_identity() {
+    let mut resume = ExecutionState::default();
+    fn push_pass(resume: &mut ExecutionState, identity: &str, turn: u64) {
+        resume.verifications.push(super::state::VerificationFact {
+            summary: format!("pass {identity}"),
+            ok: true,
+            turn,
+            anchor_revision: 1,
+            workspace_revision: 1,
+            source_tool_name: "verifier.exec".into(),
+            argument_digest: format!("digest-{identity}"),
+            verification_identity: identity.into(),
+            directive_revision: 1,
+            evidence_ref: None,
+            recipe_provenance: None,
+        });
+    }
+    // Nine distinct domains — beyond the old cap of 8, inside the contract
+    // maximum — must all stay queryable after capping.
+    for domain in 0..9usize {
+        push_pass(&mut resume, &format!("domain-{domain}"), domain as u64);
+    }
+    resume.cap(&mut Vec::new());
+    assert_eq!(
+        resume.verifications.len(),
+        9,
+        "nine distinct domain proofs fit under the contract-sized cap"
+    );
+
+    // Repeat domain-0 until the cap overflows: every other domain's only
+    // proof must survive, and the retained domain-0 row is the newest.
+    for repeat in 0..8u64 {
+        push_pass(&mut resume, "domain-0", 20 + repeat);
+    }
+    assert!(resume.verifications.len() > MAX_VERIFICATION_FACTS);
+    resume.cap(&mut Vec::new());
+    // One proof per identity: the survivors are exactly the nine
+    // distinct identities' newest proofs, bounded below the cap.
+    assert_eq!(resume.verifications.len(), 9);
+    for domain in 0..9usize {
+        let identity = format!("domain-{domain}");
+        assert!(
+            resume
+                .verifications
+                .iter()
+                .any(|fact| fact.verification_identity == identity),
+            "the repeat storm must not evict {identity}'s only proof"
+        );
+    }
+    let domain0: Vec<_> = resume
+        .verifications
+        .iter()
+        .filter(|fact| fact.verification_identity == "domain-0")
+        .collect();
+    assert_eq!(domain0.len(), 1, "one proof per identity");
+    assert_eq!(domain0[0].turn, 27, "the newest proof per identity wins");
+
+    // A real basis change still invalidates exactly as before: the check
+    // definition moved, so the retained proofs stop covering.
+    resume.mark_spec_changed();
+    resume.verification.spec_revision = 2;
+    assert!(
+        resume.view().verifications.is_empty(),
+        "a spec change must still hide the retained proofs"
+    );
 }

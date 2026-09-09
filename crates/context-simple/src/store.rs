@@ -1030,6 +1030,8 @@ pub(crate) fn plan_storage_gc(
     state: &State,
     config: &SimpleContextConfig,
     now_tick: u64,
+    protected_recovery_roots: &[ContextItemId],
+    roots_complete: bool,
 ) -> StorageGcPlan {
     fn non_deletable(entry: &ExternalizedContext) -> bool {
         !entry.semantic.is_dead()
@@ -1051,6 +1053,11 @@ pub(crate) fn plan_storage_gc(
                 .map(|edge| edge.target)
         })
         .collect();
+    // W03: retained checkpoints' recovery roots join the strong-reference
+    // root set at every deletion entry, so a still-restorable checkpoint's
+    // evidence survives task-completion GC exactly as it survives
+    // reconcile. The frontier walk below protects their citation closure.
+    referenced.extend(protected_recovery_roots.iter().copied());
     // Root the retained record itself before walking its citations. In
     // particular, a dead record kept by StorageRequired still owns evidence.
     // A worklist visits each edge once; repeated whole-map scans are quadratic
@@ -1078,42 +1085,50 @@ pub(crate) fn plan_storage_gc(
 
     let mut anchor_roots_protected = 0usize;
     let mut anchor_root_protections = Vec::new();
-    let candidates = state
-        .external
-        .iter()
-        .filter_map(|entry| {
-            // TaskAnchor 的 StorageRequired 声明：活跃任务声称这条证据
-            // 必须永久保留，storage GC 不把它列入候选（任务权威 > TTL）。
-            if let Some(claim) = state.anchor_roots.iter().find(|claim| {
-                claim.strength.requires_storage()
-                    && crate::engine::anchor_claim_matches_entry(claim, entry)
-            }) {
-                anchor_roots_protected += 1;
-                if anchor_root_protections.len() < agent_contracts::MAX_ANCHOR_ROOT_CLAIMS
-                    && !anchor_root_protections.iter().any(
-                        |existing: &agent_contracts::AnchorRootProtection| {
-                            existing.item_ref == claim.item_ref
-                                && existing.source_field_id == claim.source_field_id
-                        },
-                    )
-                {
-                    anchor_root_protections.push(claim.into());
+    // W03: an incomplete root enumeration cannot prove there is no
+    // retained owner — defer every deletion rather than treat read failure
+    // as "nothing is retained".
+    let candidates = if roots_complete {
+        state
+            .external
+            .iter()
+            .filter_map(|entry| {
+                // TaskAnchor 的 StorageRequired 声明：活跃任务声称这条证据
+                // 必须永久保留，storage GC 不把它列入候选（任务权威 > TTL）。
+                if let Some(claim) = state.anchor_roots.iter().find(|claim| {
+                    claim.strength.requires_storage()
+                        && crate::engine::anchor_claim_matches_entry(claim, entry)
+                }) {
+                    anchor_roots_protected += 1;
+                    if anchor_root_protections.len() < agent_contracts::MAX_ANCHOR_ROOT_CLAIMS
+                        && !anchor_root_protections.iter().any(
+                            |existing: &agent_contracts::AnchorRootProtection| {
+                                existing.item_ref == claim.item_ref
+                                    && existing.source_field_id == claim.source_field_id
+                            },
+                        )
+                    {
+                        anchor_root_protections.push(claim.into());
+                    }
+                    return None;
                 }
-                return None;
-            }
-            storage_candidate(
-                entry,
-                now_tick,
-                config.storage_ttl_ticks,
-                referenced.contains(&entry.item_id),
-            )
-            .map(|reason| (entry.item_id, reason))
-        })
-        .collect();
+                storage_candidate(
+                    entry,
+                    now_tick,
+                    config.storage_ttl_ticks,
+                    referenced.contains(&entry.item_id),
+                )
+                .map(|reason| (entry.item_id, reason))
+            })
+            .collect()
+    } else {
+        Vec::new()
+    };
     StorageGcPlan {
         candidates,
         anchor_roots_protected,
         anchor_root_protections,
+        deletion_deferred: !roots_complete,
     }
 }
 
@@ -1124,6 +1139,9 @@ pub(crate) struct StorageGcPlan {
     /// claim protects them.
     pub(crate) anchor_roots_protected: usize,
     pub(crate) anchor_root_protections: Vec<agent_contracts::AnchorRootProtection>,
+    /// W03: the root enumeration was incomplete — the pass deliberately
+    /// deleted nothing and the report must say so.
+    pub(crate) deletion_deferred: bool,
 }
 
 /// Phase 2 (no lock held): remove the planned store files. Real IO errors
@@ -1218,6 +1236,12 @@ pub(crate) fn commit_storage_gc(
     report.scanned = state.external.len() + report.deleted;
     report.anchor_roots_protected = plan.anchor_roots_protected;
     report.anchor_root_protections = plan.anchor_root_protections;
+    // W03: an incomplete retained-root enumeration deferred every deletion.
+    if plan.deletion_deferred {
+        report
+            .reasons
+            .push("deletion deferred: retained-checkpoint recovery roots are incomplete".into());
+    }
     // Explainable reason rows are a bounded collector; the typed counters
     // above remain the authoritative totals.
     report.reasons_truncated =
@@ -1234,7 +1258,7 @@ pub(crate) fn run_storage_gc(
     config: &SimpleContextConfig,
     now_tick: u64,
 ) -> StorageGcReport {
-    let plan = plan_storage_gc(state, config, now_tick);
+    let plan = plan_storage_gc(state, config, now_tick, &[], true);
     let dir = store_dir(config);
     let io = plan
         .candidates
@@ -1316,7 +1340,7 @@ pub(crate) async fn run_reconcile_io(
     map_checksums: &HashMap<ContextItemId, Option<String>>,
     resident_ids: &HashSet<ContextItemId>,
 ) -> ReconcileIo {
-    run_reconcile_io_protecting(dir, map_checksums, resident_ids, &[]).await
+    run_reconcile_io_protecting(dir, map_checksums, resident_ids, &[], true).await
 }
 
 /// Phase 2 of the reconcile (no lock held): scan the store directory, read
@@ -1334,6 +1358,7 @@ pub(crate) async fn run_reconcile_io_protecting(
     map_checksums: &HashMap<ContextItemId, Option<String>>,
     resident_ids: &HashSet<ContextItemId>,
     protected: &[ContextItemId],
+    roots_complete: bool,
 ) -> ReconcileIo {
     let protected: HashSet<ContextItemId> = protected.iter().copied().collect();
     let mut io = ReconcileIo::default();
@@ -1478,7 +1503,10 @@ pub(crate) async fn run_reconcile_io_protecting(
             // still-retained checkpoint's restore (R03), so it is kept even
             // though the current view made the id resident.
             None => {
-                if resident_ids.contains(&item_id) && !protected.contains(&item_id) {
+                if resident_ids.contains(&item_id)
+                    && !protected.contains(&item_id)
+                    && roots_complete
+                {
                     match tokio::fs::remove_file(&path).await {
                         Ok(()) => {
                             io.deleted_stale += 1;
@@ -1491,6 +1519,10 @@ pub(crate) async fn run_reconcile_io_protecting(
                                 .push(format!("could not remove stale blob {name}: {e}"));
                         }
                     }
+                } else if resident_ids.contains(&item_id) && !roots_complete {
+                    io.reasons.push(format!(
+                        "kept blob {name}: root enumeration incomplete, deletion deferred (W03)"
+                    ));
                 } else if resident_ids.contains(&item_id) {
                     io.reasons.push(format!(
                         "kept blob {name}: id is resident but a retained checkpoint still references it as a recovery root"
@@ -2328,7 +2360,8 @@ mod tests {
         let resident: HashSet<_> = [id].into_iter().collect();
         let protected = [id];
         let io =
-            run_reconcile_io_protecting(dir.path(), &HashMap::new(), &resident, &protected).await;
+            run_reconcile_io_protecting(dir.path(), &HashMap::new(), &resident, &protected, true)
+                .await;
         let report = commit_reconcile(&mut state, io, 1, 1);
         assert_eq!(
             report.deleted_stale, 0,
@@ -2813,7 +2846,7 @@ mod tests {
         }
 
         let now_tick = 100;
-        let plan = plan_storage_gc(&state, &config, now_tick);
+        let plan = plan_storage_gc(&state, &config, now_tick, &[], true);
         let planned: HashSet<ContextItemId> = plan.candidates.iter().map(|(id, _)| *id).collect();
 
         // The manual closure's complement: dead, retention-eligible, old and

@@ -382,7 +382,15 @@ impl RuntimeActor {
         // 完成边界前推送根声明投影：StorageRequired 的声明会让 storage GC
         // 保留其指向的 store 条目（已完成任务的证据留存由声明决定）。
         self.push_gc_projections(true).await;
-        match self.services.context_storage_gc().await {
+        // W03: 删除入口与 reconcile 共用保留根——仍被保留 checkpoint 引用
+        // 的 external blob 是强恢复根；根枚举不完整时本 pass 不删除任何
+        // 条目（读失败不能被包装成「没有保留者」），延期留给下一个边界。
+        let (recovery_roots, roots_complete) = self.collect_checkpoint_recovery_roots().await;
+        match self
+            .services
+            .context_storage_gc_protecting(&recovery_roots, roots_complete)
+            .await
+        {
             Ok(report) => {
                 if let Err(error) = self
                     .core

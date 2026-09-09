@@ -632,6 +632,7 @@ fn named_engine(
             let rolling = RollingSummaryEngine::with_config(RollingConfig {
                 summary_threshold_tokens: 200,
                 keep_most_recent_tokens: 100,
+                ..Default::default()
             });
             let rolling = match live_model.clone() {
                 Some(model) => rolling
@@ -2166,6 +2167,7 @@ mod tests {
         let rolling = RollingSummaryEngine::with_config(RollingConfig {
             summary_threshold_tokens: 20,
             keep_most_recent_tokens: 5,
+            ..Default::default()
         })
         .with_compactor(Arc::new(ScriptedCompactor));
         for turn in 0..20 {

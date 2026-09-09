@@ -206,7 +206,7 @@ async fn reconcile_protects_an_older_checkpoints_blob_after_restore() {
         "A's checkpoint must name the external body as a recovery root"
     );
     let report = engine
-        .reconcile_store_protecting(&recovery_roots)
+        .reconcile_store_protecting(&recovery_roots, true)
         .await
         .unwrap();
     assert_eq!(
@@ -1474,4 +1474,89 @@ async fn completed_task_summary_leaves_the_resident_heap_but_stays_durable() {
         in_buffer || in_store,
         "the durable summary must stay recallable from the buffer or the store"
     );
+}
+
+/// W03 regression, engine level: the completion-boundary deletion pass
+/// honors the same retained-root invariant the post-restore reconcile
+/// already obeys. The audit probe sequence is:
+///
+/// 1. a deletable external entry (semantically dead, Working retention,
+///    TTL expired) with a real blob on disk;
+/// 2. `storage_gc_protecting(&[root], true)` — the retained checkpoint's
+///    recovery root is a strong root, so the blob survives;
+/// 3. `storage_gc_protecting(&[], false)` — an incomplete root enumeration
+///    cannot prove there is no retained owner, so every deletion is
+///    deferred and the report says so;
+/// 4. `storage_gc_protecting(&[], true)` — the control pass (nothing
+///    retained) deletes exactly as before.
+#[tokio::test]
+async fn completion_boundary_storage_gc_honors_retained_checkpoint_roots() {
+    let dir = tempfile::tempdir().unwrap();
+    let engine = SimpleContextEngine::new(SimpleContextConfig {
+        gc_buffer_capacity: 1,
+        storage_ttl_ticks: 1,
+        context_store_dir: Some(dir.path().to_path_buf()),
+        ..SimpleContextConfig::default()
+    });
+    let seed_dead = |state: &mut crate::engine::State, tick: u64| {
+        let mut item = crate::item::make_item(
+            state,
+            &engine.config,
+            "retired evidence blob".into(),
+            ContextKind::Note,
+            ContextScope::Task,
+            ContextRetention::Working,
+            0.4,
+            None,
+        );
+        item.id = ContextItemId::new();
+        item.semantic = SemanticState::VerifiedFixed { by: None };
+        let reference = crate::store::externalize(dir.path(), &item).unwrap();
+        state.external.push(crate::store::to_external_entry(
+            &item, reference, tick, 1, None,
+        ));
+        item.id
+    };
+    let (first, second) = {
+        let mut state = engine.state.lock().await;
+        let first = seed_dead(&mut state, 0);
+        let second = seed_dead(&mut state, 1);
+        (first, second)
+    };
+    let blob = |id: ContextItemId| dir.path().join(format!("{id}.json"));
+    assert!(blob(first).exists() && blob(second).exists());
+
+    // Step 2: the retained checkpoint's recovery root keeps the blob.
+    let protected = engine.storage_gc_protecting(&[first], true).await.unwrap();
+    assert_eq!(
+        protected.deleted, 0,
+        "a recovery root must survive the completion-boundary pass: {protected:?}"
+    );
+    assert!(
+        blob(first).exists(),
+        "the retained checkpoint's blob survives"
+    );
+
+    // Step 3: incomplete roots defer every deletion, with a visible reason.
+    let deferred = engine.storage_gc_protecting(&[], false).await.unwrap();
+    assert_eq!(
+        deferred.deleted, 0,
+        "an incomplete root enumeration must defer deletion: {deferred:?}"
+    );
+    assert!(
+        deferred
+            .reasons
+            .iter()
+            .any(|reason| reason.contains("deferred")),
+        "the deferral must be observable in the report: {deferred:?}"
+    );
+    assert!(blob(first).exists() && blob(second).exists());
+
+    // Step 4: control — nothing retained, the plain deletion profile holds.
+    let control = engine.storage_gc_protecting(&[], true).await.unwrap();
+    assert!(
+        control.deleted >= 2,
+        "with no retained roots the deletions proceed: {control:?}"
+    );
+    assert!(!blob(first).exists() && !blob(second).exists());
 }

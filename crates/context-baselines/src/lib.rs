@@ -220,6 +220,7 @@ mod tests {
         let engine = RollingSummaryEngine::with_config(RollingConfig {
             summary_threshold_tokens: 60,
             keep_most_recent_tokens: 20,
+            ..Default::default()
         });
         for turn in 0..20 {
             run_turn(&engine, &format!("turn {turn}"), 1).await;
@@ -276,6 +277,7 @@ mod tests {
         let engine = RollingSummaryEngine::with_config(RollingConfig {
             summary_threshold_tokens: 60,
             keep_most_recent_tokens: 20,
+            ..Default::default()
         })
         .with_compactor(Arc::new(EchoCompactor));
         for turn in 0..20 {
@@ -337,6 +339,7 @@ mod tests {
         let engine = RollingSummaryEngine::with_config(RollingConfig {
             summary_threshold_tokens: 60,
             keep_most_recent_tokens: 20,
+            ..Default::default()
         })
         .with_compactor(Arc::new(EmptyCompactor));
         for turn in 0..20 {
@@ -402,6 +405,7 @@ mod tests {
         let engine = RollingSummaryEngine::with_config(RollingConfig {
             summary_threshold_tokens: 30,
             keep_most_recent_tokens: 4,
+            ..Default::default()
         })
         .with_compactor(Arc::new(EchoCompactor));
 
@@ -476,6 +480,7 @@ mod tests {
         let engine = RollingSummaryEngine::with_config(RollingConfig {
             summary_threshold_tokens: 1,
             keep_most_recent_tokens: 0,
+            ..Default::default()
         })
         .with_compactor(Arc::new(EchoCompactor));
         let big = |tag: &str| format!("{tag}_") + &"x".repeat(COMPACTION_SOURCE_CHARS + 4000);
@@ -545,6 +550,7 @@ mod tests {
         let engine = RollingSummaryEngine::with_config(RollingConfig {
             summary_threshold_tokens: 1,
             keep_most_recent_tokens: 0,
+            ..Default::default()
         })
         .with_compactor(Arc::new(EchoCompactor));
         // 一条小记录 + 一条超限大记录：小记录折叠，大记录保留。
@@ -613,6 +619,7 @@ mod tests {
         let engine = RollingSummaryEngine::with_config(RollingConfig {
             summary_threshold_tokens: 30,
             keep_most_recent_tokens: 4,
+            ..Default::default()
         })
         .with_compactor(Arc::new(FailingCompactor));
         for index in 0..10 {
@@ -653,6 +660,85 @@ mod tests {
         );
     }
 
+    /// W04：压缩器调用计数器——一次维护串行调用的次数必须有预算上限。
+    struct CountingCompactor(std::sync::atomic::AtomicUsize);
+
+    #[async_trait::async_trait]
+    impl BoundedCompactor for CountingCompactor {
+        async fn compact(
+            &self,
+            request: CompactionRequest,
+        ) -> agent_contracts::AgentResult<CompactionOutput> {
+            self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(CompactionOutput {
+                text: format!(
+                    "[summary of {}]",
+                    request.source.chars().take(24).collect::<String>()
+                ),
+                input_tokens: 10,
+                output_tokens: 4,
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn maintain_bounds_serial_compactor_calls_and_reports_the_deferred_rest() {
+        let counting = Arc::new(CountingCompactor(std::sync::atomic::AtomicUsize::new(0)));
+        let engine = RollingSummaryEngine::with_config(RollingConfig {
+            summary_threshold_tokens: 30,
+            keep_most_recent_tokens: 4,
+            max_compactor_calls_per_maintain: 2,
+        })
+        .with_compactor(Arc::clone(&counting) as Arc<dyn BoundedCompactor>);
+        for index in 0..30 {
+            engine
+                .ingest(ContextIngress::AssistantMessage {
+                    content: format!("history record {index}: {}", "x".repeat(500)),
+                })
+                .await
+                .unwrap();
+        }
+        let first = engine
+            .maintain(ContextMaintenanceTrigger::AfterModel)
+            .await
+            .unwrap();
+        assert_eq!(
+            counting.0.load(std::sync::atomic::Ordering::SeqCst),
+            2,
+            "one maintain must not exceed the configured call budget"
+        );
+        assert!(
+            first.deferred_folds > 0,
+            "a budget-limited pass must honestly report the deferred remainder"
+        );
+        // 延期不是丢失：下一次维护继续消费同一批候选。
+        let second = engine
+            .maintain(ContextMaintenanceTrigger::AfterModel)
+            .await
+            .unwrap();
+        assert_eq!(
+            counting.0.load(std::sync::atomic::Ordering::SeqCst),
+            4,
+            "the next maintain continues the deferred folds"
+        );
+        assert!(second.deferred_folds > 0 || second.archived > 0);
+        // 持续维护最终收敛：阈值满足后不再有延期。
+        let mut settled = second;
+        for _ in 0..20 {
+            if settled.deferred_folds == 0 {
+                break;
+            }
+            settled = engine
+                .maintain(ContextMaintenanceTrigger::AfterModel)
+                .await
+                .unwrap();
+        }
+        assert_eq!(
+            settled.deferred_folds, 0,
+            "repeated bounded maintains must eventually satisfy the threshold"
+        );
+    }
+
     struct GatedCompactor {
         entered: Arc<tokio::sync::Notify>,
     }
@@ -676,6 +762,7 @@ mod tests {
         let engine = RollingSummaryEngine::with_config(RollingConfig {
             summary_threshold_tokens: 30,
             keep_most_recent_tokens: 4,
+            ..Default::default()
         })
         .with_compactor(Arc::new(GatedCompactor {
             entered: Arc::clone(&entered),
@@ -844,6 +931,7 @@ mod tests {
         let rolling = RollingSummaryEngine::with_config(RollingConfig {
             summary_threshold_tokens: 60,
             keep_most_recent_tokens: 20,
+            ..Default::default()
         });
         for turn in 0..10 {
             run_turn(&rolling, &format!("turn {turn}"), 1).await;
@@ -853,6 +941,7 @@ mod tests {
         let fresh_rolling = RollingSummaryEngine::with_config(RollingConfig {
             summary_threshold_tokens: 60,
             keep_most_recent_tokens: 20,
+            ..Default::default()
         });
         fresh_rolling.restore(data).await.unwrap();
         let diagnostics_after = fresh_rolling.diagnostics().await.unwrap();

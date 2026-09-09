@@ -210,6 +210,11 @@ mod discovery_tests {
 enum OpKind {
     Model,
     Tool,
+    /// W04: before-model context maintenance runs as a spawned operation so
+    /// the actor loop keeps processing commands while it awaits the engine;
+    /// cancellation aborts the future at its next await point and the
+    /// engine's fold guard returns every moved record.
+    Maintenance,
 }
 
 const TOOL_SCOPE_CLOSE_TIMEOUT: Duration = Duration::from_secs(2);
@@ -230,6 +235,10 @@ struct InFlightOp {
     /// Model operations do not use the tool-operation registry.
     tool_identity: Option<ToolOperationIdentity>,
     cancel: CancellationToken,
+    /// Hard abort for spawned operations whose engine path has no
+    /// cooperative token (W04 maintenance). Dropping the future is the
+    /// engine-documented safe failure: the fold guard returns records.
+    abort: Option<tokio::task::AbortHandle>,
 }
 
 /// Bounded retries of a structurally empty provider completion (empty
@@ -1157,6 +1166,10 @@ pub(crate) struct OperationCompletion {
     /// Committed only after a non-stale successful ModelOutput; tool,
     /// failed and cancelled operations carry/commit none.
     context_ack: Option<ContextConsumptionAck>,
+    /// W04: the engine's maintenance report (or its failure) for a
+    /// `OpKind::Maintenance` completion. Round preparation resumes from it
+    /// after the generation fence passes.
+    maintenance: Option<AgentResult<agent_contracts::ContextMaintenanceReport>>,
 }
 
 /// Actor-side restore data that cannot be published until the host has

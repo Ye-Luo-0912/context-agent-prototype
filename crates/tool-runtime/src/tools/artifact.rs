@@ -17,12 +17,20 @@ use agent_workspace::Workspace;
 use async_trait::async_trait;
 use serde::Deserialize;
 use serde_json::{Value, json};
-use tokio::io::AsyncReadExt;
+use tokio::io::{AsyncBufReadExt, AsyncReadExt};
 
 use super::Tool;
 
-const MAX_READ_BYTES: u64 = 2 * 1024 * 1024;
+/// Captured window cap: at most this many artifact bytes are returned per
+/// call regardless of the line range.
+const MAX_READ_BYTES: usize = 2 * 1024 * 1024;
 const MAX_READ_LINES: usize = 400;
+/// Per-call scan budget (W06). Producers cap captured logs at 8 MiB, so
+/// every legally produced artifact is fully reachable; the scan streams —
+/// it never materializes the file. A file beyond this budget is readable
+/// in its earlier parts, and the report marks the totals as incomplete
+/// instead of refusing the read.
+const MAX_SCAN_BYTES: u64 = 8 * 1024 * 1024;
 
 pub struct ArtifactReadTool {
     workspace: Workspace,
@@ -99,35 +107,68 @@ impl Tool for ArtifactReadTool {
             .await?;
         let display_path = confined.display().to_path_buf();
 
-        // Bounded read: artifacts may be append-only logs that grow between
-        // a metadata probe and the read, so cap the read itself and refuse
-        // anything larger than the bound instead of trusting a size check.
+        // W06: stream the artifact line by line under a hard scan budget
+        // instead of pre-reading the whole file. Any line range of a
+        // legally produced artifact (producers cap captured output at
+        // 8 MiB) is reachable; a byte-capped capture bounds the returned
+        // window itself. Nothing trusts a size probe, and the report says
+        // when the totals stopped at the scan budget.
         let file = confined.into_tokio();
-        let mut bytes = Vec::new();
-        file.take(MAX_READ_BYTES + 1)
-            .read_to_end(&mut bytes)
-            .await
-            .map_err(|e| AgentError::Io(format!("read artifact: {e}")))?;
-        if bytes.len() as u64 > MAX_READ_BYTES {
-            return Err(AgentError::InvalidRequest(format!(
-                "artifact is {} bytes; larger artifacts cannot be read in full (use a narrower range or a specialized tool)",
-                bytes.len()
-            )));
+        let mut reader = tokio::io::BufReader::new(file.take(MAX_SCAN_BYTES));
+        let mut captured = String::new();
+        let mut captured_bytes = 0usize;
+        let mut captured_truncated = false;
+        let mut line_bytes = Vec::new();
+        let mut scanned_bytes = 0u64;
+        let mut counted_lines = 0usize;
+        loop {
+            line_bytes.clear();
+            let read = reader
+                .read_until(b'\n', &mut line_bytes)
+                .await
+                .map_err(|e| AgentError::Io(format!("read artifact: {e}")))?;
+            if read == 0 {
+                break; // end of file (or of the scan budget)
+            }
+            scanned_bytes += read as u64;
+            counted_lines += 1;
+            if counted_lines >= args.start_line && counted_lines <= args.end_line {
+                let room = MAX_READ_BYTES.saturating_sub(captured_bytes);
+                if line_bytes.len() <= room {
+                    captured_bytes += line_bytes.len();
+                    captured.push_str(&String::from_utf8_lossy(&line_bytes));
+                } else {
+                    // Artifacts can carry non-UTF-8 bytes (process logs);
+                    // the window itself is shown lossily and capped.
+                    captured.push_str(&String::from_utf8_lossy(&line_bytes[..room]));
+                    captured_truncated = true;
+                }
+            }
         }
-        // Artifacts can carry non-UTF-8 bytes (process logs); show them
-        // lossily rather than failing the whole read.
-        let text = String::from_utf8_lossy(&bytes);
-        let lines: Vec<&str> = text.lines().collect();
-        let start = args.start_line.saturating_sub(1).min(lines.len());
-        let end = args.end_line.min(lines.len());
-        let selected = lines[start..end]
+        // `take` returns 0 reads both at true EOF and at the scan budget;
+        // remaining budget distinguishes them.
+        let scan_complete = reader.get_ref().limit() > 0;
+        // The captured text is exactly the requested window (from
+        // start_line), so the render is window-relative.
+        let lines: Vec<&str> = captured.lines().collect();
+        let selected = lines
             .iter()
             .enumerate()
-            .map(|(offset, line)| format!("{:>6} | {}", start + offset + 1, line))
+            .map(|(offset, line)| format!("{:>6} | {}", args.start_line + offset, line))
             .collect::<Vec<_>>()
             .join("\n");
-        let has_more = end < lines.len();
-        let next_start_line = if has_more { end + 1 } else { end };
+        let has_more = if scan_complete {
+            args.end_line < counted_lines
+        } else {
+            // The totals stopped at the scan budget: a further page may
+            // still exist and the cursor must not claim the file ended.
+            true
+        };
+        let next_start_line = if has_more {
+            args.end_line + 1
+        } else {
+            args.end_line
+        };
 
         Ok(ToolOutcome::Value(
             ToolOutput {
@@ -135,11 +176,21 @@ impl Tool for ArtifactReadTool {
                 tool_name: "artifact.read".into(),
                 ok: true,
                 summary: format!(
-                    "read lines {}-{} of {} ({} lines total)",
-                    start + 1,
-                    end,
+                    "read lines {}-{} of {} ({} lines total{}{})",
+                    args.start_line,
+                    args.start_line + lines.len().saturating_sub(1),
                     display_relative(&self.workspace, &display_path),
-                    lines.len()
+                    counted_lines,
+                    if scan_complete {
+                        String::new()
+                    } else {
+                        format!("; scan stopped at the {MAX_SCAN_BYTES}-byte per-call budget, totals are incomplete")
+                    },
+                    if captured_truncated {
+                        "; window truncated at the per-call capture cap".to_string()
+                    } else {
+                        String::new()
+                    },
                 ),
                 model_content: if selected.is_empty() {
                     "no lines in range".to_string()
@@ -148,11 +199,13 @@ impl Tool for ArtifactReadTool {
                 },
                 artifact_ref: Some(args.reference),
                 metadata: json!({
-                    "total_lines": lines.len(),
-                    "bytes": bytes.len(),
-                    "returned": end - start,
+                    "total_lines": counted_lines,
+                    "total_lines_complete": scan_complete,
+                    "bytes": scanned_bytes,
+                    "returned": lines.len(),
                     "has_more": has_more,
                     "next_start_line": next_start_line,
+                    "window_truncated": captured_truncated,
                 }),
             }
             .with_native_execution_facts(super::builtin_bound(false)),
@@ -363,5 +416,77 @@ mod tests {
             output.is_err(),
             "artifact refs are scoped to their owning run"
         );
+    }
+
+    /// W06: a legally produced large artifact (producers cap captured
+    /// output at 8 MiB) must keep a bounded line-range recovery path. The
+    /// old implementation pre-read 2 MiB and refused the whole call, so
+    /// even the first lines of a 3 MB log were unreachable.
+    #[tokio::test]
+    async fn large_artifact_line_ranges_stay_reachable() {
+        let dir = tempfile::tempdir().unwrap();
+        let workspace = Workspace::open(dir.path()).await.unwrap();
+        let run_id = RunId::new();
+        // 3,000,000 bytes, one 100-byte line each, exactly 30,000 lines.
+        let line = format!("{}\n", "l".repeat(99));
+        let repeats = 3_000_000usize / line.len();
+        let body = line.repeat(repeats);
+        assert!(body.len() >= 3_000_000);
+        let reference = workspace
+            .write_artifact(run_id, "process", "log", body.as_bytes())
+            .await
+            .unwrap();
+        let tool = ArtifactReadTool::new(workspace);
+
+        // The first page of a 3 MB artifact.
+        let output = value(
+            tool.execute(
+                run_id,
+                "c",
+                request(run_id, json!({"reference": reference}))
+                    .call
+                    .arguments,
+                None,
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap(),
+        );
+        assert!(
+            output.ok,
+            "the first page must not be refused by size: {output:?}"
+        );
+        assert!(output.model_content.contains("     1 | "));
+        assert_eq!(output.metadata["total_lines"], repeats);
+        assert_eq!(output.metadata["total_lines_complete"], true);
+        assert_eq!(output.metadata["has_more"], true);
+
+        // A deep range past the old 2 MiB pre-read limit.
+        let deep_start = 25_000usize;
+        let output = value(
+            tool.execute(
+                run_id,
+                "c",
+                request(
+                    run_id,
+                    json!({"reference": reference, "start_line": deep_start, "end_line": deep_start + 10}),
+                )
+                .call
+                .arguments,
+                None,
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap(),
+        );
+        assert!(output.ok, "a deep range must be reachable: {output:?}");
+        assert!(
+            output
+                .model_content
+                .contains(&format!("{deep_start:>6} | ")),
+            "the requested line numbers must appear: {}",
+            output.model_content
+        );
+        assert_eq!(output.metadata["next_start_line"], deep_start + 11);
     }
 }

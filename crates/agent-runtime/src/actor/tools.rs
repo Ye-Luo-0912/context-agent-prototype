@@ -598,6 +598,7 @@ impl RuntimeActor {
             scope_id: tool_scope,
             tool_identity: Some(identity.clone()),
             cancel: cancel.clone(),
+            abort: None,
         });
         let permit = match self
             .core
@@ -739,6 +740,7 @@ impl RuntimeActor {
                     directive,
                     disposition,
                     context_ack: None,
+                    maintenance: None,
                 })
                 .await;
         });
@@ -865,6 +867,7 @@ impl RuntimeActor {
                     match completion.kind {
                         OpKind::Model => "model",
                         OpKind::Tool => "tool",
+                        OpKind::Maintenance => "maintenance",
                     },
                     completion.operation.turn_id,
                     completion.operation.generation
@@ -920,6 +923,7 @@ impl RuntimeActor {
                 match completion.kind {
                     OpKind::Model => "model",
                     OpKind::Tool => "tool",
+                    OpKind::Maintenance => "maintenance",
                 },
                 completion.operation.turn_id,
                 completion.operation.generation
@@ -934,6 +938,17 @@ impl RuntimeActor {
         let context_ack = completion.context_ack;
         if let Some(turn) = self.state.turn.as_mut() {
             turn.op = None;
+        }
+        // W04: a maintenance completion resumes round preparation instead of
+        // settling the turn. Stale completions (cancelled/superseded turn)
+        // already returned above; the actor stays single-orchestrator.
+        if completion.kind == OpKind::Maintenance {
+            let report = completion
+                .maintenance
+                .expect("a maintenance completion carries its engine report");
+            self.continue_model_operation_after_maintenance(op_tx, report)
+                .await;
+            return;
         }
         match completion.operation.outcome {
             OperationOutcome::ModelOutput {

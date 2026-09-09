@@ -107,12 +107,12 @@
 
 | 建议顺序 | 切片 | 用户能获得什么 | 状态 |
 |---|---|---|---|
-| 1 | **W01** 继续/恢复仍遵守完整原始指令（TaskRecord 当前指令身份＋InputEnvelope 引用；2,000 字符只用于展示） | 继续任务时指令尾部约束不再丢失 | **已落地（2026-09-10）**：TaskDirective 保留 sealed input 引用/inline body，继续先过 durability gate 再按原 run 认证读取；legacy 恰在旧上限拒绝；checkpoint 验证；agent-replay 不再用 preview 冒充正文。回归 `tests/turn/directive.rs` 4 项（完整指令三次请求逐字可达、inline 组成、artifact 缺失拒绝、legacy 上限拒绝）。实际检查：agent-runtime turn 119＋lib 373＋actor 74、agent-replay 59、host_restore 3、fmt、clippy 全绿；CI 全量待 run 记录 |
-| 2 | **W04+W08** 长维护可取消、失败后原文仍在（维护预算＋取消身份；summary_completed/unavailable 区分） | 132 次串行压缩调用变为有界可取消；模型失败不再把 fallback 当成功退役正文 | 待执行 |
-| 3 | **W02** 最终 packing 复用 R09 范围覆盖（required 移除即 miss） | 缺必需正文时不会被告知证据齐备 | 待执行 |
-| 4 | **W03** 全部 Storage GC 删除入口共享保留根（含根集合完整性） | 保留的旧快照持续有可恢复正文 | 待执行 |
-| 5 | **W05** 当前验收证明优先保留（9 域合法任务可收敛） | 合法多域验收能结束，重复检查不挤掉必要证明 | 待执行 |
-| 6 | **W06/W07** 两个小切片：artifact.read 大工件可达读取；patch 纠错候选取真实磁盘内容 | 大输出能按需查看；纠错依据真实内容 | 待执行 |
+| 1 | **W01** 继续/恢复仍遵守完整原始指令（TaskRecord 当前指令身份＋InputEnvelope 引用；2,000 字符只用于展示） | 继续任务时指令尾部约束不再丢失 | **已落地并推送（2026-09-10，`38b133a`）**：TaskDirective 保留 sealed input 引用/inline body，继续先过 durability gate 再按原 run 认证读取；legacy 恰在旧上限拒绝；checkpoint 验证；agent-replay 不再用 preview 冒充正文。回归 `tests/turn/directive.rs` 4 项（完整指令三次请求逐字可达、inline 组成、artifact 缺失拒绝、legacy 上限拒绝）。实际检查：agent-runtime turn 119＋lib 373＋actor 74、agent-replay 59、host_restore 3、fmt、clippy 全绿；CI 全量待 run 记录 |
+| 2 | **W04+W08** 长维护可取消、失败后原文仍在（维护预算＋取消身份；summary_completed/unavailable 区分） | 132 次串行压缩调用变为有界可取消；模型失败不再把 fallback 当成功退役正文 | **已落地（2026-09-10，本批）**：RollingConfig 调用数预算（默认 4）＋`deferred_folds` 如实延期；BeforeModel 维护改为 spawned 可取消 op（abort=引擎安全失败，FoldRestore 归还记录），cancel_turn 阻塞维护中拿到类型化回执；compactor 错误/空回复传播为 Err，源正文不退役。回归：预算/延期/收敛（context-baselines）、门控取消（turn/maintenance.rs）、失败保留源（agent-compose 引擎级） |
+| 3 | **W02** 最终 packing 复用 R09 范围覆盖（required 移除即 miss） | 缺必需正文时不会被告知证据齐备 | **已落地（2026-09-10，本批）**：`record_final_pack_drop` 改用 `visible_body_windows_cover`——互补区间删除即 required miss、整文副本/相同正文不误报、partial 不构成覆盖。回归含报告反例 |
+| 4 | **W03** 全部 Storage GC 删除入口共享保留根（含根集合完整性） | 保留的旧快照持续有可恢复正文 | **已落地（2026-09-10，本批）**：`storage_gc_protecting(roots, complete)`＋`reconcile_store_protecting` 同签名扩展；根枚举失败/截断置 incomplete → 删除分支延期并报告；完成边界 GC 经 `context_storage_gc_protecting` 传入保留根。回归：引擎级完整序列（保护存活/延期可见/对照删除） |
+| 5 | **W05** 当前验收证明优先保留（9 域合法任务可收敛） | 合法多域验收能结束，重复检查不挤掉必要证明 | **已落地（2026-09-10，本批）**：`MAX_VERIFICATION_FACTS` 对齐契约 16 域；cap 淘汰改为「每 identity 保留最新一条」，同域重复不再挤掉其他域；basis 变更失效规则不变。回归：9 域全保留＋重复风暴＋spec 变更失效 |
+| 6 | **W06/W07** 两个小切片：artifact.read 大工件可达读取；patch 纠错候选取真实磁盘内容 | 大输出能按需查看；纠错依据真实内容 | **已落地（2026-09-10，本批）**：artifact.read 改流式按行扫描（8 MiB 扫描预算＋2 MiB 捕获上限，`total_lines_complete`/`window_truncated` 诚实标记，3 MB 工件首页与第 25,000 行均可达）；patch 失败候选取磁盘原文＋失败 hunk 序号，永不引用未提交中间态 |
 | 7 | 三类真实仓库任务衡量（跨模块修改/多域验收/长输出＋中断恢复） | 成本与交互性有实测记录 | 条件性：具备真实 provider 条件才运行，否则明确 NOT_RUN |
 
 **用户结果：**继续不丢指令、维护可取消且失败不退役正文、证据缺失诚实可见、旧快照可恢复、合法验收能收敛、大输出可查看、纠错有真实依据。

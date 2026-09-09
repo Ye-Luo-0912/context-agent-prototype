@@ -470,6 +470,13 @@ impl RuntimeServices {
     /// provider may take time to observe cancellation, so the detached task
     /// must not retain the complete service bundle (and, through it, tool or
     /// workspace authority) after the actor has shut down.
+    /// W04: clone of the engine lane for the spawned before-model
+    /// maintenance operation. Engines are `Send + Sync` and serialize their
+    /// own state; only the Arc moves into the spawned task.
+    pub(crate) fn context_engine(&self) -> Arc<dyn ContextEngine> {
+        Arc::clone(&self.context)
+    }
+
     pub(crate) fn model_transport(&self) -> Arc<dyn ModelTransport> {
         self.model.clone()
     }
@@ -526,18 +533,32 @@ impl RuntimeServices {
     /// permanently deleted). The runtime schedules it only at explicit
     /// boundaries — task completion, checkpoint — never on the per-model
     /// hot path.
-    pub(crate) async fn context_storage_gc(&self) -> AgentResult<StorageGcReport> {
-        self.context.storage_gc().await
+    /// W03: Storage GC under the shared retained-root invariant — the
+    /// same protected recovery roots reconcile honors also guard the
+    /// completion-boundary deletion pass.
+    pub(crate) async fn context_storage_gc_protecting(
+        &self,
+        protected_recovery_roots: &[ContextItemId],
+        roots_complete: bool,
+    ) -> AgentResult<StorageGcReport> {
+        self.context
+            .storage_gc_protecting(protected_recovery_roots, roots_complete)
+            .await
     }
 
     /// Reconcile the store while keeping `protected` ids' blobs alive:
     /// item ids still referenced by retained, restorable checkpoints must
     /// survive even when a newer snapshot made the id resident (R03).
+    /// `roots_complete` is false when that enumeration failed — the same
+    /// W03 invariant as Storage GC: an unknown owner defers deletion.
     pub(crate) async fn context_reconcile_store_protecting(
         &self,
         protected: &[ContextItemId],
+        roots_complete: bool,
     ) -> AgentResult<StoreReconcileReport> {
-        self.context.reconcile_store_protecting(protected).await
+        self.context
+            .reconcile_store_protecting(protected, roots_complete)
+            .await
     }
 
     /// The external item ids one stored context checkpoint references —
