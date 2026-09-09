@@ -144,21 +144,41 @@ impl RollingSummaryEngine {
         }
         // ROLLING-PRIOR：下次折叠输入 = 旧摘要（先入，保证在字符上限内
         // 保留）＋ 本次移出的最旧记录。旧摘要是更早折叠的唯一残余，截掉
-        // 它等于无声丢弃已折叠历史；新记录超限截断与既有行为一致。
+        // 它等于无声丢弃已折叠历史。
+        //
+        // R08：压缩器的输入容量（SUMMARIZER_PRIOR_CAP）只够装下旧摘要
+        // 加最前面的若干条旧记录。诚实消费 = 只折叠能**完整**进入输入
+        // 条目的记录——它们全部被压缩器读到，覆盖声明与输入一致；装不
+        // 下的旧记录留在 working set（仍是可见/可恢复残余），绝不带着
+        // "未读也退出工作集"的覆盖声明移出。全部装不下（例如单条超限）
+        // 则本次不折，避免"宣称覆盖却没消费"。
         let mut prior = String::new();
         if let Some(summary) = &state.summary {
             prior.push_str(&summary.content);
             prior.push('\n');
         }
         let merged_prior_summary = state.summary.is_some();
-        let mut folded_records = Vec::with_capacity(fold_candidates);
-        let mut transitions = Vec::new();
-        for _ in 0..fold_candidates {
-            let record = state.records.remove(0);
-            if prior.chars().count() < SUMMARIZER_PRIOR_CAP {
-                prior.push_str(&record.content);
-                prior.push('\n');
+        let prior_chars = prior.chars().count();
+        let mut consumed = 0usize;
+        let mut input_chars = prior_chars;
+        for record in state.records.iter().take(fold_candidates) {
+            let chars = record.content.chars().count() + 1;
+            if input_chars.saturating_add(chars) > SUMMARIZER_PRIOR_CAP {
+                break; // 装不下的记录留在工作集，下轮或按引用恢复
             }
+            input_chars = input_chars.saturating_add(chars);
+            consumed += 1;
+        }
+        if consumed == 0 {
+            // 最旧记录本身超过输入容量：无法诚实折叠，保留工作集。
+            return None;
+        }
+        let mut folded_records = Vec::with_capacity(consumed);
+        let mut transitions = Vec::new();
+        for _ in 0..consumed {
+            let record = state.records.remove(0);
+            prior.push_str(&record.content);
+            prior.push('\n');
             state.collapsed += 1;
             folded_records.push(record.clone());
             transitions.push(ContextStateTransition {
@@ -168,7 +188,9 @@ impl RollingSummaryEngine {
                 from: AttentionState::Active,
                 to: AttentionState::Archived,
                 turn: state.turn,
-                reason: "collapsed into rolling summary (baseline B)".into(),
+                reason:
+                    "collapsed into rolling summary (baseline B, fully consumed by the compactor)"
+                        .into(),
             });
         }
         let summary_id = state
@@ -179,14 +201,14 @@ impl RollingSummaryEngine {
         Some(FoldJob {
             prior: bound_compaction_source(&prior),
             collapsed: state.collapsed,
-            folded_now: fold_candidates,
+            folded_now: consumed,
             merged_prior_summary,
             summary_id,
             transitions,
             restore: FoldRestore {
                 state: Arc::clone(&self.state),
                 records: folded_records,
-                collapsed_delta: fold_candidates,
+                collapsed_delta: consumed,
                 armed: true,
             },
         })
@@ -264,11 +286,18 @@ struct FoldJob {
 }
 
 /// 摘要的来源覆盖记录：它合并了哪些输入（本次折叠记录＋是否有旧摘要）。
+/// R08：这里的 `folded_now` 是**实际完整进入压缩输入并退役**的记录数
+/// （`F ⊆ I`）；未进入输入容量、仍留在 working set 的记录不算覆盖——
+/// 覆盖声明绝不超出压缩器真正消费的范围。
 fn summary_source(folded_now: usize, merged_prior_summary: bool) -> String {
     if merged_prior_summary {
-        format!("rolling summary (covers {folded_now} folded records + prior summary)")
+        format!(
+            "rolling summary (covers {folded_now} consumed records + prior summary; records beyond the compactor input capacity stay in the working set)"
+        )
     } else {
-        format!("rolling summary (covers {folded_now} folded records)")
+        format!(
+            "rolling summary (covers {folded_now} consumed records; records beyond the compactor input capacity stay in the working set)"
+        )
     }
 }
 

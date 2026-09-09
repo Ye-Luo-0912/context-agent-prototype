@@ -21,9 +21,9 @@ pub use rolling::{RollingConfig, RollingSummaryEngine, SUMMARIZER_PRIOR_CAP};
 mod tests {
     use super::*;
     use agent_contracts::{
-        BoundedCompactor, CompactionOutput, CompactionRequest, ContextEngine, ContextHints,
-        ContextIngress, ContextKind, ContextMaintenanceTrigger, ContextQuery, FocusState,
-        MaterializedContext, MaterializedItem, TaskId, ToolOutput,
+        BoundedCompactor, COMPACTION_SOURCE_CHARS, CompactionOutput, CompactionRequest,
+        ContextEngine, ContextHints, ContextIngress, ContextKind, ContextMaintenanceTrigger,
+        ContextQuery, FocusState, MaterializedContext, MaterializedItem, TaskId, ToolOutput,
     };
     use serde_json::json;
     use std::sync::Arc;
@@ -460,6 +460,140 @@ mod tests {
                 .contains("prior summary"),
             "source coverage must record the merge: {:?}",
             third.source
+        );
+    }
+
+    /// R08：压缩器输入容量装不下的记录绝不带「覆盖」声明移出——它们留在
+    /// working set 作为可恢复残余，下一轮还能再折叠；覆盖声明只数实际
+    /// 完整进入输入的记录。旧行为把整批 fold 候选移出却只给压缩器
+    /// 2,000 字符，未读尾部悄悄退出工作集。
+    #[tokio::test]
+    async fn records_beyond_the_compactor_input_capacity_stay_in_the_working_set() {
+        // 压缩器输入上限是 COMPACTION_SOURCE_CHARS；构造：旧摘要 + 两条
+        // 远大于上限的记录。旧代码两条都折叠（声称覆盖 2 条），但压缩器
+        // 只看到前缀；新代码第一条装不下时整条保留。
+        let engine = RollingSummaryEngine::with_config(RollingConfig {
+            summary_threshold_tokens: 1,
+            keep_most_recent_tokens: 0,
+        })
+        .with_compactor(Arc::new(EchoCompactor));
+        let big = |tag: &str| format!("{tag}_") + &"x".repeat(COMPACTION_SOURCE_CHARS + 4000);
+        engine
+            .ingest(ContextIngress::AssistantMessage {
+                content: big("old_huge"),
+            })
+            .await
+            .unwrap();
+        engine
+            .ingest(ContextIngress::AssistantMessage {
+                content: big("new_huge"),
+            })
+            .await
+            .unwrap();
+        engine
+            .maintain(ContextMaintenanceTrigger::Checkpoint)
+            .await
+            .unwrap();
+
+        // 任何单条记录都超过输入容量：本次不折叠，两条记录全部保留在
+        // working set，绝不能消失。
+        let materialized = engine
+            .materialize(ContextQuery {
+                current_input: "next".into(),
+                budget_tokens: 1_000_000,
+                hints: ContextHints::default(),
+            })
+            .await
+            .unwrap();
+        let contents: Vec<String> = materialized
+            .items
+            .iter()
+            .map(|item| item.content.clone())
+            .collect();
+        assert!(
+            contents
+                .iter()
+                .any(|content| content.starts_with("old_huge_")),
+            "the over-cap old record must stay in the working set: {contents:?}"
+        );
+        assert!(
+            contents
+                .iter()
+                .any(|content| content.starts_with("new_huge_")),
+            "the over-cap new record must stay in the working set: {contents:?}"
+        );
+        assert!(
+            materialized
+                .items
+                .iter()
+                .all(|item| item.kind != ContextKind::Summary),
+            "no summary may claim coverage the compactor never read: {contents:?}"
+        );
+    }
+
+    /// R08：部分超限时只折叠能完整进入输入的最旧记录，其余留下；覆盖
+    /// 声明准确等于实际消费数。
+    #[tokio::test]
+    async fn fold_consumes_only_records_that_fit_the_input_capacity() {
+        let engine = RollingSummaryEngine::with_config(RollingConfig {
+            summary_threshold_tokens: 1,
+            keep_most_recent_tokens: 0,
+        })
+        .with_compactor(Arc::new(EchoCompactor));
+        // 一条小记录 + 一条超限大记录：小记录折叠，大记录保留。
+        engine
+            .ingest(ContextIngress::AssistantMessage {
+                content: "small_kept_marker".into(),
+            })
+            .await
+            .unwrap();
+        let big = "huge_tail_".to_owned() + &"y".repeat(COMPACTION_SOURCE_CHARS + 4000);
+        engine
+            .ingest(ContextIngress::AssistantMessage { content: big })
+            .await
+            .unwrap();
+        engine
+            .maintain(ContextMaintenanceTrigger::Checkpoint)
+            .await
+            .unwrap();
+
+        let materialized = engine
+            .materialize(ContextQuery {
+                current_input: "next".into(),
+                budget_tokens: 1_000_000,
+                hints: ContextHints::default(),
+            })
+            .await
+            .unwrap();
+        let summaries: Vec<String> = materialized
+            .items
+            .iter()
+            .filter(|item| item.kind == ContextKind::Summary)
+            .map(|item| item.content.clone())
+            .collect();
+        let leftover: Vec<String> = materialized
+            .items
+            .iter()
+            .filter(|item| item.kind != ContextKind::Summary)
+            .map(|item| item.content.clone())
+            .collect();
+        assert!(
+            summaries
+                .iter()
+                .any(|content| content.contains("small_kept_marker")),
+            "a record that fits the input capacity is consumed into the summary: {summaries:?}"
+        );
+        assert!(
+            leftover
+                .iter()
+                .any(|content| content.starts_with("huge_tail_")),
+            "the over-cap record stays recoverable in the working set: {leftover:?}"
+        );
+        assert!(
+            summaries
+                .iter()
+                .all(|content| !content.contains("huge_tail_")),
+            "the over-cap record must never appear as covered by the summary: {summaries:?}"
         );
     }
 
