@@ -653,6 +653,102 @@ public class EventStreamTests
             await session.DisposeAsync();
         }
     }
+
+    /// <summary>R13: a session-level queue overflow completes the current event
+    /// stream (a monotonic terminal generation), but the session itself is NOT
+    /// dead. A successful reconnect REBUILDS a fresh live stream, so a consumer
+    /// re-reading <see cref="ResumableSession.Events"/> after the resync
+    /// receives new events again — a "connected but events never arrive again"
+    /// half-recovered session must not be the outcome.</summary>
+    [Fact]
+    public async Task Overflowed_session_rebuilds_its_event_stream_on_reconnect_and_delivers_new_events()
+    {
+        await using var host = new ScriptedEventHost();
+        var dropFirst = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        host.Script = async (ordinal, stream, cancellationToken) =>
+        {
+            await AnswerHandshakeAsync(stream, cancellationToken);
+            if (ordinal == 0)
+            {
+                // Overflow connection: three DURABLE notifications, each with a
+                // gap so the connection's own (source) queue drains between
+                // sends — ONLY the session-level queue (capacity 2) overflows.
+                for (ulong i = 0; i < 3; i++)
+                {
+                    await WriteFrameAsync(
+                        stream, NotificationFrame(100 + i, "{\"type\":\"task_completed\"}"), cancellationToken);
+                    await Task.Delay(50, cancellationToken);
+                }
+                // Answer the query that installed this connection, then park
+                // until the drill drops the socket to trigger the reconnect.
+                await AnswerOneRequestAsync(stream, SnapshotPayload, cancellationToken);
+                await dropFirst.Task.WaitAsync(cancellationToken);
+            }
+            else
+            {
+                // Reconnect connection: announce ONE new durable event, then
+                // serve the reconnect query's snapshot.
+                await WriteFrameAsync(stream, NotificationFrame(200, "{\"type\":\"run_started\"}"), cancellationToken);
+                while (!cancellationToken.IsCancellationRequested)
+                {
+                    await AnswerOneRequestAsync(stream, SnapshotPayload, cancellationToken);
+                }
+            }
+        };
+
+        var session = new ResumableSession(
+            () => ConnectAsync(host.Port),
+            new AgentConnectionOptions { NotificationCapacity = 2 });
+        try
+        {
+            var initial = await session.SnapshotAsync().WaitAsync(TimeSpan.FromSeconds(10));
+            Assert.Equal(41ul, initial.Watermark);
+
+            // The (now overflown) session stream is the pre-reconnect generation.
+            var reader0 = session.Events;
+            // Drain the two durable events that fit under the capacity-2 session
+            // queue; the 3rd durable arrival overflows it, completing the stream
+            // with the honest reason (observed once the backlog is drained).
+            Assert.Equal(100ul, (await ReadEventAsync(reader0, TimeSpan.FromSeconds(10))).Envelope.Seq);
+            Assert.Equal(101ul, (await ReadEventAsync(reader0, TimeSpan.FromSeconds(10))).Envelope.Seq);
+            var overflow = await Assert.ThrowsAsync<AgentContractViolationException>(async () =>
+            {
+                var wait = reader0.WaitToReadAsync(CancellationToken.None).AsTask();
+                await wait.WaitAsync(TimeSpan.FromSeconds(10));
+            });
+            Assert.StartsWith("invalid work.event.queue", overflow.Message);
+            // Being able to refresh does not mean events are reachable: the
+            // connection itself is still live, only the current stream is done.
+            Assert.True(session.IsConnected);
+
+            // The reconnect is driven by the next query once the dead
+            // connection is dropped; wait for the loss to be observed, then
+            // rebuild from the fresh snapshot (which REBUILDS the event stream).
+            dropFirst.TrySetResult();
+            var deadline = DateTimeOffset.UtcNow + TimeSpan.FromSeconds(10);
+            while (session.IsConnected)
+            {
+                Assert.True(DateTimeOffset.UtcNow < deadline, "the dropped connection never faulted");
+                await Task.Delay(20);
+            }
+            var rebuilt = await session.SnapshotAsync().WaitAsync(TimeSpan.FromSeconds(10));
+            Assert.Equal(41ul, rebuilt.Watermark);
+            Assert.Equal(2, host.ConnectionsAccepted);
+
+            // A consumer re-reading Events sees the NEW generation — the
+            // reconnect's event is delivered (the old, closed stream is not).
+            var reader1 = session.Events;
+            var fresh = await ReadEventAsync(reader1, TimeSpan.FromSeconds(10));
+            Assert.Equal("run_started", fresh.EventType);
+            Assert.Equal(200ul, fresh.Envelope.Seq);
+            Assert.False(reader0.TryRead(out _)); // the old generation stays closed
+            Assert.True(session.IsConnected);
+        }
+        finally
+        {
+            await session.DisposeAsync();
+        }
+    }
 }
 
 /// <summary>The queue's class-aware overflow policy, drilled directly.</summary>

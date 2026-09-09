@@ -191,6 +191,19 @@ public sealed class MainWindowViewModel : ObservableObject, IAsyncDisposable
     private DeltaCoalescer? _deltaCoalescer;
     private Task? _eventPump;
 
+    /// <summary>R14: explicit bounds on the pump→UI handoff, applied at the
+    /// SOURCE. At most one drain callback is ever posted to the dispatcher,
+    /// and the batched delta text is capped by the output budget, so a
+    /// slow/paused UI holds a bounded backlog — never one callback per
+    /// arrival.</summary>
+    private const int MaxPendingUiItems = 64;
+    private const int MaxPendingDeltaChars = MaxOutputBytes;
+
+    private readonly object _handoffGate = new();
+    private List<(IAgentConnection Connection, WorkEventNotification Item)> _pendingUiEvents = new();
+    private StringBuilder _pendingUiDelta = new();
+    private bool _uiDrainPosted;
+
     /// <summary>F13: connection era. Every await that ends in ApplySnapshot
     /// captures the era it started under; a result from a previous era (or a
     /// disconnected one) is dropped, never applied.</summary>
@@ -215,6 +228,13 @@ public sealed class MainWindowViewModel : ObservableObject, IAsyncDisposable
     /// NEW admission, not an idempotent re-read.</summary>
     private string? _outstandingSubmitId;
     private string? _outstandingSubmitGoal;
+
+    /// <summary>R07: true while the outstanding submit is still awaiting its
+    /// receipt (Pending); false once the receipt is lost or unknown, so a
+    /// snapshot may resolve the key from facts. A PENDING submit must never
+    /// be cleared by a concurrent refresh — that is what keeps a same-goal
+    /// retry on the SAME client_request_id instead of a new admission.</summary>
+    private bool _outstandingSubmitAwaitingReceipt;
 
     /// <summary>Connection-loss observations for the CURRENT connection
     /// era (UI-thread confined). Zeroed on every successful rebuild and
@@ -500,6 +520,11 @@ public sealed class MainWindowViewModel : ObservableObject, IAsyncDisposable
     /// receipt rendering, follow-up refresh).</summary>
     internal Task SubmitForTestsAsync() => SubmitAsync();
 
+    /// <summary>R07 drill observation: the client_request_id currently held
+    /// outstanding (unchanged while Pending and after a lost receipt, so a
+    /// same-goal retry stays on the same admission identity).</summary>
+    internal string? OutstandingSubmitIdForTests => _outstandingSubmitId;
+
     /// <summary>Integration drill seam: the real approval-answer path.</summary>
     internal Task RespondApprovalForTestsAsync(string requestId, ApprovalDecision decision) =>
         RespondApprovalAsync(requestId, decision);
@@ -523,6 +548,20 @@ public sealed class MainWindowViewModel : ObservableObject, IAsyncDisposable
     /// <summary>Bound drill seam: writes through the same bounded output
     /// path the events and receipts use.</summary>
     internal void AppendOutputForTests(string line) => AppendOutput(line);
+
+    /// <summary>R14 drill observation: pending delta chars awaiting the UI,
+    /// capped at the source by the output budget.</summary>
+    internal int PendingUiDeltaCharsForTests
+    {
+        get { lock (_handoffGate) { return _pendingUiDelta.Length; } }
+    }
+
+    /// <summary>R14 drill observation: whether one bounded UI drain is posted
+    /// (single-flight — at most one pending callback exists at a time).</summary>
+    internal bool PendingUiDrainPostedForTests
+    {
+        get { lock (_handoffGate) { return _uiDrainPosted; } }
+    }
 
     private void AppendOutput(string line)
     {
@@ -591,6 +630,15 @@ public sealed class MainWindowViewModel : ObservableObject, IAsyncDisposable
             _reconnectFailures = 0; // a successful rebuild ends the loss streak
             BannerText = "已从快照重建（重连）。挂起的审批以服务器快照为准，不会自动通过。";
             ApplySnapshot(snapshot);
+            // R13: a session-level overflow completed the previous event stream;
+            // this reconnect rebuilt it. If the earlier pump had ended (overflow
+            // or stream fault), restart it on the rebuilt stream so new events
+            // reach the UI again — the bounded drain keeps at most one callback
+            // in flight regardless.
+            if (_eventPump is { IsCompleted: true })
+            {
+                StartEventPump(session);
+            }
         });
         session.ConnectionLost += failure => _ui.Post(() =>
         {
@@ -643,8 +691,12 @@ public sealed class MainWindowViewModel : ObservableObject, IAsyncDisposable
     /// pump only renders and refreshes, it never drops facts.</summary>
     private void StartEventPump(IAgentConnection connection)
     {
+        _deltaCoalescer?.Dispose();
+        // R14: the coalescer's flush feeds the SINGLE bounded UI drain (below)
+        // instead of a fresh Post per flush, so a stalled UI cannot build an
+        // unbounded callback backlog over time.
         _deltaCoalescer = new DeltaCoalescer(
-            text => _ui.Post(() => AppendOutput(text)),
+            EnqueueDeltaForUi,
             flushCharBudget: 256);
         _eventPump = Task.Run(() => PumpEventsAsync(connection, _lifetime.Token));
     }
@@ -661,9 +713,7 @@ public sealed class MainWindowViewModel : ObservableObject, IAsyncDisposable
                     {
                         return;
                     }
-                    // UI mutations happen on the UI thread, in stream order.
-                    var captured = notification;
-                    _ui.Post(() => HandleEvent(connection, captured));
+                    RelayToUi(connection, notification);
                 }
             }
         }
@@ -675,6 +725,119 @@ public sealed class MainWindowViewModel : ObservableObject, IAsyncDisposable
         {
             _ui.Post(() => AppendOutput(
                 $"事件流结束：{failure.Message}。请从快照重建；挂起的审批不会自动通过。"));
+        }
+    }
+
+    /// <summary>
+    /// R14: the BOUNDED handoff from the event pump to the UI thread. A
+    /// notification never posts one callback of its own: deltas accumulate in
+    /// the coalescer and every other event lands in a small pending batch, and
+    /// at most ONE drain callback is posted to the dispatcher at a time. A
+    /// stalled UI therefore holds a bounded backlog (one callback + a text
+    /// buffer capped by the output budget at the source) — never one callback
+    /// per arrival. Durable events schedule the already single-flight
+    /// coalesced snapshot refresh HERE, so a render dropped under backpressure
+    /// never loses state: recovery is the snapshot, not a status line.
+    /// </summary>
+    private void RelayToUi(IAgentConnection connection, WorkEventNotification notification)
+    {
+        if (!notification.IsLiveOnlyProgress)
+        {
+            // State is recovered by the snapshot, decoupled from the render.
+            ScheduleSnapshotRefresh();
+        }
+        if (notification.EventType == "model_delta")
+        {
+            if (TryEventString(notification.Envelope.Event, "delta", out var delta) && delta.Length > 0)
+            {
+                _deltaCoalescer?.Append(delta);
+            }
+            return;
+        }
+        lock (_handoffGate)
+        {
+            if (_pendingUiEvents.Count >= MaxPendingUiItems)
+            {
+                // Explicit bound: shed the OLDEST pending render (superseded);
+                // its durable state was already queued for the snapshot refresh.
+                _pendingUiEvents.RemoveAt(0);
+            }
+            _pendingUiEvents.Add((connection, notification));
+            if (!_uiDrainPosted)
+            {
+                _uiDrainPosted = true;
+                _ui.Post(DrainPendingUiEvents);
+            }
+        }
+    }
+
+    /// <summary>R14: the coalescer's flush feeds the SAME single-flight drain
+    /// instead of a fresh per-flush Post, and the pending delta text is capped
+    /// at the source by the output budget — a paused UI accumulates at most
+    /// <see cref="MaxPendingDeltaChars"/> of text (drop-oldest) behind one
+    /// pending callback.</summary>
+    private void EnqueueDeltaForUi(string text)
+    {
+        if (text.Length == 0)
+        {
+            return;
+        }
+        lock (_handoffGate)
+        {
+            _pendingUiDelta.Append(text);
+            if (_pendingUiDelta.Length > MaxPendingDeltaChars)
+            {
+                // Source cap: keep the newest text in budget (progress is
+                // newest-wins by contract); the oldest delta is shed here,
+                // before it ever queued for the UI.
+                _pendingUiDelta.Remove(0, _pendingUiDelta.Length - MaxPendingDeltaChars);
+            }
+            if (!_uiDrainPosted)
+            {
+                _uiDrainPosted = true;
+                _ui.Post(DrainPendingUiEvents);
+            }
+        }
+    }
+
+    /// <summary>
+    /// R14: the single UI-side drain. Runs on the UI thread in stream order;
+    /// flushes pending delta text through the existing bounded
+    /// <see cref="AppendOutput"/> and renders each pending event, then
+    /// re-posts only if new work arrived while draining (otherwise it clears
+    /// the posted flag). At most one such callback exists at a time.
+    /// </summary>
+    private void DrainPendingUiEvents()
+    {
+        string deltaText;
+        List<(IAgentConnection Connection, WorkEventNotification Item)> batch;
+        lock (_handoffGate)
+        {
+            deltaText = _pendingUiDelta.ToString();
+            _pendingUiDelta = new StringBuilder();
+            batch = _pendingUiEvents;
+            _pendingUiEvents = new List<(IAgentConnection Connection, WorkEventNotification Item)>();
+        }
+        if (deltaText.Length > 0)
+        {
+            AppendOutput(deltaText);
+        }
+        foreach (var (connection, notification) in batch)
+        {
+            HandleEvent(connection, notification);
+        }
+        lock (_handoffGate)
+        {
+            if (_pendingUiDelta.Length > 0 || _pendingUiEvents.Count > 0)
+            {
+                // Work arrived (and was buffered) while we drained: keep a
+                // drain posted rather than let the buffer sit idle.
+                _ui.Post(DrainPendingUiEvents);
+            }
+            else
+            {
+                _uiDrainPosted = false;
+            }
         }
     }
 
@@ -912,6 +1075,15 @@ public sealed class MainWindowViewModel : ObservableObject, IAsyncDisposable
         {
             return;
         }
+        // R07: while the original submit is still awaiting its receipt
+        // (Pending), NO snapshot carries evidence about that specific request —
+        // a concurrent refresh must not clear the key, or a same-goal retry
+        // becomes a NEW admission. Only an outstanding submit whose receipt is
+        // already lost/unknown (Pending -> Unknown) is resolved from facts here.
+        if (_outstandingSubmitAwaitingReceipt)
+        {
+            return;
+        }
         var goal = _outstandingSubmitGoal;
         _outstandingSubmitId = null;
         _outstandingSubmitGoal = null;
@@ -946,6 +1118,7 @@ public sealed class MainWindowViewModel : ObservableObject, IAsyncDisposable
         var clientRequestId = _outstandingSubmitId ?? ClientRequestIds.Next();
         _outstandingSubmitId = clientRequestId;
         _outstandingSubmitGoal = goal;
+        _outstandingSubmitAwaitingReceipt = true;
         WorkSubmitResponse receipt;
         try
         {
@@ -953,22 +1126,40 @@ public sealed class MainWindowViewModel : ObservableObject, IAsyncDisposable
         }
         catch (AgentUnknownOutcomeException unknown)
         {
-            // The id stays outstanding ON PURPOSE, but the next snapshot —
-            // not a blind retry — resolves it: a host restart retires the
-            // client_request_id, so the same goal would be a NEW admission.
+            // Pending -> Unknown: the key stays outstanding ON PURPOSE, but the
+            // next snapshot — not a blind retry — resolves it: a host restart
+            // retires the client_request_id, so the same goal would be a NEW
+            // admission.
+            _outstandingSubmitAwaitingReceipt = false;
             AppendOutput($"提交结果未知：连接在请求期间断开（{unknown.Failure.Message}）。不会自动重发；"
                 + "下一份快照按事实解除该未知（同名任务可见即受理成立，不可见则再次提交将是新任务）。");
             return;
         }
-        catch (Exception failure)
+        catch (AgentProtocolException failure)
         {
+            // A structured server answer is DEFINITIVE evidence that k was
+            // denied — no admission was created, so clearing is safe and honest.
             _outstandingSubmitId = null;
             _outstandingSubmitGoal = null;
-            AppendOutput($"提交失败：{failure.Message}");
+            _outstandingSubmitAwaitingReceipt = false;
+            AppendOutput($"提交被拒绝：{failure.Message}");
+            return;
+        }
+        catch (Exception failure)
+        {
+            // R07: a timed-out / transport-faulted in-flight request may or may
+            // not have been delivered — the receipt is UNKNOWN. Keep k so a
+            // same-goal retry reuses the SAME admission identity; a later
+            // snapshot resolves it from facts. (Only clearing is what let each
+            // retry turn into a new admission.)
+            _outstandingSubmitAwaitingReceipt = false;
+            AppendOutput($"提交结果未知：{failure.Message}。不会自动重发；"
+                + "同一目标会以相同身份幂等重试，后续由快照按事实解除。");
             return;
         }
         _outstandingSubmitId = null;
         _outstandingSubmitGoal = null;
+        _outstandingSubmitAwaitingReceipt = false;
         AppendOutput($"已受理：task {receipt.TaskId}（{receipt.Disposition}）。受理 ≠ 完成，完成以快照与事件为准。");
         GoalInput = string.Empty;
         await RefreshSnapshotCoreAsync(silent: true);

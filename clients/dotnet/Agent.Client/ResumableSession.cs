@@ -61,8 +61,17 @@ public sealed class ResumableSession : IAgentConnection, IAsyncDisposable
     private readonly AgentConnectionOptions _options;
     private readonly Func<Task<Stream>> _connect;
     private readonly object _gate = new();
-    private readonly BoundedEventQueue _events;
+    // R13: the session event stream is re-allocatable — a reconnect after a
+    // session-level overflow REBUILDS a fresh live queue rather than trying to
+    // un-complete a monotonically closed generation.
+    private BoundedEventQueue _events;
     private AgentConnection? _connection;
+
+    /// <summary>R13: set once the session queue refused a durable
+    /// notification (terminal overflow). The current event stream is a closed,
+    /// monotonically-done generation; the next successful reconnect rebuilds
+    /// it so new events become reachable again.</summary>
+    private bool _eventsOverflowed;
 
     // F09: at most one connect attempt in flight per session (single-flight);
     // a generation counter plus the disposed flag veto stale installs, so a
@@ -207,11 +216,28 @@ public sealed class ResumableSession : IAgentConnection, IAsyncDisposable
             await fresh.DisposeAsync().ConfigureAwait(false);
             throw new ObjectDisposedException(nameof(ResumableSession));
         }
-        // B1: ordered reset boundary. The fresh snapshot rebuilds all durable
-        // state, so the replaced connection's unread backlog is pre-reset
-        // stale — drop it before the new pump starts, and never let an
-        // old-generation durable fact resurface after <see cref="Resynced"/>.
-        _events.Clear();
+        // R13: ordered reset/rebuild boundary. A NORMAL reconnect clears the
+        // unread backlog on the SAME session stream (the ONE stable reader
+        // across reconnects — the fresh snapshot rebuilds all durable state,
+        // so a replaced connection's unread facts never resurface after
+        // <see cref="Resynced"/>). After a session-level overflow the current
+        // stream is a monotonically-closed generation, so this reconnect
+        // REBUILDS a fresh live queue instead — new events become reachable
+        // again for a consumer that re-reads <see cref="Events"/>, while the
+        // faulted stream stays closed for anyone still holding it. Recovery is
+        // explicit: the lost backlog is never replayed, only re-snapshotted.
+        if (_eventsOverflowed)
+        {
+            lock (_gate)
+            {
+                _events = new BoundedEventQueue(_options.NotificationCapacity);
+                _eventsOverflowed = false;
+            }
+        }
+        else
+        {
+            _events.Clear();
+        }
         // N3: one pump per installed connection relays its typed events into
         // the session-level stream; the pump ends when the connection stops
         // being the live one. The snapshot's watermark is the dedup cursor:
@@ -274,10 +300,14 @@ public sealed class ResumableSession : IAgentConnection, IAsyncDisposable
                             }
                             // Terminal overflow at session level (the same
                             // class-aware policy as the connection queue):
-                            // the event stream ends with the honest reason.
+                            // the current event stream ends with the honest
+                            // reason. R13: the session itself is NOT terminal —
+                            // the overflow is recorded so the next successful
+                            // reconnect rebuilds a fresh stream.
                             _events.TryComplete(new AgentContractViolationException(
                                 "work.event.queue",
                                 "overflowed with undroppable approval/terminal notifications; rebuild from a snapshot"));
+                            _eventsOverflowed = true;
                             return;
                         }
                     }
@@ -420,10 +450,14 @@ public sealed class ResumableSession : IAgentConnection, IAsyncDisposable
     /// notifications stop at the switch, its unread backlog is reset (B1 —
     /// the fresh snapshot rebuilds all durable state), the new connection
     /// starts from its subscribe watermark with the snapshot watermark
-    /// deduping durable replays, and this reader never changes. The stream
-    /// ends (with the reason) only if the queue must refuse an
-    /// approval/terminal notification, or when the session is disposed.
-    /// </summary>
+    /// deduping durable replays, and — on a normal reconnect — this reader
+    /// never changes. The stream ends (with the reason) only if the queue
+    /// must refuse an approval/terminal notification, or when the session is
+    /// disposed. R13: after such an overflow the stream is a closed
+    /// generation; a subsequent successful reconnect REBUILDS a fresh live
+    /// stream, so a consumer re-reading <see cref="Events"/> after the
+    /// resync receives new events again (the lost backlog is never replayed,
+    /// only re-snapshot).
     public ChannelReader<WorkEventNotification> Events => _events.Reader;
 
     /// <summary>True once the session-level queue had to shed live-only
