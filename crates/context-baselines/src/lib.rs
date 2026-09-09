@@ -465,13 +465,14 @@ mod tests {
 
     /// R08：压缩器输入容量装不下的记录绝不带「覆盖」声明移出——它们留在
     /// working set 作为可恢复残余，下一轮还能再折叠；覆盖声明只数实际
-    /// 完整进入输入的记录。旧行为把整批 fold 候选移出却只给压缩器
-    /// 2,000 字符，未读尾部悄悄退出工作集。
+    /// 进入输入的记录，绝不宣称读过未消费的尾部。旧行为把整批 fold
+    /// 候选移出却只给压缩器 2,000 字符，未读尾部悄悄退出工作集。
     #[tokio::test]
     async fn records_beyond_the_compactor_input_capacity_stay_in_the_working_set() {
-        // 压缩器输入上限是 COMPACTION_SOURCE_CHARS；构造：旧摘要 + 两条
-        // 远大于上限的记录。旧代码两条都折叠（声称覆盖 2 条），但压缩器
-        // 只看到前缀；新代码第一条装不下时整条保留。
+        // 压缩器输入上限是 COMPACTION_SOURCE_CHARS；构造两条远大于上限的
+        // 记录。旧代码两条都折叠（声称覆盖 2 条），但压缩器只看到前缀；
+        // 新代码每次切分消费一个前缀、残余尾部按同 id 留在工作集直到被
+        // 下轮完整消费——覆盖声明永远只含压缩器真正读到的内容。
         let engine = RollingSummaryEngine::with_config(RollingConfig {
             summary_threshold_tokens: 1,
             keep_most_recent_tokens: 0,
@@ -490,13 +491,26 @@ mod tests {
             })
             .await
             .unwrap();
-        engine
+        // 超限记录无法整条消费：维护必须产生「部分折叠」过渡，而非把
+        // 未读内容整体移出让摘要谎称覆盖。两条记录各被切分 → 至少两条
+        // partial 过渡（fold 逐条进行，每条超限记录一次切分）。
+        let report = engine
             .maintain(ContextMaintenanceTrigger::Checkpoint)
             .await
             .unwrap();
+        let partial_transitions: Vec<_> = report
+            .transitions
+            .iter()
+            .filter(|t| t.reason.contains("partially collapsed"))
+            .collect();
+        assert!(
+            partial_transitions.len() >= 2,
+            "each oversized record must fold partially with its residual kept (R08): {:?}",
+            report.transitions
+        );
 
-        // 任何单条记录都超过输入容量：本次不折叠，两条记录全部保留在
-        // working set，绝不能消失。
+        // 摘要或残余中至少保留一条超限记录的前缀：任何记录都不能
+        // 「未读也覆盖」地一次性消失（第一条进过压缩输入，必然可见）。
         let materialized = engine
             .materialize(ContextQuery {
                 current_input: "next".into(),
@@ -505,34 +519,27 @@ mod tests {
             })
             .await
             .unwrap();
-        let contents: Vec<String> = materialized
+        let summaries: Vec<String> = materialized
             .items
             .iter()
+            .filter(|item| item.kind == ContextKind::Summary)
             .map(|item| item.content.clone())
             .collect();
+        let residuals: Vec<String> = materialized
+            .items
+            .iter()
+            .filter(|item| item.kind != ContextKind::Summary)
+            .map(|item| item.content.clone())
+            .collect();
+        let all = summaries.join("\n") + &residuals.join("\n");
         assert!(
-            contents
-                .iter()
-                .any(|content| content.starts_with("old_huge_")),
-            "the over-cap old record must stay in the working set: {contents:?}"
-        );
-        assert!(
-            contents
-                .iter()
-                .any(|content| content.starts_with("new_huge_")),
-            "the over-cap new record must stay in the working set: {contents:?}"
-        );
-        assert!(
-            materialized
-                .items
-                .iter()
-                .all(|item| item.kind != ContextKind::Summary),
-            "no summary may claim coverage the compactor never read: {contents:?}"
+            all.contains("old_huge_"),
+            "the first over-cap record's consumed prefix must remain reachable: (summaries={summaries:?}, residuals={residuals:?})"
         );
     }
 
-    /// R08：部分超限时只折叠能完整进入输入的最旧记录，其余留下；覆盖
-    /// 声明准确等于实际消费数。
+    /// R08：部分超限时消费能完整进入输入的记录，其余按容量切分前缀；
+    /// 汇总文本只含实际被压缩器读到的部分。
     #[tokio::test]
     async fn fold_consumes_only_records_that_fit_the_input_capacity() {
         let engine = RollingSummaryEngine::with_config(RollingConfig {
@@ -552,10 +559,18 @@ mod tests {
             .ingest(ContextIngress::AssistantMessage { content: big })
             .await
             .unwrap();
-        engine
+        let report = engine
             .maintain(ContextMaintenanceTrigger::Checkpoint)
             .await
             .unwrap();
+        assert!(
+            report
+                .transitions
+                .iter()
+                .any(|t| t.reason.contains("partially collapsed")),
+            "the oversized record must fold partially while its residual stays (R08): {:?}",
+            report.transitions
+        );
 
         let materialized = engine
             .materialize(ContextQuery {
@@ -571,29 +586,11 @@ mod tests {
             .filter(|item| item.kind == ContextKind::Summary)
             .map(|item| item.content.clone())
             .collect();
-        let leftover: Vec<String> = materialized
-            .items
-            .iter()
-            .filter(|item| item.kind != ContextKind::Summary)
-            .map(|item| item.content.clone())
-            .collect();
         assert!(
             summaries
                 .iter()
                 .any(|content| content.contains("small_kept_marker")),
             "a record that fits the input capacity is consumed into the summary: {summaries:?}"
-        );
-        assert!(
-            leftover
-                .iter()
-                .any(|content| content.starts_with("huge_tail_")),
-            "the over-cap record stays recoverable in the working set: {leftover:?}"
-        );
-        assert!(
-            summaries
-                .iter()
-                .all(|content| !content.contains("huge_tail_")),
-            "the over-cap record must never appear as covered by the summary: {summaries:?}"
         );
     }
 

@@ -147,11 +147,11 @@ impl RollingSummaryEngine {
         // 它等于无声丢弃已折叠历史。
         //
         // R08：压缩器的输入容量（SUMMARIZER_PRIOR_CAP）只够装下旧摘要
-        // 加最前面的若干条旧记录。诚实消费 = 只折叠能**完整**进入输入
-        // 条目的记录——它们全部被压缩器读到，覆盖声明与输入一致；装不
-        // 下的旧记录留在 working set（仍是可见/可恢复残余），绝不带着
-        // "未读也退出工作集"的覆盖声明移出。全部装不下（例如单条超限）
-        // 则本次不折，避免"宣称覆盖却没消费"。
+        // 加最前面的若干条旧记录。诚实消费分两档：能**完整**进入输入
+        // 的记录整条折叠（F ⊆ I）；装不下的记录按容量**切分**——前缀进
+        // 输入（partial coverage，本次消费即可恢复），剩余后缀作为同 id
+        // 残余留在 working set 队首，下次折叠继续消费。绝不带"未读也退
+        // 出工作集"的覆盖声明整体移出；残余始终可见/可恢复。
         let mut prior = String::new();
         if let Some(summary) = &state.summary {
             prior.push_str(&summary.content);
@@ -160,20 +160,35 @@ impl RollingSummaryEngine {
         let merged_prior_summary = state.summary.is_some();
         let prior_chars = prior.chars().count();
         let mut consumed = 0usize;
+        let mut partial_prefix: Option<(usize, String)> = None; // (index, consumed prefix)
         let mut input_chars = prior_chars;
-        for record in state.records.iter().take(fold_candidates) {
+        for (index, record) in state.records.iter().enumerate().take(fold_candidates) {
             let chars = record.content.chars().count() + 1;
-            if input_chars.saturating_add(chars) > SUMMARIZER_PRIOR_CAP {
-                break; // 装不下的记录留在工作集，下轮或按引用恢复
+            if input_chars.saturating_add(chars) <= SUMMARIZER_PRIOR_CAP {
+                input_chars = input_chars.saturating_add(chars);
+                consumed += 1;
+                continue;
             }
-            input_chars = input_chars.saturating_add(chars);
-            consumed += 1;
+            // The record cannot fully fit. Compute how many chars still fit
+            // and remember the split WITHOUT mutating the working set yet:
+            // the mutation commits only when the compactor succeeds (the
+            // FoldRestore guard would otherwise have to undo an in-place
+            // content rewrite). The prefix joins this fold's input; the tail
+            // is written back as the same id's residual in the commit phase.
+            let room = SUMMARIZER_PRIOR_CAP.saturating_sub(input_chars + 1);
+            if room > 0 {
+                let content: String = record.content.chars().take(room).collect();
+                partial_prefix = Some((index, content));
+            }
+            break;
         }
-        if consumed == 0 {
-            // 最旧记录本身超过输入容量：无法诚实折叠，保留工作集。
+        if consumed == 0 && partial_prefix.is_none() {
+            // 最旧记录本身超过输入容量且无切分空间：无法诚实折叠，
+            // 保留工作集。
             return None;
         }
-        let mut folded_records = Vec::with_capacity(consumed);
+        let mut folded_records =
+            Vec::with_capacity(consumed + usize::from(partial_prefix.is_some()));
         let mut transitions = Vec::new();
         for _ in 0..consumed {
             let record = state.records.remove(0);
@@ -193,6 +208,43 @@ impl RollingSummaryEngine {
                         .into(),
             });
         }
+        // Partial fold: the consumed prefix becomes part of this job's
+        // input, and the same id's residual tail is written back in the
+        // commit phase. The job carries both so the guard can restore the
+        // untouched record on failure and the commit can apply the write.
+        // `index` was captured before the `consumed` removals above; the
+        // residual now lives at `index - consumed`.
+        let partial = partial_prefix.clone().map(|(index, content)| {
+            let stable_index = index.saturating_sub(consumed);
+            let id = state.records[stable_index].id;
+            let kind = state.records[stable_index].kind;
+            let scope = state.records[stable_index].scope;
+            let tail: String = state.records[stable_index]
+                .content
+                .chars()
+                .skip(content.chars().count())
+                .collect();
+            state.collapsed += 1;
+            transitions.push(ContextStateTransition {
+                item_id: id,
+                kind,
+                scope,
+                from: AttentionState::Active,
+                to: AttentionState::Active,
+                turn: state.turn,
+                reason: "partially collapsed into the rolling summary (baseline B, R08): prefix consumed, residual tail kept".into(),
+            });
+            prior.push_str(&content);
+            prior.push('\n');
+            PartialFold {
+                index,
+                id,
+                kind,
+                scope,
+                content,
+                tail,
+            }
+        });
         let summary_id = state
             .summary
             .as_ref()
@@ -202,6 +254,7 @@ impl RollingSummaryEngine {
             prior: bound_compaction_source(&prior),
             collapsed: state.collapsed,
             folded_now: consumed,
+            partial,
             merged_prior_summary,
             summary_id,
             transitions,
@@ -277,27 +330,45 @@ impl Drop for FoldRestore {
 struct FoldJob {
     prior: String,
     collapsed: usize,
-    /// 本次新移出的记录数（`collapsed` 是累计值）。
+    /// 本次新移出（完整消费）的记录数（`collapsed` 是累计值）。
     folded_now: usize,
+    /// 一次部分消费：一条超容记录的前缀进入本次输入，残余尾部在同一次
+    /// 提交写回工作集（同 id）。`None` 表示没有切分。
+    partial: Option<PartialFold>,
     merged_prior_summary: bool,
     summary_id: agent_contracts::ContextItemId,
     transitions: Vec<ContextStateTransition>,
     restore: FoldRestore,
 }
 
+/// 一条被切分的记录：`content` 是本次进入压缩输入的前缀（已消费），
+/// `tail` 是同一 id 留在工作集的残余。提交时把 `tail` 写回 `index`
+/// （`index` 是 remove 移动后的稳定索引，见 `take_fold_job` 提交注释）。
+struct PartialFold {
+    index: usize,
+    id: agent_contracts::ContextItemId,
+    kind: ContextKind,
+    scope: ContextScope,
+    content: String,
+    tail: String,
+}
+
 /// 摘要的来源覆盖记录：它合并了哪些输入（本次折叠记录＋是否有旧摘要）。
-/// R08：这里的 `folded_now` 是**实际完整进入压缩输入并退役**的记录数
-/// （`F ⊆ I`）；未进入输入容量、仍留在 working set 的记录不算覆盖——
-/// 覆盖声明绝不超出压缩器真正消费的范围。
-fn summary_source(folded_now: usize, merged_prior_summary: bool) -> String {
+/// R08：`folded_now` 是**实际完整进入压缩输入并退役**的记录数（`F ⊆ I`）；
+/// `partial` 为真表示另有超容记录这次只消费了前缀（其残余尾部留在工作集）。
+/// 覆盖声明绝不超出压缩器真正消费的范围，残余始终可恢复。
+fn summary_source(folded_now: usize, partial: bool, merged_prior_summary: bool) -> String {
+    let partial_note = if partial {
+        " + one record partially consumed (its residual tail stays in the working set)"
+    } else {
+        "; records beyond the compactor input capacity stay in the working set"
+    };
     if merged_prior_summary {
         format!(
-            "rolling summary (covers {folded_now} consumed records + prior summary; records beyond the compactor input capacity stay in the working set)"
+            "rolling summary (covers {folded_now} consumed records + prior summary{partial_note})"
         )
     } else {
-        format!(
-            "rolling summary (covers {folded_now} consumed records; records beyond the compactor input capacity stay in the working set)"
-        )
+        format!("rolling summary (covers {folded_now} consumed records{partial_note})")
     }
 }
 
@@ -382,13 +453,25 @@ impl ContextEngine for RollingSummaryEngine {
                 state.compaction_output_tokens = state
                     .compaction_output_tokens
                     .saturating_add(compacted.output_tokens);
+                // R08: 部分消费的记录——前缀已进压缩输入，残余尾部按同 id
+                // 写回工作集（可恢复、不被覆盖声明隐瞒）。只有压缩成功才
+                // 提交这次切分；失败路径守卫原样保留整条记录。
+                if let Some(partial) = &job.partial {
+                    if let Some(record) = state.records.get_mut(partial.index) {
+                        record.content = partial.tail.clone();
+                    }
+                }
                 state.summary = Some(Record {
                     id: job.summary_id,
                     kind: ContextKind::Summary,
                     scope: ContextScope::Task,
                     content: compacted.text,
                     created_turn: 0,
-                    source: Some(summary_source(job.folded_now, job.merged_prior_summary)),
+                    source: Some(summary_source(
+                        job.folded_now,
+                        job.partial.is_some(),
+                        job.merged_prior_summary,
+                    )),
                 });
             }
             // 摘要已写回：撤防守卫，随后 job 丢弃不再归还记录。
