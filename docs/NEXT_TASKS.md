@@ -40,7 +40,7 @@
 | 6 | N5 | 平台/GUI | 正式信封恢复＋结果/差异/工件按需读取 | 恢复半已关闭（2026-09-08，`808773c`，CI `34268863699` 验证）：信封解码＋可验证 latest＋3 e2e；**backlog**：Rolling 引擎不跟踪 focus，活动任务检查点 fail-closed（需动 context-baselines）；结果/差异/工件读取仍开放 | N2 ✓, N3 ✓ |
 | 7 | ~~N6~~ | 基础 | 决策不误终结、lease 跨层一致、Skill 受限句柄、catalog 有界 | 已关闭（2026-09-08）：F15 决策需证明、F16 跨层到期保护、F17 包内普通文件围栏、F18 惰性投影；context-simple 302/302 | N0 ✓ |
 | 8 | ~~N7~~ | GUI/测量 | 对象与文本保留有界、指标覆盖如实 | **已关闭（2026-09-09，`87850ae`＋C4 记录）**：MetricsSession 覆盖标注 root_only/full_tree/unknown（Windows 不冒充 whole-tree）＋有界采样环＋显式 idle 标记＋DeltaCoalescer 定时刷新（短 delta 后无输入也按间隔刷新）；输出行/字节双界（N4 已落）＋ViewModel 关闭释放 coalescer；MetricsSession/DeltaCoalescer 测试 9/9、dotnet 全量 72/72、桌面构建 0 错误 | N4 |
-| 9 | N8 | 扩展/交付 | MCP/Plugin 可配置使用＋Rust/.NET 来源绑定发布（并入 PACKAGE-01、原 R1） | **部分落地（2026-09-09）**：PACKAGE-01 来源绑定打包（`3352273`：--target-dir 构建与复制同身份、干净 staging、agent-host/desktop 入包、SOURCE.txt、递归 SHA256SUMS、PS 原生退出码；Windows 端到端验证通过）；.NET→宿主→Runtime→工具→事件→GUI 全链 e2e（`aeddfbd` HostChainTests，真实宿主二进制＋demo model，本机 1/1、CI dotnet job 已接宿主构建）；**B4 宿主受限 MCP/Plugin 配置路径由 B 线代理并行执行中**（config.rs 在途） | N1–N6 |
+| 9 | ~~N8~~ | 扩展/交付 | MCP/Plugin 可配置使用＋Rust/.NET 来源绑定发布（并入 PACKAGE-01、原 R1） | **已关闭（2026-09-09）**：PACKAGE-01 来源绑定打包（`3352273`：--target-dir 构建与复制同身份、干净 staging、agent-host/desktop 入包、SOURCE.txt、递归 SHA256SUMS、PS 原生退出码；Windows 端到端验证通过，HEAD 重验 SOURCE SHA 绑定一致）；.NET→宿主→Runtime→工具→事件→GUI 全链 e2e（`aeddfbd` HostChainTests，真实宿主二进制＋demo model）；B4 宿主受限 MCP/Plugin 配置（`0515efb`：--mcp-config/--plugins-root bounded deny-unknown fail-closed、compose 接线、supported/unsupported 声明；agent-host lib 7/7、host_config 3/3、e2e 8/8 回归、restore 3/3）。Linux dist 侧由 CI package job 复核 | N1–N6 |
 | 10 | ~~PACKAGE-01~~ | 条件 | 打包来源绑定 | **已并入 N8 关闭（2026-09-09，`3352273`）**：Windows 端到端打包验证通过；Linux 侧由 CI package job 复核 | — |
 | 11 | MCP-01 | 条件 | MCP 写/连接/读可取消 | E1 已覆盖声明车道；新声明路径触发时补 | — |
 
@@ -89,7 +89,7 @@
 | C1 | 真实事件消费者、模型/工具输出、真实计划与状态 | GUI-EVENTS（基线时点；`843803f` 已落地，随 N4 验收） | 即 N4 主体 |
 | C2 | 知情审批、稳定行对象、单次刷新、连接代际与关闭清理 | F12/F13（`9fb2030`/`433d21e`/`843803f` 已落地，随 N4 验收） | 即 N4 主体＋N7 前半 |
 | C3 | 修改审阅、正式冷恢复走查、工件按需读取、只读 Context 检查 | — | 即 N5 结果半（GUI 侧）。**已关闭（2026-09-09）：`391f121` 未知提交按快照事实解除＋restore-walkthrough 走查测试；`93c300d` B3 四个只读路由（task_detail/changes/artifact/context）；`17409f1` C3 GUI 接线骨架（审阅 Tab：任务详情锚点卡/变更日志/工件＋Context 面板真实列表，全部只读、诚实 unavailable、era 丢弃、断开清空）；`a1033fe` 真实 host 链审阅钻取（四条 B3 路由经真实宿主＋工作台完整走查，dotnet 87/87）。真实 provider 与真实写变更场景照旧 NOT_RUN** |
-| C4 | 长会话资源上界、准确测量、Rust＋.NET 来源绑定包 | F14 | 即 N7＋N8。**已落地（2026-09-09）：N7 `87850ae`（MetricsSession 覆盖标注/有界采样环/显式 idle/时间预算 coalescer）＋N8 打包 `3352273`（dist.sh/dist.ps1 来源绑定：--target-dir 构建、干净 staging、agent-host/desktop 入包、SOURCE.txt 来源身份、递归 SHA256SUMS、PowerShell 原生退出码；Windows 端到端打包验证通过，bash 语法复核）** |
+| C4 | 长会话资源上界、准确测量、Rust＋.NET 来源绑定包 | F14 | 即 N7＋N8。**已关闭（2026-09-09）：N7 `87850ae`（MetricsSession 覆盖标注/有界采样环/显式 idle/时间预算 coalescer）＋N8 整链（`3352273` 来源绑定打包、`aeddfbd` 全链 e2e、`0515efb` B4 宿主 MCP/Plugin 配置；Windows dist 端到端打包在 HEAD `149f06c` 重验：SOURCE SHA 绑定一致、desktop 子目录＋递归 SHA256SUMS 完整、dotnet 87/87）** |
 
 **用户结果：**正式客户端能提交、观察、审批、继续、恢复和审阅，不依赖布局夹具。
 
