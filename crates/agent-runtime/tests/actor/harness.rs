@@ -979,6 +979,8 @@ impl ContextEngine for BigContextEngine {
                 source: None,
                 file_path: None,
                 file_revision: None,
+                file_start_line: None,
+                file_end_line: None,
                 partial_body: false,
             })
             .collect();

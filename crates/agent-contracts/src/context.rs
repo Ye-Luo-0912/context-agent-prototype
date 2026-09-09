@@ -977,6 +977,14 @@ pub struct ContextHints {
     /// BodyVisible.
     #[serde(default)]
     pub visible_body_identities: Vec<String>,
+    /// Bounded `fs.read` windows (path, revision, exposed line range)
+    /// already carried by this same model request. This is the interval-aware
+    /// sibling of `visible_body_identities`: a request that read L101–200 of
+    /// rev-1 must NOT price a historical L1–100 record of rev-1 as
+    /// "exact body already visible" (R09). Engines consume
+    /// [`visible_body_windows_cover`] with their record's own range.
+    #[serde(default)]
+    pub visible_body_windows: Vec<FileBodyWindow>,
     /// Current-directive exact-mention ∩ ExecutionState known paths.
     /// Engines may transiently project those file bodies for this request
     /// without changing residency (no Warm→Resident, no Stored Admit).
@@ -1260,7 +1268,10 @@ pub fn file_body_identity(path: &str, revision: &str) -> Option<String> {
 
 /// Whether the current request already carries the exact body identity.
 /// Matching is exact after slash normalization; path-only rows and another
-/// revision never cover a body.
+/// revision never cover a body. This identity-level check cannot prove
+/// *interval* coverage: two fs.read windows of the same revision are
+/// distinct bodies, so callers that know ranges must use
+/// [`visible_body_windows_cover`] instead.
 pub fn visible_body_identities_cover(
     visible_body_identities: &[String],
     path: &str,
@@ -1273,6 +1284,104 @@ pub fn visible_body_identities_cover(
         .iter()
         .take(MAX_VISIBLE_BODY_HINTS)
         .any(|row| crate::normalize_resource_path(row) == identity)
+}
+
+/// One model-visible `fs.read` window of a file version. The file revision
+/// identifies the *version*; `start_line`/`end_line` (inclusive, 1-indexed)
+/// bound the interval this read actually exposed. A whole-file read reports
+/// `covers_file`, which subsumes any interval. Unknown ranges are never a
+/// coverage proof: a window without bounds covers nothing beyond itself.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct FileBodyWindow {
+    /// Normalized workspace-relative path.
+    pub path: String,
+    /// Content revision of the version these lines came from.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub revision: Option<String>,
+    /// Inclusive 1-indexed first line exposed by the read, when bounded.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub start_line: Option<u32>,
+    /// Inclusive 1-indexed last line exposed by the read, when bounded.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub end_line: Option<u32>,
+    /// The read exposed the whole file (covers every interval).
+    #[serde(default)]
+    pub covers_file: bool,
+}
+
+/// Cap on `FileBodyWindow` hints in one request, mirroring
+/// [`MAX_VISIBLE_BODY_HINTS`] so the two hints stay comparably priced.
+pub const MAX_VISIBLE_BODY_WINDOWS: usize = MAX_VISIBLE_BODY_HINTS;
+
+/// Whether the current request already carries the file body *interval*
+/// that a historical record spans. The rule the prompt dedup, the Context
+/// descriptor and the required-miss judgment all consume:
+///
+/// ```text
+/// same(path, revision) ∧ historical_interval ⊆ union(visible_intervals)
+/// ```
+///
+/// Coverage is strict: a matching window that reports an unknown range
+/// covers nothing (an unbounded window is not a whole-file proof), and a
+/// historical record with an unknown range cannot be declared covered
+/// (`covers_file` windows are the only way an unbounded record is covered).
+/// Windows with a different revision never cover the record.
+pub fn visible_body_windows_cover(
+    visible_windows: &[FileBodyWindow],
+    path: &str,
+    revision: Option<&str>,
+    record_start_line: Option<u32>,
+    record_end_line: Option<u32>,
+) -> bool {
+    let Some(revision) = revision.map(str::trim).filter(|r| !r.is_empty()) else {
+        return false;
+    };
+    let path = crate::normalize_resource_path(path);
+    // Windows are bounded; too many hints means the caller exceeded the
+    // price and the answer must stay conservative (no coverage proof).
+    let mut covering: Vec<(u32, u32)> = Vec::new();
+    for window in visible_windows.iter().take(MAX_VISIBLE_BODY_WINDOWS) {
+        if window.revision.as_deref().is_none_or(|r| r != revision)
+            || crate::normalize_resource_path(&window.path) != path
+        {
+            continue;
+        }
+        if window.covers_file {
+            return true;
+        }
+        let (Some(start), Some(end)) = (window.start_line, window.end_line) else {
+            continue; // unknown window range: no interval to contribute
+        };
+        covering.push((start, end));
+    }
+    // A record with an unknown range is only provably covered by a
+    // covers_file window (handled above); merge the known intervals and
+    // check containment of the record's own known range.
+    let (Some(record_start), Some(record_end)) = (record_start_line, record_end_line) else {
+        return false;
+    };
+    covering.sort_unstable();
+    // At least one window must actually cover the record's start.
+    let filtered: Vec<(u32, u32)> = covering
+        .into_iter()
+        .filter(|(start, end)| start <= &record_end && record_start <= *end)
+        .collect();
+    let mut merged: Vec<(u32, u32)> = Vec::new();
+    for (start, end) in filtered {
+        if merged
+            .last()
+            .is_some_and(|(_, prev_end)| prev_end + 1 >= start)
+        {
+            let (ms, me) = merged.pop().unwrap();
+            merged.push((ms, me.max(end)));
+        } else {
+            merged.push((start, end));
+        }
+    }
+    merged
+        .iter()
+        .any(|(start, end)| *start <= record_start && record_end <= *end)
 }
 
 /// Why a record is a root. Independent of `AnchorRootStrength` (how strongly
@@ -1940,6 +2049,15 @@ pub struct MaterializedItem {
     /// `path@revision`; the assembler must not parse it out of `content`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub file_revision: Option<String>,
+    /// Inclusive 1-indexed `fs.read` window of this historical body, when
+    /// known (mirrors `ContextItem`). The runtime's own body-dedup rule
+    /// (R09) needs the interval, not just the identity: an item that read
+    /// L1–100 must not be marked "already visible" because the request
+    /// carried L101–200 of the same revision.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub file_start_line: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub file_end_line: Option<u32>,
     /// True when the body was clipped to a token budget: it is a partial
     /// projection and must never stand in for the full revision in
     /// required-body claims, consumption ledgers, or reread attribution.
@@ -3296,6 +3414,89 @@ mod tests {
     }
 
     #[test]
+    fn window_cover_requires_same_revision_and_interval_containment() {
+        let win = |start: u32, end: u32| FileBodyWindow {
+            path: "src/auth.rs".into(),
+            revision: Some("abc".into()),
+            start_line: Some(start),
+            end_line: Some(end),
+            covers_file: false,
+        };
+        let windows = vec![win(101, 200)];
+        // Same revision, contained interval: covered.
+        assert!(visible_body_windows_cover(
+            &windows,
+            "src/auth.rs",
+            Some("abc"),
+            Some(120),
+            Some(150)
+        ));
+        // Same revision but a disjoint historical interval: NOT covered
+        // (the exact scenario the audit probe exposed — L1–100 vs L101–200).
+        assert!(!visible_body_windows_cover(
+            &windows,
+            "src/auth.rs",
+            Some("abc"),
+            Some(1),
+            Some(100)
+        ));
+        assert!(!visible_body_windows_cover(
+            &windows,
+            "src/auth.rs",
+            Some("abc"),
+            Some(150),
+            Some(250)
+        ));
+        // Different revision: never covered.
+        assert!(!visible_body_windows_cover(
+            &windows,
+            "src/auth.rs",
+            Some("def"),
+            Some(120),
+            Some(150)
+        ));
+        // A whole-file window covers an unbounded record too.
+        let covers = vec![FileBodyWindow {
+            path: "src/auth.rs".into(),
+            revision: Some("abc".into()),
+            start_line: None,
+            end_line: None,
+            covers_file: true,
+        }];
+        assert!(visible_body_windows_cover(
+            &covers,
+            "src/auth.rs",
+            Some("abc"),
+            None,
+            None
+        ));
+        // An unknown-range window covers nothing for a bounded record.
+        let unknown = vec![FileBodyWindow {
+            path: "src/auth.rs".into(),
+            revision: Some("abc".into()),
+            start_line: None,
+            end_line: None,
+            covers_file: false,
+        }];
+        assert!(!visible_body_windows_cover(
+            &unknown,
+            "src/auth.rs",
+            Some("abc"),
+            Some(1),
+            Some(100)
+        ));
+        // Two adjacent windows merge into full coverage.
+        let merged = vec![win(1, 100), win(101, 200)];
+        assert!(visible_body_windows_cover(
+            &merged,
+            "src/auth.rs",
+            Some("abc"),
+            Some(50),
+            Some(150)
+        ));
+    }
+
+    #[test]
     fn advisory_only_task_progress_is_not_empty() {
         for view in [
             TaskProgressView {
@@ -3383,6 +3584,8 @@ mod tests {
             source: None,
             file_path: None,
             file_revision: None,
+            file_start_line: None,
+            file_end_line: None,
             partial_body: false,
         }
     }

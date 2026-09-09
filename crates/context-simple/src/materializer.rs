@@ -4,12 +4,12 @@ use std::collections::HashSet;
 use std::path::Path;
 
 use agent_contracts::{
-    AttentionState, CONTEXT_CONSUMPTION_ACK_ITEM_CAP, CONTEXT_MAP_VIEW_CAP, ContextItem,
-    ContextItemId, ContextMapView, ContextMaterializationIdentity, ContextMaterializationMiss,
-    ContextMaterializationMissReason, ContextMaterializationMisses, ContextQuery, ContextRetention,
-    ContextSelection, MAX_FOREGROUND_RESOURCES, MAX_FOREGROUND_TOKENS, MaterializedContext,
-    MaterializedItem, ScopeId, ScopeKind, ScopeState, ScoreBreakdown, checked_files_cover_path,
-    normalize_resource_path,
+    AttentionState, CONTEXT_CONSUMPTION_ACK_ITEM_CAP, CONTEXT_MAP_VIEW_CAP, ContextHints,
+    ContextItem, ContextItemId, ContextMapView, ContextMaterializationIdentity,
+    ContextMaterializationMiss, ContextMaterializationMissReason, ContextMaterializationMisses,
+    ContextQuery, ContextRetention, ContextSelection, MAX_FOREGROUND_RESOURCES,
+    MAX_FOREGROUND_TOKENS, MaterializedContext, MaterializedItem, ScopeId, ScopeKind, ScopeState,
+    ScoreBreakdown, checked_files_cover_path, normalize_resource_path,
 };
 
 use crate::diagnostics;
@@ -209,7 +209,7 @@ pub(crate) fn materialize(
         }
         let breakdown =
             score_item_with_breakdown(item, engine_focus.as_ref(), &state.hot_entities, turn);
-        let tokens = packed_item_tokens(item, &query.hints.visible_body_identities);
+        let tokens = packed_item_tokens(item, &query.hints);
         candidates.push((index, breakdown, tokens));
     }
 
@@ -277,7 +277,7 @@ pub(crate) fn materialize(
                 item,
                 breakdown,
                 latest_file_bodies.contains(&item.id),
-                &query.hints.visible_body_identities,
+                &query.hints,
             ),
             breakdown.clone(),
         ));
@@ -342,7 +342,7 @@ pub(crate) fn materialize(
                 item,
                 &breakdown,
                 latest_file_bodies.contains(&item.id),
-                &query.hints.visible_body_identities,
+                &query.hints,
             ),
             breakdown,
         ));
@@ -404,7 +404,7 @@ pub(crate) fn materialize(
                 if archived_below_cutoff(dep, &breakdown, config, &latest_file_bodies) {
                     continue;
                 }
-                let tokens = packed_item_tokens(dep, &query.hints.visible_body_identities);
+                let tokens = packed_item_tokens(dep, &query.hints);
                 expanded.push(ExpandedCandidate {
                     index: dep_index,
                     score: breakdown.total,
@@ -470,7 +470,7 @@ pub(crate) fn materialize(
         if path.is_empty() {
             continue;
         }
-        if prices_as_file_body_descriptor(item, &query.hints.visible_body_identities) {
+        if price_as_file_body_descriptor(item, &query.hints) {
             state.selected_descriptor_paths.insert(path);
         } else {
             state.selected_body_paths.insert(path);
@@ -480,8 +480,7 @@ pub(crate) fn materialize(
         .iter()
         .map(|index| {
             let item = &state.items[*index];
-            let descriptor =
-                prices_as_file_body_descriptor(item, &query.hints.visible_body_identities);
+            let descriptor = price_as_file_body_descriptor(item, &query.hints);
             let content = if descriptor {
                 file_body_descriptor_content(item)
             } else {
@@ -498,6 +497,8 @@ pub(crate) fn materialize(
                 source: item.source.clone(),
                 file_path: item.file_path.clone(),
                 file_revision: item.file_revision.clone(),
+                file_start_line: item.file_start_line,
+                file_end_line: item.file_end_line,
                 // Selected bodies are never preview-clipped here, but the
                 // stored body itself may be an ingest-time partial (the
                 // engine clips at `max_item_chars`): the exposure must say
@@ -794,7 +795,7 @@ fn selection_reason(
     item: &ContextItem,
     breakdown: &ScoreBreakdown,
     latest_file_body: bool,
-    visible_body_identities: &[String],
+    hints: &ContextHints,
 ) -> String {
     let mut reason = if item.retention == ContextRetention::Pinned {
         "explicitly pinned".to_string()
@@ -827,15 +828,15 @@ fn selection_reason(
             breakdown.entity_affinity,
         )
     };
-    if prices_as_file_body_descriptor(item, visible_body_identities) {
+    if price_as_file_body_descriptor(item, hints) {
         reason.push_str("; body omitted, exact body already visible");
     }
     reason
 }
 
-fn prices_as_file_body_descriptor(item: &ContextItem, visible_body_identities: &[String]) -> bool {
+fn price_as_file_body_descriptor(item: &ContextItem, hints: &ContextHints) -> bool {
     if item.kind == agent_contracts::ContextKind::Error
-        || visible_body_identities.is_empty()
+        || (hints.visible_body_windows.is_empty() && hints.visible_body_identities.is_empty())
         || !is_file_body_observation(item)
     {
         return false;
@@ -843,8 +844,23 @@ fn prices_as_file_body_descriptor(item: &ContextItem, visible_body_identities: &
     let Some(path) = observation_file_path(item) else {
         return false;
     };
+    // Interval-aware rule first: the request already carries bounded
+    // fs.read windows, so a historical record is covered only when its own
+    // range is contained in the union of the visible windows of the same
+    // revision (R09). An unknown historical range needs a covers_file window.
+    if !hints.visible_body_windows.is_empty() {
+        return agent_contracts::visible_body_windows_cover(
+            &hints.visible_body_windows,
+            path,
+            item.file_revision.as_deref(),
+            item.file_start_line,
+            item.file_end_line,
+        );
+    }
+    // Legacy identity-level rule (no interval information in the request):
+    // exact path@revision match only.
     agent_contracts::visible_body_identities_cover(
-        visible_body_identities,
+        &hints.visible_body_identities,
         path,
         item.file_revision.as_deref(),
     )
@@ -863,8 +879,8 @@ fn file_body_descriptor_content(item: &ContextItem) -> String {
     }
 }
 
-fn packed_item_tokens(item: &ContextItem, visible_body_identities: &[String]) -> usize {
-    if prices_as_file_body_descriptor(item, visible_body_identities) {
+fn packed_item_tokens(item: &ContextItem, hints: &ContextHints) -> usize {
+    if price_as_file_body_descriptor(item, hints) {
         approx_tokens(&file_body_descriptor_content(item))
             .saturating_add(FILE_BODY_DESCRIPTOR_FRAME_TOKENS)
     } else {
@@ -1009,6 +1025,8 @@ pub(crate) async fn realize_foreground(
             source: item.source.clone(),
             file_path: item.file_path.clone(),
             file_revision: item.file_revision.clone(),
+            file_start_line: item.file_start_line,
+            file_end_line: item.file_end_line,
             // A body clipped to this round's budget is an explicit partial
             // projection, and so is a body the engine already clipped at
             // ingest: either way it keeps its identity for display but must
@@ -1532,8 +1550,7 @@ pub(crate) fn apply_required(
 
         // The overlay would embed exactly this content (the stored body, or
         // a descriptor when the exact body is already visible by identity).
-        let descriptor =
-            prices_as_file_body_descriptor(&required.item, &query.hints.visible_body_identities);
+        let descriptor = price_as_file_body_descriptor(&required.item, &query.hints);
         let content = if descriptor {
             file_body_descriptor_content(&required.item)
         } else {
@@ -1556,7 +1573,7 @@ pub(crate) fn apply_required(
             continue;
         }
 
-        let tokens = packed_item_tokens(&required.item, &query.hints.visible_body_identities);
+        let tokens = packed_item_tokens(&required.item, &query.hints);
         let max_items = query.hints.max_selected_items.unwrap_or(usize::MAX);
         let Some(evictions) =
             plan_required_evictions(materialized, tokens, query.budget_tokens, max_items)
@@ -1582,6 +1599,8 @@ pub(crate) fn apply_required(
             source: required.item.source.clone(),
             file_path: required.item.file_path.clone(),
             file_revision: required.item.file_revision.clone(),
+            file_start_line: required.item.file_start_line,
+            file_end_line: required.item.file_end_line,
             // The overlay always embeds the full stored body (a partial
             // foreground copy was already rejected above), but the stored
             // body itself may be an ingest-time partial: the flag must

@@ -460,6 +460,8 @@ pub(crate) mod tests {
             source: Some(source.to_string()),
             file_path: None,
             file_revision: None,
+            file_start_line: None,
+            file_end_line: None,
             partial_body: false,
         }
     }

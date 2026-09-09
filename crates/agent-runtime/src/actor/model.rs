@@ -808,6 +808,8 @@ impl RuntimeActor {
             base_progress_view.as_ref(),
             &protocol_bodies,
         );
+        let visible_body_windows =
+            crate::prompt::visible_body_windows_for_request(&turn_frame, &protocol_bodies);
         let context_budget = model_budget.context_frame_budget;
         let materialized = match self
             .services
@@ -823,6 +825,7 @@ impl RuntimeActor {
                         .map(|view| view.checked_files.clone())
                         .unwrap_or_default(),
                     visible_body_identities,
+                    visible_body_windows,
                     foreground_resources,
                 },
             })
@@ -1927,6 +1930,8 @@ mod failure_class_tests {
             source: None,
             file_path: None,
             file_revision: None,
+            file_start_line: None,
+            file_end_line: None,
             partial_body: false,
         }
     }
