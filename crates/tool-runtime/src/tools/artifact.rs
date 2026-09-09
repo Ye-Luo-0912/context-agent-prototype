@@ -25,6 +25,10 @@ use super::Tool;
 /// call regardless of the line range.
 const MAX_READ_BYTES: usize = 2 * 1024 * 1024;
 const MAX_READ_LINES: usize = 400;
+/// `{:>6} | ` numbering prefix added to every rendered line; the capture
+/// budget reserves this per line so the FINAL rendered content stays
+/// within [`MAX_READ_BYTES`].
+const RENDER_PREFIX_CHARS: usize = 8;
 /// Per-call scan budget (W06). Producers cap captured logs at 8 MiB, so
 /// every legally produced artifact is fully reachable; the scan streams —
 /// it never materializes the file. A file beyond this budget is readable
@@ -115,12 +119,17 @@ impl Tool for ArtifactReadTool {
         // when the totals stopped at the scan budget.
         let file = confined.into_tokio();
         let mut reader = tokio::io::BufReader::new(file.take(MAX_SCAN_BYTES));
+        // Reserve the per-line numbering overhead so the final rendered
+        // content stays within MAX_READ_BYTES (W06 复核：声明预算约束的是
+        // 实际返回字符串).
+        let capture_cap = MAX_READ_BYTES - MAX_READ_LINES * RENDER_PREFIX_CHARS;
         let mut captured = String::new();
         let mut captured_bytes = 0usize;
         let mut captured_truncated = false;
         let mut line_bytes = Vec::new();
         let mut scanned_bytes = 0u64;
         let mut counted_lines = 0usize;
+        let mut last_captured_line = 0usize;
         loop {
             line_bytes.clear();
             let read = reader
@@ -133,15 +142,34 @@ impl Tool for ArtifactReadTool {
             scanned_bytes += read as u64;
             counted_lines += 1;
             if counted_lines >= args.start_line && counted_lines <= args.end_line {
-                let room = MAX_READ_BYTES.saturating_sub(captured_bytes);
-                if line_bytes.len() <= room {
-                    captured_bytes += line_bytes.len();
-                    captured.push_str(&String::from_utf8_lossy(&line_bytes));
+                // The capture budget applies to the RENDERED text: raw
+                // bytes can expand under lossy UTF-8 rendering (one
+                // invalid byte becomes a three-byte replacement char), so
+                // budgeting raw bytes could still overrun the cap.
+                let rendered = String::from_utf8_lossy(&line_bytes);
+                let room = capture_cap.saturating_sub(captured_bytes);
+                if room == 0 {
+                    // Capture budget exhausted: the remaining window lines
+                    // exist but are not shown. `last_captured_line` stays
+                    // behind so the paging cursor points at them.
+                } else if rendered.len() <= room {
+                    captured_bytes += rendered.len();
+                    captured.push_str(&rendered);
+                    last_captured_line = counted_lines;
                 } else {
-                    // Artifacts can carry non-UTF-8 bytes (process logs);
-                    // the window itself is shown lossily and capped.
-                    captured.push_str(&String::from_utf8_lossy(&line_bytes[..room]));
+                    // W06 复核反例：截断必须消费预算、必须以行边界收尾，
+                    // 否则截断尾与下一行拼接、预算声明失真。
+                    let mut take = room;
+                    while take > 0 && !rendered.is_char_boundary(take) {
+                        take -= 1;
+                    }
+                    captured.push_str(&rendered[..take]);
+                    if !captured.ends_with('\n') {
+                        captured.push('\n');
+                    }
+                    captured_bytes += take;
                     captured_truncated = true;
+                    last_captured_line = counted_lines;
                 }
             }
         }
@@ -157,14 +185,16 @@ impl Tool for ArtifactReadTool {
             .map(|(offset, line)| format!("{:>6} | {}", args.start_line + offset, line))
             .collect::<Vec<_>>()
             .join("\n");
-        let has_more = if scan_complete {
-            args.end_line < counted_lines
-        } else {
-            // The totals stopped at the scan budget: a further page may
-            // still exist and the cursor must not claim the file ended.
-            true
-        };
-        let next_start_line = if has_more {
+        // The cursor must not hide unshown data: lines captured-then-
+        // dropped from the window (capture cap) and lines beyond the scan
+        // budget both leave pages unreadable only if `has_more` lied.
+        let first_unshown_in_window = (last_captured_line + 1).max(args.start_line);
+        let in_window_unshown = first_unshown_in_window <= args.end_line.min(counted_lines);
+        let beyond_window = scan_complete && args.end_line < counted_lines;
+        let has_more = !scan_complete || in_window_unshown || beyond_window;
+        let next_start_line = if in_window_unshown {
+            first_unshown_in_window
+        } else if has_more {
             args.end_line + 1
         } else {
             args.end_line
@@ -488,5 +518,85 @@ mod tests {
             output.model_content
         );
         assert_eq!(output.metadata["next_start_line"], deep_start + 11);
+    }
+
+    /// W06 复核反例：一条 3 MiB 的长首行＋100 行尾部。截断必须消费捕获
+    /// 预算、以行边界收尾（不得把截断尾与 tail-0 拼接成一行）、返回字符
+    /// 串不得超出声明的捕获预算，且游标必须指向第一个未展示的行。
+    #[tokio::test]
+    async fn long_first_line_truncates_at_the_cap_without_merging_lines() {
+        let dir = tempfile::tempdir().unwrap();
+        let workspace = Workspace::open(dir.path()).await.unwrap();
+        let run_id = RunId::new();
+        let mut body = "l".repeat(3 * 1024 * 1024);
+        body.push('\n');
+        for index in 0..100 {
+            body.push_str(&format!("tail-{index}\n"));
+        }
+        let reference = workspace
+            .write_artifact(run_id, "process", "log", body.as_bytes())
+            .await
+            .unwrap();
+        let tool = ArtifactReadTool::new(workspace);
+
+        let output = value(
+            tool.execute(
+                run_id,
+                "c",
+                request(run_id, json!({"reference": reference}))
+                    .call
+                    .arguments,
+                None,
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap(),
+        );
+        assert!(output.ok);
+        assert_eq!(output.metadata["total_lines"], 101);
+        assert_eq!(output.metadata["total_lines_complete"], true);
+        assert_eq!(output.metadata["window_truncated"], true);
+        assert_eq!(
+            output.model_content.lines().count(),
+            1,
+            "the truncated long line is one rendered line"
+        );
+        assert!(
+            !output.model_content.contains("tail-0"),
+            "the truncated tail must not merge with the next line"
+        );
+        assert!(
+            output.model_content.len() <= MAX_READ_BYTES,
+            "the returned string must stay within the declared capture cap: {}",
+            output.model_content.len()
+        );
+        assert_eq!(output.metadata["has_more"], true);
+        assert_eq!(
+            output.metadata["next_start_line"], 2,
+            "the cursor must point at the first unshown line"
+        );
+
+        // The next page is reachable and shows the tail lines untouched.
+        let page2 = value(
+            tool.execute(
+                run_id,
+                "c",
+                request(
+                    run_id,
+                    json!({"reference": reference, "start_line": 2, "end_line": 200}),
+                )
+                .call
+                .arguments,
+                None,
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap(),
+        );
+        assert!(page2.model_content.contains("tail-0"));
+        assert!(page2.model_content.contains("tail-99"));
+        assert_eq!(page2.metadata["total_lines"], 101);
+        assert_eq!(page2.metadata["window_truncated"], false);
+        assert_eq!(page2.metadata["has_more"], false);
     }
 }

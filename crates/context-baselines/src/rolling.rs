@@ -457,13 +457,18 @@ impl ContextEngine for RollingSummaryEngine {
         // 留在工作集，如实报告为 deferred_folds，由下一次维护继续消费。
         let mut calls = 0usize;
         let mut deferred_folds = 0usize;
-        while let Some(mut job) = self.take_fold_job() {
+        loop {
+            // W04(P2)：预算检查必须发生在 take_fold_job 把候选移出工作集
+            // **之前**——移出之后再数延期会看到空工作集而误报 0，随后守卫
+            // 又把候选还回去。零调用预算的反例：两条候选留在工作集，
+            // deferred_folds 必须如实报告 2。
             if self.compactor.is_some() && calls >= self.config.max_compactor_calls_per_maintain {
                 deferred_folds = self.fold_candidates_pending();
-                // 预算耗尽：本回合不再发起新的压缩调用，job 丢弃，守卫把
-                // 移出的候选还回工作集（与失败路径同一守卫）。
                 break;
             }
+            let Some(mut job) = self.take_fold_job() else {
+                break;
+            };
             let Some(compacted) = self.compact_fold(&job).await else {
                 // 压缩失败：job 在此丢弃，守卫归还记录、旧摘要未被触碰，
                 // 折叠前状态保留。本回合不再重试同一折叠，避免对失败

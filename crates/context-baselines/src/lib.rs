@@ -772,6 +772,47 @@ mod tests {
         );
     }
 
+    /// W04(P2) 复核反例：零调用预算时不得先移走候选再统计——候选必须
+    /// 留在工作集且 deferred_folds 如实报告，而不是误报 0。
+    #[tokio::test]
+    async fn zero_budget_reports_the_deferred_candidates_it_never_moved() {
+        let counting = Arc::new(CountingCompactor(std::sync::atomic::AtomicUsize::new(0)));
+        let engine = RollingSummaryEngine::with_config(RollingConfig {
+            summary_threshold_tokens: 30,
+            keep_most_recent_tokens: 4,
+            max_compactor_calls_per_maintain: 0,
+        })
+        .with_compactor(Arc::clone(&counting) as Arc<dyn BoundedCompactor>);
+        for index in 0..3 {
+            engine
+                .ingest(ContextIngress::AssistantMessage {
+                    content: format!("history record {index}: {}", "x".repeat(700)),
+                })
+                .await
+                .unwrap();
+        }
+        let before = engine.diagnostics().await.unwrap();
+        let report = engine
+            .maintain(ContextMaintenanceTrigger::AfterModel)
+            .await
+            .unwrap();
+        assert_eq!(
+            counting.0.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "a zero budget must not issue any compactor call"
+        );
+        assert_eq!(report.archived, 0);
+        assert!(
+            report.deferred_folds > 0,
+            "the deferred candidates must be counted while still in the working set"
+        );
+        let after = engine.diagnostics().await.unwrap();
+        assert_eq!(
+            after.total_items, before.total_items,
+            "no candidate may leave the working set under a zero budget"
+        );
+    }
+
     struct GatedCompactor {
         entered: Arc<tokio::sync::Notify>,
     }
