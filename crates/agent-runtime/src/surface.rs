@@ -33,6 +33,12 @@ pub(crate) struct RoundSurfacePlan {
     task_preferred: HashSet<String>,
     legacy_generation: u64,
     source_revisions: ToolSurfaceSourceRevisions,
+    /// Compiled once per round before the model input is assembled; the
+    /// execution snapshot reuses them so the request and tool-call
+    /// validation consume the same final surface.
+    schema_profiles: BTreeMap<String, SchemaProfile>,
+    schema_rejected: Vec<String>,
+    schema_compiled: bool,
 }
 
 #[derive(Clone, Copy)]
@@ -205,6 +211,9 @@ impl RoundSurfacePlan {
             task_preferred,
             legacy_generation: candidates.generation,
             source_revisions,
+            schema_profiles: BTreeMap::new(),
+            schema_rejected: Vec::new(),
+            schema_compiled: false,
         }
     }
 
@@ -453,28 +462,92 @@ impl RoundSurfacePlan {
         }
     }
 
-    pub(crate) fn into_snapshot(mut self, surface_revision: u64) -> ToolSurfaceSnapshot {
-        // Compile the bounded schema profile for every surfaced tool once
-        // per revision. A schema that uses an unsupported keyword or exceeds
-        // the compile bounds fails capability admission: the tool is not
-        // presented to the model and its rejection is recorded for
-        // diagnostics. The gate refuses rather than silently skipping
-        // validation.
+    /// Compile the bounded schema profile for every planned tool and remove
+    /// the ones that fail. The model path runs this before the input is
+    /// assembled, the budgets are computed and the Ready report is
+    /// produced, so the provider request and the execution snapshot
+    /// describe the same final surface (`names(ModelRequest.tools)` equals
+    /// the snapshot's spec names). A schema that uses an unsupported
+    /// keyword or exceeds the compile bounds fails capability admission
+    /// here: the tool is not presented to the model, its rejection is
+    /// recorded for diagnostics, and a MustSurface requirement it carried
+    /// is returned as an explicit block so the caller refuses the round
+    /// instead of silently dropping a required tool.
+    pub(crate) fn compile_schema_profiles(&mut self) -> Vec<ToolSurfaceBlock> {
         let mut schema_profiles: BTreeMap<String, SchemaProfile> = BTreeMap::new();
         let mut schema_rejected: Vec<String> = Vec::new();
+        let mut rejected: Vec<ToolSpec> = Vec::new();
         for spec in &self.specs {
             match SchemaProfile::compile(&spec.input_schema) {
                 Ok(profile) => {
                     schema_profiles.insert(spec.name.clone(), profile);
                 }
-                Err(error) if schema_rejected.len() < MAX_SCHEMA_REJECTED_ROWS => {
-                    schema_rejected.push(format!("{}: {error}", bounded_schema_name(&spec.name)));
+                Err(error) => {
+                    if schema_rejected.len() < MAX_SCHEMA_REJECTED_ROWS {
+                        schema_rejected
+                            .push(format!("{}: {error}", bounded_schema_name(&spec.name)));
+                    }
+                    rejected.push(spec.clone());
                 }
-                Err(_) => {}
             }
+        }
+        let mut blocked = Vec::new();
+        for spec in &rejected {
+            if self.mandatory.contains(&spec.name) {
+                blocked.push(ToolSurfaceBlock {
+                    tool_name: bounded_name(&spec.name),
+                    demand: ToolSurfaceDemand::MustSurface,
+                    reason: ToolSurfaceBlockReason::Unavailable,
+                });
+            }
+            push_omission(
+                &mut self.omissions,
+                &mut self.omitted_total,
+                ToolSurfaceOmission {
+                    tool_name: spec.name.clone(),
+                    demand: self
+                        .demands
+                        .get(&spec.name)
+                        .copied()
+                        .unwrap_or(ToolSurfaceDemand::PreferSurface),
+                    origin: self
+                        .origins
+                        .get(&spec.name)
+                        .copied()
+                        .unwrap_or(ToolSurfaceOrigin::Unknown),
+                    reason: ToolSurfaceOmissionReason::Unavailable,
+                    approx_tokens: approx_layer_tokens(spec),
+                },
+            );
         }
         self.specs
             .retain(|spec| schema_profiles.contains_key(&spec.name));
+        self.mandatory
+            .retain(|name| schema_profiles.contains_key(name));
+        self.task_preferred
+            .retain(|name| schema_profiles.contains_key(name));
+        self.schema_profiles = schema_profiles;
+        self.schema_rejected = schema_rejected;
+        self.schema_compiled = true;
+        blocked
+    }
+
+    pub(crate) fn into_snapshot(mut self, surface_revision: u64) -> ToolSurfaceSnapshot {
+        // The model path compiled the profiles before assembly, budget and
+        // Ready reporting; direct snapshot consumers that skipped that step
+        // still filter here. Either way the immutable round snapshot lists
+        // exactly the tools whose schemas compiled.
+        if !self.schema_compiled {
+            let _ = self.compile_schema_profiles();
+        }
+        // Provider-budget omissions applied after compilation may have
+        // removed specs from the plan; the snapshot carries profiles
+        // exactly for the specs it lists.
+        if !self.schema_profiles.is_empty() {
+            let surfaced: HashSet<&String> = self.specs.iter().map(|spec| &spec.name).collect();
+            self.schema_profiles
+                .retain(|name, _| surfaced.contains(name));
+        }
         ToolSurfaceSnapshot {
             specs: self.specs,
             generation: self.legacy_generation,
@@ -482,8 +555,8 @@ impl RoundSurfacePlan {
             source_revisions: self.source_revisions,
             omissions: self.omissions,
             omitted_total: self.omitted_total,
-            schema_profiles,
-            schema_rejected,
+            schema_profiles: self.schema_profiles,
+            schema_rejected: self.schema_rejected,
         }
     }
 }
@@ -1104,5 +1177,126 @@ mod tests {
         );
         assert!(!snapshot.schema_profiles.contains_key("plugin.broken"));
         assert!(snapshot.schema_profiles.contains_key("fs.read"));
+    }
+
+    fn broken_spec(name: &str) -> ToolSpec {
+        let mut spec = spec(name, 10);
+        spec.input_schema = json!({
+            "type": "object",
+            "properties": {"x": {"anyOf": [{"type": "string"}]}}
+        });
+        spec
+    }
+
+    /// The pre-assembly compile step feeds every downstream consumer: the
+    /// plan specs, the Ready report and the execution snapshot all stop
+    /// listing the rejected tool, and a MustSurface requirement it carried
+    /// comes back as an explicit block instead of a silent drop.
+    #[test]
+    fn compile_schema_profiles_blocks_must_surface_and_filters_the_plan() {
+        let candidates = ToolSurfaceSnapshot {
+            specs: vec![spec("fs.read", 10), broken_spec("plugin.broken")],
+            ..Default::default()
+        };
+        let requirements = vec![requirement("plugin.broken", ToolSurfaceDemand::MustSurface)];
+        let mut plan = RoundSurfacePlan::build(candidates, &requirements, |name| name != "fs.read");
+
+        let blocked = plan.compile_schema_profiles();
+        assert_eq!(blocked.len(), 1, "a rejected MustSurface tool must block");
+        assert_eq!(blocked[0].tool_name, "plugin.broken");
+        assert_eq!(blocked[0].demand, ToolSurfaceDemand::MustSurface);
+
+        let names: Vec<&str> = plan.specs().iter().map(|spec| spec.name.as_str()).collect();
+        assert_eq!(names, ["fs.read"]);
+        assert!(plan.omissions.iter().any(|row| {
+            row.tool_name == "plugin.broken"
+                && row.reason == ToolSurfaceOmissionReason::Unavailable
+                && row.demand == ToolSurfaceDemand::MustSurface
+        }));
+
+        // The snapshot reuses the compiled profiles instead of recompiling.
+        let snapshot = plan.into_snapshot(3);
+        let snapshot_names: Vec<&str> = snapshot
+            .specs
+            .iter()
+            .map(|spec| spec.name.as_str())
+            .collect();
+        assert_eq!(snapshot_names, ["fs.read"]);
+        assert_eq!(snapshot.schema_profiles.len(), 1);
+        assert!(snapshot.schema_profiles.contains_key("fs.read"));
+        assert!(
+            snapshot
+                .schema_rejected
+                .iter()
+                .any(|row| row.contains("plugin.broken"))
+        );
+    }
+
+    /// An optional tool with a rejected schema is filtered before the Ready
+    /// report: the report's selected set equals the compiled final surface
+    /// and the rejection is an explicit omission row, not a disappearance.
+    #[test]
+    fn optional_schema_rejection_stays_out_of_the_ready_report() {
+        let candidates = ToolSurfaceSnapshot {
+            specs: vec![spec("fs.read", 10), broken_spec("plugin.broken")],
+            ..Default::default()
+        };
+        let mut plan = RoundSurfacePlan::build(candidates, &[], |name| name != "fs.read");
+
+        assert!(
+            plan.compile_schema_profiles().is_empty(),
+            "an optional rejection must not block the round"
+        );
+        let names: Vec<&str> = plan.specs().iter().map(|spec| spec.name.as_str()).collect();
+        assert_eq!(names, ["fs.read"]);
+
+        let report = plan.ready_report(SurfaceReportContext {
+            turn_id: TurnId::new(),
+            model_round: 1,
+            surface_revision: 1,
+            estimated_input_tokens: 0,
+            input_budget_tokens: 0,
+        });
+        assert_eq!(report.status, ToolSurfacePlanStatus::Ready);
+        let selected: Vec<&str> = report
+            .selected
+            .iter()
+            .map(|row| row.tool_name.as_str())
+            .collect();
+        assert_eq!(
+            selected, names,
+            "the Ready report must describe the same final set as the request"
+        );
+        assert!(report.omitted.iter().any(|row| {
+            row.tool_name == "plugin.broken" && row.reason == ToolSurfaceOmissionReason::Unavailable
+        }));
+    }
+
+    /// Provider-budget omission after compilation must not leave a stale
+    /// profile in the snapshot: the snapshot's profiles match its specs
+    /// exactly, so names(ModelRequest.tools) == names(snapshot.specs)
+    /// survives the degradation path too.
+    #[test]
+    fn budget_omission_after_compilation_drops_the_stale_profile() {
+        let candidates = ToolSurfaceSnapshot {
+            specs: vec![spec("core.read", 10), spec("optional.large", 10)],
+            ..Default::default()
+        };
+        let mut plan = RoundSurfacePlan::build(candidates, &[], |name| name != "core.read");
+        assert!(plan.compile_schema_profiles().is_empty());
+        assert!(plan.omit_largest_for_provider_budget().is_some());
+
+        let snapshot = plan.into_snapshot(2);
+        let snapshot_names: Vec<&str> = snapshot
+            .specs
+            .iter()
+            .map(|spec| spec.name.as_str())
+            .collect();
+        assert_eq!(snapshot_names, ["core.read"]);
+        assert_eq!(
+            snapshot.schema_profiles.len(),
+            snapshot.specs.len(),
+            "profiles must match the surviving specs exactly"
+        );
     }
 }

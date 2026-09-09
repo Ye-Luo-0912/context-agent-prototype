@@ -630,6 +630,64 @@ impl RuntimeActor {
             return;
         }
 
+        // Compile the bounded schema profiles before anything downstream
+        // consumes the plan: the assembled request, the budget checks, the
+        // Ready report and the execution snapshot must all describe the
+        // same final surface, so the model is never shown a tool that
+        // Core's execution surface would reject. A schema-rejected
+        // MustSurface requirement is an explicit unsatisfiable refusal,
+        // never a silently dropped tool.
+        let schema_blocked = surface_plan.compile_schema_profiles();
+        if !schema_blocked.is_empty() {
+            let rejected_names = schema_blocked
+                .iter()
+                .map(|block| block.tool_name.as_str())
+                .collect::<Vec<_>>()
+                .join(", ");
+            let surface_revision = match self.issue_surface_revision() {
+                Ok(revision) => revision,
+                Err(error) => {
+                    self.fail_round_preparation("surface_revision", error).await;
+                    return;
+                }
+            };
+            let report = surface_plan.unsatisfiable_report(
+                SurfaceReportContext {
+                    turn_id,
+                    model_round,
+                    surface_revision,
+                    estimated_input_tokens: 0,
+                    input_budget_tokens: 0,
+                },
+                ToolSurfaceBlockReason::Unavailable,
+                schema_blocked,
+            );
+            if let Err(error) = self
+                .core
+                .emit_event(RuntimeEvent::ToolSurfacePlanned { report })
+                .await
+            {
+                // The refusal decision itself could not be journaled: the
+                // audit trail must not lose why this round never started.
+                self.fail_round_preparation("tool_surface_planned_event", error)
+                    .await;
+                return;
+            }
+            // Deliberate refusal, not a fault: settle the applied input and
+            // drop the turn without fencing.
+            let _ = self
+                .core
+                .emit_event(RuntimeEvent::Error {
+                    message: crate::output::bound_error_message(format!(
+                        "the active task requires a tool whose input schema was rejected by schema compilation ({}); refusing to start the model round",
+                        rejected_names
+                    )),
+                })
+                .await;
+            self.settle_aborted_turn().await;
+            return;
+        }
+
         if surface_plan.mandatory_schema_tokens() > MAX_TOOL_SURFACE_TOKENS {
             let surface_revision = match self.issue_surface_revision() {
                 Ok(revision) => revision,
@@ -854,6 +912,11 @@ impl RuntimeActor {
             &turn_frame,
             surface_plan.specs().to_vec(),
         );
+        // TEMP-DBG
+        {
+            let names: Vec<String> = input.tool_schemas.iter().map(|t| t.name.clone()).collect();
+            eprintln!("DBG assembled input.tool_schemas={names:?}");
+        }
         // A second packed request exists only for the diagnostic off arm.
         // Ordinary product off/on paths measure and trim `input` directly;
         // they neither assemble nor clone a second ModelInput.

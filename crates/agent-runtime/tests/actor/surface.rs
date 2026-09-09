@@ -1440,6 +1440,197 @@ async fn mandatory_schema_cap_is_reported_before_model_start() {
     handle.stop().await.unwrap();
 }
 
+/// A dispatcher with one valid mandatory tool and one optional tool whose
+/// schema uses an unsupported JSON-schema keyword. Capability admission
+/// validates only name/description/size/count, so the broken schema is
+/// loaded into the plan; schema compilation must filter it before the
+/// request is assembled.
+#[derive(Debug)]
+struct SchemaBrokenToolDispatcher;
+
+#[async_trait::async_trait]
+impl ToolDispatcher for SchemaBrokenToolDispatcher {
+    fn specs(&self) -> Vec<ToolSpec> {
+        vec![
+            ToolSpec {
+                name: "fs.read".into(),
+                description: "valid core reader".into(),
+                input_schema: serde_json::json!({"type": "object"}),
+                risk: ToolRisk::ReadOnly,
+                output_budget: None,
+                roles: Vec::new(),
+            },
+            ToolSpec {
+                name: "plugin.broken".into(),
+                description: "registered with an unsupported anyOf schema".into(),
+                input_schema: serde_json::json!({
+                    "type": "object",
+                    "properties": {"x": {"anyOf": [{"type": "string"}]}}
+                }),
+                risk: ToolRisk::ReadOnly,
+                output_budget: None,
+                roles: Vec::new(),
+            },
+        ]
+    }
+
+    fn may_omit_from_round(&self, name: &str) -> bool {
+        name == "plugin.broken"
+    }
+
+    async fn execute(&self, _request: ToolExecutionRequest) -> AgentResult<ToolOutcome> {
+        Err(AgentError::Tool("never called in these tests".into()))
+    }
+}
+
+/// The real request path: a schema-rejected tool must never reach
+/// `ModelRequest.tools`, and the Ready report must describe exactly the
+/// same final set the request carries (the set the execution snapshot
+/// validates against).
+#[tokio::test]
+async fn schema_rejected_tools_never_reach_the_model_request() {
+    let model = Arc::new(RecordingModel::default());
+    let kernel = Arc::new(RuntimeServices::new(
+        CoreAuthorityConfig::default(),
+        Arc::new(TestContextEngine),
+        model.clone(),
+        Arc::new(SchemaBrokenToolDispatcher),
+        Arc::new(PolicyApprovalGate::read_only()),
+        None,
+    ));
+    let (handle, _task) = spawn_runtime(kernel);
+    let mut events = handle.subscribe();
+    handle.start().await.unwrap();
+    handle.user_message("use the tools".into()).await.unwrap();
+    let report = wait_for_ready_surface_and_model_start(&mut events).await;
+
+    let request_names: Vec<String> = {
+        let requests = model.requests.lock().unwrap();
+        assert_eq!(requests.len(), 1, "the turn must send exactly one request");
+        requests[0]
+            .tools
+            .iter()
+            .map(|spec| spec.name.clone())
+            .collect()
+    };
+    assert_eq!(
+        request_names,
+        ["fs.read"],
+        "the request must carry exactly the compiled execution surface"
+    );
+    let selected_names: Vec<&str> = report
+        .selected
+        .iter()
+        .map(|row| row.tool_name.as_str())
+        .collect();
+    assert_eq!(
+        selected_names, request_names,
+        "the Ready report and the request must describe the same final set"
+    );
+    assert!(report.omitted.iter().any(|row| {
+        row.tool_name == "plugin.broken" && row.reason == ToolSurfaceOmissionReason::Unavailable
+    }));
+    handle.stop().await.unwrap();
+}
+
+/// A MustSurface requirement on a schema-rejected tool is an explicit
+/// unsatisfiable refusal before ModelStarted: the blocked tool is named,
+/// the refusal retains its cause, and the provider is never called.
+#[tokio::test]
+async fn must_surface_schema_rejection_is_unsatisfiable_before_model_start() {
+    use agent_contracts::InputLifecycle;
+
+    let model = Arc::new(RecordingModel::default());
+    let kernel = Arc::new(RuntimeServices::new(
+        CoreAuthorityConfig::default(),
+        Arc::new(TestContextEngine),
+        model.clone(),
+        Arc::new(SchemaBrokenToolDispatcher),
+        Arc::new(PolicyApprovalGate::read_only()),
+        None,
+    ));
+    let (handle, _task) = spawn_runtime(kernel);
+    let mut surface_events = handle.subscribe();
+    let mut all_events = handle.subscribe();
+    handle.start().await.unwrap();
+    handle
+        .set_focus("must use the broken tool".into())
+        .await
+        .unwrap();
+    let task_id = handle.list_tasks().await.unwrap()[0].id;
+    handle
+        .replace_task_tool_requirements(
+            task_id,
+            0,
+            vec![ToolSurfaceRequirement {
+                tool_name: "plugin.broken".into(),
+                demand: ToolSurfaceDemand::MustSurface,
+                reason: "the task cannot proceed without it".into(),
+            }],
+        )
+        .await
+        .unwrap();
+    handle.user_message("start".into()).await.unwrap();
+
+    let report = wait_for_surface_plan(&mut surface_events).await;
+    assert_eq!(
+        report.status,
+        ToolSurfacePlanStatus::Unsatisfiable {
+            reason: ToolSurfaceBlockReason::Unavailable,
+        }
+    );
+    assert!(report.blocked.iter().any(|row| {
+        row.tool_name == "plugin.broken" && row.demand == ToolSurfaceDemand::MustSurface
+    }));
+    assert!(
+        report
+            .omitted
+            .iter()
+            .any(|row| row.tool_name == "plugin.broken"),
+        "the refusal must keep the rejected tool visible in the audit rows"
+    );
+
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    let mut saw_model_started = false;
+    let mut saw_commit_failed = false;
+    let mut saw_schema_refusal = false;
+    let mut settled = false;
+    while let Ok(envelope) = all_events.try_recv() {
+        match envelope.event {
+            RuntimeEvent::ModelStarted { .. } => saw_model_started = true,
+            RuntimeEvent::TurnCommitFailed { .. } => saw_commit_failed = true,
+            RuntimeEvent::Error { message } => {
+                saw_schema_refusal |= message.contains("schema compilation");
+            }
+            RuntimeEvent::UserMessageAccepted { input } => {
+                settled |= input.lifecycle == InputLifecycle::InterruptCommitted;
+            }
+            _ => {}
+        }
+    }
+    assert!(
+        !saw_model_started,
+        "an unsatisfiable round must not claim the model started"
+    );
+    assert!(
+        !saw_commit_failed,
+        "a deliberate refusal must not journal a turn-commit failure"
+    );
+    assert!(
+        saw_schema_refusal,
+        "the refusal must name the schema-rejection cause explicitly"
+    );
+    assert!(
+        settled,
+        "a refused round must commit the applied input's interruption"
+    );
+    assert!(
+        model.requests.lock().unwrap().is_empty(),
+        "a schema-rejected MustSurface requirement must never reach the provider"
+    );
+    handle.stop().await.unwrap();
+}
+
 #[tokio::test]
 async fn surface_event_failure_aborts_before_model_start_and_provider_call() {
     let model = Arc::new(VariableWindowModel::new(16_000));
