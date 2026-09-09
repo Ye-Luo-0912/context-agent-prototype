@@ -1385,12 +1385,15 @@ impl Workspace {
     }
 
     /// Read the change journal (B3): the newest records first, bounded by
-    /// `limit` and (when supplied) by the exclusive `after_tx` cursor — only
-    /// records *newer* than the cursor (written later in the append-only
-    /// journal) are returned, the cursor's own record never is, and records
-    /// older than it are skipped. A caller that keeps the oldest returned
-    /// `tx_id` and asks again with a LARGER limit walks strictly older
-    /// records deterministically.
+    /// `limit` and (when supplied) by the exclusive `after_tx` cursor — the
+    /// cursor names a transaction, so EVERY phase of that transaction (its
+    /// Prepared, Committed and any other record sharing the id) is excluded,
+    /// and only records strictly newer than the whole transaction are
+    /// returned (R12: a transaction id is not a unique record position, so
+    /// the cursor must advance past the entire transaction, never a single
+    /// phase). A caller that keeps the oldest returned `tx_id` and asks
+    /// again with a LARGER limit walks strictly older records
+    /// deterministically.
     ///
     /// Reading is a single sequential pass over the journal with constant
     /// memory: each line is parsed as one [`ChangeRecord`] and only the most
@@ -1422,9 +1425,12 @@ impl Workspace {
             Err(error) => return Err(AgentError::Storage(format!("open change journal: {error}"))),
         };
         // Newest-first ring: parsed newest at index 0, capped at `limit`.
-        // Until the cursor is reached (when one is given) everything is
-        // skipped; the cursor's own record is skipped too, and only records
-        // written after it are collected.
+        // The cursor names a TRANSACTION, not a single journal record: a
+        // write journals multiple phases under the same tx_id (Prepared then
+        // Committed), so "cursor reached" must exclude every record of that
+        // transaction and only collect records strictly newer than it —
+        // otherwise the same transaction's later phases are returned again
+        // and the incremental cursor never advances (R12).
         let mut newest: VecDeque<ChangeRecord> = VecDeque::with_capacity(limit);
         let mut after_cursor = after_tx.is_none();
         use std::io::BufRead;
@@ -1434,10 +1440,14 @@ impl Workspace {
             let record: ChangeRecord = serde_json::from_str(&line).map_err(|e| {
                 AgentError::Storage(format!("change journal line is not valid JSON: {e}"))
             })?;
+            if after_tx == Some(record.tx_id()) {
+                // The cursor transaction — Prepared, Committed or any other
+                // phase — is at or before the cursor and never collected.
+                after_cursor = true;
+                continue;
+            }
             if !after_cursor {
-                if record.tx_id() == after_tx.expect("cursor checked above") {
-                    after_cursor = true;
-                }
+                // Strictly older than the cursor transaction.
                 continue;
             }
             newest.push_front(record);
@@ -4421,6 +4431,69 @@ mod tests {
         // A sane reading rule: no cursor + a larger limit walks older records.
         let all = workspace.read_changes(10, None).await.unwrap();
         assert_eq!(all.len(), 5);
+    }
+
+    /// R12: a normal write journals two phases under one tx_id (Prepared,
+    /// then Committed). A cursor naming that transaction must exclude EVERY
+    /// phase — using one phase as the cursor must not resurface the other
+    /// phase as "new", or the incremental cursor never advances and the
+    /// client re-reads the last commit forever.
+    #[tokio::test]
+    async fn read_changes_cursor_excludes_every_phase_of_the_same_transaction() {
+        let dir = tempfile::tempdir().unwrap();
+        let workspace = Workspace::open(dir.path()).await.unwrap();
+        // One two-phase transaction, then a genuinely newer one.
+        workspace
+            .record_change(ChangeRecord::MutationPrepared {
+                tx_id: "tx-1".into(),
+                timestamp_ms: 1,
+                tool: "fs.write".into(),
+                path: "a.txt".into(),
+                action: "overwrite".into(),
+                bytes_before: 0,
+                bytes_after: 1,
+                before_hash: "h1".into(),
+                after_hash: "h2".into(),
+                old_content: None,
+            })
+            .await
+            .unwrap();
+        workspace
+            .record_change(ChangeRecord::MutationCommitted {
+                tx_id: "tx-1".into(),
+                timestamp_ms: 2,
+            })
+            .await
+            .unwrap();
+        workspace
+            .record_change(ChangeRecord::MutationCommitted {
+                tx_id: "tx-2".into(),
+                timestamp_ms: 3,
+            })
+            .await
+            .unwrap();
+
+        // The newest record is tx-2's Committed; the client uses it as its
+        // cursor and must NOT see tx-1's stray Committed come back as new.
+        let latest = workspace.read_changes(10, None).await.unwrap();
+        assert_eq!(latest[0].tx_id(), "tx-2", "newest commit is the cursor");
+
+        let after = workspace.read_changes(10, Some("tx-2")).await.unwrap();
+        assert!(
+            after.is_empty(),
+            "nothing strictly newer than tx-2 exists — the cursor must not resurface old commits"
+        );
+
+        // The same guarantee holds when the cursor names only the PREPARED
+        // phase of a later-opened transaction: the sibling Committed must
+        // not leak back either.
+        let after_tx1 = workspace.read_changes(10, Some("tx-1")).await.unwrap();
+        let ids: Vec<&str> = after_tx1.iter().map(ChangeRecord::tx_id).collect();
+        assert_eq!(
+            ids,
+            vec!["tx-2"],
+            "only records strictly newer than the tx-1 transaction may return"
+        );
     }
 
     #[tokio::test]

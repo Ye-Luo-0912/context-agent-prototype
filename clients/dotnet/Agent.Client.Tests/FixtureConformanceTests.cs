@@ -342,4 +342,50 @@ public class FixtureConformanceTests
         var over = response with { Items = Enumerable.Repeat(item, WorkContextRequest.MaxContextItems + 1).ToArray() };
         Assert.Throws<AgentContractViolationException>(() => over.Validate());
     }
+
+    /// <summary>R06: the snapshot and task-detail goal bounds must match the
+    /// Rust side (200_000), not the old 2_000 — a legal long goal accepted
+    /// by submit would fault every snapshot/reconnect otherwise. 2,001 chars
+    /// (over the old bound) must validate; over the real bound must not.</summary>
+    [Fact]
+    public void Snapshot_and_task_detail_accept_a_long_legal_goal_like_the_host_does()
+    {
+        var longGoal = new string('g', 2_001);
+        Assert.True(longGoal.Length > 2_000, "the regression must exceed the old broken bound");
+        Assert.True(longGoal.Length <= WorkSnapshotResponse.MaxGoalChars);
+
+        var snapshot = new WorkSnapshotResponse
+        {
+            RunStarted = true,
+            RunCompleted = false,
+            Watermark = 1,
+            Focus = new FocusSnapshot { TaskId = TaskId, Goal = longGoal, AnchorRevision = 1 },
+            Tasks = [new TaskSnapshotEntry { TaskId = TaskId, Goal = longGoal, Status = TaskSnapshotStatus.Active }],
+            PendingApprovals = [],
+            ResyncRequired = false,
+        };
+        snapshot.Validate();
+
+        var detail = new WorkTaskDetailResponse
+        {
+            TaskId = TaskId,
+            Goal = longGoal,
+            Status = TaskSnapshotStatus.Active,
+            AnchorRevision = 1,
+            Anchor = new TaskAnchorView { Revision = 1, OriginalGoal = longGoal, CurrentInterpretation = longGoal },
+        };
+        detail.Validate();
+
+        // Over the real shared bound is still refused.
+        var overGoal = new string('g', WorkSnapshotResponse.MaxGoalChars + 1);
+        Assert.Throws<AgentContractViolationException>(() =>
+            (detail with { Goal = overGoal }).Validate());
+        Assert.Throws<AgentContractViolationException>(() =>
+            (snapshot with
+            {
+                Focus = new FocusSnapshot { TaskId = TaskId, Goal = overGoal, AnchorRevision = 1 },
+            }).Validate());
+    }
+
+    private const string TaskId = "00000000-0000-4000-8000-000000000022";
 }

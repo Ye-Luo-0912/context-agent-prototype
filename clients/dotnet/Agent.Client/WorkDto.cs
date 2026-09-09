@@ -303,7 +303,11 @@ public sealed record WorkSnapshotResponse : IProtocolPayload
 {
     public const int MaxTasks = 256;
     public const int MaxPendingApprovals = 16;
-    public const int MaxGoalChars = 2_000;
+    /// Must match the Rust `MAX_SNAPSHOT_GOAL_CHARS` (200_000) exactly
+    /// (R06): the host projects accepted goals verbatim, so a snapshot
+    /// bound smaller than the submit bound would fault every reconnect for a
+    /// legal long goal.
+    public const int MaxGoalChars = 200_000;
     public const int MaxCallNameBytes = 128;
 
     [JsonPropertyName("run_started")]
