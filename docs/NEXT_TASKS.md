@@ -88,7 +88,7 @@
 |---|---|---|---|
 | C1 | 真实事件消费者、模型/工具输出、真实计划与状态 | GUI-EVENTS（基线时点；`843803f` 已落地，随 N4 验收） | 即 N4 主体 |
 | C2 | 知情审批、稳定行对象、单次刷新、连接代际与关闭清理 | F12/F13（`9fb2030`/`433d21e`/`843803f` 已落地，随 N4 验收） | 即 N4 主体＋N7 前半 |
-| C3 | 修改审阅、正式冷恢复走查、工件按需读取、只读 Context 检查 | — | 即 N5 结果半（GUI 侧）；冷恢复正式声明等 A3/B 对应验收。**已落地（2026-09-09）：`391f121` 未知提交按快照事实解除＋restore-walkthrough 走查测试；`93c300d` B3 四个只读路由（task_detail/changes/artifact/context）；`17409f1` C3 GUI 接线骨架（审阅 Tab：任务详情锚点卡/变更日志/工件＋Context 面板真实列表，全部只读、诚实 unavailable、era 丢弃、断开清空；dotnet 86/86）** |
+| C3 | 修改审阅、正式冷恢复走查、工件按需读取、只读 Context 检查 | — | 即 N5 结果半（GUI 侧）。**已关闭（2026-09-09）：`391f121` 未知提交按快照事实解除＋restore-walkthrough 走查测试；`93c300d` B3 四个只读路由（task_detail/changes/artifact/context）；`17409f1` C3 GUI 接线骨架（审阅 Tab：任务详情锚点卡/变更日志/工件＋Context 面板真实列表，全部只读、诚实 unavailable、era 丢弃、断开清空）；`a1033fe` 真实 host 链审阅钻取（四条 B3 路由经真实宿主＋工作台完整走查，dotnet 87/87）。真实 provider 与真实写变更场景照旧 NOT_RUN** |
 | C4 | 长会话资源上界、准确测量、Rust＋.NET 来源绑定包 | F14 | 即 N7＋N8。**已落地（2026-09-09）：N7 `87850ae`（MetricsSession 覆盖标注/有界采样环/显式 idle/时间预算 coalescer）＋N8 打包 `3352273`（dist.sh/dist.ps1 来源绑定：--target-dir 构建、干净 staging、agent-host/desktop 入包、SOURCE.txt 来源身份、递归 SHA256SUMS、PowerShell 原生退出码；Windows 端到端打包验证通过，bash 语法复核）** |
 
 **用户结果：**正式客户端能提交、观察、审批、继续、恢复和审阅，不依赖布局夹具。
