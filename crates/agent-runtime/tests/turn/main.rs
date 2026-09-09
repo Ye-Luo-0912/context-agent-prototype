@@ -3,6 +3,7 @@
 //! working set (Context Frame), and cancellation of a hanging model round.
 
 mod completion;
+mod directive;
 mod effects;
 mod focus;
 mod harness;

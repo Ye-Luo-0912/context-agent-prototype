@@ -59,9 +59,12 @@ pub struct TaskRecord {
     /// assembler projects a `TaskProgressView` and never scores it as a
     /// heap item.
     pub resume: crate::execution::ExecutionState,
-    /// Current user-turn directive. Replaced on every user input; never
-    /// written into `TaskAnchor` and never bumps `anchor_revision`.
+    /// Display preview of the current user-turn directive. Never use a
+    /// truncated preview as the body of a continuation.
     pub turn_intent: String,
+    /// Full current instruction identity, bound to this task and persisted
+    /// with its resume state. None on legacy checkpoints.
+    pub current_directive: Option<crate::TaskDirective>,
 }
 
 /// The bounded, revisioned tool-requirement slice of a TaskAnchor.
@@ -1396,7 +1399,17 @@ impl TaskManager {
             return;
         }
         task.turn_intent = intent;
+        task.current_directive = None;
         task.resume.on_user_turn(text);
+    }
+
+    /// Install the preview, full input identity and directive revision in
+    /// the same Actor-owned transition, after context application succeeds.
+    pub(crate) fn apply_user_directive(&mut self, text: &str, directive: crate::TaskDirective) {
+        self.on_user_turn(text);
+        if let Some(task) = self.active.and_then(|id| self.get_mut(id)) {
+            task.current_directive = Some(directive);
+        }
     }
 
     /// Record a trusted tool fact on the active task's execution state.
@@ -1590,6 +1603,7 @@ impl TaskManager {
                 anchor: task.anchor.clone(),
                 resume: task.resume.clone(),
                 turn_intent: task.turn_intent.clone(),
+                current_directive: task.current_directive.clone(),
             });
         }
         if !flipped {
@@ -1927,6 +1941,7 @@ impl TaskManager {
                     },
                     resume: crate::execution::ExecutionState::default(),
                     turn_intent: String::new(),
+                    current_directive: None,
                 });
                 self.active = Some(target);
             }
@@ -3095,6 +3110,7 @@ mod tests {
                 anchor: task.anchor.clone(),
                 resume: task.resume.clone(),
                 turn_intent: String::new(),
+                current_directive: None,
             }],
             active: Some(id),
             completed: Vec::new(),

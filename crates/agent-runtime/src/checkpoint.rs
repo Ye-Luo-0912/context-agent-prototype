@@ -602,6 +602,10 @@ pub struct TaskRecordSnapshot {
     /// Current user-turn directive. Empty on legacy checkpoints.
     #[serde(default)]
     pub turn_intent: String,
+    /// The complete current instruction is an existing sealed input ref,
+    /// or a byte-bounded inline body for compositions without artifacts.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub current_directive: Option<crate::TaskDirective>,
 }
 
 /// One dynamic capability's activation plus bounded mechanical tool
@@ -709,6 +713,14 @@ impl RuntimeCheckpoint {
                     task.id
                 ))
             })?;
+            if task.turn_intent.chars().count() > agent_contracts::MAX_TASK_ANCHOR_TEXT_CHARS {
+                return Err(AgentError::InvalidRequest(
+                    "checkpoint directive preview exceeds its character limit".into(),
+                ));
+            }
+            if let Some(directive) = &task.current_directive {
+                directive.validate(task.id)?;
+            }
         }
 
         match self.current_task_id {
@@ -873,6 +885,7 @@ impl TaskManagerSnapshot {
                     anchor: task.anchor.clone(),
                     resume: task.resume.clone(),
                     turn_intent: task.turn_intent.clone(),
+                    current_directive: task.current_directive.clone(),
                 })
                 .collect(),
             active: tasks.active(),
@@ -893,6 +906,7 @@ impl From<TaskRecordSnapshot> for TaskRecord {
             anchor: snapshot.anchor,
             resume: snapshot.resume,
             turn_intent: snapshot.turn_intent,
+            current_directive: snapshot.current_directive,
         }
     }
 }

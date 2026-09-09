@@ -8,6 +8,7 @@ mod capability;
 pub mod checkpoint;
 mod command;
 pub mod crash;
+mod directive;
 mod execution;
 pub mod frame;
 pub mod status;
@@ -47,6 +48,7 @@ pub use checkpoint::{
     decode_checkpoint_file,
 };
 pub use command::RuntimeHandle;
+pub use directive::TaskDirective;
 pub use host::{
     APPROVAL_POLICY, ARTIFACT_STORE, CONTEXT_SERVICE, CapabilityId, EVENT_STORE, MODEL_PROVIDER,
     Module, ModuleHost, ServiceRegistry, TOOL_PROVIDER,

@@ -221,6 +221,7 @@ dependencies = [
  "agent-workspace",
  "async-trait",
  "base64",
+ "context-baselines",
  "context-simple",
  "futures-util",
  "serde",

@@ -279,6 +279,15 @@ impl RuntimeActor {
         input.task_id = self.state.task_id;
         input.lifecycle = InputLifecycle::Applied;
         let applied = input.with_lifecycle(InputLifecycle::Applied);
+        let directive = if continuation {
+            None
+        } else {
+            Some(crate::TaskDirective::capture(
+                self.state.task_id.expect("an applied turn has a task"),
+                &content,
+                applied.clone(),
+            )?)
+        };
         if continuation {
             // A continuation re-runs the stored directive without
             // ingesting a new body: no context mutation precedes these
@@ -308,7 +317,10 @@ impl RuntimeActor {
             {
                 return Err(self.audit_gap_after_commit(error).await);
             }
-            self.state.tasks.on_user_turn(&content);
+            self.state.tasks.apply_user_directive(
+                &content,
+                directive.expect("new dialogue captured its full directive"),
+            );
         }
 
         // A new turn has no active call from a previous turn: the
@@ -396,22 +408,36 @@ impl RuntimeActor {
                 "no active task to continue".into(),
             ));
         };
-        let directive = self
+        // Resolve the directive only after the persisted task state is
+        // acknowledged. A body reference is not permission to resume.
+        self.continuation_durability_gate().await?;
+        let task = self
             .state
             .tasks
             .get(task_id)
-            .map(|task| task.turn_intent.trim().to_string())
-            .unwrap_or_default();
-        if directive.is_empty() {
+            .expect("the active task exists");
+        let (directive, input) = if let Some(retained) = &task.current_directive {
+            let body = retained
+                .resolve(task_id, self.services.artifact_workspace())
+                .await?;
+            let input = retained.continuation(task_id, &body);
+            (body, input)
+        } else {
+            // Legacy records below the old cap are complete. At the cap a
+            // complete instruction and a truncated one are indistinguishable;
+            // refuse rather than silently execute the stored prefix.
+            if task.turn_intent.chars().count() >= MAX_TASK_ANCHOR_TEXT_CHARS {
+                return Err(AgentError::InvalidRequest("the legacy task directive may be truncated; resend the complete instruction before continuing".into()));
+            }
+            let body = task.turn_intent.clone();
+            let input = RuntimeInputEnvelope::task_continuation(task_id, body.clone());
+            (body, input)
+        };
+        if directive.trim().is_empty() {
             return Err(AgentError::InvalidRequest(
                 "the active task has no recorded current directive to continue".into(),
             ));
         }
-        // Continuation starts from acknowledged durable state: the
-        // durability gate fails the command when the required watermark
-        // never landed, instead of starting a turn on an unfenced gap.
-        self.continuation_durability_gate().await?;
-        let input = RuntimeInputEnvelope::task_continuation(task_id, directive.clone());
         self.begin_applied_turn(directive, input, op_tx).await?;
         Ok(task_id)
     }

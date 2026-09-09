@@ -1,0 +1,189 @@
+{
+  "head": "fb1ec9c069fea05911fa360408c5b117fad90219",
+  "captured_at_utc": "2026-09-09T18:06:28.463315+00:00",
+  "note": "Selected production source identities for this workflow review; not a claim of exhaustive line coverage. Probe source is after rustfmt.",
+  "production_sources": [
+    {
+      "path": "crates/agent-contracts/src/input.rs",
+      "bytes": 14228,
+      "sha256": "fbeacd0100fde7d7c6eb6e0e2734728fdc9fa6a4aad2fa1146d502ba94b418ec"
+    },
+    {
+      "path": "crates/agent-contracts/src/tool.rs",
+      "bytes": 178941,
+      "sha256": "70ef3d91b3d9551aada98da60b4844b54a83c78796ce9c3cb11353c92a8e2b27"
+    },
+    {
+      "path": "crates/agent-contracts/src/context.rs",
+      "bytes": 150266,
+      "sha256": "1f9c4dbe4ba20469619c0e3008bd96f5cde77247b3d8f0f7e6814200316d8757"
+    },
+    {
+      "path": "crates/agent-contracts/src/compaction.rs",
+      "bytes": 2535,
+      "sha256": "0d4f3f18466817c05d2ed4f70f3534470c0de2543ca1ea96a3799eee50e5141a"
+    },
+    {
+      "path": "crates/agent-contracts/src/operation.rs",
+      "bytes": 30870,
+      "sha256": "2248b28839d1f0449935c443f0723fffe86ccb3794d6ee32205ece7dd35d2ba3"
+    },
+    {
+      "path": "crates/agent-runtime/src/actor/mod.rs",
+      "bytes": 73809,
+      "sha256": "5814ed492f43a41b0ea5a9014d5c9616eaaeefbb98a6a276b7165e813f82013e"
+    },
+    {
+      "path": "crates/agent-runtime/src/actor/model.rs",
+      "bytes": 91090,
+      "sha256": "463238ecc71dfd98e529e1c049fa3a62d9caaf8a229aa949af79ec2f7ed8f3fa"
+    },
+    {
+      "path": "crates/agent-runtime/src/actor/turn.rs",
+      "bytes": 138141,
+      "sha256": "39c185b6ccff5cf91a7498e75cffa31e9a80abe39c6e98d9b2b6b2b79d14fb7c"
+    },
+    {
+      "path": "crates/agent-runtime/src/actor/restore.rs",
+      "bytes": 15851,
+      "sha256": "2b620b7ee51fef132f5de4eba7e8d20eba9bbf3bb2c8740d8dff6755a64cb3b6"
+    },
+    {
+      "path": "crates/agent-runtime/src/actor/safepoint.rs",
+      "bytes": 26838,
+      "sha256": "5762331933bfb632c1cb1f6154cb978b7ddae1d4f2d763b27082898c0d8e2381"
+    },
+    {
+      "path": "crates/agent-runtime/src/actor/lifecycle.rs",
+      "bytes": 23523,
+      "sha256": "3ab0e5e1c7b102fc19a1650934af14d7fd53d0e569ee8bcc708fbbe83306cd89"
+    },
+    {
+      "path": "crates/agent-runtime/src/task.rs",
+      "bytes": 169672,
+      "sha256": "d17828399fa5ca754c204375a077b0e5c40c45b33b1d85cf7bf57c94c2a6c7a3"
+    },
+    {
+      "path": "crates/agent-runtime/src/execution/state.rs",
+      "bytes": 106833,
+      "sha256": "7fcbd78398b6b7c9c0d7bd5b61b79170da6910489b47a4a4c5d77d52630a5c43"
+    },
+    {
+      "path": "crates/agent-runtime/src/execution/freshness.rs",
+      "bytes": 21141,
+      "sha256": "d1a2c4d69552372cb17611aa42389778f7f473ecfd2fec1f04201e4c92a3ffad"
+    },
+    {
+      "path": "crates/agent-runtime/src/services.rs",
+      "bytes": 34971,
+      "sha256": "b705836046dc86cd5543aacb93158314096fa479a007e990d7e1681712d19dc9"
+    },
+    {
+      "path": "crates/agent-runtime/src/command.rs",
+      "bytes": 18475,
+      "sha256": "8f30a11549e9b2e67aaf8d66755848282c9c8b0dfcaec51035d42dc4c6ee9bea"
+    },
+    {
+      "path": "crates/agent-runtime/src/checkpoint.rs",
+      "bytes": 57961,
+      "sha256": "5b8690672fb35e340e99f5b7477567f1d2bb7858e5eea1c310c4d2a8f93d9994"
+    },
+    {
+      "path": "crates/agent-runtime/src/prompt.rs",
+      "bytes": 107679,
+      "sha256": "c59ad3a3e856361d9bf01e5c1f94232e242d9ba03aba4eed54d22854cf61668c"
+    },
+    {
+      "path": "crates/context-baselines/src/rolling.rs",
+      "bytes": 24398,
+      "sha256": "770d77bfc75ffe50b1b8a9f61b0e72a5b3a5db3d6e334e7184980b6af7e2083c"
+    },
+    {
+      "path": "crates/context-baselines/src/shared.rs",
+      "bytes": 9313,
+      "sha256": "befbc173c989faf11ed4a256664250230cb6c5f893b1a75b3e494cc8e099692e"
+    },
+    {
+      "path": "crates/context-simple/src/store.rs",
+      "bytes": 135012,
+      "sha256": "f9b0b8c2a998c502f63e0a8d6346c44ba340ae8eb56c7a8160a5aca55af1b9e6"
+    },
+    {
+      "path": "crates/context-simple/src/engine.rs",
+      "bytes": 106469,
+      "sha256": "12f3182da176042b6b8531d716162630b0d48d497f25a965ba616d57a449bb58"
+    },
+    {
+      "path": "crates/context-simple/src/checkpoint.rs",
+      "bytes": 7057,
+      "sha256": "01cc6f94bb32d8e96651d54a5078e3c95dd29fdf82f1266876b2ddae019db224"
+    },
+    {
+      "path": "crates/context-simple/src/materializer.rs",
+      "bytes": 63502,
+      "sha256": "c1a9decaccf64c1aa555fbd3443ba712a9bcdd70b41d2f85bbf685c4d3fd4489"
+    },
+    {
+      "path": "crates/agent-compose/src/compactor.rs",
+      "bytes": 5313,
+      "sha256": "7c0ab147d6de14091c308aa6e9c76bc37007bcf4f61c1d4220491a15912db60f"
+    },
+    {
+      "path": "crates/agent-compose/src/lib.rs",
+      "bytes": 48917,
+      "sha256": "0d375e5a52fe953521ebe627be720443fcff6307ae54d7758ecb4dcf07bdfb5f"
+    },
+    {
+      "path": "crates/agent-host/src/main.rs",
+      "bytes": 15787,
+      "sha256": "e04dd5e3cd07d4fedd41a78c58a282e23bb80094785cee0e8b8e25a2a996ff37"
+    },
+    {
+      "path": "crates/tool-runtime/src/tools/artifact.rs",
+      "bytes": 12632,
+      "sha256": "8ebda0ff36444a4197e862495b9b485b115f12c5f9aa714633832f7e5af0e8ca"
+    },
+    {
+      "path": "crates/tool-runtime/src/tools/patch.rs",
+      "bytes": 68949,
+      "sha256": "9251dccbb6e14b408b4a643b2e209351e128a5c9c58c3e6c8c11636a8063d5cd"
+    },
+    {
+      "path": "crates/tool-runtime/src/tools/mod.rs",
+      "bytes": 63497,
+      "sha256": "07cbe1f207227e9e2c9539e097ccdb5291519a8dca117cd7c43d95bc1dc91ec0"
+    },
+    {
+      "path": "crates/tool-runtime/src/tools/stream.rs",
+      "bytes": 11952,
+      "sha256": "cbc58552ba5a250e0ede97495371f5e1f88cfa79ca88c4188eb93b4477a38d32"
+    },
+    {
+      "path": "crates/tool-runtime/src/registry.rs",
+      "bytes": 113861,
+      "sha256": "e640c22b437318bde83772a55e27211ec535ed3f56b9f4b15a9aa7da745952eb"
+    }
+  ],
+  "probe_sources": [
+    {
+      "path": "docs/reviews/2026-09-10-agent-workflow-fb1ec9c/evidence/workflow-probe/Cargo.toml",
+      "bytes": 706,
+      "sha256": "7a17d2fd6768460183a72cc3282ed8ae67090bfacb2aa1bd2dd8daaebcfd66d7"
+    },
+    {
+      "path": "docs/reviews/2026-09-10-agent-workflow-fb1ec9c/evidence/workflow-probe/Cargo.lock",
+      "bytes": 19454,
+      "sha256": "0eca266e470a96f30f89c59efac6ed5484277ed0eabb8679ce19dc08fbf7d423"
+    },
+    {
+      "path": "docs/reviews/2026-09-10-agent-workflow-fb1ec9c/evidence/workflow-probe/build.rs",
+      "bytes": 958,
+      "sha256": "0c72deb5dd57d1e13430e0ee0b64220b598ac7a6922fa0fa9592d698a197195b"
+    },
+    {
+      "path": "docs/reviews/2026-09-10-agent-workflow-fb1ec9c/evidence/workflow-probe/src/main.rs",
+      "bytes": 22235,
+      "sha256": "0202f3e44f726bbdbaab52e7d9f32eb06151480649e0e3f7f6a734e32b507cc5"
+    }
+  ]
+}

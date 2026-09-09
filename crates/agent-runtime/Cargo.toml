@@ -20,6 +20,7 @@ futures-util.workspace = true
 tracing = { workspace = true }
 
 [dev-dependencies]
+context-baselines = { path = "../context-baselines" }
 agent-storage = { workspace = true }
 context-simple = { workspace = true }
 agent-workspace = { workspace = true }

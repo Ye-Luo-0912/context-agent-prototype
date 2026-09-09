@@ -1,0 +1,19 @@
+[package]
+name = "review-agent-workflow"
+version = "0.0.0"
+edition = "2024"
+
+[workspace]
+
+[dependencies]
+agent-contracts = { path = "../../../../../crates/agent-contracts" }
+agent-core = { path = "../../../../../crates/agent-core" }
+agent-runtime = { path = "../../../../../crates/agent-runtime" }
+agent-workspace = { path = "../../../../../crates/agent-workspace" }
+context-simple = { path = "../../../../../crates/context-simple" }
+context-baselines = { path = "../../../../../crates/context-baselines" }
+tool-runtime = { path = "../../../../../crates/tool-runtime" }
+async-trait = "0.1"
+serde_json = "1"
+tempfile = "3"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time"] }

@@ -296,8 +296,11 @@ impl RuntimeActor {
             .round_verification()
             .map(|projection| projection.due)
             .unwrap_or(false);
-        let turn_intent = active_task
-            .map(|task| task.turn_intent.as_str())
+        let turn_intent = self
+            .state
+            .turn
+            .as_ref()
+            .map(|turn| turn.turn_frame.user_message.as_str())
             .filter(|intent| !intent.is_empty());
         let completion_requested =
             turn_intent.is_some_and(crate::execution::ExecutionState::turn_requests_complete);
@@ -1604,8 +1607,11 @@ impl RuntimeActor {
                 .flatten(),
             catalog,
             verification_due: verification_due && verification_source_tools.is_empty(),
-            turn_intent: active_task
-                .map(|task| task.turn_intent.as_str())
+            turn_intent: self
+                .state
+                .turn
+                .as_ref()
+                .map(|turn| turn.turn_frame.user_message.as_str())
                 .filter(|intent| !intent.is_empty()),
             has_failures: snapshot
                 .map(|round| round.needs.unresolved_failure)

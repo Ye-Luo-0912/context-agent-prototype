@@ -1366,6 +1366,7 @@ mod tests {
                     anchor: TaskAnchor::default(),
                     resume: ExecutionState::default(),
                     turn_intent: String::new(),
+                    current_directive: None,
                 }],
                 active: None,
                 completed: vec![completion],

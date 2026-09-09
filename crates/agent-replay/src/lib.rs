@@ -146,12 +146,8 @@ async fn resolve_user_message_body(
     workspace: Option<&agent_workspace::Workspace>,
 ) -> anyhow::Result<String> {
     let Some(body_ref) = input.body_ref.as_deref() else {
-        // Continuation records deliberately carry only the bounded preview:
-        // the full directive lives in the task record, not the event, so
-        // the preview is the best the journal can reconstruct.
-        if input.kind == InputKind::TaskContinuation {
-            return Ok(input.preview.clone());
-        }
+        // A preview is never a full instruction merely because it is a
+        // continuation. Legacy truncated records need the original body.
         anyhow::ensure!(
             input.preview_covers_body(),
             "replay cannot resolve truncated user input without an artifact workspace (recorded {} bytes, preview {} chars)",
@@ -167,8 +163,25 @@ async fn resolve_user_message_body(
         );
         return Ok(input.preview.clone());
     };
+    let artifact_run = if input.kind == InputKind::TaskContinuation {
+        // A restored task's continuation retains its original sealed input
+        // rather than copying it into the fresh run. Ordinary new dialogue
+        // remains strictly bound to the event's run below.
+        let locator = agent_contracts::ArtifactLocator::parse_sealed(body_ref)?;
+        anyhow::ensure!(
+            locator.owner() == agent_contracts::USER_INPUT_ARTIFACT_OWNER,
+            "continuation must reference a sealed user-input artifact"
+        );
+        anyhow::ensure!(
+            input.digest.as_deref() == locator.digest().map(|digest| digest.to_string()).as_deref(),
+            "continuation input digest does not match its artifact"
+        );
+        locator.run_id()
+    } else {
+        run_id
+    };
     let (_normalized, file) = workspace
-        .open_artifact_for_run(body_ref, run_id)
+        .open_artifact_for_run(body_ref, artifact_run)
         .await
         .map_err(|error| anyhow::anyhow!("read user-input artifact {body_ref}: {error}"))?;
     // Stream under the same byte cap instead of materializing an unbounded

@@ -130,8 +130,9 @@ impl RuntimeActor {
                 host.purpose == agent_contracts::ToolExecutionPurpose::Mutate;
             let structured = execution.is_some_and(|state| state.path_is_execution_rooted(target));
             let textual = active_task.is_some_and(|task| {
-                path_exactly_in_directive(&task.turn_intent, target)
-                    || path_exactly_in_directive(&task.anchor.current_interpretation, target)
+                self.state.turn.as_ref().is_some_and(|turn| {
+                    path_exactly_in_directive(&turn.turn_frame.user_message, target)
+                }) || path_exactly_in_directive(&task.anchor.current_interpretation, target)
                     || task
                         .anchor
                         .constraints
