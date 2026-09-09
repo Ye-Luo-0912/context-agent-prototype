@@ -123,6 +123,30 @@ fn stamp(
         bump_access(state, signal);
         return true;
     }
+    // Retry-list items are stamped exactly like warm-buffer bodies: their
+    // content is still in memory and the stamp flows into the external
+    // entry when the retried write finally lands.
+    if state
+        .pending_externalize_retry
+        .iter()
+        .any(|item| item.id == item_id)
+    {
+        {
+            let item = state
+                .pending_externalize_retry
+                .iter_mut()
+                .find(|item| item.id == item_id)
+                .expect("retry item present");
+            item.last_access_tick = now_tick;
+            if let Some(turn) = turn {
+                item.last_access_turn = turn;
+                item.last_selected_turn = turn;
+                item.access_count = item.access_count.saturating_add(1);
+            }
+        }
+        bump_access(state, signal);
+        return true;
+    }
     let applied = {
         let Some(entry) = state.external.get_mut(item_id) else {
             return false;

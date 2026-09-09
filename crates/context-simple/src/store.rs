@@ -485,6 +485,9 @@ fn residual_live_candidates(state: &State) -> impl Iterator<Item = ExternalizedC
             state
                 .eviction_buffer
                 .iter()
+                // The retry list owns live in-memory bodies too; a residual
+                // free-text scan must not develop a pending-visibility gap.
+                .chain(state.pending_externalize_retry.iter())
                 .filter(|item| item.semantic.is_live())
                 .map(project_item),
         )
@@ -506,6 +509,10 @@ pub(crate) fn catalog_body(state: &State, id: ContextItemId) -> Option<ContextIt
     state
         .eviction_buffer
         .iter()
+        // Retry-list items keep their in-memory body until a successful
+        // write hands ownership to the external map, so they serve reads
+        // exactly like warm-buffer bodies.
+        .chain(state.pending_externalize_retry.iter())
         .find(|item| item.id == id && item.semantic.is_live())
         .cloned()
 }
@@ -515,7 +522,14 @@ pub(crate) fn project_search_hit(state: &State, id: ContextItemId) -> Option<Ext
         let item = &state.items[index];
         return item.semantic.is_live().then(|| project_item(item));
     }
-    if let Some(item) = state.eviction_buffer.iter().find(|item| item.id == id) {
+    if let Some(item) = state
+        .eviction_buffer
+        .iter()
+        // Same projection as warm items: the retry list still owns the
+        // body in memory.
+        .chain(state.pending_externalize_retry.iter())
+        .find(|item| item.id == id)
+    {
         return item.semantic.is_live().then(|| project_item(item));
     }
     state
@@ -974,8 +988,8 @@ fn storage_candidate(
     ) {
         return None;
     }
-    // Nothing may reference the entry anymore (dependency edges from the
-    // resident heap or the warm buffer).
+    // Nothing may reference the entry anymore (strong dependency edges from
+    // the resident heap, the warm buffer or the externalize-retry list).
     if referenced {
         return None;
     }
@@ -1000,7 +1014,9 @@ fn storage_candidate(
 /// each other's terminal history forever. Roots are:
 ///
 /// - the strong-edge targets of resident/warm items (a live working-set
-///   member's deliberate citation);
+///   member's deliberate citation), including items waiting in the
+///   externalize-retry list — a pending owner still owns its citations,
+///   and deleting the evidence it references would break the retry itself;
 /// - every non-deletable stored record itself — Live, Pinned or Durable
 ///   records are never candidates, and their strong edges must keep their
 ///   evidence targets alive even when nothing resident references the
@@ -1027,6 +1043,7 @@ pub(crate) fn plan_storage_gc(
         .items
         .iter()
         .chain(state.eviction_buffer.iter())
+        .chain(state.pending_externalize_retry.iter())
         .flat_map(|item| {
             item.dependencies
                 .iter()
@@ -1827,7 +1844,7 @@ mod tests {
             item_ids.push(state.items.last().unwrap().id);
         }
         let (short_id, deep_id) = (item_ids[0], item_ids[1]);
-        state.catalog.rebuild(&resident[..], &[], &[]);
+        state.catalog.rebuild(&resident[..], &[], &[], &[]);
 
         let hits = search_catalog(
             &state,
@@ -1868,7 +1885,7 @@ mod tests {
             state.items.push(item.clone());
             resident.push(item);
         }
-        state.catalog.rebuild(&resident[..], &[], &[]);
+        state.catalog.rebuild(&resident[..], &[], &[], &[]);
 
         let hits = search_catalog(
             &state,
@@ -2750,6 +2767,81 @@ mod tests {
         }
     }
 
+    /// R02 (safety): an owner spilled into the externalize-retry list is a
+    /// strong-reference root exactly like the same owner living in the heap.
+    /// Both cite the same terminal evidence blob with the same strong edge;
+    /// Storage GC must not delete the evidence under either ownership —
+    /// deleting it under the pending one would break the retry itself: the
+    /// write eventually lands into a state whose evidence is already gone.
+    #[test]
+    fn storage_gc_keeps_evidence_referenced_by_a_pending_retry_owner() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = store_config(dir.path());
+        let now_tick = 100;
+
+        // A real evidence blob on disk with the exact deletion profile:
+        // semantically dead, Working retention, past the storage TTL, and
+        // nothing citing it except the owner under test.
+        let evidence_id = ContextItemId::new();
+        let evidence = test_item(evidence_id, "terminal evidence body");
+        let reference = externalize(dir.path(), &evidence).unwrap();
+        let mut entry = to_external_entry(&evidence, reference, 0, 0, None);
+        entry.semantic = SemanticState::Tombstoned;
+        entry.retention = ContextRetention::Working;
+        let blob_path = file_path(dir.path(), evidence_id);
+
+        let pending_owner = |id: ContextItemId| {
+            let mut owner = test_item(id, "live owner waiting on the store");
+            owner.dependencies.push(DependencyEdge {
+                target: evidence_id,
+                kind: agent_contracts::DependencyKind::DerivedFrom,
+            });
+            owner
+        };
+
+        // Control group: the owner in the resident heap — the strong edge
+        // keeps the evidence (known-good behaviour).
+        {
+            let mut state = State::default();
+            state.external.push(entry.clone());
+            state.items.push(pending_owner(ContextItemId::new()));
+            let report = run_storage_gc(&mut state, &config, now_tick);
+            assert_eq!(
+                report.deleted, 0,
+                "a heap owner's strong edge keeps the evidence: {report:?}"
+            );
+            assert!(blob_path.exists(), "the control blob survives");
+            assert!(
+                state.external.get(evidence_id).is_some(),
+                "the control map entry survives"
+            );
+        }
+
+        // Experiment: the identical owner (live, same strong edge) spilled
+        // into the externalize-retry list by a failed store write. The edge
+        // must protect the evidence exactly the same way.
+        {
+            let mut state = State::default();
+            state.external.push(entry);
+            state
+                .pending_externalize_retry
+                .push(pending_owner(ContextItemId::new()));
+            let report = run_storage_gc(&mut state, &config, now_tick);
+            assert_eq!(
+                report.deleted, 0,
+                "a pending-retry owner is a strong-reference root too: {report:?}"
+            );
+            assert!(
+                blob_path.exists(),
+                "the evidence blob must survive while its owner waits for the retry"
+            );
+            assert!(
+                state.external.get(evidence_id).is_some(),
+                "the map entry must survive alongside the blob"
+            );
+        }
+    }
+
     /// A quarantine that fails (rename error, quarantine dir unusable) must
     /// not retire the owner: the rejected blob stays on its formal path, so
     /// the next scan sees the same rejection. Retiring the owner anyway
@@ -3054,7 +3146,7 @@ mod search_ab {
 
         state
             .catalog
-            .rebuild(&state.items[..], &[], &state.external[..]);
+            .rebuild(&state.items[..], &[], &[], &state.external[..]);
         println!(
             "AB,meta,resident={},stored={},build_and_rebuild_us={}",
             resident_count,

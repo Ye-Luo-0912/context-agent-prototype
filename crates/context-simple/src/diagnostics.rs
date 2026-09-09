@@ -8,16 +8,17 @@ use crate::item::approx_tokens;
 /// residency split (resident / warm buffer / cold store / external).
 ///
 /// `total_items` is the *logical catalog*: every item the engine knows
-/// across all body locations (resident heap + warm buffer + cold/external
-/// store entries). Each id lives in exactly one location
-/// (`has_exactly_one_owner`), so the sum is exact and replay's `final_total`
-/// is a real catalog total, not just the resident share.
+/// across all body locations (resident heap + warm buffer + externalize
+/// retry list + cold/external store entries). Each id lives in exactly one
+/// location (`has_exactly_one_owner`), so the sum is exact and replay's
+/// `final_total` is a real catalog total, not just the resident share.
 pub(crate) fn compute(state: &State) -> ContextDiagnostics {
     let mut diagnostics = ContextDiagnostics {
         total_items: state
             .items
             .len()
             .saturating_add(state.eviction_buffer.len())
+            .saturating_add(state.pending_externalize_retry.len())
             .saturating_add(state.external.len()),
         focus_generation: state.focus.as_ref().map_or(0, |f| f.generation),
         focus_task_id: state.focus.as_ref().map(|f| f.task_id),

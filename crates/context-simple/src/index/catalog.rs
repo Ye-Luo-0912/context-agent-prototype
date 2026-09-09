@@ -25,6 +25,11 @@ use agent_contracts::{
 pub(crate) enum CatalogLocation {
     Resident,
     Warm,
+    /// Waiting in the externalize-retry list: the body is still in memory
+    /// and the store write has not landed yet (a failed or cancelled IO
+    /// phase). Search and fetch project it like a warm body; only Storage
+    /// GC and the maintenance pass consume the difference.
+    Pending,
     Stored,
 }
 
@@ -32,6 +37,7 @@ pub(crate) enum CatalogLocation {
 struct CatalogFingerprint {
     heap: usize,
     warm: usize,
+    pending: usize,
     stored: usize,
     event_seq: u64,
 }
@@ -204,6 +210,7 @@ impl ContextCatalog {
         &mut self,
         heap: &[ContextItem],
         warm: &[ContextItem],
+        pending: &[ContextItem],
         stored: &[ExternalizedContext],
         event_seq: u64,
         dirty: CatalogDirty,
@@ -211,32 +218,35 @@ impl ContextCatalog {
         let fingerprint = CatalogFingerprint {
             heap: heap.len(),
             warm: warm.len(),
+            pending: pending.len(),
             stored: stored.len(),
             event_seq,
         };
         let lengths_unchanged = fingerprint.heap == self.fingerprint.heap
             && fingerprint.warm == self.fingerprint.warm
+            && fingerprint.pending == self.fingerprint.pending
             && fingerprint.stored == self.fingerprint.stored;
         if dirty.is_empty() && lengths_unchanged {
             self.fingerprint.event_seq = event_seq;
             return;
         }
         if dirty.rebuild || dirty.ids.is_empty() || (!lengths_unchanged && dirty.ids.len() > 64) {
-            self.rebuild(heap, warm, stored);
+            self.rebuild(heap, warm, pending, stored);
             self.fingerprint = fingerprint;
             return;
         }
         for id in dirty.ids {
-            self.apply_id(id, heap, warm, stored);
+            self.apply_id(id, heap, warm, pending, stored);
         }
         if self.by_id.len()
             != heap
                 .len()
                 .saturating_add(warm.len())
+                .saturating_add(pending.len())
                 .saturating_add(stored.len())
-            && !self.covers_first_locations(heap, warm, stored)
+            && !self.covers_first_locations(heap, warm, pending, stored)
         {
-            self.rebuild(heap, warm, stored);
+            self.rebuild(heap, warm, pending, stored);
         } else {
             #[cfg(test)]
             {
@@ -250,6 +260,7 @@ impl ContextCatalog {
         &mut self,
         heap: &[ContextItem],
         warm: &[ContextItem],
+        pending: &[ContextItem],
         stored: &[ExternalizedContext],
     ) {
         self.clear();
@@ -258,6 +269,12 @@ impl ContextCatalog {
         }
         for item in warm {
             self.insert_item(item, CatalogLocation::Warm);
+        }
+        // Retry-list owners are catalog members like every other body
+        // location: search, inspect and checkpoint validation see them
+        // instead of a visibility gap while their store write is pending.
+        for item in pending {
+            self.insert_item(item, CatalogLocation::Pending);
         }
         for entry in stored {
             self.insert_entry(entry);
@@ -604,6 +621,7 @@ impl ContextCatalog {
         id: ContextItemId,
         heap: &[ContextItem],
         warm: &[ContextItem],
+        pending: &[ContextItem],
         stored: &[ExternalizedContext],
     ) {
         if let Some(item) = heap.iter().find(|item| item.id == id) {
@@ -612,6 +630,10 @@ impl ContextCatalog {
         }
         if let Some(item) = warm.iter().find(|item| item.id == id) {
             self.upsert_item(item, CatalogLocation::Warm);
+            return;
+        }
+        if let Some(item) = pending.iter().find(|item| item.id == id) {
+            self.upsert_item(item, CatalogLocation::Pending);
             return;
         }
         if let Some(entry) = stored.iter().find(|entry| entry.item_id == id) {
@@ -625,6 +647,7 @@ impl ContextCatalog {
         &self,
         heap: &[ContextItem],
         warm: &[ContextItem],
+        pending: &[ContextItem],
         stored: &[ExternalizedContext],
     ) -> bool {
         let mut seen = HashSet::new();
@@ -641,6 +664,14 @@ impl ContextCatalog {
                 continue;
             }
             if self.location(item.id) != Some(CatalogLocation::Warm) {
+                return false;
+            }
+        }
+        for item in pending {
+            if !seen.insert(item.id) {
+                continue;
+            }
+            if self.location(item.id) != Some(CatalogLocation::Pending) {
                 return false;
             }
         }
@@ -963,7 +994,7 @@ mod tests {
         let stored = vec![stored(&stored_item)];
 
         let mut catalog = ContextCatalog::default();
-        catalog.rebuild(&heap, &warm, &stored);
+        catalog.rebuild(&heap, &warm, &[], &stored);
 
         assert_eq!(catalog.len(), 3);
         assert_eq!(
@@ -993,7 +1024,7 @@ mod tests {
         let stored = vec![stored(&decision), stored(&note)];
 
         let mut catalog = ContextCatalog::default();
-        catalog.rebuild(&[], &[], &stored);
+        catalog.rebuild(&[], &[], &[], &stored);
 
         let by_label = catalog
             .stored_search_ids(&ContextSearchQuery {
@@ -1029,7 +1060,7 @@ mod tests {
         long.entities.clear();
         let short = item(ContextItemId::new(), "zebra marker", None);
         let mut catalog = ContextCatalog::default();
-        catalog.rebuild(&[long, short.clone()], &[], &[]);
+        catalog.rebuild(&[long, short.clone()], &[], &[], &[]);
 
         let candidates = catalog
             .search_candidates(&ContextSearchQuery::new("zebra", 8))
@@ -1043,7 +1074,7 @@ mod tests {
 
         let mut plain = ContextCatalog::default();
         let only_short = item(ContextItemId::new(), "zebra marker", None);
-        plain.rebuild(&[only_short], &[], &[]);
+        plain.rebuild(&[only_short], &[], &[], &[]);
         let complete = plain
             .search_candidates(&ContextSearchQuery::new("zebra", 8))
             .expect("candidate");
@@ -1071,6 +1102,7 @@ mod tests {
         let mut catalog = ContextCatalog::default();
         catalog.rebuild(
             &[long_note.clone(), decision.clone(), dead_long.clone()],
+            &[],
             &[],
             &[],
         );
@@ -1115,6 +1147,7 @@ mod tests {
         catalog.rebuild(
             std::slice::from_ref(&marker),
             &[],
+            &[],
             std::slice::from_ref(&stored),
         );
 
@@ -1140,7 +1173,7 @@ mod tests {
         );
         note.entities.clear();
         let mut catalog = ContextCatalog::default();
-        catalog.rebuild(std::slice::from_ref(&note), &[], &[]);
+        catalog.rebuild(std::slice::from_ref(&note), &[], &[], &[]);
 
         let candidates = catalog
             .search_candidates(&ContextSearchQuery::new("界", 8))
@@ -1169,7 +1202,7 @@ mod tests {
         }
         let target = items.last().unwrap().id;
         let mut catalog = ContextCatalog::default();
-        catalog.rebuild(&items, &[], &[]);
+        catalog.rebuild(&items, &[], &[], &[]);
 
         let candidates = catalog
             .search_candidates(&ContextSearchQuery::new(
@@ -1191,7 +1224,7 @@ mod tests {
         long.content = format!("{} hService hidden in the tail", "x".repeat(600));
         long.entities.clear();
         let mut catalog = ContextCatalog::default();
-        catalog.rebuild(&[keyed.clone(), long], &[], &[]);
+        catalog.rebuild(&[keyed.clone(), long], &[], &[], &[]);
 
         let candidates = catalog
             .search_candidates(&ContextSearchQuery::new("hService", 8))
@@ -1221,6 +1254,7 @@ mod tests {
         let mut catalog = ContextCatalog::default();
         catalog.rebuild(
             &[raw.clone(), marker.clone()],
+            &[],
             &[],
             std::slice::from_ref(&stored_raw),
         );
@@ -1253,7 +1287,7 @@ mod tests {
         let marker = item(ContextItemId::new(), "zebra marker", None);
         let mut heap = vec![long, marker.clone()];
         let mut catalog = ContextCatalog::default();
-        catalog.sync(&heap, &[], &[], 1, CatalogDirty::default());
+        catalog.sync(&heap, &[], &[], &[], 1, CatalogDirty::default());
 
         let query = ContextSearchQuery::new("zebra", 8);
         assert_eq!(
@@ -1267,7 +1301,7 @@ mod tests {
         heap[0].content = "short and fully indexed".into();
         let mut dirty = CatalogDirty::default();
         dirty.mark(long_id);
-        catalog.sync(&heap, &[], &[], 2, dirty);
+        catalog.sync(&heap, &[], &[], &[], 2, dirty);
 
         assert_eq!(
             catalog
@@ -1291,7 +1325,7 @@ mod tests {
         );
         let marker = item(ContextItemId::new(), "zebra marker", None);
         let mut catalog = ContextCatalog::default();
-        catalog.rebuild(&[many_tokens.clone(), marker], &[], &[]);
+        catalog.rebuild(&[many_tokens.clone(), marker], &[], &[], &[]);
 
         let query = ContextSearchQuery::new("zebra", 8);
         assert_eq!(
@@ -1311,7 +1345,7 @@ mod tests {
         let both = item(ContextItemId::new(), "auth-timeout", None);
         let single = item(ContextItemId::new(), "timeout", None);
         let mut catalog = ContextCatalog::default();
-        catalog.rebuild(&[both.clone(), single.clone()], &[], &[]);
+        catalog.rebuild(&[both.clone(), single.clone()], &[], &[], &[]);
 
         let hits = catalog
             .search_ids(&ContextSearchQuery::new("auth timeout", 8))
@@ -1325,7 +1359,7 @@ mod tests {
         // 碎片查询），由候选并集的第二层提供。
         let decision = item(ContextItemId::new(), "AuthService.rs", None);
         let mut catalog = ContextCatalog::default();
-        catalog.rebuild(std::slice::from_ref(&decision), &[], &[]);
+        catalog.rebuild(std::slice::from_ref(&decision), &[], &[], &[]);
 
         let hits = catalog
             .search_ids(&ContextSearchQuery::new("hService", 8))
@@ -1339,7 +1373,7 @@ mod tests {
         let mut dead = item(ContextItemId::new(), "migration plan draft", None);
         dead.semantic = SemanticState::Tombstoned;
         let mut catalog = ContextCatalog::default();
-        catalog.rebuild(&[live.clone(), dead], &[], &[]);
+        catalog.rebuild(&[live.clone(), dead], &[], &[], &[]);
 
         let hits = catalog
             .search_ids(&ContextSearchQuery::new("migration plan", 8))
@@ -1354,7 +1388,7 @@ mod tests {
         let mut dead = item(ContextItemId::new(), "superseded design", None);
         dead.semantic = SemanticState::Tombstoned;
         let mut catalog = ContextCatalog::default();
-        catalog.rebuild(&[dead], &[], &[]);
+        catalog.rebuild(&[dead], &[], &[], &[]);
 
         let hits = catalog
             .search_ids(&ContextSearchQuery::new("design", 8))
@@ -1366,10 +1400,10 @@ mod tests {
     fn wholesale_rebuild_resets_the_text_arena() {
         // 稳定性：doc 句柄随重建代际重置，跨代际不得串号。
         let mut catalog = ContextCatalog::default();
-        catalog.rebuild(&[item(ContextItemId::new(), "alpha", None)], &[], &[]);
-        catalog.rebuild(&[], &[], &[]);
+        catalog.rebuild(&[item(ContextItemId::new(), "alpha", None)], &[], &[], &[]);
+        catalog.rebuild(&[], &[], &[], &[]);
         let second = item(ContextItemId::new(), "alpha", None);
-        catalog.rebuild(std::slice::from_ref(&second), &[], &[]);
+        catalog.rebuild(std::slice::from_ref(&second), &[], &[], &[]);
 
         let hits = catalog
             .search_ids(&ContextSearchQuery::new("alpha", 4))
@@ -1384,7 +1418,7 @@ mod tests {
         let heap = vec![item(resident_id, "AuthService.rs", None)];
         let stored = vec![stored(&item(stored_id, "CacheStore.rs", None))];
         let mut catalog = ContextCatalog::default();
-        catalog.rebuild(&heap, &[], &stored);
+        catalog.rebuild(&heap, &[], &[], &stored);
 
         let hits = catalog
             .search_ids(&ContextSearchQuery::new("AuthService", 8))
@@ -1406,14 +1440,14 @@ mod tests {
         let mut heap = vec![item(resident_id, "AuthService.rs", None)];
         let stored = vec![stored(&item(stored_id, "CacheStore.rs", None))];
         let mut catalog = ContextCatalog::default();
-        catalog.sync(&heap, &[], &stored, 1, CatalogDirty::default());
+        catalog.sync(&heap, &[], &[], &stored, 1, CatalogDirty::default());
         assert!(catalog.last_sync_rebuilt(), "first fill is a rebuild");
 
         heap[0].semantic = SemanticState::Tombstoned;
         heap[0].attention = AttentionState::Archived;
         let mut dirty = CatalogDirty::default();
         dirty.mark(resident_id);
-        catalog.sync(&heap, &[], &stored, 2, dirty);
+        catalog.sync(&heap, &[], &[], &stored, 2, dirty);
         assert!(
             !catalog.last_sync_rebuilt(),
             "same-length dirty field edits stay incremental"
@@ -1445,10 +1479,10 @@ mod tests {
         let second = ContextItemId::new();
         let heap = vec![item(first, "One.rs", None)];
         let mut catalog = ContextCatalog::default();
-        catalog.sync(&heap, &[], &[], 1, CatalogDirty::default());
+        catalog.sync(&heap, &[], &[], &[], 1, CatalogDirty::default());
 
         let heap = vec![item(first, "One.rs", None), item(second, "Two.rs", None)];
-        catalog.sync(&heap, &[], &[], 2, CatalogDirty::default());
+        catalog.sync(&heap, &[], &[], &[], 2, CatalogDirty::default());
         assert!(
             catalog.last_sync_rebuilt(),
             "an unmarked push is the rebuild safety net"

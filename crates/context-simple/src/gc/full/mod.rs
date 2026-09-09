@@ -89,13 +89,20 @@ pub(crate) fn plan_full_gc(
     turn: u64,
 ) -> Option<GcPlan> {
     if !config.gc_enabled
-        || (state.items.is_empty() && state.eviction_buffer.is_empty() && state.external.is_empty())
+        || (state.items.is_empty()
+            && state.eviction_buffer.is_empty()
+            && state.external.is_empty()
+            && state.pending_externalize_retry.is_empty())
     {
         // A pass only makes sense when something can change: resident
-        // items to sweep, buffer entries to recall, or external entries to
-        // age (Cold -> External) and recall. An external-only state must
+        // items to sweep, buffer entries to recall, external entries to
+        // age (Cold -> External) and recall, or retry-list owners still
+        // waiting for their store writes. An external-only state must
         // still run the pass — the heap and buffer being empty is exactly
-        // when aging and recall would otherwise stop forever.
+        // when aging and recall would otherwise stop forever — and a
+        // pending-only state (every owner spilled by a store outage)
+        // must run it too, or the retry the outage postponed would never
+        // happen even after IO recovers.
         return None;
     }
 

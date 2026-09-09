@@ -547,6 +547,7 @@ impl State {
         self.catalog.sync(
             &self.items[..],
             &self.eviction_buffer,
+            &self.pending_externalize_retry,
             &self.external[..],
             self.event_seq,
             dirty,
@@ -813,13 +814,20 @@ impl SimpleContextEngine {
 
 fn has_exactly_one_owner(state: &State, item_id: ContextItemId) -> bool {
     // The heap and external map own unique id indexes; the reversible Warm
-    // buffer is bounded by config, so checking all three locations is O(1)
-    // plus a small bounded scan rather than O(total history). The catalog
-    // skips a duplicate on rebuild, so it cannot be the duplicate detector.
+    // buffer is bounded by config and the externalize-retry list holds the
+    // spilled overflow, so checking all four locations is O(1) plus small
+    // bounded scans rather than O(total history). The catalog skips a
+    // duplicate on rebuild, so it cannot be the duplicate detector.
     let resident = usize::from(state.items.indexes().get(item_id).is_some());
     let warm = usize::from(state.eviction_buffer.iter().any(|item| item.id == item_id));
+    let pending = usize::from(
+        state
+            .pending_externalize_retry
+            .iter()
+            .any(|item| item.id == item_id),
+    );
     let external = usize::from(state.external.get(item_id).is_some());
-    resident + warm + external == 1
+    resident + warm + pending + external == 1
 }
 
 /// Stamp one consumed identity wherever its body/descriptor currently lives.
@@ -1717,10 +1725,10 @@ impl ContextEngine for SimpleContextEngine {
 
     async fn inspect(&self, limit: usize) -> AgentResult<Vec<ContextItemSummary>> {
         // The logical catalog, not just the resident share: the heap, the
-        // reversible warm buffer and the external store entries are all
-        // known items. External entries project from their descriptor,
-        // which carries the authoritative creation clock captured at
-        // externalize time.
+        // reversible warm buffer, the externalize-retry list and the external
+        // store entries are all known items. External entries project from
+        // their descriptor, which carries the authoritative creation clock
+        // captured at externalize time.
         //
         // Bounded by construction (F18): `limit == 0` returns before any
         // projection happens, and otherwise the summaries are generated
@@ -1742,6 +1750,12 @@ impl ContextEngine for SimpleContextEngine {
                 .iter()
                 .map(crate::heap::summary_of)
                 .chain(state.eviction_buffer.iter().map(crate::heap::summary_of))
+                .chain(
+                    state
+                        .pending_externalize_retry
+                        .iter()
+                        .map(crate::heap::summary_of),
+                )
                 .chain(state.external.iter().map(external_summary)),
         );
         Ok(summaries)

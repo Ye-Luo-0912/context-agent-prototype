@@ -53,6 +53,17 @@ pub(crate) fn validate(state: &State) -> AgentResult<()> {
             )));
         }
     }
+    // Retry-list items are live owners of their id (their store write has
+    // not landed), so the duplicate check must cover them too — otherwise a
+    // checkpoint could hold the same id both mid-retry and elsewhere.
+    for item in &state.pending_externalize_retry {
+        if let Some(owner) = owners.insert(item.id, "externalize retry list") {
+            return Err(violation(format!(
+                "item {} is owned by both {owner} and the externalize retry list",
+                item.id
+            )));
+        }
+    }
     for entry in state.external.iter() {
         if let Some(owner) = owners.insert(entry.item_id, "external map") {
             return Err(violation(format!(
@@ -116,7 +127,12 @@ pub(crate) fn validate(state: &State) -> AgentResult<()> {
         )));
     }
 
-    for item in state.items.iter().chain(state.eviction_buffer.iter()) {
+    for item in state
+        .items
+        .iter()
+        .chain(state.eviction_buffer.iter())
+        .chain(state.pending_externalize_retry.iter())
+    {
         if let Some(scope_id) = item.scope_id
             && state.scopes.by_id(scope_id).is_none()
         {
