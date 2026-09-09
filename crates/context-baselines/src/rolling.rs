@@ -237,11 +237,7 @@ impl RollingSummaryEngine {
             prior.push_str(&content);
             prior.push('\n');
             PartialFold {
-                index,
-                id,
-                kind,
-                scope,
-                content,
+                index: stable_index,
                 tail,
             }
         });
@@ -341,15 +337,12 @@ struct FoldJob {
     restore: FoldRestore,
 }
 
-/// 一条被切分的记录：`content` 是本次进入压缩输入的前缀（已消费），
-/// `tail` 是同一 id 留在工作集的残余。提交时把 `tail` 写回 `index`
-/// （`index` 是 remove 移动后的稳定索引，见 `take_fold_job` 提交注释）。
+/// 一条被切分的记录：消费前缀已并入作业输入（随后进压缩器），提交时把
+/// 残余 `tail` 写回 `index`（`index` 是 remove 移动后的稳定索引，见
+/// `take_fold_job` 提交注释）。`id`/`kind`/`scope`/`content` 在 plan 阶段
+/// 已消费（transitions 与 prior），不需要在作业里携带。
 struct PartialFold {
     index: usize,
-    id: agent_contracts::ContextItemId,
-    kind: ContextKind,
-    scope: ContextScope,
-    content: String,
     tail: String,
 }
 
@@ -456,10 +449,10 @@ impl ContextEngine for RollingSummaryEngine {
                 // R08: 部分消费的记录——前缀已进压缩输入，残余尾部按同 id
                 // 写回工作集（可恢复、不被覆盖声明隐瞒）。只有压缩成功才
                 // 提交这次切分；失败路径守卫原样保留整条记录。
-                if let Some(partial) = &job.partial {
-                    if let Some(record) = state.records.get_mut(partial.index) {
-                        record.content = partial.tail.clone();
-                    }
+                if let Some(partial) = &job.partial
+                    && let Some(record) = state.records.get_mut(partial.index)
+                {
+                    record.content = partial.tail.clone();
                 }
                 state.summary = Some(Record {
                     id: job.summary_id,
