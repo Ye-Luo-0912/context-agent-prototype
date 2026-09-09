@@ -5,6 +5,7 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
+agent-capability-process.workspace = true
 agent-contracts.workspace = true
 agent-core.workspace = true
 agent-runtime.workspace = true

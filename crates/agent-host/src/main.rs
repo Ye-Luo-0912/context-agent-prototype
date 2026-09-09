@@ -36,6 +36,13 @@ struct Args {
     /// fails startup closed).
     restore_latest: bool,
     context_policy: Option<String>,
+    /// B4/N8: path to a bounded JSON file of MCP server declarations.
+    mcp_config: Option<std::path::PathBuf>,
+    /// B4/N8: a directory whose subdirectories each may carry a plugin.json
+    /// package manifest; discovered packages are installed, enabled and
+    /// offered (their skills activated) — the operator's explicit root IS
+    /// the enabling act.
+    plugins_root: Option<std::path::PathBuf>,
 }
 
 fn parse_args() -> anyhow::Result<Args> {
@@ -46,6 +53,8 @@ fn parse_args() -> anyhow::Result<Args> {
         read_only: false,
         restore_latest: false,
         context_policy: None,
+        mcp_config: None,
+        plugins_root: None,
     };
     let mut iter = std::env::args().skip(1);
     while let Some(arg) = iter.next() {
@@ -59,6 +68,12 @@ fn parse_args() -> anyhow::Result<Args> {
             "--restore-latest" => args.restore_latest = true,
             "--context-policy" => {
                 args.context_policy = Some(iter.next().context("--context-policy needs a value")?)
+            }
+            "--mcp-config" => {
+                args.mcp_config = Some(iter.next().context("--mcp-config needs a path")?.into())
+            }
+            "--plugins-root" => {
+                args.plugins_root = Some(iter.next().context("--plugins-root needs a path")?.into())
             }
             other => anyhow::bail!(
                 "unknown argument {other:?}; see --help in the TUI for the full CLI story"
@@ -178,6 +193,54 @@ async fn real_main() -> anyhow::Result<()> {
     let artifact_store = Arc::new(workspace.clone());
     let output_broker = Arc::new(WorkspaceOutputBroker::new(workspace.clone().into()));
 
+    // B4/N8 capability configuration: bounded and fail-closed. A configured
+    // MCP file that cannot be parsed, a declared server that cannot be
+    // discovered, or a plugin package whose manifest fails admission all
+    // refuse startup — operator intent is never silently dropped.
+    let mcp_servers = match &args.mcp_config {
+        Some(path) => {
+            let servers = agent_host::config::parse_mcp_config(path)?;
+            eprintln!(
+                "host: {} MCP server(s) configured from {}",
+                servers.len(),
+                path.display()
+            );
+            servers
+        }
+        None => Vec::new(),
+    };
+    let plugins = match &args.plugins_root {
+        Some(root) => {
+            let discovered = agent_host::config::discover_plugin_packages(root)?;
+            let registry = agent_runtime::PluginRegistry::new();
+            for (manifest, package_root) in &discovered {
+                registry
+                    .install_from_root(manifest.clone(), package_root.clone())
+                    .map_err(anyhow::Error::msg)?;
+                // The explicit root IS the enabling act: every discovered
+                // package is enabled and its declared skills offered, exactly
+                // like a configured MCP server.
+                registry.enable(&manifest.id).map_err(anyhow::Error::msg)?;
+                for skill in &manifest.skills {
+                    registry
+                        .activate_skill(&manifest.id, &skill.id)
+                        .map_err(anyhow::Error::msg)?;
+                }
+            }
+            eprintln!(
+                "host: {} plugin package(s) installed and enabled from {}",
+                discovered.len(),
+                root.display()
+            );
+            Some(Arc::new(registry))
+        }
+        None => None,
+    };
+    eprintln!(
+        "host: supported capability config — mcp_servers (stdio, declared-permission risk), \
+         plugins (install_from_root + skill_read); unsupported — remote adapters, hook execution"
+    );
+
     let composed = compose(ComposeConfig {
         provider_profile_digest,
         defer_proof_refresh: false,
@@ -207,8 +270,8 @@ async fn real_main() -> anyhow::Result<()> {
         verification_recipes: Some(verification_recipes),
         project_proof_refresh: false,
         host_death_watchdog: true,
-        mcp_servers: Vec::new(),
-        plugins: None,
+        mcp_servers,
+        plugins,
     })
     .await?;
 

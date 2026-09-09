@@ -78,7 +78,7 @@
 | B1 | 快照/订阅同一切点、live 与 durable 分流、重连代际/epoch 边界 | SNAP-GAP / LIVE-DELTA（两项均**已落地 2026-09-09**，见 AUDIT_TODO 注记） | N3 已接通链路，B1 修一致性残余——**已关闭**（agent-host 单测＋e2e 7/7、agent-contracts 163、dotnet 客户端测试全绿；无 wire 变更） |
 | B2 | 队列 Completion 语义、宿主「取消全部」与「确认结束」分离、服务失败收口、retyped 原始信封验证 | QUEUE-COMPLETION / CANCEL-ALL / RETYPED（三项均**已落地 2026-09-09**，见 AUDIT_TODO 注记；agent-host 单测 5＋e2e 8/8、dotnet 72/72——计数含并行线当日新增） | N1 可靠停机的收口延伸——**代码落地，CI 全量确认后关闭** |
 | B3 | GUI 所需真实任务/审批详情/结果/工件/只读 Context 接口 | — | 即 N5 结果半（结果/差异/工件按需读取）——**代码落地，CI 全量确认后关闭**：4 个 run-scoped 只读路由 `work.task_detail`/`work.changes`/`work.artifact`/`work.context`（协议 DTO＋验证、workspace `read_changes` 有界尾读、Runtime `TaskDetail` 命令、宿主 dispatch/routing、.NET DTO＋AgentConnection 4 方法）；protocol 42/42、workspace 105/105、runtime actor 72/72、host 5＋e2e 8/8＋restore 3/3、dotnet 77/77 |
-| B4 | 同一正式宿主 profile 多入口复用、已有 MCP/Skill 配置接入 | — | 即 N8 |
+| B4 | 同一正式宿主 profile 多入口复用、已有 MCP/Skill 配置接入 | — | 即 N8——**代码落地，CI 全量确认后关闭**：宿主 `--mcp-config`/`--plugins-root`（`agent_host::config`）bounded/deny-unknown/fail-closed 解析＋compose 接线＋supported/unsupported 启动声明；agent-host lib 7/7（含 config 2 项）、host_config 3/3、e2e 8/8 回归、restore 3/3、smoke 三条失败路径均退出 1 |
 
 **用户结果：**重连不漏中间状态；坏连接与退出有明确结局；多入口调用同一套应用行为。
 
@@ -203,9 +203,9 @@
 
 **用户结果：** 安装后连接真实宿主而非 fixture；MCP/Skill 经目录与权限边界可配置使用；包来源可追溯。
 
-**步骤：** 宿主暴露受限 MCP/Plugin 配置路径与 supported/unsupported；补 .NET→Rust host→Runtime→Tool→Event→GUI 真实用例（scripted model）；打包含宿主/桌面/依赖，干净 staging＋来源身份（即 PACKAGE-01/原 R1 范围，届时一并关闭）；三类真实任务记录，未执行写 NOT_RUN。
+**已落地（2026-09-09）：** 打包来源绑定（PACKAGE-01，`3352273`，随 N7 关闭确认）；.NET→Rust host→Runtime→Tool→Event→GUI 真实用例（`aeddfbd` 全链 e2e）；**B4 能力配置（B 线，本切片）**——宿主 `--mcp-config`（`agent_host::config::parse_mcp_config`：JSON 声明数组 bounded/deny-unknown/fail-closed，上限 32 服/256KiB，id 去重与语法校验，转 `McpServerDecl`）与 `--plugins-root`（`discover_plugin_packages`：子目录按名排序、`plugin.json` 缺失跳过、坏 manifest/静态准入失败即整体拒绝、复用以 `PluginPackageAdmission::validate_static`；main.rs 显式 root 即启用：install_from_root→enable→activate_skill）接线 compose；启动声明 supported（mcp_servers stdio/declared-permission risk；plugins install_from_root+skill_read）/unsupported（remote adapters、hook execution）。不默认启用 MCP（MCP-01 条件项未触发）。
 
-**检查（建议，未执行）：** `cargo test -p agent-host --test host_e2e`；`cargo test -p agent-capability-process`；`dotnet build … -c Release`。
+**检查（本切片已执行）：** `cargo test -p agent-host --lib` 7/7（含 config 解析/发现 2 项）、`cargo test -p agent-host --test host_config` 3/3（坏声明 fail-closed、空配置 noop 回归、plugin root 经 compose 启用且 activation=Active）、回归 `cargo test -p agent-host --test host_e2e` 8/8 与 `--test host_restore` 3/3；smoke：`--mcp-config` 缺失/未知字段、`--plugins-root` 非目录均退出 1 并报错（`AGENT_DEMO=1` demo 模式、隔离 workdir）。未验证：真实 provider 与 MCP server 交互照旧 NOT_RUN（E1 已覆盖 mock 闭环）；Linux UDS 侧与 CI 全量待 run 记录。
 
 **做到这里停止：** 不新建 release/tag 除非明确要求；本切片验收前不写 M17 已完成。
 

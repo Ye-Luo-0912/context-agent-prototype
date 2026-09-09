@@ -1235,6 +1235,11 @@ fn protocol_error_response<P>(request: &PlatformEnvelope<P>, message: &str) -> s
 #[cfg(windows)]
 mod winpipe;
 
+/// Host capability configuration (B4/N8): bounded, fail-closed parsing of
+/// the MCP server declarations and plugin package roots the host may be
+/// started with.
+pub mod config;
+
 /// Non-Windows stand-in for the named-pipe backend: the transport only
 /// exists on Windows, so a misconfigured [`LocalEndpoint::NamedPipe`] fails
 /// closed with a typed error here instead of not compiling at all. The Unix
