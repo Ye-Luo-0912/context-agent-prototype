@@ -32,8 +32,9 @@
         <Border Grid.Row="0" BorderBrush="#33808080" BorderThickness="1" CornerRadius="6" Padding="8">
           <DockPanel>
             <TextBlock DockPanel.Dock="Top" Text="任务" FontWeight="Bold" Margin="0,0,0,6" />
-            <!-- ListBox 自带虚拟化：只实例化视口内的行（G3） -->
-            <ListBox ItemsSource="{Binding Tasks}">
+            <!-- ListBox 自带虚拟化：只实例化视口内的行（G3）。选中行触发
+                 B3 任务详情只读加载（C3），选择本身不提交/不继续。 -->
+            <ListBox ItemsSource="{Binding Tasks}" SelectedItem="{Binding SelectedTask}">
               <ListBox.ItemTemplate>
                 <DataTemplate x:DataType="vm:TaskItemViewModel">
                   <StackPanel Margin="2">
@@ -46,14 +47,32 @@
           </DockPanel>
         </Border>
         <Border Grid.Row="1" BorderBrush="#33808080" BorderThickness="1" CornerRadius="6" Padding="8" Margin="0,10,0,0">
-          <StackPanel Spacing="4">
-            <TextBlock Text="Context（只读）" FontWeight="Bold" />
-            <TextBlock Text="{Binding ContextPanelText}" TextWrapping="Wrap" Foreground="#99808080" />
-          </StackPanel>
+          <DockPanel>
+            <StackPanel DockPanel.Dock="Top" Spacing="4" Margin="0,0,0,4">
+              <StackPanel Orientation="Horizontal" Spacing="8">
+                <TextBlock Text="Context（只读）" FontWeight="Bold" VerticalAlignment="Center" />
+                <Button Content="刷新" Command="{Binding RefreshContextCommand}" Padding="8,2" />
+              </StackPanel>
+              <!-- C3/B3 诚实状态行：未读取/失败时明确显示，不显示推断内容 -->
+              <TextBlock Text="{Binding ContextStatusText}" TextWrapping="Wrap" Foreground="#99808080" FontSize="11" />
+            </StackPanel>
+            <!-- C3/B3：真实条目列表（有界）；每行只显示摘要自身的类型化字段 -->
+            <ScrollViewer VerticalScrollBarVisibility="Auto">
+              <ItemsControl ItemsSource="{Binding ContextItems}">
+                <ItemsControl.ItemTemplate>
+                  <DataTemplate x:DataType="vm:ContextItemRowViewModel">
+                    <StackPanel Margin="0,2">
+                      <TextBlock Text="{Binding Line}" TextWrapping="Wrap" FontSize="11" Foreground="#bb808080" />
+                    </StackPanel>
+                  </DataTemplate>
+                </ItemsControl.ItemTemplate>
+              </ItemsControl>
+            </ScrollViewer>
+          </DockPanel>
         </Border>
       </Grid>
 
-      <Grid Grid.Column="1" RowDefinitions="Auto,Auto,Auto,*,Auto">
+      <Grid Grid.Column="1" RowDefinitions="Auto,Auto,Auto,Auto,*,Auto">
 
         <!-- 输入区 -->
         <TextBox Grid.Row="0" Text="{Binding GoalInput}" Watermark="描述一个新的工作目标（提交后原子建立任务并排队首轮输入）…"
@@ -90,12 +109,54 @@
           </ItemsControl>
         </StackPanel>
 
+        <!-- C3 审阅区（B3 只读路由；纯观察，不起模型轮/不改状态） -->
+        <TabControl Grid.Row="3" Margin="0,4" MinHeight="150">
+          <TabItem Header="任务详情（只读）">
+            <ScrollViewer VerticalScrollBarVisibility="Auto">
+              <TextBlock Text="{Binding TaskDetailText}" TextWrapping="Wrap"
+                         FontFamily="Consolas,monospace" FontSize="12" />
+            </ScrollViewer>
+          </TabItem>
+          <TabItem Header="变更审阅（只读）">
+            <DockPanel>
+              <StackPanel DockPanel.Dock="Top" Orientation="Horizontal" Spacing="8" Margin="0,0,0,4">
+                <TextBlock Text="{Binding ChangesStatusText}" VerticalAlignment="Center"
+                           Foreground="#99808080" FontSize="11" />
+                <Button Content="刷新变更" Command="{Binding RefreshChangesCommand}" Padding="8,2" />
+              </StackPanel>
+              <ScrollViewer VerticalScrollBarVisibility="Auto">
+                <ItemsControl ItemsSource="{Binding Changes}">
+                  <ItemsControl.ItemTemplate>
+                    <DataTemplate x:DataType="vm:ChangeRowViewModel">
+                      <StackPanel Orientation="Horizontal" Spacing="8" Margin="0,2">
+                        <TextBlock Text="{Binding KindText}" FontSize="11" Foreground="#cc9a5a00" />
+                        <TextBlock Text="{Binding Line}" TextWrapping="Wrap" FontSize="11" FontFamily="Consolas,monospace" />
+                      </StackPanel>
+                    </DataTemplate>
+                  </ItemsControl.ItemTemplate>
+                </ItemsControl>
+              </ScrollViewer>
+            </DockPanel>
+          </TabItem>
+          <TabItem Header="工件（只读）">
+            <StackPanel Spacing="4">
+              <StackPanel Orientation="Horizontal" Spacing="8">
+                <!-- 只读观察：引用文本由操作者显式输入，读取结果如实显示 -->
+                <TextBox Text="{Binding ArtifactReference}" Watermark="工件引用（reference）…" MinWidth="320" />
+                <Button Content="读取工件" Command="{Binding ReadArtifactCommand}" Padding="8,2" />
+              </StackPanel>
+              <TextBlock Text="{Binding ArtifactText}" TextWrapping="Wrap" FontSize="11"
+                         FontFamily="Consolas,monospace" />
+            </StackPanel>
+          </TabItem>
+        </TabControl>
+
         <!-- 输出 -->
-        <TextBox Grid.Row="3" Text="{Binding OutputText}" IsReadOnly="True" TextWrapping="Wrap"
+        <TextBox Grid.Row="4" Text="{Binding OutputText}" IsReadOnly="True" TextWrapping="Wrap"
                  FontFamily="Consolas,monospace" Margin="0,8,0,0" />
 
         <!-- 状态条 -->
-        <Border Grid.Row="4" BorderBrush="#33808080" BorderThickness="0,1,0,0" Padding="0,8,0,0" Margin="0,8,0,0">
+        <Border Grid.Row="5" BorderBrush="#33808080" BorderThickness="0,1,0,0" Padding="0,8,0,0" Margin="0,8,0,0">
           <StackPanel Orientation="Horizontal" Spacing="16">
             <TextBlock><Run Text="watermark: " /><Run Text="{Binding Watermark}" /></TextBlock>
             <TextBlock Text="{Binding FocusText}" TextWrapping="Wrap" MaxWidth="380" />

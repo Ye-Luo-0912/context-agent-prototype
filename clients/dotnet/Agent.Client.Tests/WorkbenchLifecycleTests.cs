@@ -19,7 +19,7 @@ namespace FocusAgent.Client.Tests;
 /// </summary>
 public class WorkbenchLifecycleTests
 {
-    private const int BaseCommandCount = 6; // connect/disconnect/submit/continue/cancel/refresh
+    private const int BaseCommandCount = 9; // connect/disconnect/submit/continue/cancel/refresh + C3 review reads (changes/artifact/context)
 
     private static WorkSnapshotResponse SnapshotWith(params PendingApprovalSnapshot[] approvals) => new()
     {

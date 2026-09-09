@@ -32,6 +32,71 @@ public sealed class TaskItemViewModel
 }
 
 /// <summary>
+/// C3: one change-journal row (B3 <c>work.changes</c>). Renders only the
+/// typed fields the server sent — the journal's internal <c>old_content</c>
+/// never travels, so nothing here is prose-inferred or reconstructed.
+/// </summary>
+public sealed class ChangeRowViewModel
+{
+    public string KindText { get; init; } = string.Empty;
+    public string Line { get; init; } = string.Empty;
+
+    public static ChangeRowViewModel From(ChangeSummary change)
+    {
+        var kind = KindTextFor(change.Kind);
+        var line = change.Kind switch
+        {
+            ChangeSummaryKind.MutationPrepared or ChangeSummaryKind.DirectoryPrepared =>
+                $"{change.Tool}·{change.Path}（{change.BytesBefore}→{change.BytesAfter} 字节，prepared）",
+            ChangeSummaryKind.MutationCommitted or ChangeSummaryKind.DirectoryCommitted =>
+                $"提交 {change.TxId}：{change.Path ?? change.EntryIdentity ?? "（缺路径）"}",
+            ChangeSummaryKind.MutationRolledBack or ChangeSummaryKind.DirectoryRolledBack =>
+                $"回滚 {change.TxId}：{change.Reason ?? "（无原因说明）"}",
+            _ => $"变更 {change.TxId}",
+        };
+        return new ChangeRowViewModel { KindText = kind, Line = line };
+    }
+
+    private static string KindTextFor(ChangeSummaryKind kind) => kind switch
+    {
+        ChangeSummaryKind.MutationPrepared => "修改·准备",
+        ChangeSummaryKind.MutationCommitted => "修改·已提交",
+        ChangeSummaryKind.MutationRolledBack => "修改·已回滚",
+        ChangeSummaryKind.DirectoryPrepared => "目录·准备",
+        ChangeSummaryKind.DirectoryCommitted => "目录·已提交",
+        ChangeSummaryKind.DirectoryRolledBack => "目录·已回滚",
+        _ => kind.ToString(),
+    };
+}
+
+/// <summary>
+/// C3: one read-only context row (B3 <c>work.context</c>). Shows the
+/// summary's own bounded fields (id, kind label, importance, source); the
+/// type-tagged engine dimensions stay raw labels — the client routes and
+/// bounds context, it never re-interprets engine internals or attention.
+/// </summary>
+public sealed class ContextItemRowViewModel
+{
+    public string Id { get; init; } = string.Empty;
+    public string KindLabel { get; init; } = string.Empty;
+    public string Line { get; init; } = string.Empty;
+
+    public static ContextItemRowViewModel From(ContextItemSummary item)
+    {
+        var kind = item.Kind.ValueKind == System.Text.Json.JsonValueKind.String
+            ? item.Kind.GetString() ?? "?"
+            : "?";
+        var source = string.IsNullOrEmpty(item.Source) ? "（无来源标注）" : item.Source;
+        return new ContextItemRowViewModel
+        {
+            Id = item.Id,
+            KindLabel = kind,
+            Line = $"{source} · 重要性 {item.Importance:0.##}",
+        };
+    }
+}
+
+/// <summary>
 /// N4/F13: one pending approval's stable row. The row is created ONCE per
 /// server request id and updated in place from typed snapshot facts — its
 /// Allow/Deny commands are registered exactly once for the row's lifetime
@@ -173,6 +238,29 @@ public sealed class MainWindowViewModel : ObservableObject, IAsyncDisposable
     private string _outputText = string.Empty;
     private bool _autoRefresh = true;
 
+    // -----------------------------------------------------------------------
+    // C3 review surface (B3 read-only routes). Everything here is a run-scoped
+    // OBSERVATION: it never starts a model round, never mutates state and
+    // never consults Core's approval gate. Rendering is honest — before a read
+    // the panels say "unavailable", a failed or stale-era read never
+    // overwrites a fresh one, and the client never re-interprets engine
+    // internals (the context kind/attention/semantic tags are bounded raw
+    // labels, not authority).
+    // -----------------------------------------------------------------------
+
+    /// <summary>C3: cap on change records one review refresh renders.</summary>
+    internal const int MaxRenderedChanges = 64;
+
+    /// <summary>C3: cap on context entries one refresh renders.</summary>
+    internal const int MaxRenderedContextItems = 256;
+
+    private TaskItemViewModel? _selectedTask;
+    private string _taskDetailText = "任务详情：未选择任务（unavailable）。";
+    private string _changesStatusText = "变更日志：未读取（unavailable）。";
+    private string _artifactReference = string.Empty;
+    private string _artifactText = "工件：未读取（unavailable）。只显示服务端有界返回的正文。";
+    private string _contextStatusText = "只读 Context：未读取（unavailable）。";
+
     public MainWindowViewModel(IUiDispatcher? uiDispatcher = null)
     {
         _ui = uiDispatcher ?? AvaloniaUiDispatcher.Instance;
@@ -201,6 +289,22 @@ public sealed class MainWindowViewModel : ObservableObject, IAsyncDisposable
             () => IsConnected,
             error => AppendOutput($"刷新失败：{error.Message}"));
 
+        // C3 B3 read-only routes: observation only — never a model round,
+        // never a mutation. Each command refreshes its panel from the server
+        // and renders only typed facts.
+        RefreshChangesCommand = AsyncCommands.Add(
+            () => RefreshChangesAsync(),
+            () => IsConnected,
+            error => AppendOutput($"读取变更失败：{error.Message}"));
+        ReadArtifactCommand = AsyncCommands.Add(
+            () => ReadArtifactAsync(),
+            () => IsConnected && ArtifactReference.Trim().Length > 0,
+            error => AppendOutput($"读取工件失败：{error.Message}"));
+        RefreshContextCommand = AsyncCommands.Add(
+            () => RefreshContextAsync(),
+            () => IsConnected,
+            error => AppendOutput($"读取上下文失败：{error.Message}"));
+
         // Fallback safety-net refresh; the PRIMARY driver is the event
         // stream. Inert under the inline drill dispatcher.
         _fallbackTimer = new DispatcherTimerHolder(
@@ -224,8 +328,18 @@ public sealed class MainWindowViewModel : ObservableObject, IAsyncDisposable
     public ICommand CancelCommand { get; }
     public ICommand RefreshCommand { get; }
 
+    // C3 read-only review commands (B3 routes).
+    public ICommand RefreshChangesCommand { get; }
+    public ICommand ReadArtifactCommand { get; }
+    public ICommand RefreshContextCommand { get; }
+
     public ObservableCollection<TaskItemViewModel> Tasks { get; } = [];
     public ObservableCollection<ApprovalItemViewModel> Approvals { get; } = [];
+
+    // C3 review state (B3 read-only routes). All reads are observation-only;
+    // every panel starts and resets to an explicit "unavailable".
+    public ObservableCollection<ChangeRowViewModel> Changes { get; } = [];
+    public ObservableCollection<ContextItemRowViewModel> ContextItems { get; } = [];
 
     public IReadOnlyList<string> Transports => TransportLabels;
 
@@ -262,6 +376,55 @@ public sealed class MainWindowViewModel : ObservableObject, IAsyncDisposable
         }
     }
 
+    /// <summary>C3: the currently selected task; selecting one loads its full
+    /// anchor card over the B3 task-detail read. Selection itself is
+    /// observation — nothing is submitted or continued by clicking a row.</summary>
+    public TaskItemViewModel? SelectedTask
+    {
+        get => _selectedTask;
+        set
+        {
+            if (Set(ref _selectedTask, value))
+            {
+                if (value is not null)
+                {
+                    _ = LoadTaskDetailAsync(value.TaskId);
+                }
+            }
+        }
+    }
+
+    /// <summary>C3: the task-detail panel's honest text — "unavailable" until
+    /// a typed <c>work.task_detail</c> read lands, then the anchor card's own
+    /// fields (plan/open loops are the task anchor's projection, never
+    /// reconstructed from event prose).</summary>
+    public string TaskDetailText { get => _taskDetailText; private set => Set(ref _taskDetailText, value); }
+
+    /// <summary>C3: status line of the change journal panel.</summary>
+    public string ChangesStatusText { get => _changesStatusText; private set => Set(ref _changesStatusText, value); }
+
+    /// <summary>C3: artifact reference input; read with
+    /// <see cref="ReadArtifactCommand"/>.</summary>
+    public string ArtifactReference
+    {
+        get => _artifactReference;
+        set
+        {
+            if (Set(ref _artifactReference, value))
+            {
+                AsyncCommands.RaiseCanExecute();
+            }
+        }
+    }
+
+    /// <summary>C3: the artifact panel's honest text — decoded bounded body
+    /// plus the size/truncated facts the server returned; "unavailable"
+    /// before any read.</summary>
+    public string ArtifactText { get => _artifactText; private set => Set(ref _artifactText, value); }
+
+    /// <summary>C3: status line of the read-only context panel.</summary>
+    public string ContextStatusText { get => _contextStatusText; private set => Set(ref _contextStatusText, value); }
+
     public bool IsConnected
     {
         get => _isConnected;
@@ -288,12 +451,6 @@ public sealed class MainWindowViewModel : ObservableObject, IAsyncDisposable
     /// <summary>The snapshot carries no plan/open-loops projection yet — the
     /// panel says so instead of reconstructing one from event prose.</summary>
     public string PlanText { get => _planText; private set => Set(ref _planText, value); }
-
-    private string _contextPanelText =
-        "只读 Context 面板等待平台路由（来源/表示类型/实际曝光/片段范围/恢复状态）。"
-        + "在路由落地前不显示任何推断内容，也不显示不存在的“模型内部注意力”。";
-
-    public string ContextPanelText { get => _contextPanelText; private set => Set(ref _contextPanelText, value); }
 
     /// <summary>G2 banner: resync / connection-loss state, never silently hidden.</summary>
     public string BannerText { get => _bannerText; private set => Set(ref _bannerText, value); }
@@ -346,6 +503,22 @@ public sealed class MainWindowViewModel : ObservableObject, IAsyncDisposable
     /// <summary>Integration drill seam: the real approval-answer path.</summary>
     internal Task RespondApprovalForTestsAsync(string requestId, ApprovalDecision decision) =>
         RespondApprovalAsync(requestId, decision);
+
+    /// <summary>C3 drill seam: the task-detail read path a selection triggers.</summary>
+    internal Task LoadTaskDetailForTestsAsync(string taskId) => LoadTaskDetailAsync(taskId);
+
+    /// <summary>C3 drill seam: the change-journal read path.</summary>
+    internal Task RefreshChangesForTestsAsync() => RefreshChangesAsync();
+
+    /// <summary>C3 drill seam: the artifact read path.</summary>
+    internal Task ReadArtifactForTestsAsync(string reference)
+    {
+        ArtifactReference = reference;
+        return ReadArtifactAsync();
+    }
+
+    /// <summary>C3 drill seam: the read-only context read path.</summary>
+    internal Task RefreshContextForTestsAsync() => RefreshContextAsync();
 
     /// <summary>Bound drill seam: writes through the same bounded output
     /// path the events and receipts use.</summary>
@@ -857,6 +1030,242 @@ public sealed class MainWindowViewModel : ObservableObject, IAsyncDisposable
         await RefreshSnapshotCoreAsync(silent: true);
     }
 
+    // -----------------------------------------------------------------------
+    // C3: B3 read-only review reads. Each one captures the connection era,
+    // awaits the server, and applies the result ONLY through the same era plus
+    // live-connection checks — a stale/disconnected read never overwrites a
+    // fresher panel, and every failure leaves the panel's honest "unavailable"
+    // (or its previous content) in place. These are observations: no submit,
+    // no continue, no approval, no mutation.
+    // -----------------------------------------------------------------------
+
+    /// <summary>C3: loads one task's full anchor card over the B3
+    /// <c>work.task_detail</c> read (triggered by selecting a task).</summary>
+    private async Task LoadTaskDetailAsync(string taskId)
+    {
+        var connection = _connection;
+        if (connection is null)
+        {
+            TaskDetailText = "任务详情：未连接（unavailable）。";
+            return;
+        }
+        var generation = Volatile.Read(ref _generation);
+        Task<WorkTaskDetailResponse> read;
+        try
+        {
+            read = connection.TaskDetailAsync(taskId, _lifetime.Token);
+        }
+        catch (Exception failure)
+        {
+            if (!_lifetime.IsCancellationRequested)
+            {
+                AppendOutput($"任务详情读取失败：{failure.Message}");
+            }
+            TaskDetailText = "任务详情：读取失败（unavailable）。";
+            return;
+        }
+        WorkTaskDetailResponse detail;
+        try
+        {
+            detail = await read;
+        }
+        catch (Exception failure)
+        {
+            if (!_lifetime.IsCancellationRequested)
+            {
+                AppendOutput($"任务详情读取失败：{failure.Message}");
+            }
+            TaskDetailText = "任务详情：读取失败（unavailable）。";
+            return;
+        }
+        if (!IsCurrentEra(generation, connection))
+        {
+            return; // a newer connection owns the panel now; drop the stale read
+        }
+        TaskDetailText = RenderTaskDetail(detail);
+    }
+
+    /// <summary>Renders the typed anchor card. Every field is the task anchor's
+    /// own projection (safe to show); the panel never invents a plan or open
+    /// loop from event prose — those arrive only as typed anchor fields.</summary>
+    private static string RenderTaskDetail(WorkTaskDetailResponse detail)
+    {
+        var lines = new List<string>
+        {
+            $"任务 {detail.TaskId} · {detail.Status} · anchor r{detail.AnchorRevision}",
+            $"目标：{detail.Goal}",
+        };
+        var anchor = detail.Anchor;
+        lines.Add($"当前解释：{anchor.CurrentInterpretation}");
+        if (anchor.Constraints.Count > 0)
+        {
+            lines.Add("约束：");
+            lines.AddRange(anchor.Constraints.Select(text => $"  - {text}"));
+        }
+        if (anchor.AcceptanceCriteria.Count > 0)
+        {
+            lines.Add("验收标准：");
+            lines.AddRange(anchor.AcceptanceCriteria.Select(text => $"  - {text}"));
+        }
+        if (anchor.PlanProgress.Count > 0)
+        {
+            lines.Add("计划进度：");
+            lines.AddRange(anchor.PlanProgress.Select(text => $"  - {text}"));
+        }
+        if (anchor.OpenLoops.Count > 0)
+        {
+            lines.Add("open loops：");
+            lines.AddRange(anchor.OpenLoops.Select(text => $"  - {text}"));
+        }
+        if (anchor.NextAction.Length > 0)
+        {
+            lines.Add($"下一步（建议，非完成判定）：{anchor.NextAction}");
+        }
+        return string.Join('\n', lines);
+    }
+
+    /// <summary>C3: refreshes the change journal over the B3
+    /// <c>work.changes</c> read (newest first, bounded).</summary>
+    private async Task RefreshChangesAsync()
+    {
+        var connection = _connection;
+        if (connection is null)
+        {
+            ChangesStatusText = "变更日志：未连接（unavailable）。";
+            return;
+        }
+        var generation = Volatile.Read(ref _generation);
+        WorkChangesResponse changes;
+        try
+        {
+            changes = await connection.ReadChangesAsync(
+                limit: MaxRenderedChanges, cancellationToken: _lifetime.Token);
+        }
+        catch (Exception failure)
+        {
+            if (!_lifetime.IsCancellationRequested)
+            {
+                AppendOutput($"变更读取失败：{failure.Message}");
+            }
+            ChangesStatusText = "变更日志：读取失败（unavailable）。";
+            return;
+        }
+        if (!IsCurrentEra(generation, connection))
+        {
+            return;
+        }
+        var rows = changes.Changes
+            .Take(MaxRenderedChanges)
+            .Select(ChangeRowViewModel.From)
+            .ToArray();
+        Changes.ReplaceWith(rows);
+        ChangesStatusText = changes.Changes.Count > MaxRenderedChanges
+            ? $"变更日志：显示最新 {MaxRenderedChanges} 条（服务端返回 {changes.Changes.Count} 条）。"
+            : $"变更日志：{rows.Length} 条（按序，最新优先）。";
+    }
+
+    /// <summary>C3: reads one artifact by reference over the B3
+    /// <c>work.artifact</c> read. The response's own size/truncated facts are
+    /// shown verbatim; the body stays bounded (the client asks for at most
+    /// the protocol's artifact cap) and never pretends to be prose.</summary>
+    private async Task ReadArtifactAsync()
+    {
+        var connection = _connection;
+        var reference = ArtifactReference.Trim();
+        if (connection is null)
+        {
+            ArtifactText = "工件：未连接（unavailable）。";
+            return;
+        }
+        if (reference.Length == 0)
+        {
+            ArtifactText = "工件：未提供引用（unavailable）。";
+            return;
+        }
+        var generation = Volatile.Read(ref _generation);
+        WorkArtifactResponse artifact;
+        try
+        {
+            artifact = await connection.ReadArtifactAsync(
+                reference,
+                maxBytes: WorkArtifactRequest.MaxArtifactReadBytes,
+                cancellationToken: _lifetime.Token);
+        }
+        catch (Exception failure)
+        {
+            if (!_lifetime.IsCancellationRequested)
+            {
+                AppendOutput($"工件读取失败：{failure.Message}");
+            }
+            ArtifactText = "工件：读取失败（unavailable）。";
+            return;
+        }
+        if (!IsCurrentEra(generation, connection))
+        {
+            return;
+        }
+        string body;
+        try
+        {
+            body = System.Text.Encoding.UTF8.GetString(Convert.FromBase64String(artifact.ContentBase64));
+        }
+        catch (FormatException)
+        {
+            // The client-side validator already rejected invalid base64; this
+            // is a defensive fallback that never renders a guessed body.
+            body = string.Empty;
+        }
+        ArtifactText = $"工件 {artifact.Reference}：{artifact.SizeBytes} 字节"
+            + (artifact.Truncated ? "（已截断）" : "（完整）")
+            + $"：\n{body}";
+    }
+
+    /// <summary>C3: refreshes the read-only context summary over the B3
+    /// <c>work.context</c> read (bounded).</summary>
+    private async Task RefreshContextAsync()
+    {
+        var connection = _connection;
+        if (connection is null)
+        {
+            ContextStatusText = "只读 Context：未连接（unavailable）。";
+            return;
+        }
+        var generation = Volatile.Read(ref _generation);
+        WorkContextResponse context;
+        try
+        {
+            context = await connection.ReadContextAsync(
+                limit: MaxRenderedContextItems, cancellationToken: _lifetime.Token);
+        }
+        catch (Exception failure)
+        {
+            if (!_lifetime.IsCancellationRequested)
+            {
+                AppendOutput($"上下文读取失败：{failure.Message}");
+            }
+            ContextStatusText = "只读 Context：读取失败（unavailable）。";
+            return;
+        }
+        if (!IsCurrentEra(generation, connection))
+        {
+            return;
+        }
+        var rows = context.Items
+            .Take(MaxRenderedContextItems)
+            .Select(ContextItemRowViewModel.From)
+            .ToArray();
+        ContextItems.ReplaceWith(rows);
+        ContextStatusText = context.Items.Count > MaxRenderedContextItems
+            ? $"只读 Context：显示 {MaxRenderedContextItems} 条（引擎共有 {context.Items.Count} 条）。"
+            : $"只读 Context：{rows.Length} 条。";
+    }
+
+    /// <summary>F13-era guard: true only while the captured generation is
+    /// still the live one AND the connection that served the read is still
+    /// installed — a read from a replaced or disconnected era is dropped.</summary>
+    private bool IsCurrentEra(int generation, IAgentConnection connection) =>
+        generation == Volatile.Read(ref _generation) && ReferenceEquals(_connection, connection);
+
     private async Task RespondApprovalAsync(string requestId, ApprovalDecision decision)
     {
         var connection = _connection;
@@ -906,6 +1315,15 @@ public sealed class MainWindowViewModel : ObservableObject, IAsyncDisposable
         BannerText = string.Empty;
         Tasks.ReplaceWith([]);
         ApplyApprovals([]);
+        // C3: the review panels are honest on disconnect — no stale server
+        // facts survive into the next era.
+        SelectedTask = null;
+        TaskDetailText = "任务详情：未连接（unavailable）。";
+        Changes.ReplaceWith([]);
+        ChangesStatusText = "变更日志：未连接（unavailable）。";
+        ArtifactText = "工件：未连接（unavailable）。";
+        ContextItems.ReplaceWith([]);
+        ContextStatusText = "只读 Context：未连接（unavailable）。";
         AsyncCommands.RaiseCanExecute();
     }
 

@@ -293,7 +293,7 @@ public class WorkbenchIntegrationTests
                 "terminal event line");
 
             // The answered approval's commands were released with the row.
-            Assert.Equal(6, viewModel.RegisteredCommandCount);
+            Assert.Equal(9, viewModel.RegisteredCommandCount);
             Assert.Equal(42ul, viewModel.Watermark);
         }
         finally
