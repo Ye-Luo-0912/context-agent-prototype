@@ -76,9 +76,9 @@
 | 切片 | 交付 | 对应缺陷 | 与 N 系列关系 |
 |---|---|---|---|
 | B1 | 快照/订阅同一切点、live 与 durable 分流、重连代际/epoch 边界 | SNAP-GAP / LIVE-DELTA（两项均**已落地 2026-09-09**，见 AUDIT_TODO 注记） | N3 已接通链路，B1 修一致性残余——**已关闭**（agent-host 单测＋e2e 7/7、agent-contracts 163、dotnet 客户端测试全绿；无 wire 变更） |
-| B2 | 队列 Completion 语义、宿主「取消全部」与「确认结束」分离、服务失败收口、retyped 原始信封验证 | QUEUE-COMPLETION / CANCEL-ALL / RETYPED（三项均**已落地 2026-09-09**，见 AUDIT_TODO 注记；agent-host 单测 5＋e2e 8/8、dotnet 72/72——计数含并行线当日新增） | N1 可靠停机的收口延伸——**代码落地，CI 全量确认后关闭** |
-| B3 | GUI 所需真实任务/审批详情/结果/工件/只读 Context 接口 | — | 即 N5 结果半（结果/差异/工件按需读取）——**代码落地，CI 全量确认后关闭**：4 个 run-scoped 只读路由 `work.task_detail`/`work.changes`/`work.artifact`/`work.context`（协议 DTO＋验证、workspace `read_changes` 有界尾读、Runtime `TaskDetail` 命令、宿主 dispatch/routing、.NET DTO＋AgentConnection 4 方法）；protocol 42/42、workspace 105/105、runtime actor 72/72、host 5＋e2e 8/8＋restore 3/3、dotnet 77/77 |
-| B4 | 同一正式宿主 profile 多入口复用、已有 MCP/Skill 配置接入 | — | 即 N8——**代码落地，CI 全量确认后关闭**：宿主 `--mcp-config`/`--plugins-root`（`agent_host::config`）bounded/deny-unknown/fail-closed 解析＋compose 接线＋supported/unsupported 启动声明；agent-host lib 7/7（含 config 2 项）、host_config 3/3、e2e 8/8 回归、restore 3/3、smoke 三条失败路径均退出 1 |
+| B2 | 队列 Completion 语义、宿主「取消全部」与「确认结束」分离、服务失败收口、retyped 原始信封验证 | QUEUE-COMPLETION / CANCEL-ALL / RETYPED（三项均**已落地 2026-09-09**，见 AUDIT_TODO 注记；agent-host 单测 5＋e2e 8/8、dotnet 72/72——计数含并行线当日新增） | N1 可靠停机的收口延伸——**已关闭（2026-09-09）：CI run `34355401858` 七 job 全绿确认**（该 run 覆盖 B3 校验器 clippy `380b08a` 修复后的 B 线全树） |
+| B3 | GUI 所需真实任务/审批详情/结果/工件/只读 Context 接口 | — | 即 N5 结果半（结果/差异/工件按需读取）——**已关闭（2026-09-09）：CI run `34355401858` 七 job 全绿确认**：4 个 run-scoped 只读路由 `work.task_detail`/`work.changes`/`work.artifact`/`work.context`（协议 DTO＋验证、workspace `read_changes` 有界尾读、Runtime `TaskDetail` 命令、宿主 dispatch/routing、.NET DTO＋AgentConnection 4 方法）；protocol 42/42、workspace 105/105、runtime actor 72/72、host 5＋e2e 8/8＋restore 3/3、dotnet 77/77 |
+| B4 | 同一正式宿主 profile 多入口复用、已有 MCP/Skill 配置接入 | — | 即 N8——**已关闭（2026-09-09）：CI run `34355401858` 七 job 全绿确认**：宿主 `--mcp-config`/`--plugins-root`（`agent_host::config`）bounded/deny-unknown/fail-closed 解析＋compose 接线＋supported/unsupported 启动声明；agent-host lib 7/7（含 config 2 项）、host_config 3/3、e2e 8/8 回归、restore 3/3、smoke 三条失败路径均退出 1 |
 
 **用户结果：**重连不漏中间状态；坏连接与退出有明确结局；多入口调用同一套应用行为。
 
