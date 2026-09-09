@@ -697,30 +697,35 @@ async fn open_loops_return_completion_to_the_model_until_resolved() {
     handle.user_message("wrap it up".into()).await.unwrap();
     let mut labels = Vec::new();
     let deadline = tokio::time::Instant::now() + Duration::from_secs(8);
-    let mut turn_completed_at: Option<tokio::time::Instant> = None;
+    let mut last_event_at = tokio::time::Instant::now();
     while tokio::time::Instant::now() < deadline {
-        let mut quiet = true;
+        let mut received_any = false;
         while let Ok(envelope) = events.try_recv() {
-            quiet = false;
+            received_any = true;
+            last_event_at = tokio::time::Instant::now();
             match envelope.event {
                 RuntimeEvent::CheckpointDurable { .. } => labels.push("checkpoint_durable"),
                 RuntimeEvent::TaskCompleted { .. } => labels.push("task_completed"),
-                RuntimeEvent::TurnCompleted => {
-                    labels.push("turn_completed");
-                    turn_completed_at.get_or_insert(tokio::time::Instant::now());
-                }
+                RuntimeEvent::TurnCompleted => labels.push("turn_completed"),
                 _ => {}
             }
         }
-        if turn_completed_at
-            .is_some_and(|seen| seen.elapsed() > Duration::from_millis(400) && quiet)
+        // The whole sequence must be observable before we conclude; a single
+        // empty sweep is not enough on a slow CI runner, where the final
+        // checkpoint write can lag well past the turn-completed event.
+        let sequence_complete = ["turn_completed", "checkpoint_durable", "task_completed"]
+            .iter()
+            .all(|label| labels.contains(label));
+        if sequence_complete
+            && last_event_at.elapsed() > Duration::from_millis(400)
+            && !received_any
         {
             break;
         }
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
     assert!(
-        turn_completed_at.is_some(),
+        labels.contains(&"turn_completed"),
         "turn two must finish inside the test deadline"
     );
     let turn_at = labels
