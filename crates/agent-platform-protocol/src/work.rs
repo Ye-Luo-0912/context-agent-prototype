@@ -656,13 +656,13 @@ pub struct WorkChangesRequest {
 
 impl WorkChangesRequest {
     pub fn validate(&self) -> ValidationResult<()> {
-        if let Some(limit) = self.limit {
-            if limit == 0 || limit > MAX_CHANGES_LIMIT {
-                return Err(ValidationError::new(
-                    "work.changes.limit",
-                    format!("must be in 1..={MAX_CHANGES_LIMIT}"),
-                ));
-            }
+        if let Some(limit) = self.limit
+            && (limit == 0 || limit > MAX_CHANGES_LIMIT)
+        {
+            return Err(ValidationError::new(
+                "work.changes.limit",
+                format!("must be in 1..={MAX_CHANGES_LIMIT}"),
+            ));
         }
         if let Some(after_tx) = &self.after_tx {
             validate_opaque("work.changes.after_tx", after_tx, MAX_CHANGE_TX_ID_BYTES)?;
@@ -809,13 +809,13 @@ impl WorkArtifactRequest {
             &self.reference,
             agent_contracts::MAX_ARTIFACT_REFERENCE_BYTES,
         )?;
-        if let Some(max) = self.max_bytes {
-            if max == 0 || max > MAX_ARTIFACT_READ_BYTES {
-                return Err(ValidationError::new(
-                    "work.artifact.max_bytes",
-                    format!("must be in 1..={MAX_ARTIFACT_READ_BYTES}"),
-                ));
-            }
+        if let Some(max) = self.max_bytes
+            && (max == 0 || max > MAX_ARTIFACT_READ_BYTES)
+        {
+            return Err(ValidationError::new(
+                "work.artifact.max_bytes",
+                format!("must be in 1..={MAX_ARTIFACT_READ_BYTES}"),
+            ));
         }
         Ok(())
     }
@@ -883,13 +883,13 @@ pub struct WorkContextRequest {
 
 impl WorkContextRequest {
     pub fn validate(&self) -> ValidationResult<()> {
-        if let Some(limit) = self.limit {
-            if limit == 0 || limit as usize > MAX_CONTEXT_ITEMS {
-                return Err(ValidationError::new(
-                    "work.context.limit",
-                    format!("must be in 1..={MAX_CONTEXT_ITEMS}"),
-                ));
-            }
+        if let Some(limit) = self.limit
+            && (limit == 0 || limit as usize > MAX_CONTEXT_ITEMS)
+        {
+            return Err(ValidationError::new(
+                "work.context.limit",
+                format!("must be in 1..={MAX_CONTEXT_ITEMS}"),
+            ));
         }
         Ok(())
     }
