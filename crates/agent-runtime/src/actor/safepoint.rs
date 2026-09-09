@@ -170,7 +170,7 @@ impl RuntimeActor {
         self.assemble_checkpoint(None).await
     }
 
-    fn checkpoint_store(&self) -> Option<CheckpointStore> {
+    pub(super) fn checkpoint_store(&self) -> Option<CheckpointStore> {
         self.services
             .artifact_workspace()
             .map(|workspace| CheckpointStore::new(workspace.state_dir().join("checkpoints")))

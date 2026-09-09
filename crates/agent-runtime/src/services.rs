@@ -12,10 +12,10 @@ use std::sync::Arc;
 
 use agent_contracts::{
     AgentError, AgentResult, ApprovalGate, ContextEngine, ContextGcReport, ContextIngress,
-    ContextItemSummary, ContextMaintenanceReport, ContextMaintenanceTrigger, ContextQuery,
-    ContextStateTransition, EffectReconciler, EventJournal, FocusState, FsRereadClass,
-    MaterializedContext, ModelCapabilities, ModelTransport, ScopeId, ScopeKind, StorageGcReport,
-    StoreReconcileReport, TaskId, ToolCall, ToolCatalogEntry, ToolDispatcher,
+    ContextItemId, ContextItemSummary, ContextMaintenanceReport, ContextMaintenanceTrigger,
+    ContextQuery, ContextStateTransition, EffectReconciler, EventJournal, FocusState,
+    FsRereadClass, MaterializedContext, ModelCapabilities, ModelTransport, ScopeId, ScopeKind,
+    StorageGcReport, StoreReconcileReport, TaskId, ToolCall, ToolCatalogEntry, ToolDispatcher,
     ToolExecutionAttribution, ToolLeaseReconcileReport, ToolSpec, ToolSurfaceSnapshot,
     VerificationCoverageDeclaration,
 };
@@ -530,12 +530,24 @@ impl RuntimeServices {
         self.context.storage_gc().await
     }
 
-    /// Run one store reconcile: converge the on-disk blob directory with
-    /// the external map (the crash-recovery authority over formal blobs; a
-    /// missing store dir reconciles as empty). The runtime schedules it
-    /// only at session boundaries — restore/start — never on the hot path.
-    pub(crate) async fn context_reconcile_store(&self) -> AgentResult<StoreReconcileReport> {
-        self.context.reconcile_store().await
+    /// Reconcile the store while keeping `protected` ids' blobs alive:
+    /// item ids still referenced by retained, restorable checkpoints must
+    /// survive even when a newer snapshot made the id resident (R03).
+    pub(crate) async fn context_reconcile_store_protecting(
+        &self,
+        protected: &[ContextItemId],
+    ) -> AgentResult<StoreReconcileReport> {
+        self.context.reconcile_store_protecting(protected).await
+    }
+
+    /// The external item ids one stored context checkpoint references —
+    /// strong recovery roots a reconcile must not delete while the
+    /// checkpoint is retained (R03).
+    pub(crate) fn context_checkpoint_recovery_item_ids(
+        &self,
+        checkpoint: &serde_json::Value,
+    ) -> Vec<ContextItemId> {
+        self.context.checkpoint_recovery_item_ids(checkpoint)
     }
 
     /// Materialize the working set for one model request. The result is

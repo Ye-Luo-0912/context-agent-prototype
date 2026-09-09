@@ -1309,17 +1309,33 @@ pub(crate) struct ReconcileIo {
     pub(crate) seen_ids: std::collections::HashSet<ContextItemId>,
 }
 
-/// Phase 2 of the reconcile (no lock held): scan the store directory, read
-/// every formal blob, and classify it. `map_checksums` is the id -> owned
-/// checksum snapshot taken under the lock; `resident_ids` is the heap +
-/// warm-buffer id snapshot. Blobs the map owns are kept when their checksum
-/// matches; corrupt / id-mismatched blobs are moved to `quarantine/`;
-/// abandoned `.tmp` files are removed.
+/// Plain reconcile: no recovery roots to protect (startup and tests).
+#[cfg(test)]
 pub(crate) async fn run_reconcile_io(
     dir: &Path,
     map_checksums: &HashMap<ContextItemId, Option<String>>,
     resident_ids: &HashSet<ContextItemId>,
 ) -> ReconcileIo {
+    run_reconcile_io_protecting(dir, map_checksums, resident_ids, &[]).await
+}
+
+/// Phase 2 of the reconcile (no lock held): scan the store directory, read
+/// every formal blob, and classify it. `map_checksums` is the id -> owned
+/// checksum snapshot taken under the lock; `resident_ids` is the heap +
+/// warm-buffer id snapshot. `protected` carries strong recovery roots from
+/// still-retained, still-restorable checkpoints: a blob for one of those
+/// ids must never be deleted by this pass even when the current view sees
+/// the same id as resident — the older snapshot's restore promise outlives
+/// the newer one's residency (R03). Blobs the map owns are kept when their
+/// checksum matches; corrupt / id-mismatched blobs are moved to
+/// `quarantine/`; abandoned `.tmp` files are removed.
+pub(crate) async fn run_reconcile_io_protecting(
+    dir: &Path,
+    map_checksums: &HashMap<ContextItemId, Option<String>>,
+    resident_ids: &HashSet<ContextItemId>,
+    protected: &[ContextItemId],
+) -> ReconcileIo {
+    let protected: HashSet<ContextItemId> = protected.iter().copied().collect();
     let mut io = ReconcileIo::default();
     let quarantine_dir = dir.join("quarantine");
 
@@ -1458,8 +1474,11 @@ pub(crate) async fn run_reconcile_io(
             // stale duplicate after recall), the file is a stale copy of
             // resident content and is deleted; otherwise the blob is
             // re-owned as an external entry — the conservative choice.
+            // A `protected` id reverses the first arm: the blob backs a
+            // still-retained checkpoint's restore (R03), so it is kept even
+            // though the current view made the id resident.
             None => {
-                if resident_ids.contains(&item_id) {
+                if resident_ids.contains(&item_id) && !protected.contains(&item_id) {
                     match tokio::fs::remove_file(&path).await {
                         Ok(()) => {
                             io.deleted_stale += 1;
@@ -1472,6 +1491,10 @@ pub(crate) async fn run_reconcile_io(
                                 .push(format!("could not remove stale blob {name}: {e}"));
                         }
                     }
+                } else if resident_ids.contains(&item_id) {
+                    io.reasons.push(format!(
+                        "kept blob {name}: id is resident but a retained checkpoint still references it as a recovery root"
+                    ));
                 } else {
                     io.rebuilt_candidates.push((item, checksum));
                 }
@@ -2281,6 +2304,71 @@ mod tests {
             state.items.iter().any(|i| i.id == id),
             "the recalled content stayed resident"
         );
+    }
+
+    /// R03 regression: a blob whose id is a retained checkpoint's recovery
+    /// root must NOT be deleted by a reconcile that otherwise sees it as a
+    /// stale duplicate of resident content. The current view (newer
+    /// snapshot) made the id resident, but the older checkpoint's restore
+    /// promise still needs the blob: removing it would let `restore A →
+    /// fetch_external(id)` return None.
+    #[tokio::test]
+    async fn reconcile_keeps_a_blob_protected_by_a_retained_recovery_root() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut state = State::default();
+        let id = ContextItemId::new();
+        let item = test_item(id, "recovery-root content");
+        let bytes = serde_json::to_vec(&item).unwrap();
+        externalize_async(dir.path(), id, &bytes).await.unwrap();
+
+        // The blob is an ownerless duplicate of resident content — the
+        // exact window R03 described — with the id protected as a recovery
+        // root. The protecting variant must keep the file.
+        state.items.push(item);
+        let resident: HashSet<_> = [id].into_iter().collect();
+        let protected = [id];
+        let io =
+            run_reconcile_io_protecting(dir.path(), &HashMap::new(), &resident, &protected).await;
+        let report = commit_reconcile(&mut state, io, 1, 1);
+        assert_eq!(
+            report.deleted_stale, 0,
+            "a recovery-root blob must never be deleted: {report:?}"
+        );
+        assert_eq!(report.rebuilt, 0, "protected blobs are not re-owned");
+        assert!(
+            dir.path().join(format!("{id}.json")).exists(),
+            "the recovery-root blob survives the reconcile"
+        );
+        assert!(
+            report
+                .reasons
+                .iter()
+                .any(|reason| reason.contains("retained checkpoint")),
+            "the kept blob is explainable: {report:?}"
+        );
+    }
+
+    /// R03 control: without the protection the same window reclaims the
+    /// stale duplicate exactly as before — protecting is an opt-in for
+    /// known recovery roots, not a blanket no-delete.
+    #[tokio::test]
+    async fn reconcile_reclaims_the_same_blob_without_protection() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut state = State::default();
+        let id = ContextItemId::new();
+        let item = test_item(id, "plain duplicate content");
+        let bytes = serde_json::to_vec(&item).unwrap();
+        externalize_async(dir.path(), id, &bytes).await.unwrap();
+
+        state.items.push(item);
+        let resident: HashSet<_> = [id].into_iter().collect();
+        let io = run_reconcile_io(dir.path(), &HashMap::new(), &resident).await;
+        let report = commit_reconcile(&mut state, io, 1, 1);
+        assert_eq!(
+            report.deleted_stale, 1,
+            "stale duplicate reclaimed: {report:?}"
+        );
+        assert!(!dir.path().join(format!("{id}.json")).exists());
     }
 
     /// One reconcile pass over a store holding every damaged state at once:

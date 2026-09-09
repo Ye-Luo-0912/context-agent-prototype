@@ -2816,6 +2816,33 @@ pub trait ContextEngine: Send + Sync {
         Ok(StoreReconcileReport::default())
     }
 
+    /// Reconcile the store while treating `protected` item ids as strong
+    /// recovery roots that must never be deleted: blobs a still-retained,
+    /// still-restorable checkpoint references survive even when the current
+    /// view sees the same id as resident (a newer snapshot must not end the
+    /// older checkpoint's restore promise). Default forwards to
+    /// [`Self::reconcile_store`], so engines without recovery roots keep
+    /// working unchanged.
+    #[allow(unused_variables)]
+    async fn reconcile_store_protecting(
+        &self,
+        protected: &[ContextItemId],
+    ) -> AgentResult<StoreReconcileReport> {
+        self.reconcile_store().await
+    }
+
+    /// The item ids a stored context checkpoint references as external
+    /// blobs — the strong recovery roots a later reconcile must not delete
+    /// as long as the checkpoint is retained and allowed to restore. The
+    /// runtime calls this for every retained checkpoint after a restore,
+    /// unions the results, and passes them to
+    /// [`Self::reconcile_store_protecting`]. Engines without a checkpoint
+    /// byte format return nothing.
+    #[allow(unused_variables)]
+    fn checkpoint_recovery_item_ids(&self, checkpoint: &serde_json::Value) -> Vec<ContextItemId> {
+        Vec::new()
+    }
+
     /// Bounded projection of live items, oldest first, capped at `limit`.
     async fn inspect(&self, limit: usize) -> AgentResult<Vec<ContextItemSummary>>;
 

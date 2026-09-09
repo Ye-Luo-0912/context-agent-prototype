@@ -1426,6 +1426,18 @@ impl ContextEngine for SimpleContextEngine {
     }
 
     async fn reconcile_store(&self) -> AgentResult<StoreReconcileReport> {
+        // The plain form has no recovery roots to protect: every blob a
+        // retained checkpoint references must survive even a startup
+        // reconcile, so delegate to the protecting variant with an empty
+        // set. Components that know the retained-checkpoint references
+        // (the runtime after a restore) call `reconcile_store_protecting`.
+        self.reconcile_store_protecting(&[]).await
+    }
+
+    async fn reconcile_store_protecting(
+        &self,
+        protected: &[ContextItemId],
+    ) -> AgentResult<StoreReconcileReport> {
         // Same plan/io/commit split as the GC: snapshot the map's owned
         // checksums and the resident ids under the lock, scan + classify
         // the directory without it, then re-own rebuilt blobs under a
@@ -1433,6 +1445,13 @@ impl ContextEngine for SimpleContextEngine {
         // The gate keeps this three-phase operation from interleaving with
         // GC/storage-GC/checkpoint/restore, so the re-ownership commit
         // always runs against the state the plan was derived from.
+        //
+        // `protected` carries the strong recovery roots: item ids whose
+        // blobs a still-retained, still-restorable checkpoint references.
+        // The deletion branch below refuses to remove those blobs even when
+        // the current view already holds the same id resident — a newer
+        // snapshot must not silently end the older snapshot's restore
+        // promise (R03).
         let _gate = self.op_gate.lock().await;
         let (map_checksums, resident_ids) = {
             let mut state = self.state.lock().await;
@@ -1456,13 +1475,29 @@ impl ContextEngine for SimpleContextEngine {
             (map_checksums, resident_ids)
         };
         let dir = crate::store::store_dir(&self.config);
-        let io = crate::store::run_reconcile_io(&dir, &map_checksums, &resident_ids).await;
+        let io = crate::store::run_reconcile_io_protecting(
+            &dir,
+            &map_checksums,
+            &resident_ids,
+            protected,
+        )
+        .await;
         let mut state = self.state.lock().await;
         let now_tick = state.event_seq;
         let gc_epoch = state.gc_epoch;
         Ok(crate::store::commit_reconcile(
             &mut state, io, now_tick, gc_epoch,
         ))
+    }
+
+    /// Item ids a stored context checkpoint references as external blobs.
+    /// Every one is a strong recovery root: while the checkpoint is
+    /// retained and restorable, a reconcile must not delete the blob even
+    /// if a newer snapshot made the id resident (R03). The runtime unions
+    /// these across all retained checkpoints after a restore and passes the
+    /// result to `reconcile_store_protecting`.
+    fn checkpoint_recovery_item_ids(&self, checkpoint: &Value) -> Vec<ContextItemId> {
+        crate::checkpoint::recovery_item_ids(checkpoint)
     }
 
     async fn materialize(&self, query: ContextQuery) -> AgentResult<MaterializedContext> {

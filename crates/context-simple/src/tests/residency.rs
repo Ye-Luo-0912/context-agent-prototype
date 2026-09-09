@@ -98,6 +98,140 @@ async fn gc_externalizes_overflow_and_recalls_via_the_store() {
     assert_eq!(stored, 0, "one owner, one file — after the reconcile");
 }
 
+/// R03 regression, engine level: an older checkpoint whose body was
+/// re-admitted into a newer snapshot before the restore must keep its blob
+/// after the post-restore reconcile. The audit probe sequence is:
+///
+/// 1. externalize a body and save checkpoint A (A references the blob);
+/// 2. Admit the body back resident and save checkpoint B (B owns the id on
+///    the heap, not the store);
+/// 3. restore B, reconcile with the retained checkpoint's roots protected
+///    — the blob survives even though the current view holds the id
+///    resident;
+/// 4. restore A and fetch the body: it must still resolve, because the
+///    blob was not deleted as a stale duplicate.
+#[tokio::test]
+async fn reconcile_protects_an_older_checkpoints_blob_after_restore() {
+    let dir = tempfile::tempdir().unwrap();
+    let engine = SimpleContextEngine::new(SimpleContextConfig {
+        gc_buffer_capacity: 1,
+        gc_reactivate_per_pass: 8,
+        context_store_dir: Some(dir.path().to_path_buf()),
+        ..SimpleContextConfig::default()
+    });
+    open_focus(&engine, "service layer").await;
+    engine
+        .ingest(ContextIngress::UserMessage {
+            content: "work on AuthService.rs".into(),
+        })
+        .await
+        .unwrap();
+    let contents = [
+        format!("step 0: fix AuthService.rs {}", "x".repeat(160)),
+        format!("step 1: fix AuthService.rs {}", "y".repeat(160)),
+    ];
+    for (i, content) in contents.iter().enumerate() {
+        engine
+            .ingest(ContextIngress::ToolObservation {
+                facts: None,
+                output: observation_touching(
+                    &format!("step-{i}"),
+                    true,
+                    content,
+                    Some("AuthService.rs"),
+                ),
+                scope_id: None,
+            })
+            .await
+            .unwrap();
+    }
+    engine
+        .maintain(ContextMaintenanceTrigger::AfterModel)
+        .await
+        .unwrap();
+    let gc_report = engine.gc().await.unwrap();
+    assert!(
+        gc_report.externalized >= 1,
+        "buffer overflow must externalize: {gc_report:?}"
+    );
+
+    // Step 1: checkpoint A — the body lives only on the store.
+    let refs = engine
+        .search_external(agent_contracts::ContextSearchQuery {
+            query: "AuthService".into(),
+            kind: Some(ContextKind::ToolObservation),
+            scope: None,
+            task_id: None,
+            label: None,
+            limit: 16,
+        })
+        .await
+        .unwrap();
+    assert!(!refs.is_empty(), "the retrieval surface must list refs");
+    let target = refs[0].item_id;
+    let expected_content = engine
+        .fetch_external(target)
+        .await
+        .unwrap()
+        .expect("the ref resolves before any restore")
+        .content;
+    let snapshot_a = engine.checkpoint().await.unwrap();
+
+    // Step 2: Admit the body back into the working set and save B. The id
+    // is resident from now on; its store blob becomes an ownerless
+    // duplicate of resident content in B's view.
+    engine
+        .ingest(ContextIngress::ContextDirective {
+            action: ContextAction::Admit {
+                item_id: target,
+                reason: "the model needs this step again".into(),
+            },
+        })
+        .await
+        .unwrap();
+    engine
+        .maintain(ContextMaintenanceTrigger::Checkpoint)
+        .await
+        .unwrap();
+    let snapshot_b = engine.checkpoint().await.unwrap();
+
+    // Step 3: restore B, then reconcile protecting A's recovery roots.
+    // Without protection the reconcile would delete the blob as a stale
+    // duplicate (deleted_stale = 1); with A protected it must survive.
+    engine.restore(snapshot_b).await.unwrap();
+    let recovery_roots = engine.checkpoint_recovery_item_ids(&snapshot_a);
+    assert_eq!(
+        recovery_roots,
+        vec![target],
+        "A's checkpoint must name the external body as a recovery root"
+    );
+    let report = engine
+        .reconcile_store_protecting(&recovery_roots)
+        .await
+        .unwrap();
+    assert_eq!(
+        report.deleted_stale, 0,
+        "a recovery-root blob must not be deleted as stale: {report:?}"
+    );
+    assert!(
+        dir.path().join(format!("{target}.json")).exists(),
+        "the blob backstop of checkpoint A survives the reconcile"
+    );
+
+    // Step 4: restore A and fetch the body — the same promise the audit
+    // probe found broken.
+    engine.restore(snapshot_a).await.unwrap();
+    let fetched = engine
+        .fetch_external(target)
+        .await
+        .unwrap()
+        .expect("checkpoint A must still restore its body");
+    assert_eq!(
+        fetched.content, expected_content,
+        "the restored body must match what A captured"
+    );
+}
+
 /// A tampered store blob must never reach a consumer: `fetch` turns the
 /// ownership-checksum mismatch into a hard read failure instead of serving
 /// substituted content.

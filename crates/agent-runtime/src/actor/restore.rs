@@ -1,4 +1,5 @@
 use super::*;
+use agent_contracts::ContextItemId;
 
 impl RuntimeActor {
     /// Install the actor-owned planes of a runtime checkpoint, but do not
@@ -214,10 +215,19 @@ impl RuntimeActor {
                 // with the restored checkpoint's external map before the
                 // runtime serves again — reconcile is the crash-recovery
                 // authority over formal blobs (a missing store dir
-                // reconciles as empty). A failure is surfaced as an
-                // observable warning, never used to roll the committed
-                // restore back.
-                if let Err(error) = self.services.context_reconcile_store().await {
+                // reconciles as empty). Every still-retained checkpoint is
+                // an allowed restore root, so its external blobs are strong
+                // recovery roots this reconcile must not delete even when a
+                // newer snapshot made the id resident (R03): a later
+                // restore to that older checkpoint may still fetch them.
+                // A failure is surfaced as an observable warning, never used
+                // to roll the committed restore back.
+                let recovery_roots = self.collect_checkpoint_recovery_roots().await;
+                if let Err(error) = self
+                    .services
+                    .context_reconcile_store_protecting(&recovery_roots)
+                    .await
+                {
                     let _ = self
                         .core
                         .emit_event(RuntimeEvent::Warning {
@@ -236,6 +246,39 @@ impl RuntimeActor {
                 Err(error)
             }
         }
+    }
+
+    /// Union the external blobs every still-retained, still-restorable
+    /// checkpoint references. These are strong recovery roots for the
+    /// post-restore store reconcile: a blob may back a checkpoint that is
+    /// older than the one just restored, and a later restore to it must
+    /// still fetch the body (R03). Each candidate envelope is decoded and
+    /// validated with the same function restore uses, so an unreadable or
+    /// invalid artifact contributes nothing and can never suppress
+    /// protection for the valid ones. Absent a checkpoint store — or a
+    /// directory error — the empty set is returned (a missing store dir
+    /// reconciles as empty, and there is nothing to protect).
+    async fn collect_checkpoint_recovery_roots(&self) -> Vec<ContextItemId> {
+        let Some(store) = self.checkpoint_store() else {
+            return Vec::new();
+        };
+        let Ok(listed) = store.list(MAX_CHECKPOINT_LIST_ROWS).await else {
+            return Vec::new();
+        };
+        let mut roots: std::collections::HashSet<ContextItemId> = std::collections::HashSet::new();
+        for row in listed {
+            let Ok(payload) = store.load_verified(&row.artifact).await else {
+                continue;
+            };
+            let Ok(checkpoint) = crate::checkpoint::decode_checkpoint_bytes(&payload) else {
+                continue;
+            };
+            roots.extend(
+                self.services
+                    .context_checkpoint_recovery_item_ids(&checkpoint.context),
+            );
+        }
+        roots.into_iter().collect()
     }
 
     /// Reconcile the ACK debts restored with the checkpoint against the

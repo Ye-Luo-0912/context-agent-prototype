@@ -47,7 +47,7 @@ use crate::budget::{
     DEFAULT_OUTPUT_RESERVE, MAX_TOOL_SURFACE_TOKENS, ModelBudget, approx_layer_tokens,
     engine_pack_window, provider_send_window,
 };
-use crate::checkpoint::RuntimeCheckpoint;
+use crate::checkpoint::{MAX_CHECKPOINT_LIST_ROWS, RuntimeCheckpoint};
 use crate::command::{Reply, RuntimeCommand, RuntimeHandle};
 use crate::execution::{ExecutionState, RoundExecutionSnapshot, RuntimeExecutionAttribution};
 use crate::output::bound_tool_output;

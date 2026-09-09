@@ -25,6 +25,20 @@ pub(crate) fn deserialize(data: Value) -> AgentResult<State> {
     Ok(state)
 }
 
+/// Item ids one stored context checkpoint references as external blobs —
+/// the strong recovery roots a later store reconcile must not delete while
+/// the checkpoint is retained and restorable (R03). Parse handles an empty
+/// or external-less payload (a checkpoint predating the store, or a
+/// resident-only capture) as an empty set rather than an error, so a
+/// corrupt payload degrades to "nothing protected" and the caller's own
+/// validation still owns rejection.
+pub(crate) fn recovery_item_ids(data: &Value) -> Vec<ContextItemId> {
+    let Ok(state) = serde_json::from_value::<State>(data.clone()) else {
+        return Vec::new();
+    };
+    state.external.iter().map(|entry| entry.item_id).collect()
+}
+
 /// Structural validation every restore runs before the state becomes live.
 /// The engine maintains these invariants at runtime; a checkpoint that
 /// violates them is corrupt or hostile, not a legacy format. All checks are
