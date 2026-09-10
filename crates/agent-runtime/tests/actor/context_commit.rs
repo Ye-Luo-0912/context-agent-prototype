@@ -28,8 +28,10 @@ use crate::harness::*;
 #[derive(Debug, Default)]
 struct BodyTrackingEngine {
     state: Mutex<Vec<String>>,
+    fail_user_input_ingest: AtomicBool,
     fail_user_input_maintain: AtomicBool,
     fail_restore: AtomicBool,
+    user_input_maintains: AtomicUsize,
     checkpoint_maintains: AtomicUsize,
     slow_checkpoint_ms: AtomicU64,
 }
@@ -39,6 +41,11 @@ impl ContextEngine for BodyTrackingEngine {
     async fn ingest(&self, ingress: ContextIngress) -> AgentResult<()> {
         if let ContextIngress::UserMessage { content } = ingress {
             self.state.lock().unwrap().push(content);
+            if self.fail_user_input_ingest.load(Ordering::SeqCst) {
+                return Err(AgentError::Context(
+                    "simulated partial ingest failure".into(),
+                ));
+            }
         }
         Ok(())
     }
@@ -49,12 +56,13 @@ impl ContextEngine for BodyTrackingEngine {
         if trigger == ContextMaintenanceTrigger::Checkpoint {
             self.checkpoint_maintains.fetch_add(1, Ordering::SeqCst);
         }
-        if trigger == ContextMaintenanceTrigger::UserInput
-            && self.fail_user_input_maintain.load(Ordering::SeqCst)
-        {
-            return Err(AgentError::Context(
-                "simulated user-input maintenance failure".into(),
-            ));
+        if trigger == ContextMaintenanceTrigger::UserInput {
+            self.user_input_maintains.fetch_add(1, Ordering::SeqCst);
+            if self.fail_user_input_maintain.load(Ordering::SeqCst) {
+                return Err(AgentError::Context(
+                    "simulated user-input maintenance failure".into(),
+                ));
+            }
         }
         Ok(ContextMaintenanceReport::default())
     }
@@ -195,6 +203,68 @@ fn actor_kernel(context: Arc<dyn ContextEngine>) -> Arc<RuntimeServices> {
         Arc::new(PolicyApprovalGate::read_only()),
         None,
     ))
+}
+
+/// Moving ingress onto the operation lane must retain the transaction's
+/// error semantics, including errors after the engine mutated its state.
+#[tokio::test]
+async fn partial_user_input_ingest_failure_restores_before_accepting_next_input() {
+    let engine = Arc::new(BodyTrackingEngine::default());
+    engine.fail_user_input_ingest.store(true, Ordering::SeqCst);
+    let (handle, _) = spawn_runtime(actor_kernel(engine.clone()));
+    handle.start().await.unwrap();
+    let mut events = handle.subscribe();
+    let error = handle
+        .user_message("partial body".into())
+        .await
+        .unwrap_err();
+    assert!(matches!(error, AgentError::Context(_)));
+    assert!(
+        error
+            .to_string()
+            .contains("simulated partial ingest failure")
+    );
+    assert!(engine.state.lock().unwrap().is_empty());
+    assert_eq!(engine.user_input_maintains.load(Ordering::SeqCst), 0);
+    while let Ok(envelope) = events.try_recv() {
+        assert!(!matches!(
+            envelope.event,
+            RuntimeEvent::UserMessageAccepted { .. }
+        ));
+    }
+
+    engine.fail_user_input_ingest.store(false, Ordering::SeqCst);
+    handle.user_message("next input".into()).await.unwrap();
+    wait_for_turn_completed(&mut events).await;
+    assert_eq!(
+        *engine.state.lock().unwrap(),
+        vec!["next input".to_string()]
+    );
+    assert_eq!(engine.user_input_maintains.load(Ordering::SeqCst), 1);
+    handle.stop().await.unwrap();
+}
+
+#[tokio::test]
+async fn partial_user_input_ingest_with_failed_rollback_requires_recovery() {
+    let engine = Arc::new(BodyTrackingEngine::default());
+    engine.fail_user_input_ingest.store(true, Ordering::SeqCst);
+    engine.fail_restore.store(true, Ordering::SeqCst);
+    let (handle, _) = spawn_runtime(actor_kernel(engine.clone()));
+    handle.start().await.unwrap();
+    assert!(matches!(
+        handle.user_message("partial body".into()).await,
+        Err(AgentError::RecoveryRequired(_))
+    ));
+    assert_eq!(
+        *engine.state.lock().unwrap(),
+        vec!["partial body".to_string()]
+    );
+    assert!(matches!(
+        handle.user_message("must be rejected".into()).await,
+        Err(AgentError::RecoveryRequired(_))
+    ));
+    assert_eq!(engine.user_input_maintains.load(Ordering::SeqCst), 0);
+    handle.stop().await.unwrap();
 }
 
 /// A UserInput maintenance failure after the message was ingested must

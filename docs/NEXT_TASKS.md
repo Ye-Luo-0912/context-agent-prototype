@@ -107,7 +107,9 @@
 
 - **W02：已修复并包含于 `6ec044a`**。候选必须具有自己的文件/版本与完整覆盖范围；同 id 不同片段、跨来源同文本不能掩盖 required_miss。
 - **W04 非 BeforeModel 取消已落地（2026-09-10，工作树）：**UserInput/AfterTool/AfterModel 维护接入既有 operation 续接，取消先推进 Core 代际再停止并 join 维护。新输入恢复入账前快照；提交阶段中断返回 RecoveryRequired，保留已应用效果，不误发 TurnCompleted。输入事务成功后使用新 directive 的执行/证明版本；停机有界等待当前提交。门控与完成/取消竞争回归见 [W04 实施与验证回执](reviews/2026-09-10-maintenance-cancellation.md)。W04(P2) 的零预算延期账目已在 `732cf93` 修复，本片不重做。
-- **W06 已包含于 `732cf93`：**按渲染字节统计捕获上限，截断保留行边界，游标指向首个未展示行；本片核对 HEAD 后跳过重做。**下一任务为下表第 7 行真实仓库任务衡量**，沿已选 DeepSeek Flash 固定起点、目标、验收与配置，不复跑缓存合成样本。
+- **W06 已包含于 `732cf93`：**按渲染字节统计捕获上限，截断保留行边界，游标指向首个未展示行；本片核对 HEAD 后跳过重做。**第 7 行已完成小型基线，范围与下一片见下条**；不复跑缓存合成样本。
+- **W04 dynamic ingest 已完成本地验收（2026-09-11，工作树）：**取得真实 Simple 引擎＋门控 compactor 的修复前取消超时反例后，将 ingest 与 UserInput 维护纳入同一 operation/输入事务。取消和停止先 join 后恢复完整快照，继续保留原指令；正常压缩入账/用量报告各一次；部分输入失败回滚，回滚失败返回 RecoveryRequired。Runtime 620 项及 Clippy 通过，[本片回执](reviews/2026-09-11-ingest-cancellation.md)。Flash 原样本没有触发压缩，不充当关闭证据。**下一片先准备第 7 行的严格九份独立 host 验证覆盖声明任务，固定起点、目标与产物检查后再运行有界 Flash；不重复成功样本。**
+- **第 7 行首轮基线已执行，部分覆盖：**三个小型隔离真实代码样本产物通过；已知 21 次 usage、另 1 取消操作缺测。跨进程恢复和约 4 MB 工件尾部读取通过，九类应用检查不冒充九份独立 host 证明；大型跨 crate、真实 compactor 和降本对照仍未验收。[实测回执](reviews/2026-09-11-flash-workflow/REPORT.md)。
 - **供应商 KV 缓存首切片（用户明确共同底层优先）：**按 [KV_CACHE_PLAN.md](reviews/2026-09-10-cache-design-8a0dc29/KV_CACHE_PLAN.md) 在 PromptAssembler 建立稳定段/current_view 的共同布局，稳定合法工具集合的表示、状态后置，同步记录前缀变化原因；随后有界区段，再由薄 provider 适配层映射专属参数与用量。底层不等待供应商选择；独立观测不被 W04/W06 整体阻塞，涉及提交边界才依赖其修复。不启用工具 memo、不改 GC/打分，不以离线字节前缀冒充 provider 命中率。
 
   **首个保守切片已落地（2026-09-10，工作树）：**`CurrentStateLast` 移动完整目录/焦点/进度块，保留全部文字、角色、选中顺序、正文去重、工具选择和协议窗口；新增布局版本及 Legacy 组合回退，request metadata 标明布局。[实施回执](reviews/2026-09-10-cache-design-8a0dc29/KV_LAYOUT_IMPLEMENTATION.md)。为保留当前焦点策略，本片不拆正文标题、不冻结选中集合、不稳定化实际已变化的 schema surface。下一步先做最终请求前缀变化归因和用量覆盖，再决定剩余布局改动；区段化与专属缓存参数尚未实施。
@@ -128,9 +130,9 @@
 | 4 | **W03** 全部 Storage GC 删除入口共享保留根（含根集合完整性） | 保留的旧快照持续有可恢复正文 | **已落地（2026-09-10，本批）**：`storage_gc_protecting(roots, complete)`＋`reconcile_store_protecting` 同签名扩展；根枚举失败/截断置 incomplete → 删除分支延期并报告；完成边界 GC 经 `context_storage_gc_protecting` 传入保留根。回归：引擎级完整序列（保护存活/延期可见/对照删除） |
 | 5 | **W05** 当前验收证明优先保留（9 域合法任务可收敛） | 合法多域验收能结束，重复检查不挤掉必要证明 | **已落地（2026-09-10，本批）**：`MAX_VERIFICATION_FACTS` 对齐契约 16 域；cap 淘汰改为「每 identity 保留最新一条」，同域重复不再挤掉其他域；basis 变更失效规则不变。回归：9 域全保留＋重复风暴＋spec 变更失效 |
 | 6 | **W06/W07** 两个小切片：artifact.read 大工件可达读取；patch 纠错候选取真实磁盘内容 | 大输出能按需查看；纠错依据真实内容 | **已落地（2026-09-10，本批）**：artifact.read 改流式按行扫描（8 MiB 扫描预算＋2 MiB 捕获上限，`total_lines_complete`/`window_truncated` 诚实标记，3 MB 工件首页与第 25,000 行均可达）；patch 失败候选取磁盘原文＋失败 hunk 序号，永不引用未提交中间态 |
-| 7 | 三类真实仓库任务衡量（跨模块修改/多域验收/长输出＋中断恢复） | 成本与交互性有实测记录 | **NOT_RUN（2026-09-10 更新，下一任务）**：三类仓库场景尚未固定和执行。Flash 官方合成调用已通过，旧“无凭据”原因已解除；密钥仅从进程输入注入。衡量的计数面已就位——决策调用走 `RuntimeEvent::ModelUsed`（input/output/attempt/retiy），维护调用走 `ContextMaintenanceReport` 的 `compaction_input_tokens`/`compaction_output_tokens`/`compactions[]` 与 `deferred_folds`，交互性走 TurnCancelled/审批回执时延与 MetricsSession，有界性走 `deferred_folds`/工件读取字节上限。执行前置：① provider 凭据注入宿主 profile（不打进仓库）；② 固定三类任务的仓库起点/目标/验收/模型配置各一份；③ 按路线文档第五节记录总成本（决策/维护分列）、无进展动作、取消时延、交付正确性、有界性五组数据。**不为此新建评测框架或总门禁，不重开 M15/LT-EVAL** |
+| 7 | 三类真实仓库任务衡量（跨模块修改/多域验收/长输出＋中断恢复） | 成本与交互性有实测记录 | **PARTIAL（2026-09-11）**：三个固定小型真实代码样本已运行，产物 3/3 通过，见本节首轮基线回执。大型跨 crate、严格九份独立 host 证明、真实 compactor 长等待和旧版同任务对照未验收。dynamic ingest 取消已通过本地门控验收；下一片先准备严格九份 host 声明的实际任务。密钥仅从进程输入注入。衡量的计数面已就位——决策调用走 `RuntimeEvent::ModelUsed`（input/output/attempt/retiy），维护调用走 `ContextMaintenanceReport` 的 `compaction_input_tokens`/`compaction_output_tokens`/`compactions[]` 与 `deferred_folds`，交互性走 TurnCancelled/审批回执时延与 MetricsSession，有界性走 `deferred_folds`/工件读取字节上限。执行前置：① provider 凭据注入宿主 profile（不打进仓库）；② 固定三类任务的仓库起点/目标/验收/模型配置各一份；③ 按路线文档第五节记录总成本（决策/维护分列）、无进展动作、取消时延、交付正确性、有界性五组数据。**不为此新建评测框架或总门禁，不重开 M15/LT-EVAL** |
 
-**W 系列收口（2026-09-10）：**W01–W08 八项全部代码落地；**CI 确认：run `34408215832` 七 job 全绿**（覆盖 `8a0dc29`，含 W01 全树）。第 7 行三类真实任务衡量尚未运行；Flash 合成调用已通过，接续固定场景后再执行，不另立项。缺陷明细与逐项验收记录见 [AUDIT_TODO.md](AUDIT_TODO.md) 2026-09-10 表。
+**W 系列收口（2026-09-10）：**W01–W08 八项全部代码落地；**CI 确认：run `34408215832` 七 job 全绿**（覆盖 `8a0dc29`，含 W01 全树）。第 7 行已完成首轮小型样本，仍属部分覆盖，不能由原 CI 或合成缓存结果补齐；ingest 边界已本地验收，后续沿第 7 行未验覆盖推进，不另立项。缺陷明细与逐项验收记录见 [AUDIT_TODO.md](AUDIT_TODO.md) 2026-09-10 表。
 
 **用户结果：**继续不丢指令、维护可取消且失败不退役正文、证据缺失诚实可见、旧快照可恢复、合法验收能收敛、大输出可查看、纠错有真实依据。
 

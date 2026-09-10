@@ -511,23 +511,10 @@ impl RuntimeServices {
         self.context.maintain(trigger).await
     }
 
-    /// Prepare user-message ingestion and retain its rollback basis while
-    /// the actor runs UserInput maintenance as a cancellable operation.
-    pub(crate) async fn prepare_user_message(
-        &self,
-        content: String,
-    ) -> AgentResult<serde_json::Value> {
-        let checkpoint = self.context.checkpoint().await?;
-        let transition = self
-            .context
-            .ingest(ContextIngress::UserMessage { content })
-            .await;
-        if let Err(error) = transition {
-            return self
-                .finish_context_transaction("apply user message", checkpoint, Err(error))
-                .await;
-        }
-        Ok(checkpoint)
+    /// Capture the rollback basis before the actor dispatches both input
+    /// ingestion and UserInput maintenance as one cancellable operation.
+    pub(crate) async fn prepare_user_message(&self) -> AgentResult<serde_json::Value> {
+        self.context.checkpoint().await
     }
 
     /// Commit a successful pass, or restore ingestion and maintenance

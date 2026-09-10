@@ -94,6 +94,7 @@
 |---|---|---|
 | W02（P1） | 有界 candidate 使用 dropped 的文件/版本身份，另一文件的相同行号可掩盖必需正文缺失；同 id 或同文本快捷判定也不足 | **已修复**，9 项相关单测通过，含身份/范围负例及最终缺失撤销 settlement；见报告证据 |
 | W04（P1） | BeforeModel 可取消；AfterModel 等入口仍内联 await，Rolling 不按 trigger 排除模型折叠；门控 AfterModel 时 cancel 300ms 未返回 | **已修复（2026-09-10，工作树）**：UserInput/AfterTool/AfterModel 经既有 operation 阶段续接；join 后新输入回滚，提交阶段中断则持久记录精确失败 phase 与 RecoveryRequired，保留已落地效果。门控与取消/完成竞争、输入/证明版本、停机回归见 [实施回执](reviews/2026-09-10-maintenance-cancellation.md)；不外推新 CI |
+| W04（dynamic ingest，P1） | 真实 Simple 引擎在 episode 轮换的 ingest 压缩点被门控，修复前 cancel_turn 超过 2 秒未返回；此前 prepare_user_message 内联 await ingest，尚无可取消 operation | **已修复并本地验收（2026-09-11，工作树）**：ingest 与 UserInput 维护共用既有 operation/事务，取消和停止先 join 再恢复完整快照；原指令保留，正常压缩用量仅报告一次，部分输入错误/恢复失败沿原回滚与 RecoveryRequired 路径。Runtime 620 项、Clippy 通过；[实施回执](reviews/2026-09-11-ingest-cancellation.md)。未连 provider，不外推新 CI 或远端中止支持 |
 | W04（P2） | 预算分支在 take_fold_job 移走候选后统计延期，守卫随后归还候选；零预算两条记录保留但 deferred_folds=0 | **已包含于 `732cf93`**：预算在候选移出前检查，零预算延期计数按真实候选报告；本轮确认 HEAD，未重做 |
 | W06（P2） | artifact 长行截断不累计 captured_bytes，截断尾与下一行拼接；101 行反例返回 100 行且捕获上限失真 | **已包含于 `732cf93`**：渲染字节计入捕获预算，截断行不拼接后行，游标指向首个未展示行；本轮确认 HEAD，未重做 |
 
@@ -185,7 +186,7 @@ PROCESS-01 的已关闭部分（Windows Job 围栏、Unix 管道 EOF 看门狗�
 | 现象 | 复现 | 影响 | 处理 |
 |---|---|---|---|
 | 多文件 `edit.patch` 的写集合要求单个 standing grant 前缀覆盖全部目标；按文件分别授权时批量 patch 永远被拒（同路径单文件 `edit.replace` 可过） | 真二进制 live：两个分文件 grant + 跨两文件的 edit.patch → `tool denied by approval policy`（`agent-core/src/approval.rs` `grant_matches` 的 `WorkspaceWriteSet` 分支） | 可用性限制，方向 fail-closed，无权限扩大 | 有意保守设计，维持；需要时给操作者「组合 grant/公共前缀」的使用指引，或多 grant 交集匹配需单独设计评审 |
-| 恢复会话的无头 `session_end.task_state` 报 `none`，尽管 restore 后有活动任务并完成了 continue | `--restore=latest --continue` 后看 JSONL 末行（Drain 只统计本进程 live 事件） | 低：少报不虚报；脚本侧待审阅语义在恢复会话失真 | backlog；修法是让 restore 回放也驱动 Drain 的 task_active |
+| 恢复会话的无头 `session_end.task_state` 报 `none`，尽管 restore 后有活动任务并完成了 continue | `--restore=latest --continue` 后看 JSONL 末行（Drain 只统计本进程 live 事件） | 低：少报不虚报；脚本侧待审阅语义在恢复会话失真 | backlog；2026-09-11 Flash 两次冷恢复再次复现（见 [走查证据](reviews/2026-09-11-flash-workflow/REPORT.md)）；应由类型化恢复/状态快照初始化 Drain 的 task_active |
 
 ## 什么不自动打断主线
 

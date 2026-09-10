@@ -2868,6 +2868,11 @@ pub struct ContextItemSummary {
 
 #[async_trait]
 pub trait ContextEngine: Send + Sync {
+    /// Runtime may drop UserMessage ingestion and restore its captured
+    /// checkpoint before admitting the input. Release state guards on drop;
+    /// a successful restore must fence any abandoned mutation, including
+    /// remote work. If that cannot be established, restore must fail so
+    /// Runtime can require recovery instead of acknowledging rollback.
     async fn ingest(&self, ingress: ContextIngress) -> AgentResult<()>;
 
     /// Runtime may drop this future when cancelling maintenance. An engine

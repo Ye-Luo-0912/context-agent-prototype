@@ -120,9 +120,26 @@ impl RuntimeActor {
         });
         let context = self.services.context_engine();
         let trigger = continuation.trigger();
+        // Episode compaction can await inside ingest, before maintain is
+        // reached. Keep both calls under the same abort/join and rollback
+        // boundary. A continuation has no new input transaction to ingest.
+        let ingress = match &continuation {
+            MaintenanceContinuation::UserInput(start) if start.checkpoint.is_some() => {
+                Some(ContextIngress::UserMessage {
+                    content: turn.turn_frame.user_message.clone(),
+                })
+            }
+            _ => None,
+        };
         let op_tx = op_tx.clone();
         let task = tokio::spawn(async move {
-            let report = context.maintain(trigger).await;
+            let report = async {
+                if let Some(ingress) = ingress {
+                    context.ingest(ingress).await?;
+                }
+                context.maintain(trigger).await
+            }
+            .await;
             // A full completion channel cannot hold cancellation cleanup:
             // once the engine future ended, cancellation may drop this send.
             tokio::select! {

@@ -289,7 +289,7 @@ impl RuntimeActor {
         } else {
             Some(
                 self.services
-                    .prepare_user_message(content.clone())
+                    .prepare_user_message()
                     .await
                     .map_err(|error| self.context_transition_failed(error))?,
             )

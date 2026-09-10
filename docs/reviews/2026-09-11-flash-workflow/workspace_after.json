@@ -1,0 +1,11 @@
+{
+  "head": "f4dda3b45a1cf2dd80c1054da7d4a7d8795dd849",
+  "source_files_checked": 350,
+  "source_hashes_match_run": true,
+  "recorded_binary_sha256": "8776a9fef50a967078e1b91541541eef11c2c7fb855590a135ae5e3be4c95644",
+  "current_binary_sha256": "54e0d8de6a89754643d5244318b0b6c0905e24ab0bbd54459515e12bb6a2fad7",
+  "current_binary_last_write_utc": "2026-09-10T16:45:45.604500+00:00",
+  "last_run_event_utc": "2026-09-10T16:43:29.891000+00:00",
+  "binary_last_write_after_run": true,
+  "evidence_hashes_verified": 56
+}

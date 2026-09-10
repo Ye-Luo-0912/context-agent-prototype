@@ -2,6 +2,8 @@
 
 2026-09-11；HEAD `732cf93103cb7104f1961402f422e82143b8956c` 加已有工作树改动。当前工作树构建 `agent-tui`，350 个 Rust 源码/构建文件摘要在运行前后相同，二进制摘要已保存。所有模型请求配置为官方 `deepseek-flash`、Responses、`reasoning.effort=none`、原生默认缓存、dynamic Context。
 
+收尾时工作区同期已推进到 `f4dda3b45a1cf2dd80c1054da7d4a7d8795dd849`（不是本执行者发起的提交），350 个源码摘要仍完全相同。当前 `target/debug/agent-tui.exe` 在全部运行结束后被重建，SHA 已不同；本证据绑定运行前记录的二进制 SHA，不把当前 exe 当作当时工件。原二进制未另行保存，复核以已保存源码/运行身份和日志为限。[收尾工作区核对](workspace_after.json)。
+
 **固定的三个小型隔离仓库样本均通过预定产物检查。** 代码来自本仓库的文档校验脚本；这不是大型整仓开发验收，也不证明相对旧版本降本。初始任务、权限、上界和不覆盖内容已在付费调用前写入 [TASKS.md](TASKS.md)。样本输出留在证据目录，没有应用回用户的生产工作树。
 
 ## 实际结果
@@ -35,7 +37,9 @@ C 两次 `RuntimeRestored` 后沿原指令执行；4,065,097 字节、32,019 行
 
 恢复段仍将 `session_end.task_state` 报为 `none`，尽管继续任务成功、没有 TaskCompleted，且原活动任务继续保留。这复现了 [已有 backlog](../../AUDIT_TODO.md) 的无头恢复状态低报；没有把它算作“任务已持久完成”。A/B 普通 final 为 `awaiting_operator_review`，本轮没有授予额外自动关闭权。
 
-这轮覆盖小型真实代码样本的工具循环、应用检查与 Windows 跨进程恢复；仍未覆盖大型跨 crate 修改、九份独立 host 验收声明、真实 compactor 长等待、精确控制 ACK 延迟、其他平台及旧版本同任务对照。后续沿原队列补缺口，不重复本组成功调用、不重开 M15/LT-EVAL。
+**下一优先片为 dynamic ingest 的取消边界。** 执行后核对源码发现，`SimpleContextEngine::ingest(UserMessage)` 在 episode 轮换时可直接 await `run_distill`，而 Runtime 的 `prepare_user_message` 仍内联 await ingest。上一片只把 `ContextEngine::maintain` 拆入 operation，不能据此声明这个真实供应商等待也可取消。调用链已读，实际门控反例尚未执行；本组没有轮换压缩，不能用于关闭该缺口。下一片先用真实 Simple 引擎加门控 compactor 复现，再沿既有输入事务、join 与快照回滚修复，不新建调度器或原样补跑 live。
+
+这轮覆盖小型真实代码样本的工具循环、应用检查与 Windows 跨进程恢复；仍未覆盖大型跨 crate 修改、九份独立 host 验收声明、真实 compactor 长等待、精确控制 ACK 延迟、其他平台及旧版本同任务对照。后续先补上述 Runtime/Context 边界，再沿原队列补实测缺口，不重复本组成功调用、不重开 M15/LT-EVAL。
 
 ## 执行与数据修正
 
@@ -44,5 +48,8 @@ C 两次 `RuntimeRestored` 后沿原指令执行；4,065,097 字节、32,019 行
 3. 官方 `/models` 只读预检确认请求的 `deepseek-flash` 可用。用户先前提供的凭据仅经进程输入/环境传入，未进入源文件、fixture、报告或授权文件。
 4. `python -B docs/reviews/2026-09-11-flash-workflow/run.py` 执行 A/B 后，汇总脚本因 Windows 路径键使用反斜杠而抛 KeyError。模型任务本身均正常结束。保留 [原 runner](evidence/runner.initial.py)，修正路径规范化并加强不可修改文件检查，离线重验 A/B；`--resume target/flash-workflow/1789058357423842400` 只执行尚未开始的 C，没有重跑 A/B。修正版本和原因载于 manifest。
 5. 三组事后 pytest 均 9/9，A 另验证旧入口确实委托新模块；源码/测试和额外文件修改范围核对通过。C 额外核对完整工件 SHA-256、尾页内容、两次恢复、类型化取消、单次输出写入。证据包扫描未发现 credential-shaped 内容。
+6. `python scripts/doc_consistency.py` 与 `git diff --check` 通过；运行脚本 AST 解析、56 个已保存证据摘要和 350 个源码摘要复核通过。最终二进制相等检查发现上述运行后重建，已单独记账，没有覆盖原摘要或补跑 live。生产代码未在本轮修改，未重复上轮 615 项 Runtime 回归。
 
 本轮没有修改生产 Rust/文档校验脚本、提交、推送或启动子 agent。只新增可审阅运行计划、薄运行脚本与本次证据；历史冻结结果保持原样。
+
+后续记录（2026-09-11）：上述 dynamic ingest 等待已由独立 Runtime 切片复现并修复，真实 Simple 引擎门控取消/停止/正常完成及 Runtime 620 项回归通过，见 [输入压缩取消回执](../2026-09-11-ingest-cancellation.md)。该修复不改本报告的执行源码、二进制摘要、原始数据或覆盖范围，也没有补跑本组成功的 Flash 请求。

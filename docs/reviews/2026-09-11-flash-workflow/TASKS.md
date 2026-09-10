@@ -17,3 +17,5 @@
 写权限仅覆盖 A 的 `scripts/`、B 的 `validation.json`、C 的 `summary.json`；进程授权只允许固定绝对 Python 路径的 `-m pytest` 前缀，最多 4 次、30 分钟到期。密钥仅从进程输入取得，不进入任务、Git、报告或模型可读文件。
 
 保存运行前源码摘要、二进制摘要、任务起点 commit、prompt、授权范围、运行 JSONL、重试记录、最终 diff、可信验证结果及快照。普通 final 仍为待操作员审阅。取消精确请求时间若未在产品事件中暴露则标为不可测，不拿总耗时冒充取消回执延迟。维护调用没有 usage 时记缺测，不按零消耗记账。
+
+执行后预算说明更正：上文“每次 4 个 compactor 调用”是 Rolling 的配置，不能描述本次 dynamic 引擎的调用位置。源码核对显示，dynamic 的可选 episode 压缩位于 UserMessage ingest，每次 ingest 最多准备一个 distill job；本次单指令/原指令继续轨迹没有触发它，44 次维护报告均无 compaction。固定主模型轮数、响应上限、超时、任务内容未变，没有为此补跑供应商请求。这也暴露了下一片需覆盖的 ingest 长等待取消边界。

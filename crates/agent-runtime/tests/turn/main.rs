@@ -7,6 +7,7 @@ mod directive;
 mod effects;
 mod focus;
 mod harness;
+mod ingest_cancel;
 mod input_bounds;
 mod maintenance;
 mod opportunity;
