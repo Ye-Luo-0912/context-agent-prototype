@@ -17,9 +17,41 @@ lives in [`INSTALL.md`](../INSTALL.md); this is the full reference.
 
 ## Provider behavior (strict parsing: garbage is a startup error)
 
+Prompt layout is a provider-independent runtime composition choice. The
+default is `agent_contracts::PromptLayout::CurrentStateLast`: the complete
+current tool catalog and Focus/TaskAnchor/TaskProgress follow the retained
+execution history, preserving their text and roles. Context selection,
+scoring, GC, schema selection and budgets are unchanged.
+
+For an endpoint that requires the historical placement, or a controlled
+behavior comparison, a Rust composition root can call
+`agent_compose::compose_with_prompt_layout(config, PromptLayout::Legacy)`;
+direct compositions can use `RuntimeServices::with_prompt_layout`. This is
+a typed construction option, **not a new environment variable or remote
+client setting**. Older serialized ModelInput values default to Legacy.
+Request metadata names the layout. After final packing, `ModelInput::into_request`
+also binds one typed `PromptReuseBoundary` to the retained prefix and tool schemas.
+This hint alone adds no vendor parameter and claims no cache hit.
+
+For opt-in transport diagnostics, Rust callers can use
+`OpenAiProvider::complete_stream_observed` with a per-call `OpenAiCallObserver`.
+It fingerprints the actual HTTP body and reports optional model/cache counters;
+it neither changes the payload nor adds a cache setting. Normal Runtime calls
+do no diagnostic hashing or storage. See [KV diagnostics](reviews/2026-09-10-cache-live/DIAGNOSTICS.md)
+and the [isolated live result](reviews/2026-09-10-cache-live/ISOLATED_REPORT.md).
+
+`OpenAiCallObserver::on_http_error` additionally reports the protocol, HTTP
+status, and an optional exact service-reported cache rejection. It exposes no
+arbitrary error body and does not change failure/retry behavior. The current
+configured gateway/model explicitly rejected the breakpoint; see the
+[capability finding](reviews/2026-09-10-cache-live/CAPABILITY.md). This feature
+remains opt-in and the default does not send caching extensions.
+
 | Variable | Default | Range |
 | --- | --- | --- |
 | `OPENAI_API_PROTOCOL` | `auto` | `auto` / `responses` / `chat` |
+| `OPENAI_PROMPT_CACHE_MODE` | `provider_default` | `provider_default` / `responses_explicit`; explicit mode requires `OPENAI_API_PROTOCOL=responses` |
+| `OPENAI_RESPONSES_REASONING_EFFORT` | `provider_default` | `provider_default` / `none` / `low` / `high` / `max`; a pinned value requires `OPENAI_API_PROTOCOL=responses` |
 | `OPENAI_CONTEXT_WINDOW` | `128000` | integer ≥ 1024 |
 | `OPENAI_MAX_OUTPUT_TOKENS` | `4096` | integer ≥ 1 |
 | `OPENAI_TEMPERATURE` | unset = provider default | 0.0 – 2.0 |
@@ -28,13 +60,44 @@ Sampling is an **explicit operating point**: unset means the declared
 provider-default (recorded as such in the profile digest); set means the
 temperature field is pinned on every wire request under both protocols.
 
+Responses reasoning is also explicit: `provider_default` sends no `reasoning`
+field and preserves historical profile digests; a pinned value sends
+`reasoning: {"effort": "<value>"}` and changes the profile digest. Unsupported
+values/protocol combinations fail at startup; model-specific support is still
+the endpoint's responsibility. Rust callers can select the same setting with
+`OpenAiProvider::with_responses_reasoning_effort`.
+
+For DeepSeek Flash, the currently documented model is `deepseek-flash` at
+`https://api.deepseek.com`, with a native Responses endpoint. The bounded cache
+comparison pins reasoning to `none`, which DeepSeek documents as disabling
+thinking, and uses `provider_default` caching. DeepSeek learns shared prefixes
+automatically, so its comparison includes three distinct state changes per
+layout. See [DeepSeek's Responses reference](https://api-docs.deepseek.com/api/create-response/)
+and [cache rules](https://api-docs.deepseek.com/guides/kv_cache/). The test runner
+`docs/reviews/2026-09-10-cache-live/run_deepseek.py` accepts a process-local
+`DEEPSEEK_API_KEY` or stdin and never writes it into the workspace configuration.
+
+`responses_explicit` is an operator declaration that the configured endpoint/model
+supports Responses content-block caching; compatibility URLs and model aliases do
+not enable it automatically. With a valid common boundary, the provider adds one
+`prompt_cache_breakpoint: {"mode":"explicit"}` to the last retained evidence
+message (or policy for Legacy), and `prompt_cache_options: {"mode":"explicit"}`.
+Every message, its role, the complete current directive and tool definitions are
+still sent. A missing/stale hint sends the ordinary full request with no cache
+fields. Unsupported endpoints fail visibly; parameters are not silently removed
+and retried. Rust callers can select the same mode with
+`OpenAiProvider::with_prompt_cache_mode`. Explicit mode changes the provider profile
+digest; default mode preserves the historical digest. TTL and cache routing keys
+are left to the provider. See [boundary implementation and live check](reviews/2026-09-10-cache-live/BOUNDARY.md)
+and the [official Responses caching guide](https://developers.openai.com/api/docs/guides/prompt-caching).
+
 ## Serving identity
 
 Every run prints the provider profile banner and persists the digest
 into every checkpoint's run metadata:
 
 ```
-provider profile: <model> @ <base_url> protocol=responses context_window=128000 max_output_tokens=4096 sampling=provider-default digest=0123456789abcdef…
+provider profile: <model> @ <base_url> protocol=responses context_window=128000 max_output_tokens=4096 sampling=provider-default prompt_cache=provider_default responses_reasoning=provider_default digest=0123456789abcdef…
 ```
 
 Two runs compare operating points by comparing `provider_profile_digest`.

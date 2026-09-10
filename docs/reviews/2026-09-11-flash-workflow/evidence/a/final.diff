@@ -1,0 +1,40 @@
+diff --git a/scripts/doc_consistency.py b/scripts/doc_consistency.py
+index 4549207..4c2a740 100644
+--- a/scripts/doc_consistency.py
++++ b/scripts/doc_consistency.py
+@@ -21,7 +21,8 @@ import json
+ import os
+ import re
+ import sys
+-import urllib.parse
++
++from doc_links import check_markdown_links
+ 
+ ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+ REQUIRED_STATE_FIELDS = ["schema", "head_commit", "m15", "product_stage"]
+@@ -101,24 +102,7 @@ def check_stale_phrases(violations):
+ 
+ 
+ def check_links(violations):
+-    link_pattern = re.compile(r"\]\(([^)\s#]+)(?:#[^)\s]*)?\)")
+-    for relative in LIVE_DOCS:
+-        path = os.path.join(ROOT, relative)
+-        if not os.path.isfile(path):
+-            violations.append(f"live document missing: {relative}")
+-            continue
+-        with open(path, encoding="utf-8") as handle:
+-            text = handle.read()
+-        base = os.path.dirname(path)
+-        for match in link_pattern.finditer(text):
+-            target = match.group(1)
+-            if target.startswith(("http://", "https://", "mailto:")):
+-                continue
+-            resolved = os.path.normpath(
+-                os.path.join(base, urllib.parse.unquote(target))
+-            )
+-            if not os.path.exists(resolved):
+-                violations.append(f"{relative}: broken link -> {target}")
++    check_markdown_links(ROOT, LIVE_DOCS, violations)
+ 
+ 
+ def check_toolchain(violations):

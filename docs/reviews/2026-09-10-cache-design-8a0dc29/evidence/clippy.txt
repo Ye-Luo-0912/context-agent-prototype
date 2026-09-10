@@ -1,0 +1,7 @@
+    Checking agent-contracts v0.1.0 (D:\Users\Ye_Luo\APP\context-agent-prototype\crates\agent-contracts)
+    Checking agent-platform-protocol v0.1.0 (D:\Users\Ye_Luo\APP\context-agent-prototype\crates\agent-platform-protocol)
+    Checking agent-core v0.1.0 (D:\Users\Ye_Luo\APP\context-agent-prototype\crates\agent-core)
+    Checking agent-process v0.1.0 (D:\Users\Ye_Luo\APP\context-agent-prototype\crates\agent-process)
+    Checking agent-workspace v0.1.0 (D:\Users\Ye_Luo\APP\context-agent-prototype\crates\agent-workspace)
+    Checking agent-runtime v0.1.0 (D:\Users\Ye_Luo\APP\context-agent-prototype\crates\agent-runtime)
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 22.77s

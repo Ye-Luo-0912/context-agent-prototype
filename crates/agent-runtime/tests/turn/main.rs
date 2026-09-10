@@ -11,6 +11,7 @@ mod input_bounds;
 mod maintenance;
 mod opportunity;
 mod policy;
+mod prompt_layout;
 mod recovery_surface;
 mod safepoint;
 mod scopes;

@@ -88,6 +88,15 @@
 
 ## 2026-09-10 Agent 任务流程审查（基线 `fb1ec9c` → W 系列）
 
+**实施后复核补充（2026-09-10）：**[缓存设计与核心复核](reviews/2026-09-10-cache-design-8a0dc29/REPORT.md) 在 `8a0dc29` 上复现下列边界；工作期间 HEAD 推进到 `6ec044a`，W02 修复已包含于其中。原表的实施记录不等于这些新反例已关闭，继续沿原 W 编号处理：
+
+| 原项 | 复核结果 | 状态与验收 |
+|---|---|---|
+| W02（P1） | 有界 candidate 使用 dropped 的文件/版本身份，另一文件的相同行号可掩盖必需正文缺失；同 id 或同文本快捷判定也不足 | **已修复**，9 项相关单测通过，含身份/范围负例及最终缺失撤销 settlement；见报告证据 |
+| W04（P1） | BeforeModel 可取消；AfterModel 等入口仍内联 await，Rolling 不按 trigger 排除模型折叠；门控 AfterModel 时 cancel 300ms 未返回 | **已修复（2026-09-10，工作树）**：UserInput/AfterTool/AfterModel 经既有 operation 阶段续接；join 后新输入回滚，提交阶段中断则持久记录精确失败 phase 与 RecoveryRequired，保留已落地效果。门控与取消/完成竞争、输入/证明版本、停机回归见 [实施回执](reviews/2026-09-10-maintenance-cancellation.md)；不外推新 CI |
+| W04（P2） | 预算分支在 take_fold_job 移走候选后统计延期，守卫随后归还候选；零预算两条记录保留但 deferred_folds=0 | **已包含于 `732cf93`**：预算在候选移出前检查，零预算延期计数按真实候选报告；本轮确认 HEAD，未重做 |
+| W06（P2） | artifact 长行截断不累计 captured_bytes，截断尾与下一行拼接；101 行反例返回 100 行且捕获上限失真 | **已包含于 `732cf93`**：渲染字节计入捕获预算，截断行不拼接后行，游标指向首个未展示行；本轮确认 HEAD，未重做 |
+
 主审查者逐项复核调用链并运行隔离反例（8 项：4 P1、4 P2；未修改生产代码、未连真实 provider；证据层级与限制见 [EVIDENCE.md](reviews/2026-09-10-agent-workflow-fb1ec9c/EVIDENCE.md)）。原文：[REPORT.md](reviews/2026-09-10-agent-workflow-fb1ec9c/REPORT.md)；切片顺序与衡量方式：[WORKFLOW_AND_ROUTE.md](reviews/2026-09-10-agent-workflow-fb1ec9c/WORKFLOW_AND_ROUTE.md)。W 编号只是本轮定位，不另建阶段、不替代本表。执行顺序按路线文档：W01 → W04+W08（同一切片的两个半边）→ W02 → W03 → W05 → W06/W07（两个小切片）→ 三类真实任务衡量（条件性，具备真实 provider 条件才运行）。
 
 | 发现 | 已核对位置 | 要修什么 | 不要做什么 |

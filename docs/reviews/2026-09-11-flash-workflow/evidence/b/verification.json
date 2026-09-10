@@ -1,0 +1,24 @@
+{
+  "nine_domain_tests_exit": 0,
+  "nine_domain_tests": "============================= test session starts =============================\nplatform win32 -- Python 3.12.3, pytest-8.4.2, pluggy-1.6.0\nrootdir: D:\\Users\\Ye_Luo\\APP\\context-agent-prototype\\target\\flash-workflow\\1789058357423842400\\b\\workspace\nconfigfile: pytest.ini\ncollected 9 items\n\ntests\\test_links.py .........\n\n============================== 9 passed in 0.06s ==============================\n",
+  "tests_unchanged": true,
+  "diff": "",
+  "status": "?? validation.json",
+  "output": {
+    "domains": {
+      "existing": "PASS",
+      "missing": "PASS",
+      "missing_document": "PASS",
+      "external": "PASS",
+      "encoded": "PASS",
+      "fragment": "PASS",
+      "nested": "PASS",
+      "unicode": "PASS",
+      "mixed": "PASS"
+    },
+    "evidence": "Ran the trusted recipe python.pytest (verify.run) against tests/test_links.py in the workspace with pytest.ini (rootdir=workspace, configfile=pytest.ini). Collection found 9 items; all nine parametrized cases of test_link_domain passed: existing, missing, missing_document, external, encoded, fragment, nested, unicode, mixed. Result: '9 passed in 0.08s', process exit code 0. Each domain's assertion compared checker.check_links output on a temp workspace (checker.ROOT/LIVE_DOCS monkeypatched) to the expected violation list, and all matched, so every domain is reported PASS. No source or test files were modified; only validation.json was written. Full output artifact: artifact://v1/d4c5fac4-4a2d-43bb-990a-7b775e6975f9/process/c62adb39198ec2c8576962250847b3fad52fbc40276fe784b564d1ded4fa22f3"
+  },
+  "source_unchanged": true,
+  "passed": true,
+  "unexpected_changes": []
+}

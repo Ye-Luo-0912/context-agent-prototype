@@ -1,0 +1,213 @@
+{
+  "segment": "b-main",
+  "argv": [
+    "D:\\Users\\Ye_Luo\\APP\\context-agent-prototype\\target\\debug\\agent-tui.exe",
+    "--grant-file=D:\\Users\\Ye_Luo\\APP\\context-agent-prototype\\target\\flash-workflow\\1789058357423842400\\b\\b-main\\grants.json",
+    "--max-rounds=8",
+    "--timeout-secs=240",
+    "--context=dynamic",
+    "--work",
+    "--prompt=-",
+    "D:\\Users\\Ye_Luo\\APP\\context-agent-prototype\\target\\flash-workflow\\1789058357423842400\\b\\workspace"
+  ],
+  "exit_code": 0,
+  "wall_ms": 11462.83,
+  "forced_tree_stop": false,
+  "run_id": "d4c5fac4-4a2d-43bb-990a-7b775e6975f9",
+  "metrics": {
+    "event_counts": {
+      "model_started": 6,
+      "model_used": 6,
+      "tool_started": 9,
+      "tool_finished": 9,
+      "turn_completed": 1,
+      "turn_cancelled": 0,
+      "runtime_restored": 0,
+      "checkpoint_durable": 2,
+      "recovery_required": 0
+    },
+    "decision": {
+      "calls": 6,
+      "input_tokens": 31258,
+      "output_tokens": 1233,
+      "cached_input_tokens": 20992,
+      "attempts": 6,
+      "retries": 0
+    },
+    "maintenance": {
+      "passes": 12,
+      "compactions": 0,
+      "compaction_input_tokens": 0,
+      "compaction_output_tokens": 0,
+      "deferred_folds": 0
+    },
+    "tools": [
+      {
+        "name": "fs.list",
+        "ok": true,
+        "artifact_ref": null,
+        "metadata": {
+          "cursor": null,
+          "entry_count": 5,
+          "has_more": false,
+          "next_start_line": null,
+          "path": ".",
+          "returned": 5,
+          "revision": "8e0aa7d8b7c9f52db4113ffc7b8607657f0cf0251c8d6d3dcc540d083d1c5b58",
+          "scan_incomplete": false
+        }
+      },
+      {
+        "name": "fs.read",
+        "ok": true,
+        "artifact_ref": null,
+        "metadata": {
+          "bytes": 5891,
+          "covers_file": true,
+          "end_line": 167,
+          "fs_read_motive": "first",
+          "line_count": 167,
+          "line_ending": "lf",
+          "path": "scripts/doc_consistency.py",
+          "revision": "a33920f5e7a2b67b505530093347fe162bea6ba2f36b6a674c050a487100a4de",
+          "start_line": 1
+        }
+      },
+      {
+        "name": "fs.list",
+        "ok": true,
+        "artifact_ref": null,
+        "metadata": {
+          "cursor": null,
+          "entry_count": 2,
+          "has_more": false,
+          "next_start_line": null,
+          "path": "tests",
+          "returned": 2,
+          "revision": "fb515efc140c99775fa72f878191b736cb46bdb86a72f2fee6c1b993067a0200",
+          "scan_incomplete": false
+        }
+      },
+      {
+        "name": "fs.read",
+        "ok": true,
+        "artifact_ref": null,
+        "metadata": {
+          "bytes": 47,
+          "covers_file": true,
+          "end_line": 2,
+          "fs_read_motive": "first",
+          "line_count": 2,
+          "line_ending": "crlf",
+          "path": "pytest.ini",
+          "revision": "bcdf34c2f86b4545e8d8bfeccc8cde3163d12b6650a67700123cb1b5463ef3a7",
+          "start_line": 1
+        }
+      },
+      {
+        "name": "fs.read",
+        "ok": true,
+        "artifact_ref": null,
+        "metadata": {
+          "bytes": 284,
+          "covers_file": true,
+          "end_line": 4,
+          "fs_read_motive": "first",
+          "line_count": 4,
+          "line_ending": "crlf",
+          "path": "README.md",
+          "revision": "cc088a73928ef3c8d5fbcc416fe9f78484099d25dd3d492ac0ed2dd6aec8c2b2",
+          "start_line": 1
+        }
+      },
+      {
+        "name": "capability.manage",
+        "ok": true,
+        "artifact_ref": null,
+        "metadata": {
+          "active": 1,
+          "descriptors": [
+            {
+              "lifecycle": "loaded",
+              "load_cost": 0,
+              "owner": "builtin",
+              "ref": {
+                "id": "verify.run",
+                "kind": "tool",
+                "version": 1
+              },
+              "summary": "Run one trusted project verification recipe. The host owns argv, cwd and environment; choose only a recipe_id. Recipe ids are values for verify.run, not tool names and never need capability.manage load. Successful current-world PASS may be…",
+              "title": "verify.run"
+            }
+          ],
+          "has_more": false,
+          "kind": "tool",
+          "op": "search",
+          "returned": 1,
+          "total": 1
+        }
+      },
+      {
+        "name": "fs.read",
+        "ok": true,
+        "artifact_ref": null,
+        "metadata": {
+          "bytes": 1790,
+          "covers_file": true,
+          "end_line": 38,
+          "fs_read_motive": "first",
+          "line_count": 38,
+          "line_ending": "crlf",
+          "path": "tests/test_links.py",
+          "revision": "ff4545a90f3f3e1068bda72ba11681ba2dd941d163696d9507efb1e565b06779",
+          "start_line": 1
+        }
+      },
+      {
+        "name": "verify.run",
+        "ok": true,
+        "artifact_ref": "artifact://v1/d4c5fac4-4a2d-43bb-990a-7b775e6975f9/process/c62adb39198ec2c8576962250847b3fad52fbc40276fe784b564d1ded4fa22f3",
+        "metadata": {
+          "argv": "D:\\Users\\Ye_Luo\\APP\\context-agent-prototype\\target\\flash-workflow-env\\Scripts\\python.exe -m pytest",
+          "artifact_bytes": 989,
+          "artifact_limit_bytes": 8388608,
+          "artifact_truncated": false,
+          "cwd": ".",
+          "exit_code": 0,
+          "lines": 17,
+          "mutates_workspace": true,
+          "outcome": "completed",
+          "output_bytes": 989,
+          "recipe_id": "python.pytest",
+          "recipe_revision": "python-pytest-v2",
+          "resolution_fingerprint": "05930fe8ea2d1ada8b7fc97efea171ed19cb8b0ddad07177d81043b8a6371f93",
+          "resolution_scope_key": "1c5ba3cb6afac4af462ac7659361e869ba9eeaef45bb5ce90c4a921e68fa48ac",
+          "timeout_ms": 120000,
+          "verification": true
+        }
+      },
+      {
+        "name": "fs.write",
+        "ok": true,
+        "artifact_ref": null,
+        "metadata": {
+          "bytes": 1053,
+          "line_ending": "lf",
+          "path": "validation.json",
+          "revision": "94ee5097017fdda994f4e1a335d8a7eb59663a181e4ab926ab80e7a9e1419ec5"
+        }
+      }
+    ],
+    "session_end": {
+      "approval_denied": false,
+      "exit": 0,
+      "kind": "session_end",
+      "round_budget": false,
+      "schema": "agent.headless.v1",
+      "status": "completed",
+      "stop": "turn_completed",
+      "task_completed": false,
+      "task_state": "awaiting_operator_review"
+    }
+  }
+}

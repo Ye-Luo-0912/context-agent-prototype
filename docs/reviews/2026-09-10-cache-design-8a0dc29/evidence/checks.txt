@@ -1,0 +1,5 @@
+workspace fmt: exit 0
+probe fmt: exit 0
+document-consistency gate: OK (13 live docs, links and state agree)
+git diff --check: exit 0
+recorded 22 explicitly reviewed source files at 6ec044aa869fd7ae3a6adc0ec694a4bcd42e0478

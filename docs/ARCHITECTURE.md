@@ -1045,8 +1045,8 @@ ContextEngine.materialize(ContextQuery)   ── the Context Frame (long-term wo
    │
    v
 PromptAssembler.assemble_with_catalog(runtime_focus, task_anchor, history, turn, tools, catalog)
-   = System Policy + Runtime Facts + Tool Catalog Index + Focus Frame
-     + Context Frame + Turn Frame + compacted Tool Schemas
+   = System Policy + Runtime Facts + Context Frame + Turn Frame
+     + Current State (Tool Catalog Index + Focus Frame); compacted Tool Schemas
    │
    v
 ModelTransport.complete_stream()
@@ -1168,20 +1168,20 @@ candidate cost, external-ref token accounting and fit-before-top-K remain.
 ## 6. Context is rebuilt, not replayed
 
 The model-facing request is intentionally rebuilt from state instead of
-replaying an append-only transcript. The input is assembled in five layers:
+replaying an append-only transcript. The default `CurrentStateLast` layout
+assembles the same logical layers in this message order:
 
 ```text
 System Policy    - standing instructions (runtime-owned)
 Runtime Facts    - bounded host/workspace profile (runtime-owned)
-Tool Catalog Index - names of tools not on this round's schema surface
-Focus Frame      - current TaskAnchor + Focus from TaskManager (runtime-owned)
 Context Frame    - historical working set from MaterializedItem's
 Turn Frame       - the current turn's execution stack (runtime-owned)
+Current State    - Tool Catalog Index, then TaskAnchor + TaskProgress + Focus
 Active Tool Schemas - compacted tool definitions for this request
 ```
 
-Role authority follows the same split. Only the system policy and the
-focus frame render with the `System` role; the context frame (retrieved
+Role authority follows the same split. System policy, Runtime Facts, the
+tool catalog and the focus frame retain the `System` role; the context frame (retrieved
 history and external refs) renders as delimited, low-authority `user`
 messages and tool results stay `Tool`-role messages, so content retrieved
 from files, tools or the store can never gain system precedence over the
@@ -1194,6 +1194,46 @@ prompt rendering lives in one place only: `PromptAssembler` takes runtime
 Focus/TaskAnchor plus the engine's historical `MaterializedContext`. The
 engine could not format a prompt even if it wanted to — it never sees the
 system prompt or the tool schemas.
+
+#### Common prefix layout (KV first slice)
+
+`PromptLayout::CurrentStateLast` moves the complete changing catalog and
+Focus block after the retained tool exchanges. Their contents and roles are
+unchanged; evidence is not rescored, reordered, frozen, or dropped for cache
+reuse. Focus/TaskAnchor/TaskProgress are rebuilt on every request. Selected,
+foreground and restored bodies, context headers, schema order, protocol
+checkpointing and hard budgets remain unchanged in this slice. Thus a pure
+progress update need not change the preceding evidence/protocol prefix.
+
+`PromptLayout::Legacy` retains the old placement before Context and Turn.
+Old serialized `ModelInput` records without a layout marker decode as Legacy.
+Composition can choose it with `compose_with_prompt_layout` or
+`RuntimeServices::with_prompt_layout`; no provider-specific cache API is
+required. Request metadata records `prompt_layout` outside prompt text. It is
+not a measured cache hit and is not forwarded as a provider parameter.
+Actual LLM behavior and cache charges still require live evaluation; identical
+message content with a different order is not a behavioral-equivalence proof.
+
+Provider diagnostics are opt-in and per call: `complete_stream_observed`
+fingerprints the constructed HTTP body and bounded ordered input items, tools,
+and settings, and observes optional service-reported model/cache counters.
+Normal transport calls retain no diagnostic state or history. These fingerprints
+describe our send boundary, not the upstream rendered token prefix. Missing
+usage remains unknown; reported model identity does not authenticate the hidden
+upstream. See the [isolated KV check](reviews/2026-09-10-cache-live/ISOLATED_REPORT.md):
+preserving more than 20 KB of HTTP prefix did not produce reported cache reads
+after focus/progress changes on the tested gateway.
+
+After final packing and required-body coverage checks, `ModelInput::into_request`
+binds a single `PromptReuseBoundary` in existing request metadata. CurrentStateLast
+ends this prefix after actual retained Context messages; Legacy ends before its
+changing state. Roles, message order and tool schemas participate in the digest.
+Digesting streams through a constant-size buffer and retains no prior request.
+Adapters validate against the actual outgoing contract request. Only explicitly
+configured `responses_explicit` maps it to a Responses content-block breakpoint;
+default or invalid hints preserve the full ordinary payload. The hint grants no
+authority and cannot replace evidence, its coverage ACK or current instructions.
+See [boundary implementation](reviews/2026-09-10-cache-live/BOUNDARY.md).
 
 #### Turn Frame wire checkpointing (the Protocol Working Set)
 
@@ -1234,8 +1274,8 @@ they do not repeat the tool catalog. Stale trusted facts are worse than none.
 
 #### Tool Catalog Index
 
-`PromptAssembler` places a bounded `tool_catalog/v1` system block after
-Runtime Facts. It lists catalog tools that are **not** in this round's
+`PromptAssembler` places a bounded `tool_catalog/v1` system block in the
+current-state suffix, before Focus (after Runtime Facts in Legacy). It lists catalog tools that are **not** in this round's
 tools array (name + one-line summary + lifecycle). Caps: 24 rows, 64
 chars per summary, 1536 chars total. The model loads by exact name
 (`capability.manage` `op=load`). Full JSON schemas stay off the surface
@@ -2199,6 +2239,23 @@ runtime journals `TurnCommitFailed { phase, message }` (naming the exact
 step) plus `RecoveryRequired` instead of pretending the turn completed.
 "The model answered" and "the runtime durably committed this turn" are two
 different facts; this is the foundation for crash recovery.
+
+Turn maintenance (`UserInput`, `BeforeModel`, `AfterTool`, `AfterModel`)
+uses the existing operation-completion lane with one parked actor continuation.
+Cancellation advances the Core fence, aborts the maintenance task and joins it
+before restoring context or admitting another turn. New-input admission retains
+its original context checkpoint until maintenance and input audit succeed;
+failed or cancelled admission restores it and publishes no successful work
+receipt. After admission, the active execution state is refreshed from the
+committed directive basis, so a new instruction invalidates previous proof.
+Cancellation during `AfterTool` or `AfterModel` interrupts a mandatory commit:
+the actor durably records the exact `TurnCommitFailed` phase plus
+`RecoveryRequired`, preserves applied effects, and refuses later mutation.
+It cannot report `TurnCompleted` or undo an effect to make cancellation succeed.
+Maintenance-task cleanup and new-input rollback each have a five-second bound;
+unconfirmed cleanup fences recovery. Shutdown first gives an already-committing
+turn a bounded maintenance drain before taking that cancellation path. Other
+maintenance triggers keep their existing transaction scheduling.
 
 Each new run first durably writes `RunStarted` plus
 `RuntimeCommitBarrier(RunStart)`. This opts the trace into explicit-marker

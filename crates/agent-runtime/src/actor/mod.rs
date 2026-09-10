@@ -24,7 +24,7 @@ use agent_contracts::{
     FocusState, FsRereadClass, InputAuthority, InputKind, InputLifecycle, InputSource,
     MAX_COMPLETION_ARTIFACTS, MAX_MODEL_TOOL_CALLS_PER_ROUND, MAX_PINNED_CONTENT_CHARS,
     MAX_TASK_ANCHOR_TEXT_CHARS, MaterializedContext, MaterializedItem, ModelCompletionValidity,
-    ModelInput, ModelRequest, OperationId, OperationOutcome, OperationQueryResult, OperationResult,
+    ModelInput, OperationId, OperationOutcome, OperationQueryResult, OperationResult,
     OperationState, OperationTerminal, ResourceFreshness, ResourceKey, ResourceVersionOracle,
     RestoreRevision, RunId, RuntimeCommitKind, RuntimeDirective, RuntimeEvent, RuntimeFailureClass,
     RuntimeInputEnvelope, RuntimeInputId, ScopeId, ScopeKind, StatePatchProposal, TaskAnchorView,
@@ -62,6 +62,7 @@ use crate::task::{
 
 mod commands;
 mod lifecycle;
+mod maintenance;
 mod model;
 mod restore;
 #[cfg(test)]
@@ -210,7 +211,7 @@ mod discovery_tests {
 enum OpKind {
     Model,
     Tool,
-    /// W04: before-model context maintenance runs as a spawned operation so
+    /// Context maintenance runs as a spawned operation so
     /// the actor loop keeps processing commands while it awaits the engine;
     /// cancellation aborts the future at its next await point and the
     /// engine's fold guard returns every moved record.
@@ -1167,7 +1168,7 @@ pub(crate) struct OperationCompletion {
     /// failed and cancelled operations carry/commit none.
     context_ack: Option<ContextConsumptionAck>,
     /// W04: the engine's maintenance report (or its failure) for a
-    /// `OpKind::Maintenance` completion. Round preparation resumes from it
+    /// `OpKind::Maintenance` completion. Its parked actor phase resumes
     /// after the generation fence passes.
     maintenance: Option<AgentResult<agent_contracts::ContextMaintenanceReport>>,
 }
@@ -1339,6 +1340,9 @@ struct ActorState {
     /// a tool's result still offers the tool.
     active_tool: Option<String>,
     turn: Option<ActiveTurn>,
+    /// One parked continuation on the existing operation lane. Its task
+    /// must stop before cancellation restores context or admits new work.
+    maintenance: Option<maintenance::PendingMaintenance>,
     /// 上次随 ExecutionFrontier 上报的派生结算标签。进程内记忆，
     /// 不进 checkpoint：标签是重算派生态，checkpoint 不携带决策。
     last_reported_settlement: Option<agent_contracts::SettlementLabel>,
@@ -1440,7 +1444,8 @@ impl RuntimeActor {
         };
         Self {
             assembler: {
-                let assembler = PromptAssembler::new(services.system_prompt());
+                let assembler = PromptAssembler::new(services.system_prompt())
+                    .with_layout(services.prompt_layout());
                 match services.artifact_workspace() {
                     Some(workspace) => assembler.with_runtime_facts(workspace.runtime_facts()),
                     None => assembler,
@@ -1655,6 +1660,25 @@ impl RuntimeActor {
         if self.state.lifecycle != ActorLifecycle::Serving {
             self.state.pending_user_input = None;
             return Ok(());
+        }
+        self.state.pending_user_input = None;
+        // A quick commit already in progress used to finish before Stop
+        // could be handled. Preserve that graceful shutdown behavior while
+        // bounding a slow maintenance pass. Requested CancelTurn still
+        // interrupts immediately through its phase-specific recovery path.
+        let commit_deadline = tokio::time::Instant::now() + SHUTDOWN_OPERATION_DRAIN_TIMEOUT;
+        while self
+            .state
+            .turn
+            .as_ref()
+            .is_some_and(|turn| turn.turn_state == TurnState::Committing)
+        {
+            let Ok(Some(completion)) = tokio::time::timeout_at(commit_deadline, op_rx.recv()).await
+            else {
+                break;
+            };
+            self.on_operation_completed(completion, op_tx, &proof_tx)
+                .await;
         }
         let cancel = self
             .cancel_turn(TurnCancellationReason::Shutdown, None)

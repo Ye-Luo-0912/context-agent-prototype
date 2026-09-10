@@ -1,0 +1,310 @@
+{
+  "run_id": "1789058357423842400",
+  "configured_model": "deepseek-flash",
+  "source_files": 350,
+  "sources_unchanged": true,
+  "segments": [
+    {
+      "name": "a-main",
+      "wall_ms": 12478.67,
+      "exit": 0,
+      "events": {
+        "model_started": 7,
+        "model_used": 7,
+        "tool_started": 9,
+        "tool_finished": 9,
+        "turn_completed": 1,
+        "turn_cancelled": 0,
+        "runtime_restored": 0,
+        "checkpoint_durable": 3,
+        "recovery_required": 0
+      },
+      "decision": {
+        "calls": 7,
+        "input_tokens": 39857,
+        "output_tokens": 1649,
+        "cached_input_tokens": 25728,
+        "attempts": 7,
+        "retries": 0
+      },
+      "maintenance": {
+        "passes": 14,
+        "compactions": 0,
+        "compaction_input_tokens": 0,
+        "compaction_output_tokens": 0,
+        "deferred_folds": 0
+      },
+      "tool_count": 9,
+      "tool_start_to_finish_ms": 938,
+      "max_tool_start_to_finish_ms": 542,
+      "max_tool_model_content_utf8_bytes": 7532,
+      "max_context_resident_bytes": 18259,
+      "max_context_active_items": 4,
+      "session_end": {
+        "approval_denied": false,
+        "exit": 0,
+        "kind": "session_end",
+        "round_budget": false,
+        "schema": "agent.headless.v1",
+        "status": "completed",
+        "stop": "turn_completed",
+        "task_completed": false,
+        "task_state": "awaiting_operator_review"
+      }
+    },
+    {
+      "name": "b-main",
+      "wall_ms": 11462.83,
+      "exit": 0,
+      "events": {
+        "model_started": 6,
+        "model_used": 6,
+        "tool_started": 9,
+        "tool_finished": 9,
+        "turn_completed": 1,
+        "turn_cancelled": 0,
+        "runtime_restored": 0,
+        "checkpoint_durable": 2,
+        "recovery_required": 0
+      },
+      "decision": {
+        "calls": 6,
+        "input_tokens": 31258,
+        "output_tokens": 1233,
+        "cached_input_tokens": 20992,
+        "attempts": 6,
+        "retries": 0
+      },
+      "maintenance": {
+        "passes": 12,
+        "compactions": 0,
+        "compaction_input_tokens": 0,
+        "compaction_output_tokens": 0,
+        "deferred_folds": 0
+      },
+      "tool_count": 9,
+      "tool_start_to_finish_ms": 625,
+      "max_tool_start_to_finish_ms": 529,
+      "max_tool_model_content_utf8_bytes": 7532,
+      "max_context_resident_bytes": 14378,
+      "max_context_active_items": 6,
+      "session_end": {
+        "approval_denied": false,
+        "exit": 0,
+        "kind": "session_end",
+        "round_budget": false,
+        "schema": "agent.headless.v1",
+        "status": "completed",
+        "stop": "turn_completed",
+        "task_completed": false,
+        "task_state": "awaiting_operator_review"
+      }
+    },
+    {
+      "name": "c-read-yield",
+      "wall_ms": 4143.65,
+      "exit": 2,
+      "events": {
+        "model_started": 1,
+        "model_used": 1,
+        "tool_started": 2,
+        "tool_finished": 2,
+        "turn_completed": 0,
+        "turn_cancelled": 0,
+        "runtime_restored": 0,
+        "checkpoint_durable": 1,
+        "recovery_required": 0
+      },
+      "decision": {
+        "calls": 1,
+        "input_tokens": 2380,
+        "output_tokens": 87,
+        "cached_input_tokens": 1408,
+        "attempts": 1,
+        "retries": 0
+      },
+      "maintenance": {
+        "passes": 4,
+        "compactions": 0,
+        "compaction_input_tokens": 0,
+        "compaction_output_tokens": 0,
+        "deferred_folds": 0
+      },
+      "tool_count": 2,
+      "tool_start_to_finish_ms": 9,
+      "max_tool_start_to_finish_ms": 5,
+      "max_tool_model_content_utf8_bytes": 2225,
+      "max_context_resident_bytes": 1010,
+      "max_context_active_items": 1,
+      "session_end": {
+        "approval_denied": false,
+        "exit": 2,
+        "kind": "session_end",
+        "round_budget": true,
+        "schema": "agent.headless.v1",
+        "status": "round_budget",
+        "stop": "round_budget",
+        "task_completed": false,
+        "task_state": "awaiting_operator_review"
+      }
+    },
+    {
+      "name": "c-cancel",
+      "wall_ms": 3742.83,
+      "exit": 1,
+      "events": {
+        "model_started": 2,
+        "model_used": 1,
+        "tool_started": 2,
+        "tool_finished": 2,
+        "turn_completed": 0,
+        "turn_cancelled": 1,
+        "runtime_restored": 1,
+        "checkpoint_durable": 0,
+        "recovery_required": 0
+      },
+      "decision": {
+        "calls": 1,
+        "input_tokens": 2617,
+        "output_tokens": 79,
+        "cached_input_tokens": 1920,
+        "attempts": 1,
+        "retries": 0
+      },
+      "maintenance": {
+        "passes": 3,
+        "compactions": 0,
+        "compaction_input_tokens": 0,
+        "compaction_output_tokens": 0,
+        "deferred_folds": 0
+      },
+      "tool_count": 2,
+      "tool_start_to_finish_ms": 7,
+      "max_tool_start_to_finish_ms": 4,
+      "max_tool_model_content_utf8_bytes": 2225,
+      "max_context_resident_bytes": 1010,
+      "max_context_active_items": 1,
+      "session_end": {
+        "approval_denied": false,
+        "exit": 1,
+        "kind": "session_end",
+        "round_budget": false,
+        "schema": "agent.headless.v1",
+        "status": "timeout",
+        "stop": "timeout",
+        "task_completed": false,
+        "task_state": "none"
+      }
+    },
+    {
+      "name": "c-resume",
+      "wall_ms": 11444.74,
+      "exit": 0,
+      "events": {
+        "model_started": 6,
+        "model_used": 6,
+        "tool_started": 7,
+        "tool_finished": 7,
+        "turn_completed": 1,
+        "turn_cancelled": 0,
+        "runtime_restored": 1,
+        "checkpoint_durable": 2,
+        "recovery_required": 0
+      },
+      "decision": {
+        "calls": 6,
+        "input_tokens": 29726,
+        "output_tokens": 859,
+        "cached_input_tokens": 22656,
+        "attempts": 6,
+        "retries": 0
+      },
+      "maintenance": {
+        "passes": 11,
+        "compactions": 0,
+        "compaction_input_tokens": 0,
+        "compaction_output_tokens": 0,
+        "deferred_folds": 0
+      },
+      "tool_count": 7,
+      "tool_start_to_finish_ms": 1906,
+      "max_tool_start_to_finish_ms": 1376,
+      "max_tool_model_content_utf8_bytes": 12220,
+      "max_context_resident_bytes": 21020,
+      "max_context_active_items": 5,
+      "session_end": {
+        "approval_denied": false,
+        "exit": 0,
+        "kind": "session_end",
+        "round_budget": false,
+        "schema": "agent.headless.v1",
+        "status": "completed",
+        "stop": "turn_completed",
+        "task_completed": false,
+        "task_state": "none"
+      }
+    }
+  ],
+  "cases": {
+    "a": {
+      "artifact_verification": true,
+      "tests_unchanged": true,
+      "unexpected_changes": []
+    },
+    "b": {
+      "artifact_verification": true,
+      "tests_unchanged": true,
+      "unexpected_changes": []
+    },
+    "c": {
+      "artifact_verification": true,
+      "tests_unchanged": true,
+      "unexpected_changes": [],
+      "validated_restores": 2,
+      "budget_checkpoint": true,
+      "typed_cancellation": true,
+      "cancel_request_to_ack_ms": null,
+      "shutdown_after_wait_upper_bound_ms": 2742.83,
+      "diagnostic_bytes": 4065097,
+      "diagnostic_sha256": "fa86791f377ff32a2558f8b3604a34c12921f874212f773cf633b9dd76badd91",
+      "artifact_read_calls": 1,
+      "artifact_read_returned_lines": 25,
+      "artifact_read_text_utf8_bytes": 3006,
+      "marker_seen_via_artifact": true,
+      "successful_output_mutations": 1
+    }
+  },
+  "total": {
+    "calls": 21,
+    "input_tokens": 105838,
+    "output_tokens": 3907,
+    "cached_input_tokens": 72704,
+    "attempts": 21,
+    "retries": 0,
+    "wall_ms": 43272.72,
+    "model_operations_started": 22,
+    "model_operations_without_usage": 1,
+    "maintenance_passes": 44,
+    "completed_compactions": 0
+  },
+  "repeat_read_windows": [
+    {
+      "case": "c",
+      "path": "README.md",
+      "revision": "cc088a73928ef3c8d5fbcc416fe9f78484099d25dd3d492ac0ed2dd6aec8c2b2",
+      "start": 1,
+      "end": 4,
+      "observed": 3,
+      "repeats": 2
+    },
+    {
+      "case": "c",
+      "path": "tests/test_links.py",
+      "revision": "ff4545a90f3f3e1068bda72ba11681ba2dd941d163696d9507efb1e565b06779",
+      "start": 1,
+      "end": 38,
+      "observed": 3,
+      "repeats": 2
+    }
+  ]
+}

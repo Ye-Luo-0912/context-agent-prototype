@@ -1,0 +1,122 @@
+{
+  "review_start": "8a0dc29032a3175b203545addca7549efe90a495",
+  "recorded_head": "6ec044aa869fd7ae3a6adc0ec694a4bcd42e0478",
+  "scope": "Targeted W01-W08 and prompt/cache source review, not every line of the repository",
+  "files": [
+    {
+      "path": "crates/agent-runtime/src/actor/model.rs",
+      "bytes": 103847,
+      "sha256": "5b0eeeb317b022b6e0632db4173eef3d579559bf5f318bc208cca390ddbc04c8"
+    },
+    {
+      "path": "crates/agent-runtime/src/actor/turn.rs",
+      "bytes": 139625,
+      "sha256": "6cffb400b2b4af6b7f1c6b2cf2e3ab30968248d61eb776fd9444615ccfcb5cc9"
+    },
+    {
+      "path": "crates/agent-runtime/src/actor/lifecycle.rs",
+      "bytes": 23999,
+      "sha256": "01b905fe5e1f9335b240c681c46fd38752ec093c0eee7d35d84df7d29543c540"
+    },
+    {
+      "path": "crates/agent-runtime/src/actor/restore.rs",
+      "bytes": 16489,
+      "sha256": "b1c53259caa2db248cea739859711f19442820cf475d3192eb94987d82fc2bbc"
+    },
+    {
+      "path": "crates/agent-runtime/src/directive.rs",
+      "bytes": 6847,
+      "sha256": "12959c6e3bc1daf4ca253aa969a01f33d152f4149585da343224e715ddda5e4a"
+    },
+    {
+      "path": "crates/agent-runtime/src/prompt.rs",
+      "bytes": 107679,
+      "sha256": "c59ad3a3e856361d9bf01e5c1f94232e242d9ba03aba4eed54d22854cf61668c"
+    },
+    {
+      "path": "crates/agent-runtime/src/execution/memo.rs",
+      "bytes": 2464,
+      "sha256": "c2336e9926ef4a7f2ab7c9feaa2ae5e8b81e7b8f975eae38a3cb932e26b84f55"
+    },
+    {
+      "path": "crates/agent-runtime/src/execution/body_cache.rs",
+      "bytes": 8646,
+      "sha256": "844c393480385bc5ddfd66410271a27b34f08eeac18e8abed3de9ea42050cd30"
+    },
+    {
+      "path": "crates/agent-runtime/src/execution/state.rs",
+      "bytes": 109413,
+      "sha256": "5b212fbf1f81959f4bd536b888d4f1e74ed79a7ea1f01eee223f6f6f26bc82df"
+    },
+    {
+      "path": "crates/agent-contracts/src/model.rs",
+      "bytes": 41575,
+      "sha256": "c639747b659a0557fb4acb28eca8e1322a0d79007dd6b6c3bebce377ce132f8a"
+    },
+    {
+      "path": "crates/agent-contracts/src/context.rs",
+      "bytes": 152855,
+      "sha256": "84c05e4b9bd438703d30357a9487a76bf6302d8566213465d05207fe38096a40"
+    },
+    {
+      "path": "crates/agent-contracts/src/discovery.rs",
+      "bytes": 28040,
+      "sha256": "9b0689ae2df815fa19cd8978514038f25e396cea97573daf6685f7136fe360e9"
+    },
+    {
+      "path": "crates/context-simple/src/engine.rs",
+      "bytes": 107153,
+      "sha256": "13ceae90c1c9dca626531f1e3e1c26653442d851668597888f11bd5267af7359"
+    },
+    {
+      "path": "crates/context-simple/src/store.rs",
+      "bytes": 136669,
+      "sha256": "81ab53d15826e5520f1e36df2286862d374e37f53e3cd7303dab306ebc175b16"
+    },
+    {
+      "path": "crates/context-simple/src/index/catalog.rs",
+      "bytes": 56277,
+      "sha256": "f1ac13a702eb7137ef64ba8df221416eee64b50d9e3c943812b9379a397a59ad"
+    },
+    {
+      "path": "crates/context-baselines/src/rolling.rs",
+      "bytes": 26920,
+      "sha256": "d3ddef407dde2ec327cc3cb300c327dca150865cd53882a298ea9b0fd473963b"
+    },
+    {
+      "path": "crates/agent-compose/src/compactor.rs",
+      "bytes": 8476,
+      "sha256": "ce97cd30e983c740b62b4b015c82bb1d1a8724fb3ba440c4ff12fd8f1a630e6c"
+    },
+    {
+      "path": "crates/tool-runtime/src/tools/artifact.rs",
+      "bytes": 17867,
+      "sha256": "ddf05708dd50b74e7a28af9364eb58bdecc531435c6c06228b1ecd8060d6fa90"
+    },
+    {
+      "path": "crates/tool-runtime/src/tools/patch.rs",
+      "bytes": 71673,
+      "sha256": "d58979895fa4a072d1e6e3e2fb4faaa992a688ec1c40269edd320ad3e3f4fa68"
+    },
+    {
+      "path": "crates/provider-openai/src/lib.rs",
+      "bytes": 78823,
+      "sha256": "e23fb0714a125f2430c80ee3daf5600010ed0f6c19fc0d4fd97761f12b9db839"
+    },
+    {
+      "path": "crates/provider-openai/src/responses.rs",
+      "bytes": 43887,
+      "sha256": "c16acea498291fc824b4d81c51c5f4891587b5340a410109ddffd394db15ace4"
+    },
+    {
+      "path": "crates/provider-openai/src/sse.rs",
+      "bytes": 29292,
+      "sha256": "13c366d3509908500a1a990bbe7546d15509baabb43036ee5586f6e0d0fdefa8"
+    },
+    {
+      "path": "crates/provider-openai/src/wire_names.rs",
+      "bytes": 8745,
+      "sha256": "91b04cc2af9e26161d538beab05766a56b670267a4e5410459bd196be1121016"
+    }
+  ]
+}

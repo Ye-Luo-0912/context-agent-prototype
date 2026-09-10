@@ -103,6 +103,21 @@
 
 ## W 系列（2026-09-10 审查 `fb1ec9c`：Agent 任务流程核心——当前队列）
 
+**实施后复核（2026-09-10，`8a0dc29` → `6ec044a`）：**下表保留原实施与 CI 回执，新增反例仍沿原编号执行，不另建阶段。详见 [复核与缓存设计](reviews/2026-09-10-cache-design-8a0dc29/REPORT.md)、[验证记录](reviews/2026-09-10-cache-design-8a0dc29/EVIDENCE.md)。
+
+- **W02：已修复并包含于 `6ec044a`**。候选必须具有自己的文件/版本与完整覆盖范围；同 id 不同片段、跨来源同文本不能掩盖 required_miss。
+- **W04 非 BeforeModel 取消已落地（2026-09-10，工作树）：**UserInput/AfterTool/AfterModel 维护接入既有 operation 续接，取消先推进 Core 代际再停止并 join 维护。新输入恢复入账前快照；提交阶段中断返回 RecoveryRequired，保留已应用效果，不误发 TurnCompleted。输入事务成功后使用新 directive 的执行/证明版本；停机有界等待当前提交。门控与完成/取消竞争回归见 [W04 实施与验证回执](reviews/2026-09-10-maintenance-cancellation.md)。W04(P2) 的零预算延期账目已在 `732cf93` 修复，本片不重做。
+- **W06 已包含于 `732cf93`：**按渲染字节统计捕获上限，截断保留行边界，游标指向首个未展示行；本片核对 HEAD 后跳过重做。**下一任务为下表第 7 行真实仓库任务衡量**，沿已选 DeepSeek Flash 固定起点、目标、验收与配置，不复跑缓存合成样本。
+- **供应商 KV 缓存首切片（用户明确共同底层优先）：**按 [KV_CACHE_PLAN.md](reviews/2026-09-10-cache-design-8a0dc29/KV_CACHE_PLAN.md) 在 PromptAssembler 建立稳定段/current_view 的共同布局，稳定合法工具集合的表示、状态后置，同步记录前缀变化原因；随后有界区段，再由薄 provider 适配层映射专属参数与用量。底层不等待供应商选择；独立观测不被 W04/W06 整体阻塞，涉及提交边界才依赖其修复。不启用工具 memo、不改 GC/打分，不以离线字节前缀冒充 provider 命中率。
+
+  **首个保守切片已落地（2026-09-10，工作树）：**`CurrentStateLast` 移动完整目录/焦点/进度块，保留全部文字、角色、选中顺序、正文去重、工具选择和协议窗口；新增布局版本及 Legacy 组合回退，request metadata 标明布局。[实施回执](reviews/2026-09-10-cache-design-8a0dc29/KV_LAYOUT_IMPLEMENTATION.md)。为保留当前焦点策略，本片不拆正文标题、不冻结选中集合、不稳定化实际已变化的 schema surface。下一步先做最终请求前缀变化归因和用量覆盖，再决定剩余布局改动；区段化与专属缓存参数尚未实施。
+
+  **发送观测＋隔离复测已完成：**继[首次 10 次实测](reviews/2026-09-10-cache-live/REPORT.md)后，按需 provider 观测入口和 [12 次隔离预热/换序对照](reviews/2026-09-10-cache-live/ISOLATED_REPORT.md)已运行。当前 `eval.env` 可用，不再以旧“无凭据”回执作为阻塞。新布局超过 20KB 的 HTTP 前缀保持不变，但更新焦点/进度的两次请求仍为零读取；原样重放 5/6 命中，12/12 合成回答正确。由此进入下一段的共同复用边界实现。隐藏服务原因、金额和整仓任务质量未验证；不重复相同条件的付费调用，不重开长任务或冻结实验。
+
+  **共同复用边界＋显式映射本地实现完成（2026-09-10）：**`ModelInput::into_request` 从最终 packing 的请求绑定单个 `PromptReuseBoundary`，实际正文/角色/顺序/schema 失配即失效；只在 `OPENAI_PROMPT_CACHE_MODE=responses_explicit` 且固定 Responses 协议时映射断点，默认供应商请求及 profile digest 保持。定向测试与 Clippy 通过。[本片回执](reviews/2026-09-10-cache-live/BOUNDARY.md)。**真实验收未过：2 次冷请求失败，第二次 HTTP 400 且错误提到 `prompt_cache_breakpoint`；未进入改 D 复用 E 阶段。后续小请求已查明服务端明确报告当前模型不支持该断点，见 [能力定位与类型化诊断](reviews/2026-09-10-cache-live/CAPABILITY.md)。当前默认模式保持，显式收益验收需要已确认支持的端点/模型；不重复该拒绝请求，不改焦点角色/GC/选择策略。**
+
+  **DeepSeek Flash 合成复用验收通过（2026-09-10）：**用户指定官方 `deepseek-flash`，以 Responses＋非思考档位＋原生默认缓存完成 10 次真实请求，答案 10/10 正确。三次当前状态变化，新布局每次缓存读取 6,144/6,468（94.99%），Legacy 256/6,468（3.96%）。类型化推理档位配置与验证已落地；[实测回执](reviews/2026-09-10-cache-live/DEEPSEEK_FLASH.md)。本片完成；后续 W04 非 BeforeModel 维护取消现已在工作树接通，见上方回执。真实仓库质量/思考模式工具续跑/实际账单仍未验收，不重复本组合成实测。
+
 来源：2026-09-10 Agent 任务流程审查（基线 `fb1ec9c`；主审查者逐项复核＋隔离反例，8 项：4 P1、4 P2）——[reviews/2026-09-10-agent-workflow-fb1ec9c/REPORT.md](reviews/2026-09-10-agent-workflow-fb1ec9c/REPORT.md)，缺陷明细与「不要做什么」见 [AUDIT_TODO.md](AUDIT_TODO.md) 2026-09-10 表，切片顺序与衡量方式见 [WORKFLOW_AND_ROUTE.md](reviews/2026-09-10-agent-workflow-fb1ec9c/WORKFLOW_AND_ROUTE.md)。W 编号只是本轮定位，不另建阶段；此前 N/A/B/C/R 队列全部收口（CI 确认记录见 CURRENT.md）。
 
 | 建议顺序 | 切片 | 用户能获得什么 | 状态 |
@@ -113,9 +128,9 @@
 | 4 | **W03** 全部 Storage GC 删除入口共享保留根（含根集合完整性） | 保留的旧快照持续有可恢复正文 | **已落地（2026-09-10，本批）**：`storage_gc_protecting(roots, complete)`＋`reconcile_store_protecting` 同签名扩展；根枚举失败/截断置 incomplete → 删除分支延期并报告；完成边界 GC 经 `context_storage_gc_protecting` 传入保留根。回归：引擎级完整序列（保护存活/延期可见/对照删除） |
 | 5 | **W05** 当前验收证明优先保留（9 域合法任务可收敛） | 合法多域验收能结束，重复检查不挤掉必要证明 | **已落地（2026-09-10，本批）**：`MAX_VERIFICATION_FACTS` 对齐契约 16 域；cap 淘汰改为「每 identity 保留最新一条」，同域重复不再挤掉其他域；basis 变更失效规则不变。回归：9 域全保留＋重复风暴＋spec 变更失效 |
 | 6 | **W06/W07** 两个小切片：artifact.read 大工件可达读取；patch 纠错候选取真实磁盘内容 | 大输出能按需查看；纠错依据真实内容 | **已落地（2026-09-10，本批）**：artifact.read 改流式按行扫描（8 MiB 扫描预算＋2 MiB 捕获上限，`total_lines_complete`/`window_truncated` 诚实标记，3 MB 工件首页与第 25,000 行均可达）；patch 失败候选取磁盘原文＋失败 hunk 序号，永不引用未提交中间态 |
-| 7 | 三类真实仓库任务衡量（跨模块修改/多域验收/长输出＋中断恢复） | 成本与交互性有实测记录 | **NOT_RUN（2026-09-10 记录，条件项）**：无真实 provider 凭据。衡量的计数面已就位——决策调用走 `RuntimeEvent::ModelUsed`（input/output/attempt/retiy），维护调用走 `ContextMaintenanceReport` 的 `compaction_input_tokens`/`compaction_output_tokens`/`compactions[]` 与 `deferred_folds`，交互性走 TurnCancelled/审批回执时延与 MetricsSession，有界性走 `deferred_folds`/工件读取字节上限。执行前置：① provider 凭据注入宿主 profile（不打进仓库）；② 固定三类任务的仓库起点/目标/验收/模型配置各一份；③ 按路线文档第五节记录总成本（决策/维护分列）、无进展动作、取消时延、交付正确性、有界性五组数据。**不为此新建评测框架或总门禁，不重开 M15/LT-EVAL** |
+| 7 | 三类真实仓库任务衡量（跨模块修改/多域验收/长输出＋中断恢复） | 成本与交互性有实测记录 | **NOT_RUN（2026-09-10 更新，下一任务）**：三类仓库场景尚未固定和执行。Flash 官方合成调用已通过，旧“无凭据”原因已解除；密钥仅从进程输入注入。衡量的计数面已就位——决策调用走 `RuntimeEvent::ModelUsed`（input/output/attempt/retiy），维护调用走 `ContextMaintenanceReport` 的 `compaction_input_tokens`/`compaction_output_tokens`/`compactions[]` 与 `deferred_folds`，交互性走 TurnCancelled/审批回执时延与 MetricsSession，有界性走 `deferred_folds`/工件读取字节上限。执行前置：① provider 凭据注入宿主 profile（不打进仓库）；② 固定三类任务的仓库起点/目标/验收/模型配置各一份；③ 按路线文档第五节记录总成本（决策/维护分列）、无进展动作、取消时延、交付正确性、有界性五组数据。**不为此新建评测框架或总门禁，不重开 M15/LT-EVAL** |
 
-**W 系列收口（2026-09-10）：**W01–W08 八项全部代码落地；**CI 确认：run `34408215832` 七 job 全绿**（覆盖 `8a0dc29`，含 W01 全树）。第 7 行三类真实任务衡量为条件项，无真实 provider 凭据，保持 NOT_RUN，不另立项。缺陷明细与逐项验收记录见 [AUDIT_TODO.md](AUDIT_TODO.md) 2026-09-10 表。
+**W 系列收口（2026-09-10）：**W01–W08 八项全部代码落地；**CI 确认：run `34408215832` 七 job 全绿**（覆盖 `8a0dc29`，含 W01 全树）。第 7 行三类真实任务衡量尚未运行；Flash 合成调用已通过，接续固定场景后再执行，不另立项。缺陷明细与逐项验收记录见 [AUDIT_TODO.md](AUDIT_TODO.md) 2026-09-10 表。
 
 **用户结果：**继续不丢指令、维护可取消且失败不退役正文、证据缺失诚实可见、旧快照可恢复、合法验收能收敛、大输出可查看、纠错有真实依据。
 

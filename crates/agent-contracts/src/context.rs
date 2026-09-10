@@ -2870,6 +2870,11 @@ pub struct ContextItemSummary {
 pub trait ContextEngine: Send + Sync {
     async fn ingest(&self, ingress: ContextIngress) -> AgentResult<()>;
 
+    /// Runtime may drop this future when cancelling maintenance. An engine
+    /// must retain/restore any source records temporarily removed for an
+    /// unfinished fold and release its state guards on drop. This does not
+    /// roll back earlier ingress or already completed maintenance writes;
+    /// Runtime owns the enclosing transaction and its recovery boundary.
     async fn maintain(
         &self,
         trigger: ContextMaintenanceTrigger,

@@ -1,0 +1,166 @@
+{
+  "segment": "c-resume",
+  "argv": [
+    "D:\\Users\\Ye_Luo\\APP\\context-agent-prototype\\target\\debug\\agent-tui.exe",
+    "--grant-file=D:\\Users\\Ye_Luo\\APP\\context-agent-prototype\\target\\flash-workflow\\1789058357423842400\\c\\c-resume\\grants.json",
+    "--max-rounds=12",
+    "--timeout-secs=300",
+    "--context=dynamic",
+    "--restore=latest",
+    "--continue",
+    "D:\\Users\\Ye_Luo\\APP\\context-agent-prototype\\target\\flash-workflow\\1789058357423842400\\c\\workspace"
+  ],
+  "exit_code": 0,
+  "wall_ms": 11444.74,
+  "forced_tree_stop": false,
+  "run_id": "ccca5489-11bd-489b-b6fb-afb01d3beb76",
+  "metrics": {
+    "event_counts": {
+      "model_started": 6,
+      "model_used": 6,
+      "tool_started": 7,
+      "tool_finished": 7,
+      "turn_completed": 1,
+      "turn_cancelled": 0,
+      "runtime_restored": 1,
+      "checkpoint_durable": 2,
+      "recovery_required": 0
+    },
+    "decision": {
+      "calls": 6,
+      "input_tokens": 29726,
+      "output_tokens": 859,
+      "cached_input_tokens": 22656,
+      "attempts": 6,
+      "retries": 0
+    },
+    "maintenance": {
+      "passes": 11,
+      "compactions": 0,
+      "compaction_input_tokens": 0,
+      "compaction_output_tokens": 0,
+      "deferred_folds": 0
+    },
+    "tools": [
+      {
+        "name": "fs.read",
+        "ok": true,
+        "artifact_ref": null,
+        "metadata": {
+          "bytes": 284,
+          "covers_file": true,
+          "end_line": 4,
+          "fs_read_motive": "checked-fresh",
+          "line_count": 4,
+          "line_ending": "crlf",
+          "path": "README.md",
+          "revision": "cc088a73928ef3c8d5fbcc416fe9f78484099d25dd3d492ac0ed2dd6aec8c2b2",
+          "start_line": 1
+        }
+      },
+      {
+        "name": "fs.read",
+        "ok": true,
+        "artifact_ref": null,
+        "metadata": {
+          "bytes": 1790,
+          "covers_file": true,
+          "end_line": 38,
+          "fs_read_motive": "checked-fresh",
+          "line_count": 38,
+          "line_ending": "crlf",
+          "path": "tests/test_links.py",
+          "revision": "ff4545a90f3f3e1068bda72ba11681ba2dd941d163696d9507efb1e565b06779",
+          "start_line": 1
+        }
+      },
+      {
+        "name": "verify.run",
+        "ok": true,
+        "artifact_ref": "artifact://v1/ccca5489-11bd-489b-b6fb-afb01d3beb76/process/fa86791f377ff32a2558f8b3604a34c12921f874212f773cf633b9dd76badd91",
+        "metadata": {
+          "argv": "D:\\Users\\Ye_Luo\\APP\\context-agent-prototype\\target\\flash-workflow-env\\Scripts\\python.exe -m pytest",
+          "artifact_bytes": 4065097,
+          "artifact_limit_bytes": 8388608,
+          "artifact_truncated": false,
+          "cwd": ".",
+          "exit_code": 0,
+          "lines": 32019,
+          "mutates_workspace": true,
+          "outcome": "completed",
+          "output_bytes": 4065097,
+          "recipe_id": "python.pytest",
+          "recipe_revision": "python-pytest-v2",
+          "resolution_fingerprint": "05930fe8ea2d1ada8b7fc97efea171ed19cb8b0ddad07177d81043b8a6371f93",
+          "resolution_scope_key": "1c5ba3cb6afac4af462ac7659361e869ba9eeaef45bb5ce90c4a921e68fa48ac",
+          "timeout_ms": 120000,
+          "verification": true
+        }
+      },
+      {
+        "name": "artifact.read",
+        "ok": true,
+        "artifact_ref": "artifact://v1/ccca5489-11bd-489b-b6fb-afb01d3beb76/process/fa86791f377ff32a2558f8b3604a34c12921f874212f773cf633b9dd76badd91",
+        "metadata": {
+          "bytes": 4065097,
+          "has_more": false,
+          "next_start_line": 32019,
+          "returned": 25,
+          "total_lines": 32019,
+          "total_lines_complete": true,
+          "window_truncated": false
+        }
+      },
+      {
+        "name": "fs.write",
+        "ok": true,
+        "artifact_ref": null,
+        "metadata": {
+          "bytes": 82,
+          "line_ending": "lf",
+          "path": "summary.json",
+          "revision": "efb1ae7bffaaa16ca512692535a6f5119053669fdefa1429d94afe61e7890fdf"
+        }
+      },
+      {
+        "name": "fs.read",
+        "ok": true,
+        "artifact_ref": null,
+        "metadata": {
+          "bytes": 82,
+          "covers_file": true,
+          "end_line": 4,
+          "fs_read_motive": "checked-fresh",
+          "line_count": 4,
+          "line_ending": "lf",
+          "path": "summary.json",
+          "revision": "efb1ae7bffaaa16ca512692535a6f5119053669fdefa1429d94afe61e7890fdf",
+          "start_line": 1
+        }
+      },
+      {
+        "name": "git.status",
+        "ok": true,
+        "artifact_ref": null,
+        "metadata": {
+          "bytes": 16,
+          "capture_truncated": false,
+          "captured_bytes": 15,
+          "exit_code": 0,
+          "external_filters_disabled": true
+        }
+      }
+    ],
+    "session_end": {
+      "approval_denied": false,
+      "exit": 0,
+      "kind": "session_end",
+      "round_budget": false,
+      "schema": "agent.headless.v1",
+      "status": "completed",
+      "stop": "turn_completed",
+      "task_completed": false,
+      "task_state": "none"
+    }
+  }
+}

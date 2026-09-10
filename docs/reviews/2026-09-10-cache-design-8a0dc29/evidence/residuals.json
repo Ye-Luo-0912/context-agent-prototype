@@ -22,7 +22,8 @@
       "window_truncated": true
     },
     "model_content_bytes": 2098551,
-    "source_bytes": 3146229
+    "source_bytes": 3146229,
+    "unframed_payload_bytes_lower_bound": 2097552
   },
   "maintenance_deferral": {
     "compactor_budget": 0,

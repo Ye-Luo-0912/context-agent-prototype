@@ -29,8 +29,27 @@ impl RuntimeActor {
                 client_request_id,
                 reply,
             } => {
-                let result = self.start_work(goal, client_request_id, op_tx).await;
-                let _ = reply.send(result);
+                match self
+                    .start_work(goal.clone(), client_request_id.clone(), op_tx)
+                    .await
+                {
+                    Ok(submission)
+                        if submission.disposition
+                            == crate::work::WorkSubmissionDisposition::Accepted =>
+                    {
+                        let record = crate::work::WorkSubmissionRecord {
+                            goal,
+                            client_request_id,
+                            task_id: submission.task_id,
+                        };
+                        self.set_turn_start_reply(maintenance::TurnStartReply::Work(
+                            reply, submission, record,
+                        ));
+                    }
+                    result => {
+                        let _ = reply.send(result);
+                    }
+                }
             }
             RuntimeCommand::ActivateTask { task_id, reply } => {
                 let result = match self.ensure_idle().and_then(|_| self.next_focus_revision()) {
@@ -299,7 +318,14 @@ impl RuntimeActor {
                     Ok(()) => self.continue_active_task_turn(op_tx).await,
                     Err(error) => Err(error),
                 };
-                let _ = reply.send(result);
+                match result {
+                    Ok(task_id) => self.set_turn_start_reply(
+                        maintenance::TurnStartReply::Continue(reply, task_id),
+                    ),
+                    Err(error) => {
+                        let _ = reply.send(Err(error));
+                    }
+                }
             }
             RuntimeCommand::StatusSnapshot { reply } => {
                 // Read-only, like ListTasks: no lifecycle or busy fence, so

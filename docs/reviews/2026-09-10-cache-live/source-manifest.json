@@ -1,0 +1,30 @@
+{
+  "head": "732cf93103cb7104f1961402f422e82143b8956c",
+  "note": "Source snapshot after live calls, before the timing-sink style-only lint fix; working tree contains the KV layout implementation.",
+  "files": [
+    {
+      "path": "crates/agent-compose/tests/kv_cache_walk.rs",
+      "sha256": "1d4691a5efd4836aa998fd9a72a5b03e9245c7e3251fef2594fe0c27424c0bac"
+    },
+    {
+      "path": "crates/agent-runtime/src/prompt.rs",
+      "sha256": "df4873507c97c5dde6cbc3dbeeccbb21189cf77107469770f7d509549224deae"
+    },
+    {
+      "path": "crates/agent-contracts/src/model.rs",
+      "sha256": "b351ca45a211221c88ae2b4f9d3c36f4cf756154619b689e356c2c5e01eb41ab"
+    },
+    {
+      "path": "crates/provider-openai/src/lib.rs",
+      "sha256": "fd2b3e9848a73528dfdce296013b358c02edba3025f16e5d75369a408a92b6f4"
+    },
+    {
+      "path": "crates/provider-openai/src/responses.rs",
+      "sha256": "c16acea498291fc824b4d81c51c5f4891587b5340a410109ddffd394db15ace4"
+    },
+    {
+      "path": "crates/provider-openai/src/sse.rs",
+      "sha256": "13c366d3509908500a1a990bbe7546d15509baabb43036ee5586f6e0d0fdefa8"
+    }
+  ]
+}

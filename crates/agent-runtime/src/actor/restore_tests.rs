@@ -1,5 +1,6 @@
 use super::*;
 use crate::checkpoint::{RUNTIME_CHECKPOINT_VERSION, RunMetadata, TaskManagerSnapshot};
+use agent_contracts::ModelRequest;
 use agent_contracts::{
     ArgumentDigest, AuthorityRecoveryStatus, ContextDiagnostics, ContextEngine, ContextIngress,
     ContextItemSummary, ContextMaintenanceReport, EffectId, MaterializedContext, ModelCapabilities,
@@ -92,6 +93,139 @@ impl ContextEngine for TestContext {
 
 #[derive(Debug)]
 struct TestModel;
+
+#[tokio::test]
+async fn stale_user_input_maintenance_cannot_consume_a_new_turn_continuation() {
+    let services = Arc::new(RuntimeServices::new(
+        CoreAuthorityConfig::default(),
+        Arc::new(TestContext),
+        Arc::new(TestModel),
+        Arc::new(TestTools),
+        Arc::new(PolicyApprovalGate::read_only()),
+        None,
+    ));
+    let mut actor = RuntimeActor::new(services.core_port(), services);
+    mark_actor_serving(&mut actor);
+    let (op_tx, mut op_rx) = mpsc::channel(1);
+    let (proof_tx, _) = mpsc::channel(1);
+    let (old_tx, old_rx) = oneshot::channel();
+    actor.start_turn("old input".into(), old_tx, &op_tx).await;
+    // The engine finished, but the actor has not admitted its completion.
+    let stale = op_rx.recv().await.unwrap();
+    actor
+        .cancel_turn(TurnCancellationReason::Requested, None)
+        .await
+        .unwrap();
+    assert!(matches!(old_rx.await.unwrap(), Err(AgentError::Cancelled)));
+    let (new_tx, new_rx) = oneshot::channel();
+    actor.start_turn("new input".into(), new_tx, &op_tx).await;
+    let current_id = actor
+        .state
+        .turn
+        .as_ref()
+        .unwrap()
+        .op
+        .as_ref()
+        .unwrap()
+        .operation_id;
+    actor.on_operation_completed(stale, &op_tx, &proof_tx).await;
+    assert_eq!(
+        actor
+            .state
+            .turn
+            .as_ref()
+            .unwrap()
+            .op
+            .as_ref()
+            .unwrap()
+            .operation_id,
+        current_id
+    );
+    assert!(actor.state.maintenance.is_some());
+    let current = op_rx.recv().await.unwrap();
+    actor
+        .on_operation_completed(current, &op_tx, &proof_tx)
+        .await;
+    new_rx.await.unwrap().unwrap();
+    assert_eq!(
+        actor.state.turn.as_ref().unwrap().turn_frame.user_message,
+        "new input"
+    );
+    actor
+        .cancel_turn(TurnCancellationReason::Requested, None)
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
+async fn after_model_completion_and_cancel_keep_one_terminal_at_the_actor_fence() {
+    for cancel_first in [true, false] {
+        let services = Arc::new(RuntimeServices::new(
+            CoreAuthorityConfig::default(),
+            Arc::new(TestContext),
+            Arc::new(OneToolModel {
+                rounds: AtomicUsize::new(1),
+            }),
+            Arc::new(TestTools),
+            Arc::new(PolicyApprovalGate::read_only()),
+            None,
+        ));
+        let core = services.core_port();
+        let mut events = core.event_sender().subscribe();
+        let mut actor = RuntimeActor::new(core, services);
+        mark_actor_serving(&mut actor);
+        let (op_tx, mut op_rx) = mpsc::channel(1);
+        let (proof_tx, _) = mpsc::channel(1);
+        let (reply_tx, reply_rx) = oneshot::channel();
+        actor
+            .start_turn("finish once".into(), reply_tx, &op_tx)
+            .await;
+        next_round_completion(&mut actor, &mut op_rx, &op_tx, &proof_tx).await;
+        reply_rx.await.unwrap().unwrap();
+        assert_eq!(
+            actor.state.turn.as_ref().unwrap().turn_state,
+            TurnState::Committing
+        );
+        let completed = op_rx.recv().await.unwrap();
+        if cancel_first {
+            assert!(matches!(
+                actor
+                    .cancel_turn(TurnCancellationReason::Requested, None)
+                    .await,
+                Err(AgentError::RecoveryRequired(_))
+            ));
+            actor
+                .on_operation_completed(completed, &op_tx, &proof_tx)
+                .await;
+        } else {
+            actor
+                .on_operation_completed(completed, &op_tx, &proof_tx)
+                .await;
+            assert!(matches!(
+                actor
+                    .cancel_turn(TurnCancellationReason::Requested, None)
+                    .await
+                    .unwrap(),
+                TurnCancelAck::NoActiveTurn
+            ));
+        }
+        assert!(actor.state.turn.is_none() && actor.state.maintenance.is_none());
+        assert_eq!(actor.state.recovery_required, cancel_first);
+        let mut committed = 0;
+        let mut failed = 0;
+        while let Ok(envelope) = events.try_recv() {
+            match envelope.event {
+                RuntimeEvent::TurnCompleted => committed += 1,
+                RuntimeEvent::TurnCommitFailed { .. } => failed += 1,
+                _ => {}
+            }
+        }
+        assert_eq!(
+            (committed, failed),
+            if cancel_first { (0, 1) } else { (1, 0) }
+        );
+    }
+}
 
 #[async_trait]
 impl ModelTransport for TestModel {
@@ -776,8 +910,8 @@ async fn operation_cancel_losing_to_a_core_terminal_returns_truth_without_fencin
             &op_tx,
         )
         .await;
-    message_rx.await.unwrap().unwrap();
     next_round_completion(&mut actor, &mut op_rx, &op_tx, &proof_tx).await;
+    message_rx.await.unwrap().unwrap();
     tokio::time::timeout(Duration::from_secs(2), entered.notified())
         .await
         .expect("tool did not enter execution");
@@ -881,8 +1015,8 @@ async fn partial_atomic_cancel_wal_failure_fences_actor_and_stays_queryable() {
             &op_tx,
         )
         .await;
-    message_rx.await.unwrap().unwrap();
     next_round_completion(&mut actor, &mut op_rx, &op_tx, &proof_tx).await;
+    message_rx.await.unwrap().unwrap();
     tokio::time::timeout(Duration::from_secs(2), entered.notified())
         .await
         .expect("tool did not enter execution");

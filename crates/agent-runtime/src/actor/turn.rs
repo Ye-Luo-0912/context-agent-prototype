@@ -98,14 +98,20 @@ impl RuntimeActor {
             persist.0,
             persist.1,
         );
-        let _ = reply.send(self.begin_applied_turn(content, input, op_tx).await);
+        match self.begin_applied_turn(content, input, op_tx).await {
+            Ok(()) => self.set_turn_start_reply(maintenance::TurnStartReply::Message(reply)),
+            Err(error) => {
+                let _ = reply.send(Err(error));
+            }
+        }
     }
 
     /// Atomic long-task submission shared by every entry (P1, fixes the F07
     /// misdelivery race): task create/resume focus, the long-task checklist
-    /// attach and the first user message run inside this one serialized
-    /// actor command, so another client's SetFocus/Submit can never interleave
-    /// between focus and message. A repeated `client_request_id` with the
+    /// attach and the first user message share one actor-owned admission.
+    /// The prepared turn keeps idle-only mutations fenced while maintenance
+    /// runs, so another client's SetFocus/Submit cannot cross-deliver it.
+    /// A repeated `client_request_id` with the
     /// same goal returns the original admission without a second execution;
     /// the same id with a different goal is rejected instead of being
     /// re-executed under a foreign identity.
@@ -115,10 +121,7 @@ impl RuntimeActor {
         client_request_id: String,
         op_tx: &mpsc::Sender<OperationCompletion>,
     ) -> AgentResult<crate::work::WorkSubmission> {
-        use crate::work::{
-            MAX_PENDING_WORK_SUBMISSIONS, WorkSubmission, WorkSubmissionDisposition,
-            WorkSubmissionRecord,
-        };
+        use crate::work::{WorkSubmission, WorkSubmissionDisposition};
 
         if goal.trim().is_empty() {
             return Err(AgentError::InvalidRequest(
@@ -205,14 +208,6 @@ impl RuntimeActor {
         );
         self.begin_applied_turn(goal.clone(), input, op_tx).await?;
 
-        self.state.work_submissions.push_back(WorkSubmissionRecord {
-            client_request_id,
-            goal,
-            task_id,
-        });
-        while self.state.work_submissions.len() > MAX_PENDING_WORK_SUBMISSIONS {
-            self.state.work_submissions.pop_front();
-        }
         Ok(WorkSubmission {
             disposition: WorkSubmissionDisposition::Accepted,
             task_id,
@@ -288,40 +283,17 @@ impl RuntimeActor {
                 applied.clone(),
             )?)
         };
-        if continuation {
-            // A continuation re-runs the stored directive without
-            // ingesting a new body: no context mutation precedes these
-            // audit events, so an event failure is a plain error, not an
-            // audit gap.
+        let checkpoint = if continuation {
             self.emit_user_input(applied.clone()).await?;
-            let report = self
-                .services
-                .context_maintain(ContextMaintenanceTrigger::UserInput)
-                .await?;
-            self.emit_context_maintained(ContextMaintenanceTrigger::UserInput, report)
-                .await?;
+            None
         } else {
-            // Context application is one recoverable transaction: a
-            // UserInput maintenance failure restores the engine, so the
-            // context plane never runs ahead of task/audit state. The
-            // audit events are published only after the transaction
-            // commits; a publish failure is an audit gap and fences the
-            // runtime before any further mutation.
-            let report = self.services.apply_user_message(content.clone()).await?;
-            if let Err(error) = self.emit_user_input(applied.clone()).await {
-                return Err(self.audit_gap_after_commit(error).await);
-            }
-            if let Err(error) = self
-                .emit_context_maintained(ContextMaintenanceTrigger::UserInput, report)
-                .await
-            {
-                return Err(self.audit_gap_after_commit(error).await);
-            }
-            self.state.tasks.apply_user_directive(
-                &content,
-                directive.expect("new dialogue captured its full directive"),
-            );
-        }
+            Some(
+                self.services
+                    .prepare_user_message(content.clone())
+                    .await
+                    .map_err(|error| self.context_transition_failed(error))?,
+            )
+        };
 
         // A new turn has no active call from a previous turn: the
         // active-call policy only pins tools while the turn that issued
@@ -362,21 +334,16 @@ impl RuntimeActor {
             structurally_empty_retries: 0,
             pending_scope_closes: VecDeque::new(),
         });
-        if continuation && let Some(task_id) = self.state.task_id {
-            let anchor_revision = self
-                .state
-                .tasks
-                .get(task_id)
-                .map(|task| task.anchor.revision)
-                .unwrap_or_default();
-            self.core
-                .emit_event(RuntimeEvent::TaskContinuationStarted {
-                    task_id,
-                    anchor_revision,
-                })
-                .await?;
-        }
-        self.advance_turn(op_tx).await;
+        self.spawn_maintenance(
+            maintenance::MaintenanceContinuation::UserInput(Box::new(
+                maintenance::PendingTurnStart {
+                    checkpoint,
+                    directive,
+                    reply: None,
+                },
+            )),
+            op_tx,
+        );
         Ok(())
     }
 
@@ -495,10 +462,11 @@ impl RuntimeActor {
     /// Finish a model-selected `task.complete` without manufacturing a
     /// confirmation round. The action ledger is durable before the normal
     /// turn/completion transaction begins.
-    pub(super) fn finalize_terminal_completion(
-        &mut self,
+    pub(super) fn finalize_terminal_completion<'a>(
+        &'a mut self,
         summary: String,
-    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + '_>> {
+        op_tx: &'a mpsc::Sender<OperationCompletion>,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + 'a>> {
         // Return a boxed future at the function boundary. `finalize_turn`
         // contains the entire durability transaction; keeping its concrete
         // future out of the hot operation-completion state machine avoids a
@@ -525,7 +493,7 @@ impl RuntimeActor {
                     })
                     .await;
             }
-            self.finalize_turn(summary).await;
+            self.finalize_turn(summary, op_tx).await;
         })
     }
 
@@ -973,7 +941,7 @@ impl RuntimeActor {
         // hands the decision back to a model round with the refreshed
         // verification already in context.
         if let Some(summary) = self.terminal_completion_summary() {
-            self.finalize_terminal_completion(summary).await;
+            self.finalize_terminal_completion(summary, op_tx).await;
         } else {
             if !scratch.ok {
                 let _ = self
@@ -2332,7 +2300,11 @@ impl RuntimeActor {
     /// build on a state that is already inconsistent — and the runtime
     /// journals `TurnCommitFailed` (naming the phase) plus
     /// `RecoveryRequired` instead of pretending the turn completed.
-    pub(super) async fn finalize_turn(&mut self, content: String) {
+    pub(super) async fn finalize_turn(
+        &mut self,
+        content: String,
+        op_tx: &mpsc::Sender<OperationCompletion>,
+    ) {
         // Segment boundary: flush any accrued debt here too, so a failed
         // background write retries at the next turn end even when the
         // closing round had no tool batch.
@@ -2373,11 +2345,6 @@ impl RuntimeActor {
             self.safe_point_resume_commit().await;
             let _ = self.await_pending_checkpoint().await;
         }
-        let assistant_evidence_identity = self
-            .state
-            .task_id
-            .zip(self.state.turn.as_ref().map(|turn| turn.turn_id));
-        let mut pending_assistant_evidence = None;
         if let Some(turn) = self.state.turn.as_mut() {
             turn.turn_state = TurnState::ModelFinished;
         }
@@ -2420,27 +2387,25 @@ impl RuntimeActor {
             turn.turn_state = TurnState::Committing;
         }
         if ingested {
-            let report = match self
-                .services
-                .context_maintain(ContextMaintenanceTrigger::AfterTool)
-                .await
-            {
-                Ok(report) => report,
-                Err(error) => {
-                    return self
-                        .commit_failed(TurnCommitPhase::AfterToolMaintain, error)
-                        .await;
-                }
-            };
-            if let Err(error) = self
-                .emit_context_maintained(ContextMaintenanceTrigger::AfterTool, report)
-                .await
-            {
-                return self
-                    .commit_failed(TurnCommitPhase::AfterToolMaintainedEvent, error)
-                    .await;
-            }
+            self.spawn_maintenance(
+                maintenance::MaintenanceContinuation::AfterTool { content },
+                op_tx,
+            );
+        } else {
+            self.finalize_assistant_message(content, op_tx).await;
         }
+    }
+
+    pub(super) async fn finalize_assistant_message(
+        &mut self,
+        content: String,
+        op_tx: &mpsc::Sender<OperationCompletion>,
+    ) {
+        let assistant_evidence_identity = self
+            .state
+            .task_id
+            .zip(self.state.turn.as_ref().map(|turn| turn.turn_id));
+        let mut pending_assistant_evidence = None;
         // Raw-evidence retention: the exact final assistant response is
         // persisted in full *before* the bounded ContextItem is built, so
         // the raw output survives ContextItem truncation and stays
@@ -2505,26 +2470,18 @@ impl RuntimeActor {
                 .commit_failed(TurnCommitPhase::AssistantMessageEvent, error)
                 .await;
         }
-        let report = match self
-            .services
-            .context_maintain(ContextMaintenanceTrigger::AfterModel)
-            .await
-        {
-            Ok(report) => report,
-            Err(error) => {
-                return self
-                    .commit_failed(TurnCommitPhase::AfterModelMaintain, error)
-                    .await;
-            }
-        };
-        if let Err(error) = self
-            .emit_context_maintained(ContextMaintenanceTrigger::AfterModel, report)
-            .await
-        {
-            return self
-                .commit_failed(TurnCommitPhase::AfterModelMaintainedEvent, error)
-                .await;
-        }
+        self.spawn_maintenance(
+            maintenance::MaintenanceContinuation::AfterModel {
+                evidence: pending_assistant_evidence,
+            },
+            op_tx,
+        );
+    }
+
+    pub(super) async fn finalize_after_model(
+        &mut self,
+        pending_assistant_evidence: Option<AssistantArtifactEvidence>,
+    ) {
         // Turn boundary: the full GC pass compacts what the per-event
         // residency machine demoted. Eviction is reversible, and the report
         // explains every eviction and reactivation. Push TaskProgress
@@ -2857,6 +2814,7 @@ impl RuntimeActor {
                 abort.abort();
             }
         }
+        self.cancel_pending_maintenance().await?;
         // A deferred proof refresh belongs to the dying turn: arm its
         // cancellation so the runner's own loop kills and reaps the host
         // verifier process, wait (bounded) for that cleanup, and only then

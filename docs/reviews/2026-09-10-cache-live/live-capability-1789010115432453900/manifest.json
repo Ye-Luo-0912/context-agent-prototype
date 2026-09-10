@@ -1,0 +1,21 @@
+{
+  "head": "732cf93103cb7104f1961402f422e82143b8956c",
+  "sources": {
+    "Cargo.lock": "8df3959ffd4cd5b83036b299a5977bf1e0164170b95527947bf102dcc9e82cd1",
+    "crates/agent-contracts/src/model.rs": "2aa8264fca2963878de8fd5bbed7b27179765b8979493f97b47dcbdb6f2247a8",
+    "crates/agent-contracts/src/model_cache.rs": "acc7c85b95154636b89391bc9e79c7e3b4a846be0629daca11031f21586bf151",
+    "crates/agent-runtime/src/prompt.rs": "df4873507c97c5dde6cbc3dbeeccbb21189cf77107469770f7d509549224deae",
+    "crates/agent-runtime/src/actor/model.rs": "817d45bd253b083132ed7fc080e6dbb6a70f5caf3b035af07ec3dce8cdce8d65",
+    "crates/agent-compose/src/lib.rs": "d99e210837e5742e28cdcfff193846a9421679e987e3e81338d98534acf63ae5",
+    "crates/agent-compose/tests/kv_cache_walk.rs": "d2630055537b30a096de2fcbad3c941a8990ba0ae2f7f0873dd0f2549def7b4c",
+    "crates/agent-compose/tests/kv_cache_walk/boundary.rs": "583b77e078866e8851d8ca613deea0fe67a79845cb3361fdbadc1747a6ddf4df",
+    "crates/provider-openai/src/lib.rs": "74efd7f4944ec01601bee0d4416778ccd2b31f1861181dca65ee43dac14752d7",
+    "crates/agent-compose/tests/kv_cache_walk/capability.rs": "8ca3e082e928585b851464ecadff208c60c6cc8adf65ccf86d50a0641cc6c054",
+    "crates/provider-openai/src/prompt_cache.rs": "a63deb1471001978b67cf3feb36aee2fd3a547da82b51f6e0f6c28e63a4184d3",
+    "crates/provider-openai/src/diagnostics.rs": "ed831aef829f4424451eed2bb1c7063ea3b0dfe4424b3f75892f41e13ffa95c6",
+    "crates/provider-openai/src/responses.rs": "c16acea498291fc824b4d81c51c5f4891587b5340a410109ddffd394db15ace4",
+    "crates/provider-openai/src/wire_names.rs": "91b04cc2af9e26161d538beab05766a56b670267a4e5410459bd196be1121016",
+    "docs/reviews/2026-09-10-cache-live/run_live.py": "8cdaebff94e86654fe3fd888a5f6c6d554043e54dfe6c4718326972feaec4996"
+  },
+  "unchanged_after_run": true
+}

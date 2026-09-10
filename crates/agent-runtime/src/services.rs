@@ -14,10 +14,10 @@ use agent_contracts::{
     AgentError, AgentResult, ApprovalGate, ContextEngine, ContextGcReport, ContextIngress,
     ContextItemId, ContextItemSummary, ContextMaintenanceReport, ContextMaintenanceTrigger,
     ContextQuery, ContextStateTransition, EffectReconciler, EventJournal, FocusState,
-    FsRereadClass, MaterializedContext, ModelCapabilities, ModelTransport, ScopeId, ScopeKind,
-    StorageGcReport, StoreReconcileReport, TaskId, ToolCall, ToolCatalogEntry, ToolDispatcher,
-    ToolExecutionAttribution, ToolLeaseReconcileReport, ToolSpec, ToolSurfaceSnapshot,
-    VerificationCoverageDeclaration,
+    FsRereadClass, MaterializedContext, ModelCapabilities, ModelTransport, PromptLayout, ScopeId,
+    ScopeKind, StorageGcReport, StoreReconcileReport, TaskId, ToolCall, ToolCatalogEntry,
+    ToolDispatcher, ToolExecutionAttribution, ToolLeaseReconcileReport, ToolSpec,
+    ToolSurfaceSnapshot, VerificationCoverageDeclaration,
 };
 use agent_core::{CoreAuthorityConfig, CorePort, build_core_port, try_build_core_port};
 use agent_workspace::Workspace;
@@ -60,6 +60,8 @@ pub struct RuntimeServices {
     shadow_context_frame: bool,
     /// Ablation: when false, PromptAssembler omits TaskProgress. Default true.
     project_task_progress: bool,
+    /// Message placement only; Context selection and focus policy are unchanged.
+    prompt_layout: PromptLayout,
     /// Ablation: when true, a settled-candidate fact is projected into the
     /// otherwise unchanged TaskProgress view. Kept separate from
     /// `project_task_progress` so paired evaluation arms do not remove the
@@ -202,6 +204,7 @@ impl RuntimeServices {
             defer_proof_refresh: false,
             shadow_context_frame: false,
             project_task_progress: true,
+            prompt_layout: PromptLayout::CurrentStateLast,
             project_settlement: false,
             settlement_projection_diagnostics: false,
             project_completion_opportunity: false,
@@ -247,6 +250,7 @@ impl RuntimeServices {
             defer_proof_refresh: false,
             shadow_context_frame: false,
             project_task_progress: true,
+            prompt_layout: PromptLayout::CurrentStateLast,
             project_settlement: false,
             settlement_projection_diagnostics: false,
             project_completion_opportunity: false,
@@ -345,6 +349,15 @@ impl RuntimeServices {
     pub fn with_project_task_progress(mut self, project: bool) -> Self {
         self.project_task_progress = project;
         self
+    }
+
+    pub fn with_prompt_layout(mut self, layout: PromptLayout) -> Self {
+        self.prompt_layout = layout;
+        self
+    }
+
+    pub fn prompt_layout(&self) -> PromptLayout {
+        self.prompt_layout
     }
 
     pub(crate) fn project_task_progress(&self) -> bool {
@@ -466,17 +479,16 @@ impl RuntimeServices {
         self.model.capabilities()
     }
 
-    /// Clone only the model scheduling lane for a detached request. A
-    /// provider may take time to observe cancellation, so the detached task
-    /// must not retain the complete service bundle (and, through it, tool or
-    /// workspace authority) after the actor has shut down.
-    /// W04: clone of the engine lane for the spawned before-model
-    /// maintenance operation. Engines are `Send + Sync` and serialize their
-    /// own state; only the Arc moves into the spawned task.
+    /// Clone only the engine lane for a spawned maintenance operation.
+    /// Engines serialize their own state; no tool/workspace authority moves
+    /// into this task with the Arc.
     pub(crate) fn context_engine(&self) -> Arc<dyn ContextEngine> {
         Arc::clone(&self.context)
     }
 
+    /// Clone only the model scheduling lane for a detached request. A
+    /// provider may take time to observe cancellation, so the detached task
+    /// must not retain the complete service bundle or workspace authority.
     pub(crate) fn model_transport(&self) -> Arc<dyn ModelTransport> {
         self.model.clone()
     }
@@ -499,25 +511,33 @@ impl RuntimeServices {
         self.context.maintain(trigger).await
     }
 
-    /// Apply one user message transactionally: ingest the body and run the
-    /// UserInput maintenance pass against one portable checkpoint,
-    /// restoring the engine if either mutation fails. The actor publishes
-    /// the audit events only after this commits; a publish failure is an
-    /// audit gap and fences the runtime.
-    pub(crate) async fn apply_user_message(
+    /// Prepare user-message ingestion and retain its rollback basis while
+    /// the actor runs UserInput maintenance as a cancellable operation.
+    pub(crate) async fn prepare_user_message(
         &self,
         content: String,
-    ) -> AgentResult<ContextMaintenanceReport> {
+    ) -> AgentResult<serde_json::Value> {
         let checkpoint = self.context.checkpoint().await?;
-        let transition = async {
-            self.context
-                .ingest(ContextIngress::UserMessage { content })
-                .await?;
-            self.context
-                .maintain(ContextMaintenanceTrigger::UserInput)
-                .await
+        let transition = self
+            .context
+            .ingest(ContextIngress::UserMessage { content })
+            .await;
+        if let Err(error) = transition {
+            return self
+                .finish_context_transaction("apply user message", checkpoint, Err(error))
+                .await;
         }
-        .await;
+        Ok(checkpoint)
+    }
+
+    /// Commit a successful pass, or restore ingestion and maintenance
+    /// together on failure/cancellation. Completion or a joined abort must
+    /// first prove the engine future ended, so it cannot race the restore.
+    pub(crate) async fn finish_user_message(
+        &self,
+        checkpoint: serde_json::Value,
+        transition: AgentResult<ContextMaintenanceReport>,
+    ) -> AgentResult<ContextMaintenanceReport> {
         self.finish_context_transaction("apply user message", checkpoint, transition)
             .await
     }

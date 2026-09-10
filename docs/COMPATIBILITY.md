@@ -43,6 +43,18 @@ compatibility declaration; each section names the owning artifact.
 - Two runs compare operating points by comparing digests; a digest
   change means the measured object changed.
 - The digest intentionally excludes the API key and retry/timeout knobs.
+- Explicit `responses_explicit` caching adds `prompt_cache_mode` to this identity;
+  `provider_default` omits it and preserves the historical digest. The capability
+  must be configured, never inferred from a model alias or compatible base URL.
+- A pinned `OPENAI_RESPONSES_REASONING_EFFORT` similarly adds
+  `responses_reasoning_effort`; its default omits both the wire field and the
+  identity field, preserving historical/default digests. This is a serving
+  setting, not a change to task permissions or input roles.
+- `ModelRequest.metadata.prompt_reuse_boundary` is an optional, versioned,
+  request-local performance hint. Older requests need no hint. Consumers must
+  validate its message count and prefix/tools digest before use; malformed,
+  unknown-version and stale hints are ignored without dropping request content.
+  This does not change checkpoint/event formats, evidence ACKs or permissions.
 
 ## Shadow Context Frame
 

@@ -147,14 +147,24 @@ async fn final_guard_trims_to_the_input_budget_not_the_window() {
         None,
     ));
     let (handle, _task) = spawn_runtime(kernel.clone());
+    let mut events = handle.subscribe();
     handle.start().await.unwrap();
     handle.user_message("hello".into()).await.unwrap();
-    tokio::time::sleep(Duration::from_millis(150)).await;
+    wait_for_turn_completed(&mut events).await;
 
     {
         let requests = model.requests.lock().unwrap();
         assert_eq!(requests.len(), 1, "the turn must send exactly one request");
         let request = &requests[0];
+        let boundary = request
+            .prompt_reuse_boundary()
+            .expect("boundary must bind the post-trim request");
+        let directive_index = request
+            .messages
+            .iter()
+            .position(|message| message.content == "hello")
+            .unwrap();
+        assert_eq!(boundary.message_count(), directive_index);
         let total = approx_layer_tokens(&request.messages) + approx_layer_tokens(&request.tools);
         assert!(
             total <= 6_000,
@@ -273,6 +283,10 @@ async fn final_guard_omits_optional_schema_without_unloading_it() {
     {
         let requests = model.requests.lock().unwrap();
         assert_eq!(requests.len(), 1, "the small-budget round must complete");
+        assert!(
+            requests[0].prompt_reuse_boundary().is_some(),
+            "boundary must bind the final trimmed schemas"
+        );
         let total =
             approx_layer_tokens(&requests[0].messages) + approx_layer_tokens(&requests[0].tools);
         assert!(

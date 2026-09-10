@@ -1,0 +1,6 @@
+{"kind":"stage","record":{"attempts":1,"call_seq":0,"format_retries":0,"outcome":"Clean","transport_retries":0}}
+{"kind":"stage","record":{"attempts":1,"call_seq":1,"format_retries":0,"outcome":"Clean","transport_retries":0}}
+{"kind":"stage","record":{"attempts":1,"call_seq":2,"format_retries":0,"outcome":"Clean","transport_retries":0}}
+{"kind":"stage","record":{"attempts":1,"call_seq":3,"format_retries":0,"outcome":"Clean","transport_retries":0}}
+{"kind":"stage","record":{"attempts":1,"call_seq":4,"format_retries":0,"outcome":"Clean","transport_retries":0}}
+{"kind":"stage","record":{"attempts":1,"call_seq":5,"format_retries":0,"outcome":"Clean","transport_retries":0}}

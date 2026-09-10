@@ -53,10 +53,10 @@ impl agent_contracts::Effect for FlagEffect {
 
 /// A dispatcher whose mutating tool stages a `FlagEffect` instead of
 /// returning a plain value. `release` lets a test hold the execution open.
-struct EffectToolDispatcher {
-    committed: Arc<AtomicUsize>,
-    rolled_back: Arc<AtomicUsize>,
-    release: Option<Arc<tokio::sync::Notify>>,
+pub(super) struct EffectToolDispatcher {
+    pub(super) committed: Arc<AtomicUsize>,
+    pub(super) rolled_back: Arc<AtomicUsize>,
+    pub(super) release: Option<Arc<tokio::sync::Notify>>,
 }
 
 #[async_trait::async_trait]

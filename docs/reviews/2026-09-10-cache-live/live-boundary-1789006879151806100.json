@@ -1,0 +1,98 @@
+{
+  "attempted_requests": 1,
+  "completed": false,
+  "cost_status": "UNKNOWN: gateway pricing and write semantics not verified",
+  "gap_seconds": 5,
+  "max_output_tokens": 512,
+  "max_requests": 4,
+  "model": "gpt-5.6-luna",
+  "profile_digest": "6955a98da26dcdf3823fe4201a05ceabdf186c83d6843be2a8551c38bbff54f1",
+  "prompt_cache_mode": "responses_explicit",
+  "protocol": "responses",
+  "raw_requests_saved": false,
+  "requests": [
+    {
+      "boundary": {
+        "message_count": 3,
+        "prefix_digest": "3cc33ae8c83a9f9032e9287f8b596c2ace8351c9713e1c97d274d103a0bcc1bc",
+        "version": 1
+      },
+      "dropped_observations": 0,
+      "elapsed_ms": 1872,
+      "error_class": "transport",
+      "operation": "cold",
+      "response_observations": [],
+      "round": 0,
+      "sequence": 1,
+      "wire_difference": null,
+      "wire_requests": [
+        {
+          "body_bytes": 21433,
+          "body_sha256": "21b3f889df06726b55b754a9da0e292701587bde6f174530dbc75022a4bd4a63",
+          "input_items": [
+            {
+              "bytes": 275,
+              "kind": "system",
+              "sha256": "4c93f1cf9bf4837d56904431e997c8477a267e7887249d40e3a38e83a318a8c2"
+            },
+            {
+              "bytes": 140,
+              "kind": "system",
+              "sha256": "f4eb6db15ca3f63ba4d0cf19dc1a14ce317e62e49282134bc79ca679b12cc910"
+            },
+            {
+              "bytes": 20108,
+              "kind": "user",
+              "sha256": "5594568aab48900e5cdfd2741484fccc3d0476764a8128b8d89a6924fd98b200"
+            },
+            {
+              "bytes": 108,
+              "kind": "user",
+              "sha256": "503331917df6fb816b872dcdd6489745022eaf23ce534bce80b3deff0cc44890"
+            },
+            {
+              "bytes": 402,
+              "kind": "system",
+              "sha256": "6e2d1695bf36804a36f41c7bb63056eaf8e1894e6c9aa8fcbf8f32357e0d58cd"
+            }
+          ],
+          "input_items_complete": true,
+          "input_items_total": 5,
+          "prefix_block_bytes": 1024,
+          "prefix_block_sha256": [
+            "ac7c146259ae0ca36d988111433ad90eba0dd54beb2ad2cf22fcc158c413f8f6",
+            "016b034226a9651e2b212b5b0662bbf742892c136d89afd020a28c6df0b17b8c",
+            "7e89152fc6070307379054db99108abff7d172c8dfe1db8d74a7a6545125a38e",
+            "f31c8d9a1a5d75bb632d42838ec6b7797e93db5a0ee3ae31bda7f2cea5aa7cfb",
+            "da4bceaba5d9c1db3d5891c56894766c59184a66b242b7ebb0b1b22a23c75d7b",
+            "fa88e16c5210fe42fa596cd89e4f72b2cd034b2b838bee85879a64077411c2e1",
+            "4e3ce7b86eb94200f8e66bbaa0d3f3d8a504f9bfc20bf6f5089ec6b0a4320ef5",
+            "c33d405956458b456b95f5ff535fa0c3933b922fa1aedbde528887148f7ceeb7",
+            "d9f6b1255ca2a341be5cdca383821352238587b271490f3abf3b3d3c1a1d5d69",
+            "3528dae0c23efcc8d0c78feb99a37e82438d586d797d04454008f928e659090e",
+            "c92bd20d1495104d9de72996288c4d4910c46dc991d1c6fbd15515a4dc91ece5",
+            "dacdad9dc78e3034b2487e1c1cbb1d2b21f35105ed6bf4ee322cebea12fb5ee8",
+            "3e2bb4b11a87f31f75a34728e588b54c7ee7913c3111ded3a5f4e4560ad21041",
+            "b7ebe94bd1376c28308f96a12d836563a4d3a2bed6f8a5e3e472252c88833d5b",
+            "cb1e04a109608cf93e3baf3cc95d7683f8f8408cda032e3afe80455b98cb0115",
+            "ee53e8a4f53185091a398fc66ac129af7fb8079b367b6a3acb9f2021c116c212",
+            "83298bdb853b9dfce6394d4a9f54ea24c732f11f444c42441f2cfca0242fb515",
+            "ae59a43c8bfae5fe6b8abeb12ef0f33952dbaa8617e8604dd52b8ebe15a9fec1",
+            "acd1b11223676cd831286b2b02498cc2e1bd41003de57519ba14187f30c03a61",
+            "e4db181d11eccc601ec82b78712e0d93d486d7e7d1770687a969d1a6c691e90b",
+            "70b1ef736de53dc2e37d3b20efe81a1e0e12e585e492cbcfe8e63b7816d1abcb"
+          ],
+          "prefix_complete": true,
+          "protocol": "responses",
+          "settings_sha256": "6f40b26224868700881fe66b4cb1b41d0edb9654c7777f91968dbd906f707e42",
+          "tools_sha256": "f585dc0cf7ab5efaae4e72b4398ff741e706a4487fd6e585a9198c5438710a3b"
+        }
+      ]
+    }
+  ],
+  "run_nonce": "4c1b54a8-4fb2-4df9-8b61-e712e5b09850",
+  "schema": "kv-boundary-live/v1",
+  "scope": "Synthetic focus/evidence check; field acceptance does not establish that the gateway honors breakpoints",
+  "started_unix": 1789006886,
+  "transport_retries": false
+}

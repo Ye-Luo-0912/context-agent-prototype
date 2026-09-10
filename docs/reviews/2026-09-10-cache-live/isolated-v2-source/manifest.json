@@ -1,0 +1,71 @@
+{
+  "head": "732cf93103cb7104f1961402f422e82143b8956c",
+  "worktree": true,
+  "files": [
+    {
+      "path": "crates/provider-openai/src/lib.rs",
+      "sha256": "4b2c8d45ee5d6f2e15a8ecd58d02e2365263bbb5e72d13ca5cc6d2f740d45d27",
+      "snapshot": "00-lib.rs"
+    },
+    {
+      "path": "crates/provider-openai/src/diagnostics.rs",
+      "sha256": "ed831aef829f4424451eed2bb1c7063ea3b0dfe4424b3f75892f41e13ffa95c6",
+      "snapshot": "01-diagnostics.rs"
+    },
+    {
+      "path": "crates/provider-openai/src/diagnostics/tests.rs",
+      "sha256": "eba2a7ec88b5bc5c5d57e17afebb8b98539b45a7fe442417a0c314881330df47",
+      "snapshot": "02-tests.rs"
+    },
+    {
+      "path": "crates/provider-openai/src/responses.rs",
+      "sha256": "c16acea498291fc824b4d81c51c5f4891587b5340a410109ddffd394db15ace4",
+      "snapshot": "03-responses.rs"
+    },
+    {
+      "path": "crates/provider-openai/src/sse.rs",
+      "sha256": "13c366d3509908500a1a990bbe7546d15509baabb43036ee5586f6e0d0fdefa8",
+      "snapshot": "04-sse.rs"
+    },
+    {
+      "path": "crates/agent-compose/tests/kv_cache_walk.rs",
+      "sha256": "a6ca7c221635bfbf607dcee974d731f67483b19735d965cd15b5d846d85c48c2",
+      "snapshot": "05-kv_cache_walk.rs"
+    },
+    {
+      "path": "crates/agent-contracts/src/model.rs",
+      "sha256": "b351ca45a211221c88ae2b4f9d3c36f4cf756154619b689e356c2c5e01eb41ab",
+      "snapshot": "06-model.rs"
+    },
+    {
+      "path": "crates/agent-runtime/src/prompt.rs",
+      "sha256": "df4873507c97c5dde6cbc3dbeeccbb21189cf77107469770f7d509549224deae",
+      "snapshot": "07-prompt.rs"
+    },
+    {
+      "path": "crates/agent-runtime/src/actor/model.rs",
+      "sha256": "d96e00537ef7111ea9413b4df88bdad0d775b092c7d42a252d3e851428553e1c",
+      "snapshot": "08-model.rs"
+    },
+    {
+      "path": "crates/agent-runtime/src/actor/mod.rs",
+      "sha256": "a212f28120ed99f5e4cefc2324c4c43862a6d805655d62d4a570fadcf8de8f32",
+      "snapshot": "09-mod.rs"
+    },
+    {
+      "path": "crates/agent-runtime/src/services.rs",
+      "sha256": "cddeec21fc872501ed3db3f93d7c206fc50055ebbe6cebf39a5be9111c398362",
+      "snapshot": "10-services.rs"
+    },
+    {
+      "path": "crates/agent-compose/src/lib.rs",
+      "sha256": "c97b43f2cca32f89eb7b6fea640e0fc9785818e73c86166914e4862c8fc3dda1",
+      "snapshot": "11-lib.rs"
+    },
+    {
+      "path": "docs/reviews/2026-09-10-cache-live/run_live.py",
+      "sha256": "ae7488c0e8cb3a5c9313daedb1ea89f742cdc2908dfdc0fea14bbccfcd1e1fed",
+      "snapshot": "12-run_live.py"
+    }
+  ]
+}

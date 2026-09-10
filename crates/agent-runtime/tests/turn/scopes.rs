@@ -179,8 +179,8 @@ async fn turn_frame_is_execution_stack_not_long_term_memory() {
         tokio::time::sleep(Duration::from_millis(10)).await;
     }
 
-    // First model round: policy + Runtime Facts + Focus frame + user; no
-    // tool frame yet. The implicit task's focus is a third System message.
+    // First model round: policy + Runtime Facts + user + current Focus;
+    // no tool frame yet. Moving Focus preserves its System role and text.
     let requests = model.requests.lock().await;
     assert_eq!(requests.len(), 2, "two model rounds expected");
     let first = &requests[0];
@@ -189,10 +189,11 @@ async fn turn_frame_is_execution_stack_not_long_term_memory() {
         vec![
             ModelRole::System,
             ModelRole::System,
-            ModelRole::System,
-            ModelRole::User
+            ModelRole::User,
+            ModelRole::System
         ]
     );
+    assert!(first.last().unwrap().content.contains("CURRENT FOCUS"));
     assert!(
         first[1].content.starts_with("runtime_facts/v1"),
         "second system message is Runtime Facts, got {}",

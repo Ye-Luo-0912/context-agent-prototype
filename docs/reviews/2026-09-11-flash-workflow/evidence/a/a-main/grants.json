@@ -1,0 +1,28 @@
+[
+  {
+    "id": "walkthrough-output",
+    "risk": "WorkspaceWrite",
+    "target": {
+      "workspace_path_prefix": "scripts"
+    },
+    "constraint": {
+      "max_content_bytes": 32768
+    },
+    "expires_at_ms": 1789060160502
+  },
+  {
+    "id": "walkthrough-pytest",
+    "risk": "ProcessExecution",
+    "target": {
+      "exec_argv_prefix": [
+        "D:\\Users\\Ye_Luo\\APP\\context-agent-prototype\\target\\flash-workflow-env\\Scripts\\python.exe",
+        "-m",
+        "pytest"
+      ]
+    },
+    "constraint": {
+      "max_runs": 4
+    },
+    "expires_at_ms": 1789060160502
+  }
+]

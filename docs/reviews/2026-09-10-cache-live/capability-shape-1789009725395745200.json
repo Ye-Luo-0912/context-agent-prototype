@@ -1,0 +1,20 @@
+{
+  "schema": "kv-capability-shape/v1",
+  "model": "gpt-5.6-luna",
+  "max_requests": 2,
+  "max_output_tokens": 128,
+  "transport_retries": false,
+  "scope": "Tiny Responses field acceptance only; below cache measurement size",
+  "script_sha256": "b2d24e20e21715c1a1c5626915088dbeb7beb4d072a1641150a9877d6471dc2a",
+  "raw_requests_saved": false,
+  "raw_errors_saved": false,
+  "requests": [
+    {
+      "mode": "content_array_control",
+      "request_sha256": "0cb7fce2109553f10effe5280902cb706b1c2b942b050bc34cfd66924b668125",
+      "error_class": "ReadTimeout",
+      "elapsed_ms": 20735
+    }
+  ],
+  "attempted_requests": 1
+}

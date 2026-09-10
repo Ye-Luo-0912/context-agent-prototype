@@ -1,0 +1,55 @@
+{
+  "attempted_requests": 1,
+  "max_requests": 2,
+  "raw_errors_saved": false,
+  "raw_requests_saved": false,
+  "requests": [
+    {
+      "elapsed_ms": 55016,
+      "mode": "provider_default",
+      "profile_digest": "ce61f63467016cc19fe2635cf4a131acf03cd87a91bbd5e95a9afdf95a12b418",
+      "response_observations": [],
+      "transport_failure": {
+        "http_status": null,
+        "matched_labels": [],
+        "retryable": true
+      },
+      "wire_requests": [
+        {
+          "body_bytes": 353,
+          "body_sha256": "64d6c9d727627ee0059972fc2d7453523d122480aa08ea1885dbee8e13706099",
+          "input_items": [
+            {
+              "bytes": 112,
+              "kind": "system",
+              "sha256": "b15cf88c071246a7ce411d1ac42d2cf26e2d890cc3871096e6040f2fb395b086"
+            },
+            {
+              "bytes": 54,
+              "kind": "user",
+              "sha256": "fc2bba7fc94f619524bf512379a0f737f6cc888426267fa2c43b7ad9ff1d9a8b"
+            },
+            {
+              "bytes": 40,
+              "kind": "user",
+              "sha256": "68e3b93b8ff319990d3b7c9b19556e4cc06ef35880eb6b1568a3a19bf28252ef"
+            }
+          ],
+          "input_items_complete": true,
+          "input_items_total": 3,
+          "prefix_block_bytes": 1024,
+          "prefix_block_sha256": [
+            "64d6c9d727627ee0059972fc2d7453523d122480aa08ea1885dbee8e13706099"
+          ],
+          "prefix_complete": true,
+          "protocol": "responses",
+          "settings_sha256": "a962de6fb372437a9c5f20c5ed58bad1dec135f803f05885e3931e57178c5d04",
+          "tools_sha256": "4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945"
+        }
+      ]
+    }
+  ],
+  "schema": "kv-capability-shape/v2",
+  "scope": "Tiny production-provider field acceptance only, below cache-measurement size",
+  "transport_retries": false
+}

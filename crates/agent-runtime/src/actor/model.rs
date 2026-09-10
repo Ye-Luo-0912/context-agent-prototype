@@ -235,80 +235,15 @@ impl RuntimeActor {
                 .await;
         }
 
-        // Advance the decision-round counter and take the turn id. The
+        // Advance the decision-round counter. The
         // remaining round inputs are re-read by the maintenance continuation
         // once the fence passes.
-        let turn_id = {
-            let Some(turn) = self.state.turn.as_mut() else {
-                return;
-            };
-            turn.model_round += 1;
-            turn.turn_id
+        let Some(turn) = self.state.turn.as_mut() else {
+            return;
         };
+        turn.model_round += 1;
 
-        // W04: before-model maintenance is a spawned operation, not an
-        // inline await — a long bounded-maintenance pass must not keep the
-        // actor loop from processing cancel_turn. The completion resumes
-        // round preparation after the generation fence; cancellation aborts
-        // the future at its next await point (the engine's fold guard
-        // returns every moved record), and the turn finalizes cancelled.
-        let generation = self.state.generation;
-        let operation_id = OperationId::new();
-        let run_id = self.core.run_id();
-        let task_id = self.state.task_id;
-        let scope_id = self.state.scope_id;
-        {
-            let Some(turn) = self.state.turn.as_mut() else {
-                return;
-            };
-            turn.op = Some(InFlightOp {
-                operation_id,
-                turn_id,
-                generation,
-                kind: OpKind::Maintenance,
-                scope_id: None,
-                tool_identity: None,
-                cancel: CancellationToken::new(),
-                abort: None,
-            });
-        }
-        let context = self.services.context_engine();
-        let op_tx = op_tx.clone();
-        let spawned = tokio::spawn(async move {
-            let report = context
-                .maintain(ContextMaintenanceTrigger::BeforeModel)
-                .await;
-            let _ = op_tx
-                .send(OperationCompletion {
-                    operation: OperationResult {
-                        run_id,
-                        turn_id,
-                        task_id,
-                        scope_id,
-                        operation_id,
-                        generation,
-                        outcome: OperationOutcome::Completed,
-                    },
-                    kind: OpKind::Maintenance,
-                    effect: None,
-                    lease: None,
-                    effect_id: None,
-                    argument_digest: None,
-                    attribution: None,
-                    verification_call: None,
-                    tool_identity: None,
-                    value_completion_pending: false,
-                    recovery_required: None,
-                    directive: None,
-                    disposition: ToolResultDisposition::PersistObservation,
-                    context_ack: None,
-                    maintenance: Some(report),
-                })
-                .await;
-        });
-        if let Some(operation) = self.state.turn.as_mut().and_then(|turn| turn.op.as_mut()) {
-            operation.abort = Some(spawned.abort_handle());
-        }
+        self.spawn_maintenance(maintenance::MaintenanceContinuation::BeforeModel, op_tx);
     }
 
     /// Round preparation after before-model maintenance landed (W04): the
@@ -1552,7 +1487,7 @@ impl RuntimeActor {
         let run_id = core.run_id();
         let task_id = self.state.task_id;
         let scope_id = self.state.scope_id;
-        let request_metadata = model_request_metadata(
+        let mut request_metadata = model_request_metadata(
             run_id,
             materialized.selected.len(),
             materialized.approx_tokens,
@@ -1560,17 +1495,12 @@ impl RuntimeActor {
             surface_revision,
             settlement_projection_audit,
         );
+        // Application-side accounting only; this field is not prompt text
+        // or a provider-specific cache-control parameter.
+        request_metadata["prompt_layout"] = serde_json::json!(input.layout);
         tokio::spawn(async move {
             let outcome = match model
-                .complete_stream(
-                    ModelRequest {
-                        messages: input.into_messages(),
-                        tools: input.tool_schemas.clone(),
-                        metadata: request_metadata,
-                        cancel: cancel.clone(),
-                    },
-                    &sink,
-                )
+                .complete_stream(input.into_request(request_metadata, cancel.clone()), &sink)
                 .await
             {
                 Ok(output) => OperationOutcome::ModelOutput {

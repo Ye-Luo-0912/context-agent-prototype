@@ -1,0 +1,22 @@
+{
+  "head": "732cf93103cb7104f1961402f422e82143b8956c",
+  "sources": {
+    "Cargo.lock": "8df3959ffd4cd5b83036b299a5977bf1e0164170b95527947bf102dcc9e82cd1",
+    "crates/agent-contracts/src/model.rs": "2aa8264fca2963878de8fd5bbed7b27179765b8979493f97b47dcbdb6f2247a8",
+    "crates/agent-contracts/src/model_cache.rs": "acc7c85b95154636b89391bc9e79c7e3b4a846be0629daca11031f21586bf151",
+    "crates/agent-runtime/src/prompt.rs": "df4873507c97c5dde6cbc3dbeeccbb21189cf77107469770f7d509549224deae",
+    "crates/agent-runtime/src/actor/model.rs": "817d45bd253b083132ed7fc080e6dbb6a70f5caf3b035af07ec3dce8cdce8d65",
+    "crates/agent-compose/src/lib.rs": "18837ec8b9a9dcc2ac68224c1561f3fa338ca36a2ffa5de1b2bbc999d4b3e85e",
+    "crates/agent-compose/tests/kv_cache_walk.rs": "bf19ddbc8d905c45a5cb0d16dd9aedc07a9c75261941c16792f68d5b21686521",
+    "crates/agent-compose/tests/kv_cache_walk/automatic.rs": "272f652c27e758338653985a86198fb77b68e46221105de50ff0e016291c755c",
+    "crates/provider-openai/src/lib.rs": "839ffd964b2d0bc2e7acf438af88899aeea0bb7e75d8904124f9ae78ddbadcd5",
+    "crates/provider-openai/src/reasoning.rs": "e2821b3ec3e0ffa209288cbfc24b76ea9966e12257a0f01f10689d2f38976dfb",
+    "crates/provider-openai/src/prompt_cache.rs": "a63deb1471001978b67cf3feb36aee2fd3a547da82b51f6e0f6c28e63a4184d3",
+    "crates/provider-openai/src/diagnostics.rs": "c6996b0d83e3e1fb65ff9c6bbf75d87608c310b760567fa5734168bab8a5ab3e",
+    "crates/provider-openai/src/responses.rs": "c16acea498291fc824b4d81c51c5f4891587b5340a410109ddffd394db15ace4",
+    "crates/provider-openai/src/sse.rs": "13c366d3509908500a1a990bbe7546d15509baabb43036ee5586f6e0d0fdefa8",
+    "crates/provider-openai/src/wire_names.rs": "91b04cc2af9e26161d538beab05766a56b670267a4e5410459bd196be1121016",
+    "docs/reviews/2026-09-10-cache-live/run_deepseek.py": "0d2ee7932e6be93543cb902f7b9e3e48cb4b7bcb6582d47e76bdecf01fa71915"
+  },
+  "unchanged_after_run": true
+}

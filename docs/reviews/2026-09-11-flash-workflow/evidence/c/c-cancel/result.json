@@ -1,0 +1,90 @@
+{
+  "segment": "c-cancel",
+  "argv": [
+    "D:\\Users\\Ye_Luo\\APP\\context-agent-prototype\\target\\debug\\agent-tui.exe",
+    "--grant-file=D:\\Users\\Ye_Luo\\APP\\context-agent-prototype\\target\\flash-workflow\\1789058357423842400\\c\\c-cancel\\grants.json",
+    "--max-rounds=4",
+    "--timeout-secs=1",
+    "--context=dynamic",
+    "--restore=latest",
+    "--continue",
+    "D:\\Users\\Ye_Luo\\APP\\context-agent-prototype\\target\\flash-workflow\\1789058357423842400\\c\\workspace"
+  ],
+  "exit_code": 1,
+  "wall_ms": 3742.83,
+  "forced_tree_stop": false,
+  "run_id": "bb692c4a-bd0d-40cc-bdc1-36cd821de27b",
+  "metrics": {
+    "event_counts": {
+      "model_started": 2,
+      "model_used": 1,
+      "tool_started": 2,
+      "tool_finished": 2,
+      "turn_completed": 0,
+      "turn_cancelled": 1,
+      "runtime_restored": 1,
+      "checkpoint_durable": 0,
+      "recovery_required": 0
+    },
+    "decision": {
+      "calls": 1,
+      "input_tokens": 2617,
+      "output_tokens": 79,
+      "cached_input_tokens": 1920,
+      "attempts": 1,
+      "retries": 0
+    },
+    "maintenance": {
+      "passes": 3,
+      "compactions": 0,
+      "compaction_input_tokens": 0,
+      "compaction_output_tokens": 0,
+      "deferred_folds": 0
+    },
+    "tools": [
+      {
+        "name": "fs.read",
+        "ok": true,
+        "artifact_ref": null,
+        "metadata": {
+          "bytes": 284,
+          "covers_file": true,
+          "end_line": 4,
+          "fs_read_motive": "checked-fresh",
+          "line_count": 4,
+          "line_ending": "crlf",
+          "path": "README.md",
+          "revision": "cc088a73928ef3c8d5fbcc416fe9f78484099d25dd3d492ac0ed2dd6aec8c2b2",
+          "start_line": 1
+        }
+      },
+      {
+        "name": "fs.read",
+        "ok": true,
+        "artifact_ref": null,
+        "metadata": {
+          "bytes": 1790,
+          "covers_file": true,
+          "end_line": 38,
+          "fs_read_motive": "checked-fresh",
+          "line_count": 38,
+          "line_ending": "crlf",
+          "path": "tests/test_links.py",
+          "revision": "ff4545a90f3f3e1068bda72ba11681ba2dd941d163696d9507efb1e565b06779",
+          "start_line": 1
+        }
+      }
+    ],
+    "session_end": {
+      "approval_denied": false,
+      "exit": 1,
+      "kind": "session_end",
+      "round_budget": false,
+      "schema": "agent.headless.v1",
+      "status": "timeout",
+      "stop": "timeout",
+      "task_completed": false,
+      "task_state": "none"
+    }
+  }
+}

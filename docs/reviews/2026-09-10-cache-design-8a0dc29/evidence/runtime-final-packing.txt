@@ -1,0 +1,16 @@
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.23s
+     Running unittests src\lib.rs (target\debug\deps\agent_runtime-88605f2970c3c27d.exe)
+
+running 9 tests
+test actor::model::failure_class_tests::model_failures_keep_semantic_class_and_retryability ... ok
+test actor::model::failure_class_tests::final_required_miss_revokes_settlement_from_the_sent_arm ... ok
+test actor::model::failure_class_tests::final_pack_drop_of_a_duplicate_that_stays_visible_is_not_a_miss ... ok
+test actor::model::failure_class_tests::final_pack_prefers_optional_and_records_required_budget_exclusion ... ok
+test actor::model::failure_class_tests::final_pack_partial_copy_does_not_cover_and_identical_text_does ... ok
+test actor::model::failure_class_tests::final_pack_coverage_requires_candidate_identity_and_complete_body ... ok
+test actor::model::failure_class_tests::only_the_latest_completion_result_arms_repair ... ok
+test actor::model::failure_class_tests::final_pack_complementary_windows_of_one_revision_record_the_required_miss ... ok
+test actor::model::failure_class_tests::settlement_diagnostics_are_the_only_common_envelope_and_audit_path ... ok
+
+test result: ok. 9 passed; 0 failed; 0 ignored; 0 measured; 368 filtered out; finished in 0.00s
+

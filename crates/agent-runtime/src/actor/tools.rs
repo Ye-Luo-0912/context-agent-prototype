@@ -939,15 +939,14 @@ impl RuntimeActor {
         if let Some(turn) = self.state.turn.as_mut() {
             turn.op = None;
         }
-        // W04: a maintenance completion resumes round preparation instead of
-        // settling the turn. Stale completions (cancelled/superseded turn)
+        // A maintenance completion resumes its parked actor phase. Stale
+        // completions (cancelled/superseded turn)
         // already returned above; the actor stays single-orchestrator.
         if completion.kind == OpKind::Maintenance {
             let report = completion
                 .maintenance
                 .expect("a maintenance completion carries its engine report");
-            self.continue_model_operation_after_maintenance(op_tx, report)
-                .await;
+            self.continue_after_maintenance(report, op_tx).await;
             return;
         }
         match completion.operation.outcome {
@@ -1044,7 +1043,7 @@ impl RuntimeActor {
                     } else if content.trim().is_empty() {
                         self.settle_aborted_turn().await;
                     } else {
-                        self.finalize_turn(content).await;
+                        self.finalize_turn(content, op_tx).await;
                     }
                     self.drain_queued_user_input(op_tx).await;
                     return;
@@ -1083,7 +1082,7 @@ impl RuntimeActor {
                     return;
                 }
                 if tool_calls.is_empty() {
-                    self.finalize_turn(content).await;
+                    self.finalize_turn(content, op_tx).await;
                     self.drain_queued_user_input(op_tx).await;
                 } else {
                     if let Some(turn) = self.state.turn.as_mut() {
@@ -1475,7 +1474,7 @@ impl RuntimeActor {
                 // off): spends a spent lease, may offer a fresh one.
                 self.settle_completion_opportunity().await;
                 if let Some(summary) = self.terminal_completion_summary() {
-                    self.finalize_terminal_completion(summary).await;
+                    self.finalize_terminal_completion(summary, op_tx).await;
                 } else if let Some(reason) = self.completion_gate_refusal() {
                     // The proposal exists but the acceptance gate refuses:
                     // surface it once per turn and return the decision to

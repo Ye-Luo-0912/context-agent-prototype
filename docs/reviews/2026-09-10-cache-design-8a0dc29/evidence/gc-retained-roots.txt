@@ -1,0 +1,9 @@
+   Compiling context-simple v0.1.0 (D:\Users\Ye_Luo\APP\context-agent-prototype\crates\context-simple)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 11.44s
+     Running unittests src\lib.rs (target\debug\deps\context_simple-4683cd0fba2d8791.exe)
+
+running 1 test
+test tests::residency::completion_boundary_storage_gc_honors_retained_checkpoint_roots ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 317 filtered out; finished in 0.01s
+

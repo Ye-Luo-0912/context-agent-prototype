@@ -30,15 +30,19 @@ fn exchange(turn: &mut TurnFrame, n: usize) {
         name: "context.manage".into(),
         arguments: json!({"op":"inspect", "limit":n + 1}),
     }]);
-    turn.push_tool_result(ToolOutput {
-        call_id: id,
-        tool_name: "context.manage".into(),
-        ok: true,
-        summary: format!("observation-{n}"),
-        model_content: format!("observation-{n}\n{}", "bounded result\n".repeat(40)),
-        artifact_ref: None,
-        metadata: json!({}),
-    }, None, ToolExecutionFacts::default());
+    turn.push_tool_result(
+        ToolOutput {
+            call_id: id,
+            tool_name: "context.manage".into(),
+            ok: true,
+            summary: format!("observation-{n}"),
+            model_content: format!("observation-{n}\n{}", "bounded result\n".repeat(40)),
+            artifact_ref: None,
+            metadata: json!({}),
+        },
+        None,
+        ToolExecutionFacts::default(),
+    );
 }
 
 fn encoded(messages: &[ModelMessage]) -> Vec<u8> {
@@ -53,10 +57,16 @@ fn encoded(messages: &[ModelMessage]) -> Vec<u8> {
 fn measure(a: &[ModelMessage], b: &[ModelMessage]) -> Value {
     let a_bytes = encoded(a);
     let b_bytes = encoded(b);
-    let shared = a_bytes.iter().zip(&b_bytes).take_while(|(a, b)| a == b).count();
-    let same_messages = a.iter().zip(b).take_while(|(a, b)| {
-        serde_json::to_value(a).unwrap() == serde_json::to_value(b).unwrap()
-    }).count();
+    let shared = a_bytes
+        .iter()
+        .zip(&b_bytes)
+        .take_while(|(a, b)| a == b)
+        .count();
+    let same_messages = a
+        .iter()
+        .zip(b)
+        .take_while(|(a, b)| serde_json::to_value(a).unwrap() == serde_json::to_value(b).unwrap())
+        .count();
     json!({"before_bytes":a_bytes.len(), "after_bytes":b_bytes.len(),
         "common_prefix_bytes":shared, "same_leading_messages":same_messages})
 }
@@ -81,60 +91,156 @@ fn pair(name: &str, a: &ModelInput, b: &ModelInput) -> Value {
 }
 
 fn main() {
-    let assembler = PromptAssembler::new("Deterministic review policy. Preserve authority and evidence.")
-        .with_runtime_facts(RuntimeFactsView::new("fixture-os", "fixture-arch", vec!["Cargo.toml".into()]));
-    let task = TaskAnchorView { original_goal:"repair a bounded worker".into(), revision:1, ..Default::default() };
-    let progress = TaskProgressView { anchor_revision:1, workspace_revision:1, ..Default::default() };
-    let history = MaterializedContext {
-        items:vec![item(1), item(2)],
-        diagnostics:ContextDiagnostics { total_items:2, resident_items:2, ..Default::default() },
+    let assembler =
+        PromptAssembler::new("Deterministic review policy. Preserve authority and evidence.")
+            .with_runtime_facts(RuntimeFactsView::new(
+                "fixture-os",
+                "fixture-arch",
+                vec!["Cargo.toml".into()],
+            ));
+    let task = TaskAnchorView {
+        original_goal: "repair a bounded worker".into(),
+        revision: 1,
         ..Default::default()
     };
-    let tools = vec![ToolSpec { name:"context.manage".into(), description:"bounded context access".into(),
-        input_schema:json!({"type":"object"}), ..Default::default() }];
+    let progress = TaskProgressView {
+        anchor_revision: 1,
+        workspace_revision: 1,
+        ..Default::default()
+    };
+    let history = MaterializedContext {
+        items: vec![item(1), item(2)],
+        diagnostics: ContextDiagnostics {
+            total_items: 2,
+            resident_items: 2,
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    let tools = vec![ToolSpec {
+        name: "context.manage".into(),
+        description: "bounded context access".into(),
+        input_schema: json!({"type":"object"}),
+        ..Default::default()
+    }];
     let assemble = |p: &TaskProgressView, h: &MaterializedContext, t: &TurnFrame| {
         assembler.assemble(None, Some(&task), Some(p), h, t, tools.clone())
     };
     let mut turn = TurnFrame::new("Repair the worker; preserve cancellation semantics.");
     exchange(&mut turn, 0);
     let base = assemble(&progress, &history, &turn);
-    let mut cases = vec![pair("identical_request_control", &base, &assemble(&progress, &history, &turn))];
+    let mut cases = vec![pair(
+        "identical_request_control",
+        &base,
+        &assemble(&progress, &history, &turn),
+    )];
     let mut next_progress = progress.clone();
-    next_progress.checked_files.push("src/worker.rs@rev-1".into());
-    cases.push(pair("progress_only", &base, &assemble(&next_progress, &history, &turn)));
+    next_progress
+        .checked_files
+        .push("src/worker.rs@rev-1".into());
+    cases.push(pair(
+        "progress_only",
+        &base,
+        &assemble(&next_progress, &history, &turn),
+    ));
     let mut next_turn = turn.clone();
     exchange(&mut next_turn, 1);
-    cases.push(pair("append_exchange_stable_other_layers", &base, &assemble(&progress, &history, &next_turn)));
-    cases.push(pair("append_exchange_and_progress", &base, &assemble(&next_progress, &history, &next_turn)));
+    cases.push(pair(
+        "append_exchange_stable_other_layers",
+        &base,
+        &assemble(&progress, &history, &next_turn),
+    ));
+    cases.push(pair(
+        "append_exchange_and_progress",
+        &base,
+        &assemble(&next_progress, &history, &next_turn),
+    ));
     let mut residency = history.clone();
     residency.diagnostics.resident_items = 1;
     residency.diagnostics.warm_items = 1;
-    cases.push(pair("diagnostics_only_same_bodies", &base, &assemble(&progress, &residency, &turn)));
+    cases.push(pair(
+        "diagnostics_only_same_bodies",
+        &base,
+        &assemble(&progress, &residency, &turn),
+    ));
     let mut attention = history.clone();
     attention.items[0].attention = AttentionState::Cooling;
-    cases.push(pair("attention_only_same_bodies", &base, &assemble(&progress, &attention, &turn)));
+    cases.push(pair(
+        "attention_only_same_bodies",
+        &base,
+        &assemble(&progress, &attention, &turn),
+    ));
     let mut reordered = history.clone();
     reordered.items.reverse();
-    cases.push(pair("selection_order_only_same_bodies", &base, &assemble(&progress, &reordered, &turn)));
+    cases.push(pair(
+        "selection_order_only_same_bodies",
+        &base,
+        &assemble(&progress, &reordered, &turn),
+    ));
     let mut long_turn = turn.clone();
-    for n in 1..8 { exchange(&mut long_turn, n); }
+    for n in 1..8 {
+        exchange(&mut long_turn, n);
+    }
     let checkpointed = assemble(&progress, &history, &long_turn);
     exchange(&mut long_turn, 8);
-    cases.push(pair("rolling_checkpoint_8_to_9", &checkpointed, &assemble(&progress, &history, &long_turn)));
-    let optional = ToolSpec { name:"fs.read".into(), description:"bounded file read".into(),
-        input_schema:json!({"type":"object"}), ..Default::default() };
-    let catalog = vec![ToolCatalogEntry {name:optional.name.clone(), state:ToolLifecycle::Available,
-        owner:"builtin".into(), description:optional.description.clone(), risk:ToolRisk::ReadOnly, roles:vec![]}];
-    let absent = assembler.assemble_with_catalog(None, Some(&task), Some(&progress), &history,
-        &turn, tools.clone(), &catalog, &[]);
+    cases.push(pair(
+        "rolling_checkpoint_8_to_9",
+        &checkpointed,
+        &assemble(&progress, &history, &long_turn),
+    ));
+    let optional = ToolSpec {
+        name: "fs.read".into(),
+        description: "bounded file read".into(),
+        input_schema: json!({"type":"object"}),
+        ..Default::default()
+    };
+    let catalog = vec![ToolCatalogEntry {
+        name: optional.name.clone(),
+        state: ToolLifecycle::Available,
+        owner: "builtin".into(),
+        description: optional.description.clone(),
+        risk: ToolRisk::ReadOnly,
+        roles: vec![],
+    }];
+    let absent = assembler.assemble_with_catalog(
+        None,
+        Some(&task),
+        Some(&progress),
+        &history,
+        &turn,
+        tools.clone(),
+        &catalog,
+        &[],
+    );
     let mut expanded = tools;
     expanded.push(optional);
-    let present = assembler.assemble_with_catalog(None, Some(&task), Some(&progress), &history,
-        &turn, expanded, &catalog, &[]);
-    cases.push(pair("load_tool_changes_schema_and_catalog", &absent, &present));
-    assert_eq!(cases[0]["production"]["common_prefix_bytes"], cases[0]["production"]["before_bytes"]);
-    assert!(cases[1]["production"]["common_prefix_bytes"].as_u64().unwrap()
-        < cases[1]["focus_at_tail_counterfactual"]["common_prefix_bytes"].as_u64().unwrap());
+    let present = assembler.assemble_with_catalog(
+        None,
+        Some(&task),
+        Some(&progress),
+        &history,
+        &turn,
+        expanded,
+        &catalog,
+        &[],
+    );
+    cases.push(pair(
+        "load_tool_changes_schema_and_catalog",
+        &absent,
+        &present,
+    ));
+    assert_eq!(
+        cases[0]["production"]["common_prefix_bytes"],
+        cases[0]["production"]["before_bytes"]
+    );
+    assert!(
+        cases[1]["production"]["common_prefix_bytes"]
+            .as_u64()
+            .unwrap()
+            < cases[1]["focus_at_tail_counterfactual"]["common_prefix_bytes"]
+                .as_u64()
+                .unwrap()
+    );
     assert_eq!(cases.last().unwrap()["tools_equal"], false);
     println!("{}", serde_json::to_string_pretty(&json!({
         "method":"Production PromptAssembler + ModelInput::into_messages; delimited contract JSON byte LCP. NOT provider tokens, hidden prefix, hit-rate, cost, or behavior equivalence.",
