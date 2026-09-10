@@ -186,7 +186,7 @@ PROCESS-01 的已关闭部分（Windows Job 围栏、Unix 管道 EOF 看门狗�
 | 现象 | 复现 | 影响 | 处理 |
 |---|---|---|---|
 | 多文件 `edit.patch` 的写集合要求单个 standing grant 前缀覆盖全部目标；按文件分别授权时批量 patch 永远被拒（同路径单文件 `edit.replace` 可过） | 真二进制 live：两个分文件 grant + 跨两文件的 edit.patch → `tool denied by approval policy`（`agent-core/src/approval.rs` `grant_matches` 的 `WorkspaceWriteSet` 分支） | 可用性限制，方向 fail-closed，无权限扩大 | 有意保守设计，维持；需要时给操作者「组合 grant/公共前缀」的使用指引，或多 grant 交集匹配需单独设计评审 |
-| 恢复会话的无头 `session_end.task_state` 报 `none`，尽管 restore 后有活动任务并完成了 continue | `--restore=latest --continue` 后看 JSONL 末行（Drain 只统计本进程 live 事件） | 低：少报不虚报；脚本侧待审阅语义在恢复会话失真 | backlog；2026-09-11 Flash 两次冷恢复再次复现（见 [走查证据](reviews/2026-09-11-flash-workflow/REPORT.md)）；应由类型化恢复/状态快照初始化 Drain 的 task_active |
+| 恢复会话的无头 `session_end.task_state` 报 `none`，尽管 restore 后有活动任务并完成了 continue | `--restore=latest --continue` 后看 JSONL 末行（Drain 只统计本进程 live 事件） | 低：少报不虚报；脚本侧待审阅语义在恢复会话失真 | **已修复（2026-09-11）**：headless Drain 用类型化 `status_snapshot().focus_task_id` 初始化 `task_active`，live 事件增量照旧；e2e 回归 `e2e_restored_active_task_reports_awaiting_operator_review` 在旧实现下失败、修复后通过（恢复＋continue → `awaiting_operator_review`）。2026-09-11 Flash 两次冷恢复复现记录见 [走查证据](reviews/2026-09-11-flash-workflow/REPORT.md) |
 
 ## 什么不自动打断主线
 

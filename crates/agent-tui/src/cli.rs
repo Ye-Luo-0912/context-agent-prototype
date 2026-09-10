@@ -347,13 +347,18 @@ pub async fn run_headless<W: Write + Send + 'static>(
         }
     }
 
+    // The typed status snapshot initializes task_active: a restored
+    // session's active task never appears in this process's live events,
+    // so live-events-only observation under-reported restored sessions as
+    // `none` (backlog; reproduced by the 2026-09-11 Flash cold resumes).
+    let task_active_at_start = handle.status_snapshot().await?.focus_task_id.is_some();
     let mut outcome = Drain {
         turn_completed: false,
         turn_cancelled: false,
         commit_failed: false,
         recovery_required: false,
         task_completed: false,
-        task_active: false,
+        task_active: task_active_at_start,
         round_budget: false,
         approval_denied: false,
         other_failure: None,
@@ -1445,6 +1450,97 @@ mod tests {
         assert!(
             text.contains("task.manage") || text.contains("task_tool_requirements_changed"),
             "{text}"
+        );
+    }
+
+    /// A restored session's active task never appears in this process's
+    /// live events, so the drain previously under-reported restored
+    /// sessions as `session_end.task_state = none` even though the
+    /// continue kept the task active (backlog; reproduced by the
+    /// 2026-09-11 Flash cold resumes). The drain initializes `task_active`
+    /// from the typed status snapshot instead.
+    #[tokio::test]
+    async fn e2e_restored_active_task_reports_awaiting_operator_review() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().to_path_buf();
+
+        // ---- Session 1: one work turn leaves an active task; save it. ----
+        let composed = product_compose(&root, &[], Arc::new(MockModelTransport), None)
+            .await
+            .unwrap();
+        let mut events = composed.subscribe();
+        composed.instance.start().await.unwrap();
+        let (outcome, _jsonl) = run_headless(
+            composed.handle().clone(),
+            &mut events,
+            HeadlessAction::Prompt {
+                text: "demo: first segment".into(),
+                work: true,
+            },
+            Duration::from_secs(30),
+            Vec::new(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(outcome.exit, EXIT_OK, "{outcome:?}");
+        let saved = composed.instance.checkpoint().await.unwrap();
+        assert!(
+            saved.current_task_id.is_some(),
+            "the saved session must hold an active task"
+        );
+        let checkpoints_dir = composed.workspace.state_dir().join("checkpoints");
+        let store = agent_runtime::CheckpointStore::new(&checkpoints_dir);
+        store
+            .write_atomic(&serde_json::to_vec(&saved).unwrap())
+            .await
+            .unwrap();
+        composed.shutdown().await.unwrap();
+
+        // ---- Session 2: restore, then continue through the headless
+        // drain — exactly the `--restore=latest --continue` shape. ----
+        let composed = product_compose(&root, &[], Arc::new(MockModelTransport), None)
+            .await
+            .unwrap();
+        let mut events = composed.subscribe();
+        composed.instance.start().await.unwrap();
+        let resolved = crate::session::resolve_latest_checkpoint(&checkpoints_dir).unwrap();
+        let checkpoint = crate::session::load_runtime_checkpoint(&resolved).unwrap();
+        composed.instance.restore(checkpoint).await.unwrap();
+        assert!(
+            composed
+                .handle()
+                .status_snapshot()
+                .await
+                .unwrap()
+                .focus_task_id
+                .is_some(),
+            "the restored session must hold the active task"
+        );
+
+        let (outcome, jsonl) = run_headless(
+            composed.handle().clone(),
+            &mut events,
+            HeadlessAction::Continue,
+            Duration::from_secs(30),
+            Vec::new(),
+        )
+        .await
+        .unwrap();
+        composed.shutdown().await.unwrap();
+        assert_eq!(outcome.exit, EXIT_OK, "{outcome:?}");
+        assert!(
+            !outcome.task_completed,
+            "a plain final stays pending review"
+        );
+        let text = String::from_utf8(jsonl).unwrap();
+        assert!(
+            text.contains("turn_completed"),
+            "the continue must run a real turn: {text}"
+        );
+        let end = session_end(&text);
+        assert_eq!(
+            end["task_state"], "awaiting_operator_review",
+            "the restored active task must not be under-reported as none: {end}"
         );
     }
 }
