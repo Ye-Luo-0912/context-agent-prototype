@@ -6,7 +6,7 @@
 
 文档主审查基线：`2b43186b005b5e86172037f98206f4417c7e2bca`；收尾新增提交核对：`278280146df5934828962253507553762693f494`（东京时间 2026-09-14 06:19:53）。采用本文前仍须核对实际分支与工作树。
 
-已知 CI：前一 SHA `2b43186b` 的 run `34777279921` 成功；新 SHA `27828014` 的 run `34783505990` 首次运行失败，Linux/Windows 在 Clippy 步骤失败，后续 Rust 测试矩阵被跳过。Linux 日志定位到 `tool-runtime/src/tools/session.rs:2156` 的布尔 assert_eq 写法。修复和重验属于小型集成收口；前一提交的 green 不外推到本提交。
+已知 CI（2026-09-14 更新）：clippy 阻塞与一个遗留禁用的 A2 grace 重置均已修复，run `34786157399`（`4f2fb74f`）七 job 全绿；B2 完整性收口与 C 线 wire 验收随后以 `44cdd6dd` 入 main，其 CI 结果以远端 run 记录为准。
 
 新提交已包含 A1–A3 与 C 线 KV 接线相关改动，不再按“仅本地回执、代码尚未提交”派工。下一动作是核对新增实现/必要边界、修复当前 CI 阻塞并完成原验收，而不是重新生成 N04–N10 实现。新提交完整 diff 尚未逐行审阅，不能从提交说明推出所有行为已获独立确认。
 
@@ -22,7 +22,7 @@ B1–B3（本轮 N01–N03）修复已进入 main：保护性卡片清理、pend
 
 A1–A3 与 C1–C2 原回执记录的是本地实现；其相关代码现已随 `27828014` 进入 main，但本 SHA 的 CI/端到端验收未关闭。原记录：[A 线](reviews/2026-09-14-backend-review-6eda2474/A_LINE_A1_A2_A3_IMPLEMENTATION.md)、[C 线](reviews/2026-09-14-backend-review-6eda2474/C_LINE_C1_C2_IMPLEMENTATION.md)。下一动作和验收归 NEXT_TASKS。
 
-本次续审发现 B2 的调用方残余：`hydrate_all_pending_cards` 可因暂时 I/O 失败而提前返回，部分 owner 仍 pending；Storage GC/reconcile 等调用方没有因此降低完整性判定。控制流已静态核对，故障注入回归尚未在审查环境执行。它是既有修复的接缝，不是否定全部 B 线成果。
+B2 的调用方残余已关闭：hydration 完整性现在传播到 GC/reconcile（pending 未读时不可逆删除延期、search 不把未读页报成完整零命中），[回执与回归](reviews/2026-09-14-backend-review-6eda2474/STAGE_CLOSING_JOURNEY_RECEIPT.md)。
 
 正式 `agent-host` 未指定策略时仍默认 Rolling；Dynamic 是可选实现。不能用 `state.json` 中旧的 dynamic 默认记录替代实际入口配置。配置依据放在 [CONFIGURATION.md](CONFIGURATION.md)，更改默认值属于单独产品决定。
 

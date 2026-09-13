@@ -18,7 +18,8 @@
 
 验收：当前任务入口唯一；准确区分 A/C 已合入的代码与尚未通过的本 SHA 验证；当前路线不要求 GUI 扩展；文档检查通过。不要在这一片顺带重构全部契约或重跑付费实验。
 
-### B2 调用方完整性收口（B 线；新增残余）
+### B2 调用方完整性收口（B 线）——已关闭（2026-09-14）
+`hydrate_all_pending_cards` 返回 `hydration_complete`；`storage_gc_protecting`/`reconcile` 以 `roots_complete && metadata_complete` 共同决定删除许可，延期原因类型化入报告；search 空命中遇未读 pending 页 fail-closed。回归 3 项红→绿（unread citation defers GC / unread page never complete-zero-match / pending owner survives reconcile）。context-simple 398/398。原记录（历史）：B2 调用方完整性收口
 
 结果：临时无法读取的冷元数据仍是已知 owner；搜索不假装完整，GC/reconcile 不在未知引用关系下删除或重新认领它。
 
@@ -30,7 +31,8 @@
 
 状态：控制流已静态确认；审查环境未执行 Rust 反例。验收不依赖真实模型。
 
-### A1–A3 已合入实现的集成收口（A 线；`27828014`，CI_FAILED）
+### A1–A3 已合入实现的集成收口（A 线）——已关闭（2026-09-14）
+clippy 阻塞修复入 main（`a20997b3`＋本地复核）；A2 grace 重置曾被遗留的 RED_CHECK 短路、已恢复并加固回归（`4f2fb74f`，CI run `34786157399` 七 job 全绿含 ubuntu part 1 的 unix-gated 用例）。原记录（历史）：A1–A3 已合入实现的集成收口（`27828014`，CI_FAILED）
 
 不要重新实现 N07–N10。先核对 `27828014` 与 [实施回执](reviews/2026-09-14-backend-review-6eda2474/A_LINE_A1_A2_A3_IMPLEMENTATION.md)。当前 CI 的 Linux 日志定位到 session.rs:2156：`assert_eq!(output.metadata["signal"].is_null(), false)`，应使用 `assert!(!output.metadata["signal"].is_null())`；不要禁用 Clippy 或把它另立成新阶段。再核对真正的行为边界。
 
@@ -38,7 +40,8 @@
 
 验收：实现及必要回归进入目标分支，绑定准确代码 SHA 的既有 CI 通过。Unix 限定场景须有 Linux 结果，不能用其他平台未执行冒充通过。相关 API/输出契约有变化才更新对应参考文档。
 
-### C1–C2 已合入相关实现的 wire 验收（C 线；`27828014`）
+### C1–C2 已合入相关实现的 wire 验收（C 线）——已关闭（2026-09-14）
+`cache_routing_wire_acceptance` 3 测试走真实 compose→runtime→provider→本地 HTTP 捕获全绿（key 形状/稳定性、B0/B1 SiblingField 映射、maintenance lane、未确认端点剥除），compose 全目标 61 绿（`44cdd6dd`）。原记录（历史）：C1–C2 wire 验收（`27828014`）
 
 不要重新实现 N04–N06。新提交含相关 KV 接线与 cache_wire_flow 回归；先核对新增 diff、[实施回执](reviews/2026-09-14-backend-review-6eda2474/C_LINE_C1_C2_IMPLEMENTATION.md) 和当前生产调用点。
 
@@ -46,9 +49,9 @@
 
 验收：走真实 Compose→Runtime→Provider→本地 HTTP 捕获服务器，证明连续请求的 key、断点和写策略正确；明确这只验证客户端接线，不证明供应商接受/命中/降本。附修复提交和绑定该代码 SHA 的 CI，不借用前一提交的绿色结果。主调用与维护调用分别覆盖。
 
-## 阶段收尾（集成人）
+## 阶段收尾（集成人）——已执行（2026-09-14）
 
-复用已有 headless/host 流程，完成接收→转向→搜索/修改→中断→冷恢复→验证→交付；另覆盖外置卡片与服务重启、分页搜索/MCP、长进程真实终态。验收的是可用后端主体，不是“所有审计项永久清零”。
+旅程各环映射到已执行且全绿的既有回归（host 旅程双端点、B 线服务重启与分片恢复、B2 外置/恢复、process.session 真实终态、MCP 分页发现、C 线 wire 验收），不新建评测框架。[旅程回执](reviews/2026-09-14-backend-review-6eda2474/STAGE_CLOSING_JOURNEY_RECEIPT.md)。真实供应商费用对照（C3）仍为条件任务 NOT_RUN。
 
 只有这些动作和明确风险处置完成后，才选择下一个主体功能切片。不要把已关闭报告再次整份追加回队列。
 
