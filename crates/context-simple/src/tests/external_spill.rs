@@ -303,6 +303,7 @@ async fn reconcile_cleans_orphan_cards_and_honors_protection() {
         &resident_ids,
         &protected,
         true,
+        true,
     )
     .await;
     assert_eq!(
@@ -368,6 +369,7 @@ async fn an_incomplete_root_enumeration_defers_card_deletion() {
         &std::collections::HashSet::new(),
         &[],
         false,
+        true,
     )
     .await;
     assert_eq!(
@@ -388,6 +390,7 @@ async fn an_incomplete_root_enumeration_defers_card_deletion() {
         &std::collections::HashMap::new(),
         &std::collections::HashSet::new(),
         &[],
+        true,
         true,
     )
     .await;

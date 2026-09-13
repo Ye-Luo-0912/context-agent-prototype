@@ -1196,12 +1196,21 @@ pub(crate) fn reattach_owner_metadata(
 /// From any referenced record the closure traverses strong edges only, so
 /// external -> external chains survive exactly when each hop is a strong
 /// citation.
+///
+/// B2: the closure only sees edges of *installed* entries. A pending spill
+/// row is a live owner whose metadata — and therefore whose outgoing strong
+/// edges — is not in memory, so callers pass `metadata_complete: false`
+/// whenever the hydration drain left rows unread. The three rules:
+/// - a pending owner is not an ownerless entry;
+/// - recovery-root completeness is not metadata/dependency completeness;
+/// - while completeness is unknown, irreversible deletion defers.
 pub(crate) fn plan_storage_gc(
     state: &State,
     config: &SimpleContextConfig,
     now_tick: u64,
     protected_recovery_roots: &[ContextItemId],
     roots_complete: bool,
+    metadata_complete: bool,
 ) -> StorageGcPlan {
     fn non_deletable(entry: &ExternalizedContext) -> bool {
         !entry.semantic.is_dead()
@@ -1255,10 +1264,12 @@ pub(crate) fn plan_storage_gc(
 
     let mut anchor_roots_protected = 0usize;
     let mut anchor_root_protections = Vec::new();
-    // W03: an incomplete root enumeration cannot prove there is no
-    // retained owner — defer every deletion rather than treat read failure
-    // as "nothing is retained".
-    let candidates = if roots_complete {
+    // W03/B2: an incomplete root enumeration cannot prove there is no
+    // retained owner, and unread pending metadata cannot prove there is no
+    // unreferenced candidate — both defer every deletion rather than wrap a
+    // read failure into a false all-orphan verdict.
+    let deletion_permitted = roots_complete && metadata_complete;
+    let candidates = if deletion_permitted {
         state
             .external
             .iter()
@@ -1298,7 +1309,8 @@ pub(crate) fn plan_storage_gc(
         candidates,
         anchor_roots_protected,
         anchor_root_protections,
-        deletion_deferred: !roots_complete,
+        deletion_deferred: !deletion_permitted,
+        deletion_deferred_because_metadata: !metadata_complete,
     }
 }
 
@@ -1309,9 +1321,14 @@ pub(crate) struct StorageGcPlan {
     /// claim protects them.
     pub(crate) anchor_roots_protected: usize,
     pub(crate) anchor_root_protections: Vec<agent_contracts::AnchorRootProtection>,
-    /// W03: the root enumeration was incomplete — the pass deliberately
-    /// deleted nothing and the report must say so.
+    /// W03/B2: an enumeration was incomplete (retained roots, or unread
+    /// pending metadata) — the pass deliberately deleted nothing and the
+    /// report must say so.
     pub(crate) deletion_deferred: bool,
+    /// B2: the deferral was caused by unread pending spill metadata (as
+    /// opposed to an incomplete retained-root enumeration), so the report
+    /// names the actual cause.
+    pub(crate) deletion_deferred_because_metadata: bool,
 }
 
 /// Phase 2 (no lock held): remove the planned store files. Real IO errors
@@ -1406,11 +1423,19 @@ pub(crate) fn commit_storage_gc(
     report.scanned = state.external.len() + report.deleted;
     report.anchor_roots_protected = plan.anchor_roots_protected;
     report.anchor_root_protections = plan.anchor_root_protections;
-    // W03: an incomplete retained-root enumeration deferred every deletion.
+    // W03/B2: an incomplete enumeration deferred every deletion. The report
+    // names the actual cause: unread pending spill metadata (dependency
+    // edges unknown) or an incomplete retained-root enumeration.
     if plan.deletion_deferred {
         report
             .reasons
-            .push("deletion deferred: retained-checkpoint recovery roots are incomplete".into());
+            .push(if plan.deletion_deferred_because_metadata {
+                "deletion deferred: pending spill metadata is unread — owners and dependency \
+             edges are not fully visible"
+                    .into()
+            } else {
+                "deletion deferred: retained-checkpoint recovery roots are incomplete".into()
+            });
     }
     // Explainable reason rows are a bounded collector; the typed counters
     // above remain the authoritative totals.
@@ -1428,7 +1453,7 @@ pub(crate) fn run_storage_gc(
     config: &SimpleContextConfig,
     now_tick: u64,
 ) -> StorageGcReport {
-    let plan = plan_storage_gc(state, config, now_tick, &[], true);
+    let plan = plan_storage_gc(state, config, now_tick, &[], true, true);
     let dir = store_dir(config);
     let io = plan
         .candidates
@@ -1512,7 +1537,7 @@ pub(crate) async fn run_reconcile_io(
     map_checksums: &HashMap<ContextItemId, Option<String>>,
     resident_ids: &HashSet<ContextItemId>,
 ) -> ReconcileIo {
-    run_reconcile_io_protecting(dir, map_checksums, resident_ids, &[], true).await
+    run_reconcile_io_protecting(dir, map_checksums, resident_ids, &[], true, true).await
 }
 
 /// Phase 2 of the reconcile (no lock held): scan the store directory, read
@@ -1525,12 +1550,20 @@ pub(crate) async fn run_reconcile_io(
 /// the newer one's residency (R03). Blobs the map owns are kept when their
 /// checksum matches; corrupt / id-mismatched blobs are moved to
 /// `quarantine/`; abandoned `.tmp` files are removed.
+///
+/// B2: `metadata_complete` is false when the caller's hydration drain left
+/// pending spill rows unread. Each such row is a live owner (pending owner
+/// is not ownerless) whose state this scan cannot see, so the irreversible
+/// deletion branches — the stale-duplicate sweep and the orphan-card sweep
+/// — defer with their own reason rows instead of turning a read failure
+/// into a deletion.
 pub(crate) async fn run_reconcile_io_protecting(
     dir: &Path,
     map_checksums: &HashMap<ContextItemId, Option<String>>,
     resident_ids: &HashSet<ContextItemId>,
     protected: &[ContextItemId],
     roots_complete: bool,
+    metadata_complete: bool,
 ) -> ReconcileIo {
     let protected: HashSet<ContextItemId> = protected.iter().copied().collect();
     let mut io = ReconcileIo::default();
@@ -1675,10 +1708,26 @@ pub(crate) async fn run_reconcile_io_protecting(
             // still-retained checkpoint's restore (R03), so it is kept even
             // though the current view made the id resident.
             None => {
-                if resident_ids.contains(&item_id)
-                    && !protected.contains(&item_id)
-                    && roots_complete
-                {
+                if !resident_ids.contains(&item_id) {
+                    io.rebuilt_candidates.push((item, checksum));
+                } else if !roots_complete {
+                    // W03: with the root enumeration incomplete, residency
+                    // alone cannot prove the blob is a stale duplicate.
+                    io.reasons.push(format!(
+                        "kept blob {name}: root enumeration incomplete, deletion deferred (W03)"
+                    ));
+                } else if !metadata_complete {
+                    // B2: unread pending metadata — this scan's ownerless
+                    // verdict is not trustworthy, so no irreversible
+                    // deletion runs.
+                    io.reasons.push(format!(
+                        "kept blob {name}: pending spill metadata unread, deletion deferred"
+                    ));
+                } else if protected.contains(&item_id) {
+                    io.reasons.push(format!(
+                        "kept blob {name}: id is resident but a retained checkpoint still references it as a recovery root"
+                    ));
+                } else {
                     match tokio::fs::remove_file(&path).await {
                         Ok(()) => {
                             io.deleted_stale += 1;
@@ -1691,16 +1740,6 @@ pub(crate) async fn run_reconcile_io_protecting(
                                 .push(format!("could not remove stale blob {name}: {e}"));
                         }
                     }
-                } else if resident_ids.contains(&item_id) && !roots_complete {
-                    io.reasons.push(format!(
-                        "kept blob {name}: root enumeration incomplete, deletion deferred (W03)"
-                    ));
-                } else if resident_ids.contains(&item_id) {
-                    io.reasons.push(format!(
-                        "kept blob {name}: id is resident but a retained checkpoint still references it as a recovery root"
-                    ));
-                } else {
-                    io.rebuilt_candidates.push((item, checksum));
                 }
             }
         }
@@ -1782,9 +1821,18 @@ pub(crate) async fn run_reconcile_io_protecting(
             // N01: with the recovery-root enumeration incomplete, "absent
             // from the known protected set" proves nothing; deletion defers
             // exactly like the blob sweep's stale-duplicate branch (W03).
+            // B2: the same holds when pending spill metadata was unread —
+            // the card may be a live pending owner's only metadata, and
+            // pending owner is not ownerless.
             if !roots_complete {
                 io.reasons.push(format!(
                     "kept card {name}: root enumeration incomplete, deletion deferred"
+                ));
+                continue;
+            }
+            if !metadata_complete {
+                io.reasons.push(format!(
+                    "kept card {name}: pending spill metadata unread, deletion deferred"
                 ));
                 continue;
             }
@@ -2617,9 +2665,15 @@ mod tests {
         state.items.push(item);
         let resident: HashSet<_> = [id].into_iter().collect();
         let protected = [id];
-        let io =
-            run_reconcile_io_protecting(dir.path(), &HashMap::new(), &resident, &protected, true)
-                .await;
+        let io = run_reconcile_io_protecting(
+            dir.path(),
+            &HashMap::new(),
+            &resident,
+            &protected,
+            true,
+            true,
+        )
+        .await;
         let report = commit_reconcile(&mut state, io, 1, 1);
         assert_eq!(
             report.deleted_stale, 0,
@@ -3104,7 +3158,7 @@ mod tests {
         }
 
         let now_tick = 100;
-        let plan = plan_storage_gc(&state, &config, now_tick, &[], true);
+        let plan = plan_storage_gc(&state, &config, now_tick, &[], true, true);
         let planned: HashSet<ContextItemId> = plan.candidates.iter().map(|(id, _)| *id).collect();
 
         // The manual closure's complement: dead, retention-eligible, old and

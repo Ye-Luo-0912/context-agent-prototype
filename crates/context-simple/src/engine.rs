@@ -1064,11 +1064,19 @@ impl SimpleContextEngine {
         let mut state = self.state.lock().await;
         let mut claimed = Vec::new();
         for (item_id, hash, entry) in found {
-            // Someone else may own this id now (a rebuild, an admit). The
-            // live owner wins; a paged-in card never creates a second owner.
+            // Someone else may own this id now (a reconcile rebuild, an
+            // admit). The live owner wins; a paged-in card never creates a
+            // second owner. B2: the read verified and the row's promise is
+            // already fulfilled, so the redundant row is consumed — leaving
+            // it queued would make every later drain re-read this card
+            // forever and report the external set as incomplete, deferring
+            // deletions indefinitely.
             if state.external.get(item_id).is_some()
                 || crate::store::catalog_body(&state, item_id).is_some()
             {
+                state
+                    .pending_external_cards
+                    .retain(|(id, _)| *id != item_id);
                 continue;
             }
             // N03: a card whose entry references a scope this state does not
@@ -1118,12 +1126,21 @@ impl SimpleContextEngine {
     /// F2: drain every pending spill row, in bounded batches. Callers that
     /// need the complete external set (search, GC planning) use this: the
     /// per-batch I/O stays bounded, the total is paid once after a restore.
-    async fn hydrate_all_pending_cards(&self) {
+    ///
+    /// B2: returns whether the drain ended with the complete external set in
+    /// memory. `false` means rows remain that this pass could not read
+    /// (transient I/O) — the queue keeps them (N02), and the caller owns the
+    /// consequence: its view of owners and dependency edges is *incomplete*.
+    /// The three rules this propagates (see `plan_storage_gc`):
+    /// - a pending owner is not an ownerless entry;
+    /// - recovery-root completeness is not metadata/dependency completeness;
+    /// - while completeness is unknown, irreversible deletion defers.
+    async fn hydrate_all_pending_cards(&self) -> bool {
         let batch = self.config.external_restore_card_batch.max(1);
         loop {
             let pending_len = self.state.lock().await.pending_external_cards.len();
             if pending_len == 0 {
-                return;
+                return true;
             }
             let installed = self.hydrate_pending_cards(batch).await;
             // N02: a batch that installs nothing and consumes nothing hit
@@ -1133,9 +1150,36 @@ impl SimpleContextEngine {
             // retry loop.
             let remaining = self.state.lock().await.pending_external_cards.len();
             if installed == 0 && remaining == pending_len {
-                return;
+                // B2: the batch hit only unreadable cards. Report the drain
+                // as incomplete instead of letting the caller plan as if
+                // the partial external set were the whole one.
+                return false;
             }
         }
+    }
+
+    /// B2: report search hits — unless the result is empty while pending
+    /// spill pages were left unread this pass. In that state the catalog
+    /// could not see those cold bodies at all, so an empty `Ok` would read
+    /// as a complete zero-match over the whole external set. Same fail-closed
+    /// rule as the checked stored-read phase: a coverage failure is surfaced
+    /// as a typed error, never folded into an authoritative-looking "no
+    /// matches". Partial hits are returned as-is; the caller-facing search
+    /// is bounded and ranked, so non-empty results never claimed completeness.
+    async fn finish_search_hits(
+        &self,
+        hydration_complete: bool,
+        hits: Vec<agent_contracts::ExternalizedContext>,
+    ) -> AgentResult<Vec<agent_contracts::ExternalizedContext>> {
+        if hydration_complete || !hits.is_empty() {
+            return Ok(hits);
+        }
+        let unread = self.state.lock().await.pending_external_cards.len();
+        Err(AgentError::Context(format!(
+            "context search coverage incomplete: {unread} pending spill page(s) could not be \
+             read this pass and may contain matches; reporting an empty result would be a \
+             false zero-match"
+        )))
     }
 
     /// One card read with the regression gates applied: the deterministic
@@ -1961,7 +2005,10 @@ impl ContextEngine for SimpleContextEngine {
         // Storage GC remains the only other deleter.
         //
         // F2: a pass plans against the whole external set, so pending spill
-        // rows page in first (bounded batches, off-lock).
+        // rows page in first (bounded batches, off-lock). B2: the full pass
+        // deletes no blobs — recall, reconcile and Storage GC own deletion —
+        // so an unread pending row only means its entry is not aged this
+        // pass; that is conservative and needs no deferral here.
         self.hydrate_all_pending_cards().await;
         let mut state = self.state.lock().await;
         state.event_seq += 1;
@@ -2013,7 +2060,14 @@ impl ContextEngine for SimpleContextEngine {
         // not in memory. Page the rows in before the sweep decides what is
         // orphaned, so paging can never turn into deletion or a re-owned
         // duplicate.
-        self.hydrate_all_pending_cards().await;
+        //
+        // B2: a row the drain could not read stays a live owner whose card
+        // must survive this pass — pending owner is not ownerless, and root
+        // completeness is not metadata completeness. The unread rows fold
+        // into the same typed defer as an incomplete root enumeration, so
+        // the stale-duplicate and orphan-card sweeps cannot turn a read
+        // failure into a deletion.
+        let hydration_complete = self.hydrate_all_pending_cards().await;
         let (map_checksums, resident_ids) = {
             let mut state = self.state.lock().await;
             state.event_seq += 1;
@@ -2042,6 +2096,7 @@ impl ContextEngine for SimpleContextEngine {
             &resident_ids,
             protected,
             roots_complete,
+            hydration_complete,
         )
         .await;
         let mut state = self.state.lock().await;
@@ -2384,7 +2439,12 @@ impl ContextEngine for SimpleContextEngine {
         // F2: search coverage is unchanged by restore paging — a pending
         // spill row is paged in first (bounded batches) so the catalog and
         // the residual scan see the same external set they always did.
-        self.hydrate_all_pending_cards().await;
+        //
+        // B2: the drain outcome decides whether an empty result may be
+        // reported. A row left unread is a cold entry whose body the catalog
+        // cannot see; an empty hit list in that state is NOT a complete
+        // zero-match, so it fails closed below instead.
+        let hydration_complete = self.hydrate_all_pending_cards().await;
         let read_plan = {
             let mut state = self.state.lock().await;
             state.sync_catalog();
@@ -2397,7 +2457,7 @@ impl ContextEngine for SimpleContextEngine {
                 crate::access::reinforce_search_hits(&mut state, &hits, &query);
                 drop(state);
                 self.record_search_observation(ContextSearchObservation::default());
-                return Ok(hits);
+                return self.finish_search_hits(hydration_complete, hits).await;
             }
             let read_plan = crate::store::plan_stored_search_reads(&state, &query)?;
             if read_plan.is_empty() {
@@ -2405,7 +2465,7 @@ impl ContextEngine for SimpleContextEngine {
                 crate::access::reinforce_search_hits(&mut state, &hits, &query);
                 drop(state);
                 self.record_search_observation(ContextSearchObservation::default());
-                return Ok(hits);
+                return self.finish_search_hits(hydration_complete, hits).await;
             }
             read_plan
         };
@@ -2431,7 +2491,7 @@ impl ContextEngine for SimpleContextEngine {
         crate::access::reinforce_search_hits(&mut state, &hits, &query);
         drop(state);
         self.record_search_observation(observation);
-        Ok(hits)
+        self.finish_search_hits(hydration_complete, hits).await
     }
 
     fn last_search_observation(&self) -> ContextSearchObservation {
@@ -2755,7 +2815,14 @@ impl ContextEngine for SimpleContextEngine {
         // F2: deletion must see every owner. A pending spill row's metadata
         // is not in memory, so it pages in before the plan — paging is never
         // allowed to look like an unreferenced blob.
-        self.hydrate_all_pending_cards().await;
+        //
+        // B2: a row the drain could not read (transient I/O) is still a live
+        // owner whose dependency edges are invisible to the planner — adding
+        // the pending *id* to the roots would not reveal its edges. Pending
+        // owner is not ownerless, and root completeness is not metadata
+        // completeness: with unread cold metadata the deletion branch defers
+        // exactly like an incomplete root enumeration.
+        let hydration_complete = self.hydrate_all_pending_cards().await;
         let plan = {
             let mut state = self.state.lock().await;
             state.event_seq += 1;
@@ -2766,6 +2833,7 @@ impl ContextEngine for SimpleContextEngine {
                 now_tick,
                 protected_recovery_roots,
                 roots_complete,
+                hydration_complete,
             )
         };
         let dir = store::store_dir(&self.config);
