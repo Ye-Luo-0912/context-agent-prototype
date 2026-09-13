@@ -157,6 +157,8 @@ public class WorkbenchIntegrationTests
         run_started = true,
         run_completed = approved,
         watermark = approved ? 42ul : 40ul,
+        run_id = "00000000-0000-4000-8000-000000000031",
+        workspace_root = "/workspaces/test",
         focus = (object?)null,
         tasks = Array.Empty<object>(),
         pending_approvals = approved
@@ -256,14 +258,14 @@ public class WorkbenchIntegrationTests
             // 1. Typed submit receipt.
             viewModel.GoalInput = "n4 集成链路：类型化提交到事件审批终态";
             await viewModel.SubmitForTestsAsync();
-            Assert.Contains("已受理", viewModel.OutputText);
-            Assert.Contains(TaskId, viewModel.OutputText);
+            Assert.Contains("已受理", viewModel.LogText);
+            Assert.Contains(TaskId, viewModel.LogText);
 
             // 2. The typed tool event reached the pump and was rendered.
             await WaitUntilAsync(
-                () => viewModel.OutputText.Contains("tool_started"),
+                () => viewModel.LogText.Contains("tool_started"),
                 "typed tool event line",
-                diagnostics: () => $"IsConnected={connection.IsConnected}{Environment.NewLine}output=<<{viewModel.OutputText}>>");
+                diagnostics: () => $"IsConnected={connection.IsConnected}{Environment.NewLine}output=<<{viewModel.OutputText}>>log=<<{viewModel.LogText}>>");
 
             // 3. The approval row carries the gate's typed risk and the
             // bounded target summary — informed approval, not a bare id.
@@ -277,7 +279,7 @@ public class WorkbenchIntegrationTests
             // 4. The operator answers; the receipt is the typed Delivered
             // outcome and the honest fact is rendered.
             await viewModel.RespondApprovalForTestsAsync(ApprovalRequestId, ApprovalDecision.Allow);
-            Assert.Contains($"审批 {ApprovalRequestId} 已送达：Allow", viewModel.OutputText);
+            Assert.Contains($"审批 {ApprovalRequestId} 已送达：Allow", viewModel.LogText);
 
             // 5. The follow-up refresh (driven by the respond path AND the
             // terminal event) applies the server's post-decision snapshot:
@@ -289,11 +291,11 @@ public class WorkbenchIntegrationTests
 
             // 6. The terminal event was rendered as a fact (never as state).
             await WaitUntilAsync(
-                () => viewModel.OutputText.Contains("任务到达终态"),
+                () => viewModel.LogText.Contains("任务到达终态"),
                 "terminal event line");
 
             // The answered approval's commands were released with the row.
-            Assert.Equal(9, viewModel.RegisteredCommandCount);
+            Assert.Equal(11, viewModel.RegisteredCommandCount);
             Assert.Equal(42ul, viewModel.Watermark);
         }
         finally

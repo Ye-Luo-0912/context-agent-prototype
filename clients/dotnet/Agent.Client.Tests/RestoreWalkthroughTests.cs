@@ -132,6 +132,8 @@ public class RestoreWalkthroughTests
         run_started = true,
         run_completed = false,
         watermark = 7ul,
+        run_id = "00000000-0000-4000-8000-000000000031",
+        workspace_root = "/workspaces/test",
         focus = (object?)null,
         tasks,
         pending_approvals = Array.Empty<object>(),
@@ -140,10 +142,18 @@ public class RestoreWalkthroughTests
 
     /// <summary>Answers the handshake routes and accepts submits under
     /// <paramref name="taskId"/>. <paramref name="onSubmit"/> observes every
-    /// submit frame received (the no-auto-resend observation).</summary>
+    /// submit frame received (the no-auto-resend observation, with the
+    /// frame's own client_request_id). <paramref name="submitResult"/>
+    /// answers the GUI-3/F06 exact-request ledger query for a queried id —
+    /// absent, the route answers like a ledger that cannot testify.</summary>
     private static Func<int, Stream, CancellationToken, Task> AnsweringScript(
-        object snapshot, string taskId, Action<int, Stream, CancellationToken>? onSubmit = null)
+        object snapshot,
+        string taskId,
+        Action<string>? onSubmit = null,
+        Func<string, object?>? submitResult = null,
+        string? runId = null)
     {
+        var ledgerRunId = runId ?? "00000000-0000-4000-8000-0000000000b2";
         return async (_, stream, cancellationToken) =>
         {
             while (!cancellationToken.IsCancellationRequested)
@@ -177,7 +187,8 @@ public class RestoreWalkthroughTests
                         break;
 
                     case "submit":
-                        onSubmit?.Invoke(_, stream, cancellationToken);
+                        onSubmit?.Invoke(
+                            document.RootElement.GetProperty("payload").GetProperty("client_request_id").GetString()!);
                         await FrameCodec.WriteFrameAsync(
                             stream,
                             ResponseFrame(
@@ -186,6 +197,24 @@ public class RestoreWalkthroughTests
                             FrameCodec.DefaultMaxFrameBytes,
                             cancellationToken);
                         break;
+
+                    case "submit_result":
+                        {
+                            var queriedId = document.RootElement
+                                .GetProperty("payload").GetProperty("client_request_id").GetString()!;
+                            var answer = submitResult?.Invoke(queriedId) ?? new
+                            {
+                                run_id = ledgerRunId,
+                                client_request_id = queriedId,
+                                disposition = "unknown",
+                            };
+                            await FrameCodec.WriteFrameAsync(
+                                stream,
+                                ResponseFrame(document.RootElement, new { status = "success", value = answer }),
+                                FrameCodec.DefaultMaxFrameBytes,
+                                cancellationToken);
+                            break;
+                        }
 
                     default:
                         await FrameCodec.WriteFrameAsync(
@@ -246,22 +275,48 @@ public class RestoreWalkthroughTests
         };
     }
 
-    [Fact]
-    public async Task Unknown_submit_is_resolved_by_snapshot_facts_not_by_replay()
+    private static async Task WaitUntilAsync(Func<bool> condition, string what)
     {
-        const string goal = "c3 走查：宿主重启后未知提交按快照事实解除";
+        var deadline = DateTimeOffset.UtcNow + TimeSpan.FromSeconds(10);
+        while (!condition())
+        {
+            Assert.True(DateTimeOffset.UtcNow < deadline, $"timed out waiting for {what}");
+            await Task.Delay(20);
+        }
+    }
+
+    [Fact]
+    public async Task Unknown_submit_is_resolved_by_the_ledger_receipt_without_any_replay()
+    {
+        const string goal = "c3 走查：丢回执后由受理账本核实（任务列表不参与判定）";
         var hostBSubmits = 0;
+        var hostBLedgerQueries = 0;
+        const string ledgerRunId = "00000000-0000-4000-8000-0000000000b2";
 
         // Host A: the instance that dies with the submit unanswered. Host B:
-        // the restarted instance whose restored task table carries the goal.
+        // the ledger the original request actually reached (the connection
+        // died, not the admission). Its snapshot does NOT carry the goal —
+        // the task list is not the evidence, the ledger is; the GUI-3/F06
+        // rule is that only the exact-request query can testify.
         await using var hostA = new ScriptedHost();
         hostA.Script = DyingInstanceScript();
 
         await using var hostB = new ScriptedHost();
         hostB.Script = AnsweringScript(
-            SnapshotPayload(TaskEntry(TaskIdFirst, goal)),
+            SnapshotPayload(),
             TaskIdSecond,
-            onSubmit: (_, _, _) => Interlocked.Increment(ref hostBSubmits));
+            onSubmit: _ => Interlocked.Increment(ref hostBSubmits),
+            submitResult: queriedId =>
+            {
+                Interlocked.Increment(ref hostBLedgerQueries);
+                return new
+                {
+                    run_id = ledgerRunId,
+                    client_request_id = queriedId,
+                    disposition = "accepted",
+                    task_id = TaskIdSecond,
+                };
+            });
 
         var connectionIndex = 0;
         var viewModel = new MainWindowViewModel(new InlineUiDispatcher());
@@ -273,29 +328,33 @@ public class RestoreWalkthroughTests
                 return await ConnectAsync(index == 0 ? hostA.Port : hostB.Port);
             });
 
-            // 1. The submit's outcome is UNKNOWN: the host died with the
-            // request unanswered. The desktop must not claim idempotent
-            // replay — across a host restart the client_request_id is gone.
+            // 1. The submit's outcome is UNKNOWN: the connection died with
+            // the request unanswered. The desktop must not claim idempotent
+            // replay and must not auto-resend.
             viewModel.GoalInput = goal;
             await viewModel.SubmitForTestsAsync();
-            Assert.Contains("提交结果未知", viewModel.OutputText);
-            Assert.Contains("不会自动重发", viewModel.OutputText);
-            Assert.Equal(1, viewModel.ReconnectFailuresForTests);
+            Assert.Contains("提交结果未知", viewModel.LogText);
+            Assert.Contains("不会自动重发", viewModel.LogText);
 
-            // 2. The first snapshot after the rebuild resolves the unknown
-            // from FACTS: the goal's task is visible, so the admission
-            // happened — stated, never replayed.
-            await viewModel.RefreshOnceForTestsAsync();
-            Assert.Contains("在快照中可见", viewModel.OutputText);
+            // 2. The ledger resolves the unknown by EXACT REQUEST identity —
+            // queried with the id and the payload digest, never the goal
+            // text; the snapshot's (empty) task list never mattered. The
+            // rebuild ends the loss streak, and NO submit frame was replayed.
+            await WaitUntilAsync(
+                () => viewModel.OutstandingSubmitIdForTests is null,
+                "the ledger receipt to release the outstanding key");
+            Assert.True(hostBLedgerQueries >= 1, "the ledger was queried at least once");
+            Assert.Equal(0, hostBSubmits);
+            Assert.Contains("账本", viewModel.LogText);
+            Assert.Contains(TaskIdSecond, viewModel.LogText);
             Assert.Equal(0, viewModel.ReconnectFailuresForTests);
 
-            // 3. The unknown is closed: a DIFFERENT goal submits normally
-            // (pre-fix behavior refused it while an unknown was open), and
-            // exactly one submit frame reached the restarted host — the
-            // original request was never replayed.
+            // 3. The unknown is closed: a DIFFERENT goal submits normally,
+            // and exactly one submit frame reached the host — the original
+            // request was never replayed behind the operator's back.
             viewModel.GoalInput = "c3 走查：未知解除后的新目标";
             await viewModel.SubmitForTestsAsync();
-            Assert.Contains(TaskIdSecond, viewModel.OutputText);
+            Assert.Contains(TaskIdSecond, viewModel.LogText);
             Assert.Equal(1, hostBSubmits);
         }
         finally
@@ -307,22 +366,28 @@ public class RestoreWalkthroughTests
     }
 
     [Fact]
-    public async Task Unknown_submit_without_a_visible_task_names_the_new_admission_consequence()
+    public async Task Unknown_submit_across_a_restart_stays_unknown_until_the_operator_resubmits()
     {
-        const string goal = "c3 走查：恢复后任务不可见的保守分支";
+        const string goal = "c3 走查：跨重启无证据保持未知";
         var hostBSubmits = 0;
+        var hostBSubmitIds = new System.Collections.Concurrent.ConcurrentQueue<string>();
 
         await using var hostA = new ScriptedHost();
         hostA.Script = DyingInstanceScript();
 
-        // The restarted host's snapshot does NOT carry the goal (a fresh
-        // start, or the admission never reached a safe point): the desktop
-        // must say that a resubmission is a NEW task.
+        // The restarted host is a FRESH ledger: it holds no evidence for the
+        // id (the default submit_result answer is `unknown`), and its
+        // snapshot does not carry the goal. Nothing — not the empty list,
+        // not a name match — may turn that into a certainty.
         await using var hostB = new ScriptedHost();
         hostB.Script = AnsweringScript(
             SnapshotPayload(),
             TaskIdFirst,
-            onSubmit: (_, _, _) => Interlocked.Increment(ref hostBSubmits));
+            onSubmit: id =>
+            {
+                hostBSubmitIds.Enqueue(id);
+                Interlocked.Increment(ref hostBSubmits);
+            });
 
         var connectionIndex = 0;
         var viewModel = new MainWindowViewModel(new InlineUiDispatcher());
@@ -336,19 +401,30 @@ public class RestoreWalkthroughTests
 
             viewModel.GoalInput = goal;
             await viewModel.SubmitForTestsAsync();
-            Assert.Contains("提交结果未知", viewModel.OutputText);
+            Assert.Contains("提交结果未知", viewModel.LogText);
 
+            // The rebuilt host's ledger cannot testify: the unknown STAYS
+            // unknown, the key stays outstanding (a same-goal retry remains
+            // an idempotent re-entry on the SAME admission identity), and no
+            // submit frame was sent automatically.
             await viewModel.RefreshOnceForTestsAsync();
-            Assert.Contains("快照中没有同名目标任务", viewModel.OutputText);
-            Assert.Contains("将作为新任务执行", viewModel.OutputText);
+            await WaitUntilAsync(
+                () => viewModel.LogText.Contains("无法证明"),
+                "the ledger's indeterminate verdict");
+            Assert.DoesNotContain("解除", viewModel.LogText);
+            var outstanding = viewModel.OutstandingSubmitIdForTests;
+            Assert.NotNull(outstanding);
+            Assert.Equal(0, hostBSubmits);
 
-            // The conservative resolution leaves the decision explicit: the
-            // SAME goal may be resubmitted (as the new admission it now is),
-            // and nothing was sent automatically.
+            // The operator resubmits the SAME goal: it re-enters on the SAME
+            // client_request_id (one frame total), the fresh host admits it,
+            // and the receipt — not a guess — closes the unknown.
             viewModel.GoalInput = goal;
             await viewModel.SubmitForTestsAsync();
-            Assert.Contains(TaskIdFirst, viewModel.OutputText);
             Assert.Equal(1, hostBSubmits);
+            Assert.Equal(outstanding, Assert.Single(hostBSubmitIds));
+            Assert.Null(viewModel.OutstandingSubmitIdForTests);
+            Assert.Contains(TaskIdFirst, viewModel.LogText);
         }
         finally
         {

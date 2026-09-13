@@ -97,10 +97,13 @@ public static class AgentTransports
     public const string DefaultPipeName = "focus-agent.platform.v1";
 
     /// <summary>The per-workspace endpoint discriminator: 16 hex chars of
-    /// the SHA-256 digest over the workspace root's bytes as given. One
-    /// workspace always resolves to the same suffix and two workspaces never
-    /// share one. Mirrors <c>agent_platform_protocol::workspace_endpoint_suffix</c>
-    /// exactly (no canonicalization on either side of the shared rule).</summary>
+    /// the SHA-256 digest over the workspace root's bytes as given. The
+    /// PRIMITIVE stays byte-exact over whatever string it is given (the
+    /// shared fixture pins exactly those bytes); resolving a workspace root
+    /// to its canonical form happens in
+    /// <see cref="WorkspaceIdentity.Resolve"/>, ABOVE this primitive, so
+    /// both sides hash the same canonical directory rather than the same
+    /// spelling.</summary>
     public static string WorkspaceEndpointSuffix(string workspaceRoot)
     {
         var digest = SHA256.HashData(Encoding.UTF8.GetBytes(workspaceRoot));
@@ -114,8 +117,9 @@ public static class AgentTransports
 
     /// <summary>The default UDS endpoint for one workspace: the user's
     /// runtime directory when the platform provides one, else the temp dir —
-    /// plus the workspace discriminator. Mirrors the host's
-    /// <c>default_socket_path_for</c> for the same workspace root.</summary>
+    /// plus the workspace discriminator of the RESOLVED workspace root.
+    /// Mirrors the host's <c>default_socket_path_for</c> for the same
+    /// workspace.</summary>
     public static string DefaultSocketPathFor(string workspaceRoot)
     {
         var baseDir = Environment.GetEnvironmentVariable("XDG_RUNTIME_DIR");
@@ -123,12 +127,14 @@ public static class AgentTransports
         {
             baseDir = Path.GetTempPath();
         }
-        return Path.Combine(baseDir, $"focus-agent-platform-{WorkspaceEndpointSuffix(workspaceRoot)}.sock");
+        var suffix = WorkspaceIdentity.Resolve(workspaceRoot).EndpointSuffix;
+        return Path.Combine(baseDir, $"focus-agent-platform-{suffix}.sock");
     }
 
     /// <summary>The default local transport: the shared pipe name on
-    /// Windows, the workspace-scoped UDS path (for the caller's current
-    /// directory, the host's own default) on Unix.</summary>
+    /// Windows, the workspace-scoped UDS path (resolved from the caller's
+    /// current directory — the host's own default workspace choice) on
+    /// Unix.</summary>
     public static IAgentTransport DefaultLocal() =>
         OperatingSystem.IsWindows()
             ? new NamedPipeTransport(DefaultPipeName)
@@ -140,4 +146,64 @@ public static class AgentTransports
         OperatingSystem.IsWindows()
             ? DefaultPipeName
             : DefaultSocketPathFor(Environment.CurrentDirectory);
+}
+
+/// <summary>PLATFORM-3: one resolved workspace binding — the canonical
+/// absolute root, the endpoint discriminator derived from it, and the human
+/// display string. The shared rule both sides follow: the discriminator
+/// hashes the RESOLVED root; each side canonicalizes with its own platform
+/// semantics and the host's bind is authoritative. A client that must be
+/// certain which workspace answered compares this root against
+/// <see cref="WorkSnapshotResponse.WorkspaceRoot"/> — the snapshot carries
+/// the host's own canonical form, which no client-side guess can override.
+/// </summary>
+public sealed record WorkspaceIdentity(string Root, string EndpointSuffix)
+{
+    public string Display => $"workspace {Root}";
+
+    public static WorkspaceIdentity Resolve(string workspaceRoot)
+    {
+        if (string.IsNullOrWhiteSpace(workspaceRoot))
+        {
+            throw new ArgumentException("workspace root must not be blank", nameof(workspaceRoot));
+        }
+        var root = ResolveCanonical(workspaceRoot);
+        return new WorkspaceIdentity(root, AgentTransports.WorkspaceEndpointSuffix(root));
+    }
+
+    /// <summary>Best-effort mirror of the host's <c>std::fs::canonicalize</c>:
+    /// make the path absolute, drop redundant components, and follow the
+    /// final symlink/junction target when the path exists. Every step that
+    /// cannot complete keeps the previous form — never a guess beyond what
+    /// the platform can prove; the snapshot's host-side root remains the
+    /// authority for equality.</summary>
+    private static string ResolveCanonical(string path)
+    {
+        var full = Path.GetFullPath(path);
+        var root = Path.GetPathRoot(full) ?? string.Empty;
+        // Trim a trailing separator only when more than the root remains:
+        // "C:\" must never collapse to the drive-relative "C:".
+        if (full.Length > root.Length)
+        {
+            full = full.TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar);
+        }
+        try
+        {
+            if (Directory.Exists(full))
+            {
+                var target = new DirectoryInfo(full)
+                    .ResolveLinkTarget(returnFinalTarget: true)
+                    ?.FullName;
+                if (target is not null)
+                {
+                    full = target;
+                }
+            }
+        }
+        catch (IOException)
+        {
+            // A link that cannot be resolved keeps the current form.
+        }
+        return full;
+    }
 }

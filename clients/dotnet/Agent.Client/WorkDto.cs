@@ -298,11 +298,16 @@ public sealed record PendingApprovalSnapshot
 /// One consistent typed snapshot. <see cref="Watermark"/> is the durable event
 /// sequence it reflects; a client whose stream is behind must treat
 /// <see cref="ResyncRequired"/> as "rebuild from this snapshot", never splice.
+/// PLATFORM-3: the snapshot names the run (<see cref="RunId"/>) and workspace
+/// (<see cref="WorkspaceRoot"/>) that produced it, so a reconnecting client —
+/// perhaps on a shared default endpoint — can tell whose facts it is reading.
 /// </summary>
 public sealed record WorkSnapshotResponse : IProtocolPayload
 {
     public const int MaxTasks = 256;
     public const int MaxPendingApprovals = 16;
+    /// Must match the Rust <c>MAX_SNAPSHOT_WORKSPACE_ROOT_BYTES</c> (4_096) exactly.
+    public const int MaxWorkspaceRootBytes = 4096;
     /// Must match the Rust `MAX_SNAPSHOT_GOAL_CHARS` (200_000) exactly
     /// (R06): the host projects accepted goals verbatim, so a snapshot
     /// bound smaller than the submit bound would fault every reconnect for a
@@ -319,6 +324,18 @@ public sealed record WorkSnapshotResponse : IProtocolPayload
     [JsonPropertyName("watermark")]
     public ulong Watermark { get; init; }
 
+    /// <summary>The run whose state this snapshot projects. A client that saw
+    /// a different run id before reconnecting must rebuild instead of
+    /// splicing.</summary>
+    [JsonPropertyName("run_id")]
+    public string RunId { get; init; } = string.Empty;
+
+    /// <summary>The workspace root the answering host is bound to, in the
+    /// host's canonical form when the path resolves. A client on a shared
+    /// default endpoint verifies this is the workspace it meant.</summary>
+    [JsonPropertyName("workspace_root")]
+    public string WorkspaceRoot { get; init; } = string.Empty;
+
     [JsonPropertyName("focus")]
     public FocusSnapshot? Focus { get; init; }
 
@@ -331,8 +348,40 @@ public sealed record WorkSnapshotResponse : IProtocolPayload
     [JsonPropertyName("resync_required")]
     public bool ResyncRequired { get; init; }
 
+    /// <summary>Must match the Rust <c>MAX_SNAPSHOT_DEGRADED_RUNS</c> (64)
+    /// exactly.</summary>
+    public const int MaxDegradedRuns = 64;
+    /// <summary>Must match the Rust <c>MAX_SNAPSHOT_DEGRADED_RUN_ID_BYTES</c>
+    /// (128) exactly.</summary>
+    public const int MaxDegradedRunIdBytes = 128;
+
+    /// <summary>EXEC-6 (R2-02): the predecessor runs whose sealed references
+    /// the last restore could not admit into this run's lineage. A
+    /// re-obtainable, bounded fact; empty means nothing is degraded. Absent
+    /// on older servers — decodes as empty.</summary>
+    [JsonPropertyName("restore_evidence_degraded")]
+    public IReadOnlyList<string> RestoreEvidenceDegraded { get; init; } = [];
+
     public void Validate()
     {
+        // PLATFORM-3: the identity facts are mandatory — a snapshot that
+        // cannot say which run and workspace produced it is not a valid
+        // projection, because a reconnecting client cannot tell whose facts
+        // it is reading.
+        ProtocolIds.ValidateCanonical("work.snapshot.run_id", RunId);
+        ContractText.ValidateOpaque(
+            "work.snapshot.workspace_root", WorkspaceRoot, MaxWorkspaceRootBytes);
+        if (RestoreEvidenceDegraded.Count > MaxDegradedRuns)
+        {
+            throw new AgentContractViolationException(
+                "work.snapshot.restore_evidence_degraded",
+                $"contains {RestoreEvidenceDegraded.Count} entries, above the {MaxDegradedRuns} entry bound");
+        }
+        foreach (var run in RestoreEvidenceDegraded)
+        {
+            ContractText.ValidateOpaque(
+                "work.snapshot.restore_evidence_degraded", run, MaxDegradedRunIdBytes);
+        }
         if (Tasks.Count > MaxTasks)
         {
             throw new AgentContractViolationException(
@@ -358,6 +407,110 @@ public sealed record WorkSnapshotResponse : IProtocolPayload
             ContractText.ValidateText("work.snapshot.focus.goal", Focus.Goal, MaxGoalChars);
             ContractText.ValidateTaskId("work.snapshot.focus.task_id", Focus.TaskId);
         }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// EXEC-8 (R2-09): cold completion lookup. Read-only and run-scoped; every
+// answer is typed evidence, never a guess.
+// ---------------------------------------------------------------------------
+
+public sealed record WorkTaskCompletionRequest : IProtocolPayload
+{
+    [JsonPropertyName("task_id")]
+    public string TaskId { get; init; } = string.Empty;
+
+    public void Validate()
+    {
+        ProtocolIds.ValidateCanonical("work.task_completion.task_id", TaskId);
+    }
+}
+
+/// <summary>Mirrors Rust <c>WorkCompletionFact</c>: tagged snake_case via the
+/// "kind" discriminator.</summary>
+[JsonPolymorphic(TypeDiscriminatorPropertyName = "kind")]
+[JsonDerivedType(typeof(WorkCompletionFactHot), "hot")]
+[JsonDerivedType(typeof(WorkCompletionFactRetired), "retired")]
+[JsonDerivedType(typeof(WorkCompletionFactBeyondJournalWindow), "beyond_journal_window")]
+[JsonDerivedType(typeof(WorkCompletionFactUnknown), "unknown")]
+public abstract record WorkCompletionFact
+{
+    public void Validate()
+    {
+        if (this is WorkCompletionFactRetired retired)
+        {
+            retired.Validate();
+        }
+    }
+}
+
+public sealed record WorkCompletionFactHot : WorkCompletionFact;
+
+public sealed record WorkCompletionFactRetired : WorkCompletionFact
+{
+    /// <summary>Must match the Rust <c>MAX_COMPLETION_SUMMARY_CHARS</c>
+    /// (2_000) exactly.</summary>
+    public const int MaxSummaryChars = 2_000;
+    /// <summary>Must match the Rust <c>MAX_COMPLETION_ARTIFACTS</c> (32)
+    /// plus the one raw-evidence ref exactly.</summary>
+    public const int MaxArtifacts = 33;
+    /// <summary>Must match the Rust <c>MAX_COMPLETION_REF_CHARS</c> (256)
+    /// exactly.</summary>
+    public const int MaxArtifactRefChars = 256;
+    /// <summary>Must match the Rust <c>MAX_COMPLETION_DIGEST_CHARS</c> (128)
+    /// exactly.</summary>
+    public const int MaxDigestChars = 128;
+
+    [JsonPropertyName("summary")]
+    public string Summary { get; init; } = string.Empty;
+
+    [JsonPropertyName("anchor_revision")]
+    public ulong AnchorRevision { get; init; }
+
+    [JsonPropertyName("artifacts")]
+    public IReadOnlyList<string> Artifacts { get; init; } = [];
+
+    [JsonPropertyName("final_output_digest")]
+    public string? FinalOutputDigest { get; init; }
+
+    public new void Validate()
+    {
+        ContractText.ValidateText("work.task_completion.summary", Summary, MaxSummaryChars);
+        if (Artifacts.Count > MaxArtifacts)
+        {
+            throw new AgentContractViolationException(
+                "work.task_completion.artifacts",
+                $"carries {Artifacts.Count} references, above the {MaxArtifacts} bound");
+        }
+        foreach (var artifact in Artifacts)
+        {
+            ContractText.ValidateText(
+                "work.task_completion.artifact", artifact, MaxArtifactRefChars);
+        }
+        if (FinalOutputDigest is not null)
+        {
+            ContractText.ValidateText(
+                "work.task_completion.final_output_digest", FinalOutputDigest, MaxDigestChars);
+        }
+    }
+}
+
+public sealed record WorkCompletionFactBeyondJournalWindow : WorkCompletionFact;
+
+public sealed record WorkCompletionFactUnknown : WorkCompletionFact;
+
+public sealed record WorkTaskCompletionResponse : IProtocolPayload
+{
+    [JsonPropertyName("task_id")]
+    public string TaskId { get; init; } = string.Empty;
+
+    [JsonPropertyName("fact")]
+    public WorkCompletionFact Fact { get; init; } = new WorkCompletionFactUnknown();
+
+    public void Validate()
+    {
+        ProtocolIds.ValidateCanonical("work.task_completion.task_id", TaskId);
+        Fact.Validate();
     }
 }
 
@@ -426,7 +579,9 @@ public sealed record RuntimeEventEnvelope
     public JsonElement Event { get; init; }
 
     /// <summary>The event's snake_case type tag (empty when the frame is
-    /// malformed; <see cref="Validate"/> refuses that shape).</summary>
+    /// malformed; <see cref="Validate"/> refuses that shape). A derived
+    /// read — never a wire field.</summary>
+    [JsonIgnore]
     public string EventType =>
         Event.ValueKind == JsonValueKind.Object
         && Event.TryGetProperty("type", out var tag)
@@ -441,6 +596,7 @@ public sealed record RuntimeEventEnvelope
     /// including every approval-relevant and terminal lifecycle fact — is
     /// durable by default (fail closed).
     /// </summary>
+    [JsonIgnore]
     public bool IsLiveOnlyProgress => EventType is "model_delta" or "model_retrying";
 
     public void Validate()
@@ -457,6 +613,79 @@ public sealed record RuntimeEventEnvelope
                 "work.event.envelope.event.type", "must be a non-empty string tag");
         }
     }
+
+    /// <summary>PLATFORM-4: one model round's usage facts exactly as the
+    /// kernel typed them, read straight off the raw event element — the SDK
+    /// stays a single event algebra away from drift, but cost facts should
+    /// not force the GUI to parse JSON strings.</summary>
+    public readonly record struct ModelUsageFact(
+        ulong InputTokens,
+        ulong OutputTokens,
+        ulong CachedInputTokens,
+        uint Attempts,
+        uint Retries,
+        string UsageIdentity,
+        ulong? CacheWriteInputTokens = null,
+        ulong? CacheMissInputTokens = null,
+        string Role = "main")
+    {
+        /// <summary>True only when the identity says the counters are
+        /// provider-observed (or the role made no call, so zero is a fact).
+        /// Estimated/unknown counts must never be summed as observed
+        /// consumption.</summary>
+        public bool IsObserved => UsageIdentity == "observed";
+
+        /// <summary>True when the outcome is genuinely undetermined.</summary>
+        public bool IsIndeterminate => UsageIdentity == "unknown";
+    }
+
+    /// <summary>Reads the usage facts off a <c>model_used</c> event.
+    /// Returns false for every other event type — that is a fact about the
+    /// event, never about consumption. COST-6: the cache-write and
+    /// cache-miss counters come from the typed <c>usage</c> report and stay
+    /// <c>null</c> when the provider did not report them (never zero).</summary>
+    public bool TryGetModelUsage(out ModelUsageFact fact)
+    {
+        fact = default;
+        if (EventType != "model_used" || Event.ValueKind != JsonValueKind.Object)
+        {
+            return false;
+        }
+        ulong U64(string name) =>
+            Event.TryGetProperty(name, out var element) && element.TryGetUInt64(out var value)
+                ? value
+                : 0;
+        ulong? NestedU64(string name) =>
+            Event.TryGetProperty("usage", out var usage)
+            && usage.ValueKind == JsonValueKind.Object
+            && usage.TryGetProperty(name, out var element)
+            && element.TryGetUInt64(out var value)
+                ? value
+                : null;
+        var identity = Event.TryGetProperty("usage_identity", out var id)
+            && id.ValueKind == JsonValueKind.String
+                ? id.GetString() ?? "unknown"
+                : "unknown";
+        var role = Event.TryGetProperty("role", out var roleElement)
+            && roleElement.ValueKind == JsonValueKind.String
+                ? roleElement.GetString() ?? "main"
+                : "main";
+        fact = new ModelUsageFact(
+            U64("input_tokens"),
+            U64("output_tokens"),
+            U64("cached_input_tokens"),
+            Event.TryGetProperty("attempts", out var attempts) && attempts.TryGetUInt32(out var a)
+                ? a
+                : 0,
+            Event.TryGetProperty("retries", out var retries) && retries.TryGetUInt32(out var r)
+                ? r
+                : 0,
+            identity,
+            NestedU64("cache_write_input_tokens"),
+            NestedU64("cache_miss_input_tokens"),
+            role);
+        return true;
+    }
 }
 
 /// <summary>
@@ -471,11 +700,15 @@ public sealed record WorkEventNotification : IProtocolPayload
     public RuntimeEventEnvelope Envelope { get; init; } = new();
 
     /// <summary>Queue-pressure classification derived from the event type:
-    /// live-only progress may be shed under load; durable facts may not.</summary>
+    /// live-only progress may be shed under load; durable facts may not.
+    /// A derived read — never a wire field.</summary>
+    [JsonIgnore]
     public bool IsLiveOnlyProgress => Envelope.IsLiveOnlyProgress;
 
     /// <summary>The event's snake_case type tag — the classification key for
-    /// queue shedding and the consumer's first-level dispatch key.</summary>
+    /// queue shedding and the consumer's first-level dispatch key. A derived
+    /// read — never a wire field.</summary>
+    [JsonIgnore]
     public string EventType => Envelope.EventType;
 
     public void Validate() => Envelope.Validate();
@@ -592,6 +825,158 @@ public sealed record WorkTaskDetailResponse : IProtocolPayload
     }
 }
 
+// ---------------------------------------------------------------------------
+// PLATFORM-1 (F06): the exact-request submission receipt query. Run-scoped and
+// read-only: it never starts a turn and never mutates state. The caller names
+// its own client_request_id (never a goal-text match) and may name its own
+// payload digest so the host can distinguish "this exact request" from "a
+// different payload holding this id".
+// ---------------------------------------------------------------------------
+
+/// <summary>What the host's bounded, process-lifetime ledger can testify about
+/// one client_request_id. Every value is a fact about evidence —
+/// <c>Unknown</c> and <c>Expired</c> prove nothing in either direction, so a
+/// caller must never read them as "not executed" nor auto-resend.</summary>
+public enum WorkSubmitResultDisposition
+{
+    Accepted,
+    AlreadyAccepted,
+    KnownRejected,
+    Unknown,
+    Expired,
+}
+
+public static class WorkSubmitResultDispositionExtensions
+{
+    /// <summary>Does this disposition establish that the exact request was
+    /// admitted?</summary>
+    public static bool IsAdmitted(this WorkSubmitResultDisposition disposition) =>
+        disposition is WorkSubmitResultDisposition.Accepted
+            or WorkSubmitResultDisposition.AlreadyAccepted;
+
+    /// <summary>Does this disposition leave the outcome genuinely
+    /// undetermined?</summary>
+    public static bool IsIndeterminate(this WorkSubmitResultDisposition disposition) =>
+        disposition is WorkSubmitResultDisposition.Unknown
+            or WorkSubmitResultDisposition.Expired;
+}
+
+public sealed record WorkSubmitResultRequest : IProtocolPayload
+{
+    [JsonPropertyName("client_request_id")]
+    public string ClientRequestId { get; init; } = string.Empty;
+
+    /// <summary>Optional comparison token over the caller's own payload,
+    /// produced by <see cref="SubmitPayloadDigest"/>. It is never authority
+    /// and the host never echoes goal text back.</summary>
+    [JsonPropertyName("payload_digest")]
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    public string? PayloadDigest { get; init; }
+
+    public const int MaxClientRequestIdBytes = 128;
+    public const int MaxPayloadDigestBytes = 128;
+
+    public void Validate()
+    {
+        ContractText.ValidateOpaque("work.submit_result.client_request_id", ClientRequestId, MaxClientRequestIdBytes);
+        if (PayloadDigest is not null)
+        {
+            ContractText.ValidateOpaque("work.submit_result.payload_digest", PayloadDigest, MaxPayloadDigestBytes);
+        }
+    }
+}
+
+public sealed record WorkSubmitResultResponse : IProtocolPayload
+{
+    /// <summary>The run whose ledger answered. A client that reconnected to a
+    /// different run must re-query instead of trusting a stale answer.</summary>
+    [JsonPropertyName("run_id")]
+    public string RunId { get; init; } = string.Empty;
+
+    [JsonPropertyName("client_request_id")]
+    public string ClientRequestId { get; init; } = string.Empty;
+
+    [JsonPropertyName("disposition")]
+    public WorkSubmitResultDisposition Disposition { get; init; }
+
+    [JsonPropertyName("task_id")]
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    public string? TaskId { get; init; }
+
+    /// <summary>Present only on a conflict: the digest the id was originally
+    /// admitted for, so the client can show "same id, different content"
+    /// without shipping the old goal text.</summary>
+    [JsonPropertyName("accepted_payload_digest")]
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    public string? AcceptedPayloadDigest { get; init; }
+
+    public void Validate()
+    {
+        ContractText.ValidateOpaque("work.submit_result.client_request_id", ClientRequestId, WorkSubmitResultRequest.MaxClientRequestIdBytes);
+        ProtocolIds.ValidateCanonical("work.submit_result.run_id", RunId);
+        switch (Disposition)
+        {
+            case WorkSubmitResultDisposition.Accepted:
+            case WorkSubmitResultDisposition.AlreadyAccepted:
+            case WorkSubmitResultDisposition.KnownRejected:
+                if (TaskId is null)
+                {
+                    throw new AgentContractViolationException(
+                        "work.submit_result.task_id", "a recorded disposition must name its task");
+                }
+                ContractText.ValidateTaskId("work.submit_result.task_id", TaskId);
+                break;
+            case WorkSubmitResultDisposition.Unknown:
+            case WorkSubmitResultDisposition.Expired:
+                if (TaskId is not null)
+                {
+                    throw new AgentContractViolationException(
+                        "work.submit_result.task_id", "an indeterminate disposition must not name a task");
+                }
+                break;
+            default:
+                throw new AgentContractViolationException(
+                    "work.submit_result.disposition", "unknown disposition value");
+        }
+
+        if (Disposition == WorkSubmitResultDisposition.KnownRejected)
+        {
+            ContractText.ValidateOpaque(
+                "work.submit_result.accepted_payload_digest",
+                AcceptedPayloadDigest ?? string.Empty,
+                WorkSubmitResultRequest.MaxPayloadDigestBytes);
+        }
+        else if (AcceptedPayloadDigest is not null)
+        {
+            throw new AgentContractViolationException(
+                "work.submit_result.accepted_payload_digest",
+                "only a rejected conflict carries the recorded payload digest");
+        }
+    }
+}
+
+/// <summary>Mirrors the host's submission payload digest so a .NET client can
+/// name its own payload in an exact-request query. Domain-separated SHA-256
+/// over <c>DOMAIN || 0x00 || utf8(goal)</c>, lowercase hex — byte-identical to
+/// the Rust <c>submission_payload_digest</c>.</summary>
+public static class SubmitPayloadDigest
+{
+    public const string Domain = "focus-agent.platform.work.submit-payload.v1";
+
+    public static string Compute(string goal)
+    {
+        using var hasher = System.Security.Cryptography.SHA256.Create();
+        var domain = System.Text.Encoding.UTF8.GetBytes(Domain);
+        var payload = System.Text.Encoding.UTF8.GetBytes(goal);
+        var buffer = new byte[domain.Length + 1 + payload.Length];
+        domain.CopyTo(buffer, 0);
+        buffer[domain.Length] = 0;
+        payload.CopyTo(buffer, domain.Length + 1);
+        var digest = hasher.ComputeHash(buffer);
+        return Convert.ToHexStringLower(digest);
+    }
+}
+
 /// <summary>Wire mirror of the workspace change journal (B3). A single record
 /// carries one transaction's journaled phase; the journal's internal
 /// <c>old_content</c> capture never travels.</summary>
@@ -628,6 +1013,11 @@ public sealed record ChangeSummary
 
     public string? AfterHash { get; init; }
 
+    /// <summary>Run-scoped artifact reference to the captured before-body
+    /// (PLATFORM-2); readable via the paged artifact route. Null when the
+    /// journal captured no content.</summary>
+    public string? OldContentArtifact { get; init; }
+
     public string? Reason { get; init; }
 
     public string? EntryIdentity { get; init; }
@@ -639,7 +1029,7 @@ public sealed record ChangeSummary
 internal sealed class ChangeSummaryConverter : JsonConverter<ChangeSummary>
 {
     private static readonly string[] PreparedFields =
-        ["tx_id", "timestamp_ms", "tool", "path", "action", "bytes_before", "bytes_after", "before_hash", "after_hash"];
+        ["tx_id", "timestamp_ms", "tool", "path", "action", "bytes_before", "bytes_after", "before_hash", "after_hash", "old_content_artifact"];
     private static readonly string[] CommittedFields = ["tx_id", "timestamp_ms"];
     private static readonly string[] RolledBackFields = ["tx_id", "timestamp_ms", "reason"];
     private static readonly string[] DirectoryPreparedFields = ["tx_id", "timestamp_ms", "tool", "path"];
@@ -702,6 +1092,7 @@ internal sealed class ChangeSummaryConverter : JsonConverter<ChangeSummary>
             BytesAfter = root.TryGetProperty("bytes_after", out var ba) && ba.TryGetUInt64(out var bav) ? bav : 0,
             BeforeHash = root.TryGetProperty("before_hash", out var bh) && bh.ValueKind == JsonValueKind.String ? bh.GetString() : null,
             AfterHash = root.TryGetProperty("after_hash", out var ah) && ah.ValueKind == JsonValueKind.String ? ah.GetString() : null,
+            OldContentArtifact = root.TryGetProperty("old_content_artifact", out var oca) && oca.ValueKind == JsonValueKind.String ? oca.GetString() : null,
             Reason = root.TryGetProperty("reason", out var reason) && reason.ValueKind == JsonValueKind.String ? reason.GetString() : null,
             EntryIdentity = root.TryGetProperty("entry_identity", out var identity) && identity.ValueKind == JsonValueKind.String ? identity.GetString() : null,
         };
@@ -731,6 +1122,10 @@ internal sealed class ChangeSummaryConverter : JsonConverter<ChangeSummary>
                 writer.WriteNumber("bytes_after", value.BytesAfter);
                 writer.WriteString("before_hash", value.BeforeHash);
                 writer.WriteString("after_hash", value.AfterHash);
+                if (value.OldContentArtifact is { } oldArtifact)
+                {
+                    writer.WriteString("old_content_artifact", oldArtifact);
+                }
                 break;
             case ChangeSummaryKind.MutationRolledBack:
                 writer.WriteString("reason", value.Reason);
@@ -793,6 +1188,15 @@ public sealed record WorkChangesResponse : IProtocolPayload
         {
             throw new AgentContractViolationException("work.changes.tx_id", "must not be empty");
         }
+        foreach (var change in Changes)
+        {
+            // PLATFORM-2: the before-body artifact reference must stay within
+            // the same bound the artifact route validates (Rust 256).
+            if (change.OldContentArtifact is { } reference)
+            {
+                ContractText.ValidateOpaque("work.changes.old_content_artifact", reference, 256);
+            }
+        }
     }
 }
 
@@ -805,6 +1209,12 @@ public sealed record WorkArtifactRequest : IProtocolPayload
 
     [JsonPropertyName("max_bytes")]
     public uint? MaxBytes { get; init; }
+
+    /// <summary>PLATFORM-2 (F08): byte position where this read starts.
+    /// Absent/0 reads from the beginning (the historical prefix read).</summary>
+    [JsonPropertyName("offset")]
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    public ulong? Offset { get; init; }
 
     public void Validate()
     {
@@ -825,8 +1235,20 @@ public sealed record WorkArtifactResponse : IProtocolPayload
     [JsonPropertyName("size_bytes")]
     public ulong SizeBytes { get; init; }
 
+    /// <summary>Byte position where <see cref="ContentBase64"/> starts
+    /// (0 for the historical prefix read).</summary>
+    [JsonPropertyName("offset")]
+    public ulong Offset { get; init; }
+
+    /// <summary>True only when there are more bytes beyond this window.</summary>
     [JsonPropertyName("truncated")]
     public bool Truncated { get; init; }
+
+    /// <summary>The next byte position to read, present exactly when
+    /// <see cref="Truncated"/> is true; an eof page carries no cursor.</summary>
+    [JsonPropertyName("next_offset")]
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    public ulong? NextOffset { get; init; }
 
     [JsonPropertyName("content_base64")]
     public string ContentBase64 { get; init; } = string.Empty;
@@ -843,14 +1265,33 @@ public sealed record WorkArtifactResponse : IProtocolPayload
         {
             throw new AgentContractViolationException("work.artifact.content_base64", "is not valid base64");
         }
-        var consistent = Truncated
-            ? decoded.LongLength < (long)SizeBytes
-            : (ulong)decoded.LongLength == SizeBytes;
-        if (!consistent)
+        var end = Offset + (ulong)decoded.LongLength;
+        if (Offset > SizeBytes || end > SizeBytes)
         {
             throw new AgentContractViolationException(
                 "work.artifact.size_bytes",
-                $"size {SizeBytes} and truncated {Truncated} disagree with {decoded.LongLength} decoded bytes");
+                $"window [{Offset},{end}) does not fit the artifact of {SizeBytes} bytes");
+        }
+        if (Truncated != (NextOffset is not null))
+        {
+            throw new AgentContractViolationException(
+                "work.artifact.next_offset",
+                "the continuation cursor must be present exactly when the window is truncated");
+        }
+        if (Truncated)
+        {
+            if (NextOffset != end || end >= SizeBytes)
+            {
+                throw new AgentContractViolationException(
+                    "work.artifact.next_offset",
+                    $"must point at the first unread byte ({end}) of a window that ends before {SizeBytes}");
+            }
+        }
+        else if (end != SizeBytes)
+        {
+            throw new AgentContractViolationException(
+                "work.artifact.size_bytes",
+                $"a non-truncated window must reach the end of the artifact ({SizeBytes}), not {end}");
         }
     }
 }
@@ -928,6 +1369,16 @@ public sealed record ContextItemSummary
 
     [JsonPropertyName("source")]
     public string? Source { get; init; }
+
+    /// <summary>PLATFORM-2: where the body lives right now — resident /
+    /// warm / cold / external. Legacy servers omit the field.</summary>
+    [JsonPropertyName("residency")]
+    public string? Residency { get; init; }
+
+    /// <summary>PLATFORM-2: the body went into the most recent materialized
+    /// surface of the current turn ("actually sent").</summary>
+    [JsonPropertyName("selected_current_turn")]
+    public bool? SelectedCurrentTurn { get; init; }
 }
 
 public sealed record WorkContextResponse : IProtocolPayload

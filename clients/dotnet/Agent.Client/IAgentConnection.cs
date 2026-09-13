@@ -50,18 +50,34 @@ public interface IAgentConnection : IAsyncDisposable
 
     /// <summary>Reads the workspace change journal, newest first (B3).
     /// Run-scoped read; never starts a model round.</summary>
+    Task<WorkTaskCompletionResponse> TaskCompletionAsync(
+        string taskId, CancellationToken cancellationToken = default);
+
     Task<WorkChangesResponse> ReadChangesAsync(
         int? limit = null, string? afterTx = null, CancellationToken cancellationToken = default);
 
-    /// <summary>Reads one run-scoped artifact's bounded body (B3). Run-scoped
-    /// read; never starts a model round.</summary>
+    /// <summary>Reads one run-scoped artifact's bounded body (B3), starting
+    /// at the byte <paramref name="offset"/> when paging (PLATFORM-2/F08).
+    /// Run-scoped read; never starts a model round. The response's
+    /// <c>next_offset</c>/<c>truncated</c> facts drive the continuation.</summary>
     Task<WorkArtifactResponse> ReadArtifactAsync(
-        string reference, uint? maxBytes = null, CancellationToken cancellationToken = default);
+        string reference, uint? maxBytes = null, ulong? offset = null, CancellationToken cancellationToken = default);
 
     /// <summary>Reads the context engine's bounded item summary (B3).
     /// Run-scoped read; never starts a model round.</summary>
     Task<WorkContextResponse> ReadContextAsync(
         uint? limit = null, CancellationToken cancellationToken = default);
+
+    /// <summary>PLATFORM-1 (F06): asks the run's submission ledger what became
+    /// of THIS caller's exact <paramref name="clientRequestId"/> — never a
+    /// goal-text match. <paramref name="payloadDigest"/> (the caller's own
+    /// <see cref="SubmitPayloadDigest.Compute"/> token) lets the answer
+    /// distinguish "this exact payload was admitted" from "a different payload
+    /// holds this id". Run-scoped read; never starts a model round and never
+    /// mutates state. <c>Unknown</c>/<c>Expired</c> prove nothing in either
+    /// direction and must never be read as "not executed".</summary>
+    Task<WorkSubmitResultResponse> SubmitResultAsync(
+        string clientRequestId, string? payloadDigest = null, CancellationToken cancellationToken = default);
 }
 
 /// <summary>

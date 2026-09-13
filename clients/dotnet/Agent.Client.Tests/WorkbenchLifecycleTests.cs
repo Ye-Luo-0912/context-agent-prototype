@@ -19,7 +19,7 @@ namespace FocusAgent.Client.Tests;
 /// </summary>
 public class WorkbenchLifecycleTests
 {
-    private const int BaseCommandCount = 9; // connect/disconnect/submit/continue/cancel/refresh + C3 review reads (changes/artifact/context)
+    private const int BaseCommandCount = 11; // connect/disconnect/submit/continue/cancel/refresh + C3 review reads (changes/artifact/context) + C2 paging (next-page/tail)
 
     private static WorkSnapshotResponse SnapshotWith(params PendingApprovalSnapshot[] approvals) => new()
     {
@@ -44,6 +44,9 @@ public class WorkbenchLifecycleTests
     /// programmable and whose event stream is a channel the drill writes.</summary>
     private sealed class StubConnection : IAgentConnection
     {
+        public Task<WorkTaskCompletionResponse> TaskCompletionAsync(string taskId, CancellationToken cancellationToken = default) =>
+            Task.FromResult(new WorkTaskCompletionResponse { TaskId = taskId, Fact = new WorkCompletionFactBeyondJournalWindow() });
+
         private readonly Channel<WorkEventNotification> _events =
             Channel.CreateBounded<WorkEventNotification>(64);
 
@@ -80,11 +83,14 @@ public class WorkbenchLifecycleTests
         public Task<WorkChangesResponse> ReadChangesAsync(int? limit = null, string? afterTx = null, CancellationToken cancellationToken = default) =>
             throw new NotSupportedException("lifecycle drills do not read changes");
 
-        public Task<WorkArtifactResponse> ReadArtifactAsync(string reference, uint? maxBytes = null, CancellationToken cancellationToken = default) =>
+        public Task<WorkArtifactResponse> ReadArtifactAsync(string reference, uint? maxBytes = null, ulong? offset = null, CancellationToken cancellationToken = default) =>
             throw new NotSupportedException("lifecycle drills do not read artifacts");
 
         public Task<WorkContextResponse> ReadContextAsync(uint? limit = null, CancellationToken cancellationToken = default) =>
             throw new NotSupportedException("lifecycle drills do not read context");
+
+        public Task<WorkSubmitResultResponse> SubmitResultAsync(string clientRequestId, string? payloadDigest = null, CancellationToken cancellationToken = default) =>
+            throw new NotSupportedException("lifecycle drills do not query the submit ledger");
 
         public ValueTask DisposeAsync()
         {
@@ -225,7 +231,7 @@ public class WorkbenchLifecycleTests
         Assert.Equal(0ul, viewModel.Watermark);
 
         Assert.True(stub.EventWriter.TryWrite(Notification("task_completed", 7)));
-        await WaitUntilAsync(() => viewModel.OutputText.Contains("任务到达终态"), "terminal fact line");
+        await WaitUntilAsync(() => viewModel.LogText.Contains("任务到达终态"), "terminal fact line");
         // The durable event also drove a snapshot refresh (watermark applied
         // from the fresh snapshot, not inferred from the event text).
         await WaitUntilAsync(() => snapshotsServed > 0 && viewModel.Watermark == 41ul, "event-driven refresh");

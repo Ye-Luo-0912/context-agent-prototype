@@ -78,11 +78,15 @@
         <TextBox Grid.Row="0" Text="{Binding GoalInput}" Watermark="描述一个新的工作目标（提交后原子建立任务并排队首轮输入）…"
                  AcceptsReturn="True" MinHeight="64" TextWrapping="Wrap" />
 
-        <StackPanel Grid.Row="1" Orientation="Horizontal" Spacing="8" Margin="0,8">
-          <Button Content="提交新工作" Command="{Binding SubmitCommand}" />
-          <Button Content="继续" Command="{Binding ContinueCommand}" />
-          <Button Content="取消当前轮" Command="{Binding CancelCommand}" />
-          <Button Content="刷新快照" Command="{Binding RefreshCommand}" />
+        <StackPanel Grid.Row="1" Margin="0,8">
+          <StackPanel Orientation="Horizontal" Spacing="8">
+            <Button Content="提交新工作" Command="{Binding SubmitCommand}" />
+            <Button Content="继续活动任务" Command="{Binding ContinueCommand}" />
+            <Button Content="取消当前轮" Command="{Binding CancelCommand}" />
+            <Button Content="刷新快照" Command="{Binding RefreshCommand}" />
+          </StackPanel>
+          <TextBlock Text="「继续」沿活动任务当前指令继续；新目标永远是新任务。取消以服务端确认为准。"
+                     FontSize="11" Foreground="#99808080" Margin="0,4,0,0" TextWrapping="Wrap" />
         </StackPanel>
 
         <!-- 待审批 -->
@@ -138,22 +142,34 @@
               </ScrollViewer>
             </DockPanel>
           </TabItem>
-          <TabItem Header="工件（只读）">
-            <StackPanel Spacing="4">
-              <StackPanel Orientation="Horizontal" Spacing="8">
+          <TabItem Header="工件（只读，可分页）">
+            <DockPanel>
+              <StackPanel DockPanel.Dock="Top" Orientation="Horizontal" Spacing="8" Margin="0,0,0,4">
                 <!-- 只读观察：引用文本由操作者显式输入，读取结果如实显示 -->
-                <TextBox Text="{Binding ArtifactReference}" Watermark="工件引用（reference）…" MinWidth="320" />
-                <Button Content="读取工件" Command="{Binding ReadArtifactCommand}" Padding="8,2" />
+                <TextBox Text="{Binding ArtifactReference}" Watermark="工件引用（reference）…" MinWidth="280" />
+                <Button Content="读取" Command="{Binding ReadArtifactCommand}" Padding="8,2" />
+                <Button Content="下一页" Command="{Binding NextArtifactPageCommand}" Padding="8,2" />
+                <Button Content="读尾部" Command="{Binding ReadArtifactTailCommand}" Padding="8,2" />
               </StackPanel>
-              <TextBlock Text="{Binding ArtifactText}" TextWrapping="Wrap" FontSize="11"
-                         FontFamily="Consolas,monospace" />
-            </StackPanel>
+              <ScrollViewer VerticalScrollBarVisibility="Auto">
+                <TextBlock Text="{Binding ArtifactText}" TextWrapping="Wrap" FontSize="11"
+                           FontFamily="Consolas,monospace" />
+              </ScrollViewer>
+            </DockPanel>
           </TabItem>
         </TabControl>
 
-        <!-- 输出 -->
-        <TextBox Grid.Row="4" Text="{Binding OutputText}" IsReadOnly="True" TextWrapping="Wrap"
-                 FontFamily="Consolas,monospace" Margin="0,8,0,0" />
+        <!-- C2（GUI-2）：输出正文（模型内容）与运行日志（回执/失败/账目）分开呈现 -->
+        <TabControl Grid.Row="4" Margin="0,8,0,0">
+          <TabItem Header="输出正文">
+            <TextBox Text="{Binding OutputText}" IsReadOnly="True" TextWrapping="Wrap"
+                     FontFamily="Consolas,monospace" />
+          </TabItem>
+          <TabItem Header="运行日志">
+            <TextBox Text="{Binding LogText}" IsReadOnly="True" TextWrapping="Wrap"
+                     FontFamily="Consolas,monospace" />
+          </TabItem>
+        </TabControl>
 
         <!-- 状态条 -->
         <Border Grid.Row="5" BorderBrush="#33808080" BorderThickness="0,1,0,0" Padding="0,8,0,0" Margin="0,8,0,0">
@@ -161,7 +177,11 @@
             <TextBlock><Run Text="watermark: " /><Run Text="{Binding Watermark}" /></TextBlock>
             <TextBlock Text="{Binding FocusText}" TextWrapping="Wrap" MaxWidth="380" />
             <TextBlock Text="{Binding RunStateText}" TextWrapping="Wrap" MaxWidth="300" />
+            <TextBlock Text="{Binding CancelStateText}" TextWrapping="Wrap" MaxWidth="320" />
             <TextBlock Text="{Binding PlanText}" Foreground="#99808080" TextWrapping="Wrap" MaxWidth="320" />
+            <TextBlock Text="{Binding CostSummaryText}" Foreground="#99808080" TextWrapping="Wrap" MaxWidth="420" />
+            <!-- C4：实测/估算/未知三分账目；未知轮计数可见，不折算成零 -->
+            <TextBlock Text="{Binding CostSummaryText}" Foreground="#99808080" TextWrapping="Wrap" MaxWidth="520" />
           </StackPanel>
         </Border>
       </Grid>

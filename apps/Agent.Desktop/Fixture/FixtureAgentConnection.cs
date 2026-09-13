@@ -44,6 +44,12 @@ public sealed class FixtureAgentConnection : IAgentConnection
         },
     ];
 
+    /// <summary>布局夹具自己的受理记录：SubmitResultAsync 只据此如实作答。</summary>
+    private readonly Dictionary<string, string> _admittedSubmits = new();
+
+    /// <summary>布局夹具的固定 run 身份（仅用于回答回执的归属字段）。</summary>
+    private const string RunId = "00000000-0000-4000-8000-0000000000f1";
+
     public bool IsConnected { get; private set; } = true;
 
     /// <summary>布局夹具不产出事件：一条已完结的空流即可。</summary>
@@ -68,10 +74,35 @@ public sealed class FixtureAgentConnection : IAgentConnection
             ToolRequirementRevision = 0,
             ToolRequirementCount = 0,
         });
+        _admittedSubmits[clientRequestId] = taskId;
         return Task.FromResult(new WorkSubmitResponse
         {
             Disposition = WorkSubmitDisposition.Accepted,
             TaskId = taskId,
+        });
+    }
+
+    /// <summary>布局夹具对账本的如实回答：只报告本夹具自己受理过的
+    /// client_request_id（即它确实收到的提交），其余一律 Unknown——夹具不
+    /// 伪造任何账本事实。</summary>
+    public Task<WorkSubmitResultResponse> SubmitResultAsync(
+        string clientRequestId, string? payloadDigest = null, CancellationToken cancellationToken = default)
+    {
+        if (_admittedSubmits.TryGetValue(clientRequestId, out var taskId))
+        {
+            return Task.FromResult(new WorkSubmitResultResponse
+            {
+                RunId = RunId,
+                ClientRequestId = clientRequestId,
+                Disposition = WorkSubmitResultDisposition.AlreadyAccepted,
+                TaskId = taskId,
+            });
+        }
+        return Task.FromResult(new WorkSubmitResultResponse
+        {
+            RunId = RunId,
+            ClientRequestId = clientRequestId,
+            Disposition = WorkSubmitResultDisposition.Unknown,
         });
     }
 
@@ -124,6 +155,17 @@ public sealed class FixtureAgentConnection : IAgentConnection
     // empty listings; wired-up reads belong to the C line's real host hookup.
     // -----------------------------------------------------------------------
 
+    public Task<WorkTaskCompletionResponse> TaskCompletionAsync(string taskId, CancellationToken cancellationToken = default)
+    {
+        // The fixture has no durable journal: a completion lookup honestly
+        // answers beyond-window instead of inventing a record.
+        return Task.FromResult(new WorkTaskCompletionResponse
+        {
+            TaskId = taskId,
+            Fact = new WorkCompletionFactBeyondJournalWindow(),
+        });
+    }
+
     public Task<WorkTaskDetailResponse> TaskDetailAsync(string taskId, CancellationToken cancellationToken = default)
     {
         var task = _tasks.FirstOrDefault(t => t.TaskId == taskId);
@@ -151,7 +193,7 @@ public sealed class FixtureAgentConnection : IAgentConnection
     public Task<WorkChangesResponse> ReadChangesAsync(int? limit = null, string? afterTx = null, CancellationToken cancellationToken = default) =>
         Task.FromResult(new WorkChangesResponse { Changes = [] });
 
-    public Task<WorkArtifactResponse> ReadArtifactAsync(string reference, uint? maxBytes = null, CancellationToken cancellationToken = default) =>
+    public Task<WorkArtifactResponse> ReadArtifactAsync(string reference, uint? maxBytes = null, ulong? offset = null, CancellationToken cancellationToken = default) =>
         Task.FromException<WorkArtifactResponse>(
             new AgentContractViolationException("work.artifact.reference", "fixture has no artifact store"));
 

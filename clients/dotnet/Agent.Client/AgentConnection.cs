@@ -278,20 +278,41 @@ public sealed class AgentConnection : IAgentConnection
         SendAsync<WorkTaskDetailRequest, WorkTaskDetailResponse>(
             Route.WorkTaskDetailRoute(), new WorkTaskDetailRequest { TaskId = taskId }, cancellationToken);
 
+    /// <summary>EXEC-8 (R2-09): read-only cold lookup of one completed
+    /// task's outcome (hot window or durable journal). Zero model/tool side
+    /// effects.</summary>
+    public Task<WorkTaskCompletionResponse> TaskCompletionAsync(
+        string taskId, CancellationToken cancellationToken = default) =>
+        SendAsync<WorkTaskCompletionRequest, WorkTaskCompletionResponse>(
+            Route.WorkTaskCompletionRoute(), new WorkTaskCompletionRequest { TaskId = taskId }, cancellationToken);
+
     public Task<WorkChangesResponse> ReadChangesAsync(
         int? limit = null, string? afterTx = null, CancellationToken cancellationToken = default) =>
         SendAsync<WorkChangesRequest, WorkChangesResponse>(
             Route.WorkChangesRoute(), new WorkChangesRequest { Limit = limit, AfterTx = afterTx }, cancellationToken);
 
     public Task<WorkArtifactResponse> ReadArtifactAsync(
-        string reference, uint? maxBytes = null, CancellationToken cancellationToken = default) =>
+        string reference, uint? maxBytes = null, ulong? offset = null, CancellationToken cancellationToken = default) =>
         SendAsync<WorkArtifactRequest, WorkArtifactResponse>(
-            Route.WorkArtifactRoute(), new WorkArtifactRequest { Reference = reference, MaxBytes = maxBytes }, cancellationToken);
+            Route.WorkArtifactRoute(),
+            new WorkArtifactRequest { Reference = reference, MaxBytes = maxBytes, Offset = offset },
+            cancellationToken);
 
     public Task<WorkContextResponse> ReadContextAsync(
         uint? limit = null, CancellationToken cancellationToken = default) =>
         SendAsync<WorkContextRequest, WorkContextResponse>(
             Route.WorkContextRoute(), new WorkContextRequest { Limit = limit }, cancellationToken);
+
+    // PLATFORM-1 (F06): the exact-request submission receipt query. Read-only
+    // like the B3 routes: the server enforces the run-scoped read through the
+    // installed session grant, and the ledger answers from its own facts.
+
+    public Task<WorkSubmitResultResponse> SubmitResultAsync(
+        string clientRequestId, string? payloadDigest = null, CancellationToken cancellationToken = default) =>
+        SendAsync<WorkSubmitResultRequest, WorkSubmitResultResponse>(
+            Route.WorkSubmitResultRoute(),
+            new WorkSubmitResultRequest { ClientRequestId = clientRequestId, PayloadDigest = payloadDigest },
+            cancellationToken);
 
     private async Task ReadLoopAsync(CancellationToken cancellationToken)
     {

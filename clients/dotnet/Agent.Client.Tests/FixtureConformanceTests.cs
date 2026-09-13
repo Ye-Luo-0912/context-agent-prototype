@@ -107,6 +107,10 @@ public class FixtureConformanceTests
         Assert.True(snapshot.RunStarted);
         Assert.False(snapshot.RunCompleted);
         Assert.Equal(41ul, snapshot.Watermark);
+        // PLATFORM-3: the snapshot names the run and workspace that produced
+        // it — a reconnecting client can tell whose facts it is reading.
+        Assert.Equal("00000000-0000-4000-8000-000000000002", snapshot.RunId);
+        Assert.Equal("/workspaces/alpha", snapshot.WorkspaceRoot);
         Assert.Equal(1ul, snapshot.Focus!.AnchorRevision);
         Assert.Single(snapshot.Tasks);
         Assert.Equal(TaskSnapshotStatus.Active, snapshot.Tasks[0].Status);
@@ -118,6 +122,56 @@ public class FixtureConformanceTests
         Assert.Equal("docs/plan.md", snapshot.PendingApprovals[0].TargetSummary);
         snapshot.PendingApprovals[0].Validate();
         Assert.False(snapshot.ResyncRequired);
+        // EXEC-6 (R2-02): the restore-evidence degradation is a typed,
+        // re-obtainable snapshot fact. The shared fixture carries an empty
+        // list (nothing degraded); a populated list survives the round trip
+        // and an over-cap list fails validation closed.
+        Assert.Empty(snapshot.RestoreEvidenceDegraded);
+        var degraded = snapshot with
+        {
+            RestoreEvidenceDegraded = Enumerable.Range(0, WorkSnapshotResponse.MaxDegradedRuns + 1)
+                .Select(_ => "00000000-0000-4000-8000-000000000009")
+                .ToList(),
+        };
+        Assert.Throws<AgentContractViolationException>(() => degraded.Validate());
+        var bounded = snapshot with
+        {
+            RestoreEvidenceDegraded = ["00000000-0000-4000-8000-000000000009"],
+        };
+        bounded.Validate();
+        Assert.Single(bounded.RestoreEvidenceDegraded);
+    }
+
+    [Fact]
+    public void Task_completion_fixture_pins_the_retired_fact_cross_language()
+    {
+        // EXEC-8 (R2-09): a retired completion reads back from the durable
+        // journal as typed evidence; the shared fixture round-trips
+        // byte-identically so a .NET client decodes exactly what the
+        // runtime serialized.
+        var responseText = Read("task_completion_response.json");
+        AssertRoundTripByteIdentical<PlatformEnvelope<PlatformResponse<WorkTaskCompletionResponse>>>(
+            responseText, "task_completion_response.json");
+        var response = JsonSerializer.Deserialize<PlatformEnvelope<PlatformResponse<WorkTaskCompletionResponse>>>(
+            responseText, AgentJson.Options)!;
+        response.Payload.Validate();
+        var value = response.Payload.ExpectValue();
+        Assert.Equal("00000000-0000-4000-8000-000000000033", value.TaskId);
+        var retired = Assert.IsType<WorkCompletionFactRetired>(value.Fact);
+        Assert.Equal("migrated the retry table", retired.Summary);
+        Assert.Equal(3ul, retired.AnchorRevision);
+        var artifact = Assert.Single(retired.Artifacts);
+        Assert.StartsWith("artifact://v1/", artifact);
+        Assert.Equal(new string('a', 64), retired.FinalOutputDigest);
+        // A beyond-window fact is an honestly bounded unknown, and an
+        // over-cap retired fact fails validation closed.
+        new WorkCompletionFactBeyondJournalWindow().Validate();
+        var oversized = retired with
+        {
+            Artifacts = Enumerable.Range(0, WorkCompletionFactRetired.MaxArtifacts + 1)
+                .Select(_ => "artifact://v1/x/y/z").ToList(),
+        };
+        Assert.Throws<AgentContractViolationException>(() => oversized.Validate());
     }
 
     /// <summary>The endpoint suffix rule is pinned cross-language: the host
@@ -272,16 +326,32 @@ public class FixtureConformanceTests
             BytesAfter = 20,
             BeforeHash = "a1",
             AfterHash = "b2",
+            OldContentArtifact = "artifact://run/changes/tx-1-before",
         };
         var wire = JsonSerializer.Serialize(prepared, AgentJson.Options);
         Assert.Contains("\"kind\":\"mutation_prepared\"", wire, StringComparison.Ordinal);
-        Assert.DoesNotContain("old_content", wire, StringComparison.Ordinal);
+        // PLATFORM-2: the located reference travels; the journal's internal
+        // raw `old_content` body never does.
+        Assert.Contains("\"old_content_artifact\":", wire, StringComparison.Ordinal);
+        Assert.DoesNotContain("\"old_content\":", wire, StringComparison.Ordinal);
         var decoded = JsonSerializer.Deserialize<ChangeSummary>(wire, AgentJson.Options)!;
         Assert.Equal(ChangeSummaryKind.MutationPrepared, decoded.Kind);
         Assert.Equal("docs/plan.md", decoded.Path);
+        Assert.Equal("artifact://run/changes/tx-1-before", decoded.OldContentArtifact);
         Assert.True(
             JsonSerializer.Serialize(decoded, AgentJson.Options) == wire,
             $"change summary must round-trip byte-identically.{Environment.NewLine}expected: {wire}{Environment.NewLine}actual:   {JsonSerializer.Serialize(decoded, AgentJson.Options)}");
+
+        // Without a located reference the field is absent from the wire, and
+        // the raw `old_content` capture stays unacceptable in every shape.
+        var captureless = prepared with { OldContentArtifact = null };
+        var capturelessWire = JsonSerializer.Serialize(captureless, AgentJson.Options);
+        Assert.DoesNotContain("old_content", capturelessWire, StringComparison.Ordinal);
+        var forgedCapture = capturelessWire.Replace(
+            "\"after_hash\":\"b2\"",
+            "\"after_hash\":\"b2\",\"old_content\":\"stale\"",
+            StringComparison.Ordinal);
+        Assert.Throws<JsonException>(() => JsonSerializer.Deserialize<ChangeSummary>(forgedCapture, AgentJson.Options));
 
         // The journal's internal old-content capture must never be accepted
         // from the wire: an unknown field on the variant is a decode failure.
@@ -312,7 +382,7 @@ public class FixtureConformanceTests
             JsonSerializer.Serialize(full, AgentJson.Options), AgentJson.Options)!;
         reencoded.Validate();
 
-        var truncated = full with { SizeBytes = 100, Truncated = true };
+        var truncated = full with { SizeBytes = 100, Truncated = true, NextOffset = (ulong)body.LongLength };
         truncated.Validate();
 
         var lies = full with { SizeBytes = 32, Truncated = false };
@@ -359,6 +429,8 @@ public class FixtureConformanceTests
             RunStarted = true,
             RunCompleted = false,
             Watermark = 1,
+            RunId = RunId,
+            WorkspaceRoot = "/workspaces/alpha",
             Focus = new FocusSnapshot { TaskId = TaskId, Goal = longGoal, AnchorRevision = 1 },
             Tasks = [new TaskSnapshotEntry { TaskId = TaskId, Goal = longGoal, Status = TaskSnapshotStatus.Active }],
             PendingApprovals = [],
@@ -385,6 +457,233 @@ public class FixtureConformanceTests
             {
                 Focus = new FocusSnapshot { TaskId = TaskId, Goal = overGoal, AnchorRevision = 1 },
             }).Validate());
+    }
+
+    // -----------------------------------------------------------------------
+    // PLATFORM-1 (F06): the exact-request submission receipt query. Wire
+    // shapes pinned like the B3 routes (independent of the older fixture
+    // set), plus the cross-language digest golden the conflict
+    // classification depends on.
+    // -----------------------------------------------------------------------
+
+    private const string RunId = "00000000-0000-4000-8000-000000000031";
+
+    [Fact]
+    public void Submit_result_disposition_pins_snake_case_wire_and_fact_binding()
+    {
+        // A conflict answer: snake_case disposition on the wire, the recorded
+        // task, and the digest the id was originally admitted for.
+        const string conflict = """
+            {"run_id":"00000000-0000-4000-8000-000000000031","client_request_id":"client-1",
+             "disposition":"known_rejected","task_id":"00000000-0000-4000-8000-000000000022",
+             "accepted_payload_digest":"f9e5a123a1495f7c02973725850272a97e070a586e6640b570dd06db44170016"}
+            """;
+        var compact = JsonSerializer.Serialize(
+            JsonSerializer.Deserialize<JsonElement>(conflict, AgentJson.Options), AgentJson.Options);
+        var decoded = JsonSerializer.Deserialize<WorkSubmitResultResponse>(compact, AgentJson.Options)!;
+        decoded.Validate();
+        Assert.Equal(WorkSubmitResultDisposition.KnownRejected, decoded.Disposition);
+        Assert.Equal(TaskId, decoded.TaskId);
+        Assert.False(decoded.Disposition.IsAdmitted());
+        Assert.False(decoded.Disposition.IsIndeterminate());
+
+        var reencoded = JsonSerializer.Serialize(decoded, AgentJson.Options);
+        Assert.True(reencoded == compact,
+            $"submit result must round-trip byte-identically.{Environment.NewLine}expected: {compact}{Environment.NewLine}actual:   {reencoded}");
+
+        // An indeterminate answer proves nothing and must not manufacture a
+        // task; an admitted answer must name the task it bound.
+        const string unknown = """
+            {"run_id":"00000000-0000-4000-8000-000000000031","client_request_id":"client-1",
+             "disposition":"unknown"}
+            """;
+        var unknownDecoded = JsonSerializer.Deserialize<WorkSubmitResultResponse>(
+            JsonSerializer.Serialize(JsonSerializer.Deserialize<JsonElement>(unknown, AgentJson.Options), AgentJson.Options),
+            AgentJson.Options)!;
+        unknownDecoded.Validate();
+        Assert.True(unknownDecoded.Disposition.IsIndeterminate());
+
+        Assert.Throws<AgentContractViolationException>(() =>
+            (unknownDecoded with { TaskId = TaskId }).Validate());
+        // The recorded-payload digest belongs to a conflict only: any other
+        // disposition carrying one is a contradiction.
+        Assert.Throws<AgentContractViolationException>(() =>
+            (decoded with { Disposition = WorkSubmitResultDisposition.Accepted }).Validate());
+        Assert.Throws<AgentContractViolationException>(() =>
+            (unknownDecoded with { Disposition = WorkSubmitResultDisposition.Unknown, AcceptedPayloadDigest = "aa" }).Validate());
+
+        // Unknown fields are a decode failure, not silently ignored facts.
+        var forged = compact.Replace(
+            "\"disposition\":\"known_rejected\"",
+            "\"disposition\":\"known_rejected\",\"goal\":\"sneaky\"",
+            StringComparison.Ordinal);
+        Assert.Throws<JsonException>(() => JsonSerializer.Deserialize<WorkSubmitResultResponse>(forged, AgentJson.Options));
+    }
+
+    /// <summary>The conflict classification only means anything if the .NET
+    /// client and the Rust host hash identically. The golden hex pins the
+    /// documented domain-separated preimage
+    /// (DOMAIN || 0x00 || utf8(goal)); the Rust side pins the same
+    /// construction in agent-platform-protocol's
+    /// <c>submission_payload_digest_is_stable_and_content_bound</c>.</summary>
+    [Fact]
+    public void Submit_payload_digest_matches_the_host_golden_preimage()
+    {
+        Assert.Equal(
+            "f9e5a123a1495f7c02973725850272a97e070a586e6640b570dd06db44170016",
+            SubmitPayloadDigest.Compute("migrate the retry table"));
+        Assert.NotEqual(
+            SubmitPayloadDigest.Compute("migrate the retry table"),
+            SubmitPayloadDigest.Compute("migrate the retry tablE"));
+    }
+
+    [Fact]
+    public void Snapshot_identity_facts_are_mandatory_and_bounded()
+    {
+        var snapshot = new WorkSnapshotResponse
+        {
+            RunStarted = true,
+            RunCompleted = false,
+            Watermark = 1,
+            RunId = RunId,
+            WorkspaceRoot = "/workspaces/alpha",
+            Tasks = [],
+            PendingApprovals = [],
+            ResyncRequired = false,
+        };
+        snapshot.Validate();
+
+        // A nil run id is not a run identity.
+        Assert.Throws<AgentContractViolationException>(
+            () => (snapshot with { RunId = "00000000-0000-0000-0000-000000000000" }).Validate());
+        // An empty workspace root is not an identity either.
+        Assert.Throws<AgentContractViolationException>(
+            () => (snapshot with { WorkspaceRoot = "" }).Validate());
+        Assert.Throws<AgentContractViolationException>(
+            () => (snapshot with { WorkspaceRoot = "/workspaces/alpha" }).Validate());
+        // Over the shared path bound is refused; at the bound is legal.
+        Assert.Throws<AgentContractViolationException>(
+            () => (snapshot with { WorkspaceRoot = new string('/', WorkSnapshotResponse.MaxWorkspaceRootBytes + 1) }).Validate());
+        (snapshot with { WorkspaceRoot = new string('/', WorkSnapshotResponse.MaxWorkspaceRootBytes) }).Validate();
+    }
+
+    /// <summary>PLATFORM-3: the endpoint discriminator hashes the RESOLVED
+    /// workspace root — the host canonicalizes before hashing, so the client
+    /// must too, or a relative/symlinked spelling derives a different
+    /// endpoint than the one the host bound. The byte primitive stays exact
+    /// (the fixture pins it); resolution happens above it, and the
+    /// snapshot's host-side root remains the equality authority.</summary>
+    [Fact]
+    public void Workspace_identity_resolves_before_hashing()
+    {
+        var existing = Path.Combine(Path.GetTempPath(), $"p3-resolve-{Guid.NewGuid():N}", "sub");
+        Directory.CreateDirectory(existing);
+
+        try
+        {
+            var absolute = WorkspaceIdentity.Resolve(existing);
+            var relative = WorkspaceIdentity.Resolve(Path.Combine(existing, "sub", ".."));
+
+            Assert.Equal(absolute.EndpointSuffix, relative.EndpointSuffix);
+            Assert.Equal(Path.GetFullPath(existing), absolute.Root);
+            Assert.Contains(absolute.Root, absolute.Display);
+
+            // The spelling-sensitive primitive stays byte-exact above
+            // resolution: two spellings of one directory legitimately differ
+            // there — which is exactly why Default* go through Resolve.
+            Assert.NotEqual(
+                AgentTransports.WorkspaceEndpointSuffix(
+                    Path.Combine(existing, "sub", "..")),
+                AgentTransports.WorkspaceEndpointSuffix(existing));
+
+            // A drive root never collapses to a drive-relative spelling.
+            var driveRoot = Path.GetPathRoot(Path.GetTempPath())!;
+            Assert.Equal(driveRoot, WorkspaceIdentity.Resolve(driveRoot).Root);
+        }
+        finally
+        {
+            try { Directory.Delete(Path.GetDirectoryName(existing)!, recursive: true); } catch { }
+        }
+
+        Assert.Throws<ArgumentException>(() => WorkspaceIdentity.Resolve("  "));
+    }
+
+    /// <summary>PLATFORM-4: the usage facts a GUI renders for "why did this
+    /// cost anything" are pinned cross-language — the same fixture bytes the
+    /// Rust side decodes into the typed kernel envelope feed the .NET
+    /// accessor here.</summary>
+    [Fact]
+    public void Event_fixture_pins_model_usage_facts()
+    {
+        var text = Read("event_model_used.json");
+        AssertRoundTripByteIdentical<PlatformEnvelope<WorkEventNotification>>(text, "event_model_used.json");
+        var notification = JsonSerializer.Deserialize<PlatformEnvelope<WorkEventNotification>>(text, AgentJson.Options)!;
+        notification.Validate(FixtureIdentity);
+        var envelope = notification.Payload.Envelope;
+        Assert.Equal(41ul, envelope.Seq);
+        Assert.Equal("00000000-0000-4000-8000-000000000002", envelope.RunId);
+        Assert.False(envelope.IsLiveOnlyProgress);
+
+        Assert.True(envelope.TryGetModelUsage(out var usage));
+        Assert.Equal(100ul, usage.InputTokens);
+        Assert.Equal(5ul, usage.OutputTokens);
+        Assert.Equal(80ul, usage.CachedInputTokens);
+        Assert.Equal(1u, usage.Attempts);
+        Assert.Equal("observed", usage.UsageIdentity);
+        Assert.True(usage.IsObserved);
+        Assert.False(usage.IsIndeterminate);
+
+        // A non-usage event yields no facts — that is about the event, not
+        // about consumption.
+        var nonUsage = JsonSerializer.Deserialize<PlatformEnvelope<WorkEventNotification>>(
+            text.Replace("\"type\":\"model_used\"", "\"type\":\"turn_completed\"", StringComparison.Ordinal),
+            AgentJson.Options)!;
+        Assert.False(nonUsage.Payload.Envelope.TryGetModelUsage(out _));
+    }
+
+    /// <summary>COST-6 (R2-10): the cache-write and cache-miss counters are
+    /// readable at the SDK off the same fixture bytes the Rust side pins.
+    /// The counters stay null when the provider did not report them —
+    /// a missing report is never read as a zero.</summary>
+    [Fact]
+    public void Event_fixture_pins_cache_write_and_miss_facts()
+    {
+        var text = Read("event_model_used_cache_fields.json");
+        AssertRoundTripByteIdentical<PlatformEnvelope<WorkEventNotification>>(text, "event_model_used_cache_fields.json");
+        var notification = JsonSerializer.Deserialize<PlatformEnvelope<WorkEventNotification>>(text, AgentJson.Options)!;
+        notification.Validate(FixtureIdentity);
+
+        Assert.True(notification.Payload.Envelope.TryGetModelUsage(out var usage));
+        Assert.Equal(80ul, usage.CachedInputTokens);
+        Assert.Equal(10ul, usage.CacheWriteInputTokens);
+        Assert.Equal(20ul, usage.CacheMissInputTokens);
+        Assert.Equal("main", usage.Role);
+        Assert.True(usage.IsObserved);
+
+        // The legacy fixture (no cache write/miss on the wire) keeps them
+        // null — an unreported counter is not an invented zero.
+        var legacy = Read("event_model_used.json");
+        var legacyNotification = JsonSerializer.Deserialize<PlatformEnvelope<WorkEventNotification>>(legacy, AgentJson.Options)!;
+        Assert.True(legacyNotification.Payload.Envelope.TryGetModelUsage(out var legacyUsage));
+        Assert.Null(legacyUsage.CacheWriteInputTokens);
+        Assert.Null(legacyUsage.CacheMissInputTokens);
+    }
+
+    /// <summary>COST-1 (E05.3): the compaction event carries its own usage
+    /// identity across the language boundary — the GUI classifies the cost
+    /// row from the wire fact instead of guessing.</summary>
+    [Fact]
+    public void Event_fixture_pins_compaction_usage_identity()
+    {
+        var text = Read("event_context_compacted.json");
+        AssertRoundTripByteIdentical<PlatformEnvelope<WorkEventNotification>>(text, "event_context_compacted.json");
+        var notification = JsonSerializer.Deserialize<PlatformEnvelope<WorkEventNotification>>(text, AgentJson.Options)!;
+        notification.Validate(FixtureIdentity);
+        var envelope = notification.Payload.Envelope;
+        Assert.Equal("context_compacted", envelope.EventType);
+        Assert.False(envelope.IsLiveOnlyProgress);
+        Assert.Equal("estimated", envelope.Event.GetProperty("usage_identity").GetString());
+        Assert.Equal(12000ul, envelope.Event.GetProperty("input_tokens").GetUInt64());
     }
 
     private const string TaskId = "00000000-0000-4000-8000-000000000022";

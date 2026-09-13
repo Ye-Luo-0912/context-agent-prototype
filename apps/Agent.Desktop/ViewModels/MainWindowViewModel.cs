@@ -81,17 +81,45 @@ public sealed class ContextItemRowViewModel
     public string KindLabel { get; init; } = string.Empty;
     public string Line { get; init; } = string.Empty;
 
+    /// <summary>C4: freshness/residency tag rendered from the PLATFORM-2
+    /// typed fields. A missing field (legacy server) renders as unknown —
+    /// never guessed from kind or prose.</summary>
+    public string FreshnessLabel { get; init; } = string.Empty;
+
     public static ContextItemRowViewModel From(ContextItemSummary item)
     {
         var kind = item.Kind.ValueKind == System.Text.Json.JsonValueKind.String
             ? item.Kind.GetString() ?? "?"
             : "?";
         var source = string.IsNullOrEmpty(item.Source) ? "（无来源标注）" : item.Source;
+        var freshness = Freshness(item);
         return new ContextItemRowViewModel
         {
             Id = item.Id,
             KindLabel = kind,
-            Line = $"{source} · 重要性 {item.Importance:0.##}",
+            FreshnessLabel = freshness,
+            Line = $"{source} · 重要性 {item.Importance:0.##} · {freshness}",
+        };
+    }
+
+    /// <summary>C4: the four-state freshness fact — actually sent this turn,
+    /// resident (available but not in the latest surface), stored
+    /// (pointer-only without a fetch), or unknown when the server predates
+    /// the typed fields. warm/cold read as stored: neither is the working
+    /// set.</summary>
+    internal static string Freshness(ContextItemSummary item)
+    {
+        if (string.IsNullOrEmpty(item.Residency))
+        {
+            return "新鲜度未知";
+        }
+        return item.Residency switch
+        {
+            "resident" when item.SelectedCurrentTurn is true => "驻留 · 本轮已发送",
+            "resident" => "驻留（未在最新表面）",
+            "warm" => "暖缓冲（正文可取回）",
+            "cold" or "external" => "存储中（仅摘要指针）",
+            _ => "新鲜度未知",
         };
     }
 }
@@ -169,6 +197,21 @@ public enum TransportKind
     LayoutPreview = 3,
 }
 
+/// <summary>GUI-3: the cancel surface's honest phase. <see cref="Requested"/>
+/// means the cancel request was SENT — not that the turn stopped; only a
+/// typed ack (<c>TurnCancelAckStatus.Cancelled</c>) proves the barrier, a
+/// <c>NoActiveTurn</c> ack is a fact (not a failure), and an undetermined
+/// outcome keeps the side-effect warning until a trusted snapshot
+/// re-derives the state.</summary>
+public enum CancelRequestPhase
+{
+    Idle,
+    Requested,
+    Cancelled,
+    NoActiveTurn,
+    Unknown,
+}
+
 public sealed class MainWindowViewModel : ObservableObject, IAsyncDisposable
 {
     private static readonly string[] TransportLabels =
@@ -202,6 +245,15 @@ public sealed class MainWindowViewModel : ObservableObject, IAsyncDisposable
     private readonly object _handoffGate = new();
     private List<(IAgentConnection Connection, WorkEventNotification Item)> _pendingUiEvents = new();
     private StringBuilder _pendingUiDelta = new();
+
+    /// <summary>F07: the connection instance the currently buffered delta
+    /// text was produced by. The delta buffer has no per-item stamp (it is one
+    /// coalesced string), so the era is tracked alongside it: a queued drain
+    /// flushes the text only while THIS connection is still the live one, and
+    /// <see cref="DisconnectCoreAsync"/> drops the buffer outright. Without
+    /// this, a delta buffered under a retired connection was appended to the
+    /// output panel with no era check at all.</summary>
+    private IAgentConnection? _deltaEraConnection;
     private bool _uiDrainPosted;
 
     /// <summary>F13: connection era. Every await that ends in ApplySnapshot
@@ -222,19 +274,33 @@ public sealed class MainWindowViewModel : ObservableObject, IAsyncDisposable
 
     /// <summary>A submit whose server-side outcome is unknown keeps its
     /// client_request_id here so a retry of the same goal is idempotent.
-    /// The pair is resolved from snapshot FACTS the next time one is
-    /// applied — never replayed blindly: a host restart retires the
-    /// client_request_id, so a resubmission of the same goal would be a
-    /// NEW admission, not an idempotent re-read.</summary>
+    /// GUI-3/F06: the pair is resolved ONLY by the exact-request ledger query
+    /// (<c>work.submit_result</c>) — the snapshot's task list is never
+    /// consulted, because a same-goal task is not evidence about this request
+    /// id. The goal is kept solely to compute the query's payload digest; it
+    /// never takes part in any matching.</summary>
     private string? _outstandingSubmitId;
     private string? _outstandingSubmitGoal;
 
     /// <summary>R07: true while the outstanding submit is still awaiting its
-    /// receipt (Pending); false once the receipt is lost or unknown, so a
-    /// snapshot may resolve the key from facts. A PENDING submit must never
-    /// be cleared by a concurrent refresh — that is what keeps a same-goal
-    /// retry on the SAME client_request_id instead of a new admission.</summary>
+    /// receipt (Pending); false once the receipt is lost or unknown, so the
+    /// ledger query may resolve the key from facts. A PENDING submit must
+    /// never be resolved by a concurrent refresh — that is what keeps a
+    /// same-goal retry on the SAME client_request_id instead of a new
+    /// admission.</summary>
     private bool _outstandingSubmitAwaitingReceipt;
+
+    /// <summary>GUI-3/F06: single-flight for the ledger resolution query —
+    /// every applied snapshot re-asks while a key is outstanding, and at most
+    /// one query is in flight at any time.</summary>
+    private int _submitResultQueryInFlight;
+
+    /// <summary>GUI-3/F06: the indeterminate (Unknown/Expired/failed) verdict
+    /// for the CURRENT outstanding id has been reported once. Definitive
+    /// verdicts always report (they release the key, so they happen at most
+    /// once per id); repeating "still unknown" on every snapshot would only
+    /// bury the output panel.</summary>
+    private bool _outstandingSubmitResolutionReported;
 
     /// <summary>Connection-loss observations for the CURRENT connection
     /// era (UI-thread confined). Zeroed on every successful rebuild and
@@ -281,6 +347,62 @@ public sealed class MainWindowViewModel : ObservableObject, IAsyncDisposable
     private string _artifactText = "工件：未读取（unavailable）。只显示服务端有界返回的正文。";
     private string _contextStatusText = "只读 Context：未读取（unavailable）。";
 
+
+    // ---------------------------------------------------------------------
+    // C4 (GUI-4): session cost accounting, read straight off the typed
+    // model_used facts (PLATFORM-4's TryGetModelUsage). The three identity
+    // classes are NEVER summed together: observed tokens are the
+    // provider-reported bill; estimated are runtime approximations;
+    // unknown rounds are real costs whose evidence is lost (a cancelled
+    // in-flight call) — they are COUNTED, never rendered as zero.
+    // ---------------------------------------------------------------------
+
+    private ulong _costObservedInput;
+    private ulong _costObservedOutput;
+    private ulong _costObservedCached;
+    private int _costObservedRounds;
+    private ulong _costEstimatedInput;
+    private ulong _costEstimatedOutput;
+    private int _costEstimatedRounds;
+    private int _costUnknownRounds;
+    // COST-9 (R3-14): render rows shed by the bounded queue after their
+    // cost facts were accumulated — observability for the lossy log, not a
+    // hole in the totals.
+    private int _costRenderRowsShed;
+    // COST-7: the maintenance/compactor lane's observed rows, kept apart
+    // from the main-round bill (both are service-reported, but the lanes
+    // are different cost centers).
+    private int _costMaintenanceRounds;
+    private ulong _costMaintenanceInput;
+    private ulong _costMaintenanceOutput;
+    // C4: compaction cost (context_compacted). The event carries NO usage
+    // identity, so its counters are service-reported numbers kept OUTSIDE
+    // the observed model bill — never upgraded into "measured" by the GUI.
+    private int _costCompactions;
+    private ulong _costCompactionInput;
+    private ulong _costCompactionOutput;
+    private string _costSummaryText = "成本账目：暂无模型调用。";
+
+    public string CostSummaryText { get => _costSummaryText; private set => Set(ref _costSummaryText, value); }
+
+    // ---------------------------------------------------------------------
+    // C2 (GUI-2): bounded paging-review window over one artifact. The window
+    // accumulates the paged reads' bytes (drop-oldest at a hard cap), so a
+    // large artifact's tail is reachable and re-readable WITHOUT re-triggering
+    // any model or tool side effect — every page is a read-only wire call that
+    // re-verifies the same sealed identity.
+    // ---------------------------------------------------------------------
+
+    /// <summary>C2: hard cap on the accumulated review window. Beyond it the
+    /// OLDEST bytes are released (never silently: the panel says so) — the
+    /// full artifact stays on the host, readable page by page.</summary>
+    internal const int MaxArtifactWindowBytes = 1024 * 1024;
+
+    private readonly List<byte> _artifactWindow = new();
+    private string? _artifactSessionReference;
+    private ulong _artifactWindowStart;
+    private int _artifactReadInFlight;
+
     public MainWindowViewModel(IUiDispatcher? uiDispatcher = null)
     {
         _ui = uiDispatcher ?? AvaloniaUiDispatcher.Instance;
@@ -288,26 +410,26 @@ public sealed class MainWindowViewModel : ObservableObject, IAsyncDisposable
         ConnectCommand = AsyncCommands.Add(
             () => ConnectAsync(),
             () => !IsConnected,
-            error => AppendOutput($"连接失败：{error.Message}"));
+            error => AppendLog($"连接失败：{error.Message}"));
         DisconnectCommand = AsyncCommands.Add(
             () => DisconnectAsync(),
             () => IsConnected);
         SubmitCommand = AsyncCommands.Add(
             () => SubmitAsync(),
             () => IsConnected && GoalInput.Trim().Length > 0,
-            error => AppendOutput($"提交失败：{error.Message}"));
+            error => AppendLog($"提交失败：{error.Message}"));
         ContinueCommand = AsyncCommands.Add(
             () => ContinueAsync(),
             () => IsConnected,
-            error => AppendOutput($"继续失败：{error.Message}"));
+            error => AppendLog($"继续失败：{error.Message}"));
         CancelCommand = AsyncCommands.Add(
             () => CancelAsync(),
             () => IsConnected,
-            error => AppendOutput($"取消失败：{error.Message}"));
+            error => AppendLog($"取消失败：{error.Message}"));
         RefreshCommand = AsyncCommands.Add(
             () => RefreshSnapshotNowAsync(),
             () => IsConnected,
-            error => AppendOutput($"刷新失败：{error.Message}"));
+            error => AppendLog($"刷新失败：{error.Message}"));
 
         // C3 B3 read-only routes: observation only — never a model round,
         // never a mutation. Each command refreshes its panel from the server
@@ -315,15 +437,26 @@ public sealed class MainWindowViewModel : ObservableObject, IAsyncDisposable
         RefreshChangesCommand = AsyncCommands.Add(
             () => RefreshChangesAsync(),
             () => IsConnected,
-            error => AppendOutput($"读取变更失败：{error.Message}"));
+            error => AppendLog($"读取变更失败：{error.Message}"));
         ReadArtifactCommand = AsyncCommands.Add(
             () => ReadArtifactAsync(),
             () => IsConnected && ArtifactReference.Trim().Length > 0,
-            error => AppendOutput($"读取工件失败：{error.Message}"));
+            error => AppendLog($"读取工件失败：{error.Message}"));
+        // C2 (GUI-2): paging continues from the server's own cursor and is
+        // disabled at eof — a read-only continuation, never a re-trigger of
+        // any work.
+        NextArtifactPageCommand = AsyncCommands.Add(
+            () => ReadNextArtifactPageAsync(),
+            () => IsConnected && ArtifactNextOffset.HasValue,
+            error => AppendLog($"读取工件下一页失败：{error.Message}"));
+        ReadArtifactTailCommand = AsyncCommands.Add(
+            () => ReadArtifactTailAsync(),
+            () => IsConnected && ArtifactReference.Trim().Length > 0,
+            error => AppendLog($"读取工件尾部失败：{error.Message}"));
         RefreshContextCommand = AsyncCommands.Add(
             () => RefreshContextAsync(),
             () => IsConnected,
-            error => AppendOutput($"读取上下文失败：{error.Message}"));
+            error => AppendLog($"读取上下文失败：{error.Message}"));
 
         // Fallback safety-net refresh; the PRIMARY driver is the event
         // stream. Inert under the inline drill dispatcher.
@@ -352,6 +485,10 @@ public sealed class MainWindowViewModel : ObservableObject, IAsyncDisposable
     public ICommand RefreshChangesCommand { get; }
     public ICommand ReadArtifactCommand { get; }
     public ICommand RefreshContextCommand { get; }
+
+    // C2 (GUI-2): artifact paging commands (PLATFORM-2 continuation cursor).
+    public ICommand NextArtifactPageCommand { get; }
+    public ICommand ReadArtifactTailCommand { get; }
 
     public ObservableCollection<TaskItemViewModel> Tasks { get; } = [];
     public ObservableCollection<ApprovalItemViewModel> Approvals { get; } = [];
@@ -406,9 +543,13 @@ public sealed class MainWindowViewModel : ObservableObject, IAsyncDisposable
         {
             if (Set(ref _selectedTask, value))
             {
+                // F07: every selection change (including to null) advances the
+                // ordinal, so a detail read still in flight for the previous
+                // selection is retired and can never paint this one's panel.
+                var selection = Interlocked.Increment(ref _selectionSequence);
                 if (value is not null)
                 {
-                    _ = LoadTaskDetailAsync(value.TaskId);
+                    _ = LoadTaskDetailAsync(value.TaskId, selection);
                 }
             }
         }
@@ -442,8 +583,16 @@ public sealed class MainWindowViewModel : ObservableObject, IAsyncDisposable
     /// before any read.</summary>
     public string ArtifactText { get => _artifactText; private set => Set(ref _artifactText, value); }
 
+    /// <summary>C2 (GUI-2): the server's continuation cursor for the current
+    /// artifact session — null once the last read reached eof (and before any
+    /// read). Drives the「下一页」command's availability.</summary>
+    private ulong? _artifactNextOffset;
+
+    public ulong? ArtifactNextOffset { get => _artifactNextOffset; private set => Set(ref _artifactNextOffset, value); }
+
     /// <summary>C3: status line of the read-only context panel.</summary>
     public string ContextStatusText { get => _contextStatusText; private set => Set(ref _contextStatusText, value); }
+
 
     public bool IsConnected
     {
@@ -467,6 +616,26 @@ public sealed class MainWindowViewModel : ObservableObject, IAsyncDisposable
     /// <summary>Honest execution state rendered only from typed snapshot
     /// fields; before the first snapshot it says so.</summary>
     public string RunStateText { get => _runStateText; private set => Set(ref _runStateText, value); }
+
+    /// <summary>GUI-3: the cancel request's phase and its honest text —
+    /// "requested" from the moment the frame is sent, upgraded only by typed
+    /// facts (ack / snapshot), never by hope.</summary>
+    private CancelRequestPhase _cancelPhase = CancelRequestPhase.Idle;
+    private string _cancelStateText = "尚未发出取消请求。";
+
+    public CancelRequestPhase CancelPhase { get => _cancelPhase; private set => Set(ref _cancelPhase, value); }
+
+    public string CancelStateText { get => _cancelStateText; private set => Set(ref _cancelStateText, value); }
+
+    private void SetCancelPhase(CancelRequestPhase phase, string text)
+    {
+        CancelPhase = phase;
+        CancelStateText = text;
+    }
+
+    /// <summary>GUI-3: while a cancel is in flight its outcome is owned by the
+    /// in-flight request; snapshots must not re-derive the phase under it.</summary>
+    private int _cancelInFlight;
 
     /// <summary>The snapshot carries no plan/open-loops projection yet — the
     /// panel says so instead of reconstructing one from event prose.</summary>
@@ -520,6 +689,13 @@ public sealed class MainWindowViewModel : ObservableObject, IAsyncDisposable
     /// receipt rendering, follow-up refresh).</summary>
     internal Task SubmitForTestsAsync() => SubmitAsync();
 
+    /// <summary>GUI-3 drill seam: the real continue path (typed receipt with
+    /// selected-task comparison).</summary>
+    internal Task ContinueForTestsAsync() => ContinueAsync();
+
+    /// <summary>GUI-3 drill seam: the real cancel path (phase machine).</summary>
+    internal Task CancelForTestsAsync() => CancelAsync();
+
     /// <summary>R07 drill observation: the client_request_id currently held
     /// outstanding (unchanged while Pending and after a lost receipt, so a
     /// same-goal retry stays on the same admission identity).</summary>
@@ -529,8 +705,11 @@ public sealed class MainWindowViewModel : ObservableObject, IAsyncDisposable
     internal Task RespondApprovalForTestsAsync(string requestId, ApprovalDecision decision) =>
         RespondApprovalAsync(requestId, decision);
 
-    /// <summary>C3 drill seam: the task-detail read path a selection triggers.</summary>
-    internal Task LoadTaskDetailForTestsAsync(string taskId) => LoadTaskDetailAsync(taskId);
+    /// <summary>C3 drill seam: the task-detail read path a selection triggers.
+    /// F07: it runs under the CURRENT selection ordinal, exactly like a real
+    /// selection, so era/selection fencing is exercised as production does.</summary>
+    internal Task LoadTaskDetailForTestsAsync(string taskId) =>
+        LoadTaskDetailAsync(taskId, Volatile.Read(ref _selectionSequence));
 
     /// <summary>C3 drill seam: the change-journal read path.</summary>
     internal Task RefreshChangesForTestsAsync() => RefreshChangesAsync();
@@ -542,12 +721,21 @@ public sealed class MainWindowViewModel : ObservableObject, IAsyncDisposable
         return ReadArtifactAsync();
     }
 
+    /// <summary>C2 drill seam: the paging continuation path.</summary>
+    internal Task ReadNextArtifactPageForTestsAsync() => ReadNextArtifactPageAsync();
+
+    /// <summary>C2 drill seam: the tail-jump path.</summary>
+    internal Task ReadArtifactTailForTestsAsync() => ReadArtifactTailAsync();
+
     /// <summary>C3 drill seam: the read-only context read path.</summary>
     internal Task RefreshContextForTestsAsync() => RefreshContextAsync();
 
     /// <summary>Bound drill seam: writes through the same bounded output
     /// path the events and receipts use.</summary>
     internal void AppendOutputForTests(string line) => AppendOutput(line);
+
+    /// <summary>C2 drill seam: writes through the bounded log path.</summary>
+    internal void AppendLogForTests(string line) => AppendLog(line);
 
     /// <summary>R14 drill observation: pending delta chars awaiting the UI,
     /// capped at the source by the output budget.</summary>
@@ -563,17 +751,38 @@ public sealed class MainWindowViewModel : ObservableObject, IAsyncDisposable
         get { lock (_handoffGate) { return _uiDrainPosted; } }
     }
 
-    private void AppendOutput(string line)
+    private void AppendOutput(string line) => OutputText = AppendBoundedLine(_outputBuilder, line);
+
+    // -----------------------------------------------------------------------
+    // C2 (GUI-2): 输出正文与运行日志分离。OutputText is the MODEL's own
+    // content (streamed deltas only); LogText is the workbench's operational
+    // record (receipts, failures, accounting). A log line is never presented
+    // as the task's result, and the result panel is never padded with
+    // operational prose.
+    // -----------------------------------------------------------------------
+
+    /// <summary>C2: bounded operational log (receipts/failures/accounting),
+    /// same retention bounds as the output panel.</summary>
+    private readonly StringBuilder _logBuilder = new();
+    private string _logText = string.Empty;
+
+    public string LogText { get => _logText; private set => Set(ref _logText, value); }
+
+    private void AppendLog(string line) => LogText = AppendBoundedLine(_logBuilder, line);
+
+    /// <summary>The shared bounded-append: whole-line retention cap plus the
+    /// byte budget, dropping the OLDEST lines only.</summary>
+    private static string AppendBoundedLine(StringBuilder builder, string line)
     {
-        _outputBuilder.AppendLine(line);
-        var text = _outputBuilder.ToString();
+        builder.AppendLine(line);
+        var text = builder.ToString();
         var lines = text.Split('\n');
         if (lines.Length > MaxOutputLines)
         {
             text = string.Join('\n', lines[^MaxOutputLines..]);
         }
         // N4: byte bound on top of the line bound — drop whole OLDEST lines
-        // (never mid-line) until the retained output fits the budget.
+        // (never mid-line) until the retained text fits the budget.
         while (Encoding.UTF8.GetByteCount(text) > MaxOutputBytes)
         {
             var newline = text.IndexOf('\n');
@@ -584,15 +793,41 @@ public sealed class MainWindowViewModel : ObservableObject, IAsyncDisposable
             }
             text = text[(newline + 1)..];
         }
-        _outputBuilder.Clear();
-        _outputBuilder.Append(text);
-        OutputText = text;
+        builder.Clear();
+        builder.Append(text);
+        return text;
     }
 
-    private IAgentTransport BuildTransport() => (TransportKind)TransportIndex switch
+    /// <summary>
+    /// F05: the transport the production connect actually builds. The
+    /// <see cref="TransportKind.RealHost"/> default is PLATFORM-AWARE — it
+    /// asks the SDK for the local transport of THIS OS (named pipe on
+    /// Windows, workspace-scoped UDS on Unix) instead of falling through to
+    /// the Windows pipe and throwing <c>PlatformNotSupportedException</c> on
+    /// Linux. The two explicit kinds keep the user's typed endpoint verbatim,
+    /// and the pipe kind still fails closed off Windows (it never pretends
+    /// the custom endpoint is a socket).
+    /// </summary>
+    internal IAgentTransport BuildTransport() => BuildTransport(
+        (TransportKind)TransportIndex, Endpoint, OperatingSystem.IsWindows());
+
+    /// <summary>
+    /// F05: the platform-aware decision, factored from OS detection so the
+    /// non-Windows branch is testable on any host — the defect this pins
+    /// (RealHost → Windows pipe) only misbehaves off Windows, so the drill
+    /// must be able to drive that branch regardless of where the tests run.
+    /// </summary>
+    internal static IAgentTransport BuildTransport(
+        TransportKind kind, string endpoint, bool isWindows) => kind switch
     {
-        TransportKind.UnixSocket => new UnixDomainSocketTransport(Endpoint),
-        _ => new NamedPipeTransport(Endpoint),
+        TransportKind.WindowsNamedPipe => new NamedPipeTransport(endpoint),
+        TransportKind.UnixSocket => new UnixDomainSocketTransport(endpoint),
+        // RealHost (default) and LayoutPreview: the platform-correct LOCAL
+        // endpoint, never an OS-specific guess.
+        _ => isWindows
+            ? new NamedPipeTransport(AgentTransports.DefaultPipeName)
+            : new UnixDomainSocketTransport(
+                AgentTransports.DefaultSocketPathFor(Environment.CurrentDirectory)),
     };
 
     private async Task ConnectAsync()
@@ -651,12 +886,12 @@ public sealed class MainWindowViewModel : ObservableObject, IAsyncDisposable
                 ? "连接丢失。挂起的审批不会自动通过；正在重连并从快照重建。"
                 : $"连接丢失：已观测到 {_reconnectFailures} 次连接失败（最近：{BoundBannerDetail(failure.Message)}）。"
                     + "宿主可能已停止；宿主恢复后将自动从快照重建。挂起的审批不会自动通过。";
-            AppendOutput($"连接丢失：{failure.Message}");
+            AppendLog($"连接丢失：{failure.Message}");
         });
         _connection = session;
         Interlocked.Increment(ref _generation);
         IsConnected = true;
-        AppendOutput($"已连接：{TransportLabels[TransportIndex]} / {Endpoint}");
+        AppendLog($"已连接：{TransportLabels[TransportIndex]} / {Endpoint}");
         StartEventPump(session);
         var generation = Volatile.Read(ref _generation);
         WorkSnapshotResponse first;
@@ -666,7 +901,7 @@ public sealed class MainWindowViewModel : ObservableObject, IAsyncDisposable
         }
         catch (Exception failure)
         {
-            AppendOutput($"握手失败：{failure.Message}。未建立任何任务事实，可重试连接。");
+            AppendLog($"握手失败：{failure.Message}。未建立任何任务事实，可重试连接。");
             await DisconnectCoreAsync();
             return;
         }
@@ -723,7 +958,7 @@ public sealed class MainWindowViewModel : ObservableObject, IAsyncDisposable
         }
         catch (Exception failure)
         {
-            _ui.Post(() => AppendOutput(
+            _ui.Post(() => AppendLog(
                 $"事件流结束：{failure.Message}。请从快照重建；挂起的审批不会自动通过。"));
         }
     }
@@ -754,13 +989,21 @@ public sealed class MainWindowViewModel : ObservableObject, IAsyncDisposable
             }
             return;
         }
+        var shedCostFact = false;
         lock (_handoffGate)
         {
             if (_pendingUiEvents.Count >= MaxPendingUiItems)
             {
-                // Explicit bound: shed the OLDEST pending render (superseded);
-                // its durable state was already queued for the snapshot refresh.
+                // COST-9 (R3-14): a shed render row's COST FACTS are
+                // accumulated before the row leaves the bounded queue — the
+                // totals stay exact even though the log rendering is lossy.
+                // Rendering is a read-only projection of these accumulators,
+                // never their authority.
+                var shed = _pendingUiEvents[0].Item;
                 _pendingUiEvents.RemoveAt(0);
+                _costRenderRowsShed++;
+                AccumulateCostFactFromShedRow(shed);
+                shedCostFact = true;
             }
             _pendingUiEvents.Add((connection, notification));
             if (!_uiDrainPosted)
@@ -768,6 +1011,12 @@ public sealed class MainWindowViewModel : ObservableObject, IAsyncDisposable
                 _uiDrainPosted = true;
                 _ui.Post(DrainPendingUiEvents);
             }
+        }
+        if (shedCostFact)
+        {
+            // The accumulators changed off the UI thread: refresh the
+            // summary projection through the dispatcher.
+            _ui.Post(() => CostSummaryText = BuildCostSummaryText());
         }
     }
 
@@ -784,6 +1033,10 @@ public sealed class MainWindowViewModel : ObservableObject, IAsyncDisposable
         }
         lock (_handoffGate)
         {
+            // F07: stamp the buffer with the connection that produced it, so
+            // a drain that runs after a disconnect/rebuild cannot flush a
+            // retired era's prose into the new session's panel.
+            _deltaEraConnection = _connection;
             _pendingUiDelta.Append(text);
             if (_pendingUiDelta.Length > MaxPendingDeltaChars)
             {
@@ -818,7 +1071,14 @@ public sealed class MainWindowViewModel : ObservableObject, IAsyncDisposable
             batch = _pendingUiEvents;
             _pendingUiEvents = new List<(IAgentConnection Connection, WorkEventNotification Item)>();
         }
-        if (deltaText.Length > 0)
+        // F07: the pending buffered work is ERA-SCOPED. DisconnectCoreAsync
+        // clears both buffers, so anything captured here belongs to a live
+        // handoff; the per-event loop re-checks the connection instance anyway,
+        // and each delta already carries its own connection stamp when queued
+        // (see EnqueueDeltaForUi), so a retired era's prose can never paint the
+        // new session's output panel.
+        if (deltaText.Length > 0 && _deltaEraConnection is { } deltaEra
+            && ReferenceEquals(_connection, deltaEra))
         {
             AppendOutput(deltaText);
         }
@@ -862,28 +1122,37 @@ public sealed class MainWindowViewModel : ObservableObject, IAsyncDisposable
                 break;
             case "assistant_message":
                 _deltaCoalescer?.Flush();
-                AppendOutput($"[{envelope.Seq}] assistant 消息已入账。");
+                AppendLog($"[{envelope.Seq}] assistant 消息已入账。");
                 break;
             case "run_started":
-                AppendOutput($"[{envelope.Seq}] 运行已启动。");
+                AppendLog($"[{envelope.Seq}] 运行已启动。");
                 break;
             case "focus_changed":
-                AppendOutput(TryEventString(envelope.Event, "goal", out var goal) && goal.Length > 0
+                AppendLog(TryEventString(envelope.Event, "goal", out var goal) && goal.Length > 0
                     ? $"[{envelope.Seq}] 焦点任务：{goal}"
                     : $"[{envelope.Seq}] 焦点任务已变更。");
                 break;
             case "turn_completed":
-                AppendOutput($"[{envelope.Seq}] 本轮结束（以快照为准）。");
+                AppendLog($"[{envelope.Seq}] 本轮结束（以快照为准）。");
                 break;
             case "turn_cancelled":
-                AppendOutput($"[{envelope.Seq}] 本轮已取消（以快照为准）。");
+                AppendLog($"[{envelope.Seq}] 本轮已取消（以快照为准）。");
                 break;
             case "task_completed":
-                AppendOutput($"[{envelope.Seq}] 任务到达终态（结果与产出以快照为准）。");
+                AppendLog($"[{envelope.Seq}] 任务到达终态（结果与产出以快照为准）。");
                 break;
             case "tool_started":
             case "tool_finished":
-                AppendOutput($"[{envelope.Seq}] {notification.EventType}（工具事件；结果内容不在此渲染）。");
+                AppendLog($"[{envelope.Seq}] {notification.EventType}（工具事件；结果内容不在此渲染）。");
+                break;
+            case "model_used":
+                if (notification.Envelope.TryGetModelUsage(out var usage))
+                {
+                    RecordModelUsage(envelope.Seq, usage);
+                }
+                break;
+            case "context_compacted":
+                RecordCompactionCost(envelope.Seq, envelope.Event);
                 break;
             default:
                 // Accounting/diagnostic events are not rendered (bounded
@@ -909,6 +1178,194 @@ public sealed class MainWindowViewModel : ObservableObject, IAsyncDisposable
         }
         value = string.Empty;
         return false;
+    }
+
+    /// <summary>C4: files one model round into its identity class and keeps
+    /// the summary line honest — estimated and unknown rounds are visible
+    /// counts, never folded into the observed bill nor shown as zero.
+    /// COST-7: the maintenance/compactor lane keeps its own accumulators so
+    /// a compactor row never blurs into the main-round bill.</summary>
+    private void RecordModelUsage(ulong seq, RuntimeEventEnvelope.ModelUsageFact usage)
+    {
+        AccumulateModelUsage(usage);
+        var retryNote = usage.Retries > 0
+            ? $" · 含 {usage.Retries} 次重试（失败尝试通常无用量，数值为下界）"
+            : string.Empty;
+        var laneNote = usage.Role == "maintenance" ? "维护压缩调用" : "主调用";
+        switch (usage.UsageIdentity)
+        {
+            case "observed" when usage.Role == "maintenance":
+                AppendLog(
+                    $"[{seq}] 模型消耗（实测·{laneNote}）：输入 {usage.InputTokens} · 输出 {usage.OutputTokens}" +
+                    retryNote);
+                break;
+            case "observed":
+                AppendLog(
+                    $"[{seq}] 模型消耗（实测·{laneNote}）：输入 {usage.InputTokens} · 输出 {usage.OutputTokens}" +
+                    (usage.CachedInputTokens > 0 ? $" · 缓存读 {usage.CachedInputTokens}" : string.Empty) +
+                    retryNote);
+                break;
+            case "estimated":
+                AppendLog(
+                    $"[{seq}] 模型消耗（估算·{laneNote}）：输入 {usage.InputTokens} · 输出 {usage.OutputTokens}" +
+                    "——运行时近似推导，非 provider 账单" + retryNote);
+                break;
+            default:
+                AppendLog(
+                    $"[{seq}] 模型消耗（未知·{laneNote}）：本轮用量证据丢失（例如取消在飞调用）——按未知计，不计为零" +
+                    retryNote);
+                break;
+        }
+        CostSummaryText = BuildCostSummaryText();
+    }
+
+    /// <summary>COST-9 (R3-14): the fixed-size cost accumulators are the
+    /// authority; the log rows are a lossy projection. Both the live render
+    /// path and the shed-row path feed the SAME accumulators exactly once.
+    /// </summary>
+    private void AccumulateModelUsage(RuntimeEventEnvelope.ModelUsageFact usage)
+    {
+        switch (usage.UsageIdentity)
+        {
+            case "observed" when usage.Role == "maintenance":
+                _costMaintenanceRounds++;
+                _costMaintenanceInput += usage.InputTokens;
+                _costMaintenanceOutput += usage.OutputTokens;
+                break;
+            case "observed":
+                _costObservedInput += usage.InputTokens;
+                _costObservedOutput += usage.OutputTokens;
+                _costObservedCached += usage.CachedInputTokens;
+                _costObservedRounds++;
+                break;
+            case "estimated":
+                _costEstimatedInput += usage.InputTokens;
+                _costEstimatedOutput += usage.OutputTokens;
+                _costEstimatedRounds++;
+                break;
+            default:
+                _costUnknownRounds++;
+                break;
+        }
+    }
+
+    /// <summary>COST-9 (R3-14): a shed render row still contributes its cost
+    /// fact before it leaves the bounded queue — the account never loses a
+    /// billed call to the rendering cap.</summary>
+    private void AccumulateCostFactFromShedRow(WorkEventNotification notification)
+    {
+        var envelope = notification.Envelope;
+        switch (notification.EventType)
+        {
+            case "model_used" when envelope.TryGetModelUsage(out var usage):
+                AccumulateModelUsage(usage);
+                break;
+            case "context_compacted":
+                AccumulateCompactionCost(envelope.Event);
+                break;
+        }
+    }
+
+    /// <summary>C4: compaction cost read straight off the typed
+    /// <c>context_compacted</c> fields. The event carries no usage identity,
+    /// so the row says "service-reported" and stays OUTSIDE the observed
+    /// model bill — the GUI never upgrades a reported number into a measured
+    /// one.</summary>
+    private void RecordCompactionCost(ulong seq, System.Text.Json.JsonElement @event)
+    {
+        ulong U64(string name) =>
+            @event.ValueKind == System.Text.Json.JsonValueKind.Object
+            && @event.TryGetProperty(name, out var element)
+            && element.TryGetUInt64(out var value)
+                ? value
+                : 0UL;
+        var reason = @event.ValueKind == System.Text.Json.JsonValueKind.Object
+            && @event.TryGetProperty("reason", out var reasonElement)
+            && reasonElement.ValueKind == System.Text.Json.JsonValueKind.String
+                ? reasonElement.GetString() ?? "?"
+                : "?";
+        // COST-1 (E05.3): newer events carry the compaction's own usage
+        // identity; legacy events omit it. The row renders whichever fact
+        // the wire provided — never an upgrade to "measured" by the GUI.
+        var identity = @event.ValueKind == System.Text.Json.JsonValueKind.Object
+            && @event.TryGetProperty("usage_identity", out var identityElement)
+            && identityElement.ValueKind == System.Text.Json.JsonValueKind.String
+                ? identityElement.GetString()
+                : null;
+        var identityText = identity switch
+        {
+            "observed" => "实测",
+            "estimated" => "估算（运行时近似，非 provider 账单）",
+            "unknown" => "usage 未知（按未知计，不计为零）",
+            null or "" => "服务端报告，未带实测身份",
+            var other => $"身份:{other}",
+        };
+        var input = U64("input_tokens");
+        var output = U64("output_tokens");
+        AccumulateCompactionCost(@event);
+        // COST-2 (E05.4): the event now carries the compressor call's own
+        // cache-read and attempt counters — rendered verbatim, still outside
+        // the model bill.
+        var cached = U64("cached_input_tokens");
+        var attempts = U64("attempts");
+        var counters = cached > 0 ? $" · 输入 {input} · 输出 {output} tokens（缓存读 {cached}）" : $" · 输入 {input} · 输出 {output} tokens";
+        var attemptNote = attempts > 0 ? $" · 尝试 {attempts}" : string.Empty;
+        AppendLog(
+            $"[{seq}] 压缩消耗（{identityText}）：原因 {reason}{counters}{attemptNote} · 移出 {U64("source_items")} 条——不并入主调用实测合计");
+        CostSummaryText = BuildCostSummaryText();
+    }
+
+    /// <summary>COST-9 (R3-14): compaction totals accumulate independently
+    /// of the (lossy) log rendering — the shed-row path feeds the same
+    /// fixed-size accumulators exactly once.</summary>
+    private void AccumulateCompactionCost(System.Text.Json.JsonElement @event)
+    {
+        ulong U64(string name) =>
+            @event.ValueKind == System.Text.Json.JsonValueKind.Object
+            && @event.TryGetProperty(name, out var element)
+            && element.TryGetUInt64(out var value)
+                ? value
+                : 0UL;
+        _costCompactions++;
+        _costCompactionInput += U64("input_tokens");
+        _costCompactionOutput += U64("output_tokens");
+    }
+
+    /// <summary>C4: one summary line whose identity classes are never
+    /// merged — observed is the bill, estimated/unknown are visible counts,
+    /// and compaction is service-reported cost outside the bill.</summary>
+    private string BuildCostSummaryText() =>
+        $"成本账目：实测 {_costObservedRounds} 轮（输入 {_costObservedInput} · 输出 {_costObservedOutput}" +
+        $" · 缓存读 {_costObservedCached}）" +
+        (_costEstimatedRounds > 0
+            ? $" · 估算 {_costEstimatedRounds} 轮（输入 {_costEstimatedInput} · 输出 {_costEstimatedOutput}）"
+            : string.Empty) +
+        (_costUnknownRounds > 0 ? $" · 未知 {_costUnknownRounds} 轮" : string.Empty) +
+        (_costMaintenanceRounds > 0
+            ? $" · 维护压缩调用 {_costMaintenanceRounds} 轮（输入 {_costMaintenanceInput} · 输出 {_costMaintenanceOutput}）"
+            : string.Empty) +
+        (_costCompactions > 0
+            ? $" · 压缩 {_costCompactions} 次（输入 {_costCompactionInput} · 输出 {_costCompactionOutput}，服务端报告，未带实测身份）"
+            : string.Empty);
+
+    private void ResetCostAccount()
+    {
+        _costObservedInput = 0;
+        _costObservedOutput = 0;
+        _costObservedCached = 0;
+        _costObservedRounds = 0;
+        _costEstimatedInput = 0;
+        _costEstimatedOutput = 0;
+        _costEstimatedRounds = 0;
+        _costUnknownRounds = 0;
+        _costMaintenanceRounds = 0;
+        _costMaintenanceInput = 0;
+        _costMaintenanceOutput = 0;
+        _costCompactions = 0;
+        _costCompactionInput = 0;
+        _costCompactionOutput = 0;
+        _costRenderRowsShed = 0;
+        CostSummaryText = "成本账目：暂无模型调用。";
     }
 
     /// <summary>Coalesced, event-driven snapshot refresh: many arriving
@@ -971,7 +1428,7 @@ public sealed class MainWindowViewModel : ObservableObject, IAsyncDisposable
             {
                 if (!silent && !_lifetime.IsCancellationRequested)
                 {
-                    AppendOutput($"刷新失败：{failure.Message}（下一轮或手动刷新会重试。）");
+                    AppendLog($"刷新失败：{failure.Message}（下一轮或手动刷新会重试。）");
                 }
                 return;
             }
@@ -997,7 +1454,7 @@ public sealed class MainWindowViewModel : ObservableObject, IAsyncDisposable
                 .Select(entry => TaskItemViewModel.From(entry, entry.TaskId == focusId)));
         if (snapshot.Tasks.Count > MaxRenderedTasks)
         {
-            AppendOutput($"任务列表超过 {MaxRenderedTasks} 条，界面只保留前 {MaxRenderedTasks} 条（有界保留）。");
+            AppendLog($"任务列表超过 {MaxRenderedTasks} 条，界面只保留前 {MaxRenderedTasks} 条（有界保留）。");
         }
         ApplyApprovals(snapshot.PendingApprovals);
         Watermark = snapshot.Watermark;
@@ -1011,7 +1468,20 @@ public sealed class MainWindowViewModel : ObservableObject, IAsyncDisposable
             _ => "运行状态：未启动。",
         };
         PlanText = "计划 / open loops：快照未提供（unavailable）——不从事件文字推断。";
-        ResolveOutstandingSubmitFromSnapshot(snapshot);
+        // GUI-3: a trusted snapshot re-derives an unresolved cancel phase
+        // (Requested/Unknown) from typed facts — but never while the request
+        // that owns the phase is still in flight.
+        if (Volatile.Read(ref _cancelInFlight) == 0
+            && (CancelPhase is CancelRequestPhase.Requested or CancelRequestPhase.Unknown))
+        {
+            SetCancelPhase(CancelRequestPhase.Idle, snapshot.RunStarted
+                ? "以快照为准解除未决的取消请求：快照显示运行仍在进行；该请求是否已生效以快照与事件为准。"
+                : "以快照为准解除未决的取消请求：快照显示当前没有进行中的运行。");
+        }
+        // GUI-3/F06: a new snapshot is a fresh chance for the ledger to
+        // testify about an outstanding unknown submit — by exact request
+        // identity, never by goal text.
+        _ = ResolveOutstandingSubmitByQueryAsync();
         if (snapshot.ResyncRequired)
         {
             BannerText = "事件流出现缺口（resync_required）：显示状态已由本快照整体重建。";
@@ -1039,10 +1509,10 @@ public sealed class MainWindowViewModel : ObservableObject, IAsyncDisposable
                     requestId,
                     AsyncCommands.Add(
                         () => RespondApprovalAsync(requestId, ApprovalDecision.Allow),
-                        onError: error => AppendOutput($"审批失败：{error.Message}")),
+                        onError: error => AppendLog($"审批失败：{error.Message}")),
                     AsyncCommands.Add(
                         () => RespondApprovalAsync(requestId, ApprovalDecision.Deny),
-                        onError: error => AppendOutput($"审批失败：{error.Message}")));
+                        onError: error => AppendLog($"审批失败：{error.Message}")));
                 _approvalRows[requestId] = row;
             }
             row.UpdateFrom(entry);
@@ -1060,38 +1530,120 @@ public sealed class MainWindowViewModel : ObservableObject, IAsyncDisposable
         Approvals.ReplaceWith(rows);
     }
 
-    /// <summary>Every applied snapshot resolves an outstanding UNKNOWN
-    /// submit from facts — the cold-restore honesty rule. The desktop never
-    /// claims idempotence across a rebuild: a host restart retires the
-    /// client_request_id, so whether the same goal reappears decides what a
-    /// resubmission WOULD mean (nothing is resent automatically).
+    /// <summary>GUI-3/F06: every applied snapshot (and every newly recorded
+    /// unknown receipt) asks the run's submission ledger about the EXACT
+    /// client_request_id — with the payload digest computed over the caller's
+    /// own goal — via the read-only <c>work.submit_result</c> route. The
+    /// snapshot's task list is NEVER consulted: a same-goal task (old,
+    /// renamed, or coincidental) is not evidence about this request id, and a
+    /// bounded list or a goal past the display cap proves nothing either way.
     ///
-    /// A goal longer than the snapshot's bounded goal field can never
-    /// appear verbatim, so it always takes the conservative branch: the
-    /// operator checks the task list themselves.</summary>
-    private void ResolveOutstandingSubmitFromSnapshot(WorkSnapshotResponse snapshot)
+    /// Every disposition is rendered as the fact it is:
+    ///   Accepted/AlreadyAccepted — the ledger testifies this exact request
+    ///     was admitted; the unknown is resolved and the key released.
+    ///   KnownRejected — the id was admitted for a DIFFERENT payload; this
+    ///     request was never admitted and the id is dead, so it is released
+    ///     (the operator's next submit takes a fresh identity).
+    ///   Unknown/Expired — the ledger has no surviving evidence; the outcome
+    ///     is genuinely undetermined, nothing is auto-resent, and the key
+    ///     stays so a same-goal retry remains an idempotent re-read.
+    ///
+    /// The answer only lands while the connection era that served the query
+    /// is still the live one and the echoed id matches — a retired era's or a
+    /// mismatched receipt proves nothing here (the next snapshot re-asks).</summary>
+    private async Task ResolveOutstandingSubmitByQueryAsync()
     {
-        if (_outstandingSubmitId is null || _outstandingSubmitGoal is null)
-        {
-            return;
-        }
-        // R07: while the original submit is still awaiting its receipt
-        // (Pending), NO snapshot carries evidence about that specific request —
-        // a concurrent refresh must not clear the key, or a same-goal retry
-        // becomes a NEW admission. Only an outstanding submit whose receipt is
-        // already lost/unknown (Pending -> Unknown) is resolved from facts here.
-        if (_outstandingSubmitAwaitingReceipt)
-        {
-            return;
-        }
+        var id = _outstandingSubmitId;
         var goal = _outstandingSubmitGoal;
+        if (id is null || goal is null || _outstandingSubmitAwaitingReceipt)
+        {
+            return;
+        }
+        var connection = _connection;
+        if (connection is null)
+        {
+            return;
+        }
+        if (Interlocked.CompareExchange(ref _submitResultQueryInFlight, 1, 0) != 0)
+        {
+            return;
+        }
+        try
+        {
+            var generation = Volatile.Read(ref _generation);
+            WorkSubmitResultResponse answer;
+            try
+            {
+                answer = await connection.SubmitResultAsync(
+                    id, SubmitPayloadDigest.Compute(goal), _lifetime.Token);
+            }
+            catch (OperationCanceledException)
+            {
+                return; // the window closed or the era ended; nothing resolved here
+            }
+            catch (Exception failure)
+            {
+                ReportOutstandingResolutionOnce(
+                    $"提交核对失败：{failure.Message}。该提交保持未知；不会自动重发，之后每份快照都会再向受理账本核对一次。");
+                return;
+            }
+            if (generation != Volatile.Read(ref _generation)
+                || !ReferenceEquals(_connection, connection)
+                || answer.ClientRequestId != id)
+            {
+                return; // a retired era's or mismatched answer is not evidence
+            }
+            switch (answer.Disposition)
+            {
+                case WorkSubmitResultDisposition.Accepted:
+                case WorkSubmitResultDisposition.AlreadyAccepted:
+                    ClearOutstandingSubmit();
+                    AppendLog(
+                        $"未知提交已由受理账本核实：client_request_id {id} 已受理为 task {answer.TaskId}"
+                        + "（该结论来自精确请求查询，不凭同名目标；不会自动重发）。");
+                    break;
+                case WorkSubmitResultDisposition.KnownRejected:
+                    ClearOutstandingSubmit();
+                    var digest = answer.AcceptedPayloadDigest is { Length: > 0 } recorded
+                        ? (recorded.Length <= 16 ? recorded : recorded[..16] + "…")
+                        : "（无摘要）";
+                    AppendLog(
+                        $"提交核对完成：同一 client_request_id 曾以不同内容提交（原内容摘要前缀 {digest}）。"
+                        + "这次提交从未被受理，该 id 已不可复用；再次提交同一目标将以新身份执行（需你再次操作）。");
+                    break;
+                default:
+                    ReportOutstandingResolutionOnce(
+                        $"提交核对完成：受理账本无法证明该提交的结果（{answer.Disposition}——无证据，或证据已随宿主进程终止而淘汰）。"
+                        + "该提交保持未知：不会自动重发；同一目标再提交仍用同一身份幂等重试，账本核对会随每份快照继续。");
+                    break;
+            }
+        }
+        finally
+        {
+            Interlocked.Exchange(ref _submitResultQueryInFlight, 0);
+        }
+    }
+
+    private void ClearOutstandingSubmit()
+    {
         _outstandingSubmitId = null;
         _outstandingSubmitGoal = null;
-        var visible = goal.Length <= WorkSnapshotResponse.MaxGoalChars
-            && snapshot.Tasks.Any(entry => entry.Goal == goal);
-        AppendOutput(visible
-            ? $"未知提交已核对：同名目标任务「{BoundBannerDetail(goal)}」在快照中可见，该未知以此事实解除（不自动重发）。"
-            : $"未知提交已核对：快照中没有同名目标任务「{BoundBannerDetail(goal)}」。旧提交的结果不可再核；再次提交同一目标将作为新任务执行。");
+        _outstandingSubmitAwaitingReceipt = false;
+        _outstandingSubmitResolutionReported = false;
+    }
+
+    /// <summary>Indeterminate or failed resolutions report once per
+    /// outstanding id — every snapshot re-asks the ledger while the key is
+    /// outstanding, and repeating the same "still unknown" line would only
+    /// bury the output panel.</summary>
+    private void ReportOutstandingResolutionOnce(string line)
+    {
+        if (_outstandingSubmitResolutionReported)
+        {
+            return;
+        }
+        _outstandingSubmitResolutionReported = true;
+        AppendLog(line);
     }
 
     private async Task SubmitAsync()
@@ -1112,13 +1664,14 @@ public sealed class MainWindowViewModel : ObservableObject, IAsyncDisposable
         // second submission.
         if (_outstandingSubmitId is not null && _outstandingSubmitGoal != goal)
         {
-            AppendOutput("上一次提交的结果未知，且这次目标不同。先刷新快照核对；重复同一目标才会幂等重试。");
+            AppendLog("上一次提交的结果未知，且这次目标不同。先刷新快照（会自动向受理账本核对）；重复同一目标才会幂等重试。");
             return;
         }
         var clientRequestId = _outstandingSubmitId ?? ClientRequestIds.Next();
         _outstandingSubmitId = clientRequestId;
         _outstandingSubmitGoal = goal;
         _outstandingSubmitAwaitingReceipt = true;
+        _outstandingSubmitResolutionReported = false;
         WorkSubmitResponse receipt;
         try
         {
@@ -1126,45 +1679,47 @@ public sealed class MainWindowViewModel : ObservableObject, IAsyncDisposable
         }
         catch (AgentUnknownOutcomeException unknown)
         {
-            // Pending -> Unknown: the key stays outstanding ON PURPOSE, but the
-            // next snapshot — not a blind retry — resolves it: a host restart
-            // retires the client_request_id, so the same goal would be a NEW
-            // admission.
+            // Pending -> Unknown: the key stays outstanding ON PURPOSE, and
+            // the exact-request ledger query — not a blind retry, and never a
+            // goal-text match — resolves it.
             _outstandingSubmitAwaitingReceipt = false;
-            AppendOutput($"提交结果未知：连接在请求期间断开（{unknown.Failure.Message}）。不会自动重发；"
-                + "下一份快照按事实解除该未知（同名任务可见即受理成立，不可见则再次提交将是新任务）。");
+            AppendLog($"提交结果未知：连接在请求期间断开（{unknown.Failure.Message}）。不会自动重发；"
+                + "正在以精确请求查询（client_request_id＋内容摘要）向受理账本核对，不凭同名目标猜测。");
+            _ = ResolveOutstandingSubmitByQueryAsync();
             return;
         }
         catch (AgentProtocolException failure)
         {
-            // A structured server answer is DEFINITIVE evidence that k was
-            // denied — no admission was created, so clearing is safe and honest.
-            _outstandingSubmitId = null;
-            _outstandingSubmitGoal = null;
-            _outstandingSubmitAwaitingReceipt = false;
-            AppendOutput($"提交被拒绝：{failure.Message}");
+            // A structured server answer is DEFINITIVE evidence that k
+            // was denied — no admission was created, so clearing is safe and honest.
+            ClearOutstandingSubmit();
+            AppendLog($"提交被拒绝：{failure.Message}");
             return;
         }
         catch (Exception failure)
         {
             // R07: a timed-out / transport-faulted in-flight request may or may
             // not have been delivered — the receipt is UNKNOWN. Keep k so a
-            // same-goal retry reuses the SAME admission identity; a later
-            // snapshot resolves it from facts. (Only clearing is what let each
+            // same-goal retry reuses the SAME admission identity; the ledger
+            // query resolves it from facts. (Only clearing is what let each
             // retry turn into a new admission.)
             _outstandingSubmitAwaitingReceipt = false;
-            AppendOutput($"提交结果未知：{failure.Message}。不会自动重发；"
-                + "同一目标会以相同身份幂等重试，后续由快照按事实解除。");
+            AppendLog($"提交结果未知：{failure.Message}。不会自动重发；"
+                + "同一目标会以相同身份幂等重试，账本核对会随快照继续。");
+            _ = ResolveOutstandingSubmitByQueryAsync();
             return;
         }
-        _outstandingSubmitId = null;
-        _outstandingSubmitGoal = null;
-        _outstandingSubmitAwaitingReceipt = false;
-        AppendOutput($"已受理：task {receipt.TaskId}（{receipt.Disposition}）。受理 ≠ 完成，完成以快照与事件为准。");
+        ClearOutstandingSubmit();
+        AppendLog($"已受理：task {receipt.TaskId}（{receipt.Disposition}）。受理 ≠ 完成，完成以快照与事件为准。");
         GoalInput = string.Empty;
         await RefreshSnapshotCoreAsync(silent: true);
     }
 
+    /// <summary>GUI-3: continue re-drives the run's ACTIVE task — the wire
+    /// carries no task binding — so the receipt is compared with the
+    /// operator's selection and any difference is stated plainly. Nothing
+    /// here starts another task or switches the selection behind the
+    /// operator's back.</summary>
     private async Task ContinueAsync()
     {
         var connection = _connection;
@@ -1172,6 +1727,7 @@ public sealed class MainWindowViewModel : ObservableObject, IAsyncDisposable
         {
             return;
         }
+        var selectedTaskId = SelectedTask?.TaskId;
         WorkContinueResponse receipt;
         try
         {
@@ -1179,18 +1735,30 @@ public sealed class MainWindowViewModel : ObservableObject, IAsyncDisposable
         }
         catch (AgentUnknownOutcomeException unknown)
         {
-            AppendOutput($"继续结果未知：连接在请求期间断开（{unknown.Failure.Message}）。从快照核对当前状态后再决定。");
+            AppendLog($"继续结果未知：连接在请求期间断开（{unknown.Failure.Message}）。从快照核对当前状态后再决定。");
             return;
         }
         catch (Exception failure)
         {
-            AppendOutput($"继续失败：{failure.Message}");
+            AppendLog($"继续失败：{failure.Message}");
             return;
         }
-        AppendOutput($"已继续活动任务 {receipt.TaskId}。");
+        var line = $"已继续活动任务 {receipt.TaskId}（沿用该任务当前指令；受理 ≠ 完成，以快照与事件为准）。";
+        if (!string.IsNullOrEmpty(selectedTaskId) && selectedTaskId != receipt.TaskId)
+        {
+            line += $"注意：继续的是运行的活动任务，不是当前选中的任务 {selectedTaskId}——继续动作始终跟随活动任务，不隐式切换选择或新启任务。";
+        }
+        AppendLog(line);
         await RefreshSnapshotCoreAsync(silent: true);
     }
 
+    /// <summary>GUI-3: the cancel surface's phase machine. The request is
+    /// shown as REQUESTED from the moment it is sent; only typed facts move
+    /// it — the ack's <c>Cancelled</c> proves the barrier, <c>NoActiveTurn</c>
+    /// is a fact (not a failure), and an undetermined outcome keeps the
+    /// side-effect warning (the turn may or may not have stopped; nothing is
+    /// re-sent). A trusted snapshot re-derives an unresolved phase once no
+    /// request is in flight.</summary>
     private async Task CancelAsync()
     {
         var connection = _connection;
@@ -1198,27 +1766,62 @@ public sealed class MainWindowViewModel : ObservableObject, IAsyncDisposable
         {
             return;
         }
-        WorkCancelResponse receipt;
+        if (Interlocked.CompareExchange(ref _cancelInFlight, 1, 0) != 0)
+        {
+            return;
+        }
         try
         {
-            receipt = await connection.CancelCurrentTurnAsync(_lifetime.Token);
+            var generation = Volatile.Read(ref _generation);
+            SetCancelPhase(CancelRequestPhase.Requested, "取消请求已发出，等待服务端确认——在可信确认前不视为已停止。");
+            WorkCancelResponse receipt;
+            try
+            {
+                receipt = await connection.CancelCurrentTurnAsync(_lifetime.Token);
+            }
+            catch (AgentUnknownOutcomeException unknown)
+            {
+                // A retired era already retired this phase (disconnect); its
+                // verdict must not resurrect a state on the new view.
+                if (!IsCurrentEra(generation, connection))
+                {
+                    return;
+                }
+                SetCancelPhase(CancelRequestPhase.Unknown,
+                    $"取消结果不可确定：连接在请求期间断开（{unknown.Failure.Message}）。"
+                    + "该轮可能已停止也可能未停止——副作用以快照与事件为准；不会自动重发取消请求。");
+                return;
+            }
+            catch (Exception failure)
+            {
+                if (!IsCurrentEra(generation, connection))
+                {
+                    return;
+                }
+                SetCancelPhase(CancelRequestPhase.Unknown,
+                    $"取消结果不可确定：{failure.Message}。该轮可能已停止也可能未停止——副作用以快照与事件为准；不会自动重发取消请求。");
+                return;
+            }
+            if (!IsCurrentEra(generation, connection))
+            {
+                return;
+            }
+            SetCancelPhase(receipt.Ack.Status switch
+            {
+                TurnCancelAckStatus.Cancelled => CancelRequestPhase.Cancelled,
+                _ => CancelRequestPhase.NoActiveTurn,
+            }, receipt.Ack.Status switch
+            {
+                TurnCancelAckStatus.Cancelled =>
+                    $"已确认取消（屏障已过）：generation {receipt.Ack.CancelledGeneration} → {receipt.Ack.EffectiveGeneration}。",
+                _ => "当前没有活动轮次（这是事实，不是失败）。",
+            });
+            await RefreshSnapshotCoreAsync(silent: true);
         }
-        catch (AgentUnknownOutcomeException unknown)
+        finally
         {
-            AppendOutput($"取消结果未知：连接在请求期间断开（{unknown.Failure.Message}）。服务端是否已过屏障以快照与事件为准。");
-            return;
+            Interlocked.Exchange(ref _cancelInFlight, 0);
         }
-        catch (Exception failure)
-        {
-            AppendOutput($"取消失败：{failure.Message}");
-            return;
-        }
-        AppendOutput(receipt.Ack.Status switch
-        {
-            TurnCancelAckStatus.Cancelled => $"取消已过屏障：generation {receipt.Ack.CancelledGeneration} → {receipt.Ack.EffectiveGeneration}。",
-            _ => "当前没有活动轮次（这是事实，不是失败）。",
-        });
-        await RefreshSnapshotCoreAsync(silent: true);
     }
 
     // -----------------------------------------------------------------------
@@ -1231,8 +1834,11 @@ public sealed class MainWindowViewModel : ObservableObject, IAsyncDisposable
     // -----------------------------------------------------------------------
 
     /// <summary>C3: loads one task's full anchor card over the B3
-    /// <c>work.task_detail</c> read (triggered by selecting a task).</summary>
-    private async Task LoadTaskDetailAsync(string taskId)
+    /// <c>work.task_detail</c> read (triggered by selecting a task). F07: the
+    /// read is bound to the selection ordinal it was issued for, so both a
+    /// late success AND a late failure from a previous selection are retired
+    /// instead of painting the panel that now belongs to another task.</summary>
+    private async Task LoadTaskDetailAsync(string taskId, long selection)
     {
         var connection = _connection;
         if (connection is null)
@@ -1240,38 +1846,34 @@ public sealed class MainWindowViewModel : ObservableObject, IAsyncDisposable
             TaskDetailText = "任务详情：未连接（unavailable）。";
             return;
         }
-        var generation = Volatile.Read(ref _generation);
-        Task<WorkTaskDetailResponse> read;
-        try
-        {
-            read = connection.TaskDetailAsync(taskId, _lifetime.Token);
-        }
-        catch (Exception failure)
-        {
-            if (!_lifetime.IsCancellationRequested)
-            {
-                AppendOutput($"任务详情读取失败：{failure.Message}");
-            }
-            TaskDetailText = "任务详情：读取失败（unavailable）。";
-            return;
-        }
+        // F07: capture the fencing token BEFORE the await; every panel write
+        // below (success, failure) re-checks it against the live era.
+        var era = CaptureRequestEra(selection);
         WorkTaskDetailResponse detail;
         try
         {
-            detail = await read;
+            detail = await connection.TaskDetailAsync(taskId, _lifetime.Token);
         }
         catch (Exception failure)
         {
+            // F07: a failed read only reports "unavailable" while it is still
+            // THIS era's and THIS selection's request. A late failure from a
+            // replaced connection or a previous selection leaves the newer
+            // panel untouched.
+            if (!IsRequestCurrent(era, connection))
+            {
+                return;
+            }
             if (!_lifetime.IsCancellationRequested)
             {
-                AppendOutput($"任务详情读取失败：{failure.Message}");
+                AppendLog($"任务详情读取失败：{failure.Message}");
             }
             TaskDetailText = "任务详情：读取失败（unavailable）。";
             return;
         }
-        if (!IsCurrentEra(generation, connection))
+        if (!IsRequestCurrent(era, connection))
         {
-            return; // a newer connection owns the panel now; drop the stale read
+            return; // a newer connection or selection owns the panel now
         }
         TaskDetailText = RenderTaskDetail(detail);
     }
@@ -1325,7 +1927,7 @@ public sealed class MainWindowViewModel : ObservableObject, IAsyncDisposable
             ChangesStatusText = "变更日志：未连接（unavailable）。";
             return;
         }
-        var generation = Volatile.Read(ref _generation);
+        var era = CaptureRequestEra();
         WorkChangesResponse changes;
         try
         {
@@ -1334,14 +1936,20 @@ public sealed class MainWindowViewModel : ObservableObject, IAsyncDisposable
         }
         catch (Exception failure)
         {
+            // F07: a late failure from a replaced era must not clear a fresh
+            // panel — only report it while this request is still current.
+            if (!IsRequestCurrent(era, connection))
+            {
+                return;
+            }
             if (!_lifetime.IsCancellationRequested)
             {
-                AppendOutput($"变更读取失败：{failure.Message}");
+                AppendLog($"变更读取失败：{failure.Message}");
             }
             ChangesStatusText = "变更日志：读取失败（unavailable）。";
             return;
         }
-        if (!IsCurrentEra(generation, connection))
+        if (!IsRequestCurrent(era, connection))
         {
             return;
         }
@@ -1355,11 +1963,48 @@ public sealed class MainWindowViewModel : ObservableObject, IAsyncDisposable
             : $"变更日志：{rows.Length} 条（按序，最新优先）。";
     }
 
-    /// <summary>C3: reads one artifact by reference over the B3
-    /// <c>work.artifact</c> read. The response's own size/truncated facts are
-    /// shown verbatim; the body stays bounded (the client asks for at most
-    /// the protocol's artifact cap) and never pretends to be prose.</summary>
-    private async Task ReadArtifactAsync()
+    /// <summary>C3/C2: reads one artifact by reference over the B3/PLATFORM-2
+    /// paged read. A fresh read restarts the review window at byte 0; the
+    /// response's own size/cursor facts drive the honest header and the
+    /// 「下一页」 command. Reads are observations — they never re-trigger a
+    /// model or tool side effect.</summary>
+    private Task ReadArtifactAsync()
+    {
+        var connection = _connection;
+        var reference = ArtifactReference.Trim();
+        if (connection is null)
+        {
+            ArtifactText = "工件：未连接（unavailable）。";
+            return Task.CompletedTask;
+        }
+        if (reference.Length == 0)
+        {
+            ArtifactText = "工件：未提供引用（unavailable）。";
+            return Task.CompletedTask;
+        }
+        return ReadArtifactIntoWindowAsync(connection, reference, offset: 0, resetWindow: true);
+    }
+
+    /// <summary>C2: continues the current paging session from the server's
+    /// own cursor. Disabled at eof by the command's gate; a stale-era or
+    /// failed continuation leaves the window untouched.</summary>
+    private Task ReadNextArtifactPageAsync()
+    {
+        var connection = _connection;
+        if (connection is null
+            || _artifactNextOffset is not { } next
+            || _artifactSessionReference is not { } reference)
+        {
+            return Task.CompletedTask;
+        }
+        return ReadArtifactIntoWindowAsync(connection, reference, offset: next, resetWindow: false);
+    }
+
+    /// <summary>C2: jumps to the artifact's last window (a one-byte probe
+    /// learns the size, then the final window is read fresh). Key conclusions
+    /// at the tail of a large artifact are reachable in two read-only calls
+    /// instead of paging through everything.</summary>
+    private async Task ReadArtifactTailAsync()
     {
         var connection = _connection;
         var reference = ArtifactReference.Trim();
@@ -1373,42 +2018,178 @@ public sealed class MainWindowViewModel : ObservableObject, IAsyncDisposable
             ArtifactText = "工件：未提供引用（unavailable）。";
             return;
         }
-        var generation = Volatile.Read(ref _generation);
-        WorkArtifactResponse artifact;
+        if (Interlocked.CompareExchange(ref _artifactReadInFlight, 1, 0) != 0)
+        {
+            return;
+        }
+        ulong tailOffset;
         try
         {
-            artifact = await connection.ReadArtifactAsync(
-                reference,
-                maxBytes: WorkArtifactRequest.MaxArtifactReadBytes,
-                cancellationToken: _lifetime.Token);
-        }
-        catch (Exception failure)
-        {
-            if (!_lifetime.IsCancellationRequested)
+            var era = CaptureRequestEra();
+            WorkArtifactResponse probe;
+            try
             {
-                AppendOutput($"工件读取失败：{failure.Message}");
+                probe = await connection.ReadArtifactAsync(
+                    reference, maxBytes: 1, offset: 0, cancellationToken: _lifetime.Token);
             }
-            ArtifactText = "工件：读取失败（unavailable）。";
-            return;
+            catch (Exception failure)
+            {
+                if (!IsRequestCurrent(era, connection) || _lifetime.IsCancellationRequested)
+                {
+                    return;
+                }
+                AppendLog($"工件读取失败：{failure.Message}");
+                ArtifactText = "工件：读取失败（unavailable）。";
+                return;
+            }
+            if (!IsRequestCurrent(era, connection))
+            {
+                return;
+            }
+            tailOffset = probe.SizeBytes <= WorkArtifactRequest.MaxArtifactReadBytes
+                ? 0UL
+                : probe.SizeBytes - WorkArtifactRequest.MaxArtifactReadBytes;
         }
-        if (!IsCurrentEra(generation, connection))
+        finally
+        {
+            Interlocked.Exchange(ref _artifactReadInFlight, 0);
+        }
+        await ReadArtifactIntoWindowAsync(connection, reference, offset: tailOffset, resetWindow: true);
+    }
+
+    /// <summary>The one paged-read path: era-fenced wire call, then the
+    /// window apply. The sealed artifact is immutable, so consecutive pages
+    /// re-verify the same identity — paging cannot quietly switch versions.</summary>
+    private async Task ReadArtifactIntoWindowAsync(
+        IAgentConnection connection, string reference, ulong offset, bool resetWindow)
+    {
+        if (Interlocked.CompareExchange(ref _artifactReadInFlight, 1, 0) != 0)
         {
             return;
         }
-        string body;
         try
         {
-            body = System.Text.Encoding.UTF8.GetString(Convert.FromBase64String(artifact.ContentBase64));
+            var era = CaptureRequestEra();
+            WorkArtifactResponse page;
+            try
+            {
+                page = await connection.ReadArtifactAsync(
+                    reference,
+                    maxBytes: WorkArtifactRequest.MaxArtifactReadBytes,
+                    offset: offset,
+                    cancellationToken: _lifetime.Token);
+            }
+            catch (Exception failure)
+            {
+                // F07 fencing: a stale era's failure never overwrites the panel.
+                if (!IsRequestCurrent(era, connection))
+                {
+                    return;
+                }
+                if (!_lifetime.IsCancellationRequested)
+                {
+                    AppendLog($"工件读取失败：{failure.Message}");
+                }
+                ArtifactText = "工件：读取失败（unavailable）。";
+                return;
+            }
+            if (!IsRequestCurrent(era, connection))
+            {
+                return;
+            }
+            ApplyArtifactPage(reference, page, resetWindow);
+        }
+        finally
+        {
+            Interlocked.Exchange(ref _artifactReadInFlight, 0);
+        }
+    }
+
+    private void ApplyArtifactPage(string reference, WorkArtifactResponse page, bool resetWindow)
+    {
+        byte[] body;
+        try
+        {
+            body = Convert.FromBase64String(page.ContentBase64);
         }
         catch (FormatException)
         {
             // The client-side validator already rejected invalid base64; this
-            // is a defensive fallback that never renders a guessed body.
-            body = string.Empty;
+            // defensive fallback never renders a guessed body.
+            ArtifactText = "工件：读取失败（响应不是合法 base64）.";
+            return;
         }
-        ArtifactText = $"工件 {artifact.Reference}：{artifact.SizeBytes} 字节"
-            + (artifact.Truncated ? "（已截断）" : "（完整）")
-            + $"：\n{body}";
+        if (resetWindow || _artifactSessionReference != page.Reference)
+        {
+            _artifactWindow.Clear();
+            _artifactWindowStart = page.Offset;
+        }
+        _artifactSessionReference = page.Reference;
+        _artifactWindow.AddRange(body);
+
+        // Bounded window: release the OLDEST bytes at the hard cap, never
+        // silently — the panel names the release, and the full artifact stays
+        // on the host (re-「读取」 restarts from byte 0).
+        var releaseNote = string.Empty;
+        while (_artifactWindow.Count > MaxArtifactWindowBytes)
+        {
+            var cut = _artifactWindow.Count / 4;
+            while (cut < _artifactWindow.Count && (_artifactWindow[cut] & 0xC0) == 0x80)
+            {
+                cut++; // never release half a UTF-8 sequence: cut before a lead byte
+            }
+            _artifactWindow.RemoveRange(0, cut);
+            _artifactWindowStart += (ulong)cut;
+            releaseNote = "…（窗口已达上限，最旧的字节已从面板释放；重新「读取」可回到开头）…\n";
+        }
+
+        _artifactNextOffset = page.NextOffset;
+        ArtifactNextOffset = page.NextOffset;
+
+        // Incremental UTF-8 across page boundaries: a multibyte character cut
+        // by the page edge is held back (bytes stay in the window) instead of
+        // rendering a replacement character; the next page completes it. At
+        // eof everything is decoded as-is.
+        var displayBytes = page.Truncated
+            ? _artifactWindow.GetRange(0, _artifactWindow.Count - IncompleteUtf8TailLength(_artifactWindow))
+            : _artifactWindow.ToList();
+        var text = Encoding.UTF8.GetString(displayBytes.ToArray());
+        var tailNote = page.Truncated && displayBytes.Count < _artifactWindow.Count
+            ? "\n（末尾多字节字符被页边界切分，读取下一页后补全）"
+            : string.Empty;
+        var eofNote = page.Truncated
+            ? $"后续还有（下一页从字节 {page.NextOffset} 开始）"
+            : "已到文件末尾（eof）";
+        var header = $"工件 {page.Reference}：{page.SizeBytes} 字节"
+            + $" · 窗口 [{_artifactWindowStart},{_artifactWindowStart + (ulong)_artifactWindow.Count})"
+            + $" · {eofNote}"
+            + $" · 每页至多 {WorkArtifactRequest.MaxArtifactReadBytes} 字节";
+        ArtifactText = $"{header}\n{releaseNote}{text}{tailNote}";
+        AsyncCommands.RaiseCanExecute();
+    }
+
+    /// <summary>C2: length of an incomplete trailing UTF-8 sequence in the
+    /// window (its bytes stay buffered; only the display holds them back).
+    /// Trailing ASCII (and complete sequences) return 0.</summary>
+    private static int IncompleteUtf8TailLength(List<byte> buffer)
+    {
+        var continuations = 0;
+        var i = buffer.Count;
+        while (i > 0 && continuations < 4 && (buffer[i - 1] & 0xC0) == 0x80)
+        {
+            i--;
+            continuations++;
+        }
+        if (i == 0)
+        {
+            return continuations; // no lead byte in the window at all
+        }
+        var lead = buffer[i - 1];
+        var expected =
+            (lead & 0xF8) == 0xF0 ? 4 :
+            (lead & 0xF0) == 0xE0 ? 3 :
+            (lead & 0xE0) == 0xC0 ? 2 : 1;
+        return continuations + 1 < expected ? continuations + 1 : 0;
     }
 
     /// <summary>C3: refreshes the read-only context summary over the B3
@@ -1421,7 +2202,7 @@ public sealed class MainWindowViewModel : ObservableObject, IAsyncDisposable
             ContextStatusText = "只读 Context：未连接（unavailable）。";
             return;
         }
-        var generation = Volatile.Read(ref _generation);
+        var era = CaptureRequestEra();
         WorkContextResponse context;
         try
         {
@@ -1430,14 +2211,18 @@ public sealed class MainWindowViewModel : ObservableObject, IAsyncDisposable
         }
         catch (Exception failure)
         {
+            if (!IsRequestCurrent(era, connection))
+            {
+                return; // stale era: never overwrite a newer panel with a failure
+            }
             if (!_lifetime.IsCancellationRequested)
             {
-                AppendOutput($"上下文读取失败：{failure.Message}");
+                AppendLog($"上下文读取失败：{failure.Message}");
             }
             ContextStatusText = "只读 Context：读取失败（unavailable）。";
             return;
         }
-        if (!IsCurrentEra(generation, connection))
+        if (!IsRequestCurrent(era, connection))
         {
             return;
         }
@@ -1451,11 +2236,58 @@ public sealed class MainWindowViewModel : ObservableObject, IAsyncDisposable
             : $"只读 Context：{rows.Length} 条。";
     }
 
-    /// <summary>F13-era guard: true only while the captured generation is
-    /// still the live one AND the connection that served the read is still
-    /// installed — a read from a replaced or disconnected era is dropped.</summary>
+    /// <summary>
+    /// F13-era guard: true only while the captured generation is still the
+    /// live one AND the connection that served the read is still
+    /// installed — a read from a replaced or disconnected era is dropped.
+    /// </summary>
     private bool IsCurrentEra(int generation, IAgentConnection connection) =>
         generation == Volatile.Read(ref _generation) && ReferenceEquals(_connection, connection);
+
+    /// <summary>
+    /// F07: one read-only request's fencing token. A panel update is only
+    /// allowed when ALL of the following still hold:
+    /// <list type="bullet">
+    /// <item>the connection epoch (generation) the request started under is
+    /// still the live one — a disconnect or reconnect retires it;</item>
+    /// <item>the exact connection instance that served the request is still
+    /// installed — a rebuilt session is a different object;</item>
+    /// <item>for per-selection reads, the selection the request was issued
+    /// for is still the current one — task A's late answer must never land on
+    /// task B's panel.</item>
+    /// </list>
+    /// The SAME token gates the success, failure and finally paths, so a late
+    /// error from a replaced era can no longer overwrite a fresh panel with
+    /// "unavailable". Captured once per request at issue time; evaluated
+    /// exactly once when the await settles.
+    /// </summary>
+    private readonly record struct RequestEra(long Selection)
+    {
+        /// <summary>A read not bound to any particular task selection
+        /// (changes / artifact / context / snapshot).</summary>
+        public static readonly RequestEra Unbound = new(0);
+    }
+
+    /// <summary>Monotonic selection ordinal: incremented every time
+    /// <see cref="SelectedTask"/> changes (including to null), so a slow
+    /// task-detail read for a previous selection is retired.</summary>
+    private long _selectionSequence;
+
+    /// <summary>F07: capture the fencing token for a read-only request issued
+    /// right now. <paramref name="selection"/> is the ordinal a
+    /// selection-bound read was issued for, or 0 for an unbound read.</summary>
+    private RequestEra CaptureRequestEra(long selection = 0) =>
+        new(selection);
+
+    /// <summary>F07: whether a captured request's panel update may still be
+    /// applied. Evaluated on every visible state write of a read path —
+    /// success, catch and finally alike.</summary>
+    private bool IsRequestCurrent(RequestEra era, IAgentConnection connection) =>
+        IsCurrentEra(Volatile.Read(ref _generation), connection)
+        && (era.Selection == 0 || era.Selection == Volatile.Read(ref _selectionSequence));
+
+    /// <summary>F07: the current selection ordinal (drill observation).</summary>
+    internal long SelectionSequenceForTests => Volatile.Read(ref _selectionSequence);
 
     private async Task RespondApprovalAsync(string requestId, ApprovalDecision decision)
     {
@@ -1474,11 +2306,11 @@ public sealed class MainWindowViewModel : ObservableObject, IAsyncDisposable
             // Approval answers are never retried here: a lost answer could
             // mean the decision was or was not delivered. Re-snapshot and
             // decide again from facts.
-            AppendOutput($"审批 {requestId} 未送达：{failure.Message}。请刷新快照后基于事实重新决定；不会自动重发。");
+            AppendLog($"审批 {requestId} 未送达：{failure.Message}。请刷新快照后基于事实重新决定；不会自动重发。");
             await RefreshSnapshotCoreAsync(silent: true);
             return;
         }
-        AppendOutput(outcome.Outcome == ApprovalRespondOutcome.Delivered
+        AppendLog(outcome.Outcome == ApprovalRespondOutcome.Delivered
             ? $"审批 {requestId} 已送达：{decision}。"
             : $"审批 {requestId} 已不在待决（迟到或重复），当前事实被返回。");
         await RefreshSnapshotCoreAsync(silent: true);
@@ -1502,8 +2334,29 @@ public sealed class MainWindowViewModel : ObservableObject, IAsyncDisposable
             await connection.DisposeAsync();
         }
         _reconnectFailures = 0; // a new connection era counts its own losses
+        // F07: drop the retired era's buffered handoff — its pending events
+        // carry a dead connection (dropped by HandleEvent) and its coalesced
+        // delta text has no per-item stamp. The delta buffer's own era alone
+        // would not retire it: if a NEW connection had already been installed
+        // when a stale drain ran, the stamp would still match a live object
+        // only by accident of ordering, so the buffer is cleared here, at the
+        // single era boundary, together with the panels.
+        lock (_handoffGate)
+        {
+            _pendingUiEvents.Clear();
+            _pendingUiDelta.Clear();
+            _deltaEraConnection = null;
+            // C4: the cost account belongs to the connected era. A retired
+            // connection's round counters are dropped with its buffers —
+            // they are re-accumulated from typed facts on the live era.
+            ResetCostAccount();
+        }
         IsConnected = false;
         BannerText = string.Empty;
+        // GUI-3: a disconnected era can never confirm a pending cancel; the
+        // phase is retired here (a late ack is dropped by the era guard in
+        // CancelAsync's snapshot path — the state below stays honest).
+        SetCancelPhase(CancelRequestPhase.Idle, "已断开：未决的取消请求状态失效；重连后以快照为准。");
         Tasks.ReplaceWith([]);
         ApplyApprovals([]);
         // C3: the review panels are honest on disconnect — no stale server
@@ -1513,6 +2366,12 @@ public sealed class MainWindowViewModel : ObservableObject, IAsyncDisposable
         Changes.ReplaceWith([]);
         ChangesStatusText = "变更日志：未连接（unavailable）。";
         ArtifactText = "工件：未连接（unavailable）。";
+        // C2: the paging session belongs to the retired era — window, cursor
+        // and identity all reset, so nothing leaks into the next connection.
+        _artifactWindow.Clear();
+        _artifactSessionReference = null;
+        _artifactNextOffset = null;
+        ArtifactNextOffset = null;
         ContextItems.ReplaceWith([]);
         ContextStatusText = "只读 Context：未连接（unavailable）。";
         AsyncCommands.RaiseCanExecute();

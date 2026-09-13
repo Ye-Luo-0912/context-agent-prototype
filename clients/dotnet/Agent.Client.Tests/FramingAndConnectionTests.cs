@@ -163,6 +163,8 @@ public class ConnectionTests
                         run_started = true,
                         run_completed = false,
                         watermark = 41ul,
+                        run_id = "00000000-0000-4000-8000-000000000031",
+                        workspace_root = "/workspaces/test",
                         focus = (object?)null,
                         tasks = Array.Empty<object>(),
                         pending_approvals = Array.Empty<object>(),

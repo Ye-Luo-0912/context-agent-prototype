@@ -430,17 +430,32 @@ public sealed class ResumableSession : IAgentConnection, IAsyncDisposable
         string taskId, CancellationToken cancellationToken = default) =>
         RunQueryAsync((connection, token) => connection.TaskDetailAsync(taskId, token), cancellationToken);
 
+    /// <summary>EXEC-8 (R2-09): read-only cold completion lookup; a query,
+    /// so a faulted connection reconnects once and re-issues.</summary>
+    public Task<WorkTaskCompletionResponse> TaskCompletionAsync(
+        string taskId, CancellationToken cancellationToken = default) =>
+        RunQueryAsync((connection, token) => connection.TaskCompletionAsync(taskId, token), cancellationToken);
+
     public Task<WorkChangesResponse> ReadChangesAsync(
         int? limit = null, string? afterTx = null, CancellationToken cancellationToken = default) =>
         RunQueryAsync((connection, token) => connection.ReadChangesAsync(limit, afterTx, token), cancellationToken);
 
     public Task<WorkArtifactResponse> ReadArtifactAsync(
-        string reference, uint? maxBytes = null, CancellationToken cancellationToken = default) =>
-        RunQueryAsync((connection, token) => connection.ReadArtifactAsync(reference, maxBytes, token), cancellationToken);
+        string reference, uint? maxBytes = null, ulong? offset = null, CancellationToken cancellationToken = default) =>
+        RunQueryAsync((connection, token) => connection.ReadArtifactAsync(reference, maxBytes, offset, token), cancellationToken);
 
     public Task<WorkContextResponse> ReadContextAsync(
         uint? limit = null, CancellationToken cancellationToken = default) =>
         RunQueryAsync((connection, token) => connection.ReadContextAsync(limit, token), cancellationToken);
+
+    /// <summary>PLATFORM-1 (F06): queries the run's submission ledger for one
+    /// exact <c>client_request_id</c>. A read like the B3 routes: a faulted
+    /// connection reconnects once and re-issues, and an
+    /// <c>Unknown</c>/<c>Expired</c> answer is a fact about missing evidence —
+    /// never a license to resend.</summary>
+    public Task<WorkSubmitResultResponse> SubmitResultAsync(
+        string clientRequestId, string? payloadDigest = null, CancellationToken cancellationToken = default) =>
+        RunQueryAsync((connection, token) => connection.SubmitResultAsync(clientRequestId, payloadDigest, token), cancellationToken);
 
     /// <summary>
     /// The session-level typed event stream (N3): every installed

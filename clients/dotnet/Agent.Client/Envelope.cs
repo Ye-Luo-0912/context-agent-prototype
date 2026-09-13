@@ -159,9 +159,15 @@ public sealed record Route
     public const string WorkEvent = "event";
     // B3 read-only routes (run-scoped; never start a model round).
     public const string WorkTaskDetail = "task_detail";
+    /// <summary>EXEC-8 (R2-09): read-only cold lookup of one completed
+    /// task's outcome.</summary>
+    public const string WorkTaskCompletion = "task_completion";
     public const string WorkChanges = "changes";
     public const string WorkArtifact = "artifact";
     public const string WorkContext = "context";
+    // PLATFORM-1 (F06): exact-request submission receipt query (run-scoped,
+    // read-only).
+    public const string WorkSubmitResult = "submit_result";
     public const string ApprovalRespond = "respond";
 
     [JsonPropertyName("namespace")]
@@ -176,9 +182,11 @@ public sealed record Route
     public static Route WorkSnapshotRoute() => new() { Namespace = WorkNamespace, Operation = WorkSnapshot };
     public static Route WorkSubscribeRoute() => new() { Namespace = WorkNamespace, Operation = WorkSubscribe };
     public static Route WorkTaskDetailRoute() => new() { Namespace = WorkNamespace, Operation = WorkTaskDetail };
+    public static Route WorkTaskCompletionRoute() => new() { Namespace = WorkNamespace, Operation = WorkTaskCompletion };
     public static Route WorkChangesRoute() => new() { Namespace = WorkNamespace, Operation = WorkChanges };
     public static Route WorkArtifactRoute() => new() { Namespace = WorkNamespace, Operation = WorkArtifact };
     public static Route WorkContextRoute() => new() { Namespace = WorkNamespace, Operation = WorkContext };
+    public static Route WorkSubmitResultRoute() => new() { Namespace = WorkNamespace, Operation = WorkSubmitResult };
     public static Route WorkEventRoute() => new() { Namespace = WorkNamespace, Operation = WorkEvent };
     public static Route ApprovalRespondRoute() => new() { Namespace = ApprovalNamespace, Operation = ApprovalRespond };
 
