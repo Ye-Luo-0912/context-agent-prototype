@@ -13,8 +13,13 @@
 //! success response here proves the first two only.
 
 use agent_contracts::{
-    ApprovalDecision, ContextItemSummary, TaskAnchorView, TaskId, TurnCancelAck,
+    ApprovalDecision, ContextItemSummary, MAX_COMPLETION_ARTIFACTS, MAX_COMPLETION_REF_CHARS,
+    MAX_COMPLETION_SUMMARY_CHARS, RunId, TaskAnchorView, TaskId, TurnCancelAck,
 };
+
+/// EXEC-8: a final-output digest is a hex string over SHA-256 — 128 chars is
+/// a generous opaque bound.
+pub const MAX_COMPLETION_DIGEST_CHARS: usize = 128;
 use serde::{Deserialize, Serialize};
 
 use crate::{
@@ -32,9 +37,15 @@ pub const WORK_SUBSCRIBE: &str = "subscribe";
 pub const WORK_EVENT: &str = "event";
 // B3 read-only operations (run-scoped; never start a model round).
 pub const WORK_TASK_DETAIL: &str = "task_detail";
+/// EXEC-8 (R2-09): read-only cold lookup of one completed task's outcome.
+pub const WORK_TASK_COMPLETION: &str = "task_completion";
 pub const WORK_CHANGES: &str = "changes";
 pub const WORK_ARTIFACT: &str = "artifact";
 pub const WORK_CONTEXT: &str = "context";
+/// PLATFORM-1 (F06): exact-request submission receipt query. Run-scoped and
+/// read-only; the caller names its own `client_request_id` instead of
+/// inferring admission from a matching goal.
+pub const WORK_SUBMIT_RESULT: &str = "submit_result";
 pub const APPROVAL_NAMESPACE: &str = "approval";
 pub const APPROVAL_RESPOND: &str = "respond";
 
@@ -44,9 +55,19 @@ pub const APPROVAL_RESPOND: &str = "respond";
 /// bound mirroring the runtime's own input cap.
 pub const MAX_WORK_GOAL_CHARS: usize = 200_000;
 pub const MAX_CLIENT_REQUEST_ID_BYTES: usize = 128;
+/// PLATFORM-1 (F06): bound on the recorded-payload digest returned by the
+/// exact-request query's conflict classification (hex sha-256 fits with room).
+pub const MAX_SUBMIT_PAYLOAD_DIGEST_BYTES: usize = 128;
+/// PLATFORM-3: bound on the workspace root a snapshot names. Long paths are
+/// legal (Unix allows 4 KiB), control characters are not.
+pub const MAX_SNAPSHOT_WORKSPACE_ROOT_BYTES: usize = 4096;
 /// Matches the runtime's resumable task-record cap.
 pub const MAX_SNAPSHOT_TASKS: usize = 256;
 pub const MAX_SNAPSHOT_PENDING_APPROVALS: usize = 16;
+/// EXEC-6: bounded degrade facts ride the snapshot; the cap mirrors the
+/// protected-run/lineage bound it reports about.
+pub const MAX_SNAPSHOT_DEGRADED_RUNS: usize = 64;
+pub const MAX_SNAPSHOT_DEGRADED_RUN_ID_BYTES: usize = 128;
 pub const MAX_SNAPSHOT_GOAL_CHARS: usize = MAX_WORK_GOAL_CHARS;
 /// Byte backstop mirroring `agent_contracts::input::USER_INPUT_REPLAY_MAX_BYTES`:
 /// the same total budget the runtime applies to a submitted instruction, so
@@ -159,6 +180,19 @@ impl Route {
         self.namespace == WORK_NAMESPACE && self.operation == WORK_TASK_DETAIL
     }
 
+    /// EXEC-8 (R2-09): read-only route — one completed task's outcome from
+    /// the hot window or the durable journal. Run-scoped, read-only.
+    pub fn work_task_completion() -> Self {
+        Self {
+            namespace: WORK_NAMESPACE.to_owned(),
+            operation: WORK_TASK_COMPLETION.to_owned(),
+        }
+    }
+
+    pub fn is_work_task_completion(&self) -> bool {
+        self.namespace == WORK_NAMESPACE && self.operation == WORK_TASK_COMPLETION
+    }
+
     /// B3 read-only route: the workspace change journal (review surface).
     /// Run-scoped and read-only.
     pub fn work_changes() -> Self {
@@ -207,6 +241,19 @@ impl Route {
 
     pub fn is_work_event(&self) -> bool {
         self.namespace == WORK_NAMESPACE && self.operation == WORK_EVENT
+    }
+
+    /// PLATFORM-1 (F06) read-only route: the exact-request submission receipt
+    /// query. Run-scoped and read-only.
+    pub fn work_submit_result() -> Self {
+        Self {
+            namespace: WORK_NAMESPACE.to_owned(),
+            operation: WORK_SUBMIT_RESULT.to_owned(),
+        }
+    }
+
+    pub fn is_work_submit_result(&self) -> bool {
+        self.namespace == WORK_NAMESPACE && self.operation == WORK_SUBMIT_RESULT
     }
 
     pub fn is_approval_respond(&self) -> bool {
@@ -412,6 +459,12 @@ pub struct PendingApprovalSnapshot {
 /// the state reflects; a client whose live stream is behind must treat
 /// `resync_required` as "your stream has a hole, rebuild from this snapshot"
 /// rather than splicing events into a stale projection.
+///
+/// PLATFORM-3: every snapshot names the run and workspace that produced it,
+/// so a client that reconnected — perhaps to a different host incarnation on
+/// a shared default endpoint — can tell "this run says X" from "a previous
+/// run said X" and can verify the endpoint is bound to the workspace it
+/// meant to reach. These are facts about identity, never a completion claim.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct WorkSnapshotResponse {
@@ -419,16 +472,60 @@ pub struct WorkSnapshotResponse {
     pub run_completed: bool,
     /// Latest durable event sequence visible to this run.
     pub watermark: u64,
+    /// The run whose state this snapshot projects. A client that saw a
+    /// different run id before reconnect must rebuild instead of splicing.
+    pub run_id: RunId,
+    /// The workspace root the answering host is bound to, in the host's
+    /// canonical form when the path resolves. A client connecting over a
+    /// shared default endpoint verifies this is the workspace it meant.
+    pub workspace_root: String,
     pub focus: Option<FocusSnapshot>,
     #[serde(default)]
     pub tasks: Vec<TaskSnapshotEntry>,
     #[serde(default)]
     pub pending_approvals: Vec<PendingApprovalSnapshot>,
     pub resync_required: bool,
+    /// EXEC-6 (R2-02): the predecessor runs whose sealed references the last
+    /// restore could not admit into this run's lineage. A re-obtainable,
+    /// bounded fact (not a fire-once event): an empty list means nothing is
+    /// degraded. Absent on older servers — decodes as empty.
+    #[serde(default)]
+    pub restore_evidence_degraded: Vec<String>,
 }
 
 impl WorkSnapshotResponse {
     pub fn validate(&self) -> ValidationResult<()> {
+        // PLATFORM-3: the identity facts are mandatory — a snapshot that
+        // cannot say which run and workspace produced it is not a valid
+        // projection, because a reconnecting client cannot tell whose facts
+        // it is reading.
+        if self.run_id.0.is_nil() {
+            return Err(ValidationError::new(
+                "work.snapshot.run_id",
+                "must not be a nil UUID",
+            ));
+        }
+        validate_opaque(
+            "work.snapshot.workspace_root",
+            &self.workspace_root,
+            MAX_SNAPSHOT_WORKSPACE_ROOT_BYTES,
+        )?;
+        if self.restore_evidence_degraded.len() > MAX_SNAPSHOT_DEGRADED_RUNS {
+            return Err(ValidationError::new(
+                "work.snapshot.restore_evidence_degraded",
+                format!(
+                    "carries {} entries, above the {MAX_SNAPSHOT_DEGRADED_RUNS} entry bound",
+                    self.restore_evidence_degraded.len()
+                ),
+            ));
+        }
+        for run in &self.restore_evidence_degraded {
+            validate_opaque(
+                "work.snapshot.restore_evidence_degraded",
+                run,
+                MAX_SNAPSHOT_DEGRADED_RUN_ID_BYTES,
+            )?;
+        }
         if self.tasks.len() > MAX_SNAPSHOT_TASKS {
             return Err(ValidationError::new(
                 "work.snapshot.tasks",
@@ -642,6 +739,293 @@ impl WorkTaskDetailResponse {
     }
 }
 
+// ---------------------------------------------------------------------------
+// EXEC-8 (R2-09): cold completion lookup. Read-only and run-scoped; the
+// answer is typed evidence — a retired record read back from the durable
+// journal, an honestly bounded unknown, or the hot-table pointer.
+// ---------------------------------------------------------------------------
+
+/// The bounded facts of one retired completion. Mirrors the runtime's
+/// `TaskCompletionLookup::Retired` payload; legacy completions carry empty
+/// artifacts and no digest.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum WorkCompletionFact {
+    /// The task row is still in the hot table — `task_detail` covers it.
+    Hot,
+    /// Retired from the hot window; the durable journal carried the
+    /// completion.
+    Retired {
+        summary: String,
+        anchor_revision: u64,
+        artifacts: Vec<String>,
+        final_output_digest: Option<String>,
+    },
+    /// The bounded journal window could not reach this task's era — an
+    /// honestly bounded unknown, never "does not exist".
+    BeyondJournalWindow,
+    /// The window covered this task's era and nothing was journaled.
+    Unknown,
+}
+
+impl WorkCompletionFact {
+    pub fn validate(&self) -> ValidationResult<()> {
+        match self {
+            Self::Hot | Self::BeyondJournalWindow | Self::Unknown => Ok(()),
+            Self::Retired {
+                summary,
+                anchor_revision: _,
+                artifacts,
+                final_output_digest,
+            } => {
+                validate_text(
+                    "work.task_completion.summary",
+                    summary,
+                    MAX_COMPLETION_SUMMARY_CHARS,
+                )?;
+                if artifacts.len() > MAX_COMPLETION_ARTIFACTS + 1 {
+                    return Err(ValidationError::new(
+                        "work.task_completion.artifacts",
+                        format!(
+                            "carries {} references, above the {} bound",
+                            artifacts.len(),
+                            MAX_COMPLETION_ARTIFACTS + 1
+                        ),
+                    ));
+                }
+                for artifact in artifacts {
+                    validate_text(
+                        "work.task_completion.artifact",
+                        artifact,
+                        MAX_COMPLETION_REF_CHARS,
+                    )?;
+                }
+                if let Some(digest) = final_output_digest {
+                    validate_text(
+                        "work.task_completion.final_output_digest",
+                        digest,
+                        MAX_COMPLETION_DIGEST_CHARS,
+                    )?;
+                }
+                Ok(())
+            }
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WorkTaskCompletionRequest {
+    pub task_id: TaskId,
+}
+
+impl WorkTaskCompletionRequest {
+    pub fn validate(&self) -> ValidationResult<()> {
+        if self.task_id.0.is_nil() {
+            return Err(ValidationError::new(
+                "work.task_completion.task_id",
+                "must not be a nil UUID",
+            ));
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WorkTaskCompletionResponse {
+    pub task_id: TaskId,
+    pub fact: WorkCompletionFact,
+}
+
+impl WorkTaskCompletionResponse {
+    pub fn validate(&self) -> ValidationResult<()> {
+        if self.task_id.0.is_nil() {
+            return Err(ValidationError::new(
+                "work.task_completion.task_id",
+                "must not be a nil UUID",
+            ));
+        }
+        self.fact.validate()
+    }
+}
+
+// ---------------------------------------------------------------------------
+// PLATFORM-1 (F06): exact-request submission receipt query.
+// ---------------------------------------------------------------------------
+
+/// Ask whether THIS caller's submission was admitted. The caller names its own
+/// `client_request_id`; the query never matches on goal text, and the
+/// envelope's `message_id` is never used as (nor conflated with) the request
+/// identity. Run-scoped and read-only.
+///
+/// `payload_digest` is optional and is only a comparison token the caller
+/// computes over its OWN payload with [`submission_payload_digest`]'s
+/// documented preimage — it is never authority and the server never echoes
+/// goal text back. When present, the answer can distinguish "this exact
+/// payload was admitted" from "a different payload holds this id"
+/// (`KnownRejected`). When absent, the answer can only speak to identity.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WorkSubmitResultRequest {
+    pub client_request_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub payload_digest: Option<String>,
+}
+
+impl WorkSubmitResultRequest {
+    pub fn validate(&self) -> ValidationResult<()> {
+        validate_opaque(
+            "work.submit_result.client_request_id",
+            &self.client_request_id,
+            MAX_CLIENT_REQUEST_ID_BYTES,
+        )?;
+        if let Some(digest) = &self.payload_digest {
+            validate_opaque(
+                "work.submit_result.payload_digest",
+                digest,
+                MAX_SUBMIT_PAYLOAD_DIGEST_BYTES,
+            )?;
+        }
+        Ok(())
+    }
+}
+
+/// The documented preimage for the submission payload digest, so a Rust host
+/// and a .NET client hash identically. Exposed as a constant so both sides
+/// derive it from one place instead of copying a literal.
+pub const SUBMIT_PAYLOAD_DIGEST_DOMAIN: &str = "focus-agent.platform.work.submit-payload.v1";
+
+/// Compute the submission payload digest over a goal exactly as the runtime
+/// does: domain-separated SHA-256, lowercase hex. This is the comparison token
+/// the exact-request query accepts; it is not an authority surface.
+pub fn submission_payload_digest(goal: &str) -> String {
+    use sha2::{Digest, Sha256};
+    let mut hasher = Sha256::new();
+    hasher.update(SUBMIT_PAYLOAD_DIGEST_DOMAIN.as_bytes());
+    hasher.update([0u8]);
+    hasher.update(goal.as_bytes());
+    let digest = hasher.finalize();
+    let mut hex = String::with_capacity(digest.len() * 2);
+    for byte in digest {
+        use std::fmt::Write as _;
+        let _ = write!(hex, "{byte:02x}");
+    }
+    hex
+}
+
+/// What the ledger can testify about one `client_request_id`. Every variant is
+/// a fact, not an instruction: `Unknown` and `Expired` mean the runtime cannot
+/// prove either admission or non-admission, so a client must not read them as
+/// "not executed" and must not auto-resend a side-effecting request.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WorkSubmitResultDisposition {
+    /// This run admitted the id and applied the goal.
+    Accepted,
+    /// The id was already admitted for the identical payload; no second
+    /// execution happened. The original admission is the authority.
+    AlreadyAccepted,
+    /// The id was seen, but with a different payload. The current request was
+    /// never admitted; the recorded one was. Terminal — reusing the id will
+    /// never succeed.
+    KnownRejected,
+    /// The runtime has no evidence for this id: it was never seen, or the
+    /// bounded process-lifetime window already evicted it. Not proof of
+    /// non-execution.
+    Unknown,
+    /// The id belonged to an earlier host/run epoch and this run has no
+    /// carried-over evidence. Not proof of non-execution.
+    Expired,
+}
+
+impl WorkSubmitResultDisposition {
+    /// Does this disposition establish that the exact request was admitted?
+    pub fn is_admitted(self) -> bool {
+        matches!(self, Self::Accepted | Self::AlreadyAccepted)
+    }
+
+    /// Does this disposition leave the outcome genuinely undetermined?
+    pub fn is_indeterminate(self) -> bool {
+        matches!(self, Self::Unknown | Self::Expired)
+    }
+}
+
+/// The receipt query's answer, bound to the epoch and run that produced it so
+/// a client can tell "this run says X" from "a previous run said X".
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WorkSubmitResultResponse {
+    /// The run whose ledger answered. A client that reconnects to a different
+    /// run must re-query instead of trusting a stale answer.
+    pub run_id: RunId,
+    /// Echo of the queried key, so a late response can never be applied to a
+    /// different request.
+    pub client_request_id: String,
+    pub disposition: WorkSubmitResultDisposition,
+    /// Present only when the disposition is `Accepted` / `AlreadyAccepted` /
+    /// `KnownRejected`: the task the recorded admission bound to.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub task_id: Option<TaskId>,
+    /// Present only when the disposition is `KnownRejected`: a stable digest of
+    /// the payload the id was originally admitted for. Lets a client show
+    /// "same id, different content" without shipping the old goal text.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub accepted_payload_digest: Option<String>,
+}
+
+impl WorkSubmitResultResponse {
+    pub fn validate(&self) -> ValidationResult<()> {
+        validate_opaque(
+            "work.submit_result.client_request_id",
+            &self.client_request_id,
+            MAX_CLIENT_REQUEST_ID_BYTES,
+        )?;
+        // A disposition that claims a recorded admission must name its task;
+        // an indeterminate one must not pretend to.
+        match self.disposition {
+            WorkSubmitResultDisposition::Accepted
+            | WorkSubmitResultDisposition::AlreadyAccepted
+            | WorkSubmitResultDisposition::KnownRejected => {
+                let Some(task_id) = self.task_id else {
+                    return Err(ValidationError::new(
+                        "work.submit_result.task_id",
+                        "a recorded disposition must name its task",
+                    ));
+                };
+                if task_id.0.is_nil() {
+                    return Err(ValidationError::new(
+                        "work.submit_result.task_id",
+                        "must not be a nil UUID",
+                    ));
+                }
+            }
+            WorkSubmitResultDisposition::Unknown | WorkSubmitResultDisposition::Expired => {
+                if self.task_id.is_some() {
+                    return Err(ValidationError::new(
+                        "work.submit_result.task_id",
+                        "an indeterminate disposition must not name a task",
+                    ));
+                }
+            }
+        }
+        // The rejected-payload digest only exists on a conflict.
+        if self.disposition == WorkSubmitResultDisposition::KnownRejected {
+            validate_opaque(
+                "work.submit_result.accepted_payload_digest",
+                self.accepted_payload_digest.as_deref().unwrap_or_default(),
+                MAX_SUBMIT_PAYLOAD_DIGEST_BYTES,
+            )?;
+        } else if self.accepted_payload_digest.is_some() {
+            return Err(ValidationError::new(
+                "work.submit_result.accepted_payload_digest",
+                "only a rejected conflict carries the recorded payload digest",
+            ));
+        }
+        Ok(())
+    }
+}
+
 /// Bounded change-journal listing request. `after_tx` names an exclusive
 /// cursor: records are returned newest-first until the cursor, `limit`, or
 /// the journal head is reached.
@@ -671,9 +1055,11 @@ impl WorkChangesRequest {
     }
 }
 
-/// One mirrored workspace journal record. `old_content` never travels to the
-/// wire: the journal's old-content capture is an internal review aid, kept
-/// bounded inside the workspace and not duplicated as a protocol field.
+/// One mirrored workspace journal record. `old_content` itself still never
+/// travels as a protocol field: the platform spills a captured before-body
+/// into the run's sealed artifact store and hands back a *reference*
+/// (PLATFORM-2), so the review chain locates the actual content through the
+/// same bounded, digest-verified paging every other read uses.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum ChangeSummary {
@@ -687,6 +1073,11 @@ pub enum ChangeSummary {
         bytes_after: u64,
         before_hash: String,
         after_hash: String,
+        /// Run-scoped `artifact://` reference to the captured before-body,
+        /// readable with the paged `work.artifact` route. Absent when the
+        /// journal captured no content (oversized capture or empty file).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        old_content_artifact: Option<String>,
     },
     MutationCommitted {
         tx_id: String,
@@ -727,17 +1118,27 @@ impl ChangeSummary {
                 action,
                 before_hash,
                 after_hash,
+                old_content_artifact,
                 ..
-            } => (
-                tx_id,
-                vec![
-                    ("work.changes.tool", tool),
-                    ("work.changes.path", path),
-                    ("work.changes.action", action),
-                    ("work.changes.before_hash", before_hash),
-                    ("work.changes.after_hash", after_hash),
-                ],
-            ),
+            } => {
+                if let Some(reference) = old_content_artifact {
+                    validate_opaque(
+                        "work.changes.old_content_artifact",
+                        reference,
+                        agent_contracts::MAX_ARTIFACT_REFERENCE_BYTES,
+                    )?;
+                }
+                (
+                    tx_id,
+                    vec![
+                        ("work.changes.tool", tool),
+                        ("work.changes.path", path),
+                        ("work.changes.action", action),
+                        ("work.changes.before_hash", before_hash),
+                        ("work.changes.after_hash", after_hash),
+                    ],
+                )
+            }
             Self::MutationCommitted { tx_id, .. } => (tx_id, Vec::new()),
             Self::MutationRolledBack { tx_id, reason, .. } => {
                 (tx_id, vec![("work.changes.reason", reason)])
@@ -790,16 +1191,22 @@ impl WorkChangesResponse {
     }
 }
 
-/// Read one run-scoped artifact reference with an explicit byte budget.
+/// Read one run-scoped artifact reference with an explicit byte budget and
+/// (optionally) a byte offset — PLATFORM-2 (F08): the bounded-paging read.
 /// `reference` is a sealed `artifact://` locator; the workspace verifies the
 /// run binding and (when the reference carries one) the content digest before
-/// the router reads anything.
+/// the router reads anything. The sealed artifact is immutable, so paging
+/// cannot quietly switch versions: every page re-verifies the same identity.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct WorkArtifactRequest {
     pub reference: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_bytes: Option<u32>,
+    /// Byte position where this read starts. Absent/0 reads from the
+    /// beginning (the historical prefix read).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub offset: Option<u64>,
 }
 
 impl WorkArtifactRequest {
@@ -829,10 +1236,19 @@ pub struct WorkArtifactResponse {
     pub reference: String,
     /// The artifact's on-disk byte length, before any route-side bound.
     pub size_bytes: u64,
-    /// `true` only when the returned body is a prefix, cut at the requested
-    /// budget; a body that fits fully is never marked truncated.
+    /// The byte position where `content_base64` starts (0 for the
+    /// historical prefix read).
+    #[serde(default)]
+    pub offset: u64,
+    /// `true` only when there are more bytes beyond this window (cut at the
+    /// requested budget); a window that reaches the end of the artifact is
+    /// never marked truncated.
     pub truncated: bool,
-    /// The (possibly truncated) body, base64-encoded.
+    /// The next byte position to read, present exactly when `truncated` is
+    /// true. `truncated == false` (eof) carries no cursor.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub next_offset: Option<u64>,
+    /// The (possibly bounded) body window starting at `offset`, base64.
     pub content_base64: String,
 }
 
@@ -852,19 +1268,43 @@ impl WorkArtifactResponse {
                 ));
             }
         };
-        let truncated = self.truncated;
-        let consistent = if truncated {
-            decoded_len < self.size_bytes as usize
-        } else {
-            (decoded_len as u64) == self.size_bytes
-        };
-        if !consistent {
+        let end = self.offset + decoded_len as u64;
+        if self.offset > self.size_bytes || end > self.size_bytes {
             return Err(ValidationError::new(
                 "work.artifact.size_bytes",
                 format!(
-                    "size {size} and truncated {truncated} disagree with {decoded} decoded bytes",
-                    size = self.size_bytes,
-                    decoded = decoded_len
+                    "window [{offset},{end}) does not fit the artifact of {size} bytes",
+                    offset = self.offset,
+                    end = end,
+                    size = self.size_bytes
+                ),
+            ));
+        }
+        if self.truncated != self.next_offset.is_some() {
+            return Err(ValidationError::new(
+                "work.artifact.next_offset",
+                "the continuation cursor must be present exactly when the window is truncated",
+            ));
+        }
+        if self.truncated {
+            let next = self.next_offset.expect("checked above");
+            if next != end || end >= self.size_bytes {
+                return Err(ValidationError::new(
+                    "work.artifact.next_offset",
+                    format!(
+                        "must point at the first unread byte ({end}) of a window that ends before {size}",
+                        end = end,
+                        size = self.size_bytes
+                    ),
+                ));
+            }
+        } else if end != self.size_bytes {
+            return Err(ValidationError::new(
+                "work.artifact.size_bytes",
+                format!(
+                    "a non-truncated window must reach the end of the artifact ({size}), not {end}",
+                    end = end,
+                    size = self.size_bytes
                 ),
             ));
         }
@@ -1170,6 +1610,27 @@ pub fn validate_work_task_detail_request(
     })
 }
 
+pub fn validate_work_task_completion_request(
+    profile: &NegotiatedContractProfile,
+    request: &PlatformEnvelope<WorkTaskCompletionRequest>,
+) -> ValidationResult<()> {
+    validate_run_scoped_request(
+        profile,
+        request,
+        Route::is_work_task_completion,
+        |payload| payload.validate(),
+    )
+}
+
+pub fn validate_work_task_completion_response(
+    profile: &NegotiatedContractProfile,
+    request: &PlatformEnvelope<WorkTaskCompletionRequest>,
+    response: &PlatformEnvelope<PlatformResponse<WorkTaskCompletionResponse>>,
+) -> ValidationResult<()> {
+    validate_work_task_completion_request(profile, request)?;
+    validate_run_scoped_response(profile, request, response, |payload| payload.validate())
+}
+
 pub fn validate_work_task_detail_response(
     profile: &NegotiatedContractProfile,
     request: &PlatformEnvelope<WorkTaskDetailRequest>,
@@ -1177,6 +1638,34 @@ pub fn validate_work_task_detail_response(
 ) -> ValidationResult<()> {
     validate_work_task_detail_request(profile, request)?;
     validate_run_scoped_response(profile, request, response, |payload| payload.validate())
+}
+
+pub fn validate_work_submit_result_request(
+    profile: &NegotiatedContractProfile,
+    request: &PlatformEnvelope<WorkSubmitResultRequest>,
+) -> ValidationResult<()> {
+    validate_run_scoped_request(profile, request, Route::is_work_submit_result, |payload| {
+        payload.validate()
+    })
+}
+
+pub fn validate_work_submit_result_response(
+    profile: &NegotiatedContractProfile,
+    request: &PlatformEnvelope<WorkSubmitResultRequest>,
+    response: &PlatformEnvelope<PlatformResponse<WorkSubmitResultResponse>>,
+) -> ValidationResult<()> {
+    validate_work_submit_result_request(profile, request)?;
+    validate_run_scoped_response(profile, request, response, |payload| payload.validate())?;
+    if let PlatformResponse::Success { value } = &response.payload {
+        // The answer must speak about the request that was actually asked.
+        if value.client_request_id != request.payload.client_request_id {
+            return Err(ValidationError::new(
+                "work.submit_result.client_request_id",
+                "must echo the queried client request id",
+            ));
+        }
+    }
+    Ok(())
 }
 
 pub fn validate_work_changes_request(
@@ -1318,6 +1807,10 @@ mod tests {
         TaskId::from_str(TASK).unwrap()
     }
 
+    fn run_id() -> RunId {
+        RunId::from_str(RUN).unwrap()
+    }
+
     #[test]
     fn work_submit_request_has_exact_golden_shape() {
         let request = submit_request();
@@ -1424,6 +1917,8 @@ mod tests {
             run_started: true,
             run_completed: false,
             watermark: 41,
+            run_id: run_id(),
+            workspace_root: "/workspaces/alpha".into(),
             focus: Some(FocusSnapshot {
                 task_id: task_id(),
                 goal: "migrate".into(),
@@ -1444,6 +1939,7 @@ mod tests {
                 target_summary: Some("docs/plan.md".into()),
             }],
             resync_required: false,
+            restore_evidence_degraded: Vec::new(),
         };
         let success = response(&request, snapshot.clone());
         validate_work_snapshot_response(&profile(), &request, &success).unwrap();
@@ -1474,6 +1970,72 @@ mod tests {
         assert!(snapshot.validate().is_err());
     }
 
+    /// PLATFORM-3: a snapshot must name the run and workspace that produced
+    /// it. Silent defaults would let a reconnecting client read one host's
+    /// facts while believing they are another's, so the identity facts are
+    /// mandatory and bounded.
+    #[test]
+    fn snapshot_identity_facts_are_mandatory_and_bounded() {
+        let request = run_scoped_request(Route::work_snapshot(), WorkSnapshotRequest {});
+        let snapshot = WorkSnapshotResponse {
+            run_started: true,
+            run_completed: false,
+            watermark: 1,
+            run_id: run_id(),
+            workspace_root: "/workspaces/alpha".into(),
+            focus: None,
+            tasks: vec![],
+            pending_approvals: vec![],
+            resync_required: false,
+            restore_evidence_degraded: Vec::new(),
+        };
+        validate_work_snapshot_response(
+            &profile(),
+            &request,
+            &response(&request, snapshot.clone()),
+        )
+        .unwrap();
+
+        // A nil run id is not a run identity.
+        let mut anonymous = snapshot.clone();
+        anonymous.run_id = RunId::from_str("00000000-0000-0000-0000-000000000000").unwrap();
+        assert_eq!(
+            anonymous.validate().unwrap_err().field(),
+            "work.snapshot.run_id"
+        );
+
+        // An empty or control-bearing workspace root is not an identity.
+        let mut unnamed = snapshot.clone();
+        unnamed.workspace_root.clear();
+        assert_eq!(
+            unnamed.validate().unwrap_err().field(),
+            "work.snapshot.workspace_root"
+        );
+        let mut control = snapshot;
+        control.workspace_root = "/workspaces/al\u{1}pha".into();
+        assert_eq!(
+            control.validate().unwrap_err().field(),
+            "work.snapshot.workspace_root"
+        );
+
+        // Over the path bound is refused; at the bound is legal.
+        let mut long = WorkSnapshotResponse {
+            run_started: true,
+            run_completed: false,
+            watermark: 1,
+            run_id: run_id(),
+            workspace_root: "/".repeat(MAX_SNAPSHOT_WORKSPACE_ROOT_BYTES + 1),
+            focus: None,
+            tasks: vec![],
+            pending_approvals: vec![],
+            resync_required: false,
+            restore_evidence_degraded: Vec::new(),
+        };
+        assert!(long.validate().is_err());
+        long.workspace_root = "/".repeat(MAX_SNAPSHOT_WORKSPACE_ROOT_BYTES);
+        long.validate().unwrap();
+    }
+
     /// F12: an approval's target summary is a bounded display projection.
     /// Oversized or control-bearing summaries fail validation; the summary
     /// travels on the wire exactly as encoded (snake_case risk).
@@ -1492,12 +2054,15 @@ mod tests {
             run_started: true,
             run_completed: false,
             watermark: 1,
+            run_id: run_id(),
+            workspace_root: "/workspaces/alpha".into(),
             focus: None,
             tasks: vec![],
             pending_approvals: vec![approval(Some(
                 "x".repeat(MAX_SNAPSHOT_APPROVAL_TARGET_CHARS + 1),
             ))],
             resync_required: false,
+            restore_evidence_degraded: Vec::new(),
         };
         assert!(snapshot.validate().is_err());
 
@@ -1663,6 +2228,174 @@ mod tests {
         assert!(validate_work_task_detail_response(&profile(), &empty_goal, &bad).is_err());
     }
 
+    /// PLATFORM-1: the exact-request query answers about the id it was asked
+    /// about, and every disposition carries exactly the facts it can prove.
+    #[test]
+    fn submit_result_query_binds_the_answer_to_the_asked_request() {
+        let request = run_scoped_request(
+            Route::work_submit_result(),
+            WorkSubmitResultRequest {
+                client_request_id: "client-7".into(),
+                payload_digest: Some(submission_payload_digest("migrate the retry table")),
+            },
+        );
+        validate_work_submit_result_request(&profile(), &request).unwrap();
+
+        // An identity-only query (no payload) is legal too, and then answers
+        // only about identity.
+        let identity_only = run_scoped_request(
+            Route::work_submit_result(),
+            WorkSubmitResultRequest {
+                client_request_id: "client-7".into(),
+                payload_digest: None,
+            },
+        );
+        validate_work_submit_result_request(&profile(), &identity_only).unwrap();
+
+        // Admitted: the id and its task.
+        let admitted = response(
+            &request,
+            WorkSubmitResultResponse {
+                run_id: RunId::from_str(RUN).unwrap(),
+                client_request_id: "client-7".into(),
+                disposition: WorkSubmitResultDisposition::Accepted,
+                task_id: Some(task_id()),
+                accepted_payload_digest: None,
+            },
+        );
+        validate_work_submit_result_response(&profile(), &request, &admitted).unwrap();
+
+        // Indeterminate: no task, because none can be proven.
+        let unknown = response(
+            &request,
+            WorkSubmitResultResponse {
+                run_id: RunId::from_str(RUN).unwrap(),
+                client_request_id: "client-7".into(),
+                disposition: WorkSubmitResultDisposition::Unknown,
+                task_id: None,
+                accepted_payload_digest: None,
+            },
+        );
+        validate_work_submit_result_response(&profile(), &request, &unknown).unwrap();
+
+        // Conflict: the recorded task plus the digest it was admitted for.
+        let rejected = response(
+            &request,
+            WorkSubmitResultResponse {
+                run_id: RunId::from_str(RUN).unwrap(),
+                client_request_id: "client-7".into(),
+                disposition: WorkSubmitResultDisposition::KnownRejected,
+                task_id: Some(task_id()),
+                accepted_payload_digest: Some("ab".repeat(32)),
+            },
+        );
+        validate_work_submit_result_response(&profile(), &request, &rejected).unwrap();
+
+        // The answer must be about the requested id, not some other one.
+        let mut mismatched = admitted.clone();
+        if let PlatformResponse::Success { value } = &mut mismatched.payload {
+            value.client_request_id = "client-8".into();
+        }
+        let error =
+            validate_work_submit_result_response(&profile(), &request, &mismatched).unwrap_err();
+        assert_eq!(error.field(), "work.submit_result.client_request_id");
+
+        // An empty id can never be queried.
+        let mut empty = request.clone();
+        empty.payload.client_request_id.clear();
+        assert!(empty.payload.validate().is_err());
+    }
+
+    /// The submission payload digest is domain-separated and content-bound, so
+    /// the same goal always hashes the same and two different goals never
+    /// trivially collide. The golden construction pins the preimage so a .NET
+    /// client reproduces it byte-for-byte.
+    #[test]
+    fn submission_payload_digest_is_stable_and_content_bound() {
+        let a = submission_payload_digest("migrate the retry table");
+        let b = submission_payload_digest("migrate the retry table");
+        let c = submission_payload_digest("migrate the retry tablE");
+        assert_eq!(a, b);
+        assert_ne!(a, c);
+        assert_eq!(a.len(), 64);
+        assert!(a.chars().all(|ch| ch.is_ascii_hexdigit()));
+
+        let mut hasher = sha2::Sha256::new();
+        use sha2::Digest as _;
+        hasher.update(SUBMIT_PAYLOAD_DIGEST_DOMAIN.as_bytes());
+        hasher.update([0u8]);
+        hasher.update(b"migrate the retry table");
+        let expected: String = hasher
+            .finalize()
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect();
+        assert_eq!(a, expected);
+    }
+
+    /// A recorded disposition must name its task; an indeterminate one must
+    /// not manufacture a task. Silent contradictions are rejected as fields.
+    #[test]
+    fn submit_result_disposition_and_task_facts_must_agree() {
+        let no_task = WorkSubmitResultResponse {
+            run_id: RunId::from_str(RUN).unwrap(),
+            client_request_id: "client-7".into(),
+            disposition: WorkSubmitResultDisposition::Accepted,
+            task_id: None,
+            accepted_payload_digest: None,
+        };
+        assert_eq!(
+            no_task.validate().unwrap_err().field(),
+            "work.submit_result.task_id"
+        );
+
+        let invented_task = WorkSubmitResultResponse {
+            run_id: RunId::from_str(RUN).unwrap(),
+            client_request_id: "client-7".into(),
+            disposition: WorkSubmitResultDisposition::Expired,
+            task_id: Some(task_id()),
+            accepted_payload_digest: None,
+        };
+        assert_eq!(
+            invented_task.validate().unwrap_err().field(),
+            "work.submit_result.task_id"
+        );
+
+        // A conflict without the recorded digest cannot show "different
+        // content"; a non-conflict must not carry one.
+        let silent_conflict = WorkSubmitResultResponse {
+            run_id: RunId::from_str(RUN).unwrap(),
+            client_request_id: "client-7".into(),
+            disposition: WorkSubmitResultDisposition::KnownRejected,
+            task_id: Some(task_id()),
+            accepted_payload_digest: None,
+        };
+        assert_eq!(
+            silent_conflict.validate().unwrap_err().field(),
+            "work.submit_result.accepted_payload_digest"
+        );
+        let stray_digest = WorkSubmitResultResponse {
+            run_id: RunId::from_str(RUN).unwrap(),
+            client_request_id: "client-7".into(),
+            disposition: WorkSubmitResultDisposition::Accepted,
+            task_id: Some(task_id()),
+            accepted_payload_digest: Some("ab".repeat(32)),
+        };
+        assert_eq!(
+            stray_digest.validate().unwrap_err().field(),
+            "work.submit_result.accepted_payload_digest"
+        );
+
+        // The disposition helpers keep "admitted" separate from
+        // "indeterminate" — the distinction the GUI must not collapse.
+        assert!(WorkSubmitResultDisposition::Accepted.is_admitted());
+        assert!(WorkSubmitResultDisposition::AlreadyAccepted.is_admitted());
+        assert!(!WorkSubmitResultDisposition::KnownRejected.is_admitted());
+        assert!(WorkSubmitResultDisposition::Unknown.is_indeterminate());
+        assert!(WorkSubmitResultDisposition::Expired.is_indeterminate());
+        assert!(!WorkSubmitResultDisposition::Accepted.is_indeterminate());
+    }
+
     #[test]
     fn changes_listing_round_trips_and_stays_bounded() {
         let request = run_scoped_request(
@@ -1687,6 +2420,7 @@ mod tests {
                         bytes_after: 20,
                         before_hash: "a1".into(),
                         after_hash: "b2".into(),
+                        old_content_artifact: None,
                     },
                     ChangeSummary::MutationCommitted {
                         tx_id: "tx-3".into(),
@@ -1749,6 +2483,7 @@ mod tests {
             WorkArtifactRequest {
                 reference: "artifact://.focus-agent/artifacts/r/proof/aa".into(),
                 max_bytes: Some(32),
+                offset: None,
             },
         );
         validate_work_artifact_request(&profile(), &request).unwrap();
@@ -1761,14 +2496,17 @@ mod tests {
         long_ref.payload.reference = "x".repeat(agent_contracts::MAX_ARTIFACT_REFERENCE_BYTES + 1);
         assert!(long_ref.payload.validate().is_err());
 
-        // A truncated body must be strictly shorter than size_bytes; a full
-        // body must equal it. Both are validated, never assumed.
+        // A window that reaches the end of the artifact carries no cursor; a
+        // truncated window carries the exact next byte position. Both are
+        // validated, never assumed. (PLATFORM-2/F08 paging contract.)
         let full = response(
             &request,
             WorkArtifactResponse {
                 reference: "artifact://r".into(),
                 size_bytes: 5,
+                offset: 0,
                 truncated: false,
+                next_offset: None,
                 content_base64: base64::engine::general_purpose::STANDARD.encode(b"hello"),
             },
         );
@@ -1779,7 +2517,9 @@ mod tests {
             WorkArtifactResponse {
                 reference: "artifact://r".into(),
                 size_bytes: 100,
+                offset: 0,
                 truncated: true,
+                next_offset: Some(5),
                 content_base64: base64::engine::general_purpose::STANDARD.encode(b"hello"),
             },
         );
@@ -1790,11 +2530,95 @@ mod tests {
             WorkArtifactResponse {
                 reference: "artifact://r".into(),
                 size_bytes: 32,
+                offset: 0,
                 truncated: false,
+                next_offset: None,
                 content_base64: base64::engine::general_purpose::STANDARD.encode(b"hello"),
             },
         );
         assert!(validate_work_artifact_response(&profile(), &request, &lies).is_err());
+    }
+
+    #[test]
+    fn artifact_pages_carry_offset_and_continuation_truth() {
+        // PLATFORM-2 (F08): a middle page must name where it starts, carry a
+        // cursor to the next unread byte, and an eof page must carry none.
+        // Every inconsistency below is a rejected answer, not a guess.
+        let request = run_scoped_request(
+            Route::work_artifact(),
+            WorkArtifactRequest {
+                reference: "artifact://r".into(),
+                max_bytes: Some(8),
+                offset: Some(10),
+            },
+        );
+        validate_work_artifact_request(&profile(), &request).unwrap();
+
+        let middle_payload = WorkArtifactResponse {
+            reference: "artifact://r".into(),
+            size_bytes: 40,
+            offset: 10,
+            truncated: true,
+            next_offset: Some(18),
+            content_base64: base64::engine::general_purpose::STANDARD.encode([0u8; 8]),
+        };
+        let middle_page = response(&request, middle_payload.clone());
+        validate_work_artifact_response(&profile(), &request, &middle_page).unwrap();
+
+        // eof page: the window reaches exactly the end; no cursor.
+        let eof_payload = WorkArtifactResponse {
+            reference: "artifact://r".into(),
+            size_bytes: 40,
+            offset: 32,
+            truncated: false,
+            next_offset: None,
+            content_base64: base64::engine::general_purpose::STANDARD.encode([0u8; 8]),
+        };
+        let eof_page = response(&request, eof_payload.clone());
+        validate_work_artifact_response(&profile(), &request, &eof_page).unwrap();
+
+        // A cursor that skips bytes (or points backwards) is a lie.
+        let mut skipping = middle_payload.clone();
+        skipping.next_offset = Some(20);
+        assert!(
+            validate_work_artifact_response(&profile(), &request, &response(&request, skipping))
+                .is_err()
+        );
+
+        // A window that overruns the artifact is rejected.
+        let mut overrun = eof_payload.clone();
+        overrun.offset = 36;
+        assert!(
+            validate_work_artifact_response(&profile(), &request, &response(&request, overrun))
+                .is_err()
+        );
+
+        // Truncated with no cursor (and the inverse) is rejected.
+        let mut cursorless = middle_payload.clone();
+        cursorless.next_offset = None;
+        assert!(
+            validate_work_artifact_response(&profile(), &request, &response(&request, cursorless))
+                .is_err()
+        );
+        let mut cursor_at_eof = eof_payload.clone();
+        cursor_at_eof.next_offset = Some(40);
+        cursor_at_eof.truncated = true;
+        assert!(
+            validate_work_artifact_response(
+                &profile(),
+                &request,
+                &response(&request, cursor_at_eof)
+            )
+            .is_err()
+        );
+
+        // An offset beyond the artifact cannot serve any window.
+        let mut beyond = eof_payload;
+        beyond.offset = 41;
+        assert!(
+            validate_work_artifact_response(&profile(), &request, &response(&request, beyond))
+                .is_err()
+        );
     }
 
     #[test]

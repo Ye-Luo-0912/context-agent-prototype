@@ -115,6 +115,8 @@ async fn product_config(
         agent_compose::ContextPolicy::Dynamic,
         workspace.state_dir(),
         None,
+        None,
+        &agent_compose::MaintenanceBudget::default(),
     )
     .await?;
     let base_tools = Arc::new(
@@ -375,7 +377,22 @@ async fn product_budget_stop_after_a_read_only_round_still_lands_a_resumable_che
         "the read-only round must not have written anything"
     );
     // The BudgetStopYield debt forces a resumable snapshot even though
-    // nothing was mutated.
+    // nothing was mutated. EXEC-7: the safe point's checkpoint maintenance
+    // runs as a spawned prepare — wait for the durable acknowledgement
+    // before listing, so the assertion reflects the durability guarantee
+    // rather than a write-start race.
+    let durable_deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(15);
+    loop {
+        let store_probe = agent_runtime::CheckpointStore::new(checkpoint_dir.clone());
+        if !store_probe.list(5).await?.is_empty() {
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < durable_deadline,
+            "the budget stop must land a resumable checkpoint"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
     let store = agent_runtime::CheckpointStore::new(checkpoint_dir.clone());
     let rows = store.list(5).await?;
     assert!(

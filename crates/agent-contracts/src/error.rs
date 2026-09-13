@@ -89,6 +89,35 @@ pub enum AgentError {
     #[error("model error: {0}")]
     Model(String),
 
+    /// COST-7 (R2-11): the compaction call completed at the provider but its
+    /// summary was empty, so the fold must be discarded (an empty summary
+    /// never retires source text) — while the call's own usage evidence, if
+    /// the provider reported one, must survive into the cost account. The
+    /// engine maps the carried usage back under its honest identity instead
+    /// of losing a billed call as an unknown zero.
+    #[error("compaction model returned an empty summary")]
+    EmptyCompactionSummary {
+        /// The provider's usage report for the (billed) call, when it sent
+        /// one. Absent counters stay `None` — never an invented zero.
+        usage: crate::model::ModelUsage,
+    },
+
+    /// COST-7 (R3-12): a provider call FAILED after the provider had
+    /// already reported usage for the attempt. The known counters travel
+    /// with the failure under one shared representation — every failure
+    /// shape wraps its original error (class and retryability preserved
+    /// through `source`) instead of each site growing its own cost
+    /// conversion. A usage-less failure never becomes this variant.
+    #[error("model call failed after a reported usage: {source}")]
+    FailedWithUsage {
+        /// The provider's own report for the failed attempt, verbatim:
+        /// absent counters stay `None`, never an invented zero.
+        usage: crate::model::ModelUsage,
+        /// The original failure, preserved so classification (retryable,
+        /// output limit, transport) keeps its meaning.
+        source: Box<AgentError>,
+    },
+
     /// The provider's stream violated the selected model wire protocol.
     /// Adapters fail closed; policy may regenerate a malformed tool-call body
     /// only under a separate bounded format budget and only before the sink's
@@ -158,6 +187,45 @@ pub enum AgentError {
     /// can classify staleness structurally instead of parsing error text.
     #[error("operation epoch {expected} is stale; current Core epoch is {current}")]
     StaleEpoch { expected: u64, current: u64 },
+}
+
+impl AgentError {
+    /// COST-7 (R3-12): wrap a failure with the usage the provider already
+    /// reported for the attempt. A report without any counter (or no
+    /// report at all) returns the original error unchanged — an empty
+    /// envelope never masquerades as evidence.
+    pub fn failed_with_usage(usage: crate::model::ModelUsage, source: AgentError) -> AgentError {
+        if usage.has_any_reported() {
+            AgentError::FailedWithUsage {
+                usage,
+                source: Box::new(source),
+            }
+        } else {
+            source
+        }
+    }
+
+    /// COST-7 (R2-11/R3-12): the usage evidence a FAILED call already
+    /// produced, when the typed error carries it. Engines fold this back
+    /// into the cost account under its honest identity — a billed call
+    /// must not vanish because its business result was refused.
+    pub fn reported_usage(&self) -> Option<&crate::model::ModelUsage> {
+        match self {
+            AgentError::EmptyCompactionSummary { usage } => Some(usage),
+            AgentError::FailedWithUsage { usage, .. } => Some(usage),
+            _ => None,
+        }
+    }
+
+    /// R3-12: classification must look through the usage wrapper — a
+    /// wrapped transport failure stays retryable, a wrapped output limit
+    /// stays a budget outcome.
+    pub fn failure_source(&self) -> &AgentError {
+        match self {
+            AgentError::FailedWithUsage { source, .. } => source,
+            other => other,
+        }
+    }
 }
 
 pub type AgentResult<T> = Result<T, AgentError>;

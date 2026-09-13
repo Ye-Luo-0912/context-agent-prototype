@@ -17,7 +17,8 @@ use std::path::Path;
 use std::sync::Arc;
 
 use agent_contracts::{
-    AgentResult, ApprovalGate, ContextEngine, ModelTransport, RuntimeEventEnvelope, ToolDispatcher,
+    AgentResult, ApprovalGate, BoundedCompactor, ContextEngine, ModelTransport,
+    RuntimeEventEnvelope, ToolDispatcher,
 };
 use agent_core::CoreAuthorityConfig;
 use agent_runtime::{
@@ -92,16 +93,44 @@ impl ContextPolicy {
 /// episode-rotation semantic distill 共用（`TaskCompleted` 直接写入
 /// `CompletionRecord.summary`，不再二次 LLM）。`append` 和
 /// 进程外 `service` 不注入（子进程引擎没有这条 in-process 注入缝）。
+///
+/// **CTX-4 产品 profile 决策（2026-09-12）**：生产默认保持
+/// `ContextPolicy::Rolling`（宿主未指定时的选择），最低正确性义务由
+/// baseline 引擎的 `required_claim_misses`（CORE-2：每个 PromptRequired
+/// 如实报 Missing）＋runtime 的模型可读 required-miss 呈现（CTX-4）承担
+/// ——不把「不支持必需正文投影」伪装成「全部已满足」。切换 Dynamic 是
+/// 质量/产品决策，须先通过 CTX-4 的真实默认入口旅程验收；实验 baseline
+/// （append/rolling）的可比语义保持不变。
 pub async fn build_context_engine(
     policy: ContextPolicy,
     state_dir: &Path,
     model: Option<Arc<dyn ModelTransport>>,
+    maintenance_model: Option<Arc<dyn ModelTransport>>,
+    budget: &MaintenanceBudget,
 ) -> anyhow::Result<Arc<dyn ContextEngine>> {
-    let compactor = model.map(|model| Arc::new(ModelBackedCompactor::new(model)));
+    // COST-4 (D02): the optional maintenance transport owns the compactor —
+    // its timeout (and the request-level output cap) are the maintenance
+    // call's own bounds instead of the main profile's. Absent, the main
+    // model serves (the historical single-transport behavior).
+    // COST-8: a ZERO budget (calls or tokens) means the compactor is not
+    // attached at all — zero budget never sends, and the budget's count/
+    // token/backoff values flow into the engine's own per-pass limits.
+    let compactor = if budget.allows_calls() {
+        maintenance_model
+            .or(model)
+            .map(|model| Arc::new(ModelBackedCompactor::new(model)) as Arc<dyn BoundedCompactor>)
+    } else {
+        None
+    };
     match policy {
         ContextPolicy::Append => Ok(Arc::new(AppendOnlyEngine::new())),
         ContextPolicy::Rolling => {
-            let engine = RollingSummaryEngine::with_config(RollingConfig::default());
+            let engine = RollingSummaryEngine::with_config(RollingConfig {
+                max_compactor_calls_per_maintain: budget.max_calls_per_maintain,
+                max_compactor_tokens_per_maintain: budget.max_tokens_per_maintain,
+                compact_failure_backoff_maintains: budget.compact_failure_backoff_maintains,
+                ..RollingConfig::default()
+            });
             Ok(Arc::new(match compactor {
                 Some(compactor) => engine.with_compactor(compactor),
                 None => engine,
@@ -265,6 +294,133 @@ pub fn try_model_from_env() -> anyhow::Result<ModelSelection> {
     }
 }
 
+/// COST-8: the product-facing MAINTENANCE budget — how much one execution
+/// segment may spend on compaction and how it recovers from a failing
+/// source. The budget lives in the composition root (env at the host/TUI/
+/// CLI entries), flows into the engine's rolling config, and its effective
+/// values are printed in the startup banner so a run's spending limits are
+/// checkable, not folklore.
+///
+/// Boundaries, explicitly named: `max_calls_per_maintain` bounds one
+/// maintain pass's serial compactor CALLS; `max_tokens_per_maintain` bounds
+/// one pass's cumulative in+out tokens (observed/estimated; unknown rows
+/// carry no numbers and stay covered by the call budget); neither claims a
+/// whole-execution-segment cap — separate passes each spend up to the
+/// budget again. `compact_failure_backoff_maintains` defers a FAILED fold
+/// request for that many fold-eligible passes; changed folded content
+/// invalidates the deferral immediately.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MaintenanceBudget {
+    /// Compactor calls one maintain pass may make. `0` = never send.
+    pub max_calls_per_maintain: usize,
+    /// Cumulative in+out tokens one maintain pass may spend. `0` = never
+    /// send.
+    pub max_tokens_per_maintain: u64,
+    /// Fold-eligible passes a failed fold request stays deferred.
+    pub compact_failure_backoff_maintains: u32,
+}
+
+impl Default for MaintenanceBudget {
+    fn default() -> Self {
+        Self {
+            max_calls_per_maintain: 4,
+            // Unlimited by default — an explicit token budget stays opt-in,
+            // and the default is NOT reported as "costs are capped".
+            max_tokens_per_maintain: u64::MAX,
+            compact_failure_backoff_maintains: 4,
+        }
+    }
+}
+
+impl MaintenanceBudget {
+    /// Whether this budget lets any compactor call happen at all.
+    pub fn allows_calls(&self) -> bool {
+        self.max_calls_per_maintain > 0 && self.max_tokens_per_maintain > 0
+    }
+
+    /// The key-free, checkable one-line description for banners and
+    /// run metadata.
+    pub fn describe(&self) -> String {
+        let tokens = if self.max_tokens_per_maintain == u64::MAX {
+            "unbounded".to_string()
+        } else {
+            self.max_tokens_per_maintain.to_string()
+        };
+        format!(
+            "maintenance budget: <= {} compactor call(s) and <= {tokens} token(s) per maintain pass; failed folds back off {} pass(es)",
+            self.max_calls_per_maintain, self.compact_failure_backoff_maintains
+        )
+    }
+}
+
+/// Reads the maintenance budget from the process environment. Unset
+/// variables keep the defaults; a variable that fails to parse is a
+/// startup error, never a silent fallback:
+/// - `MAINTENANCE_MAX_CALLS_PER_MAINTAIN` (usize, 0 = disable compaction)
+/// - `MAINTENANCE_MAX_TOKENS_PER_MAINTAIN` (u64, 0 = disable compaction)
+/// - `MAINTENANCE_COMPACT_FAILURE_BACKOFF` (u32 passes, 0 = retry at once)
+pub fn maintenance_budget_from_env() -> anyhow::Result<MaintenanceBudget> {
+    let mut budget = MaintenanceBudget::default();
+    if let Some(calls) = env_checked("MAINTENANCE_MAX_CALLS_PER_MAINTAIN", |raw| {
+        raw.parse::<usize>()
+            .map_err(|_| format!("must be a non-negative integer, got '{raw}'"))
+    })? {
+        budget.max_calls_per_maintain = calls;
+    }
+    if let Some(tokens) = env_checked("MAINTENANCE_MAX_TOKENS_PER_MAINTAIN", |raw| {
+        raw.parse::<u64>()
+            .map_err(|_| format!("must be a non-negative integer, got '{raw}'"))
+    })? {
+        budget.max_tokens_per_maintain = tokens;
+    }
+    if let Some(backoff) = env_checked("MAINTENANCE_COMPACT_FAILURE_BACKOFF", |raw| {
+        raw.parse::<u32>()
+            .map_err(|_| format!("must be a non-negative integer, got '{raw}'"))
+    })? {
+        budget.compact_failure_backoff_maintains = backoff;
+    }
+    Ok(budget)
+}
+
+/// COST-4 (D02): an OPTIONAL independent maintenance transport. When
+/// `MAINTENANCE_TIMEOUT_SECS` is set (and provider credentials are present),
+/// compaction calls run on their own transport with that timeout —
+/// maintenance time is bounded by its own profile instead of the main
+/// model's 120 s. The retry budget is inherited by design (bounded, and
+/// model selection stays out until a semantic regression asks for it).
+/// Demo mode never returns a transport: the mock does not bill.
+pub fn try_maintenance_transport_from_env() -> anyhow::Result<Option<Arc<dyn ModelTransport>>> {
+    let timeout_secs = env_checked("MAINTENANCE_TIMEOUT_SECS", |raw| {
+        raw.parse::<u64>()
+            .map_err(|_| format!("must be an integer >= 1, got '{raw}'"))
+    })?;
+    let Some(timeout_secs) = timeout_secs else {
+        return Ok(None);
+    };
+    if timeout_secs == 0 {
+        return Err(anyhow::anyhow!("MAINTENANCE_TIMEOUT_SECS: must be >= 1"));
+    }
+    let demo = std::env::var("AGENT_DEMO")
+        .map(|value| value == "1" || value.eq_ignore_ascii_case("true"))
+        .unwrap_or(false);
+    if demo {
+        return Ok(None);
+    }
+    let api_key = std::env::var("OPENAI_API_KEY")
+        .ok()
+        .filter(|key| !key.trim().is_empty())
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "MAINTENANCE_TIMEOUT_SECS is set but no provider is configured: set OPENAI_API_KEY"
+            )
+        })?;
+    let (transport, _profile) = provider_from_env_with_timeout(
+        api_key,
+        Some(std::time::Duration::from_secs(timeout_secs)),
+    )?;
+    Ok(Some(transport))
+}
+
 /// One optional environment string that must parse when present.
 fn env_checked<T>(
     name: &str,
@@ -304,6 +460,15 @@ fn env_usize(name: &str, default: usize, min: usize) -> anyhow::Result<usize> {
 /// workspace or runtime state exists.
 fn provider_from_env(
     api_key: String,
+) -> anyhow::Result<(Arc<dyn ModelTransport>, ProviderProfile)> {
+    provider_from_env_with_timeout(api_key, None)
+}
+
+/// COST-4 (D02): `timeout_override` lets the optional maintenance transport
+/// carry its own time bound; the main-model path keeps the profile default.
+fn provider_from_env_with_timeout(
+    api_key: String,
+    timeout_override: Option<std::time::Duration>,
 ) -> anyhow::Result<(Arc<dyn ModelTransport>, ProviderProfile)> {
     let base_url = std::env::var("OPENAI_BASE_URL")
         .ok()
@@ -361,7 +526,7 @@ fn provider_from_env(
         model,
         protocol,
         max_output_tokens: profile.max_output_tokens,
-        timeout: std::time::Duration::from_secs(120),
+        timeout: timeout_override.unwrap_or(std::time::Duration::from_secs(120)),
         send_stream_options: true,
         send_max_tokens: true,
         max_stream_bytes: provider_openai::DEFAULT_MAX_STREAM_BYTES,
@@ -769,7 +934,10 @@ pub async fn compose_with_prompt_layout(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use agent_contracts::{ApprovalGate, ContextEngine, ModelTransport, ToolDispatcher};
+    use agent_contracts::{
+        ApprovalGate, ContextEngine, ContextIngress, ContextMaintenanceTrigger, ModelRequest,
+        ModelTransport, ToolDispatcher,
+    };
     use agent_core::PolicyApprovalGate;
     use agent_runtime::ProofVerifier;
     use context_simple::{SimpleContextConfig, SimpleContextEngine};
@@ -1029,6 +1197,204 @@ mod tests {
             Err(error) => error,
         };
         assert!(!error.to_string().is_empty());
+    }
+    /// COST-4 (D02): the OPTIONAL maintenance transport OWNS the compactor —
+    /// a folding pass goes to the maintenance model (which fails here), and
+    /// the main model is never asked. The failed call still lands in the
+    /// report as an Unknown-identity compaction (COST-1 accounting).
+    #[tokio::test]
+    async fn the_maintenance_transport_owns_the_compactor() {
+        struct FailingMaintenance;
+        #[async_trait::async_trait]
+        impl ModelTransport for FailingMaintenance {
+            fn capabilities(&self) -> agent_contracts::ModelCapabilities {
+                agent_contracts::ModelCapabilities::default()
+            }
+            async fn complete(
+                &self,
+                _request: ModelRequest,
+            ) -> agent_contracts::AgentResult<agent_contracts::ModelOutput> {
+                Err(agent_contracts::AgentError::Model(
+                    "maintenance transport down".into(),
+                ))
+            }
+        }
+        struct CountingMain {
+            calls: std::sync::Arc<std::sync::Mutex<u32>>,
+        }
+        #[async_trait::async_trait]
+        impl ModelTransport for CountingMain {
+            fn capabilities(&self) -> agent_contracts::ModelCapabilities {
+                agent_contracts::ModelCapabilities::default()
+            }
+            async fn complete(
+                &self,
+                _request: ModelRequest,
+            ) -> agent_contracts::AgentResult<agent_contracts::ModelOutput> {
+                *self.calls.lock().unwrap() += 1;
+                Ok(agent_contracts::ModelOutput {
+                    content: "main model should never compress".into(),
+                    tool_calls: Vec::new(),
+                    usage: agent_contracts::ModelUsage::default(),
+                })
+            }
+        }
+
+        let main_calls = std::sync::Arc::new(std::sync::Mutex::new(0u32));
+        let main = Arc::new(CountingMain {
+            calls: Arc::clone(&main_calls),
+        });
+        let engine = build_context_engine(
+            ContextPolicy::Rolling,
+            std::path::Path::new("unused-by-rolling"),
+            Some(main),
+            Some(Arc::new(FailingMaintenance)),
+            &MaintenanceBudget::default(),
+        )
+        .await
+        .unwrap();
+        // Cross the rolling fold threshold (default: 9,000 summary tokens
+        // with an 8,000 verbatim tail) so the next maintain runs the
+        // compactor.
+        for index in 0..40 {
+            engine
+                .ingest(ContextIngress::AssistantMessage {
+                    content: format!("history record {index}: {}", "detail ".repeat(140)),
+                })
+                .await
+                .unwrap();
+        }
+        let report = engine
+            .maintain(ContextMaintenanceTrigger::AfterModel)
+            .await
+            .unwrap();
+
+        let failed = report
+            .compactions
+            .first()
+            .expect("the failed compactor call must be accounted");
+        assert_eq!(
+            failed.usage_identity,
+            agent_contracts::UsageIdentity::Unknown,
+            "the maintenance transport's failed call is accounted as unknown"
+        );
+        assert_eq!(
+            *main_calls.lock().unwrap(),
+            0,
+            "the main model must never be asked to compress"
+        );
+    }
+}
+
+#[cfg(test)]
+mod maintenance_budget_tests {
+    use super::*;
+
+    /// Env mutations are process-global; serialize them.
+    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// COST-8: the product config reaches the engine's per-pass limits —
+    /// a budget's count/token/backoff values become the rolling config, and
+    /// a zero budget attaches no compactor at all (zero never sends).
+    #[tokio::test]
+    async fn the_maintenance_budget_flows_into_the_engine_config() {
+        // Zero budget: the compactor is NOT attached — the model would
+        // never be asked to compress, whatever the history pressure. The
+        // model panics if the budget ever leaked a call through.
+        struct ZeroBudgetModel;
+        #[async_trait::async_trait]
+        impl ModelTransport for ZeroBudgetModel {
+            fn capabilities(&self) -> agent_contracts::ModelCapabilities {
+                agent_contracts::ModelCapabilities::default()
+            }
+            async fn complete(
+                &self,
+                _request: agent_contracts::ModelRequest,
+            ) -> AgentResult<agent_contracts::ModelOutput> {
+                panic!("a zero maintenance budget must never reach the model");
+            }
+        }
+        // The budget description is checkable, one line, key-free.
+        let budget = MaintenanceBudget {
+            max_calls_per_maintain: 1,
+            max_tokens_per_maintain: 100,
+            compact_failure_backoff_maintains: 2,
+        };
+        assert_eq!(
+            budget.describe(),
+            "maintenance budget: <= 1 compactor call(s) and <= 100 token(s) per maintain pass; failed folds back off 2 pass(es)"
+        );
+
+        let zero = MaintenanceBudget {
+            max_calls_per_maintain: 0,
+            ..budget
+        };
+        assert!(!zero.allows_calls());
+        let engine = build_context_engine(
+            ContextPolicy::Rolling,
+            std::path::Path::new("unused-by-rolling"),
+            Some(Arc::new(ZeroBudgetModel)),
+            None,
+            &zero,
+        )
+        .await
+        .unwrap();
+        // The engine still works as a plain rolling engine without a
+        // compactor.
+        engine
+            .ingest(agent_contracts::ContextIngress::AssistantMessage {
+                content: "plain record".into(),
+            })
+            .await
+            .unwrap();
+        engine
+            .maintain(agent_contracts::ContextMaintenanceTrigger::AfterModel)
+            .await
+            .unwrap();
+    }
+
+    /// COST-8: budget env variables parse strictly — unset keeps defaults,
+    /// an invalid value is a startup error, never a silent fallback.
+    #[test]
+    fn maintenance_budget_env_parses_strictly() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let keys = [
+            "MAINTENANCE_MAX_CALLS_PER_MAINTAIN",
+            "MAINTENANCE_MAX_TOKENS_PER_MAINTAIN",
+            "MAINTENANCE_COMPACT_FAILURE_BACKOFF",
+        ];
+        let mut saved = Vec::new();
+        for key in keys {
+            saved.push((key, std::env::var(key).ok()));
+            unsafe { std::env::remove_var(key) };
+        }
+        // Unset: the defaults (and the default is NOT a claimed cap).
+        let budget = maintenance_budget_from_env().unwrap();
+        assert_eq!(budget, MaintenanceBudget::default());
+        assert!(budget.describe().contains("unbounded"));
+
+        // Explicit values parse.
+        unsafe { std::env::set_var("MAINTENANCE_MAX_CALLS_PER_MAINTAIN", "2") };
+        unsafe { std::env::set_var("MAINTENANCE_MAX_TOKENS_PER_MAINTAIN", "5000") };
+        unsafe { std::env::set_var("MAINTENANCE_COMPACT_FAILURE_BACKOFF", "1") };
+        let budget = maintenance_budget_from_env().unwrap();
+        assert_eq!(budget.max_calls_per_maintain, 2);
+        assert_eq!(budget.max_tokens_per_maintain, 5000);
+        assert_eq!(budget.compact_failure_backoff_maintains, 1);
+
+        // Invalid values fail closed.
+        unsafe { std::env::set_var("MAINTENANCE_MAX_CALLS_PER_MAINTAIN", "two") };
+        assert!(maintenance_budget_from_env().is_err());
+        unsafe { std::env::set_var("MAINTENANCE_MAX_CALLS_PER_MAINTAIN", "2") };
+        unsafe { std::env::set_var("MAINTENANCE_MAX_TOKENS_PER_MAINTAIN", "-1") };
+        assert!(maintenance_budget_from_env().is_err());
+
+        for (key, value) in saved {
+            match value {
+                Some(value) => unsafe { std::env::set_var(key, value) },
+                None => unsafe { std::env::remove_var(key) },
+            }
+        }
     }
 }
 

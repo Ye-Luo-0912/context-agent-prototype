@@ -116,6 +116,7 @@ mod tests {
             tools: Vec::new(),
             metadata: serde_json::json!({}),
             cancel: agent_contracts::CancellationToken::new(),
+            ..Default::default()
         }
     }
 

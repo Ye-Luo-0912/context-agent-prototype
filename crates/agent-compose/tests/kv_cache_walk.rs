@@ -245,6 +245,7 @@ async fn compare_layouts_with_bounded_live_requests() {
                     tools: input.tool_schemas.clone(),
                     metadata: json!({"prompt_layout":layout}),
                     cancel: CancellationToken::new(),
+                    ..Default::default()
                 },
                 &timing,
             )
@@ -461,6 +462,7 @@ async fn compare_isolated_warmed_layouts() {
                         tools: input.tool_schemas,
                         metadata: json!({"prompt_layout":layout}),
                         cancel: CancellationToken::new(),
+                        ..Default::default()
                     },
                     &timing,
                     &observer,

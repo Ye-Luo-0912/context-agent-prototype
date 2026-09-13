@@ -504,6 +504,7 @@ impl ModelInput {
             tools: self.tool_schemas,
             metadata,
             cancel,
+            max_output_tokens: None,
         };
         request.bind_prompt_reuse_boundary(prefix_len);
         request
@@ -671,27 +672,64 @@ pub trait ModelEventSink: Send + Sync {
     async fn on_chunk(&self, chunk: ModelChunk) -> AgentResult<()>;
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct ModelRequest {
     pub messages: Vec<ModelMessage>,
     pub tools: Vec<ToolSpec>,
     #[serde(default)]
     pub metadata: Value,
+    /// COST-4 (D02): an optional per-request output ceiling. A caller with a
+    /// bounded-output contract (the compactor's 512-char cap) states it on
+    /// the request so the provider stops generating at the bound instead of
+    /// the transport's profile default — generation cost is limited, not
+    /// merely truncated afterwards. Honored only where the transport
+    /// negotiates a max-output field (`send_max_tokens`); `None` keeps the
+    /// profile behavior byte-for-byte.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_output_tokens: Option<u32>,
     /// Cooperative cancellation handle for this request. Not serialized.
     #[serde(skip)]
     pub cancel: CancellationToken,
 }
 
+/// One model round's token counters. COST-6 (R2-10): the cache buckets are
+/// the provider's own observations with endpoint-defined containment —
+/// `input_tokens` is the provider's total and the cache buckets typically
+/// partition or subset it, but the relation is per endpoint/protocol and is
+/// never repaired or re-derived here: no counter is filled by arithmetic on
+/// the others, and an unreported counter stays `None` (never an invented
+/// zero). Summing `input_tokens` with any cache bucket double-counts.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct ModelUsage {
     pub input_tokens: Option<u64>,
     pub output_tokens: Option<u64>,
     /// Provider-reported prompt tokens served from a prefix cache
     /// (`input_tokens_details.cached_tokens` for Responses,
-    /// `prompt_tokens_details.cached_tokens` for Chat Completions).
+    /// `prompt_tokens_details.cached_tokens` for Chat Completions, with the
+    /// DeepSeek top-level `prompt_cache_hit_tokens` as fallback).
     /// `None` when the provider did not report them.
     #[serde(default)]
     pub cached_input_tokens: Option<u64>,
+    /// COST-2 (E05.4): provider-reported prompt tokens WRITTEN to the
+    /// prefix cache, filled only from an EXPLICIT provider write counter
+    /// (`input_tokens_details.cache_write_tokens` /
+    /// `prompt_tokens_details.cache_write_tokens`). A cache miss is not a
+    /// write: the uncached input is reported separately. `None` when the
+    /// provider does not report one — the uncached remainder of the input
+    /// stays derivable as `input_tokens - cached_input_tokens` and must
+    /// never be invented here.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache_write_input_tokens: Option<u64>,
+    /// COST-6 (R2-10): provider-reported input tokens that MISSED the
+    /// prefix cache (DeepSeek's top-level `prompt_cache_miss_tokens`). This
+    /// is the uncached part of the input — a read-side observation, not
+    /// evidence of a cache write and not billed as one. `None` when the
+    /// provider did not report it. Events emitted before COST-6 may carry a
+    /// DeepSeek miss count in `cache_write_input_tokens`; those historical
+    /// records are preserved as-is and must not be silently re-read as
+    /// trusted write costs.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache_miss_input_tokens: Option<u64>,
     /// Transport attempts that produced this output. `0` on legacy events
     /// means unknown (treat as one successful attempt). Failed attempts
     /// usually report no usage, so recorded tokens are a lower bound when
@@ -701,6 +739,65 @@ pub struct ModelUsage {
     /// `attempts.saturating_sub(1)` when known.
     #[serde(default)]
     pub retries: u32,
+}
+
+/// The evidence identity of one model-call role's token record (CORE-4):
+/// every accounting row must say where its numbers came from, because the
+/// three classes aggregate differently and none may masquerade as another.
+/// Unknown is never zero — a lost usage is still a real cost.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum UsageIdentity {
+    /// Exact evidence: the counters come from the provider's own report,
+    /// or the role made no model call at all so zero is a fact.
+    #[default]
+    Observed,
+    /// At least partly derived by the runtime (bounded approximation over
+    /// rendered text). Never presented as provider-reported.
+    Estimated,
+    /// No usable evidence (aborted round, usage-less failure, legacy
+    /// record predating typed usage). The numeric fields are a lower
+    /// bound of zero and must not be summed as observed consumption.
+    Unknown,
+}
+
+impl ModelUsage {
+    /// The evidence identity of one provider round: both counters reported
+    /// means observed; any missing counter means unknown (the reported
+    /// side stays a lower bound, never a complete bill).
+    pub fn usage_identity(&self) -> UsageIdentity {
+        match (self.input_tokens, self.output_tokens) {
+            (Some(_), Some(_)) => UsageIdentity::Observed,
+            _ => UsageIdentity::Unknown,
+        }
+    }
+
+    /// COST-7 (R3-12): true when the provider reported at least one
+    /// counter — the minimum for a failure to travel wrapped in
+    /// [`crate::AgentError::FailedWithUsage`]. An empty envelope is not
+    /// evidence.
+    pub fn has_any_reported(&self) -> bool {
+        self.input_tokens.is_some()
+            || self.output_tokens.is_some()
+            || self.cached_input_tokens.is_some()
+            || self.cache_write_input_tokens.is_some()
+            || self.cache_miss_input_tokens.is_some()
+    }
+}
+
+/// Which call lane a usage row belongs to (COST-7, R2-11): the main model
+/// rounds and the compactor's maintenance calls are different cost centers,
+/// so a row that only says "unknown" must still say WHERE the unknown cost
+/// sits. Legacy rows default to the main lane.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ModelCallRole {
+    /// The task's main model rounds.
+    #[default]
+    Main,
+    /// A bounded compaction/maintenance call (compressor, distiller) —
+    /// possibly on the independent maintenance transport.
+    Maintenance,
 }
 
 /// Whether a model round is a usable completion or a transport/parser hole.
@@ -1160,8 +1257,10 @@ mod tests {
             input_tokens: Some(12),
             output_tokens: Some(0),
             cached_input_tokens: Some(4),
+            cache_write_input_tokens: None,
             attempts: 1,
             retries: 0,
+            ..Default::default()
         };
         assert_eq!(
             completion_validity("", &[], &billed),
@@ -1206,5 +1305,83 @@ mod tests {
         let summed = current.saturating_add(current);
         assert_eq!(summed.historical_context_tokens, 60);
         assert_eq!(summed.restored_protocol_tokens, 20);
+    }
+    /// CORE-4: the evidence identity of a round derives from the report.
+    #[test]
+    fn usage_identity_follows_the_provider_report() {
+        let full = ModelUsage {
+            input_tokens: Some(10),
+            output_tokens: Some(2),
+            cached_input_tokens: None,
+            cache_write_input_tokens: None,
+            attempts: 1,
+            retries: 0,
+            ..Default::default()
+        };
+        assert_eq!(full.usage_identity(), UsageIdentity::Observed);
+        // A missing counter means unknown even when the other side is
+        // reported: the bill is incomplete, never fully observed.
+        let partial = ModelUsage {
+            input_tokens: Some(10),
+            output_tokens: None,
+            ..full.clone()
+        };
+        assert_eq!(partial.usage_identity(), UsageIdentity::Unknown);
+        let none = ModelUsage::default();
+        assert_eq!(none.usage_identity(), UsageIdentity::Unknown);
+    }
+
+    /// CORE-4: legacy ModelUsed JSON (pre-identity) decodes with the
+    /// honest `unknown` default — old zeros must not read as observed
+    /// consumption.
+    #[test]
+    fn legacy_model_used_events_default_to_unknown_identity() {
+        let legacy = r#"{"type":"model_used","input_tokens":900,"output_tokens":30,
+            "cached_input_tokens":100,"attempts":1,"retries":0}"#;
+        let event: crate::RuntimeEvent = serde_json::from_str(legacy).unwrap();
+        let crate::RuntimeEvent::ModelUsed {
+            usage_identity,
+            usage,
+            input_tokens,
+            ..
+        } = event
+        else {
+            panic!("wrong variant");
+        };
+        assert_eq!(usage_identity, UsageIdentity::Unknown);
+        assert!(usage.is_none(), "legacy rows carry no typed report");
+        assert_eq!(input_tokens, 900);
+    }
+
+    /// COST-6 (R2-10): a `ModelUsage` written before the miss field existed
+    /// decodes with `cache_miss_input_tokens = None` (not zero), and the
+    /// unreported cache buckets stay off the wire so historical bytes stay
+    /// byte-stable.
+    #[test]
+    fn legacy_usage_json_decodes_with_an_unreported_miss_counter() {
+        let legacy = r#"{"input_tokens":100,"output_tokens":5,"cached_input_tokens":80}"#;
+        let usage: ModelUsage = serde_json::from_str(legacy).unwrap();
+        assert_eq!(usage.cached_input_tokens, Some(80));
+        assert_eq!(usage.cache_write_input_tokens, None);
+        assert_eq!(usage.cache_miss_input_tokens, None);
+
+        let wire = serde_json::to_string(&usage).unwrap();
+        assert!(
+            !wire.contains("cache_miss_input_tokens"),
+            "an unreported miss counter must not appear on the wire: {wire}"
+        );
+        assert!(
+            !wire.contains("cache_write_input_tokens"),
+            "an unreported write counter must not appear on the wire: {wire}"
+        );
+
+        let full = ModelUsage {
+            cache_write_input_tokens: Some(10),
+            cache_miss_input_tokens: Some(20),
+            ..usage
+        };
+        let wire = serde_json::to_value(full).unwrap();
+        assert_eq!(wire["cache_write_input_tokens"], 10);
+        assert_eq!(wire["cache_miss_input_tokens"], 20);
     }
 }

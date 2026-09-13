@@ -7,6 +7,7 @@
 use async_trait::async_trait;
 
 use crate::error::AgentResult;
+use crate::model::UsageIdentity;
 
 /// 交给压缩器的源文本上限（字符）。折叠再多也不能让摘要输入随历史膨胀。
 pub const COMPACTION_SOURCE_CHARS: usize = 2_000;
@@ -22,11 +23,28 @@ pub struct CompactionRequest {
 }
 
 /// 一次有界压缩结果。token 字段是压缩调用本身的花费，不是工作集可见体积。
+/// `usage_identity` 说明数字来源：provider 有报告（或未发生模型调用、
+/// 零即事实）为 observed；运行时近似推导为 estimated（不得冒充观测）；
+/// 压缩调用失败后花费不可知为 unknown。
 #[derive(Debug, Clone, Default)]
 pub struct CompactionOutput {
     pub text: String,
     pub input_tokens: u64,
     pub output_tokens: u64,
+    pub usage_identity: UsageIdentity,
+    /// COST-2 (E05.4)/COST-7 (R2-11): the compressor call's cache-read
+    /// counter — `None` when the provider did not report one. A missing
+    /// report is never flattened into an observed zero.
+    pub cached_input_tokens: Option<u64>,
+    /// COST-7 (R2-11): the compressor call's explicit cache-write and
+    /// cache-miss counters, same honesty rule — unreported stays `None`.
+    pub cache_write_input_tokens: Option<u64>,
+    pub cache_miss_input_tokens: Option<u64>,
+    /// COST-2 (E05.4): the transport's attempt/retry accounting for the
+    /// compressor call; with `retries > 0` the token counters are a lower
+    /// bound (failed attempts usually report no usage).
+    pub attempts: u32,
+    pub retries: u32,
 }
 
 /// 把任意长的折叠正文收成压缩器输入。

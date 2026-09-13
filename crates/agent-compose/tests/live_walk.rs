@@ -157,6 +157,8 @@ async fn product_compose(
         ContextPolicy::Dynamic,
         workspace.state_dir(),
         Some(model.clone()),
+        None,
+        &agent_compose::MaintenanceBudget::default(),
     )
     .await?;
     let journal = Arc::new(FileEventJournal::open(workspace.state_dir().join("traces")).await?);

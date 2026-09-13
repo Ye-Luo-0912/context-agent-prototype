@@ -13,12 +13,14 @@ use agent_platform_protocol::{
     ApprovalRespondOutcome, ApprovalRespondRequest, ApprovalRespondResponse, ApprovalRisk, Attempt,
     DeadlineRemainingMs, EnvelopeKind, MessageId, NegotiatedContractProfile, PlatformEnvelope,
     PlatformResponse, ProtocolIdentity, ProtocolVersion, RequestId, SchemaDigest,
-    TaskSnapshotStatus, WorkSubmitDisposition, WorkSubmitRequest, WorkSubmitResponse,
-    validate_approval_respond_request, validate_approval_respond_response,
-    validate_work_cancel_request, validate_work_cancel_response, validate_work_continue_request,
-    validate_work_continue_response, validate_work_snapshot_request,
-    validate_work_snapshot_response, validate_work_submit_request, validate_work_submit_response,
-    validate_work_subscribe_request, validate_work_subscribe_response,
+    TaskSnapshotStatus, WorkCompletionFact, WorkSubmitDisposition, WorkSubmitRequest,
+    WorkSubmitResponse, WorkTaskCompletionResponse, validate_approval_respond_request,
+    validate_approval_respond_response, validate_work_cancel_request,
+    validate_work_cancel_response, validate_work_continue_request, validate_work_continue_response,
+    validate_work_snapshot_request, validate_work_snapshot_response, validate_work_submit_request,
+    validate_work_submit_response, validate_work_subscribe_request,
+    validate_work_subscribe_response, validate_work_task_completion_request,
+    validate_work_task_completion_response,
 };
 use std::str::FromStr;
 
@@ -180,6 +182,58 @@ fn value_task_id() -> String {
 }
 
 #[test]
+#[test]
+fn task_completion_fixture_pins_the_retired_fact_cross_language() {
+    // The response is checked standalone: the paired request fixture is the
+    // snapshot's, but a completion lookup has its own typed request built
+    // here and validated against the same run-scoped rules.
+    let response_text = read_fixture("task_completion_response.json");
+    assert_round_trip_is_byte_identical::<
+        PlatformEnvelope<PlatformResponse<WorkTaskCompletionResponse>>,
+    >(&response_text, "task_completion_response.json");
+    let response: PlatformEnvelope<PlatformResponse<WorkTaskCompletionResponse>> =
+        serde_json::from_str(&response_text).unwrap();
+    let mut request = request_pair(
+        "snapshot_request.json",
+        "snapshot_response.json",
+        validate_work_snapshot_request,
+        validate_work_snapshot_response,
+    )
+    .0;
+    let request_value = serde_json::to_value(&request).unwrap();
+    let mut typed_request = request_value.clone();
+    typed_request["route"]["operation"] = serde_json::json!("task_completion");
+    request = serde_json::from_value(typed_request).unwrap();
+    let _ = request;
+    let value = match response.payload {
+        PlatformResponse::Success { value } => value,
+        other => panic!("the fixture must be a success response, got {other:?}"),
+    };
+    // EXEC-8 (R2-09): a retired completion reads back with its bounded
+    // evidence facts; the fact round-trips byte-identically so a .NET
+    // client decodes exactly what the runtime serialized.
+    assert_eq!(
+        value.task_id.to_string(),
+        "00000000-0000-4000-8000-000000000033"
+    );
+    match &value.fact {
+        WorkCompletionFact::Retired {
+            summary,
+            anchor_revision,
+            artifacts,
+            final_output_digest,
+        } => {
+            assert_eq!(summary, "migrated the retry table");
+            assert_eq!(*anchor_revision, 3);
+            assert_eq!(artifacts.len(), 1);
+            assert!(artifacts[0].starts_with("artifact://v1/"));
+            assert_eq!(final_output_digest.as_deref(), Some(&"a".repeat(64)[..]));
+        }
+        other => panic!("the fixture must carry a retired fact, got {other:?}"),
+    }
+}
+
+#[test]
 fn snapshot_fixture_pair_is_bounded_typed_and_watermarked() {
     let (_, value) = request_pair(
         "snapshot_request.json",
@@ -313,4 +367,160 @@ fn envelope_primitives_stay_fail_closed() {
         serde_json::to_string(&EnvelopeKind::Notification).unwrap(),
         "\"notification\""
     );
+}
+
+/// PLATFORM-4: the newest fact-bearing event is pinned cross-language. A
+/// `model_used` notification decodes into the kernel's typed envelope on the
+/// Rust side and stays a raw element with a typed accessor on the .NET side
+/// (FocusAgent.Client's RuntimeEventEnvelope.TryGetModelUsage); both must
+/// read the same counters and the same usage identity off these exact bytes.
+#[test]
+fn event_fixture_pins_model_usage_facts() {
+    let text = read_fixture("event_model_used.json");
+    let notification: PlatformEnvelope<agent_platform_protocol::WorkEventNotification> =
+        serde_json::from_str(&text).expect("event fixture must decode");
+
+    let envelope = &notification.payload.envelope;
+    assert_eq!(envelope.seq, 41);
+    assert_eq!(
+        envelope.run_id.to_string(),
+        "00000000-0000-4000-8000-000000000002"
+    );
+    match &envelope.event {
+        agent_contracts::RuntimeEvent::ModelUsed {
+            input_tokens,
+            output_tokens,
+            cached_input_tokens,
+            attempts,
+            usage_identity,
+            ..
+        } => {
+            assert_eq!(*input_tokens, 100);
+            assert_eq!(*output_tokens, 5);
+            assert_eq!(*cached_input_tokens, 80);
+            assert_eq!(*attempts, 1);
+            assert_eq!(*usage_identity, agent_contracts::UsageIdentity::Observed);
+        }
+        other => panic!("fixture must carry a model_used event, got {other:?}"),
+    }
+}
+
+/// COST-6 (R2-10): the cache-write and cache-miss counters are pinned
+/// cross-language on their own fixture. The transport normalization is the
+/// producer's job — the wire fact is that the write came from an explicit
+/// provider field and the miss stayed a miss; both stay readable without
+/// parsing prose. The legacy fixture keeps its exact historical bytes
+/// (unreported counters are skip-serialized, never rewritten to zeros).
+#[test]
+fn event_fixture_pins_cache_write_and_miss_facts() {
+    let text = read_fixture("event_model_used_cache_fields.json");
+    let notification: PlatformEnvelope<agent_platform_protocol::WorkEventNotification> =
+        serde_json::from_str(&text).expect("event fixture must decode");
+
+    let envelope = &notification.payload.envelope;
+    assert_eq!(envelope.seq, 43);
+    match &envelope.event {
+        agent_contracts::RuntimeEvent::ModelUsed { usage, role, .. } => {
+            let usage = usage.as_ref().expect("typed usage report present");
+            assert_eq!(usage.cached_input_tokens, Some(80));
+            assert_eq!(usage.cache_write_input_tokens, Some(10));
+            assert_eq!(usage.cache_miss_input_tokens, Some(20));
+            assert_eq!(*role, agent_contracts::ModelCallRole::Main);
+        }
+        other => panic!("fixture must carry a model_used event, got {other:?}"),
+    }
+
+    let legacy = read_fixture("event_model_used.json");
+    let notification: PlatformEnvelope<agent_platform_protocol::WorkEventNotification> =
+        serde_json::from_str(&legacy).expect("legacy fixture must decode");
+    let rewritten = serde_json::to_string(&notification).unwrap();
+    assert!(
+        !rewritten.contains("cache_miss_input_tokens")
+            && !rewritten.contains("cache_write_input_tokens"),
+        "unreported cache counters stay off the wire (no invented zeros): {rewritten}"
+    );
+    match &notification.payload.envelope.event {
+        agent_contracts::RuntimeEvent::ModelUsed { usage, .. } => {
+            let usage = usage.as_ref().expect("typed usage report present");
+            assert_eq!(usage.cached_input_tokens, Some(80));
+            assert_eq!(usage.cache_write_input_tokens, None);
+            assert_eq!(usage.cache_miss_input_tokens, None);
+        }
+        other => panic!("legacy fixture must carry a model_used event, got {other:?}"),
+    }
+}
+
+/// COST-1 (E05.3): the compaction event carries its own usage evidence
+/// identity — the projection no longer loses what the typed report had.
+#[test]
+fn event_fixture_pins_compaction_usage_identity() {
+    let text = read_fixture("event_context_compacted.json");
+    let notification: PlatformEnvelope<agent_platform_protocol::WorkEventNotification> =
+        serde_json::from_str(&text).expect("event fixture must decode");
+
+    let envelope = &notification.payload.envelope;
+    assert_eq!(envelope.seq, 42);
+    match &envelope.event {
+        agent_contracts::RuntimeEvent::ContextCompacted {
+            reason,
+            input_tokens,
+            output_tokens,
+            source_items,
+            usage_identity,
+            cached_input_tokens,
+            attempts,
+            retries,
+            cache_write_input_tokens: _,
+            cache_miss_input_tokens: _,
+        } => {
+            assert_eq!(*reason, agent_contracts::CompactionReason::RollingFold);
+            assert_eq!(*input_tokens, 12_000);
+            assert_eq!(*output_tokens, 800);
+            assert_eq!(*source_items, 14);
+            assert_eq!(*usage_identity, agent_contracts::UsageIdentity::Estimated);
+            assert_eq!(*cached_input_tokens, Some(300));
+            assert_eq!(*attempts, 2);
+            assert_eq!(*retries, 1);
+        }
+        other => panic!("fixture must carry a context_compacted event, got {other:?}"),
+    }
+}
+
+/// PLATFORM-4: usage accounting facts cross the language boundary verbatim.
+/// The .NET client decodes the SAME fixture files and reads the typed
+/// identity — a renamed field or a re-classed identity breaks one side
+/// first, never silently.
+#[test]
+fn model_used_fixture_exposes_usage_identity_cross_language() {
+    for (name, expected_identity, expected_input) in [
+        ("model_used_event.json", "observed", 9_000u64),
+        ("model_used_event_unknown.json", "unknown", 0),
+    ] {
+        let text = read_fixture(name);
+        let notification: agent_platform_protocol::WorkEventNotification =
+            serde_json::from_str(&text).unwrap_or_else(|e| panic!("{name} must decode: {e}"));
+        let agent_contracts::RuntimeEvent::ModelUsed {
+            input_tokens,
+            usage_identity,
+            usage,
+            ..
+        } = &notification.envelope.event
+        else {
+            panic!("{name} must carry a model_used event");
+        };
+        assert_eq!(*input_tokens, expected_input, "{name}");
+        assert_eq!(
+            format!("{usage_identity:?}").to_lowercase(),
+            expected_identity,
+            "{name}"
+        );
+        assert_eq!(usage.is_some(), expected_identity == "observed", "{name}");
+        // Byte-identical re-encode: the wire shape is a shared contract.
+        let re_encoded = serde_json::to_string(&notification).unwrap();
+        assert_eq!(
+            re_encoded,
+            text.trim_end(),
+            "{name} must round-trip byte-identical"
+        );
+    }
 }

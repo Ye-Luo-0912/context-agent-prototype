@@ -77,6 +77,12 @@ pub enum OperationOutcome {
         #[serde(default)]
         retryable: bool,
         message: String,
+        /// COST-7 (R3-12): usage the provider already reported for the
+        /// failed attempt, carried verbatim from the typed error. `None`
+        /// (also the legacy default) means no usable evidence — the
+        /// account keeps its explicit unknown row instead.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        usage: Option<ModelUsage>,
     },
     Cancelled,
 }

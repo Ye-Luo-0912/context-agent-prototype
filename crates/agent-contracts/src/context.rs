@@ -4,7 +4,8 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 
 use crate::{
-    AgentError, AgentResult, ContextItemId, Label, OperationId, ScopeId, TaskId, ToolOutput, TurnId,
+    AgentError, AgentResult, ContextItemId, Label, OperationId, ScopeId, TaskId, ToolOutput,
+    TurnId, model::UsageIdentity,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -969,12 +970,14 @@ pub struct ContextHints {
     /// rendering.
     #[serde(default)]
     pub checked_files: Vec<String>,
-    /// Exact `path@revision` identities whose file bodies are already
-    /// carried by another low-authority layer of this same model request
-    /// (the retained turn tail or checkpoint-body restoration). An engine
-    /// may price only those historical file bodies as descriptors. This is
-    /// deliberately separate from `checked_files`: IdentityKnown is not
-    /// BodyVisible.
+    /// Exact `path@revision` identities whose file bodies are carried by
+    /// another low-authority layer of this same model request. **CTX-1/
+    /// E01: informational only.** Identity alone can never prove interval
+    /// coverage, so engines must not omit or re-price a historical body on
+    /// this list alone — use [`Self::visible_body_windows`] with
+    /// [`visible_body_windows_cover`]. Kept (serde-defaulted) so older
+    /// checkpoints decode and richer consumers can still correlate
+    /// identities with extents.
     #[serde(default)]
     pub visible_body_identities: Vec<String>,
     /// Bounded `fs.read` windows (path, revision, exposed line range)
@@ -1291,6 +1294,12 @@ pub fn visible_body_identities_cover(
 /// bound the interval this read actually exposed. A whole-file read reports
 /// `covers_file`, which subsumes any interval. Unknown ranges are never a
 /// coverage proof: a window without bounds covers nothing beyond itself.
+///
+/// `complete` distinguishes "the tool exposed this interval" from "the
+/// interval survived into the request". A body that the broker or a
+/// checkpoint clipped after the fact must set `complete = false`: the
+/// declared range is then an upper bound of what was captured, not proof
+/// that the model saw it (F01). Partial windows never upgrade to whole-file.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct FileBodyWindow {
@@ -1308,6 +1317,20 @@ pub struct FileBodyWindow {
     /// The read exposed the whole file (covers every interval).
     #[serde(default)]
     pub covers_file: bool,
+    /// Whether the captured body still spans the declared range in full.
+    /// `false` means a later stage truncated the body: the window can no
+    /// longer prove coverage of the interval it names. Defaults to `true`
+    /// so pre-existing callers that only ever build unclipped windows keep
+    /// their old meaning.
+    #[serde(default = "default_true")]
+    pub complete: bool,
+}
+
+/// Serde default for [`FileBodyWindow::complete`]. Unclipped windows are the
+/// only shape older serialized hints can carry, so decoding them as complete
+/// preserves the previous semantics instead of silently weakening coverage.
+fn default_true() -> bool {
+    true
 }
 
 /// Cap on `FileBodyWindow` hints in one request, mirroring
@@ -1326,7 +1349,9 @@ pub const MAX_VISIBLE_BODY_WINDOWS: usize = MAX_VISIBLE_BODY_HINTS;
 /// covers nothing (an unbounded window is not a whole-file proof), and a
 /// historical record with an unknown range cannot be declared covered
 /// (`covers_file` windows are the only way an unbounded record is covered).
-/// Windows with a different revision never cover the record.
+/// Windows with a different revision never cover the record. A window that
+/// was clipped after the read (`complete = false`) proves nothing about the
+/// interval it names — the declared range is only an upper bound (F01).
 pub fn visible_body_windows_cover(
     visible_windows: &[FileBodyWindow],
     path: &str,
@@ -1345,6 +1370,12 @@ pub fn visible_body_windows_cover(
         if window.revision.as_deref().is_none_or(|r| r != revision)
             || crate::normalize_resource_path(&window.path) != path
         {
+            continue;
+        }
+        // A clipped body cannot prove it carried the range it claims: the
+        // interval is an upper bound, not an exposure. Conservative only —
+        // never a coverage proof.
+        if !window.complete {
             continue;
         }
         if window.covers_file {
@@ -1933,6 +1964,21 @@ pub struct ContextDiagnostics {
     /// GC dimension: items sitting in the reversible eviction buffer.
     #[serde(default)]
     pub warm_items: usize,
+    /// CTX-8 (R2-06): items in the externalize-retry list (store write
+    /// failed / deferred). They own full in-memory bodies — the honest
+    /// backpressure axis of a failing store, not derivable from
+    /// `warm_items < cap`.
+    #[serde(default)]
+    pub pending_items: usize,
+    /// CTX-8: UTF-8 bytes of the retry-list bodies (`pending_items`'s
+    /// weight). Bounded by the engine's pending cap × max item chars.
+    #[serde(default)]
+    pub pending_bytes: u64,
+    /// CTX-9: number of retired-scope fact notes currently retained (the
+    /// bounded retirement ring). The scope tree itself stops growing with
+    /// finished work; these notes are its explicit, bounded remainder.
+    #[serde(default)]
+    pub retired_scope_notes: usize,
     /// GC dimension: items externalized to the context store, still tracked
     /// in memory with a lightweight entry (`Cold`, content in the store).
     #[serde(default)]
@@ -2314,6 +2360,13 @@ pub struct ContextMaintenanceReport {
     /// state, not a silent shortfall: the next maintain continues.
     #[serde(default)]
     pub deferred_folds: usize,
+    /// COST-4: true when THIS pass stopped because the configured
+    /// cumulative compactor token budget ran out (the opt-in
+    /// `max_compactor_tokens_per_maintain`). The remaining folds are
+    /// deferred, never silently dropped; default false keeps legacy rows
+    /// and unlimited budgets indistinguishable from "consumed everything".
+    #[serde(default)]
+    pub compaction_budget_exhausted: bool,
 }
 
 /// Why a bounded compaction pass ran.
@@ -2326,12 +2379,38 @@ pub enum CompactionReason {
 }
 
 /// One bounded compaction pass. Token fields are the compressor call itself.
+/// `usage_identity` carries the call's evidence class (CORE-4): observed =
+/// provider-reported or no model call (zero is a fact); estimated = runtime
+/// approximation; unknown = the call failed and its cost is unknowable.
+/// Legacy rows default to unknown. Sums over mixed rows must keep the
+/// classes apart; `unknown` is never counted as consumed zeros.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ContextCompaction {
     pub reason: CompactionReason,
     pub input_tokens: u64,
     pub output_tokens: u64,
     pub source_items: usize,
+    #[serde(default = "crate::event::unknown_usage_identity")]
+    pub usage_identity: UsageIdentity,
+    /// COST-2 (E05.4)/COST-7 (R2-11): the compressor call's cache-read
+    /// counter. `None` (also the legacy default) when the provider did not
+    /// report one — a missing report is never an observed zero; COST-2-era
+    /// rows that flattened an unreported counter to 0 keep their historical
+    /// `Some(0)` bytes on decode.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cached_input_tokens: Option<u64>,
+    /// COST-7 (R2-11): the compressor call's explicit cache-write and
+    /// cache-miss counters — same rule, unreported stays off the wire.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache_write_input_tokens: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache_miss_input_tokens: Option<u64>,
+    /// COST-2 (E05.4): the transport's attempt/retry accounting for the
+    /// compressor call. Legacy rows default to 0 (unknown, not "one").
+    #[serde(default)]
+    pub attempts: u32,
+    #[serde(default)]
+    pub retries: u32,
 }
 
 /// One reversible eviction produced by a full GC pass: the item left the
@@ -2399,6 +2478,34 @@ pub struct ContextGcReport {
     /// (`anchor_revision + source_field + RootReason`).
     #[serde(default)]
     pub anchor_root_protections: Vec<AnchorRootProtection>,
+    /// CTX-5 (R2-03): residency-strength claims (`ResidentRequired` /
+    /// `PromptRequired`) of the current projection that matched **no live
+    /// item in any body location** this pass. Bounded by
+    /// `MAX_ANCHOR_ROOT_CLAIMS`: every unsatisfied holding obligation is
+    /// explicitly reported, never silently dropped. Empty on pre-field
+    /// reports.
+    #[serde(default)]
+    pub anchor_root_misses: Vec<AnchorRootProtection>,
+    /// CTX-8 (R2-06): overflow items left in the eviction buffer this pass
+    /// because the retry list was at its item cap. They stay owned (never
+    /// dropped); the count is the honest size of the store outage's debt.
+    #[serde(default)]
+    pub externalize_deferred: u64,
+    /// CTX-8: true when this pass hit the retry-list cap and deferred
+    /// overflow — the typed backpressure signal a runtime consumes to stop
+    /// feeding the engine before memory grows without bound.
+    #[serde(default)]
+    pub externalize_backpressure: bool,
+    /// CTX-8: store writes and recall reads that failed this pass. A failed
+    /// write keeps its item owned in the retry list; a failed read leaves
+    /// its entry in the map. Neither is silently swallowed any more.
+    #[serde(default)]
+    pub store_io_failures: u64,
+    /// CTX-9 (R2-07): closed, fully unreferenced scope nodes retired this
+    /// pass — their historical metadata left the tree, memory and
+    /// checkpoint; a bounded fact note (id/kind/task/completion) remains.
+    #[serde(default)]
+    pub scopes_retired: u64,
     #[serde(default)]
     pub evictions: Vec<ContextEviction>,
     /// Rows omitted from [`Self::evictions`] because the pass exceeded the
@@ -2819,6 +2926,11 @@ pub struct StoreReconcileReport {
     /// removed.
     #[serde(default)]
     pub temp_cleaned: usize,
+    /// CTX-9 残余：清理的孤儿外置元数据卡片（`cards/` 下的 `.card`
+    /// 文件，其 id 既不在当前 external map 也不在任何保护根）——已删除
+    /// 条目或元数据已更替的旧哈希卡片。
+    #[serde(default)]
+    pub external_cards_removed: usize,
     /// Real filesystem errors (permission, disk): the blob was left in
     /// place and surfaced, not guessed at.
     #[serde(default)]
@@ -2864,6 +2976,17 @@ pub struct ContextItemSummary {
     pub lease_until_turn: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub source: Option<String>,
+    /// PLATFORM-2: where the item's body lives right now — resident in the
+    /// working set, warm in the reversible buffer, or cold/external in the
+    /// store (a reader without a fetch sees the summary pointer only).
+    /// Legacy summaries default to `Resident`.
+    #[serde(default)]
+    pub residency: ContextResidency,
+    /// PLATFORM-2: the item's body was selected into the most recent
+    /// materialized model surface of the current turn — "actually sent",
+    /// not merely resident. Legacy summaries default to `false`.
+    #[serde(default)]
+    pub selected_current_turn: bool,
 }
 
 #[async_trait]
@@ -3017,10 +3140,18 @@ pub trait ContextEngine: Send + Sync {
     /// runtime calls this for every retained checkpoint after a restore,
     /// unions the results, and passes them to
     /// [`Self::reconcile_store_protecting`]. Engines without a checkpoint
-    /// byte format return nothing.
+    /// byte format return an empty list. EXEC-9 (R3-01): the call is async
+    /// and fallible so a process-boundary engine can parse with the real
+    /// (versioned) implementation behind the wire — a parse/enumeration
+    /// failure is an `Err`, which the runtime reports as an INCOMPLETE root
+    /// set (physical deletion deferred) instead of an empty set that reads
+    /// as "nothing retained".
     #[allow(unused_variables)]
-    fn checkpoint_recovery_item_ids(&self, checkpoint: &serde_json::Value) -> Vec<ContextItemId> {
-        Vec::new()
+    async fn checkpoint_recovery_item_ids(
+        &self,
+        checkpoint: &serde_json::Value,
+    ) -> AgentResult<Vec<ContextItemId>> {
+        Ok(Vec::new())
     }
 
     /// Bounded projection of live items, oldest first, capped at `limit`.
@@ -3483,6 +3614,7 @@ mod tests {
             start_line: Some(start),
             end_line: Some(end),
             covers_file: false,
+            complete: true,
         };
         let windows = vec![win(101, 200)];
         // Same revision, contained interval: covered.
@@ -3524,6 +3656,7 @@ mod tests {
             start_line: None,
             end_line: None,
             covers_file: true,
+            complete: true,
         }];
         assert!(visible_body_windows_cover(
             &covers,
@@ -3539,6 +3672,7 @@ mod tests {
             start_line: None,
             end_line: None,
             covers_file: false,
+            complete: true,
         }];
         assert!(!visible_body_windows_cover(
             &unknown,
@@ -3556,6 +3690,105 @@ mod tests {
             Some(50),
             Some(150)
         ));
+    }
+
+    #[test]
+    fn clipped_window_is_never_a_coverage_proof() {
+        // F01: a read exposed L1–200, but a later stage (broker head/tail
+        // clamp or checkpoint clamp) truncated the body it captured. The
+        // declared range is now an upper bound of what was *read*, not
+        // proof of what the request carries — so the interval it names must
+        // not hide a historical record.
+        let clipped = vec![FileBodyWindow {
+            path: "src/auth.rs".into(),
+            revision: Some("abc".into()),
+            start_line: Some(1),
+            end_line: Some(200),
+            covers_file: false,
+            complete: false,
+        }];
+        assert!(
+            !visible_body_windows_cover(&clipped, "src/auth.rs", Some("abc"), Some(1), Some(200)),
+            "a truncated body cannot prove it exposed the range it declares"
+        );
+        assert!(!visible_body_windows_cover(
+            &clipped,
+            "src/auth.rs",
+            Some("abc"),
+            Some(50),
+            Some(80)
+        ));
+        // A clipped whole-file claim is equally worthless: clips must never
+        // upgrade a partial capture into whole-file coverage.
+        let clipped_whole = vec![FileBodyWindow {
+            path: "src/auth.rs".into(),
+            revision: Some("abc".into()),
+            start_line: None,
+            end_line: None,
+            covers_file: true,
+            complete: false,
+        }];
+        assert!(!visible_body_windows_cover(
+            &clipped_whole,
+            "src/auth.rs",
+            Some("abc"),
+            None,
+            None
+        ));
+        // The same window marked complete still proves coverage: the guard
+        // is the clipping flag, not the interval shape.
+        let intact = vec![FileBodyWindow {
+            complete: true,
+            ..clipped[0].clone()
+        }];
+        assert!(visible_body_windows_cover(
+            &intact,
+            "src/auth.rs",
+            Some("abc"),
+            Some(1),
+            Some(200)
+        ));
+        // A clipped window does not poison an intact sibling covering the
+        // same interval.
+        let mixed = vec![clipped[0].clone(), intact[0].clone()];
+        assert!(visible_body_windows_cover(
+            &mixed,
+            "src/auth.rs",
+            Some("abc"),
+            Some(1),
+            Some(200)
+        ));
+    }
+
+    #[test]
+    fn legacy_window_decodes_as_complete() {
+        // Hints persisted before F01 carry no `complete` field. Treating
+        // them as unclipped preserves the previous meaning instead of
+        // silently dropping all coverage on decode.
+        let decoded: FileBodyWindow = serde_json::from_str(
+            r#"{"path":"src/a.rs","revision":"r1","start_line":1,"end_line":100,"covers_file":false}"#,
+        )
+        .expect("legacy window decodes");
+        assert!(decoded.complete);
+        assert!(visible_body_windows_cover(
+            &[decoded],
+            "src/a.rs",
+            Some("r1"),
+            Some(10),
+            Some(20)
+        ));
+        // And the field round-trips without changing the wire shape of
+        // windows that were never clipped.
+        let serialized = serde_json::to_string(&FileBodyWindow {
+            path: "src/a.rs".into(),
+            revision: Some("r1".into()),
+            start_line: Some(1),
+            end_line: Some(100),
+            covers_file: false,
+            complete: true,
+        })
+        .expect("window serializes");
+        assert!(serialized.contains("\"complete\":true"));
     }
 
     #[test]

@@ -213,11 +213,35 @@ pub enum RuntimeEvent {
     },
     /// One bounded compaction pass. Cost accounting sums these events
     /// instead of guessing from diagnostics snapshots or maintain deltas.
+    /// E05.3/COST-1: the compaction's own usage evidence identity travels
+    /// with the event — the projection must not lose what the typed report
+    /// carried. Legacy rows (before the field) default to `Unknown`: their
+    /// zero counters are not observed consumption.
     ContextCompacted {
         reason: CompactionReason,
         input_tokens: u64,
         output_tokens: u64,
         source_items: usize,
+        #[serde(default = "unknown_usage_identity")]
+        usage_identity: crate::model::UsageIdentity,
+        /// COST-2 (E05.4)/COST-7 (R2-11): the compressor call's cache-read
+        /// counter. `None` (also the legacy default) when the provider did
+        /// not report one — a missing report is never an observed zero;
+        /// COST-2-era rows keep their historical `0` bytes as `Some(0)`.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        cached_input_tokens: Option<u64>,
+        /// COST-7 (R2-11): the compressor call's explicit cache-write and
+        /// cache-miss counters — same rule, unreported stays off the wire.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        cache_write_input_tokens: Option<u64>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        cache_miss_input_tokens: Option<u64>,
+        /// COST-2 (E05.4): the transport's attempt/retry accounting for
+        /// the compressor call (legacy rows: 0 = unknown).
+        #[serde(default)]
+        attempts: u32,
+        #[serde(default)]
+        retries: u32,
     },
     /// A full GC pass ran: roots were marked, unmarked items were evicted to
     /// the reversible buffer and/or reactivated. The report explains every
@@ -480,10 +504,18 @@ pub enum RuntimeEvent {
     /// for it. Carries the task/result identity (task id and the anchor
     /// revision the outcome was measured against) plus the bounded summary;
     /// the full record lives in the runtime's task catalog, not the event.
+    /// EXEC-8 (R2-09): the bounded artifact references and the final-output
+    /// digest ride along so a completion that later leaves the hot task
+    /// window stays reviewable from the durable journal alone. Legacy rows
+    /// decode with empty artifacts and no digest.
     TaskCompleted {
         task_id: TaskId,
         anchor_revision: u64,
         summary: String,
+        #[serde(default)]
+        artifacts: Vec<String>,
+        #[serde(default)]
+        final_output_digest: Option<String>,
     },
     /// A task's anchor was replaced through whole-set CAS. The event is the
     /// bounded audit row: task identity, the resulting revision, the names
@@ -690,6 +722,15 @@ pub enum RuntimeEvent {
     /// did not report them. `attempts`/`retries` come from the transport;
     /// failed attempts usually have no usage, so tokens are a lower bound
     /// whenever `retries > 0`.
+    ///
+    /// CORE-4: `usage_identity` says what the counters are — `observed`
+    /// (provider-reported, or zero because no call happened), `estimated`
+    /// (runtime approximation), `unknown` (aborted round, usage-less
+    /// failure, or a legacy row predating this field). Unknown is never
+    /// zero consumption: legacy rows and cancelled in-flight rounds carry
+    /// `unknown` precisely so no consumer sums them as real zeros.
+    /// `usage` carries the exact typed report when one arrived (per-field
+    /// `Option`, including the cache counter); `None` on legacy rows.
     ModelUsed {
         input_tokens: u64,
         output_tokens: u64,
@@ -701,6 +742,16 @@ pub enum RuntimeEvent {
         attempts: u32,
         #[serde(default)]
         retries: u32,
+        #[serde(default = "unknown_usage_identity")]
+        usage_identity: crate::model::UsageIdentity,
+        /// COST-7 (R2-11): which call lane produced this row. The main
+        /// rounds and the maintenance/compactor lane are different cost
+        /// centers — an unknown row must say where the unknown cost sits.
+        /// Legacy rows default to the main lane.
+        #[serde(default)]
+        role: crate::model::ModelCallRole,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        usage: Option<crate::model::ModelUsage>,
     },
     /// A shadow-mode approval decision (ACI v2 compatibility order step 4):
     /// the v2 intent-derived verdict recorded beside the legacy gate. Only
@@ -708,6 +759,16 @@ pub enum RuntimeEvent {
     /// is the one that runs. `legacy_allowed` records whether the legacy
     /// path allowed the call, so the invariant trace can prove the shadow
     /// gate never grants beyond the legacy gate.
+    /// EXEC-3 (E07): the restore itself committed, but not every protected
+    /// predecessor reference could be admitted into the new run's bounded
+    /// artifact lineage. The named runs' sealed reads keep failing closed
+    /// until an operator restores again or re-admits them — this is the
+    /// typed distinction between "restore succeeded" and "every restored
+    /// evidence reference stays readable".
+    RestoreEvidenceDegraded {
+        /// The predecessor runs that could not be admitted (bounded).
+        unadmitted_runs: Vec<String>,
+    },
     ShadowDecision {
         call_name: String,
         legacy_allowed: bool,
@@ -757,6 +818,12 @@ impl RuntimeEvent {
 }
 
 /// Emit `ContextCompacted` rows then the `ContextMaintained` audit.
+/// Serde default for usage-identity fields: legacy rows predate typed
+/// evidence, so their zeros must not read as observed consumption.
+pub(crate) fn unknown_usage_identity() -> crate::model::UsageIdentity {
+    crate::model::UsageIdentity::Unknown
+}
+
 pub fn context_maintenance_events(
     trigger: ContextMaintenanceTrigger,
     report: ContextMaintenanceReport,
@@ -769,6 +836,12 @@ pub fn context_maintenance_events(
             input_tokens: compaction.input_tokens,
             output_tokens: compaction.output_tokens,
             source_items: compaction.source_items,
+            usage_identity: compaction.usage_identity,
+            cached_input_tokens: compaction.cached_input_tokens,
+            cache_write_input_tokens: compaction.cache_write_input_tokens,
+            cache_miss_input_tokens: compaction.cache_miss_input_tokens,
+            attempts: compaction.attempts,
+            retries: compaction.retries,
         })
         .collect();
     events.push(RuntimeEvent::ContextMaintained { trigger, report });
@@ -781,5 +854,20 @@ pub trait EventJournal: Send + Sync {
 
     async fn flush(&self) -> AgentResult<()> {
         Ok(())
+    }
+
+    /// EXEC-8 (R2-09): read at most `max` envelopes from the tail of one
+    /// run's durable journal, oldest first, plus whether the window is
+    /// COMPLETE (`false` = the journal holds more rows before this window,
+    /// so an absent fact is not proof of absence). Memory stays bounded by
+    /// `max` rows regardless of journal size. `Ok(None)` = this backend
+    /// cannot serve read-back at all; callers must answer "beyond window",
+    /// never "does not exist".
+    async fn read_tail(
+        &self,
+        _run_id: RunId,
+        _max: usize,
+    ) -> AgentResult<Option<(Vec<RuntimeEventEnvelope>, bool)>> {
+        Ok(None)
     }
 }

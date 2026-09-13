@@ -1,0 +1,1 @@
+{"envelope":{"run_id":"00000000-0000-4000-8000-000000000002","seq":8,"timestamp_ms":1100,"event":{"type":"model_used","input_tokens":0,"output_tokens":0,"cached_input_tokens":0,"attempts":0,"retries":0,"usage_identity":"unknown","role":"main"}}}

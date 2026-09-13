@@ -46,17 +46,31 @@ impl BoundedCompactor for ModelBackedCompactor {
                     "folded_items": request.folded_items,
                     "output_char_cap": COMPACTION_OUTPUT_CHARS,
                 }),
+                // COST-4 (D02): the output cap finally reaches the provider
+                // parameter — where the transport negotiates a max-output
+                // field, generation stops at the compaction bound instead of
+                // the main profile's cap (truncation stays as the backstop).
+                max_output_tokens: Some(COMPACTION_OUTPUT_CHARS as u32),
                 cancel: CancellationToken::new(),
             })
             .await?;
         let text = bound_compaction_output(&output.content);
         if text.trim().is_empty() {
             // 调用成功但没有任何可用摘要：与失败同型（summary_unavailable），
-            // 不能拿源前缀冒充折叠结果。
-            return Err(AgentError::Model(
-                "compaction model returned an empty summary".into(),
-            ));
+            // 不能拿源前缀冒充折叠结果。COST-7 (R2-11)：调用本身可能已被
+            // 计费——已收到的 usage 随类型化错误一起交还引擎，不再随
+            // Err 一起丢失。
+            return Err(AgentError::EmptyCompactionSummary {
+                usage: output.usage,
+            });
         }
+        // CORE-4: the approximation fallback must be labelled as an
+        // estimate — a runtime-derived token count never masquerades as
+        // provider-reported usage.
+        let usage_identity = match (output.usage.input_tokens, output.usage.output_tokens) {
+            (Some(_), Some(_)) => agent_contracts::UsageIdentity::Observed,
+            _ => agent_contracts::UsageIdentity::Estimated,
+        };
         let input_tokens = output
             .usage
             .input_tokens
@@ -69,6 +83,16 @@ impl BoundedCompactor for ModelBackedCompactor {
             text,
             input_tokens,
             output_tokens,
+            usage_identity,
+            // COST-2 (E05.4)/COST-7 (R2-11): the transport's cache/attempt
+            // facts travel with the output verbatim — unreported counters
+            // stay `None` (never a flattened zero), and the write/miss
+            // split survives to the consumer.
+            cached_input_tokens: output.usage.cached_input_tokens,
+            cache_write_input_tokens: output.usage.cache_write_input_tokens,
+            cache_miss_input_tokens: output.usage.cache_miss_input_tokens,
+            attempts: output.usage.attempts,
+            retries: output.usage.retries,
         })
     }
 }
@@ -81,6 +105,7 @@ mod tests {
     struct RecordingModel {
         content: String,
         fail: bool,
+        report_usage: bool,
     }
 
     #[async_trait]
@@ -102,10 +127,14 @@ mod tests {
             Ok(ModelOutput {
                 content: self.content.clone(),
                 tool_calls: Vec::new(),
-                usage: ModelUsage {
-                    input_tokens: Some(11),
-                    output_tokens: Some(7),
-                    ..Default::default()
+                usage: if self.report_usage {
+                    ModelUsage {
+                        input_tokens: Some(11),
+                        output_tokens: Some(7),
+                        ..Default::default()
+                    }
+                } else {
+                    ModelUsage::default()
                 },
             })
         }
@@ -117,6 +146,7 @@ mod tests {
         let compactor = ModelBackedCompactor::new(Arc::new(RecordingModel {
             content: long,
             fail: false,
+            report_usage: true,
         }));
         let out = compactor
             .compact(CompactionRequest {
@@ -128,6 +158,85 @@ mod tests {
         assert_eq!(out.text.chars().count(), COMPACTION_OUTPUT_CHARS);
         assert_eq!(out.input_tokens, 11);
         assert_eq!(out.output_tokens, 7);
+        assert_eq!(
+            out.usage_identity,
+            agent_contracts::UsageIdentity::Observed,
+            "a full provider report is observed usage"
+        );
+    }
+
+    /// CORE-4：provider 没报 usage 时运行时近似推导——数值可用，但身份
+    /// 必须是 estimated，不得冒充 provider 观测。
+    #[tokio::test]
+    async fn a_missing_usage_report_is_labelled_estimated_not_observed() {
+        let compactor = ModelBackedCompactor::new(Arc::new(RecordingModel {
+            content: "short summary".into(),
+            fail: false,
+            report_usage: false,
+        }));
+        let out = compactor
+            .compact(CompactionRequest {
+                folded_items: 4,
+                source: "goal: fix auth".into(),
+            })
+            .await
+            .unwrap();
+        assert!(
+            out.input_tokens > 0,
+            "the approximation still fills numbers"
+        );
+        assert_eq!(
+            out.usage_identity,
+            agent_contracts::UsageIdentity::Estimated,
+            "derived numbers must carry the estimated identity"
+        );
+    }
+
+    /// COST-4 (D02): the compactor's bounded-output contract reaches the
+    /// PROVIDER parameter — the request states its own output ceiling, so
+    /// generation stops at the compaction bound instead of the main
+    /// profile's default (truncation afterwards is only a backstop).
+    #[tokio::test]
+    async fn the_output_cap_reaches_the_provider_request() {
+        struct CapturingModel {
+            seen_caps: std::sync::Arc<std::sync::Mutex<Vec<Option<u32>>>>,
+        }
+        #[async_trait::async_trait]
+        impl ModelTransport for CapturingModel {
+            fn capabilities(&self) -> ModelCapabilities {
+                ModelCapabilities::default()
+            }
+            async fn complete(&self, request: ModelRequest) -> AgentResult<ModelOutput> {
+                self.seen_caps
+                    .lock()
+                    .unwrap()
+                    .push(request.max_output_tokens);
+                Ok(ModelOutput {
+                    content: "short summary".into(),
+                    tool_calls: Vec::new(),
+                    usage: ModelUsage::default(),
+                })
+            }
+        }
+        let seen_caps = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let seen_for_model = Arc::clone(&seen_caps);
+        let model: Arc<dyn ModelTransport> = Arc::new(CapturingModel {
+            seen_caps: seen_for_model,
+        });
+        let compactor = ModelBackedCompactor::new(Arc::clone(&model));
+        let _ = compactor
+            .compact(CompactionRequest {
+                folded_items: 2,
+                source: "keep this".into(),
+            })
+            .await
+            .unwrap();
+        let caps = seen_caps.lock().unwrap().clone();
+        assert_eq!(
+            caps,
+            vec![Some(COMPACTION_OUTPUT_CHARS as u32)],
+            "the request must state the compaction output bound"
+        );
     }
 
     #[tokio::test]
@@ -135,6 +244,7 @@ mod tests {
         let compactor = ModelBackedCompactor::new(Arc::new(RecordingModel {
             content: String::new(),
             fail: true,
+            report_usage: true,
         }));
         let error = compactor
             .compact(CompactionRequest {
@@ -154,6 +264,7 @@ mod tests {
         let compactor = ModelBackedCompactor::new(Arc::new(RecordingModel {
             content: String::new(),
             fail: false,
+            report_usage: true,
         }));
         let error = compactor
             .compact(CompactionRequest {
@@ -163,6 +274,103 @@ mod tests {
             .await
             .unwrap_err();
         assert!(error.to_string().contains("empty summary"));
+    }
+
+    /// COST-7 (R2-11): an empty summary still discards the fold, but the
+    /// usage the provider already reported for the billed call travels back
+    /// on the typed error — it must not vanish with the refused result.
+    #[tokio::test]
+    async fn an_empty_summary_keeps_the_reported_usage_evidence() {
+        struct EmptySummaryWithUsageModel;
+        #[async_trait]
+        impl ModelTransport for EmptySummaryWithUsageModel {
+            fn capabilities(&self) -> ModelCapabilities {
+                ModelCapabilities::default()
+            }
+            async fn complete(&self, _request: ModelRequest) -> AgentResult<ModelOutput> {
+                Ok(ModelOutput {
+                    content: "   ".into(),
+                    tool_calls: Vec::new(),
+                    usage: ModelUsage {
+                        input_tokens: Some(140),
+                        output_tokens: Some(0),
+                        cached_input_tokens: Some(90),
+                        attempts: 1,
+                        retries: 0,
+                        ..Default::default()
+                    },
+                })
+            }
+        }
+        let compactor = ModelBackedCompactor::new(Arc::new(EmptySummaryWithUsageModel));
+        let error = compactor
+            .compact(CompactionRequest {
+                folded_items: 1,
+                source: "unique constraint lives in the source".into(),
+            })
+            .await
+            .unwrap_err();
+        let usage = error
+            .reported_usage()
+            .expect("an empty-summary error carries the billed call's usage");
+        assert_eq!(usage.input_tokens, Some(140));
+        assert_eq!(usage.cached_input_tokens, Some(90));
+    }
+
+    /// COST-7 (R2-11): the cache read/write/miss split passes through
+    /// verbatim — an unreported counter stays `None`, never a zero.
+    #[tokio::test]
+    async fn cache_buckets_pass_through_without_flattening() {
+        struct CacheReportingModel;
+        #[async_trait]
+        impl ModelTransport for CacheReportingModel {
+            fn capabilities(&self) -> ModelCapabilities {
+                ModelCapabilities::default()
+            }
+            async fn complete(&self, _request: ModelRequest) -> AgentResult<ModelOutput> {
+                Ok(ModelOutput {
+                    content: "short summary".into(),
+                    tool_calls: Vec::new(),
+                    usage: ModelUsage {
+                        input_tokens: Some(100),
+                        output_tokens: Some(7),
+                        cached_input_tokens: Some(80),
+                        cache_write_input_tokens: Some(10),
+                        cache_miss_input_tokens: Some(20),
+                        attempts: 1,
+                        retries: 0,
+                        ..Default::default()
+                    },
+                })
+            }
+        }
+        let compactor = ModelBackedCompactor::new(Arc::new(CacheReportingModel));
+        let out = compactor
+            .compact(CompactionRequest {
+                folded_items: 1,
+                source: "keep this".into(),
+            })
+            .await
+            .unwrap();
+        assert_eq!(out.cached_input_tokens, Some(80));
+        assert_eq!(out.cache_write_input_tokens, Some(10));
+        assert_eq!(out.cache_miss_input_tokens, Some(20));
+
+        let compactor = ModelBackedCompactor::new(Arc::new(RecordingModel {
+            content: "short summary".into(),
+            fail: false,
+            report_usage: false,
+        }));
+        let out = compactor
+            .compact(CompactionRequest {
+                folded_items: 1,
+                source: "keep this".into(),
+            })
+            .await
+            .unwrap();
+        assert_eq!(out.cached_input_tokens, None);
+        assert_eq!(out.cache_write_input_tokens, None);
+        assert_eq!(out.cache_miss_input_tokens, None);
     }
 }
 
