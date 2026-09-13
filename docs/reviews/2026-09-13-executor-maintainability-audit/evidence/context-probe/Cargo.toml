@@ -1,0 +1,17 @@
+[package]
+name = "executor-review-context-probe"
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+[workspace]
+
+[dependencies]
+agent-contracts = { path = "../../../../../crates/agent-contracts" }
+context-simple = { path = "../../../../../crates/context-simple" }
+context-contextcore = { path = "../../../../../crates/context-contextcore" }
+context-baselines = { path = "../../../../../crates/context-baselines" }
+async-trait = "0.1"
+serde_json = "1"
+tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
+tempfile = "3"

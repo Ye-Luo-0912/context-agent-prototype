@@ -1,0 +1,182 @@
+{
+  "segment": "b-main",
+  "argv": [
+    "D:\\Users\\Ye_Luo\\APP\\context-agent-prototype\\target\\debug\\agent-tui.exe",
+    "--grant-file=D:\\Users\\Ye_Luo\\APP\\context-agent-prototype\\target\\flash-workflow\\1789256926462857600\\b\\b-main\\grants.json",
+    "--max-rounds=8",
+    "--timeout-secs=240",
+    "--context=dynamic",
+    "--work",
+    "--prompt=-",
+    "D:\\Users\\Ye_Luo\\APP\\context-agent-prototype\\target\\flash-workflow\\1789256926462857600\\b\\workspace"
+  ],
+  "exit_code": 0,
+  "wall_ms": 11851.26,
+  "forced_tree_stop": false,
+  "run_id": "1cd2037c-34ab-4d48-a766-d1bdbe68b63f",
+  "metrics": {
+    "event_counts": {
+      "model_started": 6,
+      "model_used": 6,
+      "tool_started": 8,
+      "tool_finished": 8,
+      "turn_completed": 1,
+      "turn_cancelled": 0,
+      "runtime_restored": 0,
+      "checkpoint_durable": 2,
+      "recovery_required": 0
+    },
+    "decision": {
+      "calls": 6,
+      "input_tokens": 27753,
+      "output_tokens": 1007,
+      "cached_input_tokens": 18688,
+      "attempts": 6,
+      "retries": 0
+    },
+    "maintenance": {
+      "passes": 12,
+      "compactions": 0,
+      "compaction_input_tokens": 0,
+      "compaction_output_tokens": 0,
+      "deferred_folds": 0
+    },
+    "tools": [
+      {
+        "name": "fs.list",
+        "ok": true,
+        "artifact_ref": null,
+        "metadata": {
+          "cursor": null,
+          "entry_count": 5,
+          "has_more": false,
+          "next_start_line": null,
+          "path": ".",
+          "returned": 5,
+          "revision": "8e0aa7d8b7c9f52db4113ffc7b8607657f0cf0251c8d6d3dcc540d083d1c5b58",
+          "scan_incomplete": false
+        }
+      },
+      {
+        "name": "git.status",
+        "ok": true,
+        "artifact_ref": null,
+        "metadata": {
+          "bytes": 0,
+          "capture_truncated": false,
+          "captured_bytes": 0,
+          "exit_code": 0,
+          "external_filters_disabled": true
+        }
+      },
+      {
+        "name": "fs.read",
+        "ok": true,
+        "artifact_ref": null,
+        "metadata": {
+          "bytes": 5891,
+          "covers_file": true,
+          "end_line": 167,
+          "fs_read_motive": "first",
+          "line_count": 167,
+          "line_ending": "lf",
+          "path": "scripts/doc_consistency.py",
+          "revision": "a33920f5e7a2b67b505530093347fe162bea6ba2f36b6a674c050a487100a4de",
+          "start_line": 1
+        }
+      },
+      {
+        "name": "fs.list",
+        "ok": true,
+        "artifact_ref": null,
+        "metadata": {
+          "cursor": null,
+          "entry_count": 2,
+          "has_more": false,
+          "next_start_line": null,
+          "path": "tests",
+          "returned": 2,
+          "revision": "fb515efc140c99775fa72f878191b736cb46bdb86a72f2fee6c1b993067a0200",
+          "scan_incomplete": false
+        }
+      },
+      {
+        "name": "fs.read",
+        "ok": true,
+        "artifact_ref": null,
+        "metadata": {
+          "bytes": 47,
+          "covers_file": true,
+          "end_line": 2,
+          "fs_read_motive": "first",
+          "line_count": 2,
+          "line_ending": "crlf",
+          "path": "pytest.ini",
+          "revision": "bcdf34c2f86b4545e8d8bfeccc8cde3163d12b6650a67700123cb1b5463ef3a7",
+          "start_line": 1
+        }
+      },
+      {
+        "name": "fs.read",
+        "ok": true,
+        "artifact_ref": null,
+        "metadata": {
+          "bytes": 1790,
+          "covers_file": true,
+          "end_line": 38,
+          "fs_read_motive": "first",
+          "line_count": 38,
+          "line_ending": "crlf",
+          "path": "tests/test_links.py",
+          "revision": "ff4545a90f3f3e1068bda72ba11681ba2dd941d163696d9507efb1e565b06779",
+          "start_line": 1
+        }
+      },
+      {
+        "name": "verify.run",
+        "ok": true,
+        "artifact_ref": "artifact://v1/1cd2037c-34ab-4d48-a766-d1bdbe68b63f/process/7af54ce8ffb130cc7b29cd93a8e47e98bb71c938f66b775d35f70d46ab0b5168",
+        "metadata": {
+          "argv": "D:\\Users\\Ye_Luo\\APP\\context-agent-prototype\\target\\flash-workflow-env\\Scripts\\python.exe -m pytest",
+          "artifact_bytes": 989,
+          "artifact_limit_bytes": 8388608,
+          "artifact_truncated": false,
+          "cwd": ".",
+          "exit_code": 0,
+          "lines": 17,
+          "mutates_workspace": true,
+          "outcome": "completed",
+          "output_bytes": 989,
+          "recipe_id": "python.pytest",
+          "recipe_revision": "python-pytest-v2",
+          "resolution_fingerprint": "05930fe8ea2d1ada8b7fc97efea171ed19cb8b0ddad07177d81043b8a6371f93",
+          "resolution_scope_key": "1c5ba3cb6afac4af462ac7659361e869ba9eeaef45bb5ce90c4a921e68fa48ac",
+          "timeout_ms": 120000,
+          "verification": true
+        }
+      },
+      {
+        "name": "fs.write",
+        "ok": true,
+        "artifact_ref": null,
+        "metadata": {
+          "bytes": 843,
+          "line_ending": "lf",
+          "path": "validation.json",
+          "revision": "4380a25b195403a7b957912189e1322132623e778ea7e1baeada15fec22842be"
+        }
+      }
+    ],
+    "session_end": {
+      "approval_denied": false,
+      "exit": 0,
+      "kind": "session_end",
+      "round_budget": false,
+      "schema": "agent.headless.v1",
+      "status": "completed",
+      "stop": "turn_completed",
+      "task_completed": false,
+      "task_state": "awaiting_operator_review"
+    }
+  }
+}

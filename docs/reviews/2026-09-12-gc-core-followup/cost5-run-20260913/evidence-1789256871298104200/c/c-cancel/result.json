@@ -1,0 +1,57 @@
+{
+  "segment": "c-cancel",
+  "argv": [
+    "D:\\Users\\Ye_Luo\\APP\\context-agent-prototype\\target\\debug\\agent-tui.exe",
+    "--grant-file=D:\\Users\\Ye_Luo\\APP\\context-agent-prototype\\target\\flash-workflow\\1789256871298104200\\c\\c-cancel\\grants.json",
+    "--max-rounds=4",
+    "--timeout-secs=1",
+    "--context=dynamic",
+    "--restore=latest",
+    "--continue",
+    "D:\\Users\\Ye_Luo\\APP\\context-agent-prototype\\target\\flash-workflow\\1789256871298104200\\c\\workspace"
+  ],
+  "exit_code": 1,
+  "wall_ms": 4084.29,
+  "forced_tree_stop": false,
+  "run_id": "ba512c4c-70c7-41b6-858e-198aa9b51171",
+  "metrics": {
+    "event_counts": {
+      "model_started": 1,
+      "model_used": 1,
+      "tool_started": 0,
+      "tool_finished": 0,
+      "turn_completed": 0,
+      "turn_cancelled": 1,
+      "runtime_restored": 1,
+      "checkpoint_durable": 0,
+      "recovery_required": 0
+    },
+    "decision": {
+      "calls": 1,
+      "input_tokens": 0,
+      "output_tokens": 0,
+      "cached_input_tokens": 0,
+      "attempts": 0,
+      "retries": 0
+    },
+    "maintenance": {
+      "passes": 2,
+      "compactions": 0,
+      "compaction_input_tokens": 0,
+      "compaction_output_tokens": 0,
+      "deferred_folds": 0
+    },
+    "tools": [],
+    "session_end": {
+      "approval_denied": false,
+      "exit": 1,
+      "kind": "session_end",
+      "round_budget": false,
+      "schema": "agent.headless.v1",
+      "status": "timeout",
+      "stop": "timeout",
+      "task_completed": false,
+      "task_state": "awaiting_operator_review"
+    }
+  }
+}

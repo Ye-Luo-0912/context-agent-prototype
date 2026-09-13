@@ -1,0 +1,9 @@
+{"case":"pending_foreground","fetch_has_body":true,"foreground_count":0,"misses":{"entries":[{"identity":{"anchor_revision":0,"item_ref":"src/a.rs@rev-1","source_field_id":"foreground_resources"},"reason":"missing"}],"omitted":0}}
+{"case":"warm_recall_budget","reactivations":[0,0,0],"target_still_warm":true}
+{"case":"retirement_ring","first_retained":true,"latest_retained":false,"notes":512}
+{"case":"stored_materialization_metadata","fetch_retention":"Pinned","fetch_scope":"Session","foreground":[],"required":[{"retention":"Working","scope":"Task"}]}
+{"case":"retired_scope_recall","reactivated":1,"restore_error":"context error: checkpoint restore validation: item 775fa2b1-af32-4f19-b41a-170bcf7f6793 references missing scope 161de037-d1a5-485e-8dd0-13baf96ee006"}
+{"case":"store_outage_growth","samples":[{"backpressure":true,"pending":3,"rounds":6,"warm":3},{"backpressure":true,"pending":3,"rounds":20,"warm":17},{"backpressure":true,"pending":3,"rounds":40,"warm":56}]}
+{"adapter_roots":0,"blob_survived":false,"case":"service_recovery_roots","direct_roots":1,"reconcile":{"deleted_stale":1,"io_errors":0,"owner_quarantined":0,"quarantined":0,"reasons":["deleted stale blob 4d0e3943-734e-4bc3-8d5b-3048332337fa.json: id already resident"],"reasons_truncated":0,"rebuilt":0,"scanned":1,"temp_cleaned":0},"retained_checkpoint_body_readable":false}
+{"case":"compatible_decisions","new":"replace timeout logging in AuthService.rs with structured events","old":"use AuthService.rs with a 5-second timeout","old_semantic":{"Superseded":{"by":"63453e68-fc35-4da0-ba2d-e981d850090e"}}}
+{"calls":2,"case":"rolling_same_request_backoff","same_folded_items":true,"same_source":true,"source_chars":2000}

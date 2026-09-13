@@ -1,0 +1,5560 @@
+{
+  "note": "Lexical inventory only; matches are not defects or proof of line-by-line review.",
+  "files": [
+    {
+      "path": ".github/workflows/ci.yml",
+      "counts": {
+        "error_exit": 0,
+        "whole_read": 0,
+        "unbounded_queue": 0,
+        "lifecycle": 1,
+        "clone_collect": 0,
+        "markers": 0
+      }
+    },
+    {
+      "path": ".github/workflows/package.yml",
+      "counts": {
+        "error_exit": 0,
+        "whole_read": 0,
+        "unbounded_queue": 0,
+        "lifecycle": 0,
+        "clone_collect": 0,
+        "markers": 0
+      }
+    },
+    {
+      "path": "Cargo.toml",
+      "counts": {
+        "error_exit": 0,
+        "whole_read": 0,
+        "unbounded_queue": 0,
+        "lifecycle": 0,
+        "clone_collect": 0,
+        "markers": 0
+      }
+    },
+    {
+      "path": "apps/Agent.Desktop/Agent.Desktop.csproj",
+      "counts": {
+        "error_exit": 0,
+        "whole_read": 0,
+        "unbounded_queue": 0,
+        "lifecycle": 0,
+        "clone_collect": 0,
+        "markers": 0
+      }
+    },
+    {
+      "path": "apps/Agent.Desktop/App.axaml",
+      "counts": {
+        "error_exit": 0,
+        "whole_read": 0,
+        "unbounded_queue": 0,
+        "lifecycle": 0,
+        "clone_collect": 0,
+        "markers": 0
+      }
+    },
+    {
+      "path": "apps/Agent.Desktop/App.axaml.cs",
+      "counts": {
+        "error_exit": 0,
+        "whole_read": 0,
+        "unbounded_queue": 0,
+        "lifecycle": 0,
+        "clone_collect": 0,
+        "markers": 0
+      }
+    },
+    {
+      "path": "apps/Agent.Desktop/Fixture/FixtureAgentConnection.cs",
+      "counts": {
+        "error_exit": 0,
+        "whole_read": 0,
+        "unbounded_queue": 0,
+        "lifecycle": 0,
+        "clone_collect": 0,
+        "markers": 0
+      }
+    },
+    {
+      "path": "apps/Agent.Desktop/Infrastructure/ObservableObject.cs",
+      "counts": {
+        "error_exit": 0,
+        "whole_read": 0,
+        "unbounded_queue": 0,
+        "lifecycle": 0,
+        "clone_collect": 0,
+        "markers": 0
+      }
+    },
+    {
+      "path": "apps/Agent.Desktop/MainWindow.axaml",
+      "counts": {
+        "error_exit": 0,
+        "whole_read": 0,
+        "unbounded_queue": 0,
+        "lifecycle": 0,
+        "clone_collect": 0,
+        "markers": 0
+      }
+    },
+    {
+      "path": "apps/Agent.Desktop/MainWindow.axaml.cs",
+      "counts": {
+        "error_exit": 0,
+        "whole_read": 0,
+        "unbounded_queue": 0,
+        "lifecycle": 0,
+        "clone_collect": 0,
+        "markers": 0
+      }
+    },
+    {
+      "path": "apps/Agent.Desktop/Program.cs",
+      "counts": {
+        "error_exit": 0,
+        "whole_read": 0,
+        "unbounded_queue": 0,
+        "lifecycle": 0,
+        "clone_collect": 0,
+        "markers": 0
+      }
+    },
+    {
+      "path": "apps/Agent.Desktop/ViewModels/MainWindowViewModel.cs",
+      "counts": {
+        "error_exit": 0,
+        "whole_read": 0,
+        "unbounded_queue": 1,
+        "lifecycle": 10,
+        "clone_collect": 0,
+        "markers": 0
+      }
+    },
+    {
+      "path": "clients/dotnet/Agent.Client.Tests/Agent.Client.Tests.csproj",
+      "counts": {
+        "error_exit": 0,
+        "whole_read": 0,
+        "unbounded_queue": 0,
+        "lifecycle": 0,
+        "clone_collect": 0,
+        "markers": 0
+      }
+    },
+    {
+      "path": "clients/dotnet/Agent.Client.Tests/ClientSafetyTests.cs",
+      "counts": {
+        "error_exit": 0,
+        "whole_read": 0,
+        "unbounded_queue": 0,
+        "lifecycle": 1,
+        "clone_collect": 0,
+        "markers": 0
+      }
+    },
+    {
+      "path": "clients/dotnet/Agent.Client.Tests/ContractFixtures.cs",
+      "counts": {
+        "error_exit": 0,
+        "whole_read": 0,
+        "unbounded_queue": 0,
+        "lifecycle": 0,
+        "clone_collect": 0,
+        "markers": 0
+      }
+    },
+    {
+      "path": "clients/dotnet/Agent.Client.Tests/EventStreamTests.cs",
+      "counts": {
+        "error_exit": 0,
+        "whole_read": 0,
+        "unbounded_queue": 0,
+        "lifecycle": 2,
+        "clone_collect": 0,
+        "markers": 0
+      }
+    },
+    {
+      "path": "clients/dotnet/Agent.Client.Tests/FixtureConformanceTests.cs",
+      "counts": {
+        "error_exit": 0,
+        "whole_read": 0,
+        "unbounded_queue": 0,
+        "lifecycle": 1,
+        "clone_collect": 0,
+        "markers": 0
+      }
+    },
+    {
+      "path": "clients/dotnet/Agent.Client.Tests/FramingAndConnectionTests.cs",
+      "counts": {
+        "error_exit": 0,
+        "whole_read": 0,
+        "unbounded_queue": 0,
+        "lifecycle": 0,
+        "clone_collect": 0,
+        "markers": 0
+      }
+    },
+    {
+      "path": "clients/dotnet/Agent.Client.Tests/HostChainTests.cs",
+      "counts": {
+        "error_exit": 0,
+        "whole_read": 0,
+        "unbounded_queue": 0,
+        "lifecycle": 0,
+        "clone_collect": 0,
+        "markers": 0
+      }
+    },
+    {
+      "path": "clients/dotnet/Agent.Client.Tests/ResilienceTests.cs",
+      "counts": {
+        "error_exit": 0,
+        "whole_read": 0,
+        "unbounded_queue": 0,
+        "lifecycle": 3,
+        "clone_collect": 0,
+        "markers": 0
+      }
+    },
+    {
+      "path": "clients/dotnet/Agent.Client.Tests/RestoreWalkthroughTests.cs",
+      "counts": {
+        "error_exit": 0,
+        "whole_read": 0,
+        "unbounded_queue": 0,
+        "lifecycle": 2,
+        "clone_collect": 0,
+        "markers": 0
+      }
+    },
+    {
+      "path": "clients/dotnet/Agent.Client.Tests/WorkbenchBackpressureAndIdempotencyTests.cs",
+      "counts": {
+        "error_exit": 0,
+        "whole_read": 0,
+        "unbounded_queue": 3,
+        "lifecycle": 3,
+        "clone_collect": 0,
+        "markers": 0
+      }
+    },
+    {
+      "path": "clients/dotnet/Agent.Client.Tests/WorkbenchContinueCancelTests.cs",
+      "counts": {
+        "error_exit": 0,
+        "whole_read": 0,
+        "unbounded_queue": 1,
+        "lifecycle": 11,
+        "clone_collect": 0,
+        "markers": 0
+      }
+    },
+    {
+      "path": "clients/dotnet/Agent.Client.Tests/WorkbenchIntegrationTests.cs",
+      "counts": {
+        "error_exit": 0,
+        "whole_read": 0,
+        "unbounded_queue": 0,
+        "lifecycle": 0,
+        "clone_collect": 0,
+        "markers": 0
+      }
+    },
+    {
+      "path": "clients/dotnet/Agent.Client.Tests/WorkbenchLifecycleTests.cs",
+      "counts": {
+        "error_exit": 0,
+        "whole_read": 0,
+        "unbounded_queue": 0,
+        "lifecycle": 2,
+        "clone_collect": 0,
+        "markers": 0
+      }
+    },
+    {
+      "path": "clients/dotnet/Agent.Client.Tests/WorkbenchReviewTests.cs",
+      "counts": {
+        "error_exit": 0,
+        "whole_read": 0,
+        "unbounded_queue": 0,
+        "lifecycle": 1,
+        "clone_collect": 0,
+        "markers": 0
+      }
+    },
+    {
+      "path": "clients/dotnet/Agent.Client/Agent.Client.csproj",
+      "counts": {
+        "error_exit": 0,
+        "whole_read": 0,
+        "unbounded_queue": 0,
+        "lifecycle": 0,
+        "clone_collect": 0,
+        "markers": 0
+      }
+    },
+    {
+      "path": "clients/dotnet/Agent.Client/AgentConnection.cs",
+      "counts": {
+        "error_exit": 0,
+        "whole_read": 0,
+        "unbounded_queue": 0,
+        "lifecycle": 1,
+        "clone_collect": 0,
+        "markers": 0
+      }
+    },
+    {
+      "path": "clients/dotnet/Agent.Client/BoundedEventQueue.cs",
+      "counts": {
+        "error_exit": 0,
+        "whole_read": 0,
+        "unbounded_queue": 0,
+        "lifecycle": 2,
+        "clone_collect": 0,
+        "markers": 0
+      }
+    },
+    {
+      "path": "clients/dotnet/Agent.Client/DeltaCoalescer.cs",
+      "counts": {
+        "error_exit": 0,
+        "whole_read": 0,
+        "unbounded_queue": 0,
+        "lifecycle": 0,
+        "clone_collect": 0,
+        "markers": 0
+      }
+    },
+    {
+      "path": "clients/dotnet/Agent.Client/Envelope.cs",
+      "counts": {
+        "error_exit": 0,
+        "whole_read": 0,
+        "unbounded_queue": 0,
+        "lifecycle": 1,
+        "clone_collect": 0,
+        "markers": 0
+      }
+    },
+    {
+      "path": "clients/dotnet/Agent.Client/Framing.cs",
+      "counts": {
+        "error_exit": 0,
+        "whole_read": 0,
+        "unbounded_queue": 0,
+        "lifecycle": 0,
+        "clone_collect": 0,
+        "markers": 0
+      }
+    },
+    {
+      "path": "clients/dotnet/Agent.Client/IAgentConnection.cs",
+      "counts": {
+        "error_exit": 0,
+        "whole_read": 0,
+        "unbounded_queue": 0,
+        "lifecycle": 1,
+        "clone_collect": 0,
+        "markers": 0
+      }
+    },
+    {
+      "path": "clients/dotnet/Agent.Client/JsonOptions.cs",
+      "counts": {
+        "error_exit": 0,
+        "whole_read": 0,
+        "unbounded_queue": 0,
+        "lifecycle": 0,
+        "clone_collect": 0,
+        "markers": 0
+      }
+    },
+    {
+      "path": "clients/dotnet/Agent.Client/MetricsSession.cs",
+      "counts": {
+        "error_exit": 0,
+        "whole_read": 0,
+        "unbounded_queue": 0,
+        "lifecycle": 0,
+        "clone_collect": 0,
+        "markers": 0
+      }
+    },
+    {
+      "path": "clients/dotnet/Agent.Client/ProtocolDto.cs",
+      "counts": {
+        "error_exit": 0,
+        "whole_read": 0,
+        "unbounded_queue": 0,
+        "lifecycle": 0,
+        "clone_collect": 0,
+        "markers": 0
+      }
+    },
+    {
+      "path": "clients/dotnet/Agent.Client/ResumableSession.cs",
+      "counts": {
+        "error_exit": 0,
+        "whole_read": 0,
+        "unbounded_queue": 0,
+        "lifecycle": 4,
+        "clone_collect": 0,
+        "markers": 0
+      }
+    },
+    {
+      "path": "clients/dotnet/Agent.Client/Transports.cs",
+      "counts": {
+        "error_exit": 0,
+        "whole_read": 0,
+        "unbounded_queue": 0,
+        "lifecycle": 0,
+        "clone_collect": 0,
+        "markers": 0
+      }
+    },
+    {
+      "path": "clients/dotnet/Agent.Client/WorkDto.cs",
+      "counts": {
+        "error_exit": 0,
+        "whole_read": 0,
+        "unbounded_queue": 0,
+        "lifecycle": 4,
+        "clone_collect": 0,
+        "markers": 0
+      }
+    },
+    {
+      "path": "clients/dotnet/InteropSmoke/InteropSmoke.csproj",
+      "counts": {
+        "error_exit": 0,
+        "whole_read": 0,
+        "unbounded_queue": 0,
+        "lifecycle": 0,
+        "clone_collect": 0,
+        "markers": 0
+      }
+    },
+    {
+      "path": "clients/dotnet/InteropSmoke/Program.cs",
+      "counts": {
+        "error_exit": 0,
+        "whole_read": 0,
+        "unbounded_queue": 0,
+        "lifecycle": 3,
+        "clone_collect": 0,
+        "markers": 0
+      }
+    },
+    {
+      "path": "crates/agent-capability-process/Cargo.toml",
+      "counts": {
+        "error_exit": 0,
+        "whole_read": 0,
+        "unbounded_queue": 0,
+        "lifecycle": 0,
+        "clone_collect": 0,
+        "markers": 0
+      }
+    },
+    {
+      "path": "crates/agent-capability-process/src/bin/mcp_mock_server.rs",
+      "counts": {
+        "error_exit": 0,
+        "whole_read": 0,
+        "unbounded_queue": 0,
+        "lifecycle": 2,
+        "clone_collect": 0,
+        "markers": 0
+      }
+    },
+    {
+      "path": "crates/agent-capability-process/src/capability_host.rs",
+      "counts": {
+        "error_exit": 4,
+        "whole_read": 0,
+        "unbounded_queue": 1,
+        "lifecycle": 4,
+        "clone_collect": 7,
+        "markers": 0
+      }
+    },
+    {
+      "path": "crates/agent-capability-process/src/lib.rs",
+      "counts": {
+        "error_exit": 0,
+        "whole_read": 0,
+        "unbounded_queue": 0,
+        "lifecycle": 0,
+        "clone_collect": 0,
+        "markers": 0
+      }
+    },
+    {
+      "path": "crates/agent-capability-process/src/mcp.rs",
+      "counts": {
+        "error_exit": 34,
+        "whole_read": 2,
+        "unbounded_queue": 0,
+        "lifecycle": 60,
+        "clone_collect": 13,
+        "markers": 0
+      }
+    },
+    {
+      "path": "crates/agent-capability-process/tests/capability_process.rs",
+      "counts": {
+        "error_exit": 87,
+        "whole_read": 13,
+        "unbounded_queue": 2,
+        "lifecycle": 40,
+        "clone_collect": 16,
+        "markers": 0
+      }
+    },
+    {
+      "path": "crates/agent-capability-process/tests/common/mod.rs",
+      "counts": {
+        "error_exit": 0,
+        "whole_read": 0,
+        "unbounded_queue": 0,
+        "lifecycle": 0,
+        "clone_collect": 0,
+        "markers": 0
+      }
+    },
+    {
+      "path": "crates/agent-capability-process/tests/e1_mcp_loop.rs",
+      "counts": {
+        "error_exit": 16,
+        "whole_read": 1,
+        "unbounded_queue": 0,
+        "lifecycle": 5,
+        "clone_collect": 6,
+        "markers": 0
+      }
+    },
+    {
+      "path": "crates/agent-compose/Cargo.toml",
+      "counts": {
+        "error_exit": 0,
+        "whole_read": 0,
+        "unbounded_queue": 0,
+        "lifecycle": 0,
+        "clone_collect": 0,
+        "markers": 0
+      }
+    },
+    {
+      "path": "crates/agent-compose/src/bin/crash_child.rs",
+      "counts": {
+        "error_exit": 3,
+        "whole_read": 0,
+        "unbounded_queue": 0,
+        "lifecycle": 2,
+        "clone_collect": 5,
+        "markers": 0
+      }
+    },
+    {
+      "path": "crates/agent-compose/src/compactor.rs",
+      "counts": {
+        "error_exit": 12,
+        "whole_read": 0,
+        "unbounded_queue": 0,
+        "lifecycle": 5,
+        "clone_collect": 3,
+        "markers": 0
+      }
+    },
+    {
+      "path": "crates/agent-compose/src/host_policies.rs",
+      "counts": {
+        "error_exit": 26,
+        "whole_read": 0,
+        "unbounded_queue": 0,
+        "lifecycle": 1,
+        "clone_collect": 9,
+        "markers": 0
+      }
+    },
+    {
+      "path": "crates/agent-compose/src/lib.rs",
+      "counts": {
+        "error_exit": 53,
+        "whole_read": 0,
+        "unbounded_queue": 2,
+        "lifecycle": 15,
+        "clone_collect": 15,
+        "markers": 0
+      }
+    },
+    {
+      "path": "crates/agent-compose/src/mock_model.rs",
+      "counts": {
+        "error_exit": 3,
+        "whole_read": 0,
+        "unbounded_queue": 0,
+        "lifecycle": 1,
+        "clone_collect": 0,
+        "markers": 0
+      }
+    },
+    {
+      "path": "crates/agent-compose/src/proof_verifier.rs",
+      "counts": {
+        "error_exit": 0,
+        "whole_read": 0,
+        "unbounded_queue": 0,
+        "lifecycle": 1,
+        "clone_collect": 0,
+        "markers": 0
+      }
+    },
+    {
+      "path": "crates/agent-compose/tests/core3_restore_snapshot_paging.rs",
+      "counts": {
+        "error_exit": 8,
+        "whole_read": 0,
+        "unbounded_queue": 0,
+        "lifecycle": 12,
+        "clone_collect": 7,
+        "markers": 0
+      }
+    },
+    {
+      "path": "crates/agent-compose/tests/crash_resume.rs",
+      "counts": {
+        "error_exit": 40,
+        "whole_read": 5,
+        "unbounded_queue": 0,
+        "lifecycle": 16,
+        "clone_collect": 3,
+        "markers": 0
+      }
+    },
+    {
+      "path": "crates/agent-compose/tests/kv_cache_walk.rs",
+      "counts": {
+        "error_exit": 32,
+        "whole_read": 0,
+        "unbounded_queue": 0,
+        "lifecycle": 2,
+        "clone_collect": 8,
+        "markers": 0
+      }
+    },
+    {
+      "path": "crates/agent-compose/tests/kv_cache_walk/automatic.rs",
+      "counts": {
+        "error_exit": 11,
+        "whole_read": 0,
+        "unbounded_queue": 0,
+        "lifecycle": 0,
+        "clone_collect": 2,
+        "markers": 0
+      }
+    },
+    {
+      "path": "crates/agent-compose/tests/kv_cache_walk/boundary.rs",
+      "counts": {
+        "error_exit": 11,
+        "whole_read": 0,
+        "unbounded_queue": 0,
+        "lifecycle": 0,
+        "clone_collect": 3,
+        "markers": 0
+      }
+    },
+    {
+      "path": "crates/agent-compose/tests/kv_cache_walk/capability.rs",
+      "counts": {
+        "error_exit": 8,
+        "whole_read": 0,
+        "unbounded_queue": 0,
+        "lifecycle": 0,
+        "clone_collect": 3,
+        "markers": 0
+      }
+    },
+    {
+      "path": "crates/agent-compose/tests/live_walk.rs",
+      "counts": {
+        "error_exit": 7,
+        "whole_read": 4,
+        "unbounded_queue": 0,
+        "lifecycle": 11,
+        "clone_collect": 19,
+        "markers": 0
+      }
+    },
+    {
+      "path": "crates/agent-compose/tests/m16_restore.rs",
+      "counts": {
+        "error_exit": 14,
+        "whole_read": 4,
+        "unbounded_queue": 0,
+        "lifecycle": 24,
+        "clone_collect": 9,
+        "markers": 0
+      }
+    },
+    {
+      "path": "crates/agent-compose/tests/product_flow.rs",
+      "counts": {
+        "error_exit": 23,
+        "whole_read": 2,
+        "unbounded_queue": 0,
+        "lifecycle": 12,
+        "clone_collect": 5,
+        "markers": 0
+      }
+    },
+    {
+      "path": "crates/agent-compose/tests/proof_supervision.rs",
+      "counts": {
+        "error_exit": 10,
+        "whole_read": 3,
+        "unbounded_queue": 0,
+        "lifecycle": 0,
+        "clone_collect": 0,
+        "markers": 0
+      }
+    },
+    {
+      "path": "crates/agent-compose/tests/route_flow.rs",
+      "counts": {
+        "error_exit": 30,
+        "whole_read": 1,
+        "unbounded_queue": 0,
+        "lifecycle": 15,
+        "clone_collect": 4,
+        "markers": 0
+      }
+    },
+    {
+      "path": "crates/agent-compose/tests/supervision_gate.rs",
+      "counts": {
+        "error_exit": 22,
+        "whole_read": 0,
+        "unbounded_queue": 0,
+        "lifecycle": 1,
+        "clone_collect": 3,
+        "markers": 0
+      }
+    },
+    {
+      "path": "crates/agent-conformance/Cargo.toml",
+      "counts": {
+        "error_exit": 0,
+        "whole_read": 0,
+        "unbounded_queue": 0,
+        "lifecycle": 0,
+        "clone_collect": 0,
+        "markers": 0
+      }
+    },
+    {
+      "path": "crates/agent-conformance/src/checks.rs",
+      "counts": {
+        "error_exit": 5,
+        "whole_read": 0,
+        "unbounded_queue": 1,
+        "lifecycle": 3,
+        "clone_collect": 16,
+        "markers": 0
+      }
+    },
+    {
+      "path": "crates/agent-conformance/src/lib.rs",
+      "counts": {
+        "error_exit": 0,
+        "whole_read": 0,
+        "unbounded_queue": 1,
+        "lifecycle": 0,
+        "clone_collect": 0,
+        "markers": 0
+      }
+    },
+    {
+      "path": "crates/agent-conformance/src/report.rs",
+      "counts": {
+        "error_exit": 0,
+        "whole_read": 0,
+        "unbounded_queue": 0,
+        "lifecycle": 0,
+        "clone_collect": 0,
+        "markers": 0
+      }
+    },
+    {
+      "path": "crates/agent-conformance/tests/adapter_fault_matrix.rs",
+      "counts": {
+        "error_exit": 26,
+        "whole_read": 0,
+        "unbounded_queue": 0,
+        "lifecycle": 10,
+        "clone_collect": 2,
+        "markers": 0
+      }
+    },
+    {
+      "path": "crates/agent-conformance/tests/builtin.rs",
+      "counts": {
+        "error_exit": 23,
+        "whole_read": 0,
+        "unbounded_queue": 0,
+        "lifecycle": 1,
+        "clone_collect": 7,
+        "markers": 0
+      }
+    },
+    {
+      "path": "crates/agent-conformance/tests/dependency_boundaries.rs",
+      "counts": {
+        "error_exit": 14,
+        "whole_read": 2,
+        "unbounded_queue": 0,
+        "lifecycle": 0,
+        "clone_collect": 10,
+        "markers": 0
+      }
+    },
+    {
+      "path": "crates/agent-context-service/Cargo.toml",
+      "counts": {
+        "error_exit": 0,
+        "whole_read": 0,
+        "unbounded_queue": 0,
+        "lifecycle": 0,
+        "clone_collect": 0,
+        "markers": 0
+      }
+    },
+    {
+      "path": "crates/agent-context-service/src/lib.rs",
+      "counts": {
+        "error_exit": 14,
+        "whole_read": 0,
+        "unbounded_queue": 0,
+        "lifecycle": 6,
+        "clone_collect": 2,
+        "markers": 0
+      }
+    },
+    {
+      "path": "crates/agent-context-service/src/main.rs",
+      "counts": {
+        "error_exit": 2,
+        "whole_read": 0,
+        "unbounded_queue": 0,
+        "lifecycle": 0,
+        "clone_collect": 1,
+        "markers": 0
+      }
+    },
+    {
+      "path": "crates/agent-context-service/tests/service.rs",
+      "counts": {
+        "error_exit": 0,
+        "whole_read": 0,
+        "unbounded_queue": 0,
+        "lifecycle": 0,
+        "clone_collect": 0,
+        "markers": 0
+      }
+    },
+    {
+      "path": "crates/agent-contracts/Cargo.toml",
+      "counts": {
+        "error_exit": 0,
+        "whole_read": 0,
+        "unbounded_queue": 0,
+        "lifecycle": 0,
+        "clone_collect": 0,
+        "markers": 0
+      }
+    },
+    {
+      "path": "crates/agent-contracts/src/approval.rs",
+      "counts": {
+        "error_exit": 2,
+        "whole_read": 0,
+        "unbounded_queue": 0,
+        "lifecycle": 2,
+        "clone_collect": 0,
+        "markers": 0
+      }
+    },
+    {
+      "path": "crates/agent-contracts/src/artifact.rs",
+      "counts": {
+        "error_exit": 8,
+        "whole_read": 0,
+        "unbounded_queue": 0,
+        "lifecycle": 1,
+        "clone_collect": 2,
+        "markers": 0
+      }
+    },
+    {
+      "path": "crates/agent-contracts/src/cancellation.rs",
+      "counts": {
+        "error_exit": 0,
+        "whole_read": 0,
+        "unbounded_queue": 0,
+        "lifecycle": 3,
+        "clone_collect": 0,
+        "markers": 0
+      }
+    },
+    {
+      "path": "crates/agent-contracts/src/capability.rs",
+      "counts": {
+        "error_exit": 7,
+        "whole_read": 0,
+        "unbounded_queue": 0,
+        "lifecycle": 1,
+        "clone_collect": 7,
+        "markers": 0
+      }
+    },
+    {
+      "path": "crates/agent-contracts/src/compaction.rs",
+      "counts": {
+        "error_exit": 0,
+        "whole_read": 0,
+        "unbounded_queue": 0,
+        "lifecycle": 0,
+        "clone_collect": 1,
+        "markers": 0
+      }
+    },
+    {
+      "path": "crates/agent-contracts/src/context.rs",
+      "counts": {
+        "error_exit": 15,
+        "whole_read": 0,
+        "unbounded_queue": 5,
+        "lifecycle": 44,
+        "clone_collect": 20,
+        "markers": 0
+      }
+    },
+    {
+      "path": "crates/agent-contracts/src/discovery.rs",
+      "counts": {
+        "error_exit": 4,
+        "whole_read": 0,
+        "unbounded_queue": 0,
+        "lifecycle": 4,
+        "clone_collect": 18,
+        "markers": 0
+      }
+    },
+    {
+      "path": "crates/agent-contracts/src/error.rs",
+      "counts": {
+        "error_exit": 1,
+        "whole_read": 0,
+        "unbounded_queue": 1,
+        "lifecycle": 0,
+        "clone_collect": 0,
+        "markers": 0
+      }
+    },
+    {
+      "path": "crates/agent-contracts/src/event.rs",
+      "counts": {
+        "error_exit": 0,
+        "whole_read": 0,
+        "unbounded_queue": 0,
+        "lifecycle": 24,
+        "clone_collect": 1,
+        "markers": 0
+      }
+    },
+    {
+      "path": "crates/agent-contracts/src/execution_facts.rs",
+      "counts": {
+        "error_exit": 11,
+        "whole_read": 0,
+        "unbounded_queue": 0,
+        "lifecycle": 0,
+        "clone_collect": 5,
+        "markers": 0
+      }
+    },
+    {
+      "path": "crates/agent-contracts/src/host_policy.rs",
+      "counts": {
+        "error_exit": 0,
+        "whole_read": 0,
+        "unbounded_queue": 0,
+        "lifecycle": 1,
+        "clone_collect": 0,
+        "markers": 0
+      }
+    },
+    {
+      "path": "crates/agent-contracts/src/ids.rs",
+      "counts": {
+        "error_exit": 6,
+        "whole_read": 0,
+        "unbounded_queue": 0,
+        "lifecycle": 0,
+        "clone_collect": 0,
+        "markers": 0
+      }
+    },
+    {
+      "path": "crates/agent-contracts/src/input.rs",
+      "counts": {
+        "error_exit": 7,
+        "whole_read": 0,
+        "unbounded_queue": 1,
+        "lifecycle": 2,
+        "clone_collect": 2,
+        "markers": 0
+      }
+    },
+    {
+      "path": "crates/agent-contracts/src/jcs.rs",
+      "counts": {
+        "error_exit": 6,
+        "whole_read": 0,
+        "unbounded_queue": 0,
+        "lifecycle": 0,
+        "clone_collect": 2,
+        "markers": 0
+      }
+    },
+    {
+      "path": "crates/agent-contracts/src/label.rs",
+      "counts": {
+        "error_exit": 6,
+        "whole_read": 0,
+        "unbounded_queue": 0,
+        "lifecycle": 1,
+        "clone_collect": 0,
+        "markers": 0
+      }
+    },
+    {
+      "path": "crates/agent-contracts/src/lib.rs",
+      "counts": {
+        "error_exit": 0,
+        "whole_read": 0,
+        "unbounded_queue": 0,
+        "lifecycle": 0,
+        "clone_collect": 0,
+        "markers": 0
+      }
+    },
+    {
+      "path": "crates/agent-contracts/src/model.rs",
+      "counts": {
+        "error_exit": 19,
+        "whole_read": 0,
+        "unbounded_queue": 0,
+        "lifecycle": 47,
+        "clone_collect": 17,
+        "markers": 0
+      }
+    },
+    {
+      "path": "crates/agent-contracts/src/model_cache.rs",
+      "counts": {
+        "error_exit": 1,
+        "whole_read": 0,
+        "unbounded_queue": 0,
+        "lifecycle": 1,
+        "clone_collect": 1,
+        "markers": 0
+      }
+    },
+    {
+      "path": "crates/agent-contracts/src/model_cache/tests.rs",
+      "counts": {
+        "error_exit": 9,
+        "whole_read": 0,
+        "unbounded_queue": 0,
+        "lifecycle": 0,
+        "clone_collect": 11,
+        "markers": 0
+      }
+    },
+    {
+      "path": "crates/agent-contracts/src/operation.rs",
+      "counts": {
+        "error_exit": 16,
+        "whole_read": 0,
+        "unbounded_queue": 0,
+        "lifecycle": 12,
+        "clone_collect": 2,
+        "markers": 0
+      }
+    },
+    {
+      "path": "crates/agent-contracts/src/plugin.rs",
+      "counts": {
+        "error_exit": 0,
+        "whole_read": 0,
+        "unbounded_queue": 0,
+        "lifecycle": 1,
+        "clone_collect": 0,
+        "markers": 0
+      }
+    },
+    {
+      "path": "crates/agent-contracts/src/runtime.rs",
+      "counts": {
+        "error_exit": 0,
+        "whole_read": 0,
+        "unbounded_queue": 0,
+        "lifecycle": 3,
+        "clone_collect": 0,
+        "markers": 0
+      }
+    },
+    {
+      "path": "crates/agent-contracts/src/runtime_facts.rs",
+      "counts": {
+        "error_exit": 0,
+        "whole_read": 0,
+        "unbounded_queue": 0,
+        "lifecycle": 1,
+        "clone_collect": 3,
+        "markers": 0
+      }
+    },
+    {
+      "path": "crates/agent-contracts/src/schema_profile.rs",
+      "counts": {
+        "error_exit": 7,
+        "whole_read": 0,
+        "unbounded_queue": 2,
+        "lifecycle": 0,
+        "clone_collect": 8,
+        "markers": 0
+      }
+    },
+    {
+      "path": "crates/agent-contracts/src/search.rs",
+      "counts": {
+        "error_exit": 0,
+        "whole_read": 0,
+        "unbounded_queue": 0,
+        "lifecycle": 4,
+        "clone_collect": 5,
+        "markers": 0
+      }
+    },
+    {
+      "path": "crates/agent-contracts/src/tokens.rs",
+      "counts": {
+        "error_exit": 0,
+        "whole_read": 0,
+        "unbounded_queue": 0,
+        "lifecycle": 0,
+        "clone_collect": 0,
+        "markers": 0
+      }
+    },
+    {
+      "path": "crates/agent-contracts/src/tool.rs",
+      "counts": {
+        "error_exit": 11,
+        "whole_read": 0,
+        "unbounded_queue": 1,
+        "lifecycle": 9,
+        "clone_collect": 67,
+        "markers": 0
+      }
+    },
+    {
+      "path": "crates/agent-core/Cargo.toml",
+      "counts": {
+        "error_exit": 0,
+        "whole_read": 0,
+        "unbounded_queue": 0,
+        "lifecycle": 0,
+        "clone_collect": 0,
+        "markers": 0
+      }
+    },
+    {
+      "path": "crates/agent-core/src/approval.rs",
+      "counts": {
+        "error_exit": 52,
+        "whole_read": 0,
+        "unbounded_queue": 0,
+        "lifecycle": 14,
+        "clone_collect": 39,
+        "markers": 0
+      }
+    },
+    {
+      "path": "crates/agent-core/src/authority.rs",
+      "counts": {
+        "error_exit": 22,
+        "whole_read": 0,
+        "unbounded_queue": 0,
+        "lifecycle": 6,
+        "clone_collect": 12,
+        "markers": 0
+      }
+    },
+    {
+      "path": "crates/agent-core/src/bin/broker_host.rs",
+      "counts": {
+        "error_exit": 0,
+        "whole_read": 0,
+        "unbounded_queue": 0,
+        "lifecycle": 1,
+        "clone_collect": 0,
+        "markers": 0
+      }
+    },
+    {
+      "path": "crates/agent-core/src/bin/coordinator_fake.rs",
+      "counts": {
+        "error_exit": 0,
+        "whole_read": 0,
+        "unbounded_queue": 0,
+        "lifecycle": 2,
+        "clone_collect": 0,
+        "markers": 0
+      }
+    },
+    {
+      "path": "crates/agent-core/src/broker.rs",
+      "counts": {
+        "error_exit": 54,
+        "whole_read": 0,
+        "unbounded_queue": 0,
+        "lifecycle": 12,
+        "clone_collect": 20,
+        "markers": 0
+      }
+    },
+    {
+      "path": "crates/agent-core/src/capability_admission.rs",
+      "counts": {
+        "error_exit": 2,
+        "whole_read": 0,
+        "unbounded_queue": 0,
+        "lifecycle": 0,
+        "clone_collect": 4,
+        "markers": 0
+      }
+    },
+    {
+      "path": "crates/agent-core/src/capability_state.rs",
+      "counts": {
+        "error_exit": 21,
+        "whole_read": 0,
+        "unbounded_queue": 0,
+        "lifecycle": 6,
+        "clone_collect": 3,
+        "markers": 0
+      }
+    },
+    {
+      "path": "crates/agent-core/src/crash.rs",
+      "counts": {
+        "error_exit": 0,
+        "whole_read": 0,
+        "unbounded_queue": 0,
+        "lifecycle": 0,
+        "clone_collect": 1,
+        "markers": 0
+      }
+    },
+    {
+      "path": "crates/agent-core/src/kernel/mod.rs",
+      "counts": {
+        "error_exit": 10,
+        "whole_read": 0,
+        "unbounded_queue": 0,
+        "lifecycle": 35,
+        "clone_collect": 38,
+        "markers": 0
+      }
+    },
+    {
+      "path": "crates/agent-core/src/kernel/tests.rs",
+      "counts": {
+        "error_exit": 32,
+        "whole_read": 0,
+        "unbounded_queue": 0,
+        "lifecycle": 2,
+        "clone_collect": 35,
+        "markers": 0
+      }
+    },
+    {
+      "path": "crates/agent-core/src/lib.rs",
+      "counts": {
+        "error_exit": 0,
+        "whole_read": 0,
+        "unbounded_queue": 0,
+        "lifecycle": 0,
+        "clone_collect": 0,
+        "markers": 0
+      }
+    },
+    {
+      "path": "crates/agent-core/src/operation.rs",
+      "counts": {
+        "error_exit": 68,
+        "whole_read": 0,
+        "unbounded_queue": 0,
+        "lifecycle": 6,
+        "clone_collect": 30,
+        "markers": 0
+      }
+    },
+    {
+      "path": "crates/agent-core/src/plugin_admission.rs",
+      "counts": {
+        "error_exit": 5,
+        "whole_read": 0,
+        "unbounded_queue": 0,
+        "lifecycle": 0,
+        "clone_collect": 2,
+        "markers": 0
+      }
+    },
+    {
+      "path": "crates/agent-core/src/plugin_state.rs",
+      "counts": {
+        "error_exit": 9,
+        "whole_read": 0,
+        "unbounded_queue": 0,
+        "lifecycle": 0,
+        "clone_collect": 0,
+        "markers": 0
+      }
+    },
+    {
+      "path": "crates/agent-core/src/port.rs",
+      "counts": {
+        "error_exit": 83,
+        "whole_read": 0,
+        "unbounded_queue": 0,
+        "lifecycle": 21,
+        "clone_collect": 76,
+        "markers": 0
+      }
+    },
+    {
+      "path": "crates/agent-core/tests/broker_host_coordinator.rs",
+      "counts": {
+        "error_exit": 63,
+        "whole_read": 0,
+        "unbounded_queue": 0,
+        "lifecycle": 12,
+        "clone_collect": 3,
+        "markers": 0
+      }
+    },
+    {
+      "path": "crates/agent-eval/Cargo.toml",
+      "counts": {
+        "error_exit": 0,
+        "whole_read": 0,
+        "unbounded_queue": 0,
+        "lifecycle": 0,
+        "clone_collect": 0,
+        "markers": 0
+      }
+    },
+    {
+      "path": "crates/agent-eval/context-bench/checks/env_wins.py",
+      "counts": {
+        "error_exit": 0,
+        "whole_read": 0,
+        "unbounded_queue": 0,
+        "lifecycle": 0,
+        "clone_collect": 0,
+        "markers": 0
+      }
+    },
+    {
+      "path": "crates/agent-eval/context-bench/checks/fallback_anonymous.py",
+      "counts": {
+        "error_exit": 0,
+        "whole_read": 0,
+        "unbounded_queue": 0,
+        "lifecycle": 0,
+        "clone_collect": 0,
+        "markers": 0
+      }
+    },
+    {
+      "path": "crates/agent-eval/context-bench/checks/index_fix.py",
+      "counts": {
+        "error_exit": 0,
+        "whole_read": 0,
+        "unbounded_queue": 0,
+        "lifecycle": 0,
+        "clone_collect": 0,
+        "markers": 0
+      }
+    },
+    {
+      "path": "crates/agent-eval/context-bench/checks/switch_resume.py",
+      "counts": {
+        "error_exit": 0,
+        "whole_read": 0,
+        "unbounded_queue": 0,
+        "lifecycle": 0,
+        "clone_collect": 0,
+        "markers": 0
+      }
+    },
+    {
+      "path": "crates/agent-eval/context-bench/checks/token_now.py",
+      "counts": {
+        "error_exit": 0,
+        "whole_read": 0,
+        "unbounded_queue": 0,
+        "lifecycle": 0,
+        "clone_collect": 0,
+        "markers": 0
+      }
+    },
+    {
+      "path": "crates/agent-eval/context-bench/checks/wire_v1.py",
+      "counts": {
+        "error_exit": 0,
+        "whole_read": 0,
+        "unbounded_queue": 0,
+        "lifecycle": 0,
+        "clone_collect": 0,
+        "markers": 0
+      }
+    },
+    {
+      "path": "crates/agent-eval/context-bench/golden/horizon_long/src/auth.rs",
+      "counts": {
+        "error_exit": 0,
+        "whole_read": 0,
+        "unbounded_queue": 0,
+        "lifecycle": 0,
+        "clone_collect": 0,
+        "markers": 0
+      }
+    },
+    {
+      "path": "crates/agent-eval/context-bench/golden/horizon_long/src/session.rs",
+      "counts": {
+        "error_exit": 0,
+        "whole_read": 0,
+        "unbounded_queue": 0,
+        "lifecycle": 0,
+        "clone_collect": 0,
+        "markers": 0
+      }
+    },
+    {
+      "path": "crates/agent-eval/context-bench/golden/horizon_long/src/tests.rs",
+      "counts": {
+        "error_exit": 0,
+        "whole_read": 0,
+        "unbounded_queue": 0,
+        "lifecycle": 0,
+        "clone_collect": 0,
+        "markers": 0
+      }
+    },
+    {
+      "path": "crates/agent-eval/context-bench/golden/horizon_long/src/token.rs",
+      "counts": {
+        "error_exit": 0,
+        "whole_read": 0,
+        "unbounded_queue": 0,
+        "lifecycle": 0,
+        "clone_collect": 0,
+        "markers": 0
+      }
+    },
+    {
+      "path": "crates/agent-eval/context-bench/golden/horizon_short/src/auth.rs",
+      "counts": {
+        "error_exit": 0,
+        "whole_read": 0,
+        "unbounded_queue": 0,
+        "lifecycle": 0,
+        "clone_collect": 0,
+        "markers": 0
+      }
+    },
+    {
+      "path": "crates/agent-eval/context-bench/golden/horizon_short/src/session.rs",
+      "counts": {
+        "error_exit": 0,
+        "whole_read": 0,
+        "unbounded_queue": 0,
+        "lifecycle": 0,
+        "clone_collect": 0,
+        "markers": 0
+      }
+    },
+    {
+      "path": "crates/agent-eval/context-bench/golden/horizon_short/src/tests.rs",
+      "counts": {
+        "error_exit": 0,
+        "whole_read": 0,
+        "unbounded_queue": 0,
+        "lifecycle": 0,
+        "clone_collect": 0,
+        "markers": 0
+      }
+    },
+    {
+      "path": "crates/agent-eval/context-bench/golden/horizon_short/src/token.rs",
+      "counts": {
+        "error_exit": 0,
+        "whole_read": 0,
+        "unbounded_queue": 0,
+        "lifecycle": 0,
+        "clone_collect": 0,
+        "markers": 0
+      }
+    },
+    {
+      "path": "crates/agent-eval/context-bench/golden/long_refactor/src/auth.rs",
+      "counts": {
+        "error_exit": 0,
+        "whole_read": 0,
+        "unbounded_queue": 0,
+        "lifecycle": 0,
+        "clone_collect": 0,
+        "markers": 0
+      }
+    },
+    {
+      "path": "crates/agent-eval/context-bench/golden/long_refactor/src/session.rs",
+      "counts": {
+        "error_exit": 0,
+        "whole_read": 0,
+        "unbounded_queue": 0,
+        "lifecycle": 0,
+        "clone_collect": 0,
+        "markers": 0
+      }
+    },
+    {
+      "path": "crates/agent-eval/context-bench/golden/long_refactor/src/tests.rs",
+      "counts": {
+        "error_exit": 0,
+        "whole_read": 0,
+        "unbounded_queue": 0,
+        "lifecycle": 0,
+        "clone_collect": 0,
+        "markers": 0
+      }
+    },
+    {
+      "path": "crates/agent-eval/context-bench/golden/long_refactor/src/token.rs",
+      "counts": {
+        "error_exit": 0,
+        "whole_read": 0,
+        "unbounded_queue": 0,
+        "lifecycle": 0,
+        "clone_collect": 0,
+        "markers": 0
+      }
+    },
+    {
+      "path": "crates/agent-eval/context-bench/golden/long_refactor_relitigate/src/auth.rs",
+      "counts": {
+        "error_exit": 0,
+        "whole_read": 0,
+        "unbounded_queue": 0,
+        "lifecycle": 0,
+        "clone_collect": 0,
+        "markers": 0
+      }
+    },
+    {
+      "path": "crates/agent-eval/context-bench/golden/long_refactor_relitigate/src/session.rs",
+      "counts": {
+        "error_exit": 0,
+        "whole_read": 0,
+        "unbounded_queue": 0,
+        "lifecycle": 0,
+        "clone_collect": 0,
+        "markers": 0
+      }
+    },
+    {
+      "path": "crates/agent-eval/context-bench/golden/long_refactor_relitigate/src/tests.rs",
+      "counts": {
+        "error_exit": 0,
+        "whole_read": 0,
+        "unbounded_queue": 0,
+        "lifecycle": 0,
+        "clone_collect": 0,
+        "markers": 0
+      }
+    },
+    {
+      "path": "crates/agent-eval/context-bench/golden/long_refactor_relitigate/src/token.rs",
+      "counts": {
+        "error_exit": 0,
+        "whole_read": 0,
+        "unbounded_queue": 0,
+        "lifecycle": 0,
+        "clone_collect": 0,
+        "markers": 0
+      }
+    },
+    {
+      "path": "crates/agent-eval/context-bench/golden/noise_recovery/src/parse.rs",
+      "counts": {
+        "error_exit": 0,
+        "whole_read": 0,
+        "unbounded_queue": 0,
+        "lifecycle": 0,
+        "clone_collect": 0,
+        "markers": 0
+      }
+    },
+    {
+      "path": "crates/agent-eval/context-bench/golden/noise_repeat_fail/src/parse.rs",
+      "counts": {
+        "error_exit": 0,
+        "whole_read": 0,
+        "unbounded_queue": 0,
+        "lifecycle": 0,
+        "clone_collect": 0,
+        "markers": 0
+      }
+    },
+    {
+      "path": "crates/agent-eval/context-bench/golden/semantic_recall/src/protocol.rs",
+      "counts": {
+        "error_exit": 0,
+        "whole_read": 0,
+        "unbounded_queue": 0,
+        "lifecycle": 0,
+        "clone_collect": 0,
+        "markers": 0
+      }
+    },
+    {
+      "path": "crates/agent-eval/context-bench/golden/semantic_recall_fallback/src/store.rs",
+      "counts": {
+        "error_exit": 0,
+        "whole_read": 0,
+        "unbounded_queue": 0,
+        "lifecycle": 0,
+        "clone_collect": 0,
+        "markers": 0
+      }
+    },
+    {
+      "path": "crates/agent-eval/context-bench/golden/supersession/src/config.rs",
+      "counts": {
+        "error_exit": 0,
+        "whole_read": 0,
+        "unbounded_queue": 0,
+        "lifecycle": 0,
+        "clone_collect": 0,
+        "markers": 0
+      }
+    },
+    {
+      "path": "crates/agent-eval/context-bench/golden/supersession_leak/src/config.rs",
+      "counts": {
+        "error_exit": 0,
+        "whole_read": 0,
+        "unbounded_queue": 0,
+        "lifecycle": 0,
+        "clone_collect": 0,
+        "markers": 0
+      }
+    },
+    {
+      "path": "crates/agent-eval/context-bench/golden/task_switch/src/auth.rs",
+      "counts": {
+        "error_exit": 0,
+        "whole_read": 0,
+        "unbounded_queue": 0,
+        "lifecycle": 0,
+        "clone_collect": 0,
+        "markers": 0
+      }
+    },
+    {
+      "path": "crates/agent-eval/context-bench/golden/task_switch/src/billing.rs",
+      "counts": {
+        "error_exit": 0,
+        "whole_read": 0,
+        "unbounded_queue": 0,
+        "lifecycle": 0,
+        "clone_collect": 0,
+        "markers": 0
+      }
+    },
+    {
+      "path": "crates/agent-eval/context-bench/golden/task_switch_long_b/src/auth.rs",
+      "counts": {
+        "error_exit": 0,
+        "whole_read": 0,
+        "unbounded_queue": 0,
+        "lifecycle": 0,
+        "clone_collect": 0,
+        "markers": 0
+      }
+    },
+    {
+      "path": "crates/agent-eval/context-bench/golden/task_switch_long_b/src/billing.rs",
+      "counts": {
+        "error_exit": 0,
+        "whole_read": 0,
+        "unbounded_queue": 0,
+        "lifecycle": 0,
+        "clone_collect": 0,
+        "markers": 0
+      }
+    },
+    {
+      "path": "crates/agent-eval/context-bench/seeds/authbox/src/auth.rs",
+      "counts": {
+        "error_exit": 0,
+        "whole_read": 0,
+        "unbounded_queue": 0,
+        "lifecycle": 0,
+        "clone_collect": 0,
+        "markers": 0
+      }
+    },
+    {
+      "path": "crates/agent-eval/context-bench/seeds/authbox/src/session.rs",
+      "counts": {
+        "error_exit": 0,
+        "whole_read": 0,
+        "unbounded_queue": 0,
+        "lifecycle": 0,
+        "clone_collect": 0,
+        "markers": 0
+      }
+    },
+    {
+      "path": "crates/agent-eval/context-bench/seeds/authbox/src/tests.rs",
+      "counts": {
+        "error_exit": 0,
+        "whole_read": 0,
+        "unbounded_queue": 0,
+        "lifecycle": 0,
+        "clone_collect": 0,
+        "markers": 0
+      }
+    },
+    {
+      "path": "crates/agent-eval/context-bench/seeds/authbox/src/token.rs",
+      "counts": {
+        "error_exit": 0,
+        "whole_read": 0,
+        "unbounded_queue": 0,
+        "lifecycle": 0,
+        "clone_collect": 0,
+        "markers": 0
+      }
+    },
+    {
+      "path": "crates/agent-eval/context-bench/seeds/config/src/config.rs",
+      "counts": {
+        "error_exit": 0,
+        "whole_read": 0,
+        "unbounded_queue": 0,
+        "lifecycle": 0,
+        "clone_collect": 0,
+        "markers": 0
+      }
+    },
+    {
+      "path": "crates/agent-eval/context-bench/seeds/config_leak/src/config.rs",
+      "counts": {
+        "error_exit": 0,
+        "whole_read": 0,
+        "unbounded_queue": 0,
+        "lifecycle": 0,
+        "clone_collect": 0,
+        "markers": 0
+      }
+    },
+    {
+      "path": "crates/agent-eval/context-bench/seeds/fallback/src/store.rs",
+      "counts": {
+        "error_exit": 0,
+        "whole_read": 0,
+        "unbounded_queue": 0,
+        "lifecycle": 0,
+        "clone_collect": 0,
+        "markers": 0
+      }
+    },
+    {
+      "path": "crates/agent-eval/context-bench/seeds/noise/src/dump.rs",
+      "counts": {
+        "error_exit": 0,
+        "whole_read": 0,
+        "unbounded_queue": 0,
+        "lifecycle": 0,
+        "clone_collect": 0,
+        "markers": 0
+      }
+    },
+    {
+      "path": "crates/agent-eval/context-bench/seeds/noise/src/parse.rs",
+      "counts": {
+        "error_exit": 0,
+        "whole_read": 0,
+        "unbounded_queue": 0,
+        "lifecycle": 0,
+        "clone_collect": 0,
+        "markers": 0
+      }
+    },
+    {
+      "path": "crates/agent-eval/context-bench/seeds/protocol/src/protocol.rs",
+      "counts": {
+        "error_exit": 0,
+        "whole_read": 0,
+        "unbounded_queue": 0,
+        "lifecycle": 0,
+        "clone_collect": 0,
+        "markers": 0
+      }
+    },
+    {
+      "path": "crates/agent-eval/context-bench/seeds/switch/src/auth.rs",
+      "counts": {
+        "error_exit": 0,
+        "whole_read": 0,
+        "unbounded_queue": 0,
+        "lifecycle": 0,
+        "clone_collect": 0,
+        "markers": 0
+      }
+    },
+    {
+      "path": "crates/agent-eval/context-bench/seeds/switch/src/billing.rs",
+      "counts": {
+        "error_exit": 0,
+        "whole_read": 0,
+        "unbounded_queue": 0,
+        "lifecycle": 0,
+        "clone_collect": 0,
+        "markers": 0
+      }
+    },
+    {
+      "path": "crates/agent-eval/context-mech/checks/index_fix.py",
+      "counts": {
+        "error_exit": 0,
+        "whole_read": 0,
+        "unbounded_queue": 0,
+        "lifecycle": 0,
+        "clone_collect": 0,
+        "markers": 0
+      }
+    },
+    {
+      "path": "crates/agent-eval/context-mech/checks/switch_resume.py",
+      "counts": {
+        "error_exit": 0,
+        "whole_read": 0,
+        "unbounded_queue": 0,
+        "lifecycle": 0,
+        "clone_collect": 0,
+        "markers": 0
+      }
+    },
+    {
+      "path": "crates/agent-eval/context-mech/checks/wire_v1.py",
+      "counts": {
+        "error_exit": 0,
+        "whole_read": 0,
+        "unbounded_queue": 0,
+        "lifecycle": 0,
+        "clone_collect": 0,
+        "markers": 0
+      }
+    },
+    {
+      "path": "crates/agent-eval/context-mech/golden/late_semantic_constraint/src/protocol.rs",
+      "counts": {
+        "error_exit": 0,
+        "whole_read": 0,
+        "unbounded_queue": 0,
+        "lifecycle": 0,
+        "clone_collect": 0,
+        "markers": 0
+      }
+    },
+    {
+      "path": "crates/agent-eval/context-mech/golden/no_semantic_episode/src/parse.rs",
+      "counts": {
+        "error_exit": 0,
+        "whole_read": 0,
+        "unbounded_queue": 0,
+        "lifecycle": 0,
+        "clone_collect": 0,
+        "markers": 0
+      }
+    },
+    {
+      "path": "crates/agent-eval/context-mech/golden/resume_operational_state/src/auth.rs",
+      "counts": {
+        "error_exit": 0,
+        "whole_read": 0,
+        "unbounded_queue": 0,
+        "lifecycle": 0,
+        "clone_collect": 0,
+        "markers": 0
+      }
+    },
+    {
+      "path": "crates/agent-eval/context-mech/golden/resume_operational_state/src/billing.rs",
+      "counts": {
+        "error_exit": 0,
+        "whole_read": 0,
+        "unbounded_queue": 0,
+        "lifecycle": 0,
+        "clone_collect": 0,
+        "markers": 0
+      }
+    },
+    {
+      "path": "crates/agent-eval/context-mech/seeds/noise/src/dump.rs",
+      "counts": {
+        "error_exit": 0,
+        "whole_read": 0,
+        "unbounded_queue": 0,
+        "lifecycle": 0,
+        "clone_collect": 0,
+        "markers": 0
+      }
+    },
+    {
+      "path": "crates/agent-eval/context-mech/seeds/noise/src/parse.rs",
+      "counts": {
+        "error_exit": 0,
+        "whole_read": 0,
+        "unbounded_queue": 0,
+        "lifecycle": 0,
+        "clone_collect": 0,
+        "markers": 0
+      }
+    },
+    {
+      "path": "crates/agent-eval/context-mech/seeds/protocol/src/protocol.rs",
+      "counts": {
+        "error_exit": 0,
+        "whole_read": 0,
+        "unbounded_queue": 0,
+        "lifecycle": 0,
+        "clone_collect": 0,
+        "markers": 0
+      }
+    },
+    {
+      "path": "crates/agent-eval/context-mech/seeds/switch/src/auth.rs",
+      "counts": {
+        "error_exit": 0,
+        "whole_read": 0,
+        "unbounded_queue": 0,
+        "lifecycle": 0,
+        "clone_collect": 0,
+        "markers": 0
+      }
+    },
+    {
+      "path": "crates/agent-eval/context-mech/seeds/switch/src/billing.rs",
+      "counts": {
+        "error_exit": 0,
+        "whole_read": 0,
+        "unbounded_queue": 0,
+        "lifecycle": 0,
+        "clone_collect": 0,
+        "markers": 0
+      }
+    },
+    {
+      "path": "crates/agent-eval/longflow/checks/wire_v1.py",
+      "counts": {
+        "error_exit": 0,
+        "whole_read": 0,
+        "unbounded_queue": 0,
+        "lifecycle": 0,
+        "clone_collect": 0,
+        "markers": 0
+      }
+    },
+    {
+      "path": "crates/agent-eval/longflow/seeds/protocol/src/protocol.rs",
+      "counts": {
+        "error_exit": 0,
+        "whole_read": 0,
+        "unbounded_queue": 0,
+        "lifecycle": 0,
+        "clone_collect": 0,
+        "markers": 0
+      }
+    },
+    {
+      "path": "crates/agent-eval/scripts/gen_context_bench.py",
+      "counts": {
+        "error_exit": 0,
+        "whole_read": 0,
+        "unbounded_queue": 0,
+        "lifecycle": 0,
+        "clone_collect": 0,
+        "markers": 0
+      }
+    },
+    {
+      "path": "crates/agent-eval/scripts/run_swebench_gold.py",
+      "counts": {
+        "error_exit": 0,
+        "whole_read": 0,
+        "unbounded_queue": 0,
+        "lifecycle": 0,
+        "clone_collect": 0,
+        "markers": 0
+      }
+    },
+    {
+      "path": "crates/agent-eval/src/acceptance.rs",
+      "counts": {
+        "error_exit": 2,
+        "whole_read": 0,
+        "unbounded_queue": 0,
+        "lifecycle": 0,
+        "clone_collect": 11,
+        "markers": 0
+      }
+    },
+    {
+      "path": "crates/agent-eval/src/analysis.rs",
+      "counts": {
+        "error_exit": 12,
+        "whole_read": 3,
+        "unbounded_queue": 0,
+        "lifecycle": 0,
+        "clone_collect": 10,
+        "markers": 0
+      }
+    },
+    {
+      "path": "crates/agent-eval/src/bundle.rs",
+      "counts": {
+        "error_exit": 53,
+        "whole_read": 10,
+        "unbounded_queue": 0,
+        "lifecycle": 0,
+        "clone_collect": 13,
+        "markers": 0
+      }
+    },
+    {
+      "path": "crates/agent-eval/src/context_bench.rs",
+      "counts": {
+        "error_exit": 21,
+        "whole_read": 5,
+        "unbounded_queue": 0,
+        "lifecycle": 0,
+        "clone_collect": 10,
+        "markers": 0
+      }
+    },
+    {
+      "path": "crates/agent-eval/src/context_mech.rs",
+      "counts": {
+        "error_exit": 3,
+        "whole_read": 3,
+        "unbounded_queue": 0,
+        "lifecycle": 0,
+        "clone_collect": 2,
+        "markers": 0
+      }
+    },
+    {
+      "path": "crates/agent-eval/src/convergence_bench.rs",
+      "counts": {
+        "error_exit": 1,
+        "whole_read": 0,
+        "unbounded_queue": 0,
+        "lifecycle": 3,
+        "clone_collect": 4,
+        "markers": 0
+      }
+    },
+    {
+      "path": "crates/agent-eval/src/doctor.rs",
+      "counts": {
+        "error_exit": 0,
+        "whole_read": 2,
+        "unbounded_queue": 0,
+        "lifecycle": 1,
+        "clone_collect": 0,
+        "markers": 0
+      }
+    },
+    {
+      "path": "crates/agent-eval/src/driver.rs",
+      "counts": {
+        "error_exit": 0,
+        "whole_read": 0,
+        "unbounded_queue": 0,
+        "lifecycle": 1,
+        "clone_collect": 2,
+        "markers": 0
+      }
+    },
+    {
+      "path": "crates/agent-eval/src/envfile.rs",
+      "counts": {
+        "error_exit": 4,
+        "whole_read": 1,
+        "unbounded_queue": 0,
+        "lifecycle": 0,
+        "clone_collect": 2,
+        "markers": 0
+      }
+    },
+    {
+      "path": "crates/agent-eval/src/fixture_driver.rs",
+      "counts": {
+        "error_exit": 74,
+        "whole_read": 8,
+        "unbounded_queue": 0,
+        "lifecycle": 4,
+        "clone_collect": 59,
+        "markers": 0
+      }
+    },
+    {
+      "path": "crates/agent-eval/src/harvest.rs",
+      "counts": {
+        "error_exit": 8,
+        "whole_read": 3,
+        "unbounded_queue": 0,
+        "lifecycle": 0,
+        "clone_collect": 7,
+        "markers": 0
+      }
+    },
+    {
+      "path": "crates/agent-eval/src/hygiene.rs",
+      "counts": {
+        "error_exit": 2,
+        "whole_read": 0,
+        "unbounded_queue": 0,
+        "lifecycle": 0,
+        "clone_collect": 0,
+        "markers": 0
+      }
+    },
+    {
+      "path": "crates/agent-eval/src/long_live.rs",
+      "counts": {
+        "error_exit": 36,
+        "whole_read": 5,
+        "unbounded_queue": 0,
+        "lifecycle": 44,
+        "clone_collect": 77,
+        "markers": 0
+      }
+    },
+    {
+      "path": "crates/agent-eval/src/long_task.rs",
+      "counts": {
+        "error_exit": 4,
+        "whole_read": 4,
+        "unbounded_queue": 0,
+        "lifecycle": 35,
+        "clone_collect": 12,
+        "markers": 3
+      }
+    },
+    {
+      "path": "crates/agent-eval/src/longflow.rs",
+      "counts": {
+        "error_exit": 1,
+        "whole_read": 2,
+        "unbounded_queue": 0,
+        "lifecycle": 0,
+        "clone_collect": 1,
+        "markers": 0
+      }
+    },
+    {
+      "path": "crates/agent-eval/src/m15_pack.rs",
+      "counts": {
+        "error_exit": 32,
+        "whole_read": 1,
+        "unbounded_queue": 0,
+        "lifecycle": 0,
+        "clone_collect": 5,
+        "markers": 0
+      }
+    },
+    {
+      "path": "crates/agent-eval/src/m15_report.rs",
+      "counts": {
+        "error_exit": 77,
+        "whole_read": 0,
+        "unbounded_queue": 0,
+        "lifecycle": 0,
+        "clone_collect": 28,
+        "markers": 0
+      }
+    },
+    {
+      "path": "crates/agent-eval/src/main.rs",
+      "counts": {
+        "error_exit": 21,
+        "whole_read": 5,
+        "unbounded_queue": 0,
+        "lifecycle": 6,
+        "clone_collect": 79,
+        "markers": 0
+      }
+    },
+    {
+      "path": "crates/agent-eval/src/metrics.rs",
+      "counts": {
+        "error_exit": 1,
+        "whole_read": 0,
+        "unbounded_queue": 0,
+        "lifecycle": 6,
+        "clone_collect": 14,
+        "markers": 0
+      }
+    },
+    {
+      "path": "crates/agent-eval/src/mock_model.rs",
+      "counts": {
+        "error_exit": 6,
+        "whole_read": 0,
+        "unbounded_queue": 0,
+        "lifecycle": 2,
+        "clone_collect": 5,
+        "markers": 0
+      }
+    },
+    {
+      "path": "crates/agent-eval/src/pilot.rs",
+      "counts": {
+        "error_exit": 6,
+        "whole_read": 0,
+        "unbounded_queue": 0,
+        "lifecycle": 3,
+        "clone_collect": 19,
+        "markers": 0
+      }
+    },
+    {
+      "path": "crates/agent-eval/src/platform_closure.rs",
+      "counts": {
+        "error_exit": 5,
+        "whole_read": 2,
+        "unbounded_queue": 0,
+        "lifecycle": 2,
+        "clone_collect": 49,
+        "markers": 0
+      }
+    },
+    {
+      "path": "crates/agent-eval/src/platform_closure_m13.rs",
+      "counts": {
+        "error_exit": 3,
+        "whole_read": 1,
+        "unbounded_queue": 0,
+        "lifecycle": 1,
+        "clone_collect": 10,
+        "markers": 0
+      }
+    },
+    {
+      "path": "crates/agent-eval/src/retrieval.rs",
+      "counts": {
+        "error_exit": 1,
+        "whole_read": 0,
+        "unbounded_queue": 0,
+        "lifecycle": 0,
+        "clone_collect": 3,
+        "markers": 0
+      }
+    },
+    {
+      "path": "crates/agent-eval/src/suite.rs",
+      "counts": {
+        "error_exit": 20,
+        "whole_read": 5,
+        "unbounded_queue": 0,
+        "lifecycle": 0,
+        "clone_collect": 8,
+        "markers": 0
+      }
+    },
+    {
+      "path": "crates/agent-eval/src/task.rs",
+      "counts": {
+        "error_exit": 1,
+        "whole_read": 0,
+        "unbounded_queue": 0,
+        "lifecycle": 0,
+        "clone_collect": 0,
+        "markers": 0
+      }
+    },
+    {
+      "path": "crates/agent-eval/src/tool_edit_gate.rs",
+      "counts": {
+        "error_exit": 27,
+        "whole_read": 0,
+        "unbounded_queue": 0,
+        "lifecycle": 0,
+        "clone_collect": 35,
+        "markers": 0
+      }
+    },
+    {
+      "path": "crates/agent-eval/src/tool_edit_pack.rs",
+      "counts": {
+        "error_exit": 36,
+        "whole_read": 2,
+        "unbounded_queue": 0,
+        "lifecycle": 1,
+        "clone_collect": 7,
+        "markers": 0
+      }
+    },
+    {
+      "path": "crates/agent-eval/src/verify_route.rs",
+      "counts": {
+        "error_exit": 1,
+        "whole_read": 1,
+        "unbounded_queue": 0,
+        "lifecycle": 1,
+        "clone_collect": 8,
+        "markers": 0
+      }
+    },
+    {
+      "path": "crates/agent-eval/src/workload.rs",
+      "counts": {
+        "error_exit": 29,
+        "whole_read": 0,
+        "unbounded_queue": 0,
+        "lifecycle": 0,
+        "clone_collect": 6,
+        "markers": 2
+      }
+    },
+    {
+      "path": "crates/agent-eval/suite/tasks/openai-wire-tool-names/expected/src/lib.rs",
+      "counts": {
+        "error_exit": 0,
+        "whole_read": 0,
+        "unbounded_queue": 0,
+        "lifecycle": 0,
+        "clone_collect": 0,
+        "markers": 0
+      }
+    },
+    {
+      "path": "crates/agent-eval/suite/tasks/openai-wire-tool-names/hidden/tests/hidden.rs",
+      "counts": {
+        "error_exit": 1,
+        "whole_read": 0,
+        "unbounded_queue": 0,
+        "lifecycle": 0,
+        "clone_collect": 0,
+        "markers": 0
+      }
+    },
+    {
+      "path": "crates/agent-eval/suite/tasks/openai-wire-tool-names/seed/Cargo.toml",
+      "counts": {
+        "error_exit": 0,
+        "whole_read": 0,
+        "unbounded_queue": 0,
+        "lifecycle": 0,
+        "clone_collect": 0,
+        "markers": 0
+      }
+    },
+    {
+      "path": "crates/agent-eval/suite/tasks/openai-wire-tool-names/seed/src/lib.rs",
+      "counts": {
+        "error_exit": 0,
+        "whole_read": 0,
+        "unbounded_queue": 0,
+        "lifecycle": 0,
+        "clone_collect": 0,
+        "markers": 0
+      }
+    },
+    {
+      "path": "crates/agent-eval/suite/tasks/python-itertools-batched/expected/batched.py",
+      "counts": {
+        "error_exit": 0,
+        "whole_read": 0,
+        "unbounded_queue": 0,
+        "lifecycle": 0,
+        "clone_collect": 0,
+        "markers": 0
+      }
+    },
+    {
+      "path": "crates/agent-eval/suite/tasks/python-itertools-batched/hidden/tests/test_hidden.py",
+      "counts": {
+        "error_exit": 0,
+        "whole_read": 0,
+        "unbounded_queue": 0,
+        "lifecycle": 0,
+        "clone_collect": 0,
+        "markers": 0
+      }
+    },
+    {
+      "path": "crates/agent-eval/suite/tasks/python-itertools-batched/seed/batched.py",
+      "counts": {
+        "error_exit": 0,
+        "whole_read": 0,
+        "unbounded_queue": 0,
+        "lifecycle": 0,
+        "clone_collect": 0,
+        "markers": 0
+      }
+    },
+    {
+      "path": "crates/agent-eval/suite/tasks/python-pep616-removeprefix/expected/remove_prefix.py",
+      "counts": {
+        "error_exit": 0,
+        "whole_read": 0,
+        "unbounded_queue": 0,
+        "lifecycle": 0,
+        "clone_collect": 0,
+        "markers": 0
+      }
+    },
+    {
+      "path": "crates/agent-eval/suite/tasks/python-pep616-removeprefix/hidden/tests/test_hidden.py",
+      "counts": {
+        "error_exit": 0,
+        "whole_read": 0,
+        "unbounded_queue": 0,
+        "lifecycle": 0,
+        "clone_collect": 0,
+        "markers": 0
+      }
+    },
+    {
+      "path": "crates/agent-eval/suite/tasks/python-pep616-removeprefix/seed/remove_prefix.py",
+      "counts": {
+        "error_exit": 0,
+        "whole_read": 0,
+        "unbounded_queue": 0,
+        "lifecycle": 0,
+        "clone_collect": 0,
+        "markers": 0
+      }
+    },
+    {
+      "path": "crates/agent-eval/suite/tasks/python-symbols-add-tests/expected/tests/test_symbols.py",
+      "counts": {
+        "error_exit": 0,
+        "whole_read": 0,
+        "unbounded_queue": 0,
+        "lifecycle": 0,
+        "clone_collect": 0,
+        "markers": 0
+      }
+    },
+    {
+      "path": "crates/agent-eval/suite/tasks/python-symbols-add-tests/hidden/tests/test_hidden.py",
+      "counts": {
+        "error_exit": 0,
+        "whole_read": 0,
+        "unbounded_queue": 0,
+        "lifecycle": 0,
+        "clone_collect": 0,
+        "markers": 0
+      }
+    },
+    {
+      "path": "crates/agent-eval/suite/tasks/python-symbols-add-tests/seed/symbols.py",
+      "counts": {
+        "error_exit": 0,
+        "whole_read": 0,
+        "unbounded_queue": 0,
+        "lifecycle": 0,
+        "clone_collect": 0,
+        "markers": 0
+      }
+    },
+    {
+      "path": "crates/agent-eval/suite/tasks/rust-grep-cooperative-cancel/expected/src/lib.rs",
+      "counts": {
+        "error_exit": 0,
+        "whole_read": 0,
+        "unbounded_queue": 0,
+        "lifecycle": 3,
+        "clone_collect": 1,
+        "markers": 0
+      }
+    },
+    {
+      "path": "crates/agent-eval/suite/tasks/rust-grep-cooperative-cancel/hidden/tests/hidden.rs",
+      "counts": {
+        "error_exit": 0,
+        "whole_read": 0,
+        "unbounded_queue": 0,
+        "lifecycle": 6,
+        "clone_collect": 0,
+        "markers": 0
+      }
+    },
+    {
+      "path": "crates/agent-eval/suite/tasks/rust-grep-cooperative-cancel/seed/Cargo.toml",
+      "counts": {
+        "error_exit": 0,
+        "whole_read": 0,
+        "unbounded_queue": 0,
+        "lifecycle": 0,
+        "clone_collect": 0,
+        "markers": 0
+      }
+    },
+    {
+      "path": "crates/agent-eval/suite/tasks/rust-grep-cooperative-cancel/seed/src/lib.rs",
+      "counts": {
+        "error_exit": 0,
+        "whole_read": 0,
+        "unbounded_queue": 0,
+        "lifecycle": 1,
+        "clone_collect": 1,
+        "markers": 0
+      }
+    },
+    {
+      "path": "crates/agent-eval/suite/tasks/rust-jcs-canonical-objects/expected/src/lib.rs",
+      "counts": {
+        "error_exit": 0,
+        "whole_read": 0,
+        "unbounded_queue": 0,
+        "lifecycle": 0,
+        "clone_collect": 1,
+        "markers": 0
+      }
+    },
+    {
+      "path": "crates/agent-eval/suite/tasks/rust-jcs-canonical-objects/hidden/tests/hidden.rs",
+      "counts": {
+        "error_exit": 0,
+        "whole_read": 0,
+        "unbounded_queue": 0,
+        "lifecycle": 0,
+        "clone_collect": 0,
+        "markers": 0
+      }
+    },
+    {
+      "path": "crates/agent-eval/suite/tasks/rust-jcs-canonical-objects/seed/Cargo.toml",
+      "counts": {
+        "error_exit": 0,
+        "whole_read": 0,
+        "unbounded_queue": 0,
+        "lifecycle": 0,
+        "clone_collect": 0,
+        "markers": 0
+      }
+    },
+    {
+      "path": "crates/agent-eval/suite/tasks/rust-jcs-canonical-objects/seed/src/lib.rs",
+      "counts": {
+        "error_exit": 0,
+        "whole_read": 0,
+        "unbounded_queue": 0,
+        "lifecycle": 0,
+        "clone_collect": 2,
+        "markers": 0
+      }
+    },
+    {
+      "path": "crates/agent-eval/suite/tasks/uuid-parity-keys/expected/src/lib.rs",
+      "counts": {
+        "error_exit": 0,
+        "whole_read": 0,
+        "unbounded_queue": 0,
+        "lifecycle": 0,
+        "clone_collect": 0,
+        "markers": 0
+      }
+    },
+    {
+      "path": "crates/agent-eval/suite/tasks/uuid-parity-keys/hidden/tests/hidden.rs",
+      "counts": {
+        "error_exit": 0,
+        "whole_read": 0,
+        "unbounded_queue": 0,
+        "lifecycle": 0,
+        "clone_collect": 1,
+        "markers": 0
+      }
+    },
+    {
+      "path": "crates/agent-eval/suite/tasks/uuid-parity-keys/seed/Cargo.toml",
+      "counts": {
+        "error_exit": 0,
+        "whole_read": 0,
+        "unbounded_queue": 0,
+        "lifecycle": 0,
+        "clone_collect": 0,
+        "markers": 0
+      }
+    },
+    {
+      "path": "crates/agent-eval/suite/tasks/uuid-parity-keys/seed/src/lib.rs",
+      "counts": {
+        "error_exit": 0,
+        "whole_read": 0,
+        "unbounded_queue": 0,
+        "lifecycle": 0,
+        "clone_collect": 0,
+        "markers": 0
+      }
+    },
+    {
+      "path": "crates/agent-host/Cargo.toml",
+      "counts": {
+        "error_exit": 0,
+        "whole_read": 0,
+        "unbounded_queue": 0,
+        "lifecycle": 0,
+        "clone_collect": 0,
+        "markers": 0
+      }
+    },
+    {
+      "path": "crates/agent-host/src/config.rs",
+      "counts": {
+        "error_exit": 7,
+        "whole_read": 0,
+        "unbounded_queue": 0,
+        "lifecycle": 0,
+        "clone_collect": 2,
+        "markers": 0
+      }
+    },
+    {
+      "path": "crates/agent-host/src/lib.rs",
+      "counts": {
+        "error_exit": 12,
+        "whole_read": 1,
+        "unbounded_queue": 0,
+        "lifecycle": 58,
+        "clone_collect": 26,
+        "markers": 0
+      }
+    },
+    {
+      "path": "crates/agent-host/src/main.rs",
+      "counts": {
+        "error_exit": 0,
+        "whole_read": 0,
+        "unbounded_queue": 0,
+        "lifecycle": 16,
+        "clone_collect": 19,
+        "markers": 0
+      }
+    },
+    {
+      "path": "crates/agent-host/src/winpipe.rs",
+      "counts": {
+        "error_exit": 0,
+        "whole_read": 0,
+        "unbounded_queue": 0,
+        "lifecycle": 6,
+        "clone_collect": 3,
+        "markers": 0
+      }
+    },
+    {
+      "path": "crates/agent-host/tests/host_config.rs",
+      "counts": {
+        "error_exit": 17,
+        "whole_read": 0,
+        "unbounded_queue": 0,
+        "lifecycle": 4,
+        "clone_collect": 10,
+        "markers": 0
+      }
+    },
+    {
+      "path": "crates/agent-host/tests/host_e2e.rs",
+      "counts": {
+        "error_exit": 48,
+        "whole_read": 0,
+        "unbounded_queue": 1,
+        "lifecycle": 19,
+        "clone_collect": 26,
+        "markers": 0
+      }
+    },
+    {
+      "path": "crates/agent-host/tests/host_restore.rs",
+      "counts": {
+        "error_exit": 5,
+        "whole_read": 0,
+        "unbounded_queue": 0,
+        "lifecycle": 35,
+        "clone_collect": 7,
+        "markers": 0
+      }
+    },
+    {
+      "path": "crates/agent-platform-protocol/Cargo.toml",
+      "counts": {
+        "error_exit": 0,
+        "whole_read": 0,
+        "unbounded_queue": 0,
+        "lifecycle": 0,
+        "clone_collect": 0,
+        "markers": 0
+      }
+    },
+    {
+      "path": "crates/agent-platform-protocol/src/contract.rs",
+      "counts": {
+        "error_exit": 68,
+        "whole_read": 0,
+        "unbounded_queue": 1,
+        "lifecycle": 0,
+        "clone_collect": 14,
+        "markers": 0
+      }
+    },
+    {
+      "path": "crates/agent-platform-protocol/src/digest.rs",
+      "counts": {
+        "error_exit": 0,
+        "whole_read": 0,
+        "unbounded_queue": 0,
+        "lifecycle": 0,
+        "clone_collect": 0,
+        "markers": 0
+      }
+    },
+    {
+      "path": "crates/agent-platform-protocol/src/error.rs",
+      "counts": {
+        "error_exit": 0,
+        "whole_read": 0,
+        "unbounded_queue": 0,
+        "lifecycle": 0,
+        "clone_collect": 0,
+        "markers": 0
+      }
+    },
+    {
+      "path": "crates/agent-platform-protocol/src/ids.rs",
+      "counts": {
+        "error_exit": 0,
+        "whole_read": 0,
+        "unbounded_queue": 0,
+        "lifecycle": 0,
+        "clone_collect": 0,
+        "markers": 0
+      }
+    },
+    {
+      "path": "crates/agent-platform-protocol/src/json.rs",
+      "counts": {
+        "error_exit": 2,
+        "whole_read": 0,
+        "unbounded_queue": 0,
+        "lifecycle": 1,
+        "clone_collect": 0,
+        "markers": 0
+      }
+    },
+    {
+      "path": "crates/agent-platform-protocol/src/lib.rs",
+      "counts": {
+        "error_exit": 0,
+        "whole_read": 0,
+        "unbounded_queue": 0,
+        "lifecycle": 1,
+        "clone_collect": 0,
+        "markers": 0
+      }
+    },
+    {
+      "path": "crates/agent-platform-protocol/src/operation.rs",
+      "counts": {
+        "error_exit": 42,
+        "whole_read": 0,
+        "unbounded_queue": 0,
+        "lifecycle": 4,
+        "clone_collect": 7,
+        "markers": 0
+      }
+    },
+    {
+      "path": "crates/agent-platform-protocol/src/validation.rs",
+      "counts": {
+        "error_exit": 0,
+        "whole_read": 0,
+        "unbounded_queue": 0,
+        "lifecycle": 0,
+        "clone_collect": 0,
+        "markers": 0
+      }
+    },
+    {
+      "path": "crates/agent-platform-protocol/src/work.rs",
+      "counts": {
+        "error_exit": 66,
+        "whole_read": 0,
+        "unbounded_queue": 0,
+        "lifecycle": 3,
+        "clone_collect": 23,
+        "markers": 0
+      }
+    },
+    {
+      "path": "crates/agent-platform-protocol/tests/work_fixtures.rs",
+      "counts": {
+        "error_exit": 30,
+        "whole_read": 1,
+        "unbounded_queue": 0,
+        "lifecycle": 1,
+        "clone_collect": 1,
+        "markers": 0
+      }
+    },
+    {
+      "path": "crates/agent-process/Cargo.toml",
+      "counts": {
+        "error_exit": 0,
+        "whole_read": 0,
+        "unbounded_queue": 0,
+        "lifecycle": 0,
+        "clone_collect": 0,
+        "markers": 0
+      }
+    },
+    {
+      "path": "crates/agent-process/src/bin/mock_host.rs",
+      "counts": {
+        "error_exit": 7,
+        "whole_read": 0,
+        "unbounded_queue": 0,
+        "lifecycle": 4,
+        "clone_collect": 0,
+        "markers": 0
+      }
+    },
+    {
+      "path": "crates/agent-process/src/bin/sandbox_probe.rs",
+      "counts": {
+        "error_exit": 0,
+        "whole_read": 2,
+        "unbounded_queue": 0,
+        "lifecycle": 11,
+        "clone_collect": 1,
+        "markers": 0
+      }
+    },
+    {
+      "path": "crates/agent-process/src/frame.rs",
+      "counts": {
+        "error_exit": 8,
+        "whole_read": 0,
+        "unbounded_queue": 0,
+        "lifecycle": 0,
+        "clone_collect": 1,
+        "markers": 0
+      }
+    },
+    {
+      "path": "crates/agent-process/src/health.rs",
+      "counts": {
+        "error_exit": 3,
+        "whole_read": 0,
+        "unbounded_queue": 0,
+        "lifecycle": 2,
+        "clone_collect": 0,
+        "markers": 0
+      }
+    },
+    {
+      "path": "crates/agent-process/src/host.rs",
+      "counts": {
+        "error_exit": 28,
+        "whole_read": 0,
+        "unbounded_queue": 3,
+        "lifecycle": 44,
+        "clone_collect": 10,
+        "markers": 0
+      }
+    },
+    {
+      "path": "crates/agent-process/src/integrity.rs",
+      "counts": {
+        "error_exit": 0,
+        "whole_read": 0,
+        "unbounded_queue": 0,
+        "lifecycle": 0,
+        "clone_collect": 2,
+        "markers": 0
+      }
+    },
+    {
+      "path": "crates/agent-process/src/landlock.rs",
+      "counts": {
+        "error_exit": 4,
+        "whole_read": 0,
+        "unbounded_queue": 0,
+        "lifecycle": 5,
+        "clone_collect": 0,
+        "markers": 0
+      }
+    },
+    {
+      "path": "crates/agent-process/src/lib.rs",
+      "counts": {
+        "error_exit": 0,
+        "whole_read": 0,
+        "unbounded_queue": 0,
+        "lifecycle": 1,
+        "clone_collect": 0,
+        "markers": 0
+      }
+    },
+    {
+      "path": "crates/agent-process/src/lifecycle.rs",
+      "counts": {
+        "error_exit": 23,
+        "whole_read": 3,
+        "unbounded_queue": 0,
+        "lifecycle": 1,
+        "clone_collect": 0,
+        "markers": 0
+      }
+    },
+    {
+      "path": "crates/agent-process/src/session.rs",
+      "counts": {
+        "error_exit": 29,
+        "whole_read": 0,
+        "unbounded_queue": 0,
+        "lifecycle": 0,
+        "clone_collect": 1,
+        "markers": 0
+      }
+    },
+    {
+      "path": "crates/agent-process/src/supervisor.rs",
+      "counts": {
+        "error_exit": 4,
+        "whole_read": 0,
+        "unbounded_queue": 0,
+        "lifecycle": 6,
+        "clone_collect": 0,
+        "markers": 0
+      }
+    },
+    {
+      "path": "crates/agent-process/src/watchdog.rs",
+      "counts": {
+        "error_exit": 10,
+        "whole_read": 0,
+        "unbounded_queue": 0,
+        "lifecycle": 2,
+        "clone_collect": 0,
+        "markers": 0
+      }
+    },
+    {
+      "path": "crates/agent-process/tests/common/mod.rs",
+      "counts": {
+        "error_exit": 0,
+        "whole_read": 0,
+        "unbounded_queue": 0,
+        "lifecycle": 0,
+        "clone_collect": 0,
+        "markers": 0
+      }
+    },
+    {
+      "path": "crates/agent-process/tests/host.rs",
+      "counts": {
+        "error_exit": 13,
+        "whole_read": 0,
+        "unbounded_queue": 0,
+        "lifecycle": 39,
+        "clone_collect": 4,
+        "markers": 0
+      }
+    },
+    {
+      "path": "crates/agent-process/tests/integrity.rs",
+      "counts": {
+        "error_exit": 11,
+        "whole_read": 0,
+        "unbounded_queue": 0,
+        "lifecycle": 1,
+        "clone_collect": 0,
+        "markers": 0
+      }
+    },
+    {
+      "path": "crates/agent-process/tests/landlock.rs",
+      "counts": {
+        "error_exit": 20,
+        "whole_read": 0,
+        "unbounded_queue": 0,
+        "lifecycle": 6,
+        "clone_collect": 0,
+        "markers": 0
+      }
+    },
+    {
+      "path": "crates/agent-process/tests/rlimits.rs",
+      "counts": {
+        "error_exit": 18,
+        "whole_read": 0,
+        "unbounded_queue": 0,
+        "lifecycle": 3,
+        "clone_collect": 0,
+        "markers": 0
+      }
+    },
+    {
+      "path": "crates/agent-process/tests/sandbox.rs",
+      "counts": {
+        "error_exit": 13,
+        "whole_read": 0,
+        "unbounded_queue": 0,
+        "lifecycle": 7,
+        "clone_collect": 3,
+        "markers": 0
+      }
+    },
+    {
+      "path": "crates/agent-process/tests/watchdog.rs",
+      "counts": {
+        "error_exit": 14,
+        "whole_read": 1,
+        "unbounded_queue": 0,
+        "lifecycle": 0,
+        "clone_collect": 0,
+        "markers": 0
+      }
+    },
+    {
+      "path": "crates/agent-replay/Cargo.toml",
+      "counts": {
+        "error_exit": 0,
+        "whole_read": 0,
+        "unbounded_queue": 0,
+        "lifecycle": 0,
+        "clone_collect": 0,
+        "markers": 0
+      }
+    },
+    {
+      "path": "crates/agent-replay/src/facts.rs",
+      "counts": {
+        "error_exit": 13,
+        "whole_read": 0,
+        "unbounded_queue": 0,
+        "lifecycle": 0,
+        "clone_collect": 1,
+        "markers": 0
+      }
+    },
+    {
+      "path": "crates/agent-replay/src/frame_report.rs",
+      "counts": {
+        "error_exit": 5,
+        "whole_read": 2,
+        "unbounded_queue": 1,
+        "lifecycle": 0,
+        "clone_collect": 5,
+        "markers": 0
+      }
+    },
+    {
+      "path": "crates/agent-replay/src/frontier.rs",
+      "counts": {
+        "error_exit": 0,
+        "whole_read": 0,
+        "unbounded_queue": 0,
+        "lifecycle": 0,
+        "clone_collect": 0,
+        "markers": 0
+      }
+    },
+    {
+      "path": "crates/agent-replay/src/lib.rs",
+      "counts": {
+        "error_exit": 48,
+        "whole_read": 1,
+        "unbounded_queue": 1,
+        "lifecycle": 2,
+        "clone_collect": 24,
+        "markers": 0
+      }
+    },
+    {
+      "path": "crates/agent-replay/src/main.rs",
+      "counts": {
+        "error_exit": 0,
+        "whole_read": 0,
+        "unbounded_queue": 0,
+        "lifecycle": 1,
+        "clone_collect": 6,
+        "markers": 0
+      }
+    },
+    {
+      "path": "crates/agent-replay/src/recovery.rs",
+      "counts": {
+        "error_exit": 39,
+        "whole_read": 0,
+        "unbounded_queue": 0,
+        "lifecycle": 57,
+        "clone_collect": 11,
+        "markers": 0
+      }
+    },
+    {
+      "path": "crates/agent-replay/src/run_summary.rs",
+      "counts": {
+        "error_exit": 7,
+        "whole_read": 0,
+        "unbounded_queue": 0,
+        "lifecycle": 4,
+        "clone_collect": 2,
+        "markers": 0
+      }
+    },
+    {
+      "path": "crates/agent-replay/src/scenarios.rs",
+      "counts": {
+        "error_exit": 24,
+        "whole_read": 0,
+        "unbounded_queue": 1,
+        "lifecycle": 0,
+        "clone_collect": 2,
+        "markers": 0
+      }
+    },
+    {
+      "path": "crates/agent-runtime/Cargo.toml",
+      "counts": {
+        "error_exit": 0,
+        "whole_read": 0,
+        "unbounded_queue": 0,
+        "lifecycle": 0,
+        "clone_collect": 0,
+        "markers": 0
+      }
+    },
+    {
+      "path": "crates/agent-runtime/src/actor/commands.rs",
+      "counts": {
+        "error_exit": 0,
+        "whole_read": 0,
+        "unbounded_queue": 0,
+        "lifecycle": 7,
+        "clone_collect": 12,
+        "markers": 0
+      }
+    },
+    {
+      "path": "crates/agent-runtime/src/actor/lifecycle.rs",
+      "counts": {
+        "error_exit": 0,
+        "whole_read": 0,
+        "unbounded_queue": 0,
+        "lifecycle": 3,
+        "clone_collect": 6,
+        "markers": 0
+      }
+    },
+    {
+      "path": "crates/agent-runtime/src/actor/maintenance.rs",
+      "counts": {
+        "error_exit": 11,
+        "whole_read": 0,
+        "unbounded_queue": 0,
+        "lifecycle": 43,
+        "clone_collect": 17,
+        "markers": 0
+      }
+    },
+    {
+      "path": "crates/agent-runtime/src/actor/mod.rs",
+      "counts": {
+        "error_exit": 4,
+        "whole_read": 0,
+        "unbounded_queue": 1,
+        "lifecycle": 59,
+        "clone_collect": 20,
+        "markers": 0
+      }
+    },
+    {
+      "path": "crates/agent-runtime/src/actor/model.rs",
+      "counts": {
+        "error_exit": 7,
+        "whole_read": 0,
+        "unbounded_queue": 1,
+        "lifecycle": 11,
+        "clone_collect": 68,
+        "markers": 0
+      }
+    },
+    {
+      "path": "crates/agent-runtime/src/actor/restore.rs",
+      "counts": {
+        "error_exit": 0,
+        "whole_read": 0,
+        "unbounded_queue": 0,
+        "lifecycle": 94,
+        "clone_collect": 9,
+        "markers": 0
+      }
+    },
+    {
+      "path": "crates/agent-runtime/src/actor/restore_tests.rs",
+      "counts": {
+        "error_exit": 80,
+        "whole_read": 0,
+        "unbounded_queue": 0,
+        "lifecycle": 16,
+        "clone_collect": 32,
+        "markers": 0
+      }
+    },
+    {
+      "path": "crates/agent-runtime/src/actor/safepoint.rs",
+      "counts": {
+        "error_exit": 3,
+        "whole_read": 0,
+        "unbounded_queue": 0,
+        "lifecycle": 25,
+        "clone_collect": 4,
+        "markers": 0
+      }
+    },
+    {
+      "path": "crates/agent-runtime/src/actor/tools.rs",
+      "counts": {
+        "error_exit": 8,
+        "whole_read": 0,
+        "unbounded_queue": 1,
+        "lifecycle": 15,
+        "clone_collect": 52,
+        "markers": 0
+      }
+    },
+    {
+      "path": "crates/agent-runtime/src/actor/turn.rs",
+      "counts": {
+        "error_exit": 8,
+        "whole_read": 0,
+        "unbounded_queue": 0,
+        "lifecycle": 55,
+        "clone_collect": 56,
+        "markers": 0
+      }
+    },
+    {
+      "path": "crates/agent-runtime/src/budget.rs",
+      "counts": {
+        "error_exit": 1,
+        "whole_read": 0,
+        "unbounded_queue": 0,
+        "lifecycle": 0,
+        "clone_collect": 4,
+        "markers": 0
+      }
+    },
+    {
+      "path": "crates/agent-runtime/src/capability/mod.rs",
+      "counts": {
+        "error_exit": 50,
+        "whole_read": 0,
+        "unbounded_queue": 0,
+        "lifecycle": 33,
+        "clone_collect": 64,
+        "markers": 0
+      }
+    },
+    {
+      "path": "crates/agent-runtime/src/capability/tests.rs",
+      "counts": {
+        "error_exit": 77,
+        "whole_read": 0,
+        "unbounded_queue": 0,
+        "lifecycle": 25,
+        "clone_collect": 23,
+        "markers": 0
+      }
+    },
+    {
+      "path": "crates/agent-runtime/src/checkpoint.rs",
+      "counts": {
+        "error_exit": 63,
+        "whole_read": 2,
+        "unbounded_queue": 0,
+        "lifecycle": 117,
+        "clone_collect": 11,
+        "markers": 0
+      }
+    },
+    {
+      "path": "crates/agent-runtime/src/command.rs",
+      "counts": {
+        "error_exit": 0,
+        "whole_read": 0,
+        "unbounded_queue": 0,
+        "lifecycle": 21,
+        "clone_collect": 0,
+        "markers": 0
+      }
+    },
+    {
+      "path": "crates/agent-runtime/src/crash.rs",
+      "counts": {
+        "error_exit": 0,
+        "whole_read": 0,
+        "unbounded_queue": 0,
+        "lifecycle": 0,
+        "clone_collect": 1,
+        "markers": 0
+      }
+    },
+    {
+      "path": "crates/agent-runtime/src/directive.rs",
+      "counts": {
+        "error_exit": 0,
+        "whole_read": 1,
+        "unbounded_queue": 0,
+        "lifecycle": 3,
+        "clone_collect": 3,
+        "markers": 0
+      }
+    },
+    {
+      "path": "crates/agent-runtime/src/execution/body_cache.rs",
+      "counts": {
+        "error_exit": 1,
+        "whole_read": 0,
+        "unbounded_queue": 0,
+        "lifecycle": 4,
+        "clone_collect": 3,
+        "markers": 0
+      }
+    },
+    {
+      "path": "crates/agent-runtime/src/execution/classify.rs",
+      "counts": {
+        "error_exit": 0,
+        "whole_read": 0,
+        "unbounded_queue": 0,
+        "lifecycle": 1,
+        "clone_collect": 0,
+        "markers": 0
+      }
+    },
+    {
+      "path": "crates/agent-runtime/src/execution/freshness.rs",
+      "counts": {
+        "error_exit": 0,
+        "whole_read": 0,
+        "unbounded_queue": 0,
+        "lifecycle": 4,
+        "clone_collect": 8,
+        "markers": 0
+      }
+    },
+    {
+      "path": "crates/agent-runtime/src/execution/memo.rs",
+      "counts": {
+        "error_exit": 0,
+        "whole_read": 0,
+        "unbounded_queue": 0,
+        "lifecycle": 0,
+        "clone_collect": 0,
+        "markers": 0
+      }
+    },
+    {
+      "path": "crates/agent-runtime/src/execution/mod.rs",
+      "counts": {
+        "error_exit": 0,
+        "whole_read": 0,
+        "unbounded_queue": 0,
+        "lifecycle": 0,
+        "clone_collect": 0,
+        "markers": 0
+      }
+    },
+    {
+      "path": "crates/agent-runtime/src/execution/needs.rs",
+      "counts": {
+        "error_exit": 0,
+        "whole_read": 0,
+        "unbounded_queue": 0,
+        "lifecycle": 0,
+        "clone_collect": 0,
+        "markers": 0
+      }
+    },
+    {
+      "path": "crates/agent-runtime/src/execution/snapshot.rs",
+      "counts": {
+        "error_exit": 0,
+        "whole_read": 0,
+        "unbounded_queue": 0,
+        "lifecycle": 0,
+        "clone_collect": 1,
+        "markers": 0
+      }
+    },
+    {
+      "path": "crates/agent-runtime/src/execution/state.rs",
+      "counts": {
+        "error_exit": 1,
+        "whole_read": 0,
+        "unbounded_queue": 0,
+        "lifecycle": 19,
+        "clone_collect": 41,
+        "markers": 0
+      }
+    },
+    {
+      "path": "crates/agent-runtime/src/execution/tests.rs",
+      "counts": {
+        "error_exit": 25,
+        "whole_read": 0,
+        "unbounded_queue": 0,
+        "lifecycle": 3,
+        "clone_collect": 3,
+        "markers": 0
+      }
+    },
+    {
+      "path": "crates/agent-runtime/src/frame.rs",
+      "counts": {
+        "error_exit": 5,
+        "whole_read": 0,
+        "unbounded_queue": 2,
+        "lifecycle": 2,
+        "clone_collect": 14,
+        "markers": 0
+      }
+    },
+    {
+      "path": "crates/agent-runtime/src/host.rs",
+      "counts": {
+        "error_exit": 6,
+        "whole_read": 0,
+        "unbounded_queue": 0,
+        "lifecycle": 0,
+        "clone_collect": 3,
+        "markers": 0
+      }
+    },
+    {
+      "path": "crates/agent-runtime/src/instance.rs",
+      "counts": {
+        "error_exit": 0,
+        "whole_read": 0,
+        "unbounded_queue": 0,
+        "lifecycle": 22,
+        "clone_collect": 1,
+        "markers": 0
+      }
+    },
+    {
+      "path": "crates/agent-runtime/src/lib.rs",
+      "counts": {
+        "error_exit": 0,
+        "whole_read": 0,
+        "unbounded_queue": 0,
+        "lifecycle": 2,
+        "clone_collect": 0,
+        "markers": 0
+      }
+    },
+    {
+      "path": "crates/agent-runtime/src/modules.rs",
+      "counts": {
+        "error_exit": 0,
+        "whole_read": 0,
+        "unbounded_queue": 0,
+        "lifecycle": 0,
+        "clone_collect": 6,
+        "markers": 0
+      }
+    },
+    {
+      "path": "crates/agent-runtime/src/opportunity.rs",
+      "counts": {
+        "error_exit": 6,
+        "whole_read": 0,
+        "unbounded_queue": 0,
+        "lifecycle": 2,
+        "clone_collect": 4,
+        "markers": 0
+      }
+    },
+    {
+      "path": "crates/agent-runtime/src/output.rs",
+      "counts": {
+        "error_exit": 0,
+        "whole_read": 0,
+        "unbounded_queue": 0,
+        "lifecycle": 0,
+        "clone_collect": 6,
+        "markers": 0
+      }
+    },
+    {
+      "path": "crates/agent-runtime/src/platform.rs",
+      "counts": {
+        "error_exit": 56,
+        "whole_read": 0,
+        "unbounded_queue": 0,
+        "lifecycle": 6,
+        "clone_collect": 13,
+        "markers": 0
+      }
+    },
+    {
+      "path": "crates/agent-runtime/src/platform/session.rs",
+      "counts": {
+        "error_exit": 4,
+        "whole_read": 0,
+        "unbounded_queue": 0,
+        "lifecycle": 3,
+        "clone_collect": 1,
+        "markers": 0
+      }
+    },
+    {
+      "path": "crates/agent-runtime/src/platform/work.rs",
+      "counts": {
+        "error_exit": 8,
+        "whole_read": 0,
+        "unbounded_queue": 0,
+        "lifecycle": 5,
+        "clone_collect": 24,
+        "markers": 0
+      }
+    },
+    {
+      "path": "crates/agent-runtime/src/plugin.rs",
+      "counts": {
+        "error_exit": 115,
+        "whole_read": 2,
+        "unbounded_queue": 0,
+        "lifecycle": 5,
+        "clone_collect": 28,
+        "markers": 0
+      }
+    },
+    {
+      "path": "crates/agent-runtime/src/policy.rs",
+      "counts": {
+        "error_exit": 0,
+        "whole_read": 0,
+        "unbounded_queue": 0,
+        "lifecycle": 0,
+        "clone_collect": 5,
+        "markers": 0
+      }
+    },
+    {
+      "path": "crates/agent-runtime/src/prompt.rs",
+      "counts": {
+        "error_exit": 33,
+        "whole_read": 0,
+        "unbounded_queue": 0,
+        "lifecycle": 16,
+        "clone_collect": 44,
+        "markers": 0
+      }
+    },
+    {
+      "path": "crates/agent-runtime/src/prompt_layout_tests.rs",
+      "counts": {
+        "error_exit": 13,
+        "whole_read": 0,
+        "unbounded_queue": 0,
+        "lifecycle": 0,
+        "clone_collect": 4,
+        "markers": 0
+      }
+    },
+    {
+      "path": "crates/agent-runtime/src/services.rs",
+      "counts": {
+        "error_exit": 5,
+        "whole_read": 0,
+        "unbounded_queue": 0,
+        "lifecycle": 35,
+        "clone_collect": 19,
+        "markers": 0
+      }
+    },
+    {
+      "path": "crates/agent-runtime/src/sink.rs",
+      "counts": {
+        "error_exit": 0,
+        "whole_read": 0,
+        "unbounded_queue": 0,
+        "lifecycle": 0,
+        "clone_collect": 0,
+        "markers": 0
+      }
+    },
+    {
+      "path": "crates/agent-runtime/src/status.rs",
+      "counts": {
+        "error_exit": 6,
+        "whole_read": 0,
+        "unbounded_queue": 0,
+        "lifecycle": 3,
+        "clone_collect": 7,
+        "markers": 0
+      }
+    },
+    {
+      "path": "crates/agent-runtime/src/surface.rs",
+      "counts": {
+        "error_exit": 8,
+        "whole_read": 0,
+        "unbounded_queue": 0,
+        "lifecycle": 8,
+        "clone_collect": 31,
+        "markers": 0
+      }
+    },
+    {
+      "path": "crates/agent-runtime/src/task.rs",
+      "counts": {
+        "error_exit": 86,
+        "whole_read": 0,
+        "unbounded_queue": 2,
+        "lifecycle": 59,
+        "clone_collect": 79,
+        "markers": 0
+      }
+    },
+    {
+      "path": "crates/agent-runtime/src/verification.rs",
+      "counts": {
+        "error_exit": 0,
+        "whole_read": 0,
+        "unbounded_queue": 0,
+        "lifecycle": 1,
+        "clone_collect": 0,
+        "markers": 0
+      }
+    },
+    {
+      "path": "crates/agent-runtime/src/work.rs",
+      "counts": {
+        "error_exit": 0,
+        "whole_read": 0,
+        "unbounded_queue": 0,
+        "lifecycle": 2,
+        "clone_collect": 0,
+        "markers": 0
+      }
+    },
+    {
+      "path": "crates/agent-runtime/tests/actor/barrier.rs",
+      "counts": {
+        "error_exit": 23,
+        "whole_read": 0,
+        "unbounded_queue": 0,
+        "lifecycle": 3,
+        "clone_collect": 6,
+        "markers": 0
+      }
+    },
+    {
+      "path": "crates/agent-runtime/tests/actor/budget.rs",
+      "counts": {
+        "error_exit": 5,
+        "whole_read": 0,
+        "unbounded_queue": 0,
+        "lifecycle": 0,
+        "clone_collect": 4,
+        "markers": 0
+      }
+    },
+    {
+      "path": "crates/agent-runtime/tests/actor/busy.rs",
+      "counts": {
+        "error_exit": 13,
+        "whole_read": 0,
+        "unbounded_queue": 0,
+        "lifecycle": 4,
+        "clone_collect": 2,
+        "markers": 0
+      }
+    },
+    {
+      "path": "crates/agent-runtime/tests/actor/context_commit.rs",
+      "counts": {
+        "error_exit": 32,
+        "whole_read": 0,
+        "unbounded_queue": 0,
+        "lifecycle": 10,
+        "clone_collect": 9,
+        "markers": 0
+      }
+    },
+    {
+      "path": "crates/agent-runtime/tests/actor/focus.rs",
+      "counts": {
+        "error_exit": 15,
+        "whole_read": 0,
+        "unbounded_queue": 0,
+        "lifecycle": 0,
+        "clone_collect": 3,
+        "markers": 0
+      }
+    },
+    {
+      "path": "crates/agent-runtime/tests/actor/harness.rs",
+      "counts": {
+        "error_exit": 22,
+        "whole_read": 0,
+        "unbounded_queue": 0,
+        "lifecycle": 23,
+        "clone_collect": 8,
+        "markers": 0
+      }
+    },
+    {
+      "path": "crates/agent-runtime/tests/actor/input.rs",
+      "counts": {
+        "error_exit": 50,
+        "whole_read": 2,
+        "unbounded_queue": 0,
+        "lifecycle": 5,
+        "clone_collect": 14,
+        "markers": 0
+      }
+    },
+    {
+      "path": "crates/agent-runtime/tests/actor/main.rs",
+      "counts": {
+        "error_exit": 0,
+        "whole_read": 0,
+        "unbounded_queue": 0,
+        "lifecycle": 1,
+        "clone_collect": 0,
+        "markers": 0
+      }
+    },
+    {
+      "path": "crates/agent-runtime/tests/actor/materialize_cancel.rs",
+      "counts": {
+        "error_exit": 26,
+        "whole_read": 0,
+        "unbounded_queue": 0,
+        "lifecycle": 7,
+        "clone_collect": 5,
+        "markers": 0
+      }
+    },
+    {
+      "path": "crates/agent-runtime/tests/actor/protocol_bodies.rs",
+      "counts": {
+        "error_exit": 9,
+        "whole_read": 0,
+        "unbounded_queue": 0,
+        "lifecycle": 2,
+        "clone_collect": 3,
+        "markers": 0
+      }
+    },
+    {
+      "path": "crates/agent-runtime/tests/actor/restore.rs",
+      "counts": {
+        "error_exit": 30,
+        "whole_read": 0,
+        "unbounded_queue": 0,
+        "lifecycle": 17,
+        "clone_collect": 1,
+        "markers": 0
+      }
+    },
+    {
+      "path": "crates/agent-runtime/tests/actor/surface.rs",
+      "counts": {
+        "error_exit": 172,
+        "whole_read": 0,
+        "unbounded_queue": 0,
+        "lifecycle": 3,
+        "clone_collect": 50,
+        "markers": 0
+      }
+    },
+    {
+      "path": "crates/agent-runtime/tests/actor/work.rs",
+      "counts": {
+        "error_exit": 31,
+        "whole_read": 0,
+        "unbounded_queue": 0,
+        "lifecycle": 0,
+        "clone_collect": 6,
+        "markers": 0
+      }
+    },
+    {
+      "path": "crates/agent-runtime/tests/actor/work_control.rs",
+      "counts": {
+        "error_exit": 35,
+        "whole_read": 0,
+        "unbounded_queue": 0,
+        "lifecycle": 5,
+        "clone_collect": 13,
+        "markers": 0
+      }
+    },
+    {
+      "path": "crates/agent-runtime/tests/approval.rs",
+      "counts": {
+        "error_exit": 9,
+        "whole_read": 0,
+        "unbounded_queue": 0,
+        "lifecycle": 2,
+        "clone_collect": 9,
+        "markers": 0
+      }
+    },
+    {
+      "path": "crates/agent-runtime/tests/host/capability.rs",
+      "counts": {
+        "error_exit": 23,
+        "whole_read": 0,
+        "unbounded_queue": 0,
+        "lifecycle": 0,
+        "clone_collect": 14,
+        "markers": 0
+      }
+    },
+    {
+      "path": "crates/agent-runtime/tests/host/catalog.rs",
+      "counts": {
+        "error_exit": 14,
+        "whole_read": 0,
+        "unbounded_queue": 0,
+        "lifecycle": 6,
+        "clone_collect": 7,
+        "markers": 0
+      }
+    },
+    {
+      "path": "crates/agent-runtime/tests/host/harness.rs",
+      "counts": {
+        "error_exit": 8,
+        "whole_read": 0,
+        "unbounded_queue": 0,
+        "lifecycle": 5,
+        "clone_collect": 15,
+        "markers": 0
+      }
+    },
+    {
+      "path": "crates/agent-runtime/tests/host/host.rs",
+      "counts": {
+        "error_exit": 39,
+        "whole_read": 0,
+        "unbounded_queue": 0,
+        "lifecycle": 0,
+        "clone_collect": 15,
+        "markers": 0
+      }
+    },
+    {
+      "path": "crates/agent-runtime/tests/host/lifecycle.rs",
+      "counts": {
+        "error_exit": 70,
+        "whole_read": 0,
+        "unbounded_queue": 2,
+        "lifecycle": 3,
+        "clone_collect": 31,
+        "markers": 0
+      }
+    },
+    {
+      "path": "crates/agent-runtime/tests/host/main.rs",
+      "counts": {
+        "error_exit": 0,
+        "whole_read": 0,
+        "unbounded_queue": 0,
+        "lifecycle": 0,
+        "clone_collect": 0,
+        "markers": 0
+      }
+    },
+    {
+      "path": "crates/agent-runtime/tests/instance/anchor.rs",
+      "counts": {
+        "error_exit": 38,
+        "whole_read": 0,
+        "unbounded_queue": 0,
+        "lifecycle": 9,
+        "clone_collect": 1,
+        "markers": 0
+      }
+    },
+    {
+      "path": "crates/agent-runtime/tests/instance/completion.rs",
+      "counts": {
+        "error_exit": 54,
+        "whole_read": 0,
+        "unbounded_queue": 0,
+        "lifecycle": 44,
+        "clone_collect": 1,
+        "markers": 0
+      }
+    },
+    {
+      "path": "crates/agent-runtime/tests/instance/harness.rs",
+      "counts": {
+        "error_exit": 10,
+        "whole_read": 0,
+        "unbounded_queue": 0,
+        "lifecycle": 16,
+        "clone_collect": 4,
+        "markers": 0
+      }
+    },
+    {
+      "path": "crates/agent-runtime/tests/instance/main.rs",
+      "counts": {
+        "error_exit": 0,
+        "whole_read": 0,
+        "unbounded_queue": 0,
+        "lifecycle": 4,
+        "clone_collect": 0,
+        "markers": 0
+      }
+    },
+    {
+      "path": "crates/agent-runtime/tests/instance/restore.rs",
+      "counts": {
+        "error_exit": 114,
+        "whole_read": 0,
+        "unbounded_queue": 0,
+        "lifecycle": 139,
+        "clone_collect": 7,
+        "markers": 0
+      }
+    },
+    {
+      "path": "crates/agent-runtime/tests/instance/shutdown.rs",
+      "counts": {
+        "error_exit": 12,
+        "whole_read": 0,
+        "unbounded_queue": 0,
+        "lifecycle": 8,
+        "clone_collect": 2,
+        "markers": 0
+      }
+    },
+    {
+      "path": "crates/agent-runtime/tests/recall.rs",
+      "counts": {
+        "error_exit": 45,
+        "whole_read": 0,
+        "unbounded_queue": 0,
+        "lifecycle": 4,
+        "clone_collect": 14,
+        "markers": 0
+      }
+    },
+    {
+      "path": "crates/agent-runtime/tests/turn/completion.rs",
+      "counts": {
+        "error_exit": 245,
+        "whole_read": 2,
+        "unbounded_queue": 0,
+        "lifecycle": 157,
+        "clone_collect": 51,
+        "markers": 0
+      }
+    },
+    {
+      "path": "crates/agent-runtime/tests/turn/directive.rs",
+      "counts": {
+        "error_exit": 55,
+        "whole_read": 0,
+        "unbounded_queue": 0,
+        "lifecycle": 25,
+        "clone_collect": 11,
+        "markers": 0
+      }
+    },
+    {
+      "path": "crates/agent-runtime/tests/turn/effects.rs",
+      "counts": {
+        "error_exit": 42,
+        "whole_read": 0,
+        "unbounded_queue": 0,
+        "lifecycle": 8,
+        "clone_collect": 25,
+        "markers": 0
+      }
+    },
+    {
+      "path": "crates/agent-runtime/tests/turn/focus.rs",
+      "counts": {
+        "error_exit": 2,
+        "whole_read": 0,
+        "unbounded_queue": 0,
+        "lifecycle": 0,
+        "clone_collect": 0,
+        "markers": 0
+      }
+    },
+    {
+      "path": "crates/agent-runtime/tests/turn/harness.rs",
+      "counts": {
+        "error_exit": 3,
+        "whole_read": 0,
+        "unbounded_queue": 0,
+        "lifecycle": 5,
+        "clone_collect": 1,
+        "markers": 0
+      }
+    },
+    {
+      "path": "crates/agent-runtime/tests/turn/ingest_cancel.rs",
+      "counts": {
+        "error_exit": 33,
+        "whole_read": 0,
+        "unbounded_queue": 0,
+        "lifecycle": 4,
+        "clone_collect": 7,
+        "markers": 0
+      }
+    },
+    {
+      "path": "crates/agent-runtime/tests/turn/input_bounds.rs",
+      "counts": {
+        "error_exit": 5,
+        "whole_read": 0,
+        "unbounded_queue": 0,
+        "lifecycle": 0,
+        "clone_collect": 1,
+        "markers": 0
+      }
+    },
+    {
+      "path": "crates/agent-runtime/tests/turn/main.rs",
+      "counts": {
+        "error_exit": 0,
+        "whole_read": 0,
+        "unbounded_queue": 0,
+        "lifecycle": 0,
+        "clone_collect": 0,
+        "markers": 0
+      }
+    },
+    {
+      "path": "crates/agent-runtime/tests/turn/maintenance.rs",
+      "counts": {
+        "error_exit": 57,
+        "whole_read": 0,
+        "unbounded_queue": 0,
+        "lifecycle": 8,
+        "clone_collect": 26,
+        "markers": 0
+      }
+    },
+    {
+      "path": "crates/agent-runtime/tests/turn/opportunity.rs",
+      "counts": {
+        "error_exit": 7,
+        "whole_read": 0,
+        "unbounded_queue": 0,
+        "lifecycle": 0,
+        "clone_collect": 0,
+        "markers": 0
+      }
+    },
+    {
+      "path": "crates/agent-runtime/tests/turn/policy.rs",
+      "counts": {
+        "error_exit": 9,
+        "whole_read": 0,
+        "unbounded_queue": 0,
+        "lifecycle": 0,
+        "clone_collect": 8,
+        "markers": 0
+      }
+    },
+    {
+      "path": "crates/agent-runtime/tests/turn/prompt_layout.rs",
+      "counts": {
+        "error_exit": 14,
+        "whole_read": 0,
+        "unbounded_queue": 0,
+        "lifecycle": 0,
+        "clone_collect": 3,
+        "markers": 0
+      }
+    },
+    {
+      "path": "crates/agent-runtime/tests/turn/recovery_surface.rs",
+      "counts": {
+        "error_exit": 10,
+        "whole_read": 0,
+        "unbounded_queue": 0,
+        "lifecycle": 0,
+        "clone_collect": 3,
+        "markers": 0
+      }
+    },
+    {
+      "path": "crates/agent-runtime/tests/turn/safepoint.rs",
+      "counts": {
+        "error_exit": 162,
+        "whole_read": 0,
+        "unbounded_queue": 0,
+        "lifecycle": 68,
+        "clone_collect": 10,
+        "markers": 0
+      }
+    },
+    {
+      "path": "crates/agent-runtime/tests/turn/scopes.rs",
+      "counts": {
+        "error_exit": 39,
+        "whole_read": 0,
+        "unbounded_queue": 0,
+        "lifecycle": 10,
+        "clone_collect": 19,
+        "markers": 0
+      }
+    },
+    {
+      "path": "crates/agent-runtime/tests/turn/settlement.rs",
+      "counts": {
+        "error_exit": 98,
+        "whole_read": 0,
+        "unbounded_queue": 0,
+        "lifecycle": 67,
+        "clone_collect": 6,
+        "markers": 0
+      }
+    },
+    {
+      "path": "crates/agent-runtime/tests/turn/stream.rs",
+      "counts": {
+        "error_exit": 25,
+        "whole_read": 0,
+        "unbounded_queue": 0,
+        "lifecycle": 9,
+        "clone_collect": 7,
+        "markers": 0
+      }
+    },
+    {
+      "path": "crates/agent-runtime/tests/turn/task_progress.rs",
+      "counts": {
+        "error_exit": 10,
+        "whole_read": 0,
+        "unbounded_queue": 0,
+        "lifecycle": 0,
+        "clone_collect": 1,
+        "markers": 0
+      }
+    },
+    {
+      "path": "crates/agent-storage/Cargo.toml",
+      "counts": {
+        "error_exit": 0,
+        "whole_read": 0,
+        "unbounded_queue": 0,
+        "lifecycle": 0,
+        "clone_collect": 0,
+        "markers": 0
+      }
+    },
+    {
+      "path": "crates/agent-storage/src/lib.rs",
+      "counts": {
+        "error_exit": 188,
+        "whole_read": 1,
+        "unbounded_queue": 0,
+        "lifecycle": 7,
+        "clone_collect": 45,
+        "markers": 0
+      }
+    },
+    {
+      "path": "crates/agent-tui/Cargo.toml",
+      "counts": {
+        "error_exit": 0,
+        "whole_read": 0,
+        "unbounded_queue": 0,
+        "lifecycle": 0,
+        "clone_collect": 0,
+        "markers": 0
+      }
+    },
+    {
+      "path": "crates/agent-tui/src/args.rs",
+      "counts": {
+        "error_exit": 6,
+        "whole_read": 0,
+        "unbounded_queue": 0,
+        "lifecycle": 10,
+        "clone_collect": 0,
+        "markers": 0
+      }
+    },
+    {
+      "path": "crates/agent-tui/src/cli.rs",
+      "counts": {
+        "error_exit": 100,
+        "whole_read": 8,
+        "unbounded_queue": 3,
+        "lifecycle": 18,
+        "clone_collect": 24,
+        "markers": 0
+      }
+    },
+    {
+      "path": "crates/agent-tui/src/doctor.rs",
+      "counts": {
+        "error_exit": 14,
+        "whole_read": 2,
+        "unbounded_queue": 0,
+        "lifecycle": 12,
+        "clone_collect": 3,
+        "markers": 0
+      }
+    },
+    {
+      "path": "crates/agent-tui/src/main.rs",
+      "counts": {
+        "error_exit": 0,
+        "whole_read": 0,
+        "unbounded_queue": 0,
+        "lifecycle": 16,
+        "clone_collect": 19,
+        "markers": 0
+      }
+    },
+    {
+      "path": "crates/agent-tui/src/session.rs",
+      "counts": {
+        "error_exit": 60,
+        "whole_read": 6,
+        "unbounded_queue": 0,
+        "lifecycle": 65,
+        "clone_collect": 65,
+        "markers": 0
+      }
+    },
+    {
+      "path": "crates/agent-tui/src/state.rs",
+      "counts": {
+        "error_exit": 17,
+        "whole_read": 1,
+        "unbounded_queue": 1,
+        "lifecycle": 19,
+        "clone_collect": 26,
+        "markers": 0
+      }
+    },
+    {
+      "path": "crates/agent-tui/src/ui.rs",
+      "counts": {
+        "error_exit": 0,
+        "whole_read": 0,
+        "unbounded_queue": 0,
+        "lifecycle": 0,
+        "clone_collect": 4,
+        "markers": 0
+      }
+    },
+    {
+      "path": "crates/agent-tui/src/work.rs",
+      "counts": {
+        "error_exit": 0,
+        "whole_read": 0,
+        "unbounded_queue": 0,
+        "lifecycle": 0,
+        "clone_collect": 0,
+        "markers": 0
+      }
+    },
+    {
+      "path": "crates/agent-tui/tests/real_binary_startup.rs",
+      "counts": {
+        "error_exit": 6,
+        "whole_read": 1,
+        "unbounded_queue": 0,
+        "lifecycle": 0,
+        "clone_collect": 0,
+        "markers": 0
+      }
+    },
+    {
+      "path": "crates/agent-workspace/Cargo.toml",
+      "counts": {
+        "error_exit": 0,
+        "whole_read": 0,
+        "unbounded_queue": 0,
+        "lifecycle": 0,
+        "clone_collect": 0,
+        "markers": 0
+      }
+    },
+    {
+      "path": "crates/agent-workspace/src/bin/crash_probe.rs",
+      "counts": {
+        "error_exit": 14,
+        "whole_read": 0,
+        "unbounded_queue": 0,
+        "lifecycle": 0,
+        "clone_collect": 2,
+        "markers": 0
+      }
+    },
+    {
+      "path": "crates/agent-workspace/src/broker.rs",
+      "counts": {
+        "error_exit": 17,
+        "whole_read": 0,
+        "unbounded_queue": 0,
+        "lifecycle": 1,
+        "clone_collect": 17,
+        "markers": 0
+      }
+    },
+    {
+      "path": "crates/agent-workspace/src/confined.rs",
+      "counts": {
+        "error_exit": 0,
+        "whole_read": 0,
+        "unbounded_queue": 0,
+        "lifecycle": 1,
+        "clone_collect": 3,
+        "markers": 0
+      }
+    },
+    {
+      "path": "crates/agent-workspace/src/handles.rs",
+      "counts": {
+        "error_exit": 10,
+        "whole_read": 2,
+        "unbounded_queue": 0,
+        "lifecycle": 0,
+        "clone_collect": 4,
+        "markers": 0
+      }
+    },
+    {
+      "path": "crates/agent-workspace/src/journal.rs",
+      "counts": {
+        "error_exit": 144,
+        "whole_read": 1,
+        "unbounded_queue": 1,
+        "lifecycle": 3,
+        "clone_collect": 49,
+        "markers": 0
+      }
+    },
+    {
+      "path": "crates/agent-workspace/src/lib.rs",
+      "counts": {
+        "error_exit": 438,
+        "whole_read": 33,
+        "unbounded_queue": 2,
+        "lifecycle": 4,
+        "clone_collect": 80,
+        "markers": 0
+      }
+    },
+    {
+      "path": "crates/agent-workspace/src/process_journal.rs",
+      "counts": {
+        "error_exit": 29,
+        "whole_read": 0,
+        "unbounded_queue": 0,
+        "lifecycle": 2,
+        "clone_collect": 14,
+        "markers": 0
+      }
+    },
+    {
+      "path": "crates/agent-workspace/src/remote_journal.rs",
+      "counts": {
+        "error_exit": 24,
+        "whole_read": 0,
+        "unbounded_queue": 0,
+        "lifecycle": 2,
+        "clone_collect": 8,
+        "markers": 0
+      }
+    },
+    {
+      "path": "crates/agent-workspace/src/runtime_facts.rs",
+      "counts": {
+        "error_exit": 9,
+        "whole_read": 1,
+        "unbounded_queue": 0,
+        "lifecycle": 0,
+        "clone_collect": 2,
+        "markers": 0
+      }
+    },
+    {
+      "path": "crates/agent-workspace/src/storage_faults.rs",
+      "counts": {
+        "error_exit": 1,
+        "whole_read": 0,
+        "unbounded_queue": 0,
+        "lifecycle": 0,
+        "clone_collect": 1,
+        "markers": 0
+      }
+    },
+    {
+      "path": "crates/agent-workspace/tests/abrupt_prepare_crash.rs",
+      "counts": {
+        "error_exit": 43,
+        "whole_read": 1,
+        "unbounded_queue": 0,
+        "lifecycle": 0,
+        "clone_collect": 0,
+        "markers": 0
+      }
+    },
+    {
+      "path": "crates/agent-workspace/tests/disk_full_recovery.rs",
+      "counts": {
+        "error_exit": 26,
+        "whole_read": 3,
+        "unbounded_queue": 0,
+        "lifecycle": 0,
+        "clone_collect": 2,
+        "markers": 0
+      }
+    },
+    {
+      "path": "crates/context-baselines/Cargo.toml",
+      "counts": {
+        "error_exit": 0,
+        "whole_read": 0,
+        "unbounded_queue": 0,
+        "lifecycle": 0,
+        "clone_collect": 0,
+        "markers": 0
+      }
+    },
+    {
+      "path": "crates/context-baselines/src/append.rs",
+      "counts": {
+        "error_exit": 7,
+        "whole_read": 0,
+        "unbounded_queue": 0,
+        "lifecycle": 5,
+        "clone_collect": 2,
+        "markers": 0
+      }
+    },
+    {
+      "path": "crates/context-baselines/src/lib.rs",
+      "counts": {
+        "error_exit": 111,
+        "whole_read": 0,
+        "unbounded_queue": 2,
+        "lifecycle": 15,
+        "clone_collect": 13,
+        "markers": 0
+      }
+    },
+    {
+      "path": "crates/context-baselines/src/rolling.rs",
+      "counts": {
+        "error_exit": 14,
+        "whole_read": 0,
+        "unbounded_queue": 2,
+        "lifecycle": 9,
+        "clone_collect": 8,
+        "markers": 0
+      }
+    },
+    {
+      "path": "crates/context-baselines/src/shared.rs",
+      "counts": {
+        "error_exit": 0,
+        "whole_read": 0,
+        "unbounded_queue": 1,
+        "lifecycle": 0,
+        "clone_collect": 10,
+        "markers": 0
+      }
+    },
+    {
+      "path": "crates/context-contextcore/Cargo.toml",
+      "counts": {
+        "error_exit": 0,
+        "whole_read": 0,
+        "unbounded_queue": 0,
+        "lifecycle": 0,
+        "clone_collect": 0,
+        "markers": 0
+      }
+    },
+    {
+      "path": "crates/context-contextcore/src/adapter.rs",
+      "counts": {
+        "error_exit": 0,
+        "whole_read": 0,
+        "unbounded_queue": 0,
+        "lifecycle": 4,
+        "clone_collect": 2,
+        "markers": 0
+      }
+    },
+    {
+      "path": "crates/context-contextcore/src/lib.rs",
+      "counts": {
+        "error_exit": 0,
+        "whole_read": 0,
+        "unbounded_queue": 0,
+        "lifecycle": 0,
+        "clone_collect": 0,
+        "markers": 0
+      }
+    },
+    {
+      "path": "crates/context-contextcore/src/wire.rs",
+      "counts": {
+        "error_exit": 17,
+        "whole_read": 0,
+        "unbounded_queue": 0,
+        "lifecycle": 0,
+        "clone_collect": 2,
+        "markers": 0
+      }
+    },
+    {
+      "path": "crates/context-contextcore/tests/service.rs",
+      "counts": {
+        "error_exit": 105,
+        "whole_read": 0,
+        "unbounded_queue": 1,
+        "lifecycle": 22,
+        "clone_collect": 10,
+        "markers": 0
+      }
+    },
+    {
+      "path": "crates/context-simple/Cargo.toml",
+      "counts": {
+        "error_exit": 0,
+        "whole_read": 0,
+        "unbounded_queue": 0,
+        "lifecycle": 0,
+        "clone_collect": 0,
+        "markers": 0
+      }
+    },
+    {
+      "path": "crates/context-simple/src/access.rs",
+      "counts": {
+        "error_exit": 3,
+        "whole_read": 0,
+        "unbounded_queue": 0,
+        "lifecycle": 0,
+        "clone_collect": 0,
+        "markers": 0
+      }
+    },
+    {
+      "path": "crates/context-simple/src/checkpoint.rs",
+      "counts": {
+        "error_exit": 0,
+        "whole_read": 0,
+        "unbounded_queue": 0,
+        "lifecycle": 12,
+        "clone_collect": 3,
+        "markers": 0
+      }
+    },
+    {
+      "path": "crates/context-simple/src/diagnostics.rs",
+      "counts": {
+        "error_exit": 0,
+        "whole_read": 0,
+        "unbounded_queue": 0,
+        "lifecycle": 1,
+        "clone_collect": 0,
+        "markers": 0
+      }
+    },
+    {
+      "path": "crates/context-simple/src/directive.rs",
+      "counts": {
+        "error_exit": 0,
+        "whole_read": 0,
+        "unbounded_queue": 0,
+        "lifecycle": 1,
+        "clone_collect": 0,
+        "markers": 0
+      }
+    },
+    {
+      "path": "crates/context-simple/src/distill.rs",
+      "counts": {
+        "error_exit": 0,
+        "whole_read": 0,
+        "unbounded_queue": 0,
+        "lifecycle": 0,
+        "clone_collect": 2,
+        "markers": 0
+      }
+    },
+    {
+      "path": "crates/context-simple/src/engine.rs",
+      "counts": {
+        "error_exit": 2,
+        "whole_read": 0,
+        "unbounded_queue": 1,
+        "lifecycle": 50,
+        "clone_collect": 34,
+        "markers": 0
+      }
+    },
+    {
+      "path": "crates/context-simple/src/gc/full/mod.rs",
+      "counts": {
+        "error_exit": 4,
+        "whole_read": 0,
+        "unbounded_queue": 2,
+        "lifecycle": 5,
+        "clone_collect": 26,
+        "markers": 0
+      }
+    },
+    {
+      "path": "crates/context-simple/src/gc/full/tests.rs",
+      "counts": {
+        "error_exit": 107,
+        "whole_read": 0,
+        "unbounded_queue": 0,
+        "lifecycle": 1,
+        "clone_collect": 3,
+        "markers": 0
+      }
+    },
+    {
+      "path": "crates/context-simple/src/gc/minor.rs",
+      "counts": {
+        "error_exit": 0,
+        "whole_read": 0,
+        "unbounded_queue": 0,
+        "lifecycle": 0,
+        "clone_collect": 8,
+        "markers": 0
+      }
+    },
+    {
+      "path": "crates/context-simple/src/gc/mod.rs",
+      "counts": {
+        "error_exit": 0,
+        "whole_read": 0,
+        "unbounded_queue": 0,
+        "lifecycle": 0,
+        "clone_collect": 0,
+        "markers": 0
+      }
+    },
+    {
+      "path": "crates/context-simple/src/gc/reachability.rs",
+      "counts": {
+        "error_exit": 0,
+        "whole_read": 0,
+        "unbounded_queue": 0,
+        "lifecycle": 2,
+        "clone_collect": 12,
+        "markers": 0
+      }
+    },
+    {
+      "path": "crates/context-simple/src/heap.rs",
+      "counts": {
+        "error_exit": 1,
+        "whole_read": 0,
+        "unbounded_queue": 0,
+        "lifecycle": 3,
+        "clone_collect": 9,
+        "markers": 0
+      }
+    },
+    {
+      "path": "crates/context-simple/src/index/catalog.rs",
+      "counts": {
+        "error_exit": 29,
+        "whole_read": 0,
+        "unbounded_queue": 0,
+        "lifecycle": 4,
+        "clone_collect": 38,
+        "markers": 0
+      }
+    },
+    {
+      "path": "crates/context-simple/src/index/dependency.rs",
+      "counts": {
+        "error_exit": 12,
+        "whole_read": 0,
+        "unbounded_queue": 0,
+        "lifecycle": 0,
+        "clone_collect": 3,
+        "markers": 0
+      }
+    },
+    {
+      "path": "crates/context-simple/src/index/entity.rs",
+      "counts": {
+        "error_exit": 0,
+        "whole_read": 0,
+        "unbounded_queue": 0,
+        "lifecycle": 2,
+        "clone_collect": 5,
+        "markers": 0
+      }
+    },
+    {
+      "path": "crates/context-simple/src/index/external.rs",
+      "counts": {
+        "error_exit": 9,
+        "whole_read": 0,
+        "unbounded_queue": 0,
+        "lifecycle": 13,
+        "clone_collect": 4,
+        "markers": 0
+      }
+    },
+    {
+      "path": "crates/context-simple/src/index/heap.rs",
+      "counts": {
+        "error_exit": 0,
+        "whole_read": 0,
+        "unbounded_queue": 0,
+        "lifecycle": 4,
+        "clone_collect": 1,
+        "markers": 0
+      }
+    },
+    {
+      "path": "crates/context-simple/src/index/indexes.rs",
+      "counts": {
+        "error_exit": 0,
+        "whole_read": 0,
+        "unbounded_queue": 0,
+        "lifecycle": 1,
+        "clone_collect": 3,
+        "markers": 0
+      }
+    },
+    {
+      "path": "crates/context-simple/src/index/mod.rs",
+      "counts": {
+        "error_exit": 0,
+        "whole_read": 0,
+        "unbounded_queue": 0,
+        "lifecycle": 0,
+        "clone_collect": 0,
+        "markers": 0
+      }
+    },
+    {
+      "path": "crates/context-simple/src/index/task.rs",
+      "counts": {
+        "error_exit": 0,
+        "whole_read": 0,
+        "unbounded_queue": 0,
+        "lifecycle": 0,
+        "clone_collect": 0,
+        "markers": 0
+      }
+    },
+    {
+      "path": "crates/context-simple/src/item.rs",
+      "counts": {
+        "error_exit": 0,
+        "whole_read": 0,
+        "unbounded_queue": 0,
+        "lifecycle": 0,
+        "clone_collect": 2,
+        "markers": 0
+      }
+    },
+    {
+      "path": "crates/context-simple/src/ledger.rs",
+      "counts": {
+        "error_exit": 3,
+        "whole_read": 0,
+        "unbounded_queue": 0,
+        "lifecycle": 0,
+        "clone_collect": 2,
+        "markers": 0
+      }
+    },
+    {
+      "path": "crates/context-simple/src/lib.rs",
+      "counts": {
+        "error_exit": 0,
+        "whole_read": 0,
+        "unbounded_queue": 0,
+        "lifecycle": 1,
+        "clone_collect": 0,
+        "markers": 0
+      }
+    },
+    {
+      "path": "crates/context-simple/src/materializer.rs",
+      "counts": {
+        "error_exit": 0,
+        "whole_read": 0,
+        "unbounded_queue": 0,
+        "lifecycle": 2,
+        "clone_collect": 40,
+        "markers": 0
+      }
+    },
+    {
+      "path": "crates/context-simple/src/policy/mod.rs",
+      "counts": {
+        "error_exit": 0,
+        "whole_read": 0,
+        "unbounded_queue": 0,
+        "lifecycle": 0,
+        "clone_collect": 0,
+        "markers": 0
+      }
+    },
+    {
+      "path": "crates/context-simple/src/policy/simple.rs",
+      "counts": {
+        "error_exit": 0,
+        "whole_read": 0,
+        "unbounded_queue": 0,
+        "lifecycle": 0,
+        "clone_collect": 1,
+        "markers": 0
+      }
+    },
+    {
+      "path": "crates/context-simple/src/reactivation.rs",
+      "counts": {
+        "error_exit": 0,
+        "whole_read": 0,
+        "unbounded_queue": 0,
+        "lifecycle": 0,
+        "clone_collect": 1,
+        "markers": 0
+      }
+    },
+    {
+      "path": "crates/context-simple/src/residency.rs",
+      "counts": {
+        "error_exit": 0,
+        "whole_read": 0,
+        "unbounded_queue": 0,
+        "lifecycle": 0,
+        "clone_collect": 0,
+        "markers": 0
+      }
+    },
+    {
+      "path": "crates/context-simple/src/scope.rs",
+      "counts": {
+        "error_exit": 2,
+        "whole_read": 0,
+        "unbounded_queue": 0,
+        "lifecycle": 3,
+        "clone_collect": 7,
+        "markers": 0
+      }
+    },
+    {
+      "path": "crates/context-simple/src/scope_tree.rs",
+      "counts": {
+        "error_exit": 8,
+        "whole_read": 0,
+        "unbounded_queue": 0,
+        "lifecycle": 4,
+        "clone_collect": 0,
+        "markers": 0
+      }
+    },
+    {
+      "path": "crates/context-simple/src/store.rs",
+      "counts": {
+        "error_exit": 74,
+        "whole_read": 1,
+        "unbounded_queue": 3,
+        "lifecycle": 18,
+        "clone_collect": 67,
+        "markers": 0
+      }
+    },
+    {
+      "path": "crates/context-simple/src/tests/admit.rs",
+      "counts": {
+        "error_exit": 305,
+        "whole_read": 3,
+        "unbounded_queue": 0,
+        "lifecycle": 58,
+        "clone_collect": 23,
+        "markers": 0
+      }
+    },
+    {
+      "path": "crates/context-simple/src/tests/anchor_expiry.rs",
+      "counts": {
+        "error_exit": 10,
+        "whole_read": 0,
+        "unbounded_queue": 0,
+        "lifecycle": 0,
+        "clone_collect": 0,
+        "markers": 0
+      }
+    },
+    {
+      "path": "crates/context-simple/src/tests/consumption_truth.rs",
+      "counts": {
+        "error_exit": 13,
+        "whole_read": 0,
+        "unbounded_queue": 0,
+        "lifecycle": 0,
+        "clone_collect": 0,
+        "markers": 0
+      }
+    },
+    {
+      "path": "crates/context-simple/src/tests/directive.rs",
+      "counts": {
+        "error_exit": 82,
+        "whole_read": 0,
+        "unbounded_queue": 0,
+        "lifecycle": 1,
+        "clone_collect": 1,
+        "markers": 0
+      }
+    },
+    {
+      "path": "crates/context-simple/src/tests/distill.rs",
+      "counts": {
+        "error_exit": 47,
+        "whole_read": 0,
+        "unbounded_queue": 0,
+        "lifecycle": 7,
+        "clone_collect": 2,
+        "markers": 0
+      }
+    },
+    {
+      "path": "crates/context-simple/src/tests/entity.rs",
+      "counts": {
+        "error_exit": 82,
+        "whole_read": 0,
+        "unbounded_queue": 0,
+        "lifecycle": 0,
+        "clone_collect": 7,
+        "markers": 0
+      }
+    },
+    {
+      "path": "crates/context-simple/src/tests/foreground.rs",
+      "counts": {
+        "error_exit": 42,
+        "whole_read": 0,
+        "unbounded_queue": 0,
+        "lifecycle": 19,
+        "clone_collect": 6,
+        "markers": 0
+      }
+    },
+    {
+      "path": "crates/context-simple/src/tests/gc_backpressure.rs",
+      "counts": {
+        "error_exit": 14,
+        "whole_read": 0,
+        "unbounded_queue": 1,
+        "lifecycle": 2,
+        "clone_collect": 0,
+        "markers": 0
+      }
+    },
+    {
+      "path": "crates/context-simple/src/tests/gc_bounds.rs",
+      "counts": {
+        "error_exit": 36,
+        "whole_read": 0,
+        "unbounded_queue": 0,
+        "lifecycle": 11,
+        "clone_collect": 1,
+        "markers": 0
+      }
+    },
+    {
+      "path": "crates/context-simple/src/tests/harness.rs",
+      "counts": {
+        "error_exit": 15,
+        "whole_read": 0,
+        "unbounded_queue": 0,
+        "lifecycle": 0,
+        "clone_collect": 4,
+        "markers": 0
+      }
+    },
+    {
+      "path": "crates/context-simple/src/tests/lifecycle.rs",
+      "counts": {
+        "error_exit": 168,
+        "whole_read": 0,
+        "unbounded_queue": 0,
+        "lifecycle": 20,
+        "clone_collect": 9,
+        "markers": 0
+      }
+    },
+    {
+      "path": "crates/context-simple/src/tests/mod.rs",
+      "counts": {
+        "error_exit": 0,
+        "whole_read": 0,
+        "unbounded_queue": 0,
+        "lifecycle": 0,
+        "clone_collect": 0,
+        "markers": 0
+      }
+    },
+    {
+      "path": "crates/context-simple/src/tests/pending_owner.rs",
+      "counts": {
+        "error_exit": 30,
+        "whole_read": 0,
+        "unbounded_queue": 0,
+        "lifecycle": 6,
+        "clone_collect": 0,
+        "markers": 0
+      }
+    },
+    {
+      "path": "crates/context-simple/src/tests/required.rs",
+      "counts": {
+        "error_exit": 20,
+        "whole_read": 0,
+        "unbounded_queue": 0,
+        "lifecycle": 0,
+        "clone_collect": 2,
+        "markers": 0
+      }
+    },
+    {
+      "path": "crates/context-simple/src/tests/residency.rs",
+      "counts": {
+        "error_exit": 159,
+        "whole_read": 0,
+        "unbounded_queue": 0,
+        "lifecycle": 26,
+        "clone_collect": 3,
+        "markers": 0
+      }
+    },
+    {
+      "path": "crates/context-simple/src/tests/scope.rs",
+      "counts": {
+        "error_exit": 81,
+        "whole_read": 0,
+        "unbounded_queue": 0,
+        "lifecycle": 5,
+        "clone_collect": 0,
+        "markers": 0
+      }
+    },
+    {
+      "path": "crates/context-simple/src/tests/scope_retirement.rs",
+      "counts": {
+        "error_exit": 35,
+        "whole_read": 0,
+        "unbounded_queue": 0,
+        "lifecycle": 6,
+        "clone_collect": 0,
+        "markers": 0
+      }
+    },
+    {
+      "path": "crates/context-simple/src/tests/search.rs",
+      "counts": {
+        "error_exit": 146,
+        "whole_read": 0,
+        "unbounded_queue": 1,
+        "lifecycle": 8,
+        "clone_collect": 8,
+        "markers": 0
+      }
+    },
+    {
+      "path": "crates/context-simple/src/tests/stored_metadata.rs",
+      "counts": {
+        "error_exit": 16,
+        "whole_read": 0,
+        "unbounded_queue": 0,
+        "lifecycle": 8,
+        "clone_collect": 2,
+        "markers": 0
+      }
+    },
+    {
+      "path": "crates/provider-openai/Cargo.toml",
+      "counts": {
+        "error_exit": 0,
+        "whole_read": 0,
+        "unbounded_queue": 0,
+        "lifecycle": 0,
+        "clone_collect": 0,
+        "markers": 0
+      }
+    },
+    {
+      "path": "crates/provider-openai/src/diagnostics.rs",
+      "counts": {
+        "error_exit": 1,
+        "whole_read": 0,
+        "unbounded_queue": 0,
+        "lifecycle": 0,
+        "clone_collect": 5,
+        "markers": 0
+      }
+    },
+    {
+      "path": "crates/provider-openai/src/diagnostics/tests.rs",
+      "counts": {
+        "error_exit": 33,
+        "whole_read": 0,
+        "unbounded_queue": 0,
+        "lifecycle": 2,
+        "clone_collect": 2,
+        "markers": 0
+      }
+    },
+    {
+      "path": "crates/provider-openai/src/lib.rs",
+      "counts": {
+        "error_exit": 95,
+        "whole_read": 0,
+        "unbounded_queue": 5,
+        "lifecycle": 12,
+        "clone_collect": 6,
+        "markers": 0
+      }
+    },
+    {
+      "path": "crates/provider-openai/src/prompt_cache.rs",
+      "counts": {
+        "error_exit": 0,
+        "whole_read": 0,
+        "unbounded_queue": 0,
+        "lifecycle": 0,
+        "clone_collect": 0,
+        "markers": 0
+      }
+    },
+    {
+      "path": "crates/provider-openai/src/prompt_cache/tests.rs",
+      "counts": {
+        "error_exit": 25,
+        "whole_read": 0,
+        "unbounded_queue": 0,
+        "lifecycle": 0,
+        "clone_collect": 4,
+        "markers": 0
+      }
+    },
+    {
+      "path": "crates/provider-openai/src/reasoning.rs",
+      "counts": {
+        "error_exit": 1,
+        "whole_read": 0,
+        "unbounded_queue": 0,
+        "lifecycle": 0,
+        "clone_collect": 1,
+        "markers": 0
+      }
+    },
+    {
+      "path": "crates/provider-openai/src/responses.rs",
+      "counts": {
+        "error_exit": 47,
+        "whole_read": 0,
+        "unbounded_queue": 1,
+        "lifecycle": 0,
+        "clone_collect": 6,
+        "markers": 0
+      }
+    },
+    {
+      "path": "crates/provider-openai/src/retry.rs",
+      "counts": {
+        "error_exit": 60,
+        "whole_read": 2,
+        "unbounded_queue": 2,
+        "lifecycle": 16,
+        "clone_collect": 39,
+        "markers": 0
+      }
+    },
+    {
+      "path": "crates/provider-openai/src/sse.rs",
+      "counts": {
+        "error_exit": 62,
+        "whole_read": 0,
+        "unbounded_queue": 1,
+        "lifecycle": 1,
+        "clone_collect": 10,
+        "markers": 0
+      }
+    },
+    {
+      "path": "crates/provider-openai/src/wire_names.rs",
+      "counts": {
+        "error_exit": 4,
+        "whole_read": 0,
+        "unbounded_queue": 0,
+        "lifecycle": 3,
+        "clone_collect": 2,
+        "markers": 0
+      }
+    },
+    {
+      "path": "crates/tool-runtime/Cargo.toml",
+      "counts": {
+        "error_exit": 0,
+        "whole_read": 0,
+        "unbounded_queue": 0,
+        "lifecycle": 0,
+        "clone_collect": 0,
+        "markers": 0
+      }
+    },
+    {
+      "path": "crates/tool-runtime/src/host_policies.rs",
+      "counts": {
+        "error_exit": 0,
+        "whole_read": 0,
+        "unbounded_queue": 0,
+        "lifecycle": 0,
+        "clone_collect": 0,
+        "markers": 0
+      }
+    },
+    {
+      "path": "crates/tool-runtime/src/lib.rs",
+      "counts": {
+        "error_exit": 0,
+        "whole_read": 0,
+        "unbounded_queue": 0,
+        "lifecycle": 0,
+        "clone_collect": 0,
+        "markers": 0
+      }
+    },
+    {
+      "path": "crates/tool-runtime/src/proof_runner.rs",
+      "counts": {
+        "error_exit": 25,
+        "whole_read": 0,
+        "unbounded_queue": 0,
+        "lifecycle": 2,
+        "clone_collect": 9,
+        "markers": 0
+      }
+    },
+    {
+      "path": "crates/tool-runtime/src/python.rs",
+      "counts": {
+        "error_exit": 25,
+        "whole_read": 2,
+        "unbounded_queue": 1,
+        "lifecycle": 0,
+        "clone_collect": 8,
+        "markers": 0
+      }
+    },
+    {
+      "path": "crates/tool-runtime/src/registry.rs",
+      "counts": {
+        "error_exit": 107,
+        "whole_read": 1,
+        "unbounded_queue": 1,
+        "lifecycle": 5,
+        "clone_collect": 50,
+        "markers": 0
+      }
+    },
+    {
+      "path": "crates/tool-runtime/src/supervision.rs",
+      "counts": {
+        "error_exit": 68,
+        "whole_read": 3,
+        "unbounded_queue": 0,
+        "lifecycle": 2,
+        "clone_collect": 4,
+        "markers": 0
+      }
+    },
+    {
+      "path": "crates/tool-runtime/src/tools/artifact.rs",
+      "counts": {
+        "error_exit": 23,
+        "whole_read": 0,
+        "unbounded_queue": 0,
+        "lifecycle": 1,
+        "clone_collect": 1,
+        "markers": 0
+      }
+    },
+    {
+      "path": "crates/tool-runtime/src/tools/code.rs",
+      "counts": {
+        "error_exit": 21,
+        "whole_read": 1,
+        "unbounded_queue": 0,
+        "lifecycle": 7,
+        "clone_collect": 13,
+        "markers": 0
+      }
+    },
+    {
+      "path": "crates/tool-runtime/src/tools/context.rs",
+      "counts": {
+        "error_exit": 0,
+        "whole_read": 0,
+        "unbounded_queue": 0,
+        "lifecycle": 0,
+        "clone_collect": 4,
+        "markers": 0
+      }
+    },
+    {
+      "path": "crates/tool-runtime/src/tools/edit.rs",
+      "counts": {
+        "error_exit": 68,
+        "whole_read": 5,
+        "unbounded_queue": 0,
+        "lifecycle": 3,
+        "clone_collect": 7,
+        "markers": 0
+      }
+    },
+    {
+      "path": "crates/tool-runtime/src/tools/fs.rs",
+      "counts": {
+        "error_exit": 99,
+        "whole_read": 4,
+        "unbounded_queue": 0,
+        "lifecycle": 3,
+        "clone_collect": 15,
+        "markers": 0
+      }
+    },
+    {
+      "path": "crates/tool-runtime/src/tools/git.rs",
+      "counts": {
+        "error_exit": 42,
+        "whole_read": 0,
+        "unbounded_queue": 0,
+        "lifecycle": 23,
+        "clone_collect": 2,
+        "markers": 0
+      }
+    },
+    {
+      "path": "crates/tool-runtime/src/tools/mod.rs",
+      "counts": {
+        "error_exit": 29,
+        "whole_read": 4,
+        "unbounded_queue": 1,
+        "lifecycle": 9,
+        "clone_collect": 10,
+        "markers": 0
+      }
+    },
+    {
+      "path": "crates/tool-runtime/src/tools/patch.rs",
+      "counts": {
+        "error_exit": 130,
+        "whole_read": 17,
+        "unbounded_queue": 0,
+        "lifecycle": 4,
+        "clone_collect": 28,
+        "markers": 0
+      }
+    },
+    {
+      "path": "crates/tool-runtime/src/tools/process.rs",
+      "counts": {
+        "error_exit": 86,
+        "whole_read": 0,
+        "unbounded_queue": 0,
+        "lifecycle": 27,
+        "clone_collect": 24,
+        "markers": 0
+      }
+    },
+    {
+      "path": "crates/tool-runtime/src/tools/search.rs",
+      "counts": {
+        "error_exit": 31,
+        "whole_read": 0,
+        "unbounded_queue": 0,
+        "lifecycle": 18,
+        "clone_collect": 9,
+        "markers": 0
+      }
+    },
+    {
+      "path": "crates/tool-runtime/src/tools/session.rs",
+      "counts": {
+        "error_exit": 80,
+        "whole_read": 3,
+        "unbounded_queue": 0,
+        "lifecycle": 29,
+        "clone_collect": 24,
+        "markers": 0
+      }
+    },
+    {
+      "path": "crates/tool-runtime/src/tools/shell.rs",
+      "counts": {
+        "error_exit": 40,
+        "whole_read": 4,
+        "unbounded_queue": 1,
+        "lifecycle": 21,
+        "clone_collect": 16,
+        "markers": 0
+      }
+    },
+    {
+      "path": "crates/tool-runtime/src/tools/stream.rs",
+      "counts": {
+        "error_exit": 7,
+        "whole_read": 0,
+        "unbounded_queue": 1,
+        "lifecycle": 1,
+        "clone_collect": 2,
+        "markers": 0
+      }
+    },
+    {
+      "path": "crates/tool-runtime/src/tools/task.rs",
+      "counts": {
+        "error_exit": 2,
+        "whole_read": 0,
+        "unbounded_queue": 0,
+        "lifecycle": 2,
+        "clone_collect": 0,
+        "markers": 0
+      }
+    },
+    {
+      "path": "crates/tool-runtime/src/tools/task_manage.rs",
+      "counts": {
+        "error_exit": 1,
+        "whole_read": 0,
+        "unbounded_queue": 0,
+        "lifecycle": 0,
+        "clone_collect": 0,
+        "markers": 0
+      }
+    },
+    {
+      "path": "crates/tool-runtime/src/tools/verify.rs",
+      "counts": {
+        "error_exit": 29,
+        "whole_read": 0,
+        "unbounded_queue": 0,
+        "lifecycle": 2,
+        "clone_collect": 6,
+        "markers": 0
+      }
+    },
+    {
+      "path": "crates/tool-runtime/src/tools/view.rs",
+      "counts": {
+        "error_exit": 0,
+        "whole_read": 0,
+        "unbounded_queue": 0,
+        "lifecycle": 1,
+        "clone_collect": 1,
+        "markers": 0
+      }
+    },
+    {
+      "path": "crates/tool-runtime/src/verification.rs",
+      "counts": {
+        "error_exit": 60,
+        "whole_read": 1,
+        "unbounded_queue": 1,
+        "lifecycle": 1,
+        "clone_collect": 21,
+        "markers": 0
+      }
+    },
+    {
+      "path": "scripts/doc_consistency.py",
+      "counts": {
+        "error_exit": 0,
+        "whole_read": 0,
+        "unbounded_queue": 0,
+        "lifecycle": 0,
+        "clone_collect": 0,
+        "markers": 0
+      }
+    }
+  ]
+}

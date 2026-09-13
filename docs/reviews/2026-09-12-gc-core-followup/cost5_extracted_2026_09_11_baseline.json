@@ -1,0 +1,511 @@
+{
+  "segments": [
+    {
+      "segment": "a-main",
+      "quality": {
+        "exit_code": 0,
+        "forced_tree_stop": false,
+        "wall_ms": 12478.67,
+        "event_counts": {
+          "run_started": 1,
+          "runtime_commit_barrier": 1,
+          "focus_changed": 1,
+          "context_maintained": 14,
+          "task_tool_requirements_changed": 1,
+          "user_message_accepted": 3,
+          "protocol_body_cache_stats": 7,
+          "context_prepared": 7,
+          "tool_surface_planned": 7,
+          "model_started": 7,
+          "context_consumed": 7,
+          "model_used": 7,
+          "tool_leases_reconciled": 7,
+          "operation_accepted": 9,
+          "tool_started": 9,
+          "tool_finished": 9,
+          "execution_frontier": 8,
+          "execution_batch_settled": 6,
+          "context_degraded": 6,
+          "lease_issued": 3,
+          "task_resume_committed": 3,
+          "checkpoint_durable": 3,
+          "assistant_message": 1,
+          "context_gc": 1,
+          "turn_completed": 1
+        }
+      },
+      "decision_lane": {
+        "rows": 7,
+        "identity": {
+          "observed": 0,
+          "estimated": 0,
+          "unknown": 0,
+          "unreported": 7
+        },
+        "input_tokens": 0,
+        "output_tokens": 0,
+        "cache_read_input_tokens": 0,
+        "attempts": 7,
+        "retries": 0,
+        "raw_input_tokens_lower_bound": 39857,
+        "raw_output_tokens_lower_bound": 1649,
+        "raw_cached_input_tokens_lower_bound": 25728,
+        "cache_write_input_tokens": 0,
+        "cache_write_input_tokens_reported_rows": 0,
+        "cache_miss_input_tokens": 0,
+        "cache_miss_input_tokens_reported_rows": 0
+      },
+      "maintenance_lane": {
+        "rows": 0,
+        "identity": {
+          "observed": 0,
+          "estimated": 0,
+          "unknown": 0,
+          "unreported": 0
+        },
+        "input_tokens": 0,
+        "output_tokens": 0,
+        "cache_read_input_tokens": 0,
+        "attempts": 0,
+        "retries": 0,
+        "raw_input_tokens_lower_bound": 0,
+        "raw_output_tokens_lower_bound": 0,
+        "raw_cached_input_tokens_lower_bound": 0,
+        "cache_write_input_tokens": 0,
+        "cache_write_input_tokens_reported_rows": 0,
+        "cache_miss_input_tokens": 0,
+        "cache_miss_input_tokens_reported_rows": 0
+      },
+      "compaction_rows": {
+        "count": 0,
+        "identity": {
+          "observed": 0,
+          "estimated": 0,
+          "unknown": 0,
+          "unreported": 0
+        },
+        "input_tokens": 0,
+        "output_tokens": 0,
+        "cache_read_input_tokens": 0,
+        "cache_write_input_tokens": 0,
+        "cache_miss_input_tokens": 0,
+        "retries": 0
+      },
+      "gc": {
+        "passes": 1,
+        "evicted": 6,
+        "externalized": 0,
+        "store_write_bytes": 0,
+        "store_io_failures": 0
+      },
+      "bill_lower_bound": true,
+      "_walls_ms": [
+        12478.67
+      ]
+    },
+    {
+      "segment": "b-main",
+      "quality": {
+        "exit_code": 0,
+        "forced_tree_stop": false,
+        "wall_ms": 11462.83,
+        "event_counts": {
+          "run_started": 1,
+          "runtime_commit_barrier": 1,
+          "focus_changed": 1,
+          "context_maintained": 12,
+          "task_tool_requirements_changed": 1,
+          "user_message_accepted": 3,
+          "protocol_body_cache_stats": 6,
+          "context_prepared": 6,
+          "tool_surface_planned": 6,
+          "model_started": 6,
+          "context_consumed": 6,
+          "model_used": 6,
+          "tool_leases_reconciled": 6,
+          "operation_accepted": 9,
+          "tool_started": 9,
+          "tool_finished": 9,
+          "execution_frontier": 8,
+          "execution_batch_settled": 5,
+          "context_degraded": 5,
+          "lease_issued": 2,
+          "task_resume_committed": 2,
+          "checkpoint_durable": 2,
+          "assistant_message": 1,
+          "context_gc": 1,
+          "turn_completed": 1
+        }
+      },
+      "decision_lane": {
+        "rows": 6,
+        "identity": {
+          "observed": 0,
+          "estimated": 0,
+          "unknown": 0,
+          "unreported": 6
+        },
+        "input_tokens": 0,
+        "output_tokens": 0,
+        "cache_read_input_tokens": 0,
+        "attempts": 6,
+        "retries": 0,
+        "raw_input_tokens_lower_bound": 31258,
+        "raw_output_tokens_lower_bound": 1233,
+        "raw_cached_input_tokens_lower_bound": 20992,
+        "cache_write_input_tokens": 0,
+        "cache_write_input_tokens_reported_rows": 0,
+        "cache_miss_input_tokens": 0,
+        "cache_miss_input_tokens_reported_rows": 0
+      },
+      "maintenance_lane": {
+        "rows": 0,
+        "identity": {
+          "observed": 0,
+          "estimated": 0,
+          "unknown": 0,
+          "unreported": 0
+        },
+        "input_tokens": 0,
+        "output_tokens": 0,
+        "cache_read_input_tokens": 0,
+        "attempts": 0,
+        "retries": 0,
+        "raw_input_tokens_lower_bound": 0,
+        "raw_output_tokens_lower_bound": 0,
+        "raw_cached_input_tokens_lower_bound": 0,
+        "cache_write_input_tokens": 0,
+        "cache_write_input_tokens_reported_rows": 0,
+        "cache_miss_input_tokens": 0,
+        "cache_miss_input_tokens_reported_rows": 0
+      },
+      "compaction_rows": {
+        "count": 0,
+        "identity": {
+          "observed": 0,
+          "estimated": 0,
+          "unknown": 0,
+          "unreported": 0
+        },
+        "input_tokens": 0,
+        "output_tokens": 0,
+        "cache_read_input_tokens": 0,
+        "cache_write_input_tokens": 0,
+        "cache_miss_input_tokens": 0,
+        "retries": 0
+      },
+      "gc": {
+        "passes": 1,
+        "evicted": 4,
+        "externalized": 0,
+        "store_write_bytes": 0,
+        "store_io_failures": 0
+      },
+      "bill_lower_bound": true,
+      "_walls_ms": [
+        11462.83
+      ]
+    },
+    {
+      "segment": "c-cancel",
+      "quality": {
+        "exit_code": 1,
+        "forced_tree_stop": false,
+        "wall_ms": 3742.83,
+        "event_counts": {
+          "run_started": 1,
+          "runtime_commit_barrier": 1,
+          "runtime_restored": 1,
+          "user_message_accepted": 2,
+          "context_maintained": 3,
+          "task_continuation_started": 1,
+          "protocol_body_cache_stats": 2,
+          "context_prepared": 2,
+          "context_degraded": 2,
+          "tool_surface_planned": 2,
+          "model_started": 2,
+          "context_consumed": 1,
+          "model_used": 1,
+          "tool_leases_reconciled": 1,
+          "operation_accepted": 2,
+          "tool_started": 2,
+          "tool_finished": 2,
+          "execution_frontier": 2,
+          "execution_batch_settled": 1
+        }
+      },
+      "decision_lane": {
+        "rows": 1,
+        "identity": {
+          "observed": 0,
+          "estimated": 0,
+          "unknown": 0,
+          "unreported": 1
+        },
+        "input_tokens": 0,
+        "output_tokens": 0,
+        "cache_read_input_tokens": 0,
+        "attempts": 1,
+        "retries": 0,
+        "raw_input_tokens_lower_bound": 2617,
+        "raw_output_tokens_lower_bound": 79,
+        "raw_cached_input_tokens_lower_bound": 1920,
+        "cache_write_input_tokens": 0,
+        "cache_write_input_tokens_reported_rows": 0,
+        "cache_miss_input_tokens": 0,
+        "cache_miss_input_tokens_reported_rows": 0
+      },
+      "maintenance_lane": {
+        "rows": 0,
+        "identity": {
+          "observed": 0,
+          "estimated": 0,
+          "unknown": 0,
+          "unreported": 0
+        },
+        "input_tokens": 0,
+        "output_tokens": 0,
+        "cache_read_input_tokens": 0,
+        "attempts": 0,
+        "retries": 0,
+        "raw_input_tokens_lower_bound": 0,
+        "raw_output_tokens_lower_bound": 0,
+        "raw_cached_input_tokens_lower_bound": 0,
+        "cache_write_input_tokens": 0,
+        "cache_write_input_tokens_reported_rows": 0,
+        "cache_miss_input_tokens": 0,
+        "cache_miss_input_tokens_reported_rows": 0
+      },
+      "compaction_rows": {
+        "count": 0,
+        "identity": {
+          "observed": 0,
+          "estimated": 0,
+          "unknown": 0,
+          "unreported": 0
+        },
+        "input_tokens": 0,
+        "output_tokens": 0,
+        "cache_read_input_tokens": 0,
+        "cache_write_input_tokens": 0,
+        "cache_miss_input_tokens": 0,
+        "retries": 0
+      },
+      "gc": {
+        "passes": 0,
+        "evicted": 0,
+        "externalized": 0,
+        "store_write_bytes": 0,
+        "store_io_failures": 0
+      },
+      "bill_lower_bound": true,
+      "_walls_ms": [
+        3742.83
+      ]
+    },
+    {
+      "segment": "c-read-yield",
+      "quality": {
+        "exit_code": 2,
+        "forced_tree_stop": false,
+        "wall_ms": 4143.65,
+        "event_counts": {
+          "run_started": 1,
+          "runtime_commit_barrier": 1,
+          "focus_changed": 1,
+          "context_maintained": 3,
+          "task_tool_requirements_changed": 1,
+          "user_message_accepted": 2,
+          "protocol_body_cache_stats": 1,
+          "context_prepared": 1,
+          "tool_surface_planned": 1,
+          "model_started": 1,
+          "context_consumed": 1,
+          "model_used": 1,
+          "tool_leases_reconciled": 1,
+          "operation_accepted": 2,
+          "tool_started": 2,
+          "tool_finished": 2,
+          "execution_frontier": 2,
+          "execution_batch_settled": 1,
+          "warning": 1,
+          "failure": 1
+        }
+      },
+      "decision_lane": {
+        "rows": 1,
+        "identity": {
+          "observed": 0,
+          "estimated": 0,
+          "unknown": 0,
+          "unreported": 1
+        },
+        "input_tokens": 0,
+        "output_tokens": 0,
+        "cache_read_input_tokens": 0,
+        "attempts": 1,
+        "retries": 0,
+        "raw_input_tokens_lower_bound": 2380,
+        "raw_output_tokens_lower_bound": 87,
+        "raw_cached_input_tokens_lower_bound": 1408,
+        "cache_write_input_tokens": 0,
+        "cache_write_input_tokens_reported_rows": 0,
+        "cache_miss_input_tokens": 0,
+        "cache_miss_input_tokens_reported_rows": 0
+      },
+      "maintenance_lane": {
+        "rows": 0,
+        "identity": {
+          "observed": 0,
+          "estimated": 0,
+          "unknown": 0,
+          "unreported": 0
+        },
+        "input_tokens": 0,
+        "output_tokens": 0,
+        "cache_read_input_tokens": 0,
+        "attempts": 0,
+        "retries": 0,
+        "raw_input_tokens_lower_bound": 0,
+        "raw_output_tokens_lower_bound": 0,
+        "raw_cached_input_tokens_lower_bound": 0,
+        "cache_write_input_tokens": 0,
+        "cache_write_input_tokens_reported_rows": 0,
+        "cache_miss_input_tokens": 0,
+        "cache_miss_input_tokens_reported_rows": 0
+      },
+      "compaction_rows": {
+        "count": 0,
+        "identity": {
+          "observed": 0,
+          "estimated": 0,
+          "unknown": 0,
+          "unreported": 0
+        },
+        "input_tokens": 0,
+        "output_tokens": 0,
+        "cache_read_input_tokens": 0,
+        "cache_write_input_tokens": 0,
+        "cache_miss_input_tokens": 0,
+        "retries": 0
+      },
+      "gc": {
+        "passes": 0,
+        "evicted": 0,
+        "externalized": 0,
+        "store_write_bytes": 0,
+        "store_io_failures": 0
+      },
+      "bill_lower_bound": true,
+      "_walls_ms": [
+        4143.65
+      ]
+    },
+    {
+      "segment": "c-resume",
+      "quality": {
+        "exit_code": 0,
+        "forced_tree_stop": false,
+        "wall_ms": 11444.74,
+        "event_counts": {
+          "run_started": 1,
+          "runtime_commit_barrier": 1,
+          "runtime_restored": 1,
+          "user_message_accepted": 3,
+          "context_maintained": 11,
+          "task_continuation_started": 1,
+          "protocol_body_cache_stats": 6,
+          "context_prepared": 6,
+          "context_degraded": 6,
+          "tool_surface_planned": 6,
+          "model_started": 6,
+          "context_consumed": 6,
+          "model_used": 6,
+          "tool_leases_reconciled": 6,
+          "operation_accepted": 7,
+          "tool_started": 7,
+          "tool_finished": 7,
+          "execution_frontier": 7,
+          "execution_batch_settled": 5,
+          "lease_issued": 2,
+          "task_resume_committed": 2,
+          "checkpoint_durable": 2,
+          "assistant_message": 1,
+          "context_gc": 1,
+          "turn_completed": 1
+        }
+      },
+      "decision_lane": {
+        "rows": 6,
+        "identity": {
+          "observed": 0,
+          "estimated": 0,
+          "unknown": 0,
+          "unreported": 6
+        },
+        "input_tokens": 0,
+        "output_tokens": 0,
+        "cache_read_input_tokens": 0,
+        "attempts": 6,
+        "retries": 0,
+        "raw_input_tokens_lower_bound": 29726,
+        "raw_output_tokens_lower_bound": 859,
+        "raw_cached_input_tokens_lower_bound": 22656,
+        "cache_write_input_tokens": 0,
+        "cache_write_input_tokens_reported_rows": 0,
+        "cache_miss_input_tokens": 0,
+        "cache_miss_input_tokens_reported_rows": 0
+      },
+      "maintenance_lane": {
+        "rows": 0,
+        "identity": {
+          "observed": 0,
+          "estimated": 0,
+          "unknown": 0,
+          "unreported": 0
+        },
+        "input_tokens": 0,
+        "output_tokens": 0,
+        "cache_read_input_tokens": 0,
+        "attempts": 0,
+        "retries": 0,
+        "raw_input_tokens_lower_bound": 0,
+        "raw_output_tokens_lower_bound": 0,
+        "raw_cached_input_tokens_lower_bound": 0,
+        "cache_write_input_tokens": 0,
+        "cache_write_input_tokens_reported_rows": 0,
+        "cache_miss_input_tokens": 0,
+        "cache_miss_input_tokens_reported_rows": 0
+      },
+      "compaction_rows": {
+        "count": 0,
+        "identity": {
+          "observed": 0,
+          "estimated": 0,
+          "unknown": 0,
+          "unreported": 0
+        },
+        "input_tokens": 0,
+        "output_tokens": 0,
+        "cache_read_input_tokens": 0,
+        "cache_write_input_tokens": 0,
+        "cache_miss_input_tokens": 0,
+        "retries": 0
+      },
+      "gc": {
+        "passes": 1,
+        "evicted": 4,
+        "externalized": 0,
+        "store_write_bytes": 0,
+        "store_io_failures": 0
+      },
+      "bill_lower_bound": true,
+      "_walls_ms": [
+        11444.74
+      ]
+    }
+  ],
+  "wall_ms_p50": 11444.74,
+  "note": "pre-CORE-4/COST-2 evidence reports identity=unreported and no cache split; absent counters are recorded as unreported, never as observed zeros",
+  "cross_check": "totals match the 2026-09-11 flash-workflow receipt exactly: in=105838 out=3907 cached=72704"
+}

@@ -1,0 +1,287 @@
+{
+  "repository": "Ye-Luo-0912/context-agent-prototype",
+  "ref": "685b6bbb29275bc8ec73ce6625a94567a8b8d23d",
+  "review_date": "2026-09-11",
+  "scope": "关键生产链路源码审查；不是逐文件全仓完成声明",
+  "local_checkout": false,
+  "local_rust_tests_run": false,
+  "local_dotnet_tests_run": false,
+  "remote_ci": {
+    "run_id": 34513313166,
+    "head_sha": "685b6bbb29275bc8ec73ce6625a94567a8b8d23d",
+    "conclusion": "success",
+    "evidence": "GitHub Actions run metadata; individual job logs not reviewed"
+  },
+  "source_files_read_or_partially_read": [
+    {
+      "path": "README.md",
+      "range": "全文",
+      "note": "文档，非运行证据",
+      "url": "https://github.com/Ye-Luo-0912/context-agent-prototype/blob/685b6bbb29275bc8ec73ce6625a94567a8b8d23d/README.md"
+    },
+    {
+      "path": "Cargo.toml",
+      "range": "全文",
+      "note": "工作区清单",
+      "url": "https://github.com/Ye-Luo-0912/context-agent-prototype/blob/685b6bbb29275bc8ec73ce6625a94567a8b8d23d/Cargo.toml"
+    },
+    {
+      "path": "docs/CURRENT.md",
+      "range": "部分；响应截断",
+      "note": "当前状态声明，未作为本地验收证明",
+      "url": "https://github.com/Ye-Luo-0912/context-agent-prototype/blob/685b6bbb29275bc8ec73ce6625a94567a8b8d23d/docs/CURRENT.md"
+    },
+    {
+      "path": "docs/NEXT_TASKS.md",
+      "range": "1–200；另读85–155；响应部分截断",
+      "note": "仅核对已完成工作与下一步，不宣称全文读完",
+      "url": "https://github.com/Ye-Luo-0912/context-agent-prototype/blob/685b6bbb29275bc8ec73ce6625a94567a8b8d23d/docs/NEXT_TASKS.md"
+    },
+    {
+      "path": "crates/agent-contracts/src/lib.rs",
+      "range": "全文",
+      "note": "接口索引",
+      "url": "https://github.com/Ye-Luo-0912/context-agent-prototype/blob/685b6bbb29275bc8ec73ce6625a94567a8b8d23d/crates/agent-contracts/src/lib.rs"
+    },
+    {
+      "path": "crates/agent-contracts/src/model.rs",
+      "range": "1–620",
+      "note": "消息、TurnFrame、布局",
+      "url": "https://github.com/Ye-Luo-0912/context-agent-prototype/blob/685b6bbb29275bc8ec73ce6625a94567a8b8d23d/crates/agent-contracts/src/model.rs"
+    },
+    {
+      "path": "crates/agent-contracts/src/model_cache.rs",
+      "range": "全文",
+      "note": "缓存边界与摘要",
+      "url": "https://github.com/Ye-Luo-0912/context-agent-prototype/blob/685b6bbb29275bc8ec73ce6625a94567a8b8d23d/crates/agent-contracts/src/model_cache.rs"
+    },
+    {
+      "path": "crates/agent-runtime/src/lib.rs",
+      "range": "全文",
+      "note": "模块与公开边界",
+      "url": "https://github.com/Ye-Luo-0912/context-agent-prototype/blob/685b6bbb29275bc8ec73ce6625a94567a8b8d23d/crates/agent-runtime/src/lib.rs"
+    },
+    {
+      "path": "crates/agent-runtime/src/prompt.rs",
+      "range": "1–1180；重点复读490–725",
+      "note": "生产组装逻辑与部分测试；未覆盖全文件测试尾部",
+      "url": "https://github.com/Ye-Luo-0912/context-agent-prototype/blob/685b6bbb29275bc8ec73ce6625a94567a8b8d23d/crates/agent-runtime/src/prompt.rs"
+    },
+    {
+      "path": "crates/agent-runtime/src/execution/body_cache.rs",
+      "range": "全文",
+      "note": "正文回注缓存",
+      "url": "https://github.com/Ye-Luo-0912/context-agent-prototype/blob/685b6bbb29275bc8ec73ce6625a94567a8b8d23d/crates/agent-runtime/src/execution/body_cache.rs"
+    },
+    {
+      "path": "crates/agent-runtime/src/actor/mod.rs",
+      "range": "600–920；1100–1400",
+      "note": "缓存写入、部分执行/恢复状态",
+      "url": "https://github.com/Ye-Luo-0912/context-agent-prototype/blob/685b6bbb29275bc8ec73ce6625a94567a8b8d23d/crates/agent-runtime/src/actor/mod.rs"
+    },
+    {
+      "path": "crates/agent-runtime/src/actor/model.rs",
+      "range": "1–585；640–1620",
+      "note": "主要请求准备、预算、组装、发送；585–639及后续未完整阅读",
+      "url": "https://github.com/Ye-Luo-0912/context-agent-prototype/blob/685b6bbb29275bc8ec73ce6625a94567a8b8d23d/crates/agent-runtime/src/actor/model.rs"
+    },
+    {
+      "path": "crates/agent-runtime/src/services.rs",
+      "range": "1–655",
+      "note": "组合缝与上下文委托；余下未完整阅读",
+      "url": "https://github.com/Ye-Luo-0912/context-agent-prototype/blob/685b6bbb29275bc8ec73ce6625a94567a8b8d23d/crates/agent-runtime/src/services.rs"
+    },
+    {
+      "path": "crates/agent-runtime/src/output.rs",
+      "range": "全文",
+      "note": "最终输出限幅",
+      "url": "https://github.com/Ye-Luo-0912/context-agent-prototype/blob/685b6bbb29275bc8ec73ce6625a94567a8b8d23d/crates/agent-runtime/src/output.rs"
+    },
+    {
+      "path": "crates/agent-runtime/src/task.rs",
+      "range": "1–330",
+      "note": "任务锚点、完成策略；非完整任务管理器审查",
+      "url": "https://github.com/Ye-Luo-0912/context-agent-prototype/blob/685b6bbb29275bc8ec73ce6625a94567a8b8d23d/crates/agent-runtime/src/task.rs"
+    },
+    {
+      "path": "crates/agent-runtime/src/work.rs",
+      "range": "全文",
+      "note": "提交收据和进程内去重边界",
+      "url": "https://github.com/Ye-Luo-0912/context-agent-prototype/blob/685b6bbb29275bc8ec73ce6625a94567a8b8d23d/crates/agent-runtime/src/work.rs"
+    },
+    {
+      "path": "crates/agent-runtime/src/platform.rs",
+      "range": "1–300",
+      "note": "平台路由与操作查询；余下未完整阅读",
+      "url": "https://github.com/Ye-Luo-0912/context-agent-prototype/blob/685b6bbb29275bc8ec73ce6625a94567a8b8d23d/crates/agent-runtime/src/platform.rs"
+    },
+    {
+      "path": "crates/agent-runtime/src/platform/work.rs",
+      "range": "1–310；600–870",
+      "note": "授权、任务详情、变化、artifact、context读取；其余未完整阅读",
+      "url": "https://github.com/Ye-Luo-0912/context-agent-prototype/blob/685b6bbb29275bc8ec73ce6625a94567a8b8d23d/crates/agent-runtime/src/platform/work.rs"
+    },
+    {
+      "path": "crates/context-simple/src/lib.rs",
+      "range": "全文",
+      "note": "模块索引",
+      "url": "https://github.com/Ye-Luo-0912/context-agent-prototype/blob/685b6bbb29275bc8ec73ce6625a94567a8b8d23d/crates/context-simple/src/lib.rs"
+    },
+    {
+      "path": "crates/context-simple/src/engine.rs",
+      "range": "1–300；850–1110",
+      "note": "配置、部分状态、真实消息/工具摄入；其余未完整阅读",
+      "url": "https://github.com/Ye-Luo-0912/context-agent-prototype/blob/685b6bbb29275bc8ec73ce6625a94567a8b8d23d/crates/context-simple/src/engine.rs"
+    },
+    {
+      "path": "crates/context-simple/src/materializer.rs",
+      "range": "1–970",
+      "note": "主要选择、范围覆盖和前景计划；其余未完整阅读",
+      "url": "https://github.com/Ye-Luo-0912/context-agent-prototype/blob/685b6bbb29275bc8ec73ce6625a94567a8b8d23d/crates/context-simple/src/materializer.rs"
+    },
+    {
+      "path": "crates/context-simple/src/gc/reachability.rs",
+      "range": "全文",
+      "note": "决策/错误/正文语义终结",
+      "url": "https://github.com/Ye-Luo-0912/context-agent-prototype/blob/685b6bbb29275bc8ec73ce6625a94567a8b8d23d/crates/context-simple/src/gc/reachability.rs"
+    },
+    {
+      "path": "crates/context-simple/src/index/entity.rs",
+      "range": "1–300",
+      "note": "实体抽取、精确匹配、最新文件根；测试尾部未完整阅读",
+      "url": "https://github.com/Ye-Luo-0912/context-agent-prototype/blob/685b6bbb29275bc8ec73ce6625a94567a8b8d23d/crates/context-simple/src/index/entity.rs"
+    },
+    {
+      "path": "crates/context-baselines/src/lib.rs",
+      "range": "1–300",
+      "note": "入口及部分测试",
+      "url": "https://github.com/Ye-Luo-0912/context-agent-prototype/blob/685b6bbb29275bc8ec73ce6625a94567a8b8d23d/crates/context-baselines/src/lib.rs"
+    },
+    {
+      "path": "crates/context-baselines/src/rolling.rs",
+      "range": "全文",
+      "note": "Rolling维护、回滚、materialize",
+      "url": "https://github.com/Ye-Luo-0912/context-agent-prototype/blob/685b6bbb29275bc8ec73ce6625a94567a8b8d23d/crates/context-baselines/src/rolling.rs"
+    },
+    {
+      "path": "crates/context-baselines/src/shared.rs",
+      "range": "全文",
+      "note": "基线摄入及材料化映射",
+      "url": "https://github.com/Ye-Luo-0912/context-agent-prototype/blob/685b6bbb29275bc8ec73ce6625a94567a8b8d23d/crates/context-baselines/src/shared.rs"
+    },
+    {
+      "path": "crates/tool-runtime/src/lib.rs",
+      "range": "全文",
+      "note": "工具模块索引",
+      "url": "https://github.com/Ye-Luo-0912/context-agent-prototype/blob/685b6bbb29275bc8ec73ce6625a94567a8b8d23d/crates/tool-runtime/src/lib.rs"
+    },
+    {
+      "path": "crates/tool-runtime/src/tools/mod.rs",
+      "range": "1–260",
+      "note": "有界目录遍历",
+      "url": "https://github.com/Ye-Luo-0912/context-agent-prototype/blob/685b6bbb29275bc8ec73ce6625a94567a8b8d23d/crates/tool-runtime/src/tools/mod.rs"
+    },
+    {
+      "path": "crates/tool-runtime/src/tools/fs.rs",
+      "range": "1–600",
+      "note": "文件读取/列表的主要生产逻辑及部分测试",
+      "url": "https://github.com/Ye-Luo-0912/context-agent-prototype/blob/685b6bbb29275bc8ec73ce6625a94567a8b8d23d/crates/tool-runtime/src/tools/fs.rs"
+    },
+    {
+      "path": "crates/tool-runtime/src/tools/search.rs",
+      "range": "1–580",
+      "note": "搜索主要生产逻辑与部分测试",
+      "url": "https://github.com/Ye-Luo-0912/context-agent-prototype/blob/685b6bbb29275bc8ec73ce6625a94567a8b8d23d/crates/tool-runtime/src/tools/search.rs"
+    },
+    {
+      "path": "crates/agent-core/src/lib.rs",
+      "range": "全文",
+      "note": "只完成模块与权责边界检查，非Core全实现审查",
+      "url": "https://github.com/Ye-Luo-0912/context-agent-prototype/blob/685b6bbb29275bc8ec73ce6625a94567a8b8d23d/crates/agent-core/src/lib.rs"
+    },
+    {
+      "path": "crates/agent-workspace/src/lib.rs",
+      "range": "1–280；340–675",
+      "note": "artifact、工作区打开、部分修改事务；非完整文件审查",
+      "url": "https://github.com/Ye-Luo-0912/context-agent-prototype/blob/685b6bbb29275bc8ec73ce6625a94567a8b8d23d/crates/agent-workspace/src/lib.rs"
+    },
+    {
+      "path": "crates/agent-workspace/src/broker.rs",
+      "range": "1–340",
+      "note": "输出broker全部生产逻辑及部分测试",
+      "url": "https://github.com/Ye-Luo-0912/context-agent-prototype/blob/685b6bbb29275bc8ec73ce6625a94567a8b8d23d/crates/agent-workspace/src/broker.rs"
+    },
+    {
+      "path": "crates/agent-workspace/src/journal.rs",
+      "range": "1–270",
+      "note": "独占锁、WAL结构和部分写入；恢复算法未完整阅读",
+      "url": "https://github.com/Ye-Luo-0912/context-agent-prototype/blob/685b6bbb29275bc8ec73ce6625a94567a8b8d23d/crates/agent-workspace/src/journal.rs"
+    },
+    {
+      "path": "crates/provider-openai/src/prompt_cache.rs",
+      "range": "全文",
+      "note": "provider缓存模式",
+      "url": "https://github.com/Ye-Luo-0912/context-agent-prototype/blob/685b6bbb29275bc8ec73ce6625a94567a8b8d23d/crates/provider-openai/src/prompt_cache.rs"
+    },
+    {
+      "path": "crates/provider-openai/src/diagnostics.rs",
+      "range": "全文",
+      "note": "请求身份和usage诊断",
+      "url": "https://github.com/Ye-Luo-0912/context-agent-prototype/blob/685b6bbb29275bc8ec73ce6625a94567a8b8d23d/crates/provider-openai/src/diagnostics.rs"
+    },
+    {
+      "path": "crates/agent-compose/src/lib.rs",
+      "range": "1–330",
+      "note": "上下文引擎与provider组合入口；其余未完整阅读",
+      "url": "https://github.com/Ye-Luo-0912/context-agent-prototype/blob/685b6bbb29275bc8ec73ce6625a94567a8b8d23d/crates/agent-compose/src/lib.rs"
+    },
+    {
+      "path": "crates/agent-compose/src/compactor.rs",
+      "range": "全文",
+      "note": "有界压缩器及相关回归",
+      "url": "https://github.com/Ye-Luo-0912/context-agent-prototype/blob/685b6bbb29275bc8ec73ce6625a94567a8b8d23d/crates/agent-compose/src/compactor.rs"
+    },
+    {
+      "path": "crates/agent-host/src/lib.rs",
+      "range": "1–340",
+      "note": "宿主边界、帧、锁辅助与部分恢复；余下未完整阅读",
+      "url": "https://github.com/Ye-Luo-0912/context-agent-prototype/blob/685b6bbb29275bc8ec73ce6625a94567a8b8d23d/crates/agent-host/src/lib.rs"
+    },
+    {
+      "path": "crates/agent-host/src/main.rs",
+      "range": "1–340",
+      "note": "生产启动与端点选择；余下未完整阅读",
+      "url": "https://github.com/Ye-Luo-0912/context-agent-prototype/blob/685b6bbb29275bc8ec73ce6625a94567a8b8d23d/crates/agent-host/src/main.rs"
+    },
+    {
+      "path": "clients/dotnet/Agent.Client/Transports.cs",
+      "range": "全文",
+      "note": "真实连接运输选择",
+      "url": "https://github.com/Ye-Luo-0912/context-agent-prototype/blob/685b6bbb29275bc8ec73ce6625a94567a8b8d23d/clients/dotnet/Agent.Client/Transports.cs"
+    },
+    {
+      "path": "apps/Agent.Desktop/ViewModels/MainWindowViewModel.cs",
+      "range": "全文，分段读取至文件结尾",
+      "note": "生产GUI ViewModel；不等于所有GUI文件",
+      "url": "https://github.com/Ye-Luo-0912/context-agent-prototype/blob/685b6bbb29275bc8ec73ce6625a94567a8b8d23d/apps/Agent.Desktop/ViewModels/MainWindowViewModel.cs"
+    }
+  ],
+  "not_fully_reviewed": [
+    "agent-platform-protocol实现",
+    "agent-process",
+    "agent-capability-process",
+    "agent-context-service",
+    "context-contextcore",
+    "agent-conformance",
+    "agent-storage",
+    "agent-replay",
+    "agent-eval实现",
+    "agent-tui实现",
+    "provider主传输/Responses/SSE/retry实现",
+    "Core权限/执行全实现",
+    "runtime完整恢复/维护/工具/完成链路",
+    "context-simple完整GC/store/search/恢复实现",
+    "全部.NET客户端、XAML、打包与测试"
+  ],
+  "limitations": "克隆受网络限制，未形成完整本地checkout；环境无cargo/rustc/dotnet。全文标签仅指已读取的特定文件，不代表所属crate全部完成。未审查项不得被解释为无问题。"
+}
