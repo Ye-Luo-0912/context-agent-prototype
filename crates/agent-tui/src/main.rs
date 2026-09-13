@@ -128,6 +128,26 @@ async fn real_main() -> anyhow::Result<()> {
             Arc::new(PolicyApprovalGate::read_only()) as Arc<dyn agent_contracts::ApprovalGate>,
             None,
         )
+    } else if std::env::var("AGENT_AUTO_APPROVE")
+        .map(|value| value == "1" || value.eq_ignore_ascii_case("true"))
+        .unwrap_or(false)
+    {
+        // Local/dev convenience: skip interactive prompts and allow
+        // workspace writes + process/shell effects. Not a product flag.
+        eprintln!("agent-tui: AGENT_AUTO_APPROVE=1 — using permissive approval (no prompts)");
+        let task_gate = Arc::new(
+            TaskApprovalGate::new(Arc::new(PolicyApprovalGate::permissive()))
+                .with_host_policies(host_policies.clone()),
+        );
+        for json in &grant_args {
+            let grant: agent_contracts::StandingGrant = serde_json::from_str(json)
+                .with_context(|| format!("invalid --grant JSON: {json}"))?;
+            task_gate.grant(grant).await?;
+        }
+        (
+            task_gate as Arc<dyn agent_contracts::ApprovalGate>,
+            None,
+        )
     } else if args.is_headless() {
         (
             cli::headless_approval(false, &grant_args, host_policies.clone()).await?,

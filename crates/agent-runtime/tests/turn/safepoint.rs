@@ -1899,6 +1899,23 @@ async fn restore_is_refused_while_a_terminal_commit_is_parked() {
         checkpoint.current_task_id.is_none(),
         "committed, not restored"
     );
+
+    // EXEC-10 residual: the refusal is a two-step handshake, not a dead end —
+    // once the parked commit has settled, the SAME restore must be accepted.
+    // Capture the committed state and restore it: the busy gate no longer
+    // fires, and the restored planes match the committed shape.
+    let retry_source = instance.checkpoint().await.unwrap();
+    tokio::time::timeout(Duration::from_secs(10), instance.restore(retry_source))
+        .await
+        .expect("the retry restore must answer")
+        .expect("the refused restore must succeed once the commit has settled");
+    let restored = instance.checkpoint().await.unwrap();
+    assert_eq!(
+        restored.tasks.completed.len(),
+        1,
+        "the committed record survives the restore round-trip"
+    );
+    assert!(restored.current_task_id.is_none());
     context.gc_gate.add_permits(1);
     instance.shutdown().await.unwrap();
 }

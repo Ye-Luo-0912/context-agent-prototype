@@ -1,5 +1,22 @@
 # 可执行任务队列
 
+## 并行插入：供应商 KV 布局 + ZCode 清单（2026-09-13）
+
+M18 队列顺序不变；本插入是长流程 C 线（供应商 KV／prompt cache 布局）与工具表面收口，**由 ZCode 实施**。
+
+| 切片 | 用户结果与验收边界 |
+|---|---|
+| **A0** | 调查 proof_supervision CI「exact proof tree exit」；保留进程身份事实；禁止只加 timeout / 删测 |
+| **R7（先修）** | search.grep 的 scan_continuation 进入模型可见 input_schema；经 ToolSpec→wire→dispatcher 续跑第二批 |
+| **R2** | 已确认端点发送稳定 prompt_cache_key（非每轮 UUID） |
+| **R3** | 显式-only：无合法边界时不悄悄退回隐式写；compactor 单独策略 |
+| **R1+R4** | 稳定证据基座 B0/B1 与易变投影分离；状态字段不破坏合法前缀 |
+| **R6** | 每次真实 attempt 已知 usage 不丢、同 attempt 不重复计 |
+| **R5** | 协议尾复用仅在基座完成后评估 |
+
+清单与停止条件：[ZCODE_TASKS.md](reviews/2026-09-13-kv-cache-layout-489c89cd/ZCODE_TASKS.md)。核实：[VERIFICATION.md](reviews/2026-09-13-kv-cache-layout-489c89cd/VERIFICATION.md)。
+
+**做到这里停止（文档侧）：** 不在本插入里用 Cursor 云端写产品代码；不宣称已测降本。
 ## 并行插入：长流程后端 F5 —— 宿主长任务控制面（2026-09-13）
 
 M18 队列顺序不变；F5 是长流程后端审查开出的**平台线**切片，与下方队列并行，不接管主线。
