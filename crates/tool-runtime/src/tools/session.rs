@@ -2153,7 +2153,7 @@ mod tests {
             "the model content must carry the signal fact: {}",
             output.model_content
         );
-        assert_eq!(output.metadata["signal"].is_null(), false);
+        assert!(!output.metadata["signal"].is_null());
     }
 
     /// A1 (N08): a large output burst makes the batch bounds BITE: the
