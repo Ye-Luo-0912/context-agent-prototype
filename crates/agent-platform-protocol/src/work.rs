@@ -3039,6 +3039,343 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
+    // F5: in-task steering, precise identity, formal checkpoints.
+    // -----------------------------------------------------------------------
+
+    /// A correction is bound to the task it names. The response validator is
+    /// the second line of defence behind the runtime: even if a server tried
+    /// to report a correction as applied to a different task, the contract
+    /// refuses the answer instead of letting a client believe the misdelivery.
+    #[test]
+    fn steer_response_cannot_report_landing_on_another_task() {
+        let named = task_id();
+        let other = TaskId::from_str("00000000-0000-4000-8000-000000000044").unwrap();
+        let request = run_scoped_request(
+            Route::work_steer(),
+            WorkSteerRequest {
+                instruction: "keep the five second timeout".into(),
+                expected_task_id: Some(named),
+            },
+        );
+        validate_work_steer_request(&profile(), &request).unwrap();
+
+        let applied = response(
+            &request,
+            WorkSteerResponse {
+                disposition: WorkSteerDisposition::Applied,
+                task_id: Some(named),
+                rejection: None,
+                active_task_id: None,
+            },
+        );
+        validate_work_steer_response(&profile(), &request, &applied).unwrap();
+
+        let misdelivered = response(
+            &request,
+            WorkSteerResponse {
+                disposition: WorkSteerDisposition::Applied,
+                task_id: Some(other),
+                rejection: None,
+                active_task_id: None,
+            },
+        );
+        assert_eq!(
+            validate_work_steer_response(&profile(), &request, &misdelivered)
+                .unwrap_err()
+                .field(),
+            "work.steer.task_id"
+        );
+    }
+
+    /// Every steering receipt must be internally consistent: an admitted
+    /// correction names its task and carries no reason, a refused one names its
+    /// typed reason and no task. A half-filled receipt is not a fact.
+    #[test]
+    fn steer_receipt_shapes_stay_consistent() {
+        let mut admitted_without_task = WorkSteerResponse {
+            disposition: WorkSteerDisposition::Queued,
+            task_id: None,
+            rejection: None,
+            active_task_id: None,
+        };
+        assert_eq!(
+            admitted_without_task.validate().unwrap_err().field(),
+            "work.steer.task_id"
+        );
+        admitted_without_task.task_id = Some(task_id());
+        admitted_without_task.validate().unwrap();
+
+        let mut refused_without_reason = WorkSteerResponse {
+            disposition: WorkSteerDisposition::Rejected,
+            task_id: None,
+            rejection: None,
+            active_task_id: Some(task_id()),
+        };
+        assert_eq!(
+            refused_without_reason.validate().unwrap_err().field(),
+            "work.steer.rejection"
+        );
+        refused_without_reason.rejection = Some(WorkSteerRejection::NoActiveTask);
+        refused_without_reason.validate().unwrap();
+
+        // A rejection that also claims a landing task is contradictory.
+        let mut contradictory = refused_without_reason;
+        contradictory.task_id = Some(task_id());
+        assert_eq!(
+            contradictory.validate().unwrap_err().field(),
+            "work.steer.task_id"
+        );
+
+        // The instruction is bounded, and a nil expectation is not a wildcard.
+        let empty = WorkSteerRequest {
+            instruction: String::new(),
+            expected_task_id: None,
+        };
+        assert_eq!(
+            empty.validate().unwrap_err().field(),
+            "work.steer.instruction"
+        );
+        let nil = WorkSteerRequest {
+            instruction: "ok".into(),
+            expected_task_id: Some(TaskId::from_str("00000000-0000-0000-0000-000000000000").unwrap()),
+        };
+        assert_eq!(
+            nil.validate().unwrap_err().field(),
+            "work.steer.expected_task_id"
+        );
+    }
+
+    /// F5: the expectation fields are additive. A request that names no
+    /// expectation and a continuation that happened both encode exactly the
+    /// historical bytes, so an older client is never handed a new field.
+    #[test]
+    fn expectation_fields_do_not_change_the_historical_wire_bytes() {
+        assert_eq!(
+            serde_json::to_string(&WorkContinueRequest::default()).unwrap(),
+            "{}"
+        );
+        assert_eq!(
+            serde_json::to_string(&WorkCancelRequest::default()).unwrap(),
+            "{}"
+        );
+        assert_eq!(
+            serde_json::to_string(&WorkContinueResponse {
+                task_id: Some(task_id()),
+                disposition: WorkContinueDisposition::Continued,
+                active_task_id: None,
+            })
+            .unwrap(),
+            format!("{{\"task_id\":\"{}\"}}", task_id())
+        );
+        assert_eq!(
+            serde_json::to_string(&WorkCancelResponse {
+                ack: TurnCancelAck::NoActiveTurn,
+                identity_mismatch: None,
+            })
+            .unwrap(),
+            "{\"ack\":{\"status\":\"no_active_turn\"}}"
+        );
+    }
+
+    /// A continuation receipt cannot claim both outcomes, and a cancel that
+    /// matched nothing must not carry a cancelled acknowledgement: reporting a
+    /// barrier beside a mismatch would claim a stop that never happened.
+    #[test]
+    fn precise_receipts_never_claim_two_truths() {
+        let mut continued_without_task = WorkContinueResponse {
+            task_id: None,
+            disposition: WorkContinueDisposition::Continued,
+            active_task_id: None,
+        };
+        assert_eq!(
+            continued_without_task.validate().unwrap_err().field(),
+            "work.continue.task_id"
+        );
+        continued_without_task.task_id = Some(task_id());
+        continued_without_task.validate().unwrap();
+
+        let rejected_naming_a_continuation = WorkContinueResponse {
+            task_id: Some(task_id()),
+            disposition: WorkContinueDisposition::ExpectedTaskMismatch,
+            active_task_id: Some(task_id()),
+        };
+        assert_eq!(
+            rejected_naming_a_continuation.validate().unwrap_err().field(),
+            "work.continue.task_id"
+        );
+
+        let mismatch_with_a_cancelled_ack = WorkCancelResponse {
+            ack: TurnCancelAck::Cancelled {
+                turn_id: TurnId::new(),
+                task_id: Some(task_id()),
+                operation_id: None,
+                cancelled_generation: 1,
+                effective_generation: 2,
+            },
+            identity_mismatch: Some(WorkTurnIdentity {
+                task_id: Some(task_id()),
+                turn_id: Some(TurnId::new()),
+            }),
+        };
+        assert_eq!(
+            mismatch_with_a_cancelled_ack.validate().unwrap_err().field(),
+            "work.cancel.identity_mismatch"
+        );
+
+        let honest_mismatch = WorkCancelResponse {
+            ack: TurnCancelAck::NoActiveTurn,
+            identity_mismatch: Some(WorkTurnIdentity {
+                task_id: Some(task_id()),
+                turn_id: None,
+            }),
+        };
+        honest_mismatch.validate().unwrap();
+    }
+
+    /// A suspension names what it suspended; anything else names nothing.
+    /// Suspension is never reported for a task the request did not ask about.
+    #[test]
+    fn suspend_receipt_names_only_what_it_suspended() {
+        let suspended_without_task = WorkSuspendResponse {
+            disposition: WorkSuspendDisposition::Suspended,
+            task_id: None,
+            active_task_id: None,
+        };
+        assert_eq!(
+            suspended_without_task.validate().unwrap_err().field(),
+            "work.suspend.task_id"
+        );
+
+        let nothing_happened_but_named_a_task = WorkSuspendResponse {
+            disposition: WorkSuspendDisposition::NoActiveTask,
+            task_id: Some(task_id()),
+            active_task_id: None,
+        };
+        assert_eq!(
+            nothing_happened_but_named_a_task
+                .validate()
+                .unwrap_err()
+                .field(),
+            "work.suspend.task_id"
+        );
+
+        let other = TaskId::from_str("00000000-0000-4000-8000-000000000044").unwrap();
+        let request = run_scoped_request(
+            Route::work_suspend(),
+            WorkSuspendRequest {
+                expected_task_id: Some(task_id()),
+            },
+        );
+        let foreign = response(
+            &request,
+            WorkSuspendResponse {
+                disposition: WorkSuspendDisposition::Suspended,
+                task_id: Some(other),
+                active_task_id: None,
+            },
+        );
+        assert_eq!(
+            validate_work_suspend_response(&profile(), &request, &foreign)
+                .unwrap_err()
+                .field(),
+            "work.suspend.task_id"
+        );
+    }
+
+    /// A checkpoint artifact is a name inside the run's own store. Anything
+    /// path-like is refused by the contract, so a wire string can never reach
+    /// outside the store directory even before the store re-checks it.
+    #[test]
+    fn checkpoint_artifacts_are_store_names_not_paths() {
+        for hostile in [
+            "../outside.json",
+            "sub/checkpoint-1.json",
+            "..",
+            ".",
+            r"c:\checkpoint-1.json",
+            r"dir\checkpoint-1.json",
+        ] {
+            let request = WorkRestoreRequest {
+                artifact: Some(hostile.to_owned()),
+            };
+            assert_eq!(
+                request.validate().unwrap_err().field(),
+                "work.restore.artifact",
+                "{hostile} must be refused"
+            );
+        }
+
+        // A legitimate store name passes, and so does asking for the newest.
+        WorkRestoreRequest {
+            artifact: Some("checkpoint-1737000000-abcdef.json".into()),
+        }
+        .validate()
+        .unwrap();
+        WorkRestoreRequest::default().validate().unwrap();
+
+        // A restore answer must name the artifact the request asked for.
+        let request = run_scoped_request(
+            Route::work_restore(),
+            WorkRestoreRequest {
+                artifact: Some("checkpoint-a.json".into()),
+            },
+        );
+        let other = response(
+            &request,
+            WorkRestoreResponse {
+                artifact: "checkpoint-b.json".into(),
+                checkpoint_version: 4,
+                restored_run_id: run_id(),
+                evidence_degraded: Vec::new(),
+            },
+        );
+        assert_eq!(
+            validate_work_restore_response(&profile(), &request, &other)
+                .unwrap_err()
+                .field(),
+            "work.restore.artifact"
+        );
+    }
+
+    /// The reported configuration must be usable as a fact: a zero round budget
+    /// could never finish a turn, and "ready" may not appear beside a blocker.
+    #[test]
+    fn reported_run_config_and_continue_readiness_stay_self_consistent() {
+        let mut config = WorkRunConfig {
+            context_policy: "rolling".into(),
+            max_model_rounds: 16,
+            max_model_rounds_source: "kernel_default".into(),
+            maintenance_max_calls_per_maintain: 4,
+            maintenance_max_tokens_per_maintain: None,
+            maintenance_timeout_secs: None,
+            provider_profile_digest: None,
+            prompt_cache_mode: None,
+            read_only: false,
+        };
+        config.validate().unwrap();
+        config.max_model_rounds = 0;
+        assert_eq!(
+            config.validate().unwrap_err().field(),
+            "work.snapshot.effective_config.max_model_rounds"
+        );
+
+        let lying = WorkContinueReadiness {
+            can_continue: true,
+            reason: WorkContinueReason::TurnRunning,
+        };
+        assert_eq!(
+            lying.validate().unwrap_err().field(),
+            "work.snapshot.continue_readiness"
+        );
+        WorkContinueReadiness {
+            can_continue: false,
+            reason: WorkContinueReason::TurnRunning,
+        }
+        .validate()
+        .unwrap();
+    }
+
+    // -----------------------------------------------------------------------
     // B3 read-only routes.
     // -----------------------------------------------------------------------
 
