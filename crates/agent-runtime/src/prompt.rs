@@ -470,9 +470,11 @@ pub struct ProtocolBodyAssemblyStats {
 }
 
 /// 回注挑选：某行的正文只有同时满足
-/// (a) 完整帧里有它的非空读取结果、(b) 保留尾已不含该结果（checkpoint
-/// 截掉）、(c) TASK PROGRESS 的 Fresh 事实仍是同一 path@digest，才会
-/// 被回注。行本身来自有界当轮缓存。
+/// (a) 完整帧里有它的非空读取结果、(b) 保留尾的窗口并集盖不住这次
+/// 暴露（checkpoint 截掉或只留下同版本另一区间）、(c) TASK PROGRESS
+/// 的 Fresh 事实仍是同一 path@digest，才会被回注。行本身来自有界当轮
+/// 缓存；缓存仍按 path 单槽，所以同 path 的后写窗口不能顶替未覆盖的
+/// 前一窗口，缺的区间走完整帧 spill。
 fn rehydrated_protocol_bodies(
     full_turn: &TurnFrame,
     retained: &TurnFrame,
@@ -484,46 +486,148 @@ fn rehydrated_protocol_bodies(
         return Vec::new();
     }
     // The full ActiveTurn frame is the bounded audit backing for this open
-    // turn. Select exactly the bodies the checkpoint just spilled; do not
-    // depend on a latest-read LRU that tends to retain rows still in the
-    // tail and evict the older row that now needs restoration.
+    // turn. Select exactly the windows the checkpoint left uncovered; do
+    // not depend on a path-keyed LRU that tends to retain the later
+    // window still in the tail and evict the earlier disjoint window.
     let spilled_rows = demanded_file_read_body_rows(full_turn, &demand);
-    demand
-        .into_iter()
-        .filter_map(|identity| {
-            protocol_bodies
-                .iter()
-                .find(|row| row.identity == identity && !row.body.is_empty())
-                .cloned()
-                .or_else(|| {
-                    spilled_rows
-                        .iter()
-                        .find(|row| row.identity == identity)
-                        .cloned()
-                })
-        })
-        .take(agent_contracts::MAX_PROTOCOL_BODY_ROWS)
-        .collect()
+    let mut restored: Vec<ProtocolBodyRow> = Vec::new();
+    for needed in demand {
+        let Some(row) = protocol_bodies
+            .iter()
+            .find(|row| row_satisfies_demand(row, &needed))
+            .cloned()
+            .or_else(|| {
+                spilled_rows
+                    .iter()
+                    .find(|row| row_satisfies_demand(row, &needed))
+                    .cloned()
+            })
+        else {
+            continue;
+        };
+        if restored
+            .iter()
+            .any(|existing| existing.identity == row.identity && existing.window == row.window)
+        {
+            continue;
+        }
+        restored.push(row);
+        if restored.len() >= agent_contracts::MAX_PROTOCOL_BODY_ROWS {
+            break;
+        }
+    }
+    restored
 }
 
+/// Exposed windows from the full open-turn history that the retained
+/// protocol tail does not already cover. Freshness is still identity-level
+/// (`path@revision`); coverage is window-level, so L201–300 of the same
+/// revision cannot cancel demand for an earlier L1–100.
 fn checkpoint_body_demand(
     full_turn: &TurnFrame,
     retained: &TurnFrame,
     progress: Option<&TaskProgressView>,
-) -> Vec<String> {
-    let retained_set: HashSet<String> = file_read_body_identities(retained).into_iter().collect();
+) -> Vec<FileBodyWindow> {
+    let retained_windows = file_read_exposure_windows(retained);
     let fresh_facts: Option<HashSet<String>> =
         progress.map(|progress| progress.checked_files.iter().cloned().collect());
-    file_read_body_identities(full_turn)
-        .into_iter()
-        .filter(|identity| {
-            !retained_set.contains(identity)
-                && fresh_facts
-                    .as_ref()
-                    .is_some_and(|facts| facts.contains(identity))
-        })
-        .take(agent_contracts::MAX_PROTOCOL_BODY_ROWS)
-        .collect()
+    let mut demand = Vec::new();
+    for window in file_read_exposure_windows(full_turn) {
+        let Some(identity) = window
+            .revision
+            .as_deref()
+            .and_then(|revision| agent_contracts::file_body_identity(&window.path, revision))
+        else {
+            continue;
+        };
+        if !fresh_facts
+            .as_ref()
+            .is_some_and(|facts| facts.contains(&identity))
+        {
+            continue;
+        }
+        if window_already_satisfied(&retained_windows, &window) {
+            continue;
+        }
+        if demand
+            .iter()
+            .any(|existing| same_body_exposure(existing, &window))
+        {
+            continue;
+        }
+        demand.push(window);
+        if demand.len() >= agent_contracts::MAX_PROTOCOL_BODY_ROWS {
+            break;
+        }
+    }
+    demand
+}
+
+/// Whether a cached or spilled row can stand in for one uncovered
+/// exposure. The row's identity must match the demanded `path@revision`
+/// AND its own window must cover the demanded range: the current-turn body
+/// cache keys by path, so a row holding L201–300 must never be accepted as
+/// the answer to a demand for L1–100 of the same version (F3). A row with
+/// no trustworthy range answers only an equally unknown demand.
+fn row_satisfies_demand(row: &ProtocolBodyRow, needed: &FileBodyWindow) -> bool {
+    if row.body.is_empty() {
+        return false;
+    }
+    let Some(identity) = needed
+        .revision
+        .as_deref()
+        .and_then(|revision| agent_contracts::file_body_identity(&needed.path, revision))
+    else {
+        return false;
+    };
+    if agent_contracts::normalize_resource_path(&row.identity) != identity {
+        return false;
+    }
+    match row.window.as_ref() {
+        Some(window) => {
+            same_body_exposure(window, needed)
+                || agent_contracts::visible_body_windows_cover(
+                    std::slice::from_ref(window),
+                    &needed.path,
+                    needed.revision.as_deref(),
+                    needed.start_line,
+                    needed.end_line,
+                )
+        }
+        None => needed.start_line.is_none() && needed.end_line.is_none() && !needed.covers_file,
+    }
+}
+
+/// Whether the retained protocol tail already carries this exposure. The
+/// same read still in the tail needs no restoration; otherwise the tail's
+/// windows must contain the demanded interval under the shared coverage
+/// rule, so a later disjoint window of the same version never cancels an
+/// earlier one (F3).
+fn window_already_satisfied(retained_windows: &[FileBodyWindow], needed: &FileBodyWindow) -> bool {
+    retained_windows
+        .iter()
+        .any(|retained| same_body_exposure(retained, needed))
+        || agent_contracts::visible_body_windows_cover(
+            retained_windows,
+            &needed.path,
+            needed.revision.as_deref(),
+            needed.start_line,
+            needed.end_line,
+        )
+}
+
+/// Whether two windows describe the same read exposure: same version, same
+/// declared range, same completeness. Exposure equality is what lets an
+/// unknown-range body still be recognized in the retained tail, where
+/// interval containment can prove nothing.
+fn same_body_exposure(left: &FileBodyWindow, right: &FileBodyWindow) -> bool {
+    agent_contracts::normalize_resource_path(&left.path)
+        == agent_contracts::normalize_resource_path(&right.path)
+        && left.revision.as_deref().map(str::trim) == right.revision.as_deref().map(str::trim)
+        && left.start_line == right.start_line
+        && left.end_line == right.end_line
+        && left.covers_file == right.covers_file
+        && left.complete == right.complete
 }
 
 /// Exact file-body identities already present in the model-facing request.
@@ -539,18 +643,38 @@ pub(crate) fn visible_body_identities_for_request(
     visible_body_identities_from_parts(&retained, &restored)
 }
 
-/// Exact fs.read identities that the next checkpoint projection will drop,
-/// independent of freshness. Runtime uses this bounded demand set to spend
-/// its existing revalidation quota on bodies that can actually prevent a
-/// model-driven reread.
+/// Identities of the fs.read exposures the next checkpoint projection
+/// leaves uncovered, independent of freshness. Runtime uses this bounded
+/// set to spend its existing revalidation quota on bodies that can actually
+/// prevent a model-driven reread.
+///
+/// F3: coverage is judged per window, using the same rule as
+/// [`checkpoint_body_demand`]. An identity whose retained window exposes a
+/// different interval of the same version is still spilled, so the earlier
+/// window keeps its revalidation priority.
 pub(crate) fn checkpoint_spilled_body_identities(full_turn: &TurnFrame) -> Vec<String> {
     let (retained, _) = full_turn.checkpoint_tail(agent_contracts::TURN_FRAME_KEEP_EXCHANGES);
-    let retained_set: HashSet<String> = file_read_body_identities(&retained).into_iter().collect();
-    file_read_body_identities(full_turn)
-        .into_iter()
-        .filter(|identity| !retained_set.contains(identity))
-        .take(agent_contracts::MAX_PROTOCOL_BODY_ROWS)
-        .collect()
+    let retained_windows = file_read_exposure_windows(&retained);
+    let mut identities = Vec::new();
+    for window in file_read_exposure_windows(full_turn) {
+        if window_already_satisfied(&retained_windows, &window) {
+            continue;
+        }
+        let Some(identity) = window
+            .revision
+            .as_deref()
+            .and_then(|revision| agent_contracts::file_body_identity(&window.path, revision))
+        else {
+            continue;
+        };
+        if !identities.contains(&identity) {
+            identities.push(identity);
+            if identities.len() >= agent_contracts::MAX_PROTOCOL_BODY_ROWS {
+                break;
+            }
+        }
+    }
+    identities
 }
 
 fn visible_body_identities_from_parts(
@@ -696,6 +820,51 @@ fn file_read_body_windows(frame: &TurnFrame) -> Vec<agent_contracts::FileBodyWin
     windows
 }
 
+/// Every fs.read exposure of a frame, in frame order and one entry per
+/// read. The interval-aware sibling of [`file_read_body_identities`] used
+/// for *demand*: unlike [`file_read_body_windows`], a read whose range is
+/// unknown still yields an entry (with an unknown range, which proves no
+/// interval). Demand has to account for that body; coverage still cannot be
+/// claimed from it.
+fn file_read_exposure_windows(frame: &TurnFrame) -> Vec<agent_contracts::FileBodyWindow> {
+    let mut windows = Vec::new();
+    for step in &frame.steps {
+        let TurnFrameStep::ToolResult { output, facts, .. } = step else {
+            continue;
+        };
+        if output.tool_name != "fs.read" || !output.ok || output.model_content.is_empty() {
+            continue;
+        }
+        let Some(touch) = primary_result_touch(output, facts) else {
+            continue;
+        };
+        if touch
+            .revision
+            .as_deref()
+            .map(str::trim)
+            .is_none_or(str::is_empty)
+        {
+            continue;
+        }
+        windows.push(
+            file_read_window_from_output(output, &touch).unwrap_or_else(|| {
+                agent_contracts::FileBodyWindow {
+                    path: touch.path.clone(),
+                    revision: touch.revision.clone(),
+                    start_line: None,
+                    end_line: None,
+                    covers_file: false,
+                    complete: true,
+                }
+            }),
+        );
+        if windows.len() >= agent_contracts::MAX_VISIBLE_BODY_WINDOWS {
+            break;
+        }
+    }
+    windows
+}
+
 /// Trusted exposure window of one `fs.read` result: version plus the line
 /// range it actually returned. Metadata keys are stamped by the dispatcher
 /// lane; an absent range yields `None` and never becomes a coverage proof.
@@ -749,11 +918,17 @@ pub(crate) fn file_read_window_from_output(
     })
 }
 
+/// Bodies from the bounded full turn that answer the uncovered windows.
+///
+/// F3: one slot per demanded window, not per identity. Two disjoint reads
+/// of the same `path@revision` are two demands, so the later read can no
+/// longer overwrite the earlier one out of the restoration set. Within one
+/// window the latest matching read still wins.
 fn demanded_file_read_body_rows(
     frame: &TurnFrame,
-    demanded_identities: &[String],
+    demand: &[agent_contracts::FileBodyWindow],
 ) -> Vec<ProtocolBodyRow> {
-    let mut rows: Vec<ProtocolBodyRow> = Vec::new();
+    let mut rows: Vec<Option<ProtocolBodyRow>> = vec![None; demand.len()];
     for step in &frame.steps {
         let TurnFrameStep::ToolResult { output, facts, .. } = step else {
             continue;
@@ -775,32 +950,22 @@ fn demanded_file_read_body_rows(
         else {
             continue;
         };
-        if !demanded_identities.contains(&identity) {
-            continue;
-        }
         // F01: this row is about to enter the request, so it carries the
         // range that read exposed. The window is derived from the same
         // trusted fs.read metadata the retained-tail windows use, so a
         // spilled partial read never widens into whole-file coverage.
         let row = ProtocolBodyRow {
-            identity: identity.clone(),
+            identity,
             body: output.model_content.clone(),
             window: file_read_window_from_output(output, &touch),
         };
-        if let Some(existing) = rows.iter_mut().find(|row| row.identity == identity) {
-            *existing = row;
-        } else {
-            rows.push(row);
-        }
-        if rows.len()
-            >= demanded_identities
-                .len()
-                .min(agent_contracts::MAX_PROTOCOL_BODY_ROWS)
-        {
-            break;
+        for (slot, needed) in rows.iter_mut().zip(demand) {
+            if row_satisfies_demand(&row, needed) {
+                *slot = Some(row.clone());
+            }
         }
     }
-    rows
+    rows.into_iter().flatten().collect()
 }
 
 /// Token cost of the runtime-owned Focus frame (TaskAnchor + TaskProgress +
@@ -3091,6 +3256,301 @@ mod tests {
                 .count(),
             windows.iter().filter(|w| w.path == "src/auth.rs").count(),
             "identity set and window set must agree on what actually got in"
+        );
+    }
+
+    /// One `fs.read` exchange exposing `start..end` of `path@revision`.
+    fn push_windowed_read(
+        turn: &mut TurnFrame,
+        call_id: &str,
+        path: &str,
+        revision: &str,
+        start: u32,
+        end: u32,
+        body: &str,
+    ) {
+        turn.push_tool_calls(vec![agent_contracts::ToolCall {
+            id: call_id.to_string(),
+            name: "fs.read".into(),
+            arguments: serde_json::json!({ "path": path }),
+        }]);
+        turn.push_tool_result(
+            agent_contracts::ToolOutput {
+                call_id: call_id.to_string(),
+                tool_name: "fs.read".into(),
+                ok: true,
+                summary: "read".into(),
+                model_content: body.to_string(),
+                artifact_ref: None,
+                metadata: serde_json::json!({
+                    "path": path,
+                    "revision": revision,
+                    "start_line": start,
+                    "end_line": end,
+                    "covers_file": false,
+                }),
+            },
+            None,
+            agent_contracts::ToolExecutionFacts::empty(),
+        );
+    }
+
+    /// An open turn whose first exchange read `src/auth.rs` L1–100 of
+    /// `rev-1` and whose last exchange read the given later window of the
+    /// same path. Eight exchanges put the first read past the retained tail.
+    fn turn_with_spilled_head_read(
+        later_revision: &str,
+        later_start: u32,
+        later_end: u32,
+    ) -> TurnFrame {
+        let mut turn = TurnFrame::new("inspect auth");
+        push_windowed_read(
+            &mut turn,
+            "read-head",
+            "src/auth.rs",
+            "rev-1",
+            1,
+            100,
+            "L1..L100 fn early_body() {}",
+        );
+        for index in 1..7 {
+            push_windowed_read(
+                &mut turn,
+                &format!("read-{index}"),
+                "src/other.rs",
+                "rev-1",
+                1,
+                10,
+                &format!("other content {index}"),
+            );
+        }
+        push_windowed_read(
+            &mut turn,
+            "read-tail",
+            "src/auth.rs",
+            later_revision,
+            later_start,
+            later_end,
+            "L201..L300 fn later_body() {}",
+        );
+        turn
+    }
+
+    fn restored_block(assembled: &ModelInput) -> Option<&str> {
+        assembled
+            .context_frame
+            .iter()
+            .find(|message| message.content.contains("RESTORED TURN BODIES"))
+            .map(|message| message.content.as_str())
+    }
+
+    /// F3: the head read exposed L1–100 of `src/auth.rs@rev-1` and fell out
+    /// of the retained tail; a later read of the SAME version exposed
+    /// L201–300 and is still in the tail. Identity-level demand saw "a body
+    /// for this path@revision is still present" and cancelled restoration,
+    /// so the model silently lost L1–100. Demand is per window: disjoint
+    /// windows of one version do not cancel each other.
+    #[test]
+    fn a_disjoint_retained_window_does_not_cancel_the_spilled_window() {
+        let assembler = PromptAssembler::new("policy");
+        let turn = turn_with_spilled_head_read("rev-1", 201, 300);
+        let progress = TaskProgressView {
+            checked_files: vec!["src/auth.rs@rev-1".into()],
+            ..Default::default()
+        };
+        let history = materialized_with(Vec::new(), ContextMapView::default());
+
+        let (retained, _) = turn.checkpoint_tail(agent_contracts::TURN_FRAME_KEEP_EXCHANGES);
+        let demand = checkpoint_body_demand(&turn, &retained, Some(&progress));
+        assert_eq!(
+            demand.len(),
+            1,
+            "the spilled L1-100 window is still demanded: {demand:?}"
+        );
+        assert_eq!(demand[0].start_line, Some(1));
+        assert_eq!(demand[0].end_line, Some(100));
+
+        let assembled = assembler.assemble_with_catalog(
+            None,
+            None,
+            Some(&progress),
+            &history,
+            &turn,
+            Vec::new(),
+            &[],
+            &[],
+        );
+        let restored = restored_block(&assembled).expect("the spilled window must be restored");
+        assert!(
+            restored.contains("fn early_body"),
+            "the disjoint earlier window must re-enter the request: {restored}"
+        );
+        assert!(
+            !restored.contains("fn later_body"),
+            "the retained window must not be duplicated: {restored}"
+        );
+        // The spilled identity keeps its revalidation priority even though
+        // another window of the same version stayed in the tail.
+        assert_eq!(
+            checkpoint_spilled_body_identities(&turn),
+            vec!["src/auth.rs@rev-1".to_string()]
+        );
+    }
+
+    /// F3: the current-turn body cache keys by path, so one entry can hold
+    /// a window that answers nothing. A cache row carrying L201–300 must
+    /// not be handed back as the answer to the L1–100 demand; the bounded
+    /// full turn supplies the real body instead.
+    #[test]
+    fn a_path_keyed_cache_row_cannot_answer_an_uncovered_window() {
+        let assembler = PromptAssembler::new("policy");
+        let turn = turn_with_spilled_head_read("rev-1", 201, 300);
+        let progress = TaskProgressView {
+            checked_files: vec!["src/auth.rs@rev-1".into()],
+            ..Default::default()
+        };
+        let history = materialized_with(Vec::new(), ContextMapView::default());
+        // Same identity, wrong interval: the single path-keyed slot was
+        // overwritten by the later read.
+        let wrong_window_row = ProtocolBodyRow {
+            identity: "src/auth.rs@rev-1".into(),
+            body: "L201..L300 fn later_body() {}".into(),
+            window: Some(FileBodyWindow {
+                path: "src/auth.rs".into(),
+                revision: Some("rev-1".into()),
+                start_line: Some(201),
+                end_line: Some(300),
+                covers_file: false,
+                complete: true,
+            }),
+        };
+
+        let assembled = assembler.assemble_with_catalog(
+            None,
+            None,
+            Some(&progress),
+            &history,
+            &turn,
+            Vec::new(),
+            &[],
+            std::slice::from_ref(&wrong_window_row),
+        );
+        let restored = restored_block(&assembled).expect("the spilled window must be restored");
+        assert!(
+            restored.contains("fn early_body"),
+            "the uncovered range must be satisfied by the real body: {restored}"
+        );
+
+        let windows = visible_body_windows_for_request(&turn, Some(&progress), &[wrong_window_row]);
+        assert!(
+            agent_contracts::visible_body_windows_cover(
+                &windows,
+                "src/auth.rs",
+                Some("rev-1"),
+                Some(1),
+                Some(100)
+            ),
+            "the restored window is priced as visible: {windows:?}"
+        );
+    }
+
+    /// F3 control: a retained window that DOES contain the spilled range
+    /// leaves nothing to restore. The window rule must not turn every
+    /// earlier read into a re-injection.
+    #[test]
+    fn an_already_covered_window_is_not_reinjected() {
+        let assembler = PromptAssembler::new("policy");
+        // The tail read spans L1–300 of the same version, containing the
+        // spilled L1–100 exposure.
+        let turn = turn_with_spilled_head_read("rev-1", 1, 300);
+        let progress = TaskProgressView {
+            checked_files: vec!["src/auth.rs@rev-1".into()],
+            ..Default::default()
+        };
+        let history = materialized_with(Vec::new(), ContextMapView::default());
+
+        let (retained, _) = turn.checkpoint_tail(agent_contracts::TURN_FRAME_KEEP_EXCHANGES);
+        assert!(
+            checkpoint_body_demand(&turn, &retained, Some(&progress)).is_empty(),
+            "a covered window needs no restoration"
+        );
+        assert!(
+            checkpoint_spilled_body_identities(&turn).is_empty(),
+            "a covered window claims no revalidation priority"
+        );
+
+        let assembled = assembler.assemble_with_catalog(
+            None,
+            None,
+            Some(&progress),
+            &history,
+            &turn,
+            Vec::new(),
+            &[],
+            &[],
+        );
+        assert!(
+            restored_block(&assembled).is_none(),
+            "the covered body must not be re-injected: {:?}",
+            restored_block(&assembled)
+        );
+    }
+
+    /// F3: coverage never crosses revisions. A retained read of `rev-2`
+    /// spanning L1–300 says nothing about `rev-1` L1–100, and a cache row
+    /// of another version can never answer the demand — the window of the
+    /// demanded version is the only thing that counts.
+    #[test]
+    fn a_newer_revision_window_does_not_cover_the_older_revision() {
+        let assembler = PromptAssembler::new("policy");
+        let turn = turn_with_spilled_head_read("rev-2", 1, 300);
+        let progress = TaskProgressView {
+            checked_files: vec!["src/auth.rs@rev-1".into(), "src/auth.rs@rev-2".into()],
+            ..Default::default()
+        };
+        let history = materialized_with(Vec::new(), ContextMapView::default());
+
+        let (retained, _) = turn.checkpoint_tail(agent_contracts::TURN_FRAME_KEEP_EXCHANGES);
+        let demand = checkpoint_body_demand(&turn, &retained, Some(&progress));
+        assert_eq!(demand.len(), 1, "the rev-1 window is still demanded");
+        assert_eq!(demand[0].revision.as_deref(), Some("rev-1"));
+
+        // A cache row for the other revision must not satisfy it.
+        let other_revision_row = ProtocolBodyRow {
+            identity: "src/auth.rs@rev-2".into(),
+            body: "L1..L300 fn rev_two_body() {}".into(),
+            window: Some(FileBodyWindow {
+                path: "src/auth.rs".into(),
+                revision: Some("rev-2".into()),
+                start_line: Some(1),
+                end_line: Some(300),
+                covers_file: false,
+                complete: true,
+            }),
+        };
+        assert!(
+            !row_satisfies_demand(&other_revision_row, &demand[0]),
+            "a row of another revision never answers this demand"
+        );
+
+        let assembled = assembler.assemble_with_catalog(
+            None,
+            None,
+            Some(&progress),
+            &history,
+            &turn,
+            Vec::new(),
+            &[],
+            std::slice::from_ref(&other_revision_row),
+        );
+        let restored = restored_block(&assembled).expect("the rev-1 window must be restored");
+        assert!(
+            restored.contains("fn early_body"),
+            "the older revision's own body is the only valid answer: {restored}"
+        );
+        assert!(
+            !restored.contains("fn rev_two_body"),
+            "a newer revision body must not stand in for the older one: {restored}"
         );
     }
 
