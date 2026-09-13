@@ -1,13 +1,105 @@
 # 可执行任务队列
 
-> 状态：**M17 收尾——可恢复的多入口工作台（N 系列，2026-09-08 切换）。** 上一队列（M17 三线）的代码主体已落地：B1–B3、C0、P1、P2 主体、P3 宿主、G1–G3 客户端侧、E1 全部关闭或落地（见下方 M17 队列表）。2026-09-08 外部闭环审查（基线 `11afdd747d6cbbb58ef0d7371841e8e365c4f8db`，55 路径正文、新 GUI/客户端/宿主三子树全文）指出：**组件存在 ≠ 链路接通**——事件订阅 receiver 被丢弃、重连自动重发修改操作、宿主恢复绕过正式信封解码、多连接/会话释放/停机缺口等 20 项（F01–F20），进入本队列。
-> **CI 状态按 run 记录，不外推到任意 SHA**（2026-09-09 核对）：run `34163939549`（`96e4605`）与 `34268863699`（N3/N5 批次）七 job 全绿；run `34271105841`（`bbf7f5d`）Windows 全测试失败于 `context-simple` admit 并发测试（其余 job 通过），`7e026ee` 已改为比例断言修准 load-flaky（确定性屏障方案仍为 A 线建议项）；N4 批次 run `34278244036`/`34278810636` 文档写作时进行中。更早的 fmt 红与 conformance/protocol/replay/supervision 四个被遮蔽问题的修复记录见 git 历史。
-> 本队列接续 M17 未闭环项；不重做已落地的 B1/B2/C0/P1/G1/E1，也不新增 Chronicle/TaskGraph/第二套状态权威。
-> 剩余条件项不变：真实 provider live（无凭据写 `NOT_RUN`）、下次实际发布的 PACKAGE-01（并入 N8）、默认启用 MCP 后的 MCP-01（E1 已覆盖声明车道的取消贯通）。
-> 审查原文：[reviews/2026-09-08-closure-audit-11afdd7/REPORT.md](reviews/2026-09-08-closure-audit-11afdd7/REPORT.md)；工单全文：[reviews/2026-09-08-closure-audit-11afdd7/NEXT_STAGE_TASKS.md](reviews/2026-09-08-closure-audit-11afdd7/NEXT_STAGE_TASKS.md)。
-> 2026-09-09 三线审查（基线 `bbf7f5d`）：[reviews/2026-09-09-audit-bbf7f5d-three-tracks/REPORT.md](reviews/2026-09-09-audit-bbf7f5d-three-tracks/REPORT.md)；由此开出的并行三线（A/B/C）切片与不干扰规则见下方「并行三线」节——**N 系列主顺序不变，三线与之并行执行**。
-> 上一轮（2026-09-07 platform-native）原文：[reviews/2026-09-07-platform-native-audit/REPORT.md](reviews/2026-09-07-platform-native-audit/REPORT.md)。
-> 不替代 Core、Effect、Workspace、恢复与输出边界契约；不改写历史评测结论。
+## 当前：M18 第三轮执行者、长期运行与可维护性续接（2026-09-13）
+
+**仍是 M18，同质量、长期稳定、高效可靠与全成本下降。** 当前基线 `685b6bbb` 加实际未提交树。第三轮 14 项（4 P1＋10 P2），9 项有界反例、5 项源码核实；本轮没有改产品代码，也没有做真实 provider 或完整 Rust/.NET/CI 验收。[报告](reviews/2026-09-13-executor-maintainability-audit/REPORT.md) 与 [覆盖/证据](reviews/2026-09-13-executor-maintainability-audit/COVERAGE.md) 是本表依据，下面前序表仅保留时点回执。
+
+| 归属/顺序 | 功能切片 | 用户结果与验收边界 |
+|---|---|---|
+| A 首片 | **CTX-10** | 退休 scope 不被旧 blob 带回，召回后 checkpoint 可恢复；退休事实环不改变完成语义。R3-02/04 **代码落地（2026-09-13，工作树）**：merge 规则 entry 无条件胜出（None=显式释放，悬空引用不可能；pre-scope 旧行降级 legacy 推断）；退休环时间序满员淘汰最旧＋`retirement_ring_overflowed` 置位；`scope::completion_facts` 保守完成语义（溢出后无 live scope 且无注记=未知=保守已完成，不恢复自动召回）。回归 2（红检查：召回带退休 scope→restore 报 missing scope；513 次循环后最新事实保留＋古老正文不召回）。[回执](reviews/2026-09-13-executor-maintainability-audit/CTX10_TO_CTX12_A_LINE_IMPLEMENTATION.md)；未提交/未跑远端 CI |
+| A 第二片 | **CTX-2 残余** | 修改超时日志仍保留五秒超时；永久撤销需要具体依据，不继续堆词表。R3-03 **代码落地（2026-09-13，工作树）**：`names_replaced_object` 收窄为替换宾语**全部**内容词（双侧排除停用词/路径词）命中旧决策；维度词共享不再授予 Superseded，不确定即 Live；未增关键词。回归 2（红检查：R3-03 反例四 owner 全 Live＋全宾语对照照常撤销；35+33 项既有撤销回归保持）。[回执](reviews/2026-09-13-executor-maintainability-audit/CTX10_TO_CTX12_A_LINE_IMPLEMENTATION.md)；未提交/未跑远端 CI |
+| A 后续 | **CTX-11** | foreground/required/fetch 复用四种 owner 与当前 metadata；Pending 不漏、Stored 不退回旧属性。R3-05/06 **代码落地（2026-09-13，工作树）**：`plan_foreground` 补 Pending 查找（store 故障期当前文件不再 Missing）；`ForegroundPlanItem::Store` 携带 plan 时 owner 快照，读回经同一 `reattach_owner_metadata` 合并——五个 blob 读回路径统一。回归 1（红检查双腿：撤臂→Missing；撤合并→帧带旧 Working）。[回执](reviews/2026-09-13-executor-maintainability-audit/CTX10_TO_CTX12_A_LINE_IMPLEMENTATION.md)；未提交/未跑远端 CI |
+| A 后续 | **CTX-12** | 无效候选不消耗有效召回额度，保持既有评分和默认策略。R3-07 **代码落地（2026-09-13，工作树）**：warm 循环先判定 `reactivation_reason` 再扣 `remaining`——无效候选零消耗；anchor 独立上限不变；扫描仍受既有批次边界。回归 1（红检查：预算 1 时无效候选先行→reactivated=0）。[回执](reviews/2026-09-13-executor-maintainability-audit/CTX10_TO_CTX12_A_LINE_IMPLEMENTATION.md)；未提交/未跑远端 CI |
+| B 首片 | **EXEC-9** | service Context 透传保留 checkpoint 保护根；未知不当空集，旧正文不会被 reconcile 误删。R3-01 **代码落地＋验证（2026-09-13，工作树，B 线会话；async 保护根接口的 A 线测试适配已同步）**：adapter/wire 透传＋service.rs 180 行回归。回执见 [B_LINE_ROUND3_RECEIPT.md](reviews/2026-09-13-executor-maintainability-audit/B_LINE_ROUND3_RECEIPT.md)；未提交/未跑远端 CI | **代码落地（2026-09-13，工作树）**：wire 增 `CheckpointRecoveryItemIds`/`StorageGcProtecting`/`ReconcileStoreProtecting` 三操作，适配器三方法走真实服务解析；`checkpoint_recovery_item_ids` 改 async+Result（解析失败=不完整→删除延期）；actor 与 spawned-boundary 根枚举收敛为单一实现。服务进程回归：外置→checkpoint A→Admit→checkpoint B→restore B→A 根恰一、未知根/不完整延期、保护性 reconcile 后 restore A 正文逐字节读回（红：适配器空集时失败）。[回执](reviews/2026-09-13-executor-maintainability-audit/B_LINE_ROUND3_RECEIPT.md)；未提交/未跑远端 CI |
+| B 第二片 | **EXEC-10** | gc_work 单槽准入覆盖 capture/terminal/restore/stop，每份回执可结算，恢复不续接旧事务。R3-09/10 **代码落地＋门控回归执行（2026-09-13，工作树）**：spawn_gc_op 单槽 vacancy check（busy 类型化拒绝、continuation 归还）；prepare_restore 对 parked TerminalFreeze/prepare 确定性拒绝（旧事务不触恢复态）。门控回归 `restore_is_refused_while_a_terminal_commit_is_parked`＋`two_concurrent_checkpoint_captures_both_settle_deterministically` 均绿；actor/turn 全量 **143/143**。回执见 [B_LINE_ROUND3_RECEIPT.md](reviews/2026-09-13-executor-maintainability-audit/B_LINE_ROUND3_RECEIPT.md)；未提交/未跑远端 CI | **代码落地（2026-09-13，工作树）**：`spawn_gc_op` 单槽空位检查，占用返回 typed busy 并把续体交还（capture→确定性拒绝；终局冻结→回滚路径；turn-scoped→不可达内联兜底）；`prepare_restore` 在停靠 commit 事务/prepare 存在时类型化拒绝 restore（旧事务永不触碰恢复后状态）。门控回归：restore 停靠期被拒＋放行后 completion 正常结算；并发两份 capture 均有确定回执。[回执](reviews/2026-09-13-executor-maintainability-audit/B_LINE_ROUND3_RECEIPT.md)；未提交/未跑远端 CI |
+| B 后续 | **EXEC-8 残余** | 冷结果查询总扫描字节/单行/等待有界，Actor 与 journal 仍能响应。R3-11 **代码落地＋验证（2026-09-13，工作树）**：`read_trace_tail` 尾部有界窗口（非整文件扫描）；storage **26/26**（含字节上界回归）。其 TaskCompleted{artifacts,final_output_digest} 契约的 replay/eval/protocol 测试构造由集成窗口机械收口（10 处字面量补齐＋status.rs match 臂修复），workspace 全量编译解除。[B_LINE_ROUND3_RECEIPT.md](reviews/2026-09-13-executor-maintainability-audit/B_LINE_ROUND3_RECEIPT.md)；未提交/未跑远端 CI | **代码落地（2026-09-13，工作树）**：`read_trace_tail` 改为文件末尾字节窗口（8 MiB 扫描上界）＋单行 1 MiB 上限（超限 typed 错误 fail-closed），窗口未达文件头即如实 `complete=false`；读取移出 journal writer 循环（flush 后 spawn_blocking）；Actor 冷查询命令改 spawn 任务＋reply（命令分支不再等扫描）。回归：200 行日志 max=50 → 窗口/不完整如实；超大行 → typed 错误。[回执](reviews/2026-09-13-executor-maintainability-audit/B_LINE_ROUND3_RECEIPT.md)；未提交/未跑远端 CI |
+| B 后续 | **CTX-8 Runtime 接线** | 持续存储故障不继续积累正文；背压状态可查询、可修复后继续。R3-08 **代码落地＋验证（2026-09-13，工作树）**：`store_backpressure` 状态（观察/上报/tools 输入闸/完成边界解除）入 status 快照；回归 `store_backpressure_is_observed_and_lifted_on_the_status_snapshot` 绿。[B_LINE_ROUND3_RECEIPT.md](reviews/2026-09-13-executor-maintainability-audit/B_LINE_ROUND3_RECEIPT.md)；未提交/未跑远端 CI | **代码落地（2026-09-13，工作树）**：边界 pass 的 `externalize_backpressure/externalize_deferred/store_io_failures` 记入 actor 状态并上 `RuntimeStatusSnapshot.store_backpressure`（可再取的快照事实）；背压激活期间跳过 working-set 预热旁路（工具结果投递不受影响），清洁 pass 解除。门控回归：背压 pass → status active=true（deferred=7/io=2），清洁 pass 后 active=false。[回执](reviews/2026-09-13-executor-maintainability-audit/B_LINE_ROUND3_RECEIPT.md)；未提交/未跑远端 CI |
+| C 首片 | **COST-7 残余** | provider 失败时已知 usage 不降成 Unknown，重试保留逐次已知/未知并去重。R3-12 | **代码落地（2026-09-13，工作树）**：新 `AgentError::FailedWithUsage{usage,source}`（唯一共享失败用量表达，`failed_with_usage` 构造器对空信封原样放行，`failure_source()` 供分类看穿）；Chat/Responses 全部失败出口先读 accumulator usage 再失败；三条重试路径 give-up 携带最近已知 usage 且包装的 Transport 失败仍可重试；`OperationOutcome::Failed` 增 usage（B 契约），actor 失败分支有证据发真实行（身份随报告、Main lane）、无证据保持 Unknown，去重队列防一笔两次。回归：provider 134（+5：length/缺DONE/Responses failed＋usage、无 usage 原错误）、retry give-up 保留＋包装可重试、runtime stream 7（+1 失败 Observed 真实行）。[回执](reviews/2026-09-13-executor-maintainability-audit/COST_R3_C_LINE_IMPLEMENTATION.md)；未提交/未跑远端 CI |
+| C 第二片，A 单一改 Rolling | **COST-8 残余** | 退避绑定真正发送的 FoldPlan，追加未发送尾部不触发相同失败调用。R3-13 | **代码落地（2026-09-13，工作树）**：只读 `plan_fold_packing -> FoldPacking{consumed,partial}`——退避摘要与实际取料共用同一装箱计划（digest＝prior id＋实际整取 id＋切分 id/前缀长）；追加进不了 source 的候选不解退避，实际输入变化仍立即重试；失败还源、partial 身份、单 pass 上限与默认值保留。回归：未发送尾部追加只调用一次（旧代码必红）、真实 source 变化恰两次调用、既有退避/冷恢复回归保持。baselines **25/25**。[回执](reviews/2026-09-13-executor-maintainability-audit/COST_R3_C_LINE_IMPLEMENTATION.md)；未提交/未跑远端 CI |
+| C 后续 | **COST-9** | GUI 先累计费用事实再丢弃渲染行，64 条 render cap 不吞计费事件。R3-14 **代码落地＋验证（2026-09-13，工作树，C 线会话）**：固定大小成本累计器先于渲染队列丢弃；shed 行费用事实仍入账。dotnet **123/123**。[COST_R3_C_LINE_IMPLEMENTATION.md](reviews/2026-09-13-executor-maintainability-audit/COST_R3_C_LINE_IMPLEMENTATION.md)；未提交/未跑远端 CI | **代码落地（2026-09-13，工作树）**：固定大小累计字段成为费用事实权威，日志行改有损投影；渲染队列弃行前先提取 model_used/context_compacted 事实入账（与活渲染共用同一累加器恰一次），摘要经 `_ui.Post` 刷新，新增 `_costRenderRowsShed` 随纪元重置；未移除 cap、未建无界队列。回归：model_used 与 context_compacted 被挤出 64 cap 后合计仍完整且不重复（旧代码必红）。dotnet **123/123**。[回执](reviews/2026-09-13-executor-maintainability-audit/COST_R3_C_LINE_IMPLEMENTATION.md)；未提交/未跑远端 CI |
+| 既有后续 | **CTX-9 / N7 元数据有界** | ExternalMap/Catalog/checkpoint 总历史工作与资源按原残余推进，不因 scope 节点退休而关闭 **checkpoint external tail spill 已落地（2026-09-13，工作树）**：checkpoint 的 external 尾部超目标即分片（inline 数组＋`external_spilled` 卡片，capture-time 元数据、缺失卡降级不失败、recovery roots 覆盖 spilled ids）；context-simple **376**（external_spill 4 项回归）。回执见 [CTX9_RESIDUAL_CHECKPOINT_SPILL_IMPLEMENTATION.md](reviews/2026-09-13-executor-maintainability-audit/CTX9_RESIDUAL_CHECKPOINT_SPILL_IMPLEMENTATION.md)；未提交/未跑远端 CI | **首片代码落地（2026-09-13，工作树）：checkpoint 外置尾分片**——超额最旧 External 条目元数据卡片写既有 store（内容寻址幂等、单 capture 写预算、IO 失败保持内联），checkpoint 只带内联段＋`external_spilled` 寻址清单；restore 查重（spilled∩owned fail-closed）后全量重水化，缺卡诚实计数不失败；`recovery_item_ids` 并入分片 id（保护根闭合）。搜索/召回/目录零改动（条目仍全驻内存）。回归 4（分片/幂等/capture 时点元数据/缺卡降级/保护根；红检查＝目标置 MAX 复现旧行为）。context-simple **376/376**、baselines 25、fmt/clippy 0。[回执](reviews/2026-09-13-executor-maintainability-audit/CTX9_RESIDUAL_CHECKPOINT_SPILL_IMPLEMENTATION.md)。**第二片（同日续）：卡片生命周期闭合**——卡片移 `cards/` 子目录与 blob 命名空间分离；启动 reconcile 孤儿清扫（保护规则与 blob 镜像：map∪保护根之外的卡删除，异形卡 quarantine，`StoreReconcileReport.external_cards_removed` 计数上报，serde default 字节稳定）。回归 `reconcile_cleans_orphan_cards_and_honors_protection`（恰删 9 保 1＋10 活跃）。context-simple **377/377**。**残余（唯一）**：Runtime 内存面（ExternalMap/Catalog 溢出）——需产品决策：O(spilled) 每搜索 IO、新增面向模型的完整性声明、或压缩驻留索引，三者取舍未定，不偷工；未提交/未跑远端 CI |
+| 联合，C 汇总 | **COST-5** | 既有真实长任务、同质量全成本与恢复/资源对照；本轮 NOT_RUN，不另建评测框架 | **EXECUTED（2026-09-13，有界双臂）**：固定三任务 harness 双臂真实运行（default vs COST-8 预算旋钮），两臂产物验收全 PASS、取消/恢复编排真实执行、账目完整（两臂均无 unknown 行）；COST-6 桶语义在真实 wire 呈现（读有报告、write/miss 如实缺席）。**降本不声明**：两臂压缩事件均为 0，预算杠杆未参与，Token 差异属方差。降本判定待压缩密集固定任务的下一配对窗口。[运行回执](reviews/2026-09-12-gc-core-followup/COST5_BOUNDED_RUN_RECEIPT.md) |
+
+**三个完整任务包：** [A 上下文与 GC](reviews/2026-09-13-executor-maintainability-audit/TASK_A_CONTEXT_GC.md)、[B 执行核心与恢复](reviews/2026-09-13-executor-maintainability-audit/TASK_B_EXECUTION_RECOVERY.md)、[C 成本与接入](reviews/2026-09-13-executor-maintainability-audit/TASK_C_COST_CONNECTIVITY.md)。本次实施首片为 **CTX-10 / EXEC-9 / COST-7 残余**，每条线一次只交付一片；本轮审查没有自动开始这些产品修复。
+
+**复用与所有权：** A 维护 Context 状态与 GC（Rolling 状态/取料也由 A 单一编辑）；C 负责 provider/eval、成本语义及费用展示；B 负责 Actor/恢复/平台，单一合入共享 contracts/protocol/`command.rs`/compose/必要 DTO。COST-8 的 Rolling 改动由 C 提需求交 A，COST-7 的失败事实契约交 B。修复已有分叉，不新造目录、数据库、通用调度器或每入口一套补丁；不冻结证据/Focus/GC 追求缓存。
+
+已有 CTX/EXEC/COST 实现经定向核对后复用，不整体重开。功能开发跑定向回归，合并沿现有 CI；文档检查不能关闭产品任务。下面回执的“本次派发/首片”仅指它的历史时点。
+
+---
+
+## M18 第二轮安排与实施回执（2026-09-12，当前由顶部第三轮续接）
+
+**仍是同一个 M18，目标为长期稳定、高效可靠、同质量全成本下降。** 本轮只审查与安排，没有改产品代码或运行 Rust/.NET/真实 provider。基线 `685b6bbb` 加当前未提交树；相对上一轮 70 个文件变化、1 个新增。对 418 个源码/测试/构建文件完成全量盘点和词法扫描，深入追踪 GC、四种 owner、检查点、恢复与成本；未逐行全覆盖。发现 12 项源码问题（5 P1＋7 P2），见 [第二轮报告](reviews/2026-09-12-gc-core-followup/REPORT.md) 与 [覆盖边界](reviews/2026-09-12-gc-core-followup/COVERAGE.md)。
+
+**三个执行入口：** [A 上下文与 GC](reviews/2026-09-12-gc-core-followup/TASK_A_CONTEXT_GC.md)、[B 执行核心与恢复](reviews/2026-09-12-gc-core-followup/TASK_B_EXECUTION_RECOVERY.md)、[C 缓存与成本](reviews/2026-09-12-gc-core-followup/TASK_C_COST_CACHE.md)。原 CTX-1/2/3、EXEC-1、COST-1/2/3/4 的实际修复定向核对后复用；局部实现/测试通过不代替本轮发现的组合边界。
+
+| 负责人/顺序 | 切片 | 用户结果 | 依据与依赖 |
+|---|---|---|---|
+| A 首片 | CTX-5 | 当前必需 Live 证据跨 TTL/GC 仍受保护，死证据不复活 | R2-03 **代码落地（2026-09-13，工作树）**：唯一 live 保护判定 `anchor_claim_defers_expiry` 贯穿驻留 TTL/ttl×4、warm 老化、full sweep 三处终结判据（当前投影整集替换、终态不复活、StorageRequired 不延长驻留）；warm/Stored 声明召回独立预算不被启发式预算饿死；`ContextGcReport.anchor_root_misses` 显式上报未满足义务。回归 7 新增（红检查 4 项核心全红后转绿）。context-simple **366**（含续接段）、contracts 174、baselines 23、fmt/clippy 0。[回执](reviews/2026-09-12-gc-core-followup/CTX5_TO_CTX9_A_LINE_IMPLEMENTATION.md)；未提交/未跑远端 CI |
+| A 第二片 | CTX-6 | Pending 正文也能正确终结、材料化与受控召回 | R2-04 **代码落地（2026-09-13，工作树）**：Pending（外置重试列表）接入全部语义路径——四个终态队列扫描＋`apply_terminal_semantic` Pending 臂、required 计划覆盖（搜索存在与 required Missing 的矛盾消除）、admit/derive/lease/gc_hint/tag 真实执行且配额跨正文位置、scope close 原地提升；真实不可写 store 跨 checkpoint 恰一 owner，磁盘恢复后 drain 携带当前语义。回归 10 新增（红检查 7 项语义全红）。[回执](reviews/2026-09-12-gc-core-followup/CTX5_TO_CTX9_A_LINE_IMPLEMENTATION.md)；未提交/未跑远端 CI |
+| A 后续 | CTX-7 | Stored 读回不覆盖当前作用域/保留等元数据 | R2-05 **代码落地（2026-09-13，工作树）**：唯一合并规则 `store::reattach_owner_metadata`（blob＝内容/创建身份权威，entry＝当前状态权威，tags 并集防复活、entry scope_id=None 不重打）接入 fetch/admit/recall 三个读回点。回归 4 新增，整条外置→提升→读回→restore 链验证（红检查 4/4 全红）。[回执](reviews/2026-09-12-gc-core-followup/CTX5_TO_CTX9_A_LINE_IMPLEMENTATION.md)；未提交/未跑远端 CI |
+| A 后续 | CTX-8 | 外置长期失败时总驻留/full GC 工作有界，明确背压 | R2-06 **代码落地（2026-09-13，工作树）**：pending 条目硬上限（满员延期不丢弃＋`externalize_backpressure` 类型化背压）＋单 pass 外置批预算（`gc_externalize_batch`=64，公平 FIFO）；`store_io_failures` 计数不再吞错；diagnostics 增 pending_items/bytes；sweep `marked.contains` 改 HashSet（O(items+marks)，顺序不变）。Runtime 背压接线归 B 线。回归 4 新增（持续故障 6 轮上界、恢复后按批 FIFO drain、失败计数恰为尝试批、2000 条目单趟有界）。[回执](reviews/2026-09-12-gc-core-followup/CTX5_TO_CTX9_A_LINE_IMPLEMENTATION.md)；未提交/未跑远端 CI |
+| A 后续 | CTX-9 | closed scope 与历史索引有界且可恢复 | R2-07 **代码落地（2026-09-13，工作树）**：closed 且零引用且后代皆可退休的 scope 节点退休（自底向上整链一趟，无悬空 parent），`RetiredScopeNote` 有界事实环（512）保留完成事实——`task_completed` 经 `task_completion_recorded` 在退休后仍成立，完成任务不自动召回，重开任务清注记；scope close/外置两处释放非提升成员 chain stamp；`scope_retire_target`=1024＋`scopes_retired`/`retired_scope_notes` 可观测。1 万次工具 scope 开闭后树 ≤128、checkpoint <512KiB。回归 4 新增（红检查）＋既有 stamp 断言按新语义改准 2 处。残余：ExternalMap/Catalog 全量元数据分页属后续（需 Runtime 背压配合）。[回执](reviews/2026-09-12-gc-core-followup/CTX5_TO_CTX9_A_LINE_IMPLEMENTATION.md)；未提交/未跑远端 CI |
+| B 首片 | EXEC-5 | 超过 64 个完成任务后仍生成合法 checkpoint 并继续恢复 | R2-01；64 task/256 receipt 冲突 | **代码落地（2026-09-12，工作树）**：`bounded_hot_pair_window` 单一投影——完成任务行与完成记录成对淘汰，`enforce_hot_bounds` 与 `prospective_terminal_snapshot` 共用（终局 checkpoint 承认的形状＝提交后内存形状）；孤立回执投影出局（legacy 恢复防御），256 记录上界降为 legacy backstop。红-first 7 项单测（含真实 `RuntimeCheckpoint::validate` 门与 64/65/66/256/257/1000 边界）＋真实 actor 全链回归（66 次完成→逐次 validate→真实终端 checkpoint 解码→冷恢复→再完成→validate）。[回执](reviews/2026-09-12-exec-core-b-line/RECEIPT.md)；未提交/未跑远端 CI |
+| B 第二片 | EXEC-6 | typed 恢复引用不从正文授予读权限，坏 Unicode 引用不 panic | R2-02 | **代码落地（2026-09-12，工作树）**：`protected_runs_from_checkpoint` 只在 decode+validate 后从 typed 字段以 `ArtifactLocator::parse_sealed` 提取（needle 伪引用/prose/draft/坏 id 不构成引用，无 panic 路径，cap 64）；`collect_checkpoint_recovery_roots` 收窄为存储保护集（先 decode 再读）；读授权集改由 `PendingRestore.protected_runs` 携带（恢复 checkpoint 自身的引用，无关 checkpoint 不再进入 lineage）。`RestoreEvidenceDegraded` 事实入 `RuntimeStatusSnapshot.restore_evidence_degraded`＋`WorkSnapshotResponse`（双侧校验＋fixture）。红：旧扫描器对 `artifact://run/`＋35a＋汉 实测 panic。[回执](reviews/2026-09-12-exec-core-b-line/RECEIPT.md)；未提交/未跑远端 CI |
+| B 后续 | EXEC-7 | GC/检查点维护等待不阻塞取消与停止 | R2-08；复用 operation lane | **代码落地（2026-09-12，工作树）**：`OpKind::Gc`＋`gc_work` 停靠道。落道：turn-final full GC（取消=可逆 pass 干净中止，未确认→RecoveryRequired；排队输入 drain 移入真实提交尾并随终局停靠推迟）、终局冻结的 checkpoint 维护（整笔事务停靠＋`ensure_idle` 拒新变异＋resume 复原全部错误路径与回执）、完成边界（full GC＋根枚举＋storage GC 一个 spawned op，只产事件不伪称回滚）、只读 capture。门控引擎行为回归：GC 停顿期间 status/cancel 可应答且取消后无 TurnCompleted；终局维护停顿期间 status 应答、放行后 commit 到达。**如实记录**：显式 collect 与 safe-point 写入保持内联（批次续体停靠／同步耐久协议，注释写明归属）。[回执](reviews/2026-09-12-exec-core-b-line/RECEIPT.md)；未提交/未跑远端 CI |
+| B 后续 | EXEC-8 | 旧完成任务退出热表后仍能有界查询/审阅 | R2-09，依赖 EXEC-5/6 | **代码落地（2026-09-12，工作树）**：`EventJournal::read_tail`（FileEventJournal writer 任务串行实现，环形缓冲内存有界、坏行 typed 封死）；`TaskCompleted` 事件增 artifacts/final_output_digest（serde default）；`TaskCompletionLookup{Hot/Retired/BeyondJournalWindow/Unknown}`＋`RuntimeHandle::task_completion`（当前 run＋有界祖先 run 分区各 4096 行窗口，新者胜；窗口不完整如实 Beyond）。平台 `work/task_completion` 路由＋.NET `TaskCompletionAsync`＋共享 fixture 双侧钉死。全链回归：ids[0]→Retired、ids[65]→Hot、随机→Unknown、冷恢复后同 Retired。[回执](reviews/2026-09-12-exec-core-b-line/RECEIPT.md)；GUI 接线归 C 线；未提交/未跑远端 CI |
+| B 残余 | EXEC-4 启动入口收口 | 启动 --restore/latest 也在读取阶段限额 | R2-12，保留已修交互入口 | **已落地（2026-09-12，工作树）**：`decode_checkpoint_file` 改一柄 take(cap+1)——超界在读取阶段点名 artifact 上限拒绝（红实测：旧代码整文件缓冲后报无关 parse 错），恰 cap 过读取门进内容校验，句柄读取使 stat 后增长无关；启动与交互入口共用。agent-tui 启动 wrapper 回归＋checkpoint 单测。[回执](reviews/2026-09-12-exec-core-b-line/RECEIPT.md)；未提交/未跑远端 CI |
+| C 首片 | COST-6 | cache hit/miss/write 不混淆，双协议计费字段正确 | R2-10 | **代码落地（2026-09-13，工作树）**：DeepSeek miss 进新 `ModelUsage.cache_miss_input_tokens`（None=未报告），write 只来自显式 `cache_write_tokens` 字段；Responses transport 读取显式 write（此前仅 diagnostics 可见）；不一致计数原样保留不修复，非法/溢出类型化失败；旧事件字节不改写；跨语言金样＋.NET 访问器（write/miss 可空、Role lane）。provider **129**、contracts **174**、protocol 47＋14、dotnet **120/120**。[回执](reviews/2026-09-12-gc-core-followup/COST6_CACHE_FIELD_NORMALIZATION_IMPLEMENTATION.md)；未提交/未跑远端 CI |
+| C 第二片 | COST-7 | Dynamic/maintenance/late/partial 用量可对账，完整性贯通 | R2-11 | **代码落地（2026-09-13，工作树）**：Dynamic 非零门槛移除；空摘要经 `AgentError::EmptyCompactionSummary{usage}` 保留已计费 usage（W08 拒折语义不变），cached 字段 Option 化不再拍平成 0，write/miss 全链透传；stale 完成/维护报告的用量按原身份补充，`usage_accounted_ops` 有界去重（取消＋晚到一笔一次），维护取消也留 unknown 行；`ModelUsed` 增 `role`（Main/Maintenance），eval 聚合维护侧 unknown/重试进全局下界，JSONL 观测加 transport 实例标签。context-simple **351**、baselines **22**、runtime lib **407**（相干窗口）、compose lib **38**（含新回归）、定向套件全绿。[回执](reviews/2026-09-12-gc-core-followup/COST7_FULL_CALL_COST_COMPLETENESS_IMPLEMENTATION.md)；compose 集成目标与 actor 全量待并行 EXEC-7 收口窗口（共享树在飞域）；未提交/未跑远端 CI |
+| C 后续 | COST-8 | 产品可配置执行段维护额度，同源失败不反复付费 | COST-4 续接，与 A/B 协调 | **代码落地（2026-09-13，工作树）**：`MaintenanceBudget`（calls/tokens/失败退避，env 严格解析）经 `build_context_engine` 进 Rolling 配置；零预算不挂压缩器（零不发送）；rolling 同源失败退避按候选身份摘要、内容变化即失效、随 checkpoint 持久；启动横幅打印可核对预算行（默认 token 无界如实标 unbounded，单次 pass 上界、不声称执行段总费用）。baselines **23** 含退避与冷恢复预算语义回归，compose lib **38** 含预算接线与环境解析回归。[回执](reviews/2026-09-12-gc-core-followup/COST8_CONFIGURABLE_MAINTENANCE_BUDGET_IMPLEMENTATION.md)；compose 集成目标待并行线收口窗口；轻量模型切换不实施；未提交/未跑远端 CI |
+| 联合验收，C 汇总 | COST-5 继续 | 默认产品真实长任务同质量降本，故障恢复与资源不退化 | 既有验收不重开框架 | **PREPARED / NOT_RUN（2026-09-13）**：配对验收脚本＋记账提取器已交付并交叉验证（对 09-11 真实证据干跑，总额逐 token 吻合回执 105,838/3,907/72,704；双臂=default vs COST-8 预算旋钮，复用固定三任务 harness 单源）。真实执行阻塞：①agent-tui/replay 因并行 B 线在飞事件字段消费点未收口无法重建二进制；②付费窗口与 `--rounds/--timeout` 上限需明确选择。[准备回执](reviews/2026-09-12-gc-core-followup/COST5_PAIRED_ACCEPTANCE_PREPARATION.md) |
+
+**本次派发各一片：CTX-5 / EXEC-5 / COST-6。** 每片先做能暴露组合问题的定向反例，完成实施与实际验收回执即停；不能只新增测试/文档冒充修复。B 单一合入共享 contracts/protocol/command/compose/DTO 与 Actor 发射点，A/C 确认领域语义。不得擅自覆盖共享工作树，不从裸 HEAD 漏掉前序未提交实现。
+
+**验收重点：** 完成任务 64/65/66/256/257 的真实 checkpoint 往返；必需证据跨老化与所有正文位置；持久 store 故障恢复；GC/保存中取消；旧结果可查询；只在费用分桶正确、main/maintenance/retry 账目完整的同起点对照中宣布降本。引用了文件、磁盘留着日志、输出集合有 cap、辅助函数测试通过，分别不等于可信读授权、产品可审阅、总资源有界、组合链通过。
+
+保持 Actor/Core 权责、GC 语义终态、有效工具与证据新鲜性；不冻结上下文追求缓存、不加 filler、不新增状态数据库/通用调度器。开发用相关回归，集成沿用既有 CI；本轮文档检查不能关闭代码任务。
+
+---
+
+## M18 第一轮安排与实施回执（已由顶部第二轮队列续接）
+
+**本轮已完成审查与编排，以下功能尚未执行。** 审查基线为 `685b6bbb` 加已有未提交工作树；20 个 Rust crate、SDK/桌面及构建入口共 417 个源码/测试/构建文件完成盘点与词法扫描，关键路径逐段追踪，**未逐行全覆盖、未运行 Rust/.NET 测试或真实 provider**。8 项源码问题为 3 P1＋5 P2；证据和限制见 [审查报告](reviews/2026-09-12-executor-audit/REPORT.md)，实施步骤/验收/停止条件见 [三部分任务书](reviews/2026-09-12-executor-audit/TASKS.md)。
+
+下一大阶段分 **A 上下文与长期记忆、B 执行核心与恢复、C 缓存与成本**。平台/GUI 的相关消费面随功能切片接通。M17 与 9 月 11 日工作树的集成和真实使用验收继续保留，不因新阶段命名自动关闭；前序实现核对后复用，不重开整套 CORE/PLATFORM/GUI。
+
+| 顺序/负责人 | 工单 | 用户结果 | 前序映射/依赖 |
+|---|---|---|---|
+| A 首片 | CTX-1 | 未知范围不再让已选正文被错误省略；最终覆盖/定价/消费一致 | CORE-1/F01 残余，E01 | **代码落地（2026-09-12，工作树）**：删除 prompt.rs `omit_selected_file_body` 与 materializer.rs `price_as_file_body_descriptor` 的 identity-only 退路——`visible_body_windows_cover` 成为唯一省略/定价依据（无窗口=不省略，宁可重复不可丢失）；`ContextHints.visible_body_identities` 保留为 informational（serde default 兼容旧数据），仍由同一趟回注筛选派生。回归：E01 反例（零窗口同版本记录保留）＋无关文件窗口＋required 记录保留（均核对最终请求正文）；改写 2 项固化旧行为的 entity 测试为窗口语义；既有不相交/包含、裁剪、缓存未回注、旧 checkpoint 回归全保持。prompt:: **38**、context-simple **321**、fmt 通过；clippy 残留告警全在 EXEC-1 并行在途 actor 文件，不归属本片。[回执](reviews/2026-09-12-executor-audit/CTX1_FINAL_VISIBLE_COVERAGE_IMPLEMENTATION.md)；未提交/未跑远端 CI |
+| A 第二片 | CTX-2 | 日志变化不撤销超时等独立要求 | CORE-2/F02 残余，E02 | **代码落地（2026-09-12，工作树）**：删除 `instead`/`revert`＋共享实体的整行捷径与「共享任意实词」分支；替代宣告必须点名替代对象（`replace <obj>` / `instead of X` / `rather than X` 宾语与旧决策内容词/实体相交），逐字 run 须含内容词且重申超集（消息逐字包含旧行）不算引用；新增保留/否定保护（keep/retain/not/still… → 并存）。`use X instead` 裸形式按 E02 授权降级为并存（需 `drop X`/`instead of X`/引用旧行）。回归 5 新增＋2 改写（stored 同判据、GC 不复活触发形式改写）；context-simple **327**、fmt、clippy 0 警告。[回执](reviews/2026-09-12-executor-audit/CTX2_EXPLICIT_WITHDRAWAL_IMPLEMENTATION.md)；未提交/未跑远端 CI |
+| A 后续 | CTX-3 | 摘要只声明实际收到的来源与范围；旧卡替代有依据 | E04，与 COST-4 协调 | **代码落地（2026-09-12，工作树）**：来源级装箱（成员整取或整不取、仅最新超预算来源可截断），`source_ids` 恒等于实际进入输入的来源，排除计数在卡片头 `covers N of M sources` 明示；卡片定义为累计笔记——旧 episode 卡不受 opened_tick 限制参与输入，替代仅对「实际进输入的旧卡」排队（装不进的保持 live 可检索）；失败 fallback 明示「未完成压缩」并附原文。回归 6 新增＋1 断言更新（溢出排除/预算装箱/三次旋转卡链/旧卡保留/失败明示/restore provenance 稳定）；context-simple **333**、fmt、clippy 0 警告。[回执](reviews/2026-09-12-executor-audit/CTX3_DISTILL_PROVENANCE_IMPLEMENTATION.md)；未提交/未跑远端 CI |
+| A 后续 | CTX-4 | 默认长期上下文能力与产品承诺一致，缺失可操作 | CTX-1/2/3、EXEC-1；不直接换默认 | **代码落地（2026-09-12，工作树）**：①profile 决策——生产默认保持 Rolling＋baseline 最低义务（CORE-2 required_claim_misses）＋模型可读呈现，切 Dynamic 须先过真实入口旅程验收（声明落 build_context_engine 文档）；②required miss 渲染进最终请求——`REQUIRED CONTEXT STATUS (not satisfied)` 逐行 reason 类别＋item_ref＋source，恢复入口（context.search/context.fetch/artifact.read/让出操作员）收尾，8 行有界＋omitted 计数。回归 2 新增（红-first）；prompt:: **40**、compose lib 32。[回执](reviews/2026-09-12-executor-audit/CTX4_PROFILE_DECISION_AND_MISS_RENDER_IMPLEMENTATION.md)；真实入口旅程验收 NOT_RUN（需真实宿主＋provider） |
+| B 首片 | EXEC-1 | 材料化等待期间仍能取消并获得可信状态 | W04 的材料化续接，E03 | **代码落地（2026-09-12，工作树）**：`OpKind::Materialize` 入既有 operation lane——轮准备在构建完整克隆 `ContextQuery` 后派生引擎调用，准备尾段打包为 `ModelRoundPlan` 驻留 Actor，完成项经代际围栏（is_stale）后以原名解构恢复（尾段语义逐字保持）；`cancel_turn` 新增 `cancel_pending_materialization`：按既有 5 秒清理上限 join，未确认即围栏（RecoveryRequired＋`TurnCommitFailed{materialize_cancel_cleanup}`），不声明可信取消、不接纳新状态；stale 晚到预览丢弃（materialize 是非消费预览，abort=文档化安全失败：锁释放、无消费、无成本）。E03 引用的 `services.rs` 内联转发器删除；Stop 经 `cancel_turn(Shutdown)` 自动获得同一有界清理。回归：门控引擎契约 5 项（挂起取消/释放与取消同到恰一终态/取消后新轮可达新 materialize/挂起时有界 Stop/存储失败围栏）——核心反例以 `EXEC1_RED_CHECK=1` 切回内联行为复现红（cancel 超时不被受理）；真引擎回归 1 项（既有 IoBoundaryPause 屏障：abort 有界结束、gate 释放、事件时钟不动、无残留 pending）。actor **86/86**、runtime lib **393/393**（完成项泵更新为跳过内部准备 op）、baselines 17、compose 全绿；fmt/clippy 本片 0 警告。如实记录：turn safepoint 1 败与 context-simple supersession 失败属并行线在飞域（新旧路径同败已归因），非本片引入。[回执](reviews/2026-09-12-executor-audit/EXEC1_MATERIALIZATION_CANCEL_IMPLEMENTATION.md)；未提交/未跑远端 CI |
+| B 第二片 | EXEC-2 | 已完成任务不使热状态/checkpoint 无限增长，旧结果可审阅 | N7 续接，E06 | **代码落地（2026-09-12，工作树）**：`TaskManager` 热驻留有界——新常量 `MAX_HOT_COMPLETED_TASK_RECORDS=64`（完成任务完整热行窗口）与 `MAX_HOT_COMPLETION_RECORDS=256`（完成记录窗口）；`enforce_hot_bounds` 在每次 Complete 提交与 restore 装入后执行（最旧先出、淘汰计数器单调、resumable 行与 active 永不受影响、oversized 旧 checkpoint 恢复进同一窗口）；淘汰不删盘（journal 完成事件＋sealed 工件按 artifact store 自身保留规则继续可审阅，窗口外查询如实返回无记录）；新 `TaskHotStateSummary`（计数＋淘汰计数器）进入 `RuntimeStatusSnapshot.task_hot_state` 诊断面。回归 4 项：MAX_HOT+10 完成淘汰窗口＋挂起 resumable 存活、300 完成记录窗口＋近期可查/早期归 journal、**1000 次合法完成后快照行数恰在双上限且序列化 < 2 MiB**、oversized 旧快照恢复入界且 active 保留。runtime lib **397/397**、actor 86/86、baselines 18、compose 全绿、clippy 0 警告。如实记录：turn safepoint 1 败与 context-simple distill 失败属并行线在飞域（归因证据见回执）。[回执](reviews/2026-09-12-executor-audit/EXEC2_BOUNDED_TASK_HOT_STATE_IMPLEMENTATION.md)；未提交/未跑远端 CI |
+| B 后续 | EXEC-3 | 多次冷恢复仍能读活跃任务的旧 sealed 快照 | CORE-3 恢复续接，E07 | **代码落地（2026-09-12，工作树）**：谱系登记改为**保护式**——`admit_artifact_run_lineage(current, predecessor, protected) -> LineageAdmission{admitted, unadmitted}`，装入顺序＝直接前代→受保护集→血统祖先（新近度）；受保护集来自 `collect_checkpoint_recovery_roots` 遍历保留 checkpoint 时对载荷 `artifact://run/<uuid>` 定位符的提取（`extract_protected_run_ids`：仅认规范定位符、畸形跳过、去重上限 64）——保护依据是「恢复状态仍引用它」，不是年代；受保护项绝不因祖先年龄淘汰，容量不足时溢出进入 `unadmitted` **类型化降级**（新契约事件 `RestoreEvidenceDegraded{unadmitted_runs}`；整个登记失败列出全部受保护前代＋Warning）——模型/SDK 首次能区分「恢复成功」与「证据可继续读取」。读取授权语义不变：非谱系前代照旧 fail closed、digest 照旧、不构成完成证明或重放授权。回归：33 次恢复后纯血统链对第一代如实拒绝（旧边界保留）而保护式登记恢复可读（**报告反例**）；40 受保护超 32 席→装入 31/点名 9 且已装入者真实可读；提取器只认规范定位符。workspace **110/110**、runtime lib **398/398**、actor 86/86、compose CORE-3 走查通过。树上并行域（COST cache-write 字段、CTX-2/3）编辑中间态如实记录。[回执](reviews/2026-09-12-executor-audit/EXEC3_RESTORE_LINEAGE_PROTECTION_IMPLEMENTATION.md)；未提交/未跑远端 CI |
+| B 后续 | EXEC-4 | 大状态载入/长 trace 审阅读入在读入阶段有界 | E08 | **已落地并验收（2026-09-12，工作树）**：三入口同句柄 cap+1 有界读——TUI `/restore`（一次 open、同句柄 take(上限+1) 读入；超界在读入阶段拒绝并点名上限字节数，stat 后增长以句柄实际读到的字节为准；恰 cap 原样通过）、workspace lineage（8 KiB+1 小额读、缺失/损坏/超界 fail-closed）、replay `run_summaries_from_files`（按行流式折叠＋1 MiB 行界＋per-file 摘要预算 64，超长行计 omitted 不吞下一行）。正常大小行为不变，截断 JSON 不冒充完整恢复。验收：replay 61/61、workspace 111、agent-tui 111 全绿。[验收回执](reviews/2026-09-12-executor-audit/EXEC4_BOUNDED_LOADS_VERIFICATION.md)；未提交/未跑远端 CI |
+| C 首片 | COST-1 | 成功/失败/取消/压缩/重试都有诚实成本账目 | CORE-4 续接，E05 | **代码全部落地（2026-09-12，工作树；E05.1/2/3 三断点收口）**：E05 断点 3 收口——`RuntimeEvent::ContextCompacted` 增 `usage_identity`（serde default=Unknown，旧行零计数不读作已观测），发射透传报告原值；eval metrics 仅 observed 入 token 合计、estimated/unknown 计次不入合计；共享金样 `event_context_compacted.json` 双语言 roundtrip；GUI 压缩行按 wire 身份分类、绝不并入主调用实测合计。contracts 173、protocol 47＋13、eval 223、dotnet 117/117、桌面 build 0 警告。[回执](reviews/2026-09-12-executor-audit/COST1_IDENTITY_PROJECTION_IMPLEMENTATION.md)。**收尾半（同日，EXEC-1 落地后垂直收口）**：E05.1——`OperationOutcome::Failed` 对模型轮经共享助手发 Unknown 用量行（失败/中断不消失于账本，未知不充当零）；E05.2——rolling 维护循环失败压缩推入 Unknown 条目（保源回退不变）且移除「非零才入账」门槛（provider 未报 usage 的成功调用按其身份照常入账）。回归新增 3 项（runtime 失败轮 unknown 行、baselines 失败行钉住＋零用量入账）。actor 86、turn effects 16、contracts 173、baselines 18、compose 全目标 0 失败、clippy 0、fmt OK。[回执](reviews/2026-09-12-executor-audit/COST1_IDENTITY_PROJECTION_IMPLEMENTATION.md)。**残余与交接**：stale 完成丢弃路径的用量未入账（超 E05.1 点名范围，记残余）；`turn safepoint` 1 项既有失败为共享树跨线缺陷（EXEC1_RED_CHECK 独立复核归因成立、文件零未提交差异），归集成者/B 线；E05.4 供应商字段归 COST-2，消费端已就绪 |
+| C 第二片 | COST-2 | 按供应商能力映射 cache-read/write/miss 和计费字段 | COST-1；复用现有缓存边界 | **代码落地（2026-09-12，工作树）**：Chat SSE 增 DeepSeek 顶层 hit/miss——缓存读优先 OpenAI details 拼写、回退 hit，miss 保留为 provider 自己的 cache-write 报告（未发送保持 None，绝不发明零；两种拼写并存 details 优先）；`ModelUsage` 增 `cache_write_input_tokens`（serde default＋skip_serializing_if，既有金样字节稳定）；压缩链路补齐调用事实——`CompactionOutput`/`ContextCompaction`/`ContextCompacted` 增 `cached_input_tokens`/`attempts`/`retries`（旧行 default=0=未知），`ModelBackedCompactor` 透传主 transport 缓存与尝试记账，rolling→报告→事件→GUI 全链贯通，GUI 压缩行原样呈现缓存读与尝试数。provider **119**（+2 DeepSeek 映射测试）、contracts 173、eval 223、baselines 18、protocol 47＋13、compose 12 目标全绿、actor 86、dotnet 117/117、clippy 0、fmt OK。[回执](reviews/2026-09-12-executor-audit/COST2_PROVIDER_FIELDS_IMPLEMENTATION.md)。未验收：未提交/推送、未跑远端 CI；真实端点字段观测照旧 NOT_RUN（属 COST-5）；context-simple dynamic 引擎同型「非零才入账」门槛属 A 线（接口请求见回执） |
+| C 后续 | COST-3 | 减少不必要前缀变化与重复组装，保留语义和权限 | CTX-1、COST-1/2；prompt 交 A 合入 | **B 线部分代码落地（2026-09-12，工作树）**：D04——items/foreground/surface-omit 三个裁剪循环的总量求导从「每次比较全量 into_messages 克隆」改为「每次重组后单次求导」跟踪值（唯一真值保持最新组装的 input；最终拒绝与保守余量不变；末尾账目直接取跟踪值，删除最后一次重复求导）；D05——删除 actor 热路径无条件 TEMP-DBG stderr（工具面事实已在 ToolSurfacePlanned 持久事件）。D03 prompt 半归 A 线合入中（B 线已在 prompt.rs 落红-first 契约测试 `identical_items_assemble_identically_regardless_of_diagnostics_counts` 钉住目标：同 items 不同诊断计数必须逐字节同请求；census 事实已由 ContextPrepared 事件承载）。actor 86/86、kv 探针 5/5、clippy 0 警告。D04 为组装开销确定性削减，非缓存收益声明（收益归 COST-5 实测）。[回执](reviews/2026-09-12-executor-audit/COST3_PREFIX_STABILITY_BLINE_IMPLEMENTATION.md)；未提交/未跑远端 CI  **A 线合入窗完成（2026-09-12，本会话）**：D03 落地——working 消息的 catalog 计数行整体移出模型请求（留 ContextPrepared 事件/引擎 diagnostics），相同 items 请求逐字节稳定（修复并行会话 identical_items 测试的随机 id 缺陷并转绿；census 断言更新为「不得重进请求」）；D05 TEMP-DBG stderr 已由 COST 线自删。prompt:: **41**、agent-runtime lib **401**。[回执](reviews/2026-09-12-executor-audit/COST3_PROMPT_SIDE_STABLE_PREFIX.md)；provider 侧测量/D04/COST-5 归 C 线 | |
+| C 后续 | COST-4 | 维护调用有独立输出/时间/重试和累计预算 | COST-1/2、CTX-3 | **首半代码落地（2026-09-12，工作树）**：请求级输出上限——`ModelRequest` 增 `max_output_tokens: Option<u32>`（serde default＋skip；`derive Default`），压缩器把 `COMPACTION_OUTPUT_CHARS` 作为请求级上限写入请求，provider 双协议在 `send_max_tokens` 协商开启时以请求 cap 覆盖 profile cap（Chat `max_tokens`／Responses `max_output_tokens`）——生成成本在 provider 侧被限制，回复后截短退为兜底；端点未协商该字段时行为逐字节不变。provider **120**（+1 双协议覆盖测试）、compose 12 目标全绿（+1 cap 透传测试）、contracts 173、clippy 0、fmt OK。[回执](reviews/2026-09-12-executor-audit/COST4_MAINTENANCE_OUTPUT_CAP_IMPLEMENTATION.md)。**后半代码落地（2026-09-12，工作树）**：独立 maintenance transport——compose 增 `try_maintenance_transport_from_env()`（`MAINTENANCE_TIMEOUT_SECS` 可选覆盖压缩 transport 的时间上界，默认 120s；同一 provider 凭据与重试预算；demo 模式忽略；缺失凭据 fail-closed 报错），`build_context_engine` 增第 4 参 `maintenance_model`（缺省回退主模型），宿主/TUI/CLI 三入口一致接线（横幅标注 maintenance transport 激活）；端到端测试证明折叠走向 maintenance 模型（失败入 Unknown 账）而主模型零调用。compose 12 目标全绿（+1 所有权测试）、provider 120、clippy 0、fmt OK。**COST-4 完成（输出/时间已控；重试预算继承既有有界默认，模型选择按 D02 留待语义回归；引擎侧单维护 token 总预算 `max_compactor_tokens_per_maintain` 已存在于 RollingConfig 默认 MAX——按运营需要收紧属 A 线运营面）。[回执](reviews/2026-09-12-executor-audit/COST4_MAINTENANCE_OUTPUT_CAP_IMPLEMENTATION.md)  **A 线后半落地（2026-09-12，本会话）**：引擎侧单维护 token 预算——`RollingConfig.max_compactor_tokens_per_maintain`（默认 u64::MAX opt-in），累计（in＋out，observed/estimated）到限即延期（候选移出前判定，deferred_folds 诚实；unknown 行由 CALL 预算覆盖、`compaction_budget_exhausted` 专指 token 门槛）；报表增 serde-default 字段。回归 2 新增（预算延期＋默认对照）；context-baselines **20**。[回执](reviews/2026-09-12-executor-audit/COST4_TOKEN_BUDGET_ENGINE_SIDE.md)；compose 产品面（时间/重试/模型选择）归 C 线 | |
+| 联合验收，C 汇总 | COST-5 | 同质量真实长任务的全成本下降，取消恢复与资源边界不退化 | 承接 W 第 7 行，不重开冻结评测 |
+
+**第一轮历史派发（当前开工改读顶部第二轮三份任务）：** [上下文执行者](reviews/2026-09-12-executor-audit/HANDOFF_CONTEXT.md)首片 CTX-1；[执行核心负责人](reviews/2026-09-12-executor-audit/HANDOFF_EXECUTION.md)首片 EXEC-1；[缓存与成本执行者](reviews/2026-09-12-executor-audit/HANDOFF_COST.md)首片 COST-1。保留此处用于对照实施回执，不重复派发已经落地的首片。
+
+**共享契约单一合入：** B 负责 contracts/protocol/command/compose/公共 DTO 与 Actor 发射点，领域语义由 A/C 确认；A 拥有 prompt 证据逻辑，C 需要变更时由 A 合入；同一 GUI ViewModel 预约窗口，禁止双写。当前修复未提交，执行前形成可复现基线或核验工作树快照，不从裸 HEAD 遗漏他人改动。
+
+**验收底线：** 完整质量与权限/完成语义先通过；账目按 main/maintenance/repair/retry 区分 observed/estimated/unknown；真实成本使用不重叠的计费分桶。仅 Token 降低时只声明 Token 优化，未知费用不当零。保持 Focus、新鲜性、GC 终态、有效工具与硬资源预算；不添 filler 或无限历史追求命中。本轮不调用付费模型，真实对照留给后续有界执行。
+
+开发按本片做必要定向验证，集成沿用既有 CI；文档变化只跑 `python scripts/doc_consistency.py`。任务书中建议命令不等于已运行。完成验收即停止扩展，不建 Chronicle/TaskGraph/新 worker 调度器或第二套任务权威。
+
+---
+
+## 前序队列与实施回执（以下为 2026-09-11 及更早时点记录）
+
+以下保留已有工作树实施内容和历史限制。**开工以顶部 CTX/EXEC/COST 队列为准，旧段中的“当前/待做”按其记录日期理解；已修项不重复实现，残余按上表续接。**
+
+> 状态：**新阶段「可靠长任务工作台」三条并行线（CORE/PLATFORM/GUI，2026-09-11 切换）。** 来源：2026-09-11 执行者 LLM 视角审查（基线 `685b6bbb29275bc8ec73ce6625a94567a8b8d23d`，提交时间 2026-09-10 18:16:27 UTC，对应远端 CI run `34513313166` success）——42 个源码/文档文件部分读取，追踪请求组装、上下文、正文缓存、工具输出、任务与平台边界、宿主启动与桌面主 ViewModel；**未逐行全覆盖、未运行本地 Rust/.NET 测试**（克隆受网络限制、环境无工具链），反例为源码推导。核心结论：**下一阶段不继续「再加一套 GC、再加一层编排、再扩大缓存」，而是围绕「LLM 实际收到的证据是否准确、完整、可恢复」推进；核心、平台、GUI 并行，但三线必须使用同一套证据与请求身份，不能各自推断状态。** F01–F08（4 P1、4 P2）映射为 CORE-1/2/3、PLATFORM-1/2/3、GUI-1，CORE-4 与 GUI-2/3/4 承接已有布局/只读面板/成本记账户为后续增量。原文：[reviews/2026-09-11-audit-685b6bbb/REPORT.md](reviews/2026-09-11-audit-685b6bbb/REPORT.md)；任务书：[NEXT_STAGE_THREE_TRACKS.md](reviews/2026-09-11-audit-685b6bbb/NEXT_STAGE_THREE_TRACKS.md)；读取清单：[COVERAGE.json](reviews/2026-09-11-audit-685b6bbb/COVERAGE.json)。
+> 上一队列（W 系列）**W01–W08 代码全部落地**（收口见下方「W 系列」节，CI run `34408215832` 七 job 全绿）；**第 7 行「三类真实仓库任务衡量」仍是部分覆盖**（三个小型隔离样本产物通过；大型跨 crate、严格九份独立 host 覆盖声明、真实 compactor 长等待、降本对照未验收），沿原编号继续推进，**改为在本阶段真实用户旅程中一并验收，不另立项、不重开**。M17 N 系列（N0–N8）、并行三线 A/B/C、2026-09-09 核心续审 R01–R14 全部收口，不重开已关闭项。
+> 本次审查与既有修复的关系：F01 不等同 R09/W02——R09 已统一「正文可见窗口」的区间包含规则，缺口在**缓存写入侧未保留范围**；F02 是 F15/N6 的续接（F15 要求「仅明确替代目标才进终态」，本轮指出即使加入替换提示词仍缺少**被替换决策本身的身份**）。已落地组件不重做，断着的链路直接接通。
+> CI 状态按 run 记录，不外推到任意 SHA。
+> 剩余条件项不变：真实 provider live（无凭据写 `NOT_RUN`）、下次实际发布的 PACKAGE-01（已并入 N8）、默认启用 MCP 后的 MCP-01（E1 已覆盖声明车道的取消贯通）。
 
 ## 开始执行
 
@@ -15,20 +107,149 @@
 已完成的项定向确认后跳过。一次只做一个工单。
 **四个不同事实**：代码存在、已接真实传输/产品入口、检查实际执行、真实用户场景跑通——分别记录，不互相冒充。
 执行任何工单前先 `git status --short` / `git rev-parse HEAD`；审查未读过的模块现场补读，不宣称全仓已审。
+本轮审查基线为 `685b6bbb`；开工前先核对相关文件在该基线之后是否已变，若问题已修则引用实际修复与回归，不重复实现。
 
-## 并行与进入顺序
+## 权责不变（本阶段）
 
-| 批次 | 工单 | 约束 |
-|---|---|---|
-| 第一批 | **N0 构建与验证入口**（立即）；N1 宿主长期服务、N2 客户端操作安全、N6 核心语义与读取边界 | 互不阻塞；N0 的集成检查期间即可并行开工 |
-| 第二批 | N3 真实事件与完整输入 → N4 正式 GUI 操作链；N5 恢复与结果审阅 | N3 最小契约固定后 GUI 接真实数据 |
-| 第三批 | N7 长会话低占用；N8 能力配置与联合交付（含 PACKAGE-01） | 高风险恢复/执行声明等对应修复通过 |
+- **RuntimeActor**：唯一调度器，执行轮次、安全点、取消与恢复协调。
+- **TaskManager / TaskAnchor**：任务身份、解释、约束与进度，继续属于 runtime；不引入第二套任务状态权威。
+- **Core**：授权、操作/效果权威与日志；不新增任务规划权威。
+- **ContextEngine**：选择、驻留、可恢复外存与派生摘要；**不自行撤销无法证明失效的用户约束**。
+- **Platform**：鉴权后的路由、连接与可查询结果；不创建另一个任务状态机，继续是经授权的 RuntimeHandle 门面。
+- **GUI**：可信状态投影与显式用户操作；不以日志文字、同名目标或超时自行判定事实。
 
-共享协议、`RuntimeCommand`、compose 入口单一维护者；修改结果未知时不重发（返回 Unknown/要求重同步）；快照与事件以同一 run/host 身份衔接；客户端不从显示文字制造完成、审批或恢复事实。
+## 三线所有权与合并规则
 
-2026-09-09 起三线（A/B/C）与 N 系列同步执行、互不阻塞：**N 系列保持原顺序（N4 收尾验收 → N7 → N8），三线切片并行推进**；重叠切片一次执行、两边同时关闭。所有权与不干扰规则见下方「并行三线」节。
+- **核心线**拥有 `crates/agent-runtime` 的执行/上下文/请求组装、`crates/context-simple`、`crates/context-baselines`、基础 fs/search 输出、provider 请求与 usage 语义；不改 GUI。
+- **平台线**拥有 `crates/agent-host`、runtime 平台路由、IPC/连接生命周期、对外读模型、`clients/dotnet` 协议与连接；不拥有 TaskManager，不改 GC 策略。
+- **GUI 线**拥有 `apps/Agent.Desktop`、正式用户工作流、面板状态、导航与呈现；不直读宿主数据库/状态目录，不绕 SDK 推测完成或授权。
+- **共享契约**（`agent-contracts`、`agent-platform-protocol`、`RuntimeCommand` 对外增量、`agent-compose`、共享 DTO fixture）由**单一接口合并负责人**协调，默认由平台线负责合入，**核心语义必须由核心线确认**；三线不得各自发明版本不兼容的 Receipt/Result/ContextFrame。
 
-## 当前队列（M17 收尾：N 系列）
+## 共享小前置（不阻塞三线开工）
+
+先提交一份短契约变更说明与共同反例 fixture，然后并行实现：
+
+1. **证据投影**：在既有 `FileBodyWindow`、`ContextHints`、`MaterializedContext` 及输出 DTO 上补足 `resource identity`（workspace/run binding＋规范化路径＋内容修订）、`visible extent`（行/字节区间或已验证整文件）、`completeness`（full/partial/unknown＋裁剪或扫描受限原因）、`provenance`（call/item/artifact 身份）。**同版本 ≠ 同范围；范围声明 ≠ 截断后仍完整。** 该「最终可见清单」是最终请求的派生视图，不是新的持久化任务权威。
+2. **请求结果身份**：在既有提交收据上加可查询路径，明确进程内与跨重启承诺，使用已有 run/epoch/client_request_id/task_id/payload 身份，**不以 goal 文本匹配**；最小结果分类 accepted / known rejected / unknown / expired。
+3. **可读完的产物**：在既有 sealed artifact 身份上加 offset/cursor、next offset、eof/partial；保持每页硬上限与权限/内容摘要核对；不新建任意路径下载接口。
+
+## 2026-09-11 队列回执（可靠长任务工作台，后续见顶部）
+
+### A 线：核心——让执行者持续拥有准确依据
+
+| 顺序 | 切片 | 用户能获得什么 | 对应发现 | 状态 |
+|---|---|---|---|---|
+| A1 | **CORE-1 正文覆盖一致性**：缓存保留结构化范围/修订/完整性/来源；覆盖证明只来自最终实际进入请求的正文；定价、去重、预算裁剪、消费观测共用同一份派生清单；二次截断同步降级覆盖 | 模型不会因读取同文件另一个片段而丢失之前需要的片段；确有重复时仍能去重 | F01（P1） | **代码落地（2026-09-11，本地未提交）**：`ProtocolBodyRow` 让缓存行携带真实窗口直达组装器；`visible_body_windows_from_parts` 不再硬造 `covers_file` 整文件声明（未知范围贡献 0 窗口；裁剪窗口不构成证明）；`visible_body_windows_for_request` 与身份集合共用同一趟回注筛选（定价集合不再可能超过回注集合）。1197 项本地通过（runtime lib 391、contracts 171、context-simple 16、context-baselines 318、workspace check、fmt、clippy 0 警告、doc 检查 OK）。[回执](reviews/2026-09-11-audit-685b6bbb/CORE1_BODY_COVERAGE_IMPLEMENTATION.md)；待远端 CI 确认 |
+| A2 | **CORE-2 上下文义务与语义终结**：公共 mandatory-claims 边界或明确 Unsupported；决策撤销绑定具体旧决策及其替换依据 | 必需依据不会静默丢失；改一项要求不会顺便抹掉同文件其他要求 | F02（P1）、F03（P1） | **代码落地（2026-09-11，本地未提交）**：F02——`queue_decision_supersessions` 追加 `names_the_same_requirement`，按提示动词直接宾语区分「整实体撤销」（`use X instead`/`drop X for Y`）与「范围化替换」（`replace … logging in X with …`），文件路径相同永不单独构成证明，外部存储分支同判据；反例「改日志格式不撤销超时要求」先失败后转绿，`drop X for Y` 等既有正当撤销保持绿。F03——基线引擎不再硬编码空 `required_misses`，改为把每个 `PromptRequired` 声明如实报告为 `Missing`（`shared.rs::required_claim_misses`），生产默认 `rolling` 的未兑现义务不再被当成「已满足」；`dynamic` 引擎本就真实兑现该契约、不动。context-simple **320**、context-baselines **17** 通过；workspace check、fmt、clippy 0 警告、doc 检查 OK。另有 2 个既有回归在中途被过严判据改红、已修复并保留过程记录。[回执](reviews/2026-09-11-audit-685b6bbb/CORE2_OBLIGATIONS_AND_TERMINALITY_IMPLEMENTATION.md)；待远端 CI 确认 |
+| A3 | **CORE-3 检索—补读—复用闭环**：结果正文带类型化 coverage header（范围/跳过原因/后续页/原始 artifact 与 cursor）；分页与 checkpoint 保留同一语义；串联既有检索、context lookup、artifact read | 模型知道搜索是否找全，能定位并补读具体范围，而非反复全仓重扫 | F04（通常 P2，穷尽性任务 P1） | **代码落地（2026-09-11，本地未提交）**：正文级 coverage 页脚统一——`TurnFrame` 只发 `model_content`，故 `search.grep`（含取消部分命中与快照分页）、`fs.list`（非空 PARTIAL 同类）、`artifact.read`（窗口/续页/结束标记/扫描预算截断）与 `context.search`（打满 limit）的完整性声明全部由类型化扫描值生成为 `[coverage]` 单行页脚长在正文里；溢出续读指针并入同一条页脚。8 项新回归均先复现失败再转绿；tool-runtime 261、agent-core 152、context-simple 320、context-baselines 17、compose 全套、agent-runtime lib 391 通过；workspace check 0 警告、fmt、clippy 0 警告、doc 检查 OK。[回执](reviews/2026-09-11-audit-685b6bbb/CORE3_SEARCH_COVERAGE_BODY.md)；**同日收口 checkpoint 半**——恢复走查抓到真缺陷：冷恢复后 run 换新，恢复前捕获的快照 cursor 全部被 `open_artifact_for_run` 拒绝；修复为恢复提交时 actor 经 `admit_artifact_run_lineage` 把前代 run 登记进当前 run 的谱系文件（有界 32、原子写、fail closed、sealed digest 照旧），真实组合端到端回归验证「恢复前 cursor → 冷恢复 → 翻同一快照末页 + 源文件改写不混入」。workspace 108、compose 49＋1、agent-runtime lib 391 通过。真实 provider 场景未验收，待远端 CI 确认 |
+| A4 | **CORE-4 缓存与压缩的实际成本优化**：保留 CurrentStateLast 与既有布局；稳定不变段保持顺序与序列化；主请求/压缩/重试/取消统一记账，保留 observed/estimated/unknown 身份 | 长任务少重复读取、较少无效压缩，并能解释成本来自哪里 | 报告设计建议（非新缺陷） | **记账真值半代码落地（2026-09-11，本地未提交）**：`UsageIdentity`（observed/estimated/unknown）入契约；`ModelUsed` 增身份字段＋类型化 `usage`（旧行 default unknown，.NET 不消费该事件、无跨语言影响）；取消在飞模型回合显式留 unknown 账目行（不再静默丢失）；`CompactionOutput`/`ContextCompaction` 带身份，`ModelBackedCompactor` 近似推导标 estimated 不再冒充观测；eval 聚合仅 observed 计入消耗。5 项新回归（取消/压缩器两项红-first）；contracts 173、agent-eval 221、compose 50、其余基线不变。[回执](reviews/2026-09-11-audit-685b6bbb/CORE4_USAGE_ACCOUNTING_IDENTITY.md)；前缀优化/成本对比需真实 provider，照旧 NOT_RUN |
+
+**实现落点：** `agent-runtime/src/execution/body_cache.rs`、`actor/mod.rs::record_protocol_body`、`prompt.rs`、`actor/model.rs`、`context-simple/materializer.rs`、`context-simple/engine.rs`、`gc/reachability.rs`、`context-baselines/src/{rolling,shared}.rs`、`tool-runtime/src/tools/{fs,search}.rs`，以及 broker/runtime 的二次限幅边界（`agent-workspace/src/broker.rs`）。
+
+**做到这里停止：** 不重写 GC、不新增存储后端或向量库、不做大型语义解析体系、不新增 TaskGraph、不为提高缓存命中率冻结当前焦点/权限/工艺面。搜索性能真正成为瓶颈后，再做路径/版本驱动的增量索引，优先复用已有索引与恢复接口。
+
+### B 线：平台——让每次操作和每份结果都可以被准确查询
+
+| 顺序 | 切片 | 用户能获得什么 | 对应发现 | 状态 |
+|---|---|---|---|---|
+| B1 | **PLATFORM-1 精确提交结果查询**：既有 actor 账本上增加只读 exact-request 查询；分型 accepted/known rejected/unknown/expired；明确 256 条进程内窗口与重启边界 | 断线后能区分本次提交已受理、明确失败、证据丢失或仍未知 | F06（P1） | **代码落地（2026-09-11，工作树）**：新只读路由 `work/submit_result`——runtime 账本（256 条进程内 `VecDeque`）受理时记录 domain 分离 payload digest；`WorkSubmissionQuery`（Recorded{task_id,payload_digest,matches}/Unknown）经 `RuntimeHandle::query_work_submission` 只读暴露（无 idle fence/模型轮/checkpoint）。协议五分型 `accepted/already_accepted/known_rejected/unknown/expired`＋run 绑定＋id 回显＋事实一致性校验；runtime 只产出三态（`already_accepted` 并入 Accepted 语义、`expired` 为持久化收据承诺预留的 wire 分型，进程内无证据一律 Unknown 不冒装知道历史）。.NET 镜像 DTO＋`SubmitPayloadDigest`（与 Rust 字节一致，跨语言金样钉死）＋`IAgentConnection/AgentConnection/ResumableSession.SubmitResultAsync`（RunQueryAsync 故障重连一次重问）。回归：协议 3、actor 4（含报告反例「同 Goal 旧任务在列，未受理 id 仍 Unknown」与 256 条挤过期读作 Unknown）、host e2e wire 三臂、.NET 3（conformance 2（wire 形状＋digest 金样）＋真实宿主 `ResumableSession` 收据三态（含换 id 同 Goal 仍 Unknown））。protocol 45、actor work 22、host_e2e 8/8、dotnet 过滤 21/21 全绿；fmt/clippy 0 警告。**跨重启确认按任务书明确不实现**（持久化收据是产品承诺，不是扩容 HashMap）。GUI 消费半（删 Goal 核对文案）由 C3 承接。[回执](reviews/2026-09-11-audit-685b6bbb/PLATFORM1_EXACT_REQUEST_RECEIPT_IMPLEMENTATION.md)；待远端 CI 确认 |
+| B2 | **PLATFORM-3 正式连接契约**：平台感知 transport 集中到 SDK/连接配置；统一 WorkspaceIdentity/endpoint 展示与解析；公开 host/run epoch 与协商 profile；共享协议 fixture 检查 Rust/.NET 关键字段与错误分类 | 默认连接在目标 OS 正常工作；连接指向哪个工作区与宿主清晰可见 | F05（P1，支持 GUI-1） | **代码落地（2026-09-11，工作树）**：①WorkspaceIdentity 解析规则对称化——修复「宿主 canonicalize 后哈希、.NET 按原样字节哈希」的真实不对称（相对路径/`sub/..`/符号链接 CWD 推导出不同端点）；新 `WorkspaceIdentity.Resolve`（GetFullPath＋盘根不折叠＋叶链接最终目标，失败保原形），`DefaultSocketPathFor/DefaultLocal/DefaultEndpoint` 全部改经 Resolve；哈希原语保持逐字节（金样钉原语、规范化语义不进跨平台 fixture），宿主新增 `sub/..` 等价回归。②快照公开 run epoch＋工作区身份——`WorkSnapshotResponse` 新增 `run_id`＋`workspace_root`（canonical 展示形，剥离 Windows verbatim 前缀；校验非 nil/4096 字节 opaque），宿主从 `RuntimeStatusSnapshot`/`Workspace::root()` 填充；快照金样双侧同步；相等性权威＝快照里的宿主 canonical root（客户端 best-effort 解析不冒充逐位一致）。③版本漂移拒绝已由每帧信封 protocol 校验满足，不复制第二真相；Windows 共享管道保持既有 DACL＋首实例设计，误连由快照 `workspace_root` 比对闭合。回归：协议 1＋宿主 1＋e2e 双平台断言＋.NET 2＋六个测试双体快照载荷补齐身份字段（SendAsync 接收路径校验诚实拒绝缺字段应答）。protocol 47、fixtures 10、host lib 8、e2e 8/8、runtime actor 80、dotnet **108/108** 全绿；fmt/clippy 本切片文件干净。GUI 面板呈现归 C 线。期间并行 CORE（RuntimeEvent usage）与 PLATFORM-2（artifact 分页）在同一批共享文件落码，窗口后全树检查不归属本切片，回执有记录。[回执](reviews/2026-09-11-audit-685b6bbb/PLATFORM3_CONNECTION_CONTRACT_IMPLEMENTATION.md)；待远端 CI 确认 |
+| B3 | **PLATFORM-2 完整结果与证据读取**：artifact 扩展为有界分页（绑定原始 run 与 sealed digest，返回位置与 eof）；changes 读模型补可定位的修订/产物引用；context 读模型区分在存储/驻留/本轮实际发送/仅摘要指针 | 能读完大型产物、从变化摘要定位实际内容，并看到信息的新鲜度与完整性 | F08（P2 功能缺口） | **artifact 分页半随 GUI-2 垂直落地（2026-09-11，工作树）**：`WorkArtifactRequest.offset`／`WorkArtifactResponse.offset`＋`next_offset`（恰在 truncated 时出现）＋收紧的双侧一致性校验；runtime 按 offset seek 有界读、越界结构化拒绝；sealed 身份逐页核验不换版本；host_e2e 分页序列＋重组逐字节一致＋越界拒绝 8/8；.NET DTO/连接面镜像。`changes`/`context` 读模型两半已收口（2026-09-11）：`ChangeSummary::MutationPrepared.old_content_artifact` 把捕获 before-body 溢出为 run 内 sealed 引用（内容寻址去重、失败降级 None，changes→分页读回原文闭环）；`ContextItemSummary.residency`＋`selected_current_turn` 区分驻留/存储/本轮实际发送/仅摘要指针（context-simple inspect 统一盖章、baselines Resident、.NET 镜像可空）。[回执（两半＋分页验收）](reviews/2026-09-11-audit-685b6bbb/PLATFORM2_EVIDENCE_READING_IMPLEMENTATION.md)、[GUI-2 回执](reviews/2026-09-11-audit-685b6bbb/GUI2_REVIEW_WORKBENCH_IMPLEMENTATION.md) |
+| B4 | **PLATFORM-4 跨层事实与协议一致性**：维护共享接口版本与有限跨层 fixture；核心的 evidence completeness 与 usage 来源可被 SDK/GUI 原样读取；对已有指标与恢复事件做增量字段 | SDK 与 GUI 不必从日志文字推断事实 | 报告设计建议 | **代码落地（2026-09-11，工作树）**：①usage 原样读取——核心线 CORE-4 加进 `RuntimeEvent::ModelUsed` 的 `usage_identity`（observed/estimated/unknown）与 `usage` 详细报告经平台事件通知的 `RuntimeEventEnvelope` 原样转发；.NET 新增类型化访问器 `TryGetModelUsage(out ModelUsageFact)`（计数＋attempts/retries＋identity，`IsObserved`/`IsIndeterminate` 强制区分实测与推计——「丢失 usage 的取消不得显示成零消耗」在 SDK 层有类型化表达；非 usage 事件返回 false）。②跨层 fixture——新增共享金样 `event_model_used.json`（完整 model_used 通知帧），Rust `event_fixture_pins_model_usage_facts`（解码内核类型化信封＋断言 `UsageIdentity::Observed`）与 .NET `Event_fixture_pins_model_usage_facts`（逐字节 roundtrip＋访问器）双侧消费。③随附修复 wire 卫生缺陷——.NET 事件信封的四个派生只读属性（`EventType`×2、`IsLiveOnlyProgress`×2）此前会被序列化进输出（客户端侧重序列化事件帧即注入 Rust 侧不存在的字段），全部 `[JsonIgnore]` 并由新 fixture 逐字节 roundtrip 钉住。④PLATFORM-2 跨层缺口补全（同回执）——并行会话的 `old_content_artifact` 引用未进 .NET converter 白名单，真实宿主 changes 应答会被 .NET 拒收；已修复＋校验上限＋conformance 三事实钉住。共享接口版本与错误分类的每帧校验经 PLATFORM-3 核验维持。验证：protocol 47＋fixtures 11、actor 81、host 8/8、workspace check、fmt/clippy 0 警告、dotnet **112/112**、doc_consistency OK。GUI-4 成本面板消费归 C 线。[回执](reviews/2026-09-11-audit-685b6bbb/PLATFORM2_PLATFORM4_COMPLETION_IMPLEMENTATION.md)；待远端 CI 确认 |
+
+**实现落点：** `agent-runtime/src/work.rs`、`platform.rs`、`platform/work.rs`、`agent-host/src/{lib,main}.rs`、`agent-platform-protocol/src/work.rs`、`clients/dotnet/Agent.Client/{Transports,WorkDto,ResumableSession,AgentConnection}.cs`。
+
+**做到这里停止：** 不新建第二个 TaskManager、不建任务日志数据库、不另建评测平台；MCP/Skills/多 Agent 的全面扩展不阻塞本阶段。
+
+### C 线：GUI——把现有正式客户端推进成可以完成工作的界面
+
+| 顺序 | 切片 | 用户能获得什么 | 对应发现 | 状态 |
+|---|---|---|---|---|
+| C1 | **GUI-1 生产入口与异步隔离**：RealHost 走平台感知选择（实际 `ConnectAsync → BuildTransport`）；统一捕获 connection epoch/selection id/request sequence，成功与失败路径同等 fencing；unknown/未送达/已受理/已执行/已完成分状态 | 默认 Linux 连接正确；旧连接/旧任务结果不会覆盖当前界面 | F05（P1）、F07（P2） | **代码落地（2026-09-11，工作树）**：F05 `BuildTransport` 的 RealHost 分支改为平台感知（Windows 命名管道／Unix 工作区 UDS），显式 endpoint 两种选择原样保留；决策抽出为可注入 OS 的静态重载，使非 Windows 分支在任何宿主可测。F07 三处：①新增 `RequestEra` 统一守卫（connection epoch＋selection 序号），四条只读路径成功/失败同一校验——旧 era 的**失败**不再清空新连接面板；②`SelectedTask` 每次变更（含置空）递增 selection 序号，旧任务详情晚到不覆盖新选择；③**era 作用域 UI 缓冲**——断开时清理 `_pendingUiEvents`/`_pendingUiDelta`，且 delta 缓冲带产出连接戳，退役 era 的 delta 正文不再在晚到的 drain 里刷进新会话输出面板（原 `DrainPendingUiEvents` 对 `deltaText` 无任何 era 检查）。新增 4 项回归，**每项均先在回退修复的代码上复现失败**再转绿。dotnet 95/95、桌面 build 0 警告。未验收：真实 Linux 宿主端到端（本机为 Windows，非 Windows 分支由决策表与注入式重载覆盖，未跑真实 UDS 连接）；unknown/未送达/已受理分状态待 PLATFORM-1 落地后承接；真实 provider 照旧 NOT_RUN |
+| C2 | **GUI-2 结果审阅工作台**：保留既有任务/审批/changes/artifact/context 面板，对接分页继续阅读与明确 eof；提供身份/修订/部分完整标记；输出正文与运行日志分开呈现 | 大结果关键结论在尾部时用户仍可独立核查；重复查看不重触发模型或工具副作用 | F08（P2） | **代码落地（2026-09-11，工作树）**：artifact 分页消费面——「读取/下一页/读尾部」三命令（续读沿服务端游标、eof 失效、尾部经 1 字节探测直跳末窗），面板头部带身份/窗口区间/eof 标记；有界累积窗口（1 MiB，超限释放最旧并明示，不在 UTF-8 序列中间切）；跨页多字节字符由下一页补全（不渲染替换符）；重复查看均为只读调用。输出正文与运行日志分离——模型 delta 独占「输出正文」，回执/失败/账目/事件行入「运行日志」（同等有界保留），AXAML 双 Tab。平台依赖（artifact offset/cursor/eof）随本片垂直落地，见 B3 行。dotnet 111/111、桌面 build 0 警告。[回执](reviews/2026-09-11-audit-685b6bbb/GUI2_REVIEW_WORKBENCH_IMPLEMENTATION.md)。未验收：未提交/推送、未跑远端 CI；GUI→真实宿主分页人工走查未做（host_e2e 已含真实宿主分页序列）；「点击证据回到对应调用」深链未做 |
+| C3 | **GUI-3 可靠继续与恢复**：使用 exact request 查询并删除基于相同 Goal 消除未知提交的逻辑；追加指令绑定选定 task；取消按钮区分取消请求与可信停止；重连先取可信 snapshot 再按 watermark 接续事件 | 丢 ACK、重启、旧同名任务、审批未知、取消与工具完成竞态均无虚假确定文案，也不自动重发有副作用操作 | F06（P1） | **两片代码落地（2026-09-11，工作树）**。**第一片（F06 消费半）**：删除 `ResolveOutstandingSubmitFromSnapshot` 的 Goal 文字匹配，未知提交改由 `work.submit_result` exact-request 查询解除（client_request_id＋`SubmitPayloadDigest`，快照任务列表不参与判定）：Accepted/AlreadyAccepted 解除未知并报 task id；KnownRejected 报冲突（原内容摘要前缀为证）并释放死 id；Unknown/Expired/查询失败**保持未知**、每 id 只报一次；era fencing＋回执 id 回显核对，Pending 不查询（R07 同 id 幂等重试保持）；每份快照与每个新未知触发 single-flight 查询。.NET 客户端只读消费面随片落地（`IAgentConnection/AgentConnection/ResumableSession/FixtureAgentConnection` 的 `SubmitResultAsync`；与 PLATFORM-1 重叠半边一次关闭，协议/宿主侧未动）。**第二片（任务书第 2/3/4 条）**：继续回执核对选中任务并在不一致时明说「继续的是活动任务」（wire 无绑定字段，GUI 诚实呈现，不改协议），按钮文案「继续活动任务」；新增 `CancelRequestPhase` 状态机＋状态条 `CancelStateText`——发出即「已发出等待确认」，仅类型化 ack 升级「已确认取消/没有活动轮次」，不可确定保持警告，未决阶段由可信快照重推导（在途不越权、断开作废、era 守卫拒晚到结果）；重连 snapshot→watermark 接续核对为复用既有 B1/ResumableSession 机制，无新增代码。新增 3 项 F06 回归＋5 项继续/取消回归＋2 项 restore 走查升级（均先红后绿）。dotnet 106/106、桌面 build 0 警告、doc 检查 OK。[回执一](reviews/2026-09-11-audit-685b6bbb/GUI3_EXACT_REQUEST_IMPLEMENTATION.md)、[回执二](reviews/2026-09-11-audit-685b6bbb/GUI3_CONTINUE_CANCEL_IMPLEMENTATION.md)。未验收：未提交/推送、未跑远端 CI；真实宿主 e2e 与人工 GUI 走查未做（协议/宿主侧验收属 PLATFORM 线）；continue 的协议级 task 绑定属平台契约增量；统一用户旅程验收待真实场景；真实 provider 照旧 NOT_RUN |
+| C4 | **GUI-4 展示实际上下文与成本**：区分 actual sent/resident/pointer-only/stale/missing；成本显示主调用/压缩/重试并区分实测/估算/未知；随功能拆分 MainWindowViewModel | 用户能回答「为什么模型又读了这个文件」「哪些资料没有完整提供」「这次取消有没有未知费用」 | 报告设计建议 | 第三波；**GUI 消费面已代码落地（2026-09-11/12，工作树）**：①成本三分账目——`model_used` 经 `TryGetModelUsage` 按实测/估算/未知分类，实测合计只含 observed，未知轮「按未知计，不计为零」（丢回执的取消不显示成零消耗），重试记为下界；②压缩成本——`context_compacted` 按服务端报告呈现（事件未带实测身份，明确不并入主调用实测合计）；③只读 Context 每行渲染类型化新鲜度四态（驻留·本轮已发送／驻留未在最新表面／暖缓冲／存储中仅摘要指针），旧服务端缺字段显示「新鲜度未知」，绝不推断；账目随连接纪元断开重置。dotnet **115/115**、桌面 build 0 警告、doc 检查 OK。[成本与新鲜度回执](reviews/2026-09-11-audit-685b6bbb/GUI4_COST_CONTEXT_DISPLAY_IMPLEMENTATION.md)、[压缩成本补充](reviews/2026-09-11-audit-685b6bbb/GUI4_COMPACTION_COST_ADDENDUM.md)。未验收：未提交/推送、未跑远端 CI；真实宿主 GUI 人工走查未做；ViewModel 拆分随功能逐步进行、大规模纯重构不作前置；真实 provider 的金额与缓存收益对比照旧 NOT_RUN（属 M18 COST 阶段验收） |
+
+**实现落点：** `apps/Agent.Desktop/ViewModels/MainWindowViewModel.cs` 及其面板/命令；`clients/dotnet/Agent.Client` 的只读方法消费面。
+
+**做到这里停止：** 不换 GUI 技术路线、不另做验证壳、不把大规模纯重构设为全功能前置；GUI 不保存第二份任务/权限/完成真相，不改 Core 绕过文件写入口。
+
+## 并行节奏与合并点
+
+**不是「核心完成后开发平台，平台完成后开发 GUI」。**
+
+| 波次 | 核心 | 平台 | GUI |
+|---|---|---|---|
+| **第一波：修真值与入口** | CORE-1、CORE-2 | PLATFORM-1（进程内精确查询）、PLATFORM-3 | GUI-1；unknown 文案与同名核对停止 |
+| **第二波：形成工作闭环** | CORE-3 | PLATFORM-2、跨层 DTO | GUI-2、GUI-3 |
+| **第三波：优化与解释** | CORE-4 | PLATFORM-4 | GUI-4 |
+
+GUI 可用契约 fixture 开发界面，但每个功能必须尽快落到真实宿主链路，不以 fixture-only 宣告正式完成。重叠切片一次执行、双方同时关闭，不重复立项、不拆第二套待办。
+
+## 统一阶段验收：一条真实用户旅程
+
+复用仓库已有验证与回归入口，不额外建立独立任务编排或 benchmark 系统；每个新行为补对应的最小反例回归。
+
+1. 从正式 GUI 默认连接真实宿主，提交跨文件修改任务。
+2. 模型搜索到部分命中且遇到被跳过范围，明确看到不完整声明并补读。
+3. 对同版本文件读取不相交片段，跨过尾部截断，再需要较早片段；它仍准确可见或可恢复。
+4. 用户追加只改变日志格式的要求，原有超时/兼容性约束没有被撤销。
+5. 过程中断线导致一个 ACK 丢失，重连不凭同名任务猜测，也不自动重复提交。
+6. 用户从 GUI 阅读大型产物尾部和修改证据，触发一次显式取消/继续；所有状态与实际 authority 一致。
+7. 完成后汇总任务结果与 observed/estimated/unknown 成本；丢失 usage 的取消不能显示成零消耗。
+
+**通过条件：** 任务产物正确、必需证据闭合、权限/副作用边界保持、默认生产入口可用、未知状态不被假定为确定、结果可完整核查。缓存优化不得以损失任何一项为代价。
+
+**已有验证域与实测工作继续沿原入口推进**（W 系列第 7 行的三类真实任务衡量并入本旅程验收，不新建平行评测工程），真实 provider 不可用照旧写 `NOT_RUN`。
+
+## 文档收敛
+
+- `CURRENT` 只写实际默认配置、最近成功路径与仍未验收的限制。
+- `NEXT_TASKS` 只保留三条活动主线、接口依赖与可交付产物（本节）。
+- 完成历史归档但保留证据，不删除必要证据、不让历史修复清单继续占据 coding agent 的主要工作焦点。
+
+---
+
+## W 系列（2026-09-10 审查 `fb1ec9c`：Agent 任务流程核心——代码全部落地，第 7 行仍有部分覆盖）
+
+**实施后复核（2026-09-10，`8a0dc29` → `6ec044a`）：**下表保留原实施与 CI 回执，新增反例仍沿原编号执行，不另建阶段。详见 [复核与缓存设计](reviews/2026-09-10-cache-design-8a0dc29/REPORT.md)、[验证记录](reviews/2026-09-10-cache-design-8a0dc29/EVIDENCE.md)。
+
+- **W02：已修复并包含于 `6ec044a`**。候选必须具有自己的文件/版本与完整覆盖范围；同 id 不同片段、跨来源同文本不能掩盖 required_miss。
+- **W04 非 BeforeModel 取消已落地（2026-09-10，工作树）：**UserInput/AfterTool/AfterModel 维护接入既有 operation 续接，取消先推进 Core 代际再停止并 join 维护。新输入恢复入账前快照；提交阶段中断返回 RecoveryRequired，保留已应用效果，不误发 TurnCompleted。输入事务成功后使用新 directive 的执行/证明版本；停机有界等待当前提交。门控与完成/取消竞争回归见 [W04 实施与验证回执](reviews/2026-09-10-maintenance-cancellation.md)。W04(P2) 的零预算延期账目已在 `732cf93` 修复，本片不重做。
+- **W06 已包含于 `732cf93`：**按渲染字节统计捕获上限，截断保留行边界，游标指向首个未展示行；本片核对 HEAD 后跳过重做。**第 7 行已完成小型基线，范围与下一片见下条**；不复跑缓存合成样本。
+- **W04 dynamic ingest 已完成本地验收（2026-09-11，工作树）：**取得真实 Simple 引擎＋门控 compactor 的修复前取消超时反例后，将 ingest 与 UserInput 维护纳入同一 operation/输入事务。取消和停止先 join 后恢复完整快照，继续保留原指令；正常压缩入账/用量报告各一次；部分输入失败回滚，回滚失败返回 RecoveryRequired。Runtime 620 项及 Clippy 通过，[本片回执](reviews/2026-09-11-ingest-cancellation.md)。Flash 原样本没有触发压缩，不充当关闭证据。**下一片先准备第 7 行的严格九份独立 host 验证覆盖声明任务，固定起点、目标与产物检查后再运行有界 Flash；不重复成功样本。**
+- **第 7 行首轮基线已执行，部分覆盖：**三个小型隔离真实代码样本产物通过；已知 21 次 usage、另 1 取消操作缺测。跨进程恢复和约 4 MB 工件尾部读取通过，九类应用检查不冒充九份独立 host 证明；大型跨 crate、真实 compactor 和降本对照仍未验收。[实测回执](reviews/2026-09-11-flash-workflow/REPORT.md)。**本行后续并入「可靠长任务工作台」的统一用户旅程验收，沿原编号推进。**
+- **供应商 KV 缓存首切片（用户明确共同底层优先）：**按 [KV_CACHE_PLAN.md](reviews/2026-09-10-cache-design-8a0dc29/KV_CACHE_PLAN.md) 在 PromptAssembler 建立稳定段/current_view 的共同布局，稳定合法工具集合的表示、状态后置，同步记录前缀变化原因；随后有界区段，再由薄 provider 适配层映射专属参数与用量。底层不等待供应商选择；独立观测不被 W04/W06 整体阻塞，涉及提交边界才依赖其修复。不启用工具 memo、不改 GC/打分，不以离线字节前缀冒充 provider 命中率。
+
+  **首个保守切片已落地（2026-09-10，工作树）：**`CurrentStateLast` 移动完整目录/焦点/进度块，保留全部文字、角色、选中顺序、正文去重、工具选择和协议窗口；新增布局版本及 Legacy 组合回退，request metadata 标明布局。[实施回执](reviews/2026-09-10-cache-design-8a0dc29/KV_LAYOUT_IMPLEMENTATION.md)。为保留当前焦点策略，本片不拆正文标题、不冻结选中集合、不稳定化实际已变化的 schema surface。下一步先做最终请求前缀变化归因和用量覆盖，再决定剩余布局改动；区段化与专属缓存参数尚未实施。
+
+  **发送观测＋隔离复测已完成：**继[首次 10 次实测](reviews/2026-09-10-cache-live/REPORT.md)后，按需 provider 观测入口和 [12 次隔离预热/换序对照](reviews/2026-09-10-cache-live/ISOLATED_REPORT.md)已运行。当前 `eval.env` 可用，不再以旧“无凭据”回执作为阻塞。新布局超过 20KB 的 HTTP 前缀保持不变，但更新焦点/进度的两次请求仍为零读取；原样重放 5/6 命中，12/12 合成回答正确。由此进入下一段的共同复用边界实现。隐藏服务原因、金额和整仓任务质量未验证；不重复相同条件的付费调用，不重开长任务或冻结实验。
+
+  **共同复用边界＋显式映射本地实现完成（2026-09-10）：**`ModelInput::into_request` 从最终 packing 的请求绑定单个 `PromptReuseBoundary`，实际正文/角色/顺序/schema 失配即失效；只在 `OPENAI_PROMPT_CACHE_MODE=responses_explicit` 且固定 Responses 协议时映射断点，默认供应商请求及 profile digest 保持。定向测试与 Clippy 通过。[本片回执](reviews/2026-09-10-cache-live/BOUNDARY.md)。**真实验收未过：2 次冷请求失败，第二次 HTTP 400 且错误提到 `prompt_cache_breakpoint`；未进入改 D 复用 E 阶段。后续小请求已查明服务端明确报告当前模型不支持该断点，见 [能力定位与类型化诊断](reviews/2026-09-10-cache-live/CAPABILITY.md)。当前默认模式保持，显式收益验收需要已确认支持的端点/模型；不重复该拒绝请求，不改焦点角色/GC/选择策略。**
+
+  **DeepSeek Flash 合成复用验收通过（2026-09-10）：**用户指定官方 `deepseek-flash`，以 Responses＋非思考档位＋原生默认缓存完成 10 次真实请求，答案 10/10 正确。三次当前状态变化，新布局每次缓存读取 6,144/6,468（94.99%），Legacy 256/6,468（3.96%）。类型化推理档位配置与验证已落地；[实测回执](reviews/2026-09-10-cache-live/DEEPSEEK_FLASH.md)。本片完成；后续 W04 非 BeforeModel 维护取消现已在工作树接通，见上方回执。真实仓库质量/思考模式工具续跑/实际账单仍未验收，不重复本组合成实测。
+
+来源：2026-09-10 Agent 任务流程审查（基线 `fb1ec9c`；主审查者逐项复核＋隔离反例，8 项：4 P1、4 P2）——[reviews/2026-09-10-agent-workflow-fb1ec9c/REPORT.md](reviews/2026-09-10-agent-workflow-fb1ec9c/REPORT.md)，缺陷明细与「不要做什么」见 [AUDIT_TODO.md](AUDIT_TODO.md) 2026-09-10 表，切片顺序与衡量方式见 [WORKFLOW_AND_ROUTE.md](reviews/2026-09-10-agent-workflow-fb1ec9c/WORKFLOW_AND_ROUTE.md)。W 编号只是本轮定位，不另建阶段；此前 N/A/B/C/R 队列全部收口（CI 确认记录见 CURRENT.md）。
+
+| 建议顺序 | 切片 | 用户能获得什么 | 状态 |
+|---|---|---|---|
+| 1 | **W01** 继续/恢复仍遵守完整原始指令（TaskRecord 当前指令身份＋InputEnvelope 引用；2,000 字符只用于展示） | 继续任务时指令尾部约束不再丢失 | **已关闭（2026-09-10）：CI run `34397568867` 七 job 全绿确认**（`38b133a`）：TaskDirective 保留 sealed input 引用/inline body，继续先过 durability gate 再按原 run 认证读取；legacy 恰在旧上限拒绝；checkpoint 验证；agent-replay 不再用 preview 冒充正文。回归 `tests/turn/directive.rs` 4 项；agent-runtime turn 119＋lib 373＋actor 74、agent-replay 59、host_restore 3、fmt、clippy 全绿 |
+| 2 | **W04+W08** 长维护可取消、失败后原文仍在（维护预算＋取消身份；summary_completed/unavailable 区分） | 132 次串行压缩调用变为有界可取消；模型失败不再把 fallback 当成功退役正文 | **已落地（2026-09-10，本批）**：RollingConfig 调用数预算（默认 4）＋`deferred_folds` 如实延期；BeforeModel 维护改为 spawned 可取消 op（abort=引擎安全失败，FoldRestore 归还记录），cancel_turn 阻塞维护中拿到类型化回执；compactor 错误/空回复传播为 Err，源正文不退役。回归：预算/延期/收敛（context-baselines）、门控取消（turn/maintenance.rs）、失败保留源（agent-compose 引擎级） |
+| 3 | **W02** 最终 packing 复用 R09 范围覆盖（required 移除即 miss） | 缺必需正文时不会被告知证据齐备 | **已落地（2026-09-10，本批）**：`record_final_pack_drop` 改用 `visible_body_windows_cover`——互补区间删除即 required miss、整文副本/相同正文不误报、partial 不构成覆盖。回归含报告反例 |
+| 4 | **W03** 全部 Storage GC 删除入口共享保留根（含根集合完整性） | 保留的旧快照持续有可恢复正文 | **已落地（2026-09-10，本批）**：`storage_gc_protecting(roots, complete)`＋`reconcile_store_protecting` 同签名扩展；根枚举失败/截断置 incomplete → 删除分支延期并报告；完成边界 GC 经 `context_storage_gc_protecting` 传入保留根。回归：引擎级完整序列（保护存活/延期可见/对照删除） |
+| 5 | **W05** 当前验收证明优先保留（9 域合法任务可收敛） | 合法多域验收能结束，重复检查不挤掉必要证明 | **已落地（2026-09-10，本批）**：`MAX_VERIFICATION_FACTS` 对齐契约 16 域；cap 淘汰改为「每 identity 保留最新一条」，同域重复不再挤掉其他域；basis 变更失效规则不变。回归：9 域全保留＋重复风暴＋spec 变更失效 |
+| 6 | **W06/W07** 两个小切片：artifact.read 大工件可达读取；patch 纠错候选取真实磁盘内容 | 大输出能按需查看；纠错依据真实内容 | **已落地（2026-09-10，本批）**：artifact.read 改流式按行扫描（8 MiB 扫描预算＋2 MiB 捕获上限，`total_lines_complete`/`window_truncated` 诚实标记，3 MB 工件首页与第 25,000 行均可达）；patch 失败候选取磁盘原文＋失败 hunk 序号，永不引用未提交中间态 |
+| 7 | 三类真实仓库任务衡量（跨模块修改/多域验收/长输出＋中断恢复） | 成本与交互性有实测记录 | **PARTIAL（2026-09-11）**：三个固定小型真实代码样本已运行，产物 3/3 通过，见本节首轮基线回执。大型跨 crate、严格九份独立 host 证明、真实 compactor 长等待和旧版同任务对照未验收。dynamic ingest 取消已通过本地门控验收；本行后续并入「可靠长任务工作台」的统一用户旅程，沿原编号推进。密钥仅从进程输入注入；不为此新建评测框架或总门禁，不重开 M15/LT-EVAL |
+
+**W 系列收口（2026-09-10）：**W01–W08 八项全部代码落地；**CI 确认：run `34408215832` 七 job 全绿**（覆盖 `8a0dc29`，含 W01 全树）。第 7 行仍属部分覆盖，不能由原 CI 或合成缓存结果补齐；后续沿本阶段统一旅程推进，不另立项。缺陷明细与逐项验收记录见 [AUDIT_TODO.md](AUDIT_TODO.md) 2026-09-10 表。
+
+**用户结果：**继续不丢指令、维护可取消且失败不退役正文、证据缺失诚实可见、旧快照可恢复、合法验收能收敛、大输出可查看、纠错有真实依据。
+
+---
+
+## 当前队列（M17 收尾：N 系列——已全部收口，保留为关闭记录）
+
+**说明（2026-09-11）：**N0–N8 全部关闭（关闭与 CI 确认记录见本表各行与 [CURRENT.md](CURRENT.md)）。下表作为关闭证据保留，不再是当前执行队列；历史批次入口顺序记录在其后「并行与进入顺序」。
 
 | 顺序 | 工单 | 线 | 交付物 | 状态 | 依赖 |
 |---|---|---|---|---|---|
@@ -101,7 +322,7 @@
 
 ---
 
-## W 系列（2026-09-10 审查 `fb1ec9c`：Agent 任务流程核心——当前队列）
+## W 系列明细（2026-09-10 审查 `fb1ec9c`：Agent 任务流程核心——代码全部落地，第 7 行仍有部分覆盖）
 
 **实施后复核（2026-09-10，`8a0dc29` → `6ec044a`）：**下表保留原实施与 CI 回执，新增反例仍沿原编号执行，不另建阶段。详见 [复核与缓存设计](reviews/2026-09-10-cache-design-8a0dc29/REPORT.md)、[验证记录](reviews/2026-09-10-cache-design-8a0dc29/EVIDENCE.md)。
 

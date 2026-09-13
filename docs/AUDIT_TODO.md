@@ -1,6 +1,74 @@
 # 缺陷分流
 
-当前执行顺序由 [NEXT_TASKS.md](NEXT_TASKS.md) 前列决定：**2026-09-10 Agent 任务流程审查（基线 `fb1ec9c`，W01–W08）为当前队列**。此前队列全部收口：M17 N 系列（N0–N8）、并行三线 A/B/C、2026-09-09 核心续审 R01–R14 均已代码落地（关闭与 CI 确认记录见 [CURRENT.md](CURRENT.md)），不重开已关闭项；2026-09-10 W 系列表见下方，按路线文档建议顺序切片执行，不另建阶段。
+## 2026-09-13 第三轮当前分流
+
+基线 `685b6bbb` 加共享未提交树，产品代码未改。当前只有 [NEXT_TASKS.md](NEXT_TASKS.md) 顶部这一套执行顺序，三个任务包和完整反例见 [第三轮报告](reviews/2026-09-13-executor-maintainability-audit/REPORT.md)。共 14 项（4 P1＋10 P2）；R3-01～08、R3-13 共 9 项有本轮反例，其余为源码核实、动态回归未跑。
+
+| 问题 | 级别 | 影响 | 切片 |
+|---|---|---|---|
+| R3-01 | P1 | service Context 漏恢复保护根，误删旧 checkpoint 正文 | EXEC-9 |
+| R3-02 | P1 | 退休 scope 被 blob 带回，检查点无法恢复 | CTX-10 |
+| R3-03 | P1 | 修改超时日志永久撤销超时时长 | CTX-2 残余 |
+| R3-04 | P2 | 退休环丢最新事实，完成保护不能依赖可淘汰环 | CTX-10 |
+| R3-05 | P2 | Pending foreground 漏正文 | CTX-11 |
+| R3-06 | P2 | Stored 材料化使用过期 owner 元数据 | CTX-11 |
+| R3-07 | P2 | 无效候选耗尽召回额度 | CTX-12 |
+| R3-08 | P2 | 背压报告未消费，总驻留持续增长 | CTX-8 B 线后半，已知未完项 |
+| R3-09 | P1 | restore 未隔离停靠的终局事务 | EXEC-10 |
+| R3-10 | P2 | 并发 capture 覆盖 gc_work 丢回执/任务所有权 | EXEC-10 |
+| R3-11 | P2 | 冷查询整文件扫描阻塞 Actor/journal | EXEC-8 残余 |
+| R3-12 | P2 | provider 失败出口丢已收到 usage | COST-7 残余 |
+| R3-13 | P2 | 未发送候选改变退避 identity，重复调用 | COST-8 残余 |
+| R3-14 | P2 | GUI render overflow 吞成本累计事件 | COST-9 |
+
+维护性改动与具体缺陷同切片交付，不另起“大文件清理”队列。前序已修事实保留，旧 report 的缺陷编号不等于当前仍未实现；下面是当时分流。
+
+## 2026-09-12 第二轮分流（历史时点）
+
+本轮基线为 `685b6bbb` 加最新未提交树；源码反例未运行复现。唯一执行顺序在 [NEXT_TASKS.md](NEXT_TASKS.md) 顶部，证据和优先级见 [第二轮报告](reviews/2026-09-12-gc-core-followup/REPORT.md)。这些是跨路径续接，旧修复不整体重开。
+
+| 问题 | 级别 | 核心影响 | 切片 |
+|---|---|---|---|
+| R2-01 | P1 | 64 task / 256 completion 裁剪破坏 checkpoint 关系校验 | EXEC-5 |
+| R2-02 | P1 | 原始正文产生恢复读集合，36 字节切片可因 Unicode panic | EXEC-6 |
+| R2-03 | P1 | Live 必需根没有贯穿 TTL/老化 | CTX-5 |
+| R2-04 | P1 | Pending owner 漏语义终结/required 等路径 | CTX-6 |
+| R2-05 | P2 | stored promotion 的元数据在读回时被旧 blob 覆盖 | CTX-7 |
+| R2-06 | P2 | 外置失败的 Pending/序列化/full pass 总量缺边界 | CTX-8 |
+| R2-07 | P2 | closed scope/历史目录和 checkpoint 元数据继续增长 | CTX-9 |
+| R2-08 | P1 | GC/checkpoint maintenance 仍占 Actor 命令处理分支 | EXEC-7 |
+| R2-09 | P2 | 完成热记录退休后无产品级冷查询接续 | EXEC-8 |
+| R2-10 | P2 | cache miss 错映射 write，正常 Responses write 字段仍遗漏 | COST-6 |
+| R2-11 | P2 | Dynamic/维护取消/late/partial 用量与全局完整性不闭合 | COST-7 |
+| R2-12 | P2 | 启动 restore helper 仍先整文件读取 | EXEC-4 残余 |
+
+维护总预算接线、摘要局部覆盖与 full GC 性能测量按三份任务安排；原 COST-5 继续统一真实验收，不另立评测框架。前序 safepoint 失败仍需现场复核，未在本轮确认修复或归因。
+
+## 2026-09-12 第一轮分流与实施记录
+
+执行顺序以 [NEXT_TASKS.md](NEXT_TASKS.md) 顶部 CTX/EXEC/COST 三部分为准。审查只安排任务，未实施修复；源码证据、反例、覆盖边界见 [REPORT.md](reviews/2026-09-12-executor-audit/REPORT.md)。以下 E 编号仅是缺陷索引，不另建执行队列。
+
+| 缺陷 | 优先级 | 问题 | 执行归属 |
+|---|---|---|---|
+| E01 | P1 | 范围未知仍经 identity-only 分支省略正文 | CTX-1，CORE-1 残余 |
+| E02 | P1 | instead/revert＋同实体误终结独立旧要求 | CTX-2，CORE-2 残余 |
+| E03 | P1 | 材料化在 Actor handler 内等待，取消被阻塞 | EXEC-1，W04 续接 |
+| E04 | P2 | 蒸馏 source_ids 大于实际输入，旧卡替代不证明覆盖 | CTX-3 |
+| E05 | P2 | 普通失败/压缩漏账、压缩事件丢身份、正常缓存计费字段缺失 | COST-1/2，CORE-4 续接 |
+| **B-SP1**（live 全量发现，2026-09-12） | P2 | `turn safepoint::failed_checkpoint_write_fences_continuation_until_a_retry_lands` 在集成树上确定性失败：继续被拒绝的路径（fence refusal→`safe_point_resume_commit`）会消耗一个快照序号（其写失败于破损存储），使修复后重试轮的首个 durable 为 `(1,3)`，旧测试钉住「恰一个新快照」`(1,2)`。**归属裁决需求**：是实现回归（refusal 不应冻结）还是契约演进（R01 欠账语义下 refusal 合法冻结、测试应随行数演进）——由 B 线 checkpoint 欠账机制所有者裁决；二选一均为小改（refusal 不 freeze 或测试改断言最新窗口序号）。诊断证据：EXEC1_RED_CHECK=1 reverted 仍败（非 EXEC-1）；safepoint 实现/测试在 2026-09-12 前零未提交差异（非当日并行线）；DBG-DURABLE 仪器行显示断言前无任何 durable ack（序号被消耗但从未落盘）。 | B 线（checkpoint 欠账所有者） |
+| E06 | P2 | 256 上限仅数未完成任务，完成表/checkpoint 持续增长 | EXEC-2，N7 续接 |
+| E07 | P2 | 最近 32 代恢复谱系可能淘汰活跃旧引用 | EXEC-3，CORE-3 续接 |
+| E08 | P2 | restore/lineage/summary 部分入口先整文件读取后限额 | EXEC-4 |
+
+默认上下文 profile、maintenance 独立预算、前缀计数变化、组装重复开销属于产品/优化任务，未运行的压力与降本实验属于验收缺口，不混入已证实缺陷。无新增已验证权限绕过/重复副作用结论。
+
+## 前序审查分流与关闭记录
+
+以下状态按原记录日期保留；新的反例只沿顶部映射续接，已关闭实现不重做。
+
+当前执行顺序由 [NEXT_TASKS.md](NEXT_TASKS.md) 前列决定：**2026-09-11 执行者视角审查（基线 `685b6bbb`，F01–F08 → 十条并行切片 CORE-1/2/3、PLATFORM-1/2/3、GUI-1，另 CORE-4/GUI-2/3/4 承接已含项）为当前主线**。W 系列 W01–W08 代码全部落地（收口记录见下文与 [CURRENT.md](CURRENT.md)），其中第 7 行「三类真实仓库任务衡量」仍是部分覆盖、沿原编号推进，不因本轮审查重开；W 系列不再另立阶段。此前队列全部收口：M17 N 系列（N0–N8）、并行三线 A/B/C、2026-09-09 核心续审 R01–R14 均已代码落地（关闭与 CI 确认记录见 [CURRENT.md](CURRENT.md)），不重开已关闭项。
+
+2026-09-11 审查原文：[reviews/2026-09-11-audit-685b6bbb/REPORT.md](reviews/2026-09-11-audit-685b6bbb/REPORT.md)；三条并行任务书：[reviews/2026-09-11-audit-685b6bbb/NEXT_STAGE_THREE_TRACKS.md](reviews/2026-09-11-audit-685b6bbb/NEXT_STAGE_THREE_TRACKS.md)；源码读取清单（机器可读）：[COVERAGE.json](reviews/2026-09-11-audit-685b6bbb/COVERAGE.json)。
 
 2026-09-09 核心续审原文：[reviews/2026-09-09-core-audit-93c300d/REPORT.md](reviews/2026-09-09-core-audit-93c300d/REPORT.md)。
 
@@ -11,6 +79,25 @@
 2026-09-07 续审原文：[reviews/2026-09-07-platform-native-audit/REPORT.md](reviews/2026-09-07-platform-native-audit/REPORT.md)。
 建议回归按 [TEST_MATRIX.md](reviews/2026-09-06-deep-audit/TEST_MATRIX.md) 补进现有 crate，不新建总门禁。
 旧审计正文：`docs/archive/route-reset-12c8628/docs/AUDIT_TODO.md`。
+
+## 2026-09-11 执行者视角审查（基线 `685b6bbb` → 三条并行线 CORE/PLATFORM/GUI）
+
+**审查性质与边界：** 执行者 LLM 视角的部分源码静态审查（42 个源码/文档文件的全部或部分正文，重点为请求组装、上下文摄入/材料化、正文缓存、工具输出、任务与平台边界、宿主启动、桌面主 ViewModel）。本地克隆受网络限制失败、环境无 cargo/rustc/dotnet，**未运行本地 Rust/.NET 回归或真实模型试验**；下述反例均为源码推导，实施前须在仓库现有测试入口中现场复核并复现。远端基线 CI（run `34513313166`）success 不构成新反例已被覆盖的证明。读取范围与实际未覆盖区域见 [REPORT.md](reviews/2026-09-11-audit-685b6bbb/REPORT.md)「阅读范围」节与 [COVERAGE.json](reviews/2026-09-11-audit-685b6bbb/COVERAGE.json)。分级：P1＝可使执行者丢失有效依据、误认任务/证据状态，或阻断正常生产入口；P2＝产品闭环、可观测性或维护性缺口。
+
+**编号约定：** F01–F08 为本轮审查定位编号，不重开已完成的 N/W/R 编号；切片与所有权见 [NEXT_TASKS.md](NEXT_TASKS.md)「可靠长任务工作台」节。F01/F02 与既有 R09/W02、F15/N6 处不同切片——**R09 统一了「正文可见窗口」的区间包含规则，本轮的缺口在缓存写入侧未保留范围**；F15/N6 要求「仅明确替代目标才进终态」，本轮指出即使加入替换提示词仍缺少被替换决策本身的身份。
+
+| 发现 | 已核对位置 | 要修什么 | 不要做什么 |
+|---|---|---|---|
+| **F01（P1 → CORE-1）〔已关闭 2026-09-11，工作树；见 CURRENT.md 首段回执〕** | 路径 `fs.read → ActiveTurn::record_protocol_body → ProtocolBodyCache → visible_body_windows_for_request → materializer/最终 prompt`。`fs.read` 本返回路径、文件修订、行范围与 `covers_file`；缓存写入只保留 path/digest/body 且同路径替换，未保留原始读取窗口与完整性。`prompt.rs::visible_body_windows_from_parts` 对每个恢复正文直接构造 `start_line: None, end_line: None, covers_file: true`——**这不是「返回的片段完整」，而是「整个文件已可见」**。第二处不一致：`visible_body_identities_for_request` 经过真实回注筛选，`visible_body_windows_for_request` 却把传入缓存行全部计入可见窗口，**用于材料化定价/正文省略的集合可能大于实际回注集合**。第三处同类：broker/runtime 做 head/tail 限幅后旧行范围元数据未同步降级，`file_read_body_windows` 直接信任这些字段。反例：同版本先读 `a.rs` L1–100、后读 L501–600 并跨过当轮尾部保留窗口，缓存只剩后段，材料化仍可把前段省略为 descriptor，理由是「完整正文已可见」 | 缓存条目保留结构化范围、修订、裁剪状态与来源（`path + revision + range + completeness + provenance`），不再只剩 `path@digest`；**覆盖证明只来自最终实际进入请求的正文**；定价、去重、预算裁剪与消费观测共用同一份派生可见清单；broker/runtime 二次截断必须同步降低覆盖声明；未知窗口不得当成全文，越界空读/不同版本不能升级 whole-file。容量策略维持现状起步，先修正确性 | **不重做 GC**（`gc/reachability.rs` 同版本正文 supersession 已检查区间包含与 clipping，问题在缓存层未提供真实输入）；不扩大到向量库或新存储后端；验收断言检查实际 `ModelRequest`，不只看 ContextHints 或缓存内部状态 |
+| **F02（P1，启用 supersession 的路径 → CORE-2）〔已关闭 2026-09-11，工作树；见 CORE-2 回执〕** | `queue_decision_supersessions`：同任务＋新消息含替换提示词＋精确实体相交即终结旧决策；`entities_match_exact` 实为任意相同路径/符号，不是「同一决策维度」；`engine.rs` 的真实 UserMessage 摄入直接进入该路径。反例：同一任务先后 `use AuthService.rs with a 5-second timeout` 与 `replace plain-text logging in AuthService.rs with structured logging`，新指令的 `replace`＋同文件可把旧记录排入 `Superseded`，**但改日志格式并未撤销五秒超时要求**；`Superseded` 是语义终态（非仅降低注意力），外存记录同样受影响。此处终结的是上下文决策记录，不据此声称 `TaskAnchor.constraints` 已被改写；锚点若另有完整副本可缓解影响，该判定仍不成立 | 永久语义撤销必须指向**具体旧决策 identity 及其替换依据**；文件相关/实体重叠只用于检索与注意力调整。无法证明被撤销则保持 Live，必要时移出焦点而非不可逆判死。已有精确文件版本替代与同 probe 错误修复保持不动 | 不用继续添加中英文关键词代替证据；不必先做大型语义本体系统；不据此重做存储/权限 |
+| **F03（P1，任务使用强制正文声明时 → CORE-2）〔已关闭 2026-09-11，工作树；见 CORE-2 回执〕** | 宿主未指定策略时选 Rolling，`build_context_engine` 直接实例化、无公共必需正文包装；`RollingSummaryEngine::materialize` 只用部分普通选择 hint，未处理 anchor roots/foreground requirements，返回空 required ids、空 required misses；共享基线摄入忽略全部 `ContextDirective`。后果：**「未实现必需正文处理」被表示成「没有必需正文缺失」**——运行时后续只消费引擎报告的缺失信息，无法用空集合识别未兑现义务。本项不等于断言所有 Rolling 任务都会错误完成，触发点是任务确实使用了必需正文声明 | 明确两层边界：**历史保留策略可不同，生产任务最低正确性契约不能静默不同**。择一——公共层兑现 mandatory claims 的检查/呈现，或引擎明确声明不支持并返回 Unsupported/缺失结果；**不能以空 miss 代替不支持**。保持 append/rolling/dynamic 实验选择差异不变 | 不仅为绕过问题直接切换默认 Dynamic 再宣布闭环；不把「重建强制正文处理」做成大型工程前置；不调整全局打分权重 |
+| **F04（通常 P2；全量审查/迁移/找全调用点类任务可升 P1 → CORE-3）〔已关闭 2026-09-11，工作树；见 [CORE-3 回执](reviews/2026-09-11-audit-685b6bbb/CORE3_SEARCH_COVERAGE_BODY.md)。收口时恢复走查另抓到「冷恢复后 run 换新导致恢复前快照 cursor 全部失效」真缺陷，经恢复谱系登记（fail closed、digest 照旧）修复并有端到端回归〕** | `search.grep` 知道扫描可能因文件大小、访问错误或遍历上限而不完整，相关 warning 只进 summary/metadata；有命中时 `model_content` 主要呈现命中正文、缺少同等完整性告警，`TurnFrame` 发给模型的是 `model_content`、不自动追加 summary/metadata；`fs.list` 非空结果同类。反例：一个可读文件找到调用点、另一关键文件因限制未扫描，模型看到正常命中列表却无从得知「这不能证明已找全」 | 结果正文提供**有界、类型化生成的 coverage header**（范围、跳过原因计数、是否还有后续页、原始 artifact/cursor）；分页与 checkpoint 保留同样语义；扫描不完整时不得给出已穷尽的否定结论；summary/metadata/原始 artifact 与正文不得互相矛盾。已有目录/索引/context lookup/artifact paging 直接复用 | **零命中路径已有警告，不得说成同一漏洞**——残留问题是 positive result ≠ exhaustive result；不在真实任务证明遍历成为瓶颈前新建索引；不新建重复检索栈 |
+| **F05（P1 → GUI-1＋PLATFORM-3）〔GUI 半已落地 2026-09-11（C1）；平台半已落地 2026-09-11，工作树；见 PLATFORM-3 回执〕** | `MainWindowViewModel.BuildTransport()` 仅在明确选 UnixSocket 时建 UDS，其 default（含 RealHost）建 NamedPipe；`NamedPipeAgentTransport.ConnectAsync` 在非 Windows 上直接抛不支持异常。客户端已有平台感知的 `AgentTransports.DefaultLocal()`，但 GUI 生产入口未走它。手动选 UDS 是可用绕路，不等于默认入口正确。**已在工作树复核成立（2026-09-11，基线 `685b6bbb`）：`MainWindowViewModel.cs:592` 旧 default 臂 `_ => new NamedPipeTransport(Endpoint)`**。**平台半补充缺陷（PLATFORM-3 落地时确认）：端点区分符哈希两侧不对称——宿主 canonicalize 后哈希、.NET 按原样字节哈希，相对路径/冗余组件/符号链接 CWD 推导出不同端点** | RealHost 明确做平台分派（保留用户自定义 endpoint），实际修 `ConnectAsync → BuildTransport` 而不是只修测试注入路径；平台选择逻辑集中到 SDK/连接配置并定义统一 `WorkspaceIdentity`/endpoint 展示与解析规则，消除相对/绝对路径与客户端当前目录歧义 | 回归必须经过实际生产连接入口，**不能只用直接注入已连接 session 的测试代替连接选择验证**；不抢做多租户服务 |
+| **F06（P1 → PLATFORM-1＋GUI-3）〔平台半已落地 2026-09-11，工作树；见 PLATFORM-1 回执；GUI-3 消费半由 GUI 线承接〕** | `ResolveOutstandingSubmitFromSnapshot` 先清掉 outstanding request id，再以 snapshot 中是否存在相同 Goal 判定是否已受理——旧任务、尤其历史同名任务不能证明本次 request id 已受理；列表有界或目标过长时「没找到」也不是未受理证明。**不是指责已有客户端会自动重发**（「未知结果禁止自动重发」逻辑已存在），残留问题是人工界面把未证明状态变成确定结论。Runtime 已有 `client_request_id` 收据，但明确为最多 256 条、进程生命周期内，不承诺跨重启 exactly-once | 在既有 actor 提交账本上提供只读 **exact-request 查询**，至少绑定 host/process epoch、run、client request id 与 payload identity（请求 envelope 的 message id 与 client_request_id 不混用）；逐一分型 accepted / known rejected / unknown / expired；跨重启无持久证据时继续显示 unknown；改写重连核对文案与 SDK 类型，使 GUI 无须自行推理。是否新增持久化收据须作为明确产品承诺并定义 accepted 提交点与恢复判定 | **不得只把进程内去重表扩容就宣称跨重启 exactly-once**；不以 Goal 文本作幂等键替代 request id；unknown/expired 不自动变成「未执行」，也不自动重发 |
+| **F07（P2 → GUI-1）** | task detail/artifact/context/changes 等只读读取成功路径检查 generation 与 connection，但部分 catch 路径直接写「不可用」；旧连接上的失败较晚返回时可覆盖新连接刚取得的有效面板状态；任务详情还需绑定被请求的 task id/选择代次，而非仅连接代次。**已在工作树复核成立（2026-09-11，基线 `685b6bbb`）：`LoadTaskDetailAsync`/`RefreshChangesAsync`/`ReadArtifactAsync`/`RefreshContextAsync` 的 catch 分支均无 era 判断即写「不可用」；`SelectedTask` setter 无 selection 代次。补充复核：`DrainPendingUiEvents` 对合并 `deltaText` 无 era 检查，且 `DisconnectCoreAsync` 不清理 `_pendingUiEvents`/`_pendingUiDelta`——退役 era 的 delta 正文会在晚到 drain 中刷进新面板** | 每个只读请求捕获 connection epoch＋selection id＋request sequence；成功、失败、finally 中的可见状态更新受同样 fencing；旧任务详情不能覆盖新选择，旧连接失败不能清掉新连接有效面板，断开/切换时清理所属 era 的 UI 缓冲；best 下沉为客户端/VM 的小型统一助手 | 不再复制数套布尔状态；不换 GUI 框架；不把大规模纯重构设为功能前置 |
+| **F08（P2 功能缺口 → PLATFORM-2＋GUI-2）〔平台半已落地 2026-09-11，工作树；平台侧回执见 PLATFORM-2/4 收口回执；GUI-2 已随垂直切片落地〕** | `WorkControlRouter::artifact` 从文件开头读 `max_bytes`，返回诚实的 `truncated`，但接口没有 offset/cursor；GUI 当前也只做有界首次读取——大文件后半段无法通过这条正式审阅链路查看。**这是 B3 有界预览之后的新产品增量，不是已完成的工具侧 artifact 分页 W06 被判为未做：工具能继续读 ≠ 平台与 GUI 的正式审阅链路也能读完** | 在现有 run-bound、digest-verified sealed artifact 身份上增加**有界 byte offset/cursor**，返回 next offset 与 eof/partial；固定读同一 sealed artifact，翻页不得悄悄换版本；每页保持硬上限与权限/内容摘要核对；GUI 用增量 UTF-8 解码处理跨页多字节字符；changes 读模型补可定位的修订/产物引用；context 读模型区分「在存储中/驻留/本轮实际发送/仅摘要指针」（从现有事实派生） | 不把一次读取上限改成无限大；不新建任意路径下载接口；不通过读接口绕过原有副作用授权；不另建持久化真值 |
+
+**本轮建议实现顺序（与三条并行线不冲突）：** 先修正文覆盖真值（F01）与决策撤销（F02），同时修 GUI 默认连接（F05）与提交身份核对（F06）；随后让平台与 GUI 能完整审阅结果（F08/F07）；最后再证明缓存优化真正降低完成任务的总成本。缓存四层职责切分（上下文驻留/外存、协议正文缓存、工具结果复用、provider prompt cache）与「指标以完成工作为分母」的原则见 [REPORT.md](reviews/2026-09-11-audit-685b6bbb/REPORT.md)「缓存与上下文」节。
 
 ## 2026-09-08 闭环审查（基线 `11afdd7` → N 系列）
 

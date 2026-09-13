@@ -1,5 +1,31 @@
 # 产品功能路线
 
+## M18 当前续接：执行者、长期运行与可维护性三部分（2026-09-13 第三轮）
+
+本轮仍沿 M18：优先修真实证据丢失、不可恢复状态和错误语义终结，再接操作生命周期、资源与全成本。第三轮基于实际未提交树形成 14 项（4 P1＋10 P2），9 项有有界反例；报告不代表产品修复、远端 CI 或真实降本已验收。见 [第三轮报告](reviews/2026-09-13-executor-maintainability-audit/REPORT.md)。
+
+三部分与顺序统一在 [NEXT_TASKS.md](NEXT_TASKS.md) 顶部：[A 上下文/GC](reviews/2026-09-13-executor-maintainability-audit/TASK_A_CONTEXT_GC.md)、[B 执行/恢复](reviews/2026-09-13-executor-maintainability-audit/TASK_B_EXECUTION_RECOVERY.md)、[C 成本/接入](reviews/2026-09-13-executor-maintainability-audit/TASK_C_COST_CONNECTIVITY.md)。首片 CTX-10 / EXEC-9 / COST-7 残余；已有 CTX/EXEC/COST 修复保留，COST-5 继续统一真实验收。
+
+可维护性以同一规则能否贯穿实际路径衡量：复用正文 owner 解析、当前元数据合并、恢复根枚举、操作准入和真实压缩计划；不以更多词表或每入口一套补丁维持正确性。不新增通用调度器/第二状态库，不改变 Core 完成和副作用权威，不为缓存冻结当前事实。
+
+## M18 第二轮路线记录（2026-09-12，已有成果保留）
+
+长期稳定、高效可靠与同质量降本目标不变，不新立 M19。第一轮主体修复已进入未提交工作树；第二轮将“有界容器/局部测试”继续接成真实组合闭环。优先解决：完成任务窗口与 checkpoint 校验一致；可信恢复引用与 Unicode 安全；Live 必需证据在 GC/TTL/Pending/Stored 各位置的一致语义；慢 GC/保存的控制响应；总资源和全调用费用完整性。
+
+三份任务和当前首片以 [NEXT_TASKS.md](NEXT_TASKS.md) 顶部为准：[A 上下文/GC](reviews/2026-09-12-gc-core-followup/TASK_A_CONTEXT_GC.md)、[B 执行核心/恢复](reviews/2026-09-12-gc-core-followup/TASK_B_EXECUTION_RECOVERY.md)、[C 缓存/成本](reviews/2026-09-12-gc-core-followup/TASK_C_COST_CACHE.md)。原 COST-5 保留为最后统一验收，权限、完成语义、证据新鲜性和冷恢复不因降本放宽。
+
+当前修复并非全仓/真实 provider/长期资源已验收；事实边界见 [第二轮报告](reviews/2026-09-12-gc-core-followup/REPORT.md)。本轮只审查编排，不改实现。
+
+## M18 第一轮路线记录（已有成果保留）
+
+目标是在同样的产物质量、权限与恢复要求下，让执行者长期取得正确证据，保持取消/恢复和资源边界，并降低每个成功任务的全成本。三部分为 **A 上下文与长期记忆、B 执行核心与恢复、C 缓存与成本**；平台与 GUI 消费面并入相关功能切片。详细顺序见 [NEXT_TASKS.md](NEXT_TASKS.md) 顶部，依据见 [2026-09-12 审查](reviews/2026-09-12-executor-audit/REPORT.md)。
+
+M17/9 月 11 日已有实现与未提交修改保留，尚缺的集成、真实产品与供应商验收按相应路径完成，不能因安排了 M18 就宣布 M17 正式通过。沿用 RuntimeActor、TaskAnchor/ExecutionState/Checkpoint、Core effect 权威和可替换 Context；不新增 Chronicle、TaskGraph、调度器或第二状态库，不以缓存收益冻结过期上下文。
+
+首批 CTX-1 / EXEC-1 / COST-1 并行；随后落实约束/摘要正确性、完成任务和恢复引用有界、供应商计费字段与维护预算，最后复用既有评测做同起点真实长任务对照。未知账目不能当零，本地前缀或 cached ratio 不能当费用节省。
+
+## 前序路线记录（已有成果与验收限制保留）
+
 > 状态：**M17 收尾——可恢复的多入口工作台（N 系列，2026-09-08 切换）＋并行三线 A/B/C（2026-09-09 审查开线）。** M17 三线代码主体已落地（B1–B3、C0、P1、P2 主体、P3、G1–G3 客户端侧、E1）；2026-09-08 闭环审查（`11afdd7`）的 20 项链路断点（F01–F20）映射 N0–N8，N0–N3/N5/N6 已关闭，N4 主体落地待验收；2026-09-09 三线审查（`bbf7f5d`）把上下文/GC/搜索提为正式 A 线，与 B（Runtime/平台一致性）、C（桌面产品）并行推进，**N 系列主顺序不变**。CI 结论按 run 记录（见 [CURRENT.md](CURRENT.md)），不外推到任意 SHA。
 > 旧报告中的"先全部可靠性收口、再 Chronicle/TaskGraph、再开发功能"不是当前执行顺序；Chronicle→TaskGraph→worker 也不是正式 GUI、公共应用接口或只读工具子 Agent 的技术前置。
 > 不改变 Core 安全边界，不改写历史实验结果，不取消现有 CI。
