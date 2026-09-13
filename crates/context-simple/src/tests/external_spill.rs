@@ -5,7 +5,7 @@
 //! 卡片缺失/损坏 = 恢复的 external 集合不完整，如实计数、整体不失败。
 
 use agent_contracts::{
-    ContextEngine, ContextKind, ContextResidency, ContextRetention, ContextScope,
+    ContextEngine, ContextIngress, ContextKind, ContextResidency, ContextRetention, ContextScope,
 };
 
 use crate::checkpoint;
@@ -202,7 +202,7 @@ async fn recovery_roots_cover_spilled_ids() {
     let ids = externalize_n(&engine, 20).await;
     let value = engine.checkpoint().await.unwrap();
 
-    let roots = checkpoint::recovery_item_ids(&value);
+    let roots = checkpoint::recovery_item_ids(&value).expect("valid spill list");
     for id in &ids {
         assert!(
             roots.contains(id),
@@ -277,4 +277,202 @@ async fn reconcile_cleans_orphan_cards_and_honors_protection() {
             .any(|name| name.starts_with(&spilled[0].to_string())),
         "the protected card survives"
     );
+}
+
+const LIVE_MARKER: &str = "LIVE-MARKER-MUST-SURVIVE";
+
+async fn engine_with_live_marker() -> SimpleContextEngine {
+    let engine = SimpleContextEngine::new(SimpleContextConfig::default());
+    open_focus(&engine, "live state must survive a refused restore").await;
+    engine
+        .ingest(ContextIngress::UserMessage {
+            content: LIVE_MARKER.into(),
+        })
+        .await
+        .unwrap();
+    engine
+}
+
+async fn assert_live_marker_untouched(engine: &SimpleContextEngine, before: &serde_json::Value) {
+    let after = engine.checkpoint().await.unwrap();
+    assert_eq!(
+        after, *before,
+        "a refused restore must leave the live checkpoint byte-identical"
+    );
+    let state = engine.state.lock().await;
+    assert!(
+        state
+            .items
+            .iter()
+            .any(|item| item.content.contains(LIVE_MARKER)),
+        "the live marker heap item must still be present"
+    );
+    assert_eq!(
+        state.external_cards_missing, 0,
+        "a structural reject must not take the missing-card degrade path"
+    );
+}
+
+fn colliding_owner_checkpoint(
+    location: CollidingOwner,
+) -> (serde_json::Value, agent_contracts::ContextItemId) {
+    let config = SimpleContextConfig::default();
+    let mut state = crate::engine::State::default();
+    let mut item = crate::item::make_item(
+        &state,
+        &config,
+        "body that already owns this id".into(),
+        ContextKind::Note,
+        ContextScope::Task,
+        ContextRetention::Working,
+        0.5,
+        Some("spill-f1".into()),
+    );
+    item.residency = match location {
+        CollidingOwner::Warm => ContextResidency::Warm,
+        CollidingOwner::Pending => ContextResidency::Warm,
+    };
+    item.evicted_at_tick = Some(0);
+    let id = item.id;
+    match location {
+        CollidingOwner::Warm => state.eviction_buffer.push(item),
+        CollidingOwner::Pending => state.pending_externalize_retry.push(item),
+    }
+    state.sync_catalog();
+    let mut value = checkpoint::serialize(&state).unwrap();
+    value["external_spilled"] = serde_json::json!([{
+        "id": id.to_string(),
+        "hash": "0123456789ab",
+    }]);
+    (value, id)
+}
+
+#[derive(Clone, Copy)]
+enum CollidingOwner {
+    Warm,
+    Pending,
+}
+
+/// Review anti-example: a valid spilled checkpoint with one `external_spilled`
+/// row duplicated must be refused, and must not replace live state.
+#[tokio::test]
+async fn duplicate_spill_id_in_manifest_is_refused_without_mutating_live_state() {
+    let dir = tempfile::tempdir().unwrap();
+    let engine = spill_engine(&dir, 10).await;
+    open_focus(&engine, "duplicate spill id").await;
+    let ids = externalize_n(&engine, 15).await;
+    let mut hostile = engine.checkpoint().await.unwrap();
+    engine
+        .ingest(ContextIngress::UserMessage {
+            content: LIVE_MARKER.into(),
+        })
+        .await
+        .unwrap();
+    let before = engine.checkpoint().await.unwrap();
+
+    let first = hostile["external_spilled"]
+        .as_array()
+        .expect("the tail was spilled")
+        .first()
+        .expect("at least one spilled row")
+        .clone();
+    hostile["external_spilled"]
+        .as_array_mut()
+        .unwrap()
+        .push(first);
+
+    let error = engine.restore(hostile).await.unwrap_err().to_string();
+    assert!(
+        error.contains("both spilled and already owned"),
+        "duplicate spill ids are a structural contradiction, got: {error}"
+    );
+    assert_eq!(
+        engine.checkpoint().await.unwrap(),
+        before,
+        "duplicate spill restore must not mutate live state"
+    );
+    let state = engine.state.lock().await;
+    assert!(
+        state
+            .items
+            .iter()
+            .any(|item| item.content.contains(LIVE_MARKER)),
+        "the post-checkpoint live marker must survive"
+    );
+    assert_eq!(state.external.len(), 15);
+    for id in &ids {
+        assert!(state.external.get(*id).is_some());
+    }
+    assert_eq!(state.external_cards_missing, 0);
+}
+
+#[tokio::test]
+async fn spill_id_colliding_with_warm_buffer_is_refused_without_mutating_live_state() {
+    let engine = engine_with_live_marker().await;
+    let before = engine.checkpoint().await.unwrap();
+    let (hostile, id) = colliding_owner_checkpoint(CollidingOwner::Warm);
+    let error = engine.restore(hostile).await.unwrap_err().to_string();
+    assert!(
+        error.contains(&id.to_string()) && error.contains("both spilled and already owned"),
+        "Warm collision must fail closed, got: {error}"
+    );
+    assert_live_marker_untouched(&engine, &before).await;
+}
+
+#[tokio::test]
+async fn spill_id_colliding_with_pending_retry_is_refused_without_mutating_live_state() {
+    let engine = engine_with_live_marker().await;
+    let before = engine.checkpoint().await.unwrap();
+    let (hostile, id) = colliding_owner_checkpoint(CollidingOwner::Pending);
+    let error = engine.restore(hostile).await.unwrap_err().to_string();
+    assert!(
+        error.contains(&id.to_string()) && error.contains("both spilled and already owned"),
+        "Pending collision must fail closed, got: {error}"
+    );
+    assert_live_marker_untouched(&engine, &before).await;
+}
+
+/// Present-but-invalid spill rows are structural errors: they must not be
+/// silently dropped (which would let restore succeed and clobber live state).
+#[tokio::test]
+async fn illegal_spill_manifest_row_is_refused_without_mutating_live_state() {
+    let dir = tempfile::tempdir().unwrap();
+    let engine = spill_engine(&dir, 10).await;
+    open_focus(&engine, "illegal spill row").await;
+    let _ids = externalize_n(&engine, 15).await;
+    let mut hostile = engine.checkpoint().await.unwrap();
+    engine
+        .ingest(ContextIngress::UserMessage {
+            content: LIVE_MARKER.into(),
+        })
+        .await
+        .unwrap();
+    let before = engine.checkpoint().await.unwrap();
+
+    hostile["external_spilled"]
+        .as_array_mut()
+        .expect("the tail was spilled")
+        .push(serde_json::json!({
+            "id": "not-a-uuid",
+            "hash": "0123456789ab",
+        }));
+
+    let error = engine.restore(hostile).await.unwrap_err().to_string();
+    assert!(
+        error.contains("checkpoint restore validation") && error.contains("external_spilled"),
+        "an illegal present row must fail closed, got: {error}"
+    );
+    assert_eq!(
+        engine.checkpoint().await.unwrap(),
+        before,
+        "illegal spill restore must not mutate live state"
+    );
+    let state = engine.state.lock().await;
+    assert!(
+        state
+            .items
+            .iter()
+            .any(|item| item.content.contains(LIVE_MARKER))
+    );
+    assert_eq!(state.external_cards_missing, 0);
 }
