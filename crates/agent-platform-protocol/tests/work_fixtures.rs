@@ -151,7 +151,14 @@ fn continue_fixture_pair_binds_the_active_task() {
         validate_work_continue_request,
         validate_work_continue_response,
     );
-    assert!(!value.task_id.to_string().is_empty());
+    // F5: the historical fixture carries no expectation, so the answer is a
+    // plain continuation that names its task and reports no mismatch.
+    assert_eq!(
+        value.disposition,
+        agent_platform_protocol::WorkContinueDisposition::Continued
+    );
+    assert!(value.task_id.is_some(), "a continuation names its task");
+    assert!(value.active_task_id.is_none());
 }
 
 #[test]

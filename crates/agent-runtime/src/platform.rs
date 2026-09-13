@@ -15,7 +15,7 @@ mod session;
 mod work;
 
 pub use work::{
-    BoundWorkSessionAuthorizer, MAX_WORK_CONTROL_SESSIONS, WorkControlAction,
+    BoundWorkSessionAuthorizer, HostRunConfig, MAX_WORK_CONTROL_SESSIONS, WorkControlAction,
     WorkControlAuthorization, WorkControlAuthorizationRequest, WorkControlAuthorizer,
     WorkControlGrant, WorkControlRouter, WorkControlSessionRegistry,
 };

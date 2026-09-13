@@ -52,7 +52,26 @@ impl RuntimeActor {
                     }
                 }
             }
+            RuntimeCommand::SteerActiveTask {
+                instruction,
+                expected_task_id,
+                reply,
+            } => {
+                self.steer_active_task(instruction, expected_task_id, reply, op_tx)
+                    .await;
+            }
             RuntimeCommand::ActivateTask { task_id, reply } => {
+                let previously_active = self.state.tasks.active();
+                if previously_active == Some(task_id) {
+                    // Already on it: nothing to move, and re-running the focus
+                    // transition would bump the generation for no change.
+                    let _ = reply.send(Ok(crate::work::TaskActivation {
+                        task_id,
+                        previously_active,
+                        already_active: true,
+                    }));
+                    return;
+                }
                 let result = match self.ensure_idle().and_then(|_| self.next_focus_revision()) {
                     Ok(next_focus_revision) => match self.state.tasks.prepare_activate(task_id) {
                         None => Err(AgentError::InvalidRequest(format!(
@@ -95,9 +114,27 @@ impl RuntimeActor {
                     },
                     Err(error) => Err(error),
                 };
-                let _ = reply.send(result);
+                let _ = reply.send(result.map(|()| crate::work::TaskActivation {
+                    task_id,
+                    previously_active,
+                    already_active: false,
+                }));
             }
-            RuntimeCommand::SuspendTask { reply } => {
+            RuntimeCommand::SuspendTask {
+                expected_task_id,
+                reply,
+            } => {
+                let active = self.state.tasks.active();
+                // F5: the expectation is compared here, inside the serialized
+                // step, before any transition is prepared.
+                if let Some(expected) = expected_task_id
+                    && active != Some(expected)
+                {
+                    let _ = reply.send(Ok(crate::work::SuspendOutcome::ExpectedTaskMismatch {
+                        active_task_id: active,
+                    }));
+                    return;
+                }
                 let result = match self.ensure_idle().and_then(|_| self.next_focus_revision()) {
                     Ok(next_focus_revision) => match self.state.tasks.prepare_suspend() {
                         None => Ok(()),
@@ -122,7 +159,10 @@ impl RuntimeActor {
                     },
                     Err(error) => Err(error),
                 };
-                let _ = reply.send(result);
+                let _ = reply.send(result.map(|()| match active {
+                    Some(task_id) => crate::work::SuspendOutcome::Suspended { task_id },
+                    None => crate::work::SuspendOutcome::NoActiveTask,
+                }));
             }
             RuntimeCommand::ListTasks { reply } => {
                 let _ = reply.send(Ok(self.state.tasks.list()));
@@ -329,7 +369,21 @@ impl RuntimeActor {
                     }
                 }
             }
-            RuntimeCommand::ContinueActiveTask { reply } => {
+            RuntimeCommand::ContinueActiveTask {
+                expected_task_id,
+                reply,
+            } => {
+                // F5: compare the caller's expected task against the live
+                // active task before the continuation touches anything. A
+                // mismatch starts no turn and re-reads no directive.
+                if let Some(expected) = expected_task_id
+                    && self.state.tasks.active() != Some(expected)
+                {
+                    let _ = reply.send(Ok(crate::work::ContinueOutcome::ExpectedTaskMismatch {
+                        active_task_id: self.state.tasks.active(),
+                    }));
+                    return;
+                }
                 let result = match self.ensure_idle() {
                     Ok(()) => self.continue_active_task_turn(op_tx).await,
                     Err(error) => Err(error),
@@ -360,6 +414,12 @@ impl RuntimeActor {
                     task_hot_state: self.state.tasks.hot_state_summary(),
                     restore_evidence_degraded: self.state.restore_evidence_degraded.clone(),
                     store_backpressure: self.state.store_backpressure.clone(),
+                    // F5: the budget the kernel actually enforces and the
+                    // typed continuation reason, so a headless client can
+                    // answer "what is configured?" and "can I continue?"
+                    // without a GUI and without parsing text.
+                    max_model_rounds: self.services.max_tool_rounds(),
+                    continue_readiness: self.continue_readiness(),
                 };
                 let _ = reply.send(Ok(snapshot));
             }
@@ -486,7 +546,29 @@ impl RuntimeActor {
                 }
                 let _ = reply.send(result);
             }
-            RuntimeCommand::CancelTurn { reply } => {
+            RuntimeCommand::CancelTurn { expected, reply } => {
+                // F5: an expectation is checked against the LIVE turn here,
+                // in the same serialized step that would cancel it. A client
+                // that snapshotted a turn which has since ended cancels
+                // nothing instead of killing its successor.
+                if let Some(expected) = expected.filter(|expected| !expected.is_empty()) {
+                    let live_task = self.state.task_id;
+                    let live_turn = self.state.turn.as_ref().map(|turn| turn.turn_id);
+                    let task_matches = expected
+                        .task_id
+                        .is_none_or(|task_id| live_task == Some(task_id));
+                    let turn_matches = expected
+                        .turn_id
+                        .is_none_or(|turn_id| live_turn == Some(turn_id));
+                    if !task_matches || !turn_matches {
+                        let _ =
+                            reply.send(Ok(crate::work::CancelOutcome::ExpectedIdentityMismatch {
+                                active_task_id: live_task,
+                                active_turn_id: live_turn,
+                            }));
+                        return;
+                    }
+                }
                 let result = match self.ensure_serving() {
                     Ok(()) => {
                         self.cancel_turn(TurnCancellationReason::Requested, None)
@@ -497,7 +579,7 @@ impl RuntimeActor {
                 if result.is_ok() {
                     self.drain_queued_user_input(op_tx).await;
                 }
-                let _ = reply.send(result);
+                let _ = reply.send(result.map(crate::work::CancelOutcome::Acknowledged));
             }
             RuntimeCommand::Stop { .. } => unreachable!("Stop is handled in the run loop"),
         }

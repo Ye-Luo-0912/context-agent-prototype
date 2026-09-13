@@ -6,7 +6,7 @@
 //! tasks (the F07 misdelivery race), and every admission returns a stable
 //! receipt keyed by the caller's `client_request_id`.
 
-use agent_contracts::{AgentResult, RunId, TaskAnchorView, TaskId};
+use agent_contracts::{AgentResult, RunId, TaskAnchorView, TaskId, TurnId};
 
 use crate::RuntimeHandle;
 use crate::task::TaskInfo;
@@ -80,6 +80,129 @@ pub enum WorkSubmissionQuery {
     Unknown,
 }
 
+/// F5: the identity a multi-entry client expects the runtime to be on when it
+/// asks for a precise operation. Every field is optional: naming nothing keeps
+/// the historical "whatever is current" behaviour, naming a field asks the
+/// actor to compare it against the live value inside the same serialized step
+/// — never snapshot-then-unconditional-command.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct TurnIdentityExpectation {
+    pub task_id: Option<TaskId>,
+    pub turn_id: Option<TurnId>,
+}
+
+impl TurnIdentityExpectation {
+    pub const fn is_empty(&self) -> bool {
+        self.task_id.is_none() && self.turn_id.is_none()
+    }
+}
+
+/// F5: what an in-task steering/correction did. Steering is NOT a submission:
+/// it never creates a task, never re-focuses, and refuses rather than guess a
+/// target when the runtime is not on the task the caller named.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SteeringDisposition {
+    /// Applied to the named task; a fresh turn carries it.
+    Applied,
+    /// A turn is already running, so the correction took that turn's single
+    /// queued-input slot. It is admitted, not yet executed.
+    Queued,
+}
+
+/// Why steering was refused. Each variant is a fact about the runtime's
+/// current identity or capacity, never an instruction to resend blindly.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SteeringRejection {
+    /// The caller named a task the runtime is not on.
+    ExpectedTaskMismatch,
+    /// Nothing is active; steering never mints a task (that is submission).
+    NoActiveTask,
+    /// The running turn's correction slot is already taken.
+    QueueFull,
+}
+
+/// The receipt for one steering attempt: applied, queued or refused with the
+/// live identity attached so the caller can re-target instead of retrying.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SteeringOutcome {
+    Accepted {
+        disposition: SteeringDisposition,
+        task_id: TaskId,
+    },
+    Rejected {
+        rejection: SteeringRejection,
+        active_task_id: Option<TaskId>,
+    },
+}
+
+/// F5: the receipt for activating an existing task through the one
+/// RuntimeActor. `already_active` distinguishes "nothing moved" from a real
+/// focus switch; there is no second task table to consult.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TaskActivation {
+    pub task_id: TaskId,
+    pub previously_active: Option<TaskId>,
+    pub already_active: bool,
+}
+
+/// F5: the receipt for suspending a task without completing it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SuspendOutcome {
+    Suspended { task_id: TaskId },
+    /// Nothing was active — a fact, not a failure.
+    NoActiveTask,
+    /// The caller named a task the runtime is not on; nothing was suspended.
+    ExpectedTaskMismatch { active_task_id: Option<TaskId> },
+}
+
+/// F5: the receipt for continuing the active task's retained directive.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ContinueOutcome {
+    Continued {
+        task_id: TaskId,
+    },
+    /// The caller named a task the runtime is not on; NO turn was started.
+    ExpectedTaskMismatch {
+        active_task_id: Option<TaskId>,
+    },
+}
+
+/// F5: the receipt for a precise cancel. `Acknowledged` carries Core's exact
+/// truth (including `NoActiveTurn`); the mismatch arm proves nothing was
+/// cancelled and names what is actually live.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CancelOutcome {
+    Acknowledged(agent_contracts::TurnCancelAck),
+    ExpectedIdentityMismatch {
+        active_task_id: Option<TaskId>,
+        active_turn_id: Option<TurnId>,
+    },
+}
+
+/// F5: why the runtime can (or cannot) continue the active task's retained
+/// directive right now. A read-only projection of the very preconditions
+/// `continue_active_task` enforces, so a non-GUI client can tell "not ready
+/// yet" from "will never work without a fresh instruction".
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ContinueReason {
+    Ready,
+    NoActiveTask,
+    TurnRunning,
+    RecoveryRequired,
+    CleanupInFlight,
+    /// The active task holds no directive body to replay.
+    NoRetainedDirective,
+    /// A legacy record sits exactly at the old anchor cap: a complete and a
+    /// truncated instruction are indistinguishable, so continuation refuses.
+    DirectiveMayBeTruncated,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ContinueReadiness {
+    pub can_continue: bool,
+    pub reason: ContinueReason,
+}
+
 /// Start (or resume) a long task the way `/work` and `--work` do. The actor
 /// creates or resumes the task for `goal`, attaches the long-task checklist
 /// surface when the requirement set is empty, and applies the goal once
@@ -121,6 +244,13 @@ pub struct RuntimeStatusSnapshot {
     /// limit NEW body production while every control/query channel stays
     /// live; `Some(false)`/`None` mean no backpressure is observed.
     pub store_backpressure: Option<crate::work::StoreBackpressure>,
+    /// F5: the finite per-turn model-round budget the kernel is actually
+    /// enforcing for this run. Read from the live authority config, so a
+    /// client never has to infer the budget from a CLI string it did not send.
+    pub max_model_rounds: usize,
+    /// F5: whether the active task's retained directive can be continued right
+    /// now, with the typed reason when it cannot.
+    pub continue_readiness: ContinueReadiness,
 }
 
 /// CTX-8 接线 (R3-08): the observation itself. `active == true` means the

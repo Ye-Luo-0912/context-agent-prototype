@@ -36,6 +36,10 @@ struct Args {
     /// fails startup closed).
     restore_latest: bool,
     context_policy: Option<String>,
+    /// F5: the finite per-turn MODEL-round budget for this host's runs. Parsed
+    /// through the shared strict validator; unset inherits the kernel default,
+    /// and the effective value is reported on every snapshot either way.
+    max_rounds: Option<usize>,
     /// B4/N8: path to a bounded JSON file of MCP server declarations.
     mcp_config: Option<std::path::PathBuf>,
     /// B4/N8: a directory whose subdirectories each may carry a plugin.json
@@ -53,6 +57,7 @@ fn parse_args() -> anyhow::Result<Args> {
         read_only: false,
         restore_latest: false,
         context_policy: None,
+        max_rounds: None,
         mcp_config: None,
         plugins_root: None,
     };
@@ -68,6 +73,17 @@ fn parse_args() -> anyhow::Result<Args> {
             "--restore-latest" => args.restore_latest = true,
             "--context-policy" => {
                 args.context_policy = Some(iter.next().context("--context-policy needs a value")?)
+            }
+            // F5: the same strict rule the TUI applies, so the two entry
+            // points cannot disagree about what a legal budget is. An invalid
+            // value fails startup before any workspace mutation.
+            "--max-rounds" => {
+                let raw = iter.next().context("--max-rounds needs a value")?;
+                args.max_rounds = Some(agent_compose::parse_max_model_rounds(&raw)?);
+            }
+            other if other.starts_with("--max-rounds=") => {
+                let raw = other.trim_start_matches("--max-rounds=");
+                args.max_rounds = Some(agent_compose::parse_max_model_rounds(raw)?);
             }
             "--mcp-config" => {
                 args.mcp_config = Some(iter.next().context("--mcp-config needs a path")?.into())
@@ -133,20 +149,22 @@ async fn real_main() -> anyhow::Result<()> {
         None => ContextPolicy::Rolling,
     };
 
-    let (model, provider_profile_digest) = match try_model_from_env()? {
+    let (model, provider_profile_digest, prompt_cache_mode) = match try_model_from_env()? {
         ModelSelection::Mock(mock) => {
             eprintln!("host: demo mode (AGENT_DEMO=1) selected the mock transport");
-            (mock, None)
+            (mock, None, None)
         }
         ModelSelection::Provider(provider, profile) => {
             eprintln!("host: {}", profile.banner());
             let digest = profile.digest();
-            (provider, Some(digest))
+            let cache_mode = profile.prompt_cache_mode.as_str().to_owned();
+            (provider, Some(digest), Some(cache_mode))
         }
     };
 
     // COST-4 (D02): an optional independent maintenance transport (its own
     // time bound) owns compaction calls; absent, the main model serves.
+    let maintenance_timeout_secs = agent_compose::maintenance_timeout_secs_from_env()?;
     let maintenance_transport = try_maintenance_transport_from_env()?;
     if maintenance_transport.is_some() {
         eprintln!("host: maintenance transport active (MAINTENANCE_TIMEOUT_SECS)");
@@ -257,7 +275,7 @@ async fn real_main() -> anyhow::Result<()> {
     );
 
     let composed = compose(ComposeConfig {
-        provider_profile_digest,
+        provider_profile_digest: provider_profile_digest.clone(),
         defer_proof_refresh: false,
         shadow_context_frame: false,
         workspace: workspace.clone(),
@@ -269,7 +287,7 @@ async fn real_main() -> anyhow::Result<()> {
         journal: Some(journal),
         artifact_store: Some(artifact_store),
         output_broker: Some(output_broker),
-        max_tool_rounds: None,
+        max_tool_rounds: args.max_rounds,
         project_task_progress: true,
         project_settlement: false,
         settlement_projection_diagnostics: false,
@@ -329,6 +347,26 @@ async fn real_main() -> anyhow::Result<()> {
         session_schema_digest_hex()
     );
 
+    // F5: the effective run configuration this host applied. Every value is
+    // the one in force — the round budget is reported from the kernel's own
+    // live authority in the snapshot, and an unset maintenance token ceiling
+    // is reported as unbounded rather than as a large number.
+    let run_config = agent_runtime::HostRunConfig {
+        context_policy: policy.as_str().to_owned(),
+        max_model_rounds_from_cli: args.max_rounds.is_some(),
+        maintenance_max_calls_per_maintain: u32::try_from(
+            maintenance_budget.max_calls_per_maintain,
+        )
+        .unwrap_or(u32::MAX),
+        maintenance_max_tokens_per_maintain: (maintenance_budget.max_tokens_per_maintain
+            != u64::MAX)
+            .then_some(maintenance_budget.max_tokens_per_maintain),
+        maintenance_timeout_secs,
+        provider_profile_digest,
+        prompt_cache_mode,
+        read_only: args.read_only,
+    };
+
     let plane = HostPlane {
         profile,
         handle,
@@ -336,6 +374,10 @@ async fn real_main() -> anyhow::Result<()> {
         gate,
         registry,
         workspace: Arc::new(composed.workspace.clone()),
+        // F5: save/restore over the wire runs the same cross-plane transaction
+        // as `--restore-latest` and the TUI's `/checkpoint`.
+        checkpoints: Some(composed.instance.checkpoint_plane()),
+        run_config: Some(run_config),
     };
     let stop = Arc::new(AtomicBool::new(false));
     let endpoint = resolve_endpoint(&args, &root);

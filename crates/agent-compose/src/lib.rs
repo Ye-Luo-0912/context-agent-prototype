@@ -353,6 +353,36 @@ impl MaintenanceBudget {
     }
 }
 
+/// F5: the shared strict parser for an operator-supplied model-round budget.
+///
+/// The budget counts MODEL decision rounds — the unit the kernel actually
+/// enforces (`Failure { RoundBudget }`) — never tool calls: one round may make
+/// several tool calls and still be one round. There is deliberately no
+/// "unlimited" value; a long task gets an explicitly larger finite budget, so
+/// an unbounded main loop can never be configured by accident. Every entry
+/// point (TUI, host) parses through this one function so their CLIs cannot
+/// drift into different validation rules.
+pub fn parse_max_model_rounds(value: &str) -> anyhow::Result<usize> {
+    let rounds: usize = value.trim().parse().map_err(|_| {
+        anyhow::anyhow!("invalid max rounds {value:?}: expected a positive integer (model rounds)")
+    })?;
+    if rounds == 0 {
+        anyhow::bail!("invalid max rounds 0: the budget must be at least 1 model round");
+    }
+    Ok(rounds)
+}
+
+/// F5: the maintenance transport's configured time bound, for reporting the
+/// effective configuration. Reads the same variable
+/// [`try_maintenance_transport_from_env`] acts on, so the reported value can
+/// never disagree with the transport that was actually built.
+pub fn maintenance_timeout_secs_from_env() -> anyhow::Result<Option<u64>> {
+    env_checked("MAINTENANCE_TIMEOUT_SECS", |raw| {
+        raw.parse::<u64>()
+            .map_err(|_| format!("must be an integer >= 1, got '{raw}'"))
+    })
+}
+
 /// Reads the maintenance budget from the process environment. Unset
 /// variables keep the defaults; a variable that fails to parse is a
 /// startup error, never a silent fallback:

@@ -100,6 +100,22 @@ async fn compose_workspace(root: &std::path::Path) -> anyhow::Result<Composed> {
     })
 }
 
+/// F5: the host-owned half of the reported run configuration. Mirrors what the
+/// binary builds from its CLI/environment; the kernel-owned round budget is
+/// filled by the runtime itself, so it is deliberately absent here.
+fn test_run_config() -> agent_runtime::HostRunConfig {
+    agent_runtime::HostRunConfig {
+        context_policy: "rolling".into(),
+        max_model_rounds_from_cli: false,
+        maintenance_max_calls_per_maintain: 4,
+        maintenance_max_tokens_per_maintain: None,
+        maintenance_timeout_secs: None,
+        provider_profile_digest: None,
+        prompt_cache_mode: None,
+        read_only: false,
+    }
+}
+
 fn client_protocol() -> ProtocolIdentity {
     ProtocolIdentity {
         name: "focus-agent.platform".into(),
@@ -170,6 +186,10 @@ async fn run_e2e(endpoint: LocalEndpoint, label: &str) -> anyhow::Result<()> {
         gate: Arc::clone(&fixture.gate),
         registry,
         workspace: Arc::new(fixture.composed.workspace.clone()),
+        // F5: the formal cross-plane checkpoint seam and the effective run
+        // configuration are exactly what the product host serves.
+        checkpoints: Some(fixture.composed.instance.checkpoint_plane()),
+        run_config: Some(test_run_config()),
     };
 
     fixture.composed.instance.start().await?;
@@ -628,7 +648,7 @@ async fn run_e2e(endpoint: LocalEndpoint, label: &str) -> anyhow::Result<()> {
     // 6. cancel: either truth is honest (no turn was started by submit).
     let cancel = expect_value(exchange::<_, _, WorkCancelResponse>(
         &mut stream,
-        &request("work", "cancel", WorkCancelRequest {}),
+        &request("work", "cancel", WorkCancelRequest::default()),
     )?);
     assert!(matches!(
         cancel.ack,
@@ -768,6 +788,8 @@ async fn start_server(
         gate: Arc::clone(&fixture.gate),
         registry: Arc::clone(&registry),
         workspace: Arc::new(fixture.composed.workspace.clone()),
+        checkpoints: Some(fixture.composed.instance.checkpoint_plane()),
+        run_config: Some(test_run_config()),
     };
     let stop = Arc::new(AtomicBool::new(false));
     let server = HostServer {
@@ -1331,7 +1353,7 @@ async fn subscribe_delivers_runtime_events(endpoint: LocalEndpoint) -> anyhow::R
     let probe_endpoint = server.endpoint.clone();
     let probe = std::thread::spawn(move || -> anyhow::Result<()> {
         let mut probe_client = connect_blocking(&probe_endpoint)?;
-        let cont = request("work", "continue", WorkContinueRequest {});
+        let cont = request("work", "continue", WorkContinueRequest::default());
         agent_host::write_frame(&mut probe_client, &serde_json::to_vec(&cont)?)?;
         let mut ignored = Vec::new();
         let response = read_response_collecting::<WorkContinueResponse>(
@@ -1445,7 +1467,7 @@ async fn slow_subscriber_never_blocks_service_or_stop(
     }
     let cancelled = expect_value(exchange::<_, _, WorkCancelResponse>(
         &mut healthy,
-        &request("work", "cancel", WorkCancelRequest {}),
+        &request("work", "cancel", WorkCancelRequest::default()),
     )?);
     assert!(matches!(
         cancelled.ack,

@@ -32,6 +32,20 @@ pub const WORK_NAMESPACE: &str = "work";
 pub const WORK_SUBMIT: &str = "submit";
 pub const WORK_CONTINUE: &str = "continue";
 pub const WORK_CANCEL: &str = "cancel";
+/// F5: in-task steering/correction — distinct from [`WORK_SUBMIT`]. Steering
+/// lands on the task the run is already on and never creates one.
+pub const WORK_STEER: &str = "steer";
+/// F5: activate an existing task through the same RuntimeActor (no second
+/// task table, no client-side focus authority).
+pub const WORK_ACTIVATE: &str = "activate";
+/// F5: suspend a task without completing it.
+pub const WORK_SUSPEND: &str = "suspend";
+/// F5: capture one FORMAL cross-plane runtime checkpoint (actor + context +
+/// capability planes) into the run's checkpoint store.
+pub const WORK_CHECKPOINT: &str = "checkpoint";
+/// F5: restore one verified checkpoint artifact through the full cross-plane
+/// transaction.
+pub const WORK_RESTORE: &str = "restore";
 pub const WORK_SNAPSHOT: &str = "snapshot";
 pub const WORK_SUBSCRIBE: &str = "subscribe";
 pub const WORK_EVENT: &str = "event";
@@ -157,6 +171,66 @@ impl Route {
 
     pub fn is_work_cancel(&self) -> bool {
         self.namespace == WORK_NAMESPACE && self.operation == WORK_CANCEL
+    }
+
+    /// F5: the in-task steering route.
+    pub fn work_steer() -> Self {
+        Self {
+            namespace: WORK_NAMESPACE.to_owned(),
+            operation: WORK_STEER.to_owned(),
+        }
+    }
+
+    pub fn is_work_steer(&self) -> bool {
+        self.namespace == WORK_NAMESPACE && self.operation == WORK_STEER
+    }
+
+    /// F5: activate an existing task.
+    pub fn work_activate() -> Self {
+        Self {
+            namespace: WORK_NAMESPACE.to_owned(),
+            operation: WORK_ACTIVATE.to_owned(),
+        }
+    }
+
+    pub fn is_work_activate(&self) -> bool {
+        self.namespace == WORK_NAMESPACE && self.operation == WORK_ACTIVATE
+    }
+
+    /// F5: suspend the active task without completing it.
+    pub fn work_suspend() -> Self {
+        Self {
+            namespace: WORK_NAMESPACE.to_owned(),
+            operation: WORK_SUSPEND.to_owned(),
+        }
+    }
+
+    pub fn is_work_suspend(&self) -> bool {
+        self.namespace == WORK_NAMESPACE && self.operation == WORK_SUSPEND
+    }
+
+    /// F5: capture one formal cross-plane checkpoint.
+    pub fn work_checkpoint() -> Self {
+        Self {
+            namespace: WORK_NAMESPACE.to_owned(),
+            operation: WORK_CHECKPOINT.to_owned(),
+        }
+    }
+
+    pub fn is_work_checkpoint(&self) -> bool {
+        self.namespace == WORK_NAMESPACE && self.operation == WORK_CHECKPOINT
+    }
+
+    /// F5: restore one verified checkpoint artifact.
+    pub fn work_restore() -> Self {
+        Self {
+            namespace: WORK_NAMESPACE.to_owned(),
+            operation: WORK_RESTORE.to_owned(),
+        }
+    }
+
+    pub fn is_work_restore(&self) -> bool {
+        self.namespace == WORK_NAMESPACE && self.operation == WORK_RESTORE
     }
 
     pub fn is_work_snapshot(&self) -> bool {
@@ -321,46 +395,156 @@ impl WorkSubmitResponse {
     }
 }
 
-/// Continue the active task's stored directive. The body is empty; the task
-/// is whatever the session's run currently focuses.
+/// Continue the active task's stored directive.
+///
+/// F5: `expected_task_id` makes "continue" precise for a multi-entry client.
+/// Omitted (the historical empty body) the run's own active task is continued;
+/// named, the runtime compares it against the live active task inside the
+/// actor and starts NO turn on a mismatch. The comparison never happens in the
+/// client, so a stale snapshot cannot continue somebody else's task.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub struct WorkContinueRequest {}
+pub struct WorkContinueRequest {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expected_task_id: Option<TaskId>,
+}
 
 impl WorkContinueRequest {
-    pub const fn validate(&self) -> ValidationResult<()> {
-        Ok(())
+    pub fn validate(&self) -> ValidationResult<()> {
+        validate_optional_task_id("work.continue.expected_task_id", self.expected_task_id)
+    }
+}
+
+/// Whether the continuation actually started a turn. `Rejected` only occurs
+/// for a request that named an expectation, so it never reaches a client that
+/// did not opt in.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WorkContinueDisposition {
+    #[default]
+    Continued,
+    /// The named `expected_task_id` is not the live active task; nothing was
+    /// continued and no directive was re-read.
+    ExpectedTaskMismatch,
+}
+
+impl WorkContinueDisposition {
+    fn is_continued(&self) -> bool {
+        matches!(self, Self::Continued)
     }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct WorkContinueResponse {
-    pub task_id: TaskId,
+    /// The task the directive continues under. `None` only on a rejection with
+    /// no active task at all.
+    #[serde(default)]
+    pub task_id: Option<TaskId>,
+    /// Absent (and therefore byte-compatible with the historical response)
+    /// whenever the continuation happened.
+    #[serde(default, skip_serializing_if = "WorkContinueDisposition::is_continued")]
+    pub disposition: WorkContinueDisposition,
+    /// F5: the live active task when the expectation did not match, so the
+    /// caller can re-target instead of retrying blindly.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub active_task_id: Option<TaskId>,
 }
 
 impl WorkContinueResponse {
     pub fn validate(&self) -> ValidationResult<()> {
-        if self.task_id.0.is_nil() {
-            return Err(ValidationError::new(
-                "work.continue.task_id",
-                "must not be a nil UUID",
-            ));
+        validate_optional_task_id("work.continue.task_id", self.task_id)?;
+        validate_optional_task_id("work.continue.active_task_id", self.active_task_id)?;
+        match self.disposition {
+            WorkContinueDisposition::Continued => {
+                if self.task_id.is_none() {
+                    return Err(ValidationError::new(
+                        "work.continue.task_id",
+                        "a continued turn must name its task",
+                    ));
+                }
+                if self.active_task_id.is_some() {
+                    return Err(ValidationError::new(
+                        "work.continue.active_task_id",
+                        "only a rejection reports the live active task",
+                    ));
+                }
+            }
+            WorkContinueDisposition::ExpectedTaskMismatch => {
+                if self.task_id.is_some() {
+                    return Err(ValidationError::new(
+                        "work.continue.task_id",
+                        "a rejected continuation must not name a continued task",
+                    ));
+                }
+            }
         }
         Ok(())
+    }
+}
+
+/// F5: the run/turn identity a precise cancel or steer names. A nil UUID is
+/// never a wildcard — omit the field instead.
+fn validate_optional_task_id(field: &'static str, task_id: Option<TaskId>) -> ValidationResult<()> {
+    match task_id {
+        Some(task_id) if task_id.0.is_nil() => {
+            Err(ValidationError::new(field, "must not be a nil UUID"))
+        }
+        _ => Ok(()),
+    }
+}
+
+fn validate_optional_turn_id(
+    field: &'static str,
+    turn_id: Option<agent_contracts::TurnId>,
+) -> ValidationResult<()> {
+    match turn_id {
+        Some(turn_id) if turn_id.0.is_nil() => {
+            Err(ValidationError::new(field, "must not be a nil UUID"))
+        }
+        _ => Ok(()),
     }
 }
 
 /// Cancel the run's current in-flight turn. Task completion and child-process
 /// cleanup are separate facts and are not claimed here; they surface through
 /// the durable `TurnCancelled` acknowledgement and supervision truth.
+///
+/// F5: naming `expected_task_id` / `expected_turn_id` turns "cancel whatever is
+/// current" into "cancel exactly the turn I observed". The runtime compares the
+/// expectation against the live turn in the same serialized step that would
+/// cancel it, so a slow client can never kill the successor of the turn it saw.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub struct WorkCancelRequest {}
+pub struct WorkCancelRequest {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expected_task_id: Option<TaskId>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expected_turn_id: Option<agent_contracts::TurnId>,
+}
 
 impl WorkCancelRequest {
-    pub const fn validate(&self) -> ValidationResult<()> {
-        Ok(())
+    pub fn validate(&self) -> ValidationResult<()> {
+        validate_optional_task_id("work.cancel.expected_task_id", self.expected_task_id)?;
+        validate_optional_turn_id("work.cancel.expected_turn_id", self.expected_turn_id)
+    }
+}
+
+/// F5: the live turn identity reported when a precise cancel did not match.
+/// Its presence is the proof that NOTHING was cancelled.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WorkTurnIdentity {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub task_id: Option<TaskId>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub turn_id: Option<agent_contracts::TurnId>,
+}
+
+impl WorkTurnIdentity {
+    pub fn validate(&self) -> ValidationResult<()> {
+        validate_optional_task_id("work.cancel.identity_mismatch.task_id", self.task_id)?;
+        validate_optional_turn_id("work.cancel.identity_mismatch.turn_id", self.turn_id)
     }
 }
 
@@ -370,12 +554,379 @@ pub struct WorkCancelResponse {
     /// Core's exact post-cancellation truth. `Cancelled` proves the durable
     /// barrier; `NoActiveTurn` is a fact, not a failure.
     pub ack: TurnCancelAck,
+    /// F5: present only when the request named an expectation that did not
+    /// match. Then `ack` is `NoActiveTurn` because this call cancelled nothing,
+    /// and these are the identities that are actually live.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub identity_mismatch: Option<WorkTurnIdentity>,
 }
 
 impl WorkCancelResponse {
     pub fn validate(&self) -> ValidationResult<()> {
+        if let Some(mismatch) = &self.identity_mismatch {
+            mismatch.validate()?;
+            // A mismatch means this request did not cancel anything. Reporting
+            // a cancellation ack beside it would claim a stop that never
+            // happened for the turn the caller asked about.
+            if !matches!(self.ack, TurnCancelAck::NoActiveTurn) {
+                return Err(ValidationError::new(
+                    "work.cancel.identity_mismatch",
+                    "an unmatched expectation cancels nothing and must not carry a cancelled ack",
+                ));
+            }
+        }
         Ok(())
     }
+}
+
+// ---------------------------------------------------------------------------
+// F5 in-task steering and task lifecycle.
+//
+// `submit` starts NEW work; `steer` corrects work already running. Keeping
+// them as separate routes is the point: a correction must never silently
+// become a new task, and a new task must never be mistaken for a correction.
+// `activate`/`suspend` drive the SAME RuntimeActor that owns the task table —
+// there is no second task authority anywhere in this contract.
+// ---------------------------------------------------------------------------
+
+/// Char bound on one steering instruction. Corrections are ordinary user
+/// instructions, so they share the submitted-goal budget.
+pub const MAX_STEER_INSTRUCTION_CHARS: usize = MAX_WORK_GOAL_CHARS;
+
+/// One in-task correction. `expected_task_id` is the caller's target
+/// assertion: omit it to steer whatever the run is on, name it to refuse
+/// unless the runtime is on exactly that task.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WorkSteerRequest {
+    pub instruction: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expected_task_id: Option<TaskId>,
+}
+
+impl WorkSteerRequest {
+    pub fn validate(&self) -> ValidationResult<()> {
+        validate_text(
+            "work.steer.instruction",
+            &self.instruction,
+            MAX_STEER_INSTRUCTION_CHARS,
+        )?;
+        validate_optional_task_id("work.steer.expected_task_id", self.expected_task_id)
+    }
+}
+
+/// What the runtime did with the correction. All three are receipts, not
+/// errors: `Rejected` is a fact about the runtime's identity or capacity.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WorkSteerDisposition {
+    /// Admitted and carried by a fresh turn.
+    Applied,
+    /// Admitted into the running turn's single correction slot — accepted, not
+    /// yet executed.
+    Queued,
+    /// Nothing was admitted; see `rejection`.
+    Rejected,
+}
+
+/// Why a correction was refused.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WorkSteerRejection {
+    /// The caller named a task the runtime is not on.
+    ExpectedTaskMismatch,
+    /// Nothing is active. Steering never creates a task — submit does.
+    NoActiveTask,
+    /// The running turn's correction slot is already taken.
+    QueueFull,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WorkSteerResponse {
+    pub disposition: WorkSteerDisposition,
+    /// The task the correction landed on (absent on a rejection).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub task_id: Option<TaskId>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rejection: Option<WorkSteerRejection>,
+    /// The live active task, so a refused caller can re-target.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub active_task_id: Option<TaskId>,
+}
+
+impl WorkSteerResponse {
+    pub fn validate(&self) -> ValidationResult<()> {
+        validate_optional_task_id("work.steer.task_id", self.task_id)?;
+        validate_optional_task_id("work.steer.active_task_id", self.active_task_id)?;
+        match self.disposition {
+            WorkSteerDisposition::Applied | WorkSteerDisposition::Queued => {
+                if self.task_id.is_none() {
+                    return Err(ValidationError::new(
+                        "work.steer.task_id",
+                        "an admitted correction must name the task it landed on",
+                    ));
+                }
+                if self.rejection.is_some() {
+                    return Err(ValidationError::new(
+                        "work.steer.rejection",
+                        "an admitted correction must not carry a rejection reason",
+                    ));
+                }
+            }
+            WorkSteerDisposition::Rejected => {
+                if self.rejection.is_none() {
+                    return Err(ValidationError::new(
+                        "work.steer.rejection",
+                        "a rejected correction must name its typed reason",
+                    ));
+                }
+                if self.task_id.is_some() {
+                    return Err(ValidationError::new(
+                        "work.steer.task_id",
+                        "a rejected correction landed on no task",
+                    ));
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+/// Activate an existing task by id. The id IS the expectation: an unknown or
+/// completed task is refused rather than resolved to "whatever is current".
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WorkActivateRequest {
+    pub task_id: TaskId,
+}
+
+impl WorkActivateRequest {
+    pub fn validate(&self) -> ValidationResult<()> {
+        if self.task_id.0.is_nil() {
+            return Err(ValidationError::new(
+                "work.activate.task_id",
+                "must not be a nil UUID",
+            ));
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WorkActivateResponse {
+    pub task_id: TaskId,
+    /// The task this activation displaced, if any.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub previously_active: Option<TaskId>,
+    /// The run was already on this task: nothing moved, no focus transition.
+    pub already_active: bool,
+}
+
+impl WorkActivateResponse {
+    pub fn validate(&self) -> ValidationResult<()> {
+        if self.task_id.0.is_nil() {
+            return Err(ValidationError::new(
+                "work.activate.task_id",
+                "must not be a nil UUID",
+            ));
+        }
+        validate_optional_task_id("work.activate.previously_active", self.previously_active)
+    }
+}
+
+/// Suspend a task without completing it. Suspension is not completion and this
+/// response never claims otherwise.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WorkSuspendRequest {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expected_task_id: Option<TaskId>,
+}
+
+impl WorkSuspendRequest {
+    pub fn validate(&self) -> ValidationResult<()> {
+        validate_optional_task_id("work.suspend.expected_task_id", self.expected_task_id)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WorkSuspendDisposition {
+    Suspended,
+    /// Nothing was active — a fact, not a failure.
+    NoActiveTask,
+    /// The named task is not the live active task; nothing was suspended.
+    ExpectedTaskMismatch,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WorkSuspendResponse {
+    pub disposition: WorkSuspendDisposition,
+    /// The task that was suspended (only on `Suspended`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub task_id: Option<TaskId>,
+    /// The live active task on a mismatch.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub active_task_id: Option<TaskId>,
+}
+
+impl WorkSuspendResponse {
+    pub fn validate(&self) -> ValidationResult<()> {
+        validate_optional_task_id("work.suspend.task_id", self.task_id)?;
+        validate_optional_task_id("work.suspend.active_task_id", self.active_task_id)?;
+        match self.disposition {
+            WorkSuspendDisposition::Suspended if self.task_id.is_none() => Err(
+                ValidationError::new(
+                    "work.suspend.task_id",
+                    "a suspension must name the task it suspended",
+                ),
+            ),
+            WorkSuspendDisposition::Suspended => Ok(()),
+            _ if self.task_id.is_some() => Err(ValidationError::new(
+                "work.suspend.task_id",
+                "nothing was suspended, so no task may be named",
+            )),
+            _ => Ok(()),
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// F5 formal checkpoint capture / restore.
+//
+// These routes go through the runtime's cross-plane transaction (actor state +
+// context state + host capability plane + the durable Core authority marker).
+// An actor-only dump is NOT a checkpoint and is deliberately unreachable from
+// here. Artifacts are named inside the run's own checkpoint store — never an
+// arbitrary filesystem path — and a restore verifies the envelope before it
+// touches any state.
+// ---------------------------------------------------------------------------
+
+/// Bound on a checkpoint artifact name (a store-relative file name, not a path).
+pub const MAX_CHECKPOINT_ARTIFACT_NAME_BYTES: usize = 256;
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WorkCheckpointRequest {}
+
+impl WorkCheckpointRequest {
+    pub const fn validate(&self) -> ValidationResult<()> {
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WorkCheckpointResponse {
+    /// The store artifact the capture landed in; the same name `work.restore`
+    /// accepts.
+    pub artifact: String,
+    pub payload_bytes: u64,
+    pub checkpoint_version: u32,
+    /// The run that produced the artifact.
+    pub run_id: RunId,
+    /// Task rows the artifact carries (a size fact, not a completion claim).
+    pub tasks: u32,
+}
+
+impl WorkCheckpointResponse {
+    pub fn validate(&self) -> ValidationResult<()> {
+        validate_checkpoint_artifact_name("work.checkpoint.artifact", &self.artifact)?;
+        if self.run_id.0.is_nil() {
+            return Err(ValidationError::new(
+                "work.checkpoint.run_id",
+                "must not be a nil UUID",
+            ));
+        }
+        Ok(())
+    }
+}
+
+/// Restore one checkpoint. `artifact` names a file in the run's own checkpoint
+/// store; omitting it restores the newest artifact that fully verifies.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WorkRestoreRequest {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub artifact: Option<String>,
+}
+
+impl WorkRestoreRequest {
+    pub fn validate(&self) -> ValidationResult<()> {
+        match &self.artifact {
+            Some(artifact) => {
+                validate_checkpoint_artifact_name("work.restore.artifact", artifact)
+            }
+            None => Ok(()),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WorkRestoreResponse {
+    /// The artifact that was actually restored (resolved, when the request
+    /// asked for the newest verifiable one).
+    pub artifact: String,
+    pub checkpoint_version: u32,
+    /// The run the restored checkpoint was captured under. The serving run id
+    /// stays what `work.snapshot` reports.
+    pub restored_run_id: RunId,
+    /// EXEC-6: predecessor runs whose sealed references this restore could not
+    /// admit. Restore succeeded; some earlier evidence may be unreadable.
+    #[serde(default)]
+    pub evidence_degraded: Vec<String>,
+}
+
+impl WorkRestoreResponse {
+    pub fn validate(&self) -> ValidationResult<()> {
+        validate_checkpoint_artifact_name("work.restore.artifact", &self.artifact)?;
+        if self.restored_run_id.0.is_nil() {
+            return Err(ValidationError::new(
+                "work.restore.restored_run_id",
+                "must not be a nil UUID",
+            ));
+        }
+        if self.evidence_degraded.len() > MAX_SNAPSHOT_DEGRADED_RUNS {
+            return Err(ValidationError::new(
+                "work.restore.evidence_degraded",
+                format!(
+                    "carries {} entries, above the {MAX_SNAPSHOT_DEGRADED_RUNS} entry bound",
+                    self.evidence_degraded.len()
+                ),
+            ));
+        }
+        for run in &self.evidence_degraded {
+            validate_opaque(
+                "work.restore.evidence_degraded",
+                run,
+                MAX_SNAPSHOT_DEGRADED_RUN_ID_BYTES,
+            )?;
+        }
+        Ok(())
+    }
+}
+
+/// A checkpoint artifact is a NAME inside the run's store, never a path: any
+/// separator, parent reference or root marker is refused here so a wire string
+/// can never reach outside the store directory.
+fn validate_checkpoint_artifact_name(field: &'static str, artifact: &str) -> ValidationResult<()> {
+    validate_opaque(field, artifact, MAX_CHECKPOINT_ARTIFACT_NAME_BYTES)?;
+    if artifact.contains('/')
+        || artifact.contains('\\')
+        || artifact.contains(':')
+        || artifact == "."
+        || artifact == ".."
+    {
+        return Err(ValidationError::new(
+            field,
+            "must be a store artifact name, not a path",
+        ));
+    }
+    Ok(())
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -491,6 +1042,149 @@ pub struct WorkSnapshotResponse {
     /// degraded. Absent on older servers — decodes as empty.
     #[serde(default)]
     pub restore_evidence_degraded: Vec<String>,
+    /// F5: the run configuration actually in effect, so a headless client can
+    /// answer "what is this host configured to do?" without a GUI and without
+    /// re-deriving the host's own CLI. Absent on older servers.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub effective_config: Option<WorkRunConfig>,
+    /// F5 (CTX-8 接线): the engine's store-outage backpressure as last
+    /// observed. Absent means the server does not report it; `active: false`
+    /// means a clean pass has lifted it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub store_backpressure: Option<WorkStoreBackpressure>,
+    /// F5: whether the active task's retained directive can be continued right
+    /// now, with the typed reason when it cannot.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub continue_readiness: Option<WorkContinueReadiness>,
+}
+
+/// F5: the validated run configuration a long-flow client needs to see. Every
+/// field is the value in force for THIS run, reported by the host that applied
+/// it — not an echo of what a client asked for.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WorkRunConfig {
+    /// `append` | `rolling` | `dynamic` | `service`.
+    pub context_policy: String,
+    /// The finite per-turn MODEL-round budget the kernel enforces. Counts
+    /// model decision rounds, not tool calls.
+    pub max_model_rounds: u32,
+    /// Where that budget came from: `cli` when the operator set it explicitly,
+    /// `kernel_default` otherwise.
+    pub max_model_rounds_source: String,
+    /// Compaction calls allowed per maintenance pass.
+    pub maintenance_max_calls_per_maintain: u32,
+    /// Compaction token ceiling per maintenance pass. `None` means unbounded —
+    /// reported honestly instead of as a large number.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub maintenance_max_tokens_per_maintain: Option<u64>,
+    /// The independent maintenance transport's time bound, when one is active.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub maintenance_timeout_secs: Option<u64>,
+    /// The provider profile digest in force; absent in demo/mock mode.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider_profile_digest: Option<String>,
+    /// The provider prompt-cache mode in force, when the provider reports one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prompt_cache_mode: Option<String>,
+    /// Whether this host serves observation-only sessions.
+    pub read_only: bool,
+}
+
+/// Bound on one opaque configuration string (policy name, digest, mode).
+pub const MAX_RUN_CONFIG_FIELD_BYTES: usize = 128;
+
+impl WorkRunConfig {
+    pub fn validate(&self) -> ValidationResult<()> {
+        validate_identifier(
+            "work.snapshot.effective_config.context_policy",
+            &self.context_policy,
+            MAX_RUN_CONFIG_FIELD_BYTES,
+        )?;
+        validate_identifier(
+            "work.snapshot.effective_config.max_model_rounds_source",
+            &self.max_model_rounds_source,
+            MAX_RUN_CONFIG_FIELD_BYTES,
+        )?;
+        // A zero round budget could never complete a turn; a host reporting it
+        // is misconfigured, and silently accepting it would hide that.
+        if self.max_model_rounds == 0 {
+            return Err(ValidationError::new(
+                "work.snapshot.effective_config.max_model_rounds",
+                "must be at least one model round",
+            ));
+        }
+        if let Some(digest) = &self.provider_profile_digest {
+            validate_opaque(
+                "work.snapshot.effective_config.provider_profile_digest",
+                digest,
+                MAX_RUN_CONFIG_FIELD_BYTES,
+            )?;
+        }
+        if let Some(mode) = &self.prompt_cache_mode {
+            validate_identifier(
+                "work.snapshot.effective_config.prompt_cache_mode",
+                mode,
+                MAX_RUN_CONFIG_FIELD_BYTES,
+            )?;
+        }
+        Ok(())
+    }
+}
+
+/// F5: the store-outage backpressure fact carried on the snapshot.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WorkStoreBackpressure {
+    /// The last boundary pass hit the retry-list cap: NEW body production is
+    /// throttled while every control/query channel stays live.
+    pub active: bool,
+    pub externalize_deferred: u64,
+    pub store_io_failures: u64,
+}
+
+impl WorkStoreBackpressure {
+    pub const fn validate(&self) -> ValidationResult<()> {
+        Ok(())
+    }
+}
+
+/// F5: why `work.continue` would (or would not) start a turn right now.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WorkContinueReason {
+    Ready,
+    NoActiveTask,
+    TurnRunning,
+    RecoveryRequired,
+    CleanupInFlight,
+    /// The active task holds no directive body to replay.
+    NoRetainedDirective,
+    /// A legacy record sits exactly at the old anchor cap, where a complete
+    /// and a truncated instruction are indistinguishable: continuation refuses
+    /// rather than replay a prefix.
+    DirectiveMayBeTruncated,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WorkContinueReadiness {
+    pub can_continue: bool,
+    pub reason: WorkContinueReason,
+}
+
+impl WorkContinueReadiness {
+    pub fn validate(&self) -> ValidationResult<()> {
+        // The boolean is a projection of the reason, never an independent
+        // claim: a client must not be able to read "ready" beside a blocker.
+        if self.can_continue != matches!(self.reason, WorkContinueReason::Ready) {
+            return Err(ValidationError::new(
+                "work.snapshot.continue_readiness",
+                "can_continue must agree with the typed reason",
+            ));
+        }
+        Ok(())
+    }
 }
 
 impl WorkSnapshotResponse {
@@ -588,6 +1282,15 @@ impl WorkSnapshotResponse {
                     "must not be a nil UUID",
                 ));
             }
+        }
+        if let Some(config) = &self.effective_config {
+            config.validate()?;
+        }
+        if let Some(backpressure) = &self.store_backpressure {
+            backpressure.validate()?;
+        }
+        if let Some(readiness) = &self.continue_readiness {
+            readiness.validate()?;
         }
         Ok(())
     }
@@ -1547,6 +2250,140 @@ pub fn validate_work_cancel_response(
     validate_run_scoped_response(profile, request, response, |payload| payload.validate())
 }
 
+pub fn validate_work_steer_request(
+    profile: &NegotiatedContractProfile,
+    request: &PlatformEnvelope<WorkSteerRequest>,
+) -> ValidationResult<()> {
+    validate_run_scoped_request(profile, request, Route::is_work_steer, |payload| {
+        payload.validate()
+    })
+}
+
+pub fn validate_work_steer_response(
+    profile: &NegotiatedContractProfile,
+    request: &PlatformEnvelope<WorkSteerRequest>,
+    response: &PlatformEnvelope<PlatformResponse<WorkSteerResponse>>,
+) -> ValidationResult<()> {
+    validate_work_steer_request(profile, request)?;
+    validate_run_scoped_response(profile, request, response, |payload| payload.validate())?;
+    if let PlatformResponse::Success { value } = &response.payload {
+        // A correction that names a target must never be reported as applied to
+        // a different task: that is exactly the misdelivery this route exists
+        // to prevent.
+        if let (Some(expected), Some(landed)) = (request.payload.expected_task_id, value.task_id)
+            && expected != landed
+        {
+            return Err(ValidationError::new(
+                "work.steer.task_id",
+                "an admitted correction must land on the task the request named",
+            ));
+        }
+    }
+    Ok(())
+}
+
+pub fn validate_work_activate_request(
+    profile: &NegotiatedContractProfile,
+    request: &PlatformEnvelope<WorkActivateRequest>,
+) -> ValidationResult<()> {
+    validate_run_scoped_request(profile, request, Route::is_work_activate, |payload| {
+        payload.validate()
+    })
+}
+
+pub fn validate_work_activate_response(
+    profile: &NegotiatedContractProfile,
+    request: &PlatformEnvelope<WorkActivateRequest>,
+    response: &PlatformEnvelope<PlatformResponse<WorkActivateResponse>>,
+) -> ValidationResult<()> {
+    validate_work_activate_request(profile, request)?;
+    validate_run_scoped_response(profile, request, response, |payload| payload.validate())?;
+    if let PlatformResponse::Success { value } = &response.payload
+        && value.task_id != request.payload.task_id
+    {
+        return Err(ValidationError::new(
+            "work.activate.task_id",
+            "must echo the task the request asked to activate",
+        ));
+    }
+    Ok(())
+}
+
+pub fn validate_work_suspend_request(
+    profile: &NegotiatedContractProfile,
+    request: &PlatformEnvelope<WorkSuspendRequest>,
+) -> ValidationResult<()> {
+    validate_run_scoped_request(profile, request, Route::is_work_suspend, |payload| {
+        payload.validate()
+    })
+}
+
+pub fn validate_work_suspend_response(
+    profile: &NegotiatedContractProfile,
+    request: &PlatformEnvelope<WorkSuspendRequest>,
+    response: &PlatformEnvelope<PlatformResponse<WorkSuspendResponse>>,
+) -> ValidationResult<()> {
+    validate_work_suspend_request(profile, request)?;
+    validate_run_scoped_response(profile, request, response, |payload| payload.validate())?;
+    if let PlatformResponse::Success { value } = &response.payload
+        && let (Some(expected), Some(suspended)) =
+            (request.payload.expected_task_id, value.task_id)
+        && expected != suspended
+    {
+        return Err(ValidationError::new(
+            "work.suspend.task_id",
+            "must not report suspending a task other than the one named",
+        ));
+    }
+    Ok(())
+}
+
+pub fn validate_work_checkpoint_request(
+    profile: &NegotiatedContractProfile,
+    request: &PlatformEnvelope<WorkCheckpointRequest>,
+) -> ValidationResult<()> {
+    validate_run_scoped_request(profile, request, Route::is_work_checkpoint, |payload| {
+        payload.validate()
+    })
+}
+
+pub fn validate_work_checkpoint_response(
+    profile: &NegotiatedContractProfile,
+    request: &PlatformEnvelope<WorkCheckpointRequest>,
+    response: &PlatformEnvelope<PlatformResponse<WorkCheckpointResponse>>,
+) -> ValidationResult<()> {
+    validate_work_checkpoint_request(profile, request)?;
+    validate_run_scoped_response(profile, request, response, |payload| payload.validate())
+}
+
+pub fn validate_work_restore_request(
+    profile: &NegotiatedContractProfile,
+    request: &PlatformEnvelope<WorkRestoreRequest>,
+) -> ValidationResult<()> {
+    validate_run_scoped_request(profile, request, Route::is_work_restore, |payload| {
+        payload.validate()
+    })
+}
+
+pub fn validate_work_restore_response(
+    profile: &NegotiatedContractProfile,
+    request: &PlatformEnvelope<WorkRestoreRequest>,
+    response: &PlatformEnvelope<PlatformResponse<WorkRestoreResponse>>,
+) -> ValidationResult<()> {
+    validate_work_restore_request(profile, request)?;
+    validate_run_scoped_response(profile, request, response, |payload| payload.validate())?;
+    if let PlatformResponse::Success { value } = &response.payload
+        && let Some(asked) = &request.payload.artifact
+        && asked != &value.artifact
+    {
+        return Err(ValidationError::new(
+            "work.restore.artifact",
+            "must name the artifact the request asked to restore",
+        ));
+    }
+    Ok(())
+}
+
 pub fn validate_work_snapshot_request(
     profile: &NegotiatedContractProfile,
     request: &PlatformEnvelope<WorkSnapshotRequest>,
@@ -1940,6 +2777,9 @@ mod tests {
             }],
             resync_required: false,
             restore_evidence_degraded: Vec::new(),
+            effective_config: None,
+            store_backpressure: None,
+            continue_readiness: None,
         };
         let success = response(&request, snapshot.clone());
         validate_work_snapshot_response(&profile(), &request, &success).unwrap();
@@ -1988,6 +2828,9 @@ mod tests {
             pending_approvals: vec![],
             resync_required: false,
             restore_evidence_degraded: Vec::new(),
+            effective_config: None,
+            store_backpressure: None,
+            continue_readiness: None,
         };
         validate_work_snapshot_response(
             &profile(),
@@ -2030,6 +2873,9 @@ mod tests {
             pending_approvals: vec![],
             resync_required: false,
             restore_evidence_degraded: Vec::new(),
+            effective_config: None,
+            store_backpressure: None,
+            continue_readiness: None,
         };
         assert!(long.validate().is_err());
         long.workspace_root = "/".repeat(MAX_SNAPSHOT_WORKSPACE_ROOT_BYTES);
@@ -2063,6 +2909,9 @@ mod tests {
             ))],
             resync_required: false,
             restore_evidence_degraded: Vec::new(),
+            effective_config: None,
+            store_backpressure: None,
+            continue_readiness: None,
         };
         assert!(snapshot.validate().is_err());
 
@@ -2081,7 +2930,7 @@ mod tests {
 
     #[test]
     fn cancel_ack_round_trips_both_truths() {
-        let request = run_scoped_request(Route::work_cancel(), WorkCancelRequest {});
+        let request = run_scoped_request(Route::work_cancel(), WorkCancelRequest::default());
         for ack in [
             TurnCancelAck::NoActiveTurn,
             TurnCancelAck::Cancelled {
@@ -2092,7 +2941,13 @@ mod tests {
                 effective_generation: 4,
             },
         ] {
-            let success = response(&request, WorkCancelResponse { ack: ack.clone() });
+            let success = response(
+                &request,
+                WorkCancelResponse {
+                    ack: ack.clone(),
+                    identity_mismatch: None,
+                },
+            );
             validate_work_cancel_response(&profile(), &request, &success).unwrap();
             let decoded: PlatformResponse<WorkCancelResponse> =
                 serde_json::from_str(&serde_json::to_string(&success.payload).unwrap()).unwrap();
@@ -2160,10 +3015,17 @@ mod tests {
 
     #[test]
     fn continue_route_has_empty_body_and_validated_task() {
-        let request = run_scoped_request(Route::work_continue(), WorkContinueRequest {});
+        let request = run_scoped_request(Route::work_continue(), WorkContinueRequest::default());
         validate_work_continue_request(&profile(), &request).unwrap();
 
-        let success = response(&request, WorkContinueResponse { task_id: task_id() });
+        let success = response(
+            &request,
+            WorkContinueResponse {
+                task_id: Some(task_id()),
+                disposition: WorkContinueDisposition::Continued,
+                active_task_id: None,
+            },
+        );
         validate_work_continue_response(&profile(), &request, &success).unwrap();
 
         // Unknown fields stay rejected on every run-scoped body.
