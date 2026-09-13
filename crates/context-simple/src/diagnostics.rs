@@ -28,6 +28,15 @@ pub(crate) fn compute(state: &State) -> ContextDiagnostics {
         resident_items: state.items.len(),
         resident_bytes: 0,
         warm_items: state.eviction_buffer.len(),
+        // CTX-8: the retry list is the honest backpressure axis of a
+        // failing store — count and byte weight surfaced per pass.
+        pending_items: state.pending_externalize_retry.len(),
+        pending_bytes: state
+            .pending_externalize_retry
+            .iter()
+            .map(|item| item.content.len() as u64)
+            .sum(),
+        retired_scope_notes: state.retired_scopes.len(),
         // O(1): the external map maintains its Cold/External counts, so
         // diagnostics never scans a store that grows with logical history.
         cold_items: state.external.cold_entries(),

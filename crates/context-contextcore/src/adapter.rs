@@ -267,6 +267,59 @@ impl ContextEngine for ContextServiceAdapter {
             .map_err(|e| AgentError::Context(format!("decode external context item: {e}")))
     }
 
+    /// EXEC-9 (R3-01): root parsing runs in the service process with the
+    /// engine's real, versioned implementation — never an empty-set guess.
+    /// A wire failure is an `Err`, which the runtime reports as an
+    /// INCOMPLETE root set (deletion defers) instead of "nothing retained".
+    async fn checkpoint_recovery_item_ids(
+        &self,
+        checkpoint: &serde_json::Value,
+    ) -> AgentResult<Vec<ContextItemId>> {
+        let value = self
+            .call(ServiceOp::CheckpointRecoveryItemIds {
+                checkpoint: checkpoint.clone(),
+            })
+            .await?;
+        serde_json::from_value(value)
+            .map_err(|e| AgentError::Context(format!("decode checkpoint recovery roots: {e}")))
+    }
+
+    /// EXEC-9 (R3-01): the protecting Storage GC crosses the wire with its
+    /// roots and completeness flag; the service-side engine owns the real
+    /// deletion decision under the shared retained-root invariant.
+    async fn storage_gc_protecting(
+        &self,
+        protected_recovery_roots: &[ContextItemId],
+        roots_complete: bool,
+    ) -> AgentResult<agent_contracts::StorageGcReport> {
+        let value = self
+            .call(ServiceOp::StorageGcProtecting {
+                roots: protected_recovery_roots.to_vec(),
+                roots_complete,
+            })
+            .await?;
+        serde_json::from_value(value)
+            .map_err(|e| AgentError::Context(format!("decode protected storage gc report: {e}")))
+    }
+
+    /// EXEC-9 (R3-01): the protecting reconcile crosses the wire with its
+    /// roots and completeness flag; the service-side engine owns the real
+    /// stale-duplicate decision under the shared retained-root invariant.
+    async fn reconcile_store_protecting(
+        &self,
+        protected: &[ContextItemId],
+        roots_complete: bool,
+    ) -> AgentResult<agent_contracts::StoreReconcileReport> {
+        let value = self
+            .call(ServiceOp::ReconcileStoreProtecting {
+                roots: protected.to_vec(),
+                roots_complete,
+            })
+            .await?;
+        serde_json::from_value(value)
+            .map_err(|e| AgentError::Context(format!("decode protected reconcile report: {e}")))
+    }
+
     async fn checkpoint(&self) -> AgentResult<Value> {
         self.call(ServiceOp::Checkpoint).await
     }

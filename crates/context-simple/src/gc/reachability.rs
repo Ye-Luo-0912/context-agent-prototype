@@ -6,7 +6,7 @@ use agent_contracts::{
 use crate::engine::State;
 use crate::index::entity::{
     entities_match_exact, extract_entities, is_file_body_entry, is_file_body_observation,
-    observation_file_path,
+    is_file_path_entity, observation_file_path,
 };
 
 /// A user message reads as a decision when it carries a directive verb
@@ -51,6 +51,400 @@ fn has_replacement_cue(text: &str) -> bool {
     CUES.iter().any(|cue| lower.contains(cue))
 }
 
+/// Words that carry no requirement on their own: articles, prepositions,
+/// copulas and the directive verbs/cues themselves. A shared word from this
+/// set is never evidence that two decisions address the same requirement.
+fn is_stop_word(word: &str) -> bool {
+    const STOP: &[&str] = &[
+        "the",
+        "a",
+        "an",
+        "to",
+        "for",
+        "with",
+        "of",
+        "in",
+        "on",
+        "at",
+        "by",
+        "and",
+        "or",
+        "but",
+        "is",
+        "are",
+        "be",
+        "was",
+        "were",
+        "it",
+        "its",
+        "this",
+        "that",
+        "these",
+        "those",
+        "from",
+        "into",
+        "as",
+        "use",
+        "using",
+        "used",
+        "switch",
+        "switching",
+        "revert",
+        "reverting",
+        "drop",
+        "dropping",
+        "remove",
+        "removing",
+        "replace",
+        "replacing",
+        "prefer",
+        "adopt",
+        "instead",
+        "actually",
+        "please",
+        "should",
+        "must",
+        "will",
+        "would",
+        "can",
+        "could",
+        "let",
+        "lets",
+        "we",
+        "i",
+        "you",
+        "now",
+        "then",
+        "also",
+        "not",
+        "no",
+        "yes",
+        "all",
+        "any",
+    ];
+    STOP.contains(&word)
+}
+
+/// Lowercased content words (length >= 3, not stop words), deduplicated.
+/// Used to test whether the replacing message actually names the *subject*
+/// of an older decision rather than merely co-mentioning its file.
+fn content_words(text: &str) -> Vec<String> {
+    let mut words: Vec<String> = text
+        .split_whitespace()
+        .map(|word| {
+            word.trim_matches(|c: char| !c.is_alphanumeric() && c != '-' && c != '_')
+                .to_lowercase()
+        })
+        .filter(|word| word.len() >= 3 && !is_stop_word(word))
+        .collect();
+    words.sort();
+    words.dedup();
+    words
+}
+
+/// True when the incoming message proves it addresses the same requirement
+/// as the older decision, rather than just naming the same file (F02).
+///
+/// A shared file path is a *relevance* signal: it says two decisions are
+/// about the same resource, not that they are about the same requirement.
+/// "use AuthService.rs with a 5-second timeout" and "replace plain-text
+/// logging in AuthService.rs with structured logging" share the file but
+/// withdraw nothing from each other — the cue `replace` is scoped to
+/// `plain-text logging`, not to the file. Proof needs one of:
+///
+/// - a **whole-entity withdrawal**: the message withdraws the shared entity
+///   itself ("use X instead", "drop X", "switch to Y"). Here the cue's
+///   object *is* the decision, so naming the same file is enough.
+/// - the two share a non-file content word — a concrete requirement noun
+///   such as `timeout`, `logging` or `toml` — which is the dimension being
+///   replaced, or
+/// - the message quotes a distinctive phrase of the older decision.
+///
+/// File-path tokens are excluded from the word comparison so path equality
+/// alone can never satisfy the shared-word branch.
+fn names_the_same_requirement(content: &str, older: &ContextItem) -> bool {
+    names_the_same_requirement_in(content, &older.content)
+}
+
+/// [`names_the_same_requirement`] over a plain older text, so the external
+/// map — which only keeps a stored summary — can apply the same proof.
+fn names_the_same_requirement_in(content: &str, older_text: &str) -> bool {
+    // CTX-2: retaining/negating wording ("do not replace …", "keep the
+    // timeout") is the opposite of a replacement declaration. It wins over
+    // every cue below — ambiguity coexists.
+    if has_retention_protection(content) {
+        return false;
+    }
+    // A verbatim run of several words is the strongest available proof:
+    // "replace the AuthService.rs 5-second timeout with …" quotes the line
+    // it withdraws. CTX-2: the run must contain at least one CONTENT word —
+    // a template opening like "use AuthService.rs with" is shared by every
+    // decision about that file and quotes nothing. And when the message
+    // contains the older line VERBATIM, it is a restatement/superset of the
+    // old decision, not a quotation for replacement — the object-naming
+    // rule below still decides.
+    if !contains_verbatim(older_text, content) && shares_content_run(content, older_text, 3) {
+        return true;
+    }
+    // CTX-2/E02: a replacement declaration must NAME what it replaces, and
+    // the named object must be part of the older decision. A bare cue plus
+    // a shared file (or any shared word anywhere in the message) is no
+    // longer accepted — "… with structured logging instead of plain-text
+    // logging" names logging as the replaced object, so it cannot withdraw
+    // the same file's 5-second-timeout requirement, and restating a
+    // requirement is not revoking it.
+    if names_replaced_object(content, older_text) {
+        return true;
+    }
+    // Direct-object withdrawal verbs keep their whole-entity rule: "drop
+    // AuthService.rs" — the entity itself is the object being retracted.
+    has_whole_entity_cue(content, older_text)
+}
+
+/// Words that mark retention or negation: a message carrying one of these
+/// contradicts a replacement declaration and never supersedes anything.
+fn has_retention_protection(content: &str) -> bool {
+    let tokens: Vec<String> = content
+        .split_whitespace()
+        .map(|token| {
+            token
+                .trim_matches(|c: char| !c.is_alphanumeric() && c != '-' && c != '_')
+                .to_lowercase()
+        })
+        .collect();
+    for token in &tokens {
+        if matches!(
+            token.as_str(),
+            "keep"
+                | "keeps"
+                | "keeping"
+                | "retain"
+                | "retains"
+                | "retaining"
+                | "preserve"
+                | "preserves"
+                | "preserving"
+                | "remains"
+                | "remain"
+                | "still"
+                | "never"
+                | "dont"
+                | "not"
+        ) {
+            return true;
+        }
+    }
+    tokens.windows(2).any(|pair| pair == ["do", "not"])
+}
+
+/// True when a replacement cue's OBJECT names part of the older decision.
+///
+/// The object positions are explainable surface patterns:
+/// - `replace <obj> (with …)?` — the direct object of `replace`;
+/// - `instead of <obj>` / `rather than <obj>` — the contrast phrase;
+/// - `replaces|replaced|replacing <obj>`.
+///
+/// The object phrase (up to four content words) is compared against the
+/// older decision's content words and entities; file-path words are
+/// excluded on both sides, so path equality alone never satisfies it.
+fn names_replaced_object(content: &str, older_text: &str) -> bool {
+    let mut older_words: Vec<String> = content_words(older_text)
+        .into_iter()
+        .filter(|word| !is_file_path_entity(word))
+        .collect();
+    for entity in extract_entities(older_text) {
+        let entity = entity.to_lowercase();
+        if !is_file_path_entity(&entity) {
+            older_words.push(entity);
+        }
+    }
+    if older_words.is_empty() {
+        return false;
+    }
+    let tokens: Vec<String> = content
+        .split_whitespace()
+        .map(|token| {
+            token
+                .trim_matches(|c: char| !c.is_alphanumeric() && c != '-' && c != '_')
+                .to_lowercase()
+        })
+        .collect();
+    // CTX-2 残余（R3-03）：替换宾语的*每一个*内容词都必须出现在旧决策里。
+    // 只共享一个需求维度词（"timeout logging" vs "5-second timeout"）是
+    // 相关性信号，不是撤销证明——命名一条要求意味着命名它的全部内容词。
+    // 不确定时保守共存，实体/词语继续服务于检索与相关性。
+    let object_names_older = |object: &[String]| -> bool {
+        !object.is_empty()
+            && object
+                .iter()
+                .all(|word| !word.is_empty() && older_words.iter().any(|prior| prior == word))
+    };
+    let mut index = 0;
+    while index < tokens.len() {
+        // `instead of <obj>` / `rather than <obj>`: the contrast object.
+        let contrast = (tokens[index] == "instead"
+            && index + 1 < tokens.len()
+            && (tokens[index + 1] == "of" || tokens[index + 1] == "than"))
+            || (tokens[index] == "rather"
+                && index + 1 < tokens.len()
+                && tokens[index + 1] == "than");
+        if contrast {
+            let object: Vec<String> = tokens[index + 2..]
+                .iter()
+                .take(4)
+                .filter(|word| !is_stop_word(word) && !is_file_path_entity(word))
+                .cloned()
+                .collect();
+            if object_names_older(&object) {
+                return true;
+            }
+            index += 2;
+            continue;
+        }
+        // `replace <obj> (with …)`: the direct object runs until `with`.
+        if matches!(
+            tokens[index].as_str(),
+            "replace" | "replaces" | "replaced" | "replacing"
+        ) {
+            let mut object: Vec<String> = Vec::new();
+            for token in tokens.iter().skip(index + 1).take(6) {
+                if token == "with" {
+                    break;
+                }
+                // File-path words are excluded on both sides (the doc above):
+                // a location phrase inside the object ("replace the 5-second
+                // timeout in AuthService.rs with …") is not requirement
+                // content, and it must not block the all-word proof below.
+                if !is_stop_word(token) && !is_file_path_entity(token) {
+                    object.push(token.clone());
+                }
+                if object.len() >= 4 {
+                    break;
+                }
+            }
+            if object_names_older(&object) {
+                return true;
+            }
+        }
+        index += 1;
+    }
+    false
+}
+
+/// True when `content` withdraws the shared entity itself rather than a
+/// scoped part of it.
+///
+/// The distinguishing feature is the cue verb's **direct object**:
+///
+/// - `drop AuthService.rs for the cache layer` — the object of the verb is
+///   the entity itself, so the decision is retracted.
+/// - `replace plain-text logging in AuthService.rs with structured logging`
+///   — the object of `replace` is `plain-text logging`; the entity appears
+///   only as a prepositional *location* (`in AuthService.rs`). Withdrawing
+///   one dimension of a file is not withdrawing the file's other decisions.
+///
+/// CTX-2/E02: the former `instead`/`revert` shortcut is gone. `instead`
+/// often introduces a *contrast phrase* ("… instead of plain-text
+/// logging") whose object is a scoped dimension, not the whole entity;
+/// treating it as a whole-entity withdrawal revoked unrelated requirements
+/// on the same file. Contrast phrases are handled by
+/// [`names_replaced_object`], which requires the named object to actually
+/// match the older decision.
+fn has_whole_entity_cue(content: &str, older_text: &str) -> bool {
+    let older_entities = extract_entities(older_text);
+    if older_entities.is_empty() {
+        return false;
+    }
+    let tokens: Vec<String> = content
+        .split_whitespace()
+        .map(|token| {
+            token
+                .trim_matches(|c: char| !c.is_alphanumeric() && c != '-' && c != '_')
+                .to_lowercase()
+        })
+        .collect();
+    let shared = |token: &str| -> bool {
+        older_entities
+            .iter()
+            .any(|entity| entity.to_lowercase() == token)
+    };
+    // `drop` / `remove` / `switch`(to) / `use` take a direct object: the
+    // entity must be that object, not a later prepositional location.
+    const DIRECT_OBJECT_CUES: &[&str] = &["drop", "remove", "switch", "discard", "abandon"];
+    for (index, token) in tokens.iter().enumerate() {
+        if !DIRECT_OBJECT_CUES.contains(&token.as_str()) {
+            continue;
+        }
+        // Skip determiners/adjectives that may precede the object.
+        for candidate in tokens.iter().skip(index + 1).take(3) {
+            if matches!(
+                candidate.as_str(),
+                "to" | "the" | "a" | "an" | "our" | "this"
+            ) {
+                continue;
+            }
+            if shared(candidate) {
+                return true;
+            }
+            // The first real object noun decides: if it is not the shared
+            // entity, the withdrawal is scoped elsewhere.
+            break;
+        }
+    }
+    false
+}
+
+/// Whether `left` and `right` share a verbatim run of at least `run` words
+/// (case-insensitive, punctuation-insensitive). Cheap and explainable: it
+/// is the "quotes the line it replaces" signal.
+/// True when `needle`'s full normalized word sequence appears verbatim
+/// (contiguously) inside `haystack` — a restatement or superset.
+fn contains_verbatim(needle: &str, haystack: &str) -> bool {
+    let normalize = |text: &str| -> Vec<String> {
+        text.split_whitespace()
+            .map(|word| {
+                word.trim_matches(|c: char| !c.is_alphanumeric() && c != '-' && c != '_')
+                    .to_lowercase()
+            })
+            .filter(|word| !word.is_empty())
+            .collect()
+    };
+    let needle_words = normalize(needle);
+    let haystack_words = normalize(haystack);
+    needle_words.len() >= 3
+        && haystack_words
+            .windows(needle_words.len())
+            .any(|window| window == needle_words.as_slice())
+}
+
+/// [`shares_verbatim_run`], additionally requiring the matched run to
+/// carry at least one non-stop, non-path content word: a run of template
+/// words ("use <file> with") names no requirement.
+fn shares_content_run(left: &str, right: &str, run: usize) -> bool {
+    let normalize = |text: &str| -> Vec<String> {
+        text.split_whitespace()
+            .map(|word| {
+                word.trim_matches(|c: char| !c.is_alphanumeric() && c != '-' && c != '_')
+                    .to_lowercase()
+            })
+            .filter(|word| !word.is_empty())
+            .collect()
+    };
+    let left_words = normalize(left);
+    let right_words = normalize(right);
+    if left_words.len() < run || right_words.len() < run {
+        return false;
+    }
+    left_words.windows(run).any(|window| {
+        right_words.windows(run).any(|other| {
+            other == window
+                && window
+                    .iter()
+                    .any(|word| !is_stop_word(word) && !is_file_path_entity(word))
+        })
+    })
+}
+
 /// True when the item is permanently excluded from model requests: a
 /// superseded decision or a verified-fixed error, whatever its score. The
 /// semantic state is authoritative; the legacy lifecycle labels are only
@@ -64,18 +458,25 @@ pub(crate) fn is_excluded(item: &ContextItem) -> bool {
 }
 
 /// Queue supersession of an earlier decision, but only when the incoming
-/// decision *proves* it replaces that specific line (F15): the same task
-/// context, an explicit replacement cue in the message, and the same
-/// semantic key — an exact path/symbol identity (`entities_match_exact`),
-/// not substring affinity. Entity overlap alone is a relevance signal, not
-/// proof: two compatible decisions about one file ("use AuthService.rs with
-/// a 5-second timeout", "use AuthService.rs with structured logging") share
-/// the key but withdraw nothing, so both stay live, and a decision from
-/// another task never finalizes one from this task even on a full key
-/// match. When no proof exists nothing is queued — the older decision keeps
-/// its state and decays through the ordinary relevance scorer; attention is
-/// deliberately not demoted here, because that would be a second unproven
-/// judgment.
+/// decision *proves* it replaces that specific line (F15, F02): the same
+/// task context, an explicit replacement cue in the message, and — beyond
+/// an exact path/symbol identity (`entities_match_exact`) — a shared
+/// *requirement*, not merely a shared file. Entity overlap is a relevance
+/// signal, not proof: two compatible decisions about one file ("use
+/// AuthService.rs with a 5-second timeout", "replace plain-text logging in
+/// AuthService.rs with structured logging") share the key but withdraw
+/// nothing, so both stay live, and a decision from another task never
+/// finalizes one from this task even on a full key match.
+///
+/// F02 narrowed the last same-task hole: the replacement cue applies to the
+/// whole message, so a message that changes one dimension of a file
+/// (`replace … logging …`) used to finalize every other decision on that
+/// file (`… 5-second timeout …`). Finalization therefore additionally
+/// requires [`names_the_same_requirement`] — the message must quote the
+/// older line or share a concrete requirement word with it. When no proof
+/// exists nothing is queued — the older decision keeps its state and decays
+/// through the ordinary relevance scorer; attention is deliberately not
+/// demoted here, because that would be a second unproven judgment.
 ///
 /// `by_id` is the new decision's id: it excludes the new item itself and
 /// becomes the `by` of the Superseded semantic state. `task_id` is the new
@@ -105,6 +506,7 @@ pub(crate) fn queue_decision_supersessions(
             && !is_excluded(item)
             && item.task_id == task_id
             && entities_match_exact(&entities, &item.entities)
+            && names_the_same_requirement(content, item)
     };
     for item in &mut state.items {
         if !matches(item) {
@@ -124,6 +526,18 @@ pub(crate) fn queue_decision_supersessions(
             .pending_supersessions
             .push((item.id, by_id, format!("{reason_prefix}: '{snippet}'")));
     }
+    // CTX-6: the externalize-retry list owns full live bodies while the
+    // store is down — a proven replacement supersedes that decision too,
+    // wherever its body currently sits.
+    for item in &mut state.pending_externalize_retry {
+        if !matches(item) {
+            continue;
+        }
+        let snippet: String = item.content.chars().take(60).collect();
+        state
+            .pending_supersessions
+            .push((item.id, by_id, format!("{reason_prefix}: '{snippet}'")));
+    }
     for entry in &state.external {
         let decision = entry.kind == ContextKind::Decision
             || entry
@@ -135,6 +549,9 @@ pub(crate) fn queue_decision_supersessions(
             || entry.semantic.is_dead()
             || entry.task_id != task_id
             || !entities_match_exact(&entities, &entry.entities)
+            // F02: the stored body is only a summary, but it still has to
+            // name the same requirement — a shared file never suffices.
+            || !names_the_same_requirement_in(content, &entry.context_ref.summary)
         {
             continue;
         }
@@ -182,6 +599,15 @@ pub(crate) fn queue_error_verifications(
         }
     }
     for item in &mut state.eviction_buffer {
+        if matches(item) {
+            state
+                .pending_verifications
+                .push((item.id, by_id, reason.to_string()));
+        }
+    }
+    // CTX-6: a spilled (store-unavailable) error is still the same error and
+    // still gets verified by a later success of its own recipe.
+    for item in &mut state.pending_externalize_retry {
         if matches(item) {
             state
                 .pending_verifications
@@ -240,6 +666,14 @@ pub(crate) fn queue_file_body_supersessions(state: &mut State, new_item: &Contex
         }
     }
     for item in &mut state.eviction_buffer {
+        if is_same_file(item) && supersedes(item) {
+            let reason = reason_for(item);
+            state.pending_supersessions.push((item.id, by_id, reason));
+        }
+    }
+    // CTX-6: a pending file body is a full in-memory body — the same
+    // revision/coverage proof applies to it as to any resident body.
+    for item in &mut state.pending_externalize_retry {
         if is_same_file(item) && supersedes(item) {
             let reason = reason_for(item);
             state.pending_supersessions.push((item.id, by_id, reason));
@@ -336,6 +770,8 @@ pub(crate) fn queue_error_recurrence(state: &mut State, new_item: &ContextItem, 
         .items
         .iter()
         .chain(state.eviction_buffer.iter())
+        // CTX-6: a pending error body is identical-fault provable too.
+        .chain(state.pending_externalize_retry.iter())
         .filter(|item| matches(item))
     {
         state.pending_supersessions.push((
@@ -419,6 +855,13 @@ fn has_matching_verification_evidence(
             .get(id)
             .and_then(|slot| state.items.get(slot))
             .or_else(|| state.eviction_buffer.iter().find(|item| item.id == id))
+            // CTX-6: a pending body proves its recipe identity the same way.
+            .or_else(|| {
+                state
+                    .pending_externalize_retry
+                    .iter()
+                    .find(|item| item.id == id)
+            })
         {
             return Some((item.task_id?, item.verify_recipe.as_ref()?, item.kind));
         }
@@ -469,6 +912,33 @@ fn apply_terminal_semantic(
     // Warm reversible buffer.
     if let Some(item) = state
         .eviction_buffer
+        .iter_mut()
+        .find(|item| item.id == item_id)
+    {
+        if item.semantic.is_dead() {
+            return None;
+        }
+        let transition = ContextStateTransition {
+            item_id: item.id,
+            kind: item.kind,
+            scope: item.scope,
+            from: item.attention,
+            to: AttentionState::Archived,
+            turn,
+            reason: reason.to_string(),
+        };
+        item.attention = AttentionState::Archived;
+        item.relevance = 0.0;
+        item.semantic = terminal;
+        state.mark_catalog(item_id);
+        return Some(transition);
+    }
+    // CTX-6: the externalize-retry list owns full live bodies while the
+    // store is down — a queued terminal transition lands there exactly like
+    // on the heap or the warm buffer. The item stays in the retry list; the
+    // store write that eventually succeeds carries the terminal semantics.
+    if let Some(item) = state
+        .pending_externalize_retry
         .iter_mut()
         .find(|item| item.id == item_id)
     {

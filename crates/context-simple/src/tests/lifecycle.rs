@@ -1,7 +1,8 @@
 use agent_contracts::{
     AttentionState, ContextAction, ContextConsumptionAck, ContextEngine, ContextHints,
     ContextIngress, ContextItemId, ContextKind, ContextMaintenanceTrigger, ContextQuery,
-    ContextRetention, ContextScope, OperationId, ToolOutput, TurnId,
+    ContextResidency, ContextRetention, ContextScope, OperationId, SemanticState, ToolOutput,
+    TurnId,
 };
 
 use crate::engine::{SimpleContextConfig, SimpleContextEngine};
@@ -1150,6 +1151,85 @@ async fn explicit_replacement_supersedes_and_names_the_replacement() {
     assert!(new.semantic.is_live(), "the replacement stays live");
 }
 
+/// F02: a replacement cue plus a shared file must NOT finalize a different
+/// requirement on that same file. The earlier line ("use AuthService.rs
+/// with a 5-second timeout") and the later one ("replace plain-text logging
+/// in AuthService.rs with structured logging") are two independent
+/// constraints that happen to name one file. The later message contains the
+/// cue "replace" and shares the entity `AuthService.rs`, but it withdraws
+/// nothing about the timeout — changing a log format is not proof of
+/// retracting a latency requirement.
+///
+/// F15 already stopped *cross-task* overlap and required an exact entity.
+/// This is the remaining same-task hole: entity overlap is a relevance
+/// signal for retrieval, never a permanent semantic revocation.
+#[tokio::test]
+async fn a_replace_cue_on_a_shared_file_does_not_withdraw_an_unrelated_requirement() {
+    let engine = SimpleContextEngine::new(SimpleContextConfig::default());
+    engine
+        .ingest(ContextIngress::UserMessage {
+            content: "use AuthService.rs with a 5-second timeout".into(),
+        })
+        .await
+        .unwrap();
+    engine
+        .ingest(ContextIngress::UserMessage {
+            content: "replace plain-text logging in AuthService.rs with structured logging".into(),
+        })
+        .await
+        .unwrap();
+    engine
+        .maintain(ContextMaintenanceTrigger::UserInput)
+        .await
+        .unwrap();
+    let state = engine.state.lock().await;
+    let timeout = state
+        .items
+        .iter()
+        .find(|item| item.content.contains("5-second timeout"))
+        .expect("the timeout requirement stays addressable");
+    assert!(
+        timeout.semantic.is_live(),
+        "replacing the logging format must not retract the timeout requirement, got {:?}",
+        timeout.semantic
+    );
+}
+
+/// F02 control: a genuine withdrawal that names the same dimension still
+/// finalizes the older decision, so the fix narrows only the unproven
+/// overlap case and does not disable replacement entirely.
+#[tokio::test]
+async fn an_explicit_withdrawal_of_the_same_requirement_still_supersedes() {
+    let engine = SimpleContextEngine::new(SimpleContextConfig::default());
+    engine
+        .ingest(ContextIngress::UserMessage {
+            content: "use AuthService.rs with a 5-second timeout".into(),
+        })
+        .await
+        .unwrap();
+    engine
+        .ingest(ContextIngress::UserMessage {
+            content: "replace the AuthService.rs 5-second timeout with a 30-second timeout".into(),
+        })
+        .await
+        .unwrap();
+    engine
+        .maintain(ContextMaintenanceTrigger::UserInput)
+        .await
+        .unwrap();
+    let state = engine.state.lock().await;
+    let old = state
+        .items
+        .iter()
+        .find(|item| item.content.contains("5-second timeout") && item.content.contains("use "))
+        .expect("the replaced decision stays addressable");
+    assert!(
+        !old.semantic.is_live(),
+        "an explicit replacement of the same requirement must still withdraw it, got {:?}",
+        old.semantic
+    );
+}
+
 #[tokio::test]
 async fn recurring_failure_supersedes_prior_error() {
     let engine = SimpleContextEngine::new(SimpleContextConfig::default());
@@ -1415,5 +1495,478 @@ async fn externalized_authority_metadata_survives_externalization() {
     assert_eq!(
         resident.evicted_at_tick, None,
         "the eviction marker is cleared on re-entry"
+    );
+}
+
+/// PLATFORM-2：inspect 读模型区分「驻留 / 本轮实际发送 / 仅摘要指针」——
+/// 驻留条目 residency=Resident；materialize 选中后（同回合）selected_current_turn
+/// 为真；外部条目 residency=External（读者无 fetch 只见摘要指针）。
+#[tokio::test]
+async fn inspect_reports_residency_and_actual_send_freshness() {
+    let dir = tempfile::tempdir().unwrap();
+    let engine = SimpleContextEngine::new(SimpleContextConfig {
+        context_store_dir: Some(dir.path().to_path_buf()),
+        ..SimpleContextConfig::default()
+    });
+    let external_id = {
+        let mut state = crate::engine::State::default();
+        let config = SimpleContextConfig::default();
+        let mut item = crate::item::make_item(
+            &state,
+            &config,
+            "externalized pointer-only finding".into(),
+            ContextKind::Note,
+            ContextScope::Task,
+            ContextRetention::Working,
+            0.6,
+            None,
+        );
+        item.id = ContextItemId::new();
+        let reference = crate::store::externalize(dir.path(), &item).unwrap();
+        state.external.push(crate::store::to_external_entry(
+            &item, reference, 1, 1, None,
+        ));
+        let value = crate::checkpoint::serialize(&state).unwrap();
+        engine.restore(value).await.unwrap();
+        item.id
+    };
+
+    open_focus(&engine, "freshness").await;
+    engine
+        .ingest(ContextIngress::UserMessage {
+            content: "summarize the fresh facts".into(),
+        })
+        .await
+        .unwrap();
+    // 一个成功的观察条目：本轮的候选正文。
+    engine
+        .ingest(ContextIngress::ToolObservation {
+            facts: None,
+            output: ToolOutput {
+                call_id: "1".into(),
+                tool_name: "fs.read".into(),
+                ok: true,
+                summary: "read".into(),
+                model_content: "the fresh fact: cache layer is the hot path".into(),
+                artifact_ref: None,
+                metadata: serde_json::Value::Null,
+            },
+            scope_id: None,
+        })
+        .await
+        .unwrap();
+
+    // 首次 inspect（本回合尚无 materialize）：驻留条目未发送，外部条目
+    // 是指针。
+    let catalog = engine.inspect(usize::MAX).await.unwrap();
+    let external = catalog
+        .iter()
+        .find(|summary| summary.id == external_id)
+        .expect("the external entry stays in the logical catalog");
+    assert_eq!(external.residency, ContextResidency::External);
+    assert!(!external.selected_current_turn);
+
+    // materialize 选中驻留正文 → inspect 如实标记「本轮实际发送」。
+    let snapshot = engine
+        .materialize(ContextQuery {
+            current_input: "summarize the fresh facts".into(),
+            budget_tokens: 4096,
+            hints: ContextHints::default(),
+        })
+        .await
+        .unwrap();
+    assert!(
+        !snapshot.items.is_empty(),
+        "the working set must produce a surface"
+    );
+    let catalog = engine.inspect(usize::MAX).await.unwrap();
+    for selected in &snapshot.items {
+        let summary = catalog
+            .iter()
+            .find(|summary| summary.id == selected.item_id)
+            .expect("every sent item stays visible in the catalog");
+        assert_eq!(
+            summary.residency,
+            ContextResidency::Resident,
+            "a sent body is a resident body"
+        );
+        assert!(
+            summary.selected_current_turn,
+            "an item in the latest surface must be marked actually-sent: {:?}",
+            summary.last_selected_turn
+        );
+    }
+}
+
+/// CTX-2/E02 反例：`with Y instead of Z` 是范围化替换的介词结构——它点名的
+/// 替代对象是 Z（logging），不是旧决策的要求（timeout）。共享文件＋出现
+/// instead 不再构成整实体撤销，旧超时决策保持 live。
+#[tokio::test]
+async fn an_instead_of_phrase_names_its_own_object_not_the_whole_file() {
+    let engine = SimpleContextEngine::new(SimpleContextConfig::default());
+    engine
+        .ingest(ContextIngress::UserMessage {
+            content: "use AuthService.rs with a 5-second timeout".into(),
+        })
+        .await
+        .unwrap();
+    engine
+        .ingest(ContextIngress::UserMessage {
+            content: "use AuthService.rs with structured logging instead of plain-text logging"
+                .into(),
+        })
+        .await
+        .unwrap();
+    let report = engine
+        .maintain(ContextMaintenanceTrigger::UserInput)
+        .await
+        .unwrap();
+    assert!(
+        report
+            .transitions
+            .iter()
+            .all(|t| !t.reason.contains("superseded by decision")),
+        "a scoped instead-of phrase must not withdraw the unrelated timeout: {:?}",
+        report
+            .transitions
+            .iter()
+            .map(|t| &t.reason)
+            .collect::<Vec<_>>()
+    );
+    let state = engine.state.lock().await;
+    let timeout = state
+        .items
+        .iter()
+        .find(|item| item.content.contains("5-second timeout"))
+        .expect("the timeout decision exists");
+    assert!(
+        timeout.semantic.is_live(),
+        "the timeout requirement must stay live: {:?}",
+        timeout.semantic
+    );
+}
+
+/// CTX-2：一句包含多条要求——重申旧要求（追加新要求）不是替代宣告；
+/// 替代对象点名的是 logging 维度，被重申的 timeout 不被终结。
+#[tokio::test]
+async fn one_message_with_several_requirements_restates_without_revoking() {
+    let engine = SimpleContextEngine::new(SimpleContextConfig::default());
+    engine
+        .ingest(ContextIngress::UserMessage {
+            content: "use AuthService.rs with a 5-second timeout".into(),
+        })
+        .await
+        .unwrap();
+    engine
+        .ingest(ContextIngress::UserMessage {
+            content:
+                "use AuthService.rs with a 5-second timeout and switch the logging to structured"
+                    .into(),
+        })
+        .await
+        .unwrap();
+    let report = engine
+        .maintain(ContextMaintenanceTrigger::UserInput)
+        .await
+        .unwrap();
+    assert!(
+        report
+            .transitions
+            .iter()
+            .all(|t| !t.reason.contains("superseded by decision")),
+        "restating a requirement is not a replacement declaration: {:?}",
+        report
+            .transitions
+            .iter()
+            .map(|t| &t.reason)
+            .collect::<Vec<_>>()
+    );
+}
+
+/// CTX-2：否定/保留话术（"do not replace"、"keep"）不构成替代宣告——
+/// 歧义先并存。
+#[tokio::test]
+async fn negated_or_retaining_wording_never_supersedes() {
+    let engine = SimpleContextEngine::new(SimpleContextConfig::default());
+    engine
+        .ingest(ContextIngress::UserMessage {
+            content: "use AuthService.rs with a 5-second timeout".into(),
+        })
+        .await
+        .unwrap();
+    engine
+        .ingest(ContextIngress::UserMessage {
+            content: "do not replace the logging approach in AuthService.rs, and keep the timeout"
+                .into(),
+        })
+        .await
+        .unwrap();
+    let report = engine
+        .maintain(ContextMaintenanceTrigger::UserInput)
+        .await
+        .unwrap();
+    assert!(
+        report
+            .transitions
+            .iter()
+            .all(|t| !t.reason.contains("superseded by decision")),
+        "negated replacement wording must not supersede: {:?}",
+        report
+            .transitions
+            .iter()
+            .map(|t| &t.reason)
+            .collect::<Vec<_>>()
+    );
+}
+
+/// CTX-2：中文追加条件不触发替代——并存（中文撤销支持不在本片范围，
+/// 如实记录为限制）。
+#[tokio::test]
+async fn a_chinese_appended_condition_coexists() {
+    let engine = SimpleContextEngine::new(SimpleContextConfig::default());
+    engine
+        .ingest(ContextIngress::UserMessage {
+            content: "use AuthService.rs with a 5-second timeout".into(),
+        })
+        .await
+        .unwrap();
+    engine
+        .ingest(ContextIngress::UserMessage {
+            content: "另外 AuthService.rs 的日志要改成结构化日志".into(),
+        })
+        .await
+        .unwrap();
+    let report = engine
+        .maintain(ContextMaintenanceTrigger::UserInput)
+        .await
+        .unwrap();
+    assert!(
+        report
+            .transitions
+            .iter()
+            .all(|t| !t.reason.contains("superseded by decision")),
+        "an appended Chinese condition must not supersede: {:?}",
+        report
+            .transitions
+            .iter()
+            .map(|t| &t.reason)
+            .collect::<Vec<_>>()
+    );
+}
+
+/// CTX-2：Stored（外存摘要）与 Resident 同一判据——E02 反例消息对已
+/// 外存的同文件超时决策同样不终结。
+#[tokio::test]
+async fn a_stored_decision_gets_the_same_scoped_instead_of_rule() {
+    let dir = tempfile::tempdir().unwrap();
+    let engine = SimpleContextEngine::new(SimpleContextConfig {
+        context_store_dir: Some(dir.path().to_path_buf()),
+        ..SimpleContextConfig::default()
+    });
+    // Put the decision into the external store directly (the same path a
+    // real externalization uses), so the stored-summary rule can be probed.
+    let stored_id = {
+        let mut state = crate::engine::State::default();
+        let config = SimpleContextConfig::default();
+        let mut item = crate::item::make_item(
+            &state,
+            &config,
+            "use AuthService.rs with a 5-second timeout".into(),
+            ContextKind::Decision,
+            ContextScope::Task,
+            ContextRetention::Working,
+            0.7,
+            None,
+        );
+        item.id = ContextItemId::new();
+        let reference = crate::store::externalize(dir.path(), &item).unwrap();
+        let entry = crate::store::to_external_entry(&item, reference, 1, 1, None);
+        state.external.push(entry);
+        let value = crate::checkpoint::serialize(&state).unwrap();
+        engine.restore(value).await.unwrap();
+        item.id
+    };
+    engine
+        .ingest(ContextIngress::UserMessage {
+            content: "use AuthService.rs with structured logging instead of plain-text logging"
+                .into(),
+        })
+        .await
+        .unwrap();
+    let report = engine
+        .maintain(ContextMaintenanceTrigger::UserInput)
+        .await
+        .unwrap();
+    assert!(
+        report
+            .transitions
+            .iter()
+            .all(|t| !t.reason.contains("stored decision")),
+        "a stored decision must survive the scoped instead-of phrase: {:?}",
+        report
+            .transitions
+            .iter()
+            .map(|t| &t.reason)
+            .collect::<Vec<_>>()
+    );
+    let state = engine.state.lock().await;
+    let entry = state
+        .external
+        .iter()
+        .find(|entry| entry.item_id == stored_id)
+        .expect("the stored decision stays in the store");
+    assert!(
+        entry.semantic.is_live(),
+        "the stored timeout decision must stay live: {:?}",
+        entry.semantic
+    );
+}
+
+/// CTX-2 残余（R3-03）：修改超时*日志*不撤销超时*时长*。替换宾语与旧决策
+/// 只共享一个内容词（timeout）不构成撤销证明——四个正文位置同判定，
+/// 兼容要求保持 Live 共存。
+#[tokio::test]
+async fn modifying_timeout_logging_does_not_withdraw_the_timeout_requirement() {
+    let dir = tempfile::tempdir().unwrap();
+    let engine = SimpleContextEngine::new(SimpleContextConfig {
+        context_store_dir: Some(dir.path().to_path_buf()),
+        gc_buffer_capacity: 0, // evictions go straight to the store
+        ..SimpleContextConfig::default()
+    });
+    open_focus(&engine, "auth service requirements").await;
+    let message = "use AuthService.rs with a 5-second timeout";
+
+    // The same decision in all four body locations.
+    engine
+        .ingest(ContextIngress::UserMessage {
+            content: message.into(),
+        })
+        .await
+        .unwrap(); // Resident
+    {
+        let mut state = engine.state.lock().await;
+        let make_copy = |state: &crate::engine::State| {
+            let mut item = crate::item::make_item(
+                state,
+                &engine.config,
+                message.into(),
+                ContextKind::UserMessage,
+                ContextScope::Task,
+                ContextRetention::Working,
+                0.62,
+                Some("user".into()),
+            );
+            item.residency = ContextResidency::Warm;
+            item.evicted_at_tick = Some(0);
+            item
+        };
+        // Warm copy.
+        let item = make_copy(&state);
+        state.eviction_buffer.push(item);
+        // Pending copy.
+        let item = make_copy(&state);
+        state.pending_externalize_retry.push(item);
+        // Stored: the second copy externalizes on the next pass.
+        let mut item = crate::item::make_item(
+            &state,
+            &engine.config,
+            message.into(),
+            ContextKind::UserMessage,
+            ContextScope::Task,
+            ContextRetention::Working,
+            0.62,
+            Some("user".into()),
+        );
+        item.residency = ContextResidency::Warm;
+        item.evicted_at_tick = Some(0);
+        state.eviction_buffer.push(item);
+    }
+    engine.gc().await.unwrap();
+    {
+        let state = engine.state.lock().await;
+        assert!(
+            !state.external.is_empty(),
+            "setup: the stored copy must be externalized"
+        );
+    }
+
+    // The scoped log-format change shares the dimension word "timeout" and
+    // the file, but names neither the whole requirement nor all its words.
+    engine
+        .ingest(ContextIngress::UserMessage {
+            content: "replace timeout logging in AuthService.rs with structured events".into(),
+        })
+        .await
+        .unwrap();
+    let report = engine
+        .maintain(ContextMaintenanceTrigger::UserInput)
+        .await
+        .unwrap();
+
+    let state = engine.state.lock().await;
+    let mut live_copies = 0usize;
+    for item in state
+        .items
+        .iter()
+        .chain(state.eviction_buffer.iter())
+        .chain(state.pending_externalize_retry.iter())
+    {
+        if item.content == message {
+            assert!(
+                item.semantic.is_live(),
+                "the timeout requirement must stay live in every in-memory location: {:?}",
+                item.semantic
+            );
+            live_copies += 1;
+        }
+    }
+    for entry in state.external.iter() {
+        if entry.context_ref.summary.contains("5-second timeout") {
+            assert!(
+                entry.semantic.is_live(),
+                "the stored copy must not be finalized by a scoped log change"
+            );
+            live_copies += 1;
+        }
+    }
+    assert!(
+        live_copies >= 4,
+        "all four copies must still exist: {live_copies} ({report:?})"
+    );
+}
+
+/// 正面对照：替换宾语点名了旧要求的*全部*内容词（5-second timeout），
+/// 明确撤销照常生效。
+#[tokio::test]
+async fn naming_the_full_requirement_still_supersedes() {
+    let engine = SimpleContextEngine::new(SimpleContextConfig::default());
+    engine
+        .ingest(ContextIngress::UserMessage {
+            content: "use AuthService.rs with a 5-second timeout".into(),
+        })
+        .await
+        .unwrap();
+    engine
+        .ingest(ContextIngress::UserMessage {
+            content: "replace the 5-second timeout in AuthService.rs with a 30-second timeout"
+                .into(),
+        })
+        .await
+        .unwrap();
+    engine
+        .maintain(ContextMaintenanceTrigger::UserInput)
+        .await
+        .unwrap();
+
+    let state = engine.state.lock().await;
+    let old = state
+        .items
+        .iter()
+        .find(|item| item.content == "use AuthService.rs with a 5-second timeout")
+        .expect("the old decision exists");
+    assert!(
+        matches!(old.semantic, SemanticState::Superseded { .. }),
+        "the explicit full-object withdrawal must supersede: {:?}",
+        old.semantic
     );
 }

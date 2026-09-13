@@ -48,6 +48,22 @@ pub(crate) fn plan_admit(state: &State, item_id: ContextItemId) -> AdmitPlan {
         }
         return AdmitPlan::InMemory;
     }
+    // CTX-6: a pending (store-write failed) body is an in-memory owner —
+    // admit serves it exactly like the warm buffer, with the same terminal
+    // refusal.
+    if let Some(item) = state
+        .pending_externalize_retry
+        .iter()
+        .find(|item| item.id == item_id)
+    {
+        if !item.semantic.is_live() {
+            return AdmitPlan::Refused(
+                "admit refused: the item's semantic lifecycle ended (terminal states never resurrect)"
+                    .to_string(),
+            );
+        }
+        return AdmitPlan::InMemory;
+    }
     match state.external.get(item_id) {
         Some(entry) if crate::store::externally_retrievable(entry) => {
             AdmitPlan::ReadExternal(item_id)
@@ -125,6 +141,41 @@ pub(crate) fn apply_admit(
         return None;
     }
 
+    // CTX-6: a pending (store-write failed) body is admitted exactly like a
+    // warm one — it leaves the retry list and re-enters the heap under the
+    // same id, with the same terminal refusal before any migration.
+    if let Some(index) = state
+        .pending_externalize_retry
+        .iter()
+        .position(|item| item.id == item_id)
+    {
+        if !state.pending_externalize_retry[index].semantic.is_live() {
+            return Some(
+                "admit refused: the item's semantic lifecycle ended (terminal states never resurrect)"
+                    .to_string(),
+            );
+        }
+        let mut item = state.pending_externalize_retry.remove(index);
+        let from = item.attention;
+        reenter_working_set(&mut item, now_tick, state, config);
+        let transition = admit_transition(&item, from, turn, reason);
+        crate::ledger::record(
+            state,
+            item.id,
+            agent_contracts::LifecycleAxis::Residency,
+            "Pending",
+            "Resident",
+            reason.to_string(),
+            "directive",
+            None,
+        );
+        state.items.push(item);
+        state.pending_ingest_transitions.push(transition);
+        state.admits_this_turn += 1;
+        state.access_admits = state.access_admits.saturating_add(1);
+        return None;
+    }
+
     // External: the content was read outside the lock. Re-check membership
     // and retrievability after IO, then re-enter the heap under the same id.
     if let Some((read_id, Some(mut item))) = external_read
@@ -138,6 +189,12 @@ pub(crate) fn apply_admit(
             // The entry became terminal or left while the file was read —
             // nothing to admit, and no mutation to roll back.
             return None;
+        }
+        // CTX-7: the entry owns the current metadata (promotion, terminal
+        // state, access clocks); the blob only supplies the body. Merge
+        // before the admission re-stamp so the promotion survives.
+        if let Some(owner) = state.external.get(item_id).cloned() {
+            item = crate::store::reattach_owner_metadata(&owner, item);
         }
         let from = item.attention;
         reenter_working_set(&mut item, now_tick, state, config);
@@ -184,6 +241,12 @@ pub(crate) fn apply_derive(
     }
     let source_exists = state.items.iter().any(|item| item.id == item_id)
         || state.eviction_buffer.iter().any(|item| item.id == item_id)
+        // CTX-6: a pending body is a real source — a derive against it must
+        // execute, not silently no-op while the store is down.
+        || state
+            .pending_externalize_retry
+            .iter()
+            .any(|item| item.id == item_id)
         || state
             .external
             .get(item_id)

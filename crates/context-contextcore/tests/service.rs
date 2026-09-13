@@ -12,10 +12,10 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use agent_contracts::{
-    AgentResult, ContextConsumptionAck, ContextEngine, ContextHints, ContextIngress,
-    ContextItemSummary, ContextMaintenanceReport, ContextMaintenanceTrigger, ContextQuery,
-    MaterializedContext, ModelCapabilities, ModelOutput, ModelRequest, ModelTransport, OperationId,
-    RuntimeEvent, ToolOutcome, ToolOutput, TurnId,
+    AgentResult, ContextAction, ContextConsumptionAck, ContextEngine, ContextHints, ContextIngress,
+    ContextItemId, ContextItemSummary, ContextMaintenanceReport, ContextMaintenanceTrigger,
+    ContextQuery, MaterializedContext, ModelCapabilities, ModelOutput, ModelRequest,
+    ModelTransport, OperationId, RuntimeEvent, ToolOutcome, ToolOutput, TurnId,
 };
 use agent_core::{CoreAuthorityConfig, PolicyApprovalGate};
 use context_contextcore::{ContextServiceAdapter, ContextServiceConfig, ServiceEngine};
@@ -1299,5 +1299,177 @@ async fn graceful_shutdown_exits_zero() {
     assert!(
         status.success(),
         "a graceful shutdown request must exit zero"
+    );
+}
+
+/// EXEC-9 (R3-01): the audit's deletion counterexample, turned into a
+/// retention regression that runs the real service process. An externalized
+/// body is referenced by retained checkpoint A; a newer snapshot B admits
+/// the body back into the working set, so from B's view the blob is a stale
+/// duplicate. The service engine must (1) parse A's recovery roots with its
+/// real, versioned implementation — never an empty set; (2) defer deletion
+/// for an unknown root or an incomplete root set; (3) keep the blob under a
+/// protecting reconcile; (4) restore A and read the body back — identical to
+/// the in-process engine.
+#[tokio::test]
+async fn recovery_roots_and_protected_reconcile_parity_across_the_service_boundary() {
+    let service_store = IsolatedStore::new("exec9-service");
+    let service = ContextServiceAdapter::connect(&ContextServiceConfig {
+        program: Some(service_program()),
+        engine: ServiceEngine::Dynamic,
+        store_dir: Some(service_store.path().to_path_buf()),
+        ..ContextServiceConfig::default()
+    })
+    .await
+    .expect("spawn isolated context service");
+    let local_store = IsolatedStore::new("exec9-local");
+    let local = context_simple::SimpleContextEngine::new(context_simple::SimpleContextConfig {
+        context_store_dir: Some(local_store.path().to_path_buf()),
+        ..context_simple::SimpleContextConfig::default()
+    });
+
+    let mut root_counts = Vec::new();
+    let service: Arc<dyn ContextEngine> = Arc::new(service);
+    let local: Arc<dyn ContextEngine> = Arc::new(local);
+    let engines: Vec<Arc<dyn ContextEngine>> = vec![service, local];
+    for engine in engines {
+        // Overflow the reversible buffer with observations touching one
+        // resource, so the full GC pass externalizes their bodies into the
+        // store (each becomes a recovery root for the checkpoint below).
+        let overflow = context_simple::SimpleContextConfig::default().gc_buffer_capacity + 1;
+        for item in 0..overflow {
+            engine
+                .ingest(ContextIngress::ToolObservation {
+                    facts: None,
+                    output: ToolOutput {
+                        call_id: format!("exec9-{item}"),
+                        tool_name: "shell.exec".into(),
+                        ok: true,
+                        summary: "ok".into(),
+                        model_content: format!(
+                            "step {item}: fix AuthService.rs {}",
+                            "x".repeat(120)
+                        ),
+                        artifact_ref: None,
+                        metadata: json!({ "path": "AuthService.rs" }),
+                    },
+                    scope_id: None,
+                })
+                .await
+                .unwrap();
+        }
+        engine
+            .maintain(ContextMaintenanceTrigger::AfterModel)
+            .await
+            .unwrap();
+        let gc = engine.gc().await.unwrap();
+        assert!(
+            gc.externalized > 0,
+            "the buffer overflow must externalize the bodies: {gc:?}"
+        );
+
+        // The externalized body and the checkpoint that references it.
+        let refs = engine
+            .search_external(agent_contracts::ContextSearchQuery {
+                query: "AuthService".into(),
+                kind: Some(agent_contracts::ContextKind::ToolObservation),
+                scope: None,
+                task_id: None,
+                label: None,
+                limit: 16,
+            })
+            .await
+            .unwrap();
+        assert!(!refs.is_empty(), "the retrieval surface must list the ref");
+        let target = refs[0].item_id;
+        let expected = engine
+            .fetch_external(target)
+            .await
+            .unwrap()
+            .expect("the ref resolves before any restore")
+            .content;
+        let snapshot_a = engine.checkpoint().await.unwrap();
+
+        // Admit the body back into the working set, then save B: from B's
+        // view the blob is a stale duplicate of resident content.
+        engine
+            .ingest(ContextIngress::ContextDirective {
+                action: ContextAction::Admit {
+                    item_id: target,
+                    reason: "the model needs this step again".into(),
+                },
+            })
+            .await
+            .unwrap();
+        engine
+            .maintain(ContextMaintenanceTrigger::Checkpoint)
+            .await
+            .unwrap();
+        let snapshot_b = engine.checkpoint().await.unwrap();
+
+        engine.restore(snapshot_b.clone()).await.unwrap();
+
+        // (1) A's recovery roots parse for real — one root, exactly the
+        // externalized body. The pre-fix service returned an empty set here
+        // (R3-01), which reads as "nothing retained".
+        let roots = engine
+            .checkpoint_recovery_item_ids(&snapshot_a)
+            .await
+            .unwrap();
+        assert_eq!(
+            roots,
+            vec![target],
+            "A's checkpoint must name the external body as a recovery root"
+        );
+
+        // (2) an incomplete root set defers deletion: the runtime cannot
+        // prove "nothing retained", so the stale-duplicate branch holds.
+        let incomplete = engine.reconcile_store_protecting(&[], false).await.unwrap();
+        assert_eq!(
+            incomplete.deleted_stale, 0,
+            "an incomplete root set must defer deletion: {incomplete:?}"
+        );
+
+        // (3) the protecting reconcile keeps the blob; restoring A reads the
+        // same body back.
+        let report = engine
+            .reconcile_store_protecting(&roots, true)
+            .await
+            .unwrap();
+        assert_eq!(
+            report.deleted_stale, 0,
+            "a recovery-root blob must not be deleted as stale: {report:?}"
+        );
+        engine.restore(snapshot_a.clone()).await.unwrap();
+        let fetched = engine
+            .fetch_external(target)
+            .await
+            .unwrap()
+            .expect("checkpoint A must still restore its body");
+        assert_eq!(fetched.content, expected, "the restored body must match");
+
+        // (5) the honest counterexample: back in B's view (the body is
+        // resident again), with the blob NOT named in the root set the same
+        // reconcile deletes it as a stale duplicate — deletion only ever
+        // happens outside protection, never through it.
+        engine.restore(snapshot_b.clone()).await.unwrap();
+        let unprotected = engine
+            .reconcile_store_protecting(&[ContextItemId::new()], true)
+            .await
+            .unwrap();
+        assert_eq!(
+            unprotected.deleted_stale, 1,
+            "outside protection the stale duplicate is deleted: {unprotected:?}"
+        );
+
+        root_counts.push(roots.len());
+    }
+    service_and_local_root_parity(&root_counts);
+}
+
+fn service_and_local_root_parity(counts: &[usize]) {
+    assert!(
+        counts.iter().all(|count| *count == 1),
+        "the protected root must parse identically in-process and across the service boundary: {counts:?}"
     );
 }

@@ -33,10 +33,33 @@ pub(crate) fn deserialize(data: Value) -> AgentResult<State> {
 /// corrupt payload degrades to "nothing protected" and the caller's own
 /// validation still owns rejection.
 pub(crate) fn recovery_item_ids(data: &Value) -> Vec<ContextItemId> {
-    let Ok(state) = serde_json::from_value::<State>(data.clone()) else {
+    let mut ids: Vec<ContextItemId> = match serde_json::from_value::<State>(data.clone()) {
+        Ok(state) => state.external.iter().map(|entry| entry.item_id).collect(),
+        // A spilled-tail checkpoint may carry more external ids than the
+        // inline array alone; the id parse below still owns those roots.
+        Err(_) => Vec::new(),
+    };
+    for (id, _) in spilled_entries_from_value(data) {
+        if !ids.contains(&id) {
+            ids.push(id);
+        }
+    }
+    ids
+}
+
+/// CTX-9 残余：读取 checkpoint 外置尾分片的 `(id, card-hash)` 清单。
+/// 旧 checkpoint（或未分片的 capture）没有该键 → 空清单。
+pub(crate) fn spilled_entries_from_value(data: &Value) -> Vec<(ContextItemId, String)> {
+    let Some(list) = data.get("external_spilled").and_then(Value::as_array) else {
         return Vec::new();
     };
-    state.external.iter().map(|entry| entry.item_id).collect()
+    list.iter()
+        .filter_map(|item| {
+            let id = ContextItemId::parse_ref(item.get("id")?.as_str()?).ok()?;
+            let hash = item.get("hash")?.as_str()?.to_string();
+            Some((id, hash))
+        })
+        .collect()
 }
 
 /// Structural validation every restore runs before the state becomes live.

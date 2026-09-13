@@ -44,6 +44,11 @@ pub(crate) fn protected_from_expiry(item: &ContextItem, turn: u64) -> bool {
 /// the policy score and capped by the stale-task gate.
 /// 参数是正交的 residency 输入（item/config/trigger/clocks/focus/file-body），
 /// 不收成一个只会在这一处使用的包。
+/// `anchor_protected` 是 CTX-5 的唯一 live 保护判定
+/// （`engine::anchor_claim_defers_expiry`）在本条目上的结果：当前投影的
+/// ResidentRequired/PromptRequired 声明把 TTL/ttl×4 两条语义终结路径推迟，
+/// 与 keep_alive/租约同一豁免位；终态条目在调用前已被 `is_excluded` 拦下，
+/// 保护不复活。
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn next_residency(
     item: &ContextItem,
@@ -54,6 +59,7 @@ pub(crate) fn next_residency(
     focus: Option<&FocusState>,
     hot_entities: &[String],
     latest_file_body: bool,
+    anchor_protected: bool,
 ) -> ResidencyOutcome {
     if item.retention == ContextRetention::Pinned || item.scope == ContextScope::Pinned {
         return ResidencyOutcome {
@@ -123,7 +129,8 @@ pub(crate) fn next_residency(
     let turn_age = turn.saturating_sub(item.created_turn);
     let ttl_expired = item.retention == ContextRetention::Ephemeral
         && turn_age > config.turn_ttl_ticks
-        && !protected_from_expiry(item, turn);
+        && !protected_from_expiry(item, turn)
+        && !anchor_protected;
     if ttl_expired {
         return ResidencyOutcome {
             attention: AttentionState::Archived,
@@ -147,7 +154,10 @@ pub(crate) fn next_residency(
         AttentionState::Cooling
     } else if item.retention == ContextRetention::Durable {
         AttentionState::Archived
-    } else if turn_age > config.turn_ttl_ticks * 4 && !protected_from_expiry(item, turn) {
+    } else if turn_age > config.turn_ttl_ticks * 4
+        && !protected_from_expiry(item, turn)
+        && !anchor_protected
+    {
         // A working item that outlived every TTL by a wide margin is not
         // coming back: its lifecycle ends here, terminally. Expiry
         // protection (keep_alive / unexpired lease) defers the death exactly

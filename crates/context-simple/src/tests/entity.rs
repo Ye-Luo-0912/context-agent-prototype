@@ -1174,13 +1174,23 @@ async fn fs_read_of_a_descriptorized_body_is_selected_descriptor() {
         })
         .await
         .unwrap();
+    // CTX-1/E01: descriptor pricing needs a real window now — an identity
+    // hint alone no longer omits the body. A whole-file window of the same
+    // revision drives the same descriptor stamp.
     engine
         .materialize(ContextQuery {
             current_input: "inspect src/a.rs".into(),
             budget_tokens: 10_000,
             hints: ContextHints {
                 checked_files: vec!["src/a.rs@rev".into()],
-                visible_body_identities: vec!["src/a.rs@rev".into()],
+                visible_body_windows: vec![agent_contracts::FileBodyWindow {
+                    path: "src/a.rs".into(),
+                    revision: Some("rev".into()),
+                    start_line: None,
+                    end_line: None,
+                    covers_file: true,
+                    complete: true,
+                }],
                 ..ContextHints::default()
             },
         })
@@ -1198,7 +1208,7 @@ async fn fs_read_of_a_descriptorized_body_is_selected_descriptor() {
         let state = engine.state.lock().await;
         assert_eq!(
             state.reread_selected_descriptor, 1,
-            "a packed path@rev is selected-descriptor, not body-visible"
+            "a body omitted behind a whole-file window is selected-descriptor"
         );
         assert_eq!(state.reread_previously_selected, 0);
     }
@@ -1438,13 +1448,45 @@ async fn only_visible_exact_file_body_is_priced_as_a_descriptor() {
         "identity-only progress must still price the real body"
     );
 
-    let with_visible_body = engine
+    // CTX-1/E01: an identity WITHOUT a trustworthy window never prices the
+    // body as an already-visible descriptor — unknown extent keeps the full
+    // body (it simply does not fit the 200-token budget here).
+    let identity_without_window = engine
         .materialize(ContextQuery {
             current_input: "continue".into(),
             budget_tokens: 200,
             hints: ContextHints {
                 checked_files: vec!["src/big.rs@aaa".into()],
                 visible_body_identities: vec!["src/big.rs@aaa".into()],
+                ..Default::default()
+            },
+        })
+        .await
+        .unwrap();
+    assert!(
+        !identity_without_window
+            .items
+            .iter()
+            .any(|item| item.item_id == body_id && item.content == "src/big.rs@aaa"),
+        "an identity match with no window must not collapse the body to a descriptor"
+    );
+
+    // A genuine whole-file window of the same revision is the only
+    // descriptor-pricing evidence.
+    let with_visible_body = engine
+        .materialize(ContextQuery {
+            current_input: "continue".into(),
+            budget_tokens: 200,
+            hints: ContextHints {
+                checked_files: vec!["src/big.rs@aaa".into()],
+                visible_body_windows: vec![agent_contracts::FileBodyWindow {
+                    path: "src/big.rs".into(),
+                    revision: Some("aaa".into()),
+                    start_line: None,
+                    end_line: None,
+                    covers_file: true,
+                    complete: true,
+                }],
                 ..Default::default()
             },
         })

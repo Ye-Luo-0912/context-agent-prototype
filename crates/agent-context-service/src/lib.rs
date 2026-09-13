@@ -113,6 +113,26 @@ pub async fn handle(op: ServiceOp, engine: &dyn ContextEngine) -> Result<Value, 
             engine.restore(data).await?;
             Ok(Value::Null)
         }
+        ServiceOp::CheckpointRecoveryItemIds { checkpoint } => {
+            let roots = engine.checkpoint_recovery_item_ids(&checkpoint).await?;
+            serde_json::to_value(roots).map_err(|e| AgentError::Context(e.to_string()))
+        }
+        ServiceOp::StorageGcProtecting {
+            roots,
+            roots_complete,
+        } => {
+            let report = engine.storage_gc_protecting(&roots, roots_complete).await?;
+            serde_json::to_value(report).map_err(|e| AgentError::Context(e.to_string()))
+        }
+        ServiceOp::ReconcileStoreProtecting {
+            roots,
+            roots_complete,
+        } => {
+            let report = engine
+                .reconcile_store_protecting(&roots, roots_complete)
+                .await?;
+            serde_json::to_value(report).map_err(|e| AgentError::Context(e.to_string()))
+        }
         ServiceOp::Shutdown => Ok(Value::Null),
     }
 }

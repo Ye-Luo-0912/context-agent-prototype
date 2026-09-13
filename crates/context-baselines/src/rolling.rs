@@ -18,7 +18,7 @@ use agent_contracts::{
     ContextEngine, ContextIngress, ContextKind, ContextMaintenanceReport,
     ContextMaintenanceTrigger, ContextQuery, ContextScope, ContextSelection,
     ContextStateTransition, FocusState, MaterializedContext, ScopeId, ScopeKind, ScoreBreakdown,
-    bound_compaction_output, bound_compaction_source,
+    UsageIdentity, bound_compaction_output, bound_compaction_source,
 };
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
@@ -41,6 +41,20 @@ pub struct RollingConfig {
     /// the threshold still demands is reported as `deferred_folds` and
     /// consumed by the next maintain instead of one unbounded serial run.
     pub max_compactor_calls_per_maintain: usize,
+    /// COST-4: the pass's cumulative compactor token budget (input＋output,
+    /// observed/estimated counters only — unknown rows carry no numbers and
+    /// stay covered by the CALL budget). When the running total reaches the
+    /// limit the pass defers the remaining folds (reported with
+    /// `compaction_budget_exhausted`) instead of an unbounded serial run.
+    /// Default: unlimited — the explicit budget is an opt-in profile.
+    pub max_compactor_tokens_per_maintain: u64,
+    /// COST-8: after a failed compactor call, the SAME fold request (same
+    /// prior summary + same candidate records) is deferred for this many
+    /// fold-eligible maintain passes before it is retried — every
+    /// BeforeModel/AfterTool/AfterModel trigger must not re-hit a request
+    /// that just failed. Changed folded content invalidates the backoff
+    /// and retries immediately. `0` restores the retry-every-pass behavior.
+    pub compact_failure_backoff_maintains: u32,
 }
 
 impl Default for RollingConfig {
@@ -49,6 +63,8 @@ impl Default for RollingConfig {
             summary_threshold_tokens: 9_000,
             keep_most_recent_tokens: 8_000,
             max_compactor_calls_per_maintain: 4,
+            max_compactor_tokens_per_maintain: u64::MAX,
+            compact_failure_backoff_maintains: 4,
         }
     }
 }
@@ -76,6 +92,24 @@ struct RollingState {
     compaction_input_tokens: u64,
     #[serde(default)]
     compaction_output_tokens: u64,
+    /// COST-8: the failed fold request currently backing off (serde default
+    /// keeps older checkpoints loading).
+    #[serde(default)]
+    last_failed_fold: Option<FailedFoldBackoff>,
+}
+
+/// COST-8 残余 (R3-13): 一次折叠的只读装箱结果——实际能进入
+/// 本次输入的内容（退避与取料共用）。
+struct FoldPacking {
+    consumed: usize,
+    partial: Option<(usize, usize)>,
+}
+
+/// COST-8: one failed fold request's identity and its remaining deferral.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct FailedFoldBackoff {
+    candidates_digest: u64,
+    maintains_left: u32,
 }
 
 impl RollingState {
@@ -137,6 +171,113 @@ impl RollingSummaryEngine {
     /// the working set right now. Zero means the threshold is satisfied or
     /// nothing older than the keep-window exists. W04 uses it to report
     /// deferral when the per-maintain call budget stops the loop early.
+    /// COST-8 残余 (R3-13): 只读装箱计划——描述**实际会进入一次折叠
+    /// 输入**的内容（整取数＋切分前缀），退避摘要与实际取料共用这一份
+    /// 计划。未发送的候选尾部变化不再解除退避；实际输入变化才解除。
+    fn plan_fold_packing(state: &RollingState, config: &RollingConfig) -> Option<FoldPacking> {
+        if state.total_tokens() <= config.summary_threshold_tokens {
+            return None;
+        }
+        let mut kept_tokens = 0usize;
+        let mut fold_candidates = 0usize;
+        for record in state.records.iter().rev() {
+            if kept_tokens >= config.keep_most_recent_tokens {
+                fold_candidates += 1;
+            }
+            kept_tokens += approx_tokens(&record.content);
+        }
+        if fold_candidates == 0 {
+            return None;
+        }
+        let mut prior_chars = if let Some(summary) = &state.summary {
+            summary.content.chars().count() + 1
+        } else {
+            0
+        };
+        let mut consumed = 0usize;
+        let mut partial: Option<(usize, usize)> = None;
+        for index in 0..fold_candidates {
+            let chars = state.records[index].content.chars().count() + 1;
+            if prior_chars.saturating_add(chars) <= SUMMARIZER_PRIOR_CAP {
+                prior_chars = prior_chars.saturating_add(chars);
+                consumed += 1;
+                continue;
+            }
+            let room = SUMMARIZER_PRIOR_CAP.saturating_sub(prior_chars + 1);
+            if room > 0 {
+                partial = Some((index, room));
+            }
+            break;
+        }
+        if consumed == 0 && partial.is_none() {
+            return None;
+        }
+        Some(FoldPacking { consumed, partial })
+    }
+
+    /// COST-8: the identity of the fold request the engine would make now —
+    /// the prior summary plus EXACTLY the records that fit into this pass's
+    /// bounded input (and the partial prefix split). Appended records that
+    /// cannot enter the source do not change this digest; only the actual
+    /// input changing does. `None` when nothing can honestly fold.
+    fn fold_request_digest(&self) -> Option<u64> {
+        use std::hash::{Hash, Hasher};
+        let state = self.state.lock().expect("rolling state poisoned");
+        let packing = Self::plan_fold_packing(&state, &self.config)?;
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        if let Some(summary) = &state.summary {
+            summary.id.hash(&mut hasher);
+        }
+        for record in state.records.iter().take(packing.consumed) {
+            record.id.hash(&mut hasher);
+        }
+        if let Some((index, chars)) = packing.partial {
+            state.records[index].id.hash(&mut hasher);
+            chars.hash(&mut hasher);
+        }
+        Some(hasher.finish())
+    }
+
+    /// COST-8: `true` when this exact request just failed and its backoff
+    /// still has deferrals left (each fold-eligible pass consumes one).
+    /// A changed digest — different folded content — clears the backoff and
+    /// lets the pass retry immediately.
+    fn same_source_failure_backoff(&self, digest: u64) -> bool {
+        let mut state = self.state.lock().expect("rolling state poisoned");
+        match &mut state.last_failed_fold {
+            Some(failure) if failure.candidates_digest == digest => {
+                if failure.maintains_left == 0 {
+                    state.last_failed_fold = None;
+                    false
+                } else {
+                    failure.maintains_left = failure.maintains_left.saturating_sub(1);
+                    true
+                }
+            }
+            Some(_) => {
+                state.last_failed_fold = None;
+                false
+            }
+            None => false,
+        }
+    }
+
+    /// COST-8: remember this request as failed so later maintain passes
+    /// defer it instead of re-hitting the compactor with the same bytes.
+    fn register_failed_fold(&self, digest: u64) {
+        let mut state = self.state.lock().expect("rolling state poisoned");
+        state.last_failed_fold = Some(FailedFoldBackoff {
+            candidates_digest: digest,
+            maintains_left: self.config.compact_failure_backoff_maintains,
+        });
+    }
+
+    /// COST-8: a successful fold retires any running backoff.
+    fn clear_failed_fold(&self) {
+        let mut state = self.state.lock().expect("rolling state poisoned");
+        state.last_failed_fold = None;
+    }
+
     fn fold_candidates_pending(&self) -> usize {
         let state = self.state.lock().expect("rolling state poisoned");
         if state.total_tokens() <= self.config.summary_threshold_tokens {
@@ -179,36 +320,26 @@ impl RollingSummaryEngine {
         // 输入（partial coverage，本次消费即可恢复），剩余后缀作为同 id
         // 残余留在 working set 队首，下次折叠继续消费。绝不带"未读也退
         // 出工作集"的覆盖声明整体移出；残余始终可见/可恢复。
+        // COST-8 残余 (R3-13)：取料与退避共用同一只读装箱计划——
+        // 实际发送的 source 由这份计划决定，digest 不再看未发送的候选。
+        let packing = Self::plan_fold_packing(&state, &self.config)?;
         let mut prior = String::new();
         if let Some(summary) = &state.summary {
             prior.push_str(&summary.content);
             prior.push('\n');
         }
         let merged_prior_summary = state.summary.is_some();
-        let prior_chars = prior.chars().count();
-        let mut consumed = 0usize;
-        let mut partial_prefix: Option<(usize, String)> = None; // (index, consumed prefix)
-        let mut input_chars = prior_chars;
-        for (index, record) in state.records.iter().enumerate().take(fold_candidates) {
-            let chars = record.content.chars().count() + 1;
-            if input_chars.saturating_add(chars) <= SUMMARIZER_PRIOR_CAP {
-                input_chars = input_chars.saturating_add(chars);
-                consumed += 1;
-                continue;
-            }
-            // The record cannot fully fit. Compute how many chars still fit
-            // and remember the split WITHOUT mutating the working set yet:
-            // the mutation commits only when the compactor succeeds (the
-            // FoldRestore guard would otherwise have to undo an in-place
-            // content rewrite). The prefix joins this fold's input; the tail
-            // is written back as the same id's residual in the commit phase.
-            let room = SUMMARIZER_PRIOR_CAP.saturating_sub(input_chars + 1);
-            if room > 0 {
-                let content: String = record.content.chars().take(room).collect();
-                partial_prefix = Some((index, content));
-            }
-            break;
-        }
+        let consumed = packing.consumed;
+        let partial_prefix: Option<(usize, String)> = packing.partial.map(|(index, room)| {
+            (
+                index,
+                state.records[index]
+                    .content
+                    .chars()
+                    .take(room)
+                    .collect::<String>(),
+            )
+        });
         if consumed == 0 && partial_prefix.is_none() {
             // 最旧记录本身超过输入容量且无切分空间：无法诚实折叠，
             // 保留工作集。
@@ -294,10 +425,10 @@ impl RollingSummaryEngine {
         })
     }
 
-    async fn compact_fold(&self, job: &FoldJob) -> Option<CompactionOutput> {
+    async fn compact_fold(&self, job: &FoldJob) -> Result<CompactionOutput, AgentError> {
         let fallback = fallback_marker(job.collapsed, &job.prior);
         let Some(compactor) = &self.compactor else {
-            return Some(CompactionOutput {
+            return Ok(CompactionOutput {
                 text: fallback,
                 ..CompactionOutput::default()
             });
@@ -314,13 +445,50 @@ impl RollingSummaryEngine {
                 if output.text.is_empty() {
                     output.text = fallback;
                 }
-                Some(output)
+                Ok(output)
             }
-            // 压缩失败：不写占位覆盖旧摘要。返回 None 让调用方丢弃 job，
+            // 压缩失败：不写占位覆盖旧摘要。返回 Err 让调用方丢弃 job，
             // 守卫把移出的记录还回 working set，折叠前状态完整保留，
-            // 下一个维护触发再试。
-            Err(_) => None,
+            // 下一个维护触发再试。失败携带的 usage 证据由调用方入账。
+            Err(error) => Err(error),
         }
+    }
+}
+
+/// COST-7 (R2-11): the cost row for a FAILED compactor call, built from
+/// whatever evidence the typed error carries — an empty-summary error keeps
+/// the provider's real counters under their honest identity (partial
+/// reports degrade to Unknown with the known values as the lower bound);
+/// any other failure stays an explicit Unknown row, never a silent zero.
+fn failed_fold_compaction_row(
+    source_items: usize,
+    error: Option<&AgentError>,
+) -> ContextCompaction {
+    match error.and_then(AgentError::reported_usage) {
+        Some(usage) => ContextCompaction {
+            reason: CompactionReason::RollingFold,
+            input_tokens: usage.input_tokens.unwrap_or(0),
+            output_tokens: usage.output_tokens.unwrap_or(0),
+            source_items,
+            usage_identity: usage.usage_identity(),
+            cached_input_tokens: usage.cached_input_tokens,
+            cache_write_input_tokens: usage.cache_write_input_tokens,
+            cache_miss_input_tokens: usage.cache_miss_input_tokens,
+            attempts: usage.attempts,
+            retries: usage.retries,
+        },
+        None => ContextCompaction {
+            reason: CompactionReason::RollingFold,
+            input_tokens: 0,
+            output_tokens: 0,
+            source_items,
+            usage_identity: UsageIdentity::Unknown,
+            cached_input_tokens: None,
+            cache_write_input_tokens: None,
+            cache_miss_input_tokens: None,
+            attempts: 0,
+            retries: 0,
+        },
     }
 }
 
@@ -457,35 +625,100 @@ impl ContextEngine for RollingSummaryEngine {
         // 留在工作集，如实报告为 deferred_folds，由下一次维护继续消费。
         let mut calls = 0usize;
         let mut deferred_folds = 0usize;
+        let mut tokens_used = 0u64;
+        let mut budget_exhausted = false;
         loop {
             // W04(P2)：预算检查必须发生在 take_fold_job 把候选移出工作集
             // **之前**——移出之后再数延期会看到空工作集而误报 0，随后守卫
             // 又把候选还回去。零调用预算的反例：两条候选留在工作集，
             // deferred_folds 必须如实报告 2。
             if self.compactor.is_some() && calls >= self.config.max_compactor_calls_per_maintain {
+                // The CALL budget keeps its W04 shape: `deferred_folds`
+                // already reports it. `compaction_budget_exhausted` stays
+                // dedicated to the TOKEN budget so the two mechanisms stay
+                // distinguishable in reports.
                 deferred_folds = self.fold_candidates_pending();
                 break;
+            }
+            // COST-4: the same defer semantics for the cumulative token
+            // budget — checked BEFORE candidates leave the working set, so
+            // the deferral count stays honest. Output length is not known
+            // in advance (the provider-side request cap bounds it); a call
+            // that overshoots the remaining budget is billed and folded,
+            // and the NEXT iteration defers.
+            if self.compactor.is_some()
+                && tokens_used >= self.config.max_compactor_tokens_per_maintain
+            {
+                deferred_folds = self.fold_candidates_pending();
+                budget_exhausted = true;
+                break;
+            }
+            // COST-8: a failed fold request backs off. The digest is taken
+            // BEFORE `take_fold_job` moves candidates (the guard restores
+            // them on failure, so the digest stays valid); changed content
+            // clears the backoff inside the check and retries at once.
+            let mut request_digest = None;
+            if self.compactor.is_some() {
+                request_digest = self.fold_request_digest();
+                if let Some(digest) = request_digest
+                    && self.same_source_failure_backoff(digest)
+                {
+                    deferred_folds = self.fold_candidates_pending();
+                    break;
+                }
             }
             let Some(mut job) = self.take_fold_job() else {
                 break;
             };
-            let Some(compacted) = self.compact_fold(&job).await else {
-                // 压缩失败：job 在此丢弃，守卫归还记录、旧摘要未被触碰，
-                // 折叠前状态保留。本回合不再重试同一折叠，避免对失败
-                // 压缩器空转。
-                break;
+            let compacted = match self.compact_fold(&job).await {
+                Ok(compacted) => compacted,
+                Err(error) => {
+                    // 压缩失败：job 在此丢弃，守卫归还记录、旧摘要未被触碰，
+                    // 折叠前状态保留。本回合不再重试同一折叠，避免对失败
+                    // 压缩器空转。
+                    // COST-1 (E05.2)/COST-7 (R2-11)：失败的压缩器调用仍是
+                    // 真实成本——provider 可能已为被中断的调用计费，空摘要
+                    // 错误还会携带已收到的 usage。账目按证据入账：有类型化
+                    // 报告走真实数字与身份，其余带一条显式 Unknown 行，而
+                    // 不是静默零；保源回退语义不变。
+                    if self.compactor.is_some() {
+                        compactions.push(failed_fold_compaction_row(job.collapsed, Some(&error)));
+                        // COST-8: this exact request now backs off (a zero
+                        // backoff config registers nothing to defer).
+                        if let Some(digest) = request_digest
+                            && self.config.compact_failure_backoff_maintains > 0
+                        {
+                            self.register_failed_fold(digest);
+                        }
+                    }
+                    break;
+                }
             };
             if self.compactor.is_some() {
-                calls += 1;
+                // COST-8: a successful fold retires any backoff.
+                self.clear_failed_fold();
             }
-            pass_in = pass_in.saturating_add(compacted.input_tokens);
-            pass_out = pass_out.saturating_add(compacted.output_tokens);
-            if compacted.input_tokens > 0 || compacted.output_tokens > 0 {
+            if self.compactor.is_some() {
+                calls += 1;
+                tokens_used = tokens_used
+                    .saturating_add(compacted.input_tokens)
+                    .saturating_add(compacted.output_tokens);
+                pass_in = pass_in.saturating_add(compacted.input_tokens);
+                pass_out = pass_out.saturating_add(compacted.output_tokens);
+                // COST-1 (E05.2)：每次压缩器调用都入账（身份随结果）——
+                // 零用量的成功调用（provider 未报 usage）也不再被静默
+                // 丢弃；分类由消费端按身份完成。
                 compactions.push(ContextCompaction {
                     reason: CompactionReason::RollingFold,
                     input_tokens: compacted.input_tokens,
                     output_tokens: compacted.output_tokens,
                     source_items: job.collapsed,
+                    usage_identity: compacted.usage_identity,
+                    cached_input_tokens: compacted.cached_input_tokens,
+                    cache_write_input_tokens: compacted.cache_write_input_tokens,
+                    cache_miss_input_tokens: compacted.cache_miss_input_tokens,
+                    attempts: compacted.attempts,
+                    retries: compacted.retries,
                 });
             }
             {
@@ -532,6 +765,7 @@ impl ContextEngine for RollingSummaryEngine {
             compaction_output_tokens: pass_out,
             compactions,
             deferred_folds,
+            compaction_budget_exhausted: budget_exhausted,
             ..ContextMaintenanceReport::default()
         })
     }
@@ -595,7 +829,10 @@ impl ContextEngine for RollingSummaryEngine {
             approx_tokens: approx_tokens_total,
             foreground: Vec::new(),
             required_item_ids: Vec::new(),
-            required_misses: Default::default(),
+            // F03: this engine does not resolve mandatory anchor claims; it
+            // reports every `PromptRequired` claim as unmet instead of
+            // returning an empty miss set that would read as "all satisfied".
+            required_misses: crate::shared::required_claim_misses(&query.hints),
             optional_misses: Default::default(),
             diagnostics: state.diagnostics(),
         })

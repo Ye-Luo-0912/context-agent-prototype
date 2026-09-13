@@ -918,9 +918,11 @@ async fn gc_never_resurrects_superseded_items() {
         })
         .await
         .unwrap();
+    // CTX-2/E02: "use X instead" is ambiguous (revoke vs. also-use), so a
+    // whole-entity withdrawal now needs an explicit object — "drop X".
     engine
         .ingest(ContextIngress::UserMessage {
-            content: "use AuthService.rs instead".into(),
+            content: "drop AuthService.rs".into(),
         })
         .await
         .unwrap();
@@ -1119,8 +1121,15 @@ fn dependency_marking_handles_a_large_root_set_without_edges() {
     }
 
     let latest_file_bodies = HashSet::new();
-    let (marked, anchor_roots_protected) =
-        mark_roots(&state, &config, None, &[], &latest_file_bodies);
+    let completed_tasks = crate::scope::CompletionFacts::default();
+    let (marked, anchor_roots_protected) = mark_roots(
+        &state,
+        &config,
+        None,
+        &[],
+        &latest_file_bodies,
+        &completed_tasks,
+    );
     assert_eq!(marked.len(), ROOTS, "every pinned root remains marked");
     assert_eq!(anchor_roots_protected, 0);
 }

@@ -17,7 +17,12 @@ pub(crate) struct DistillJob {
     pub(crate) summary_scope_id: Option<ScopeId>,
     pub(crate) fallback: String,
     pub(crate) source: String,
+    /// Exactly the sources whose bodies entered `source` — E04/CTX-3: a
+    /// source the compactor never saw can not carry a `DerivedFrom` edge.
     pub(crate) source_ids: Vec<ContextItemId>,
+    /// How many episode members were left out of the input by the source
+    /// budget (rendered onto the card so the omission is visible).
+    pub(crate) excluded_sources: usize,
     pub(crate) source_label: &'static str,
     pub(crate) reason: CompactionReason,
 }
@@ -44,14 +49,23 @@ pub(crate) fn plan_episode_distill(
                 && scope.state != ScopeState::Closed
         })
         .map(|scope| scope.opened_tick)?;
+    // E04/CTX-3: the episode card is a CUMULATIVE note — the previous card
+    // participates in the input like any other member, so a rotation that
+    // supersedes it does so WITH coverage (its content was actually read).
+    // A prior card that does not fit the budget is not superseded at all
+    // and stays retrievable.
     let members: Vec<(ContextItemId, &str)> = state
         .items
         .iter()
         .filter(|item| {
             item.task_id == Some(task)
-                && item.created_tick >= opened_tick
                 && item.semantic.is_live()
-                && item.source.as_deref() != Some(EPISODE_DERIVED_SOURCE)
+                // E04/CTX-3: a prior episode card participates WHEREVER it
+                // was created — the card is a cumulative note, so a
+                // rotation supersedes it only with its content in the
+                // input (source-level packing decides fit).
+                && (item.source.as_deref() == Some(EPISODE_DERIVED_SOURCE)
+                    || item.created_tick >= opened_tick)
         })
         .map(|item| (item.id, item.content.as_str()))
         .collect();
@@ -65,10 +79,38 @@ pub(crate) fn plan_episode_distill(
     if !config.force_episode_llm_distill && !episode_worth_llm_distill(state, opened_tick, task) {
         return None;
     }
-    let start = members.len().saturating_sub(MAX_DISTILL_SOURCES);
+    // Source-level packing (E04/CTX-3): walk the members newest-first and
+    // take a source WHOLE or not at all. Only the newest source may be
+    // truncated when it alone exceeds the budget (then nothing older fits).
+    // `source_ids` therefore never names a source the compactor did not
+    // see, and every left-out member is counted for the card's coverage
+    // note.
+    let mut picked: Vec<(ContextItemId, &str)> = Vec::new();
+    let mut excluded_sources = 0usize;
+    let mut budget = agent_contracts::COMPACTION_SOURCE_CHARS;
+    for (id, content) in members.iter().rev() {
+        if picked.len() >= MAX_DISTILL_SOURCES {
+            excluded_sources += 1;
+            continue;
+        }
+        let cost = content.chars().count() + 1;
+        if cost <= budget {
+            budget -= cost;
+            picked.push((*id, *content));
+        } else if picked.is_empty() {
+            // Newest source alone over the budget: it enters truncated and
+            // everything older is excluded.
+            excluded_sources += members.len() - 1;
+            picked.push((*id, *content));
+            break;
+        } else {
+            excluded_sources += 1;
+        }
+    }
+    picked.reverse();
     let mut source = String::new();
     let mut source_ids = Vec::new();
-    for (id, content) in &members[start..] {
+    for (id, content) in &picked {
         source_ids.push(*id);
         source.push_str(content);
         source.push('\n');
@@ -86,9 +128,15 @@ pub(crate) fn plan_episode_distill(
     Some(DistillJob {
         task_id: Some(task),
         summary_scope_id,
-        fallback: format!("[episode] {source}"),
+        // E04/CTX-3: a fallback card says plainly that the compaction did
+        // not happen — the verbatim sources stay attached and retrievable,
+        // and nothing claims summary coverage it does not have.
+        fallback: format!(
+            "[episode distill incomplete: compactor unavailable; raw sources follow, still retrievable]\n{source}"
+        ),
         source,
         source_ids,
+        excluded_sources,
         source_label: EPISODE_DERIVED_SOURCE,
         reason: CompactionReason::EpisodeRotation,
     })
@@ -169,7 +217,10 @@ pub(crate) fn insert_derived_summary(
     }
     let id = dependency::push_linked(state, config, item);
     if source_label == EPISODE_DERIVED_SOURCE {
-        queue_prior_episode_cards(state, task_id, id);
+        // E04/CTX-3: a prior card is superseded only when its content
+        // actually entered this card's input (it is among the sources) —
+        // replacement WITH coverage, never an unconditional revocation.
+        queue_prior_episode_cards(state, task_id, id, source_ids);
     }
     id
 }
@@ -197,17 +248,24 @@ pub(crate) fn insert_task_summary(
 /// card wherever its body sits. Terminal semantic death is drained by the
 /// next maintain pass so the transition is observable. Raw episode bodies
 /// stay retrievable; only the derived card is superseded.
-fn queue_prior_episode_cards(state: &mut State, task: Option<TaskId>, by_id: ContextItemId) {
+fn queue_prior_episode_cards(
+    state: &mut State,
+    task: Option<TaskId>,
+    by_id: ContextItemId,
+    source_ids: &[ContextItemId],
+) {
     let Some(task) = task else {
         return;
     };
-    let reason = "episode rotated, prior episode card superseded".to_string();
+    let reason = "episode rotated, prior episode card superseded with coverage".to_string();
+    let covered = |id: ContextItemId| source_ids.contains(&id);
     let mut old = Vec::new();
     for item in state.items.iter() {
         if item.id != by_id
             && item.task_id == Some(task)
             && item.source.as_deref() == Some(EPISODE_DERIVED_SOURCE)
             && item.semantic.is_live()
+            && covered(item.id)
         {
             old.push(item.id);
         }
@@ -217,6 +275,7 @@ fn queue_prior_episode_cards(state: &mut State, task: Option<TaskId>, by_id: Con
             && item.task_id == Some(task)
             && item.source.as_deref() == Some(EPISODE_DERIVED_SOURCE)
             && item.semantic.is_live()
+            && covered(item.id)
         {
             old.push(item.id);
         }
@@ -226,6 +285,7 @@ fn queue_prior_episode_cards(state: &mut State, task: Option<TaskId>, by_id: Con
             && entry.task_id == Some(task)
             && entry.source.as_deref() == Some(EPISODE_DERIVED_SOURCE)
             && entry.semantic.is_live()
+            && covered(entry.item_id)
         {
             old.push(entry.item_id);
         }

@@ -122,7 +122,10 @@ impl ContextEngine for AppendOnlyEngine {
             approx_tokens: approx_tokens_total,
             foreground: Vec::new(),
             required_item_ids: Vec::new(),
-            required_misses: Default::default(),
+            // F03: this engine does not resolve mandatory anchor claims; it
+            // reports every `PromptRequired` claim as unmet instead of
+            // returning an empty miss set that would read as "all satisfied".
+            required_misses: crate::shared::required_claim_misses(&query.hints),
             optional_misses: Default::default(),
             diagnostics: active_diagnostics(&state.records, None, 0),
         })

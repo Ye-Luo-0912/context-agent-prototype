@@ -3,6 +3,8 @@ use agent_contracts::{
     ContextStateTransition, Label, LifecycleLabel, Scope, ScopeId, ScopeKind, ScopeState, TaskId,
 };
 
+use std::collections::HashMap;
+
 use crate::engine::State;
 use crate::gc::reachability::is_excluded;
 
@@ -65,6 +67,12 @@ pub(crate) fn ensure_task_scope(state: &mut State, task_id: TaskId) -> ScopeId {
         existing.last_active_tick = state.event_seq;
         existing.id
     } else {
+        // CTX-9: (re)opening a task retires the retirement note — a live
+        // task scope is the fresh authority, and a stale "completed" note
+        // must not keep declaring it finished.
+        state
+            .retired_scopes
+            .retain(|note| !(note.kind == ScopeKind::Task && note.task_id == Some(task_id)));
         let scope = Scope {
             id: ScopeId::new(),
             parent: Some(session),
@@ -416,6 +424,30 @@ fn close_members(
         }
     }
 
+    // CTX-6: pending (store-write failed) members of the closing scope get
+    // the same durable-outcome promotion as resident, warm and external
+    // members — re-stamped *in place* (the retry list keeps owning the body;
+    // the owed store write must not be dropped). Terminal semantics and
+    // non-promotable bodies stay untouched: eviction is the GC's job, and a
+    // dead body is never promoted.
+    for item in &mut state.pending_externalize_retry {
+        if !belongs_to(&state.scopes, item, scope) {
+            continue;
+        }
+        if !item.semantic.is_live() || is_excluded(item) || !should_promote(item) {
+            continue;
+        }
+        // No heap-index move applies: the body stays in the retry list.
+        promote(
+            item,
+            parent_scope,
+            parent_id,
+            scope.kind,
+            turn,
+            &mut transitions,
+        );
+    }
+
     // External entries of the closing scope get the same membership
     // promotion as resident and warm bodies. Their content lives in the
     // store, so there is nothing to re-enter — the promotion re-stamps the
@@ -432,6 +464,17 @@ fn close_members(
             continue;
         }
         if !entry.semantic.is_live() || !retention_or_tag_promotable(entry.retention, &entry.tags) {
+            // CTX-9: a member that will never promote (terminal, or not a
+            // durable outcome) releases its scope stamp. The close already
+            // decided its membership; the dead stamp would otherwise pin
+            // the whole closed chain in memory and checkpoints forever.
+            // Retrieval/promotion semantics are unchanged: terminal
+            // entries are never served, non-promotable members are skipped
+            // by every later close, and `task_id` keeps the legacy
+            // inference available.
+            if entry.scope_id.take().is_some() {
+                external_catalog_changed = true;
+            }
             continue;
         }
         // Same no-op guard as the resident promote: already a member of
@@ -629,4 +672,205 @@ fn kind_name(kind: ScopeKind) -> &'static str {
         ScopeKind::Focus => "focus",
         ScopeKind::Tool => "tool",
     }
+}
+
+/// CTX-9 (R2-07)：一个已退休 scope 的有界事实保留。节点本身（goal、
+/// ticks 等历史元数据）离开树、内存与 checkpoint；身份、种类、归属任务
+/// 与关闭事实留在这条有界环里，`task_completed` 据此在退休后仍成立，
+/// 完成任务不会被误判为未完成而自动召回。环满淘汰最旧——保留期显式
+/// 且有界，不是清空。
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub(crate) struct RetiredScopeNote {
+    pub(crate) id: ScopeId,
+    pub(crate) kind: ScopeKind,
+    pub(crate) task_id: Option<TaskId>,
+    pub(crate) closed_tick: Option<u64>,
+}
+
+/// Hard bound on the retirement ring. Notes are tiny (id + kind + task +
+/// tick); 512 keeps every recent completion fact addressable while the
+/// hot metadata stays bounded in memory and checkpoint size.
+pub(crate) const MAX_RETIRED_SCOPE_NOTES: usize = 512;
+
+/// CTX-9: retire closed scopes that nothing references anymore, keeping a
+/// bounded fact note per retirement. A scope is retirable when all hold:
+/// - closed and not the session scope (the session never retires);
+/// - no item / external entry / the active scope carries its id (direct
+///   referents);
+/// - every remaining scope under it is itself retirable (chain integrity:
+///   subtree walks and ancestor closes must never hit a missing node) —
+///   decided bottom-up, so a whole unreferenced chain retires in one pass.
+///
+/// The pass runs only above `target_len`; it never opens, closes or
+/// re-parents anything. Returns how many scopes were retired.
+pub(crate) fn retire_closed_scopes(state: &mut State, target_len: usize) -> usize {
+    if state.scopes.len() <= target_len {
+        return 0;
+    }
+    let mut referenced: std::collections::HashSet<ScopeId> = state
+        .items
+        .iter()
+        .filter_map(|item| item.scope_id)
+        .collect();
+    referenced.extend(
+        state
+            .pending_externalize_retry
+            .iter()
+            .filter_map(|item| item.scope_id),
+    );
+    referenced.extend(
+        state
+            .eviction_buffer
+            .iter()
+            .filter_map(|item| item.scope_id),
+    );
+    referenced.extend(state.external.iter().filter_map(|entry| entry.scope_id));
+    if let Some(active) = state.active_scope_id {
+        referenced.insert(active);
+    }
+
+    // Bottom-up verdicts (children before parents, Kahn order on reversed
+    // parent edges): a node is retirable when it is a closed, unreferenced
+    // non-session scope and every in-tree child of it is retirable.
+    let mut child_count: HashMap<ScopeId, usize> = HashMap::new();
+    let mut retirable_children: HashMap<ScopeId, usize> = HashMap::new();
+    for scope in state.scopes.iter() {
+        if let Some(parent) = scope.parent {
+            *child_count.entry(parent).or_insert(0) += 1;
+        }
+    }
+    let mut retirable: HashMap<ScopeId, bool> = HashMap::new();
+    let mut queue: std::collections::VecDeque<ScopeId> = state
+        .scopes
+        .iter()
+        .filter(|scope| child_count.get(&scope.id).copied().unwrap_or(0) == 0)
+        .map(|scope| scope.id)
+        .collect();
+    while let Some(id) = queue.pop_front() {
+        let self_ok = state.scopes.by_id(id).is_some_and(|scope| {
+            scope.state == ScopeState::Closed
+                && scope.kind != ScopeKind::Session
+                && !referenced.contains(&scope.id)
+        });
+        let children_all = retirable_children.get(&id).copied().unwrap_or(0)
+            == child_count.get(&id).copied().unwrap_or(0);
+        let verdict = self_ok && children_all;
+        retirable.insert(id, verdict);
+        let parent = state.scopes.by_id(id).and_then(|scope| scope.parent);
+        if let Some(parent) = parent {
+            *retirable_children.entry(parent).or_insert(0) += usize::from(verdict);
+            // Enqueue the parent once its last child is decided.
+            if retirable_children[&parent] == child_count.get(&parent).copied().unwrap_or(0)
+                && !retirable.contains_key(&parent)
+            {
+                queue.push_back(parent);
+            }
+        }
+    }
+
+    // Remove the retirable nodes and keep their facts. Slot order is
+    // creation order, so notes read oldest-first.
+    let notes: Vec<RetiredScopeNote> = state
+        .scopes
+        .iter()
+        .filter(|scope| retirable.get(&scope.id).copied().unwrap_or(false))
+        .map(|scope| RetiredScopeNote {
+            id: scope.id,
+            kind: scope.kind,
+            task_id: scope.task_id,
+            closed_tick: scope.closed_tick,
+        })
+        .collect();
+    let retired = notes.len();
+    if retired == 0 {
+        return 0;
+    }
+    state
+        .scopes
+        .retain_and_rebuild(|scope| !retirable.get(&scope.id).copied().unwrap_or(false));
+    // CTX-10（R3-04）：环按时间序维护——既有事实保持最旧在前，新事实追加
+    // 在后，满员淘汰最旧前端。最新退休事实（刚完成的任务）绝不能第一个
+    // 被淘汰。一旦发生淘汰，环就是「最近窗口」而非完整记录，溢出事实被
+    // 显式置位（完成语义据此进入保守模式）。
+    let mut merged = std::mem::take(&mut state.retired_scopes);
+    merged.extend(notes);
+    if merged.len() > MAX_RETIRED_SCOPE_NOTES {
+        let drop = merged.len() - MAX_RETIRED_SCOPE_NOTES;
+        merged.drain(0..drop);
+        state.retirement_ring_overflowed = true;
+    }
+    state.retired_scopes = merged;
+    retired
+}
+
+/// CTX-9: the single source of the completed-task fact — a closed Task
+/// scope still in the tree, plus every retirement note. One GC pass builds
+/// this set once (sweep/reactivate/commit share the snapshot);
+/// `task_completion_recorded` answers a single id against the same facts.
+pub(crate) fn completed_task_facts(state: &State) -> std::collections::HashSet<TaskId> {
+    state
+        .scopes
+        .iter()
+        .filter(|scope| scope.kind == ScopeKind::Task && scope.state == ScopeState::Closed)
+        .filter_map(|scope| scope.task_id)
+        .chain(
+            state
+                .retired_scopes
+                .iter()
+                .filter(|note| note.kind == ScopeKind::Task)
+                .filter_map(|note| note.task_id),
+        )
+        .collect()
+}
+
+/// CTX-10 (R3-04): the completed-task fact set plus its completeness. Once
+/// the bounded retirement ring has overflowed, a task with no live Task
+/// scope in the tree and no note is *unknown*, not active: its scope was
+/// necessarily retired (only closed scopes retire) and its note may have
+/// been trimmed. Conservatively, unknown counts as completed — a finished
+/// task's retained bodies never regain automatic recall just because the
+/// bounded window forgot it. Automatic recall always had an explicit-reason
+/// requirement; this only closes the "forgotten fact" hole.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct CompletionFacts {
+    completed: std::collections::HashSet<TaskId>,
+    in_tree: std::collections::HashSet<TaskId>,
+    conservative: bool,
+}
+
+impl CompletionFacts {
+    /// Whether this task's records are treated as completed (certain fact,
+    /// or unknown under the conservative post-overflow rule).
+    pub(crate) fn is_completed(&self, task_id: Option<TaskId>) -> bool {
+        match task_id {
+            None => false,
+            Some(task) => {
+                self.completed.contains(&task)
+                    || (self.conservative && !self.in_tree.contains(&task))
+            }
+        }
+    }
+}
+
+/// Build the per-pass completion snapshot (see [`CompletionFacts`]).
+pub(crate) fn completion_facts(state: &State) -> CompletionFacts {
+    CompletionFacts {
+        completed: completed_task_facts(state),
+        in_tree: state
+            .scopes
+            .iter()
+            .filter(|scope| scope.kind == ScopeKind::Task)
+            .filter_map(|scope| scope.task_id)
+            .collect(),
+        conservative: state.retirement_ring_overflowed,
+    }
+}
+
+/// CTX-9 (test/audit helper): whether one task's completion fact is on
+/// record — a closed Task scope still in the tree, or a retirement note
+/// for one. Production readers build the [`completed_task_facts`] set once
+/// per pass; this answers a single id against the same facts.
+#[cfg(test)]
+pub(crate) fn task_completion_recorded(state: &State, task_id: TaskId) -> bool {
+    completed_task_facts(state).contains(&task_id)
 }

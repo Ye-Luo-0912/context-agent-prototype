@@ -59,7 +59,7 @@ pub(crate) struct StoredSearchRead {
 /// a corruption/bit-rot detector for reconcile, which compares the blob
 /// against the checksum the owning entry captured at write time. The hot
 /// read path skips it so per-item retrieval stays IO-cheap.
-fn checksum_hex(bytes: &[u8]) -> String {
+pub(crate) fn checksum_hex(bytes: &[u8]) -> String {
     let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
     for byte in bytes {
         hash ^= u64::from(*byte);
@@ -155,6 +155,87 @@ pub(crate) async fn externalize_async(
     }
     tokio::fs::rename(&tmp, &path).await?;
     Ok(checksum_hex(bytes))
+}
+
+/// CTX-9 残余：外置条目的元数据侧车（卡片）——checkpoint 外置尾分片的
+/// 既有 store 按需恢复路径。卡片文件名携带内容的短哈希（内容寻址）：
+/// 元数据未变的条目跨 capture 命中同一文件（幂等，零重写）；元数据变化
+/// 产生新文件，旧文件成为孤儿垃圾（启动 reconcile 对已删除 id 清理，
+/// 运行期残留有界：每次元数据变更 ≤1KB）。`.card` 后缀不匹配 reconcile
+/// 的 `.json` blob 扫描，不会被误当正文。
+pub(crate) fn external_card_path(dir: &Path, item_id: ContextItemId, hash: &str) -> PathBuf {
+    dir.join("cards").join(format!("{item_id}.{hash}.card"))
+}
+
+/// The card directory (the reconcile sweep enumerates it; blobs and cards
+/// live in disjoint namespaces).
+pub(crate) fn external_cards_dir(dir: &Path) -> PathBuf {
+    dir.join("cards")
+}
+
+/// Serialize one externalized entry into its card envelope.
+pub(crate) fn external_card_bytes(entry: &agent_contracts::ExternalizedContext) -> Vec<u8> {
+    let envelope = serde_json::json!({
+        "schema": "context-external-card/v1",
+        "entry": entry,
+    });
+    serde_json::to_vec(&envelope).unwrap_or_default()
+}
+
+/// Parse and validate a card: the envelope schema must match and the entry
+/// must carry the expected id — a foreign or damaged card is corruption,
+/// never another entry's metadata.
+pub(crate) fn parse_external_card(
+    bytes: &[u8],
+    expected_id: ContextItemId,
+) -> Result<agent_contracts::ExternalizedContext, ()> {
+    let value: serde_json::Value = serde_json::from_slice(bytes).map_err(|_| ())?;
+    if value.get("schema").and_then(|v| v.as_str()) != Some("context-external-card/v1") {
+        return Err(());
+    }
+    let entry: agent_contracts::ExternalizedContext =
+        serde_json::from_value(value.get("entry").cloned().ok_or(())?).map_err(|_| ())?;
+    if entry.item_id != expected_id {
+        return Err(());
+    }
+    Ok(entry)
+}
+
+/// Atomically write one metadata card (temp file -> flush + sync -> rename,
+/// mirroring [`externalize_async`]). Returns the final path.
+pub(crate) async fn write_external_card_async(
+    dir: &Path,
+    path: &Path,
+    bytes: &[u8],
+) -> std::io::Result<()> {
+    tokio::fs::create_dir_all(path.parent().unwrap_or(dir)).await?;
+    let tmp = dir.join(format!(
+        "card-{}.tmp",
+        agent_contracts::ContextItemId::new()
+    ));
+    {
+        use tokio::io::AsyncWriteExt;
+        let mut file = tokio::fs::File::create(&tmp).await?;
+        file.write_all(bytes).await?;
+        file.flush().await?;
+        file.sync_all().await?;
+    }
+    tokio::fs::rename(&tmp, path).await?;
+    Ok(())
+}
+
+/// Read one metadata card. `Ok(None)` = the file does not exist (a
+/// pruned-checkpoint restore legitimately finds nothing); `Err(())` = the
+/// card exists but is corrupt or names another id.
+pub(crate) async fn read_external_card_async(
+    path: &Path,
+    expected_id: ContextItemId,
+) -> Result<Option<agent_contracts::ExternalizedContext>, ()> {
+    match tokio::fs::read(path).await {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(_) => Err(()),
+        Ok(bytes) => parse_external_card(&bytes, expected_id).map(Some),
+    }
 }
 
 pub(crate) fn make_context_ref(item: &ContextItem) -> ContextRef {
@@ -1003,6 +1084,55 @@ fn storage_candidate(
     ))
 }
 
+/// CTX-7（R2-05）：把 store blob 读回的字节与*当前 owner 元数据*合并。
+///
+/// blob 只对「这条正文是什么」有权威：id、content、kind、内容派生的实体
+/// 签名、依赖边、文件身份与不可变的创建时钟。其余一切「这条正文现在在
+/// 哪里、处于什么状态」都由内存里的 external entry 权威拥有——scope close
+/// 的提升只重打 entry（磁盘 blob 留着外置时的旧快照），语义终结也只落在
+/// entry 上，所以读回 blob 绝不能让旧 scope/retention 覆盖之后的提升，
+/// 也不能由 blob 的 Live 覆盖 owner 的终态。tags 取并集：tags 只增不减，
+/// 旧 checkpoint 行的 entry 侧缺省列表不得抹掉 blob 里的真实标签（包括
+/// 旧的生命周期标签——保留它是防复活的证据）。调用方必须已通过 checksum
+/// 或 id 校验 blob 归属；本合并不替换内容，只合并元数据。
+pub(crate) fn reattach_owner_metadata(
+    entry: &ExternalizedContext,
+    mut item: ContextItem,
+) -> ContextItem {
+    debug_assert_eq!(item.id, entry.item_id, "owner merge pairs id to id");
+    item.task_id = entry.task_id;
+    item.scope = entry.scope;
+    // CTX-10（R3-02）：entry 的 scope_id 在两个方向上都是当前 owner 事实——
+    // Some 是提升后的重打，None 是 owner 的*显式释放*（链条已退休，blob 的
+    // 旧印章不得把退休 scope 当成悬空引用带回工作集）。pre-scope 时代的
+    // 旧 checkpoint 行（entry 缺省 None 覆盖带印章的 blob）由此降级为
+    // task_id 的 legacy 推断——那是整个引擎已视为一等公民的路径，绝不产生
+    // 悬空引用。
+    item.scope_id = entry.scope_id;
+    item.retention = entry.retention;
+    item.attention = entry.attention;
+    item.semantic = entry.semantic;
+    let mut tags = entry.tags.clone();
+    for tag in &item.tags {
+        if !tags.contains(tag) {
+            tags.push(tag.clone());
+        }
+    }
+    item.tags = tags;
+    item.keep_alive = entry.keep_alive;
+    item.lease_until_turn = entry.lease_until_turn;
+    item.residency = entry.residency;
+    item.importance = entry.importance;
+    item.relevance = entry.relevance;
+    item.last_access_tick = entry.last_access_tick;
+    item.last_access_turn = entry.last_access_turn;
+    item.last_selected_turn = entry.last_selected_turn;
+    item.access_count = entry.access_count;
+    item.evicted_at_tick = entry.evicted_at_tick;
+    item.gc_generation = entry.gc_generation;
+    item
+}
+
 /// Phase 1 of the conservative Storage GC (under the state lock): decide
 /// which store entries are deletable and why. Pure in-memory — reachability
 /// closure over the reference graph, then retention/semantic/TTL checks —
@@ -1324,6 +1454,8 @@ pub(crate) struct ReconcileIo {
     /// rejected file as a fresh baseline.
     pub(crate) owner_quarantined_ids: Vec<ContextItemId>,
     pub(crate) temp_cleaned: usize,
+    /// CTX-9 残余：清扫掉的孤儿外置元数据卡片数。
+    pub(crate) external_cards_removed: usize,
     pub(crate) io_errors: usize,
     pub(crate) reasons: Vec<String>,
     /// Item ids seen as `.json` files this scan (whatever their fate:
@@ -1544,6 +1676,66 @@ pub(crate) async fn run_reconcile_io_protecting(
             ));
         }
     }
+    // CTX-9 残余：孤儿卡片清扫。卡片与 blob 的保护规则完全镜像——
+    // id 在当前 external map（保留：仍是活跃条目）或保护根（保留：仍被
+    // 保留 checkpoint 的恢复承诺引用）之外即孤儿（条目已被 Storage GC
+    // 删除，或元数据更替后的旧哈希文件），删除并计数。read 失败按 IO
+    // 错误如实上报，不静默。
+    {
+        let cards_dir = external_cards_dir(dir);
+        let mut cards = match tokio::fs::read_dir(&cards_dir).await {
+            Ok(cards) => Some(cards),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+            Err(e) => {
+                io.io_errors += 1;
+                io.reasons.push(format!("cards dir unreadable: {e}"));
+                return io;
+            }
+        };
+        while let Some(entry) = match cards.as_mut() {
+            Some(cards) => cards.next_entry().await.unwrap_or_else(|e| {
+                io.io_errors += 1;
+                io.reasons.push(format!("cards dir read error: {e}"));
+                None
+            }),
+            None => None,
+        } {
+            let path = entry.path();
+            let Some(name) = path.file_name().and_then(|n| n.to_str()).map(str::to_owned) else {
+                continue;
+            };
+            let Some(raw_id) = name.strip_suffix(".card") else {
+                continue;
+            };
+            let raw_id = raw_id.rsplit_once('.').map(|(id, _)| id).unwrap_or(raw_id);
+            let Ok(card_id) = raw_id.parse::<ContextItemId>() else {
+                // 异形卡片：与 blob 同型，移入 quarantine 而不是猜测。
+                quarantine(
+                    &quarantine_dir,
+                    &path,
+                    &name,
+                    &mut io,
+                    "card file name is not an item id",
+                )
+                .await;
+                continue;
+            };
+            if map_checksums.contains_key(&card_id) || protected.contains(&card_id) {
+                continue;
+            }
+            match tokio::fs::remove_file(&path).await {
+                Ok(()) => {
+                    io.external_cards_removed += 1;
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) => {
+                    io.io_errors += 1;
+                    io.reasons
+                        .push(format!("could not remove card {name}: {e}"));
+                }
+            }
+        }
+    }
     io
 }
 
@@ -1621,6 +1813,7 @@ pub(crate) fn commit_reconcile(
         quarantined: io.quarantined,
         owner_quarantined,
         temp_cleaned: io.temp_cleaned,
+        external_cards_removed: io.external_cards_removed,
         io_errors: io.io_errors,
         reasons: io.reasons,
         ..StoreReconcileReport::default()

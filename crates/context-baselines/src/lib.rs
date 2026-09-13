@@ -268,8 +268,75 @@ mod tests {
                 ),
                 input_tokens: 4,
                 output_tokens: 2,
+                usage_identity: agent_contracts::UsageIdentity::Observed,
+                ..Default::default()
             })
         }
+    }
+
+    /// COST-7 (R2-11): an empty summary is a refused fold but a billed
+    /// call — the typed error's usage report reaches the maintenance
+    /// ledger with its real counters and honest identity instead of
+    /// collapsing into an unknown zero (or vanishing).
+    struct EmptySummaryWithUsage;
+
+    #[async_trait::async_trait]
+    impl BoundedCompactor for EmptySummaryWithUsage {
+        async fn compact(
+            &self,
+            _request: CompactionRequest,
+        ) -> agent_contracts::AgentResult<CompactionOutput> {
+            Err(agent_contracts::AgentError::EmptyCompactionSummary {
+                usage: agent_contracts::ModelUsage {
+                    input_tokens: Some(140),
+                    output_tokens: Some(9),
+                    cached_input_tokens: Some(90),
+                    attempts: 1,
+                    retries: 0,
+                    ..Default::default()
+                },
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn a_refused_fold_keeps_the_billed_call_usage_in_the_ledger() {
+        let engine = RollingSummaryEngine::with_config(RollingConfig {
+            summary_threshold_tokens: 30,
+            keep_most_recent_tokens: 4,
+            ..Default::default()
+        })
+        .with_compactor(Arc::new(EmptySummaryWithUsage));
+        // 一次触发折叠的轮次；压缩器返回空摘要 + usage 报告。
+        engine
+            .ingest(ContextIngress::UserMessage {
+                content: "fold me".into(),
+            })
+            .await
+            .unwrap();
+        engine
+            .ingest(ContextIngress::AssistantMessage {
+                content: "f".repeat(600),
+            })
+            .await
+            .unwrap();
+        let report = engine
+            .maintain(ContextMaintenanceTrigger::AfterModel)
+            .await
+            .unwrap();
+        let row = report
+            .compactions
+            .iter()
+            .find(|row| row.reason == agent_contracts::CompactionReason::RollingFold)
+            .expect("the billed call must appear in the ledger");
+        assert_eq!(row.input_tokens, 140);
+        assert_eq!(row.output_tokens, 9);
+        assert_eq!(row.cached_input_tokens, Some(90));
+        assert_eq!(
+            row.usage_identity,
+            agent_contracts::UsageIdentity::Observed,
+            "a full provider report stays observed, not unknown"
+        );
     }
 
     #[tokio::test]
@@ -330,8 +397,68 @@ mod tests {
                 text: String::new(),
                 input_tokens: 1,
                 output_tokens: 0,
+                usage_identity: agent_contracts::UsageIdentity::Observed,
+                ..Default::default()
             })
         }
+    }
+
+    /// COST-1 (E05.2): a SUCCESSFUL compactor call that reported zero usage
+    /// is still accounted (with its own identity) — the old nonzero-token
+    /// gate silently dropped it from the ledger.
+    #[tokio::test]
+    async fn zero_usage_compaction_is_still_accounted_with_its_identity() {
+        struct ZeroUsageCompactor;
+        #[async_trait::async_trait]
+        impl BoundedCompactor for ZeroUsageCompactor {
+            async fn compact(
+                &self,
+                _request: CompactionRequest,
+            ) -> agent_contracts::AgentResult<CompactionOutput> {
+                Ok(CompactionOutput {
+                    text: "folded".into(),
+                    input_tokens: 0,
+                    output_tokens: 0,
+                    usage_identity: agent_contracts::UsageIdentity::Unknown,
+                    cached_input_tokens: Some(250),
+                    cache_write_input_tokens: None,
+                    cache_miss_input_tokens: None,
+                    attempts: 2,
+                    retries: 1,
+                })
+            }
+        }
+        let engine = RollingSummaryEngine::with_config(RollingConfig {
+            summary_threshold_tokens: 30,
+            keep_most_recent_tokens: 4,
+            ..Default::default()
+        })
+        .with_compactor(Arc::new(ZeroUsageCompactor));
+        for index in 0..10 {
+            engine
+                .ingest(ContextIngress::AssistantMessage {
+                    content: format!("history record {index}"),
+                })
+                .await
+                .unwrap();
+        }
+        let report = engine
+            .maintain(ContextMaintenanceTrigger::AfterModel)
+            .await
+            .unwrap();
+        let entry = report
+            .compactions
+            .first()
+            .expect("a zero-usage call must still be accounted");
+        assert_eq!(
+            entry.usage_identity,
+            agent_contracts::UsageIdentity::Unknown
+        );
+        assert_eq!((entry.input_tokens, entry.output_tokens), (0, 0));
+        // COST-2 (E05.4): the call's cache/attempt facts survive the whole
+        // engine→report→event path instead of being dropped at the output.
+        assert_eq!(entry.cached_input_tokens, Some(250));
+        assert_eq!((entry.attempts, entry.retries), (2, 1));
     }
 
     #[tokio::test]
@@ -640,6 +767,20 @@ mod tests {
             "a failed fold must not report collapses (archived={})",
             report.archived
         );
+        // COST-1 (E05.2): the FAILED compactor call is a real cost whose
+        // evidence is lost — the report carries an explicit Unknown row
+        // (zero counters, never read as observed consumption) instead of
+        // dropping the call from the account.
+        let failed = report
+            .compactions
+            .first()
+            .expect("a failed compactor call must be accounted");
+        assert_eq!(
+            failed.usage_identity,
+            agent_contracts::UsageIdentity::Unknown,
+            "the failed call's counters prove nothing"
+        );
+        assert_eq!((failed.input_tokens, failed.output_tokens), (0, 0));
         let after = engine.diagnostics().await.unwrap();
         assert_eq!(
             after.total_items, before.total_items,
@@ -710,8 +851,374 @@ mod tests {
                 ),
                 input_tokens: 10,
                 output_tokens: 4,
+                usage_identity: agent_contracts::UsageIdentity::Observed,
+                ..Default::default()
             })
         }
+    }
+
+    /// COST-4：单维护累计 token 预算——CountingCompactor 每次调用
+    /// in=10/out=4（14 tokens/次）；预算 20 使第二次调用后耗尽，第三次
+    /// 调用前延期：calls=2、deferred_folds>0、`compaction_budget_exhausted`
+    /// 为真；已折叠部分保留。无限预算（默认 u64::MAX）行为不变。
+    /// COST-8 残余 (R3-13): 最旧记录填满输入后，追加进不了
+    /// source 的记录不解除退避—相同的失败请求只调用一次。
+    #[tokio::test]
+    async fn an_unsent_tail_append_does_not_retrigger_the_failed_fold() {
+        struct CountingFailing {
+            calls: Arc<std::sync::atomic::AtomicUsize>,
+        }
+        #[async_trait::async_trait]
+        impl BoundedCompactor for CountingFailing {
+            async fn compact(
+                &self,
+                _request: CompactionRequest,
+            ) -> agent_contracts::AgentResult<CompactionOutput> {
+                self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                Err(agent_contracts::AgentError::Model("provider down".into()))
+            }
+        }
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let engine = RollingSummaryEngine::with_config(RollingConfig {
+            summary_threshold_tokens: 30,
+            keep_most_recent_tokens: 4,
+            max_compactor_calls_per_maintain: 8,
+            compact_failure_backoff_maintains: 4,
+            ..Default::default()
+        })
+        .with_compactor(Arc::new(CountingFailing {
+            calls: calls.clone(),
+        }));
+        // 第一次：最旧记录以切分前缀填满 2000 字符输入，失败入账。
+        engine
+            .ingest(ContextIngress::UserMessage {
+                content: "f".repeat(2500),
+            })
+            .await
+            .unwrap();
+        engine
+            .ingest(ContextIngress::UserMessage {
+                content: "second workstream note".into(),
+            })
+            .await
+            .unwrap();
+        let failed = engine
+            .maintain(ContextMaintenanceTrigger::AfterModel)
+            .await
+            .unwrap();
+        assert_eq!(failed.compactions.len(), 1);
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+
+        // 追加一条记录：它成为新候选（改变旧摘要的候选集），
+        // 但进不了实际 source（切分前缀已占满输入）。
+        engine
+            .ingest(ContextIngress::UserMessage {
+                content: "an appended tail that cannot enter the bounded source".into(),
+            })
+            .await
+            .unwrap();
+        let deferred = engine
+            .maintain(ContextMaintenanceTrigger::BeforeModel)
+            .await
+            .unwrap();
+        assert!(
+            deferred.compactions.is_empty(),
+            "the same failed request must not re-hit the compactor"
+        );
+        assert!(
+            deferred.deferred_folds > 0,
+            "the deferral stays visible: {deferred:?}"
+        );
+        assert_eq!(
+            calls.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "an appended unsent tail must not retrigger the failed fold"
+        );
+    }
+
+    /// COST-8 残余 (R3-13): 实际输入变化（新记录能进 source）
+    /// 仍然解除退避—退避绑定真实输入，不是冻结一切重试。
+    #[tokio::test]
+    async fn a_real_source_change_still_allows_the_retry() {
+        struct CountingFailing {
+            calls: Arc<std::sync::atomic::AtomicUsize>,
+        }
+        #[async_trait::async_trait]
+        impl BoundedCompactor for CountingFailing {
+            async fn compact(
+                &self,
+                _request: CompactionRequest,
+            ) -> agent_contracts::AgentResult<CompactionOutput> {
+                self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                Err(agent_contracts::AgentError::Model("provider down".into()))
+            }
+        }
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let engine = RollingSummaryEngine::with_config(RollingConfig {
+            summary_threshold_tokens: 30,
+            keep_most_recent_tokens: 4,
+            max_compactor_calls_per_maintain: 8,
+            compact_failure_backoff_maintains: 4,
+            ..Default::default()
+        })
+        .with_compactor(Arc::new(CountingFailing {
+            calls: calls.clone(),
+        }));
+        engine
+            .ingest(ContextIngress::UserMessage {
+                content: "f".repeat(600),
+            })
+            .await
+            .unwrap();
+        engine
+            .ingest(ContextIngress::UserMessage {
+                content: "s".repeat(600),
+            })
+            .await
+            .unwrap();
+        let failed = engine
+            .maintain(ContextMaintenanceTrigger::AfterModel)
+            .await
+            .unwrap();
+        assert_eq!(failed.compactions.len(), 1);
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+
+        // 追加的记录能进入下一次输入（还有容量）——实际 source
+        // 变化，退避解除，立即重试。
+        engine
+            .ingest(ContextIngress::UserMessage {
+                content: "t".repeat(200),
+            })
+            .await
+            .unwrap();
+        let retried = engine
+            .maintain(ContextMaintenanceTrigger::BeforeModel)
+            .await
+            .unwrap();
+        assert_eq!(
+            retried.compactions.len(),
+            1,
+            "a real source change retries immediately"
+        );
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 2);
+    }
+
+    /// COST-8: after a failed fold, the SAME request backs off — the next
+    /// fold-eligible passes defer without calling the compactor — while
+    /// changed folded content invalidates the backoff and retries at once.
+    #[tokio::test]
+    async fn a_failed_fold_request_backs_off_until_the_content_changes() {
+        struct FailingCompactor;
+        #[async_trait::async_trait]
+        impl BoundedCompactor for FailingCompactor {
+            async fn compact(
+                &self,
+                _request: CompactionRequest,
+            ) -> agent_contracts::AgentResult<CompactionOutput> {
+                Err(agent_contracts::AgentError::Model("provider down".into()))
+            }
+        }
+        let engine = RollingSummaryEngine::with_config(RollingConfig {
+            summary_threshold_tokens: 30,
+            keep_most_recent_tokens: 4,
+            max_compactor_calls_per_maintain: 8,
+            compact_failure_backoff_maintains: 2,
+            ..Default::default()
+        })
+        .with_compactor(Arc::new(FailingCompactor));
+        // 触发第一次折叠失败（两条记录：旧的那条成为折叠候选）。
+        engine
+            .ingest(ContextIngress::UserMessage {
+                content: "fold me please".into(),
+            })
+            .await
+            .unwrap();
+        engine
+            .ingest(ContextIngress::UserMessage {
+                content: "f".repeat(600),
+            })
+            .await
+            .unwrap();
+        let failed = engine
+            .maintain(ContextMaintenanceTrigger::AfterModel)
+            .await
+            .unwrap();
+        assert_eq!(failed.compactions.len(), 1, "the failure is accounted");
+
+        // 同一内容：下一次维护推迟，不再打压缩器（无新账目行）。
+        let deferred = engine
+            .maintain(ContextMaintenanceTrigger::BeforeModel)
+            .await
+            .unwrap();
+        assert!(
+            deferred.compactions.is_empty(),
+            "a backing-off request must not re-hit the compactor"
+        );
+        assert!(
+            deferred.deferred_folds > 0,
+            "the deferral is visible in the report"
+        );
+
+        // 内容变化使退避失效：立即重试（失败重新入账）。
+        engine
+            .ingest(ContextIngress::UserMessage {
+                content: "a changed workstream with brand-new words gaga".into(),
+            })
+            .await
+            .unwrap();
+        let retried = engine
+            .maintain(ContextMaintenanceTrigger::AfterModel)
+            .await
+            .unwrap();
+        assert_eq!(
+            retried.compactions.len(),
+            1,
+            "changed folded content retries immediately"
+        );
+    }
+
+    /// COST-8: the backoff survives a cold restore — it rides the rolling
+    /// checkpoint, so a restored engine keeps deferring the same failed
+    /// request instead of re-hitting the compactor on its first maintain.
+    #[tokio::test]
+    async fn the_fold_backoff_survives_a_cold_restore() {
+        struct FailingCompactor;
+        #[async_trait::async_trait]
+        impl BoundedCompactor for FailingCompactor {
+            async fn compact(
+                &self,
+                _request: CompactionRequest,
+            ) -> agent_contracts::AgentResult<CompactionOutput> {
+                Err(agent_contracts::AgentError::Model("provider down".into()))
+            }
+        }
+        let engine = RollingSummaryEngine::with_config(RollingConfig {
+            summary_threshold_tokens: 30,
+            keep_most_recent_tokens: 4,
+            max_compactor_calls_per_maintain: 8,
+            compact_failure_backoff_maintains: 2,
+            ..Default::default()
+        })
+        .with_compactor(Arc::new(FailingCompactor));
+        engine
+            .ingest(ContextIngress::UserMessage {
+                content: "fold me please".into(),
+            })
+            .await
+            .unwrap();
+        engine
+            .ingest(ContextIngress::UserMessage {
+                content: "f".repeat(600),
+            })
+            .await
+            .unwrap();
+        let failed = engine
+            .maintain(ContextMaintenanceTrigger::AfterModel)
+            .await
+            .unwrap();
+        assert_eq!(failed.compactions.len(), 1, "the failure is accounted");
+
+        // 冷恢复：checkpoint 带出走退避状态，恢复后第一次维护仍推迟。
+        let snapshot = engine.checkpoint().await.unwrap();
+        assert!(
+            snapshot["last_failed_fold"].is_object(),
+            "the backoff state rides the checkpoint: {snapshot}"
+        );
+        let restored = RollingSummaryEngine::with_config(RollingConfig {
+            summary_threshold_tokens: 30,
+            keep_most_recent_tokens: 4,
+            max_compactor_calls_per_maintain: 8,
+            compact_failure_backoff_maintains: 2,
+            ..Default::default()
+        })
+        .with_compactor(Arc::new(FailingCompactor));
+        restored.restore(snapshot).await.unwrap();
+        let deferred = restored
+            .maintain(ContextMaintenanceTrigger::BeforeModel)
+            .await
+            .unwrap();
+        assert!(
+            deferred.compactions.is_empty(),
+            "a restored engine keeps deferring the same failed request"
+        );
+        assert!(deferred.deferred_folds > 0, "the deferral stays visible");
+    }
+
+    #[tokio::test]
+    async fn a_token_budget_defers_the_rest_of_the_pass_and_reports_it() {
+        let counting = Arc::new(CountingCompactor(std::sync::atomic::AtomicUsize::new(0)));
+        let engine = RollingSummaryEngine::with_config(RollingConfig {
+            summary_threshold_tokens: 30,
+            keep_most_recent_tokens: 4,
+            max_compactor_calls_per_maintain: 8,
+            max_compactor_tokens_per_maintain: 20,
+            compact_failure_backoff_maintains: 0,
+        })
+        .with_compactor(Arc::clone(&counting) as Arc<dyn BoundedCompactor>);
+        for index in 0..30 {
+            engine
+                .ingest(ContextIngress::AssistantMessage {
+                    content: format!("history record {index}: {}", "x".repeat(500)),
+                })
+                .await
+                .unwrap();
+        }
+        let report = engine
+            .maintain(ContextMaintenanceTrigger::AfterModel)
+            .await
+            .unwrap();
+        assert_eq!(
+            counting.0.load(std::sync::atomic::Ordering::SeqCst),
+            2,
+            "the token budget stops the pass before a third call (2x14 >= 20)"
+        );
+        assert!(
+            report.compaction_budget_exhausted,
+            "the token-budget deferral must be visible on the report"
+        );
+        assert!(
+            report.deferred_folds > 0,
+            "the deferred remainder must be reported"
+        );
+        assert_eq!(report.compaction_input_tokens, 20);
+        assert_eq!(report.compaction_output_tokens, 8);
+    }
+
+    /// COST-4 对照组：默认无限预算（u64::MAX）下同一批候选不被 token
+    /// 门槛延期——只有 calls 预算照旧生效，exhausted 标志保持 false。
+    #[tokio::test]
+    async fn the_default_token_budget_keeps_existing_behavior() {
+        let counting = Arc::new(CountingCompactor(std::sync::atomic::AtomicUsize::new(0)));
+        let engine = RollingSummaryEngine::with_config(RollingConfig {
+            summary_threshold_tokens: 30,
+            keep_most_recent_tokens: 4,
+            max_compactor_calls_per_maintain: 2,
+            max_compactor_tokens_per_maintain: u64::MAX,
+            compact_failure_backoff_maintains: 0,
+        })
+        .with_compactor(Arc::clone(&counting) as Arc<dyn BoundedCompactor>);
+        for index in 0..30 {
+            engine
+                .ingest(ContextIngress::AssistantMessage {
+                    content: format!("history record {index}: {}", "x".repeat(500)),
+                })
+                .await
+                .unwrap();
+        }
+        let report = engine
+            .maintain(ContextMaintenanceTrigger::AfterModel)
+            .await
+            .unwrap();
+        assert_eq!(
+            counting.0.load(std::sync::atomic::Ordering::SeqCst),
+            2,
+            "only the call budget applies"
+        );
+        assert!(
+            !report.compaction_budget_exhausted,
+            "the token budget never fired under the default"
+        );
+        assert!(report.deferred_folds > 0);
     }
 
     #[tokio::test]
@@ -721,6 +1228,8 @@ mod tests {
             summary_threshold_tokens: 30,
             keep_most_recent_tokens: 4,
             max_compactor_calls_per_maintain: 2,
+            max_compactor_tokens_per_maintain: u64::MAX,
+            compact_failure_backoff_maintains: 0,
         })
         .with_compactor(Arc::clone(&counting) as Arc<dyn BoundedCompactor>);
         for index in 0..30 {
@@ -781,6 +1290,8 @@ mod tests {
             summary_threshold_tokens: 30,
             keep_most_recent_tokens: 4,
             max_compactor_calls_per_maintain: 0,
+            max_compactor_tokens_per_maintain: u64::MAX,
+            compact_failure_backoff_maintains: 0,
         })
         .with_compactor(Arc::clone(&counting) as Arc<dyn BoundedCompactor>);
         for index in 0..3 {
@@ -1090,5 +1601,81 @@ mod tests {
             .unwrap();
         assert_eq!(materialized.selected.len(), 256);
         materialized.validate_materialization().unwrap();
+    }
+
+    /// F03: a baseline engine cannot resolve `PromptRequired` anchor claims,
+    /// so it must report them as unmet. Returning an empty miss set would
+    /// claim "every required body is present", which the runtime consumes as
+    /// a satisfied obligation — an unimplemented contract rendered as a
+    /// success. Both baselines must surface the miss instead.
+    #[tokio::test]
+    async fn baselines_report_unsatisfied_required_claims_instead_of_an_empty_miss_set() {
+        use agent_contracts::{AnchorRootClaim, AnchorRootStrength};
+
+        let prompt_required = AnchorRootClaim {
+            item_ref: "src/auth.rs@rev-1".into(),
+            strength: AnchorRootStrength::PromptRequired,
+            source_field_id: "task.anchor.pinned".into(),
+            anchor_revision: 7,
+            ..Default::default()
+        };
+        // Recallable is not a mandatory claim: the engine may legitimately
+        // ignore it, so it must not be reported as a miss.
+        let recallable = AnchorRootClaim {
+            item_ref: "src/other.rs@rev-1".into(),
+            strength: AnchorRootStrength::Recallable,
+            source_field_id: "task.anchor.roots".into(),
+            anchor_revision: 7,
+            ..Default::default()
+        };
+        let hints = ContextHints {
+            anchor_roots: vec![prompt_required, recallable],
+            ..Default::default()
+        };
+
+        for materialized in [
+            AppendOnlyEngine::new()
+                .materialize(ContextQuery {
+                    current_input: "next".into(),
+                    budget_tokens: 100_000,
+                    hints: hints.clone(),
+                })
+                .await
+                .unwrap(),
+            RollingSummaryEngine::new()
+                .materialize(ContextQuery {
+                    current_input: "next".into(),
+                    budget_tokens: 100_000,
+                    hints: hints.clone(),
+                })
+                .await
+                .unwrap(),
+        ] {
+            assert_eq!(
+                materialized.required_misses.total(),
+                1,
+                "the unsatisfied PromptRequired claim must be reported, got {:?}",
+                materialized.required_misses
+            );
+            let miss = &materialized.required_misses.as_slice()[0];
+            assert_eq!(miss.identity.item_ref, "src/auth.rs@rev-1");
+            assert_eq!(miss.identity.anchor_revision, 7);
+            assert!(materialized.required_item_ids.is_empty());
+            // The engine claims nothing about the recallable root, so it is
+            // not a miss either way.
+            assert_eq!(materialized.optional_misses.total(), 0);
+        }
+
+        // No claims at all: the miss set is legitimately empty, so the fix
+        // does not fabricate misses for an engine with nothing to satisfy.
+        let no_claims = AppendOnlyEngine::new()
+            .materialize(ContextQuery {
+                current_input: "next".into(),
+                budget_tokens: 100_000,
+                hints: ContextHints::default(),
+            })
+            .await
+            .unwrap();
+        assert!(no_claims.required_misses.is_empty());
     }
 }

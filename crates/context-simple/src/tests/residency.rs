@@ -199,7 +199,10 @@ async fn reconcile_protects_an_older_checkpoints_blob_after_restore() {
     // Without protection the reconcile would delete the blob as a stale
     // duplicate (deleted_stale = 1); with A protected it must survive.
     engine.restore(snapshot_b).await.unwrap();
-    let recovery_roots = engine.checkpoint_recovery_item_ids(&snapshot_a);
+    let recovery_roots = engine
+        .checkpoint_recovery_item_ids(&snapshot_a)
+        .await
+        .unwrap();
     assert_eq!(
         recovery_roots,
         vec![target],

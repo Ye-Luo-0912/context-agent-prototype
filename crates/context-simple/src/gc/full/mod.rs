@@ -3,7 +3,7 @@ use std::collections::HashSet;
 use agent_contracts::{
     AttentionState, ContextEviction, ContextGcReport, ContextItem, ContextItemId, ContextKind,
     ContextReactivation, ContextResidency, ContextRetention, ContextScope, CoreLabel,
-    DependencyEdge, FocusState, Label, LifecycleAxis, ScopeId, ScopeKind, ScopeState, TaskId,
+    DependencyEdge, FocusState, Label, LifecycleAxis, ScopeId, ScopeKind, ScopeState,
     checked_files_cover_path,
 };
 
@@ -50,6 +50,18 @@ pub(crate) struct GcPlan {
     pub(crate) aged_external: usize,
     /// Live resident items protected this pass by anchor root claims.
     pub(crate) anchor_roots_protected: usize,
+    /// CTX-8: overflow items deferred this pass because the retry list was
+    /// at its cap; they stay owned in the eviction buffer.
+    pub(crate) externalize_deferred: u64,
+    /// CTX-8: the retry list hit its cap this pass.
+    pub(crate) externalize_backpressure: bool,
+    /// CTX-9: closed, fully unreferenced scope nodes retired this pass
+    /// (bounded fact notes kept).
+    pub(crate) scopes_retired: u64,
+    /// CTX-8/9/10: the pass's completion snapshot (certain facts plus the
+    /// conservative post-overflow rule). Built once, shared by the sweep,
+    /// the reactivate phase and the commit's stamp release.
+    pub(crate) completed_tasks: crate::scope::CompletionFacts,
 }
 
 /// The store IO outcomes, applied by the commit under a fresh lock.
@@ -61,6 +73,10 @@ pub(crate) struct GcIoResult {
     pub(crate) externalized: Vec<(ContextItemId, String)>,
     /// Recalled items with full content read back from the store.
     pub(crate) recalled: Vec<ContextItem>,
+    /// CTX-8: writes and reads that failed this pass. The owning items and
+    /// entries stay put; the count is surfaced in the report instead of
+    /// being silently swallowed.
+    pub(crate) failures: u64,
 }
 
 /// One full GC pass, phase 1 (planning, under the state lock): mark roots,
@@ -88,11 +104,13 @@ pub(crate) fn plan_full_gc(
     now_tick: u64,
     turn: u64,
 ) -> Option<GcPlan> {
-    if !config.gc_enabled
-        || (state.items.is_empty()
-            && state.eviction_buffer.is_empty()
-            && state.external.is_empty()
-            && state.pending_externalize_retry.is_empty())
+    if !config.gc_enabled {
+        return None;
+    }
+    if state.items.is_empty()
+        && state.eviction_buffer.is_empty()
+        && state.external.is_empty()
+        && state.pending_externalize_retry.is_empty()
     {
         // A pass only makes sense when something can change: resident
         // items to sweep, buffer entries to recall, external entries to
@@ -103,7 +121,30 @@ pub(crate) fn plan_full_gc(
         // pending-only state (every owner spilled by a store outage)
         // must run it too, or the retry the outage postponed would never
         // happen even after IO recovers.
-        return None;
+        //
+        // CTX-9: the one exception is scope retirement — a body-free state
+        // can still carry an oversized closed-scope tree (10k finished
+        // tool frames), and exactly that state has nothing else left to
+        // do. Retire here so the tree never waits for a body to exist.
+        let retired = crate::scope::retire_closed_scopes(state, config.scope_retire_target) as u64;
+        if retired == 0 {
+            return None;
+        }
+        return Some(GcPlan {
+            externalize: Vec::new(),
+            recall_candidates: Vec::new(),
+            evictions: Vec::new(),
+            buffer_reactivations: Vec::new(),
+            marked_roots: 0,
+            evicted: 0,
+            reactivated: 0,
+            aged_external: 0,
+            anchor_roots_protected: 0,
+            externalize_deferred: 0,
+            externalize_backpressure: false,
+            scopes_retired: retired,
+            completed_tasks: crate::scope::CompletionFacts::default(),
+        });
     }
 
     // One full GC generation. External aging and TTLs count generations —
@@ -123,6 +164,10 @@ pub(crate) fn plan_full_gc(
         reactivated: 0,
         aged_external: 0,
         anchor_roots_protected: 0,
+        externalize_deferred: 0,
+        externalize_backpressure: false,
+        scopes_retired: 0,
+        completed_tasks: crate::scope::CompletionFacts::default(),
     };
 
     // ----- Mark phase: the root set --------------------------------
@@ -136,14 +181,30 @@ pub(crate) fn plan_full_gc(
     let focus = state.focus.clone();
     let hot_entities = state.hot_entities.clone();
     let latest_file_bodies = state.latest_file_body_ids();
+    // CTX-8 (report follow-up 3): the completed-task fact is a per-pass
+    // snapshot set, not a per-item scope-tree scan — `O(items × scopes)`
+    // becomes `O(scopes + items)`. Equivalent output: the pass never
+    // mutates scopes before this set's last reader (retirement runs at the
+    // very end), and the set comes from the single source
+    // `scope::completed_task_facts` (live closed Task scopes, retired Task
+    // notes). The set rides the plan into the commit, which releases
+    // completed-task entry stamps with the same snapshot.
+    let completed_tasks: crate::scope::CompletionFacts = crate::scope::completion_facts(state);
+    plan.completed_tasks = completed_tasks.clone();
     let (marked, anchor_roots_protected) = mark_roots(
         state,
         config,
         focus.as_ref(),
         &hot_entities,
         &latest_file_bodies,
+        &completed_tasks,
     );
     plan.anchor_roots_protected = anchor_roots_protected;
+    // CTX-8: the sweep tests membership once per item — a HashSet keeps the
+    // whole pass O(items + marks) instead of O(items × marks) when the root
+    // set is large. Output and selection order are untouched (membership
+    // tests only); the same set serves the reactivate phase below.
+    let marked_set: HashSet<ContextItemId> = marked.iter().copied().collect();
     // The ids of items whose entities are hot right now, mirroring the
     // mark phase's `hot` test. The sweep exempts hot items from the
     // ordinary-dialogue aging rule, and the reactivate phase applies the
@@ -152,7 +213,7 @@ pub(crate) fn plan_full_gc(
         .items
         .iter()
         .filter(|item| {
-            !task_completed(state, item.task_id)
+            !completed_tasks.is_completed(item.task_id)
                 && !hot_entities.is_empty()
                 && entities_match_exact(&item.entities, &hot_entities)
         })
@@ -189,10 +250,17 @@ pub(crate) fn plan_full_gc(
         // marked — it stays Live in the reversible buffer, so this is
         // aging, not death.
         let aged_ordinary = aged_ordinary_dialogue(&item, config, turn, hot_ids.contains(&item.id));
-        let alive_root = !aged_ordinary
-            && item.semantic.is_live()
-            && marked.contains(&item.id)
-            && (model_directed || !consumed_ephemeral);
+        // CTX-5: a current residency-strength anchor claim holds this live
+        // item — task authority outranks every aging heuristic (ordinary
+        // dialogue, closed-scope membership, consumed-ephemeral release),
+        // so a held item is an alive root on its own. Semantic death still
+        // wins first: protection never resurrects.
+        let anchor_protected = crate::engine::anchor_claim_defers_expiry(state, &item);
+        let alive_root = item.semantic.is_live()
+            && (anchor_protected
+                || (!aged_ordinary
+                    && marked_set.contains(&item.id)
+                    && (model_directed || !consumed_ephemeral)));
         if alive_root {
             // A root is currently relevant: "young" again.
             let mut root = item;
@@ -271,8 +339,14 @@ pub(crate) fn plan_full_gc(
     // only — the content read happens in the IO phase) both get a second
     // chance on hot entities / a high score. A marked dependency is a
     // stronger reason: the root that depends on it is live right now.
-    let marked_set: HashSet<ContextItemId> = marked.iter().copied().collect();
-    reactivate(state, config, now_tick, &mut plan, &marked_set);
+    reactivate(
+        state,
+        config,
+        now_tick,
+        &mut plan,
+        &marked_set,
+        &completed_tasks,
+    );
 
     // ----- Externalize phase: the buffer is bounded -----------------
     // Context GC never purges: overflow writes the item to the context
@@ -288,13 +362,30 @@ pub(crate) fn plan_full_gc(
     // carries only ids + pre-serialized bytes, so a dropped IO phase (a
     // cancelled future, a panicked join) cannot lose items: the next pass
     // retries them through the same list, exactly like a failed write.
+    //
+    // CTX-8: two honest bounds replace the unbounded spill. (1) The retry
+    // list has a hard item cap — when it is full, further overflow is
+    // deferred (the items stay owned in the buffer) and the pass reports
+    // typed backpressure instead of silently growing memory with the
+    // backlog. (2) One pass serializes at most `gc_externalize_batch`
+    // owners (oldest first, fair FIFO), so the per-pass serialization work
+    // and store IO are bounded by the batch, never by the backlog size.
+    let pending_cap = config.max_pending_externalize_items.max(1);
     while state.eviction_buffer.len() > config.gc_buffer_capacity {
+        if state.pending_externalize_retry.len() >= pending_cap {
+            plan.externalize_deferred =
+                (state.eviction_buffer.len() - config.gc_buffer_capacity) as u64;
+            plan.externalize_backpressure = true;
+            break;
+        }
         let item = state.eviction_buffer.remove(0);
         state.pending_externalize_retry.push(item);
     }
+    let batch = config.gc_externalize_batch.max(1);
     plan.externalize = state
         .pending_externalize_retry
         .iter()
+        .take(batch)
         .map(|item| {
             let bytes = serde_json::to_vec(item).expect("context items serialize");
             (item.id, bytes)
@@ -304,6 +395,13 @@ pub(crate) fn plan_full_gc(
     // Cold -> External aging: entries untouched for the configured number
     // of full GC generations become references only.
     plan.aged_external = store::age_external_entries(state, config, gc_epoch);
+
+    // CTX-9: retire closed, fully unreferenced scopes down to the target
+    // size, keeping bounded fact notes (completion facts included). Runs
+    // after the sweep/externalize decisions, so freshly closed chains whose
+    // stamps were released can leave memory in the same pass.
+    plan.scopes_retired =
+        crate::scope::retire_closed_scopes(state, config.scope_retire_target) as u64;
 
     plan.marked_roots = marked.len();
     Some(plan)
@@ -332,6 +430,7 @@ pub(crate) async fn run_store_io(config: &SimpleContextConfig, plan: &mut GcPlan
     let mut io = GcIoResult {
         externalized: Vec::new(),
         recalled: Vec::new(),
+        failures: 0,
     };
 
     // Write overflow items concurrently. Only the pre-serialized bytes
@@ -358,13 +457,18 @@ pub(crate) async fn run_store_io(config: &SimpleContextConfig, plan: &mut GcPlan
             Ok((id, Ok(checksum))) => io.externalized.push((id, checksum)),
             Ok((id, Err(_))) => {
                 // The write failed; the item stays in the retry list and
-                // the next pass retries it. Nothing to recover here.
+                // the next pass retries it. The failure is counted, not
+                // swallowed (CTX-8).
+                io.failures += 1;
                 let _ = id;
             }
             // A task panicked: the remaining writes are abandoned. The
             // items are still owned by the state's retry list, so this is
             // merely a partially completed pass, never a loss.
-            Err(_) => break,
+            Err(_) => {
+                io.failures += 1;
+                break;
+            }
         }
     }
 
@@ -386,8 +490,16 @@ pub(crate) async fn run_store_io(config: &SimpleContextConfig, plan: &mut GcPlan
         });
     }
     while let Some(joined) = reads.join_next().await {
-        if let Ok((_item_id, Ok(item))) = joined {
-            io.recalled.push(item);
+        match joined {
+            // A successful read lands in the results; a failed one leaves
+            // its entry in the map for a later pass — counted, not
+            // swallowed (CTX-8).
+            Ok((_, Ok(item))) => io.recalled.push(item),
+            Ok((_, Err(_))) => io.failures += 1,
+            Err(_) => {
+                io.failures += 1;
+                break;
+            }
         }
     }
     io
@@ -417,6 +529,7 @@ pub(crate) fn commit_full_gc(
     // not move out of the retry list this pass stay there and retry next
     // pass, oldest first.
     let externalized_count = io.externalized.len();
+    let io_failures = io.failures;
     let externalized_ids: Vec<ContextItemId> = io.externalized.iter().map(|(id, _)| *id).collect();
     let mut store_write_bytes = 0u64;
     for (id, checksum) in io.externalized {
@@ -434,13 +547,16 @@ pub(crate) fn commit_full_gc(
         store_write_bytes += item.content.len() as u64;
         let context_ref = store::make_context_ref(&item);
         state.gc_externalized_total += 1;
-        state.external.push(store::to_external_entry(
-            &item,
-            context_ref,
-            now_tick,
-            state.gc_epoch,
-            Some(checksum),
-        ));
+        let mut entry =
+            store::to_external_entry(&item, context_ref, now_tick, state.gc_epoch, Some(checksum));
+        // CTX-9: a body whose task has completed pins no scope chain. The
+        // task's promotion boundary has passed (its close already promoted
+        // the durable outcomes); the completion fact lives in the live
+        // scope or the retirement note, so the entry carries task_id only.
+        if plan.completed_tasks.is_completed(item.task_id) {
+            entry.scope_id = None;
+        }
+        state.external.push(entry);
         crate::ledger::record(
             state,
             item.id,
@@ -453,13 +569,11 @@ pub(crate) fn commit_full_gc(
         );
     }
     // ...and successfully recalled entries leave the map: their content is
-    // resident again, so keeping the reference would duplicate it.
+    // resident again, so keeping the reference would duplicate it. The
+    // removal happens AFTER the merge loop below: the recalled item takes
+    // its current owner metadata from the entry while the entry still owns
+    // the id (CTX-7).
     let recalled_ids: HashSet<ContextItemId> = io.recalled.iter().map(|item| item.id).collect();
-    if !recalled_ids.is_empty() {
-        state
-            .external
-            .retain(|entry| !recalled_ids.contains(&entry.item_id));
-    }
     let store_read_bytes = io
         .recalled
         .iter()
@@ -468,11 +582,16 @@ pub(crate) fn commit_full_gc(
     let store_recalled_items = io.recalled.len() as u64;
 
     // Recalled items re-enter the heap as active residents, exactly like a
-    // warm-buffer reactivation.
+    // warm-buffer reactivation. CTX-7: each recall merges the CURRENT entry
+    // metadata over the blob snapshot (promotion/terminal/access truth),
+    // while the entry still owns the id.
     let mut recalled_reactivations: Vec<ContextReactivation> = Vec::new();
     for mut item in io.recalled {
         let reason = "entities are hot again in the working set (recalled from the context store)"
             .to_string();
+        if let Some(owner) = state.external.get(item.id).cloned() {
+            item = store::reattach_owner_metadata(&owner, item);
+        }
         crate::ledger::record(
             state,
             item.id,
@@ -500,6 +619,12 @@ pub(crate) fn commit_full_gc(
         state.items.push(item);
         state.gc_reactivated_total += 1;
     }
+    // The merge loop above consumed the entries; now the map drops them.
+    if !recalled_ids.is_empty() {
+        state
+            .external
+            .retain(|entry| !recalled_ids.contains(&entry.item_id));
+    }
 
     let mut report = ContextGcReport {
         resident: state.items.len(),
@@ -510,6 +635,11 @@ pub(crate) fn commit_full_gc(
         aged_external: plan.aged_external,
         anchor_roots_protected: plan.anchor_roots_protected,
         anchor_root_protections: collect_residency_protections(state),
+        anchor_root_misses: collect_unsatisfied_residency_claims(state),
+        externalize_deferred: plan.externalize_deferred,
+        externalize_backpressure: plan.externalize_backpressure,
+        store_io_failures: io_failures,
+        scopes_retired: plan.scopes_retired,
         store_write_bytes,
         store_read_bytes,
         store_recalled_items,
@@ -538,6 +668,7 @@ fn mark_roots(
     focus: Option<&FocusState>,
     hot_entities: &[String],
     latest_file_bodies: &HashSet<ContextItemId>,
+    completed_tasks: &crate::scope::CompletionFacts,
 ) -> (Vec<ContextItemId>, usize) {
     let active_task = focus.map(|f| f.task_id);
     // The active focus scope of the current task: the attention container.
@@ -582,12 +713,12 @@ fn mark_roots(
             // the resident heap growing with every completed task. Only an
             // explicit reason (hot entity of a live task, pin, model
             // hint/lease) brings it back into the working set.
-            && !task_completed(state, item.task_id);
+            && !completed_tasks.is_completed(item.task_id);
         // A completed task's records are never roots through the hot set:
         // automatic recall of finished work requires an explicit reason,
         // and the task's own entities may linger in the hot set
         // after completion.
-        let hot = !task_completed(state, item.task_id)
+        let hot = !completed_tasks.is_completed(item.task_id)
             && !hot_entities.is_empty()
             && entities_match_exact(&item.entities, hot_entities);
         // Model/operator-directed protection (`context.gc_hint` /
@@ -689,6 +820,38 @@ fn collect_residency_protections(state: &State) -> Vec<agent_contracts::AnchorRo
         }
     }
     out
+}
+
+/// CTX-5: residency claims of the current projection that hold **no live
+/// body in any location** (heap, warm buffer, externalize-retry list,
+/// external map) are the holding obligations the engine could not satisfy
+/// this pass — reported explicitly instead of silently dropped. Bounded by
+/// the claim cap. A live Stored match counts as held: the body exists and
+/// is protected; its recall continues on a later pass.
+fn collect_unsatisfied_residency_claims(
+    state: &State,
+) -> Vec<agent_contracts::AnchorRootProtection> {
+    state
+        .anchor_roots
+        .iter()
+        .filter(|claim| claim.strength.requires_residency())
+        .filter(|claim| {
+            let held_item = state
+                .items
+                .iter()
+                .chain(state.eviction_buffer.iter())
+                .chain(state.pending_externalize_retry.iter())
+                .any(|item| {
+                    item.semantic.is_live() && crate::engine::anchor_claim_matches_item(claim, item)
+                });
+            let held_entry = state.external.iter().any(|entry| {
+                entry.semantic.is_live() && crate::engine::anchor_claim_matches_entry(claim, entry)
+            });
+            !held_item && !held_entry
+        })
+        .map(|claim| claim.into())
+        .take(agent_contracts::MAX_ANCHOR_ROOT_CLAIMS)
+        .collect()
 }
 
 /// The dependency edges of an item wherever its record lives: the resident
@@ -852,14 +1015,22 @@ fn reactivate(
     now_tick: u64,
     plan: &mut GcPlan,
     marked: &HashSet<ContextItemId>,
+    completed_tasks: &crate::scope::CompletionFacts,
 ) {
     let focus = state.focus.clone();
     let hot_entities = state.hot_entities.clone();
     let mut remaining = config.gc_reactivate_per_pass;
+    // CTX-5: authority-driven reactivations (a current residency-strength
+    // anchor claim holds the item) are requirements, not heuristics — they
+    // must not be starved by the per-pass heuristic budget. Their bound is
+    // the claim cap, not the budget.
+    let mut anchor_reactivated = 0usize;
 
-    // Warm buffer entries (content still in memory).
+    // Warm buffer entries (content still in memory). The loop walks the
+    // whole buffer: heuristic reactivations stop when the budget is spent,
+    // claim-held live items keep coming back up to the claim cap.
     let mut index = state.eviction_buffer.len();
-    while index > 0 && remaining > 0 {
+    while index > 0 {
         index -= 1;
         let item = &state.eviction_buffer[index];
         if item.evicted_at_tick == Some(now_tick) {
@@ -898,6 +1069,9 @@ fn reactivate(
         if !anchor_rooted && aged_ordinary_dialogue(item, config, state.turn, hot_now) {
             continue;
         }
+        // CTX-12 (R3-07): the reason is decided BEFORE any budget is
+        // consumed — an invalid candidate (no reactivation reason) must not
+        // spend the per-pass quota and starve valid candidates behind it.
         let live_root_dep = marked.contains(&item.id);
         let Some(reason) = reactivation_reason(
             item,
@@ -908,7 +1082,7 @@ fn reactivate(
                 current_turn: state.turn,
                 guard: RecallGuard {
                     scope_closed,
-                    completed_task: task_completed(state, item.task_id),
+                    completed_task: completed_tasks.is_completed(item.task_id),
                 },
                 live_root_dep,
                 anchor_rooted,
@@ -917,6 +1091,18 @@ fn reactivate(
         ) else {
             continue;
         };
+        // Budget is spent here, on a reactivation that actually happens.
+        if anchor_rooted {
+            if anchor_reactivated >= agent_contracts::MAX_ANCHOR_ROOT_CLAIMS {
+                continue;
+            }
+            anchor_reactivated += 1;
+        } else {
+            if remaining == 0 {
+                continue;
+            }
+            remaining -= 1;
+        }
         let mut item = state.eviction_buffer.remove(index);
         item.attention = AttentionState::Active;
         item.relevance = item.relevance.max(0.5);
@@ -949,7 +1135,6 @@ fn reactivate(
         state.gc_reactivated_total += 1;
         // The heap push indexes the item at its slot in the same step.
         state.items.push(item);
-        remaining -= 1;
     }
 
     // Cold store entries: content lives in the store; recall is earned by
@@ -963,8 +1148,12 @@ fn reactivate(
     // entity `src/auth/AuthService.rs` — cannot be indexed with exact
     // keys, so a residual scan covers the entries the index did not
     // already propose. Coverage is preserved; the common exact-match case
-    // is fast. Skip the whole pass when no store directory exists yet.
-    if remaining > 0
+    // is fast. CTX-5: claim-driven recalls get their own budget (the claim
+    // cap) so a spent heuristic budget cannot starve a Stored
+    // ResidentRequired/PromptRequired body. Skip the whole pass when no
+    // store directory exists yet.
+    let mut anchor_recall_budget = agent_contracts::MAX_ANCHOR_ROOT_CLAIMS;
+    if (remaining > 0 || anchor_recall_budget > 0)
         && store::store_ready(config)
         && (!hot_entities.is_empty() || !marked.is_empty() || !state.anchor_roots.is_empty())
     {
@@ -972,9 +1161,10 @@ fn reactivate(
         // Anchor root claims first: a Cold entry a ResidentRequired /
         // PromptRequired claim targets must be recalled — task authority
         // says it belongs in the working set, regardless of hot entities.
+        // Budgeted separately from the heuristic recalls (CTX-5).
         if !state.anchor_roots.is_empty() {
             for entry in state.external.iter() {
-                if remaining == 0 {
+                if anchor_recall_budget == 0 {
                     break;
                 }
                 let claimed = state.anchor_roots.iter().any(|claim| {
@@ -989,7 +1179,7 @@ fn reactivate(
                     plan.recall_candidates
                         .push((entry.item_id, entry.blob_checksum.clone()));
                     plan.anchor_roots_protected += 1;
-                    remaining -= 1;
+                    anchor_recall_budget -= 1;
                 }
             }
         }
@@ -1031,7 +1221,7 @@ fn reactivate(
                     };
                     if entry.semantic.is_live()
                         && store::recallable(entry)
-                        && !task_completed(state, entry.task_id)
+                        && !completed_tasks.is_completed(entry.task_id)
                         && entities_match_exact(&entry.entities, &hot_entities)
                     {
                         if skip_raw_evidence_reactivation(
@@ -1060,7 +1250,7 @@ fn reactivate(
                     }
                     if entry.semantic.is_live()
                         && store::recallable(entry)
-                        && !task_completed(state, entry.task_id)
+                        && !completed_tasks.is_completed(entry.task_id)
                         && entities_match_exact(&entry.entities, &hot_entities)
                     {
                         if skip_raw_evidence_reactivation(
@@ -1123,20 +1313,6 @@ fn keep_semantic_body_reactivation(kind: ContextKind, tags: &[Label]) -> bool {
         tag.is_core(CoreLabel::Decision)
             || tag.is_core(CoreLabel::Constraint)
             || tag.is_core(CoreLabel::OpenLoop)
-    })
-}
-
-/// Whether the item's task has completed: its Task scope is closed. A
-/// completed task's records may return to the working set only for an
-/// explicit reason (pin, model hint/lease), never for automatic hot-entity
-/// recall.
-fn task_completed(state: &State, task_id: Option<TaskId>) -> bool {
-    task_id.is_some_and(|tid| {
-        state.scopes.iter().any(|scope| {
-            scope.kind == ScopeKind::Task
-                && scope.task_id == Some(tid)
-                && scope.state == ScopeState::Closed
-        })
     })
 }
 

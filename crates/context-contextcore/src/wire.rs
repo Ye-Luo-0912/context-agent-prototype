@@ -93,6 +93,31 @@ pub enum ServiceOp {
     Restore {
         data: Value,
     },
+    /// EXEC-9 (R3-01): the item ids a stored context checkpoint references
+    /// as external blobs — the strong recovery roots reconcile/Storage GC
+    /// must not delete while the checkpoint is retained and restorable.
+    /// The payload is the engine's own serialized checkpoint state; parsing
+    /// is the engine's real, versioned implementation behind this op, so a
+    /// service answers exactly like the in-process engine.
+    CheckpointRecoveryItemIds {
+        checkpoint: Value,
+    },
+    /// EXEC-9 (R3-01): conservative Storage GC under the shared
+    /// retained-root invariant — `roots` are the item ids retained
+    /// checkpoints still reference and must never be deleted;
+    /// `roots_complete == false` defers every deletion (an incomplete root
+    /// set cannot prove "nothing retained").
+    StorageGcProtecting {
+        roots: Vec<ContextItemId>,
+        roots_complete: bool,
+    },
+    /// EXEC-9 (R3-01): startup reconcile under the same retained-root
+    /// invariant — the stale-duplicate deletion branch defers while the
+    /// roots are incomplete or still referenced.
+    ReconcileStoreProtecting {
+        roots: Vec<ContextItemId>,
+        roots_complete: bool,
+    },
     /// Graceful stop: the service replies and exits 0.
     Shutdown,
 }

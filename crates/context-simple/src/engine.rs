@@ -5,7 +5,8 @@ use agent_contracts::{
     ContextMaintenanceReport, ContextMaintenanceTrigger, ContextQuery, ContextRetention,
     ContextScope, ContextSearchObservation, ContextStateTransition, CoreLabel, FocusState,
     FsRereadClass, Label, MAX_RESOURCE_TOUCHES, MaterializedContext, ScopeId, ScopeKind,
-    ScopeState, StoreReconcileReport, bound_compaction_output, normalize_resource_path,
+    ScopeState, StoreReconcileReport, UsageIdentity, bound_compaction_output,
+    normalize_resource_path,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -69,6 +70,21 @@ pub(crate) fn anchor_claim_matches_entry(
     entry: &agent_contracts::ExternalizedContext,
 ) -> bool {
     anchor_ref_matches(&claim.item_ref, entry.item_id, &entry.entities)
+}
+
+/// CTX-5（R2-03）：唯一的 live 保护判定——当前投影里一条
+/// ResidentRequired/PromptRequired 声明命中的 *live* 条目，被一切启发式
+/// 终结路径（驻留 TTL/ttl×4、warm 老化、full sweep 的普通对话老化）豁免，
+/// Resident/Warm/Stored 四个正文位置一致。`state.anchor_roots` 是运行时
+/// 在每次 GC/materialize 前整集替换的当前投影（释放＝空投影），所以旧/空
+/// 投影不会冒充当前根；anchor_revision 随声明保留在报告里。调用方只在
+/// semantic liveness 之后评估本判定，Superseded/VerifiedFixed/Tombstoned
+/// 保持终态——保护绝不复活。StorageRequired 只保护储存，从不延长驻留。
+pub(crate) fn anchor_claim_defers_expiry(state: &State, item: &ContextItem) -> bool {
+    item.semantic.is_live()
+        && state.anchor_roots.iter().any(|claim| {
+            claim.strength.requires_residency() && anchor_claim_matches_item(claim, item)
+        })
 }
 
 #[derive(Debug, Clone)]
@@ -172,6 +188,31 @@ pub struct SimpleContextConfig {
     /// reachable). Decision / Constraint / Error / OpenLoop still
     /// auto-reactivate bodies. Default false (current policy).
     pub descriptor_only_tool_observation_reactivation: bool,
+    /// CTX-8 (R2-06): hard cap on the externalize-retry list. When the list
+    /// holds this many owners, a pass defers further buffer overflow (the
+    /// items stay owned in the buffer) and reports
+    /// `externalize_backpressure` — the runtime consumes that flag to stop
+    /// feeding new input instead of letting memory grow without bound.
+    /// Default 4096.
+    pub max_pending_externalize_items: usize,
+    /// CTX-8: how many retry-list owners one full GC pass serializes and
+    /// attempts to write (oldest first). Bounds the per-pass serialization
+    /// bytes and store IO independent of the backlog size; the rest stay
+    /// owned and retry on later passes. Default 64.
+    pub gc_externalize_batch: usize,
+    /// CTX-9 (R2-07): full GC retires closed, fully unreferenced scope
+    /// nodes down to this target size, keeping a bounded fact note per
+    /// retirement (completion facts survive via `task_completed`). The
+    /// tree, memory use and checkpoint size stop growing with the number
+    /// of finished tool frames and tasks. Default 1024.
+    pub scope_retire_target: usize,
+    /// CTX-9 残余：checkpoint 外置尾分片的内联目标——最旧的超额
+    /// External 条目卡片进 store，checkpoint 只携带内联段＋寻址清单。
+    /// 默认远超正常工作集（冻结策略未动，opt-in 收紧）。
+    pub external_checkpoint_inline_target: usize,
+    /// 单次 capture 的卡片写入预算（读校验不计入）：预算耗尽时剩余条目
+    /// 本次保持内联（checkpoint 如实变大），下次 capture 继续收敛。
+    pub external_checkpoint_card_batch: usize,
 }
 
 impl Default for SimpleContextConfig {
@@ -210,6 +251,11 @@ impl Default for SimpleContextConfig {
             recent_file_bodies: crate::index::entity::MAX_RECENT_FILE_BODIES,
             recent_file_body_lease_turns: 0,
             descriptor_only_tool_observation_reactivation: false,
+            max_pending_externalize_items: 4096,
+            gc_externalize_batch: 64,
+            scope_retire_target: 1024,
+            external_checkpoint_inline_target: 2048,
+            external_checkpoint_card_batch: 64,
         }
     }
 }
@@ -235,7 +281,7 @@ impl SimpleContextConfig {
 /// through `pub(crate)` access.
 #[derive(Debug, Default)]
 pub(crate) struct PendingMaterialization {
-    id: u64,
+    pub(crate) id: u64,
     item_ids: std::collections::HashSet<ContextItemId>,
     external_item_ids: std::collections::HashSet<ContextItemId>,
     pub(crate) foreground_item_ids: std::collections::HashSet<ContextItemId>,
@@ -284,6 +330,23 @@ pub(crate) struct State {
     /// (item_id, by_id, reason) queued by ingest for verified-fixed errors.
     #[serde(default)]
     pub(crate) pending_verifications: Vec<(ContextItemId, ContextItemId, String)>,
+    /// CTX-9 残余：最近一次 restore 中缺失/损坏的外置元数据卡片数。
+    /// 非零＝恢复的 external 集合不完整（旧 checkpoint 的卡片已被
+    /// Storage GC 清理），消费端不得把它读成完整状态。
+    #[serde(default)]
+    pub(crate) external_cards_missing: u64,
+    /// CTX-9: bounded fact notes for retired (fully unreferenced, closed)
+    /// scopes. The nodes leave the tree and every checkpoint; the facts
+    /// (id/kind/task/completion) stay addressable for `task_completed` and
+    /// audit within the explicit retention ring.
+    #[serde(default)]
+    pub(crate) retired_scopes: Vec<crate::scope::RetiredScopeNote>,
+    /// CTX-10 (R3-04): set once the bounded retirement ring has dropped a
+    /// fact. From then on the ring is a *recent window*, not a complete
+    /// record: a task with no live scope and no note is unknown, and the
+    /// GC treats unknown as conservatively completed.
+    #[serde(default)]
+    pub(crate) retirement_ring_overflowed: bool,
     /// Lifecycle transitions already applied by ingest (focus episode
     /// rotation). They are surfaced by the next maintenance report so the
     /// rotation is observable as bounded runtime events.
@@ -764,9 +827,31 @@ impl SimpleContextEngine {
                 }
                 output
             }
-            Err(_) => CompactionOutput {
-                text: fallback,
-                ..CompactionOutput::default()
+            // COST-7 (R2-11): the call failed, but evidence the provider
+            // already reported (an empty-summary error carries the billed
+            // call's usage) stays in the account under its honest identity
+            // — a partially-reported call degrades to Unknown with the
+            // known values as the lower bound, never a fabricated 0/0.
+            Err(error) => match error.reported_usage() {
+                Some(usage) => CompactionOutput {
+                    text: fallback,
+                    input_tokens: usage.input_tokens.unwrap_or(0),
+                    output_tokens: usage.output_tokens.unwrap_or(0),
+                    usage_identity: usage.usage_identity(),
+                    cached_input_tokens: usage.cached_input_tokens,
+                    cache_write_input_tokens: usage.cache_write_input_tokens,
+                    cache_miss_input_tokens: usage.cache_miss_input_tokens,
+                    attempts: usage.attempts,
+                    retries: usage.retries,
+                },
+                None => CompactionOutput {
+                    text: fallback,
+                    // No typed evidence at all: whether the provider
+                    // processed (and billed) work before failing is
+                    // unknowable.
+                    usage_identity: UsageIdentity::Unknown,
+                    ..CompactionOutput::default()
+                },
             },
         }
     }
@@ -1329,24 +1414,47 @@ impl ContextEngine for SimpleContextEngine {
 
         if let Some(job) = distill {
             let output = self.run_distill(&job).await;
+            // E04/CTX-3: the card states its own coverage — sources the
+            // budget left out stay visible as an omission, not a silent
+            // shrink.
+            let text = if job.excluded_sources > 0 {
+                format!(
+                    "[episode covers {} of {} sources; earlier sources stay retrievable]
+{}",
+                    job.source_ids.len(),
+                    job.source_ids.len() + job.excluded_sources,
+                    output.text
+                )
+            } else {
+                output.text
+            };
             let mut state = self.state.lock().await;
             insert_derived_summary(
                 &mut state,
                 &self.config,
                 job.task_id,
                 job.summary_scope_id,
-                output.text,
+                text,
                 &job.source_ids,
                 job.source_label,
             );
-            if output.input_tokens > 0 || output.output_tokens > 0 {
-                state.pending_compactions.push(ContextCompaction {
-                    reason: job.reason,
-                    input_tokens: output.input_tokens,
-                    output_tokens: output.output_tokens,
-                    source_items: job.source_ids.len(),
-                });
-            }
+            // COST-7 (R2-11): every compaction call is accounted, whatever
+            // its counters — the old "non-zero tokens only" gate made a
+            // failed call's Unknown 0/0 row vanish, so a billed-but-failed
+            // distill disappeared from the ledger entirely. The identity
+            // tells consumers whether zero is a fact or a missing report.
+            state.pending_compactions.push(ContextCompaction {
+                reason: job.reason,
+                input_tokens: output.input_tokens,
+                output_tokens: output.output_tokens,
+                source_items: job.source_ids.len(),
+                usage_identity: output.usage_identity,
+                cached_input_tokens: output.cached_input_tokens,
+                cache_write_input_tokens: output.cache_write_input_tokens,
+                cache_miss_input_tokens: output.cache_miss_input_tokens,
+                attempts: output.attempts,
+                retries: output.retries,
+            });
             state.compaction_input_tokens = state
                 .compaction_input_tokens
                 .saturating_add(output.input_tokens);
@@ -1498,8 +1606,11 @@ impl ContextEngine for SimpleContextEngine {
     /// if a newer snapshot made the id resident (R03). The runtime unions
     /// these across all retained checkpoints after a restore and passes the
     /// result to `reconcile_store_protecting`.
-    fn checkpoint_recovery_item_ids(&self, checkpoint: &Value) -> Vec<ContextItemId> {
-        crate::checkpoint::recovery_item_ids(checkpoint)
+    async fn checkpoint_recovery_item_ids(
+        &self,
+        checkpoint: &Value,
+    ) -> AgentResult<Vec<ContextItemId>> {
+        Ok(crate::checkpoint::recovery_item_ids(checkpoint))
     }
 
     async fn materialize(&self, query: ContextQuery) -> AgentResult<MaterializedContext> {
@@ -1780,7 +1891,8 @@ impl ContextEngine for SimpleContextEngine {
             return Ok(Vec::new());
         }
         let state = self.state.lock().await;
-        let summaries = crate::heap::bounded_catalog(
+        let current_turn = state.turn;
+        let mut summaries = crate::heap::bounded_catalog(
             limit,
             state
                 .items
@@ -1795,6 +1907,13 @@ impl ContextEngine for SimpleContextEngine {
                 )
                 .chain(state.external.iter().map(external_summary)),
         );
+        // PLATFORM-2: "actually sent" freshness — the body went into the
+        // most recent materialized surface of the *current* turn. Turn 0 is
+        // the pre-turn baseline, so nothing qualifies there.
+        for summary in &mut summaries {
+            summary.selected_current_turn =
+                current_turn > 0 && summary.last_selected_turn == current_turn;
+        }
         Ok(summaries)
     }
 
@@ -1938,13 +2057,18 @@ impl ContextEngine for SimpleContextEngine {
             }
         };
         let mut state = self.state.lock().await;
-        let still_retrievable = state
+        // CTX-7: the current entry owns the metadata — merge it over the
+        // blob's snapshot so a promoted (or terminal) entry is never
+        // overwritten by the stale metadata frozen in the blob.
+        let owner = state
             .external
             .get(item_id)
-            .is_some_and(crate::store::externally_retrievable);
-        if !still_retrievable {
+            .filter(|entry| crate::store::externally_retrievable(entry))
+            .cloned();
+        let Some(owner) = owner else {
             return Ok(None);
-        }
+        };
+        let item = crate::store::reattach_owner_metadata(&owner, item);
         crate::access::stamp_read(&mut state, item_id, agent_contracts::AccessSignal::Fetch);
         Ok(Some(item))
     }
@@ -1954,7 +2078,73 @@ impl ContextEngine for SimpleContextEngine {
         // captures a state torn across a GC/storage-GC commit boundary.
         let _gate = self.op_gate.lock().await;
         let state = self.state.lock().await;
-        checkpoint::serialize(&state)
+        // CTX-9 残余：外置尾分片——最旧的超额 External 条目把元数据卡片
+        // 写进既有 store（内容寻址、幂等：未变化的条目命中同一文件，零
+        // 重写），checkpoint 只携带内联段＋`external_spilled` 寻址清单。
+        // 写入预算限制单次 capture 的 IO；预算耗尽时剩余条目本次保持
+        // 内联（checkpoint 如实变大），下次 capture 继续收敛。搜索/召回/
+        // 目录语义不变：条目仍全部驻留内存，分片只压缩 checkpoint 字节。
+        let inline_target = self.config.external_checkpoint_inline_target;
+        let over: Vec<&agent_contracts::ExternalizedContext> =
+            if state.external.len() <= inline_target {
+                Vec::new()
+            } else {
+                // 最旧优先（槽位序即外置序）；仅 External 驻留——Cold 仍在
+                // 老化通道上活跃访问计数，Pinned/keep_alive 永不离开内存。
+                state
+                    .external
+                    .iter()
+                    .filter(|entry| {
+                        entry.residency == agent_contracts::ContextResidency::External
+                            && entry.retention != agent_contracts::ContextRetention::Pinned
+                            && !entry.keep_alive
+                    })
+                    .take(state.external.len().saturating_sub(inline_target))
+                    .collect()
+            };
+        let dir = crate::store::store_dir(&self.config);
+        let mut spilled: Vec<(ContextItemId, String)> = Vec::new();
+        let mut budget = self.config.external_checkpoint_card_batch;
+        for entry in &over {
+            let card = crate::store::external_card_bytes(entry);
+            let hash = crate::store::checksum_hex(&card)[..12].to_string();
+            let path = crate::store::external_card_path(&dir, entry.item_id, &hash);
+            // 内容寻址幂等：文件已存在即卡片已是最早 capture 的同一字节，
+            // 无需重写，也不消耗预算。
+            if tokio::fs::try_exists(&path).await.unwrap_or(false) {
+                spilled.push((entry.item_id, hash));
+                continue;
+            }
+            if budget == 0 {
+                break;
+            }
+            budget -= 1;
+            match crate::store::write_external_card_async(&dir, &path, &card).await {
+                Ok(()) => spilled.push((entry.item_id, hash)),
+                // Store IO 失败：该条目本次保持内联（宁可 checkpoint 大，
+                // 不可丢恢复状态）；与外部化失败同一诚实语义。
+                Err(_) => continue,
+            }
+        }
+        let mut value = checkpoint::serialize(&state)?;
+        if !spilled.is_empty() {
+            let spilled_ids: std::collections::HashSet<ContextItemId> =
+                spilled.iter().map(|(id, _)| *id).collect();
+            let inline: Vec<&agent_contracts::ExternalizedContext> = state
+                .external
+                .iter()
+                .filter(|entry| !spilled_ids.contains(&entry.item_id))
+                .collect();
+            value["external"] = serde_json::to_value(&inline)
+                .map_err(|e| AgentError::Context(format!("checkpoint spill serialize: {e}")))?;
+            let spilled_json: Vec<serde_json::Value> = spilled
+                .iter()
+                .map(|(id, hash)| serde_json::json!({ "id": id.to_string(), "hash": hash }))
+                .collect();
+            value["external_spilled"] = serde_json::to_value(&spilled_json)
+                .map_err(|e| AgentError::Context(format!("checkpoint spill ids: {e}")))?;
+        }
+        Ok(value)
     }
 
     async fn restore(&self, data: Value) -> AgentResult<()> {
@@ -1966,8 +2156,45 @@ impl ContextEngine for SimpleContextEngine {
         // Deserialize and structurally validate the replacement before it
         // becomes live: a corrupt or hostile checkpoint must not clobber the
         // running state. Only a valid snapshot is committed into the lock.
+        let spilled = checkpoint::spilled_entries_from_value(&data);
         let mut next = checkpoint::deserialize(data)?;
         checkpoint::validate(&next)?;
+        // CTX-9 残余：外置尾重水化——分片 checkpoint 只携带内联段，卡片
+        // 由这里从既有 store 读回。op_gate 已把整个 restore 与 GC/其他
+        // restore 串行化：放掉 state 锁做卡片 IO 不会交错任何结构变更。
+        // 卡片缺失/损坏（典型：已过保留窗的旧 checkpoint，其条目随后被
+        // Storage GC 删除）→ 该条目缺席＋计数如实上报，恢复整体不失败
+        // ——与旧 checkpoint 的 blob 缺失同一诚实降级，绝不伪造完整。
+        let mut missing_cards: u64 = 0;
+        let mut rehydrated: Vec<agent_contracts::ExternalizedContext> = Vec::new();
+        if !spilled.is_empty() {
+            let mut owned: std::collections::HashSet<ContextItemId> =
+                next.external.iter().map(|entry| entry.item_id).collect();
+            for item in next.items.iter() {
+                owned.insert(item.id);
+            }
+            for (id, _hash) in &spilled {
+                if owned.contains(id) {
+                    // 分片清单声称的 id 已被内联段（external 或 heap）持有：
+                    // 结构性矛盾，fail-closed（敌意/损坏 checkpoint，不是
+                    // 旧格式）——重水化会造成同一 id 双 owner。
+                    return Err(AgentError::Context(format!(
+                        "checkpoint external entry {id} is both spilled and already owned"
+                    )));
+                }
+            }
+            drop(state);
+            let dir = crate::store::store_dir(&self.config);
+            for (id, hash) in &spilled {
+                let path = crate::store::external_card_path(&dir, *id, hash);
+                match crate::store::read_external_card_async(&path, *id).await {
+                    Ok(Some(entry)) => rehydrated.push(entry),
+                    // 缺失（Ok(None)）与损坏（Err）同一诚实计数。
+                    _ => missing_cards += 1,
+                }
+            }
+            state = self.state.lock().await;
+        }
         // The revision is a process-lifetime nonce, not rollbackable task
         // state. Keeping the larger live value prevents restore from reusing
         // a preview id and accepting a delayed pre-restore acknowledgement
@@ -1975,6 +2202,15 @@ impl ContextEngine for SimpleContextEngine {
         next.materialization_revision = next
             .materialization_revision
             .max(state.materialization_revision);
+        // 重水化的条目按外置序并入 external map（卡片捕获时即外置序），
+        // ExternalMap::replace_all 的重建会重建全部索引。
+        if !rehydrated.is_empty() || missing_cards > 0 {
+            let mut entries: Vec<agent_contracts::ExternalizedContext> = next.external.take_all();
+            entries.extend(rehydrated);
+            entries.sort_by_key(|entry| entry.externalized_at_tick);
+            next.external.replace_all(entries);
+            next.external_cards_missing = next.external_cards_missing.saturating_add(missing_cards);
+        }
         *state = next;
         state.sync_catalog();
         crate::reactivation::clear_segment(&mut state);
@@ -2149,11 +2385,13 @@ fn apply_directive(
             keep_alive: true, ..
         } => {
             // Quotas are global across body locations: a keep_alive item in
-            // the warm buffer still consumes the cap.
+            // the warm buffer still consumes the cap — and so does one in
+            // the externalize-retry list (CTX-6: it owns a full body).
             let kept = state
                 .items
                 .iter()
                 .chain(&state.eviction_buffer)
+                .chain(&state.pending_externalize_retry)
                 .filter(|item| item.keep_alive)
                 .count();
             (kept >= config.max_keep_alive_items).then(|| {
@@ -2164,6 +2402,9 @@ fn apply_directive(
             })
         }
         ContextAction::Lease { .. } => {
+            // CTX-6: a lease target must resolve wherever its body lives,
+            // including the externalize-retry list — otherwise the directive
+            // silently no-ops on a body the state owns.
             let target = state
                 .items
                 .iter()
@@ -2171,6 +2412,12 @@ fn apply_directive(
                 .or_else(|| {
                     state
                         .eviction_buffer
+                        .iter()
+                        .find(|item| item.id == target_id)
+                })
+                .or_else(|| {
+                    state
+                        .pending_externalize_retry
                         .iter()
                         .find(|item| item.id == target_id)
                 });
@@ -2189,11 +2436,12 @@ fn apply_directive(
                         .is_some_and(|until| until >= state.turn);
                     // Leased-item accounting is global across body locations:
                     // a leased item in the warm buffer still counts against
-                    // the task cap.
+                    // the task cap, and so does one in the retry list.
                     let (leased, leased_tokens) = state
                         .items
                         .iter()
                         .chain(&state.eviction_buffer)
+                        .chain(&state.pending_externalize_retry)
                         .filter(|other| {
                             other
                                 .lease_until_turn
@@ -2240,10 +2488,14 @@ fn apply_directive(
 
     let mut tagged = false;
     {
+        // CTX-6: in-place directives (gc_hint/tag/lease) reach a body in the
+        // externalize-retry list too — a control action must actually
+        // execute against every in-memory owner, never silently no-op.
         let mut target = state
             .items
             .iter_mut()
             .chain(state.eviction_buffer.iter_mut())
+            .chain(state.pending_externalize_retry.iter_mut())
             .find(|item| item.id == target_id);
         if let Some(item) = target.as_mut() {
             match action {

@@ -835,8 +835,15 @@ fn selection_reason(
 }
 
 fn price_as_file_body_descriptor(item: &ContextItem, hints: &ContextHints) -> bool {
+    // CTX-1/E01: the interval-aware rule is the ONLY descriptor-pricing
+    // rule. The request must carry a bounded, complete fs.read window of
+    // the same revision whose union contains the record's own range; an
+    // identity match alone (same path@revision) cannot prove the model
+    // already sees this record's interval, so with no trustworthy window
+    // nothing is priced as visible — unknown stays unknown and the body
+    // keeps its real size (duplication beats loss).
     if item.kind == agent_contracts::ContextKind::Error
-        || (hints.visible_body_windows.is_empty() && hints.visible_body_identities.is_empty())
+        || hints.visible_body_windows.is_empty()
         || !is_file_body_observation(item)
     {
         return false;
@@ -844,25 +851,12 @@ fn price_as_file_body_descriptor(item: &ContextItem, hints: &ContextHints) -> bo
     let Some(path) = observation_file_path(item) else {
         return false;
     };
-    // Interval-aware rule first: the request already carries bounded
-    // fs.read windows, so a historical record is covered only when its own
-    // range is contained in the union of the visible windows of the same
-    // revision (R09). An unknown historical range needs a covers_file window.
-    if !hints.visible_body_windows.is_empty() {
-        return agent_contracts::visible_body_windows_cover(
-            &hints.visible_body_windows,
-            path,
-            item.file_revision.as_deref(),
-            item.file_start_line,
-            item.file_end_line,
-        );
-    }
-    // Legacy identity-level rule (no interval information in the request):
-    // exact path@revision match only.
-    agent_contracts::visible_body_identities_cover(
-        &hints.visible_body_identities,
+    agent_contracts::visible_body_windows_cover(
+        &hints.visible_body_windows,
         path,
         item.file_revision.as_deref(),
+        item.file_start_line,
+        item.file_end_line,
     )
 }
 
@@ -899,6 +893,10 @@ pub(crate) enum ForegroundPlanItem {
         item_id: ContextItemId,
         checksum: Option<String>,
         identity: ContextMaterializationIdentity,
+        /// CTX-11 (R3-06): the entry's owner metadata snapshot captured at
+        /// plan time; the checksum-verified blob read merges it over the
+        /// frozen blob metadata, exactly like required/fetch/admit/recall.
+        owner: Box<agent_contracts::ExternalizedContext>,
     },
 }
 
@@ -945,11 +943,25 @@ pub(crate) fn plan_foreground(
             });
             continue;
         }
+        // CTX-11 (R3-05): the externalize-retry list owns full in-memory
+        // bodies while the store is down — a current file the model must
+        // edit is projected from there too, not reported Missing while
+        // `fetch` would happily serve it.
+        if let Some(item) =
+            best_live_file_body(state.pending_externalize_retry.iter(), &path, revision)
+        {
+            plan.push(ForegroundPlanItem::Ready {
+                item: Box::new(item.clone()),
+                identity,
+            });
+            continue;
+        }
         if let Some(entry) = best_stored_file_body(state, &path, revision) {
             plan.push(ForegroundPlanItem::Store {
                 item_id: entry.item_id,
                 checksum: entry.blob_checksum.clone(),
                 identity,
+                owner: Box::new(entry.clone()),
             });
         } else {
             misses.push(context_miss(
@@ -989,8 +1001,12 @@ pub(crate) async fn realize_foreground(
                 item_id,
                 checksum,
                 identity,
+                owner,
             } => match store::read_item_checked_async(dir, item_id, checksum.as_deref()).await {
-                Ok(item) => (item, identity),
+                // CTX-11 (R3-06): current owner metadata wins over the
+                // blob's frozen snapshot (promotion/retention truth), the
+                // blob stays authoritative for content and creation identity.
+                Ok(item) => (store::reattach_owner_metadata(&owner, item), identity),
                 Err(failure) => {
                     misses.push(context_miss(identity, store_miss_reason(failure)));
                     continue;
@@ -1145,6 +1161,13 @@ enum RequiredPlanSource {
     Store {
         item_id: ContextItemId,
         checksum: Option<String>,
+        /// CTX-7: the entry's owner metadata snapshot captured under the
+        /// state lock at plan time. The blob read is checksum-verified
+        /// against this same owner, and the read-back merges this snapshot
+        /// over the blob's frozen metadata (promotion/terminal/access
+        /// truth) — the required path serves current ownership, never the
+        /// stale externalization-time snapshot.
+        owner: Box<agent_contracts::ExternalizedContext>,
     },
 }
 
@@ -1193,10 +1216,13 @@ pub(crate) fn plan_required(state: &State, query: &ContextQuery) -> RequiredPlan
     let mut seen = HashSet::new();
 
     // Pinned retention keeps its existing priority ahead of anchor roots.
+    // CTX-6: the retry list owns full in-memory bodies while the store is
+    // down, so a pinned body there is served like a warm one.
     for item in state
         .items
         .iter()
         .chain(state.eviction_buffer.iter())
+        .chain(state.pending_externalize_retry.iter())
         .filter(|item| item.retention == ContextRetention::Pinned)
     {
         let identity = pinned_identity(item.id);
@@ -1246,7 +1272,15 @@ pub(crate) fn plan_required(state: &State, query: &ContextQuery) -> RequiredPlan
                     &mut items,
                     &mut misses,
                 );
-            } else if let Some(item) = state.eviction_buffer.iter().find(|item| item.id == id) {
+            } else if let Some(item) = state
+                .eviction_buffer
+                .iter()
+                // CTX-6: the same required body must not read as searchable
+                // (search covers the retry list) yet Missing to the required
+                // planner.
+                .chain(state.pending_externalize_retry.iter())
+                .find(|item| item.id == id)
+            {
                 matched = true;
                 bounded_out = !plan_memory_required(
                     state,
@@ -1294,6 +1328,7 @@ pub(crate) fn plan_required(state: &State, query: &ContextQuery) -> RequiredPlan
         for item in state
             .eviction_buffer
             .iter()
+            .chain(state.pending_externalize_retry.iter())
             .filter(|item| crate::engine::anchor_claim_matches_item(claim, item))
         {
             if bounded_out {
@@ -1425,6 +1460,7 @@ fn plan_store_required(
         source: RequiredPlanSource::Store {
             item_id: entry.item_id,
             checksum: entry.blob_checksum.clone(),
+            owner: Box::new(entry.clone()),
         },
     });
     true
@@ -1463,6 +1499,15 @@ fn claim_identity(
     )
 }
 
+/// One `realize_required` slot: the plan identity, the read outcome (or
+/// `None` until its store read lands), and the plan-time owner metadata
+/// snapshot a store read merges over the blob (CTX-7).
+type RealizeSlot = (
+    ContextMaterializationIdentity,
+    Option<Result<ContextItem, store::StoreReadFailure>>,
+    Option<Box<agent_contracts::ExternalizedContext>>,
+);
+
 /// Execute required store reads outside the state lock with the same bounded
 /// concurrency as GC. Result order is restored by plan ordinal so events and
 /// packing stay deterministic even when disk completion order differs.
@@ -1470,18 +1515,19 @@ pub(crate) async fn realize_required(
     plan: RequiredPlan,
     dir: &Path,
 ) -> (Vec<RequiredBody>, ContextMaterializationMisses) {
-    let mut slots: Vec<(
-        ContextMaterializationIdentity,
-        Option<Result<ContextItem, store::StoreReadFailure>>,
-    )> = Vec::with_capacity(plan.items.len());
+    let mut slots: Vec<RealizeSlot> = Vec::with_capacity(plan.items.len());
     let mut jobs = std::collections::VecDeque::new();
     for (ordinal, item) in plan.items.into_iter().enumerate() {
         match item.source {
             RequiredPlanSource::Ready(body) => {
-                slots.push((item.identity, Some(Ok(*body))));
+                slots.push((item.identity, Some(Ok(*body)), None));
             }
-            RequiredPlanSource::Store { item_id, checksum } => {
-                slots.push((item.identity, None));
+            RequiredPlanSource::Store {
+                item_id,
+                checksum,
+                owner,
+            } => {
+                slots.push((item.identity, None, Some(owner)));
                 jobs.push_back((ordinal, item_id, checksum));
             }
         }
@@ -1509,15 +1555,26 @@ pub(crate) async fn realize_required(
 
     let mut bodies = Vec::new();
     let mut misses = plan.misses;
-    for (identity, result) in slots {
+    for (identity, result, owner) in slots {
         match result {
-            Some(Ok(item)) if item.semantic.is_live() && !is_excluded(&item) => {
-                bodies.push(RequiredBody { item, identity });
+            Some(Ok(mut item)) => {
+                // CTX-7: the blob supplies the body; the plan-time owner
+                // snapshot supplies the current metadata. Terminal/policy
+                // exclusion is then judged on the merged item, so a stale
+                // live-looking blob can never resurrect a dead owner and a
+                // promoted entry keeps its promotion in the frame.
+                if let Some(owner) = owner {
+                    item = store::reattach_owner_metadata(&owner, item);
+                }
+                if item.semantic.is_live() && !is_excluded(&item) {
+                    bodies.push(RequiredBody { item, identity });
+                } else {
+                    misses.push(context_miss(
+                        identity,
+                        ContextMaterializationMissReason::PolicyExcluded,
+                    ));
+                }
             }
-            Some(Ok(_)) => misses.push(context_miss(
-                identity,
-                ContextMaterializationMissReason::PolicyExcluded,
-            )),
             Some(Err(failure)) => misses.push(context_miss(identity, store_miss_reason(failure))),
             None => misses.push(context_miss(
                 identity,

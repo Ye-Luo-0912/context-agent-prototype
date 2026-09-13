@@ -8,7 +8,7 @@
 
 use agent_contracts::{
     AttentionState, ContextDiagnostics, ContextIngress, ContextItemId, ContextItemSummary,
-    ContextKind, ContextRetention, ContextScope, MaterializedItem, SemanticState,
+    ContextKind, ContextResidency, ContextRetention, ContextScope, MaterializedItem, SemanticState,
 };
 
 /// Token estimator shared by the baseline engines. Must match the convention
@@ -58,6 +58,11 @@ impl Record {
             keep_alive: false,
             lease_until_turn: None,
             source: self.source.clone(),
+            // Baseline engines keep every record in memory: resident by
+            // construction, and no materialized-surface tracking to speak
+            // of — never claim "actually sent".
+            residency: ContextResidency::Resident,
+            selected_current_turn: false,
         }
     }
 }
@@ -246,4 +251,41 @@ pub(crate) fn active_diagnostics(
         resident_bytes,
         ..ContextDiagnostics::default()
     }
+}
+
+/// Required-claim misses for a baseline engine (F03).
+///
+/// Baselines A and B keep a flat transcript; they do not implement
+/// anchor-root resolution or mandatory-body projection. Reporting an *empty*
+/// miss set would claim "every required body is satisfied", which is false
+/// — the runtime consumes only this miss set and would then treat an
+/// unfulfilled obligation as met. Instead every `PromptRequired` claim is
+/// reported as `Missing`, so the unmet obligation is visible to the caller
+/// even though this engine cannot do anything about it.
+///
+/// This is deliberately a truthful "unsupported" signal, not a silent
+/// success and not an implementation of mandatory-claim resolution.
+pub(crate) fn required_claim_misses(
+    hints: &agent_contracts::ContextHints,
+) -> agent_contracts::ContextMaterializationMisses {
+    use agent_contracts::{
+        AnchorRootStrength, ContextMaterializationIdentity, ContextMaterializationMiss,
+        ContextMaterializationMissReason, ContextMaterializationMisses,
+    };
+    let mut misses = ContextMaterializationMisses::default();
+    for claim in &hints.anchor_roots {
+        if claim.strength != AnchorRootStrength::PromptRequired {
+            continue;
+        }
+        misses.push(ContextMaterializationMiss {
+            identity: ContextMaterializationIdentity::new(
+                claim.item_ref.clone(),
+                None,
+                claim.source_field_id.clone(),
+                claim.anchor_revision,
+            ),
+            reason: ContextMaterializationMissReason::Missing,
+        });
+    }
+    misses
 }

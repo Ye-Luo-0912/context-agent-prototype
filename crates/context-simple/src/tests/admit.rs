@@ -1924,9 +1924,17 @@ async fn external_durable_outcome_is_promoted_on_scope_close() {
             Some(task_scope_id),
             "a legacy entry without a scope stamp must promote by task id"
         );
+        // CTX-9: the working body is not a durable outcome, so it is not
+        // promoted (retention stays Working) — and its stale chain stamp is
+        // released: the closed focus scope pins nothing anymore.
+        let working = state.external.get(working_id).unwrap();
         assert_eq!(
-            state.external.get(working_id).unwrap().scope_id,
-            Some(focus_scope_id),
+            working.scope_id, None,
+            "a non-promotable member of the closed scope releases its chain stamp"
+        );
+        assert_eq!(
+            working.retention,
+            ContextRetention::Working,
             "a working body is not a durable outcome and must not be promoted"
         );
         assert_eq!(
@@ -1962,10 +1970,12 @@ async fn external_durable_outcome_is_promoted_on_scope_close() {
         assert_eq!(durable.scope, ContextScope::Session);
         let legacy = state.external.get(legacy_id).unwrap();
         assert_eq!(legacy.scope_id, Some(session_id));
+        // CTX-9: the task close releases the working body's stale stamp
+        // too — after the task's promotion boundary it pins nothing.
         assert_eq!(
             state.external.get(working_id).unwrap().scope_id,
-            Some(focus_scope_id),
-            "the working body must still point at the closed focus"
+            None,
+            "the working body keeps no chain stamp after the task close"
         );
         assert_eq!(state.external.get(other_id).unwrap().scope_id, None);
     }
@@ -2255,6 +2265,12 @@ impl BoundedCompactor for TaskDistillCompactor {
         request: CompactionRequest,
     ) -> agent_contracts::AgentResult<CompactionOutput> {
         Ok(CompactionOutput {
+            usage_identity: agent_contracts::UsageIdentity::Observed,
+            cached_input_tokens: None,
+            cache_write_input_tokens: None,
+            cache_miss_input_tokens: None,
+            attempts: 0,
+            retries: 0,
             text: format!("[distilled] {}", request.source),
             input_tokens: 5,
             output_tokens: 3,
@@ -2464,9 +2480,11 @@ async fn episode_rotation_compact_failure_falls_back_and_does_not_fail_ingest() 
         .iter()
         .find(|item| item.source.as_deref() == Some("episode-derived"))
         .expect("fallback episode card must exist");
+    // CTX-3/E04: the fallback marker now SAYS the compaction did not
+    // happen instead of a bare "[episode]" tag.
     assert!(
-        summary.content.contains("[episode]"),
-        "compact failure must fall back to the bounded marker, got: {}",
+        summary.content.contains("[episode distill incomplete"),
+        "compact failure must fall back to the incomplete marker, got: {}",
         summary.content
     );
     assert!(
@@ -2505,6 +2523,12 @@ async fn short_episode_without_semantic_outcome_skips_llm_compactor() {
         ) -> agent_contracts::AgentResult<CompactionOutput> {
             self.0.fetch_add(1, Ordering::SeqCst);
             Ok(CompactionOutput {
+                usage_identity: agent_contracts::UsageIdentity::Observed,
+                cached_input_tokens: None,
+                cache_write_input_tokens: None,
+                cache_miss_input_tokens: None,
+                attempts: 0,
+                retries: 0,
                 text: format!("[distilled] {}", request.source),
                 input_tokens: 9,
                 output_tokens: 3,
@@ -2542,6 +2566,12 @@ async fn long_episode_without_semantic_delta_rotates_without_paying_llm() {
         ) -> agent_contracts::AgentResult<CompactionOutput> {
             self.0.fetch_add(1, Ordering::SeqCst);
             Ok(CompactionOutput {
+                usage_identity: agent_contracts::UsageIdentity::Observed,
+                cached_input_tokens: None,
+                cache_write_input_tokens: None,
+                cache_miss_input_tokens: None,
+                attempts: 0,
+                retries: 0,
                 text: format!("[distilled] {}", request.source),
                 input_tokens: 9,
                 output_tokens: 3,
@@ -2627,6 +2657,12 @@ async fn file_observation_alone_does_not_pay_for_episode_compaction() {
         ) -> agent_contracts::AgentResult<CompactionOutput> {
             self.0.fetch_add(1, Ordering::SeqCst);
             Ok(CompactionOutput {
+                usage_identity: agent_contracts::UsageIdentity::Observed,
+                cached_input_tokens: None,
+                cache_write_input_tokens: None,
+                cache_miss_input_tokens: None,
+                attempts: 0,
+                retries: 0,
                 text: format!("[distilled] {}", request.source),
                 input_tokens: 9,
                 output_tokens: 3,
@@ -2669,6 +2705,12 @@ async fn force_episode_llm_distill_pays_without_semantic_delta() {
         ) -> agent_contracts::AgentResult<CompactionOutput> {
             self.0.fetch_add(1, Ordering::SeqCst);
             Ok(CompactionOutput {
+                usage_identity: agent_contracts::UsageIdentity::Observed,
+                cached_input_tokens: None,
+                cache_write_input_tokens: None,
+                cache_miss_input_tokens: None,
+                attempts: 0,
+                retries: 0,
                 text: format!("[distilled] {}", request.source),
                 input_tokens: 9,
                 output_tokens: 3,

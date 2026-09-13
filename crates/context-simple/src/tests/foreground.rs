@@ -507,3 +507,128 @@ async fn foreground_deducts_actual_tokens_from_the_historical_budget() {
             .collect::<Vec<_>>()
     );
 }
+
+/// EXEC-1: the actor cancels a parked materialization by aborting its
+/// spawned future. Against the REAL engine, an abort while the store read
+/// is parked must (a) end the wait under the bounded join, (b) release the
+/// engine gate — a follow-up materialize succeeds immediately — and
+/// (c) commit nothing: a preview is a read, so the event clock is untouched
+/// and no pending preview survives.
+#[tokio::test]
+async fn an_aborted_materialize_wait_releases_the_engine_and_commits_nothing() {
+    let dir = tempfile::tempdir().unwrap();
+    let config = SimpleContextConfig {
+        context_store_dir: Some(dir.path().to_path_buf()),
+        ..SimpleContextConfig::default()
+    };
+    let engine = Arc::new(SimpleContextEngine::new(config));
+    open_focus(&engine, "append notes").await;
+    engine
+        .ingest(ContextIngress::ToolObservation {
+            facts: None,
+            output: fs_read("1", "src/stale.md"),
+            scope_id: None,
+        })
+        .await
+        .unwrap();
+    {
+        let mut state = engine.state.lock().await;
+        let mut items = state.items.take_all();
+        let position = items
+            .iter()
+            .position(|item| item.file_path.as_deref() == Some("src/stale.md"))
+            .expect("the file body is resident");
+        let item = items.remove(position);
+        let context_ref = crate::store::externalize(dir.path(), &item).unwrap();
+        state.external.push(crate::store::to_external_entry(
+            &item,
+            context_ref,
+            0,
+            0,
+            None,
+        ));
+    }
+    let before = engine.diagnostics().await.unwrap();
+
+    let planned = Arc::new(Notify::new());
+    let release = Arc::new(Notify::new());
+    *engine
+        .materialize_io_pause
+        .lock()
+        .expect("materialize test pause mutex poisoned") = Some(IoBoundaryPause {
+        planned: Arc::clone(&planned),
+        release: Arc::clone(&release),
+    });
+
+    let materialize = {
+        let engine = Arc::clone(&engine);
+        tokio::spawn(async move {
+            engine
+                .materialize(ContextQuery {
+                    current_input: "append src/stale.md".into(),
+                    budget_tokens: 10_000,
+                    hints: ContextHints {
+                        foreground_resources: vec![ResourceKey {
+                            path: "src/stale.md".into(),
+                            revision: None,
+                        }],
+                        ..ContextHints::default()
+                    },
+                })
+                .await
+        })
+    };
+    tokio::time::timeout(std::time::Duration::from_secs(2), planned.notified())
+        .await
+        .expect("materialize reached the plan/I/O boundary");
+
+    // The actor's cancellation: cancel token (ignored by the engine) plus a
+    // hard abort of the spawned future — the documented safe failure for a
+    // non-consuming preview.
+    materialize.abort();
+    tokio::time::timeout(std::time::Duration::from_secs(2), materialize)
+        .await
+        .expect("the aborted materialize wait ends under the bounded join")
+        .expect_err("an aborted future reports cancellation");
+
+    // The gate and state locks are released: a follow-up materialize
+    // succeeds immediately (release was never fired, so no pause is armed
+    // for it — the pause field was consumed by the parked call).
+    *engine
+        .materialize_io_pause
+        .lock()
+        .expect("materialize test pause mutex poisoned") = None;
+    let followup = {
+        let engine = Arc::clone(&engine);
+        tokio::spawn(async move {
+            engine
+                .materialize(ContextQuery {
+                    current_input: "append src/stale.md again".into(),
+                    budget_tokens: 10_000,
+                    hints: ContextHints::default(),
+                })
+                .await
+        })
+    };
+    let preview = tokio::time::timeout(std::time::Duration::from_secs(2), followup)
+        .await
+        .expect("the follow-up materialize is not blocked by the aborted one")
+        .unwrap()
+        .expect("the follow-up preview succeeds");
+    let _ = preview;
+
+    // Nothing was consumed: a preview is a read, so the event clock is
+    // exactly where it was, and no pending preview survives the abort.
+    let after = engine.diagnostics().await.unwrap();
+    assert_eq!(
+        after.event_seq, before.event_seq,
+        "an aborted preview must not advance the engine clock"
+    );
+    let state = engine.state.lock().await;
+    if let Some(pending) = &state.pending_materialization {
+        assert_eq!(
+            pending.id, preview.materialization_id,
+            "the only pending preview is the follow-up's own — the aborted wait left nothing"
+        );
+    }
+}

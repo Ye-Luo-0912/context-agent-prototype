@@ -100,6 +100,25 @@ pub(crate) fn run_minor(
     let mut ledger_rows: Vec<(ContextItemId, LifecycleAxis, String, String, String)> = Vec::new();
     let mut catalog_dirty: Vec<ContextItemId> = Vec::new();
     let latest_file_bodies = state.latest_file_body_ids();
+    // CTX-5: the anchor-claim expiry protection is computed once per pass
+    // over every in-memory body location (heap + warm buffer), so the
+    // resident TTL/staleness machine and the warm aging path apply the same
+    // single live-protection judgment.
+    let anchor_protected: std::collections::HashSet<ContextItemId> = if state
+        .anchor_roots
+        .iter()
+        .any(|claim| claim.strength.requires_residency())
+    {
+        state
+            .items
+            .iter()
+            .chain(state.eviction_buffer.iter())
+            .filter(|item| crate::engine::anchor_claim_defers_expiry(state, item))
+            .map(|item| item.id)
+            .collect()
+    } else {
+        std::collections::HashSet::new()
+    };
     let n = state.items.len();
     let batch = config.gc_work_batch.max(1);
     if n <= batch {
@@ -114,6 +133,7 @@ pub(crate) fn run_minor(
                 focus.as_ref(),
                 &hot_entities,
                 &latest_file_bodies,
+                anchor_protected.contains(&item.id),
                 &mut report,
                 &mut ledger_rows,
                 &mut catalog_dirty,
@@ -133,6 +153,7 @@ pub(crate) fn run_minor(
                 focus.as_ref(),
                 &hot_entities,
                 &latest_file_bodies,
+                anchor_protected.contains(&item.id),
                 &mut report,
                 &mut ledger_rows,
                 &mut catalog_dirty,
@@ -155,6 +176,7 @@ pub(crate) fn run_minor(
                 item,
                 config,
                 turn,
+                anchor_protected.contains(&item.id),
                 &mut report,
                 &mut ledger_rows,
                 &mut catalog_dirty,
@@ -168,6 +190,7 @@ pub(crate) fn run_minor(
                 item,
                 config,
                 turn,
+                anchor_protected.contains(&item.id),
                 &mut report,
                 &mut ledger_rows,
                 &mut catalog_dirty,
@@ -223,6 +246,7 @@ fn apply_resident_residency(
     focus: Option<&agent_contracts::FocusState>,
     hot_entities: &[String],
     latest_file_bodies: &std::collections::HashSet<ContextItemId>,
+    anchor_protected: bool,
     report: &mut ContextMaintenanceReport,
     ledger_rows: &mut Vec<(ContextItemId, LifecycleAxis, String, String, String)>,
     catalog_dirty: &mut Vec<ContextItemId>,
@@ -239,6 +263,7 @@ fn apply_resident_residency(
         focus,
         hot_entities,
         latest_file_body,
+        anchor_protected,
     );
     item.attention = outcome.attention;
     item.relevance = outcome.relevance;
@@ -304,6 +329,7 @@ fn apply_warm_aging(
     item: &mut agent_contracts::ContextItem,
     config: &SimpleContextConfig,
     turn: u64,
+    anchor_protected: bool,
     report: &mut ContextMaintenanceReport,
     ledger_rows: &mut Vec<(ContextItemId, LifecycleAxis, String, String, String)>,
     catalog_dirty: &mut Vec<ContextItemId>,
@@ -313,7 +339,13 @@ fn apply_warm_aging(
     }
     // Same expiry protection as the resident path (F16): keep_alive or an
     // unexpired lease defers the aging; an expired lease protects nothing.
-    if item.retention == ContextRetention::Pinned || protected_from_expiry(item, turn) {
+    // CTX-5: a current residency-strength anchor claim defers it the same
+    // way — task authority outranks the warm aging heuristic, exactly like
+    // the resident TTL path.
+    if item.retention == ContextRetention::Pinned
+        || anchor_protected
+        || protected_from_expiry(item, turn)
+    {
         return;
     }
     let turn_age = turn.saturating_sub(item.created_turn);

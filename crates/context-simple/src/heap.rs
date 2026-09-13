@@ -1,6 +1,6 @@
 use std::cmp::Ordering;
 
-use agent_contracts::{ContextItem, ContextItemSummary, ExternalizedContext};
+use agent_contracts::{ContextItem, ContextItemSummary, ContextResidency, ExternalizedContext};
 
 /// Project one item into a bounded UI/replay summary. `inspect` maps this
 /// over its sources lazily (iterator chain into `bounded_catalog`), so a
@@ -27,6 +27,11 @@ pub(crate) fn summary_of(item: &ContextItem) -> ContextItemSummary {
         keep_alive: item.keep_alive,
         lease_until_turn: item.lease_until_turn,
         source: item.source.clone(),
+        // PLATFORM-2: the authoritative per-item residency. Whether the
+        // body was actually sent this turn is stamped by `inspect` once,
+        // against the engine's current turn.
+        residency: item.residency,
+        selected_current_turn: false,
     }
 }
 
@@ -58,6 +63,9 @@ pub(crate) fn external_summary(entry: &ExternalizedContext) -> ContextItemSummar
         // 来源权威随条目外部化保留，inspect 如实显示原始来源，而不是
         // 一个固定的 "externalized" 占位——否则外部化会抹掉来源信息。
         source: entry.source.clone(),
+        // External-store entries are pointer-only by definition.
+        residency: ContextResidency::External,
+        selected_current_turn: false,
     }
 }
 
@@ -151,6 +159,8 @@ mod tests {
             keep_alive: false,
             lease_until_turn: None,
             source: Some(tag.to_string()),
+            residency: ContextResidency::Resident,
+            selected_current_turn: false,
         }
     }
 

@@ -74,6 +74,20 @@ impl ScopeTree {
         }
     }
 
+    /// CTX-9: drop every scope the predicate rejects and rebuild the id
+    /// index. Retirement removes whole nodes (not field edits), so the
+    /// index must be rebuilt; callers own the safety rules (no remaining
+    /// scope may reference a removed id as parent).
+    pub(crate) fn retain_and_rebuild(&mut self, keep: impl Fn(&Scope) -> bool) -> usize {
+        let before = self.scopes.len();
+        self.scopes.retain(|scope| keep(scope));
+        let removed = before - self.scopes.len();
+        if removed > 0 {
+            self.rebuild();
+        }
+        removed
+    }
+
     fn rebuild(&mut self) {
         self.id_index.clear();
         for (slot, scope) in self.scopes.iter().enumerate() {

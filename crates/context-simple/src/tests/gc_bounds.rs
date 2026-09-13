@@ -186,6 +186,7 @@ fn dropped_externalize_plan_keeps_items_owned_by_the_state() {
     let io = crate::gc::full::GcIoResult {
         externalized: vec![(spill_id, "checksum".to_string())],
         recalled: Vec::new(),
+        failures: 0,
     };
     let report = crate::gc::full::commit_full_gc(&mut state, 2, plan, io);
     assert_eq!(report.externalized, 1);
@@ -256,6 +257,7 @@ fn a_pending_only_state_still_runs_the_pass_and_lands_the_retry() {
     let io = crate::gc::full::GcIoResult {
         externalized: vec![(owner_id, "checksum".to_string())],
         recalled: Vec::new(),
+        failures: 0,
     };
     let report = crate::gc::full::commit_full_gc(&mut state, 1, plan, io);
     assert_eq!(report.externalized, 1);
