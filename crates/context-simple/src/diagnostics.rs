@@ -19,7 +19,12 @@ pub(crate) fn compute(state: &State) -> ContextDiagnostics {
             .len()
             .saturating_add(state.eviction_buffer.len())
             .saturating_add(state.pending_externalize_retry.len())
-            .saturating_add(state.external.len()),
+            .saturating_add(state.external.len())
+            // F2: spill rows a bounded restore has not paged in yet are
+            // known ids whose body is in the store and whose metadata is on
+            // a card. Counting them keeps the logical total stable across a
+            // restore instead of dipping until hydration runs.
+            .saturating_add(state.pending_external_cards.len()),
         focus_generation: state.focus.as_ref().map_or(0, |f| f.generation),
         focus_task_id: state.focus.as_ref().map(|f| f.task_id),
         turn: state.turn,

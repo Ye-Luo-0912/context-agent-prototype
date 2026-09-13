@@ -1054,15 +1054,14 @@ pub(crate) fn parse_cursor(cursor: &str) -> AgentResult<(&str, usize)> {
     Ok((reference, offset))
 }
 
-/// Read a spilled snapshot artifact (bounded) and return its lines. Cursor
-/// paging serves every page from the *same immutable snapshot*, so the
-/// paging is consistent: changes to the underlying directory or file set
-/// between pages cannot cause duplicates or gaps.
-pub(crate) async fn read_snapshot_lines(
+/// Read a run-owned sealed artifact (bounded) as raw bytes. The open
+/// authenticates the run and the sealed digest, so a reference the model
+/// invented cannot resolve.
+pub(crate) async fn read_snapshot_bytes(
     workspace: &Workspace,
     run_id: RunId,
     reference: &str,
-) -> AgentResult<Vec<String>> {
+) -> AgentResult<Vec<u8>> {
     let (_normalized, confined) = workspace.open_artifact_for_run(reference, run_id).await?;
     let file = confined.into_tokio();
     let mut bytes = Vec::new();
@@ -1075,6 +1074,19 @@ pub(crate) async fn read_snapshot_lines(
             "snapshot artifact exceeds {MAX_SNAPSHOT_BYTES} bytes"
         )));
     }
+    Ok(bytes)
+}
+
+/// Read a spilled snapshot artifact (bounded) and return its lines. Cursor
+/// paging serves every page from the *same immutable snapshot*, so the
+/// paging is consistent: changes to the underlying directory or file set
+/// between pages cannot cause duplicates or gaps.
+pub(crate) async fn read_snapshot_lines(
+    workspace: &Workspace,
+    run_id: RunId,
+    reference: &str,
+) -> AgentResult<Vec<String>> {
+    let bytes = read_snapshot_bytes(workspace, run_id, reference).await?;
     Ok(String::from_utf8_lossy(&bytes)
         .lines()
         .map(String::from)
