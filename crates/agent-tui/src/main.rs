@@ -144,10 +144,7 @@ async fn real_main() -> anyhow::Result<()> {
                 .with_context(|| format!("invalid --grant JSON: {json}"))?;
             task_gate.grant(grant).await?;
         }
-        (
-            task_gate as Arc<dyn agent_contracts::ApprovalGate>,
-            None,
-        )
+        (task_gate as Arc<dyn agent_contracts::ApprovalGate>, None)
     } else if args.is_headless() {
         (
             cli::headless_approval(false, &grant_args, host_policies.clone()).await?,
