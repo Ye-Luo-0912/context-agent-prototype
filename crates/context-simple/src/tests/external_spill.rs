@@ -414,9 +414,9 @@ async fn an_unchanged_tail_respills_without_reserializing_it() {
     );
 }
 
-/// The directory only ever claims what is真 on disk: handing out a mutable
-/// entry drops its row, so the next capture serializes that entry again and
-/// the card it writes describes the new metadata.
+/// The directory only ever claims what is really on disk: handing out a
+/// mutable entry drops its row, so the next capture serializes that entry
+/// again and the card it writes describes the new metadata.
 #[tokio::test]
 async fn a_mutated_entry_loses_its_recorded_card_and_is_written_again() {
     let dir = tempfile::tempdir().unwrap();
@@ -568,6 +568,15 @@ async fn a_restore_pages_in_a_bounded_batch_and_defers_the_rest() {
         restored.diagnostics().await.unwrap().total_items,
         total_while_pending,
         "the logical total never dipped while rows were pending"
+    );
+
+    // Paging kept the map in externalization order, so the next capture's
+    // oldest-first choice is the same tail as before the restore.
+    let recaptured = restored.checkpoint().await.unwrap();
+    assert_eq!(
+        manifest_ids(&recaptured),
+        spilled,
+        "a paged-in entry lands in externalization order, not at the end"
     );
 }
 

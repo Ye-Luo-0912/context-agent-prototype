@@ -222,6 +222,21 @@ impl ExternalMap {
         self.rebuild_indexes();
     }
 
+    /// Merge paged-in entries (F2: spill cards a bounded restore deferred)
+    /// keeping the map in externalization order — slot order is that order,
+    /// and the capture's oldest-first spill choice reads it. Recorded cards
+    /// survive: a slot moving says nothing about an entry's metadata.
+    pub(crate) fn merge_paged(&mut self, entries: Vec<ExternalizedContext>) {
+        if entries.is_empty() {
+            return;
+        }
+        self.catalog_rebuild = true;
+        self.catalog_dirty.clear();
+        self.entries.extend(entries);
+        self.entries.sort_by_key(|entry| entry.externalized_at_tick);
+        self.rebuild_indexes();
+    }
+
     /// Record that `id`'s current metadata is serialized in the card named
     /// by `hash`. Only the capture path (which just wrote or verified that
     /// file) and a restore rehydrating from that exact card may claim this.

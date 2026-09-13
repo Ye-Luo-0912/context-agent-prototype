@@ -1017,7 +1017,7 @@ impl SimpleContextEngine {
             }
         }
         let mut state = self.state.lock().await;
-        let mut installed = 0usize;
+        let mut claimed = Vec::new();
         for (entry, hash) in entries {
             // Someone else may own this id now (a rebuild, an admit). The
             // live owner wins; a paged-in card never creates a second owner.
@@ -1026,10 +1026,14 @@ impl SimpleContextEngine {
             {
                 continue;
             }
-            let item_id = entry.item_id;
-            state.external.push(entry);
-            state.external.record_card(item_id, hash);
-            installed += 1;
+            claimed.push((entry, hash));
+        }
+        let installed = claimed.len();
+        state
+            .external
+            .merge_paged(claimed.iter().map(|(entry, _)| entry.clone()).collect());
+        for (entry, hash) in claimed {
+            state.external.record_card(entry.item_id, hash);
         }
         state.external_cards_missing = state.external_cards_missing.saturating_add(missing);
         state.sync_catalog();
@@ -1071,7 +1075,7 @@ impl SimpleContextEngine {
         let mut state = self.state.lock().await;
         match entry {
             Ok(Some(entry)) if state.external.get(item_id).is_none() => {
-                state.external.push(entry);
+                state.external.merge_paged(vec![entry]);
                 state.external.record_card(item_id, hash);
                 state.sync_catalog();
                 true
