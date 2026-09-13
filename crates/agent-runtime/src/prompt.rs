@@ -345,25 +345,10 @@ impl PromptAssembler {
         // files, tools or the store cannot gain system precedence over the
         // operator's instructions (prompt injection defense).
         let mut context_frame = Vec::new();
-        if !history.foreground.is_empty() {
-            // Passive transient rehydration: file bodies the current
-            // directive exactly named. Not GC reactivation — Warm stays
-            // Warm and Stored is not Admitted. Foreground is itself a body,
-            // never an identity-only descriptor.
-            let mut foreground = String::from("CURRENT FOREGROUND EVIDENCE");
-            for item in &history.foreground {
-                foreground.push_str(&render_selected_item(item, &[], task_progress));
-            }
-            context_frame.push(ModelMessage::user(foreground));
-        }
         if !history.items.is_empty() {
             let mut working = String::from("SELECTED WORKING CONTEXT");
             for item in &history.items {
-                working.push_str(&render_selected_item(
-                    item,
-                    &visible_body_windows,
-                    task_progress,
-                ));
+                working.push_str(&render_selected_item(item, &visible_body_windows));
             }
             // COST-3/D03: the per-turn catalog counters are cuttable
             // diagnostics — they live in ContextPrepared events and engine
@@ -371,6 +356,17 @@ impl PromptAssembler {
             // (head or tail) invalidated the provider-reusable prefix every
             // turn without carrying any evidence.
             context_frame.push(ModelMessage::user(working));
+        }
+        if !history.foreground.is_empty() {
+            // Passive transient rehydration: file bodies the current
+            // directive exactly named. Not GC reactivation — Warm stays
+            // Warm and Stored is not Admitted. Foreground is itself a body,
+            // never an identity-only descriptor.
+            let mut foreground = String::from("CURRENT FOREGROUND EVIDENCE");
+            for item in &history.foreground {
+                foreground.push_str(&render_selected_item(item, &[]));
+            }
+            context_frame.push(ModelMessage::user(foreground));
         }
         // CTX-4: the engine's required-context facts reach the model. A
         // mandated body that did not arrive is a bounded, actionable state —
@@ -417,6 +413,12 @@ impl PromptAssembler {
         if let Some(index) = render_tool_catalog_index(catalog, &surfaced) {
             current_state_frame.push(ModelMessage::system(index));
         }
+        // C3/R4: the volatile per-item state (currency, attention) renders
+        // into the dynamic tail — after the reusable evidence — instead of
+        // inside evidence headers.
+        if let Some(state) = render_working_set_state(&history.items, task_progress) {
+            current_state_frame.push(state);
+        }
 
         let body_stats = ProtocolBodyAssemblyStats {
             eligible: checkpoint_body_demand.len() as u64,
@@ -440,6 +442,18 @@ impl PromptAssembler {
             }
             context_frame.push(ModelMessage::user(restored_block));
         }
+        // C3/R1: the SELECTED WORKING CONTEXT block is the current epoch's
+        // evidence — the declared reusable prefix stops at its end; the
+        // volatile projections after it (foreground/misses/external/
+        // restored) no longer extend the declared prefix when they change.
+        let evidence_split = if context_frame
+            .iter()
+            .any(|message| message.content.contains("SELECTED WORKING CONTEXT"))
+        {
+            Some(agent_contracts::EvidenceSplit { base: 0, epoch: 1 })
+        } else {
+            None
+        };
         (
             ModelInput {
                 layout: self.layout,
@@ -450,6 +464,7 @@ impl PromptAssembler {
                 turn_frame,
                 tool_schemas: tools,
                 turn_checkpoint: (compacted_exchanges > 0).then_some(turn_checkpoint),
+                evidence_split,
             },
             body_stats,
         )
@@ -1323,23 +1338,52 @@ fn append_list(out: &mut String, label: &str, items: &[String]) {
 fn render_selected_item(
     item: &MaterializedItem,
     visible_body_windows: &[agent_contracts::FileBodyWindow],
-    progress: Option<&TaskProgressView>,
 ) -> String {
     let path = render_selected_path(item);
-    let current = if selected_item_is_current(item, progress) {
-        " | workspace_identity=current"
-    } else {
-        ""
-    };
     let body = if omit_selected_file_body(item, visible_body_windows) {
         String::new()
     } else {
         item.content.clone()
     };
+    // C3/R4: the volatile per-item state (workspace_identity currency,
+    // attention) is NOT part of the evidence header — it lives in the
+    // identity-referenced dynamic state segment (`render_working_set_state`)
+    // so a state flip cannot rewrite the evidence block's reusable bytes.
+    // `semantic` stays: it only moves on a real terminal transition, which
+    // is a legitimate evidence change.
     format!(
-        "\n[{:?} | {:?} | id={}{path}{current} | attention={:?} | semantic={:?}]\n{body}\n",
-        item.kind, item.scope, item.item_id, item.attention, item.semantic
+        "\n[{:?} | {:?} | id={}{path} | semantic={:?}]\n{body}\n",
+        item.kind, item.scope, item.item_id, item.semantic
     )
+}
+
+/// C3/R4: the identity-referenced dynamic state segment for the selected
+/// working set — currency and attention per item, rendered in the dynamic
+/// tail (after the reusable evidence) instead of inside evidence headers.
+fn render_working_set_state(
+    items: &[MaterializedItem],
+    progress: Option<&TaskProgressView>,
+) -> Option<ModelMessage> {
+    if items.is_empty() {
+        return None;
+    }
+    let mut state = String::from("WORKING SET STATE (identity-referenced; dynamic)\n");
+    for item in items {
+        let current = if selected_item_is_current(item, progress) {
+            " workspace_identity=current"
+        } else {
+            ""
+        };
+        let path = render_selected_path(item);
+        state.push_str(&format!(
+            "id={}{path} attention={:?}{current}\n",
+            item.item_id, item.attention
+        ));
+    }
+    // PROMPT-AUTH-01: the rows carry item-derived paths (tool-observation
+    // metadata), so the block renders as low-authority `user` content —
+    // never system, exactly like the evidence it annotates.
+    Some(ModelMessage::user(state))
 }
 
 fn selected_item_is_current(item: &MaterializedItem, progress: Option<&TaskProgressView>) -> bool {
@@ -1426,7 +1470,9 @@ fn omit_selected_file_body(
 mod tests {
     use super::*;
     use agent_contracts::{
-        AccessSignal, AttentionState, ContextItemId, ContextKind, ContextMapView, ContextRef,
+        AccessSignal, AttentionState, CancellationToken, ContextItemId, ContextKind,
+        ContextMapView, ContextMaterializationIdentity, ContextMaterializationMiss,
+        ContextMaterializationMissReason, ContextMaterializationMisses, ContextRef,
         ContextResidency, ContextRetention, ContextScope, ExternalizedContext, MaterializedContext,
         MaterializedItem, ModelRole, SemanticState,
     };
@@ -1713,6 +1759,173 @@ mod tests {
         );
     }
 
+    /// C3/R1 (KV-cache audit, red-first): a required-miss change must not
+    /// move or invalidate the declared reusable prefix — the prefix stops
+    /// at the end of the epoch evidence (B1), the volatile projections live
+    /// beyond it, and the explicit breakpoint list names B0/B1.
+    #[test]
+    fn required_miss_changes_do_not_invalidate_the_declared_evidence_prefix() {
+        let assembler = PromptAssembler::new("policy");
+        let mut file = item("fn kept_body() {}");
+        file.kind = ContextKind::ToolObservation;
+        file.source = Some("tool:fs.read".into());
+        let history = materialized_with(vec![file], ContextMapView::default());
+
+        let miss = |id: &str| {
+            let mut misses = ContextMaterializationMisses::default();
+            misses.push(ContextMaterializationMiss {
+                identity: ContextMaterializationIdentity::new(id, None, "evidence_refs", 1),
+                reason: ContextMaterializationMissReason::BudgetExcluded,
+            });
+            misses
+        };
+
+        let build = |misses: ContextMaterializationMisses| {
+            let mut history = history.clone();
+            history.required_misses = misses;
+            assembler
+                .assemble(
+                    None,
+                    None,
+                    None,
+                    &history,
+                    &TurnFrame::new("continue"),
+                    Vec::new(),
+                )
+                .into_request(serde_json::Value::Null, CancellationToken::new())
+        };
+
+        let request_a = build(miss("context://run/required-a"));
+        let request_b = build(miss("context://run/required-b"));
+
+        // The explicit breakpoint list names B0 (end of stable policy) and
+        // B1 (end of the epoch evidence) — the volatile projections live
+        // beyond both.
+        assert_eq!(
+            request_a.cache_breakpoints.len(),
+            2,
+            "B0/B1 breakpoints must be declared: {:?}",
+            request_a.cache_breakpoints
+        );
+        let b1 = request_a.cache_breakpoints[1];
+        let b1 = request_b.cache_breakpoints[1].min(b1);
+
+        // The declared prefix (through B1) is byte-identical across the two
+        // rounds; the misses differ strictly beyond it.
+        assert!(
+            request_a.messages[..=b1] == request_b.messages[..=b1],
+            "the reusable prefix must survive a miss-only change"
+        );
+        // The two rounds actually differ in their misses, strictly beyond B1.
+        let miss_message = |request: &agent_contracts::ModelRequest| {
+            request
+                .messages
+                .iter()
+                .position(|message| message.content.contains("REQUIRED CONTEXT"))
+                .expect("the miss projection must be rendered")
+        };
+        let miss_a = miss_message(&request_a);
+        let miss_b = miss_message(&request_b);
+        assert!(
+            miss_a > b1 && miss_b > b1,
+            "the miss projection must live beyond the declared prefix: {miss_a}/{miss_b} vs {b1}"
+        );
+        assert_ne!(
+            request_a.messages[miss_a].content, request_b.messages[miss_b].content,
+            "the two rounds must actually differ in their misses"
+        );
+        let boundary = request_a.prompt_reuse_boundary().expect("boundary binds");
+        assert!(
+            boundary.message_count() <= b1 + 1,
+            "the declared prefix must stop at or before B1, not cover the misses:              boundary={} b1={b1}",
+            boundary.message_count()
+        );
+    }
+
+    /// C3/R4 (KV-cache audit, red-first): volatile per-item state —
+    /// currency and attention — must not rewrite the evidence block's
+    /// bytes. The state lives in an identity-referenced dynamic segment
+    /// instead of the item header, so a state flip cannot invalidate the
+    /// reusable evidence prefix.
+    #[test]
+    fn volatile_item_state_does_not_rewrite_the_evidence_block() {
+        let assembler = PromptAssembler::new("policy");
+        let mut file = item("fn kept_body() {}");
+        file.kind = ContextKind::ToolObservation;
+        file.source = Some("tool:fs.read".into());
+        file.file_path = Some("src/auth.rs".into());
+        file.file_revision = Some("abc123".into());
+        let history_current = materialized_with(vec![file.clone()], ContextMapView::default());
+        let progress = TaskProgressView {
+            checked_files: vec!["src/auth.rs@abc123".into()],
+            ..Default::default()
+        };
+
+        // Same evidence, stale attention: the engine aged the item between
+        // rounds. Body, identity, version and scope are unchanged.
+        let mut stale = file.clone();
+        stale.attention = AttentionState::Archived;
+        let history_stale = materialized_with(vec![stale], ContextMapView::default());
+
+        let evidence_message = |input: &ModelInput| {
+            input
+                .context_frame
+                .iter()
+                .find(|message| message.content.contains("SELECTED WORKING CONTEXT"))
+                .expect("working set")
+                .content
+                .clone()
+        };
+
+        let current_bytes = evidence_message(&assembler.assemble(
+            None,
+            None,
+            Some(&progress),
+            &history_current,
+            &TurnFrame::new("continue"),
+            Vec::new(),
+        ));
+        let stale_bytes = evidence_message(&assembler.assemble(
+            None,
+            None,
+            Some(&progress),
+            &history_stale,
+            &TurnFrame::new("continue"),
+            Vec::new(),
+        ));
+        assert_eq!(
+            current_bytes, stale_bytes,
+            "an attention flip must not rewrite the evidence block:              current={current_bytes:?}
+stale={stale_bytes:?}"
+        );
+        assert!(
+            !current_bytes.contains("attention="),
+            "attention must leave the evidence header entirely"
+        );
+
+        // The currency fact is not lost — it moves to the dynamic state
+        // segment, referenced by the item identity.
+        let with_facts = assembler.assemble(
+            None,
+            None,
+            Some(&progress),
+            &history_current,
+            &TurnFrame::new("continue"),
+            Vec::new(),
+        );
+        assert!(
+            with_facts.current_state_frame.iter().any(|message| {
+                message.content.contains("src/auth.rs@abc123")
+                    && message.content.contains("workspace_identity=current")
+            }),
+            "the currency fact must be observable in the dynamic state segment"
+        );
+        assert!(
+            !evidence_message(&with_facts).contains("workspace_identity=current"),
+            "currency must leave the evidence header entirely"
+        );
+    }
+
     #[test]
     fn progress_identity_alone_keeps_the_only_historical_body() {
         let assembler = PromptAssembler::new("policy");
@@ -1721,6 +1934,7 @@ mod tests {
         file.source = Some("tool:fs.read".into());
         file.file_path = Some("src/auth.rs".into());
         file.file_revision = Some("abc123".into());
+        let item_id = file.item_id;
         let history = materialized_with(vec![file], ContextMapView::default());
         let progress = TaskProgressView {
             checked_files: vec!["src/auth.rs@abc123".into()],
@@ -1742,10 +1956,25 @@ mod tests {
             .find(|message| message.content.contains("SELECTED WORKING CONTEXT"))
             .expect("working set");
         assert!(working.content.contains("path=src/auth.rs@abc123"));
+        // C3/R4: the currency FACT moved to the identity-referenced dynamic
+        // state segment (a state flip must not rewrite evidence bytes); the
+        // exact identity (path@revision) stays co-located with the body.
         assert!(
-            working.content.contains("workspace_identity=current"),
-            "the body and its exact fresh identity must be co-located: {}",
+            !working.content.contains("workspace_identity=current"),
+            "currency must leave the evidence header: {}",
             working.content
+        );
+        let state = with_progress
+            .current_state_frame
+            .iter()
+            .find(|message| message.content.contains("WORKING SET STATE"))
+            .expect("dynamic state segment");
+        assert!(
+            state.content.contains("path=src/auth.rs@abc123")
+                && state.content.contains("workspace_identity=current")
+                && state.content.contains(&format!("id={}", item_id)),
+            "the currency fact must reference the exact identity: {}",
+            state.content
         );
         assert!(
             working.content.contains("fn secret_body"),
