@@ -1282,6 +1282,45 @@ selection code: the constructor asserts `<= 32` and the wire
 deserializer rejects over-cap payloads, so the bound holds on both sides
 of the context-service boundary.
 
+**Checkpoint spill cards, and the history scale this supports (F2).**
+Beyond `external_checkpoint_inline_target`, the oldest `External` entries
+put their metadata in a content-addressed card in the existing store and the
+checkpoint carries an `external_spilled` manifest instead of those entries.
+A capture is three-phased like the GC: it plans under the state lock
+(bounded serialization, no I/O), writes cards with the lock released, then
+records and serializes under a fresh lock, all inside the same `op_gate`
+lane. `ExternalMap` keeps a compact `id -> card hash` directory so an entry
+whose card is already on disk enters the manifest from one hash lookup —
+every mutation path drops the row (`get_mut` hands out a mutable entry, so
+the row goes even for a read), which is what makes a recorded hash a claim
+about the *live* metadata. One capture is therefore bounded by
+`external_checkpoint_scan_budget` (entries serialized),
+`external_checkpoint_card_bytes` (serialized/written bytes) and
+`external_checkpoint_io_budget_ms` (off-lock batch), and its cost tracks the
+number of *changed* entries rather than the length of history; whatever a
+budget leaves out stays inline and the next capture continues.
+
+A restore reads at most `external_restore_card_batch` cards and leaves the
+rest as `(id, card hash)` rows. Those ids stay known, so nothing silently
+disappears: `fetch_external` / `inspect_external` page in one card by id,
+`search_external`, full GC, Storage GC, reconcile and context directives
+drain the directory in bounded batches before they need the complete set
+(coverage and deletion decisions are unchanged), a capture re-emits rows it
+has not paged in, and `diagnostics` counts them so the logical total does
+not dip. A pending row is a live owner whose metadata is not in memory — it
+is never an unreferenced blob.
+
+**What this does not claim.** Entries do not leave memory: the map still
+holds every external entry's metadata and its indexes, so resident metadata
+is O(externalized history) once the directory has drained. Supported scale
+is accordingly "a history whose external metadata fits in the process",
+with the checkpoint, the capture pass and each restore/drain batch bounded
+independently of it. Making entries live only on cards — search candidates
+generated from a paged index — is the open CTX-9 residual and needs a
+product decision between per-search `O(spilled)` I/O, a new model-facing
+completeness declaration, and a compressed resident index; unbounded
+history is not claimed to be stable today.
+
 ### 9k. V1-M9: typed dependency edges and the scope tree index
 
 The dependency graph is typed. `ContextItem.dependencies` (and the
