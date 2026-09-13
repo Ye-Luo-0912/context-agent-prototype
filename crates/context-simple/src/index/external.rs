@@ -44,6 +44,16 @@ pub(crate) struct ExternalMap {
     cold_entries: usize,
     /// External-entry count (the reference-only tail of the store).
     external_entries: usize,
+    /// F2: id -> card hash for entries whose *current* metadata is already
+    /// serialized on disk as a checkpoint spill card. A row here lets a
+    /// capture put the entry in the spill manifest without serializing or
+    /// writing it again, so per-capture work tracks the number of *changed*
+    /// entries instead of the length of history. Every mutation path drops
+    /// the row (conservatively: `get_mut` hands out a mutable entry, so the
+    /// row goes even if the caller only reads), which is what makes a
+    /// recorded hash a valid claim about the live metadata rather than a
+    /// stale one.
+    card_hashes: HashMap<ContextItemId, String>,
     catalog_dirty: HashSet<ContextItemId>,
     catalog_rebuild: bool,
 }
@@ -57,6 +67,7 @@ impl ExternalMap {
     /// must be fully formed (entities captured) before the push.
     pub(crate) fn push(&mut self, entry: ExternalizedContext) {
         self.mark_catalog(entry.item_id);
+        self.card_hashes.remove(&entry.item_id);
         let slot = self.entries.len();
         self.id_index.insert(entry.item_id, slot);
         for entity in &entry.entities {
@@ -115,6 +126,7 @@ impl ExternalMap {
                 aged += 1;
                 let id = self.entries[idx].item_id;
                 self.mark_catalog(id);
+                self.card_hashes.remove(&id);
             }
         }
         *cursor = if take == n { 0 } else { (start + take) % n };
@@ -178,6 +190,10 @@ impl ExternalMap {
         self.catalog_dirty.clear();
         self.entries.retain(keep);
         self.rebuild_indexes();
+        // Cards of dropped entries are no longer claims about anything the
+        // map owns; the reconcile sweep reclaims the files themselves.
+        self.card_hashes
+            .retain(|id, _| self.id_index.contains_key(id));
     }
 
     /// Take the map out for wholesale processing (storage-GC commit); the
@@ -186,6 +202,9 @@ impl ExternalMap {
     pub(crate) fn take_all(&mut self) -> Vec<ExternalizedContext> {
         self.catalog_rebuild = true;
         self.catalog_dirty.clear();
+        // The caller may edit the entries wholesale before replacing them,
+        // so no recorded card can still be proven current.
+        self.card_hashes.clear();
         self.id_index.clear();
         self.entity_index.clear();
         self.pinned_ids.clear();
@@ -198,8 +217,45 @@ impl ExternalMap {
     pub(crate) fn replace_all(&mut self, entries: Vec<ExternalizedContext>) {
         self.catalog_rebuild = true;
         self.catalog_dirty.clear();
+        self.card_hashes.clear();
         self.entries = entries;
         self.rebuild_indexes();
+    }
+
+    /// Merge paged-in entries (F2: spill cards a bounded restore deferred)
+    /// keeping the map in externalization order — slot order is that order,
+    /// and the capture's oldest-first spill choice reads it. Recorded cards
+    /// survive: a slot moving says nothing about an entry's metadata.
+    pub(crate) fn merge_paged(&mut self, entries: Vec<ExternalizedContext>) {
+        if entries.is_empty() {
+            return;
+        }
+        self.catalog_rebuild = true;
+        self.catalog_dirty.clear();
+        self.entries.extend(entries);
+        self.entries.sort_by_key(|entry| entry.externalized_at_tick);
+        self.rebuild_indexes();
+    }
+
+    /// Record that `id`'s current metadata is serialized in the card named
+    /// by `hash`. Only the capture path (which just wrote or verified that
+    /// file) and a restore rehydrating from that exact card may claim this.
+    pub(crate) fn record_card(&mut self, id: ContextItemId, hash: String) {
+        if self.id_index.contains_key(&id) {
+            self.card_hashes.insert(id, hash);
+        }
+    }
+
+    /// The card whose bytes still describe this entry, if one is known.
+    pub(crate) fn card_hash(&self, id: ContextItemId) -> Option<&str> {
+        self.card_hashes.get(&id).map(String::as_str)
+    }
+
+    /// Recorded card rows. Bounded by the number of externalized entries,
+    /// and each row is an id plus a short hash rather than metadata.
+    #[cfg(test)]
+    pub(crate) fn recorded_cards(&self) -> usize {
+        self.card_hashes.len()
     }
 
     /// O(1) lookup by id (the model's per-item retrieval loop).
@@ -213,6 +269,7 @@ impl ExternalMap {
     /// residency aging). Mutating `item_id`, `entities` or `retention`
     /// through this handle would silently desync the indexes.
     pub(crate) fn get_mut(&mut self, id: ContextItemId) -> Option<&mut ExternalizedContext> {
+        self.card_hashes.remove(&id);
         self.id_index
             .get(&id)
             .copied()
@@ -337,6 +394,9 @@ impl<'a> IntoIterator for &'a mut ExternalMap {
     type IntoIter = std::slice::IterMut<'a, ExternalizedContext>;
 
     fn into_iter(self) -> Self::IntoIter {
+        // Wholesale mutable iteration can change any entry, so no recorded
+        // card survives it.
+        self.card_hashes.clear();
         self.entries.iter_mut()
     }
 }

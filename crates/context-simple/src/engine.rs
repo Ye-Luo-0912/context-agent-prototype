@@ -213,6 +213,26 @@ pub struct SimpleContextConfig {
     /// 单次 capture 的卡片写入预算（读校验不计入）：预算耗尽时剩余条目
     /// 本次保持内联（checkpoint 如实变大），下次 capture 继续收敛。
     pub external_checkpoint_card_batch: usize,
+    /// F2: how many *not yet carded* entries one capture may serialize while
+    /// planning the spill. This is the lock-held work budget: entries whose
+    /// card is already on disk cost one hash lookup and are free, so a
+    /// capture pays for changed entries only, and anything past the window
+    /// stays inline until a later capture.
+    pub external_checkpoint_scan_budget: usize,
+    /// F2: total card bytes one capture may serialize (the peak the plan
+    /// holds in memory) and therefore write. Entries whose card is already
+    /// on disk cost nothing here — they enter the manifest from the
+    /// recorded-card directory — so this bounds the changed-entry work.
+    pub external_checkpoint_card_bytes: u64,
+    /// F2: wall-clock budget for one capture's off-lock card I/O batch.
+    /// When it is spent, the remaining planned cards stay inline and the
+    /// next capture continues; a slow disk cannot stretch one capture
+    /// without bound.
+    pub external_checkpoint_io_budget_ms: u64,
+    /// F2: how many spill cards one restore reads before it returns. The
+    /// rest stay a pending directory of `(id, card hash)` rows that page in
+    /// on demand, so restore cost does not track total history length.
+    pub external_restore_card_batch: usize,
 }
 
 impl Default for SimpleContextConfig {
@@ -256,6 +276,10 @@ impl Default for SimpleContextConfig {
             scope_retire_target: 1024,
             external_checkpoint_inline_target: 2048,
             external_checkpoint_card_batch: 64,
+            external_checkpoint_scan_budget: 4096,
+            external_checkpoint_card_bytes: 8 * 1024 * 1024,
+            external_checkpoint_io_budget_ms: 2_000,
+            external_restore_card_batch: 256,
         }
     }
 }
@@ -335,6 +359,13 @@ pub(crate) struct State {
     /// Storage GC 清理），消费端不得把它读成完整状态。
     #[serde(default)]
     pub(crate) external_cards_missing: u64,
+    /// F2: spill-card rows a restore accepted but has not paged in yet —
+    /// `(item id, card hash)`. The ids are known (so blob/card deletion is
+    /// deferred and an id lookup pages its card in), the metadata is not in
+    /// memory. Never serialized as state: a capture re-emits these rows
+    /// into the checkpoint's spill manifest, which is the same directory.
+    #[serde(skip)]
+    pub(crate) pending_external_cards: Vec<(ContextItemId, String)>,
     /// CTX-9: bounded fact notes for retired (fully unreferenced, closed)
     /// scopes. The nodes leave the tree and every checkpoint; the facts
     /// (id/kind/task/completion) stay addressable for `task_completed` and
@@ -744,6 +775,12 @@ pub struct SimpleContextEngine {
     /// while the read is parked here — no timing inference.
     #[cfg(test)]
     pub(crate) admit_read_pause: std::sync::Mutex<Option<IoBoundaryPause>>,
+    /// Deterministic pause at the checkpoint card-write boundary (F2): the
+    /// planned cards are written with the state lock released, and a
+    /// regression proves unrelated state reads answer while the capture is
+    /// parked here — no timing inference.
+    #[cfg(test)]
+    pub(crate) checkpoint_io_pause: std::sync::Mutex<Option<IoBoundaryPause>>,
     /// 与 B 共用的有界压缩器。缺省为 None：任务摘要仍用 runtime 给的原文。
     /// 注入后，任务完成和 episode 旋转会蒸馏成带 `DerivedFrom` 的派生摘要，
     /// 原文条目保留。
@@ -768,6 +805,8 @@ impl SimpleContextEngine {
             materialize_io_pause: std::sync::Mutex::new(None),
             #[cfg(test)]
             admit_read_pause: std::sync::Mutex::new(None),
+            #[cfg(test)]
+            checkpoint_io_pause: std::sync::Mutex::new(None),
             compactor: None,
             search_observation: std::sync::Mutex::new(ContextSearchObservation::default()),
         }
@@ -895,6 +934,241 @@ impl SimpleContextEngine {
             }
         }
     }
+
+    /// F2 phase 2 of a capture: put the planned cards on disk with the state
+    /// lock released. Existence probes cost no write budget (a card is
+    /// content-addressed, so an existing file already holds these bytes);
+    /// the wall-clock budget stops a slow disk from stretching one capture,
+    /// and the entries it leaves behind simply stay inline this time.
+    async fn run_external_spill_io(&self, plan: ExternalSpillPlan) -> ExternalSpillIo {
+        let mut io = ExternalSpillIo {
+            spilled: plan.recorded,
+            ..ExternalSpillIo::default()
+        };
+        if plan.writes.is_empty() {
+            return io;
+        }
+        #[cfg(test)]
+        {
+            let pause = self
+                .checkpoint_io_pause
+                .lock()
+                .expect("checkpoint test pause mutex poisoned")
+                .clone();
+            if let Some(pause) = pause {
+                pause.planned.notify_one();
+                pause.release.notified().await;
+            }
+        }
+        let dir = crate::store::store_dir(&self.config);
+        let budget = std::time::Duration::from_millis(self.config.external_checkpoint_io_budget_ms);
+        let started = std::time::Instant::now();
+        for (index, (item_id, hash, bytes)) in plan.writes.into_iter().enumerate() {
+            let path = crate::store::external_card_path(&dir, item_id, &hash);
+            // 内容寻址幂等：文件已存在即卡片已是同一字节，无需重写。
+            if tokio::fs::try_exists(&path).await.unwrap_or(false) {
+                io.written.push((item_id, hash.clone()));
+                io.spilled.push((item_id, hash));
+                continue;
+            }
+            // Checked after the first write so a spent budget still makes
+            // progress instead of live-locking the spill forever. What is
+            // left stays inline; the next capture continues.
+            if index > 0 && started.elapsed() >= budget {
+                break;
+            }
+            match crate::store::write_external_card_async(&dir, &path, &bytes).await {
+                Ok(()) => {
+                    io.written.push((item_id, hash.clone()));
+                    io.spilled.push((item_id, hash));
+                }
+                // Store IO 失败：该条目本次保持内联（宁可 checkpoint 大，
+                // 不可丢恢复状态）；与外部化失败同一诚实语义。
+                Err(_) => continue,
+            }
+        }
+        io
+    }
+
+    /// F2: page in at most `budget` pending spill cards. Restore leaves the
+    /// tail of a long history as `(id, card hash)` rows; this is the bounded
+    /// drain every completeness-sensitive caller runs before it needs the
+    /// whole external set. A row whose id was claimed in the meantime is
+    /// dropped without touching the live owner, and a missing or corrupt
+    /// card is counted exactly like a missing card at restore time.
+    async fn hydrate_pending_cards(&self, budget: usize) -> usize {
+        let rows = {
+            let mut state = self.state.lock().await;
+            if state.pending_external_cards.is_empty() {
+                return 0;
+            }
+            let take = budget.min(state.pending_external_cards.len());
+            let rest = state.pending_external_cards.split_off(take);
+            std::mem::replace(&mut state.pending_external_cards, rest)
+        };
+        let dir = crate::store::store_dir(&self.config);
+        let mut entries = Vec::new();
+        let mut missing = 0u64;
+        for (item_id, hash) in &rows {
+            let path = crate::store::external_card_path(&dir, *item_id, hash);
+            match crate::store::read_external_card_async(&path, *item_id).await {
+                Ok(Some(entry)) => entries.push((entry, hash.clone())),
+                _ => missing += 1,
+            }
+        }
+        let mut state = self.state.lock().await;
+        let mut claimed = Vec::new();
+        for (entry, hash) in entries {
+            // Someone else may own this id now (a rebuild, an admit). The
+            // live owner wins; a paged-in card never creates a second owner.
+            if state.external.get(entry.item_id).is_some()
+                || crate::store::catalog_body(&state, entry.item_id).is_some()
+            {
+                continue;
+            }
+            claimed.push((entry, hash));
+        }
+        let installed = claimed.len();
+        state
+            .external
+            .merge_paged(claimed.iter().map(|(entry, _)| entry.clone()).collect());
+        for (entry, hash) in claimed {
+            state.external.record_card(entry.item_id, hash);
+        }
+        state.external_cards_missing = state.external_cards_missing.saturating_add(missing);
+        state.sync_catalog();
+        installed
+    }
+
+    /// F2: drain every pending spill row, in bounded batches. Callers that
+    /// need the complete external set (search, GC planning) use this: the
+    /// per-batch I/O stays bounded, the total is paid once after a restore.
+    async fn hydrate_all_pending_cards(&self) {
+        let batch = self.config.external_restore_card_batch.max(1);
+        loop {
+            if self.state.lock().await.pending_external_cards.is_empty() {
+                return;
+            }
+            // Every batch removes its rows from the queue (installed, or
+            // counted as a missing card), so this terminates.
+            self.hydrate_pending_cards(batch).await;
+        }
+    }
+
+    /// F2: page in one pending row by id (an id lookup must keep working the
+    /// moment a restore returns). Returns whether the entry became live.
+    async fn hydrate_card_for(&self, item_id: ContextItemId) -> bool {
+        let hash = {
+            let mut state = self.state.lock().await;
+            let Some(position) = state
+                .pending_external_cards
+                .iter()
+                .position(|(id, _)| *id == item_id)
+            else {
+                return false;
+            };
+            state.pending_external_cards.remove(position).1
+        };
+        let dir = crate::store::store_dir(&self.config);
+        let path = crate::store::external_card_path(&dir, item_id, &hash);
+        let entry = crate::store::read_external_card_async(&path, item_id).await;
+        let mut state = self.state.lock().await;
+        match entry {
+            Ok(Some(entry)) if state.external.get(item_id).is_none() => {
+                state.external.merge_paged(vec![entry]);
+                state.external.record_card(item_id, hash);
+                state.sync_catalog();
+                true
+            }
+            Ok(Some(_)) => false,
+            _ => {
+                state.external_cards_missing = state.external_cards_missing.saturating_add(1);
+                false
+            }
+        }
+    }
+}
+
+/// F2: one capture's spill plan, computed while the state lock is held.
+/// Everything expensive is either already accounted for here (bounded
+/// serialization) or happens after the lock is released.
+#[derive(Debug, Default)]
+struct ExternalSpillPlan {
+    /// Rows whose card is already on disk for the *current* metadata: they
+    /// enter the manifest with no serialization and no write.
+    recorded: Vec<(ContextItemId, String)>,
+    /// Cards this capture must write: (id, card hash, bytes).
+    writes: Vec<(ContextItemId, String, Vec<u8>)>,
+    /// Entries this capture serialized. Bounded by the scan budget; an
+    /// entry the budgets leave out simply stays inline this time.
+    scanned: usize,
+}
+
+/// Result of a capture's off-lock card I/O.
+#[derive(Debug, Default)]
+struct ExternalSpillIo {
+    /// Manifest rows: recorded plus cards this capture put on disk.
+    spilled: Vec<(ContextItemId, String)>,
+    /// Cards proven on disk by this capture (written, or found already
+    /// there), to be recorded in the directory under the fresh lock.
+    written: Vec<(ContextItemId, String)>,
+}
+
+/// Whether an external entry may have its metadata spilled to a card.
+/// `Cold` entries still age and count accesses in memory; Pinned and
+/// keep-alive entries never leave.
+fn spillable_entry(entry: &agent_contracts::ExternalizedContext) -> bool {
+    entry.residency == agent_contracts::ContextResidency::External
+        && entry.retention != agent_contracts::ContextRetention::Pinned
+        && !entry.keep_alive
+}
+
+/// F2 phase 1 of a capture: decide what the manifest holds, under budgets
+/// that bound the lock-held work rather than only the number of new cards.
+fn plan_external_spill(state: &State, config: &SimpleContextConfig) -> ExternalSpillPlan {
+    let mut plan = ExternalSpillPlan {
+        // Rows a restore has not paged in yet are already on disk and are
+        // not in the inline array either: they must stay in the manifest or
+        // this capture would drop them.
+        recorded: state.pending_external_cards.clone(),
+        ..ExternalSpillPlan::default()
+    };
+    let total = state.external.len();
+    if total <= config.external_checkpoint_inline_target {
+        return plan;
+    }
+    let over = total.saturating_sub(config.external_checkpoint_inline_target);
+    let mut bytes_left = config.external_checkpoint_card_bytes;
+    let mut writes_left = config.external_checkpoint_card_batch;
+    // 最旧优先（槽位序即外置序）。
+    for entry in state
+        .external
+        .iter()
+        .filter(|entry| spillable_entry(entry))
+        .take(over)
+    {
+        // A recorded card already holds this entry's current metadata: the
+        // row is free (one hash lookup, no serialization, no I/O), so it
+        // does not spend the scan budget. That is what lets a capture keep
+        // a long tail spilled while only paying for *changed* entries.
+        if let Some(hash) = state.external.card_hash(entry.item_id) {
+            plan.recorded.push((entry.item_id, hash.to_string()));
+            continue;
+        }
+        if plan.scanned >= config.external_checkpoint_scan_budget || writes_left == 0 {
+            break;
+        }
+        plan.scanned += 1;
+        let bytes = crate::store::external_card_bytes(entry);
+        if bytes.len() as u64 > bytes_left {
+            continue;
+        }
+        bytes_left -= bytes.len() as u64;
+        writes_left -= 1;
+        let hash = crate::store::checksum_hex(&bytes)[..12].to_string();
+        plan.writes.push((entry.item_id, hash, bytes));
+    }
+    plan
 }
 
 fn has_exactly_one_owner(state: &State, item_id: ContextItemId) -> bool {
@@ -936,6 +1210,12 @@ impl ContextEngine for SimpleContextEngine {
         // another operation temporarily releases that lock for store I/O, and
         // it also covers the optional distill plan/await/commit span below.
         let _gate = self.op_gate.lock().await;
+        // F2: a directive names an item by id and its plan runs under the
+        // state lock, so pending spill rows page in first (bounded batches).
+        // Plain message/tool ingress never pays for cold metadata.
+        if matches!(ingress, ContextIngress::ContextDirective { .. }) {
+            self.hydrate_all_pending_cards().await;
+        }
         let mut distill: Option<DistillJob> = None;
         // The only lock boundary inside one ingest: a directive may read an
         // externalized blob with the state lock released. `(action, store id
@@ -1516,6 +1796,10 @@ impl ContextEngine for SimpleContextEngine {
         // still reference the blob. The file stays; the startup reconcile
         // reclaims it as a stale duplicate against the restored state, and
         // Storage GC remains the only other deleter.
+        //
+        // F2: a pass plans against the whole external set, so pending spill
+        // rows page in first (bounded batches, off-lock).
+        self.hydrate_all_pending_cards().await;
         let mut state = self.state.lock().await;
         state.event_seq += 1;
         let now_tick = state.event_seq;
@@ -1562,6 +1846,11 @@ impl ContextEngine for SimpleContextEngine {
         // snapshot must not silently end the older snapshot's restore
         // promise (R03).
         let _gate = self.op_gate.lock().await;
+        // F2: an unpaged spill row is a live owner whose metadata simply is
+        // not in memory. Page the rows in before the sweep decides what is
+        // orphaned, so paging can never turn into deletion or a re-owned
+        // duplicate.
+        self.hydrate_all_pending_cards().await;
         let (map_checksums, resident_ids) = {
             let mut state = self.state.lock().await;
             state.event_seq += 1;
@@ -1929,6 +2218,10 @@ impl ContextEngine for SimpleContextEngine {
         // whole operation shares the mutation lane. An incomplete catalog may
         // additionally release the state lock for checked Stored-body reads.
         let _gate = self.op_gate.lock().await;
+        // F2: search coverage is unchanged by restore paging — a pending
+        // spill row is paged in first (bounded batches) so the catalog and
+        // the residual scan see the same external set they always did.
+        self.hydrate_all_pending_cards().await;
         let read_plan = {
             let mut state = self.state.lock().await;
             state.sync_catalog();
@@ -1992,6 +2285,10 @@ impl ContextEngine for SimpleContextEngine {
         // Inspect stamps access state and therefore shares the same mutation
         // lane as GC/materialization even though it performs no store I/O.
         let _gate = self.op_gate.lock().await;
+        // F2: an id lookup works the moment a restore returns — a spill row
+        // still on the pending directory pages in its own card, without
+        // touching the rest of the tail.
+        self.hydrate_card_for(item_id).await;
         let mut state = self.state.lock().await;
         state.sync_catalog();
         // 目录级 inspect：Resident/Warm 投影 heap，Stored 用 map 描述符。
@@ -2008,6 +2305,9 @@ impl ContextEngine for SimpleContextEngine {
         // state lock, then stamps that same owner. Serialize the span with
         // GC and restore so it cannot return bytes from a replaced owner.
         let _gate = self.op_gate.lock().await;
+        // F2: a pending spill row pages in by id before the read plan, so a
+        // bounded restore never makes a stored body unreachable.
+        self.hydrate_card_for(item_id).await;
         // Catalog bodies (Resident / Warm) are returned from heap/buffer.
         // Catalog residency is not the selected working set; this is a
         // stamped read, not a reactivation. Stored bodies still come from
@@ -2076,56 +2376,41 @@ impl ContextEngine for SimpleContextEngine {
     async fn checkpoint(&self) -> AgentResult<Value> {
         // Serialized with the multi-phase operations so a checkpoint never
         // captures a state torn across a GC/storage-GC commit boundary.
-        let _gate = self.op_gate.lock().await;
-        let state = self.state.lock().await;
+        //
         // CTX-9 残余：外置尾分片——最旧的超额 External 条目把元数据卡片
-        // 写进既有 store（内容寻址、幂等：未变化的条目命中同一文件，零
-        // 重写），checkpoint 只携带内联段＋`external_spilled` 寻址清单。
-        // 写入预算限制单次 capture 的 IO；预算耗尽时剩余条目本次保持
-        // 内联（checkpoint 如实变大），下次 capture 继续收敛。搜索/召回/
-        // 目录语义不变：条目仍全部驻留内存，分片只压缩 checkpoint 字节。
-        let inline_target = self.config.external_checkpoint_inline_target;
-        let over: Vec<&agent_contracts::ExternalizedContext> =
-            if state.external.len() <= inline_target {
-                Vec::new()
-            } else {
-                // 最旧优先（槽位序即外置序）；仅 External 驻留——Cold 仍在
-                // 老化通道上活跃访问计数，Pinned/keep_alive 永不离开内存。
-                state
-                    .external
-                    .iter()
-                    .filter(|entry| {
-                        entry.residency == agent_contracts::ContextResidency::External
-                            && entry.retention != agent_contracts::ContextRetention::Pinned
-                            && !entry.keep_alive
-                    })
-                    .take(state.external.len().saturating_sub(inline_target))
-                    .collect()
-            };
-        let dir = crate::store::store_dir(&self.config);
-        let mut spilled: Vec<(ContextItemId, String)> = Vec::new();
-        let mut budget = self.config.external_checkpoint_card_batch;
-        for entry in &over {
-            let card = crate::store::external_card_bytes(entry);
-            let hash = crate::store::checksum_hex(&card)[..12].to_string();
-            let path = crate::store::external_card_path(&dir, entry.item_id, &hash);
-            // 内容寻址幂等：文件已存在即卡片已是最早 capture 的同一字节，
-            // 无需重写，也不消耗预算。
-            if tokio::fs::try_exists(&path).await.unwrap_or(false) {
-                spilled.push((entry.item_id, hash));
-                continue;
-            }
-            if budget == 0 {
-                break;
-            }
-            budget -= 1;
-            match crate::store::write_external_card_async(&dir, &path, &card).await {
-                Ok(()) => spilled.push((entry.item_id, hash)),
-                // Store IO 失败：该条目本次保持内联（宁可 checkpoint 大，
-                // 不可丢恢复状态）；与外部化失败同一诚实语义。
-                Err(_) => continue,
-            }
+        // 写进既有 store（内容寻址、幂等），checkpoint 只携带内联段＋
+        // `external_spilled` 寻址清单。
+        //
+        // F2 三阶段（与 GC/storage GC/reconcile 同一形状）：在状态锁内只
+        // planning（有界扫描、有界序列化字节），卡片存在性探测与写入在锁
+        // 释放后进行，最后取新锁登记卡片并序列化。锁内工作因此与外置历史
+        // 长度无关；已有卡片的未变条目连序列化都不做，单次 capture 的成本
+        // 跟随*变化*条目数。
+        let _gate = self.op_gate.lock().await;
+        let plan = {
+            let state = self.state.lock().await;
+            plan_external_spill(&state, &self.config)
+        };
+        let io = self.run_external_spill_io(plan).await;
+        let mut state = self.state.lock().await;
+        for (id, hash) in &io.written {
+            state.external.record_card(*id, hash.clone());
         }
+        // A manifest row must name an entry this checkpoint really is not
+        // carrying inline: either the live map owns it (its metadata is in
+        // the card) or it is a still-pending restore row (already on disk).
+        // The gate keeps the state from moving under the I/O phase; this is
+        // the cheap proof rather than an assumption.
+        let pending: std::collections::HashSet<ContextItemId> = state
+            .pending_external_cards
+            .iter()
+            .map(|(id, _)| *id)
+            .collect();
+        let spilled: Vec<(ContextItemId, String)> = io
+            .spilled
+            .into_iter()
+            .filter(|(id, _)| state.external.get(*id).is_some() || pending.contains(id))
+            .collect();
         let mut value = checkpoint::serialize(&state)?;
         if !spilled.is_empty() {
             let spilled_ids: std::collections::HashSet<ContextItemId> =
@@ -2169,27 +2454,50 @@ impl ContextEngine for SimpleContextEngine {
         // 卡片缺失/损坏（典型：已过保留窗的旧 checkpoint，其条目随后被
         // Storage GC 删除）→ 该条目缺席＋计数如实上报，恢复整体不失败
         // ——与旧 checkpoint 的 blob 缺失同一诚实降级，绝不伪造完整。
+        //
+        // F2: the read is *bounded* — at most `external_restore_card_batch`
+        // cards are paged in before restore returns. The rest stay as
+        // `(id, card hash)` rows in `pending_external_cards`: the ids are
+        // known (so no blob or card can be reclaimed under them and an id
+        // lookup pages its own card in) while the metadata is not in
+        // memory, so a restore's cost does not track total history length.
+        // Merge and re-validate stay on the local candidate (F1): a
+        // structural reject never installs, and the live lock is taken only
+        // after the candidate is valid.
+        let mut missing_cards: u64 = 0;
+        let mut rehydrated: Vec<(agent_contracts::ExternalizedContext, String)> = Vec::new();
+        let mut deferred_cards: Vec<(ContextItemId, String)> = Vec::new();
         if !spilled.is_empty() {
             let dir = crate::store::store_dir(&self.config);
-            let mut missing_cards: u64 = 0;
-            let mut rehydrated: Vec<agent_contracts::ExternalizedContext> = Vec::new();
-            for (id, hash) in &spilled {
+            let batch = self.config.external_restore_card_batch;
+            for (index, (id, hash)) in spilled.iter().enumerate() {
+                if index >= batch {
+                    deferred_cards.push((*id, hash.clone()));
+                    continue;
+                }
                 let path = crate::store::external_card_path(&dir, *id, hash);
                 match crate::store::read_external_card_async(&path, *id).await {
-                    Ok(Some(entry)) => rehydrated.push(entry),
+                    Ok(Some(entry)) => rehydrated.push((entry, hash.clone())),
                     // 缺失（Ok(None)）与损坏（Err）同一诚实计数。
                     _ => missing_cards += 1,
                 }
             }
-            if !rehydrated.is_empty() || missing_cards > 0 {
-                let mut entries: Vec<agent_contracts::ExternalizedContext> =
-                    next.external.take_all();
-                entries.extend(rehydrated);
-                entries.sort_by_key(|entry| entry.externalized_at_tick);
-                next.external.replace_all(entries);
-                next.external_cards_missing =
-                    next.external_cards_missing.saturating_add(missing_cards);
-            }
+        }
+        if !rehydrated.is_empty() || missing_cards > 0 {
+            let mut entries: Vec<agent_contracts::ExternalizedContext> = next.external.take_all();
+            entries.extend(rehydrated.iter().map(|(entry, _)| entry.clone()));
+            entries.sort_by_key(|entry| entry.externalized_at_tick);
+            next.external.replace_all(entries);
+            next.external_cards_missing = next.external_cards_missing.saturating_add(missing_cards);
+        }
+        // The card each rehydrated entry came from still describes it, so the
+        // next capture re-uses that file instead of serializing the entry
+        // again (`replace_all` cleared the directory, hence after it).
+        for (entry, hash) in &rehydrated {
+            next.external.record_card(entry.item_id, hash.clone());
+        }
+        next.pending_external_cards = deferred_cards;
+        if !spilled.is_empty() {
             next.sync_catalog();
             checkpoint::validate(&next)?;
         }
@@ -2266,6 +2574,10 @@ impl ContextEngine for SimpleContextEngine {
         // serializes this with GC/reconcile/checkpoint/restore so the
         // commit always sees the state the plan was derived from.
         let _gate = self.op_gate.lock().await;
+        // F2: deletion must see every owner. A pending spill row's metadata
+        // is not in memory, so it pages in before the plan — paging is never
+        // allowed to look like an unreferenced blob.
+        self.hydrate_all_pending_cards().await;
         let plan = {
             let mut state = self.state.lock().await;
             state.event_seq += 1;

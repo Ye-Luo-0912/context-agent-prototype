@@ -5,7 +5,8 @@
 //! 卡片缺失/损坏 = 恢复的 external 集合不完整，如实计数、整体不失败。
 
 use agent_contracts::{
-    ContextEngine, ContextIngress, ContextKind, ContextResidency, ContextRetention, ContextScope,
+    ContextEngine, ContextIngress, ContextKind, ContextQuery, ContextResidency, ContextRetention,
+    ContextScope,
 };
 
 use crate::checkpoint;
@@ -13,14 +14,52 @@ use crate::engine::{SimpleContextConfig, SimpleContextEngine};
 
 use super::harness::open_focus;
 
-async fn spill_engine(dir: &tempfile::TempDir, inline_target: usize) -> SimpleContextEngine {
-    SimpleContextEngine::new(SimpleContextConfig {
+fn spill_config(dir: &tempfile::TempDir, inline_target: usize) -> SimpleContextConfig {
+    SimpleContextConfig {
         external_checkpoint_inline_target: inline_target,
         external_checkpoint_card_batch: 64,
         gc_buffer_capacity: 0,
         context_store_dir: Some(dir.path().to_path_buf()),
         ..SimpleContextConfig::default()
-    })
+    }
+}
+
+async fn spill_engine(dir: &tempfile::TempDir, inline_target: usize) -> SimpleContextEngine {
+    SimpleContextEngine::new(spill_config(dir, inline_target))
+}
+
+/// Manifest rows of one capture, in manifest order.
+fn manifest_ids(value: &serde_json::Value) -> Vec<agent_contracts::ContextItemId> {
+    value
+        .get("external_spilled")
+        .and_then(|v| v.as_array())
+        .map(|rows| {
+            rows.iter()
+                .map(|row| {
+                    agent_contracts::ContextItemId::parse_ref(row["id"].as_str().unwrap()).unwrap()
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+fn inline_len(value: &serde_json::Value) -> usize {
+    value
+        .get("external")
+        .and_then(|v| v.as_array())
+        .map(|rows| rows.len())
+        .unwrap_or(0)
+}
+
+fn card_files(dir: &std::path::Path) -> Vec<String> {
+    let Ok(entries) = std::fs::read_dir(dir.join("cards")) else {
+        return Vec::new();
+    };
+    entries
+        .filter_map(|entry| entry.ok())
+        .filter(|entry| entry.path().extension().is_some_and(|ext| ext == "card"))
+        .filter_map(|entry| entry.file_name().into_string().ok())
+        .collect()
 }
 
 /// Externalize `n` items (empty eviction buffer → straight to the store) and
@@ -278,6 +317,361 @@ async fn reconcile_cleans_orphan_cards_and_honors_protection() {
         "the protected card survives"
     );
 }
+
+// ---------------------------------------------------------------------------
+// F2: the capture's work is bounded and happens off the state lock, and a
+// restore does not have to load the whole cold tail before the next turn.
+// ---------------------------------------------------------------------------
+
+/// Deterministic barrier, no timing inference: park a capture exactly at its
+/// card-write boundary and prove an unrelated state read answers *while the
+/// writes are parked*. The timeout is a deadlock guard; the assertion is that
+/// diagnostics returns at all before the release fires.
+#[tokio::test]
+async fn capture_card_writes_run_with_the_state_lock_released() {
+    let dir = tempfile::tempdir().unwrap();
+    let engine = std::sync::Arc::new(spill_engine(&dir, 10).await);
+    open_focus(&engine, "prove the capture lock boundary").await;
+    externalize_n(&engine, 15).await;
+
+    let planned = std::sync::Arc::new(tokio::sync::Notify::new());
+    let release = std::sync::Arc::new(tokio::sync::Notify::new());
+    *engine
+        .checkpoint_io_pause
+        .lock()
+        .expect("checkpoint test pause mutex poisoned") = Some(crate::engine::IoBoundaryPause {
+        planned: std::sync::Arc::clone(&planned),
+        release: std::sync::Arc::clone(&release),
+    });
+
+    let capture = {
+        let engine = std::sync::Arc::clone(&engine);
+        tokio::spawn(async move { engine.checkpoint().await })
+    };
+    tokio::time::timeout(std::time::Duration::from_secs(10), planned.notified())
+        .await
+        .expect("the capture reached its card-write boundary");
+
+    let diagnostics = tokio::time::timeout(std::time::Duration::from_secs(10), {
+        let engine = std::sync::Arc::clone(&engine);
+        async move { engine.diagnostics().await }
+    })
+    .await
+    .expect("diagnostics must not queue behind the capture's card writes")
+    .unwrap();
+    assert!(
+        diagnostics.total_items >= 15,
+        "the parked capture answered from a live state: {diagnostics:?}"
+    );
+
+    release.notify_one();
+    let value = capture.await.unwrap().unwrap();
+    assert_eq!(
+        manifest_ids(&value).len(),
+        5,
+        "the released capture still spilled the over-target tail"
+    );
+    *engine
+        .checkpoint_io_pause
+        .lock()
+        .expect("checkpoint test pause mutex poisoned") = None;
+}
+
+/// A tail nobody touched is spilled from the recorded-card directory: one
+/// hash lookup per entry, no serialization and no write. The starved engine
+/// has *zero* write, byte and serialization budget, so every manifest row it
+/// produces can only come from that directory.
+#[tokio::test]
+async fn an_unchanged_tail_respills_without_reserializing_it() {
+    let dir = tempfile::tempdir().unwrap();
+    let engine = spill_engine(&dir, 10).await;
+    open_focus(&engine, "spill once, then re-spill for free").await;
+    externalize_n(&engine, 30).await;
+
+    let first = engine.checkpoint().await.unwrap();
+    assert_eq!(manifest_ids(&first).len(), 20);
+    let cards_after_first = card_files(dir.path()).len();
+    assert_eq!(cards_after_first, 20);
+
+    let starved = SimpleContextEngine::new(SimpleContextConfig {
+        external_checkpoint_card_batch: 0,
+        external_checkpoint_card_bytes: 0,
+        external_checkpoint_scan_budget: 0,
+        ..spill_config(&dir, 10)
+    });
+    starved.restore(first).await.unwrap();
+    let second = starved.checkpoint().await.unwrap();
+
+    assert_eq!(
+        manifest_ids(&second).len(),
+        20,
+        "an unchanged tail stays spilled without any serialization budget"
+    );
+    assert_eq!(inline_len(&second), 10);
+    assert_eq!(
+        card_files(dir.path()).len(),
+        cards_after_first,
+        "no card is rewritten for an unchanged entry"
+    );
+}
+
+/// The directory only ever claims what is really on disk: handing out a
+/// mutable entry drops its row, so the next capture serializes that entry
+/// again and the card it writes describes the new metadata.
+#[tokio::test]
+async fn a_mutated_entry_loses_its_recorded_card_and_is_written_again() {
+    let dir = tempfile::tempdir().unwrap();
+    let engine = spill_engine(&dir, 10).await;
+    open_focus(&engine, "mutate a spilled entry").await;
+    let ids = externalize_n(&engine, 15).await;
+
+    let first = engine.checkpoint().await.unwrap();
+    assert_eq!(manifest_ids(&first).len(), 5);
+    assert_eq!(engine.state.lock().await.external.recorded_cards(), 5);
+
+    {
+        let mut state = engine.state.lock().await;
+        state.external.get_mut(ids[0]).unwrap().last_access_tick = 4242;
+    }
+    assert_eq!(
+        engine.state.lock().await.external.recorded_cards(),
+        4,
+        "a mutable handle drops the card claim for that entry"
+    );
+
+    let second = engine.checkpoint().await.unwrap();
+    assert_eq!(manifest_ids(&second).len(), 5);
+    assert_eq!(
+        card_files(dir.path()).len(),
+        6,
+        "only the mutated entry is serialized again"
+    );
+}
+
+/// The serialization budget bounds one capture's lock-held work; because
+/// already-carded entries are free, successive captures converge on the whole
+/// over-target tail instead of stalling at the first window.
+#[tokio::test]
+async fn a_capture_serialization_budget_bounds_one_pass_and_converges() {
+    let dir = tempfile::tempdir().unwrap();
+    let engine = SimpleContextEngine::new(SimpleContextConfig {
+        external_checkpoint_scan_budget: 5,
+        ..spill_config(&dir, 10)
+    });
+    open_focus(&engine, "bound one capture").await;
+    externalize_n(&engine, 30).await;
+
+    let mut manifest_sizes = Vec::new();
+    for _ in 0..4 {
+        let value = engine.checkpoint().await.unwrap();
+        manifest_sizes.push(manifest_ids(&value).len());
+    }
+    assert_eq!(
+        manifest_sizes,
+        vec![5, 10, 15, 20],
+        "each capture serializes at most the budget, and the tail converges"
+    );
+    assert_eq!(card_files(dir.path()).len(), 20);
+
+    let converged = engine.checkpoint().await.unwrap();
+    assert_eq!(inline_len(&converged), 10);
+    engine.restore(converged).await.unwrap();
+    let state = engine.state.lock().await;
+    assert_eq!(state.external.len(), 30);
+    assert_eq!(state.external_cards_missing, 0);
+}
+
+/// A restore reads one bounded batch of cards and leaves the rest as
+/// `(id, card hash)` rows: the next turn's prompt assembly needs no cold
+/// metadata, an id lookup pages in its own card, and search still sees the
+/// complete external set.
+#[tokio::test]
+async fn a_restore_pages_in_a_bounded_batch_and_defers_the_rest() {
+    let dir = tempfile::tempdir().unwrap();
+    let engine = spill_engine(&dir, 10).await;
+    open_focus(&engine, "restore without the whole tail").await;
+    let ids = externalize_n(&engine, 30).await;
+    let value = engine.checkpoint().await.unwrap();
+    let spilled = manifest_ids(&value);
+    assert_eq!(spilled.len(), 20);
+
+    let restored = SimpleContextEngine::new(SimpleContextConfig {
+        external_restore_card_batch: 5,
+        ..spill_config(&dir, 10)
+    });
+    restored.restore(value).await.unwrap();
+    {
+        let state = restored.state.lock().await;
+        assert_eq!(
+            state.external.len(),
+            15,
+            "the inline entries plus exactly one bounded batch of cards"
+        );
+        assert_eq!(
+            state.pending_external_cards.len(),
+            15,
+            "the rest of the tail is a directory of (id, card hash) rows"
+        );
+    }
+    let total_while_pending = restored.diagnostics().await.unwrap().total_items;
+
+    let preview = restored
+        .materialize(ContextQuery {
+            current_input: "continue".into(),
+            budget_tokens: 4_096,
+            hints: Default::default(),
+        })
+        .await
+        .unwrap();
+    assert!(preview.materialization_id > 0);
+    assert_eq!(
+        restored.state.lock().await.pending_external_cards.len(),
+        15,
+        "the next turn's materialization reads no cold metadata"
+    );
+
+    // An id lookup works the moment the restore returns.
+    let deferred = spilled[19];
+    let fetched = restored.fetch_external(deferred).await.unwrap();
+    assert!(
+        fetched.is_some(),
+        "a deferred row is still retrievable by id"
+    );
+    {
+        let state = restored.state.lock().await;
+        assert_eq!(state.pending_external_cards.len(), 14);
+        assert!(state.external.get(deferred).is_some());
+    }
+
+    // Search coverage is unchanged: the directory drains in bounded batches
+    // before candidates are generated.
+    let hits = restored
+        .search_external(agent_contracts::ContextSearchQuery::new(
+            "unique-token-19",
+            8,
+        ))
+        .await
+        .unwrap();
+    assert!(
+        hits.iter().any(|hit| hit.item_id == ids[19]),
+        "a spilled entry is searchable again after the drain"
+    );
+    {
+        let state = restored.state.lock().await;
+        assert!(
+            state.pending_external_cards.is_empty(),
+            "search drains the pending directory"
+        );
+        assert_eq!(state.external.len(), 30);
+        assert_eq!(state.external_cards_missing, 0);
+    }
+    assert_eq!(
+        restored.diagnostics().await.unwrap().total_items,
+        total_while_pending,
+        "the logical total never dipped while rows were pending"
+    );
+
+    // Paging kept the map in externalization order, so the next capture's
+    // oldest-first choice is the same tail as before the restore.
+    let recaptured = restored.checkpoint().await.unwrap();
+    assert_eq!(
+        manifest_ids(&recaptured),
+        spilled,
+        "a paged-in entry lands in externalization order, not at the end"
+    );
+}
+
+/// A capture taken before any paging still names every deferred row, so a
+/// bounded restore followed by a checkpoint cannot lose the tail.
+#[tokio::test]
+async fn a_capture_taken_before_paging_keeps_every_deferred_row() {
+    let dir = tempfile::tempdir().unwrap();
+    let engine = spill_engine(&dir, 10).await;
+    open_focus(&engine, "capture before paging").await;
+    externalize_n(&engine, 30).await;
+    let value = engine.checkpoint().await.unwrap();
+
+    let restored = SimpleContextEngine::new(SimpleContextConfig {
+        external_restore_card_batch: 0,
+        ..spill_config(&dir, 10)
+    });
+    restored.restore(value).await.unwrap();
+    {
+        let state = restored.state.lock().await;
+        assert_eq!(state.pending_external_cards.len(), 20);
+        assert_eq!(state.external.len(), 10);
+    }
+
+    let second = restored.checkpoint().await.unwrap();
+    assert_eq!(
+        manifest_ids(&second).len(),
+        20,
+        "a capture re-emits the rows it has not paged in"
+    );
+    assert_eq!(inline_len(&second), 10);
+
+    let reloaded = spill_engine(&dir, 10).await;
+    reloaded.restore(second).await.unwrap();
+    let state = reloaded.state.lock().await;
+    assert_eq!(
+        state.external.len(),
+        30,
+        "every entry survives the round trip"
+    );
+    assert_eq!(state.external_cards_missing, 0);
+}
+
+/// A pending row is a live owner whose metadata is not in memory. The
+/// reconcile sweep must page it in before deciding what is orphaned —
+/// otherwise a bounded restore would hand every deferred body to the
+/// stale-blob deletion branch.
+#[tokio::test]
+async fn a_deferred_restore_row_is_never_reclaimed_as_an_orphan() {
+    let dir = tempfile::tempdir().unwrap();
+    let engine = spill_engine(&dir, 10).await;
+    open_focus(&engine, "reconcile after a bounded restore").await;
+    let ids = externalize_n(&engine, 30).await;
+    let value = engine.checkpoint().await.unwrap();
+
+    let restored = SimpleContextEngine::new(SimpleContextConfig {
+        external_restore_card_batch: 0,
+        ..spill_config(&dir, 10)
+    });
+    restored.restore(value).await.unwrap();
+    assert_eq!(restored.state.lock().await.pending_external_cards.len(), 20);
+
+    let report = restored.reconcile_store().await.unwrap();
+    assert_eq!(
+        report.deleted_stale, 0,
+        "a pending row still owns its blob: {:?}",
+        report.reasons
+    );
+    assert_eq!(
+        report.external_cards_removed, 0,
+        "a pending row's card is not an orphan: {:?}",
+        report.reasons
+    );
+    {
+        let state = restored.state.lock().await;
+        assert_eq!(
+            state.external.len(),
+            30,
+            "the sweep paged the directory in before classifying blobs"
+        );
+        assert!(state.pending_external_cards.is_empty());
+    }
+    for id in [ids[0], ids[19], ids[29]] {
+        assert!(
+            restored.fetch_external(id).await.unwrap().is_some(),
+            "every body stays readable by id: {id}"
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// F1: a hostile or malformed spill restore must fail closed without
+// replacing live state. Kept alongside F2's bounded paging.
+// ---------------------------------------------------------------------------
 
 const LIVE_MARKER: &str = "LIVE-MARKER-MUST-SURVIVE";
 
