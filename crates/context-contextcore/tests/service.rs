@@ -1473,3 +1473,138 @@ fn service_and_local_root_parity(counts: &[usize]) {
         "the protected root must parse identically in-process and across the service boundary: {counts:?}"
     );
 }
+
+/// N01 (baseline `6eda2474` re-review): the real service process's startup
+/// reconcile runs BEFORE any restore installs recovery ownership, so it must
+/// be non-destructive. A sharded checkpoint's spill cards survive a full
+/// service exit → same-store restart → restore, and every restored entry
+/// carries the exact metadata captured at checkpoint time — not the
+/// degraded "rebuilt" shape the old startup reconcile's orphan-card sweep
+/// produced.
+#[tokio::test]
+async fn a_service_restart_over_one_store_keeps_the_sharded_checkpoints_cards() {
+    // Build the spilled state in-process: the service binary's default
+    // config never spills (inline target 2048), so the writer engine uses a
+    // small inline target while the store layout stays identical.
+    let store = IsolatedStore::new("n01-restart");
+    let local = context_simple::SimpleContextEngine::new(context_simple::SimpleContextConfig {
+        external_checkpoint_inline_target: 10,
+        gc_buffer_capacity: 0,
+        context_store_dir: Some(store.path().to_path_buf()),
+        ..context_simple::SimpleContextConfig::default()
+    });
+    let overflow = context_simple::SimpleContextConfig::default().gc_buffer_capacity + 1;
+    for item in 0..overflow {
+        local
+            .ingest(ContextIngress::ToolObservation {
+                facts: None,
+                output: ToolOutput {
+                    call_id: format!("n01-{item}"),
+                    tool_name: "shell.exec".into(),
+                    ok: true,
+                    summary: "historical result".into(),
+                    model_content: format!(
+                        "step {item}: fix Ledger.rs {}",
+                        "y".repeat(120)
+                    ),
+                    artifact_ref: None,
+                    metadata: json!({ "path": "Ledger.rs" }),
+                },
+                scope_id: None,
+            })
+            .await
+            .unwrap();
+    }
+    local
+        .maintain(ContextMaintenanceTrigger::AfterModel)
+        .await
+        .unwrap();
+    let gc = local.gc().await.unwrap();
+    assert!(
+        gc.externalized > 0,
+        "the overflow must externalize bodies: {gc:?}"
+    );
+    // Age the Cold entries to External residency: spill cards only cover
+    // entries whose stored life has aged past gc_external_ttl_generations
+    // (4) idle full-GC generations. Each extra pass bumps the epoch without
+    // touching the entries.
+    for _ in 0..5 {
+        local.gc().await.unwrap();
+    }
+
+    let checkpoint = local.checkpoint().await.unwrap();
+    let spilled_rows = checkpoint["external_spilled"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default();
+    assert!(
+        !spilled_rows.is_empty(),
+        "the capture must spill metadata cards: externalized={} spilled={} external_len={}",
+        gc.externalized,
+        spilled_rows.len(),
+        checkpoint["external"]
+            .as_array()
+            .map(|a| a.len())
+            .unwrap_or(0),
+    );
+    // The metadata as captured — this is what the restore promise covers.
+    let mut captured = Vec::new();
+    for row in &spilled_rows {
+        let id =
+            ContextItemId::parse_ref(row["id"].as_str().unwrap()).unwrap();
+        let entry = local
+            .inspect_external(id)
+            .await
+            .unwrap()
+            .expect("the spilled entry is live before the restart");
+        captured.push((id, serde_json::to_value(&entry).unwrap()));
+    }
+    drop(local);
+
+    // Restart: the real service binary over the same store. Its startup
+    // reconcile sees an empty external map, the checkpoint's cards, and
+    // their blobs — the exact N01 counterexample shape.
+    let service = ContextServiceAdapter::connect(&ContextServiceConfig {
+        program: Some(service_program()),
+        engine: ServiceEngine::Dynamic,
+        store_dir: Some(store.path().to_path_buf()),
+        ..ContextServiceConfig::default()
+    })
+    .await
+    .expect("spawn isolated context service");
+    let cards_dir = store.path().join("cards");
+    let card_count = std::fs::read_dir(&cards_dir)
+        .expect("the cards directory survives the restart")
+        .filter_map(|entry| entry.ok())
+        .filter(|entry| entry.path().extension().is_some_and(|ext| ext == "card"))
+        .count();
+    assert_eq!(
+        card_count,
+        spilled_rows.len(),
+        "the startup reconcile must not delete the retained checkpoint's cards"
+    );
+
+    // Restore and verify: every spilled entry comes back with the captured
+    // metadata, and one body reads back through the formal fetch path.
+    service.restore(checkpoint).await.unwrap();
+    for (id, before) in &captured {
+        let after = service
+            .inspect_external(*id)
+            .await
+            .unwrap()
+            .unwrap_or_else(|| panic!("restored entry {id} is missing after the restart"));
+        assert_eq!(
+            serde_json::to_value(&after).unwrap(),
+            *before,
+            "entry {id} must restore the exact captured metadata"
+        );
+    }
+    let body = service
+        .fetch_external(captured[0].0)
+        .await
+        .unwrap()
+        .expect("the retained checkpoint's body is retrievable");
+    assert!(body.content.contains("Ledger.rs"), "{body:?}");
+
+    service.shutdown().await;
+}

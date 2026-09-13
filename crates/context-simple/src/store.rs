@@ -224,17 +224,57 @@ pub(crate) async fn write_external_card_async(
     Ok(())
 }
 
-/// Read one metadata card. `Ok(None)` = the file does not exist (a
-/// pruned-checkpoint restore legitimately finds nothing); `Err(())` = the
-/// card exists but is corrupt or names another id.
-pub(crate) async fn read_external_card_async(
+/// N02/N03: one metadata-card read outcome. `Missing` and `Corrupt` are
+/// permanent facts about this locator (a pruned checkpoint's absent card, a
+/// damaged or foreign card, an oversized file, or bytes that no longer
+/// match the manifest's captured hash); `IoFailed` is a transient I/O error
+/// whose locator must stay retryable — it is never equivalent to "the data
+/// does not exist".
+#[allow(clippy::large_enum_variant)] // the entry payload IS the read's purpose
+pub(crate) enum ExternalCardRead {
+    Found(agent_contracts::ExternalizedContext),
+    Missing,
+    // The details have no reason channel to reach yet (restore/hydration
+    // degrade by honest counters); they stay for diagnosability.
+    Corrupt(#[allow(dead_code)] String),
+    IoFailed(#[allow(dead_code)] std::io::Error),
+}
+
+/// Read one metadata card with the blob read path's resource bounds and the
+/// manifest's captured identity. `expected_hash` is the 12-hex-char content
+/// prefix the checkpoint manifest recorded: bytes whose hash differs are a
+/// different capture wearing the same name, never this entry's metadata
+/// (the same FNV corruption detector the formal blobs use — not
+/// cryptographic authentication). The read itself is bounded
+/// (`read_bounded_blob`): an oversized card is refused at the metadata
+/// check instead of being read into memory whole.
+pub(crate) async fn read_external_card_checked_async(
     path: &Path,
     expected_id: ContextItemId,
-) -> Result<Option<agent_contracts::ExternalizedContext>, ()> {
-    match tokio::fs::read(path).await {
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
-        Err(_) => Err(()),
-        Ok(bytes) => parse_external_card(&bytes, expected_id).map(Some),
+    expected_hash: Option<&str>,
+) -> ExternalCardRead {
+    let bytes = match read_bounded_blob(path).await {
+        Ok(bytes) => bytes,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            return ExternalCardRead::Missing;
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::InvalidData => {
+            return ExternalCardRead::Corrupt(e.to_string());
+        }
+        Err(e) => return ExternalCardRead::IoFailed(e),
+    };
+    if let Some(hash) = expected_hash
+        && checksum_hex(&bytes)[..12] != *hash
+    {
+        return ExternalCardRead::Corrupt(format!(
+            "card content does not match the manifest's captured hash {hash}"
+        ));
+    }
+    match parse_external_card(&bytes, expected_id) {
+        Ok(entry) => ExternalCardRead::Found(entry),
+        Err(()) => ExternalCardRead::Corrupt(
+            "card envelope is corrupt or names another id".to_string(),
+        ),
     }
 }
 
@@ -1721,6 +1761,26 @@ pub(crate) async fn run_reconcile_io_protecting(
                 continue;
             };
             if map_checksums.contains_key(&card_id) || protected.contains(&card_id) {
+                continue;
+            }
+            // N01: the card shares the blob sweep's deletion permit — it is
+            // the metadata sidecar of the same id's owner. A blob this scan
+            // just found ownerless and non-resident is about to be re-owned
+            // (`rebuilt_candidates`): deleting its card here would strip the
+            // rebuilt entry's captured lifecycle/retention state, so the
+            // pair survives together and the commit phase yields one owner.
+            if io.rebuilt_candidates.iter().any(|(item, _)| item.id == card_id) {
+                io.reasons
+                    .push(format!("kept card {name}: this scan re-claims the id's blob"));
+                continue;
+            }
+            // N01: with the recovery-root enumeration incomplete, "absent
+            // from the known protected set" proves nothing; deletion defers
+            // exactly like the blob sweep's stale-duplicate branch (W03).
+            if !roots_complete {
+                io.reasons.push(format!(
+                    "kept card {name}: root enumeration incomplete, deletion deferred"
+                ));
                 continue;
             }
             match tokio::fs::remove_file(&path).await {

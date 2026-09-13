@@ -359,6 +359,10 @@ pub(crate) struct State {
     /// Storage GC 清理），消费端不得把它读成完整状态。
     #[serde(default)]
     pub(crate) external_cards_missing: u64,
+    /// N02：卡片读取的瞬态 I/O 失败数。与缺失分开计数——瞬时故障的
+    /// locator 仍留在 pending 队列里可重试，不是「数据不存在」。
+    #[serde(default)]
+    pub(crate) external_card_io_failures: u64,
     /// F2: spill-card rows a restore accepted but has not paged in yet —
     /// `(item id, card hash)`. The ids are known (so blob/card deletion is
     /// deferred and an id lookup pages its card in), the metadata is not in
@@ -781,6 +785,16 @@ pub struct SimpleContextEngine {
     /// parked here — no timing inference.
     #[cfg(test)]
     pub(crate) checkpoint_io_pause: std::sync::Mutex<Option<IoBoundaryPause>>,
+    /// N02 regression gate: park a hydration exactly at the n-th card-read
+    /// boundary (0-based index within one batch's read plan), so a dropped
+    /// future is observed against a precise mid-read state — no timing
+    /// inference.
+    #[cfg(test)]
+    pub(crate) card_read_pause: std::sync::Mutex<Option<(IoBoundaryPause, usize)>>,
+    /// N02 regression fault: when nonzero, the next card read fails with a
+    /// fabricated transient I/O error (the value bounds how many reads).
+    #[cfg(test)]
+    pub(crate) card_read_failure_bomb: std::sync::atomic::AtomicU32,
     /// 与 B 共用的有界压缩器。缺省为 None：任务摘要仍用 runtime 给的原文。
     /// 注入后，任务完成和 episode 旋转会蒸馏成带 `DerivedFrom` 的派生摘要，
     /// 原文条目保留。
@@ -807,6 +821,10 @@ impl SimpleContextEngine {
             admit_read_pause: std::sync::Mutex::new(None),
             #[cfg(test)]
             checkpoint_io_pause: std::sync::Mutex::new(None),
+            #[cfg(test)]
+            card_read_pause: std::sync::Mutex::new(None),
+            #[cfg(test)]
+            card_read_failure_bomb: std::sync::atomic::AtomicU32::new(0),
             compactor: None,
             search_observation: std::sync::Mutex::new(ContextSearchObservation::default()),
         }
@@ -994,39 +1012,91 @@ impl SimpleContextEngine {
     /// tail of a long history as `(id, card hash)` rows; this is the bounded
     /// drain every completeness-sensitive caller runs before it needs the
     /// whole external set. A row whose id was claimed in the meantime is
-    /// dropped without touching the live owner, and a missing or corrupt
-    /// card is counted exactly like a missing card at restore time.
-    async fn hydrate_pending_cards(&self, budget: usize) -> usize {
-        let rows = {
-            let mut state = self.state.lock().await;
+    /// dropped without touching the live owner, and a missing, corrupt or
+    /// structurally invalid card is consumed and counted exactly like a
+    /// missing card at restore time.
+    ///
+    /// N02: the pending rows keep their owner until a read *verifies*. The
+    /// lock-held phase only copies a bounded read plan, so a future dropped
+    /// between the plan and the commit (cancellation at any await boundary)
+    /// loses nothing — the rows are still queued and the next batch reads
+    /// them again. Only a verified outcome migrates a row off the queue: an
+    /// installed entry, or a permanently absent/damaged card. A transient
+    /// I/O failure keeps its row for the next drain — it is never
+    /// equivalent to "the data does not exist".
+    pub(crate) async fn hydrate_pending_cards(&self, budget: usize) -> usize {
+        let rows: Vec<(ContextItemId, String)> = {
+            let state = self.state.lock().await;
             if state.pending_external_cards.is_empty() {
                 return 0;
             }
-            let take = budget.min(state.pending_external_cards.len());
-            let rest = state.pending_external_cards.split_off(take);
-            std::mem::replace(&mut state.pending_external_cards, rest)
+            state
+                .pending_external_cards
+                .iter()
+                .take(budget)
+                .cloned()
+                .collect()
         };
         let dir = crate::store::store_dir(&self.config);
-        let mut entries = Vec::new();
+        let mut found: Vec<(ContextItemId, String, agent_contracts::ExternalizedContext)> =
+            Vec::new();
+        let mut consumed: Vec<ContextItemId> = Vec::new();
         let mut missing = 0u64;
-        for (item_id, hash) in &rows {
-            let path = crate::store::external_card_path(&dir, *item_id, hash);
-            match crate::store::read_external_card_async(&path, *item_id).await {
-                Ok(Some(entry)) => entries.push((entry, hash.clone())),
-                _ => missing += 1,
+        let mut io_failures = 0u64;
+        for (index, (item_id, hash)) in rows.iter().enumerate() {
+            match self.read_card_with_test_hooks(&dir, *item_id, hash, index).await {
+                crate::store::ExternalCardRead::Found(entry) => {
+                    found.push((*item_id, hash.clone(), entry));
+                }
+                crate::store::ExternalCardRead::Missing
+                | crate::store::ExternalCardRead::Corrupt(_) => {
+                    consumed.push(*item_id);
+                    missing += 1;
+                }
+                crate::store::ExternalCardRead::IoFailed(_) => {
+                    io_failures += 1;
+                }
             }
         }
         let mut state = self.state.lock().await;
         let mut claimed = Vec::new();
-        for (entry, hash) in entries {
+        for (item_id, hash, entry) in found {
             // Someone else may own this id now (a rebuild, an admit). The
             // live owner wins; a paged-in card never creates a second owner.
-            if state.external.get(entry.item_id).is_some()
-                || crate::store::catalog_body(&state, entry.item_id).is_some()
+            if state.external.get(item_id).is_some()
+                || crate::store::catalog_body(&state, item_id).is_some()
             {
                 continue;
             }
+            // N03: a card whose entry references a scope this state does not
+            // know is structurally invalid — the same violation
+            // `checkpoint::validate` rejects at restore time. It must not
+            // install; the card file stays on disk (the locator stays
+            // diagnosable) while the row is consumed like a corrupt card.
+            if let Some(scope_id) = entry.scope_id
+                && state.scopes.by_id(scope_id).is_none()
+            {
+                consumed.push(item_id);
+                missing += 1;
+                continue;
+            }
+            // N02: the row must still be the pending owner under the same
+            // hash for this read to migrate it.
+            let Some(position) = state
+                .pending_external_cards
+                .iter()
+                .position(|(id, h)| *id == item_id && *h == hash)
+            else {
+                continue;
+            };
+            state.pending_external_cards.remove(position);
             claimed.push((entry, hash));
+        }
+        if !consumed.is_empty() {
+            let consumed: HashSet<ContextItemId> = consumed.into_iter().collect();
+            state
+                .pending_external_cards
+                .retain(|(id, _)| !consumed.contains(id));
         }
         let installed = claimed.len();
         state
@@ -1036,6 +1106,9 @@ impl SimpleContextEngine {
             state.external.record_card(entry.item_id, hash);
         }
         state.external_cards_missing = state.external_cards_missing.saturating_add(missing);
+        state.external_card_io_failures = state
+            .external_card_io_failures
+            .saturating_add(io_failures);
         state.sync_catalog();
         installed
     }
@@ -1046,43 +1119,129 @@ impl SimpleContextEngine {
     async fn hydrate_all_pending_cards(&self) {
         let batch = self.config.external_restore_card_batch.max(1);
         loop {
-            if self.state.lock().await.pending_external_cards.is_empty() {
+            let pending_len = self.state.lock().await.pending_external_cards.len();
+            if pending_len == 0 {
                 return;
             }
-            // Every batch removes its rows from the queue (installed, or
-            // counted as a missing card), so this terminates.
-            self.hydrate_pending_cards(batch).await;
+            let installed = self.hydrate_pending_cards(batch).await;
+            // N02: a batch that installs nothing and consumes nothing hit
+            // only transiently unreadable cards — their rows stayed queued
+            // on purpose. Draining them is a later successful pass's job;
+            // spinning here would turn one flaky read into an unbounded
+            // retry loop.
+            let remaining = self.state.lock().await.pending_external_cards.len();
+            if installed == 0 && remaining == pending_len {
+                return;
+            }
         }
+    }
+
+    /// One card read with the regression gates applied: the deterministic
+    /// pause parks the loop exactly at this read boundary, and the failure
+    /// bomb turns this read into a transient I/O error. Both compile out
+    /// outside tests.
+    async fn read_card_with_test_hooks(
+        &self,
+        dir: &std::path::Path,
+        item_id: ContextItemId,
+        hash: &str,
+        read_index: usize,
+    ) -> crate::store::ExternalCardRead {
+        #[cfg(test)]
+        {
+            let pause = self
+                .card_read_pause
+                .lock()
+                .expect("card read pause mutex poisoned")
+                .clone();
+            if let Some((pause, fire_on)) = pause
+                && fire_on == read_index
+            {
+                pause.planned.notify_one();
+                pause.release.notified().await;
+            }
+            if self
+                .card_read_failure_bomb
+                .fetch_update(
+                    std::sync::atomic::Ordering::Relaxed,
+                    std::sync::atomic::Ordering::Relaxed,
+                    |count| if count > 0 { Some(count - 1) } else { None },
+                )
+                .is_ok()
+            {
+                return crate::store::ExternalCardRead::IoFailed(std::io::Error::new(
+                    std::io::ErrorKind::PermissionDenied,
+                    "injected transient card read failure",
+                ));
+            }
+        }
+        let _ = read_index;
+        let path = crate::store::external_card_path(dir, item_id, hash);
+        crate::store::read_external_card_checked_async(&path, item_id, Some(hash)).await
     }
 
     /// F2: page in one pending row by id (an id lookup must keep working the
     /// moment a restore returns). Returns whether the entry became live.
+    /// N02: the pending row keeps its owner until the read verifies — a
+    /// cancelled or dropped fetch leaves the row queued; a transient I/O
+    /// failure keeps it retryable; only an installed entry or a verified
+    /// absent/damaged card consumes it.
     async fn hydrate_card_for(&self, item_id: ContextItemId) -> bool {
         let hash = {
-            let mut state = self.state.lock().await;
-            let Some(position) = state
+            let state = self.state.lock().await;
+            state
                 .pending_external_cards
                 .iter()
-                .position(|(id, _)| *id == item_id)
-            else {
-                return false;
-            };
-            state.pending_external_cards.remove(position).1
+                .find(|(id, _)| *id == item_id)
+                .map(|(_, hash)| hash.clone())
+        };
+        let Some(hash) = hash else {
+            return false;
         };
         let dir = crate::store::store_dir(&self.config);
-        let path = crate::store::external_card_path(&dir, item_id, &hash);
-        let entry = crate::store::read_external_card_async(&path, item_id).await;
+        let outcome = self.read_card_with_test_hooks(&dir, item_id, &hash, 0).await;
         let mut state = self.state.lock().await;
-        match entry {
-            Ok(Some(entry)) if state.external.get(item_id).is_none() => {
+        match outcome {
+            crate::store::ExternalCardRead::Found(entry)
+                if state.external.get(item_id).is_none() =>
+            {
+                // Same structural check as the batch path (N03): an entry
+                // referencing an unknown scope never installs.
+                if let Some(scope_id) = entry.scope_id
+                    && state.scopes.by_id(scope_id).is_none()
+                {
+                    state
+                        .pending_external_cards
+                        .retain(|(id, _)| *id != item_id);
+                    state.external_cards_missing = state.external_cards_missing.saturating_add(1);
+                    return false;
+                }
+                let Some(position) = state
+                    .pending_external_cards
+                    .iter()
+                    .position(|(id, h)| *id == item_id && *h == hash)
+                else {
+                    return false;
+                };
+                state.pending_external_cards.remove(position);
                 state.external.merge_paged(vec![entry]);
                 state.external.record_card(item_id, hash);
                 state.sync_catalog();
                 true
             }
-            Ok(Some(_)) => false,
-            _ => {
+            crate::store::ExternalCardRead::Found(_) => false,
+            crate::store::ExternalCardRead::Missing | crate::store::ExternalCardRead::Corrupt(_) => {
+                state
+                    .pending_external_cards
+                    .retain(|(id, _)| *id != item_id);
                 state.external_cards_missing = state.external_cards_missing.saturating_add(1);
+                false
+            }
+            crate::store::ExternalCardRead::IoFailed(_) => {
+                // N02: a transient failure keeps the retryable locator and
+                // is counted separately from "the data does not exist".
+                state.external_card_io_failures =
+                    state.external_card_io_failures.saturating_add(1);
                 false
             }
         }
@@ -2465,6 +2624,7 @@ impl ContextEngine for SimpleContextEngine {
         // structural reject never installs, and the live lock is taken only
         // after the candidate is valid.
         let mut missing_cards: u64 = 0;
+        let mut io_failed_cards: u64 = 0;
         let mut rehydrated: Vec<(agent_contracts::ExternalizedContext, String)> = Vec::new();
         let mut deferred_cards: Vec<(ContextItemId, String)> = Vec::new();
         if !spilled.is_empty() {
@@ -2476,10 +2636,22 @@ impl ContextEngine for SimpleContextEngine {
                     continue;
                 }
                 let path = crate::store::external_card_path(&dir, *id, hash);
-                match crate::store::read_external_card_async(&path, *id).await {
-                    Ok(Some(entry)) => rehydrated.push((entry, hash.clone())),
-                    // 缺失（Ok(None)）与损坏（Err）同一诚实计数。
-                    _ => missing_cards += 1,
+                match crate::store::read_external_card_checked_async(&path, *id, Some(hash)).await
+                {
+                    crate::store::ExternalCardRead::Found(entry) => {
+                        rehydrated.push((entry, hash.clone()));
+                    }
+                    // N02: a transient I/O failure never consumes the
+                    // locator — the row stays queued (the manifest keeps
+                    // recording it), and the next bounded drain retries it.
+                    crate::store::ExternalCardRead::IoFailed(_) => {
+                        deferred_cards.push((*id, hash.clone()));
+                        io_failed_cards += 1;
+                    }
+                    // 缺失、损坏与哈希失配同一诚实计数（数据不存在的
+                    // 永久事实，恢复如实降级）。
+                    crate::store::ExternalCardRead::Missing
+                    | crate::store::ExternalCardRead::Corrupt(_) => missing_cards += 1,
                 }
             }
         }
@@ -2490,6 +2662,9 @@ impl ContextEngine for SimpleContextEngine {
             next.external.replace_all(entries);
             next.external_cards_missing = next.external_cards_missing.saturating_add(missing_cards);
         }
+        next.external_card_io_failures = next
+            .external_card_io_failures
+            .saturating_add(io_failed_cards);
         // The card each rehydrated entry came from still describes it, so the
         // next capture re-uses that file instead of serializing the entry
         // again (`replace_all` cleared the directory, hence after it).

@@ -940,7 +940,16 @@ pub async fn compose_with_prompt_layout(
     // and the startup store reconcile remain, and both are rolled back
     // closed when they fail.
     host.start().await?;
-    if let Err(error) = host.registry().context_service()?.reconcile_store().await {
+    // N01: the composition root reconciles before the actor exists and
+    // before any restore installed recovery ownership — no retained-
+    // checkpoint enumeration has run, so the root set is not complete and
+    // this pass must defer every deletion (rebuild-only convergence).
+    if let Err(error) = host
+        .registry()
+        .context_service()?
+        .reconcile_store_protecting(&[], false)
+        .await
+    {
         // The store reconcile races nothing yet (the actor is not spawned),
         // but it is the last post-start seam: stop every started module
         // before reporting the failure so no serving child survives.
@@ -1183,6 +1192,17 @@ mod tests {
             self.inner.restore(data).await
         }
         async fn reconcile_store(&self) -> AgentResult<agent_contracts::StoreReconcileReport> {
+            Err(agent_contracts::AgentError::Internal(
+                "simulated startup store reconcile failure".into(),
+            ))
+        }
+        // N01: the composition root's startup seam is the protecting call
+        // (restore ownership is not installed yet); the fault fires there.
+        async fn reconcile_store_protecting(
+            &self,
+            _protected: &[agent_contracts::ContextItemId],
+            _roots_complete: bool,
+        ) -> AgentResult<agent_contracts::StoreReconcileReport> {
             Err(agent_contracts::AgentError::Internal(
                 "simulated startup store reconcile failure".into(),
             ))

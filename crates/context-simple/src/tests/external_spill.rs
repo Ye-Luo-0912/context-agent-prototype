@@ -267,15 +267,22 @@ async fn reconcile_cleans_orphan_cards_and_honors_protection() {
         .collect();
     assert_eq!(spilled.len(), 20);
 
-    // 模拟 Storage GC 删除前 10 个分片条目（保留其 blob 的场景按保护根
-    // 语义单独验证；这里关心的是卡片清扫跟随条目删除）。
+    // N01: 卡片的删除许可与 blob 完全一致。前 9 个分片条目模拟真实
+    // Storage GC 孤儿（GC 只删 blob 不删卡片——blob 与 map 条目都消失）；
+    // spilled[9] 只删 map 条目、保留 blob——该 blob 会被同一次扫描重新
+    // 认领（rebuilt），其卡片必须一起幸存（N01 旧行为反例：卡片先于
+    // owner 提交被当孤儿删除）。
     let removed: std::collections::HashSet<agent_contracts::ContextItemId> =
         spilled[..10].iter().copied().collect();
+    let rebuilt_source = spilled[9];
     {
         let mut state = engine.state.lock().await;
         state
             .external
             .retain(|entry| !removed.contains(&entry.item_id));
+    }
+    for id in removed.iter().filter(|id| **id != rebuilt_source) {
+        std::fs::remove_file(dir.path().join(format!("{id}.json"))).unwrap();
     }
     // 保留 checkpoint 的恢复承诺仍覆盖第一个被删 id：其卡片必须幸存。
     let protected = vec![spilled[0]];
@@ -299,9 +306,14 @@ async fn reconcile_cleans_orphan_cards_and_honors_protection() {
     )
     .await;
     assert_eq!(
-        io.external_cards_removed, 9,
-        "every orphan card goes; only the protected one survives: {:?}",
+        io.external_cards_removed, 8,
+        "only true orphans (blob and owner both gone, unprotected) go: {:?}",
         io.reasons
+    );
+    assert_eq!(
+        io.rebuilt_candidates.len(),
+        1,
+        "the surviving ownerless blob is re-claimed this scan"
     );
     let cards_dir = dir.path().join("cards");
     let card_names: Vec<String> = std::fs::read_dir(&cards_dir)
@@ -309,12 +321,85 @@ async fn reconcile_cleans_orphan_cards_and_honors_protection() {
         .filter_map(|entry| entry.ok())
         .filter_map(|entry| entry.file_name().into_string().ok())
         .collect();
-    assert_eq!(card_names.len(), 11, "10 mapped + 1 protected");
+    assert_eq!(
+        card_names.len(),
+        12,
+        "10 mapped + 1 protected + 1 rebuilt: {:?}",
+        card_names
+    );
     assert!(
         card_names
             .iter()
             .any(|name| name.starts_with(&spilled[0].to_string())),
         "the protected card survives"
+    );
+    assert!(
+        card_names
+            .iter()
+            .any(|name| name.starts_with(&rebuilt_source.to_string())),
+        "the rebuilt id's card survives with its blob (N01)"
+    );
+}
+
+/// N01 (W03): with the recovery-root enumeration incomplete, "absent from
+/// the known protected set" proves nothing — card deletion defers exactly
+/// like the blob sweep's stale-duplicate branch. The same fresh-engine
+/// state under a complete-root pass is what may delete: there the
+/// ownerless ids' blobs are re-claimed (rebuilt), so their cards survive
+/// WITH them.
+#[tokio::test]
+async fn an_incomplete_root_enumeration_defers_card_deletion() {
+    let dir = tempfile::tempdir().unwrap();
+    let engine = spill_engine(&dir, 10).await;
+    open_focus(&engine, "spill then defer").await;
+    let _ids = externalize_n(&engine, 12).await;
+    let value = engine.checkpoint().await.unwrap();
+    assert_eq!(value["external_spilled"].as_array().unwrap().len(), 2);
+
+    // Fresh-engine shape: restore ownership not installed — an empty
+    // external map with two cards on disk the map does not own.
+    {
+        let mut state = engine.state.lock().await;
+        state.external.retain(|_| false);
+    }
+    let io = crate::store::run_reconcile_io_protecting(
+        dir.path(),
+        &std::collections::HashMap::new(),
+        &std::collections::HashSet::new(),
+        &[],
+        false,
+    )
+    .await;
+    assert_eq!(
+        io.external_cards_removed, 0,
+        "an incomplete root set must defer every card deletion: {:?}",
+        io.reasons
+    );
+    assert_eq!(
+        card_files(dir.path()).len(),
+        2,
+        "both cards survive the incomplete sweep"
+    );
+
+    // The complete-root pass over the identical state: every ownerless
+    // blob is re-claimed (rebuilt), so every card survives with its owner.
+    let io_complete = crate::store::run_reconcile_io_protecting(
+        dir.path(),
+        &std::collections::HashMap::new(),
+        &std::collections::HashSet::new(),
+        &[],
+        true,
+    )
+    .await;
+    assert_eq!(
+        io_complete.rebuilt_candidates.len(),
+        12,
+        "the complete pass re-claims every ownerless blob (2 spilled + 10 inline)"
+    );
+    assert_eq!(
+        card_files(dir.path()).len(),
+        2,
+        "the rebuilt pairs keep their cards"
     );
 }
 
@@ -869,4 +954,367 @@ async fn illegal_spill_manifest_row_is_refused_without_mutating_live_state() {
             .any(|item| item.content.contains(LIVE_MARKER))
     );
     assert_eq!(state.external_cards_missing, 0);
+}
+
+// ---------------------------------------------------------------------------
+// N02/N03: 冷页读取的取消安全、瞬态故障可重试、以及卡片的资源/一致性边界。
+// ---------------------------------------------------------------------------
+
+/// One engine captured three spilled cards; a fresh engine restores it with
+/// `external_restore_card_batch: 1`, leaving two pending rows — the exact
+/// production shape of a sharded restore's deferred tail. Returns the engine
+/// and the two deferred ids.
+async fn sharded_restore_with_pending_tail(
+    dir: &tempfile::TempDir,
+) -> (
+    SimpleContextEngine,
+    [agent_contracts::ContextItemId; 2],
+) {
+    let first = spill_engine(dir, 10).await;
+    open_focus(&first, "sharded restore tail").await;
+    let _ids = externalize_n(&first, 13).await;
+    let value = first.checkpoint().await.unwrap();
+    assert_eq!(manifest_ids(&value).len(), 3);
+
+    let second = SimpleContextEngine::new(SimpleContextConfig {
+        external_restore_card_batch: 1,
+        ..spill_config(dir, 10)
+    });
+    second.restore(value).await.unwrap();
+    let pending = second.state.lock().await.pending_external_cards.clone();
+    assert_eq!(pending.len(), 2, "the batch bound defers two rows");
+    (second, [pending[0].0, pending[1].0])
+}
+
+/// N02 (red-first): a future dropped mid-batch — parked deterministically at
+/// the second card's read boundary and aborted — must not lose a single
+/// pending row. The old shape moved the rows out of the queue before the
+/// reads: the abort consumed them, and the next checkpoint's manifest
+/// silently dropped their ids.
+#[tokio::test]
+async fn a_cancelled_batch_hydration_keeps_every_pending_row() {
+    let dir = tempfile::tempdir().unwrap();
+    let (engine, _pending_ids) = sharded_restore_with_pending_tail(&dir).await;
+    assert_eq!(engine.state.lock().await.pending_external_cards.len(), 2);
+
+    let planned = std::sync::Arc::new(tokio::sync::Notify::new());
+    let release = std::sync::Arc::new(tokio::sync::Notify::new());
+    *engine
+        .card_read_pause
+        .lock()
+        .expect("card read pause mutex poisoned") = Some((
+        crate::engine::IoBoundaryPause {
+            planned: std::sync::Arc::clone(&planned),
+            release: std::sync::Arc::clone(&release),
+        },
+        1,
+    ));
+
+    let engine = std::sync::Arc::new(engine);
+    let batch = {
+        let engine = std::sync::Arc::clone(&engine);
+        tokio::spawn(async move { engine.hydrate_pending_cards(2).await })
+    };
+    tokio::time::timeout(std::time::Duration::from_secs(10), planned.notified())
+        .await
+        .expect("the hydration reached the second card's read boundary");
+    batch.abort();
+    release.notify_one();
+    let _ = batch.await;
+
+    assert_eq!(
+        engine.state.lock().await.pending_external_cards.len(),
+        2,
+        "an aborted hydration must not consume a single pending row"
+    );
+
+    // A later, undisturbed drain installs everything: nothing was lost.
+    *engine.card_read_pause.lock().expect("poisoned") = None;
+    let installed = engine.hydrate_pending_cards(2).await;
+    assert_eq!(installed, 2, "the retry installs every deferred row");
+    let state = engine.state.lock().await;
+    assert_eq!(state.pending_external_cards.len(), 0);
+    assert_eq!(state.external_cards_missing, 0);
+}
+
+/// N02 (red-first): cancelling a single-id fetch mid-read keeps its pending
+/// row, so the next fetch still resolves the body. The old shape removed the
+/// row before the read: the aborted fetch consumed the only locator and the
+/// body became unreachable.
+#[tokio::test]
+async fn a_cancelled_id_fetch_keeps_its_pending_row() {
+    let dir = tempfile::tempdir().unwrap();
+    let (engine, _pending_ids) = sharded_restore_with_pending_tail(&dir).await;
+    let target = engine.state.lock().await.pending_external_cards[0].0;
+
+    let planned = std::sync::Arc::new(tokio::sync::Notify::new());
+    let release = std::sync::Arc::new(tokio::sync::Notify::new());
+    *engine
+        .card_read_pause
+        .lock()
+        .expect("card read pause mutex poisoned") = Some((
+        crate::engine::IoBoundaryPause {
+            planned: std::sync::Arc::clone(&planned),
+            release: std::sync::Arc::clone(&release),
+        },
+        0,
+    ));
+
+    let engine = std::sync::Arc::new(engine);
+    let fetch = {
+        let engine = std::sync::Arc::clone(&engine);
+        tokio::spawn(async move { engine.fetch_external(target).await })
+    };
+    tokio::time::timeout(std::time::Duration::from_secs(10), planned.notified())
+        .await
+        .expect("the fetch reached its card-read boundary");
+    fetch.abort();
+    release.notify_one();
+    let _ = fetch.await;
+
+    assert!(
+        engine
+            .state
+            .lock()
+            .await
+            .pending_external_cards
+            .iter()
+            .any(|(id, _)| *id == target),
+        "an aborted fetch must keep the pending locator"
+    );
+
+    *engine.card_read_pause.lock().expect("poisoned") = None;
+    let item = engine
+        .fetch_external(target)
+        .await
+        .unwrap()
+        .expect("the retried fetch pages the card in and serves the body");
+    assert!(
+        item.content.contains("unique-token"),
+        "the fetched body is the captured one: {}",
+        item.content
+    );
+    assert_eq!(
+        engine.state.lock().await.pending_external_cards.len(),
+        1,
+        "only the fetched row left the queue"
+    );
+}
+
+/// N02 (red-first): one transient I/O failure keeps the retryable locator
+/// and counts as an I/O failure — never as "the data does not exist". The
+/// next drain, with the disk recovered, installs the entry exactly once.
+#[tokio::test]
+async fn a_transient_card_read_failure_keeps_the_retryable_locator() {
+    let dir = tempfile::tempdir().unwrap();
+    let (engine, _pending_ids) = sharded_restore_with_pending_tail(&dir).await;
+    engine
+        .card_read_failure_bomb
+        .store(1, std::sync::atomic::Ordering::Relaxed);
+
+    let installed = engine.hydrate_pending_cards(2).await;
+    assert_eq!(
+        installed, 1,
+        "only the failed read installs nothing; the other row is fine"
+    );
+    {
+        let state = engine.state.lock().await;
+        assert_eq!(
+            state.pending_external_cards.len(),
+            1,
+            "a transient failure must not consume the locator"
+        );
+        assert_eq!(
+            state.external_card_io_failures, 1,
+            "the transient failure is counted, separately from missing"
+        );
+        assert_eq!(
+            state.external_cards_missing, 0,
+            "a transient failure is never counted as absent data"
+        );
+    }
+
+    let installed_again = engine.hydrate_pending_cards(1).await;
+    assert_eq!(installed_again, 1, "the recovered read installs the row");
+    let state = engine.state.lock().await;
+    assert_eq!(state.pending_external_cards.len(), 0);
+    assert_eq!(
+        state.external.len(),
+        13,
+        "10 inline + 1 restore-paged + 2 drained: one owner each"
+    );
+    assert_eq!(state.external_card_io_failures, 1);
+    assert_eq!(state.external_cards_missing, 0);
+}
+
+/// N03: a card grown past the shared blob byte ceiling is refused at the
+/// bounded read — typed as corrupt, never read into memory whole; a missing
+/// card stays Missing (the pruned-checkpoint case).
+#[tokio::test]
+async fn an_oversized_card_is_refused_at_the_bounded_read() {
+    let dir = tempfile::tempdir().unwrap();
+    let cards = dir.path().join("cards");
+    std::fs::create_dir_all(&cards).unwrap();
+    let id = agent_contracts::ContextItemId::new();
+    let card = cards.join(format!("{id}.deadbeefcafe.card"));
+    std::fs::write(&card, vec![b'x'; 2 * 1024 * 1024]).unwrap();
+
+    let outcome =
+        crate::store::read_external_card_checked_async(&card, id, Some("deadbeefcafe")).await;
+    assert!(
+        matches!(outcome, crate::store::ExternalCardRead::Corrupt(_)),
+        "an oversized card is corrupt, not absent and not an entry"
+    );
+
+    let outcome = crate::store::read_external_card_checked_async(
+        &cards.join(format!("{}.deadbeefcafe.card", agent_contracts::ContextItemId::new())),
+        agent_contracts::ContextItemId::new(),
+        Some("deadbeefcafe"),
+    )
+    .await;
+    assert!(matches!(outcome, crate::store::ExternalCardRead::Missing));
+}
+
+/// N03 (red-first): the manifest names the card bytes captured at write
+/// time. A file at the manifest's name whose bytes hash differently is a
+/// different capture wearing the same name — corrupt, never this entry's
+/// metadata. The old reader parsed whatever was there and installed it.
+#[tokio::test]
+async fn a_card_whose_bytes_lost_the_captured_hash_is_corrupt_and_never_installs() {
+    let dir = tempfile::tempdir().unwrap();
+    let engine = spill_engine(&dir, 10).await;
+    open_focus(&engine, "hash mismatch").await;
+    let ids = externalize_n(&engine, 12).await;
+    let value = engine.checkpoint().await.unwrap();
+    assert_eq!(manifest_ids(&value).len(), 2);
+    let target = ids[0];
+
+    // Tamper with the card's bytes under the SAME content-addressed name.
+    let hash = engine
+        .state
+        .lock()
+        .await
+        .external
+        .card_hash(target)
+        .unwrap()
+        .to_string();
+    let card_path = dir.path().join("cards").join(format!("{target}.{hash}.card"));
+    let mut card: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&card_path).unwrap()).unwrap();
+    card["entry"]["attention"] =
+        serde_json::to_value(agent_contracts::AttentionState::Archived).unwrap();
+    std::fs::write(&card_path, serde_json::to_vec(&card).unwrap()).unwrap();
+
+    // The store-level read refuses the tampered bytes.
+    let outcome =
+        crate::store::read_external_card_checked_async(&card_path, target, Some(&hash)).await;
+    assert!(
+        matches!(outcome, crate::store::ExternalCardRead::Corrupt(_)),
+        "bytes that lost the captured hash are corrupt"
+    );
+
+    // And hydration never installs them: fresh engine, deferred row.
+    let fresh = SimpleContextEngine::new(SimpleContextConfig {
+        external_restore_card_batch: 1,
+        ..spill_config(&dir, 10)
+    });
+    fresh.restore(value).await.unwrap();
+    fresh.hydrate_pending_cards(2).await;
+    let state = fresh.state.lock().await;
+    assert!(
+        state.external.get(target).is_none(),
+        "a tampered card never installs its metadata"
+    );
+    assert_eq!(
+        state.external.recorded_cards(),
+        1,
+        "only the untouched first card (restore's inline batch) claims itself"
+    );
+    assert!(
+        state.external.card_hash(target).is_none(),
+        "nothing claims the tampered card as current metadata"
+    );
+}
+
+/// N03 (red-first): a deferred card whose entry references a scope this
+/// state does not know is the same structural violation
+/// `checkpoint::validate` rejects at restore time. The page never installs;
+/// the row is consumed and counted as missing (the card file stays on disk
+/// for diagnosis).
+#[tokio::test]
+async fn a_deferred_card_referencing_an_unknown_scope_never_installs() {
+    let dir = tempfile::tempdir().unwrap();
+    let engine = spill_engine(&dir, 10).await;
+    open_focus(&engine, "unknown scope page").await;
+    let ids = externalize_n(&engine, 12).await;
+    let mut value = engine.checkpoint().await.unwrap();
+    // The SECOND spilled id lands in the deferred tail under
+    // `external_restore_card_batch: 1` — the page hydration must reject,
+    // exactly where restore's own first-batch validation does not reach.
+    // (A tampered card inside the first batch is refused by restore's
+    // `checkpoint::validate` itself.)
+    let target = ids[1];
+
+    // Rewrite the target's card with a scope id no restored scope answers,
+    // under the tampered bytes' own content-addressed name.
+    let bogus_scope = agent_contracts::ScopeId::new();
+    let hash = engine
+        .state
+        .lock()
+        .await
+        .external
+        .card_hash(target)
+        .unwrap()
+        .to_string();
+    let cards_dir = dir.path().join("cards");
+    let old_path = cards_dir.join(format!("{target}.{hash}.card"));
+    let mut card: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&old_path).unwrap()).unwrap();
+    card["entry"]["scope_id"] = serde_json::to_value(bogus_scope).unwrap();
+    let new_bytes = serde_json::to_vec(&card).unwrap();
+    let new_hash = crate::store::checksum_hex(&new_bytes)[..12].to_string();
+    std::fs::write(
+        cards_dir.join(format!("{target}.{new_hash}.card")),
+        &new_bytes,
+    )
+    .unwrap();
+    std::fs::remove_file(&old_path).unwrap();
+    // The manifest now names the tampered bytes: the hash check passes and
+    // the scope validation is what must reject this page.
+    let rows = value["external_spilled"].as_array_mut().unwrap();
+    let row = rows
+        .iter_mut()
+        .find(|row| row["id"].as_str() == Some(&target.to_string()))
+        .unwrap();
+    row["hash"] = serde_json::to_value(&new_hash).unwrap();
+
+    let fresh = SimpleContextEngine::new(SimpleContextConfig {
+        external_restore_card_batch: 1,
+        ..spill_config(&dir, 10)
+    });
+    fresh.restore(value).await.unwrap();
+    {
+        let state = fresh.state.lock().await;
+        assert!(
+            state
+                .pending_external_cards
+                .iter()
+                .any(|(id, h)| *id == target && *h == new_hash),
+            "the deferred row waits under the rewritten card's hash"
+        );
+    }
+    fresh.hydrate_pending_cards(2).await;
+    let state = fresh.state.lock().await;
+    assert!(
+        state.external.get(target).is_none(),
+        "an entry referencing an unknown scope never installs"
+    );
+    assert!(
+        state.external_cards_missing >= 1,
+        "the invalid page is counted honestly, not silently dropped"
+    );
+    assert!(
+        cards_dir.join(format!("{target}.{new_hash}.card")).exists(),
+        "the invalid card file stays on disk: the locator stays diagnosable"
+    );
 }

@@ -78,8 +78,15 @@ async fn main() {
     // when the service owns an explicit store — the temp-dir fallback is
     // not a persistence domain to reconcile. Refuse to serve on failure
     // instead of running a session over an unreconciled store.
+    //
+    // N01: this pass runs BEFORE any Restore has installed recovery
+    // ownership and before any retained-checkpoint enumeration has run, so
+    // the root set is genuinely NOT complete here — the pass may re-own
+    // ownerless blobs (the conservative rebuild) but must defer every
+    // deletion (stale blobs and orphan cards alike) until a caller that
+    // knows the retained roots asks for a protecting reconcile.
     if store_dir.is_some()
-        && let Err(problem) = engine.reconcile_store().await
+        && let Err(problem) = engine.reconcile_store_protecting(&[], false).await
     {
         eprintln!("startup store reconcile failed: {problem}");
         std::process::exit(1);
