@@ -1407,6 +1407,46 @@ and quarantining an owned checksum mismatch invalidates its external-map owner.
 Read-path caching is permitted only after measurement and must preserve
 equivalent integrity evidence.
 
+### Completeness conditions for irreversible deletion (2026-09-14)
+
+Two completeness facts are independent and must not stand in for each other:
+
+- **Recovery-root completeness** — the retained-checkpoint root enumeration
+  succeeded (`roots_complete`). It says nothing about whether the *metadata
+  and dependency graph* of every stored owner is currently readable.
+- **Metadata / reference completeness** — every cold owner's card is
+  installed (hydrated), so its outgoing edges are visible to the deletion
+  planner. A pending card (its read deferred or failed temporarily) still
+  owns its id and body, but its *edges* have not been read.
+
+Rules:
+
+1. **A pending owner is not an ownerless one.** Neither deletion planning
+   nor reconcile may treat a card still pending hydration as an orphan or
+   reclaim its id, regardless of why the read has not happened.
+2. **Irreversible deletion requires the completeness it actually needs.**
+   When the deletion planner's reachability closure depends on stored
+   owners' edges, unresolved pending cards must degrade the deletion pass
+   the same way an incomplete root enumeration does: defer the affected
+   deletions and surface the deferral, instead of planning over a partial
+   edge set. Adding pending *ids* to the root set protects the cards
+   themselves; it does **not** protect the edges those cards have not yet
+   revealed, and is not a substitute for the deferral.
+3. **Root enumeration complete ≠ metadata complete.** A pass may report
+   complete roots and still be unable to safely delete, because a source
+   it would need to consult (a pending card) has not been read. Callers
+   consume both facts, not one.
+4. **Temporary read failures keep the source retryable.** An I/O error
+   hydrating a card leaves the card pending (typed, distinguishable from
+   missing/corrupt); it never mutates ownership and never becomes "gone".
+   The next pass retries it.
+
+These rules accompany the storage-protection work: pending-owner
+cancellation safety, bounded/hash-verified card reads and typed read
+outcomes landed 2026-09-13; the *caller-side* completeness propagation
+(hydration incompleteness reaching the GC/reconcile deletion decisions)
+is tracked as the B2 caller task in `docs/NEXT_TASKS.md`.
+
 ## 10. What should become durable later
 
 A later policy can promote only structured outcomes such as:

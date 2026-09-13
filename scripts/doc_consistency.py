@@ -1,20 +1,29 @@
 #!/usr/bin/env python3
-"""Document-consistency gate (run in CI and locally before doc commits).
+"""Document-structure gate (run in CI and locally before doc commits).
 
-Checks that the live documentation cannot drift from the machine-readable
-state or from the repository itself:
+This gate verifies MECHANICAL structure only. It does NOT verify that the
+documentation is semantically true, that described code exists, that a CI
+run covers a claimed implementation, or that the current route is the one
+the maintainer intends. Those facts are owned by the entry documents
+themselves (docs/CURRENT.md, docs/NEXT_TASKS.md) and the code-review
+process, not by this script.
 
-1. docs/state.json parses and carries the required fields.
-2. Every `_windows/<id>` window referenced by docs/STATUS.md exists on
-   disk with a REPORT.md and manifest.json.
-3. Stale-phrase blacklist on the live documents (README current status,
-   docs/CURRENT.md, docs/STATUS.md): phrases that were true once and must
-   never silently return.
-4. Every relative markdown link in README.md and docs/*.md resolves.
+Checks:
+
+1. docs/state.json parses and carries the v2 navigation fields (the v1
+   current-status fields live in the archived snapshot).
+2. Entry roles: each entry file exists and is non-empty; docs/CURRENT.md
+   and docs/NEXT_TASKS.md cross-reference each other; AGENTS.md points to
+   the entry pair. The archived entry snapshot exists alongside its
+   baseline provenance note.
+3. Historical `_windows/<id>` references in docs/STATUS.md resolve on disk
+   (kept because STATUS historically carried window links).
+4. Every relative markdown link in the live documents resolves to a file.
 5. The CI toolchain pin is present, and the workspace does not declare a
    conflicting rust-version.
 
-Exit 0 only when every check passes.
+Exit 0 only when every check passes. Success means structure/links/toolchain
+checks passed — nothing more.
 """
 
 import json
@@ -24,7 +33,7 @@ import sys
 import urllib.parse
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-REQUIRED_STATE_FIELDS = ["schema", "head_commit", "m15", "product_stage"]
+REQUIRED_STATE_FIELDS = ["schema", "role", "maintained_by", "historical_snapshots"]
 STALE_PHRASES = {
     "README.md": [
         "seven v4 valid FAIL",
@@ -121,6 +130,47 @@ def check_links(violations):
                 violations.append(f"{relative}: broken link -> {target}")
 
 
+def check_entry_roles(violations):
+    """Cheap structural checks on the entry pair, per the 2026-09-14 doc
+    migration: the entry files exist, cross-reference each other, and the
+    stable-conventions file points at them. This is structure, not truth."""
+    entries = {
+        "AGENTS.md": ["docs/CURRENT.md", "docs/NEXT_TASKS.md"],
+        "docs/CURRENT.md": ["NEXT_TASKS.md"],
+        "docs/NEXT_TASKS.md": ["CURRENT.md"],
+        "docs/ROADMAP.md": ["CURRENT.md", "NEXT_TASKS.md"],
+        "docs/STATUS.md": ["CURRENT.md", "NEXT_TASKS.md"],
+    }
+    for relative, refs in entries.items():
+        path = os.path.join(ROOT, relative)
+        if not os.path.isfile(path):
+            violations.append(f"entry document missing: {relative}")
+            continue
+        with open(path, encoding="utf-8") as handle:
+            text = handle.read()
+        if len(text.strip()) == 0:
+            violations.append(f"entry document is empty: {relative}")
+        for ref in refs:
+            if ref not in text:
+                violations.append(
+                    f"{relative} no longer references {ref} (entry cross-link)"
+                )
+    archive = os.path.join(
+        ROOT, "docs", "archive", "entries-2026-09-13-2b43186b"
+    )
+    for name in (
+        "AGENTS.md",
+        "CURRENT.md",
+        "NEXT_TASKS.md",
+        "ROADMAP.md",
+        "STATUS.md",
+        "state.json",
+        "state-PROVENANCE.md",
+    ):
+        if not os.path.isfile(os.path.join(archive, name)):
+            violations.append(f"archived entry snapshot missing: {name}")
+
+
 def check_toolchain(violations):
     ci_path = os.path.join(ROOT, ".github", "workflows", "ci.yml")
     with open(ci_path, encoding="utf-8") as handle:
@@ -145,12 +195,30 @@ def main():
     with open(os.path.join(ROOT, "docs", "STATUS.md"), encoding="utf-8") as handle:
         status_text = handle.read()
     if state is not None:
-        closing = state.get("m15", {}).get("closing_window", {})
-        report = closing.get("report")
-        if report and not os.path.isfile(os.path.join(ROOT, report)):
-            violations.append(f"state.json closing window report missing: {report}")
+        # The v1 m15 closing-window evidence lives in the archived snapshot;
+        # keep checking the referenced report exists so the archive stays
+        # honest, but read it from the snapshot rather than live state.
+        snapshots = state.get("historical_snapshots", {})
+        for meta in snapshots.values():
+            archive_dir = meta.get("path")
+            if not archive_dir:
+                violations.append("state.json snapshot entry missing path")
+                continue
+            archive_state = os.path.join(ROOT, archive_dir, "state.json")
+            if not os.path.isfile(archive_state):
+                violations.append(f"archived state snapshot missing: {archive_state}")
+                continue
+            with open(archive_state, encoding="utf-8") as handle:
+                archived = json.load(handle)
+            closing = archived.get("m15", {}).get("closing_window", {})
+            report = closing.get("report")
+            if report and not os.path.isfile(os.path.join(ROOT, report)):
+                violations.append(
+                    f"archived state closing window report missing: {report}"
+                )
     check_windows(status_text, violations)
     check_stale_phrases(violations)
+    check_entry_roles(violations)
     check_links(violations)
     check_toolchain(violations)
 
@@ -160,7 +228,7 @@ def main():
             print(f"  - {violation}")
         sys.exit(1)
     print("document-consistency gate: OK "
-          f"({len(LIVE_DOCS)} live docs, links and state agree)")
+          f"({len(LIVE_DOCS)} live docs; structure/links/toolchain checks passed)")
 
 
 if __name__ == "__main__":

@@ -1,180 +1,19 @@
 {
-  "schema": "project-state.v1",
-  "updated": "2026-09-07",
-  "maintained_by": "CURRENT.md and NEXT_TASKS.md record the active product route; the existing document-consistency script checks structure/links, not semantic equivalence or future CI success",
-  "head_commit": "12c86283b8d5991e9f17a07f14871dcf39d65066",
-  "code_commit": "12c86283b8d5991e9f17a07f14871dcf39d65066",
-  "ci": {
-    "head_commit": "green",
-    "head_run_id": 34268863699,
-    "observation": "CI all-green at e508ad6 (seven jobs); second batch N3 (real events to the client, multi-line input) and N5 (envelope restore) closed",
-    "scope": "remote CI on the named source only; not local validation or future commits"
-  },
-  "milestone_gates": {
-    "m15_real_evaluation": "closed",
-    "next_ordered": [
-      "M16-08 live walkthrough: DONE 2026-09-07 (docs/walkthroughs/2026-09-07-live-binary.md) — three real tasks through the real binary; two defects found and fixed (BudgetStopYield resumable checkpoint, shutdown awaits in-flight safe-point writes)",
-      "M17 stage switch landed 2026-09-07 (CURRENT/ROADMAP/NEXT_TASKS/STATUS/AUDIT_TODO/AGENTS + docs/reviews/2026-09-07-platform-native-audit); next: C0 protocol DTO, B1/B2 start in parallel, then P1+G1",
-      "PACKAGE-01 package source binding at the next actual release (folded into R1)",
-      "MCP-01 only if default product enables MCP writes (E1 explicit-use paths also trigger it)"
-    ],
-    "lt_eval_06": {
-      "status": "evidence banked 2026-09-05",
-      "first_breadth_run": "12/12 PASS, 0 NOT_RUN (ltev_diagfix 4/4, ltev_migrate 4/4, harness_maint_dev 4/4; exact-tuple restore-and-continue on resume arms)",
-      "evidence": "crates/agent-eval/evidence/lt-eval-06/",
-      "contract_outcome": "TaskAnchor + ExecutionState substrate validated across three task families; no TaskGraph opened"
+  "schema": "project-state.v2",
+  "role": "navigation and provenance metadata only; not a current-status authority",
+  "updated": "2026-09-14",
+  "maintained_by": "docs/CURRENT.md is the current-facts entry; docs/NEXT_TASKS.md is the only executable queue",
+  "historical_snapshots": {
+    "entries_2026_09_13": {
+      "baseline_commit": "2b43186b005b5e86172037f98206f4417c7e2bca",
+      "path": "docs/archive/entries-2026-09-13-2b43186b/",
+      "note": "previous AGENTS/CURRENT/NEXT_TASKS/ROADMAP/STATUS/state.json full text; git history at that commit is the authoritative copy"
     }
   },
-  "m15": {
-    "status": "closed",
-    "closed_utc": "2026-09-04",
-    "closure_commit": "d004836d4e638d2774f8c6d704b9f50e0f591173",
-    "closing_window": {
-      "ordinal": 10,
-      "candidate_code_commit": "050aa8e68f59c49d42b95e2a4d38fa37234a1e78",
-      "manifest_created_utc": "2026-09-04T16:25:28Z",
-      "verdict": "pass",
-      "passed_cells": 12,
-      "total_cells": 12,
-      "not_run_cells": 0,
-      "report": "crates/agent-eval/evidence/m15-window/_windows/1788539149184/REPORT.md",
-      "run_log": "window10.log"
-    },
-    "pre_closure_runs_committed": 10,
-    "best_pre_closure_window": {
-      "ordinal": 9,
-      "verdict": "valid_fail",
-      "passed_cells": 11,
-      "report": "crates/agent-eval/evidence/m15-window/_windows/1788533384841/REPORT.md"
-    }
+  "milestone_evidence_locations": {
+    "m15_acceptance": "docs/M15_ACCEPTANCE.md",
+    "lt_eval_06_evidence": "crates/agent-eval/evidence/lt-eval-06/",
+    "frozen_experiment_reports": "docs/reviews/"
   },
-  "product_stage": "alpha",
-  "product_phase": "daily-coding-workflow",
-  "phase_2_started": "2026-09-04",
-  "phase_2_slices_landed": [
-    "checked model configuration: AGENT_DEMO=1 selects the mock explicitly, a missing OPENAI_API_KEY is a visible startup error (32ea622)",
-    "CHECKPOINT-PRODUCT-01: manual and automatic checkpoints share the runtime envelope store; retention scoped to real artifacts; fail-closed legacy decoder (e8e5fff)",
-    "CRASH-RESUME-01 (partial): real child-process kill points at checkpoint-after-temp-write and turn-before-commit-barrier with crash/resume acceptance (5f94dc7)",
-    "PRODUCT-PROFILE-01: strict provider env parsing, SamplingPolicy operating point, ProviderProfile + provider_profile_digest in the startup banner (d21b686)",
-    "TUI transcript bounded at 400 rows through a single push path (ca6db07)",
-    "CRASH-RESUME-01 completed: all four kill points (effect prepare, effect apply-before-ack, checkpoint temp-write, turn barrier) with a real child-process crash matrix (9f159fa)",
-    "TUI approval detail (risk + per-argument breakdown) and visible Lagged-event warnings (dc15079)",
-    "PACKAGE-01 base: dist.sh/dist.ps1 release packaging with SHA256SUMS, Windows path validated by a real run (072b185)",
-    "PROOF-OPERATION-01 (mostly closed): host verifier runs outside the actor loop behind an opt-in defer_proof_refresh switch, with fenced resume; frozen inline semantics default; cross-turn acceptance (turn-holding) remains (6d851ab)",
-    "PROOF-OPERATION-01 closed: turn-holding makes the deferred accepted commit deterministic; verifier runs outside the actor loop behind the opt-in defer_proof_refresh flag",
-    "CONTEXT-FRAME-SHADOW-01 (Frame-0): shadow ContextFrameCompiler emits a zoned, classified FrameManifest per model round behind the opt-in shadow_context_frame flag; model input unchanged",
-    "Frame-1: agent-replay --frame-report folds shadow manifests vs prompt-layer costs from flag-enabled traces (offline comparison)",
-    "Frame-2: scripted gate over compiled and recorded manifests (unit matrix + agent-replay --frame-gate for CI captures)",
-    "PACKAGE-01 closed: agent-tui --doctor product self-check, dual-platform CI packaging smoke with artifacts, INSTALL.md install/config/upgrade notes",
-    "RUN-PROJECTION-01: agent-replay --run-summary rebuilds lifecycle/tasks/checkpoints/debts/costs from traces; docs/COMPATIBILITY.md declares the V1 cross-version contract"
-  ],
-  "default_context": "dynamic-in-process",
-  "experimental": [
-    "context-service",
-    "completion-opportunity",
-    "settlement-projection",
-    "recovery-surface"
-  ],
-  "branch_protection": false,
-  "next_ordered": [
-    "M17 closure (N-series, switched 2026-09-08): N0 build/CI entry first — CI run 34148921895 fails at cargo fmt --check (agent-host); N1 host long-running service, N2 client operation safety, N6 core semantics/limits in parallel; N3->N4 real events into the GUI; N5 envelope restore; N7 bounded long sessions; N8 capability config + source-bound packaging (folds PACKAGE-01/R1)",
-    "conditional: real-provider live records (NOT_RUN without credentials); MCP-01 for newly declared MCP lanes (E1 covered the declared one)",
-    "audit basis 11afdd7 stored at docs/reviews/2026-09-08-closure-audit-11afdd7/; prior round at docs/reviews/2026-09-07-platform-native-audit/"
-  ],
-  "release": {
-    "version": "0.1.0",
-    "tag": "v0.1.0",
-    "notes": "first packaged release: M15 + LT-EVAL-06 gates closed, alpha hardening tranche (checkpoints unified, crash matrix, strict config + sampling identity, status projection, doctor, diagnostics export), Context Frame shadow measurement",
-    "artifacts": "package workflow run on the tag (dist-ubuntu-latest / dist-windows-latest + SHA256SUMS)",
-    "github_release": "https://github.com/Ye-Luo-0912/context-agent-prototype/releases/tag/v0.1.0",
-    "assets": [
-      "agent-tui-v0.1.0-linux.zip",
-      "agent-tui-v0.1.0-windows.zip"
-    ]
-  },
-  "previous_status_snapshot": {
-    "head_commit": "(refresh after doc commit)",
-    "code_commit": "050aa8e68f59c49d42b95e2a4d38fa37234a1e78",
-    "ci": {
-      "head_commit": "green",
-      "head_run_id": 33898496334,
-      "last_green_commit": "33081b40debd4a022691b3a7ae70d67977d5e677",
-      "code_commit": "green"
-    },
-    "next_ordered": [
-      "packaged V1 release gate (package workflow 33983799960 dispatched)",
-      "V1 freeze: version/tag/release notes"
-    ]
-  },
-  "reviewed_source_commit": "12c86283b8d5991e9f17a07f14871dcf39d65066",
-  "source_scope_note": "Fixed reviewed source, not the SHA of later documentation or product commits. 2026-09-06 deep review was a partial-source pass (clone failed; 29 paths, not a full-repo inventory; no local Rust); its code items all closed. 2026-09-07 platform-native re-audit (baseline b299c6a, 19 paths, 4 full) is likewise partial-source; its residuals lead the M17 queue (B1-B3, P1, P2) — see docs/reviews/2026-09-07-platform-native-audit/.",
-  "active_task": "M17 closure: N0/N1/N2/N6/N3/N5 closed (CI run 34268863699 all-green on e508ad6); current N4 (formal GUI: consume the real event stream, informed approvals, stable row lifecycle); then N7 (bounded long sessions), N8 (capability config + source-bound packaging); backlog: Rolling engine focus-tracking gap",
-  "route_reset": {
-    "task_document": "docs/NEXT_TASKS.md",
-    "archive": "docs/archive/route-reset-12c8628",
-    "feature_status": "M16 closed 2026-09-07 (walkthroughs automated; conditional items remain). M17 switched 2026-09-07: three parallel lines (B/C0 contract, foundations B1-B3, platform P1-P3, GUI G1-G3); the queue leads with C0 docs (done) / B1 / B2",
-    "D0_remaining": "done 2026-09-06: README route links updated, NEXT_TASKS added to LIVE_DOCS, doc-consistency gate green",
-    "research_not_a_product_prerequisite": [
-      "M15 rerun",
-      "Frame-3",
-      "Chronicle",
-      "TaskGraph",
-      "new GC/ranking algorithms"
-    ],
-    "F1_status": "closed 2026-09-07 incl. the last preflight gap: model-config validation moved before Workspace::open (fa2b6d1), guarded by the real-binary integration test real_binary_startup.rs (bad key fails with no .focus-agent left; AGENT_DEMO headless run completes with awaiting_operator_review in the JSONL)",
-    "F2_status": "closed 2026-09-07: /work, /plan, checkpoint roundtrip, plus closure-semantics display (awaiting operator review vs durably completed) verified by the automated session-loop E2E (tui_e2e_work_status_names_awaiting_review_then_done_closes_durably)",
-    "F3_status": "landed 2026-09-06 incl. continued-review 6a (EOF-wait bounds) and 6b (verifier cancellation bridge armed on turn cancel and shutdown before bounded join); inline default until a real slow-verification walkthrough",
-    "F4_status": "closed 2026-09-07: resync_projection newest-first/current-run/watermark/bounded-read, run_summary entries+omitted counting, shadow-frame dedup-vs-cap accounting; dual-workspace walkthrough automated (headless e2e_bug_fix_preserves_user_modifications + interactive tui_e2e_review_attributes_the_agents_change_not_the_users); diag-export now carries the review-before-sharing header and defensively masks sk-/Bearer/OPENAI_API_KEY= shapes (4e9dbf4)",
-    "F5_status": "landed 2026-09-06: provable file-body supersession, verify-only error clearing, search.grep and fs.list PARTIAL coverage, fs.read range facts through ingest/supersession, confined bounded reads for grep/symbols, context-search cold-read observation; F6 headless live covered a cross-file task",
-    "F6_status": "headless live 2026-09-06: real provider gpt-5.6-luna via product compose/RuntimeHandle; three disposable workspaces passed harness file checks (bugfix, feature, interrupt/restore/continue); empty verification recipe table no longer fails compose; TUI interactive walkthroughs still pending; record in docs/walkthroughs/2026-09-06-f6.md",
-    "N1_status": "landed 2026-09-06: agent-tui --prompt/--work/--continue headless JSONL on the product compose/RuntimeHandle path; ungranted writes denied (no --yes/--allow-all); exit 0/2/3/1; targeted agent-tui tests cover deny/grant/work/round-budget",
-    "N2_status": "landed 2026-09-06: --grant-file JSON object/array (bounded, fail-closed) and --jsonl-out file capture for editor/task invoke; no daemon",
-    "headless_acceptance": "agent-compose/tests/route_flow.rs: real composition + scripted model covers /work composition, task.manage plan, round-budget stop with durable safe point, /continue incl. cross-checkpoint restore; landed 2026-09-06 with two wiring fixes (compose now wires the artifact store into runtime checkpoint services; the round-budget refusal drains the in-flight write and lands its own safe point)",
-    "continued_review_2026_09_06": {
-      "baseline": "12c86283b8d5991e9f17a07f14871dcf39d65066",
-      "report": "docs/reviews/2026-09-06-continued-audit/REVIEW.md",
-      "status": "all four findings fixed 2026-09-06: EOF wait stays inside the timeout/cancel select (cross-platform tests with watchdogs), verifier cancellation token bridges actor cancel incl. the parked NoActiveTurn path (arm then bounded join, no bare abort), resync_projection newest-first/current-run/watermark/bounded-read, run_summary counts entries+omitted with real-event tests and mid-file run split, shadow-frame duplicates vs cap omissions separated; regression tests added per fix",
-      "old_findings_already_fixed": "consumption stamping + PromptRequired dedup fixed in c6fbbab",
-      "correction": "F5 remaining (fs.read range facts, fs.list PARTIAL, confined bounded reads, search cold-read observation) landed 2026-09-06"
-    },
-    "deep_review_2026_09_06": {
-      "baseline": "12c86283b8d5991e9f17a07f14871dcf39d65066",
-      "report": "docs/reviews/2026-09-06-deep-audit/REVIEW.md",
-      "status": "partial source review; all of its code findings closed on this branch by 2026-09-07 (PROCESS-01 Unix validated on WSL2). Later 2026-09-07 re-audit residuals are tracked separately under M17. Not a full-repo audit; clone failed on DNS; no local Rust in the review.",
-      "new_findings": 13,
-      "executed_probes": [
-        "dist.sh stub cargo (stale binary and leftover helper packaged; build-fail exits 17)",
-        "POSIX FIFO open without O_NONBLOCK blocks",
-        "Linux SIGKILL parent leaves grouped child alive"
-      ],
-      "STORAGE_01_status": "landed 2026-09-06: Windows MoveFileEx replace without pre-unlink; open refuses empty generation-1 init when metadata is missing and WAL generations remain; does not auto-pick max .gN; agent-storage tests cover remnant WAL and post-compact .g2+.g3; Windows in-replace process crash not injected"
-    },
-    "platform_native_review_2026_09_07": {
-      "baseline": "b299c6a08fdb055a0148a24dea65053861df6ff1",
-      "report": "docs/reviews/2026-09-07-platform-native-audit/REPORT.md",
-      "tasks": "docs/reviews/2026-09-07-platform-native-audit/NEXT_STAGE_TASKS.md",
-      "status": "partial-source static re-audit (19 paths read, 4 full; clone failed on DNS; no local Rust/.NET; remote CI observed green). Key code claims (F01-F09 locations) re-verified statically at this working tree's HEAD 7c3236d on 2026-09-07. Findings mapped to M17: F01-F04 -> B1, F05 -> B2, F06 -> P2, F07 -> P1, F08/F09 -> B3, F10 -> C0 docs (landed). Not a full-repo pass; no fault injection or GUI measurements were run."
-    },
-    "m16": {
-      "proposal": "docs/reviews/2026-09-06-m16-proposal/TRIAGE.md",
-      "basis": "12c86283b8d5991e9f17a07f14871dcf39d65066",
-      "note": "M16 replaces D0/F1-F6 as the stage order. Remaining 2026-09-06 deep-audit items currently lead the same queue. The proposal marked every task unimplemented against 12c8628; this working tree maps landed product work onto M16-00..08.",
-      "M16_00": "done 2026-09-06: live CURRENT/ROADMAP/NEXT_TASKS/AGENTS point at M16; proposal stored under reviews/",
-      "M16_02": "closed 2026-09-07 (9a6e988): StatusProjection task line distinguishes [awaiting operator review] vs [durably completed (operator accepted)]; the TUI names the state at turn end; headless session_end gains task_state (operator_accepted / awaiting_operator_review / none); /done keeps the existing operator acceptance path",
-      "current_ticket": "M17: C0 (docs done 2026-09-07, protocol DTO next), then B1/B2; historical M16 tickets below are closed",
-      "M16_04": "closed 2026-09-07 (e6795ed): agent-compose/tests/m16_restore.rs — product-config save, shutdown, restore into a fresh composition (validate + RuntimeRestored), /continue lands segment two; read-only-base + standing-grants approval, capability-aware dispatcher, persisted reservation journal, startup ledger reconciliation"
-    }
-  },
-  "deep_audit_queue": {
-    "STORAGE-02": "closed 2026-09-06: compact_locked runs every fallible step (new-WAL seek, next_seq overflow check, recovery rebuild) before the metadata publish; post-publish is in-memory swap + best-effort old-WAL removal only, so the writer can never keep appending to the old generation after a failed compact. Tests: pre-publish new-WAL failure keeps old gen appendable and metadata untouched; crash between publish and old-WAL removal reopens on the published generation (agent-storage 21/21).",
-    "current": "M17 closure N-series (2026-09-08 audit, baseline 11afdd7, F01-F20 -> N0-N8): see docs/AUDIT_TODO.md and docs/NEXT_TASKS.md. Prior rounds' code items stay closed; CI currently red at fmt (run 34148921895) — N0.",
-    "PROVIDER-01": "closed 2026-09-06: non-2xx bodies read through bounded_error_body (8 KiB cap via bytes_stream take + per-chunk deadline, truncation marked in the message) instead of unbounded response.text(); watchdog regression proves the call returns against a 1 MiB declared body written past the cap",
-    "PROVIDER-02": "closed 2026-09-06: Chat finish_reason=length arms StreamAccumulator::take_output_limit and maps to AgentError::ModelOutputLimit instead of replaying the truncated accumulation as a normal completion",
-    "PROVIDER-03": "closed 2026-09-06: the EOF-flushed residual Responses frame passes validate_sse_event_routing like every blank-line terminated frame; regression: contradictory event name on the residual frame fails malformed-event",
-    "CONTEXT-01": "closed 2026-09-06: dependency ingest scans each entity bucket newest-first so the 64-candidate budget is spent on the freshest priors (old head-truncation linked the oldest 64), and entity bucket removal is order-preserving (no swap_remove) to keep slot order = creation order; regression: a 70-item bucket links the new item to items 62..=69",
-    "PROCESS-01": "containment fully landed 2026-09-07: Windows KILL_ON_JOB_CLOSE fence (7c72df3); Unix pipe-EOF watchdog (a954314) — the host re-enters its own executable as a watchdog (env marker dispatched at the top of main, before tokio) holding the read half of a UnixStream pair; host death closes the pipe and the watchdog kills the watched group only if the leader still answers, so the normal-shutdown disarm never signals; armed only by the product TUI. Supervision ledger (995a457) — execute_invocation records every spawned child via ChildLease (released on every normal exit path after the reap, left behind on crash); compose() reconciles the ledger at startup and clears it before the workspace is reused; pid matching is exact JSON-number and stale dead entries are cleared so a reused pid is never targeted. Validated 2026-09-07 on real Linux (WSL2 Ubuntu): agent-process 40/40 (all six watchdog tests), agent-workspace 132, tool-runtime 229 — the ledger's reconcile now proves it kills an abandoned group-leader child; CI re-runs remain as regression.",
-    "PROCESS-02": "closed 2026-09-06: reap clears the pid only after a confirmed exit (typed ProcessReapOutcome) and kill_tree's direct-child fallback no longer depends on the child lock (direct pid kill); regression: a non-group-leader child dies through the fallback while the lock is held",
-    "WORKSPACE-01": "closed 2026-09-06: ordinary confined opens carry O_NONBLOCK with the same-handle stat accepting only regular files/directories (staged targets require a regular file); project_markers is a metadata-only probe (fstatat AT_SYMLINK_NOFOLLOW) so the root scan never opens an entry; regression: a writerless FIFO at Cargo.toml no longer blocks the scan (17c5ded; agent-workspace 98+5+3)",
-    "WORKSPACE-02": "closed 2026-09-06: all six raw-HANDLE sites take ownership (from_raw_handle / File::from_raw_handle) before check_not_reparse, matching the recovery-helper pattern; existing reparse rejection tests cover behavior; handle-count fault injection not performed (17c5ded)"
-  }
+  "retired_fields_note": "head_commit/code_commit/ci/milestone_gates/m15 of schema v1 moved to the archived snapshot; live values live in CURRENT.md bound to source SHA + environment + verification scope"
 }

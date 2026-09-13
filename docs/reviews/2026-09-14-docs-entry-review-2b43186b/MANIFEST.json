@@ -1,0 +1,55 @@
+{
+  "reviewed_source_sha": "2b43186b005b5e86172037f98206f4417c7e2bca",
+  "kind": "unapplied documentation drafts and source review",
+  "repository_modified": false,
+  "repository_tests_run": false,
+  "repository_doc_gate_run": false,
+  "provider_calls_run": false,
+  "original_entry_bytes": {
+    "AGENTS.md": 4445,
+    "docs/CURRENT.md": 122317,
+    "docs/NEXT_TASKS.md": 189638
+  },
+  "files": {
+    "drafts/AGENTS.md": {
+      "bytes": 3246,
+      "lines": 30
+    },
+    "drafts/docs/CURRENT.md": {
+      "bytes": 3678,
+      "lines": 35
+    },
+    "drafts/docs/NEXT_TASKS.md": {
+      "bytes": 5320,
+      "lines": 59
+    },
+    "drafts/docs/ROADMAP.md": {
+      "bytes": 2485,
+      "lines": 35
+    },
+    "drafts/docs/STATUS.md": {
+      "bytes": 339,
+      "lines": 9
+    },
+    "README_INTRO_REPLACEMENT.md": {
+      "bytes": 1581,
+      "lines": 26
+    },
+    "MIGRATION_TASK.md": {
+      "bytes": 5106,
+      "lines": 51
+    },
+    "REVIEW.md": {
+      "bytes": 11563,
+      "lines": 91
+    }
+  },
+  "latest_observed_sha": "278280146df5934828962253507553762693f494",
+  "latest_ci": {
+    "run_id": 34783505990,
+    "status": "completed",
+    "conclusion": "failure",
+    "attempt": 1
+  },
+  "latest_delta_scope": "metadata, partial diff, CURRENT top, partial ModelInput and unchanged hydration blob; not full diff or full-repo review"
+}

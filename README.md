@@ -6,27 +6,22 @@ A small Rust coding-agent runtime built to test one hypothesis first:
 
 This repository intentionally does **not** include vectors, RAG, knowledge graphs, multi-agent orchestration, or learned context ranking in v0.1.
 
-The concrete product target is a reliable **single-user local coding Agent**:
-one workspace, one explicit provider profile, bounded builtin tools,
-human-approved effects, verifiable completion and cold resume. The alpha
-(`v0.1.0`: packaged Windows/Linux binaries, install notes, checked
-configuration, checkpoints/status/doctor) is released, and the formal M15
-reliability gate is closed. M16 (daily-usable local agent) is closed with
-its walkthroughs automated. M17's three lines (foundation correctness
-B1–B3, platform service P1–P3, .NET 10 + Avalonia GUI G1–G3 over a
-dedicated Rust host) have landed their code; the current stage is the
-**M17 closure pass — the resumable multi-entry workbench (N0–N8)**: a
-2026-09-08 partial-source re-audit (`11afdd7`) found the remaining gaps
-are broken end-to-end links, not missing components — the event
-subscription drops its receiver, reconnects auto-retry mutations, the
-host restore bypasses the checkpoint envelope, and long-lived serving
-has session/shutdown gaps. N0 (current) restores the build and CI entry:
-CI run 34148921895 currently fails at `cargo fmt --check`
-(violations in agent-host). The ordered route is
-[`docs/ROADMAP.md`](docs/ROADMAP.md#route-to-a-usable-local-agent); the
-active task queue is [`docs/NEXT_TASKS.md`](docs/NEXT_TASKS.md). No
-Chronicle, TaskGraph, second orchestrator, or second task state
-authority.
+The product target is a single-user local coding-agent backend: one workspace,
+one runtime orchestrator, explicit provider configuration, bounded tools,
+authorized effects, verifiable outcomes, and checkpoint-based recovery.
+
+The current work prioritizes the backend long-flow path: execution and tools,
+context/GC/search, and platform integration with provider-side prompt caching.
+Existing interfaces remain clients of the same runtime; new GUI features are
+not a prerequisite for backend completion.
+
+See [`docs/CURRENT.md`](docs/CURRENT.md) for the source-scoped implementation
+status and [`docs/NEXT_TASKS.md`](docs/NEXT_TASKS.md) for executable work.
+[`docs/ROADMAP.md`](docs/ROADMAP.md#route-to-a-usable-local-agent) defines capability
+milestones. This README does not duplicate changing CI results or task queues.
+
+Historical reports and experiment artifacts remain evidence for their named
+source and environment; they do not certify newer code or uncommitted work.
 
 ## Architecture
 
@@ -68,8 +63,11 @@ agent-core CorePort (stateless trusted facade)
 - `agent-platform-protocol`: bounded semantic wire DTOs for extension
   clients (parse-time JSON budgets, no transport/runtime).
 - `context-simple`: first non-vector working-set implementation (dynamic).
-- `context-baselines`: baseline A (append-only) and B (rolling-window + fixed
-  marker, despite the legacy `RollingSummaryEngine` name) for A/B/C experiments.
+- `context-baselines`: baseline A (append-only) and B (rolling-window) for
+  A/B/C experiments. In baseline form B folds with a fixed marker only when
+  no compactor is injected; the product composition root injects the real
+  bounded compactor — the effective strategy follows the actual
+  `build_context_engine` wiring at each entry, not this README.
 - `context-contextcore`: `ContextEngine` adapter over a context-service process boundary (the ContextCore integration shape).
 - `agent-context-service`: standalone context-service process speaking the adapter's JSON-lines protocol.
 - `agent-workspace`: workspace root and artifact storage.
