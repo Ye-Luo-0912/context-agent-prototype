@@ -4,9 +4,9 @@
 use std::sync::Arc;
 
 use agent_contracts::{
-    AgentError, AgentResult, BoundedCompactor, COMPACTION_OUTPUT_CHARS, CancellationToken,
-    CompactionOutput, CompactionRequest, ModelMessage, ModelRequest, ModelTransport,
-    bound_compaction_output, bound_compaction_source, tokens,
+    AgentError, AgentResult, BoundedCompactor, COMPACTION_OUTPUT_CHARS, CacheWritePolicy,
+    CancellationToken, CompactionOutput, CompactionRequest, ModelMessage, ModelRequest,
+    ModelTransport, bound_compaction_output, bound_compaction_source, tokens,
 };
 use async_trait::async_trait;
 
@@ -51,6 +51,14 @@ impl BoundedCompactor for ModelBackedCompactor {
                 // field, generation stops at the compaction bound instead of
                 // the main profile's cap (truncation stays as the backstop).
                 max_output_tokens: Some(COMPACTION_OUTPUT_CHARS as u32),
+                // C1/C2 (R2/R3): the maintenance lane marks its own request.
+                // The routing key is the caller's (runtime's) to fill when
+                // its composition wants one; the policy is the compactor's
+                // own declaration so a confirmed explicit-only transport
+                // never silently implicit-writes the one-shot suffix.
+                prompt_cache_key: None,
+                cache_write_policy: Some(CacheWritePolicy::ExplicitOnly),
+                cache_breakpoints: Vec::new(),
                 cancel: CancellationToken::new(),
             })
             .await?;
@@ -236,6 +244,51 @@ mod tests {
             caps,
             vec![Some(COMPACTION_OUTPUT_CHARS as u32)],
             "the request must state the compaction output bound"
+        );
+    }
+
+    /// C2 (R3): the compaction call declares its own lane and cache write
+    /// policy. On a confirmed explicit-only transport it must never fall back
+    /// to the provider-default implicit write of a one-shot suffix: the
+    /// request itself carries `CacheWritePolicy::ExplicitOnly`, so a missing
+    /// reuse boundary maps to the endpoint's no-cache-write shape.
+    #[tokio::test]
+    async fn compaction_requests_declare_the_explicit_only_cache_write_policy() {
+        struct CapturingModel {
+            seen_policies: std::sync::Arc<std::sync::Mutex<Vec<Option<CacheWritePolicy>>>>,
+        }
+        #[async_trait]
+        impl ModelTransport for CapturingModel {
+            fn capabilities(&self) -> ModelCapabilities {
+                ModelCapabilities::default()
+            }
+            async fn complete(&self, request: ModelRequest) -> AgentResult<ModelOutput> {
+                self.seen_policies
+                    .lock()
+                    .unwrap()
+                    .push(request.cache_write_policy);
+                Ok(ModelOutput {
+                    content: "short summary".into(),
+                    tool_calls: Vec::new(),
+                    usage: ModelUsage::default(),
+                })
+            }
+        }
+        let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let compactor = ModelBackedCompactor::new(Arc::new(CapturingModel {
+            seen_policies: Arc::clone(&seen),
+        }));
+        let _ = compactor
+            .compact(CompactionRequest {
+                folded_items: 2,
+                source: "keep this".into(),
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            *seen.lock().unwrap(),
+            vec![Some(CacheWritePolicy::ExplicitOnly)],
+            "the maintenance lane must mark its own explicit-only write policy"
         );
     }
 

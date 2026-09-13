@@ -735,7 +735,7 @@ fn strip_json_schema_descriptions(value: &mut Value) {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(PartialEq, Debug, Clone, Serialize, Deserialize)]
 pub struct ToolCall {
     pub id: String,
     pub name: String,

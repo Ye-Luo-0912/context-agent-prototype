@@ -159,7 +159,10 @@ pub enum StageOutcome {
 }
 
 /// Terminal stage of one model call once the retry loop exits.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+// `known_usage` carries provider counters, which intentionally have no
+// equality semantics (absent vs zero is meaningful), so the stage compares
+// field-by-field instead of deriving whole-value equality.
+#[derive(Debug, Clone, Serialize)]
 pub struct CallStage {
     /// Monotonic per-transport call sequence: every incident and stage of
     /// the same model call carry the same value, so JSONL observers can
@@ -173,6 +176,13 @@ pub struct CallStage {
     /// Retries consumed by the tool-call format credit.
     pub format_retries: u32,
     pub outcome: StageOutcome,
+    /// C4 (R6): usage counters that completed attempts of this call already
+    /// reported, kept on the terminal record for outcomes whose error cannot
+    /// carry them (cancellation must surface as the plain variant so hosts
+    /// keep running their cancellation barrier). `None` when no attempt
+    /// reported anything — unknown stays unknown, never an invented zero.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub known_usage: Option<ModelUsage>,
 }
 
 fn final_stage(
@@ -209,19 +219,91 @@ fn final_stage(
         transport_retries,
         format_retries,
         outcome,
+        known_usage: None,
     }
 }
 
-/// COST-7 (R3-12): keep the most recent usage a failed attempt reported
-/// when the final error itself carries none — the billed attempt's
-/// evidence survives the give-up instead of degrading to unknown.
-fn attach_known_usage(error: AgentError, carried: Option<ModelUsage>) -> AgentError {
-    if error.reported_usage().is_some() {
-        return error;
+/// C4 (R6): the running total of usage counters that completed attempts of
+/// this call already reported. Each real attempt settles exactly once — its
+/// error carries the attempt's final accumulator snapshot — different real
+/// attempts add up, and attempts that reported nothing stay absent: unknown
+/// is never filled with an invented zero.
+#[derive(Debug, Default, Clone)]
+struct KnownAttemptUsage(Option<ModelUsage>);
+
+impl KnownAttemptUsage {
+    fn settle_failure(&mut self, error: &AgentError) {
+        if let Some(usage) = error.reported_usage() {
+            self.settle(usage);
+        }
     }
-    match carried {
-        Some(usage) => AgentError::failed_with_usage(usage, error),
-        None => error,
+
+    fn settle(&mut self, usage: &ModelUsage) {
+        match &mut self.0 {
+            Some(total) => merge_known_usage(total, usage),
+            None => self.0 = Some(usage.clone()),
+        }
+    }
+
+    fn record(&self) -> Option<ModelUsage> {
+        self.0.clone()
+    }
+
+    fn take_record(&mut self) -> Option<ModelUsage> {
+        self.0.take()
+    }
+}
+
+/// Saturating merge of the counters the provider actually reported. A counter
+/// absent on both sides stays absent on the total; one side reporting is kept
+/// verbatim. Attempts/retries are transport counters stamped elsewhere.
+fn merge_known_usage(total: &mut ModelUsage, addition: &ModelUsage) {
+    fn add(target: &mut Option<u64>, source: Option<u64>) {
+        if source.is_some() || target.is_some() {
+            *target = Some(target.unwrap_or(0).saturating_add(source.unwrap_or(0)));
+        }
+    }
+    add(&mut total.input_tokens, addition.input_tokens);
+    add(&mut total.output_tokens, addition.output_tokens);
+    add(&mut total.cached_input_tokens, addition.cached_input_tokens);
+    add(
+        &mut total.cache_write_input_tokens,
+        addition.cache_write_input_tokens,
+    );
+    add(
+        &mut total.cache_miss_input_tokens,
+        addition.cache_miss_input_tokens,
+    );
+}
+
+/// A cancellation must surface as the plain variant so hosts keep matching it
+/// and running their cancellation barrier; its already-reported usage travels
+/// on the terminal stage record instead.
+fn is_cancellation(error: &AgentError) -> bool {
+    matches!(error.failure_source(), AgentError::Cancelled)
+}
+
+/// Terminal error of the retry loop with the settled known usage attached
+/// through the shared `FailedWithUsage` representation. The original failure
+/// semantics stay readable through `failure_source` (no wrapper nesting), and
+/// a usage-less call keeps its plain typed error.
+fn terminal_error(error: AgentError, known: &mut KnownAttemptUsage) -> AgentError {
+    if is_cancellation(&error) {
+        return match error {
+            AgentError::FailedWithUsage { source, .. } => *source,
+            other => other,
+        };
+    }
+    let Some(usage) = known.take_record() else {
+        return error;
+    };
+    let source = match error {
+        AgentError::FailedWithUsage { source, .. } => *source,
+        other => other,
+    };
+    AgentError::FailedWithUsage {
+        usage,
+        source: Box::new(source),
     }
 }
 
@@ -234,6 +316,7 @@ fn cancelled_stage(budget: &RetryBudget, call_seq: u64) -> CallStage {
         transport_retries: budget.transport_failures,
         format_retries: budget.format_failures,
         outcome: StageOutcome::Cancelled,
+        known_usage: None,
     }
 }
 
@@ -559,7 +642,7 @@ impl<T: ModelTransport> ModelTransport for RetryingTransport<T> {
 
     async fn complete(&self, request: ModelRequest) -> AgentResult<ModelOutput> {
         let call_seq = self.call_seq.fetch_add(1, Ordering::Relaxed);
-        let (mut output, attempts) = retry(
+        let (mut output, attempts, mut known) = retry(
             self.max_attempts,
             &self.schedule,
             &request.cancel,
@@ -568,6 +651,9 @@ impl<T: ModelTransport> ModelTransport for RetryingTransport<T> {
             || self.inner.complete(request.clone()),
         )
         .await?;
+        if let Some(usage) = known.take_record() {
+            merge_known_usage(&mut output.usage, &usage);
+        }
         stamp_attempt_usage(&mut output, attempts);
         Ok(output)
     }
@@ -587,6 +673,30 @@ impl<T: ModelTransport> ModelTransport for RetryingTransport<T> {
 }
 
 impl<T: ModelTransport> RetryingTransport<T> {
+    /// Records the terminal stage with the call's settled known usage.
+    fn emit_stage(&self, mut stage: CallStage, known: &KnownAttemptUsage) {
+        stage.known_usage = known.record();
+        self.observer.on_stage(&stage);
+    }
+
+    /// Terminal failure that will not be retried: record the stage and
+    /// return the error with the settled known usage attached.
+    fn finish_failed(
+        &self,
+        budget: &RetryBudget,
+        class: Option<RetryClass>,
+        call_seq: u64,
+        error: AgentError,
+        known: &mut KnownAttemptUsage,
+    ) -> AgentError {
+        if is_cancellation(&error) {
+            self.emit_stage(cancelled_stage(budget, call_seq), known);
+            return terminal_error(error, known);
+        }
+        self.emit_stage(final_stage(budget, false, class, call_seq), known);
+        terminal_error(error, known)
+    }
+
     /// Live mode: forward chunks as they arrive; a retryable failure after an
     /// irreversible chunk cannot be replayed into the same sink, so it is
     /// surfaced instead of retried. Protocol-internal chunks may remain below
@@ -599,8 +709,9 @@ impl<T: ModelTransport> RetryingTransport<T> {
     ) -> AgentResult<ModelOutput> {
         let emitted = AtomicBool::new(false);
         let mut budget = RetryBudget::new(self.max_attempts);
-        // COST-7 (R3-12): the most recent usage any failed attempt reported.
-        let mut carried_usage: Option<ModelUsage> = None;
+        // C4 (R6): every attempt's reported usage settles into this total
+        // exactly once; the final error or output carries the sum.
+        let mut known = KnownAttemptUsage::default();
         loop {
             let tracking = EmissionTrackingSink {
                 inner: sink,
@@ -608,32 +719,38 @@ impl<T: ModelTransport> RetryingTransport<T> {
             };
             match self.inner.complete_stream(request.clone(), &tracking).await {
                 Ok(mut output) => {
-                    self.observer
-                        .on_stage(&final_stage(&budget, true, None, call_seq));
+                    self.emit_stage(final_stage(&budget, true, None, call_seq), &known);
+                    if let Some(usage) = known.take_record() {
+                        merge_known_usage(&mut output.usage, &usage);
+                    }
                     stamp_attempt_usage(&mut output, budget.attempts);
                     return Ok(output);
                 }
                 Err(error) => {
-                    if let Some(usage) = error.reported_usage() {
-                        carried_usage = Some(usage.clone());
-                    }
+                    known.settle_failure(&error);
                     let Some(class) = retry_class(&error) else {
-                        self.observer
-                            .on_stage(&final_stage(&budget, false, None, call_seq));
-                        return Err(attach_known_usage(error, carried_usage.take()));
+                        return Err(self.finish_failed(&budget, None, call_seq, error, &mut known));
                     };
                     if emitted.load(Ordering::Relaxed) {
                         // A stream that already emitted deltas cannot be
                         // replayed into the same sink: the live listener has
                         // no rewind, and a retry would duplicate the output.
-                        self.observer
-                            .on_stage(&final_stage(&budget, false, Some(class), call_seq));
-                        return Err(attach_known_usage(error, carried_usage.take()));
+                        return Err(self.finish_failed(
+                            &budget,
+                            Some(class),
+                            call_seq,
+                            error,
+                            &mut known,
+                        ));
                     }
                     let Some(reservation) = budget.reserve_retry(class) else {
-                        self.observer
-                            .on_stage(&final_stage(&budget, false, Some(class), call_seq));
-                        return Err(attach_known_usage(error, carried_usage.take()));
+                        return Err(self.finish_failed(
+                            &budget,
+                            Some(class),
+                            call_seq,
+                            error,
+                            &mut known,
+                        ));
                     };
                     let delay = retry_delay(
                         class,
@@ -664,14 +781,19 @@ impl<T: ModelTransport> RetryingTransport<T> {
                     {
                         // The retry notification itself failed: the call
                         // ends here, and the terminal stage records it.
-                        self.observer
-                            .on_stage(&final_stage(&budget, false, Some(class), call_seq));
-                        return Err(error);
+                        return Err(self.finish_failed(
+                            &budget,
+                            Some(class),
+                            call_seq,
+                            error,
+                            &mut known,
+                        ));
                     }
                     tokio::select! {
                         _ = request.cancel.cancelled() => {
-                            self.observer
-                                .on_stage(&cancelled_stage(&budget, call_seq));
+                            // Cancellation keeps its plain variant; the known
+                            // usage stays on the terminal stage record.
+                            self.emit_stage(cancelled_stage(&budget, call_seq), &known);
                             return Err(AgentError::Cancelled);
                         }
                         _ = tokio::time::sleep(delay) => {}
@@ -691,8 +813,9 @@ impl<T: ModelTransport> RetryingTransport<T> {
         call_seq: u64,
     ) -> AgentResult<ModelOutput> {
         let mut budget = RetryBudget::new(self.max_attempts);
-        // COST-7 (R3-12): the most recent usage any failed attempt reported.
-        let mut carried_usage: Option<ModelUsage> = None;
+        // C4 (R6): every attempt's reported usage settles into this total
+        // exactly once; the final error or output carries the sum.
+        let mut known = KnownAttemptUsage::default();
         loop {
             let collected = BufferedSink::default();
             match self
@@ -706,38 +829,42 @@ impl<T: ModelTransport> RetryingTransport<T> {
                             for chunk in chunks {
                                 if let Err(error) = sink.on_chunk(chunk).await {
                                     // Replay into the real sink failed: the
-                                    // call ends here; the terminal stage
-                                    // records it.
-                                    self.observer
-                                        .on_stage(&final_stage(&budget, false, None, call_seq));
-                                    return Err(error);
+                                    // call ends here; the successful
+                                    // attempt's usage is real evidence too.
+                                    known.settle(&output.usage);
+                                    return Err(self.finish_failed(
+                                        &budget, None, call_seq, error, &mut known,
+                                    ));
                                 }
                             }
                         }
                         Err(error) => {
-                            self.observer
-                                .on_stage(&final_stage(&budget, false, None, call_seq));
-                            return Err(error);
+                            known.settle(&output.usage);
+                            return Err(
+                                self.finish_failed(&budget, None, call_seq, error, &mut known)
+                            );
                         }
                     }
-                    self.observer
-                        .on_stage(&final_stage(&budget, true, None, call_seq));
+                    self.emit_stage(final_stage(&budget, true, None, call_seq), &known);
+                    if let Some(usage) = known.take_record() {
+                        merge_known_usage(&mut output.usage, &usage);
+                    }
                     stamp_attempt_usage(&mut output, budget.attempts);
                     return Ok(output);
                 }
                 Err(error) => {
-                    if let Some(usage) = error.reported_usage() {
-                        carried_usage = Some(usage.clone());
-                    }
+                    known.settle_failure(&error);
                     let Some(class) = retry_class(&error) else {
-                        self.observer
-                            .on_stage(&final_stage(&budget, false, None, call_seq));
-                        return Err(attach_known_usage(error, carried_usage.take()));
+                        return Err(self.finish_failed(&budget, None, call_seq, error, &mut known));
                     };
                     let Some(reservation) = budget.reserve_retry(class) else {
-                        self.observer
-                            .on_stage(&final_stage(&budget, false, Some(class), call_seq));
-                        return Err(attach_known_usage(error, carried_usage.take()));
+                        return Err(self.finish_failed(
+                            &budget,
+                            Some(class),
+                            call_seq,
+                            error,
+                            &mut known,
+                        ));
                     };
                     let delay = retry_delay(
                         class,
@@ -766,14 +893,17 @@ impl<T: ModelTransport> RetryingTransport<T> {
                         })
                         .await
                     {
-                        self.observer
-                            .on_stage(&final_stage(&budget, false, Some(class), call_seq));
-                        return Err(error);
+                        return Err(self.finish_failed(
+                            &budget,
+                            Some(class),
+                            call_seq,
+                            error,
+                            &mut known,
+                        ));
                     }
                     tokio::select! {
                         _ = request.cancel.cancelled() => {
-                            self.observer
-                                .on_stage(&cancelled_stage(&budget, call_seq));
+                            self.emit_stage(cancelled_stage(&budget, call_seq), &known);
                             return Err(AgentError::Cancelled);
                         }
                         _ = tokio::time::sleep(delay) => {}
@@ -907,31 +1037,42 @@ async fn retry<T, F, Fut>(
     call_seq: u64,
     observer: &dyn RetryObserver,
     mut op: F,
-) -> AgentResult<(T, u32)>
+) -> AgentResult<(T, u32, KnownAttemptUsage)>
 where
     F: FnMut() -> Fut,
     Fut: std::future::Future<Output = AgentResult<T>>,
 {
     let mut budget = RetryBudget::new(max_attempts);
-    // COST-7 (R3-12): the most recent usage any failed attempt reported.
-    let mut carried_usage: Option<ModelUsage> = None;
+    // C4 (R6): every attempt's reported usage settles into this total exactly
+    // once; the final error or value carries the sum.
+    let mut known = KnownAttemptUsage::default();
     loop {
         match op().await {
             Ok(value) => {
-                observer.on_stage(&final_stage(&budget, true, None, call_seq));
-                return Ok((value, budget.attempts));
+                let mut stage = final_stage(&budget, true, None, call_seq);
+                stage.known_usage = known.record();
+                observer.on_stage(&stage);
+                return Ok((value, budget.attempts, known));
             }
             Err(error) => {
-                if let Some(usage) = error.reported_usage() {
-                    carried_usage = Some(usage.clone());
-                }
+                known.settle_failure(&error);
                 let Some(class) = retry_class(&error) else {
-                    observer.on_stage(&final_stage(&budget, false, None, call_seq));
-                    return Err(attach_known_usage(error, carried_usage.take()));
+                    if is_cancellation(&error) {
+                        let mut stage = cancelled_stage(&budget, call_seq);
+                        stage.known_usage = known.record();
+                        observer.on_stage(&stage);
+                        return Err(terminal_error(error, &mut known));
+                    }
+                    let mut stage = final_stage(&budget, false, None, call_seq);
+                    stage.known_usage = known.record();
+                    observer.on_stage(&stage);
+                    return Err(terminal_error(error, &mut known));
                 };
                 let Some(reservation) = budget.reserve_retry(class) else {
-                    observer.on_stage(&final_stage(&budget, false, Some(class), call_seq));
-                    return Err(attach_known_usage(error, carried_usage.take()));
+                    let mut stage = final_stage(&budget, false, Some(class), call_seq);
+                    stage.known_usage = known.record();
+                    observer.on_stage(&stage);
+                    return Err(terminal_error(error, &mut known));
                 };
                 let delay = retry_delay(class, schedule, reservation.class_retry_number, &error);
                 observer.on_incident(&RetryIncident {
@@ -950,7 +1091,9 @@ where
                 );
                 tokio::select! {
                     _ = cancel.cancelled() => {
-                        observer.on_stage(&cancelled_stage(&budget, call_seq));
+                        let mut stage = cancelled_stage(&budget, call_seq);
+                        stage.known_usage = known.record();
+                        observer.on_stage(&stage);
                         return Err(AgentError::Cancelled);
                     }
                     _ = tokio::time::sleep(delay) => {}
@@ -990,6 +1133,7 @@ mod tests {
             transport_retries: 0,
             format_retries: 1,
             outcome: StageOutcome::Recovered,
+            known_usage: None,
         });
         let lines = std::fs::read_to_string(&path).unwrap();
         let lines: Vec<&str> = lines.lines().collect();
@@ -1017,6 +1161,7 @@ mod tests {
             transport_retries: 0,
             format_retries: 0,
             outcome: StageOutcome::Clean,
+            known_usage: None,
         });
         assert_eq!(
             std::fs::metadata(&path).unwrap().len(),
@@ -1035,6 +1180,7 @@ mod tests {
             transport_retries: 0,
             format_retries: 0,
             outcome: StageOutcome::GaveUp,
+            known_usage: None,
         });
         observer.on_incident(&RetryIncident {
             call_seq: 0,
@@ -1264,6 +1410,511 @@ mod tests {
         let output = transport.complete(request()).await.unwrap();
         assert_eq!(output.content, "recovered");
         assert_eq!(calls.load(Ordering::SeqCst), 2);
+        // C4 (R6): the failed attempt's reported counters ride on the
+        // successful round's usage — known values are not lost and each
+        // attempt is counted exactly once (40 + 10, not 40 + 10 + 40).
+        assert_eq!(output.usage.input_tokens, Some(50));
+        assert_eq!(output.usage.output_tokens, Some(2));
+        assert_eq!(output.usage.attempts, 2);
+    }
+
+    /// C4 (R6) fixture: attempt 1 fails retryable with reported usage; the
+    /// next attempt succeeds with its own counters.
+    struct UsageThenSucceed {
+        calls: Arc<AtomicU32>,
+    }
+
+    #[async_trait]
+    impl ModelTransport for UsageThenSucceed {
+        fn capabilities(&self) -> ModelCapabilities {
+            ModelCapabilities::default()
+        }
+        async fn complete(&self, _request: ModelRequest) -> AgentResult<ModelOutput> {
+            unreachable!("streaming model should be driven through complete_stream")
+        }
+        async fn complete_stream(
+            &self,
+            _request: ModelRequest,
+            sink: &dyn ModelEventSink,
+        ) -> AgentResult<ModelOutput> {
+            if self.calls.fetch_add(1, Ordering::SeqCst) == 0 {
+                return Err(AgentError::failed_with_usage(
+                    ModelUsage {
+                        input_tokens: Some(90),
+                        output_tokens: Some(30),
+                        cached_input_tokens: Some(60),
+                        ..ModelUsage::default()
+                    },
+                    AgentError::Transport {
+                        retryable: true,
+                        message: "stream dropped after the usage frame".into(),
+                    },
+                ));
+            }
+            sink.on_chunk(ModelChunk::Done).await?;
+            Ok(ModelOutput {
+                content: "ok".into(),
+                tool_calls: Vec::new(),
+                usage: ModelUsage {
+                    input_tokens: Some(10),
+                    output_tokens: Some(2),
+                    ..ModelUsage::default()
+                },
+            })
+        }
+    }
+
+    /// C4 (R6) fixture: complete()-path transport whose first
+    /// `fail_with_usage` attempts fail retryable WITH a usage report and any
+    /// further attempt fails usage-less.
+    struct UsageFailures {
+        calls: Arc<AtomicU32>,
+        fail_with_usage: u32,
+    }
+
+    #[async_trait]
+    impl ModelTransport for UsageFailures {
+        fn capabilities(&self) -> ModelCapabilities {
+            ModelCapabilities::default()
+        }
+        async fn complete(&self, _request: ModelRequest) -> AgentResult<ModelOutput> {
+            let call = self.calls.fetch_add(1, Ordering::SeqCst) + 1;
+            let reported: Option<ModelUsage> = match (call, self.fail_with_usage) {
+                (1, 1) | (1, 2) => Some(ModelUsage {
+                    input_tokens: Some(90),
+                    output_tokens: Some(30),
+                    ..ModelUsage::default()
+                }),
+                (2, 2) => Some(ModelUsage {
+                    input_tokens: Some(40),
+                    output_tokens: Some(5),
+                    ..ModelUsage::default()
+                }),
+                _ => None,
+            };
+            match reported {
+                Some(usage) => Err(AgentError::failed_with_usage(
+                    usage,
+                    AgentError::Transport {
+                        retryable: true,
+                        message: format!("attempt {call} dropped"),
+                    },
+                )),
+                None => Err(AgentError::Transport {
+                    retryable: true,
+                    message: "link gone".into(),
+                }),
+            }
+        }
+        async fn complete_stream(
+            &self,
+            _request: ModelRequest,
+            _sink: &dyn ModelEventSink,
+        ) -> AgentResult<ModelOutput> {
+            unreachable!("the complete()-path fixture is driven through complete")
+        }
+    }
+
+    /// C4 (R6) fixture: streaming variant of [`UsageFailures`] — the first
+    /// `fail_with_usage` stream attempts fail retryable WITH a usage report,
+    /// any further attempt fails usage-less.
+    struct UsageStreamFailures {
+        calls: Arc<AtomicU32>,
+        fail_with_usage: u32,
+    }
+
+    #[async_trait]
+    impl ModelTransport for UsageStreamFailures {
+        fn capabilities(&self) -> ModelCapabilities {
+            ModelCapabilities::default()
+        }
+        async fn complete(&self, _request: ModelRequest) -> AgentResult<ModelOutput> {
+            unreachable!("streaming model should be driven through complete_stream")
+        }
+        async fn complete_stream(
+            &self,
+            _request: ModelRequest,
+            _sink: &dyn ModelEventSink,
+        ) -> AgentResult<ModelOutput> {
+            let call = self.calls.fetch_add(1, Ordering::SeqCst) + 1;
+            let reported: Option<ModelUsage> = match (call, self.fail_with_usage) {
+                (1, _) => Some(ModelUsage {
+                    input_tokens: Some(90),
+                    output_tokens: Some(30),
+                    ..ModelUsage::default()
+                }),
+                _ => None,
+            };
+            match reported {
+                Some(usage) => Err(AgentError::failed_with_usage(
+                    usage,
+                    AgentError::Transport {
+                        retryable: true,
+                        message: format!("stream attempt {call} dropped"),
+                    },
+                )),
+                None => Err(AgentError::Transport {
+                    retryable: true,
+                    message: "link gone".into(),
+                }),
+            }
+        }
+    }
+
+    /// C4 (R6) stop condition — failure-with-usage → success: the known
+    /// counters of the failed attempt survive into the returned output, in
+    /// both streaming modes, and the successful attempt adds on top of them.
+    #[tokio::test]
+    async fn a_usage_reported_before_success_is_kept_and_counted_once() {
+        let calls = Arc::new(AtomicU32::new(0));
+        let live = RetryingTransport::new(
+            UsageThenSucceed {
+                calls: calls.clone(),
+            },
+            3,
+            Duration::from_millis(1),
+        )
+        .with_jitter(|delay, _| delay);
+        let output = live
+            .complete_stream(request(), &RecordingSink::default())
+            .await
+            .unwrap();
+        assert_eq!(output.content, "ok");
+        assert_eq!(output.usage.input_tokens, Some(100));
+        assert_eq!(output.usage.output_tokens, Some(32));
+        assert_eq!(output.usage.cached_input_tokens, Some(60));
+        assert_eq!(output.usage.attempts, 2);
+
+        let calls = Arc::new(AtomicU32::new(0));
+        let buffered = RetryingTransport::new_buffering(
+            UsageThenSucceed { calls },
+            3,
+            Duration::from_millis(1),
+        )
+        .with_jitter(|delay, _| delay);
+        let output = buffered
+            .complete_stream(request(), &RecordingSink::default())
+            .await
+            .unwrap();
+        assert_eq!(output.usage.input_tokens, Some(100));
+        assert_eq!(output.usage.output_tokens, Some(32));
+        assert_eq!(output.usage.cached_input_tokens, Some(60));
+        assert_eq!(output.usage.attempts, 2);
+    }
+
+    /// C4 (R6) stop condition — two failure-with-usage attempts → give-up:
+    /// the final error carries the SUM of every attempt that reported, each
+    /// settled exactly once, with the original failure class still readable
+    /// through `failure_source` (no wrapper nesting).
+    #[tokio::test]
+    async fn two_usage_reporting_failures_sum_exactly_once_on_give_up() {
+        // Two usage-reporting failures, then a usage-less final failure.
+        let calls = Arc::new(AtomicU32::new(0));
+        let transport = RetryingTransport::new(
+            UsageFailures {
+                calls: calls.clone(),
+                fail_with_usage: 2,
+            },
+            3,
+            Duration::from_millis(1),
+        );
+        let error = transport.complete(request()).await.unwrap_err();
+        let usage = error
+            .reported_usage()
+            .expect("both reported attempts must survive the give-up");
+        assert_eq!(usage.input_tokens, Some(130), "90 + 40, each settled once");
+        assert_eq!(usage.output_tokens, Some(35), "30 + 5, each settled once");
+        assert!(
+            matches!(
+                error.failure_source(),
+                AgentError::Transport {
+                    retryable: true,
+                    ..
+                }
+            ),
+            "the original failure stays readable: {error:?}"
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 3);
+
+        // The final failing attempt itself reports usage: its counters merge
+        // with the earlier ones instead of replacing them.
+        let calls = Arc::new(AtomicU32::new(0));
+        let transport = RetryingTransport::new(
+            UsageFailures {
+                calls: calls.clone(),
+                fail_with_usage: 2,
+            },
+            2,
+            Duration::from_millis(1),
+        );
+        let error = transport.complete(request()).await.unwrap_err();
+        let usage = error.reported_usage().unwrap();
+        assert_eq!(usage.input_tokens, Some(130));
+        assert_eq!(usage.output_tokens, Some(35));
+        assert!(matches!(
+            error.failure_source(),
+            AgentError::Transport {
+                retryable: true,
+                ..
+            }
+        ));
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+    }
+
+    /// C4 (R6) stop condition — cancel after usage: the cancellation keeps
+    /// its plain variant (hosts run their barrier on it) while the known
+    /// counters stay on the terminal stage record.
+    #[tokio::test]
+    async fn cancel_after_a_reported_usage_keeps_plain_cancelled_and_the_stage_record() {
+        struct UsageThenPending {
+            calls: Arc<AtomicU32>,
+        }
+        #[async_trait]
+        impl ModelTransport for UsageThenPending {
+            fn capabilities(&self) -> ModelCapabilities {
+                ModelCapabilities::default()
+            }
+            async fn complete(&self, _request: ModelRequest) -> AgentResult<ModelOutput> {
+                unreachable!("streaming model should be driven through complete_stream")
+            }
+            async fn complete_stream(
+                &self,
+                _request: ModelRequest,
+                _sink: &dyn ModelEventSink,
+            ) -> AgentResult<ModelOutput> {
+                if self.calls.fetch_add(1, Ordering::SeqCst) == 0 {
+                    return Err(AgentError::failed_with_usage(
+                        ModelUsage {
+                            input_tokens: Some(90),
+                            output_tokens: Some(30),
+                            ..ModelUsage::default()
+                        },
+                        AgentError::Transport {
+                            retryable: true,
+                            message: "stream dropped".into(),
+                        },
+                    ));
+                }
+                std::future::pending::<()>().await;
+                unreachable!("the pending attempt never resolves")
+            }
+        }
+        let calls = Arc::new(AtomicU32::new(0));
+        let observer = Arc::new(RecordingObserver::default());
+        let transport =
+            RetryingTransport::new(UsageThenPending { calls }, 3, Duration::from_secs(60))
+                .with_observer(observer.clone());
+        let token = CancellationToken::new();
+        let mut request = request();
+        request.cancel = token.clone();
+        let run = tokio::spawn(async move {
+            transport
+                .complete_stream(request, &RecordingSink::default())
+                .await
+        });
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        token.cancel();
+        let error = tokio::time::timeout(Duration::from_secs(1), run)
+            .await
+            .expect("cancellation must abort the wait")
+            .expect("retry task panicked")
+            .unwrap_err();
+        assert!(
+            matches!(error, AgentError::Cancelled),
+            "cancellation must keep its plain variant: {error:?}"
+        );
+        let stages = observer.stages.lock().unwrap();
+        let stage = stages.last().unwrap();
+        assert_eq!(stage.outcome, StageOutcome::Cancelled);
+        let usage = stage
+            .known_usage
+            .as_ref()
+            .expect("the reported usage must stay on the stage record");
+        assert_eq!(usage.input_tokens, Some(90));
+        assert_eq!(usage.output_tokens, Some(30));
+    }
+
+    /// C4 (R6): a cancellation DURING a streaming attempt (the provider
+    /// reported usage frames and then the request was cancelled) unwraps to
+    /// the plain Cancelled variant, and its reported counters join the stage
+    /// record together with the earlier attempt's.
+    #[tokio::test]
+    async fn a_mid_stream_cancellation_keeps_the_plain_variant_and_the_stage_usage() {
+        struct UsageThenCancelMidStream {
+            calls: Arc<AtomicU32>,
+        }
+        #[async_trait]
+        impl ModelTransport for UsageThenCancelMidStream {
+            fn capabilities(&self) -> ModelCapabilities {
+                ModelCapabilities::default()
+            }
+            async fn complete(&self, _request: ModelRequest) -> AgentResult<ModelOutput> {
+                unreachable!("streaming model should be driven through complete_stream")
+            }
+            async fn complete_stream(
+                &self,
+                _request: ModelRequest,
+                _sink: &dyn ModelEventSink,
+            ) -> AgentResult<ModelOutput> {
+                let call = self.calls.fetch_add(1, Ordering::SeqCst);
+                if call == 0 {
+                    return Err(AgentError::failed_with_usage(
+                        ModelUsage {
+                            input_tokens: Some(90),
+                            output_tokens: Some(30),
+                            ..ModelUsage::default()
+                        },
+                        AgentError::Transport {
+                            retryable: true,
+                            message: "stream dropped".into(),
+                        },
+                    ));
+                }
+                Err(AgentError::failed_with_usage(
+                    ModelUsage {
+                        input_tokens: Some(7),
+                        output_tokens: Some(3),
+                        ..ModelUsage::default()
+                    },
+                    AgentError::Cancelled,
+                ))
+            }
+        }
+        let calls = Arc::new(AtomicU32::new(0));
+        let observer = Arc::new(RecordingObserver::default());
+        let transport = RetryingTransport::new(
+            UsageThenCancelMidStream { calls },
+            3,
+            Duration::from_millis(1),
+        )
+        .with_jitter(|delay, _| delay)
+        .with_observer(observer.clone());
+        let error = transport
+            .complete_stream(request(), &RecordingSink::default())
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(error, AgentError::Cancelled),
+            "the cancellation must surface unwrapped: {error:?}"
+        );
+        let stages = observer.stages.lock().unwrap();
+        let stage = stages.last().unwrap();
+        assert_eq!(stage.outcome, StageOutcome::Cancelled);
+        let usage = stage.known_usage.as_ref().unwrap();
+        assert_eq!(usage.input_tokens, Some(97), "90 + 7");
+        assert_eq!(usage.output_tokens, Some(33), "30 + 3");
+    }
+
+    /// C4 (R6) stop condition — sink failure: the retry notification failing
+    /// (live) and the successful replay failing (buffered) both keep the
+    /// already-reported usage of every attempt on the terminal error.
+    #[tokio::test]
+    async fn a_sink_failure_keeps_the_reported_usage_of_every_attempt() {
+        #[derive(Default)]
+        struct RetryingFailsSink {
+            chunks: std::sync::Mutex<Vec<ModelChunk>>,
+        }
+        #[async_trait]
+        impl ModelEventSink for RetryingFailsSink {
+            async fn on_chunk(&self, chunk: ModelChunk) -> AgentResult<()> {
+                let is_retrying = matches!(chunk, ModelChunk::Retrying { .. });
+                self.chunks.lock().unwrap().push(chunk);
+                if is_retrying {
+                    return Err(AgentError::Transport {
+                        retryable: true,
+                        message: "sink died at the retry notice".into(),
+                    });
+                }
+                Ok(())
+            }
+        }
+
+        // Live mode: the retry notification itself fails after attempt 1
+        // already reported usage.
+        let calls = Arc::new(AtomicU32::new(0));
+        let observer = Arc::new(RecordingObserver::default());
+        let transport = RetryingTransport::new(
+            UsageStreamFailures {
+                calls: calls.clone(),
+                fail_with_usage: 1,
+            },
+            5,
+            Duration::from_millis(1),
+        )
+        .with_jitter(|delay, _| delay)
+        .with_observer(observer.clone());
+        let error = transport
+            .complete_stream(request(), &RetryingFailsSink::default())
+            .await
+            .unwrap_err();
+        let usage = error
+            .reported_usage()
+            .expect("the known usage must survive");
+        assert_eq!(usage.input_tokens, Some(90));
+        assert_eq!(usage.output_tokens, Some(30));
+        let stage = observer.stages.lock().unwrap().last().unwrap().clone();
+        assert_eq!(stage.outcome, StageOutcome::GaveUp);
+        assert_eq!(stage.known_usage.map(|u| u.input_tokens), Some(Some(90)));
+
+        // Buffered mode: attempt 1 reported usage, attempt 2 succeeded but
+        // the replay into the real sink failed — both attempts' counters are
+        // kept (90 + 10 / 30 + 2), exactly once each. The sink tolerates the
+        // Retrying notice and fails on the replayed content.
+        #[derive(Default)]
+        struct ReplayFailsSink;
+        #[async_trait]
+        impl ModelEventSink for ReplayFailsSink {
+            async fn on_chunk(&self, chunk: ModelChunk) -> AgentResult<()> {
+                if matches!(chunk, ModelChunk::Retrying { .. }) {
+                    return Ok(());
+                }
+                Err(AgentError::Transport {
+                    retryable: true,
+                    message: "replay failed".into(),
+                })
+            }
+        }
+        let calls = Arc::new(AtomicU32::new(0));
+        let observer = Arc::new(RecordingObserver::default());
+        let transport = RetryingTransport::new_buffering(
+            UsageThenSucceed { calls },
+            5,
+            Duration::from_millis(1),
+        )
+        .with_jitter(|delay, _| delay)
+        .with_observer(observer.clone());
+        let error = transport
+            .complete_stream(request(), &ReplayFailsSink)
+            .await
+            .unwrap_err();
+        let usage = error.reported_usage().expect("both attempts must survive");
+        assert_eq!(usage.input_tokens, Some(100));
+        assert_eq!(usage.output_tokens, Some(32));
+        let stage = observer.stages.lock().unwrap().last().unwrap().clone();
+        assert_eq!(stage.known_usage.map(|u| u.output_tokens), Some(Some(32)));
+    }
+
+    /// C4 (R6): a give-up where NO attempt reported anything stays a plain
+    /// typed error with no usage envelope — unknown is never manufactured.
+    #[tokio::test]
+    async fn a_give_up_without_any_reported_usage_stays_unknown() {
+        let calls = Arc::new(AtomicU32::new(0));
+        let observer = Arc::new(RecordingObserver::default());
+        let inner = Flaky {
+            calls: calls.clone(),
+            failures_before_success: 100,
+            retryable: true,
+        };
+        let transport = RetryingTransport::new(inner, 2, Duration::from_millis(1))
+            .with_observer(observer.clone());
+        let error = transport.complete(request()).await.unwrap_err();
+        assert!(
+            error.reported_usage().is_none(),
+            "no report means no envelope: {error:?}"
+        );
+        let stages = observer.stages.lock().unwrap();
+        assert_eq!(stages.last().unwrap().outcome, StageOutcome::GaveUp);
+        assert!(stages.last().unwrap().known_usage.is_none());
     }
 
     #[tokio::test]
@@ -2319,6 +2970,7 @@ mod tests {
             transport_retries: 0,
             format_retries: 0,
             outcome: StageOutcome::Clean,
+            known_usage: None,
         };
         first.on_stage(&stage);
         second.on_stage(&stage);

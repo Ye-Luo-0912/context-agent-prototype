@@ -36,8 +36,8 @@ use std::{
 };
 
 use agent_contracts::{
-    AgentError, AgentResult, ModelCapabilities, ModelChunk, ModelEventSink, ModelOutput,
-    ModelProtocolErrorKind, ModelRequest, ModelRole, ModelTransport, RetryAfterMillis,
+    AgentError, AgentResult, CacheWritePolicy, ModelCapabilities, ModelChunk, ModelEventSink,
+    ModelOutput, ModelProtocolErrorKind, ModelRequest, ModelRole, ModelTransport, RetryAfterMillis,
 };
 use async_trait::async_trait;
 use futures_util::{StreamExt, TryStreamExt};
@@ -541,7 +541,15 @@ impl OpenAiProvider {
         loop {
             tokio::select! {
                 _ = request.cancel.cancelled() => {
-                    return Err(ProtocolError::from(AgentError::Cancelled));
+                    // C4 (R6): counters this in-flight attempt already
+                    // reported stay evidence. The retry wrapper unwraps the
+                    // plain cancellation and settles the numbers on its
+                    // terminal stage record.
+                    let usage = accumulator.usage.clone().unwrap_or_default();
+                    return Err(ProtocolError::from(AgentError::failed_with_usage(
+                        usage,
+                        AgentError::Cancelled,
+                    )));
                 }
                 _ = tokio::time::sleep_until(idle_deadline) => {
                     return Err(ProtocolError::transport(
@@ -674,9 +682,11 @@ impl OpenAiProvider {
             ProtocolError::from(AgentError::failed_with_usage(usage.clone(), error))
         })?;
         let tool_calls = codec.remap_calls(tool_calls);
-        sink.on_chunk(ModelChunk::Done)
-            .await
-            .map_err(ProtocolError::from)?;
+        // C4 (R6): a Done-sink failure must not discard the usage this
+        // (billed) attempt already reported.
+        sink.on_chunk(ModelChunk::Done).await.map_err(|error| {
+            ProtocolError::from(AgentError::failed_with_usage(usage.clone(), error))
+        })?;
 
         Ok(ModelOutput {
             content,
@@ -732,7 +742,15 @@ impl OpenAiProvider {
         let mut idle_deadline = tokio::time::Instant::now() + self.config.timeout;
         loop {
             tokio::select! {
-                _ = request.cancel.cancelled() => return Err(ProtocolError::from(AgentError::Cancelled)),
+                _ = request.cancel.cancelled() => {
+                    // C4 (R6): see the Chat path — keep the in-flight
+                    // attempt's reported counters as evidence.
+                    let usage = accumulator.usage().unwrap_or_default();
+                    return Err(ProtocolError::from(AgentError::failed_with_usage(
+                        usage,
+                        AgentError::Cancelled,
+                    )));
+                }
                 _ = tokio::time::sleep_until(idle_deadline) => {
                     return Err(ProtocolError::transport(
                         true,
@@ -848,9 +866,11 @@ impl OpenAiProvider {
             .finalize()
             .map_err(|error| ProtocolError::from(AgentError::failed_with_usage(usage, error)))?;
         let tool_calls = codec.remap_calls(tool_calls);
-        sink.on_chunk(ModelChunk::Done)
-            .await
-            .map_err(ProtocolError::from)?;
+        // C4 (R6): a Done-sink failure must not discard the usage this
+        // (billed) attempt already reported.
+        sink.on_chunk(ModelChunk::Done).await.map_err(|error| {
+            ProtocolError::from(AgentError::failed_with_usage(usage.clone(), error))
+        })?;
         Ok(ModelOutput {
             content,
             tool_calls,
@@ -864,6 +884,11 @@ fn build_chat_wire_request(
     config: &OpenAiConfig,
     codec: &ToolNameCodec,
 ) -> Value {
+    // C1/C2 (R2/R3): this adapter has no confirmed cache capability signal
+    // for the Chat dialect (the explicit mode is Responses-only and
+    // validated at configuration time), so neither the routing key nor any
+    // write-policy shape is mapped here: the payload stays byte-identical
+    // for every request, keyed or not, policy-marked or not.
     let messages: Vec<Value> = request
         .messages
         .iter()
@@ -952,7 +977,8 @@ fn build_responses_wire_request(
     codec: &ToolNameCodec,
     cache_mode: OpenAiPromptCacheMode,
 ) -> Value {
-    let boundary_index = (cache_mode == OpenAiPromptCacheMode::ResponsesExplicit)
+    let confirmed_explicit = cache_mode == OpenAiPromptCacheMode::ResponsesExplicit;
+    let boundary_index = confirmed_explicit
         .then(|| request.prompt_reuse_boundary())
         .flatten()
         .map(|boundary| boundary.message_count() - 1);
@@ -1021,6 +1047,33 @@ fn build_responses_wire_request(
         // No implicit write of the changing suffix. If the common hint is
         // absent/stale, leave normal provider behavior entirely untouched.
         wire["prompt_cache_options"] = json!({"mode": "explicit"});
+    } else if confirmed_explicit
+        && request.cache_write_policy == Some(CacheWritePolicy::ExplicitOnly)
+    {
+        // C2 (R3): the caller declared this call explicit-only on an endpoint
+        // whose capability is confirmed. With no valid reuse boundary the
+        // supported no-cache-write shape is explicit mode with ZERO
+        // breakpoints — writes happen only at declared breakpoints, so
+        // nothing is cached — instead of the provider-default request that
+        // would let the endpoint implicitly cache the one-shot suffix.
+        // ProviderDefault/unknown-capability endpoints keep their historical
+        // payload byte-for-byte (checked below by construction).
+        tracing::debug!(
+            reason = "explicit_only_write_policy_without_valid_reuse_boundary",
+            "sending the zero-breakpoint explicit shape: no provider cache write this call"
+        );
+        wire["prompt_cache_options"] = json!({"mode": "explicit"});
+    }
+    // C1 (R2): the caller-owned stable routing key rides only on the
+    // confirmed-capability profile. It is a routing namespace the caller
+    // guarantees to keep stable per task/isolation domain; the transport
+    // never derives one. Unknown endpoints and keyless requests keep the
+    // exact historical payload.
+    if confirmed_explicit
+        && let Some(key) = request.prompt_cache_key.as_deref()
+        && !key.is_empty()
+    {
+        wire["prompt_cache_key"] = json!(key);
     }
     if config.send_stream_options {
         wire["stream_options"] = json!({ "include_obfuscation": false });
@@ -1078,6 +1131,7 @@ mod tests {
             metadata: serde_json::json!({"role": "bounded-compactor"}),
             max_output_tokens: Some(512),
             cancel: CancellationToken::new(),
+            ..Default::default()
         };
         let mut config = dummy_config("https://example.com/v1".into());
         config.max_output_tokens = 2048;
@@ -1605,6 +1659,37 @@ Connection: close
             ) || matches!(error.failure_source(), AgentError::Model(_)),
             "the terminal kind stays readable: {error:?}"
         );
+    }
+
+    /// C4 (R6): usage frames inside ONE attempt are cumulative snapshots of
+    /// the same bill — the accumulator keeps the latest snapshot and the
+    /// failure carries it once, never a sum of the intermediate snapshots.
+    /// (Different attempts are added by the retry wrapper, not here.)
+    #[tokio::test]
+    async fn chat_usage_snapshots_within_one_attempt_settle_once() {
+        let addr = serve_sse_once(concat!(
+            "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"a\"}}],\"usage\":{\"prompt_tokens\":60}}\n\n",
+            "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"b\"}}],\"usage\":{\"prompt_tokens\":100,\"completion_tokens\":4}}\n\n",
+        ))
+        .await;
+        let provider = OpenAiProvider::with_client(
+            dummy_config(format!("http://{addr}/v1")),
+            Client::builder().no_proxy().build().unwrap(),
+        );
+        let sink = RecordingSink::default();
+        let error = provider
+            .complete_stream(fs_list_request(), &sink)
+            .await
+            .unwrap_err();
+        let usage = error
+            .reported_usage()
+            .expect("the accumulated snapshot is real evidence");
+        assert_eq!(
+            usage.input_tokens,
+            Some(100),
+            "the latest cumulative snapshot settles once: {usage:?}"
+        );
+        assert_eq!(usage.output_tokens, Some(4));
     }
 
     /// PROVIDER-03: an EOF-flushed residual frame goes through the same

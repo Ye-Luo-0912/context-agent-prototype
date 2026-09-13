@@ -14,7 +14,7 @@ pub enum ModelRole {
     Tool,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(PartialEq, Debug, Clone, Serialize, Deserialize)]
 pub struct ModelMessage {
     pub role: ModelRole,
     pub content: String,
@@ -450,6 +450,26 @@ pub struct ModelInput {
     /// turn-end persistence still see the full frame).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub turn_checkpoint: Option<TurnCheckpoint>,
+    /// C3/R1 (KV-cache layout): when present, names the declared reusable
+    /// evidence prefix explicitly — `system_policy` plus `base + epoch`
+    /// `context_frame` messages (CurrentStateLast). The volatile projections
+    /// after it (foreground, required misses, external, restored) live
+    /// beyond the declared prefix, so their per-round changes never move it.
+    /// `base + epoch` must not exceed `context_frame.len()`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub evidence_split: Option<EvidenceSplit>,
+}
+
+/// C3/R1: the declared split of a `ModelInput`'s context frame into the
+/// reusable evidence prefix and the volatile projection tail. `base`
+/// context messages open the declared prefix (stable across rounds) and
+/// `epoch` more complete the current epoch's evidence, so cache
+/// breakpoints can be pinned at the end of each segment without pinning
+/// the volatile tail.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub struct EvidenceSplit {
+    pub base: usize,
+    pub epoch: usize,
 }
 
 /// How many completed exchanges a model input's turn frame compacted
@@ -488,23 +508,58 @@ impl ModelInput {
     /// selection. Legacy stops before its changing state; CurrentStateLast
     /// can also include the actual retained evidence. The turn is excluded.
     pub fn into_request(self, metadata: Value, cancel: CancellationToken) -> ModelRequest {
-        let prefix_len = self.system_policy.len()
-            + if self.layout == PromptLayout::CurrentStateLast {
-                self.context_frame.len()
-            } else {
-                0
-            };
+        // C3/R1: a declared evidence split names the reusable prefix
+        // precisely — system policy plus the base and epoch evidence
+        // messages — instead of the whole context frame; the volatile
+        // projections beyond it (foreground, misses, external, restored)
+        // then never move the declared prefix when they change.
+        let declared_len = if self.layout == PromptLayout::CurrentStateLast {
+            match self.evidence_split {
+                Some(split) => self.system_policy.len() + split.base + split.epoch,
+                None => self.system_policy.len() + self.context_frame.len(),
+            }
+        } else {
+            self.system_policy.len()
+        };
+        let declared_split = self.evidence_split.is_some();
         let messages = self.into_messages();
-        let prefix_len = messages[..prefix_len]
+        let prefix_len = messages[..declared_len]
             .iter()
             .rposition(|message| !message.content.is_empty())
             .map_or(0, |index| index + 1);
+        // C3/R1: name the explicit breakpoint endpoints — B0 at the end of
+        // the stable policy, B1 at the end of the declared epoch evidence —
+        // as 0-based message indexes under the same last-non-empty rule.
+        let cache_breakpoints = if declared_split {
+            let mut breakpoints = Vec::new();
+            if let Some(index) = messages[..self.system_policy.len()]
+                .iter()
+                .rposition(|message| !message.content.is_empty())
+            {
+                breakpoints.push(index);
+            }
+            if prefix_len > 0 {
+                let end = prefix_len - 1;
+                if breakpoints.last() != Some(&end) {
+                    breakpoints.push(end);
+                }
+            }
+            breakpoints
+        } else {
+            Vec::new()
+        };
         let mut request = ModelRequest {
             messages,
             tools: self.tool_schemas,
             metadata,
             cancel,
             max_output_tokens: None,
+            // C1/C2 (R2/R3): the caller fills these on the returned request
+            // when its lane/endpoint combination calls for them; packing
+            // never invents a routing key or a write policy.
+            prompt_cache_key: None,
+            cache_write_policy: None,
+            cache_breakpoints,
         };
         request.bind_prompt_reuse_boundary(prefix_len);
         request
@@ -687,9 +742,46 @@ pub struct ModelRequest {
     /// profile behavior byte-for-byte.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_output_tokens: Option<u32>,
+    /// C1 (R2): the stable prompt-cache routing key for this call's
+    /// isolation domain. The transport writes it on the wire only for
+    /// profiles whose explicit cache capability is confirmed at
+    /// configuration time; unknown endpoints never receive the field.
+    /// Callers keep it stable across the rounds of one persistent task
+    /// (including cold restorations of the same task identity) and never
+    /// derive it per-round.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prompt_cache_key: Option<String>,
+    /// C2 (R3): this call's expected provider cache-write policy. `None`
+    /// keeps the historical per-endpoint behavior byte-for-byte. The
+    /// policy states a caller-side expectation, not an endpoint
+    /// capability switch.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache_write_policy: Option<CacheWritePolicy>,
+    /// C3 (R1): explicit cache-breakpoint endpoints as 0-based message
+    /// indexes into `messages` (ascending, deduplicated, at most two:
+    /// B0 = end of the stable policy, B1 = end of the declared epoch
+    /// evidence). Empty when the input declared no evidence split — the
+    /// transport then falls back to the prompt-reuse-boundary hint.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub cache_breakpoints: Vec<usize>,
     /// Cooperative cancellation handle for this request. Not serialized.
     #[serde(skip)]
     pub cancel: CancellationToken,
+}
+
+/// C2 (R3): the caller's declared cache-write expectation for this
+/// request. This is a caller-side contract, not an endpoint capability:
+/// transports honor it only on profiles whose explicit-cache capability
+/// is already confirmed at configuration time, and unknown endpoints
+/// keep their historical payloads regardless.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CacheWritePolicy {
+    /// The endpoint is confirmed explicit-only: when no valid reuse
+    /// boundary exists for this call, the transport must send the
+    /// no-write shape (explicit mode with zero breakpoints) instead of
+    /// letting the provider implicitly cache a one-shot suffix.
+    ExplicitOnly,
 }
 
 /// One model round's token counters. COST-6 (R2-10): the cache buckets are
@@ -699,7 +791,7 @@ pub struct ModelRequest {
 /// never repaired or re-derived here: no counter is filled by arithmetic on
 /// the others, and an unreported counter stays `None` (never an invented
 /// zero). Summing `input_tokens` with any cache bucket double-counts.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(PartialEq, Debug, Clone, Default, Serialize, Deserialize)]
 pub struct ModelUsage {
     pub input_tokens: Option<u64>,
     pub output_tokens: Option<u64>,
@@ -952,6 +1044,7 @@ mod tests {
             turn_frame: turn,
             tool_schemas: Vec::new(),
             turn_checkpoint: None,
+            evidence_split: None,
         };
 
         let messages = input.into_messages();
@@ -1207,6 +1300,7 @@ mod tests {
                 compacted_exchanges: compacted,
                 receipts: Vec::new(),
             }),
+            evidence_split: None,
         };
         let messages = input.turn_frame_wire_messages();
         assert_eq!(messages.len(), 1 + 1 + 12);
@@ -1244,6 +1338,47 @@ mod tests {
             serde_json::from_str(r#"{"compacted_exchanges":3}"#).unwrap();
         assert_eq!(checkpoint.compacted_exchanges, 3);
         assert!(checkpoint.receipts.is_empty());
+    }
+
+    /// C1/C2/C3 (KV-cache audit): the request fields are additive — a
+    /// request with none of them set serializes byte-identical to the
+    /// historical shape, and old payloads without the fields parse.
+    #[test]
+    fn cache_fields_are_additive_and_old_payloads_parse() {
+        let plain =
+            ModelInput::default().into_request(serde_json::Value::Null, CancellationToken::new());
+        let json = serde_json::to_string(&plain).unwrap();
+        assert!(
+            !json.contains("prompt_cache_key")
+                && !json.contains("cache_write_policy")
+                && !json.contains("cache_breakpoints"),
+            "unset cache fields must not appear on the wire: {json}"
+        );
+        let reparsed: ModelRequest = serde_json::from_str(&json).unwrap();
+        assert!(reparsed.prompt_cache_key.is_none());
+        assert!(reparsed.cache_write_policy.is_none());
+        assert!(reparsed.cache_breakpoints.is_empty());
+
+        // An old payload that predates every cache field still parses.
+        let old: ModelRequest = serde_json::from_str(
+            r#"{"messages":[{"role":"User","content":"hi"}],"tools":[],"metadata":null}"#,
+        )
+        .unwrap();
+        assert!(old.prompt_cache_key.is_none() && old.messages.len() == 1);
+
+        // Set fields round-trip with their snake_case wire names.
+        let mut keyed = plain;
+        keyed.prompt_cache_key = Some("domain|task".into());
+        keyed.cache_write_policy = Some(CacheWritePolicy::ExplicitOnly);
+        keyed.cache_breakpoints = vec![0, 3];
+        let keyed_json = serde_json::to_string(&keyed).unwrap();
+        assert!(keyed_json.contains(r#""prompt_cache_key":"domain|task""#));
+        assert!(keyed_json.contains(r#""cache_write_policy":"explicit_only""#));
+        assert!(keyed_json.contains(r#""cache_breakpoints":[0,3]"#));
+        let round: ModelRequest = serde_json::from_str(&keyed_json).unwrap();
+        assert_eq!(round.prompt_cache_key, keyed.prompt_cache_key);
+        assert_eq!(round.cache_write_policy, keyed.cache_write_policy);
+        assert_eq!(round.cache_breakpoints, keyed.cache_breakpoints);
     }
 
     #[test]
