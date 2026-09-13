@@ -174,16 +174,21 @@ impl ProductArgs {
 /// status banner renders — never tool calls. Zero or garbage is a
 /// startup error before any workspace mutation; there is no infinite
 /// value: a long task gets an explicitly larger finite budget.
+///
+/// F5: the rule itself lives in `agent_compose::parse_max_model_rounds`, so the
+/// TUI and the Platform host validate the operator's budget identically. The
+/// flag name is restored here because the error a user reads must name the flag
+/// they typed.
 pub fn parse_max_rounds(value: &str) -> anyhow::Result<usize> {
-    let rounds: usize = value.trim().parse().map_err(|_| {
-        anyhow::anyhow!(
-            "invalid --max-rounds {value:?}: expected a positive integer (model rounds)"
-        )
-    })?;
-    if rounds == 0 {
-        anyhow::bail!("invalid --max-rounds 0: the budget must be at least 1 model round");
-    }
-    Ok(rounds)
+    agent_compose::parse_max_model_rounds(value).map_err(|_| {
+        if value.trim() == "0" {
+            anyhow::anyhow!("invalid --max-rounds 0: the budget must be at least 1 model round")
+        } else {
+            anyhow::anyhow!(
+                "invalid --max-rounds {value:?}: expected a positive integer (model rounds)"
+            )
+        }
+    })
 }
 
 fn parse_timeout_secs(value: &str) -> anyhow::Result<u64> {

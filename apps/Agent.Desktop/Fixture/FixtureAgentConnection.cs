@@ -106,11 +106,39 @@ public sealed class FixtureAgentConnection : IAgentConnection
         });
     }
 
-    public Task<WorkContinueResponse> ContinueAsync(CancellationToken cancellationToken = default) =>
-        Task.FromResult(new WorkContinueResponse { TaskId = _tasks[0].TaskId });
+    public Task<WorkContinueResponse> ContinueAsync(
+        string? expectedTaskId = null, CancellationToken cancellationToken = default)
+    {
+        // F5: the fixture applies the same identity rule the real host applies —
+        // a named task that is not the fixture's active one continues nothing.
+        if (expectedTaskId is not null && expectedTaskId != _tasks[0].TaskId)
+        {
+            return Task.FromResult(new WorkContinueResponse
+            {
+                Disposition = WorkContinueDisposition.ExpectedTaskMismatch,
+                ActiveTaskId = _tasks[0].TaskId,
+            });
+        }
+        return Task.FromResult(new WorkContinueResponse { TaskId = _tasks[0].TaskId });
+    }
 
-    public Task<WorkCancelResponse> CancelCurrentTurnAsync(CancellationToken cancellationToken = default) =>
-        Task.FromResult(new WorkCancelResponse
+    public Task<WorkCancelResponse> CancelCurrentTurnAsync(
+        string? expectedTaskId = null,
+        string? expectedTurnId = null,
+        CancellationToken cancellationToken = default)
+    {
+        // A named turn id can never match: the fixture runs no turns, so it must
+        // report a mismatch rather than claim a cancellation it did not perform.
+        if (expectedTurnId is not null
+            || (expectedTaskId is not null && expectedTaskId != _tasks[0].TaskId))
+        {
+            return Task.FromResult(new WorkCancelResponse
+            {
+                Ack = new TurnCancelAck { Status = TurnCancelAckStatus.NoActiveTurn },
+                IdentityMismatch = new WorkTurnIdentity { TaskId = _tasks[0].TaskId },
+            });
+        }
+        return Task.FromResult(new WorkCancelResponse
         {
             Ack = new TurnCancelAck
             {
@@ -121,6 +149,93 @@ public sealed class FixtureAgentConnection : IAgentConnection
                 EffectiveGeneration = 3,
             },
         });
+    }
+
+    // -----------------------------------------------------------------------
+    // F5 layout-fixture answers. The fixture owns no runtime, so it never
+    // pretends to execute: steering moves nothing, and the checkpoint plane is
+    // honestly absent rather than faking an artifact.
+    // -----------------------------------------------------------------------
+
+    public Task<WorkSteerResponse> SteerAsync(
+        string instruction, string? expectedTaskId = null, CancellationToken cancellationToken = default)
+    {
+        if (expectedTaskId is not null && expectedTaskId != _tasks[0].TaskId)
+        {
+            return Task.FromResult(new WorkSteerResponse
+            {
+                Disposition = WorkSteerDisposition.Rejected,
+                Rejection = WorkSteerRejection.ExpectedTaskMismatch,
+                ActiveTaskId = _tasks[0].TaskId,
+            });
+        }
+        return Task.FromResult(new WorkSteerResponse
+        {
+            Disposition = WorkSteerDisposition.Applied,
+            TaskId = _tasks[0].TaskId,
+        });
+    }
+
+    public Task<WorkActivateResponse> ActivateTaskAsync(
+        string taskId, CancellationToken cancellationToken = default)
+    {
+        var index = _tasks.FindIndex(t => t.TaskId == taskId);
+        if (index < 0)
+        {
+            return Task.FromException<WorkActivateResponse>(
+                new AgentContractViolationException("work.activate.task_id", "task not found in fixture"));
+        }
+        if (index == 0)
+        {
+            return Task.FromResult(new WorkActivateResponse
+            {
+                TaskId = taskId,
+                PreviouslyActive = taskId,
+                AlreadyActive = true,
+            });
+        }
+        var previous = _tasks[0].TaskId;
+        var task = _tasks[index];
+        _tasks.RemoveAt(index);
+        _tasks.Insert(0, task with { Status = TaskSnapshotStatus.Active });
+        return Task.FromResult(new WorkActivateResponse
+        {
+            TaskId = taskId,
+            PreviouslyActive = previous,
+            AlreadyActive = false,
+        });
+    }
+
+    public Task<WorkSuspendResponse> SuspendTaskAsync(
+        string? expectedTaskId = null, CancellationToken cancellationToken = default)
+    {
+        if (expectedTaskId is not null && expectedTaskId != _tasks[0].TaskId)
+        {
+            return Task.FromResult(new WorkSuspendResponse
+            {
+                Disposition = WorkSuspendDisposition.ExpectedTaskMismatch,
+                ActiveTaskId = _tasks[0].TaskId,
+            });
+        }
+        var suspended = _tasks[0];
+        _tasks[0] = suspended with { Status = TaskSnapshotStatus.Suspended };
+        return Task.FromResult(new WorkSuspendResponse
+        {
+            Disposition = WorkSuspendDisposition.Suspended,
+            TaskId = suspended.TaskId,
+        });
+    }
+
+    public Task<WorkCheckpointResponse> CheckpointAsync(CancellationToken cancellationToken = default) =>
+        Task.FromException<WorkCheckpointResponse>(
+            new AgentContractViolationException(
+                "work.checkpoint", "the layout fixture serves no checkpoint plane"));
+
+    public Task<WorkRestoreResponse> RestoreAsync(
+        string? artifact = null, CancellationToken cancellationToken = default) =>
+        Task.FromException<WorkRestoreResponse>(
+            new AgentContractViolationException(
+                "work.restore", "the layout fixture serves no checkpoint plane"));
 
     public Task<WorkSnapshotResponse> SnapshotAsync(CancellationToken cancellationToken = default) =>
         Task.FromResult(new WorkSnapshotResponse

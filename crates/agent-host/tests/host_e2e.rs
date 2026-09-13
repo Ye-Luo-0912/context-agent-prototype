@@ -23,13 +23,16 @@ use agent_host::{
 use agent_platform_protocol::{
     ActiveFeatures, ApprovalRespondOutcome, ApprovalRespondRequest, ApprovalRespondResponse,
     Causality, EnvelopeKind, MessageId, PlatformEnvelope, PlatformResponse, ProtocolIdentity,
-    ProtocolVersion, RequestId, Route, WorkArtifactRequest, WorkArtifactResponse,
-    WorkCancelRequest, WorkCancelResponse, WorkChangesRequest, WorkChangesResponse,
-    WorkContextRequest, WorkContextResponse, WorkContinueRequest, WorkContinueResponse,
-    WorkEventNotification, WorkSnapshotRequest, WorkSnapshotResponse, WorkSubmitDisposition,
+    ProtocolVersion, RequestId, Route, WorkActivateRequest, WorkActivateResponse,
+    WorkArtifactRequest, WorkArtifactResponse, WorkCancelRequest, WorkCancelResponse,
+    WorkChangesRequest, WorkChangesResponse, WorkCheckpointRequest, WorkCheckpointResponse,
+    WorkContextRequest, WorkContextResponse, WorkContinueDisposition, WorkContinueReason,
+    WorkContinueRequest, WorkContinueResponse, WorkEventNotification, WorkRestoreRequest,
+    WorkRestoreResponse, WorkSnapshotRequest, WorkSnapshotResponse, WorkSteerDisposition,
+    WorkSteerRejection, WorkSteerRequest, WorkSteerResponse, WorkSubmitDisposition,
     WorkSubmitRequest, WorkSubmitResponse, WorkSubmitResultDisposition, WorkSubmitResultRequest,
-    WorkSubmitResultResponse, WorkSubscribeRequest, WorkSubscribeResponse, WorkTaskDetailRequest,
-    WorkTaskDetailResponse,
+    WorkSubmitResultResponse, WorkSubscribeRequest, WorkSubscribeResponse, WorkSuspendDisposition,
+    WorkSuspendRequest, WorkSuspendResponse, WorkTaskDetailRequest, WorkTaskDetailResponse,
 };
 use agent_runtime::{RuntimeHandle, WorkControlSessionRegistry};
 use serde_json::json;
@@ -98,6 +101,22 @@ async fn compose_workspace(root: &std::path::Path) -> anyhow::Result<Composed> {
         gate,
         _lock: lock,
     })
+}
+
+/// F5: the host-owned half of the reported run configuration. Mirrors what the
+/// binary builds from its CLI/environment; the kernel-owned round budget is
+/// filled by the runtime itself, so it is deliberately absent here.
+fn test_run_config() -> agent_runtime::HostRunConfig {
+    agent_runtime::HostRunConfig {
+        context_policy: "rolling".into(),
+        max_model_rounds_from_cli: false,
+        maintenance_max_calls_per_maintain: 4,
+        maintenance_max_tokens_per_maintain: None,
+        maintenance_timeout_secs: None,
+        provider_profile_digest: None,
+        prompt_cache_mode: None,
+        read_only: false,
+    }
 }
 
 fn client_protocol() -> ProtocolIdentity {
@@ -170,6 +189,10 @@ async fn run_e2e(endpoint: LocalEndpoint, label: &str) -> anyhow::Result<()> {
         gate: Arc::clone(&fixture.gate),
         registry,
         workspace: Arc::new(fixture.composed.workspace.clone()),
+        // F5: the formal cross-plane checkpoint seam and the effective run
+        // configuration are exactly what the product host serves.
+        checkpoints: Some(fixture.composed.instance.checkpoint_plane()),
+        run_config: Some(test_run_config()),
     };
 
     fixture.composed.instance.start().await?;
@@ -628,7 +651,7 @@ async fn run_e2e(endpoint: LocalEndpoint, label: &str) -> anyhow::Result<()> {
     // 6. cancel: either truth is honest (no turn was started by submit).
     let cancel = expect_value(exchange::<_, _, WorkCancelResponse>(
         &mut stream,
-        &request("work", "cancel", WorkCancelRequest {}),
+        &request("work", "cancel", WorkCancelRequest::default()),
     )?);
     assert!(matches!(
         cancel.ack,
@@ -659,6 +682,355 @@ async fn run_e2e(endpoint: LocalEndpoint, label: &str) -> anyhow::Result<()> {
         .map_err(|_| anyhow::anyhow!("serve thread panicked"))?;
     serve_result?;
     eprintln!("e2e[{label}]: done");
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// F5: the long-flow control loop over the wire.
+//
+// One non-GUI client drives start -> steer -> suspend -> activate -> continue
+// -> checkpoint -> restore -> verify against one RuntimeActor, and every
+// precise operation names the identity it expects. The assertions are about
+// typed facts only: no terminal text is parsed and no outcome is inferred from
+// a second, racy query.
+// ---------------------------------------------------------------------------
+
+/// Waits until the runtime reports it is not mid-turn, using the snapshot's own
+/// typed continuation reason. Polling a typed fact is the honest way to observe
+/// idleness; sleeping a fixed time would only hide a race.
+async fn wait_until_not_running<S: Read + Write>(
+    stream: &mut S,
+    what: &str,
+) -> anyhow::Result<WorkSnapshotResponse> {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+    loop {
+        let snapshot = expect_value(exchange::<_, _, WorkSnapshotResponse>(
+            stream,
+            &request("work", "snapshot", WorkSnapshotRequest {}),
+        )?);
+        let readiness = snapshot
+            .continue_readiness
+            .expect("F5: the snapshot reports why continuation is or is not available");
+        if readiness.reason != WorkContinueReason::TurnRunning {
+            return Ok(snapshot);
+        }
+        anyhow::ensure!(
+            std::time::Instant::now() < deadline,
+            "the runtime never left the running state while waiting for {what}"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+}
+
+async fn long_flow_controls_close_the_loop(
+    endpoint: LocalEndpoint,
+    label: &str,
+) -> anyhow::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let fixture = compose_workspace(dir.path()).await?;
+    fixture.composed.instance.start().await?;
+    let run_id = fixture.composed.handle().run_id();
+    let server = start_server(&fixture, endpoint.clone(), true).await?;
+    let mut stream = connect(&endpoint).await;
+    eprintln!("f5[{label}]: connected");
+
+    // 1. start: a NEW submission creates and focuses its task.
+    let first = expect_value(exchange::<_, _, WorkSubmitResponse>(
+        &mut stream,
+        &request(
+            "work",
+            "submit",
+            WorkSubmitRequest {
+                goal: "f5: migrate the retry table".into(),
+                client_request_id: "f5-submit-1".into(),
+            },
+        ),
+    )?);
+    assert_eq!(first.disposition, WorkSubmitDisposition::Accepted);
+    let task_a = first.task_id;
+
+    // The effective configuration is readable without a GUI, and the round
+    // budget it reports is the kernel's own — never an echo of a client string.
+    let snapshot = wait_until_not_running(&mut stream, "the first submission").await?;
+    let config = snapshot
+        .effective_config
+        .clone()
+        .expect("F5: the snapshot reports the effective run configuration");
+    assert_eq!(config.context_policy, "rolling");
+    assert_eq!(config.max_model_rounds_source, "kernel_default");
+    assert!(
+        config.max_model_rounds >= 1,
+        "the enforced model-round budget must be finite and positive"
+    );
+    assert!(!config.read_only);
+
+    // 2. steer: an in-task correction lands on the task the caller named. It is
+    //    a correction, not a submission — no new task appears.
+    let steered = expect_value(exchange::<_, _, WorkSteerResponse>(
+        &mut stream,
+        &request(
+            "work",
+            "steer",
+            WorkSteerRequest {
+                instruction: "f5: keep the five second timeout while migrating".into(),
+                expected_task_id: Some(task_a),
+            },
+        ),
+    )?);
+    assert!(
+        matches!(
+            steered.disposition,
+            WorkSteerDisposition::Applied | WorkSteerDisposition::Queued
+        ),
+        "a correction for the active task must be admitted, got {:?}",
+        steered.disposition
+    );
+    assert_eq!(
+        steered.task_id,
+        Some(task_a),
+        "the correction names its task"
+    );
+    let after_steer = wait_until_not_running(&mut stream, "the correction").await?;
+    assert_eq!(
+        after_steer.tasks.len(),
+        1,
+        "steering must never create a second task"
+    );
+
+    // 3. a NEW submission is a different task: submit and steer stay distinct.
+    let second = expect_value(exchange::<_, _, WorkSubmitResponse>(
+        &mut stream,
+        &request(
+            "work",
+            "submit",
+            WorkSubmitRequest {
+                goal: "f5: add the compatibility shim".into(),
+                client_request_id: "f5-submit-2".into(),
+            },
+        ),
+    )?);
+    let task_b = second.task_id;
+    assert_ne!(task_a, task_b, "a new goal is new work, not a correction");
+    wait_until_not_running(&mut stream, "the second submission").await?;
+
+    // 4. a correction aimed at the task that is no longer active is refused,
+    //    and the refusal names what IS live instead of guessing a target.
+    let stale = expect_value(exchange::<_, _, WorkSteerResponse>(
+        &mut stream,
+        &request(
+            "work",
+            "steer",
+            WorkSteerRequest {
+                instruction: "f5: this correction belongs to the first task".into(),
+                expected_task_id: Some(task_a),
+            },
+        ),
+    )?);
+    assert_eq!(stale.disposition, WorkSteerDisposition::Rejected);
+    assert_eq!(
+        stale.rejection,
+        Some(WorkSteerRejection::ExpectedTaskMismatch)
+    );
+    assert_eq!(stale.active_task_id, Some(task_b));
+    assert_eq!(stale.task_id, None, "a refused correction landed nowhere");
+
+    // 5. suspend: precise, and a second attempt with the same expectation is
+    //    honestly a mismatch (nothing is active any more) rather than a repeat.
+    let suspended = expect_value(exchange::<_, _, WorkSuspendResponse>(
+        &mut stream,
+        &request(
+            "work",
+            "suspend",
+            WorkSuspendRequest {
+                expected_task_id: Some(task_b),
+            },
+        ),
+    )?);
+    assert_eq!(suspended.disposition, WorkSuspendDisposition::Suspended);
+    assert_eq!(suspended.task_id, Some(task_b));
+    let idle = expect_value(exchange::<_, _, WorkSnapshotResponse>(
+        &mut stream,
+        &request("work", "snapshot", WorkSnapshotRequest {}),
+    )?);
+    assert!(idle.focus.is_none(), "a suspended run holds no focus");
+    assert_eq!(
+        idle.continue_readiness.map(|readiness| readiness.reason),
+        Some(WorkContinueReason::NoActiveTask),
+        "with nothing active the snapshot says so instead of offering a continuation"
+    );
+
+    let repeat = expect_value(exchange::<_, _, WorkSuspendResponse>(
+        &mut stream,
+        &request(
+            "work",
+            "suspend",
+            WorkSuspendRequest {
+                expected_task_id: Some(task_b),
+            },
+        ),
+    )?);
+    assert_eq!(
+        repeat.disposition,
+        WorkSuspendDisposition::ExpectedTaskMismatch
+    );
+    assert_eq!(repeat.active_task_id, None);
+
+    // 6. activate: the same RuntimeActor owns the task table, so an existing
+    //    task comes back by id — and a redundant activation says "nothing moved".
+    let activated = expect_value(exchange::<_, _, WorkActivateResponse>(
+        &mut stream,
+        &request("work", "activate", WorkActivateRequest { task_id: task_a }),
+    )?);
+    assert_eq!(activated.task_id, task_a);
+    assert!(!activated.already_active);
+    let again = expect_value(exchange::<_, _, WorkActivateResponse>(
+        &mut stream,
+        &request("work", "activate", WorkActivateRequest { task_id: task_a }),
+    )?);
+    assert!(
+        again.already_active,
+        "re-activating the live task must report that nothing moved"
+    );
+
+    // 7. continue: naming the wrong task starts NO turn; naming the live task
+    //    resumes its retained directive.
+    let mismatched = expect_value(exchange::<_, _, WorkContinueResponse>(
+        &mut stream,
+        &request(
+            "work",
+            "continue",
+            WorkContinueRequest {
+                expected_task_id: Some(task_b),
+            },
+        ),
+    )?);
+    assert_eq!(
+        mismatched.disposition,
+        WorkContinueDisposition::ExpectedTaskMismatch
+    );
+    assert_eq!(mismatched.task_id, None);
+    assert_eq!(mismatched.active_task_id, Some(task_a));
+
+    let continued = expect_value(exchange::<_, _, WorkContinueResponse>(
+        &mut stream,
+        &request(
+            "work",
+            "continue",
+            WorkContinueRequest {
+                expected_task_id: Some(task_a),
+            },
+        ),
+    )?);
+    assert_eq!(continued.disposition, WorkContinueDisposition::Continued);
+    assert_eq!(continued.task_id, Some(task_a));
+    wait_until_not_running(&mut stream, "the continuation").await?;
+
+    // 8. cancel: an expectation that no longer matches cancels nothing, and the
+    //    answer proves it (a mismatch beside a no-active-turn ack).
+    let stale_cancel = expect_value(exchange::<_, _, WorkCancelResponse>(
+        &mut stream,
+        &request(
+            "work",
+            "cancel",
+            WorkCancelRequest {
+                expected_task_id: Some(task_a),
+                expected_turn_id: Some(agent_contracts::TurnId::new()),
+            },
+        ),
+    )?);
+    assert!(
+        stale_cancel.identity_mismatch.is_some(),
+        "an unmatched cancel expectation must report the live identity"
+    );
+    assert!(matches!(
+        stale_cancel.ack,
+        agent_contracts::TurnCancelAck::NoActiveTurn
+    ));
+
+    // 9. checkpoint: a FORMAL cross-plane artifact in the run's own store.
+    let captured = expect_value(exchange::<_, _, WorkCheckpointResponse>(
+        &mut stream,
+        &request("work", "checkpoint", WorkCheckpointRequest {}),
+    )?);
+    assert_eq!(captured.run_id, run_id);
+    assert!(captured.payload_bytes > 0);
+    assert!(
+        captured.artifact.starts_with("checkpoint-"),
+        "the capture must land in the runtime's own store: {}",
+        captured.artifact
+    );
+    assert!(
+        dir.path()
+            .join(".focus-agent")
+            .join("checkpoints")
+            .join(&captured.artifact)
+            .exists()
+            || fixture
+                .composed
+                .workspace
+                .state_dir()
+                .join("checkpoints")
+                .join(&captured.artifact)
+                .exists(),
+        "the artifact exists on disk under the run's checkpoint store"
+    );
+
+    // An artifact name is not a path: a traversal attempt is refused by the
+    // contract, before any file is opened.
+    match exchange::<_, _, WorkRestoreResponse>(
+        &mut stream,
+        &request(
+            "work",
+            "restore",
+            WorkRestoreRequest {
+                artifact: Some("../outside.json".into()),
+            },
+        ),
+    )? {
+        PlatformResponse::Error { error } => {
+            assert_eq!(error.code, "protocol.request_invalid")
+        }
+        PlatformResponse::Success { .. } => panic!("a path-like artifact must be refused"),
+    }
+
+    // 10. restore: the same cross-plane transaction every other entry point
+    //     runs, then verify the task plane survived it.
+    let restored = expect_value(exchange::<_, _, WorkRestoreResponse>(
+        &mut stream,
+        &request(
+            "work",
+            "restore",
+            WorkRestoreRequest {
+                artifact: Some(captured.artifact.clone()),
+            },
+        ),
+    )?);
+    assert_eq!(restored.artifact, captured.artifact);
+    assert_eq!(restored.restored_run_id, run_id);
+
+    let verified = wait_until_not_running(&mut stream, "the restore").await?;
+    assert_eq!(
+        verified.focus.as_ref().map(|focus| focus.task_id),
+        Some(task_a),
+        "the restored plane keeps the task that was active when it was captured"
+    );
+    let known: Vec<_> = verified.tasks.iter().map(|task| task.task_id).collect();
+    assert!(
+        known.contains(&task_a) && known.contains(&task_b),
+        "both tasks survive the restore: {known:?}"
+    );
+    assert_eq!(
+        verified
+            .continue_readiness
+            .map(|readiness| readiness.can_continue),
+        Some(true),
+        "after a restore the retained directive is continuable again"
+    );
+
+    drop(stream);
+    fixture.composed.shutdown().await?;
+    stop_and_join_bounded(server, BOUNDED_STOP).await?;
+    eprintln!("f5[{label}]: done");
     Ok(())
 }
 
@@ -768,6 +1140,8 @@ async fn start_server(
         gate: Arc::clone(&fixture.gate),
         registry: Arc::clone(&registry),
         workspace: Arc::new(fixture.composed.workspace.clone()),
+        checkpoints: Some(fixture.composed.instance.checkpoint_plane()),
+        run_config: Some(test_run_config()),
     };
     let stop = Arc::new(AtomicBool::new(false));
     let server = HostServer {
@@ -1331,7 +1705,7 @@ async fn subscribe_delivers_runtime_events(endpoint: LocalEndpoint) -> anyhow::R
     let probe_endpoint = server.endpoint.clone();
     let probe = std::thread::spawn(move || -> anyhow::Result<()> {
         let mut probe_client = connect_blocking(&probe_endpoint)?;
-        let cont = request("work", "continue", WorkContinueRequest {});
+        let cont = request("work", "continue", WorkContinueRequest::default());
         agent_host::write_frame(&mut probe_client, &serde_json::to_vec(&cont)?)?;
         let mut ignored = Vec::new();
         let response = read_response_collecting::<WorkContinueResponse>(
@@ -1445,7 +1819,7 @@ async fn slow_subscriber_never_blocks_service_or_stop(
     }
     let cancelled = expect_value(exchange::<_, _, WorkCancelResponse>(
         &mut healthy,
-        &request("work", "cancel", WorkCancelRequest {}),
+        &request("work", "cancel", WorkCancelRequest::default()),
     )?);
     assert!(matches!(
         cancelled.ack,
@@ -1565,6 +1939,32 @@ async fn unix_socket_end_to_end_work_plane() {
     run_e2e(LocalEndpoint::UnixSocket(path), "uds")
         .await
         .unwrap();
+}
+
+/// F5: the whole long-flow control loop on the desktop client's transport.
+#[cfg(windows)]
+#[tokio::test(flavor = "multi_thread")]
+async fn named_pipe_long_flow_controls_close_the_loop() {
+    long_flow_controls_close_the_loop(
+        LocalEndpoint::NamedPipe(format!("focus-agent-e2e-f5-{}", uuid_like())),
+        "named-pipe",
+    )
+    .await
+    .unwrap();
+}
+
+/// F5: the same loop on the Linux transport CI serves.
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread")]
+async fn unix_socket_long_flow_controls_close_the_loop() {
+    long_flow_controls_close_the_loop(
+        LocalEndpoint::UnixSocket(
+            std::env::temp_dir().join(format!("focus-agent-e2e-f5-{}.sock", uuid_like())),
+        ),
+        "uds",
+    )
+    .await
+    .unwrap();
 }
 
 #[cfg(windows)]

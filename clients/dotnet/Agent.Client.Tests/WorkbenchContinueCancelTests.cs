@@ -46,7 +46,7 @@ public class WorkbenchContinueCancelTests
 
     /// <summary>Drill connection with programmable continue/cancel results,
     /// including a cancel that can be held in flight across a snapshot.</summary>
-    private sealed class ContinueCancelStub : IAgentConnection
+    private sealed class ContinueCancelStub : LongFlowControlsNotExercised, IAgentConnection
     {
         public Task<WorkTaskCompletionResponse> TaskCompletionAsync(string taskId, CancellationToken cancellationToken = default) =>
             Task.FromResult(new WorkTaskCompletionResponse { TaskId = taskId, Fact = new WorkCompletionFactBeyondJournalWindow() });
@@ -68,10 +68,10 @@ public class WorkbenchContinueCancelTests
         public Task<WorkSubmitResponse> SubmitWorkAsync(string goal, string clientRequestId, CancellationToken cancellationToken = default) =>
             throw new NotSupportedException("drills do not submit");
 
-        public Task<WorkContinueResponse> ContinueAsync(CancellationToken cancellationToken = default) =>
+        public Task<WorkContinueResponse> ContinueAsync(string? expectedTaskId = null, CancellationToken cancellationToken = default) =>
             ContinueHandler(cancellationToken);
 
-        public Task<WorkCancelResponse> CancelCurrentTurnAsync(CancellationToken cancellationToken = default) =>
+        public Task<WorkCancelResponse> CancelCurrentTurnAsync(string? expectedTaskId = null, string? expectedTurnId = null, CancellationToken cancellationToken = default) =>
             CancelHandler(cancellationToken);
 
         public Task<WorkSubscribeResponse> SubscribeAsync(ulong? replayAfterSeq = null, CancellationToken cancellationToken = default) =>

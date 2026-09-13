@@ -53,13 +53,13 @@ pub use host::{
     APPROVAL_POLICY, ARTIFACT_STORE, CONTEXT_SERVICE, CapabilityId, EVENT_STORE, MODEL_PROVIDER,
     Module, ModuleHost, ServiceRegistry, TOOL_PROVIDER,
 };
-pub use instance::RuntimeInstance;
+pub use instance::{RuntimeCheckpointPlane, RuntimeInstance};
 pub use modules::{
     ApprovalModule, ArtifactModule, ContextModule, EventModule, ModelModule, ToolModule,
 };
 pub use platform::{
     AuthenticatedOperationControlAdapter, BoundSessionAuthorizer, BoundWorkSessionAuthorizer,
-    MAX_OPERATION_CONTROL_ENVELOPE_BYTES, MAX_OPERATION_CONTROL_SESSIONS,
+    HostRunConfig, MAX_OPERATION_CONTROL_ENVELOPE_BYTES, MAX_OPERATION_CONTROL_SESSIONS,
     MAX_WORK_CONTROL_SESSIONS, OperationAcceptedSubscription, OperationControlAction,
     OperationControlAuthorization, OperationControlAuthorizationRequest,
     OperationControlAuthorizer, OperationControlGrant, OperationControlRouter,
@@ -83,5 +83,7 @@ pub use task::{
 };
 pub use verification::{ProofVerifier, ProofVerifierOutcome, ProofVerifierRequest};
 pub use work::{
-    RuntimeStatusSnapshot, WorkSubmission, WorkSubmissionDisposition, WorkSubmissionQuery,
+    CancelOutcome, ContinueOutcome, ContinueReadiness, ContinueReason, RuntimeStatusSnapshot,
+    SteeringDisposition, SteeringOutcome, SteeringRejection, SuspendOutcome, TaskActivation,
+    TurnIdentityExpectation, WorkSubmission, WorkSubmissionDisposition, WorkSubmissionQuery,
 };

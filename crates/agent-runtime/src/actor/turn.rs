@@ -106,6 +106,164 @@ impl RuntimeActor {
         }
     }
 
+    /// F5: in-task steering/correction — the other half of the submit/steer
+    /// split. A submission may create or re-focus a task; a correction must
+    /// land on the task the runtime is ALREADY on, or be refused with the live
+    /// identity attached. Steering therefore never calls `apply_focus`, never
+    /// mints a task, and never attaches a checklist surface.
+    ///
+    /// The receipt distinguishes the three real outcomes: `Applied` (a fresh
+    /// turn carries the correction), `Queued` (the running turn's single
+    /// correction slot took it) and `Rejected` (identity mismatch, no active
+    /// task, or the slot is already taken). A rejection is a fact about the
+    /// runtime, not an instruction to resend under a different target.
+    pub(super) async fn steer_active_task(
+        &mut self,
+        instruction: String,
+        expected_task_id: Option<TaskId>,
+        reply: Reply<AgentResult<crate::work::SteeringOutcome>>,
+        op_tx: &mpsc::Sender<OperationCompletion>,
+    ) {
+        use crate::work::{SteeringDisposition, SteeringOutcome, SteeringRejection};
+
+        if let Err(error) = self.ensure_serving() {
+            let _ = reply.send(Err(error));
+            return;
+        }
+        if self.state.recovery_required {
+            let _ = reply.send(Err(AgentError::RecoveryRequired(
+                "runtime recovery is required before normal mutation may continue".into(),
+            )));
+            return;
+        }
+        if let Some(operation_id) = self.state.pending_tool_cleanup {
+            let _ = self.record_rejected_user_dialogue(&instruction).await;
+            let _ = reply.send(Err(AgentError::InvalidRequest(format!(
+                "agent is finishing explicit cleanup for cancelled tool operation {operation_id}"
+            ))));
+            return;
+        }
+        if instruction.trim().is_empty() {
+            let _ = reply.send(Err(AgentError::InvalidRequest(
+                "a steering instruction must not be empty".into(),
+            )));
+            return;
+        }
+        if instruction.len() > USER_INPUT_MAX_BYTES {
+            let _ = reply.send(Err(AgentError::InvalidRequest(format!(
+                "steering instruction is {} bytes, above the {USER_INPUT_MAX_BYTES} byte cap",
+                instruction.len()
+            ))));
+            return;
+        }
+
+        // The target is resolved here, inside the serialized command: no
+        // client can act on a snapshot that has since changed.
+        let active = self.state.tasks.active();
+        let Some(task_id) = active else {
+            let _ = reply.send(Ok(SteeringOutcome::Rejected {
+                rejection: SteeringRejection::NoActiveTask,
+                active_task_id: None,
+            }));
+            return;
+        };
+        if let Some(expected) = expected_task_id
+            && expected != task_id
+        {
+            let _ = reply.send(Ok(SteeringOutcome::Rejected {
+                rejection: SteeringRejection::ExpectedTaskMismatch,
+                active_task_id: active,
+            }));
+            return;
+        }
+
+        if self.state.turn.is_some() {
+            // The correction rides the running turn's single input slot. A
+            // full slot is a typed refusal, not a silent overwrite.
+            if self.state.pending_user_input.is_some() {
+                let _ = self.record_rejected_user_dialogue(&instruction).await;
+                let _ = reply.send(Ok(SteeringOutcome::Rejected {
+                    rejection: SteeringRejection::QueueFull,
+                    active_task_id: active,
+                }));
+                return;
+            }
+            let result = self.queue_user_dialogue(instruction).await;
+            let _ = reply.send(result.map(|()| SteeringOutcome::Accepted {
+                disposition: SteeringDisposition::Queued,
+                task_id,
+            }));
+            return;
+        }
+
+        let input_id = RuntimeInputId::new();
+        let persist = match self.persist_user_input_body(&instruction).await {
+            Ok(stored) => stored,
+            Err(error) => {
+                let _ = reply.send(Err(error));
+                return;
+            }
+        };
+        let input = RuntimeInputEnvelope::user_dialogue(
+            instruction.clone(),
+            Some(input_id),
+            Some(task_id),
+            None,
+            persist.0,
+            persist.1,
+        );
+        match self.begin_applied_turn(instruction, input, op_tx).await {
+            Ok(()) => self.set_turn_start_reply(maintenance::TurnStartReply::Steer(
+                reply,
+                SteeringOutcome::Accepted {
+                    disposition: SteeringDisposition::Applied,
+                    task_id,
+                },
+            )),
+            Err(error) => {
+                let _ = reply.send(Err(error));
+            }
+        }
+    }
+
+    /// F5: the read-only projection of `continue_active_task_turn`'s own
+    /// preconditions. Same order, same rules — a client learns why a
+    /// continuation is unavailable instead of discovering it by attempting one.
+    pub(super) fn continue_readiness(&self) -> crate::work::ContinueReadiness {
+        use crate::work::{ContinueReadiness, ContinueReason};
+
+        let reason = if self.state.recovery_required {
+            ContinueReason::RecoveryRequired
+        } else if self.state.pending_tool_cleanup.is_some() {
+            ContinueReason::CleanupInFlight
+        } else if self.state.turn.is_some() {
+            ContinueReason::TurnRunning
+        } else {
+            match self
+                .state
+                .tasks
+                .active()
+                .and_then(|task_id| self.state.tasks.get(task_id))
+            {
+                None => ContinueReason::NoActiveTask,
+                Some(task) if task.current_directive.is_some() => ContinueReason::Ready,
+                // Legacy record: complete below the old cap, indistinguishable
+                // from a truncated prefix exactly at it.
+                Some(task) if task.turn_intent.trim().is_empty() => {
+                    ContinueReason::NoRetainedDirective
+                }
+                Some(task) if task.turn_intent.chars().count() >= MAX_TASK_ANCHOR_TEXT_CHARS => {
+                    ContinueReason::DirectiveMayBeTruncated
+                }
+                Some(_) => ContinueReason::Ready,
+            }
+        };
+        ContinueReadiness {
+            can_continue: reason == ContinueReason::Ready,
+            reason,
+        }
+    }
+
     /// Atomic long-task submission shared by every entry (P1, fixes the F07
     /// misdelivery race): task create/resume focus, the long-task checklist
     /// attach and the first user message share one actor-owned admission.

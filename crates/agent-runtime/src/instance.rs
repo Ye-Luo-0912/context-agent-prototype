@@ -28,12 +28,50 @@ pub struct RuntimeInstance {
     host: ModuleHost,
     handle: RuntimeHandle,
     task: JoinHandle<()>,
+    /// The one cross-plane capture/restore implementation. Shared (not
+    /// duplicated) with any long-lived entry point that must offer save and
+    /// restore while this instance keeps owning shutdown.
+    checkpoints: Arc<RuntimeCheckpointPlane>,
+}
+
+/// F5: the cross-plane checkpoint seam, shareable with a serving host.
+///
+/// A complete runtime checkpoint spans two planes: the actor's own state and
+/// the host-owned capability surface. The actor-only dump is deliberately
+/// crate-private, so a client cannot persist a partial artifact and call it a
+/// checkpoint. This handle is the *only* way an external entry point (the
+/// Platform host's save/restore routes) reaches the full transaction, and it
+/// runs exactly the same steps [`RuntimeInstance::checkpoint`] and
+/// [`RuntimeInstance::restore`] run — there is no second flow to drift from.
+pub struct RuntimeCheckpointPlane {
+    handle: RuntimeHandle,
+    capabilities: Arc<crate::capability::CapabilityRegistry>,
     /// Serializes the full cross-plane restore transaction. An actor-side
     /// restore token rejects stale finalization, but it cannot undo a late
     /// capability-registry write from an older concurrent caller; holding
     /// this gate across prepare -> capability restore -> finalize prevents
     /// that split-brain interleaving.
     restore_gate: Mutex<()>,
+}
+
+impl RuntimeCheckpointPlane {
+    /// Capture actor state, context state, the host-owned capability surface
+    /// and the durable Core authority marker as one artifact.
+    pub async fn capture(&self) -> AgentResult<RuntimeCheckpoint> {
+        self.handle.checkpoint().await
+    }
+
+    /// The full two-phase restore: prepare (validate + install under the
+    /// actor's recovery fence) -> apply the capability plane -> durably
+    /// publish the commit. A failed marker or barrier leaves normal mutation
+    /// blocked instead of exposing a half-restored runtime.
+    pub async fn restore(&self, checkpoint: RuntimeCheckpoint) -> AgentResult<()> {
+        let _restore = self.restore_gate.lock().await;
+        let capabilities = checkpoint.capabilities.clone();
+        let restore_id = self.handle.prepare_restore(checkpoint).await?;
+        let applied = self.capabilities.restore(&capabilities);
+        self.handle.finalize_restore(restore_id, applied > 0).await
+    }
 }
 
 impl RuntimeInstance {
@@ -59,16 +97,28 @@ impl RuntimeInstance {
         }
         let services = Arc::new(services);
         let (handle, task) = crate::actor::spawn_runtime(services);
+        let checkpoints = Arc::new(RuntimeCheckpointPlane {
+            handle: handle.clone(),
+            capabilities: host.capability_registry(),
+            restore_gate: Mutex::new(()),
+        });
         Self {
             host,
             handle,
             task,
-            restore_gate: Mutex::new(()),
+            checkpoints,
         }
     }
 
     pub fn handle(&self) -> &RuntimeHandle {
         &self.handle
+    }
+
+    /// F5: the shareable cross-plane capture/restore seam. A serving host
+    /// clones this to expose save/restore routes while the instance keeps
+    /// owning shutdown; both paths execute the same transaction.
+    pub fn checkpoint_plane(&self) -> Arc<RuntimeCheckpointPlane> {
+        Arc::clone(&self.checkpoints)
     }
 
     /// Start the runtime (emits `RunStarted`). Subscribe first to see it.
@@ -87,7 +137,7 @@ impl RuntimeInstance {
     /// read, with bounded retries against a stable generation. The external
     /// instance path and automatic safe points therefore cannot drift.
     pub async fn checkpoint(&self) -> AgentResult<RuntimeCheckpoint> {
-        self.handle.checkpoint().await
+        self.checkpoints.capture().await
     }
 
     /// Restore the whole runtime from a checkpoint through a two-phase
@@ -100,11 +150,7 @@ impl RuntimeInstance {
     /// barrier leaves normal mutation blocked instead of exposing a
     /// half-restored runtime.
     pub async fn restore(&self, checkpoint: RuntimeCheckpoint) -> AgentResult<()> {
-        let _restore = self.restore_gate.lock().await;
-        let capabilities = checkpoint.capabilities.clone();
-        let restore_id = self.handle.prepare_restore(checkpoint).await?;
-        let applied = self.host.capability_registry().restore(&capabilities);
-        self.handle.finalize_restore(restore_id, applied > 0).await
+        self.checkpoints.restore(checkpoint).await
     }
 
     /// Full ordered shutdown. Every step runs even when an earlier one

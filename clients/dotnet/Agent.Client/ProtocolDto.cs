@@ -20,6 +20,18 @@ public sealed class AgentContractViolationException : Exception
 {
     public string Field { get; }
 
+    /// <summary>
+    /// Whether this violation fired on the outgoing request, strictly before any
+    /// byte reached the wire. Then the request definitively did NOT happen, and
+    /// a caller must not be told the outcome is unknown: a fabricated "unknown"
+    /// is as harmful as a fabricated success, because it pushes the caller into
+    /// re-checking (or re-sending) work that was never sent.
+    /// <para>Set by the connection's pre-send guard; a violation found while
+    /// decoding or validating a RESPONSE leaves it <c>false</c>, because that
+    /// request did reach the server.</para>
+    /// </summary>
+    public bool RequestNotSent { get; internal set; }
+
     public AgentContractViolationException(string field, string reason)
         : base($"invalid {field}: {reason}")
     {

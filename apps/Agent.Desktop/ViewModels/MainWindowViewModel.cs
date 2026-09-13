@@ -1731,7 +1731,10 @@ public sealed class MainWindowViewModel : ObservableObject, IAsyncDisposable
         WorkContinueResponse receipt;
         try
         {
-            receipt = await connection.ContinueAsync(_lifetime.Token);
+            // The GUI continues the ACTIVE task (F5's expectation field is for a
+            // caller that means "only this task"); the panel already states that
+            // continue follows the active task rather than the selection.
+            receipt = await connection.ContinueAsync(cancellationToken: _lifetime.Token);
         }
         catch (AgentUnknownOutcomeException unknown)
         {
@@ -1777,7 +1780,8 @@ public sealed class MainWindowViewModel : ObservableObject, IAsyncDisposable
             WorkCancelResponse receipt;
             try
             {
-                receipt = await connection.CancelCurrentTurnAsync(_lifetime.Token);
+                receipt = await connection.CancelCurrentTurnAsync(
+                    cancellationToken: _lifetime.Token);
             }
             catch (AgentUnknownOutcomeException unknown)
             {

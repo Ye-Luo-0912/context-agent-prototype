@@ -12,6 +12,7 @@ mod input;
 mod materialize_cancel;
 mod protocol_bodies;
 mod restore;
+mod steering;
 mod surface;
 mod work;
 mod work_control;

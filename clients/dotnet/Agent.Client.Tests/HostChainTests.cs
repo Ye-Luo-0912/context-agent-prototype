@@ -209,6 +209,206 @@ public class HostChainTests
     }
 
     /// <summary>
+    /// F5: the long-flow control loop from a HEADLESS .NET client against the
+    /// REAL <c>agent-host</c> binary — no GUI anywhere in the path.
+    ///
+    /// One <see cref="ResumableSession"/> drives start → steer → suspend →
+    /// activate → continue → checkpoint → restore → verify on one RuntimeActor,
+    /// and every precise operation names the identity it expects. The
+    /// assertions read typed receipts only: nothing is inferred from log text,
+    /// and a refused operation is proved to have changed nothing.
+    ///
+    /// Passes as NOT_RUN without the debug host binary.
+    /// </summary>
+    [Fact]
+    public async Task Real_host_serves_the_long_flow_control_loop_headlessly()
+    {
+        var hostBinary = FindHostBinary();
+        if (hostBinary is null)
+        {
+            return; // NOT_RUN: this environment has no debug agent-host build
+        }
+
+        var workdir = Path.Combine(Path.GetTempPath(), $"f5-loop-{Guid.NewGuid():N}");
+        Directory.CreateDirectory(workdir);
+        var pipeName = $"f5-loop-{Guid.NewGuid():N}";
+        var socketPath = Path.Combine(workdir, "host.sock");
+        // The host's own finite model-round budget: the snapshot must report
+        // this exact value and attribute it to the operator's CLI.
+        var args = OperatingSystem.IsWindows()
+            ? $"--workdir \"{workdir}\" --pipe {pipeName} --max-rounds 12"
+            : $"--workdir \"{workdir}\" --socket \"{socketPath}\" --max-rounds 12";
+
+        var start = new ProcessStartInfo
+        {
+            FileName = hostBinary,
+            Arguments = args,
+            UseShellExecute = false,
+            RedirectStandardOutput = true,
+            RedirectStandardError = true,
+        };
+        start.Environment["AGENT_DEMO"] = "1";
+        using var process = Process.Start(start)!;
+        await using var spawned = new SpawnedHost { Process = process, Workdir = workdir };
+        try
+        {
+            var ready = await WaitForEndpointAsync(
+                socketPath, pipeName, TimeSpan.FromSeconds(60));
+            Assert.True(
+                ready,
+                "the host endpoint never became connectable"
+                    + (process.HasExited
+                        ? $"; stderr:\n{await process.StandardError.ReadToEndAsync()}"
+                        : "; the host is still running"));
+
+            await using var session = new ResumableSession(() =>
+                OperatingSystem.IsWindows()
+                    ? new NamedPipeTransport(pipeName).ConnectAsync(CancellationToken.None)
+                    : new UnixDomainSocketTransport(socketPath).ConnectAsync(CancellationToken.None));
+
+            // The snapshot's typed continuation reason is how a headless client
+            // observes idleness; polling a fact beats sleeping a guess.
+            async Task<WorkSnapshotResponse> SettledAsync(string what)
+            {
+                var deadline = DateTimeOffset.UtcNow + TimeSpan.FromSeconds(120);
+                while (DateTimeOffset.UtcNow < deadline)
+                {
+                    var snapshot = await session.SnapshotAsync()
+                        .WaitAsync(TimeSpan.FromSeconds(30));
+                    var readiness = snapshot.ContinueReadiness;
+                    Assert.NotNull(readiness);
+                    if (readiness!.Reason != WorkContinueReason.TurnRunning)
+                    {
+                        return snapshot;
+                    }
+                    await Task.Delay(200);
+                }
+                throw new TimeoutException($"the runtime never settled while waiting for {what}");
+            }
+
+            // 1. start: a NEW submission creates and focuses its task.
+            var first = await session.SubmitWorkAsync("f5: first goal", "f5-loop-1")
+                .WaitAsync(TimeSpan.FromSeconds(30));
+            Assert.Equal(WorkSubmitDisposition.Accepted, first.Disposition);
+            var taskA = first.TaskId;
+
+            // The effective configuration is readable without a GUI, and the
+            // budget it reports is the one this host was started with.
+            var configured = await SettledAsync("the first submission");
+            var config = configured.EffectiveConfig;
+            Assert.NotNull(config);
+            Assert.Equal("rolling", config!.ContextPolicy);
+            Assert.Equal(12u, config.MaxModelRounds);
+            Assert.Equal("cli", config.MaxModelRoundsSource);
+            Assert.False(config.ReadOnly);
+
+            // 2. steer: an in-task correction lands on the named task and does
+            //    not create a second one.
+            var steered = await session.SteerAsync("f5: keep the timeout", taskA)
+                .WaitAsync(TimeSpan.FromSeconds(30));
+            Assert.True(steered.IsAdmitted);
+            Assert.Equal(taskA, steered.TaskId);
+            var afterSteer = await SettledAsync("the correction");
+            Assert.Single(afterSteer.Tasks);
+
+            // 3. a NEW submission is new work: submit and steer stay distinct.
+            var second = await session.SubmitWorkAsync("f5: second goal", "f5-loop-2")
+                .WaitAsync(TimeSpan.FromSeconds(30));
+            var taskB = second.TaskId;
+            Assert.NotEqual(taskA, taskB);
+            await SettledAsync("the second submission");
+
+            // 4. a correction for the task that moved is refused, and the
+            //    refusal names what is live.
+            var stale = await session.SteerAsync("f5: belongs to the first task", taskA)
+                .WaitAsync(TimeSpan.FromSeconds(30));
+            Assert.Equal(WorkSteerDisposition.Rejected, stale.Disposition);
+            Assert.Equal(WorkSteerRejection.ExpectedTaskMismatch, stale.Rejection);
+            Assert.Equal(taskB, stale.ActiveTaskId);
+            Assert.Null(stale.TaskId);
+
+            // 5. suspend the task the client observed, then prove a repeat of
+            //    the same expectation is an honest mismatch.
+            var suspended = await session.SuspendTaskAsync(taskB)
+                .WaitAsync(TimeSpan.FromSeconds(30));
+            Assert.Equal(WorkSuspendDisposition.Suspended, suspended.Disposition);
+            Assert.Equal(taskB, suspended.TaskId);
+            var repeat = await session.SuspendTaskAsync(taskB)
+                .WaitAsync(TimeSpan.FromSeconds(30));
+            Assert.Equal(WorkSuspendDisposition.ExpectedTaskMismatch, repeat.Disposition);
+
+            // 6. activate an existing task through the same actor.
+            var activated = await session.ActivateTaskAsync(taskA)
+                .WaitAsync(TimeSpan.FromSeconds(30));
+            Assert.Equal(taskA, activated.TaskId);
+            Assert.False(activated.AlreadyActive);
+            var again = await session.ActivateTaskAsync(taskA)
+                .WaitAsync(TimeSpan.FromSeconds(30));
+            Assert.True(again.AlreadyActive);
+
+            // 7. continue: the wrong expectation starts no turn; the right one
+            //    resumes the retained directive.
+            var mismatched = await session.ContinueAsync(taskB)
+                .WaitAsync(TimeSpan.FromSeconds(30));
+            Assert.Equal(WorkContinueDisposition.ExpectedTaskMismatch, mismatched.Disposition);
+            Assert.Null(mismatched.TaskId);
+            Assert.Equal(taskA, mismatched.ActiveTaskId);
+
+            var continued = await session.ContinueAsync(taskA)
+                .WaitAsync(TimeSpan.FromSeconds(30));
+            Assert.Equal(WorkContinueDisposition.Continued, continued.Disposition);
+            Assert.Equal(taskA, continued.TaskId);
+            await SettledAsync("the continuation");
+
+            // 8. a precise cancel whose expectation no longer matches cancels
+            //    nothing, and the receipt proves it.
+            var staleCancel = await session
+                .CancelCurrentTurnAsync(taskA, Guid.NewGuid().ToString("D"))
+                .WaitAsync(TimeSpan.FromSeconds(30));
+            Assert.NotNull(staleCancel.IdentityMismatch);
+            Assert.Equal(TurnCancelAckStatus.NoActiveTurn, staleCancel.Ack.Status);
+
+            // 9. a formal cross-plane checkpoint, named inside the run's store.
+            var captured = await session.CheckpointAsync()
+                .WaitAsync(TimeSpan.FromSeconds(60));
+            Assert.StartsWith("checkpoint-", captured.Artifact);
+            Assert.True(captured.PayloadBytes > 0);
+            Assert.Equal(configured.RunId, captured.RunId);
+
+            // An artifact name is not a path: the client refuses a traversal
+            // attempt before any frame is sent.
+            await Assert.ThrowsAsync<AgentContractViolationException>(
+                () => session.RestoreAsync("../outside.json"));
+
+            // 10. restore through the same transaction, then verify the task
+            //     plane and that continuation is available again.
+            var restored = await session.RestoreAsync(captured.Artifact)
+                .WaitAsync(TimeSpan.FromSeconds(120));
+            Assert.Equal(captured.Artifact, restored.Artifact);
+            Assert.Equal(configured.RunId, restored.RestoredRunId);
+
+            var verified = await SettledAsync("the restore");
+            Assert.Equal(taskA, verified.Focus?.TaskId);
+            Assert.Contains(verified.Tasks, task => task.TaskId == taskA);
+            Assert.Contains(verified.Tasks, task => task.TaskId == taskB);
+            Assert.True(verified.ContinueReadiness?.CanContinue);
+        }
+        finally
+        {
+            try
+            {
+                if (!process.HasExited)
+                {
+                    process.Kill(entireProcessTree: true);
+                }
+            }
+            catch
+            {
+            }
+        }
+    }
+
+    /// <summary>
     /// C3: the review surface against the REAL host — the four B3 read-only
     /// routes (task detail / change journal / artifact bytes / read-only
     /// context) driven through the REAL <see cref="ResumableSession"/> and the

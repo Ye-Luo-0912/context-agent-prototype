@@ -300,6 +300,24 @@ async fn work_plan_budget_and_continue_flow_through_the_product_composition() {
 
     // ---- Session 2: checkpoint, restart, restore, and /continue again —
     // the checklist and the stored directive survive the restart.
+    //
+    // A tool having written its file is NOT the end of the turn: the segment
+    // still has to settle. A checkpoint capture requires an idle runtime, so
+    // wait for the runtime's own typed readiness fact instead of treating the
+    // file as a turn-end signal (the earlier version raced the settling turn
+    // and failed with "agent is busy" under load).
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
+    loop {
+        let status = handle.status_snapshot().await.unwrap();
+        if status.continue_readiness.reason != agent_runtime::ContinueReason::TurnRunning {
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the continuation segment never settled before the checkpoint"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
     let checkpoint = composed.instance.checkpoint().await.unwrap();
     std::fs::create_dir_all(checkpoint_path.parent().unwrap()).unwrap();
     std::fs::write(&checkpoint_path, serde_json::to_vec(&checkpoint).unwrap()).unwrap();

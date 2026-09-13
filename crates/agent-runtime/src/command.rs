@@ -8,7 +8,11 @@ use tokio::sync::{broadcast, mpsc, oneshot};
 
 use crate::checkpoint::RuntimeCheckpoint;
 use crate::task::{AnchorPatch, TaskAnchor, TaskInfo};
-use crate::work::{RuntimeStatusSnapshot, TaskDetailSnapshot, WorkSubmission, WorkSubmissionQuery};
+use crate::work::{
+    CancelOutcome, ContinueOutcome, RuntimeStatusSnapshot, SteeringOutcome, SuspendOutcome,
+    TaskActivation, TaskDetailSnapshot, TurnIdentityExpectation, WorkSubmission,
+    WorkSubmissionQuery,
+};
 
 /// Reply channel back to the caller of a command.
 pub type Reply<T> = oneshot::Sender<T>;
@@ -44,14 +48,30 @@ pub enum RuntimeCommand {
         client_request_id: String,
         reply: Reply<AgentResult<WorkSubmission>>,
     },
+    /// F5: in-task steering/correction. Unlike `StartWork` this NEVER creates
+    /// or re-focuses a task: it applies the caller's correction to the task
+    /// the runtime is already on (or queues it behind the running turn), and
+    /// refuses with the live identity attached when `expected_task_id` names a
+    /// different task. The comparison happens inside this one serialized
+    /// command, so no client can act on a stale snapshot.
+    SteerActiveTask {
+        instruction: String,
+        expected_task_id: Option<TaskId>,
+        reply: Reply<AgentResult<SteeringOutcome>>,
+    },
     /// Activate an existing task by id (resuming its scopes in the engine).
+    /// The id IS the expected identity: an unknown or completed task is a
+    /// typed rejection, never a guess at "whatever is current".
     ActivateTask {
         task_id: TaskId,
-        reply: Reply<AgentResult<()>>,
+        reply: Reply<AgentResult<TaskActivation>>,
     },
-    /// Suspend the active task without completing it (focus cleared).
+    /// Suspend the active task without completing it (focus cleared). When
+    /// `expected_task_id` is named the actor compares it against the live
+    /// active task before suspending anything.
     SuspendTask {
-        reply: Reply<AgentResult<()>>,
+        expected_task_id: Option<TaskId>,
+        reply: Reply<AgentResult<SuspendOutcome>>,
     },
     /// List the tasks the runtime knows (for the UI's `/tasks`).
     ListTasks {
@@ -105,9 +125,11 @@ pub enum RuntimeCommand {
     /// a stop/restore. No new user instruction is minted and the stored
     /// directive identity does not change. Returns the task the directive
     /// was continued under, so a receipt never has to be inferred from a
-    /// second, racy query.
+    /// second, racy query. `expected_task_id` (F5) makes "continue" precise
+    /// for multi-entry clients: a mismatch starts NO turn.
     ContinueActiveTask {
-        reply: Reply<AgentResult<TaskId>>,
+        expected_task_id: Option<TaskId>,
+        reply: Reply<AgentResult<ContinueOutcome>>,
     },
     /// Read-only, one-shot typed status snapshot (P2): focus, per-task
     /// revisions and the durable event watermark, read atomically inside
@@ -181,8 +203,13 @@ pub enum RuntimeCommand {
         reply: Reply<AgentResult<OperationQueryResult>>,
     },
     /// `/cancel`：直达取消，不经 UserMessage 信封解释。
+    /// F5: `expected` lets a multi-entry client cancel exactly the turn it
+    /// observed. The actor compares the expectation against the live turn in
+    /// this same serialized step and cancels nothing on a mismatch, so a
+    /// slow client can never cancel a turn that started after its snapshot.
     CancelTurn {
-        reply: Reply<AgentResult<TurnCancelAck>>,
+        expected: Option<TurnIdentityExpectation>,
+        reply: Reply<AgentResult<CancelOutcome>>,
     },
     Stop {
         reply: Reply<AgentResult<()>>,
@@ -255,16 +282,51 @@ impl RuntimeHandle {
         .await
     }
 
+    /// F5: apply an in-task correction to the task the runtime is already on.
+    /// This is the steering half of the submit/steer split: it never creates a
+    /// task and never re-focuses, so a correction can never silently become a
+    /// new piece of work. `expected_task_id` is compared inside the actor.
+    pub async fn steer_active_task(
+        &self,
+        instruction: String,
+        expected_task_id: Option<TaskId>,
+    ) -> AgentResult<SteeringOutcome> {
+        self.call(|reply| RuntimeCommand::SteerActiveTask {
+            instruction,
+            expected_task_id,
+            reply,
+        })
+        .await
+    }
+
     /// Activate an existing task, resuming its scopes in the context engine.
     pub async fn activate_task(&self, task_id: TaskId) -> AgentResult<()> {
+        self.activate_task_reporting(task_id).await.map(|_| ())
+    }
+
+    /// F5: the same activation, with the receipt a multi-entry client needs
+    /// (which task is now active, what it displaced, whether anything moved).
+    pub async fn activate_task_reporting(&self, task_id: TaskId) -> AgentResult<TaskActivation> {
         self.call(|reply| RuntimeCommand::ActivateTask { task_id, reply })
             .await
     }
 
     /// Suspend the active task without completing it.
     pub async fn suspend_task(&self) -> AgentResult<()> {
-        self.call(|reply| RuntimeCommand::SuspendTask { reply })
-            .await
+        self.suspend_task_expecting(None).await.map(|_| ())
+    }
+
+    /// F5: suspend exactly the task the caller observed. A named
+    /// `expected_task_id` that is not the live active task suspends nothing.
+    pub async fn suspend_task_expecting(
+        &self,
+        expected_task_id: Option<TaskId>,
+    ) -> AgentResult<SuspendOutcome> {
+        self.call(|reply| RuntimeCommand::SuspendTask {
+            expected_task_id,
+            reply,
+        })
+        .await
     }
 
     /// Snapshot of the tasks the runtime knows.
@@ -360,8 +422,29 @@ impl RuntimeHandle {
     /// turn. Public: stop/restore twins are a host-driven flow. Returns the
     /// task the directive continues under.
     pub async fn continue_active_task(&self) -> AgentResult<TaskId> {
-        self.call(|reply| RuntimeCommand::ContinueActiveTask { reply })
-            .await
+        match self.continue_active_task_expecting(None).await? {
+            ContinueOutcome::Continued { task_id } => Ok(task_id),
+            // Unreachable without an expectation: the actor only refuses when
+            // the caller named a task. Reported instead of unwrapped so a
+            // future change cannot turn into a silent success.
+            ContinueOutcome::ExpectedTaskMismatch { .. } => Err(AgentError::Internal(
+                "continuation reported an identity mismatch for an unconditional request".into(),
+            )),
+        }
+    }
+
+    /// F5: continue exactly the task the caller observed. A mismatch starts no
+    /// turn and names the live active task, so a multi-entry client re-targets
+    /// instead of continuing someone else's work.
+    pub async fn continue_active_task_expecting(
+        &self,
+        expected_task_id: Option<TaskId>,
+    ) -> AgentResult<ContinueOutcome> {
+        self.call(|reply| RuntimeCommand::ContinueActiveTask {
+            expected_task_id,
+            reply,
+        })
+        .await
     }
 
     /// One consistent typed status snapshot (P2). Read-only; the actor
@@ -491,7 +574,25 @@ impl RuntimeHandle {
     /// Cancel the in-flight turn (if any). The actor immediately considers
     /// the turn superseded, so its late completion is dropped as stale.
     pub async fn cancel_turn(&self) -> AgentResult<TurnCancelAck> {
-        self.call(|reply| RuntimeCommand::CancelTurn { reply })
+        match self.cancel_turn_expecting(None).await? {
+            CancelOutcome::Acknowledged(ack) => Ok(ack),
+            // Unreachable without an expectation, for the same reason as
+            // `continue_active_task`.
+            CancelOutcome::ExpectedIdentityMismatch { .. } => Err(AgentError::Internal(
+                "cancellation reported an identity mismatch for an unconditional request".into(),
+            )),
+        }
+    }
+
+    /// F5: cancel exactly the turn the caller observed. The expectation is
+    /// compared against the live turn inside the actor — a mismatch cancels
+    /// nothing and reports what is actually running, instead of the
+    /// snapshot-then-unconditional-cancel race a client would otherwise run.
+    pub async fn cancel_turn_expecting(
+        &self,
+        expected: Option<TurnIdentityExpectation>,
+    ) -> AgentResult<CancelOutcome> {
+        self.call(|reply| RuntimeCommand::CancelTurn { expected, reply })
             .await
     }
 

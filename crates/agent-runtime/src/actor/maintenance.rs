@@ -6,7 +6,14 @@ const MAINTENANCE_CLEANUP_TIMEOUT: Duration = Duration::from_secs(5);
 
 pub(super) enum TurnStartReply {
     Message(Reply<AgentResult<()>>),
-    Continue(Reply<AgentResult<TaskId>>, TaskId),
+    Continue(Reply<AgentResult<crate::work::ContinueOutcome>>, TaskId),
+    /// F5: an in-task steering correction that started its own turn. The
+    /// receipt is settled after the same commit barrier every other turn-start
+    /// reply waits for, so "applied" never precedes the durable transition.
+    Steer(
+        Reply<AgentResult<crate::work::SteeringOutcome>>,
+        crate::work::SteeringOutcome,
+    ),
     Work(
         Reply<AgentResult<crate::work::WorkSubmission>>,
         crate::work::WorkSubmission,
@@ -88,7 +95,11 @@ impl RuntimeActor {
                 let _ = reply.send(result);
             }
             Some(TurnStartReply::Continue(reply, task_id)) => {
-                let _ = reply.send(result.map(|()| task_id));
+                let _ = reply
+                    .send(result.map(|()| crate::work::ContinueOutcome::Continued { task_id }));
+            }
+            Some(TurnStartReply::Steer(reply, outcome)) => {
+                let _ = reply.send(result.map(|()| outcome));
             }
             Some(TurnStartReply::Work(reply, submission, record)) => {
                 if result.is_ok() {

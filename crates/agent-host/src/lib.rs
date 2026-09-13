@@ -37,13 +37,15 @@ use agent_platform_protocol::{
     MAX_JSON_CONTROL_OBJECT_KEYS, MAX_JSON_CONTROL_STRING_BYTES,
     MAX_JSON_CONTROL_TOTAL_STRING_BYTES, MessageId, NegotiatedContractProfile, PlatformEnvelope,
     PlatformError, PlatformErrorClass, PlatformResponse, ProtocolIdentity, RetryDisposition, Route,
-    SchemaDigest, WorkArtifactRequest, WorkCancelRequest, WorkChangesRequest, WorkContextRequest,
-    WorkContinueRequest, WorkEventNotification, WorkSnapshotRequest, WorkSubmitRequest,
-    WorkSubmitResultRequest, WorkSubscribeRequest, WorkTaskCompletionRequest,
+    SchemaDigest, WorkActivateRequest, WorkArtifactRequest, WorkCancelRequest, WorkChangesRequest,
+    WorkCheckpointRequest, WorkContextRequest, WorkContinueRequest, WorkEventNotification,
+    WorkRestoreRequest, WorkSnapshotRequest, WorkSteerRequest, WorkSubmitRequest,
+    WorkSubmitResultRequest, WorkSubscribeRequest, WorkSuspendRequest, WorkTaskCompletionRequest,
     WorkTaskDetailRequest,
 };
 use agent_runtime::{
-    RuntimeHandle, WorkControlGrant, WorkControlRouter, WorkControlSessionRegistry,
+    HostRunConfig, RuntimeCheckpointPlane, RuntimeHandle, WorkControlGrant, WorkControlRouter,
+    WorkControlSessionRegistry,
 };
 use tokio::sync::broadcast;
 
@@ -405,6 +407,14 @@ pub struct HostPlane {
     /// The run's workspace: B3 read-only routes (change journal, artifact
     /// bytes) read through it. Shared and read-only at the router boundary.
     pub workspace: Arc<agent_workspace::Workspace>,
+    /// F5: the runtime's cross-plane checkpoint seam, so `work.checkpoint` /
+    /// `work.restore` run the SAME transaction the TUI and startup restore
+    /// run. `None` serves a host without save/restore, and those routes then
+    /// refuse rather than write an actor-only dump.
+    pub checkpoints: Option<Arc<RuntimeCheckpointPlane>>,
+    /// F5: the effective run configuration this host applied, reported on
+    /// every snapshot so a headless client never has to guess it.
+    pub run_config: Option<HostRunConfig>,
 }
 
 pub struct HostServer {
@@ -727,7 +737,7 @@ fn open_connection_plane(
         .registry
         .bind(&session_id)
         .map_err(|error| anyhow::anyhow!(error.to_string()))?;
-    let router = WorkControlRouter::new(
+    let mut router = WorkControlRouter::new(
         base.profile.clone(),
         base.handle.clone(),
         Arc::clone(&base.broker),
@@ -736,6 +746,22 @@ fn open_connection_plane(
         Arc::clone(&base.workspace),
     )
     .map_err(|error| anyhow::anyhow!(error.to_string()))?;
+    // F5: the checkpoint plane and the reported configuration are host-owned
+    // facts. A read-only session still sees the configuration (observation)
+    // while its grant denies every checkpoint mutation.
+    if let Some(plane) = base.checkpoints.as_ref() {
+        router = router.with_checkpoint_plane(
+            Arc::clone(plane),
+            base.workspace.state_dir().join("checkpoints"),
+        );
+    }
+    if let Some(config) = base.run_config.as_ref() {
+        let mut config = config.clone();
+        // The grant class is the truth about this connection, not the host's
+        // default: a read-only session must never read "read_only: false".
+        config.read_only = read_only || config.read_only;
+        router = router.with_run_config(config);
+    }
     Ok((router, guard))
 }
 
@@ -1119,6 +1145,25 @@ fn dispatch<W: Write + Send + 'static>(
         }
         ("work", "cancel") => {
             run_route!(WorkCancelRequest, cancel)
+        }
+        // F5: in-task steering and task lifecycle. `steer` is deliberately a
+        // different route from `submit` — a correction must never be admitted
+        // as new work — and both activate/suspend go to the same RuntimeActor.
+        ("work", "steer") => {
+            run_route!(WorkSteerRequest, steer)
+        }
+        ("work", "activate") => {
+            run_route!(WorkActivateRequest, activate)
+        }
+        ("work", "suspend") => {
+            run_route!(WorkSuspendRequest, suspend)
+        }
+        // F5: the formal cross-plane capture/restore flow.
+        ("work", "checkpoint") => {
+            run_route!(WorkCheckpointRequest, checkpoint)
+        }
+        ("work", "restore") => {
+            run_route!(WorkRestoreRequest, restore)
         }
         ("work", "snapshot") => {
             run_route!(WorkSnapshotRequest, snapshot)

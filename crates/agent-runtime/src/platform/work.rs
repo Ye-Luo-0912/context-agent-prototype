@@ -20,21 +20,29 @@ use agent_platform_protocol::{
     MAX_SNAPSHOT_PENDING_APPROVALS, MAX_SNAPSHOT_TASKS, MessageId, NegotiatedContractProfile,
     PendingApprovalSnapshot, PlatformEnvelope, PlatformError, PlatformErrorClass, PlatformResponse,
     RetryDisposition, TaskSnapshotEntry, TaskSnapshotStatus, ValidationError, ValidationResult,
-    WorkArtifactRequest, WorkArtifactResponse, WorkCancelRequest, WorkCancelResponse,
-    WorkChangesRequest, WorkChangesResponse, WorkCompletionFact, WorkContextRequest,
-    WorkContextResponse, WorkContinueRequest, WorkContinueResponse, WorkSnapshotRequest,
-    WorkSnapshotResponse, WorkSubmitDisposition, WorkSubmitRequest, WorkSubmitResponse,
-    WorkSubmitResultDisposition, WorkSubmitResultRequest, WorkSubmitResultResponse,
-    WorkSubscribeRequest, WorkSubscribeResponse, WorkTaskCompletionRequest,
-    WorkTaskCompletionResponse, WorkTaskDetailRequest, WorkTaskDetailResponse,
+    WorkActivateRequest, WorkActivateResponse, WorkArtifactRequest, WorkArtifactResponse,
+    WorkCancelRequest, WorkCancelResponse, WorkChangesRequest, WorkChangesResponse,
+    WorkCheckpointRequest, WorkCheckpointResponse, WorkCompletionFact, WorkContextRequest,
+    WorkContextResponse, WorkContinueDisposition, WorkContinueReadiness, WorkContinueReason,
+    WorkContinueRequest, WorkContinueResponse, WorkRestoreRequest, WorkRestoreResponse,
+    WorkRunConfig, WorkSnapshotRequest, WorkSnapshotResponse, WorkSteerDisposition,
+    WorkSteerRejection, WorkSteerRequest, WorkSteerResponse, WorkStoreBackpressure,
+    WorkSubmitDisposition, WorkSubmitRequest, WorkSubmitResponse, WorkSubmitResultDisposition,
+    WorkSubmitResultRequest, WorkSubmitResultResponse, WorkSubscribeRequest, WorkSubscribeResponse,
+    WorkSuspendDisposition, WorkSuspendRequest, WorkSuspendResponse, WorkTaskCompletionRequest,
+    WorkTaskCompletionResponse, WorkTaskDetailRequest, WorkTaskDetailResponse, WorkTurnIdentity,
     validate_approval_respond_request, validate_approval_respond_response,
+    validate_work_activate_request, validate_work_activate_response,
     validate_work_artifact_request, validate_work_artifact_response, validate_work_cancel_request,
     validate_work_cancel_response, validate_work_changes_request, validate_work_changes_response,
+    validate_work_checkpoint_request, validate_work_checkpoint_response,
     validate_work_context_request, validate_work_context_response, validate_work_continue_request,
-    validate_work_continue_response, validate_work_snapshot_request,
-    validate_work_snapshot_response, validate_work_submit_request, validate_work_submit_response,
+    validate_work_continue_response, validate_work_restore_request, validate_work_restore_response,
+    validate_work_snapshot_request, validate_work_snapshot_response, validate_work_steer_request,
+    validate_work_steer_response, validate_work_submit_request, validate_work_submit_response,
     validate_work_submit_result_request, validate_work_submit_result_response,
     validate_work_subscribe_request, validate_work_subscribe_response,
+    validate_work_suspend_request, validate_work_suspend_response,
     validate_work_task_completion_request, validate_work_task_completion_response,
     validate_work_task_detail_request, validate_work_task_detail_response,
 };
@@ -68,6 +76,18 @@ pub enum WorkControlAction {
     Snapshot,
     Subscribe,
     ApprovalRespond,
+    /// F5: in-task steering/correction. A separate permission from `Submit`:
+    /// a session may be allowed to correct running work without being allowed
+    /// to start new work, and the two must never be confused for each other.
+    Steer,
+    /// F5: activate an existing task (focus switch through the actor).
+    Activate,
+    /// F5: suspend a task without completing it.
+    Suspend,
+    /// F5: capture one formal cross-plane checkpoint.
+    Checkpoint,
+    /// F5: restore one verified checkpoint artifact.
+    Restore,
     /// B3 read-only: one task's full anchor card.
     ReadTaskDetail,
     /// B3 read-only: the workspace change journal.
@@ -110,6 +130,13 @@ pub struct WorkControlGrant {
     pub allow_snapshot: bool,
     pub allow_subscribe: bool,
     pub allow_approval_respond: bool,
+    /// F5 mutations: steering an in-flight task, moving the active task and
+    /// driving the formal checkpoint plane. All operator-class.
+    pub allow_steer: bool,
+    pub allow_activate: bool,
+    pub allow_suspend: bool,
+    pub allow_checkpoint: bool,
+    pub allow_restore: bool,
     /// B3: all four read-only routes are observation; every grant class that
     /// may see a snapshot may read these too.
     pub allow_read_task_detail: bool,
@@ -132,6 +159,13 @@ impl WorkControlGrant {
             allow_snapshot: true,
             allow_subscribe: true,
             allow_approval_respond: false,
+            // Observation only: steering, focus moves and the checkpoint plane
+            // are all mutations of run state.
+            allow_steer: false,
+            allow_activate: false,
+            allow_suspend: false,
+            allow_checkpoint: false,
+            allow_restore: false,
             allow_read_task_detail: true,
             allow_read_changes: true,
             allow_read_artifact: true,
@@ -149,6 +183,11 @@ impl WorkControlGrant {
             allow_snapshot: true,
             allow_subscribe: true,
             allow_approval_respond: true,
+            allow_steer: true,
+            allow_activate: true,
+            allow_suspend: true,
+            allow_checkpoint: true,
+            allow_restore: true,
             allow_read_task_detail: true,
             allow_read_changes: true,
             allow_read_artifact: true,
@@ -165,6 +204,11 @@ impl WorkControlGrant {
             WorkControlAction::Snapshot => self.allow_snapshot,
             WorkControlAction::Subscribe => self.allow_subscribe,
             WorkControlAction::ApprovalRespond => self.allow_approval_respond,
+            WorkControlAction::Steer => self.allow_steer,
+            WorkControlAction::Activate => self.allow_activate,
+            WorkControlAction::Suspend => self.allow_suspend,
+            WorkControlAction::Checkpoint => self.allow_checkpoint,
+            WorkControlAction::Restore => self.allow_restore,
             WorkControlAction::ReadTaskDetail => self.allow_read_task_detail,
             WorkControlAction::ReadChanges => self.allow_read_changes,
             WorkControlAction::ReadArtifact => self.allow_read_artifact,
@@ -292,6 +336,36 @@ pub struct WorkControlRouter {
     /// journal, artifact bytes) read from it; everything stays read-only —
     /// no mutation entry is ever opened through the router.
     workspace: Arc<agent_workspace::Workspace>,
+    /// F5: the formal cross-plane checkpoint seam plus the store the artifacts
+    /// live in. `None` means this host does not offer save/restore, and the
+    /// routes say so instead of writing a partial actor-only dump.
+    checkpoints: Option<(Arc<crate::RuntimeCheckpointPlane>, crate::CheckpointStore)>,
+    /// F5: the host-owned half of the effective run configuration (policy,
+    /// maintenance budget, provider identity). The kernel-owned half (the
+    /// finite model-round budget) is read from the status snapshot, so the
+    /// reported budget is the one actually enforced. `None` means this host
+    /// does not report configuration.
+    run_config: Option<HostRunConfig>,
+}
+
+/// F5: the run-configuration facts only the composition root knows. The
+/// snapshot pairs them with the kernel's own effective round budget so a
+/// non-GUI client can read one validated answer instead of re-deriving the
+/// host's CLI and environment.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HostRunConfig {
+    /// `append` | `rolling` | `dynamic` | `service`.
+    pub context_policy: String,
+    /// Whether the operator set the model-round budget explicitly, rather than
+    /// inheriting the kernel default.
+    pub max_model_rounds_from_cli: bool,
+    pub maintenance_max_calls_per_maintain: u32,
+    /// `None` is reported as unbounded, never as a large number.
+    pub maintenance_max_tokens_per_maintain: Option<u64>,
+    pub maintenance_timeout_secs: Option<u64>,
+    pub provider_profile_digest: Option<String>,
+    pub prompt_cache_mode: Option<String>,
+    pub read_only: bool,
 }
 
 type ResponseValidator<RequestPayload, ResponsePayload> = fn(
@@ -319,7 +393,28 @@ impl WorkControlRouter {
             gate,
             authorizer,
             workspace,
+            checkpoints: None,
+            run_config: None,
         })
+    }
+
+    /// F5: offer the formal checkpoint routes. The plane comes from
+    /// `RuntimeInstance::checkpoint_plane`, so save/restore over the wire runs
+    /// the same cross-plane transaction as every other entry point; the store
+    /// is the run's own checkpoint directory, and artifact names never leave it.
+    pub fn with_checkpoint_plane(
+        mut self,
+        plane: Arc<crate::RuntimeCheckpointPlane>,
+        store_dir: std::path::PathBuf,
+    ) -> Self {
+        self.checkpoints = Some((plane, crate::CheckpointStore::new(store_dir)));
+        self
+    }
+
+    /// F5: report the effective run configuration on every snapshot.
+    pub fn with_run_config(mut self, config: HostRunConfig) -> Self {
+        self.run_config = Some(config);
+        self
     }
 
     /// The live event stream, for subscribers. The receiver sees events from
@@ -400,17 +495,40 @@ impl WorkControlRouter {
                 },
             );
         }
+        // F5: the caller's expectation travels INTO the actor. A router-side
+        // "read the snapshot, then continue unconditionally" would reintroduce
+        // exactly the race this route is supposed to close.
+        let expected_task_id = request.payload.expected_task_id;
         let continued = self
-            .bounded(started, || self.runtime.continue_active_task())
+            .bounded(started, || {
+                self.runtime
+                    .continue_active_task_expecting(expected_task_id)
+            })
             .await;
         match continued {
-            Ok(task_id) => self.continue_response(
+            Ok(crate::ContinueOutcome::Continued { task_id }) => self.continue_response(
                 &request,
                 started,
                 PlatformResponse::Success {
-                    value: WorkContinueResponse { task_id },
+                    value: WorkContinueResponse {
+                        task_id: Some(task_id),
+                        disposition: WorkContinueDisposition::Continued,
+                        active_task_id: None,
+                    },
                 },
             ),
+            Ok(crate::ContinueOutcome::ExpectedTaskMismatch { active_task_id }) => self
+                .continue_response(
+                    &request,
+                    started,
+                    PlatformResponse::Success {
+                        value: WorkContinueResponse {
+                            task_id: None,
+                            disposition: WorkContinueDisposition::ExpectedTaskMismatch,
+                            active_task_id,
+                        },
+                    },
+                ),
             Err(error) => self.continue_response(
                 &request,
                 started,
@@ -440,16 +558,378 @@ impl WorkControlRouter {
                 },
             );
         }
-        let ack = self.bounded(started, || self.runtime.cancel_turn()).await;
+        // F5: an expectation is compared inside the actor, in the same
+        // serialized step that would cancel the turn.
+        let expected = crate::TurnIdentityExpectation {
+            task_id: request.payload.expected_task_id,
+            turn_id: request.payload.expected_turn_id,
+        };
+        let expected = (!expected.is_empty()).then_some(expected);
+        let ack = self
+            .bounded(started, || self.runtime.cancel_turn_expecting(expected))
+            .await;
         match ack {
-            Ok(ack) => self.cancel_response(
+            Ok(crate::CancelOutcome::Acknowledged(ack)) => self.cancel_response(
                 &request,
                 started,
                 PlatformResponse::Success {
-                    value: WorkCancelResponse { ack },
+                    value: WorkCancelResponse {
+                        ack,
+                        identity_mismatch: None,
+                    },
+                },
+            ),
+            Ok(crate::CancelOutcome::ExpectedIdentityMismatch {
+                active_task_id,
+                active_turn_id,
+            }) => self.cancel_response(
+                &request,
+                started,
+                PlatformResponse::Success {
+                    value: WorkCancelResponse {
+                        // Nothing was cancelled by this call, so the ack must
+                        // not claim a barrier: the mismatch is the whole answer.
+                        ack: agent_contracts::TurnCancelAck::NoActiveTurn,
+                        identity_mismatch: Some(WorkTurnIdentity {
+                            task_id: active_task_id,
+                            turn_id: active_turn_id,
+                        }),
+                    },
                 },
             ),
             Err(error) => self.cancel_response(
+                &request,
+                started,
+                PlatformResponse::Error {
+                    error: work_runtime_error(error),
+                },
+            ),
+        }
+    }
+
+    /// F5: in-task steering — apply a correction to work already running.
+    /// Never creates a task (that is `submit`) and never re-focuses: the
+    /// receipt says applied, queued, or refused with the live identity.
+    pub async fn steer(
+        &self,
+        request: PlatformEnvelope<WorkSteerRequest>,
+    ) -> AgentResult<PlatformEnvelope<PlatformResponse<WorkSteerResponse>>> {
+        validate_work_steer_request(&self.profile, &request)
+            .map_err(|error| AgentError::InvalidRequest(error.to_string()))?;
+        let started = Instant::now();
+        if !self.is_authorized(WorkControlAction::Steer, &request) {
+            return self.steer_response(
+                &request,
+                started,
+                PlatformResponse::Error {
+                    error: forbidden_error(),
+                },
+            );
+        }
+        let instruction = request.payload.instruction.clone();
+        let expected_task_id = request.payload.expected_task_id;
+        let steered = self
+            .bounded(started, || {
+                self.runtime
+                    .steer_active_task(instruction, expected_task_id)
+            })
+            .await;
+        match steered {
+            Ok(crate::SteeringOutcome::Accepted {
+                disposition,
+                task_id,
+            }) => {
+                let value = WorkSteerResponse {
+                    disposition: match disposition {
+                        crate::SteeringDisposition::Applied => WorkSteerDisposition::Applied,
+                        crate::SteeringDisposition::Queued => WorkSteerDisposition::Queued,
+                    },
+                    task_id: Some(task_id),
+                    rejection: None,
+                    active_task_id: None,
+                };
+                self.steer_response(&request, started, PlatformResponse::Success { value })
+            }
+            Ok(crate::SteeringOutcome::Rejected {
+                rejection,
+                active_task_id,
+            }) => {
+                let value = WorkSteerResponse {
+                    disposition: WorkSteerDisposition::Rejected,
+                    task_id: None,
+                    rejection: Some(match rejection {
+                        crate::SteeringRejection::ExpectedTaskMismatch => {
+                            WorkSteerRejection::ExpectedTaskMismatch
+                        }
+                        crate::SteeringRejection::NoActiveTask => WorkSteerRejection::NoActiveTask,
+                        crate::SteeringRejection::QueueFull => WorkSteerRejection::QueueFull,
+                    }),
+                    active_task_id,
+                };
+                self.steer_response(&request, started, PlatformResponse::Success { value })
+            }
+            Err(error) => self.steer_response(
+                &request,
+                started,
+                PlatformResponse::Error {
+                    error: work_runtime_error(error),
+                },
+            ),
+        }
+    }
+
+    /// F5: activate an existing task through the one RuntimeActor. There is no
+    /// second task table: an unknown or completed task is a typed rejection.
+    pub async fn activate(
+        &self,
+        request: PlatformEnvelope<WorkActivateRequest>,
+    ) -> AgentResult<PlatformEnvelope<PlatformResponse<WorkActivateResponse>>> {
+        validate_work_activate_request(&self.profile, &request)
+            .map_err(|error| AgentError::InvalidRequest(error.to_string()))?;
+        let started = Instant::now();
+        if !self.is_authorized(WorkControlAction::Activate, &request) {
+            return self.activate_response(
+                &request,
+                started,
+                PlatformResponse::Error {
+                    error: forbidden_error(),
+                },
+            );
+        }
+        let task_id = request.payload.task_id;
+        let activated = self
+            .bounded(started, || self.runtime.activate_task_reporting(task_id))
+            .await;
+        match activated {
+            Ok(activation) => {
+                let value = WorkActivateResponse {
+                    task_id: activation.task_id,
+                    previously_active: activation.previously_active,
+                    already_active: activation.already_active,
+                };
+                self.activate_response(&request, started, PlatformResponse::Success { value })
+            }
+            Err(error) => self.activate_response(
+                &request,
+                started,
+                PlatformResponse::Error {
+                    error: work_runtime_error(error),
+                },
+            ),
+        }
+    }
+
+    /// F5: suspend a task without completing it. Suspension is not completion,
+    /// and the response never implies one.
+    pub async fn suspend(
+        &self,
+        request: PlatformEnvelope<WorkSuspendRequest>,
+    ) -> AgentResult<PlatformEnvelope<PlatformResponse<WorkSuspendResponse>>> {
+        validate_work_suspend_request(&self.profile, &request)
+            .map_err(|error| AgentError::InvalidRequest(error.to_string()))?;
+        let started = Instant::now();
+        if !self.is_authorized(WorkControlAction::Suspend, &request) {
+            return self.suspend_response(
+                &request,
+                started,
+                PlatformResponse::Error {
+                    error: forbidden_error(),
+                },
+            );
+        }
+        let expected_task_id = request.payload.expected_task_id;
+        let suspended = self
+            .bounded(started, || {
+                self.runtime.suspend_task_expecting(expected_task_id)
+            })
+            .await;
+        match suspended {
+            Ok(outcome) => {
+                let value = match outcome {
+                    crate::SuspendOutcome::Suspended { task_id } => WorkSuspendResponse {
+                        disposition: WorkSuspendDisposition::Suspended,
+                        task_id: Some(task_id),
+                        active_task_id: None,
+                    },
+                    crate::SuspendOutcome::NoActiveTask => WorkSuspendResponse {
+                        disposition: WorkSuspendDisposition::NoActiveTask,
+                        task_id: None,
+                        active_task_id: None,
+                    },
+                    crate::SuspendOutcome::ExpectedTaskMismatch { active_task_id } => {
+                        WorkSuspendResponse {
+                            disposition: WorkSuspendDisposition::ExpectedTaskMismatch,
+                            task_id: None,
+                            active_task_id,
+                        }
+                    }
+                };
+                self.suspend_response(&request, started, PlatformResponse::Success { value })
+            }
+            Err(error) => self.suspend_response(
+                &request,
+                started,
+                PlatformResponse::Error {
+                    error: work_runtime_error(error),
+                },
+            ),
+        }
+    }
+
+    /// F5: capture one FORMAL checkpoint. The artifact spans the actor,
+    /// context and host capability planes and lands in the run's own store
+    /// through the same atomic envelope writer every other entry point uses.
+    /// A host without the plane refuses instead of writing a partial dump.
+    pub async fn checkpoint(
+        &self,
+        request: PlatformEnvelope<WorkCheckpointRequest>,
+    ) -> AgentResult<PlatformEnvelope<PlatformResponse<WorkCheckpointResponse>>> {
+        validate_work_checkpoint_request(&self.profile, &request)
+            .map_err(|error| AgentError::InvalidRequest(error.to_string()))?;
+        let started = Instant::now();
+        if !self.is_authorized(WorkControlAction::Checkpoint, &request) {
+            return self.checkpoint_response(
+                &request,
+                started,
+                PlatformResponse::Error {
+                    error: forbidden_error(),
+                },
+            );
+        }
+        let Some((plane, store)) = &self.checkpoints else {
+            return self.checkpoint_response(
+                &request,
+                started,
+                PlatformResponse::Error {
+                    error: checkpoint_plane_unavailable(),
+                },
+            );
+        };
+        // The capture itself is bounded by the request deadline; the store
+        // write is a durable side effect and must not be abandoned midway, so
+        // it runs after the capture with its own failure reported honestly.
+        let captured = self.bounded(started, || plane.capture()).await;
+        let checkpoint = match captured {
+            Ok(checkpoint) => checkpoint,
+            Err(error) => {
+                return self.checkpoint_response(
+                    &request,
+                    started,
+                    PlatformResponse::Error {
+                        error: work_runtime_error(error),
+                    },
+                );
+            }
+        };
+        let version = checkpoint.version;
+        let run_id = checkpoint.run_metadata.run_id;
+        let tasks = u32::try_from(checkpoint.tasks.tasks.len()).unwrap_or(u32::MAX);
+        let bytes = match serde_json::to_vec(&checkpoint) {
+            Ok(bytes) => bytes,
+            Err(error) => {
+                return self.checkpoint_response(
+                    &request,
+                    started,
+                    PlatformResponse::Error {
+                        error: work_runtime_error(AgentError::Internal(format!(
+                            "checkpoint serialization failed: {error}"
+                        ))),
+                    },
+                );
+            }
+        };
+        match store.write_atomic(&bytes).await {
+            Ok(stored) => {
+                let value = WorkCheckpointResponse {
+                    artifact: stored.artifact,
+                    payload_bytes: bytes.len() as u64,
+                    checkpoint_version: version,
+                    run_id,
+                    tasks,
+                };
+                self.checkpoint_response(&request, started, PlatformResponse::Success { value })
+            }
+            Err(error) => self.checkpoint_response(
+                &request,
+                started,
+                PlatformResponse::Error {
+                    error: work_runtime_error(error),
+                },
+            ),
+        }
+    }
+
+    /// F5: restore one checkpoint through the full cross-plane transaction.
+    /// The artifact is resolved inside the run's store (never an arbitrary
+    /// path), its envelope is verified before any state is touched, and a
+    /// refused artifact fails closed rather than half-restoring.
+    pub async fn restore(
+        &self,
+        request: PlatformEnvelope<WorkRestoreRequest>,
+    ) -> AgentResult<PlatformEnvelope<PlatformResponse<WorkRestoreResponse>>> {
+        validate_work_restore_request(&self.profile, &request)
+            .map_err(|error| AgentError::InvalidRequest(error.to_string()))?;
+        let started = Instant::now();
+        if !self.is_authorized(WorkControlAction::Restore, &request) {
+            return self.restore_response(
+                &request,
+                started,
+                PlatformResponse::Error {
+                    error: forbidden_error(),
+                },
+            );
+        }
+        let Some((plane, store)) = &self.checkpoints else {
+            return self.restore_response(
+                &request,
+                started,
+                PlatformResponse::Error {
+                    error: checkpoint_plane_unavailable(),
+                },
+            );
+        };
+        let resolved = match &request.payload.artifact {
+            Some(artifact) => resolve_named_checkpoint(store, artifact).await,
+            None => resolve_latest_verified_in_store(store).await,
+        };
+        let (artifact, checkpoint) = match resolved {
+            Ok(resolved) => resolved,
+            Err(error) => {
+                return self.restore_response(
+                    &request,
+                    started,
+                    PlatformResponse::Error {
+                        error: work_runtime_error(error),
+                    },
+                );
+            }
+        };
+        let version = checkpoint.version;
+        let restored_run_id = checkpoint.run_metadata.run_id;
+        // The restore transaction owns its own internal bounds (prepare,
+        // capability apply, durable commit). Wrapping it in the router's short
+        // request deadline could abandon it mid-transaction, so it is awaited
+        // to completion and the connection's own framing bounds the wait.
+        match plane.restore(checkpoint).await {
+            Ok(()) => {
+                // EXEC-6: a successful restore may still leave earlier evidence
+                // unreadable. That degradation is reported, never hidden behind
+                // the success.
+                let evidence_degraded = self
+                    .runtime
+                    .status_snapshot()
+                    .await
+                    .map(|status| status.restore_evidence_degraded)
+                    .unwrap_or_default();
+                let value = WorkRestoreResponse {
+                    artifact,
+                    checkpoint_version: version,
+                    restored_run_id,
+                    evidence_degraded,
+                };
+                self.restore_response(&request, started, PlatformResponse::Success { value })
+            }
+            Err(error) => self.restore_response(
                 &request,
                 started,
                 PlatformResponse::Error {
@@ -562,6 +1042,49 @@ impl WorkControlRouter {
             // EXEC-6 (R2-02): the typed status snapshot re-serves the last
             // restore's evidence degradation so clients can re-obtain it.
             restore_evidence_degraded: status.restore_evidence_degraded.clone(),
+            // F5: the configuration in force pairs the host's own choices with
+            // the round budget the kernel is actually enforcing.
+            effective_config: self.run_config.as_ref().map(|config| WorkRunConfig {
+                context_policy: config.context_policy.clone(),
+                max_model_rounds: u32::try_from(status.max_model_rounds).unwrap_or(u32::MAX),
+                max_model_rounds_source: if config.max_model_rounds_from_cli {
+                    "cli".to_owned()
+                } else {
+                    "kernel_default".to_owned()
+                },
+                maintenance_max_calls_per_maintain: config.maintenance_max_calls_per_maintain,
+                maintenance_max_tokens_per_maintain: config.maintenance_max_tokens_per_maintain,
+                maintenance_timeout_secs: config.maintenance_timeout_secs,
+                provider_profile_digest: config.provider_profile_digest.clone(),
+                prompt_cache_mode: config.prompt_cache_mode.clone(),
+                read_only: config.read_only,
+            }),
+            // F5 (CTX-8 接线): the store-outage fact, re-served until a clean
+            // pass lifts it.
+            store_backpressure: status.store_backpressure.as_ref().map(|backpressure| {
+                WorkStoreBackpressure {
+                    active: backpressure.active,
+                    externalize_deferred: backpressure.externalize_deferred,
+                    store_io_failures: backpressure.store_io_failures,
+                }
+            }),
+            // F5: why a continuation would or would not start a turn.
+            continue_readiness: Some(WorkContinueReadiness {
+                can_continue: status.continue_readiness.can_continue,
+                reason: match status.continue_readiness.reason {
+                    crate::ContinueReason::Ready => WorkContinueReason::Ready,
+                    crate::ContinueReason::NoActiveTask => WorkContinueReason::NoActiveTask,
+                    crate::ContinueReason::TurnRunning => WorkContinueReason::TurnRunning,
+                    crate::ContinueReason::RecoveryRequired => WorkContinueReason::RecoveryRequired,
+                    crate::ContinueReason::CleanupInFlight => WorkContinueReason::CleanupInFlight,
+                    crate::ContinueReason::NoRetainedDirective => {
+                        WorkContinueReason::NoRetainedDirective
+                    }
+                    crate::ContinueReason::DirectiveMayBeTruncated => {
+                        WorkContinueReason::DirectiveMayBeTruncated
+                    }
+                },
+            }),
         };
         self.snapshot_response(&request, started, PlatformResponse::Success { value })
     }
@@ -1103,6 +1626,51 @@ impl WorkControlRouter {
         self.finish(request, started, payload, validate_work_cancel_response)
     }
 
+    fn steer_response(
+        &self,
+        request: &PlatformEnvelope<WorkSteerRequest>,
+        started: Instant,
+        payload: PlatformResponse<WorkSteerResponse>,
+    ) -> AgentResult<PlatformEnvelope<PlatformResponse<WorkSteerResponse>>> {
+        self.finish(request, started, payload, validate_work_steer_response)
+    }
+
+    fn activate_response(
+        &self,
+        request: &PlatformEnvelope<WorkActivateRequest>,
+        started: Instant,
+        payload: PlatformResponse<WorkActivateResponse>,
+    ) -> AgentResult<PlatformEnvelope<PlatformResponse<WorkActivateResponse>>> {
+        self.finish(request, started, payload, validate_work_activate_response)
+    }
+
+    fn suspend_response(
+        &self,
+        request: &PlatformEnvelope<WorkSuspendRequest>,
+        started: Instant,
+        payload: PlatformResponse<WorkSuspendResponse>,
+    ) -> AgentResult<PlatformEnvelope<PlatformResponse<WorkSuspendResponse>>> {
+        self.finish(request, started, payload, validate_work_suspend_response)
+    }
+
+    fn checkpoint_response(
+        &self,
+        request: &PlatformEnvelope<WorkCheckpointRequest>,
+        started: Instant,
+        payload: PlatformResponse<WorkCheckpointResponse>,
+    ) -> AgentResult<PlatformEnvelope<PlatformResponse<WorkCheckpointResponse>>> {
+        self.finish(request, started, payload, validate_work_checkpoint_response)
+    }
+
+    fn restore_response(
+        &self,
+        request: &PlatformEnvelope<WorkRestoreRequest>,
+        started: Instant,
+        payload: PlatformResponse<WorkRestoreResponse>,
+    ) -> AgentResult<PlatformEnvelope<PlatformResponse<WorkRestoreResponse>>> {
+        self.finish(request, started, payload, validate_work_restore_response)
+    }
+
     fn snapshot_response(
         &self,
         request: &PlatformEnvelope<WorkSnapshotRequest>,
@@ -1216,6 +1784,56 @@ impl WorkControlRouter {
             .map_err(|error: ValidationError| AgentError::Internal(error.to_string()))?;
         Ok(response)
     }
+}
+
+/// F5: a host that was composed without the cross-plane checkpoint seam says
+/// so. The alternative — writing the actor-only dump — would put a partial
+/// artifact on disk under the name of a complete checkpoint.
+fn checkpoint_plane_unavailable() -> PlatformError {
+    platform_error(
+        PlatformErrorClass::Domain,
+        "work.checkpoint_unavailable",
+        "this host serves no checkpoint plane; an actor-only dump is not a checkpoint",
+        RetryDisposition::Never,
+        EffectStateDisposition::NotApplied,
+    )
+}
+
+/// F5: resolve one named store artifact. The name was already refused if it
+/// looked like a path; the store re-checks it and verifies the envelope
+/// (checksum, bounds) before anything is decoded into runtime state.
+async fn resolve_named_checkpoint(
+    store: &crate::CheckpointStore,
+    artifact: &str,
+) -> AgentResult<(String, crate::checkpoint::RuntimeCheckpoint)> {
+    let payload = store.load_verified(artifact).await?;
+    let checkpoint = crate::decode_checkpoint_bytes(&payload)?;
+    Ok((artifact.to_owned(), checkpoint))
+}
+
+/// F5: the newest artifact that FULLY verifies, skipping invalid candidates
+/// visibly instead of restoring a guess. An empty store fails closed.
+async fn resolve_latest_verified_in_store(
+    store: &crate::CheckpointStore,
+) -> AgentResult<(String, crate::checkpoint::RuntimeCheckpoint)> {
+    let rows = store
+        .list(crate::checkpoint::MAX_CHECKPOINT_LIST_ROWS)
+        .await?;
+    if rows.is_empty() {
+        return Err(AgentError::InvalidRequest(
+            "no verifiable checkpoint exists in this run's store; capture one first".into(),
+        ));
+    }
+    let mut skipped = 0usize;
+    for row in &rows {
+        match resolve_named_checkpoint(store, &row.artifact).await {
+            Ok(resolved) => return Ok(resolved),
+            Err(_) => skipped += 1,
+        }
+    }
+    Err(AgentError::InvalidRequest(format!(
+        "all {skipped} checkpoint(s) in this run's store failed verification; refusing to restore"
+    )))
 }
 
 /// F12: the gate's own declared risk, mirrored into the protocol's tag.
