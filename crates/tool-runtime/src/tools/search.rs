@@ -282,6 +282,10 @@ async fn enumerate_candidates(
     budget: usize,
     cancel: &CancellationToken,
 ) -> AgentResult<CandidateBatch> {
+    // At least one candidate per batch: a zero-width batch could report
+    // "more candidates" without scanning any, which is a continuation that
+    // never advances.
+    let budget = budget.max(1);
     let mut heap: BinaryHeap<(String, PathBuf)> = BinaryHeap::new();
     let mut more_candidates = false;
     let mut enumeration_truncated = false;
