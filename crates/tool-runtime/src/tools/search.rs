@@ -378,7 +378,12 @@ impl Tool for SearchGrepTool {
                 "properties": {
                     "pattern": {"type": "string", "description": "Regular expression"},
                     "path": {"type": "string", "description": "Optional workspace-relative file or directory: a file is searched directly, a directory is searched recursively"},
-                    "limit": {"type": "integer", "minimum": 1, "maximum": 1000}
+                    "limit": {"type": "integer", "minimum": 1, "maximum": 1000},
+                    "scan_continuation": {
+                        "type": "string",
+                        "maxLength": 256,
+                        "description": "Opaque sealed handle from a previous PARTIAL scan's coverage footer. Pass it back VERBATIM together with the SAME pattern (the handle binds the original query: a different pattern or a widened path is refused) to resume scanning the files and lines that scan did not reach. Omit on a fresh search; never invent or edit one."
+                    }
                 }
             }),
             risk: ToolRisk::ReadOnly,
@@ -1583,6 +1588,80 @@ needle
     /// F4: the hit limit stops a scan inside a file. The continuation must
     /// resume at the next line of that same file, not re-page the hits the
     /// first batch already returned.
+    /// R7 (KV-cache audit, red-first): the scan continuation must be
+    /// MODEL-VISIBLE. The spec's input_schema declares the optional handle
+    /// (with a real length bound), the declaration survives the
+    /// model-facing surface compaction, and arguments built strictly from
+    /// the schema-declared properties dispatch through the public execute
+    /// path to the second batch — not just to an internal resume call.
+    #[tokio::test]
+    async fn spec_schema_declares_the_scan_continuation_and_schema_shaped_args_dispatch() {
+        let (workspace, dir) = temp_workspace().await;
+        let tool = SearchGrepTool::new(workspace);
+
+        let spec = tool.spec();
+        let property = spec.input_schema["properties"]["scan_continuation"]
+            .as_object()
+            .expect("scan_continuation must be declared in the model-visible input_schema (R7)");
+        assert_eq!(property["type"], "string");
+        let max_len = property["maxLength"].as_u64().expect("a length bound");
+        assert!(
+            (100..=512).contains(&max_len),
+            "the declared bound must cover the real sealed locator (~125 chars) without              being unbounded: {max_len}"
+        );
+
+        // The declaration survives model-facing surface compaction.
+        let compacted = spec.clone().compact_for_model_surface();
+        assert!(
+            compacted.input_schema["properties"]["scan_continuation"].is_object(),
+            "surface compaction must keep the scan_continuation declaration"
+        );
+
+        // Batch 1: force a PARTIAL scan and take the runtime-issued handle.
+        for index in 0..6 {
+            write(
+                dir.path(),
+                &format!("file_{index:02}.txt"),
+                &format!(
+                    "needle_{index:02} here
+"
+                ),
+            )
+            .await;
+        }
+        let run_id = RunId::new();
+        let first = grep_call(&tool, run_id, json!({"pattern": "needle_", "limit": 3})).await;
+        assert_eq!(first.metadata["scan_complete"], json!(false));
+        let handle = continuation(&first);
+        let handle_len = handle.len() as u64;
+        assert!(
+            handle_len <= max_len,
+            "the declared bound must cover the real handle ({} chars)",
+            handle.len()
+        );
+
+        // Batch 2: arguments built STRICTLY from the schema-declared
+        // properties (pattern + scan_continuation; limit and path omitted —
+        // both optional in the schema), dispatched through the public path.
+        let second = grep_call(
+            &tool,
+            run_id,
+            json!({"pattern": "needle_", "scan_continuation": handle}),
+        )
+        .await;
+        assert!(second.ok);
+        assert_eq!(second.metadata["hits"], 3);
+        assert!(
+            second.model_content.contains("file_03.txt")
+                || second.model_content.contains("file_04.txt")
+                || second.model_content.contains("file_05.txt"),
+            "the continuation must reach files the first batch never scanned: {}",
+            second.model_content
+        );
+        assert_eq!(second.metadata["hits_total"], 6);
+        assert_eq!(second.metadata["scan_complete"], json!(true));
+    }
+
     #[tokio::test]
     async fn a_continuation_finds_matches_after_the_hit_limit_in_one_file() {
         let (workspace, _dir) = temp_workspace().await;
