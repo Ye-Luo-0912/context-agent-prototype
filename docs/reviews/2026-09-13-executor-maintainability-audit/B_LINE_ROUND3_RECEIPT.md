@@ -50,7 +50,7 @@
 
 - 全部改动未提交、未推送、未跑远端 CI。
 - EXEC-9：服务根解析的「版本化」随引擎 checkpoint 格式自身版本走（Simple 引擎 serde 兼容）；未做长跑 soak。
-- EXEC-10：restore 拒绝是确定性 busy——「完整结算后自动恢复」未做（调用方重试即可，语义等价）；busy 内联路径在门控测试下会阻塞 actor 至 gate 释放（真实引擎下有界）。
+- EXEC-10：restore 拒绝是确定性 busy——「完整结算后自动恢复」未做（调用方重试即可，语义等价）；busy 内联路径在门控测试下会阻塞 actor 至 gate 释放（真实引擎下有界）。**已按设计收口（2026-09-13 补充）**：拒绝→停靠 commit 结算→同一 restore 重试成功的端到端闭环由 `restore_is_refused_while_a_terminal_commit_is_parked` 的重试段回归证明（capture 已提交状态→restore 成功→completed 记录在往返后保留）。`prepare_restore` 内不做自动等待是有意设计：停靠事务的 resume 依赖 actor 循环泵完成通道，restore 内联等待会死锁并违反 EXEC-7 命令分支纪律；语义等价的「结算后重试」由调用方执行且回归证明必然成功。
 - EXEC-8 残余：字节窗口 8 MiB 为常量，未做成配置；超大行只会 fail-closed，不会截断服务。
 - CTX-8 接线：限制点目前只覆盖 working-set 预热信号（投递路径不受影响）；「按批 drain 后解除背压」依赖引擎既有机制。共享树并行线（COST-7 的 `OperationOutcome::Failed.usage`、provider-openai 流式 usage 携带）编辑中间态由 B 线机械收敛。
 - 本轮未调用付费模型；真实 provider 照旧 NOT_RUN。
