@@ -66,6 +66,45 @@ fn watch_stream_to_eof_then_kill<R: std::io::Read>(stream: &mut R, leader: i32) 
     let _ = unsafe { libc::kill(0, libc::SIGKILL) };
 }
 
+/// A transient fork/exec resource failure (clone EAGAIN under fork-bomb
+/// guards, ENOMEM under memory pressure) must not permanently strip
+/// containment from an already-running child: the caller degrades to no
+/// containment on an arm error, so a single unlucky clone silently orphans
+/// the whole watched tree (observed as CI run 34754942152's exact proof
+/// tree outliving a SIGKILLed host with no watchdog ever forked). The arm
+/// therefore retries only the transient error class, a bounded number of
+/// times, before surfacing the failure.
+#[cfg(unix)]
+const ARM_SPAWN_ATTEMPTS: u32 = 3;
+#[cfg(unix)]
+const ARM_SPAWN_RETRY_BACKOFF: std::time::Duration = std::time::Duration::from_millis(100);
+/// Run `spawn`, retrying only transient OS resource failures. Permanent
+/// failures (a missing executable, a refused group) return immediately.
+#[cfg(unix)]
+fn spawn_watchdog_with_transient_retry(
+    mut spawn: impl FnMut() -> std::io::Result<std::process::Child>,
+) -> std::io::Result<std::process::Child> {
+    let mut attempt = 1;
+    loop {
+        match spawn() {
+            Ok(child) => return Ok(child),
+            Err(error) if attempt < ARM_SPAWN_ATTEMPTS && is_transient_spawn_failure(&error) => {
+                attempt += 1;
+                std::thread::sleep(ARM_SPAWN_RETRY_BACKOFF);
+            }
+            Err(error) => return Err(error),
+        }
+    }
+}
+
+#[cfg(unix)]
+fn is_transient_spawn_failure(error: &std::io::Error) -> bool {
+    matches!(
+        error.raw_os_error(),
+        Some(libc::EAGAIN) | Some(libc::ENOMEM)
+    )
+}
+
 /// The host-side handle. Held for the whole watched run; dropping it is
 /// the disarm path.
 #[cfg(unix)]
@@ -170,20 +209,26 @@ impl HostDeathWatchdog {
         let (read_half, write_half) = std::os::unix::net::UnixStream::pair()?;
         // Do not set kill_on_drop: dropping the Child must not SIGKILL the
         // watchdog — Drop closes the write half and waits instead.
-        let child = Command::new(exe)
-            .env(WATCHDOG_ENV, leader.to_string())
-            // The read half becomes the watchdog's stdin: EOF there is the
-            // host's death. The write half never leaves this process (both
-            // pair ends are close-on-exec), so the pipe has exactly two
-            // holders.
-            .stdin(Stdio::from(std::os::fd::OwnedFd::from(read_half)))
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            // Join before exec, while the child identity is still owned.
-            // The watched group is separate from the host's foreground
-            // group, so host-only signals do not stop this watchdog.
-            .process_group(leader as i32)
-            .spawn()?;
+        let child = spawn_watchdog_with_transient_retry(|| {
+            // A fresh dup per attempt: a failed attempt consumes its own
+            // Stdio copy while the original stays owned here, so the pipe
+            // still ends with exactly two holders after the winning spawn.
+            let stdin_half = read_half.try_clone()?;
+            Command::new(exe)
+                .env(WATCHDOG_ENV, leader.to_string())
+                // The read half becomes the watchdog's stdin: EOF there is
+                // the host's death. The write half never leaves this
+                // process (both pair ends are close-on-exec).
+                .stdin(Stdio::from(std::os::fd::OwnedFd::from(stdin_half)))
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                // Join before exec, while the child identity is still owned.
+                // The watched group is separate from the host's foreground
+                // group, so host-only signals do not stop this watchdog.
+                .process_group(leader as i32)
+                .spawn()
+        })?;
+        drop(read_half);
         Ok(Self {
             write_half: Some(write_half),
             child: Some(child),
@@ -338,6 +383,48 @@ mod tests {
                 unsafe { libc::getpgrp() } as u32,
             )
             .is_err()
+        );
+    }
+
+    /// A transient clone failure (EAGAIN/ENOMEM under runner pressure) must
+    /// not permanently strip containment from an already-running child: the
+    /// arm retries the transient class until it arms. Without the retry the
+    /// first assertion's spawner would surface its EAGAIN as a final arm
+    /// error and the caller would silently degrade to no containment.
+    #[test]
+    fn transient_spawn_failures_are_retried_until_the_watchdog_arms() {
+        let mut transient_failures = 2_u32;
+        let mut child = spawn_watchdog_with_transient_retry(|| {
+            if transient_failures > 0 {
+                transient_failures -= 1;
+                return Err(std::io::Error::from_raw_os_error(libc::EAGAIN));
+            }
+            Command::new("/bin/cat").stdin(Stdio::null()).spawn()
+        })
+        .expect("a transiently failing spawn must eventually arm");
+        assert_eq!(
+            transient_failures, 0,
+            "the spawn was retried, not abandoned"
+        );
+        let _ = child.kill();
+        let _ = child.wait();
+    }
+
+    /// Permanent failures are not retried: the caller sees the real error
+    /// immediately instead of a delayed degrade with the child uncontained.
+    #[test]
+    fn permanent_spawn_failures_return_without_retry() {
+        let start = Instant::now();
+        let mut attempts = 0_u32;
+        let result = spawn_watchdog_with_transient_retry(|| {
+            attempts += 1;
+            Err(std::io::Error::from_raw_os_error(libc::ENOENT))
+        });
+        assert!(result.is_err());
+        assert_eq!(attempts, 1, "a permanent failure must not be retried");
+        assert!(
+            start.elapsed() < Duration::from_millis(500),
+            "a permanent failure must return without the retry backoff"
         );
     }
 }

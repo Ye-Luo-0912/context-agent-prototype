@@ -475,6 +475,45 @@ fn linux_identity_token(pid: u32) -> Result<String, String> {
     linux_token_from_stat(pid, &stat)
 }
 
+/// Linux: live (non-zombie) members of the process group `pgid`, observed
+/// read-only through /proc. Supervision diagnostics identify containment
+/// processes by group membership — the host-death watchdog has no name and
+/// must never be matched by a pid number. Unreadable entries (a process
+/// that exited during the scan, or hidden by proc permissions) are skipped:
+/// this is an observation helper, and a missed member must surface through
+/// the caller's own bounded wait, never through a fabricated pid here.
+#[cfg(target_os = "linux")]
+pub fn process_group_members(pgid: u32) -> Result<Vec<u32>, String> {
+    let entries = std::fs::read_dir("/proc").map_err(|error| format!("read /proc: {error}"))?;
+    let mut members = Vec::new();
+    for entry in entries.flatten() {
+        let Ok(name) = entry.file_name().into_string() else {
+            continue;
+        };
+        let Ok(pid) = name.parse::<u32>() else {
+            continue;
+        };
+        let Ok(stat) = std::fs::read_to_string(format!("/proc/{pid}/stat")) else {
+            continue;
+        };
+        let Some((_, fields)) = stat.rsplit_once(')') else {
+            continue;
+        };
+        let mut fields = fields.split_whitespace();
+        match fields.next() {
+            // A zombie still occupies its group but can never observe its
+            // pipe or signal anyone: not a live containment member.
+            Some("Z") | Some("X") | None => continue,
+            _ => {}
+        }
+        // After the state field: ppid, then pgrp.
+        if fields.nth(1).and_then(|pgrp| pgrp.parse::<u32>().ok()) == Some(pgid) {
+            members.push(pid);
+        }
+    }
+    Ok(members)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -40,6 +40,8 @@ pub use host::{
 };
 #[cfg(unix)]
 pub use host::{apply_unix_rlimits, close_inherited_fds};
+#[cfg(target_os = "linux")]
+pub use lifecycle::process_group_members;
 pub use lifecycle::{
     ProcessCleanupOutcome, ProcessIdentity, ProcessState, capture_process_identity,
     inspect_process, kill_matching_process_tree, process_identity_matches, process_is_running,
