@@ -23,3 +23,8 @@ apps/**/obj/
 .idea/
 /target-host
 /bash.exe.stackdump
+
+# Local tool state and Python caches (not part of any deliverable).
+.trae/
+__pycache__/
+.workbuddy/
