@@ -1610,7 +1610,7 @@ impl ContextEngine for SimpleContextEngine {
         &self,
         checkpoint: &Value,
     ) -> AgentResult<Vec<ContextItemId>> {
-        Ok(crate::checkpoint::recovery_item_ids(checkpoint))
+        crate::checkpoint::recovery_item_ids(checkpoint)
     }
 
     async fn materialize(&self, query: ContextQuery) -> AgentResult<MaterializedContext> {
@@ -2150,41 +2150,29 @@ impl ContextEngine for SimpleContextEngine {
     async fn restore(&self, data: Value) -> AgentResult<()> {
         // Whole-state replacement must not interleave with a multi-phase
         // plan: a GC plan computed before the restore would otherwise
-        // commit stale transitions against the restored state.
+        // commit stale transitions against the restored state. op_gate
+        // serializes this with GC/checkpoint/other restore; the state lock
+        // is taken only to install a fully validated candidate.
         let _gate = self.op_gate.lock().await;
-        let mut state = self.state.lock().await;
         // Deserialize and structurally validate the replacement before it
         // becomes live: a corrupt or hostile checkpoint must not clobber the
-        // running state. Only a valid snapshot is committed into the lock.
-        let spilled = checkpoint::spilled_entries_from_value(&data);
+        // running state. Present-but-invalid spill rows and duplicate spill
+        // ownership are structural contradictions (reject, no mutation),
+        // distinct from missing/corrupt cards (honest degrade).
+        let spilled = checkpoint::spilled_entries_from_value(&data)?;
         let mut next = checkpoint::deserialize(data)?;
         checkpoint::validate(&next)?;
+        checkpoint::reject_duplicate_spill_ownership(&next, &spilled)?;
         // CTX-9 残余：外置尾重水化——分片 checkpoint 只携带内联段，卡片
         // 由这里从既有 store 读回。op_gate 已把整个 restore 与 GC/其他
-        // restore 串行化：放掉 state 锁做卡片 IO 不会交错任何结构变更。
+        // restore 串行化：卡片 IO 不持 state 锁，不会交错任何结构变更。
         // 卡片缺失/损坏（典型：已过保留窗的旧 checkpoint，其条目随后被
         // Storage GC 删除）→ 该条目缺席＋计数如实上报，恢复整体不失败
         // ——与旧 checkpoint 的 blob 缺失同一诚实降级，绝不伪造完整。
-        let mut missing_cards: u64 = 0;
-        let mut rehydrated: Vec<agent_contracts::ExternalizedContext> = Vec::new();
         if !spilled.is_empty() {
-            let mut owned: std::collections::HashSet<ContextItemId> =
-                next.external.iter().map(|entry| entry.item_id).collect();
-            for item in next.items.iter() {
-                owned.insert(item.id);
-            }
-            for (id, _hash) in &spilled {
-                if owned.contains(id) {
-                    // 分片清单声称的 id 已被内联段（external 或 heap）持有：
-                    // 结构性矛盾，fail-closed（敌意/损坏 checkpoint，不是
-                    // 旧格式）——重水化会造成同一 id 双 owner。
-                    return Err(AgentError::Context(format!(
-                        "checkpoint external entry {id} is both spilled and already owned"
-                    )));
-                }
-            }
-            drop(state);
             let dir = crate::store::store_dir(&self.config);
+            let mut missing_cards: u64 = 0;
+            let mut rehydrated: Vec<agent_contracts::ExternalizedContext> = Vec::new();
             for (id, hash) in &spilled {
                 let path = crate::store::external_card_path(&dir, *id, hash);
                 match crate::store::read_external_card_async(&path, *id).await {
@@ -2193,8 +2181,19 @@ impl ContextEngine for SimpleContextEngine {
                     _ => missing_cards += 1,
                 }
             }
-            state = self.state.lock().await;
+            if !rehydrated.is_empty() || missing_cards > 0 {
+                let mut entries: Vec<agent_contracts::ExternalizedContext> =
+                    next.external.take_all();
+                entries.extend(rehydrated);
+                entries.sort_by_key(|entry| entry.externalized_at_tick);
+                next.external.replace_all(entries);
+                next.external_cards_missing =
+                    next.external_cards_missing.saturating_add(missing_cards);
+            }
+            next.sync_catalog();
+            checkpoint::validate(&next)?;
         }
+        let mut state = self.state.lock().await;
         // The revision is a process-lifetime nonce, not rollbackable task
         // state. Keeping the larger live value prevents restore from reusing
         // a preview id and accepting a delayed pre-restore acknowledgement
@@ -2202,15 +2201,6 @@ impl ContextEngine for SimpleContextEngine {
         next.materialization_revision = next
             .materialization_revision
             .max(state.materialization_revision);
-        // 重水化的条目按外置序并入 external map（卡片捕获时即外置序），
-        // ExternalMap::replace_all 的重建会重建全部索引。
-        if !rehydrated.is_empty() || missing_cards > 0 {
-            let mut entries: Vec<agent_contracts::ExternalizedContext> = next.external.take_all();
-            entries.extend(rehydrated);
-            entries.sort_by_key(|entry| entry.externalized_at_tick);
-            next.external.replace_all(entries);
-            next.external_cards_missing = next.external_cards_missing.saturating_add(missing_cards);
-        }
         *state = next;
         state.sync_catalog();
         crate::reactivation::clear_segment(&mut state);
