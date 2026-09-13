@@ -107,6 +107,7 @@ pub async fn build_context_engine(
     model: Option<Arc<dyn ModelTransport>>,
     maintenance_model: Option<Arc<dyn ModelTransport>>,
     budget: &MaintenanceBudget,
+    maintenance_cache_key: Option<String>,
 ) -> anyhow::Result<Arc<dyn ContextEngine>> {
     // COST-4 (D02): the optional maintenance transport owns the compactor —
     // its timeout (and the request-level output cap) are the maintenance
@@ -116,9 +117,10 @@ pub async fn build_context_engine(
     // attached at all — zero budget never sends, and the budget's count/
     // token/backoff values flow into the engine's own per-pass limits.
     let compactor = if budget.allows_calls() {
-        maintenance_model
-            .or(model)
-            .map(|model| Arc::new(ModelBackedCompactor::new(model)) as Arc<dyn BoundedCompactor>)
+        maintenance_model.or(model).map(|model| {
+            Arc::new(ModelBackedCompactor::new(model).with_cache_key(maintenance_cache_key))
+                as Arc<dyn BoundedCompactor>
+        })
     } else {
         None
     };
@@ -587,6 +589,10 @@ pub struct ComposeConfig {
     /// into every checkpoint's run metadata. `None` for demo/mock or
     /// harness compositions that record the tuple in their own manifests.
     pub provider_profile_digest: Option<String>,
+    /// N04: the composition root's stable cache-routing namespace. When
+    /// present, every main-lane model request carries the derived per-task
+    /// routing key; `None` keeps requests keyless.
+    pub cache_routing: Option<agent_contracts::PromptCacheRouting>,
     /// Opt-in: run the completion-time host proof refresh outside the
     /// actor loop and resume the parked completion when it finishes.
     /// `false` (default) keeps the historical inline refresh with its
@@ -723,6 +729,7 @@ pub async fn compose_with_prompt_layout(
 ) -> anyhow::Result<ComposedRuntime> {
     let ComposeConfig {
         provider_profile_digest: provider_profile_digest_in,
+        cache_routing: cache_routing_in,
         defer_proof_refresh,
         shadow_context_frame,
         workspace,
@@ -906,6 +913,9 @@ pub async fn compose_with_prompt_layout(
     if let Some(digest) = provider_profile_digest_in {
         services.set_provider_profile_digest(digest);
     }
+    if let Some(routing) = cache_routing_in {
+        services.set_cache_routing(routing);
+    }
     services = services.with_defer_proof_refresh(defer_proof_refresh);
     services = services.with_shadow_context_frame(shadow_context_frame);
     if let Some(artifact_store) = artifact_store_for_services {
@@ -1010,6 +1020,7 @@ mod tests {
             Arc::new(BuiltinToolDispatcher::new(workspace.clone()).unwrap());
         ComposeConfig {
             provider_profile_digest: None,
+            cache_routing: None,
             defer_proof_refresh: false,
             shadow_context_frame: false,
             workspace,
@@ -1300,6 +1311,7 @@ mod tests {
             Some(main),
             Some(Arc::new(FailingMaintenance)),
             &MaintenanceBudget::default(),
+            None,
         )
         .await
         .unwrap();
@@ -1386,6 +1398,7 @@ mod maintenance_budget_tests {
             Some(Arc::new(ZeroBudgetModel)),
             None,
             &zero,
+            None,
         )
         .await
         .unwrap();

@@ -513,15 +513,37 @@ impl ModelInput {
         // messages — instead of the whole context frame; the volatile
         // projections beyond it (foreground, misses, external, restored)
         // then never move the declared prefix when they change.
-        let declared_len = if self.layout == PromptLayout::CurrentStateLast {
+        //
+        // N06: the declared counts are PUBLIC and deserializable, so they
+        // are validated against the layer they index BEFORE any slicing —
+        // checked arithmetic, and base+epoch may not exceed the context
+        // frame they name. An illegal declaration abandons the cache hint
+        // entirely (prefix falls back to the stable system policy, no
+        // breakpoints): the messages stay complete and unchanged, the turn
+        // region is never claimed stable, and an invalid hint is not
+        // rewarded with the legacy whole-frame prefix.
+        let (declared_len, declared_split) = if self.layout == PromptLayout::CurrentStateLast {
             match self.evidence_split {
-                Some(split) => self.system_policy.len() + split.base + split.epoch,
-                None => self.system_policy.len() + self.context_frame.len(),
+                Some(split) => {
+                    let epoch_end = split
+                        .base
+                        .checked_add(split.epoch)
+                        .filter(|end| *end <= self.context_frame.len());
+                    match epoch_end {
+                        Some(end) => (self.system_policy.len() + end, true),
+                        None => (self.system_policy.len(), false),
+                    }
+                }
+                // N05: `None` is the LEGACY serialized-input compatibility
+                // shape only — the whole context frame stays reusable, the
+                // historical behavior. New assembler output always declares
+                // an explicit split (Some{0,0} for an empty stable set), so
+                // an empty selection is never confused with an old format.
+                None => (self.system_policy.len() + self.context_frame.len(), false),
             }
         } else {
-            self.system_policy.len()
+            (self.system_policy.len(), false)
         };
-        let declared_split = self.evidence_split.is_some();
         let messages = self.into_messages();
         let prefix_len = messages[..declared_len]
             .iter()
@@ -1316,6 +1338,117 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(plain.turn_frame_wire_messages().len(), 5);
+    }
+
+    /// N06 (red-first): an ILLEGAL declared split (unchecked overflow or a
+    /// count past the layer it indexes) must not panic, must not change the
+    /// messages, and must not be rewarded with the legacy whole-frame
+    /// prefix — the cache hint is abandoned, never silently extended over
+    /// the volatile turn region.
+    #[test]
+    fn illegal_evidence_splits_are_rejected_without_panicking() {
+        let build = |split: EvidenceSplit| {
+            let input = ModelInput {
+                layout: PromptLayout::CurrentStateLast,
+                system_policy: vec![
+                    ModelMessage::system("policy"),
+                    ModelMessage::system("facts"),
+                ],
+                context_frame: vec![
+                    ModelMessage::user("epoch evidence"),
+                    ModelMessage::user("volatile foreground"),
+                ],
+                evidence_split: Some(split),
+                ..ModelInput::default()
+            };
+            input.into_request(serde_json::Value::Null, CancellationToken::new())
+        };
+
+        for split in [
+            // Overflow: base + epoch does not fit usize.
+            EvidenceSplit {
+                base: usize::MAX,
+                epoch: 1,
+            },
+            // Past the indexed layer.
+            EvidenceSplit { base: 3, epoch: 0 },
+            EvidenceSplit { base: 0, epoch: 3 },
+        ] {
+            let request = build(split);
+            assert!(
+                request.cache_breakpoints.is_empty(),
+                "an illegal split abandons the cache hint: {split:?}"
+            );
+            // Any surviving boundary hint may only claim the stable system
+            // policy — never the volatile frame the illegal split pointed
+            // at.
+            if let Some(boundary) = request.prompt_reuse_boundary() {
+                assert!(
+                    boundary.message_count() <= 2,
+                    "no prefix hint may claim the volatile frame: {split:?}"
+                );
+            }
+        }
+
+        // The messages themselves stay complete and unchanged through every
+        // rejected declaration.
+        let reference = ModelInput {
+            layout: PromptLayout::CurrentStateLast,
+            system_policy: vec![
+                ModelMessage::system("policy"),
+                ModelMessage::system("facts"),
+            ],
+            context_frame: vec![
+                ModelMessage::user("epoch evidence"),
+                ModelMessage::user("volatile foreground"),
+            ],
+            ..ModelInput::default()
+        };
+        let expected: Vec<_> = reference
+            .into_messages()
+            .into_iter()
+            .map(|message| (message.role, message.content.clone()))
+            .collect();
+        for split in [
+            EvidenceSplit {
+                base: usize::MAX,
+                epoch: 1,
+            },
+            EvidenceSplit { base: 3, epoch: 0 },
+        ] {
+            let request = build(split);
+            let actual: Vec<_> = request
+                .messages
+                .iter()
+                .map(|message| (message.role, message.content.clone()))
+                .collect();
+            assert_eq!(actual, expected, "messages unchanged for {split:?}");
+        }
+    }
+
+    /// N06: a split that names EXACTLY the whole context frame is legal —
+    /// the declared prefix covers system policy plus both frame messages,
+    /// and the breakpoint list names the validated boundary.
+    #[test]
+    fn an_exact_boundary_split_stays_valid() {
+        let input = ModelInput {
+            layout: PromptLayout::CurrentStateLast,
+            system_policy: vec![
+                ModelMessage::system("policy"),
+                ModelMessage::system("facts"),
+            ],
+            context_frame: vec![ModelMessage::user("epoch evidence")],
+            evidence_split: Some(EvidenceSplit { base: 0, epoch: 1 }),
+            ..ModelInput::default()
+        };
+        let request = input.into_request(serde_json::Value::Null, CancellationToken::new());
+        // Breakpoints name last-non-empty message indexes: B0 ends the
+        // system policy (index 1), B1 ends the declared prefix (index 2).
+        assert_eq!(request.cache_breakpoints, vec![1, 2]);
+        let boundary = request
+            .prompt_reuse_boundary()
+            .expect("the exact boundary binds a real prefix");
+        assert_eq!(boundary.message_count(), 3);
     }
 
     #[test]

@@ -197,6 +197,7 @@ async fn drive_cell(
         Arc::new(SimpleContextEngine::new(SimpleContextConfig::default()));
     let composed = compose(ComposeConfig {
         provider_profile_digest: None,
+        cache_routing: None,
         defer_proof_refresh: false,
         shadow_context_frame: false,
         workspace,

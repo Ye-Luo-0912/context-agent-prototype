@@ -82,6 +82,63 @@ impl ModelRequest {
     }
 }
 
+/// N04: the composition root's STABLE cache-routing namespace — who owns
+/// the endpoint/workspace pair a task runs in. The key derived from it is
+/// an opaque routing string: stable across the rounds and restores of one
+/// task, different across isolation domains, never derived from request
+/// content (no per-round UUID, no prompt digest). Components come from the
+/// composition root because it — not a model alias or a compatible URL —
+/// knows which endpoint/workspace it actually configured.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PromptCacheRouting {
+    /// Deployment-level isolation namespace (opaque to the provider).
+    pub isolation: String,
+    /// The workspace this task runs against (canonical root or its digest).
+    pub workspace: String,
+    /// The serving endpoint identity (base URL or the profile digest).
+    pub endpoint: String,
+}
+
+/// Component bounds keep the derived key a bounded, opaque routing string
+/// on the wire — a hostile configuration cannot turn it into an unbounded
+/// header.
+const ROUTING_COMPONENT_MAX_CHARS: usize = 256;
+const ROUTING_KEY_MAX_CHARS: usize = 1024;
+
+impl PromptCacheRouting {
+    fn bounded(component: &str) -> String {
+        let trimmed = component.trim();
+        if trimmed.chars().count() <= ROUTING_COMPONENT_MAX_CHARS {
+            trimmed.to_string()
+        } else {
+            // Oversized components are digested, not truncated: a cut
+            // string could collide with a different real component's
+            // prefix.
+            use sha2::{Digest, Sha256};
+            let digest = Sha256::digest(trimmed.as_bytes());
+            format!("sha256:{:x}", digest)[..64].to_string()
+        }
+    }
+
+    /// The stable routing key for one task on one call lane.
+    pub fn key_for(&self, task: &str, lane: &str) -> String {
+        let key = format!(
+            "{}|{}|{}|{}|{}",
+            Self::bounded(&self.isolation),
+            Self::bounded(&self.workspace),
+            Self::bounded(&self.endpoint),
+            Self::bounded(task),
+            Self::bounded(lane),
+        );
+        if key.chars().count() <= ROUTING_KEY_MAX_CHARS {
+            key
+        } else {
+            key.chars().take(ROUTING_KEY_MAX_CHARS).collect()
+        }
+    }
+}
+
 struct DigestWriter(Sha256);
 
 impl Write for DigestWriter {

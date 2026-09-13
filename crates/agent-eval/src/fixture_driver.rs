@@ -1101,6 +1101,7 @@ async fn run_workspace_session_harness_ops(
 
     let composed = agent_compose::compose(agent_compose::ComposeConfig {
         provider_profile_digest: None,
+        cache_routing: None,
         defer_proof_refresh: false,
         shadow_context_frame: false,
         workspace,

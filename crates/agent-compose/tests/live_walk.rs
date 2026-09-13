@@ -159,6 +159,7 @@ async fn product_compose(
         Some(model.clone()),
         None,
         &agent_compose::MaintenanceBudget::default(),
+        None,
     )
     .await?;
     let journal = Arc::new(FileEventJournal::open(workspace.state_dir().join("traces")).await?);
@@ -181,6 +182,7 @@ async fn product_compose(
         .join("broker-reservations.jsonl");
     compose(ComposeConfig {
         provider_profile_digest: None,
+        cache_routing: None,
         defer_proof_refresh: false,
         shadow_context_frame: false,
         workspace,

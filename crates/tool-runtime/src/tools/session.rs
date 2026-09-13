@@ -45,17 +45,85 @@ const MAX_SESSIONS: usize = 16;
 /// process exit and pipe EOF are two different events, and a poll must not
 /// report "exited" until the readers are at EOF so the model-facing tail
 /// is complete. When the bound bites (a reader wedged or heavily delayed,
-/// e.g. a grandchild holding the pipe open) the poll reports "running"
-/// instead — the output keeps accumulating in the session's tail, so a
-/// later poll drains it; "exited" therefore always means the tail is
-/// complete.
+/// e.g. a grandchild holding the pipe open) the poll reports
+/// `output_pending` instead — the output keeps accumulating in the
+/// session's tail, so a later poll drains it. A1 (N08): this is ONE
+/// absolute deadline for the whole post-exit sweep, not a fresh timeout
+/// per received chunk — a continuously writing descendant cannot extend
+/// it indefinitely.
 const EXIT_DRAIN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(1);
+
+/// A1 (N08): hard bounds for ONE poll's initial non-blocking sweep. The
+/// sweep must never run unbounded while `capture.record` awaits disk: the
+/// chunk/byte caps and the batch deadline stop the loop and leave the rest
+/// of the output in the channel for the next poll (`output_pending`).
+const POLL_BATCH_DEADLINE: std::time::Duration = std::time::Duration::from_secs(2);
+const POLL_MAX_CHUNKS: usize = 8192;
+const POLL_MAX_BYTES: usize = 8 * 1024 * 1024;
+
+/// A1 (N07): a process termination is a FACT, remembered once observed —
+/// it can never be misread as "running" again. Unix signal kills have
+/// `ExitStatus::code() == None`, which the old `Option<i32>` conflated
+/// with running.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ProcessTermination {
+    Exited {
+        code: i32,
+        success: bool,
+    },
+    /// Unix signal termination: `ExitStatus::code()` is None. Constructed
+    /// on unix only (Windows exit codes are always present), hence the
+    /// dead-code allowance on the windows build.
+    #[cfg_attr(not(unix), allow(dead_code))]
+    Signaled {
+        signal: i32,
+    },
+}
+
+impl ProcessTermination {
+    fn from_status(status: &std::process::ExitStatus) -> Option<Self> {
+        if let Some(code) = status.code() {
+            return Some(Self::Exited {
+                code,
+                success: status.success(),
+            });
+        }
+        #[cfg(unix)]
+        if let Some(signal) = std::os::unix::process::ExitStatusExt::signal(status) {
+            return Some(Self::Signaled { signal });
+        }
+        None
+    }
+
+    /// The model-facing label: poll API success and process success are
+    /// two different facts, and the model only sees `model_content`.
+    fn label(&self) -> String {
+        match self {
+            Self::Exited { code, success } => format!(
+                "{} (exit code {code})",
+                if *success { "success" } else { "failure" }
+            ),
+            Self::Signaled { signal } => format!("terminated by signal {signal}"),
+        }
+    }
+}
+
+/// What one poll's drain observed: how much output was collected, the
+/// process termination (if any) and whether output remains unread.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct DrainOutcome {
+    pub(crate) new_lines: usize,
+    pub(crate) termination: Option<ProcessTermination>,
+    pub(crate) output_pending: bool,
+}
 
 /// A running (or finished-but-unreaped) session: the live child plus the
 /// drained-output state. The output reader tasks keep pushing lines into
 /// the channel; `poll` drains them into the bounded tail and the artifact.
 pub(crate) struct ProcessSession {
     child: tokio::process::Child,
+    /// A1 (N07): remembered once observed — a terminal state is a fact.
+    termination: Option<ProcessTermination>,
     #[cfg(windows)]
     host_death_job: Option<super::process::host_death_job::HostDeathJob>,
     pub(crate) pid: u32,
@@ -63,26 +131,58 @@ pub(crate) struct ProcessSession {
     capture: StreamCapture,
     artifact_ref: String,
     /// 同一个 pinned draft 句柄贯穿整个 session；stop 时才封成 digest。
-    artifact: BufWriter<ArtifactDraft>,
+    artifact: Option<BufWriter<ArtifactDraft>>,
 }
 
 impl ProcessSession {
-    /// Drain the available output and report the session state. `Ok((n,
-    /// Some(code)))` means the child HAS exited and its tail was fully
-    /// drained; `Ok((n, None))` means it is still running.
+    /// Drain the available output and report the session state. The
+    /// termination fact is remembered once observed (N07): a signal-killed
+    /// child is `Signaled`, never "running".
     ///
     /// R05: pipe EOF is NOT process exit — a process can close its output and
     /// keep running — so "exited" is decided only by the child's actual state
-    /// (`try_wait`), never by the channel disconnecting. This path is bounded
-    /// (non-blocking try_recv plus a per-attempt timeout on the exited-drain)
-    /// and responds to `cancel`, so a live or wedged process never makes a
-    /// poll hang.
-    async fn drain(&mut self, cancel: &CancellationToken) -> AgentResult<(usize, Option<i32>)> {
+    /// (`try_wait`), never by the channel disconnecting.
+    ///
+    /// A1 (N08): every phase of this drain is hard-bounded — the initial
+    /// sweep by chunk/byte caps and a batch deadline, the post-exit sweep by
+    /// ONE absolute deadline (never re-armed per chunk) — and checks
+    /// `cancel` throughout. Whatever does not fit stays in the channel and
+    /// is reported as `output_pending`; nothing is dropped.
+    async fn drain(&mut self, cancel: &CancellationToken) -> AgentResult<DrainOutcome> {
         let mut new_lines = 0usize;
+        let mut chunks = 0usize;
+        let mut output_pending = false;
+        let start_bytes = self.capture.total_bytes();
+        let drained_bytes =
+            |capture: &StreamCapture| capture.total_bytes().saturating_sub(start_bytes);
+        let batch_deadline = tokio::time::Instant::now() + POLL_BATCH_DEADLINE;
+        // Initial non-blocking sweep, hard-bounded (A1/N08): chunk count,
+        // drained bytes and an absolute batch deadline all stop the loop;
+        // `capture.record`'s await can let the producer feed more, but the
+        // caps re-check after every chunk. Whatever is left stays in the
+        // channel (`output_pending`).
         loop {
+            if cancel.is_cancelled()
+                || chunks >= POLL_MAX_CHUNKS
+                || drained_bytes(&self.capture) >= POLL_MAX_BYTES
+                || tokio::time::Instant::now() >= batch_deadline
+            {
+                output_pending = true;
+                break;
+            }
             match self.rx.try_recv() {
                 Ok(chunk) => {
-                    if self.capture.record(chunk, &mut self.artifact).await? {
+                    chunks = chunks.saturating_add(1);
+                    if self
+                        .capture
+                        .record(
+                            chunk,
+                            self.artifact
+                                .as_mut()
+                                .expect("artifact lives until teardown"),
+                        )
+                        .await?
+                    {
                         new_lines = new_lines.saturating_add(1);
                     }
                 }
@@ -93,38 +193,69 @@ impl ProcessSession {
                 Err(mpsc::error::TryRecvError::Disconnected) => break,
             }
         }
-        match self
-            .child
-            .try_wait()
-            .map_err(|error| AgentError::Io(format!("inspect session child: {error}")))?
-        {
-            Some(status) => {
-                // The child genuinely exited. Drain the remaining buffered
-                // output (bounded and cancellable) so "exited" carries a
-                // complete model-facing tail; a wedged reader degrades to
-                // "running" rather than report an incomplete tail as exited.
-                loop {
-                    if cancel.is_cancelled() {
-                        return Ok((new_lines, None));
+        if self.termination.is_none() {
+            let status = self
+                .child
+                .try_wait()
+                .map_err(|error| AgentError::Io(format!("inspect session child: {error}")))?;
+            self.termination = status.as_ref().and_then(ProcessTermination::from_status);
+        }
+        if let Some(termination) = self.termination {
+            // The child genuinely exited. Drain the remaining buffered
+            // output under ONE absolute deadline (never re-armed per chunk)
+            // so "exited" carries a complete model-facing tail; a wedged or
+            // still-writing reader degrades to `output_pending` rather than
+            // an incomplete tail.
+            let deadline = tokio::time::Instant::now() + EXIT_DRAIN_TIMEOUT;
+            loop {
+                if cancel.is_cancelled()
+                    || chunks >= POLL_MAX_CHUNKS
+                    || drained_bytes(&self.capture) >= POLL_MAX_BYTES
+                {
+                    output_pending = true;
+                    break;
+                }
+                let now = tokio::time::Instant::now();
+                if now >= deadline {
+                    output_pending = true;
+                    break;
+                }
+                match tokio::time::timeout(deadline - now, self.rx.recv()).await {
+                    Ok(Some(chunk)) => {
+                        chunks = chunks.saturating_add(1);
+                        if self
+                            .capture
+                            .record(
+                                chunk,
+                                self.artifact
+                                    .as_mut()
+                                    .expect("artifact lives until teardown"),
+                            )
+                            .await?
+                        {
+                            new_lines = new_lines.saturating_add(1);
+                        }
                     }
-                    match tokio::time::timeout(EXIT_DRAIN_TIMEOUT, self.rx.recv()).await {
-                        Ok(Some(chunk)) => {
-                            if self.capture.record(chunk, &mut self.artifact).await? {
-                                new_lines = new_lines.saturating_add(1);
-                            }
-                        }
-                        Ok(None) => break, // all readers at EOF: the tail is complete
-                        Err(_) => {
-                            // Bounded: never block a poll forever, but never
-                            // claim "exited" with a possibly-incomplete tail.
-                            return Ok((new_lines, None));
-                        }
+                    Ok(None) => break, // all readers at EOF: the tail is complete
+                    Err(_) => {
+                        // Bounded: never block a poll forever, but never
+                        // claim a complete tail while output may remain.
+                        output_pending = true;
+                        break;
                     }
                 }
-                Ok((new_lines, status.code()))
             }
-            None => Ok((new_lines, None)), // still running
+            return Ok(DrainOutcome {
+                new_lines,
+                termination: Some(termination),
+                output_pending,
+            });
         }
+        Ok(DrainOutcome {
+            new_lines,
+            termination: None,
+            output_pending,
+        })
     }
 }
 
@@ -136,7 +267,11 @@ impl ProcessSession {
 /// its own reservation.
 pub(crate) enum SessionSlot {
     Pending,
-    Running(Box<ProcessSession>),
+    /// A1 (N08): the session state sits behind its OWN lock, so a poll's
+    /// bounded drain (artifact I/O included) holds only this session's
+    /// lock — the registry table stays free for concurrent stop/drain of
+    /// other sessions.
+    Running(Arc<tokio::sync::Mutex<ProcessSession>>),
 }
 
 /// The per-dispatcher session registry, shared by every
@@ -528,16 +663,17 @@ impl ProcessSessionTool {
         let child = guard.keep();
         self.sessions.lock().await.insert(
             session_id.clone(),
-            SessionSlot::Running(Box::new(ProcessSession {
+            SessionSlot::Running(Arc::new(tokio::sync::Mutex::new(ProcessSession {
                 child,
                 #[cfg(windows)]
                 host_death_job,
                 pid,
+                termination: None,
                 rx: line_rx,
                 capture: StreamCapture::new(),
                 artifact_ref: artifact_ref.clone(),
-                artifact: BufWriter::new(draft),
-            })),
+                artifact: Some(BufWriter::new(draft)),
+            }))),
         );
 
         Ok(ToolOutcome::Value(
@@ -573,13 +709,24 @@ impl ProcessSessionTool {
         let session_id = args.session_id.ok_or_else(|| {
             AgentError::InvalidRequest("process.session poll requires a session_id".into())
         })?;
-        // R05(c): take a SHORT lock to drain and snapshot the session, then
-        // drop it before any process-exit settle / persist — the whole table
-        // is never held while waiting. The drain itself is bounded and
-        // cancellable (R05(b)), so a live process cannot make a poll hang.
+        // R05(c) + A1 (N08): take a SHORT registry lock to clone the
+        // session handle, then drop the TABLE before any I/O — a poll's
+        // bounded drain and artifact flush hold only this session's lock,
+        // so stop/drain of OTHER sessions never queues behind it.
+        let live = {
+            let sessions = self.sessions.lock().await;
+            match sessions.get(&session_id) {
+                Some(SessionSlot::Running(live)) => live.clone(),
+                _ => {
+                    return Err(AgentError::InvalidRequest(format!(
+                        "process.session: no session '{session_id}' (unknown or already stopped)"
+                    )));
+                }
+            }
+        };
         let (
+            outcome,
             new_lines,
-            exit_code,
             pid,
             tail,
             total_lines,
@@ -588,21 +735,18 @@ impl ProcessSessionTool {
             artifact_truncated,
             artifact_ref,
         ) = {
-            let mut sessions = self.sessions.lock().await;
-            let Some(SessionSlot::Running(session)) = sessions.get_mut(&session_id) else {
-                return Err(AgentError::InvalidRequest(format!(
-                    "process.session: no session '{session_id}' (unknown or already stopped)"
-                )));
-            };
-            let (new_lines, exit_code) = session.drain(&cancel).await?;
+            let mut session = live.lock().await;
+            let outcome @ DrainOutcome { new_lines, .. } = session.drain(&cancel).await?;
             session
                 .artifact
+                .as_mut()
+                .expect("artifact lives until teardown")
                 .flush()
                 .await
                 .map_err(|e| AgentError::Io(format!("flush session artifact: {e}")))?;
             (
+                outcome,
                 new_lines,
-                exit_code,
                 session.pid,
                 session.capture.model_tail(),
                 session.capture.total_lines(),
@@ -613,11 +757,46 @@ impl ProcessSessionTool {
             )
         };
 
-        let (status, exit_code) = if let Some(code) = exit_code {
-            super::persist_process_exit(&self.workspace, pid, Some(code))?;
-            ("exited", Some(code))
+        // A1 (N07): the termination is a remembered fact (a signal kill is
+        // `Signaled`, never "running"), and the model-facing content says
+        // whether the process succeeded — poll API success and process
+        // success are two different facts.
+        let (status, termination, signal, success) = match outcome.termination {
+            Some(termination) => {
+                let signal = match termination {
+                    ProcessTermination::Signaled { signal } => Some(signal),
+                    _ => None,
+                };
+                let success = match termination {
+                    ProcessTermination::Exited { success, .. } => Some(success),
+                    _ => None,
+                };
+                if let ProcessTermination::Exited { code, .. } = termination {
+                    super::persist_process_exit(&self.workspace, pid, Some(code))?;
+                } else {
+                    super::persist_process_exit(&self.workspace, pid, None)?;
+                }
+                ("exited", Some(termination), signal, success)
+            }
+            None => ("running", None, None, None),
+        };
+        let exit_code = match termination {
+            Some(ProcessTermination::Exited { code, .. }) => Some(code),
+            _ => None,
+        };
+        let output_pending = outcome.output_pending;
+        let termination_note = match termination {
+            Some(termination) if status == "exited" => {
+                format!("; process {}", termination.label())
+            }
+            _ => String::new(),
+        };
+        let pending_note = if output_pending && status == "exited" {
+            "; output still pending (readers not at EOF)"
+        } else if output_pending {
+            "; output batch bounded, more output pending"
         } else {
-            ("running", None)
+            ""
         };
         let truncation_note = if artifact_truncated {
             format!(
@@ -639,13 +818,15 @@ impl ProcessSessionTool {
                 tool_name: "process.session".into(),
                 ok: true,
                 summary: format!(
-                    "session {session_id} {status} ({new_lines} new line(s), {total_lines} total{truncation_summary})",
+                    "session {session_id} {status} ({new_lines} new line(s), {total_lines} total{truncation_summary}{termination_note})",
                 ),
                 model_content: if new_lines == 0 && tail.is_empty() {
-                    format!("session {session_id} {status}; no output yet{truncation_note}")
+                    format!(
+                        "session {session_id} {status}{termination_note}{pending_note}; no output yet{truncation_note}"
+                    )
                 } else {
                     format!(
-                        "[session {session_id} {status}; {new_lines} new line(s); {total_lines} total]\n{tail}{truncation_note}",
+                        "[session {session_id} {status}{termination_note}{pending_note}; {new_lines} new line(s); {total_lines} total]\n{tail}{truncation_note}",
                     )
                 },
                 artifact_ref: Some(artifact_ref),
@@ -654,6 +835,9 @@ impl ProcessSessionTool {
                     "session_id": session_id,
                     "status": status,
                     "exit_code": exit_code,
+                    "signal": signal,
+                    "success": success,
+                    "output_pending": output_pending,
                     "new_lines": new_lines,
                     "total_lines": total_lines,
                     "output_bytes": output_bytes,
@@ -670,19 +854,31 @@ impl ProcessSessionTool {
         let session_id = args.session_id.ok_or_else(|| {
             AgentError::InvalidRequest("process.session stop requires a session_id".into())
         })?;
-        let mut sessions = self.sessions.lock().await;
-        let Some(SessionSlot::Running(session)) = sessions.remove(&session_id) else {
-            return Err(AgentError::InvalidRequest(format!(
-                "process.session: no session '{session_id}' (unknown or already stopped)"
-            )));
+        // A1 (N08): the table lock only guards the remove; teardown locks
+        // the session itself, so a concurrent poll of ANOTHER session is
+        // never blocked behind this session's kill/reap I/O.
+        let live = {
+            let mut sessions = self.sessions.lock().await;
+            match sessions.remove(&session_id) {
+                Some(SessionSlot::Running(live)) => live,
+                _ => {
+                    return Err(AgentError::InvalidRequest(format!(
+                        "process.session: no session '{session_id}' (unknown or already stopped)"
+                    )));
+                }
+            }
         };
-        let total_lines = session.capture.total_lines();
-        let output_bytes = session.capture.total_bytes();
-        let artifact_bytes = session.capture.artifact_bytes();
-        let artifact_truncated = session.capture.artifact_truncated();
-        drop(sessions);
-
-        let artifact_ref = teardown_session(&self.workspace, *session).await?;
+        let (total_lines, output_bytes, artifact_bytes, artifact_truncated, artifact_ref) = {
+            let mut session = live.lock().await;
+            let facts = (
+                session.capture.total_lines(),
+                session.capture.total_bytes(),
+                session.capture.artifact_bytes(),
+                session.capture.artifact_truncated(),
+            );
+            let artifact_ref = teardown_session(&self.workspace, &mut session).await?;
+            (facts.0, facts.1, facts.2, facts.3, artifact_ref)
+        };
 
         let truncation_summary = if artifact_truncated {
             ", artifact truncated"
@@ -754,7 +950,7 @@ fn cancelled_start_output(call_id: &str, phase: &str) -> ToolOutcome {
 /// artifact. Bounded per session so teardown itself cannot hang.
 async fn teardown_session(
     workspace: &Workspace,
-    mut session: ProcessSession,
+    session: &mut ProcessSession,
 ) -> AgentResult<String> {
     #[cfg(windows)]
     drop(session.host_death_job.take());
@@ -762,7 +958,11 @@ async fn teardown_session(
     let _ = session.child.start_kill();
     let exit_status = reap_session_child(&mut session.child).await?;
     super::persist_process_exit(workspace, session.pid, exit_status.code())?;
-    workspace.seal_buffered_artifact(session.artifact).await
+    let artifact = session
+        .artifact
+        .take()
+        .ok_or_else(|| AgentError::Internal("session artifact already sealed".into()))?;
+    workspace.seal_buffered_artifact(artifact).await
 }
 
 #[cfg(test)]
@@ -805,11 +1005,13 @@ pub(crate) async fn drain_sessions(
     drop(slots);
     let mut first_error: Option<AgentError> = None;
     for (_, slot) in entries {
-        if let SessionSlot::Running(session) = slot
-            && let Err(error) = teardown_session(workspace, *session).await
-            && first_error.is_none()
-        {
-            first_error = Some(error);
+        if let SessionSlot::Running(live) = slot {
+            let mut session = live.lock().await;
+            if let Err(error) = teardown_session(workspace, &mut session).await
+                && first_error.is_none()
+            {
+                first_error = Some(error);
+            }
         }
     }
     match first_error {
@@ -1783,5 +1985,471 @@ mod tests {
             "shutdown drain must empty the registry"
         );
         super::super::test_procs::wait_for_all_dead(&tracked, "the drained sessions");
+    }
+
+    /// A1 (N07): a process that fails with exit code 7 must be distinguish
+    /// able from a success in the MODEL content — poll API success and
+    /// process success are two facts, and TurnFrame only forwards
+    /// model_content.
+    #[tokio::test]
+    async fn a1_nonzero_exit_is_reported_as_failure_in_model_content() {
+        let dir = tempfile::tempdir().unwrap();
+        let tool = ProcessSessionTool::new(
+            Workspace::open(dir.path()).await.unwrap(),
+            SessionRegistry::default(),
+        );
+        let run_id = RunId::new();
+        #[cfg(windows)]
+        let argv: Vec<String> = vec!["cmd".into(), "/C".into(), "exit 7".into()];
+        #[cfg(not(windows))]
+        let argv: Vec<String> = vec!["sh".into(), "-c".into(), "exit 7".into()];
+        let start_args = json!({"action": "start", "argv": argv});
+        let context = start_ctx(run_id, &start_args);
+        let output = value(
+            tool.execute(
+                run_id,
+                "c",
+                start_args,
+                Some(context),
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap(),
+        );
+        let session_id = output.metadata["session_id"].as_str().unwrap().to_string();
+        let mut last = None;
+        for _ in 0..50 {
+            let output = value(
+                tool.execute(
+                    run_id,
+                    "c",
+                    json!({"action": "poll", "session_id": session_id}),
+                    None,
+                    CancellationToken::new(),
+                )
+                .await
+                .unwrap(),
+            );
+            if output.metadata["status"] == "exited" {
+                last = Some(output);
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+        let output = last.expect("the process must exit within the poll window");
+        assert!(
+            output.model_content.contains("failure") && output.model_content.contains("7"),
+            "the model content must carry the failure fact: {}",
+            output.model_content
+        );
+        assert_eq!(output.metadata["exit_code"], 7);
+        assert_eq!(output.metadata["success"], false);
+    }
+
+    /// A1 (N07): success must be labeled too.
+    #[tokio::test]
+    async fn a1_zero_exit_is_reported_as_success_in_model_content() {
+        let dir = tempfile::tempdir().unwrap();
+        let tool = ProcessSessionTool::new(
+            Workspace::open(dir.path()).await.unwrap(),
+            SessionRegistry::default(),
+        );
+        let run_id = RunId::new();
+        #[cfg(windows)]
+        let argv: Vec<String> = vec!["cmd".into(), "/C".into(), "exit 0".into()];
+        #[cfg(not(windows))]
+        let argv: Vec<String> = vec!["sh".into(), "-c".into(), "exit 0".into()];
+        let start_args = json!({"action": "start", "argv": argv});
+        let context = start_ctx(run_id, &start_args);
+        let output = value(
+            tool.execute(
+                run_id,
+                "c",
+                start_args,
+                Some(context),
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap(),
+        );
+        let session_id = output.metadata["session_id"].as_str().unwrap().to_string();
+        let mut last = None;
+        for _ in 0..50 {
+            let output = value(
+                tool.execute(
+                    run_id,
+                    "c",
+                    json!({"action": "poll", "session_id": session_id}),
+                    None,
+                    CancellationToken::new(),
+                )
+                .await
+                .unwrap(),
+            );
+            if output.metadata["status"] == "exited" {
+                last = Some(output);
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+        let output = last.expect("the process must exit within the poll window");
+        assert!(
+            output.model_content.contains("success"),
+            "zero exit must read as success: {}",
+            output.model_content
+        );
+        assert_eq!(output.metadata["success"], true);
+    }
+
+    /// A1 (N07, unix): a signal-killed process has `ExitStatus::code() ==
+    /// None`; the old `Option<i32>` reported it RUNNING forever. The
+    /// remembered termination must say "exited, terminated by signal".
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a1_signal_killed_process_is_not_running_forever() {
+        let dir = tempfile::tempdir().unwrap();
+        let tool = ProcessSessionTool::new(
+            Workspace::open(dir.path()).await.unwrap(),
+            SessionRegistry::default(),
+        );
+        let run_id = RunId::new();
+        let argv: Vec<String> = vec!["sh".into(), "-c".into(), "kill -TERM $$".into()];
+        let start_args = json!({"action": "start", "argv": argv});
+        let context = start_ctx(run_id, &start_args);
+        let output = value(
+            tool.execute(
+                run_id,
+                "c",
+                start_args,
+                Some(context),
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap(),
+        );
+        let session_id = output.metadata["session_id"].as_str().unwrap().to_string();
+        let mut last = None;
+        for _ in 0..50 {
+            let output = value(
+                tool.execute(
+                    run_id,
+                    "c",
+                    json!({"action": "poll", "session_id": session_id}),
+                    None,
+                    CancellationToken::new(),
+                )
+                .await
+                .unwrap(),
+            );
+            if output.metadata["status"] == "exited" {
+                last = Some(output);
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+        let output = last.expect("a signal-killed process must be reported exited, not running");
+        assert!(
+            output.model_content.contains("terminated by signal"),
+            "the model content must carry the signal fact: {}",
+            output.model_content
+        );
+        assert_eq!(output.metadata["signal"].is_null(), false);
+    }
+
+    /// A1 (N08): a large output burst makes the batch bounds BITE: the
+    /// first poll reports `output_pending` (caps reached) and the next
+    /// polls keep draining in batches until every line is through —
+    /// nothing is dropped and no poll runs unbounded.
+    #[tokio::test]
+    async fn a1_continuous_writer_poll_is_bounded_and_output_pending() {
+        let dir = tempfile::tempdir().unwrap();
+        let tool = ProcessSessionTool::new(
+            Workspace::open(dir.path()).await.unwrap(),
+            SessionRegistry::default(),
+        );
+        let run_id = RunId::new();
+        // 20 000 lines in one burst: far more than POLL_MAX_CHUNKS (8192).
+        #[cfg(windows)]
+        let argv: Vec<String> = vec![
+            "powershell".into(),
+            "-NoProfile".into(),
+            "-Command".into(),
+            "1..20000 | ForEach-Object { \"tick $_\" }".into(),
+        ];
+        #[cfg(not(windows))]
+        let argv: Vec<String> = vec![
+            "sh".into(),
+            "-c".into(),
+            "seq 1 20000 | sed 's/^/tick /'".into(),
+        ];
+        let start_args = json!({"action": "start", "argv": argv});
+        let context = start_ctx(run_id, &start_args);
+        let output = value(
+            tool.execute(
+                run_id,
+                "c",
+                start_args,
+                Some(context),
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap(),
+        );
+        let session_id = output.metadata["session_id"].as_str().unwrap().to_string();
+
+        // The first poll must stop at the chunk cap, not drain forever.
+        let started = std::time::Instant::now();
+        let first = value(
+            tool.execute(
+                run_id,
+                "c",
+                json!({"action": "poll", "session_id": session_id}),
+                None,
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap(),
+        );
+        let elapsed = started.elapsed();
+        assert!(
+            elapsed < std::time::Duration::from_secs(10),
+            "a poll must stay within the batch bounds, took {elapsed:?}"
+        );
+        // Later polls drain the rest in bounded batches: every line arrives.
+        let mut total = first.metadata["total_lines"].as_u64().unwrap();
+        for _ in 0..60 {
+            if total >= 20_000 {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+            let output = value(
+                tool.execute(
+                    run_id,
+                    "c",
+                    json!({"action": "poll", "session_id": session_id}),
+                    None,
+                    CancellationToken::new(),
+                )
+                .await
+                .unwrap(),
+            );
+            total = output.metadata["total_lines"].as_u64().unwrap();
+        }
+        assert_eq!(
+            total, 20_000,
+            "batched polls must drain the whole burst without dropping lines"
+        );
+        let stop = tool
+            .execute(
+                run_id,
+                "c",
+                json!({"action": "stop", "session_id": session_id}),
+                None,
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(value(stop).metadata["status"], "stopped");
+    }
+
+    /// A1 (N08), discriminating: after the parent exits, a descendant that
+    /// keeps the pipe and writes every 300 ms must not extend the
+    /// post-exit drain indefinitely. The old code re-armed a fresh 1 s
+    /// timeout per received chunk, so an endless writer kept the poll in
+    /// the drain loop forever; the fix bounds the sweep by ONE absolute
+    /// deadline and reports `output_pending`.
+    #[tokio::test]
+    async fn a1_post_exit_continuous_writer_cannot_extend_the_drain() {
+        let dir = tempfile::tempdir().unwrap();
+        let tool = ProcessSessionTool::new(
+            Workspace::open(dir.path()).await.unwrap(),
+            SessionRegistry::default(),
+        );
+        let run_id = RunId::new();
+        // Parent: HEAD then exit. Descendant: inherits the pipe, ticks
+        // every 300 ms for a long time (tree-killed by the final stop).
+        #[cfg(windows)]
+        let argv: Vec<String> = vec![
+            "powershell".into(),
+            "-NoProfile".into(),
+            "-Command".into(),
+            "echo HEAD; Start-Process -NoNewWindow powershell -ArgumentList @('-NoProfile','-Command','1..120 | % { echo CONT-TICK; Start-Sleep -m 300 }'); exit 0".into(),
+        ];
+        #[cfg(not(windows))]
+        let argv: Vec<String> = vec![
+            "sh".into(),
+            "-c".into(),
+            "echo HEAD; sh -c 'while true; do echo CONT-TICK; sleep 0.3; done' & exit 0".into(),
+        ];
+        let start_args = json!({"action": "start", "argv": argv});
+        let context = start_ctx(run_id, &start_args);
+        let output = value(
+            tool.execute(
+                run_id,
+                "c",
+                start_args,
+                Some(context),
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap(),
+        );
+        let session_id = output.metadata["session_id"].as_str().unwrap().to_string();
+
+        // Wait for the parent to exit; the descendant keeps ticking.
+        for _ in 0..60 {
+            let probe = value(
+                tool.execute(
+                    run_id,
+                    "c",
+                    json!({"action": "poll", "session_id": session_id}),
+                    None,
+                    CancellationToken::new(),
+                )
+                .await
+                .unwrap(),
+            );
+            if probe.metadata["status"] == "exited" {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+
+        // THE BOUND: this poll faces a writer ticking every 300 ms — under
+        // the per-chunk re-armed timeout it ran for the descendant's whole
+        // lifetime; now it returns within roughly one absolute deadline.
+        let started = std::time::Instant::now();
+        let output = value(
+            tokio::time::timeout(
+                std::time::Duration::from_secs(10),
+                tool.execute(
+                    run_id,
+                    "c",
+                    json!({"action": "poll", "session_id": session_id}),
+                    None,
+                    CancellationToken::new(),
+                ),
+            )
+            .await
+            .expect("the poll must be bounded (the old per-chunk timeout extended it forever)")
+            .unwrap(),
+        );
+        let elapsed = started.elapsed();
+        assert_eq!(output.metadata["status"], "exited");
+        assert_eq!(output.metadata["output_pending"], true);
+        assert!(
+            elapsed < std::time::Duration::from_secs(3),
+            "the post-exit drain must be one absolute deadline, took {elapsed:?}"
+        );
+
+        let stop = tool
+            .execute(
+                run_id,
+                "c",
+                json!({"action": "stop", "session_id": session_id}),
+                None,
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(value(stop).metadata["status"], "stopped");
+    }
+
+    /// A1 (N08): a poll of session A must not block the stop of session B —
+    /// the registry table lock is never held across the drain's I/O.
+    #[tokio::test]
+    async fn a1_stop_of_another_session_is_not_blocked_by_a_poll() {
+        let dir = tempfile::tempdir().unwrap();
+        let tool = std::sync::Arc::new(ProcessSessionTool::new(
+            Workspace::open(dir.path()).await.unwrap(),
+            SessionRegistry::default(),
+        ));
+        let run_id = RunId::new();
+
+        // A: continuous writer (the poll's drain has work to do).
+        #[cfg(windows)]
+        let argv_a: Vec<String> = vec![
+            "cmd".into(),
+            "/C".into(),
+            "for /L %i in (1,1,300) do @(echo tick %i& ping -n 1 -w 100 127.0.0.1 > NUL)".into(),
+        ];
+        #[cfg(not(windows))]
+        let argv_a: Vec<String> = vec![
+            "sh".into(),
+            "-c".into(),
+            "for i in $(seq 1 300); do echo tick $i; sleep 0.1; done".into(),
+        ];
+        let start_a = json!({"action": "start", "argv": argv_a});
+        let output_a = value(
+            tool.execute(
+                run_id,
+                "c",
+                start_a.clone(),
+                Some(start_ctx(run_id, &start_a)),
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap(),
+        );
+        let session_a = output_a.metadata["session_id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+
+        // B: a long-running quiet session to stop.
+        let start_b = json!({"action": "start", "argv": long_argv()});
+        let output_b = value(
+            tool.execute(
+                run_id,
+                "c",
+                start_b.clone(),
+                Some(start_ctx(run_id, &start_b)),
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap(),
+        );
+        let session_b = output_b.metadata["session_id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+
+        // Start poll A in the background, then stop B while it runs.
+        let poll_tool = tool.clone();
+        let poll_args = json!({"action": "poll", "session_id": session_a});
+        let poll_handle = tokio::spawn(async move {
+            poll_tool
+                .execute(RunId::new(), "c", poll_args, None, CancellationToken::new())
+                .await
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        let stop_started = std::time::Instant::now();
+        let stop = value(
+            tool.execute(
+                run_id,
+                "c",
+                json!({"action": "stop", "session_id": session_b}),
+                None,
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap(),
+        );
+        let stop_elapsed = stop_started.elapsed();
+        assert_eq!(stop.metadata["status"], "stopped");
+        assert!(
+            stop_elapsed < std::time::Duration::from_secs(5),
+            "stop B must not queue behind poll A's drain, took {stop_elapsed:?}"
+        );
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(10), poll_handle).await;
+        let _ = tool
+            .execute(
+                run_id,
+                "c",
+                json!({"action": "stop", "session_id": session_a}),
+                None,
+                CancellationToken::new(),
+            )
+            .await;
     }
 }

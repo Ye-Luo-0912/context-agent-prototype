@@ -442,18 +442,21 @@ impl PromptAssembler {
             }
             context_frame.push(ModelMessage::user(restored_block));
         }
-        // C3/R1: the SELECTED WORKING CONTEXT block is the current epoch's
-        // evidence — the declared reusable prefix stops at its end; the
-        // volatile projections after it (foreground/misses/external/
-        // restored) no longer extend the declared prefix when they change.
-        let evidence_split = if context_frame
-            .iter()
-            .any(|message| message.content.contains("SELECTED WORKING CONTEXT"))
-        {
-            Some(agent_contracts::EvidenceSplit { base: 0, epoch: 1 })
-        } else {
-            None
-        };
+        // C3/R1 + N05: the declared split comes from the TYPED assembly
+        // counts, never from scanning content. `context_frame[0]` is the
+        // SELECTED WORKING CONTEXT block exactly when the selection was
+        // non-empty, so the epoch evidence is one message there and zero
+        // otherwise — an empty stable set declares `Some{0,0}` explicitly
+        // instead of falling into the legacy `None` compatibility shape,
+        // and a file body that happens to contain the header literal can
+        // never decide the layout. The volatile projections after it
+        // (foreground/misses/external/restored) never extend the declared
+        // prefix when they change.
+        let stable_epoch_messages = usize::from(!history.items.is_empty());
+        let evidence_split = Some(agent_contracts::EvidenceSplit {
+            base: 0,
+            epoch: stable_epoch_messages,
+        });
         (
             ModelInput {
                 layout: self.layout,
@@ -1756,6 +1759,96 @@ mod tests {
         assert!(
             !selected.contains("fn secret_body"),
             "selected working set still omits the checked body: {selected}"
+        );
+    }
+
+    /// N05 (red-first): an EMPTY selected set declares the explicit empty
+    /// split `Some{0,0}` — never the legacy `None`, whose compatibility
+    /// shape would fold the whole volatile context frame into the reusable
+    /// prefix.
+    #[test]
+    fn an_empty_selection_declares_an_explicit_empty_split() {
+        let assembler = PromptAssembler::new("policy");
+        let mut history = materialized_with(Vec::new(), ContextMapView::default());
+        history.foreground = vec![item("volatile foreground body")];
+
+        let assembled = assembler.assemble(
+            None,
+            None,
+            None,
+            &history,
+            &TurnFrame::new("turn"),
+            Vec::new(),
+        );
+
+        assert_eq!(
+            assembled.evidence_split,
+            Some(agent_contracts::EvidenceSplit { base: 0, epoch: 0 }),
+            "an empty stable set is an explicit empty split, not legacy None"
+        );
+        // The declared prefix therefore stops at the system policy: the
+        // volatile foreground stays out of the reusable prefix.
+        let request = assembled.into_request(serde_json::Value::Null, CancellationToken::new());
+        let boundary = request
+            .prompt_reuse_boundary()
+            .expect("a system-policy prefix is still a valid stable boundary");
+        assert_eq!(
+            boundary.message_count(),
+            2,
+            "system policy + runtime facts only: {boundary:?}"
+        );
+    }
+
+    /// N05 (red-first): a file body that happens to contain the section
+    /// header literal cannot decide the layout — the split comes from the
+    /// typed assembly counts, not a content scan.
+    #[test]
+    fn a_body_containing_the_header_literal_does_not_decide_the_split() {
+        let assembler = PromptAssembler::new("policy");
+        let mut history = materialized_with(Vec::new(), ContextMapView::default());
+        history.foreground = vec![item(
+            "SELECTED WORKING CONTEXT
+this body merely quotes the header",
+        )];
+
+        let assembled = assembler.assemble(
+            None,
+            None,
+            None,
+            &history,
+            &TurnFrame::new("turn"),
+            Vec::new(),
+        );
+
+        assert_eq!(
+            assembled.evidence_split,
+            Some(agent_contracts::EvidenceSplit { base: 0, epoch: 0 }),
+            "content must not decide structure: the foreground is volatile"
+        );
+    }
+
+    /// N05: a non-empty selection keeps the single epoch-evidence message
+    /// declaration the prefix design names.
+    #[test]
+    fn a_nonempty_selection_declares_one_epoch_message() {
+        let assembler = PromptAssembler::new("policy");
+        let history = materialized_with(
+            vec![item("kept evidence"), item("more evidence")],
+            ContextMapView::default(),
+        );
+
+        let assembled = assembler.assemble(
+            None,
+            None,
+            None,
+            &history,
+            &TurnFrame::new("turn"),
+            Vec::new(),
+        );
+
+        assert_eq!(
+            assembled.evidence_split,
+            Some(agent_contracts::EvidenceSplit { base: 0, epoch: 1 })
         );
     }
 

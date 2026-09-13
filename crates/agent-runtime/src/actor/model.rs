@@ -1595,11 +1595,21 @@ impl RuntimeActor {
         // Application-side accounting only; this field is not prompt text
         // or a provider-specific cache-control parameter.
         request_metadata["prompt_layout"] = serde_json::json!(input.layout);
+        // N04: the composition root's stable routing namespace names this
+        // task on the main lane. The key is an opaque routing string —
+        // stable across the rounds and restores of one task, different
+        // across isolation domains — never a per-round identity or a
+        // request digest. Keyless compositions keep the historical payload.
+        let cache_routing = self.services.cache_routing().cloned();
         tokio::spawn(async move {
-            let outcome = match model
-                .complete_stream(input.into_request(request_metadata, cancel.clone()), &sink)
-                .await
-            {
+            let mut request = input.into_request(request_metadata, cancel.clone());
+            if let Some(routing) = cache_routing.as_ref() {
+                let task = task_id
+                    .map(|id| id.to_string())
+                    .unwrap_or_else(|| "unassigned".to_string());
+                request.prompt_cache_key = Some(routing.key_for(&task, "main"));
+            }
+            let outcome = match model.complete_stream(request, &sink).await {
                 Ok(output) => OperationOutcome::ModelOutput {
                     content: output.content,
                     tool_calls: output.tool_calls,

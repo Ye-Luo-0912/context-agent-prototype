@@ -161,6 +161,7 @@ async fn e1_loop_config_discover_load_invoke_bounded_result_shutdown() {
     let model = Arc::new(LoopModel::new(&heartbeat_path.to_string_lossy()));
     let composed = compose(ComposeConfig {
         provider_profile_digest: None,
+        cache_routing: None,
         defer_proof_refresh: false,
         shadow_context_frame: false,
         workspace: workspace.clone(),

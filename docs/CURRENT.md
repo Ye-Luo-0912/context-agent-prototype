@@ -1,4 +1,6 @@
 # 当前工作
+**2026-09-14 A 线三片（A1/A2/A3）已代码落地——详见 [回执](reviews/2026-09-14-backend-review-6eda2474/A_LINE_A1_A2_A3_IMPLEMENTATION.md)。**
+
 
 ## 现在做什么
 

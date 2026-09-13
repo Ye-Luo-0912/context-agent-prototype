@@ -55,6 +55,7 @@ async fn compose_workspace(root: &std::path::Path) -> anyhow::Result<Composed> {
         Some(model.clone()),
         None,
         &agent_compose::MaintenanceBudget::default(),
+        None,
     )
     .await?;
     let verification_recipes = Arc::new(tool_runtime::VerificationRecipes::discover(&workspace)?);
@@ -69,6 +70,7 @@ async fn compose_workspace(root: &std::path::Path) -> anyhow::Result<Composed> {
     let base_tools = Arc::new(tool_runtime::BuiltinToolDispatcher::new(workspace.clone())?);
     let composed = compose(ComposeConfig {
         provider_profile_digest: None,
+        cache_routing: None,
         defer_proof_refresh: false,
         shadow_context_frame: false,
         workspace: workspace.clone(),

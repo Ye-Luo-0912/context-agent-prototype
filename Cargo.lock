@@ -39,6 +39,7 @@ dependencies = [
  "context-contextcore",
  "context-simple",
  "provider-openai",
+ "reqwest",
  "serde_json",
  "sha2",
  "tempfile",

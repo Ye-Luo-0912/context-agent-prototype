@@ -149,18 +149,20 @@ async fn real_main() -> anyhow::Result<()> {
         None => ContextPolicy::Rolling,
     };
 
-    let (model, provider_profile_digest, prompt_cache_mode) = match try_model_from_env()? {
-        ModelSelection::Mock(mock) => {
-            eprintln!("host: demo mode (AGENT_DEMO=1) selected the mock transport");
-            (mock, None, None)
-        }
-        ModelSelection::Provider(provider, profile) => {
-            eprintln!("host: {}", profile.banner());
-            let digest = profile.digest();
-            let cache_mode = profile.prompt_cache_mode.as_str().to_owned();
-            (provider, Some(digest), Some(cache_mode))
-        }
-    };
+    let (model, provider_profile_digest, prompt_cache_mode, cache_endpoint) =
+        match try_model_from_env()? {
+            ModelSelection::Mock(mock) => {
+                eprintln!("host: demo mode (AGENT_DEMO=1) selected the mock transport");
+                (mock, None, None, None)
+            }
+            ModelSelection::Provider(provider, profile) => {
+                eprintln!("host: {}", profile.banner());
+                let digest = profile.digest();
+                let cache_mode = profile.prompt_cache_mode.as_str().to_owned();
+                let endpoint = profile.base_url.clone();
+                (provider, Some(digest), Some(cache_mode), Some(endpoint))
+            }
+        };
 
     // COST-4 (D02): an optional independent maintenance transport (its own
     // time bound) owns compaction calls; absent, the main model serves.
@@ -173,6 +175,17 @@ async fn real_main() -> anyhow::Result<()> {
     let workspace = Workspace::open(&root).await?;
     let single = SingleInstance::acquire(workspace.state_dir())?;
     eprintln!("host: workspace {}", root.display());
+    // N04: the composition root's stable cache-routing namespace — the
+    // host workspace + configured endpoint identify the isolation domain;
+    // the per-task/lane suffix is derived at the request build point.
+    let cache_routing = cache_endpoint.map(|endpoint| agent_contracts::PromptCacheRouting {
+        isolation: "host".to_string(),
+        workspace: workspace.root().display().to_string(),
+        endpoint,
+    });
+    let maintenance_cache_key = cache_routing
+        .as_ref()
+        .map(|routing| routing.key_for("compaction", "maintenance"));
 
     let journal = Arc::new(FileEventJournal::open(workspace.state_dir().join("traces")).await?);
     let maintenance_budget = maintenance_budget_from_env()?;
@@ -183,6 +196,7 @@ async fn real_main() -> anyhow::Result<()> {
         Some(model.clone()),
         maintenance_transport,
         &maintenance_budget,
+        maintenance_cache_key,
     )
     .await?;
     let verification_recipes = Arc::new(VerificationRecipes::discover(&workspace)?);
@@ -276,6 +290,7 @@ async fn real_main() -> anyhow::Result<()> {
 
     let composed = compose(ComposeConfig {
         provider_profile_digest: provider_profile_digest.clone(),
+        cache_routing: cache_routing.clone(),
         defer_proof_refresh: false,
         shadow_context_frame: false,
         workspace: workspace.clone(),

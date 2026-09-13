@@ -1117,6 +1117,9 @@ impl ProcessRunTool {
         // stdout/stderr and keeps running must stay bounded by the same
         // deadline and cancellation as every other run.
         let mut outputs_closed = false;
+        // A2 (N09): separately reported — a size cap and an undrained pipe
+        // are two different kinds of incompleteness.
+        let mut pipes_drained = true;
 
         loop {
             tokio::select! {
@@ -1142,9 +1145,20 @@ impl ProcessRunTool {
                         // nothing left to wait for, skip the grace window.
                         break;
                     }
+                    // A2 (N09): the drain budget starts at the FIRST exit
+                    // observation, not at spawn — a command that outlived
+                    // the pre-armed timer still gets its full grace window
+                    // for the pipe tail to arrive.
+                    grace.as_mut().reset(tokio::time::Instant::now() + Duration::from_millis(500));
                     grace_started = true;
                 }
-                _ = &mut grace, if grace_started => break,
+                _ = &mut grace, if grace_started => {
+                    // A2 (N09): the grace fired with pipes still open — the
+                    // tail may be incomplete. That fact must not be folded
+                    // into the size-truncation flag.
+                    pipes_drained = false;
+                    break;
+                }
                 line = line_rx.recv(), if !outputs_closed => {
                     match line {
                         Some(line) => {
@@ -1250,6 +1264,7 @@ impl ProcessRunTool {
             "artifact_bytes": artifact_bytes,
             "artifact_limit_bytes": MAX_ARTIFACT_BYTES,
             "artifact_truncated": artifact_truncated,
+            "pipes_drained": pipes_drained,
             "outcome": outcome,
             "cwd": if cwd_text.is_empty() { "." } else { &cwd_text },
             "argv": argv_text,

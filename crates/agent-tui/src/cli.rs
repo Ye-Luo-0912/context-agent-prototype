@@ -662,6 +662,7 @@ mod tests {
             Some(model.clone()),
             try_maintenance_transport_from_env()?,
             &maintenance_budget_from_env()?,
+            None,
         )
         .await?;
         let base_tools = Arc::new(BuiltinToolDispatcher::with_config_and_verification_recipes(
@@ -675,6 +676,7 @@ mod tests {
             .join("broker-reservations.jsonl");
         compose(ComposeConfig {
             provider_profile_digest: None,
+            cache_routing: None,
             defer_proof_refresh: false,
             shadow_context_frame: false,
             workspace: workspace.clone(),

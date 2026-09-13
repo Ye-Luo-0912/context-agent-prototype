@@ -77,6 +77,7 @@ async fn compose_config(
     );
     Ok(ComposeConfig {
         provider_profile_digest: None,
+        cache_routing: None,
         defer_proof_refresh: false,
         // The shadow frame compiler runs for real in this acceptance flow:
         // one manifest per model round must reach the event stream.

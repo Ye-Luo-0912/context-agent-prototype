@@ -982,12 +982,27 @@ fn build_responses_wire_request(
         .then(|| request.prompt_reuse_boundary())
         .flatten()
         .map(|boundary| boundary.message_count() - 1);
+    // N04: the declared multi-breakpoint list (B0 = end of the stable
+    // policy, B1 = end of the declared epoch evidence) is mapped per item.
+    // The indexes name FLAT request messages under the last-non-empty rule;
+    // the wire input skips empty messages and expands assistant tool calls,
+    // so each breakpoint attaches to the LAST wire item its message
+    // produced — never to a shifted position. When the declared list is
+    // absent, the legacy single-boundary hint keeps its historical shape.
+    let mut declared_breakpoints: std::collections::HashSet<usize> = if confirmed_explicit {
+        request.cache_breakpoints.iter().copied().collect()
+    } else {
+        std::collections::HashSet::new()
+    };
     let mut input = Vec::with_capacity(request.messages.len());
     for (message_index, message) in request.messages.iter().enumerate() {
+        let first_new_item = input.len();
         match message.role {
             ModelRole::System | ModelRole::User | ModelRole::Assistant => {
                 if !message.content.is_empty() {
-                    let content = if boundary_index == Some(message_index) {
+                    let content = if boundary_index == Some(message_index)
+                        && !declared_breakpoints.contains(&message_index)
+                    {
                         json!([{
                             "type": "input_text",
                             "text": message.content,
@@ -1022,6 +1037,27 @@ fn build_responses_wire_request(
                 }
             }
         }
+        // Attach this message's breakpoint to the LAST wire item its
+        // message produced (content items carry it inside the content
+        // array — the established shape; expanded tool-call/function items
+        // carry it as a sibling field). A message that produced no items
+        // (filtered empty content) cannot host a breakpoint: the declared
+        // index was last-non-empty, so this only fires on hostile inputs,
+        // which fail the boundary validation instead.
+        if declared_breakpoints.remove(&message_index) && input.len() > first_new_item {
+            let last = input.len() - 1;
+            if let Some(content) = input[last]
+                .get_mut("content")
+                .and_then(|content| content.as_array_mut())
+                && let Some(last_text) = content
+                    .iter_mut()
+                    .find(|part| part.get("type").and_then(Value::as_str) == Some("input_text"))
+            {
+                last_text["prompt_cache_breakpoint"] = json!({"mode": "explicit"});
+                continue;
+            }
+            input[last]["prompt_cache_breakpoint"] = json!({"mode": "explicit"});
+        }
     }
 
     let tools: Vec<Value> = request
@@ -1043,7 +1079,10 @@ fn build_responses_wire_request(
         "stream": true,
         "store": false,
     });
-    if boundary_index.is_some() {
+    if confirmed_explicit && (boundary_index.is_some() || !request.cache_breakpoints.is_empty()) {
+        // N04: declared breakpoints alone (with the confirmed capability)
+        // also request the explicit shape; an unconfirmed endpoint keeps
+        // the exact historical payload.
         // No implicit write of the changing suffix. If the common hint is
         // absent/stale, leave normal provider behavior entirely untouched.
         wire["prompt_cache_options"] = json!({"mode": "explicit"});

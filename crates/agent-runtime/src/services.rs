@@ -54,6 +54,12 @@ pub struct RuntimeServices {
     /// every checkpoint's run metadata. Absent when the composition did
     /// not provide one.
     provider_profile_digest: Option<String>,
+    /// N04: the composition root's stable cache-routing namespace. When
+    /// present, the actor stamps every main-lane model request with the
+    /// derived per-task key; `None` keeps requests keyless (unknown-
+    /// capability endpoints and bare compositions keep the historical
+    /// payload).
+    cache_routing: Option<agent_contracts::PromptCacheRouting>,
     /// When false (the default), a completion-time proof refresh runs
     /// inline in the actor, preserving the historical same-round gate
     /// result. When true, the host verifier runs outside the actor loop
@@ -207,6 +213,7 @@ impl RuntimeServices {
             verification_coverage_declarations,
             artifact_workspace: None,
             provider_profile_digest: None,
+            cache_routing: None,
             defer_proof_refresh: false,
             shadow_context_frame: false,
             project_task_progress: true,
@@ -255,6 +262,7 @@ impl RuntimeServices {
             verification_coverage_declarations,
             artifact_workspace: None,
             provider_profile_digest: None,
+            cache_routing: None,
             defer_proof_refresh: false,
             shadow_context_frame: false,
             project_task_progress: true,
@@ -327,6 +335,16 @@ impl RuntimeServices {
     /// every checkpoint's run metadata.
     pub fn set_provider_profile_digest(&mut self, digest: String) {
         self.provider_profile_digest = Some(digest);
+    }
+
+    /// N04: inject the stable cache-routing namespace (composition root).
+    pub fn set_cache_routing(&mut self, routing: agent_contracts::PromptCacheRouting) {
+        self.cache_routing = Some(routing);
+    }
+
+    /// N04: the routing namespace for the main model lane, if configured.
+    pub fn cache_routing(&self) -> Option<&agent_contracts::PromptCacheRouting> {
+        self.cache_routing.as_ref()
     }
 
     pub fn provider_profile_digest(&self) -> Option<&str> {

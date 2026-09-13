@@ -219,25 +219,66 @@ where
         self.list_tools_with_cancel(&CancellationToken::new()).await
     }
 
-    /// `tools/list` that also aborts when `cancel` fires.
+    /// `tools/list` that also aborts when `cancel` fires. A3 (N10): the
+    /// pinned 2024-11-05 protocol pages `tools/list` via `nextCursor`, so
+    /// discovery runs a BOUNDED loop until the server stops paginating —
+    /// page cap, total-tool cap and an overall deadline all fail CLOSED
+    /// (a typed "discovery incomplete" error the adapter turns into a
+    /// refused install), never a silently-complete first page. Duplicate
+    /// cursors and duplicate tool names are protocol faults, not skippable
+    /// rows.
     pub async fn list_tools_with_cancel(
         &mut self,
         cancel: &CancellationToken,
     ) -> AgentResult<Vec<McpTool>> {
-        let result = self
-            .request_with_cancel("tools/list", json!({}), cancel)
-            .await?;
-        let tools = result
-            .get("tools")
-            .and_then(Value::as_array)
-            .ok_or_else(|| AgentError::Tool("MCP tools/list returned no tools array".into()))?;
-        tools
-            .iter()
-            .map(|tool| {
+        const MAX_DISCOVERY_PAGES: usize = 16;
+        const MAX_DISCOVERY_TOOLS: usize = 512;
+        const DISCOVERY_DEADLINE: Duration = Duration::from_secs(30);
+        let deadline = tokio::time::Instant::now() + DISCOVERY_DEADLINE;
+        let mut tools: Vec<McpTool> = Vec::new();
+        let mut seen_names: std::collections::HashSet<String> = std::collections::HashSet::new();
+        let mut cursor: Option<String> = None;
+        let mut previous_cursor: Option<String> = None;
+        let mut pages = 0usize;
+        loop {
+            if pages >= MAX_DISCOVERY_PAGES {
+                return Err(AgentError::Tool(format!(
+                    "MCP tool discovery incomplete: exceeded {MAX_DISCOVERY_PAGES} tools/list pages;                      the server's manifest was not fully enumerated (install refused)"
+                )));
+            }
+            if tokio::time::Instant::now() >= deadline {
+                return Err(AgentError::Tool(
+                    "MCP tool discovery incomplete: the overall discovery deadline elapsed;                      the server's manifest was not fully enumerated (install refused)"
+                        .into(),
+                ));
+            }
+            if tools.len() > MAX_DISCOVERY_TOOLS {
+                return Err(AgentError::Tool(format!(
+                    "MCP tool discovery incomplete: more than {MAX_DISCOVERY_TOOLS} tools;                      install refused"
+                )));
+            }
+            pages += 1;
+            let mut params = json!({});
+            if let Some(cursor) = &cursor {
+                params["cursor"] = json!(cursor);
+            }
+            let result = self
+                .request_with_cancel("tools/list", params, cancel)
+                .await?;
+            let page = result
+                .get("tools")
+                .and_then(Value::as_array)
+                .ok_or_else(|| AgentError::Tool("MCP tools/list returned no tools array".into()))?;
+            for tool in page {
                 let name = tool
                     .get("name")
                     .and_then(Value::as_str)
                     .ok_or_else(|| AgentError::Tool("MCP tool missing name".into()))?;
+                if !seen_names.insert(name.to_string()) {
+                    return Err(AgentError::Tool(format!(
+                        "MCP tool discovery fault: duplicate tool name '{name}' across pages"
+                    )));
+                }
                 let description = tool
                     .get("description")
                     .and_then(Value::as_str)
@@ -247,13 +288,31 @@ where
                     .get("inputSchema")
                     .cloned()
                     .unwrap_or_else(|| json!({"type": "object"}));
-                Ok(McpTool {
+                tools.push(McpTool {
                     name: name.to_string(),
                     description,
                     input_schema,
-                })
-            })
-            .collect()
+                });
+            }
+            let next = result
+                .get("nextCursor")
+                .and_then(Value::as_str)
+                .filter(|value| !value.is_empty());
+            match next {
+                Some(next) => {
+                    let next = next.to_string();
+                    if previous_cursor.as_deref() == Some(next.as_str()) {
+                        return Err(AgentError::Tool(
+                            "MCP tool discovery fault: the server repeated the same nextCursor"
+                                .into(),
+                        ));
+                    }
+                    previous_cursor = cursor.take();
+                    cursor = Some(next);
+                }
+                None => return Ok(tools),
+            }
+        }
     }
 
     /// `tools/call`: invoke one tool with its arguments and return the
@@ -1939,6 +1998,139 @@ mod tests {
         assert!(
             output.model_content.chars().count() <= MAX_MCP_TOOL_TEXT_CHARS + 64,
             "MCP text must be clipped before it reaches the model"
+        );
+    }
+
+    /// A3 (N10): a paginating MCP server — page 1 carries one tool plus a
+    /// nextCursor; only page 2 carries the target tool. Discovery must walk
+    /// the pages; returning the first page as a complete manifest loses the
+    /// tool the model needs.
+    async fn paginated_server(
+        mut read: impl AsyncRead + Unpin + Send,
+        mut write: impl AsyncWrite + Unpin + Send,
+        repeated_cursor: bool,
+        fail_second_page: bool,
+    ) {
+        let mut line = Vec::new();
+        loop {
+            line.clear();
+            let Ok(count) = read_line(&mut read, &mut line).await else {
+                return;
+            };
+            if count == 0 {
+                return;
+            }
+            let Ok(request) = serde_json::from_slice::<Value>(&line) else {
+                return;
+            };
+            let method = request.get("method").and_then(Value::as_str).unwrap_or("");
+            let id = match request.get("id") {
+                Some(id) => id.clone(),
+                None => continue,
+            };
+            let response = match method {
+                "initialize" => json!({
+                    "jsonrpc": "2.0", "id": id,
+                    "result": {"protocolVersion": MCP_PROTOCOL_VERSION, "capabilities": {}, "serverInfo": {"name": "paged", "version": "0.1.0"}}
+                }),
+                "tools/list" => {
+                    let cursor = request["params"]["cursor"].as_str().unwrap_or("");
+                    if repeated_cursor {
+                        json!({
+                            "jsonrpc": "2.0", "id": id,
+                            "result": {"tools": [
+                                {"name": "page1.only", "description": "first page", "inputSchema": {"type": "object"}}
+                            ], "nextCursor": "page-2"}
+                        })
+                    } else if fail_second_page && cursor == "page-2" {
+                        json!({
+                            "jsonrpc": "2.0", "id": id,
+                            "error": {"code": -32000, "message": "second page exploded"}
+                        })
+                    } else if cursor == "page-2" {
+                        json!({
+                            "jsonrpc": "2.0", "id": id,
+                            "result": {"tools": [
+                                {"name": "page2.target", "description": "the needed tool", "inputSchema": {"type": "object"}}
+                            ]}
+                        })
+                    } else {
+                        json!({
+                            "jsonrpc": "2.0", "id": id,
+                            "result": {"tools": [
+                                {"name": "page1.only", "description": "first page", "inputSchema": {"type": "object"}}
+                            ], "nextCursor": "page-2"}
+                        })
+                    }
+                }
+                _ => json!({
+                    "jsonrpc": "2.0", "id": id,
+                    "error": {"code": -32601, "message": "method not found"}
+                }),
+            };
+            let mut frame = serde_json::to_string(&response).unwrap();
+            frame.push('\n');
+            if write.write_all(frame.as_bytes()).await.is_err() {
+                return;
+            }
+            let _ = write.flush().await;
+        }
+    }
+    async fn paginated_client(
+        repeated_cursor: bool,
+        fail_second_page: bool,
+    ) -> McpClient<tokio::io::DuplexStream, tokio::io::DuplexStream> {
+        let (client_read, server_write) = duplex(64 * 1024);
+        let (server_read, client_write) = duplex(64 * 1024);
+        tokio::spawn(async move {
+            paginated_server(server_read, server_write, repeated_cursor, fail_second_page).await;
+        });
+        let mut client = McpClient::new(
+            client_read,
+            client_write,
+            Duration::from_secs(5),
+            1024 * 1024,
+        );
+        client.initialize().await.expect("handshake succeeds");
+        client
+    }
+
+    #[tokio::test]
+    async fn paginated_discovery_finds_tools_on_the_second_page() {
+        let mut client = paginated_client(false, false).await;
+        let tools = client.list_tools().await.expect("paged discovery succeeds");
+        let names: Vec<&str> = tools.iter().map(|tool| tool.name.as_str()).collect();
+        assert!(
+            names.contains(&"page1.only") && names.contains(&"page2.target"),
+            "discovery must walk nextCursor pages: {names:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_repeated_cursor_is_a_discovery_fault_not_a_complete_manifest() {
+        let mut client = paginated_client(true, false).await;
+        let error = client
+            .list_tools()
+            .await
+            .expect_err("a repeating cursor must fail discovery, not return page 1");
+        let message = error.to_string();
+        assert!(
+            message.contains("repeated the same nextCursor")
+                || message.contains("duplicate tool name"),
+            "a repeating-cursor server must fail typed discovery: {message}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_second_page_failure_is_not_a_silent_complete_manifest() {
+        let mut client = paginated_client(false, true).await;
+        let error = client
+            .list_tools()
+            .await
+            .expect_err("a failing second page must fail discovery");
+        assert!(
+            error.to_string().contains("second page exploded"),
+            "the page failure must surface: {error}"
         );
     }
 }

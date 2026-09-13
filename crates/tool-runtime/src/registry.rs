@@ -152,8 +152,14 @@ impl Drop for BuiltinToolDispatcher {
         // callers with an await budget (tests, hosts) use.
         if let Ok(sessions) = self.sessions.try_lock() {
             for slot in sessions.values() {
-                if let SessionSlot::Running(session) = slot {
-                    kill_process_tree(session.pid);
+                if let SessionSlot::Running(live) = slot {
+                    // A1 (N08): the session state is behind its own async
+                    // lock; Drop cannot await, so only an uncontended lock
+                    // (poll not in flight) can read the pid. The child
+                    // handle dropping kills the direct child regardless.
+                    if let Ok(session) = live.try_lock() {
+                        kill_process_tree(session.pid);
+                    }
                 }
             }
         }

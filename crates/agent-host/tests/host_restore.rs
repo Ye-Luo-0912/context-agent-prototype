@@ -62,6 +62,7 @@ async fn host_config(
         None,
         None,
         &agent_compose::MaintenanceBudget::default(),
+        None,
     )
     .await?;
     let base_tools = Arc::new(
@@ -77,6 +78,7 @@ async fn host_config(
         .join("broker-reservations.jsonl");
     Ok(ComposeConfig {
         provider_profile_digest: None,
+        cache_routing: None,
         defer_proof_refresh: false,
         shadow_context_frame: false,
         workspace: workspace.clone(),

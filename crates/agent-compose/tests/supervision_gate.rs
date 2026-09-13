@@ -90,6 +90,7 @@ async fn compose_config(root: &std::path::Path) -> anyhow::Result<ComposeConfig>
     );
     Ok(ComposeConfig {
         provider_profile_digest: None,
+        cache_routing: None,
         defer_proof_refresh: false,
         shadow_context_frame: false,
         workspace: workspace.clone(),

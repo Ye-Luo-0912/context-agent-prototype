@@ -362,6 +362,9 @@ impl Tool for ShellExecTool {
         // stdout/stderr and keeps running must stay bounded by the same
         // deadline and cancellation as every other run.
         let mut outputs_closed = false;
+        // A2 (N09): separately reported — a size cap and an undrained pipe
+        // are two different kinds of incompleteness.
+        let mut pipes_drained = true;
 
         loop {
             tokio::select! {
@@ -387,9 +390,15 @@ impl Tool for ShellExecTool {
                         // nothing left to wait for, skip the grace window.
                         break;
                     }
-                    grace_started = true;
+                    grace_started = true; // RED_CHECK
                 }
-                _ = &mut grace, if grace_started => break,
+                _ = &mut grace, if grace_started => {
+                    // A2 (N09): the grace fired with pipes still open — the
+                    // tail may be incomplete. That fact must not be folded
+                    // into the size-truncation flag.
+                    pipes_drained = false;
+                    break;
+                }
                 line = line_rx.recv(), if !outputs_closed => {
                     match line {
                         Some(line) => {
@@ -462,6 +471,7 @@ impl Tool for ShellExecTool {
             "artifact_bytes": artifact_bytes,
             "artifact_limit_bytes": MAX_ARTIFACT_BYTES,
             "artifact_truncated": artifact_truncated,
+            "pipes_drained": pipes_drained,
             "outcome": outcome,
             "shell_dialect": self.dialect.label(),
             "command": args.command.clone(),
@@ -999,5 +1009,90 @@ mod tests {
             output.summary
         );
         assert!(elapsed >= Duration::from_secs(6), "{elapsed:?}");
+    }
+
+    /// N09 (A2): ordering guard — head and a pre-exit tail both survive the
+    /// exit/grace/EOF sequence (platform-independent regression guard; the
+    /// discriminating post-exit descendant test is unix-gated below).
+    #[tokio::test]
+    async fn n09_tail_ordering_guard() {
+        let dir = tempfile::tempdir().unwrap();
+        let workspace = Workspace::open(dir.path()).await.unwrap();
+        let tool = ShellExecTool::with_dialect(workspace.clone(), test_dialect());
+        let run_id = RunId::new();
+        #[cfg(windows)]
+        let command = "echo HEAD& ping -n 2 127.0.0.1 > NUL& echo TAIL-SENTINEL";
+        #[cfg(not(windows))]
+        let command = "echo HEAD; sleep 1; echo TAIL-SENTINEL";
+        let arguments = json!({
+            "command": command,
+            "timeout_ms": 15000,
+        });
+        let context = ctx(run_id, &arguments);
+        let output = value(
+            tokio::time::timeout(
+                Duration::from_secs(20),
+                tool.execute(
+                    run_id,
+                    "c",
+                    arguments,
+                    Some(context),
+                    CancellationToken::new(),
+                ),
+            )
+            .await
+            .expect("the run must finish within the tool deadline")
+            .unwrap(),
+        );
+        assert!(output.ok, "{}", output.summary);
+        assert!(output.model_content.contains("HEAD"));
+        assert!(
+            output.model_content.contains("TAIL-SENTINEL"),
+            "the pre-exit tail must survive: {}",
+            output.model_content
+        );
+    }
+
+    /// N09 (A2), discriminating: a descendant that holds the inherited pipe
+    /// and writes the sentinel shortly AFTER the shell exits must be
+    /// collected by the grace window re-armed at exit; the old pre-armed
+    /// timer (expired long before) cut the tail off. Requires real signal/
+    /// job semantics, so it runs on unix (the CI Linux job covers it).
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn n09_post_exit_descendant_sentinel_survives_the_rearmed_grace() {
+        let dir = tempfile::tempdir().unwrap();
+        let workspace = Workspace::open(dir.path()).await.unwrap();
+        let tool = ShellExecTool::with_dialect(workspace.clone(), test_dialect());
+        let run_id = RunId::new();
+        // HEAD, ~3 s run (the pre-armed 500 ms timer expires long before),
+        // exit; the background subshell writes the sentinel 0.2 s later.
+        let command = "echo HEAD; sleep 3; ( sleep 0.2; echo TAIL-SENTINEL ) &";
+        let arguments = json!({
+            "command": command,
+            "timeout_ms": 15000,
+        });
+        let context = ctx(run_id, &arguments);
+        let output = value(
+            tokio::time::timeout(
+                Duration::from_secs(20),
+                tool.execute(
+                    run_id,
+                    "c",
+                    arguments,
+                    Some(context),
+                    CancellationToken::new(),
+                ),
+            )
+            .await
+            .expect("the run must finish within the tool deadline")
+            .unwrap(),
+        );
+        assert!(output.ok, "{}", output.summary);
+        assert!(
+            output.model_content.contains("TAIL-SENTINEL"),
+            "the descendant's post-exit sentinel must survive the re-armed grace: {}",
+            output.model_content
+        );
     }
 }

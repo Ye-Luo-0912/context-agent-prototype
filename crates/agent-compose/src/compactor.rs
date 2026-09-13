@@ -21,11 +21,26 @@ Do not call tools. Do not invent files or results.";
 /// 失败守卫会把折叠候选原样还回工作集，等下一次维护再消费。
 pub struct ModelBackedCompactor {
     model: Arc<dyn ModelTransport>,
+    /// N04: the composition root's stable routing key for the MAINTENANCE
+    /// lane. Compaction is engine-level (not task-scoped), so the key names
+    /// the maintenance namespace itself; `None` keeps requests keyless.
+    cache_key: Option<String>,
 }
 
 impl ModelBackedCompactor {
     pub fn new(model: Arc<dyn ModelTransport>) -> Self {
-        Self { model }
+        Self {
+            model,
+            cache_key: None,
+        }
+    }
+
+    /// N04: stamp maintenance-lane requests with the composition root's
+    /// stable routing key (only meaningful on endpoints that negotiated the
+    /// explicit cache capability — the transport gates the wire field).
+    pub fn with_cache_key(mut self, key: Option<String>) -> Self {
+        self.cache_key = key;
+        self
     }
 }
 
@@ -51,12 +66,13 @@ impl BoundedCompactor for ModelBackedCompactor {
                 // field, generation stops at the compaction bound instead of
                 // the main profile's cap (truncation stays as the backstop).
                 max_output_tokens: Some(COMPACTION_OUTPUT_CHARS as u32),
-                // C1/C2 (R2/R3): the maintenance lane marks its own request.
-                // The routing key is the caller's (runtime's) to fill when
-                // its composition wants one; the policy is the compactor's
-                // own declaration so a confirmed explicit-only transport
-                // never silently implicit-writes the one-shot suffix.
-                prompt_cache_key: None,
+                // C1/C2 (R2/R3) + N04: the maintenance lane marks its own
+                // request. The routing key is the composition root's stable
+                // maintenance-namespace key (injected via
+                // `with_cache_key`); the policy is the compactor's own
+                // declaration so a confirmed explicit-only transport never
+                // silently implicit-writes the one-shot suffix.
+                prompt_cache_key: self.cache_key.clone(),
                 cache_write_policy: Some(CacheWritePolicy::ExplicitOnly),
                 cache_breakpoints: Vec::new(),
                 cancel: CancellationToken::new(),

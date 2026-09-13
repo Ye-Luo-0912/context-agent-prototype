@@ -43,7 +43,7 @@ pub use input::*;
 pub use jcs::{JcsError, serialize as jcs_serialize};
 pub use label::*;
 pub use model::*;
-pub use model_cache::PromptReuseBoundary;
+pub use model_cache::{PromptCacheRouting, PromptReuseBoundary};
 pub use operation::*;
 pub use plugin::*;
 pub use runtime::*;

@@ -76,23 +76,37 @@ async fn real_main() -> anyhow::Result<()> {
     // BEFORE the workspace or journal exists, so a bad key or profile is a
     // configuration error that leaves no runtime state behind (M16-01).
     // Doctor above deliberately runs keyless and stays before this.
-    let (model, serving_banner, provider_profile_digest) = match try_model_from_env()? {
-        agent_compose::ModelSelection::Mock(mock) => {
-            eprintln!("demo mode: AGENT_DEMO=1 selected the explicit mock transport");
-            (
-                mock,
-                "serving: demo mock transport (AGENT_DEMO=1)".to_string(),
-                None,
-            )
-        }
-        agent_compose::ModelSelection::Provider(provider, profile) => {
-            eprintln!("{}", profile.banner());
-            let digest = profile.digest();
-            let banner = format!("serving: {} | profile digest {digest}", profile.banner());
-            (provider, banner, Some(digest))
-        }
-    };
+    let (model, serving_banner, provider_profile_digest, cache_endpoint) =
+        match try_model_from_env()? {
+            agent_compose::ModelSelection::Mock(mock) => {
+                eprintln!("demo mode: AGENT_DEMO=1 selected the explicit mock transport");
+                (
+                    mock,
+                    "serving: demo mock transport (AGENT_DEMO=1)".to_string(),
+                    None,
+                    None,
+                )
+            }
+            agent_compose::ModelSelection::Provider(provider, profile) => {
+                eprintln!("{}", profile.banner());
+                let digest = profile.digest();
+                let banner = format!("serving: {} | profile digest {digest}", profile.banner());
+                let endpoint = profile.base_url.clone();
+                (provider, banner, Some(digest), Some(endpoint))
+            }
+        };
     let workspace = Workspace::open(&root).await?;
+    // N04: the composition root's stable cache-routing namespace (host
+    // workspace + configured endpoint). Demo/mock compositions stay
+    // keyless.
+    let cache_routing = cache_endpoint.map(|endpoint| agent_contracts::PromptCacheRouting {
+        isolation: "tui".to_string(),
+        workspace: workspace.root().display().to_string(),
+        endpoint,
+    });
+    let maintenance_cache_key = cache_routing
+        .as_ref()
+        .map(|routing| routing.key_for("compaction", "maintenance"));
     let restore_checkpoint = if restore_latest {
         let resolved = resolve_latest_checkpoint(&workspace.state_dir().join("checkpoints"))?;
         let checkpoint = load_runtime_checkpoint(&resolved)?;
@@ -114,6 +128,7 @@ async fn real_main() -> anyhow::Result<()> {
         Some(model.clone()),
         try_maintenance_transport_from_env()?,
         &maintenance_budget,
+        maintenance_cache_key,
     )
     .await?;
     // 授权映射是组合根的决定：一份内置注册表同时交给审批门、能力
@@ -209,6 +224,7 @@ async fn real_main() -> anyhow::Result<()> {
     };
     let composed = compose(ComposeConfig {
         provider_profile_digest,
+        cache_routing,
         defer_proof_refresh: defer_proof,
         shadow_context_frame: false,
         workspace,
