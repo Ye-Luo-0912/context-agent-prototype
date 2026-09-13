@@ -110,10 +110,29 @@ jobs:
       # agent-eval fixture/bench tests probe a real Python 3 interpreter
       # (py -3 / python3 / python) for their deterministic golden runs.
       # Hosted windows runners can expose a Store alias that hangs the probe
-      # instead of a working interpreter, so install a known-good one.
+      # instead of a working interpreter, so install a known-good one and
+      # point AGENT_PYTHON at it — otherwise discovery still walks py -3
+      # first and a 5s hang per candidate can fail the golden commands
+      # even though setup-python already put a working 3.12 on PATH.
       - uses: actions/setup-python@v5
+        id: python
         with:
           python-version: "3.12"
+
+      - name: Point host Python probes at the installed interpreter
+        shell: bash
+        run: |
+          PYTHON_PATH="${{ steps.python.outputs.python-path }}"
+          if [ -z "$PYTHON_PATH" ]; then
+            echo "setup-python did not report python-path"
+            exit 1
+          fi
+          {
+            echo "AGENT_PYTHON<<EOF"
+            echo "$PYTHON_PATH"
+            echo "EOF"
+          } >> "$GITHUB_ENV"
+          echo "AGENT_PYTHON=$PYTHON_PATH"
 
       # A scoped test job selects only its part's crates, so integration
       # tests that spawn sibling binaries (mock_host / broker_host from

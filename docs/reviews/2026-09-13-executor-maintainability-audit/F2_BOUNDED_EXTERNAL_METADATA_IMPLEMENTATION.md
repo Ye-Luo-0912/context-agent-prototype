@@ -43,5 +43,10 @@
 
 - 本片有界化：capture 工作量、capture 的锁持有、每批 restore/drain I/O、重复分片成本。**未做**：条目离开内存——`ExternalMap` 仍持有全部外置条目元数据与索引，drain 之后驻留元数据仍是 O(历史)。因此支持规模的诚实表述是「外置元数据能装进进程的历史」，而 checkpoint 字节、capture pass、单批 restore/drain 各自独立有界。
 - **唯一残余（CTX-9 内存面）**：真正的驻留分页（条目只存在于卡片、搜索候选来自分页索引）需要既有回执记录的产品决策——每次搜索 `O(spilled)` I/O、新增面向模型的完整性声明、或压缩驻留索引。本片不偷工、不假称已解决。
-- 未跑远端 CI（PR 已开，等 run 记录）、未调用真实 provider、未跑全仓 `cargo test --workspace`（定向包＋全仓 `check --all-targets`）。
+- 未调用真实 provider、未跑全仓 `cargo test --workspace`（定向包＋全仓 `check --all-targets`）。
 - F1（restore spill 所有权 fail-closed，PR [#3](https://github.com/Ye-Luo-0912/context-agent-prototype/pull/3)）为并行独立分支，本片未改其收紧的解析/校验语义；两者在 `engine.rs` restore 与 `tests/external_spill.rs` 上有相邻改动，合并时以后合入者解冲突。
+
+## 远端 CI
+
+- run [`34746807046`](https://github.com/Ye-Luo-0912/context-agent-prototype/actions/runs/34746807046)（`30d33bcf`，F2 代码、docs/`merge_paged` 之前）：七 job 全绿，含 `test (windows-latest, part full)`。
+- run [`34747095706`](https://github.com/Ye-Luo-0912/context-agent-prototype/actions/runs/34747095706)（`f6294702`）：6 绿；Windows full 败于 `agent-eval` 五项 hidden-command（`context_bench::seed_fails_and_golden_passes_file_asserts`、`context_bench::golden_hidden_commands_reverify_from_report`、`context_mech::pack_self_check`、`fixture_driver::suite_oracle_passes_hidden_commands_on_a_file_task`、`suite::harvested_seed_fails_and_expected_passes`）。file 断言过；command 为 `python_interpreter_unavailable`（`py -3` / `python3` / `python` 探针均 timeout）。同 SHA 的 ubuntu part 2（含 `-p agent-eval`）全绿。F2 未改 `agent-eval`。CI 已 `setup-python` 3.12（注释写明 Windows Store 别名会挂住探针）但未把 `AGENT_PYTHON` 指过去，发现仍先撞 `py -3`。本提交把 `AGENT_PYTHON` 接到 `setup-python` 的 `python-path`。不把 Windows Python 探针超时当 F2 回归，不改 `tool-runtime` 的 5s `PROBE_TIMEOUT`。
