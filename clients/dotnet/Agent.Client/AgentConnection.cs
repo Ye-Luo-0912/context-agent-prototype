@@ -172,9 +172,19 @@ public sealed class AgentConnection : IAgentConnection
                 // F19: the typed request payload validator runs before any
                 // byte is written; a violation is a protocol fault, so a
                 // malformed request can never reach the wire (and a mutation
-                // is never re-sent for it).
-                payload.Validate();
-                request.Validate(_identity);
+                // is never re-sent for it). The violation is marked as
+                // never-sent so callers above are told the request did not
+                // happen instead of being handed a fabricated unknown outcome.
+                try
+                {
+                    payload.Validate();
+                    request.Validate(_identity);
+                }
+                catch (AgentContractViolationException violation)
+                {
+                    violation.RequestNotSent = true;
+                    throw;
+                }
 
                 var encoded = JsonSerializer.SerializeToUtf8Bytes(request, AgentJson.Options);
                 using var timeout = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken, _disposed.Token);
@@ -249,11 +259,54 @@ public sealed class AgentConnection : IAgentConnection
         SendAsync<WorkSubmitRequest, WorkSubmitResponse>(
             Route.WorkSubmitRoute(), new WorkSubmitRequest { Goal = goal, ClientRequestId = clientRequestId }, cancellationToken);
 
-    public Task<WorkContinueResponse> ContinueAsync(CancellationToken cancellationToken = default) =>
-        SendAsync<WorkContinueRequest, WorkContinueResponse>(Route.WorkContinueRoute(), new WorkContinueRequest(), cancellationToken);
+    public Task<WorkContinueResponse> ContinueAsync(
+        string? expectedTaskId = null, CancellationToken cancellationToken = default) =>
+        SendAsync<WorkContinueRequest, WorkContinueResponse>(
+            Route.WorkContinueRoute(),
+            new WorkContinueRequest { ExpectedTaskId = expectedTaskId },
+            cancellationToken);
 
-    public Task<WorkCancelResponse> CancelCurrentTurnAsync(CancellationToken cancellationToken = default) =>
-        SendAsync<WorkCancelRequest, WorkCancelResponse>(Route.WorkCancelRoute(), new WorkCancelRequest(), cancellationToken);
+    public Task<WorkCancelResponse> CancelCurrentTurnAsync(
+        string? expectedTaskId = null,
+        string? expectedTurnId = null,
+        CancellationToken cancellationToken = default) =>
+        SendAsync<WorkCancelRequest, WorkCancelResponse>(
+            Route.WorkCancelRoute(),
+            new WorkCancelRequest { ExpectedTaskId = expectedTaskId, ExpectedTurnId = expectedTurnId },
+            cancellationToken);
+
+    // -----------------------------------------------------------------------
+    // F5: in-task steering, task lifecycle and the formal checkpoint plane.
+    // Each is a mutation, so the resumable session sends it exactly once.
+    // -----------------------------------------------------------------------
+
+    public Task<WorkSteerResponse> SteerAsync(
+        string instruction, string? expectedTaskId = null, CancellationToken cancellationToken = default) =>
+        SendAsync<WorkSteerRequest, WorkSteerResponse>(
+            Route.WorkSteerRoute(),
+            new WorkSteerRequest { Instruction = instruction, ExpectedTaskId = expectedTaskId },
+            cancellationToken);
+
+    public Task<WorkActivateResponse> ActivateTaskAsync(
+        string taskId, CancellationToken cancellationToken = default) =>
+        SendAsync<WorkActivateRequest, WorkActivateResponse>(
+            Route.WorkActivateRoute(), new WorkActivateRequest { TaskId = taskId }, cancellationToken);
+
+    public Task<WorkSuspendResponse> SuspendTaskAsync(
+        string? expectedTaskId = null, CancellationToken cancellationToken = default) =>
+        SendAsync<WorkSuspendRequest, WorkSuspendResponse>(
+            Route.WorkSuspendRoute(),
+            new WorkSuspendRequest { ExpectedTaskId = expectedTaskId },
+            cancellationToken);
+
+    public Task<WorkCheckpointResponse> CheckpointAsync(CancellationToken cancellationToken = default) =>
+        SendAsync<WorkCheckpointRequest, WorkCheckpointResponse>(
+            Route.WorkCheckpointRoute(), new WorkCheckpointRequest(), cancellationToken);
+
+    public Task<WorkRestoreResponse> RestoreAsync(
+        string? artifact = null, CancellationToken cancellationToken = default) =>
+        SendAsync<WorkRestoreRequest, WorkRestoreResponse>(
+            Route.WorkRestoreRoute(), new WorkRestoreRequest { Artifact = artifact }, cancellationToken);
 
     public Task<WorkSnapshotResponse> SnapshotAsync(CancellationToken cancellationToken = default) =>
         SendAsync<WorkSnapshotRequest, WorkSnapshotResponse>(Route.WorkSnapshotRoute(), new WorkSnapshotRequest(), cancellationToken);

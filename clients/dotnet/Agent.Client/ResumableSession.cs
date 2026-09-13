@@ -364,6 +364,14 @@ public sealed class ResumableSession : IAgentConnection, IAsyncDisposable
         {
             return await operation(connection, cancellationToken).ConfigureAwait(false);
         }
+        // A request the client itself refused never reached the wire, so its
+        // outcome is not unknown — it is known not to have happened. Reporting
+        // an unknown here would send the caller re-snapshotting (or worse,
+        // retrying) work that was never sent.
+        catch (AgentContractViolationException refused) when (refused.RequestNotSent)
+        {
+            throw;
+        }
         catch (Exception failure) when (failure is not OperationCanceledException
             && failure is not AgentProtocolException)
         {
@@ -390,16 +398,66 @@ public sealed class ResumableSession : IAgentConnection, IAsyncDisposable
     /// connection failure the outcome is unknown —
     /// <see cref="AgentUnknownOutcomeException"/>, never an automatic
     /// re-send.</summary>
-    public Task<WorkContinueResponse> ContinueAsync(CancellationToken cancellationToken = default) =>
-        RunMutationAsync((connection, token) => connection.ContinueAsync(token), cancellationToken);
+    public Task<WorkContinueResponse> ContinueAsync(
+        string? expectedTaskId = null, CancellationToken cancellationToken = default) =>
+        RunMutationAsync(
+            (connection, token) => connection.ContinueAsync(expectedTaskId, token), cancellationToken);
 
     /// <summary>Cancels the run's current turn. Sent exactly once: on a
     /// connection failure the outcome is unknown — the turn may or may not
     /// have been cancelled server-side — so
     /// <see cref="AgentUnknownOutcomeException"/> is thrown instead of
     /// re-arming a second cancel.</summary>
-    public Task<WorkCancelResponse> CancelCurrentTurnAsync(CancellationToken cancellationToken = default) =>
-        RunMutationAsync((connection, token) => connection.CancelCurrentTurnAsync(token), cancellationToken);
+    public Task<WorkCancelResponse> CancelCurrentTurnAsync(
+        string? expectedTaskId = null,
+        string? expectedTurnId = null,
+        CancellationToken cancellationToken = default) =>
+        RunMutationAsync(
+            (connection, token) =>
+                connection.CancelCurrentTurnAsync(expectedTaskId, expectedTurnId, token),
+            cancellationToken);
+
+    /// <summary>
+    /// F5: applies an in-task correction. Sent exactly once — on a connection
+    /// failure the outcome is unknown
+    /// (<see cref="AgentUnknownOutcomeException"/>), never an automatic re-send:
+    /// re-issuing a correction could apply it twice, and the runtime keeps no
+    /// steering ledger to deduplicate one. The caller re-reads a snapshot and
+    /// decides.
+    /// </summary>
+    public Task<WorkSteerResponse> SteerAsync(
+        string instruction, string? expectedTaskId = null, CancellationToken cancellationToken = default) =>
+        RunMutationAsync(
+            (connection, token) => connection.SteerAsync(instruction, expectedTaskId, token),
+            cancellationToken);
+
+    /// <summary>F5: activates an existing task. Sent exactly once; a lost reply
+    /// is an unknown outcome resolved by the next snapshot.</summary>
+    public Task<WorkActivateResponse> ActivateTaskAsync(
+        string taskId, CancellationToken cancellationToken = default) =>
+        RunMutationAsync(
+            (connection, token) => connection.ActivateTaskAsync(taskId, token), cancellationToken);
+
+    /// <summary>F5: suspends a task without completing it. Sent exactly
+    /// once.</summary>
+    public Task<WorkSuspendResponse> SuspendTaskAsync(
+        string? expectedTaskId = null, CancellationToken cancellationToken = default) =>
+        RunMutationAsync(
+            (connection, token) => connection.SuspendTaskAsync(expectedTaskId, token), cancellationToken);
+
+    /// <summary>F5: captures one formal cross-plane checkpoint. Sent exactly
+    /// once: a lost reply leaves it unknown whether the artifact landed, and the
+    /// caller re-reads the store rather than capturing a second copy blindly.</summary>
+    public Task<WorkCheckpointResponse> CheckpointAsync(CancellationToken cancellationToken = default) =>
+        RunMutationAsync((connection, token) => connection.CheckpointAsync(token), cancellationToken);
+
+    /// <summary>F5: restores one checkpoint through the full cross-plane
+    /// transaction. Sent exactly once — a restore is the least safe thing to
+    /// replay automatically.</summary>
+    public Task<WorkRestoreResponse> RestoreAsync(
+        string? artifact = null, CancellationToken cancellationToken = default) =>
+        RunMutationAsync(
+            (connection, token) => connection.RestoreAsync(artifact, token), cancellationToken);
 
     public Task<WorkSubscribeResponse> SubscribeAsync(ulong? replayAfterSeq = null, CancellationToken cancellationToken = default) =>
         RunQueryAsync((connection, token) => connection.SubscribeAsync(replayAfterSeq, token), cancellationToken);

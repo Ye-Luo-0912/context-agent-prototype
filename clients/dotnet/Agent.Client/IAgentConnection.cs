@@ -24,12 +24,52 @@ public interface IAgentConnection : IAsyncDisposable
     /// (admission, not completion).</summary>
     Task<WorkSubmitResponse> SubmitWorkAsync(string goal, string clientRequestId, CancellationToken cancellationToken = default);
 
-    /// <summary>Continues the run's active task.</summary>
-    Task<WorkContinueResponse> ContinueAsync(CancellationToken cancellationToken = default);
+    /// <summary>Continues the run's active task. F5: pass
+    /// <paramref name="expectedTaskId"/> to continue only when the run is on
+    /// exactly that task — the server compares it inside the actor and starts no
+    /// turn on a mismatch.</summary>
+    Task<WorkContinueResponse> ContinueAsync(
+        string? expectedTaskId = null, CancellationToken cancellationToken = default);
 
     /// <summary>Explicit cancel command for the current turn. Distinct from
-    /// cancelling a local request wait.</summary>
-    Task<WorkCancelResponse> CancelCurrentTurnAsync(CancellationToken cancellationToken = default);
+    /// cancelling a local request wait. F5: naming the task/turn the caller
+    /// observed makes the cancel precise — an expectation that no longer matches
+    /// cancels nothing and reports the live identity.</summary>
+    Task<WorkCancelResponse> CancelCurrentTurnAsync(
+        string? expectedTaskId = null,
+        string? expectedTurnId = null,
+        CancellationToken cancellationToken = default);
+
+    /// <summary>F5: applies an in-task correction to work already running. This
+    /// is NOT a submission: it never creates a task and never re-focuses, and
+    /// naming <paramref name="expectedTaskId"/> refuses unless the runtime is on
+    /// exactly that task. The receipt distinguishes applied, queued (admitted
+    /// into the running turn's single slot) and refused.
+    /// <para>Sent exactly once: a lost reply is an unknown outcome, never an
+    /// automatic re-send — re-issuing a correction could double-apply it.</para></summary>
+    Task<WorkSteerResponse> SteerAsync(
+        string instruction, string? expectedTaskId = null, CancellationToken cancellationToken = default);
+
+    /// <summary>F5: activates an existing task through the same RuntimeActor
+    /// that owns the task table. An unknown or completed task is refused.</summary>
+    Task<WorkActivateResponse> ActivateTaskAsync(
+        string taskId, CancellationToken cancellationToken = default);
+
+    /// <summary>F5: suspends a task without completing it. Suspension is not
+    /// completion; the response never implies one.</summary>
+    Task<WorkSuspendResponse> SuspendTaskAsync(
+        string? expectedTaskId = null, CancellationToken cancellationToken = default);
+
+    /// <summary>F5: captures one FORMAL cross-plane checkpoint (actor, context
+    /// and host capability planes) into the run's own store and returns the
+    /// artifact name <see cref="RestoreAsync"/> accepts.</summary>
+    Task<WorkCheckpointResponse> CheckpointAsync(CancellationToken cancellationToken = default);
+
+    /// <summary>F5: restores one checkpoint through the full cross-plane
+    /// transaction. <paramref name="artifact"/> is a store artifact name — never
+    /// a path; omitting it restores the newest artifact that fully verifies.</summary>
+    Task<WorkRestoreResponse> RestoreAsync(
+        string? artifact = null, CancellationToken cancellationToken = default);
 
     /// <summary>Fetches one consistent typed snapshot.</summary>
     Task<WorkSnapshotResponse> SnapshotAsync(CancellationToken cancellationToken = default);

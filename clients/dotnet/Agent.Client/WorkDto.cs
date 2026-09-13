@@ -46,28 +46,141 @@ public sealed record WorkSubmitResponse : IProtocolPayload
         ContractText.ValidateTaskId("work.submit.task_id", TaskId);
 }
 
-/// <summary>Continue the run's active task. Empty body by contract.</summary>
+/// <summary>
+/// Continue the run's active task.
+/// <para>F5: naming <see cref="ExpectedTaskId"/> turns "continue whatever is
+/// current" into "continue exactly the task I observed". The comparison happens
+/// server-side inside the actor, so a stale snapshot can never continue someone
+/// else's task; omitting it keeps the historical empty body.</para>
+/// </summary>
 public sealed record WorkContinueRequest : IProtocolPayload
 {
+    [JsonPropertyName("expected_task_id")]
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    public string? ExpectedTaskId { get; init; }
+
     public void Validate()
     {
+        if (ExpectedTaskId is not null)
+        {
+            ContractText.ValidateTaskId("work.continue.expected_task_id", ExpectedTaskId);
+        }
     }
+}
+
+/// <summary>Whether the continuation actually started a turn. The rejection
+/// only reaches a client that named an expectation.</summary>
+public enum WorkContinueDisposition
+{
+    Continued,
+    /// <summary>The named task is not the live active task: no turn started and
+    /// no directive was re-read.</summary>
+    ExpectedTaskMismatch,
 }
 
 public sealed record WorkContinueResponse : IProtocolPayload
 {
+    /// <summary>The task the directive continues under; <c>null</c> only on a
+    /// rejection where nothing is active.</summary>
     [JsonPropertyName("task_id")]
-    public string TaskId { get; init; } = string.Empty;
+    public string? TaskId { get; init; }
 
-    public void Validate() =>
-        ContractText.ValidateTaskId("work.continue.task_id", TaskId);
-}
+    /// <summary>Absent on the wire whenever the continuation happened (the
+    /// default), so the historical response shape is byte-identical. Mirrors the
+    /// Rust <c>skip_serializing_if</c> on the same field.</summary>
+    [JsonPropertyName("disposition")]
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingDefault)]
+    public WorkContinueDisposition Disposition { get; init; } = WorkContinueDisposition.Continued;
 
-/// <summary>Cancel the run's current in-flight turn. Empty body by contract.</summary>
-public sealed record WorkCancelRequest : IProtocolPayload
-{
+    /// <summary>F5: the live active task when the expectation did not match, so
+    /// the caller re-targets instead of retrying blindly.</summary>
+    [JsonPropertyName("active_task_id")]
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    public string? ActiveTaskId { get; init; }
+
     public void Validate()
     {
+        if (TaskId is not null)
+        {
+            ContractText.ValidateTaskId("work.continue.task_id", TaskId);
+        }
+        if (ActiveTaskId is not null)
+        {
+            ContractText.ValidateTaskId("work.continue.active_task_id", ActiveTaskId);
+        }
+        if (Disposition == WorkContinueDisposition.Continued)
+        {
+            if (TaskId is null)
+            {
+                throw new AgentContractViolationException(
+                    "work.continue.task_id", "a continued turn must name its task");
+            }
+            if (ActiveTaskId is not null)
+            {
+                throw new AgentContractViolationException(
+                    "work.continue.active_task_id", "only a rejection reports the live active task");
+            }
+        }
+        else if (TaskId is not null)
+        {
+            throw new AgentContractViolationException(
+                "work.continue.task_id", "a rejected continuation must not name a continued task");
+        }
+    }
+}
+
+/// <summary>
+/// Cancel the run's current in-flight turn.
+/// <para>F5: naming <see cref="ExpectedTaskId"/> / <see cref="ExpectedTurnId"/>
+/// makes the cancel precise. The runtime compares the expectation against the
+/// live turn in the same serialized step that would cancel it, so a slow client
+/// can never kill the successor of the turn it saw.</para>
+/// </summary>
+public sealed record WorkCancelRequest : IProtocolPayload
+{
+    [JsonPropertyName("expected_task_id")]
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    public string? ExpectedTaskId { get; init; }
+
+    [JsonPropertyName("expected_turn_id")]
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    public string? ExpectedTurnId { get; init; }
+
+    public void Validate()
+    {
+        if (ExpectedTaskId is not null)
+        {
+            ContractText.ValidateTaskId("work.cancel.expected_task_id", ExpectedTaskId);
+        }
+        if (ExpectedTurnId is not null)
+        {
+            ContractText.ValidateTaskId("work.cancel.expected_turn_id", ExpectedTurnId);
+        }
+    }
+}
+
+/// <summary>F5: the live turn identity reported when a precise cancel did not
+/// match. Its presence is the proof that NOTHING was cancelled.</summary>
+public sealed record WorkTurnIdentity
+{
+    [JsonPropertyName("task_id")]
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    public string? TaskId { get; init; }
+
+    [JsonPropertyName("turn_id")]
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    public string? TurnId { get; init; }
+
+    public void Validate()
+    {
+        if (TaskId is not null)
+        {
+            ContractText.ValidateTaskId("work.cancel.identity_mismatch.task_id", TaskId);
+        }
+        if (TurnId is not null)
+        {
+            ContractText.ValidateTaskId("work.cancel.identity_mismatch.turn_id", TurnId);
+        }
     }
 }
 
@@ -191,8 +304,383 @@ public sealed record WorkCancelResponse : IProtocolPayload
     [JsonConverter(typeof(TurnCancelAckConverter))]
     public TurnCancelAck Ack { get; init; } = new();
 
+    /// <summary>F5: present only when the request named an expectation that did
+    /// not match. Then <see cref="Ack"/> is <c>NoActiveTurn</c> because this call
+    /// cancelled nothing, and these are the identities that are actually
+    /// live.</summary>
+    [JsonPropertyName("identity_mismatch")]
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    public WorkTurnIdentity? IdentityMismatch { get; init; }
+
     public void Validate()
     {
+        if (IdentityMismatch is null)
+        {
+            return;
+        }
+        IdentityMismatch.Validate();
+        // A mismatch means this request cancelled nothing; a cancelled ack
+        // beside it would claim a stop that never happened for the turn the
+        // caller asked about.
+        if (Ack.Status != TurnCancelAckStatus.NoActiveTurn)
+        {
+            throw new AgentContractViolationException(
+                "work.cancel.identity_mismatch",
+                "an unmatched expectation cancels nothing and must not carry a cancelled ack");
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// F5: in-task steering and task lifecycle.
+//
+// `submit` starts NEW work; `steer` corrects work already running. They are
+// separate routes on purpose: a correction must never silently become a new
+// task, and a new task must never be mistaken for a correction. Activate and
+// suspend drive the same RuntimeActor that owns the task table — this client
+// keeps no second task authority.
+// ---------------------------------------------------------------------------
+
+/// <summary>One in-task correction. Omit <see cref="ExpectedTaskId"/> to steer
+/// whatever the run is on; name it to be refused unless the runtime is on
+/// exactly that task.</summary>
+public sealed record WorkSteerRequest : IProtocolPayload
+{
+    /// Must match the Rust <c>MAX_STEER_INSTRUCTION_CHARS</c> (200_000) exactly.
+    public const int MaxInstructionChars = 200_000;
+
+    [JsonPropertyName("instruction")]
+    public string Instruction { get; init; } = string.Empty;
+
+    [JsonPropertyName("expected_task_id")]
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    public string? ExpectedTaskId { get; init; }
+
+    public void Validate()
+    {
+        ContractText.ValidateText("work.steer.instruction", Instruction, MaxInstructionChars);
+        if (ExpectedTaskId is not null)
+        {
+            ContractText.ValidateTaskId("work.steer.expected_task_id", ExpectedTaskId);
+        }
+    }
+}
+
+/// <summary>What the runtime did with the correction. All three are receipts,
+/// not errors: <see cref="Rejected"/> is a fact about the runtime's identity or
+/// capacity.</summary>
+public enum WorkSteerDisposition
+{
+    /// <summary>Admitted and carried by a fresh turn.</summary>
+    Applied,
+    /// <summary>Admitted into the running turn's single correction slot —
+    /// accepted, not yet executed.</summary>
+    Queued,
+    /// <summary>Nothing was admitted; see the typed rejection.</summary>
+    Rejected,
+}
+
+/// <summary>Why a correction was refused.</summary>
+public enum WorkSteerRejection
+{
+    /// <summary>The caller named a task the runtime is not on.</summary>
+    ExpectedTaskMismatch,
+    /// <summary>Nothing is active. Steering never creates a task — submit
+    /// does.</summary>
+    NoActiveTask,
+    /// <summary>The running turn's correction slot is already taken.</summary>
+    QueueFull,
+}
+
+public sealed record WorkSteerResponse : IProtocolPayload
+{
+    [JsonPropertyName("disposition")]
+    [JsonRequired]
+    public WorkSteerDisposition Disposition { get; init; }
+
+    [JsonPropertyName("task_id")]
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    public string? TaskId { get; init; }
+
+    [JsonPropertyName("rejection")]
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    public WorkSteerRejection? Rejection { get; init; }
+
+    [JsonPropertyName("active_task_id")]
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    public string? ActiveTaskId { get; init; }
+
+    /// <summary>Whether this receipt says the correction was admitted (applied
+    /// or queued). A queued correction is admitted but not yet executed.</summary>
+    [JsonIgnore]
+    public bool IsAdmitted =>
+        Disposition is WorkSteerDisposition.Applied or WorkSteerDisposition.Queued;
+
+    public void Validate()
+    {
+        if (!Enum.IsDefined(typeof(WorkSteerDisposition), Disposition))
+        {
+            throw new AgentContractViolationException(
+                "work.steer.disposition", $"is not a defined steering disposition: {Disposition}");
+        }
+        if (TaskId is not null)
+        {
+            ContractText.ValidateTaskId("work.steer.task_id", TaskId);
+        }
+        if (ActiveTaskId is not null)
+        {
+            ContractText.ValidateTaskId("work.steer.active_task_id", ActiveTaskId);
+        }
+        if (IsAdmitted)
+        {
+            if (TaskId is null)
+            {
+                throw new AgentContractViolationException(
+                    "work.steer.task_id", "an admitted correction must name the task it landed on");
+            }
+            if (Rejection is not null)
+            {
+                throw new AgentContractViolationException(
+                    "work.steer.rejection", "an admitted correction must not carry a rejection reason");
+            }
+        }
+        else
+        {
+            if (Rejection is null)
+            {
+                throw new AgentContractViolationException(
+                    "work.steer.rejection", "a rejected correction must name its typed reason");
+            }
+            if (TaskId is not null)
+            {
+                throw new AgentContractViolationException(
+                    "work.steer.task_id", "a rejected correction landed on no task");
+            }
+        }
+    }
+}
+
+/// <summary>Activate an existing task by id. The id IS the expectation: an
+/// unknown or completed task is refused rather than resolved to "whatever is
+/// current".</summary>
+public sealed record WorkActivateRequest : IProtocolPayload
+{
+    [JsonPropertyName("task_id")]
+    public string TaskId { get; init; } = string.Empty;
+
+    public void Validate() => ContractText.ValidateTaskId("work.activate.task_id", TaskId);
+}
+
+public sealed record WorkActivateResponse : IProtocolPayload
+{
+    [JsonPropertyName("task_id")]
+    public string TaskId { get; init; } = string.Empty;
+
+    /// <summary>The task this activation displaced, if any.</summary>
+    [JsonPropertyName("previously_active")]
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    public string? PreviouslyActive { get; init; }
+
+    /// <summary>The run was already on this task: nothing moved.</summary>
+    [JsonPropertyName("already_active")]
+    public bool AlreadyActive { get; init; }
+
+    public void Validate()
+    {
+        ContractText.ValidateTaskId("work.activate.task_id", TaskId);
+        if (PreviouslyActive is not null)
+        {
+            ContractText.ValidateTaskId("work.activate.previously_active", PreviouslyActive);
+        }
+    }
+}
+
+/// <summary>Suspend a task without completing it. Suspension is not completion
+/// and this contract never implies one.</summary>
+public sealed record WorkSuspendRequest : IProtocolPayload
+{
+    [JsonPropertyName("expected_task_id")]
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    public string? ExpectedTaskId { get; init; }
+
+    public void Validate()
+    {
+        if (ExpectedTaskId is not null)
+        {
+            ContractText.ValidateTaskId("work.suspend.expected_task_id", ExpectedTaskId);
+        }
+    }
+}
+
+public enum WorkSuspendDisposition
+{
+    Suspended,
+    /// <summary>Nothing was active — a fact, not a failure.</summary>
+    NoActiveTask,
+    /// <summary>The named task is not the live active task; nothing was
+    /// suspended.</summary>
+    ExpectedTaskMismatch,
+}
+
+public sealed record WorkSuspendResponse : IProtocolPayload
+{
+    [JsonPropertyName("disposition")]
+    [JsonRequired]
+    public WorkSuspendDisposition Disposition { get; init; }
+
+    [JsonPropertyName("task_id")]
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    public string? TaskId { get; init; }
+
+    [JsonPropertyName("active_task_id")]
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    public string? ActiveTaskId { get; init; }
+
+    public void Validate()
+    {
+        if (!Enum.IsDefined(typeof(WorkSuspendDisposition), Disposition))
+        {
+            throw new AgentContractViolationException(
+                "work.suspend.disposition", $"is not a defined suspend disposition: {Disposition}");
+        }
+        if (TaskId is not null)
+        {
+            ContractText.ValidateTaskId("work.suspend.task_id", TaskId);
+        }
+        if (ActiveTaskId is not null)
+        {
+            ContractText.ValidateTaskId("work.suspend.active_task_id", ActiveTaskId);
+        }
+        if (Disposition == WorkSuspendDisposition.Suspended)
+        {
+            if (TaskId is null)
+            {
+                throw new AgentContractViolationException(
+                    "work.suspend.task_id", "a suspension must name the task it suspended");
+            }
+        }
+        else if (TaskId is not null)
+        {
+            throw new AgentContractViolationException(
+                "work.suspend.task_id", "nothing was suspended, so no task may be named");
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// F5: formal checkpoint capture / restore.
+//
+// These routes drive the runtime's cross-plane transaction (actor state,
+// context state, host capability plane and the durable authority marker). An
+// actor-only dump is not a checkpoint and is unreachable from here. Artifacts
+// are named inside the run's own store — never an arbitrary filesystem path.
+// ---------------------------------------------------------------------------
+
+public sealed record WorkCheckpointRequest : IProtocolPayload
+{
+    public void Validate()
+    {
+    }
+}
+
+public sealed record WorkCheckpointResponse : IProtocolPayload
+{
+    /// Must match the Rust <c>MAX_CHECKPOINT_ARTIFACT_NAME_BYTES</c> (256) exactly.
+    public const int MaxArtifactNameBytes = 256;
+
+    /// <summary>The store artifact the capture landed in; the same name
+    /// <c>work.restore</c> accepts.</summary>
+    [JsonPropertyName("artifact")]
+    public string Artifact { get; init; } = string.Empty;
+
+    [JsonPropertyName("payload_bytes")]
+    public ulong PayloadBytes { get; init; }
+
+    [JsonPropertyName("checkpoint_version")]
+    public uint CheckpointVersion { get; init; }
+
+    [JsonPropertyName("run_id")]
+    public string RunId { get; init; } = string.Empty;
+
+    /// <summary>Task rows the artifact carries: a size fact, never a completion
+    /// claim.</summary>
+    [JsonPropertyName("tasks")]
+    public uint Tasks { get; init; }
+
+    public void Validate()
+    {
+        ValidateCheckpointArtifactName("work.checkpoint.artifact", Artifact);
+        ProtocolIds.ValidateCanonical("work.checkpoint.run_id", RunId);
+    }
+
+    /// <summary>A checkpoint artifact is a NAME inside the run's store, never a
+    /// path: any separator, parent reference or root marker is refused so a wire
+    /// string can never reach outside the store directory.</summary>
+    internal static void ValidateCheckpointArtifactName(string field, string artifact)
+    {
+        ContractText.ValidateOpaque(field, artifact, MaxArtifactNameBytes);
+        if (artifact.Contains('/') || artifact.Contains('\\') || artifact.Contains(':')
+            || artifact == "." || artifact == "..")
+        {
+            throw new AgentContractViolationException(
+                field, "must be a store artifact name, not a path");
+        }
+    }
+}
+
+/// <summary>Restore one checkpoint. <see cref="Artifact"/> names a file in the
+/// run's own checkpoint store; omitting it restores the newest artifact that
+/// fully verifies.</summary>
+public sealed record WorkRestoreRequest : IProtocolPayload
+{
+    [JsonPropertyName("artifact")]
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    public string? Artifact { get; init; }
+
+    public void Validate()
+    {
+        if (Artifact is not null)
+        {
+            WorkCheckpointResponse.ValidateCheckpointArtifactName("work.restore.artifact", Artifact);
+        }
+    }
+}
+
+public sealed record WorkRestoreResponse : IProtocolPayload
+{
+    [JsonPropertyName("artifact")]
+    public string Artifact { get; init; } = string.Empty;
+
+    [JsonPropertyName("checkpoint_version")]
+    public uint CheckpointVersion { get; init; }
+
+    /// <summary>The run the restored checkpoint was captured under. The serving
+    /// run id stays what <c>work.snapshot</c> reports.</summary>
+    [JsonPropertyName("restored_run_id")]
+    public string RestoredRunId { get; init; } = string.Empty;
+
+    /// <summary>EXEC-6: predecessor runs whose sealed references this restore
+    /// could not admit. The restore succeeded; some earlier evidence may be
+    /// unreadable — a degradation, never hidden behind the success.</summary>
+    [JsonPropertyName("evidence_degraded")]
+    public IReadOnlyList<string> EvidenceDegraded { get; init; } = [];
+
+    public void Validate()
+    {
+        WorkCheckpointResponse.ValidateCheckpointArtifactName("work.restore.artifact", Artifact);
+        ProtocolIds.ValidateCanonical("work.restore.restored_run_id", RestoredRunId);
+        if (EvidenceDegraded.Count > WorkSnapshotResponse.MaxDegradedRuns)
+        {
+            throw new AgentContractViolationException(
+                "work.restore.evidence_degraded",
+                $"carries {EvidenceDegraded.Count} entries, above the "
+                    + $"{WorkSnapshotResponse.MaxDegradedRuns} entry bound");
+        }
+        foreach (var run in EvidenceDegraded)
+        {
+            ContractText.ValidateOpaque(
+                "work.restore.evidence_degraded", run, WorkSnapshotResponse.MaxDegradedRunIdBytes);
+        }
     }
 }
 
@@ -208,6 +696,142 @@ public enum TaskSnapshotStatus
     Active,
     Suspended,
     Completed,
+}
+
+/// <summary>
+/// F5: the validated run configuration a long-flow client needs to see. Every
+/// field is the value in force for THIS run, reported by the host that applied
+/// it — not an echo of what a client asked for.
+/// </summary>
+public sealed record WorkRunConfig
+{
+    /// Must match the Rust <c>MAX_RUN_CONFIG_FIELD_BYTES</c> (128) exactly.
+    public const int MaxFieldBytes = 128;
+
+    /// <summary><c>append</c> | <c>rolling</c> | <c>dynamic</c> | <c>service</c>.</summary>
+    [JsonPropertyName("context_policy")]
+    public string ContextPolicy { get; init; } = string.Empty;
+
+    /// <summary>The finite per-turn MODEL-round budget the kernel enforces.
+    /// Counts model decision rounds, not tool calls.</summary>
+    [JsonPropertyName("max_model_rounds")]
+    public uint MaxModelRounds { get; init; }
+
+    /// <summary><c>cli</c> when the operator set the budget explicitly,
+    /// <c>kernel_default</c> otherwise.</summary>
+    [JsonPropertyName("max_model_rounds_source")]
+    public string MaxModelRoundsSource { get; init; } = string.Empty;
+
+    [JsonPropertyName("maintenance_max_calls_per_maintain")]
+    public uint MaintenanceMaxCallsPerMaintain { get; init; }
+
+    /// <summary><c>null</c> means unbounded — reported honestly instead of as a
+    /// large number.</summary>
+    [JsonPropertyName("maintenance_max_tokens_per_maintain")]
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    public ulong? MaintenanceMaxTokensPerMaintain { get; init; }
+
+    [JsonPropertyName("maintenance_timeout_secs")]
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    public ulong? MaintenanceTimeoutSecs { get; init; }
+
+    [JsonPropertyName("provider_profile_digest")]
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    public string? ProviderProfileDigest { get; init; }
+
+    [JsonPropertyName("prompt_cache_mode")]
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    public string? PromptCacheMode { get; init; }
+
+    /// <summary>Whether this session is observation-only.</summary>
+    [JsonPropertyName("read_only")]
+    public bool ReadOnly { get; init; }
+
+    public void Validate()
+    {
+        ContractText.ValidateIdentifier(
+            "work.snapshot.effective_config.context_policy", ContextPolicy, MaxFieldBytes);
+        ContractText.ValidateIdentifier(
+            "work.snapshot.effective_config.max_model_rounds_source", MaxModelRoundsSource, MaxFieldBytes);
+        // A zero round budget could never complete a turn; accepting it silently
+        // would hide a misconfigured host.
+        if (MaxModelRounds == 0)
+        {
+            throw new AgentContractViolationException(
+                "work.snapshot.effective_config.max_model_rounds", "must be at least one model round");
+        }
+        if (ProviderProfileDigest is not null)
+        {
+            ContractText.ValidateOpaque(
+                "work.snapshot.effective_config.provider_profile_digest", ProviderProfileDigest, MaxFieldBytes);
+        }
+        if (PromptCacheMode is not null)
+        {
+            ContractText.ValidateIdentifier(
+                "work.snapshot.effective_config.prompt_cache_mode", PromptCacheMode, MaxFieldBytes);
+        }
+    }
+}
+
+/// <summary>F5: the store-outage backpressure fact carried on the snapshot.</summary>
+public sealed record WorkStoreBackpressure
+{
+    /// <summary>The last boundary pass hit the retry-list cap: NEW body
+    /// production is throttled while every control/query channel stays live.</summary>
+    [JsonPropertyName("active")]
+    public bool Active { get; init; }
+
+    [JsonPropertyName("externalize_deferred")]
+    public ulong ExternalizeDeferred { get; init; }
+
+    [JsonPropertyName("store_io_failures")]
+    public ulong StoreIoFailures { get; init; }
+
+    public void Validate()
+    {
+    }
+}
+
+/// <summary>F5: why <c>work.continue</c> would (or would not) start a turn.</summary>
+public enum WorkContinueReason
+{
+    Ready,
+    NoActiveTask,
+    TurnRunning,
+    RecoveryRequired,
+    CleanupInFlight,
+    /// <summary>The active task holds no directive body to replay.</summary>
+    NoRetainedDirective,
+    /// <summary>A legacy record sits exactly at the old anchor cap, where a
+    /// complete and a truncated instruction are indistinguishable: continuation
+    /// refuses rather than replay a prefix.</summary>
+    DirectiveMayBeTruncated,
+}
+
+public sealed record WorkContinueReadiness
+{
+    [JsonPropertyName("can_continue")]
+    public bool CanContinue { get; init; }
+
+    [JsonPropertyName("reason")]
+    [JsonRequired]
+    public WorkContinueReason Reason { get; init; }
+
+    public void Validate()
+    {
+        if (!Enum.IsDefined(typeof(WorkContinueReason), Reason))
+        {
+            throw new AgentContractViolationException(
+                "work.snapshot.continue_readiness.reason", $"is not a defined reason: {Reason}");
+        }
+        // The boolean is a projection of the reason, never an independent claim:
+        // a client must not be able to read "ready" beside a blocker.
+        if (CanContinue != (Reason == WorkContinueReason.Ready))
+        {
+            throw new AgentContractViolationException(
+                "work.snapshot.continue_readiness", "can_continue must agree with the typed reason");
+        }
+    }
 }
 
 public sealed record TaskSnapshotEntry
@@ -362,6 +986,26 @@ public sealed record WorkSnapshotResponse : IProtocolPayload
     [JsonPropertyName("restore_evidence_degraded")]
     public IReadOnlyList<string> RestoreEvidenceDegraded { get; init; } = [];
 
+    /// <summary>F5: the run configuration actually in effect, so a headless
+    /// client can answer "what is this host configured to do?" without a GUI.
+    /// <c>null</c> on a server that does not report it.</summary>
+    [JsonPropertyName("effective_config")]
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    public WorkRunConfig? EffectiveConfig { get; init; }
+
+    /// <summary>F5 (CTX-8): the engine's store-outage backpressure as last
+    /// observed. <c>null</c> means the server does not report it;
+    /// <c>Active == false</c> means a clean pass lifted it.</summary>
+    [JsonPropertyName("store_backpressure")]
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    public WorkStoreBackpressure? StoreBackpressure { get; init; }
+
+    /// <summary>F5: whether the active task's retained directive can be
+    /// continued right now, with the typed reason when it cannot.</summary>
+    [JsonPropertyName("continue_readiness")]
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    public WorkContinueReadiness? ContinueReadiness { get; init; }
+
     public void Validate()
     {
         // PLATFORM-3: the identity facts are mandatory — a snapshot that
@@ -407,6 +1051,9 @@ public sealed record WorkSnapshotResponse : IProtocolPayload
             ContractText.ValidateText("work.snapshot.focus.goal", Focus.Goal, MaxGoalChars);
             ContractText.ValidateTaskId("work.snapshot.focus.task_id", Focus.TaskId);
         }
+        EffectiveConfig?.Validate();
+        StoreBackpressure?.Validate();
+        ContinueReadiness?.Validate();
     }
 }
 

@@ -86,7 +86,7 @@ public class WorkbenchBackpressureAndIdempotencyTests
 
     /// <summary>Drill connection with a writable event stream and a
     /// snapshot handler, so the pump can be fed deterministically.</summary>
-    private sealed class WritableEventConnection : IAgentConnection
+    private sealed class WritableEventConnection : LongFlowControlsNotExercised, IAgentConnection
     {
         public Task<WorkTaskCompletionResponse> TaskCompletionAsync(string taskId, CancellationToken cancellationToken = default) =>
             Task.FromResult(new WorkTaskCompletionResponse { TaskId = taskId, Fact = new WorkCompletionFactBeyondJournalWindow() });
@@ -106,10 +106,10 @@ public class WorkbenchBackpressureAndIdempotencyTests
         public Task<WorkSubmitResponse> SubmitWorkAsync(string goal, string clientRequestId, CancellationToken cancellationToken = default) =>
             throw new NotSupportedException("drills do not submit over this connection");
 
-        public Task<WorkContinueResponse> ContinueAsync(CancellationToken cancellationToken = default) =>
+        public Task<WorkContinueResponse> ContinueAsync(string? expectedTaskId = null, CancellationToken cancellationToken = default) =>
             throw new NotSupportedException("drills do not continue");
 
-        public Task<WorkCancelResponse> CancelCurrentTurnAsync(CancellationToken cancellationToken = default) =>
+        public Task<WorkCancelResponse> CancelCurrentTurnAsync(string? expectedTaskId = null, string? expectedTurnId = null, CancellationToken cancellationToken = default) =>
             throw new NotSupportedException("drills do not cancel");
 
         public Task<WorkSubscribeResponse> SubscribeAsync(ulong? replayAfterSeq = null, CancellationToken cancellationToken = default) =>
@@ -144,7 +144,7 @@ public class WorkbenchBackpressureAndIdempotencyTests
     /// <summary>Drill connection that records every submit's
     /// <c>client_request_id</c> and lets a test control the in-flight result
     /// (open / faulted), so the idempotency-key lifecycle is observable.</summary>
-    private sealed class RecordingSubmitConnection : IAgentConnection
+    private sealed class RecordingSubmitConnection : LongFlowControlsNotExercised, IAgentConnection
     {
         public Task<WorkTaskCompletionResponse> TaskCompletionAsync(string taskId, CancellationToken cancellationToken = default) =>
             Task.FromResult(new WorkTaskCompletionResponse { TaskId = taskId, Fact = new WorkCompletionFactBeyondJournalWindow() });
@@ -170,10 +170,10 @@ public class WorkbenchBackpressureAndIdempotencyTests
             return CurrentSubmit.Task;
         }
 
-        public Task<WorkContinueResponse> ContinueAsync(CancellationToken cancellationToken = default) =>
+        public Task<WorkContinueResponse> ContinueAsync(string? expectedTaskId = null, CancellationToken cancellationToken = default) =>
             throw new NotSupportedException("drills do not continue");
 
-        public Task<WorkCancelResponse> CancelCurrentTurnAsync(CancellationToken cancellationToken = default) =>
+        public Task<WorkCancelResponse> CancelCurrentTurnAsync(string? expectedTaskId = null, string? expectedTurnId = null, CancellationToken cancellationToken = default) =>
             throw new NotSupportedException("drills do not cancel");
 
         public Task<WorkSubscribeResponse> SubscribeAsync(ulong? replayAfterSeq = null, CancellationToken cancellationToken = default) =>
@@ -214,7 +214,7 @@ public class WorkbenchBackpressureAndIdempotencyTests
     /// programmable. Queries are recorded with the id and digest they asked
     /// about, and the answer models a correct server by echoing the queried
     /// id — so the resolution path's identity handling is observable.</summary>
-    private sealed class LostReceiptConnection : IAgentConnection
+    private sealed class LostReceiptConnection : LongFlowControlsNotExercised, IAgentConnection
     {
         public Task<WorkTaskCompletionResponse> TaskCompletionAsync(string taskId, CancellationToken cancellationToken = default) =>
             Task.FromResult(new WorkTaskCompletionResponse { TaskId = taskId, Fact = new WorkCompletionFactBeyondJournalWindow() });
@@ -256,10 +256,10 @@ public class WorkbenchBackpressureAndIdempotencyTests
             });
         }
 
-        public Task<WorkContinueResponse> ContinueAsync(CancellationToken cancellationToken = default) =>
+        public Task<WorkContinueResponse> ContinueAsync(string? expectedTaskId = null, CancellationToken cancellationToken = default) =>
             throw new NotSupportedException("drills do not continue");
 
-        public Task<WorkCancelResponse> CancelCurrentTurnAsync(CancellationToken cancellationToken = default) =>
+        public Task<WorkCancelResponse> CancelCurrentTurnAsync(string? expectedTaskId = null, string? expectedTurnId = null, CancellationToken cancellationToken = default) =>
             throw new NotSupportedException("drills do not cancel");
 
         public Task<WorkSubscribeResponse> SubscribeAsync(ulong? replayAfterSeq = null, CancellationToken cancellationToken = default) =>

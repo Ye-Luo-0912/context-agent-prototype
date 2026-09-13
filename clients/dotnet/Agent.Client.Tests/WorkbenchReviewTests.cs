@@ -25,7 +25,7 @@ public class WorkbenchReviewTests
     /// <summary>Review drill fixture: a connection whose four B3 read routes
     /// are programmable handlers plus the minimal snapshot/event surface the
     /// workbench's connect path needs.</summary>
-    private sealed class ReviewStub : IAgentConnection
+    private sealed class ReviewStub : LongFlowControlsNotExercised, IAgentConnection
     {
         public Task<WorkTaskCompletionResponse> TaskCompletionAsync(string taskId, CancellationToken cancellationToken = default) =>
             Task.FromResult(new WorkTaskCompletionResponse { TaskId = taskId, Fact = new WorkCompletionFactBeyondJournalWindow() });
@@ -74,10 +74,10 @@ public class WorkbenchReviewTests
         public Task<WorkSubmitResponse> SubmitWorkAsync(string goal, string clientRequestId, CancellationToken cancellationToken = default) =>
             throw new NotSupportedException("review drills do not submit");
 
-        public Task<WorkContinueResponse> ContinueAsync(CancellationToken cancellationToken = default) =>
+        public Task<WorkContinueResponse> ContinueAsync(string? expectedTaskId = null, CancellationToken cancellationToken = default) =>
             throw new NotSupportedException("review drills do not continue");
 
-        public Task<WorkCancelResponse> CancelCurrentTurnAsync(CancellationToken cancellationToken = default) =>
+        public Task<WorkCancelResponse> CancelCurrentTurnAsync(string? expectedTaskId = null, string? expectedTurnId = null, CancellationToken cancellationToken = default) =>
             throw new NotSupportedException("review drills do not cancel");
 
         public Task<WorkSubscribeResponse> SubscribeAsync(ulong? replayAfterSeq = null, CancellationToken cancellationToken = default) =>

@@ -42,7 +42,7 @@ public class WorkbenchLifecycleTests
 
     /// <summary>Drill fixture: a connection whose snapshot answers are
     /// programmable and whose event stream is a channel the drill writes.</summary>
-    private sealed class StubConnection : IAgentConnection
+    private sealed class StubConnection : LongFlowControlsNotExercised, IAgentConnection
     {
         public Task<WorkTaskCompletionResponse> TaskCompletionAsync(string taskId, CancellationToken cancellationToken = default) =>
             Task.FromResult(new WorkTaskCompletionResponse { TaskId = taskId, Fact = new WorkCompletionFactBeyondJournalWindow() });
@@ -65,10 +65,10 @@ public class WorkbenchLifecycleTests
         public Task<WorkSubmitResponse> SubmitWorkAsync(string goal, string clientRequestId, CancellationToken cancellationToken = default) =>
             throw new NotSupportedException("lifecycle drills do not submit");
 
-        public Task<WorkContinueResponse> ContinueAsync(CancellationToken cancellationToken = default) =>
+        public Task<WorkContinueResponse> ContinueAsync(string? expectedTaskId = null, CancellationToken cancellationToken = default) =>
             throw new NotSupportedException("lifecycle drills do not continue");
 
-        public Task<WorkCancelResponse> CancelCurrentTurnAsync(CancellationToken cancellationToken = default) =>
+        public Task<WorkCancelResponse> CancelCurrentTurnAsync(string? expectedTaskId = null, string? expectedTurnId = null, CancellationToken cancellationToken = default) =>
             throw new NotSupportedException("lifecycle drills do not cancel");
 
         public Task<WorkSubscribeResponse> SubscribeAsync(ulong? replayAfterSeq = null, CancellationToken cancellationToken = default) =>

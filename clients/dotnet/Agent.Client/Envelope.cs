@@ -157,6 +157,14 @@ public sealed record Route
     public const string WorkSnapshot = "snapshot";
     public const string WorkSubscribe = "subscribe";
     public const string WorkEvent = "event";
+    // F5: in-task steering, task lifecycle and the formal checkpoint plane.
+    // `steer` is deliberately a different route from `submit`: a correction must
+    // never be admitted as new work.
+    public const string WorkSteer = "steer";
+    public const string WorkActivate = "activate";
+    public const string WorkSuspend = "suspend";
+    public const string WorkCheckpoint = "checkpoint";
+    public const string WorkRestore = "restore";
     // B3 read-only routes (run-scoped; never start a model round).
     public const string WorkTaskDetail = "task_detail";
     /// <summary>EXEC-8 (R2-09): read-only cold lookup of one completed
@@ -179,6 +187,11 @@ public sealed record Route
     public static Route WorkSubmitRoute() => new() { Namespace = WorkNamespace, Operation = WorkSubmit };
     public static Route WorkContinueRoute() => new() { Namespace = WorkNamespace, Operation = WorkContinue };
     public static Route WorkCancelRoute() => new() { Namespace = WorkNamespace, Operation = WorkCancel };
+    public static Route WorkSteerRoute() => new() { Namespace = WorkNamespace, Operation = WorkSteer };
+    public static Route WorkActivateRoute() => new() { Namespace = WorkNamespace, Operation = WorkActivate };
+    public static Route WorkSuspendRoute() => new() { Namespace = WorkNamespace, Operation = WorkSuspend };
+    public static Route WorkCheckpointRoute() => new() { Namespace = WorkNamespace, Operation = WorkCheckpoint };
+    public static Route WorkRestoreRoute() => new() { Namespace = WorkNamespace, Operation = WorkRestore };
     public static Route WorkSnapshotRoute() => new() { Namespace = WorkNamespace, Operation = WorkSnapshot };
     public static Route WorkSubscribeRoute() => new() { Namespace = WorkNamespace, Operation = WorkSubscribe };
     public static Route WorkTaskDetailRoute() => new() { Namespace = WorkNamespace, Operation = WorkTaskDetail };
