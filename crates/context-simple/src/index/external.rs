@@ -192,7 +192,8 @@ impl ExternalMap {
         self.rebuild_indexes();
         // Cards of dropped entries are no longer claims about anything the
         // map owns; the reconcile sweep reclaims the files themselves.
-        self.card_hashes.retain(|id, _| self.id_index.contains_key(id));
+        self.card_hashes
+            .retain(|id, _| self.id_index.contains_key(id));
     }
 
     /// Take the map out for wholesale processing (storage-GC commit); the
@@ -237,6 +238,7 @@ impl ExternalMap {
 
     /// Recorded card rows. Bounded by the number of externalized entries,
     /// and each row is an id plus a short hash rather than metadata.
+    #[cfg(test)]
     pub(crate) fn recorded_cards(&self) -> usize {
         self.card_hashes.len()
     }

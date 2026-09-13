@@ -943,7 +943,6 @@ impl SimpleContextEngine {
     async fn run_external_spill_io(&self, plan: ExternalSpillPlan) -> ExternalSpillIo {
         let mut io = ExternalSpillIo {
             spilled: plan.recorded,
-            deferred: plan.deferred,
             ..ExternalSpillIo::default()
         };
         if plan.writes.is_empty() {
@@ -966,16 +965,17 @@ impl SimpleContextEngine {
         let started = std::time::Instant::now();
         for (index, (item_id, hash, bytes)) in plan.writes.into_iter().enumerate() {
             let path = crate::store::external_card_path(&dir, item_id, &hash);
+            // 内容寻址幂等：文件已存在即卡片已是同一字节，无需重写。
             if tokio::fs::try_exists(&path).await.unwrap_or(false) {
+                io.written.push((item_id, hash.clone()));
                 io.spilled.push((item_id, hash));
                 continue;
             }
-            // Checked after the first write so a zero budget still makes
-            // progress instead of live-locking the spill forever.
+            // Checked after the first write so a spent budget still makes
+            // progress instead of live-locking the spill forever. What is
+            // left stays inline; the next capture continues.
             if index > 0 && started.elapsed() >= budget {
-                io.deferred = io.deferred.saturating_add(1);
-                io.io_budget_exhausted += 1;
-                continue;
+                break;
             }
             match crate::store::write_external_card_async(&dir, &path, &bytes).await {
                 Ok(()) => {
@@ -984,10 +984,7 @@ impl SimpleContextEngine {
                 }
                 // Store IO 失败：该条目本次保持内联（宁可 checkpoint 大，
                 // 不可丢恢复状态）；与外部化失败同一诚实语义。
-                Err(_) => {
-                    io.deferred = io.deferred.saturating_add(1);
-                    io.io_failures += 1;
-                }
+                Err(_) => continue,
             }
         }
         io
@@ -1006,10 +1003,8 @@ impl SimpleContextEngine {
                 return 0;
             }
             let take = budget.min(state.pending_external_cards.len());
-            state
-                .pending_external_cards
-                .drain(..take)
-                .collect::<Vec<_>>()
+            let rest = state.pending_external_cards.split_off(take);
+            std::mem::replace(&mut state.pending_external_cards, rest)
         };
         let dir = crate::store::store_dir(&self.config);
         let mut entries = Vec::new();
@@ -1100,24 +1095,19 @@ struct ExternalSpillPlan {
     recorded: Vec<(ContextItemId, String)>,
     /// Cards this capture must write: (id, card hash, bytes).
     writes: Vec<(ContextItemId, String, Vec<u8>)>,
-    /// Entries examined while planning. Bounded by the scan budget.
+    /// Entries this capture serialized. Bounded by the scan budget; an
+    /// entry the budgets leave out simply stays inline this time.
     scanned: usize,
-    /// Over-target candidates this capture leaves inline (scan, byte, write
-    /// or duration budget). The checkpoint is honestly larger; the next
-    /// capture continues from the recorded-card directory.
-    deferred: usize,
 }
 
 /// Result of a capture's off-lock card I/O.
 #[derive(Debug, Default)]
 struct ExternalSpillIo {
-    /// Manifest rows: recorded plus newly written cards.
+    /// Manifest rows: recorded plus cards this capture put on disk.
     spilled: Vec<(ContextItemId, String)>,
-    /// Cards written by this capture, to be recorded under the fresh lock.
+    /// Cards proven on disk by this capture (written, or found already
+    /// there), to be recorded in the directory under the fresh lock.
     written: Vec<(ContextItemId, String)>,
-    deferred: usize,
-    io_failures: usize,
-    io_budget_exhausted: usize,
 }
 
 /// Whether an external entry may have its metadata spilled to a card.
@@ -1146,13 +1136,13 @@ fn plan_external_spill(state: &State, config: &SimpleContextConfig) -> ExternalS
     let over = total.saturating_sub(config.external_checkpoint_inline_target);
     let mut bytes_left = config.external_checkpoint_card_bytes;
     let mut writes_left = config.external_checkpoint_card_batch;
-    let mut candidates = 0usize;
     // 最旧优先（槽位序即外置序）。
-    for entry in state.external.iter().filter(|entry| spillable_entry(entry)) {
-        if candidates >= over {
-            break;
-        }
-        candidates += 1;
+    for entry in state
+        .external
+        .iter()
+        .filter(|entry| spillable_entry(entry))
+        .take(over)
+    {
         // A recorded card already holds this entry's current metadata: the
         // row is free (one hash lookup, no serialization, no I/O), so it
         // does not spend the scan budget. That is what lets a capture keep
@@ -1161,20 +1151,12 @@ fn plan_external_spill(state: &State, config: &SimpleContextConfig) -> ExternalS
             plan.recorded.push((entry.item_id, hash.to_string()));
             continue;
         }
-        if plan.scanned >= config.external_checkpoint_scan_budget {
-            // Arithmetic, not another scan: every candidate left is one this
-            // capture leaves inline.
-            plan.deferred = plan.deferred.saturating_add(over.saturating_sub(candidates - 1));
+        if plan.scanned >= config.external_checkpoint_scan_budget || writes_left == 0 {
             break;
         }
         plan.scanned += 1;
-        if writes_left == 0 {
-            plan.deferred += 1;
-            continue;
-        }
         let bytes = crate::store::external_card_bytes(entry);
         if bytes.len() as u64 > bytes_left {
-            plan.deferred += 1;
             continue;
         }
         bytes_left -= bytes.len() as u64;

@@ -545,7 +545,10 @@ async fn a_restore_pages_in_a_bounded_batch_and_defers_the_rest() {
     // Search coverage is unchanged: the directory drains in bounded batches
     // before candidates are generated.
     let hits = restored
-        .search_external(agent_contracts::ContextSearchQuery::new("unique-token-19", 8))
+        .search_external(agent_contracts::ContextSearchQuery::new(
+            "unique-token-19",
+            8,
+        ))
         .await
         .unwrap();
     assert!(
@@ -600,7 +603,11 @@ async fn a_capture_taken_before_paging_keeps_every_deferred_row() {
     let reloaded = spill_engine(&dir, 10).await;
     reloaded.restore(second).await.unwrap();
     let state = reloaded.state.lock().await;
-    assert_eq!(state.external.len(), 30, "every entry survives the round trip");
+    assert_eq!(
+        state.external.len(),
+        30,
+        "every entry survives the round trip"
+    );
     assert_eq!(state.external_cards_missing, 0);
 }
 
