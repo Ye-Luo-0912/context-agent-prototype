@@ -7,7 +7,7 @@ M18 队列顺序不变；本插入是长流程 C 线（供应商 KV／prompt cac
 | 切片 | 用户结果与验收边界 |
 |---|---|
 | **A0** | 调查 proof_supervision CI「exact proof tree exit」；保留进程身份事实；禁止只加 timeout / 删测 |
-| **R7（先修）** | search.grep 的 scan_continuation 进入模型可见 input_schema；经 ToolSpec→wire→dispatcher 续跑第二批 |
+| **R7（先修）** | search.grep 的 scan_continuation 进入模型可见 input_schema；经 ToolSpec→wire→dispatcher 续跑第二批 | **代码落地（2026-09-13，工作树）**：spec 的 input_schema 新增 `scan_continuation`（string、maxLength 256——与真实 sealed locator ≈125 字符对照断言、同查询语义与「原样回传/不得编造」写入 description）；声明经 `compact_for_model_surface` 保留（compactor 只截 description/剥 schema description，实测断言钉住）；红检查在先（schema 未声明时失败），dispatcher 端到端：batch2 参数严格由 schema 声明属性构造（仅 pattern＋scan_continuation）经公开 execute 到第二批、hits_total=6、scan_complete=true。tool-runtime **271** 全绿、clippy 0。[回执](reviews/2026-09-13-kv-cache-layout-489c89cd/A1_R7_GREP_SCHEMA_RECEIPT.md)；未提交/未跑远端 CI |
 | **R2** | 已确认端点发送稳定 prompt_cache_key（非每轮 UUID） |
 | **R3** | 显式-only：无合法边界时不悄悄退回隐式写；compactor 单独策略 |
 | **R1+R4** | 稳定证据基座 B0/B1 与易变投影分离；状态字段不破坏合法前缀 |
