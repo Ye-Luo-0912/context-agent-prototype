@@ -1,6 +1,30 @@
 # 可执行任务队列
 
-## 并行插入：供应商 KV 布局 + ZCode 清单（2026-09-13）
+## 当前：2026-09-14 后端续审（基线 `6eda2474`）——恢复保全优先，A/B/C 三线续接
+
+**本轮重点不是新增功能，而是把已有功能在持久恢复、异步取消、工具结果与供应商请求之间没有接通的链路补完。** 固定基线 `6eda2474`（远端 CI 已成功的当前 main）；10 项问题（2 P1＋8 P2）全部来自源码路径审查，与本轮交付包一起入库：[REVIEW_6eda2474.md](reviews/2026-09-14-backend-review-6eda2474/REVIEW_6eda2474.md)｜[NEXT_BACKEND_TASKS.md](reviews/2026-09-14-backend-review-6eda2474/NEXT_BACKEND_TASKS.md)｜[COVERAGE_6eda2474.md](reviews/2026-09-14-backend-review-6eda2474/COVERAGE_6eda2474.md)。审查方环境无 Cargo/.NET，**所有回归均待添加执行**；上轮旧版本 CI 失败不计入当前版本。
+
+**执行顺序：B1/B2（数据保全 P1）最先收口；A、C 并行。** 已落地能力不重做（上轮 A0/R7/R2/R3/R1+R4/R6 保留，本轮是它们的接线与残余缺陷）。
+
+| 归属 | 切片（报告编号） | 用户结果与验收边界 |
+|---|---|---|
+| B 首片 · **P1** | **B1**（N01）卡片清理绕过保护根：blob 清理看 `roots_complete` 但 cards 分支不看，也不保护本次扫描新发现的 `rebuilt_candidates`；服务冷启动 reconcile 用空保护集＋`roots_complete=true`，可能删除保留 checkpoint 引用的卡片。**最小修复：**blob 与 card 共用删除许可；根不完整延后相应删除；启动阶段（恢复所有权未安装时）只做非破坏性 reconcile；仅把启动参数改 `false` 不够，必须修 cards 分支。验收：真实服务进程回归——外置→分片 checkpoint→服务退出→同 store 重启→restore→原文与捕获元数据一致；真孤儿在完整根下仍可清理 |
+| B 第二片 · **P1** | **B2**（N02）冷页读取先移除 owner 再 await：`hydrate_pending_cards`/`hydrate_card_for` 锁内 remove 后等磁盘 I/O，取消或临时 I/O 错误（被统一计成 missing）都丢目录项；`op_gate` 不在 future 丢弃时回滚。**最小修复：**锁内复制有界读取计划保留原 owner；锁外读取；重拿锁后仅对验证成功条目提交迁移；区分 Missing/Corrupt/IoFailed 与取消。验收：读取中间设可控暂停点，分别取消单条 fetch 与批量 hydration，检查 owner 集合、诊断数量与下一份 checkpoint |
+| B 第三片 | **B3**（N03）卡片读取无硬字节上限（整体 `tokio::fs::read`）、不核对 manifest expected hash、延后页直接 `merge_paged` 绕过结构验证。复用已有 blob reader 模式补齐三点；Missing/Corrupt/IoFailed 不强行归一。FNV 校验和不冒充密码学认证。规模残余（hydrate_all 总工作量）沿原队列，明确当前支持规模 |
+| A 首片 | **A1**（N07/N08）`process.session` 把信号退出（`ExitStatus::code()==None`）误判为 running；即时 `model_content` 不区分 exit=0/exit=7；poll 的 try_recv 初段无总预算、退出后每次 recv 重计 1s、持全局 sessions mutex 等慢 I/O。**修复：**进程状态（Running/Exited{code,signal,success}）与输出状态（排空/有待读）分离；短注册表锁＋每会话状态；绝对批次期限＋循环中取消检查；未读输出留下一批。验收：两会话并发（一持续写）另一停止仍及时；查询成功/进程结束/进程成功/输出完整四事实独立可见 |
+| A 第二片 | **A2**（N09）shell.exec 与 process.run 的退出后 grace 实际从启动时 `sleep(500ms)` 起算，长命令退出时 timer 已过期，漏日志尾部。**修复：**从实际观察到退出的时刻起算排空预算，两处同类控制流一起修；大小截断标志不冒充管道已排空。验收：长命令退出后 grace 内送达的 sentinel 不丢；超 grace 明确 incomplete |
+| A 第三片 | **A3**（N10）MCP `tools/list` 只读第一页（忽略 `nextCursor`，2024-11-05 规范已定义），第二页工具不进能力目录。**修复：**沿现有客户端补有界发现循环——总页数/总工具数/总字节/总期限；重复 cursor、重复工具名、取消与中途失败处理；达界明确不完整，不把首批静默当完整 manifest。验收：第二页工具从正式 adapter 被发现和调用 |
+| C 首片 | **C1**（N04）KV 字段停在声明层：`into_request` 生成 `cache_breakpoints` 但 `prompt_cache_key` 默认 None；Runtime 生产调用点直接用 `into_request` 结果，不填 key；Responses mapper 仍只映射旧单一 `prompt_reuse_boundary`，多断点列表未被逐项映射。**修复：**Runtime/组合根在生产组装点按 `{隔离域}|{workspace}|{端点}|{task}|{lane}` 形状填稳定不透明键（禁每轮 UUID/完整请求 hash）；mapper 对最终请求的合法边界逐项验证映射，考虑空消息过滤与协议展开后下标变化；仅确认端点收字段。**验收必须是真实生产链路（Compose→actor→transport→HTTP）发出的请求，不是 DTO 手工填 key 的 mapper 测试** |
+| C 第二片 | **C2**（N05/N06）无稳定证据时回退成整个 context 可缓存（`None` 被当旧格式兼容纳入全部 `context_frame`），且用正文包含 "SELECTED WORKING CONTEXT" 字符串猜分段；`EvidenceSplit.base+epoch` 未经验证直接相加切片（越界/溢出风险）。**修复：**分段结构来自组装过程的类型化计数，新输入无稳定证据也明确 `Some{0,0}`，`None` 只留旧序列化输入；checked_add＋所属层长度验证先于任何切片，非法 split 拒绝而非 panic |
+| C 条件 | **C3**（成本对照，条件任务）先读回最终 wire 验证正确性，再按既有 live harness 固定任务对照；无预算/凭据记 NOT_RUN；实测前不报降本百分比 |
+
+**收尾旅程（N01/N02 是发布前要求）：**①一个跨模块真实任务走 headless/host 接收→转向→停止→恢复→验证→交付；②同一任务触发外置/分片/服务重启，恢复 metadata+body 原事实；③长进程与分页 MCP 工具实际参与执行且模型看到正确结果；④至少两次生产链路组装的请求验证稳定 key/B0/B1（条件允许时附真实供应商用量对照）。
+
+**做到这里停止：**不新建 scheduler／任务 authority／GC 框架／trace 数据库；不做 GUI 功能扩展（仅必要兼容修复）；不为缓存保留失效证据或延迟权限撤销；代码审查小问题不自动升级为发布总门禁（高风险恢复缺陷例外）。
+
+---
+
+## 并行插入：供应商 KV 布局 + ZCode 清单（2026-09-13，已收口）
 
 M18 队列顺序不变；本插入是长流程 C 线（供应商 KV／prompt cache 布局）与工具表面收口，**由 ZCode 实施**。
 **状态（2026-09-13 收口）：A0/R7/R2/R3/R1+R4/R6 全部落地并合入 main（提交 `aaeb827f`、`3bd326a2`、`3c9f600e`、`8dca1b63`，fmt 修复 `2642d2c5`），CI run `34765619847` 七个作业全绿；仅 R5（条件性）未开始。**

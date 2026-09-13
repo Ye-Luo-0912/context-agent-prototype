@@ -1,0 +1,530 @@
+{
+  "repository": "Ye-Luo-0912/context-agent-prototype",
+  "baseline_sha": "6eda247401092a18bcbd547e475bc79b1ed3a4c1",
+  "comparison_sha": "489c89cd7d139f4e721348ec9c54054700d93b7b",
+  "review_date_jst": "2026-09-14",
+  "review_mode": "static_multi_crate_continuation",
+  "all_files_read": false,
+  "workspace_crates_in_inventory": 20,
+  "local_rust_tests": "NOT_RUN",
+  "local_dotnet_tests": "NOT_RUN",
+  "paid_provider_calls": "NOT_RUN",
+  "repository_mutations": false,
+  "ci": {
+    "run_id": 34766940848,
+    "status": "completed",
+    "conclusion": "success",
+    "evidence": "remote GitHub Actions response"
+  },
+  "findings": [
+    {
+      "id": "N01",
+      "severity": "P1",
+      "title": "元数据卡片清理绕过保护根完整性，服务冷启动可破坏保留 checkpoint",
+      "files": [
+        [
+          "crates/context-simple/src/store.rs",
+          1450,
+          1765
+        ],
+        [
+          "crates/context-simple/src/engine.rs",
+          1740,
+          1945
+        ],
+        [
+          "crates/agent-context-service/src/main.rs",
+          1,
+          120
+        ],
+        [
+          "crates/agent-context-service/src/lib.rs",
+          1,
+          155
+        ]
+      ],
+      "fact": "blob 清理分支使用 roots_complete，但 cards 目录的清理只检查 map_checksums 和 protected 是否包含 id。它不检查 roots_complete，也没有把本次 blob 扫描待重新认领的 rebuilt_candidates 纳入保护集。服务启动时 build_engine 创建新引擎，然后在接收 Restore 前调用普通 reconcile_store；普通版本传入空保护集和 roots_complete=true。",
+      "trigger": "路径一：调用保护性 reconcile，但根枚举失败，传 roots_complete=false；不在当前 map/已知 protected 中的卡片仍可能被删除。路径二：已有包含 external_spilled 的保留检查点，关闭服务，再在同一持久 store 上启动新服务；空 map 下的 blob 被排入待认领列表，卡片却在这些 owner 提交前被当孤儿删除。",
+      "impact": "恢复所依赖的 .card 元数据可能被实际删除，后续恢复只能缺失或降级。不能把这个结论扩大为所有 .json 原文立即被删除：原文可能还在，失去的是 checkpoint 捕获的元数据版本及恢复承诺。",
+      "fix": "统一 blob 与 card 的删除许可：根集合不完整时延后所有相应删除。恢复所有权尚未安装的启动阶段采用非破坏性 reconcile；仅把启动参数换成 false 不够，必须先修 cards 分支。当前 pending owner 与本轮待认领 owner 必须计入保留判断。继续复用现有根枚举、store 和事务，不增加第二个根数据库。",
+      "tests": [
+        "真实 service 进程：外置 → 分片 checkpoint → 退出 → 同 store 重启 → restore → 原文与捕获元数据逐项一致。",
+        "roots_complete=false 且没有已知 owner 的卡片不得删除；故障消失后完整枚举才允许做删除判断。",
+        "同一次 reconcile 的有效 ownerless blob 与对应 card 一起保留，随后只产生一个 owner。"
+      ],
+      "stop": "两类删除反例都变为保留；完整根条件下真正孤儿仍能清理；原文、卡片与检查点恢复语义一致。"
+    },
+    {
+      "id": "N02",
+      "severity": "P1",
+      "title": "冷页读取先移除待加载 owner，再 await；取消与临时 I/O 失败会丢失目录项",
+      "files": [
+        [
+          "crates/context-simple/src/engine.rs",
+          990,
+          1155
+        ],
+        [
+          "crates/context-simple/src/engine.rs",
+          1740,
+          1945
+        ],
+        [
+          "crates/context-simple/src/engine.rs",
+          2090,
+          2285
+        ]
+      ],
+      "fact": "hydrate_pending_cards 先 split_off/mem::replace 移出 pending_external_cards，再逐卡 await；hydrate_card_for 先 remove(position)，再 await。没有保留状态内 owner 的 in-flight 记录或取消归还守卫。读取的所有失败被合并为 missing 并消费该记录。",
+      "trigger": "在页已从 pending 集合移出、但磁盘读取尚未返回时取消/dropping future。另一个触发是权限、设备或短暂读取错误；即使稍后磁盘恢复，这个 pending locator 也已被消费。",
+      "impact": "条目可从当前逻辑目录和下一份 checkpoint 的 manifest 消失。op_gate 只保证互斥，不自动实现取消回滚。部分上层回滚可能补救，但底层不能依赖每个调用方恰好回滚；是否进一步引发错误清理由对应集成用例验证。",
+      "fix": "在状态中保留原 pending owner，锁内只复制有限读取计划；锁外读取；重新拿锁后仅对验证成功的相同 owner 提交迁移。或者使用可证明的取消安全所有权守卫。对 Missing、Corrupt、IoFailed、Cancelled 分别处理，临时失败保留可重试位置，不按“没有数据”消费。",
+      "tests": [
+        "门控 card read：取计划后挂起，abort，再比较 owner 集、diagnostics、下一份 checkpoint manifest。",
+        "单 id fetch 与整批 hydration 分别取消；覆盖成功一部分、下一张卡等待中的情形。",
+        "注入一次临时 I/O 失败，恢复磁盘后同 id 仍可读取且无双 owner。"
+      ],
+      "stop": "任何 await 边界取消都不丢 owner；可重试失败不永久丢引用；成功迁移恰有一个 owner。"
+    },
+    {
+      "id": "N03",
+      "severity": "P2",
+      "title": "卡片读入缺少硬字节上限与捕获校验和验证，延后页结构验证不完整",
+      "files": [
+        [
+          "crates/context-simple/src/store.rs",
+          1,
+          295
+        ],
+        [
+          "crates/context-simple/src/engine.rs",
+          990,
+          1100
+        ],
+        [
+          "crates/context-simple/src/engine.rs",
+          2420,
+          2560
+        ]
+      ],
+      "fact": "read_external_card_async 使用 tokio::fs::read 整体分配；parse_external_card 只验证 envelope schema 和 item_id，不接收 manifest 中的 expected hash。初始 restore 会校验候选状态，但延后页直接 merge_paged，未经过等价的完整结构校验。正式 .json blob 已有有界读取，可以复用。",
+      "trigger": "私有 store 中卡片被异常替换、损坏为超大文件，或者同 id 内容与 checkpoint 捕获的 hash 不一致；错误 scope 等字段恰好位于启动首批以后的页。",
+      "impact": "可能产生不必要的大分配，或把不属于该捕获版本的元数据装入运行状态。本轮没有证明外部未授权攻击入口，不应标为已确认远程利用。当前 FNV 校验和不是密码学认证，修复也不能把它宣传成强认证。",
+      "fix": "复用 opened-handle + metadata 检查 + take(cap+1) 的有界读模式。按已有格式校验 expected checksum/prefix；需要改为强摘要时显式做格式迁移，不暗改旧检查点。延后页入库前验证 id、owner、scope 和必要结构关系；非法页不改变运行状态，并保留可诊断定位。",
+      "tests": [
+        "超限 card 在有界读取处拒绝，而不是先全量分配。",
+        "同 id/不同捕获字节被判为不匹配。",
+        "首批之后的卡片引用不存在 scope，读取不得静默安装。"
+      ],
+      "stop": "卡片与正文读路径拥有同等级的资源和一致性边界；合法旧卡仍能读取。"
+    },
+    {
+      "id": "N04",
+      "severity": "P2",
+      "title": "供应商 KV 路由键与多断点停在声明层，未完整进入生产 HTTP 请求",
+      "files": [
+        [
+          "crates/agent-contracts/src/model.rs",
+          398,
+          630
+        ],
+        [
+          "crates/provider-openai/src/lib.rs",
+          960,
+          1125
+        ],
+        [
+          "crates/agent-runtime/src/actor/model.rs",
+          null,
+          null
+        ],
+        [
+          "docs/reviews/2026-09-13-kv-cache-layout-489c89cd/C_LINE_PROVIDER_RECEIPT.md",
+          null,
+          null
+        ]
+      ],
+      "fact": "ModelInput::into_request 生成 cache_breakpoints 列表，却仍默认 prompt_cache_key=None。实际 actor/model 生产调用直接把 into_request 的结果交给 complete_stream，未填写 key。Responses mapper 仍从旧 prompt_reuse_boundary 得到唯一 boundary_index，忽略新的 cache_breakpoints 列表；虽然已会转发非空 key，但生产调用方没有提供。C 线回执也仍留有“谁填 key”的接口请求。",
+      "trigger": "运行真实 Compose → RuntimeActor → Provider 请求，而不是手工构造带 key/breakpoints 的测试 ModelRequest。证据变化后希望复用较早 B0 时，wire 实际未声明这个独立边界。",
+      "impact": "已声明的 B0/B1 分层与稳定路由键收益没有端到端实现。不能推断“所有供应商缓存完全失效”：自动缓存或唯一旧边界仍可能命中。缺陷是意图中的接线未完成，不是服务端命中率已被实测为零。",
+      "fix": "在现有 runtime/组合根的最终请求构建点派生稳定、不透明、按真实隔离域限定的 key。不要每轮生成 UUID，也不要用完整动态请求 digest 充当稳定路由键。mapper 对可支持的多个合法边界逐一校验并映射，保留空消息删除及协议展开后的索引对应关系。不同端点的能力不能从模型别名/兼容 URL 猜测。",
+      "tests": [
+        "捕获由真正组合链路发出的 HTTP：同任务两次请求 key 相同，策略末端 B0 与证据末端 B1 均实际可见。",
+        "仅证据变化时 B0 内容不变，当前指令仍更新；工具撤销必须真实反映在请求中。",
+        "不同有效隔离域不共享不应共享的 key；未知能力端点不接收专属字段。"
+      ],
+      "stop": "生产 wire 而非仅 DTO/assertion 证明 key 与多断点存在；不在此片宣称金额收益。"
+    },
+    {
+      "id": "N05",
+      "severity": "P2",
+      "title": "空选中集回退到全 context 前缀，且用正文字符串猜 EvidenceSplit",
+      "files": [
+        [
+          "crates/agent-runtime/src/prompt.rs",
+          315,
+          510
+        ],
+        [
+          "crates/agent-contracts/src/model.rs",
+          398,
+          630
+        ]
+      ],
+      "fact": "assembler 用 content.contains(\"SELECTED WORKING CONTEXT\") 判断是否存在稳定证据，然后设置 Some{base:0,epoch:1}；没有命中则 None。into_request 把 None 解释为旧布局兼容：把整个 context_frame 纳入可复用前缀。",
+      "trigger": "当前没有 history.items，但有 foreground、required misses、external refs 或恢复投影。另一反例：文件正文恰好含有该标题字符串，误触发布局判断。",
+      "impact": "新请求的空稳定集被混同于旧格式，易变尾部重新进入缓存前缀；来源文本可以影响布局声明。这是缓存分段错误，不是本轮已证明的权限提升。",
+      "fix": "按构建时的类型化消息计数设置 split；当前新 assembler 即使无稳定证据，也明确声明 Some{base:0,epoch:0}。None 只保留给确实缺少新声明的旧序列化输入，绝不扫描正文决定结构。",
+      "tests": [
+        "selected 为空，分别改变 foreground/misses/restored，稳定 policy 边界保持不变。",
+        "文件正文含完整标题字面量，不改变其所属分区。",
+        "旧序列化输入按明确兼容路径解析，新输入不进入旧分支。"
+      ],
+      "stop": "空集与旧格式可区分；内容不能决定结构；前缀计数来自真实组装。"
+    },
+    {
+      "id": "N06",
+      "severity": "P2",
+      "title": "公开 EvidenceSplit 数量未经验证就参与相加与切片",
+      "files": [
+        [
+          "crates/agent-contracts/src/model.rs",
+          398,
+          630
+        ]
+      ],
+      "fact": "base/epoch 是可反序列化的 usize 字段。into_request 直接相加 system_policy.len()+base+epoch 并取 messages[..declared_len]，未验证 base+epoch 不超过 context_frame.len()，也未用 checked_add。",
+      "trigger": "库调用方或反序列化输入提供超限 split；较小但错误的数量也可能落入扁平 messages 的 turn 区域。当前生产 assembler 只生成小计数，所以这不是已证明的正常用户触发崩溃。",
+      "impact": "不合法的结构提示可变为 panic/溢出或错误边界，而不是类型化拒绝。这里的严重性是公共契约健壮性；尚未证明网络可达性。",
+      "fix": "在 flatten 前对所属层验证数量并使用 checked arithmetic。异常声明应通过 Result 拒绝，或明确放弃该缓存 hint 而完整保留原消息；不静默扩展到 turn 内容。继续绑定真实最终消息与工具，不能只相信整数位置。",
+      "tests": [
+        "usize::MAX、超过 context_frame.len()、恰好到边界及空消息组合。",
+        "无效声明不 panic，不改变请求正文/角色，不把动态区缓存声明为稳定区。"
+      ],
+      "stop": "结构校验先于索引运算；有效兼容输入行为不变。"
+    },
+    {
+      "id": "N07",
+      "severity": "P2",
+      "title": "process.session 把信号退出视为 running，退出结果未完整到达模型正文",
+      "files": [
+        [
+          "crates/tool-runtime/src/tools/session.rs",
+          1,
+          145
+        ],
+        [
+          "crates/tool-runtime/src/tools/session.rs",
+          567,
+          686
+        ],
+        [
+          "crates/agent-contracts/src/model.rs",
+          270,
+          335
+        ]
+      ],
+      "fact": "drain 返回 Option<i32>，已退出时取 status.code()；poll 用 Some(code) 区分 exited，用 None 表示 running。Unix 信号终止的 code() 本来就是 None。正常退出码只写在 metadata；model_content 的 status 文本未区分 exit=0 与 exit=7。TurnFrame.messages 只转发 model_content。",
+      "trigger": "session 进程由信号结束；或两个任务输出相同/为空，但一个退出0、另一个退出7。",
+      "impact": "模型可能继续轮询已经结束的进程，或缺少“任务成功还是失败”的直接结果信息。poll API 成功不等于被轮询进程成功，这两类事实应分别呈现。",
+      "fix": "用明确退出状态保存 Running / Exited{code,signal,success}，输出收集完整性另列，不能借 running 表达“已退出但管道未读完”。把模型决策必需的终止结果放入有界 model_content；metadata 保留精确事实。",
+      "tests": [
+        "exit0、exit7、signal、先 EOF 后退出、先退出后 EOF。",
+        "经过实际 dispatcher → broker → TurnFrame，确认模型看到退出结果，而非仅检查 metadata。"
+      ],
+      "stop": "每种真实进程终态有明确表达；终态不会永久显示 running；模型可区分成功与失败。"
+    },
+    {
+      "id": "N08",
+      "severity": "P2",
+      "title": "process.session poll 的本地 drain 没有总工作界限，且持有整个 registry 锁",
+      "files": [
+        [
+          "crates/tool-runtime/src/tools/session.rs",
+          1,
+          145
+        ],
+        [
+          "crates/tool-runtime/src/tools/session.rs",
+          567,
+          686
+        ]
+      ],
+      "fact": "初段 try_recv 循环没有总 chunks/bytes/deadline/cancel 检查，并在 capture.record 的 await 期间允许生产者补入数据。退出后每次 recv 都重新计一个1秒超时，持续产生数据的后代可以不断延后结束。poll 持有共享 sessions mutex 等待 drain 与 artifact.flush。",
+      "trigger": "持续输出进程、持有管道且持续输出的后代，或者慢 artifact 写盘；同时停止另一个 session。",
+      "impact": "单次 poll 的本地耗时没有宣称的总界限，并可拖住其他 session 的控制操作。外层 runtime 超时可能最终中止它，所以不能把静态结论夸大为整个宿主一定永久死锁。",
+      "fix": "registry 只用于短时间获取 session handle，长 I/O 使用每会话状态保护。设置绝对批次截止点、最大 chunks/bytes，并在循环中检查 cancel；没有读完的输出留待下一批，正确报告 output_pending。",
+      "tests": [
+        "连续 writer 下 poll 仍在配置总预算内返回。",
+        "poll A 的同时 stop B 不被 A 的磁盘等待拖住。",
+        "小于1秒周期的后代输出不导致退出 drain 无限延长。"
+      ],
+      "stop": "每次 poll 有可证明的总工作边界；控制路径不被其他 session 长 I/O 占住；剩余输出不丢。"
+    },
+    {
+      "id": "N09",
+      "severity": "P2",
+      "title": "shell/process 的退出后排空 grace 从启动阶段开始计时",
+      "files": [
+        [
+          "crates/tool-runtime/src/tools/shell.rs",
+          235,
+          500
+        ],
+        [
+          "crates/tool-runtime/src/tools/process.rs",
+          970,
+          1240
+        ]
+      ],
+      "fact": "grace=sleep(500ms) 在执行循环前建立，child.wait 返回时只把 grace_started 设为 true，没有重置 deadline。运行超过500ms的命令，启用分支时该 timer 已过期。",
+      "trigger": "运行超过500ms，退出时尚有未送达消费端的 pipe 尾部；select 可以先命中过期 timer 而结束采集。",
+      "impact": "最终日志或测试尾部可能丢失。现有 artifact_truncated 是容量裁剪事实，不能代替“管道是否排空”；仅因未触发大小 cap 就写 Full output 会过度宣称完整性。不是每次运行都必然触发，需门控时序回归。",
+      "fix": "在首次观察到进程退出时建立/重置 grace 截止点；区分 process_exited、pipes_drained 和 size_truncated。未排空就诚实报告，不把短前缀当完整输出。",
+      "tests": [
+        "门控 reader：子进程运行>500ms后退出，最终 sentinel 在退出后 grace 内抵达，必须收集到。",
+        "管道被后代持有超过 grace 时有界结束并显式报告不完整。"
+      ],
+      "stop": "排空预算从退出时刻计算；容量裁剪与未排空两种不完整可区分。"
+    },
+    {
+      "id": "N10",
+      "severity": "P2",
+      "title": "MCP 工具发现忽略 nextCursor，首批被当成完整静态 manifest",
+      "files": [
+        [
+          "crates/agent-capability-process/src/mcp.rs",
+          1,
+          330
+        ],
+        [
+          "crates/agent-capability-process/src/mcp.rs",
+          520,
+          850
+        ]
+      ],
+      "fact": "list_tools_with_cancel 只发送一次 tools/list，读取 tools 数组后返回，未处理 nextCursor。adapter connect 随后从这份结果建立静态工具清单，并关闭发现连接。仓库钉住的2024-11-05协议已经支持分页。",
+      "trigger": "合法 MCP 服务把必要工具放在 tools/list 第二页或后续页。",
+      "impact": "后续页工具不会进入能力目录，模型可能无法发现实际存在的能力。这不是版本升级需求，而是现有协议支持范围的完整性缺口。",
+      "fix": "在既有客户端补有界发现循环：最大页数、总字节、总工具数和整体期限；处理取消、重复 cursor、重复 tool 名及中途失败。达到边界时返回明确不完整/拒绝安装，或使用明确分页目录契约，不能静默安装“看似完整”的首批。",
+      "tests": [
+        "两页 server，只有第二页提供目标工具，正式 adapter 可以发现并调用。",
+        "重复 cursor、有界超限、第二页失败和取消，均不静默当作完整发现。"
+      ],
+      "stop": "按既有协议覆盖分页，所有退出都说明发现是否完成，不引入新能力平台。"
+    }
+  ],
+  "coverage": [
+    {
+      "crate": "agent-capability-process",
+      "path": "crates/agent-capability-process/src/mcp.rs",
+      "ranges": "1–330；520–850",
+      "qualification": "范围审阅：发现、调用、连接和 manifest 建立；中段与后部并未逐行读完"
+    },
+    {
+      "crate": "agent-compose",
+      "path": "crates/agent-compose/src/lib.rs",
+      "ranges": "1–310",
+      "qualification": "范围审阅：引擎构建、预算注入、供应商配置身份；其余组合代码与 tests 未全读"
+    },
+    {
+      "crate": "agent-conformance",
+      "path": "crates/agent-conformance/src/lib.rs",
+      "ranges": "入口文件",
+      "qualification": "仅导出与契约说明；checks.rs / report.rs 未逐行审查"
+    },
+    {
+      "crate": "agent-context-service",
+      "path": "crates/agent-context-service/src/main.rs",
+      "ranges": "入口文件全文",
+      "qualification": "已审阅启动到 serve 的生产入口"
+    },
+    {
+      "crate": "agent-context-service",
+      "path": "crates/agent-context-service/src/lib.rs",
+      "ranges": "1–155",
+      "qualification": "范围审阅：build_engine、ServiceOp 分发；帧循环和其余测试未全读"
+    },
+    {
+      "crate": "agent-contracts",
+      "path": "crates/agent-contracts/src/model.rs",
+      "ranges": "1–335；398–630",
+      "qualification": "范围审阅：TurnFrame、wire、ModelInput、split；其余模型契约及测试未全读"
+    },
+    {
+      "crate": "agent-contracts",
+      "path": "crates/agent-contracts/src/model_cache.rs",
+      "ranges": "文件主体",
+      "qualification": "复用 hint 验证路径；子模块 tests 未全读"
+    },
+    {
+      "crate": "agent-core",
+      "path": "crates/agent-core/src/lib.rs",
+      "ranges": "入口/导出",
+      "qualification": "不能把导出列表视为全部内核实现已审查"
+    },
+    {
+      "crate": "agent-core",
+      "path": "crates/agent-core/src/approval.rs",
+      "ranges": "1–345",
+      "qualification": "范围审阅：审批生命周期；后部未全读"
+    },
+    {
+      "crate": "agent-core",
+      "path": "crates/agent-core/src/kernel/mod.rs",
+      "ranges": "1–240",
+      "qualification": "范围审阅：内核入口；子模块未全部逐行读完"
+    },
+    {
+      "crate": "agent-eval",
+      "path": "crates/agent-eval/src/metrics.rs",
+      "ranges": "1–280",
+      "qualification": "主要读到计量结构定义；不是全部聚合器/分析算法审查"
+    },
+    {
+      "crate": "agent-host",
+      "path": "crates/agent-host/src/lib.rs",
+      "ranges": "300–650",
+      "qualification": "范围审阅：正式宿主路由；其余 transport/测试未全读"
+    },
+    {
+      "crate": "agent-platform-protocol",
+      "path": "crates/agent-platform-protocol/src/work.rs",
+      "ranges": "1–275",
+      "qualification": "路由和边界契约；验证器与其他协议文件未全读"
+    },
+    {
+      "crate": "agent-process",
+      "path": "crates/agent-process/src/watchdog.rs",
+      "ranges": "1–365（返回有截断）",
+      "qualification": "watchdog 主路径与重试；不认定所有测试行已读取"
+    },
+    {
+      "crate": "agent-replay",
+      "path": "crates/agent-replay/src/main.rs",
+      "ranges": "1–260",
+      "qualification": "回放入口/参数与模式"
+    },
+    {
+      "crate": "agent-replay",
+      "path": "crates/agent-replay/src/lib.rs",
+      "ranges": "1–245",
+      "qualification": "导出、配置、输入工件有界读取；实际事件重放主循环未全读"
+    },
+    {
+      "crate": "agent-runtime",
+      "path": "crates/agent-runtime/src/prompt.rs",
+      "ranges": "315–520；1330–1460",
+      "qualification": "组装、分段及状态投影；其他范围/全部测试未全读"
+    },
+    {
+      "crate": "agent-runtime",
+      "path": "crates/agent-runtime/src/instance.rs",
+      "ranges": "1–335",
+      "qualification": "检查点平面与实例入口；不等于所有恢复参与者已全读"
+    },
+    {
+      "crate": "agent-runtime",
+      "path": "crates/agent-runtime/src/platform/work.rs",
+      "ranges": "650–970",
+      "qualification": "正式检查点/恢复控制路径"
+    },
+    {
+      "crate": "agent-runtime",
+      "path": "crates/agent-runtime/src/actor/model.rs",
+      "ranges": "本轮生产调用的搜索片段",
+      "qualification": "确认 into_request 直接交 complete_stream；本轮未全文件重读，旧轮范围不算本轮覆盖"
+    },
+    {
+      "crate": "agent-storage",
+      "path": "crates/agent-storage/src/lib.rs",
+      "ranges": "1–270",
+      "qualification": "文件事件存储入口；其余 journal/checkpoint 实现未全读"
+    },
+    {
+      "crate": "agent-tui",
+      "path": "crates/agent-tui/src/main.rs",
+      "ranges": "1–245",
+      "qualification": "启动、授权、组合和恢复入口；UI及会话子模块未全读"
+    },
+    {
+      "crate": "agent-workspace",
+      "path": "crates/agent-workspace/src/broker.rs",
+      "ranges": "1–315",
+      "qualification": "输出 broker 生产主体与部分回归；其他 workspace 文件仅目录核对"
+    },
+    {
+      "crate": "context-baselines",
+      "path": "crates/context-baselines/src/lib.rs",
+      "ranges": "1–360",
+      "qualification": "导出与部分实验回归"
+    },
+    {
+      "crate": "context-baselines",
+      "path": "crates/context-baselines/src/rolling.rs",
+      "ranges": "1–410（一次返回截断）；345–615；615–文件尾",
+      "qualification": "覆盖主要 Rolling 生产路径；不声称其他 baseline 文件全读"
+    },
+    {
+      "crate": "context-contextcore",
+      "path": "crates/context-contextcore/src/adapter.rs",
+      "ranges": "1–315",
+      "qualification": "服务适配与保护根操作；后续/协议子模块未全读"
+    },
+    {
+      "crate": "context-simple",
+      "path": "crates/context-simple/src/engine.rs",
+      "ranges": "700–1175；1430–1705；1740–1945；2090–2285；2420–2675",
+      "qualification": "多段审阅：hydration、ingest、GC、reconcile、search、restore、storage GC；存在未读间隔"
+    },
+    {
+      "crate": "context-simple",
+      "path": "crates/context-simple/src/store.rs",
+      "ranges": "1–350；1150–1765",
+      "qualification": "card/blob、存储 GC、reconcile；中间检索/召回段未全读"
+    },
+    {
+      "crate": "provider-openai",
+      "path": "crates/provider-openai/src/prompt_cache.rs",
+      "ranges": "文件主体",
+      "qualification": "模式配置与兼容判断；tests 未本轮全读"
+    },
+    {
+      "crate": "provider-openai",
+      "path": "crates/provider-openai/src/lib.rs",
+      "ranges": "850–1125",
+      "qualification": "两种 wire mapper及缓存映射；流解析/传输主体未本轮全读"
+    },
+    {
+      "crate": "provider-openai",
+      "path": "crates/provider-openai/src/retry.rs",
+      "ranges": "213–420；625–845",
+      "qualification": "已知尝试聚合和主要重试出口；其他范围未全读"
+    },
+    {
+      "crate": "tool-runtime",
+      "path": "crates/tool-runtime/src/tools/session.rs",
+      "ranges": "1–145；567–686",
+      "qualification": "drain/poll；start/stop 其他范围未本轮全读"
+    },
+    {
+      "crate": "tool-runtime",
+      "path": "crates/tool-runtime/src/tools/process.rs",
+      "ranges": "1–380；970–1240",
+      "qualification": "进程配置/执行尾与监督接线；有未读间隔"
+    },
+    {
+      "crate": "tool-runtime",
+      "path": "crates/tool-runtime/src/tools/shell.rs",
+      "ranges": "235–755",
+      "qualification": "执行主循环、结果与部分测试；前部 dialect 未本轮全读"
+    },
+    {
+      "crate": "tool-runtime",
+      "path": "crates/tool-runtime/src/tools/search.rs",
+      "ranges": "370–430",
+      "qualification": "本轮确认 scan_continuation 已进入 spec；不是全部搜索实现重审"
+    }
+  ],
+  "uncertainty": "Static source paths verified; proposed regressions were not executed. Severity is a review recommendation, not an exploit certification."
+}
