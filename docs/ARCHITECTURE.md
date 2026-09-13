@@ -1487,6 +1487,24 @@ file (2 MB). It checks the request `CancellationToken` between files and every
 `metadata.cancelled` and any hits already found (not `Err(Cancelled)`, which
 Core would strip to an empty tool error).
 
+A bounded grep leaves two distinct remainders, and each has its own handle.
+The snapshot `cursor` above pages hits the scan **already found**; exhausting
+it exhausts the saved hits and says nothing about the query. The *scan*
+remainder — files the walk never listed, and matches after the hit limit
+inside a file — resumes through `metadata.scan_continuation`, the sealed
+reference of a run-owned scan-state artifact recording the query it belongs
+to and the scan position. Candidates are enumerated in ascending
+workspace-relative path order and each batch keeps only the smallest
+budget-worth above the watermark, so memory stays bounded while later batches
+reach later files; a partially scanned file is recorded with the revision it
+was read at. Because the handle is run-authenticated and content-addressed a
+model cannot invent one, and it is not advertised in `input_schema` for the
+same reason the snapshot cursors are not. Every continuation batch re-applies
+the same file/byte budgets and cancellation checks; a changed, unreadable or
+removed file at a recorded position invalidates the continuation and names
+the two recoveries (restart or narrow) instead of mixing two revisions of one
+result set.
+
 `shell.exec` streams stdout/stderr through two reader tasks into a
 bounded channel (512), kills the child on timeout/cancel, and appends the full
 log incrementally to an artifact via `Workspace::create_artifact`.

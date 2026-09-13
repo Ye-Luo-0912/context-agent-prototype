@@ -241,9 +241,9 @@ matrix with schemas lives in [`docs/TOOL_INVENTORY.json`](TOOL_INVENTORY.json).
 | `search.grep` / `code.symbols` | traversal entries / path bytes | 50 000 / 8 MiB; partial coverage is explicit |
 | `search.grep` | hit line excerpt | 1 024 bytes plus clipping marker, centered near first match |
 | `code.symbols` | symbol name | 256 chars plus clipping marker |
-| `search.grep` | `MAX_FILES_SCANNED` | 5 000 |
+| `search.grep` | `MAX_FILES_SCANNED` | 5 000 per batch; a batch that stops here or at the hit limit returns a runtime-issued `scan_continuation` carrying its scan position |
 | | `MAX_BYTES_PER_FILE` | 2 MiB |
-| | `MODEL_HITS` | 100 (overflow → artifact) |
+| | `MODEL_HITS` | 100 (overflow → artifact; that `cursor` pages saved hits only and never resumes the scan) |
 | `fs.read` | `MAX_READ_BYTES` | 4 MiB (shared `MAX_MUTATION_BYTES`; canonical edit revisions cover every admitted mutation target) |
 | | `MAX_READ_LINES` | 400 |
 | | render working memory | O(returned window), not O(total file lines) |
