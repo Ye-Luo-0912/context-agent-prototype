@@ -19,8 +19,7 @@ use agent_platform_protocol::{
     validate_work_cancel_response, validate_work_continue_request, validate_work_continue_response,
     validate_work_snapshot_request, validate_work_snapshot_response, validate_work_submit_request,
     validate_work_submit_response, validate_work_subscribe_request,
-    validate_work_subscribe_response, validate_work_task_completion_request,
-    validate_work_task_completion_response,
+    validate_work_subscribe_response,
 };
 use std::str::FromStr;
 
@@ -181,7 +180,6 @@ fn value_task_id() -> String {
     "00000000-0000-4000-8000-000000000022".into()
 }
 
-#[test]
 #[test]
 fn task_completion_fixture_pins_the_retired_fact_cross_language() {
     // The response is checked standalone: the paired request fixture is the

@@ -339,7 +339,6 @@ mod tests {
                         cache_miss_input_tokens: Some(20),
                         attempts: 1,
                         retries: 0,
-                        ..Default::default()
                     },
                 })
             }
