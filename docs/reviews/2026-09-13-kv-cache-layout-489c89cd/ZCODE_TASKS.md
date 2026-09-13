@@ -4,6 +4,13 @@
 权威说明：[REPORT.md](./REPORT.md)、[VERIFICATION.md](./VERIFICATION.md)。  
 **不要用 Cursor 云端额度做这些切片**（本清单留给 ZCode 免费额度）。
 
+> **实施状态（2026-09-13）：A0、A1/R7、C1/R2、C2/R3、C3/R1+R4、C4/R6 已全部落地合入 main**
+> （`aaeb827f`、`3bd326a2`、`3c9f600e`、`8dca1b63`；CI run `34765619847` 全绿）。
+> 回执：A0 → [A0_PROOF_SUPERVISION_ROOT_CAUSE.md](./A0_PROOF_SUPERVISION_ROOT_CAUSE.md)；
+> A1 → [A1_R7_GREP_SCHEMA_RECEIPT.md](./A1_R7_GREP_SCHEMA_RECEIPT.md)；
+> C1–C4 → [C_LINE_PROVIDER_RECEIPT.md](./C_LINE_PROVIDER_RECEIPT.md) 与 NEXT_TASKS.md 状态表。
+> 仅 **C5/R5**（条件性）未开始。下方清单保留为原始停止条件，供复核。
+
 ## 硬约束
 
 - 勿重开 F1/F3；F4 续跑实现已在，只补 schema（R7）。

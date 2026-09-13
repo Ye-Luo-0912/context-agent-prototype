@@ -3,16 +3,17 @@
 ## 并行插入：供应商 KV 布局 + ZCode 清单（2026-09-13）
 
 M18 队列顺序不变；本插入是长流程 C 线（供应商 KV／prompt cache 布局）与工具表面收口，**由 ZCode 实施**。
+**状态（2026-09-13 收口）：A0/R7/R2/R3/R1+R4/R6 全部落地并合入 main（提交 `aaeb827f`、`3bd326a2`、`3c9f600e`、`8dca1b63`，fmt 修复 `2642d2c5`），CI run `34765619847` 七个作业全绿；仅 R5（条件性）未开始。**
 
-| 切片 | 用户结果与验收边界 |
-|---|---|
-| **A0** | 调查 proof_supervision CI「exact proof tree exit」；保留进程身份事实；禁止只加 timeout / 删测 |
-| **R7（先修）** | search.grep 的 scan_continuation 进入模型可见 input_schema；经 ToolSpec→wire→dispatcher 续跑第二批 | **代码落地（2026-09-13，工作树）**：spec 的 input_schema 新增 `scan_continuation`（string、maxLength 256——与真实 sealed locator ≈125 字符对照断言、同查询语义与「原样回传/不得编造」写入 description）；声明经 `compact_for_model_surface` 保留（compactor 只截 description/剥 schema description，实测断言钉住）；红检查在先（schema 未声明时失败），dispatcher 端到端：batch2 参数严格由 schema 声明属性构造（仅 pattern＋scan_continuation）经公开 execute 到第二批、hits_total=6、scan_complete=true。tool-runtime **271** 全绿、clippy 0。[回执](reviews/2026-09-13-kv-cache-layout-489c89cd/A1_R7_GREP_SCHEMA_RECEIPT.md)；未提交/未跑远端 CI |
-| **R2** | 已确认端点发送稳定 prompt_cache_key（非每轮 UUID） |
-| **R3** | 显式-only：无合法边界时不悄悄退回隐式写；compactor 单独策略 |
-| **R1+R4** | 稳定证据基座 B0/B1 与易变投影分离；状态字段不破坏合法前缀 |
-| **R6** | 每次真实 attempt 已知 usage 不丢、同 attempt 不重复计 |
-| **R5** | 协议尾复用仅在基座完成后评估 |
+| 切片 | 用户结果与验收边界 | 状态 |
+|---|---|---|
+| **A0** | 调查 proof_supervision CI「exact proof tree exit」；保留进程身份事实；禁止只加 timeout / 删测 | **已关闭**：根因是 containments 静默降级（Linux pipe-EOF watchdog 未 fork、Windows Job 未生效），此前「时序抖动」记录为误读；watchdog spawn 瞬时失败重试（3×100ms）、`process_group_members` 收敛为只读观察器，proof_supervision 改等 containment-established 确定性屏障并在降级标记出现时立即失败归因。[回执](reviews/2026-09-13-kv-cache-layout-489c89cd/A0_PROOF_SUPERVISION_ROOT_CAUSE.md) |
+| **R7（先修）** | search.grep 的 scan_continuation 进入模型可见 input_schema；经 ToolSpec→wire→dispatcher 续跑第二批 | **已关闭（`aaeb827f`）**：spec 的 input_schema 新增 `scan_continuation`（string、maxLength 256、同查询语义与「原样回传/不得编造」写入 description）；声明经 `compact_for_model_surface` 保留；红检查在先，dispatcher 端到端（batch2 参数仅 pattern＋scan_continuation、hits_total=6、scan_complete=true）。tool-runtime 271 全绿。[回执](reviews/2026-09-13-kv-cache-layout-489c89cd/A1_R7_GREP_SCHEMA_RECEIPT.md) |
+| **R2** | 已确认端点发送稳定 prompt_cache_key（非每轮 UUID） | **已关闭（`3bd326a2`）**：键仅在配置期确认的 `responses_explicit` profile 上 wire（顶层 `prompt_cache_key`）；ProviderDefault/Chat 任何情况不写；byte-stable、跨隔离域不混用、真实 HTTP 回归（3 payload）。[回执](reviews/2026-09-13-kv-cache-layout-489c89cd/C_LINE_PROVIDER_RECEIPT.md) |
+| **R3** | 显式-only：无合法边界时不悄悄退回隐式写；compactor 单独策略 | **已关闭（`3bd326a2`）**：`CacheWritePolicy::ExplicitOnly`——无合法边界（缺 hint/摘要失配）发零断点 explicit 形状并记原因；有合法边界照常写；未确认端点带/不带策略 payload 逐字节不变；compactor 声明自己的 ExplicitOnly（不发明键） |
+| **R1+R4** | 稳定证据基座 B0/B1 与易变投影分离；状态字段不破坏合法前缀 | **已关闭（`3c9f600e`）**：契约新增 `EvidenceSplit`＋`ModelRequest.cache_breakpoints`（B0=稳定 policy 末、B1=阶段证据末，0 基消息索引）；工作集证据块结束声明前缀，required-miss/foreground/external/restored 投影严格在后（miss-only 变化前缀字节不变的红先回归）；currency/attention 移到身份引用的动态段（user 角色），evidence header 不再重写。contracts 176、provider 147、runtime prompt 47、model_cache 4、kv_cache_walk 5（付费 5 ignored）全绿 |
+| **R6** | 每次真实 attempt 已知 usage 不丢、同 attempt 不重复计 | **已关闭（`3bd326a2`）**：`KnownAttemptUsage`——同 attempt 多条 SSE 快照单次结算、跨 attempt 饱和相加、未报告保持 unknown 不补零；give-up/success/sink 失败均保留已知用量（`FailedWithUsage` 不嵌套）；取消保持 plain `Cancelled`（取消屏障匹配不破坏），已知用量入 stage `known_usage`（JSONL）。retry 定向红检查（replace-only 变体 5 项转红）后全绿 |
+| **R5** | 协议尾复用仅在基座完成后评估 | **未开始**（条件已满足，待单独评估；不得改 call/result 配对或把工具输出抬成 user 正文） |
 
 清单与停止条件：[ZCODE_TASKS.md](reviews/2026-09-13-kv-cache-layout-489c89cd/ZCODE_TASKS.md)。核实：[VERIFICATION.md](reviews/2026-09-13-kv-cache-layout-489c89cd/VERIFICATION.md)。
 
