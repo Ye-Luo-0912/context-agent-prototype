@@ -90,10 +90,25 @@ fn killing_the_rust_host_cleans_the_exact_proof_tree_without_a_completion_receip
     // Windows it is TerminateProcess. Its Rust destructors cannot run.
     host.0.kill().unwrap();
     wait_for(|| host.0.try_wait().unwrap().is_some(), "host exit");
-    wait_for(
-        || owned_process_exited(&leader) && owned_process_exited(&member),
-        "exact proof tree exit",
-    );
+    // Host-death containment is kernel-side (Unix watchdog EOF / Windows
+    // KILL_ON_JOB_CLOSE) and usually finishes in milliseconds. The Windows
+    // full-suite CI job (`-j 2 --test-threads 2`) has a documented load
+    // jitter that delayed the same observation past 10s (run 34748602228)
+    // while a solo rerun is green. Stay well under the worker's 30s
+    // self-expiry so a missed containment still fails rather than passing
+    // via the workers timing out on their own.
+    let tree_deadline = Instant::now() + Duration::from_secs(20);
+    while !(owned_process_exited(&leader) && owned_process_exited(&member)) {
+        assert!(
+            Instant::now() < tree_deadline,
+            "timed out: exact proof tree exit (leader pid {} inspect {:?}; member pid {} inspect {:?})",
+            leader.pid,
+            inspect_process(leader.pid),
+            member.pid,
+            inspect_process(member.pid),
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
     assert!(
         !state.join("result").exists(),
         "host death cannot mint a proof receipt"
