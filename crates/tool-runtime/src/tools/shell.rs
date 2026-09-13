@@ -390,7 +390,12 @@ impl Tool for ShellExecTool {
                         // nothing left to wait for, skip the grace window.
                         break;
                     }
-                    grace_started = true; // RED_CHECK
+                    // A2 (N09): the drain budget starts at the FIRST exit
+                    // observation, not at spawn — a command that outlived
+                    // the pre-armed timer still gets its full grace window
+                    // for the pipe tail to arrive.
+                    grace.as_mut().reset(tokio::time::Instant::now() + Duration::from_millis(500));
+                    grace_started = true;
                 }
                 _ = &mut grace, if grace_started => {
                     // A2 (N09): the grace fired with pipes still open — the
