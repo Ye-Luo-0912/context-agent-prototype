@@ -229,6 +229,8 @@ pub(crate) async fn run_session<S: UiSource, O: UiSink>(
                     break;
                 }
             }
+            // scroll is holdback from the latest row: PageUp reads older
+            // SYSTEM/dialogue, PageDown returns toward the live tail.
             KeyCode::PageUp => app.scroll = app.scroll.saturating_add(8),
             KeyCode::PageDown => app.scroll = app.scroll.saturating_sub(8),
             KeyCode::Tab => app.toggle_context_panel(),
