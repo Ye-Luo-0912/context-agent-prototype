@@ -1,5 +1,17 @@
 # 可执行任务队列
 
+## 并行插入：长流程后端 F5 —— 宿主长任务控制面（2026-09-13）
+
+M18 队列顺序不变；F5 是长流程后端审查开出的**平台线**切片，与下方队列并行，不接管主线。
+
+| 切片 | 用户结果与验收边界 |
+|---|---|
+| **F5** | 两个非 GUI 客户端（host e2e / SDK）在同一 RuntimeActor 上走通 start→steer→suspend→activate→continue→restore→verify，未知修改不被盲目重放。**代码落地＋本地验证（2026-09-13，分支 `cursor/f5-host-sdk-long-task-controls-8e75`）**：`work.steer`/`work.activate`/`work.suspend`/`work.checkpoint`/`work.restore` 五条路由＋continue/cancel 可选期望身份（actor 内比较）＋`RuntimeCheckpointPlane` 单一跨面事务＋宿主 `--max-rounds`（与 TUI 共用校验器）＋快照 `effective_config`/`continue_readiness`/`store_backpressure`。host_e2e 11、runtime actor 93、protocol 54＋15、dotnet 131/131、fmt/clippy 0、doc OK；既有金样零改动。**未验收：** 真实 provider（demo 模型）、GUI 界面（归 C 线）、`work.steer` 无幂等账本（只发一次）、远端 CI 待 run 记录。[回执](reviews/2026-09-13-longflow-backend-f5/RECEIPT.md) |
+
+**做到这里停止：** 不做 GUI 功能、不碰 F1–F4、不引入多 Agent 编排或插件 UI；不新增第二套任务权威、调度器或 trace 存储。
+
+---
+
 ## 当前：M18 第三轮执行者、长期运行与可维护性续接（2026-09-13）
 
 **仍是 M18，同质量、长期稳定、高效可靠与全成本下降。** 当前基线 `685b6bbb` 加实际未提交树。第三轮 14 项（4 P1＋10 P2），9 项有界反例、5 项源码核实；本轮没有改产品代码，也没有做真实 provider 或完整 Rust/.NET/CI 验收。[报告](reviews/2026-09-13-executor-maintainability-audit/REPORT.md) 与 [覆盖/证据](reviews/2026-09-13-executor-maintainability-audit/COVERAGE.md) 是本表依据，下面前序表仅保留时点回执。

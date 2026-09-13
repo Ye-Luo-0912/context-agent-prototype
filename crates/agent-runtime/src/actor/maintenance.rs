@@ -95,9 +95,8 @@ impl RuntimeActor {
                 let _ = reply.send(result);
             }
             Some(TurnStartReply::Continue(reply, task_id)) => {
-                let _ = reply.send(
-                    result.map(|()| crate::work::ContinueOutcome::Continued { task_id }),
-                );
+                let _ = reply
+                    .send(result.map(|()| crate::work::ContinueOutcome::Continued { task_id }));
             }
             Some(TurnStartReply::Steer(reply, outcome)) => {
                 let _ = reply.send(result.map(|()| outcome));

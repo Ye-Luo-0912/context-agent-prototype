@@ -501,7 +501,8 @@ impl WorkControlRouter {
         let expected_task_id = request.payload.expected_task_id;
         let continued = self
             .bounded(started, || {
-                self.runtime.continue_active_task_expecting(expected_task_id)
+                self.runtime
+                    .continue_active_task_expecting(expected_task_id)
             })
             .await;
         match continued {
@@ -629,7 +630,8 @@ impl WorkControlRouter {
         let expected_task_id = request.payload.expected_task_id;
         let steered = self
             .bounded(started, || {
-                self.runtime.steer_active_task(instruction, expected_task_id)
+                self.runtime
+                    .steer_active_task(instruction, expected_task_id)
             })
             .await;
         match steered {
@@ -1073,9 +1075,7 @@ impl WorkControlRouter {
                     crate::ContinueReason::Ready => WorkContinueReason::Ready,
                     crate::ContinueReason::NoActiveTask => WorkContinueReason::NoActiveTask,
                     crate::ContinueReason::TurnRunning => WorkContinueReason::TurnRunning,
-                    crate::ContinueReason::RecoveryRequired => {
-                        WorkContinueReason::RecoveryRequired
-                    }
+                    crate::ContinueReason::RecoveryRequired => WorkContinueReason::RecoveryRequired,
                     crate::ContinueReason::CleanupInFlight => WorkContinueReason::CleanupInFlight,
                     crate::ContinueReason::NoRetainedDirective => {
                         WorkContinueReason::NoRetainedDirective
@@ -1659,12 +1659,7 @@ impl WorkControlRouter {
         started: Instant,
         payload: PlatformResponse<WorkCheckpointResponse>,
     ) -> AgentResult<PlatformEnvelope<PlatformResponse<WorkCheckpointResponse>>> {
-        self.finish(
-            request,
-            started,
-            payload,
-            validate_work_checkpoint_response,
-        )
+        self.finish(request, started, payload, validate_work_checkpoint_response)
     }
 
     fn restore_response(

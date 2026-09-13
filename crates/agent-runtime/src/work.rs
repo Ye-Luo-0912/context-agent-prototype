@@ -148,11 +148,15 @@ pub struct TaskActivation {
 /// F5: the receipt for suspending a task without completing it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SuspendOutcome {
-    Suspended { task_id: TaskId },
+    Suspended {
+        task_id: TaskId,
+    },
     /// Nothing was active — a fact, not a failure.
     NoActiveTask,
     /// The caller named a task the runtime is not on; nothing was suspended.
-    ExpectedTaskMismatch { active_task_id: Option<TaskId> },
+    ExpectedTaskMismatch {
+        active_task_id: Option<TaskId>,
+    },
 }
 
 /// F5: the receipt for continuing the active task's retained directive.

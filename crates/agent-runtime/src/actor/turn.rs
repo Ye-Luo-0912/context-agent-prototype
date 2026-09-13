@@ -252,9 +252,7 @@ impl RuntimeActor {
                 Some(task) if task.turn_intent.trim().is_empty() => {
                     ContinueReason::NoRetainedDirective
                 }
-                Some(task)
-                    if task.turn_intent.chars().count() >= MAX_TASK_ANCHOR_TEXT_CHARS =>
-                {
+                Some(task) if task.turn_intent.chars().count() >= MAX_TASK_ANCHOR_TEXT_CHARS => {
                     ContinueReason::DirectiveMayBeTruncated
                 }
                 Some(_) => ContinueReason::Ready,

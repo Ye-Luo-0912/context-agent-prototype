@@ -31,9 +31,8 @@ use agent_platform_protocol::{
     WorkRestoreResponse, WorkSnapshotRequest, WorkSnapshotResponse, WorkSteerDisposition,
     WorkSteerRejection, WorkSteerRequest, WorkSteerResponse, WorkSubmitDisposition,
     WorkSubmitRequest, WorkSubmitResponse, WorkSubmitResultDisposition, WorkSubmitResultRequest,
-    WorkSubmitResultResponse, WorkSubscribeRequest, WorkSubscribeResponse,
-    WorkSuspendDisposition, WorkSuspendRequest, WorkSuspendResponse, WorkTaskDetailRequest,
-    WorkTaskDetailResponse,
+    WorkSubmitResultResponse, WorkSubscribeRequest, WorkSubscribeResponse, WorkSuspendDisposition,
+    WorkSuspendRequest, WorkSuspendResponse, WorkTaskDetailRequest, WorkTaskDetailResponse,
 };
 use agent_runtime::{RuntimeHandle, WorkControlSessionRegistry};
 use serde_json::json;
@@ -786,7 +785,11 @@ async fn long_flow_controls_close_the_loop(
         "a correction for the active task must be admitted, got {:?}",
         steered.disposition
     );
-    assert_eq!(steered.task_id, Some(task_a), "the correction names its task");
+    assert_eq!(
+        steered.task_id,
+        Some(task_a),
+        "the correction names its task"
+    );
     let after_steer = wait_until_not_running(&mut stream, "the correction").await?;
     assert_eq!(
         after_steer.tasks.len(),

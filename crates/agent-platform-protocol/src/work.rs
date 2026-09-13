@@ -778,12 +778,12 @@ impl WorkSuspendResponse {
         validate_optional_task_id("work.suspend.task_id", self.task_id)?;
         validate_optional_task_id("work.suspend.active_task_id", self.active_task_id)?;
         match self.disposition {
-            WorkSuspendDisposition::Suspended if self.task_id.is_none() => Err(
-                ValidationError::new(
+            WorkSuspendDisposition::Suspended if self.task_id.is_none() => {
+                Err(ValidationError::new(
                     "work.suspend.task_id",
                     "a suspension must name the task it suspended",
-                ),
-            ),
+                ))
+            }
             WorkSuspendDisposition::Suspended => Ok(()),
             _ if self.task_id.is_some() => Err(ValidationError::new(
                 "work.suspend.task_id",
@@ -857,9 +857,7 @@ pub struct WorkRestoreRequest {
 impl WorkRestoreRequest {
     pub fn validate(&self) -> ValidationResult<()> {
         match &self.artifact {
-            Some(artifact) => {
-                validate_checkpoint_artifact_name("work.restore.artifact", artifact)
-            }
+            Some(artifact) => validate_checkpoint_artifact_name("work.restore.artifact", artifact),
             None => Ok(()),
         }
     }
@@ -2326,8 +2324,7 @@ pub fn validate_work_suspend_response(
     validate_work_suspend_request(profile, request)?;
     validate_run_scoped_response(profile, request, response, |payload| payload.validate())?;
     if let PlatformResponse::Success { value } = &response.payload
-        && let (Some(expected), Some(suspended)) =
-            (request.payload.expected_task_id, value.task_id)
+        && let (Some(expected), Some(suspended)) = (request.payload.expected_task_id, value.task_id)
         && expected != suspended
     {
         return Err(ValidationError::new(
@@ -3137,7 +3134,9 @@ mod tests {
         );
         let nil = WorkSteerRequest {
             instruction: "ok".into(),
-            expected_task_id: Some(TaskId::from_str("00000000-0000-0000-0000-000000000000").unwrap()),
+            expected_task_id: Some(
+                TaskId::from_str("00000000-0000-0000-0000-000000000000").unwrap(),
+            ),
         };
         assert_eq!(
             nil.validate().unwrap_err().field(),
@@ -3200,7 +3199,10 @@ mod tests {
             active_task_id: Some(task_id()),
         };
         assert_eq!(
-            rejected_naming_a_continuation.validate().unwrap_err().field(),
+            rejected_naming_a_continuation
+                .validate()
+                .unwrap_err()
+                .field(),
             "work.continue.task_id"
         );
 
@@ -3218,7 +3220,10 @@ mod tests {
             }),
         };
         assert_eq!(
-            mismatch_with_a_cancelled_ack.validate().unwrap_err().field(),
+            mismatch_with_a_cancelled_ack
+                .validate()
+                .unwrap_err()
+                .field(),
             "work.cancel.identity_mismatch"
         );
 
