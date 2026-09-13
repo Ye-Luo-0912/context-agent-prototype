@@ -38,10 +38,7 @@ async fn spawn_capture_server(bodies: Arc<std::sync::Mutex<Vec<String>>>) -> u16
                 // then reads the response; half-close is not guaranteed, so
                 // parse headers and read content-length).
                 let mut read = vec![0u8; 16 * 1024];
-                loop {
-                    let Ok(n) = socket.read(&mut read).await else {
-                        break;
-                    };
+                while let Ok(n) = socket.read(&mut read).await {
                     if n == 0 {
                         break;
                     }
@@ -175,7 +172,7 @@ async fn two_production_requests_of_one_task_share_the_key_and_carry_b0_b1() {
 
     let context_engine = agent_compose::build_context_engine(
         agent_compose::ContextPolicy::Dynamic,
-        &workspace.state_dir(),
+        workspace.state_dir(),
         None,
         None,
         &agent_compose::MaintenanceBudget::default(),
