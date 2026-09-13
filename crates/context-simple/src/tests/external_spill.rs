@@ -862,9 +862,11 @@ async fn illegal_spill_manifest_row_is_refused_without_mutating_live_state() {
         "illegal spill restore must not mutate live state"
     );
     let state = engine.state.lock().await;
-    assert!(state
-        .items
-        .iter()
-        .any(|item| item.content.contains(LIVE_MARKER)));
+    assert!(
+        state
+            .items
+            .iter()
+            .any(|item| item.content.contains(LIVE_MARKER))
+    );
     assert_eq!(state.external_cards_missing, 0);
 }

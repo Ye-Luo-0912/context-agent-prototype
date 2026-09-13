@@ -1,11 +1,12 @@
 use agent_contracts::{
-    bound_compaction_output, normalize_resource_path, AgentError, AgentResult, BoundedCompactor,
-    CompactionOutput, CompactionRequest, ContextAction, ContextCompaction, ContextConsumptionAck,
-    ContextDiagnostics, ContextEngine, ContextGcReport, ContextIngress, ContextItem, ContextItemId,
-    ContextItemSummary, ContextKind, ContextMaintenanceReport, ContextMaintenanceTrigger,
-    ContextQuery, ContextRetention, ContextScope, ContextSearchObservation, ContextStateTransition,
-    CoreLabel, FocusState, FsRereadClass, Label, MaterializedContext, ScopeId, ScopeKind,
-    ScopeState, StoreReconcileReport, UsageIdentity, MAX_RESOURCE_TOUCHES,
+    AgentError, AgentResult, BoundedCompactor, CompactionOutput, CompactionRequest, ContextAction,
+    ContextCompaction, ContextConsumptionAck, ContextDiagnostics, ContextEngine, ContextGcReport,
+    ContextIngress, ContextItem, ContextItemId, ContextItemSummary, ContextKind,
+    ContextMaintenanceReport, ContextMaintenanceTrigger, ContextQuery, ContextRetention,
+    ContextScope, ContextSearchObservation, ContextStateTransition, CoreLabel, FocusState,
+    FsRereadClass, Label, MAX_RESOURCE_TOUCHES, MaterializedContext, ScopeId, ScopeKind,
+    ScopeState, StoreReconcileReport, UsageIdentity, bound_compaction_output,
+    normalize_resource_path,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -16,7 +17,7 @@ use tokio::sync::Mutex;
 use crate::checkpoint;
 use crate::diagnostics;
 use crate::distill::{
-    insert_derived_summary, insert_task_summary, plan_episode_distill, DistillJob,
+    DistillJob, insert_derived_summary, insert_task_summary, plan_episode_distill,
 };
 use crate::gc::{full, minor, reachability};
 use crate::heap::external_summary;
