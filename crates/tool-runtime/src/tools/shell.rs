@@ -1053,21 +1053,25 @@ mod tests {
         );
     }
 
-    /// N09 (A2), discriminating: a descendant that holds the inherited pipe
-    /// and writes the sentinel shortly AFTER the shell exits must be
-    /// collected by the grace window re-armed at exit; the old pre-armed
-    /// timer (expired long before) cut the tail off. Requires real signal/
-    /// job semantics, so it runs on unix (the CI Linux job covers it).
-    #[cfg(unix)]
+    /// N09 (A2), discriminating: the tail written right before exit must
+    /// survive the drain. The pre-armed grace timer expired while the
+    /// command ran, so the OLD loop broke the instant the process exited
+    /// and lost the whole burst; the fix re-arms the grace at the first
+    /// exit observation and the burst is drained. Deterministic on both
+    /// platforms (no descendant scheduling involved).
     #[tokio::test]
-    async fn n09_post_exit_descendant_sentinel_survives_the_rearmed_grace() {
+    async fn n09_pre_exit_burst_survives_the_rearmed_grace() {
         let dir = tempfile::tempdir().unwrap();
         let workspace = Workspace::open(dir.path()).await.unwrap();
         let tool = ShellExecTool::with_dialect(workspace.clone(), test_dialect());
         let run_id = RunId::new();
-        // HEAD, ~3 s run (the pre-armed 500 ms timer expires long before),
-        // exit; the background subshell writes the sentinel 0.2 s later.
-        let command = "echo HEAD; sleep 3; ( sleep 0.2; echo TAIL-SENTINEL ) &";
+        // HEAD, ~3 s of silence (the pre-armed 500 ms timer expires long
+        // before), then a 3 000-line burst written immediately before exit.
+        #[cfg(windows)]
+        let command =
+            "echo HEAD& ping -n 4 127.0.0.1 > NUL& (for /L %i in (1,1,3000) do @echo tick %i)";
+        #[cfg(not(windows))]
+        let command = "echo HEAD; sleep 3; seq 1 3000 | sed 's/^/tick /'";
         let arguments = json!({
             "command": command,
             "timeout_ms": 15000,
@@ -1089,9 +1093,12 @@ mod tests {
             .unwrap(),
         );
         assert!(output.ok, "{}", output.summary);
+        // The model tail is a bounded window: the 3 000-line burst evicts
+        // HEAD, and that is exactly why the LAST line is the assertion that
+        // matters — the whole burst was drained, not a prefix.
         assert!(
-            output.model_content.contains("TAIL-SENTINEL"),
-            "the descendant's post-exit sentinel must survive the re-armed grace: {}",
+            output.model_content.contains("tick 3000"),
+            "the last line of the pre-exit burst must survive the re-armed grace: {}",
             output.model_content
         );
     }
