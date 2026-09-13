@@ -233,6 +233,11 @@ impl ResponsesAccumulator {
         }
         validate_optional_u64(usage, "input_tokens", "Responses usage")?;
         validate_optional_u64(usage, "output_tokens", "Responses usage")?;
+        // COST-6 (R2-10): some Responses-protocol gateways report DeepSeek-
+        // style top-level cache counters; their shapes are validated too so
+        // a malformed counter fails typed instead of being dropped.
+        validate_optional_u64(usage, "prompt_cache_hit_tokens", "Responses usage")?;
+        validate_optional_u64(usage, "prompt_cache_miss_tokens", "Responses usage")?;
         if let Some(details) = usage.get("input_tokens_details") {
             if !details.is_object() {
                 return Err(malformed_event(
@@ -240,12 +245,30 @@ impl ResponsesAccumulator {
                 ));
             }
             validate_optional_u64(details, "cached_tokens", "Responses input_tokens_details")?;
+            validate_optional_u64(
+                details,
+                "cache_write_tokens",
+                "Responses input_tokens_details",
+            )?;
         }
+        // COST-6 (R2-10): the same normalization as the Chat transport. The
+        // cache READ prefers the details spelling and falls back to the
+        // top-level hit counter; the WRITE is filled only by the explicit
+        // details write counter; the top-level miss counter stays a miss.
+        // Unreported counters stay None — never an invented zero.
+        let cached_input_tokens = usage
+            .pointer("/input_tokens_details/cached_tokens")
+            .and_then(Value::as_u64)
+            .or_else(|| usage.get("prompt_cache_hit_tokens").and_then(Value::as_u64));
         self.usage = Some(ModelUsage {
             input_tokens: usage.get("input_tokens").and_then(Value::as_u64),
             output_tokens: usage.get("output_tokens").and_then(Value::as_u64),
-            cached_input_tokens: usage
-                .pointer("/input_tokens_details/cached_tokens")
+            cached_input_tokens,
+            cache_write_input_tokens: usage
+                .pointer("/input_tokens_details/cache_write_tokens")
+                .and_then(Value::as_u64),
+            cache_miss_input_tokens: usage
+                .get("prompt_cache_miss_tokens")
                 .and_then(Value::as_u64),
             ..Default::default()
         });
@@ -254,6 +277,12 @@ impl ResponsesAccumulator {
 
     pub fn take_terminal_error(&mut self) -> Option<ResponseStreamError> {
         self.terminal_error.take()
+    }
+
+    /// COST-7 (R3-12): the usage the provider reported so far, readable
+    /// before finalize — a failing stream must not lose its evidence.
+    pub fn usage(&self) -> Option<ModelUsage> {
+        self.usage.clone()
     }
 
     pub fn is_completed(&self) -> bool {
@@ -789,6 +818,87 @@ mod tests {
                 }
             ));
         }
+    }
+
+    /// COST-6 (R2-10): the normal Responses transport reads the explicitly
+    /// reported cache-write counter — it is no longer visible only to the
+    /// opt-in diagnostics.
+    #[test]
+    fn an_explicit_responses_write_counter_reaches_the_product_usage() {
+        let mut accumulator = ResponsesAccumulator::default();
+        accumulator
+            .apply(&json!({
+                "type": "response.completed",
+                "response": {"usage": {
+                    "input_tokens": 100,
+                    "output_tokens": 5,
+                    "input_tokens_details": {"cached_tokens": 30, "cache_write_tokens": 10}
+                }}
+            }))
+            .unwrap();
+        let (_, _, usage) = accumulator.finalize().unwrap();
+        assert_eq!(usage.cached_input_tokens, Some(30));
+        assert_eq!(usage.cache_write_input_tokens, Some(10));
+        assert_eq!(usage.cache_miss_input_tokens, None);
+    }
+
+    /// COST-6 (R2-10): a Responses-protocol gateway reporting DeepSeek-style
+    /// top-level counters gets the same normalization as Chat — hit feeds the
+    /// read bucket as fallback, and the miss is never relabeled into a write.
+    #[test]
+    fn top_level_hit_and_miss_counters_are_read_and_miss_never_becomes_a_write() {
+        let mut accumulator = ResponsesAccumulator::default();
+        accumulator
+            .apply(&json!({
+                "type": "response.completed",
+                "response": {"usage": {
+                    "input_tokens": 100,
+                    "output_tokens": 5,
+                    "prompt_cache_hit_tokens": 80,
+                    "prompt_cache_miss_tokens": 20
+                }}
+            }))
+            .unwrap();
+        let (_, _, usage) = accumulator.finalize().unwrap();
+        assert_eq!(usage.cached_input_tokens, Some(80));
+        assert_eq!(usage.cache_miss_input_tokens, Some(20));
+        assert_eq!(usage.cache_write_input_tokens, None);
+    }
+
+    /// COST-6: partially reported counters keep the unreported halves None,
+    /// and an illegal counter shape fails typed instead of being dropped.
+    #[test]
+    fn responses_cache_counter_shapes_fail_closed_or_stay_none() {
+        let mut accumulator = ResponsesAccumulator::default();
+        accumulator
+            .apply(&json!({
+                "type": "response.completed",
+                "response": {"usage": {
+                    "input_tokens": 100,
+                    "output_tokens": 5,
+                    "input_tokens_details": {"cache_write_tokens": 40}
+                }}
+            }))
+            .unwrap();
+        let (_, _, usage) = accumulator.finalize().unwrap();
+        assert_eq!(usage.cache_write_input_tokens, Some(40));
+        assert_eq!(usage.cached_input_tokens, None);
+        assert_eq!(usage.cache_miss_input_tokens, None);
+
+        let mut accumulator = ResponsesAccumulator::default();
+        let error = accumulator
+            .apply(&json!({
+                "type": "response.completed",
+                "response": {"usage": {"input_tokens": 100, "prompt_cache_miss_tokens": "many"}}
+            }))
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            AgentError::ModelProtocol {
+                kind: ModelProtocolErrorKind::MalformedEvent,
+                ..
+            }
+        ));
     }
 
     #[test]

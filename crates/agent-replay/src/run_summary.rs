@@ -32,6 +32,10 @@ pub struct RunTaskSummary {
     pub required_miss_items: usize,
     pub checkpoints: Vec<(String, u64)>,
     pub tasks: Vec<TaskSummaryRow>,
+    /// EXEC-4 (E08): lines this summary's file skipped — oversized lines
+    /// and rows beyond the per-file summary budget. A non-zero count means
+    /// the rendered totals are a bounded view, not the whole stream.
+    pub omitted_lines: u64,
 }
 
 impl RunTaskSummary {
@@ -164,20 +168,153 @@ pub fn fold_run_summary(lines: impl Iterator<Item = String>, summary: &mut RunTa
 
 /// Fold each trace file into its own summary (traces are single-run, but a
 /// run id change inside one file starts a new summary).
+/// EXEC-4 (E08): 单行读入上限——超长单行按损坏/滥用计入 omitted，绝不
+/// 为一行分配无界内存。trace 事件是单行 JSON，合法行远低于此界。
+const MAX_TRACE_LINE_BYTES: usize = 1024 * 1024;
+/// EXEC-4 (E08)：单文件最多折叠的摘要数（trace 内 run id 反复翻转也不能
+/// 让结果集合无限增长）；超出的行计入 omitted。
+const MAX_SUMMARIES_PER_FILE: usize = 64;
+
 pub fn run_summaries_from_files(
     paths: &[std::path::PathBuf],
 ) -> anyhow::Result<Vec<RunTaskSummary>> {
     let mut summaries = Vec::new();
     for path in paths {
-        let content = std::fs::read_to_string(path)
+        let file = std::fs::File::open(path)
             .map_err(|error| anyhow::anyhow!("read {}: {error}", path.display()))?;
-        let mut summary = RunTaskSummary::default();
-        fold_run_summary(content.lines().map(|line| line.to_string()), &mut summary);
-        if !summary.run_id.is_empty() {
-            summaries.push(summary);
+        let mut reader = std::io::BufReader::new(file);
+        let mut file_summaries: Vec<RunTaskSummary> = Vec::new();
+        let mut omitted: u64 = 0;
+        loop {
+            // EXEC-4：行界内读入——超长单行按损坏计入 omitted，且跳行时
+            // 用 fill_buf/consume 保住换行边界（下一行不被吞掉）。
+            let next = match next_bounded_line(&mut reader, MAX_TRACE_LINE_BYTES) {
+                Ok(next) => next,
+                Err(error) => return Err(anyhow::anyhow!("read {}: {error}", path.display())),
+            };
+            let Some(line) = next else {
+                break;
+            };
+            match line {
+                BoundedLine::Line(line) => {
+                    let run_id = serde_json::from_str::<serde_json::Value>(&line)
+                        .ok()
+                        .and_then(|value| {
+                            value
+                                .get("run_id")
+                                .and_then(|value| value.as_str())
+                                .map(str::to_owned)
+                        });
+                    let Some(run_id) = run_id else {
+                        omitted += 1;
+                        continue;
+                    };
+                    let slot = file_summaries
+                        .iter_mut()
+                        .find(|summary| summary.run_id == run_id);
+                    if let Some(summary) = slot {
+                        fold_run_summary([line].into_iter(), summary);
+                    } else if file_summaries.len() < MAX_SUMMARIES_PER_FILE {
+                        let mut summary = RunTaskSummary::default();
+                        fold_run_summary([line].into_iter(), &mut summary);
+                        file_summaries.push(summary);
+                    } else {
+                        // Beyond the per-file summary budget: the rows are
+                        // counted as omitted instead of folding forever.
+                        omitted += 1;
+                    }
+                }
+                BoundedLine::Oversized => {
+                    omitted += 1;
+                }
+            }
         }
+        file_summaries.retain(|summary| !summary.run_id.is_empty());
+        for summary in &mut file_summaries {
+            summary.omitted_lines = omitted;
+        }
+        summaries.extend(file_summaries);
     }
     Ok(summaries)
+}
+
+/// EXEC-4: one streamed trace line — [`BoundedLine::Oversized`] marks a
+/// single line beyond the budget, whose content was discarded at the
+/// newline boundary (the following line is never consumed).
+enum BoundedLine {
+    Line(String),
+    Oversized,
+}
+
+/// Bounded line reader over any buffered source: fills the buffer, keeps
+/// bytes up to the newline, and — once a line crosses the cap — discards
+/// whole windows until the newline appears, so the reader stays exactly at
+/// the next line's first byte. Memory is O(window + cap), never O(line).
+fn next_bounded_line<R: std::io::BufRead>(
+    reader: &mut R,
+    cap: usize,
+) -> std::io::Result<Option<BoundedLine>> {
+    let mut line: Vec<u8> = Vec::new();
+    loop {
+        let available = reader.fill_buf()?;
+        if available.is_empty() {
+            // EOF: a non-empty tail is the file's last (newline-free) line.
+            return if line.is_empty() {
+                Ok(None)
+            } else {
+                Ok(Some(BoundedLine::Line(
+                    String::from_utf8_lossy(&line).into_owned(),
+                )))
+            };
+        }
+        match available.iter().position(|byte| *byte == b'\n') {
+            Some(pos) => {
+                // The line bytes are `line + available[..pos]`; the newline
+                // itself never counts toward the cap.
+                let fits = line.len() + pos <= cap;
+                if fits {
+                    line.extend_from_slice(&available[..pos]);
+                }
+                reader.consume(pos + 1);
+                return if fits {
+                    Ok(Some(BoundedLine::Line(
+                        String::from_utf8_lossy(&line).into_owned(),
+                    )))
+                } else {
+                    Ok(Some(BoundedLine::Oversized))
+                };
+            }
+            None => {
+                let window = available.len();
+                if line.len() + window > cap {
+                    // The line provably crosses the cap: discard whole
+                    // windows (newline included when it appears) until the
+                    // boundary, then report one oversized line.
+                    reader.consume(window);
+                    line.clear();
+                    loop {
+                        let rest = reader.fill_buf()?;
+                        if rest.is_empty() {
+                            return Ok(Some(BoundedLine::Oversized));
+                        }
+                        match rest.iter().position(|byte| *byte == b'\n') {
+                            Some(pos) => {
+                                reader.consume(pos + 1);
+                                return Ok(Some(BoundedLine::Oversized));
+                            }
+                            None => {
+                                let size = rest.len();
+                                reader.consume(size);
+                            }
+                        }
+                    }
+                }
+                line.extend_from_slice(available);
+                let size = available.len();
+                reader.consume(size);
+            }
+        }
+    }
 }
 
 /// Compact human report for one run.
@@ -399,5 +536,73 @@ mod tests {
         assert_eq!(summary.run_id, "run-b");
         assert_eq!(summary.user_messages, 2, "only run-b's events are counted");
         assert!(summary.started, "run-b's own start is part of its summary");
+    }
+}
+
+#[cfg(test)]
+mod exec4_tests {
+    use super::*;
+
+    /// EXEC-4：行界——恰好上限的行折叠、超一字节的行计入 omitted，且其
+    /// 后的行仍然被折叠（换行边界不被吞掉）。
+    #[test]
+    fn bounded_lines_keep_the_boundary_across_an_oversized_line() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("trace.jsonl");
+        let mut content = String::new();
+        // 恰好上限的一行（合法 JSON 事件）：按前后缀精确补齐。
+        let prefix = "{\"run_id\":\"r1\",\"event\":{\"type\":\"run_started\"},\"pad\":\"";
+        let pad = MAX_TRACE_LINE_BYTES - prefix.len() - 3;
+        content.push_str(prefix);
+        content.push_str(&"a".repeat(pad));
+        content.push_str("\"}\n");
+        debug_assert_eq!(
+            content.len(),
+            MAX_TRACE_LINE_BYTES,
+            "the regression needs an exactly-cap line"
+        );
+        // 超一字节的行。
+        content.push_str(&format!(
+            "{{\"run_id\":\"r1\",\"pad\":\"{}\"}}\n",
+            "b".repeat(MAX_TRACE_LINE_BYTES)
+        ));
+        // 之后的行必须仍然被折叠到同一 run。
+        content.push_str("{\"run_id\":\"r1\",\"event\":{\"type\":\"run_completed\"}}\n");
+        std::fs::write(&path, content).unwrap();
+
+        let summaries = run_summaries_from_files(&[path]).unwrap();
+        eprintln!("DBG summaries={summaries:?}");
+        let summary = &summaries[0];
+        assert_eq!(summary.run_id, "r1");
+        assert!(summary.started, "the exactly-cap line folded");
+        assert!(summary.completed, "the line after the oversized one folded");
+        assert_eq!(summary.omitted_lines, 1, "the over-cap line was counted");
+    }
+
+    /// EXEC-4：整文件不再一次性装入——用超长单行 + 大量行验证内存路径
+    /// 有界（结果集合有摘要数预算，超出的计入 omitted）。
+    #[test]
+    fn per_file_summary_budget_and_omissions_are_counted() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("multi.jsonl");
+        let mut content = String::new();
+        for index in 0..(MAX_SUMMARIES_PER_FILE + 10) {
+            content.push_str("{\"run_id\":\"run-");
+            content.push_str(&index.to_string());
+            content.push_str(
+                "\",\"event\":{\"type\":\"run_started\"}}
+",
+            );
+        }
+        content.push_str("not an envelope\n");
+        std::fs::write(&path, content).unwrap();
+
+        let summaries = run_summaries_from_files(&[path]).unwrap();
+        assert_eq!(summaries.len(), MAX_SUMMARIES_PER_FILE);
+        assert_eq!(
+            summaries[0].omitted_lines,
+            10 + 1,
+            "beyond-budget and non-envelope rows are counted"
+        );
     }
 }

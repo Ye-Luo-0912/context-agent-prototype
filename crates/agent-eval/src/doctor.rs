@@ -268,6 +268,7 @@ async fn provider_probe() -> DoctorStep {
         tools: Vec::new(),
         metadata: serde_json::json!({ "purpose": "doctor-probe" }),
         cancel: agent_contracts::CancellationToken::new(),
+        ..Default::default()
     };
     match provider.complete(request).await {
         Ok(output) => DoctorStep {

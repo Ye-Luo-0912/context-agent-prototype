@@ -1322,6 +1322,8 @@ mod tests {
                     task_id,
                     anchor_revision: 0,
                     summary: "task one done".into(),
+                    artifacts: Vec::new(),
+                    final_output_digest: None,
                 },
             ),
             envelope(

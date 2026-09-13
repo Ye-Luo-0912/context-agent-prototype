@@ -4149,6 +4149,7 @@ mod tests {
             tools,
             metadata: serde_json::Value::Null,
             cancel: CancellationToken::new(),
+            ..Default::default()
         };
         let off = serde_json::to_value(comparison).unwrap();
         assert_eq!(

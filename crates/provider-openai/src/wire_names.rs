@@ -128,6 +128,7 @@ mod tests {
                 .collect(),
             metadata: json!({}),
             cancel: CancellationToken::new(),
+            ..Default::default()
         }
     }
 
@@ -170,6 +171,7 @@ mod tests {
             tools: Vec::new(),
             metadata: json!({}),
             cancel: CancellationToken::new(),
+            ..Default::default()
         };
         let codec = ToolNameCodec::from_request(&request).expect("no collision");
         assert_eq!(codec.decode_wire_name("edit_replace"), "edit.replace");
@@ -199,6 +201,7 @@ mod tests {
             }],
             metadata: json!({}),
             cancel: CancellationToken::new(),
+            ..Default::default()
         };
         let codec = ToolNameCodec::from_request(&request)
             .expect("a raw history wire name must not fail the request");

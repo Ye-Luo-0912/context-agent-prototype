@@ -250,6 +250,8 @@ impl Script {
             task_id,
             anchor_revision: 0,
             summary: summary.into(),
+            artifacts: Vec::new(),
+            final_output_digest: None,
         });
         self.push(RuntimeEvent::ContextMaintained {
             trigger: ContextMaintenanceTrigger::TaskCompleted,

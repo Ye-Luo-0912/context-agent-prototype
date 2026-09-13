@@ -81,6 +81,7 @@ async fn http_rejection_observation_preserves_the_failure_and_wire_on_both_proto
             tools: vec![],
             metadata: json!({}),
             cancel: Default::default(),
+            ..Default::default()
         };
         let recorder = Recorder::default();
         let observed = provider
@@ -260,6 +261,7 @@ async fn observer_fingerprints_actual_http_bytes_without_changing_either_protoco
             tools: vec![],
             metadata: json!({"private-metadata":"must-not-send"}),
             cancel: Default::default(),
+            ..Default::default()
         };
         let recorder = Recorder::default();
         let observed = provider

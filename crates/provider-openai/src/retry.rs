@@ -23,7 +23,7 @@ use std::time::{Duration, SystemTime};
 use agent_contracts::{
     AgentError, AgentResult, CancellationToken, LocalResourceLimitKind, ModelCapabilities,
     ModelChunk, ModelEventSink, ModelOutput, ModelProtocolErrorKind, ModelRequest, ModelTransport,
-    RetryAfterMillis,
+    ModelUsage, RetryAfterMillis,
 };
 use async_trait::async_trait;
 use serde::Serialize;
@@ -108,6 +108,10 @@ pub enum RetryClass {
 }
 
 fn retry_class(error: &AgentError) -> Option<RetryClass> {
+    // COST-7 (R3-12): classification looks through the usage wrapper — a
+    // wrapped transport failure stays retryable, a wrapped output limit
+    // stays a budget outcome.
+    let error = error.failure_source();
     match error {
         AgentError::Transport {
             retryable: true, ..
@@ -208,6 +212,19 @@ fn final_stage(
     }
 }
 
+/// COST-7 (R3-12): keep the most recent usage a failed attempt reported
+/// when the final error itself carries none — the billed attempt's
+/// evidence survives the give-up instead of degrading to unknown.
+fn attach_known_usage(error: AgentError, carried: Option<ModelUsage>) -> AgentError {
+    if error.reported_usage().is_some() {
+        return error;
+    }
+    match carried {
+        Some(usage) => AgentError::failed_with_usage(usage, error),
+        None => error,
+    }
+}
+
 /// Terminal stage for a request cancelled during a retry wait: no further
 /// attempt ran, and the counters are the failures the loop already burned.
 fn cancelled_stage(budget: &RetryBudget, call_seq: u64) -> CallStage {
@@ -241,11 +258,23 @@ impl RetryObserver for NullRetryObserver {
 /// provider must not grow the artifact unbounded.
 const MAX_RETRY_METRICS_BYTES: u64 = 4 * 1024 * 1024;
 
+/// COST-7 (R2-11): process-unique observer instance tag. The main model and
+/// the independent maintenance transport each build their own observer over
+/// the SAME metrics file, and each transport's `call_seq` starts at zero —
+/// without a per-writer tag, stage/incident records from the two lanes with
+/// the same sequence number are ambiguous in one JSONL log.
+static NEXT_RETRY_OBSERVER_INSTANCE: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
 /// Persists the transport's typed retry records as JSONL (one line per
 /// record) under the path the host selects. Without a path it is a no-op and
 /// the stderr retry line remains the human channel.
 pub struct JsonlRetryObserver {
     path: Option<std::path::PathBuf>,
+    /// COST-7 (R2-11): which writer produced the line. Two transports
+    /// sharing one metrics file stay attributable:
+    /// `(transport_instance, call_seq)` pairs uniquely.
+    instance: u64,
     /// Serializes appends for this process so the remaining-cap accounting
     /// and the line write are one observation; a line that would cross the
     /// cap is dropped whole, never partial-appended. Cross-process writers
@@ -259,6 +288,8 @@ impl JsonlRetryObserver {
     pub fn new(path: Option<std::path::PathBuf>) -> Self {
         Self {
             path,
+            instance: NEXT_RETRY_OBSERVER_INSTANCE
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed),
             gate: std::sync::Mutex::new(()),
         }
     }
@@ -276,9 +307,9 @@ impl JsonlRetryObserver {
 
     fn append(&self, kind: &str, record: &impl serde::Serialize) {
         let Some(path) = &self.path else { return };
-        let Ok(line) =
-            serde_json::to_string(&serde_json::json!({ "kind": kind, "record": record }))
-        else {
+        let Ok(line) = serde_json::to_string(
+            &serde_json::json!({ "kind": kind, "transport": self.instance, "record": record }),
+        ) else {
             return;
         };
         use std::io::Write;
@@ -568,6 +599,8 @@ impl<T: ModelTransport> RetryingTransport<T> {
     ) -> AgentResult<ModelOutput> {
         let emitted = AtomicBool::new(false);
         let mut budget = RetryBudget::new(self.max_attempts);
+        // COST-7 (R3-12): the most recent usage any failed attempt reported.
+        let mut carried_usage: Option<ModelUsage> = None;
         loop {
             let tracking = EmissionTrackingSink {
                 inner: sink,
@@ -581,10 +614,13 @@ impl<T: ModelTransport> RetryingTransport<T> {
                     return Ok(output);
                 }
                 Err(error) => {
+                    if let Some(usage) = error.reported_usage() {
+                        carried_usage = Some(usage.clone());
+                    }
                     let Some(class) = retry_class(&error) else {
                         self.observer
                             .on_stage(&final_stage(&budget, false, None, call_seq));
-                        return Err(error);
+                        return Err(attach_known_usage(error, carried_usage.take()));
                     };
                     if emitted.load(Ordering::Relaxed) {
                         // A stream that already emitted deltas cannot be
@@ -592,12 +628,12 @@ impl<T: ModelTransport> RetryingTransport<T> {
                         // no rewind, and a retry would duplicate the output.
                         self.observer
                             .on_stage(&final_stage(&budget, false, Some(class), call_seq));
-                        return Err(error);
+                        return Err(attach_known_usage(error, carried_usage.take()));
                     }
                     let Some(reservation) = budget.reserve_retry(class) else {
                         self.observer
                             .on_stage(&final_stage(&budget, false, Some(class), call_seq));
-                        return Err(error);
+                        return Err(attach_known_usage(error, carried_usage.take()));
                     };
                     let delay = retry_delay(
                         class,
@@ -655,6 +691,8 @@ impl<T: ModelTransport> RetryingTransport<T> {
         call_seq: u64,
     ) -> AgentResult<ModelOutput> {
         let mut budget = RetryBudget::new(self.max_attempts);
+        // COST-7 (R3-12): the most recent usage any failed attempt reported.
+        let mut carried_usage: Option<ModelUsage> = None;
         loop {
             let collected = BufferedSink::default();
             match self
@@ -688,15 +726,18 @@ impl<T: ModelTransport> RetryingTransport<T> {
                     return Ok(output);
                 }
                 Err(error) => {
+                    if let Some(usage) = error.reported_usage() {
+                        carried_usage = Some(usage.clone());
+                    }
                     let Some(class) = retry_class(&error) else {
                         self.observer
                             .on_stage(&final_stage(&budget, false, None, call_seq));
-                        return Err(error);
+                        return Err(attach_known_usage(error, carried_usage.take()));
                     };
                     let Some(reservation) = budget.reserve_retry(class) else {
                         self.observer
                             .on_stage(&final_stage(&budget, false, Some(class), call_seq));
-                        return Err(error);
+                        return Err(attach_known_usage(error, carried_usage.take()));
                     };
                     let delay = retry_delay(
                         class,
@@ -872,6 +913,8 @@ where
     Fut: std::future::Future<Output = AgentResult<T>>,
 {
     let mut budget = RetryBudget::new(max_attempts);
+    // COST-7 (R3-12): the most recent usage any failed attempt reported.
+    let mut carried_usage: Option<ModelUsage> = None;
     loop {
         match op().await {
             Ok(value) => {
@@ -879,13 +922,16 @@ where
                 return Ok((value, budget.attempts));
             }
             Err(error) => {
+                if let Some(usage) = error.reported_usage() {
+                    carried_usage = Some(usage.clone());
+                }
                 let Some(class) = retry_class(&error) else {
                     observer.on_stage(&final_stage(&budget, false, None, call_seq));
-                    return Err(error);
+                    return Err(attach_known_usage(error, carried_usage.take()));
                 };
                 let Some(reservation) = budget.reserve_retry(class) else {
                     observer.on_stage(&final_stage(&budget, false, Some(class), call_seq));
-                    return Err(error);
+                    return Err(attach_known_usage(error, carried_usage.take()));
                 };
                 let delay = retry_delay(class, schedule, reservation.class_retry_number, &error);
                 observer.on_incident(&RetryIncident {
@@ -1028,6 +1074,7 @@ mod tests {
             tools: Vec::new(),
             metadata: json!({}),
             cancel: CancellationToken::new(),
+            ..Default::default()
         }
     }
 
@@ -1109,6 +1156,114 @@ mod tests {
                 usage: ModelUsage::default(),
             })
         }
+    }
+
+    /// COST-7 (R3-12): a failed attempt whose usage the provider already
+    /// reported keeps that evidence when the retry loop gives up — the
+    /// final plain failure does not downgrade it to unknown.
+    #[tokio::test]
+    async fn give_up_keeps_the_earlier_attempts_reported_usage() {
+        struct UsageThenFail {
+            calls: Arc<AtomicU32>,
+        }
+        #[async_trait]
+        impl ModelTransport for UsageThenFail {
+            fn capabilities(&self) -> ModelCapabilities {
+                ModelCapabilities::default()
+            }
+            async fn complete(&self, _request: ModelRequest) -> AgentResult<ModelOutput> {
+                let call = self.calls.fetch_add(1, Ordering::SeqCst) + 1;
+                if call == 1 {
+                    return Err(AgentError::failed_with_usage(
+                        ModelUsage {
+                            input_tokens: Some(90),
+                            output_tokens: Some(30),
+                            attempts: 1,
+                            ..ModelUsage::default()
+                        },
+                        AgentError::Transport {
+                            retryable: true,
+                            message: "stream dropped after the usage frame".into(),
+                        },
+                    ));
+                }
+                Err(AgentError::Transport {
+                    retryable: true,
+                    message: "link gone".into(),
+                })
+            }
+        }
+        let calls = Arc::new(AtomicU32::new(0));
+        let transport = RetryingTransport::new(
+            UsageThenFail {
+                calls: calls.clone(),
+            },
+            2,
+            Duration::from_millis(1),
+        );
+        let error = transport.complete(request()).await.unwrap_err();
+        let usage = error
+            .reported_usage()
+            .expect("the known usage must survive the give-up");
+        assert_eq!(usage.input_tokens, Some(90));
+        assert_eq!(usage.output_tokens, Some(30));
+        // The original failure semantics stay readable through the wrapper.
+        assert!(matches!(
+            error.failure_source(),
+            AgentError::Transport { .. }
+        ));
+        assert_eq!(calls.load(Ordering::SeqCst), 2, "both attempts ran");
+    }
+
+    /// COST-7 (R3-12): a usage-wrapped TRANSPORT failure stays retryable —
+    /// classification looks through the wrapper, so the known usage does
+    /// not turn a retryable outage into a terminal one.
+    #[tokio::test]
+    async fn a_usage_wrapped_transport_failure_stays_retryable() {
+        struct UsageFailOnce {
+            calls: Arc<AtomicU32>,
+        }
+        #[async_trait]
+        impl ModelTransport for UsageFailOnce {
+            fn capabilities(&self) -> ModelCapabilities {
+                ModelCapabilities::default()
+            }
+            async fn complete(&self, _request: ModelRequest) -> AgentResult<ModelOutput> {
+                if self.calls.fetch_add(1, Ordering::SeqCst) == 0 {
+                    return Err(AgentError::failed_with_usage(
+                        ModelUsage {
+                            input_tokens: Some(40),
+                            ..ModelUsage::default()
+                        },
+                        AgentError::Transport {
+                            retryable: true,
+                            message: "retryable with usage".into(),
+                        },
+                    ));
+                }
+                Ok(ModelOutput {
+                    content: "recovered".into(),
+                    tool_calls: Vec::new(),
+                    usage: ModelUsage {
+                        input_tokens: Some(10),
+                        output_tokens: Some(2),
+                        attempts: 1,
+                        ..ModelUsage::default()
+                    },
+                })
+            }
+        }
+        let calls = Arc::new(AtomicU32::new(0));
+        let transport = RetryingTransport::new(
+            UsageFailOnce {
+                calls: calls.clone(),
+            },
+            3,
+            Duration::from_millis(1),
+        );
+        let output = transport.complete(request()).await.unwrap();
+        assert_eq!(output.content, "recovered");
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
     }
 
     #[tokio::test]
@@ -1637,6 +1792,7 @@ mod tests {
             tools: Vec::new(),
             metadata: json!({}),
             cancel: token.clone(),
+            ..Default::default()
         };
         let run = tokio::spawn(async move { transport.complete(request).await });
 
@@ -1669,6 +1825,7 @@ mod tests {
             tools: Vec::new(),
             metadata: json!({}),
             cancel: token.clone(),
+            ..Default::default()
         };
         let run = tokio::spawn(async move { transport.complete(request).await });
         tokio::time::sleep(Duration::from_millis(50)).await;
@@ -2136,5 +2293,45 @@ mod tests {
         assert_eq!(stages.len(), 1);
         assert_eq!(stages[0].outcome, StageOutcome::Recovered);
         assert_eq!(stages[0].attempts, 2);
+    }
+
+    /// COST-7 (R2-11): two observers over one shared metrics file carry
+    /// distinct transport tags, so the main lane and the maintenance lane
+    /// never alias each other's `(transport, call_seq)` pairs.
+    #[test]
+    fn jsonl_observer_lines_carry_distinct_transport_tags() {
+        let dir = std::env::temp_dir().join(format!(
+            "retry-observer-tags-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("retry.jsonl");
+        let first = JsonlRetryObserver::new(Some(path.clone()));
+        let second = JsonlRetryObserver::new(Some(path.clone()));
+        assert_ne!(first.instance, second.instance);
+        let stage = CallStage {
+            call_seq: 5,
+            attempts: 1,
+            transport_retries: 0,
+            format_retries: 0,
+            outcome: StageOutcome::Clean,
+        };
+        first.on_stage(&stage);
+        second.on_stage(&stage);
+        let text = std::fs::read_to_string(&path).unwrap();
+        let lines: Vec<serde_json::Value> = text
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        assert_eq!(lines.len(), 2);
+        assert_eq!(lines[0]["transport"], lines[0]["transport"]);
+        assert_ne!(lines[0]["transport"], lines[1]["transport"]);
+        assert_eq!(lines[0]["record"]["call_seq"], 5);
+        assert_eq!(lines[1]["record"]["call_seq"], 5);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

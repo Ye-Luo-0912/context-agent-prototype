@@ -1316,6 +1316,17 @@ mod tests {
                     cached_input_tokens: 0,
                     attempts: 1,
                     retries: 0,
+                    usage_identity: agent_contracts::UsageIdentity::Observed,
+                    role: agent_contracts::ModelCallRole::Main,
+                    usage: Some(agent_contracts::ModelUsage {
+                        input_tokens: Some(10),
+                        output_tokens: Some(5),
+                        cached_input_tokens: Some(0),
+                        cache_write_input_tokens: None,
+                        attempts: 1,
+                        retries: 0,
+                        ..Default::default()
+                    }),
                 },
             ),
         ];

@@ -893,6 +893,87 @@ fn assert_search_cold_read_observation(output: &ToolOutput) {
 }
 
 #[tokio::test]
+async fn a_capped_catalog_search_says_the_cap_in_the_body() {
+    // F04：命中数打满 limit 时可能被截断——正文必须声明 cap（正文是
+    // 唯一进 TurnFrame 的字段）；未触顶的完整答案保持朴素。
+    let engine = Arc::new(RecordingEngine {
+        searched_limits: Default::default(),
+        searched_queries: Default::default(),
+        search_hits: std::sync::Mutex::new(vec![external_entry(None), external_entry(None)]),
+        inspect_external_entry: Default::default(),
+        inspect_summaries: Default::default(),
+        search_error: Default::default(),
+        fetched: Default::default(),
+    });
+    let kernel = test_kernel(
+        engine.clone(),
+        Arc::new(BigOutputDispatcher {
+            output: ToolOutput {
+                call_id: "c1".into(),
+                tool_name: "context.manage".into(),
+                ok: true,
+                summary: "placeholder".into(),
+                model_content: "placeholder".into(),
+                artifact_ref: None,
+                metadata: serde_json::Value::Null,
+            },
+        }),
+        None,
+    );
+    let placeholder = || ToolOutput {
+        call_id: "c1".into(),
+        tool_name: "context.manage".into(),
+        ok: true,
+        summary: "placeholder".into(),
+        model_content: "placeholder".into(),
+        artifact_ref: None,
+        metadata: serde_json::Value::Null,
+    };
+    let capped = kernel
+        .resolve_engine_query(
+            placeholder(),
+            EngineQuery::SearchExternal {
+                query: "x".into(),
+                kind: None,
+                scope: None,
+                task_id: None,
+                label: None,
+                limit: 2,
+            },
+        )
+        .await;
+    assert!(
+        capped
+            .model_content
+            .contains("[coverage] result capped at limit=2"),
+        "a limit-filling hit list must carry the cap statement in the body: {}",
+        capped.model_content
+    );
+    assert_eq!(capped.metadata["result_capped"], true);
+
+    // 对照组：命中数低于 limit 的答案不带 cap 声明。
+    let uncapped = kernel
+        .resolve_engine_query(
+            placeholder(),
+            EngineQuery::SearchExternal {
+                query: "x".into(),
+                kind: None,
+                scope: None,
+                task_id: None,
+                label: None,
+                limit: 10,
+            },
+        )
+        .await;
+    assert!(
+        !uncapped.model_content.contains("[coverage]"),
+        "an answer below the limit stays plain: {}",
+        uncapped.model_content
+    );
+    assert_eq!(uncapped.metadata["result_capped"], false);
+}
+
+#[tokio::test]
 async fn inspect_renders_the_source_authority() {
     // inspect 元数据视图与 residency/semantic 并列展示来源权威。
     let engine = Arc::new(RecordingEngine {
@@ -985,6 +1066,8 @@ fn dead_summary(id: ContextItemId) -> ContextItemSummary {
         keep_alive: false,
         lease_until_turn: None,
         source: None,
+        residency: ContextResidency::Resident,
+        selected_current_turn: false,
     }
 }
 

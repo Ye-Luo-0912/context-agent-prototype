@@ -1081,6 +1081,31 @@ pub(crate) async fn read_snapshot_lines(
         .collect())
 }
 
+/// F04/CORE-3: the model-facing coverage footer for bounded results.
+///
+/// `TurnFrame` sends only `model_content` to the model — `summary` and
+/// `metadata` never reach the request — so a bounded or incomplete result
+/// must state that fact in the body itself. Every clause is generated from
+/// typed scan values at the call site, never parsed back from prose; the
+/// single line is prefixed `[coverage] ` so it reads as machine-generated
+/// coverage, not result data.
+pub(crate) fn coverage_footer(clauses: Vec<String>) -> Option<String> {
+    let mut clauses = clauses;
+    clauses.retain(|clause| !clause.is_empty());
+    if clauses.is_empty() {
+        return None;
+    }
+    Some(format!("[coverage] {}", clauses.join("; ")))
+}
+
+/// Append the coverage footer to a model body on its own final line.
+pub(crate) fn with_coverage_footer(body: String, footer: Option<String>) -> String {
+    match footer {
+        Some(footer) => format!("{body}\n{footer}"),
+        None => body,
+    }
+}
+
 /// Synchronous tree-kill guard for one-shot process tools: armed right
 /// after spawn, disarmed only after the direct child is reaped. Any
 /// early return (artifact I/O failure, persistence error) then kills

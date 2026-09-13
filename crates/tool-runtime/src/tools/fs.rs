@@ -11,8 +11,9 @@ use serde_json::{Value, json};
 use tokio::fs;
 
 use super::{
-    LineEnding, Tool, content_digest, hidden_path_output, is_hidden_name, is_not_found_error,
-    missing_parent_output, missing_path_output, model_json_string, ordinary_view_blocked,
+    LineEnding, Tool, content_digest, coverage_footer, hidden_path_output, is_hidden_name,
+    is_not_found_error, missing_parent_output, missing_path_output, model_json_string,
+    ordinary_view_blocked, with_coverage_footer,
 };
 
 // A revision returned by `fs.read` must be usable by the canonical edit
@@ -164,16 +165,6 @@ impl Tool for FsListTool {
             Some(reference) => (Some(format!("{reference}#{limit}")), true),
             None => (None, false),
         };
-        let truncated_note = artifact_ref
-            .as_ref()
-            .map(|r| {
-                format!(
-                    "\n... {} more entries; full listing artifact: {r}. Continue with artifact.read reference={r} start_line={}",
-                    entries.len() - visible.len(),
-                    visible.len() + 1,
-                )
-            })
-            .unwrap_or_default();
         let coverage_note = if scan_incomplete {
             " (PARTIAL scan: directory entry budget reached; do not treat this as the complete directory)"
         } else {
@@ -190,6 +181,29 @@ impl Tool for FsListTool {
             listed_relative
         };
         let list_revision = content_digest(full.as_bytes());
+
+        // Body-level coverage statement (F04): summary/metadata never reach
+        // the model, so a budget-truncated listing must say so in the body,
+        // and an overflowing listing must name its continuation there.
+        let mut clauses: Vec<String> = Vec::new();
+        if scan_incomplete {
+            let scope = if entries.is_empty() {
+                "this is not an empty directory"
+            } else {
+                "this is not the complete directory"
+            };
+            clauses.push(format!(
+                "PARTIAL listing: directory entry budget reached; {scope} ({listed})"
+            ));
+        }
+        if let Some(reference) = &artifact_ref {
+            clauses.push(format!(
+                "continue with artifact.read reference={reference} start_line={}",
+                visible.len() + 1
+            ));
+        }
+        let coverage = coverage_footer(clauses);
+
         let mut output = ToolOutput {
             call_id: call_id.into(),
             tool_name: "fs.list".into(),
@@ -199,11 +213,14 @@ impl Tool for FsListTool {
                 entries.len(),
                 display_relative(&self.workspace, &path)
             ),
-            model_content: if entries.is_empty() && scan_incomplete {
-                "no entries in the scanned prefix; the scan is incomplete, so this is not an empty directory".to_string()
-            } else {
-                format!("{}{}", visible.join("\n"), truncated_note)
-            },
+            model_content: with_coverage_footer(
+                if entries.is_empty() && scan_incomplete {
+                    "no entries in the scanned prefix".to_string()
+                } else {
+                    visible.join("\n")
+                },
+                coverage,
+            ),
             artifact_ref,
             metadata: json!({
                 // digest 对完整 listing 计算：visible 只是分页窗口，
@@ -259,6 +276,22 @@ impl FsListTool {
         let has_more = next_offset < lines.len();
         let next_cursor = has_more.then(|| format!("{reference}#{next_offset}"));
 
+        // Paging semantics in the body (F04): every page names its range
+        // and snapshot identity; a middle page names its continuation and
+        // the final page carries an explicit end marker.
+        let coverage = if has_more {
+            coverage_footer(vec![format!(
+                "entries {}-{} of {} (snapshot {reference}); continue with fs.list cursor={reference}#{next_offset}",
+                offset + 1,
+                next_offset,
+                lines.len()
+            )])
+        } else {
+            coverage_footer(vec![format!(
+                "end of listing ({next_offset} total, snapshot {reference})"
+            )])
+        };
+
         let mut output = ToolOutput {
             call_id: call_id.into(),
             tool_name: "fs.list".into(),
@@ -269,11 +302,14 @@ impl FsListTool {
                 next_offset,
                 lines.len()
             ),
-            model_content: if page.is_empty() {
-                "no more entries".to_string()
-            } else {
-                page.join("\n")
-            },
+            model_content: with_coverage_footer(
+                if page.is_empty() {
+                    "no more entries".to_string()
+                } else {
+                    page.join("\n")
+                },
+                coverage,
+            ),
             artifact_ref: Some(reference.to_string()),
             metadata: json!({
                 "entry_count": lines.len(),
@@ -1320,7 +1356,19 @@ mod tests {
             panic!("fs.list returns a plain value");
         };
         let second_lines: Vec<&str> = output.model_content.lines().collect();
-        assert_eq!(second_lines.len(), 4);
+        assert_eq!(
+            second_lines.len(),
+            5,
+            "4 entries plus the coverage footer line"
+        );
+        assert!(
+            second_lines
+                .last()
+                .is_some_and(|line| line.contains("entries 5-8 of 10 (snapshot")
+                    && line.contains("continue with fs.list cursor=")),
+            "a middle page must carry range, snapshot identity and continuation: {:?}",
+            second_lines.last()
+        );
         assert_eq!(output.metadata["returned"], 4);
         assert_eq!(output.metadata["has_more"], true);
         let first_lines: Vec<&str> = first_content.lines().collect();
@@ -1344,6 +1392,13 @@ mod tests {
         assert_eq!(output.metadata["returned"], 2);
         assert_eq!(output.metadata["has_more"], false);
         assert!(output.metadata["cursor"].is_null());
+        assert!(
+            output
+                .model_content
+                .contains("end of listing (10 total, snapshot"),
+            "the final page must carry the end marker in the body: {}",
+            output.model_content
+        );
 
         // A corrupted cursor (offset beyond the snapshot) is a clean error.
         let bad = format!("{}#9999", output.artifact_ref.as_deref().unwrap());
@@ -1387,6 +1442,50 @@ mod tests {
                 .contains("do not treat this as the complete directory"),
             "{}",
             output.summary
+        );
+    }
+
+    /// F04 反例（fs.list 版）：非空但被条目预算截断的列表在正文里也
+    /// 必须声明不完整——`model_content` 是唯一进 TurnFrame 的字段，
+    /// summary/metadata 到不了模型。
+    #[tokio::test]
+    async fn a_partial_nonempty_listing_declares_incompleteness_in_the_model_body() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir(dir.path().join("many")).unwrap();
+        for i in 0..=MAX_LIST_ENTRIES {
+            std::fs::write(dir.path().join("many").join(format!("f-{i:04}.txt")), "x").unwrap();
+        }
+        let workspace = Workspace::open(dir.path()).await.unwrap();
+        let tool = FsListTool::new(workspace);
+        let outcome = tool
+            .execute(
+                RunId::new(),
+                "c",
+                json!({"path": "many", "limit": 8}),
+                None,
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+        let ToolOutcome::Value(output) = outcome else {
+            panic!("fs.list returns a value");
+        };
+        assert!(
+            output.model_content.contains("f-0000"),
+            "entries stay visible: {}",
+            output.model_content
+        );
+        assert!(
+            output.model_content.contains("[coverage]") && output.model_content.contains("PARTIAL"),
+            "a non-empty partial listing must carry the coverage statement in the body: {}",
+            output.model_content
+        );
+        assert!(
+            output
+                .model_content
+                .contains("not the complete directory (many)"),
+            "the body must name the scope of the partial listing: {}",
+            output.model_content
         );
     }
 

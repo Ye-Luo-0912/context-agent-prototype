@@ -112,6 +112,8 @@ impl agent_contracts::BoundedCompactor for ScriptedCompactor {
             ),
             input_tokens: 0,
             output_tokens: 0,
+            usage_identity: agent_contracts::UsageIdentity::Observed,
+            ..Default::default()
         })
     }
 }

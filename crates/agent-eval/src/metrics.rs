@@ -412,6 +412,21 @@ pub struct RunMetrics {
     /// 旧 traces 回退到 `ContextMaintained.report` 本轮花费。
     pub compaction_input_tokens: u64,
     pub compaction_output_tokens: u64,
+    /// E05.3/COST-1: compactions whose usage is estimated/unknown are
+    /// counted as events, never folded into the observed token totals.
+    pub compaction_estimated_events: u64,
+    pub compaction_unknown_events: u64,
+    /// COST-7 (R2-11): retries the compactor calls consumed. A compaction
+    /// retry usually reports no usage on the failed attempt, so the
+    /// compaction token totals are a lower bound when this is nonzero.
+    pub compaction_retries: u64,
+    /// COST-7 (R2-11): `ModelUsed` rows attributed to the maintenance/
+    /// compactor lane, with their observed token sums kept apart from the
+    /// main-lane bill (an unknown maintenance row must not read as an
+    /// unknown main round).
+    pub maintenance_used_rows: u64,
+    pub maintenance_observed_input_tokens: u64,
+    pub maintenance_observed_output_tokens: u64,
 }
 
 /// Aggregate one run's envelopes. The caller filters to a single run.
@@ -911,6 +926,8 @@ pub fn aggregate_metrics(events: &[RuntimeEventEnvelope]) -> RunMetrics {
             RuntimeEvent::ContextCompacted {
                 input_tokens,
                 output_tokens,
+                usage_identity,
+                retries,
                 ..
             } => {
                 if !seen_context_compacted {
@@ -918,12 +935,36 @@ pub fn aggregate_metrics(events: &[RuntimeEventEnvelope]) -> RunMetrics {
                     metrics.compaction_output_tokens = 0;
                     seen_context_compacted = true;
                 }
-                metrics.compaction_input_tokens = metrics
-                    .compaction_input_tokens
-                    .saturating_add(*input_tokens);
-                metrics.compaction_output_tokens = metrics
-                    .compaction_output_tokens
-                    .saturating_add(*output_tokens);
+                // E05.3/COST-1: the token totals are the OBSERVED bill only.
+                // Estimated/unknown compactions are counted as events —
+                // unknown is never folded in as consumed zeros.
+                // COST-7 (R2-11): estimated/unknown compactions and
+                // compaction retries mark the whole bill incomplete exactly
+                // like model rounds do — a run where only the maintenance
+                // lane has unknowns must not read as fully observed.
+                match usage_identity {
+                    agent_contracts::UsageIdentity::Observed => {
+                        metrics.compaction_input_tokens = metrics
+                            .compaction_input_tokens
+                            .saturating_add(*input_tokens);
+                        metrics.compaction_output_tokens = metrics
+                            .compaction_output_tokens
+                            .saturating_add(*output_tokens);
+                    }
+                    agent_contracts::UsageIdentity::Estimated => {
+                        metrics.compaction_estimated_events += 1;
+                        metrics.provider_tokens_lower_bound = true;
+                    }
+                    agent_contracts::UsageIdentity::Unknown => {
+                        metrics.compaction_unknown_events += 1;
+                        metrics.provider_tokens_lower_bound = true;
+                    }
+                }
+                if *retries > 0 {
+                    metrics.compaction_retries =
+                        metrics.compaction_retries.saturating_add(*retries as u64);
+                    metrics.provider_tokens_lower_bound = true;
+                }
             }
             RuntimeEvent::ContextGc { report } => {
                 metrics.gc_evictions += report.evicted as u64;
@@ -1045,10 +1086,30 @@ pub fn aggregate_metrics(events: &[RuntimeEventEnvelope]) -> RunMetrics {
                 cached_input_tokens,
                 attempts,
                 retries,
+                usage_identity,
+                role,
+                ..
             } => {
-                metrics.model_input_tokens += input_tokens;
-                metrics.model_output_tokens += output_tokens;
-                metrics.model_cached_input_tokens += cached_input_tokens;
+                // CORE-4: unknown rows (cancelled in-flight rounds, legacy
+                // records) are not observed consumption — they must not be
+                // summed as real zeros. COST-7: the maintenance lane keeps
+                // its own counters so a main-round bill and a compactor
+                // bill stay separable; both lanes feed the completeness
+                // flag the same way.
+                let maintenance = *role == agent_contracts::ModelCallRole::Maintenance;
+                if *usage_identity == agent_contracts::UsageIdentity::Observed {
+                    if maintenance {
+                        metrics.maintenance_used_rows += 1;
+                        metrics.maintenance_observed_input_tokens += input_tokens;
+                        metrics.maintenance_observed_output_tokens += output_tokens;
+                    } else {
+                        metrics.model_input_tokens += input_tokens;
+                        metrics.model_output_tokens += output_tokens;
+                        metrics.model_cached_input_tokens += cached_input_tokens;
+                    }
+                } else {
+                    metrics.provider_tokens_lower_bound = true;
+                }
                 let attempts = (*attempts).max(1) as u64;
                 metrics.model_attempts = metrics.model_attempts.saturating_add(attempts);
                 metrics.model_retries = metrics.model_retries.saturating_add(*retries as u64);
@@ -2049,6 +2110,11 @@ mod tests {
                     diagnostics: Default::default(),
                     externalized_ids: Vec::new(),
                     anchor_root_protections: Vec::new(),
+                    anchor_root_misses: Vec::new(),
+                    externalize_deferred: 0,
+                    externalize_backpressure: false,
+                    store_io_failures: 0,
+                    scopes_retired: 0,
                 },
             },
         ));
@@ -2119,6 +2185,17 @@ mod tests {
                 cached_input_tokens: 2_500,
                 attempts: 1,
                 retries: 0,
+                usage_identity: agent_contracts::UsageIdentity::Observed,
+                role: agent_contracts::ModelCallRole::Main,
+                usage: Some(agent_contracts::ModelUsage {
+                    input_tokens: Some(2_500),
+                    output_tokens: Some(25),
+                    cached_input_tokens: Some(2_500),
+                    cache_write_input_tokens: None,
+                    attempts: 1,
+                    retries: 0,
+                    ..Default::default()
+                }),
             },
         ));
         seq += 1;
@@ -2402,6 +2479,8 @@ mod tests {
                     task_id,
                     anchor_revision: 3,
                     summary: "done".into(),
+                    artifacts: Vec::new(),
+                    final_output_digest: None,
                 },
             ),
             envelope(run, 13, RuntimeEvent::TurnCompleted),
@@ -3015,12 +3094,210 @@ mod tests {
                     input_tokens: 34600,
                     output_tokens: 1300,
                     source_items: 8,
+                    usage_identity: agent_contracts::UsageIdentity::Observed,
+                    cached_input_tokens: None,
+                    cache_write_input_tokens: None,
+                    cache_miss_input_tokens: None,
+                    attempts: 0,
+                    retries: 0,
                 },
             ),
         ];
         let metrics = aggregate_metrics(&events);
         assert_eq!(metrics.compaction_input_tokens, 34600);
         assert_eq!(metrics.compaction_output_tokens, 1300);
+    }
+
+    /// E05.3/COST-1: estimated/unknown compactions are COUNTED as events —
+    /// their counters never fold into the observed token totals, and
+    /// unknown is never silently consumed as zeros.
+    #[test]
+    fn unobserved_compactions_are_counted_outside_the_token_totals() {
+        let run = RunId::new();
+        let events = vec![
+            envelope(
+                run,
+                1,
+                RuntimeEvent::ContextCompacted {
+                    reason: CompactionReason::RollingFold,
+                    input_tokens: 34600,
+                    output_tokens: 1300,
+                    source_items: 8,
+                    usage_identity: agent_contracts::UsageIdentity::Observed,
+                    cached_input_tokens: None,
+                    cache_write_input_tokens: None,
+                    cache_miss_input_tokens: None,
+                    attempts: 0,
+                    retries: 0,
+                },
+            ),
+            envelope(
+                run,
+                2,
+                RuntimeEvent::ContextCompacted {
+                    reason: CompactionReason::RollingFold,
+                    input_tokens: 9999,
+                    output_tokens: 777,
+                    source_items: 3,
+                    usage_identity: agent_contracts::UsageIdentity::Estimated,
+                    cached_input_tokens: None,
+                    cache_write_input_tokens: None,
+                    cache_miss_input_tokens: None,
+                    attempts: 0,
+                    retries: 0,
+                },
+            ),
+            envelope(
+                run,
+                3,
+                RuntimeEvent::ContextCompacted {
+                    reason: CompactionReason::RollingFold,
+                    input_tokens: 0,
+                    output_tokens: 0,
+                    source_items: 2,
+                    usage_identity: agent_contracts::UsageIdentity::Unknown,
+                    cached_input_tokens: None,
+                    cache_write_input_tokens: None,
+                    cache_miss_input_tokens: None,
+                    attempts: 0,
+                    retries: 0,
+                },
+            ),
+        ];
+        let metrics = aggregate_metrics(&events);
+        assert_eq!(metrics.compaction_input_tokens, 34600);
+        assert_eq!(metrics.compaction_output_tokens, 1300);
+        assert_eq!(metrics.compaction_estimated_events, 1);
+        assert_eq!(metrics.compaction_unknown_events, 1);
+    }
+
+    /// COST-7 (R2-11): a run where only the MAINTENANCE lane has unknowns
+    /// must not read as fully observed — compaction estimated/unknown rows
+    /// and compaction retries mark the whole bill a lower bound, and the
+    /// retries are counted.
+    #[test]
+    fn maintenance_side_unknowns_and_retries_mark_the_bill_incomplete() {
+        let run = RunId::new();
+        let events = vec![
+            envelope(
+                run,
+                1,
+                RuntimeEvent::ModelUsed {
+                    input_tokens: 500,
+                    output_tokens: 50,
+                    cached_input_tokens: 0,
+                    attempts: 1,
+                    retries: 0,
+                    usage_identity: agent_contracts::UsageIdentity::Observed,
+                    role: agent_contracts::ModelCallRole::Main,
+                    usage: None,
+                },
+            ),
+            envelope(
+                run,
+                2,
+                RuntimeEvent::ContextCompacted {
+                    reason: CompactionReason::RollingFold,
+                    input_tokens: 0,
+                    output_tokens: 0,
+                    source_items: 3,
+                    usage_identity: agent_contracts::UsageIdentity::Unknown,
+                    cached_input_tokens: None,
+                    cache_write_input_tokens: None,
+                    cache_miss_input_tokens: None,
+                    attempts: 0,
+                    retries: 2,
+                },
+            ),
+        ];
+        let metrics = aggregate_metrics(&events);
+        assert_eq!(metrics.compaction_unknown_events, 1);
+        assert_eq!(metrics.compaction_retries, 2);
+        assert!(
+            metrics.provider_tokens_lower_bound,
+            "only maintenance has unknowns/retries, yet the bill must read incomplete"
+        );
+        // The main lane's observed bill is untouched by the maintenance row.
+        assert_eq!(metrics.model_input_tokens, 500);
+        assert_eq!(metrics.model_output_tokens, 50);
+        assert_eq!(metrics.compaction_input_tokens, 0);
+    }
+
+    /// COST-7 (R2-11): the maintenance lane's observed rows keep their own
+    /// counters instead of blurring into the main-round bill.
+    #[test]
+    fn maintenance_lane_usage_rows_are_counted_apart_from_main_rounds() {
+        let run = RunId::new();
+        let events = vec![
+            envelope(
+                run,
+                1,
+                RuntimeEvent::ModelUsed {
+                    input_tokens: 900,
+                    output_tokens: 30,
+                    cached_input_tokens: 0,
+                    attempts: 1,
+                    retries: 0,
+                    usage_identity: agent_contracts::UsageIdentity::Observed,
+                    role: agent_contracts::ModelCallRole::Main,
+                    usage: None,
+                },
+            ),
+            envelope(
+                run,
+                2,
+                RuntimeEvent::ModelUsed {
+                    input_tokens: 140,
+                    output_tokens: 9,
+                    cached_input_tokens: 0,
+                    attempts: 1,
+                    retries: 0,
+                    usage_identity: agent_contracts::UsageIdentity::Observed,
+                    role: agent_contracts::ModelCallRole::Maintenance,
+                    usage: None,
+                },
+            ),
+            envelope(
+                run,
+                3,
+                RuntimeEvent::ModelUsed {
+                    input_tokens: 0,
+                    output_tokens: 0,
+                    cached_input_tokens: 0,
+                    attempts: 0,
+                    retries: 0,
+                    usage_identity: agent_contracts::UsageIdentity::Unknown,
+                    role: agent_contracts::ModelCallRole::Maintenance,
+                    usage: None,
+                },
+            ),
+        ];
+        let metrics = aggregate_metrics(&events);
+        assert_eq!(metrics.model_input_tokens, 900, "main bill stays main");
+        assert_eq!(metrics.model_output_tokens, 30);
+        assert_eq!(metrics.maintenance_used_rows, 1);
+        assert_eq!(metrics.maintenance_observed_input_tokens, 140);
+        assert_eq!(metrics.maintenance_observed_output_tokens, 9);
+        assert!(
+            metrics.provider_tokens_lower_bound,
+            "the maintenance unknown row marks the bill incomplete"
+        );
+    }
+
+    /// E05.3/COST-1: a legacy compaction row predating the typed identity
+    /// decodes as Unknown — its zero counters are not observed consumption.
+    #[test]
+    fn legacy_compacted_rows_decode_as_unknown_identity() {
+        let event: RuntimeEvent = serde_json::from_str(
+            "{\"type\":\"context_compacted\",\"reason\":\"rolling_fold\",\"input_tokens\":0,\"output_tokens\":0,\"source_items\":2}",
+        )
+        .expect("legacy compaction event must decode");
+        match event {
+            RuntimeEvent::ContextCompacted { usage_identity, .. } => {
+                assert_eq!(usage_identity, agent_contracts::UsageIdentity::Unknown);
+            }
+            other => panic!("wrong event: {other:?}"),
+        }
     }
 
     #[test]
@@ -3402,6 +3679,8 @@ mod tests {
                     task_id,
                     anchor_revision: 1,
                     summary: "done".into(),
+                    artifacts: Vec::new(),
+                    final_output_digest: None,
                 },
             ),
             envelope(run, 5, settled_frontier()),
@@ -3460,6 +3739,8 @@ mod tests {
                     task_id,
                     anchor_revision: 1,
                     summary: "done".into(),
+                    artifacts: Vec::new(),
+                    final_output_digest: None,
                 },
             ),
             envelope(

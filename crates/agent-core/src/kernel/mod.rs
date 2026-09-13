@@ -608,6 +608,9 @@ impl CoreAuthority {
                     limit,
                 }
                 .normalized();
+                // F04: a result that fills the limit may have been cut — the
+                // body must say so (summary/metadata never reach the model).
+                let search_limit = search.limit;
                 match self.context.search_external(search).await {
                     Ok(hits) if hits.is_empty() => {
                         let observation = self.context.last_search_observation();
@@ -672,6 +675,16 @@ impl CoreAuthority {
                             })
                             .collect::<Vec<_>>()
                             .join("\n");
+                        // F04: a result that fills the limit may have been
+                        // cut by it — a plain hit list must not read as the
+                        // whole catalog answer. limit=0 means "engine
+                        // default", so it proves nothing about a cap.
+                        let capped = search_limit > 0 && hits.len() >= search_limit;
+                        if capped {
+                            output.model_content.push_str(&format!(
+                                "\n[coverage] result capped at limit={search_limit}; the catalog may hold more matches"
+                            ));
+                        }
                         output.metadata = serde_json::json!({
                             "op": "search",
                             "kind": "context",
@@ -682,6 +695,7 @@ impl CoreAuthority {
                             "cold_reads": observation.cold_reads,
                             "cold_read_bytes": observation.cold_read_bytes,
                             "cold_read_ms": observation.cold_read_ms,
+                            "result_capped": capped,
                         });
                     }
                     Err(error) => {

@@ -635,26 +635,44 @@ impl OpenAiProvider {
             }
         }
 
+        // COST-7 (R3-12): read the accumulated usage BEFORE any failure
+        // return — a stream the provider already billed must not have its
+        // known counters downgraded to unknown by the failure itself.
+        let usage = accumulator.usage.clone().unwrap_or_default();
+
         // finish_reason = length means the model hit its output cap: the
         // accumulated text is a truncated prefix, not a complete answer
         // (PROVIDER-02).
         if accumulator.take_output_limit() {
-            return Err(ProtocolError::from(AgentError::ModelOutputLimit {
-                reason: "Chat Completions stream ended with finish_reason=length;                          the model output was truncated"
-                    .into(),
-            }));
+            return Err(ProtocolError::from(AgentError::failed_with_usage(
+                usage,
+                AgentError::ModelOutputLimit {
+                    reason: "Chat Completions stream ended with finish_reason=length;                          the model output was truncated"
+                        .into(),
+                },
+            )));
         }
         if let Some(message) = accumulator.take_terminal_error() {
-            return Err(ProtocolError::transport(true, message));
+            return Err(ProtocolError::from(AgentError::failed_with_usage(
+                usage,
+                AgentError::Transport {
+                    retryable: true,
+                    message,
+                },
+            )));
         }
         if !saw_done {
-            return Err(ProtocolError::transport(
-                true,
-                "Chat Completions stream ended before the [DONE] marker".into(),
-            ));
+            return Err(ProtocolError::from(AgentError::failed_with_usage(
+                usage,
+                AgentError::Transport {
+                    retryable: true,
+                    message: "Chat Completions stream ended before the [DONE] marker".into(),
+                },
+            )));
         }
-        let usage = accumulator.usage.clone().unwrap_or_default();
-        let (content, tool_calls) = accumulator.finalize().map_err(ProtocolError::from)?;
+        let (content, tool_calls) = accumulator.finalize().map_err(|error| {
+            ProtocolError::from(AgentError::failed_with_usage(usage.clone(), error))
+        })?;
         let tool_calls = codec.remap_calls(tool_calls);
         sink.on_chunk(ModelChunk::Done)
             .await
@@ -797,28 +815,38 @@ impl OpenAiProvider {
             }
         }
 
+        // COST-7 (R3-12): the usage evidence is read before any failure
+        // return and travels with the typed failure when the provider
+        // already reported counters.
+        let usage = accumulator.usage().unwrap_or_default();
+
         if let Some(error) = accumulator.take_terminal_error() {
-            return Err(match error.kind {
-                ResponseStreamErrorKind::OutputLimit => {
-                    ProtocolError::from(AgentError::ModelOutputLimit {
-                        reason: error.message,
-                    })
-                }
-                ResponseStreamErrorKind::Model => {
-                    ProtocolError::from(AgentError::Model(error.message))
-                }
-                ResponseStreamErrorKind::Transport => {
-                    ProtocolError::transport(error.retryable, error.message)
-                }
-            });
+            let source = match error.kind {
+                ResponseStreamErrorKind::OutputLimit => AgentError::ModelOutputLimit {
+                    reason: error.message,
+                },
+                ResponseStreamErrorKind::Model => AgentError::Model(error.message),
+                ResponseStreamErrorKind::Transport => AgentError::Transport {
+                    retryable: error.retryable,
+                    message: error.message,
+                },
+            };
+            return Err(ProtocolError::from(AgentError::failed_with_usage(
+                usage, source,
+            )));
         }
         if !accumulator.is_completed() {
-            return Err(ProtocolError::transport(
-                true,
-                "Responses stream ended before the response.completed marker".into(),
-            ));
+            return Err(ProtocolError::from(AgentError::failed_with_usage(
+                usage,
+                AgentError::Transport {
+                    retryable: true,
+                    message: "Responses stream ended before the response.completed marker".into(),
+                },
+            )));
         }
-        let (content, tool_calls, usage) = accumulator.finalize().map_err(ProtocolError::from)?;
+        let (content, tool_calls, usage) = accumulator
+            .finalize()
+            .map_err(|error| ProtocolError::from(AgentError::failed_with_usage(usage, error)))?;
         let tool_calls = codec.remap_calls(tool_calls);
         sink.on_chunk(ModelChunk::Done)
             .await
@@ -903,7 +931,14 @@ fn build_chat_wire_request(
         wire["stream_options"] = json!({ "include_usage": true });
     }
     if config.send_max_tokens {
-        wire["max_tokens"] = json!(config.max_output_tokens);
+        // COST-4 (D02): a request-level ceiling (the compactor's
+        // bounded-output contract) overrides the transport's profile cap —
+        // generation is limited, not merely truncated afterwards.
+        wire["max_tokens"] = json!(
+            request
+                .max_output_tokens
+                .unwrap_or(config.max_output_tokens as u32)
+        );
     }
     if let SamplingPolicy::Temperature(temperature) = config.sampling {
         wire["temperature"] = json!(temperature);
@@ -991,7 +1026,13 @@ fn build_responses_wire_request(
         wire["stream_options"] = json!({ "include_obfuscation": false });
     }
     if config.send_max_tokens {
-        wire["max_output_tokens"] = json!(config.max_output_tokens);
+        // COST-4 (D02): a request-level ceiling overrides the profile cap
+        // (see the Chat builder note).
+        wire["max_output_tokens"] = json!(
+            request
+                .max_output_tokens
+                .unwrap_or(config.max_output_tokens as u32)
+        );
     }
     if let SamplingPolicy::Temperature(temperature) = config.sampling {
         wire["temperature"] = json!(temperature);
@@ -1025,6 +1066,44 @@ mod tests {
     };
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
+    /// COST-4 (D02): a request-level output ceiling overrides the
+    /// transport's profile cap in BOTH wire dialects — the compactor's
+    /// bounded-output contract limits generation instead of post-hoc
+    /// truncation. Only where the transport negotiates the field.
+    #[test]
+    fn request_level_output_cap_overrides_the_profile_cap() {
+        let request = ModelRequest {
+            messages: vec![ModelMessage::user("compact this")],
+            tools: Vec::new(),
+            metadata: serde_json::json!({"role": "bounded-compactor"}),
+            max_output_tokens: Some(512),
+            cancel: CancellationToken::new(),
+        };
+        let mut config = dummy_config("https://example.com/v1".into());
+        config.max_output_tokens = 2048;
+        config.send_max_tokens = true;
+        let chat = build_chat_wire_request(&request, &config, &ToolNameCodec::default());
+        assert_eq!(chat["max_tokens"], 512, "the request cap wins on Chat");
+
+        config.protocol = OpenAiProtocol::Responses;
+        let responses = build_responses_wire_request(
+            &request,
+            &config,
+            &ToolNameCodec::default(),
+            OpenAiPromptCacheMode::ProviderDefault,
+        );
+        assert_eq!(
+            responses["max_output_tokens"], 512,
+            "the request cap wins on Responses"
+        );
+
+        // Endpoints that negotiate no max-output field never receive one,
+        // regardless of the request (their rejection risk is known).
+        config.send_max_tokens = false;
+        let negotiated_away = build_chat_wire_request(&request, &config, &ToolNameCodec::default());
+        assert!(negotiated_away.get("max_tokens").is_none());
+    }
+
     #[test]
     fn builds_wire_request() {
         let request = ModelRequest {
@@ -1048,6 +1127,7 @@ mod tests {
             }],
             metadata: json!({}),
             cancel: CancellationToken::new(),
+            ..Default::default()
         };
         let config = OpenAiConfig {
             api_key: "secret".into(),
@@ -1158,6 +1238,7 @@ mod tests {
             }],
             metadata: json!({}),
             cancel: CancellationToken::new(),
+            ..Default::default()
         };
         let mut config = dummy_config("https://example.com/v1".into());
         config.protocol = OpenAiProtocol::Responses;
@@ -1193,6 +1274,7 @@ mod tests {
             tools: Vec::new(),
             metadata: json!({}),
             cancel: CancellationToken::new(),
+            ..Default::default()
         };
         let config = OpenAiConfig {
             api_key: "secret".into(),
@@ -1249,6 +1331,7 @@ mod tests {
             }],
             metadata: json!({}),
             cancel: CancellationToken::new(),
+            ..Default::default()
         }
     }
 
@@ -1402,6 +1485,125 @@ Connection: close
         assert!(
             matches!(&error, AgentError::ModelOutputLimit { .. }),
             "length must map to an output-limit failure: {error}"
+        );
+    }
+
+    /// COST-7 (R3-12): a length-truncated stream the provider already
+    /// billed keeps its reported counters on the typed failure — the
+    /// known usage is not downgraded to unknown by the failure itself.
+    #[tokio::test]
+    async fn chat_length_with_usage_keeps_the_reported_counters() {
+        let addr = serve_sse_once(
+            "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"trun\"},\"finish_reason\":\"length\"}],\"usage\":{\"prompt_tokens\":90,\"completion_tokens\":30}}
+
+",
+        )
+        .await;
+        let provider = OpenAiProvider::with_client(
+            dummy_config(format!("http://{addr}/v1")),
+            Client::builder().no_proxy().build().unwrap(),
+        );
+        let sink = RecordingSink::default();
+        let error = provider
+            .complete_stream(fs_list_request(), &sink)
+            .await
+            .unwrap_err();
+        let usage = error
+            .reported_usage()
+            .expect("the billed truncation keeps its usage");
+        assert_eq!(usage.input_tokens, Some(90));
+        assert_eq!(usage.output_tokens, Some(30));
+        assert!(
+            matches!(error.failure_source(), AgentError::ModelOutputLimit { .. }),
+            "the output-limit class stays readable through the wrapper"
+        );
+    }
+
+    /// COST-7 (R3-12): a stream ending before [DONE] with a usage frame
+    /// keeps the evidence; a failure without any report stays the plain
+    /// error (an empty envelope never becomes evidence).
+    #[tokio::test]
+    async fn chat_missing_done_with_usage_keeps_evidence_and_without_stays_plain() {
+        let addr = serve_sse_once(
+            "data: {\"choices\":[{\"index\":0,\"delta\":{}}],\"usage\":{\"prompt_tokens\":40}}
+
+",
+        )
+        .await;
+        let provider = OpenAiProvider::with_client(
+            dummy_config(format!("http://{addr}/v1")),
+            Client::builder().no_proxy().build().unwrap(),
+        );
+        let sink = RecordingSink::default();
+        let error = provider
+            .complete_stream(fs_list_request(), &sink)
+            .await
+            .unwrap_err();
+        let usage = error
+            .reported_usage()
+            .expect("the partial usage frame is real evidence");
+        assert_eq!(usage.input_tokens, Some(40));
+        assert_eq!(usage.output_tokens, None, "absent counters stay absent");
+
+        let addr = serve_sse_once(concat!(
+            "data: {\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"length\"}]}
+
+",
+            "data: [DONE]
+
+",
+        ))
+        .await;
+        let provider = OpenAiProvider::with_client(
+            dummy_config(format!("http://{addr}/v1")),
+            Client::builder().no_proxy().build().unwrap(),
+        );
+        let sink = RecordingSink::default();
+        let error = provider
+            .complete_stream(fs_list_request(), &sink)
+            .await
+            .unwrap_err();
+        assert!(
+            error.reported_usage().is_none(),
+            "a usage-less failure keeps its plain typed error: {error}"
+        );
+    }
+
+    /// COST-7 (R3-12): a Responses terminal failure carrying usage keeps
+    /// the counters and the original failure kind.
+    #[tokio::test]
+    async fn responses_failed_with_usage_keeps_the_reported_counters() {
+        let sse = concat!(
+            "event: response.failed
+",
+            "data: {\"type\":\"response.failed\",\"response\":{\"error\":{\"message\":\"upstream exploded\"},\"usage\":{\"input_tokens\":55,\"output_tokens\":7}}}
+
+",
+        );
+        let addr = serve_sse_once(sse).await;
+        let mut config = dummy_config(format!("http://{addr}/v1"));
+        config.protocol = OpenAiProtocol::Responses;
+        let provider =
+            OpenAiProvider::with_client(config, Client::builder().no_proxy().build().unwrap());
+        let sink = RecordingSink::default();
+        let error = provider
+            .complete_stream(fs_list_request(), &sink)
+            .await
+            .unwrap_err();
+        let usage = error
+            .reported_usage()
+            .expect("the failed response keeps its reported usage");
+        assert_eq!(usage.input_tokens, Some(55));
+        assert_eq!(usage.output_tokens, Some(7));
+        assert!(
+            matches!(
+                error.failure_source(),
+                AgentError::Transport {
+                    retryable: false,
+                    ..
+                }
+            ) || matches!(error.failure_source(), AgentError::Model(_)),
+            "the terminal kind stays readable: {error:?}"
         );
     }
 
@@ -1983,6 +2185,7 @@ Connection: close
             tools: Vec::new(),
             metadata: json!({}),
             cancel: CancellationToken::new(),
+            ..Default::default()
         };
         let error = provider.complete(request).await.unwrap_err().to_string();
         assert!(
@@ -2030,6 +2233,7 @@ Connection: close
             tools: Vec::new(),
             metadata: json!({}),
             cancel: CancellationToken::new(),
+            ..Default::default()
         };
 
         let error = provider.complete(request).await.unwrap_err().to_string();

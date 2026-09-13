@@ -139,6 +139,7 @@ mod tests {
             tools: Vec::new(),
             metadata: serde_json::Value::Null,
             cancel: agent_contracts::CancellationToken::new(),
+            ..Default::default()
         };
         let first = model.complete(request.clone()).await.unwrap();
         assert_eq!(first.tool_calls.len(), 1);
@@ -173,6 +174,7 @@ mod tests {
             tools: Vec::new(),
             metadata: serde_json::Value::Null,
             cancel: agent_contracts::CancellationToken::new(),
+            ..Default::default()
         };
         let first = model.complete(request.clone()).await.unwrap();
         assert_eq!(first.tool_calls[0].name, "fs.read");

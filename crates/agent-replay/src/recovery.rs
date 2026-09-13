@@ -901,6 +901,8 @@ mod tests {
                 task_id: TaskId::new(),
                 anchor_revision: 0,
                 summary: "checkpoint landed but audit transaction did not".into(),
+                artifacts: Vec::new(),
+                final_output_digest: None,
             },
         ));
         assert_eq!(analyze_barrier(&events).last_committed_seq, committed);

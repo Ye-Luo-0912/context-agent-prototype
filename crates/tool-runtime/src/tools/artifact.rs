@@ -19,7 +19,7 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 use tokio::io::{AsyncBufReadExt, AsyncReadExt};
 
-use super::Tool;
+use super::{Tool, coverage_footer, with_coverage_footer};
 
 /// Captured window cap: at most this many artifact bytes are returned per
 /// call regardless of the line range.
@@ -200,6 +200,50 @@ impl Tool for ArtifactReadTool {
             args.end_line
         };
 
+        // The body-level coverage statement (F04/CORE-3): the model sees
+        // only `model_content`, so a window that is not the whole artifact
+        // must name its range, the total, and the continuation or end
+        // marker there. A complete single-page read stays plain.
+        let whole_artifact_in_one_page =
+            args.start_line == 1 && args.end_line >= counted_lines && !captured_truncated;
+        let mut clauses: Vec<String> = Vec::new();
+        if has_more || !scan_complete || !whole_artifact_in_one_page {
+            if lines.is_empty() {
+                clauses.push(format!(
+                    "no lines in the scanned prefix of {} lines{}",
+                    counted_lines,
+                    if scan_complete {
+                        String::new()
+                    } else {
+                        " (scan budget reached; totals are incomplete)".to_string()
+                    }
+                ));
+            } else if scan_complete {
+                clauses.push(format!(
+                    "showing lines {}-{} of {} total",
+                    args.start_line,
+                    args.start_line + lines.len().saturating_sub(1),
+                    counted_lines
+                ));
+            } else {
+                clauses.push(format!(
+                    "showing lines {}-{} of at least {} total (scan budget reached; totals are incomplete)",
+                    args.start_line,
+                    args.start_line + lines.len().saturating_sub(1),
+                    counted_lines
+                ));
+            }
+            if has_more {
+                clauses.push(format!(
+                    "continue with artifact.read reference={} start_line={next_start_line}",
+                    args.reference
+                ));
+            } else {
+                clauses.push(format!("end of artifact ({counted_lines} lines)"));
+            }
+        }
+        let coverage = coverage_footer(clauses);
+
         Ok(ToolOutcome::Value(
             ToolOutput {
                 call_id: call_id.into(),
@@ -222,11 +266,14 @@ impl Tool for ArtifactReadTool {
                         String::new()
                     },
                 ),
-                model_content: if selected.is_empty() {
-                    "no lines in range".to_string()
-                } else {
-                    selected
-                },
+                model_content: with_coverage_footer(
+                    if selected.is_empty() {
+                        "no lines in range".to_string()
+                    } else {
+                        selected
+                    },
+                    coverage,
+                ),
                 artifact_ref: Some(args.reference),
                 metadata: json!({
                     "total_lines": counted_lines,
@@ -556,10 +603,26 @@ mod tests {
         assert_eq!(output.metadata["total_lines"], 101);
         assert_eq!(output.metadata["total_lines_complete"], true);
         assert_eq!(output.metadata["window_truncated"], true);
+        // The window renders as exactly one content line (the truncated
+        // long line), plus the coverage footer — the truncated tail must
+        // not merge with the next line, and the footer must not merge
+        // with either (F04 页脚在正文自己的行上).
+        let mut body_lines = output.model_content.lines();
+        let content_line = body_lines.next().unwrap();
+        assert!(
+            content_line.starts_with("     1 | "),
+            "the truncated long line is one rendered line: {content_line}"
+        );
         assert_eq!(
-            output.model_content.lines().count(),
+            body_lines.count(),
             1,
-            "the truncated long line is one rendered line"
+            "exactly one content line plus one coverage footer remain: {}",
+            output.model_content
+        );
+        assert!(
+            output.model_content.contains("[coverage]"),
+            "the truncated window must carry the coverage footer: {}",
+            output.model_content
         );
         assert!(
             !output.model_content.contains("tail-0"),
@@ -598,5 +661,117 @@ mod tests {
         assert_eq!(page2.metadata["total_lines"], 101);
         assert_eq!(page2.metadata["window_truncated"], false);
         assert_eq!(page2.metadata["has_more"], false);
+    }
+
+    /// F04/CORE-3：溢出列表的续读指针必须长在正文里——`model_content`
+    /// 是唯一进 TurnFrame 的字段，metadata 的 has_more/next_start_line
+    /// 到不了模型。完整单页读取保持朴素正文，不加噪音。
+    #[tokio::test]
+    async fn the_body_names_the_window_and_the_next_page() {
+        let (tool, _dir, run_id, reference) = tool_with_artifact().await;
+
+        // A narrow window: the body must name the range, the total and the
+        // continuation pointer.
+        let output = value(
+            tool.execute(
+                run_id,
+                "c",
+                json!({"reference": reference, "start_line": 2, "end_line": 3}),
+                None,
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap(),
+        );
+        assert!(
+            output
+                .model_content
+                .contains("[coverage] showing lines 2-3 of 4 total"),
+            "the body must name the window: {}",
+            output.model_content
+        );
+        assert!(
+            output.model_content.contains(&format!(
+                "continue with artifact.read reference={reference} start_line=4"
+            )),
+            "the body must carry the continuation pointer: {}",
+            output.model_content
+        );
+
+        // The whole artifact in one page: no coverage footer, plain body.
+        let full = value(
+            tool.execute(
+                run_id,
+                "c",
+                json!({"reference": reference}),
+                None,
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap(),
+        );
+        assert!(
+            !full.model_content.contains("[coverage]"),
+            "a complete single-page read stays plain: {}",
+            full.model_content
+        );
+
+        // The final page carries the end marker.
+        let tail = value(
+            tool.execute(
+                run_id,
+                "c",
+                json!({"reference": reference, "start_line": 4, "end_line": 4}),
+                None,
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap(),
+        );
+        assert!(
+            tail.model_content.contains("end of artifact (4 lines)"),
+            "the last page must carry the end marker: {}",
+            tail.model_content
+        );
+    }
+
+    /// 扫描预算截断的工件：正文必须声明总数不完整，不能让模型把
+    /// 「读到了预算处」当成「读完了」。
+    #[tokio::test]
+    async fn a_scan_budget_truncated_artifact_declares_incomplete_totals_in_the_body() {
+        let dir = tempfile::tempdir().unwrap();
+        let workspace = Workspace::open(dir.path()).await.unwrap();
+        let run_id = RunId::new();
+        // 8 MiB 扫描预算之外再多几行，扫描必然停在预算处。
+        let body = "x\n".repeat((MAX_SCAN_BYTES / 2) as usize + 16);
+        let reference = workspace
+            .write_artifact(run_id, "process", "log", body.as_bytes())
+            .await
+            .unwrap();
+        let tool = ArtifactReadTool::new(workspace);
+
+        let output = value(
+            tool.execute(
+                run_id,
+                "c",
+                json!({"reference": reference}),
+                None,
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap(),
+        );
+        assert!(output.ok);
+        assert_eq!(output.metadata["total_lines_complete"], false);
+        assert!(
+            output.model_content.contains("totals are incomplete"),
+            "the body must say the totals stopped at the scan budget: {}",
+            output.model_content
+        );
+        assert!(
+            output.model_content.contains("continue with artifact.read"),
+            "the next page pointer stays reachable: {}",
+            output.model_content
+        );
     }
 }

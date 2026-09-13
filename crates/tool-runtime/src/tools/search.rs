@@ -17,8 +17,8 @@ use serde_json::{Value, json};
 use tokio::fs;
 
 use super::{
-    Tool, display_relative, hidden_path_output, is_not_found_error, missing_path_output,
-    ordinary_view_blocked, walk_files,
+    Tool, coverage_footer, display_relative, hidden_path_output, is_not_found_error,
+    missing_path_output, ordinary_view_blocked, walk_files, with_coverage_footer,
 };
 
 const MAX_FILES_SCANNED: usize = 5_000;
@@ -102,6 +102,18 @@ fn cancelled_outcome(
         "cursor": serde_json::Value::Null,
     });
     attach_failure_class(&mut metadata, ToolFailureClass::Cancellation);
+    // 有命中的取消路径与零命中一样诚实：正文必须说明扫描被打断，
+    // 否则部分命中会读成完整结果（F04：positive ≠ exhaustive）。
+    let model_content = if model_hits.is_empty() {
+        "cancelled".into()
+    } else {
+        with_coverage_footer(
+            model_hits.join("\n"),
+            coverage_footer(vec![format!(
+                "scan cancelled after {scanned_files} files; these partial hits are not the complete set"
+            )]),
+        )
+    };
     ToolOutcome::Value(
         ToolOutput {
             call_id: call_id.into(),
@@ -113,11 +125,7 @@ fn cancelled_outcome(
                 pattern,
                 scanned_files
             ),
-            model_content: if model_hits.is_empty() {
-                "cancelled".into()
-            } else {
-                model_hits.join("\n")
-            },
+            model_content,
             artifact_ref: None,
             metadata,
         }
@@ -286,16 +294,6 @@ impl Tool for SearchGrepTool {
             Some(reference) => (Some(format!("{reference}#{MODEL_HITS}")), true),
             None => (None, false),
         };
-        let truncated_note = artifact_ref
-            .as_ref()
-            .map(|r| {
-                format!(
-                    "\n... {} more hits; full-list artifact: {r}. Continue with artifact.read reference={r} start_line={}",
-                    hits.len() - model_hits.len(),
-                    model_hits.len() + 1,
-                )
-            })
-            .unwrap_or_default();
 
         let mut metadata = json!({
             "hits": hits.len(),
@@ -310,31 +308,61 @@ impl Tool for SearchGrepTool {
         // Coverage truth: the scan is incomplete when the hit limit stopped
         // it early, the file budget truncated the candidate list, or files
         // had to be skipped (unreadable, binary, oversized). A partial
-        // no-hit must never read as repo-wide absence.
+        // no-hit must never read as repo-wide absence — and a partial hit
+        // list must never read as the complete set (F04).
         let limit_reached = hits.len() >= limit;
         let scan_incomplete = limit_reached || walk_budget_reached || skipped_files > 0;
-        let mut coverage_note = String::new();
-        if scan_incomplete {
-            let mut reasons: Vec<&str> = Vec::new();
-            if limit_reached {
-                reasons.push("hit limit reached");
-            }
-            if walk_budget_reached {
-                reasons.push("file budget reached");
-            }
-            if skipped_files > 0 {
-                reasons.push("some files unreadable/oversized and skipped");
-            }
-            coverage_note = format!(
+        let mut partial_reasons: Vec<String> = Vec::new();
+        if limit_reached {
+            partial_reasons.push("hit limit reached".into());
+        }
+        if walk_budget_reached {
+            partial_reasons.push("file budget reached".into());
+        }
+        if skipped_files > 0 {
+            partial_reasons.push(format!(
+                "files unreadable/oversized skipped: {skipped_files}"
+            ));
+        }
+        let coverage_note = if scan_incomplete {
+            format!(
                 " (PARTIAL scan: {}; do not treat this as the complete set of matches)",
-                reasons.join(", ")
-            );
+                partial_reasons.join(", ")
+            )
+        } else {
+            String::new()
+        };
+        metadata["scan_incomplete"] = json!(scan_incomplete);
+        if skipped_files > 0 {
             metadata["skipped_files"] = json!(skipped_files);
         }
-        metadata["scan_incomplete"] = json!(scan_incomplete);
         if hits.is_empty() {
             attach_failure_class(&mut metadata, ToolFailureClass::NoSearchMatch);
         }
+
+        // The body-level coverage statement: summary/metadata never reach
+        // the model, so incompleteness and the continuation pointer live
+        // here, generated from the same typed facts as the summary.
+        let mut clauses: Vec<String> = Vec::new();
+        if scan_incomplete {
+            let scope = if model_hits.is_empty() {
+                "this is not a repo-wide absence"
+            } else {
+                "these are not all the matches"
+            };
+            clauses.push(format!(
+                "PARTIAL scan: {}; {}",
+                partial_reasons.join(", "),
+                scope
+            ));
+        }
+        if let Some(reference) = &artifact_ref {
+            clauses.push(format!(
+                "continue with artifact.read reference={reference} start_line={}",
+                model_hits.len() + 1
+            ));
+        }
+        let coverage = coverage_footer(clauses);
 
         Ok(ToolOutcome::Value(
             ToolOutput {
@@ -348,17 +376,18 @@ impl Tool for SearchGrepTool {
                     scanned_files,
                     coverage_note
                 ),
-                model_content: if model_hits.is_empty() {
-                    if scan_incomplete {
-                        "no matches in the scanned files; the scan is incomplete, so this is \
-                         not a repo-wide absence"
-                            .to_string()
+                model_content: with_coverage_footer(
+                    if model_hits.is_empty() {
+                        if scan_incomplete {
+                            "no matches in the scanned files".to_string()
+                        } else {
+                            "no matches".to_string()
+                        }
                     } else {
-                        "no matches".to_string()
-                    }
-                } else {
-                    format!("{}{}", model_hits.join("\n"), truncated_note)
-                },
+                        model_hits.join("\n")
+                    },
+                    coverage,
+                ),
                 artifact_ref,
                 metadata,
             }
@@ -399,6 +428,22 @@ impl SearchGrepTool {
         let has_more = next_offset < lines.len();
         let next_cursor = has_more.then(|| format!("{reference}#{next_offset}"));
 
+        // Every page names its range and snapshot identity, and carries an
+        // explicit continuation or end marker: one page of text must never
+        // read as the whole result set (F04 分页语义).
+        let coverage = if has_more {
+            coverage_footer(vec![format!(
+                "hits {}-{} of {} (snapshot {reference}); continue with search.grep cursor={reference}#{next_offset}",
+                offset + 1,
+                next_offset,
+                lines.len()
+            )])
+        } else {
+            coverage_footer(vec![format!(
+                "end of results ({next_offset} total, snapshot {reference})"
+            )])
+        };
+
         Ok(ToolOutcome::Value(
             ToolOutput {
                 call_id: call_id.into(),
@@ -410,11 +455,14 @@ impl SearchGrepTool {
                     next_offset,
                     lines.len()
                 ),
-                model_content: if page.is_empty() {
-                    "no more hits".to_string()
-                } else {
-                    page.join("\n")
-                },
+                model_content: with_coverage_footer(
+                    if page.is_empty() {
+                        "no more hits".to_string()
+                    } else {
+                        page.join("\n")
+                    },
+                    coverage,
+                ),
                 artifact_ref: Some(reference.to_string()),
                 metadata: json!({
                     "hits": lines.len(),
@@ -855,6 +903,150 @@ needle
             output.summary.contains("PARTIAL scan"),
             "{}",
             output.summary
+        );
+    }
+
+    /// F04 反例：一个可读文件命中、另一个关键文件因超限被跳过。正文
+    /// （model_content）是唯一进入 TurnFrame 的字段——有命中也不能把
+    /// 不完整扫描伪装成完整命中列表；coverage 声明必须长在正文里。
+    #[tokio::test]
+    async fn hits_with_a_skipped_file_declare_incompleteness_in_the_model_body() {
+        let (workspace, _dir) = temp_workspace().await;
+        let root = workspace.root().to_path_buf();
+        write(&root, "src/small.rs", "needle here\n").await;
+        std::fs::write(
+            root.join("src/huge.rs"),
+            vec![b'x'; (MAX_BYTES_PER_FILE as usize) + 1],
+        )
+        .unwrap();
+
+        let tool = SearchGrepTool::new(workspace);
+        let output = tool
+            .execute(
+                RunId::new(),
+                "c",
+                json!({"pattern": "needle"}),
+                None,
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+        let output = value(output);
+        assert!(output.ok);
+        assert!(
+            output.model_content.contains("src/small.rs:1"),
+            "the hit itself must still be present: {}",
+            output.model_content
+        );
+        assert!(
+            output.model_content.contains("[coverage]") && output.model_content.contains("PARTIAL"),
+            "a hit list from a partial scan must carry the coverage statement in the body: {}",
+            output.model_content
+        );
+        assert!(
+            output
+                .model_content
+                .contains("files unreadable/oversized skipped: 1"),
+            "the body must name the skip count, not bury it in metadata: {}",
+            output.model_content
+        );
+    }
+
+    /// 取消留下的部分命中同样不能读成完整结果：正文必须说明扫描被
+    /// 打断（零命中路径的 "cancelled" 早已诚实，这里补齐有命中路径）。
+    #[test]
+    fn a_cancelled_partial_hit_list_says_the_scan_stopped_in_the_body() {
+        let outcome = cancelled_outcome(
+            "c",
+            "needle",
+            vec!["src/a.rs:1: needle".into(), "src/b.rs:2: needle".into()],
+            7,
+        );
+        let ToolOutcome::Value(output) = outcome else {
+            panic!("cancelled_outcome returns a plain value");
+        };
+        assert!(
+            output.model_content.contains("src/a.rs:1"),
+            "partial hits stay visible: {}",
+            output.model_content
+        );
+        assert!(
+            output.model_content.contains("[coverage]")
+                && output
+                    .model_content
+                    .contains("scan cancelled after 7 files"),
+            "partial hits from a cancelled scan must say so in the body: {}",
+            output.model_content
+        );
+    }
+
+    /// 快照分页在正文里保留范围身份与结束标记：中间页给出续读指针，
+    /// 最后一页明确 end of results——一页文本永远不能读成全部结果。
+    #[tokio::test]
+    async fn snapshot_pages_carry_identity_and_an_end_marker_in_the_body() {
+        let (workspace, _dir) = temp_workspace().await;
+        let root = workspace.root().to_path_buf();
+        let mut body = String::new();
+        for i in 0..220 {
+            body.push_str(&format!("match_{i:03}: something\n"));
+        }
+        write(&root, "big.txt", &body).await;
+
+        let tool = SearchGrepTool::new(workspace.clone());
+        let run_id = RunId::new();
+        let grep = |args: Value| {
+            let tool = &tool;
+            async move {
+                tool.execute(run_id, "c", args, None, CancellationToken::new())
+                    .await
+            }
+        };
+
+        let first = value(
+            grep(json!({"pattern": "match_", "limit": 300}))
+                .await
+                .unwrap(),
+        );
+        let cursor = first.metadata["cursor"].as_str().unwrap().to_string();
+        assert!(
+            first
+                .model_content
+                .contains("continue with artifact.read reference="),
+            "the first page must name the continuation in the body: {}",
+            first.model_content
+        );
+
+        let second = value(
+            grep(json!({"pattern": "match_", "limit": 300, "cursor": cursor}))
+                .await
+                .unwrap(),
+        );
+        assert!(
+            second
+                .model_content
+                .contains("hits 101-200 of 220 (snapshot"),
+            "a middle page must carry its range and snapshot identity: {}",
+            second.model_content
+        );
+        assert!(
+            second
+                .model_content
+                .contains("continue with search.grep cursor="),
+            "a middle page must name its continuation: {}",
+            second.model_content
+        );
+        let cursor2 = second.metadata["cursor"].as_str().unwrap().to_string();
+        let third = value(
+            grep(json!({"pattern": "match_", "limit": 300, "cursor": cursor2}))
+                .await
+                .unwrap(),
+        );
+        assert!(
+            third
+                .model_content
+                .contains("end of results (220 total, snapshot"),
+            "the final page must carry the end marker: {}",
+            third.model_content
         );
     }
 }

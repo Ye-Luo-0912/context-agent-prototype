@@ -105,6 +105,7 @@ impl ChangeRecord {
 /// Old-content capture limit for `ChangeRecord::MutationPrepared` (bounded
 /// journal).
 pub const CHANGE_CAPTURE_LIMIT: usize = 256 * 1024;
+
 /// Serialized JSONL frame ceiling. This covers worst-case JSON escaping of
 /// the bounded old-content capture while keeping the indivisible append
 /// latency and memory use finite.
@@ -113,6 +114,27 @@ const MAX_CHANGE_RECORD_BYTES: usize = 2 * 1024 * 1024;
 /// belong in the artifact store; no builtin or capability handle may bypass
 /// this boundary by calling `MutationTransaction::prepare` directly.
 pub const MAX_MUTATION_BYTES: usize = 4 * 1024 * 1024;
+
+/// 恢复谱系文件名：`.focus-agent/artifacts/<run>/lineage.json`。
+const LINEAGE_FILE: &str = "lineage.json";
+/// 恢复谱系链上限：最旧的祖先先淘汰。链必须有界。
+const MAX_ARTIFACT_RUN_LINEAGE: usize = 32;
+/// 谱系文件字节上限；超过按损坏处理（fail closed，不放行任何前代）。
+const MAX_ARTIFACT_RUN_LINEAGE_BYTES: usize = 8 * 1024;
+
+/// 恢复谱系记录的持久形状（运行时写、运行时读；模型可写面无法伪造）。
+#[derive(Serialize, Deserialize)]
+struct ArtifactRunLineage {
+    #[serde(default)]
+    predecessors: Vec<String>,
+}
+
+/// EXEC-3（E07）：一次谱系登记的结果。`unadmitted` 点名没能装入有界文件
+/// 的受保护前代——调用方必须以类型化降级呈现，读取保持 fail closed。
+pub struct LineageAdmission {
+    pub admitted: usize,
+    pub unadmitted: Vec<RunId>,
+}
 
 /// FNV-1a 64-bit content hash: deterministic across runs and platforms, so
 /// a journaled `before_hash`/`after_hash` can be re-derived later without a
@@ -809,13 +831,26 @@ impl Workspace {
 
     /// 打开当前 run 的制品。sealed 定位符会对流式哈希结果与 URI digest
     /// 比对；draft 只确认仍是普通文件。返回的字符串永远是规范身份拼写。
+    ///
+    /// 恢复谱系（CORE-3）：冷恢复后运行时的 run id 会换新，而模型在
+    /// 恢复前捕获的 cursor/引用仍指向旧 run 的快照。恢复提交时运行时
+    /// 通过 [`Self::admit_artifact_run_lineage`] 把前代 run 登记进当前
+    /// run 的谱系文件；这里在 run 不匹配且前代在谱系内时放行——sealed
+    /// digest 校验照旧，快照不可变性不变。读取失败一律拒绝（fail
+    /// closed），谱系从不放宽 digest 或 confinement。
     pub async fn open_artifact_for_run(
         &self,
         reference: &str,
         run_id: RunId,
     ) -> AgentResult<(String, ConfinedFile)> {
         let locator = ArtifactLocator::parse(reference)?;
-        locator.ensure_run(run_id)?;
+        if locator.run_id() != run_id
+            && !self
+                .artifact_run_lineage_admits(run_id, locator.run_id())
+                .await
+        {
+            locator.ensure_run(run_id)?;
+        }
         let relative = locator_relative_path(&locator);
         let confined = self.confined_open_read(&relative).await?;
         let metadata = confined.metadata().map_err(|e| {
@@ -834,6 +869,141 @@ impl Workspace {
             return Ok((locator.to_string(), confined));
         }
         Ok((locator.to_string(), confined))
+    }
+
+    /// 登记恢复谱系：`predecessor`（及其自身的谱系）成为 `current` 可读
+    /// 的前代 run。链有界（[`MAX_ARTIFACT_RUN_LINEAGE`]，最旧者先淘汰），
+    /// 文件落在运行时持有的 state 目录内，模型可写面无法伪造。原子写
+    /// （temp + rename）保证读者只见完整文件。
+    pub async fn admit_artifact_run_lineage(
+        &self,
+        current: RunId,
+        predecessor: RunId,
+        protected: &[RunId],
+    ) -> AgentResult<LineageAdmission> {
+        use tokio::io::AsyncWriteExt;
+
+        if current == predecessor {
+            return Ok(LineageAdmission {
+                admitted: 0,
+                unadmitted: Vec::new(),
+            });
+        }
+        // EXEC-3（E07）：有界链以**活跃引用**为保护依据——`protected` 是
+        // 恢复状态的检查点载荷里仍然引用着的前代 run，紧跟直接前代之后
+        // 装入，绝不因祖先年龄被淘汰；血统祖先随后按新近度填充剩余容量。
+        // 容量不够时装入的受保护 run 进入 `unadmitted` 类型化降级——绝不
+        // 静默按年代丢弃仍然被引用的前代。
+        let mut lineage = vec![predecessor];
+        let mut unadmitted = Vec::new();
+        for run in protected {
+            if *run == predecessor || lineage.contains(run) {
+                continue;
+            }
+            if lineage.len() >= MAX_ARTIFACT_RUN_LINEAGE {
+                unadmitted.push(*run);
+                continue;
+            }
+            lineage.push(*run);
+        }
+        for ancestor in self.artifact_run_lineage(predecessor).await {
+            if lineage.len() >= MAX_ARTIFACT_RUN_LINEAGE {
+                break;
+            }
+            if !lineage.contains(&ancestor) {
+                lineage.push(ancestor);
+            }
+        }
+        let admitted = lineage.len();
+        let payload = serde_json::to_vec(&ArtifactRunLineage {
+            predecessors: lineage.iter().map(|run| run.to_string()).collect(),
+        })
+        .map_err(|e| AgentError::Storage(format!("serialize artifact run lineage: {e}")))?;
+
+        // 当前 run 目录可能尚不存在；ConfinedDir 的 open-or-create 保证
+        // 整个下降过程不跟随符号链接。
+        let run_dir = self.artifact_run_dir(current)?;
+        let staging = format!(".tmp-lineage-{}", Uuid::new_v4());
+        let mut file = tokio::fs::File::from_std(
+            run_dir
+                .create_new_file(std::ffi::OsStr::new(&staging))
+                .map_err(|e| {
+                    confined_io_error(
+                        "create artifact lineage",
+                        &run_dir.display().join(&staging),
+                        e,
+                    )
+                })?,
+        );
+        file.write_all(&payload)
+            .await
+            .map_err(|e| AgentError::Io(format!("write artifact lineage: {e}")))?;
+        let std_file = file.into_std().await;
+        run_dir
+            .replace_file(
+                &std_file,
+                std::ffi::OsStr::new(&staging),
+                std::ffi::OsStr::new(LINEAGE_FILE),
+            )
+            .map_err(|e| {
+                confined_io_error(
+                    "seal artifact lineage",
+                    &run_dir.display().join(LINEAGE_FILE),
+                    e,
+                )
+            })?;
+        Ok(LineageAdmission {
+            admitted,
+            unadmitted,
+        })
+    }
+
+    /// 读取一个 run 的恢复谱系；文件缺失/损坏/超界一律视为空（读路径
+    /// fail closed：不认识的前代绝不放行）。
+    async fn artifact_run_lineage(&self, run: RunId) -> Vec<RunId> {
+        // EXEC-4 (E08)：同句柄 cap+1 小额有界读——文件是否超界在读入阶段
+        // 即可判定（8 KiB＋1 字节的内存上界），不再先整读未知长度的文件。
+        let Ok(file) = tokio::fs::File::open(
+            self.state_dir
+                .join("artifacts")
+                .join(run.to_string())
+                .join(LINEAGE_FILE),
+        )
+        .await
+        else {
+            return Vec::new();
+        };
+        use tokio::io::AsyncReadExt;
+        let mut bytes = Vec::new();
+        if file
+            .take((MAX_ARTIFACT_RUN_LINEAGE_BYTES + 1) as u64)
+            .read_to_end(&mut bytes)
+            .await
+            .is_err()
+        {
+            return Vec::new();
+        }
+        if bytes.len() > MAX_ARTIFACT_RUN_LINEAGE_BYTES {
+            return Vec::new();
+        }
+        let Ok(parsed) = serde_json::from_slice::<ArtifactRunLineage>(&bytes) else {
+            return Vec::new();
+        };
+        parsed
+            .predecessors
+            .into_iter()
+            .take(MAX_ARTIFACT_RUN_LINEAGE)
+            .filter_map(|run| run.parse::<RunId>().ok())
+            .collect()
+    }
+
+    /// 前代授权判定：`predecessor` 是否在 `current` 的恢复谱系内。
+    async fn artifact_run_lineage_admits(&self, current: RunId, predecessor: RunId) -> bool {
+        predecessor != current
+            && self
+                .artifact_run_lineage(current)
+                .await
+                .contains(&predecessor)
     }
 
     async fn confine(&self, clean: PathBuf) -> AgentResult<PathBuf> {
@@ -4551,4 +4721,223 @@ mod tests {
         let changes = workspace.read_changes(10, None).await.unwrap();
         assert!(changes.is_empty());
     }
+
+    /// CORE-3：冷恢复后 run 换新，恢复前捕获的 sealed 引用必须仍可读。
+    /// 登记谱系后放行（digest 校验照旧）；未登记的异 run 依旧拒绝。
+    #[tokio::test]
+    async fn a_restored_run_reads_its_admitted_predecessors_sealed_artifact() {
+        let dir = tempfile::tempdir().unwrap();
+        let workspace = Workspace::open(dir.path()).await.unwrap();
+        let predecessor = RunId::new();
+        let reference = workspace
+            .write_artifact(predecessor, "grep", "txt", b"snapshot body\n")
+            .await
+            .unwrap();
+
+        // 登记前：异 run 引用被拒（原语义保持）。
+        let restored = RunId::new();
+        let Err(denied) = workspace.open_artifact_for_run(&reference, restored).await else {
+            panic!("without lineage admission the cross-run read must fail");
+        };
+        assert!(
+            denied.to_string().contains("does not belong to run"),
+            "without lineage admission the cross-run read must fail: {denied}"
+        );
+
+        workspace
+            .admit_artifact_run_lineage(restored, predecessor, &[])
+            .await
+            .unwrap();
+        let (_normalized, file) = workspace
+            .open_artifact_for_run(&reference, restored)
+            .await
+            .expect("an admitted predecessor's sealed artifact must open");
+        let mut body = Vec::new();
+        use tokio::io::AsyncReadExt;
+        file.into_tokio().read_to_end(&mut body).await.unwrap();
+        assert_eq!(body, b"snapshot body\n", "digest-verified content");
+
+        // 无关 run 不在谱系内，依旧拒绝。
+        let unrelated = RunId::new();
+        let Err(still_denied) = workspace.open_artifact_for_run(&reference, unrelated).await else {
+            panic!("an unadmitted run must stay denied");
+        };
+        assert!(still_denied.to_string().contains("does not belong to run"));
+    }
+
+    /// 谱系链传递：A→B→C 两跳恢复后，最新 run 仍可读最初 run 的快照
+    /// （每次恢复继承前代的谱系），且有界——超出上限的最旧祖先被淘汰。
+    #[tokio::test]
+    async fn run_lineage_composes_transitively_across_restore_chains() {
+        let dir = tempfile::tempdir().unwrap();
+        let workspace = Workspace::open(dir.path()).await.unwrap();
+        let oldest = RunId::new();
+        let reference = workspace
+            .write_artifact(oldest, "grep", "txt", b"oldest snapshot\n")
+            .await
+            .unwrap();
+        let middle = RunId::new();
+        workspace
+            .admit_artifact_run_lineage(middle, oldest, &[])
+            .await
+            .unwrap();
+        let newest = RunId::new();
+        workspace
+            .admit_artifact_run_lineage(newest, middle, &[])
+            .await
+            .unwrap();
+
+        workspace
+            .open_artifact_for_run(&reference, newest)
+            .await
+            .expect("the chain must keep the oldest run readable");
+
+        // 损坏的谱系文件 fail closed：不放行任何前代。
+        let lineage_path = workspace
+            .state_dir()
+            .join("artifacts")
+            .join(newest.to_string())
+            .join("lineage.json");
+        std::fs::write(&lineage_path, "{ not json").unwrap();
+        let Err(denied) = workspace.open_artifact_for_run(&reference, newest).await else {
+            panic!("a corrupt lineage must fail closed");
+        };
+        assert!(
+            denied.to_string().contains("does not belong to run"),
+            "a corrupt lineage must fail closed: {denied}"
+        );
+    }
+}
+
+/// EXEC-3（E07）：33 次冷恢复后，纯血统链已把第一代淘汰（旧行为的
+/// 边界，这里如实断言其拒绝）；而**仍被恢复状态引用**的前代以受保护
+/// 集登记后，无论链多深都保持可读——保护依据是引用，不是年代。
+#[tokio::test]
+async fn a_still_referenced_first_generation_survives_deep_restore_chains() {
+    let dir = tempfile::tempdir().unwrap();
+    let workspace = Workspace::open(dir.path()).await.unwrap();
+    let first = RunId::new();
+    let reference = workspace
+        .write_artifact(first, "grep", "txt", b"first generation snapshot\n")
+        .await
+        .unwrap();
+
+    // 33 次「恢复」：每次新 run 只承认直接前代（不带保护集）。
+    let mut runs = vec![first];
+    for _ in 0..33 {
+        let next = RunId::new();
+        workspace
+            .admit_artifact_run_lineage(next, *runs.last().unwrap(), &[])
+            .await
+            .unwrap();
+        runs.push(next);
+    }
+    let latest = *runs.last().unwrap();
+    let Err(dropped) = workspace.open_artifact_for_run(&reference, latest).await else {
+        panic!("an age-evicted ancestor without protection stays fail-closed");
+    };
+    assert!(dropped.to_string().contains("does not belong to run"));
+
+    // 操作者重新进入该 run（或恢复状态再次引用它）：保护式登记让
+    // 第一代重新可读——引用在，资格就在。
+    workspace
+        .admit_artifact_run_lineage(latest, runs[runs.len() - 2], &[first])
+        .await
+        .unwrap();
+    workspace
+        .open_artifact_for_run(&reference, latest)
+        .await
+        .expect("a protected reference keeps its sealed artifact readable");
+}
+
+/// EXEC-3（E07）：受保护集超过有界承载时，超出部分进入 `unadmitted`
+/// 类型化降级——已装入的照常可读，未装入的保持 fail closed，绝不静默。
+#[tokio::test]
+async fn an_over_capacity_protected_set_degrades_typed_not_silent() {
+    let dir = tempfile::tempdir().unwrap();
+    let workspace = Workspace::open(dir.path()).await.unwrap();
+    let current = RunId::new();
+    let predecessor = RunId::new();
+    let mut protected = Vec::new();
+    for _ in 0..(MAX_ARTIFACT_RUN_LINEAGE + 8) {
+        protected.push(RunId::new());
+    }
+    let admission = workspace
+        .admit_artifact_run_lineage(current, predecessor, &protected)
+        .await
+        .unwrap();
+    assert_eq!(admission.admitted, MAX_ARTIFACT_RUN_LINEAGE);
+    assert_eq!(
+        admission.unadmitted.len(),
+        9,
+        "the overflow is named, not dropped silently"
+    );
+    // 装入的受保护 run 可读：把其中之一做成有工件的 run 验证。
+    let admitted_run = protected[0];
+    let reference = workspace
+        .write_artifact(admitted_run, "grep", "txt", b"protected body\n")
+        .await
+        .unwrap();
+    workspace
+        .open_artifact_for_run(&reference, current)
+        .await
+        .expect("an admitted protected run stays readable");
+}
+
+/// EXEC-4（E08）：谱系文件读入有界——超过字节上限的文件在读入阶段即
+/// fail closed（空谱系），绝不先吃下整个未知长度的文件；恰在上限内的
+/// 正常谱系照旧解析（以前代工件的**可读性**为可观察行为）。
+#[tokio::test]
+async fn an_oversized_lineage_file_fails_closed_at_the_read_bound() {
+    let dir = tempfile::tempdir().unwrap();
+    let workspace = Workspace::open(dir.path()).await.unwrap();
+    let current = RunId::new();
+    let predecessor = RunId::new();
+    let reference = workspace
+        .write_artifact(
+            predecessor,
+            "grep",
+            "txt",
+            b"lineage bound probe
+",
+        )
+        .await
+        .unwrap();
+    // 建立一条正常谱系（≤上限）：前代工件可读。
+    workspace
+        .admit_artifact_run_lineage(current, predecessor, &[])
+        .await
+        .unwrap();
+    let lineage_path = workspace
+        .state_dir()
+        .join("artifacts")
+        .join(current.to_string())
+        .join("lineage.json");
+    let normal = std::fs::read(&lineage_path).unwrap();
+    assert!(normal.len() <= MAX_ARTIFACT_RUN_LINEAGE_BYTES);
+    workspace
+        .open_artifact_for_run(&reference, current)
+        .await
+        .expect("a within-bound lineage authorizes the read");
+
+    // 超上限一字节的谱系：内容仍是合法 JSON，但读入有界拒绝——
+    // 前代工件回到 fail closed，绝不整读超界文件。
+    let mut oversized = normal.clone();
+    // 合法 JSON 填充字段（serde 允许未知字段），把文件推过读入上限。
+    let mut filler = b"\"pad\":\"".to_vec();
+    filler.extend(std::iter::repeat_n(
+        b'u',
+        MAX_ARTIFACT_RUN_LINEAGE_BYTES + 1024,
+    ));
+    filler.extend(b"\",".iter());
+    oversized.splice(1..1, filler);
+    assert!(oversized.len() > MAX_ARTIFACT_RUN_LINEAGE_BYTES);
+    std::fs::write(&lineage_path, &oversized).unwrap();
+    assert!(
+        workspace
+            .open_artifact_for_run(&reference, current)
+            .await
+            .is_err(),
+        "an over-bound lineage read fails closed without ingesting the file"
+    );
 }

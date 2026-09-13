@@ -149,11 +149,28 @@ pub struct WireUsage {
     pub completion_tokens: Option<u64>,
     #[serde(default)]
     pub prompt_tokens_details: Option<WirePromptTokensDetails>,
+    /// COST-2 (E05.4): DeepSeek reports the cache split as TOP-LEVEL
+    /// counters next to the totals (not inside `prompt_tokens_details`).
+    /// `prompt_cache_hit_tokens` is the cache-read part.
+    /// COST-6 (R2-10): `prompt_cache_miss_tokens` is the UNCACHED part of
+    /// the input — it is recorded as a miss and never relabeled into a
+    /// cache write. Both are optional: OpenAI-compatible endpoints omit
+    /// them.
+    #[serde(default)]
+    pub prompt_cache_hit_tokens: Option<u64>,
+    #[serde(default)]
+    pub prompt_cache_miss_tokens: Option<u64>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Default, Deserialize)]
 pub struct WirePromptTokensDetails {
+    #[serde(default)]
     pub cached_tokens: Option<u64>,
+    /// COST-6 (R2-10): an EXPLICIT provider cache-write counter. Only this
+    /// field fills `cache_write_input_tokens`; a cache miss never becomes a
+    /// write.
+    #[serde(default)]
+    pub cache_write_tokens: Option<u64>,
 }
 
 fn protocol_event_error(message: impl Into<String>) -> AgentError {
@@ -265,13 +282,29 @@ impl StreamAccumulator {
         }
 
         if let Some(usage) = &chunk.usage {
+            // COST-6 (R2-10): the cache counters keep the provider's own
+            // semantics. READ prefers the OpenAI details spelling and falls
+            // back to DeepSeek's top-level hit counter. WRITE is filled only
+            // by an explicit write field
+            // (`prompt_tokens_details.cache_write_tokens`); DeepSeek's
+            // `prompt_cache_miss_tokens` is the uncached part of the input
+            // and is recorded as a miss. A counter the provider did not send
+            // stays `None` — zeros are never invented, no bucket is derived
+            // from the others, and inconsistent counters are kept verbatim.
+            let cached_input_tokens = usage
+                .prompt_tokens_details
+                .as_ref()
+                .and_then(|details| details.cached_tokens)
+                .or(usage.prompt_cache_hit_tokens);
             self.usage = Some(ModelUsage {
                 input_tokens: usage.prompt_tokens,
                 output_tokens: usage.completion_tokens,
-                cached_input_tokens: usage
+                cached_input_tokens,
+                cache_write_input_tokens: usage
                     .prompt_tokens_details
                     .as_ref()
-                    .and_then(|details| details.cached_tokens),
+                    .and_then(|details| details.cache_write_tokens),
+                cache_miss_input_tokens: usage.prompt_cache_miss_tokens,
                 ..Default::default()
             });
         }
@@ -607,6 +640,156 @@ mod tests {
         assert_eq!(usage.input_tokens, Some(120));
         assert_eq!(usage.output_tokens, Some(45));
         assert_eq!(usage.cached_input_tokens, Some(30));
+    }
+
+    /// COST-6 (R2-10): DeepSeek reports the cache split as TOP-LEVEL
+    /// counters. The hit half feeds `cached_input_tokens` when the OpenAI
+    /// details spelling is absent; the miss half is the UNCACHED part of the
+    /// input — recorded as miss, never relabeled into a cache write. Neither
+    /// may be silently dropped.
+    #[test]
+    fn deepseek_top_level_cache_hit_and_miss_are_mapped() {
+        let mut acc = StreamAccumulator::default();
+        let chunk: WireChunk = serde_json::from_str(
+            r#"{"choices":[{"index":0,"delta":{},"finish_reason":"stop"}],"usage":{"prompt_tokens":120,"completion_tokens":45,"prompt_cache_hit_tokens":96,"prompt_cache_miss_tokens":24}}"#,
+        )
+        .unwrap();
+        acc.apply(&chunk).unwrap();
+        let usage = acc.usage.expect("usage should be captured");
+        assert_eq!(usage.cached_input_tokens, Some(96), "hit = cache read");
+        assert_eq!(
+            usage.cache_miss_input_tokens,
+            Some(24),
+            "miss stays the provider's own uncached-input counter"
+        );
+        assert_eq!(
+            usage.cache_write_input_tokens, None,
+            "a miss is not a charged cache write: without an explicit write field, write stays None"
+        );
+    }
+
+    /// COST-6 fixture: 100 input / 80 hit / 20 miss with no write field —
+    /// write stays None, and the read/miss counters are never re-derived
+    /// from each other or from the total.
+    #[test]
+    fn hit_miss_without_an_explicit_write_field_reports_write_none() {
+        let mut acc = StreamAccumulator::default();
+        let chunk: WireChunk = serde_json::from_str(
+            r#"{"choices":[{"index":0,"delta":{},"finish_reason":"stop"}],"usage":{"prompt_tokens":100,"completion_tokens":5,"prompt_cache_hit_tokens":80,"prompt_cache_miss_tokens":20}}"#,
+        )
+        .unwrap();
+        acc.apply(&chunk).unwrap();
+        let usage = acc.usage.expect("usage should be captured");
+        assert_eq!(usage.input_tokens, Some(100));
+        assert_eq!(usage.cached_input_tokens, Some(80));
+        assert_eq!(usage.cache_miss_input_tokens, Some(20));
+        assert_eq!(usage.cache_write_input_tokens, None);
+    }
+
+    /// COST-6: an explicit provider write counter is the only source of
+    /// `cache_write_input_tokens`; the miss counter stays independent so a
+    /// gateway reporting both is not collapsed into one bucket.
+    #[test]
+    fn an_explicit_write_field_is_the_only_write_source() {
+        let mut acc = StreamAccumulator::default();
+        let chunk: WireChunk = serde_json::from_str(
+            r#"{"choices":[{"index":0,"delta":{},"finish_reason":"stop"}],"usage":{"prompt_tokens":100,"completion_tokens":5,"prompt_tokens_details":{"cached_tokens":30,"cache_write_tokens":10},"prompt_cache_miss_tokens":60}}"#,
+        )
+        .unwrap();
+        acc.apply(&chunk).unwrap();
+        let usage = acc.usage.expect("usage should be captured");
+        assert_eq!(usage.cached_input_tokens, Some(30));
+        assert_eq!(usage.cache_write_input_tokens, Some(10));
+        assert_eq!(usage.cache_miss_input_tokens, Some(60));
+    }
+
+    /// COST-6: only partial counters reported — the unreported halves stay
+    /// None (never an invented zero), and nothing is derived from the total.
+    #[test]
+    fn partially_reported_cache_counters_stay_none_where_absent() {
+        let mut acc = StreamAccumulator::default();
+        let chunk: WireChunk = serde_json::from_str(
+            r#"{"choices":[{"index":0,"delta":{},"finish_reason":"stop"}],"usage":{"prompt_tokens":100,"completion_tokens":5,"prompt_cache_miss_tokens":100}}"#,
+        )
+        .unwrap();
+        acc.apply(&chunk).unwrap();
+        let usage = acc.usage.expect("usage should be captured");
+        assert_eq!(usage.cached_input_tokens, None);
+        assert_eq!(usage.cache_miss_input_tokens, Some(100));
+        assert_eq!(usage.cache_write_input_tokens, None);
+
+        let mut acc = StreamAccumulator::default();
+        let chunk: WireChunk = serde_json::from_str(
+            r#"{"choices":[{"index":0,"delta":{},"finish_reason":"stop"}],"usage":{"prompt_tokens":100,"completion_tokens":5,"prompt_tokens_details":{"cache_write_tokens":40}}}"#,
+        )
+        .unwrap();
+        acc.apply(&chunk).unwrap();
+        let usage = acc.usage.expect("usage should be captured");
+        assert_eq!(usage.cached_input_tokens, None);
+        assert_eq!(usage.cache_write_input_tokens, Some(40));
+        assert_eq!(usage.cache_miss_input_tokens, None);
+    }
+
+    /// COST-6: the buckets are the provider's own observations and are kept
+    /// verbatim even when they do not sum to the reported input — no
+    /// client-side repair, no silent drop, no re-derivation.
+    #[test]
+    fn inconsistent_cache_counters_are_kept_as_reported_not_repaired() {
+        let mut acc = StreamAccumulator::default();
+        let chunk: WireChunk = serde_json::from_str(
+            r#"{"choices":[{"index":0,"delta":{},"finish_reason":"stop"}],"usage":{"prompt_tokens":100,"completion_tokens":5,"prompt_cache_hit_tokens":80,"prompt_cache_miss_tokens":30}}"#,
+        )
+        .unwrap();
+        acc.apply(&chunk).unwrap();
+        let usage = acc.usage.expect("usage should be captured");
+        assert_eq!(usage.input_tokens, Some(100));
+        assert_eq!(usage.cached_input_tokens, Some(80));
+        assert_eq!(usage.cache_miss_input_tokens, Some(30));
+    }
+
+    /// COST-6: an illegal (non-integer) or overflowing cache counter fails
+    /// the chunk with a typed protocol error instead of clamping, wrapping,
+    /// or being silently dropped.
+    #[test]
+    fn illegal_or_overflowing_cache_counters_fail_typed() {
+        let illegal = parse_wire_chunk(
+            r#"{"choices":[],"usage":{"prompt_tokens":100,"prompt_cache_miss_tokens":"many"}}"#,
+        )
+        .expect_err("a string counter is a malformed usage shape");
+        assert!(matches!(
+            illegal,
+            AgentError::ModelProtocol {
+                kind: ModelProtocolErrorKind::MalformedEvent,
+                ..
+            }
+        ));
+        let overflow = parse_wire_chunk(
+            r#"{"choices":[],"usage":{"prompt_tokens":100,"prompt_cache_hit_tokens":18446744073709551616}}"#,
+        )
+        .expect_err("a counter past u64::MAX cannot be represented honestly");
+        assert!(matches!(
+            overflow,
+            AgentError::ModelProtocol {
+                kind: ModelProtocolErrorKind::MalformedEvent,
+                ..
+            }
+        ));
+    }
+
+    /// COST-2 (E05.4): when both spellings are present the OpenAI details
+    /// counter wins; a provider that reports neither keeps `None` (never an
+    /// invented zero).
+    #[test]
+    fn details_cache_tokens_take_precedence_over_deepseek_hit() {
+        let mut acc = StreamAccumulator::default();
+        let chunk: WireChunk = serde_json::from_str(
+            r#"{"choices":[{"index":0,"delta":{},"finish_reason":"stop"}],"usage":{"prompt_tokens":120,"completion_tokens":45,"prompt_tokens_details":{"cached_tokens":30},"prompt_cache_hit_tokens":96}}"#,
+        )
+        .unwrap();
+        acc.apply(&chunk).unwrap();
+        let usage = acc.usage.expect("usage should be captured");
+        assert_eq!(usage.cached_input_tokens, Some(30));
+        assert_eq!(usage.cache_write_input_tokens, None);
     }
 
     #[test]
