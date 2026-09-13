@@ -123,22 +123,42 @@ fn contains_as_path_token(haystack: &str, needle: &str) -> bool {
     if needle.is_empty() {
         return false;
     }
-    let mut start = 0;
-    while let Some(rel) = haystack[start..].find(needle) {
-        let abs = start + rel;
-        let before_ok = abs == 0 || is_path_token_boundary(haystack.as_bytes()[abs - 1]);
-        let after = abs + needle.len();
-        let after_ok =
-            after == haystack.len() || is_path_token_boundary(haystack.as_bytes()[after]);
+    // Walk char boundaries only. A rejected match used to retry at
+    // `abs + 1`, which lands inside a multi-byte CJK scalar such as `笔`
+    // and panics (`start byte index … is not a char boundary`).
+    let mut search_from = 0;
+    while search_from < haystack.len() {
+        let Some(rel) = haystack[search_from..].find(needle) else {
+            break;
+        };
+        let abs = search_from + rel;
+        let before_ok = haystack[..abs]
+            .chars()
+            .next_back()
+            .is_none_or(is_path_token_boundary_char);
+        let after_ok = haystack[abs + needle.len()..]
+            .chars()
+            .next()
+            .is_none_or(is_path_token_boundary_char);
         if before_ok && after_ok {
             return true;
         }
-        start = abs.saturating_add(1);
-        if start >= haystack.len() {
+        let Some(advance) = haystack[abs..].chars().next().map(char::len_utf8) else {
             break;
-        }
+        };
+        search_from = abs + advance;
     }
     false
+}
+
+fn is_path_token_boundary_char(ch: char) -> bool {
+    if ch.is_ascii() {
+        is_path_token_boundary(ch as u8)
+    } else {
+        // Full-width punctuation (`；` `。` `，`) and other non-letter
+        // marks split a path token the same way ASCII `;` does.
+        !ch.is_alphanumeric()
+    }
 }
 
 fn is_path_token_boundary(byte: u8) -> bool {
@@ -3448,6 +3468,26 @@ mod tests {
             "file.rs.bak is stale",
             "file.rs"
         ));
+    }
+
+    #[test]
+    fn path_token_scan_survives_cjk_filename_followed_by_fullwidth_punct() {
+        // Full-width `；` sits immediately after a CJK basename. A byte-wise
+        // `start + 1` retry used to panic inside `笔` (`start byte index … is
+        // not a char boundary`). The same mark must still count as a token
+        // boundary, matching ASCII `;`.
+        assert!(path_exactly_in_directive("笔记.md；", "笔记.md"));
+        assert!(path_exactly_in_directive(
+            "打开 笔记.md；并列出目录",
+            "笔记.md"
+        ));
+        assert!(path_exactly_in_directive("打开 笔记.md。", "笔记.md"));
+        assert!(path_exactly_in_directive("见 `笔记.md`", "笔记.md"));
+        // Rejected match that still has to walk past `笔` without panicking.
+        assert!(
+            !path_exactly_in_directive("请看长笔记.md；", "笔记.md"),
+            "CJK text before the basename is still a token character, not a boundary"
+        );
     }
 
     #[test]

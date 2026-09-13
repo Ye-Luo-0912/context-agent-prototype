@@ -28,27 +28,14 @@ pub fn render(frame: &mut Frame<'_>, app: &AppState) {
         (root[0], None)
     };
 
-    let history = app
-        .messages
-        .iter()
-        .flat_map(|message| {
-            let prefix = match message.role {
-                UiRole::User => "YOU",
-                UiRole::Assistant => "AGENT",
-                UiRole::Tool => "TOOL",
-                UiRole::System => "SYSTEM",
-            };
-            vec![
-                Line::from(Span::raw(format!("[{prefix}]"))),
-                Line::from(message.content.clone()),
-                Line::from(""),
-            ]
-        })
-        .collect::<Vec<_>>();
+    let history = conversation_lines(app);
+    let inner_width = history_area.width.saturating_sub(2);
+    let inner_height = history_area.height.saturating_sub(2);
+    let scroll = conversation_scroll(&history, inner_width, inner_height, app.scroll);
     let history = Paragraph::new(Text::from(history))
         .block(Block::default().borders(Borders::ALL).title("Conversation"))
         .wrap(Wrap { trim: false })
-        .scroll((app.scroll, 0));
+        .scroll((scroll, 0));
     frame.render_widget(history, history_area);
 
     if let Some(area) = inspect_area {
@@ -159,4 +146,140 @@ fn render_context_panel(frame: &mut Frame<'_>, area: ratatui::layout::Rect, app:
 fn short_id(id: &agent_contracts::ContextItemId) -> String {
     let text = id.to_string();
     text.chars().take(8).collect()
+}
+
+pub(crate) fn conversation_lines(app: &AppState) -> Vec<Line<'static>> {
+    app.messages
+        .iter()
+        .flat_map(|message| {
+            let prefix = match message.role {
+                UiRole::User => "YOU",
+                UiRole::Assistant => "AGENT",
+                UiRole::Tool => "TOOL",
+                UiRole::System => "SYSTEM",
+            };
+            vec![
+                Line::from(Span::raw(format!("[{prefix}]"))),
+                Line::from(message.content.clone()),
+                Line::from(""),
+            ]
+        })
+        .collect()
+}
+
+/// `holdback` is how many wrapped rows above the latest the operator
+/// asked to keep (PageUp). Zero follows the tail so [YOU]/AGENT/TOOL
+/// rows are not hidden under the opening SYSTEM banners.
+pub(crate) fn conversation_scroll(
+    lines: &[Line<'_>],
+    inner_width: u16,
+    inner_height: u16,
+    holdback: u16,
+) -> u16 {
+    let wrapped = wrapped_row_count(lines, inner_width);
+    let max_skip = wrapped.saturating_sub(inner_height.max(1) as usize);
+    max_skip.saturating_sub(holdback as usize) as u16
+}
+
+fn wrapped_row_count(lines: &[Line<'_>], inner_width: u16) -> usize {
+    let width = inner_width.max(1) as usize;
+    lines
+        .iter()
+        .map(|line| line.width().max(1).div_ceil(width))
+        .sum()
+}
+
+/// Visible Conversation rows for a given pane size. Tests use a width
+/// wide enough that nothing wraps, so each source line is one row.
+#[cfg(test)]
+pub(crate) fn visible_conversation(
+    app: &AppState,
+    inner_width: u16,
+    inner_height: u16,
+    holdback: u16,
+) -> Vec<String> {
+    let lines = conversation_lines(app);
+    let rows: Vec<String> = lines
+        .iter()
+        .map(|line| {
+            line.spans
+                .iter()
+                .map(|span| span.content.as_ref())
+                .collect::<String>()
+        })
+        .collect();
+    let scroll = conversation_scroll(&lines, inner_width, inner_height, holdback) as usize;
+    let end = (scroll + inner_height.max(1) as usize).min(rows.len());
+    rows.get(scroll..end).unwrap_or(&[]).to_vec()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::state::AppState;
+    use agent_contracts::{RunId, RuntimeEvent, RuntimeEventEnvelope, TaskId};
+
+    fn envelope(event: RuntimeEvent) -> RuntimeEventEnvelope {
+        RuntimeEventEnvelope {
+            run_id: RunId::new(),
+            seq: 1,
+            timestamp_ms: 0,
+            event,
+        }
+    }
+
+    #[test]
+    fn conversation_follows_the_latest_dialogue_not_the_opening_banners() {
+        let mut app = AppState::new(RunId::new());
+        app.push_system("context policy: dynamic".into());
+        app.push_system("serving: deepseek-flash | profile digest abc".into());
+        app.apply_runtime_event(envelope(RuntimeEvent::FocusChanged {
+            task_id: TaskId::new(),
+            goal: "请根据笔记.md整理目录".into(),
+        }));
+        let input =
+            agent_contracts::RuntimeInputEnvelope::from_preview("请列出目录并更新笔记.md；");
+        app.apply_runtime_event(envelope(RuntimeEvent::UserMessageAccepted { input }));
+        app.apply_runtime_event(envelope(RuntimeEvent::AssistantMessage {
+            content: "先看目录，再写笔记。".into(),
+        }));
+        app.apply_runtime_event(envelope(RuntimeEvent::ToolFinished {
+            output: agent_contracts::ToolOutput {
+                call_id: "call-1".into(),
+                tool_name: "fs.list".into(),
+                ok: true,
+                summary: "3 entries".into(),
+                model_content: String::new(),
+                artifact_ref: None,
+                metadata: serde_json::Value::Null,
+            },
+            facts: None,
+        }));
+
+        let roles: Vec<_> = app.messages.iter().map(|message| message.role).collect();
+        assert!(roles.contains(&UiRole::User), "{roles:?}");
+        assert!(roles.contains(&UiRole::Assistant), "{roles:?}");
+        assert!(roles.contains(&UiRole::Tool), "{roles:?}");
+
+        // A short pane that can only show the opening SYSTEM/Focus
+        // banners if scroll stays pinned at the top.
+        let visible = visible_conversation(&app, 80, 10, 0);
+        let joined = visible.join("\n");
+        assert!(
+            joined.contains("[YOU]") || joined.contains("请列出目录"),
+            "user prompt must be in the followed viewport:\n{joined}"
+        );
+        assert!(
+            joined.contains("[AGENT]") || joined.contains("先看目录"),
+            "assistant reply must be in the followed viewport:\n{joined}"
+        );
+        assert!(
+            joined.contains("[TOOL]") || joined.contains("3 entries"),
+            "tool summary must be in the followed viewport:\n{joined}"
+        );
+        assert!(
+            !joined.contains("Prototype ready"),
+            "following the tail must leave the opening banner: {joined}"
+        );
+    }
 }
