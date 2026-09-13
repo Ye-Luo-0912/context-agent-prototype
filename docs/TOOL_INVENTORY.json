@@ -88,7 +88,8 @@
         "pattern": {"type": "string", "required": true, "note": "rg-style regex"},
         "path": {"type": "string", "note": "optional workspace-relative directory"},
         "limit": {"type": "integer", "minimum": 1, "maximum": 1000},
-        "cursor": {"type": "string", "note": "opaque token from a previous search.grep result; serves the next page from that call's snapshot artifact"}
+        "cursor": {"type": "string", "note": "opaque token from a previous search.grep result; serves the next page from that call's snapshot artifact — a result page over hits already found, never a resumed scan"},
+        "scan_continuation": {"type": "string", "note": "runtime-issued handle (sealed run-owned scan-state artifact) that resumes an unfinished scan: unlisted files and later matches inside a partially scanned file; bound to the issuing pattern/path; quoted verbatim from the result's coverage line and deliberately absent from the advertised schema so it cannot be invented"}
       },
       "limits": {
         "max_files_scanned": 5000,
@@ -97,7 +98,8 @@
         "max_bytes_per_file": 2097152,
         "model_hits": 100,
         "max_hit_line_bytes": 1024,
-        "note": "hit sets above model_hits spill to an artifact and return a cursor; later pages are served from the immutable snapshot, so file changes between pages cannot cause duplicates or gaps; ignored dirs: .git, .focus-agent, target, node_modules, vendor, dist, build"
+        "scan_state_version": 1,
+        "note": "hit sets above model_hits spill to an artifact and return a cursor; later pages are served from the immutable snapshot, so file changes between pages cannot cause duplicates or gaps; exhausting a snapshot exhausts the saved hits only, never the query; candidates are enumerated in ascending workspace-relative path order and a batch that stops at the hit limit or max_files_scanned returns a scan_continuation carrying that position (path watermark plus in-file line offset and the revision it was read at); every continuation batch gets these same budgets and the same cancellation checks; a changed, unreadable or removed file at a recorded position invalidates the continuation (restart or narrow) instead of mixing revisions; ignored dirs: .git, .focus-agent, target, node_modules, vendor, dist, build"
       },
       "effects": ["read:workspace"],
       "context_disposition": "PersistObservation",

@@ -311,9 +311,18 @@ async fn snapshot_paging_keeps_its_semantics_across_a_checkpoint_restore() -> an
         page.model_content
     );
     assert!(
-        page.model_content
-            .contains(&format!("end of results ({MATCH_LINES} total, snapshot")),
+        page.model_content.contains(&format!(
+            "end of saved results ({MATCH_LINES} total, snapshot"
+        )),
         "the final page must carry the end marker: {}",
+        page.model_content
+    );
+    // F4：末页只结束这份快照里已保存的命中，不代表查询已穷尽——恢复后
+    // 同样如此，否则跨重启的分页会读成「全仓已找全」。
+    assert!(
+        page.model_content
+            .contains("not proof the search was exhausted"),
+        "the resumed final page must not claim the query is exhausted: {}",
         page.model_content
     );
     // 快照不可变：重启后写入源文件的内容不得混进快照页。

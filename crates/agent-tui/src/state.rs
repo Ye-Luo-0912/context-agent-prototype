@@ -231,6 +231,14 @@ fn bounded_tool_surface_message(report: &ToolSurfacePlanReport) -> String {
     }
 }
 
+fn tool_transcript_text(output: &agent_contracts::ToolOutput) -> String {
+    format!(
+        "{}\n{}",
+        output.summary,
+        output.artifact_ref.clone().unwrap_or_default()
+    )
+}
+
 pub struct AppState {
     pub run_id: RunId,
     pub input: String,
@@ -245,6 +253,10 @@ pub struct AppState {
     pub status: String,
     pub tool_status: String,
     pub busy: bool,
+    /// How many wrapped rows above the latest transcript the operator is
+    /// holding in view (PageUp). Zero follows the tail so new [YOU]/AGENT/
+    /// TOOL rows stay visible instead of hiding under the opening SYSTEM
+    /// banners.
     pub scroll: u16,
     pub pending_approval: Option<PendingApproval>,
     /// Cumulative provider-reported token usage for the live run (fed by
@@ -434,6 +446,11 @@ impl AppState {
                     continue;
                 }
                 self.status_projection.fold(&envelope.event);
+                // The journal is the durable transcript. A Lagged live
+                // receiver may have dropped User/Assistant/Tool rows even
+                // though they were written to JSONL; fold them back so the
+                // Conversation pane can show the dialogue that ran.
+                self.recover_dialogue_event(&envelope.event);
                 folded += 1;
                 max_seq = max_seq.max(Some(envelope.seq));
             }
@@ -447,6 +464,49 @@ impl AppState {
 
     pub fn push_system(&mut self, content: String) {
         self.push_message(UiRole::System, content);
+    }
+
+    /// Fold one durable dialogue event into the Conversation pane.
+    /// Used after a broadcast Lagged so JSONL-backed user/assistant/tool
+    /// rows reappear even if the live receiver never saw them. SYSTEM
+    /// banners stay as they are; this only fills missing dialogue.
+    fn recover_dialogue_event(&mut self, event: &RuntimeEvent) {
+        match event {
+            RuntimeEvent::UserMessageAccepted { input } if input.appears_in_user_transcript() => {
+                let already_shown = input
+                    .input_id
+                    .is_some_and(|id| self.last_shown_input_id == Some(id))
+                    || self.messages.iter().any(|message| {
+                        message.role == UiRole::User && message.content == input.preview
+                    });
+                if !already_shown {
+                    if let Some(id) = input.input_id {
+                        self.last_shown_input_id = Some(id);
+                    }
+                    self.push_message(UiRole::User, input.preview.clone());
+                }
+            }
+            RuntimeEvent::AssistantMessage { content } => {
+                if !content.is_empty()
+                    && !self.messages.iter().any(|message| {
+                        message.role == UiRole::Assistant && message.content == *content
+                    })
+                {
+                    self.push_message(UiRole::Assistant, content.clone());
+                }
+            }
+            RuntimeEvent::ToolFinished { output, .. } => {
+                let text = tool_transcript_text(output);
+                if !self
+                    .messages
+                    .iter()
+                    .any(|message| message.role == UiRole::Tool && message.content == text)
+                {
+                    self.push_message(UiRole::Tool, text);
+                }
+            }
+            _ => {}
+        }
     }
 
     /// Append one transcript row, draining the oldest rows beyond the
@@ -557,6 +617,8 @@ impl AppState {
                         }
                         self.busy = true;
                         self.status = "working".into();
+                        // Follow the tail: scroll 0 is "latest", not the
+                        // opening SYSTEM banners.
                         self.scroll = 0;
                     } else {
                         if let Some(id) = input.input_id
@@ -859,9 +921,18 @@ impl AppState {
             }
             RuntimeEvent::AssistantMessage { content } => {
                 self.streaming = false;
-                match self.messages.last_mut() {
-                    Some(last) if last.role == UiRole::Assistant => last.content = content,
-                    _ => self.push_message(UiRole::Assistant, content),
+                if self
+                    .messages
+                    .iter()
+                    .any(|message| message.role == UiRole::Assistant && message.content == content)
+                {
+                    // Already recovered from the journal after a Lagged
+                    // receiver; do not add a second bubble.
+                } else {
+                    match self.messages.last_mut() {
+                        Some(last) if last.role == UiRole::Assistant => last.content = content,
+                        _ => self.push_message(UiRole::Assistant, content),
+                    }
                 }
             }
             RuntimeEvent::OperationAccepted { .. } => {
@@ -912,14 +983,14 @@ impl AppState {
                         artifact: output.artifact_ref.clone(),
                     });
                 }
-                self.push_message(
-                    UiRole::Tool,
-                    format!(
-                        "{}\n{}",
-                        output.summary,
-                        output.artifact_ref.unwrap_or_default()
-                    ),
-                );
+                let text = tool_transcript_text(&output);
+                if !self
+                    .messages
+                    .iter()
+                    .any(|message| message.role == UiRole::Tool && message.content == text)
+                {
+                    self.push_message(UiRole::Tool, text);
+                }
             }
             RuntimeEvent::ToolScopeClosed {
                 scope_id,
@@ -1783,6 +1854,45 @@ mod tests {
         assert!(lines[0].contains("no result material yet"));
     }
 
+    #[test]
+    fn dialogue_events_map_to_user_assistant_and_tool_bubbles() {
+        let mut app = AppState::new(RunId::new());
+        let input = agent_contracts::RuntimeInputEnvelope::from_preview("请列出目录并写笔记.md");
+        app.apply_runtime_event(envelope(RuntimeEvent::UserMessageAccepted { input }));
+        app.apply_runtime_event(envelope(RuntimeEvent::AssistantMessage {
+            content: "先看目录，再写笔记。".into(),
+        }));
+        app.apply_runtime_event(envelope(RuntimeEvent::ToolFinished {
+            output: tool_output("fs.list", true, "3 entries", None),
+            facts: None,
+        }));
+
+        let user = app
+            .messages
+            .iter()
+            .find(|message| message.role == UiRole::User)
+            .expect("user bubble");
+        assert_eq!(user.content, "请列出目录并写笔记.md");
+        let assistant = app
+            .messages
+            .iter()
+            .find(|message| message.role == UiRole::Assistant)
+            .expect("assistant bubble");
+        assert_eq!(assistant.content, "先看目录，再写笔记。");
+        let tool = app
+            .messages
+            .iter()
+            .find(|message| message.role == UiRole::Tool)
+            .expect("tool bubble");
+        assert!(tool.content.contains("3 entries"), "{}", tool.content);
+        assert!(
+            app.messages
+                .iter()
+                .any(|message| message.role == UiRole::System),
+            "SYSTEM banners stay"
+        );
+    }
+
     #[tokio::test]
     async fn completed_task_persists_the_result_card_artifact() {
         let dir = tempfile::tempdir().unwrap();
@@ -2085,5 +2195,78 @@ mod resync_tests {
         assert!(!partial);
         assert_eq!(folded, 0);
         assert!(app.status_projection.lines()[0].contains("not started"));
+    }
+
+    #[tokio::test]
+    async fn resync_recovers_dialogue_events_dropped_by_a_lagged_receiver() {
+        let dir = tempfile::tempdir().unwrap();
+        let traces = dir.path().join("traces");
+        std::fs::create_dir_all(&traces).unwrap();
+        let mut app = AppState::new(RunId::new());
+        let input = agent_contracts::RuntimeInputEnvelope::from_preview("请更新笔记.md；");
+        let lines = [
+            RuntimeEvent::UserMessageAccepted { input },
+            RuntimeEvent::AssistantMessage {
+                content: "已写入笔记。".into(),
+            },
+            RuntimeEvent::ToolFinished {
+                output: agent_contracts::ToolOutput {
+                    call_id: "call-1".into(),
+                    tool_name: "fs.write".into(),
+                    ok: true,
+                    summary: "wrote 4 lines".into(),
+                    model_content: String::new(),
+                    artifact_ref: None,
+                    metadata: serde_json::json!({ "path": "笔记.md" }),
+                },
+                facts: None,
+            },
+        ]
+        .into_iter()
+        .enumerate()
+        .map(|(index, event)| {
+            serde_json::to_string(&RuntimeEventEnvelope {
+                run_id: app.run_id,
+                seq: (index as u64) + 1,
+                timestamp_ms: index as u64,
+                event,
+            })
+            .unwrap()
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+        std::fs::write(traces.join("run.jsonl"), lines).unwrap();
+
+        // Lag: the live receiver never folded these into the transcript.
+        assert!(
+            app.messages
+                .iter()
+                .all(|message| message.role == UiRole::System)
+        );
+        let (folded, partial) = app.resync_projection(&traces).await;
+        assert!(!partial);
+        assert_eq!(folded, 3);
+        assert!(
+            app.messages
+                .iter()
+                .any(|message| message.role == UiRole::User && message.content.contains("笔记.md")),
+            "{:?}",
+            app.messages.iter().map(|m| &m.content).collect::<Vec<_>>()
+        );
+        assert!(app.messages.iter().any(|message| {
+            message.role == UiRole::Assistant && message.content.contains("已写入笔记")
+        }));
+        assert!(
+            app.messages
+                .iter()
+                .any(|message| message.role == UiRole::Tool && message.content.contains("wrote 4"))
+        );
+        assert!(
+            app.messages
+                .iter()
+                .any(|message| message.role == UiRole::System
+                    && message.content.contains("Prototype")),
+            "session SYSTEM banners must remain"
+        );
     }
 }
