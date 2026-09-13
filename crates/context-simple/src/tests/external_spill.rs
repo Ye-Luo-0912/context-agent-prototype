@@ -966,10 +966,7 @@ async fn illegal_spill_manifest_row_is_refused_without_mutating_live_state() {
 /// and the two deferred ids.
 async fn sharded_restore_with_pending_tail(
     dir: &tempfile::TempDir,
-) -> (
-    SimpleContextEngine,
-    [agent_contracts::ContextItemId; 2],
-) {
+) -> (SimpleContextEngine, [agent_contracts::ContextItemId; 2]) {
     let first = spill_engine(dir, 10).await;
     open_focus(&first, "sharded restore tail").await;
     let _ids = externalize_n(&first, 13).await;
@@ -1167,7 +1164,10 @@ async fn an_oversized_card_is_refused_at_the_bounded_read() {
     );
 
     let outcome = crate::store::read_external_card_checked_async(
-        &cards.join(format!("{}.deadbeefcafe.card", agent_contracts::ContextItemId::new())),
+        &cards.join(format!(
+            "{}.deadbeefcafe.card",
+            agent_contracts::ContextItemId::new()
+        )),
         agent_contracts::ContextItemId::new(),
         Some("deadbeefcafe"),
     )
@@ -1198,7 +1198,10 @@ async fn a_card_whose_bytes_lost_the_captured_hash_is_corrupt_and_never_installs
         .card_hash(target)
         .unwrap()
         .to_string();
-    let card_path = dir.path().join("cards").join(format!("{target}.{hash}.card"));
+    let card_path = dir
+        .path()
+        .join("cards")
+        .join(format!("{target}.{hash}.card"));
     let mut card: serde_json::Value =
         serde_json::from_slice(&std::fs::read(&card_path).unwrap()).unwrap();
     card["entry"]["attention"] =

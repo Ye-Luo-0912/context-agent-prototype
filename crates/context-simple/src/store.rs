@@ -272,9 +272,9 @@ pub(crate) async fn read_external_card_checked_async(
     }
     match parse_external_card(&bytes, expected_id) {
         Ok(entry) => ExternalCardRead::Found(entry),
-        Err(()) => ExternalCardRead::Corrupt(
-            "card envelope is corrupt or names another id".to_string(),
-        ),
+        Err(()) => {
+            ExternalCardRead::Corrupt("card envelope is corrupt or names another id".to_string())
+        }
     }
 }
 
@@ -1769,9 +1769,14 @@ pub(crate) async fn run_reconcile_io_protecting(
             // (`rebuilt_candidates`): deleting its card here would strip the
             // rebuilt entry's captured lifecycle/retention state, so the
             // pair survives together and the commit phase yields one owner.
-            if io.rebuilt_candidates.iter().any(|(item, _)| item.id == card_id) {
-                io.reasons
-                    .push(format!("kept card {name}: this scan re-claims the id's blob"));
+            if io
+                .rebuilt_candidates
+                .iter()
+                .any(|(item, _)| item.id == card_id)
+            {
+                io.reasons.push(format!(
+                    "kept card {name}: this scan re-claims the id's blob"
+                ));
                 continue;
             }
             // N01: with the recovery-root enumeration incomplete, "absent

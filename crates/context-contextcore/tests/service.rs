@@ -1503,10 +1503,7 @@ async fn a_service_restart_over_one_store_keeps_the_sharded_checkpoints_cards() 
                     tool_name: "shell.exec".into(),
                     ok: true,
                     summary: "historical result".into(),
-                    model_content: format!(
-                        "step {item}: fix Ledger.rs {}",
-                        "y".repeat(120)
-                    ),
+                    model_content: format!("step {item}: fix Ledger.rs {}", "y".repeat(120)),
                     artifact_ref: None,
                     metadata: json!({ "path": "Ledger.rs" }),
                 },
@@ -1550,8 +1547,7 @@ async fn a_service_restart_over_one_store_keeps_the_sharded_checkpoints_cards() 
     // The metadata as captured — this is what the restore promise covers.
     let mut captured = Vec::new();
     for row in &spilled_rows {
-        let id =
-            ContextItemId::parse_ref(row["id"].as_str().unwrap()).unwrap();
+        let id = ContextItemId::parse_ref(row["id"].as_str().unwrap()).unwrap();
         let entry = local
             .inspect_external(id)
             .await

@@ -1044,7 +1044,10 @@ impl SimpleContextEngine {
         let mut missing = 0u64;
         let mut io_failures = 0u64;
         for (index, (item_id, hash)) in rows.iter().enumerate() {
-            match self.read_card_with_test_hooks(&dir, *item_id, hash, index).await {
+            match self
+                .read_card_with_test_hooks(&dir, *item_id, hash, index)
+                .await
+            {
                 crate::store::ExternalCardRead::Found(entry) => {
                     found.push((*item_id, hash.clone(), entry));
                 }
@@ -1106,9 +1109,8 @@ impl SimpleContextEngine {
             state.external.record_card(entry.item_id, hash);
         }
         state.external_cards_missing = state.external_cards_missing.saturating_add(missing);
-        state.external_card_io_failures = state
-            .external_card_io_failures
-            .saturating_add(io_failures);
+        state.external_card_io_failures =
+            state.external_card_io_failures.saturating_add(io_failures);
         state.sync_catalog();
         installed
     }
@@ -1199,7 +1201,9 @@ impl SimpleContextEngine {
             return false;
         };
         let dir = crate::store::store_dir(&self.config);
-        let outcome = self.read_card_with_test_hooks(&dir, item_id, &hash, 0).await;
+        let outcome = self
+            .read_card_with_test_hooks(&dir, item_id, &hash, 0)
+            .await;
         let mut state = self.state.lock().await;
         match outcome {
             crate::store::ExternalCardRead::Found(entry)
@@ -1230,7 +1234,8 @@ impl SimpleContextEngine {
                 true
             }
             crate::store::ExternalCardRead::Found(_) => false,
-            crate::store::ExternalCardRead::Missing | crate::store::ExternalCardRead::Corrupt(_) => {
+            crate::store::ExternalCardRead::Missing
+            | crate::store::ExternalCardRead::Corrupt(_) => {
                 state
                     .pending_external_cards
                     .retain(|(id, _)| *id != item_id);
@@ -1240,8 +1245,7 @@ impl SimpleContextEngine {
             crate::store::ExternalCardRead::IoFailed(_) => {
                 // N02: a transient failure keeps the retryable locator and
                 // is counted separately from "the data does not exist".
-                state.external_card_io_failures =
-                    state.external_card_io_failures.saturating_add(1);
+                state.external_card_io_failures = state.external_card_io_failures.saturating_add(1);
                 false
             }
         }
@@ -2636,8 +2640,7 @@ impl ContextEngine for SimpleContextEngine {
                     continue;
                 }
                 let path = crate::store::external_card_path(&dir, *id, hash);
-                match crate::store::read_external_card_checked_async(&path, *id, Some(hash)).await
-                {
+                match crate::store::read_external_card_checked_async(&path, *id, Some(hash)).await {
                     crate::store::ExternalCardRead::Found(entry) => {
                         rehydrated.push((entry, hash.clone()));
                     }
