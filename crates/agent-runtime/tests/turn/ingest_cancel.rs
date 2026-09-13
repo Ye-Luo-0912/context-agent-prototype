@@ -57,6 +57,8 @@ impl BoundedCompactor for GatedCompactor {
             text: "[episode card] keep the original unversioned ping constraint".into(),
             input_tokens: 17,
             output_tokens: 5,
+            usage_identity: agent_contracts::UsageIdentity::Observed,
+            ..Default::default()
         })
     }
 }
@@ -291,6 +293,7 @@ async fn completed_dynamic_ingest_admits_once_and_reports_compaction_once() {
                 input_tokens,
                 output_tokens,
                 source_items,
+                ..
             } => Some((*reason, *input_tokens, *output_tokens, *source_items)),
             _ => None,
         })

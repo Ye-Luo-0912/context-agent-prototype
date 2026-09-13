@@ -741,6 +741,8 @@ impl RuntimeActor {
                     disposition,
                     context_ack: None,
                     maintenance: None,
+                    materialization: None,
+                    gc: None,
                 })
                 .await;
         });
@@ -857,7 +859,68 @@ impl RuntimeActor {
                 })
                 .await;
         }
+        // EXEC-7 (R2-08): boundary completions fence against the parked
+        // `gc_work` slot, not the turn — idle boundary work has no turn,
+        // and a cancelled turn-scoped pass already lost its slot (the drop
+        // inside `continue_after_gc_work` IS the rollback).
+        if completion.kind == OpKind::Gc {
+            self.continue_after_gc_work(completion, op_tx).await;
+            return;
+        }
         if self.is_stale(&completion) {
+            // COST-7 (R2-11): the business result dies here, but the cost
+            // does not. A stale MODEL round whose provider report arrived
+            // keeps its real usage under its honest identity; a stale
+            // MAINTENANCE completion keeps its engine report's compaction
+            // rows. The dedupe fence (cancel-vs-late-completion, duplicate
+            // arrivals) makes sure one cost enters the account once.
+            if self.usage_already_accounted(completion.operation.operation_id) {
+                // Already in the account (e.g. the cancellation's unknown
+                // row): only the business drop below still applies.
+            } else if let OperationOutcome::ModelOutput { usage, .. } =
+                &completion.operation.outcome
+            {
+                let _ = self
+                    .core
+                    .emit_event(RuntimeEvent::ModelUsed {
+                        input_tokens: usage.input_tokens.unwrap_or(0),
+                        output_tokens: usage.output_tokens.unwrap_or(0),
+                        cached_input_tokens: usage.cached_input_tokens.unwrap_or(0),
+                        attempts: usage.attempts.max(1),
+                        retries: usage.retries,
+                        usage_identity: usage.usage_identity(),
+                        role: agent_contracts::ModelCallRole::Main,
+                        usage: Some(usage.clone()),
+                    })
+                    .await;
+                self.mark_usage_accounted(completion.operation.operation_id);
+            } else if completion.kind == OpKind::Maintenance
+                && let Some(Ok(report)) = completion.maintenance.as_ref()
+            {
+                for compaction in &report.compactions {
+                    let _ = self
+                        .core
+                        .emit_event(RuntimeEvent::ContextCompacted {
+                            reason: compaction.reason,
+                            input_tokens: compaction.input_tokens,
+                            output_tokens: compaction.output_tokens,
+                            source_items: compaction.source_items,
+                            usage_identity: compaction.usage_identity,
+                            cached_input_tokens: compaction.cached_input_tokens,
+                            cache_write_input_tokens: compaction.cache_write_input_tokens,
+                            cache_miss_input_tokens: compaction.cache_miss_input_tokens,
+                            attempts: compaction.attempts,
+                            retries: compaction.retries,
+                        })
+                        .await;
+                }
+                self.mark_usage_accounted(completion.operation.operation_id);
+            }
+            // A stale materialization's parked round plan goes with it: the
+            // preview is non-consuming, so dropping it is the whole rollback.
+            if completion.kind == OpKind::Materialize {
+                self.state.materialization = None;
+            }
             // The operation turned stale before its side effect was
             // committed: roll the staged effect back so a cancelled or
             // superseded tool never mutates the workspace.
@@ -868,6 +931,8 @@ impl RuntimeActor {
                         OpKind::Model => "model",
                         OpKind::Tool => "tool",
                         OpKind::Maintenance => "maintenance",
+                        OpKind::Materialize => "materialize",
+                        OpKind::Gc => "boundary",
                     },
                     completion.operation.turn_id,
                     completion.operation.generation
@@ -924,6 +989,8 @@ impl RuntimeActor {
                     OpKind::Model => "model",
                     OpKind::Tool => "tool",
                     OpKind::Maintenance => "maintenance",
+                    OpKind::Materialize => "materialize",
+                    OpKind::Gc => "boundary",
                 },
                 completion.operation.turn_id,
                 completion.operation.generation
@@ -947,6 +1014,25 @@ impl RuntimeActor {
                 .maintenance
                 .expect("a maintenance completion carries its engine report");
             self.continue_after_maintenance(report, op_tx).await;
+            return;
+        }
+        if completion.kind == OpKind::Materialize {
+            let result = completion
+                .materialization
+                .expect("a materialize completion carries its preview result");
+            let pending = self.state.materialization.take();
+            match pending {
+                Some(pending) => {
+                    self.continue_model_operation_after_materialize(pending.plan, result, op_tx)
+                        .await;
+                }
+                None => {
+                    // The parked plan is gone (cancelled or superseded
+                    // between the engine return and this completion):
+                    // materialize is non-consuming, so dropping the preview
+                    // is the whole rollback.
+                }
+            }
             return;
         }
         match completion.operation.outcome {
@@ -985,6 +1071,9 @@ impl RuntimeActor {
                         cached_input_tokens: usage.cached_input_tokens.unwrap_or(0),
                         attempts: usage.attempts.max(1),
                         retries: usage.retries,
+                        usage_identity: usage.usage_identity(),
+                        role: agent_contracts::ModelCallRole::Main,
+                        usage: Some(usage.clone()),
                     })
                     .await;
                 if structurally_empty {
@@ -1384,13 +1473,19 @@ impl RuntimeActor {
                 // before the next model round. Failed execution results
                 // stay on the TurnFrame only.
                 if output.heats_working_set() {
-                    let _ = self
-                        .services
-                        .context_ingest(ContextIngress::WorkingSetSignal {
-                            resources: output.resource_touches(),
-                            content: String::new(),
-                        })
-                        .await;
+                    // CTX-8 接线 (R3-08): under store backpressure the
+                    // working-set heat signal is skipped (best-effort by
+                    // contract) — the result still enters the frame, so
+                    // delivery never depends on the failing store.
+                    if !self.store_backpressure_active() {
+                        let _ = self
+                            .services
+                            .context_ingest(ContextIngress::WorkingSetSignal {
+                                resources: output.resource_touches(),
+                                content: String::new(),
+                            })
+                            .await;
+                    }
                 }
                 if let Some(turn) = self.state.turn.as_mut() {
                     let facts = self.services.tools().execution_facts(&output);
@@ -1498,6 +1593,8 @@ impl RuntimeActor {
                 class,
                 retryable,
                 message,
+                usage,
+                ..
             } => {
                 let _ = self
                     .core
@@ -1507,6 +1604,40 @@ impl RuntimeActor {
                         message,
                     })
                     .await;
+                // COST-1 (E05.1)/COST-7 (R3-12): a failed MODEL round is
+                // still a real cost. When the typed failure carries usage
+                // the provider already reported, the account keeps the REAL
+                // counters under their honest identity; only a failure with
+                // no usable evidence carries the explicit unknown row. A
+                // usage-less failure is never read as a zero.
+                if completion.kind == OpKind::Model {
+                    match usage {
+                        Some(usage) if usage.has_any_reported() => {
+                            let _ = self
+                                .core
+                                .emit_event(RuntimeEvent::ModelUsed {
+                                    input_tokens: usage.input_tokens.unwrap_or(0),
+                                    output_tokens: usage.output_tokens.unwrap_or(0),
+                                    cached_input_tokens: usage.cached_input_tokens.unwrap_or(0),
+                                    attempts: usage.attempts.max(1),
+                                    retries: usage.retries,
+                                    usage_identity: usage.usage_identity(),
+                                    role: agent_contracts::ModelCallRole::Main,
+                                    usage: Some(usage.clone()),
+                                })
+                                .await;
+                            self.mark_usage_accounted(completion.operation.operation_id);
+                        }
+                        _ => {
+                            RuntimeActor::emit_unknown_model_usage_row(
+                                &self.core,
+                                agent_contracts::ModelCallRole::Main,
+                            )
+                            .await;
+                            self.mark_usage_accounted(completion.operation.operation_id);
+                        }
+                    }
+                }
                 // Provider failure, not runtime corruption: settle the
                 // applied input and drop the turn without fencing.
                 self.settle_aborted_turn().await;

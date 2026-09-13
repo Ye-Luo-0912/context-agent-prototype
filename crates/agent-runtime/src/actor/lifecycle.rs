@@ -57,6 +57,20 @@ impl RuntimeActor {
             Err(AgentError::InvalidRequest(format!(
                 "agent is finishing explicit cleanup for cancelled tool operation {operation_id}"
             )))
+        } else if self
+            .state
+            .gc_work
+            .as_ref()
+            .is_some_and(|pending| pending.is_commit_in_flight())
+        {
+            // EXEC-7 (R2-08): a task-completion or safe-point commit is in
+            // flight as a spawned boundary operation. Its prepared task
+            // transaction must apply over exactly the task table it was
+            // prepared against, so no new mutation is admitted until the
+            // commit settles.
+            Err(AgentError::InvalidRequest(
+                "a task-completion / checkpoint commit is settling; retry when it completes".into(),
+            ))
         } else {
             self.ensure_no_active_turn()
         }
@@ -336,16 +350,31 @@ impl RuntimeActor {
         self.push_checked_files_for_gc().await;
     }
 
-    /// One full GC pass after a task completed, so the finished task's
-    /// records leave the resident heap and stay recallable from the
-    /// reversible buffer / context store. The completion itself is already
-    /// committed; a GC failure is surfaced as an `Error` event and never
-    /// rolls the outcome back.
-    pub(super) async fn compact_after_completion(&mut self) {
-        // 完成边界前的根声明投影：完成任务后 active 通常已切换/清空，
-        // 强制推送当前（或空）根集，声明不再保护已完成任务的工作集。
-        self.push_gc_projections(true).await;
-        match self.services.context_gc().await {
+    /// EXEC-7 (R2-08): the post-completion boundary's resume half. The
+    /// completion itself is already committed; a GC failure is surfaced as
+    /// an `Error` event and never rolls the outcome back. The full pass and
+    /// the storage boundary ran in the spawned boundary operation; only
+    /// their audit events are emitted here, in the same order the inline
+    /// version used.
+    pub(super) async fn finish_completion_boundary(
+        &mut self,
+        gc: AgentResult<agent_contracts::ContextGcReport>,
+        storage: AgentResult<agent_contracts::StorageGcReport>,
+    ) {
+        // CTX-8 接线 (R3-08): observe the boundary pass for the status
+        // snapshot. A backpressured pass throttles NEW body production; a
+        // clean pass lifts the throttle. The observation rides the typed
+        // status snapshot — the throttle itself lives in the engine's
+        // pending/owned items, never in a second GC authority.
+        self.state.store_backpressure = match (&gc, &storage) {
+            (Ok(gc_report), _) => Some(crate::work::StoreBackpressure {
+                active: gc_report.externalize_backpressure,
+                externalize_deferred: gc_report.externalize_deferred,
+                store_io_failures: gc_report.store_io_failures,
+            }),
+            (Err(_), _) => None,
+        };
+        match gc {
             Ok(report) => {
                 if let Err(error) = self
                     .core
@@ -369,28 +398,7 @@ impl RuntimeActor {
                     .await;
             }
         }
-    }
-
-    /// Task completion is an explicit runtime boundary for Storage GC: the
-    /// completed task's records are storage roots until this point, after
-    /// which the only live references are the completion outcome and its
-    /// evidence. Run one conservative Storage GC pass here — never on the
-    /// per-model hot path — and publish the report so every permanent
-    /// deletion is observable and auditable. A failure is surfaced as an
-    /// Error event, never allowed to undo the completed task.
-    pub(super) async fn run_storage_gc_at_boundary(&mut self) {
-        // 完成边界前推送根声明投影：StorageRequired 的声明会让 storage GC
-        // 保留其指向的 store 条目（已完成任务的证据留存由声明决定）。
-        self.push_gc_projections(true).await;
-        // W03: 删除入口与 reconcile 共用保留根——仍被保留 checkpoint 引用
-        // 的 external blob 是强恢复根；根枚举不完整时本 pass 不删除任何
-        // 条目（读失败不能被包装成「没有保留者」），延期留给下一个边界。
-        let (recovery_roots, roots_complete) = self.collect_checkpoint_recovery_roots().await;
-        match self
-            .services
-            .context_storage_gc_protecting(&recovery_roots, roots_complete)
-            .await
-        {
+        match storage {
             Ok(report) => {
                 if let Err(error) = self
                     .core

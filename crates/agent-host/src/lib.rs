@@ -39,7 +39,8 @@ use agent_platform_protocol::{
     PlatformError, PlatformErrorClass, PlatformResponse, ProtocolIdentity, RetryDisposition, Route,
     SchemaDigest, WorkArtifactRequest, WorkCancelRequest, WorkChangesRequest, WorkContextRequest,
     WorkContinueRequest, WorkEventNotification, WorkSnapshotRequest, WorkSubmitRequest,
-    WorkSubscribeRequest, WorkTaskDetailRequest,
+    WorkSubmitResultRequest, WorkSubscribeRequest, WorkTaskCompletionRequest,
+    WorkTaskDetailRequest,
 };
 use agent_runtime::{
     RuntimeHandle, WorkControlGrant, WorkControlRouter, WorkControlSessionRegistry,
@@ -1125,6 +1126,12 @@ fn dispatch<W: Write + Send + 'static>(
         ("work", "task_detail") => {
             run_route!(WorkTaskDetailRequest, task_detail)
         }
+        ("work", "submit_result") => {
+            run_route!(WorkSubmitResultRequest, submit_result)
+        }
+        ("work", "task_completion") => {
+            run_route!(WorkTaskCompletionRequest, task_completion)
+        }
         ("work", "changes") => {
             run_route!(WorkChangesRequest, changes)
         }
@@ -1425,6 +1432,31 @@ mod tests {
             workspace_endpoint_suffix(beta),
             "two workspaces must not share a default endpoint"
         );
+    }
+
+    /// PLATFORM-3: the canonicalization before hashing is what makes a
+    /// client's derived endpoint agree with the host's bind. A path that
+    /// names the same directory through a redundant component (`sub/..`)
+    /// must hash to the same suffix as its canonical form — the shared
+    /// endpoint identity is the workspace, not the spelling.
+    #[test]
+    fn workspace_endpoint_suffix_resolves_redundant_path_components() {
+        let workspace = std::env::temp_dir().join(format!(
+            "p3-suffix-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(workspace.join("sub")).unwrap();
+        let through_dotdot = workspace.join("sub").join("..");
+        assert_eq!(
+            workspace_endpoint_suffix(&workspace),
+            workspace_endpoint_suffix(&through_dotdot),
+            "the same workspace must derive the same endpoint however it is spelled"
+        );
+        std::fs::remove_dir_all(workspace).unwrap();
     }
 
     #[cfg(unix)]

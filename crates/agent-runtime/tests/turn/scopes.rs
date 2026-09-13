@@ -8,7 +8,7 @@ use std::{
 
 use agent_contracts::{
     AgentError, AgentResult, AttentionState, CompletionProposal, ContextAction, ContextDiagnostics,
-    ContextEngine, ContextIngress, ContextItemId, ContextItemSummary, ContextKind,
+    ContextEngine, ContextGcReport, ContextIngress, ContextItemId, ContextItemSummary, ContextKind,
     ContextMaintenanceReport, ContextMaintenanceTrigger, ContextQuery, ContextScope,
     ContextStateTransition, EventJournal, MaterializedContext, ModelCapabilities, ModelOutput,
     ModelRequest, ModelRole, ModelTransport, RuntimeDirective, RuntimeEvent, RuntimeEventEnvelope,
@@ -1307,6 +1307,126 @@ async fn actor_routes_lease_directive_into_the_context_engine() {
             && directive_index < second_materialize,
         "a ContextAction must be effective before the next model round, got: {activity:?}"
     );
+}
+
+/// EXEC-7 (R2-08) red/green: the explicit collect's full pass runs as a
+/// spawned boundary operation. While it stalls on a gated engine, the
+/// actor's command branch stays free (status answers), and after the gate
+/// releases the pass lands and the deferred model decision round assembles.
+#[derive(Debug)]
+struct GatedGcContext {
+    gc_gate: tokio::sync::Semaphore,
+    gc_started: std::sync::atomic::AtomicBool,
+    gc_count: std::sync::atomic::AtomicUsize,
+}
+
+impl GatedGcContext {
+    fn new() -> Self {
+        Self {
+            gc_gate: tokio::sync::Semaphore::new(0),
+            gc_started: std::sync::atomic::AtomicBool::new(false),
+            gc_count: std::sync::atomic::AtomicUsize::new(0),
+        }
+    }
+}
+
+#[async_trait::async_trait]
+impl ContextEngine for GatedGcContext {
+    async fn ingest(&self, _ingress: ContextIngress) -> AgentResult<()> {
+        Ok(())
+    }
+    async fn maintain(
+        &self,
+        _trigger: ContextMaintenanceTrigger,
+    ) -> AgentResult<ContextMaintenanceReport> {
+        Ok(ContextMaintenanceReport::default())
+    }
+    async fn materialize(&self, _query: ContextQuery) -> AgentResult<MaterializedContext> {
+        Ok(MaterializedContext::default())
+    }
+    async fn open_scope(&self, _kind: ScopeKind, _parent: Option<ScopeId>) -> AgentResult<ScopeId> {
+        Ok(ScopeId::new())
+    }
+    async fn close_scope(&self, _scope_id: ScopeId) -> AgentResult<Vec<ContextStateTransition>> {
+        Ok(Vec::new())
+    }
+    async fn diagnostics(&self) -> AgentResult<ContextDiagnostics> {
+        Ok(ContextDiagnostics::default())
+    }
+    async fn inspect(&self, _limit: usize) -> AgentResult<Vec<ContextItemSummary>> {
+        Ok(Vec::new())
+    }
+    async fn checkpoint(&self) -> AgentResult<serde_json::Value> {
+        Ok(serde_json::Value::Null)
+    }
+    async fn restore(&self, _data: serde_json::Value) -> AgentResult<()> {
+        Ok(())
+    }
+    async fn gc(&self) -> AgentResult<ContextGcReport> {
+        self.gc_started
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        self.gc_count
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let _permit = self.gc_gate.acquire().await;
+        Ok(ContextGcReport::default())
+    }
+}
+
+#[tokio::test]
+async fn explicit_collect_stall_keeps_the_command_branch_free_and_defers_the_round() {
+    let context = Arc::new(GatedGcContext::new());
+    let handle = spawn_with(
+        Arc::new(DirectiveModel {
+            tool_name: "context.collect",
+            rounds: AtomicUsize::new(0),
+        }),
+        context.clone(),
+        Arc::new(DirectiveToolDispatcher),
+    )
+    .await;
+    let mut events = handle.subscribe();
+    handle.user_message("collect now".into()).await.unwrap();
+
+    // The deferred collect parks on the gate.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    while !context.gc_started.load(std::sync::atomic::Ordering::SeqCst) {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the collect must reach its GC pass"
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+
+    // The stalled pass does not own the actor: status still answers.
+    let status = tokio::time::timeout(Duration::from_secs(2), handle.status_snapshot())
+        .await
+        .expect("status must answer while the explicit collect is stalled")
+        .unwrap();
+    assert!(!status.tasks.is_empty() || status.focus_goal.is_empty());
+
+    // Release: the pass lands, its audit event publishes, and the deferred
+    // model decision round assembles.
+    context.gc_gate.add_permits(1);
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
+    let (mut saw_gc, mut saw_turn_completed) = (false, false);
+    loop {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the collect and the deferred round must land after the gate releases"
+        );
+        if let Ok(envelope) = events.try_recv() {
+            match envelope.event {
+                RuntimeEvent::ContextGc { .. } => saw_gc = true,
+                RuntimeEvent::TurnCompleted => saw_turn_completed = true,
+                _ => {}
+            }
+        }
+        if saw_gc && saw_turn_completed {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    handle.cancel_turn().await.unwrap();
 }
 
 #[tokio::test]

@@ -13,7 +13,35 @@ impl RuntimeActor {
         checkpoint: RuntimeCheckpoint,
     ) -> AgentResult<u64> {
         self.ensure_no_active_turn()?;
+        // EXEC-10 (R3-09): a parked commit transaction (an explicit
+        // completion's terminal freeze waiting on its checkpoint maintenance,
+        // or a safe-point prepare carrying frozen debt) is isolated from
+        // restore by REFUSAL: installing restored planes under it would let
+        // the old TaskTxn/prepared Context commit or roll back over a state
+        // they never saw. The refusal is deterministic and typed; the
+        // completion settles (or its caller retries) before any restore is
+        // accepted.
+        if self.state.checkpoint_prepare.is_some()
+            || self
+                .state
+                .gc_work
+                .as_ref()
+                .is_some_and(|pending| pending.is_commit_in_flight())
+        {
+            return Err(AgentError::InvalidRequest(
+                "a completion / checkpoint commit is settling; restore is refused until it \
+                 settles so the old transaction cannot touch the restored state"
+                    .into(),
+            ));
+        }
         checkpoint.validate()?;
+        // EXEC-6 (R2-02): the decoded, validated checkpoint is at hand — take
+        // its typed sealed references now. Finalization never re-reads or
+        // scans any payload. A new restore also resets the previous run's
+        // degradation facts; they are re-derived from this restore's
+        // admission outcome, never accumulated across restores.
+        let protected_runs = protected_runs_from_checkpoint(&checkpoint);
+        self.state.restore_evidence_degraded = Vec::new();
         // CorePort is private to this single actor. No other component can
         // advance the authority epoch between this prefix proof and the CAS
         // below. A late tool may append operation truth in between, which is
@@ -130,6 +158,7 @@ impl RuntimeActor {
             },
             rebased_tasks,
             rebased_task_sample,
+            protected_runs,
         });
         Ok(restore_id)
     }
@@ -187,6 +216,20 @@ impl RuntimeActor {
                 pending.restore_id
             )));
         }
+        let restored_run_id = pending.restored_run_id;
+        // EXEC-6 (R2-02): taken from the pending borrow up front; the pending
+        // slot itself is consumed below once the restore commits.
+        let protected_runs = pending.protected_runs.clone();
+        // EXEC-8 (R2-09): the restored run's durable journal partition stays
+        // reachable for cold completion lookups. Bounded: a long restore
+        // chain keeps the most recent ancestors.
+        if !self.state.journal_runs.contains(&restored_run_id) {
+            const MAX_JOURNAL_RUNS: usize = 64;
+            if self.state.journal_runs.len() >= MAX_JOURNAL_RUNS {
+                self.state.journal_runs.remove(0);
+            }
+            self.state.journal_runs.push(restored_run_id);
+        }
         let restored_event = RuntimeEvent::RuntimeRestored {
             checkpoint_version: pending.checkpoint_version,
             restored_run_id: pending.restored_run_id,
@@ -222,6 +265,10 @@ impl RuntimeActor {
                 // restore to that older checkpoint may still fetch them.
                 // A failure is surfaced as an observable warning, never used
                 // to roll the committed restore back.
+                // EXEC-6 (R2-02): storage protection (context recovery
+                // roots over every retained checkpoint) and read
+                // authorization (the restored checkpoint's own typed
+                // references) are different sets from different evidence.
                 let (recovery_roots, roots_complete) =
                     self.collect_checkpoint_recovery_roots().await;
                 if let Err(error) = self
@@ -235,6 +282,69 @@ impl RuntimeActor {
                             message: format!("store reconcile after restore failed: {error}"),
                         })
                         .await;
+                }
+
+                // CORE-3: the restored task keeps reading the sealed
+                // snapshots it captured before the restart. Model-visible
+                // references (spill cursors, artifact.read pointers) name
+                // the predecessor run, so admit it — and the lineage it
+                // itself restored from — into this run's artifact lineage.
+                // Admission failure is a visible warning: reads keep
+                // failing closed, never open.
+                if let Some(workspace) = self.services.artifact_workspace() {
+                    let current_run = self.core.run_id();
+                    match workspace
+                        .admit_artifact_run_lineage(current_run, restored_run_id, &protected_runs)
+                        .await
+                    {
+                        Ok(admission) => {
+                            if !admission.unadmitted.is_empty() {
+                                // Typed degradation: the restore succeeded,
+                                // but the bounded lineage could not carry
+                                // every protected reference. The named
+                                // runs' sealed reads keep failing closed.
+                                let unadmitted_runs = admission
+                                    .unadmitted
+                                    .iter()
+                                    .map(RunId::to_string)
+                                    .collect::<Vec<_>>();
+                                // EXEC-6: the degradation is a queryable
+                                // fact, not only a fire-once event — the
+                                // typed status snapshot re-serves it until
+                                // the next restore recomputes it.
+                                self.state.restore_evidence_degraded = unadmitted_runs.clone();
+                                let _ = self
+                                    .core
+                                    .emit_event(RuntimeEvent::RestoreEvidenceDegraded {
+                                        unadmitted_runs,
+                                    })
+                                    .await;
+                            }
+                        }
+                        Err(error) => {
+                            // The whole admission failed: every protected
+                            // reference is unreadable, stated as facts.
+                            let unadmitted_runs = protected_runs
+                                .iter()
+                                .map(RunId::to_string)
+                                .collect::<Vec<_>>();
+                            self.state.restore_evidence_degraded = unadmitted_runs.clone();
+                            let _ = self
+                                .core
+                                .emit_event(RuntimeEvent::RestoreEvidenceDegraded {
+                                    unadmitted_runs,
+                                })
+                                .await;
+                            let _ = self
+                                .core
+                                .emit_event(RuntimeEvent::Warning {
+                                    message: format!(
+                                        "artifact run-lineage admission failed: {error}"
+                                    ),
+                                })
+                                .await;
+                        }
+                    }
                 }
                 Ok(())
             }
@@ -262,36 +372,17 @@ impl RuntimeActor {
     /// failure as "nothing is retained". Absent a checkpoint store the
     /// empty complete set is returned (a missing store dir reconciles as
     /// empty, and there is nothing to protect).
+    ///
+    /// EXEC-6 (R2-02): this collector is the STORAGE protection set only.
+    /// Which ancestor runs the restored state may READ is a different,
+    /// strictly smaller question, answered by `protected_runs_from_checkpoint`
+    /// over the restored checkpoint itself — never by an unrelated retained
+    /// checkpoint, and never by raw payload text.
     pub(super) async fn collect_checkpoint_recovery_roots(&self) -> (Vec<ContextItemId>, bool) {
-        let Some(store) = self.checkpoint_store() else {
-            return (Vec::new(), true);
-        };
-        let Ok(listed) = store.list(MAX_CHECKPOINT_LIST_ROWS).await else {
-            return (Vec::new(), false);
-        };
-        let mut complete = listed.len() < MAX_CHECKPOINT_LIST_ROWS;
-        let mut roots: std::collections::HashSet<ContextItemId> = std::collections::HashSet::new();
-        for row in listed {
-            let payload = match store.load_verified(&row.artifact).await {
-                Ok(payload) => payload,
-                Err(_) => {
-                    complete = false;
-                    continue;
-                }
-            };
-            let checkpoint = match crate::checkpoint::decode_checkpoint_bytes(&payload) {
-                Ok(checkpoint) => checkpoint,
-                Err(_) => {
-                    complete = false;
-                    continue;
-                }
-            };
-            roots.extend(
-                self.services
-                    .context_checkpoint_recovery_item_ids(&checkpoint.context),
-            );
-        }
-        (roots.into_iter().collect(), complete)
+        // EXEC-9 (R3-01): the one shared enumeration (see the free function
+        // in `maintenance.rs`) — the actor-side wrapper exists so restore
+        // and the spawned boundary can never drift apart again.
+        super::maintenance::collect_checkpoint_recovery_roots_for(&self.services).await
     }
 
     /// Reconcile the ACK debts restored with the checkpoint against the
@@ -340,5 +431,253 @@ impl RuntimeActor {
         } else {
             self.state.unresolved_ack_debts = unresolved;
         }
+    }
+}
+
+/// EXEC-6 (R2-02): the predecessor runs the restored checkpoint's own typed
+/// fields still name through canonical SEALED artifact locators — the
+/// restored state's live sealed references (EXEC-3's protection, on honest
+/// evidence). Extraction never touches raw payload bytes: it reads only
+/// runtime-written locator fields (completion records, final-output refs,
+/// directive body refs) of an already decoded and validated checkpoint, so
+/// a string that merely appears in user/tool prose — in the context payload
+/// or anywhere else — is not a captured reference and grants nothing.
+/// Parsing is total (`ArtifactLocator::parse_sealed`): a value that does not
+/// parse is skipped, never guessed, and no byte shape can panic extraction.
+/// The set is deduplicated and capped; overflow keeps the earliest entrants,
+/// mirroring the bounded lineage it feeds.
+fn protected_runs_from_checkpoint(checkpoint: &RuntimeCheckpoint) -> Vec<RunId> {
+    let mut runs: Vec<RunId> = Vec::new();
+    fn consider(value: Option<&str>, runs: &mut Vec<RunId>) {
+        const MAX_PROTECTED_RUNS: usize = 64;
+        if runs.len() >= MAX_PROTECTED_RUNS {
+            return;
+        }
+        let Some(value) = value else {
+            return;
+        };
+        let Ok(locator) = agent_contracts::ArtifactLocator::parse_sealed(value) else {
+            return;
+        };
+        let run = locator.run_id();
+        if !runs.contains(&run) {
+            runs.push(run);
+        }
+    }
+    for task in &checkpoint.tasks.tasks {
+        if let Some(directive) = &task.current_directive {
+            consider(directive.input.body_ref.as_deref(), &mut runs);
+        }
+    }
+    for record in &checkpoint.tasks.completed {
+        consider(record.final_output_ref.as_deref(), &mut runs);
+        for artifact in &record.artifacts {
+            consider(Some(artifact.as_str()), &mut runs);
+        }
+    }
+    runs
+}
+
+#[cfg(test)]
+mod exec6_extraction_tests {
+    use super::*;
+
+    fn sealed_locator(run: RunId, owner: &str) -> String {
+        format!(
+            "artifact://v1/{run}/{owner}/{}",
+            agent_contracts::ContentDigest::sha256_bytes(owner.as_bytes())
+        )
+    }
+
+    fn empty_checkpoint() -> RuntimeCheckpoint {
+        crate::checkpoint::RuntimeCheckpoint {
+            version: crate::checkpoint::RUNTIME_CHECKPOINT_VERSION,
+            run_metadata: crate::checkpoint::RunMetadata {
+                run_id: RunId::new(),
+                created_at_ms: 1,
+                provider_profile_digest: String::new(),
+            },
+            tasks: crate::checkpoint::TaskManagerSnapshot {
+                tasks: Vec::new(),
+                active: None,
+                completed: Vec::new(),
+            },
+            current_task_id: None,
+            focus_revision: 0,
+            last_surface_revision: 0,
+            context: serde_json::json!({}),
+            capabilities: Vec::new(),
+            authority: None,
+            snapshot_sequence: 1,
+            capability_generation: 0,
+            unresolved_ack_debts: Vec::new(),
+            event_cover_seq: 0,
+            terminal_commit: false,
+        }
+    }
+
+    fn envelope_template() -> agent_contracts::RuntimeInputEnvelope {
+        agent_contracts::RuntimeInputEnvelope {
+            preview: String::new(),
+            input_id: None,
+            task_id: None,
+            turn_id: None,
+            causal_parent: None,
+            source: Default::default(),
+            authority: Default::default(),
+            kind: Default::default(),
+            lifecycle: Default::default(),
+            body_ref: None,
+            digest: None,
+            bytes: 0,
+            proposal: Default::default(),
+        }
+    }
+
+    fn completion_record(run: RunId, owner: &str) -> crate::task::CompletionRecord {
+        crate::task::CompletionRecord {
+            task_id: TaskId::new(),
+            anchor_revision: 0,
+            summary: "done".into(),
+            completed_at_ms: 1,
+            final_output_ref: None,
+            final_output_digest: None,
+            artifacts: vec![sealed_locator(run, owner)],
+            verification_status: Default::default(),
+            verification_refs: Vec::new(),
+            disposition: Default::default(),
+            unmet_reasons: Vec::new(),
+        }
+    }
+
+    /// EXEC-6 (R2-02): the run ids a restored checkpoint still references
+    /// through canonical SEALED locators in its runtime-written fields are
+    /// exactly the protected set. Needle-form pseudo references (the raw
+    /// scan's only evidence) protect nothing, and duplicates collapse.
+    #[test]
+    fn typed_sealed_locators_in_runtime_fields_are_the_protection_evidence() {
+        let artifact_run = RunId::new();
+        let output_run = RunId::new();
+        let directive_run = RunId::new();
+        let mut checkpoint = empty_checkpoint();
+
+        checkpoint
+            .tasks
+            .completed
+            .push(completion_record(artifact_run, "grep"));
+        let mut final_record = completion_record(output_run, "assistant-response");
+        final_record.artifacts.clear();
+        final_record.final_output_ref = Some(sealed_locator(output_run, "assistant-response"));
+        checkpoint.tasks.completed.push(final_record);
+        // Dedup: naming the same run twice keeps one entry.
+        checkpoint.tasks.completed[0]
+            .artifacts
+            .push(sealed_locator(artifact_run, "other-owner"));
+
+        let directive_input = agent_contracts::RuntimeInputEnvelope {
+            preview: "continue".into(),
+            body_ref: Some(sealed_locator(directive_run, "user-input")),
+            bytes: 8,
+            ..envelope_template()
+        };
+        checkpoint
+            .tasks
+            .tasks
+            .push(crate::checkpoint::TaskRecordSnapshot {
+                id: TaskId::new(),
+                goal: "g".into(),
+                status: crate::task::TaskStatus::Active,
+                created_at_ms: 0,
+                last_active_ms: 0,
+                tool_requirements: Default::default(),
+                anchor: Default::default(),
+                resume: Default::default(),
+                turn_intent: String::new(),
+                current_directive: Some(crate::TaskDirective {
+                    input: directive_input,
+                    inline_body: None,
+                }),
+            });
+
+        let runs = protected_runs_from_checkpoint(&checkpoint);
+        assert_eq!(
+            runs.len(),
+            3,
+            "one protected entry per referenced run: {runs:?}"
+        );
+        assert!(runs.contains(&artifact_run));
+        assert!(runs.contains(&output_run));
+        assert!(runs.contains(&directive_run));
+    }
+
+    /// EXEC-6 (R2-02): strings that merely appear in payloads — prose in the
+    /// opaque context blob, needle-form pseudo locators, draft locators,
+    /// malformed ids — are not captured references and protect nothing. A
+    /// multi-byte character anywhere can no longer panic extraction: the
+    /// extractor never slices raw bytes.
+    #[test]
+    fn pseudo_references_and_malformed_unicode_protect_nothing() {
+        let real_run = RunId::new();
+        let mut checkpoint = empty_checkpoint();
+
+        // The context payload is opaque engine state: even a canonical
+        // locator inside it is prose, not a typed captured reference.
+        checkpoint.context = serde_json::json!({
+            "records": [{
+                "body": format!("see artifact://v1/{real_run}/grep/{} and more", "b".repeat(64)),
+                "tail": "artifact://run/汉汉汉",
+            }]
+        });
+        // Needle-form pseudo refs (what the raw scan matched) in runtime
+        // fields protect nothing: no digest, wrong shape, unparseable.
+        let mut record = completion_record(real_run, "grep");
+        record.artifacts = vec![
+            format!("artifact://run/{real_run}/proof/aa"),
+            "artifact://run/not-a-uuid".into(),
+            "".to_string(),
+        ];
+        checkpoint.tasks.completed.push(record);
+
+        let runs = protected_runs_from_checkpoint(&checkpoint);
+        assert!(
+            runs.is_empty(),
+            "pseudo references must never widen the restored read set: {runs:?}"
+        );
+
+        // The exact R2-02 payload — needle + 35 ASCII + a multi-byte char —
+        // rides along in an adjacent runtime field without panicking
+        // anything, while the well-formed locator in its own entry still
+        // parses and protects.
+        let nasty = format!("{}{}", "a".repeat(35), "\u{6c49}");
+        checkpoint.tasks.completed[0]
+            .artifacts
+            .push(format!("annotated artifact://run/{nasty} tail"));
+        checkpoint.tasks.completed[0]
+            .artifacts
+            .push(sealed_locator(real_run, "grep"));
+        let runs = protected_runs_from_checkpoint(&checkpoint);
+        assert_eq!(runs, vec![real_run]);
+    }
+
+    /// EXEC-6 (R2-02): the protection set stays bounded — extraction keeps
+    /// the earliest entrants past the cap instead of growing with the
+    /// checkpoint.
+    #[test]
+    fn the_protection_set_is_bounded() {
+        let mut checkpoint = empty_checkpoint();
+        let mut expected = Vec::new();
+        for index in 0..70 {
+            let run = RunId::new();
+            if expected.len() < 64 {
+                expected.push(run);
+            }
+            checkpoint
+                .tasks
+                .completed
+                .push(completion_record(run, &format!("owner-{index}")));
+        }
+        let runs = protected_runs_from_checkpoint(&checkpoint);
+        assert_eq!(runs.len(), 64);
+        assert_eq!(runs, expected);
     }
 }

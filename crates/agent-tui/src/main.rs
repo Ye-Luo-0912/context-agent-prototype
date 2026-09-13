@@ -10,7 +10,7 @@ use std::{io, sync::Arc};
 
 use agent_compose::{
     ComposeConfig, ContextPolicy, HostToolPolicyRegistry, build_context_engine, compose,
-    try_model_from_env,
+    maintenance_budget_from_env, try_maintenance_transport_from_env, try_model_from_env,
 };
 use agent_core::{ApprovalBroker, InteractiveApprovalGate, PolicyApprovalGate, TaskApprovalGate};
 use agent_storage::FileEventJournal;
@@ -107,8 +107,15 @@ async fn real_main() -> anyhow::Result<()> {
     // against any `ContextEngine` implementation (the A/B/C baselines, and
     // the process-boundary adapter). Rolling/dynamic 与 live eval 共用同一
     // 有界压缩器，避免 TUI 仍走占位折叠。
-    let context_engine =
-        build_context_engine(policy, workspace.state_dir(), Some(model.clone())).await?;
+    let maintenance_budget = maintenance_budget_from_env()?;
+    let context_engine = build_context_engine(
+        policy,
+        workspace.state_dir(),
+        Some(model.clone()),
+        try_maintenance_transport_from_env()?,
+        &maintenance_budget,
+    )
+    .await?;
     // 授权映射是组合根的决定：一份内置注册表同时交给审批门、能力
     // 分发器与内核租约路径。
     let verification_recipes = Arc::new(VerificationRecipes::discover(&workspace)?);

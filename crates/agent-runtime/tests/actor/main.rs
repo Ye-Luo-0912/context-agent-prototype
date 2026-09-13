@@ -9,6 +9,7 @@ mod context_commit;
 mod focus;
 mod harness;
 mod input;
+mod materialize_cancel;
 mod protocol_bodies;
 mod restore;
 mod surface;

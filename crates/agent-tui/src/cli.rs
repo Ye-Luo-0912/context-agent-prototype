@@ -620,7 +620,8 @@ mod tests {
 
     use agent_compose::{
         ComposeConfig, ContextPolicy, HostToolPolicyRegistry, MockModelTransport,
-        build_context_engine, compose,
+        build_context_engine, compose, maintenance_budget_from_env,
+        try_maintenance_transport_from_env,
     };
     use agent_contracts::{
         AgentResult, ModelCapabilities, ModelOutput, ModelRequest, ModelTransport, ToolCall,
@@ -659,6 +660,8 @@ mod tests {
             ContextPolicy::Dynamic,
             workspace.state_dir(),
             Some(model.clone()),
+            try_maintenance_transport_from_env()?,
+            &maintenance_budget_from_env()?,
         )
         .await?;
         let base_tools = Arc::new(BuiltinToolDispatcher::with_config_and_verification_recipes(

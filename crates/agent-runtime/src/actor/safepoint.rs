@@ -25,6 +25,20 @@ use crate::checkpoint::{CheckpointDebtReason, CheckpointStore, StoredCheckpoint}
 /// live debt at freeze time). That frozen set is the ONLY thing this
 /// acknowledgement may retire; a failed or errored write hands it back
 /// to the live debt set.
+/// EXEC-7 (R2-08): a safe-point checkpoint whose Checkpoint-trigger
+/// maintenance runs as a spawned prepare task. The frozen debt and the
+/// allocated sequence live here until a barrier or the settled-batch pump
+/// lands the prepare (maintenance report applied, planes captured,
+/// validated, serialized) and hands the bytes to the in-flight write —
+/// preserving the synchronous durability protocol's observable state while
+/// the actor's command branch stays free during a slow engine.
+pub(super) struct PendingCheckpointPrepare {
+    pub(super) handle: tokio::task::JoinHandle<AgentResult<ContextMaintenanceReport>>,
+    pub(super) sequence: u64,
+    pub(super) anchor_revision: u64,
+    pub(super) captured_debt: Vec<CheckpointDebtReason>,
+}
+
 pub(super) struct InFlightCheckpoint {
     handle: tokio::task::JoinHandle<AgentResult<(u64, StoredCheckpoint)>>,
     /// The active task's anchor revision at freeze time, surfaced on the
@@ -45,7 +59,7 @@ impl RuntimeActor {
     /// The active task's anchor revision, or zero when no task is active.
     /// Observability only: durability ordering follows the snapshot
     /// sequence, never this value.
-    fn current_anchor_revision(&self) -> u64 {
+    pub(super) fn current_anchor_revision(&self) -> u64 {
         self.state
             .task_id
             .and_then(|task_id| self.state.tasks.get(task_id))
@@ -67,7 +81,7 @@ impl RuntimeActor {
     /// Hand a failed write's frozen debt back to the live set, merging
     /// without duplicates so a re-accrued reason stays a single entry.
     /// Failure must keep every reason visible and retryable.
-    fn restore_checkpoint_debt(&mut self, reasons: &[CheckpointDebtReason]) {
+    pub(super) fn restore_checkpoint_debt(&mut self, reasons: &[CheckpointDebtReason]) {
         for reason in reasons {
             if !self.state.checkpoint_debt.contains(reason) {
                 self.state.checkpoint_debt.push(*reason);
@@ -84,25 +98,15 @@ impl RuntimeActor {
     /// A terminal override freezes the prospective post-completion task
     /// plane together with the already-prepared post-completion context
     /// plane and its next focus revision.
-    async fn assemble_checkpoint(
+    pub(super) async fn assemble_checkpoint(
         &self,
         terminal_override: Option<(crate::checkpoint::TaskManagerSnapshot, u64)>,
     ) -> AgentResult<RuntimeCheckpoint> {
-        // The runtime owns the Checkpoint maintenance schedule: run it
-        // once per assembly, outside the generation-stability retry loop,
-        // so a retry never repeats logical maintenance. A fenced Core
-        // still receives a pure snapshot with no maintenance claim.
-        if !matches!(
-            self.core.recovery_status(),
-            agent_contracts::AuthorityRecoveryStatus::RecoveryRequired { .. }
-        ) {
-            let report = self
-                .services
-                .context_maintain(ContextMaintenanceTrigger::Checkpoint)
-                .await?;
-            self.emit_context_maintained(ContextMaintenanceTrigger::Checkpoint, report)
-                .await?;
-        }
+        // EXEC-7 (R2-08): the Checkpoint-trigger maintenance no longer runs
+        // inside the assembly — it is the spawned prepare task, landed (and
+        // its report applied) before any caller assembles. A fenced Core
+        // receives a pure snapshot with no maintenance claim (the fence is
+        // evaluated when the prepare is scheduled).
         let registry = self.services.capability_registry();
         let mut last_error: Option<AgentError> = None;
         for _ in 0..3 {
@@ -166,6 +170,9 @@ impl RuntimeActor {
         }))
     }
 
+    /// EXEC-7: the maintenance-free capture — the Checkpoint-trigger
+    /// maintenance runs as the spawned prepare (or is skipped under a
+    /// Core fence) before any caller assembles.
     pub(super) async fn capture_checkpoint(&self) -> AgentResult<RuntimeCheckpoint> {
         self.assemble_checkpoint(None).await
     }
@@ -176,7 +183,7 @@ impl RuntimeActor {
             .map(|workspace| CheckpointStore::new(workspace.state_dir().join("checkpoints")))
     }
 
-    fn checkpoint_store_missing_error() -> AgentError {
+    pub(super) fn checkpoint_store_missing_error() -> AgentError {
         AgentError::InvalidRequest("no checkpoint store configured".into())
     }
 
@@ -189,6 +196,34 @@ impl RuntimeActor {
     /// failure restores the frozen set to the live debt and surfaces an
     /// error so barrier callers fail closed.
     async fn take_settled_checkpoint_write(&mut self) -> AgentResult<()> {
+        // EXEC-7: a finished prepare lands first so the write starts even
+        // without an explicit barrier caller.
+        if self
+            .state
+            .checkpoint_prepare
+            .as_ref()
+            .is_some_and(|prepare| prepare.handle.is_finished())
+            && let Some(prepare) = self.state.checkpoint_prepare.take()
+        {
+            let report = match prepare.handle.await {
+                Ok(report) => report,
+                Err(join_error) => {
+                    self.restore_checkpoint_debt(&prepare.captured_debt);
+                    let error = AgentError::InvalidRequest(format!(
+                        "checkpoint prepare task failed: {join_error}"
+                    ));
+                    self.emit_checkpoint_write_failed(error.to_string()).await;
+                    return Err(error);
+                }
+            };
+            self.land_safepoint_write(
+                prepare.sequence,
+                prepare.anchor_revision,
+                prepare.captured_debt,
+                Some(report),
+            )
+            .await;
+        }
         let finished = matches!(
             self.state.checkpoint_write.as_ref(),
             Some(in_flight) if in_flight.is_finished()
@@ -241,7 +276,7 @@ impl RuntimeActor {
         }
     }
 
-    async fn emit_checkpoint_write_failed(&mut self, detail: String) {
+    pub(super) async fn emit_checkpoint_write_failed(&mut self, detail: String) {
         self.state.checkpoint_write_failed = true;
         let _ = self
             .core
@@ -262,7 +297,10 @@ impl RuntimeActor {
     /// instead of letting the first acknowledgement silently absorb it.
     pub(super) async fn safe_point_resume_commit(&mut self) {
         let _ = self.take_settled_checkpoint_write().await;
-        if self.state.checkpoint_debt.is_empty() || self.state.checkpoint_write.is_some() {
+        if self.state.checkpoint_debt.is_empty()
+            || self.state.checkpoint_write.is_some()
+            || self.state.checkpoint_prepare.is_some()
+        {
             return;
         }
         let Some(task_id) = self.state.tasks.active() else {
@@ -330,12 +368,66 @@ impl RuntimeActor {
     /// permanently; every failure path here hands the set back to the
     /// live debt, keeping everything visible and retryable, including an
     /// impossible-by-configuration store.
+    ///
+    /// EXEC-7 (R2-08): the Checkpoint-trigger maintenance runs as a spawned
+    /// PREPARE task, not on the actor's command branch. The synchronous
+    /// durability protocol is preserved by ownership, not by blocking: the
+    /// frozen debt and the sequence live in `checkpoint_prepare`, and every
+    /// barrier (`await_pending_checkpoint`) — plus the settled-batch pump —
+    /// lands the prepare before anything may claim the safe point settled.
     async fn schedule_checkpoint_write(
         &mut self,
         sequence: u64,
         anchor_revision: u64,
         captured_debt: Vec<CheckpointDebtReason>,
     ) {
+        let fenced = matches!(
+            self.core.recovery_status(),
+            agent_contracts::AuthorityRecoveryStatus::RecoveryRequired { .. }
+        );
+        if fenced {
+            // A fenced Core receives a pure snapshot with no maintenance
+            // claim — inline, byte-for-byte the no-maintenance behavior.
+            self.land_safepoint_write(sequence, anchor_revision, captured_debt, None)
+                .await;
+            return;
+        }
+        let context = self.services.context_engine();
+        let handle = tokio::spawn(async move {
+            context
+                .maintain(ContextMaintenanceTrigger::Checkpoint)
+                .await
+        });
+        self.state.checkpoint_prepare = Some(PendingCheckpointPrepare {
+            handle,
+            sequence,
+            anchor_revision,
+            captured_debt,
+        });
+    }
+
+    /// EXEC-7: land a safe-point prepare — apply the maintenance report (or
+    /// the fenced no-report), capture the planes maintenance-free, validate,
+    /// serialize and hand the bytes to the in-flight write. Every failure
+    /// path hands the frozen debt back to the live set; a failed assembly
+    /// never propagates past the safe point (matching the inline behavior it
+    /// replaces: CheckpointWriteFailed plus the continuation fence).
+    pub(super) async fn land_safepoint_write(
+        &mut self,
+        sequence: u64,
+        anchor_revision: u64,
+        captured_debt: Vec<CheckpointDebtReason>,
+        report: Option<AgentResult<ContextMaintenanceReport>>,
+    ) {
+        if let Some(Ok(maintain_report)) = report
+            && let Err(error) = self
+                .emit_context_maintained(ContextMaintenanceTrigger::Checkpoint, maintain_report)
+                .await
+        {
+            self.restore_checkpoint_debt(&captured_debt);
+            self.emit_checkpoint_write_failed(error.to_string()).await;
+            return;
+        }
         let capture = self.capture_checkpoint().await;
         let snapshot = match capture {
             Ok(snapshot) => {
@@ -394,6 +486,117 @@ impl RuntimeActor {
         });
     }
 
+    /// EXEC-7: the turn-commit path's non-blocking turn-end barrier. A
+    /// parked safe-point prepare is NOT awaited here (that would block the
+    /// actor's command branch on the engine): a relay task carries the
+    /// maintenance report home through the operation lane, the turn's
+    /// remaining commit tail parks behind it as
+    /// `GcContinuation::SafepointCommit`, and the resume lands the prepare
+    /// (with its own frozen debt bookkeeping) before running the tail —
+    /// preserving the resume-before-TurnCompleted durable ordering without
+    /// giving up the command branch. Returns true when the tail was parked.
+    pub(super) async fn relay_parked_checkpoint_prepare(
+        &mut self,
+        content: String,
+        op_tx: &mpsc::Sender<OperationCompletion>,
+    ) -> bool {
+        let Some(mut prepare) = self.state.checkpoint_prepare.take() else {
+            return false;
+        };
+        let operation_id = OperationId::new();
+        let generation = self.state.generation;
+        let run_id = self.core.run_id();
+        let task_id = self.state.task_id;
+        let scope_id = self.state.scope_id;
+        let turn_id = self.state.turn.as_ref().map(|turn| turn.turn_id);
+        let cancel = CancellationToken::new();
+        if let Some(turn) = self.state.turn.as_mut() {
+            turn.op = Some(InFlightOp {
+                operation_id,
+                turn_id: turn.turn_id,
+                generation,
+                kind: OpKind::Gc,
+                scope_id: None,
+                tool_identity: None,
+                cancel: cancel.clone(),
+                // The relay is cheap and must not be killed: aborting it
+                // would orphan the parked report. Cancellation drops the
+                // parked tail instead (see `cancel_pending_gc_work`).
+                abort: None,
+            });
+        }
+        let maintain_handle = prepare.handle;
+        // The report fans out to two consumers: the completion relay (which
+        // resumes the parked turn-commit tail) and the parked prepare's own
+        // handle (which blocking barriers land through).
+        let (report_tx, report_rx) = tokio::sync::oneshot::channel();
+        let relay_op_tx = op_tx.clone();
+        let relay = tokio::spawn(async move {
+            let report = maintain_handle.await.unwrap_or_else(|join_error| {
+                Err(AgentError::InvalidRequest(format!(
+                    "checkpoint prepare task failed: {join_error}"
+                )))
+            });
+            // AgentError is not Clone: map a transport failure to the typed
+            // storage error for the barrier copy, keep the original for the
+            // tail resume.
+            let for_barrier = match &report {
+                Ok(report) => Ok(report.clone()),
+                Err(error) => Err(AgentError::Storage(format!(
+                    "checkpoint prepare failed: {error}"
+                ))),
+            };
+            let _ = report_tx.send(for_barrier);
+            let _sent = relay_op_tx
+                .send(OperationCompletion {
+                    operation: OperationResult {
+                        run_id,
+                        turn_id: turn_id.unwrap_or_default(),
+                        task_id,
+                        scope_id,
+                        operation_id,
+                        generation,
+                        outcome: OperationOutcome::Completed,
+                    },
+                    kind: OpKind::Gc,
+                    effect: None,
+                    lease: None,
+                    effect_id: None,
+                    argument_digest: None,
+                    attribution: None,
+                    verification_call: None,
+                    tool_identity: None,
+                    value_completion_pending: false,
+                    recovery_required: None,
+                    directive: None,
+                    disposition: ToolResultDisposition::PersistObservation,
+                    context_ack: None,
+                    maintenance: None,
+                    materialization: None,
+                    gc: Some(super::maintenance::GcOutcome::SafepointPrepareSettled(
+                        report,
+                    )),
+                })
+                .await;
+        });
+        // The parked prepare's handle becomes the report relay: blocking
+        // barriers (shutdown, failure paths) still land the same report.
+        prepare.handle = tokio::spawn(async move {
+            report_rx.await.unwrap_or_else(|_| {
+                Err(AgentError::Storage(
+                    "checkpoint prepare relay dropped".into(),
+                ))
+            })
+        });
+        self.state.checkpoint_prepare = Some(prepare);
+        self.state.gc_work = Some(super::maintenance::PendingGc::new(
+            operation_id,
+            super::maintenance::GcContinuation::SafepointCommit { content },
+            relay,
+        ));
+        true
+    }
+
     /// Barrier wait: explicit pause/suspend/completion/shutdown paths call
     /// this so they never report an outcome whose resume checkpoint is
     /// still in flight. A durable ack advances the sequence watermark; the
@@ -402,6 +605,30 @@ impl RuntimeActor {
     /// reason retained and an error return, so callers refuse to claim
     /// resumability.
     pub(super) async fn await_pending_checkpoint(&mut self) -> AgentResult<()> {
+        // EXEC-7: a parked safe-point prepare lands here first — the barrier
+        // semantics are unchanged (this returns only once the write is in
+        // flight and drained, or the failure restored its debt), but the
+        // wait happens on the prepare's own handle, not on the actor loop.
+        if let Some(prepare) = self.state.checkpoint_prepare.take() {
+            let report = match prepare.handle.await {
+                Ok(report) => report,
+                Err(join_error) => {
+                    self.restore_checkpoint_debt(&prepare.captured_debt);
+                    let error = AgentError::InvalidRequest(format!(
+                        "checkpoint prepare task failed: {join_error}"
+                    ));
+                    self.emit_checkpoint_write_failed(error.to_string()).await;
+                    return Err(error);
+                }
+            };
+            self.land_safepoint_write(
+                prepare.sequence,
+                prepare.anchor_revision,
+                prepare.captured_debt,
+                Some(report),
+            )
+            .await;
+        }
         if self.state.checkpoint_write.is_none() {
             return Ok(());
         }
@@ -466,7 +693,10 @@ impl RuntimeActor {
                 )));
             }
         }
-        if !self.state.checkpoint_debt.is_empty() || self.state.checkpoint_write.is_some() {
+        if !self.state.checkpoint_debt.is_empty()
+            || self.state.checkpoint_write.is_some()
+            || self.state.checkpoint_prepare.is_some()
+        {
             return Err(AgentError::RecoveryRequired(
                 "outstanding checkpoint debt has not been captured at a settled safe point \
                  yet; continuation is fenced until the next safe point lands"
@@ -474,125 +704,5 @@ impl RuntimeActor {
             ));
         }
         Ok(())
-    }
-
-    /// Two-phase terminal completion (phase P). The prospective
-    /// post-completion task plane is frozen under a fresh sequence,
-    /// validated, written and durably acknowledged while every live value
-    /// stays untouched. Only the caller — after this returns Ok — commits
-    /// the in-memory terminal transition and emits `TaskCompleted`. A
-    /// failed write leaves the task active/completion-pending and returns
-    /// an error so it may retry from the same authorized completion intent.
-    pub(super) async fn freeze_and_acknowledge_terminal(
-        &mut self,
-        record: crate::task::CompletionRecord,
-        terminal_focus_revision: u64,
-    ) -> Result<Option<u64>, AgentError> {
-        // `Ok(Some(sequence))` = the exact terminal shape is durably
-        // acknowledged; `Ok(None)` = this composition has no checkpoint store, so
-        // there is nothing to make resumable and the caller completes
-        // in-memory behind one explicit warning. Only `Err` fences.
-        let Some(store) = self.checkpoint_store() else {
-            let _ = self
-                .core
-                .emit_event(RuntimeEvent::CheckpointWriteFailed {
-                    reason: Self::checkpoint_store_missing_error().to_string(),
-                })
-                .await;
-            return Ok(None);
-        };
-        self.await_pending_checkpoint().await?;
-        let Some(terminal_tasks) =
-            crate::task::TaskManager::prospective_terminal_snapshot(&self.state.tasks, record)
-        else {
-            return Err(AgentError::InvalidRequest(
-                "no active task to freeze into a terminal checkpoint".into(),
-            ));
-        };
-        // Allocate the terminal snapshot's identity before freezing planes.
-        self.state.snapshot_sequence = self
-            .state
-            .snapshot_sequence
-            .checked_add(1)
-            .expect("snapshot sequence cannot overflow within any realistic run");
-        let sequence = self.state.snapshot_sequence;
-        let prior_required_sequence = self.state.required_sequence;
-        self.state.required_sequence =
-            Some(self.state.required_sequence.unwrap_or(0).max(sequence));
-        // Completion resolves every obligation by definition: whatever
-        // debt survived to this point is retired with the terminal freeze,
-        // not deferred.
-        let prior_debt = std::mem::take(&mut self.state.checkpoint_debt);
-        let anchor = self.current_anchor_revision();
-
-        let snapshot = match self
-            .assemble_checkpoint(Some((terminal_tasks, terminal_focus_revision)))
-            .await
-        {
-            Ok(snapshot) => snapshot,
-            Err(error) => {
-                self.state.checkpoint_debt = prior_debt;
-                self.state.required_sequence = prior_required_sequence;
-                self.emit_checkpoint_write_failed(error.to_string()).await;
-                return Err(error);
-            }
-        };
-        if let Err(error) = snapshot.validate() {
-            self.state.checkpoint_debt = prior_debt;
-            self.state.required_sequence = prior_required_sequence;
-            return Err(AgentError::InvalidRequest(format!(
-                "the terminal checkpoint is internally inconsistent; nothing was committed: {error}"
-            )));
-        }
-        let bytes = match serde_json::to_vec(&snapshot) {
-            Ok(bytes) => bytes,
-            Err(error) => {
-                self.state.checkpoint_debt = prior_debt;
-                self.state.required_sequence = prior_required_sequence;
-                return Err(AgentError::Internal(format!(
-                    "terminal checkpoint serialization failed: {error}"
-                )));
-            }
-        };
-        let in_flight_handle = tokio::spawn(async move {
-            store
-                .write_atomic(&bytes)
-                .await
-                .map(|stored| (sequence, stored))
-        });
-        let acked = match in_flight_handle.await {
-            Ok(result) => result,
-            Err(join_error) => Err(AgentError::InvalidRequest(format!(
-                "checkpoint write task failed: {join_error}"
-            ))),
-        };
-        match acked {
-            Ok((acked_sequence, stored)) => {
-                self.state.checkpoint_write_failed = false;
-                self.state.durable_sequence =
-                    Some(self.state.durable_sequence.unwrap_or(0).max(acked_sequence));
-                let _ = self
-                    .core
-                    .emit_event(RuntimeEvent::CheckpointDurable {
-                        bytes: stored.bytes,
-                        artifact: stored.artifact,
-                        revision: anchor,
-                        checksum: stored.checksum,
-                        sequence: acked_sequence,
-                        capability_generation: snapshot.capability_generation,
-                    })
-                    .await;
-                Ok(Some(acked_sequence))
-            }
-            Err(error) => {
-                self.state.checkpoint_debt = prior_debt;
-                self.state.required_sequence = prior_required_sequence;
-                self.emit_checkpoint_write_failed(error.to_string()).await;
-                Err(AgentError::Storage(format!(
-                    "the terminal checkpoint never landed durably ({error}); the task stays \
-                     completion-pending and the completion intent stays retryable"
-                )))
-            }
-        }
     }
 }

@@ -770,6 +770,7 @@ async fn task_complete_proposal_commits_the_typed_record_at_turn_end() {
                 task_id,
                 anchor_revision,
                 summary,
+                ..
             } = &envelope.event
             {
                 completed_event = Some((*task_id, *anchor_revision, summary.clone()));
@@ -3708,4 +3709,207 @@ async fn turn_cancellation_arms_the_deferred_verifier_token() {
     );
     assert!(checkpoint.current_task_id.is_some());
     instance.shutdown().await.unwrap();
+}
+
+// ---------------------------------------------------------------------------
+// EXEC-5 (R2-01): completions past the hot window keep the checkpoint
+// authority relation valid, the next completions commit, and a cold restore
+// of the durable artifact still accepts further completions. This walks the
+// real actor commands (SetFocus + CompleteTask with terminal commits), not a
+// TaskManager test helper.
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn completions_past_the_hot_window_keep_checkpoints_restore_and_next_completion_working() {
+    let dir = tempfile::tempdir().unwrap();
+    let workspace = Arc::new(agent_workspace::Workspace::open(dir.path()).await.unwrap());
+    let event_journal = agent_storage::FileEventJournal::open(dir.path())
+        .await
+        .unwrap();
+    let services = agent_runtime::RuntimeServices::try_new(
+        CoreAuthorityConfig::default(),
+        Arc::new(TestContextEngine),
+        Arc::new(PlainModel),
+        Arc::new(TestToolDispatcher),
+        Arc::new(PolicyApprovalGate::read_only()),
+        Some(Arc::new(event_journal)),
+        agent_runtime::AuthorityRecoveryServices::new(
+            Arc::new(
+                agent_storage::FileOperationJournal::open(
+                    dir.path().join("runtime-operations.jsonl"),
+                )
+                .unwrap()
+                .0,
+            ),
+            None,
+        ),
+    )
+    .unwrap()
+    .with_artifact_workspace(workspace);
+    let mut host = ModuleHost::new();
+    host.start().await.expect("test module host starts");
+    let instance = RuntimeInstance::spawn(host, services);
+    let handle = instance.handle();
+    instance.start().await.unwrap();
+
+    let mut task_ids = Vec::new();
+    for index in 0..66usize {
+        handle
+            .set_focus(format!("hot-window task {index}"))
+            .await
+            .unwrap();
+        task_ids.push(
+            handle
+                .status_snapshot()
+                .await
+                .unwrap()
+                .focus_task_id
+                .unwrap(),
+        );
+        handle
+            .complete_current_task(format!("done {index}"))
+            .await
+            .unwrap_or_else(|error| {
+                panic!("completion {index} must still commit past the hot window: {error}")
+            });
+        let checkpoint = instance.checkpoint().await.unwrap();
+        checkpoint.validate().unwrap_or_else(|error| {
+            panic!("the checkpoint after completion {index} must validate: {error}")
+        });
+        assert_eq!(
+            checkpoint.tasks.completed.len(),
+            checkpoint
+                .tasks
+                .tasks
+                .iter()
+                .filter(|task| task.status == agent_runtime::TaskStatus::Completed)
+                .count(),
+            "records and completed rows share one window after completion {index}"
+        );
+    }
+
+    // EXEC-8 (R2-09): a task that left the hot window stays reviewable from
+    // the durable journal; the newest completion is still hot.
+    let first = handle.task_completion(task_ids[0]).await.unwrap();
+    match first {
+        agent_runtime::work::TaskCompletionLookup::Retired {
+            summary,
+            anchor_revision,
+            final_output_digest,
+            ..
+        } => {
+            assert_eq!(summary, "done 0");
+            // The record's anchor revision rides the durable fact verbatim.
+            let _ = anchor_revision;
+            assert!(final_output_digest.is_some());
+        }
+        other => panic!("the oldest completion must be retired-but-queryable: {other:?}"),
+    }
+    let last = handle.task_completion(task_ids[65]).await.unwrap();
+    assert!(
+        matches!(last, agent_runtime::work::TaskCompletionLookup::Hot),
+        "the newest completion is still in the hot window: {last:?}"
+    );
+    let never = handle
+        .task_completion(agent_contracts::TaskId::new())
+        .await
+        .unwrap();
+    assert!(
+        matches!(never, agent_runtime::work::TaskCompletionLookup::Unknown),
+        "an id the covered window never saw is Unknown: {never:?}"
+    );
+
+    // The durable artifact of the last terminal commit decodes, validates and
+    // restores into a fresh runtime, which can keep completing tasks.
+    let final_checkpoint = instance.checkpoint().await.unwrap();
+    assert_eq!(final_checkpoint.tasks.completed.len(), 64);
+    instance.shutdown().await.unwrap();
+
+    let store_dir = dir.path().join(".focus-agent").join("checkpoints");
+    let mut candidates: Vec<_> = std::fs::read_dir(&store_dir)
+        .expect("the real terminal commits must have written checkpoints")
+        .flatten()
+        .map(|entry| entry.path())
+        .collect();
+    candidates.sort_by_key(|path| {
+        std::fs::metadata(path)
+            .and_then(|meta| meta.modified())
+            .expect("checkpoint metadata must be readable")
+    });
+    let newest = candidates
+        .last()
+        .expect("at least one durable checkpoint must exist")
+        .clone();
+    let decoded = agent_runtime::decode_checkpoint_file(&newest)
+        .expect("the durable terminal checkpoint must decode");
+    decoded
+        .validate()
+        .expect("the durable terminal checkpoint must satisfy the authority relation");
+
+    // A second runtime may only attach after the previous runtime fully
+    // released the operation-journal lock. In production the old process has
+    // exited by then; in-process, the previous actor's last detached
+    // services clones drop a tick after shutdown returns, so retry briefly.
+    let journal = {
+        let path = dir.path().join("runtime-operations.jsonl");
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            match agent_storage::FileOperationJournal::open(&path) {
+                Ok(journal) => break journal.0,
+                Err(_) if tokio::time::Instant::now() < deadline => {
+                    tokio::time::sleep(Duration::from_millis(50)).await;
+                }
+                Err(error) => panic!("the previous runtime must release the journal: {error}"),
+            }
+        }
+    };
+    let event_journal = agent_storage::FileEventJournal::open(dir.path())
+        .await
+        .unwrap();
+    let mut services = agent_runtime::RuntimeServices::try_new(
+        CoreAuthorityConfig::default(),
+        Arc::new(TestContextEngine),
+        Arc::new(PlainModel),
+        Arc::new(TestToolDispatcher),
+        Arc::new(PolicyApprovalGate::read_only()),
+        Some(Arc::new(event_journal)),
+        agent_runtime::AuthorityRecoveryServices::new(Arc::new(journal), None),
+    )
+    .unwrap();
+    let reopened = Arc::new(agent_workspace::Workspace::open(dir.path()).await.unwrap());
+    services = services.with_artifact_workspace(reopened);
+    let mut host = ModuleHost::new();
+    host.start().await.expect("fresh module host starts");
+    let fresh = RuntimeInstance::spawn(host, services);
+    fresh.start().await.unwrap();
+    fresh.restore(decoded).await.unwrap();
+    fresh
+        .handle()
+        .set_focus("after the cold restore".into())
+        .await
+        .unwrap();
+    fresh
+        .handle()
+        .complete_current_task("done after restore".into())
+        .await
+        .expect("the first completion after a cold restore must commit");
+    let after = fresh.checkpoint().await.unwrap();
+    after
+        .validate()
+        .expect("the post-restore checkpoint must still validate");
+    assert_eq!(
+        after.tasks.completed.len(),
+        64,
+        "the window stays bounded across the restore boundary"
+    );
+    // EXEC-8: the cold runtime reads the SAME retired completion from the
+    // same durable journal — the fact survives the restore boundary.
+    let retired_after_restore = fresh.handle().task_completion(task_ids[0]).await.unwrap();
+    match retired_after_restore {
+        agent_runtime::work::TaskCompletionLookup::Retired { summary, .. } => {
+            assert_eq!(summary, "done 0");
+        }
+        other => panic!("the retired fact must survive a cold restore: {other:?}"),
+    }
+    fresh.shutdown().await.unwrap();
 }

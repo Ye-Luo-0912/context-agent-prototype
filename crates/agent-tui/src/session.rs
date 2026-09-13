@@ -576,9 +576,7 @@ async fn dispatch_command(
     if let Some(restore_target) = trimmed.strip_prefix("/restore ") {
         let result = async {
             let path = resolve_restore_target(checkpoint_dir, restore_target.trim());
-            let bytes = tokio::fs::read(&path)
-                .await
-                .map_err(|error| anyhow::anyhow!("read {}: {error}", path.display()))?;
+            let bytes = read_checkpoint_bounded(&path).await?;
             let checkpoint = decode_checkpoint_bytes(&bytes)
                 .map_err(|error| anyhow::anyhow!("{}: {error}", path.display()))?;
             runtime
@@ -777,6 +775,30 @@ const CHECKPOINT_LIST_LIMIT: usize = 20;
 /// A bare store artifact name (`checkpoint-*.json`, no path separators)
 /// resolves inside the checkpoint directory; anything else is an explicit
 /// filesystem path the user typed.
+/// EXEC-4 (E08): one open handle, cap+1 read — an oversized or grown file
+/// is refused before its bytes land in memory, and reading from the handle
+/// makes a post-stat size change irrelevant. A legal file reads
+/// byte-for-byte exactly as before.
+async fn read_checkpoint_bounded(path: &std::path::Path) -> anyhow::Result<Vec<u8>> {
+    let file = tokio::fs::File::open(path)
+        .await
+        .map_err(|error| anyhow::anyhow!("read {}: {error}", path.display()))?;
+    use tokio::io::AsyncReadExt;
+    let mut bytes = Vec::new();
+    file.take(agent_runtime::MAX_CHECKPOINT_ARTIFACT_BYTES as u64 + 1)
+        .read_to_end(&mut bytes)
+        .await
+        .map_err(|error| anyhow::anyhow!("read {}: {error}", path.display()))?;
+    if bytes.len() as u64 > agent_runtime::MAX_CHECKPOINT_ARTIFACT_BYTES as u64 {
+        anyhow::bail!(
+            "{} exceeds the checkpoint artifact bound ({})",
+            path.display(),
+            agent_runtime::MAX_CHECKPOINT_ARTIFACT_BYTES
+        );
+    }
+    Ok(bytes)
+}
+
 fn resolve_restore_target(checkpoint_dir: &std::path::Path, target: &str) -> std::path::PathBuf {
     let is_plain_artifact_name = !target.contains('/')
         && !target.contains('\\')
@@ -919,6 +941,26 @@ mod tests {
             "{error:#}"
         );
     }
+
+    /// EXEC-4 residual (R2-12): the startup entries (`--restore` and
+    /// latest) inherit the shared bounded read — a file past the artifact
+    /// bound is refused by name at load, never buffered whole and never
+    /// misreported as a parse failure.
+    #[test]
+    fn startup_restore_refuses_an_oversized_file_at_the_shared_bound() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("oversized.json");
+        let file = std::fs::File::create(&path).unwrap();
+        file.set_len(agent_runtime::MAX_CHECKPOINT_ARTIFACT_BYTES as u64 + 1)
+            .unwrap();
+        drop(file);
+        let error = load_runtime_checkpoint(&path).unwrap_err();
+        let message = format!("{error:#}");
+        assert!(
+            message.contains("exceeds the checkpoint artifact bound"),
+            "the startup path must name the bound at read time, got: {message}"
+        );
+    }
 }
 
 /// End-to-end tests of the interactive session loop itself: a real
@@ -932,6 +974,7 @@ mod tui_e2e {
     use super::*;
     use agent_compose::{
         ComposeConfig, ContextPolicy, HostToolPolicyRegistry, build_context_engine, compose,
+        maintenance_budget_from_env, try_maintenance_transport_from_env,
     };
     use agent_contracts::{
         AgentResult, ModelCapabilities, ModelOutput, ModelRequest, ModelRole, ModelTransport,
@@ -983,6 +1026,8 @@ mod tui_e2e {
             ContextPolicy::Dynamic,
             workspace.state_dir(),
             Some(model.clone()),
+            try_maintenance_transport_from_env()?,
+            &maintenance_budget_from_env()?,
         )
         .await?;
         let base_tools = Arc::new(BuiltinToolDispatcher::with_config_and_verification_recipes(
@@ -1728,6 +1773,41 @@ mod tui_e2e {
         assert!(
             !card.contains("config.txt"),
             "the user's own file must not be claimed by the card: {card}"
+        );
+    }
+}
+
+#[cfg(test)]
+mod exec4_restore_read_tests {
+    use super::*;
+
+    /// EXEC-4 (E08)：恰好 checkpoint 工件上限的稀疏文件照常读入（解码由
+    /// 既有摘要验证负责）；超上限一字节的文件在**读入阶段**被拒绝——错误
+    /// 点名边界，而不是先吃下整个文件再失败。
+    #[tokio::test]
+    async fn restore_read_refuses_an_oversized_file_at_the_bound() {
+        let dir = tempfile::tempdir().unwrap();
+        let cap = agent_runtime::MAX_CHECKPOINT_ARTIFACT_BYTES as u64;
+
+        // 恰好上限：稀疏写入（洞读作零），读入成功且字节数精确。
+        let exact = dir.path().join("exact.json");
+        let file = std::fs::File::create(&exact).unwrap();
+        file.set_len(cap).unwrap();
+        drop(file);
+        let bytes = read_checkpoint_bounded(&exact).await.unwrap();
+        assert_eq!(bytes.len() as u64, cap);
+
+        // 超上限一字节：拒绝发生在读入阶段，错误点名边界。
+        let over = dir.path().join("over.json");
+        let file = std::fs::File::create(&over).unwrap();
+        file.set_len(cap + 1).unwrap();
+        drop(file);
+        let error = read_checkpoint_bounded(&over).await.unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("exceeds the checkpoint artifact bound"),
+            "the refusal names the bound: {error}"
         );
     }
 }

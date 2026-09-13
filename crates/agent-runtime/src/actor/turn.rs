@@ -145,13 +145,16 @@ impl RuntimeActor {
         // Idempotent-retry ledger: process-lifetime, bounded, oldest evicted.
         // Nothing here is durable and no cross-restart exactly-once exists;
         // an id that fell out of the window (or a restart) is simply unknown.
+        // The payload digest — never the goal text — is the comparison key
+        // (F06): the id, not the goal, is the submission identity.
+        let payload_digest = crate::work::submission_payload_digest(&goal);
         if let Some(existing) = self
             .state
             .work_submissions
             .iter()
             .find(|record| record.client_request_id == client_request_id)
         {
-            if existing.goal == goal {
+            if existing.payload_digest == payload_digest {
                 return Ok(WorkSubmission {
                     disposition: WorkSubmissionDisposition::AlreadyAccepted,
                     task_id: existing.task_id,
@@ -159,8 +162,9 @@ impl RuntimeActor {
                 });
             }
             return Err(AgentError::InvalidRequest(
-                "client request id was already admitted for a different goal; \
-                 query the task list instead of reusing the id"
+                "client request id was already admitted for a different payload; \
+                 query the exact-request receipt or the task list instead of \
+                 reusing the id"
                     .into(),
             ));
         }
@@ -315,6 +319,7 @@ impl RuntimeActor {
             turn_frame: TurnFrame::new(content),
             model_round: 0,
             pending_tools: VecDeque::new(),
+            deferred_context_collect: false,
             pending_loaded_tools: Vec::new(),
             result_delivery_tools: Vec::new(),
             action_batch: None,
@@ -522,6 +527,20 @@ impl RuntimeActor {
             turn.op.is_none() && turn.model_round >= self.services.max_tool_rounds()
         });
         if over_budget {
+            // EXEC-7: a collect deferred to this funnel runs inline here —
+            // the turn is stopping, and the model asked for it "now".
+            let deferred = self
+                .state
+                .turn
+                .as_ref()
+                .is_some_and(|turn| turn.deferred_context_collect);
+            if deferred {
+                if let Some(turn) = self.state.turn.as_mut() {
+                    turn.deferred_context_collect = false;
+                }
+                let report = self.services.context_engine().gc().await;
+                self.finish_explicit_collect(report).await;
+            }
             let message = format!(
                 "tool round budget exhausted after {} rounds",
                 self.services.max_tool_rounds()
@@ -567,6 +586,11 @@ impl RuntimeActor {
                 );
             }
             self.safe_point_resume_commit().await;
+            // EXEC-7: the safe point's maintenance runs as a spawned prepare;
+            // the budget stop owes a DURABLE resumable snapshot before
+            // control returns, so barrier here (this waits on the store
+            // write, not on the engine).
+            let _ = self.await_pending_checkpoint().await;
             self.settle_aborted_turn().await;
             return;
         }
@@ -587,34 +611,18 @@ impl RuntimeActor {
                 // 推送失败不阻塞 collect——引擎仍按已推送的根集运行。
                 // 空投影跳过（collect 本身不是 ingest directive）。
                 self.push_gc_projections(false).await;
-                match self.services.context_gc().await {
-                    Ok(report) => {
-                        if let Err(error) = self
-                            .core
-                            .emit_event(RuntimeEvent::ContextGc { report })
-                            .await
-                        {
-                            // The GC state change landed but its audit
-                            // event did not: surface it instead of letting
-                            // the state silently outrun its journal event.
-                            let _ = self
-                                .core
-                                .emit_event(RuntimeEvent::Error {
-                                    message: error.to_string(),
-                                })
-                                .await;
-                        }
-                    }
-                    Err(error) => {
-                        // A failed explicit collect is not silent: the model
-                        // asked for a pass and the engine refused it.
-                        let _ = self
-                            .core
-                            .emit_event(RuntimeEvent::Error {
-                                message: error.to_string(),
-                            })
-                            .await;
-                    }
+                // EXEC-7 (R2-08): the pass runs as a spawned boundary
+                // operation. The eviction is deferred to the next model
+                // round funnel — `spawn_model_operation` exchanges this flag
+                // for the pass, so it still lands before the next model
+                // decision, without blocking the actor's command branch. A
+                // turn that ends without another round (budget stop) runs
+                // the pass inline there.
+                if let Some(turn) = self.state.turn.as_mut() {
+                    turn.deferred_context_collect = true;
+                } else {
+                    self.finish_explicit_collect(self.services.context_engine().gc().await)
+                        .await;
                 }
             }
             RuntimeDirective::Context(other) => {
@@ -2052,24 +2060,80 @@ impl RuntimeActor {
             .await;
     }
 
-    pub(super) async fn commit_completion(
+    /// The store-missing typed error, shared with the safepoint module.
+    pub(super) fn terminal_store_missing_error() -> AgentError {
+        AgentError::InvalidRequest("no checkpoint store configured".into())
+    }
+
+    /// EXEC-7 (R2-08): a completion commit either settles within this call
+    /// (including its failure paths — the reply channel comes back owned)
+    /// or parks behind the spawned checkpoint maintenance, in which case the
+    /// resume owns the reply and the rest of the transaction.
+    pub(super) fn commit_completion<'a>(
+        &'a mut self,
+        intent: CompletionIntent,
+        summary: String,
+        artifacts: Vec<String>,
+        next_focus_revision: u64,
+        reply: Option<crate::actor::Reply<AgentResult<()>>>,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = CompletionCommitOutcome> + Send + 'a>>
+    {
+        Box::pin(self.commit_terminal_transaction(
+            intent,
+            summary,
+            artifacts,
+            next_focus_revision,
+            reply,
+        ))
+    }
+
+    async fn commit_terminal_transaction(
         &mut self,
         intent: CompletionIntent,
         summary: String,
         artifacts: Vec<String>,
         next_focus_revision: u64,
-    ) -> AgentResult<()> {
+        reply: Option<crate::actor::Reply<AgentResult<()>>>,
+    ) -> CompletionCommitOutcome {
+        let outcome = self
+            .commit_terminal_transaction_inner(
+                intent,
+                summary,
+                artifacts,
+                next_focus_revision,
+                reply,
+            )
+            .await;
+        match outcome {
+            Ok(outcome) => outcome,
+            Err((error, reply)) => CompletionCommitOutcome::Settled(Err(error), reply),
+        }
+    }
+
+    async fn commit_terminal_transaction_inner(
+        &mut self,
+        intent: CompletionIntent,
+        summary: String,
+        artifacts: Vec<String>,
+        next_focus_revision: u64,
+        reply: Option<crate::actor::Reply<AgentResult<()>>>,
+    ) -> Result<CompletionCommitOutcome, (AgentError, Option<crate::actor::Reply<AgentResult<()>>>)>
+    {
         // The acceptance gate runs again at the commit safe point: state
         // may have moved since the proposal was stored.
         let readiness = self.completion_readiness(intent, None);
         if !readiness.allows_completion() {
-            return Err(readiness.refusal());
+            return Err((readiness.refusal(), reply));
         }
-        let active_task = self
-            .state
-            .tasks
-            .active()
-            .ok_or_else(|| AgentError::InvalidRequest("no active task to complete".into()))?;
+        let active_task = match self.state.tasks.active() {
+            Some(active_task) => active_task,
+            None => {
+                return Err((
+                    AgentError::InvalidRequest("no active task to complete".into()),
+                    reply,
+                ));
+            }
+        };
 
         // Revalidate at the commit safe point: acceptance and commit are
         // separated by the rest of the turn, so a referenced file may have
@@ -2120,13 +2184,20 @@ impl RuntimeActor {
         let mut dropped_for_cap = 0usize;
         for artifact in artifacts {
             let Some(workspace) = workspace.as_ref() else {
-                return Err(AgentError::InvalidRequest(
-                    "completion artifacts require a trusted artifact workspace".into(),
+                return Err((
+                    AgentError::InvalidRequest(
+                        "completion artifacts require a trusted artifact workspace".into(),
+                    ),
+                    reply,
                 ));
             };
-            let (normalized, _file) = workspace
+            let (normalized, _file) = match workspace
                 .open_artifact_for_run(&artifact, self.core.run_id())
-                .await?;
+                .await
+            {
+                Ok(opened) => opened,
+                Err(error) => return Err((error, reply)),
+            };
             if !seen.insert(normalized.clone()) {
                 continue;
             }
@@ -2186,8 +2257,9 @@ impl RuntimeActor {
                     unmet_reasons: readiness.override_reasons(),
                 })
         else {
-            return Err(AgentError::InvalidRequest(
-                "no active task to complete".into(),
+            return Err((
+                AgentError::InvalidRequest("no active task to complete".into()),
+                reply,
             ));
         };
         let task_id = record.task_id;
@@ -2197,34 +2269,381 @@ impl RuntimeActor {
         // Fence old operations before either mutable plane moves; every
         // operation after this point either commits under the new generation
         // or is rejected as stale.
-        self.bump_generation()?;
+        let bumped = match self.bump_generation() {
+            Ok(generation) => generation,
+            Err(error) => return Err((error, reply)),
+        };
+        let _ = bumped;
 
         // PHASE P — prepare the post-completion context plane while retaining
         // its portable rollback snapshot, then freeze that exact context
         // together with the prospective terminal task plane. A failed
         // assembly/write restores context and leaves TaskManager active. Only
         // a failed restore makes the runtime unreconcilable.
-        let prepared_context = self
+        let prepared_context = match self
             .services
             .prepare_complete_current_task(task_id, summary)
             .await
-            .map_err(|error| self.context_transition_failed(error))?;
-        let checkpoint_sequence = match self
-            .freeze_and_acknowledge_terminal(record, next_focus_revision)
-            .await
         {
-            Ok(sequence) => sequence,
+            Ok(prepared) => prepared,
             Err(error) => {
-                if let Err(rollback_error) = self
-                    .services
-                    .rollback_task_completion(prepared_context)
-                    .await
-                {
-                    return Err(self.context_transition_failed(rollback_error));
-                }
-                return Err(error);
+                let error = self.context_transition_failed(error);
+                return Err((error, reply));
             }
         };
+        // EXEC-7 (R2-08): the terminal freeze's checkpoint maintenance runs
+        // as a spawned boundary operation. The prepared transaction parks
+        // with everything the tail needs; new mutations are refused while
+        // it is parked, so the transaction applies over exactly the task
+        // table it was prepared against.
+        let commit_input = TerminalCommitInput {
+            intent,
+            txn,
+            task_id,
+            anchor_revision,
+            event_summary,
+            prepared: prepared_context,
+            next_focus_revision,
+            artifacts: record.artifacts.clone(),
+            final_output_digest: record.final_output_digest.clone(),
+            reply,
+        };
+        match self.begin_terminal_freeze(commit_input, record).await {
+            Ok(FreezeOutcome::NoStore(input)) => {
+                let input = *input;
+                let reply = input.reply;
+                let result = self
+                    .commit_task_completion_tail(
+                        input.intent,
+                        input.txn,
+                        input.task_id,
+                        input.anchor_revision,
+                        input.event_summary,
+                        input.prepared,
+                        input.next_focus_revision,
+                        input.artifacts,
+                        input.final_output_digest,
+                        None,
+                    )
+                    .await;
+                if let Some(reply) = reply {
+                    let _ = reply.send(result);
+                }
+                Ok(CompletionCommitOutcome::Settled(Ok(()), None))
+            }
+            // The maintenance completion owns the rest of the transaction,
+            // including the reply.
+            Ok(FreezeOutcome::Parked) => Ok(CompletionCommitOutcome::Parked),
+            Err((error, input)) => {
+                // The freeze never landed: roll the prepared context plane
+                // back and settle the failure through the normal paths.
+                let error = match self.services.rollback_task_completion(input.prepared).await {
+                    Ok(()) => error,
+                    Err(rollback_error) => self.context_transition_failed(rollback_error),
+                };
+                Err((error, input.reply))
+            }
+        }
+    }
+
+    /// EXEC-7 (R2-08): the freeze either discovers there is no checkpoint
+    /// store (the tail runs inline with `sequence = None` — the same
+    /// not-resumable-by-design warning fires there) or parks behind the
+    /// spawned checkpoint maintenance. A pre-park failure hands the input
+    /// back so the prepared context can roll back.
+    async fn begin_terminal_freeze(
+        &mut self,
+        input: TerminalCommitInput,
+        record: crate::task::CompletionRecord,
+    ) -> Result<FreezeOutcome, (AgentError, TerminalCommitInput)> {
+        let Some(_store) = self.checkpoint_store() else {
+            return Ok(FreezeOutcome::NoStore(Box::new(input)));
+        };
+        if let Err(error) = self.await_pending_checkpoint().await {
+            return Err((error, input));
+        }
+        let terminal_tasks = match crate::task::TaskManager::prospective_terminal_snapshot(
+            &self.state.tasks,
+            record,
+        ) {
+            Some(terminal_tasks) => terminal_tasks,
+            None => {
+                return Err((
+                    AgentError::InvalidRequest(
+                        "no active task to freeze into a terminal checkpoint".into(),
+                    ),
+                    input,
+                ));
+            }
+        };
+        // Allocate the terminal snapshot's identity before freezing planes.
+        self.state.snapshot_sequence = self
+            .state
+            .snapshot_sequence
+            .checked_add(1)
+            .expect("snapshot sequence cannot overflow within any realistic run");
+        let sequence = self.state.snapshot_sequence;
+        let prior_required_sequence = self.state.required_sequence;
+        self.state.required_sequence =
+            Some(self.state.required_sequence.unwrap_or(0).max(sequence));
+        // Completion resolves every obligation by definition: whatever
+        // debt survived to this point is retired with the terminal freeze,
+        // not deferred.
+        let prior_debt = std::mem::take(&mut self.state.checkpoint_debt);
+        let anchor = self.current_anchor_revision();
+        let park = super::maintenance::TerminalFreezePark {
+            intent: input.intent,
+            txn: input.txn,
+            task_id: input.task_id,
+            anchor_revision: input.anchor_revision,
+            event_summary: input.event_summary,
+            prepared: input.prepared,
+            next_focus_revision: input.next_focus_revision,
+            artifacts: input.artifacts,
+            final_output_digest: input.final_output_digest,
+            terminal_focus_revision: input.next_focus_revision,
+            terminal_tasks,
+            sequence,
+            prior_required_sequence,
+            prior_debt,
+            anchor,
+            reply: input.reply,
+        };
+        self.begin_checkpoint_maintain(super::maintenance::CheckpointResume::TerminalFreeze(
+            Box::new(park),
+        ))
+        .await;
+        Ok(FreezeOutcome::Parked)
+    }
+
+    /// EXEC-7 (R2-08): the terminal freeze's resume half — maintenance
+    /// settled, so assemble, validate, write and acknowledge exactly like
+    /// the inline freeze, then run the post-freeze commit tail. The parked
+    /// reply is settled here on every path.
+    pub(super) async fn finish_terminal_freeze(
+        &mut self,
+        park: super::maintenance::TerminalFreezePark,
+        report: Option<AgentResult<agent_contracts::ContextMaintenanceReport>>,
+    ) -> AgentResult<()> {
+        let result = self.finish_terminal_freeze_inner(park, report).await;
+        // The terminal transaction settled (committed, or rolled back with
+        // the task still active): queued input may now drain.
+        if let Some(op_tx) = self.op_tx() {
+            self.drain_queued_user_input(&op_tx).await;
+        }
+        result
+    }
+
+    async fn finish_terminal_freeze_inner(
+        &mut self,
+        park: super::maintenance::TerminalFreezePark,
+        report: Option<AgentResult<agent_contracts::ContextMaintenanceReport>>,
+    ) -> AgentResult<()> {
+        // Destructure the parked transaction once: every fallible arm needs
+        // a different subset, and nothing may be partially moved.
+        let super::maintenance::TerminalFreezePark {
+            intent,
+            txn,
+            task_id,
+            anchor_revision,
+            event_summary,
+            prepared,
+            next_focus_revision,
+            artifacts,
+            final_output_digest,
+            terminal_tasks,
+            terminal_focus_revision,
+            sequence,
+            prior_required_sequence,
+            prior_debt,
+            anchor,
+            reply,
+        } = park;
+
+        if let Some(Err(error)) = report {
+            self.state.checkpoint_debt = prior_debt;
+            self.state.required_sequence = prior_required_sequence;
+            self.emit_checkpoint_write_failed(error.to_string()).await;
+            return self
+                .fail_terminal_commit(intent, task_id, prepared, reply, error)
+                .await;
+        }
+        if let Some(Ok(maintain_report)) = report
+            && let Err(error) = self
+                .emit_context_maintained(ContextMaintenanceTrigger::Checkpoint, maintain_report)
+                .await
+        {
+            self.state.checkpoint_debt = prior_debt;
+            self.state.required_sequence = prior_required_sequence;
+            self.emit_checkpoint_write_failed(error.to_string()).await;
+            return self
+                .fail_terminal_commit(intent, task_id, prepared, reply, error)
+                .await;
+        }
+        let snapshot = match self
+            .assemble_checkpoint(Some((terminal_tasks, terminal_focus_revision)))
+            .await
+        {
+            Ok(snapshot) => snapshot,
+            Err(error) => {
+                self.state.checkpoint_debt = prior_debt;
+                self.state.required_sequence = prior_required_sequence;
+                self.emit_checkpoint_write_failed(error.to_string()).await;
+                return self
+                    .fail_terminal_commit(intent, task_id, prepared, reply, error)
+                    .await;
+            }
+        };
+        if let Err(error) = snapshot.validate() {
+            self.state.checkpoint_debt = prior_debt;
+            self.state.required_sequence = prior_required_sequence;
+            return self
+                .fail_terminal_commit(
+                    intent,
+                    task_id,
+                    prepared,
+                    reply,
+                    AgentError::InvalidRequest(format!(
+                        "the terminal checkpoint is internally inconsistent; nothing was committed: {error}"
+                    )),
+                )
+                .await;
+        }
+        let bytes = match serde_json::to_vec(&snapshot) {
+            Ok(bytes) => bytes,
+            Err(error) => {
+                self.state.checkpoint_debt = prior_debt;
+                self.state.required_sequence = prior_required_sequence;
+                return self
+                    .fail_terminal_commit(
+                        intent,
+                        task_id,
+                        prepared,
+                        reply,
+                        AgentError::Internal(format!(
+                            "terminal checkpoint serialization failed: {error}"
+                        )),
+                    )
+                    .await;
+            }
+        };
+        let capability_generation = snapshot.capability_generation;
+        let Some(store) = self.checkpoint_store() else {
+            self.state.checkpoint_debt = prior_debt;
+            self.state.required_sequence = prior_required_sequence;
+            self.state.checkpoint_write_failed = true;
+            let error = Self::terminal_store_missing_error();
+            self.emit_checkpoint_write_failed(error.to_string()).await;
+            return self
+                .fail_terminal_commit(intent, task_id, prepared, reply, error)
+                .await;
+        };
+        let in_flight_handle = tokio::spawn(async move {
+            store
+                .write_atomic(&bytes)
+                .await
+                .map(|stored| (sequence, stored))
+        });
+        let acked = match in_flight_handle.await {
+            Ok(result) => result,
+            Err(join_error) => Err(AgentError::InvalidRequest(format!(
+                "checkpoint write task failed: {join_error}"
+            ))),
+        };
+        match acked {
+            Ok((acked_sequence, stored)) => {
+                self.state.checkpoint_write_failed = false;
+                self.state.durable_sequence =
+                    Some(self.state.durable_sequence.unwrap_or(0).max(acked_sequence));
+                let _ = self
+                    .core
+                    .emit_event(RuntimeEvent::CheckpointDurable {
+                        bytes: stored.bytes,
+                        artifact: stored.artifact,
+                        revision: anchor,
+                        checksum: stored.checksum,
+                        sequence: acked_sequence,
+                        capability_generation,
+                    })
+                    .await;
+                let result = self
+                    .commit_task_completion_tail(
+                        intent,
+                        txn,
+                        task_id,
+                        anchor_revision,
+                        event_summary,
+                        prepared,
+                        next_focus_revision,
+                        artifacts,
+                        final_output_digest,
+                        Some(acked_sequence),
+                    )
+                    .await;
+                if let Some(reply) = reply {
+                    let _ = reply.send(result);
+                    return Ok(());
+                }
+                result
+            }
+            Err(error) => {
+                self.state.checkpoint_debt = prior_debt;
+                self.state.required_sequence = prior_required_sequence;
+                self.emit_checkpoint_write_failed(error.to_string()).await;
+                let error = AgentError::Storage(format!(
+                    "the terminal checkpoint never landed durably ({error}); the task stays \
+                     completion-pending and the completion intent stays retryable"
+                ));
+                self.fail_terminal_commit(intent, task_id, prepared, reply, error)
+                    .await
+            }
+        }
+    }
+
+    /// The parked terminal transaction's failure path: roll the prepared
+    /// context back (the freeze never landed), settle the reply, and — for
+    /// a model proposal — project the bounded retryable failure onto the
+    /// still-live task, exactly like the direct path does.
+    #[allow(clippy::too_many_arguments)]
+    async fn fail_terminal_commit(
+        &mut self,
+        intent: CompletionIntent,
+        task_id: TaskId,
+        prepared: crate::services::PreparedTaskCompletion,
+        reply: Option<crate::actor::Reply<AgentResult<()>>>,
+        error: AgentError,
+    ) -> AgentResult<()> {
+        let error = match self.services.rollback_task_completion(prepared).await {
+            Ok(()) => error,
+            Err(rollback_error) => self.context_transition_failed(rollback_error),
+        };
+        if intent == CompletionIntent::ModelProposal {
+            self.record_completion_commit_failure(task_id, &error).await;
+        }
+        if let Some(reply) = reply {
+            let _ = reply.send(Err(error));
+            return Ok(());
+        }
+        Err(error)
+    }
+
+    /// The terminal commit's post-freeze tail: the no-store warning, the
+    /// infallible actor assignments, the durable TaskCompleted barrier, and
+    /// the completion storage boundary as a spawned operation (EXEC-7).
+    #[allow(clippy::too_many_arguments)]
+    async fn commit_task_completion_tail(
+        &mut self,
+        intent: CompletionIntent,
+        txn: crate::task::TaskTxn,
+        task_id: TaskId,
+        anchor_revision: u64,
+        event_summary: String,
+        prepared: crate::services::PreparedTaskCompletion,
+        next_focus_revision: u64,
+        artifacts: Vec<String>,
+        final_output_digest: Option<String>,
+        checkpoint_sequence: Option<u64>,
+    ) -> AgentResult<()> {
         if checkpoint_sequence.is_none() {
             let _ = self
                 .core
@@ -2235,12 +2654,12 @@ impl RuntimeActor {
                 )
                 .await;
         }
-
+        let _ = intent;
         // PHASE Q — the terminal checkpoint authorizes only infallible actor
         // assignments. The context plane is already exactly the one frozen
         // above; publishing its audit and the task outcome happens as one
         // explicit durable event transaction.
-        let report = prepared_context.report;
+        let report = prepared.report;
         self.state.tasks.commit(txn);
         self.state.task_id = None;
         self.state.last_assistant_artifact = None;
@@ -2249,6 +2668,8 @@ impl RuntimeActor {
             task_id,
             anchor_revision,
             summary: event_summary,
+            artifacts,
+            final_output_digest,
         }];
         terminal_events.extend(context_maintenance_events(
             ContextMaintenanceTrigger::TaskCompleted,
@@ -2282,8 +2703,14 @@ impl RuntimeActor {
                 })
                 .await;
         }
-        self.compact_after_completion().await;
-        self.run_storage_gc_at_boundary().await;
+        // 完成边界前的根声明投影：完成任务后 active 通常已切换/清空，
+        // 强制推送当前（或空）根集，声明不再保护已完成任务的工作集。
+        self.push_gc_projections(true).await;
+        // EXEC-7 (R2-08): the post-commit boundary (full GC + retained-root
+        // enumeration + storage GC) runs as a spawned operation. Landed
+        // physical deletes are durable facts; failures are events and never
+        // roll the committed outcome back.
+        self.begin_completion_boundary().await;
         Ok(())
     }
 
@@ -2334,6 +2761,18 @@ impl RuntimeActor {
         // event, so the JSONL order proves resume-before-completion. A
         // failure is already published as CheckpointWriteFailed; the turn
         // still completes and nothing claims resumability from it.
+        //
+        // EXEC-7 (R2-08): when the safe point's checkpoint maintenance is
+        // still parked as a spawned prepare, the remaining commit tail parks
+        // behind it (resumed by the relay completion) instead of blocking
+        // the actor's command branch on the engine. The deferred path skips
+        // the immediate debt re-capture below — debt accrued after the
+        // freeze stays live for the next settled batch, exactly like any
+        // post-freeze accrual.
+        if self.state.checkpoint_prepare.is_some() {
+            self.relay_parked_checkpoint_prepare(content, op_tx).await;
+            return;
+        }
         if self.await_pending_checkpoint().await.is_ok() && !self.state.checkpoint_debt.is_empty() {
             // Barrier exit must prove no uncaptured debt remains — not
             // merely that the current JoinHandle ended. Debt accrued while
@@ -2342,6 +2781,62 @@ impl RuntimeActor {
             // here. A failed barrier write keeps its debt restored and
             // fenced for the next settled batch's retry; this re-capture
             // deliberately does not inline-retry a failure.
+            self.safe_point_resume_commit().await;
+            let _ = self.await_pending_checkpoint().await;
+        }
+        self.finalize_turn_tail(content, op_tx).await;
+    }
+
+    /// EXEC-7 (R2-08): the explicit collect's audit, resumed when the
+    /// spawned pass returns. A failed explicit collect is not silent: the
+    /// model asked for a pass and the engine refused it.
+    pub(super) async fn finish_explicit_collect(
+        &mut self,
+        report: AgentResult<agent_contracts::ContextGcReport>,
+    ) {
+        match report {
+            Ok(report) => {
+                if let Err(error) = self
+                    .core
+                    .emit_event(RuntimeEvent::ContextGc { report })
+                    .await
+                {
+                    // The GC state change landed but its audit event did
+                    // not: surface it instead of letting the state
+                    // silently outrun its journal event.
+                    let _ = self
+                        .core
+                        .emit_event(RuntimeEvent::Error {
+                            message: error.to_string(),
+                        })
+                        .await;
+                }
+            }
+            Err(error) => {
+                let _ = self
+                    .core
+                    .emit_event(RuntimeEvent::Error {
+                        message: error.to_string(),
+                    })
+                    .await;
+            }
+        }
+    }
+
+    /// EXEC-7: the turn-commit tail after the turn-end checkpoint barrier —
+    /// evidence persistence, the durable TurnCompleted barrier, the resume
+    /// install, and any parked completion proposal. Runs either inline after
+    /// the barrier or resumed from the safe-point prepare's relay.
+    pub(super) async fn finalize_turn_tail(
+        &mut self,
+        content: String,
+        op_tx: &mpsc::Sender<OperationCompletion>,
+    ) {
+        // The deferred turn-end barrier: the prepare already landed and put
+        // the write in flight — wait for its durable acknowledgement here so
+        // the JSONL order still proves resume-before-TurnCompleted. This
+        // waits on the store write (bounded), not on the engine.
+        if self.await_pending_checkpoint().await.is_ok() && !self.state.checkpoint_debt.is_empty() {
             self.safe_point_resume_commit().await;
             let _ = self.await_pending_checkpoint().await;
         }
@@ -2487,12 +2982,34 @@ impl RuntimeActor {
         // explains every eviction and reactivation. Push TaskProgress
         // checked paths first so covered file bodies stay Warm/Stored.
         self.push_gc_projections(false).await;
-        let report = match self.services.context_gc().await {
+        // EXEC-7 (R2-08): the full pass runs as a spawned boundary
+        // operation, so a slow engine no longer occupies the actor's
+        // command branch — cancel/stop/status stay live while it waits.
+        // The commit tail resumes from the completion; a cancelled pass
+        // dies with the turn (it never committed, so there is nothing to
+        // roll back).
+        self.begin_turn_final_gc(pending_assistant_evidence).await;
+    }
+
+    /// EXEC-7 (R2-08): the turn-final commit tail, resumed when the spawned
+    /// full GC pass returns its report.
+    pub(super) async fn finish_turn_final_gc(
+        &mut self,
+        report: AgentResult<agent_contracts::ContextGcReport>,
+        pending_assistant_evidence: Option<AssistantArtifactEvidence>,
+    ) {
+        let report = match report {
             Ok(report) => report,
             Err(error) => {
                 return self.commit_failed(TurnCommitPhase::Gc, error).await;
             }
         };
+        // CTX-8 接线 (R3-08): remember what the pass said about the store.
+        self.state.store_backpressure = Some(crate::work::StoreBackpressure {
+            active: report.externalize_backpressure,
+            externalize_deferred: report.externalize_deferred,
+            store_io_failures: report.store_io_failures,
+        });
         if let Err(error) = self
             .core
             .emit_event(RuntimeEvent::ContextGc { report })
@@ -2558,8 +3075,18 @@ impl RuntimeActor {
             .as_ref()
             .and_then(|turn| turn.pending_completion.clone());
         self.state.turn = None;
-        if let Some(proposal) = pending_completion {
-            self.process_pending_completion(proposal).await;
+        if let Some(proposal) = pending_completion
+            && self.process_pending_completion(proposal).await
+        {
+            // The terminal transaction parked: its resume runs the
+            // queued-input drain after the commit settles.
+            return;
+        }
+        // EXEC-7: this tail may have resumed from the boundary lane — the
+        // queued-input drain that used to follow finalize inline runs here,
+        // on the actor's own operation channel.
+        if let Some(op_tx) = self.op_tx() {
+            self.drain_queued_user_input(&op_tx).await;
         }
     }
 
@@ -2568,7 +3095,13 @@ impl RuntimeActor {
     /// becomes the active task's typed CompletionRecord. No active task
     /// (suspended/completed meanwhile) drops the proposal with a warning —
     /// it never fails the already-committed turn.
-    pub(super) async fn process_pending_completion(&mut self, proposal: CompletionProposal) {
+    /// Returns true when the terminal transaction parked behind the spawned
+    /// checkpoint maintenance — the caller must defer any follow-up work
+    /// (the queued-input drain) to the terminal resume.
+    pub(super) async fn process_pending_completion(
+        &mut self,
+        proposal: CompletionProposal,
+    ) -> bool {
         // Completion waits for its in-flight resume write; a failed one
         // surfaces as CheckpointWriteFailed and never claims resumability.
         let _ = self.await_pending_checkpoint().await;
@@ -2577,7 +3110,7 @@ impl RuntimeActor {
                 .core
                 .emit_warning("completion proposal dropped: no active task".to_string())
                 .await;
-            return;
+            return false;
         }
         let task_id = self
             .state
@@ -2586,19 +3119,29 @@ impl RuntimeActor {
             .expect("active task checked above");
         let result = match self.next_focus_revision() {
             Ok(next_focus_revision) => {
-                self.commit_completion(
-                    CompletionIntent::ModelProposal,
-                    proposal.summary,
-                    proposal.artifacts,
-                    next_focus_revision,
-                )
-                .await
+                match self
+                    .commit_completion(
+                        CompletionIntent::ModelProposal,
+                        proposal.summary,
+                        proposal.artifacts,
+                        next_focus_revision,
+                        None,
+                    )
+                    .await
+                {
+                    // The resume owns the rest, including the typed failure
+                    // projection onto the still-live task and the queued-input
+                    // drain.
+                    CompletionCommitOutcome::Parked => return true,
+                    CompletionCommitOutcome::Settled(result, _) => result,
+                }
             }
             Err(error) => Err(error),
         };
         if let Err(error) = result {
             self.record_completion_commit_failure(task_id, &error).await;
         }
+        false
     }
 
     /// Persist and project a deferred completion failure onto the still-live
@@ -2769,6 +3312,83 @@ impl RuntimeActor {
     /// is fenced and its late completion is stale), but a failed barrier
     /// returns `RecoveryRequired` and poisons ordinary mutation rather than
     /// pretending the cancellation was durably acknowledged.
+    /// CORE-4: an in-flight model round died with the turn. Its usage is
+    /// genuinely unknown — the provider may still bill for work the abort
+    /// cut short — so the account carries an explicit `unknown` row instead
+    /// of a silent zero. COST-7 (R2-11): the same holds for an in-flight
+    /// MAINTENANCE op — the compactor call it may have been running is a
+    /// real cost center of its own, so its unknown row names the
+    /// maintenance lane. Every other cancellation shape (tool in flight,
+    /// idle turn) already committed its rounds.
+    async fn emit_cancelled_usage_row(
+        &mut self,
+        cleanup_kind: Option<OpKind>,
+        operation_id: Option<OperationId>,
+    ) {
+        match cleanup_kind {
+            Some(OpKind::Model) => {
+                Self::emit_unknown_model_usage_row(
+                    &self.core,
+                    agent_contracts::ModelCallRole::Main,
+                )
+                .await;
+            }
+            Some(OpKind::Maintenance) => {
+                Self::emit_unknown_model_usage_row(
+                    &self.core,
+                    agent_contracts::ModelCallRole::Maintenance,
+                )
+                .await;
+            }
+            _ => return,
+        }
+        if let Some(operation_id) = operation_id {
+            self.mark_usage_accounted(operation_id);
+        }
+    }
+
+    /// COST-7 (R2-11): remember that this operation's cost is already in
+    /// the account, so a later stale/duplicate completion of the same
+    /// operation cannot supplement the same cost twice.
+    pub(super) fn mark_usage_accounted(&mut self, operation_id: OperationId) {
+        let queue = &mut self.state.usage_accounted_ops;
+        if queue.contains(&operation_id) {
+            return;
+        }
+        queue.push_back(operation_id);
+        while queue.len() > MAX_USAGE_ACCOUNTED_OPS {
+            queue.pop_front();
+        }
+    }
+
+    /// COST-7 (R2-11): true when this operation's cost was already accounted
+    /// (cancel-time unknown row or an earlier supplement).
+    pub(super) fn usage_already_accounted(&self, operation_id: OperationId) -> bool {
+        self.state.usage_accounted_ops.contains(&operation_id)
+    }
+
+    /// COST-1 (E05.1): the shared unknown-round row — the provider may still
+    /// bill for an aborted or failed model call, so the account records an
+    /// explicit `unknown` row instead of a silent zero. COST-7: the row
+    /// names its call lane.
+    pub(super) async fn emit_unknown_model_usage_row(
+        core: &Arc<dyn CorePort>,
+        role: agent_contracts::ModelCallRole,
+    ) {
+        let _ = core
+            .emit_event(RuntimeEvent::ModelUsed {
+                input_tokens: 0,
+                output_tokens: 0,
+                cached_input_tokens: 0,
+                attempts: 0,
+                retries: 0,
+                usage_identity: agent_contracts::UsageIdentity::Unknown,
+                role,
+                usage: Some(agent_contracts::ModelUsage::default()),
+            })
+            .await;
+    }
+
     pub(super) async fn cancel_turn(
         &mut self,
         reason: TurnCancellationReason,
@@ -2815,6 +3435,15 @@ impl RuntimeActor {
             }
         }
         self.cancel_pending_maintenance().await?;
+        // EXEC-7 (R2-08): turn-scoped boundary work (the turn-final GC, an
+        // explicit collect) joins under the same bounded cleanup cap;
+        // idle boundary work is untouched — it has no turn to revoke, and
+        // shutdown joins it separately.
+        self.cancel_pending_gc_work().await?;
+        // EXEC-1: a parked materialization joins under the same bounded
+        // cleanup cap; an unconfirmed join fences instead of claiming a
+        // trustworthy cancellation.
+        self.cancel_pending_materialization().await?;
         // A deferred proof refresh belongs to the dying turn: arm its
         // cancellation so the runner's own loop kills and reaps the host
         // verifier process, wait (bounded) for that cleanup, and only then
@@ -2876,6 +3505,8 @@ impl RuntimeActor {
             .take()
             .expect("the active turn was inspected immediately above");
         turn.op = None;
+        self.emit_cancelled_usage_row(cleanup_kind, operation_id)
+            .await;
         let event = RuntimeEvent::TurnCancelled {
             turn_id: turn.turn_id,
             task_id: self.state.task_id,
@@ -2974,6 +3605,8 @@ impl RuntimeActor {
             .take()
             .expect("the active turn was inspected immediately above");
         turn.op = None;
+        self.emit_cancelled_usage_row(cleanup_kind, operation_id)
+            .await;
         let event = RuntimeEvent::TurnCancelled {
             turn_id: turn.turn_id,
             task_id: self.state.task_id,
@@ -3153,4 +3786,45 @@ fn proof_is_sole_blocker(readiness: &CompletionReadiness) -> bool {
                     | CompletionBlocker::AcceptanceUncovered { .. }
             )
         })
+}
+
+/// EXEC-7 (R2-08): how a completion commit settled.
+pub(super) enum CompletionCommitOutcome {
+    /// Fully settled within the call; the reply channel (if any) comes
+    /// back owned by the caller.
+    Settled(
+        AgentResult<()>,
+        Option<crate::actor::Reply<AgentResult<()>>>,
+    ),
+    /// Parked behind the spawned checkpoint maintenance; the resume
+    /// owns the reply and the rest of the transaction.
+    Parked,
+}
+
+/// EXEC-7 (R2-08): what `begin_terminal_freeze` decided.
+pub(super) enum FreezeOutcome {
+    /// No checkpoint store exists: the tail runs inline with
+    /// `sequence = None` and the not-resumable-by-design warning.
+    NoStore(Box<TerminalCommitInput>),
+    /// Parked behind the spawned checkpoint maintenance.
+    Parked,
+}
+
+/// Everything the terminal transaction's tail needs once the freeze's
+/// checkpoint maintenance has settled. Built after the completion gate
+/// and the context preparation, parked behind the spawned maintenance.
+pub(super) struct TerminalCommitInput {
+    pub(super) intent: CompletionIntent,
+    pub(super) txn: crate::task::TaskTxn,
+    pub(super) task_id: TaskId,
+    pub(super) anchor_revision: u64,
+    pub(super) event_summary: String,
+    pub(super) prepared: crate::services::PreparedTaskCompletion,
+    pub(super) next_focus_revision: u64,
+    /// EXEC-8: the record's bounded evidence facts ride the durable
+    /// TaskCompleted event so the completion stays reviewable after it
+    /// leaves the hot task window.
+    pub(super) artifacts: Vec<String>,
+    pub(super) final_output_digest: Option<String>,
+    pub(super) reply: Option<crate::actor::Reply<AgentResult<()>>>,
 }

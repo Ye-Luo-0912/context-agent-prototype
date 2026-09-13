@@ -10,8 +10,8 @@ use agent_core::{ApprovalBroker, InteractiveApprovalGate};
 use agent_platform_protocol::{
     ApprovalRespondOutcome, ApprovalRespondRequest, Causality, EnvelopeKind, MessageId,
     NegotiatedContractProfile, PlatformEnvelope, PlatformResponse, ProtocolIdentity,
-    ProtocolVersion, RequestId, RetryDisposition, Route, SchemaDigest, WorkSubmitDisposition,
-    WorkSubmitRequest, WorkSubscribeRequest,
+    ProtocolVersion, RequestId, RetryDisposition, Route, SchemaDigest, WorkArtifactRequest,
+    WorkChangesRequest, WorkSubmitDisposition, WorkSubmitRequest, WorkSubscribeRequest,
 };
 use agent_runtime::{
     WorkControlAction, WorkControlAuthorization, WorkControlAuthorizationRequest,
@@ -439,4 +439,104 @@ async fn session_registry_grants_and_revokes() {
         "revocation must take effect immediately"
     );
     assert!(registry.bind(&session).is_err());
+}
+
+/// PLATFORM-2: a journaled change whose before-body was captured carries a
+/// run-scoped artifact reference on the wire, and the paged artifact route
+/// reads the original bytes back. Content itself still never travels in the
+/// change row.
+#[tokio::test]
+async fn changes_rows_locate_captured_content_through_an_artifact_reference() {
+    let (handle, _task) = start(Arc::new(SilentModel)).await;
+    let broker = ApprovalBroker::new();
+    let gate = Arc::new(InteractiveApprovalGate::new(Arc::clone(&broker)));
+    let (router, dir) = router_with(
+        handle.clone(),
+        Arc::new(AllowAll),
+        Arc::clone(&broker),
+        Arc::clone(&gate),
+    )
+    .await;
+
+    // Journal one prepared mutation with a small before-body. Appending the
+    // record directly keeps the router's workspace the only instance (its
+    // effect journal holds an exclusive lock); `read_changes` reads exactly
+    // this JSONL surface.
+    let state_dir = dir.path().join(".focus-agent");
+    std::fs::create_dir_all(&state_dir).unwrap();
+    let record = agent_workspace::ChangeRecord::MutationPrepared {
+        tx_id: "tx-locate-1".into(),
+        timestamp_ms: 1,
+        tool: "fs.write".into(),
+        path: "notes.txt".into(),
+        action: "overwrite".into(),
+        bytes_before: 18,
+        bytes_after: 8,
+        before_hash: "0".repeat(16),
+        after_hash: "1".repeat(16),
+        old_content: Some("old body to locate".into()),
+    };
+    use std::io::Write;
+    let mut journal = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(state_dir.join("changes.jsonl"))
+        .unwrap();
+    writeln!(journal, "{}", serde_json::to_string(&record).unwrap()).unwrap();
+    journal.flush().unwrap();
+
+    let listed = router
+        .changes(run_scoped_envelope(
+            Route::work_changes(),
+            WorkChangesRequest {
+                limit: None,
+                after_tx: None,
+            },
+        ))
+        .await
+        .unwrap();
+    let PlatformResponse::Success { value } = listed.payload else {
+        panic!("expected success: {listed:?}");
+    };
+    let prepared = value
+        .changes
+        .iter()
+        .find_map(|row| match row {
+            agent_platform_protocol::ChangeSummary::MutationPrepared {
+                tx_id,
+                old_content_artifact,
+                ..
+            } => Some((tx_id.clone(), old_content_artifact.clone())),
+            _ => None,
+        })
+        .expect("the prepared mutation must be listed");
+    let reference = prepared
+        .1
+        .clone()
+        .expect("a captured before-body must expose an artifact reference");
+
+    // The reference resolves through the paged artifact route to the exact
+    // original bytes.
+    let page = router
+        .artifact(run_scoped_envelope(
+            Route::work_artifact(),
+            WorkArtifactRequest {
+                reference,
+                max_bytes: None,
+                offset: None,
+            },
+        ))
+        .await
+        .unwrap();
+    let PlatformResponse::Success { value } = page.payload else {
+        panic!("expected success: {page:?}");
+    };
+    assert!(!value.truncated, "a small body fits one page");
+    assert!(value.next_offset.is_none());
+    use base64::Engine;
+    let decoded = base64::engine::general_purpose::STANDARD
+        .decode(&value.content_base64)
+        .unwrap();
+    assert_eq!(decoded, b"old body to locate");
+    let _ = prepared.0;
 }

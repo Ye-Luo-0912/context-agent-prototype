@@ -1246,6 +1246,10 @@ fn corrupt_operation_journal(path: &Path, detail: &str) -> AgentError {
     ))
 }
 
+/// EXEC-8: the bounded tail read result — newest rows oldest-first, plus
+/// whether the window is complete (the journal holds nothing before it).
+pub type ReadTailWindow = (Vec<RuntimeEventEnvelope>, bool);
+
 enum JournalCommand {
     Append(Box<RuntimeEventEnvelope>),
     Flush(oneshot::Sender<AgentResult<()>>),
@@ -1266,11 +1270,16 @@ enum JournalCommand {
 /// is intact.
 pub struct FileEventJournal {
     tx: mpsc::Sender<JournalCommand>,
+    /// EXEC-8 残余 (R3-11): the trace directory, kept so cold tail reads run
+    /// on their own blocking task instead of inside the journal writer loop
+    /// (a long scan must not stall appends or flushes).
+    directory: PathBuf,
 }
 
 impl FileEventJournal {
     pub async fn open(directory: impl AsRef<Path>) -> AgentResult<Self> {
         let directory = directory.as_ref().to_path_buf();
+        let directory_for_reads = directory.clone();
         tokio::task::spawn_blocking({
             let directory = directory.clone();
             move || {
@@ -1322,7 +1331,10 @@ impl FileEventJournal {
             }
         });
 
-        Ok(Self { tx })
+        Ok(Self {
+            tx,
+            directory: directory_for_reads,
+        })
     }
 }
 
@@ -1343,6 +1355,20 @@ impl EventJournal for FileEventJournal {
             .map_err(|_| AgentError::Storage("event journal writer stopped".into()))?;
         rx.await
             .map_err(|_| AgentError::Storage("event journal flush failed".into()))?
+    }
+
+    async fn read_tail(&self, run_id: RunId, max: usize) -> AgentResult<Option<ReadTailWindow>> {
+        // EXEC-8 残余 (R3-11): flush (quick, serialized with appends), then
+        // run the bounded scan on a blocking task — the writer loop keeps
+        // serving appends and flushes while the scan runs, and the scan's
+        // total bytes/single-row bounds hold no matter how long the run grew.
+        self.flush().await?;
+        let directory = self.directory.clone();
+        tokio::task::spawn_blocking(move || read_trace_tail(&directory, run_id, max))
+            .await
+            .map_err(|error| {
+                AgentError::Storage(format!("event journal read task failed: {error}"))
+            })?
     }
 }
 
@@ -1396,6 +1422,92 @@ fn flush_all(writers: &mut HashMap<RunId, BufWriter<File>>) -> AgentResult<()> {
 
 fn trace_path(directory: &Path, run_id: RunId) -> PathBuf {
     directory.join(format!("{run_id}.jsonl"))
+}
+
+/// EXEC-8 (R2-09): the last `max` envelopes of one run's trace, oldest
+/// first, plus whether the file holds MORE rows before that window. The
+/// read streams the file line by line and keeps only a ring of `max`
+/// decoded rows, so memory stays bounded whatever the journal size. A
+/// malformed line fails closed (typed error) instead of silently shortening
+/// history; a missing trace is an empty complete window.
+/// EXEC-8 残余 (R3-11): hard bounds for one cold-completion tail read —
+/// the scan never touches more than this many bytes of the journal no
+/// matter how long the run grew, and a single row larger than the line cap
+/// fails the read closed (a row that big is itself the typed answer).
+pub const MAX_TAIL_SCAN_BYTES: u64 = 8 * 1024 * 1024;
+pub const MAX_TAIL_LINE_BYTES: usize = 1024 * 1024;
+
+fn read_trace_tail(
+    directory: &Path,
+    run_id: RunId,
+    max: usize,
+) -> AgentResult<Option<(Vec<RuntimeEventEnvelope>, bool)>> {
+    use std::io::{BufRead, BufReader, Seek, SeekFrom};
+    if max == 0 {
+        return Ok(Some((Vec::new(), false)));
+    }
+    let path = trace_path(directory, run_id);
+    let mut file = match File::open(&path) {
+        Ok(file) => file,
+        // No trace for this run yet: nothing is journaled, and the window
+        // (the whole file) is complete.
+        Err(_) => return Ok(Some((Vec::new(), true))),
+    };
+    let file_len = file
+        .metadata()
+        .map_err(|error| AgentError::Storage(format!("stat trace {}: {error}", path.display())))?
+        .len();
+
+    // R3-11: read a bounded WINDOW at the end of the file instead of
+    // walking the whole journal — total scan bytes are capped no matter how
+    // long the run grew. The first (partial) row of the window is skipped
+    // when the window does not reach the file start; the window is then
+    // incomplete by construction.
+    let window = file_len.min(MAX_TAIL_SCAN_BYTES);
+    let window_starts_at_file_start = window == file_len;
+    let seek_to = file_len - window;
+    file.seek(SeekFrom::Start(seek_to))
+        .map_err(|error| AgentError::Storage(format!("seek trace {}: {error}", path.display())))?;
+    let mut reader = BufReader::new(file);
+    let mut first = String::new();
+    if !window_starts_at_file_start {
+        // Skip the (almost certainly partial) row split by the window.
+        reader.read_line(&mut first).map_err(|error| {
+            AgentError::Storage(format!("read trace {}: {error}", path.display()))
+        })?;
+    }
+    let mut ring: std::collections::VecDeque<RuntimeEventEnvelope> =
+        std::collections::VecDeque::with_capacity(max.min(256));
+    let mut overflow = false;
+    for line in reader.lines() {
+        let line = line.map_err(|error| {
+            AgentError::Storage(format!("read trace {}: {error}", path.display()))
+        })?;
+        if line.trim().is_empty() {
+            continue;
+        }
+        if line.len() > MAX_TAIL_LINE_BYTES {
+            return Err(AgentError::Storage(format!(
+                "trace {} holds a row of {} bytes, above the {} single-row cap; the journal                  read fails closed",
+                path.display(),
+                line.len(),
+                MAX_TAIL_LINE_BYTES
+            )));
+        }
+        let envelope: RuntimeEventEnvelope = serde_json::from_str(&line).map_err(|error| {
+            AgentError::Storage(format!(
+                "trace {} holds an undecodable row; the journal read fails closed: {error}",
+                path.display()
+            ))
+        })?;
+        if ring.len() == max {
+            ring.pop_front();
+            overflow = true;
+        }
+        ring.push_back(envelope);
+    }
+    let complete = window_starts_at_file_start && !overflow;
+    Ok(Some((ring.into_iter().collect(), complete)))
 }
 
 #[cfg(test)]
@@ -2289,5 +2401,147 @@ mod tests {
         drop(journal);
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
         let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+#[cfg(test)]
+mod exec8_read_tail_tests {
+    use super::*;
+
+    fn completion_envelope(run_id: RunId, seq: u64, summary: &str) -> RuntimeEventEnvelope {
+        use agent_contracts::{RuntimeEvent, RuntimeEventEnvelope};
+        RuntimeEventEnvelope {
+            run_id,
+            seq,
+            timestamp_ms: seq,
+            event: RuntimeEvent::TaskCompleted {
+                task_id: agent_contracts::TaskId::new(),
+                anchor_revision: seq,
+                summary: summary.to_string(),
+                artifacts: Vec::new(),
+                final_output_digest: None,
+            },
+        }
+    }
+
+    /// EXEC-8 (R2-09): the bounded tail read keeps the newest `max` rows
+    /// oldest-first, reports window incompleteness honestly, and a malformed
+    /// row fails closed instead of silently shortening history.
+    #[test]
+    fn read_tail_keeps_the_newest_rows_and_reports_window_completeness() {
+        let dir = tempfile::tempdir().unwrap();
+        let run = RunId::new();
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        runtime.block_on(async {
+            let journal = FileEventJournal::open(dir.path()).await.unwrap();
+            for seq in 1..=10u64 {
+                journal
+                    .append(&completion_envelope(run, seq, &format!("done {seq}")))
+                    .await
+                    .unwrap();
+            }
+            journal.flush().await.unwrap();
+
+            // A window smaller than the journal: newest rows, incompleteness
+            // reported, order preserved.
+            let (rows, complete) = journal.read_tail(run, 4).await.unwrap().unwrap();
+            assert!(!complete, "the journal holds rows before this window");
+            assert_eq!(rows.len(), 4);
+            let seqs: Vec<u64> = rows.iter().map(|row| row.seq).collect();
+            assert_eq!(seqs, vec![7, 8, 9, 10], "oldest of the window first");
+
+            // A window at least as large as the journal: everything, and
+            // the window is complete.
+            let (rows, complete) = journal.read_tail(run, 10).await.unwrap().unwrap();
+            assert!(complete);
+            assert_eq!(rows.len(), 10);
+
+            // An unknown run: an empty, complete window.
+            let (rows, complete) = journal.read_tail(RunId::new(), 4).await.unwrap().unwrap();
+            assert!(rows.is_empty() && complete);
+        });
+    }
+
+    #[test]
+    fn read_tail_fails_closed_on_a_corrupted_row() {
+        let dir = tempfile::tempdir().unwrap();
+        let run = RunId::new();
+        let trace = dir.path().join(format!("{run}.jsonl"));
+        std::fs::write(&trace, "{\"seq\":1}\n{ not json }\n").unwrap();
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        runtime.block_on(async {
+            let journal = FileEventJournal::open(dir.path()).await.unwrap();
+            let error = journal.read_tail(run, 8).await.unwrap_err();
+            assert!(error.to_string().contains("undecodable"), "{error}");
+        });
+    }
+}
+
+#[cfg(test)]
+mod exec8_r311_bounds_tests {
+    use super::*;
+    use agent_contracts::{RuntimeEvent, RuntimeEventEnvelope};
+
+    fn gc_envelope(run: RunId, seq: u64) -> String {
+        let envelope = RuntimeEventEnvelope {
+            run_id: run,
+            seq,
+            timestamp_ms: seq,
+            event: RuntimeEvent::StorageGc {
+                report: Default::default(),
+            },
+        };
+        serde_json::to_string(&envelope).unwrap()
+    }
+
+    /// EXEC-8 残余 (R3-11): the tail read is byte-bounded — a journal far
+    /// larger than the row ring reports its newest window with
+    /// `complete == false` instead of walking the whole file. Rows are
+    /// real serialized envelopes.
+    #[test]
+    fn read_tail_reports_an_incomplete_window_when_history_outgrows_the_ring() {
+        let dir = tempfile::tempdir().unwrap();
+        let run = RunId::new();
+        let trace = dir.path().join(format!("{run}.jsonl"));
+        let mut body = String::new();
+        for seq in 1..=200u64 {
+            body.push_str(&gc_envelope(run, seq));
+            body.push('\n');
+        }
+        std::fs::write(&trace, body).unwrap();
+
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        runtime.block_on(async {
+            let journal = FileEventJournal::open(dir.path()).await.unwrap();
+            let (rows, complete) = journal
+                .read_tail(run, 50)
+                .await
+                .unwrap()
+                .expect("a real journal serves reads");
+            assert_eq!(rows.len(), 50, "the ring keeps exactly the newest rows");
+            assert!(!complete, "history before the window must be reported");
+            assert_eq!(rows.last().unwrap().seq, 200, "newest row is last");
+            assert_eq!(rows.first().unwrap().seq, 151, "oldest of the window");
+        });
+    }
+
+    /// EXEC-8 残余 (R3-11): a single row over the line cap fails the read
+    /// closed with a typed error — never served, never silently skipped.
+    #[test]
+    fn read_tail_fails_closed_on_an_oversized_row() {
+        let dir = tempfile::tempdir().unwrap();
+        let run = RunId::new();
+        let trace = dir.path().join(format!("{run}.jsonl"));
+        let mut body = gc_envelope(run, 1);
+        body.push('\n');
+        body.push_str(&"x".repeat(crate::MAX_TAIL_LINE_BYTES + 1));
+        body.push('\n');
+        std::fs::write(&trace, body).unwrap();
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        runtime.block_on(async {
+            let journal = FileEventJournal::open(dir.path()).await.unwrap();
+            let error = journal.read_tail(run, 8).await.unwrap_err();
+            assert!(error.to_string().contains("single-row cap"), "{error}");
+        });
     }
 }

@@ -21,17 +21,21 @@ use agent_platform_protocol::{
     PendingApprovalSnapshot, PlatformEnvelope, PlatformError, PlatformErrorClass, PlatformResponse,
     RetryDisposition, TaskSnapshotEntry, TaskSnapshotStatus, ValidationError, ValidationResult,
     WorkArtifactRequest, WorkArtifactResponse, WorkCancelRequest, WorkCancelResponse,
-    WorkChangesRequest, WorkChangesResponse, WorkContextRequest, WorkContextResponse,
-    WorkContinueRequest, WorkContinueResponse, WorkSnapshotRequest, WorkSnapshotResponse,
-    WorkSubmitDisposition, WorkSubmitRequest, WorkSubmitResponse, WorkSubscribeRequest,
-    WorkSubscribeResponse, WorkTaskDetailRequest, WorkTaskDetailResponse,
+    WorkChangesRequest, WorkChangesResponse, WorkCompletionFact, WorkContextRequest,
+    WorkContextResponse, WorkContinueRequest, WorkContinueResponse, WorkSnapshotRequest,
+    WorkSnapshotResponse, WorkSubmitDisposition, WorkSubmitRequest, WorkSubmitResponse,
+    WorkSubmitResultDisposition, WorkSubmitResultRequest, WorkSubmitResultResponse,
+    WorkSubscribeRequest, WorkSubscribeResponse, WorkTaskCompletionRequest,
+    WorkTaskCompletionResponse, WorkTaskDetailRequest, WorkTaskDetailResponse,
     validate_approval_respond_request, validate_approval_respond_response,
     validate_work_artifact_request, validate_work_artifact_response, validate_work_cancel_request,
     validate_work_cancel_response, validate_work_changes_request, validate_work_changes_response,
     validate_work_context_request, validate_work_context_response, validate_work_continue_request,
     validate_work_continue_response, validate_work_snapshot_request,
     validate_work_snapshot_response, validate_work_submit_request, validate_work_submit_response,
+    validate_work_submit_result_request, validate_work_submit_result_response,
     validate_work_subscribe_request, validate_work_subscribe_response,
+    validate_work_task_completion_request, validate_work_task_completion_response,
     validate_work_task_detail_request, validate_work_task_detail_response,
 };
 use tokio::sync::broadcast;
@@ -72,6 +76,8 @@ pub enum WorkControlAction {
     ReadArtifact,
     /// B3 read-only: the context-engine item summary.
     ReadContext,
+    /// PLATFORM-1 read-only: one exact submission's admission receipt.
+    ReadSubmitResult,
 }
 
 /// Bounded facts supplied to the trusted authorizer. `authority_ref` is only
@@ -110,6 +116,8 @@ pub struct WorkControlGrant {
     pub allow_read_changes: bool,
     pub allow_read_artifact: bool,
     pub allow_read_context: bool,
+    /// PLATFORM-1: the exact-request receipt query is observation too.
+    pub allow_read_submit_result: bool,
 }
 
 impl WorkControlGrant {
@@ -128,6 +136,7 @@ impl WorkControlGrant {
             allow_read_changes: true,
             allow_read_artifact: true,
             allow_read_context: true,
+            allow_read_submit_result: true,
         }
     }
 
@@ -144,6 +153,7 @@ impl WorkControlGrant {
             allow_read_changes: true,
             allow_read_artifact: true,
             allow_read_context: true,
+            allow_read_submit_result: true,
         }
     }
 
@@ -159,6 +169,7 @@ impl WorkControlGrant {
             WorkControlAction::ReadChanges => self.allow_read_changes,
             WorkControlAction::ReadArtifact => self.allow_read_artifact,
             WorkControlAction::ReadContext => self.allow_read_context,
+            WorkControlAction::ReadSubmitResult => self.allow_read_submit_result,
         }
     }
 }
@@ -535,12 +546,22 @@ impl WorkControlRouter {
             run_started: status.serving,
             run_completed: false,
             watermark: status.watermark,
+            // PLATFORM-3: the snapshot names the run and workspace that
+            // produced it. The root is shown in the host's canonical form
+            // when the path resolves (the same rule the endpoint suffix
+            // hashes), so a client on a shared default endpoint can verify
+            // which workspace — and which run — is actually answering.
+            run_id: status.run_id,
+            workspace_root: canonical_workspace_display(&self.workspace),
             focus,
             tasks,
             pending_approvals,
             // Stream gaps are reported by the subscribe handshake or the
             // broadcast channel's explicit lag error.
             resync_required: false,
+            // EXEC-6 (R2-02): the typed status snapshot re-serves the last
+            // restore's evidence degradation so clients can re-obtain it.
+            restore_evidence_degraded: status.restore_evidence_degraded.clone(),
         };
         self.snapshot_response(&request, started, PlatformResponse::Success { value })
     }
@@ -706,6 +727,142 @@ impl WorkControlRouter {
         }
     }
 
+    /// EXEC-8 (R2-09) read-only: one completed task's outcome from the hot
+    /// window or the durable journal. Never starts a model round, never runs
+    /// a tool and never writes a checkpoint; every answer is typed evidence.
+    pub async fn task_completion(
+        &self,
+        request: PlatformEnvelope<WorkTaskCompletionRequest>,
+    ) -> AgentResult<PlatformEnvelope<PlatformResponse<WorkTaskCompletionResponse>>> {
+        validate_work_task_completion_request(&self.profile, &request)
+            .map_err(|error| AgentError::InvalidRequest(error.to_string()))?;
+        let started = Instant::now();
+        if !self.is_authorized(WorkControlAction::ReadTaskDetail, &request) {
+            return self.task_completion_response(
+                &request,
+                started,
+                PlatformResponse::Error {
+                    error: forbidden_error(),
+                },
+            );
+        }
+        let lookup = self
+            .bounded(started, || {
+                self.runtime.task_completion(request.payload.task_id)
+            })
+            .await;
+        let fact = match lookup {
+            Ok(fact) => fact,
+            Err(error) => {
+                return self.task_completion_response(
+                    &request,
+                    started,
+                    PlatformResponse::Error {
+                        error: work_runtime_error(error),
+                    },
+                );
+            }
+        };
+        let value = WorkTaskCompletionResponse {
+            task_id: request.payload.task_id,
+            fact: match fact {
+                crate::work::TaskCompletionLookup::Hot => WorkCompletionFact::Hot,
+                crate::work::TaskCompletionLookup::Retired {
+                    summary,
+                    anchor_revision,
+                    artifacts,
+                    final_output_digest,
+                } => WorkCompletionFact::Retired {
+                    summary,
+                    anchor_revision,
+                    artifacts,
+                    final_output_digest,
+                },
+                crate::work::TaskCompletionLookup::BeyondJournalWindow => {
+                    WorkCompletionFact::BeyondJournalWindow
+                }
+                crate::work::TaskCompletionLookup::Unknown => WorkCompletionFact::Unknown,
+            },
+        };
+        self.task_completion_response(&request, started, PlatformResponse::Success { value })
+    }
+
+    /// PLATFORM-1 (F06) read-only: what THIS run's ledger can prove about one
+    /// exact `client_request_id`. The query never matches on goal text and
+    /// never claims non-execution: an id outside the bounded evidence is
+    /// `Unknown`, and a recorded id with a different payload is
+    /// `KnownRejected`. The response echoes the run it answered from so a
+    /// client that reconnected elsewhere cannot misapply a stale answer.
+    pub async fn submit_result(
+        &self,
+        request: PlatformEnvelope<WorkSubmitResultRequest>,
+    ) -> AgentResult<PlatformEnvelope<PlatformResponse<WorkSubmitResultResponse>>> {
+        validate_work_submit_result_request(&self.profile, &request)
+            .map_err(|error| AgentError::InvalidRequest(error.to_string()))?;
+        let started = Instant::now();
+        if !self.is_authorized(WorkControlAction::ReadSubmitResult, &request) {
+            return self.submit_result_response(
+                &request,
+                started,
+                PlatformResponse::Error {
+                    error: forbidden_error(),
+                },
+            );
+        }
+        let run_id = self.runtime.run_id();
+        let client_request_id = request.payload.client_request_id.clone();
+        let asked_digest = request.payload.payload_digest.clone();
+        let queried = self
+            .bounded(started, || {
+                self.runtime
+                    .query_work_submission(client_request_id.clone(), asked_digest.clone())
+            })
+            .await;
+        match queried {
+            Ok(query) => {
+                let (disposition, task_id, accepted_payload_digest) = match query {
+                    crate::WorkSubmissionQuery::Recorded {
+                        task_id,
+                        payload_digest,
+                        matches,
+                    } => match matches {
+                        // The caller named the same payload: this exact
+                        // request is admitted.
+                        Some(true) | None => {
+                            (WorkSubmitResultDisposition::Accepted, Some(task_id), None)
+                        }
+                        // The caller named a different payload: the id is held
+                        // by another submission and this one was never
+                        // admitted. Terminal for this id.
+                        Some(false) => (
+                            WorkSubmitResultDisposition::KnownRejected,
+                            Some(task_id),
+                            Some(payload_digest),
+                        ),
+                    },
+                    crate::WorkSubmissionQuery::Unknown => {
+                        (WorkSubmitResultDisposition::Unknown, None, None)
+                    }
+                };
+                let value = WorkSubmitResultResponse {
+                    run_id,
+                    client_request_id: request.payload.client_request_id.clone(),
+                    disposition,
+                    task_id,
+                    accepted_payload_digest,
+                };
+                self.submit_result_response(&request, started, PlatformResponse::Success { value })
+            }
+            Err(error) => self.submit_result_response(
+                &request,
+                started,
+                PlatformResponse::Error {
+                    error: work_runtime_error(error),
+                },
+            ),
+        }
+    }
+
     /// B3 read-only: the workspace change journal, newest first, bounded and
     /// cursor-filtered. Reads the trusted journal; no mutation entry is ever
     /// opened through this router.
@@ -735,7 +892,12 @@ impl WorkControlRouter {
             .await;
         match records {
             Ok(records) => {
-                let changes = records.into_iter().map(change_summary).collect();
+                let run_id = self.runtime.run_id();
+                let workspace = Arc::clone(&self.workspace);
+                let mut changes = Vec::with_capacity(records.len());
+                for record in records {
+                    changes.push(change_summary_with_artifact(&workspace, run_id, record).await);
+                }
                 let value = WorkChangesResponse { changes };
                 self.changes_response(&request, started, PlatformResponse::Success { value })
             }
@@ -749,10 +911,13 @@ impl WorkControlRouter {
         }
     }
 
-    /// B3 read-only: one run-scoped artifact's bounded body. The workspace
-    /// verifies the run binding and (for sealed references) the content
-    /// digest before the router reads anything; the body never exceeds the
-    /// requested budget and `truncated` is the honest leftover fact.
+    /// B3 read-only, extended by PLATFORM-2 (F08) with bounded paging. The
+    /// workspace verifies the run binding and (for sealed references) the
+    /// content digest before the router reads anything; the window never
+    /// exceeds the requested budget and starts at the requested byte offset.
+    /// The sealed artifact is immutable, so every page re-verifies the same
+    /// identity and paging cannot quietly switch versions; `truncated` plus
+    /// `next_offset` are the honest continuation facts.
     pub async fn artifact(
         &self,
         request: PlatformEnvelope<WorkArtifactRequest>,
@@ -774,6 +939,7 @@ impl WorkControlRouter {
             .max_bytes
             .unwrap_or(DEFAULT_ARTIFACT_READ_BYTES)
             .min(MAX_ARTIFACT_READ_BYTES) as u64;
+        let offset = request.payload.offset.unwrap_or(0);
         let read = self
             .bounded(started, || {
                 let workspace = Arc::clone(&self.workspace);
@@ -786,9 +952,21 @@ impl WorkControlRouter {
                         .metadata()
                         .map_err(|e| AgentError::Io(format!("stat artifact: {e}")))?
                         .len();
-                    let want = size.min(max) as usize;
+                    if offset > size {
+                        return Err(AgentError::InvalidRequest(format!(
+                            "artifact offset {offset} is beyond the artifact of {size} bytes"
+                        )));
+                    }
+                    let want = size.saturating_sub(offset).min(max) as usize;
                     let mut buf = vec![0_u8; want];
                     let mut handle = file.into_tokio();
+                    if offset > 0 {
+                        use tokio::io::AsyncSeekExt;
+                        handle
+                            .seek(std::io::SeekFrom::Start(offset))
+                            .await
+                            .map_err(|e| AgentError::Io(format!("seek artifact: {e}")))?;
+                    }
                     use tokio::io::AsyncReadExt;
                     let mut filled = 0usize;
                     while filled < want {
@@ -808,11 +986,15 @@ impl WorkControlRouter {
             .await;
         match read {
             Ok((canonical, size, body)) => {
-                let truncated = size > max;
+                let end = offset + body.len() as u64;
+                let truncated = end < size;
+                let next_offset = truncated.then_some(end);
                 let value = WorkArtifactResponse {
                     reference: canonical,
                     size_bytes: size,
+                    offset,
                     truncated,
+                    next_offset,
                     content_base64: base64::engine::general_purpose::STANDARD.encode(&body),
                 };
                 self.artifact_response(&request, started, PlatformResponse::Success { value })
@@ -967,6 +1149,34 @@ impl WorkControlRouter {
         )
     }
 
+    fn task_completion_response(
+        &self,
+        request: &PlatformEnvelope<WorkTaskCompletionRequest>,
+        started: Instant,
+        payload: PlatformResponse<WorkTaskCompletionResponse>,
+    ) -> AgentResult<PlatformEnvelope<PlatformResponse<WorkTaskCompletionResponse>>> {
+        self.finish(
+            request,
+            started,
+            payload,
+            validate_work_task_completion_response,
+        )
+    }
+
+    fn submit_result_response(
+        &self,
+        request: &PlatformEnvelope<WorkSubmitResultRequest>,
+        started: Instant,
+        payload: PlatformResponse<WorkSubmitResultResponse>,
+    ) -> AgentResult<PlatformEnvelope<PlatformResponse<WorkSubmitResultResponse>>> {
+        self.finish(
+            request,
+            started,
+            payload,
+            validate_work_submit_result_response,
+        )
+    }
+
     fn changes_response(
         &self,
         request: &PlatformEnvelope<WorkChangesRequest>,
@@ -1017,6 +1227,27 @@ fn approval_risk(risk: ToolRisk) -> ApprovalRisk {
     }
 }
 
+/// PLATFORM-3: the workspace root as the snapshot reports it — the host's
+/// canonical form when the path resolves, the given form otherwise (the same
+/// fallback the endpoint-suffix rule uses). The Windows verbatim prefix that
+/// `canonicalize` emits (`\\?\C:\…`) is stripped for the display form: it is
+/// a representation artifact, not part of the workspace name a client would
+/// resolve on its side.
+fn canonical_workspace_display(workspace: &agent_workspace::Workspace) -> String {
+    let root = workspace.root();
+    let canonical = std::fs::canonicalize(root)
+        .unwrap_or_else(|_| root.to_path_buf())
+        .to_string_lossy()
+        .into_owned();
+    match canonical.strip_prefix(r"\\?\UNC\") {
+        Some(unc) => format!(r"\\{unc}"),
+        None => canonical
+            .strip_prefix(r"\\?\")
+            .map(str::to_owned)
+            .unwrap_or(canonical),
+    }
+}
+
 /// Runtime task lifecycle → protocol tag (shared by snapshot and the B3
 /// task-detail route).
 fn task_snapshot_status(status: crate::task::TaskStatus) -> TaskSnapshotStatus {
@@ -1027,10 +1258,17 @@ fn task_snapshot_status(status: crate::task::TaskStatus) -> TaskSnapshotStatus {
     }
 }
 
-/// Mirror one journal record onto the wire (B3). The journal's internal
-/// `old_content` capture never travels: it is a bounded review aid on disk,
-/// not a protocol field.
-fn change_summary(record: agent_workspace::ChangeRecord) -> ChangeSummary {
+/// Mirror one journal record onto the wire (B3). A captured `old_content`
+/// still never travels inline: PLATFORM-2 spills it once into the run's
+/// sealed artifact store (content-addressed, so identical captures dedupe)
+/// and hands back a *reference* the paged `work.artifact` route can read.
+/// A spill failure degrades to `None` — the row stays reviewable through
+/// its hashes; a missing locator must not fail the whole journal read.
+async fn change_summary_with_artifact(
+    workspace: &agent_workspace::Workspace,
+    run_id: RunId,
+    record: agent_workspace::ChangeRecord,
+) -> ChangeSummary {
     match record {
         agent_workspace::ChangeRecord::MutationPrepared {
             tx_id,
@@ -1042,18 +1280,28 @@ fn change_summary(record: agent_workspace::ChangeRecord) -> ChangeSummary {
             bytes_after,
             before_hash,
             after_hash,
-            ..
-        } => ChangeSummary::MutationPrepared {
-            tx_id,
-            timestamp_ms,
-            tool,
-            path,
-            action,
-            bytes_before,
-            bytes_after,
-            before_hash,
-            after_hash,
-        },
+            old_content,
+        } => {
+            let old_content_artifact = match old_content.filter(|body| !body.is_empty()) {
+                Some(body) => workspace
+                    .write_artifact(run_id, "changes", "txt", body.as_bytes())
+                    .await
+                    .ok(),
+                None => None,
+            };
+            ChangeSummary::MutationPrepared {
+                tx_id,
+                timestamp_ms,
+                tool,
+                path,
+                action,
+                bytes_before,
+                bytes_after,
+                before_hash,
+                after_hash,
+                old_content_artifact,
+            }
+        }
         agent_workspace::ChangeRecord::MutationCommitted {
             tx_id,
             timestamp_ms,

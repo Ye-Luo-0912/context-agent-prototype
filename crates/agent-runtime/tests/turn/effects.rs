@@ -1138,3 +1138,135 @@ async fn failed_turn_commit_emits_turn_commit_failed_and_recovery_required() {
         "the runtime must require a known-good restore after a failed turn commit: {next}"
     );
 }
+
+/// CORE-4: cancelling while a model round is in flight must leave an
+/// explicit `unknown` usage row — the provider may still bill the cut-off
+/// call, so silence (or zeros labelled observed) would understate cost.
+#[tokio::test]
+async fn cancelling_an_in_flight_model_round_leaves_an_unknown_usage_row() {
+    struct HangingModel;
+    #[async_trait::async_trait]
+    impl ModelTransport for HangingModel {
+        fn capabilities(&self) -> ModelCapabilities {
+            ModelCapabilities::default()
+        }
+        async fn complete(&self, request: ModelRequest) -> AgentResult<ModelOutput> {
+            request.cancel.cancelled().await;
+            Err(AgentError::Model(
+                "model round aborted by cancellation".into(),
+            ))
+        }
+    }
+
+    let handle = spawn_with_approval(
+        Arc::new(HangingModel),
+        Arc::new(TestContextEngine),
+        Arc::new(TestToolDispatcher),
+        Arc::new(PolicyApprovalGate::permissive()),
+    )
+    .await;
+    let mut events = handle.subscribe();
+    handle.user_message("go".into()).await.unwrap();
+    // Let the model round start and hang on the provider call.
+    tokio::time::sleep(Duration::from_millis(80)).await;
+    handle.cancel_turn().await.unwrap();
+
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+    let (mut unknown_row, mut cancelled) = (false, false);
+    while tokio::time::Instant::now() < deadline {
+        while let Ok(envelope) = events.try_recv() {
+            match envelope.event {
+                RuntimeEvent::ModelUsed {
+                    usage_identity,
+                    input_tokens,
+                    output_tokens,
+                    ..
+                } => {
+                    assert_eq!(
+                        usage_identity,
+                        agent_contracts::UsageIdentity::Unknown,
+                        "an aborted round has no usable evidence"
+                    );
+                    assert_eq!((input_tokens, output_tokens), (0, 0));
+                    unknown_row = true;
+                }
+                RuntimeEvent::TurnCancelled { .. } => cancelled = true,
+                _ => {}
+            }
+        }
+        if unknown_row && cancelled {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert!(
+        unknown_row,
+        "the cancelled in-flight round must carry an unknown usage row"
+    );
+    assert!(cancelled, "the turn must end cancelled");
+}
+
+/// COST-1 (E05.1): a model round that FAILS on its own (provider error,
+/// stream interrupt — no cancellation involved) is still a real cost whose
+/// evidence is lost: the failure-terminal path carries an explicit
+/// `unknown` usage row instead of a silent zero.
+#[tokio::test]
+async fn a_failed_model_round_leaves_an_unknown_usage_row() {
+    struct FailingModel;
+    #[async_trait::async_trait]
+    impl ModelTransport for FailingModel {
+        fn capabilities(&self) -> ModelCapabilities {
+            ModelCapabilities::default()
+        }
+        async fn complete(&self, _request: ModelRequest) -> AgentResult<ModelOutput> {
+            Err(AgentError::Model("provider stream interrupted".into()))
+        }
+    }
+
+    let handle = spawn_with_approval(
+        Arc::new(FailingModel),
+        Arc::new(TestContextEngine),
+        Arc::new(TestToolDispatcher),
+        Arc::new(PolicyApprovalGate::permissive()),
+    )
+    .await;
+    let mut events = handle.subscribe();
+    handle.user_message("go".into()).await.unwrap();
+
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+    let (mut unknown_row, mut failure) = (false, false);
+    while tokio::time::Instant::now() < deadline {
+        while let Ok(envelope) = events.try_recv() {
+            match envelope.event {
+                RuntimeEvent::ModelUsed {
+                    usage_identity,
+                    input_tokens,
+                    output_tokens,
+                    ..
+                } => {
+                    assert_eq!(
+                        usage_identity,
+                        agent_contracts::UsageIdentity::Unknown,
+                        "a failed round has no usable evidence"
+                    );
+                    assert_eq!((input_tokens, output_tokens), (0, 0));
+                    unknown_row = true;
+                }
+                RuntimeEvent::Failure { .. } => failure = true,
+                _ => {}
+            }
+        }
+        if unknown_row && failure {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert!(
+        unknown_row,
+        "the failed round must carry an unknown usage row"
+    );
+    assert!(
+        failure,
+        "the provider failure must still surface as Failure"
+    );
+}

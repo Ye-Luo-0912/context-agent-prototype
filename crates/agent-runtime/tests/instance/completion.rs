@@ -170,6 +170,7 @@ async fn completion_commits_a_typed_record_and_publishes_task_identity() {
                 task_id: event_task,
                 anchor_revision,
                 summary,
+                ..
             } = envelope.event
             {
                 saw = Some((event_task, anchor_revision, summary));
@@ -411,17 +412,40 @@ async fn thousand_completed_tasks_stay_bounded_and_searchable() {
             .unwrap();
     }
 
-    // Every completed task owns exactly one committed outcome: the runtime's
-    // task catalog holds all of them, and the checkpoint persists each one.
-    assert_eq!(instance.handle().list_tasks().await.unwrap().len(), 1000);
+    // EXEC-2: the HOT catalog is a bounded window (64 completed rows /
+    // 256 completion records). Completing 1,000 tasks leaves exactly the
+    // window's worth of hot rows; the evicted outcomes stay auditable in
+    // the journal instead of growing the hot state linearly.
+    assert_eq!(
+        instance.handle().list_tasks().await.unwrap().len(),
+        64,
+        "the hot completed-task window holds exactly MAX_HOT_COMPLETED_TASK_RECORDS rows"
+    );
     let checkpoint = instance.checkpoint().await.unwrap();
-    assert_eq!(checkpoint.tasks.completed.len(), 1000);
+    assert!(
+        checkpoint.tasks.completed.len() <= 256,
+        "the hot completion-record window is bounded, got {}",
+        checkpoint.tasks.completed.len()
+    );
     assert!(
         checkpoint
             .tasks
             .tasks
             .iter()
             .all(|task| task.status == agent_runtime::TaskStatus::Completed)
+    );
+    // The NEWEST outcome is inside the window and searchable by its summary
+    // content: the last completion names "component 999 fixed".
+    let newest = checkpoint
+        .tasks
+        .completed
+        .iter()
+        .max_by_key(|record| record.completed_at_ms)
+        .expect("the window must hold the newest completions");
+    assert!(
+        newest.summary.contains("component 999"),
+        "the newest completion must be the last task's outcome: {:?}",
+        newest.summary
     );
 
     // The context working set stays bounded: completing 1,000 tasks must not

@@ -56,9 +56,14 @@ async fn host_config(
     // reads `diagnostics.focus_task_id`, so an active-task checkpoint
     // restores under the default profile instead of being irrecoverably
     // refused.
-    let context_engine =
-        agent_compose::build_context_engine(ContextPolicy::Rolling, workspace.state_dir(), None)
-            .await?;
+    let context_engine = agent_compose::build_context_engine(
+        ContextPolicy::Rolling,
+        workspace.state_dir(),
+        None,
+        None,
+        &agent_compose::MaintenanceBudget::default(),
+    )
+    .await?;
     let base_tools = Arc::new(
         tool_runtime::BuiltinToolDispatcher::with_config_and_verification_recipes(
             workspace.clone(),

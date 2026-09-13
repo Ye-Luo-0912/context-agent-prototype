@@ -26,6 +26,34 @@ impl ModelTransport for HangingModel {
     }
 }
 
+/// COST-7 (R2-11): completes WITH usage shortly after the cancellation
+/// fires — the provider had already answered, but the turn has moved on.
+/// The late result must not advance the task, and its cost must be counted
+/// exactly once (the cancellation's unknown row stands in; a second,
+/// double-counted row must not appear).
+#[derive(Debug)]
+struct LateUsageModel;
+
+#[async_trait::async_trait]
+impl ModelTransport for LateUsageModel {
+    fn capabilities(&self) -> ModelCapabilities {
+        ModelCapabilities::default()
+    }
+    async fn complete(&self, request: ModelRequest) -> AgentResult<ModelOutput> {
+        request.cancel.cancelled().await;
+        tokio::time::sleep(Duration::from_millis(80)).await;
+        Ok(ModelOutput {
+            content: "too late".into(),
+            tool_calls: Vec::new(),
+            usage: agent_contracts::ModelUsage {
+                input_tokens: Some(321),
+                output_tokens: Some(78),
+                ..Default::default()
+            },
+        })
+    }
+}
+
 /// Deliberately ignores cancellation until the test releases it. Real
 /// provider transports can have the same short-lived lag while a request is
 /// unwinding, so actor shutdown may not assume the model future is gone.
@@ -390,4 +418,140 @@ async fn actor_cancels_hanging_model_cleanly() {
         !turn_completed,
         "cancellation must never masquerade as a successful turn commit"
     );
+}
+
+/// COST-7 (R3-12): fails AFTER the provider reported usage for the
+/// attempt — the typed failure carries the known counters.
+#[derive(Debug)]
+struct FailedWithUsageModel;
+
+#[async_trait::async_trait]
+impl ModelTransport for FailedWithUsageModel {
+    fn capabilities(&self) -> ModelCapabilities {
+        ModelCapabilities::default()
+    }
+    async fn complete(&self, _request: ModelRequest) -> AgentResult<ModelOutput> {
+        Err(AgentError::failed_with_usage(
+            agent_contracts::ModelUsage {
+                input_tokens: Some(321),
+                output_tokens: Some(78),
+                attempts: 1,
+                ..agent_contracts::ModelUsage::default()
+            },
+            AgentError::Model("generation failed after billing".into()),
+        ))
+    }
+}
+
+/// COST-7 (R3-12): a failed MODEL round whose provider usage arrived keeps
+/// the REAL counters under their honest identity on the main lane — the
+/// failure no longer downgrades known evidence to an unknown row.
+#[tokio::test]
+async fn a_failed_round_with_reported_usage_keeps_the_real_counters() {
+    let handle = spawn_with(
+        Arc::new(FailedWithUsageModel),
+        Arc::new(TestContextEngine),
+        Arc::new(TestToolDispatcher),
+    )
+    .await;
+    let mut events = handle.subscribe();
+    handle.user_message("hello".into()).await.unwrap();
+
+    let mut model_used = None;
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+    while tokio::time::Instant::now() < deadline {
+        while let Ok(envelope) = events.try_recv() {
+            if let RuntimeEvent::ModelUsed {
+                input_tokens,
+                output_tokens,
+                usage_identity,
+                role,
+                ..
+            } = envelope.event
+            {
+                model_used = Some((input_tokens, output_tokens, usage_identity, role));
+            }
+        }
+        if model_used.is_some() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    let (input, output, identity, role) =
+        model_used.expect("the failed round must still produce a usage row");
+    assert_eq!((input, output), (321, 78), "the real counters survive");
+    assert_eq!(
+        identity,
+        agent_contracts::UsageIdentity::Observed,
+        "a full provider report stays observed, not unknown"
+    );
+    assert_eq!(role, agent_contracts::ModelCallRole::Main);
+}
+
+/// COST-7 (R2-11): cancel and a late usage-bearing completion arrive for
+/// the same round. The account carries exactly one row — the cancellation's
+/// unknown main-lane row — and the stale completion supplements nothing
+/// twice, does not advance the turn, and does not emit a second observed
+/// row for the same operation.
+#[tokio::test]
+async fn cancel_and_late_completion_count_one_cost_exactly_once() {
+    let handle = spawn_with(
+        Arc::new(LateUsageModel),
+        Arc::new(TestContextEngine),
+        Arc::new(TestToolDispatcher),
+    )
+    .await;
+    let mut events = handle.subscribe();
+    handle.user_message("hello".into()).await.unwrap();
+
+    // Cancel while the model call is parked on the cancellation token.
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    handle.cancel_turn().await.unwrap();
+
+    // Let the late usage-bearing completion land and be processed stale.
+    tokio::time::sleep(Duration::from_millis(300)).await;
+
+    let mut model_used_rows: Vec<(u64, u64, &'static str, &'static str)> = Vec::new();
+    let mut turn_completed = false;
+    while let Ok(envelope) = events.try_recv() {
+        match envelope.event {
+            RuntimeEvent::ModelUsed {
+                input_tokens,
+                output_tokens,
+                usage_identity,
+                role,
+                ..
+            } => {
+                let identity = match usage_identity {
+                    agent_contracts::UsageIdentity::Observed => "observed",
+                    agent_contracts::UsageIdentity::Estimated => "estimated",
+                    agent_contracts::UsageIdentity::Unknown => "unknown",
+                };
+                let role_name = match role {
+                    agent_contracts::ModelCallRole::Main => "main",
+                    agent_contracts::ModelCallRole::Maintenance => "maintenance",
+                };
+                model_used_rows.push((input_tokens, output_tokens, identity, role_name));
+            }
+            RuntimeEvent::TurnCompleted => turn_completed = true,
+            _ => {}
+        }
+    }
+    assert!(!turn_completed, "the cancelled turn must not complete");
+    assert_eq!(
+        model_used_rows.len(),
+        1,
+        "one round costs one row: got {model_used_rows:?}"
+    );
+    let (input, output, identity, role) = model_used_rows[0];
+    assert_eq!(
+        (input, output),
+        (0, 0),
+        "the unknown row carries no invented counters"
+    );
+    assert_eq!(
+        identity, "unknown",
+        "the cancelled round's evidence is unknown"
+    );
+    assert_eq!(role, "main", "the row names the main lane");
 }

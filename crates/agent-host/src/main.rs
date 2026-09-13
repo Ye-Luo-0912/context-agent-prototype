@@ -12,7 +12,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 use agent_compose::{
     ComposeConfig, ContextPolicy, HostToolPolicyRegistry, ModelSelection, build_context_engine,
-    compose, try_model_from_env,
+    compose, maintenance_budget_from_env, try_maintenance_transport_from_env, try_model_from_env,
 };
 use agent_core::{ApprovalBroker, InteractiveApprovalGate, PolicyApprovalGate, TaskApprovalGate};
 use agent_host::{
@@ -145,13 +145,28 @@ async fn real_main() -> anyhow::Result<()> {
         }
     };
 
+    // COST-4 (D02): an optional independent maintenance transport (its own
+    // time bound) owns compaction calls; absent, the main model serves.
+    let maintenance_transport = try_maintenance_transport_from_env()?;
+    if maintenance_transport.is_some() {
+        eprintln!("host: maintenance transport active (MAINTENANCE_TIMEOUT_SECS)");
+    }
+
     let workspace = Workspace::open(&root).await?;
     let single = SingleInstance::acquire(workspace.state_dir())?;
     eprintln!("host: workspace {}", root.display());
 
     let journal = Arc::new(FileEventJournal::open(workspace.state_dir().join("traces")).await?);
-    let context_engine =
-        build_context_engine(policy, workspace.state_dir(), Some(model.clone())).await?;
+    let maintenance_budget = maintenance_budget_from_env()?;
+    eprintln!("host: {}", maintenance_budget.describe());
+    let context_engine = build_context_engine(
+        policy,
+        workspace.state_dir(),
+        Some(model.clone()),
+        maintenance_transport,
+        &maintenance_budget,
+    )
+    .await?;
     let verification_recipes = Arc::new(VerificationRecipes::discover(&workspace)?);
     let host_policies = Arc::new(
         HostToolPolicyRegistry::with_builtins_and_verification(&verification_recipes)

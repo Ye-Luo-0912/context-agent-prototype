@@ -70,6 +70,9 @@ fn final_pack_window_covers(candidate: &MaterializedItem, dropped: &Materialized
         start_line: candidate.file_start_line,
         end_line: candidate.file_end_line,
         covers_file,
+        // F01: the candidate here is the body that actually reached the
+        // final request, so its declared range is the range the model saw.
+        complete: true,
     };
     agent_contracts::visible_body_windows_cover(
         &[window],
@@ -213,6 +216,26 @@ fn model_request_metadata(
     metadata
 }
 
+/// EXEC-1: the prepared round locals the post-materialization tail
+/// consumes. Parked with the actor while the spawned materialization
+/// runs; destructured back to the original names so the tail reads
+/// exactly as it did when it ran inline.
+pub(super) struct ModelRoundPlan {
+    pub(super) turn_id: TurnId,
+    pub(super) model_round: usize,
+    pub(super) turn_frame: TurnFrame,
+    pub(super) runtime_focus: Option<agent_contracts::FocusState>,
+    pub(super) task_view: Option<agent_contracts::TaskAnchorView>,
+    pub(super) base_progress_view: Option<agent_contracts::TaskProgressView>,
+    pub(super) settlement_candidate: bool,
+    pub(super) project_settlement: bool,
+    pub(super) settlement_projection_diagnostics: bool,
+    pub(super) materialize_started: std::time::Instant,
+    pub(super) output_reserve: usize,
+    pub(super) send_window: usize,
+    pub(super) surface_plan: RoundSurfacePlan,
+    pub(super) proof_surface_available: bool,
+}
 impl RuntimeActor {
     /// Prepare + spawn one model round: close the consumed tool frames,
     /// maintenance, materialize, assemble, then the model call as an
@@ -221,6 +244,18 @@ impl RuntimeActor {
         &mut self,
         op_tx: &mpsc::Sender<OperationCompletion>,
     ) {
+        // EXEC-7 (R2-08): a deferred explicit collect parks here — the round
+        // assembles after the pass lands, so the eviction the model asked
+        // for is in place before the next decision. This is the one funnel
+        // every next-model-round path goes through, including the deferred
+        // resumes.
+        if let Some(turn) = self.state.turn.as_mut()
+            && turn.deferred_context_collect
+        {
+            turn.deferred_context_collect = false;
+            self.begin_explicit_collect().await;
+            return;
+        }
         // The previous round's tool frames end here: the model request below
         // consumes their results (they ride in the turn frame).
         if let Err(error) = self.close_tool_frames().await {
@@ -818,7 +853,7 @@ impl RuntimeActor {
             .specs()
             .iter()
             .any(|spec| spec.name == "verify.run");
-        let (runtime_focus, task_view, mut base_progress_view, settlement_candidate) = self
+        let (runtime_focus, task_view, base_progress_view, settlement_candidate) = self
             .runtime_prompt_focus(&turn_frame, proof_surface_available)
             .await;
         let project_settlement = self.services.project_settlement();
@@ -867,29 +902,80 @@ impl RuntimeActor {
             base_progress_view.as_ref(),
             &protocol_bodies,
         );
-        let visible_body_windows =
-            crate::prompt::visible_body_windows_for_request(&turn_frame, &protocol_bodies);
+        let visible_body_windows = crate::prompt::visible_body_windows_for_request(
+            &turn_frame,
+            base_progress_view.as_ref(),
+            &protocol_bodies,
+        );
         let context_budget = model_budget.context_frame_budget;
-        let materialized = match self
-            .services
-            .context_materialize(ContextQuery {
-                current_input: current_input.clone(),
-                budget_tokens: context_budget,
-                hints: ContextHints {
-                    max_selected_items: Some(CONTEXT_CONSUMPTION_ACK_ITEM_CAP),
-                    anchor_roots,
-                    task: task_view.clone(),
-                    checked_files: base_progress_view
-                        .as_ref()
-                        .map(|view| view.checked_files.clone())
-                        .unwrap_or_default(),
-                    visible_body_identities,
-                    visible_body_windows,
-                    foreground_resources,
-                },
-            })
-            .await
-        {
+        let query = ContextQuery {
+            current_input: current_input.clone(),
+            budget_tokens: context_budget,
+            hints: ContextHints {
+                max_selected_items: Some(CONTEXT_CONSUMPTION_ACK_ITEM_CAP),
+                anchor_roots,
+                task: task_view.clone(),
+                checked_files: base_progress_view
+                    .as_ref()
+                    .map(|view| view.checked_files.clone())
+                    .unwrap_or_default(),
+                visible_body_identities,
+                visible_body_windows,
+                foreground_resources,
+            },
+        };
+        let plan = ModelRoundPlan {
+            turn_id,
+            model_round,
+            turn_frame,
+            runtime_focus,
+            task_view,
+            base_progress_view,
+            settlement_candidate,
+            project_settlement,
+            settlement_projection_diagnostics,
+            materialize_started,
+            output_reserve,
+            send_window,
+            surface_plan,
+            proof_surface_available,
+        };
+        // EXEC-1: the engine's materialization is the round's one unbounded
+        // wait (engine gate + storage reads bounded by bytes, never by
+        // time). It runs as a spawned operation so Cancel/Stop keep being
+        // received while it waits; the prepared tail is parked with the
+        // actor and resumes from this exact plan on the operation's
+        // completion. The query is fully cloned here — the actor only
+        // plans, fences and commits.
+        self.spawn_materialization(query, plan, op_tx);
+    }
+
+    /// EXEC-1: the round tail after the engine's materialization preview
+    /// returned. Every await from here to the provider spawn is a bounded
+    /// journal/event emission, so the actor's command lane stays live.
+    pub(super) async fn continue_model_operation_after_materialize(
+        &mut self,
+        plan: ModelRoundPlan,
+        result: AgentResult<MaterializedContext>,
+        op_tx: &mpsc::Sender<OperationCompletion>,
+    ) {
+        let ModelRoundPlan {
+            turn_id,
+            model_round,
+            turn_frame,
+            runtime_focus,
+            task_view,
+            mut base_progress_view,
+            settlement_candidate,
+            project_settlement,
+            settlement_projection_diagnostics,
+            materialize_started,
+            output_reserve,
+            send_window,
+            mut surface_plan,
+            proof_surface_available,
+        } = plan;
+        let materialized = match result {
             Ok(materialized) => materialized,
             Err(error) => {
                 // Materialize advances engine clocks and may run through the
@@ -974,11 +1060,9 @@ impl RuntimeActor {
             &turn_frame,
             surface_plan.specs().to_vec(),
         );
-        // TEMP-DBG
-        {
-            let names: Vec<String> = input.tool_schemas.iter().map(|t| t.name.clone()).collect();
-            eprintln!("DBG assembled input.tool_schemas={names:?}");
-        }
+        // COST-3 (D05): the unconditional stderr dump of assembled tool
+        // schemas is gone — tool-surface facts are already durable in
+        // `ToolSurfacePlanned` and need no hot-path printing.
         // A second packed request exists only for the diagnostic off arm.
         // Ordinary product off/on paths measure and trim `input` directly;
         // they neither assemble nor clone a second ModelInput.
@@ -1004,12 +1088,16 @@ impl RuntimeActor {
         let assembled_total = |input: &ModelInput| {
             approx_layer_tokens(&input.into_messages()) + approx_layer_tokens(&input.tool_schemas)
         };
-        let packed_total = |input: &ModelInput, packing: &Option<ModelInput>| {
-            assembled_total(packing.as_ref().unwrap_or(input))
-        };
-        while packed_total(&input, &packing_input) > max_input_budget
-            && !materialized.items.is_empty()
-        {
+        // COST-3 (D04): the totals are derived ONCE per assembly and tracked
+        // as plain values — the packing conditions below no longer
+        // re-serialize the whole message list on every comparison. The
+        // single source of truth stays the freshly assembled `input`;
+        // `approx_tokens` remains the engine's own heuristic and the final
+        // refusal keeps its conservative margin.
+        let mut input_total = assembled_total(&input);
+        let mut packing_total = packing_input.as_ref().map(assembled_total);
+        let mut packed_now = packing_total.unwrap_or(input_total);
+        while packed_now > max_input_budget && !materialized.items.is_empty() {
             // Drop the largest optional item first. If only mandatory
             // bodies remain, the hard provider budget still wins, but that
             // removal becomes an explicit BudgetExcluded completion blocker.
@@ -1033,6 +1121,7 @@ impl RuntimeActor {
                 &turn_frame,
                 surface_plan.specs().to_vec(),
             );
+            input_total = assembled_total(&input);
             if packing_input.is_some() {
                 packing_input = Some(
                     self.assemble_model_input(
@@ -1045,11 +1134,11 @@ impl RuntimeActor {
                     )
                     .0,
                 );
+                packing_total = Some(assembled_total(packing_input.as_ref().unwrap()));
             }
+            packed_now = packing_total.unwrap_or(input_total);
         }
-        while packed_total(&input, &packing_input) > max_input_budget
-            && !materialized.foreground.is_empty()
-        {
+        while packed_now > max_input_budget && !materialized.foreground.is_empty() {
             let drop_index = largest_final_pack_drop_index(&materialized, &materialized.foreground);
             let Some(drop_index) = drop_index else {
                 break;
@@ -1067,6 +1156,7 @@ impl RuntimeActor {
                 &turn_frame,
                 surface_plan.specs().to_vec(),
             );
+            input_total = assembled_total(&input);
             if packing_input.is_some() {
                 packing_input = Some(
                     self.assemble_model_input(
@@ -1079,7 +1169,9 @@ impl RuntimeActor {
                     )
                     .0,
                 );
+                packing_total = Some(assembled_total(packing_input.as_ref().unwrap()));
             }
+            packed_now = packing_total.unwrap_or(input_total);
         }
 
         // The context frame is empty but the fixed layers still overshoot:
@@ -1088,7 +1180,7 @@ impl RuntimeActor {
         // generation or make a later, larger-budget round forget the tool.
         // The trimmed snapshot remains the one source for prompt assembly,
         // accounting and tool-call validation in this round.
-        while packed_total(&input, &packing_input) > max_input_budget {
+        while packed_now > max_input_budget {
             if surface_plan.omit_largest_for_provider_budget().is_none() {
                 break;
             }
@@ -1121,6 +1213,7 @@ impl RuntimeActor {
                 &turn_frame,
                 surface_plan.specs().to_vec(),
             );
+            input_total = assembled_total(&input);
             if packing_input.is_some() {
                 packing_input = Some(
                     self.assemble_model_input(
@@ -1133,7 +1226,9 @@ impl RuntimeActor {
                     )
                     .0,
                 );
+                packing_total = Some(assembled_total(packing_input.as_ref().unwrap()));
             }
+            packed_now = packing_total.unwrap_or(input_total);
         }
 
         // Runtime trimming itself may have displaced a required body and
@@ -1189,8 +1284,10 @@ impl RuntimeActor {
             return;
         }
 
-        let estimated_input_tokens = assembled_total(&input);
-        let packing_input_tokens = packed_total(&input, &packing_input);
+        // COST-3 (D04): the tracked totals ARE the final derivation — no
+        // extra message re-serialization for the accounting read.
+        let estimated_input_tokens = input_total;
+        let packing_input_tokens = packing_total.unwrap_or(input_total);
         // 正文恢复账目出账（增量）。eligible 是最终
         // 组装的真实 checkpoint demand；失效/超限计数是自上一条账目
         // 以来的累计，drain 后归零。
@@ -1515,6 +1612,10 @@ impl RuntimeActor {
                         class,
                         retryable,
                         message: crate::output::bound_error_message(error.to_string()),
+                        // COST-7 (R3-12): usage the provider already
+                        // reported for the failed attempt travels with the
+                        // outcome instead of degrading to unknown.
+                        usage: error.reported_usage().cloned(),
                     }
                 }
             };
@@ -1543,13 +1644,17 @@ impl RuntimeActor {
                     disposition: ToolResultDisposition::PersistObservation,
                     context_ack: Some(context_ack),
                     maintenance: None,
+                    materialization: None,
+                    gc: None,
                 })
                 .await;
         });
     }
 
     fn classify_model_failure(error: &AgentError) -> (RuntimeFailureClass, bool) {
-        match error {
+        // COST-7 (R3-12): classification looks through the usage wrapper so
+        // a wrapped transport/limit failure keeps its class and retryability.
+        match error.failure_source() {
             AgentError::Transport { retryable, .. } => {
                 (RuntimeFailureClass::ProviderTransport, *retryable)
             }
@@ -1590,7 +1695,10 @@ impl RuntimeActor {
         )
     }
 
-    fn eligible_protocol_bodies(&self) -> Vec<(String, String)> {
+    /// Re-injectable protocol bodies with their real exposed windows. The
+    /// rows are the assembler's own row type, so the coverage each row can
+    /// prove travels with it instead of being re-derived (F01).
+    fn eligible_protocol_bodies(&self) -> Vec<crate::prompt::ProtocolBodyRow> {
         self.state
             .turn
             .as_ref()

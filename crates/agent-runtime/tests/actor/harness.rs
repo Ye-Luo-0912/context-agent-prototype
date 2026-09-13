@@ -658,8 +658,10 @@ impl ModelTransport for SilentModel {
                 input_tokens: Some(1),
                 output_tokens: Some(1),
                 cached_input_tokens: Some(0),
+                cache_write_input_tokens: None,
                 attempts: 1,
                 retries: 0,
+                ..Default::default()
             },
         })
     }
@@ -1772,4 +1774,69 @@ pub(crate) fn kernel_with_journal(journal: Arc<dyn EventJournal>) -> Arc<Runtime
         Arc::new(PolicyApprovalGate::read_only()),
         Some(journal),
     ))
+}
+
+/// EXEC-1: a context engine whose `materialize` parks on a notify gate, so
+/// actor tests hold the round's materialization wait deterministically (no
+/// sleep-guessed timing). Everything except `materialize` behaves exactly
+/// like [`TestContextEngine`]; the released wait returns either the normal
+/// empty preview or a storage failure, whichever the test installed.
+#[derive(Default)]
+pub(crate) struct GatedContextEngine {
+    /// Signalled once `materialize` is parked at its wait.
+    pub(crate) entered: tokio::sync::Notify,
+    /// Releases one parked `materialize`.
+    pub(crate) release: tokio::sync::Notify,
+    /// What the released wait returns. `StorageFailure` models a blocked
+    /// store read that eventually errors.
+    pub(crate) outcome: std::sync::Mutex<GateOutcome>,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) enum GateOutcome {
+    #[default]
+    Preview,
+    StorageFailure,
+}
+
+#[async_trait::async_trait]
+impl ContextEngine for GatedContextEngine {
+    async fn ingest(&self, ingress: ContextIngress) -> AgentResult<()> {
+        TestContextEngine.ingest(ingress).await
+    }
+    async fn maintain(
+        &self,
+        trigger: ContextMaintenanceTrigger,
+    ) -> AgentResult<ContextMaintenanceReport> {
+        TestContextEngine.maintain(trigger).await
+    }
+    async fn materialize(&self, query: ContextQuery) -> AgentResult<MaterializedContext> {
+        self.entered.notify_one();
+        self.release.notified().await;
+        let outcome = *self.outcome.lock().unwrap();
+        match outcome {
+            GateOutcome::Preview => TestContextEngine.materialize(query).await,
+            GateOutcome::StorageFailure => Err(agent_contracts::AgentError::Storage(
+                "gated engine storage read failed".into(),
+            )),
+        }
+    }
+    async fn open_scope(&self, kind: ScopeKind, parent: Option<ScopeId>) -> AgentResult<ScopeId> {
+        TestContextEngine.open_scope(kind, parent).await
+    }
+    async fn close_scope(&self, scope_id: ScopeId) -> AgentResult<Vec<ContextStateTransition>> {
+        TestContextEngine.close_scope(scope_id).await
+    }
+    async fn diagnostics(&self) -> AgentResult<ContextDiagnostics> {
+        TestContextEngine.diagnostics().await
+    }
+    async fn inspect(&self, limit: usize) -> AgentResult<Vec<ContextItemSummary>> {
+        TestContextEngine.inspect(limit).await
+    }
+    async fn checkpoint(&self) -> AgentResult<serde_json::Value> {
+        TestContextEngine.checkpoint().await
+    }
+    async fn restore(&self, data: serde_json::Value) -> AgentResult<()> {
+        TestContextEngine.restore(data).await
+    }
 }

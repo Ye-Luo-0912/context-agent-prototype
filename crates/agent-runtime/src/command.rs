@@ -8,7 +8,7 @@ use tokio::sync::{broadcast, mpsc, oneshot};
 
 use crate::checkpoint::RuntimeCheckpoint;
 use crate::task::{AnchorPatch, TaskAnchor, TaskInfo};
-use crate::work::{RuntimeStatusSnapshot, TaskDetailSnapshot, WorkSubmission};
+use crate::work::{RuntimeStatusSnapshot, TaskDetailSnapshot, WorkSubmission, WorkSubmissionQuery};
 
 /// Reply channel back to the caller of a command.
 pub type Reply<T> = oneshot::Sender<T>;
@@ -145,6 +145,27 @@ pub enum RuntimeCommand {
     TaskDetail {
         task_id: TaskId,
         reply: Reply<AgentResult<TaskDetailSnapshot>>,
+    },
+    /// EXEC-8 (R2-09): read-only cold lookup of one task's completed
+    /// outcome. Hot rows answer `Hot`; retired rows are read back from the
+    /// durable journal under a bounded window; the answer distinguishes an
+    /// honestly-bounded unknown from a covered absence. Reading never
+    /// mutates state, never starts a turn, never runs a tool and never
+    /// writes a checkpoint.
+    TaskCompletionLookup {
+        task_id: TaskId,
+        reply: Reply<AgentResult<crate::work::TaskCompletionLookup>>,
+    },
+    /// PLATFORM-1 (F06): read-only exact-request receipt query over the
+    /// process-lifetime submission ledger. The caller names its own
+    /// `client_request_id` and may name its payload digest (computed over its
+    /// own content, never authority); the answer never matches on goal text
+    /// and never claims non-execution. Always succeeds — an id the runtime
+    /// cannot testify about is `Unknown`, which is a fact, not an error.
+    QueryWorkSubmission {
+        client_request_id: String,
+        payload_digest: Option<String>,
+        reply: Reply<AgentResult<WorkSubmissionQuery>>,
     },
     /// Read Core's bounded authority truth for one tool operation. This is
     /// diagnostic/control-plane state, not a request to redispatch work.
@@ -390,6 +411,35 @@ impl RuntimeHandle {
     pub async fn task_detail(&self, task_id: TaskId) -> AgentResult<TaskDetailSnapshot> {
         self.call(|reply| RuntimeCommand::TaskDetail { task_id, reply })
             .await
+    }
+
+    /// EXEC-8 (R2-09): read-only cold lookup of one completed task's
+    /// outcome (hot window or durable journal). Zero model/tool side
+    /// effects; the answer is typed evidence, never a guess.
+    pub async fn task_completion(
+        &self,
+        task_id: TaskId,
+    ) -> AgentResult<crate::work::TaskCompletionLookup> {
+        self.call(|reply| RuntimeCommand::TaskCompletionLookup { task_id, reply })
+            .await
+    }
+
+    /// PLATFORM-1 (F06): read-only exact-request receipt query. Answers about
+    /// the caller's own `client_request_id` in THIS run's bounded,
+    /// process-lifetime ledger. An id outside that evidence is `Unknown` —
+    /// never "not executed" and never permission to resend. Reading never
+    /// mutates state, never starts a turn and never writes a checkpoint.
+    pub async fn query_work_submission(
+        &self,
+        client_request_id: String,
+        payload_digest: Option<String>,
+    ) -> AgentResult<WorkSubmissionQuery> {
+        self.call(|reply| RuntimeCommand::QueryWorkSubmission {
+            client_request_id,
+            payload_digest,
+            reply,
+        })
+        .await
     }
 
     /// Read Core's exact retained truth for one tool operation. The three

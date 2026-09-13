@@ -47,7 +47,7 @@ use crate::budget::{
     DEFAULT_OUTPUT_RESERVE, MAX_TOOL_SURFACE_TOKENS, ModelBudget, approx_layer_tokens,
     engine_pack_window, provider_send_window,
 };
-use crate::checkpoint::{MAX_CHECKPOINT_LIST_ROWS, RuntimeCheckpoint};
+use crate::checkpoint::RuntimeCheckpoint;
 use crate::command::{Reply, RuntimeCommand, RuntimeHandle};
 use crate::execution::{ExecutionState, RoundExecutionSnapshot, RuntimeExecutionAttribution};
 use crate::output::bound_tool_output;
@@ -216,6 +216,19 @@ enum OpKind {
     /// cancellation aborts the future at its next await point and the
     /// engine's fold guard returns every moved record.
     Maintenance,
+    /// EXEC-1: the round's context materialization runs as a spawned
+    /// operation for the same reason. `materialize` is the engine's
+    /// documented non-consuming preview — aborting the future releases the
+    /// engine gate/state locks and leaves no consumption committed, so a
+    /// cancelled wait claims neither a preview nor a cost.
+    Materialize,
+    /// EXEC-7 (R2-08): full-GC passes, the completion storage boundary, and
+    /// checkpoint-trigger maintenance run as spawned operations so a slow
+    /// engine (gated store, real compactor calls) never occupies the actor's
+    /// command branch. Turn-scoped GC work cancels like maintenance (abort =
+    /// the pass never committed); idle boundary work is joined by shutdown
+    /// and never fakes a rollback of landed physical deletes.
+    Gc,
 }
 
 const TOOL_SCOPE_CLOSE_TIMEOUT: Duration = Duration::from_secs(2);
@@ -390,6 +403,13 @@ struct ActiveTurn {
     turn_frame: TurnFrame,
     model_round: usize,
     pending_tools: VecDeque<ToolCall>,
+    /// EXEC-7 (R2-08): a `context.collect` directive whose full GC pass is
+    /// parked as a spawned boundary operation. Set at the directive's
+    /// operation-commit time; the next model-round funnel
+    /// (`spawn_model_operation`) exchanges it for the pass, so the collect
+    /// still lands before the next model decision without blocking the
+    /// actor's command branch.
+    deferred_context_collect: bool,
     /// Optional tools explicitly loaded by the model but not yet called in
     /// this directive. Unlike a time-to-live lease, this set advances on a
     /// semantic event: using the exact tool consumes its pending-load root.
@@ -793,6 +813,9 @@ impl ActiveTurn {
     /// 是 fs.read——edit 的 model_content 是 patch echo 不是完整文件，
     /// 不得冒充 exact body。失效规则：任何 Known mutation 使被触 path
     /// 失效；Unknown mutation 全部作废。
+    ///
+    /// 同时保存这次读取真实暴露的范围与完整性：缓存只证明「这些行被
+    /// 读过」，不证明「整个文件已可见」（F01）。
     fn record_protocol_body(&mut self, output: &ToolOutput) {
         if !output.ok {
             return;
@@ -820,8 +843,9 @@ impl ActiveTurn {
         let Some(digest) = touch.revision.clone().filter(|digest| !digest.is_empty()) else {
             return;
         };
+        let window = crate::prompt::file_read_window_from_output(output, touch);
         self.protocol_bodies
-            .record(&touch.path, &digest, &output.model_content);
+            .record(&touch.path, &digest, &output.model_content, window);
     }
 }
 
@@ -836,6 +860,7 @@ mod edit_attempt_tests {
             turn_frame: TurnFrame::new("edit the file"),
             model_round: 1,
             pending_tools: VecDeque::new(),
+            deferred_context_collect: false,
             pending_loaded_tools: Vec::new(),
             result_delivery_tools: Vec::new(),
             action_batch: None,
@@ -1171,6 +1196,15 @@ pub(crate) struct OperationCompletion {
     /// `OpKind::Maintenance` completion. Its parked actor phase resumes
     /// after the generation fence passes.
     maintenance: Option<AgentResult<agent_contracts::ContextMaintenanceReport>>,
+    /// EXEC-1: the engine's materialization preview (or its failure) for a
+    /// `OpKind::Materialize` completion. Resumes the parked round tail only
+    /// after the generation fence passes; a stale preview is dropped —
+    /// nothing was consumed.
+    materialization: Option<AgentResult<agent_contracts::MaterializedContext>>,
+    /// EXEC-7 (R2-08): the boundary work result for a `OpKind::Gc`
+    /// completion, dispatched against the parked `gc_work` continuation
+    /// instead of the turn fence.
+    gc: Option<maintenance::GcOutcome>,
 }
 
 /// Actor-side restore data that cannot be published until the host has
@@ -1185,6 +1219,11 @@ struct PendingRestore {
     surface_revision: RestoreRevision,
     rebased_tasks: usize,
     rebased_task_sample: Vec<TaskId>,
+    /// EXEC-6 (R2-02): the predecessor runs the RESTORED checkpoint's own
+    /// typed fields still name through canonical sealed locators — captured
+    /// while the decoded checkpoint is at hand, so finalization never needs
+    /// to re-read or scan any payload.
+    protected_runs: Vec<RunId>,
 }
 
 /// Latest final-packed mandatory-context result for the active task. The
@@ -1332,6 +1371,13 @@ struct ActorState {
     /// A full restore whose actor-owned planes are installed but whose host
     /// capability plane and durable commit record are not yet finalized.
     pending_restore: Option<PendingRestore>,
+    /// EXEC-6 (R2-02): bounded, re-obtainable facts about the current run's
+    /// restoration evidence — the predecessor runs whose sealed references
+    /// could NOT be admitted into this run's artifact lineage. Empty means
+    /// the last restore degraded nothing (or no restore happened yet).
+    /// Surfaced on the typed status snapshot; a fire-once event alone is not
+    /// a queryable fact.
+    restore_evidence_degraded: Vec<String>,
     /// The runtime's view of the current scope (filled once the context
     /// engine exposes its scope tree through the contract).
     scope_id: Option<ScopeId>,
@@ -1343,6 +1389,41 @@ struct ActorState {
     /// One parked continuation on the existing operation lane. Its task
     /// must stop before cancellation restores context or admits new work.
     maintenance: Option<maintenance::PendingMaintenance>,
+    /// EXEC-1: the parked round plan waiting for a spawned materialization.
+    /// Held separately from `turn.op` so the completion can resume exactly
+    /// this round's prepared tail; cancellation joins the task before any
+    /// new state is admitted.
+    materialization: Option<maintenance::PendingMaterialization>,
+    /// EXEC-7 (R2-08): one parked boundary operation (full GC, completion
+    /// storage boundary, or checkpoint maintenance) and the continuation
+    /// that resumes the interrupted commit tail. Turn-scoped work also owns
+    /// the turn's `InFlightOp`; idle work (completion boundary, checkpoint
+    /// maintenance) runs without a turn and is joined by shutdown.
+    gc_work: Option<maintenance::PendingGc>,
+    /// The actor's own operation-completion channel handle, stored at run
+    /// entry so internal paths can spawn boundary work without threading
+    /// the sender through every signature.
+    op_tx: Option<mpsc::Sender<OperationCompletion>>,
+    /// EXEC-7 (R2-08): a safe-point checkpoint whose Checkpoint-trigger
+    /// maintenance runs as a spawned prepare task. The frozen debt and the
+    /// allocated sequence live here until the barrier (`await_pending_checkpoint`)
+    /// or the settled-batch pump lands the prepare and hands the bytes to
+    /// the in-flight write — the synchronous durability protocol keeps every
+    /// barrier observable exactly as before, while the actor's command
+    /// branch stays free during a slow engine.
+    checkpoint_prepare: Option<safepoint::PendingCheckpointPrepare>,
+    /// CTX-8 接线 (R3-08): the engine's store-outage backpressure, observed
+    /// at the latest boundary pass (turn-final, completion boundary, or
+    /// explicit collect). `Some(false)` = the last pass ran clean;
+    /// `Some(true)` = the store is failing and NEW body production is
+    /// throttled; `None` = no pass has run yet.
+    store_backpressure: Option<crate::work::StoreBackpressure>,
+    /// EXEC-8 (R2-09): this run plus the runs it restored from, oldest
+    /// registration first — cold completion lookups scan each run's durable
+    /// journal partition under one bounded window each. Bounded like the
+    /// artifact lineage; a restore chain past the cap degrades the lookup
+    /// to beyond-window honestly rather than growing unbounded.
+    journal_runs: Vec<RunId>,
     /// 上次随 ExecutionFrontier 上报的派生结算标签。进程内记忆，
     /// 不进 checkpoint：标签是重算派生态，checkpoint 不携带决策。
     last_reported_settlement: Option<agent_contracts::SettlementLabel>,
@@ -1399,7 +1480,17 @@ struct ActorState {
     /// Not checkpointed: a restored/continued model round must materialize
     /// again before its completion proposal can rely on context readiness.
     context_requirement_observation: Option<ContextRequirementObservation>,
+    /// COST-7 (R2-11): operations whose cost is already in the account (a
+    /// cancellation's unknown row, or a stale completion's usage
+    /// supplement). The fence keeps cancel-vs-late-completion and duplicate
+    /// arrivals from counting one cost twice; bounded FIFO, process-local,
+    /// never checkpoint authority.
+    usage_accounted_ops: VecDeque<OperationId>,
 }
+
+/// Bounded window for the usage dedupe fence: cancellations and stale
+/// completions race within one turn's lifetime, so a small FIFO is enough.
+const MAX_USAGE_ACCOUNTED_OPS: usize = 64;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 enum ActorLifecycle {
@@ -1593,6 +1684,7 @@ impl RuntimeActor {
         proof_tx: mpsc::Sender<turn::DeferredProofRefresh>,
         mut proof_rx: mpsc::Receiver<turn::DeferredProofRefresh>,
     ) {
+        self.state.op_tx = Some(op_tx.clone());
         loop {
             tokio::select! {
                 command = rx.recv() => {
@@ -1616,7 +1708,7 @@ impl RuntimeActor {
                     match completed {
                         Some(completion) => {
                             self.on_operation_completed(completion, &op_tx, &proof_tx)
-                                .await
+                                .await;
                         }
                         None => {
                             let _ = self.shutdown(&mut op_rx, &op_tx, proof_tx.clone()).await;
@@ -1687,6 +1779,14 @@ impl RuntimeActor {
         let cleanup = self
             .drain_cancelled_tool_cleanup(op_rx, op_tx, &proof_tx)
             .await;
+        // EXEC-7 (R2-08): an idle boundary operation (completion storage
+        // boundary, checkpoint maintenance) must not be killed mid-pass
+        // silently. One bounded drain lets it land; a boundary that misses
+        // the shutdown window is aborted with its landed deletes staying
+        // durable facts — never a claimed rollback.
+        let boundary = self
+            .drain_gc_work_at_shutdown(op_rx, op_tx, &proof_tx)
+            .await;
         // An in-flight safe-point write must land before the kernel stops:
         // killing it mid-write leaves a `.tmp` remnant in the store and the
         // run without its resumable checkpoint. Awaiting here also keeps the
@@ -1700,6 +1800,9 @@ impl RuntimeActor {
         if let Err(error) = cleanup {
             errors.push(format!("cancelled operation cleanup failed: {error}"));
         }
+        if let Err(error) = boundary {
+            errors.push(format!("boundary operation drain failed: {error}"));
+        }
         if let Err(error) = final_checkpoint {
             errors.push(format!("final safe-point write failed: {error}"));
         }
@@ -1711,6 +1814,13 @@ impl RuntimeActor {
         } else {
             Err(AgentError::RecoveryRequired(errors.join("; ")))
         }
+    }
+
+    /// The actor's own completion-channel handle, if a run loop owns this
+    /// actor. Direct-call constructions (tests) have none and fall back to
+    /// inline boundary execution.
+    pub(super) fn op_tx(&self) -> Option<mpsc::Sender<OperationCompletion>> {
+        self.state.op_tx.clone()
     }
 
     async fn drain_cancelled_tool_cleanup(

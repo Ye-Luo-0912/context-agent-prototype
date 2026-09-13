@@ -39,6 +39,106 @@ pub enum TaskStatus {
 /// grow the resumable directory.
 pub(crate) const MAX_TASK_RECORDS: usize = 256;
 
+/// EXEC-2 (E06): completed tasks leave the hot catalog once this many newer
+/// completions exist. The hot row carries the full anchor/execution resume;
+/// the durable facts (journal event, sealed final-output artifact under the
+/// artifact store's own retention) survive the eviction. Resumable rows are
+/// never touched by this bound.
+pub(crate) const MAX_HOT_COMPLETED_TASK_RECORDS: usize = 64;
+/// EXEC-5 (R2-01): legacy backstop for the completion-record window. Since
+/// EXEC-5 the records retire pairwise with their completed rows (see
+/// `bounded_hot_pair_window`), so the live window is always a subset of the
+/// row window and this cap only guards against a future path reintroducing
+/// an independent record projection.
+pub(crate) const MAX_HOT_COMPLETION_RECORDS: usize = 256;
+
+/// EXEC-5 (R2-01): uniform access to the hot-eviction facts of a task row,
+/// so the live `TaskRecord` table and the checkpoint's `TaskRecordSnapshot`
+/// rows project through the exact same window.
+trait HotTaskRow {
+    fn hot_id(&self) -> TaskId;
+    fn hot_status(&self) -> TaskStatus;
+    fn hot_order_key(&self) -> (u64, u64);
+}
+
+impl HotTaskRow for TaskRecord {
+    fn hot_id(&self) -> TaskId {
+        self.id
+    }
+    fn hot_status(&self) -> TaskStatus {
+        self.status
+    }
+    fn hot_order_key(&self) -> (u64, u64) {
+        (self.last_active_ms, self.created_at_ms)
+    }
+}
+
+impl HotTaskRow for crate::checkpoint::TaskRecordSnapshot {
+    fn hot_id(&self) -> TaskId {
+        self.id
+    }
+    fn hot_status(&self) -> TaskStatus {
+        self.status
+    }
+    fn hot_order_key(&self) -> (u64, u64) {
+        (self.last_active_ms, self.created_at_ms)
+    }
+}
+
+/// EXEC-5 (R2-01): the one bounded hot projection shared by the live
+/// manager and the prospective terminal snapshot. Completed task rows and
+/// their completion records retire as a pair — `RuntimeCheckpoint::validate`
+/// requires every retained record to name a retained completed row and every
+/// completed row to own its record, so retiring one side alone would make
+/// every later checkpoint (and therefore every later completion) fail.
+/// Eviction order is oldest-completed-first by
+/// (`last_active_ms`, `created_at_ms`). Records whose row is gone (a shape
+/// no validated checkpoint can contain) are projected out as well. Returns
+/// `(rows, records, evicted_rows, evicted_records)`.
+fn bounded_hot_pair_window<R: HotTaskRow>(
+    mut rows: Vec<R>,
+    mut completed: Vec<CompletionRecord>,
+) -> (Vec<R>, Vec<CompletionRecord>, u64, u64) {
+    let mut evicted_rows = 0u64;
+    let mut evicted_records = 0u64;
+    loop {
+        let completed_rows = rows
+            .iter()
+            .filter(|row| row.hot_status() == TaskStatus::Completed)
+            .count();
+        if completed_rows <= MAX_HOT_COMPLETED_TASK_RECORDS {
+            break;
+        }
+        let Some(oldest) = rows
+            .iter()
+            .filter(|row| row.hot_status() == TaskStatus::Completed)
+            .min_by_key(|row| row.hot_order_key())
+            .map(|row| row.hot_id())
+        else {
+            break;
+        };
+        rows.retain(|row| row.hot_id() != oldest);
+        if let Some(position) = completed.iter().position(|record| record.task_id == oldest) {
+            completed.remove(position);
+            evicted_records += 1;
+        }
+        evicted_rows += 1;
+    }
+    let live_completed: std::collections::HashSet<TaskId> = rows
+        .iter()
+        .filter(|row| row.hot_status() == TaskStatus::Completed)
+        .map(|row| row.hot_id())
+        .collect();
+    let before = completed.len();
+    completed.retain(|record| live_completed.contains(&record.task_id));
+    evicted_records += (before - completed.len()) as u64;
+    debug_assert!(
+        completed.len() <= MAX_HOT_COMPLETION_RECORDS,
+        "the pairwise window is always a subset of the legacy record cap"
+    );
+    (rows, completed, evicted_rows, evicted_records)
+}
+
 /// One long-lived task the runtime knows about.
 #[derive(Debug, Clone)]
 pub struct TaskRecord {
@@ -1356,13 +1456,37 @@ enum TaskPlan {
     },
 }
 
+/// EXEC-2/EXEC-5: the bounded hot-state facts surfaced with the runtime's
+/// typed status snapshot, so "is the task table still bounded?" is a readable
+/// number pair, not a Vec observation. Since EXEC-5 the completion window is
+/// a subset of the completed-row window (pairwise eviction), so
+/// `completion_records` never exceeds `hot_completed_task_records`.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct TaskHotStateSummary {
+    pub resumable_tasks: usize,
+    pub hot_completed_task_records: usize,
+    pub completion_records: usize,
+    pub evicted_completed_task_records: u64,
+    pub evicted_completion_records: u64,
+}
+
 #[derive(Default)]
 pub struct TaskManager {
     tasks: Vec<TaskRecord>,
     active: Option<TaskId>,
     /// One immutable outcome per completed task, in completion order. This
     /// is the authoritative task-catalog result, persisted in checkpoints.
+    /// EXEC-5: bounded to the same window as the completed task rows — at
+    /// most `MAX_HOT_COMPLETED_TASK_RECORDS` newest outcomes, retired
+    /// pairwise with their rows; older facts remain in the run journal and
+    /// the artifact store.
     completed: Vec<CompletionRecord>,
+    /// EXEC-2/EXEC-5: how many completed hot rows / completion records the
+    /// bounded windows have retired. Monotonic for the manager's lifetime;
+    /// since EXEC-5 rows and records retire as pairs, so both counters move
+    /// together (plus any legacy orphan records dropped on restore).
+    evicted_completed_task_records: u64,
+    evicted_completion_records: u64,
 }
 
 impl TaskManager {
@@ -1611,6 +1735,12 @@ impl TaskManager {
         }
         let mut completed = tasks.completed_records().to_vec();
         completed.push(record);
+        // EXEC-5 (R2-01): the durable acknowledgement must be the exact shape
+        // the manager holds once the transition applies its own bounds — run
+        // the same pairwise hot projection here that `TaskPlan::Complete`
+        // runs in memory, so the terminal checkpoint can never carry a shape
+        // the live state (or any later regular snapshot) contradicts.
+        let (task_rows, completed, _, _) = bounded_hot_pair_window(task_rows, completed);
         Some(crate::checkpoint::TaskManagerSnapshot {
             tasks: task_rows,
             active: None,
@@ -1968,6 +2098,7 @@ impl TaskManager {
                 }
                 self.completed.push(completion);
                 self.active = None;
+                self.enforce_hot_bounds();
             }
             TaskPlan::ReplaceToolRequirements {
                 target,
@@ -2026,6 +2157,45 @@ impl TaskManager {
         self.tasks = snapshot.tasks.into_iter().map(TaskRecord::from).collect();
         self.active = snapshot.active;
         self.completed = snapshot.completed;
+        // EXEC-2: a legacy (or oversized) checkpoint restores inside the same
+        // hot-state bounds — newest kept, oldest retired with the same
+        // counters, so a restored runtime cannot inherit unbounded growth.
+        self.enforce_hot_bounds();
+    }
+
+    /// EXEC-2/EXEC-5: retire the oldest completed hot rows together with
+    /// their completion records past the bounded window. Resumable rows are
+    /// never touched, the active task can never be completed, and nothing on
+    /// disk is deleted: evicted facts live on in the run journal and the
+    /// artifact store.
+    fn enforce_hot_bounds(&mut self) {
+        let (tasks, completed, evicted_rows, evicted_records) = bounded_hot_pair_window(
+            std::mem::take(&mut self.tasks),
+            std::mem::take(&mut self.completed),
+        );
+        self.tasks = tasks;
+        self.completed = completed;
+        self.evicted_completed_task_records += evicted_rows;
+        self.evicted_completion_records += evicted_records;
+    }
+
+    /// EXEC-2: the bounded hot-state facts for the typed status snapshot.
+    pub fn hot_state_summary(&self) -> TaskHotStateSummary {
+        TaskHotStateSummary {
+            resumable_tasks: self
+                .tasks
+                .iter()
+                .filter(|task| task.status != TaskStatus::Completed)
+                .count(),
+            hot_completed_task_records: self
+                .tasks
+                .iter()
+                .filter(|task| task.status == TaskStatus::Completed)
+                .count(),
+            completion_records: self.completed.len(),
+            evicted_completed_task_records: self.evicted_completed_task_records,
+            evicted_completion_records: self.evicted_completion_records,
+        }
     }
 
     /// Snapshot for the UI.
@@ -2577,6 +2747,393 @@ mod tests {
 
         // A completed task cannot be re-activated.
         assert!(tasks.prepare_activate(a).is_none());
+    }
+
+    fn complete_active(tasks: &mut TaskManager, summary: &str) {
+        let (txn, _record) = tasks
+            .prepare_complete(CompletionRecordDraft {
+                summary: summary.into(),
+                ..CompletionRecordDraft::default()
+            })
+            .expect("an active task completes");
+        tasks.commit(txn);
+    }
+
+    /// EXEC-2: completing many tasks retires the oldest completed hot rows
+    /// past the bounded window while resumable rows (suspended included)
+    /// stay put.
+    #[test]
+    fn completed_hot_rows_retire_at_the_bounded_window_and_resumables_survive() {
+        let mut tasks = TaskManager::new();
+        let survivor = create(&mut tasks, "the suspended resumable task");
+        let mut early = Vec::new();
+        for index in 0..(MAX_HOT_COMPLETED_TASK_RECORDS + 10) {
+            let id = create(&mut tasks, &format!("short task {index}"));
+            if index < 10 {
+                early.push(id);
+            }
+            complete_active(&mut tasks, &format!("done {index}"));
+        }
+
+        let summary = tasks.hot_state_summary();
+        assert_eq!(
+            summary.hot_completed_task_records, MAX_HOT_COMPLETED_TASK_RECORDS,
+            "the hot window holds exactly the newest completions"
+        );
+        assert_eq!(summary.evicted_completed_task_records, 10);
+        assert_eq!(
+            summary.evicted_completion_records, 10,
+            "each retired completed row takes its own record (EXEC-5 pair eviction)"
+        );
+        for id in early {
+            assert!(
+                tasks.get(id).is_none(),
+                "an old completed hot row leaves the catalog"
+            );
+        }
+        // Resumable rows are never touched: the survivor stays, and the
+        // cap-256 resumable budget is unaffected by completion churn.
+        assert_eq!(
+            tasks.get(survivor).map(|t| t.status),
+            Some(TaskStatus::Suspended)
+        );
+        assert_eq!(summary.resumable_tasks, 1);
+        // The active slot is empty after completions and no active task was
+        // ever evicted.
+        assert_eq!(tasks.active(), None);
+    }
+
+    /// EXEC-2: completion records stay queryable inside the hot window and
+    /// retirements are counted; older facts belong to the durable journal,
+    /// not to an unbounded hot table. EXEC-5: the record window rides the
+    /// same eviction as its completed rows, so a record never outlives the
+    /// row that owns it.
+    #[test]
+    fn completion_records_stay_queryable_inside_the_hot_window() {
+        let mut tasks = TaskManager::new();
+        let mut ids = Vec::new();
+        for index in 0..(MAX_HOT_COMPLETION_RECORDS + 44) {
+            let id = create(&mut tasks, &format!("task {index}"));
+            ids.push((index, id));
+            complete_active(&mut tasks, &format!("done {index}"));
+        }
+
+        let summary = tasks.hot_state_summary();
+        assert_eq!(
+            summary.completion_records, MAX_HOT_COMPLETED_TASK_RECORDS,
+            "records retire pairwise with their completed rows"
+        );
+        assert_eq!(
+            summary.evicted_completion_records,
+            (MAX_HOT_COMPLETION_RECORDS + 44 - MAX_HOT_COMPLETED_TASK_RECORDS) as u64
+        );
+
+        let (recent_index, recent_id) = *ids.last().unwrap();
+        assert_eq!(
+            tasks.completion_of(recent_id).unwrap().summary,
+            format!("done {recent_index}"),
+            "a recent outcome is queryable"
+        );
+        let (early_index, early_id) = ids[0];
+        assert!(
+            tasks.completion_of(early_id).is_none(),
+            "outcome {early_index} left the hot window; the journal keeps the fact"
+        );
+    }
+
+    /// EXEC-5: run the real `RuntimeCheckpoint::validate` over the manager's
+    /// current snapshot — the same gate the safepoint runs before every
+    /// durable write.
+    fn validated_checkpoint(tasks: &TaskManager) -> crate::checkpoint::RuntimeCheckpoint {
+        let checkpoint = crate::checkpoint::RuntimeCheckpoint {
+            version: crate::checkpoint::RUNTIME_CHECKPOINT_VERSION,
+            run_metadata: crate::checkpoint::RunMetadata {
+                run_id: agent_contracts::RunId::new(),
+                created_at_ms: 1,
+                provider_profile_digest: String::new(),
+            },
+            tasks: crate::checkpoint::TaskManagerSnapshot::from_manager(tasks),
+            current_task_id: tasks.active(),
+            focus_revision: 0,
+            last_surface_revision: 0,
+            context: serde_json::json!({}),
+            capabilities: Vec::new(),
+            authority: None,
+            snapshot_sequence: 1,
+            capability_generation: 0,
+            unresolved_ack_debts: Vec::new(),
+            event_cover_seq: 0,
+            terminal_commit: false,
+        };
+        checkpoint
+            .validate()
+            .expect("the task snapshot must satisfy the checkpoint authority relation");
+        checkpoint
+    }
+
+    /// EXEC-5 (R2-01): past the hot window every later snapshot must still
+    /// satisfy the checkpoint relation — every retained completion record
+    /// names a retained completed row and every completed row owns its
+    /// record. The record window therefore rides the same pairwise eviction
+    /// as the rows; a projection that retired one side alone would make the
+    /// safepoint's next durable write fail validation.
+    #[test]
+    fn completions_beyond_the_hot_window_keep_the_checkpoint_relation_valid() {
+        for completions in [
+            MAX_HOT_COMPLETED_TASK_RECORDS - 1,
+            MAX_HOT_COMPLETED_TASK_RECORDS,
+            MAX_HOT_COMPLETED_TASK_RECORDS + 1,
+            MAX_HOT_COMPLETED_TASK_RECORDS + 2,
+            MAX_HOT_COMPLETION_RECORDS,
+            MAX_HOT_COMPLETION_RECORDS + 1,
+        ] {
+            let mut tasks = TaskManager::new();
+            for index in 0..completions {
+                create(&mut tasks, &format!("task {index}"));
+                complete_active(&mut tasks, &format!("done {index}"));
+            }
+            validated_checkpoint(&tasks);
+            let summary = tasks.hot_state_summary();
+            assert_eq!(
+                summary.completion_records, summary.hot_completed_task_records,
+                "records and completed rows share one window after {completions} completions"
+            );
+        }
+    }
+
+    /// EXEC-5: the durable terminal acknowledgement is the exact shape the
+    /// manager holds once the transition applies its own bounds — the
+    /// prospective snapshot runs the same pairwise projection as the
+    /// in-memory commit, and the just-completed task stays queryable.
+    #[test]
+    fn prospective_terminal_snapshot_matches_the_committed_shape() {
+        let mut tasks = TaskManager::new();
+        for index in 0..MAX_HOT_COMPLETED_TASK_RECORDS {
+            create(&mut tasks, &format!("task {index}"));
+            complete_active(&mut tasks, &format!("done {index}"));
+        }
+        let boundary_task = create(&mut tasks, "the boundary task");
+        let (txn, record) = tasks
+            .prepare_complete(CompletionRecordDraft {
+                summary: "boundary done".into(),
+                ..CompletionRecordDraft::default()
+            })
+            .expect("an active task completes");
+        let prospective =
+            TaskManager::prospective_terminal_snapshot(&tasks, record).expect("active flips");
+        tasks.commit(txn);
+
+        let shape = |snapshot: &crate::checkpoint::TaskManagerSnapshot| {
+            (
+                snapshot
+                    .tasks
+                    .iter()
+                    .map(|task| task.id)
+                    .collect::<Vec<_>>(),
+                snapshot
+                    .completed
+                    .iter()
+                    .map(|record| record.task_id)
+                    .collect::<Vec<_>>(),
+            )
+        };
+        assert_eq!(
+            shape(&prospective),
+            shape(&crate::checkpoint::TaskManagerSnapshot::from_manager(
+                &tasks
+            )),
+            "the acknowledged terminal shape is the shape the manager holds"
+        );
+        assert_eq!(
+            tasks
+                .completion_of(boundary_task)
+                .map(|r| r.summary.as_str()),
+            Some("boundary done"),
+            "the newest completion stays inside the window"
+        );
+    }
+
+    /// EXEC-2/EXEC-5: after a thousand legal completions the checkpoint's
+    /// task snapshot is bounded, the authority relation still validates, and
+    /// the serialized payload no longer grows with completion age.
+    #[test]
+    fn the_checkpoint_task_snapshot_stays_bounded_across_a_thousand_completions() {
+        let mut tasks = TaskManager::new();
+        for index in 0..1000 {
+            create(&mut tasks, &format!("task {index}"));
+            complete_active(&mut tasks, &format!("done {index}"));
+        }
+        let checkpoint = validated_checkpoint(&tasks);
+        assert_eq!(
+            checkpoint
+                .tasks
+                .tasks
+                .iter()
+                .filter(|task| task.status == TaskStatus::Completed)
+                .count(),
+            MAX_HOT_COMPLETED_TASK_RECORDS
+        );
+        assert_eq!(
+            checkpoint.tasks.completed.len(),
+            MAX_HOT_COMPLETED_TASK_RECORDS
+        );
+        let bytes = serde_json::to_string(&checkpoint.tasks).unwrap().len();
+        assert!(
+            bytes < 2 * 1024 * 1024,
+            "the task snapshot must stay far below the checkpoint payload cap, got {bytes} bytes"
+        );
+    }
+
+    /// EXEC-5: a legacy snapshot larger than the hot windows restores inside
+    /// the same bounds — completed rows and their records retire as pairs
+    /// (newest kept, retirements counted), the active task survives, and the
+    /// restored manager can still produce a valid checkpoint.
+    #[test]
+    fn an_oversized_legacy_snapshot_restores_inside_the_bounds() {
+        let active_id = TaskId::new();
+        let mut completed_rows = Vec::new();
+        let mut records = Vec::new();
+        for index in 0..100 {
+            let id = TaskId::new();
+            completed_rows.push(crate::checkpoint::TaskRecordSnapshot {
+                id,
+                goal: format!("old task {index}"),
+                status: TaskStatus::Completed,
+                created_at_ms: index as u64,
+                last_active_ms: index as u64,
+                tool_requirements: TaskToolRequirementSet::default(),
+                anchor: TaskAnchor::default(),
+                resume: crate::execution::ExecutionState::default(),
+                turn_intent: String::new(),
+                current_directive: None,
+            });
+            records.push(CompletionRecord {
+                task_id: id,
+                anchor_revision: 0,
+                summary: format!("done {index}"),
+                completed_at_ms: index as u64,
+                final_output_ref: None,
+                final_output_digest: None,
+                artifacts: Vec::new(),
+                verification_status: Default::default(),
+                verification_refs: Vec::new(),
+                disposition: Default::default(),
+                unmet_reasons: Vec::new(),
+            });
+        }
+        let active_row = crate::checkpoint::TaskRecordSnapshot {
+            id: active_id,
+            goal: "the active task".into(),
+            status: TaskStatus::Active,
+            created_at_ms: 0,
+            last_active_ms: 0,
+            tool_requirements: TaskToolRequirementSet::default(),
+            anchor: TaskAnchor::default(),
+            resume: crate::execution::ExecutionState::default(),
+            turn_intent: String::new(),
+            current_directive: None,
+        };
+        let mut rows = vec![active_row];
+        rows.extend(completed_rows);
+        let mut tasks = TaskManager::new();
+        tasks.restore(crate::checkpoint::TaskManagerSnapshot {
+            tasks: rows,
+            active: Some(active_id),
+            completed: records,
+        });
+
+        let summary = tasks.hot_state_summary();
+        assert_eq!(
+            summary.hot_completed_task_records,
+            MAX_HOT_COMPLETED_TASK_RECORDS
+        );
+        assert_eq!(
+            summary.completion_records, MAX_HOT_COMPLETED_TASK_RECORDS,
+            "each retired row took its own record with it"
+        );
+        assert_eq!(summary.evicted_completed_task_records, 36);
+        assert_eq!(summary.evicted_completion_records, 36);
+        // The active task survives the bounds — it is never a completed row.
+        assert_eq!(tasks.active(), Some(active_id));
+        assert!(tasks.get(active_id).is_some());
+        validated_checkpoint(&tasks);
+    }
+
+    /// EXEC-5: restoring a snapshot that carries receipts without their rows
+    /// (a shape no validated checkpoint can contain) drops the orphans
+    /// instead of inheriting them — the restored runtime must be able to
+    /// validate its own next checkpoint.
+    #[test]
+    fn restore_drops_orphan_completion_records_instead_of_inheriting_them() {
+        let active_id = TaskId::new();
+        let mut rows = vec![crate::checkpoint::TaskRecordSnapshot {
+            id: active_id,
+            goal: "the active task".into(),
+            status: TaskStatus::Active,
+            created_at_ms: 0,
+            last_active_ms: 0,
+            tool_requirements: TaskToolRequirementSet::default(),
+            anchor: TaskAnchor::default(),
+            resume: crate::execution::ExecutionState::default(),
+            turn_intent: String::new(),
+            current_directive: None,
+        }];
+        let mut records = Vec::new();
+        for index in 0..10 {
+            let id = TaskId::new();
+            rows.push(crate::checkpoint::TaskRecordSnapshot {
+                id,
+                goal: format!("old task {index}"),
+                status: TaskStatus::Completed,
+                created_at_ms: index as u64,
+                last_active_ms: index as u64,
+                tool_requirements: TaskToolRequirementSet::default(),
+                anchor: TaskAnchor::default(),
+                resume: crate::execution::ExecutionState::default(),
+                turn_intent: String::new(),
+                current_directive: None,
+            });
+            records.push(CompletionRecord {
+                task_id: id,
+                anchor_revision: 0,
+                summary: format!("done {index}"),
+                completed_at_ms: index as u64,
+                final_output_ref: None,
+                final_output_digest: None,
+                artifacts: Vec::new(),
+                verification_status: Default::default(),
+                verification_refs: Vec::new(),
+                disposition: Default::default(),
+                unmet_reasons: Vec::new(),
+            });
+        }
+        for index in 0..5 {
+            records.push(CompletionRecord {
+                task_id: TaskId::new(),
+                anchor_revision: 0,
+                summary: format!("orphan {index}"),
+                completed_at_ms: 1_000 + index as u64,
+                final_output_ref: None,
+                final_output_digest: None,
+                artifacts: Vec::new(),
+                verification_status: Default::default(),
+                verification_refs: Vec::new(),
+                disposition: Default::default(),
+                unmet_reasons: Vec::new(),
+            });
+        }
+        let mut tasks = TaskManager::new();
+        tasks.restore(crate::checkpoint::TaskManagerSnapshot {
+            tasks: rows,
+            active: Some(active_id),
+            completed: records,
+        });
+
+        let summary = tasks.hot_state_summary();
+        assert_eq!(summary.hot_completed_task_records, 10);
+        assert_eq!(summary.completion_records, 10);
+        assert_eq!(summary.evicted_completion_records, 5);
+        validated_checkpoint(&tasks);
     }
 
     #[test]

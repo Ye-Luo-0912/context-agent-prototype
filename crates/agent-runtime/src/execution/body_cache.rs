@@ -8,8 +8,15 @@
 //! 边界：条目不进 Context 引擎、不被 admit、不落盘——它只是
 //! `ModelInput` 组装时的一次性输入，随轮结束消失。Known mutation 使对
 //! 应 path 失效；Unknown mutation 使全部失效（保守）。
+//!
+//! 覆盖真值：条目保留 `path@revision` 之外的**真实暴露范围与完整性**
+//! （F01）。回注只发生在本轮真正进入请求的那些行上，所以「缓存里存在
+//! 某个片段」永远不等于「整个文件已经可见」——`path@digest` 命中只
+//! 说明身份已知，不构成整文件覆盖证明。
 
 use std::collections::VecDeque;
+
+use agent_contracts::FileBodyWindow;
 
 /// 最多缓存的正文件数。
 pub(crate) const MAX_PROTOCOL_BODIES: usize = 4;
@@ -21,6 +28,9 @@ struct ProtocolBodyEntry {
     path: String,
     digest: String,
     body: String,
+    /// 这条正文实际暴露的范围与完整性；`None` 表示来源没有给出可信
+    /// 窗口（未知范围），此时它不能作为任何覆盖证明。
+    window: Option<FileBodyWindow>,
     /// Unknown mutation 后置 true：字节保留但不再视为当前可用。
     dormant: bool,
 }
@@ -58,7 +68,18 @@ pub(crate) struct ProtocolBodyCache {
 
 impl ProtocolBodyCache {
     /// 记录一份成功观察到的正文。同 path 覆盖并移到最新位。
-    pub(crate) fn record(&mut self, path: &str, digest: &str, body: &str) -> BodyRecordOutcome {
+    ///
+    /// `window` 是这份正文实际暴露的范围与完整性（来自 fs.read 的可信
+    /// metadata）。`None` 表示范围未知；未知范围不得被当作整文件覆盖，
+    /// 但仍可回注正文（回注的资格由身份与 Fresh 事实决定，不由覆盖证明
+    /// 决定）。
+    pub(crate) fn record(
+        &mut self,
+        path: &str,
+        digest: &str,
+        body: &str,
+        window: Option<FileBodyWindow>,
+    ) -> BodyRecordOutcome {
         if path.is_empty() || digest.is_empty() || body.is_empty() {
             return BodyRecordOutcome::Empty;
         }
@@ -71,6 +92,16 @@ impl ProtocolBodyCache {
             path: path.to_string(),
             digest: digest.to_string(),
             body: body.to_string(),
+            // A window that names a different path/revision than the entry
+            // itself cannot describe this body; drop it rather than let a
+            // mismatched interval prove coverage for the wrong identity.
+            window: window.filter(|window| {
+                window.path == path
+                    && window
+                        .revision
+                        .as_deref()
+                        .is_none_or(|revision| revision == digest)
+            }),
             dormant: false,
         });
         while self.entries.len() > MAX_PROTOCOL_BODIES {
@@ -108,14 +139,17 @@ impl ProtocolBodyCache {
         std::mem::take(&mut self.pending)
     }
 
-    /// 当前可回注行：(path@digest, body)，最新在前。Active 条目直接
+    /// 当前可回注行：(identity, body, window)，最新在前。Active 条目直接
     /// 可选；Dormant 条目只有在事实表里同 path@digest 重新成为 Fresh
     /// （BeforeModel 重验证通过）时才恢复资格。调用方仍会核对
     /// checkpoint 是否真的截掉了正文。
+    ///
+    /// `window` 保留条目真实的暴露范围与完整性：回注时用它证明覆盖，
+    /// 而不是假定整文件可见（F01）。
     pub(crate) fn eligible_rows(
         &self,
         fresh_identities: &[(String, String)],
-    ) -> Vec<(String, String)> {
+    ) -> Vec<crate::prompt::ProtocolBodyRow> {
         self.entries
             .iter()
             .rev()
@@ -125,11 +159,10 @@ impl ProtocolBodyCache {
                         .iter()
                         .any(|(path, digest)| path == &entry.path && digest == &entry.digest)
             })
-            .map(|entry| {
-                (
-                    format!("{}@{}", entry.path, entry.digest),
-                    entry.body.clone(),
-                )
+            .map(|entry| crate::prompt::ProtocolBodyRow {
+                identity: format!("{}@{}", entry.path, entry.digest),
+                body: entry.body.clone(),
+                window: entry.window.clone(),
             })
             .collect()
     }
@@ -152,17 +185,28 @@ impl ProtocolBodyCache {
 mod tests {
     use super::*;
 
+    fn window(path: &str, revision: &str, start: u32, end: u32) -> FileBodyWindow {
+        FileBodyWindow {
+            path: path.into(),
+            revision: Some(revision.into()),
+            start_line: Some(start),
+            end_line: Some(end),
+            covers_file: false,
+            complete: true,
+        }
+    }
+
     #[test]
     fn record_is_bounded_and_lru_evicts_oldest() {
         let mut cache = ProtocolBodyCache::default();
         for index in 0..(MAX_PROTOCOL_BODIES + 2) {
-            cache.record(&format!("src/f{index}.rs"), "r1", "body");
+            cache.record(&format!("src/f{index}.rs"), "r1", "body", None);
         }
         assert_eq!(cache.len(), MAX_PROTOCOL_BODIES);
         // 最老的两个被挤出；最新的在 rows 首位。
         assert!(cache.lookup("src/f0.rs", "r1").is_none());
         let rows = cache.eligible_rows(&[]);
-        assert!(rows[0].0.starts_with("src/f5.rs@"));
+        assert!(rows[0].identity.starts_with("src/f5.rs@"));
     }
 
     #[test]
@@ -170,7 +214,7 @@ mod tests {
         let mut cache = ProtocolBodyCache::default();
         let big = "x".repeat(MAX_PROTOCOL_BODY_BYTES + 1);
         assert_eq!(
-            cache.record("src/big.rs", "r1", &big),
+            cache.record("src/big.rs", "r1", &big, None),
             BodyRecordOutcome::Oversize
         );
         assert_eq!(cache.len(), 0);
@@ -182,8 +226,8 @@ mod tests {
     #[test]
     fn invalidation_rules_match_mutation_footprints() {
         let mut cache = ProtocolBodyCache::default();
-        cache.record("src/a.rs", "r1", "a-body");
-        cache.record("src/b.rs", "r1", "b-body");
+        cache.record("src/a.rs", "r1", "a-body", None);
+        cache.record("src/b.rs", "r1", "b-body", None);
         // Known mutation 只物理丢弃对应 path。
         assert_eq!(cache.invalidate_path("src/a.rs"), 1);
         assert!(cache.lookup("src/a.rs", "r1").is_none());
@@ -194,7 +238,7 @@ mod tests {
         assert!(cache.eligible_rows(&[]).is_empty(), "dormant without proof");
         let rows = cache.eligible_rows(&fresh);
         assert_eq!(rows.len(), 1, "revalidated identity restores eligibility");
-        assert!(rows[0].0.starts_with("src/b.rs@"));
+        assert!(rows[0].identity.starts_with("src/b.rs@"));
         assert_eq!(
             cache.drain_deltas(),
             ProtocolBodyCacheDeltas {
@@ -208,14 +252,69 @@ mod tests {
     #[test]
     fn dormant_entry_stays_ineligible_when_the_identity_changed() {
         let mut cache = ProtocolBodyCache::default();
-        cache.record("src/a.rs", "r1", "a-body");
+        cache.record("src/a.rs", "r1", "a-body", None);
         cache.suspend_all();
         // 重验证发现内容已变（Fresh 但 digest 不同）：身份门不过，
         // 休眠条目永不回注，等 LRU 淘汰。
         let changed = vec![("src/a.rs".to_string(), "r2".to_string())];
         assert!(cache.eligible_rows(&changed).is_empty());
         // 新观察覆盖同 path：恢复为 Active 且换新身份。
-        cache.record("src/a.rs", "r2", "new-body");
+        cache.record("src/a.rs", "r2", "new-body", None);
         assert_eq!(cache.eligible_rows(&[]).len(), 1);
+    }
+
+    #[test]
+    fn eligible_rows_carry_the_recorded_window_verbatim() {
+        // F01: 缓存行不再把范围压成 `path@digest`——回注时组装器需要的
+        // 是这条正文真实暴露的区间，而不是「整文件已可见」的假定。
+        let mut cache = ProtocolBodyCache::default();
+        cache.record(
+            "src/a.rs",
+            "r1",
+            "lines 101..200",
+            Some(window("src/a.rs", "r1", 101, 200)),
+        );
+        let rows = cache.eligible_rows(&[]);
+        assert_eq!(rows.len(), 1);
+        let recorded = rows[0].window.as_ref().expect("window preserved");
+        assert_eq!(recorded.start_line, Some(101));
+        assert_eq!(recorded.end_line, Some(200));
+        assert!(!recorded.covers_file);
+        assert!(recorded.complete);
+    }
+
+    #[test]
+    fn a_window_for_another_identity_is_not_attached() {
+        // 范围元数据若与条目身份不符（换版本、换 path），宁可丢窗口也
+        // 不能让它替错误的身份作证。
+        let mut cache = ProtocolBodyCache::default();
+        cache.record(
+            "src/a.rs",
+            "r1",
+            "body",
+            Some(window("src/a.rs", "r2", 1, 100)),
+        );
+        assert!(cache.eligible_rows(&[])[0].window.is_none());
+        cache.record(
+            "src/a.rs",
+            "r1",
+            "body",
+            Some(window("src/b.rs", "r1", 1, 100)),
+        );
+        assert!(cache.eligible_rows(&[])[0].window.is_none());
+    }
+
+    #[test]
+    fn unknown_window_stays_unknown_instead_of_becoming_whole_file() {
+        // 来源没给出可信范围时，条目仍可回注正文（资格由身份与 Fresh
+        // 事实决定），但绝不能因此生成一个 covers_file 覆盖声明。
+        let mut cache = ProtocolBodyCache::default();
+        cache.record("src/a.rs", "r1", "body", None);
+        let rows = cache.eligible_rows(&[]);
+        assert_eq!(rows.len(), 1, "body remains eligible for rehydration");
+        assert!(
+            rows[0].window.is_none(),
+            "unknown range must not be upgraded into a coverage proof"
+        );
     }
 }

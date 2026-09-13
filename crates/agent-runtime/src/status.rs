@@ -308,6 +308,8 @@ mod tests {
                 task_id,
                 anchor_revision: 3,
                 summary: "migration landed".into(),
+                artifacts: Vec::new(),
+                final_output_digest: None,
             },
         ]);
         let lines = completed.lines();
@@ -326,6 +328,8 @@ mod tests {
                 task_id,
                 anchor_revision: 3,
                 summary: "done".into(),
+                artifacts: Vec::new(),
+                final_output_digest: None,
             },
             RuntimeEvent::FocusChanged {
                 task_id: TaskId::new(),
@@ -444,6 +448,17 @@ mod tests {
                 cached_input_tokens: 100,
                 attempts: 1,
                 retries: 0,
+                usage_identity: agent_contracts::UsageIdentity::Observed,
+                role: agent_contracts::ModelCallRole::Main,
+                usage: Some(agent_contracts::ModelUsage {
+                    input_tokens: Some(900),
+                    output_tokens: Some(30),
+                    cached_input_tokens: Some(100),
+                    cache_write_input_tokens: None,
+                    cache_miss_input_tokens: None,
+                    attempts: 1,
+                    retries: 0,
+                }),
             },
             RuntimeEvent::ToolStarted {
                 call: tool_call.clone(),

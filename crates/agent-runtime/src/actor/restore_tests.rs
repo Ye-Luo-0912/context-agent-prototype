@@ -28,11 +28,18 @@ async fn next_round_completion(
 ) {
     loop {
         let completion = op_rx.recv().await.unwrap();
-        let maintenance = completion.kind == super::OpKind::Maintenance;
+        // EXEC-1: a round's completions now include the spawned
+        // materialization between maintenance and the terminal model op.
+        // Pump through the internal preparation operations; only a terminal
+        // (model/tool) completion ends the round.
+        let internal = matches!(
+            completion.kind,
+            super::OpKind::Maintenance | super::OpKind::Materialize
+        );
         actor
             .on_operation_completed(completion, op_tx, proof_tx)
             .await;
-        if !maintenance {
+        if !internal {
             return;
         }
     }

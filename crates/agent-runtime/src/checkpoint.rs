@@ -424,11 +424,31 @@ fn verify_envelope_bytes(artifact: &str, stored: &[u8]) -> AgentResult<Vec<u8>> 
 /// store form) or the legacy raw pretty JSON the first TUI releases saved
 /// by hand. Anything else — truncated envelopes, foreign JSON, other
 /// formats — fails closed with a typed error before any restore can start.
+///
+/// EXEC-4 residual (R2-12): the read itself is bounded — one open handle,
+/// a `take(cap + 1)` read, so an oversized file is refused BY NAME during
+/// the read and its bytes never fully land in memory. Reading from the
+/// handle (not from a stat) also makes a post-open size change irrelevant:
+/// the file that is read is exactly the file that is judged. Startup
+/// `--restore`, latest-restore and the interactive TUI entry all share this
+/// helper, so one bound covers every product entry.
 pub fn decode_checkpoint_file(path: &std::path::Path) -> AgentResult<RuntimeCheckpoint> {
     let label = path.display().to_string();
-    let stored = std::fs::read(path).map_err(|error| {
+    use std::io::Read;
+    let file = std::fs::File::open(path).map_err(|error| {
         AgentError::InvalidRequest(format!("checkpoint file {label} unreadable: {error}"))
     })?;
+    let mut stored = Vec::new();
+    file.take(MAX_CHECKPOINT_ARTIFACT_BYTES as u64 + 1)
+        .read_to_end(&mut stored)
+        .map_err(|error| {
+            AgentError::InvalidRequest(format!("checkpoint file {label} unreadable: {error}"))
+        })?;
+    if stored.len() > MAX_CHECKPOINT_ARTIFACT_BYTES {
+        return Err(AgentError::InvalidRequest(format!(
+            "checkpoint file {label} exceeds the checkpoint artifact bound ({MAX_CHECKPOINT_ARTIFACT_BYTES}); nothing was loaded"
+        )));
+    }
     decode_checkpoint_bytes(&stored).map_err(|error| {
         AgentError::InvalidRequest(format!(
             "checkpoint file {label} refused before any mutation: {error}"
@@ -1373,5 +1393,39 @@ mod tests {
         std::fs::write(&truncated_path, &full[..full.len() - 8]).unwrap();
         let error = decode_checkpoint_file(&truncated_path).unwrap_err();
         assert!(error.to_string().contains("is truncated"));
+    }
+
+    /// EXEC-4 residual (R2-12): the shared startup decode reads through a
+    /// capped handle, so a file one byte past the artifact bound is refused
+    /// BY NAME at the read itself — never fully buffered and never left to
+    /// surface later as an unrelated parse error.
+    #[test]
+    fn startup_checkpoint_decode_refuses_an_oversized_file_at_the_read_bound() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("oversized.json");
+        let file = std::fs::File::create(&path).unwrap();
+        file.set_len(MAX_CHECKPOINT_ARTIFACT_BYTES as u64 + 1)
+            .unwrap();
+        drop(file);
+        let error = decode_checkpoint_file(&path).unwrap_err();
+        let message = error.to_string();
+        assert!(
+            message.contains("exceeds the checkpoint artifact bound"),
+            "the bound must be named at read time, got: {message}"
+        );
+
+        // A file exactly at the bound passes the read gate and proceeds to
+        // (failing) content validation — the error is about the content,
+        // not the size.
+        let path = dir.path().join("at-bound.json");
+        let file = std::fs::File::create(&path).unwrap();
+        file.set_len(MAX_CHECKPOINT_ARTIFACT_BYTES as u64).unwrap();
+        drop(file);
+        let error = decode_checkpoint_file(&path).unwrap_err();
+        let message = error.to_string();
+        assert!(
+            !message.contains("exceeds the checkpoint artifact bound"),
+            "a file at the bound must reach content validation, got: {message}"
+        );
     }
 }

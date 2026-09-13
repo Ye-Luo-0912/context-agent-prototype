@@ -11,13 +11,13 @@
 use std::sync::Arc;
 
 use agent_contracts::{
-    AgentError, AgentResult, ApprovalGate, ContextEngine, ContextGcReport, ContextIngress,
-    ContextItemId, ContextItemSummary, ContextMaintenanceReport, ContextMaintenanceTrigger,
-    ContextQuery, ContextStateTransition, EffectReconciler, EventJournal, FocusState,
-    FsRereadClass, MaterializedContext, ModelCapabilities, ModelTransport, PromptLayout, ScopeId,
-    ScopeKind, StorageGcReport, StoreReconcileReport, TaskId, ToolCall, ToolCatalogEntry,
-    ToolDispatcher, ToolExecutionAttribution, ToolLeaseReconcileReport, ToolSpec,
-    ToolSurfaceSnapshot, VerificationCoverageDeclaration,
+    AgentError, AgentResult, ApprovalGate, ContextEngine, ContextIngress, ContextItemId,
+    ContextItemSummary, ContextMaintenanceReport, ContextMaintenanceTrigger,
+    ContextStateTransition, EffectReconciler, EventJournal, FocusState, FsRereadClass,
+    ModelCapabilities, ModelTransport, PromptLayout, ScopeId, ScopeKind, StorageGcReport,
+    StoreReconcileReport, TaskId, ToolCall, ToolCatalogEntry, ToolDispatcher,
+    ToolExecutionAttribution, ToolLeaseReconcileReport, ToolSpec, ToolSurfaceSnapshot,
+    VerificationCoverageDeclaration,
 };
 use agent_core::{CoreAuthorityConfig, CorePort, build_core_port, try_build_core_port};
 use agent_workspace::Workspace;
@@ -35,6 +35,10 @@ pub struct RuntimeServices {
     context: Arc<dyn ContextEngine>,
     model: Arc<dyn ModelTransport>,
     tools: Arc<dyn ToolDispatcher>,
+    /// EXEC-8 (R2-09): the durable event journal, retained for bounded
+    /// read-back (cold completion lookups). `None` = this composition has
+    /// no journal and lookups answer beyond-window honestly.
+    event_journal: Option<Arc<dyn EventJournal>>,
     /// Immutable, bounded construction-time projection of the concrete
     /// host's coverage table. Completion reads this narrow contract rather
     /// than reaching into a tool implementation, and re-composition takes a
@@ -185,6 +189,7 @@ impl RuntimeServices {
     ) -> Self {
         let verification_coverage_declarations =
             snapshot_verification_coverage_declarations(tools.as_ref());
+        let event_journal = journal.clone();
         let core = build_core_port(
             kernel_config.clone(),
             context.clone(),
@@ -195,6 +200,7 @@ impl RuntimeServices {
         Self {
             core,
             kernel_config,
+            event_journal,
             context,
             model,
             tools,
@@ -229,6 +235,7 @@ impl RuntimeServices {
     ) -> AgentResult<Self> {
         let verification_coverage_declarations =
             snapshot_verification_coverage_declarations(tools.as_ref());
+        let event_journal = journal.clone();
         let core = try_build_core_port(
             kernel_config.clone(),
             context.clone(),
@@ -241,6 +248,7 @@ impl RuntimeServices {
         Ok(Self {
             core,
             kernel_config,
+            event_journal,
             context,
             model,
             tools,
@@ -482,6 +490,11 @@ impl RuntimeServices {
     /// Clone only the engine lane for a spawned maintenance operation.
     /// Engines serialize their own state; no tool/workspace authority moves
     /// into this task with the Arc.
+    /// EXEC-8: bounded read-back access to the durable event journal.
+    pub(crate) fn event_journal(&self) -> Option<Arc<dyn EventJournal>> {
+        self.event_journal.clone()
+    }
+
     pub(crate) fn context_engine(&self) -> Arc<dyn ContextEngine> {
         Arc::clone(&self.context)
     }
@@ -504,13 +517,6 @@ impl RuntimeServices {
         self.context.fs_read_residency(path).await
     }
 
-    pub(crate) async fn context_maintain(
-        &self,
-        trigger: ContextMaintenanceTrigger,
-    ) -> AgentResult<ContextMaintenanceReport> {
-        self.context.maintain(trigger).await
-    }
-
     /// Capture the rollback basis before the actor dispatches both input
     /// ingestion and UserInput maintenance as one cancellable operation.
     pub(crate) async fn prepare_user_message(&self) -> AgentResult<serde_json::Value> {
@@ -527,13 +533,6 @@ impl RuntimeServices {
     ) -> AgentResult<ContextMaintenanceReport> {
         self.finish_context_transaction("apply user message", checkpoint, transition)
             .await
-    }
-
-    /// Run a full GC pass (mark roots, sweep, reversible eviction). Called
-    /// by the actor at turn boundaries; engines without a GC pass return an
-    /// empty report.
-    pub(crate) async fn context_gc(&self) -> AgentResult<ContextGcReport> {
-        self.context.gc().await
     }
 
     /// Run one conservative Storage GC pass (the only place information is
@@ -571,23 +570,15 @@ impl RuntimeServices {
     /// The external item ids one stored context checkpoint references —
     /// strong recovery roots a reconcile must not delete while the
     /// checkpoint is retained (R03).
-    pub(crate) fn context_checkpoint_recovery_item_ids(
+    pub(crate) async fn context_checkpoint_recovery_item_ids(
         &self,
         checkpoint: &serde_json::Value,
-    ) -> Vec<ContextItemId> {
-        self.context.checkpoint_recovery_item_ids(checkpoint)
+    ) -> AgentResult<Vec<ContextItemId>> {
+        self.context.checkpoint_recovery_item_ids(checkpoint).await
     }
 
     /// Materialize the working set for one model request. The result is
     /// structured items; prompt assembly happens in the runtime actor.
-    pub(crate) async fn context_materialize(
-        &self,
-        query: ContextQuery,
-    ) -> AgentResult<MaterializedContext> {
-        self.context.materialize(query).await
-    }
-
-    /// Open a scope (runtime-driven, e.g. a tool scope at tool start).
     pub(crate) async fn context_open_scope(
         &self,
         kind: ScopeKind,
@@ -784,8 +775,8 @@ impl RuntimeServices {
 mod tests {
     use super::*;
     use agent_contracts::{
-        ContextDiagnostics, ModelCapabilities, ModelOutput, ModelRequest, ToolExecutionRequest,
-        ToolOutcome,
+        ContextDiagnostics, ContextQuery, MaterializedContext, ModelCapabilities, ModelOutput,
+        ModelRequest, ToolExecutionRequest, ToolOutcome,
     };
     use agent_core::PolicyApprovalGate;
 

@@ -27,8 +27,9 @@ use agent_platform_protocol::{
     WorkCancelRequest, WorkCancelResponse, WorkChangesRequest, WorkChangesResponse,
     WorkContextRequest, WorkContextResponse, WorkContinueRequest, WorkContinueResponse,
     WorkEventNotification, WorkSnapshotRequest, WorkSnapshotResponse, WorkSubmitDisposition,
-    WorkSubmitRequest, WorkSubmitResponse, WorkSubscribeRequest, WorkSubscribeResponse,
-    WorkTaskDetailRequest, WorkTaskDetailResponse,
+    WorkSubmitRequest, WorkSubmitResponse, WorkSubmitResultDisposition, WorkSubmitResultRequest,
+    WorkSubmitResultResponse, WorkSubscribeRequest, WorkSubscribeResponse, WorkTaskDetailRequest,
+    WorkTaskDetailResponse,
 };
 use agent_runtime::{RuntimeHandle, WorkControlSessionRegistry};
 use serde_json::json;
@@ -49,6 +50,8 @@ async fn compose_workspace(root: &std::path::Path) -> anyhow::Result<Composed> {
         ContextPolicy::Rolling,
         workspace.state_dir(),
         Some(model.clone()),
+        None,
+        &agent_compose::MaintenanceBudget::default(),
     )
     .await?;
     let verification_recipes = Arc::new(tool_runtime::VerificationRecipes::discover(&workspace)?);
@@ -240,6 +243,110 @@ async fn run_e2e(endpoint: LocalEndpoint, label: &str) -> anyhow::Result<()> {
     assert!(snapshot.run_started);
     let focus = snapshot.focus.as_ref().expect("focus after submit");
     assert_eq!(focus.task_id.to_string(), task_id);
+    // PLATFORM-3: the snapshot names the run and workspace that produced it,
+    // so a reconnecting client can tell whose facts it is reading and
+    // verify a shared default endpoint is bound to the workspace it meant.
+    assert_eq!(
+        snapshot.run_id.to_string(),
+        fixture.composed.handle().run_id().to_string(),
+        "the snapshot must carry the answering run's identity"
+    );
+    {
+        // Mirror the host's display rule: canonical form, Windows verbatim
+        // prefix stripped.
+        let canonical = dir
+            .path()
+            .canonicalize()
+            .unwrap_or_else(|_| dir.path().to_path_buf())
+            .to_string_lossy()
+            .into_owned();
+        let display = match canonical.strip_prefix(r"\\?\UNC\") {
+            Some(unc) => format!(r"\\{unc}"),
+            None => canonical
+                .strip_prefix(r"\\?\")
+                .map(str::to_owned)
+                .unwrap_or(canonical),
+        };
+        assert_eq!(
+            snapshot.workspace_root, display,
+            "the snapshot must name the bound workspace in its canonical form"
+        );
+    }
+
+    // PLATFORM-1 (F06) 4c. submit_result: the exact-request receipt query
+    // over the wire. The admitted id reports its task; the payload digest
+    // confirms the exact content; a foreign payload under the same id is an
+    // explicit conflict; an unseen id is unknown (never "not executed").
+    let goal = "host e2e: fix the flaky retry test";
+    let digest = agent_platform_protocol::submission_payload_digest(goal);
+    let receipt = expect_value(exchange::<_, _, WorkSubmitResultResponse>(
+        &mut stream,
+        &request(
+            "work",
+            "submit_result",
+            WorkSubmitResultRequest {
+                client_request_id: "e2e-1".into(),
+                payload_digest: Some(digest.clone()),
+            },
+        ),
+    )?);
+    assert_eq!(
+        receipt.disposition,
+        WorkSubmitResultDisposition::Accepted,
+        "the admitted id must read back as accepted"
+    );
+    assert_eq!(
+        receipt
+            .task_id
+            .expect("accepted names its task")
+            .to_string(),
+        task_id
+    );
+    assert_eq!(receipt.client_request_id, "e2e-1");
+    assert_eq!(receipt.run_id, fixture.composed.handle().run_id());
+
+    let foreign = expect_value(exchange::<_, _, WorkSubmitResultResponse>(
+        &mut stream,
+        &request(
+            "work",
+            "submit_result",
+            WorkSubmitResultRequest {
+                client_request_id: "e2e-1".into(),
+                payload_digest: Some(agent_platform_protocol::submission_payload_digest(
+                    "some other goal",
+                )),
+            },
+        ),
+    )?);
+    assert_eq!(
+        foreign.disposition,
+        WorkSubmitResultDisposition::KnownRejected,
+        "a different payload under a recorded id is a conflict"
+    );
+    assert_eq!(
+        foreign.accepted_payload_digest.as_deref(),
+        Some(digest.as_str()),
+        "the conflict reports the digest the id was admitted for"
+    );
+
+    let unseen = expect_value(exchange::<_, _, WorkSubmitResultResponse>(
+        &mut stream,
+        &request(
+            "work",
+            "submit_result",
+            WorkSubmitResultRequest {
+                client_request_id: "e2e-never-seen".into(),
+                payload_digest: None,
+            },
+        ),
+    )?);
+    assert_eq!(
+        unseen.disposition,
+        WorkSubmitResultDisposition::Unknown,
+        "an unseen id is unknown, not a claim it never ran"
+    );
+    assert!(unseen.task_id.is_none());
+    assert!(unseen.disposition.is_indeterminate());
 
     // B3 4a. task_detail: the full anchor card for the submitted task —
     // the plan/acceptance surface the GUI renders, read on demand.
@@ -350,11 +457,14 @@ async fn run_e2e(endpoint: LocalEndpoint, label: &str) -> anyhow::Result<()> {
             WorkArtifactRequest {
                 reference: sealed.clone(),
                 max_bytes: Some(4096),
+                offset: None,
             },
         ),
     )?);
     assert_eq!(full.size_bytes, "b3 artifact body".len() as u64);
     assert!(!full.truncated);
+    assert_eq!(full.offset, 0);
+    assert_eq!(full.next_offset, None, "eof carries no continuation cursor");
     use base64::Engine;
     let decoded = base64::engine::general_purpose::STANDARD
         .decode(&full.content_base64)
@@ -362,6 +472,11 @@ async fn run_e2e(endpoint: LocalEndpoint, label: &str) -> anyhow::Result<()> {
     assert_eq!(decoded, b"b3 artifact body");
     assert!(full.reference.contains("proof"), "canonical reference");
 
+    // PLATFORM-2 (F08): the tiny read is page one of a paging sequence — its
+    // cursor names the next unread byte, and following the cursors serves the
+    // exact remainder until a page lands on eof with no cursor. Paging the
+    // sealed artifact re-verifies the same identity, so the reassembled body
+    // is byte-identical to the whole read above.
     let tiny = expect_value(exchange::<_, _, WorkArtifactResponse>(
         &mut stream,
         &request(
@@ -370,6 +485,7 @@ async fn run_e2e(endpoint: LocalEndpoint, label: &str) -> anyhow::Result<()> {
             WorkArtifactRequest {
                 reference: sealed.clone(),
                 max_bytes: Some(4),
+                offset: None,
             },
         ),
     )?);
@@ -383,6 +499,61 @@ async fn run_e2e(endpoint: LocalEndpoint, label: &str) -> anyhow::Result<()> {
         .decode(&tiny.content_base64)
         .expect("valid base64 body");
     assert_eq!(truncated_bytes, b"b3 a", "exactly the requested budget");
+    assert_eq!(
+        tiny.next_offset,
+        Some(truncated_bytes.len() as u64),
+        "the continuation cursor is the first unread byte"
+    );
+
+    let mut paged = truncated_bytes;
+    let mut cursor = tiny.next_offset;
+    while let Some(next) = cursor {
+        let page = expect_value(exchange::<_, _, WorkArtifactResponse>(
+            &mut stream,
+            &request(
+                "work",
+                "artifact",
+                WorkArtifactRequest {
+                    reference: sealed.clone(),
+                    max_bytes: Some(4),
+                    offset: Some(next),
+                },
+            ),
+        )?);
+        assert_eq!(page.offset, next, "each page starts at its cursor");
+        let page_bytes = base64::engine::general_purpose::STANDARD
+            .decode(&page.content_base64)
+            .expect("valid base64 body");
+        paged.extend_from_slice(&page_bytes);
+        assert_eq!(
+            page.truncated,
+            page.next_offset.is_some(),
+            "truncated and the cursor agree"
+        );
+        if page.truncated {
+            assert_eq!(page.next_offset, Some(next + page_bytes.len() as u64));
+        }
+        cursor = page.next_offset;
+    }
+    assert_eq!(paged, decoded, "paged reassembly equals the whole read");
+
+    // An offset beyond the artifact is a structured refusal, not a clamp.
+    let beyond = exchange::<_, _, WorkArtifactResponse>(
+        &mut stream,
+        &request(
+            "work",
+            "artifact",
+            WorkArtifactRequest {
+                reference: sealed.clone(),
+                max_bytes: Some(4),
+                offset: Some(999),
+            },
+        ),
+    )?;
+    assert!(
+        matches!(beyond, PlatformResponse::Error { .. }),
+        "an offset past the end must be refused"
+    );
 
     // B3 4d. context: the engine's read-only item summary — the submitted
     // goal reaches the engine, so the listing is non-empty and bounded.

@@ -43,9 +43,9 @@ pub use capability::{
     CapabilityAwareDispatcher, CapabilityCatalogEntry, CapabilityRegistry, CapabilityRunState,
 };
 pub use checkpoint::{
-    CapabilitySnapshot, CheckpointStore, ListedCheckpoint, RUNTIME_CHECKPOINT_VERSION, RunMetadata,
-    RuntimeCheckpoint, TaskManagerSnapshot, TaskRecordSnapshot, decode_checkpoint_bytes,
-    decode_checkpoint_file,
+    CapabilitySnapshot, CheckpointStore, ListedCheckpoint, MAX_CHECKPOINT_ARTIFACT_BYTES,
+    RUNTIME_CHECKPOINT_VERSION, RunMetadata, RuntimeCheckpoint, TaskManagerSnapshot,
+    TaskRecordSnapshot, decode_checkpoint_bytes, decode_checkpoint_file,
 };
 pub use command::RuntimeHandle;
 pub use directive::TaskDirective;
@@ -82,4 +82,6 @@ pub use task::{
     TaskStatus, TaskToolRequirementSet, anchor_root_claims, task_anchor_view,
 };
 pub use verification::{ProofVerifier, ProofVerifierOutcome, ProofVerifierRequest};
-pub use work::{RuntimeStatusSnapshot, WorkSubmission, WorkSubmissionDisposition};
+pub use work::{
+    RuntimeStatusSnapshot, WorkSubmission, WorkSubmissionDisposition, WorkSubmissionQuery,
+};

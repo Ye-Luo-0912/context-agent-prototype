@@ -7,16 +7,19 @@
 use std::{
     sync::{
         Arc,
-        atomic::{AtomicUsize, Ordering},
+        atomic::{AtomicBool, AtomicUsize, Ordering},
     },
     time::Duration,
 };
 
 use agent_contracts::{
-    AgentResult, ContextEngine, ContextKind, InputKind, ModelCapabilities, ModelOutput,
-    ModelRequest, ModelTransport, RuntimeDirective, RuntimeEvent, RuntimeEventEnvelope,
-    TaskProgressProposal, ToolCall, ToolDispatcher, ToolExecutionAttribution, ToolExecutionPurpose,
-    ToolExecutionRequest, ToolOutcome, ToolOutput, ToolRisk, ToolSpec, VerificationReuse,
+    AgentResult, ContextDiagnostics, ContextEngine, ContextGcReport, ContextIngress,
+    ContextItemSummary, ContextKind, ContextMaintenanceReport, ContextMaintenanceTrigger,
+    ContextQuery, ContextStateTransition, InputKind, MaterializedContext, ModelCapabilities,
+    ModelOutput, ModelRequest, ModelTransport, RuntimeDirective, RuntimeEvent,
+    RuntimeEventEnvelope, ScopeId, ScopeKind, TaskProgressProposal, ToolCall, ToolDispatcher,
+    ToolExecutionAttribution, ToolExecutionPurpose, ToolExecutionRequest, ToolOutcome, ToolOutput,
+    ToolRisk, ToolSpec, VerificationReuse,
 };
 use agent_core::{CoreAuthorityConfig, PolicyApprovalGate};
 use agent_runtime::{ModuleHost, RuntimeInstance, RuntimeServices};
@@ -941,11 +944,18 @@ async fn failed_checkpoint_write_fences_continuation_until_a_retry_lands() {
             } => {
                 durable_seen = true;
                 // The retry captured the SAME anchor revision under a fresh
-                // snapshot: same anchor, distinct (higher) sequence.
-                assert_eq!(
-                    (revision, sequence),
-                    (1, 2),
-                    "the retry acknowledges a new snapshot of the unchanged anchor"
+                // snapshot: same anchor, a sequence strictly newer than the
+                // failed attempt (seq 1). EXEC-1: the bounded tool-batch
+                // safe point may consume an intermediate sequence while the
+                // store is still blocked — how many failed attempts precede
+                // the durable one is an attempt-count detail, so the test
+                // pins the invariant (unchanged revision, strictly newer
+                // durable snapshot), never the exact number.
+                assert_eq!(revision, 1, "the anchor revision is unchanged");
+                assert!(
+                    sequence >= 2,
+                    "the retry's snapshot must be strictly newer than the \
+                     failed seq-1 attempt, got {sequence}"
                 );
             }
             RuntimeEvent::TurnCompleted => break,
@@ -1500,5 +1510,575 @@ async fn same_reason_debt_accrued_during_background_save_survives_the_ack() {
         tasks[0].anchor_revision, 2,
         "the mid-flight mutation survives restore from the second artifact"
     );
+    instance.shutdown().await.unwrap();
+}
+
+// ---------------------------------------------------------------------------
+// EXEC-7 (R2-08): long boundary waits must not occupy the actor's command
+// branch. A gated engine proves it: while the full GC pass and the
+// checkpoint maintenance are stuck on their gates, status stays live, a
+// cancel is bounded and honest, and a parked terminal commit still settles.
+// ---------------------------------------------------------------------------
+
+/// A context engine whose full GC pass and checkpoint-trigger maintenance
+/// park on permits until the test releases them.
+#[derive(Debug)]
+struct GatedBoundaryContext {
+    gc_gate: tokio::sync::Semaphore,
+    maintain_gate: tokio::sync::Semaphore,
+    gc_started: AtomicBool,
+    maintain_started: AtomicBool,
+    /// EXEC-10: every Checkpoint-trigger maintenance start, counted — the
+    /// single-slot regressions need to tell the first stall from the second.
+    maintain_starts: AtomicUsize,
+}
+
+impl GatedBoundaryContext {
+    fn new() -> Self {
+        Self {
+            gc_gate: tokio::sync::Semaphore::new(0),
+            maintain_gate: tokio::sync::Semaphore::new(0),
+            gc_started: AtomicBool::new(false),
+            maintain_started: AtomicBool::new(false),
+            maintain_starts: AtomicUsize::new(0),
+        }
+    }
+}
+
+#[async_trait::async_trait]
+impl ContextEngine for GatedBoundaryContext {
+    async fn ingest(&self, _ingress: ContextIngress) -> AgentResult<()> {
+        Ok(())
+    }
+    async fn maintain(
+        &self,
+        trigger: ContextMaintenanceTrigger,
+    ) -> AgentResult<ContextMaintenanceReport> {
+        if matches!(trigger, ContextMaintenanceTrigger::Checkpoint) {
+            self.maintain_started.store(true, Ordering::SeqCst);
+            let n = self
+                .maintain_starts
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+                + 1;
+            eprintln!("DEBUG gated maintain start #{n}");
+            let _permit = self.maintain_gate.acquire().await;
+            eprintln!("DEBUG gated maintain #{n} released");
+        }
+        Ok(ContextMaintenanceReport::default())
+    }
+    async fn materialize(&self, _query: ContextQuery) -> AgentResult<MaterializedContext> {
+        Ok(MaterializedContext::default())
+    }
+    async fn open_scope(&self, _kind: ScopeKind, _parent: Option<ScopeId>) -> AgentResult<ScopeId> {
+        Ok(ScopeId::new())
+    }
+    async fn close_scope(&self, _scope_id: ScopeId) -> AgentResult<Vec<ContextStateTransition>> {
+        Ok(Vec::new())
+    }
+    async fn diagnostics(&self) -> AgentResult<ContextDiagnostics> {
+        Ok(ContextDiagnostics::default())
+    }
+    async fn inspect(&self, _limit: usize) -> AgentResult<Vec<ContextItemSummary>> {
+        Ok(Vec::new())
+    }
+    async fn checkpoint(&self) -> AgentResult<serde_json::Value> {
+        Ok(serde_json::Value::Null)
+    }
+    async fn restore(&self, _data: serde_json::Value) -> AgentResult<()> {
+        Ok(())
+    }
+    async fn gc(&self) -> AgentResult<ContextGcReport> {
+        self.gc_started.store(true, Ordering::SeqCst);
+        let _permit = self.gc_gate.acquire().await;
+        Ok(ContextGcReport::default())
+    }
+}
+
+/// The turn-final full GC parks on a gated engine: the actor still answers
+/// a status command while it waits, and a cancel is bounded and honest —
+/// the reversible pass aborts, the turn ends cancelled, and TurnCompleted
+/// never fires for it.
+#[tokio::test]
+async fn cancel_and_status_stay_live_while_the_turn_final_gc_is_stalled() {
+    let context = Arc::new(GatedBoundaryContext::new());
+    let services = RuntimeServices::new(
+        CoreAuthorityConfig::default(),
+        context.clone(),
+        Arc::new(PlainModel),
+        Arc::new(TestToolDispatcher),
+        Arc::new(PolicyApprovalGate::read_only()),
+        None,
+    );
+    let mut host = ModuleHost::new();
+    host.start().await.expect("test module host starts");
+    let instance = RuntimeInstance::spawn(host, services);
+    let handle = instance.handle();
+    instance.start().await.unwrap();
+    handle
+        .user_message("work until the boundary".into())
+        .await
+        .unwrap();
+
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    while !context.gc_started.load(Ordering::SeqCst) {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the turn must reach its turn-final GC"
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+
+    // The stalled pass does not own the actor: a typed status snapshot
+    // still comes back, and a cancel is accepted with a bounded result.
+    let status = tokio::time::timeout(Duration::from_secs(2), handle.status_snapshot())
+        .await
+        .expect("status must answer while the full GC is stalled")
+        .unwrap();
+    assert!(status.serving);
+    let cancel = tokio::time::timeout(Duration::from_secs(5), handle.cancel_turn())
+        .await
+        .expect("cancel must answer while the full GC is stalled")
+        .unwrap();
+    assert!(
+        matches!(cancel, agent_contracts::TurnCancelAck::Cancelled { .. }),
+        "the reversible pass aborts and the turn cancels cleanly: {cancel:?}"
+    );
+
+    // Release the gate: the aborted pass simply ends; the cancelled turn
+    // must not come back to life as TurnCompleted.
+    context.gc_gate.add_permits(1);
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    let mut events = handle.subscribe();
+    let deadline = tokio::time::Instant::now() + Duration::from_millis(300);
+    while tokio::time::Instant::now() < deadline {
+        if let Ok(envelope) = events.try_recv()
+            && matches!(envelope.event, RuntimeEvent::TurnCompleted)
+        {
+            panic!("a cancelled turn must never be completed by its aborted boundary pass");
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    instance.shutdown().await.unwrap();
+}
+
+/// EXEC-7 (R2-08): the SAFE-POINT write's checkpoint maintenance parks on a
+/// gated engine while the turn keeps committing. The actor stays answerable
+/// during the stall, the durable acknowledgement is deferred until the gate
+/// releases, and after the release it lands (the debt retires with it).
+#[tokio::test]
+async fn safe_point_checkpoint_maintenance_does_not_own_the_command_branch() {
+    let context = Arc::new(GatedBoundaryContext::new());
+    let workspace_dir = tempfile::tempdir().unwrap();
+    let workspace = Arc::new(
+        agent_workspace::Workspace::open(workspace_dir.path())
+            .await
+            .unwrap(),
+    );
+    let services = RuntimeServices::new(
+        CoreAuthorityConfig::default(),
+        context.clone(),
+        Arc::new(TwoStageProgressModel {
+            rounds: AtomicUsize::new(0),
+        }),
+        Arc::new(ProgressDirectiveDispatcher),
+        Arc::new(PolicyApprovalGate::read_only()),
+        None,
+    )
+    .with_artifact_workspace(workspace);
+    let mut host = ModuleHost::new();
+    host.start().await.expect("test module host starts");
+    let instance = RuntimeInstance::spawn(host, services);
+    let handle = instance.handle();
+    handle.start().await.unwrap();
+    let mut events = handle.subscribe();
+    handle
+        .set_focus("stall the safe point".into())
+        .await
+        .unwrap();
+    handle.user_message("keep going".into()).await.unwrap();
+
+    // The safe point's maintenance parks on the gate.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    while !context.maintain_started.load(Ordering::SeqCst) {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the safe point must reach its checkpoint maintenance"
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+
+    // The parked prepare does not own the actor: status still answers, and
+    // no durable acknowledgement can have landed yet.
+    let status = tokio::time::timeout(Duration::from_secs(2), handle.status_snapshot())
+        .await
+        .expect("status must answer while the safe-point maintenance is stalled")
+        .unwrap();
+    assert_eq!(status.focus_goal, "stall the safe point");
+
+    // Release: the prepare lands, the write goes in flight and the durable
+    // acknowledgement arrives (with the deferred TurnCompleted whenever the
+    // rest of the boundary reaches it).
+    context.maintain_gate.add_permits(1);
+    context.gc_gate.add_permits(1);
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
+    loop {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the deferred safe point must land after the gate releases"
+        );
+        if let Ok(envelope) = events.try_recv()
+            && matches!(envelope.event, RuntimeEvent::CheckpointDurable { .. })
+        {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    instance.shutdown().await.unwrap();
+}
+
+/// The terminal commit's checkpoint maintenance parks on a gated engine:
+/// the CompleteTask reply is outstanding, but the actor keeps answering
+/// status commands, and once the gate releases the completion commits.
+#[tokio::test]
+async fn status_stays_live_and_the_terminal_commit_settles_around_a_stalled_checkpoint_maintenance()
+{
+    let context = Arc::new(GatedBoundaryContext::new());
+    let workspace_dir = tempfile::tempdir().unwrap();
+    let workspace = Arc::new(
+        agent_workspace::Workspace::open(workspace_dir.path())
+            .await
+            .unwrap(),
+    );
+    let services = RuntimeServices::new(
+        CoreAuthorityConfig::default(),
+        context.clone(),
+        Arc::new(PlainModel),
+        Arc::new(TestToolDispatcher),
+        Arc::new(PolicyApprovalGate::read_only()),
+        None,
+    )
+    .with_artifact_workspace(workspace);
+    let mut host = ModuleHost::new();
+    host.start().await.expect("test module host starts");
+    let instance = RuntimeInstance::spawn(host, services);
+    let handle = instance.handle();
+    instance.start().await.unwrap();
+    handle.set_focus("complete me".into()).await.unwrap();
+
+    let commit_handle = handle.clone();
+    let commit = tokio::spawn(async move {
+        commit_handle
+            .complete_current_task("gated done".into())
+            .await
+    });
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    while !context.maintain_started.load(Ordering::SeqCst) {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the terminal commit must reach its checkpoint maintenance"
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+
+    // The parked transaction does not own the actor: status still answers.
+    let status = tokio::time::timeout(Duration::from_secs(2), handle.status_snapshot())
+        .await
+        .expect("status must answer while the checkpoint maintenance is stalled")
+        .unwrap();
+    assert_eq!(status.focus_goal, "complete me");
+
+    // Release: the maintenance lands, the transaction commits, and the
+    // operator's reply arrives. The commit tail's storage boundary (full GC
+    // pass) uses the same gated engine — release it too so the boundary can
+    // settle instead of holding the shutdown drain.
+    context.maintain_gate.add_permits(1);
+    context.gc_gate.add_permits(1);
+    tokio::time::timeout(Duration::from_secs(10), commit)
+        .await
+        .expect("the terminal commit must settle after the gate releases")
+        .unwrap()
+        .unwrap();
+    let checkpoint = instance.checkpoint().await.unwrap();
+    assert_eq!(checkpoint.tasks.completed.len(), 1);
+    instance.shutdown().await.unwrap();
+}
+
+/// EXEC-10 (R3-09): while an explicit completion's terminal freeze waits on
+/// its checkpoint maintenance, a RESTORE is refused deterministically — the
+/// old transaction must never commit or roll back over restored planes.
+/// After the gate releases, the completion settles normally (the runtime
+/// ends completed, not restored).
+#[tokio::test]
+async fn restore_is_refused_while_a_terminal_commit_is_parked() {
+    let context = Arc::new(GatedBoundaryContext::new());
+    let workspace_dir = tempfile::tempdir().unwrap();
+    let workspace = Arc::new(
+        agent_workspace::Workspace::open(workspace_dir.path())
+            .await
+            .unwrap(),
+    );
+    let services = RuntimeServices::new(
+        CoreAuthorityConfig::default(),
+        context.clone(),
+        Arc::new(PlainModel),
+        Arc::new(TestToolDispatcher),
+        Arc::new(PolicyApprovalGate::read_only()),
+        None,
+    )
+    .with_artifact_workspace(workspace);
+    let mut host = ModuleHost::new();
+    host.start().await.expect("test module host starts");
+    let instance = RuntimeInstance::spawn(host, services);
+    let handle = instance.handle();
+    instance.start().await.unwrap();
+    handle.set_focus("complete me".into()).await.unwrap();
+
+    // No permits: the terminal freeze's checkpoint maintenance parks right
+    // after the freeze parks the completion transaction.
+    let commit_handle = handle.clone();
+    let commit = tokio::spawn(async move {
+        commit_handle
+            .complete_current_task("gated done".into())
+            .await
+    });
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    while context.maintain_starts.load(Ordering::SeqCst) < 1 {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the terminal freeze must reach its checkpoint maintenance"
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+
+    // Restore while the completion transaction is parked: a deterministic,
+    // typed refusal — never a silent interleaving over the prepared planes.
+    // The refusal fires before validation, so a minimal checkpoint payload
+    // is enough to reach it.
+    let before = agent_runtime::RuntimeCheckpoint {
+        version: agent_runtime::RUNTIME_CHECKPOINT_VERSION,
+        run_metadata: agent_runtime::checkpoint::RunMetadata {
+            run_id: agent_contracts::RunId::new(),
+            created_at_ms: 1,
+            provider_profile_digest: String::new(),
+        },
+        tasks: agent_runtime::checkpoint::TaskManagerSnapshot {
+            tasks: Vec::new(),
+            active: None,
+            completed: Vec::new(),
+        },
+        current_task_id: None,
+        focus_revision: 0,
+        last_surface_revision: 0,
+        context: serde_json::json!({}),
+        capabilities: Vec::new(),
+        authority: None,
+        snapshot_sequence: 1,
+        capability_generation: 0,
+        unresolved_ack_debts: Vec::new(),
+        event_cover_seq: 0,
+        terminal_commit: false,
+    };
+    let refusal = tokio::time::timeout(Duration::from_secs(5), instance.restore(before))
+        .await
+        .expect("restore must answer while the commit is parked")
+        .expect_err("restore during a parked commit must be refused");
+    let refusal = refusal.to_string();
+    assert!(
+        refusal.contains("commit is settling"),
+        "the refusal must name the parked commit: {refusal}"
+    );
+
+    // Release: the completion settles normally.
+    context.maintain_gate.add_permits(1);
+    let _ = commit
+        .await
+        .expect("the completion must settle after the gate releases");
+    let checkpoint = instance.checkpoint().await.unwrap();
+    assert_eq!(checkpoint.tasks.completed.len(), 1);
+    assert!(
+        checkpoint.current_task_id.is_none(),
+        "committed, not restored"
+    );
+    context.gc_gate.add_permits(1);
+    instance.shutdown().await.unwrap();
+}
+
+/// EXEC-10 (R3-10): the boundary lane is single-slot. A second checkpoint
+/// capture while one is parked must not overwrite the first — the second
+/// lands via the bounded inline path and BOTH replies are determinate.
+#[tokio::test]
+async fn two_concurrent_checkpoint_captures_both_settle_deterministically() {
+    let context = Arc::new(GatedBoundaryContext::new());
+    let services = RuntimeServices::new(
+        CoreAuthorityConfig::default(),
+        context.clone(),
+        Arc::new(PlainModel),
+        Arc::new(TestToolDispatcher),
+        Arc::new(PolicyApprovalGate::read_only()),
+        None,
+    );
+    let mut host = ModuleHost::new();
+    host.start().await.expect("test module host starts");
+    let instance = RuntimeInstance::spawn(host, services);
+    let handle = instance.handle();
+    instance.start().await.unwrap();
+    handle.set_focus("capture twice".into()).await.unwrap();
+
+    // Two concurrent captures: A parks on the spawned maintenance; B hits
+    // the single-slot lane and lands via the bounded inline path. Both
+    // replies must settle deterministically once the gate releases — neither
+    // may overwrite or lose the other.
+    // Release both gates from a side task so the captures' parked passes
+    // finish while the main body awaits their replies.
+    {
+        let context = context.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(200)).await;
+            context.maintain_gate.add_permits(2);
+        });
+    }
+    let (a, b) = tokio::join!(
+        tokio::time::timeout(Duration::from_secs(15), instance.checkpoint()),
+        tokio::time::timeout(Duration::from_secs(15), instance.checkpoint()),
+    );
+    a.expect("capture A must settle")
+        .expect("capture A must succeed");
+    b.expect("capture B must settle")
+        .expect("capture B must succeed");
+    instance.shutdown().await.unwrap();
+}
+
+/// CTX-8 接线 (R3-08): a boundary pass that reports store backpressure is
+/// observed on the typed status snapshot (active, with the honest debt
+/// counts), and a later clean pass lifts the throttle — while the control
+/// channel never stopped answering.
+#[derive(Debug)]
+struct BackpressureContext {
+    gc_gate: tokio::sync::Semaphore,
+    /// Reports written by the test: each gc() pops the front value.
+    gc_reports: tokio::sync::Mutex<Vec<agent_contracts::ContextGcReport>>,
+}
+
+#[async_trait::async_trait]
+impl ContextEngine for BackpressureContext {
+    async fn ingest(&self, _ingress: ContextIngress) -> AgentResult<()> {
+        Ok(())
+    }
+    async fn maintain(
+        &self,
+        _trigger: ContextMaintenanceTrigger,
+    ) -> AgentResult<ContextMaintenanceReport> {
+        Ok(ContextMaintenanceReport::default())
+    }
+    async fn materialize(&self, _query: ContextQuery) -> AgentResult<MaterializedContext> {
+        Ok(MaterializedContext::default())
+    }
+    async fn open_scope(&self, _kind: ScopeKind, _parent: Option<ScopeId>) -> AgentResult<ScopeId> {
+        Ok(ScopeId::new())
+    }
+    async fn close_scope(&self, _scope_id: ScopeId) -> AgentResult<Vec<ContextStateTransition>> {
+        Ok(Vec::new())
+    }
+    async fn diagnostics(&self) -> AgentResult<ContextDiagnostics> {
+        Ok(ContextDiagnostics::default())
+    }
+    async fn inspect(&self, _limit: usize) -> AgentResult<Vec<ContextItemSummary>> {
+        Ok(Vec::new())
+    }
+    async fn checkpoint(&self) -> AgentResult<serde_json::Value> {
+        Ok(serde_json::Value::Null)
+    }
+    async fn restore(&self, _data: serde_json::Value) -> AgentResult<()> {
+        Ok(())
+    }
+    async fn gc(&self) -> AgentResult<ContextGcReport> {
+        let _permit = self.gc_gate.acquire().await;
+        let mut reports = self.gc_reports.lock().await;
+        if reports.is_empty() {
+            return Ok(agent_contracts::ContextGcReport {
+                externalize_backpressure: true,
+                externalize_deferred: 7,
+                store_io_failures: 2,
+                ..Default::default()
+            });
+        }
+        Ok(reports.remove(0))
+    }
+}
+
+#[tokio::test]
+async fn store_backpressure_is_observed_and_lifted_on_the_status_snapshot() {
+    let context = Arc::new(BackpressureContext {
+        gc_gate: tokio::sync::Semaphore::new(1),
+        gc_reports: tokio::sync::Mutex::new(Vec::new()),
+    });
+    let services = RuntimeServices::new(
+        CoreAuthorityConfig::default(),
+        context.clone(),
+        Arc::new(PlainModel),
+        Arc::new(TestToolDispatcher),
+        Arc::new(PolicyApprovalGate::read_only()),
+        None,
+    );
+    let mut host = ModuleHost::new();
+    host.start().await.expect("test module host starts");
+    let instance = RuntimeInstance::spawn(host, services);
+    let handle = instance.handle();
+    instance.start().await.unwrap();
+    handle.set_focus("under outage".into()).await.unwrap();
+    let mut events = handle.subscribe();
+    handle
+        .user_message("work under outage".into())
+        .await
+        .unwrap();
+
+    // Wait for the turn-final pass to land; it reported backpressure.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the turn-final pass must land"
+        );
+        if let Ok(envelope) = events.try_recv()
+            && matches!(envelope.event, RuntimeEvent::TurnCompleted)
+        {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+
+    let status = handle.status_snapshot().await.unwrap();
+    let bp = status
+        .store_backpressure
+        .expect("the backpressured pass must be observed");
+    assert!(bp.active, "the outage must be visible on the snapshot");
+    assert_eq!(bp.externalize_deferred, 7);
+    assert_eq!(bp.store_io_failures, 2);
+
+    // A second turn runs a clean pass: queue the clean report BEFORE the
+    // turn's funnel reaches the pass, then drive the turn.
+    context
+        .gc_reports
+        .lock()
+        .await
+        .push(agent_contracts::ContextGcReport::default());
+    handle.set_focus("clean again".into()).await.unwrap();
+    handle.user_message("work again".into()).await.unwrap();
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the second turn must land its clean pass"
+        );
+        if let Ok(envelope) = events.try_recv()
+            && matches!(envelope.event, RuntimeEvent::TurnCompleted)
+        {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    let status = handle.status_snapshot().await.unwrap();
+    let bp = status.store_backpressure.expect("a clean pass ran");
+    assert!(!bp.active, "the clean pass lifts the throttle");
     instance.shutdown().await.unwrap();
 }

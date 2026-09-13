@@ -38,6 +38,8 @@ async fn compose_fixture(
         ContextPolicy::Rolling,
         workspace.state_dir(),
         Some(model.clone()),
+        None,
+        &agent_compose::MaintenanceBudget::default(),
     )
     .await?;
     let verification_recipes = Arc::new(VerificationRecipes::discover(&workspace)?);

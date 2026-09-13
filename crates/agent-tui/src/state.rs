@@ -525,6 +525,15 @@ impl AppState {
         }
         match envelope.event {
             RuntimeEvent::RunStarted => self.status = "ready".into(),
+            // EXEC-3 (E07): restore succeeded, but some protected evidence
+            // references could not be admitted — surfaced, never inferred.
+            RuntimeEvent::RestoreEvidenceDegraded { unadmitted_runs } => {
+                self.status = format!(
+                    "restored, but {} protected reference(s) are unreadable: {}",
+                    unadmitted_runs.len(),
+                    unadmitted_runs.join(", ")
+                );
+            }
             RuntimeEvent::UserMessageAccepted { input } => {
                 if input.appears_in_user_transcript() {
                     let already_shown = input
@@ -723,6 +732,7 @@ impl AppState {
                 input_tokens,
                 output_tokens,
                 source_items,
+                ..
             } => {
                 self.push_system(format!(
                     "context compacted ({reason:?}): {input_tokens}->{output_tokens} tokens, {source_items} sources"
@@ -973,6 +983,7 @@ impl AppState {
                 task_id,
                 anchor_revision,
                 summary,
+                ..
             } => {
                 self.current_task = None;
                 self.result_card.completion = Some(CardCompletion {
@@ -1715,6 +1726,8 @@ mod tests {
             task_id: TaskId::new(),
             anchor_revision: 4,
             summary: "migration landed".into(),
+            artifacts: Vec::new(),
+            final_output_digest: None,
         }));
 
         let card = &app.result_card;
@@ -1783,6 +1796,8 @@ mod tests {
             task_id: TaskId::new(),
             anchor_revision: 2,
             summary: "done".into(),
+            artifacts: Vec::new(),
+            final_output_digest: None,
         }));
         let mut bytes = None;
         for _ in 0..200 {
@@ -2010,6 +2025,9 @@ mod resync_tests {
                     attempts: 1,
                     retries: 0,
                     cached_input_tokens: 0,
+                    usage_identity: agent_contracts::UsageIdentity::Observed,
+                    role: agent_contracts::ModelCallRole::Main,
+                    usage: None,
                 },
             ),
             (4u64, RuntimeEvent::TurnCompleted),

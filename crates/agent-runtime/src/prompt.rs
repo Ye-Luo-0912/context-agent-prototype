@@ -8,16 +8,31 @@
 use std::collections::HashSet;
 
 use agent_contracts::{
-    AgentError, AgentResult, ContentDigest, ContextKind, FocusState, MaterializedContext,
-    MaterializedItem, ModelInput, ModelMessage, PromptLayout, RuntimeFactsView, TaskAnchorView,
-    TaskId, TaskProgressView, ToolCatalogEntry, ToolSpec, TurnFrame, TurnFrameStep,
-    render_tool_catalog_index,
+    AgentError, AgentResult, ContentDigest, ContextKind, FileBodyWindow, FocusState,
+    MaterializedContext, MaterializedItem, ModelInput, ModelMessage, PromptLayout,
+    RuntimeFactsView, TaskAnchorView, TaskId, TaskProgressView, ToolCatalogEntry, ToolSpec,
+    TurnFrame, TurnFrameStep, render_tool_catalog_index,
 };
 use agent_workspace::capture_host_runtime_facts;
 
 #[cfg(test)]
 #[path = "prompt_layout_tests.rs"]
 mod layout_tests;
+
+/// One protocol body eligible for re-injection into the assembled request:
+/// its `path@revision` identity header, its text, and the range that read
+/// actually exposed.
+///
+/// F01: the window travels with the body so coverage is proved by the real
+/// interval, never by "a body for this path exists". `None` means the source
+/// gave no trustworthy range — the row may still be re-injected as text, but
+/// it proves nothing about any interval.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProtocolBodyRow {
+    pub identity: String,
+    pub body: String,
+    pub window: Option<FileBodyWindow>,
+}
 
 /// Assembles the model input for one model request.
 ///
@@ -280,7 +295,7 @@ impl PromptAssembler {
         turn: &TurnFrame,
         tools: Vec<ToolSpec>,
         catalog: &[ToolCatalogEntry],
-        protocol_bodies: &[(String, String)],
+        protocol_bodies: &[ProtocolBodyRow],
     ) -> ModelInput {
         self.assemble_with_catalog_stats(
             runtime_focus,
@@ -307,7 +322,7 @@ impl PromptAssembler {
         turn: &TurnFrame,
         tools: Vec<ToolSpec>,
         catalog: &[ToolCatalogEntry],
-        protocol_bodies: &[(String, String)],
+        protocol_bodies: &[ProtocolBodyRow],
     ) -> (ModelInput, ProtocolBodyAssemblyStats) {
         let tools: Vec<ToolSpec> = tools
             .into_iter()
@@ -323,7 +338,6 @@ impl PromptAssembler {
         let checkpoint_body_demand = checkpoint_body_demand(turn, &turn_frame, task_progress);
         let restored =
             rehydrated_protocol_bodies(turn, &turn_frame, task_progress, protocol_bodies);
-        let visible_body_identities = visible_body_identities_from_parts(&turn_frame, &restored);
         let visible_body_windows = visible_body_windows_from_parts(&turn_frame, &restored);
         // Observations (retrieved history, external refs) are rendered as
         // low-authority `user` messages, never as `system`: policy and
@@ -338,34 +352,34 @@ impl PromptAssembler {
             // never an identity-only descriptor.
             let mut foreground = String::from("CURRENT FOREGROUND EVIDENCE");
             for item in &history.foreground {
-                foreground.push_str(&render_selected_item(item, &[], &[], task_progress));
+                foreground.push_str(&render_selected_item(item, &[], task_progress));
             }
             context_frame.push(ModelMessage::user(foreground));
         }
         if !history.items.is_empty() {
             let mut working = String::from("SELECTED WORKING CONTEXT");
-            let diagnostics = &history.diagnostics;
-            if diagnostics.total_items > 0 {
-                working.push_str(&format!(
-                    "\ncatalog total={} resident={} warm={} stored={} selected={}",
-                    diagnostics.total_items,
-                    diagnostics.resident_items,
-                    diagnostics.warm_items,
-                    diagnostics
-                        .cold_items
-                        .saturating_add(diagnostics.external_items),
-                    history.items.len(),
-                ));
-            }
             for item in &history.items {
                 working.push_str(&render_selected_item(
                     item,
-                    &visible_body_identities,
                     &visible_body_windows,
                     task_progress,
                 ));
             }
+            // COST-3/D03: the per-turn catalog counters are cuttable
+            // diagnostics — they live in ContextPrepared events and engine
+            // diagnostics, NOT in the model request. A volatile line here
+            // (head or tail) invalidated the provider-reusable prefix every
+            // turn without carrying any evidence.
             context_frame.push(ModelMessage::user(working));
+        }
+        // CTX-4: the engine's required-context facts reach the model. A
+        // mandated body that did not arrive is a bounded, actionable state —
+        // never silence (silence reads as settled) and never an instruction
+        // to fake it.
+        if !history.required_misses.is_empty() {
+            context_frame.push(ModelMessage::user(render_required_misses(
+                &history.required_misses,
+            )));
         }
         if !history.external.is_empty() {
             // Externalized items: the model sees refs, not content. The
@@ -409,7 +423,7 @@ impl PromptAssembler {
             restored: restored.len() as u64,
             restored_body_tokens: restored
                 .iter()
-                .map(|(_, body)| agent_contracts::tokens::approx_tokens(body) as u64)
+                .map(|row| agent_contracts::tokens::approx_tokens(&row.body) as u64)
                 .sum(),
         };
         if !restored.is_empty() {
@@ -418,10 +432,10 @@ impl PromptAssembler {
             // 文件正文（可能含对抗指令）提权到系统层。
             let mut restored_block =
                 String::from("RESTORED TURN BODIES (this turn's cache; identity verified)\n");
-            for (identity, body) in restored {
-                restored_block.push_str(&identity);
+            for row in &restored {
+                restored_block.push_str(&row.identity);
                 restored_block.push('\n');
-                restored_block.push_str(&body);
+                restored_block.push_str(&row.body);
                 restored_block.push('\n');
             }
             context_frame.push(ModelMessage::user(restored_block));
@@ -463,8 +477,8 @@ fn rehydrated_protocol_bodies(
     full_turn: &TurnFrame,
     retained: &TurnFrame,
     progress: Option<&TaskProgressView>,
-    protocol_bodies: &[(String, String)],
-) -> Vec<(String, String)> {
+    protocol_bodies: &[ProtocolBodyRow],
+) -> Vec<ProtocolBodyRow> {
     let demand = checkpoint_body_demand(full_turn, retained, progress);
     if demand.is_empty() {
         return Vec::new();
@@ -479,12 +493,12 @@ fn rehydrated_protocol_bodies(
         .filter_map(|identity| {
             protocol_bodies
                 .iter()
-                .find(|(cached, body)| cached == &identity && !body.is_empty())
+                .find(|row| row.identity == identity && !row.body.is_empty())
                 .cloned()
                 .or_else(|| {
                     spilled_rows
                         .iter()
-                        .find(|(spilled, _)| spilled == &identity)
+                        .find(|row| row.identity == identity)
                         .cloned()
                 })
         })
@@ -518,7 +532,7 @@ fn checkpoint_body_demand(
 pub(crate) fn visible_body_identities_for_request(
     full_turn: &TurnFrame,
     progress: Option<&TaskProgressView>,
-    protocol_bodies: &[(String, String)],
+    protocol_bodies: &[ProtocolBodyRow],
 ) -> Vec<String> {
     let (retained, _) = full_turn.checkpoint_tail(agent_contracts::TURN_FRAME_KEEP_EXCHANGES);
     let restored = rehydrated_protocol_bodies(full_turn, &retained, progress, protocol_bodies);
@@ -541,15 +555,15 @@ pub(crate) fn checkpoint_spilled_body_identities(full_turn: &TurnFrame) -> Vec<S
 
 fn visible_body_identities_from_parts(
     retained: &TurnFrame,
-    restored: &[(String, String)],
+    restored: &[ProtocolBodyRow],
 ) -> Vec<String> {
     let mut identities = file_read_body_identities(retained);
-    for (identity, _) in restored {
+    for row in restored {
         if identities.len() >= agent_contracts::MAX_VISIBLE_BODY_HINTS {
             break;
         }
-        if !identities.contains(identity) {
-            identities.push(identity.clone());
+        if !identities.contains(&row.identity) {
+            identities.push(row.identity.clone());
         }
     }
     identities
@@ -557,31 +571,28 @@ fn visible_body_identities_from_parts(
 
 /// Same composition as [`visible_body_identities_from_parts`], but with the
 /// interval-aware windows: retained-tail fs.read steps contribute their own
-/// bounded windows; every restored protocol body is a whole-file exposure
-/// and covers all intervals of its `path@revision`. The assembled request
-/// and the engine's descriptor pricing consume the same windows (R09).
+/// bounded windows; every rehydrated protocol body contributes the range its
+/// own read actually exposed.
+///
+/// F01: the rehydrated rows carry their real window (see
+/// [`ProtocolBodyRow`]). A row whose source gave no trustworthy range stays
+/// unknown and proves nothing; it must never be widened into a whole-file
+/// claim just because it is being re-injected. Only bodies that actually
+/// enter this request contribute a window at all.
 fn visible_body_windows_from_parts(
     retained: &TurnFrame,
-    restored: &[(String, String)],
+    restored: &[ProtocolBodyRow],
 ) -> Vec<agent_contracts::FileBodyWindow> {
     let mut windows = file_read_body_windows(retained);
-    for (identity, _) in restored {
+    for row in restored {
         if windows.len() >= agent_contracts::MAX_VISIBLE_BODY_WINDOWS {
             break;
         }
-        let identity = identity.trim();
-        let Some((path, revision)) = identity
-            .split_once('@')
-            .map(|(path, revision)| (path, revision.to_owned()))
-        else {
+        // The window is the truth about what this body exposed. No window
+        // means the range is unknown: the row is still re-injected as text,
+        // but it proves no interval coverage.
+        let Some(window) = row.window.clone() else {
             continue;
-        };
-        let window = agent_contracts::FileBodyWindow {
-            path: path.to_owned(),
-            revision: Some(revision),
-            start_line: None,
-            end_line: None,
-            covers_file: true,
         };
         if !windows.contains(&window) {
             windows.push(window);
@@ -596,12 +607,20 @@ fn visible_body_windows_from_parts(
 /// [`agent_contracts::visible_body_windows_cover`] with each historical
 /// record's own range, so a disjoint window of the same revision never
 /// hides it.
+///
+/// F01: the windows come from the same [`rehydrated_protocol_bodies`] pass
+/// that decides which bodies actually re-enter this request. The priced set
+/// can therefore never be larger than the re-injected set — a cache row that
+/// fails freshness, identity, or the demand filter contributes no window,
+/// exactly as it contributes no identity.
 pub(crate) fn visible_body_windows_for_request(
     full_turn: &TurnFrame,
-    protocol_bodies: &[(String, String)],
+    progress: Option<&TaskProgressView>,
+    protocol_bodies: &[ProtocolBodyRow],
 ) -> Vec<agent_contracts::FileBodyWindow> {
     let (retained, _) = full_turn.checkpoint_tail(agent_contracts::TURN_FRAME_KEEP_EXCHANGES);
-    visible_body_windows_from_parts(&retained, protocol_bodies)
+    let restored = rehydrated_protocol_bodies(full_turn, &retained, progress, protocol_bodies);
+    visible_body_windows_from_parts(&retained, &restored)
 }
 
 /// First trusted resource touch of a settled result. Facts captured on the
@@ -666,32 +685,10 @@ fn file_read_body_windows(frame: &TurnFrame) -> Vec<agent_contracts::FileBodyWin
         let Some(touch) = primary_result_touch(output, facts) else {
             continue;
         };
-        // Trusted metadata keys the dispatcher lane stamped on the result:
-        // `start_line`/`end_line` (inclusive, 1-indexed, when the read was
-        // bounded) and `covers_file` (a whole-file read). Unknown range is
-        // carried as `None` — it never becomes a coverage proof.
-        let start_line = output
-            .metadata
-            .get("start_line")
-            .and_then(serde_json::Value::as_u64)
-            .and_then(|line| u32::try_from(line).ok());
-        let end_line = output
-            .metadata
-            .get("end_line")
-            .and_then(serde_json::Value::as_u64)
-            .and_then(|line| u32::try_from(line).ok());
-        let covers_file = output
-            .metadata
-            .get("covers_file")
-            .and_then(serde_json::Value::as_bool)
-            .unwrap_or(false);
-        windows.push(agent_contracts::FileBodyWindow {
-            path: touch.path.clone(),
-            revision: touch.revision.clone(),
-            start_line,
-            end_line,
-            covers_file,
-        });
+        let Some(window) = file_read_window_from_output(output, &touch) else {
+            continue;
+        };
+        windows.push(window);
         if windows.len() >= agent_contracts::MAX_VISIBLE_BODY_WINDOWS {
             break;
         }
@@ -699,11 +696,64 @@ fn file_read_body_windows(frame: &TurnFrame) -> Vec<agent_contracts::FileBodyWin
     windows
 }
 
+/// Trusted exposure window of one `fs.read` result: version plus the line
+/// range it actually returned. Metadata keys are stamped by the dispatcher
+/// lane; an absent range yields `None` and never becomes a coverage proof.
+/// `complete` is `false` when the captured body was clipped after the read,
+/// so the declared range is only an upper bound (F01).
+pub(crate) fn file_read_window_from_output(
+    output: &agent_contracts::ToolOutput,
+    touch: &agent_contracts::ResourceTouch,
+) -> Option<agent_contracts::FileBodyWindow> {
+    let start_line = output
+        .metadata
+        .get("start_line")
+        .and_then(serde_json::Value::as_u64)
+        .and_then(|line| u32::try_from(line).ok());
+    let end_line = output
+        .metadata
+        .get("end_line")
+        .and_then(serde_json::Value::as_u64)
+        .and_then(|line| u32::try_from(line).ok());
+    let covers_file = output
+        .metadata
+        .get("covers_file")
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false);
+    // A body clipped after capture no longer spans the range its header
+    // declares. The producer reports the window it *tried* to expose;
+    // `truncated`/`window_truncated` report the body was cut short, so the
+    // interval is downgraded to unproven rather than keeping a whole-file
+    // authority it no longer has.
+    let clipped = output
+        .metadata
+        .get("truncated")
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false)
+        || output
+            .metadata
+            .get("window_truncated")
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false);
+    if !clipped && start_line.is_none() && end_line.is_none() && !covers_file {
+        // No trusted range at all: contribute no interval.
+        return None;
+    }
+    Some(agent_contracts::FileBodyWindow {
+        path: touch.path.clone(),
+        revision: touch.revision.clone(),
+        start_line,
+        end_line,
+        covers_file: !clipped && covers_file,
+        complete: !clipped,
+    })
+}
+
 fn demanded_file_read_body_rows(
     frame: &TurnFrame,
     demanded_identities: &[String],
-) -> Vec<(String, String)> {
-    let mut rows = Vec::new();
+) -> Vec<ProtocolBodyRow> {
+    let mut rows: Vec<ProtocolBodyRow> = Vec::new();
     for step in &frame.steps {
         let TurnFrameStep::ToolResult { output, facts, .. } = step else {
             continue;
@@ -728,10 +778,19 @@ fn demanded_file_read_body_rows(
         if !demanded_identities.contains(&identity) {
             continue;
         }
-        if let Some(existing) = rows.iter_mut().find(|(existing, _)| existing == &identity) {
-            *existing = (identity, output.model_content.clone());
+        // F01: this row is about to enter the request, so it carries the
+        // range that read exposed. The window is derived from the same
+        // trusted fs.read metadata the retained-tail windows use, so a
+        // spilled partial read never widens into whole-file coverage.
+        let row = ProtocolBodyRow {
+            identity: identity.clone(),
+            body: output.model_content.clone(),
+            window: file_read_window_from_output(output, &touch),
+        };
+        if let Some(existing) = rows.iter_mut().find(|row| row.identity == identity) {
+            *existing = row;
         } else {
-            rows.push((identity, output.model_content.clone()));
+            rows.push(row);
         }
         if rows.len()
             >= demanded_identities
@@ -766,7 +825,7 @@ pub fn prompt_layer_costs_with_catalog(
     turn: &TurnFrame,
     tools: &[ToolSpec],
     catalog: &[ToolCatalogEntry],
-    protocol_bodies: &[(String, String)],
+    protocol_bodies: &[ProtocolBodyRow],
 ) -> agent_contracts::PromptLayerCosts {
     let (assembled, body_stats) = assembler.assemble_with_catalog_stats(
         focus,
@@ -1041,6 +1100,48 @@ fn format_task_progress(
     out
 }
 
+/// Cap on required-miss rows rendered into one request (CTX-4).
+const MAX_REQUIRED_MISS_ROWS: usize = 8;
+
+/// CTX-4: render the engine's required-context misses as a bounded,
+/// fact-only status block. Per-reason classes stay distinct (a budget cut
+/// is recoverable by re-reading later; a policy exclusion is not), each
+/// row names the requirement identity, and the block ends with the
+/// product's actual recovery entry points. Bounded: rows cap, the
+/// engine-side omitted count stays visible.
+fn render_required_misses(misses: &agent_contracts::ContextMaterializationMisses) -> String {
+    let mut out = String::from(
+        "REQUIRED CONTEXT STATUS (not satisfied)
+",
+    );
+    let unrendered = misses.len().saturating_sub(MAX_REQUIRED_MISS_ROWS);
+    for miss in misses.iter().take(MAX_REQUIRED_MISS_ROWS) {
+        let identity = &miss.identity.item_ref;
+        let source = if miss.identity.source_field_id.is_empty() {
+            String::new()
+        } else {
+            format!(" source={}", miss.identity.source_field_id)
+        };
+        out.push_str(&format!(
+            "- {:?} item_ref={identity}{source}
+",
+            miss.reason
+        ));
+    }
+    let omitted = misses.omitted() as usize + unrendered;
+    if omitted > 0 {
+        out.push_str(&format!(
+            "- ... {omitted} further misses omitted (bounded render)
+"
+        ));
+    }
+    out.push_str(
+        "recovery: context.search / context.fetch the item_ref above, or artifact.read the          named source; if it cannot be recovered, say so and ask the operator. Do not treat          these requirements as satisfied.
+",
+    );
+    out
+}
+
 fn append_list(out: &mut String, label: &str, items: &[String]) {
     if items.is_empty() {
         return;
@@ -1056,7 +1157,6 @@ fn append_list(out: &mut String, label: &str, items: &[String]) {
 
 fn render_selected_item(
     item: &MaterializedItem,
-    visible_body_identities: &[String],
     visible_body_windows: &[agent_contracts::FileBodyWindow],
     progress: Option<&TaskProgressView>,
 ) -> String {
@@ -1066,7 +1166,7 @@ fn render_selected_item(
     } else {
         ""
     };
-    let body = if omit_selected_file_body(item, visible_body_identities, visible_body_windows) {
+    let body = if omit_selected_file_body(item, visible_body_windows) {
         String::new()
     } else {
         item.content.clone()
@@ -1122,14 +1222,16 @@ fn render_selected_path(item: &MaterializedItem) -> String {
 /// this exact request already carries the same `path@revision` body *for
 /// the interval this record spans*. A TaskProgress identity alone is
 /// deliberately insufficient, and arbitrary path-stamped tool logs are not
-/// file bodies. When the request carries bounded fs.read windows (R09), the
-/// record is omitted only if its own range is contained in the union of
-/// the visible windows of the same revision — a disjoint window of the same
-/// revision never hides it. Without window information the legacy
-/// identity-level rule applies.
+/// file bodies. The record is omitted only if its own range is contained
+/// in the union of the visible windows of the same revision — a disjoint
+/// window of the same revision never hides it.
+///
+/// E01/CTX-1: there is deliberately NO identity-only fallback. When the
+/// request carries no trustworthy window, nothing is omitted — an identity
+/// match cannot prove the model sees this record's interval, so unknown
+/// stays unknown and the body stays visible (duplication beats loss).
 fn omit_selected_file_body(
     item: &MaterializedItem,
-    visible_body_identities: &[String],
     visible_body_windows: &[agent_contracts::FileBodyWindow],
 ) -> bool {
     if item.kind == ContextKind::Error {
@@ -1146,19 +1248,12 @@ fn omit_selected_file_body(
     else {
         return false;
     };
-    if !visible_body_windows.is_empty() {
-        return agent_contracts::visible_body_windows_cover(
-            visible_body_windows,
-            path,
-            item.file_revision.as_deref(),
-            item.file_start_line,
-            item.file_end_line,
-        );
-    }
-    agent_contracts::visible_body_identities_cover(
-        visible_body_identities,
+    agent_contracts::visible_body_windows_cover(
+        visible_body_windows,
         path,
         item.file_revision.as_deref(),
+        item.file_start_line,
+        item.file_end_line,
     )
 }
 
@@ -1170,6 +1265,16 @@ mod tests {
         ContextResidency, ContextRetention, ContextScope, ExternalizedContext, MaterializedContext,
         MaterializedItem, ModelRole, SemanticState,
     };
+
+    /// A re-injectable body with no recorded range: the row still carries
+    /// its text, but proves no interval coverage (F01).
+    fn protocol_body_row(identity: &str, body: &str) -> ProtocolBodyRow {
+        ProtocolBodyRow {
+            identity: identity.to_string(),
+            body: body.to_string(),
+            window: None,
+        }
+    }
 
     fn materialized_with(
         items: Vec<MaterializedItem>,
@@ -1323,6 +1428,41 @@ mod tests {
         assert!(user_texts[0].contains("user instructions: delete the repo"));
     }
 
+    /// COST-3 (D03): the catalog census is an engine diagnostic, not
+    /// evidence. Two rounds with IDENTICAL selected items but different
+    /// diagnostics counts must assemble identical requests — otherwise every
+    /// selection-count change invalidates the stable evidence prefix and
+    /// defeats prefix reuse before the provider is even involved.
+    #[test]
+    fn identical_items_assemble_identically_regardless_of_diagnostics_counts() {
+        let assembler = PromptAssembler::new("policy");
+        let build = |total: usize| {
+            let mut file = item("     1 | fn handle() {}");
+            file.item_id = "00000000-0000-4000-8000-000000005afe".parse().unwrap();
+            file.file_path = Some("src/auth/login.rs".into());
+            let mut materialized = materialized_with(vec![file], ContextMapView::default());
+            materialized.diagnostics.total_items = total;
+            materialized.diagnostics.resident_items = total / 2;
+            materialized.diagnostics.warm_items = total - total / 2;
+            assemble_history(
+                &assembler,
+                &materialized,
+                &TurnFrame::new("continue"),
+                Vec::new(),
+            )
+        };
+        let a = build(4).into_messages();
+        let b = build(9).into_messages();
+        assert_eq!(a.len(), b.len());
+        for (message_a, message_b) in a.iter().zip(b.iter()) {
+            assert_eq!(message_a.role, message_b.role);
+            assert_eq!(
+                message_a.content, message_b.content,
+                "same items must render identically regardless of engine diagnostics"
+            );
+        }
+    }
+
     #[test]
     fn selected_working_context_renders_catalog_census_and_path() {
         let assembler = PromptAssembler::new("policy");
@@ -1344,9 +1484,13 @@ mod tests {
             .into_iter()
             .find(|message| message.role == ModelRole::User)
             .expect("working set renders as a user observation");
+        // COST-3/D03: the catalog census left the request (it lives in
+        // ContextPrepared events / engine diagnostics); evidence still
+        // renders.
         assert!(
+            !user.content.contains("catalog total="),
+            "volatile diagnostics must not re-enter the request: {}",
             user.content
-                .contains("catalog total=4 resident=2 warm=1 stored=1 selected=1")
         );
         assert!(user.content.contains("path=src/auth/login.rs"));
         assert!(
@@ -1624,6 +1768,351 @@ mod tests {
         assert!(
             !working.content.contains("fn covered_body"),
             "a containing window of the same revision deduplicates the historical body (R09): {}",
+            working.content
+        );
+    }
+
+    /// F01: a cached body that did NOT re-enter this request proves nothing.
+    /// The historical record spans L1–100 of `rev-1`; the retained tail
+    /// carries only L501–600 of the same revision. The window set must be
+    /// built from what actually reached the model, so the older interval is
+    /// NOT priced as covered and its body stays visible.
+    ///
+    /// Before the fix the window set was assembled from the raw cache rows
+    /// and each restored body was asserted to cover the whole file, so this
+    /// scenario silently dropped the L1–100 evidence.
+    #[test]
+    fn a_cached_but_unrehydrated_body_proves_no_coverage() {
+        let assembler = PromptAssembler::new("policy");
+        let mut file = item("L1..L100 fn historical_body() {}");
+        file.kind = ContextKind::ToolObservation;
+        file.source = Some("tool:fs.read".into());
+        file.file_path = Some("src/auth.rs".into());
+        file.file_revision = Some("rev-1".into());
+        file.file_start_line = Some(1);
+        file.file_end_line = Some(100);
+        let history = materialized_with(vec![file], ContextMapView::default());
+        let mut turn = TurnFrame::new("continue");
+        turn.push_tool_result(
+            agent_contracts::ToolOutput {
+                call_id: "read-late".into(),
+                tool_name: "fs.read".into(),
+                ok: true,
+                summary: "read".into(),
+                model_content: "L501..L600 fn tail_body() {}".into(),
+                artifact_ref: None,
+                metadata: serde_json::json!({
+                    "path": "src/auth.rs",
+                    "revision": "rev-1",
+                    "start_line": 501,
+                    "end_line": 600,
+                    "covers_file": false,
+                }),
+            },
+            None,
+            agent_contracts::ToolExecutionFacts::empty(),
+        );
+        let assembled = assembler.assemble(None, None, None, &history, &turn, Vec::new());
+        let working = assembled
+            .context_frame
+            .iter()
+            .find(|message| message.content.contains("SELECTED WORKING CONTEXT"))
+            .expect("working set");
+        assert!(
+            working.content.contains("fn historical_body"),
+            "a later disjoint read must not be treated as whole-file coverage (F01): {}",
+            working.content
+        );
+    }
+
+    /// F01 control: a whole-file read of the same revision still dedups the
+    /// historical record, so the fix narrows only the fabricated
+    /// whole-file claim and does not disable legitimate dedup.
+    #[test]
+    fn a_whole_file_read_still_deduplicates_the_historical_body() {
+        let assembler = PromptAssembler::new("policy");
+        let mut file = item("L1..L100 fn covered_body() {}");
+        file.kind = ContextKind::ToolObservation;
+        file.source = Some("tool:fs.read".into());
+        file.file_path = Some("src/auth.rs".into());
+        file.file_revision = Some("rev-1".into());
+        file.file_start_line = Some(1);
+        file.file_end_line = Some(100);
+        let history = materialized_with(vec![file], ContextMapView::default());
+        let mut turn = TurnFrame::new("continue");
+        turn.push_tool_result(
+            agent_contracts::ToolOutput {
+                call_id: "read-whole".into(),
+                tool_name: "fs.read".into(),
+                ok: true,
+                summary: "read".into(),
+                model_content: "L1..L200 fn every_body() {}".into(),
+                artifact_ref: None,
+                metadata: serde_json::json!({
+                    "path": "src/auth.rs",
+                    "revision": "rev-1",
+                    "start_line": 1,
+                    "end_line": 200,
+                    "covers_file": true,
+                }),
+            },
+            None,
+            agent_contracts::ToolExecutionFacts::empty(),
+        );
+        let assembled = assembler.assemble(None, None, None, &history, &turn, Vec::new());
+        let working = assembled
+            .context_frame
+            .iter()
+            .find(|message| message.content.contains("SELECTED WORKING CONTEXT"))
+            .expect("working set");
+        assert!(
+            !working.content.contains("fn covered_body"),
+            "a genuine whole-file read still deduplicates the older record: {}",
+            working.content
+        );
+    }
+
+    /// E01/CTX-1：窗口属于无关文件时不构成覆盖；required 选中记录在窗口
+    /// 不覆盖它的区间时必须保留正文（最终请求正文核对，不只查 helper）。
+    #[test]
+    fn an_unrelated_files_window_never_covers_a_required_same_revision_record() {
+        let assembler = PromptAssembler::new("policy");
+        let mut file = item("L1..L100 fn required_needed_body() {}");
+        file.kind = ContextKind::ToolObservation;
+        file.source = Some("tool:fs.read".into());
+        file.file_path = Some("src/required.rs".into());
+        file.file_revision = Some("rev-9".into());
+        file.file_start_line = Some(1);
+        file.file_end_line = Some(100);
+        let history = materialized_with(vec![file], ContextMapView::default());
+        let mut turn = TurnFrame::new("continue");
+        // The only window in this request belongs to a DIFFERENT file.
+        turn.push_tool_result(
+            agent_contracts::ToolOutput {
+                call_id: "read-other".into(),
+                tool_name: "fs.read".into(),
+                ok: true,
+                summary: "read".into(),
+                model_content: "fn other_file_body() {}".into(),
+                artifact_ref: None,
+                metadata: serde_json::json!({
+                    "path": "src/other.rs",
+                    "revision": "rev-9",
+                    "start_line": 1,
+                    "end_line": 200,
+                    "covers_file": true,
+                }),
+            },
+            None,
+            agent_contracts::ToolExecutionFacts::empty(),
+        );
+        let assembled = assembler.assemble(None, None, None, &history, &turn, Vec::new());
+        let working = assembled
+            .context_frame
+            .iter()
+            .find(|message| message.content.contains("SELECTED WORKING CONTEXT"))
+            .expect("working set");
+        assert!(
+            working.content.contains("fn required_needed_body"),
+            "a window of another file never covers this record: {}",
+            working.content
+        );
+    }
+
+    /// CTX-4: the engine's required-context facts are rendered INTO the
+    /// request — the model learns which mandated body did not arrive and
+    /// which product recovery paths exist. Silence would read as settled.
+    #[test]
+    fn required_context_misses_are_rendered_with_recovery_paths() {
+        let assembler = PromptAssembler::new("policy");
+        let mut history = materialized_with(vec![], ContextMapView::default());
+        history
+            .required_misses
+            .push(agent_contracts::ContextMaterializationMiss {
+                identity: agent_contracts::ContextMaterializationIdentity::new(
+                    "anchor:goal:2",
+                    None,
+                    "anchor_roots",
+                    3,
+                ),
+                reason: agent_contracts::ContextMaterializationMissReason::Missing,
+            });
+        history
+            .required_misses
+            .push(agent_contracts::ContextMaterializationMiss {
+                identity: agent_contracts::ContextMaterializationIdentity::new(
+                    "src/auth.rs",
+                    None,
+                    String::new(),
+                    0,
+                ),
+                reason: agent_contracts::ContextMaterializationMissReason::BudgetExcluded,
+            });
+        let assembled = assembler.assemble(
+            None,
+            None,
+            None,
+            &history,
+            &TurnFrame::new("go"),
+            Vec::new(),
+        );
+        let rendered: String = assembled
+            .context_frame
+            .iter()
+            .map(|message| message.content.as_str())
+            .collect();
+        assert!(
+            rendered.contains("REQUIRED CONTEXT STATUS"),
+            "the request must name the required-context gap: {}",
+            rendered
+        );
+        assert!(rendered.contains("anchor:goal:2"), "{}", rendered);
+        assert!(
+            rendered.to_lowercase().contains("budget"),
+            "the reason class must survive into the render: {}",
+            rendered
+        );
+        assert!(
+            rendered.contains("context.search"),
+            "the recovery entry point must be named: {}",
+            rendered
+        );
+    }
+
+    /// CTX-4: the required-miss render is bounded — rows cap and the
+    /// omitted count stays visible.
+    #[test]
+    fn required_miss_rendering_is_bounded() {
+        let assembler = PromptAssembler::new("policy");
+        let mut history = materialized_with(vec![], ContextMapView::default());
+        for index in 0..40u64 {
+            history
+                .required_misses
+                .push(agent_contracts::ContextMaterializationMiss {
+                    identity: agent_contracts::ContextMaterializationIdentity::new(
+                        format!("anchor:claim:{index}"),
+                        None,
+                        String::new(),
+                        0,
+                    ),
+                    reason: agent_contracts::ContextMaterializationMissReason::Missing,
+                });
+        }
+        let assembled = assembler.assemble(
+            None,
+            None,
+            None,
+            &history,
+            &TurnFrame::new("go"),
+            Vec::new(),
+        );
+        let rendered: String = assembled
+            .context_frame
+            .iter()
+            .map(|message| message.content.as_str())
+            .collect();
+        let rendered_rows = rendered.matches("anchor:claim:").count();
+        assert!(
+            rendered_rows < 40,
+            "the render must be bounded, got {rendered_rows} rows"
+        );
+        assert!(
+            rendered.to_lowercase().contains("omitted"),
+            "the omitted count must stay visible: {}",
+            rendered
+        );
+    }
+
+    /// E01/CTX-1 反例：请求携带同版本正文但**没有任何可信窗口**（旧
+    /// producer 只报 path@revision）。identity 命中不再构成省略依据——
+    /// 未知范围保持未知，历史区间必须保留，宁可重复不可丢失。
+    #[test]
+    fn an_identity_match_without_any_window_never_omits_the_historical_record() {
+        let assembler = PromptAssembler::new("policy");
+        let mut file = item("L1..L100 fn historic_range_body() {}");
+        file.kind = ContextKind::ToolObservation;
+        file.source = Some("tool:fs.read".into());
+        file.file_path = Some("src/auth.rs".into());
+        file.file_revision = Some("rev-1".into());
+        file.file_start_line = Some(1);
+        file.file_end_line = Some(100);
+        let history = materialized_with(vec![file], ContextMapView::default());
+        // The request's only fs.read carries the same path@revision but no
+        // range metadata at all: identity is known, extent is unknown.
+        let mut turn = TurnFrame::new("continue");
+        turn.push_tool_result(
+            agent_contracts::ToolOutput {
+                call_id: "read-rangeless".into(),
+                tool_name: "fs.read".into(),
+                ok: true,
+                summary: "read".into(),
+                model_content: "fn partial_unknown_extent() {}".into(),
+                artifact_ref: None,
+                metadata: serde_json::json!({
+                    "path": "src/auth.rs",
+                    "revision": "rev-1",
+                }),
+            },
+            None,
+            agent_contracts::ToolExecutionFacts::empty(),
+        );
+        let assembled = assembler.assemble(None, None, None, &history, &turn, Vec::new());
+        let working = assembled
+            .context_frame
+            .iter()
+            .find(|message| message.content.contains("SELECTED WORKING CONTEXT"))
+            .expect("working set");
+        assert!(
+            working.content.contains("fn historic_range_body"),
+            "an identity match with no window must never omit the historical              interval: {}",
+            working.content
+        );
+    }
+
+    /// F01: a body the producer clipped after capture must not keep its
+    /// declared (pre-clip) range as a coverage proof. `truncated` downgrades
+    /// the window, so the historical interval stays visible.
+    #[test]
+    fn a_clipped_read_does_not_prove_coverage_of_its_declared_range() {
+        let assembler = PromptAssembler::new("policy");
+        let mut file = item("L1..L100 fn historical_body() {}");
+        file.kind = ContextKind::ToolObservation;
+        file.source = Some("tool:fs.read".into());
+        file.file_path = Some("src/auth.rs".into());
+        file.file_revision = Some("rev-1".into());
+        file.file_start_line = Some(1);
+        file.file_end_line = Some(100);
+        let history = materialized_with(vec![file], ContextMapView::default());
+        let mut turn = TurnFrame::new("continue");
+        turn.push_tool_result(
+            agent_contracts::ToolOutput {
+                call_id: "read-clipped".into(),
+                tool_name: "fs.read".into(),
+                ok: true,
+                summary: "read".into(),
+                model_content: "L1..L200 head only".into(),
+                artifact_ref: None,
+                metadata: serde_json::json!({
+                    "path": "src/auth.rs",
+                    "revision": "rev-1",
+                    "start_line": 1,
+                    "end_line": 200,
+                    "covers_file": false,
+                    "truncated": true,
+                }),
+            },
+            None,
+            agent_contracts::ToolExecutionFacts::empty(),
+        );
+        let assembled = assembler.assemble(None, None, None, &history, &turn, Vec::new());
+        let working = assembled
+            .context_frame
+            .iter()
+            .find(|message| message.content.contains("SELECTED WORKING CONTEXT"))
+            .expect("working set");
+        assert!(
+            working.content.contains("fn historical_body"),
+            "a clipped body cannot prove the range it declares (F01): {}",
             working.content
         );
     }
@@ -2289,9 +2778,9 @@ mod tests {
             checked_files: vec!["src/auth.rs@abc123".into()],
             ..Default::default()
         };
-        let bodies = vec![(
-            "src/auth.rs@abc123".to_string(),
-            "fn secret_body() {}".to_string(),
+        let bodies = vec![protocol_body_row(
+            "src/auth.rs@abc123",
+            "fn secret_body() {}",
         )];
         let history = materialized_with(Vec::new(), ContextMapView::default());
         let assembled = assembler.assemble_with_catalog(
@@ -2351,7 +2840,7 @@ mod tests {
 
         // A stale cache row cannot override the exact body in the trusted
         // open-turn frame.
-        let stale = vec![("src/auth.rs@old".to_string(), "stale body".to_string())];
+        let stale = vec![protocol_body_row("src/auth.rs@old", "stale body")];
         let stale_cache_ignored = assembler.assemble_with_catalog(
             None,
             None,
@@ -2430,6 +2919,178 @@ mod tests {
                 .iter()
                 .any(|message| message.content.contains("RESTORED TURN BODIES")),
             "a retained body must not be duplicated"
+        );
+    }
+
+    /// F01: a re-injected protocol body proves coverage only of the range
+    /// its own read exposed. A disjoint earlier read of the same revision
+    /// must not be priced as already visible just because *some* body for
+    /// that `path@revision` is in the request — and a row with no recorded
+    /// range proves nothing at all.
+    #[test]
+    fn rehydrated_body_coverage_comes_from_its_own_window() {
+        let retained = TurnFrame::new("keep context");
+        // The earlier read exposed L1–100 of rev-abc; the later read is the
+        // one that spilled out of the tail.
+        let later = FileBodyWindow {
+            path: "src/auth.rs".into(),
+            revision: Some("abc".into()),
+            start_line: Some(501),
+            end_line: Some(600),
+            covers_file: false,
+            complete: true,
+        };
+        let later_row = ProtocolBodyRow {
+            identity: "src/auth.rs@abc".into(),
+            body: "lines 501..600".into(),
+            window: Some(later),
+        };
+        let windows = visible_body_windows_from_parts(&retained, &[later_row]);
+        assert_eq!(windows.len(), 1, "only the row's own window is declared");
+        assert_eq!(windows[0].start_line, Some(501));
+        // The disjoint earlier interval is NOT covered by the later row.
+        assert!(
+            !agent_contracts::visible_body_windows_cover(
+                &windows,
+                "src/auth.rs",
+                Some("abc"),
+                Some(1),
+                Some(100)
+            ),
+            "a disjoint later window must not hide the earlier record"
+        );
+        // Its own interval is covered.
+        assert!(agent_contracts::visible_body_windows_cover(
+            &windows,
+            "src/auth.rs",
+            Some("abc"),
+            Some(520),
+            Some(560)
+        ));
+
+        // A row with no trustworthy range proves no interval: the body is
+        // re-injected as text, but never widened into whole-file coverage.
+        let unknown_row = protocol_body_row("src/auth.rs@abc", "body without a range");
+        let unknown = visible_body_windows_from_parts(&retained, &[unknown_row]);
+        assert!(
+            unknown.is_empty(),
+            "an unknown range must contribute no window: {unknown:?}"
+        );
+        assert!(!agent_contracts::visible_body_windows_cover(
+            &unknown,
+            "src/auth.rs",
+            Some("abc"),
+            None,
+            None
+        ));
+    }
+
+    /// F01: a body clipped after capture never proves the interval it
+    /// declares, even when it is the body being assembled into this request.
+    #[test]
+    fn a_clipped_rehydrated_window_never_proves_coverage() {
+        let retained = TurnFrame::new("keep context");
+        let clipped = FileBodyWindow {
+            path: "src/auth.rs".into(),
+            revision: Some("abc".into()),
+            start_line: Some(1),
+            end_line: Some(200),
+            covers_file: false,
+            complete: false,
+        };
+        let row = ProtocolBodyRow {
+            identity: "src/auth.rs@abc".into(),
+            body: "head of a clipped body".into(),
+            window: Some(clipped),
+        };
+        let windows = visible_body_windows_from_parts(&retained, &[row]);
+        assert_eq!(windows.len(), 1, "the window is carried, not dropped");
+        assert!(
+            !agent_contracts::visible_body_windows_cover(
+                &windows,
+                "src/auth.rs",
+                Some("abc"),
+                Some(1),
+                Some(200)
+            ),
+            "a truncated body cannot prove it exposed the range it names"
+        );
+    }
+
+    /// F01, second inconsistency: the identity set is filtered through the
+    /// real re-injection pass while the window set used to be built from
+    /// every row the caller handed in. A cache row that never re-enters the
+    /// request (freshness or demand filter rejects it) must contribute no
+    /// window either — otherwise descriptor pricing could omit a historical
+    /// body as "already visible" while that body's text is absent from the
+    /// very request being assembled.
+    #[test]
+    fn a_row_that_never_reinjects_contributes_no_window() {
+        // A cache row whose range would cover the historical interval, but
+        // which no open-turn read demands, so rehydration drops it.
+        let covering = ProtocolBodyRow {
+            identity: "src/auth.rs@rev-1".into(),
+            body: "L1..L100 whole body".into(),
+            window: Some(FileBodyWindow {
+                path: "src/auth.rs".into(),
+                revision: Some("rev-1".into()),
+                start_line: Some(1),
+                end_line: Some(100),
+                covers_file: false,
+                complete: true,
+            }),
+        };
+        // The open turn only ever read a different path, so nothing in it
+        // demands `src/auth.rs@rev-1`. No progress means no fresh-fact gate
+        // passes either.
+        let mut turn = TurnFrame::new("continue");
+        turn.push_tool_result(
+            agent_contracts::ToolOutput {
+                call_id: "read-other".into(),
+                tool_name: "fs.read".into(),
+                ok: true,
+                summary: "read".into(),
+                model_content: "other body".into(),
+                artifact_ref: None,
+                metadata: serde_json::json!({
+                    "path": "src/other.rs",
+                    "revision": "rev-1",
+                    "start_line": 1,
+                    "end_line": 50,
+                    "covers_file": false,
+                }),
+            },
+            None,
+            agent_contracts::ToolExecutionFacts::empty(),
+        );
+
+        let identities =
+            visible_body_identities_for_request(&turn, None, std::slice::from_ref(&covering));
+        let windows =
+            visible_body_windows_for_request(&turn, None, std::slice::from_ref(&covering));
+        assert!(
+            !identities.iter().any(|id| id == "src/auth.rs@rev-1"),
+            "a row that never re-enters contributes no identity: {identities:?}"
+        );
+        assert!(
+            !agent_contracts::visible_body_windows_cover(
+                &windows,
+                "src/auth.rs",
+                Some("rev-1"),
+                Some(1),
+                Some(100)
+            ),
+            "the priced window set must not exceed the re-injected set: {windows:?}"
+        );
+        // Both views agree on the row they rejected: the same identity that
+        // is absent from the identity set is absent from the window set.
+        assert_eq!(
+            identities
+                .iter()
+                .filter(|id| id.starts_with("src/auth.rs"))
+                .count(),
+            windows.iter().filter(|w| w.path == "src/auth.rs").count(),
+            "identity set and window set must agree on what actually got in"
         );
     }
 

@@ -38,6 +38,7 @@ impl RuntimeActor {
                             == crate::work::WorkSubmissionDisposition::Accepted =>
                     {
                         let record = crate::work::WorkSubmissionRecord {
+                            payload_digest: crate::work::submission_payload_digest(&goal),
                             goal,
                             client_request_id,
                             task_id: submission.task_id,
@@ -292,26 +293,41 @@ impl RuntimeActor {
                 let _ = reply.send(result);
             }
             RuntimeCommand::CompleteTask { summary, reply } => {
-                let result = match self.ensure_idle().and_then(|_| self.next_focus_revision()) {
+                // EXEC-7 (R2-08): a settled commit comes back with the reply
+                // channel owned; a parked one hands the reply to the resume,
+                // which settles it after the spawned checkpoint maintenance.
+                let outcome = match self.ensure_idle().and_then(|_| self.next_focus_revision()) {
                     Ok(next_focus_revision) => {
                         self.commit_completion(
                             CompletionIntent::ExplicitOperator,
                             summary,
                             Vec::new(),
                             next_focus_revision,
+                            Some(reply),
                         )
                         .await
                     }
-                    Err(error) => Err(error),
+                    Err(error) => {
+                        crate::actor::turn::CompletionCommitOutcome::Settled(Err(error), None)
+                    }
                 };
-                let _ = reply.send(result);
+                if let crate::actor::turn::CompletionCommitOutcome::Settled(result, Some(reply)) =
+                    outcome
+                {
+                    let _ = reply.send(result);
+                }
             }
             RuntimeCommand::Checkpoint { reply } => {
-                let result = match self.ensure_idle() {
-                    Ok(()) => self.capture_checkpoint().await,
-                    Err(error) => Err(error),
-                };
-                let _ = reply.send(result);
+                // EXEC-7 (R2-08): the capture's maintenance parks the reply
+                // on the boundary lane, so a slow engine never blocks the
+                // actor's other commands while the reply still carries the
+                // same authoritative snapshot.
+                match self.ensure_idle() {
+                    Ok(()) => self.begin_read_only_capture(reply).await,
+                    Err(error) => {
+                        let _ = reply.send(Err(error));
+                    }
+                }
             }
             RuntimeCommand::ContinueActiveTask { reply } => {
                 let result = match self.ensure_idle() {
@@ -341,6 +357,9 @@ impl RuntimeActor {
                     focus_goal: focused.map(|task| task.goal.clone()).unwrap_or_default(),
                     focus_anchor_revision: focused.map(|task| task.anchor.revision).unwrap_or(0),
                     tasks: self.state.tasks.list(),
+                    task_hot_state: self.state.tasks.hot_state_summary(),
+                    restore_evidence_degraded: self.state.restore_evidence_degraded.clone(),
+                    store_backpressure: self.state.store_backpressure.clone(),
                 };
                 let _ = reply.send(Ok(snapshot));
             }
@@ -377,6 +396,30 @@ impl RuntimeActor {
             RuntimeCommand::InspectContext { limit, reply } => {
                 let _ = reply.send(self.services.inspect_context(limit).await);
             }
+            RuntimeCommand::TaskCompletionLookup { task_id, reply } => {
+                // EXEC-8 (R2-09): read-only, no fences that could starve —
+                // the hot check is one table scan; the cold path reads a
+                // bounded tail of the durable journal. No model, no tool,
+                // no checkpoint write.
+                if self.state.tasks.get(task_id).is_some() {
+                    let _ = reply.send(Ok(crate::work::TaskCompletionLookup::Hot));
+                    return;
+                }
+                // EXEC-8 残余 (R3-11): the cold scan runs on its own task —
+                // the actor's command branch never waits on journal I/O, so
+                // status/cancel/stop stay live during a long scan.
+                let journal = self.services.event_journal();
+                let runs = {
+                    let mut runs = vec![self.core.run_id()];
+                    runs.extend(self.state.journal_runs.iter().copied().rev());
+                    runs
+                };
+                tokio::spawn(async move {
+                    let result =
+                        crate::work::cold_completion_lookup_in(&journal, &runs, task_id).await;
+                    let _ = reply.send(result);
+                });
+            }
             RuntimeCommand::TaskDetail { task_id, reply } => {
                 // Read-only, like StatusSnapshot: no idle fence, no model
                 // round, no checkpoint. Unknown tasks are a typed error.
@@ -397,6 +440,32 @@ impl RuntimeActor {
                     ))),
                 };
                 let _ = reply.send(result);
+            }
+            RuntimeCommand::QueryWorkSubmission {
+                client_request_id,
+                payload_digest,
+                reply,
+            } => {
+                // Read-only, like TaskDetail: no idle fence, no model round,
+                // no checkpoint. The ledger is bounded and process-local, so
+                // an id outside it is `Unknown` — the honest fact, never a
+                // claim that the request was not executed.
+                let query = match self
+                    .state
+                    .work_submissions
+                    .iter()
+                    .find(|record| record.client_request_id == client_request_id)
+                {
+                    Some(record) => crate::work::WorkSubmissionQuery::Recorded {
+                        task_id: record.task_id,
+                        payload_digest: record.payload_digest.clone(),
+                        matches: payload_digest
+                            .as_deref()
+                            .map(|asked| asked == record.payload_digest),
+                    },
+                    None => crate::work::WorkSubmissionQuery::Unknown,
+                };
+                let _ = reply.send(Ok(query));
             }
             RuntimeCommand::QueryOperation {
                 operation_id,
@@ -434,3 +503,5 @@ impl RuntimeActor {
         }
     }
 }
+
+impl RuntimeActor {}
