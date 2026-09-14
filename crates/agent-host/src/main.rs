@@ -288,40 +288,33 @@ async fn real_main() -> anyhow::Result<()> {
          plugins (install_from_root + skill_read); unsupported — remote adapters, hook execution"
     );
 
-    let composed = compose(ComposeConfig {
-        provider_profile_digest: provider_profile_digest.clone(),
-        cache_routing: cache_routing.clone(),
-        defer_proof_refresh: false,
-        shadow_context_frame: false,
-        workspace: workspace.clone(),
+    // T5: the product composition baseline is shared with the headless CLI;
+    // this entry states only its own differences (journals, round budget,
+    // provider identity, capability config) on top of it.
+    let mut config = ComposeConfig::product_baseline(
+        workspace.clone(),
         context_engine,
         model,
         approval,
         base_tools,
-        capability_aware: true,
-        journal: Some(journal),
-        artifact_store: Some(artifact_store),
-        output_broker: Some(output_broker),
-        max_tool_rounds: args.max_rounds,
-        project_task_progress: true,
-        project_settlement: false,
-        settlement_projection_diagnostics: false,
-        project_completion_opportunity: false,
-        recovery_surface: false,
-        host_policies: Some(host_policies),
-        effect_reservation_journal: Some(
-            workspace
-                .state_dir()
-                .join("authority")
-                .join("broker-reservations.jsonl"),
-        ),
-        verification_recipes: Some(verification_recipes),
-        project_proof_refresh: false,
-        host_death_watchdog: true,
-        mcp_servers,
-        plugins,
-    })
-    .await?;
+    );
+    config.provider_profile_digest = provider_profile_digest.clone();
+    config.cache_routing = cache_routing.clone();
+    config.journal = Some(journal);
+    config.artifact_store = Some(artifact_store);
+    config.output_broker = Some(output_broker);
+    config.max_tool_rounds = args.max_rounds;
+    config.host_policies = Some(host_policies);
+    config.effect_reservation_journal = Some(
+        workspace
+            .state_dir()
+            .join("authority")
+            .join("broker-reservations.jsonl"),
+    );
+    config.verification_recipes = Some(verification_recipes);
+    config.mcp_servers = mcp_servers;
+    config.plugins = plugins;
+    let composed = compose(config).await?;
 
     // Subscribe before start, exactly like every other composition root.
     let _run_events = composed.subscribe();

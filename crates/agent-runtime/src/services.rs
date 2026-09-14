@@ -29,7 +29,15 @@ use crate::host::ServiceRegistry;
 /// lives here in the runtime; CorePort is the authority seam
 /// (`services.core_port()`) the actor consults for events, approval, effects,
 /// output and tool-execution wiring.
+/// The fields are grouped in construction order: the product configuration
+/// (services, durable plumbing and product behavior switches) first, then
+/// the frozen experiment-projection switches. The two groups are also the
+/// two constructor bundles ([`ProductServicesConfig`] and
+/// [`ExperimentProjection`]); `new` and `try_new` converge on
+/// [`RuntimeServices::from_parts`] so there is exactly one initialization
+/// path for both.
 pub struct RuntimeServices {
+    // --- product configuration ---
     core: Arc<dyn CorePort>,
     kernel_config: CoreAuthorityConfig,
     context: Arc<dyn ContextEngine>,
@@ -60,18 +68,31 @@ pub struct RuntimeServices {
     /// capability endpoints and bare compositions keep the historical
     /// payload).
     cache_routing: Option<agent_contracts::PromptCacheRouting>,
-    /// When false (the default), a completion-time proof refresh runs
-    /// inline in the actor, preserving the historical same-round gate
-    /// result. When true, the host verifier runs outside the actor loop
-    /// and the parked completion resumes when it finishes.
+    /// Read-only handle onto the host capability registry, injected at
+    /// spawn so the actor's safe-point checkpoints capture the full plane
+    /// set. The actor snapshots it; it never mutates through this handle.
+    capability_registry: Option<Arc<crate::capability::CapabilityRegistry>>,
+    /// Optional host-side exact verifier for the completion-gate
+    /// proof-refresh transaction. `None` keeps ordinary refusals.
+    proof_verifier: Option<Arc<dyn crate::verification::ProofVerifier>>,
+    /// Product opt-in: when false (the default), a completion-time proof
+    /// refresh runs inline in the actor, preserving the historical
+    /// same-round gate result. When true, the host verifier runs outside
+    /// the actor loop and the parked completion resumes when it finishes.
     defer_proof_refresh: bool,
-    /// Compile the shadow Context Frame manifest and emit it as
-    /// `ContextFrameShadow` diagnostics. Never changes model input.
+    /// Product opt-in: compile the shadow Context Frame manifest and emit
+    /// it as `ContextFrameShadow` diagnostics. Never changes model input.
     shadow_context_frame: bool,
+    /// Product surface choice: message placement only; Context selection
+    /// and focus policy are unchanged.
+    prompt_layout: PromptLayout,
+    /// Product gate (default off, promotion-gated): when false the gate
+    /// never runs the proof-refresh transaction even with a verifier
+    /// injected.
+    project_proof_refresh: bool,
+    // --- frozen experiment projection (ablation switches; never deleted) ---
     /// Ablation: when false, PromptAssembler omits TaskProgress. Default true.
     project_task_progress: bool,
-    /// Message placement only; Context selection and focus policy are unchanged.
-    prompt_layout: PromptLayout,
     /// Ablation: when true, a settled-candidate fact is projected into the
     /// otherwise unchanged TaskProgress view. Kept separate from
     /// `project_task_progress` so paired evaluation arms do not remove the
@@ -94,16 +115,77 @@ pub struct RuntimeServices {
     /// the trusted recovery source surfaces the exact host-owned tool for
     /// one decision. Promotion requires the isolation paired live gate.
     recovery_surface: bool,
-    /// Read-only handle onto the host capability registry, injected at
-    /// spawn so the actor's safe-point checkpoints capture the full plane
-    /// set. The actor snapshots it; it never mutates through this handle.
+}
+
+/// The product-configuration half of a [`RuntimeServices`] construction:
+/// the durable plumbing a composition root resolves plus the
+/// product-visible behavior switches. Grouping these apart from
+/// [`ExperimentProjection`] states in one place which switches a product
+/// entry point sets; the defaults here are the product baseline every
+/// constructor starts from.
+struct ProductServicesConfig {
+    event_journal: Option<Arc<dyn EventJournal>>,
+    verification_coverage_declarations: Arc<[VerificationCoverageDeclaration]>,
+    artifact_workspace: Option<Arc<Workspace>>,
+    provider_profile_digest: Option<String>,
+    cache_routing: Option<agent_contracts::PromptCacheRouting>,
     capability_registry: Option<Arc<crate::capability::CapabilityRegistry>>,
-    /// Optional host-side exact verifier for the completion-gate
-    /// proof-refresh transaction. `None` keeps ordinary refusals.
     proof_verifier: Option<Arc<dyn crate::verification::ProofVerifier>>,
-    /// Ablation: when false (the default), the gate never runs the
-    /// proof-refresh transaction even with a verifier injected.
+    defer_proof_refresh: bool,
+    shadow_context_frame: bool,
+    prompt_layout: PromptLayout,
     project_proof_refresh: bool,
+}
+
+impl Default for ProductServicesConfig {
+    fn default() -> Self {
+        Self {
+            event_journal: None,
+            verification_coverage_declarations: Arc::from([]),
+            artifact_workspace: None,
+            provider_profile_digest: None,
+            cache_routing: None,
+            capability_registry: None,
+            proof_verifier: None,
+            defer_proof_refresh: false,
+            shadow_context_frame: false,
+            prompt_layout: PromptLayout::CurrentStateLast,
+            project_proof_refresh: false,
+        }
+    }
+}
+
+/// The frozen experiment-projection switches of a [`RuntimeServices`]
+/// construction. These are ablation/projection bools with paired-evaluation
+/// semantics; they are grouped (not removed) so a product baseline and an
+/// experiment arm differ by exactly one explicit switch. The baseline is
+/// the product configuration: TaskProgress on, every projection off.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct ExperimentProjection {
+    project_task_progress: bool,
+    project_settlement: bool,
+    settlement_projection_diagnostics: bool,
+    project_completion_opportunity: bool,
+    recovery_surface: bool,
+}
+
+impl Default for ExperimentProjection {
+    fn default() -> Self {
+        Self::baseline()
+    }
+}
+
+impl ExperimentProjection {
+    /// The frozen product baseline every composition starts from.
+    const fn baseline() -> Self {
+        Self {
+            project_task_progress: true,
+            project_settlement: false,
+            settlement_projection_diagnostics: false,
+            project_completion_opportunity: false,
+            recovery_surface: false,
+        }
+    }
 }
 
 fn snapshot_verification_coverage_declarations(
@@ -136,6 +218,65 @@ pub(crate) struct PreparedTaskCompletion {
 }
 
 impl RuntimeServices {
+    /// The single initialization path [`Self::new`] and [`Self::try_new`]
+    /// converge on: the two constructors differ only in how the Core port
+    /// is built (plain vs recoverable authority); everything else — product
+    /// configuration and frozen experiment projection — is assembled here
+    /// exactly once, so the two paths cannot drift apart.
+    fn from_parts(
+        core: Arc<dyn CorePort>,
+        kernel_config: CoreAuthorityConfig,
+        context: Arc<dyn ContextEngine>,
+        model: Arc<dyn ModelTransport>,
+        tools: Arc<dyn ToolDispatcher>,
+        product: ProductServicesConfig,
+        experiments: ExperimentProjection,
+    ) -> Self {
+        let ProductServicesConfig {
+            event_journal,
+            verification_coverage_declarations,
+            artifact_workspace,
+            provider_profile_digest,
+            cache_routing,
+            capability_registry,
+            proof_verifier,
+            defer_proof_refresh,
+            shadow_context_frame,
+            prompt_layout,
+            project_proof_refresh,
+        } = product;
+        let ExperimentProjection {
+            project_task_progress,
+            project_settlement,
+            settlement_projection_diagnostics,
+            project_completion_opportunity,
+            recovery_surface,
+        } = experiments;
+        Self {
+            core,
+            kernel_config,
+            context,
+            model,
+            tools,
+            event_journal,
+            verification_coverage_declarations,
+            artifact_workspace,
+            provider_profile_digest,
+            cache_routing,
+            capability_registry,
+            proof_verifier,
+            defer_proof_refresh,
+            shadow_context_frame,
+            prompt_layout,
+            project_proof_refresh,
+            project_task_progress,
+            project_settlement,
+            settlement_projection_diagnostics,
+            project_completion_opportunity,
+            recovery_surface,
+        }
+    }
+
     /// Live registry handle for the capture-side generation handshake.
     pub(crate) fn capability_registry(
         &self,
@@ -195,37 +336,26 @@ impl RuntimeServices {
     ) -> Self {
         let verification_coverage_declarations =
             snapshot_verification_coverage_declarations(tools.as_ref());
-        let event_journal = journal.clone();
         let core = build_core_port(
             kernel_config.clone(),
             context.clone(),
             tools.clone(),
             approval,
-            journal,
+            journal.clone(),
         );
-        Self {
+        Self::from_parts(
             core,
             kernel_config,
-            event_journal,
             context,
             model,
             tools,
-            verification_coverage_declarations,
-            artifact_workspace: None,
-            provider_profile_digest: None,
-            cache_routing: None,
-            defer_proof_refresh: false,
-            shadow_context_frame: false,
-            project_task_progress: true,
-            prompt_layout: PromptLayout::CurrentStateLast,
-            project_settlement: false,
-            settlement_projection_diagnostics: false,
-            project_completion_opportunity: false,
-            recovery_surface: false,
-            capability_registry: None,
-            proof_verifier: None,
-            project_proof_refresh: false,
-        }
+            ProductServicesConfig {
+                event_journal: journal,
+                verification_coverage_declarations,
+                ..ProductServicesConfig::default()
+            },
+            ExperimentProjection::default(),
+        )
     }
 
     /// Fallible construction for a Core configured with recoverable
@@ -242,39 +372,28 @@ impl RuntimeServices {
     ) -> AgentResult<Self> {
         let verification_coverage_declarations =
             snapshot_verification_coverage_declarations(tools.as_ref());
-        let event_journal = journal.clone();
         let core = try_build_core_port(
             kernel_config.clone(),
             context.clone(),
             tools.clone(),
             approval,
-            journal,
+            journal.clone(),
             Some(authority_recovery.operation_journal),
             authority_recovery.effect_reconciler,
         )?;
-        Ok(Self {
+        Ok(Self::from_parts(
             core,
             kernel_config,
-            event_journal,
             context,
             model,
             tools,
-            verification_coverage_declarations,
-            artifact_workspace: None,
-            provider_profile_digest: None,
-            cache_routing: None,
-            defer_proof_refresh: false,
-            shadow_context_frame: false,
-            project_task_progress: true,
-            prompt_layout: PromptLayout::CurrentStateLast,
-            project_settlement: false,
-            settlement_projection_diagnostics: false,
-            project_completion_opportunity: false,
-            recovery_surface: false,
-            capability_registry: None,
-            proof_verifier: None,
-            project_proof_refresh: false,
-        })
+            ProductServicesConfig {
+                event_journal: journal,
+                verification_coverage_declarations,
+                ..ProductServicesConfig::default()
+            },
+            ExperimentProjection::default(),
+        ))
     }
 
     /// Resolve every service from the module host's typed registry. The
@@ -792,6 +911,7 @@ impl RuntimeServices {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use agent_contracts::OperationJournal;
     use agent_contracts::{
         ContextDiagnostics, ContextQuery, MaterializedContext, ModelCapabilities, ModelOutput,
         ModelRequest, ToolExecutionRequest, ToolOutcome,
@@ -937,5 +1057,101 @@ mod tests {
             services.system_prompt(),
             "from_registry preserves the root's configuration"
         );
+    }
+
+    /// Minimal in-memory authority journal so `try_new` is exercisable in
+    /// this module without a filesystem.
+    #[derive(Default)]
+    struct BaselineOperationJournal {
+        sequence: std::sync::atomic::AtomicU64,
+    }
+
+    impl OperationJournal for BaselineOperationJournal {
+        fn append_and_sync(
+            &self,
+            transition: &agent_contracts::OperationJournalTransition,
+        ) -> AgentResult<agent_contracts::OperationJournalRecord> {
+            Ok(agent_contracts::OperationJournalRecord {
+                version: agent_contracts::OPERATION_JOURNAL_VERSION,
+                seq: self
+                    .sequence
+                    .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+                    + 1,
+                transition: transition.clone(),
+            })
+        }
+
+        fn recover(&self) -> AgentResult<agent_contracts::OperationJournalRecovery> {
+            Ok(agent_contracts::OperationJournalRecovery::default())
+        }
+    }
+
+    /// T5 characterization: `new` and `try_new` converge on one
+    /// initialization path and both produce the same frozen
+    /// product/experiment baseline. If the grouped constructors ever drift
+    /// a default, this test names the observable that moved.
+    #[test]
+    fn new_and_try_new_share_the_frozen_product_baseline() {
+        let config = CoreAuthorityConfig::default();
+        let context: Arc<dyn ContextEngine> = Arc::new(StubContext);
+        let model: Arc<dyn ModelTransport> = Arc::new(StubModel);
+        let tools: Arc<dyn ToolDispatcher> = Arc::new(StubTools);
+        let approval: Arc<dyn ApprovalGate> = Arc::new(PolicyApprovalGate::read_only());
+        let plain = RuntimeServices::new(
+            config.clone(),
+            context.clone(),
+            model.clone(),
+            tools.clone(),
+            approval.clone(),
+            None,
+        );
+        let recovered = RuntimeServices::try_new(
+            config,
+            context.clone(),
+            model.clone(),
+            tools.clone(),
+            approval.clone(),
+            None,
+            AuthorityRecoveryServices::new(Arc::new(BaselineOperationJournal::default()), None),
+        )
+        .expect("the recoverable authority builds against an empty journal");
+        for services in [&plain, &recovered] {
+            // Product configuration defaults.
+            assert!(services.artifact_workspace().is_none());
+            assert!(services.provider_profile_digest().is_none());
+            assert!(services.cache_routing().is_none());
+            assert!(!services.defer_proof_refresh());
+            assert!(!services.shadow_context_frame());
+            assert_eq!(services.prompt_layout(), PromptLayout::CurrentStateLast);
+            assert!(!services.project_proof_refresh());
+            assert!(services.capability_registry().is_none());
+            assert!(services.event_journal().is_none());
+            // Frozen experiment projection baseline: TaskProgress on,
+            // every projection/ablation switch off.
+            assert!(services.project_task_progress());
+            assert!(!services.project_settlement());
+            assert!(!services.settlement_projection_diagnostics());
+            assert!(!services.project_completion_opportunity());
+            assert!(!services.recovery_surface());
+            // A no-op tool surface snapshots to an empty coverage table.
+            assert!(services.verification_coverage_declarations().is_empty());
+        }
+        // The grouped bundles themselves pin the frozen baseline.
+        assert_eq!(
+            ExperimentProjection::default(),
+            ExperimentProjection::baseline()
+        );
+        assert!(ExperimentProjection::baseline().project_task_progress);
+        assert!(!ExperimentProjection::baseline().project_settlement);
+        assert!(!ExperimentProjection::baseline().settlement_projection_diagnostics);
+        assert!(!ExperimentProjection::baseline().project_completion_opportunity);
+        assert!(!ExperimentProjection::baseline().recovery_surface);
+        assert_eq!(
+            ProductServicesConfig::default().prompt_layout,
+            PromptLayout::CurrentStateLast
+        );
+        assert!(!ProductServicesConfig::default().defer_proof_refresh);
+        assert!(!ProductServicesConfig::default().shadow_context_frame);
+        assert!(!ProductServicesConfig::default().project_proof_refresh);
     }
 }

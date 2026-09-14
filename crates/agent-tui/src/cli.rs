@@ -674,39 +674,29 @@ mod tests {
             .state_dir()
             .join("authority")
             .join("broker-reservations.jsonl");
-        compose(ComposeConfig {
-            provider_profile_digest: None,
-            cache_routing: None,
-            defer_proof_refresh: false,
-            shadow_context_frame: false,
-            workspace: workspace.clone(),
+        // T5: the shared product composition baseline (same as the platform
+        // host); this headless entry states only its own differences below.
+        let mut config = ComposeConfig::product_baseline(
+            workspace.clone(),
             context_engine,
             model,
             approval,
             base_tools,
-            capability_aware: true,
-            journal: Some(journal),
-            artifact_store: Some(Arc::new(workspace.clone())),
-            output_broker: Some(Arc::new(WorkspaceOutputBroker::new(
-                workspace.clone().into(),
-            ))),
-            max_tool_rounds,
-            project_task_progress: true,
-            project_settlement: false,
-            settlement_projection_diagnostics: false,
-            project_completion_opportunity: false,
-            recovery_surface: false,
-            host_policies: Some(host_policies),
-            effect_reservation_journal: Some(reservation),
-            verification_recipes: Some(recipes.clone()),
-            project_proof_refresh: !recipes.is_empty(),
-            // Headless CLI shares the product binary's watchdog dispatch.
-            host_death_watchdog: true,
-            // Harness/eval compositions register no external capabilities by default.
-            mcp_servers: Vec::new(),
-            plugins: None,
-        })
-        .await
+        );
+        config.journal = Some(journal);
+        config.artifact_store = Some(Arc::new(workspace.clone()));
+        config.output_broker = Some(Arc::new(WorkspaceOutputBroker::new(
+            workspace.clone().into(),
+        )));
+        config.max_tool_rounds = max_tool_rounds;
+        config.host_policies = Some(host_policies);
+        config.effect_reservation_journal = Some(reservation);
+        config.verification_recipes = Some(recipes.clone());
+        // Difference from the platform host: the headless CLI runs the
+        // product proof-refresh transaction whenever the workspace carries
+        // a recipe table.
+        config.project_proof_refresh = !recipes.is_empty();
+        compose(config).await
     }
 
     fn session_end(jsonl: &str) -> serde_json::Value {

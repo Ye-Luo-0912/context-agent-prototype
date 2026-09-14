@@ -101,6 +101,21 @@ impl ContextPolicy {
 /// ——不把「不支持必需正文投影」伪装成「全部已满足」。切换 Dynamic 是
 /// 质量/产品决策，须先通过 CTX-4 的真实默认入口旅程验收；实验 baseline
 /// （append/rolling）的可比语义保持不变。
+///
+/// **维护预算的适用引擎（如实区分「未接入」与「默认」，T5）**：同一份
+/// `MaintenanceBudget` 在不同 policy 下生效的维度不同——
+/// - `rolling`：预算完整生效。`max_calls_per_maintain` /
+///   `max_tokens_per_maintain` / `compact_failure_backoff_maintains`
+///   逐项进入 `RollingConfig`，成为该引擎逐 pass 的硬上限。
+/// - `dynamic`：只有「是否挂压缩器」（`allows_calls`）生效；逐 pass 的
+///   call/token/backoff 上限**未接入** `SimpleContextConfig`（context-simple
+///   没有对应字段）。这是「未支持/未接入」，不是「默认关闭」——运行时
+///   报告里的正数预算对 dynamic 的逐 pass 维护不构成约束。
+/// - `append` / `service`：不挂任何压缩器（service 的压缩在子进程内），
+///   预算不约束任何调用。
+///
+/// 因此读取 effective config 时，正数维护预算只在 `context_policy=rolling`
+/// 下表示「逐 pass 已生效」；其他 policy 下它只表示压缩器的挂载决策。
 pub async fn build_context_engine(
     policy: ContextPolicy,
     state_dir: &Path,
@@ -311,6 +326,13 @@ pub fn try_model_from_env() -> anyhow::Result<ModelSelection> {
 /// budget again. `compact_failure_backoff_maintains` defers a FAILED fold
 /// request for that many fold-eligible passes; changed folded content
 /// invalidates the deferral immediately.
+///
+/// Applicability is engine-specific and stated where the budget is applied
+/// (see [`build_context_engine`]): only the rolling engine currently
+/// enforces the per-pass count/token/backoff caps; for dynamic the budget
+/// decides only whether a compactor is attached at all; append/service
+/// attach no compactor. A positive number here is therefore NOT evidence
+/// that every engine bounds its maintenance passes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct MaintenanceBudget {
     /// Compactor calls one maintain pass may make. `0` = never send.
@@ -675,6 +697,61 @@ pub struct ComposeConfig {
     /// dispatcher so `capability.manage read_skill` can serve on-demand,
     /// bounded skill bodies. `None` (default) leaves skill reads refused.
     pub plugins: Option<Arc<agent_runtime::PluginRegistry>>,
+}
+
+impl ComposeConfig {
+    /// The product composition baseline every product entry point (the
+    /// platform host, the headless CLI) starts from, so two entry points
+    /// cannot silently disagree about a product default: the frozen
+    /// experiment projection switches at their off/baseline values
+    /// (TaskProgress on, settlement/completion-opportunity/recovery-surface
+    /// off — the paired-evaluation switches remain, grouped, for experiment
+    /// arms to set explicitly), the proof-refresh transaction closed, and
+    /// product plumbing on (capability-aware dispatch, host-death
+    /// containment — keep the latter only in a binary whose `main`
+    /// dispatches on `agent_process::watchdog::WATCHDOG_ENV`).
+    ///
+    /// Callers pass the composition-root decisions this function takes as
+    /// parameters and then overwrite ONLY their entry-specific options
+    /// (journals, round budget, provider identity, capability config), never
+    /// the product defaults.
+    #[must_use]
+    pub fn product_baseline(
+        workspace: Workspace,
+        context_engine: Arc<dyn ContextEngine>,
+        model: Arc<dyn ModelTransport>,
+        approval: Arc<dyn ApprovalGate>,
+        base_tools: Arc<dyn ToolDispatcher>,
+    ) -> Self {
+        Self {
+            workspace,
+            context_engine,
+            model,
+            approval,
+            base_tools,
+            provider_profile_digest: None,
+            cache_routing: None,
+            defer_proof_refresh: false,
+            shadow_context_frame: false,
+            capability_aware: true,
+            journal: None,
+            artifact_store: None,
+            output_broker: None,
+            max_tool_rounds: None,
+            project_task_progress: true,
+            project_settlement: false,
+            settlement_projection_diagnostics: false,
+            project_completion_opportunity: false,
+            recovery_surface: false,
+            host_policies: None,
+            effect_reservation_journal: None,
+            verification_recipes: None,
+            project_proof_refresh: false,
+            host_death_watchdog: true,
+            mcp_servers: Vec::new(),
+            plugins: None,
+        }
+    }
 }
 
 /// A composed runtime. Owns the workspace and the spawned `RuntimeInstance`
@@ -1054,6 +1131,70 @@ mod tests {
         let composed = compose(config).await.unwrap();
         composed.instance.start().await.unwrap();
         composed.shutdown().await.unwrap();
+    }
+
+    /// T5 characterization: the shared product baseline pins the values the
+    /// host and headless entries used to spell out literally, so the
+    /// constructor cannot silently drift from the historical product
+    /// configuration.
+    #[tokio::test]
+    async fn product_baseline_pins_the_historical_product_values() {
+        let dir = tempfile::tempdir().unwrap();
+        let workspace = Workspace::open(dir.path()).await.unwrap();
+        let engine: Arc<dyn ContextEngine> =
+            Arc::new(SimpleContextEngine::new(SimpleContextConfig::default()));
+        let model: Arc<dyn ModelTransport> = Arc::new(MockModelTransport);
+        let approval: Arc<dyn ApprovalGate> = Arc::new(PolicyApprovalGate::permissive());
+        let base_tools: Arc<dyn ToolDispatcher> =
+            Arc::new(BuiltinToolDispatcher::new(workspace.clone()).unwrap());
+        let config =
+            ComposeConfig::product_baseline(workspace, engine, model, approval, base_tools);
+        // Product plumbing on.
+        assert!(config.capability_aware);
+        assert!(config.host_death_watchdog);
+        // Frozen experiment projection baseline: TaskProgress on, every
+        // projection/ablation switch off.
+        assert!(config.project_task_progress);
+        assert!(!config.project_settlement);
+        assert!(!config.settlement_projection_diagnostics);
+        assert!(!config.project_completion_opportunity);
+        assert!(!config.recovery_surface);
+        // Proof refresh closed; measurement switches off.
+        assert!(!config.defer_proof_refresh);
+        assert!(!config.shadow_context_frame);
+        assert!(!config.project_proof_refresh);
+        // Entry-specific options start unset; the entries fill them.
+        assert!(config.provider_profile_digest.is_none());
+        assert!(config.cache_routing.is_none());
+        assert!(config.journal.is_none());
+        assert!(config.artifact_store.is_none());
+        assert!(config.output_broker.is_none());
+        assert!(config.max_tool_rounds.is_none());
+        assert!(config.host_policies.is_none());
+        assert!(config.effect_reservation_journal.is_none());
+        assert!(config.verification_recipes.is_none());
+        assert!(config.mcp_servers.is_empty());
+        assert!(config.plugins.is_none());
+    }
+
+    /// The shared product baseline composes end to end with only
+    /// entry-specific overrides applied on top — the shape the host and
+    /// headless CLI entries use.
+    #[tokio::test]
+    async fn product_baseline_with_entry_overrides_composes() {
+        let dir = tempfile::tempdir().unwrap();
+        let workspace = Workspace::open(dir.path()).await.unwrap();
+        let engine: Arc<dyn ContextEngine> =
+            Arc::new(SimpleContextEngine::new(SimpleContextConfig::default()));
+        let model: Arc<dyn ModelTransport> = Arc::new(MockModelTransport);
+        let approval: Arc<dyn ApprovalGate> = Arc::new(PolicyApprovalGate::permissive());
+        let base_tools: Arc<dyn ToolDispatcher> =
+            Arc::new(BuiltinToolDispatcher::new(workspace.clone()).unwrap());
+        let mut config =
+            ComposeConfig::product_baseline(workspace, engine, model, approval, base_tools);
+        // Entry-specific differences only (the host's shape).
+        config.max_tool_rounds = Some(8);
+        run_smoke(config).await;
     }
 
     /// The default composition injects no host verifier and keeps the
