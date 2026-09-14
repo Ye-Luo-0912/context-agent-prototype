@@ -6,6 +6,7 @@ mod barrier;
 mod budget;
 mod busy;
 mod context_commit;
+mod final_pack;
 mod focus;
 mod harness;
 mod input;

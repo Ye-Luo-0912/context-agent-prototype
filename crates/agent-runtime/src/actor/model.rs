@@ -7,22 +7,106 @@ fn is_required_context_body(materialized: &MaterializedContext, item: &Materiali
         || materialized.required_item_ids.contains(&item.item_id)
 }
 
-fn largest_final_pack_drop_index(
+/// T1 (R1): one trim candidate of the final packing layer. The view spans
+/// every droppable partition — selected working-set bodies, foreground
+/// bodies and omitable optional schemas — so required-vs-optional priority
+/// is decided once against the whole frame instead of by whichever
+/// partition a sequential loop happened to be draining.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FinalPackPartition {
+    SelectedBody,
+    ForegroundBody,
+    OptionalSchema,
+}
+
+struct FinalPackCandidate {
+    partition: FinalPackPartition,
+    /// Index inside the source partition (`items` / `foreground`). The
+    /// schema partition keeps its plan-owned omission order, so its index
+    /// is always 0.
+    index: usize,
+    /// Identity of the candidate (item id or tool name), for diagnostics.
+    #[allow(dead_code)]
+    identity: String,
+    required: bool,
+    approx_size: usize,
+}
+
+/// Drop priority, compared with `max`: optional content anywhere before
+/// required content; within the same class the partition rank keeps the
+/// historical order (selected bodies, then foreground bodies, then optional
+/// schemas), and the largest estimated content goes first. Ties fall back
+/// to the later index, matching the previous per-list `max_by_key`
+/// behaviour.
+fn final_pack_candidate_key(candidate: &FinalPackCandidate) -> (u8, u8, usize, usize) {
+    let rank = match candidate.partition {
+        FinalPackPartition::SelectedBody => 0,
+        FinalPackPartition::ForegroundBody => 1,
+        FinalPackPartition::OptionalSchema => 2,
+    };
+    (
+        u8::from(!candidate.required),
+        u8::MAX - rank,
+        candidate.approx_size,
+        candidate.index,
+    )
+}
+
+/// The next drop of the unified final-pack view. `optional_schema_candidate`
+/// is the plan's own peek at what `omit_largest_for_provider_budget` would
+/// remove (never a mandatory schema); bodies come from the materialized
+/// frame. Returns `None` only when nothing droppable remains, after which a
+/// still-overshooting request is refused, never sent.
+fn largest_final_pack_candidate(
     materialized: &MaterializedContext,
-    items: &[MaterializedItem],
-) -> Option<usize> {
-    items
-        .iter()
-        .enumerate()
-        .filter(|(_, item)| !is_required_context_body(materialized, item))
-        .max_by_key(|(_, item)| approx_tokens(&item.content))
-        .or_else(|| {
-            items
-                .iter()
-                .enumerate()
-                .max_by_key(|(_, item)| approx_tokens(&item.content))
-        })
-        .map(|(index, _)| index)
+    optional_schema_candidate: Option<(String, usize)>,
+) -> Option<FinalPackCandidate> {
+    let mut best: Option<FinalPackCandidate> = None;
+    let consider = |candidate: FinalPackCandidate, best: &mut Option<FinalPackCandidate>| {
+        let better = best.as_ref().is_none_or(|current| {
+            final_pack_candidate_key(&candidate) > final_pack_candidate_key(current)
+        });
+        if better {
+            *best = Some(candidate);
+        }
+    };
+    for (index, item) in materialized.items.iter().enumerate() {
+        consider(
+            FinalPackCandidate {
+                partition: FinalPackPartition::SelectedBody,
+                index,
+                identity: item.item_id.to_string(),
+                required: is_required_context_body(materialized, item),
+                approx_size: approx_tokens(&item.content),
+            },
+            &mut best,
+        );
+    }
+    for (index, item) in materialized.foreground.iter().enumerate() {
+        consider(
+            FinalPackCandidate {
+                partition: FinalPackPartition::ForegroundBody,
+                index,
+                identity: item.item_id.to_string(),
+                required: is_required_context_body(materialized, item),
+                approx_size: approx_tokens(&item.content),
+            },
+            &mut best,
+        );
+    }
+    if let Some((name, approx_size)) = optional_schema_candidate {
+        consider(
+            FinalPackCandidate {
+                partition: FinalPackPartition::OptionalSchema,
+                index: 0,
+                identity: name,
+                required: false,
+                approx_size,
+            },
+            &mut best,
+        );
+    }
+    best
 }
 
 fn final_pack_window_covers(candidate: &MaterializedItem, dropped: &MaterializedItem) -> bool {
@@ -83,11 +167,20 @@ fn final_pack_window_covers(candidate: &MaterializedItem, dropped: &Materialized
     )
 }
 
+/// Records the budget exclusion of one removed body. `required` is the
+/// classification captured BEFORE the frame was mutated (see the pack-start
+/// snapshot in `continue_model_operation_after_materialize`). Returns
+/// `true` when a REQUIRED miss was appended: the caller must then also drop
+/// the id from `required_item_ids`, because the final materialization
+/// validation demands that every still-listed required identity is
+/// physically present in the frame — the miss itself now carries the
+/// identity of the body that could not fit (T1/R1 honest degradation).
 fn record_final_pack_drop(
     materialized: &mut MaterializedContext,
     dropped: &MaterializedItem,
+    required: bool,
     active_anchor_revision: u64,
-) {
+) -> bool {
     // The same body may legitimately live in both the selected and the
     // foreground layer (a resource that was both scored and explicitly
     // requested). Removing one copy is not a miss while another copy of
@@ -112,9 +205,8 @@ fn record_final_pack_drop(
                 || final_pack_window_covers(item, dropped)
         });
     if still_visible {
-        return;
+        return false;
     }
-    let required = is_required_context_body(materialized, dropped);
     let miss = ContextMaterializationMiss {
         identity: ContextMaterializationIdentity::new(
             format!("context://run/{}", dropped.item_id),
@@ -129,6 +221,7 @@ fn record_final_pack_drop(
     } else {
         materialized.optional_misses.push(miss);
     }
+    required
 }
 
 fn settlement_progress_views(
@@ -235,6 +328,36 @@ pub(super) struct ModelRoundPlan {
     pub(super) send_window: usize,
     pub(super) surface_plan: RoundSurfacePlan,
     pub(super) proof_surface_available: bool,
+}
+
+/// The conservative input-token estimate of one assembled request: the wire
+/// form of the final message list plus the wire form of its tool schemas.
+/// The provider ingests exactly these bytes, so this is the honest measure
+/// the published accounting uses.
+fn assembled_input_total(input: &ModelInput) -> usize {
+    approx_layer_tokens(&input.into_messages()) + approx_layer_tokens(&input.tool_schemas)
+}
+
+/// T1 (R2): the one immutable publish state of final packing. The request
+/// input, its body-cache accounting and every count derived from them come
+/// from the SAME assembly generation. All packing mutations — body drops,
+/// schema omissions, the settlement-projection revocation — rebuild this
+/// state through one recompute step, so no branch can leave a stale count
+/// behind for the budget check or the Ready report.
+struct FinalPackInputs {
+    input: ModelInput,
+    body_cache_stats: crate::prompt::ProtocolBodyAssemblyStats,
+    input_total: usize,
+    packing_input: Option<ModelInput>,
+    packing_total: Option<usize>,
+}
+
+impl FinalPackInputs {
+    /// The conservative total the final budget check prices: the diagnostic
+    /// packing probe when one exists, otherwise the actual request.
+    fn packed_total(&self) -> usize {
+        self.packing_total.unwrap_or(self.input_total)
+    }
 }
 impl RuntimeActor {
     /// Prepare + spawn one model round: close the consumed tool frames,
@@ -1052,183 +1175,147 @@ impl RuntimeActor {
             .and_then(|task_id| self.state.tasks.get(task_id))
             .map(|task| task.anchor.revision)
             .unwrap_or_default();
-        let (mut input, mut body_cache_stats) = self.assemble_model_input(
+        // T1 (R1): required-body classification is snapshotted once against
+        // the frame AS MATERIALIZED, so a candidate's class does not depend
+        // on which copies earlier packing iterations already removed (two
+        // projections of one required id stay required until one of them is
+        // recorded as the miss).
+        let pack_required_item_ids = materialized.required_item_ids.clone();
+        let is_pack_required = |item: &MaterializedItem| {
+            item.retention == ContextRetention::Pinned
+                || pack_required_item_ids.contains(&item.item_id)
+        };
+        // T1 (R2): the packing counterfactual follows the live candidate
+        // fact, and the single recompute step below re-reads it after every
+        // mutation, so the counts can never outlive the projection state
+        // they were derived from.
+        let mut final_inputs = self.reassemble_final_pack_inputs(
             runtime_focus.as_ref(),
             task_view.as_ref(),
             progress_view.as_ref(),
+            packing_progress_view.as_ref(),
             &materialized,
             &turn_frame,
             surface_plan.specs().to_vec(),
+            settlement_packing_requires_counterfactual(
+                settlement_candidate,
+                project_settlement,
+                settlement_projection_diagnostics,
+            ),
         );
-        // COST-3 (D05): the unconditional stderr dump of assembled tool
-        // schemas is gone — tool-surface facts are already durable in
-        // `ToolSurfacePlanned` and need no hot-path printing.
-        // A second packed request exists only for the diagnostic off arm.
-        // Ordinary product off/on paths measure and trim `input` directly;
-        // they neither assemble nor clone a second ModelInput.
-        let mut packing_input = if settlement_packing_requires_counterfactual(
-            settlement_candidate,
-            project_settlement,
-            settlement_projection_diagnostics,
-        ) {
-            Some(
-                self.assemble_model_input(
-                    runtime_focus.as_ref(),
-                    task_view.as_ref(),
-                    packing_progress_view.as_ref(),
-                    &materialized,
-                    &turn_frame,
-                    surface_plan.specs().to_vec(),
-                )
-                .0,
-            )
-        } else {
-            None
-        };
-        let assembled_total = |input: &ModelInput| {
-            approx_layer_tokens(&input.into_messages()) + approx_layer_tokens(&input.tool_schemas)
-        };
-        // COST-3 (D04): the totals are derived ONCE per assembly and tracked
-        // as plain values — the packing conditions below no longer
-        // re-serialize the whole message list on every comparison. The
-        // single source of truth stays the freshly assembled `input`;
-        // `approx_tokens` remains the engine's own heuristic and the final
-        // refusal keeps its conservative margin.
-        let mut input_total = assembled_total(&input);
-        let mut packing_total = packing_input.as_ref().map(assembled_total);
-        let mut packed_now = packing_total.unwrap_or(input_total);
-        while packed_now > max_input_budget && !materialized.items.is_empty() {
-            // Drop the largest optional item first. If only mandatory
-            // bodies remain, the hard provider budget still wins, but that
-            // removal becomes an explicit BudgetExcluded completion blocker.
-            let drop_index = largest_final_pack_drop_index(&materialized, &materialized.items);
-            let Some(drop_index) = drop_index else {
-                break;
-            };
-            let dropped = materialized.items.remove(drop_index);
-            record_final_pack_drop(&mut materialized, &dropped, active_anchor_revision);
-            materialized
-                .selected
-                .retain(|selection| selection.item_id != dropped.item_id);
-            materialized.approx_tokens = materialized
-                .approx_tokens
-                .saturating_sub(approx_tokens(&dropped.content));
-            (input, body_cache_stats) = self.assemble_model_input(
-                runtime_focus.as_ref(),
-                task_view.as_ref(),
-                progress_view.as_ref(),
-                &materialized,
-                &turn_frame,
-                surface_plan.specs().to_vec(),
-            );
-            input_total = assembled_total(&input);
-            if packing_input.is_some() {
-                packing_input = Some(
-                    self.assemble_model_input(
-                        runtime_focus.as_ref(),
-                        task_view.as_ref(),
-                        packing_progress_view.as_ref(),
-                        &materialized,
-                        &turn_frame,
-                        surface_plan.specs().to_vec(),
-                    )
-                    .0,
-                );
-                packing_total = Some(assembled_total(packing_input.as_ref().unwrap()));
-            }
-            packed_now = packing_total.unwrap_or(input_total);
-        }
-        while packed_now > max_input_budget && !materialized.foreground.is_empty() {
-            let drop_index = largest_final_pack_drop_index(&materialized, &materialized.foreground);
-            let Some(drop_index) = drop_index else {
-                break;
-            };
-            let dropped = materialized.foreground.remove(drop_index);
-            record_final_pack_drop(&mut materialized, &dropped, active_anchor_revision);
-            materialized.approx_tokens = materialized
-                .approx_tokens
-                .saturating_sub(approx_tokens(&dropped.content));
-            (input, body_cache_stats) = self.assemble_model_input(
-                runtime_focus.as_ref(),
-                task_view.as_ref(),
-                progress_view.as_ref(),
-                &materialized,
-                &turn_frame,
-                surface_plan.specs().to_vec(),
-            );
-            input_total = assembled_total(&input);
-            if packing_input.is_some() {
-                packing_input = Some(
-                    self.assemble_model_input(
-                        runtime_focus.as_ref(),
-                        task_view.as_ref(),
-                        packing_progress_view.as_ref(),
-                        &materialized,
-                        &turn_frame,
-                        surface_plan.specs().to_vec(),
-                    )
-                    .0,
-                );
-                packing_total = Some(assembled_total(packing_input.as_ref().unwrap()));
-            }
-            packed_now = packing_total.unwrap_or(input_total);
-        }
-
-        // The context frame is empty but the fixed layers still overshoot:
-        // omit optional schemas from this round's snapshot only. Provider
-        // token pressure must never unload a catalog entry, bump its
-        // generation or make a later, larger-budget round forget the tool.
-        // The trimmed snapshot remains the one source for prompt assembly,
-        // accounting and tool-call validation in this round.
+        // COST-3 (D04): the tracked totals are derived ONCE per assembly and
+        // tracked inside `final_inputs` — the loop below never re-serializes
+        // the message list outside the recompute step, and `approx_tokens`
+        // remains the engine's own heuristic while the final refusal keeps
+        // its conservative margin.
+        let mut packed_now = final_inputs.packed_total();
         while packed_now > max_input_budget {
-            if surface_plan.omit_largest_for_provider_budget().is_none() {
+            // T1 (R1): ONE candidate view across selected bodies, foreground
+            // bodies and omitable optional schemas. Optional content
+            // anywhere goes before required content, so the partition
+            // execution order can no longer sacrifice a required body while
+            // another partition still holds a droppable optional candidate.
+            // When only required candidates remain, the hard provider
+            // budget still wins, but each removal becomes an explicit
+            // `BudgetExcluded` miss — never a silent loss and never
+            // fabricated coverage. A remainder whose mandatory layers still
+            // overshoot is refused after the loop, never sent.
+            let Some(candidate) = largest_final_pack_candidate(
+                &materialized,
+                surface_plan.peek_provider_budget_omission_candidate(),
+            ) else {
                 break;
+            };
+            match candidate.partition {
+                FinalPackPartition::SelectedBody => {
+                    let dropped = materialized.items.remove(candidate.index);
+                    if record_final_pack_drop(
+                        &mut materialized,
+                        &dropped,
+                        is_pack_required(&dropped),
+                        active_anchor_revision,
+                    ) {
+                        // The miss now carries the identity; the id list may
+                        // only name bodies still present in the frame, or
+                        // the final materialization validation would fence.
+                        materialized
+                            .required_item_ids
+                            .retain(|item_id| *item_id != dropped.item_id);
+                    }
+                    materialized
+                        .selected
+                        .retain(|selection| selection.item_id != dropped.item_id);
+                    materialized.approx_tokens = materialized
+                        .approx_tokens
+                        .saturating_sub(approx_tokens(&dropped.content));
+                }
+                FinalPackPartition::ForegroundBody => {
+                    let dropped = materialized.foreground.remove(candidate.index);
+                    if record_final_pack_drop(
+                        &mut materialized,
+                        &dropped,
+                        is_pack_required(&dropped),
+                        active_anchor_revision,
+                    ) {
+                        materialized
+                            .required_item_ids
+                            .retain(|item_id| *item_id != dropped.item_id);
+                    }
+                    materialized.approx_tokens = materialized
+                        .approx_tokens
+                        .saturating_sub(approx_tokens(&dropped.content));
+                }
+                FinalPackPartition::OptionalSchema => {
+                    // Round-local omission of exactly the peeked candidate.
+                    // Provider token pressure must never unload a catalog
+                    // entry, bump its generation or make a later,
+                    // larger-budget round forget the tool; the trimmed
+                    // snapshot remains the one source for prompt assembly,
+                    // accounting and tool-call validation in this round.
+                    let omitted = surface_plan.omit_largest_for_provider_budget();
+                    debug_assert!(
+                        omitted.is_some(),
+                        "the peered schema candidate {} vanished",
+                        candidate.identity
+                    );
+                    let final_proof_surface_available = surface_plan
+                        .specs()
+                        .iter()
+                        .any(|spec| spec.name == "verify.run");
+                    if final_proof_surface_available != proof_surface_available {
+                        self.project_completion_repair(
+                            &mut base_progress_view,
+                            final_proof_surface_available,
+                        );
+                        (treatment_progress_view, progress_view) = settlement_progress_views(
+                            &base_progress_view,
+                            settlement_candidate,
+                            project_settlement,
+                            settlement_projection_diagnostics,
+                        );
+                        packing_progress_view = if settlement_projection_diagnostics {
+                            treatment_progress_view.clone()
+                        } else {
+                            progress_view.clone()
+                        };
+                    }
+                }
             }
-            let final_proof_surface_available = surface_plan
-                .specs()
-                .iter()
-                .any(|spec| spec.name == "verify.run");
-            if final_proof_surface_available != proof_surface_available {
-                self.project_completion_repair(
-                    &mut base_progress_view,
-                    final_proof_surface_available,
-                );
-                (treatment_progress_view, progress_view) = settlement_progress_views(
-                    &base_progress_view,
+            final_inputs = self.reassemble_final_pack_inputs(
+                runtime_focus.as_ref(),
+                task_view.as_ref(),
+                progress_view.as_ref(),
+                packing_progress_view.as_ref(),
+                &materialized,
+                &turn_frame,
+                surface_plan.specs().to_vec(),
+                settlement_packing_requires_counterfactual(
                     settlement_candidate,
                     project_settlement,
                     settlement_projection_diagnostics,
-                );
-                packing_progress_view = if settlement_projection_diagnostics {
-                    treatment_progress_view.clone()
-                } else {
-                    progress_view.clone()
-                };
-            }
-            (input, body_cache_stats) = self.assemble_model_input(
-                runtime_focus.as_ref(),
-                task_view.as_ref(),
-                progress_view.as_ref(),
-                &materialized,
-                &turn_frame,
-                surface_plan.specs().to_vec(),
+                ),
             );
-            input_total = assembled_total(&input);
-            if packing_input.is_some() {
-                packing_input = Some(
-                    self.assemble_model_input(
-                        runtime_focus.as_ref(),
-                        task_view.as_ref(),
-                        packing_progress_view.as_ref(),
-                        &materialized,
-                        &turn_frame,
-                        surface_plan.specs().to_vec(),
-                    )
-                    .0,
-                );
-                packing_total = Some(assembled_total(packing_input.as_ref().unwrap()));
-            }
-            packed_now = packing_total.unwrap_or(input_total);
+            packed_now = final_inputs.packed_total();
         }
 
         // Runtime trimming itself may have displaced a required body and
@@ -1236,6 +1323,10 @@ impl RuntimeActor {
         // request being sent. Once the candidate is revoked there is no
         // treatment exposure to compare, so a diagnostic off-arm probe is
         // dropped as well instead of retaining a second large input.
+        // T1 (R2): the revoked projection changes the published request, so
+        // the SAME recompute step rebuilds it together with every count —
+        // the previous code left `input_total`/`packing_total` at their
+        // pre-revocation values here.
         if settlement_candidate && !materialized.required_misses.is_empty() {
             settlement_candidate = false;
             (treatment_progress_view, progress_view) = settlement_progress_views(
@@ -1249,45 +1340,38 @@ impl RuntimeActor {
             } else {
                 progress_view.clone()
             };
-            (input, body_cache_stats) = self.assemble_model_input(
+            final_inputs = self.reassemble_final_pack_inputs(
                 runtime_focus.as_ref(),
                 task_view.as_ref(),
                 progress_view.as_ref(),
+                packing_progress_view.as_ref(),
                 &materialized,
                 &turn_frame,
                 surface_plan.specs().to_vec(),
+                settlement_packing_requires_counterfactual(
+                    settlement_candidate,
+                    project_settlement,
+                    settlement_projection_diagnostics,
+                ),
             );
-            packing_input = if settlement_packing_requires_counterfactual(
-                settlement_candidate,
-                project_settlement,
-                settlement_projection_diagnostics,
-            ) {
-                Some(
-                    self.assemble_model_input(
-                        runtime_focus.as_ref(),
-                        task_view.as_ref(),
-                        packing_progress_view.as_ref(),
-                        &materialized,
-                        &turn_frame,
-                        surface_plan.specs().to_vec(),
-                    )
-                    .0,
-                )
-            } else {
-                None
-            };
         }
+        // COST-3 (D04): the destructured totals ARE the final derivation —
+        // no extra message re-serialization for the accounting read, and no
+        // branch-local counts that can drift from the published request.
+        let FinalPackInputs {
+            input,
+            body_cache_stats,
+            input_total: estimated_input_tokens,
+            packing_input,
+            packing_total,
+        } = final_inputs;
+        let packing_input_tokens = packing_total.unwrap_or(estimated_input_tokens);
 
         if let Err(error) = materialized.validate_materialization() {
             self.fail_round_preparation("final_context_materialization", error)
                 .await;
             return;
         }
-
-        // COST-3 (D04): the tracked totals ARE the final derivation — no
-        // extra message re-serialization for the accounting read.
-        let estimated_input_tokens = input_total;
-        let packing_input_tokens = packing_total.unwrap_or(input_total);
         // 正文恢复账目出账（增量）。eligible 是最终
         // 组装的真实 checkpoint demand；失效/超限计数是自上一条账目
         // 以来的累计，drain 后归零。
@@ -1703,6 +1787,72 @@ impl RuntimeActor {
             &self.services.tool_catalog(),
             &protocol_bodies,
         )
+    }
+
+    /// T1 (R2): the single recompute exit of final packing. Assembles the
+    /// actual request input and — when the current projection mode calls
+    /// for it — the diagnostic packing probe, then derives every count from
+    /// those assemblies. The trimming loop and the settlement-projection
+    /// revocation both go through here, so `estimated_input_tokens` and the
+    /// budget check can only ever describe the request that is published.
+    ///
+    /// T1 抽取方案（本片完成计数单一出口；完整纯函数化按下述边界落地，
+    /// 不另起第二套待办）：把「候选构建 → 统一裁剪 → 投影修订 → 最终
+    /// 消息与工具表面 → 覆盖/计数/缓存计划 → 一次发布」收敛为一个纯决策
+    /// 函数 `plan_final_publish(input: FinalPackDecisionInput) ->
+    /// FinalPackDecision`，Actor 只保留调度、身份与提交。所需输入全部
+    /// 值语义：已验证的 `MaterializedContext`、`RoundSurfacePlan` 快照、
+    /// 三个投影视图（base/actual/packing）、预算（send_window、
+    /// output_reserve）、`active_anchor_revision` 与组装所需的只读目录/
+    /// 协议正文行。输出即 [`FinalPackInputs`] 加 `required_item_ids` 的
+    /// 终态与 `proof_surface_available` 变化。两处 `&self` 依赖按现有
+    /// 签名直接搬进输入结构即可纯化：`assemble_model_input`（只读
+    /// assembler + 目录 + 协议正文行）与 `project_completion_repair`
+    /// （只读 readiness 投影）。回归保护：现有 final-pack /
+    /// settlement / input_bounds 三组反例保持红→绿等价，报告计数与
+    /// 线上请求逐字节相等由
+    /// `settlement_projection_revocation_republishes_counts_from_the_final_request`
+    /// 钉住。
+    #[allow(clippy::too_many_arguments)]
+    fn reassemble_final_pack_inputs(
+        &self,
+        runtime_focus: Option<&FocusState>,
+        task_view: Option<&TaskAnchorView>,
+        progress_view: Option<&TaskProgressView>,
+        packing_progress_view: Option<&TaskProgressView>,
+        materialized: &MaterializedContext,
+        turn_frame: &TurnFrame,
+        tool_specs: Vec<ToolSpec>,
+        assemble_counterfactual: bool,
+    ) -> FinalPackInputs {
+        let (input, body_cache_stats) = self.assemble_model_input(
+            runtime_focus,
+            task_view,
+            progress_view,
+            materialized,
+            turn_frame,
+            tool_specs.clone(),
+        );
+        let input_total = assembled_input_total(&input);
+        let packing_input = assemble_counterfactual.then(|| {
+            self.assemble_model_input(
+                runtime_focus,
+                task_view,
+                packing_progress_view,
+                materialized,
+                turn_frame,
+                tool_specs,
+            )
+            .0
+        });
+        let packing_total = packing_input.as_ref().map(assembled_input_total);
+        FinalPackInputs {
+            input,
+            body_cache_stats,
+            input_total,
+            packing_input,
+            packing_total,
+        }
     }
 
     /// Re-injectable protocol bodies with their real exposed windows. The
@@ -2168,18 +2318,32 @@ mod failure_class_tests {
             ..Default::default()
         };
 
+        let candidate = largest_final_pack_candidate(&materialized, None)
+            .expect("a droppable candidate exists");
         assert_eq!(
-            largest_final_pack_drop_index(&materialized, &materialized.items),
-            Some(1),
+            candidate.partition,
+            FinalPackPartition::SelectedBody,
             "optional content is displaced before a larger mandatory body"
         );
+        assert_eq!(candidate.index, 1);
+        assert!(!candidate.required);
         // The runtime removes the optional copy first, then has nothing
         // left but the required body; dropping it removes the body from
         // the frame entirely and is recorded as a BudgetExcluded miss.
         let dropped_optional = materialized.items.remove(1);
-        record_final_pack_drop(&mut materialized, &dropped_optional, 9);
+        assert!(!record_final_pack_drop(
+            &mut materialized,
+            &dropped_optional,
+            false,
+            9,
+        ));
         materialized.items.remove(0);
-        record_final_pack_drop(&mut materialized, &required, 9);
+        assert!(record_final_pack_drop(
+            &mut materialized,
+            &required,
+            true,
+            9
+        ));
         assert_eq!(materialized.required_misses.total(), 1);
         let miss = &materialized.required_misses.as_slice()[0];
         assert_eq!(miss.identity.item_id, Some(required.item_id));
@@ -2189,6 +2353,86 @@ mod failure_class_tests {
             ContextMaterializationMissReason::BudgetExcluded
         );
         assert_eq!(materialized.optional_misses.total(), 1);
+    }
+
+    #[test]
+    fn final_pack_unified_candidate_keeps_required_body_while_foreground_is_optional() {
+        // R1 counterexample at the selector level: the selected layer holds
+        // only a small REQUIRED body while the foreground layer holds an
+        // OPTIONAL one. The unified view must pick the optional foreground
+        // body no matter the partition order; the old per-list selector
+        // fell back to the required body because its list had no optional
+        // candidate left.
+        let required = context_item(ContextRetention::Working, &"r".repeat(1_000));
+        let required_id = required.item_id;
+        let optional_foreground = context_item(ContextRetention::Working, "foreground");
+        let materialized = MaterializedContext {
+            items: vec![required],
+            foreground: vec![optional_foreground],
+            required_item_ids: vec![required_id],
+            ..Default::default()
+        };
+        let candidate =
+            largest_final_pack_candidate(&materialized, None).expect("candidate exists");
+        assert_eq!(candidate.partition, FinalPackPartition::ForegroundBody);
+        assert!(!candidate.required, "optional foreground must win");
+    }
+
+    #[test]
+    fn final_pack_unified_candidate_prefers_optional_schema_over_required_body() {
+        let required = context_item(ContextRetention::Working, &"r".repeat(5_000));
+        let materialized = MaterializedContext {
+            items: vec![required.clone()],
+            required_item_ids: vec![required.item_id],
+            ..Default::default()
+        };
+        let candidate =
+            largest_final_pack_candidate(&materialized, Some(("optional.large".to_string(), 64)))
+                .expect("candidate exists");
+        assert_eq!(
+            candidate.partition,
+            FinalPackPartition::OptionalSchema,
+            "a round-local optional schema goes before a required body"
+        );
+        assert_eq!(candidate.identity, "optional.large");
+    }
+
+    #[test]
+    fn final_pack_unified_candidate_orders_optional_bodies_before_optional_schema() {
+        let optional_body = context_item(ContextRetention::Working, &"o".repeat(10));
+        let materialized = MaterializedContext {
+            items: vec![optional_body],
+            ..Default::default()
+        };
+        let candidate = largest_final_pack_candidate(
+            &materialized,
+            Some(("optional.large".to_string(), 9_000)),
+        )
+        .expect("candidate exists");
+        assert_eq!(
+            candidate.partition,
+            FinalPackPartition::SelectedBody,
+            "the historical optional-kind order (bodies, then schemas) is preserved"
+        );
+    }
+
+    #[test]
+    fn final_pack_unified_candidate_falls_back_to_the_largest_required_body() {
+        let small = context_item(ContextRetention::Working, "s");
+        let large = context_item(ContextRetention::Working, &"l".repeat(500));
+        let materialized = MaterializedContext {
+            items: vec![small.clone(), large.clone()],
+            required_item_ids: vec![small.item_id, large.item_id],
+            ..Default::default()
+        };
+        let candidate = largest_final_pack_candidate(&materialized, None).expect("candidate");
+        assert_eq!(candidate.partition, FinalPackPartition::SelectedBody);
+        assert!(candidate.required);
+        assert_eq!(
+            candidate.identity,
+            large.item_id.to_string(),
+            "with nothing optional left, the largest required body is displaced first"
+        );
     }
 
     #[test]
@@ -2204,7 +2448,12 @@ mod failure_class_tests {
             ..Default::default()
         };
         materialized.items.remove(0);
-        record_final_pack_drop(&mut materialized, &required, 9);
+        assert!(!record_final_pack_drop(
+            &mut materialized,
+            &required,
+            true,
+            9
+        ));
         assert_eq!(
             materialized.required_misses.total(),
             0,
@@ -2276,7 +2525,7 @@ mod failure_class_tests {
                 required_item_ids: vec![required.item_id],
                 ..Default::default()
             };
-            record_final_pack_drop(&mut materialized, &required, 9);
+            record_final_pack_drop(&mut materialized, &required, true, 9);
             assert_eq!(materialized.required_misses.total(), 1, "{case}");
         }
 
@@ -2291,7 +2540,12 @@ mod failure_class_tests {
             required_item_ids: vec![required.item_id],
             ..Default::default()
         };
-        record_final_pack_drop(&mut materialized, &required, 9);
+        assert!(!record_final_pack_drop(
+            &mut materialized,
+            &required,
+            true,
+            9
+        ));
         assert!(materialized.required_misses.is_empty());
     }
 
@@ -2320,7 +2574,7 @@ mod failure_class_tests {
             ..Default::default()
         };
         let dropped = materialized.items.remove(0);
-        record_final_pack_drop(&mut materialized, &dropped, 9);
+        assert!(record_final_pack_drop(&mut materialized, &dropped, true, 9));
         assert_eq!(
             materialized.required_misses.total(),
             1,
@@ -2351,7 +2605,12 @@ mod failure_class_tests {
             ..Default::default()
         };
         let dropped = materialized.items.pop().unwrap();
-        record_final_pack_drop(&mut materialized, &dropped, 9);
+        assert!(!record_final_pack_drop(
+            &mut materialized,
+            &dropped,
+            true,
+            9
+        ));
         assert_eq!(
             materialized.required_misses.total(),
             0,
@@ -2382,7 +2641,7 @@ mod failure_class_tests {
             ..Default::default()
         };
         let dropped = materialized.items.remove(0);
-        record_final_pack_drop(&mut materialized, &dropped, 9);
+        assert!(record_final_pack_drop(&mut materialized, &dropped, true, 9));
         assert_eq!(
             materialized.required_misses.total(),
             1,
@@ -2408,7 +2667,12 @@ mod failure_class_tests {
             ..Default::default()
         };
         let dropped = materialized.items.remove(0);
-        record_final_pack_drop(&mut materialized, &dropped, 9);
+        assert!(!record_final_pack_drop(
+            &mut materialized,
+            &dropped,
+            true,
+            9
+        ));
         assert_eq!(
             materialized.required_misses.total(),
             0,

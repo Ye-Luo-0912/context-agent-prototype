@@ -13,13 +13,17 @@ use std::{
 };
 
 use agent_contracts::{
-    AgentResult, EventJournal, ModelCapabilities, ModelOutput, ModelRequest, ModelTransport,
-    RuntimeDirective, RuntimeEvent, RuntimeEventEnvelope, SettlementLabel, TaskProgressProposal,
-    ToolCall, ToolDispatcher, ToolExecutionAttribution, ToolExecutionPurpose, ToolExecutionRequest,
-    ToolOutcome, ToolOutput, ToolRisk, ToolSpec, VerificationReuse,
+    AgentResult, AttentionState, ContextDiagnostics, ContextEngine, ContextIngress, ContextItemId,
+    ContextItemSummary, ContextKind, ContextMaintenanceReport, ContextMaintenanceTrigger,
+    ContextQuery, ContextRetention, ContextScope, ContextStateTransition, EventJournal,
+    MaterializedContext, MaterializedItem, ModelCapabilities, ModelOutput, ModelRequest,
+    ModelTransport, RuntimeDirective, RuntimeEvent, RuntimeEventEnvelope, SemanticState,
+    SettlementLabel, TaskProgressProposal, ToolCall, ToolDispatcher, ToolExecutionAttribution,
+    ToolExecutionPurpose, ToolExecutionRequest, ToolOutcome, ToolOutput, ToolRisk, ToolSpec,
+    ToolSurfacePlanReport, ToolSurfacePlanStatus, VerificationReuse,
 };
 use agent_core::{CoreAuthorityConfig, PolicyApprovalGate};
-use agent_runtime::{ModuleHost, RuntimeInstance, RuntimeServices};
+use agent_runtime::{ModuleHost, RuntimeInstance, RuntimeServices, approx_layer_tokens};
 use serde_json::json;
 
 use crate::harness::*;
@@ -79,12 +83,15 @@ fn verify_identity() -> String {
 /// Plays a round script exactly; a request beyond the script panics, so a
 /// runtime that refuses to settle (or auto-stops) fails the test loudly.
 /// Every model request's full message text is appended to `requests` so
-/// request-level projection tests can assert on the assembled prompt.
+/// request-level projection tests can assert on the assembled prompt, and
+/// the whole wire request to `full_requests` so packing tests can compare
+/// published counts against the request actually sent.
 #[derive(Debug)]
 struct SettlementModel {
     script: Vec<Step>,
     rounds: AtomicUsize,
     requests: Arc<std::sync::Mutex<Vec<String>>>,
+    full_requests: Arc<std::sync::Mutex<Vec<ModelRequest>>>,
 }
 
 #[async_trait::async_trait]
@@ -100,6 +107,7 @@ impl ModelTransport for SettlementModel {
             .collect::<Vec<_>>()
             .join("\n");
         self.requests.lock().unwrap().push(text);
+        self.full_requests.lock().unwrap().push(request.clone());
         let round = self.rounds.fetch_add(1, Ordering::SeqCst);
         let Some(step) = self.script.get(round) else {
             panic!("the runtime requested round {round} beyond the script");
@@ -599,6 +607,7 @@ async fn settlement_instance_with_journal(
             script,
             rounds: AtomicUsize::new(0),
             requests: capture.clone(),
+            full_requests: Arc::new(std::sync::Mutex::new(Vec::new())),
         }),
         Arc::new(SettlementToolDispatcher),
         Arc::new(PolicyApprovalGate::permissive()),
@@ -1623,6 +1632,249 @@ async fn task_progress_block_stays_within_cap_when_settlement_projected() {
             measured, 2,
             "the write and the verified rounds both carry a bounded TASK PROGRESS block"
         );
+    }
+    instance.shutdown().await.unwrap();
+}
+
+/// T1/R2 fixture: an engine that ignores the pack budget and, on its LAST
+/// materialization (the settled final round), returns one REQUIRED body far
+/// larger than the whole context frame budget. Earlier rounds stay clean so
+/// the task can settle; the runtime's final packing layer must then displace
+/// the body in that round, record the typed `BudgetExcluded` required miss,
+/// and revoke the settlement projection on the exact request being sent.
+/// The counts published with that round must describe the request that
+/// actually goes out, not the pre-revocation assembly.
+#[derive(Debug, Default)]
+struct OversizedRequiredBodyEngine {
+    calls: std::sync::atomic::AtomicUsize,
+    /// The 1-based materialization call that carries the oversized body.
+    oversized_on_call: usize,
+}
+
+const OVERSIZED_REQUIRED_BODY_MARKER: &str = "OVERSIZED-REQUIRED-BODY-MARKER";
+
+impl OversizedRequiredBodyEngine {
+    fn settling_final_round(oversized_on_call: usize) -> Self {
+        Self {
+            calls: std::sync::atomic::AtomicUsize::new(0),
+            oversized_on_call,
+        }
+    }
+}
+
+#[async_trait::async_trait]
+impl ContextEngine for OversizedRequiredBodyEngine {
+    async fn ingest(&self, _ingress: ContextIngress) -> AgentResult<()> {
+        Ok(())
+    }
+    async fn maintain(
+        &self,
+        _trigger: ContextMaintenanceTrigger,
+    ) -> AgentResult<ContextMaintenanceReport> {
+        Ok(ContextMaintenanceReport::default())
+    }
+    async fn materialize(&self, _query: ContextQuery) -> AgentResult<MaterializedContext> {
+        let call = self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
+        if call != self.oversized_on_call {
+            return Ok(MaterializedContext {
+                materialization_id: 0,
+                focus: None,
+                task: None,
+                items: Vec::new(),
+                external: agent_contracts::ContextMapView::default(),
+                selected: Vec::new(),
+                approx_tokens: 0,
+                foreground: Vec::new(),
+                required_item_ids: Vec::new(),
+                required_misses: Default::default(),
+                optional_misses: Default::default(),
+                diagnostics: ContextDiagnostics::default(),
+            });
+        }
+        let item_id = ContextItemId::new();
+        Ok(MaterializedContext {
+            materialization_id: 0,
+            focus: None,
+            task: None,
+            items: vec![MaterializedItem {
+                item_id,
+                kind: ContextKind::FileObservation,
+                scope: ContextScope::Task,
+                attention: AttentionState::Active,
+                semantic: SemanticState::Live,
+                retention: ContextRetention::Working,
+                content: format!("{OVERSIZED_REQUIRED_BODY_MARKER}{}", "r".repeat(120_000)),
+                source: None,
+                file_path: None,
+                file_revision: None,
+                file_start_line: None,
+                file_end_line: None,
+                partial_body: false,
+            }],
+            external: agent_contracts::ContextMapView::default(),
+            selected: Vec::new(),
+            approx_tokens: 30_000,
+            foreground: Vec::new(),
+            required_item_ids: vec![item_id],
+            required_misses: Default::default(),
+            optional_misses: Default::default(),
+            diagnostics: ContextDiagnostics::default(),
+        })
+    }
+    async fn open_scope(
+        &self,
+        _kind: agent_contracts::ScopeKind,
+        _parent: Option<agent_contracts::ScopeId>,
+    ) -> AgentResult<agent_contracts::ScopeId> {
+        Ok(agent_contracts::ScopeId::new())
+    }
+    async fn close_scope(
+        &self,
+        _scope_id: agent_contracts::ScopeId,
+    ) -> AgentResult<Vec<ContextStateTransition>> {
+        Ok(Vec::new())
+    }
+    async fn diagnostics(&self) -> AgentResult<ContextDiagnostics> {
+        Ok(ContextDiagnostics::default())
+    }
+    async fn inspect(&self, _limit: usize) -> AgentResult<Vec<ContextItemSummary>> {
+        Ok(Vec::new())
+    }
+    async fn checkpoint(&self) -> AgentResult<serde_json::Value> {
+        Ok(serde_json::Value::Null)
+    }
+    async fn restore(&self, _data: serde_json::Value) -> AgentResult<()> {
+        Ok(())
+    }
+}
+
+/// The settlement rig wired to the over-budget required body engine, with a
+/// full wire-request capture. `project_settlement` on means the settled
+/// candidate arm is the one actually sent, so the post-miss revocation
+/// changes the published request.
+#[allow(clippy::type_complexity)]
+async fn settlement_instance_with_overbudget_required_body(
+    dir: &std::path::Path,
+    script: Vec<Step>,
+    project_settlement: bool,
+) -> (
+    RuntimeInstance,
+    RuntimeEventEnvelopeCollector,
+    Arc<std::sync::Mutex<Vec<ModelRequest>>>,
+) {
+    let full_requests = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let workspace = Arc::new(agent_workspace::Workspace::open(dir).await.unwrap());
+    let services = RuntimeServices::new(
+        CoreAuthorityConfig::default(),
+        Arc::new(OversizedRequiredBodyEngine::settling_final_round(
+            script.len(),
+        )),
+        Arc::new(SettlementModel {
+            script,
+            rounds: AtomicUsize::new(0),
+            requests: Arc::new(std::sync::Mutex::new(Vec::new())),
+            full_requests: full_requests.clone(),
+        }),
+        Arc::new(SettlementToolDispatcher),
+        Arc::new(PolicyApprovalGate::permissive()),
+        None,
+    )
+    .with_artifact_workspace(workspace)
+    .with_project_task_progress(true)
+    .with_project_settlement(project_settlement);
+    let mut host = ModuleHost::new();
+    host.start().await.expect("test module host starts");
+    let instance = RuntimeInstance::spawn(host, services);
+    let collector = RuntimeEventEnvelopeCollector {
+        events: instance.handle().subscribe(),
+    };
+    (instance, collector, full_requests)
+}
+
+/// R2 counterexample: the round that packs a required-body loss revokes the
+/// settlement projection and rebuilds its request. The Ready report and the
+/// budget refusal check must then count THAT final request — the whole
+/// published triple (request, coverage, counts) comes from one assembly.
+/// Before the unified packing slice this scenario could not even publish
+/// honestly: the displaced required id stayed listed in `required_item_ids`
+/// and the round fenced in the final materialization validation.
+#[tokio::test]
+async fn settlement_projection_revocation_republishes_counts_from_the_final_request() {
+    let dir = tempfile::tempdir().unwrap();
+    let (instance, collector, requests) = settlement_instance_with_overbudget_required_body(
+        dir.path(),
+        vec![Step::Write("r2"), Step::Verify("r2"), Step::Plain("done")],
+        true,
+    )
+    .await;
+    started_task_with_patch(&instance, settled_patch()).await;
+    let events = user_turn(&instance, collector).await;
+    assert!(
+        settlement_labels(&events).contains(&SettlementLabel::SettledCandidate),
+        "the verified mutation settles the candidate before the final round"
+    );
+
+    let degraded = events
+        .iter()
+        .filter(|envelope| matches!(envelope.event, RuntimeEvent::ContextDegraded { .. }))
+        .count();
+    assert!(
+        degraded > 0,
+        "the displaced required body must degrade the frame honestly, not fence it"
+    );
+    assert!(
+        events
+            .iter()
+            .all(|envelope| !matches!(envelope.event, RuntimeEvent::TurnCommitFailed { .. })),
+        "a typed budget miss is not a preparation fault"
+    );
+
+    {
+        let sent = requests.lock().unwrap();
+        assert_eq!(sent.len(), 3, "write, verify and final rounds all send");
+        // The revocation must actually have fired on the sent arm: the final
+        // request is back to the baseline shape.
+        let final_text = sent[2]
+            .messages
+            .iter()
+            .map(|message| message.content.as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            !final_text.contains("TASK SETTLED"),
+            "the required miss revokes the settlement projection from the sent arm"
+        );
+        assert!(
+            !final_text.contains(OVERSIZED_REQUIRED_BODY_MARKER),
+            "the oversized required body is honestly absent from the sent request"
+        );
+
+        // Counts and request come from the same assembly: every Ready report
+        // prices exactly the request its round sent.
+        let ready_reports = events
+            .iter()
+            .filter_map(|envelope| match &envelope.event {
+                RuntimeEvent::ToolSurfacePlanned { report }
+                    if report.status == ToolSurfacePlanStatus::Ready =>
+                {
+                    Some(report.clone())
+                }
+                _ => None,
+            })
+            .collect::<Vec<ToolSurfacePlanReport>>();
+        assert_eq!(
+            ready_reports.len(),
+            sent.len(),
+            "one Ready report per sent request"
+        );
+        for (round, report) in ready_reports.iter().enumerate() {
+            let actual = approx_layer_tokens(&sent[round].messages)
+                + approx_layer_tokens(&sent[round].tools);
+            assert_eq!(
+                report.estimated_input_tokens, actual,
+                "round {round}: the published count must be recomputed from the final request after the projection revision"
+            );
+        }
     }
     instance.shutdown().await.unwrap();
 }

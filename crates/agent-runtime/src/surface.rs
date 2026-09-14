@@ -298,11 +298,13 @@ impl RoundSurfacePlan {
         self.task_preferred.clear();
     }
 
-    /// Final provider-window degradation: remove only a non-mandatory entry
-    /// from this local plan. Catalog lifecycle and generation are unreachable.
-    pub(crate) fn omit_largest_for_provider_budget(&mut self) -> Option<ToolSpec> {
-        let index = self
-            .specs
+    /// Index of the entry the provider-budget degradation removes:
+    /// non-mandatory, least-committed first (task-preferred tools last),
+    /// then the largest schema, name as the tie-break. One selection shared
+    /// by the omission and its peek, so the unified final-pack selector
+    /// (T1/R1) weighs exactly the candidate this plan would drop.
+    fn provider_budget_omission_index(&self) -> Option<usize> {
+        self.specs
             .iter()
             .enumerate()
             .filter(|(_, spec)| !self.mandatory.contains(&spec.name))
@@ -315,7 +317,23 @@ impl RoundSurfacePlan {
                             .then_with(|| left.name.cmp(&right.name))
                     })
             })
-            .map(|(index, _)| index)?;
+            .map(|(index, _)| index)
+    }
+
+    /// T1 (R1): the candidate [`Self::omit_largest_for_provider_budget`]
+    /// would remove, as `(tool name, approx tokens)`, WITHOUT mutating the
+    /// plan. The final packing layer weighs it against body candidates
+    /// first and only then asks the plan to perform the omission.
+    pub(crate) fn peek_provider_budget_omission_candidate(&self) -> Option<(String, usize)> {
+        let index = self.provider_budget_omission_index()?;
+        let spec = &self.specs[index];
+        Some((spec.name.clone(), approx_layer_tokens(spec)))
+    }
+
+    /// Final provider-window degradation: remove only a non-mandatory entry
+    /// from this local plan. Catalog lifecycle and generation are unreachable.
+    pub(crate) fn omit_largest_for_provider_budget(&mut self) -> Option<ToolSpec> {
+        let index = self.provider_budget_omission_index()?;
         let spec = self.specs.remove(index);
         let demand = self
             .demands
