@@ -1,35 +1,37 @@
 # 当前事实与工作范围
 
-本页是当前状态入口，不是历史流水账。执行任务及状态只维护在 [NEXT_TASKS.md](NEXT_TASKS.md)。旧报告中的“当前”只属于其固定基线。
+本页是当前状态入口。执行任务及状态只维护在 [NEXT_TASKS.md](NEXT_TASKS.md)。旧报告中的"当前"只属于其固定基线。
 
 ## 已核对基线
 
-文档主审查基线：`2b43186b005b5e86172037f98206f4417c7e2bca`；收尾新增提交核对：`278280146df5934828962253507553762693f494`（东京时间 2026-09-14 06:19:53）。采用本文前仍须核对实际分支与工作树。
+- 阶段审查基线：`4aaa8bea89336e2ec0fd21c76d04967814b24020`（2026-09-14）。该 SHA 的 CI run `34788369834` 最终 success，**第 2 次尝试**（满载抖动重跑），非首次全绿。审查报告：[下一阶段审查](reviews/2026-09-14-next-stage-review-4aaa8bea/REVIEW.md)。
+- main 之上另有并行分支在飞（如 `codex/headless-output-budget`：真实 DeepSeek 任务记录 headless 输出缺口、失败轮结算与输出预算修复）。采用任何结论前核对实际分支与 HEAD。
 
-已知 CI（2026-09-14 更新）：clippy 阻塞与一个遗留禁用的 A2 grace 重置均已修复，run `34786157399`（`4f2fb74f`）七 job 全绿；B2 完整性收口与 C 线 wire 验收随后以 `44cdd6dd` 入 main，其 CI 结果以远端 run 记录为准。
+## 当前阶段：可持续使用的后端开发流程
 
-新提交已包含 A1–A3 与 C 线 KV 接线相关改动，不再按“仅本地回执、代码尚未提交”派工。下一动作是核对新增实现/必要边界、修复当前 CI 阻塞并完成原验收，而不是重新生成 N04–N10 实现。新提交完整 diff 尚未逐行审阅，不能从提交说明推出所有行为已获独立确认。
+目标：**同一 Agent 在同一任务与工作区内，持续完成计划、检索、修改、验证、中途纠正、中断、冷恢复和交付；热资源、维护工作和供应商缓存成本有明确边界，核心规则在少数实现入口维护。**
 
-## 当前范围
+不是"继续关闭审查项"，也不是全仓重写。每推进一个主体功能，同步消除该功能涉及的重复决策、隐式约定和状态分歧（可维护性是切片验收条件）。GUI 维持必要兼容，不扩展功能。
 
-优先完成可持续执行、可纠正、可取消、可冷恢复、结果可核验的后端长流程。核心、上下文、GC、搜索、工具、最小平台与供应商 KV/Prompt Cache 同属主体。GUI 只维持必要兼容与正确性修复，不扩展产品功能。
+三线不变：**A 执行核心与工具；B Context/GC/搜索；C 平台/供应商 KV 与成本。** 引用历史问题时带报告日期与原始编号。
 
-工作线固定为：A 执行核心与工具；B 上下文/GC/搜索；C 平台/供应商缓存与成本。旧报告的 A/B/C 字母仅是历史别名，不能单凭字母推断本轮所有权。
+## 上一阶段成果（已关闭，回执可查）
 
-## 已落地主体与限制
+- 文档入口已分离职责；文档检查只验证机械结构。[应用回执](reviews/2026-09-14-docs-entry-review-2b43186b/APPLICATION_RECEIPT.md)
+- B 线恢复数据保全（N01–N03）＋ hydration 完整性传播（B2）：pending owner 保全、有界/校验卡片读取、删除许可=根完整∧元数据完整。[B 线回执](reviews/2026-09-14-backend-review-6eda2474/B_LINE_RECEIPT.md)
+- A 线 session 终态事实化/批次硬界/每会话锁、grace 退出时重置、MCP 分页发现。[A 线回执](reviews/2026-09-14-backend-review-6eda2474/A_LINE_A1_A2_A3_IMPLEMENTATION.md)
+- C 线 KV 接线与真实链路 wire 验收（本地 HTTP 捕获，非供应商校验）。[C 线回执](reviews/2026-09-14-backend-review-6eda2474/C_LINE_C1_C2_IMPLEMENTATION.md)
+- 阶段收尾旅程：各环映射到已执行的全绿回归。[旅程回执](reviews/2026-09-14-backend-review-6eda2474/STAGE_CLOSING_JOURNEY_RECEIPT.md)
 
-B1–B3（本轮 N01–N03）修复已进入 main：保护性卡片清理、pending owner 取消安全、卡片有界及哈希/结构校验。依据：[B 线回执](reviews/2026-09-14-backend-review-6eda2474/B_LINE_RECEIPT.md)。这些已修行为不原样重开。
+## 当前限制（如实）
 
-A1–A3 与 C1–C2 原回执记录的是本地实现；其相关代码现已随 `27828014` 进入 main，但本 SHA 的 CI/端到端验收未关闭。原记录：[A 线](reviews/2026-09-14-backend-review-6eda2474/A_LINE_A1_A2_A3_IMPLEMENTATION.md)、[C 线](reviews/2026-09-14-backend-review-6eda2474/C_LINE_C1_C2_IMPLEMENTATION.md)。下一动作和验收归 NEXT_TASKS。
-
-B2 的调用方残余已关闭：hydration 完整性现在传播到 GC/reconcile（pending 未读时不可逆删除延期、search 不把未读页报成完整零命中），[回执与回归](reviews/2026-09-14-backend-review-6eda2474/STAGE_CLOSING_JOURNEY_RECEIPT.md)。
-
-正式 `agent-host` 未指定策略时仍默认 Rolling；Dynamic 是可选实现。不能用 `state.json` 中旧的 dynamic 默认记录替代实际入口配置。配置依据放在 [CONFIGURATION.md](CONFIGURATION.md)，更改默认值属于单独产品决定。
-
-尚不能宣称：无限历史热内存有界、全部源码逐行审查完成、A/C 新实现已获本 SHA 的完整绿色 CI 验证、供应商 KV 已实测降低任务费用。真实模型实验按预算和凭据条件执行，不阻塞无须模型的生产接线。
+- 旅程各环由不同回归覆盖，**尚无同一 TaskId、同工作区、跨进程重启的一条连续任务轨迹**（T7 目标）。
+- 本地 HTTP 捕获只证明客户端发出了字段；端点 schema 接受、实际命中、任务净成本下降均未验证（T6/T8）。
+- 正式 `agent-host` 未指定策略时仍默认 Rolling；Dynamic 是可选实现。配置依据 [CONFIGURATION.md](CONFIGURATION.md)。
+- 尚不能宣称：无限历史热内存有界、全部源码逐行审查完成、供应商 KV 已实测降低任务费用。真实模型实验按预算和凭据条件执行，不阻塞无须模型的生产接线。
 
 ## 按需阅读
 
 架构边界：[ARCHITECTURE.md](ARCHITECTURE.md)；上下文规则：[CONTEXT_LIFECYCLE.md](CONTEXT_LIFECYCLE.md)；恢复操作：[RECOVERY_RUNBOOK.md](RECOVERY_RUNBOOK.md)。只读当前任务相关部分。
 
-历史报告及冻结证据保留原位置。旧 `state.json` 的里程碑数据不参与当前派工；迁移时应撤销其重复“当前状态”角色，并同步调整文档检查脚本。
+历史报告及冻结证据保留原位置。旧 `state.json`（v2）只作导航/来源元数据，不参与当前派工。
