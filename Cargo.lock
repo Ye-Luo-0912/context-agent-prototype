@@ -156,6 +156,7 @@ dependencies = [
  "agent-storage",
  "agent-workspace",
  "anyhow",
+ "async-trait",
  "base64",
  "context-simple",
  "libc",

@@ -35,6 +35,7 @@ windows-sys = { version = "0.59", features = [
 
 [dev-dependencies]
 base64.workspace = true
+async-trait.workspace = true
 tempfile = "3"
 
 [target.'cfg(windows)'.dev-dependencies]
