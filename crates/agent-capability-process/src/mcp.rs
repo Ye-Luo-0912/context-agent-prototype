@@ -18,7 +18,10 @@ use agent_contracts::{
     validate_capability_id,
 };
 use agent_platform_protocol::{JsonDecodeBudget, decode_value};
-use agent_process::{DEFAULT_CANCEL_ACK_TIMEOUT, HostLifecycle, ProcessSupervisor, RestartCircuit};
+use agent_process::{
+    DEFAULT_CANCEL_ACK_TIMEOUT, HostLifecycle, ProcessCleanupOutcome, ProcessSupervisor,
+    RestartCircuit,
+};
 use async_trait::async_trait;
 use serde_json::{Value, json};
 use tokio::io::{AsyncWrite, AsyncWriteExt, BufReader, BufWriter};
@@ -45,6 +48,23 @@ pub const DEFAULT_MAX_SKIPPED_BYTES_PER_REQUEST: u64 = 1024 * 1024;
 pub const CANCEL_NOTIFY_SEND_TIMEOUT: Duration = Duration::from_secs(2);
 /// MCP peer cancel notification. Not Core `OperationCancelAck`.
 pub const MCP_CANCEL_NOTIFICATION: &str = "notifications/cancelled";
+
+/// Discovery bounds for the paginated `tools/list` walk: page cap, total
+/// tool cap, cumulative accepted payload, and the overall deadline. Scope
+/// note (R4): these bound the DISCOVERY PHASE ONLY — Core admission
+/// independently caps what a capability may install
+/// (`MAX_TOOLS_PER_CAPABILITY` = 32). An over-large manifest fails
+/// discovery closed (typed refusal, install refused) instead of being
+/// silently truncated or silently installed; a user-facing filtering
+/// surface is a separate product decision.
+const MAX_DISCOVERY_PAGES: usize = 16;
+const MAX_DISCOVERY_TOOLS: usize = 512;
+/// Cumulative accepted tool payload (name + description + schema bytes)
+/// across all pages of one discovery walk. Per-page frames and per-request
+/// exchanges are already bounded; this caps their sum.
+const MAX_DISCOVERY_TOTAL_BYTES: u64 = 16 * 1024 * 1024;
+/// Overall deadline for one complete `tools/list` walk.
+const DISCOVERY_DEADLINE: Duration = Duration::from_secs(30);
 
 /// A declared MCP server: identity plus how to spawn it. The id follows the
 /// capability id grammar (it is embedded in catalog routes).
@@ -116,6 +136,10 @@ pub struct McpClient<R, W> {
     /// Owned by the client so the child's private cwd outlives the spawn
     /// call (dropped when the connection is torn down).
     _private_cwd: Option<tempfile::TempDir>,
+    /// Test-only fault injection (R5): forces the next reap's outcome so
+    /// the unconfirmed path is testable without an unkillable process.
+    #[cfg(test)]
+    forced_reap_outcome: Option<ProcessCleanupOutcome>,
 }
 
 /// The concrete stdio client type produced by [`McpClient::connect_stdio`].
@@ -144,6 +168,8 @@ where
             supervisor: None,
             poisoned: None,
             _private_cwd: None,
+            #[cfg(test)]
+            forced_reap_outcome: None,
         }
     }
 
@@ -169,14 +195,44 @@ where
     }
 
     /// Reap the owned child after a kill (avoids a zombie on Unix). Safe to
-    /// call on a stream variant (no child): a no-op. Dropping the supervisor
-    /// after reap cannot kill a reused pid: [`ProcessSupervisor::reap`]
-    /// clears it first.
-    async fn reap(&mut self) {
-        if let Some(supervisor) = &self.supervisor {
-            supervisor.reap().await;
+    /// call on a stream variant (no child): a no-op reported as
+    /// [`ProcessCleanupOutcome::ExitConfirmed`].
+    ///
+    /// R5: the settlement fact is NOT dropped. The outcome is returned so
+    /// exchange callers can surface it in their typed error; teardown-only
+    /// paths acknowledge it with an explicit `let _ =` because they have no
+    /// error channel left — the uncertainty is recorded HERE, on stderr,
+    /// the same diagnostic channel the spawn path already uses for degraded
+    /// sandboxing. Rationale: every exchange already returns an error, so
+    /// propagation is free there; the teardown paths are discarding the
+    /// client either way, and recording beats pretending the tree's death
+    /// was observed. The helper keeps the domain outcome instead of
+    /// collapsing to a `Result<()>` that callers would `.ok()` away.
+    /// Dropping the supervisor afterwards stays safe even when unconfirmed:
+    /// [`ProcessSupervisor::reap`] leaves the pid armed exactly so the
+    /// supervisor's Drop keeps the kill responsibility.
+    #[must_use = "an unconfirmed cleanup must surface in the caller's error or be recorded — never dropped silently"]
+    async fn reap(&mut self) -> ProcessCleanupOutcome {
+        #[cfg(test)]
+        {
+            // Test-only fault injection: forces the next reap's outcome so
+            // the unconfirmed path is testable without an unkillable
+            // process (the production path computes the fact from observed
+            // waits only).
+            if let Some(forced) = self.forced_reap_outcome.clone() {
+                self.supervisor = None;
+                return forced;
+            }
+        }
+        let outcome = match &self.supervisor {
+            Some(supervisor) => supervisor.reap_outcome().await,
+            None => ProcessCleanupOutcome::ExitConfirmed,
+        };
+        if let ProcessCleanupOutcome::Unconfirmed { reason } = &outcome {
+            eprintln!("mcp: {reason}");
         }
         self.supervisor = None;
+        outcome
     }
 
     /// The MCP `initialize` handshake: send the initialize request, check
@@ -227,18 +283,46 @@ where
     /// refused install), never a silently-complete first page. Duplicate
     /// cursors and duplicate tool names are protocol faults, not skippable
     /// rows.
+    ///
+    /// R4 scope note: the discovery bounds are the discovery phase's
+    /// resource limits, not the install surface — Core admission
+    /// independently caps a capability at `MAX_TOOLS_PER_CAPABILITY` (32).
+    /// The bounds fail closed so an over-large manifest is reported, never
+    /// silently truncated.
     pub async fn list_tools_with_cancel(
         &mut self,
         cancel: &CancellationToken,
     ) -> AgentResult<Vec<McpTool>> {
-        const MAX_DISCOVERY_PAGES: usize = 16;
-        const MAX_DISCOVERY_TOOLS: usize = 512;
-        const DISCOVERY_DEADLINE: Duration = Duration::from_secs(30);
-        let deadline = tokio::time::Instant::now() + DISCOVERY_DEADLINE;
+        self.list_tools_with_budget(cancel, DISCOVERY_DEADLINE)
+            .await
+    }
+
+    /// The bounded discovery loop with an injectable total budget: the
+    /// production entry pins [`DISCOVERY_DEADLINE`]; tests shrink the
+    /// budget so the last-page-crossing case needs no 30 s wait.
+    ///
+    /// R4: the caps are enforced where they bind — per accepted tool (the
+    /// old code checked only at the next loop entry, so a final page
+    /// pushing past the tool cap returned `Ok`), on the cumulative
+    /// accepted payload, and by clamping every page exchange to the
+    /// remaining budget (the old code gave each request the full
+    /// per-request timeout, so a late final page returned after the
+    /// overall deadline had passed). Cursor repetition is checked against
+    /// the full seen set — bounded by construction: at most one cursor
+    /// enters per iteration and the page cap bounds the iterations — so a
+    /// cycling server fails fast as a typed fault instead of spinning to
+    /// the page cap.
+    async fn list_tools_with_budget(
+        &mut self,
+        cancel: &CancellationToken,
+        total_budget: Duration,
+    ) -> AgentResult<Vec<McpTool>> {
+        let deadline = tokio::time::Instant::now() + total_budget;
         let mut tools: Vec<McpTool> = Vec::new();
+        let mut accepted_bytes = 0u64;
         let mut seen_names: std::collections::HashSet<String> = std::collections::HashSet::new();
+        let mut seen_cursors: std::collections::HashSet<String> = std::collections::HashSet::new();
         let mut cursor: Option<String> = None;
-        let mut previous_cursor: Option<String> = None;
         let mut pages = 0usize;
         loop {
             if pages >= MAX_DISCOVERY_PAGES {
@@ -252,6 +336,9 @@ where
                         .into(),
                 ));
             }
+            // Defense in depth: the per-item checks below make this
+            // unreachable, but the entry state is re-asserted so the loop
+            // invariant does not depend on the page handler.
             if tools.len() > MAX_DISCOVERY_TOOLS {
                 return Err(AgentError::Tool(format!(
                     "MCP tool discovery incomplete: more than {MAX_DISCOVERY_TOOLS} tools;                      install refused"
@@ -262,14 +349,26 @@ where
             if let Some(cursor) = &cursor {
                 params["cursor"] = json!(cursor);
             }
+            // The remaining overall budget bounds THIS exchange: a page
+            // request cannot outlive the discovery deadline. Timeout and
+            // cancel keep their poison + kill-then-reap settlement from the
+            // request path.
             let result = self
-                .request_with_cancel("tools/list", params, cancel)
+                .request_with_cancel_before("tools/list", params, cancel, Some(deadline))
                 .await?;
             let page = result
                 .get("tools")
                 .and_then(Value::as_array)
                 .ok_or_else(|| AgentError::Tool("MCP tools/list returned no tools array".into()))?;
             for tool in page {
+                // R4: checked BEFORE accepting the item, so the refusal
+                // fires on the page that crosses the cap instead of one
+                // loop too late.
+                if tools.len() >= MAX_DISCOVERY_TOOLS {
+                    return Err(AgentError::Tool(format!(
+                        "MCP tool discovery incomplete: more than {MAX_DISCOVERY_TOOLS} tools;                      install refused"
+                    )));
+                }
                 let name = tool
                     .get("name")
                     .and_then(Value::as_str)
@@ -288,6 +387,18 @@ where
                     .get("inputSchema")
                     .cloned()
                     .unwrap_or_else(|| json!({"type": "object"}));
+                let schema_bytes = serde_json::to_vec(&input_schema)
+                    .map(|bytes| bytes.len() as u64)
+                    .unwrap_or(u64::MAX);
+                accepted_bytes = accepted_bytes
+                    .saturating_add(name.len() as u64)
+                    .saturating_add(description.len() as u64)
+                    .saturating_add(schema_bytes);
+                if accepted_bytes > MAX_DISCOVERY_TOTAL_BYTES {
+                    return Err(AgentError::Tool(format!(
+                        "MCP tool discovery incomplete: accepted tool payloads exceeded {MAX_DISCOVERY_TOTAL_BYTES} bytes;                      install refused"
+                    )));
+                }
                 tools.push(McpTool {
                     name: name.to_string(),
                     description,
@@ -301,16 +412,32 @@ where
             match next {
                 Some(next) => {
                     let next = next.to_string();
-                    if previous_cursor.as_deref() == Some(next.as_str()) {
+                    // The full seen set, not just the previous cursor: a
+                    // server cycling cursors must fail here (bounded — at
+                    // most one insert per iteration, and the page cap
+                    // bounds the iterations) instead of spinning to the
+                    // page cap.
+                    if !seen_cursors.insert(next.clone()) {
                         return Err(AgentError::Tool(
-                            "MCP tool discovery fault: the server repeated the same nextCursor"
+                            "MCP tool discovery fault: the server repeated a previously seen nextCursor"
                                 .into(),
                         ));
                     }
-                    previous_cursor = cursor.take();
                     cursor = Some(next);
                 }
-                None => return Ok(tools),
+                None => {
+                    // R4: re-checked at the actual return — the loop-entry
+                    // checks only saw the state before the final page.
+                    if tools.len() > MAX_DISCOVERY_TOOLS
+                        || accepted_bytes > MAX_DISCOVERY_TOTAL_BYTES
+                    {
+                        return Err(AgentError::Tool(
+                            "MCP tool discovery incomplete: the enumerated manifest exceeds discovery bounds;                      install refused"
+                                .into(),
+                        ));
+                    }
+                    return Ok(tools);
+                }
             }
         }
     }
@@ -358,6 +485,23 @@ where
         params: Value,
         cancel: &CancellationToken,
     ) -> AgentResult<Value> {
+        self.request_with_cancel_before(method, params, cancel, None)
+            .await
+    }
+
+    /// [`Self::request_with_cancel`] with an optional outer budget: when
+    /// `overall` is set, the exchange deadline is clamped to the remaining
+    /// overall budget, so a request cannot outlive the caller's phase
+    /// deadline (R4 discovery). Cancel/timeout settlement (poison +
+    /// kill-then-reap) is unchanged; a clamped timeout surfaces as the same
+    /// typed timeout error, with the actually-applied bound in the message.
+    async fn request_with_cancel_before(
+        &mut self,
+        method: &str,
+        params: Value,
+        cancel: &CancellationToken,
+        overall: Option<tokio::time::Instant>,
+    ) -> AgentResult<Value> {
         if self.is_poisoned() {
             return Err(AgentError::Tool(format!(
                 "MCP connection poisoned: {}",
@@ -382,23 +526,33 @@ where
         // here immediately instead of only after the deadline, and because
         // a cancelled write may have flushed a partial frame, the same
         // settlement as a read-phase cancel applies (poison + kill-then-reap).
-        let deadline = std::time::Instant::now() + self.request_timeout;
-        let write = tokio::time::timeout_at(deadline.into(), self.send_frame(&request));
+        // R4: when an outer budget is set, the exchange is clamped to the
+        // remaining overall time, so a request can never outlive the
+        // caller's phase deadline.
+        let effective_timeout = match overall {
+            Some(overall) => overall
+                .saturating_duration_since(tokio::time::Instant::now())
+                .min(self.request_timeout),
+            None => self.request_timeout,
+        };
+        let deadline = tokio::time::Instant::now() + effective_timeout;
+        let write = tokio::time::timeout_at(deadline, self.send_frame(&request));
         tokio::select! {
             biased;
             _ = cancel.cancelled() => {
                 self.poison(format!("request '{method}' cancelled during write"));
-                self.reap().await;
+                // A cancel keeps the `Cancelled` variant; the reap records
+                // an unconfirmed cleanup itself (R5).
+                let _ = self.reap().await;
                 return Err(AgentError::Cancelled);
             }
             write_result = write => match write_result {
                 Err(_) => {
                     let error = self.poison(format!(
-                        "request '{method}' write timed out after {:?}",
-                        self.request_timeout
+                        "request '{method}' write timed out after {effective_timeout:?}"
                     ));
-                    self.reap().await;
-                    return Err(error);
+                    let settlement = self.reap().await;
+                    return Err(with_settlement_fact(error, &settlement));
                 }
                 // A write error (`Ok(Err(_))`) already poisons the connection
                 // when bytes may have been written; the outbound over-cap
@@ -431,21 +585,24 @@ where
                 )
                 .await;
                 self.poison(format!("request '{method}' cancelled by the runtime"));
-                self.reap().await;
+                let _ = self.reap().await;
                 Err(AgentError::Cancelled)
             }
-            result = tokio::time::timeout_at(deadline.into(), self.read_matching(&id)) => {
+            result = tokio::time::timeout_at(deadline, self.read_matching(&id)) => {
                 match result {
-                    Ok(inner) => {
-                        if inner.is_err() && self.is_poisoned() {
-                            self.reap().await;
+                    Ok(inner) => match inner {
+                        // R5: a poisoned read's error carries the settlement
+                        // fact when the kill could not be confirmed.
+                        Err(error) if self.is_poisoned() => {
+                            let settlement = self.reap().await;
+                            Err(with_settlement_fact(error, &settlement))
                         }
-                        inner
-                    }
+                        other => other,
+                    },
                     Err(_) => {
                         let error = self.poison(format!("request '{method}' timed out"));
-                        self.reap().await;
-                        Err(error)
+                        let settlement = self.reap().await;
+                        Err(with_settlement_fact(error, &settlement))
                     }
                 }
             }
@@ -737,15 +894,25 @@ impl McpClient<tokio::process::ChildStdout, tokio::process::ChildStdin> {
         let stdin = match child.stdin.take() {
             Some(stdin) => stdin,
             None => {
-                ProcessSupervisor::from_child(child, pid).terminate().await;
-                return Err(AgentError::Tool("MCP server stdin not available".into()));
+                let settlement = ProcessSupervisor::from_child(child, pid)
+                    .terminate_outcome()
+                    .await;
+                return Err(with_settlement_fact(
+                    AgentError::Tool("MCP server stdin not available".into()),
+                    &settlement,
+                ));
             }
         };
         let stdout = match child.stdout.take() {
             Some(stdout) => stdout,
             None => {
-                ProcessSupervisor::from_child(child, pid).terminate().await;
-                return Err(AgentError::Tool("MCP server stdout not available".into()));
+                let settlement = ProcessSupervisor::from_child(child, pid)
+                    .terminate_outcome()
+                    .await;
+                return Err(with_settlement_fact(
+                    AgentError::Tool("MCP server stdout not available".into()),
+                    &settlement,
+                ));
             }
         };
         let mut client = Self::new(stdout, stdin, request_timeout, max_frame_bytes);
@@ -767,20 +934,36 @@ impl McpClient<tokio::process::ChildStdout, tokio::process::ChildStdin> {
                 None => false,
             };
             client.poison("initialize handshake failed".into());
-            client.reap().await;
+            let settlement = client.reap().await;
             if server_exited {
                 return Err(AgentError::Tool(format!(
                     "spawn MCP server '{}' exited before the handshake completed",
                     decl.program
                 )));
             }
-            return Err(error);
+            return Err(with_settlement_fact(error, &settlement));
         }
         // The private cwd is owned by the client: it lives for the child's
         // lifetime and is removed when the connection is torn down.
         client._private_cwd = Some(private);
         Ok(client)
     }
+}
+
+/// R5: attach an unconfirmed-settlement fact to a surfaced error. Only
+/// `Tool` errors carry the appended fact: `Cancelled` must keep its variant
+/// (callers match on it to distinguish runtime cancels from server faults),
+/// and the uncertainty was already recorded on stderr inside the reap
+/// helper for every path that discards the outcome.
+fn with_settlement_fact(error: AgentError, settlement: &ProcessCleanupOutcome) -> AgentError {
+    if let (AgentError::Tool(message), ProcessCleanupOutcome::Unconfirmed { .. }) =
+        (&error, settlement)
+    {
+        return AgentError::Tool(format!(
+            "{message}; MCP server cleanup was not confirmed (the kill could not be observed)"
+        ));
+    }
+    error
 }
 
 fn bounded_tool_text(content: Option<&Vec<Value>>) -> String {
@@ -852,14 +1035,14 @@ impl McpCapabilityAdapter {
             Ok(tools) => tools,
             Err(error) => {
                 client.poison("tool discovery failed".into());
-                client.reap().await;
-                return Err(error);
+                let settlement = client.reap().await;
+                return Err(with_settlement_fact(error, &settlement));
             }
         };
         // Discovery establishes the static manifest only. The declared
         // lifecycle is Lazy, so no server stays resident until first invoke.
         client.poison("tool discovery completed".into());
-        client.reap().await;
+        let _ = client.reap().await;
         let tool_specs: Vec<ToolSpec> = tools
             .into_iter()
             .map(|tool| ToolSpec {
@@ -946,7 +1129,10 @@ impl Capability for McpCapabilityAdapter {
                         reason: "restarting".into(),
                     },
                 ) {
-                    stale.reap().await;
+                    // Teardown of a stale client mid-restart has no error
+                    // channel; reap records an unconfirmed cleanup itself
+                    // (R5).
+                    let _ = stale.reap().await;
                 }
             }
             match McpClient::connect_stdio_with_cancel(
@@ -995,7 +1181,11 @@ impl Capability for McpCapabilityAdapter {
             std::mem::replace(&mut *guard, HostLifecycle::Stopped)
         {
             client.poison("capability stopped by the runtime".into());
-            client.reap().await;
+            // Teardown-only path: stop reports the capability stopped either
+            // way and has no error channel left; an unconfirmed cleanup is
+            // recorded by reap (R5), and the armed supervisor drop keeps the
+            // kill responsibility.
+            let _ = client.reap().await;
         }
         Ok(())
     }
@@ -1219,7 +1409,10 @@ mod tests {
             .await
             .expect("echo works");
         client.poison("probe done".into());
-        client.reap().await;
+        // The settlement is consumed and checked: a healthy kill of a live
+        // server must confirm the exit (R5 — the outcome is never dropped).
+        let settlement = client.reap().await;
+        assert_eq!(settlement, ProcessCleanupOutcome::ExitConfirmed);
         let read = || -> Option<u64> {
             std::fs::read_to_string(&heartbeat)
                 .ok()?
@@ -2131,6 +2324,290 @@ mod tests {
         assert!(
             error.to_string().contains("second page exploded"),
             "the page failure must surface: {error}"
+        );
+    }
+
+    /// R4: a single page carrying more than the tool cap must be refused —
+    /// the old code checked the cap only at the NEXT loop entry, so a final
+    /// page without a nextCursor returned `Ok` past the cap.
+    async fn oversized_page_server(
+        mut read: impl AsyncRead + Unpin + Send,
+        mut write: impl AsyncWrite + Unpin + Send,
+    ) {
+        let tools: Vec<Value> = (0..513usize)
+            .map(|index| {
+                json!({
+                    "name": format!("wide.tool.{index}"),
+                    "description": "wide",
+                    "inputSchema": {"type": "object"}
+                })
+            })
+            .collect();
+        let mut line = Vec::new();
+        loop {
+            line.clear();
+            let Ok(count) = read_line(&mut read, &mut line).await else {
+                return;
+            };
+            if count == 0 {
+                return;
+            }
+            let Ok(request) = serde_json::from_slice::<Value>(&line) else {
+                return;
+            };
+            let method = request.get("method").and_then(Value::as_str).unwrap_or("");
+            let Some(id) = request.get("id") else {
+                continue;
+            };
+            let response = match method {
+                "initialize" => json!({
+                    "jsonrpc": "2.0", "id": id,
+                    "result": {"protocolVersion": MCP_PROTOCOL_VERSION, "capabilities": {}, "serverInfo": {"name": "wide", "version": "0.1.0"}}
+                }),
+                "tools/list" => json!({
+                    "jsonrpc": "2.0", "id": id,
+                    "result": {"tools": tools}
+                }),
+                _ => json!({
+                    "jsonrpc": "2.0", "id": id,
+                    "error": {"code": -32601, "message": "method not found"}
+                }),
+            };
+            let mut frame = serde_json::to_string(&response).unwrap();
+            frame.push('\n');
+            if write.write_all(frame.as_bytes()).await.is_err() {
+                return;
+            }
+            let _ = write.flush().await;
+        }
+    }
+
+    #[tokio::test]
+    async fn a_single_page_above_the_tool_cap_is_refused_not_returned() {
+        let (client_read, server_write) = duplex(1024 * 1024);
+        let (server_read, client_write) = duplex(1024 * 1024);
+        tokio::spawn(async move {
+            oversized_page_server(server_read, server_write).await;
+        });
+        let mut client = McpClient::new(
+            client_read,
+            client_write,
+            Duration::from_secs(5),
+            1024 * 1024,
+        );
+        client.initialize().await.expect("handshake succeeds");
+        let error = client
+            .list_tools()
+            .await
+            .expect_err("a page past the tool cap must be refused, not returned");
+        assert!(
+            error.to_string().contains("more than 512 tools"),
+            "the refusal must name the tool cap: {error}"
+        );
+    }
+
+    /// R4: the final page request must be bounded by the REMAINING overall
+    /// discovery budget, not the per-request timeout — a server that serves
+    /// the last page after the deadline must be rejected, not returned as a
+    /// complete manifest.
+    async fn late_final_page_server(
+        mut read: impl AsyncRead + Unpin + Send,
+        mut write: impl AsyncWrite + Unpin + Send,
+    ) {
+        let mut line = Vec::new();
+        loop {
+            line.clear();
+            let Ok(count) = read_line(&mut read, &mut line).await else {
+                return;
+            };
+            if count == 0 {
+                return;
+            }
+            let Ok(request) = serde_json::from_slice::<Value>(&line) else {
+                return;
+            };
+            let method = request.get("method").and_then(Value::as_str).unwrap_or("");
+            let Some(id) = request.get("id") else {
+                continue;
+            };
+            let response = match method {
+                "initialize" => json!({
+                    "jsonrpc": "2.0", "id": id,
+                    "result": {"protocolVersion": MCP_PROTOCOL_VERSION, "capabilities": {}, "serverInfo": {"name": "late", "version": "0.1.0"}}
+                }),
+                "tools/list" => {
+                    let cursor = request["params"]["cursor"].as_str().unwrap_or("");
+                    if cursor == "late-2" {
+                        // The final page arrives long after the discovery
+                        // budget the test will pass in.
+                        tokio::time::sleep(Duration::from_millis(500)).await;
+                        json!({
+                            "jsonrpc": "2.0", "id": id,
+                            "result": {"tools": [
+                                {"name": "late.final", "description": "late", "inputSchema": {"type": "object"}}
+                            ]}
+                        })
+                    } else {
+                        json!({
+                            "jsonrpc": "2.0", "id": id,
+                            "result": {"tools": [
+                                {"name": "late.first", "description": "first", "inputSchema": {"type": "object"}}
+                            ], "nextCursor": "late-2"}
+                        })
+                    }
+                }
+                _ => json!({
+                    "jsonrpc": "2.0", "id": id,
+                    "error": {"code": -32601, "message": "method not found"}
+                }),
+            };
+            let mut frame = serde_json::to_string(&response).unwrap();
+            frame.push('\n');
+            if write.write_all(frame.as_bytes()).await.is_err() {
+                return;
+            }
+            let _ = write.flush().await;
+        }
+    }
+
+    #[tokio::test]
+    async fn a_final_page_crossing_the_discovery_deadline_is_rejected() {
+        let (client_read, server_write) = duplex(64 * 1024);
+        let (server_read, client_write) = duplex(64 * 1024);
+        tokio::spawn(async move {
+            late_final_page_server(server_read, server_write).await;
+        });
+        let mut client = McpClient::new(
+            client_read,
+            client_write,
+            Duration::from_secs(5),
+            1024 * 1024,
+        );
+        client.initialize().await.expect("handshake succeeds");
+        let error = client
+            .list_tools_with_budget(&CancellationToken::new(), Duration::from_millis(250))
+            .await
+            .expect_err("a final page served after the budget must be rejected");
+        let message = error.to_string();
+        assert!(
+            message.contains("timed out"),
+            "the late final page must hit the clamped exchange deadline: {message}"
+        );
+        assert!(
+            client.is_poisoned(),
+            "crossing the deadline must settle (poison + kill-then-reap) the connection"
+        );
+    }
+
+    /// R4: a server cycling its cursor while offering a FRESH tool name
+    /// every time — the duplicate-name fault must not pre-empt the cursor
+    /// fault, and the loop must die on the repeated cursor instead of
+    /// spinning to the page cap. (The old code remembered only the previous
+    /// cursor, so a 3-cycle slipped through it.)
+    async fn cursor_cycle_server(
+        mut read: impl AsyncRead + Unpin + Send,
+        mut write: impl AsyncWrite + Unpin + Send,
+    ) {
+        let mut requests = 0usize;
+        let mut line = Vec::new();
+        loop {
+            line.clear();
+            let Ok(count) = read_line(&mut read, &mut line).await else {
+                return;
+            };
+            if count == 0 {
+                return;
+            }
+            let Ok(request) = serde_json::from_slice::<Value>(&line) else {
+                return;
+            };
+            let method = request.get("method").and_then(Value::as_str).unwrap_or("");
+            let Some(id) = request.get("id") else {
+                continue;
+            };
+            let response = match method {
+                "initialize" => json!({
+                    "jsonrpc": "2.0", "id": id,
+                    "result": {"protocolVersion": MCP_PROTOCOL_VERSION, "capabilities": {}, "serverInfo": {"name": "cycle", "version": "0.1.0"}}
+                }),
+                "tools/list" => {
+                    requests += 1;
+                    let next_cursor = ["c-1", "c-2", "c-3"][requests % 3];
+                    json!({
+                        "jsonrpc": "2.0", "id": id,
+                        "result": {"tools": [
+                            {"name": format!("cycle.tool.{requests}"), "description": "cycle", "inputSchema": {"type": "object"}}
+                        ], "nextCursor": next_cursor}
+                    })
+                }
+                _ => json!({
+                    "jsonrpc": "2.0", "id": id,
+                    "error": {"code": -32601, "message": "method not found"}
+                }),
+            };
+            let mut frame = serde_json::to_string(&response).unwrap();
+            frame.push('\n');
+            if write.write_all(frame.as_bytes()).await.is_err() {
+                return;
+            }
+            let _ = write.flush().await;
+        }
+    }
+
+    #[tokio::test]
+    async fn a_cursor_cycle_with_fresh_names_is_a_cursor_fault() {
+        let (client_read, server_write) = duplex(64 * 1024);
+        let (server_read, client_write) = duplex(64 * 1024);
+        tokio::spawn(async move {
+            cursor_cycle_server(server_read, server_write).await;
+        });
+        let mut client = McpClient::new(
+            client_read,
+            client_write,
+            Duration::from_secs(5),
+            1024 * 1024,
+        );
+        client.initialize().await.expect("handshake succeeds");
+        let error = client
+            .list_tools()
+            .await
+            .expect_err("a cycling cursor must fail discovery");
+        let message = error.to_string();
+        assert!(
+            message.contains("repeated a previously seen nextCursor"),
+            "the cursor cycle must fail as a typed cursor fault, not spin to the page cap: {message}"
+        );
+    }
+
+    /// R5: an unconfirmed cleanup must not be dropped silently. The seam
+    /// forces the reap outcome (no unkillable process needed); a request
+    /// that times out poisons and reaps, and the surfaced error must carry
+    /// the settlement fact.
+    #[tokio::test]
+    async fn an_unconfirmed_cleanup_is_surfaced_in_the_typed_error() {
+        let (client_read, _server_write) = duplex(64 * 1024);
+        let (_server_read, client_write) = duplex(64 * 1024);
+        let mut client = McpClient::new(
+            client_read,
+            client_write,
+            Duration::from_millis(200),
+            1024 * 1024,
+        );
+        client.forced_reap_outcome = Some(ProcessCleanupOutcome::Unconfirmed {
+            reason: "injected for the regression".into(),
+        });
+        let error = client
+            .call_tool("mock.echo", json!({}))
+            .await
+            .expect_err("a silent peer must time out");
+        let message = error.to_string();
+        assert!(
+            message.contains("cleanup was not confirmed"),
+            "the unconfirmed settlement must surface in the typed error, got: {message}"
+        );
+        assert!(
+            client.is_poisoned(),
+            "the timed-out exchange must still poison the connection"
         );
     }
 }

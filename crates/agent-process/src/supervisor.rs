@@ -14,6 +14,7 @@ use tokio::process::Child;
 use tokio::sync::Mutex;
 
 use crate::host::kill_process_tree;
+use crate::lifecycle::ProcessCleanupOutcome;
 
 #[cfg(windows)]
 use crate::host::JobObject;
@@ -27,6 +28,15 @@ const REAP_GRACE: std::time::Duration = std::time::Duration::from_secs(5);
 /// Whether a reap observed the child's exit. `Unconfirmed` means every
 /// wait failed or timed out even after a tree kill: the pid stays armed so
 /// Drop keeps trying, and the caller must not treat the cleanup as done.
+///
+/// R5 note: this type deliberately carries no `#[must_use]` yet — three
+/// `ProcessHost` sites (`host.rs`) still discard `reap()`'s outcome, and
+/// flagging the type today would surface as warnings in a file this slice
+/// does not own. The must_use contract is enforced on the settlement
+/// interfaces whose callers already acknowledge the outcome
+/// ([`ProcessSupervisor::terminate`], [`ProcessSupervisor::reap_outcome`],
+/// [`ProcessSupervisor::terminate_outcome`]); putting it on this type (or
+/// on `reap`) is a one-line follow-up once the host sites consume theirs.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ProcessReapOutcome {
     Confirmed,
@@ -131,17 +141,19 @@ impl ProcessSupervisor {
     /// confirm dead (PROCESS-02). The confirmation is returned so callers
     /// can surface an unconfirmed cleanup instead of assuming success.
     pub async fn reap(&self) -> ProcessReapOutcome {
+        self.reap_with_grace(REAP_GRACE).await
+    }
+
+    /// The reap core with the wait bound injected. Test seam only (no
+    /// production caller — production always waits out [`REAP_GRACE`]): the
+    /// `Unconfirmed` branch needs a kill that cannot be observed, which a
+    /// real spawn cannot provide portably.
+    async fn reap_with_grace(&self, grace: std::time::Duration) -> ProcessReapOutcome {
         let mut child = self.child.lock().await;
-        let mut confirmed = matches!(
-            tokio::time::timeout(REAP_GRACE, child.wait()).await,
-            Ok(Ok(_))
-        );
+        let mut confirmed = matches!(tokio::time::timeout(grace, child.wait()).await, Ok(Ok(_)));
         if !confirmed {
             self.kill_tree();
-            confirmed = matches!(
-                tokio::time::timeout(REAP_GRACE, child.wait()).await,
-                Ok(Ok(_))
-            );
+            confirmed = matches!(tokio::time::timeout(grace, child.wait()).await, Ok(Ok(_)));
         }
         if confirmed {
             // Drop must never `kill_process_tree` a numeric pid the OS has
@@ -165,9 +177,37 @@ impl ProcessSupervisor {
 
     /// Kill the tree then await reap. Error/cancel/timeout paths use this
     /// before returning.
+    #[must_use = "an unconfirmed cleanup must be surfaced or recorded — never dropped silently"]
     pub async fn terminate(&self) -> ProcessReapOutcome {
         self.kill_tree();
         self.reap().await
+    }
+
+    /// [`Self::reap`] as the crate-exported [`ProcessCleanupOutcome`], for
+    /// adapters outside this crate that cannot name the crate-private
+    /// [`ProcessReapOutcome`]. R5: the settlement fact must stay consumable
+    /// as a typed value, so the boundary maps it instead of flattening to
+    /// bool or dropping it.
+    #[must_use = "an unconfirmed cleanup must be surfaced or recorded — never dropped silently"]
+    pub async fn reap_outcome(&self) -> ProcessCleanupOutcome {
+        match self.reap().await {
+            ProcessReapOutcome::Confirmed => ProcessCleanupOutcome::ExitConfirmed,
+            ProcessReapOutcome::Unconfirmed => ProcessCleanupOutcome::Unconfirmed {
+                reason: "the child's exit was not observed even after a tree kill".into(),
+            },
+        }
+    }
+
+    /// [`Self::terminate`] in the [`ProcessCleanupOutcome`] shape (see
+    /// [`Self::reap_outcome`]).
+    #[must_use = "an unconfirmed cleanup must be surfaced or recorded — never dropped silently"]
+    pub async fn terminate_outcome(&self) -> ProcessCleanupOutcome {
+        match self.terminate().await {
+            ProcessReapOutcome::Confirmed => ProcessCleanupOutcome::ExitConfirmed,
+            ProcessReapOutcome::Unconfirmed => ProcessCleanupOutcome::Unconfirmed {
+                reason: "the child's exit was not observed even after a tree kill".into(),
+            },
+        }
     }
 
     pub async fn stderr_tail(&self) -> String {
@@ -220,7 +260,10 @@ mod tests {
         let child = sleeper().spawn().unwrap();
         let pid = child.id().unwrap_or(0);
         let supervisor = ProcessSupervisor::from_child(child, pid);
-        supervisor.terminate().await;
+        // The settlement is consumed and checked (R5): a killable child
+        // must confirm, not merely "probably died".
+        let outcome = supervisor.terminate().await;
+        assert_eq!(outcome, ProcessReapOutcome::Confirmed);
         tokio::time::sleep(Duration::from_millis(200)).await;
         assert_eq!(
             supervisor.pid(),
@@ -276,6 +319,39 @@ mod tests {
         assert!(
             !crate::lifecycle::process_is_running(pid),
             "dropping the supervisor must kill the child, not orphan it"
+        );
+    }
+
+    /// R5 seam proof: `Unconfirmed` is a reachable outcome without an
+    /// unkillable process. A supervisor armed with pid 0 cannot kill
+    /// (`kill_process_tree` and the unix group-kill both no-op on 0), so
+    /// both bounded waits time out while the real child (kept alive by
+    /// `kill_on_drop`) is still running. The injected grace keeps the test
+    /// fast; production always waits out `REAP_GRACE`.
+    #[tokio::test]
+    async fn an_unobservable_kill_reports_unconfirmed() {
+        let child = sleeper().spawn().unwrap();
+        let real_pid = child.id().unwrap_or(0);
+        assert_ne!(real_pid, 0, "sleeper must report a pid");
+        // The armed pid is 0: kill_tree is a documented no-op for it.
+        let supervisor = ProcessSupervisor::from_child(child, 0);
+        let outcome = supervisor.reap_with_grace(Duration::from_millis(100)).await;
+        assert_eq!(
+            outcome,
+            ProcessReapOutcome::Unconfirmed,
+            "a kill whose exit was never observed must report Unconfirmed"
+        );
+        assert!(
+            crate::lifecycle::process_is_running(real_pid),
+            "the unconfirmed report must not claim an exit the waits never saw"
+        );
+        // The armed pid stayed in place: Drop keeps kill responsibility
+        // (here via kill_on_drop on the real child).
+        drop(supervisor);
+        tokio::time::sleep(Duration::from_millis(400)).await;
+        assert!(
+            !crate::lifecycle::process_is_running(real_pid),
+            "dropping the unconfirmed supervisor must still kill the child"
         );
     }
 }
