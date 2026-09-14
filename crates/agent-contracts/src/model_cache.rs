@@ -100,42 +100,44 @@ pub struct PromptCacheRouting {
     pub endpoint: String,
 }
 
-/// Component bounds keep the derived key a bounded, opaque routing string
-/// on the wire — a hostile configuration cannot turn it into an unbounded
-/// header.
-const ROUTING_COMPONENT_MAX_CHARS: usize = 256;
-const ROUTING_KEY_MAX_CHARS: usize = 1024;
+/// R6: the routing key is the versioned, length-prefixed serialization of
+/// the five-field tuple (isolation, workspace, endpoint, task, lane),
+/// digested through the existing SHA-256/ContentDigest facility into a
+/// fixed-length opaque string. The per-field byte-length prefixes make the
+/// encoding injective: no separator text — however hostile the configured
+/// components — can alias two different identities, no component is
+/// rewritten, trimmed or truncated, and the digest bounds the wire key
+/// regardless of component sizes. The encoding version participates in the
+/// digest, so a future encoding change is a fresh key space rather than a
+/// silent aliasing of the old one (the `rc2-` wire prefix marks it).
+const ROUTING_KEY_ENCODING_VERSION: u8 = 2;
+/// Wire prefix of the v2 digest encoding: `rc2-` + 64 lowercase hex.
+const ROUTING_KEY_ENCODING_PREFIX: &str = "rc2-";
 
 impl PromptCacheRouting {
-    fn bounded(component: &str) -> String {
-        let trimmed = component.trim();
-        if trimmed.chars().count() <= ROUTING_COMPONENT_MAX_CHARS {
-            trimmed.to_string()
-        } else {
-            // Oversized components are digested, not truncated: a cut
-            // string could collide with a different real component's
-            // prefix.
-            use sha2::{Digest, Sha256};
-            let digest = Sha256::digest(trimmed.as_bytes());
-            format!("sha256:{:x}", digest)[..64].to_string()
-        }
-    }
-
     /// The stable routing key for one task on one call lane.
     pub fn key_for(&self, task: &str, lane: &str) -> String {
-        let key = format!(
-            "{}|{}|{}|{}|{}",
-            Self::bounded(&self.isolation),
-            Self::bounded(&self.workspace),
-            Self::bounded(&self.endpoint),
-            Self::bounded(task),
-            Self::bounded(lane),
-        );
-        if key.chars().count() <= ROUTING_KEY_MAX_CHARS {
-            key
-        } else {
-            key.chars().take(ROUTING_KEY_MAX_CHARS).collect()
+        // Canonical tuple encoding: one version byte, then for each field
+        // in fixed order (isolation, workspace, endpoint, task, lane) its
+        // UTF-8 byte length as an 8-byte big-endian prefix followed by the
+        // field bytes. Prefix-free and unambiguous; the exact byte stream
+        // is hashed whole — never truncated, never rebuilt from pieces.
+        let mut hasher = Sha256::new();
+        hasher.update([ROUTING_KEY_ENCODING_VERSION]);
+        for field in [
+            self.isolation.as_bytes(),
+            self.workspace.as_bytes(),
+            self.endpoint.as_bytes(),
+            task.as_bytes(),
+            lane.as_bytes(),
+        ] {
+            hasher.update((field.len() as u64).to_be_bytes());
+            hasher.update(field);
         }
+        format!(
+            "{ROUTING_KEY_ENCODING_PREFIX}{}",
+            ContentDigest::from_bytes(hasher.finalize().into())
+        )
     }
 }
 

@@ -183,7 +183,7 @@ async fn two_production_requests_of_one_task_share_the_key_and_carry_b0_b1() {
 
     let config = ComposeConfig {
         provider_profile_digest: None,
-        cache_routing: Some(routing),
+        cache_routing: Some(routing.clone()),
         defer_proof_refresh: false,
         shadow_context_frame: false,
         workspace: workspace.clone(),
@@ -219,6 +219,7 @@ async fn two_production_requests_of_one_task_share_the_key_and_carry_b0_b1() {
     // The production flow: set_focus creates the task while idle; the two
     // user messages are two turns of that same task.
     handle.set_focus("the capture task".into()).await.unwrap();
+    let task = wait_for_focus(&mut events, "the capture task").await;
     handle
         .user_message("first turn of the capture task".into())
         .await
@@ -245,8 +246,9 @@ async fn two_production_requests_of_one_task_share_the_key_and_carry_b0_b1() {
     let parsed: Vec<serde_json::Value> = captured.iter().map(|body| parse(body)).collect();
 
     // The routing key: identical across EVERY round of the task, non-empty,
-    // composed from the configured isolation/workspace/endpoint/task/lane —
-    // and never the request content itself.
+    // the versioned fixed-length digest of the composed
+    // isolation/workspace/endpoint/task/lane tuple (R6) — and never the
+    // request content itself.
     let keys: Vec<String> = parsed
         .iter()
         .map(|body| {
@@ -260,8 +262,21 @@ async fn two_production_requests_of_one_task_share_the_key_and_carry_b0_b1() {
         keys.iter().all(|key| key == &keys[0]),
         "one task, one stable key across all rounds: {keys:?}"
     );
-    assert!(keys[0].contains("test-isolation"));
-    assert!(keys[0].contains("|main"));
+    assert_eq!(
+        keys[0],
+        routing.key_for(&task.to_string(), "main"),
+        "the wire key is the composed routing digest of this task"
+    );
+    assert!(
+        keys[0].starts_with("rc2-") && keys[0].len() == 68,
+        "the key is the versioned 64-hex routing digest: {}",
+        keys[0]
+    );
+    assert!(
+        !keys[0].contains('|'),
+        "the opaque digest carries no readable composed components: {}",
+        keys[0]
+    );
     assert!(
         !keys[0].contains("capture task"),
         "the key is routing, not request content: {}",
@@ -332,6 +347,35 @@ async fn wait_for_turn_completed(
             Err(tokio::sync::broadcast::error::TryRecvError::Lagged(_)) => {}
             Err(tokio::sync::broadcast::error::TryRecvError::Closed) => {
                 panic!("the event stream closed before TurnCompleted")
+            }
+            Err(tokio::sync::broadcast::error::TryRecvError::Empty) => {}
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+}
+
+async fn wait_for_focus(
+    events: &mut tokio::sync::broadcast::Receiver<agent_contracts::RuntimeEventEnvelope>,
+    goal_marker: &str,
+) -> agent_contracts::TaskId {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+    loop {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "no FocusChanged for {goal_marker} within the test deadline"
+        );
+        match events.try_recv() {
+            Ok(envelope) => {
+                if let agent_contracts::RuntimeEvent::FocusChanged { task_id, goal } =
+                    &envelope.event
+                    && goal.contains(goal_marker)
+                {
+                    return *task_id;
+                }
+            }
+            Err(tokio::sync::broadcast::error::TryRecvError::Lagged(_)) => {}
+            Err(tokio::sync::broadcast::error::TryRecvError::Closed) => {
+                panic!("the event stream closed before FocusChanged({goal_marker})")
             }
             Err(tokio::sync::broadcast::error::TryRecvError::Empty) => {}
         }

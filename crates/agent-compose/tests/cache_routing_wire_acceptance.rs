@@ -6,11 +6,15 @@
 //! `prompt_cache_options` or `prompt_cache_breakpoint` itself.
 //!
 //! Covered here beyond `cache_wire_flow.rs`:
-//! - the key's exact composed shape `{isolation}|{workspace}|{endpoint}|{task}|{lane}`
-//!   (with an OPAQUE workspace identity — the composed runtime owns the real
-//!   workspace root, and the key must never leak that plaintext path);
+//! - the key's exact composed identity: the R6 encoding is a versioned,
+//!   length-prefixed serialization of the
+//!   `{isolation,workspace,endpoint,task,lane}` tuple digested to a
+//!   fixed-length opaque `rc2-<64 hex>` string (the pre-R6 `|`-joined form
+//!   was ambiguous and truncated — that migration is one-time and complete);
+//!   the wire key must equal `routing.key_for` for the round's task and
+//!   never leak the workspace path or component text;
 //! - different task => different key, maintenance lane => different key
-//!   (`...|compaction|maintenance`, its own ExplicitOnly ZERO-breakpoint
+//!   (`compaction|maintenance`, its own ExplicitOnly ZERO-breakpoint
 //!   no-write shape and the compaction output cap on the wire);
 //! - multi-breakpoint mapping: B0 stable policy / B1 declared epoch evidence
 //!   are per-item sibling fields whose contents really separate the stable
@@ -356,7 +360,7 @@ async fn routing_keys_route_by_task_and_lane_on_the_wire() {
 
     let config = ComposeConfig {
         provider_profile_digest: None,
-        cache_routing: Some(routing),
+        cache_routing: Some(routing.clone()),
         defer_proof_refresh: false,
         shadow_context_frame: false,
         workspace: workspace.clone(),
@@ -457,9 +461,12 @@ async fn routing_keys_route_by_task_and_lane_on_the_wire() {
         );
     }
 
-    // ---- Main lane: the exact composed key shape, stable per task ----
-    let expected_main_key =
-        |task: TaskId| format!("{ISOLATION}|{workspace_identity}|{base_url}|{task}|main");
+    // ---- Main lane: the versioned digest of the composed routing tuple ----
+    // R6: the wire key must equal `routing.key_for` for the round's task —
+    // a fixed-length opaque digest, so the round's task is identified by
+    // its changing-tail text instead of being parsed back out of the key.
+    let alpha_key = routing.key_for(&task_a.to_string(), "main");
+    let beta_key = routing.key_for(&task_b.to_string(), "main");
     let mut keys_a = BTreeSet::new();
     let mut keys_b = BTreeSet::new();
     for &round in &main_rounds {
@@ -467,30 +474,41 @@ async fn routing_keys_route_by_task_and_lane_on_the_wire() {
         let key = body["prompt_cache_key"]
             .as_str()
             .expect("every confirmed-capability main request carries the routing key");
-        let components: Vec<&str> = key.split('|').collect();
-        assert_eq!(
-            components.len(),
-            5,
-            "the key is the five-component isolation|workspace|endpoint|task|lane composition: {key}"
-        );
-        assert_eq!(components[0], ISOLATION);
-        assert_eq!(
-            components[1], workspace_identity,
-            "the configured OPAQUE workspace identity is the component, verbatim"
-        );
-        assert_eq!(components[2], base_url);
-        assert_eq!(components[4], "main");
-        let task = components[3]
-            .parse::<TaskId>()
-            .expect("the task component is the minted task id");
         assert!(
-            task == task_a || task == task_b,
-            "the task component names one of this run's tasks: {key}"
+            key.starts_with("rc2-")
+                && key.len() == 68
+                && key["rc2-".len()..]
+                    .bytes()
+                    .all(|byte| matches!(byte, b'0'..=b'9' | b'a'..=b'f')),
+            "the key is the versioned 64-hex routing digest: {key}"
+        );
+        assert!(
+            !key.contains('|'),
+            "the opaque digest carries no composed components: {key}"
+        );
+        // The round's task is named in its VOLATILE TAIL (current directive
+        // and focus, after the last breakpoint) — never by the full input,
+        // whose B1 evidence block legitimately carries earlier turns' ingest
+        // records across tasks.
+        let positions = breakpoint_positions(body);
+        let last_breakpoint = positions.last().map(|(index, _)| *index).unwrap_or(0);
+        let tail_text = body["input"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .skip(last_breakpoint + 1)
+            .map(item_text)
+            .collect::<String>();
+        let is_alpha = tail_text.contains(TURN_ONE) || tail_text.contains(TURN_TWO);
+        let is_beta = tail_text.contains("beta turn of the acceptance routing check");
+        assert!(
+            is_alpha ^ is_beta,
+            "each main round names exactly one of this run's tasks by its tail text (round {round}): {tail_text:?}"
         );
         assert_eq!(
             key,
-            expected_main_key(task),
-            "the wire key is exactly the composed routing string"
+            if is_alpha { &alpha_key } else { &beta_key },
+            "the wire key is exactly the composed routing digest of the round's task"
         );
         assert!(
             !key.contains(&root_path),
@@ -505,7 +523,7 @@ async fn routing_keys_route_by_task_and_lane_on_the_wire() {
             Some("explicit"),
             "the confirmed explicit capability is declared on the wire"
         );
-        if task == task_a {
+        if is_alpha {
             keys_a.insert(key.to_string());
         } else {
             keys_b.insert(key.to_string());
@@ -591,8 +609,7 @@ async fn routing_keys_route_by_task_and_lane_on_the_wire() {
     }
 
     // ---- Maintenance lane: its own namespace, its own write policy ----
-    let expected_maintenance_key =
-        format!("{ISOLATION}|{workspace_identity}|{base_url}|compaction|maintenance");
+    let expected_maintenance_key = routing.key_for("compaction", "maintenance");
     for &round in &compactor_rounds {
         let body = &parsed[round];
         let key = body["prompt_cache_key"]
@@ -662,7 +679,7 @@ async fn empty_stable_set_first_request_declares_only_b0_in_the_declared_shape()
 
     let config = ComposeConfig {
         provider_profile_digest: None,
-        cache_routing: Some(routing),
+        cache_routing: Some(routing.clone()),
         defer_proof_refresh: false,
         shadow_context_frame: false,
         workspace: workspace.clone(),
@@ -717,7 +734,7 @@ async fn empty_stable_set_first_request_declares_only_b0_in_the_declared_shape()
         .expect("the first request carries the routing key");
     assert_eq!(
         key,
-        format!("acceptance-empty|{workspace_identity}|{base_url}|{task}|main"),
+        routing.key_for(&task.to_string(), "main"),
         "the very first request already uses the composed stable key"
     );
     assert_eq!(

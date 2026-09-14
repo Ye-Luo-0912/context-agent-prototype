@@ -41,3 +41,6 @@ impl OpenAiPromptCacheMode {
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod endpoint_shape_tests;
