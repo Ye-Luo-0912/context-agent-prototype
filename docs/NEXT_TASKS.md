@@ -63,7 +63,8 @@ RuntimeServices 字段分组＋`from_parts` 唯一构造路径；`ComposeConfig:
 
 复用 compose/services：产品与实验设置分组、共用默认构造和校验（RuntimeServices 的 new/try_new 重复初始化与实验 bool 汇合），入口只解析差异。正式 host 默认 Rolling 先保持；Dynamic 明确可启用 profile、回归范围与实际限制；正数维护预算/backoff 的适用引擎在 effective config 中诚实区分"不支持/未接入"与"默认"。验收：读取 effective config 与执行时实际选择一致；不支持的组合拒绝或显式报告；未知修改不自动重放；普通 final 与持久完成区别保持。停止：不换 GUI 技术、不加多工作区总调度、不任意改变公开 wire。
 
-### T7 — 同一任务的完整后端开发流程（A 主持，三线共同）
+### T7 — 同一任务的完整后端开发流程（A 主持，三线共同）——已完成（2026-09-15，host_t7_journey）
+一条连续轨迹（named pipe；unix 入口同款归 CI）：跨文件目标提交（幂等重试同 task）→ 脚本模型经 Runtime 真实 fs.write（wire 审批放行）→ 运行中 steer（Queued 槽，无第二任务）→ continue＋mid-flight cancel（类型化 TurnCancelled barrier）→ 正式 checkpoint → 宿主关闭 → **新 server 冷恢复同任务**（同 TaskId 重聚焦、run lineage 链接）→ 文件逐字节存活/无效果重放 → 继续完成 summary.md → 交付＋OperatorClosureOnly 操作员关闭（TaskCompleted 携带 final_output_digest）。故障变体：恢复后真实 fs 失败保持 Active/可重试、条件清除后同写入成功。host 全量 25 绿（t7 2），clippy 0。原始任务：
 
 结果：一个真实跨模块代码任务在同一 TaskId、同一工作区、同一恢复 lineage 内完成——不是多组无关测试的成功行相加。
 
