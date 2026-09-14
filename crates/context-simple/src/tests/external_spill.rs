@@ -1,7 +1,7 @@
 //! CTX-9 残余：checkpoint 外置尾分片——最旧的超额 External 条目把元数据
 //! 卡片写进既有 store（内容寻址、幂等），checkpoint 只携带内联段＋
-//! `external_spilled` 寻址清单；restore 从卡片全量重水化。搜索/召回/
-//! 目录语义不变（条目全部驻留内存，分片只压缩 checkpoint 字节）。
+//! `external_spilled` 寻址清单；restore 按批次重水化（T4 起，超预算/超热
+//! 上限的部分留在 pending 目录按预算续取）。搜索/召回/目录语义不变。
 //! 卡片缺失/损坏 = 恢复的 external 集合不完整，如实计数、整体不失败。
 
 use agent_contracts::{

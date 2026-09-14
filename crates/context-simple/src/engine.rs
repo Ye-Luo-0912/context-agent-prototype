@@ -233,6 +233,37 @@ pub struct SimpleContextConfig {
     /// rest stay a pending directory of `(id, card hash)` rows that page in
     /// on demand, so restore cost does not track total history length.
     pub external_restore_card_batch: usize,
+    /// T4: how many pending spill cards ONE operation (search, full GC,
+    /// reconcile, storage GC, directive ingest) may page in before it must
+    /// report a typed incomplete result instead of silently paying a total
+    /// that tracks history length. The pending queue is never dropped: the
+    /// next operation continues where this one stopped, and a direct id
+    /// lookup (`fetch`/`inspect`/a directive's own target) pages its card
+    /// regardless of this budget. Default 4096 — generous enough that normal
+    /// workloads still drain in one pass, tight enough that a pathological
+    /// cold tail cannot stretch one operation without bound.
+    pub external_hydrate_max_items: usize,
+    /// T4: wall-clock budget for one operation's hydration drain, measured
+    /// from the operation's start. Spent, it stops the drain between read
+    /// batches and the typed outcome reports the unread remainder — a slow
+    /// disk cannot turn one search into an unbounded wait. Default 2000 ms
+    /// (the same order as the capture-side IO budget).
+    pub external_hydrate_budget_ms: u64,
+    /// T4: hard cap on resident external metadata entries (the hot
+    /// directory). Once the map holds this many entries, bulk hydration
+    /// stops paging more in — the typed outcome says so, and per-id service
+    /// (a fetch/inspect/directive naming a pending row) keeps working. No
+    /// entry is ever dropped to enforce this: it bounds hot residency, never
+    /// owners, and Storage GC's own B2 deferral covers the unread edges.
+    /// Default 8192 (well above the inline target and restore batch, so it
+    /// only binds on collections deliberately larger than the hot budget).
+    pub external_hot_metadata_max_entries: usize,
+    /// T4: soft byte cap on resident external metadata, checked between
+    /// hydration batches against a cheap per-entry estimate (uri + summary +
+    /// entities + a fixed overhead — not a serialized size). Like the entry
+    /// cap it stops bulk paging only; owners are never dropped. Default
+    /// 32 MiB.
+    pub external_hot_metadata_max_bytes: u64,
 }
 
 impl Default for SimpleContextConfig {
@@ -280,6 +311,10 @@ impl Default for SimpleContextConfig {
             external_checkpoint_card_bytes: 8 * 1024 * 1024,
             external_checkpoint_io_budget_ms: 2_000,
             external_restore_card_batch: 256,
+            external_hydrate_max_items: 4096,
+            external_hydrate_budget_ms: 2_000,
+            external_hot_metadata_max_entries: 8192,
+            external_hot_metadata_max_bytes: 32 * 1024 * 1024,
         }
     }
 }
@@ -295,6 +330,87 @@ impl SimpleContextConfig {
             entity_affinity: false,
             dependency_expansion: false,
             ..Self::default()
+        }
+    }
+}
+
+/// T4: why one operation's pending-card drain stopped short. The typed
+/// difference matters to callers: `Budget` and `HotCap` are resumable states
+/// (the queue is untouched, the next operation continues), `Unreadable` is
+/// the B2 transient-I/O state — all three mean "the in-memory external set
+/// is incomplete", never "there is nothing left".
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum HydrationStop {
+    /// Every pending row was consumed: the external set in memory is
+    /// complete.
+    Complete,
+    /// The operation's items budget or wall-clock deadline was spent.
+    Budget,
+    /// The resident-metadata cap (entries or estimated bytes) is reached;
+    /// further cold metadata is served per id, not bulk-paged.
+    HotCap,
+    /// Every remaining row hit a transient read failure this pass (the
+    /// pre-T4 B2 shape).
+    Unreadable,
+}
+
+/// T4: typed result of one operation's bounded hydration drain. Replaces the
+/// bare `bool` completeness flag: callers see how much is left and why the
+/// drain stopped, and the pending queue always stays resumable (N02 rows
+/// keep their owner; nothing is consumed but a verified outcome).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct HydrationOutcome {
+    /// True only when the pending queue drained fully this pass.
+    pub(crate) complete: bool,
+    /// Pending rows left unread — the queue keeps them, and this count is
+    /// what typed consumers (storage-GC deferral, search fail-closed)
+    /// surface.
+    pub(crate) remaining: usize,
+    pub(crate) stopped: HydrationStop,
+}
+
+impl HydrationOutcome {
+    pub(crate) fn complete() -> Self {
+        Self {
+            complete: true,
+            remaining: 0,
+            stopped: HydrationStop::Complete,
+        }
+    }
+
+    fn stopped(stopped: HydrationStop, remaining: usize) -> Self {
+        Self {
+            complete: false,
+            remaining,
+            stopped,
+        }
+    }
+}
+
+/// T4: one operation's hydration budget — items plus an absolute deadline
+/// plus the resident-metadata caps — built from the config at the
+/// operation's start so every caller shares one definition of "this
+/// operation's fair share of cold reads".
+pub(crate) struct HydrationBudget {
+    /// Pending cards this operation may page in.
+    pub(crate) max_items: usize,
+    /// Absolute wall-clock deadline for the whole drain.
+    pub(crate) deadline: std::time::Instant,
+    /// Resident external-metadata entry cap (bulk paging stops at it).
+    pub(crate) hot_max_entries: usize,
+    /// Resident external-metadata byte cap (estimated; checked between
+    /// batches).
+    pub(crate) hot_max_bytes: u64,
+}
+
+impl HydrationBudget {
+    pub(crate) fn for_operation(config: &SimpleContextConfig) -> Self {
+        Self {
+            max_items: config.external_hydrate_max_items,
+            deadline: std::time::Instant::now()
+                + std::time::Duration::from_millis(config.external_hydrate_budget_ms),
+            hot_max_entries: config.external_hot_metadata_max_entries,
+            hot_max_bytes: config.external_hot_metadata_max_bytes,
         }
     }
 }
@@ -1135,14 +1251,52 @@ impl SimpleContextEngine {
     /// - a pending owner is not an ownerless entry;
     /// - recovery-root completeness is not metadata/dependency completeness;
     /// - while completeness is unknown, irreversible deletion defers.
-    async fn hydrate_all_pending_cards(&self) -> bool {
+    ///
+    /// T4: the drain is one operation's fair share, not "however long the
+    /// history is". The budget (items + absolute deadline + resident-metadata
+    /// caps, from config) stops it between read batches; the typed outcome
+    /// carries the unread remainder and the stop cause. The pending queue is
+    /// never dropped, so the next operation resumes exactly where this one
+    /// stopped.
+    async fn hydrate_all_pending_cards(&self) -> HydrationOutcome {
+        let budget = HydrationBudget::for_operation(&self.config);
+        self.hydrate_within_budget(budget).await
+    }
+
+    /// T4: the budgeted drain body. Visible to tests so regressions can pin
+    /// exact budget arithmetic; production callers go through
+    /// [`Self::hydrate_all_pending_cards`].
+    pub(crate) async fn hydrate_within_budget(&self, budget: HydrationBudget) -> HydrationOutcome {
         let batch = self.config.external_restore_card_batch.max(1);
+        let mut items_left = budget.max_items;
         loop {
-            let pending_len = self.state.lock().await.pending_external_cards.len();
+            let (pending_len, hot_entries, hot_bytes) = {
+                let state = self.state.lock().await;
+                (
+                    state.pending_external_cards.len(),
+                    state.external.len(),
+                    state.external.metadata_bytes_estimate(),
+                )
+            };
             if pending_len == 0 {
-                return true;
+                return HydrationOutcome::complete();
             }
-            let installed = self.hydrate_pending_cards(batch).await;
+            // T4: the resident-metadata caps stop the *bulk* drain only. The
+            // per-id service path (fetch/inspect/a directive naming its own
+            // target) never goes through here, so a capped hot directory
+            // still serves any pending row the model asks for by id.
+            if hot_entries >= budget.hot_max_entries || hot_bytes >= budget.hot_max_bytes {
+                return HydrationOutcome::stopped(HydrationStop::HotCap, pending_len);
+            }
+            // The caps bound the batch, so a drain can fill the hot
+            // directory exactly to the cap without stepping past it.
+            let room = budget.hot_max_entries - hot_entries;
+            let take = batch.min(items_left).min(room);
+            if take == 0 || std::time::Instant::now() >= budget.deadline {
+                return HydrationOutcome::stopped(HydrationStop::Budget, pending_len);
+            }
+            items_left -= take;
+            let installed = self.hydrate_pending_cards(take).await;
             // N02: a batch that installs nothing and consumes nothing hit
             // only transiently unreadable cards — their rows stayed queued
             // on purpose. Draining them is a later successful pass's job;
@@ -1153,7 +1307,7 @@ impl SimpleContextEngine {
                 // B2: the batch hit only unreadable cards. Report the drain
                 // as incomplete instead of letting the caller plan as if
                 // the partial external set were the whole one.
-                return false;
+                return HydrationOutcome::stopped(HydrationStop::Unreadable, remaining);
             }
         }
     }
@@ -1166,19 +1320,24 @@ impl SimpleContextEngine {
     /// as a typed error, never folded into an authoritative-looking "no
     /// matches". Partial hits are returned as-is; the caller-facing search
     /// is bounded and ranked, so non-empty results never claimed completeness.
+    ///
+    /// T4: the fail-closed error carries the typed drain outcome — the exact
+    /// unread remainder and why the drain stopped (budget spent, hot cap, or
+    /// transient read failures) — so a caller can distinguish "no matches in
+    /// the region we could see" from a resumable coverage gap.
     async fn finish_search_hits(
         &self,
-        hydration_complete: bool,
+        hydration: HydrationOutcome,
         hits: Vec<agent_contracts::ExternalizedContext>,
     ) -> AgentResult<Vec<agent_contracts::ExternalizedContext>> {
-        if hydration_complete || !hits.is_empty() {
+        if hydration.complete || !hits.is_empty() {
             return Ok(hits);
         }
-        let unread = self.state.lock().await.pending_external_cards.len();
         Err(AgentError::Context(format!(
-            "context search coverage incomplete: {unread} pending spill page(s) could not be \
-             read this pass and may contain matches; reporting an empty result would be a \
-             false zero-match"
+            "context search coverage incomplete: {} pending spill page(s) could not be paged in \
+             this pass (stopped: {:?}) and may contain matches; reporting an empty result would \
+             be a false zero-match",
+            hydration.remaining, hydration.stopped
         )))
     }
 
@@ -1420,7 +1579,15 @@ impl ContextEngine for SimpleContextEngine {
         // F2: a directive names an item by id and its plan runs under the
         // state lock, so pending spill rows page in first (bounded batches).
         // Plain message/tool ingress never pays for cold metadata.
+        //
+        // T4: the directive's own target pages in first — per-id service is
+        // never budget- or cap-blocked, so the plan always sees its item.
+        // The bulk drain stays within the operation budget and may honestly
+        // leave rows for the next pass.
         if matches!(ingress, ContextIngress::ContextDirective { .. }) {
+            if let ContextIngress::ContextDirective { action } = &ingress {
+                self.hydrate_card_for(directive_item_id(action)).await;
+            }
             self.hydrate_all_pending_cards().await;
         }
         let mut distill: Option<DistillJob> = None;
@@ -2009,7 +2176,12 @@ impl ContextEngine for SimpleContextEngine {
         // deletes no blobs — recall, reconcile and Storage GC own deletion —
         // so an unread pending row only means its entry is not aged this
         // pass; that is conservative and needs no deferral here.
-        self.hydrate_all_pending_cards().await;
+        //
+        // T4: the drain is budget-bounded. Rows left unread keep their owner
+        // queued and are simply not aged (and not recallable) this pass; the
+        // typed outcome needs no deferral for the memory pass because
+        // deletion belongs to Storage GC, which defers on it below.
+        let _hydration = self.hydrate_all_pending_cards().await;
         let mut state = self.state.lock().await;
         state.event_seq += 1;
         let now_tick = state.event_seq;
@@ -2067,7 +2239,12 @@ impl ContextEngine for SimpleContextEngine {
         // into the same typed defer as an incomplete root enumeration, so
         // the stale-duplicate and orphan-card sweeps cannot turn a read
         // failure into a deletion.
-        let hydration_complete = self.hydrate_all_pending_cards().await;
+        //
+        // T4: a budget- or cap-stopped drain lands in the same typed defer:
+        // the sweep sees `metadata_complete = hydration.complete == false`
+        // and defers, while the queued rows stay resumable for the next
+        // pass.
+        let hydration = self.hydrate_all_pending_cards().await;
         let (map_checksums, resident_ids) = {
             let mut state = self.state.lock().await;
             state.event_seq += 1;
@@ -2096,7 +2273,7 @@ impl ContextEngine for SimpleContextEngine {
             &resident_ids,
             protected,
             roots_complete,
-            hydration_complete,
+            hydration.complete,
         )
         .await;
         let mut state = self.state.lock().await;
@@ -2444,7 +2621,11 @@ impl ContextEngine for SimpleContextEngine {
         // reported. A row left unread is a cold entry whose body the catalog
         // cannot see; an empty hit list in that state is NOT a complete
         // zero-match, so it fails closed below instead.
-        let hydration_complete = self.hydrate_all_pending_cards().await;
+        //
+        // T4: the drain is budget-bounded, and the typed outcome (unread
+        // remainder + stop cause) is what `finish_search_hits` consumes —
+        // same fail-closed rule, now naming the resumable amount.
+        let hydration = self.hydrate_all_pending_cards().await;
         let read_plan = {
             let mut state = self.state.lock().await;
             state.sync_catalog();
@@ -2457,7 +2638,7 @@ impl ContextEngine for SimpleContextEngine {
                 crate::access::reinforce_search_hits(&mut state, &hits, &query);
                 drop(state);
                 self.record_search_observation(ContextSearchObservation::default());
-                return self.finish_search_hits(hydration_complete, hits).await;
+                return self.finish_search_hits(hydration, hits).await;
             }
             let read_plan = crate::store::plan_stored_search_reads(&state, &query)?;
             if read_plan.is_empty() {
@@ -2465,7 +2646,7 @@ impl ContextEngine for SimpleContextEngine {
                 crate::access::reinforce_search_hits(&mut state, &hits, &query);
                 drop(state);
                 self.record_search_observation(ContextSearchObservation::default());
-                return self.finish_search_hits(hydration_complete, hits).await;
+                return self.finish_search_hits(hydration, hits).await;
             }
             read_plan
         };
@@ -2491,7 +2672,7 @@ impl ContextEngine for SimpleContextEngine {
         crate::access::reinforce_search_hits(&mut state, &hits, &query);
         drop(state);
         self.record_search_observation(observation);
-        self.finish_search_hits(hydration_complete, hits).await
+        self.finish_search_hits(hydration, hits).await
     }
 
     fn last_search_observation(&self) -> ContextSearchObservation {
@@ -2822,7 +3003,11 @@ impl ContextEngine for SimpleContextEngine {
         // owner is not ownerless, and root completeness is not metadata
         // completeness: with unread cold metadata the deletion branch defers
         // exactly like an incomplete root enumeration.
-        let hydration_complete = self.hydrate_all_pending_cards().await;
+        //
+        // T4: a budget- or hot-cap-stopped drain lands in the same typed
+        // defer, and the report names the resumable remainder instead of a
+        // bare "incomplete".
+        let hydration = self.hydrate_all_pending_cards().await;
         let plan = {
             let mut state = self.state.lock().await;
             state.event_seq += 1;
@@ -2833,7 +3018,7 @@ impl ContextEngine for SimpleContextEngine {
                 now_tick,
                 protected_recovery_roots,
                 roots_complete,
-                hydration_complete,
+                hydration,
             )
         };
         let dir = store::store_dir(&self.config);

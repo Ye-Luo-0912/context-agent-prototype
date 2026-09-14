@@ -1199,8 +1199,11 @@ pub(crate) fn reattach_owner_metadata(
 ///
 /// B2: the closure only sees edges of *installed* entries. A pending spill
 /// row is a live owner whose metadata — and therefore whose outgoing strong
-/// edges — is not in memory, so callers pass `metadata_complete: false`
-/// whenever the hydration drain left rows unread. The three rules:
+/// edges — is not in memory, so callers pass the typed hydration outcome and
+/// `metadata.complete == false` whenever the drain left rows unread. T4: the
+/// outcome also carries *why* (budget spent, hot cap, transient read
+/// failures) and the unread remainder, which the report names. The three
+/// rules:
 /// - a pending owner is not an ownerless entry;
 /// - recovery-root completeness is not metadata/dependency completeness;
 /// - while completeness is unknown, irreversible deletion defers.
@@ -1210,7 +1213,7 @@ pub(crate) fn plan_storage_gc(
     now_tick: u64,
     protected_recovery_roots: &[ContextItemId],
     roots_complete: bool,
-    metadata_complete: bool,
+    metadata: crate::engine::HydrationOutcome,
 ) -> StorageGcPlan {
     fn non_deletable(entry: &ExternalizedContext) -> bool {
         !entry.semantic.is_dead()
@@ -1268,7 +1271,7 @@ pub(crate) fn plan_storage_gc(
     // retained owner, and unread pending metadata cannot prove there is no
     // unreferenced candidate — both defer every deletion rather than wrap a
     // read failure into a false all-orphan verdict.
-    let deletion_permitted = roots_complete && metadata_complete;
+    let deletion_permitted = roots_complete && metadata.complete;
     let candidates = if deletion_permitted {
         state
             .external
@@ -1310,7 +1313,8 @@ pub(crate) fn plan_storage_gc(
         anchor_roots_protected,
         anchor_root_protections,
         deletion_deferred: !deletion_permitted,
-        deletion_deferred_because_metadata: !metadata_complete,
+        deletion_deferred_because_metadata: !metadata.complete,
+        deletion_deferred_metadata_remaining: metadata.remaining,
     }
 }
 
@@ -1329,6 +1333,10 @@ pub(crate) struct StorageGcPlan {
     /// opposed to an incomplete retained-root enumeration), so the report
     /// names the actual cause.
     pub(crate) deletion_deferred_because_metadata: bool,
+    /// T4: how many pending spill rows the hydration drain left unread when
+    /// it stopped (typed budget/cap/read-failure remainder), so the report
+    /// states the resumable amount instead of a bare "incomplete".
+    pub(crate) deletion_deferred_metadata_remaining: usize,
 }
 
 /// Phase 2 (no lock held): remove the planned store files. Real IO errors
@@ -1432,14 +1440,18 @@ pub(crate) fn commit_storage_gc(
     report.anchor_root_protections = plan.anchor_root_protections;
     // W03/B2: an incomplete enumeration deferred every deletion. The report
     // names the actual cause: unread pending spill metadata (dependency
-    // edges unknown) or an incomplete retained-root enumeration.
+    // edges unknown) or an incomplete retained-root enumeration. T4: the
+    // metadata cause states the resumable remainder — these rows stay queued
+    // and the next pass pages them in.
     if plan.deletion_deferred {
         report
             .reasons
             .push(if plan.deletion_deferred_because_metadata {
-                "deletion deferred: pending spill metadata is unread — owners and dependency \
-             edges are not fully visible"
-                    .into()
+                format!(
+                    "deletion deferred: {} pending spill row(s) unread — owners and dependency \
+                     edges are not fully visible; the next pass resumes the drain",
+                    plan.deletion_deferred_metadata_remaining
+                )
             } else {
                 "deletion deferred: retained-checkpoint recovery roots are incomplete".into()
             });
@@ -1460,7 +1472,14 @@ pub(crate) fn run_storage_gc(
     config: &SimpleContextConfig,
     now_tick: u64,
 ) -> StorageGcReport {
-    let plan = plan_storage_gc(state, config, now_tick, &[], true, true);
+    let plan = plan_storage_gc(
+        state,
+        config,
+        now_tick,
+        &[],
+        true,
+        crate::engine::HydrationOutcome::complete(),
+    );
     let dir = store_dir(config);
     let io = plan
         .candidates
@@ -2075,7 +2094,14 @@ mod tests {
         }
         assert_eq!(state.external.recorded_cards(), 3, "setup recorded all");
 
-        let plan = plan_storage_gc(&state, &config, 2, &[], true, true);
+        let plan = plan_storage_gc(
+            &state,
+            &config,
+            2,
+            &[],
+            true,
+            crate::engine::HydrationOutcome::complete(),
+        );
         assert!(plan.candidates.is_empty(), "nothing is dead yet");
         let report = commit_storage_gc(&mut state, plan, Vec::new());
         assert_eq!(report.deleted, 0);
@@ -2111,7 +2137,14 @@ mod tests {
             state.external.record_card(*id, format!("hash{i:012}"));
         }
 
-        let plan = plan_storage_gc(&state, &config, 2, &[], false, true);
+        let plan = plan_storage_gc(
+            &state,
+            &config,
+            2,
+            &[],
+            false,
+            crate::engine::HydrationOutcome::complete(),
+        );
         assert!(plan.deletion_deferred, "incomplete roots defer");
         assert!(plan.candidates.is_empty());
         let report = commit_storage_gc(&mut state, plan, Vec::new());
@@ -2167,7 +2200,14 @@ mod tests {
         }
         assert_eq!(state.external.recorded_cards(), 4, "setup recorded all");
 
-        let plan = plan_storage_gc(&state, &config, 40, &[], true, true);
+        let plan = plan_storage_gc(
+            &state,
+            &config,
+            40,
+            &[],
+            true,
+            crate::engine::HydrationOutcome::complete(),
+        );
         assert_eq!(
             plan.candidates.len(),
             2,
@@ -3310,7 +3350,14 @@ mod tests {
         }
 
         let now_tick = 100;
-        let plan = plan_storage_gc(&state, &config, now_tick, &[], true, true);
+        let plan = plan_storage_gc(
+            &state,
+            &config,
+            now_tick,
+            &[],
+            true,
+            crate::engine::HydrationOutcome::complete(),
+        );
         let planned: HashSet<ContextItemId> = plan.candidates.iter().map(|(id, _)| *id).collect();
 
         // The manual closure's complement: dead, retention-eligible, old and

@@ -170,6 +170,41 @@ impl ExternalMap {
         self.external_entries
     }
 
+    /// T4: cheap estimate of the resident metadata bytes (uri + summary +
+    /// entities + a fixed per-entry overhead for the fixed-size fields).
+    /// Deliberately NOT a serialized size: the hydration drain checks it
+    /// between batches against the configured hot cap, so the walk is paid
+    /// once per batch, not per entry mutation. It bounds hot residency; it
+    /// never decides ownership.
+    pub(crate) fn metadata_bytes_estimate(&self) -> u64 {
+        const FIXED_PER_ENTRY: u64 = 256;
+        const FIXED_PER_DEPENDENCY: u64 = 64;
+        self.entries
+            .iter()
+            .map(|entry| {
+                FIXED_PER_ENTRY
+                    + entry.context_ref.uri.len() as u64
+                    + entry.context_ref.summary.len() as u64
+                    + entry
+                        .entities
+                        .iter()
+                        .map(|entity| entity.len() as u64 + 1)
+                        .sum::<u64>()
+                    + entry.dependencies.len() as u64 * FIXED_PER_DEPENDENCY
+            })
+            .sum()
+    }
+
+    /// Exact resident metadata bytes (serialization length). Test-only: the
+    /// scale regression asserts the resident footprint against a real
+    /// measurement, not the estimate.
+    #[cfg(test)]
+    pub(crate) fn serialized_bytes(&self) -> usize {
+        serde_json::to_vec(self)
+            .map(|bytes| bytes.len())
+            .unwrap_or(0)
+    }
+
     /// How this entry contributes to the Cold/External counts. A free
     /// function so callers can update the counters field-by-field without
     /// a whole-`self` borrow (the counts and the entry vec are disjoint).
