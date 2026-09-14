@@ -196,9 +196,49 @@ impl ExternalMap {
             .retain(|id, _| self.id_index.contains_key(id));
     }
 
-    /// Take the map out for wholesale processing (storage-GC commit); the
-    /// caller must `replace_all` the survivors before any indexed query
-    /// runs again.
+    /// Storage-GC commit: remove exactly the ids whose store files the IO
+    /// phase proved deleted (or already absent). Returns how many entries
+    /// left the map. R3 (2026-09-14 review): this is the named operation
+    /// that owns the whole state migration of a deletion — entries, their
+    /// card claims, the id/entity/pinned indexes and the catalog-dirty
+    /// marks — so a caller cannot forget a step. Survivors are untouched:
+    /// their claims and index rows stay valid, and only the removed ids are
+    /// marked catalog-dirty, so the derived catalog updates incrementally
+    /// instead of rebuilding. An empty list (zero-deletion pass) changes
+    /// nothing at all.
+    pub(crate) fn remove_ids(&mut self, ids: &[ContextItemId]) -> usize {
+        if ids.is_empty() {
+            return 0;
+        }
+        let doomed: HashSet<ContextItemId> = ids.iter().copied().collect();
+        let before = self.entries.len();
+        self.entries
+            .retain(|entry| !doomed.contains(&entry.item_id));
+        let removed = before - self.entries.len();
+        if removed == 0 {
+            return 0;
+        }
+        // Only real deletions invalidate: each removed id loses its card
+        // claim (the file is gone, so the claim names nothing) and becomes
+        // a catalog-dirty id (the next sync drops it from the catalog).
+        for id in &doomed {
+            self.card_hashes.remove(id);
+            self.mark_catalog(*id);
+        }
+        // Slot order is externalization order; re-index the survivors in
+        // one step (same trade as `retain`: O(n) at commit time, and a
+        // partial index update would risk drifting on the entity buckets).
+        self.rebuild_indexes();
+        removed
+    }
+
+    /// Take the map out for wholesale entry editing (task-completion
+    /// keep-alive clears, restore rehydration merges, reconcile's
+    /// owner-quarantine retirement); the caller must `replace_all` the
+    /// result before any indexed query runs again. Prefer a named
+    /// operation (`remove_ids`, `retain`) when the change is a deletion —
+    /// this round-trip invalidates every card claim and forces a full
+    /// catalog rebuild.
     pub(crate) fn take_all(&mut self) -> Vec<ExternalizedContext> {
         self.catalog_rebuild = true;
         self.catalog_dirty.clear();
@@ -508,6 +548,53 @@ mod tests {
         assert_eq!(map.get(b).unwrap().item_id, b);
         assert_eq!(map.ids_for_entity("b.rs"), &[b]);
         assert!(map.ids_for_entity("a.rs").is_empty());
+    }
+
+    #[test]
+    fn remove_ids_drops_only_removed_claims_and_keeps_survivors_valid() {
+        let mut map = ExternalMap::new();
+        let ids: Vec<ContextItemId> = (0..3).map(|_| ContextItemId::new()).collect();
+        for (i, id) in ids.iter().enumerate() {
+            map.push(entry(*id, &[&format!("e{i}.rs")]));
+            map.record_card(*id, format!("hash{i}"));
+        }
+        // Drain the pushes' own dirty marks; only removal marks are under test.
+        map.drain_catalog_dirty();
+
+        let removed = map.remove_ids(&[ids[0]]);
+        assert_eq!(removed, 1);
+        assert_eq!(map.len(), 2);
+        assert!(map.get(ids[0]).is_none());
+        assert!(
+            map.card_hash(ids[0]).is_none(),
+            "the removed entry's claim dies with it"
+        );
+        assert!(
+            map.card_hash(ids[1]).is_some() && map.card_hash(ids[2]).is_some(),
+            "survivor claims stay valid"
+        );
+        assert!(
+            map.ids_for_entity("e0.rs").is_empty(),
+            "the removed id leaves its entity bucket"
+        );
+        assert_eq!(map.ids_for_entity("e1.rs"), &[ids[1]]);
+        let (rebuild, dirty) = map.drain_catalog_dirty();
+        assert!(
+            !rebuild,
+            "a partial removal is incremental, not a catalog rebuild"
+        );
+        assert_eq!(
+            dirty.into_iter().collect::<Vec<_>>(),
+            vec![ids[0]],
+            "only the removed id is catalog-dirty"
+        );
+
+        // The empty list is a complete no-op: no marks, no claims touched.
+        assert_eq!(map.remove_ids(&[]), 0);
+        let (rebuild, dirty) = map.drain_catalog_dirty();
+        assert!(!rebuild);
+        assert!(dirty.is_empty());
+        assert_eq!(map.recorded_cards(), 2);
     }
 
     #[test]

@@ -1376,50 +1376,57 @@ pub(crate) async fn run_storage_io(
 /// Phase 3 (under a fresh lock): apply the IO results to the external map
 /// and build the report. Deleted/NotFound drop their entries; IO errors
 /// keep them; non-candidates are untouched.
+///
+/// R3 (2026-09-14 review): the commit applies exactly the outcomes the IO
+/// phase proved — nothing else. A pass with no proven deletion (no
+/// candidates, a deferred pass, or every candidate hitting a real IO error)
+/// makes NO structural change: the map, its recorded card claims and its
+/// catalog-dirty marks stay exactly as they were. The old take_all →
+/// replace_all round-trip cleared every card claim and forced a full
+/// catalog rebuild on every pass, so even a no-op GC made the next capture
+/// re-serialize metadata nobody had changed.
 pub(crate) fn commit_storage_gc(
     state: &mut State,
     plan: StorageGcPlan,
     io: Vec<(ContextItemId, Result<DeleteOutcome, std::io::Error>)>,
 ) -> StorageGcReport {
-    let reasons: std::collections::HashMap<ContextItemId, String> =
-        plan.candidates.into_iter().collect();
     let outcomes: std::collections::HashMap<_, _> = io.into_iter().collect();
-
     let mut report = StorageGcReport::default();
-    let mut kept: Vec<ExternalizedContext> = Vec::with_capacity(state.external.len());
-    for entry in state.external.take_all() {
-        match outcomes.get(&entry.item_id) {
+
+    // One row per proven outcome, in candidate order (= externalization
+    // order, deterministic). An entry may only leave the map through the
+    // named `remove_ids`, which retires its card claim and marks it
+    // catalog-dirty in the same step; survivors keep both.
+    let mut deleted_ids: Vec<ContextItemId> = Vec::new();
+    for (item_id, reason) in plan.candidates {
+        let Some(entry) = state.external.get(item_id) else {
+            // Not owned by the map anymore (a concurrent structural change
+            // between plan and commit): there is nothing to delete or keep.
+            continue;
+        };
+        let uri = entry.context_ref.uri.clone();
+        match outcomes.get(&item_id) {
             Some(Ok(DeleteOutcome::Deleted | DeleteOutcome::NotFound)) => {
-                report.deleted += 1;
-                state.gc_storage_deleted_total += 1;
-                let reason = reasons
-                    .get(&entry.item_id)
-                    .map(String::as_str)
-                    .unwrap_or("deleted by storage GC");
-                report
-                    .reasons
-                    .push(format!("deleted {} ({reason})", entry.context_ref.uri));
+                deleted_ids.push(item_id);
+                report.reasons.push(format!("deleted {uri} ({reason})"));
             }
             Some(Err(e)) => {
                 // Real IO failure: keep the entry and its metadata. The
                 // content still exists on disk; deleting the reference would
                 // orphan it silently.
                 report.io_errors += 1;
-                let uri = entry.context_ref.uri.clone();
-                let reason = reasons
-                    .get(&entry.item_id)
-                    .map(String::as_str)
-                    .unwrap_or("storage GC");
-                kept.push(entry);
                 report
                     .reasons
                     .push(format!("kept {uri}: storage IO error: {e} ({reason})"));
             }
-            None => kept.push(entry),
+            // No outcome for this candidate: nothing was proven, the entry
+            // stays — the same conservative outcome as an IO error.
+            None => {}
         }
     }
-    // The map re-indexes the survivors in one step (take/replace pair).
-    state.external.replace_all(kept);
+    let removed = state.external.remove_ids(&deleted_ids);
+    state.gc_storage_deleted_total += removed as u64;
+    report.deleted = removed;
     report.scanned = state.external.len() + report.deleted;
     report.anchor_roots_protected = plan.anchor_roots_protected;
     report.anchor_root_protections = plan.anchor_root_protections;
@@ -2045,6 +2052,151 @@ mod tests {
             "the deletable orphan leaves the map"
         );
         assert_eq!(state.gc_storage_deleted_total, 1);
+    }
+
+    /// R3 (2026-09-14 review): a zero-deletion commit — no candidates at
+    /// all — must not touch the map's structure. The old take_all →
+    /// replace_all round-trip cleared every recorded card claim, so even a
+    /// no-op pass made the next capture re-serialize metadata nobody had
+    /// changed.
+    #[test]
+    fn zero_candidate_gc_keeps_every_recorded_card_claim() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = store_config(dir.path());
+        let mut state = State::default();
+        let ids: Vec<ContextItemId> = (0..3).map(|_| ContextItemId::new()).collect();
+        for (i, id) in ids.iter().enumerate() {
+            let item = test_item(*id, &format!("live content {i}"));
+            let reference = externalize(dir.path(), &item).unwrap();
+            state
+                .external
+                .push(to_external_entry(&item, reference, 1, 1, None));
+            state.external.record_card(*id, format!("hash{i:012}"));
+        }
+        assert_eq!(state.external.recorded_cards(), 3, "setup recorded all");
+
+        let plan = plan_storage_gc(&state, &config, 2, &[], true, true);
+        assert!(plan.candidates.is_empty(), "nothing is dead yet");
+        let report = commit_storage_gc(&mut state, plan, Vec::new());
+        assert_eq!(report.deleted, 0);
+        assert_eq!(report.scanned, 3, "the pass still reports what it saw");
+        for (i, id) in ids.iter().enumerate() {
+            assert!(
+                state.external.card_hash(*id).is_some(),
+                "entry {i}'s card claim survives a no-op GC"
+            );
+        }
+        assert_eq!(
+            state.external.recorded_cards(),
+            3,
+            "every claim survives: the next capture re-serializes nothing"
+        );
+    }
+
+    /// R3: a deferred pass (incomplete root enumeration) deletes nothing by
+    /// decision — the commit must stay observation-only and keep every
+    /// card claim exactly like the zero-candidate case.
+    #[test]
+    fn deferred_deletion_keeps_every_recorded_card_claim() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = store_config(dir.path());
+        let mut state = State::default();
+        let ids: Vec<ContextItemId> = (0..3).map(|_| ContextItemId::new()).collect();
+        for (i, id) in ids.iter().enumerate() {
+            let item = test_item(*id, &format!("live content {i}"));
+            let reference = externalize(dir.path(), &item).unwrap();
+            state
+                .external
+                .push(to_external_entry(&item, reference, 1, 1, None));
+            state.external.record_card(*id, format!("hash{i:012}"));
+        }
+
+        let plan = plan_storage_gc(&state, &config, 2, &[], false, true);
+        assert!(plan.deletion_deferred, "incomplete roots defer");
+        assert!(plan.candidates.is_empty());
+        let report = commit_storage_gc(&mut state, plan, Vec::new());
+        assert_eq!(report.deleted, 0);
+        assert!(
+            report
+                .reasons
+                .iter()
+                .any(|row| row.contains("deletion deferred")),
+            "the deferral is still reported: {:?}",
+            report.reasons
+        );
+        for (i, id) in ids.iter().enumerate() {
+            assert!(
+                state.external.card_hash(*id).is_some(),
+                "entry {i}'s card claim survives the deferred pass"
+            );
+        }
+        assert_eq!(state.external.recorded_cards(), 3);
+    }
+
+    /// R3: a partial deletion updates only the proven ids. The removed
+    /// entries' card claims die with them; every survivor keeps its claim
+    /// and its index rows, so the next capture re-serializes only what
+    /// actually changed (nothing) — not the whole map.
+    #[test]
+    fn partial_deletion_keeps_survivor_card_claims() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = store_config(dir.path());
+        let mut state = State::default();
+        let mut ids = Vec::new();
+        for i in 0..2 {
+            let id = ContextItemId::new();
+            let item = test_item(id, &format!("live content {i}"));
+            let reference = externalize(dir.path(), &item).unwrap();
+            state
+                .external
+                .push(to_external_entry(&item, reference, 1, 1, None));
+            state.external.record_card(id, format!("livehash{i:08}"));
+            ids.push(id);
+        }
+        for i in 0..2 {
+            let id = ContextItemId::new();
+            let mut item = test_item(id, &format!("dead content {i}"));
+            item.semantic = SemanticState::Tombstoned;
+            let reference = externalize(dir.path(), &item).unwrap();
+            // externalized at tick 0: aged past the storage TTL at tick 40.
+            state
+                .external
+                .push(to_external_entry(&item, reference, 0, 1, None));
+            state.external.record_card(id, format!("deadhash{i:08}"));
+            ids.push(id);
+        }
+        assert_eq!(state.external.recorded_cards(), 4, "setup recorded all");
+
+        let plan = plan_storage_gc(&state, &config, 40, &[], true, true);
+        assert_eq!(
+            plan.candidates.len(),
+            2,
+            "only the two dead entries are candidates"
+        );
+        let io: Vec<(ContextItemId, Result<DeleteOutcome, std::io::Error>)> = plan
+            .candidates
+            .iter()
+            .map(|(id, _)| (*id, Ok(DeleteOutcome::Deleted)))
+            .collect();
+        let report = commit_storage_gc(&mut state, plan, io);
+        assert_eq!(report.deleted, 2);
+        assert_eq!(state.external.len(), 2, "only the candidates left");
+        assert!(
+            state.external.card_hash(ids[0]).is_some()
+                && state.external.card_hash(ids[1]).is_some(),
+            "survivor card claims stay valid"
+        );
+        assert!(
+            state.external.card_hash(ids[2]).is_none()
+                && state.external.card_hash(ids[3]).is_none(),
+            "a removed entry's claim dies with it"
+        );
+        assert_eq!(
+            state.external.recorded_cards(),
+            2,
+            "exactly the survivors' claims remain"
+        );
+        assert_eq!(state.gc_storage_deleted_total, 2);
     }
 
     #[test]
