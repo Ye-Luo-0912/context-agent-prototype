@@ -1229,31 +1229,44 @@ fn try_connect_once(endpoint: &LocalEndpoint) -> bool {
 }
 
 /// The stop-path assertion: set the cooperative stop flag, poke the parked
-/// accept loop with one throwaway connection (the same stop/wake mechanism
+/// accept loop with throwaway connections (the same stop/wake mechanism
 /// the real Ctrl-C path uses — msys cannot deliver CTRL_C), and require the
 /// serve thread to have exited `Ok` within `bound`. Returns the elapsed
 /// time and the registry so callers can assert post-shutdown facts.
+///
+/// The pokes are fire-and-forget on purpose: if the endpoint stops accepting
+/// because the serve loop already exited on its own, the join below is the
+/// referee and surfaces the thread's actual outcome — a poke must never
+/// spin out a connect budget on a dead pipe and panic ahead of that verdict.
 async fn stop_and_join_bounded(
     server: TestServer,
     bound: std::time::Duration,
 ) -> anyhow::Result<(std::time::Duration, Arc<WorkControlSessionRegistry>)> {
     let started = std::time::Instant::now();
     server.stop.store(true, Ordering::SeqCst);
-    let _ = connect(&server.endpoint).await;
+    let poke = {
+        let endpoint = server.endpoint.clone();
+        tokio::spawn(async move {
+            while !try_connect_once(&endpoint) {
+                tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+            }
+        })
+    };
     let (done_tx, done_rx) = std::sync::mpsc::channel();
     std::thread::spawn(move || {
         let _ = done_tx.send(server.serve.join());
     });
-    match done_rx.recv_timeout(bound) {
-        Ok(joined) => {
-            joined.map_err(|_| anyhow::anyhow!("serve thread panicked"))??;
-            Ok((started.elapsed(), server.registry))
-        }
+    let verdict = match done_rx.recv_timeout(bound) {
+        Ok(joined) => joined
+            .map_err(|_| anyhow::anyhow!("serve thread panicked"))?
+            .map(|()| (started.elapsed(), server.registry)),
         Err(_) => Err(anyhow::anyhow!(
             "serve loop did not exit within {bound:?} (still running after {:?})",
             started.elapsed()
         )),
-    }
+    };
+    poke.abort();
+    verdict
 }
 
 /// Polls until every installed session grant has been revoked (the
