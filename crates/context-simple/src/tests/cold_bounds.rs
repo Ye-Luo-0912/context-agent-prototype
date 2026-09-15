@@ -298,3 +298,68 @@ async fn a_cold_collection_larger_than_the_hot_budget_stays_bounded_and_resumabl
         );
     }
 }
+
+/// T4 第二期（热/冷双向驻留）：热目录满员（16）后，新的外置增长把
+/// 最旧的已卡片化条目降级回 pending 目录（card 在盘、(id,hash) 行随
+/// 队）；热目录保持在上限内，被降级的 id 经 per-id 服务仍可取回，
+/// owner 一个不丢。无降级钩子时热目录涨到 19（红）。
+#[tokio::test]
+async fn externalize_growth_demotes_the_oldest_carded_entries_back_to_pending() {
+    let dir = tempfile::tempdir().unwrap();
+    let (_, value, ids) = captured_history(&dir).await;
+    assert_eq!(ids.len(), COLD_TOTAL);
+    let engine = SimpleContextEngine::new(cold_bounds_config(&dir));
+    engine.restore(value).await.unwrap();
+    let _ = engine
+        .search_external(ContextSearchQuery::new("unique-token", 8))
+        .await
+        .unwrap();
+    {
+        let state = engine.state.lock().await;
+        assert_eq!(state.external.len(), HOT_METADATA_CAP, "setup: hot at cap");
+    }
+
+    // 新的外置增长（无卡片——checkpoint 未再运行）。
+    let fresh = externalize_n(&engine, 3).await;
+
+    // 旅程继续：GC 提交后降级最旧的已卡片化条目（oldest-first，跳过
+    // pinned 与无 claim 的条目）。
+    let report = engine.gc().await.unwrap();
+    {
+        let state = engine.state.lock().await;
+        assert!(
+            state.external.len() <= HOT_METADATA_CAP,
+            "demotion must trim the hot directory back to the cap: {} (report {report:?})",
+            state.external.len()
+        );
+        // 新的无卡片条目留在热目录（无 card claim 可降级）。
+        for id in &fresh {
+            assert!(
+                state.external.get(*id).is_some(),
+                "uncarded fresh entries stay hot"
+            );
+        }
+        // 被降级的最旧条目进入 pending 目录，且经 per-id 服务仍可取回。
+        for (index, id) in ids.iter().enumerate().take(3) {
+            assert!(
+                state
+                    .pending_external_cards
+                    .iter()
+                    .any(|(pending_id, _)| pending_id == id),
+                "the oldest carded entry {index} must be demoted to pending"
+            );
+            assert!(state.external.get(*id).is_none());
+            let fetched = engine.fetch_external(*id).await.unwrap().unwrap();
+            assert!(
+                fetched.content.contains(&format!("unique-token-{index}")),
+                "the demoted body is the captured one"
+            );
+        }
+        // owner 总量守恒：热 + pending = 全历史。
+        assert_eq!(
+            state.external.len() + state.pending_external_cards.len(),
+            COLD_TOTAL,
+            "no owner is lost across demotion"
+        );
+    }
+}

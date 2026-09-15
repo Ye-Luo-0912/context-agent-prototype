@@ -58,6 +58,22 @@ pub(crate) struct ExternalMap {
     catalog_rebuild: bool,
 }
 
+/// Per-entry byte weight for the hot-metadata caps (same shape the
+/// map-level estimate sums).
+fn entry_metadata_bytes_estimate(entry: &ExternalizedContext) -> u64 {
+    const FIXED_PER_ENTRY: u64 = 256;
+    const FIXED_PER_DEPENDENCY: u64 = 64;
+    FIXED_PER_ENTRY
+        + entry.context_ref.uri.len() as u64
+        + entry.context_ref.summary.len() as u64
+        + entry
+            .entities
+            .iter()
+            .map(|entity| entity.len() as u64 + 1)
+            .sum::<u64>()
+        + entry.dependencies.len() as u64 * FIXED_PER_DEPENDENCY
+}
+
 impl ExternalMap {
     pub(crate) fn new() -> Self {
         Self::default()
@@ -265,6 +281,70 @@ impl ExternalMap {
         // partial index update would risk drifting on the entity buckets).
         self.rebuild_indexes();
         removed
+    }
+
+    /// T4 second stage (hot/cold bidirectional residency): return overflow
+    /// entries to the pending directory. Removes the OLDEST entries that
+    /// carry a card claim (skipping pinned and claim-less entries) while
+    /// the map is over `max_entries` or the metadata-byte estimate is over
+    /// `max_bytes`, and returns their `(id, card hash)` rows for the
+    /// caller's pending directory.
+    ///
+    /// The card claim is deliberately KEPT: the on-disk card still
+    /// describes the entry byte-for-byte (demotion changes residency, not
+    /// metadata), and the pending row carries the same hash, so a later
+    /// hydration re-reads exactly that card. Counters, entity/id indexes
+    /// and catalog-dirty marks are all maintained here (the named-operation
+    /// rule) — the caller only appends the returned rows to its pending
+    /// queue.
+    pub(crate) fn demote_overflow(
+        &mut self,
+        max_entries: usize,
+        max_bytes: u64,
+    ) -> Vec<(ContextItemId, String)> {
+        let mut demoted: Vec<(ContextItemId, String)> = Vec::new();
+        let mut bytes = self.metadata_bytes_estimate();
+        let mut index = 0usize;
+        while self.entries.len() > max_entries || bytes > max_bytes {
+            if index >= self.entries.len() {
+                break; // the rest cannot be demoted (no claim / pinned / live)
+            }
+            let entry = &self.entries[index];
+            let pinned = self.pinned_ids.contains(&entry.item_id);
+            let carded = self.card_hashes.contains_key(&entry.item_id);
+            if pinned || !carded {
+                index += 1;
+                continue;
+            }
+            let (cold_delta, external_delta) = match entry.residency {
+                ContextResidency::Cold => (1usize, 0usize),
+                ContextResidency::External => (0usize, 1usize),
+                ContextResidency::Resident | ContextResidency::Warm => (0usize, 0usize),
+            };
+            self.cold_entries = self.cold_entries.saturating_sub(cold_delta);
+            self.external_entries = self.external_entries.saturating_sub(external_delta);
+            let (id, hash) = (
+                entry.item_id,
+                self.card_hashes
+                    .get(&entry.item_id)
+                    .cloned()
+                    .unwrap_or_default(),
+            );
+            bytes = bytes.saturating_sub(entry_metadata_bytes_estimate(entry));
+            self.entries.remove(index);
+            demoted.push((id, hash));
+            // Do not advance `index`: the next entry moved into this slot.
+        }
+        if demoted.is_empty() {
+            return demoted;
+        }
+        // Slot indexes must be rebuilt after mid-vec removals; the demoted
+        // ids leave the catalog (they are pending rows now, not hot ones).
+        self.rebuild_indexes();
+        for (id, _) in &demoted {
+            self.mark_catalog(*id);
+        }
+        demoted
     }
 
     /// Take the map out for wholesale entry editing (task-completion

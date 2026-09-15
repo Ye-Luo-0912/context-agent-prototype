@@ -2196,7 +2196,22 @@ impl ContextEngine for SimpleContextEngine {
         drop(state);
         let io = full::run_store_io(&self.config, &mut plan).await;
         let mut state = self.state.lock().await;
-        Ok(full::commit_full_gc(&mut state, now_tick, plan, io))
+        let report = full::commit_full_gc(&mut state, now_tick, plan, io);
+        // T4 second stage (hot/cold bidirectional residency): externalize
+        // is the growth path of the hot directory. Entries whose metadata
+        // already sits on a spill card are returned to the pending
+        // directory here, so the hot map stays bounded even when history
+        // keeps growing; the card claim and the (id, hash) row survive, so
+        // per-id fetch and the next budgeted hydration still see them.
+        let demoted = state.external.demote_overflow(
+            self.config.external_hot_metadata_max_entries,
+            self.config.external_hot_metadata_max_bytes,
+        );
+        if !demoted.is_empty() {
+            state.pending_external_cards.extend(demoted);
+            state.sync_catalog();
+        }
+        Ok(report)
     }
 
     async fn reconcile_store(&self) -> AgentResult<StoreReconcileReport> {
