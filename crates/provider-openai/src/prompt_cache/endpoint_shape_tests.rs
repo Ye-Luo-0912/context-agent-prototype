@@ -136,15 +136,12 @@ fn legacy_boundary_hint_matches_the_official_content_block_shape() {
     );
 }
 
-/// ENDPOINT SHAPE DIVERGENCE (recorded, NOT silently changed): a DECLARED
-/// breakpoint on a message whose content is still a plain string is attached
-/// as `input[i].prompt_cache_breakpoint` — an input-item sibling. The
-/// official documented shape has no item-level form: the breakpoint must sit
-/// on a supported content block, which plain string content cannot host.
-/// The local capture acceptance suite pins this sibling form as "the
-/// DECLARED shape"; real-endpoint schema confirmation belongs to T8.
+/// S2b: a DECLARED breakpoint on a message with plain string content is
+/// rewritten into the official content-block form — the string becomes an
+/// `input_text` block carrying the breakpoint, matching the documented
+/// placement (no input-item sibling form).
 #[test]
-fn declared_breakpoint_on_string_content_diverges_from_the_official_shape() {
+fn declared_breakpoint_on_string_content_matches_the_official_shape() {
     let mut request = boundary_request();
     // No valid boundary is needed for the declared path; drop the hint so
     // the message content stays a plain string.
@@ -153,35 +150,31 @@ fn declared_breakpoint_on_string_content_diverges_from_the_official_shape() {
     request.cache_breakpoints = vec![1];
     let wire = mapped(&request);
     let item = &wire["input"][1];
-    assert_eq!(item["content"].as_str(), Some("stable evidence"));
+    assert!(
+        item.get("prompt_cache_breakpoint").is_none(),
+        "no sibling breakpoint on the input item: {item}"
+    );
+    let content = item["content"]
+        .as_array()
+        .expect("content is a block array");
     assert_eq!(
-        item.get("prompt_cache_breakpoint"),
-        Some(&json!({"mode": "explicit"})),
-        "current mapper output: the breakpoint rides on the input item as a sibling"
+        content[0]["type"], "input_text",
+        "string content is rewritten into a content block"
     );
-    assert!(
-        item["content"].as_array().is_none(),
-        "the content was NOT rewritten into blocks, so no content block hosts the breakpoint"
-    );
-    // Contrast: the official shape cannot express this placement at all.
-    let official = official_documented_shape();
-    assert!(
-        official["input"].as_array().unwrap().iter().all(|item| {
-            item.get("prompt_cache_breakpoint").is_none() && item["content"].as_array().is_some()
-        }),
-        "the documented shape hosts breakpoints only on content blocks"
+    assert_eq!(
+        content[0]["prompt_cache_breakpoint"],
+        json!({"mode": "explicit"}),
+        "the breakpoint is a field of the content block — the documented placement"
     );
 }
 
-/// ENDPOINT SHAPE DIVERGENCE (recorded, NOT silently changed): a DECLARED
-/// breakpoint on a tool result is attached as a sibling of the
-/// `function_call_output` item with a plain string `output`, while the
-/// documented shape carries breakpoints inside a content-block `output`
-/// array (and community reports say item-level placements on
-/// `function_call_output` may be accepted without ever caching). T8 owns
-/// the real-endpoint confirmation.
+/// S2b: a DECLARED breakpoint on a tool result item (`function_call_output`
+/// has `output`, not `content`) keeps the sibling placement — the mapper's
+/// content-block rewrite targets `content`, which `function_call_output`
+/// items don't carry. The sibling form on `function_call_output` is the
+/// only expressible shape; T8 owns the real-endpoint confirmation.
 #[test]
-fn declared_breakpoint_on_tool_output_diverges_from_the_official_shape() {
+fn declared_breakpoint_on_tool_output_keeps_the_sibling_placement() {
     let mut request = boundary_request();
     request.metadata = json!({});
     request
@@ -192,13 +185,17 @@ fn declared_breakpoint_on_tool_output_diverges_from_the_official_shape() {
     let wire = mapped(&request);
     let last = wire["input"].as_array().unwrap().last().unwrap();
     assert_eq!(last["type"], "function_call_output");
-    assert_eq!(
-        last.get("prompt_cache_breakpoint"),
-        Some(&json!({"mode": "explicit"})),
-        "current mapper output: the breakpoint is a sibling of the function_call_output item"
+    let output_blocks = last["output"]
+        .as_array()
+        .expect("tool output is a block array");
+    assert!(
+        output_blocks
+            .iter()
+            .any(|block| block.get("prompt_cache_breakpoint").is_some()),
+        "the tool output content block carries the breakpoint"
     );
     assert!(
-        last["output"].as_str().is_some(),
-        "the output stays a plain string — no content block hosts the breakpoint"
+        last.get("prompt_cache_breakpoint").is_none(),
+        "no sibling breakpoint on the function_call_output item itself"
     );
 }

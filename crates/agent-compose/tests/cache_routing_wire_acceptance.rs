@@ -212,10 +212,11 @@ fn item_text(item: &Value) -> String {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum BreakpointForm {
-    /// `input[i].prompt_cache_breakpoint` — the DECLARED per-item shape.
+    /// The pre-S2b sibling form (input item level, not the documented
+    /// placement). Kept as a variant for legacy-capture detection.
     SiblingField,
-    /// `input[i].content[k].prompt_cache_breakpoint` — the LEGACY
-    /// whole-frame reuse-boundary shape (rewritten content array).
+    /// `input[i].content[k].prompt_cache_breakpoint` — the official
+    /// content-block shape (the breakpoint sits on a supported block).
     ContentPart,
 }
 
@@ -564,8 +565,8 @@ async fn routing_keys_route_by_task_and_lane_on_the_wire() {
         assert!(b0 < b1, "B0 (stable policy end) precedes B1 (evidence end)");
         assert_eq!(
             (b0_form, b1_form),
-            (BreakpointForm::SiblingField, BreakpointForm::SiblingField),
-            "declared breakpoints map per item as sibling fields, never through the legacy content-array rewrite"
+            (BreakpointForm::ContentPart, BreakpointForm::ContentPart),
+            "declared breakpoints map onto content blocks (the official shape)"
         );
         let b1_text = item_text(&input[b1]);
         assert!(
@@ -750,13 +751,24 @@ async fn empty_stable_set_first_request_declares_only_b0_in_the_declared_shape()
     let positions = breakpoint_positions(&body);
     assert_eq!(
         positions,
-        vec![(1, BreakpointForm::SiblingField)],
-        "an empty stable set declares exactly B0 as a per-item sibling field: {positions:?}"
+        vec![(1, BreakpointForm::ContentPart)],
+        "an empty stable set declares exactly B0 in the content-block form: {positions:?}"
     );
     let input = body["input"].as_array().unwrap();
-    assert!(
-        input[1]["content"].is_string(),
-        "the declared shape keeps the message content intact (no legacy content-array rewrite)"
+    // S2b: the declared breakpoint rewrites string content into the
+    // official content-block form — an `input_text` block carrying the
+    // breakpoint.
+    let b0_content = input[1]["content"]
+        .as_array()
+        .expect("B0 content is a block array");
+    assert_eq!(
+        b0_content[0]["type"], "input_text",
+        "the B0 block is an input_text content block"
+    );
+    assert_eq!(
+        b0_content[0]["prompt_cache_breakpoint"],
+        json!({"mode": "explicit"}),
+        "the B0 block carries the declared breakpoint"
     );
     assert!(input.len() > 2, "a volatile tail exists beyond B0");
     let mut turn_text_after_b0 = false;

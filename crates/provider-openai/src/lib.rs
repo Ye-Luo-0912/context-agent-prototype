@@ -1046,17 +1046,64 @@ fn build_responses_wire_request(
         // which fail the boundary validation instead.
         if declared_breakpoints.remove(&message_index) && input.len() > first_new_item {
             let last = input.len() - 1;
-            if let Some(content) = input[last]
-                .get_mut("content")
-                .and_then(|content| content.as_array_mut())
-                && let Some(last_text) = content
-                    .iter_mut()
-                    .find(|part| part.get("type").and_then(Value::as_str) == Some("input_text"))
-            {
-                last_text["prompt_cache_breakpoint"] = json!({"mode": "explicit"});
-                continue;
+            // S2b (continuation review 258eb4eb R5): the breakpoint belongs
+            // on a supported content block (the documented shape), never as
+            // a sibling field on the input item. String content is
+            // rewritten into a single `input_text` block carrying the
+            // breakpoint; array content gets the breakpoint on the last
+            // `input_text` block.
+            let is_tool_output =
+                input[last].get("type").and_then(Value::as_str) == Some("function_call_output");
+            if is_tool_output && let Some(output) = input[last].get_mut("output") {
+                // S2b: function_call_output items carry `output` (not
+                // `content`). The documented shape wraps tool output in a
+                // content-block array with the breakpoint on the block.
+                match output.take() {
+                    Value::String(text) => {
+                        *output = json!([{
+                            "type": "output_text",
+                            "text": text,
+                            "prompt_cache_breakpoint": {"mode": "explicit"},
+                        }]);
+                    }
+                    other => {
+                        *output = other;
+                        input[last]["prompt_cache_breakpoint"] = json!({"mode": "explicit"});
+                    }
+                }
+            } else if let Some(content) = input[last].get_mut("content") {
+                match content.take() {
+                    Value::Array(mut blocks) => {
+                        let mut placed = false;
+                        for block in blocks.iter_mut().rev() {
+                            if block.get("type").and_then(Value::as_str) == Some("input_text") {
+                                block["prompt_cache_breakpoint"] = json!({"mode": "explicit"});
+                                placed = true;
+                                break;
+                            }
+                        }
+                        *content = Value::Array(blocks);
+                        if placed {
+                            continue;
+                        }
+                        // No input_text block to host the breakpoint: keep
+                        // the sibling as a fallback for items the official
+                        // content-block form cannot express.
+                        input[last]["prompt_cache_breakpoint"] = json!({"mode": "explicit"});
+                    }
+                    Value::String(text) => {
+                        *content = json!([{
+                            "type": "input_text",
+                            "text": text,
+                            "prompt_cache_breakpoint": {"mode": "explicit"},
+                        }]);
+                    }
+                    other => {
+                        *content = other;
+                        input[last]["prompt_cache_breakpoint"] = json!({"mode": "explicit"});
+                    }
+                }
             }
-            input[last]["prompt_cache_breakpoint"] = json!({"mode": "explicit"});
         }
     }
 
