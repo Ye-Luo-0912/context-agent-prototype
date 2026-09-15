@@ -24,11 +24,13 @@ declared 多断点仍放 input item sibling；旧单断点分支反而已是 con
 
 ## 第三批（S3 主体能力）
 
-### S3 — 固定预算冷目录闭环（B，context-simple）
+### S3 — 固定预算冷目录闭环（B，context-simple）——已关闭（2026-09-15）
 T4 一期/二期已有预算与降级，但"有界"仍是局部控制（续审 R3/R4）：(a) deadline 只在批间检查，单次读取不被剩余期限约束；(b) 批 take 按条数不按剩余字节预留；(c) per-id fetch/inspect 绕过热上限可无限扩大热表；(d) demote 跳过 pinned/无 claim，无可降级项时不报告背压；(e) 非空搜索命中丢掉 HydrationOutcome——1 命中/limit 20/大量未读页时模型看到普通结果无覆盖缺口。收口方向：统一安装/读后驻留/降级/预算结算到同一 metadata-residency 入口；搜索结果沿引擎→服务→Core→模型正文传 hits+coverage+remaining+stop_reason（复用 HydrationOutcome）；固定预算下连续访问不同冷页仍可取正文且热资源受控或明确背压；续查真正推进到后续冷页（不反复撞同一满员热表）。命名收口：`hydrate_all_pending_cards` 已不保证读完全部 pending——改名或契约化（不追加历史补丁注释）。
+落地回执：[S3_FIXED_BUDGET_COLD_DIR_RECEIPT](reviews/2026-09-15-continuation-review-258eb4eb/S3_FIXED_BUDGET_COLD_DIR_RECEIPT.md)。单次读取进剩余 deadline（超时保持 pending owner、`HydrationStop::Deadline`）；安装前按估算字节预留、装不下保持可寻址 pending；`ExternalMap::stamp_access` 保 claim（根因：get_mut 访问戳杀 claim 使读过条目不可降级）+ 统一 `settle_metadata_residency` + `demote_overflow` 类型化 `DemoteOutcome`/`hot_metadata_backpressure`；搜索沿引擎→Core→模型正文传 coverage+continuation（坏页不挡后续页、续查累积 skip 收敛）；`hydrate_all_pending_cards` → `hydrate_pending_cards_within_budget`。context-simple 414/0、clippy 0、7 条新反例红→绿。限制（wire 层 coverage、续查 token 不进 checkpoint、pending 目录仍随历史增长）见回执。
 
-### S4 — T7 补进程边界与指令传递证据（A，agent-host）
+### S4 — T7 补进程边界与指令传递证据（A，agent-host）——已关闭（2026-09-15）
 现旅程的同进程重组保留，但补两个证据：(a) 独立进程变体——用已有 host 二进制新 OS 进程（不同 PID）、确认前一进程退出、从磁盘恢复同 TaskId/lineage 继续；(b) 纠正传递证据——唯一标记的 steer 指令，脚本 provider 检查实际收到的请求确实包含该标记与任务约束（缺失即拒绝推进），恢复后的请求也断言包含正确剩余义务。不换真实付费模型。
+落地回执：[S4_PROCESS_AND_STEER_EVIDENCE_RECEIPT](reviews/2026-09-15-continuation-review-258eb4eb/S4_PROCESS_AND_STEER_EVIDENCE_RECEIPT.md)。新测试 `host_process_variant`（named pipe/UDS 双入口）：真实 host 二进制两进程、`pid confirmed gone` 后新进程接管 stale host.lock、`work/restore` 携带被杀进程 RunId、同 TaskId 重聚焦且无效果重放；脚本 provider 纯函数门禁（缺目标/缺标记/恢复后缺剩余义务即拒绝），写入内容由请求体内实际送达的 token 派生。host 套件 31/0、clippy 0、进程变体 3 次重复全绿。限制（同进程旅程保留、watchdog 全路径不声称、unix 入口未本机运行）见回执。
 
 ## T1–T7 完成记录（历史）
 
