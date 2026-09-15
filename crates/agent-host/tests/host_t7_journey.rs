@@ -657,6 +657,31 @@ async fn drive_turn_to_idle<S: Read + Write>(
     }
 }
 
+/// Waits for a committed fs.write artifact. The approval decision is
+/// `Delivered` before the effect commit is observed, so the two quiet
+/// snapshots `wait_turn_parked` needs can both land inside that gap on a
+/// loaded runner; poll for the durable artifact instead of racing it.
+async fn wait_file_content(
+    path: &std::path::Path,
+    expected: &str,
+    what: &str,
+) -> anyhow::Result<()> {
+    let deadline = std::time::Instant::now() + Duration::from_secs(30);
+    loop {
+        if std::fs::read_to_string(path)
+            .map(|content| content == expected)
+            .unwrap_or(false)
+        {
+            return Ok(());
+        }
+        anyhow::ensure!(
+            std::time::Instant::now() < deadline,
+            "the committed effect never landed for {what}"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+}
+
 /// Waits until the turn is RUNNING with nothing pending approval — twice in
 /// a row — which means the scripted model holds the turn open in its parked
 /// round. From this point the turn cannot end by itself, so a mid-turn
@@ -794,15 +819,12 @@ async fn same_task_journey(endpoint: LocalEndpoint) -> anyhow::Result<()> {
         //    the write parks in the interactive approval gate until this client
         //    answers on the wire; then the model reaches its parked round.
         wait_turn_parked(&mut stream).await?;
-        assert!(
-            root.join("part_a.md").exists(),
-            "part_a.md must be a real workspace artifact before the correction"
-        );
-        assert_eq!(
-            std::fs::read_to_string(root.join("part_a.md"))?,
+        wait_file_content(
+            &root.join("part_a.md"),
             PART_A,
-            "the model's fs.write landed the real file"
-        );
+            "part_a.md must be a real workspace artifact before the correction",
+        )
+        .await?;
         assert!(!root.join("part_b.md").exists());
 
         // 3. MID-TURN CORRECTION: the steer rides the running turn's single
