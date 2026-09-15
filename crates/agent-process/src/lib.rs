@@ -38,6 +38,11 @@ pub use host::{
     MAX_SYSTEM_REQUESTS_PER_CALL, PROTOCOL_VERSION, ProcessHost, ProcessHostConfig, ProcessSandbox,
     SystemBroker, kill_process_tree, probe_siblings, resolve_program,
 };
+// `offered_features` is part of this crate's public config surface, so the
+// feature type is re-exported with it: callers in roles that may not name the
+// wire layer directly (context-adapter) construct it through this path and
+// keep their dependency matrix clean.
+pub use agent_platform_protocol::ActiveFeatures;
 #[cfg(unix)]
 pub use host::{apply_unix_rlimits, close_inherited_fds};
 #[cfg(target_os = "linux")]

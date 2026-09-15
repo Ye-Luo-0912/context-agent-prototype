@@ -489,7 +489,6 @@ name = "context-contextcore"
 version = "0.1.0"
 dependencies = [
  "agent-contracts",
- "agent-platform-protocol",
  "agent-process",
  "async-trait",
  "serde",

@@ -157,7 +157,7 @@ impl ContextServiceAdapter {
             // pong advertises what IT supports and the host intersects;
             // a service that did not advertise it leaves
             // `search_external_report` explicitly Unsupported.
-            offered_features: agent_platform_protocol::ActiveFeatures::new(vec![
+            offered_features: agent_process::ActiveFeatures::new(vec![
                 FEATURE_CONTEXT_SEARCH_REPORT.to_string(),
             ])
             .unwrap_or_default(),
