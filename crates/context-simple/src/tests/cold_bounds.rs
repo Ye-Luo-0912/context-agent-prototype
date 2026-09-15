@@ -324,7 +324,15 @@ async fn externalize_growth_demotes_the_oldest_carded_entries_back_to_pending() 
 
     // 旅程继续：GC 提交后降级最旧的已卡片化条目（oldest-first，跳过
     // pinned 与无 claim 的条目）。
+    //
+    // S1 (2026-09-15 review): the assertions below MUST NOT hold the state
+    // guard across `fetch_external` — that engine method re-acquires the
+    // same lock internally (hydrate_card_for), so holding the guard across
+    // the call is a deterministic self-deadlock (CI run 34917761534). The
+    // scope is split: snapshot under the lock, fetch through the public
+    // engine API with the guard released, re-lock to verify.
     let report = engine.gc().await.unwrap();
+    let demoted_ids: Vec<agent_contracts::ContextItemId> = ids.iter().copied().take(3).collect();
     {
         let state = engine.state.lock().await;
         assert!(
@@ -339,8 +347,8 @@ async fn externalize_growth_demotes_the_oldest_carded_entries_back_to_pending() 
                 "uncarded fresh entries stay hot"
             );
         }
-        // 被降级的最旧条目进入 pending 目录，且经 per-id 服务仍可取回。
-        for (index, id) in ids.iter().enumerate().take(3) {
+        // 被降级的最旧条目进入 pending 目录（此处只快照，不调用引擎）。
+        for (index, id) in demoted_ids.iter().enumerate() {
             assert!(
                 state
                     .pending_external_cards
@@ -349,17 +357,53 @@ async fn externalize_growth_demotes_the_oldest_carded_entries_back_to_pending() 
                 "the oldest carded entry {index} must be demoted to pending"
             );
             assert!(state.external.get(*id).is_none());
-            let fetched = engine.fetch_external(*id).await.unwrap().unwrap();
+        }
+    }
+    // Guard released: per-id fetch through the public engine API. Each
+    // demoted id pages its own card in and returns the captured body.
+    for (index, id) in demoted_ids.iter().enumerate() {
+        let fetched = engine.fetch_external(*id).await.unwrap().unwrap();
+        assert!(
+            fetched.content.contains(&format!("unique-token-{index}")),
+            "the demoted body is the captured one"
+        );
+    }
+    // owner 集合守恒（S1: 集合比较替代总数——排除丢一条又重复一条）：
+    // 旧 ids ∪ fresh ids 恰好等于热目录 ∪ pending 目录，且热与 pending
+    // 不重叠。本轨迹无删除，共 COLD_TOTAL + 3 个 owner。
+    {
+        let state = engine.state.lock().await;
+        let mut expected: std::collections::HashSet<agent_contracts::ContextItemId> =
+            ids.iter().copied().collect();
+        expected.extend(fresh.iter().copied());
+        let hot: std::collections::HashSet<agent_contracts::ContextItemId> =
+            state.external.iter().map(|e| e.item_id).collect();
+        let pending: std::collections::HashSet<agent_contracts::ContextItemId> = state
+            .pending_external_cards
+            .iter()
+            .map(|(id, _)| *id)
+            .collect();
+        assert!(
+            hot.is_disjoint(&pending),
+            "hot and pending directories must not overlap"
+        );
+        let mut actual = hot.union(&pending).copied().collect::<Vec<_>>();
+        actual.sort_by_key(|id| ids.iter().position(|x| x == id).unwrap_or(usize::MAX));
+        let mut expected_vec: Vec<_> = expected.into_iter().collect();
+        expected_vec.sort_by_key(|id| ids.iter().position(|x| x == id).unwrap_or(usize::MAX));
+        assert_eq!(
+            actual.len(),
+            expected_vec.len(),
+            "no owner is lost or duplicated across demotion: hot {} + pending {} vs expected {}",
+            hot.len(),
+            pending.len(),
+            expected_vec.len()
+        );
+        for id in &expected_vec {
             assert!(
-                fetched.content.contains(&format!("unique-token-{index}")),
-                "the demoted body is the captured one"
+                hot.contains(id) || pending.contains(id),
+                "owner {id} must exist in exactly one directory"
             );
         }
-        // owner 总量守恒：热 + pending = 全历史。
-        assert_eq!(
-            state.external.len() + state.pending_external_cards.len(),
-            COLD_TOTAL,
-            "no owner is lost across demotion"
-        );
     }
 }

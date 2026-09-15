@@ -1,6 +1,6 @@
 # 可执行任务队列
 
-有效范围见 [CURRENT.md](CURRENT.md)。本文件只保留本阶段仍需动作的任务；历史缺陷描述、验证日志和已关闭细节只链接到原回执，不复制正文。任务依据：[下一阶段审查](reviews/2026-09-14-next-stage-review-4aaa8bea/REVIEW.md)（T 编号来自该报告；R1–R6 为其当前发现）。
+有效范围见 [CURRENT.md](CURRENT.md)。本文件只保留本阶段仍需动作的任务；历史缺陷描述、验证日志和已关闭细节只链接到原回执，不复制正文。任务依据：[下一阶段审查](reviews/2026-09-14-next-stage-review-4aaa8bea/REVIEW.md)（T 编号）＋[续审](reviews/2026-09-15-continuation-review-258eb4eb/REVIEW.md)（S 编号、R1–R6 为其发现；T1–T7 已关闭）。
 
 ## 接手规则
 
@@ -8,7 +8,29 @@
 
 **开工顺序：T1/T2/T3 并行（第一批）；T4/T6 并行（第二批）；T5 随组合点接入；T7 收尾；T8 条件任务。** 每片先写用户动作与目标反例，再做实现；可维护性边界（见审查报告「四个责任边界」节）随片交付，不另起全仓重写。
 
-## 第一批（并行）——已全部完成合入 main（2026-09-15，T1 `5292bad7`、T2 `a590522e`、T3 `a007f474`；CI run 待记录，T1/T2/T3 各自本地全量绿＋clippy 0）
+## S1 — 冷目录测试自锁（已关闭 2026-09-15）
+
+`externalize_growth_demotes…` 曾在持有 state guard 时调用 `fetch_external`（内部重取同一锁），确定性自锁（CI run `34917761534` 两 job 取消）。修复：锁内只快照、guard 释放后经公开 API fetch、重锁核对；owner 断言改为集合比较（旧∪新 vs 热∪pending，不重叠，替代单纯总数）。cold_bounds 2/2、B2 3/3 绿、clippy 0。
+
+## 第二批（S2 可并行修正）
+
+### S2a — 最终装箱身份/覆盖一致性（B/C，agent-runtime）
+`record_final_pack_drop` 允许异 ID 同路径/版本/范围覆盖被删正文且不记 miss；但被删 ID 仍留在 `required_item_ids`，最终 validate 报其缺失并中止——证据仍在帧内却结构性失败。修复：分开"物理记录是否仍存在"与"证据义务是否被覆盖"；由覆盖关系决定 miss 与义务承担者，不由"是否刚添加 miss"顺带决定身份清单。回归须走最终裁剪→覆盖计算→最终校验（含：同 ID 双层删一份、异 ID 覆盖、异版本不覆盖、真预算不足如实 miss）。不要清空 required IDs 或放宽 validator。
+
+### S2b — 官方缓存 mapper 协议一致性（C，provider-openai）
+declared 多断点仍放 input item sibling；旧单断点分支反而已是 content-block 形。按官方 Responses 文档（断点在受支持 content block 上）修正真实 mapper，fixture 断言正确形状；`endpoint_shape_tests` 现有的"差异 pin"测试翻转为正确形状断言。兼容网关方言（若确认）分开命名；未知能力端点继续不发送专属字段。这是本地可完成的协议修正，不等 T8 付费实验。
+
+## 第三批（S3 主体能力）
+
+### S3 — 固定预算冷目录闭环（B，context-simple）
+T4 一期/二期已有预算与降级，但"有界"仍是局部控制（续审 R3/R4）：(a) deadline 只在批间检查，单次读取不被剩余期限约束；(b) 批 take 按条数不按剩余字节预留；(c) per-id fetch/inspect 绕过热上限可无限扩大热表；(d) demote 跳过 pinned/无 claim，无可降级项时不报告背压；(e) 非空搜索命中丢掉 HydrationOutcome——1 命中/limit 20/大量未读页时模型看到普通结果无覆盖缺口。收口方向：统一安装/读后驻留/降级/预算结算到同一 metadata-residency 入口；搜索结果沿引擎→服务→Core→模型正文传 hits+coverage+remaining+stop_reason（复用 HydrationOutcome）；固定预算下连续访问不同冷页仍可取正文且热资源受控或明确背压；续查真正推进到后续冷页（不反复撞同一满员热表）。命名收口：`hydrate_all_pending_cards` 已不保证读完全部 pending——改名或契约化（不追加历史补丁注释）。
+
+### S4 — T7 补进程边界与指令传递证据（A，agent-host）
+现旅程的同进程重组保留，但补两个证据：(a) 独立进程变体——用已有 host 二进制新 OS 进程（不同 PID）、确认前一进程退出、从磁盘恢复同 TaskId/lineage 继续；(b) 纠正传递证据——唯一标记的 steer 指令，脚本 provider 检查实际收到的请求确实包含该标记与任务约束（缺失即拒绝推进），恢复后的请求也断言包含正确剩余义务。不换真实付费模型。
+
+## T1–T7 完成记录（历史）
+
+
 
 ### T1 — 统一最终装箱与发布（B/C 共享，单一集成人）
 
