@@ -1229,18 +1229,21 @@ impl RuntimeActor {
             match candidate.partition {
                 FinalPackPartition::SelectedBody => {
                     let dropped = materialized.items.remove(candidate.index);
+                    // S2a: whether a required miss was recorded (no covering
+                    // evidence) or the obligation was picked up by a covering
+                    // record, the physical record is gone from `items` — the
+                    // dropped id can no longer be required to be physically
+                    // present.
+                    materialized
+                        .required_item_ids
+                        .retain(|item_id| *item_id != dropped.item_id);
                     if record_final_pack_drop(
                         &mut materialized,
                         &dropped,
                         is_pack_required(&dropped),
                         active_anchor_revision,
                     ) {
-                        // The miss now carries the identity; the id list may
-                        // only name bodies still present in the frame, or
-                        // the final materialization validation would fence.
-                        materialized
-                            .required_item_ids
-                            .retain(|item_id| *item_id != dropped.item_id);
+                        // A required miss was appended (no covering evidence).
                     }
                     materialized
                         .selected
@@ -1251,15 +1254,20 @@ impl RuntimeActor {
                 }
                 FinalPackPartition::ForegroundBody => {
                     let dropped = materialized.foreground.remove(candidate.index);
+                    // S2a: same rule as SelectedBody — the physical record
+                    // is gone, so the dropped id leaves required_item_ids
+                    // whether a miss was recorded or coverage satisfied the
+                    // obligation.
+                    materialized
+                        .required_item_ids
+                        .retain(|item_id| *item_id != dropped.item_id);
                     if record_final_pack_drop(
                         &mut materialized,
                         &dropped,
                         is_pack_required(&dropped),
                         active_anchor_revision,
                     ) {
-                        materialized
-                            .required_item_ids
-                            .retain(|item_id| *item_id != dropped.item_id);
+                        // A required miss was appended.
                     }
                     materialized.approx_tokens = materialized
                         .approx_tokens

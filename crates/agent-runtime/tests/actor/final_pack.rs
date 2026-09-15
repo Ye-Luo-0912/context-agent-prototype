@@ -343,3 +343,65 @@ async fn final_pack_reports_a_required_miss_when_only_required_content_exceeds_t
         );
     }
 }
+
+/// S2a (continuation review 258eb4eb R2): two REQUIRED records with the
+/// same file window but different IDs. The budget drops one; the survivor
+/// covers the dropped one's evidence, so no `BudgetExcluded` miss is
+/// recorded — and the dropped id must leave `required_item_ids` even
+/// though no miss was recorded. Under the old code the id stayed (retain
+/// only fired on miss) and the final materialization validation fenced
+/// the round with "required item missing from the final frame".
+#[tokio::test]
+async fn covered_required_id_leaves_required_item_ids_without_structural_failure() {
+    let model = tiny_window_model();
+    // A: small, B: large — same file window, different ids.
+    let mut a = required_body();
+    a.file_path = Some("s2a.rs".into());
+    a.file_revision = Some("r1".into());
+    a.file_start_line = Some(1);
+    a.file_end_line = Some(50);
+    let mut b = required_body();
+    b.file_path = Some("s2a.rs".into());
+    b.file_revision = Some("r1".into());
+    b.file_start_line = Some(1);
+    b.file_end_line = Some(50);
+    b.content = format!("{}:{}", "B-BODY-MARKER", "b".repeat(2_000));
+    let id_a = a.item_id;
+    let engine = Arc::new(SplitFrameEngine::new(vec![a, b], Vec::new()));
+    let (handle, mut events) = spawn(model.clone(), engine).await;
+    handle.user_message("hello".into()).await.unwrap();
+    let seen = drain_turn(&mut events).await;
+
+    assert!(
+        seen.iter()
+            .any(|event| matches!(event, RuntimeEvent::TurnCompleted)),
+        "the round must publish honestly instead of fencing: {:?}",
+        required_misses_of(&seen)
+    );
+    // The wire request carries exactly one of the two records (the
+    // smaller one that fits); the larger one's evidence obligation is
+    // satisfied by the survivor's file-window coverage.
+    let requests = model.requests.lock().unwrap();
+    let sent = request_text(&requests[0]);
+    assert!(
+        sent.contains(&id_a.to_string()) || sent.contains("B-BODY-MARKER"),
+        "one of the two same-window records must reach the wire"
+    );
+    // No BudgetExcluded miss: the evidence is covered, not lost.
+    for event in seen.iter() {
+        if let RuntimeEvent::ContextDegraded {
+            required_misses, ..
+        } = event
+        {
+            assert_eq!(
+                required_misses.total(),
+                0,
+                "covered evidence must not produce a required miss"
+            );
+        }
+        assert!(
+            !matches!(event, RuntimeEvent::TurnCommitFailed { .. }),
+            "coverage satisfied the obligation; no fencing"
+        );
+    }
+}
