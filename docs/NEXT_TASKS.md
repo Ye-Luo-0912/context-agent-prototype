@@ -18,7 +18,8 @@
 required_item_ids 的清理在物理记录被移除时无条件执行（旧代码仅在记录 miss 时清理——异 ID 覆盖时 ID 残留导致 validate fence）。回归 `covered_required_id_leaves_required_item_ids_without_structural_failure` 红→绿。
 `record_final_pack_drop` 允许异 ID 同路径/版本/范围覆盖被删正文且不记 miss；但被删 ID 仍留在 `required_item_ids`，最终 validate 报其缺失并中止——证据仍在帧内却结构性失败。修复：分开"物理记录是否仍存在"与"证据义务是否被覆盖"；由覆盖关系决定 miss 与义务承担者，不由"是否刚添加 miss"顺带决定身份清单。回归须走最终裁剪→覆盖计算→最终校验（含：同 ID 双层删一份、异 ID 覆盖、异版本不覆盖、真预算不足如实 miss）。不要清空 required IDs 或放宽 validator。
 
-### S2b — 官方缓存 mapper 协议一致性（C，provider-openai）
+### S2b — 官方缓存 mapper 协议一致性（C，provider-openai）——已关闭（2026-09-15，`ea9c0e5c`）
+declared 断点路径重写 string content 为 content-block 数组（`input_text` 块携带断点），与 legacy 单断点分支和官方文档一致；`function_call_output` 项的 `output` 同样包装为 content-block 数组并携带断点。`endpoint_shape_tests` 从差异 pin 翻转为正确形状断言。compose wire 验收 B0 断言更新为 ContentPart 形式。
 declared 多断点仍放 input item sibling；旧单断点分支反而已是 content-block 形。按官方 Responses 文档（断点在受支持 content block 上）修正真实 mapper，fixture 断言正确形状；`endpoint_shape_tests` 现有的"差异 pin"测试翻转为正确形状断言。兼容网关方言（若确认）分开命名；未知能力端点继续不发送专属字段。这是本地可完成的协议修正，不等 T8 付费实验。
 
 ## 第三批（S3 主体能力）
