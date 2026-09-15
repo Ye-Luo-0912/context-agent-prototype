@@ -2116,6 +2116,7 @@ mod tests {
                     hot_metadata_backpressure: false,
                     store_io_failures: 0,
                     scopes_retired: 0,
+                    scope_retirement_deferred: false,
                 },
             },
         ));
