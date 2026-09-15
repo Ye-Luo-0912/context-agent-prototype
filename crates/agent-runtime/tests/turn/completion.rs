@@ -1405,10 +1405,26 @@ async fn completion_proposal_cannot_attach_a_cross_run_artifact() {
     host.start().await.expect("test module host starts");
     let instance = RuntimeInstance::spawn(host, services);
     let handle = instance.handle();
+    let mut events = handle.subscribe();
     handle.start().await.unwrap();
     handle.user_message("finish".into()).await.unwrap();
 
-    tokio::time::sleep(Duration::from_millis(100)).await;
+    // Same race as the directory-reference twin below: a checkpoint is only
+    // legal once the refused proposal's turn has ended, so wait for the
+    // turn-end event instead of a fixed sleep.
+    tokio::time::timeout(Duration::from_secs(30), async {
+        loop {
+            match events.recv().await {
+                Ok(envelope) if matches!(envelope.event, RuntimeEvent::TurnCompleted) => break,
+                Ok(_) | Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {}
+                Err(tokio::sync::broadcast::error::RecvError::Closed) => {
+                    panic!("runtime event stream closed before TurnCompleted")
+                }
+            }
+        }
+    })
+    .await
+    .expect("the turn must end after the safe-point rejection");
     let checkpoint = instance.checkpoint().await.unwrap();
     assert!(
         checkpoint.tasks.completed.is_empty(),
@@ -1672,13 +1688,30 @@ async fn completion_safe_point_rejects_a_current_run_directory_reference() {
     let mut host = ModuleHost::new();
     host.start().await.expect("test module host starts");
     let instance = RuntimeInstance::spawn(host, services);
+    let mut events = instance.handle().subscribe();
     instance.start().await.unwrap();
     instance
         .handle()
         .user_message("finish with a directory".into())
         .await
         .unwrap();
-    tokio::time::sleep(Duration::from_millis(150)).await;
+    // The safe point rejects the directory reference, the model's plain final
+    // ends the turn, and only then is a checkpoint legal: the capture is
+    // refused while a turn runs (EXEC-7 ensure_idle), so wait for the turn
+    // to settle instead of racing it with a fixed sleep.
+    tokio::time::timeout(Duration::from_secs(30), async {
+        loop {
+            match events.recv().await {
+                Ok(envelope) if matches!(envelope.event, RuntimeEvent::TurnCompleted) => break,
+                Ok(_) | Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {}
+                Err(tokio::sync::broadcast::error::RecvError::Closed) => {
+                    panic!("runtime event stream closed before TurnCompleted")
+                }
+            }
+        }
+    })
+    .await
+    .expect("the turn must end after the safe-point rejection");
     assert!(
         instance
             .checkpoint()
