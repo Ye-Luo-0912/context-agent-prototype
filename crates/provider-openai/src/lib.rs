@@ -971,6 +971,65 @@ fn build_chat_wire_request(
     wire
 }
 
+/// V6 (4f6eb7ff review): the content-block types the official
+/// prompt-caching guide documents as hosts for an explicit
+/// `prompt_cache_breakpoint` — the breakpoint rides ON such a block inside
+/// `content` (role items) or inside `output` (`function_call_output`
+/// items; the guide's multi-turn agent example wraps tool results as
+/// `output: [{"type": "input_text", ...}]`, because a tool result is the
+/// NEXT request's input). There is no documented input-item-level (sibling)
+/// breakpoint field, and `function_call` items cannot host one at all.
+pub(crate) const BREAKPOINT_BLOCK_TYPES: [&str; 3] = ["input_text", "input_image", "input_file"];
+
+/// The recorded outcome of placing one declared breakpoint on its wire
+/// item's block-bearing field (`content`/`output`). Dropped hints are a
+/// testable record, not a silent reshape into an undocumented form.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum DeclaredBreakpointPlacement {
+    /// Attached to a supported content block; a bare string was rewritten
+    /// into a single `input_text` block carrying the breakpoint.
+    PlacedOnContentBlock,
+    /// The payload has no officially supported block to host the
+    /// breakpoint (no block array at all, or no block of a supported
+    /// type): the hint is dropped and the caller records why.
+    DroppedNoSupportedBlock,
+}
+
+/// ONE typed placement rule for every declared-breakpoint host shape:
+/// - string payload → rewritten into a single supported `input_text` block
+///   carrying the breakpoint (the documented form for both plain message
+///   content and `function_call_output.output`);
+/// - block array → the LAST supported block hosts the breakpoint;
+/// - anything else → the hint is dropped (never the undocumented
+///   input-item sibling field).
+pub(crate) fn place_declared_breakpoint(payload: &mut Value) -> DeclaredBreakpointPlacement {
+    match payload {
+        Value::String(text) => {
+            let text = std::mem::take(text);
+            *payload = json!([{
+                "type": "input_text",
+                "text": text,
+                "prompt_cache_breakpoint": {"mode": "explicit"},
+            }]);
+            DeclaredBreakpointPlacement::PlacedOnContentBlock
+        }
+        Value::Array(blocks) => {
+            for block in blocks.iter_mut().rev() {
+                let supported = block
+                    .get("type")
+                    .and_then(Value::as_str)
+                    .is_some_and(|kind| BREAKPOINT_BLOCK_TYPES.contains(&kind));
+                if supported {
+                    block["prompt_cache_breakpoint"] = json!({"mode": "explicit"});
+                    return DeclaredBreakpointPlacement::PlacedOnContentBlock;
+                }
+            }
+            DeclaredBreakpointPlacement::DroppedNoSupportedBlock
+        }
+        _ => DeclaredBreakpointPlacement::DroppedNoSupportedBlock,
+    }
+}
+
 fn build_responses_wire_request(
     request: &ModelRequest,
     config: &OpenAiConfig,
@@ -1038,71 +1097,40 @@ fn build_responses_wire_request(
             }
         }
         // Attach this message's breakpoint to the LAST wire item its
-        // message produced (content items carry it inside the content
-        // array — the established shape; expanded tool-call/function items
-        // carry it as a sibling field). A message that produced no items
-        // (filtered empty content) cannot host a breakpoint: the declared
-        // index was last-non-empty, so this only fires on hostile inputs,
-        // which fail the boundary validation instead.
+        // message produced. A message that produced no items (filtered
+        // empty content) cannot host a breakpoint: the declared index was
+        // last-non-empty, so this only fires on hostile inputs, which fail
+        // the boundary validation instead.
         if declared_breakpoints.remove(&message_index) && input.len() > first_new_item {
             let last = input.len() - 1;
-            // S2b (continuation review 258eb4eb R5): the breakpoint belongs
-            // on a supported content block (the documented shape), never as
-            // a sibling field on the input item. String content is
-            // rewritten into a single `input_text` block carrying the
-            // breakpoint; array content gets the breakpoint on the last
-            // `input_text` block.
-            let is_tool_output =
-                input[last].get("type").and_then(Value::as_str) == Some("function_call_output");
-            if is_tool_output && let Some(output) = input[last].get_mut("output") {
-                // S2b: function_call_output items carry `output` (not
-                // `content`). The documented shape wraps tool output in a
-                // content-block array with the breakpoint on the block.
-                match output.take() {
-                    Value::String(text) => {
-                        *output = json!([{
-                            "type": "output_text",
-                            "text": text,
-                            "prompt_cache_breakpoint": {"mode": "explicit"},
-                        }]);
-                    }
-                    other => {
-                        *output = other;
-                        input[last]["prompt_cache_breakpoint"] = json!({"mode": "explicit"});
-                    }
-                }
-            } else if let Some(content) = input[last].get_mut("content") {
-                match content.take() {
-                    Value::Array(mut blocks) => {
-                        let mut placed = false;
-                        for block in blocks.iter_mut().rev() {
-                            if block.get("type").and_then(Value::as_str) == Some("input_text") {
-                                block["prompt_cache_breakpoint"] = json!({"mode": "explicit"});
-                                placed = true;
-                                break;
-                            }
-                        }
-                        *content = Value::Array(blocks);
-                        if placed {
-                            continue;
-                        }
-                        // No input_text block to host the breakpoint: keep
-                        // the sibling as a fallback for items the official
-                        // content-block form cannot express.
-                        input[last]["prompt_cache_breakpoint"] = json!({"mode": "explicit"});
-                    }
-                    Value::String(text) => {
-                        *content = json!([{
-                            "type": "input_text",
-                            "text": text,
-                            "prompt_cache_breakpoint": {"mode": "explicit"},
-                        }]);
-                    }
-                    other => {
-                        *content = other;
-                        input[last]["prompt_cache_breakpoint"] = json!({"mode": "explicit"});
-                    }
-                }
+            // V6: ONE typed placement rule (see `place_declared_breakpoint`).
+            // The breakpoint rides on a supported content block of the
+            // item's block-bearing field — `output` for
+            // `function_call_output` (the official guide's multi-turn agent
+            // example wraps tool results as `input_text` blocks inside
+            // `output`, because the tool result is the NEXT request's
+            // input), `content` for role items. Items that cannot legally
+            // host one (`function_call` expansion items carry neither
+            // field; block arrays without a supported block have no
+            // documented form) DROP the hint with a recorded reason —
+            // never a silent fallback to the undocumented input-item
+            // sibling field.
+            let payload = if input[last].get("type").and_then(Value::as_str)
+                == Some("function_call_output")
+            {
+                input[last].get_mut("output")
+            } else {
+                input[last].get_mut("content")
+            };
+            if !matches!(
+                payload.map(place_declared_breakpoint),
+                Some(DeclaredBreakpointPlacement::PlacedOnContentBlock)
+            ) {
+                tracing::debug!(
+                    reason = "declared_breakpoint_dropped_no_supported_content_block",
+                    message_index,
+                    "dropping the declared cache breakpoint: its wire item has no officially supported content block to host it (no undocumented sibling fallback)"
+                );
             }
         }
     }
