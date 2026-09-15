@@ -1,6 +1,6 @@
 # 可执行任务队列
 
-有效范围见 [CURRENT.md](CURRENT.md)。本文件只保留本阶段仍需动作的任务；历史缺陷描述、验证日志和已关闭细节只链接到原回执，不复制正文。任务依据：[下一阶段审查](reviews/2026-09-14-next-stage-review-4aaa8bea/REVIEW.md)（T 编号）＋[续审](reviews/2026-09-15-continuation-review-258eb4eb/REVIEW.md)（S 编号、R1–R6 为其发现；T1–T7 已关闭）。
+有效范围见 [CURRENT.md](CURRENT.md)。本文件只保留本阶段仍需动作的任务；历史缺陷描述、验证日志和已关闭细节只链接到原回执，不复制正文。任务依据：[下一阶段审查](reviews/2026-09-14-next-stage-review-4aaa8bea/REVIEW.md)（T 编号）＋[续审](reviews/2026-09-15-continuation-review-258eb4eb/REVIEW.md)（S 编号；R1–R6 为其发现；T1–T7、S1–S4 已关闭）＋[4f6eb7ff 审查](reviews/2026-09-16-review-4f6eb7ff/REVIEW.md)（V 编号，其 NEXT_ACTIONS 与覆盖表见同目录）。
 
 ## 接手规则
 
@@ -31,6 +31,37 @@ T4 一期/二期已有预算与降级，但"有界"仍是局部控制（续审 R
 ### S4 — T7 补进程边界与指令传递证据（A，agent-host）——已关闭（2026-09-15）
 现旅程的同进程重组保留，但补两个证据：(a) 独立进程变体——用已有 host 二进制新 OS 进程（不同 PID）、确认前一进程退出、从磁盘恢复同 TaskId/lineage 继续；(b) 纠正传递证据——唯一标记的 steer 指令，脚本 provider 检查实际收到的请求确实包含该标记与任务约束（缺失即拒绝推进），恢复后的请求也断言包含正确剩余义务。不换真实付费模型。
 落地回执：[S4_PROCESS_AND_STEER_EVIDENCE_RECEIPT](reviews/2026-09-15-continuation-review-258eb4eb/S4_PROCESS_AND_STEER_EVIDENCE_RECEIPT.md)。新测试 `host_process_variant`（named pipe/UDS 双入口）：真实 host 二进制两进程、`pid confirmed gone` 后新进程接管 stale host.lock、`work/restore` 携带被杀进程 RunId、同 TaskId 重聚焦且无效果重放；脚本 provider 纯函数门禁（缺目标/缺标记/恢复后缺剩余义务即拒绝），写入内容由请求体内实际送达的 token 派生。host 套件 31/0、clippy 0、进程变体 3 次重复全绿。限制（同进程旅程保留、watchdog 全路径不声称、unix 入口未本机运行）见回执。
+
+## 第四批（V 系列四切片；V1 先行，其余可并行）
+
+审查基线 `4f6eb7ff`（报告：[REVIEW.md](reviews/2026-09-16-review-4f6eb7ff/REVIEW.md)，行动与停止条件：[NEXT_ACTIONS.md](reviews/2026-09-16-review-4f6eb7ff/NEXT_ACTIONS.md)）。共同主线：分页只改变驻留位置，不改变记录的语义身份与保护义务；取消只改变执行结果，不抹掉已知成本。共享 ContextEngine/service wire/ModelRequest 契约由单一集成人维护；行为修改与机械移动分开提交；定向测试后跑既有相关跨 crate 集成，合并沿用现有 CI。
+
+### W1 — 逻辑 owner 与冷页解析（B，context-simple；含 V1＋V2）——P1 先行
+用户动作：历史已外置/分页后，Agent 仍可正确要求这份证据进入下一次请求；运行 GC 不会让未读卡片失去有效 scope。
+- V1（P1）：`retire_closed_scopes` 的 referenced 集合只枚举 heap/Warm/写入重试表/已加载 external/active scope，未加载 pending 卡片中的 scope 引用不可见——退休可移除仍被未读冷页引用的 scope，`hydrate_card_for` 读回时因 scope 不存在而消费定位行，破坏可达性/恢复目录。修复：把元数据/引用闭包完整性传入退休许可——未证明闭包完整时不退休未知冷页可能引用的节点；不依赖完整引用信息的内存 GC 照常。不许删 scope 校验放行坏结构；不许全历史加载替代分页。长期可沿目录维护 scope 引用计数（须与分页 owner/迁移/checkpoint 原子一致，不建第二份任务真相）。
+- V2：`materialize`→`plan_required` 只查已加载索引，pending 卡片不在解析路径——同一正文 `fetch_external(id)` 可读、声明成 PromptRequired 却报 Missing。修复：必需正文规划前对有界 required refs 做目标解析（精确 ID 直接定位卡片；路径/实体沿冷目录）；区分 不存在/读取失败/策略排除/因预算未解析，不压成 Missing，不全历史 hydration。
+- 回归：卡片保持未加载→GC 触发退休→按 ID 读取→checkpoint/restore，核对正文、scope 关系、owner 集合（证明目标卡片本轮未加载，不得靠 fixture 顺序巧合进热表绕过反例）；required 目标位于 restore 首批之后＋固定热预算＋精确 URI 直接 materialize。
+- 停止：同一正文在已加载与分页状态下语义保证一致；正常退休仍可收敛（释放最后一个真实引用后才退休）。
+
+### W2 — 原子搜索结果与 continuation 生命周期（B/C；含 V3＋V4＋V5）
+用户动作：部分命中时 Agent 知道尚有未读区间并能在固定预算内续查；恢复/目录变更后旧游标不能错用。
+- V3：`ContextServiceAdapter::search_external` 只返回 `Vec<ExternalizedContext>`，未覆盖 `last_search_coverage`/`search_external_continuation`，继承默认 complete＋忽略 token——service 模式退回「普通完整结果」。修复：一次搜索原子返回 hits+coverage+observation+continuation/视图身份（不靠调用后再读可变 `last_search_*` 旁路）；旧服务无该能力时明确 Unknown/Unsupported，不默认 complete；经既有协议版本/能力协商迁移。
+- V4：`record_search_coverage` 在 query_key 相同时无去重追加旧 `covered_ids`，普通搜索不持 token 也可持续追加同一热窗口——固定历史下重复普通查询即可让 retained state 随调用次数增长。修复：fresh（开始新遍历，不继承）与 resume（验证过的遍历）分开；覆盖状态去重、链级条数/字节边界；超界返回显式状态。
+- V5：`restore` 替换 State 但不清理 State 之外的续查状态；token 编号由 slot 尾数推导、链完成后清空重开——旧 token 可在原位 restore 后或新链 ABA 命中。修复：成功 restore 使旧 token 失效（拒绝 restore 不动现有合法状态）；token 用进程生命周期单调 nonce/不透明身份并绑定目录/恢复代际。
+- 回归：固定历史上重复普通搜索，retained state 不随调用次数增长；固定预算续查每次推进不漏页；同一冷热 fixture 下 in-process 与 service 模式的 非空不完整/空不完整/续查到末页/过期 token 语义一致；视图 V1 签发 token→恢复 V0→旧 token 不得把 V0 未搜索内容当作已覆盖。
+- 停止：一次查询结果自带 coverage；fresh/resume/restore 一套生命周期规则。
+
+### W3 — 工具结果缓存断点块类型（C，provider-openai；V6）
+用户动作：显式标记可复用工具结果时，请求使用合法输入内容块，不发错误类型或未确认 fallback。
+- `build_responses_wire_request` 的 function_call_output 分支把 output 包成 `output_text` 块——官方 Responses 缓存断点只支持 input_text/input_image/input_file；另有未确认的 input-item sibling fallback 残留。现有 `endpoint_shape_tests` 工具用例只断言"数组内有断点、顶层没有"，未查块类型（函数名/注释还与断言相反）。
+- 修复：受支持 input 块类型化映射；无法合法承载断点时剔除 hint 并记录原因（或拒绝该缓存计划），保留真实消息与工具配对；网关方言显式独立命名。普通文本 input_text 已修部分不重做。
+- 回归：fixture 断言块类型/位置/消息展开后的对应关系（不只字段存在）。本地无需付费可完成；真实接受/命中/净费用仍是 T8 条件实验，不互相替代。
+
+### W4 — 取消不抹掉已知用量（A/C；V7）
+用户动作：失败调用已报告费用→退避等待中用户取消→账目仍保留已知数值，执行状态仍是取消。
+- 现状：backoff cancel 分支把 known_usage 写 CallStage 后返回普通 `AgentError::Cancelled`；生产 observer 是 `JsonlRetryObserver::from_env()`——未设 `OPENAI_RETRY_METRICS_FILE` 时 append 直接返回；Runtime 把 Cancelled 映射为不带用量的 `OperationOutcome::Cancelled`。已知信息被降级为无正式去向。
+- 修复：沿既有模型 operation 结算入口把 outcome 与 usage 正交表达——取消仍保持 Cancelled 分类与安全屏障/代际隔离，已知 usage 走必有的结算通道，JSONL 只留诊断副本。不许用 `FailedWithUsage(Cancelled)` 换返回值而不调调用链（会把取消误分类为失败）。
+- 回归：Compose→Retry→backoff cancel 全链、metrics 环境变量不存在：已知用量保留、取消分类不变、未执行重试不多计、未知字段不补零、同次 SSE 累计快照不重复相加。
 
 ## T1–T7 完成记录（历史）
 

@@ -13,6 +13,8 @@
 
 **2026-09-15 续审批次收口**：S1/S2a/S2b/S3/S4 全部关闭（见 [NEXT_TASKS.md](NEXT_TASKS.md) 对应行与回执）。S3 固定预算冷目录闭环（per-read deadline、字节预留、保 claim 访问戳、类型化背压、搜索 coverage+continuation 进模型正文）；S4 独立进程变体＋指令传递证据（真实两进程、脚本 provider 内容门禁）。同批修复三处满载 Windows 抖动：t7 旅程审批交付后的立即断言（`4ba60b97`）、cold_bounds 捕获 io 墙钟预算 2s 过窄（随 S3 关闭）、host_e2e stop 唤醒在死管道上盲转 panic（`48ddcb1f`）。残余限制如实记录在两份回执（wire 层 coverage 传播、续查 token 不进 checkpoint、pending 目录随历史增长）。T8 仍为条件任务（付费实验），无新开任务。
 
+**2026-09-16 新审查（基线 `4f6eb7ff`，CI run `35019429861` 首次成功）**：开 V1–V7 七项发现，核心主线是"分页只改变驻留位置、不改变语义身份与保护义务；取消只改变执行结果、不抹掉已知成本"。最高优先级 V1（P1）：scope 退休扫描看不到未加载冷页的 scope 引用，可破坏可达性/恢复目录。四切片 W1–W4 已入 [NEXT_TASKS.md](NEXT_TASKS.md) 第四批（V1 先行，其余可并行），报告与覆盖表见 [docs/reviews/2026-09-16-review-4f6eb7ff/](reviews/2026-09-16-review-4f6eb7ff/REVIEW.md)。审查环境未执行本地测试，全部回归待实现时红-first 补齐。
+
 ## 当前阶段：可持续使用的后端开发流程
 
 目标：**同一 Agent 在同一任务与工作区内，持续完成计划、检索、修改、验证、中途纠正、中断、冷恢复和交付；热资源、维护工作和供应商缓存成本有明确边界，核心规则在少数实现入口维护。**
@@ -31,8 +33,9 @@
 
 ## 当前限制（如实）
 
-- 旅程各环由不同回归覆盖，**尚无同一 TaskId、同工作区、跨进程重启的一条连续任务轨迹**（T7 目标）。
-- 本地 HTTP 捕获只证明客户端发出了字段；端点 schema 接受、实际命中、任务净成本下降均未验证（T6/T8）。
+- 跨进程连续任务轨迹已由 `host_process_variant` 证明（真实两 OS 进程、同 TaskId/lineage 恢复、指令传递证据）；仍未覆盖 watchdog/监督重初始化的全部路径。
+- 本地 HTTP 捕获只证明客户端发出了字段；端点 schema 接受、实际命中、任务净成本下降均未验证（T6/T8；V6 工具结果块类型是 W3 待修项）。
+- 冷目录分页与旧路径的跨层缺口未收口：scope 退休可漏未加载冷页引用（V1）、必需正文可被误报 Missing（V2）、service 边界丢 coverage/续查（V3）、续查状态可膨胀与 ABA（V4/V5）、取消丢已知用量（V7）——W1–W4 队列见 [NEXT_TASKS.md](NEXT_TASKS.md)。
 - 正式 `agent-host` 未指定策略时仍默认 Rolling；Dynamic 是可选实现。配置依据 [CONFIGURATION.md](CONFIGURATION.md)。
 - 尚不能宣称：无限历史热内存有界、全部源码逐行审查完成、供应商 KV 已实测降低任务费用。真实模型实验按预算和凭据条件执行，不阻塞无须模型的生产接线。
 
