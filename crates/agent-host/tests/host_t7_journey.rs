@@ -1,6 +1,22 @@
 //! T7: ONE continuous same-task backend development journey over the real
 //! host wire — not several unrelated green rows stitched together.
 //!
+//! What these tests PROVE: the full same-task journey semantics — real
+//! workspace effects through the real tool runtime, interactive approvals
+//! answered on the wire, the mid-turn steer slot, the durable cancel
+//! barrier, a formal cross-plane checkpoint, cold recomposition, restoring
+//! the SAME TaskId under a NEW RunId (one lineage), no effect replay, and
+//! `OperatorClosureOnly` delivery.
+//!
+//! What these tests do NOT prove: a new OS process. Both "sessions" run in
+//! THIS test process — each session composes a fresh runtime and serves it
+//! with `std::thread::spawn`ed `HostServer` threads, so the "restart" is a
+//! same-process recomposition (a new RunId, not a new PID). Host process
+//! death and the global state it exercises (single-instance lock takeover,
+//! process liveness, watchdog/supervision re-arms) are deliberately out of
+//! scope here; `host_process_variant.rs` adds that independent-process
+//! variant with the real host binary.
+//!
 //! One TaskId, one workspace, one restore lineage:
 //!
 //!   submit a real cross-file goal -> the scripted model drives the Runtime
@@ -10,14 +26,14 @@
 //!   single correction slot) is incorporated into the execution -> the turn
 //!   continuation is cancelled mid-flight (durable `Cancelled` barrier) -> a
 //!   formal checkpoint lands in the run's own store -> the whole host side
-//!   shuts down -> a NEW composition + NEW host process (same workspace dir)
-//!   cold-restores the SAME task over the wire -> the external changes are
-//!   still on disk -> the remaining goal work completes through real tools
-//!   again -> delivery checks (task still `Active` under the default
-//!   `OperatorClosureOnly` policy — an ordinary final is NOT a durable
-//!   completion) -> the local operator surface closes the task explicitly,
-//!   and the typed `TaskCompleted` event carries the operator summary plus
-//!   the final output's digest.
+//!   shuts down -> a NEW composition + NEW host server thread (same
+//!   workspace dir) cold-restores the SAME task over the wire -> the
+//!   external changes are still on disk -> the remaining goal work completes
+//!   through real tools again -> delivery checks (task still `Active` under
+//!   the default `OperatorClosureOnly` policy — an ordinary final is NOT a
+//!   durable completion) -> the local operator surface closes the task
+//!   explicitly, and the typed `TaskCompleted` event carries the operator
+//!   summary plus the final output's digest.
 //!
 //! A second test runs the key failure variant: after the cold restore, one
 //! transient real tool failure (a write whose parent directory does not
