@@ -147,32 +147,13 @@ fn stamp(
         bump_access(state, signal);
         return true;
     }
-    let applied = {
-        let Some(entry) = state.external.get_mut(item_id) else {
-            return false;
-        };
-        if !externally_retrievable(entry) {
-            return false;
-        }
-        if signal.rank() < entry.last_access_signal.rank() {
-            // 弱信号不得覆盖更强的时钟/等级；调用方仍可读取当前描述符。
-            return false;
-        }
-        entry.last_access_tick = now_tick;
-        entry.last_access_signal = signal;
-        if let Some(gc_epoch) = gc_epoch {
-            entry.last_access_gc_epoch = Some(gc_epoch);
-        }
-        if let Some(turn) = turn {
-            entry.last_access_turn = turn;
-            entry.last_selected_turn = turn;
-            entry.access_count = entry.access_count.saturating_add(1);
-        }
-        if signal.rank() > AccessSignal::SearchHit.rank() {
-            entry.search_reinforce_count = 0;
-        }
-        true
-    };
+    // S3: the stamp goes through the named claim-keeping map operation —
+    // access stamps are not card-relevant, and killing the claim here would
+    // make every fetched entry undemotable (the hot cap could never settle
+    // after a fetch).
+    let applied = state
+        .external
+        .stamp_access(item_id, signal, now_tick, gc_epoch, turn, None);
     if applied {
         bump_access(state, signal);
     }
@@ -201,31 +182,31 @@ fn bump_access(state: &mut State, signal: AccessSignal) {
 }
 
 fn apply_search_hit(state: &mut State, item_id: ContextItemId, now_tick: u64, gc_epoch: u64) {
-    if state.external.get(item_id).is_some() {
-        let stamped = {
-            let Some(entry) = state.external.get_mut(item_id) else {
-                return;
-            };
-            if !externally_retrievable(entry) {
-                return;
-            }
-            if entry.last_access_signal.rank() > AccessSignal::SearchHit.rank() {
-                return;
-            }
-            // 同一 event_seq 内 search 已写过：冷却，避免同一次检索循环连刷。
-            if entry.last_access_signal == AccessSignal::SearchHit
-                && entry.last_access_tick == now_tick
-            {
-                return;
-            }
-            entry.last_access_tick = now_tick;
-            entry.last_access_signal = AccessSignal::SearchHit;
-            if entry.search_reinforce_count < SEARCH_REINFORCE_SATURATION {
-                entry.last_access_gc_epoch = Some(gc_epoch);
-                entry.search_reinforce_count = entry.search_reinforce_count.saturating_add(1);
-            }
-            true
-        };
+    // S3: guards read through the immutable lookup; the write goes through
+    // the named claim-keeping stamp (search-hit reinforcement is also not
+    // card-relevant metadata).
+    if let Some(entry) = state.external.get(item_id) {
+        if !externally_retrievable(entry) {
+            return;
+        }
+        if entry.last_access_signal.rank() > AccessSignal::SearchHit.rank() {
+            return;
+        }
+        // 同一 event_seq 内 search 已写过：冷却，避免同一次检索循环连刷。
+        if entry.last_access_signal == AccessSignal::SearchHit && entry.last_access_tick == now_tick
+        {
+            return;
+        }
+        let reinforce =
+            (entry.search_reinforce_count < SEARCH_REINFORCE_SATURATION).then_some(gc_epoch);
+        let stamped = state.external.stamp_access(
+            item_id,
+            AccessSignal::SearchHit,
+            now_tick,
+            None,
+            None,
+            reinforce,
+        );
         if stamped {
             bump_access(state, AccessSignal::SearchHit);
         }

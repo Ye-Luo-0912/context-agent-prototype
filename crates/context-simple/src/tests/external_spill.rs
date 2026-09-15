@@ -1013,7 +1013,11 @@ async fn a_cancelled_batch_hydration_keeps_every_pending_row() {
     let engine = std::sync::Arc::new(engine);
     let batch = {
         let engine = std::sync::Arc::clone(&engine);
-        tokio::spawn(async move { engine.hydrate_pending_cards(2).await })
+        tokio::spawn(async move {
+            engine
+                .hydrate_pending_cards(2, &crate::engine::HydrationBudget::for_tests(), &[])
+                .await
+        })
     };
     tokio::time::timeout(std::time::Duration::from_secs(10), planned.notified())
         .await
@@ -1030,8 +1034,13 @@ async fn a_cancelled_batch_hydration_keeps_every_pending_row() {
 
     // A later, undisturbed drain installs everything: nothing was lost.
     *engine.card_read_pause.lock().expect("poisoned") = None;
-    let installed = engine.hydrate_pending_cards(2).await;
-    assert_eq!(installed, 2, "the retry installs every deferred row");
+    let installed = engine
+        .hydrate_pending_cards(2, &crate::engine::HydrationBudget::for_tests(), &[])
+        .await;
+    assert_eq!(
+        installed.installed, 2,
+        "the retry installs every deferred row"
+    );
     let state = engine.state.lock().await;
     assert_eq!(state.pending_external_cards.len(), 0);
     assert_eq!(state.external_cards_missing, 0);
@@ -1112,9 +1121,11 @@ async fn a_transient_card_read_failure_keeps_the_retryable_locator() {
         .card_read_failure_bomb
         .store(1, std::sync::atomic::Ordering::Relaxed);
 
-    let installed = engine.hydrate_pending_cards(2).await;
+    let installed = engine
+        .hydrate_pending_cards(2, &crate::engine::HydrationBudget::for_tests(), &[])
+        .await;
     assert_eq!(
-        installed, 1,
+        installed.installed, 1,
         "only the failed read installs nothing; the other row is fine"
     );
     {
@@ -1134,8 +1145,13 @@ async fn a_transient_card_read_failure_keeps_the_retryable_locator() {
         );
     }
 
-    let installed_again = engine.hydrate_pending_cards(1).await;
-    assert_eq!(installed_again, 1, "the recovered read installs the row");
+    let installed_again = engine
+        .hydrate_pending_cards(1, &crate::engine::HydrationBudget::for_tests(), &[])
+        .await;
+    assert_eq!(
+        installed_again.installed, 1,
+        "the recovered read installs the row"
+    );
     let state = engine.state.lock().await;
     assert_eq!(state.pending_external_cards.len(), 0);
     assert_eq!(
@@ -1225,7 +1241,9 @@ async fn a_card_whose_bytes_lost_the_captured_hash_is_corrupt_and_never_installs
         ..spill_config(&dir, 10)
     });
     fresh.restore(value).await.unwrap();
-    fresh.hydrate_pending_cards(2).await;
+    fresh
+        .hydrate_pending_cards(2, &crate::engine::HydrationBudget::for_tests(), &[])
+        .await;
     let state = fresh.state.lock().await;
     assert!(
         state.external.get(target).is_none(),
@@ -1309,7 +1327,9 @@ async fn a_deferred_card_referencing_an_unknown_scope_never_installs() {
             "the deferred row waits under the rewritten card's hash"
         );
     }
-    fresh.hydrate_pending_cards(2).await;
+    fresh
+        .hydrate_pending_cards(2, &crate::engine::HydrationBudget::for_tests(), &[])
+        .await;
     let state = fresh.state.lock().await;
     assert!(
         state.external.get(target).is_none(),

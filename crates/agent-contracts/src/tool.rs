@@ -2293,7 +2293,10 @@ pub enum ToolOutcome {
 #[derive(Debug, Clone)]
 pub enum EngineQuery {
     /// Deterministic search over externalized refs (entity/kind/scope/task
-    /// /label filters + recency). `limit` caps the answer.
+    /// /label filters + recency). `limit` caps the answer. `continuation` is
+    /// the opaque token an earlier incomplete search's coverage named: the
+    /// engine advances its cold-page window instead of re-serving the same
+    /// pages. `None` starts from the freshest region.
     SearchExternal {
         query: String,
         kind: Option<ContextKind>,
@@ -2301,6 +2304,7 @@ pub enum EngineQuery {
         task_id: Option<TaskId>,
         label: Option<String>,
         limit: usize,
+        continuation: Option<String>,
     },
     /// Metadata of one externalized entry by item id (no store read).
     InspectExternal { item_id: ContextItemId },

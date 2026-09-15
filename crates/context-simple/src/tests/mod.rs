@@ -7,6 +7,7 @@ mod directive;
 mod distill;
 mod entity;
 mod external_spill;
+mod fixed_budget_closure;
 mod foreground;
 mod gc_backpressure;
 mod gc_bounds;

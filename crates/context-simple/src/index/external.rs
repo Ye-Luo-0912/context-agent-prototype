@@ -59,8 +59,11 @@ pub(crate) struct ExternalMap {
 }
 
 /// Per-entry byte weight for the hot-metadata caps (same shape the
-/// map-level estimate sums).
-fn entry_metadata_bytes_estimate(entry: &ExternalizedContext) -> u64 {
+/// map-level estimate sums). This is the single estimation basis every
+/// residency decision shares: the bulk drain's pre-install reservation and
+/// `demote_overflow`'s accounting both subtract exactly what
+/// [`ExternalMap::metadata_bytes_estimate`] sums.
+pub(crate) fn entry_metadata_bytes_estimate(entry: &ExternalizedContext) -> u64 {
     const FIXED_PER_ENTRY: u64 = 256;
     const FIXED_PER_DEPENDENCY: u64 = 64;
     FIXED_PER_ENTRY
@@ -72,6 +75,19 @@ fn entry_metadata_bytes_estimate(entry: &ExternalizedContext) -> u64 {
             .map(|entity| entity.len() as u64 + 1)
             .sum::<u64>()
         + entry.dependencies.len() as u64 * FIXED_PER_DEPENDENCY
+}
+
+/// S3: typed outcome of one overflow-demotion pass. `demoted` carries the
+/// `(id, card hash)` rows for the caller's pending directory; `over_entries`
+/// / `over_bytes` are the residual above the caps *after* every demotable
+/// entry was returned — a non-zero residual is the typed backpressure fact
+/// "hot residency over budget and nothing safe left to demote" (pinned or
+/// card-less entries are never dropped to enforce a cap).
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub(crate) struct DemoteOutcome {
+    pub(crate) demoted: Vec<(ContextItemId, String)>,
+    pub(crate) over_entries: usize,
+    pub(crate) over_bytes: u64,
 }
 
 impl ExternalMap {
@@ -283,12 +299,14 @@ impl ExternalMap {
         removed
     }
 
-    /// T4 second stage (hot/cold bidirectional residency): return overflow
-    /// entries to the pending directory. Removes the OLDEST entries that
-    /// carry a card claim (skipping pinned and claim-less entries) while
-    /// the map is over `max_entries` or the metadata-byte estimate is over
-    /// `max_bytes`, and returns their `(id, card hash)` rows for the
-    /// caller's pending directory.
+    /// T4 second stage (hot/cold bidirectional residency), S3 typed: return
+    /// overflow entries to the pending directory. Removes the OLDEST entries
+    /// that carry a card claim (skipping pinned, claim-less and `skip`-listed
+    /// entries) while the map is over `max_entries` or the metadata-byte
+    /// estimate is over `max_bytes`, and returns a typed
+    /// [`DemoteOutcome`]: the `(id, card hash)` rows for the caller's pending
+    /// directory plus the residual above the caps when nothing demotable is
+    /// left (the caller's backpressure fact — never a silent success).
     ///
     /// The card claim is deliberately KEPT: the on-disk card still
     /// describes the entry byte-for-byte (demotion changes residency, not
@@ -301,7 +319,8 @@ impl ExternalMap {
         &mut self,
         max_entries: usize,
         max_bytes: u64,
-    ) -> Vec<(ContextItemId, String)> {
+        skip: &[ContextItemId],
+    ) -> DemoteOutcome {
         let mut demoted: Vec<(ContextItemId, String)> = Vec::new();
         let mut bytes = self.metadata_bytes_estimate();
         let mut index = 0usize;
@@ -312,7 +331,7 @@ impl ExternalMap {
             let entry = &self.entries[index];
             let pinned = self.pinned_ids.contains(&entry.item_id);
             let carded = self.card_hashes.contains_key(&entry.item_id);
-            if pinned || !carded {
+            if pinned || !carded || skip.contains(&entry.item_id) {
                 index += 1;
                 continue;
             }
@@ -336,7 +355,11 @@ impl ExternalMap {
             // Do not advance `index`: the next entry moved into this slot.
         }
         if demoted.is_empty() {
-            return demoted;
+            return DemoteOutcome {
+                demoted,
+                over_entries: self.entries.len().saturating_sub(max_entries),
+                over_bytes: bytes.saturating_sub(max_bytes),
+            };
         }
         // Slot indexes must be rebuilt after mid-vec removals; the demoted
         // ids leave the catalog (they are pending rows now, not hot ones).
@@ -344,7 +367,73 @@ impl ExternalMap {
         for (id, _) in &demoted {
             self.mark_catalog(*id);
         }
+        DemoteOutcome {
+            over_entries: self.entries.len().saturating_sub(max_entries),
+            over_bytes: bytes.saturating_sub(max_bytes),
+            demoted,
+        }
+    }
+
+    /// S3: return exactly the listed entries to the pending directory (the
+    /// search continuation's window rotation). Each listed id demotes only if
+    /// it is carded and not pinned — protected owners simply stay hot. Card
+    /// claims are kept (the card still describes the entry), counters,
+    /// indexes and catalog marks are maintained in this one named operation,
+    /// and the returned `(id, hash)` rows go to the BACK of the caller's
+    /// pending queue so unread pages hydrate before re-readable ones.
+    pub(crate) fn demote_ids(&mut self, ids: &[ContextItemId]) -> Vec<(ContextItemId, String)> {
+        if ids.is_empty() {
+            return Vec::new();
+        }
+        let wanted: HashSet<ContextItemId> = ids.iter().copied().collect();
+        let mut demoted: Vec<(ContextItemId, String)> = Vec::new();
+        let mut kept: Vec<ExternalizedContext> = Vec::with_capacity(self.entries.len());
+        for entry in self.entries.drain(..) {
+            let demotable = wanted.contains(&entry.item_id)
+                && !self.pinned_ids.contains(&entry.item_id)
+                && self.card_hashes.contains_key(&entry.item_id);
+            if demotable {
+                let (cold_delta, external_delta) = match entry.residency {
+                    ContextResidency::Cold => (1usize, 0usize),
+                    ContextResidency::External => (0usize, 1usize),
+                    ContextResidency::Resident | ContextResidency::Warm => (0usize, 0usize),
+                };
+                self.cold_entries = self.cold_entries.saturating_sub(cold_delta);
+                self.external_entries = self.external_entries.saturating_sub(external_delta);
+                let hash = self
+                    .card_hashes
+                    .get(&entry.item_id)
+                    .cloned()
+                    .unwrap_or_default();
+                demoted.push((entry.item_id, hash));
+                continue;
+            }
+            kept.push(entry);
+        }
+        self.entries = kept;
+        if demoted.is_empty() {
+            return demoted;
+        }
+        self.rebuild_indexes();
+        for (id, _) in &demoted {
+            self.mark_catalog(*id);
+        }
         demoted
+    }
+
+    /// S3: ids of hot entries whose metadata is serialized on a card and
+    /// that are not pinned — exactly the owners a window rotation may
+    /// demote. Each row is an id only; the hash lookup happens in
+    /// [`Self::demote_ids`].
+    pub(crate) fn carded_hot_ids(&self) -> Vec<ContextItemId> {
+        self.entries
+            .iter()
+            .filter(|entry| {
+                self.card_hashes.contains_key(&entry.item_id)
+                    && !self.pinned_ids.contains(&entry.item_id)
+            })
+            .map(|entry| entry.item_id)
+            .collect()
     }
 
     /// Take the map out for wholesale entry editing (task-completion
@@ -429,6 +518,60 @@ impl ExternalMap {
             .get(&id)
             .copied()
             .and_then(move |slot| self.entries.get_mut(slot))
+    }
+
+    /// S3: apply a pure access-stamp update to one external entry. Unlike
+    /// [`Self::get_mut`], the card claim is deliberately KEPT: access stamps
+    /// are not card-relevant metadata — a card re-installed later may carry
+    /// older stamps, the same honest staleness a restore already accepts for
+    /// card snapshots, while the entry stays demotable (the per-id residency
+    /// settlement needs the claim to return it to the pending directory).
+    /// Any card-relevant field change must go through `get_mut` instead,
+    /// whose claim drop forces a re-serialization at the next capture.
+    /// Returns whether the stamp was applied (the same guard set the
+    /// `access` module historically enforced on the map).
+    pub(crate) fn stamp_access(
+        &mut self,
+        item_id: ContextItemId,
+        signal: agent_contracts::AccessSignal,
+        now_tick: u64,
+        gc_epoch: Option<u64>,
+        turn: Option<u64>,
+        reinforce_bump: Option<u64>,
+    ) -> bool {
+        let Some(slot) = self.id_index.get(&item_id).copied() else {
+            return false;
+        };
+        let Some(entry) = self.entries.get_mut(slot) else {
+            return false;
+        };
+        if !crate::store::externally_retrievable(entry) {
+            return false;
+        }
+        if signal.rank() < entry.last_access_signal.rank() {
+            // 弱信号不得覆盖更强的时钟/等级；调用方仍可读取当前描述符。
+            return false;
+        }
+        entry.last_access_tick = now_tick;
+        entry.last_access_signal = signal;
+        if let Some(gc_epoch) = gc_epoch {
+            entry.last_access_gc_epoch = Some(gc_epoch);
+        }
+        if let Some(turn) = turn {
+            entry.last_access_turn = turn;
+            entry.last_selected_turn = turn;
+            entry.access_count = entry.access_count.saturating_add(1);
+        }
+        if let Some(epoch) = reinforce_bump
+            && entry.search_reinforce_count < crate::access::SEARCH_REINFORCE_SATURATION
+        {
+            entry.last_access_gc_epoch = Some(epoch);
+            entry.search_reinforce_count += 1;
+        }
+        if signal.rank() > agent_contracts::AccessSignal::SearchHit.rank() {
+            entry.search_reinforce_count = 0;
+        }
+        true
     }
 
     /// Immutable iteration over every entry in externalization order
@@ -794,5 +937,93 @@ mod tests {
         assert_eq!(map.cold_entries(), 0);
         assert_eq!(map.external_entries(), 3);
         assert_eq!(cursor, 0, "full wrap resets the stored cursor");
+    }
+
+    /// S3 (backpressure, red-first): nothing demotable means the residual
+    /// over-budget is the *typed* return — never a silent empty success.
+    #[test]
+    fn demote_overflow_reports_residual_backpressure_when_nothing_is_demotable() {
+        let mut map = ExternalMap::new();
+        let a = ContextItemId::new();
+        let b = ContextItemId::new();
+        let pinned = ContextItemId::new();
+        map.push(entry(a, &["a.rs"]));
+        map.push(entry(b, &["b.rs"]));
+        let mut pinned_entry = entry(pinned, &["p.rs"]);
+        pinned_entry.retention = ContextRetention::Pinned;
+        map.push(pinned_entry);
+        // No card claims at all, and one pinned entry.
+        let outcome = map.demote_overflow(1, u64::MAX, &[]);
+        assert!(outcome.demoted.is_empty(), "nothing is demotable");
+        assert_eq!(
+            outcome.over_entries, 2,
+            "the residual over-budget is the typed backpressure fact: {outcome:?}"
+        );
+
+        // Carded but skip-listed entries count toward the residual too.
+        let c = ContextItemId::new();
+        map.push(entry(c, &["c.rs"]));
+        map.record_card(c, "hash-c".to_string());
+        let outcome = map.demote_overflow(1, u64::MAX, &[c]);
+        assert!(outcome.demoted.is_empty());
+        assert_eq!(outcome.over_entries, 3);
+    }
+
+    /// S3: demote_overflow demotes oldest carded entries first and reports
+    /// a zero residual once the map is back within the caps.
+    #[test]
+    fn demote_overflow_trims_to_the_cap_and_reports_zero_residual() {
+        let mut map = ExternalMap::new();
+        let ids: Vec<ContextItemId> = (0..3).map(|_| ContextItemId::new()).collect();
+        for (i, id) in ids.iter().enumerate() {
+            map.push(entry(*id, &[&format!("e{i}.rs")]));
+            map.record_card(*id, format!("hash-{i}"));
+        }
+        let outcome = map.demote_overflow(1, u64::MAX, &[]);
+        assert_eq!(outcome.demoted.len(), 2, "the oldest two carded demote");
+        assert_eq!(outcome.demoted[0].0, ids[0], "oldest first");
+        assert_eq!(outcome.over_entries, 0, "back within the cap");
+        assert_eq!(map.len(), 1);
+        assert_eq!(map.get(ids[2]).unwrap().item_id, ids[2]);
+        assert!(
+            map.card_hash(ids[2]).is_some(),
+            "the survivor keeps its claim"
+        );
+        assert!(
+            map.ids_for_entity("e0.rs").is_empty(),
+            "the demoted id leaves its entity bucket"
+        );
+    }
+
+    /// S3: demote_ids returns exactly the listed carded, non-pinned owners
+    /// as pending rows, keeps their card claims and keeps everyone else.
+    #[test]
+    fn demote_ids_rotates_exactly_the_listed_carded_entries() {
+        let mut map = ExternalMap::new();
+        let a = ContextItemId::new();
+        let b = ContextItemId::new();
+        let pinned = ContextItemId::new();
+        let uncarded = ContextItemId::new();
+        map.push(entry(a, &["a.rs"]));
+        map.record_card(a, "hash-a".to_string());
+        map.push(entry(b, &["b.rs"]));
+        map.record_card(b, "hash-b".to_string());
+        let mut pinned_entry = entry(pinned, &["p.rs"]);
+        pinned_entry.retention = ContextRetention::Pinned;
+        map.push(pinned_entry);
+        map.record_card(pinned, "hash-p".to_string());
+        map.push(entry(uncarded, &["u.rs"]));
+
+        let rows = map.demote_ids(&[a, pinned, uncarded]);
+        assert_eq!(rows, vec![(a, "hash-a".to_string())]);
+        assert!(map.get(a).is_none(), "the listed entry left the hot map");
+        assert_eq!(
+            map.card_hash(a),
+            Some("hash-a"),
+            "the card claim survives: the pending row re-reads exactly that card"
+        );
+        assert!(map.get(pinned).is_some(), "pinned owners stay hot");
+        assert!(map.get(uncarded).is_some(), "claim-less owners stay hot");
+        assert_eq!(map.len(), 3);
     }
 }

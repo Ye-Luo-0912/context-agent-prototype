@@ -77,6 +77,8 @@ struct ManageArgs {
     task_id: Option<String>,
     #[serde(default)]
     label: Option<String>,
+    #[serde(default)]
+    continuation: Option<String>,
     // Admit / derive
     #[serde(default)]
     reason: Option<String>,
@@ -213,7 +215,8 @@ impl Tool for ContextManageTool {
                     "kind": {"type": "string", "enum": ["Goal", "Constraint", "Decision", "UserMessage", "AssistantMessage", "ToolObservation", "FileObservation", "Error", "Summary", "Note"], "description": "search only: optional ContextKind filter; omit for other operations"},
                     "scope": {"type": "string", "enum": ["Message", "Turn", "Task", "Session", "Pinned"], "description": "search only: optional ContextScope filter; omit for other operations"},
                     "task_id": {"type": "string", "minLength": 36, "description": "search only: optional TaskId UUID filter; omit for other operations"},
-                    "label": {"type": "string", "minLength": 1, "description": "search only: optional label filter (decision, open-loop, ext:...); omit for other operations"}
+                    "label": {"type": "string", "minLength": 1, "description": "search only: optional label filter (decision, open-loop, ext:...); omit for other operations"},
+                    "continuation": {"type": "string", "minLength": 1, "description": "search only: opaque token from a previous result's [coverage] line; rerun the SAME query with it to advance to the next cold page. Omit for other operations and for a fresh search."}
                 }
             }),
             risk: ToolRisk::ReadOnly,
@@ -298,6 +301,7 @@ impl Tool for ContextManageTool {
                         task_id,
                         label,
                         limit: args.limit.unwrap_or(16),
+                        continuation: optional_text(&args.continuation).map(str::to_string),
                     },
                 })
             }

@@ -1,10 +1,10 @@
 //! B2 调用方完整性收口：hydration → GC/reconcile/search 的完整性传播。
 //!
-//! `hydrate_all_pending_cards` 对一批读取全部失败时提前返回（避免无限重试），
+//! `hydrate_pending_cards_within_budget` 对一批读取全部失败时提前返回（避免无限重试），
 //! 但调用方必须知道「仍有 pending 元数据未读取」。删除规划器的可达性闭包只
 //! 遍历已安装条目的依赖边——pending 卡片里的出边不可见；只把 pending 的 id
 //! 加入根集合不足以保护未读出的边。本模块钉住三条规则（同时写在
-//! `hydrate_all_pending_cards` 与 `plan_storage_gc` 上）：
+//! `hydrate_pending_cards_within_budget` 与 `plan_storage_gc` 上）：
 //!
 //! - pending owner ≠ ownerless；
 //! - 恢复根完整 ≠ 元数据/依赖完整；

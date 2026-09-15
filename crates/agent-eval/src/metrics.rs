@@ -2113,6 +2113,7 @@ mod tests {
                     anchor_root_misses: Vec::new(),
                     externalize_deferred: 0,
                     externalize_backpressure: false,
+                    hot_metadata_backpressure: false,
                     store_io_failures: 0,
                     scopes_retired: 0,
                 },

@@ -595,6 +595,7 @@ impl CoreAuthority {
                 task_id,
                 label,
                 limit,
+                continuation,
             } => {
                 // 空结果区分无过滤与带过滤，方便换条件；不在这里写工作集说明书。
                 let has_filter =
@@ -611,7 +612,17 @@ impl CoreAuthority {
                 // F04: a result that fills the limit may have been cut — the
                 // body must say so (summary/metadata never reach the model).
                 let search_limit = search.limit;
-                match self.context.search_external(search).await {
+                // S3: a continuation token routes to the cold-page walk; the
+                // engine validates the query binding and types the outcome.
+                let result = match continuation.as_deref() {
+                    Some(token) => {
+                        self.context
+                            .search_external_continuation(search, token)
+                            .await
+                    }
+                    None => self.context.search_external(search).await,
+                };
+                match result {
                     Ok(hits) if hits.is_empty() => {
                         let observation = self.context.last_search_observation();
                         output.ok = true;
@@ -685,6 +696,36 @@ impl CoreAuthority {
                                 "\n[coverage] result capped at limit={search_limit}; the catalog may hold more matches"
                             ));
                         }
+                        // S3 (R4): a result-capped fact and an incomplete
+                        // candidate coverage are DIFFERENT facts — a cap
+                        // truncates a ranked Top-K over the visible region,
+                        // an incomplete coverage means whole cold pages were
+                        // never examined. The model-visible body must carry
+                        // the incompleteness (metadata alone never reaches
+                        // the model) plus the continuation that advances to
+                        // the next cold page.
+                        let coverage = self.context.last_search_coverage();
+                        if !coverage.complete {
+                            output.model_content.push_str(&format!(
+                                "\n[coverage] INCOMPLETE: {} cold page(s) were not readable in \
+                                 this pass (stopped: {}), so matches may be missing from those \
+                                 pages. To advance to the next page, rerun the SAME search with \
+                                 continuation=\"{}\".",
+                                coverage.unread_pages,
+                                coverage.stop,
+                                coverage.continuation.as_deref().unwrap_or("-")
+                            ));
+                        }
+                        let coverage_metadata = if coverage.complete {
+                            serde_json::json!({ "complete": true })
+                        } else {
+                            serde_json::json!({
+                                "complete": false,
+                                "unread_pages": coverage.unread_pages,
+                                "stop": coverage.stop.to_string(),
+                                "continuation": coverage.continuation,
+                            })
+                        };
                         output.metadata = serde_json::json!({
                             "op": "search",
                             "kind": "context",
@@ -696,6 +737,7 @@ impl CoreAuthority {
                             "cold_read_bytes": observation.cold_read_bytes,
                             "cold_read_ms": observation.cold_read_ms,
                             "result_capped": capped,
+                            "coverage": coverage_metadata,
                         });
                     }
                     Err(error) => {

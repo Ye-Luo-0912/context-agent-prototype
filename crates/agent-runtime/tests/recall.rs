@@ -192,6 +192,7 @@ impl ToolDispatcher for EngineQueryTools {
                     task_id: None,
                     label: None,
                     limit: 16,
+                    continuation: None,
                 },
             }),
             ("inspect", Some(_)) => {

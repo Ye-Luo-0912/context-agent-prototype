@@ -2,7 +2,7 @@
 //!
 //! 审查基线（2026-09-14 review T4 节）：「每批有限，不代表一次操作总工作量
 //! 有限；checkpoint 文件变小，也不代表内存占用不再跟随历史增长。」旧形状的
-//! `hydrate_all_pending_cards` 循环到队列为空为止：一次 search/GC/reconcile
+//! `hydrate_pending_cards_within_budget` 循环到队列为空为止：一次 search/GC/reconcile
 //! 就把整段历史的冷元数据全部装进热目录——总量跟随历史长度。
 //!
 //! 本模块钉住五条规则：
@@ -35,6 +35,11 @@ fn cold_bounds_config(dir: &tempfile::TempDir) -> SimpleContextConfig {
         external_hydrate_max_items: HYDRATE_ITEMS_BUDGET,
         external_hot_metadata_max_entries: HOT_METADATA_CAP,
         gc_buffer_capacity: 0,
+        // 捕获的卡片写入有墙钟预算（超时条目留在 inline、下次捕获续写——
+        // 该语义有自己的确定性覆盖）。满载 CI runner 上 40 次小文件写入可
+        // 越过默认 2s（run 34999486097：spilled 38/40），墙钟噪声不是本
+        // 模块钉住的对象，这里把它钉宽。
+        external_checkpoint_io_budget_ms: 60_000,
         context_store_dir: Some(dir.path().to_path_buf()),
         ..SimpleContextConfig::default()
     }
@@ -117,7 +122,7 @@ async fn a_cold_collection_larger_than_the_hot_budget_stays_bounded_and_resumabl
 
     // 冷恢复：restore 只读一个批次，其余是 pending 行——id 可知、元数据
     // 不在内存。
-    let mut engine = SimpleContextEngine::new(cold_bounds_config(&dir));
+    let engine = SimpleContextEngine::new(cold_bounds_config(&dir));
     engine.restore(value).await.unwrap();
     {
         let state = engine.state.lock().await;
@@ -145,7 +150,7 @@ async fn a_cold_collection_larger_than_the_hot_budget_stays_bounded_and_resumabl
     // 搜索：非空命中照常返回（ranked Top-K 从不声称完整）；同一次操作的
     // 重水化被预算与热上限夹住——热目录恰好到上限，而不是全历史。
     let hits = engine
-        .search_external(ContextSearchQuery::new("unique-token", 8))
+        .search_external(ContextSearchQuery::new("unique-token", 20))
         .await
         .expect("non-empty hits are returned as-is");
     assert!(!hits.is_empty(), "the hot region matches the query");
@@ -227,43 +232,85 @@ async fn a_cold_collection_larger_than_the_hot_budget_stays_bounded_and_resumabl
         .unwrap();
     assert!(fetched.content.contains("unique-token"));
 
-    // 续排空：提高热上限后，后续 search 继续消费预算内的 pending 行，直到
-    // 队列真正排空——此时完整零命中才是合法结果。
-    engine.config.external_hot_metadata_max_entries = COLD_TOTAL * 2;
+    // 续排空（S3 形状，替代旧的「提高热上限排空全历史」）：热上限固定不动，
+    // 用上一次 coverage 发出的 continuation 续查——窗口轮转把已覆盖的热页
+    // 换回 pending、drain 跳过它们直接读下一批未读页——直到本次查询的候选
+    // 区域真正走完。此时完整零命中才是合法结果，且全程热目录不越固定上限。
+    let mut continuation = engine.last_search_coverage().continuation.clone();
+    let mut seen: std::collections::HashSet<agent_contracts::ContextItemId> =
+        hits.iter().map(|hit| hit.item_id).collect();
     let mut passes = 0;
-    loop {
+    while let Some(token) = continuation {
         passes += 1;
-        let state = engine.state.lock().await;
-        let pending_left = state.pending_external_cards.len();
-        drop(state);
-        if pending_left == 0 {
-            break;
-        }
         assert!(
             passes <= 8,
-            "each pass consumes at most the items budget; the queue must converge"
+            "each continuation advances at least one cold page; the walk must converge"
         );
-        engine
-            .search_external(ContextSearchQuery::new("unique-token", 8))
+        let page_hits = engine
+            .search_external_continuation(ContextSearchQuery::new("unique-token", 20), &token)
             .await
-            .unwrap();
+            .expect("a query-bound continuation always serves the next page");
+        seen.extend(page_hits.iter().map(|hit| hit.item_id));
+        let coverage = engine.last_search_coverage();
+        {
+            let state = engine.state.lock().await;
+            assert!(
+                state.external.len() <= HOT_METADATA_CAP,
+                "the fixed hot cap holds through the whole page walk: {}",
+                state.external.len()
+            );
+        }
+        continuation = coverage.continuation.clone();
+        if coverage.complete {
+            break;
+        }
     }
+    assert_eq!(
+        seen.len(),
+        COLD_TOTAL,
+        "the continuation walk reaches every cold page's metadata without raising the cap"
+    );
     {
         let state = engine.state.lock().await;
-        assert_eq!(
-            state.external.len(),
-            COLD_TOTAL,
-            "the resumed drains eventually page the whole collection back in"
+        assert!(
+            state.external.len() <= HOT_METADATA_CAP,
+            "the walk ends within the fixed cap, not with the history resident: {}",
+            state.external.len()
         );
     }
-    let empty = engine
+    // 新查询的零命中在热上限处依旧 fail-closed（B2 语义保留，错误带出自己的
+    // continuation）；把这个查询自己的候选区域也走完，完整零命中才是合法 Ok。
+    let zero_error = engine
         .search_external(ContextSearchQuery::new("zzz-no-such-token", 8))
         .await
-        .unwrap();
+        .expect_err("a capped zero-match must fail closed");
     assert!(
-        empty.is_empty(),
-        "with hydration complete, a zero-match may finally be reported as complete"
+        zero_error.to_string().contains("continuation="),
+        "the fail-closed error names the way forward: {zero_error}"
     );
+    let mut zero_token = engine
+        .last_search_coverage()
+        .continuation
+        .expect("the failed-closed pass recorded its coverage facts");
+    let mut zero_passes = 0;
+    loop {
+        zero_passes += 1;
+        assert!(zero_passes <= 8, "the zero-match walk must converge");
+        let outcome = engine
+            .search_external_continuation(
+                ContextSearchQuery::new("zzz-no-such-token", 8),
+                &zero_token,
+            )
+            .await;
+        if let Ok(empty) = outcome {
+            assert!(empty.is_empty(), "the completed zero-match is empty");
+            break;
+        }
+        let coverage = engine.last_search_coverage();
+        zero_token = coverage
+            .continuation
+            .expect("an incomplete pass issues the next continuation");
+    }
     let _ = ids;
 
     // 热资源不随全历史永久增长：在预算内往返后（提额续排空之前的形状），

@@ -1874,11 +1874,33 @@ mod tests {
                 scope,
                 task_id,
                 label,
+                continuation,
             } => {
                 assert_eq!(query, "AuthService");
                 assert_eq!(limit, 8);
                 assert!(kind.is_none() && scope.is_none() && task_id.is_none());
                 assert!(label.is_none());
+                assert!(continuation.is_none());
+            }
+            other => panic!("expected SearchExternal, got {other:?}"),
+        }
+
+        // S3: a cold-page continuation rides the search query to the engine.
+        let outcome = dispatcher
+            .execute(request(
+                "context.manage",
+                json!({
+                    "op": "search",
+                    "query": "AuthService",
+                    "limit": 8,
+                    "continuation": "cold-window-1"
+                }),
+            ))
+            .await
+            .unwrap();
+        match query(outcome) {
+            agent_contracts::EngineQuery::SearchExternal { continuation, .. } => {
+                assert_eq!(continuation.as_deref(), Some("cold-window-1"));
             }
             other => panic!("expected SearchExternal, got {other:?}"),
         }

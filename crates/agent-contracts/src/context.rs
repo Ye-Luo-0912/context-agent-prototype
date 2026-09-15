@@ -2516,6 +2516,13 @@ pub struct ContextGcReport {
     /// feeding the engine before memory grows without bound.
     #[serde(default)]
     pub externalize_backpressure: bool,
+    /// S3: true when this pass ended with the resident external-metadata
+    /// directory still over the hot cap because no demotable entry remained
+    /// (pinned or card-less). Owners are never dropped to enforce the cap,
+    /// so this is the honest "hot residency over budget, nothing safe to
+    /// demote" backpressure fact — not a silent success.
+    #[serde(default)]
+    pub hot_metadata_backpressure: bool,
     /// CTX-8: store writes and recall reads that failed this pass. A failed
     /// write keeps its item owned in the retry list; a failed read leaves
     /// its entry in the map. Neither is silently swallowed any more.
@@ -2848,6 +2855,79 @@ pub struct ContextSearchObservation {
     pub cold_reads: u32,
     pub cold_read_bytes: u64,
     pub cold_read_ms: u64,
+}
+
+/// Why one search's candidate coverage over the cold external tail stopped
+/// short. `Complete` is the only value that means "every candidate region was
+/// visible to this pass"; every other value means the hit list is a ranked
+/// result over a *partial* view, never a claim about the whole catalog.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ContextSearchCoverageStop {
+    /// The whole external set was in memory for this pass.
+    #[default]
+    Complete,
+    /// The operation's items budget or wall-clock deadline was spent between
+    /// read batches.
+    Budget,
+    /// A single cold read was cancelled at the deadline boundary; its page
+    /// stays pending.
+    Deadline,
+    /// The resident-metadata cap (entries or estimated bytes) is reached.
+    HotCap,
+    /// Every remaining cold page hit a transient read failure this pass.
+    Unreadable,
+}
+
+impl std::fmt::Display for ContextSearchCoverageStop {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let name = match self {
+            Self::Complete => "complete",
+            Self::Budget => "budget",
+            Self::Deadline => "deadline",
+            Self::HotCap => "hot-cap",
+            Self::Unreadable => "unreadable",
+        };
+        f.write_str(name)
+    }
+}
+
+/// S3: typed candidate-coverage facts for the most recent
+/// [`ContextEngine::search_external`]. Distinct from "result capped at
+/// limit": a cap means ranked Top-K truncation over the visible region,
+/// while an incomplete coverage means some candidate pages were never
+/// examined at all. `continuation` carries the opaque token the caller can
+/// pass back (a repeated search with the same query plus that token) to
+/// advance the cold-page window; it is bound to the query that produced it
+/// and is only issued while pages remain unread.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ContextSearchCoverage {
+    /// True only when no candidate region was left unexamined.
+    pub complete: bool,
+    /// Cold pages (pending spill rows) that were not readable in memory for
+    /// this pass.
+    pub unread_pages: usize,
+    pub stop: ContextSearchCoverageStop,
+    /// Opaque token for the next page, issued by the engine that served the
+    /// search. `None` when the coverage is complete.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub continuation: Option<String>,
+}
+
+impl ContextSearchCoverage {
+    pub fn complete() -> Self {
+        Self {
+            complete: true,
+            unread_pages: 0,
+            stop: ContextSearchCoverageStop::Complete,
+            continuation: None,
+        }
+    }
+}
+
+impl Default for ContextSearchCoverage {
+    fn default() -> Self {
+        Self::complete()
+    }
 }
 
 impl ContextSearchQuery {
@@ -3198,6 +3278,31 @@ pub trait ContextEngine: Send + Sync {
     /// the zero default.
     fn last_search_observation(&self) -> ContextSearchObservation {
         ContextSearchObservation::default()
+    }
+
+    /// S3: typed candidate coverage of the most recent `search_external` /
+    /// `search_external_continuation` on this engine. Call immediately after
+    /// that search; the facts describe exactly that pass. Engines that always
+    /// see their whole catalog keep the complete default — an incomplete
+    /// coverage must never be invented by a caller.
+    fn last_search_coverage(&self) -> ContextSearchCoverage {
+        ContextSearchCoverage::complete()
+    }
+
+    /// S3: the same bounded catalog search, resumed at the cold-page window a
+    /// previous incomplete pass named with its coverage `continuation` token.
+    /// The token is bound to the query that produced it: an engine may treat a
+    /// stale, mismatched or unknown token as a fresh search rather than an
+    /// error (rotation is reversible; the coverage facts stay authoritative).
+    /// Default ignores the token and forwards to [`Self::search_external`] —
+    /// correct for engines whose catalog is always fully in memory.
+    async fn search_external_continuation(
+        &self,
+        query: ContextSearchQuery,
+        continuation: &str,
+    ) -> AgentResult<Vec<ExternalizedContext>> {
+        let _ = continuation;
+        self.search_external(query).await
     }
 
     /// One catalog entry's metadata by item id. Resident/Warm projections

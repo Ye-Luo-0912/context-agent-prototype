@@ -4,9 +4,10 @@ use agent_contracts::{
     CONTEXT_SEARCH_MAX_QUERY_CHARS, ContextDiagnostics, ContextIngress, ContextItem, ContextItemId,
     ContextItemSummary, ContextKind, ContextMaintenanceReport, ContextMaintenanceTrigger,
     ContextQuery, ContextRef, ContextResidency, ContextRetention, ContextScope,
-    ContextSearchObservation, ContextStateTransition, ExternalizedContext, MaterializedContext,
-    ScopeId, ScopeKind, SemanticState, ToolRisk, ToolSemanticRole, ToolSpec, ToolSurfaceDemand,
-    ToolSurfaceOmission, ToolSurfaceOmissionReason, TurnId,
+    ContextSearchCoverage, ContextSearchCoverageStop, ContextSearchObservation,
+    ContextStateTransition, ExternalizedContext, MaterializedContext, ScopeId, ScopeKind,
+    SemanticState, ToolRisk, ToolSemanticRole, ToolSpec, ToolSurfaceDemand, ToolSurfaceOmission,
+    ToolSurfaceOmissionReason, TurnId,
 };
 fn call(name: &str) -> ToolCall {
     ToolCall {
@@ -212,6 +213,10 @@ struct RecordingEngine {
     inspect_summaries: std::sync::Mutex<Vec<ContextItemSummary>>,
     fetched: std::sync::Mutex<Option<ContextItem>>,
     search_error: std::sync::Mutex<Option<String>>,
+    /// S3: the typed coverage the next search should report, and the
+    /// continuation tokens that reached the engine.
+    search_coverage: std::sync::Mutex<Option<ContextSearchCoverage>>,
+    continued_tokens: std::sync::Mutex<Vec<String>>,
 }
 
 #[async_trait::async_trait]
@@ -260,6 +265,24 @@ impl ContextEngine for RecordingEngine {
             cold_read_bytes: 12,
             cold_read_ms: 7,
         }
+    }
+    async fn search_external_continuation(
+        &self,
+        query: ContextSearchQuery,
+        continuation: &str,
+    ) -> AgentResult<Vec<ExternalizedContext>> {
+        self.continued_tokens
+            .lock()
+            .unwrap()
+            .push(continuation.to_string());
+        self.search_external(query).await
+    }
+    fn last_search_coverage(&self) -> ContextSearchCoverage {
+        self.search_coverage
+            .lock()
+            .unwrap()
+            .clone()
+            .unwrap_or_else(ContextSearchCoverage::complete)
     }
     async fn inspect_external(
         &self,
@@ -382,6 +405,111 @@ fn external_entry(source: Option<&str>) -> ExternalizedContext {
     }
 }
 
+/// S3 (R4, red-first): a non-empty but incomplete search must carry the
+/// coverage facts in the MODEL-VISIBLE body — distinct from the limit-cap
+/// fact — and name the continuation that advances to the next cold page.
+/// The continuation token the model sends back must reach the engine.
+#[tokio::test]
+async fn incomplete_search_coverage_reaches_the_model_body_with_a_continuation() {
+    let engine = Arc::new(RecordingEngine {
+        searched_limits: Default::default(),
+        searched_queries: Default::default(),
+        search_hits: Default::default(),
+        inspect_external_entry: Default::default(),
+        inspect_summaries: Default::default(),
+        search_error: Default::default(),
+        fetched: Default::default(),
+        search_coverage: std::sync::Mutex::new(Some(ContextSearchCoverage {
+            complete: false,
+            unread_pages: 40,
+            stop: ContextSearchCoverageStop::HotCap,
+            continuation: Some("cold-window-3".into()),
+        })),
+        continued_tokens: Default::default(),
+    });
+    *engine.search_hits.lock().unwrap() = vec![external_entry(None)];
+    let kernel = test_kernel(
+        engine.clone(),
+        Arc::new(BigOutputDispatcher {
+            output: ToolOutput {
+                call_id: "c1".into(),
+                tool_name: "context.manage".into(),
+                ok: true,
+                summary: "placeholder".into(),
+                model_content: "placeholder".into(),
+                artifact_ref: None,
+                metadata: serde_json::Value::Null,
+            },
+        }),
+        None,
+    );
+    let placeholder = placeholder_output();
+    let output = kernel
+        .resolve_engine_query(
+            placeholder.clone(),
+            EngineQuery::SearchExternal {
+                query: "unique-token".into(),
+                kind: None,
+                scope: None,
+                task_id: None,
+                label: None,
+                limit: 20,
+                continuation: None,
+            },
+        )
+        .await;
+    assert!(output.ok);
+    assert!(
+        output.model_content.contains("coverage"),
+        "the model-visible body must carry the coverage fact: {}",
+        output.model_content
+    );
+    assert!(
+        output.model_content.contains("40"),
+        "the body names the unread remainder: {}",
+        output.model_content
+    );
+    assert!(
+        output.model_content.contains("cold-window-3"),
+        "the body names the continuation token: {}",
+        output.model_content
+    );
+    assert!(
+        !output.metadata["result_capped"].as_bool().unwrap_or(true),
+        "1 hit against limit 20 is coverage-incomplete, not result-capped"
+    );
+    assert_eq!(
+        output.metadata["coverage"]["complete"].as_bool(),
+        Some(false)
+    );
+    assert_eq!(
+        output.metadata["coverage"]["unread_pages"].as_u64(),
+        Some(40)
+    );
+
+    // The continuation the model sends back reaches the engine.
+    let continued = kernel
+        .resolve_engine_query(
+            placeholder,
+            EngineQuery::SearchExternal {
+                query: "unique-token".into(),
+                kind: None,
+                scope: None,
+                task_id: None,
+                label: None,
+                limit: 20,
+                continuation: Some("cold-window-3".into()),
+            },
+        )
+        .await;
+    assert!(continued.ok);
+    assert_eq!(
+        engine.continued_tokens.lock().unwrap().as_slice(),
+        &["cold-window-3".to_string()],
+        "the model's continuation token must reach the engine"
+    );
+}
+
 fn surface_with(name: &str) -> ToolSurfaceSnapshot {
     ToolSurfaceSnapshot {
         specs: vec![ToolSpec {
@@ -418,6 +546,8 @@ async fn output_broker_bounds_tool_results_before_the_actor() {
             inspect_external_entry: Default::default(),
             inspect_summaries: Default::default(),
             search_error: Default::default(),
+            search_coverage: Default::default(),
+            continued_tokens: Default::default(),
             fetched: Default::default(),
         }),
         dispatcher,
@@ -474,6 +604,8 @@ async fn no_broker_keeps_the_outcome_untouched() {
             inspect_external_entry: Default::default(),
             inspect_summaries: Default::default(),
             search_error: Default::default(),
+            search_coverage: Default::default(),
+            continued_tokens: Default::default(),
             fetched: Default::default(),
         }),
         dispatcher,
@@ -511,6 +643,8 @@ async fn context_fetch_results_are_bounded_after_resolve() {
         inspect_external_entry: Default::default(),
         inspect_summaries: Default::default(),
         search_error: Default::default(),
+        search_coverage: Default::default(),
+        continued_tokens: Default::default(),
         fetched: std::sync::Mutex::new(Some(test_item("big".repeat(200_000)))),
     });
     let kernel = test_kernel(
@@ -572,6 +706,8 @@ async fn search_limit_is_clamped_in_execution() {
         inspect_external_entry: Default::default(),
         inspect_summaries: Default::default(),
         search_error: Default::default(),
+        search_coverage: Default::default(),
+        continued_tokens: Default::default(),
         fetched: Default::default(),
     });
     let kernel = test_kernel(
@@ -608,6 +744,7 @@ async fn search_limit_is_clamped_in_execution() {
                 task_id: None,
                 label: None,
                 limit: 1_000_000,
+                continuation: None,
             },
         )
         .await;
@@ -624,6 +761,8 @@ async fn search_limit_zero_keeps_the_engine_default() {
         inspect_external_entry: Default::default(),
         inspect_summaries: Default::default(),
         search_error: Default::default(),
+        search_coverage: Default::default(),
+        continued_tokens: Default::default(),
         fetched: Default::default(),
     });
     let kernel = test_kernel(
@@ -660,6 +799,7 @@ async fn search_limit_zero_keeps_the_engine_default() {
                 task_id: None,
                 label: None,
                 limit: 0,
+                continuation: None,
             },
         )
         .await;
@@ -682,6 +822,8 @@ async fn search_query_length_is_bounded_in_execution() {
         inspect_external_entry: Default::default(),
         inspect_summaries: Default::default(),
         search_error: Default::default(),
+        search_coverage: Default::default(),
+        continued_tokens: Default::default(),
         fetched: Default::default(),
     });
     let kernel = test_kernel(
@@ -718,6 +860,7 @@ async fn search_query_length_is_bounded_in_execution() {
                 task_id: None,
                 label: None,
                 limit: 10,
+                continuation: None,
             },
         )
         .await;
@@ -740,6 +883,8 @@ async fn empty_search_distinguishes_no_evidence_from_filter_miss() {
         inspect_external_entry: Default::default(),
         inspect_summaries: Default::default(),
         search_error: Default::default(),
+        search_coverage: Default::default(),
+        continued_tokens: Default::default(),
         fetched: Default::default(),
     });
     let kernel = test_kernel(
@@ -776,6 +921,7 @@ async fn empty_search_distinguishes_no_evidence_from_filter_miss() {
                 task_id: None,
                 label: None,
                 limit: 10,
+                continuation: None,
             },
         )
         .await;
@@ -794,6 +940,7 @@ async fn empty_search_distinguishes_no_evidence_from_filter_miss() {
                 task_id: None,
                 label: None,
                 limit: 10,
+                continuation: None,
             },
         )
         .await;
@@ -819,6 +966,8 @@ async fn search_hits_render_the_source_authority() {
         inspect_external_entry: Default::default(),
         inspect_summaries: Default::default(),
         search_error: Default::default(),
+        search_coverage: Default::default(),
+        continued_tokens: Default::default(),
         fetched: Default::default(),
     });
     let kernel = test_kernel(
@@ -854,6 +1003,7 @@ async fn search_hits_render_the_source_authority() {
                 task_id: None,
                 label: None,
                 limit: 10,
+                continuation: None,
             },
         )
         .await;
@@ -903,6 +1053,8 @@ async fn a_capped_catalog_search_says_the_cap_in_the_body() {
         inspect_external_entry: Default::default(),
         inspect_summaries: Default::default(),
         search_error: Default::default(),
+        search_coverage: Default::default(),
+        continued_tokens: Default::default(),
         fetched: Default::default(),
     });
     let kernel = test_kernel(
@@ -939,6 +1091,7 @@ async fn a_capped_catalog_search_says_the_cap_in_the_body() {
                 task_id: None,
                 label: None,
                 limit: 2,
+                continuation: None,
             },
         )
         .await;
@@ -962,6 +1115,7 @@ async fn a_capped_catalog_search_says_the_cap_in_the_body() {
                 task_id: None,
                 label: None,
                 limit: 10,
+                continuation: None,
             },
         )
         .await;
@@ -983,6 +1137,8 @@ async fn inspect_renders_the_source_authority() {
         inspect_external_entry: std::sync::Mutex::new(Some(external_entry(Some("tool-session")))),
         inspect_summaries: Default::default(),
         search_error: Default::default(),
+        search_coverage: Default::default(),
+        continued_tokens: Default::default(),
         fetched: Default::default(),
     });
     let kernel = test_kernel(
@@ -1124,6 +1280,7 @@ async fn search_provider_error_is_unavailable() {
                 task_id: None,
                 label: None,
                 limit: 10,
+                continuation: None,
             },
         )
         .await;
@@ -1143,6 +1300,8 @@ async fn fetch_renders_the_source_authority() {
         inspect_external_entry: Default::default(),
         inspect_summaries: Default::default(),
         search_error: Default::default(),
+        search_coverage: Default::default(),
+        continued_tokens: Default::default(),
         fetched: std::sync::Mutex::new(Some(item)),
     });
     let kernel = test_kernel(
@@ -1250,6 +1409,8 @@ async fn execute_tool_publishes_the_shadow_decision_event() {
             inspect_external_entry: Default::default(),
             inspect_summaries: Default::default(),
             search_error: Default::default(),
+            search_coverage: Default::default(),
+            continued_tokens: Default::default(),
             fetched: Default::default(),
         }),
         Arc::new(BigOutputDispatcher {
@@ -1355,6 +1516,8 @@ async fn execute_tool_mints_a_commit_time_lease_for_side_effecting_calls() {
             inspect_external_entry: Default::default(),
             inspect_summaries: Default::default(),
             search_error: Default::default(),
+            search_coverage: Default::default(),
+            continued_tokens: Default::default(),
             fetched: Default::default(),
         }),
         Arc::new(EchoDispatcher {
@@ -1486,6 +1649,8 @@ async fn execute_tool_rejects_a_stale_authority_epoch_before_dispatch() {
             inspect_external_entry: Default::default(),
             inspect_summaries: Default::default(),
             search_error: Default::default(),
+            search_coverage: Default::default(),
+            continued_tokens: Default::default(),
             fetched: Default::default(),
         }),
         Arc::new(CountingTools(executions.clone())),
@@ -1577,6 +1742,8 @@ async fn execute_tool_rechecks_epoch_after_awaiting_approval() {
             inspect_external_entry: Default::default(),
             inspect_summaries: Default::default(),
             search_error: Default::default(),
+            search_coverage: Default::default(),
+            continued_tokens: Default::default(),
             fetched: Default::default(),
         }),
         Arc::new(CountingTools(executions.clone())),
@@ -1644,6 +1811,8 @@ async fn lease_is_minted_even_when_the_shadow_gate_denies() {
             inspect_external_entry: Default::default(),
             inspect_summaries: Default::default(),
             search_error: Default::default(),
+            search_coverage: Default::default(),
+            continued_tokens: Default::default(),
             fetched: Default::default(),
         }),
         Arc::new(EchoDispatcher {
