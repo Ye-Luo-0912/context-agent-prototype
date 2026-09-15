@@ -29,11 +29,20 @@ use tokio::io::{AsyncBufRead, AsyncWrite, AsyncWriteExt};
 /// be exercised against engines without a GC/store at all. `store_dir`
 /// (from `--store-dir`) pins the context store under the caller-provided
 /// state dir; `None` falls back to the engine's temp-dir default — never a
-/// CWD-relative path.
-pub fn build_engine(engine: &str, store_dir: Option<PathBuf>) -> Arc<dyn ContextEngine> {
+/// CWD-relative path. `cold_paging` (from `--cold-paging`) pins the dynamic
+/// engine's cold-paging knobs below production defaults for boundary parity
+/// tests; `None` keeps the production defaults.
+pub fn build_engine(
+    engine: &str,
+    store_dir: Option<PathBuf>,
+    cold_paging: Option<(usize, usize, usize)>,
+) -> Arc<dyn ContextEngine> {
     match engine {
         "dynamic" => Arc::new(SimpleContextEngine::new(SimpleContextConfig {
             context_store_dir: store_dir,
+            external_restore_card_batch: cold_paging.map(|(restore, _, _)| restore).unwrap_or(256),
+            external_hot_metadata_max_entries: cold_paging.map(|(_, hot, _)| hot).unwrap_or(8192),
+            external_hydrate_max_items: cold_paging.map(|(_, _, items)| items).unwrap_or(4096),
             ..SimpleContextConfig::default()
         })),
         "append" => Arc::new(AppendOnlyEngine::new()),
@@ -99,6 +108,18 @@ pub async fn handle(op: ServiceOp, engine: &dyn ContextEngine) -> Result<Value, 
         ServiceOp::SearchExternal { query } => {
             let entries = engine.search_external(query).await?;
             serde_json::to_value(entries).map_err(|e| AgentError::Context(e.to_string()))
+        }
+        ServiceOp::SearchExternalReport {
+            query,
+            continuation,
+        } => {
+            // W2 (V3): the atomic pass — hits, coverage and observation of
+            // exactly this search cross the wire in one value, so the
+            // adapter never has to re-read a side channel it cannot trust.
+            let report = engine
+                .search_external_report(query, continuation.as_deref())
+                .await?;
+            serde_json::to_value(report).map_err(|e| AgentError::Context(e.to_string()))
         }
         ServiceOp::InspectExternal { item_id } => {
             let entry = engine.inspect_external(item_id).await?;
@@ -215,6 +236,7 @@ where
         }
 
         let shutdown = matches!(request.op, ServiceOp::Shutdown);
+        let is_ping = matches!(request.op, ServiceOp::Ping);
         let result = handle(request.op, engine).await;
         let response = match result {
             Ok(value) => ServiceResponse::ok(id, value),
@@ -222,6 +244,15 @@ where
                 ServiceResponse::error(id, ServiceErrorCategory::Engine, false, error.to_string())
             }
         };
+        let mut response = response;
+        if is_ping {
+            // W2 (V3): the handshake pong advertises this build's feature
+            // table as a top-level frame field — the shared process host
+            // intersects it with what the adapter offered, so an old
+            // service (no field) is an explicit capability absence the
+            // adapter reports as Unsupported instead of defaulting facts.
+            response.features = Some(context_contextcore::service_features());
+        }
         let disposition = write_response(writer, &response, max_frame_bytes).await?;
         if shutdown {
             return Ok(SessionEnd::Clean);

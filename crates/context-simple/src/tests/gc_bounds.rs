@@ -145,8 +145,14 @@ fn dropped_externalize_plan_keeps_items_owned_by_the_state() {
     state.eviction_buffer.push(overflow_a);
     state.eviction_buffer.push(overflow_b);
 
-    let plan = crate::gc::full::plan_full_gc(&mut state, &config, 1, 1)
-        .expect("a pass is due: the buffer holds content");
+    let plan = crate::gc::full::plan_full_gc(
+        &mut state,
+        &config,
+        1,
+        1,
+        &crate::scope::ScopeRetirementPermit::closure_complete(),
+    )
+    .expect("a pass is due: the buffer holds content");
     // Cap 1 with 2 buffered items: one overflows (the oldest), joining the
     // prior spill — both are planned, both stay owned by the retry list.
     assert_eq!(
@@ -181,8 +187,14 @@ fn dropped_externalize_plan_keeps_items_owned_by_the_state() {
 
     // The next pass plans again; at commit, only the writes that actually
     // landed leave the retry list.
-    let plan = crate::gc::full::plan_full_gc(&mut state, &config, 2, 2)
-        .expect("the retry list keeps the pass due");
+    let plan = crate::gc::full::plan_full_gc(
+        &mut state,
+        &config,
+        2,
+        2,
+        &crate::scope::ScopeRetirementPermit::closure_complete(),
+    )
+    .expect("the retry list keeps the pass due");
     let io = crate::gc::full::GcIoResult {
         externalized: vec![(spill_id, "checksum".to_string())],
         recalled: Vec::new(),
@@ -244,8 +256,14 @@ fn a_pending_only_state_still_runs_the_pass_and_lands_the_retry() {
         "the precondition: only pending holds content"
     );
 
-    let plan = crate::gc::full::plan_full_gc(&mut state, &config, 1, 1)
-        .expect("the pending retry list keeps the maintenance pass due");
+    let plan = crate::gc::full::plan_full_gc(
+        &mut state,
+        &config,
+        1,
+        1,
+        &crate::scope::ScopeRetirementPermit::closure_complete(),
+    )
+    .expect("the pending retry list keeps the maintenance pass due");
     assert_eq!(
         plan.externalize.len(),
         1,

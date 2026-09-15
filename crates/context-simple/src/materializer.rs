@@ -1207,10 +1207,72 @@ pub(crate) struct RequiredBody {
     identity: ContextMaterializationIdentity,
 }
 
+/// W1 (V2): what the pre-planning cold-directory resolution proved about
+/// the bounded set of required refs. Produced by the engine's per-id lane
+/// and bounded pending scan; consumed by
+/// [`plan_required_with_resolution`] so a miss names its actual cause
+/// instead of folding every unresolved state into `Missing`.
+#[derive(Debug, Default)]
+pub(crate) struct RequiredColdResolution {
+    /// Typed per-id outcome for every exact-id claim that named a pending
+    /// row. `Installed`/`AlreadyOwned` targets are found by the normal
+    /// planning lookups; the failure outcomes type the miss.
+    pub(crate) per_id: std::collections::HashMap<ContextItemId, crate::engine::PendingIdOutcome>,
+    /// Pending rows the bounded entity/path scan left unexamined. While
+    /// nonzero, an entity/path claim matching nothing loaded is an
+    /// *unproven absence* (`UnreadColdPage`), never `Missing`.
+    pub(crate) pending_unread: usize,
+}
+
+impl RequiredColdResolution {
+    /// The typed miss reason for one exact-id resolution outcome.
+    pub(crate) fn miss_reason(
+        outcome: crate::engine::PendingIdOutcome,
+    ) -> ContextMaterializationMissReason {
+        match outcome {
+            crate::engine::PendingIdOutcome::Corrupt => ContextMaterializationMissReason::Corrupt,
+            crate::engine::PendingIdOutcome::IoFailed => ContextMaterializationMissReason::IoFailed,
+            // Verified absent (or structurally invalid — the row was
+            // consumed): a permanent fact, honestly `Missing`.
+            crate::engine::PendingIdOutcome::Missing
+            | crate::engine::PendingIdOutcome::NoPendingRow => {
+                ContextMaterializationMissReason::Missing
+            }
+            // The planning lookups find these; a miss for them is not
+            // expected here.
+            crate::engine::PendingIdOutcome::Installed
+            | crate::engine::PendingIdOutcome::AlreadyOwned => {
+                ContextMaterializationMissReason::Missing
+            }
+        }
+    }
+}
+
 /// Plan every mandatory body under the state lock. This does not change
 /// residency or scoring: it only makes the already-defined Pinned and
 /// PromptRequired contract explicit when its body lives outside the heap.
+///
+/// W1 (V2): the engine's materialize path goes through
+/// [`plan_required_with_resolution`] with the bounded cold-directory
+/// resolution; this plain entry stays for unit tests that pin planning
+/// arithmetic against a loaded state (no pending directory involved).
+#[cfg(test)]
 pub(crate) fn plan_required(state: &State, query: &ContextQuery) -> RequiredPlan {
+    plan_required_with_resolution(state, query, &RequiredColdResolution::default())
+}
+
+/// W1 (V2): the planning entry the engine's materialize path uses. The
+/// resolution carries what the bounded cold-directory pass proved:
+/// - an exact-id claim whose pending card failed to read reports the typed
+///   cause (`Corrupt`/`IoFailed`), not a blanket `Missing`;
+/// - an entity/path claim matching nothing while `pending_unread` rows
+///   stayed unexamined reports `UnreadColdPage` — absence is unproven —
+///   and only a fully examined directory proves a zero-match `Missing`.
+pub(crate) fn plan_required_with_resolution(
+    state: &State,
+    query: &ContextQuery,
+    resolution: &RequiredColdResolution,
+) -> RequiredPlan {
     let mut items = Vec::new();
     let mut misses = ContextMaterializationMisses::default();
     let mut seen = HashSet::new();
@@ -1365,10 +1427,24 @@ pub(crate) fn plan_required(state: &State, query: &ContextQuery) -> RequiredPlan
             break;
         }
         if !matched {
-            misses.push(context_miss(
-                claim_identity(claim, None),
-                ContextMaterializationMissReason::Missing,
-            ));
+            // W1 (V2): name the actual cause instead of a blanket Missing.
+            // An exact-id claim whose pending card was resolved through the
+            // per-id lane reports the typed read outcome; an entity/path
+            // claim over an unexamined cold remainder is an unproven
+            // absence (`UnreadColdPage`) — only a fully examined directory
+            // proves a zero-match.
+            let reason = match ContextItemId::parse_ref(&claim.item_ref) {
+                Ok(id) => resolution
+                    .per_id
+                    .get(&id)
+                    .map(|outcome| RequiredColdResolution::miss_reason(*outcome))
+                    .unwrap_or(ContextMaterializationMissReason::Missing),
+                Err(_) if resolution.pending_unread > 0 => {
+                    ContextMaterializationMissReason::UnreadColdPage
+                }
+                Err(_) => ContextMaterializationMissReason::Missing,
+            };
+            misses.push(context_miss(claim_identity(claim, None), reason));
         }
     }
 

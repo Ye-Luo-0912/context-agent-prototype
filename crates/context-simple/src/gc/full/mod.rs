@@ -58,6 +58,11 @@ pub(crate) struct GcPlan {
     /// CTX-9: closed, fully unreferenced scope nodes retired this pass
     /// (bounded fact notes kept).
     pub(crate) scopes_retired: u64,
+    /// W1 (V1): true when the pass deferred scope retirement because the
+    /// pending cold directory could not be examined whole — the retirement
+    /// scan must not remove a node an unread card may reference. Surfaced
+    /// as `ContextGcReport::scope_retirement_deferred`.
+    pub(crate) scope_retirement_deferred: bool,
     /// CTX-8/9/10: the pass's completion snapshot (certain facts plus the
     /// conservative post-overflow rule). Built once, shared by the sweep,
     /// the reactivate phase and the commit's stamp release.
@@ -103,6 +108,7 @@ pub(crate) fn plan_full_gc(
     config: &SimpleContextConfig,
     now_tick: u64,
     turn: u64,
+    retirement_permit: &crate::scope::ScopeRetirementPermit,
 ) -> Option<GcPlan> {
     if !config.gc_enabled {
         return None;
@@ -126,8 +132,16 @@ pub(crate) fn plan_full_gc(
         // can still carry an oversized closed-scope tree (10k finished
         // tool frames), and exactly that state has nothing else left to
         // do. Retire here so the tree never waits for a body to exist.
-        let retired = crate::scope::retire_closed_scopes(state, config.scope_retire_target) as u64;
-        if retired == 0 {
+        // W1 (V1): the retirement permit gates this path too; a deferred
+        // oversized tree is reported instead of silently skipped.
+        let deferred =
+            retirement_permit.is_unknown() && state.scopes.len() > config.scope_retire_target;
+        let retired = crate::scope::retire_closed_scopes(
+            state,
+            config.scope_retire_target,
+            retirement_permit,
+        ) as u64;
+        if retired == 0 && !deferred {
             return None;
         }
         return Some(GcPlan {
@@ -143,6 +157,7 @@ pub(crate) fn plan_full_gc(
             externalize_deferred: 0,
             externalize_backpressure: false,
             scopes_retired: retired,
+            scope_retirement_deferred: deferred,
             completed_tasks: crate::scope::CompletionFacts::default(),
         });
     }
@@ -167,6 +182,7 @@ pub(crate) fn plan_full_gc(
         externalize_deferred: 0,
         externalize_backpressure: false,
         scopes_retired: 0,
+        scope_retirement_deferred: false,
         completed_tasks: crate::scope::CompletionFacts::default(),
     };
 
@@ -400,8 +416,16 @@ pub(crate) fn plan_full_gc(
     // size, keeping bounded fact notes (completion facts included). Runs
     // after the sweep/externalize decisions, so freshly closed chains whose
     // stamps were released can leave memory in the same pass.
+    //
+    // W1 (V1): the permit carries the probed reference closure of the
+    // unread pending cards — with an unproven remainder nothing retires and
+    // the deferral is reported (an oversized tree stays bounded in the
+    // report, never silently skipped).
+    plan.scope_retirement_deferred =
+        retirement_permit.is_unknown() && state.scopes.len() > config.scope_retire_target;
     plan.scopes_retired =
-        crate::scope::retire_closed_scopes(state, config.scope_retire_target) as u64;
+        crate::scope::retire_closed_scopes(state, config.scope_retire_target, retirement_permit)
+            as u64;
 
     plan.marked_roots = marked.len();
     Some(plan)
@@ -640,6 +664,7 @@ pub(crate) fn commit_full_gc(
         externalize_backpressure: plan.externalize_backpressure,
         store_io_failures: io_failures,
         scopes_retired: plan.scopes_retired,
+        scope_retirement_deferred: plan.scope_retirement_deferred,
         store_write_bytes,
         store_read_bytes,
         store_recalled_items,

@@ -10,6 +10,7 @@ autotests = false
 
 [dependencies]
 agent-contracts.workspace = true
+agent-platform-protocol.workspace = true
 agent-process.workspace = true
 async-trait.workspace = true
 serde.workspace = true

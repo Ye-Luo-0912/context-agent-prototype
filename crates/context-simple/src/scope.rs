@@ -692,19 +692,68 @@ pub(crate) struct RetiredScopeNote {
 /// hot metadata stays bounded in memory and checkpoint size.
 pub(crate) const MAX_RETIRED_SCOPE_NOTES: usize = 512;
 
+/// W1 (V1): the scope-retirement permission derived from the pending cold
+/// directory's reference closure. The retirement scan enumerates heap /
+/// Warm / write-retry / loaded-external / active-scope references in
+/// memory; an *unread* pending spill card's `scope_id` is invisible to it.
+/// A card referencing a retired scope is structurally invalid on read-back
+/// (its locator is consumed), so retirement must not remove a node an
+/// unread page may reference until the closure is proven:
+///
+/// - `pending_scope_refs`: scope ids that pending cards verifiably
+///   reference (a bounded disk-side probe read them);
+/// - `pending_unknown`: the probe could not examine every pending row
+///   (budget, deadline or a transient read failure) — no retirement proof
+///   exists this pass, so *all* retirement defers (conservative, never a
+///   silent skip; the queue stays resumable and later passes converge).
+///
+/// This is the short-term shape. The long-term fix is a scope reference
+/// count maintained atomically with the paging owner/migration/checkpoint
+/// path — not a second source of truth bolted on here.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct ScopeRetirementPermit {
+    pub(crate) pending_scope_refs: std::collections::HashSet<ScopeId>,
+    pub(crate) pending_unknown: bool,
+}
+
+impl ScopeRetirementPermit {
+    /// The pending queue drained this pass: every cold card's references
+    /// are in the loaded indexes, so the in-memory scan is the whole truth.
+    pub(crate) fn closure_complete() -> Self {
+        Self::default()
+    }
+
+    pub(crate) fn is_unknown(&self) -> bool {
+        self.pending_unknown
+    }
+}
+
 /// CTX-9: retire closed scopes that nothing references anymore, keeping a
 /// bounded fact note per retirement. A scope is retirable when all hold:
 /// - closed and not the session scope (the session never retires);
 /// - no item / external entry / the active scope carries its id (direct
 ///   referents);
+/// - no *unread pending card* references it (W1 V1: the permit carries the
+///   probed closure — with an unproven remainder nothing retires);
 /// - every remaining scope under it is itself retirable (chain integrity:
 ///   subtree walks and ancestor closes must never hit a missing node) —
 ///   decided bottom-up, so a whole unreferenced chain retires in one pass.
 ///
 /// The pass runs only above `target_len`; it never opens, closes or
 /// re-parents anything. Returns how many scopes were retired.
-pub(crate) fn retire_closed_scopes(state: &mut State, target_len: usize) -> usize {
+pub(crate) fn retire_closed_scopes(
+    state: &mut State,
+    target_len: usize,
+    permit: &ScopeRetirementPermit,
+) -> usize {
     if state.scopes.len() <= target_len {
+        return 0;
+    }
+    // W1 (V1): an unproven pending remainder blocks every retirement this
+    // pass — retiring a node an unread card references would consume that
+    // card's locator on read-back (structurally invalid scope). Prefer
+    // deferring (fewer retirements) over breaking reachability.
+    if permit.pending_unknown {
         return 0;
     }
     let mut referenced: std::collections::HashSet<ScopeId> = state
@@ -725,6 +774,7 @@ pub(crate) fn retire_closed_scopes(state: &mut State, target_len: usize) -> usiz
             .filter_map(|item| item.scope_id),
     );
     referenced.extend(state.external.iter().filter_map(|entry| entry.scope_id));
+    referenced.extend(permit.pending_scope_refs.iter().copied());
     if let Some(active) = state.active_scope_id {
         referenced.insert(active);
     }

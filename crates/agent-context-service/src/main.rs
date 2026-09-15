@@ -33,6 +33,7 @@ async fn main() {
     let mut engine = None;
     let mut store_dir = None;
     let mut max_frame_bytes = DEFAULT_CONTEXT_SERVICE_MAX_FRAME_BYTES;
+    let mut cold_paging: Option<(usize, usize, usize)> = None;
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
         match arg.as_str() {
@@ -54,6 +55,28 @@ async fn main() {
                 };
                 max_frame_bytes = value.parse().expect("--max-frame-bytes must be a number");
             }
+            "--cold-paging" => {
+                // W2 (V3) parity affordance: pin the dynamic engine's cold
+                // paging knobs (restore card batch, hot-metadata entries,
+                // per-op hydrate items) below production defaults so the
+                // boundary tests can reproduce a typed incomplete pass on a
+                // small fixture. Production leaves it unset.
+                let Some(value) = args.next() else {
+                    usage();
+                };
+                let parts: Vec<&str> = value.split(',').collect();
+                if parts.len() != 3 {
+                    usage();
+                }
+                let parsed: Vec<usize> = parts
+                    .iter()
+                    .map(|part| part.parse().expect("--cold-paging values must be numbers"))
+                    .collect();
+                if parsed.contains(&0) {
+                    usage();
+                }
+                cold_paging = Some((parsed[0], parsed[1], parsed[2]));
+            }
             other => {
                 eprintln!("unknown argument: {other}");
                 usage();
@@ -69,7 +92,7 @@ async fn main() {
         );
         std::process::exit(2);
     }
-    let engine = build_engine(&engine_name, store_dir.clone());
+    let engine = build_engine(&engine_name, store_dir.clone(), cold_paging);
     let engine: &dyn ContextEngine = engine.as_ref();
 
     // Startup store reconcile, part of the serve transaction: converge the

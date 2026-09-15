@@ -264,6 +264,14 @@ pub struct SimpleContextConfig {
     /// cap it stops bulk paging only; owners are never dropped. Default
     /// 32 MiB.
     pub external_hot_metadata_max_bytes: u64,
+    /// W2 (V4): chain-level cap on how many item ids ONE continuation walk
+    /// may accumulate in its covered set before the chain closes with an
+    /// explicit stop and the state is released. A fresh (no-token) search
+    /// never inherits the set, so only a resumed walk can approach it; the
+    /// caller restarts with a fresh search. `ContextItemId` is a fixed
+    /// 16-byte value, so the entry count is also the byte bound
+    /// (16,384 ids ≈ 256 KiB). Default 16,384.
+    pub search_continuation_max_covered_ids: usize,
 }
 
 impl Default for SimpleContextConfig {
@@ -315,6 +323,7 @@ impl Default for SimpleContextConfig {
             external_hydrate_budget_ms: 2_000,
             external_hot_metadata_max_entries: 8192,
             external_hot_metadata_max_bytes: 32 * 1024 * 1024,
+            search_continuation_max_covered_ids: 16_384,
         }
     }
 }
@@ -516,6 +525,23 @@ pub(crate) struct PendingCardBatch {
     pub(crate) timed_out: usize,
     pub(crate) oversized: usize,
     pub(crate) rotated: usize,
+}
+
+/// W1 (V2): the typed outcome of one per-id pending-card service
+/// ([`SimpleContextEngine::hydrate_card_for_outcome`]). `Installed` and
+/// `AlreadyOwned` mean the planning pass will find the body; `Missing`
+/// (verified absent or structurally invalid — row consumed), `Corrupt`
+/// (damaged card — row consumed) and `IoFailed` (transient — row stays
+/// retryable) name *why* it will not; `NoPendingRow` means the id has no
+/// cold owner, so loaded-index absence is authoritative for it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PendingIdOutcome {
+    Installed,
+    AlreadyOwned,
+    Missing,
+    Corrupt,
+    IoFailed,
+    NoPendingRow,
 }
 
 /// Mutable runtime state of the engine, kept behind a lock. The heap (with
@@ -1028,18 +1054,35 @@ pub struct SimpleContextEngine {
     /// incomplete search: the opaque token, the normalized query it is bound
     /// to, and the hot ids that window covered. Not checkpointed — a
     /// restored engine has no continuation until its next incomplete search
-    /// issues one.
+    /// issues one (V5: an in-place `restore` enforces this by clearing the
+    /// slot and bumping the restore generation).
     search_continuation: std::sync::Mutex<Option<IssuedSearchContinuation>>,
+    /// W2 (V5): process-lifetime monotonic serial stamped into every
+    /// continuation token. It never resets — not on chain completion, not on
+    /// a new query, not on restore — so a completed chain's token identity
+    /// can never be re-derived by a later chain (the old slot-suffix
+    /// numbering restarted at 1 and ABA-matched across chains).
+    continuation_serial: std::sync::atomic::AtomicU64,
+    /// W2 (V5): restore generation. Every successful in-place restore bumps
+    /// it; a token also embeds the generation it was issued under, so a
+    /// pre-restore token can never validate against a post-restore walk even
+    /// if the slot itself were repopulated. A rejected restore leaves it —
+    /// and the live chain — untouched.
+    continuation_epoch: std::sync::atomic::AtomicU64,
 }
 
 /// S3: one issued search continuation. The token is opaque to callers; the
-/// engine validates token + query binding before rotating the window, so a
-/// stale or foreign token degrades into a fresh search instead of moving a
-/// wrong window.
+/// engine validates token + query binding (and, since V5, the restore
+/// generation) before rotating the window, so a stale or foreign token
+/// degrades into a fresh search instead of moving a wrong window.
 #[derive(Debug, Clone)]
 struct IssuedSearchContinuation {
     token: String,
     query_key: String,
+    /// V5: the restore generation this chain was issued under.
+    epoch: u64,
+    /// V4: the walk's accumulated covered set, deduped and bounded by
+    /// [`SimpleContextConfig::search_continuation_max_covered_ids`].
     covered_ids: Vec<ContextItemId>,
 }
 
@@ -1069,6 +1112,8 @@ impl SimpleContextEngine {
             search_observation: std::sync::Mutex::new(ContextSearchObservation::default()),
             last_search_coverage: std::sync::Mutex::new(ContextSearchCoverage::complete()),
             search_continuation: std::sync::Mutex::new(None),
+            continuation_serial: std::sync::atomic::AtomicU64::new(0),
+            continuation_epoch: std::sync::atomic::AtomicU64::new(0),
         }
     }
 
@@ -1108,11 +1153,15 @@ impl SimpleContextEngine {
     /// valid token rotates the covered hot window out to the pending
     /// directory first, so the drain pages in the NEXT cold region instead
     /// of re-serving the same pages forever.
-    async fn search_with_continuation(
+    ///
+    /// W2 (V3): the pass returns ATOMICALLY — hits, coverage and observation
+    /// describe exactly this pass, so callers (including the service
+    /// boundary) never re-read a mutable "last search" channel afterwards.
+    async fn search_report_with_continuation(
         &self,
         query: agent_contracts::ContextSearchQuery,
         continuation: Option<&str>,
-    ) -> AgentResult<Vec<agent_contracts::ExternalizedContext>> {
+    ) -> AgentResult<agent_contracts::ContextSearchResult> {
         let query = query.normalized();
         let query_key = Self::search_query_key(&query);
         // Search stamps access state even when no body read is needed, so the
@@ -1120,8 +1169,16 @@ impl SimpleContextEngine {
         // additionally release the state lock for checked Stored-body reads.
         let _gate = self.op_gate.lock().await;
         let mut skip: Vec<ContextItemId> = Vec::new();
-        if let Some(token) = continuation {
-            skip = self.rotate_search_window(&query_key, token).await;
+        // V4: only a token the rotation actually validated makes this pass a
+        // RESUME of an existing walk. A missing, stale, foreign or
+        // pre-restore token leaves `resumed` false and the pass runs FRESH:
+        // it inherits nothing from any older walk.
+        let mut resumed = false;
+        if let Some(token) = continuation
+            && let Some(ids) = self.rotate_search_window(&query_key, token).await
+        {
+            skip = ids;
+            resumed = true;
         }
         // F2: search coverage is unchanged by restore paging — a pending
         // spill row is paged in first (bounded batches) so the catalog and
@@ -1133,7 +1190,7 @@ impl SimpleContextEngine {
         // zero-match, so it fails closed below instead.
         //
         // T4: the drain is budget-bounded, and the typed outcome (unread
-        // remainder + stop cause) is what `finish_search_hits` consumes —
+        // remainder + stop cause) is what `finish_search_report` consumes —
         // same fail-closed rule, now naming the resumable amount.
         //
         // S3: under a continuation the drain skips the pages the rotation
@@ -1151,16 +1208,22 @@ impl SimpleContextEngine {
                 let hits = crate::store::search_catalog(&state, &query);
                 crate::access::reinforce_search_hits(&mut state, &hits, &query);
                 drop(state);
-                self.record_search_observation(ContextSearchObservation::default());
-                return self.finish_search_hits(query_key, hydration, hits).await;
+                let observation = ContextSearchObservation::default();
+                self.record_search_observation(observation);
+                return self
+                    .finish_search_report(query_key, resumed, hydration, hits, observation)
+                    .await;
             }
             let read_plan = crate::store::plan_stored_search_reads(&state, &query)?;
             if read_plan.is_empty() {
                 let hits = crate::store::search_catalog(&state, &query);
                 crate::access::reinforce_search_hits(&mut state, &hits, &query);
                 drop(state);
-                self.record_search_observation(ContextSearchObservation::default());
-                return self.finish_search_hits(query_key, hydration, hits).await;
+                let observation = ContextSearchObservation::default();
+                self.record_search_observation(observation);
+                return self
+                    .finish_search_report(query_key, resumed, hydration, hits, observation)
+                    .await;
             }
             read_plan
         };
@@ -1186,7 +1249,8 @@ impl SimpleContextEngine {
         crate::access::reinforce_search_hits(&mut state, &hits, &query);
         drop(state);
         self.record_search_observation(observation);
-        self.finish_search_hits(query_key, hydration, hits).await
+        self.finish_search_report(query_key, resumed, hydration, hits, observation)
+            .await
     }
 
     /// Engine-owned focused task. Restore alignment and tests read this;
@@ -1698,15 +1762,25 @@ impl SimpleContextEngine {
     /// can say "only part of the catalog was examined" and name the way to
     /// reach the next cold page. Zero hits over an unread region still fail
     /// closed (the token rides in the error text).
-    async fn finish_search_hits(
+    async fn finish_search_report(
         &self,
         query_key: String,
+        resumed: bool,
         hydration: HydrationOutcome,
         hits: Vec<agent_contracts::ExternalizedContext>,
-    ) -> AgentResult<Vec<agent_contracts::ExternalizedContext>> {
-        let coverage = self.record_search_coverage(query_key, hydration).await;
+        observation: ContextSearchObservation,
+    ) -> AgentResult<agent_contracts::ContextSearchResult> {
+        let coverage = self
+            .record_search_coverage(query_key, resumed, hydration)
+            .await;
         if hydration.complete || !hits.is_empty() {
-            return Ok(hits);
+            // W2 (V3): the atomic result — the pass's hits, coverage facts and
+            // observation travel together.
+            return Ok(agent_contracts::ContextSearchResult {
+                hits,
+                coverage,
+                observation,
+            });
         }
         let continuation_hint = coverage
             .continuation
@@ -1726,14 +1800,17 @@ impl SimpleContextEngine {
         )))
     }
 
-    /// S3: turn one drain outcome into the caller-visible coverage facts and
-    /// (while pages remain unread) issue the next window continuation. The
-    /// covered set is the carded, non-pinned hot ids at issuance time: the
-    /// rotation a valid continuation performs moves exactly the pages this
-    /// search could see, so the next one pages in a new region.
+    /// S3 + W2 (V4): turn one drain outcome into the caller-visible coverage
+    /// facts and (while pages remain unread) issue the next window
+    /// continuation. The covered set of a RESUMED walk is the deduped union
+    /// of the walk's accumulated prefix and the carded, non-pinned hot ids
+    /// this pass could see; a FRESH pass (no token, or a token the rotation
+    /// rejected) starts a new walk that inherits nothing — so repeating a
+    /// plain search over a fixed history cannot grow the retained state.
     async fn record_search_coverage(
         &self,
         query_key: String,
+        resumed: bool,
         hydration: HydrationOutcome,
     ) -> ContextSearchCoverage {
         if hydration.complete {
@@ -1743,46 +1820,76 @@ impl SimpleContextEngine {
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner()) = coverage.clone();
             // The queue drained: an older token has nothing left to advance
-            // to and must not rotate a fresh window.
+            // to and must not rotate a fresh window. The token serial keeps
+            // counting (V5): the next chain mints fresh identities.
             *self
                 .search_continuation
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
             return coverage;
         }
-        let mut covered_ids = {
+        let window_ids = {
             let state = self.state.lock().await;
             state.external.carded_hot_ids()
         };
-        let token = {
-            let mut slot = self
-                .search_continuation
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner());
-            let generation = slot
-                .as_ref()
-                .and_then(|issued| issued.token.rsplit('-').next())
-                .and_then(|suffix| suffix.parse::<u64>().ok())
-                .unwrap_or(0);
-            let token = format!("cold-window-{}", generation + 1);
-            // S3: the covered set ACCUMULATES across the walk of one query —
-            // every page a pass could see joins it, so the next continuation
-            // skips the whole walked prefix and the walk converges at the
-            // last unseen page. A different query starts a fresh walk.
-            let covered = match slot.as_mut() {
-                Some(issued) if issued.query_key == query_key => {
-                    covered_ids.extend(issued.covered_ids.iter().copied());
-                    covered_ids
-                }
-                _ => covered_ids,
-            };
-            *slot = Some(IssuedSearchContinuation {
-                token: token.clone(),
-                query_key,
-                covered_ids: covered,
-            });
-            token
+        let mut slot = self
+            .search_continuation
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        // V4 fresh/resume split. `resumed` is true only when the rotation
+        // validated the token against THIS slot under op_gate, so the match
+        // arm below re-checks the binding defensively, not as the authority.
+        // A fresh pass replaces the walk; a resume extends it with dedup.
+        let covered = match (resumed, slot.as_ref()) {
+            (true, Some(issued))
+                if issued.query_key == query_key
+                    && issued.epoch
+                        == self
+                            .continuation_epoch
+                            .load(std::sync::atomic::Ordering::Relaxed) =>
+            {
+                Self::merge_covered_dedup(&issued.covered_ids, window_ids)
+            }
+            _ => Self::merge_covered_dedup(&[], window_ids),
         };
+        // V4 chain-level bound: the walk's accumulated set is engine-retained
+        // state, so it has an explicit ceiling. Past it the chain CLOSES —
+        // the set is released, the pass reports the typed stop with no
+        // continuation, and the only way forward is a fresh search (which
+        // the caller can issue immediately). `ContextItemId` is fixed-size,
+        // so the entry count is the byte bound as well.
+        if covered.len() > self.config.search_continuation_max_covered_ids {
+            *slot = None;
+            let coverage = ContextSearchCoverage {
+                complete: false,
+                unread_pages: hydration.remaining,
+                stop: ContextSearchCoverageStop::Budget,
+                continuation: None,
+            };
+            *self
+                .last_search_coverage
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner()) = coverage.clone();
+            return coverage;
+        }
+        let serial = self
+            .continuation_serial
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+            + 1;
+        let epoch = self
+            .continuation_epoch
+            .load(std::sync::atomic::Ordering::Relaxed);
+        // V5: the token identity is a process-lifetime monotonic nonce bound
+        // to the restore generation — never derived from the slot's tail
+        // digits, so a completed or restored-away chain can never be
+        // re-matched by number reuse (ABA).
+        let token = format!("cold-window-e{epoch}-n{serial}");
+        *slot = Some(IssuedSearchContinuation {
+            token: token.clone(),
+            query_key,
+            epoch,
+            covered_ids: covered,
+        });
         let coverage = ContextSearchCoverage {
             complete: false,
             unread_pages: hydration.remaining,
@@ -1802,26 +1909,57 @@ impl SimpleContextEngine {
         coverage
     }
 
-    /// S3: a continuation token rotates the window it was issued for — the
-    /// covered carded hot ids return to the pending directory (back of the
-    /// queue, card claims kept), freeing the hot directory so the drain
-    /// pages in the next cold region instead of re-serving the same pages. A
-    /// stale, foreign or unknown token is not an error: the search simply
-    /// runs fresh and its own coverage stays authoritative.
-    async fn rotate_search_window(&self, query_key: &str, token: &str) -> Vec<ContextItemId> {
+    /// V4: union two covered-id sequences keeping first-seen order and
+    /// dropping duplicates, so the walk's retained set stays bounded by the
+    /// distinct pages it actually covered — never by the number of passes.
+    fn merge_covered_dedup(
+        base: &[ContextItemId],
+        extra: Vec<ContextItemId>,
+    ) -> Vec<ContextItemId> {
+        let mut seen: std::collections::HashSet<ContextItemId> = base.iter().copied().collect();
+        let mut merged = Vec::with_capacity(base.len() + extra.len());
+        merged.extend_from_slice(base);
+        for id in extra {
+            if seen.insert(id) {
+                merged.push(id);
+            }
+        }
+        merged
+    }
+
+    /// S3 + W2 (V5): a continuation token rotates the window it was issued
+    /// for — the covered carded hot ids return to the pending directory
+    /// (back of the queue, card claims kept), freeing the hot directory so
+    /// the drain pages in the next cold region instead of re-serving the
+    /// same pages. A token is a valid resume ONLY when it names the live
+    /// slot's exact identity, the query binding matches, AND the slot was
+    /// issued under the current restore generation. Anything else — stale,
+    /// foreign, already-consumed, or pre-restore — is explicitly rejected as
+    /// a continuation (`None`): the search runs fresh and its own coverage
+    /// stays authoritative, never mixing another walk's covered state.
+    async fn rotate_search_window(
+        &self,
+        query_key: &str,
+        token: &str,
+    ) -> Option<Vec<ContextItemId>> {
         // The slot is deliberately left in place here: `record_search_coverage`
-        // re-issues it with the walk's ACCUMULATED covered set (the
-        // generation counter and the walked pages both live in the slot).
+        // re-issues it with the walk's ACCUMULATED covered set (the serial
+        // and the walked pages both live in the slot).
         let issued = self
             .search_continuation
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .clone();
-        let Some(issued) = issued else {
-            return Vec::new();
-        };
+        let issued = issued?;
         if issued.token != token || issued.query_key != query_key {
-            return Vec::new();
+            return None;
+        }
+        if issued.epoch
+            != self
+                .continuation_epoch
+                .load(std::sync::atomic::Ordering::Relaxed)
+        {
+            return None;
         }
         let mut state = self.state.lock().await;
         let rows = state.external.demote_ids(&issued.covered_ids);
@@ -1829,7 +1967,23 @@ impl SimpleContextEngine {
             state.pending_external_cards.extend(rows);
             state.sync_catalog();
         }
-        issued.covered_ids
+        Some(issued.covered_ids)
+    }
+
+    /// W2 (V4/V5) test probe: the live continuation walk's opaque token and
+    /// its accumulated covered-id set, exactly as the rotation logic sees
+    /// them. Read-only; compiles out outside tests.
+    #[cfg(test)]
+    pub(crate) fn search_continuation_probe(&self) -> Option<(String, Vec<ContextItemId>)> {
+        match self.search_continuation.lock() {
+            Ok(slot) => slot
+                .as_ref()
+                .map(|issued| (issued.token.clone(), issued.covered_ids.clone())),
+            Err(poisoned) => poisoned
+                .into_inner()
+                .as_ref()
+                .map(|issued| (issued.token.clone(), issued.covered_ids.clone())),
+        }
     }
 
     /// One card read with the regression gates applied: the deterministic
@@ -1883,6 +2037,25 @@ impl SimpleContextEngine {
     /// failure keeps it retryable; only an installed entry or a verified
     /// absent/damaged card consumes it.
     async fn hydrate_card_for(&self, item_id: ContextItemId) -> bool {
+        matches!(
+            self.hydrate_card_for_outcome(item_id).await,
+            PendingIdOutcome::Installed
+        )
+    }
+
+    /// W1 (V2): the per-id card service lane, typed. The same lane
+    /// `fetch_external`/`inspect_external`/a directive's own target use —
+    /// one card per service, never budget- or cap-blocked, settling its own
+    /// residency. The typed outcome lets the required-ref resolution report
+    /// *why* a body is unavailable instead of folding every failure into
+    /// "absent": a verified absent/structurally-invalid card consumed its
+    /// row (a permanent fact), a damaged card names the read failure, a
+    /// transient I/O failure keeps the row retryable, and `NoPendingRow`
+    /// means the id has no cold owner at all.
+    pub(crate) async fn hydrate_card_for_outcome(
+        &self,
+        item_id: ContextItemId,
+    ) -> PendingIdOutcome {
         let hash = {
             let state = self.state.lock().await;
             state
@@ -1892,7 +2065,7 @@ impl SimpleContextEngine {
                 .map(|(_, hash)| hash.clone())
         };
         let Some(hash) = hash else {
-            return false;
+            return PendingIdOutcome::NoPendingRow;
         };
         let dir = crate::store::store_dir(&self.config);
         let outcome = self
@@ -1912,14 +2085,14 @@ impl SimpleContextEngine {
                         .pending_external_cards
                         .retain(|(id, _)| *id != item_id);
                     state.external_cards_missing = state.external_cards_missing.saturating_add(1);
-                    return false;
+                    return PendingIdOutcome::Missing;
                 }
                 let Some(position) = state
                     .pending_external_cards
                     .iter()
                     .position(|(id, h)| *id == item_id && *h == hash)
                 else {
-                    return false;
+                    return PendingIdOutcome::AlreadyOwned;
                 };
                 state.pending_external_cards.remove(position);
                 state.external.merge_paged(vec![entry]);
@@ -1933,24 +2106,233 @@ impl SimpleContextEngine {
                 // distinct ids are read in sequence.
                 settle_metadata_residency(&mut state, &self.config, &[item_id]);
                 state.sync_catalog();
-                true
+                PendingIdOutcome::Installed
             }
-            crate::store::ExternalCardRead::Found(_) => false,
-            crate::store::ExternalCardRead::Missing
-            | crate::store::ExternalCardRead::Corrupt(_) => {
+            crate::store::ExternalCardRead::Found(_) => PendingIdOutcome::AlreadyOwned,
+            crate::store::ExternalCardRead::Missing => {
                 state
                     .pending_external_cards
                     .retain(|(id, _)| *id != item_id);
                 state.external_cards_missing = state.external_cards_missing.saturating_add(1);
-                false
+                PendingIdOutcome::Missing
+            }
+            // W1 (V2): a damaged card keeps the same honest accounting the
+            // batch/restore paths use (the missing counter), but the typed
+            // outcome names the read failure — absence is not proven by an
+            // undecodable file.
+            crate::store::ExternalCardRead::Corrupt(_) => {
+                state
+                    .pending_external_cards
+                    .retain(|(id, _)| *id != item_id);
+                state.external_cards_missing = state.external_cards_missing.saturating_add(1);
+                PendingIdOutcome::Corrupt
             }
             crate::store::ExternalCardRead::IoFailed(_) => {
                 // N02: a transient failure keeps the retryable locator and
                 // is counted separately from "the data does not exist".
                 state.external_card_io_failures = state.external_card_io_failures.saturating_add(1);
-                false
+                PendingIdOutcome::IoFailed
             }
         }
+    }
+
+    /// W1 (V1): probe which scopes the *unread* pending spill cards
+    /// reference, without installing anything. The retirement scan's
+    /// referenced set only sees loaded owners; a card left unread by the
+    /// pass's budgeted drain may still reference a closed scope, and
+    /// retiring that scope would consume the card's locator on read-back
+    /// (a structurally invalid scope). The probe reads cards under the
+    /// same [`HydrationBudget`] shape the drain uses (items + absolute
+    /// deadline; the hot caps do not apply — nothing installs):
+    /// - a readable card contributes its `scope_id` (a verified reference);
+    /// - a missing/damaged card references nothing (its row is dead — the
+    ///   drain's missing accounting consumes it independently);
+    /// - a transient I/O failure, or rows left when the budget stops, make
+    ///   the remainder *unknown*: no retirement proof exists this pass.
+    ///
+    /// A pure read: no state mutation, no residency change, no double
+    /// accounting — the drain keeps sole ownership of row consumption.
+    async fn probe_pending_scope_references(&self) -> crate::scope::ScopeRetirementPermit {
+        let rows: Vec<(ContextItemId, String)> = {
+            let state = self.state.lock().await;
+            if state.pending_external_cards.is_empty() {
+                return crate::scope::ScopeRetirementPermit::closure_complete();
+            }
+            state.pending_external_cards.clone()
+        };
+        let budget = HydrationBudget::for_operation(&self.config);
+        let dir = crate::store::store_dir(&self.config);
+        let mut permit = crate::scope::ScopeRetirementPermit::closure_complete();
+        for (index, (item_id, hash)) in rows.iter().enumerate() {
+            let remaining = budget
+                .deadline
+                .saturating_duration_since(std::time::Instant::now());
+            if index >= budget.max_items || remaining.is_zero() {
+                permit.pending_unknown = true;
+                return permit;
+            }
+            match tokio::time::timeout(
+                remaining,
+                self.read_card_with_test_hooks(&dir, *item_id, hash, index),
+            )
+            .await
+            {
+                Ok(crate::store::ExternalCardRead::Found(entry)) => {
+                    if let Some(scope_id) = entry.scope_id {
+                        permit.pending_scope_refs.insert(scope_id);
+                    }
+                }
+                Ok(crate::store::ExternalCardRead::Missing)
+                | Ok(crate::store::ExternalCardRead::Corrupt(_)) => {
+                    // A dead row references nothing; the drain's own missing
+                    // accounting owns consuming it.
+                }
+                Ok(crate::store::ExternalCardRead::IoFailed(_)) | Err(_) => {
+                    // A transient failure or a read that outlived the
+                    // remaining deadline: this row's reference is unknown.
+                    permit.pending_unknown = true;
+                    return permit;
+                }
+            }
+        }
+        permit
+    }
+
+    /// W1 (V2): resolve the bounded set of required refs against the
+    /// pending cold directory *before* required/foreground planning, so
+    /// "the body is fetchable by id" and "PromptRequired materializes"
+    /// cannot disagree:
+    ///
+    /// - exact-id (and `context://run/<id>` URI) claims resolve through the
+    ///   per-id service lane — one card per claim, never budget- or
+    ///   cap-blocked, exactly the established `fetch_external` shape;
+    /// - entity/path refs (and current foreground paths) resolve through a
+    ///   bounded disk-side scan of the pending rows under the same
+    ///   [`HydrationBudget`] items/deadline口径: a card whose entities/path
+    ///   match a ref installs through the per-id lane; rows the scan left
+    ///   unexamined make absence *unproven* (the typed `UnreadColdPage`
+    ///   miss), never a plain `Missing`.
+    ///
+    /// No whole-history hydration: the claim set is bounded by
+    /// `MAX_ANCHOR_ROOT_CLAIMS` (+ the foreground cap) and the scan is
+    /// bounded by the operation budget. Nothing runs when the query names
+    /// no refs or the pending directory is empty.
+    async fn resolve_required_cold_refs(
+        &self,
+        query: &ContextQuery,
+    ) -> crate::materializer::RequiredColdResolution {
+        let mut resolution = crate::materializer::RequiredColdResolution::default();
+        // Bounded key set, mirroring plan_required's claim filter.
+        let claims: Vec<&agent_contracts::AnchorRootClaim> = query
+            .hints
+            .anchor_roots
+            .iter()
+            .filter(|claim| claim.strength.requires_prompt())
+            .take(agent_contracts::MAX_ANCHOR_ROOT_CLAIMS)
+            .collect();
+        let foreground_paths: Vec<String> = query
+            .hints
+            .foreground_resources
+            .iter()
+            .map(|key| normalize_resource_path(&key.path))
+            .filter(|path| !path.is_empty())
+            .collect();
+        if claims.is_empty() && foreground_paths.is_empty() {
+            return resolution;
+        }
+        let mut exact_ids: Vec<ContextItemId> = Vec::new();
+        let mut entity_keys: Vec<String> = Vec::new();
+        for claim in &claims {
+            match ContextItemId::parse_ref(&claim.item_ref) {
+                Ok(id) => exact_ids.push(id),
+                Err(_) => entity_keys.push(claim.item_ref.clone()),
+            }
+        }
+        let has_pending = {
+            let state = self.state.lock().await;
+            !state.pending_external_cards.is_empty()
+        };
+        if !has_pending {
+            return resolution;
+        }
+        // Exact ids: the per-id lane resolves each target directly (a
+        // pending row is an O(1) locator; the outcome types the miss).
+        for id in &exact_ids {
+            let outcome = self.hydrate_card_for_outcome(*id).await;
+            resolution.per_id.insert(*id, outcome);
+        }
+        if entity_keys.is_empty() && foreground_paths.is_empty() {
+            return resolution;
+        }
+        // Entity/path keys: bounded scan of the pending rows. Only a card
+        // whose entities/path match a key installs (through the per-id
+        // lane); the scan itself never mutates state.
+        let rows: Vec<(ContextItemId, String)> = {
+            let state = self.state.lock().await;
+            state.pending_external_cards.clone()
+        };
+        if rows.is_empty() {
+            return resolution;
+        }
+        let budget = HydrationBudget::for_operation(&self.config);
+        let dir = crate::store::store_dir(&self.config);
+        let mut examined = 0usize;
+        for (index, (item_id, hash)) in rows.iter().enumerate() {
+            let remaining = budget
+                .deadline
+                .saturating_duration_since(std::time::Instant::now());
+            if index >= budget.max_items || remaining.is_zero() {
+                break;
+            }
+            // Only a *decided* read counts as examined: a verified card
+            // (match or not) or a verified dead row proves something about
+            // this ref; a transient I/O failure or a read cancelled at the
+            // deadline proves nothing, so its row stays counted unread —
+            // the miss below stays `UnreadColdPage` instead of a false
+            // zero-match.
+            let decided = match tokio::time::timeout(
+                remaining,
+                self.read_card_with_test_hooks(&dir, *item_id, hash, index),
+            )
+            .await
+            {
+                Ok(crate::store::ExternalCardRead::Found(entry)) => {
+                    let entity_hit = entity_keys
+                        .iter()
+                        .any(|key| entry.entities.iter().any(|entity| entity == key));
+                    let path_hit = foreground_paths.iter().any(|path| {
+                        entry
+                            .entities
+                            .iter()
+                            .any(|entity| normalize_resource_path(entity) == *path)
+                            || entry
+                                .file_path
+                                .as_deref()
+                                .map(normalize_resource_path)
+                                .as_deref()
+                                == Some(path.as_str())
+                    });
+                    if entity_hit || path_hit {
+                        Some(true)
+                    } else {
+                        Some(false)
+                    }
+                }
+                Ok(crate::store::ExternalCardRead::Missing)
+                | Ok(crate::store::ExternalCardRead::Corrupt(_)) => Some(false),
+                Ok(crate::store::ExternalCardRead::IoFailed(_)) | Err(_) => None,
+            };
+            let Some(matched) = decided else {
+                continue;
+            };
+            examined += 1;
+            if matched && !resolution.per_id.contains_key(item_id) {
+                let outcome = self.hydrate_card_for_outcome(*item_id).await;
+                resolution.per_id.insert(*item_id, outcome);
+            }
+        }
+        resolution.pending_unread = rows.len().saturating_sub(examined);
+        resolution
     }
 }
 
@@ -2691,12 +3073,27 @@ impl ContextEngine for SimpleContextEngine {
         // queued and are simply not aged (and not recallable) this pass; the
         // typed outcome needs no deferral for the memory pass because
         // deletion belongs to Storage GC, which defers on it below.
-        let _hydration = self.hydrate_pending_cards_within_budget(&[]).await;
+        //
+        // W1 (V1): the drain's completeness now gates scope retirement. An
+        // unread pending card's `scope_id` is invisible to the retirement
+        // scan, and retiring such a scope would consume the card's locator
+        // on read-back. With an incomplete closure the pass probes the
+        // unread rows' scope references (bounded, pure-read): a proven
+        // reference protects its scope, an unproven remainder defers all
+        // retirement this pass (reported as `scope_retirement_deferred`).
+        let hydration = self.hydrate_pending_cards_within_budget(&[]).await;
+        let retirement_permit = if hydration.complete {
+            crate::scope::ScopeRetirementPermit::closure_complete()
+        } else {
+            self.probe_pending_scope_references().await
+        };
         let mut state = self.state.lock().await;
         state.event_seq += 1;
         let now_tick = state.event_seq;
         let turn = state.turn;
-        let Some(mut plan) = full::plan_full_gc(&mut state, &self.config, now_tick, turn) else {
+        let Some(mut plan) =
+            full::plan_full_gc(&mut state, &self.config, now_tick, turn, &retirement_permit)
+        else {
             return Ok(ContextGcReport {
                 resident: state.items.len(),
                 diagnostics: diagnostics::compute(&state),
@@ -2825,6 +3222,15 @@ impl ContextEngine for SimpleContextEngine {
         // preview. Serialize that span with GC and whole-state restore so
         // neither operation can replace the stores underneath the plan.
         let _gate = self.op_gate.lock().await;
+        // W1 (V2): resolve the bounded set of required/foreground refs
+        // against the pending cold directory BEFORE planning. Exact-id
+        // claims page their card through the per-id service lane (the
+        // `fetch_external` shape); entity/path refs get a bounded cold
+        // scan. Without this, the same body could be fetchable by id yet
+        // reported Missing to a PromptRequired claim whenever the bulk
+        // hydration left its card unread. Disk IO runs off the state lock;
+        // the gate serializes the span with GC/restore as everywhere else.
+        let resolution = self.resolve_required_cold_refs(&query).await;
         let mut state = self.state.lock().await;
         // A preview is a read: it must not advance the event-sequence clock,
         // so merely materializing never ages TTLs or recency scores.
@@ -2837,7 +3243,8 @@ impl ContextEngine for SimpleContextEngine {
                 })?;
         let materialization_id = state.materialization_revision;
         let foreground_plan = materializer::plan_foreground(&state, &query, &[]);
-        let required_plan = materializer::plan_required(&state, &query);
+        let required_plan =
+            materializer::plan_required_with_resolution(&state, &query, &resolution);
         drop(state);
         #[cfg(test)]
         {
@@ -3127,7 +3534,10 @@ impl ContextEngine for SimpleContextEngine {
         &self,
         query: agent_contracts::ContextSearchQuery,
     ) -> AgentResult<Vec<agent_contracts::ExternalizedContext>> {
-        self.search_with_continuation(query, None).await
+        Ok(self
+            .search_report_with_continuation(query, None)
+            .await?
+            .hits)
     }
 
     async fn search_external_continuation(
@@ -3135,7 +3545,21 @@ impl ContextEngine for SimpleContextEngine {
         query: agent_contracts::ContextSearchQuery,
         continuation: &str,
     ) -> AgentResult<Vec<agent_contracts::ExternalizedContext>> {
-        self.search_with_continuation(query, Some(continuation))
+        Ok(self
+            .search_report_with_continuation(query, Some(continuation))
+            .await?
+            .hits)
+    }
+
+    /// W2 (V3): the serving engine's atomic channel — one pass, one value:
+    /// hits, coverage and observation of exactly this search, with no
+    /// read-after-call side channel in between.
+    async fn search_external_report(
+        &self,
+        query: agent_contracts::ContextSearchQuery,
+        continuation: Option<&str>,
+    ) -> AgentResult<agent_contracts::ContextSearchResult> {
+        self.search_report_with_continuation(query, continuation)
             .await
     }
 
@@ -3444,6 +3868,21 @@ impl ContextEngine for SimpleContextEngine {
         // the derived catalog before the next search rather than trusting
         // the pre-migration directory.
         state.catalog_dirty.mark_rebuild();
+        // W2 (V5): the installed state replaced the catalog the continuation
+        // walk was cursored over, so every outstanding token is now a claim
+        // about a view that no longer exists. Invalidate the live walk and
+        // bump the restore generation — a pre-restore token arriving later is
+        // explicitly rejected (it degrades to a fresh search) instead of
+        // rotating a window over content this view never searched. A
+        // REJECTED restore never reaches this point: its failure paths
+        // return before the state is installed, leaving the live chain
+        // untouched.
+        self.continuation_epoch
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        *self
+            .search_continuation
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
         Ok(())
     }
 

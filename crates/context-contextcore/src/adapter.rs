@@ -16,14 +16,16 @@ use std::time::Duration;
 use agent_contracts::{
     AgentError, AgentResult, ContextConsumptionAck, ContextDiagnostics, ContextEngine,
     ContextGcReport, ContextIngress, ContextItem, ContextItemId, ContextItemSummary,
-    ContextMaintenanceReport, ContextMaintenanceTrigger, ContextQuery, ContextSearchQuery,
+    ContextMaintenanceReport, ContextMaintenanceTrigger, ContextQuery, ContextSearchCoverage,
+    ContextSearchCoverageStop, ContextSearchObservation, ContextSearchQuery, ContextSearchResult,
     ContextStateTransition, ExternalizedContext, MaterializedContext, ScopeId, ScopeKind,
 };
 use async_trait::async_trait;
 use serde_json::Value;
 
 use crate::wire::{
-    DEFAULT_CONTEXT_SERVICE_MAX_FRAME_BYTES, MIN_CONTEXT_SERVICE_MAX_FRAME_BYTES, ServiceOp,
+    DEFAULT_CONTEXT_SERVICE_MAX_FRAME_BYTES, FEATURE_CONTEXT_SEARCH_REPORT,
+    MIN_CONTEXT_SERVICE_MAX_FRAME_BYTES, ServiceOp,
 };
 use agent_process::{ProcessHost, ProcessHostConfig, resolve_program};
 
@@ -59,6 +61,12 @@ pub struct ContextServiceConfig {
     /// service falls back to an OS temp dir — the store never lands in a
     /// CWD-relative path.
     pub store_dir: Option<std::path::PathBuf>,
+    /// W2 (V3) parity affordance: pin the service engine's cold-paging
+    /// knobs (restore card batch, hot-metadata entries, per-op hydrate
+    /// items) below production defaults so boundary tests can reproduce a
+    /// typed incomplete pass on a small fixture. `None` (production) keeps
+    /// the service's own defaults.
+    pub cold_paging: Option<(usize, usize, usize)>,
     pub startup_timeout: Duration,
     /// Deadline for every request after the handshake, so a wedged service
     /// cannot hang a turn.
@@ -74,6 +82,7 @@ impl Default for ContextServiceConfig {
             program: None,
             engine: ServiceEngine::Dynamic,
             store_dir: None,
+            cold_paging: None,
             startup_timeout: Duration::from_secs(10),
             request_timeout: Duration::from_secs(30),
             max_frame_bytes: DEFAULT_CONTEXT_SERVICE_MAX_FRAME_BYTES,
@@ -98,6 +107,13 @@ impl ContextServiceConfig {
 /// A `ContextEngine` whose state lives in a separate process.
 pub struct ContextServiceAdapter {
     host: ProcessHost,
+    /// W2 (V3): compatibility mirror of the most recent atomic search
+    /// report, kept ONLY so the legacy `last_search_coverage` /
+    /// `last_search_observation` side-channel methods stop answering with
+    /// the trait's `complete` default (a fabricated fact). The production
+    /// path is `search_external_report`, which returns the pass's facts
+    /// atomically and never reads this back.
+    last_report: std::sync::Mutex<Option<ContextSearchResult>>,
 }
 
 impl ContextServiceAdapter {
@@ -118,6 +134,10 @@ impl ContextServiceAdapter {
             args.push("--store-dir".into());
             args.push(dir.to_string_lossy().into_owned());
         }
+        if let Some((restore, hot, items)) = config.cold_paging {
+            args.push("--cold-paging".into());
+            args.push(format!("{restore},{hot},{items}"));
+        }
         args.push("--max-frame-bytes".into());
         args.push(config.max_frame_bytes.to_string());
         let host = ProcessHost::connect(ProcessHostConfig {
@@ -133,7 +153,14 @@ impl ContextServiceAdapter {
             // No broker is installed for this boundary; the bound is a
             // placeholder for the shared host's control-plane cap.
             max_system_answer_bytes: 512 * 1024,
-            offered_features: Default::default(),
+            // W2 (V3): offer the atomic-search capability. The service's
+            // pong advertises what IT supports and the host intersects;
+            // a service that did not advertise it leaves
+            // `search_external_report` explicitly Unsupported.
+            offered_features: agent_platform_protocol::ActiveFeatures::new(vec![
+                FEATURE_CONTEXT_SEARCH_REPORT.to_string(),
+            ])
+            .unwrap_or_default(),
             // The context service is the runtime's own trusted sidecar; it
             // keeps the historical inherit-all behavior. The strict sandbox
             // is applied to *capabilities* (see agent-capability-process).
@@ -145,13 +172,22 @@ impl ContextServiceAdapter {
                 "spawn context service '{program}': {e} (build it with `cargo build -p agent-context-service`)"
             ))
         })?;
-        Ok(Self { host })
+        Ok(Self {
+            host,
+            last_report: std::sync::Mutex::new(None),
+        })
     }
 
     async fn call(&self, op: ServiceOp) -> AgentResult<Value> {
         let op_value = serde_json::to_value(op)
             .map_err(|e| AgentError::Context(format!("serialize request: {e}")))?;
         self.host.call(op_value).await
+    }
+
+    /// W2 (V3): whether the handshake intersected the atomic-search
+    /// capability on this connection.
+    fn search_report_negotiated(&self) -> bool {
+        self.host.allows_feature(FEATURE_CONTEXT_SEARCH_REPORT)
     }
 
     /// Graceful stop: ask the service to exit, then reap it.
@@ -243,6 +279,16 @@ impl ContextEngine for ContextServiceAdapter {
         // Keep direct process-adapter callers on the same semantic bounds as
         // Core and the in-process engine. The service validates again at its
         // own engine boundary; this also bounds the outgoing wire request.
+        //
+        // W2 (V3): when the service negotiated the atomic capability, the
+        // legacy methods route through it too, so every search on this
+        // boundary updates the compatibility mirror coherently. The legacy
+        // op remains for services without the capability — with the honest
+        // consequence that no coverage facts are available (see
+        // `last_search_coverage`).
+        if self.search_report_negotiated() {
+            return Ok(self.search_external_report(query, None).await?.hits);
+        }
         let value = self
             .call(ServiceOp::SearchExternal {
                 query: query.normalized(),
@@ -250,6 +296,93 @@ impl ContextEngine for ContextServiceAdapter {
             .await?;
         serde_json::from_value(value)
             .map_err(|e| AgentError::Context(format!("decode external context search: {e}")))
+    }
+
+    async fn search_external_continuation(
+        &self,
+        query: ContextSearchQuery,
+        continuation: &str,
+    ) -> AgentResult<Vec<ExternalizedContext>> {
+        // W2 (V3): a negotiated service forwards the token to its real
+        // continuation implementation. Without the capability the token
+        // cannot cross this boundary honestly, so this is an explicit
+        // Unsupported error — silently ignoring it would degrade a resumed
+        // search into a fresh one and lose the walk semantics.
+        if self.search_report_negotiated() {
+            return Ok(self
+                .search_external_report(query, Some(continuation))
+                .await?
+                .hits);
+        }
+        Err(AgentError::Context(format!(
+            "context service did not negotiate '{FEATURE_CONTEXT_SEARCH_REPORT}': search \
+             continuation tokens cannot be forwarded across this boundary"
+        )))
+    }
+
+    /// W2 (V3): the atomic search — hits, coverage and observation of
+    /// exactly one pass, forwarded from the serving engine. This is the
+    /// channel Core uses; no read-after-call side channel is involved.
+    async fn search_external_report(
+        &self,
+        query: ContextSearchQuery,
+        continuation: Option<&str>,
+    ) -> AgentResult<ContextSearchResult> {
+        if !self.search_report_negotiated() {
+            // An old service cannot prove coverage; the honest answer is an
+            // explicit Unsupported, never a defaulted `complete`.
+            return Err(AgentError::Context(format!(
+                "context service did not negotiate '{FEATURE_CONTEXT_SEARCH_REPORT}': atomic \
+                 search facts (coverage/continuation) are unsupported on this boundary"
+            )));
+        }
+        let value = self
+            .call(ServiceOp::SearchExternalReport {
+                query: query.normalized(),
+                continuation: continuation.map(str::to_string),
+            })
+            .await?;
+        let report: ContextSearchResult = serde_json::from_value(value)
+            .map_err(|e| AgentError::Context(format!("decode external search report: {e}")))?;
+        // Compatibility mirror for the legacy side-channel methods below.
+        // Bounded (one report) and write-only here: the production path
+        // returns the value directly.
+        match self.last_report.lock() {
+            Ok(mut slot) => *slot = Some(report.clone()),
+            Err(poisoned) => *poisoned.into_inner() = Some(report.clone()),
+        }
+        Ok(report)
+    }
+
+    /// S3 + W2 (V3): the coverage facts of the most recent search this
+    /// adapter actually observed. Before any search (or against a service
+    /// without the capability) the honest answer is `Unknown` — this
+    /// boundary cannot self-certify `Complete` the way a fully in-memory
+    /// baseline can.
+    fn last_search_coverage(&self) -> ContextSearchCoverage {
+        let guard = match self.last_report.lock() {
+            Ok(slot) => slot,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        match guard.as_ref() {
+            Some(report) => report.coverage.clone(),
+            None => ContextSearchCoverage {
+                complete: false,
+                unread_pages: 0,
+                stop: ContextSearchCoverageStop::Unknown,
+                continuation: None,
+            },
+        }
+    }
+
+    fn last_search_observation(&self) -> ContextSearchObservation {
+        let guard = match self.last_report.lock() {
+            Ok(slot) => slot,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        guard
+            .as_ref()
+            .map_or_else(Default::default, |r| r.observation)
     }
 
     async fn inspect_external(

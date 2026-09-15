@@ -614,131 +614,133 @@ impl CoreAuthority {
                 let search_limit = search.limit;
                 // S3: a continuation token routes to the cold-page walk; the
                 // engine validates the query binding and types the outcome.
-                let result = match continuation.as_deref() {
-                    Some(token) => {
-                        self.context
-                            .search_external_continuation(search, token)
-                            .await
-                    }
-                    None => self.context.search_external(search).await,
-                };
+                // W2 (V3): one atomic call returns hits AND the pass's
+                // coverage/observation — no read-after-call side channel
+                // (which a process-boundary engine cannot serve honestly).
+                let result = self
+                    .context
+                    .search_external_report(search, continuation.as_deref())
+                    .await;
                 match result {
-                    Ok(hits) if hits.is_empty() => {
-                        let observation = self.context.last_search_observation();
-                        output.ok = true;
-                        output.summary = "no catalog items match".into();
-                        output.model_content = if has_filter {
-                            "context.search: nothing matches within the requested filter.".into()
+                    Ok(report) => {
+                        let hits = report.hits;
+                        let observation = report.observation;
+                        if hits.is_empty() {
+                            output.ok = true;
+                            output.summary = "no catalog items match".into();
+                            output.model_content = if has_filter {
+                                "context.search: nothing matches within the requested filter."
+                                    .into()
+                            } else {
+                                "context.search: no catalog items match.".into()
+                            };
+                            output.metadata = serde_json::json!({
+                                "op": "search",
+                                "kind": "context",
+                                "descriptors": [],
+                                "cold_reads": observation.cold_reads,
+                                "cold_read_bytes": observation.cold_read_bytes,
+                                "cold_read_ms": observation.cold_read_ms,
+                            });
                         } else {
-                            "context.search: no catalog items match.".into()
-                        };
-                        output.metadata = serde_json::json!({
-                            "op": "search",
-                            "kind": "context",
-                            "descriptors": [],
-                            "cold_reads": observation.cold_reads,
-                            "cold_read_bytes": observation.cold_read_bytes,
-                            "cold_read_ms": observation.cold_read_ms,
-                        });
-                    }
-                    Ok(hits) => {
-                        let observation = self.context.last_search_observation();
-                        output.ok = true;
-                        output.summary = format!("{} catalog hit(s)", hits.len());
-                        // 命中行只报事实：source / residency。下一步由 residency
-                        // 自己表达，不在工具输出里写操作说明书。
-                        output.model_content = hits
-                            .iter()
-                            .map(|entry| {
-                                let path = entry
-                                    .file_path
-                                    .as_deref()
-                                    .filter(|path| !path.is_empty())
-                                    .map(|path| format!(" path={path}"))
-                                    .unwrap_or_default();
-                                format!(
-                                    "{} | kind={:?} scope={:?} task={} source={}{path} residency={:?} | {}\n  tags: {}\n  entities: {}",
-                                    entry.context_ref.uri,
-                                    entry.kind,
-                                    entry.scope,
-                                    entry
-                                        .task_id
-                                        .map(|t| t.to_string())
-                                        .unwrap_or_else(|| "-".into()),
-                                    entry
-                                        .source
-                                        .as_deref()
-                                        .unwrap_or("-"),
-                                    entry.residency,
-                                    entry.context_ref.summary,
-                                    if entry.tags.is_empty() {
-                                        "-".to_string()
-                                    } else {
-                                        entry
-                                            .tags
-                                            .iter()
-                                            .map(|tag| tag.as_str().to_string())
-                                            .collect::<Vec<_>>()
-                                            .join(", ")
-                                    },
-                                    entry.entities.join(", "),
-                                )
-                            })
-                            .collect::<Vec<_>>()
-                            .join("\n");
-                        // F04: a result that fills the limit may have been
-                        // cut by it — a plain hit list must not read as the
-                        // whole catalog answer. limit=0 means "engine
-                        // default", so it proves nothing about a cap.
-                        let capped = search_limit > 0 && hits.len() >= search_limit;
-                        if capped {
-                            output.model_content.push_str(&format!(
-                                "\n[coverage] result capped at limit={search_limit}; the catalog may hold more matches"
-                            ));
-                        }
-                        // S3 (R4): a result-capped fact and an incomplete
-                        // candidate coverage are DIFFERENT facts — a cap
-                        // truncates a ranked Top-K over the visible region,
-                        // an incomplete coverage means whole cold pages were
-                        // never examined. The model-visible body must carry
-                        // the incompleteness (metadata alone never reaches
-                        // the model) plus the continuation that advances to
-                        // the next cold page.
-                        let coverage = self.context.last_search_coverage();
-                        if !coverage.complete {
-                            output.model_content.push_str(&format!(
-                                "\n[coverage] INCOMPLETE: {} cold page(s) were not readable in \
-                                 this pass (stopped: {}), so matches may be missing from those \
-                                 pages. To advance to the next page, rerun the SAME search with \
-                                 continuation=\"{}\".",
-                                coverage.unread_pages,
-                                coverage.stop,
-                                coverage.continuation.as_deref().unwrap_or("-")
-                            ));
-                        }
-                        let coverage_metadata = if coverage.complete {
-                            serde_json::json!({ "complete": true })
-                        } else {
-                            serde_json::json!({
-                                "complete": false,
-                                "unread_pages": coverage.unread_pages,
-                                "stop": coverage.stop.to_string(),
-                                "continuation": coverage.continuation,
-                            })
-                        };
-                        output.metadata = serde_json::json!({
-                            "op": "search",
-                            "kind": "context",
-                            "descriptors": hits
+                            output.ok = true;
+                            output.summary = format!("{} catalog hit(s)", hits.len());
+                            // 命中行只报事实：source / residency。下一步由 residency
+                            // 自己表达，不在工具输出里写操作说明书。
+                            output.model_content = hits
                                 .iter()
-                                .map(ResourceDescriptor::from_context)
-                                .collect::<Vec<_>>(),
-                            "cold_reads": observation.cold_reads,
-                            "cold_read_bytes": observation.cold_read_bytes,
-                            "cold_read_ms": observation.cold_read_ms,
-                            "result_capped": capped,
-                            "coverage": coverage_metadata,
-                        });
+                                .map(|entry| {
+                                    let path = entry
+                                        .file_path
+                                        .as_deref()
+                                        .filter(|path| !path.is_empty())
+                                        .map(|path| format!(" path={path}"))
+                                        .unwrap_or_default();
+                                    format!(
+                                        "{} | kind={:?} scope={:?} task={} source={}{path} residency={:?} | {}\n  tags: {}\n  entities: {}",
+                                        entry.context_ref.uri,
+                                        entry.kind,
+                                        entry.scope,
+                                        entry
+                                            .task_id
+                                            .map(|t| t.to_string())
+                                            .unwrap_or_else(|| "-".into()),
+                                        entry
+                                            .source
+                                            .as_deref()
+                                            .unwrap_or("-"),
+                                        entry.residency,
+                                        entry.context_ref.summary,
+                                        if entry.tags.is_empty() {
+                                            "-".to_string()
+                                        } else {
+                                            entry
+                                                .tags
+                                                .iter()
+                                                .map(|tag| tag.as_str().to_string())
+                                                .collect::<Vec<_>>()
+                                                .join(", ")
+                                        },
+                                        entry.entities.join(", "),
+                                    )
+                                })
+                                .collect::<Vec<_>>()
+                                .join("\n");
+                            // F04: a result that fills the limit may have been
+                            // cut by it — a plain hit list must not read as the
+                            // whole catalog answer. limit=0 means "engine
+                            // default", so it proves nothing about a cap.
+                            let capped = search_limit > 0 && hits.len() >= search_limit;
+                            if capped {
+                                output.model_content.push_str(&format!(
+                                    "\n[coverage] result capped at limit={search_limit}; the catalog may hold more matches"
+                                ));
+                            }
+                            // S3 (R4): a result-capped fact and an incomplete
+                            // candidate coverage are DIFFERENT facts — a cap
+                            // truncates a ranked Top-K over the visible region,
+                            // an incomplete coverage means whole cold pages were
+                            // never examined. The model-visible body must carry
+                            // the incompleteness (metadata alone never reaches
+                            // the model) plus the continuation that advances to
+                            // the next cold page. W2 (V3): the facts come from
+                            // the atomic result of THIS pass.
+                            let coverage = report.coverage;
+                            if !coverage.complete {
+                                output.model_content.push_str(&format!(
+                                    "\n[coverage] INCOMPLETE: {} cold page(s) were not readable in \
+                                     this pass (stopped: {}), so matches may be missing from those \
+                                     pages. To advance to the next page, rerun the SAME search with \
+                                     continuation=\"{}\".",
+                                    coverage.unread_pages,
+                                    coverage.stop,
+                                    coverage.continuation.as_deref().unwrap_or("-")
+                                ));
+                            }
+                            let coverage_metadata = if coverage.complete {
+                                serde_json::json!({ "complete": true })
+                            } else {
+                                serde_json::json!({
+                                    "complete": false,
+                                    "unread_pages": coverage.unread_pages,
+                                    "stop": coverage.stop.to_string(),
+                                    "continuation": coverage.continuation,
+                                })
+                            };
+                            output.metadata = serde_json::json!({
+                                "op": "search",
+                                "kind": "context",
+                                "descriptors": hits
+                                    .iter()
+                                    .map(ResourceDescriptor::from_context)
+                                    .collect::<Vec<_>>(),
+                                "cold_reads": observation.cold_reads,
+                                "cold_read_bytes": observation.cold_read_bytes,
+                                "cold_read_ms": observation.cold_read_ms,
+                                "result_capped": capped,
+                                "coverage": coverage_metadata,
+                            });
+                        }
                     }
                     Err(error) => {
                         output.ok = false;

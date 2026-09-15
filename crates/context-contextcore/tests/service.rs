@@ -1604,3 +1604,319 @@ async fn a_service_restart_over_one_store_keeps_the_sharded_checkpoints_cards() 
 
     service.shutdown().await;
 }
+
+// ---------------------------------------------------------------------------
+// W2 (V3): atomic search facts across the service boundary
+// ---------------------------------------------------------------------------
+
+/// The W2 parity fixture's cold-paging shape: a restore batch of 4, a hot
+/// metadata cap of 4 and a per-op hydrate budget of 8 over a 14-entry
+/// all-cards history — the first pass after restore stops at the hot cap
+/// with a typed unread remainder, exactly the state whose coverage the old
+/// adapter lost. Both engines (in-process and service via `--cold-paging`)
+/// run the SAME values; only the production defaults are larger.
+const W2_N: usize = 14;
+const W2_RESTORE_BATCH: usize = 4;
+const W2_HOT_CAP: usize = 4;
+const W2_HYDRATE_ITEMS: usize = 8;
+
+/// Build one all-cards cold history of `n` tool observations in `store` and
+/// return its checkpoint, through the PUBLIC engine surface (ingest /
+/// maintain / gc) — no crate-private fixtures. The writer spills the whole
+/// tail to manifest rows (zero inline target, one big card batch) and ages
+/// the entries past the spill gate, so a restore pages in only one batch and
+/// the rest are pending cold pages.
+async fn w2_spilled_fixture(store: &Path, n: usize) -> serde_json::Value {
+    let writer = context_simple::SimpleContextEngine::new(context_simple::SimpleContextConfig {
+        external_checkpoint_inline_target: 0,
+        gc_buffer_capacity: 0,
+        external_checkpoint_io_budget_ms: 60_000,
+        external_checkpoint_card_batch: 8_192,
+        external_checkpoint_card_bytes: 256 * 1024 * 1024,
+        external_checkpoint_scan_budget: 8_192,
+        context_store_dir: Some(store.to_path_buf()),
+        ..context_simple::SimpleContextConfig::default()
+    });
+    writer
+        .ingest(ContextIngress::FocusChanged {
+            focus: agent_contracts::FocusState::for_task(
+                agent_contracts::TaskId::new(),
+                "w2 search parity",
+            ),
+        })
+        .await
+        .unwrap();
+    for index in 0..n {
+        // The needle rides the STAMPED PATH, not the body: raw
+        // ToolObservation bodies are identity-only on the catalog surface by
+        // design (their text is not a search needle), while the stamped path
+        // is an indexed entity — exactly the surface the sentinel test
+        // above searches. Every observation of the same file shares it, so
+        // each pass's hot window yields its own hits.
+        writer
+            .ingest(ContextIngress::ToolObservation {
+                facts: None,
+                output: ToolOutput {
+                    call_id: format!("w2-{index}"),
+                    tool_name: "shell.exec".into(),
+                    ok: true,
+                    summary: "w2 observation".into(),
+                    model_content: format!("step {index}: w2-needle-{index:05} {}", "x".repeat(60)),
+                    artifact_ref: None,
+                    metadata: json!({"path": "w2-needle.rs"}),
+                },
+                scope_id: None,
+            })
+            .await
+            .unwrap();
+    }
+    writer
+        .maintain(ContextMaintenanceTrigger::AfterModel)
+        .await
+        .unwrap();
+    let gc = writer.gc().await.unwrap();
+    assert!(gc.externalized >= n, "the wave must externalize: {gc:?}");
+    // Age the external entries past the spill gate (4 idle full-GC
+    // generations) so the checkpoint spills them as manifest rows.
+    for _ in 0..5 {
+        writer.gc().await.unwrap();
+    }
+    let checkpoint = writer.checkpoint().await.unwrap();
+    let spilled = checkpoint
+        .get("external_spilled")
+        .and_then(|v| v.as_array())
+        .map(|a| a.len())
+        .unwrap_or(0);
+    assert_eq!(spilled, n, "every cold entry is a manifest row");
+    checkpoint
+}
+
+/// The in-process twin of the service's `--cold-paging` engine config.
+fn w2_local_config(store: &Path) -> context_simple::SimpleContextConfig {
+    context_simple::SimpleContextConfig {
+        context_store_dir: Some(store.to_path_buf()),
+        external_restore_card_batch: W2_RESTORE_BATCH,
+        external_hot_metadata_max_entries: W2_HOT_CAP,
+        external_hydrate_max_items: W2_HYDRATE_ITEMS,
+        ..context_simple::SimpleContextConfig::default()
+    }
+}
+
+/// Normalize one atomic report into the parity-comparable facts: hit ids in
+/// order plus the coverage tuple (tokens are per-engine opaque identities,
+/// so only their presence is comparable).
+fn w2_report_facts(
+    report: &agent_contracts::ContextSearchResult,
+) -> (
+    Vec<agent_contracts::ContextItemId>,
+    (bool, usize, String, bool),
+) {
+    (
+        report.hits.iter().map(|hit| hit.item_id).collect(),
+        (
+            report.coverage.complete,
+            report.coverage.unread_pages,
+            report.coverage.stop.to_string(),
+            report.coverage.continuation.is_some(),
+        ),
+    )
+}
+
+/// V3 live red: a fresh boundary must not self-certify `complete` coverage.
+/// The old adapter left `last_search_coverage` at the trait default, so a
+/// boundary that had never observed any pass answered "complete" — the
+/// exact fabricated fact V3 removes. (Pre-fix this assertion is red: the
+/// default is `complete`.)
+#[tokio::test]
+async fn a_fresh_boundary_never_self_certifies_complete_coverage() {
+    // The concrete adapter binding keeps the graceful shutdown available
+    // (the shared `connect()` helper erases it behind the trait object).
+    let service = ContextServiceAdapter::connect(&ContextServiceConfig {
+        program: Some(service_program()),
+        engine: ServiceEngine::Dynamic,
+        ..ContextServiceConfig::default()
+    })
+    .await
+    .expect("spawn + handshake with the context service");
+    let coverage = service.last_search_coverage();
+    assert!(
+        !coverage.complete,
+        "an unsearched boundary has no pass to describe: {coverage:?}"
+    );
+    assert_eq!(
+        coverage.stop,
+        agent_contracts::ContextSearchCoverageStop::Unknown,
+        "the explicit no-facts state is Unknown, not a silent complete: {coverage:?}"
+    );
+    service.shutdown().await;
+}
+
+/// V3 counterexample set: the same cold/hot fixture driven in lockstep
+/// through the in-process engine and the service process. The atomic report
+/// must agree on non-empty incomplete, empty incomplete (fail-closed Err),
+/// the continuation walk to the last page, and a stale token — with hits
+/// and coverage belonging to the SAME pass on both sides.
+#[tokio::test]
+async fn search_report_parity_across_the_service_boundary() {
+    let store = IsolatedStore::new("w2-parity");
+    let checkpoint = w2_spilled_fixture(store.path(), W2_N).await;
+    let service = ContextServiceAdapter::connect(&ContextServiceConfig {
+        program: Some(service_program()),
+        engine: ServiceEngine::Dynamic,
+        store_dir: Some(store.path().to_path_buf()),
+        cold_paging: Some((W2_RESTORE_BATCH, W2_HOT_CAP, W2_HYDRATE_ITEMS)),
+        ..ContextServiceConfig::default()
+    })
+    .await
+    .expect("spawn service over the fixture store");
+    let local = context_simple::SimpleContextEngine::new(w2_local_config(store.path()));
+    service.restore(checkpoint.clone()).await.unwrap();
+    local.restore(checkpoint).await.unwrap();
+
+    // --- non-empty incomplete: hits and coverage of the same pass -------
+    let query = || agent_contracts::ContextSearchQuery::new("w2-needle.rs", 20);
+    let service_report = service.search_external_report(query(), None).await.unwrap();
+    let local_report = local.search_external_report(query(), None).await.unwrap();
+    let (service_hits, service_facts) = w2_report_facts(&service_report);
+    let (local_hits, local_facts) = w2_report_facts(&local_report);
+    assert_eq!(service_hits, local_hits, "the same first window is visible");
+    assert_eq!(
+        service_facts, local_facts,
+        "the typed gap agrees: {service_facts:?}"
+    );
+    assert_eq!(
+        service_facts,
+        (false, W2_N - W2_RESTORE_BATCH, "hot-cap".to_string(), true),
+        "both sides report the non-empty incomplete pass: {service_facts:?}"
+    );
+    let stale_token = service_report.coverage.continuation.clone().unwrap();
+
+    // --- the continuation walk reaches the last page --------------------
+    let mut token = local_report.coverage.continuation.clone().unwrap();
+    let mut service_token = stale_token.clone();
+    for pass in 0..8 {
+        let service_next = service
+            .search_external_report(query(), Some(&service_token))
+            .await
+            .unwrap();
+        let local_next = local
+            .search_external_report(query(), Some(&token))
+            .await
+            .unwrap();
+        let (s_hits, s_facts) = w2_report_facts(&service_next);
+        let (l_hits, l_facts) = w2_report_facts(&local_next);
+        assert_eq!(s_hits, l_hits, "pass {pass}: the walk serves the same page");
+        assert_eq!(s_facts, l_facts, "pass {pass}: coverage agrees");
+        if service_next.coverage.complete {
+            assert!(
+                local_next.coverage.complete,
+                "pass {pass}: the walk must complete on both sides together"
+            );
+            break;
+        }
+        service_token = service_next.coverage.continuation.clone().unwrap();
+        token = local_next.coverage.continuation.clone().unwrap();
+    }
+
+    // --- empty incomplete: zero hits over an unread region fail closed --
+    let absent = || agent_contracts::ContextSearchQuery::new("w2-absent-needle", 20);
+    let service_zero = service
+        .search_external_report(absent(), None)
+        .await
+        .expect_err("an empty result over an unread region must fail closed");
+    let local_zero = local
+        .search_external_report(absent(), None)
+        .await
+        .expect_err("the in-process twin fails closed the same way");
+    let (service_zero, local_zero) = (service_zero.to_string(), local_zero.to_string());
+    for message in [&service_zero, &local_zero] {
+        assert!(
+            message.contains("coverage incomplete"),
+            "both sides name the state: {message}"
+        );
+        assert!(
+            message.contains("pending spill page"),
+            "both sides name the typed remainder: {message}"
+        );
+    }
+
+    // --- a stale token degrades to a fresh walk, never an error ---------
+    let service_replay = service
+        .search_external_report(query(), Some(&stale_token))
+        .await
+        .expect("a stale token is a fresh walk, not an error");
+    let local_replay = local
+        .search_external_report(query(), Some(&local_replay_token(&local).await))
+        .await
+        .expect("the in-process twin degrades the same way");
+    let (s_hits, s_facts) = w2_report_facts(&service_replay);
+    let (l_hits, l_facts) = w2_report_facts(&local_replay);
+    assert_eq!(s_hits, l_hits, "the replay serves the same fresh window");
+    assert_eq!(s_facts, l_facts, "the replay's coverage agrees");
+    assert_ne!(
+        service_replay.coverage.continuation.as_deref(),
+        Some(stale_token.as_str()),
+        "the replayed identity is never re-matched"
+    );
+    service.shutdown().await;
+}
+
+/// The in-process twin of the stale token used above: the first pass's
+/// token, long since replaced by the walk.
+async fn local_replay_token(local: &dyn ContextEngine) -> String {
+    local
+        .last_search_coverage()
+        .continuation
+        .clone()
+        .unwrap_or_else(|| "cold-window-e0-n1".to_string())
+}
+
+/// V3, legacy channel: a search whose pass is provably incomplete must not
+/// read back as complete coverage through the boundary. The old adapter
+/// left `last_search_coverage` at the trait default; with the atomic
+/// capability negotiated, the legacy method now routes through the report
+/// op and mirrors the real facts.
+#[tokio::test]
+async fn legacy_search_channel_no_longer_fabricates_complete_coverage() {
+    let store = IsolatedStore::new("w2-legacy");
+    let checkpoint = w2_spilled_fixture(store.path(), W2_N).await;
+    let service = ContextServiceAdapter::connect(&ContextServiceConfig {
+        program: Some(service_program()),
+        engine: ServiceEngine::Dynamic,
+        store_dir: Some(store.path().to_path_buf()),
+        cold_paging: Some((W2_RESTORE_BATCH, W2_HOT_CAP, W2_HYDRATE_ITEMS)),
+        ..ContextServiceConfig::default()
+    })
+    .await
+    .expect("spawn service over the fixture store");
+    let local = context_simple::SimpleContextEngine::new(w2_local_config(store.path()));
+    service.restore(checkpoint.clone()).await.unwrap();
+    local.restore(checkpoint).await.unwrap();
+
+    let query = agent_contracts::ContextSearchQuery::new("w2-needle.rs", 20);
+    let service_hits = service.search_external(query.clone()).await.unwrap();
+    let service_coverage = service.last_search_coverage();
+    let local_hits = local.search_external(query).await.unwrap();
+    let local_coverage = local.last_search_coverage();
+
+    assert_eq!(service_hits.len(), local_hits.len());
+    assert!(!local_coverage.complete && local_coverage.continuation.is_some());
+    assert_eq!(
+        (
+            service_coverage.complete,
+            service_coverage.unread_pages,
+            service_coverage.stop
+        ),
+        (
+            local_coverage.complete,
+            local_coverage.unread_pages,
+            local_coverage.stop
+        ),
+        "the boundary forwards the real coverage facts: {service_coverage:?} vs {local_coverage:?}"
+    );
+    assert!(
+        service_coverage.continuation.is_some(),
+        "the continuation cursor crosses the boundary: {service_coverage:?}"
+    );
+    service.shutdown().await;
+}

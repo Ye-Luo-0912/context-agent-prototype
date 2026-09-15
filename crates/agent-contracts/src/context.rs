@@ -1777,6 +1777,12 @@ pub enum ContextMaterializationMissReason {
     /// The target exists but its terminal/excluded lifecycle state forbids
     /// projection. Required claims never resurrect terminal information.
     PolicyExcluded,
+    /// W1 (V2): the requirement identity matched nothing in the loaded
+    /// indexes and the bounded cold-directory resolution left pending spill
+    /// pages unexamined — absence is *not proven*. The target may still be
+    /// pageable (by id, or after further hydration); this is a resumable
+    /// coverage gap, never a statement that the body does not exist.
+    UnreadColdPage,
 }
 
 /// One body-free materialization degradation row.
@@ -2533,6 +2539,14 @@ pub struct ContextGcReport {
     /// checkpoint; a bounded fact note (id/kind/task/completion) remains.
     #[serde(default)]
     pub scopes_retired: u64,
+    /// W1 (V1): true when this pass deferred scope retirement because the
+    /// pending cold directory could not be examined whole (budget, deadline
+    /// or transiently unreadable rows) — closed scope nodes stay in the
+    /// tree until a later pass proves no unread card references them. An
+    /// honest, typed deferral; never a silent skip, and never a license to
+    /// retire a scope an unread page may still reference.
+    #[serde(default)]
+    pub scope_retirement_deferred: bool,
     #[serde(default)]
     pub evictions: Vec<ContextEviction>,
     /// Rows omitted from [`Self::evictions`] because the pass exceeded the
@@ -2867,7 +2881,9 @@ pub enum ContextSearchCoverageStop {
     #[default]
     Complete,
     /// The operation's items budget or wall-clock deadline was spent between
-    /// read batches.
+    /// read batches. This is also the stop a paged engine reports when the
+    /// search chain itself hit its covered-id ceiling: the chain closes with
+    /// no continuation token and the caller restarts with a fresh search.
     Budget,
     /// A single cold read was cancelled at the deadline boundary; its page
     /// stays pending.
@@ -2876,6 +2892,12 @@ pub enum ContextSearchCoverageStop {
     HotCap,
     /// Every remaining cold page hit a transient read failure this pass.
     Unreadable,
+    /// W2 (V3): this boundary never observed a pass to describe — the
+    /// caller asked for side-channel facts where none exist (no search has
+    /// run, or a process-boundary peer did not negotiate the capability).
+    /// Explicitly NOT a claim of completeness: an engine that can prove its
+    /// whole catalog was visible self-certifies `Complete` instead.
+    Unknown,
 }
 
 impl std::fmt::Display for ContextSearchCoverageStop {
@@ -2886,6 +2908,7 @@ impl std::fmt::Display for ContextSearchCoverageStop {
             Self::Deadline => "deadline",
             Self::HotCap => "hot-cap",
             Self::Unreadable => "unreadable",
+            Self::Unknown => "unknown",
         };
         f.write_str(name)
     }
@@ -2928,6 +2951,28 @@ impl Default for ContextSearchCoverage {
     fn default() -> Self {
         Self::complete()
     }
+}
+
+/// W2 (V3): one catalog search pass's ATOMIC result — the hit list and the
+/// facts describing exactly the pass that produced it, delivered together so
+/// no caller has to read a mutable "last search" side channel afterwards
+/// (across a process boundary that read races, loses or fabricates the
+/// facts). `hits` and `coverage` always describe the same pass;
+/// `coverage.continuation` is the opaque cursor identity (query- and
+/// restore-generation-bound at the serving engine) for the next page, and
+/// `observation` is the pass's store-body I/O.
+///
+/// Error semantics match the underlying search: an empty hit list over an
+/// unread region still fails closed (an `Err`), so an `Ok` result with empty
+/// `hits` means a proven zero-match over complete coverage.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ContextSearchResult {
+    pub hits: Vec<ExternalizedContext>,
+    pub coverage: ContextSearchCoverage,
+    /// Store-body I/O spent by this pass. Zeros mean the catalog answered
+    /// without a cold read.
+    #[serde(default)]
+    pub observation: ContextSearchObservation,
 }
 
 impl ContextSearchQuery {
@@ -3303,6 +3348,35 @@ pub trait ContextEngine: Send + Sync {
     ) -> AgentResult<Vec<ExternalizedContext>> {
         let _ = continuation;
         self.search_external(query).await
+    }
+
+    /// W2 (V3): one search — fresh (`continuation` absent) or resumed at a
+    /// previously issued token — returning the hits AND the coverage /
+    /// observation facts of exactly that pass in one atomic value. This is
+    /// the channel Core uses; the `last_search_coverage` /
+    /// `search_external_continuation` side-channel pair remains for existing
+    /// in-process callers but a process-boundary adapter must NOT satisfy
+    /// this method by re-reading it — it forwards the serving engine's real
+    /// answer, and reports `Unsupported` when its peer did not negotiate the
+    /// capability rather than defaulting to `complete`.
+    ///
+    /// The default composes the legacy methods for engines whose side
+    /// channel is trustworthy in-process (baselines self-certify `Complete`;
+    /// paged in-process engines already maintain the channel).
+    async fn search_external_report(
+        &self,
+        query: ContextSearchQuery,
+        continuation: Option<&str>,
+    ) -> AgentResult<ContextSearchResult> {
+        let hits = match continuation {
+            Some(token) => self.search_external_continuation(query, token).await?,
+            None => self.search_external(query).await?,
+        };
+        Ok(ContextSearchResult {
+            hits,
+            coverage: self.last_search_coverage(),
+            observation: self.last_search_observation(),
+        })
     }
 
     /// One catalog entry's metadata by item id. Resident/Warm projections

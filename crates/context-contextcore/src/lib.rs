@@ -16,7 +16,8 @@ mod wire;
 
 pub use adapter::{ContextServiceAdapter, ContextServiceConfig, ServiceEngine, connect_engine};
 pub use wire::{
-    DEFAULT_CONTEXT_SERVICE_MAX_FRAME_BYTES, MAX_SERVICE_ERROR_CHARS,
-    MIN_CONTEXT_SERVICE_MAX_FRAME_BYTES, PROTOCOL_VERSION, ServiceErrorCategory,
-    ServiceErrorEnvelope, ServiceOp, ServiceRequest, ServiceResponse,
+    DEFAULT_CONTEXT_SERVICE_MAX_FRAME_BYTES, FEATURE_CONTEXT_SEARCH_REPORT,
+    MAX_SERVICE_ERROR_CHARS, MIN_CONTEXT_SERVICE_MAX_FRAME_BYTES, PROTOCOL_VERSION,
+    ServiceErrorCategory, ServiceErrorEnvelope, ServiceOp, ServiceRequest, ServiceResponse,
+    service_features,
 };
