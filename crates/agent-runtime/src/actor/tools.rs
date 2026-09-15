@@ -875,6 +875,35 @@ impl RuntimeActor {
             // rows. The dedupe fence (cancel-vs-late-completion, duplicate
             // arrivals) makes sure one cost enters the account once.
             if self.usage_already_accounted(completion.operation.operation_id) {
+                // W4 (V7): the fence stands — but a stale CANCELLED model
+                // completion whose transport already settled counters
+                // SUPPLEMENTS the cancellation's unknown row exactly once:
+                // the unknown row was the honest settlement available at
+                // the barrier; the late evidence improves it without
+                // replacing the classification and without double counting
+                // (the unknown row carries zeros by construction).
+                if completion.kind == OpKind::Model
+                    && !self.usage_supplemented(completion.operation.operation_id)
+                    && let OperationOutcome::Cancelled {
+                        known_usage: Some(usage),
+                    } = &completion.operation.outcome
+                    && usage.has_any_reported()
+                {
+                    let _ = self
+                        .core
+                        .emit_event(RuntimeEvent::ModelUsed {
+                            input_tokens: usage.input_tokens.unwrap_or(0),
+                            output_tokens: usage.output_tokens.unwrap_or(0),
+                            cached_input_tokens: usage.cached_input_tokens.unwrap_or(0),
+                            attempts: usage.attempts.max(1),
+                            retries: usage.retries,
+                            usage_identity: usage.usage_identity(),
+                            role: agent_contracts::ModelCallRole::Main,
+                            usage: Some(usage.clone()),
+                        })
+                        .await;
+                    self.mark_usage_supplemented(completion.operation.operation_id);
+                }
                 // Already in the account (e.g. the cancellation's unknown
                 // row): only the business drop below still applies.
             } else if let OperationOutcome::ModelOutput { usage, .. } =
@@ -1643,7 +1672,31 @@ impl RuntimeActor {
                 self.settle_aborted_turn().await;
                 self.drain_queued_user_input(op_tx).await;
             }
-            OperationOutcome::Cancelled => {
+            OperationOutcome::Cancelled { known_usage } => {
+                // W4 (V7): the cancellation classification, safety barrier
+                // and generational fencing all still run below — known cost
+                // is settled BEFORE the barrier so the real counters land
+                // under their honest identity instead of the barrier's
+                // unknown row. `cancel_turn` respects the usage fence, so
+                // no second row appears for the same operation.
+                if completion.kind == OpKind::Model
+                    && let Some(usage) = known_usage.filter(|usage| usage.has_any_reported())
+                {
+                    let _ = self
+                        .core
+                        .emit_event(RuntimeEvent::ModelUsed {
+                            input_tokens: usage.input_tokens.unwrap_or(0),
+                            output_tokens: usage.output_tokens.unwrap_or(0),
+                            cached_input_tokens: usage.cached_input_tokens.unwrap_or(0),
+                            attempts: usage.attempts.max(1),
+                            retries: usage.retries,
+                            usage_identity: usage.usage_identity(),
+                            role: agent_contracts::ModelCallRole::Main,
+                            usage: Some(usage.clone()),
+                        })
+                        .await;
+                    self.mark_usage_accounted(completion.operation.operation_id);
+                }
                 if let Err(error) = self
                     .cancel_turn(
                         TurnCancellationReason::OperationCancelled,

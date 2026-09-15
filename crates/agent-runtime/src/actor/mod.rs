@@ -1486,6 +1486,11 @@ struct ActorState {
     /// arrivals from counting one cost twice; bounded FIFO, process-local,
     /// never checkpoint authority.
     usage_accounted_ops: VecDeque<OperationId>,
+    /// W4 (V7): operations whose LATE known usage already supplemented the
+    /// cancellation's unknown row, so a duplicate stale cancelled arrival
+    /// cannot repeat the supplement. Same bounds and lifetime as the
+    /// account fence above.
+    usage_supplemented_ops: VecDeque<OperationId>,
 }
 
 /// Bounded window for the usage dedupe fence: cancellations and stale

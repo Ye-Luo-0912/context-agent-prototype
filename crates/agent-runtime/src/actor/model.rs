@@ -1707,7 +1707,17 @@ impl RuntimeActor {
                     tool_calls: output.tool_calls,
                     usage: output.usage,
                 },
-                Err(AgentError::Cancelled) => OperationOutcome::Cancelled,
+                // W4 (V7): a cancellation stays a cancellation whether or
+                // not the transport wrapped it with already-settled usage —
+                // matched through `failure_source` BEFORE the failure arm,
+                // so the usage envelope can never reclassify it. The known
+                // counters ride the outcome orthogonally; `None` keeps the
+                // historical unknown semantics.
+                Err(error) if matches!(error.failure_source(), AgentError::Cancelled) => {
+                    OperationOutcome::Cancelled {
+                        known_usage: error.reported_usage().cloned(),
+                    }
+                }
                 Err(error) => {
                     let (class, retryable) = Self::classify_model_failure(&error);
                     OperationOutcome::Failed {

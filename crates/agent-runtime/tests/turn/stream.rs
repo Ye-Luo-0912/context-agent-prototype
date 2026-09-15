@@ -555,3 +555,158 @@ async fn cancel_and_late_completion_count_one_cost_exactly_once() {
     );
     assert_eq!(role, "main", "the row names the main lane");
 }
+
+/// W4 (V7): the transport's cancellation shape once the retry loop settles
+/// known usage — `FailedWithUsage { source: Cancelled }`. The outcome must
+/// stay a CANCELLATION (the actor's cancel branch, TurnCancelled barrier),
+/// never a misclassified failure, and the known counters must reach the
+/// account as the round's only row.
+#[derive(Debug)]
+struct SelfCancellingWithUsageModel;
+
+#[async_trait::async_trait]
+impl ModelTransport for SelfCancellingWithUsageModel {
+    fn capabilities(&self) -> ModelCapabilities {
+        ModelCapabilities::default()
+    }
+    async fn complete(&self, _request: ModelRequest) -> AgentResult<ModelOutput> {
+        Err(AgentError::failed_with_usage(
+            agent_contracts::ModelUsage {
+                input_tokens: Some(90),
+                output_tokens: Some(30),
+                attempts: 1,
+                ..agent_contracts::ModelUsage::default()
+            },
+            AgentError::Cancelled,
+        ))
+    }
+}
+
+/// W4 (V7): a model operation that cancels itself while already carrying
+/// the provider's reported counters keeps the Cancelled classification and
+/// settles the known usage as the round's single observed row — no unknown
+/// row is layered on top of real evidence.
+#[tokio::test]
+async fn a_self_cancelled_round_with_known_usage_keeps_cancel_class_and_observed_row() {
+    let handle = spawn_with(
+        Arc::new(SelfCancellingWithUsageModel),
+        Arc::new(TestContextEngine),
+        Arc::new(TestToolDispatcher),
+    )
+    .await;
+    let mut events = handle.subscribe();
+    handle.user_message("hello".into()).await.unwrap();
+
+    let mut rows: Vec<(u64, u64, agent_contracts::UsageIdentity)> = Vec::new();
+    let mut cancelled = false;
+    let mut failed = false;
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    while tokio::time::Instant::now() < deadline {
+        while let Ok(envelope) = events.try_recv() {
+            match envelope.event {
+                RuntimeEvent::ModelUsed {
+                    input_tokens,
+                    output_tokens,
+                    usage_identity,
+                    ..
+                } => rows.push((input_tokens, output_tokens, usage_identity)),
+                RuntimeEvent::TurnCancelled { .. } => cancelled = true,
+                RuntimeEvent::Failure { .. } => failed = true,
+                _ => {}
+            }
+        }
+        if cancelled && !rows.is_empty() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert!(
+        cancelled,
+        "the usage wrapper must not reclassify the cancellation: got rows {rows:?}"
+    );
+    assert!(
+        !failed,
+        "a cancellation carrying usage is not a model failure"
+    );
+    assert_eq!(
+        rows,
+        vec![(90, 30, agent_contracts::UsageIdentity::Observed)],
+        "the known counters are the round's one row: got {rows:?}"
+    );
+}
+
+/// W4 (V7): the user cancels while the transport is still unwinding; it
+/// then resolves with the usage it had already settled (the retry loop's
+/// post-cancel shape). The cancellation barrier's unknown row stays, and
+/// the late known counters SUPPLEMENT the account exactly once instead of
+/// being dropped by the dedupe fence.
+#[derive(Debug)]
+struct CancelUnwindingWithUsageModel;
+
+#[async_trait::async_trait]
+impl ModelTransport for CancelUnwindingWithUsageModel {
+    fn capabilities(&self) -> ModelCapabilities {
+        ModelCapabilities::default()
+    }
+    async fn complete(&self, request: ModelRequest) -> AgentResult<ModelOutput> {
+        request.cancel.cancelled().await;
+        tokio::time::sleep(Duration::from_millis(80)).await;
+        Err(AgentError::failed_with_usage(
+            agent_contracts::ModelUsage {
+                input_tokens: Some(90),
+                output_tokens: Some(30),
+                attempts: 1,
+                ..agent_contracts::ModelUsage::default()
+            },
+            AgentError::Cancelled,
+        ))
+    }
+}
+
+#[tokio::test]
+async fn a_user_cancelled_round_supplements_the_known_usage_once() {
+    let handle = spawn_with(
+        Arc::new(CancelUnwindingWithUsageModel),
+        Arc::new(TestContextEngine),
+        Arc::new(TestToolDispatcher),
+    )
+    .await;
+    let mut events = handle.subscribe();
+    handle.user_message("hello".into()).await.unwrap();
+
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    handle.cancel_turn().await.unwrap();
+
+    let mut rows: Vec<(u64, u64, agent_contracts::UsageIdentity)> = Vec::new();
+    let mut cancelled = false;
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    while tokio::time::Instant::now() < deadline {
+        while let Ok(envelope) = events.try_recv() {
+            match envelope.event {
+                RuntimeEvent::ModelUsed {
+                    input_tokens,
+                    output_tokens,
+                    usage_identity,
+                    ..
+                } => rows.push((input_tokens, output_tokens, usage_identity)),
+                RuntimeEvent::TurnCancelled { .. } => cancelled = true,
+                _ => {}
+            }
+        }
+        if cancelled && rows.len() >= 2 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert!(cancelled, "the user's cancellation stands");
+    // The cancel barrier's honest unknown row plus ONE supplement with the
+    // real counters — never a second supplement, never a silent drop.
+    assert_eq!(
+        rows,
+        vec![
+            (0, 0, agent_contracts::UsageIdentity::Unknown),
+            (90, 30, agent_contracts::UsageIdentity::Observed),
+        ],
+        "known usage supplements the unknown row exactly once: got {rows:?}"
+    );
+}

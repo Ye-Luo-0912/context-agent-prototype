@@ -84,7 +84,15 @@ pub enum OperationOutcome {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         usage: Option<ModelUsage>,
     },
-    Cancelled,
+    /// W4 (V7): cancellation is orthogonal to cost. The known usage the
+    /// cancelled call's attempts already reported rides with the outcome so
+    /// the account can settle it; the classification stays `Cancelled`.
+    /// `None` (also the legacy default) keeps the historical unknown
+    /// semantics — an unreported counter is never invented as a zero.
+    Cancelled {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        known_usage: Option<ModelUsage>,
+    },
 }
 
 /// Identity and outcome of one operation. Every long-running piece of work

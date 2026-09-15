@@ -3477,12 +3477,19 @@ impl RuntimeActor {
     /// MAINTENANCE op — the compactor call it may have been running is a
     /// real cost center of its own, so its unknown row names the
     /// maintenance lane. Every other cancellation shape (tool in flight,
-    /// idle turn) already committed its rounds.
+    /// idle turn) already committed its rounds. W4 (V7): when the round
+    /// settled its known usage BEFORE this barrier (the self-cancelled
+    /// outcome path), that row stands and no unknown row is layered on top.
     async fn emit_cancelled_usage_row(
         &mut self,
         cleanup_kind: Option<OpKind>,
         operation_id: Option<OperationId>,
     ) {
+        if let Some(operation_id) = operation_id
+            && self.usage_already_accounted(operation_id)
+        {
+            return;
+        }
         match cleanup_kind {
             Some(OpKind::Model) => {
                 Self::emit_unknown_model_usage_row(
@@ -3523,6 +3530,26 @@ impl RuntimeActor {
     /// (cancel-time unknown row or an earlier supplement).
     pub(super) fn usage_already_accounted(&self, operation_id: OperationId) -> bool {
         self.state.usage_accounted_ops.contains(&operation_id)
+    }
+
+    /// W4 (V7): remember that the late known usage of an already-accounted
+    /// cancelled operation was supplemented exactly once, so duplicate stale
+    /// arrivals cannot repeat the supplement.
+    pub(super) fn mark_usage_supplemented(&mut self, operation_id: OperationId) {
+        let queue = &mut self.state.usage_supplemented_ops;
+        if queue.contains(&operation_id) {
+            return;
+        }
+        queue.push_back(operation_id);
+        while queue.len() > MAX_USAGE_ACCOUNTED_OPS {
+            queue.pop_front();
+        }
+    }
+
+    /// W4 (V7): true when this operation's late known usage already
+    /// supplemented the cancellation's unknown row.
+    pub(super) fn usage_supplemented(&self, operation_id: OperationId) -> bool {
+        self.state.usage_supplemented_ops.contains(&operation_id)
     }
 
     /// COST-1 (E05.1): the shared unknown-round row — the provider may still

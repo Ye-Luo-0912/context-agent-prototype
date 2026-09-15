@@ -176,11 +176,13 @@ pub struct CallStage {
     /// Retries consumed by the tool-call format credit.
     pub format_retries: u32,
     pub outcome: StageOutcome,
-    /// C4 (R6): usage counters that completed attempts of this call already
-    /// reported, kept on the terminal record for outcomes whose error cannot
-    /// carry them (cancellation must surface as the plain variant so hosts
-    /// keep running their cancellation barrier). `None` when no attempt
-    /// reported anything — unknown stays unknown, never an invented zero.
+    /// C4 (R6)/W4 (V7): usage counters that completed attempts of this call
+    /// already reported, kept on the terminal record as the diagnostic copy.
+    /// Since W4 the terminal ERROR carries the same evidence through the
+    /// shared `FailedWithUsage` envelope (classification still readable via
+    /// `failure_source`), so this record no longer owns the only truth.
+    /// `None` when no attempt reported anything — unknown stays unknown,
+    /// never an invented zero.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub known_usage: Option<ModelUsage>,
 }
@@ -276,9 +278,13 @@ fn merge_known_usage(total: &mut ModelUsage, addition: &ModelUsage) {
     );
 }
 
-/// A cancellation must surface as the plain variant so hosts keep matching it
-/// and running their cancellation barrier; its already-reported usage travels
-/// on the terminal stage record instead.
+/// A cancellation must stay readable as a cancellation through
+/// `failure_source` (no wrapper nesting), so hosts keep matching it and
+/// running their cancellation barrier. W4 (V7): when the loop already
+/// settled known usage, the cancellation carries it through the SAME
+/// `FailedWithUsage` representation as any other outcome — outcome and
+/// usage travel orthogonally, and a usage-less cancellation keeps the bare
+/// variant so existing plain matches stay valid.
 fn is_cancellation(error: &AgentError) -> bool {
     matches!(error.failure_source(), AgentError::Cancelled)
 }
@@ -286,25 +292,17 @@ fn is_cancellation(error: &AgentError) -> bool {
 /// Terminal error of the retry loop with the settled known usage attached
 /// through the shared `FailedWithUsage` representation. The original failure
 /// semantics stay readable through `failure_source` (no wrapper nesting), and
-/// a usage-less call keeps its plain typed error.
+/// a usage-less call keeps its plain typed error — including a usage-less
+/// cancellation.
 fn terminal_error(error: AgentError, known: &mut KnownAttemptUsage) -> AgentError {
-    if is_cancellation(&error) {
-        return match error {
-            AgentError::FailedWithUsage { source, .. } => *source,
-            other => other,
-        };
-    }
-    let Some(usage) = known.take_record() else {
-        return error;
-    };
     let source = match error {
         AgentError::FailedWithUsage { source, .. } => *source,
         other => other,
     };
-    AgentError::FailedWithUsage {
-        usage,
-        source: Box::new(source),
-    }
+    let Some(usage) = known.take_record() else {
+        return source;
+    };
+    AgentError::failed_with_usage(usage, source)
 }
 
 /// Terminal stage for a request cancelled during a retry wait: no further
@@ -791,10 +789,13 @@ impl<T: ModelTransport> RetryingTransport<T> {
                     }
                     tokio::select! {
                         _ = request.cancel.cancelled() => {
-                            // Cancellation keeps its plain variant; the known
-                            // usage stays on the terminal stage record.
+                            // W4 (V7): cancellation keeps its classification
+                            // (readable through `failure_source`) while the
+                            // already-settled usage travels on the same
+                            // terminal error; the stage record keeps its
+                            // diagnostic copy.
                             self.emit_stage(cancelled_stage(&budget, call_seq), &known);
-                            return Err(AgentError::Cancelled);
+                            return Err(terminal_error(AgentError::Cancelled, &mut known));
                         }
                         _ = tokio::time::sleep(delay) => {}
                     }
@@ -903,8 +904,11 @@ impl<T: ModelTransport> RetryingTransport<T> {
                     }
                     tokio::select! {
                         _ = request.cancel.cancelled() => {
+                            // W4 (V7): same orthogonal settlement as the
+                            // live path — classification stays a
+                            // cancellation, known usage rides the error.
                             self.emit_stage(cancelled_stage(&budget, call_seq), &known);
-                            return Err(AgentError::Cancelled);
+                            return Err(terminal_error(AgentError::Cancelled, &mut known));
                         }
                         _ = tokio::time::sleep(delay) => {}
                     }
@@ -1094,7 +1098,9 @@ where
                         let mut stage = cancelled_stage(&budget, call_seq);
                         stage.known_usage = known.record();
                         observer.on_stage(&stage);
-                        return Err(AgentError::Cancelled);
+                        // W4 (V7): the known usage travels on the terminal
+                        // error too, not only the observer record.
+                        return Err(terminal_error(AgentError::Cancelled, &mut known));
                     }
                     _ = tokio::time::sleep(delay) => {}
                 }
@@ -1661,11 +1667,13 @@ mod tests {
         assert_eq!(calls.load(Ordering::SeqCst), 2);
     }
 
-    /// C4 (R6) stop condition — cancel after usage: the cancellation keeps
-    /// its plain variant (hosts run their barrier on it) while the known
-    /// counters stay on the terminal stage record.
+    /// C4 (R6)/W4 (V7) stop condition — cancel after usage: the
+    /// classification stays a cancellation (readable through
+    /// `failure_source` so hosts keep running their barrier on it) and the
+    /// known counters travel BOTH on the terminal error and the stage
+    /// record.
     #[tokio::test]
-    async fn cancel_after_a_reported_usage_keeps_plain_cancelled_and_the_stage_record() {
+    async fn cancel_after_a_reported_usage_keeps_the_cancel_class_and_both_records() {
         struct UsageThenPending {
             calls: Arc<AtomicU32>,
         }
@@ -1720,8 +1728,12 @@ mod tests {
             .expect("retry task panicked")
             .unwrap_err();
         assert!(
-            matches!(error, AgentError::Cancelled),
-            "cancellation must keep its plain variant: {error:?}"
+            matches!(error.failure_source(), AgentError::Cancelled),
+            "cancellation must keep its classification: {error:?}"
+        );
+        assert!(
+            error.reported_usage().is_some(),
+            "W4: the known usage must also travel on the error: {error:?}"
         );
         let stages = observer.stages.lock().unwrap();
         let stage = stages.last().unwrap();
@@ -1734,12 +1746,13 @@ mod tests {
         assert_eq!(usage.output_tokens, Some(30));
     }
 
-    /// C4 (R6): a cancellation DURING a streaming attempt (the provider
-    /// reported usage frames and then the request was cancelled) unwraps to
-    /// the plain Cancelled variant, and its reported counters join the stage
-    /// record together with the earlier attempt's.
+    /// C4 (R6)/W4 (V7): a cancellation DURING a streaming attempt (the
+    /// provider reported usage frames and then the request was cancelled)
+    /// keeps its cancellation classification through the settled error, and
+    /// its reported counters join the error and the stage record together
+    /// with the earlier attempt's.
     #[tokio::test]
-    async fn a_mid_stream_cancellation_keeps_the_plain_variant_and_the_stage_usage() {
+    async fn a_mid_stream_cancellation_keeps_the_class_and_the_settled_usage() {
         struct UsageThenCancelMidStream {
             calls: Arc<AtomicU32>,
         }
@@ -1794,15 +1807,115 @@ mod tests {
             .await
             .unwrap_err();
         assert!(
-            matches!(error, AgentError::Cancelled),
-            "the cancellation must surface unwrapped: {error:?}"
+            matches!(error.failure_source(), AgentError::Cancelled),
+            "the cancellation must keep its classification: {error:?}"
         );
+        let error_usage = error
+            .reported_usage()
+            .expect("W4: the merged counters must travel on the error");
+        assert_eq!(error_usage.input_tokens, Some(97), "90 + 7");
+        assert_eq!(error_usage.output_tokens, Some(33), "30 + 3");
         let stages = observer.stages.lock().unwrap();
         let stage = stages.last().unwrap();
         assert_eq!(stage.outcome, StageOutcome::Cancelled);
         let usage = stage.known_usage.as_ref().unwrap();
         assert_eq!(usage.input_tokens, Some(97), "90 + 7");
         assert_eq!(usage.output_tokens, Some(33), "30 + 3");
+    }
+
+    /// W4 (V7): a backoff cancel after an attempt already reported usage
+    /// keeps the counters on the returned error through the shared usage
+    /// envelope, while the failure semantics stay readable as a plain
+    /// cancellation through `failure_source` — classification and evidence
+    /// travel orthogonally, so no consumer has to lose one to keep the
+    /// other. A usage-less cancel keeps the bare variant (compat).
+    #[tokio::test]
+    async fn a_backoff_cancel_carries_the_known_usage_on_the_error() {
+        struct UsageThenBackoff {
+            calls: Arc<AtomicU32>,
+        }
+        #[async_trait]
+        impl ModelTransport for UsageThenBackoff {
+            fn capabilities(&self) -> ModelCapabilities {
+                ModelCapabilities::default()
+            }
+            async fn complete(&self, _request: ModelRequest) -> AgentResult<ModelOutput> {
+                unreachable!("streaming model should be driven through complete_stream")
+            }
+            async fn complete_stream(
+                &self,
+                _request: ModelRequest,
+                _sink: &dyn ModelEventSink,
+            ) -> AgentResult<ModelOutput> {
+                assert_eq!(
+                    self.calls.fetch_add(1, Ordering::SeqCst) + 1,
+                    1,
+                    "the unexecuted retry must never run"
+                );
+                Err(AgentError::failed_with_usage(
+                    ModelUsage {
+                        input_tokens: Some(90),
+                        output_tokens: Some(30),
+                        ..ModelUsage::default()
+                    },
+                    AgentError::Transport {
+                        retryable: true,
+                        message: "stream dropped".into(),
+                    },
+                ))
+            }
+        }
+        let calls = Arc::new(AtomicU32::new(0));
+        let observer = Arc::new(RecordingObserver::default());
+        let transport = RetryingTransport::new(
+            UsageThenBackoff {
+                calls: calls.clone(),
+            },
+            3,
+            Duration::from_secs(60),
+        )
+        .with_observer(observer.clone());
+        let token = CancellationToken::new();
+        let mut request = request();
+        request.cancel = token.clone();
+        let run = tokio::spawn(async move {
+            transport
+                .complete_stream(request, &RecordingSink::default())
+                .await
+        });
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        token.cancel();
+        let error = tokio::time::timeout(Duration::from_secs(1), run)
+            .await
+            .expect("cancellation must abort the wait")
+            .expect("retry task panicked")
+            .unwrap_err();
+        // The classification stays a cancellation, read through the wrapper.
+        assert!(
+            matches!(error.failure_source(), AgentError::Cancelled),
+            "the settled error must stay a cancellation: {error:?}"
+        );
+        // The known usage survives ON the error — the formal channel, not
+        // only the optional observer artifact.
+        let usage = error
+            .reported_usage()
+            .expect("the reported usage must travel with the cancellation");
+        assert_eq!(usage.input_tokens, Some(90));
+        assert_eq!(usage.output_tokens, Some(30));
+        // The diagnostic copy still carries the same evidence.
+        let stages = observer.stages.lock().unwrap();
+        assert_eq!(stages.last().unwrap().outcome, StageOutcome::Cancelled);
+        assert_eq!(
+            stages
+                .last()
+                .unwrap()
+                .known_usage
+                .as_ref()
+                .map(|usage| usage.input_tokens),
+            Some(Some(90))
+        );
+        // The unexecuted retry never ran: no invented second attempt.
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
     }
 
     /// C4 (R6) stop condition — sink failure: the retry notification failing
