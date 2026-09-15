@@ -1077,6 +1077,14 @@ async fn procvar_journey() -> anyhow::Result<()> {
 
 /// The journey's causal-contract checks, read off the provider's ordered
 /// log. Sync on purpose: no lock is held across an await point.
+///
+/// Arrival order at the provider is only used through the round indices the
+/// provider assigns (round 1's handler holds *after* recording, and round 2
+/// is issued only after the hold is released, so indices follow the script's
+/// causal roles). The STEER entry's position must not be intersected with
+/// request positions: the held round-1 request is *issued* before the steer,
+/// so under load its arrival can be recorded after the steer's ack without
+/// any runtime causality changing.
 fn assert_evidence_ledger(log: &Mutex<ProviderLog>) {
     let log_guard = log.lock().expect("provider log mutex");
     assert!(
@@ -1089,6 +1097,21 @@ fn assert_evidence_ledger(log: &Mutex<ProviderLog>) {
         "the journey is exactly five scripted model rounds, got {}",
         log_guard.model_rounds
     );
+    let requests: Vec<&Entry> = log_guard
+        .entries
+        .iter()
+        .filter(|entry| entry.kind == EntryKind::ModelRequest)
+        .collect();
+    // Rounds 0 and 1 are process 1's pre-correction turn; the held round in
+    // particular was issued before the correction existed. The marker must
+    // not appear in either.
+    for entry in requests.iter().take(2) {
+        assert!(
+            !entry.has_token,
+            "the pre-correction requests must not carry the marker: {:?}",
+            entry.detail
+        );
+    }
     let entries = &log_guard.entries;
     let steer_pos = entries
         .iter()
@@ -1100,19 +1123,16 @@ fn assert_evidence_ledger(log: &Mutex<ProviderLog>) {
             .any(|entry| entry.kind == EntryKind::ModelRequest),
         "the steer must come after process 1's model requests"
     );
-    assert!(
-        entries[..steer_pos].iter().all(|entry| !entry.has_token),
-        "no request before the steer may contain the marker"
-    );
-    let first_after = entries[steer_pos + 1..]
-        .iter()
-        .find(|entry| entry.kind == EntryKind::ModelRequest)
-        .expect("a model request followed the steer");
-    assert!(
-        first_after.has_token,
-        "the first request after the steer must carry the marker: {:?}",
-        first_after.detail
-    );
+    // From the drained correction onward (rounds 2, 3, 4) EVERY model
+    // request carries the marker: the runtime handed the steer to the model,
+    // and the obligation survived the process boundary.
+    for entry in requests.iter().skip(2) {
+        assert!(
+            entry.has_token,
+            "every post-correction request must carry the marker: {:?}",
+            entry.detail
+        );
+    }
 }
 
 fn stage_committed(stage_path: &std::path::Path) -> bool {

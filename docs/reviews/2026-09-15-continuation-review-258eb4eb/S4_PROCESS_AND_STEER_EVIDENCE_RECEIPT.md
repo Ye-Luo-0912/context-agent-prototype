@@ -64,3 +64,9 @@ T7 旅程（`host_t7_journey.rs`）证明了真实工作区写入、wire 审批�
 
 - 共享树合并验收：`cargo test -p agent-host` 全套 31/0、clippy `--all-targets` 0、fmt clean。
 - **新增修复（同套件稳定性）**：`host_e2e.rs` 的 `stop_is_bounded_with_no_client` 在满载并行下约每两三次全量运行出现一次 30s 假失败——`stop_and_join_bounded` 的唤醒连接用的是会 panic 的 `connect()`（30s 预算）；服务线程已自行退出、管道销毁后，该唤醒在死管道上空转满预算后 panic，抢在 join 裁决之前。修复：唤醒改为 fire-and-forget 循环 poke（不 panic），裁决权完全交给带界 join——服务线程真死时其真实错误经 join 呈现，而不是被盲转掩盖。本地复现修复前 2/5 失败 → 修复后 14/14 全绿（9 线程 6 次＋16 线程 8 次）。如实记录：修复后的第一次运行出现过一次未捕获信息的失败（8.25s，非盲转模式），随后 14 次极限并行未再现；若真实 serve 线程故障再现，现在的失败信息将是 join 的原始错误而非盲转 panic。
+
+## 合入后 CI 追加修复（2026-09-15，run 35017012932）
+
+- CI 的 windows part full 里进程变体旅程失败：「the first request after the steer must carry the marker: model round 1 arrived」。根因是证据账本把**到达序**当成了因果序：被 hold 的 round-1 请求由运行时在 steer 之前发出，只是其请求体在满载 CI 上尚未被 provider 读完记录；steer ack 先入账后，账本里「steer 后第一个请求」就成了合法无标记的 round 1。到达序在此处不表达运行时因果。
+- 修复：账本断言改为按 provider 分配的轮次序号表达因果（round-1 的 handler 先记录后 hold、round-2 只在放行后发出，故序号稳定对应脚本角色）——round 0/1 不得含标记（纠正尚未存在）；从 round 2（被排空的纠正轮）起**每个**请求都必须含标记（运行时把纠正交给了模型，且该义务跨进程边界存活）。标记交付事实同时由脚本门禁独立强制（round≥2 缺标记即拒绝，refusals 必须为空）。
+- 修复后本地：procvar 6/0 共 4 次（含 3 次 `--test-threads=1` 重复）、host 全套 8 个二进制全绿、clippy 0、fmt clean。
