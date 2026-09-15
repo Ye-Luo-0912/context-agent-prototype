@@ -13,7 +13,9 @@
 
 **2026-09-15 续审批次收口**：S1/S2a/S2b/S3/S4 全部关闭（见 [NEXT_TASKS.md](NEXT_TASKS.md) 对应行与回执）。S3 固定预算冷目录闭环（per-read deadline、字节预留、保 claim 访问戳、类型化背压、搜索 coverage+continuation 进模型正文）；S4 独立进程变体＋指令传递证据（真实两进程、脚本 provider 内容门禁）。同批修复三处满载 Windows 抖动：t7 旅程审批交付后的立即断言（`4ba60b97`）、cold_bounds 捕获 io 墙钟预算 2s 过窄（随 S3 关闭）、host_e2e stop 唤醒在死管道上盲转 panic（`48ddcb1f`）。残余限制如实记录在两份回执（wire 层 coverage 传播、续查 token 不进 checkpoint、pending 目录随历史增长）。T8 仍为条件任务（付费实验），无新开任务。
 
-**2026-09-16 新审查（基线 `4f6eb7ff`，CI run `35019429861` 首次成功）**：开 V1–V7 七项发现，核心主线是"分页只改变驻留位置、不改变语义身份与保护义务；取消只改变执行结果、不抹掉已知成本"。最高优先级 V1（P1）：scope 退休扫描看不到未加载冷页的 scope 引用，可破坏可达性/恢复目录。四切片 W1–W4 已入 [NEXT_TASKS.md](NEXT_TASKS.md) 第四批（V1 先行，其余可并行），报告与覆盖表见 [docs/reviews/2026-09-16-review-4f6eb7ff/](reviews/2026-09-16-review-4f6eb7ff/REVIEW.md)。审查环境未执行本地测试，全部回归待实现时红-first 补齐。
+**2026-09-16 新审查（基线 `4f6eb7ff`，CI run `35019429861` 首次成功）**：开 V1–V7 七项发现，核心主线是"分页只改变驻留位置、不改变语义身份与保护义务；取消只改变执行结果、不抹掉已知成本"。报告与覆盖表见 [docs/reviews/2026-09-16-review-4f6eb7ff/](reviews/2026-09-16-review-4f6eb7ff/REVIEW.md)。
+
+**2026-09-16 V 批次收口**：W1–W4 全部关闭（见 [NEXT_TASKS.md](NEXT_TASKS.md) 第四批与各回执）。W1（`c0923af2`）：scope 退休引用闭包许可（未读冷页引用的 scope 不被退休、预算耗尽诚实推迟）＋必需正文冷解析（typed Missing/Corrupt/IoFailed/UnreadColdPage，不再把已存在正文报成 Missing）；W2（同上）：`ContextSearchResult` 原子返回＋wire 协商、fresh/resume 生命周期、restore 失效旧 token＋nonce 防ABA；W3（`9b176df0`）：工具结果断点改 `input_text` 块、未确认 sibling fallback 删除；W4（`4fa2d8a2`）：取消结算已知用量（`Cancelled{known_usage}`，observer 降级为诊断副本，全链回归在无 metrics env 下验证）。限制如实记录在各回执（退休探测预算耗尽时持续推迟、covered 集仍为累积 ID 集、maintenance lane 取消仍 unknown、真实端点接受/命中归 T8）。
 
 ## 当前阶段：可持续使用的后端开发流程
 
