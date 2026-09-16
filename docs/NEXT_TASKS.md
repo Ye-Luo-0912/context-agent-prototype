@@ -6,7 +6,7 @@
 
 先核对当前分支、HEAD 和未提交 diff（并行分支在飞）。MERGED 只说明代码进入目标分支，不代表 CI 或真实供应商验收通过。本轮 A=执行核心/工具，B=上下文/GC/搜索，C=平台/供应商 KV。共享 contracts/ModelInput/缓存契约由单一集成人维护。
 
-**当前开工顺序：R 系列（R1–R8）与 B3 已全部关闭。剩余仅 B1（批量 required 有界解析计划）与 B2（existing card 认领校验）——两者基线已干净，可直接开工。** 第五批（U 系列）实现已提交但按续审不视为关闭。历史顺序（已关闭）：T1/T2/T3 并行（第一批）；T4/T6 并行（第二批）；T5 随组合点接入；T7 收尾；T8 条件任务。每片先写用户动作与目标反例，再做实现；可维护性边界（见审查报告「四个责任边界」节）随片交付，不另起全仓重写；同一 crate 内多个切片按文件所有权串行，不并行互踩。
+**当前开工顺序：R 系列（R1–R8）、B1（批量 required 有界解析计划）与 B2/B3（捕获完整性与取消安全）已全部关闭。** 剩余仅 C（续）——实际请求序列的 KV 与成本比较（本地可做部分），与条件任务 T8（需授权预算/凭据）。历史顺序（已关闭）：T1/T2/T3 并行（第一批）；T4/T6 并行（第二批）；T5 随组合点接入；T7 收尾。每片先写用户动作与目标反例，再做实现；可维护性边界（见审查报告「四个责任边界」节）随片交付，不另起全仓重写；同一 crate 内多个切片按文件所有权串行，不并行互踩。
 
 ## S1 — 冷目录测试自锁（已关闭 2026-09-15）
 
@@ -107,20 +107,22 @@ T4 一期/二期已有预算与降级，但"有界"仍是局部控制（续审 R
 - 停止：事件流、`session_end`、exit 与实际结算/完整性一致；未知不冒充拒绝、失败或零费用。
 - 落地回执：[A3_A4_U5_U7_TERMINAL_AND_HEADLESS_RECEIPT](reviews/2026-09-16-review-d92564bc/A3_A4_U5_U7_TERMINAL_AND_HEADLESS_RECEIPT.md)。`Lagged` 记 `events_dropped`/`dropped_count`，终态前关闭记 `closed_without_completion`，两者任一命中新守卫臂 → 新 `EXIT_INCOMPLETE = 4` / `status: "incomplete"`（`stop` = `events_dropped`｜`stream_closed`）；尾部 `TurnCompleted` 不再掩盖被丢段；不补零、不把缺口当拒绝；`Closed` 限定为防御接口边界。另修 JSONL 双换行、非终态先取消在途回合再等输出排空、返回 writer 不再超界 re-flush。4 条新测试，变异恢复法复验两条转红后 sha256 还原。限制：`EXIT_INCOMPLETE = 4` 是新增出口码，脚本调用方需知悉；真实 PTY 端到端未执行；U3（TUI 侧事件缺口）不在本片。
 
-### B1 — 多 required 的有界解析计划（B，context-simple）
+### B1 — 多 required 的有界解析计划（B，context-simple）——已关闭（2026-09-17，`de6bf061`）
 用户动作：多个必需正文依次从冷目录加载时，先加载的目标不因随后驱逐又被报成 `Missing`。
 - `resolve_required_cold_refs` 每个 exact ID 调 `hydrate_card_for_outcome`，装完立即 `settle_metadata_residency`，protect 只含刚装的这一个 ID；解析只保存 `Installed/AlreadyOwned`，不持已验证 owner 快照；整批结束才 `plan_required_with_resolution` 按热表查找。热容量 2、required A/B/C、总量在模型预算内时，C 的安装把 A 降回 pending，规划 A 找不到 owner，`Installed` 的兜底 miss 又映射为 `Missing`。
 - 修复方向：解析时直接产生**有界的、版本/范围绑定的 `RequiredPlanSource`**（或明确受预算约束的短期租赁），不依赖整批结束时谁还恰好驻留。临时计划计入资源预算；预算不足用准确的 `BudgetExcluded/UnreadColdPage`，不宣称 `Missing`；不无限 pin、不全历史 hydration。
 - 红例：hot cap=2 ＋ required A/B/C 三个合法可降级冷页 ＋ 模型 budget 足够 → 读取均成功且 A 不因随后驱逐成为 Missing；再覆盖 entity/foreground 干扰与真实预算不足；混合 exact ID 与路径。
 - 停止：材料化与最终装箱要么给出正确正文，要么报告真正的容量/读取原因。这是对 W1 的批量补齐，不是重开"完全没有冷解析"。
+落地回执：[B1_B2_THIRD_BATCH_RECEIPT](reviews/2026-09-16-review-3bdb269c/B1_B2_THIRD_BATCH_RECEIPT.md)。per-id lane 改返回 `PendingIdRead{outcome, entry}`，`RequiredColdResolution::resolved` 在读取点捕获版本/范围绑定的卡片条目（每 id 首捕获生效、上限=观察上限）；规划对 exact ID、实体、前景三处加捕获 fallback（同一 `plan_store_required`/谓词门），热表查找仍优先。驻留结算不变；预算不足仍由 `apply_required` 报 `BudgetExcluded`。3 条红线红→绿＋三处 fallback 变异复验承重。限制（wrapper 的有界克隆、捕获上限、实体精确等值口径）见回执。
 
-### B2 — 捕获完整性证明与取消安全（B2＋B3，context-simple）
+### B2 — 捕获完整性证明与取消安全（B2＋B3，context-simple）——已关闭（B3 2026-09-16 `3fe396c9`；B2 2026-09-17 `2482f3ef`）
 用户动作：同名坏卡片存在时不把唯一可靠元数据换成坏引用；导出过程中取消不丢内存日志。
 - B2：`run_external_spill_io` 的 plan.writes 分支遇到已有路径，`try_exists` 后直接放进 `io.written/io.spilled`，既未比对现有内容与计划 bytes/hash/身份，也未走受检卡片读取；`checkpoint` 随后 `record_card` 并从 inline external 段排除它们 → 同名文件损坏/截断时新 checkpoint 只引用坏卡片，下次 restore 才发现。
 - B3（后续收口）：`export_ledger` 先 `mem::take(state.ledger)` 再 await 写临时文件与 rename；普通 I/O 错误有 merge back，但 future 在 await 中被取消/丢弃时不会运行该错误分支，记录随局部变量消失。
 - 修复方向：首次认领未验证 existing card 时做有界校验（identity/schema/hash 与计划内容一致），或按内容寻址规则安全原子写入；无法证明时本次保留 inline。导出改为成功提交后再确认消费相应记录。不引入新存储层，不做无差别全量重读，ledger 子项可晚于恢复卡片完整性。
 - 红例：无有效 claim 的 fixture 中预置同名坏文件 → capture → 新引擎 restore，原元数据仍可恢复或 capture 明确保留 inline；覆盖 existing directory／hash 不匹配／读取权限故障；在 write/rename 边界暂停并取消导出后记录仍有归属。
 - 停止：证据不因同名文件损坏而失去唯一可靠副本；已有有效不可变 claim 的复用性能不被全量重读破坏。
+B2 落地回执：[B1_B2_THIRD_BATCH_RECEIPT](reviews/2026-09-16-review-3bdb269c/B1_B2_THIRD_BATCH_RECEIPT.md)。已存在卡片路径只在「是文件、长度与计划字节相等、整读等值」时认领（内容寻址幂等免重写不变）；可读不一致/不可读落入同一条原子写入（修复或首次写入），写失败保持 inline——manifest 不再收坏引用。`recorded` 快路径零 I/O 不变。2 条红线（坏字节、目录占位）红→绿＋退回裸 `try_exists` 的变异复验双红。限制（权限故障不做专用反例、整读比较受卡字节预算约束）见回执。
 
 ### C（续）— 实际请求序列的 KV 与成本比较
 不重开 W3 已修的内容块类型任务。沿实际 request 序列核对连续请求首差异、稳定证据范围与工具 schema 变化、失败/取消的已知用量只结算一次；TUI 的 Token 显示取自同一份结算事实（与 A2 的读模型一致），不因重放再算一份不同的账。质量、指令、证据新鲜度、权限撤销不得因缓存倒退。真实端点接受/命中/净成本仍是 T8 条件实验，无预算无凭据保持 NOT_RUN。
@@ -181,7 +183,7 @@ T4 一期/二期已有预算与降级，但"有界"仍是局部控制（续审 R
 
 ### B3 — ledger 导出取消安全——已关闭（2026-09-16，`3fe396c9`）
 - 落地回执：[R6_R7_R8_B3_SECOND_BATCH_RECEIPT](reviews/2026-09-16-review-3bdb269c/R6_R7_R8_B3_SECOND_BATCH_RECEIPT.md)。导出改为「快照→提交→确认消费」，取消不再丢行；`ContextLifecycleRecord` 增 `PartialEq/Eq`。
-B3 已关闭（见上）。**B1（批量 required 的有界版本绑定计划）与 B2（首次认领 existing card 的校验）仍未做**——`context-simple` 的在飞工作已先行按归属提交（`ca6c7254`、`99218532`），因此两者现在有了干净基线。文档记载"他人本地在飞"不等于 main 已包含——先与实际工作树核对，不覆盖在飞改动。
+**B1（`de6bf061`）与 B2（`2482f3ef`）亦已关闭（2026-09-17）**——回执：[B1_B2_THIRD_BATCH_RECEIPT](reviews/2026-09-16-review-3bdb269c/B1_B2_THIRD_BATCH_RECEIPT.md)。本阶段队列至此只剩 C（续）与 T8。
 
 ### T8 — 条件性供应商成本对照
 **先有 R2 的完整结算**再测真实供应商，否则只比较最终成功调用会漏掉失败/取消成本（取消频繁的长任务成本可能被低估）。场景固定同一任务/起点/验收，至少覆盖前缀稳定、动态尾部、文件版本变化、checkpoint、维护、失败重试与取消补账；报告 uncached/read/write/output、主/维护调用、尝试数、未知覆盖与任务质量。无授权/凭据/预算则 `NOT_RUN`，不借用环境密钥发起付费实验。
