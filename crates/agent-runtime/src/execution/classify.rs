@@ -102,6 +102,7 @@ pub fn stamp_fs_read_motive(output: &mut ToolOutput, motive: FsReadMotive) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::execution::ResourceFactKind;
     use crate::execution::ResourceProvenance;
     use agent_contracts::ResourceFreshness;
 
@@ -112,6 +113,7 @@ mod tests {
             freshness,
             turn: 1,
             provenance: ResourceProvenance::Read,
+            kind: ResourceFactKind::FileBody,
         }
     }
 

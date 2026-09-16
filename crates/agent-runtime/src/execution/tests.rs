@@ -1237,6 +1237,65 @@ fn foreground_resources_are_exact_mentions_of_known_paths() {
     );
 }
 
+#[test]
+fn foreground_resources_only_include_file_body_reads() {
+    let mut resume = ExecutionState::default();
+
+    let mut listing = output("fs.list", true, "listed");
+    listing.metadata = json!({
+        "path": "src",
+        "revision": "listing-rev",
+    });
+    resume.observe_tool(&listing, 1, 1);
+    assert!(
+        resume.foreground_resources("inspect src").is_empty(),
+        "a directory listing has a path revision but no file body"
+    );
+    assert_eq!(
+        resume.checked_files[0].kind,
+        ResourceFactKind::DirectoryListing
+    );
+
+    let mut write = output("fs.write", true, "wrote");
+    write.metadata = json!({
+        "path": "src/new.rs",
+        "revision": "written-rev",
+    });
+    resume.observe_tool(&write, 1, 2);
+    assert!(
+        resume.foreground_resources("inspect src/new.rs").is_empty(),
+        "a mutation result proves a version, not a reusable file body"
+    );
+    assert_eq!(
+        resume
+            .checked_files
+            .iter()
+            .find(|row| row.path == "src/new.rs")
+            .expect("write fact")
+            .kind,
+        ResourceFactKind::Metadata
+    );
+
+    let mut read = output("fs.read", true, "read new");
+    read.metadata = json!({
+        "path": "src/new.rs",
+        "revision": "read-rev",
+    });
+    resume.observe_tool(&read, 1, 3);
+    let keys = resume.foreground_resources("inspect src/new.rs");
+    assert_eq!(keys.len(), 1);
+    assert_eq!(keys[0].revision.as_deref(), Some("read-rev"));
+    assert_eq!(
+        resume
+            .checked_files
+            .iter()
+            .find(|row| row.path == "src/new.rs")
+            .expect("read fact")
+            .kind,
+        ResourceFactKind::FileBody
+    );
+}
+
 // ---- Evidence Frontier / ConvergenceState----
 
 fn pathless_command(name: &str, ok: bool, command: &str, summary: &str) -> ToolOutput {

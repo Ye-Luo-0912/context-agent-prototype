@@ -3502,8 +3502,8 @@ mod tests {
     fn verification_basis_consumers_agree_through_progress_boundary_and_restore() {
         use crate::checkpoint::{TaskManagerSnapshot, TaskRecordSnapshot};
         use crate::execution::{
-            ExecutionState, ResourceFact, ResourceProvenance, RuntimeExecutionAttribution,
-            VerificationState,
+            ExecutionState, ResourceFact, ResourceFactKind, ResourceProvenance,
+            RuntimeExecutionAttribution, VerificationState,
         };
         use crate::opportunity::derive_completion_opportunity;
         use agent_contracts::{
@@ -3528,6 +3528,7 @@ mod tests {
             freshness: ResourceFreshness::Fresh,
             turn: 1,
             provenance: ResourceProvenance::MutationResult,
+            kind: ResourceFactKind::Metadata,
         });
         let exact = RuntimeExecutionAttribution {
             host: ToolExecutionAttribution::bounded(
@@ -4248,6 +4249,7 @@ mod tests {
                 freshness: agent_contracts::ResourceFreshness::Fresh,
                 turn: 1,
                 provenance: crate::execution::ResourceProvenance::MutationResult,
+                kind: crate::execution::ResourceFactKind::Metadata,
             });
         execution
             .verifications

@@ -888,6 +888,7 @@ mod edit_attempt_tests {
                 freshness,
                 turn: 1,
                 provenance: crate::execution::ResourceProvenance::Read,
+                kind: crate::execution::ResourceFactKind::FileBody,
             });
         turn
     }

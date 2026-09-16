@@ -62,8 +62,8 @@ pub use snapshot::RoundExecutionSnapshot;
 pub use snapshot::VerificationProjection;
 pub use state::{
     CompletionRepairPotential, CompletionRepairRecord, ExecutionState, FrontierObservation,
-    NegativeExecutionFact, NegativeFactTransition, ResourceFact, ResourceProvenance,
-    RuntimeExecutionAttribution, UnresolvedFailureOverflow, VerificationCause,
+    NegativeExecutionFact, NegativeFactTransition, ResourceFact, ResourceFactKind,
+    ResourceProvenance, RuntimeExecutionAttribution, UnresolvedFailureOverflow, VerificationCause,
     VerificationCoverage, VerificationFact, VerificationPassTransition, VerificationSourceLease,
     VerificationState,
 };

@@ -165,7 +165,7 @@ pub(crate) fn opportunity_surface_requirement() -> agent_contracts::ToolSurfaceR
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::execution::{ResourceFact, VerificationCause, VerificationFact};
+    use crate::execution::{ResourceFact, ResourceFactKind, VerificationCause, VerificationFact};
     use crate::task::TaskManager;
     use agent_contracts::ResourceFreshness;
 
@@ -187,6 +187,7 @@ mod tests {
             freshness: ResourceFreshness::Fresh,
             turn: 1,
             provenance: ResourceProvenance::MutationResult,
+            kind: ResourceFactKind::Metadata,
         });
         execution.anchor_revision = 1;
         execution.verification.spec_revision = 1;
@@ -237,6 +238,7 @@ mod tests {
             freshness: ResourceFreshness::Fresh,
             turn: 1,
             provenance: ResourceProvenance::Read,
+            kind: ResourceFactKind::FileBody,
         });
         let decision = derive_completion_opportunity(id, &anchor, &read_only, false, false, false);
         assert!(decision.ready.is_none());
@@ -257,6 +259,7 @@ mod tests {
             freshness: ResourceFreshness::Fresh,
             turn: 1,
             provenance: ResourceProvenance::MutationResult,
+            kind: ResourceFactKind::Metadata,
         });
         // NotRun / Pending / Stale / Failed all block; each names its class.
         for (state, expected) in [

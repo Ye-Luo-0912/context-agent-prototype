@@ -418,9 +418,8 @@ pub struct ConvergenceState {
 }
 
 /// How one [`ResourceFact`] was last observed. Observability only: it
-/// never gates freshness, authority, or selection — it explains why the
-/// fact is believed (effect, observation, and attention are
-/// separate truths).
+/// never gates freshness or authority — it explains why the fact is
+/// believed (effect, observation, and attention are separate truths).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ResourceProvenance {
@@ -437,6 +436,25 @@ pub enum ResourceProvenance {
     Verification,
 }
 
+/// What a resource fact can safely provide to a model-facing foreground
+/// projection. This is separate from [`ResourceProvenance`]: a directory
+/// listing and a mutation result both carry useful path/version facts, but
+/// neither carries a reusable file body.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ResourceFactKind {
+    /// A successful `fs.read` body. The default keeps older checkpoints and
+    /// hand-built facts conservative and compatible with the former shape.
+    #[default]
+    FileBody,
+    /// A directory enumeration; its digest identifies the listing snapshot,
+    /// not a file revision.
+    DirectoryListing,
+    /// A path/version observation without a reusable file body (for example
+    /// a write result, verification result, diff, or search result).
+    Metadata,
+}
+
 /// One bounded operational fact about a workspace path.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -448,6 +466,12 @@ pub struct ResourceFact {
     pub turn: u64,
     #[serde(default)]
     pub provenance: ResourceProvenance,
+    /// Body capability is distinct from path freshness and observation
+    /// provenance. Old serialized facts default to `FileBody` so a prior
+    /// fs.read remains eligible; newly recorded non-body tools set an
+    /// explicit kind.
+    #[serde(default)]
+    pub kind: ResourceFactKind,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
@@ -1229,14 +1253,19 @@ impl ExecutionState {
         })
     }
 
-    /// Current directive exact-mentions ∩ known (non-Missing) resource
-    /// paths. Recency first, capped. Runtime fills `ContextHints`; the
-    /// engine must not re-parse TurnIntent.
+    /// Current directive exact-mentions ∩ known, reusable file-body paths.
+    /// Directory listings, mutation results and other metadata remain in the
+    /// operational fact set but do not become foreground body requests.
+    /// Recency first, capped. Runtime fills `ContextHints`; the engine must
+    /// not re-parse TurnIntent.
     pub fn foreground_resources(&self, turn_intent: &str) -> Vec<ResourceKey> {
         let mut hits: Vec<&ResourceFact> = self
             .checked_files
             .iter()
             .filter(|row| row.freshness != ResourceFreshness::Missing)
+            .filter(|row| {
+                row.kind == ResourceFactKind::FileBody && row.provenance == ResourceProvenance::Read
+            })
             .filter(|row| path_exactly_in_directive(turn_intent, &row.path))
             .collect();
         hits.sort_by(|a, b| b.turn.cmp(&a.turn).then_with(|| a.path.cmp(&b.path)));
@@ -2075,6 +2104,7 @@ impl ExecutionState {
         digest: String,
         turn: u64,
         provenance: ResourceProvenance,
+        kind: ResourceFactKind,
     ) -> ResourceObservation {
         let path = bound_item(path);
         let digest = bound_item(&digest);
@@ -2092,6 +2122,7 @@ impl ExecutionState {
             existing.turn = turn;
             existing.freshness = ResourceFreshness::Fresh;
             existing.provenance = provenance;
+            existing.kind = kind;
             return if semantic_changed {
                 ResourceObservation::Advanced
             } else if currentness_repaired {
@@ -2106,6 +2137,7 @@ impl ExecutionState {
             freshness: ResourceFreshness::Fresh,
             turn,
             provenance,
+            kind,
         });
         ResourceObservation::Advanced
     }

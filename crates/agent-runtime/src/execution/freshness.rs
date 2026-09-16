@@ -9,12 +9,12 @@ use agent_contracts::{
     FrontierDelta, MutationFootprint, ResourceFreshness, ResourceVersionOracle, ToolOutput,
 };
 
-use super::ResourceProvenance;
 use super::state::{
     ExecutionState, MAX_REVALIDATE_PER_ROUND, ObservationEvidence, ResourceObservation,
     RuntimeExecutionAttribution, VerificationCause, VerificationCoverage, bound_item,
     is_command_tool, operation_identity, path_mentioned_in_query, same_operation,
 };
+use super::{ResourceFactKind, ResourceProvenance};
 
 impl ExecutionState {
     /// Account a no-dispatch exact PASS reuse without duplicating the
@@ -173,12 +173,20 @@ impl ExecutionState {
             } else {
                 ResourceProvenance::Read
             };
+            let kind = if output.tool_name == "fs.read" {
+                ResourceFactKind::FileBody
+            } else if output.tool_name == "fs.list" {
+                ResourceFactKind::DirectoryListing
+            } else {
+                ResourceFactKind::Metadata
+            };
             for touch in &touches {
                 resource_observation.merge(self.upsert_file(
                     &touch.path,
                     touch.revision.clone().unwrap_or_default(),
                     turn,
                     provenance,
+                    kind,
                 ));
             }
             // Exact operation identity is sufficient only for an untyped or
@@ -231,6 +239,7 @@ impl ExecutionState {
                             revision,
                             turn,
                             ResourceProvenance::MutationRefusal,
+                            ResourceFactKind::Metadata,
                         ));
                     }
                 }
