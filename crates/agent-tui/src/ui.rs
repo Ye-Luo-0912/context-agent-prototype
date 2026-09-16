@@ -522,10 +522,12 @@ mod render_tests {
         app.messages.push(UiMessage {
             role: UiRole::User,
             content: "first line\nsecond line\nthird line".into(),
+            event_identity: None,
         });
         app.messages.push(UiMessage {
             role: UiRole::Tool,
             content: "seg1\n\nseg2".into(),
+            event_identity: None,
         });
 
         let rows = render_rows(&app, 80, 24);

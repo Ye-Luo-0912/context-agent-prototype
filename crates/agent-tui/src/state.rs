@@ -17,6 +17,12 @@ pub enum UiRole {
 pub struct UiMessage {
     pub role: UiRole,
     pub content: String,
+    /// R7: the event that produced this row, or `None` for a session-local row
+    /// (the opening banner, a command notice, an off-loop reply). A journal
+    /// replay drops the event-derived rows and rebuilds them, so the same log
+    /// read twice yields the same visible transcript and a replayed SYSTEM row
+    /// cannot push a real dialogue row out of the window.
+    pub event_identity: Option<(RunId, u64)>,
 }
 
 /// A workspace-write / process-execution call waiting for the user's y/n.
@@ -439,7 +445,13 @@ pub struct AppState {
     shown_message_index: std::collections::HashSet<(RunId, u64)>,
     /// Input ids whose user bubble was already appended (queued then
     /// applied share one id, and a replay must not duplicate the bubble).
-    shown_input_ids: std::collections::HashSet<RuntimeInputId>,
+    /// R7: bounded like every other identity structure — keeping only the
+    /// 400-row transcript bounded proved nothing about this index.
+    shown_input_events: std::collections::VecDeque<RuntimeInputId>,
+    shown_input_index: std::collections::HashSet<RuntimeInputId>,
+    /// The durable event currently being folded, so every row it appends can
+    /// carry the identity a replay needs.
+    current_event: Option<(RunId, u64)>,
     /// Set when the journal replay could not verify a contiguous prefix —
     /// a bad line, a short read or an unreadable file. The view then says
     /// so instead of presenting a partial picture as complete.
@@ -455,6 +467,8 @@ impl AppState {
             input: String::new(),
             messages: vec![UiMessage {
                 role: UiRole::System,
+                // Session-local: never dropped by a replay.
+                event_identity: None,
                 content: "Prototype ready. /help lists the product commands; Tab inspects the working context. Try `demo: list files` and `demo: write hello`.".into(),
             }],
             context: ContextDiagnostics::default(),
@@ -491,7 +505,9 @@ impl AppState {
             applied_index: std::collections::HashSet::new(),
             shown_message_events: std::collections::VecDeque::new(),
             shown_message_index: std::collections::HashSet::new(),
-            shown_input_ids: std::collections::HashSet::new(),
+            shown_input_events: std::collections::VecDeque::new(),
+            shown_input_index: std::collections::HashSet::new(),
+            current_event: None,
             view_partial: false,
             view_partial_reason: None,
             status_projection: agent_runtime::status::StatusProjection::default(),
@@ -746,7 +762,11 @@ impl AppState {
     /// render cap. Every transcript write goes through here so no caller
     /// can reintroduce an unbounded list.
     fn push_message(&mut self, role: UiRole, content: String) {
-        self.messages.push(UiMessage { role, content });
+        self.messages.push(UiMessage {
+            role,
+            content,
+            event_identity: self.current_event,
+        });
         // A freshly appended row is not a streamed bubble any more.
         self.streaming_row_open = false;
         let overflow = self.messages.len().saturating_sub(MAX_RENDERED_MESSAGES);
@@ -904,6 +924,33 @@ impl AppState {
         true
     }
 
+    /// Claim `input_id` as the identity of a user bubble. Bounded like the
+    /// other identity memories, and cleared with the event-derived rows it
+    /// protects.
+    fn claim_input_row(&mut self, input_id: RuntimeInputId) -> bool {
+        if !self.shown_input_index.insert(input_id) {
+            return false;
+        }
+        self.shown_input_events.push_back(input_id);
+        while self.shown_input_events.len() > MAX_SHOWN_MESSAGE_EVENTS {
+            if let Some(evicted) = self.shown_input_events.pop_front() {
+                self.shown_input_index.remove(&evicted);
+            }
+        }
+        true
+    }
+
+    /// Drop every event-derived row and the identities that guard them, so a
+    /// replay rebuilds them from the journal. Session-local rows survive.
+    fn drop_event_derived_rows(&mut self) {
+        self.messages
+            .retain(|message| message.event_identity.is_none());
+        self.shown_message_events.clear();
+        self.shown_message_index.clear();
+        self.shown_input_events.clear();
+        self.shown_input_index.clear();
+    }
+
     /// Forget this run's applied identities so a journal replay re-applies
     /// its events. Used only by a rebuild, which first resets the folded
     /// fields; the transcript's row identities are intentionally kept.
@@ -937,6 +984,9 @@ impl AppState {
         self.context = ContextDiagnostics::default();
         self.context_selected.clear();
         self.context_transitions.clear();
+        // R7: the transcript is rebuilt from the journal, not appended to it.
+        self.drop_event_derived_rows();
+        self.current_event = None;
     }
 
     /// Test-only view of the replay watermark.
@@ -1004,6 +1054,9 @@ impl AppState {
     fn apply_event(&mut self, envelope: RuntimeEventEnvelope) {
         let run_id = envelope.run_id;
         let seq = envelope.seq;
+        // R7: every row this event appends carries its identity, so a replay
+        // can drop and rebuild exactly the event-derived part of the view.
+        self.current_event = Some((run_id, seq));
         self.status_projection.fold(&envelope.event);
         match envelope.event {
             RuntimeEvent::RunStarted => self.status = "ready".into(),
@@ -1022,7 +1075,7 @@ impl AppState {
                     // one (a queued input and its later applied record share
                     // it); otherwise this event. Never the message text.
                     let already_shown = match input.input_id {
-                        Some(id) => !self.shown_input_ids.insert(id),
+                        Some(id) => !self.claim_input_row(id),
                         None => !self.claim_message_row(run_id, seq),
                     };
                     if !already_shown {
@@ -3247,6 +3300,69 @@ mod resync_tests {
 
     fn journal_line(app: &AppState, seq: u64, event: RuntimeEvent) -> String {
         serde_json::to_string(&run_envelope(app.run_id, seq, event)).unwrap()
+    }
+
+    /// R7: reading the same journal twice must render the same visible
+    /// transcript. Event-derived SYSTEM rows used to be appended again on
+    /// every replay, so in a full window the duplicates pushed real dialogue
+    /// rows out — the durable log was intact, the view was not.
+    #[tokio::test]
+    async fn replaying_the_same_journal_twice_yields_the_same_transcript() {
+        let dir = tempfile::tempdir().unwrap();
+        let traces = dir.path().join("traces");
+        std::fs::create_dir_all(&traces).unwrap();
+        let run_id = RunId::new();
+        let mut app = AppState::new(run_id);
+        let events = vec![
+            RuntimeEvent::RunStarted,
+            RuntimeEvent::FocusChanged {
+                task_id: TaskId::new(),
+                goal: "replayed goal".into(),
+            },
+            RuntimeEvent::Warning {
+                message: "a warning row".into(),
+            },
+            RuntimeEvent::AssistantMessage {
+                content: "the reply".into(),
+            },
+            RuntimeEvent::TurnCompleted,
+        ];
+        let lines: Vec<String> = events
+            .iter()
+            .enumerate()
+            .map(|(index, event)| journal_line(&app, index as u64 + 1, event.clone()))
+            .collect();
+        std::fs::write(traces.join("run.jsonl"), lines.join("\n")).unwrap();
+
+        let transcript = |app: &AppState| -> Vec<String> {
+            app.messages
+                .iter()
+                .map(|message| format!("{:?}|{}", message.role, message.content))
+                .collect()
+        };
+        let (folded, partial) = app.resync_projection(&traces).await;
+        assert!(!partial);
+        assert_eq!(folded, 5);
+        let first = transcript(&app);
+        // Every event-derived row was rebuilt, not left in place.
+        assert!(
+            first.iter().any(|row| row.contains("the reply")),
+            "the dialogue must be rebuilt from the journal: {first:?}"
+        );
+
+        let (folded_again, partial_again) = app.resync_projection(&traces).await;
+        assert!(!partial_again);
+        assert_eq!(folded_again, 5, "a replay must still re-fold the journal");
+        assert_eq!(
+            first,
+            transcript(&app),
+            "the same journal must render the same visible transcript"
+        );
+        // The dialogue row survives the rebuild instead of being pushed out.
+        assert!(
+            transcript(&app).iter().any(|row| row.contains("the reply")),
+            "a replayed SYSTEM row must not push real dialogue out of the window"
+        );
     }
 
     /// A redelivered broadcast event was already folded: it must neither
