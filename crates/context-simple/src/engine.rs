@@ -1342,7 +1342,7 @@ impl SimpleContextEngine {
         // actually exists.
         let rows: Vec<agent_contracts::ContextLifecycleRecord> = {
             let state = self.state.lock().await;
-            state.ledger.iter().cloned().collect()
+            state.ledger.to_vec()
         };
         if rows.is_empty() {
             return Ok(0);

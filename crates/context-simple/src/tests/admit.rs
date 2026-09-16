@@ -4383,10 +4383,12 @@ async fn a_cancelled_ledger_export_consumes_nothing() {
     assert_eq!(engine.state.lock().await.ledger.len(), 0);
 }
 
-/// An export that cannot commit its artifact must not lose the taken rows:
-/// they merge back (FIFO, bounded) and a later export persists them.
+/// An export that cannot commit its artifact must not lose rows. Rows are no
+/// longer taken before the commit, so this is now the same guarantee as the
+/// cancellation case below seen from the error path: the buffer still owns
+/// every row and a later export persists them.
 #[tokio::test]
-async fn failed_ledger_export_merges_rows_back() {
+async fn failed_ledger_export_loses_no_rows() {
     let dir = tempfile::tempdir().unwrap();
     let engine = SimpleContextEngine::new(SimpleContextConfig {
         gc_buffer_capacity: 1,
@@ -4427,8 +4429,8 @@ async fn failed_ledger_export_merges_rows_back() {
         "{error}"
     );
 
-    // The taken rows came back: a later export to a writable path persists
-    // exactly what the failed one took.
+    // The rows were never taken: a later export to a writable path persists
+    // exactly what the failed one would have.
     let retry = dir.path().join("retry.jsonl");
     let count = engine.export_ledger(&retry).await.unwrap();
     assert!(

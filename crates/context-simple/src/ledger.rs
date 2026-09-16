@@ -54,18 +54,6 @@ pub(crate) fn record(
 /// in time but are not yet persisted, so the returned rows are spliced back
 /// in front and the bounded cap is re-applied (oldest rows drain first):
 /// an export failure loses no row and the buffer never grows past its cap.
-pub(crate) fn merge_back(state: &mut State, rows: Vec<ContextLifecycleRecord>) {
-    if rows.is_empty() {
-        return;
-    }
-    state.ledger.splice(0..0, rows);
-    let cap = state.ledger_cap.max(1);
-    if state.ledger.len() > cap {
-        let overflow = state.ledger.len() - cap;
-        state.ledger.drain(..overflow);
-    }
-}
-
 /// JSONL-serialize the buffered rows (one record per line) without touching
 /// B3: confirm that an export's rows are safely in the artifact, and only then
 /// drop them from the buffer. Matching is prefix-wise: rows are appended at the
