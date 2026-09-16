@@ -698,6 +698,28 @@ mod tests {
     use serde_json::json;
 
     #[test]
+    fn sub_unit_scientific_numbers_digest_from_the_contract_bytes() {
+        // JCS renders the 1e-7 band exponentially like every other
+        // implementation (RFC 8785 §3.2.2.3 / ECMA-262); the old local
+        // `0.0000001` spelling hashed bytes no cross-language peer would
+        // produce. The digest construction itself is unchanged — SHA-256
+        // over the canonical bytes — and persisted digests are never
+        // re-derived from persisted arguments, so historical records stay
+        // valid as opaque identity without any WAL rewrite.
+        let value = json!(1e-7);
+        assert_eq!(crate::jcs::serialize(&value).unwrap(), "1e-7");
+        assert_eq!(
+            ArgumentDigest::from_json(&value),
+            ArgumentDigest::sha256_bytes(b"1e-7")
+        );
+        assert_ne!(
+            ArgumentDigest::from_json(&value),
+            ArgumentDigest::from_json(&json!(1e-6)),
+            "the exponential and plain-decimal spellings are different values"
+        );
+    }
+
+    #[test]
     fn argument_digest_is_stable_across_object_key_order() {
         assert_eq!(
             ArgumentDigest::from_json(&json!({"a": 1, "nested": {"x": 2, "y": 3}})),
