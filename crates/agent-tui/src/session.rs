@@ -162,23 +162,175 @@ enum ViewFact {
     CheckpointSaved { artifact: String },
 }
 
+/// One submitted command plus its receipt identity. The id ties the channel
+/// item to its [`CommandLedger`] entry, so the worker can move exactly that
+/// entry through its lifecycle.
+#[derive(Debug)]
+struct QueuedCommand {
+    id: u64,
+    command: SessionCommand,
+}
+
+/// Lifecycle of one submitted command as the shutdown receipt reports it.
+/// This — not any counter — is the authority on what reached the Runtime
+/// (O3): a pending count is diagnostic and can never prove "not executed".
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CommandStatus {
+    /// Accepted by the lane, never dequeued by the worker: it never reached
+    /// the Runtime.
+    Queued,
+    /// Dequeued by the worker; its Runtime interaction has not completed.
+    /// After a stop this is reported as `result unknown` — never as "not
+    /// executed" and never as a rollback.
+    Taken,
+}
+
+/// The worker's shutdown receipt: every submission still on the books,
+/// separated into what never reached the Runtime and what was in flight when
+/// the session stopped waiting.
+#[derive(Debug, Default, PartialEq, Eq)]
+struct WorkerReceipt {
+    /// Commands the worker never dequeued: they never reached the Runtime.
+    queued_never_dispatched: usize,
+    /// Commands dequeued but not settled: their Runtime effect may or may
+    /// not have landed. Honest label: unknown.
+    taken_result_unknown: usize,
+}
+
+/// Shared, exactly-transitioned state of every submitted command. Entries
+/// are registered BEFORE the command enters the channel and removed only
+/// when the worker settles them, so the receipt after shutdown is exact:
+/// whatever remains is either still-queued or in-flight-at-stop.
+///
+/// The diagnostic pending count derives from the same entries, which closes
+/// the O3 window: the old scheme incremented after `try_send` and
+/// decremented after `recv`, so a reader could briefly observe a count that
+/// did not correspond to any queue state (down to an underflow), and the
+/// exit path read the counter while the worker was still dequeuing.
+#[derive(Default)]
+struct CommandLedger {
+    /// The stop barrier. Once set, the worker dequeues nothing new.
+    stop: std::sync::atomic::AtomicBool,
+    next_id: std::sync::atomic::AtomicU64,
+    entries: std::sync::Mutex<Vec<(u64, CommandStatus)>>,
+}
+
+impl CommandLedger {
+    fn stop_accepting(&self) {
+        self.stop.store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    fn is_stopped(&self) -> bool {
+        self.stop.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    /// Register a submission before it enters the channel. Every command in
+    /// the channel therefore always has a ledger entry.
+    fn register(&self) -> u64 {
+        let id = self
+            .next_id
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        self.entries
+            .lock()
+            .expect("the ledger mutex is never held across an await")
+            .push((id, CommandStatus::Queued));
+        id
+    }
+
+    /// Remove the entry of a submission the channel refused (full or closed):
+    /// it never became queue state.
+    fn retract(&self, id: u64) {
+        self.entries
+            .lock()
+            .expect("the ledger mutex is never held across an await")
+            .retain(|(entry_id, _)| *entry_id != id);
+    }
+
+    /// The worker dequeued this command. Called synchronously right after
+    /// `recv` resolves — before any await — so an abort can never leave a
+    /// taken command recorded as queued.
+    fn mark_taken(&self, id: u64) {
+        let mut entries = self
+            .entries
+            .lock()
+            .expect("the ledger mutex is never held across an await");
+        for (entry_id, status) in entries.iter_mut() {
+            if *entry_id == id {
+                *status = CommandStatus::Taken;
+            }
+        }
+    }
+
+    /// The worker completed this command's Runtime interaction (its outcome
+    /// went to the notice channel, Ok or Err alike); it is off the books.
+    fn settle(&self, id: u64) {
+        self.entries
+            .lock()
+            .expect("the ledger mutex is never held across an await")
+            .retain(|(entry_id, _)| *entry_id != id);
+    }
+
+    /// Diagnostic: how many submissions have not started executing. May be
+    /// read at any time; it carries no "did it reach the Runtime" meaning.
+    fn queued(&self) -> usize {
+        self.entries
+            .lock()
+            .expect("the ledger mutex is never held across an await")
+            .iter()
+            .filter(|(_, status)| *status == CommandStatus::Queued)
+            .count()
+    }
+
+    /// The shutdown receipt: the only semantic answer to "what happened to
+    /// the commands the operator typed".
+    fn receipt(&self) -> WorkerReceipt {
+        let entries = self
+            .entries
+            .lock()
+            .expect("the ledger mutex is never held across an await");
+        WorkerReceipt {
+            queued_never_dispatched: entries
+                .iter()
+                .filter(|(_, status)| *status == CommandStatus::Queued)
+                .count(),
+            taken_result_unknown: entries
+                .iter()
+                .filter(|(_, status)| *status == CommandStatus::Taken)
+                .count(),
+        }
+    }
+}
+
 /// Execute queued commands in submission order. Runs for the life of the
-/// session; the sender being dropped ends it.
+/// session; the sender being dropped ends it, and the session's stop barrier
+/// ends it sooner. Every taken command is marked on the ledger before the
+/// first await, so the shutdown receipt can never misreport a taken command
+/// as queued.
 async fn run_command_worker(
-    mut commands: tokio::sync::mpsc::Receiver<SessionCommand>,
+    mut commands: tokio::sync::mpsc::Receiver<QueuedCommand>,
     handle: RuntimeHandle,
     plane: std::sync::Arc<agent_runtime::RuntimeCheckpointPlane>,
     notice_tx: tokio::sync::mpsc::Sender<String>,
     view_tx: tokio::sync::mpsc::Sender<ViewFact>,
     checkpoint_dir: PathBuf,
-    pending: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    ledger: std::sync::Arc<CommandLedger>,
 ) {
     use agent_runtime::{ContinueOutcome, SuspendOutcome};
 
-    while let Some(command) = commands.recv().await {
-        // This submission is now executing, not queued.
-        pending.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
-        match command {
+    loop {
+        // The stop barrier: once the session stops accepting, nothing
+        // further is dequeued, let alone dispatched.
+        if ledger.is_stopped() {
+            break;
+        }
+        let Some(queued) = commands.recv().await else {
+            break;
+        };
+        // This submission is now executing, not queued. Marked before any
+        // await: tokio cancellation can only land at an await point, so an
+        // abort mid-command always finds the entry marked Taken.
+        ledger.mark_taken(queued.id);
+        match queued.command {
             SessionCommand::Work { goal } => {
                 match crate::work::start_long_task(&handle, goal).await {
                     Ok(submission) => {
@@ -328,6 +480,9 @@ async fn run_command_worker(
                 }
             }
         }
+        // The Runtime interaction for this command completed — its outcome
+        // went to the notice channel, Ok or Err alike. Settled either way.
+        ledger.settle(queued.id);
     }
 }
 
@@ -351,44 +506,53 @@ fn identity_mismatch_notice(
     )
 }
 
-/// The ordered command lane: one bounded queue, one consumer, plus a count of
-/// submissions that have not started executing yet. The session owns this
-/// value's lifetime so it can stop accepting work and name what never ran
-/// instead of dropping the sender and assuming the queue was cancelled.
+/// The ordered command lane: one bounded queue, one consumer, plus the
+/// shared [`CommandLedger`] the worker keeps exact. The session owns this
+/// value's lifetime so it can stop accepting work and — through the worker's
+/// receipt — name what never ran and what was still in flight, instead of
+/// dropping the sender and assuming the queue was cancelled. `queued()` is a
+/// diagnostic only; the receipt is the semantic authority.
 #[derive(Clone)]
 pub(crate) struct CommandLane {
-    tx: tokio::sync::mpsc::Sender<SessionCommand>,
-    pending: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    tx: tokio::sync::mpsc::Sender<QueuedCommand>,
+    ledger: std::sync::Arc<CommandLedger>,
 }
 
 impl CommandLane {
     /// Submit one command, in order, or say why it was not accepted. A full
     /// lane is reported rather than silently dropped: the operator must know
-    /// that a typed action did not reach the runtime.
+    /// that a typed action did not reach the runtime. The ledger entry is
+    /// registered before the send and retracted if the send is refused, so
+    /// the count can never underflow (O3).
     fn submit(&self, app: &mut AppState, command: SessionCommand) -> bool {
         let shown = format!("{command:?}");
-        match self.tx.try_send(command) {
-            Ok(()) => {
-                self.pending
-                    .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-                true
-            }
+        let id = self.ledger.register();
+        match self.tx.try_send(QueuedCommand { id, command }) {
+            Ok(()) => true,
             Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
+                self.ledger.retract(id);
+                // The pending count here is diagnostic: it sizes the backlog
+                // for the operator; the shutdown receipt, not this number,
+                // decides what "never executed" means.
                 app.push_system(format!(
-                    "command queue is full ({COMMAND_QUEUE_CAP}); {shown} was NOT submitted — wait for the pending commands to finish"
+                    "command queue is full ({COMMAND_QUEUE_CAP}, {pending} pending); {shown} was NOT submitted — wait for the pending commands to finish",
+                    pending = self.pending()
                 ));
                 false
             }
             Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
+                self.ledger.retract(id);
                 app.push_system("command worker is gone; the command was not submitted".into());
                 false
             }
         }
     }
 
-    /// How many submissions have not started executing.
+    /// How many submissions have not started executing. Diagnostic only —
+    /// may briefly include a command the worker is taking right now, and
+    /// never proves anything about what reached the runtime.
     fn pending(&self) -> usize {
-        self.pending.load(std::sync::atomic::Ordering::SeqCst)
+        self.ledger.queued()
     }
 }
 
@@ -446,15 +610,17 @@ pub(crate) async fn run_session<S: UiSource, O: UiSink>(
     // order — task identity commands, the slow storage commands, AND ordinary
     // text. A single worker drains it in submission order, so the operator's
     // typing order is the order the runtime receives.
-    let (command_tx, command_rx) = tokio::sync::mpsc::channel::<SessionCommand>(COMMAND_QUEUE_CAP);
+    let (command_tx, command_rx) = tokio::sync::mpsc::channel::<QueuedCommand>(COMMAND_QUEUE_CAP);
     let (view_tx, mut view_rx) = tokio::sync::mpsc::channel::<ViewFact>(8);
+    let command_ledger = std::sync::Arc::new(CommandLedger::default());
     let lane = CommandLane {
         tx: command_tx,
-        pending: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+        ledger: std::sync::Arc::clone(&command_ledger),
     };
-    // The session owns the worker's handle: on exit it stops accepting and
-    // reports work that never started, instead of dropping the sender and
-    // assuming the queue was cancelled.
+    // The session owns the worker's handle: on EVERY exit it stops accepting,
+    // raises the worker's stop barrier, reclaims the task and reads the
+    // worker's receipt, instead of dropping the sender and assuming the
+    // queue was cancelled.
     let command_worker = tokio::spawn(run_command_worker(
         command_rx,
         handle.clone(),
@@ -462,8 +628,13 @@ pub(crate) async fn run_session<S: UiSource, O: UiSink>(
         notice_tx.clone(),
         view_tx,
         checkpoint_dir.clone(),
-        std::sync::Arc::clone(&lane.pending),
+        std::sync::Arc::clone(&command_ledger),
     ));
+
+    // Q6: the loop no longer exits through `?`. Whatever ends it — Ctrl-C,
+    // /quit, a draw failure, a key failure or a dispatch failure — is
+    // captured here and runs into the one shared cleanup below.
+    let mut outcome: anyhow::Result<()> = Ok(());
 
     loop {
         let traces_dir = checkpoint_dir
@@ -519,9 +690,20 @@ pub(crate) async fn run_session<S: UiSource, O: UiSink>(
             }
         }
 
-        sink.draw(&app)?;
+        if let Err(error) = sink.draw(&app) {
+            outcome = Err(anyhow::Error::new(error).context("drawing the session frame failed"));
+            break;
+        }
 
-        let Some(key) = source.poll_key(Duration::from_millis(30)).await? else {
+        let key = match source.poll_key(Duration::from_millis(30)).await {
+            Ok(key) => key,
+            Err(error) => {
+                outcome =
+                    Err(anyhow::Error::new(error).context("reading the operator's key failed"));
+                break;
+            }
+        };
+        let Some(key) = key else {
             continue;
         };
         if key.kind != KeyEventKind::Press {
@@ -602,9 +784,14 @@ pub(crate) async fn run_session<S: UiSource, O: UiSink>(
                     &lane,
                     &checkpoint_dir,
                 )
-                .await?;
-                if !keep_running {
-                    break;
+                .await;
+                match keep_running {
+                    Ok(true) => {}
+                    Ok(false) => break,
+                    Err(error) => {
+                        outcome = Err(error);
+                        break;
+                    }
                 }
             }
             // scroll is holdback from the latest row: PageUp reads older
@@ -617,27 +804,62 @@ pub(crate) async fn run_session<S: UiSource, O: UiSink>(
         }
     }
 
-    // R6: the session owns the command worker. Stop accepting new work, then
-    // cancel what never started and NAME it — dropping the sender alone would
-    // leave the operator to assume the queued actions were cancelled. An
-    // in-flight command is abandoned with the session on purpose: the operator
-    // asked to quit, and the runtime's own ordered shutdown settles task state.
-    let unexecuted = lane.pending();
+    // Q6: one cleanup entry for EVERY exit — normal quit, draw failure, key
+    // failure, dispatch failure. Order and responsibilities:
+    //   1. stop accepting new commands (the loop above was the only
+    //      submitter);
+    //   2. raise the worker's stop barrier — from here on the worker
+    //      dequeues nothing, so no queued command is dispatched behind the
+    //      session's back;
+    //   3. reclaim the worker with abort+join. The barrier already stopped
+    //      dequeues; abort only bounds an in-flight slow command (the
+    //      established R6/A3 semantics: the operator asked to leave, and the
+    //      runtime's own ordered shutdown settles task state). The receipt —
+    //      not the abort — says what happened: abort is never reported as
+    //      "not executed" and never as a rollback;
+    //   4. read the worker's receipt and name both what never reached the
+    //      runtime and what stays with an unknown result.
+    // The terminal guard and the Runtime shutdown remain the caller's two
+    // separate responsibilities (U5), settled after this returns.
     drop(lane);
+    command_ledger.stop_accepting();
     command_worker.abort();
-    let _ = command_worker.await;
-    if unexecuted > 0 {
-        // Best-effort transcript record: the session is ending, so this line
-        // is not guaranteed to be drawn (the terminal is restored next).
-        app.push_system(format!(
-            "{unexecuted} queued command(s) never executed — the session ended first"
-        ));
-        eprintln!(
-            "warning: {unexecuted} queued command(s) never executed — the session ended first"
+    let joined = command_worker.await;
+    let receipt = command_ledger.receipt();
+    if receipt.queued_never_dispatched > 0 {
+        let line = format!(
+            "{count} queued command(s) never executed — the session ended first",
+            count = receipt.queued_never_dispatched
         );
+        // Best-effort transcript record; the final frame below draws it
+        // before the terminal is restored.
+        app.push_system(line.clone());
+        eprintln!("warning: {line}");
     }
-
-    Ok(())
+    if receipt.taken_result_unknown > 0 {
+        let line = format!(
+            "{count} command(s) were still executing when the session ended; their runtime result is unknown — this is not a rollback",
+            count = receipt.taken_result_unknown
+        );
+        app.push_system(line.clone());
+        eprintln!("warning: {line}");
+    }
+    if let Err(join_error) = joined
+        && !join_error.is_cancelled()
+    {
+        // A cancelled abort is the expected stop; a panic in the worker
+        // is a real failure and must not be swallowed.
+        let message = format!("command worker failed: {join_error}");
+        app.push_system(message.clone());
+        eprintln!("warning: {message}");
+        if outcome.is_ok() {
+            outcome = Err(anyhow::anyhow!(message));
+        }
+    }
+    // One final frame so the receipt is actually drawn before the terminal
+    // is restored. Best-effort: a sink that just failed stays failed.
+    let _ = sink.draw(&app);
+    outcome
 }
 
 /// Dispatch one submitted input line. `Ok(false)` ends the session
@@ -2130,6 +2352,454 @@ mod tui_e2e {
             "the user's own file must not be claimed by the card: {card}"
         );
     }
+
+    /// Q6 worker-lifecycle harness pieces. The session here is driven with a
+    /// fully pre-buffered key script whose source fails once the script is
+    /// exhausted (or a sink that fails on a marker input line). On the
+    /// current-thread test executor every scripted key poll resolves
+    /// immediately, so the session loop reaches its `?` early exit without
+    /// ever yielding: the command worker provably could not have taken any
+    /// submitted command. Whatever reaches the runtime afterwards is
+    /// therefore work a leaking worker dispatched after the session ended.
+    struct ScriptedErrorSource {
+        rx: tokio::sync::mpsc::Receiver<KeyEvent>,
+    }
+
+    impl UiSource for ScriptedErrorSource {
+        async fn poll_key(&mut self, _timeout: Duration) -> io::Result<Option<KeyEvent>> {
+            match self.rx.recv().await {
+                Some(key) => Ok(Some(key)),
+                None => Err(io::Error::other("injected key read failure")),
+            }
+        }
+    }
+
+    /// Renders normally until the operator's input buffer holds `trigger`,
+    /// then fails — the same `?` path a real render failure takes.
+    struct FailOnInputSink {
+        inner: CaptureSink,
+        trigger: &'static str,
+    }
+
+    impl UiSink for FailOnInputSink {
+        fn draw(&mut self, app: &AppState) -> io::Result<()> {
+            if app.input == self.trigger {
+                return Err(io::Error::other("injected draw failure"));
+            }
+            self.inner.draw(app)
+        }
+    }
+
+    /// A scripted model that counts turn executions: every plain input that
+    /// reaches the runtime costs exactly one call.
+    struct TurnCountingModel {
+        calls: Arc<AtomicUsize>,
+    }
+    #[async_trait::async_trait]
+    impl ModelTransport for TurnCountingModel {
+        fn capabilities(&self) -> ModelCapabilities {
+            ModelCapabilities {
+                streaming: true,
+                tool_calls: true,
+                max_output_tokens: 4096,
+                context_window: None,
+            }
+        }
+        async fn complete(&self, _request: ModelRequest) -> AgentResult<ModelOutput> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            Ok(ModelOutput {
+                content: "[scripted] turn done".into(),
+                tool_calls: Vec::new(),
+                usage: Default::default(),
+            })
+        }
+    }
+
+    fn keys(line: &str) -> Vec<KeyEvent> {
+        let mut keys: Vec<KeyEvent> = line
+            .chars()
+            .map(|ch| KeyEvent::new(KeyCode::Char(ch), KeyModifiers::NONE))
+            .collect();
+        keys.push(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        keys
+    }
+
+    /// Give a surviving (detached) worker a fair chance to wrongly dispatch
+    /// the queue before asserting it did not.
+    async fn drain_executor_for_wrong_dispatch() {
+        for _ in 0..100 {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    }
+
+    /// A non-empty result names the turns that ran after the session ended —
+    /// the observable signature of a worker that was never reclaimed.
+    fn model_dispatch_report(calls: &AtomicUsize) -> String {
+        let count = calls.load(Ordering::SeqCst);
+        if count == 0 {
+            String::new()
+        } else {
+            format!("{count} queued input(s) reached the runtime after the session ended")
+        }
+    }
+
+    /// Q6: a key-read failure exits through `poll_key`'s `?`. The session
+    /// must still stop the command worker, keep the queued input out of the
+    /// runtime, and name the work that never ran.
+    #[tokio::test]
+    async fn a_key_read_failure_still_reclaims_the_worker_and_names_undispatched_input() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().to_path_buf();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let (composed, interactive, checkpoint_dir) = tui_compose(
+            &root,
+            &[],
+            Arc::new(TurnCountingModel {
+                calls: calls.clone(),
+            }),
+            None,
+        )
+        .await
+        .unwrap();
+        let mut ui_events = composed.subscribe();
+        composed.instance.start().await.unwrap();
+
+        let (key_tx, key_rx) = tokio::sync::mpsc::channel::<KeyEvent>(256);
+        for key in keys("hello one")
+            .into_iter()
+            .chain(keys("hello two"))
+            .chain(keys("hello three"))
+        {
+            key_tx.try_send(key).unwrap();
+        }
+        drop(key_tx);
+
+        let captured: Captured = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let mut sink = CaptureSink {
+            captured: captured.clone(),
+        };
+        let mut source = ScriptedErrorSource { rx: key_rx };
+        let session = tokio::time::timeout(
+            Duration::from_secs(60),
+            run_session(
+                &mut source,
+                &mut sink,
+                composed.handle().clone(),
+                &composed.instance,
+                &mut ui_events,
+                Some(interactive),
+                "dynamic",
+                checkpoint_dir,
+                "serving: scripted e2e model".to_string(),
+                None,
+                false,
+            ),
+        )
+        .await;
+        assert!(session.is_ok(), "the session hung: {session:?}");
+        let error = session
+            .unwrap()
+            .expect_err("the injected key read failure must surface");
+        assert!(
+            format!("{error:#}").contains("injected key read failure"),
+            "the session error must be the injected one, got: {error}"
+        );
+
+        drain_executor_for_wrong_dispatch().await;
+        assert_eq!(
+            model_dispatch_report(&calls),
+            "",
+            "queued input must not reach the runtime after the session ended"
+        );
+        let seen = transcript(&captured);
+        assert!(
+            seen.contains("never executed"),
+            "the session must name the work that never ran: {seen}"
+        );
+        composed.shutdown().await.unwrap();
+    }
+
+    /// Q6: a draw failure exits through `sink.draw`'s `?` with the same
+    /// unified-cleanup obligations as any other exit.
+    #[tokio::test]
+    async fn a_draw_failure_still_reclaims_the_worker_and_names_undispatched_input() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().to_path_buf();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let (composed, interactive, checkpoint_dir) = tui_compose(
+            &root,
+            &[],
+            Arc::new(TurnCountingModel {
+                calls: calls.clone(),
+            }),
+            None,
+        )
+        .await
+        .unwrap();
+        let mut ui_events = composed.subscribe();
+        composed.instance.start().await.unwrap();
+
+        let (key_tx, key_rx) = tokio::sync::mpsc::channel::<KeyEvent>(256);
+        for key in keys("hello one").into_iter().chain(keys("x")) {
+            key_tx.try_send(key).unwrap();
+        }
+        drop(key_tx);
+
+        let captured: Captured = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let mut sink = FailOnInputSink {
+            inner: CaptureSink {
+                captured: captured.clone(),
+            },
+            trigger: "x",
+        };
+        let mut source = ScriptedErrorSource { rx: key_rx };
+        let session = tokio::time::timeout(
+            Duration::from_secs(60),
+            run_session(
+                &mut source,
+                &mut sink,
+                composed.handle().clone(),
+                &composed.instance,
+                &mut ui_events,
+                Some(interactive),
+                "dynamic",
+                checkpoint_dir,
+                "serving: scripted e2e model".to_string(),
+                None,
+                false,
+            ),
+        )
+        .await;
+        assert!(session.is_ok(), "the session hung: {session:?}");
+        let error = session
+            .unwrap()
+            .expect_err("the injected draw failure must surface");
+        assert!(
+            format!("{error:#}").contains("injected draw failure"),
+            "the session error must be the injected one, got: {error}"
+        );
+
+        drain_executor_for_wrong_dispatch().await;
+        assert_eq!(
+            model_dispatch_report(&calls),
+            "",
+            "queued input must not reach the runtime after the session ended"
+        );
+        composed.shutdown().await.unwrap();
+    }
+
+    /// Q6: the normal `/quit` path keeps its cleanup and now draws the
+    /// shutdown receipt, so the operator actually sees which typed commands
+    /// never ran.
+    #[tokio::test]
+    async fn a_normal_quit_reports_queued_commands_in_the_final_frame_and_dispatches_none() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().to_path_buf();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let (composed, interactive, checkpoint_dir) = tui_compose(
+            &root,
+            &[],
+            Arc::new(TurnCountingModel {
+                calls: calls.clone(),
+            }),
+            None,
+        )
+        .await
+        .unwrap();
+        let mut ui_events = composed.subscribe();
+        composed.instance.start().await.unwrap();
+
+        let (key_tx, key_rx) = tokio::sync::mpsc::channel::<KeyEvent>(256);
+        for key in keys("hello again").into_iter().chain(keys("/quit")) {
+            key_tx.try_send(key).unwrap();
+        }
+        drop(key_tx);
+
+        let captured: Captured = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let mut sink = CaptureSink {
+            captured: captured.clone(),
+        };
+        let mut source = ScriptedErrorSource { rx: key_rx };
+        let session = tokio::time::timeout(
+            Duration::from_secs(60),
+            run_session(
+                &mut source,
+                &mut sink,
+                composed.handle().clone(),
+                &composed.instance,
+                &mut ui_events,
+                Some(interactive),
+                "dynamic",
+                checkpoint_dir,
+                "serving: scripted e2e model".to_string(),
+                None,
+                false,
+            ),
+        )
+        .await;
+        assert!(session.is_ok(), "the session hung: {session:?}");
+        session.unwrap().expect("a normal quit is not an error");
+
+        let seen = transcript(&captured);
+        assert!(
+            seen.contains("never executed"),
+            "the final frame must report the queued command that never ran: {seen}"
+        );
+
+        drain_executor_for_wrong_dispatch().await;
+        assert_eq!(
+            model_dispatch_report(&calls),
+            "",
+            "input queued behind /quit must not run after the session ended"
+        );
+        composed.shutdown().await.unwrap();
+    }
+
+    /// Q6: a queued checkpoint (slow storage in flight through the lane)
+    /// must never reach the disk once the session has ended, on any exit
+    /// path.
+    #[tokio::test]
+    async fn a_queued_checkpoint_never_reaches_disk_after_the_session_ends() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().to_path_buf();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let (composed, interactive, checkpoint_dir) = tui_compose(
+            &root,
+            &[],
+            Arc::new(TurnCountingModel {
+                calls: calls.clone(),
+            }),
+            None,
+        )
+        .await
+        .unwrap();
+        let mut ui_events = composed.subscribe();
+        composed.instance.start().await.unwrap();
+
+        let (key_tx, key_rx) = tokio::sync::mpsc::channel::<KeyEvent>(256);
+        for key in keys("/checkpoint") {
+            key_tx.try_send(key).unwrap();
+        }
+        drop(key_tx);
+
+        let captured: Captured = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let mut sink = CaptureSink {
+            captured: captured.clone(),
+        };
+        let mut source = ScriptedErrorSource { rx: key_rx };
+        let session = tokio::time::timeout(
+            Duration::from_secs(60),
+            run_session(
+                &mut source,
+                &mut sink,
+                composed.handle().clone(),
+                &composed.instance,
+                &mut ui_events,
+                Some(interactive),
+                "dynamic",
+                checkpoint_dir.clone(),
+                "serving: scripted e2e model".to_string(),
+                None,
+                false,
+            ),
+        )
+        .await;
+        assert!(session.is_ok(), "the session hung: {session:?}");
+        let error = session
+            .unwrap()
+            .expect_err("the injected key read failure must surface");
+        assert!(
+            format!("{error:#}").contains("injected key read failure"),
+            "the session error must be the injected one, got: {error}"
+        );
+
+        drain_executor_for_wrong_dispatch().await;
+        let artifacts: Vec<String> = std::fs::read_dir(&checkpoint_dir)
+            .map(|entries| {
+                entries
+                    .flatten()
+                    .map(|entry| entry.file_name().to_string_lossy().into_owned())
+                    .collect()
+            })
+            .unwrap_or_default();
+        assert!(
+            artifacts.is_empty(),
+            "a checkpoint queued in the lane must not be written after the session ended: {artifacts:?}"
+        );
+        composed.shutdown().await.unwrap();
+    }
+
+    /// The worker's own contract: once the stop barrier is raised and the
+    /// worker is reclaimed, everything still on the ledger is queued-never-
+    /// dispatched, nothing reaches the runtime afterwards, and the receipt
+    /// names it. On the current-thread executor the worker is aborted before
+    /// its first poll, so every submission is provably still queued.
+    #[tokio::test]
+    async fn the_stop_barrier_and_abort_leave_queued_commands_undispatched() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().to_path_buf();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let (composed, _interactive, checkpoint_dir) = tui_compose(
+            &root,
+            &[],
+            Arc::new(TurnCountingModel {
+                calls: calls.clone(),
+            }),
+            None,
+        )
+        .await
+        .unwrap();
+        composed.instance.start().await.unwrap();
+
+        let (command_tx, command_rx) =
+            tokio::sync::mpsc::channel::<QueuedCommand>(COMMAND_QUEUE_CAP);
+        let (notice_tx, _notice_rx) = tokio::sync::mpsc::channel::<String>(NOTICE_CHANNEL_CAP);
+        let (view_tx, _view_rx) = tokio::sync::mpsc::channel::<ViewFact>(8);
+        let ledger = Arc::new(CommandLedger::default());
+        let worker = tokio::spawn(run_command_worker(
+            command_rx,
+            composed.handle().clone(),
+            composed.instance.checkpoint_plane(),
+            notice_tx,
+            view_tx,
+            checkpoint_dir.clone(),
+            Arc::clone(&ledger),
+        ));
+
+        let mut app = AppState::new(composed.handle().run_id());
+        let lane = CommandLane {
+            tx: command_tx,
+            ledger: Arc::clone(&ledger),
+        };
+        assert!(lane.submit(&mut app, SessionCommand::Input { text: "one".into() }));
+        assert!(lane.submit(&mut app, SessionCommand::Input { text: "two".into() }));
+        drop(lane);
+
+        // The same shutdown order the session uses: barrier, then reclaim.
+        ledger.stop_accepting();
+        worker.abort();
+        let joined = worker.await;
+        assert!(
+            joined.is_err(),
+            "an aborted worker reports cancellation, not success: {joined:?}"
+        );
+        assert_eq!(
+            ledger.receipt(),
+            WorkerReceipt {
+                queued_never_dispatched: 2,
+                taken_result_unknown: 0
+            },
+            "commands the worker never dequeued are queued, never executed"
+        );
+
+        drain_executor_for_wrong_dispatch().await;
+        assert_eq!(
+            model_dispatch_report(&calls),
+            "",
+            "nothing queued may reach the runtime after the barrier and abort"
+        );
+        composed.shutdown().await.unwrap();
+    }
 }
 
 #[cfg(test)]
@@ -2176,12 +2846,12 @@ mod command_queue_tests {
     }
 
     /// A lane plus the receiving end a test drives directly.
-    fn test_lane(cap: usize) -> (CommandLane, tokio::sync::mpsc::Receiver<SessionCommand>) {
-        let (tx, rx) = tokio::sync::mpsc::channel::<SessionCommand>(cap);
+    fn test_lane(cap: usize) -> (CommandLane, tokio::sync::mpsc::Receiver<QueuedCommand>) {
+        let (tx, rx) = tokio::sync::mpsc::channel::<QueuedCommand>(cap);
         (
             CommandLane {
                 tx,
-                pending: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+                ledger: std::sync::Arc::new(CommandLedger::default()),
             },
             rx,
         )
@@ -2207,11 +2877,11 @@ mod command_queue_tests {
                 observed: Some(second)
             }
         ));
-        match rx.recv().await.expect("first command") {
+        match rx.recv().await.expect("first command").command {
             SessionCommand::Activate { task_id } => assert_eq!(task_id, first),
             other => panic!("commands arrived out of order: {other:?}"),
         }
-        match rx.recv().await.expect("second command") {
+        match rx.recv().await.expect("second command").command {
             SessionCommand::Continue { observed } => assert_eq!(observed, Some(second)),
             other => panic!("commands arrived out of order: {other:?}"),
         }
@@ -2280,11 +2950,11 @@ mod command_queue_tests {
         ));
         assert_eq!(tx.pending(), 2, "both submissions are still queued");
         // The consumer starts now and must see them in the typed order.
-        match rx.recv().await.expect("first") {
+        match rx.recv().await.expect("first").command {
             SessionCommand::Activate { task_id } => assert_eq!(task_id, task),
             other => panic!("the correction overtook its task command: {other:?}"),
         }
-        match rx.recv().await.expect("second") {
+        match rx.recv().await.expect("second").command {
             SessionCommand::Input { text } => assert_eq!(text, "按这个要求修改"),
             other => panic!("the correction overtook its task command: {other:?}"),
         }
@@ -2303,6 +2973,62 @@ mod command_queue_tests {
             SessionCommand::Input { text: "hi".into() }
         ));
         assert_eq!(tx.pending(), 2);
+    }
+
+    /// O3: the receipt — not the diagnostic count — separates what never
+    /// reached the runtime from what was taken and stays with an unknown
+    /// result.
+    #[test]
+    fn the_receipt_separates_queued_taken_and_settled_commands() {
+        let ledger = CommandLedger::default();
+        let first = ledger.register();
+        let second = ledger.register();
+        assert_eq!(
+            ledger.receipt(),
+            WorkerReceipt {
+                queued_never_dispatched: 2,
+                taken_result_unknown: 0
+            }
+        );
+        // Taken: in flight, result unknown — never reported as "not executed".
+        ledger.mark_taken(first);
+        assert_eq!(
+            ledger.receipt(),
+            WorkerReceipt {
+                queued_never_dispatched: 1,
+                taken_result_unknown: 1
+            }
+        );
+        // Settled: the runtime interaction completed (outcome went to
+        // notices); it is off the books either way.
+        ledger.settle(first);
+        assert_eq!(
+            ledger.receipt(),
+            WorkerReceipt {
+                queued_never_dispatched: 1,
+                taken_result_unknown: 0
+            }
+        );
+        ledger.settle(second);
+        assert_eq!(ledger.receipt(), WorkerReceipt::default());
+        assert_eq!(ledger.queued(), 0);
+    }
+
+    /// O3: a refused submission (full or closed lane) leaves no ledger
+    /// entry, so the count can never underflow.
+    #[tokio::test]
+    async fn a_refused_submission_leaves_no_receipt_entry() {
+        let (tx, _held) = test_lane(1);
+        let mut app = app();
+        assert!(submit_command(&tx, &mut app, SessionCommand::Checkpoint));
+        assert!(!submit_command(&tx, &mut app, SessionCommand::Checkpoint));
+        assert_eq!(tx.pending(), 1, "only the accepted submission counts");
+        drop(_held);
+        assert!(
+            !submit_command(&tx, &mut app, SessionCommand::Checkpoint),
+            "a closed lane refuses"
+        );
+        assert_eq!(tx.pending(), 1, "the refusal must not change the count");
     }
 
     /// The refusal names both sides, so the operator can see which task the
