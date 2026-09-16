@@ -67,9 +67,9 @@ T4 一期/二期已有预算与降级，但"有界"仍是局部控制（续审 R
 - 回归：Compose→Retry→backoff cancel 全链、metrics 环境变量不存在：已知用量保留、取消分类不变、未执行重试不多计、未知字段不补零、同次 SSE 累计快照不重复相加。
 落地回执：[W4_CANCEL_SETTLES_KNOWN_USAGE_RECEIPT](reviews/2026-09-16-review-4f6eb7ff/W4_CANCEL_SETTLES_KNOWN_USAGE_RECEIPT.md)。`FailedWithUsage{source:Cancelled}` 携带（裸 Cancelled 不变）、`OperationOutcome::Cancelled{known_usage}` 守卫臂结算、屏障前按真实计数记账＋fence、迟到 stale completion 经有界 FIFO 一次性补记；observer 降级为诊断副本。全链回归在 env 不存在下断言正式账目。限制：maintenance lane 取消仍 unknown（token 永不取消）；迟到成功不补记（既有设计）。
 
-## 第五批（U 系列；U1 先行，A 线内部按文件所有权串行）
+## 第五批（U 系列；U1 先行，A 线内部按文件所有权串行）——**A 线已全部关闭**（`3d0b114f`，CI run `35103897272` success／attempt 2）
 
-审查基线 `d92564bc`（报告：[REVIEW.md](reviews/2026-09-16-review-d92564bc/REVIEW.md)，行动与停止条件：[NEXT_ACTIONS.md](reviews/2026-09-16-review-d92564bc/NEXT_ACTIONS.md)，覆盖表：[COVERAGE.md](reviews/2026-09-16-review-d92564bc/COVERAGE.md)）。共同主线：**让 TUI 成为可信的操作入口（一套读模型、一个保序提交口、一个布局/宽度模型），而不是另一份会自行漂移的运行状态；让 required 解析产生稳定的执行计划，而不是依赖最后剩下的热目录内容。** 都属于主体完善，不重做架构、不前置 GUI。行为修改与机械移动分开提交；定向测试后跑既有相关跨 crate 集成，合并沿用现有 CI。
+审查基线 `d92564bc`（报告：[REVIEW.md](reviews/2026-09-16-review-d92564bc/REVIEW.md)，行动与停止条件：[NEXT_ACTIONS.md](reviews/2026-09-16-review-d92564bc/NEXT_ACTIONS.md)，覆盖表：[COVERAGE.md](reviews/2026-09-16-review-d92564bc/COVERAGE.md)）。A1–A4 已全部关闭并推送 `origin/main`；attempt 1 唯一失败为 T7 旅程的 30s 墙钟抖动（与本批无依赖关系，重跑即绿）。**剩余 B1/B2 见本批文末。** 共同主线：**让 TUI 成为可信的操作入口（一套读模型、一个保序提交口、一个布局/宽度模型），而不是另一份会自行漂移的运行状态；让 required 解析产生稳定的执行计划，而不是依赖最后剩下的热目录内容。** 都属于主体完善，不重做架构、不前置 GUI。行为修改与机械移动分开提交；定向测试后跑既有相关跨 crate 集成，合并沿用现有 CI。
 
 ### A1 — 审批可核对与多行文本渲染（U1＋U2，agent-tui）——已关闭（2026-09-16，`22ab97a6`）
 用户动作：待审批的长命令/长路径/大段替换内容能在确认前翻到尾部核对；代码块、错误栈、计划按原行结构显示。

@@ -4,6 +4,7 @@
 
 ## 已核对基线
 
+- **U 批次基线 `3d0b114f`（2026-09-16，A 线收口）**：CI run `35103897272` 最终 **success，attempt 2**。attempt 1 唯一失败是 `agent-host` 的 `host_t7_journey::named_pipe_t7_same_task_full_backend_journey`（`part_a.md` 工件未在 30s 墙钟截止前落地），**与本次改动无依赖关系**（`agent-host` 不依赖 `agent-tui`，也不使用 `StatusProjection`），本机同平台复现 9.54s 通过；重跑即绿。已推送 `origin/main`（`d92564bc..3d0b114f`）。
 - 阶段审查基线：`4aaa8bea89336e2ec0fd21c76d04967814b24020`（2026-09-14）。该 SHA 的 CI run `34788369834` 最终 success，**第 2 次尝试**（满载抖动重跑），非首次全绿。审查报告：[下一阶段审查](reviews/2026-09-14-next-stage-review-4aaa8bea/REVIEW.md)。
 - main 之上另有并行分支在飞（如 `codex/headless-output-budget`：真实 DeepSeek 任务记录 headless 输出缺口、失败轮结算与输出预算修复）。采用任何结论前核对实际分支与 HEAD。
 
@@ -48,6 +49,7 @@
 - 冷目录分页与旧路径的跨层缺口未收口：scope 退休可漏未加载冷页引用（V1）、必需正文可被误报 Missing（V2）、service 边界丢 coverage/续查（V3）、续查状态可膨胀与 ABA（V4/V5）、取消丢已知用量（V7）——W1–W4 队列见 [NEXT_TASKS.md](NEXT_TASKS.md)。
 - **TUI 作为操作入口的完整性（`d92564bc` 审查）**：U1–U7 已全部关闭（A1/A2/A3/A4）。**仍未收口**——后端侧 B1（批量 required 冷解析互相驱逐）与 B2（existing card 仅凭 `exists` 认领），待 `context-simple` 在飞改动收口后接续；A 线自身残余限制见下条。U 系列队列见 [NEXT_TASKS.md](NEXT_TASKS.md) 第五批。
 - **A 线残余（`d92564bc` 审查，已记录不回退）**：`/done` 的身份校验是前置快照比对而非原子保证（需给共享 `RuntimeCommand::CompleteTask` 加 expecting 变体）；`display_width` 为内联宽字符表；结果卡归档上限 8 张、不能按 TaskId 查任意历史；`view_partial` 未覆盖 live `Lagged` 之外的缺口；真实 PTY 端到端未执行。
+- **已知抖动（不新增门禁）**：`host_t7_journey::named_pipe_t7_same_task_full_backend_journey` 的 `wait_file_content` 用 30s 墙钟截止，满载 Windows runner 上曾超时（run `35103897272` attempt 1；attempt 2 绿，本机 9.54s）。若再次出现，先看该截止而非假定功能回归。
 - 正式 `agent-host` 未指定策略时仍默认 Rolling；Dynamic 是可选实现。配置依据 [CONFIGURATION.md](CONFIGURATION.md)。
 - 尚不能宣称：无限历史热内存有界、全部源码逐行审查完成、供应商 KV 已实测降低任务费用。真实模型实验按预算和凭据条件执行，不阻塞无须模型的生产接线。
 
