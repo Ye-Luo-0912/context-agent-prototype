@@ -2132,3 +2132,123 @@ async fn schema_valid_arguments_reach_approval_and_dispatch() {
     assert!(output.ok, "{}", output.model_content);
     assert_eq!(approvals.load(std::sync::atomic::Ordering::SeqCst), 1);
 }
+
+/// A plain `integer` profile like any production tool surface.
+fn integer_surface() -> ToolSurfaceSnapshot {
+    let profile = agent_contracts::SchemaProfile::compile(&serde_json::json!({
+        "type": "object",
+        "properties": {"n": {"type": "integer"}},
+        "required": ["n"],
+    }))
+    .unwrap();
+    ToolSurfaceSnapshot {
+        specs: vec![ToolSpec {
+            name: "typed.tool".into(),
+            description: "typed surface fixture".into(),
+            input_schema: serde_json::json!({"type": "object"}),
+            risk: ToolRisk::ReadOnly,
+            output_budget: None,
+            roles: Vec::new(),
+        }],
+        schema_profiles: std::collections::BTreeMap::from([("typed.tool".to_string(), profile)]),
+        ..ToolSurfaceSnapshot::default()
+    }
+}
+
+/// 9007199254740993 (= 2^53 + 1) passes a plain integer shape check but
+/// rounds to 9007199254740992 in the binary64 domain JCS digests, so two
+/// distinct arguments would share one `ArgumentDigest` — a canonicalization
+/// collision, not a cryptographic one. The Core admission chain must refuse
+/// it as a typed no-dispatch result before the approval gate, the effect
+/// journal or dispatch ever see it; the executed arguments and the digested
+/// identity stay one semantic value.
+#[tokio::test]
+async fn non_lossless_integer_argument_is_refused_before_approval_or_dispatch() {
+    let approvals = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let kernel = Arc::new(CoreAuthority::new(
+        CoreAuthorityConfig::default(),
+        Arc::new(RecordingEngine::default()),
+        Arc::new(PanicDispatcher),
+        Arc::new(CountingApproval(approvals.clone())),
+        None,
+        None,
+    ));
+    let surface = integer_surface();
+    let mut tool_call = call("typed.tool");
+    tool_call.arguments = serde_json::json!({"n": 9007199254740993i64});
+    assert_eq!(tool_call.arguments["n"].as_i64(), Some(9007199254740993));
+    assert_ne!(
+        tool_call.arguments["n"].as_i64(),
+        serde_json::json!(9007199254740992i64).as_i64(),
+        "the two raw integers are distinguishable before digesting"
+    );
+    let generation = kernel.current_authority_epoch();
+    let execution = kernel
+        .execute_tool(
+            operation_identity(&kernel, &tool_call, generation),
+            tool_call,
+            CancellationToken::new(),
+            &surface,
+            generation,
+        )
+        .await;
+    let ToolOutcome::Value(output) = execution.outcome else {
+        panic!("numeric-domain refusal is a plain value outcome")
+    };
+    assert!(!output.ok, "{}", output.model_content);
+    assert_eq!(output.metadata["schema"]["pointer"], "/n");
+    assert!(
+        output.metadata["schema"]["expected"]
+            .as_str()
+            .is_some_and(|text| text.contains("binary64")),
+        "{}",
+        output.metadata
+    );
+    assert!(execution.lease.is_none());
+    assert!(execution.effect_id.is_none());
+    assert_eq!(approvals.load(std::sync::atomic::Ordering::SeqCst), 0);
+}
+
+/// The binary64 boundary value itself is exactly representable, keeps its
+/// own digest bytes, and executes through the normal admission chain.
+#[tokio::test]
+async fn integer_at_the_binary64_boundary_still_executes() {
+    let approvals = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let dispatcher = Arc::new(EchoDispatcher {
+        output: ToolOutput {
+            call_id: "call-ok".into(),
+            tool_name: "typed.tool".into(),
+            ok: true,
+            summary: "ok".into(),
+            model_content: "ok".into(),
+            artifact_ref: None,
+            metadata: serde_json::Value::Null,
+        },
+    });
+    let kernel = Arc::new(CoreAuthority::new(
+        CoreAuthorityConfig::default(),
+        Arc::new(RecordingEngine::default()),
+        dispatcher,
+        Arc::new(CountingApproval(approvals.clone())),
+        None,
+        None,
+    ));
+    let surface = integer_surface();
+    let mut tool_call = call("typed.tool");
+    tool_call.arguments = serde_json::json!({"n": 9007199254740992i64});
+    let generation = kernel.current_authority_epoch();
+    let execution = kernel
+        .execute_tool(
+            operation_identity(&kernel, &tool_call, generation),
+            tool_call,
+            CancellationToken::new(),
+            &surface,
+            generation,
+        )
+        .await;
+    let ToolOutcome::Value(output) = execution.outcome else {
+        panic!("a boundary-valid call executes to a plain value")
+    };
+    assert!(output.ok, "{}", output.model_content);
+    assert_eq!(approvals.load(std::sync::atomic::Ordering::SeqCst), 1);
+}

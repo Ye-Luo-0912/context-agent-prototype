@@ -14,6 +14,26 @@
 //! `minLength`/`maxLength`, `enum` (primitive options), and
 //! `additionalProperties` (boolean). `description` is an annotation and is
 //! ignored. Every other keyword fails compilation.
+//!
+//! ## Numeric domain
+//!
+//! RFC 8785 §3.1 renders every JSON number through an IEEE 754 binary64
+//! value, and `ArgumentDigest` hashes exactly those canonical bytes while
+//! dispatch carries the original `call.arguments`. Argument admission
+//! therefore restricts numbers to values that survive that conversion
+//! unchanged: floating-point spellings are already binary64, and integer
+//! spellings must lie within ±2^53 ([`MAX_BINARY64_INTEGER`]). Integers
+//! beyond that magnitude still pass an exact `i64` shape check yet
+//! canonically collide with their rounded neighbor (9007199254740993 and
+//! 9007199254740992 would share one digest), so they are refused here with
+//! a typed violation — never rounded silently. A tool that needs exact long
+//! integers must expose them through a versioned string field. Constraint
+//! values (`minimum`/`maximum`/`enum` options) obey the same rule and are
+//! read straight from their JSON literals so no lossy f64 round trip can
+//! enter the schema itself. The result is one semantic value for
+//! authorization, digest and dispatch: every argument that passes
+//! `validate` serializes to canonical bytes identical to the value the tool
+//! will read.
 
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Number, Value};
@@ -31,6 +51,14 @@ pub const MAX_ARGUMENT_DEPTH: usize = 32;
 pub const MAX_ARGUMENT_NODES: usize = 8192;
 /// Maximum serialized byte estimate for accepted arguments.
 pub const MAX_ARGUMENT_BYTES: usize = 256 * 1024;
+
+/// Largest integer magnitude admitted for tool arguments: 2^53, the exact
+/// limit of binary64 integer precision that RFC 8785 canonicalization uses.
+/// Integers with `|n| > 2^53` are refused at admission (a typed violation,
+/// never a silent round) because they would canonicalize to the same bytes
+/// as a different argument and share one [`ArgumentDigest`]. Fields that
+/// need exact long integers must be versioned string schemas instead.
+pub const MAX_BINARY64_INTEGER: i64 = 1 << 53;
 
 /// One immutable compiled tool-argument pattern. `compile` is fallible:
 /// unsupported keywords, structural misuse and unbounded schemas refuse to
@@ -250,6 +278,14 @@ impl BoundedNode {
                         if bounded.contains(option) {
                             return Err("schema 'enum' options must be unique".into());
                         }
+                        if let Value::Number(number) = option
+                            && !number_in_binary64_domain(number)
+                        {
+                            return Err(
+                                "schema 'enum' options must be exactly representable as IEEE 754 binary64 values"
+                                    .into(),
+                            );
+                        }
                         bounded.push(option.clone());
                     }
                     enum_options = Some(bounded);
@@ -330,20 +366,14 @@ impl BoundedNode {
                 allow_additional: allow_additional.unwrap_or(true),
             },
             NodeType::Integer => {
-                let minimum = minimum
-                    .map(|value| {
-                        to_i64(value).ok_or_else(|| {
-                            "integer schema 'minimum' must be an integer".to_string()
-                        })
-                    })
-                    .transpose()?;
-                let maximum = maximum
-                    .map(|value| {
-                        to_i64(value).ok_or_else(|| {
-                            "integer schema 'maximum' must be an integer".to_string()
-                        })
-                    })
-                    .transpose()?;
+                // `number_from` already confined both bound literals to the
+                // binary64 domain, so no f64 round trip can shift a bound (a
+                // `9007199254740993` minimum once compiled to
+                // `9007199254740992` that way); what remains is refusing
+                // fractional literals.
+                let minimum = minimum.map(|value| i64_constraint_from(value, "minimum"));
+                let maximum = maximum.map(|value| i64_constraint_from(value, "maximum"));
+                let (minimum, maximum) = (minimum.transpose()?, maximum.transpose()?);
                 if let (Some(min), Some(max)) = (minimum, maximum)
                     && min > max
                 {
@@ -398,7 +428,9 @@ impl BoundedNode {
     ) -> Result<(), SchemaViolation> {
         budget.charge(pointer)?;
         match self {
-            BoundedNode::Any => Ok(()),
+            // An unconstrained node still bounds and domain-checks the value
+            // it admits: numbers under it reach the digest like any other.
+            BoundedNode::Any => budget.scan_value(value, pointer),
             BoundedNode::Null => expect(value, pointer, NodeType::Null, budget),
             BoundedNode::Bool => expect(value, pointer, NodeType::Bool, budget),
             BoundedNode::Integer {
@@ -409,6 +441,18 @@ impl BoundedNode {
                 let Some(number) = value.as_i64() else {
                     return Err(violation(pointer, "integer", value));
                 };
+                if let Some(raw) = value.as_number()
+                    && !number_in_binary64_domain(raw)
+                {
+                    // Exact as i64, but outside the RFC 8785 binary64
+                    // domain: refusing here keeps digest, authorization and
+                    // dispatch on one semantic value.
+                    return Err(violation_named(
+                        pointer,
+                        lossless_number_expectation(),
+                        value,
+                    ));
+                }
                 if let Some(min) = minimum
                     && number < *min
                 {
@@ -439,6 +483,15 @@ impl BoundedNode {
                 let Some(number) = value.as_f64() else {
                     return Err(violation(pointer, "number", value));
                 };
+                if let Some(raw) = value.as_number()
+                    && !number_in_binary64_domain(raw)
+                {
+                    return Err(violation_named(
+                        pointer,
+                        lossless_number_expectation(),
+                        value,
+                    ));
+                }
                 if let Some(min) = minimum
                     && number < *min
                 {
@@ -632,6 +685,29 @@ fn violation_named(pointer: &str, expected: &str, value: &Value) -> SchemaViolat
     }
 }
 
+/// Expected-shape text for the binary64 admission rule.
+fn lossless_number_expectation() -> &'static str {
+    "a number exactly representable as an IEEE 754 binary64 value \
+     (integer magnitude at most 2^53)"
+}
+
+/// True when the JSON number keeps its exact mathematical value through the
+/// binary64 conversion RFC 8785 applies before digesting. Floating-point
+/// spellings are stored as binary64, so they are their own value; integer
+/// spellings are exact and must stay within ±[`MAX_BINARY64_INTEGER`] so
+/// their canonical bytes cannot collide with a different argument.
+fn number_in_binary64_domain(number: &Number) -> bool {
+    if number.is_f64() {
+        return true;
+    }
+    match number.as_i64() {
+        Some(value) => (-MAX_BINARY64_INTEGER..=MAX_BINARY64_INTEGER).contains(&value),
+        // u64 values beyond the i64 range are far outside binary64 integer
+        // precision.
+        None => false,
+    }
+}
+
 fn type_name(ty: NodeType) -> &'static str {
     match ty {
         NodeType::Any => "any value",
@@ -701,9 +777,30 @@ fn bounded_options(options: &[Value]) -> String {
 }
 
 fn number_from(value: &Value, keyword: &str) -> Result<f64, String> {
-    value
+    let number = value
+        .as_number()
+        .ok_or_else(|| format!("schema '{keyword}' must be a number"))?;
+    // Constraint literals obey the same binary64 domain as arguments: a
+    // bound that f64 would round must never enter the compiled schema.
+    if !number_in_binary64_domain(number) {
+        return Err(format!(
+            "schema '{keyword}' must be exactly representable as an IEEE 754 binary64 value"
+        ));
+    }
+    number
         .as_f64()
-        .ok_or_else(|| format!("schema '{keyword}' must be a number"))
+        .ok_or_else(|| format!("schema '{keyword}' must be a finite number"))
+}
+
+fn i64_constraint_from(value: f64, keyword: &str) -> Result<i64, String> {
+    // `number_from` already confined this literal to the binary64 domain, so
+    // an integral value here converts to i64 without loss.
+    if value.fract() != 0.0 {
+        return Err(format!(
+            "integer schema '{keyword}' must be an exact integer"
+        ));
+    }
+    Ok(value as i64)
 }
 
 fn usize_from(value: &Value, keyword: &str) -> Result<usize, String> {
@@ -712,18 +809,6 @@ fn usize_from(value: &Value, keyword: &str) -> Result<usize, String> {
         .or_else(|| value.as_i64().and_then(|n| u64::try_from(n).ok()))
         .ok_or_else(|| format!("schema '{keyword}' must be a non-negative integer"))?;
     usize::try_from(number).map_err(|_| format!("schema '{keyword}' exceeds usize"))
-}
-
-fn to_i64(value: f64) -> Option<i64> {
-    let rounded = value.round();
-    if (value - rounded).abs() < f64::EPSILON
-        && rounded >= i64::MIN as f64
-        && rounded <= i64::MAX as f64
-    {
-        Some(rounded as i64)
-    } else {
-        None
-    }
 }
 
 #[derive(Default)]
@@ -811,7 +896,18 @@ impl VerifyBudget {
                 self.leave();
                 Ok(())
             }
-            other => self.node_size(other, pointer),
+            other => {
+                if let Value::Number(number) = other
+                    && !number_in_binary64_domain(number)
+                {
+                    return Err(violation_named(
+                        pointer,
+                        lossless_number_expectation(),
+                        other,
+                    ));
+                }
+                self.node_size(other, pointer)
+            }
         }
     }
 }
@@ -1179,6 +1275,147 @@ mod tests {
             }))
             .is_err()
         );
+    }
+
+    #[test]
+    fn plain_integer_profile_closes_the_2e53_canonicalization_collision() {
+        // Red counterexample: 9007199254740992 (= 2^53) and 9007199254740993
+        // are distinct i64 values that a plain integer profile used to accept
+        // both. JCS renders numbers through binary64, where the neighbor
+        // rounds down to 2^53, so both arguments hashed to identical bytes:
+        // a canonicalization collision before hashing, not a SHA-256
+        // collision. Admission must refuse the neighbor so every argument
+        // that passes validation canonicalizes losslessly.
+        let exact = json!(9007199254740992i64);
+        let neighbor = json!(9007199254740993i64);
+        assert_ne!(exact.as_i64(), neighbor.as_i64(), "raw i64 values differ");
+        assert_eq!(exact.as_f64(), neighbor.as_f64(), "binary64 collapses them");
+        let profile = compile(json!({
+            "type": "object",
+            "properties": {"n": {"type": "integer"}},
+            "required": ["n"]
+        }));
+        valid(&profile, json!({"n": 9007199254740992i64}));
+        let violation = invalid(&profile, json!({"n": 9007199254740993i64}));
+        assert_eq!(violation.pointer, "/n");
+        assert!(
+            violation.expected.contains("binary64"),
+            "domain refusal must name the binary64 admission rule: {violation}"
+        );
+    }
+
+    #[test]
+    fn negative_non_lossless_integer_is_refused_and_boundary_stays_valid() {
+        let profile = compile(json!({
+            "type": "object",
+            "properties": {"n": {"type": "integer"}},
+            "required": ["n"]
+        }));
+        valid(&profile, json!({"n": -9007199254740992i64}));
+        let violation = invalid(&profile, json!({"n": -9007199254740993i64}));
+        assert_eq!(violation.pointer, "/n");
+        assert!(
+            violation.expected.contains("binary64"),
+            "-(2^53+1) must be refused by the same domain rule: {violation}"
+        );
+    }
+
+    #[test]
+    fn unconstrained_argument_numbers_obey_the_same_domain() {
+        // Numbers reach the digest from every schema shape: untyped nodes,
+        // `number` properties and additional properties alike. Each path
+        // must refuse integers that binary64 would round.
+        let number_profile = compile(json!({
+            "type": "object",
+            "properties": {"x": {"type": "number"}}
+        }));
+        valid(&number_profile, json!({"x": 9007199254740992i64}));
+        assert!(
+            invalid(&number_profile, json!({"x": 9007199254740993i64}))
+                .expected
+                .contains("binary64")
+        );
+        let any_profile = compile(json!({
+            "type": "object",
+            "properties": {"x": {}}
+        }));
+        valid(&any_profile, json!({"x": {"deep": [-9007199254740992i64]}}));
+        assert_eq!(
+            invalid(&any_profile, json!({"x": {"deep": [9007199254740993i64]}})).pointer,
+            "/x/deep/0"
+        );
+        let additional_profile = compile(json!({
+            "type": "object",
+            "properties": {},
+            "additionalProperties": true
+        }));
+        assert!(
+            invalid(&additional_profile, json!({"spare": 9007199254740993i64}))
+                .expected
+                .contains("binary64")
+        );
+    }
+
+    #[test]
+    fn integer_constraints_must_be_exact_integer_literals() {
+        // Constraint values take the same road as arguments: no lossy f64
+        // round trip may enter the schema itself. `9007199254740993` used to
+        // compile to a `minimum` of 9007199254740992 because the literal was
+        // routed through binary64 first.
+        let error = SchemaProfile::compile(&json!({
+            "type": "object",
+            "properties": {"n": {"type": "integer", "minimum": 9007199254740993i64}}
+        }))
+        .unwrap_err();
+        assert!(error.contains("minimum"), "{error}");
+        let error = SchemaProfile::compile(&json!({
+            "type": "object",
+            "properties": {"n": {"type": "integer", "maximum": -9007199254740993i64}}
+        }))
+        .unwrap_err();
+        assert!(error.contains("maximum"), "{error}");
+        // A fractional literal is not an integer constraint at all.
+        assert!(
+            SchemaProfile::compile(&json!({
+                "type": "object",
+                "properties": {"n": {"type": "integer", "minimum": 1.5}}
+            }))
+            .is_err()
+        );
+        let profile = compile(json!({
+            "type": "object",
+            "properties": {
+                "n": {"type": "integer", "minimum": -9007199254740992i64, "maximum": 9007199254740992i64}
+            }
+        }));
+        valid(&profile, json!({"n": 0}));
+        assert!(
+            invalid(&profile, json!({"n": 9007199254740993i64}))
+                .expected
+                .contains("binary64")
+        );
+    }
+
+    #[test]
+    fn number_constraints_and_enum_options_obey_the_binary64_domain() {
+        let error = SchemaProfile::compile(&json!({
+            "type": "object",
+            "properties": {"x": {"type": "number", "maximum": 9007199254740993i64}}
+        }))
+        .unwrap_err();
+        assert!(error.contains("maximum"), "{error}");
+        let error = SchemaProfile::compile(&json!({
+            "type": "object",
+            "properties": {"m": {"enum": [1, 9007199254740993i64]}}
+        }))
+        .unwrap_err();
+        assert!(error.contains("enum"), "{error}");
+        // In-domain floats and integers keep compiling as before.
+        let profile = compile(json!({
+            "type": "object",
+            "properties": {"x": {"type": "number", "minimum": 0.5, "maximum": 9007199254740992i64}}
+        }));
+        valid(&profile, json!({"x": 0.75}));
     }
 
     #[test]

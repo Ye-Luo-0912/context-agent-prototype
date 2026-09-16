@@ -34,6 +34,12 @@ pub const AUTHORITY_STATE_DIGEST_BYTES: usize = 32;
 /// `from_json` hashes the RFC 8785/JCS encoding of the value, so object key
 /// order and equivalent number spellings (`1` vs `1.0`) are the same digest
 /// across languages. Artifact bytes use [`crate::ContentDigest`] instead.
+///
+/// 数值域契约：JCS 把每个数字经 binary64 渲染，因此调用方必须先在参数
+/// 准入处（[`crate::schema_profile`]）把参数限制到 I-JSON binary64 域
+/// （整数 |n| ≤ 2^53）。域内值的规范化字节无损，摘要即执行的语义值；
+/// 域外整数（如 9007199254740993）会被准入拒绝，而不是在这里被悄悄舍入
+/// 成邻居的同摘要字节。`from_json` 本身不放宽、也不检查该域。
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
 pub struct ArgumentDigest([u8; OPERATION_DIGEST_BYTES]);
 
@@ -704,6 +710,69 @@ mod tests {
         assert_eq!(
             ArgumentDigest::from_json(&json!({"a": 1})),
             ArgumentDigest::from_json(&json!({"a": 1.0}))
+        );
+    }
+
+    #[test]
+    fn distinct_i64_neighbors_are_a_canonicalization_collision_outside_the_domain() {
+        // 9007199254740992 (= 2^53) and 9007199254740993 are different i64
+        // values, but binary64 rounds the neighbor down to 2^53, so their
+        // JCS bytes and therefore their digests coincide. This pins the
+        // canonicalization collision that argument admission
+        // ([`crate::schema_profile`]) must refuse upstream: `from_json`
+        // hashes whatever JCS renders, it does not widen the number domain.
+        let exact = json!(9007199254740992i64);
+        let neighbor = json!(9007199254740993i64);
+        assert_ne!(exact.as_i64(), neighbor.as_i64());
+        assert_eq!(exact.as_f64(), neighbor.as_f64());
+        assert_eq!(
+            ArgumentDigest::from_json(&exact),
+            ArgumentDigest::from_json(&neighbor),
+            "out-of-domain integers collide canonically, not cryptographically"
+        );
+    }
+
+    #[test]
+    fn rfc8785_integer_vectors_digest_losslessly_inside_the_domain() {
+        // RFC 8785 appendix B renders binary64 0x4340000000000000 and
+        // 0xc340000000000000 as 9007199254740992 / -9007199254740992. Inside
+        // the admission domain the integer literal, the float spelling and
+        // the raw bit pattern are one semantic value with one digest across
+        // languages, because the canonical text is plain SHA-256 input.
+        let integer = json!(9007199254740992i64);
+        let float = json!(9007199254740992.0f64);
+        let bits = Value::Number(
+            serde_json::Number::from_f64(f64::from_bits(0x4340_0000_0000_0000)).unwrap(),
+        );
+        assert_eq!(crate::jcs::serialize(&integer).unwrap(), "9007199254740992");
+        assert_eq!(crate::jcs::serialize(&float).unwrap(), "9007199254740992");
+        assert_eq!(
+            ArgumentDigest::from_json(&integer),
+            ArgumentDigest::from_json(&float)
+        );
+        assert_eq!(
+            ArgumentDigest::from_json(&integer),
+            ArgumentDigest::from_json(&bits)
+        );
+        assert_eq!(
+            ArgumentDigest::from_json(&integer),
+            ArgumentDigest::sha256_bytes(b"9007199254740992")
+        );
+        let negative = json!(-9007199254740992i64);
+        let negative_bits = Value::Number(
+            serde_json::Number::from_f64(f64::from_bits(0xc340_0000_0000_0000)).unwrap(),
+        );
+        assert_eq!(
+            crate::jcs::serialize(&negative).unwrap(),
+            "-9007199254740992"
+        );
+        assert_eq!(
+            ArgumentDigest::from_json(&negative),
+            ArgumentDigest::from_json(&negative_bits)
+        );
+        assert_ne!(
+            ArgumentDigest::from_json(&integer),
+            ArgumentDigest::from_json(&negative)
         );
     }
 
