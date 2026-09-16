@@ -20,12 +20,28 @@ pub struct UiMessage {
 }
 
 /// A workspace-write / process-execution call waiting for the user's y/n.
+///
+/// `detail` preserves the COMPLETE request — tool name, risk, request id and
+/// every argument at full length — as scrollable lines (no 220-char cap). The
+/// UI renders it in a scrollable panel so the operator can read and verify
+/// everything before answering. `truncated` is set only when the renderer's
+/// own defensive hard cap was hit (Core already bounds the request); it lets
+/// the panel mark the omission instead of silently dropping data.
 #[derive(Debug, Clone)]
 pub struct PendingApproval {
     pub request_id: String,
     pub tool_name: String,
-    pub args_preview: String,
+    pub detail: Vec<String>,
+    pub truncated: bool,
 }
+
+/// Per-argument value cap for the secondary conversation-log summary. The
+/// full value is always available in the scrollable approval panel; here we
+/// mark the cut with a trailing '…' so it never reads as complete.
+const ARG_VALUE_CAP: usize = 120;
+/// How many arguments the secondary conversation-log summary names before
+/// pointing at the scrollable approval panel.
+const ARG_PREVIEW_COUNT: usize = 8;
 
 const MAX_PANEL_TRANSITIONS: usize = 100;
 /// Hard cap on rendered transcript rows. The durable transcript is the
@@ -110,6 +126,14 @@ fn bounded_card_line(text: &str) -> String {
         bounded.push('…');
     }
     bounded
+}
+
+/// Return `text` trimmed to `cap` chars plus whether it was cut. Used by the
+/// secondary approval summary so a truncated value is marked, never silently
+/// presented as complete.
+fn bounded_preview(text: &str, cap: usize) -> (String, bool) {
+    let cut = text.chars().count() > cap;
+    (text.chars().take(cap).collect(), cut)
 }
 
 fn demand_label(demand: ToolSurfaceDemand) -> &'static str {
@@ -259,6 +283,10 @@ pub struct AppState {
     /// banners.
     pub scroll: u16,
     pub pending_approval: Option<PendingApproval>,
+    /// How many rows the operator has paged down into the scrollable
+    /// approval detail panel. Top-anchored: zero shows the request header,
+    /// larger values reveal later arguments and the trailing sentinel.
+    pub approval_scroll: u16,
     /// Cumulative provider-reported token usage for the live run (fed by
     /// `RuntimeEvent::ModelUsed`).
     pub input_tokens: u64,
@@ -315,6 +343,7 @@ impl AppState {
             busy: false,
             scroll: 0,
             pending_approval: None,
+            approval_scroll: 0,
             input_tokens: 0,
             output_tokens: 0,
             current_op: None,
@@ -520,37 +549,90 @@ impl AppState {
         }
     }
 
+    /// Begin showing an interactive approval request. The full request is
+    /// preserved in `detail` (every argument at full length) so the operator
+    /// can scroll and verify it; only the secondary conversation-log summary
+    /// is bounded, and it marks any truncation explicitly.
     pub fn begin_approval(&mut self, request: ApprovalRequest) {
-        let preview = serde_json::to_string(&request.call.arguments).unwrap_or_default();
-        let preview: String = preview.chars().take(220).collect();
-        let tool_name = request.spec.name;
+        let tool_name = request.spec.name.clone();
+        let risk = format!("{:?}", request.spec.risk);
+
+        let mut detail: Vec<String> = Vec::new();
+        detail.push(format!("Tool: {tool_name}"));
+        detail.push(format!("Risk: {risk}"));
+        detail.push(format!("Request id: {}", request.request_id));
+        if !request.spec.description.is_empty() {
+            detail.push(format!("Description: {}", request.spec.description));
+        }
+        detail.push(String::new());
+        detail.push("Arguments:".to_string());
+
+        let mut truncated = false;
+        // Keep the COMPLETE request. Core already bounds the request size, so
+        // this hard cap is defensive only; when it does bite, name the
+        // omission so the operator never thinks they saw everything.
+        const HARD_CAP: usize = 1 << 20;
+        let full_args = serde_json::to_string(&request.call.arguments).unwrap_or_default();
+        if full_args.len() > HARD_CAP {
+            truncated = true;
+            let capped: String = full_args.chars().take(HARD_CAP).collect();
+            detail.push(format!("  {capped}"));
+            detail.push(
+                "[…] arguments truncated: the request exceeded the panel's hard display cap".into(),
+            );
+        } else if let Some(map) = request.call.arguments.as_object() {
+            for (key, value) in map {
+                let rendered = serde_json::to_string(value).unwrap_or_default();
+                detail.push(format!("  {key}: {rendered}"));
+            }
+            if map.is_empty() {
+                detail.push("  (no arguments)".into());
+            }
+        } else {
+            detail.push(format!("  {full_args}"));
+        }
+        detail.push(String::new());
+        detail.push(format!("— end of request {} —", request.request_id));
+
         self.pending_approval = Some(PendingApproval {
-            request_id: request.request_id,
+            request_id: request.request_id.clone(),
             tool_name: tool_name.clone(),
-            args_preview: preview,
+            detail,
+            truncated,
         });
+        self.approval_scroll = 0;
         self.busy = true;
         self.status = "awaiting approval".into();
         self.push_system(format!(
             "approval required: {tool_name} (risk: {:?})",
             request.spec.risk
         ));
-        // Bounded per-argument breakdown so the operator approves what the
-        // call actually names, not a truncated JSON blob.
+        // Bounded secondary summary in the conversation log. Truncation is
+        // marked: a value cut at {ARG_VALUE_CAP} chars gets a trailing '…',
+        // and arguments past the first {ARG_PREVIEW_COUNT} name the count and
+        // point the operator at the scrollable approval panel.
         if let Some(map) = request.call.arguments.as_object() {
-            for (key, value) in map.iter().take(8) {
+            for (key, value) in map.iter().take(ARG_PREVIEW_COUNT) {
                 let rendered = serde_json::to_string(value).unwrap_or_default();
-                let rendered: String = rendered.chars().take(120).collect();
-                self.push_system(format!("  {key}: {rendered}"));
+                let (shown, cut) = bounded_preview(&rendered, ARG_VALUE_CAP);
+                if cut {
+                    self.push_system(format!("  {key}: {shown}…"));
+                } else {
+                    self.push_system(format!("  {key}: {shown}"));
+                }
             }
-            if map.len() > 8 {
-                self.push_system(format!("  …and {} more arguments", map.len() - 8));
+            let extra = map.len().saturating_sub(ARG_PREVIEW_COUNT);
+            if extra > 0 {
+                self.push_system(format!(
+                    "  …and {extra} more arguments (scroll the approval panel for the full list)"
+                ));
             }
         }
     }
 
     pub fn clear_approval(&mut self) {
         self.pending_approval = None;
+        self.approval_scroll = 0;
     }
 
     pub fn toggle_context_panel(&mut self) {
@@ -2093,6 +2175,73 @@ mod status_projection_tests {
         assert!(joined.contains("WorkspaceWrite"), "{joined}");
         assert!(joined.contains("  path: \"src/lib.rs\""), "{joined}");
         assert!(joined.contains("  content:"), "{joined}");
+    }
+
+    #[test]
+    fn approval_detail_keeps_full_arguments_and_marks_truncation() {
+        let mut app = AppState::new(RunId::new());
+        let long = "x".repeat(500);
+        let mut map = serde_json::Map::new();
+        for i in 1..=12 {
+            map.insert(
+                format!("arg{i}"),
+                serde_json::Value::String(format!("{long}-{i}")),
+            );
+        }
+        let request = agent_core::ApprovalRequest {
+            request_id: "req-full".into(),
+            call: agent_contracts::ToolCall {
+                id: "call-full".into(),
+                name: "fs.write".into(),
+                arguments: serde_json::Value::Object(map),
+            },
+            spec: agent_contracts::ToolSpec {
+                name: "fs.write".into(),
+                description: "write a file".into(),
+                input_schema: serde_json::json!({}),
+                risk: agent_contracts::ToolRisk::WorkspaceWrite,
+                roles: Vec::new(),
+                output_budget: None,
+            },
+        };
+        app.begin_approval(request);
+        let pending = app.pending_approval.as_ref().unwrap();
+        assert!(
+            !pending.truncated,
+            "a 500-char argument is far under the panel's hard cap"
+        );
+        // The full value survives in detail — no 220-char preview cap.
+        let detail = pending.detail.join("\n");
+        assert!(
+            detail.contains(&format!("{long}-12")),
+            "arg12's full value must be present: {detail}"
+        );
+        assert!(
+            detail.contains("arg1:") && detail.contains("arg12:"),
+            "all 12 arguments are listed, not capped at 8: {detail}"
+        );
+        assert!(
+            detail.contains("— end of request req-full —"),
+            "the trailing sentinel line is present: {detail}"
+        );
+
+        // The secondary conversation-log summary marks truncation explicitly.
+        let log = app
+            .messages
+            .iter()
+            .map(|m| m.content.clone())
+            .collect::<Vec<_>>()
+            .join("\n");
+        // A value longer than ARG_VALUE_CAP (120) gets the trailing '…'.
+        assert!(
+            log.contains("  arg1:") && log.contains('…'),
+            "a cut log value must be marked with '…': {log}"
+        );
+        // Arguments past the first 8 name the count and point at the panel.
+        assert!(
+            log.contains("…and 4 more arguments"),
+            "the log must name the extra arguments beyond 8: {log}"
+        );
     }
 
     fn envelope(seq: u64, event: RuntimeEvent) -> RuntimeEventEnvelope {

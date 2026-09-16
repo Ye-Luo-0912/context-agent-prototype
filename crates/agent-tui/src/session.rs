@@ -22,6 +22,20 @@ use crate::state::AppState;
 /// rather than blocking the command task.
 pub(crate) const NOTICE_CHANNEL_CAP: usize = 64;
 
+/// Rows a PageUp/PageDown moves the scrollable approval panel by.
+const APPROVAL_PAGE: u16 = 8;
+
+/// Map a key to the approval decision it triggers, or `None` for any key that
+/// is not an approval answer (scroll keys are routed by the caller). Kept as
+/// a pure function so the routing is unit-testable without a live session.
+pub(crate) fn classify_approval_key(code: KeyCode) -> Option<ApprovalDecision> {
+    match code {
+        KeyCode::Char('y') | KeyCode::Enter => Some(ApprovalDecision::Allow),
+        KeyCode::Char('n') | KeyCode::Esc => Some(ApprovalDecision::Deny),
+        _ => None,
+    }
+}
+
 /// UI-side handles for interactive approval: the broker carries requests from
 /// the kernel to the UI, the gate carries the user's decision back, and the
 /// task gate holds the standing grants (established from `--grant` on the
@@ -176,25 +190,46 @@ pub(crate) async fn run_session<S: UiSource, O: UiSink>(
         }
 
         // While a write/process tool waits for permission, y/n (or
-        // Enter/Esc) resolve the prompt; other keys are ignored.
+        // Enter/Esc) resolve the prompt; PageUp/PageDown scroll the approval
+        // detail so the operator can read the whole request before answering;
+        // anything else is ignored. The decision is bound to the request_id
+        // currently on screen, so a stale key for an already-resolved request
+        // can never approve a newer one that arrives in the meantime.
         if app.pending_approval.is_some() {
             let Some(handle) = &interactive else {
                 app.clear_approval();
                 continue;
             };
-            let request_id = app
-                .pending_approval
-                .as_ref()
-                .map(|p| p.request_id.clone())
-                .unwrap_or_default();
-            let decision = match key.code {
-                KeyCode::Char('y') | KeyCode::Enter => Some(ApprovalDecision::Allow),
-                KeyCode::Char('n') | KeyCode::Esc => Some(ApprovalDecision::Deny),
-                _ => None,
-            };
+            match key.code {
+                KeyCode::PageUp => {
+                    app.approval_scroll = app.approval_scroll.saturating_sub(APPROVAL_PAGE);
+                    continue;
+                }
+                KeyCode::PageDown => {
+                    app.approval_scroll = app.approval_scroll.saturating_add(APPROVAL_PAGE);
+                    continue;
+                }
+                _ => {}
+            }
+            let decision = classify_approval_key(key.code);
             if let Some(decision) = decision {
+                // Bind the answer to the request_id shown right now.
+                let request_id = app
+                    .pending_approval
+                    .as_ref()
+                    .map(|p| p.request_id.clone())
+                    .unwrap_or_default();
                 let granted = handle.gate.respond(&request_id, decision).await;
-                app.clear_approval();
+                // Only drop the displayed request if it is the one we just
+                // answered; a request that arrived in the meantime stays put
+                // for the operator to review on its own.
+                if app
+                    .pending_approval
+                    .as_ref()
+                    .is_some_and(|p| p.request_id == request_id)
+                {
+                    app.clear_approval();
+                }
                 app.push_system(match (decision, granted) {
                     (ApprovalDecision::Allow, true) => "approval granted".into(),
                     (ApprovalDecision::Deny, true) => "approval denied".into(),
@@ -1813,5 +1848,131 @@ mod exec4_restore_read_tests {
                 .contains("exceeds the checkpoint artifact bound"),
             "the refusal names the bound: {error}"
         );
+    }
+}
+
+#[cfg(test)]
+mod approval_key_tests {
+    use super::*;
+    use crossterm::event::KeyCode;
+
+    #[test]
+    fn classify_approval_key_maps_y_enter_to_allow_and_n_esc_to_deny() {
+        assert_eq!(
+            classify_approval_key(KeyCode::Char('y')),
+            Some(ApprovalDecision::Allow)
+        );
+        assert_eq!(
+            classify_approval_key(KeyCode::Enter),
+            Some(ApprovalDecision::Allow)
+        );
+        assert_eq!(
+            classify_approval_key(KeyCode::Char('n')),
+            Some(ApprovalDecision::Deny)
+        );
+        assert_eq!(
+            classify_approval_key(KeyCode::Esc),
+            Some(ApprovalDecision::Deny)
+        );
+        // Navigation and other keys are not answers; the caller scrolls or
+        // ignores them so the operator can read the request before deciding.
+        assert_eq!(classify_approval_key(KeyCode::PageUp), None);
+        assert_eq!(classify_approval_key(KeyCode::PageDown), None);
+        assert_eq!(classify_approval_key(KeyCode::Char('x')), None);
+    }
+}
+
+/// The decision must be bound to the request_id currently on screen: a stale
+/// confirmation for an already-resolved request must never approve a newer one
+/// that arrives in the meantime. Driven with a real broker + gate (no pty).
+#[cfg(test)]
+mod approval_binding_tests {
+    use super::*;
+    use agent_contracts::{
+        ApprovalDecision, ApprovalGate, CancellationToken, RunId, ToolCall, ToolRisk, ToolSpec,
+    };
+    use agent_core::{ApprovalBroker, InteractiveApprovalGate};
+    use std::sync::Arc;
+
+    fn spec(name: &str) -> ToolSpec {
+        ToolSpec {
+            name: name.into(),
+            description: String::new(),
+            input_schema: serde_json::json!({}),
+            risk: ToolRisk::WorkspaceWrite,
+            roles: Vec::new(),
+            output_budget: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn expired_request_confirmation_does_not_approve_a_later_request() {
+        let broker = ApprovalBroker::new();
+        let gate = Arc::new(InteractiveApprovalGate::new(broker.clone()));
+
+        // Request A is submitted and shown to the operator.
+        let call_a = ToolCall {
+            id: "c-a".into(),
+            name: "fs.write".into(),
+            arguments: serde_json::json!({ "path": "a.txt" }),
+        };
+        let gate_a = gate.clone();
+        let task_a = tokio::spawn(async move {
+            gate_a
+                .authorize(&call_a, &spec("fs.write"), &CancellationToken::new())
+                .await
+        });
+
+        let mut rx = broker.subscribe();
+        let req_a = rx.recv().await.expect("request A broadcast");
+        let mut app = AppState::new(RunId::new());
+        app.begin_approval(req_a);
+        let id_a = app.pending_approval.as_ref().unwrap().request_id.clone();
+
+        // A expires: resolved elsewhere (kernel timeout / cancelled turn).
+        assert!(
+            gate.respond(&id_a, ApprovalDecision::Allow).await,
+            "A should be resolvable"
+        );
+        assert!(
+            matches!(task_a.await.unwrap(), Ok(ApprovalDecision::Allow)),
+            "A's waiter sees Allow"
+        );
+
+        // Stale [y] for the expired A: bound to A's id, must be rejected.
+        let stale = app.pending_approval.as_ref().unwrap().request_id.clone();
+        let granted = gate.respond(&stale, ApprovalDecision::Allow).await;
+        assert!(
+            !granted,
+            "an expired request's confirmation must NOT be accepted"
+        );
+
+        // A new request B arrives and is shown.
+        let call_b = ToolCall {
+            id: "c-b".into(),
+            name: "fs.write".into(),
+            arguments: serde_json::json!({ "path": "b.txt" }),
+        };
+        let gate_b = gate.clone();
+        let task_b = tokio::spawn(async move {
+            gate_b
+                .authorize(&call_b, &spec("fs.write"), &CancellationToken::new())
+                .await
+        });
+        let req_b = rx.recv().await.expect("request B broadcast");
+        let id_b = req_b.request_id.clone();
+        app.begin_approval(req_b);
+        assert_eq!(app.pending_approval.as_ref().unwrap().request_id, id_b);
+
+        // B must still be unresolved: the stale A confirm never touched it.
+        let still_pending = broker.pending().await.iter().any(|r| r.request_id == id_b);
+        assert!(
+            still_pending,
+            "the later request B must not be approved by a stale confirmation for A"
+        );
+
+        // Clean up so the background task does not hang.
+        let _ = gate.respond(&id_b, ApprovalDecision::Deny).await;
+        let _ = task_b.await;
     }
 }
