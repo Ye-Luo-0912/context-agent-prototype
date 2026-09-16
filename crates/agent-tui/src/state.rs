@@ -3313,7 +3313,7 @@ mod resync_tests {
         std::fs::create_dir_all(&traces).unwrap();
         let run_id = RunId::new();
         let mut app = AppState::new(run_id);
-        let events = vec![
+        let events = [
             RuntimeEvent::RunStarted,
             RuntimeEvent::FocusChanged {
                 task_id: TaskId::new(),
