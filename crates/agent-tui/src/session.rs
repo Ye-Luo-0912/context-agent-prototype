@@ -399,12 +399,14 @@ async fn dispatch_command(
         return Ok(true);
     }
     if trimmed == "/review" {
-        // Render the latest result card: freshest is the in-session
-        // event-derived card; otherwise fall back to the persisted
-        // artifact from a previous task. Display only — no model call,
-        // no write.
-        if !app.result_card.is_empty() {
-            for line in crate::state::format_result_lines(&app.result_card) {
+        // Render the result card: the focused task's own material when it
+        // has any, otherwise the most recently finished task's. Never a
+        // blend of two tasks — a card belongs to exactly one TaskId, so
+        // task A's completion header cannot sit above task B's changes.
+        // Display only — no model call, no write.
+        if let Some(card) = app.review_card() {
+            let card = card.clone();
+            for line in crate::state::format_result_lines(&card) {
                 app.push_system(line);
             }
         } else {

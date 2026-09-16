@@ -58,6 +58,9 @@ const MAX_CARD_FILES: usize = 32;
 const MAX_CARD_CHECKS: usize = 32;
 const MAX_CARD_FAILURES: usize = 8;
 const MAX_CARD_LINE_CHARS: usize = 160;
+/// How many finished tasks' cards are kept for `/review` after the focus
+/// moves on. Bounded: this is display material, not a second task ledger.
+const MAX_ARCHIVED_CARDS: usize = 8;
 /// Per-file read cap for a projection resync (32 MiB), enforced by the
 /// reader before allocation.
 const RESYNC_FILE_BYTES: usize = 32 * 1024 * 1024;
@@ -76,11 +79,15 @@ const MAX_SHOWN_MESSAGE_EVENTS: usize = 4096;
 
 /// One file a mutating tool wrote this session, identified by the
 /// structured `metadata.path` the tool stamped — never parsed from prose.
+/// `task_id` names the task the write is attributed to, so material from
+/// two tasks can never be read as one task's result.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct CardChangedFile {
     pub path: String,
     pub tool: String,
     pub ok: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub task_id: Option<TaskId>,
 }
 
 /// One trusted verification-class run this session (verify.run,
@@ -92,6 +99,8 @@ pub struct CardCheck {
     pub summary: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub artifact: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub task_id: Option<TaskId>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -101,15 +110,49 @@ pub struct CardCompletion {
     pub summary: String,
 }
 
+/// One recorded failure with the task it belongs to.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct CardFailure {
+    pub summary: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub task_id: Option<TaskId>,
+}
+
+/// Serializes result-card snapshot commits: a single writer, versioned by
+/// the card's monotonic `revision`, so an older snapshot that finishes later
+/// can never overwrite a newer one.
+#[derive(Debug, Default)]
+struct CardSnapshotState {
+    last_written_revision: u64,
+}
+
 /// The bounded, event-derived result card `/review` renders. It lists only
 /// what this session's own tool calls prove; pre-existing workspace
 /// modifications are deliberately not attributed.
+///
+/// The card belongs to ONE task: `task_id` names it, and a different task
+/// starts a different card, so task A's durable completion header can never
+/// sit above task B's changes. `omitted_*` counts what the display caps
+/// refused to append, so a late failure is never silently absent from the
+/// review — the count is visible even when the entry is not.
 #[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct ResultCard {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub task_id: Option<TaskId>,
+    /// Monotonic snapshot revision. A stale writer must not overwrite a
+    /// newer card; see `persist_result_card`.
+    #[serde(default)]
+    pub revision: u64,
     pub changed_files: Vec<CardChangedFile>,
     pub checks: Vec<CardCheck>,
     pub completion: Option<CardCompletion>,
-    pub failures: Vec<String>,
+    pub failures: Vec<CardFailure>,
+    #[serde(default)]
+    pub omitted_files: usize,
+    #[serde(default)]
+    pub omitted_checks: usize,
+    #[serde(default)]
+    pub omitted_failures: usize,
 }
 
 impl ResultCard {
@@ -118,6 +161,16 @@ impl ResultCard {
             && self.checks.is_empty()
             && self.completion.is_none()
             && self.failures.is_empty()
+    }
+
+    /// Total recorded checks, including the ones the display cap refused.
+    pub fn total_checks(&self) -> usize {
+        self.checks.len().saturating_add(self.omitted_checks)
+    }
+
+    /// Failed checks still visible in the card.
+    pub fn failed_checks(&self) -> usize {
+        self.checks.iter().filter(|check| !check.ok).count()
     }
 }
 
@@ -330,9 +383,15 @@ pub struct AppState {
     /// Bounded event-derived review material for `/review`. The UI only
     /// displays it; nothing here drives effects.
     pub result_card: ResultCard,
+    /// Cards for tasks the focus has already left, newest last. A card is
+    /// bounded material for ONE task; switching tasks archives instead of
+    /// merging, so `/review` can still answer for the task just finished.
+    archived_cards: Vec<ResultCard>,
     /// Workspace state dir (`.focus-agent`), used to persist the latest
     /// result card as a small JSON artifact at task completion.
     pub state_dir: Option<std::path::PathBuf>,
+    /// Single-writer gate for the card snapshot; see `persist_result_card`.
+    card_snapshot_gate: std::sync::Arc<tokio::sync::Mutex<CardSnapshotState>>,
     /// Highest durable sequence of this run already folded from the
     /// journal by a resync. Live events at or below it are skipped by the
     /// projection fold so a post-resync replay never double-counts.
@@ -389,7 +448,11 @@ impl AppState {
             last_checkpoint: None,
             execution_budget: None,
             result_card: ResultCard::default(),
+            archived_cards: Vec::new(),
             state_dir: None,
+            card_snapshot_gate: std::sync::Arc::new(tokio::sync::Mutex::new(
+                CardSnapshotState::default(),
+            )),
             resynced_through_seq: None,
             applied_events: std::collections::VecDeque::new(),
             applied_index: std::collections::HashSet::new(),
@@ -436,21 +499,49 @@ impl AppState {
     }
 
     /// Persist the latest result card as one small JSON artifact under the
-    /// workspace state dir, so `/review` survives a restart. Fire-and-forget
-    /// display material: a write failure is not a runtime fault.
-    fn persist_result_card(&self) {
-        let Some(state_dir) = &self.state_dir else {
+    /// workspace state dir, so `/review` survives a restart.
+    ///
+    /// Fire-and-forget display material — a write failure is not a runtime
+    /// fault — but it must not let an OLDER card overwrite a newer one, nor
+    /// leave a half-written file to be read as "no result". Writes are
+    /// serialized through one gate and committed by rename, and a snapshot
+    /// whose revision is not newer than what was already committed is
+    /// dropped.
+    fn persist_result_card(&mut self) {
+        let Some(state_dir) = self.state_dir.clone() else {
             return;
         };
+        self.result_card.revision = self.result_card.revision.saturating_add(1);
+        let revision = self.result_card.revision;
         let Ok(bytes) = serde_json::to_vec(&self.result_card) else {
             return;
         };
         let path = state_dir.join("artifacts").join("result-card-latest.json");
+        let gate = std::sync::Arc::clone(&self.card_snapshot_gate);
         tokio::spawn(async move {
-            if let Some(parent) = path.parent() {
-                let _ = tokio::fs::create_dir_all(parent).await;
+            let mut state = gate.lock().await;
+            if revision <= state.last_written_revision {
+                // A newer snapshot already landed; an older one must never
+                // overwrite it just because it finished later.
+                return;
             }
-            let _ = tokio::fs::write(&path, bytes).await;
+            let Some(parent) = path.parent() else {
+                return;
+            };
+            if tokio::fs::create_dir_all(parent).await.is_err() {
+                return;
+            }
+            // Write-then-rename: a reader never observes a partial card.
+            let staging = path.with_extension(format!("json.tmp-{revision}"));
+            if tokio::fs::write(&staging, &bytes).await.is_err() {
+                let _ = tokio::fs::remove_file(&staging).await;
+                return;
+            }
+            if tokio::fs::rename(&staging, &path).await.is_err() {
+                let _ = tokio::fs::remove_file(&staging).await;
+                return;
+            }
+            state.last_written_revision = revision;
         });
     }
 
@@ -789,6 +880,7 @@ impl AppState {
         self.unresolved_ack_debts = 0;
         self.last_checkpoint = None;
         self.result_card = ResultCard::default();
+        self.archived_cards.clear();
         self.queued_input_id = None;
         self.context = ContextDiagnostics::default();
         self.context_selected.clear();
@@ -799,6 +891,37 @@ impl AppState {
     #[cfg(test)]
     fn resync_watermark_for_test(&self) -> Option<u64> {
         self.resynced_through_seq
+    }
+
+    /// Point the review card at `task_id`. When the current card belongs to
+    /// a different task it is archived (boundedly) rather than merged, so
+    /// one task's changes can never be read under another task's completion
+    /// header.
+    fn begin_card_for_task(&mut self, task_id: Option<TaskId>) {
+        if self.result_card.task_id == task_id {
+            return;
+        }
+        if self.result_card.is_empty() {
+            self.result_card = ResultCard::default();
+        } else {
+            self.archived_cards
+                .push(std::mem::take(&mut self.result_card));
+            let overflow = self.archived_cards.len().saturating_sub(MAX_ARCHIVED_CARDS);
+            if overflow > 0 {
+                self.archived_cards.drain(..overflow);
+            }
+        }
+        self.result_card.task_id = task_id;
+    }
+
+    /// The card `/review` renders: the focused task's own material when it
+    /// has any, otherwise the most recently finished task's. Never a blend
+    /// of two tasks.
+    pub fn review_card(&self) -> Option<&ResultCard> {
+        if !self.result_card.is_empty() {
+            return Some(&self.result_card);
+        }
+        self.archived_cards.last()
     }
 
     pub fn apply_runtime_event(&mut self, envelope: RuntimeEventEnvelope) {
@@ -876,9 +999,14 @@ impl AppState {
                 }
             }
             RuntimeEvent::FocusChanged { task_id, goal } => {
+                // A different task gets a different review card. Keeping one
+                // card across a task switch is what let task B's changes
+                // render under task A's durable completion header.
+                self.begin_card_for_task(Some(task_id));
                 self.push_system(format!("focus -> task {task_id}: {goal}"));
             }
             RuntimeEvent::FocusCleared => {
+                self.begin_card_for_task(None);
                 self.push_system("focus cleared (task suspended)".into());
             }
             RuntimeEvent::TaskToolRequirementsChanged {
@@ -1204,6 +1332,9 @@ impl AppState {
                         path: bounded_card_line(path),
                         tool: output.tool_name.clone(),
                         ok: output.ok,
+                        // Attributed to the card's own task, so a path that
+                        // both tasks touched is still two facts, not one.
+                        task_id: self.result_card.task_id,
                     };
                     let slot = self
                         .result_card
@@ -1215,19 +1346,26 @@ impl AppState {
                         None => {
                             if self.result_card.changed_files.len() < MAX_CARD_FILES {
                                 self.result_card.changed_files.push(entry);
+                            } else {
+                                // The cap refused the entry: count it so the
+                                // omission is visible rather than silent.
+                                self.result_card.omitted_files += 1;
                             }
                         }
                     }
                 }
-                if is_verification_tool(&output.tool_name)
-                    && self.result_card.checks.len() < MAX_CARD_CHECKS
-                {
-                    self.result_card.checks.push(CardCheck {
-                        tool: output.tool_name.clone(),
-                        ok: output.ok,
-                        summary: bounded_card_line(&output.summary),
-                        artifact: output.artifact_ref.clone(),
-                    });
+                if is_verification_tool(&output.tool_name) {
+                    if self.result_card.checks.len() < MAX_CARD_CHECKS {
+                        self.result_card.checks.push(CardCheck {
+                            tool: output.tool_name.clone(),
+                            ok: output.ok,
+                            summary: bounded_card_line(&output.summary),
+                            artifact: output.artifact_ref.clone(),
+                            task_id: self.result_card.task_id,
+                        });
+                    } else {
+                        self.result_card.omitted_checks += 1;
+                    }
                 }
                 let text = tool_transcript_text(&output);
                 // Identity-deduped like the other transcript rows: a
@@ -1302,6 +1440,10 @@ impl AppState {
                 ..
             } => {
                 self.current_task = None;
+                // The completion header belongs to the task it names, so the
+                // card is bound to that task: material recorded for a
+                // different task must never render under this header.
+                self.result_card.task_id = Some(task_id);
                 self.result_card.completion = Some(CardCompletion {
                     task_id,
                     anchor_revision,
@@ -1423,10 +1565,18 @@ impl AppState {
                             .into(),
                     );
                 }
-                if !retryable && self.result_card.failures.len() < MAX_CARD_FAILURES {
-                    self.result_card
-                        .failures
-                        .push(bounded_card_line(&format!("({class:?}) {message}")));
+                if !retryable {
+                    if self.result_card.failures.len() < MAX_CARD_FAILURES {
+                        self.result_card.failures.push(CardFailure {
+                            summary: bounded_card_line(&format!("({class:?}) {message}")),
+                            task_id: self.result_card.task_id,
+                        });
+                    } else {
+                        // A late failure must not vanish just because the
+                        // card is full: the omission is counted so `/review`
+                        // can say material was dropped.
+                        self.result_card.omitted_failures += 1;
+                    }
                 }
             }
             RuntimeEvent::ModelRetrying {
@@ -1556,6 +1706,10 @@ pub fn format_result_lines(card: &ResultCard) -> Vec<String> {
         ];
     }
     let mut lines = Vec::new();
+    let scope = match card.task_id {
+        Some(task_id) => format!("task {task_id}"),
+        None => "no focused task".to_string(),
+    };
     match &card.completion {
         Some(completion) => {
             lines.push(format!(
@@ -1564,17 +1718,21 @@ pub fn format_result_lines(card: &ResultCard) -> Vec<String> {
             ));
         }
         None => {
-            lines.push(
-                "review: no durable task completion this session — awaiting operator review (/done closes durably); below is what this \
-                 session's tools did so far"
-                    .into(),
-            );
+            lines.push(format!(
+                "review: {scope} — no durable task completion this session; awaiting operator \
+                 review (/done closes durably). Below is only this task's own material"
+            ));
         }
     }
     if card.changed_files.is_empty() {
         lines.push("  changed files: none recorded from this session's tool calls".into());
     } else {
         lines.push("  changed files (this session's tools only):".into());
+        lines.push(format!(
+            "    scope: {scope} — showing {} of {} recorded",
+            card.changed_files.len().min(MAX_CARD_FILES),
+            card.changed_files.len().saturating_add(card.omitted_files)
+        ));
         for file in card.changed_files.iter().take(MAX_CARD_FILES) {
             lines.push(format!(
                 "    {} {} [{}]",
@@ -1583,12 +1741,14 @@ pub fn format_result_lines(card: &ResultCard) -> Vec<String> {
                 if file.ok { "ok" } else { "FAILED" }
             ));
         }
-        let overflow = card.changed_files.len().saturating_sub(MAX_CARD_FILES);
-        if overflow > 0 {
-            lines.push(format!("    …and {overflow} more files"));
+        if card.omitted_files > 0 {
+            lines.push(format!(
+                "    …and {} more files were NOT shown (beyond the display cap)",
+                card.omitted_files
+            ));
         }
     }
-    if card.checks.is_empty() {
+    if card.checks.is_empty() && card.omitted_checks == 0 {
         lines.push(
             "  checks: none recorded — a green transcript is not verification; run \
              verify.run or an equivalent check"
@@ -1596,6 +1756,13 @@ pub fn format_result_lines(card: &ResultCard) -> Vec<String> {
         );
     } else {
         lines.push("  checks run:".into());
+        lines.push(format!(
+            "    scope: {scope} — {} recorded, {} FAILED, {} not shown (display cap {})",
+            card.total_checks(),
+            card.failed_checks(),
+            card.omitted_checks,
+            MAX_CARD_CHECKS
+        ));
         for check in card.checks.iter().take(MAX_CARD_CHECKS) {
             let artifact = check
                 .artifact
@@ -1609,15 +1776,25 @@ pub fn format_result_lines(card: &ResultCard) -> Vec<String> {
                 check.summary
             ));
         }
-        let overflow = card.checks.len().saturating_sub(MAX_CARD_CHECKS);
-        if overflow > 0 {
-            lines.push(format!("    …and {overflow} more checks"));
+        if card.omitted_checks > 0 {
+            lines.push(format!(
+                "    …and {} more checks were NOT shown (beyond the display cap); \
+                 {} of the recorded checks FAILED",
+                card.omitted_checks,
+                card.failed_checks()
+            ));
         }
     }
-    if !card.failures.is_empty() {
+    if !card.failures.is_empty() || card.omitted_failures > 0 {
         lines.push("  unresolved failures this session:".into());
         for failure in card.failures.iter().take(MAX_CARD_FAILURES) {
-            lines.push(format!("    {failure}"));
+            lines.push(format!("    {}", failure.summary));
+        }
+        if card.omitted_failures > 0 {
+            lines.push(format!(
+                "    …and {} more failures were NOT shown (beyond the display cap)",
+                card.omitted_failures
+            ));
         }
     }
     lines.push(
@@ -2168,6 +2345,163 @@ mod tests {
         let card: ResultCard = serde_json::from_slice(&bytes).unwrap();
         assert_eq!(card.changed_files.len(), 1);
         assert!(card.completion.is_some());
+    }
+
+    /// Task A's durable completion header must never sit above task B's
+    /// changes, and B's review must not list A's material.
+    #[test]
+    fn a_completed_tasks_header_never_covers_another_tasks_changes() {
+        let mut app = AppState::new(RunId::new());
+        let task_a = TaskId::new();
+        let task_b = TaskId::new();
+        app.apply_runtime_event(envelope(RuntimeEvent::FocusChanged {
+            task_id: task_a,
+            goal: "task A".into(),
+        }));
+        app.apply_runtime_event(envelope(RuntimeEvent::ToolFinished {
+            output: tool_output("fs.write", true, "wrote a", Some("a.txt")),
+            facts: None,
+        }));
+        app.apply_runtime_event(envelope(RuntimeEvent::TaskCompleted {
+            task_id: task_a,
+            anchor_revision: 1,
+            summary: "A done".into(),
+            artifacts: Vec::new(),
+            final_output_digest: None,
+        }));
+
+        // The focus moves on: task B writes and its verification FAILS.
+        app.apply_runtime_event(envelope(RuntimeEvent::FocusChanged {
+            task_id: task_b,
+            goal: "task B".into(),
+        }));
+        app.apply_runtime_event(envelope(RuntimeEvent::ToolFinished {
+            output: tool_output("fs.write", true, "wrote b", Some("b.txt")),
+            facts: None,
+        }));
+        app.apply_runtime_event(envelope(RuntimeEvent::ToolFinished {
+            output: tool_output("verify.run", false, "2 assertions failed", None),
+            facts: None,
+        }));
+
+        let card = app
+            .review_card()
+            .expect("task B must have review material")
+            .clone();
+        assert_eq!(
+            card.task_id,
+            Some(task_b),
+            "the card must belong to the task being reviewed"
+        );
+        assert!(
+            card.completion.is_none(),
+            "task B must not inherit task A's completion header"
+        );
+        let rendered = format_result_lines(&card).join("\n");
+        assert!(
+            !rendered.contains("A done"),
+            "task A's durable completion must not cover task B: {rendered}"
+        );
+        assert!(
+            !rendered.contains("a.txt"),
+            "task A's change must not appear in task B's review: {rendered}"
+        );
+        assert!(rendered.contains("b.txt"), "{rendered}");
+        assert!(rendered.contains("FAILED"), "{rendered}");
+    }
+
+    /// A failure that arrives after the display cap is full must still be
+    /// visible as a count — the old `len - cap` arithmetic could never see
+    /// it, so the entry silently vanished from the review.
+    #[test]
+    fn a_failed_check_beyond_the_card_cap_is_counted_not_hidden() {
+        let mut app = AppState::new(RunId::new());
+        for index in 0..MAX_CARD_CHECKS {
+            app.apply_runtime_event(envelope(RuntimeEvent::ToolFinished {
+                output: tool_output("verify.run", true, &format!("check {index} passed"), None),
+                facts: None,
+            }));
+        }
+        app.apply_runtime_event(envelope(RuntimeEvent::ToolFinished {
+            output: tool_output("verify.run", false, "check 33 FAILED", None),
+            facts: None,
+        }));
+
+        assert_eq!(app.result_card.checks.len(), MAX_CARD_CHECKS);
+        assert_eq!(
+            app.result_card.omitted_checks, 1,
+            "the refused check must be counted, not dropped"
+        );
+        assert_eq!(app.result_card.total_checks(), MAX_CARD_CHECKS + 1);
+        let rendered = format_result_lines(&app.result_card).join("\n");
+        assert!(
+            rendered.contains("more checks were NOT shown"),
+            "the review must name the omission: {rendered}"
+        );
+        assert!(
+            rendered.contains(&format!("{} recorded", MAX_CARD_CHECKS + 1)),
+            "the review must report the true total: {rendered}"
+        );
+    }
+
+    /// Snapshots are versioned and committed by rename: the newest card is
+    /// what survives, and no staging file is left for a reader to trip on.
+    #[tokio::test]
+    async fn card_snapshots_are_versioned_and_committed_atomically() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = AppState::new(RunId::new());
+        app.state_dir = Some(dir.path().to_path_buf());
+        let task = TaskId::new();
+        app.apply_runtime_event(envelope(RuntimeEvent::FocusChanged {
+            task_id: task,
+            goal: "g".into(),
+        }));
+        app.apply_runtime_event(envelope(RuntimeEvent::ToolFinished {
+            output: tool_output("fs.write", true, "wrote", Some("one.txt")),
+            facts: None,
+        }));
+        app.apply_runtime_event(envelope(RuntimeEvent::TaskCompleted {
+            task_id: task,
+            anchor_revision: 1,
+            summary: "first".into(),
+            artifacts: Vec::new(),
+            final_output_digest: None,
+        }));
+        // A second commit races the first one's spawned writer.
+        app.apply_runtime_event(envelope(RuntimeEvent::ToolFinished {
+            output: tool_output("fs.write", true, "wrote", Some("two.txt")),
+            facts: None,
+        }));
+        app.persist_result_card();
+
+        let path = dir.path().join("artifacts/result-card-latest.json");
+        let mut newest = None;
+        for _ in 0..300 {
+            if let Ok(bytes) = tokio::fs::read(&path).await
+                && let Ok(parsed) = serde_json::from_slice::<ResultCard>(&bytes)
+                && parsed.revision >= 2
+            {
+                newest = Some(parsed);
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        let newest = newest.expect("the newest snapshot must be committed");
+        assert_eq!(
+            newest.changed_files.len(),
+            2,
+            "the newer card must win: {newest:?}"
+        );
+        let mut entries = tokio::fs::read_dir(dir.path().join("artifacts"))
+            .await
+            .unwrap();
+        while let Ok(Some(entry)) = entries.next_entry().await {
+            let name = entry.file_name().to_string_lossy().to_string();
+            assert!(
+                !name.contains(".tmp-"),
+                "a staging file must not survive the commit: {name}"
+            );
+        }
     }
 
     #[test]
