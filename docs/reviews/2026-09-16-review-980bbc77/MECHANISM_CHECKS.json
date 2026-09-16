@@ -1,0 +1,39 @@
+{
+  "baseline": "980bbc77f4086ebf8848f5c9afa16ce22fafe39f",
+  "evidence_kind": "Python mechanism checks; not compiled repository regressions",
+  "body_projection": {
+    "original_chars": 34825,
+    "projected_chars": 16000,
+    "middle_sentinel_retained": false,
+    "unchanged_metadata_implies_complete": true,
+    "unchanged_metadata_implies_whole_file": true
+  },
+  "integer_domain": {
+    "left": 9007199254740992,
+    "right": 9007199254740993,
+    "distinct_exact_integers": true,
+    "same_binary64": true,
+    "narrow_example_canonical": "{\"n\":9007199254740992}",
+    "same_example_sha256": "66c87d9cb3014e05a11baa97df62282d89d425f22ee15816577c84534e2ef1bb",
+    "not_a_cryptographic_hash_collision": true
+  },
+  "ci_selection": {
+    "workspace_packages": 20,
+    "linux_selected_packages": 19,
+    "missing": [
+      "agent-host"
+    ],
+    "overlap": []
+  },
+  "small_output_budget_observation": {
+    "declared_chars": 1,
+    "returned_chars": 77
+  },
+  "not_executed": [
+    "Rust builds/tests",
+    ".NET builds/tests",
+    "PTY tests",
+    "provider calls",
+    "unsafe mkfifo fixture"
+  ]
+}

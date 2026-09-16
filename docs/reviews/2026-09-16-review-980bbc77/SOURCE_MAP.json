@@ -1,0 +1,250 @@
+{
+  "baseline": "980bbc77f4086ebf8848f5c9afa16ce22fafe39f",
+  "files": [
+    {
+      "path": "docs/reviews/2026-09-16-review-6afa25df/QA_QB_QC_QD_RECEIPT.md",
+      "read_ranges": "全文",
+      "connector_refs": [
+        "turn459file0"
+      ],
+      "connector_line_range": "L2-L2",
+      "url": "https://github.com/Ye-Luo-0912/context-agent-prototype/blob/980bbc77f4086ebf8848f5c9afa16ce22fafe39f/docs/reviews/2026-09-16-review-6afa25df/QA_QB_QC_QD_RECEIPT.md",
+      "note": "核对上轮回执；回执测试数不等于本轮执行"
+    },
+    {
+      "path": "crates/agent-workspace/src/broker.rs",
+      "read_ranges": "1–340",
+      "connector_refs": [
+        "turn464file0"
+      ],
+      "connector_line_range": "L2-L2",
+      "url": "https://github.com/Ye-Luo-0912/context-agent-prototype/blob/980bbc77f4086ebf8848f5c9afa16ce22fafe39f/crates/agent-workspace/src/broker.rs",
+      "note": "正文截断、元数据保留、工件与预算"
+    },
+    {
+      "path": "crates/tool-runtime/src/tools/fs.rs",
+      "read_ranges": "1–585",
+      "connector_refs": [
+        "turn465file0",
+        "turn466file0"
+      ],
+      "connector_line_range": "L2-L2",
+      "url": "https://github.com/Ye-Luo-0912/context-agent-prototype/blob/980bbc77f4086ebf8848f5c9afa16ce22fafe39f/crates/tool-runtime/src/tools/fs.rs",
+      "note": "目录读取与 fs.read 原始范围声明"
+    },
+    {
+      "path": "crates/agent-runtime/src/prompt.rs",
+      "read_ranges": "300–530；550–1000；1320–1500",
+      "connector_refs": [
+        "turn468file0",
+        "turn469file0",
+        "turn513file0",
+        "turn514file0"
+      ],
+      "connector_line_range": "L2-L2",
+      "url": "https://github.com/Ye-Luo-0912/context-agent-prototype/blob/980bbc77f4086ebf8848f5c9afa16ce22fafe39f/crates/agent-runtime/src/prompt.rs",
+      "note": "最终层次、恢复窗口、历史正文省略"
+    },
+    {
+      "path": "crates/agent-runtime/src/output.rs",
+      "read_ranges": "全文",
+      "connector_refs": [
+        "turn470file0"
+      ],
+      "connector_line_range": "L2-L2",
+      "url": "https://github.com/Ye-Luo-0912/context-agent-prototype/blob/980bbc77f4086ebf8848f5c9afa16ce22fafe39f/crates/agent-runtime/src/output.rs",
+      "note": "Runtime 兜底截断及内联测试"
+    },
+    {
+      "path": "crates/agent-core/src/authority.rs",
+      "read_ranges": "1–330",
+      "connector_refs": [
+        "turn473file0"
+      ],
+      "connector_line_range": "L2-L2",
+      "url": "https://github.com/Ye-Luo-0912/context-agent-prototype/blob/980bbc77f4086ebf8848f5c9afa16ce22fafe39f/crates/agent-core/src/authority.rs",
+      "note": "输出经纪接线、事件发布"
+    },
+    {
+      "path": "clients/dotnet/Agent.Client/ResumableSession.cs",
+      "read_ranges": "115–385",
+      "connector_refs": [
+        "turn474file0"
+      ],
+      "connector_line_range": "L2-L2",
+      "url": "https://github.com/Ye-Luo-0912/context-agent-prototype/blob/980bbc77f4086ebf8848f5c9afa16ce22fafe39f/clients/dotnet/Agent.Client/ResumableSession.cs",
+      "note": "更新后的连接/队列代际安装"
+    },
+    {
+      "path": "crates/agent-storage/src/lib.rs",
+      "read_ranges": "1–370",
+      "connector_refs": [
+        "turn475file0"
+      ],
+      "connector_line_range": "L2-L2",
+      "url": "https://github.com/Ye-Luo-0912/context-agent-prototype/blob/980bbc77f4086ebf8848f5c9afa16ce22fafe39f/crates/agent-storage/src/lib.rs",
+      "note": "操作日志初始化、持久状态边界"
+    },
+    {
+      "path": "crates/context-simple/src/index/external.rs",
+      "read_ranges": "1–650",
+      "connector_refs": [
+        "turn478file0",
+        "turn479file0"
+      ],
+      "connector_line_range": "L2-L2",
+      "url": "https://github.com/Ye-Luo-0912/context-agent-prototype/blob/980bbc77f4086ebf8848f5c9afa16ce22fafe39f/crates/context-simple/src/index/external.rs",
+      "note": "冷热迁移、卡片认领、访问戳"
+    },
+    {
+      "path": "crates/agent-workspace/src/handles.rs",
+      "read_ranges": "全文",
+      "connector_refs": [
+        "turn480file0"
+      ],
+      "connector_line_range": "L2-L2",
+      "url": "https://github.com/Ye-Luo-0912/context-agent-prototype/blob/980bbc77f4086ebf8848f5c9afa16ce22fafe39f/crates/agent-workspace/src/handles.rs",
+      "note": "受限句柄及读取/准备写入"
+    },
+    {
+      "path": "crates/agent-runtime/src/capability/mod.rs",
+      "read_ranges": "1–300",
+      "connector_refs": [
+        "turn482file0"
+      ],
+      "connector_line_range": "L2-L2",
+      "url": "https://github.com/Ye-Luo-0912/context-agent-prototype/blob/980bbc77f4086ebf8848f5c9afa16ce22fafe39f/crates/agent-runtime/src/capability/mod.rs",
+      "note": "能力登记、锁/状态职责与表面缓存"
+    },
+    {
+      "path": "crates/agent-workspace/src/runtime_facts.rs",
+      "read_ranges": "全文",
+      "connector_refs": [
+        "turn485file0"
+      ],
+      "connector_line_range": "L2-L2",
+      "url": "https://github.com/Ye-Luo-0912/context-agent-prototype/blob/980bbc77f4086ebf8848f5c9afa16ce22fafe39f/crates/agent-workspace/src/runtime_facts.rs",
+      "note": "运行事实与 Unix FIFO 测试"
+    },
+    {
+      "path": "crates/agent-contracts/src/jcs.rs",
+      "read_ranges": "全文",
+      "connector_refs": [
+        "turn487file0"
+      ],
+      "connector_line_range": "L2-L2",
+      "url": "https://github.com/Ye-Luo-0912/context-agent-prototype/blob/980bbc77f4086ebf8848f5c9afa16ce22fafe39f/crates/agent-contracts/src/jcs.rs",
+      "note": "规范序列化、数值域与现有样例"
+    },
+    {
+      "path": "crates/agent-contracts/src/operation.rs",
+      "read_ranges": "1–220",
+      "connector_refs": [
+        "turn489file0"
+      ],
+      "connector_line_range": "L2-L2",
+      "url": "https://github.com/Ye-Luo-0912/context-agent-prototype/blob/980bbc77f4086ebf8848f5c9afa16ce22fafe39f/crates/agent-contracts/src/operation.rs",
+      "note": "ArgumentDigest 构造"
+    },
+    {
+      "path": "crates/agent-contracts/src/tool.rs",
+      "read_ranges": "1–200",
+      "connector_refs": [
+        "turn491file0"
+      ],
+      "connector_line_range": "L2-L2",
+      "url": "https://github.com/Ye-Luo-0912/context-agent-prototype/blob/980bbc77f4086ebf8848f5c9afa16ce22fafe39f/crates/agent-contracts/src/tool.rs",
+      "note": "输出契约、上限与效果意图"
+    },
+    {
+      "path": "crates/agent-contracts/src/schema_profile.rs",
+      "read_ranges": "1–680",
+      "connector_refs": [
+        "turn493file0",
+        "turn494file0"
+      ],
+      "connector_line_range": "L2-L2",
+      "url": "https://github.com/Ye-Luo-0912/context-agent-prototype/blob/980bbc77f4086ebf8848f5c9afa16ce22fafe39f/crates/agent-contracts/src/schema_profile.rs",
+      "note": "数值校验、数值上下限及模式编译"
+    },
+    {
+      "path": "crates/agent-core/src/kernel/mod.rs",
+      "read_ranges": "570–1335；1600–1890",
+      "connector_refs": [
+        "turn496file0",
+        "turn497file0",
+        "turn509file0",
+        "turn510file0"
+      ],
+      "connector_line_range": "L2-L2",
+      "url": "https://github.com/Ye-Luo-0912/context-agent-prototype/blob/980bbc77f4086ebf8848f5c9afa16ce22fafe39f/crates/agent-core/src/kernel/mod.rs",
+      "note": "检索输出、operation 参数绑定、派发与恢复辅助"
+    },
+    {
+      "path": "crates/context-simple/src/engine.rs",
+      "read_ranges": "1120–1440；1490–1705；1830–2085；2330–2660；3430–3780",
+      "connector_refs": [
+        "turn499file0",
+        "turn500file0",
+        "turn501file0",
+        "turn502file0",
+        "turn503file0"
+      ],
+      "connector_line_range": "L2-L2",
+      "url": "https://github.com/Ye-Luo-0912/context-agent-prototype/blob/980bbc77f4086ebf8848f5c9afa16ce22fafe39f/crates/context-simple/src/engine.rs",
+      "note": "冷页消费确认、查询续查、存储捕获与 GC 周边"
+    },
+    {
+      "path": ".github/workflows/ci.yml",
+      "read_ranges": "全文",
+      "connector_refs": [
+        "turn504file0"
+      ],
+      "connector_line_range": "L2-L2",
+      "url": "https://github.com/Ye-Luo-0912/context-agent-prototype/blob/980bbc77f4086ebf8848f5c9afa16ce22fafe39f/.github/workflows/ci.yml",
+      "note": "构建/运行区分、Linux 分片选择"
+    },
+    {
+      "path": "Cargo.toml",
+      "read_ranges": "全文",
+      "connector_refs": [
+        "turn505file0"
+      ],
+      "connector_line_range": "L2-L2",
+      "url": "https://github.com/Ye-Luo-0912/context-agent-prototype/blob/980bbc77f4086ebf8848f5c9afa16ce22fafe39f/Cargo.toml",
+      "note": "20 个 workspace member、依赖声明"
+    },
+    {
+      "path": "crates/agent-host/Cargo.toml",
+      "read_ranges": "全文",
+      "connector_refs": [
+        "turn506file0"
+      ],
+      "connector_line_range": "L2-L2",
+      "url": "https://github.com/Ye-Luo-0912/context-agent-prototype/blob/980bbc77f4086ebf8848f5c9afa16ce22fafe39f/crates/agent-host/Cargo.toml",
+      "note": "宿主包身份及平台依赖"
+    },
+    {
+      "path": "crates/agent-tui/src/session.rs",
+      "read_ranges": "450–910",
+      "connector_refs": [
+        "turn507file0",
+        "turn508file0"
+      ],
+      "connector_line_range": "L2-L2",
+      "url": "https://github.com/Ye-Luo-0912/context-agent-prototype/blob/980bbc77f4086ebf8848f5c9afa16ce22fafe39f/crates/agent-tui/src/session.rs",
+      "note": "命令注册、正常/异常共同收尾"
+    },
+    {
+      "path": "crates/provider-openai/src/lib.rs",
+      "read_ranges": "425–780",
+      "connector_refs": [
+        "turn512file0",
+        "turn517file0"
+      ],
+      "connector_line_range": "L2-L2",
+      "url": "https://github.com/Ye-Luo-0912/context-agent-prototype/blob/980bbc77f4086ebf8848f5c9afa16ce22fafe39f/crates/provider-openai/src/lib.rs",
+      "note": "attempt 结算 helper、Chat 全部收口及 Responses 入口"
+    }
+  ]
+}
