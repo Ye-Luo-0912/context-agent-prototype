@@ -6,7 +6,7 @@
 
 先核对当前分支、HEAD 和未提交 diff（并行分支在飞）。MERGED 只说明代码进入目标分支，不代表 CI 或真实供应商验收通过。本轮 A=执行核心/工具，B=上下文/GC/搜索，C=平台/供应商 KV。共享 contracts/ModelInput/缓存契约由单一集成人维护。
 
-**当前开工顺序：U6（保序命令提交与慢 I/O 离开绘制循环，`session.rs`）为 A 线最后一片；B1/B2 待 `context-simple` 的在飞改动收口后接续（该文件当前有他人在未提交改动）。** A1（U1＋U2）、A2（U3＋U4）、A4（U7）已于 2026-09-16 关闭，A3 只剩 U6。历史顺序（已关闭）：T1/T2/T3 并行（第一批）；T4/T6 并行（第二批）；T5 随组合点接入；T7 收尾；T8 条件任务。每片先写用户动作与目标反例，再做实现；可维护性边界（见审查报告「四个责任边界」节）随片交付，不另起全仓重写；同一 crate 内多个切片按文件所有权串行，不并行互踩。
+**当前开工顺序：A 线 U 系列已全部关闭。下一步是 B1/B2（`context-simple`）——但该文件当前有他人在未提交改动，须等其收口后再接续；C 线（实际请求序列的 KV 与成本）可在不触碰 `context-simple` 的前提下并行推进。** A1（U1＋U2）、A2（U3＋U4）、A3（U5＋U6）、A4（U7）已于 2026-09-16 关闭。历史顺序（已关闭）：T1/T2/T3 并行（第一批）；T4/T6 并行（第二批）；T5 随组合点接入；T7 收尾；T8 条件任务。每片先写用户动作与目标反例，再做实现；可维护性边界（见审查报告「四个责任边界」节）随片交付，不另起全仓重写；同一 crate 内多个切片按文件所有权串行，不并行互踩。
 
 ## S1 — 冷目录测试自锁（已关闭 2026-09-15）
 
@@ -89,7 +89,7 @@ T4 一期/二期已有预算与降级，但"有界"仍是局部控制（续审 R
 - 停止：现场画面、`/status`、`/review` 与相同已验证事件视图一致；旧事件不能反向激活操作。
 - 落地回执：[A2_U3_U4_EVENT_MODEL_AND_REVIEW_RECEIPT](reviews/2026-09-16-review-d92564bc/A2_U3_U4_EVENT_MODEL_AND_REVIEW_RECEIPT.md)。U3：`apply_runtime_event` 先 claim `(RunId, seq)`，claim 被拒即**整体返回**（不再只跳投影折叠）；折叠体抽到 `apply_event` 且**重放调用同一函数**；`resync_projection` 先归零事件派生字段（`reset_event_derived_view`，纯界面状态与追加型转录不动）再重建；转录行按事件身份去重（`claim_message_row`）＋用户气泡按 `input_id`，5 处正文比对删除；`AssistantMessage` 只终结本轮自己流式打开的行（`streaming_row_open`）；`StatusProjection` 补折叠 `TurnCancelled`；坏行/短读/序列缺口 → `view_partial`＋原因，只在可验证连续前缀设水位。U4：`ResultCard` 增 `task_id`＋单调 `revision`＋`omitted_*` 计数，切换任务**归档**旧卡（有界 8 张），`/review` 走 `review_card()`（当前任务卡，否则最近归档卡，永不混合）；容量拒绝即计数并在 review 明示；快照单写者 gate＋写临时文件 rename 提交。8 条新测试，6 处变异恢复法复验转红后 sha256 还原。agent-tui 83/0、real_binary_startup 2/0、agent-runtime `status::` 5/5、clippy 0、fmt clean。**限制**：未跑 agent-runtime 全量（他人在 `execution/`、`actor/` 有未提交改动）与 workspace 全量 CI；归档上限 8 张、不能按 TaskId 查任意历史；`view_partial` 未覆盖 live `Lagged` 缺口；快照写入失败不重试。
 
-### A3 — 保序控制与可退出的终端（U5＋U6，agent-tui）——**部分关闭**：U5 已关闭（2026-09-16，`296ec005`）；**U6 待做**
+### A3 — 保序控制与可退出的终端（U5＋U6，agent-tui）——已关闭（2026-09-16，U5 `296ec005`／U6 `96c0e5c3`）
 用户动作：终端在任何早退/异常/退出路径后都恢复；用户键入顺序就是命令提交顺序；慢磁盘操作期间仍能取消/退出。
 - U5：`main.rs` 手工 `enable_raw_mode` → `EnterAlternateScreen` → `Terminal::new` → clear，raw 开启后任一 `?` 早退可绕过尾部恢复；正常退出先 `await composed.shutdown()` 才关 raw/退出 alternate/显示光标；手工 `Terminal::new` 不等于安装 panic hook。
 - U6：`/focus`、`/task`、`/done`、`/continue` 各自 detached spawn，Actor 只保证"到达之后"的顺序；`/checkpoint`、`/restore`（含磁盘读）在输入循环内直接 await，占住唯一的输入/绘制循环。
@@ -97,7 +97,7 @@ T4 一期/二期已有预算与降级，但"有界"仍是局部控制（续审 R
 - 红例：raw 开启后注入 alternate/创建终端失败/绘制失败/session 返 Err/Runtime shutdown 慢/panic 各路径终端均恢复；人为延迟 `/task` 发送后再 `/continue` 不得推进旧任务；恢复读取被暂停时仍能处理退出/取消；已取消回执不覆盖新代际；事件洪泛时键盘响应仍有界。
 - 停止：不因前端调度重排用户动作；终端先恢复，Runtime 按既有规则完成取消与清理。
 - **U5 落地回执**：[A3_A4_U5_U7_TERMINAL_AND_HEADLESS_RECEIPT](reviews/2026-09-16-review-d92564bc/A3_A4_U5_U7_TERMINAL_AND_HEADLESS_RECEIPT.md)。`TerminalGuard` 经 `TermBackend` 抽象跟踪本进程已启用状态，早退/失败先回滚部分状态再返回错误，`Drop`＋panic hook（链回原 hook）恢复；终端释放排在 `composed.shutdown()` **之前**，两类错误分别聚合。2 条可注入 backend 单测，变异恢复法复验。
-- **U6 待做（本片剩余）**：`session.rs` 仍有 20 处 detached `tokio::spawn`——`/focus`、`/task`、`/done`、`/continue` 不保证按用户键入顺序送达；`/checkpoint`、`/restore` 仍在输入循环内 `await`（慢盘占住绘制循环）；未使用 Runtime 已有的 `expected_task_id` 接口。先补红例：人为延迟 `/task` 发送后再 `/continue` 不得推进旧任务；恢复读取被暂停时仍能处理退出/取消；已取消回执不覆盖新代际；事件洪泛时键盘响应仍有界。
+- **U6 落地回执**：[A3_U6_ORDERED_COMMANDS_RECEIPT](reviews/2026-09-16-review-d92564bc/A3_U6_ORDERED_COMMANDS_RECEIPT.md)。有界命令队列（32）＋唯一 worker：任务动作与 `/checkpoint`、`/restore` 按键入顺序执行；满队/worker 消失显式报告不静默丢弃；`/continue`、`/suspend` 用 `*_expecting` 绑定操作员观察到的任务，不匹配不启动回合并点名两侧；`/done` 前置快照比对后拒绝；worker 持 `checkpoint_plane()` 使运行时捕获与原子存储写**离开绘制线程**（artifact 经类型化 `ViewFact` 回传）；每帧 drain 有预算；`/quit`、`/cancel` 不排队。4 条新测试＋既有 e2e 全链路复跑，2 处变异恢复法复验转红。agent-tui 87/0、clippy 0、fmt clean。**限制**：`/done` 非原子（`CompleteTask` 无 expecting 变体，属共享契约后续项）；身份不匹配只有文案级单测无一 e2e；只读命令之间不保证顺序；慢 I/O 只离开绘制循环未离开运行时；未跑 workspace 全量 CI。
 
 ### A4 — headless 正面终态与完整性（U7，agent-tui）——已关闭（2026-09-16，`296ec005`）
 用户动作：headless 只有拿到相关任务/回合的正面终态证据才报成功；事件有缺口时明确报告不完整。
