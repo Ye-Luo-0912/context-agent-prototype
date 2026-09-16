@@ -1333,35 +1333,37 @@ impl SimpleContextEngine {
         // artifact write runs without the state lock. Serialize it with
         // restore and every other state-changing operation.
         let _gate = self.op_gate.lock().await;
+        // B3: SNAPSHOT the rows; do not remove them yet. The previous shape did
+        // `mem::take` and only merged the rows back on an I/O error, so a
+        // cancelled export — the future dropped while it awaited the write or
+        // the rename — never reached that error branch and the rows went with
+        // the local variable. Committing first and confirming the consumption
+        // afterwards is what makes the removal happen only for an artifact that
+        // actually exists.
         let rows: Vec<agent_contracts::ContextLifecycleRecord> = {
-            let mut state = self.state.lock().await;
-            std::mem::take(&mut state.ledger)
+            let state = self.state.lock().await;
+            state.ledger.iter().cloned().collect()
         };
         if rows.is_empty() {
             return Ok(0);
         }
         let text = crate::ledger::encode(&rows);
         let tmp = path.with_extension("jsonl.tmp");
-        // The temp write and rename run as async IO rather than blocking
-        // calls; when either fails, the taken rows are merged back (FIFO,
-        // bounded) so an export failure loses no row.
-        let outcome = async {
-            tokio::fs::write(&tmp, text).await.map_err(|error| {
-                agent_contracts::AgentError::Storage(format!("write ledger artifact: {error}"))
-            })?;
-            tokio::fs::rename(&tmp, path).await.map_err(|error| {
-                agent_contracts::AgentError::Storage(format!("commit ledger artifact: {error}"))
-            })?;
-            Ok::<usize, agent_contracts::AgentError>(rows.len())
-        }
-        .await;
-        match outcome {
-            Ok(count) => Ok(count),
-            Err(error) => {
-                crate::ledger::merge_back(&mut *self.state.lock().await, rows);
-                Err(error)
-            }
-        }
+        // The temp write and rename run as async IO rather than blocking calls.
+        // A failure here changes nothing: the buffer still owns every row.
+        tokio::fs::write(&tmp, text).await.map_err(|error| {
+            agent_contracts::AgentError::Storage(format!("write ledger artifact: {error}"))
+        })?;
+        tokio::fs::rename(&tmp, path).await.map_err(|error| {
+            agent_contracts::AgentError::Storage(format!("commit ledger artifact: {error}"))
+        })?;
+        // The artifact is committed. Now, and only now, consume exactly the
+        // rows it carries.
+        let consumed = {
+            let mut state = self.state.lock().await;
+            crate::ledger::confirm_exported(&mut state, &rows)
+        };
+        Ok(consumed)
     }
 
     /// F2 phase 2 of a capture: put the planned cards on disk with the state

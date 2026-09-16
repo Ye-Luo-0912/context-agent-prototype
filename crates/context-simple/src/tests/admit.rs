@@ -4321,6 +4321,68 @@ async fn admit_rejects_a_tampered_blob() {
     );
 }
 
+/// B3: the failure path above was covered, the CANCELLATION path was not. A
+/// future dropped while it awaits the write or the rename never runs the error
+/// branch, so the rows it had already taken went with the local variable. The
+/// export must therefore commit first and consume the rows only afterwards.
+#[tokio::test]
+async fn a_cancelled_ledger_export_consumes_nothing() {
+    let dir = tempfile::tempdir().unwrap();
+    let engine = SimpleContextEngine::new(SimpleContextConfig {
+        gc_buffer_capacity: 1,
+        context_store_dir: Some(dir.path().to_path_buf()),
+        ..SimpleContextConfig::default()
+    });
+    open_focus(&engine, "service layer").await;
+    engine
+        .ingest(ContextIngress::UserMessage {
+            content: "work on AuthService.rs".into(),
+        })
+        .await
+        .unwrap();
+    engine
+        .ingest(ContextIngress::ToolObservation {
+            facts: None,
+            output: observation_touching("step-0", true, "step: read view", Some("AuthService.rs")),
+            scope_id: None,
+        })
+        .await
+        .unwrap();
+    engine
+        .maintain(ContextMaintenanceTrigger::AfterModel)
+        .await
+        .unwrap();
+    engine.gc().await.unwrap();
+
+    let rows_before = engine.state.lock().await.ledger.len();
+    assert!(rows_before >= 2, "the fixture must own rows to lose");
+
+    let target = dir.path().join("lifecycle.jsonl");
+    {
+        // Poll the export once: the first await that can suspend is the write,
+        // so this is exactly the boundary the review names. Dropping the future
+        // there IS the cancellation — no error branch runs.
+        let mut export = std::pin::pin!(engine.export_ledger(&target));
+        let waker = std::task::Waker::noop();
+        let mut cx = std::task::Context::from_waker(waker);
+        let first = std::future::Future::poll(export.as_mut(), &mut cx);
+        assert!(
+            first.is_pending(),
+            "the export must be awaiting its artifact write at the cancellation point"
+        );
+    }
+
+    let rows_after = engine.state.lock().await.ledger.len();
+    assert_eq!(
+        rows_after, rows_before,
+        "a cancelled export must consume nothing it did not commit"
+    );
+    // The rows are still there to export, and the successful export consumes
+    // them exactly once.
+    assert_eq!(engine.export_ledger(&target).await.unwrap(), rows_before);
+    assert_eq!(engine.state.lock().await.ledger.len(), 0);
+}
+
 /// An export that cannot commit its artifact must not lose the taken rows:
 /// they merge back (FIFO, bounded) and a later export persists them.
 #[tokio::test]

@@ -67,6 +67,27 @@ pub(crate) fn merge_back(state: &mut State, rows: Vec<ContextLifecycleRecord>) {
 }
 
 /// JSONL-serialize the buffered rows (one record per line) without touching
+/// B3: confirm that an export's rows are safely in the artifact, and only then
+/// drop them from the buffer. Matching is prefix-wise: rows are appended at the
+/// back and only ever evicted from the front, so the exported rows are still the
+/// front prefix unless the bounded cap evicted some while the write was in
+/// flight. When the front no longer matches, nothing is consumed — the buffer
+/// keeps its rows rather than risk deleting a row that was never exported.
+pub(crate) fn confirm_exported(state: &mut State, exported: &[ContextLifecycleRecord]) -> usize {
+    let mut consumed = 0usize;
+    while consumed < exported.len() && consumed < state.ledger.len() {
+        if state.ledger[consumed] == exported[consumed] {
+            consumed += 1;
+        } else {
+            break;
+        }
+    }
+    if consumed > 0 {
+        state.ledger.drain(..consumed);
+    }
+    consumed
+}
+
 /// the engine state; `export_ledger` owns the file write.
 pub(crate) fn encode(rows: &[ContextLifecycleRecord]) -> String {
     let mut out = String::new();

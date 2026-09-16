@@ -1920,7 +1920,7 @@ pub enum LifecycleAxis {
 /// on demand (export is never on the context hot path). Every row answers
 /// one of the acceptance questions: entered / selected / cooled-archived /
 /// evicted-reactivated / consumed because of this, at turn N, triggered by X.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ContextLifecycleRecord {
     pub item_id: ContextItemId,
     /// Per-item revision: how many ledger rows this item has accumulated.
