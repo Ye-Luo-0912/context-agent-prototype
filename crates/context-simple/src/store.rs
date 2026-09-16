@@ -355,6 +355,36 @@ async fn read_bounded_blob(path: &Path) -> std::io::Result<Vec<u8>> {
     Ok(bytes)
 }
 
+/// O2（2026-09-16 review 980bbc77 遗留观察）—— B2 已有卡片认领校验的读取
+/// 硬界。前置的 pathname/handle metadata 不是实际 read 的硬上限：并发替换
+/// 或增长可以让「长度检查通过」之后真正读到的内容任意变大。所以校验读取
+/// 通过一个打开的句柄进行：句柄级 metadata 只守「是普通文件」（目录占位在
+/// 这里被拒绝，不依赖读错误），实际读取量由落在同一个句柄上的
+/// `take(expected_len + 1)` 结构性钉死——无论 metadata 之后文件如何变化，
+/// 离开文件的字节至多 `expected_len + 1`。分配容量同样只按计划长度，不按
+/// metadata 报告的长度。调用方把返回字节与计划字节精确比对：返回长度为
+/// `expected_len + 1` 即「比计划长」，必不一致；`Err` 覆盖打不开（缺失、
+/// 权限）与非普通文件。engine 侧对 Err 与「不一致」同走修复写入，语义
+/// fail-closed。
+pub(crate) async fn read_existing_card_bounded(
+    path: &Path,
+    expected_len: usize,
+) -> std::io::Result<Vec<u8>> {
+    use tokio::io::AsyncReadExt;
+
+    let file = tokio::fs::File::open(path).await?;
+    if !file.metadata().await?.is_file() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "existing card path is not a plain file",
+        ));
+    }
+    let mut limited = file.take(expected_len as u64 + 1);
+    let mut bytes = Vec::with_capacity(expected_len + 1);
+    limited.read_to_end(&mut bytes).await?;
+    Ok(bytes)
+}
+
 fn classify_read_io(error: std::io::Error) -> StoreReadFailure {
     if error.kind() == std::io::ErrorKind::NotFound {
         StoreReadFailure::Missing

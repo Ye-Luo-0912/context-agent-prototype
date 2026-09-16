@@ -19,7 +19,9 @@ use agent_contracts::{
 };
 
 use crate::engine::{SimpleContextConfig, SimpleContextEngine};
-use crate::store::{checksum_hex, external_card_bytes, external_card_path, store_dir};
+use crate::store::{
+    checksum_hex, external_card_bytes, external_card_path, read_existing_card_bounded, store_dir,
+};
 
 use super::harness::open_focus;
 
@@ -178,6 +180,104 @@ async fn capture_keeps_an_entry_inline_when_its_card_path_is_a_directory() {
         .expect("inline metadata must fetch by id");
     assert!(
         fetched.content.contains("payload-directory-claim"),
+        "the fetched body is the captured one: {}",
+        fetched.content
+    );
+}
+
+/// O2（2026-09-16 review 980bbc77 遗留观察）：认领校验的读取必须有并发
+/// 硬界——前置 metadata（无论 pathname 还是句柄级）不是实际 read 的硬
+/// 上限，并发替换/增长可以让「长度检查通过」之后真正读到的内容任意大。
+/// 读取量必须由落在句柄上的 `take(计划长度+1)` 结构性钉死。
+///
+/// 竞态本身（metadata 与 read 之间文件增长）无法确定性构造；这里直接
+/// 断言它的结构后置条件：文件比计划字节长 16 MiB 时，校验读取拉回的
+/// 字节数**恰好**是 expected_len+1——helper 返回读到的字节，读取量直接
+/// 可断言，无界整读（变异）会读到全部后缀，这条断言即红。等长文件仍
+/// 精确相等，证明有界化没有破坏认领的匹配面。
+#[tokio::test]
+async fn claim_check_read_is_capped_at_the_planned_length_plus_one_byte() {
+    let dir = tempfile::tempdir().unwrap();
+    let expected = b"planned card bytes".to_vec();
+
+    // 巨大后缀：计划字节之后接 16 MiB 异物。有界读取一次也不把它拉进来。
+    let mut oversized = expected.clone();
+    oversized.extend(vec![b'x'; 16 * 1024 * 1024]);
+    let long_path = dir.path().join("oversized.card");
+    tokio::fs::write(&long_path, &oversized).await.unwrap();
+
+    let got = read_existing_card_bounded(&long_path, expected.len())
+        .await
+        .expect("a plain file must be readable");
+    assert_eq!(
+        got.len(),
+        expected.len() + 1,
+        "the claim check must read at most planned length + 1 bytes, \
+         never the whole oversized file"
+    );
+    assert_ne!(got, expected, "a longer file can never match the plan");
+
+    // 等长文件：读到 planned_len（上限之内），精确相等 → 可认领。
+    let exact_path = dir.path().join("exact.card");
+    tokio::fs::write(&exact_path, &expected).await.unwrap();
+    let got = read_existing_card_bounded(&exact_path, expected.len())
+        .await
+        .expect("a plain file must be readable");
+    assert_eq!(got, expected, "an equal-length file must still match");
+}
+
+/// O2 行为面：比计划字节长的同名文件不可认领——与坏字节同一 fail-closed
+/// 语义（读回不一致 → 以计划字节原子重写修复；这里预置计划字节＋巨大
+/// 后缀，修复后路径上必须只剩计划字节，restore 按 id 拿回原元数据）。
+/// 旧代码的 metadata 前置长度检查对该静态文件同样拒绝，故本条是行为
+/// 回归守卫；「读取量有界」由上一条的 helper 层断言直接承证。
+#[tokio::test]
+async fn capture_repairs_a_card_that_is_longer_than_the_planned_bytes() {
+    let dir = tempfile::tempdir().unwrap();
+    let source = SimpleContextEngine::new(b2_config(&dir));
+    open_focus(&source, "oversized claim probe").await;
+    let target = externalize_one(&source, "payload-oversized-claim").await;
+
+    // 认领路径上预置计划字节＋巨大后缀：无任何有效 claim。
+    let poison = planned_card_path(&source, target).await;
+    tokio::fs::create_dir_all(poison.parent().unwrap())
+        .await
+        .unwrap();
+    let mut oversized = {
+        let state = source.state.lock().await;
+        external_card_bytes(state.external.get(target).expect("entry resident"))
+    };
+    oversized.extend(vec![b'S'; 8 * 1024 * 1024]);
+    tokio::fs::write(&poison, &oversized).await.unwrap();
+
+    let checkpoint = source.checkpoint().await.unwrap();
+
+    // 修复之后，路径上是计划字节本身——超长异物被整个替换掉。
+    let entry = {
+        let state = source.state.lock().await;
+        state.external.get(target).expect("entry resident").clone()
+    };
+    let reread = tokio::fs::read(&poison).await.unwrap();
+    assert_eq!(
+        reread,
+        external_card_bytes(&entry),
+        "the oversized candidate must be repaired to exactly the planned bytes"
+    );
+
+    // 新引擎恢复：修复后的卡片按 id 读回原元数据。
+    let restored = SimpleContextEngine::new(b2_config(&dir));
+    restored.restore(checkpoint).await.unwrap();
+    assert!(
+        pending_row_for(&restored, target).await,
+        "setup: the card row stays deferred for the by-id read"
+    );
+    let fetched = restored
+        .fetch_external(target)
+        .await
+        .unwrap()
+        .expect("the repaired card must restore the metadata by id");
+    assert!(
+        fetched.content.contains("payload-oversized-claim"),
         "the fetched body is the captured one: {}",
         fetched.content
     );
