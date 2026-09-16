@@ -488,11 +488,17 @@ async fn a_failed_round_with_reported_usage_keeps_the_real_counters() {
     assert_eq!(role, agent_contracts::ModelCallRole::Main);
 }
 
-/// COST-7 (R2-11): cancel and a late usage-bearing completion arrive for
-/// the same round. The account carries exactly one row — the cancellation's
-/// unknown main-lane row — and the stale completion supplements nothing
-/// twice, does not advance the turn, and does not emit a second observed
-/// row for the same operation.
+/// COST-7 (R2-11) + R2: cancel and a late usage-bearing SUCCESS arrive for the
+/// same round. The turn must not advance, and the operation must settle at most
+/// one observed row — never two.
+///
+/// R2 note: this test previously asserted a single row (the unknown
+/// placeholder) because the late `ModelOutput { usage }` matched no settlement
+/// branch once the barrier had marked the operation accounted. That made the
+/// placeholder the round's only row AND silently dropped the 321/78 the
+/// provider really reported — the loss this assertion was enshrining. The
+/// placeholder still carries zeros, so the observed counters enter the account
+/// exactly once: one non-zero contribution for one round.
 #[tokio::test]
 async fn cancel_and_late_completion_count_one_cost_exactly_once() {
     let handle = spawn_with(
@@ -538,22 +544,31 @@ async fn cancel_and_late_completion_count_one_cost_exactly_once() {
         }
     }
     assert!(!turn_completed, "the cancelled turn must not complete");
+    // Exactly one placeholder plus at most one observed supplement. The
+    // anti-double-count guard this test exists for is the OBSERVED count.
     assert_eq!(
         model_used_rows.len(),
-        1,
-        "one round costs one row: got {model_used_rows:?}"
+        2,
+        "one placeholder plus one supplement, never more: got {model_used_rows:?}"
     );
-    let (input, output, identity, role) = model_used_rows[0];
+    let observed_count = model_used_rows
+        .iter()
+        .filter(|(_, _, identity, _)| *identity == "observed")
+        .count();
     assert_eq!(
-        (input, output),
-        (0, 0),
-        "the unknown row carries no invented counters"
+        observed_count, 1,
+        "one round must not settle observed counters twice: got {model_used_rows:?}"
     );
     assert_eq!(
-        identity, "unknown",
-        "the cancelled round's evidence is unknown"
+        model_used_rows[0],
+        (0, 0, "unknown", "main"),
+        "the barrier's placeholder carries no invented counters"
     );
-    assert_eq!(role, "main", "the row names the main lane");
+    assert_eq!(
+        model_used_rows[1],
+        (321, 78, "observed", "main"),
+        "the late round's real counters reach the account exactly once"
+    );
 }
 
 /// W4 (V7): the transport's cancellation shape once the retry loop settles
