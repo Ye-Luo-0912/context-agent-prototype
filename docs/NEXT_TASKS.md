@@ -187,7 +187,7 @@ B2 落地回执：[B1_B2_THIRD_BATCH_RECEIPT](reviews/2026-09-16-review-3bdb269c
 
 ## 第七批（`6afa25df` 续审：QA/QB/QC/QD 四切片）——已全部关闭（2026-09-17，回执：[QA_QB_QC_QD_RECEIPT](reviews/2026-09-16-review-6afa25df/QA_QB_QC_QD_RECEIPT.md)）
 
-审查基线 `6afa25df`（报告：[REVIEW.md](reviews/2026-09-16-review-6afa25df/REVIEW.md)，实施任务：[NEXT_ACTIONS.md](reviews/2026-09-16-review-6afa25df/NEXT_ACTIONS.md)，覆盖表：[COVERAGE.md](reviews/2026-09-16-review-6afa25df/COVERAGE.md)）。共同主线：**准备成功≠消费提交成功；连接可用≠事件流健康；业务拒绝≠没有费用。** 审查环境未执行回归（无 Cargo/dotnet），红-first 由实施补；`6afa25df` 的 CI run `35134020808` 审查读取时 attempt 1 进行中，不借用父提交结果。O1（MetricsSession 的 FullTree 把未读到编成 0）与 O2（B2 认领已修；前置长度检查应改 opened-handle＋`take(len+1)` 硬界）作为后续小切片，不阻塞本批。KV 本地序列验收表见审查 NEXT_ACTIONS（与切片并行准备，真实端点仍 NOT_RUN）。
+审查基线 `6afa25df`（报告：[REVIEW.md](reviews/2026-09-16-review-6afa25df/REVIEW.md)，实施任务：[NEXT_ACTIONS.md](reviews/2026-09-16-review-6afa25df/NEXT_ACTIONS.md)，覆盖表：[COVERAGE.md](reviews/2026-09-16-review-6afa25df/COVERAGE.md)）。共同主线：**准备成功≠消费提交成功；连接可用≠事件流健康；业务拒绝≠没有费用。** 审查环境未执行回归（无 Cargo/dotnet），红-first 由实施补；`6afa25df` 的 CI run `35134020808` 审查读取时 attempt 1 进行中，不借用父提交结果。O1 与 O2 后续小切片已关闭（2026-09-17，回执：[O1_O2_RECEIPT](reviews/2026-09-16-review-980bbc77/O1_O2_RECEIPT.md)）。KV 本地序列验收表见审查 NEXT_ACTIONS（与切片并行准备，真实端点仍 NOT_RUN）。
 
 ### QA — 冷正文从预览到消费成功（Q1，context-simple＋Runtime 集成）——已关闭（`c62ce4fe`）
 用户动作：固定小热目录下 A/B/C 必需正文进入请求并继续任务，无需扩大热预算。
