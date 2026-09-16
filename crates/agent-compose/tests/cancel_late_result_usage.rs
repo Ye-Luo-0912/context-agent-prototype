@@ -102,9 +102,12 @@ async fn drain(events: &mut Receiver<agent_contracts::RuntimeEventEnvelope>) -> 
                     cached_input_tokens,
                     usage_identity,
                     ..
-                } => observed
-                    .rows
-                    .push((input_tokens, output_tokens, cached_input_tokens, usage_identity)),
+                } => observed.rows.push((
+                    input_tokens,
+                    output_tokens,
+                    cached_input_tokens,
+                    usage_identity,
+                )),
                 RuntimeEvent::TurnCancelled { .. } => observed.cancelled = true,
                 RuntimeEvent::ToolStarted { .. } => observed.tools_started += 1,
                 _ => {}
@@ -122,9 +125,12 @@ async fn drain(events: &mut Receiver<agent_contracts::RuntimeEventEnvelope>) -> 
                     ..
                 } = envelope.event
                 {
-                    observed
-                        .rows
-                        .push((input_tokens, output_tokens, cached_input_tokens, usage_identity));
+                    observed.rows.push((
+                        input_tokens,
+                        output_tokens,
+                        cached_input_tokens,
+                        usage_identity,
+                    ));
                 }
             }
             break;
