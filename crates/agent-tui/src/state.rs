@@ -118,12 +118,18 @@ pub struct CardFailure {
     pub task_id: Option<TaskId>,
 }
 
-/// Serializes result-card snapshot commits: a single writer, versioned by
-/// the card's monotonic `revision`, so an older snapshot that finishes later
-/// can never overwrite a newer one.
+/// Serializes result-card snapshot commits: a single writer, ordered by the
+/// SESSION publish sequence, so an older snapshot that finishes later can
+/// never overwrite a newer one.
+///
+/// R4: this is deliberately NOT the card's own `revision`. A card is per-task
+/// and starts from zero again after a task switch, so using its revision as
+/// the publish watermark made the second task's snapshot look "older" than the
+/// first task's and dropped it. The publish sequence is monotonic for the life
+/// of the session and is never reset by a task switch or a projection rebuild.
 #[derive(Debug, Default)]
 struct CardSnapshotState {
-    last_written_revision: u64,
+    last_written_publish: u64,
 }
 
 /// The bounded, event-derived result card `/review` renders. It lists only
@@ -139,10 +145,14 @@ struct CardSnapshotState {
 pub struct ResultCard {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub task_id: Option<TaskId>,
-    /// Monotonic snapshot revision. A stale writer must not overwrite a
-    /// newer card; see `persist_result_card`.
+    /// The card's own content revision (per task). A task switch starts a new
+    /// card, so this may legitimately return to a small value.
     #[serde(default)]
     pub revision: u64,
+    /// Session publish sequence of the snapshot that carries this card.
+    /// Monotonic across task switches; this is what orders artifacts on disk.
+    #[serde(default)]
+    pub publish_seq: u64,
     pub changed_files: Vec<CardChangedFile>,
     pub checks: Vec<CardCheck>,
     pub completion: Option<CardCompletion>,
@@ -153,6 +163,11 @@ pub struct ResultCard {
     pub omitted_checks: usize,
     #[serde(default)]
     pub omitted_failures: usize,
+    /// Every verification-class run that ended FAILED, counted BEFORE the
+    /// display cap could refuse it. `checks` is a bounded display window;
+    /// this is the fact the window must never be mistaken for.
+    #[serde(default)]
+    pub failed_checks_total: usize,
 }
 
 impl ResultCard {
@@ -168,8 +183,10 @@ impl ResultCard {
         self.checks.len().saturating_add(self.omitted_checks)
     }
 
-    /// Failed checks still visible in the card.
-    pub fn failed_checks(&self) -> usize {
+    /// FAILED checks still visible in the bounded display window. Use
+    /// `failed_checks_total` for the account: a failure the cap refused is
+    /// still a failure.
+    pub fn failed_checks_in_window(&self) -> usize {
         self.checks.iter().filter(|check| !check.ok).count()
     }
 }
@@ -398,6 +415,13 @@ pub struct AppState {
     pub state_dir: Option<std::path::PathBuf>,
     /// Single-writer gate for the card snapshot; see `persist_result_card`.
     card_snapshot_gate: std::sync::Arc<tokio::sync::Mutex<CardSnapshotState>>,
+    /// Session-monotonic snapshot publish sequence. Never reset by a task
+    /// switch or a projection rebuild — see `CardSnapshotState` for why.
+    card_publish_seq: u64,
+    /// True while the journal replay is rebuilding the view. Historical
+    /// `TaskCompleted` events must not each re-publish a snapshot: a replay is
+    /// a read of the past, not a new delivery.
+    replaying: bool,
     /// Highest durable sequence of this run already folded from the
     /// journal by a resync. Live events at or below it are skipped by the
     /// projection fold so a post-resync replay never double-counts.
@@ -460,6 +484,8 @@ impl AppState {
             card_snapshot_gate: std::sync::Arc::new(tokio::sync::Mutex::new(
                 CardSnapshotState::default(),
             )),
+            card_publish_seq: 0,
+            replaying: false,
             resynced_through_seq: None,
             applied_events: std::collections::VecDeque::new(),
             applied_index: std::collections::HashSet::new(),
@@ -518,8 +544,18 @@ impl AppState {
         let Some(state_dir) = self.state_dir.clone() else {
             return;
         };
+        if self.replaying {
+            // R7: a replay re-reads history. Publishing a snapshot per
+            // historical `TaskCompleted` would be a side effect of reading the
+            // past, and could race the live card. The live path owns writes.
+            return;
+        }
+        // R4: the publish order is the SESSION's, not the card's. The card's
+        // own revision restarts with each task; the publish sequence does not.
         self.result_card.revision = self.result_card.revision.saturating_add(1);
-        let revision = self.result_card.revision;
+        self.card_publish_seq = self.card_publish_seq.saturating_add(1);
+        self.result_card.publish_seq = self.card_publish_seq;
+        let publish = self.card_publish_seq;
         let Ok(bytes) = serde_json::to_vec(&self.result_card) else {
             return;
         };
@@ -527,7 +563,7 @@ impl AppState {
         let gate = std::sync::Arc::clone(&self.card_snapshot_gate);
         tokio::spawn(async move {
             let mut state = gate.lock().await;
-            if revision <= state.last_written_revision {
+            if publish <= state.last_written_publish {
                 // A newer snapshot already landed; an older one must never
                 // overwrite it just because it finished later.
                 return;
@@ -539,7 +575,7 @@ impl AppState {
                 return;
             }
             // Write-then-rename: a reader never observes a partial card.
-            let staging = path.with_extension(format!("json.tmp-{revision}"));
+            let staging = path.with_extension(format!("json.tmp-{publish}"));
             if tokio::fs::write(&staging, &bytes).await.is_err() {
                 let _ = tokio::fs::remove_file(&staging).await;
                 return;
@@ -548,7 +584,7 @@ impl AppState {
                 let _ = tokio::fs::remove_file(&staging).await;
                 return;
             }
-            state.last_written_revision = revision;
+            state.last_written_publish = publish;
         });
     }
 
@@ -597,6 +633,9 @@ impl AppState {
         self.resynced_through_seq = None;
         self.view_partial = false;
         self.view_partial_reason = None;
+        // R7: the replay rebuilds the view from the past; it must not also
+        // re-publish a snapshot for every historical `TaskCompleted`.
+        self.replaying = true;
         let mut folded = 0usize;
         let mut min_seq: Option<u64> = None;
         let mut max_seq: Option<u64> = None;
@@ -694,6 +733,7 @@ impl AppState {
             // double-count. Only a verified contiguous prefix is claimed.
             self.resynced_through_seq = max_seq;
         }
+        self.replaying = false;
         let _ = bad_lines;
         (folded, self.view_partial)
     }
@@ -1379,6 +1419,15 @@ impl AppState {
                     }
                 }
                 if is_verification_tool(&output.tool_name) {
+                    // R5: the failure is counted BEFORE the display cap can
+                    // refuse the entry. `checks` is a bounded window; the
+                    // account must not read as "0 FAILED" because the window
+                    // was full. Counting here is safe against redelivery:
+                    // `apply_event` runs at most once per durable event.
+                    if !output.ok {
+                        self.result_card.failed_checks_total =
+                            self.result_card.failed_checks_total.saturating_add(1);
+                    }
                     if self.result_card.checks.len() < MAX_CARD_CHECKS {
                         self.result_card.checks.push(CardCheck {
                             tool: output.tool_name.clone(),
@@ -1781,12 +1830,17 @@ pub fn format_result_lines(card: &ResultCard) -> Vec<String> {
         );
     } else {
         lines.push("  checks run:".into());
+        // R5: the account vs the window are named separately. A failure the
+        // cap refused is still a failure, so the full count comes from the
+        // pre-cap tally; the window count says what is actually listed.
         lines.push(format!(
-            "    scope: {scope} — {} recorded, {} FAILED, {} not shown (display cap {})",
+            "    scope: {scope} — {} recorded, {} FAILED (of which {} in the {}-row \
+             display window), {} not shown",
             card.total_checks(),
-            card.failed_checks(),
+            card.failed_checks_total,
+            card.failed_checks_in_window(),
+            MAX_CARD_CHECKS,
             card.omitted_checks,
-            MAX_CARD_CHECKS
         ));
         for check in card.checks.iter().take(MAX_CARD_CHECKS) {
             let artifact = check
@@ -1804,9 +1858,8 @@ pub fn format_result_lines(card: &ResultCard) -> Vec<String> {
         if card.omitted_checks > 0 {
             lines.push(format!(
                 "    …and {} more checks were NOT shown (beyond the display cap); \
-                 {} of the recorded checks FAILED",
-                card.omitted_checks,
-                card.failed_checks()
+                 {} recorded check(s) FAILED in total",
+                card.omitted_checks, card.failed_checks_total
             ));
         }
     }
@@ -2652,6 +2705,98 @@ mod tests {
                 "a staging file must not survive the commit: {name}"
             );
         }
+    }
+
+    /// R4: the snapshot publish order belongs to the SESSION. A card's own
+    /// revision restarts with every task, so using it as the write watermark
+    /// made task B's snapshot look older than task A's and dropped it — B's
+    /// card was correct in memory and stale on disk after a restart.
+    #[tokio::test]
+    async fn consecutive_tasks_all_publish_and_the_newest_wins() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = AppState::new(RunId::new());
+        app.state_dir = Some(dir.path().to_path_buf());
+        let path = dir.path().join("artifacts/result-card-latest.json");
+        let mut tasks = Vec::new();
+        for index in 0..3u32 {
+            let task = TaskId::new();
+            tasks.push(task);
+            let file = format!("task{index}.txt");
+            app.apply_runtime_event(envelope(RuntimeEvent::FocusChanged {
+                task_id: task,
+                goal: format!("task {index}"),
+            }));
+            app.apply_runtime_event(envelope(RuntimeEvent::ToolFinished {
+                output: tool_output("fs.write", true, "wrote", Some(&file)),
+                facts: None,
+            }));
+            app.apply_runtime_event(envelope(RuntimeEvent::TaskCompleted {
+                task_id: task,
+                anchor_revision: 1,
+                summary: format!("task {index} done"),
+                artifacts: Vec::new(),
+                final_output_digest: None,
+            }));
+        }
+        let newest = *tasks.last().unwrap();
+        let mut card = None;
+        for _ in 0..300 {
+            if let Ok(bytes) = tokio::fs::read(&path).await
+                && let Ok(parsed) = serde_json::from_slice::<ResultCard>(&bytes)
+                && parsed.task_id == Some(newest)
+            {
+                card = Some(parsed);
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        let card = card.expect("the newest task's card must be the one on disk after A/B/C");
+        assert_eq!(card.task_id, Some(newest));
+        assert!(
+            card.publish_seq >= 3,
+            "the publish sequence must not restart per task: {card:?}"
+        );
+        assert_eq!(
+            card.changed_files.len(),
+            1,
+            "only the newest task's material may be in its own card: {card:?}"
+        );
+        assert_eq!(card.changed_files[0].path, "task2.txt", "{card:?}");
+    }
+
+    /// R5: a failure the display cap refused is still a failure. The previous
+    /// accounting reported `33 recorded, 0 FAILED, 1 not shown`, which names
+    /// the omission but states a wrong overall failure count.
+    #[test]
+    fn an_omitted_failed_check_does_not_read_as_zero_failures() {
+        let mut app = AppState::new(RunId::new());
+        for index in 0..MAX_CARD_CHECKS {
+            app.apply_runtime_event(envelope(RuntimeEvent::ToolFinished {
+                output: tool_output("verify.run", true, &format!("check {index} passed"), None),
+                facts: None,
+            }));
+        }
+        // The 33rd check FAILS and the cap refuses the entry.
+        app.apply_runtime_event(envelope(RuntimeEvent::ToolFinished {
+            output: tool_output("verify.run", false, "check 33 FAILED", None),
+            facts: None,
+        }));
+        assert_eq!(app.result_card.omitted_checks, 1);
+        assert_eq!(
+            app.result_card.failed_checks_total, 1,
+            "the refused failure must still be counted"
+        );
+        assert_eq!(
+            app.result_card.failed_checks_in_window(),
+            0,
+            "the display window genuinely holds no failure"
+        );
+        let rendered = format_result_lines(&app.result_card).join("\n");
+        assert!(rendered.contains("33 recorded"), "{rendered}");
+        assert!(
+            rendered.contains("1 FAILED"),
+            "the account must name the failure the window could not show: {rendered}"
+        );
     }
 
     #[test]
