@@ -1,0 +1,359 @@
+{
+  "repository": "Ye-Luo-0912/context-agent-prototype",
+  "baseline": "6afa25dff0230fec982ee7d836aa7811ad901d0c",
+  "previous_baseline": "3bdb269cba4e1bdd0fe2e71007dfa1ad7640b28d",
+  "baseline_commit_time_utc": "2026-09-16T18:19:21Z",
+  "review_scope": "whole-repository continuation; not exhaustive line-by-line coverage",
+  "source_files_read": 17,
+  "source_reads": [
+    {
+      "path": "docs/NEXT_TASKS.md",
+      "requested_ranges": [
+        [
+          1,
+          80
+        ]
+      ],
+      "coverage": "partial_response",
+      "source_citations": [
+        "turn422file0"
+      ],
+      "note": "只读取当前队列与前部历史；输出截断。"
+    },
+    {
+      "path": "crates/agent-runtime/src/execution/freshness.rs",
+      "requested_ranges": [
+        [
+          1,
+          330
+        ]
+      ],
+      "coverage": "ranges",
+      "source_citations": [
+        "turn425file0"
+      ],
+      "note": "归因、mutation footprint、观察与失败义务；不是全文件。"
+    },
+    {
+      "path": "crates/agent-tui/src/session.rs",
+      "requested_ranges": [
+        [
+          115,
+          430
+        ],
+        [
+          430,
+          700
+        ]
+      ],
+      "coverage": "ranges",
+      "source_citations": [
+        "turn426file0",
+        "turn427file0"
+      ],
+      "note": "命令 worker/提交/生命周期与主循环，未通读所有命令和测试。"
+    },
+    {
+      "path": "crates/context-simple/src/materializer.rs",
+      "requested_ranges": [
+        [
+          630,
+          1060
+        ]
+      ],
+      "coverage": "ranges",
+      "source_citations": [
+        "turn428file0"
+      ],
+      "note": "external 描述符及 foreground 冷快照 fallback。"
+    },
+    {
+      "path": "crates/context-simple/src/engine.rs",
+      "requested_ranges": [
+        [
+          2340,
+          2535
+        ],
+        [
+          3220,
+          3555
+        ]
+      ],
+      "coverage": "ranges_plus_commit_diff",
+      "source_citations": [
+        "turn431file0",
+        "turn429file0",
+        "turn423file0"
+      ],
+      "note": "冷解析/owner/材料化/ACK；existing card 比对来自父提交 diff，对比清单证明本次 docs head 未更改该逻辑。"
+    },
+    {
+      "path": "crates/agent-runtime/src/actor/tools.rs",
+      "requested_ranges": [
+        [
+          1010,
+          1220
+        ],
+        [
+          1320,
+          1650
+        ]
+      ],
+      "coverage": "ranges",
+      "source_citations": [
+        "turn434file0",
+        "turn433file0"
+      ],
+      "note": "模型结果接受与 ACK、工具结算/后续推进。"
+    },
+    {
+      "path": "crates/context-simple/src/tests/batch_required_plan.rs",
+      "requested_ranges": [
+        [
+          1,
+          380
+        ]
+      ],
+      "coverage": "partial_response",
+      "source_citations": [
+        "turn435file0"
+      ],
+      "note": "主反例及预算反例完整可见；混合反例尾部输出截断。"
+    },
+    {
+      "path": "clients/dotnet/Agent.Client/AgentConnection.cs",
+      "requested_ranges": [
+        [
+          1,
+          350
+        ],
+        [
+          351,
+          720
+        ]
+      ],
+      "coverage": "full_returned_source",
+      "source_citations": [
+        "turn437file0",
+        "turn438file0"
+      ],
+      "note": "第二段已返回文件结尾。"
+    },
+    {
+      "path": "clients/dotnet/Agent.Client/ResumableSession.cs",
+      "requested_ranges": [
+        [
+          1,
+          345
+        ],
+        [
+          346,
+          700
+        ]
+      ],
+      "coverage": "full_returned_source",
+      "source_citations": [
+        "turn439file0",
+        "turn440file0"
+      ],
+      "note": "连接、pump、重同步、API与Dispose，已至文件尾。"
+    },
+    {
+      "path": "crates/agent-contracts/src/model_cache.rs",
+      "requested_ranges": [
+        [
+          1,
+          370
+        ]
+      ],
+      "coverage": "full_returned_source",
+      "source_citations": [
+        "turn441file0"
+      ],
+      "note": "文件到末尾（外部 tests 子模块未通读）。"
+    },
+    {
+      "path": "crates/context-simple/src/access.rs",
+      "requested_ranges": [
+        [
+          1,
+          340
+        ]
+      ],
+      "coverage": "full_returned_source",
+      "source_citations": [
+        "turn443file0"
+      ],
+      "note": "文件到末尾含内联两项测试。"
+    },
+    {
+      "path": "crates/provider-openai/src/prompt_cache.rs",
+      "requested_ranges": [
+        [
+          1,
+          380
+        ]
+      ],
+      "coverage": "full_returned_source",
+      "source_citations": [
+        "turn444file0"
+      ],
+      "note": "模式配置全文；tests/endpoint_shape 子模块未在本轮通读。"
+    },
+    {
+      "path": "clients/dotnet/Agent.Client.Tests/EventStreamTests.cs",
+      "requested_ranges": [
+        [
+          400,
+          720
+        ],
+        [
+          710,
+          775
+        ]
+      ],
+      "coverage": "ranges",
+      "source_citations": [
+        "turn445file0",
+        "turn454file0"
+      ],
+      "note": "重同步与溢出回归；不是整个测试文件。"
+    },
+    {
+      "path": "crates/provider-openai/src/lib.rs",
+      "requested_ranges": [
+        [
+          1,
+          150
+        ],
+        [
+          470,
+          825
+        ],
+        [
+          800,
+          1150
+        ],
+        [
+          1150,
+          1270
+        ]
+      ],
+      "coverage": "ranges",
+      "source_citations": [
+        "turn449file0",
+        "turn447file0",
+        "turn446file0",
+        "turn448file0"
+      ],
+      "note": "主要流循环与wire mapper；未覆盖全部实现/内联测试。"
+    },
+    {
+      "path": "crates/provider-openai/src/sse.rs",
+      "requested_ranges": [
+        [
+          1,
+          280
+        ],
+        [
+          280,
+          365
+        ]
+      ],
+      "coverage": "ranges",
+      "source_citations": [
+        "turn450file0",
+        "turn451file0"
+      ],
+      "note": "framer、wire usage、parser、accumulator 前段。"
+    },
+    {
+      "path": "crates/agent-runtime/src/actor/model.rs",
+      "requested_ranges": [
+        [
+          1370,
+          1600
+        ]
+      ],
+      "coverage": "ranges",
+      "source_citations": [
+        "turn452file0"
+      ],
+      "note": "最终装箱之后的验证、surface与实际ACK构造。"
+    },
+    {
+      "path": "clients/dotnet/Agent.Client/MetricsSession.cs",
+      "requested_ranges": [
+        [
+          1,
+          390
+        ],
+        [
+          385,
+          430
+        ]
+      ],
+      "coverage": "full_returned_source",
+      "source_citations": [
+        "turn455file0",
+        "turn456file0"
+      ],
+      "note": "资源采样与父关系读取到末尾。"
+    }
+  ],
+  "metadata_reads": {
+    "branch": [
+      "turn419file0",
+      "turn442file0"
+    ],
+    "ci": [
+      "turn421file0",
+      "turn453file0"
+    ],
+    "recursive_tree": [
+      "turn424file0"
+    ],
+    "sdk_listing": [
+      "turn436file0"
+    ],
+    "compare": "18 commits; 38 changed files (metadata inventory, not all source bodies read)"
+  },
+  "excluded_as_fixed_baseline_evidence": [
+    "default-branch search fragments pointing to c5f5426a; only used as navigation"
+  ],
+  "ci_last_observed": {
+    "run_id": 35134020808,
+    "attempt": 1,
+    "status": "in_progress",
+    "conclusion": null
+  },
+  "execution": {
+    "rust_tests": "NOT_RUN",
+    "dotnet_tests": "NOT_RUN",
+    "pty_tests": "NOT_RUN",
+    "paid_provider_tests": "NOT_RUN",
+    "source_modified": false,
+    "remote_mutations": false
+  },
+  "environment": {
+    "git_available": true,
+    "cargo_available": false,
+    "rustc_available": false,
+    "dotnet_available": false,
+    "clone": "failed DNS lookup",
+    "archive_download": "not acquired"
+  },
+  "findings": [
+    "Q1",
+    "Q2",
+    "Q3",
+    "Q4",
+    "Q5",
+    "Q6"
+  ],
+  "nonblocking_observations": [
+    "O1",
+    "O2",
+    "O3"
+  ]
+}

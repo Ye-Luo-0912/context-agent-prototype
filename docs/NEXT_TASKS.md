@@ -185,6 +185,37 @@ B2 落地回执：[B1_B2_THIRD_BATCH_RECEIPT](reviews/2026-09-16-review-3bdb269c
 - 落地回执：[R6_R7_R8_B3_SECOND_BATCH_RECEIPT](reviews/2026-09-16-review-3bdb269c/R6_R7_R8_B3_SECOND_BATCH_RECEIPT.md)。导出改为「快照→提交→确认消费」，取消不再丢行；`ContextLifecycleRecord` 增 `PartialEq/Eq`。
 **B1（`de6bf061`）与 B2（`2482f3ef`）亦已关闭（2026-09-17）**——回执：[B1_B2_THIRD_BATCH_RECEIPT](reviews/2026-09-16-review-3bdb269c/B1_B2_THIRD_BATCH_RECEIPT.md)。本阶段队列至此只剩 C（续）与 T8。
 
+## 第七批（`6afa25df` 续审：QA/QB/QC/QD 四切片，文件所有权互不重叠，可并行）
+
+审查基线 `6afa25df`（报告：[REVIEW.md](reviews/2026-09-16-review-6afa25df/REVIEW.md)，实施任务：[NEXT_ACTIONS.md](reviews/2026-09-16-review-6afa25df/NEXT_ACTIONS.md)，覆盖表：[COVERAGE.md](reviews/2026-09-16-review-6afa25df/COVERAGE.md)）。共同主线：**准备成功≠消费提交成功；连接可用≠事件流健康；业务拒绝≠没有费用。** 审查环境未执行回归（无 Cargo/dotnet），红-first 由实施补；`6afa25df` 的 CI run `35134020808` 审查读取时 attempt 1 进行中，不借用父提交结果。O1（MetricsSession 的 FullTree 把未读到编成 0）与 O2（B2 认领已修；前置长度检查应改 opened-handle＋`take(len+1)` 硬界）作为后续小切片，不阻塞本批。KV 本地序列验收表见审查 NEXT_ACTIONS（与切片并行准备，真实端点仍 NOT_RUN）。
+
+### QA — 冷正文从预览到消费成功（Q1，context-simple＋Runtime 集成）
+用户动作：固定小热目录下 A/B/C 必需正文进入请求并继续任务，无需扩大热预算。
+- 现状：B1 捕获让 A 驻留冷页仍进最终帧，但 `acknowledge_consumption` 的 `has_exactly_one_owner` 只统计 heap/Warm/retry/已加载 external；`access::stamp(_consumed)` 无 pending cold 更新路径。Runtime 的 ACK 直接带最终 `materialized.items` 全部 ID → ACK 拒绝有效消费，本轮结果不提交。
+- 方向：统一逻辑 owner 查询覆盖四类已加载 owner＋冷定位，并绑定条目/卡片版本（"pending 里出现过同 ID"不充分）；消费结算给本次已验证、实际送入请求的冷正文记录有界访问事实。不许永久 pin、扩热预算、全量重水化；不取消预览身份与 owner 校验。
+- 验收：延长 `batch_required_plan` fixture 到真实 `ContextConsumptionAck`（先红：旧计数拒绝 A）→ 真实 Runtime 成功结果提交 → checkpoint/restore 一致；错误 materialization ID、外来 ID、过期卡片版本仍被拒绝。
+
+### QB — 一次模型尝试只有一个使用量结算出口（Q2＋Q3，agent-runtime＋provider-openai）
+用户动作：模型已返回计数后，流失败/内部提交失败时正式账目仍保留这些数值。
+- Q2：`OperationOutcome::ModelOutput` 分支先提交 ACK、失败即返回，`ModelUsed` 发布在其后——ACK 失败丢已知用量。用量结算须从业务接受分支提取，复用 W4/R2 既有通道与 operation 去重；ACK 失败仍拒绝工具派发与不可靠结果，不放宽校验。
+- Q3：流循环 idle timeout、流/行/帧上限、I/O、解析/accumulator 错误、部分 sink 错误等裸提前返回绕过尾部 usage 提取。一次 attempt 的读流与结算拆开：所有退出统一从该 attempt 的 accumulator 取已知数值；错误分类/可重试性/取消语义不变；同 attempt 累计快照不重复相加，多 attempt 才合计。
+- 验收：受控 Provider 已知 usage＋ContextEngine ACK 注入失败 → 工具不执行、错误如实、用量入账一次（不依赖 metrics env）；本地 SSE fixture 在 usage 后分别注入 idle timeout/坏帧/I/O/cap/sink error 断言 reported_usage，无 usage 的同形错误保持 Unknown；经真实 RetryingTransport 首次失败＋最终成功各计一次。
+
+### QC — SDK 事件流健康与重同步代际屏障（Q4＋Q5，clients/dotnet）
+用户动作：客户端自身落后导致 Session 队列溢出、底层 socket 仍健康时，能从公开入口恢复实时事件。
+- Q4：`PumpEventsAsync` 溢出后关队列置 `_eventsOverflowed` 退出但不使连接失效；`LiveAsync` 见 `IsConnected` 即复用原连接——Snapshot 可用而事件流已死。把 Session 流健康纳入可用性/恢复判断或提供显式重建 snapshot+subscription+pump 的恢复动作；未知结果 mutation/审批不自动重发；旧 reader 保持终态。
+- Q5：两个竞争窗口——新连接安装后先启 pump 后 `Resynced(snapshot)`（快照可覆盖新事件）；旧 pump 锁内校验、锁外入队（旧通知进新视图）。连接身份＋事件队列＋generation 作为同一发布边界：快照屏障先于新 pump 交付；旧 pump 最终入队受代际边界约束。用受控暂停点验证，不用 sleep。
+- 验收：复用 `Overflowed_session_rebuilds_its_event_stream_on_reconnect_and_delivers_new_events`，去掉服务端 dropFirst、保持查询可用：公开恢复路径带来新快照、新 reader、下一条事件；正常断线重连不回归。
+
+### QD — TUI worker 正常/异常退出共同收尾（Q6＋O3，agent-tui）
+用户动作：绘制/键盘出错或用户退出时，前端已结束而排队动作继续提交的情况不再发生。
+- 现状：`sink.draw(&app)?`、`source.poll_key(...).await?`、dispatch 早退绕过循环后的 `abort()+await`——JoinHandle 被丢弃即分离任务，worker 可能继续消费队列且会话失去 join 结果。
+- 方向：会话循环 Result 与统一 cleanup 分开，异常/正常同一入口：停止接收→worker 停机回执→join→诚实结算（queued/已取走/已送 Runtime/未知分开，不把 abort 冒充未执行或回滚）；终端 guard、Runtime 清理、worker 各自责任不混；O3 的 pending 计数改纯诊断并修增减时机。
+- 验收：worker 受控等待＋队列有待派发时，UiSink/UiSource 抛错与正常 quit 分别执行：stop 屏障后不偷派、worker 被回收、terminal 仍恢复、慢存储/已发命令的取消安全结算。
+
+### T8 相关——KV 本地序列验收（并行准备，不阻塞）
+固定任务/profile/工具契约/窗口预算，用最终请求逐轮只改一个原因（焦点、新检索、缺失提示、文件版本、工具撤销、checkpoint 恢复），核对边界摘要、首变原因与 usage 完整性。QB 未修时失败路径漏计已知成本，不据其宣称降本；真实端点接受/命中/净费用保持 NOT_RUN。
+
 ### T8 — 条件性供应商成本对照
 **先有 R2 的完整结算**再测真实供应商，否则只比较最终成功调用会漏掉失败/取消成本（取消频繁的长任务成本可能被低估）。场景固定同一任务/起点/验收，至少覆盖前缀稳定、动态尾部、文件版本变化、checkpoint、维护、失败重试与取消补账；报告 uncached/read/write/output、主/维护调用、尝试数、未知覆盖与任务质量。无授权/凭据/预算则 `NOT_RUN`，不借用环境密钥发起付费实验。
 

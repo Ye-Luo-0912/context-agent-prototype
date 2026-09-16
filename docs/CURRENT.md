@@ -26,6 +26,8 @@
 
 **2026-09-16 V 批次收口**：W1–W4 全部关闭（见 [NEXT_TASKS.md](NEXT_TASKS.md) 第四批与各回执）。W1（`c0923af2`）：scope 退休引用闭包许可（未读冷页引用的 scope 不被退休、预算耗尽诚实推迟）＋必需正文冷解析（typed Missing/Corrupt/IoFailed/UnreadColdPage，不再把已存在正文报成 Missing）；W2（同上）：`ContextSearchResult` 原子返回＋wire 协商、fresh/resume 生命周期、restore 失效旧 token＋nonce 防ABA；W3（`9b176df0`）：工具结果断点改 `input_text` 块、未确认 sibling fallback 删除；W4（`4fa2d8a2`）：取消结算已知用量（`Cancelled{known_usage}`，observer 降级为诊断副本，全链回归在无 metrics env 下验证）。限制如实记录在各回执（退休探测预算耗尽时持续推迟、covered 集仍为累积 ID 集、maintenance lane 取消仍 unknown、真实端点接受/命中归 T8）。
 
+**2026-09-17 新审查（基线 `6afa25df`，即 B1/B2 收口后的 docs 提交）**：开 Q1–Q6 六项发现与 O1–O3 非阻塞观察。主线：**正文"准备好了"还要能提交消费；连接"还活着"还要能继续交付事件；业务结果"失败了"也不能丢掉已知费用。** 核心是 Q1——B1 捕获让冷必需正文进入最终请求，但 `acknowledge_consumption`/`has_exactly_one_owner` 与 `access::stamp` 只认可四种已加载 owner：ACK 拒绝有效消费，且该失败发生在 `ModelUsed` 发布之前，已知用量一并丢失（Q2）；Provider 流内多种提前退出绕过 accumulator 用量结算（Q3）。报告、覆盖表与实施任务见 [docs/reviews/2026-09-16-review-6afa25df/](reviews/2026-09-16-review-6afa25df/REVIEW.md)。该 SHA 的 CI run `35134020808` 审查读取时 attempt 1 in_progress，不借用父提交绿色结果。四个实施切片（QA/QB/QC/QD，文件所有权互不重叠、可并行）见 [NEXT_TASKS.md](NEXT_TASKS.md) 第七批。
+
 ## 当前阶段：可持续使用的后端开发流程
 
 目标：**同一 Agent 在同一任务与工作区内，持续完成计划、检索、修改、验证、中途纠正、中断、冷恢复和交付；热资源、维护工作和供应商缓存成本有明确边界，核心规则在少数实现入口维护。**
