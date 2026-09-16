@@ -1,0 +1,20 @@
+{
+  "sha": "71f8a58614fcabbbc9bc9602fe85ef453df56765",
+  "run_id": 35156892711,
+  "attempt": 1,
+  "status": "completed",
+  "conclusion": "failure",
+  "successful_jobs": 6,
+  "failed_job": 104999146984,
+  "failed_test": "killing_the_rust_host_cleans_the_exact_proof_tree_without_a_completion_receipt",
+  "location": "crates/agent-compose/tests/proof_supervision.rs:171:9",
+  "observation": {
+    "leader_pid": 8316,
+    "leader_state": "Exited",
+    "member_pid": 3596,
+    "member_state": "Running",
+    "member_identity_token": "01dd462a55c4f564"
+  },
+  "root_cause": "NOT_DETERMINED",
+  "locally_reproduced": false
+}

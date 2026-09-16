@@ -1,0 +1,64 @@
+{
+  "status": "Proposed regression cases; Rust validator NOT_RUN in this environment",
+  "baseline": "71f8a58614fcabbbc9bc9602fe85ef453df56765",
+  "cases": [
+    {
+      "name": "boolean_enum_is_enforced",
+      "schema": {
+        "type": "object",
+        "properties": {
+          "flag": {
+            "type": "boolean",
+            "enum": [
+              false
+            ]
+          }
+        },
+        "required": [
+          "flag"
+        ]
+      },
+      "arguments": {
+        "flag": true
+      },
+      "required_behavior": "reject; or reject unsupported schema during compile, never accept and discard enum"
+    },
+    {
+      "name": "nested_typeless_pattern",
+      "schema": {
+        "type": "object",
+        "properties": {
+          "s": {
+            "pattern": "^ok$"
+          }
+        }
+      },
+      "arguments": {
+        "s": "bad"
+      },
+      "required_behavior": "enforce pattern for string or reject unsupported schema; never silent Any"
+    },
+    {
+      "name": "nested_typeless_required",
+      "schema": {
+        "type": "object",
+        "properties": {
+          "child": {
+            "properties": {
+              "x": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "x"
+            ]
+          }
+        }
+      },
+      "arguments": {
+        "child": {}
+      },
+      "required_behavior": "enforce object requirements or reject unsupported schema"
+    }
+  ]
+}

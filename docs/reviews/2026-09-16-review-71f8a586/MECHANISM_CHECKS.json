@@ -1,0 +1,105 @@
+{
+  "baseline": "71f8a58614fcabbbc9bc9602fe85ef453df56765",
+  "scope": "Mechanism ports + actual Node reference only; no Rust/.NET repository tests executed.",
+  "node_version": "v22.16.0",
+  "jcs_numeric_boundary": [
+    {
+      "ryu_rendering_input": "1e-8",
+      "ported_repository_helper": "1e-8",
+      "node_json_stringify": "1e-8",
+      "same_bytes": true,
+      "ported_object_sha256": "cea10b3d81a4e0c1e70e7937a4396f248e4b4b372fcd9644d7617f47267ed621",
+      "reference_object_sha256": "cea10b3d81a4e0c1e70e7937a4396f248e4b4b372fcd9644d7617f47267ed621"
+    },
+    {
+      "ryu_rendering_input": "1e-7",
+      "ported_repository_helper": "0.0000001",
+      "node_json_stringify": "1e-7",
+      "same_bytes": false,
+      "ported_object_sha256": "aca47411d23fc1465054153271bad57d7f050796d8885fab35d92775ae420ea5",
+      "reference_object_sha256": "747d6d23b64d1b2d579adb832b44de31c91c875bbef7a8e397f5d183a746b54b"
+    },
+    {
+      "ryu_rendering_input": "1.2e-7",
+      "ported_repository_helper": "0.00000012",
+      "node_json_stringify": "1.2e-7",
+      "same_bytes": false,
+      "ported_object_sha256": "2ea3f2650ff55dba0c001f70ba33660c69ff8c301bb99dcb9c090f7cbe2dee26",
+      "reference_object_sha256": "1e0f02d416a50c59d597764ed2dd0a70f98c0987e8c1528c0a05e764c49e9308"
+    },
+    {
+      "ryu_rendering_input": "-1e-7",
+      "ported_repository_helper": "-0.0000001",
+      "node_json_stringify": "-1e-7",
+      "same_bytes": false,
+      "ported_object_sha256": "920a485484595cf250900f098176b4c330abc60346f2d929d0367537bead60bc",
+      "reference_object_sha256": "212648d2fafa2d95ca2664761a41edc9374d8335fa55bc3a89908d23fae0cf1c"
+    },
+    {
+      "ryu_rendering_input": "1e-6",
+      "ported_repository_helper": "0.000001",
+      "node_json_stringify": "0.000001",
+      "same_bytes": true,
+      "ported_object_sha256": "28343867a0be00aee19f81aa90cfd6c646878b9303fa15410d16bfd3f8894578",
+      "reference_object_sha256": "28343867a0be00aee19f81aa90cfd6c646878b9303fa15410d16bfd3f8894578"
+    },
+    {
+      "ryu_rendering_input": "1e20",
+      "ported_repository_helper": "100000000000000000000",
+      "node_json_stringify": "100000000000000000000",
+      "same_bytes": true,
+      "ported_object_sha256": "58d2d5b8dd4228ab5775ce84f996718fa19ed49872271e9649b70cebaca26a09",
+      "reference_object_sha256": "58d2d5b8dd4228ab5775ce84f996718fa19ed49872271e9649b70cebaca26a09"
+    },
+    {
+      "ryu_rendering_input": "1e21",
+      "ported_repository_helper": "1e+21",
+      "node_json_stringify": "1e+21",
+      "same_bytes": true,
+      "ported_object_sha256": "f1ee2b60ee95a3170fdc07a577e5f3514ced26867443d69da265acadead81007",
+      "reference_object_sha256": "f1ee2b60ee95a3170fdc07a577e5f3514ced26867443d69da265acadead81007"
+    },
+    {
+      "ryu_rendering_input": "1e23",
+      "ported_repository_helper": "1e+23",
+      "node_json_stringify": "1e+23",
+      "same_bytes": true,
+      "ported_object_sha256": "f8acd93b4d43262e8d22f393b3fc172b2608154644f68bd2295239d62451edef",
+      "reference_object_sha256": "f8acd93b4d43262e8d22f393b3fc172b2608154644f68bd2295239d62451edef"
+    }
+  ],
+  "suggested_artifact_continuation": {
+    "first_read": {
+      "counted_lines": 450,
+      "captured_bytes_before_numbering": 1000,
+      "window_truncated": false,
+      "scan_complete": true,
+      "has_more": true,
+      "next_start_line": 201,
+      "suffix_sentinel_visible": false,
+      "reports_end_of_artifact": false
+    },
+    "next_call_effective_range": {
+      "start_line": 201,
+      "end_line": 200
+    },
+    "rejected_as_invalid_range": true
+  },
+  "single_long_line": {
+    "counted_lines": 1,
+    "captured_bytes_before_numbering": 2093953,
+    "window_truncated": true,
+    "scan_complete": true,
+    "has_more": false,
+    "next_start_line": 200,
+    "suffix_sentinel_visible": false,
+    "reports_end_of_artifact": true
+  },
+  "not_executed": [
+    "cargo test",
+    "dotnet test",
+    "real process cancellation drill",
+    "paid vendor API",
+    "full Runtime assembly sequence"
+  ]
+}

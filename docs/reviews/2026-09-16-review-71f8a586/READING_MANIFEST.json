@@ -1,0 +1,259 @@
+{
+  "baseline": "71f8a58614fcabbbc9bc9602fe85ef453df56765",
+  "repository": "https://github.com/Ye-Luo-0912/context-agent-prototype",
+  "claim": "Scope-wide continuation, not a complete line-by-line repository audit.",
+  "files": [
+    {
+      "path": "crates/agent-compose/tests/cache_wire_flow.rs",
+      "reading": "全文请求尾部截断；fixture、compose与断言主体已返回",
+      "focus": "现有真实请求key/B0/B1 smoke；read_only审批不证明成功写入",
+      "source_refs": [
+        "turn569file0"
+      ],
+      "url": "https://github.com/Ye-Luo-0912/context-agent-prototype/blob/71f8a58614fcabbbc9bc9602fe85ef453df56765/crates/agent-compose/tests/cache_wire_flow.rs"
+    },
+    {
+      "path": "docs/reviews/2026-09-16-review-980bbc77/E1_E2_E3_E4_C_RECEIPT.md",
+      "reading": "全文返回",
+      "focus": "上轮修复与 C 线关闭口径",
+      "source_refs": [
+        "turn520file0"
+      ],
+      "url": "https://github.com/Ye-Luo-0912/context-agent-prototype/blob/71f8a58614fcabbbc9bc9602fe85ef453df56765/docs/reviews/2026-09-16-review-980bbc77/E1_E2_E3_E4_C_RECEIPT.md"
+    },
+    {
+      "path": "crates/agent-contracts/src/schema_profile.rs",
+      "reading": "125–1060 多段；不是全文件",
+      "focus": "编译、validate、数值域、预算、strict parser",
+      "source_refs": [
+        "turn521file0",
+        "turn522file0",
+        "turn549file0",
+        "turn555file0"
+      ],
+      "url": "https://github.com/Ye-Luo-0912/context-agent-prototype/blob/71f8a58614fcabbbc9bc9602fe85ef453df56765/crates/agent-contracts/src/schema_profile.rs"
+    },
+    {
+      "path": "crates/agent-contracts/src/jcs.rs",
+      "reading": "全文返回",
+      "focus": "JCS 数值与对象编码、内联回归",
+      "source_refs": [
+        "turn524file0"
+      ],
+      "url": "https://github.com/Ye-Luo-0912/context-agent-prototype/blob/71f8a58614fcabbbc9bc9602fe85ef453df56765/crates/agent-contracts/src/jcs.rs"
+    },
+    {
+      "path": "crates/tool-runtime/src/tools/artifact.rs",
+      "reading": "1–850 请求；生产段1–315再次核对，测试按返回范围",
+      "focus": "默认参数、capture、coverage、游标与测试",
+      "source_refs": [
+        "turn526file0",
+        "turn527file0",
+        "turn559file0"
+      ],
+      "url": "https://github.com/Ye-Luo-0912/context-agent-prototype/blob/71f8a58614fcabbbc9bc9602fe85ef453df56765/crates/tool-runtime/src/tools/artifact.rs"
+    },
+    {
+      "path": "crates/tool-runtime/src/tools/git.rs",
+      "reading": "1–440 请求的返回区间",
+      "focus": "Git 工具结果、限制与进程调用；未作完整测试覆盖",
+      "source_refs": [
+        "turn528file0"
+      ],
+      "url": "https://github.com/Ye-Luo-0912/context-agent-prototype/blob/71f8a58614fcabbbc9bc9602fe85ef453df56765/crates/tool-runtime/src/tools/git.rs"
+    },
+    {
+      "path": "crates/tool-runtime/src/tools/code.rs",
+      "reading": "1–390请求有截断；355–740；90–230、330–550再次核对",
+      "focus": "词法扫描、execute、结果覆盖与分页",
+      "source_refs": [
+        "turn529file0",
+        "turn530file0",
+        "turn567file0",
+        "turn568file0"
+      ],
+      "url": "https://github.com/Ye-Luo-0912/context-agent-prototype/blob/71f8a58614fcabbbc9bc9602fe85ef453df56765/crates/tool-runtime/src/tools/code.rs"
+    },
+    {
+      "path": "crates/tool-runtime/src/tools/edit.rs",
+      "reading": "1–330",
+      "focus": "编辑契约与准备路径；其余未读",
+      "source_refs": [
+        "turn531file0"
+      ],
+      "url": "https://github.com/Ye-Luo-0912/context-agent-prototype/blob/71f8a58614fcabbbc9bc9602fe85ef453df56765/crates/tool-runtime/src/tools/edit.rs"
+    },
+    {
+      "path": "crates/provider-openai/src/task_sequence_tests.rs",
+      "reading": "1–300；不是1247行全文",
+      "focus": "手工ModelInput fixture与mapper序列层级",
+      "source_refs": [
+        "turn532file0"
+      ],
+      "url": "https://github.com/Ye-Luo-0912/context-agent-prototype/blob/71f8a58614fcabbbc9bc9602fe85ef453df56765/crates/provider-openai/src/task_sequence_tests.rs"
+    },
+    {
+      "path": "crates/agent-contracts/src/tokens.rs",
+      "reading": "全文返回",
+      "focus": "Token估算辅助",
+      "source_refs": [
+        "turn533file0"
+      ],
+      "url": "https://github.com/Ye-Luo-0912/context-agent-prototype/blob/71f8a58614fcabbbc9bc9602fe85ef453df56765/crates/agent-contracts/src/tokens.rs"
+    },
+    {
+      "path": "crates/agent-process/src/frame.rs",
+      "reading": "全文返回",
+      "focus": "有界帧编码与读取",
+      "source_refs": [
+        "turn535file0"
+      ],
+      "url": "https://github.com/Ye-Luo-0912/context-agent-prototype/blob/71f8a58614fcabbbc9bc9602fe85ef453df56765/crates/agent-process/src/frame.rs"
+    },
+    {
+      "path": "crates/agent-process/src/session.rs",
+      "reading": "全文返回",
+      "focus": "DuplexTransport、发送与flush",
+      "source_refs": [
+        "turn536file0"
+      ],
+      "url": "https://github.com/Ye-Luo-0912/context-agent-prototype/blob/71f8a58614fcabbbc9bc9602fe85ef453df56765/crates/agent-process/src/session.rs"
+    },
+    {
+      "path": "crates/agent-process/src/host.rs",
+      "reading": "初次全文请求被截断；700–1360另读",
+      "focus": "调用deadline、exchange、请求/答复写入、取消、收尾",
+      "source_refs": [
+        "turn538file0",
+        "turn539file0",
+        "turn540file0"
+      ],
+      "url": "https://github.com/Ye-Luo-0912/context-agent-prototype/blob/71f8a58614fcabbbc9bc9602fe85ef453df56765/crates/agent-process/src/host.rs"
+    },
+    {
+      "path": "crates/agent-capability-process/src/capability_host.rs",
+      "reading": "1–360",
+      "focus": "生产config、invoke与broker、受管效果入口",
+      "source_refs": [
+        "turn542file0"
+      ],
+      "url": "https://github.com/Ye-Luo-0912/context-agent-prototype/blob/71f8a58614fcabbbc9bc9602fe85ef453df56765/crates/agent-capability-process/src/capability_host.rs"
+    },
+    {
+      "path": "crates/agent-workspace/src/broker.rs",
+      "reading": "1–270",
+      "focus": "E1剪裁标记和预算修复；不宣称全文测试阅读",
+      "source_refs": [
+        "turn544file0"
+      ],
+      "url": "https://github.com/Ye-Luo-0912/context-agent-prototype/blob/71f8a58614fcabbbc9bc9602fe85ef453df56765/crates/agent-workspace/src/broker.rs"
+    },
+    {
+      "path": ".github/workflows/ci.yml",
+      "reading": "全文返回",
+      "focus": "Linux分片与host加入、既有CI命令",
+      "source_refs": [
+        "turn545file0"
+      ],
+      "url": "https://github.com/Ye-Luo-0912/context-agent-prototype/blob/71f8a58614fcabbbc9bc9602fe85ef453df56765/.github/workflows/ci.yml"
+    },
+    {
+      "path": "Cargo.lock",
+      "reading": "1750–1880、1950–2070",
+      "focus": "Ratatui等版本与Ryu1.0.23；未全审依赖",
+      "source_refs": [
+        "turn546file0",
+        "turn547file0"
+      ],
+      "url": "https://github.com/Ye-Luo-0912/context-agent-prototype/blob/71f8a58614fcabbbc9bc9602fe85ef453df56765/Cargo.lock"
+    },
+    {
+      "path": "crates/agent-runtime/src/execution/memo.rs",
+      "reading": "全文返回",
+      "focus": "预留memo始终miss、未接dispatch",
+      "source_refs": [
+        "turn551file0"
+      ],
+      "url": "https://github.com/Ye-Luo-0912/context-agent-prototype/blob/71f8a58614fcabbbc9bc9602fe85ef453df56765/crates/agent-runtime/src/execution/memo.rs"
+    },
+    {
+      "path": "Cargo.toml",
+      "reading": "全文返回",
+      "focus": "20workspace成员与共享依赖",
+      "source_refs": [
+        "turn552file0"
+      ],
+      "url": "https://github.com/Ye-Luo-0912/context-agent-prototype/blob/71f8a58614fcabbbc9bc9602fe85ef453df56765/Cargo.toml"
+    },
+    {
+      "path": "crates/agent-runtime/src/output.rs",
+      "reading": "全文返回",
+      "focus": "E1兜底剪裁完整性标记和回归",
+      "source_refs": [
+        "turn553file0"
+      ],
+      "url": "https://github.com/Ye-Luo-0912/context-agent-prototype/blob/71f8a58614fcabbbc9bc9602fe85ef453df56765/crates/agent-runtime/src/output.rs"
+    },
+    {
+      "path": "docs/NEXT_TASKS.md",
+      "reading": "1–190请求被截断；仅返回的当前入口/历史段",
+      "focus": "当前范围与已关闭项；不把截断当缺失",
+      "source_refs": [
+        "turn554file0"
+      ],
+      "url": "https://github.com/Ye-Luo-0912/context-agent-prototype/blob/71f8a58614fcabbbc9bc9602fe85ef453df56765/docs/NEXT_TASKS.md"
+    },
+    {
+      "path": "crates/agent-tui/src/cli.rs",
+      "reading": "1–690",
+      "focus": "Headless入口、JSONL队列、取消、结果分类；非全TUI",
+      "source_refs": [
+        "turn556file0",
+        "turn557file0"
+      ],
+      "url": "https://github.com/Ye-Luo-0912/context-agent-prototype/blob/71f8a58614fcabbbc9bc9602fe85ef453df56765/crates/agent-tui/src/cli.rs"
+    },
+    {
+      "path": "crates/agent-workspace/src/runtime_facts.rs",
+      "reading": "255–末尾",
+      "focus": "E4 CString/FIFO fixture修复",
+      "source_refs": [
+        "turn558file0"
+      ],
+      "url": "https://github.com/Ye-Luo-0912/context-agent-prototype/blob/71f8a58614fcabbbc9bc9602fe85ef453df56765/crates/agent-workspace/src/runtime_facts.rs"
+    },
+    {
+      "path": "crates/agent-core/src/kernel/mod.rs",
+      "reading": "975–1160、1480–1610",
+      "focus": "Schema执行门禁、恢复与回滚；不是整个Core",
+      "source_refs": [
+        "turn560file0",
+        "turn561file0"
+      ],
+      "url": "https://github.com/Ye-Luo-0912/context-agent-prototype/blob/71f8a58614fcabbbc9bc9602fe85ef453df56765/crates/agent-core/src/kernel/mod.rs"
+    },
+    {
+      "path": "crates/agent-compose/tests/proof_supervision.rs",
+      "reading": "全文返回",
+      "focus": "真实host死亡与验证树退出断言、CI失败点",
+      "source_refs": [
+        "turn566file0"
+      ],
+      "url": "https://github.com/Ye-Luo-0912/context-agent-prototype/blob/71f8a58614fcabbbc9bc9602fe85ef453df56765/crates/agent-compose/tests/proof_supervision.rs"
+    }
+  ],
+  "not_read_this_round": [
+    "全部源码逐行覆盖未完成",
+    "ContextEngine主体未在本轮重新通读",
+    "其余Runtime/Core文件与完整TUI模块",
+    "当前 .NET SDK 生产代码未在本轮重读",
+    "全部scripts、eval fixtures、历史证据文件",
+    "完整依赖锁定文件和第三方依赖源码"
+  ],
+  "failed_reads": [
+    {
+      "path": "crates/agent-tui/src/headless.rs",
+      "status": "404; switched to actual cli.rs; not counted as coverage"
+    }
+  ]
+}
