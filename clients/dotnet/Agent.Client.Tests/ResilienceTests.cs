@@ -232,9 +232,19 @@ public class MetricsSessionTests
         Assert.Null(report.FinalTreeWorkingSetBytes);
         Assert.Null(report.IdleTreeWorkingSetBytes);
         Assert.Null(report.Coverage);
+        Assert.Null(report.PeakCoverage);
+        Assert.Null(report.IdleCoverage);
+        Assert.Null(report.PeakWorkingSetReadFailures);
+        Assert.Null(report.FinalWorkingSetReadFailures);
+        Assert.Null(report.IdleWorkingSetReadFailures);
         Assert.Equal(0, report.SampleCount);
         var json = await File.ReadAllTextAsync(path);
         Assert.DoesNotContain("peak_tree_working_set_bytes", json); // null fields are absent, not zero
+        // O1 additions are nullable and absent when NOT_RUN: old readers of
+        // the report schema keep decoding it unchanged.
+        Assert.DoesNotContain("peak_tree_coverage", json);
+        Assert.DoesNotContain("idle_tree_coverage", json);
+        Assert.DoesNotContain("peak_working_set_read_failures", json);
     }
 
     [Fact]
@@ -329,5 +339,123 @@ public class MetricsSessionTests
         var report = await session.CompleteAsync();
         Assert.True(report.SampleCount >= 6, $"expected >= 6 samples, got {report.SampleCount}");
         Assert.True(session.RingCount <= 4, $"the ring must stay bounded, holds {session.RingCount}");
+    }
+
+    [Fact]
+    public void Partial_parent_read_failure_downgrades_coverage_to_unknown()
+    {
+        // O1: process 1's parent relation was read; process 2's read failed.
+        // A failed parent read is a structural hole, not a parentless root —
+        // one readable parent must not buy a full_tree label while part of
+        // the tree is undiscoverable.
+        var graph = MetricsSession.BuildGraph(
+        [
+            new ProcessRead(1, 100, ParentProcessId: 0, ParentReadFailed: false),
+            new ProcessRead(2, 50, ParentProcessId: null, ParentReadFailed: true),
+        ], vanishedProcesses: 0);
+        Assert.Equal(TreeCoverage.Unknown, graph.Coverage);
+    }
+
+    [Fact]
+    public void Vanished_process_downgrades_coverage_to_unknown()
+    {
+        // A process that vanished mid-enumeration also leaves a structural
+        // hole: the totals are a lower bound at best.
+        var graph = MetricsSession.BuildGraph(
+        [
+            new ProcessRead(1, 100, ParentProcessId: 0, ParentReadFailed: false),
+        ], vanishedProcesses: 1);
+        Assert.Equal(TreeCoverage.Unknown, graph.Coverage);
+    }
+
+    [Fact]
+    public void Unread_working_set_is_excluded_and_counted_not_encoded_as_zero()
+    {
+        // O1: root 1's working-set read failed. Its bytes are excluded from
+        // the total and counted as a failure — a missing value, never a
+        // measured zero. The parent map is complete, so the STRUCTURAL label
+        // stays full_tree: numeric incompleteness is carried by the failure
+        // count, not by faking the coverage label.
+        var graph = MetricsSession.BuildGraph(
+        [
+            new ProcessRead(1, null, ParentProcessId: 0, ParentReadFailed: false),
+            new ProcessRead(2, 50, ParentProcessId: 1, ParentReadFailed: false),
+        ], vanishedProcesses: 0);
+        Assert.Equal(1, graph.WorkingSetReadFailures);
+        Assert.Equal(TreeCoverage.FullTree, graph.Coverage);
+        Assert.Equal(50, graph.TotalForRoots([1])); // child counted; the unread root contributes nothing "measured"
+        Assert.Equal(50, graph.TotalForRoots([2])); // root 2's own read succeeded
+    }
+
+    [Fact]
+    public async Task Peak_and_final_keep_the_coverage_of_their_own_samples()
+    {
+        // O1: the first sample is a full-tree walk peaking at 1000; every
+        // later sample is a root-only walk. The peak must carry ITS sample's
+        // full_tree label, not borrow the last sample's root_only.
+        var path = NewPath();
+        var session = new MetricsSession("peak", path);
+        var first = true;
+        session.SnapshotFactory = () =>
+        {
+            if (first)
+            {
+                first = false;
+                return new ProcessGraph(
+                    new Dictionary<int, long> { [1] = 1000 },
+                    new Dictionary<int, int?> { [1] = null },
+                    TreeCoverage.FullTree);
+            }
+            return new ProcessGraph(
+                new Dictionary<int, long> { [1] = 10 },
+                new Dictionary<int, int?> { [1] = null },
+                TreeCoverage.RootOnly);
+        };
+        session.TrackProcessTree(1);
+        session.Start(TimeSpan.FromMilliseconds(30));
+        await Task.Delay(250);
+        var report = await session.CompleteAsync();
+        Assert.True(report.SampleCount >= 2, $"expected >= 2 samples, got {report.SampleCount}");
+        Assert.Equal(1000, report.PeakTreeWorkingSetBytes);
+        Assert.Equal(TreeCoverage.FullTree, report.PeakCoverage); // the peak sample's own label
+        Assert.Equal(TreeCoverage.RootOnly, report.Coverage);     // the last sample's label
+        Assert.True(report.FinalTreeWorkingSetBytes < report.PeakTreeWorkingSetBytes);
+        var json = await File.ReadAllTextAsync(path);
+        Assert.Contains("peak_tree_coverage", json);
+    }
+
+    [Fact]
+    public async Task Idle_mark_keeps_its_own_coverage_not_the_last_samples()
+    {
+        // O1: the idle mark's snapshot has a failed root read (bytes
+        // excluded, counted) and an unknown label; every background sample
+        // is root_only. The idle fields must reflect the idle snapshot —
+        // none of them may be borrowed from the last sample.
+        var path = NewPath();
+        var session = new MetricsSession("idle-cov", path);
+        var idlePhase = false;
+        session.SnapshotFactory = () => idlePhase
+            ? new ProcessGraph(
+                new Dictionary<int, long>(),
+                new Dictionary<int, int?> { [1] = null },
+                TreeCoverage.Unknown,
+                [1], // root 1's working-set read failed at idle
+                parentReadFailures: 0)
+            : new ProcessGraph(
+                new Dictionary<int, long> { [1] = 100 },
+                new Dictionary<int, int?> { [1] = null },
+                TreeCoverage.RootOnly);
+        session.TrackProcessTree(1);
+        session.Start(TimeSpan.FromMilliseconds(30));
+        await Task.Delay(150);
+        idlePhase = true;
+        session.MarkIdle();
+        var report = await session.CompleteAsync();
+        Assert.Equal(0, report.IdleTreeWorkingSetBytes);        // excluded, not measured
+        Assert.Equal(1, report.IdleWorkingSetReadFailures);     // the hole is counted, not hidden
+        Assert.Equal(TreeCoverage.Unknown, report.IdleCoverage); // the idle snapshot's own label
+        var json = await File.ReadAllTextAsync(path);
+        Assert.Contains("idle_tree_coverage", json);
+        Assert.Contains("idle_working_set_read_failures", json);
     }
 }
