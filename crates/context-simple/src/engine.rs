@@ -529,11 +529,11 @@ pub(crate) struct PendingCardBatch {
 
 /// W1 (V2): the typed outcome of one per-id pending-card service
 /// ([`SimpleContextEngine::hydrate_card_for_outcome`]). `Installed` and
-/// `AlreadyOwned` mean the planning pass will find the body; `Missing`
-/// (verified absent or structurally invalid — row consumed), `Corrupt`
-/// (damaged card — row consumed) and `IoFailed` (transient — row stays
-/// retryable) name *why* it will not; `NoPendingRow` means the id has no
-/// cold owner, so loaded-index absence is authoritative for it.
+/// `AlreadyOwned` mean the body was successfully served this operation;
+/// `Missing` (verified absent or structurally invalid — row consumed),
+/// `Corrupt` (damaged card — row consumed) and `IoFailed` (transient — row
+/// stays retryable) name *why* it was not; `NoPendingRow` means the id has
+/// no cold owner, so loaded-index absence is authoritative for it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum PendingIdOutcome {
     Installed,
@@ -542,6 +542,29 @@ pub(crate) enum PendingIdOutcome {
     Corrupt,
     IoFailed,
     NoPendingRow,
+}
+
+/// B1: one per-id pending-card service result — the typed outcome plus the
+/// card's entry when the read decided in the entry's favor. The entry is the
+/// version the pending row authorizes (identity, checksum and owner
+/// metadata bound to that card hash): exactly what any later re-hydration of
+/// the row would install. The required-ref resolution captures it so
+/// planning never depends on the entry still being hot when the whole
+/// resolution batch ends — a later install in the same batch may have
+/// demoted an earlier target back to pending.
+#[derive(Debug)]
+pub(crate) struct PendingIdRead {
+    pub(crate) outcome: PendingIdOutcome,
+    pub(crate) entry: Option<Box<agent_contracts::ExternalizedContext>>,
+}
+
+impl PendingIdRead {
+    fn without_entry(outcome: PendingIdOutcome) -> Self {
+        Self {
+            outcome,
+            entry: None,
+        }
+    }
 }
 
 /// Mutable runtime state of the engine, kept behind a lock. The heap (with
@@ -2040,7 +2063,7 @@ impl SimpleContextEngine {
     /// absent/damaged card consumes it.
     async fn hydrate_card_for(&self, item_id: ContextItemId) -> bool {
         matches!(
-            self.hydrate_card_for_outcome(item_id).await,
+            self.hydrate_card_for_outcome(item_id).await.outcome,
             PendingIdOutcome::Installed
         )
     }
@@ -2054,10 +2077,12 @@ impl SimpleContextEngine {
     /// row (a permanent fact), a damaged card names the read failure, a
     /// transient I/O failure keeps the row retryable, and `NoPendingRow`
     /// means the id has no cold owner at all.
-    pub(crate) async fn hydrate_card_for_outcome(
-        &self,
-        item_id: ContextItemId,
-    ) -> PendingIdOutcome {
+    ///
+    /// B1: a decided-in-favor read also returns the card's entry, so the
+    /// required-ref resolution can plan from the version the row authorizes
+    /// even when a later install in the same batch demotes this one back to
+    /// pending.
+    pub(crate) async fn hydrate_card_for_outcome(&self, item_id: ContextItemId) -> PendingIdRead {
         let hash = {
             let state = self.state.lock().await;
             state
@@ -2067,7 +2092,7 @@ impl SimpleContextEngine {
                 .map(|(_, hash)| hash.clone())
         };
         let Some(hash) = hash else {
-            return PendingIdOutcome::NoPendingRow;
+            return PendingIdRead::without_entry(PendingIdOutcome::NoPendingRow);
         };
         let dir = crate::store::store_dir(&self.config);
         let outcome = self
@@ -2087,17 +2112,20 @@ impl SimpleContextEngine {
                         .pending_external_cards
                         .retain(|(id, _)| *id != item_id);
                     state.external_cards_missing = state.external_cards_missing.saturating_add(1);
-                    return PendingIdOutcome::Missing;
+                    return PendingIdRead::without_entry(PendingIdOutcome::Missing);
                 }
                 let Some(position) = state
                     .pending_external_cards
                     .iter()
                     .position(|(id, h)| *id == item_id && *h == hash)
                 else {
-                    return PendingIdOutcome::AlreadyOwned;
+                    return PendingIdRead {
+                        outcome: PendingIdOutcome::AlreadyOwned,
+                        entry: Some(Box::new(entry)),
+                    };
                 };
                 state.pending_external_cards.remove(position);
-                state.external.merge_paged(vec![entry]);
+                state.external.merge_paged(vec![entry.clone()]);
                 state.external.record_card(item_id, hash);
                 // S3: per-id installs settle through the one residency
                 // entry (protecting the just-served id so the caller's read
@@ -2108,15 +2136,21 @@ impl SimpleContextEngine {
                 // distinct ids are read in sequence.
                 settle_metadata_residency(&mut state, &self.config, &[item_id]);
                 state.sync_catalog();
-                PendingIdOutcome::Installed
+                PendingIdRead {
+                    outcome: PendingIdOutcome::Installed,
+                    entry: Some(Box::new(entry)),
+                }
             }
-            crate::store::ExternalCardRead::Found(_) => PendingIdOutcome::AlreadyOwned,
+            crate::store::ExternalCardRead::Found(entry) => PendingIdRead {
+                outcome: PendingIdOutcome::AlreadyOwned,
+                entry: Some(Box::new(entry)),
+            },
             crate::store::ExternalCardRead::Missing => {
                 state
                     .pending_external_cards
                     .retain(|(id, _)| *id != item_id);
                 state.external_cards_missing = state.external_cards_missing.saturating_add(1);
-                PendingIdOutcome::Missing
+                PendingIdRead::without_entry(PendingIdOutcome::Missing)
             }
             // W1 (V2): a damaged card keeps the same honest accounting the
             // batch/restore paths use (the missing counter), but the typed
@@ -2127,13 +2161,13 @@ impl SimpleContextEngine {
                     .pending_external_cards
                     .retain(|(id, _)| *id != item_id);
                 state.external_cards_missing = state.external_cards_missing.saturating_add(1);
-                PendingIdOutcome::Corrupt
+                PendingIdRead::without_entry(PendingIdOutcome::Corrupt)
             }
             crate::store::ExternalCardRead::IoFailed(_) => {
                 // N02: a transient failure keeps the retryable locator and
                 // is counted separately from "the data does not exist".
                 state.external_card_io_failures = state.external_card_io_failures.saturating_add(1);
-                PendingIdOutcome::IoFailed
+                PendingIdRead::without_entry(PendingIdOutcome::IoFailed)
             }
         }
     }
@@ -2219,6 +2253,13 @@ impl SimpleContextEngine {
     /// `MAX_ANCHOR_ROOT_CLAIMS` (+ the foreground cap) and the scan is
     /// bounded by the operation budget. Nothing runs when the query names
     /// no refs or the pending directory is empty.
+    ///
+    /// B1: every decided-in-favor per-id read also captures the card's
+    /// entry into [`RequiredColdResolution::capture`] — a bounded,
+    /// version/range-bound plan source. Residency settlement is unchanged
+    /// (each install still slides the hot window); the capture only removes
+    /// the planning pass's dependency on who is still resident at the end
+    /// of the batch.
     async fn resolve_required_cold_refs(
         &self,
         query: &ContextQuery,
@@ -2267,9 +2308,17 @@ impl SimpleContextEngine {
         }
         // Exact ids: the per-id lane resolves each target directly (a
         // pending row is an O(1) locator; the outcome types the miss).
+        // B1: a decided-in-favor read's entry is captured at read time as a
+        // version/range-bound plan source — with the hot cap below the batch
+        // size, a later install in this same loop demotes an earlier target
+        // back to pending, and planning must not depend on who is still
+        // resident when the whole batch ends.
         for id in &exact_ids {
-            let outcome = self.hydrate_card_for_outcome(*id).await;
-            resolution.per_id.insert(*id, outcome);
+            let read = self.hydrate_card_for_outcome(*id).await;
+            if let Some(entry) = read.entry {
+                resolution.capture(*id, entry);
+            }
+            resolution.per_id.insert(*id, read.outcome);
         }
         if entity_keys.is_empty() && foreground_paths.is_empty() {
             return resolution;
@@ -2337,8 +2386,13 @@ impl SimpleContextEngine {
             };
             examined += 1;
             if matched && !resolution.per_id.contains_key(item_id) {
-                let outcome = self.hydrate_card_for_outcome(*item_id).await;
-                resolution.per_id.insert(*item_id, outcome);
+                // Same B1 capture as the exact-id lane: this install (or a
+                // later one in the same scan) can demote an earlier target.
+                let read = self.hydrate_card_for_outcome(*item_id).await;
+                if let Some(entry) = read.entry {
+                    resolution.capture(*item_id, entry);
+                }
+                resolution.per_id.insert(*item_id, read.outcome);
             }
         }
         resolution.pending_unread = rows.len().saturating_sub(examined);

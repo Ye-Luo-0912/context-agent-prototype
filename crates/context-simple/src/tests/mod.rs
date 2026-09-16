@@ -1,6 +1,7 @@
 mod admit;
 mod anchor_expiry;
 mod b2_hydration_completeness;
+mod batch_required_plan;
 mod cold_bounds;
 mod cold_owner_and_required;
 mod consumption_truth;

@@ -977,6 +977,31 @@ pub(crate) fn plan_foreground(
                 identity,
                 owner: Box::new(entry.clone()),
             });
+        } else if let Some(entry) = resolution
+            .resolved
+            .iter()
+            .filter(|(_, entry)| {
+                store::externally_retrievable(entry)
+                    && is_file_body_entry(entry)
+                    && observation_file_path_entry(entry)
+                        .map(normalize_resource_path)
+                        .as_deref()
+                        == Some(path.as_str())
+                    && revision_ok(entry.file_revision.as_deref(), revision)
+            })
+            .max_by_key(|(_, entry)| (entry.created_tick, entry.last_access_tick))
+            .map(|(_, entry)| &**entry)
+        {
+            // B1: the bounded scan read and installed this path's card
+            // earlier in the same operation, and a later install demoted it
+            // back to pending. The capture is the version the row
+            // authorizes — serve it instead of a false absence.
+            plan.push(ForegroundPlanItem::Store {
+                item_id: entry.item_id,
+                checksum: entry.blob_checksum.clone(),
+                identity,
+                owner: Box::new(entry.clone()),
+            });
         } else {
             misses.push(context_miss(
                 identity,
@@ -1264,9 +1289,18 @@ pub(crate) struct RequiredBody {
 #[derive(Debug, Default)]
 pub(crate) struct RequiredColdResolution {
     /// Typed per-id outcome for every exact-id claim that named a pending
-    /// row. `Installed`/`AlreadyOwned` targets are found by the normal
-    /// planning lookups; the failure outcomes type the miss.
+    /// row. `Installed`/`AlreadyOwned` targets are served through
+    /// `resolved` (below) or the normal planning lookups; the failure
+    /// outcomes type the miss.
     pub(crate) per_id: std::collections::HashMap<ContextItemId, crate::engine::PendingIdOutcome>,
+    /// B1: card entries the per-id lane (and the bounded scan) successfully
+    /// read this operation, captured at read time. Each is the version its
+    /// pending row authorizes — identity, checksum and owner metadata bound
+    /// to that card hash — so planning can serve a claim whose install was
+    /// demoted back to pending by a later install in the same batch.
+    /// Residency is untouched by these captures; the bound keeps the plan
+    /// no larger than what the required plan could carry anyway.
+    pub(crate) resolved: Vec<(ContextItemId, Box<agent_contracts::ExternalizedContext>)>,
     /// Pending rows the bounded entity/path scan left unexamined. While
     /// nonzero, an entity/path claim matching nothing loaded is an
     /// *unproven absence* (`UnreadColdPage`), never `Missing`.
@@ -1274,6 +1308,37 @@ pub(crate) struct RequiredColdResolution {
 }
 
 impl RequiredColdResolution {
+    /// B1: capture one successfully read card entry. The first capture per
+    /// id wins — the pending row authorizes exactly one card version — and
+    /// captures past the required plan's observation bound are dropped:
+    /// the plan cannot serve more bodies than that cap anyway, and the
+    /// install itself already happened.
+    pub(crate) fn capture(
+        &mut self,
+        id: ContextItemId,
+        entry: Box<agent_contracts::ExternalizedContext>,
+    ) {
+        if self.resolved.iter().any(|(seen, _)| *seen == id) {
+            return;
+        }
+        if self.resolved.len() >= MAX_REQUIRED_PLAN_OBSERVATIONS {
+            return;
+        }
+        self.resolved.push((id, entry));
+    }
+
+    /// The captured entry for one id, if a per-id read decided in its
+    /// favor this operation.
+    pub(crate) fn resolved_entry(
+        &self,
+        id: ContextItemId,
+    ) -> Option<&agent_contracts::ExternalizedContext> {
+        self.resolved
+            .iter()
+            .find(|(seen, _)| *seen == id)
+            .map(|(_, entry)| &**entry)
+    }
+
     /// The typed miss reason for one exact-id resolution outcome.
     pub(crate) fn miss_reason(
         outcome: crate::engine::PendingIdOutcome,
@@ -1287,8 +1352,11 @@ impl RequiredColdResolution {
             | crate::engine::PendingIdOutcome::NoPendingRow => {
                 ContextMaterializationMissReason::Missing
             }
-            // The planning lookups find these; a miss for them is not
-            // expected here.
+            // A decided-in-favor read is served through `resolved` or the
+            // planning lookups; reaching the miss path with one means no
+            // captured source exists (below the observation bound the
+            // capture always exists), so the honest terminal answer stays
+            // `Missing`.
             crate::engine::PendingIdOutcome::Installed
             | crate::engine::PendingIdOutcome::AlreadyOwned => {
                 ContextMaterializationMissReason::Missing
@@ -1411,6 +1479,19 @@ pub(crate) fn plan_required_with_resolution(
                     &mut items,
                     &mut misses,
                 );
+            } else if let Some(entry) = resolution.resolved_entry(id) {
+                // B1: the per-id lane read this card earlier in the same
+                // operation; a later install in the batch may have demoted
+                // it back to pending. The capture is the version the row
+                // authorizes — plan from it instead of a false `Missing`.
+                matched = true;
+                bounded_out = !plan_store_required(
+                    entry,
+                    claim_identity(claim, Some(id)),
+                    &mut seen,
+                    &mut items,
+                    &mut misses,
+                );
             }
         }
 
@@ -1467,6 +1548,25 @@ pub(crate) fn plan_required_with_resolution(
             bounded_out = !plan_store_required(
                 entry,
                 claim_identity(claim, Some(entry.item_id)),
+                &mut seen,
+                &mut items,
+                &mut misses,
+            );
+        }
+        // B1: captured cold reads whose entities match but whose install a
+        // later batch install demoted back to pending — the same fallback
+        // the exact-id branch uses.
+        for (id, entry) in resolution.resolved.iter() {
+            if bounded_out {
+                break;
+            }
+            if !entry.entities.contains(&claim.item_ref) {
+                continue;
+            }
+            matched = true;
+            bounded_out = !plan_store_required(
+                entry,
+                claim_identity(claim, Some(*id)),
                 &mut seen,
                 &mut items,
                 &mut misses,
